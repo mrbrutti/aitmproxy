@@ -10,7 +10,7 @@ import Testing
     static let outOfScope = Fixtures.rows.first { !$0.inScope }!
 
     private func item(_ verb: FlowVerb, _ context: VerbContext?) -> VerbItem {
-        VerbTable.items(for: context).first { $0.verb == verb }!
+        VerbTable.item(verb, for: context)
     }
 
     @Test func pausedWithPendingEditsAppliesAndResumes() {
@@ -103,8 +103,31 @@ import Testing
     @Test func groupsAreOrderedAndTitlesComplete() {
         let items = VerbTable.items(for: nil)
         #expect(items.map(\.group.rawValue) == items.map(\.group.rawValue).sorted())
+        #expect(VerbTable.order == items.map(\.verb))
+        #expect(VerbTable.order.first == .resume)
         #expect(VerbTable.allTitles[.resume] == ["Resume", "Apply & Resume"])
         #expect(VerbTable.allTitles[.comment] == ["Comment…", "Edit Comment…"])
         #expect(Set(VerbTable.allTitles.keys) == Set(items.map(\.verb)))
+    }
+
+    @Test func everyMarkColourSharesTheMarkRow() {
+        let outOfScope = VerbContext(row: Self.outOfScope)
+        #expect(FlowVerb.mark(.red).tableKey == .mark(nil))
+        #expect(VerbTable.item(.mark(.red), for: outOfScope).title == "Mark")
+        #expect(VerbTable.item(.mark(.red), for: outOfScope).enabled == false)
+        #expect(VerbTable.item(.mark(.green), for: VerbContext(row: Self.finished)).enabled)
+        #expect(VerbTable.titles(.mark(.blue)) == ["Mark"])
+    }
+
+    @Test func hintsPrintBareKeysAsLettersAndChordsAsGlyphs() {
+        let context = VerbContext(row: Self.paused)
+        #expect(VerbTable.item(.resume, for: context).hint == "⌘⏎")
+        #expect(VerbTable.item(.edit, for: context).hint == "e")
+        #expect(VerbTable.item(.kill, for: context).hint == "⌘\\")
+        #expect(VerbTable.item(.editAndReplay, for: context).hint == "⇧R")
+        #expect(VerbTable.item(.mark(nil), for: context).hint == "m")
+        #expect(VerbTable.item(.copyURL, for: context).hint == nil)
+        #expect(VerbTable.verb(forKey: "e") == .edit)
+        #expect(VerbTable.verb(forKey: "i") == nil)
     }
 }

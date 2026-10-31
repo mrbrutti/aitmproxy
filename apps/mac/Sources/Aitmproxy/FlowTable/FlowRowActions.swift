@@ -11,6 +11,11 @@ final class FlowKeyTable: NSTableView {
     var onToggleIntercept: (() -> Void)?
     var onCompose: (() -> Void)?
     var onEnter: (() -> Void)?
+    /// The list's undo manager (Clear's step), so Edit ▸ Undo and ⌘Z reach it while the list is
+    /// first responder; a text field in front keeps its own.
+    var undoManagerProvider: (() -> UndoManager?)?
+
+    override var undoManager: UndoManager? { undoManagerProvider?() ?? super.undoManager }
 
     override func keyDown(with event: NSEvent) {
         guard event.modifierFlags.intersection([.command, .option, .control]).isEmpty,
@@ -20,7 +25,7 @@ final class FlowKeyTable: NSTableView {
         case "n": onCompose?()
         case "\r": onEnter?()
         default:
-            guard let verb = VerbTable.verb(forKey: key, in: VerbTable.items(for: nil)) else { return super.keyDown(with: event) }
+            guard let verb = VerbTable.verb(forKey: key) else { return super.keyDown(with: event) }
             // Space toggles Quick Look, as in Finder.
             if verb == .quickLook, QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible {
                 QLPreviewPanel.shared().orderOut(nil)

@@ -2,25 +2,6 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
-@Suite struct ColumnLayoutTests {
-    @Test func unknownIdsAreIgnoredAndMissingOnesAppended() {
-        let layout = ColumnLayout(order: ["url", "ghost", "seq"], widths: ["url": 320, "ghost": 50], hidden: ["ghost", "ssl"])
-        #expect(layout.resolvedOrder(known: ["dot", "seq", "url", "ssl"]) == ["url", "seq", "dot", "ssl"])
-        #expect(layout.width(for: "url", default: 100) == 320)
-        #expect(layout.width(for: "seq", default: 52) == 52)
-        #expect(layout.isHidden("ssl"))
-        #expect(!layout.isHidden("url"))
-    }
-
-    @Test func roundTripsThroughAFile() throws {
-        let url = FileManager.default.temporaryDirectory.appending(path: "columns-\(UUID().uuidString).json")
-        let layout = ColumnLayout(order: ["seq", "url"], widths: ["url": 240.5], hidden: ["mark"])
-        try layout.save(to: url)
-        #expect(ColumnLayout.load(from: url) == layout)
-        #expect(ColumnLayout.load(from: url.appendingPathExtension("missing")) == nil)
-    }
-}
-
 @Suite struct FlowSortTests {
     let rows = Fixtures.rows
 

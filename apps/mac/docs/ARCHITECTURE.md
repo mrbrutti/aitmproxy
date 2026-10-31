@@ -38,7 +38,7 @@ actor, JSON-RPC       values only          SwiftUI + AppKit, main actor by defau
 
 ## Checks that hold the shape
 
-- `tools/verify.sh`: unit tests, self-test (105 checks, incl. menu-bar coverage from
+- `tools/verify.sh`: unit tests, self-test (126 checks, incl. menu-bar coverage from
   `CommandMap`), snapshots light + dark, parts gallery, grid-lint.
 - Kit tests parse `docs/BRIEF.md` (`CommandMapTests`): the brief, the map and the menus stay one
   list.
@@ -46,5 +46,6 @@ actor, JSON-RPC       values only          SwiftUI + AppKit, main actor by defau
   menu (`FlowTableView+Menus`), the Flow menu (`App.swift`), the intercept bar, the list's key
   handler (`FlowKeyTable`) and `CommandMap` all read it, so a title, key or enabled rule exists
   once. `VerbTableTests` hold the rules; the self-test's menu audit holds the menu bar to them.
-- `docs/architecture-review-<date>.md`: one check-in per milestone; the latest names the next
-  refactor.
+- `docs/architecture-review-<date>.md` and `docs/review-<date>.md`: one check-in per milestone;
+  the verb-table card is done, the next card is the bus poll (`BusService.pollLoop` at 500 ms
+  even with no window visible), then the `Session` split.

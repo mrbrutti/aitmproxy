@@ -121,12 +121,18 @@ final class Session {
     var restoredFlows: [FlowRow] = []
     /// "Cleared n flows — Undo" in the status bar, for a few seconds after a Clear.
     var clearNotice: ClearNotice?
-    /// What the last Clear dropped, until it is undone or the notice lapses.
+    /// What the last Clear dropped, until it is undone or the notice lapses (then it is released).
     @ObservationIgnored var clearedFlows: ClearedFlows?
     @ObservationIgnored var clearNoticeTask: Task<Void, Never>?
-    /// The undo manager the last Clear registered with (the key window's, or the session's own).
-    @ObservationIgnored private(set) var clearUndoManager: UndoManager?
-    @ObservationIgnored private lazy var ownUndoManager = UndoManager()
+    /// The flow list's undo manager: Clear's one step lives here, and `FlowKeyTable` hands it to
+    /// AppKit as the list's responder, so Edit ▸ Undo Clear (⌘Z) reaches it while the list has
+    /// focus and a text field keeps its own typing undo. No event grouping: a step is registered
+    /// and withdrawn whole, which the headless self-test can prove.
+    @ObservationIgnored let flowUndoManager: UndoManager = {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        return manager
+    }()
     /// The sidebar sub-item narrowing the list, if any.
     var group: FlowGroup?
     var details: [FlowID: FlowDetail] = [:] {
@@ -459,15 +465,18 @@ final class Session {
         ensureDetail(for: id)
     }
 
-    /// Registers one undo step named `name` on the key window's undo manager (Edit ▸ Undo, ⌘Z),
-    /// falling back to the session's own when no window is key (tests, headless runs).
-    func registerUndo(_ name: String, _ handler: @escaping @MainActor (Session) -> Void) {
-        let manager = NSApp.keyWindow?.undoManager ?? NSApp.mainWindow?.undoManager ?? ownUndoManager
-        manager.registerUndo(withTarget: self) { session in
-            MainActor.assumeIsolated { handler(session) }
+    /// Registers the one "Undo Clear" step on the flow list's undo manager; an earlier step is
+    /// withdrawn first, so the list offers one Clear step at a time.
+    func registerClearUndo() {
+        flowUndoManager.removeAllActions()
+        flowUndoManager.beginUndoGrouping()
+        flowUndoManager.registerUndo(withTarget: self) { session in
+            // AppKit runs undo handlers on the thread that called undo(): the responder chain
+            // and the self-test both do so on the main thread.
+            MainActor.assumeIsolated { session.undoClear() }
         }
-        manager.setActionName(name)
-        clearUndoManager = manager
+        flowUndoManager.setActionName("Clear")
+        flowUndoManager.endUndoGrouping()
     }
 
     /// Records the role the bus reported for this connection and flags a mismatch

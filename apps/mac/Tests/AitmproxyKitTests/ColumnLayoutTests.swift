@@ -2,6 +2,25 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
+@Suite struct ColumnLayoutTests {
+    @Test func unknownIdsAreIgnoredAndMissingOnesAppended() {
+        let layout = ColumnLayout(order: ["url", "ghost", "seq"], widths: ["url": 320, "ghost": 50], hidden: ["ghost", "ssl"])
+        #expect(layout.resolvedOrder(known: ["dot", "seq", "url", "ssl"]) == ["url", "seq", "dot", "ssl"])
+        #expect(layout.width(for: "url", default: 100) == 320)
+        #expect(layout.width(for: "seq", default: 52) == 52)
+        #expect(layout.isHidden("ssl"))
+        #expect(!layout.isHidden("url"))
+    }
+
+    @Test func roundTripsThroughAFile() throws {
+        let url = FileManager.default.temporaryDirectory.appending(path: "columns-\(UUID().uuidString).json")
+        let layout = ColumnLayout(order: ["seq", "url"], widths: ["url": 240.5], hidden: ["mark"])
+        try layout.save(to: url)
+        #expect(ColumnLayout.load(from: url) == layout)
+        #expect(ColumnLayout.load(from: url.appendingPathExtension("missing")) == nil)
+    }
+}
+
 /// Responsive flow columns: low-priority columns go first, the user's hidden set is untouched.
 @Suite struct ColumnFitTests {
     typealias C = ColumnFit.Column
@@ -42,6 +61,23 @@ import Testing
         // Without edited the sum is 1032; at 1032 nothing more needs to go, and edited is never returned.
         #expect(hidden(at: 1032, columns: columns) == [])
         #expect(hidden(at: 1031, columns: columns) == ["origin"])
+    }
+
+    @Test func theSpecsOwnBoundaries() {
+        // AC13: 1000 drops edited + origin; 800 drops through request; 500 drops every priority column.
+        #expect(hidden(at: 1000) == ["edited", "origin"])
+        #expect(hidden(at: 800) == ["edited", "origin", "ssl", "response", "request"])
+        #expect(hidden(at: 500) == Set(Self.priority))
+        // A user-hidden comment column (160) is out of the sum and never returned.
+        let withComment = Self.columns + [C(id: "comment", width: 160, userHidden: true)]
+        #expect(hidden(at: 1000, columns: withComment) == ["edited", "origin"])
+        #expect(ColumnFit.autoHidden(available: 100, columns: Self.columns, flexibleMin: 200, priority: []) == [])
+    }
+
+    @Test func theFlexibleMinimumIsPartOfTheSum() {
+        // 896 fixed + 220 (URL minimum plus 20 of spacing) = 1116: at 1115 the first column goes.
+        let hidden = ColumnFit.autoHidden(available: 1115, columns: Self.columns, flexibleMin: 220, priority: Self.priority)
+        #expect(hidden == ["edited"])
     }
 
     @Test func columnsOutsidePriorityNeverHide() {

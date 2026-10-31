@@ -135,14 +135,17 @@ final class BusService: FlowActions {
             let known = Set(ids)
             summaries = summaries.filter { known.contains($0.key) }
             let coreID = session.activeCoreID
-            let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }
-                .map { row in
-                    var row = row
-                    row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
-                    return row
-                }
-            // Rows an undone Clear put back stay ahead of the core's list; new flows number after them.
-            let rows = ClearedFlows.merge(restored: session.restoredFlows, newer: polled)
+            func scoped(_ row: FlowRow) -> FlowRow {
+                var row = row
+                row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
+                return row
+            }
+            let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
+            // Rows an undone Clear put back stay ahead of the core's list and follow the live
+            // scope like any other row; new flows number after them.
+            let restored = session.restoredFlows.map(scoped)
+            if restored != session.restoredFlows { session.restoredFlows = restored }
+            let rows = ClearedFlows.merge(restored: restored, newer: polled)
             if rows != session.rows { session.rows = rows }
             try await Task.sleep(for: pollInterval)
         }

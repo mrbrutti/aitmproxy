@@ -38,6 +38,7 @@ struct FlowTableView: NSViewRepresentable {
         table.onVerb = { [weak coordinator] verb in coordinator?.perform(verb) }
         table.onToggleIntercept = { [weak coordinator] in coordinator?.parent.onToggleIntercept() }
         table.onCompose = { [weak coordinator] in coordinator?.parent.onCompose() }
+        table.undoManagerProvider = { [session] in session.flowUndoManager }
         table.menu = coordinator.makeRowMenu()
         table.rowHeight = density.rowHeight
         table.intercellSpacing = .zero
@@ -224,8 +225,9 @@ struct FlowTableView: NSViewRepresentable {
 
         func perform(_ action: FlowVerb) {
             guard let row = targetRow else { return }
-            if case .mark(nil) = action, let table, let index = rows.firstIndex(of: row) {
-                // `m` opens the mark menu at the row.
+            if case .mark(nil) = action, let table, let index = rows.firstIndex(of: row),
+               VerbTable.item(action, for: verbContext(for: row)).enabled {
+                // `m` opens the mark menu at the row; an off verb falls through so the session reports why.
                 let menu = markMenu(for: row)
                 let rect = table.rect(ofRow: index)
                 menu.popUp(positioning: nil, at: NSPoint(x: rect.minX + 60, y: rect.maxY), in: table)
@@ -297,7 +299,9 @@ struct FlowTableView: NSViewRepresentable {
                 guard let column = FlowColumn(rawValue: c.identifier.rawValue), column != .url else { return nil }
                 return ColumnFit.Column(id: column.rawValue, width: c.width, userHidden: userHidden.contains(column))
             }
-            let hide = ColumnFit.autoHidden(available: clip.bounds.width, columns: fixed, flexibleMin: url.minWidth,
+            // The URL minimum carries the intercell spacing the fit below subtracts, so the two agree.
+            let urlSpacing = CGFloat(fixed.count + 1) * table.intercellSpacing.width
+            let hide = ColumnFit.autoHidden(available: clip.bounds.width, columns: fixed, flexibleMin: url.minWidth + urlSpacing,
                                             priority: FlowColumn.autoHidePriority.map(\.rawValue))
             autoHidden = Set(hide.compactMap(FlowColumn.init(rawValue:)))
             for c in table.tableColumns {

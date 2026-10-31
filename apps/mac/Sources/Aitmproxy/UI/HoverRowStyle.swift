@@ -13,7 +13,6 @@ struct HoverRowStyle: ButtonStyle {
             .frame(height: Tok.Size.Row.dense)
             .background(hovered ? Tok.Ground.hover.color : .clear, in: RoundedRectangle(cornerRadius: Tok.Radius.badge))
             .contentShape(Rectangle())
-            .opacity(configuration.isPressed ? 0.7 : 1)
             .onHover { hovered = $0 }
     }
 }

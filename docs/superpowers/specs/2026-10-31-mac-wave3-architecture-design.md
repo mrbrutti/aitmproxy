@@ -109,7 +109,6 @@ public struct VerbContext: Sendable {
     public var pinned: Bool             // Session.isPinned(.host(row.authority))
     public var selectedCount: Int       // rows selected in the list the row sits in
     public var selectedPausedCount: Int // of those, state == .paused
-    public var isInterceptTarget: Bool  // Session.interceptTarget?.id == row.id
 }
 
 public enum VerbGroup: Sendable { case intercept, replay, selection, annotate, host }
@@ -126,16 +125,22 @@ public struct VerbItem: Sendable {
 
 public enum VerbTable {
     public static func items(for context: VerbContext?) -> [VerbItem]
+    public static func item(_ verb: FlowVerb, for context: VerbContext?) -> VerbItem  // never misses: `.mark(color)` shares Mark's row
     public static func verb(forKey key: String, in items: [VerbItem]) -> FlowVerb?
+    public static func verb(forKey key: String) -> FlowVerb?    // the static key map FlowKeyTable uses
     public static func titles(_ verb: FlowVerb) -> [String]
-    public static var allTitles: [FlowVerb: [String]] { get }
-    public static let order: [FlowVerb]                         // the surfaces' listing order
+    public static let allTitles: [FlowVerb: [String]]
+    public static let order: [FlowVerb]                         // derived from items(for: nil)
     public static func outOfScopeReason(_ authority: String) -> String
 }
 ```
+`FlowVerb.tableKey` maps every `.mark(color)` to `.mark(nil)`, the one table row every lookup
+(`item(_:for:)`, `Session.perform`, `CommandMap`) goes through, so the scope gate covers coloured
+marks too. `VerbItem.hint` is the shortcut as a button prints it: a bare key as its letter
+(`e`), a chord as glyphs (`⌘⏎`); the intercept bar reads its titles and hints from it.
 `VerbGroup` is `Int`-backed and `CaseIterable`; `VerbItem` is `Hashable`; `VerbContext` has
 memberwise defaults (`pendingEdits: 0, pinned: false, selectedCount: 1, selectedPausedCount: 0,
-isInterceptTarget: false`) so a test can write `VerbContext(row: paused)`.
+selectedPausedCount: 0`) so a test can write `VerbContext(row: paused)`. (`isInterceptTarget` from the review card was dropped in stage 6: no title, key or enabled rule read it.)
 
 `items(for:)` returns every verb exactly once, in `VerbTable.order` (groups contiguous; the
 views put a separator at each group change):
@@ -266,10 +271,12 @@ to the baseline; S-069 checks green.
   app shows that the core no longer holds), `@ObservationIgnored` snapshot of the last clear
   and the notice timer task. `clearSession(confirm:)` captures `ClearedFlows(rows, details,
   selection, focused)` synchronously before `actions.clear()`, resets `restoredFlows = []`,
-  and after the clear succeeds registers one undo step on `(NSApp.keyWindow ??
-  NSApp.mainWindow)?.undoManager` with action name "Clear" (Edit ▸ Undo Clear, ⌘Z) and sets
-  `clearNotice = ClearNotice(count:)` (the bar's Undo calls `undoClear()`), scheduling a task that nils the
-  notice after 8 s. A failed clear registers nothing and shows no notice. `undoClear()`
+  and after the clear succeeds registers one undo step on the flow list's own undo manager
+  (`Session.flowUndoManager`, returned by `FlowKeyTable.undoManager` so Edit ▸ Undo Clear and
+  ⌘Z reach it while the list has focus) with action name "Clear" and sets
+  `clearNotice = ClearNotice(count:)` (the bar's Undo calls `undoClear()`), scheduling a task that after 8 s
+  releases the dropped copy, withdraws the undo step (`removeAllActions(withTarget:)`) and nils the
+  notice: captured traffic never outlives what the operator was told (stage-6 security finding). A failed clear registers nothing and shows no notice. `undoClear()`
   restores `rows = ClearedFlows.merge(restored:, newer: rows)`, merges `details`, sets
   `selection` and `focused`, sets `restoredFlows = cleared.rows`, cancels the timer, nils
   the notice, and clears the snapshot (one step; a second ⌘Z does nothing).
@@ -292,9 +299,12 @@ to the baseline; S-069 checks green.
   before the clear), "undo restores the rows, selection and focused flow" (`rows.count == n`,
   `selection == before.selection`, `focused == before.focused`), "undo dismisses the notice"
   (`clearNotice == nil`, and the undo manager has no step left). The undo is triggered through
-  the undo manager the clear registered with (`Session.clearUndoManager`, the key window's or
-  the session's own), so the check exercises the Edit ▸ Undo path, not a closure. Count rises
-  from 121 to 124.
+  the flow list's own undo manager (`Session.flowUndoManager`, which `FlowKeyTable.undoManager`
+  hands to AppKit while the list is first responder), so the check exercises the Edit ▸ Undo
+  path, not a closure. Two more
+  checks from the stage-6 panel: a mark colour on an out-of-scope row is refused with the
+  scope reason, and letting the notice lapse releases the copy and withdraws the step. Count
+  rises from 121 to 126.
 
 ### 4. HoverRowStyle
 
@@ -362,21 +372,22 @@ columns gone; `apps` (full width, 1199 pt ≥ 1096 pt minimum sum) byte-identica
    nothing (every row-verb title literal lives in `VerbTable.swift`); `Shell/ShellView.swift`
    is not in the diff.
 7. AC7: `swift test` is green with `VerbTableTests`, `ClearedFlowsTests` and
-   `ColumnLayoutTests` added; the self-test is 124 of 124 including every S-069 "menu has"
+   `ColumnLayoutTests` added; the self-test is 126 of 126 including every S-069 "menu has"
    check.
 8. AC8: `apps`, `edit-paused`, `filter-bar`, `overview` light and dark PNGs are byte-identical
    (`cmp`) to `/tmp/Aitmproxy-shots-dev-w3base`.
 9. AC9: In the self-test, after `clearSession` the rows are empty and `clearNotice?.count`
-   equals the pre-clear row count; after `clearUndoManager?.undo()` the rows, `selection` and
+   equals the pre-clear row count; after `flowUndoManager.undo()` the rows, `selection` and
    `focused` equal their pre-clear values and `clearNotice == nil`.
-10. AC10: `ClearedFlows.merge(restored: R, newer: N)` returns R followed by N with each N row's
-    `seq` increased by `R.map(\.seq).max()`; `merge(restored: [], newer: N) == N`.
+10. AC10: `ClearedFlows.merge(restored: R, newer: N)` returns R followed by the rows of N whose
+    id is not in R, renumbered gap-free from `R.map(\.seq).max() + 1` (so `#` stays monotonic
+    whatever `seq` the poll gave them); `merge(restored: [], newer: N) == N`.
 11. AC11: On the installed or dev app with a live bus: Clear → the status bar reads "Cleared n
     flows — Undo" → Undo → the n rows are back and stay for at least 2 s (four polls); Edit ▸
     Undo reads "Undo Clear" immediately after a Clear.
 12. AC12: `BarRow`, `HostRow` and `FlowListRow` contain no `onHover`, no `hovered` state and no
-    `Tok.Ground.hover` reference; `HoverRowStyle.swift` is the only file in
-    `Sources/Aitmproxy/Panels` + `UI` that applies `Tok.Ground.hover` to a row.
+    `Tok.Ground.hover`; each is a `HoverRowStyle` button. (`StatTile`, `ScopePanel` and
+    `ConnectionLogPanel` keep their own hover fills: not rows of this wave; a follow-up card.)
 13. AC13: `ColumnFit.autoHidden` with the default widths (dot 24, seq 52, client 96, method 72,
     status 84, time 124, duration 88, request 80, response 80, ssl 40, edited 64, origin 72,
     mark 20, comment 160 user-hidden; `flexibleMin` 200; the seven-id priority) returns `[]`

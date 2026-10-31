@@ -7,6 +7,11 @@ public enum FlowVerb: Hashable, Sendable {
     case resume, edit, kill, delete, replay, editAndReplay, buildPoC
     case resumeSelected, killSelected
     case mark(MarkColor?), comment, pinHost, copyURL, quickLook
+
+    /// The table row a verb belongs to: every mark colour shares the one `Mark` row.
+    public var tableKey: FlowVerb {
+        if case .mark = self { .mark(nil) } else { self }
+    }
 }
 
 /// The menu sections, in order; the row menu puts a separator between groups.
@@ -25,17 +30,14 @@ public struct VerbContext: Sendable {
     public var selectedCount: Int
     /// How many of those are paused (the bulk verbs act on them alone).
     public var selectedPausedCount: Int
-    /// Whether the row is the intercept bar's target (the focused paused row, else the oldest).
-    public var isInterceptTarget: Bool
 
     public init(row: FlowRow, pendingEdits: Int = 0, pinned: Bool = false, selectedCount: Int = 1,
-                selectedPausedCount: Int = 0, isInterceptTarget: Bool = false) {
+                selectedPausedCount: Int = 0) {
         self.row = row
         self.pendingEdits = pendingEdits
         self.pinned = pinned
         self.selectedCount = selectedCount
         self.selectedPausedCount = selectedPausedCount
-        self.isInterceptTarget = isInterceptTarget
     }
 }
 
@@ -63,16 +65,67 @@ public struct VerbItem: Hashable, Sendable {
         self.group = group
         self.disabledReason = disabledReason
     }
+
+    /// The shortcut as a button prints it (foundation §2.7): a bare key as the letter (`e`), a
+    /// chord as its glyphs (`⌘⏎`).
+    public var hint: String? {
+        guard let shortcut else { return key }
+        let bare = !shortcut.command && !shortcut.shift && !shortcut.option && !shortcut.control
+        return bare ? shortcut.key : shortcut.display
+    }
 }
 
 public enum VerbTable {
     /// The verbs in menu order. `nil` is "no row": default titles, every verb disabled.
     public static func items(for context: VerbContext?) -> [VerbItem] {
-        guard let context else {
-            return items(for: nil as FlowRow?, pendingEdits: 0, pinned: false, selectedCount: 1, selectedPausedCount: 0)
+        let row = context?.row
+        let state = row?.state
+        let paused = state == .paused
+        let inFlight = paused || state == .pending
+        let inScope = row?.inScope ?? false
+        let scopeReason = row.flatMap { $0.inScope ? nil : outOfScopeReason($0.authority) }
+        let selectedCount = context?.selectedCount ?? 1
+        let bulkOn = selectedCount > 1 && (context?.selectedPausedCount ?? 0) > 0
+        let bulkCount = selectedCount > 1 ? " \(selectedCount)" : ""
+        let needsPaused = "Only a paused flow can be "
+        let noPausedSelected = "No paused flows in the selection"
+
+        // `off` explains a verb the row's state turns off; the scope reason wins when both apply.
+        func item(_ verb: FlowVerb, _ title: String, key: String? = nil, shortcut: String? = nil, on: Bool = true,
+                  off: String? = nil, group: VerbGroup) -> VerbItem {
+            let enabled = inScope && on
+            let why = row == nil ? nil : (scopeReason ?? (on ? nil : off))
+            return VerbItem(verb: verb, title: title, key: key, shortcut: shortcut.flatMap(Shortcut.init(display:)),
+                            enabled: enabled, group: group, disabledReason: enabled ? nil : why)
         }
-        return items(for: context.row, pendingEdits: context.pendingEdits, pinned: context.pinned,
-                     selectedCount: context.selectedCount, selectedPausedCount: context.selectedPausedCount)
+
+        return [
+            item(.resume, (context?.pendingEdits ?? 0) > 0 ? "Apply & Resume" : "Resume", shortcut: "⌘⏎", on: paused,
+                 off: needsPaused + "resumed", group: .intercept),
+            item(.edit, "Edit Paused Request", key: "e", shortcut: "e", on: paused, off: needsPaused + "edited", group: .intercept),
+            item(.delete, inFlight ? "Kill" : "Delete", key: "d", shortcut: "d", group: .intercept),
+            item(.kill, "Kill", shortcut: "⌘\\", on: paused, off: needsPaused + "killed", group: .intercept),
+            item(.replay, "Replay", key: "r", shortcut: "r", group: .replay),
+            item(.editAndReplay, "Edit & Replay…", shortcut: "⇧R", group: .replay),
+            item(.buildPoC, "Build PoC from Flow…", key: "p", shortcut: "p", group: .replay),
+            item(.resumeSelected, "Resume\(bulkCount) Selected", on: bulkOn, off: noPausedSelected, group: .selection),
+            item(.killSelected, "Kill\(bulkCount) Selected", on: bulkOn, off: noPausedSelected, group: .selection),
+            item(.mark(nil), "Mark", key: "m", group: .annotate),
+            item(.comment, row?.comment == nil ? "Comment…" : "Edit Comment…", key: "c", shortcut: "⌘L", group: .annotate),
+            item(.pinHost, (context?.pinned ?? false) ? "Unpin Host" : "Pin Host", shortcut: "⇧P", group: .host),
+            item(.copyURL, "Copy URL", group: .host),
+            item(.quickLook, "Quick Look Body", key: " ", group: .host),
+        ]
+    }
+
+    /// One verb's row for a context (`nil` context: the default, disabled row). Every `FlowVerb`
+    /// has a row (`.mark(color)` shares `Mark`'s), so this cannot miss.
+    public static func item(_ verb: FlowVerb, for context: VerbContext?) -> VerbItem {
+        let key = verb.tableKey
+        guard let item = items(for: context).first(where: { $0.verb == key }) else {
+            preconditionFailure("VerbTable has no row for \(verb)")
+        }
+        return item
     }
 
     /// The verb a bare key fires, if any of `items` claims it (enabled or not: the caller reports).
@@ -80,9 +133,19 @@ public enum VerbTable {
         items.first { $0.key == key }?.verb
     }
 
+    /// The verb a bare key fires on the focused list; keys are the same for every row.
+    public static func verb(forKey key: String) -> FlowVerb? { keyMap[key] }
+
+    private static let keyMap: [String: FlowVerb] = Dictionary(uniqueKeysWithValues: items(for: nil).compactMap { item in
+        item.key.map { ($0, item.verb) }
+    })
+
+    /// The verbs in the order every surface lists them.
+    public static let order: [FlowVerb] = items(for: nil).map(\.verb)
+
     /// Every title a verb can show, for `CommandMap` and the menu audit.
     public static func titles(_ verb: FlowVerb) -> [String] {
-        switch verb {
+        switch verb.tableKey {
         case .resume: ["Resume", "Apply & Resume"]
         case .edit: ["Edit Paused Request"]
         case .kill: ["Kill"]
@@ -100,60 +163,9 @@ public enum VerbTable {
         }
     }
 
-    public static var allTitles: [FlowVerb: [String]] {
-        Dictionary(uniqueKeysWithValues: order.map { ($0, titles($0)) })
-    }
-
-    /// The verbs in the order every surface lists them.
-    public static let order: [FlowVerb] = [
-        .resume, .edit, .delete, .kill,
-        .replay, .editAndReplay, .buildPoC,
-        .resumeSelected, .killSelected,
-        .mark(nil), .comment,
-        .pinHost, .copyURL, .quickLook,
-    ]
+    public static let allTitles: [FlowVerb: [String]] = Dictionary(uniqueKeysWithValues: order.map { ($0, titles($0)) })
 
     public static func outOfScopeReason(_ authority: String) -> String {
         "Out of scope — add \(authority) to scope to act"
-    }
-
-    private static func items(for row: FlowRow?, pendingEdits: Int, pinned: Bool, selectedCount: Int,
-                              selectedPausedCount: Int) -> [VerbItem] {
-        let state = row?.state
-        let paused = state == .paused
-        let inFlight = paused || state == .pending
-        let inScope = row?.inScope ?? false
-        let reason = row.map { $0.inScope ? nil : outOfScopeReason($0.authority) } ?? nil
-        let bulkOn = selectedCount > 1 && selectedPausedCount > 0
-        let bulkCount = selectedCount > 1 ? " \(selectedCount)" : ""
-
-        // `off` explains a verb the row's state turns off; the scope reason wins when both apply.
-        func item(_ verb: FlowVerb, _ title: String, key: String? = nil, shortcut: String? = nil, on: Bool = true,
-                  off: String? = nil, group: VerbGroup) -> VerbItem {
-            let enabled = row != nil && inScope && on
-            let why = row == nil ? nil : (reason ?? (on ? nil : off))
-            return VerbItem(verb: verb, title: title, key: key, shortcut: shortcut.flatMap(Shortcut.init(display:)),
-                            enabled: enabled, group: group, disabledReason: enabled ? nil : why)
-        }
-        let needsPaused = "Only a paused flow can be "
-        let noPausedSelected = "No paused flows in the selection"
-
-        return [
-            item(.resume, pendingEdits > 0 ? "Apply & Resume" : "Resume", shortcut: "⌘⏎", on: paused,
-                 off: needsPaused + "resumed", group: .intercept),
-            item(.edit, "Edit Paused Request", key: "e", shortcut: "e", on: paused, off: needsPaused + "edited", group: .intercept),
-            item(.delete, inFlight ? "Kill" : "Delete", key: "d", shortcut: "d", group: .intercept),
-            item(.kill, "Kill", shortcut: "⌘\\", on: paused, off: needsPaused + "killed", group: .intercept),
-            item(.replay, "Replay", key: "r", shortcut: "r", group: .replay),
-            item(.editAndReplay, "Edit & Replay…", shortcut: "⇧R", group: .replay),
-            item(.buildPoC, "Build PoC from Flow…", key: "p", shortcut: "p", group: .replay),
-            item(.resumeSelected, "Resume\(bulkCount) Selected", on: bulkOn, off: noPausedSelected, group: .selection),
-            item(.killSelected, "Kill\(bulkCount) Selected", on: bulkOn, off: noPausedSelected, group: .selection),
-            item(.mark(nil), "Mark", key: "m", group: .annotate),
-            item(.comment, row?.comment == nil ? "Comment…" : "Edit Comment…", key: "c", shortcut: "⌘L", group: .annotate),
-            item(.pinHost, pinned ? "Unpin Host" : "Pin Host", shortcut: "⇧P", group: .host),
-            item(.copyURL, "Copy URL", group: .host),
-            item(.quickLook, "Quick Look Body", key: " ", group: .host),
-        ]
     }
 }

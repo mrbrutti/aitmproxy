@@ -86,7 +86,7 @@ extension Session {
     func killSelected() { bulk("Killed") { [self] id in kill(id) } }
 
     func bulk(_ verb: String, _ act: (FlowID) -> Void) {
-        let chosen = rows.filter { selection.contains($0.id) }
+        let chosen = focusedSelectedRows
         let paused = chosen.filter { $0.state == .paused }
         for row in paused { act(row.id) }
         let skipped = chosen.count - paused.count
@@ -94,6 +94,13 @@ extension Session {
     }
 
     var selectedRows: [FlowRow] { rows.filter { selection.contains($0.id) } }
+
+    /// The rows selected in the pane the inspector follows: the split view's second list has
+    /// its own selection, and a verb on one of its rows must count that one.
+    var focusedSelectedRows: [FlowRow] {
+        let selected = focusedPane == 1 ? secondSelection : selection
+        return rows.filter { selected.contains($0.id) }
+    }
 
     func replay(_ id: FlowID) {
         perform("replay") { [self] in
@@ -126,38 +133,58 @@ extension Session {
         perform(on ? "resume capture" : "pause capture") { [self] in try await actions.setCapturing(on) }
     }
 
-    /// Clear asks first when flows are paused (they would be dropped mid-flight). What it drops
-    /// stays in the app for one undo step: Edit ▸ Undo Clear (⌘Z) or the status bar's Undo, which
-    /// shows for `clearNoticeSeconds` (review D2, rule 43).
+    /// Clear asks first when flows are paused (they would be dropped mid-flight). Once the core
+    /// has cleared, what was dropped stays in the app for one undo step — Edit ▸ Undo Clear (⌘Z)
+    /// or the status bar's Undo — for `clearNoticeSeconds`; then the copy is released and the
+    /// step withdrawn, so captured traffic never outlives what the operator was told (D2, rule 43).
     func clearSession(confirm: (Int) -> Bool = { _ in true }) {
         let pausedCount = paused.count
         if pausedCount > 0, !confirm(pausedCount) { return }
         let dropped = ClearedFlows(rows: rows, details: details, wsDetails: wsDetails, l4Details: l4Details,
                                    selection: selection, focused: focused)
         restoredFlows = []
-        perform("clear") { [self] in try await actions.clear() }
-        guard !dropped.rows.isEmpty else { return }
-        clearedFlows = dropped
-        registerUndo("Clear") { $0.undoClear() }
-        clearNotice = ClearNotice(count: dropped.rows.count)
-        clearNoticeTask?.cancel()
-        clearNoticeTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.clearNoticeSeconds))
-            guard !Task.isCancelled else { return }
-            self?.clearNotice = nil
+        forgetClearedFlows()
+        Task { [self] in
+            do {
+                try await actions.clear()
+                lastError = nil
+                if !dropped.rows.isEmpty { offerUndo(for: dropped) }
+            } catch {
+                lastError = "clear: \(BusService.describe(error))"
+            }
         }
     }
 
     static let clearNoticeSeconds: Double = 8
+
+    private func offerUndo(for dropped: ClearedFlows) {
+        clearedFlows = dropped
+        registerClearUndo()
+        clearNotice = ClearNotice(count: dropped.count)
+        clearNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.clearNoticeSeconds))
+            guard !Task.isCancelled else { return }
+            self?.forgetClearedFlows()
+        }
+    }
+
+    /// Releases the dropped copy, withdraws the undo step and hides the notice.
+    func forgetClearedFlows() {
+        clearNoticeTask?.cancel()
+        clearNoticeTask = nil
+        clearedFlows = nil
+        clearNotice = nil
+        // The list's manager holds Clear's step alone; while an undo runs, the manager drops the
+        // step itself and a removal mid-undo is refused.
+        if !flowUndoManager.isUndoing { flowUndoManager.removeAllActions() }
+    }
 
     /// Puts back what the last Clear dropped. The rows and their cached details are the app's
     /// copy: the core has already dropped the flows, so the list and the inspector show them
     /// again, while a verb that needs the core (replay, resume) reports the core's answer.
     func undoClear() {
         guard let dropped = clearedFlows else { return }
-        clearedFlows = nil
-        clearNoticeTask?.cancel()
-        clearNotice = nil
+        forgetClearedFlows()
         restoredFlows = dropped.rows
         rows = ClearedFlows.merge(restored: dropped.rows, newer: rows)
         details.merge(dropped.details) { current, _ in current }
@@ -167,28 +194,26 @@ extension Session {
         focused = dropped.focused
     }
 
-    /// What the verb table needs to know about a row: its drafts, pin state and the
-    /// selection it sits in (`pane` 1 is the split view's second list).
-    func verbContext(for id: FlowID, pane: Int = 0) -> VerbContext? {
+    /// What the verb table needs to know about a row: its drafts, pin state and the selection
+    /// of the list it sits in (the focused pane's; pane 1 is the split view's second list).
+    func verbContext(for id: FlowID) -> VerbContext? {
         guard let row = rows.first(where: { $0.id == id }) else { return nil }
-        let selected = pane == 1 ? secondSelection : selection
-        let chosen = rows.filter { selected.contains($0.id) }
+        let chosen = focusedSelectedRows
         return VerbContext(row: row,
                            pendingEdits: pendingEditCount(id),
                            pinned: isPinned(.host(row.authority)),
                            selectedCount: chosen.count,
-                           selectedPausedCount: chosen.filter { $0.state == .paused }.count,
-                           isInterceptTarget: interceptTarget?.id == id)
+                           selectedPausedCount: chosen.filter { $0.state == .paused }.count)
     }
 
     /// The verb table for a row (every surface's titles, keys and enabled rules).
-    func verbItems(for id: FlowID?, pane: Int = 0) -> [VerbItem] {
-        VerbTable.items(for: id.flatMap { verbContext(for: $0, pane: pane) })
+    func verbItems(for id: FlowID?) -> [VerbItem] {
+        VerbTable.items(for: id.flatMap(verbContext(for:)))
     }
 
     /// One verb item for a row; with no row the default, disabled item.
-    func verbItem(_ verb: FlowVerb, for id: FlowID?, pane: Int = 0) -> VerbItem {
-        verbItems(for: id, pane: pane).first { $0.verb == verb } ?? VerbTable.items(for: nil).first { $0.verb == verb }!
+    func verbItem(_ verb: FlowVerb, for id: FlowID?) -> VerbItem {
+        VerbTable.item(verb, for: id.flatMap(verbContext(for:)))
     }
 
     /// The only entry for a row verb, from the keyboard, the context menu, the Flow menu or the
@@ -196,8 +221,8 @@ extension Session {
     func perform(_ verb: FlowVerb, on id: FlowID) {
         guard let context = verbContext(for: id) else { return }
         let row = context.row
-        let item = VerbTable.items(for: context).first { $0.verb == verb }
-        if let item, !item.enabled {
+        let item = VerbTable.item(verb, for: context)
+        guard item.enabled else {
             lastError = item.disabledReason
             return
         }

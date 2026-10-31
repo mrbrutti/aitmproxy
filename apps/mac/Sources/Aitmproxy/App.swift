@@ -128,38 +128,47 @@ struct FlowCommands: Commands {
         }
         CommandMenu("Flow") {
             // Row verbs read the verb table (titles, shortcuts, enabled); the rest are session intents.
+            // Resume and Kill act on the intercept bar's target, every other verb on the focused row.
+            let focused = session.focused
+            let target = session.interceptTarget?.id
+            let focusedItems = session.verbItems(for: focused)
+            let targetItems = session.verbItems(for: target)
+            let verb: (FlowVerb, FlowID?, [VerbItem]) -> VerbButton = { verb, id, items in
+                VerbButton(item: VerbTable.item(verb, for: nil), items: items, verb: verb) { if let id { session.perform(verb, on: id) } }
+            }
             Button(session.interceptArmed ? "Disarm Intercept" : "Arm Intercept") {
                 session.arm(!session.interceptArmed)
             }
             .keyboardShortcut("i", modifiers: [])
-            VerbButton(session: session, verb: .resume, target: session.interceptTarget?.id)
+            verb(.resume, target, targetItems)
             Button("Resume All") { session.resumeAll() }
                 .keyboardShortcut(.return, modifiers: [.command, .option])
                 .disabled(session.paused.isEmpty)
-            VerbButton(session: session, verb: .edit, target: session.focused)
+            verb(.edit, focused, focusedItems)
             // ⌘Z stays Undo inside the request editor; the item reverts the whole draft.
             Button("Revert to Original") { if let id = session.focused { session.revertDraft(id) } }
                 .disabled(session.focused.map { session.pendingEditCount($0) > 0 } != true)
-            VerbButton(session: session, verb: .kill, target: session.interceptTarget?.id)
+            verb(.kill, target, targetItems)
             Divider()
-            VerbButton(session: session, verb: .replay, target: session.focused)
-            VerbButton(session: session, verb: .editAndReplay, target: session.focused)
+            verb(.replay, focused, focusedItems)
+            verb(.editAndReplay, focused, focusedItems)
             Divider()
-            VerbButton(session: session, verb: .resumeSelected, target: session.focused)
-            VerbButton(session: session, verb: .killSelected, target: session.focused)
-            VerbButton(session: session, verb: .delete, target: session.focused)
-            VerbButton(session: session, verb: .buildPoC, target: session.focused)
+            verb(.resumeSelected, focused, focusedItems)
+            verb(.killSelected, focused, focusedItems)
+            verb(.delete, focused, focusedItems)
+            verb(.buildPoC, focused, focusedItems)
             Divider()
-            Menu(session.verbItem(.mark(nil), for: session.focused).title) {
+            let mark = focusedItems.first { $0.verb == .mark(nil) } ?? VerbTable.item(.mark(nil), for: nil)
+            Menu(mark.title) {
                 ForEach(MarkColor.allCases, id: \.self) { color in
-                    Button(color.title) { if let id = session.focused { session.perform(.mark(color), on: id) } }
+                    Button(color.title) { if let focused { session.perform(.mark(color), on: focused) } }
                 }
                 Divider()
-                Button("Clear Mark") { if let id = session.focused { session.perform(.mark(nil), on: id) } }
+                Button("Clear Mark") { if let focused { session.perform(.mark(nil), on: focused) } }
             }
-            .disabled(!session.verbItem(.mark(nil), for: session.focused).enabled)
-            VerbButton(session: session, verb: .comment, target: session.focused)
-            VerbButton(session: session, verb: .pinHost, target: session.focused)
+            .disabled(!mark.enabled)
+            verb(.comment, focused, focusedItems)
+            verb(.pinHost, focused, focusedItems)
             Button("Add Host to Scope…") { session.addFocusedHostToScope() }
                 .keyboardShortcut("s", modifiers: .shift)
                 .disabled(session.focused == nil)
@@ -176,7 +185,7 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(!session.canDiffSelected)
             // Space on the focused list; a menu shortcut would take Space from every field.
-            VerbButton(session: session, verb: .quickLook, target: session.focused)
+            verb(.quickLook, focused, focusedItems)
         }
         CommandMenu("Proxy") {
             Button("Breakpoint Rules…") { session.rulesVisible = true }
@@ -273,29 +282,38 @@ struct FlowCommands: Commands {
 }
 
 /// One Flow-menu item for a row verb: title, key equivalent and enabled state from `VerbTable`,
-/// so the menu bar can never drift from the row menu or the intercept bar.
+/// so the menu bar can never drift from the row menu or the intercept bar. `items` is the
+/// table for the row the verb acts on, computed once per menu; `item` the default row.
 private struct VerbButton: View {
-    let session: Session
+    var item: VerbItem
+    let items: [VerbItem]
     let verb: FlowVerb
-    let target: FlowID?
+    let action: () -> Void
+
+    init(item: VerbItem, items: [VerbItem], verb: FlowVerb, action: @escaping () -> Void) {
+        self.item = items.first { $0.verb == verb.tableKey } ?? item
+        self.items = items
+        self.verb = verb
+        self.action = action
+    }
 
     var body: some View {
-        let item = session.verbItem(verb, for: target)
-        Button(item.title) { if let target { session.perform(verb, on: target) } }
-            .keyboardShortcut(item.shortcut.map(KeyboardShortcut.init))
+        Button(item.title, action: action)
+            .keyboardShortcut(item.shortcut.flatMap(KeyboardShortcut.init))
             .disabled(!item.enabled)
     }
 }
 
 extension KeyboardShortcut {
-    /// The Kit's `Shortcut` as SwiftUI binds it.
-    init(_ shortcut: Shortcut) {
-        let key: KeyEquivalent = switch shortcut.key {
+    /// The Kit's `Shortcut` as SwiftUI binds it; nil for a key that is not one character.
+    init?(_ shortcut: Shortcut) {
+        guard shortcut.key.count == 1, let character = shortcut.key.first else { return nil }
+        let key: KeyEquivalent = switch character {
         case "\r": .return
         case "\u{8}": .delete
         case " ": .space
         case "\u{1b}": .escape
-        default: KeyEquivalent(Character(shortcut.key))
+        default: KeyEquivalent(character)
         }
         var modifiers: EventModifiers = []
         if shortcut.command { modifiers.insert(.command) }

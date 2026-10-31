@@ -125,20 +125,31 @@ enum SelfTest {
             check("pausing capture flips the state", !session.capturing)
             let beforeClear = session.rows
             let focusBeforeClear = session.focused
+            let selectionBeforeClear = session.selection
             session.clearSession(confirm: { _ in true })
-            await settle { session.rows.isEmpty }
+            await settle { session.rows.isEmpty && session.clearNotice != nil }
             check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
             // D2: Clear keeps one undo step (Edit > Undo Clear) and says so in the status bar.
             check("clear shows the notice with the count and registers Undo Clear",
-                  session.clearNotice?.count == beforeClear.count && session.clearUndoManager?.canUndo == true
-                      && session.clearUndoManager?.undoActionName == "Clear")
-            session.clearUndoManager?.undo()
+                  session.clearNotice?.count == beforeClear.count && session.flowUndoManager.canUndo
+                      && session.flowUndoManager.undoActionName == "Clear")
+            session.flowUndoManager.undo()
             check("undo restores the rows, selection and focused flow",
-                  session.rows == beforeClear && session.focused == focusBeforeClear && session.selection == [focusBeforeClear!],
+                  session.rows == beforeClear && session.focused == focusBeforeClear && session.selection == selectionBeforeClear,
                   "rows \(session.rows.count) of \(beforeClear.count), focused \(String(describing: session.focused))")
-            check("undo dismisses the notice and the step", session.clearNotice == nil && session.clearUndoManager?.canUndo == false)
+            check("undo dismisses the notice and the step", session.clearNotice == nil && !session.flowUndoManager.canUndo)
+            // Marking an out-of-scope row from the keyboard is refused like every other verb.
+            let outOfScope = session.rows.first { !$0.inScope }!
+            session.perform(.mark(.red), on: outOfScope.id)
+            check("a mark colour on an out-of-scope row is refused with the reason",
+                  session.rows.first { $0.id == outOfScope.id }?.mark == nil && session.lastError == VerbTable.outOfScopeReason(outOfScope.authority))
+            session.lastError = nil
             session.clearSession(confirm: { _ in true })
-            await settle { session.rows.isEmpty }
+            await settle { session.rows.isEmpty && session.clearNotice != nil }
+            session.forgetClearedFlows()
+            check("letting the notice lapse releases the copy and the step",
+                  session.clearedFlows == nil && session.clearNotice == nil && !session.flowUndoManager.canUndo,
+                  "copy \(session.clearedFlows == nil) notice \(session.clearNotice == nil) canUndo \(session.flowUndoManager.canUndo)")
 
             // M3: filters, saved filters, sidebar query, palette.
             session.loadFixtures()

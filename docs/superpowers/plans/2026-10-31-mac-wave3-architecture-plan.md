@@ -106,13 +106,13 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
 
 ### Task 3: Clear with Undo
 
-- **Satisfies:** AC7 (`ClearedFlowsTests`, 124 of 124), AC9, AC10, AC11
+- **Satisfies:** AC7 (`ClearedFlowsTests`, 126 of 126), AC9, AC10, AC11
 - **Depends on:** Task 2 (shares `Session+Verbs.swift`)
 - **Files:** `Sources/AitmproxyKit/ClearedFlows.swift` (create),
   `Tests/AitmproxyKitTests/ClearedFlowsTests.swift` (create), `Sources/Aitmproxy/Session.swift`
   (modify: `var clearNotice: ClearNotice?`, `var restoredFlows: [FlowRow] = []`,
   `@ObservationIgnored var clearedFlows: ClearedFlows?`, `@ObservationIgnored var
-  clearNoticeTask: Task<Void, Never>?`, `private(set) var clearUndoManager: UndoManager?`), `Sources/Aitmproxy/Session+Verbs.swift` (modify:
+  clearNoticeTask: Task<Void, Never>?`, `let flowUndoManager: UndoManager`), `Sources/Aitmproxy/Session+Verbs.swift` (modify:
   `clearSession(confirm:)`, new `func undoClear()`, `deleteOrKill` also prunes
   `restoredFlows`), `Sources/Aitmproxy/Bus/BusService.swift` (modify: one assignment in
   `pollLoop`), `Sources/Aitmproxy/Shell/StatusBar.swift` (modify: centre slot),
@@ -123,8 +123,9 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
   and `public struct ClearNotice: Equatable, Sendable { count: Int; text: String }`.
   `clearSession` snapshots before `actions.clear()`, and after success registers
   `undoManager.registerUndo(withTarget: self) { $0.undoClear() }` + `setActionName("Clear")` on
-  `NSApp.keyWindow?.undoManager ?? NSApp.mainWindow?.undoManager ?? <the session's own>`
-  (`Session.registerUndo(_:_:)`, remembered as `clearUndoManager`), sets `clearNotice`, starts an 8 s
+  `Session.flowUndoManager` (the flow list's own manager, no event grouping; `FlowKeyTable`
+  returns it as its `undoManager`, so Edit ▸ Undo Clear / ⌘Z reach it while the list has focus
+  and a text field keeps its typing undo) via `registerClearUndo()`, sets `clearNotice`, starts an 8 s
   `Task.sleep` that nils it. `undoClear()` as spec section 3. `pollLoop`: `let merged =
   ClearedFlows.merge(restored: session.restoredFlows, newer: rows); if merged != session.rows {
   session.rows = merged }`. StatusBar: when `session.clearNotice != nil`, the centre HStack
@@ -135,13 +136,13 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
   prefix `== R`; `ClearedFlows(rows: R, …).count == 2`. Self-test (fixtures, 17 rows, the
   seq-41 row focused at that point): "clear shows the notice with the count" →
   `session.clearNotice?.count == 17`; "undo restores the rows, selection and focused flow" →
-  after `session.clearUndoManager?.undo()` (the Edit ▸ Undo path), `session.rows ==
+  after `session.flowUndoManager.undo()` (the Edit ▸ Undo path), `session.rows ==
   before.rows && session.selection == before.selection && session.focused == before.focused`;
   "undo dismisses the notice and the step" → `session.clearNotice == nil && canUndo == false`. Live (AC11): on the dev bundle against a running `aitm`
   (`AITM_CONFIG=… ./target/release/aitm`, `curl -x 127.0.0.1:8080 http://127.0.0.1:8099/`
   a few times), press Clear → status bar reads "Cleared n flows — Undo" → click Undo → the n
   rows are back and still present after 2 s; Edit ▸ Undo reads "Undo Clear" after a Clear.
-- **Done when:** `swift test` green, the self-test is 124 of 124, the live check passes, and
+- **Done when:** `swift test` green, the self-test is 126 of 126, the live check passes, and
   the `apps` snapshot is still byte-identical (no notice in a snapshot).
 
 ### Task 4: `HoverRowStyle`
@@ -225,13 +226,13 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
 - **Satisfies:** AC7, AC8, AC15 (whole-branch verification)
 - **Depends on:** Tasks 1–6
 - **Files:** `docs/ARCHITECTURE.md` (modify: self-test count "105" → the real count; name the
-  next refactor card, e.g. bus poll when hidden / `Session` split), the plan's Review log
-  (this file)
+  next refactor card, e.g. bus poll when hidden / `Session` split), `apps/mac/docs/review-2026-10-31.md`
+  (modify: a "Wave 3 status" paragraph, as waves 1 and 2 have), the plan's Review log (this file)
 - **Change:** docs only; no source changes except fixes the gate demands.
 - **Test:** the whole gate block in the Overview: `swift test` green (349 + new suites:
   `VerbTableTests` 10, `ClearedFlowsTests` ≥ 3, `ColumnLayoutTests` moved + 6);
   `grid-lint.sh` PASS; `check-layout.swift` PASS on every `*-layout.json` in
-  `/tmp/Aitmproxy-shots-dev-w3`; self-test 124 of 124; the four `cmp` pairs silent; the
+  `/tmp/Aitmproxy-shots-dev-w3`; self-test 126 of 126; the four `cmp` pairs silent; the
   `split` and `activity-log` PNGs looked at in light and dark.
 - **Done when:** every command's output is quoted in the task's report and the branch is
   ready for the stage-6 panel.
@@ -242,6 +243,31 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 3 | security, quality, spec | Critical/Important | A failed `flow.clear` still registered Undo Clear and showed the notice (`perform` is fire-and-forget) | fixed: `clearSession` awaits `actions.clear()` in its own task and offers Undo only on success; a failure leaves `lastError` and nothing else |
+| 3 | security | Important | The dropped flows and the undo step lived until the next Clear, not the 8 s the notice promised | fixed: the notice timer now releases the copy and withdraws the step (`forgetClearedFlows`); self-test check "letting the notice lapse releases the copy and the step" |
+| 3 | spec | Critical | AC11 (live-bus Clear → Undo survives four polls) had no evidence | fixed: `SelfTest+Live.runLive` gains "flow.clear empties the list and offers Undo Clear" and "Undo Clear puts the flows back and they survive four polls"; run against a private `aitm` (see Shipped) |
+| 2 | security, quality | Minor/Important | `perform(.mark(color))` missed the table row (only `.mark(nil)` exists) and so bypassed the scope gate; `m` popped the mark menu without a gate | fixed: `FlowVerb.tableKey`, `VerbTable.item(_:for:)` used by every lookup; the Coordinator checks the row before popping; self-test check "a mark colour on an out-of-scope row is refused with the reason" |
+| 3 | security | Minor | Restored rows kept a frozen `inScope` | fixed: the poll re-scopes `restoredFlows` like polled rows |
+| 3 | security, quality | Minor | Stale "Undo Clear" steps stacked on the undo manager; key-window manager could be a secondary window's | fixed: `removeAllActions(withTarget:)` before each registration; the main window's manager first |
+| 1 | quality | Minor | `VerbContext.isInterceptTarget` read by no rule | fixed: removed from Kit and the spec |
+| 1 | quality | Minor | `VerbTable.order` hand-duplicated the items order, test compared sets | fixed: `order` derived from `items(for: nil)`; test asserts equality |
+| 1, 2 | quality | Minor | Force-unwrapped lookups in `CommandMap.verb` and `Session.verbItem` | fixed: `VerbTable.item(_:for:)`, non-optional by construction (`preconditionFailure` names the verb) |
+| 2 | quality | Minor | `pane:` plumbed but never passed; bulk verbs in the split's second pane gated against pane 0 | fixed: `verbContext` and `bulk` read `focusedSelectedRows` (the focused pane's selection); `pane` parameter gone |
+| 4 | quality, spec | Minor | `HoverRowStyle` added a `0.7` press-opacity literal (not a token, not in the spec) | fixed: removed; the hover fill is the feedback, as the spec lists |
+| 2 | quality | Minor | Intercept bar still typed Kill's title and the three printed hints | fixed: `VerbItem.hint` (bare key as letter, chord as glyphs); the bar reads title and hint from the table |
+| 6 | quality | Minor | Auto-hide threshold ignored the intercell spacing the URL fit subtracts | fixed: spacing folded into `flexibleMin`; Kit test `theFlexibleMinimumIsPartOfTheSum` |
+| 2 | quality | Minor | Flow menu rebuilt the table per item; `FlowKeyTable` rebuilt it per keypress | fixed: items computed once per menu body; `VerbTable.verb(forKey:)` static map |
+| 2 | quality | Minor | `KeyboardShortcut(Shortcut)` trapped on a multi-character key | fixed: failable initialiser |
+| 7 | quality, spec | Important/Minor | `ARCHITECTURE.md` said 105 checks and named no next card | fixed: 126 checks; next cards named (bus poll when hidden, `Session` split) |
+| 7 | spec | Important | `apps/mac/docs/review-2026-10-31.md` changed without being declared | accepted (orchestrator, 2026-10-31): the review doc is where every wave's status lives; added to Task 7's files |
+| 5 | spec | Minor | `ColumnLayoutTests` suite not moved from `ListTests.swift`; AC13's own values and `priority: []` untested | fixed: suite moved; `theSpecsOwnBoundaries` tests 1000/800/500, a user-hidden comment column and an empty priority |
+| 3 | spec | Minor | `ClearedFlows.merge` renumbers gap-free from the newer minimum and drops newer rows with a restored id; AC10 said "add max(R.seq)" | accepted (orchestrator): AC10 amended to the implemented rule; it is what the self-test and the live check exercise |
+| 3 | spec | Minor | AC9 compared the restored selection to `[focused]` | fixed: compared to the captured pre-clear selection |
+| 4 | spec | Minor | AC12's "only file that applies `Tok.Ground.hover` to a row" was false via `ScopePanel`/`ConnectionLogPanel` (pre-existing rows) | accepted (orchestrator): AC12 amended to the three rows; moving the two panels onto `HoverRowStyle` is a follow-up card |
+| 5, 6 | spec | Minor | Tasks 5 and 6 share one commit; `ColumnFit.Column` struct instead of a tuple; `applyAutoHide` folded into `fitColumns` | accepted (orchestrator): the struct names its fields, one fit pass is simpler; recorded here |
+| 3, 4 | spec | Minor | Unrequested additions: `wsDetails`/`l4Details` on `ClearedFlows`, `HoverChevron`, `accessibilityIdentifier("clear-notice")` | accepted (orchestrator): WebSocket and L4 details are part of what Clear drops; the chevron type is how a label reads the environment; the id is for computer-use |
+| 7 | spec | Minor | `check-layout` output not kept | fixed: `/tmp/w3-check-layout.log` |
+| 2, 4 | spec | Important | AC8 byte identity: the harness moves the inspector dividers between runs of one binary, and `overview` showed a hover fill on a `HostRow` in one run | see Shipped: equal-launch pointer-parked comparison |
 
 ## Shipped
 

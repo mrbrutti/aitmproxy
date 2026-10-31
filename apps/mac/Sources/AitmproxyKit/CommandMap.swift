@@ -118,12 +118,11 @@ public enum CommandMap {
         func one(_ title: String, _ shortcut: String?) -> [I] { [I([title], shortcut.flatMap(Shortcut.init(display:)))] }
         func toggle(_ titles: [String], _ shortcut: String?) -> [I] { [I(titles, shortcut.flatMap(Shortcut.init(display:)))] }
         // A row verb's titles, key equivalent and list key come from the verb table, never retyped here.
-        let verbs = VerbTable.items(for: nil)
         func verb(_ v: FlowVerb) -> [I] {
-            let item = verbs.first { $0.verb == v }!
+            let item = VerbTable.item(v, for: nil)
             return [I(VerbTable.titles(v), item.shortcut ?? item.key.map { Shortcut($0) })]
         }
-        func listKey(_ v: FlowVerb) -> String? { verbs.first { $0.verb == v }?.key }
+        func listKey(_ v: FlowVerb) -> String? { VerbTable.item(v, for: nil).key }
         let chips = ["All", "HTTP", "HTTPS", "WebSocket", "h1", "h2", "JSON", "Form", "XML"]
         return [
             E("File", "Compose Request…", "⌘N (`n`)", items: one("Compose Request…", "⌘N"), listKey: "n"),
