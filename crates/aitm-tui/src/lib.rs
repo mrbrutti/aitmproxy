@@ -251,6 +251,10 @@ pub const CORE_TOOLS: &[&str] = &[
     "proxy.pause",
     "proxy.resume",
     "config.get",
+    // capture.status (spec 2026-10-31-capture-status-verb-design): the macOS NE
+    // capture feeder's read-only state (Sensitivity::Read), registered on every
+    // platform.
+    "capture.status",
     "browser.navigate",
     "browser.click",
     "browser.type",
