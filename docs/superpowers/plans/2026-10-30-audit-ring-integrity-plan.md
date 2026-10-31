@@ -183,7 +183,7 @@ guard there. Test first: both tests fail on the code at the start of the task. E
 values: `declared_client_label("web-bridge")` is exactly `Some("web-bridge (declared)")`;
 `web-bridge` + 54 U+17B4 yields `web-bridge` + 43 U+17B4 + ` (declared)` (64 chars) and is
 the same label on the ring entry and at the host; `web` + 54 U+17B4 + `-bridge` yields
-`web` + 50 U+17B4 with no suffix (the cut head no longer reads as the name). Independent
+`web` + 50 U+17B4 with no suffix (the cut head no longer reads as the name); `web` + 40 U+17B4 + `-bridge` (50 chars, nothing is cut) yields `web` + 40 U+17B4 + `-bridge (declared)`. The fix also corrects two comments in the same file (the `sanitize_client_label` doc, "up to about 10 characters over the cap", and the test comment "For these inputs, sanitising a sanitised label changes nothing") and adds the private helpers `DECLARED_SUFFIX` and `reads_as_reserved`. Independent
 of every other task (all are done); the spec and plan text amendments of the same round
 (AC9, AC33, AC36, Intent, Residuals 4, 11, 13, 14, Review log) are the Architect's and
 touch only these two documents. After it: Tester and the panel run again, with the
@@ -742,48 +742,68 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason / accepted by the orchestrator under Matt's standing instruction, to countersign) |
 |---|---|---|---|---|
-| whole branch (round 1) | security | Important | `closing_quote` lets a later quoted secret through (an unclosed or escaped-closer quote swallows the next pair's opening quote) | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec AC36 |
-| whole branch (round 1) | security | Minor | Pair-separator blanks are ASCII only, weaker than the old `\s*` | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec AC37 |
-| whole branch (round 1) | security | Minor | Docs claim isolation the source table does not give | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): docs qualified, residuals added |
-| whole branch (round 1) | security | Minor | Invisible-character set incomplete (reserved-name guard bypassable with padding) | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec AC38 |
-| whole branch (round 1) | quality | Minor | Fair-share doc comment wrong | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b) |
-| whole branch (round 1) | quality | Minor | Sanitiser idempotence claim not literally true | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): doc, spec wording, new test |
-| whole branch (round 1) | quality | Minor | `since` filter on `recent` untested | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): new test |
+| whole branch (round 1) | security | Important | `closing_quote` lets a later quoted secret through (an unclosed or escaped-closer quote swallows the next pair's opening quote) | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): spec AC36 |
+| whole branch (round 1) | security | Minor | Pair-separator blanks are ASCII only, weaker than the old `\s*` | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): spec AC37 |
+| whole branch (round 1) | security | Minor | Docs claim isolation the source table does not give | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): docs qualified, residuals added |
+| whole branch (round 1) | security | Minor | Invisible-character set incomplete (reserved-name guard bypassable with padding) | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): spec AC38 |
+| whole branch (round 1) | quality | Minor | Fair-share doc comment wrong | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6) |
+| whole branch (round 1) | quality | Minor | Sanitiser idempotence claim not literally true | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): doc, spec wording, new test |
+| whole branch (round 1) | quality | Minor | `since` filter on `recent` untested | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): new test |
 | whole branch (round 1) | quality | Minor | AC23 floor assertion loose | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: the spec's floor is the contract |
-| whole branch (round 1) | quality | Minor | Loop-table tests stop at the first failing row | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): for the new tests only |
-| whole branch (round 1) | quality | Minor | `ends_value` and `closing_quote` duplicated in core and scanner | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): cross-reference comments; consolidation is the named follow-up "scanner vocabulary consolidation" |
-| whole branch (round 1) | quality | Minor | Stale or overclaiming doc comments | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b) |
+| whole branch (round 1) | quality | Minor | Loop-table tests stop at the first failing row | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): for the new tests only |
+| whole branch (round 1) | quality | Minor | `ends_value` and `closing_quote` duplicated in core and scanner | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): cross-reference comments; consolidation is the named follow-up "scanner vocabulary consolidation" |
+| whole branch (round 1) | quality | Minor | Stale or overclaiming doc comments | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6) |
 | whole branch (round 1) | quality | Minor | `Lane::insert` does needless work | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: about 0.8 us per append under the mutex, off the hot path |
-| whole branch (round 1) | spec | Minor | Module doc lacks the label rules | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b) |
-| whole branch (round 1) | spec | Minor | Newline blanks in the pair pass not in the spec | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): spec text (Design 4, Residual risk 6) |
-| whole branch (round 1) | spec | Minor | Residual risk not documented | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): residuals added |
+| whole branch (round 1) | spec | Minor | Module doc lacks the label rules | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6) |
+| whole branch (round 1) | spec | Minor | Newline blanks in the pair pass not in the spec | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): spec text (Design 4, Residual risk 6) |
+| whole branch (round 1) | spec | Minor | Residual risk not documented | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): residuals added |
 | whole branch (round 1) | spec | Minor | Extra tests and a doc clause beyond the spec | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: tests and doc only |
-| whole branch (round 1) | spec | Minor | Spec and plan statements not literally true | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): wording |
-| whole branch (round 2) | spec | Important | AC36, AC37 and AC38 test names in the spec and plan differ from the tests as built | fixed in 56819ce (fix task 2; docs 0ca66fe): spec and plan aligned to the built names (AC36 lists all three tests, AC38 both) |
-| whole branch (round 2) | spec | Important | AC38 test gap: no negative control and no check over the whole dropped set | fixed in 56819ce (fix task 2; docs 0ca66fe): negative controls (`webbridges`, `aitm-mac\u{3164}`) and a loop over the dropped set added (`sanitize_client_label_drops_every_invisible_character`) |
-| whole branch (round 2) | spec | Minor | Design 4 and plan Task 2 text out of step with the code (key run, end-of-value set, "stricter of the two" claim, built signatures) | fixed in 56819ce (fix task 2; docs 0ca66fe): spec Design 4, plan Task 2 note |
-| whole branch (round 2) | spec | Minor | Isolation overclaims in the spec itself | fixed in 56819ce (fix task 2; docs 0ca66fe): spec Goals, Design 1 (floor, why both lanes), Semantics table, Residual risks 2, Summary |
-| whole branch (round 2) | spec | Minor | Wording leftovers (doc strings) | fixed in 56819ce (fix task 2; docs 0ca66fe) |
+| whole branch (round 1) | spec | Minor | Spec and plan statements not literally true | fixed in 9a5aa0b (fix task 1; spec amendment 56df5b6): wording |
+| whole branch (round 2) | spec | Important | AC36, AC37 and AC38 test names in the spec and plan differ from the tests as built | fixed in 1798ec6 (fix task 2; docs 55e8da7): spec and plan aligned to the built names (AC36 lists all three tests, AC38 both) |
+| whole branch (round 2) | spec | Important | AC38 test gap: no negative control and no check over the whole dropped set | fixed in 1798ec6 (fix task 2; docs 55e8da7): negative controls (`webbridges`, `aitm-mac\u{3164}`) and a loop over the dropped set added (`sanitize_client_label_drops_every_invisible_character`) |
+| whole branch (round 2) | spec | Minor | Design 4 and plan Task 2 text out of step with the code (key run, end-of-value set, "stricter of the two" claim, built signatures) | fixed in 1798ec6 (fix task 2; docs 55e8da7): spec Design 4, plan Task 2 note |
+| whole branch (round 2) | spec | Minor | Isolation overclaims in the spec itself | fixed in 1798ec6 (fix task 2; docs 55e8da7): spec Goals, Design 1 (floor, why both lanes), Semantics table, Residual risks 2, Summary |
+| whole branch (round 2) | spec | Minor | Wording leftovers (doc strings) | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
 | whole branch (round 2) | security | Minor | A quoted key opener directly after an unclosed quote that ends in `=` or `:` can still be swallowed | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: a narrow regression versus the old regex for text where an unclosed `=`/`:`-ending quote sits directly before a victim's quoted key; accepted as Residual risks 12 (the old regex leaked the simpler adjacent `token= "password":"V"` identically) |
-| whole branch (round 2) | security | Minor | Reserved-name guard bypassable with invisible code points outside the dropped set | fixed in 56819ce (fix task 2; docs 0ca66fe): skeleton comparison, spec Design 2 item 3, AC38 |
-| whole branch (round 2) | quality | Minor | Q1: the padded-value table did not pin the end-of-value set (5 mutants survived) | fixed in 56819ce (fix task 2; docs 0ca66fe): five rows added, all five mutants killed |
-| whole branch (round 2) | quality | Minor | Q2: the per-quote-character memo was untested | fixed in 56819ce (fix task 2; docs 0ca66fe): two-quote rows added (`a_token="x b_token='y z' c` and its mirror) |
-| whole branch (round 2) | quality | Minor | Q3: the memo soundness comment omitted the invariant | fixed in 56819ce (fix task 2; docs 0ca66fe) |
-| whole branch (round 2) | quality | Minor | Q4: the "keep in step" comments were inaccurate | fixed in 56819ce (fix task 2; docs 0ca66fe) |
-| whole branch (round 2) | quality | Minor | Q5: the reason-cap docs said 1024 where the stored reason can be 1027 bytes | fixed in 56819ce (fix task 2; docs 0ca66fe): docs say "plus a one-character marker" |
+| whole branch (round 2) | security | Minor | Reserved-name guard bypassable with invisible code points outside the dropped set | fixed in 1798ec6 (fix task 2; docs 55e8da7): skeleton comparison, spec Design 2 item 3, AC38 |
+| whole branch (round 2) | quality | Minor | Q1: the padded-value table did not pin the end-of-value set (5 mutants survived) | fixed in 1798ec6 (fix task 2; docs 55e8da7): five rows added, all five mutants killed |
+| whole branch (round 2) | quality | Minor | Q2: the per-quote-character memo was untested | fixed in 1798ec6 (fix task 2; docs 55e8da7): two-quote rows added (`a_token="x b_token='y z' c` and its mirror) |
+| whole branch (round 2) | quality | Minor | Q3: the memo soundness comment omitted the invariant | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
+| whole branch (round 2) | quality | Minor | Q4: the "keep in step" comments were inaccurate | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
+| whole branch (round 2) | quality | Minor | Q5: the reason-cap docs said 1024 where the stored reason can be 1027 bytes | fixed in 1798ec6 (fix task 2; docs 55e8da7): docs say "plus a one-character marker" |
 | whole branch (round 2) | quality | Minor | Q6: a next key with only a closing quote (`password'=`; `password='x password'=S3CR3T` leaves `S3CR3T`) | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: malformed input only (11 regressions in a differential of 3M random malformed strings, all of one shape: an unclosed value quote then a later key with only a closing quote, `password'=` or `api_key"=`), the doc is softened; Residual risks 13 |
-| whole branch (round 2) | quality | Minor | Q7: `is_host_port` accepts only ASCII terminators | fixed in 56819ce (fix task 2; docs 0ca66fe): doc-only, the behaviour is stated (now recorded in spec Residual risks 11) |
-| whole branch (round 2) | quality | Minor | Q8: new-test hygiene | fixed in 56819ce (fix task 2; docs 0ca66fe) |
-| whole branch (round 2) | quality | Minor | Q9: the `agent.activity` description was full of jargon | fixed in 56819ce (fix task 2; docs 0ca66fe): shortened to the caller-relevant points, detail moved to doc comments (spec AC33) |
-| whole branch (round 3) | security | Minor | The ` (declared)` suffix is cut away at consumption: a padded lookalike of 62 to 64 chars loses it when the server re-sanitises the stored label to 64 chars | fixed in fix task 3 (sha filled at integration): `declared_client_label` stays within 64 chars including the suffix; spec Design 2 item 3, AC39, AC40 |
-| whole branch (round 3) | spec | Important | The same finding (suffix cut at consumption, found independently) | fixed in fix task 3 (sha filled at integration): spec Design 2 item 3, AC39, AC40 |
-| whole branch (round 3) | spec | Minor | Minors 2 to 7 of the round-3 spec report: wording leftovers; AC9, AC36, Intent and AC33 out of step with the tests and docs as built; Residual risks 13 and 14 (a count, and a new behaviour filed as pre-existing); the Residual 12 log row ("no new capability"); Review log traceability | fixed in fix task 3 (sha filled at integration): spec and plan text only (AC9, AC36, Intent, AC33, Residual risks 11, 13 and 14, the Residual 12 log row, one Review log row per finding) |
-| whole branch (round 3) | tester | Important | F1: the same finding (suffix cut at consumption), found independently | fixed in fix task 3 (sha filled at integration): AC39, AC40 |
-| whole branch (round 3) | tester | n/a | Added 33 tests that kill 49 surviving mutants of the ring, labels, caps and redaction | added in 29980be (tests only) |
+| whole branch (round 2) | quality | Minor | Q7: `is_host_port` accepts only ASCII terminators | fixed in 1798ec6 (fix task 2; docs 55e8da7): doc-only, the behaviour is stated (now recorded in spec Residual risks 11) |
+| whole branch (round 2) | quality | Minor | Q8: new-test hygiene | fixed in 1798ec6 (fix task 2; docs 55e8da7) |
+| whole branch (round 2) | quality | Minor | Q9: the `agent.activity` description was full of jargon | fixed in 1798ec6 (fix task 2; docs 55e8da7): shortened to the caller-relevant points, detail moved to doc comments (spec AC33) |
+| whole branch (round 3) | security | Minor | The ` (declared)` suffix is cut away at consumption: a padded lookalike of 62 to 64 chars loses it when the server re-sanitises the stored label to 64 chars | fixed in fix task 3 (21c52c7): `declared_client_label` stays within 64 chars including the suffix; spec Design 2 item 3, AC39, AC40 |
+| whole branch (round 3) | spec | Important | The same finding (suffix cut at consumption, found independently) | fixed in fix task 3 (21c52c7): spec Design 2 item 3, AC39, AC40 |
+| whole branch (round 3) | spec | Minor | Round-3 spec Minor 2: wording leftovers in audit.rs ("within a few characters of the cap", "Idempotent" test comment) | fixed in fix task 3 (21c52c7): doc now says "up to about 10 characters over the cap", comment says "For these inputs ..." |
+| whole branch (round 3) | spec | Minor | Round-3 spec Minor 3: AC9 and plan Task 2 name a test that no longer holds the 1 MiB `sid='x ` row | fixed in fix task 3 (21c52c7; docs 35a09bf): AC9 and plan Task 2 point at `scrub_text_stays_linear_when_quotes_open_but_never_close` |
+| whole branch (round 3) | spec | Minor | Round-3 spec Minor 4: AC36 text describes inputs and a template the tests do not have | fixed in fix task 3 (docs 35a09bf): AC36 lists the six rows and the five end-of-value rows actually asserted |
+| whole branch (round 3) | spec | Minor | Round-3 spec Minor 5: Intent still overclaims isolation; the shortened `agent.activity` description no longer matches AC33 | fixed in fix task 3 (docs 35a09bf): Intent qualified like Goals; AC33 reworded to the three places that carry the detail |
+| whole branch (round 3) | spec | Minor | Round-3 spec Minor 6: Residual 14 filed a new behaviour as pre-existing; Residual 13's count; Residual 12 log row said "no new capability" | fixed in fix task 3 (docs 35a09bf): host:port terminator folded into Residual 11, count corrected to 11 in 3M, Residual 12 row reworded |
+| whole branch (round 3) | spec | Minor | Round-3 spec Minor 7: the Review log bundled findings, carried placeholder SHAs, and the accepted rows need Matt's countersignature | fixed in fix task 3 (docs 35a09bf) and round 4 (this table: one row per finding, post-rebase SHAs); the countersignature on every row marked "accepted by the orchestrator" is requested in the PR description |
+| whole branch (round 3) | tester | Important | F1: the same finding (suffix cut at consumption), found independently | fixed in fix task 3 (21c52c7): AC39, AC40 |
+| whole branch (round 3) | tester | n/a | Added 33 tests that kill 49 surviving mutants of the ring, labels, caps and redaction | added in 3b53287 (tests only) |
+| whole branch (round 4) | security | n/a | Final narrow review of fix task 3: no Critical, Important or Minor findings (100M-row sweep over every Unicode scalar as the pad character, 0 counterexamples to the AC40 properties) | n/a: verdict PASS |
+| whole branch (round 4) | spec | Minor | Round-3 findings 2-7 shared one Review-log row | fixed in round 4 (this table): split into one row per finding |
+| whole branch (round 4) | spec | Minor | Review-log SHAs referred to pre-rebase commits and the round-3 rows had none | fixed in round 4: post-rebase SHAs (9a5aa0b, 56df5b6, 1798ec6, 55e8da7, 3b53287, 21c52c7) |
+| whole branch (round 4) | spec | Minor | Plan "Fix task 3" listed two of AC39's three rows and omitted the doc/comment edits | fixed in round 4: third row and the comment edits added to the plan text |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7. Follow-ups already named by
+**Shipped by this change** (branch `claude/competent-cori-43f38a`, rebased on `main` at `ff77d9f`, PR opened from it): the
+audit ring has an evidence lane and a routine lane with per-source fair-share eviction and a bounded source table;
+`record_audit` routes by registry sensitivity and outcome; client labels are sanitised (control and invisible
+characters dropped, scrubbed, 64 chars) at capture and consumption, bridge connections carry the server-minted
+`web-bridge`, and a declared reserved name is rewritten with a skeleton comparison; error reasons are capped; the PoC
+builder's secret vocabulary is the single shared one in `aitm-core` and `scrub_text`'s pair pass is a linear
+quote-aware scan. **Cut:** `durable_audit` wiring, a trusted-control Read exemption, a per-origin ring, scanner
+consolidation. **Verification:** the full gate (fmt, clippy, `cargo test`) is green on the rebased head; the socket
+tests ran in the Terminal panel; three panel rounds plus a narrow fourth; the Tester's 33 added tests kill 49
+mutants. **Open:** Matt's countersignature on the Minors marked "accepted by the orchestrator" (listed in the PR).
+
+What merged, what was cut, follow-ups. Follow-ups already named by
 the spec: "durable audit wiring" (config key, path, rotation, 0600, blocking I/O),
 "scanner vocabulary consolidation" (the scanner drops its own `redact_needle_pairs` and
 pre-pass, shares one `ends_value`/`closing_quote` with core, and fixes its stale doc
@@ -794,7 +814,7 @@ which lack core's opener-shaped rule and Unicode whitespace), "regenerate the to
 `agent.status` descriptions; `docs/research/mcp-tool-catalog.txt` still holds the old
 text), "agent-stream filtering" (the
 `notifications/aitm/agent` push for routine entries), and the PR 145 follow-ups that
-remain ("tui-mode governance", "unified agent hub", "configurable startup policy").
+remain ("unified agent hub", "configurable startup policy"; "tui-mode governance" has since landed on `main` as PR 162).
 Follow-ups found by the panel: the `server.rs` doc comments still say the durable sink
 is "opt-in by config", but no such config key exists (fix them in the "durable audit
 wiring" spec); consider tightening `is_host_port` in `redact.rs` so that it
