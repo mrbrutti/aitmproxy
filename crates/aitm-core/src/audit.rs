@@ -29,6 +29,16 @@ pub const DEFAULT_AUDIT_CAPACITY: usize = 4096;
 /// bound.
 pub const DEFAULT_ARGS_SUMMARY_CAP: usize = 512;
 
+/// The most bytes a connection's client label may keep (see [`cap_client_label`]).
+/// The label is copied into every audit entry the connection makes, so an
+/// unbounded one multiplies by the ring capacity.
+pub const MAX_CLIENT_LABEL_BYTES: usize = 128;
+
+/// How much of a client name [`cap_client_label`] hands to the secret scrubber:
+/// at least four times the cap, so a secret that starts inside the kept 128 bytes
+/// always starts inside the window, and the scrub work does not grow with the name.
+const CLIENT_LABEL_SCRUB_WINDOW_BYTES: usize = 512;
+
 /// The outcome of one recorded invocation: it ran (`Ok`) or it was refused /
 /// failed, carrying the human reason (`Error`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +145,56 @@ pub fn origin_label(frontend: Frontend) -> &'static str {
         Frontend::Mcp => "mcp",
         Frontend::Operator => "operator",
     }
+}
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a char
+/// boundary, so the cut never splits a multi-byte character.
+fn prefix_at_char_boundary(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The one place a client-declared name becomes a connection's client label.
+///
+/// A name arrives from the peer (`clientInfo.name`, up to a whole message long),
+/// is copied into every audit entry the connection makes, and is rendered in
+/// operator tables and written to logs. This bounds it and makes it safe to show.
+/// Truncates, never refuses: a client with a long name keeps working. In order:
+///
+/// 1. `None` if `name` is empty.
+/// 2. Every control character becomes `?`, so an escape sequence cannot drive a
+///    terminal that prints the label.
+/// 3. The text is cut to a 512-byte window at a char boundary, which bounds the
+///    work of the next step however long the name is.
+/// 4. [`crate::redact::scrub_text`] masks credential material (`token=abc` becomes
+///    `token=[redacted]`) so a secret in a name never reaches the ring, the push
+///    or the durable log.
+/// 5. The scrubbed text is cut at the last char boundary at or below
+///    [`MAX_CLIENT_LABEL_BYTES`] bytes, with no ellipsis.
+///
+/// The final cut is after the scrub on purpose: masking lengthens text
+/// (`token=a,` is 8 bytes, `token=[redacted],` is 17), so cutting first could
+/// leave a result over the cap.
+pub fn cap_client_label(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return None;
+    }
+    // Steps 2 and 3 in one pass that stops at the window, so a name of any
+    // length costs at most one window of work and memory: the result is the
+    // control-replaced text cut at the last char boundary at or below the window.
+    let mut window = String::with_capacity(CLIENT_LABEL_SCRUB_WINDOW_BYTES);
+    for c in name.chars() {
+        let c = if c.is_control() { '?' } else { c };
+        if window.len() + c.len_utf8() > CLIENT_LABEL_SCRUB_WINDOW_BYTES {
+            break;
+        }
+        window.push(c);
+    }
+    let scrubbed = crate::redact::scrub_text(&window);
+    Some(prefix_at_char_boundary(&scrubbed, MAX_CLIENT_LABEL_BYTES).to_string())
 }
 
 /// Where audit entries go. The in-memory [`AuditRing`] implements it (always on);
@@ -417,6 +477,70 @@ mod tests {
         };
         assert_eq!(m.get("connection_id"), Some(&Value::Null));
         assert_eq!(m.len(), 7);
+    }
+
+    #[test]
+    fn cap_client_label_cuts_ascii_at_128() {
+        let label = cap_client_label(&"x".repeat(300)).expect("non-empty name");
+        assert_eq!(label.len(), 128);
+        assert_eq!(label, "x".repeat(128));
+    }
+
+    #[test]
+    fn cap_client_label_cuts_on_a_char_boundary() {
+        // 2-byte chars: 128 is a boundary, so 64 whole chars fit.
+        let two = cap_client_label(&"é".repeat(100)).expect("non-empty name");
+        assert_eq!(two.len(), 128);
+        assert_eq!(two.chars().count(), 64);
+
+        // 3-byte chars: 128 falls inside the 43rd char, so the cut backs up to 126.
+        let three = cap_client_label(&"€".repeat(50)).expect("non-empty name");
+        assert_eq!(three.len(), 126);
+        assert_eq!(three.chars().count(), 42);
+    }
+
+    #[test]
+    fn cap_client_label_survives_the_window_boundary() {
+        // 900 bytes of 3-byte chars: the 512-byte window falls inside the 171st
+        // char, so it backs up to 510; the final cut then gives 126.
+        let label = cap_client_label(&"€".repeat(300)).expect("non-empty name");
+        assert_eq!(label.len(), 126);
+        assert_eq!(label.chars().count(), 42);
+    }
+
+    #[test]
+    fn cap_client_label_leaves_a_short_name() {
+        assert_eq!(cap_client_label("aitm-mac"), Some("aitm-mac".to_string()));
+    }
+
+    #[test]
+    fn cap_client_label_replaces_control_chars() {
+        assert_eq!(
+            cap_client_label("a\u{1b}[31mred"),
+            Some("a?[31mred".to_string())
+        );
+    }
+
+    #[test]
+    fn cap_client_label_scrubs_secrets() {
+        let label = cap_client_label("agent token=abc123").expect("non-empty name");
+        assert!(label.contains("token=[redacted]"), "{label}");
+        assert!(!label.contains("abc123"), "{label}");
+    }
+
+    #[test]
+    fn cap_client_label_cuts_after_the_scrub() {
+        // 320 bytes in; masking turns each `token=a,` (8 bytes) into
+        // `token=[redacted],` (17 bytes), about 680 bytes. Cutting before the
+        // scrub would leave 272 bytes, so only a cut after it is within 128.
+        let label = cap_client_label(&"token=a,".repeat(40)).expect("non-empty name");
+        assert!(label.len() <= 128, "{} bytes: {label}", label.len());
+        assert_eq!(label, format!("{}token=[re", "token=[redacted],".repeat(7)));
+    }
+
+    #[test]
+    fn cap_client_label_empty_is_none() {
+        assert_eq!(cap_client_label(""), None);
     }
 
     #[test]
