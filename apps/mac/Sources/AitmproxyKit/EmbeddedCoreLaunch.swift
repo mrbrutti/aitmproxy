@@ -186,6 +186,13 @@ public enum EmbeddedCoreLaunch {
         /// upstream certificate (operator opt-in from Settings ▸ Proxy; a footgun
         /// for reaching self-signed servers, never for untrusted networks).
         public var sslInsecure: Bool
+        /// When true, emit a top-level `macos_capture.enabled: true` so the core
+        /// runs the Network Extension feeder. This is the core's deny-by-default
+        /// on-switch, config-file-only by design: the operator flips it from the
+        /// app and the manager re-reads it on every spawn, so a core restart is
+        /// what applies the change (TG-AC1/TG-AC2). Off by default; nothing is
+        /// emitted when false so the core parses its disabled default.
+        public var captureEnabled: Bool
 
         public init(
             obscuraBinary: URL,
@@ -194,7 +201,8 @@ public enum EmbeddedCoreLaunch {
             token: String,
             operatorToken: String,
             endpointFile: URL,
-            sslInsecure: Bool = false
+            sslInsecure: Bool = false,
+            captureEnabled: Bool = false
         ) {
             self.obscuraBinary = obscuraBinary
             self.proxyPort = proxyPort
@@ -203,6 +211,7 @@ public enum EmbeddedCoreLaunch {
             self.operatorToken = operatorToken
             self.endpointFile = endpointFile
             self.sslInsecure = sslInsecure
+            self.captureEnabled = captureEnabled
         }
 
         /// The `config.yaml` body. The bus binds `port: 0` (ephemeral, so it
@@ -241,7 +250,16 @@ public enum EmbeddedCoreLaunch {
             // `ssl_insecure` is a top-level config key (sibling of `listen`); the core's
             // `deny_unknown_fields` rejects any wrapper object, so it must stay unindented.
             // Emitted only when the operator opts out of upstream TLS verification.
-            return sslInsecure ? base + "\nssl_insecure: true\n" : base
+            var body = sslInsecure ? base + "\nssl_insecure: true\n" : base
+            // `macos_capture` is likewise a top-level section (sibling of `listen`/`mcp`/
+            // `browser`) with `enabled` indented two spaces. Emitted only when the
+            // operator has turned capture on; when off, nothing is written so the core
+            // keeps its disabled default. The text is byte-for-byte the input of the
+            // core's `config_file.rs` `macos_capture_enable_round_trips` test.
+            if captureEnabled {
+                body += "\nmacos_capture:\n  enabled: true\n"
+            }
+            return body
         }
     }
 

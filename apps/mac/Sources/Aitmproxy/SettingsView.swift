@@ -26,6 +26,7 @@ struct SettingsView: View {
             case .general: GeneralSettings()
             case .bus: BusSettings()
             case .proxy: ProxySettings()
+            case .capture: CaptureSettings()
             case .appearance: AppearanceSettings()
             }
         }
@@ -37,7 +38,10 @@ struct SettingsView: View {
 
 /// The Settings tabs. Snapshot mode walks through every case.
 enum SettingsTab: String, CaseIterable, Identifiable {
-    case general, bus, proxy, appearance
+    case general, bus, proxy
+    /// L4 capture: the operator's on/off, its state, and the extension's uninstall.
+    case capture
+    case appearance
 
     var id: String { rawValue }
 
@@ -46,6 +50,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: "General"
         case .bus: "Bus"
         case .proxy: "Proxy"
+        case .capture: "Capture"
         case .appearance: "Appearance"
         }
     }
@@ -55,6 +60,7 @@ enum SettingsTab: String, CaseIterable, Identifiable {
         case .general: "gearshape"
         case .bus: "network"
         case .proxy: "lock.shield"
+        case .capture: "antenna.radiowaves.left.and.right"
         case .appearance: "paintpalette"
         }
     }
@@ -73,7 +79,6 @@ struct GeneralSettings: View {
             }
             Toggle("Auto-select new flows", isOn: $session.autoSelect)
         }
-        CaptureSettings()
     }
 }
 
@@ -199,28 +204,64 @@ struct ProxySettings: View {
     }
 }
 
-/// The macOS capture extension's state and its uninstall (Task 17, NE-AC15), on the
-/// General tab. Reads the capability the `ExtensionController` pushes into
-/// `CoreHealthState`; hidden when there is no extension to report on (a development
-/// build, fixture and snapshot runs, and after an uninstall).
+/// Settings ▸ Capture: the operator's switch for L4 capture on this Mac, what the capture
+/// extension is doing, and its uninstall (Task 17, NE-AC15). Capture is off until the
+/// operator turns it on here or with Proxy ▸ Enable Capture. Reads the capability the
+/// `ExtensionController` pushes into `CoreHealthState`. With no extension in this build
+/// (a development build, fixture and snapshot runs) the controls give way to a note: a
+/// toggle that does nothing is never shown.
 ///
-/// Uninstall is the operator's button and nothing else: there is no bus, MCP or
-/// `Session` verb for it (the controller documents why).
+/// Turning capture on or off, and uninstalling, are the operator's controls and nothing
+/// else: there is no bus, MCP or `Session` verb for them (the controller documents why).
+/// `CaptureSwitch` holds the steps, shared with the menu command.
+///
+/// Like Settings ▸ Proxy, the toggle is live only while the embedded core is the active
+/// one: capture is the embedded core's `macos_capture` gate, and turning it on restarts
+/// that core, which an external choice must not do. With an external core active the toggle
+/// is disabled and a note says where to change it.
 struct CaptureSettings: View {
     @Environment(Session.self) private var session
+    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    /// The persisted choice, `false` until the operator turns capture on. Read here only:
+    /// `CaptureSwitch` writes it, at the point in its steps where it must be written.
+    @AppStorage("capture.enabled") private var captureEnabled = false
     @State private var confirming = false
     @State private var removing = false
 
+    private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
+
     var body: some View {
-        let capability = session.coreHealth.captureCapability
-        if capability.isInstalledOrInstalling {
-            Section("Capture") {
-                LabeledContent(capability.isCaptureOn ? "Capture is on" : "Capture is off") {
-                    Label {
-                        Text(capability.title)
-                    } icon: {
-                        Image(systemName: symbol(for: capability))
-                            .foregroundStyle(capability.isCaptureOn ? Palette.accent : Color.secondary)
+        let health = session.coreHealth
+        let capability = health.captureCapability
+        Section("Network extension") {
+            if health.captureControlsAvailable {
+                Toggle("Capture L4 traffic", isOn: Binding(
+                    get: { health.captureChoice ?? captureEnabled },
+                    set: { on in Task { await CaptureSwitch.set(on, session: session) } }
+                ))
+                .disabled(health.captureBusy || !usesEmbedded)
+                if !usesEmbedded {
+                    Text("The active core is external, so capture is not controlled from here. Switch to the embedded core in Bus to turn it on or off.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Text("The first time you turn this on, macOS asks twice in System Settings: approve the extension under Network Extensions, then allow Add Proxy Configurations.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                LabeledContent("Status") {
+                    if health.captureBusy {
+                        Label {
+                            Text("Working…")
+                        } icon: {
+                            ProgressView().controlSize(.small)
+                        }
+                    } else {
+                        Label {
+                            Text(capability.title)
+                        } icon: {
+                            Image(systemName: symbol(for: capability))
+                                .foregroundStyle(capability.isCaptureOn ? Palette.accent : Color.secondary)
+                        }
                     }
                 }
                 if let reason = capability.degradedReason {
@@ -232,15 +273,20 @@ struct CaptureSettings: View {
                     Button(removing ? "Removing…" : "Uninstall Capture Extension…", role: .destructive) {
                         confirming = true
                     }
-                    .disabled(removing)
+                    .disabled(removing || health.captureBusy)
                     .confirmationDialog(
                         "Uninstall the capture extension?", isPresented: $confirming, titleVisibility: .visible
                     ) {
                         Button("Uninstall", role: .destructive, action: uninstall)
                     } message: {
-                        Text("Capture stops and its proxy configuration is removed. Relaunching the app installs it again and asks for approval again.")
+                        Text("Capture stops, and the extension and its proxy configuration are removed. Turning capture on again installs the extension again and asks for approval again.")
                     }
                 }
+            } else {
+                LabeledContent("Capture L4 traffic", value: "Not available in this build")
+                Text("L4 capture needs the signed Aitmproxy app with its capture extension. This build does not include it.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -252,14 +298,86 @@ struct CaptureSettings: View {
         case .approvedAttached: "checkmark.circle"
         case .capturing: "record.circle.fill"
         case .degraded: "exclamationmark.triangle"
+        case .inactive: "pause.circle"
         }
     }
 
     private func uninstall() {
         removing = true
         Task {
-            await session.coreHealth.extensionController?.uninstall()
+            await CaptureSwitch.uninstall(session: session)
             removing = false
         }
+    }
+}
+
+/// The operator's capture on, off and uninstall, in one place so Settings ▸ Capture and
+/// Proxy ▸ Enable/Disable Capture run identical steps. Operator-only: those two callers
+/// are all there is. No bus verb, `Session` action or palette entry reaches `enable()`,
+/// `disable()`, `uninstall()` or the persisted `capture.enabled` choice (see
+/// `ExtensionController`).
+///
+/// Actions are serialized on `CoreHealthState.captureBusy`: one that arrives while another
+/// runs is dropped (the controls are disabled meanwhile), and asking for the state already
+/// in force does nothing, so there is no second activation request and no needless core
+/// restart. Each action ends by bumping `restartCoreTick`, which `ShellView` maps to an
+/// embedded-core restart, so the respawned core re-reads `capture.enabled` and opens or
+/// closes its capture gate. Only while the embedded core is the active one: with an external
+/// core active the toggle does nothing and an uninstall bumps no restart, because that
+/// restart would start the embedded core the operator switched away from.
+enum CaptureSwitch {
+    /// Whether the embedded core is the active kind: the choice Settings ▸ Bus persists,
+    /// read the way `ActiveConnectionModel` and `ProxySettings.usesEmbedded` read it
+    /// (embedded when unset). The toggle and the menu command, which cannot see the views'
+    /// `@AppStorage`, gate on this.
+    static var embeddedCoreActive: Bool {
+        (UserDefaultsActiveKindPersistence().load() ?? .embedded) == .embedded
+    }
+
+    /// ON: persist the choice, activate the extension, then respawn the core so its capture
+    /// gate opens. OFF: persist the choice first, so a crash part-way fails toward off, then
+    /// stop the tunnel, then respawn the core so the gate closes. Returns when the steps are
+    /// done. Does nothing without an extension controller (no embedded extension in this
+    /// run), or unless the embedded core is the active kind. The same-value check reads the
+    /// key as `spawn()` and `start()` do, so a stored value that is not a Bool reads as off
+    /// and cannot lock turning capture on out.
+    static func set(_ on: Bool, session: Session) async {
+        let health = session.coreHealth
+        guard !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
+              on != (UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false)
+        else { return }
+        health.captureBusy = true
+        health.captureChoice = on
+        defer {
+            health.captureChoice = nil
+            health.captureBusy = false
+        }
+        if on {
+            UserDefaults.standard.set(true, forKey: "capture.enabled")
+            health.extensionController?.enable()
+            session.restartCoreTick += 1
+        } else {
+            UserDefaults.standard.set(false, forKey: "capture.enabled")
+            await health.extensionController?.disable()
+            session.restartCoreTick += 1
+        }
+    }
+
+    /// Removes the extension and its proxy configuration. A finished uninstall also switches
+    /// the persisted choice off and respawns the core, so the toggle, the menu command and
+    /// the next launch agree that nothing is installed; left on, the choice would install
+    /// the extension again at the next launch and ask for approval. The respawn happens only
+    /// while the embedded core is the active one; the choice is cleared either way.
+    static func uninstall(session: Session) async {
+        let health = session.coreHealth
+        guard !health.captureBusy else { return }
+        health.captureBusy = true
+        defer { health.captureBusy = false }
+        await health.extensionController?.uninstall()
+        guard health.captureCapability == .extensionNotInstalled,
+              UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false
+        else { return }
+        UserDefaults.standard.set(false, forKey: "capture.enabled")
+        if embeddedCoreActive { session.restartCoreTick += 1 }
     }
 }
