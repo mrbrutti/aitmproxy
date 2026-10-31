@@ -18,7 +18,13 @@
 # still match (an `expect` line), so the list stays exactly the set that legitimately
 # does and cannot quietly widen when code moves.
 #
-# The five rules, as built:
+# This tripwire greps TOKENS. It is a regression guard for honest changes (a refactor that
+# moves a call into the wrong file, a new surface that copies a neighbour's code), and it does
+# not defend against deliberately obfuscated code: a key assembled from interpolation or a
+# helper, a statement split across lines, a call reached by reflection. Catching those is
+# code review's job, not this script's.
+#
+# The seven rules, as built:
 #   1. The activation/deactivation request and submitRequest live in ExtensionController.swift only.
 #   2. Dotted .enable()/.disable() calls appear only in SettingsView.swift (the CaptureSwitch
 #      glue) and ExtensionController.swift. App.swift calls CaptureSwitch.set, never these.
@@ -29,6 +35,16 @@
 #   4. The agent-reachable surfaces reference none of the above.
 #   5. ShellView.swift constructs the ExtensionController once and calls start() on it once.
 #      (It also has `bus?.start()`, so this counts by receiver, not every .start().)
+#   6. restartCoreTick is bumped (any mutation; only `var restartCoreTick` is exempt) in
+#      SettingsView.swift, App.swift and Shell/ShellView.swift only. Session.swift declares it.
+#      Bumping it restarts the embedded core, which re-reads capture.enabled and opens or
+#      closes the capture path, so it counts as "apply the capture choice". The agent-reachable
+#      surfaces of rule 4 do not mention it at all.
+#   7. A UserDefaults write whose line names capture, a set/setValue/removeObject(forKey:) with
+#      a capture-named key, and the bare "capture" literal used as a preference key or key
+#      fragment (`"capture" + ".enabled"`) appear in SettingsView.swift only: that is where
+#      CaptureSwitch writes the choice. The bare literal alone is NOT banned: "capture" is also
+#      the L4 capability name (L4.swift, Session.swift's gates dictionary), unrelated to this.
 set -u
 set -o pipefail
 export LC_ALL=C
@@ -52,6 +68,11 @@ shell_view=Sources/Aitmproxy/Shell/ShellView.swift
 violations=0
 checked=0
 
+# scan() skips any matching line whose text also matches SCAN_IGNORE (an ERE; empty = skip
+# nothing). Set it just before one scan and clear it straight after, as rule 6 does to
+# exempt a declaration.
+SCAN_IGNORE=
+
 # The UserDefaults key. The leading boundary keeps out `macos_capture.enabled`, the core's
 # own YAML path (EmbeddedCoreLaunch.swift documents it), which is a different key.
 key_re='(^|[^A-Za-z0-9_])capture\.enabled'
@@ -72,6 +93,7 @@ scan() {
     line=${rest%%:*}
     text=${rest#*:}
     text=${text#"${text%%[![:space:]]*}"}
+    if [ -n "$SCAN_IGNORE" ] && grep -qE -e "$SCAN_IGNORE" <<<"$text"; then continue; fi
     ok=0
     for allowed in "$@"; do
       if [ "$file" = "$allowed" ]; then ok=1; break; fi
@@ -144,7 +166,7 @@ for f in "$embedded_core" "$ext_controller" "$settings_view" "$app_swift"; do
 done
 
 # ---- 4. the agent-reachable surfaces reference none of it ----------------------------
-deny "$key_re|captureEnabled|CaptureSwitch|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|\.(enable|disable)[[:space:]]*\(" \
+deny "$key_re|captureEnabled|CaptureSwitch|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|restartCoreTick|\.(enable|disable)[[:space:]]*\(" \
   Sources/Aitmproxy/Bus/BusService.swift \
   Sources/AitmproxyKit/CommandMap.swift \
   Sources/Aitmproxy/Shell/CommandPalette.swift \
@@ -182,6 +204,33 @@ else
     fi
   fi
 fi
+
+# ---- 6. restartCoreTick: bumped by the operator surfaces only ------------------------
+# Bumping it makes ShellView restart the embedded core, and the respawned core re-reads
+# capture.enabled (SettingsView documents this). So a bump is "apply the capture choice" and
+# stays with the operator surfaces. Every mutation counts (`+=`, `&+=`, a plain assignment);
+# `var restartCoreTick` (Session.swift) is the declaration and is the only line exempted.
+SCAN_IGNORE='(^|[[:space:]])var[[:space:]]+restartCoreTick([[:space:]]|:|=|$)'
+scan "6 restartCoreTick bump" 'restartCoreTick[[:space:]]*[-+*/%&|^]*=([^=]|$)' \
+  "$settings_view" "$app_swift" "$shell_view"
+SCAN_IGNORE=
+for f in "$settings_view" "$app_swift" "$shell_view"; do
+  expect "6 restartCoreTick bump" "$f" 'restartCoreTick[[:space:]]*\+=' 'a restartCoreTick += bump'
+done
+
+# ---- 7. the capture preference is WRITTEN in SettingsView only ------------------------
+# Rule 3 keeps the key text inside four files; this narrows who may write the choice to the
+# one that does (CaptureSwitch in SettingsView). Three shapes, all on one line:
+#   write   a UserDefaults write call whose line names capture;
+#   keyed   a set/setValue/removeObject(forKey:) whatever the receiver, with a capture-named key;
+#   frag    the bare "capture" literal as the whole key, or concatenated, which rebuilds
+#           "capture.enabled" without ever spelling it (so rule 3 cannot see it).
+# The bare literal alone is not banned: "capture" is also the L4 capability name.
+cap_write_re='UserDefaults.*\.(set|setValue|removeObject)[[:space:]]*\(.*[Cc]apture'
+cap_keyed_re='\.(set|setValue)[[:space:]]*\(.*forKey:[[:space:]]*"?[A-Za-z_.]*[Cc]apture|\.removeObject[[:space:]]*\([[:space:]]*forKey:[[:space:]]*"?[A-Za-z_.]*[Cc]apture'
+cap_frag_re='"capture"[[:space:]]*\+|\+[[:space:]]*"capture"|(forKey:|AppStorage\()[[:space:]]*"capture"'
+scan "7 capture preference write" "$cap_write_re|$cap_keyed_re|$cap_frag_re" "$settings_view"
+expect "7 capture preference write" "$settings_view" '\.set[[:space:]]*\(.*forKey:[[:space:]]*"capture\.enabled"' 'the UserDefaults write of capture.enabled (CaptureSwitch)'
 
 if [ "$violations" -ne 0 ]; then
   echo "FAIL check-capture-operator-only: $violations violation(s). Capture must stay operator-only."

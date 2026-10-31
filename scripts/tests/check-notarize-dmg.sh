@@ -8,7 +8,9 @@
 # undo: the sign recipe, its inside-out order, the fail-closed verify block that
 # runs before notarytool, the non-NE path, and that nothing masks codesign's exit
 # status (a `codesign … | grep … || true` would turn a failed restricted-entitlement
-# sign into a "successful" release).
+# sign into a "successful" release). The stage-6 review fixes are pinned too: both bundles
+# are asserted to carry the team the entitlement files hard-code (#8), `--entitlements -`
+# replaces the deprecated `:-` (#8), and the nested-code `find` status is checked (#10).
 #
 # Usage: scripts/tests/check-notarize-dmg.sh      exit 0 = recipe intact, 1 = drift
 #
@@ -172,10 +174,16 @@ l_verify_deep=$(first_line '^[[:space:]]*codesign --verify --deep --strict --ver
 present "codesign --verify --deep --strict stays" "$l_verify_deep"
 l_dv=$(first_line 'codesign -dv --verbose=4 "\$sysex_bundle"')
 present "SH-AC3 codesign -dv --verbose=4 on the nested sysex" "$l_dv"
-l_app_ents=$(first_line 'codesign -d --entitlements :- "\$app"')
-present "SH-AC2/SH-AC4 entitlement dump of the app" "$l_app_ents"
-l_sysex_ents=$(first_line 'codesign -d --entitlements :- "\$sysex_bundle"')
-present "SH-AC4 entitlement dump of the sysex" "$l_sysex_ents"
+# The app's own signature is read too, so its TeamIdentifier can be asserted (review #8).
+l_app_dv=$(first_line 'codesign -dv --verbose=4 "\$app"')
+present "review #8 codesign -dv --verbose=4 on the app" "$l_app_dv"
+# `--entitlements -` is the supported form; `:-` is deprecated and, on current macOS, reports an
+# invalid entitlements blob instead of the dump the assertions grep (review #8).
+l_app_ents=$(first_line 'codesign -d --entitlements - "\$app"')
+present "SH-AC2/SH-AC4 entitlement dump of the app (--entitlements -)" "$l_app_ents"
+l_sysex_ents=$(first_line 'codesign -d --entitlements - "\$sysex_bundle"')
+present "SH-AC4 entitlement dump of the sysex (--entitlements -)" "$l_sysex_ents"
+equals "the deprecated ':-' entitlements form is not used anywhere" "$(count_lines 'entitlements :-')" "0"
 l_spctl=$(first_line 'spctl -a -t exec -vvv "\$app"')
 present "SH-AC3 spctl -a -t exec -vvv on the app (advisory)" "$l_spctl"
 
@@ -189,10 +197,17 @@ l_as_app_inst=$(first_line '^[[:space:]]*assert_contains .*"\$app_ents" .*com.ap
 present "SH-AC2 asserts the app has system-extension.install" "$l_as_app_inst"
 l_as_sysex_ne=$(first_line '^[[:space:]]*assert_contains .*"\$sysex_ents" .*app-proxy-provider-systemextension')
 present "SH-AC4 asserts the sysex has app-proxy-provider-systemextension" "$l_as_sysex_ne"
+# review #8: both bundles must carry the team the entitlement files hard-code. The pattern is
+# anchored so a longer id that merely starts with it, or `not set`, cannot pass.
+l_as_sysex_team=$(first_line '^[[:space:]]*assert_contains .*"\$sysex_sig" .*\^TeamIdentifier=995PCLM9KH\$')
+present "review #8 asserts the sysex TeamIdentifier is 995PCLM9KH (anchored)" "$l_as_sysex_team"
+l_as_app_team=$(first_line '^[[:space:]]*assert_contains .*"\$app_sig" .*\^TeamIdentifier=995PCLM9KH\$')
+present "review #8 asserts the app TeamIdentifier is 995PCLM9KH (anchored)" "$l_as_app_team"
 
 # All of the NE verification runs inside the guard, after the app is signed, and
 # before both the DMG is built and notarytool is called.
 before "verify starts after the NE app sign" "$l_app_ne" "$l_dv"
+before "app signature inspection starts after the NE app sign" "$l_app_ne" "$l_app_dv"
 verify_before_dmg_and_notary() { # <label> <line>
     before "SH-AC4 $1 runs before make-dmg.sh" "$2" "$l_make_dmg"
     before "SH-AC4 $1 runs before notarytool submit" "$2" "$l_notary"
@@ -207,6 +222,9 @@ verify_before_dmg_and_notary "hardened-runtime assertion" "$l_as_runtime"
 verify_before_dmg_and_notary "app NE-provider assertion" "$l_as_app_ne"
 verify_before_dmg_and_notary "app system-extension.install assertion" "$l_as_app_inst"
 verify_before_dmg_and_notary "sysex NE-provider assertion" "$l_as_sysex_ne"
+verify_before_dmg_and_notary "app codesign -dv" "$l_app_dv"
+verify_before_dmg_and_notary "sysex TeamIdentifier assertion" "$l_as_sysex_team"
+verify_before_dmg_and_notary "app TeamIdentifier assertion" "$l_as_app_team"
 before "SH-AC4 the verify guard follows the NE sign guard" "$l_guard" "$l_dv"
 
 # Ordering alone does not prove containment. Every NE sign and verify line must sit inside an
@@ -231,6 +249,23 @@ inside_guard "SH-AC3 hardened-runtime assertion" "$l_as_runtime"
 inside_guard "SH-AC2 app NE-provider assertion" "$l_as_app_ne"
 inside_guard "SH-AC2 app system-extension.install assertion" "$l_as_app_inst"
 inside_guard "SH-AC4 sysex NE-provider assertion" "$l_as_sysex_ne"
+inside_guard "review #8 app codesign -dv" "$l_app_dv"
+inside_guard "review #8 sysex TeamIdentifier assertion" "$l_as_sysex_team"
+inside_guard "review #8 app TeamIdentifier assertion" "$l_as_app_team"
+inside_guard "review #10 nested-code find" "$l_nested_find"
+
+# --- review #10: an errored find must abort the release -----------------------
+# `while ... done < <(find ...)` discards find's exit status (a process substitution escapes
+# set -e and pipefail), so a find that errored half way would leave nested code unsigned and
+# the release would carry on. The list is written to a file first and find's status checked.
+equals "no process substitution (< <(...)) feeds a loop" "$(count_lines '<[[:space:]]*<\(')" "0"
+l_find_checked=$(first_line 'find "\$sysex_bundle/Contents" -depth .*-print0 >"\$nested_list" \|\| \{.*exit 1')
+present "review #10 find writes its list to a file and aborts on a non-zero status" "$l_find_checked"
+l_find_loop=$(first_line '^[[:space:]]*done <"\$nested_list"[[:space:]]*$')
+present "review #10 the nested-sign loop reads the list file" "$l_find_loop"
+before "review #10 find (and its status check) precede the nested sign loop" "$l_find_checked" "$l_nested"
+before "review #10 the nested sign precedes the end of the loop that reads the list" "$l_nested" "$l_find_loop"
+inside_guard "review #10 the nested-sign loop" "$l_find_loop"
 
 # --- the entitlement files the script signs with ------------------------------
 # A wrong path, or a file that no longer carries what the verify block demands, would only show
@@ -250,6 +285,20 @@ has_fixed "SH-AC2 Aitmproxy.entitlements carries com.apple.developer.system-exte
     "$app_ents_text" 'com.apple.developer.system-extension.install'
 has_fixed "SH-AC4 Aitmproxy-Extension.entitlements carries app-proxy-provider-systemextension" \
     "$sysex_ents_text" 'app-proxy-provider-systemextension'
+
+# review #8: the team the verify block demands is the team the entitlement files hard-code. If
+# the team ever changes in one place and not the other, fail here, not on Matt's Mac after a
+# full sign. ent_team prints the <string> after the com.apple.developer.team-identifier key.
+ent_team() { # <file>
+    awk '/<key>com\.apple\.developer\.team-identifier<\/key>/ { f = 1; next }
+         f && /<string>/ { gsub(/.*<string>|<\/string>.*/, ""); print; exit }' "$1"
+}
+script_team=$(grep -o -E 'TeamIdentifier=[A-Z0-9]+' <<<"$code" | sort -u | sed 's/^TeamIdentifier=//')
+equals "the script asserts exactly one team id" "$(grep -c . <<<"$script_team")" "1"
+equals "review #8 the asserted team is the app entitlements' team" \
+    "$(ent_team "$repo_root/apps/mac/Aitmproxy.entitlements")" "$script_team"
+equals "review #8 the asserted team is the extension entitlements' team" \
+    "$(ent_team "$repo_root/apps/mac/Extension/Aitmproxy-Extension.entitlements")" "$script_team"
 
 # --- SH-AC7: the header documents the credentialed manual step ----------------
 header=$(sed -n '1,/^set -euo pipefail/p' "$script")

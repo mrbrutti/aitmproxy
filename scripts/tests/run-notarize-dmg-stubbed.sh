@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Behavioural test for scripts/notarize-dmg.sh — Part 1 of the spec
 # docs/superpowers/specs/2026-10-30-macos-ne-ship-and-toggle-design.md
-# (SH-AC1, SH-AC2, SH-AC4, SH-AC6 and the "silent codesign success" anti-goal).
+# (SH-AC1, SH-AC2, SH-AC4, SH-AC6 and the "silent codesign success" anti-goal), plus the
+# stage-6 review fixes in docs/superpowers/plans/2026-10-30-macos-ne-ship-and-toggle-plan.md:
+# #8 (the app and the sysex must both carry TeamIdentifier 995PCLM9KH; cases 3g-3j) and
+# #10 (an errored find over the nested code aborts before anything is signed; case 4d).
 #
 # check-notarize-dmg.sh reads the script's text. This one RUNS it. It builds a scratch copy
 # of the repo layout around the real notarize-dmg.sh, a fake Aitmproxy.app, and puts shims
@@ -66,9 +69,16 @@ case $mode in
 verify) exit 0 ;;
 dv)
     [ -e "$last" ] || { echo "$last: No such file or directory" >&2; exit 1; }
+    # The team each bundle is signed by; the real value is the one the entitlement files
+    # hard-code. FAKE_SYSEX_TEAM / FAKE_APP_TEAM override it per bundle.
+    case $last in
+    *.systemextension) team=${FAKE_SYSEX_TEAM-995PCLM9KH} ;;
+    *) team=${FAKE_APP_TEAM-995PCLM9KH} ;;
+    esac
     echo "Executable=$last/Contents/MacOS/x" >&2
     echo "CodeDirectory v=20500 size=1 flags=${FAKE_FLAGS-0x10000(runtime)} hashes=1+1 location=embedded" >&2
     echo "Authority=${FAKE_AUTHORITY-Developer ID Application: Test (TEAM123456)}" >&2
+    echo "TeamIdentifier=$team" >&2
     exit 0
     ;;
 d)
@@ -103,7 +113,20 @@ cat >"$stub/bin/xcrun" <<'EOF'
 echo "xcrun $*" >>"$FAKE_LOG"
 exit 99
 EOF
-chmod +x "$stub/bin/codesign" "$stub/bin/spctl" "$stub/bin/xcrun"
+# The real find, then (FAKE_FIND_FAIL set) a non-zero status like find has after a read error. It
+# still lists everything it could read, so a script that ignores the status carries on with a
+# partial list and leaves the rest of the nested code unsigned.
+cat >"$stub/bin/find" <<'EOF'
+#!/usr/bin/env bash
+/usr/bin/find "$@"
+rc=$?
+if [ -n "${FAKE_FIND_FAIL-}" ]; then
+    echo "find: simulated read error while listing nested code" >&2
+    exit 1
+fi
+exit $rc
+EOF
+chmod +x "$stub/bin/codesign" "$stub/bin/spctl" "$stub/bin/xcrun" "$stub/bin/find"
 
 # ---- fixtures ---------------------------------------------------------------
 sysex_name=com.mrbrutti.aitmproxy.ne.systemextension
@@ -149,6 +172,9 @@ run_case() {
 # ---- assertions -------------------------------------------------------------
 reached_dmg() { [ -s "$log.dmg" ]; }
 called() { grep -q -F -- "$1" "$log"; } # called <fixed text>
+# called_line <whole call>: a call that is exactly this line. `called` matches a substring, and a
+# call on the app (`... $app`) is a prefix of the same call on the sysex (`... $app/Contents/...`).
+called_line() { grep -q -x -F -- "$1" "$log"; }
 first_ln() { grep -n -F -- "$1" "$log" | head -n 1 | cut -d: -f1; }
 sign_ln() { first_ln "--sign TESTID $1"; } # the line of the sign call for that path
 # signed <path>: a sign call whose LAST argument is exactly <path> (so the app is not confused
@@ -219,10 +245,15 @@ expect "the app sign call is the NE one" signed "$app"
 expect_not "the app is never signed without entitlements in an NE build" signed_without_entitlements "$app"
 l_verify=$(first_ln "--verify --deep --strict --verbose=2 $app")
 l_dv=$(first_ln "-dv --verbose=4 $sysex")
+l_app_dv=$(grep -n -x -F -- "codesign -dv --verbose=4 $app" "$log" | head -n 1 | cut -d: -f1)
 before "verification follows the app sign" "$l_app" "$l_verify"
 before "the sysex signature is inspected after the app is signed" "$l_app" "$l_dv"
-expect "the app's entitlements are dumped" called "-d --entitlements :- $app"
-expect "the sysex's entitlements are dumped" called "-d --entitlements :- $sysex"
+before "the app signature is inspected after the app is signed" "$l_app" "$l_app_dv"
+expect "the app's signature is inspected too (for its TeamIdentifier)" called_line "codesign -dv --verbose=4 $app"
+# `--entitlements -` is the supported form; the deprecated `:-` reports an invalid blob on current macOS.
+expect "the app's entitlements are dumped with --entitlements -" called_line "codesign -d --entitlements - $app"
+expect "the sysex's entitlements are dumped with --entitlements -" called_line "codesign -d --entitlements - $sysex"
+expect_not "the deprecated ':-' entitlements form is never used" called "entitlements :-"
 expect "the Gatekeeper pre-check ran and its rejection was advisory" called "spctl -a -t exec -vvv $app"
 expect_not "the benign 'replacing existing signature' chatter is filtered" grep -q -F 'replacing existing signature' "$out"
 
@@ -279,6 +310,33 @@ run_case FAKE_AUTHORITY="Apple Development: someone (ABCDE12345)"
 rc_nonzero_not_dmg "a sysex signed by a non-Developer-ID identity"
 said "the failure names Developer ID" "Developer ID"
 
+# The entitlement files hard-code team 995PCLM9KH, so a bundle signed by any other team
+# notarizes fine and then fails AMFI on the user's Mac. Each bundle is checked on its own.
+echo "--- case 3g: the sysex is signed by another team"
+mk_case ne-sysex-wrong-team ne
+run_case FAKE_SYSEX_TEAM=ZZZZZZZZZZ
+rc_nonzero_not_dmg "a sysex signed by another team"
+said "the failure names the sysex" "the nested system extension is signed by team 995PCLM9KH"
+said "the failure shows the TeamIdentifier it wanted" "TeamIdentifier=995PCLM9KH"
+
+echo "--- case 3h: the app is signed by another team"
+mk_case ne-app-wrong-team ne
+run_case FAKE_APP_TEAM=ZZZZZZZZZZ
+rc_nonzero_not_dmg "an app signed by another team"
+said "the failure names the app" "the app is signed by team 995PCLM9KH"
+
+echo "--- case 3i: the app has no team at all (ad-hoc signature)"
+mk_case ne-app-no-team ne
+run_case "FAKE_APP_TEAM=not set"
+rc_nonzero_not_dmg "an app with TeamIdentifier=not set"
+said "the failure names the app" "the app is signed by team 995PCLM9KH"
+
+echo "--- case 3j: a team id that only starts with the right one"
+mk_case ne-sysex-team-prefix ne
+run_case FAKE_SYSEX_TEAM=995PCLM9KHZ
+rc_nonzero_not_dmg "a sysex whose team id merely starts with 995PCLM9KH"
+said "the failure names the sysex" "the nested system extension is signed by team 995PCLM9KH"
+
 # ============ Case 4: a failed sign is never masked (anti-goal: silent codesign success) ===
 echo "--- case 4a: codesign fails signing the sysex"
 mk_case ne-sign-fails-sysex ne
@@ -300,6 +358,15 @@ mk_case plain-sign-fails plain
 run_case FAKE_FAIL_SIGN="$app/Contents/Resources/core/aitm"
 rc_nonzero_not_dmg "a failed aitm sign"
 expect_not "the app is not signed after a failed aitm sign" signed "$app"
+
+# find listing the code nested in the sysex errors out. A `done < <(find ...)` loop discards that
+# status and signs whatever was listed; the release must stop before anything is signed.
+echo "--- case 4d: find fails while listing the code nested in the sysex"
+mk_case ne-find-fails ne
+run_case FAKE_FIND_FAIL=1
+rc_nonzero_not_dmg "an errored nested-code find"
+said "the failure says the nested-code listing failed" "listing the code nested in"
+expect_not "nothing is signed after the errored find" called "--sign"
 
 # ============ Case 5: a bundle that cannot carry the entitlements is refused ===============
 echo "--- case 5a: no app provisioning profile"

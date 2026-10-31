@@ -141,9 +141,16 @@ if [ -n "$sysex_bundle" ]; then
     #     directory's contents before the directory). Today the extension is a lone
     #     Contents/MacOS/AitmproxyNE, sealed by signing the bundle, so this finds
     #     nothing; it keeps the recipe valid if the extension ever gains a framework.
+    #     The list goes to a file first, not into `done < <(find ...)`: a process
+    #     substitution discards find's exit status (set -e and pipefail never see
+    #     it), so a find that errored half way would leave nested code unsigned and
+    #     the release would carry on. Here a failed find aborts before anything is signed.
+    nested_list=$(mktemp "${TMPDIR:-/tmp}/notarize-nested.XXXXXX") || { echo "notarize-dmg.sh: cannot create a temp file for the nested-code list" >&2; exit 1; }
+    trap 'rm -f "$nested_list"' EXIT
+    find "$sysex_bundle/Contents" -depth \( -type d \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' -o -name '*.app' \) -o -type f -name '*.dylib' \) -print0 >"$nested_list" || { echo "notarize-dmg.sh: listing the code nested in $sysex_bundle failed (find exited non-zero); not signing a partial list" >&2; exit 1; }
     while IFS= read -r -d '' nested; do
         cs --force "${runtime_opts[@]}" --sign "$dev_id" "$nested"
-    done < <(find "$sysex_bundle/Contents" -depth \( -type d \( -name '*.framework' -o -name '*.xpc' -o -name '*.appex' -o -name '*.app' \) -o -type f -name '*.dylib' \) -print0)
+    done <"$nested_list"
     # (b) The extension bundle, with its own restricted NE entitlements.
     cs --force "${runtime_opts[@]}" --entitlements "$repo_root/apps/mac/Extension/Aitmproxy-Extension.entitlements" --sign "$dev_id" "$sysex_bundle"
 fi
@@ -172,10 +179,19 @@ codesign --verify --deep --strict --verbose=2 "$app"
 if [ -n "$sysex_bundle" ]; then
     echo "notarize-dmg.sh: verifying the nested system extension and the NE entitlements"
     sysex_sig=$(codesign -dv --verbose=4 "$sysex_bundle" 2>&1) || { printf '%s\n' "$sysex_sig" >&2; echo "notarize-dmg.sh: codesign -dv failed on $sysex_bundle" >&2; exit 1; }
-    app_ents=$(codesign -d --entitlements :- "$app" 2>&1) || { printf '%s\n' "$app_ents" >&2; echo "notarize-dmg.sh: reading the entitlements of $app failed" >&2; exit 1; }
-    sysex_ents=$(codesign -d --entitlements :- "$sysex_bundle" 2>&1) || { printf '%s\n' "$sysex_ents" >&2; echo "notarize-dmg.sh: reading the entitlements of $sysex_bundle failed" >&2; exit 1; }
+    app_sig=$(codesign -dv --verbose=4 "$app" 2>&1) || { printf '%s\n' "$app_sig" >&2; echo "notarize-dmg.sh: codesign -dv failed on $app" >&2; exit 1; }
+    # `--entitlements -` prints the text dump of the entitlements; the `:-` form is
+    # deprecated and, on current macOS, reports an invalid blob instead of the dump.
+    app_ents=$(codesign -d --entitlements - "$app" 2>&1) || { printf '%s\n' "$app_ents" >&2; echo "notarize-dmg.sh: reading the entitlements of $app failed" >&2; exit 1; }
+    sysex_ents=$(codesign -d --entitlements - "$sysex_bundle" 2>&1) || { printf '%s\n' "$sysex_ents" >&2; echo "notarize-dmg.sh: reading the entitlements of $sysex_bundle failed" >&2; exit 1; }
     assert_contains "the nested system extension is signed by a Developer ID Application identity" "$sysex_sig" 'Authority=Developer ID Application'
     assert_contains "the nested system extension has the hardened runtime (flags=...runtime)" "$sysex_sig" 'flags=.*runtime'
+    # Both bundles must carry the team the entitlement files hard-code (995PCLM9KH, in
+    # com.apple.application-identifier and team-identifier). A bundle signed by another
+    # team still reads "Developer ID Application", notarizes, and then fails AMFI on the
+    # user's Mac. The patterns are anchored: not a longer id, and not `not set`.
+    assert_contains "the nested system extension is signed by team 995PCLM9KH" "$sysex_sig" '^TeamIdentifier=995PCLM9KH$'
+    assert_contains "the app is signed by team 995PCLM9KH" "$app_sig" '^TeamIdentifier=995PCLM9KH$'
     assert_contains "the app carries the app-proxy-provider-systemextension NE entitlement" "$app_ents" 'app-proxy-provider-systemextension'
     assert_contains "the app carries com.apple.developer.system-extension.install" "$app_ents" 'com.apple.developer.system-extension.install'
     assert_contains "the system extension carries the app-proxy-provider-systemextension NE entitlement" "$sysex_ents" 'app-proxy-provider-systemextension'
