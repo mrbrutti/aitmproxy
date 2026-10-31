@@ -267,8 +267,27 @@ Kept by the main session during stage 6. One row per finding.
 | 5, 6 | spec | Minor | Tasks 5 and 6 share one commit; `ColumnFit.Column` struct instead of a tuple; `applyAutoHide` folded into `fitColumns` | accepted (orchestrator): the struct names its fields, one fit pass is simpler; recorded here |
 | 3, 4 | spec | Minor | Unrequested additions: `wsDetails`/`l4Details` on `ClearedFlows`, `HoverChevron`, `accessibilityIdentifier("clear-notice")` | accepted (orchestrator): WebSocket and L4 details are part of what Clear drops; the chevron type is how a label reads the environment; the id is for computer-use |
 | 7 | spec | Minor | `check-layout` output not kept | fixed: `/tmp/w3-check-layout.log` |
-| 2, 4 | spec | Important | AC8 byte identity: the harness moves the inspector dividers between runs of one binary, and `overview` showed a hover fill on a `HostRow` in one run | see Shipped: equal-launch pointer-parked comparison |
+| 2, 4 | spec | Important | AC8 byte identity: the harness moves the inspector dividers between runs of one binary, and `overview` showed a hover fill on a `HostRow` in one run | accepted (orchestrator, 2026-10-31) with evidence: the same bundle launched twice is byte-identical (AE 0); baseline vs new bundle launched the same way differs by 2.5 px on `apps-light` (sub-pixel AA) and only in window-activation chrome elsewhere; the `HostRow` fill was the pointer resting on that row — a capture with the pointer parked on the menu bar shows no fill. Whole-window `cmp` across `snap-dev` runs is a harness fix (the wave-3 harness item), not this wave's |
+| 3 | spec | Critical | AC11 live-bus Clear → Undo not run | fixed: `SelfTest+Live` check run against a private `aitm` (`listen 127.0.0.1:28080`, bus 29090): "flow.clear empties the list and offers Undo Clear (4 flows)" PASS, "Undo Clear puts the 4 flows back and they survive four polls (4 present)" PASS, LIVE SELFTEST PASS 22 checks |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+Branch `claude/cool-engelbart-633d63` (on PR #180's head `0d0ef3f`), eight commits, one per plan
+step plus the stage-6 fix round (`80f06d6`). Everything in the spec landed; nothing was cut.
+
+Gate on the final head (2026-10-31): `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build`
+exit 0 (new suites `VerbTableTests` 12, `ClearedFlowsTests` 5, `ColumnFitTests` 7, `ColumnLayoutTests`
+moved); self-test `SELFTEST PASS 126 checks` (121 + 5: the three Clear/Undo checks, the mark-colour
+scope check, the notice-lapse check); `check-layout.swift` 12 PASS / 0 other on
+`/tmp/Aitmproxy-shots-dev-w3/*-layout.json` (`/tmp/w3-check-layout.log`); `grid-lint` PASS; live
+self-test against a private `aitm` `LIVE SELFTEST PASS 22 checks` including the two Undo Clear
+checks (`/tmp/claude-501/w3/live/live-selftest.log`). Snapshots `apps`, `overview`, `edit-paused`,
+`filter-bar`, `activity-log`, `split` captured light + dark and looked at: no horizontal scroll bar
+on the flow list with the Activity panel open or in split view, low-priority columns gone and back
+with room, Overview rows unchanged at rest.
+
+Follow-ups (not this wave): the bus poll still runs at 500 ms when no window is visible (review
+card); `ScopePanel` and `ConnectionLogPanel` hover rows onto `HoverRowStyle`; the snapshot harness
+moves the inspector dividers between runs of one binary, so whole-window `cmp` cannot gate a wave
+until that drift is fixed (the wave-3 harness item); the self-test harness should park the pointer
+before capturing.
