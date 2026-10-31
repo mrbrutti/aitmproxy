@@ -35,6 +35,7 @@
 
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -288,6 +289,17 @@ impl ControlChannel {
     }
 }
 
+/// The control stream's file descriptor, so a [`PeerVerifier`] can read the peer's
+/// audit token off the socket. The descriptor stays owned by the channel; callers
+/// must not close it or use it past the channel's lifetime.
+///
+/// [`PeerVerifier`]: super::peer_auth::PeerVerifier
+impl AsRawFd for ControlChannel {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
+    }
+}
+
 /// One accepted per-flow data socket, after its handshake.
 pub struct DataConnection {
     /// The flow this socket carries (from its [`DataHandshake`]).
@@ -305,6 +317,16 @@ impl DataConnection {
     /// Borrow the raw data stream.
     pub fn stream_mut(&mut self) -> &mut UnixStream {
         &mut self.stream
+    }
+
+    /// The data stream's file descriptor, so a [`PeerVerifier`] can read the peer's
+    /// audit token off the socket. The descriptor stays owned by this connection;
+    /// callers must not close it or use it past the connection's lifetime.
+    ///
+    /// [`PeerVerifier`]: super::peer_auth::PeerVerifier
+    #[must_use]
+    pub fn peer_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 
     /// Read the next length-delimited datagram (UDP), or `None` at end of stream.
@@ -424,4 +446,23 @@ where
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     Ok(Some(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AsRawFd, DataConnection};
+
+    /// A `DataConnection` over a connected pair (no path bind) exposes the very
+    /// descriptor of its stream, so a peer verifier reads the right socket.
+    #[tokio::test]
+    async fn data_connection_peer_fd_is_the_stream_fd() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let raw = a.as_raw_fd();
+        let conn = DataConnection {
+            flow_id: 7,
+            stream: a,
+        };
+        assert!(conn.peer_fd() >= 0);
+        assert_eq!(conn.peer_fd(), raw);
+    }
 }

@@ -61,7 +61,17 @@ is run via the Terminal panel after each task.
   - `crates/aitm/src/macos_capture/peer_auth.rs` (create)
   - `crates/aitm/src/macos_capture/mod.rs` (modify: add `pub mod peer_auth;`)
   - `crates/aitm/src/macos_capture/listener.rs` (modify: fd accessors)
-  - `crates/aitm/Cargo.toml` (modify: add macOS-target deps)
+  - `crates/aitm/Cargo.toml` (modify: add macOS-target deps) + `Cargo.lock`
+  - **Plan gaps the coder surfaced (build-owner disposition 2026-10-30):** (1) the workspace
+    lint `unsafe_code = "forbid"` cannot be lifted by `#[allow]`, so `crates/aitm/Cargo.toml`
+    changes `[lints] workspace = true` → `[lints.rust] unsafe_code = "deny"`; unsafe stays a
+    hard error everywhere except the one audited `#[allow(unsafe_code)]` on `peer_audit_token`
+    (with a `// SAFETY:` comment). **FLAGGED FOR THE SECURITY PANEL:** accept this localized
+    `forbid`→`deny` relaxation for `crates/aitm`, or isolate the single `getsockopt` into a
+    minimal helper crate to keep the workspace-wide `forbid`. (2) `core-foundation = "0.10"`
+    added as a macOS dep (needed for `CFData` to carry the audit token; no new crate —
+    `security-framework` already pulls it at 0.10.1). (3) `security-framework = "3.7"` (locked
+    3.7.0) via `os::macos::code_signing`.
 - **Change:**
   - `pub trait PeerVerifier: Send + Sync { fn verify(&self, fd: std::os::fd::RawFd) -> bool; }`.
   - `pub const PROVIDER_REQUIREMENT: &str = "anchor apple generic and certificate leaf[subject.OU] = \"995PCLM9KH\"";`

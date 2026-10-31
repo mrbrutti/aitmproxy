@@ -16,5 +16,6 @@ pub mod availability;
 pub mod capability;
 pub mod config;
 pub mod listener;
+pub mod peer_auth;
 pub mod rendezvous;
 pub mod scope_spec;
