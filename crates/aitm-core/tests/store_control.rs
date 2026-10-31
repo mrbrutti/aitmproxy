@@ -329,6 +329,82 @@ fn abandon_response_on_an_unknown_id_or_a_websocket_flow_is_false() {
     assert!(!store.get(ws_id).unwrap().metadata().truncated);
 }
 
+// ---- tester additions: idempotence and eviction of an abandoned response ----
+
+#[test]
+fn abandon_response_is_idempotent_a_second_call_changes_nothing() {
+    // The doc promises idempotence by construction: a second call finds a
+    // buffered body, declines, and leaves the first finalisation intact (bytes,
+    // marker and the duration it measured).
+    let Flow::Http(mut f) = streamed_http() else {
+        unreachable!("streamed_http builds an HTTP flow")
+    };
+    assert!(f.abandon_response(vec![1, 2, 3]));
+    let first_duration = f.metadata.duration;
+    assert!(
+        first_duration.is_some(),
+        "the first call measures a duration"
+    );
+
+    assert!(
+        !f.abandon_response(vec![9, 9]),
+        "a second call finds a buffered body and is a no-op"
+    );
+    assert!(
+        matches!(f.response.as_ref().unwrap().body, Body::Bytes(ref b) if b == &vec![1, 2, 3]),
+        "the first capture wins; the second is dropped"
+    );
+    assert!(f.metadata.truncated);
+    assert_eq!(
+        f.metadata.duration, first_duration,
+        "the duration is not re-measured by a no-op"
+    );
+
+    // The store-side method follows: a second call is `false`, and `clear` still
+    // removes exactly one flow.
+    let store = MemFlowStore::new();
+    let id = store.insert(streamed_http());
+    assert!(store.abandon_response(id, vec![1]));
+    assert!(!store.abandon_response(id, vec![2]));
+    assert_eq!(
+        store.clear(),
+        ClearOutcome {
+            cleared: 1,
+            skipped_in_flight: 0
+        }
+    );
+}
+
+#[test]
+fn eviction_removes_an_abandoned_response_like_a_completed_one() {
+    // Spec Goals: "terminal" also means the memory-budget eviction can remove the
+    // flow. With a capacity of one, every insert past the first evicts the
+    // oldest *terminal* flow; a streaming response is passed over, an abandoned
+    // one is taken.
+    let store = MemFlowStore::with_capacity(1);
+    let first = store.insert(streamed_http());
+    let second = store.insert(streamed_http());
+    assert_eq!(
+        store.count(),
+        2,
+        "two streaming responses: neither is terminal, so neither is evicted"
+    );
+    assert!(store.get(first).is_some());
+
+    assert!(store.abandon_response(first, vec![1, 2, 3]));
+    let third = store.insert(streamed_http());
+    assert!(
+        store.get(first).is_none(),
+        "the abandoned response is terminal and is the one evicted"
+    );
+    assert!(
+        store.get(second).is_some(),
+        "a response still streaming is passed over by eviction"
+    );
+    assert!(store.get(third).is_some());
+    assert_eq!(store.count(), 2);
+}
+
 #[test]
 fn intercepted_count_tracks_parked() {
     let store = MemFlowStore::new();

@@ -5608,23 +5608,24 @@ mod tests {
 
     /// Records every event, in order, and, when `Event::Error` is dispatched for
     /// an HTTP flow, what the store held for it at that moment (whether the
-    /// response body was already `Bytes(b"abc")`, and whether the flow was already
-    /// marked truncated), as a plugin, or the MCP push built from the store on
-    /// that event, would see it.
+    /// response body was already `Bytes(expect_body)`, and whether the flow was
+    /// already marked truncated), as a plugin, or the MCP push built from the
+    /// store on that event, would see it.
     struct ErrorProbe {
         store: Arc<MemFlowStore>,
         events: Mutex<Vec<Event>>,
         at_error: Mutex<Vec<(bool, bool)>>,
+        /// The buffered body the probe expects to find at dispatch time.
+        expect_body: &'static [u8],
     }
 
     impl EventSink for ErrorProbe {
         fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
             if let Event::Error { flow, .. } = &ev {
                 if let Some(Flow::Http(f)) = self.store.get(*flow) {
-                    let buffered = f
-                        .response
-                        .as_ref()
-                        .is_some_and(|r| matches!(&r.body, Body::Bytes(b) if b == b"abc"));
+                    let buffered = f.response.as_ref().is_some_and(
+                        |r| matches!(&r.body, Body::Bytes(b) if b.as_slice() == self.expect_body),
+                    );
                     self.at_error
                         .lock()
                         .expect("at_error lock")
@@ -5646,6 +5647,7 @@ mod tests {
             store: store.clone(),
             events: Mutex::new(Vec::new()),
             at_error: Mutex::new(Vec::new()),
+            expect_body: b"abc",
         });
         let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink.clone());
         let _origin = tokio::spawn(async move {
@@ -5847,6 +5849,334 @@ mod tests {
         assert!(
             !dispatched_as_complete(&events, flow.id),
             "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    // ---- tester additions: the remaining exits and inputs of the funnel -------
+
+    /// An origin whose connection fails with an I/O **error** (not an EOF) once
+    /// its scripted reply has been read: `read` returns `ConnectionReset`, which
+    /// is the h1 loop's `Ok(r) => r?` exit (spec D4, "upstream I/O error").
+    /// Writes are accepted and discarded; the reply is released only after the
+    /// request has been written, like a real origin.
+    struct ResettingOrigin {
+        reply: Vec<u8>,
+        pos: usize,
+        request_seen: bool,
+        waiting: Option<std::task::Waker>,
+    }
+
+    impl ResettingOrigin {
+        fn replying(reply: Vec<u8>) -> Self {
+            Self {
+                reply,
+                pos: 0,
+                request_seen: false,
+                waiting: None,
+            }
+        }
+    }
+
+    impl AsyncRead for ResettingOrigin {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut TaskCx<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if !this.request_seen {
+                this.waiting = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            if this.pos < this.reply.len() {
+                let n = buf.remaining().min(this.reply.len() - this.pos);
+                buf.put_slice(&this.reply[this.pos..this.pos + n]);
+                this.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "origin connection reset",
+            )))
+        }
+    }
+
+    impl AsyncWrite for ResettingOrigin {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskCx<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.request_seen = true;
+            if let Some(waker) = this.waiting.take() {
+                waker.wake();
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_the_response_when_the_upstream_read_fails() {
+        // Spec D4, "upstream I/O error": the read itself fails rather than
+        // returning EOF. No typed error is owed on this path, but the store must
+        // be finalised like on every other exit.
+        let origin = ResettingOrigin::replying(format!("{PARTIAL_HEAD}abc").into_bytes());
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(origin)]);
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err =
+            served.expect_err("an origin whose connection resets mid-body fails the connection");
+        assert!(
+            err.to_string().contains("origin connection reset"),
+            "the connection's own I/O error is what serve returns: {err}"
+        );
+        assert!(
+            !err.to_string().contains("upstream closed"),
+            "an I/O error is not mistaken for a clean close: {err}"
+        );
+        assert!(closed, "the proxy hangs up on the client");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            format!("{PARTIAL_HEAD}abc"),
+            "the client received what the origin sent before the reset"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        assert_abandoned(&flow, b"abc");
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert!(
+            errors_for(&events, flow.id).is_empty(),
+            "no typed error is dispatched on this path (spec D4): {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_an_empty_response_when_the_upstream_closes_after_the_head() {
+        // Empty input on the abandon path: not one body byte arrived before the
+        // origin closed. The response is finalised as `Body::Empty` (never
+        // `Bytes(vec![])`), truncated and terminal, with the one typed error any
+        // early close owes.
+        let (up, mut origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(async move {
+            read_request_head(&mut origin_end).await;
+            origin_write(&mut origin_end, PARTIAL_HEAD.as_bytes()).await;
+            // Dropping the origin's end closes the connection with the whole body owed.
+        });
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an origin that closes after the head fails the connection");
+        assert!(
+            err.to_string()
+                .contains("upstream closed before completing the response"),
+            "error: {err}"
+        );
+        assert!(closed, "the proxy hangs up on the client");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            PARTIAL_HEAD,
+            "the client received the head and nothing else"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        let resp = flow
+            .response
+            .as_ref()
+            .expect("the response head was stored");
+        assert_eq!(resp.status, 200);
+        assert!(
+            matches!(resp.body, Body::Empty),
+            "nothing captured is `Empty`, not `Bytes([])`: {:?}",
+            resp.body
+        );
+        assert!(
+            flow.metadata.truncated,
+            "an abandoned response is truncated"
+        );
+        assert!(
+            flow.metadata.duration.is_some(),
+            "an abandoned response has a duration"
+        );
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned empty response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            errors_for(&events, flow.id),
+            vec![&aitm_core::FlowError::Upstream(
+                "upstream closed before completing the response".to_string()
+            )],
+            "one typed error, in fixed words: {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_caps_an_abandoned_body_at_max_body() {
+        // Oversized input: the capture buffer is bounded by `max_body` on the
+        // abandon path exactly as on the completed path (spec Constraints,
+        // Security), while the client still receives every byte the origin sent.
+        const CAP: usize = 4;
+        let (up, mut origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(async move {
+            read_request_head(&mut origin_end).await;
+            origin_write(&mut origin_end, PARTIAL_HEAD.as_bytes()).await;
+            origin_write(&mut origin_end, b"abcdef").await;
+            // Six of ten bytes, then the origin's end is dropped.
+        });
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            CAP,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an origin that closes mid-body fails the connection");
+        assert!(
+            err.to_string()
+                .contains("upstream closed before completing the response"),
+            "error: {err}"
+        );
+        assert!(closed, "the proxy hangs up on the client");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            format!("{PARTIAL_HEAD}abcdef"),
+            "the wire is unchanged: the client got every byte, cap or no cap"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        // Only the first `CAP` bytes are retained; the marker covers both the
+        // cap and the early end.
+        assert_abandoned(&flow, b"abcd");
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned, capped response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            errors_for(&events, flow.id).len(),
+            1,
+            "one typed error: {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_the_store_before_the_malformed_error_is_dispatched() {
+        // AC4's store-then-event order on the other path that dispatches a typed
+        // error (spec D3): when the machine refuses the origin's bytes after the
+        // head and a chunk were stored, the sink handling `Event::Error` already
+        // sees the response buffered (`hello`) and truncated.
+        let mut section = String::from("0\r\n");
+        for n in 0..65 {
+            section.push_str(&format!("x-evil-91c2-{n}: v\r\n"));
+        }
+        section.push_str("\r\n");
+        let (up, origin_end) = duplex(64 * 1024);
+        let store = Arc::new(MemFlowStore::new());
+        let sink = Arc::new(ErrorProbe {
+            store: store.clone(),
+            events: Mutex::new(Vec::new()),
+            at_error: Mutex::new(Vec::new()),
+            expect_body: b"hello",
+        });
+        let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink.clone());
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            Arc::new(Mutex::new(Vec::new())),
+            vec![vec![TRAILER_HEAD.to_string(), section]],
+        ));
+
+        let (served, _) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an over-cap trailer section fails the connection");
+        assert!(err.to_string().contains("trailer"), "error: {err}");
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        assert_abandoned(&flow, b"hello");
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            errors_for(&events, flow.id),
+            vec![&aitm_core::FlowError::Upstream(
+                "malformed response from upstream".to_string()
+            )],
+            "one typed error, in fixed words: {events:?}"
+        );
+        assert_eq!(
+            *sink.at_error.lock().expect("at_error lock"),
+            vec![(true, true)],
+            "the store holds the buffered, truncated response when Event::Error is dispatched"
         );
     }
 }

@@ -8445,3 +8445,119 @@ async fn push_on_error_carries_the_abandoned_response_sizes() {
     let _ = w.shutdown().await;
     let _ = task.await;
 }
+
+/// Tester addition. AC12's lock on the paths the fully-populated fixtures never
+/// reach: the null rules (no response: null `status`, `response_bytes` and
+/// `duration_ms`; a body still streaming: null `response_bytes`; a clock before
+/// the epoch: null `started_at`), a non-`observed` intercept label, and
+/// saturation (a duration past `i64::MAX` ms). Each pushed summary must equal
+/// the real `flow.get` object; the literal checks on the expected side keep the
+/// comparison from passing on two objects that both got a rule wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_summary_equals_flow_get_on_the_null_and_saturated_paths() {
+    let store = Arc::new(MemFlowStore::new());
+
+    // (a) No response yet: observed, not a replay, nothing timed.
+    let pending_id = store.insert(http_flow("example.com:443", "/pending"));
+
+    // (b) The head is stored but the body still streams; created before the epoch.
+    let mut streaming = http_flow("example.com:443", "/streaming");
+    let Flow::Http(f) = &mut streaming else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.response = Some(HttpResponse {
+        status: 206,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Streamed(StreamBody),
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = UNIX_EPOCH - Duration::from_secs(1);
+    let streaming_id = store.insert(streaming);
+
+    // (c) A killed flow whose duration does not fit an i64 of milliseconds.
+    let mut absurd = http_flow("example.com:443", "/absurd");
+    let Flow::Http(f) = &mut absurd else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.response = Some(HttpResponse {
+        status: 500,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Empty,
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.duration = Some(Duration::MAX);
+    f.intercept = InterceptState::Killed;
+    let absurd_id = store.insert(absurd);
+
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+    subscribe_all(&mut w, &mut lines).await;
+
+    // (a)
+    let expected = capture_flow_get(&store, pending_id);
+    assert_eq!(expected.get("status"), Some(&JsonValue::Null), "{expected}");
+    assert_eq!(
+        expected.get("response_bytes"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    assert_eq!(
+        expected.get("duration_ms"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    assert_eq!(expected["request_bytes"], json!(0));
+    assert_eq!(expected["intercept"], "observed");
+    assert_eq!(expected["is_replay"], json!(false));
+    assert!(expected["started_at"].is_i64(), "{expected}");
+    srv.push_flow_event(&Event::RequestHeaders(pending_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], pending_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected,
+        "no response: null status, null response_bytes, null duration_ms"
+    );
+
+    // (b)
+    let expected = capture_flow_get(&store, streaming_id);
+    assert_eq!(expected["status"], json!(206));
+    assert_eq!(
+        expected.get("response_bytes"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    assert_eq!(
+        expected.get("started_at"),
+        Some(&JsonValue::Null),
+        "{expected}"
+    );
+    srv.push_flow_event(&Event::ResponseHeaders(streaming_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], streaming_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected,
+        "a streaming body is a null size; a pre-epoch clock is a null started_at"
+    );
+
+    // (c)
+    let expected = capture_flow_get(&store, absurd_id);
+    assert_eq!(expected["duration_ms"], json!(i64::MAX), "{expected}");
+    assert_eq!(expected["intercept"], "killed");
+    assert_eq!(expected["response_bytes"], json!(0));
+    assert_eq!(expected["status"], json!(500));
+    srv.push_flow_event(&Event::Response(absurd_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], absurd_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected,
+        "a saturated duration and a killed label render the same on both sides"
+    );
+
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}

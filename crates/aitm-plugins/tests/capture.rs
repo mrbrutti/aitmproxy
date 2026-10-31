@@ -556,3 +556,115 @@ fn flow_get_reports_sizes_for_an_abandoned_response() {
         after.get("duration_ms")
     );
 }
+
+// ---- tester additions: empty and oversized inputs on the timing/size paths ----
+
+/// Empty input on the abandon path: a response that failed before any body byte
+/// arrived is stored as `Body::Empty`, and `flow.get` reports a concrete
+/// `response_bytes: 0` (not null) with a duration, so a UI waiting on the size
+/// stops waiting.
+#[test]
+fn flow_get_reports_zero_bytes_for_an_abandoned_response_with_nothing_captured() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let store = MemFlowStore::new();
+
+    let mut streaming = http_flow("GET", "/stream-empty", Some(200));
+    if let Flow::Http(f) = &mut streaming {
+        f.response.as_mut().expect("response").body = Body::Streamed(aitm_core::StreamBody);
+    }
+    let id = store.insert(streaming);
+
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+    let get = |id: FlowId| -> BTreeMap<String, Value> {
+        match reg
+            .command("flow.get")
+            .expect("flow.get registered")
+            .invoke(id_params(id), &host)
+            .expect("flow.get ok")
+        {
+            Value::Object(obj) => obj,
+            other => panic!("flow.get must return an object, got {other:?}"),
+        }
+    };
+
+    assert_eq!(get(id).get("response_bytes"), Some(&Value::Null));
+    assert!(store.abandon_response(id, Vec::new()));
+    let after = get(id);
+    assert_eq!(
+        after.get("response_bytes"),
+        Some(&Value::Int(0)),
+        "nothing captured is a known size of zero, not an unknown size"
+    );
+    assert_eq!(after.get("status"), Some(&Value::Int(200)));
+    assert!(
+        matches!(after.get("duration_ms"), Some(&Value::Int(_))),
+        "an abandoned response has a duration, got {:?}",
+        after.get("duration_ms")
+    );
+    assert_eq!(
+        store.clear().cleared,
+        1,
+        "an abandoned response with an empty body is terminal"
+    );
+}
+
+/// Oversized input: a duration whose millisecond count exceeds `i64` is
+/// saturated to `i64::MAX` by both `flow.get` and `flow.table` (the shared
+/// helper), never wrapped into a negative or truncated number.
+#[test]
+fn flow_get_and_flow_table_saturate_an_absurd_duration() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let store = MemFlowStore::new();
+
+    let mut absurd = http_flow("GET", "/forever", Some(200));
+    if let Flow::Http(f) = &mut absurd {
+        f.metadata.duration = Some(Duration::MAX);
+    }
+    let id = store.insert(absurd);
+
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let got = reg
+        .command("flow.get")
+        .expect("flow.get registered")
+        .invoke(id_params(id), &host)
+        .expect("flow.get ok");
+    let Value::Object(summary) = got else {
+        panic!("flow.get must return an object, got {got:?}");
+    };
+    assert_eq!(
+        summary.get("duration_ms"),
+        Some(&Value::Int(i64::MAX)),
+        "flow.get saturates rather than wraps"
+    );
+
+    let table = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .invoke(Params::default(), &host)
+        .expect("flow.table ok");
+    let Value::Object(obj) = table else {
+        panic!("flow.table must return an object, got {table:?}");
+    };
+    let Some(Value::Array(rows)) = obj.get("flows") else {
+        panic!("flow.table result must have a `flows` array: {obj:?}");
+    };
+    let row = rows
+        .iter()
+        .find_map(|row| match row {
+            Value::Object(r) if r.get("id") == Some(&Value::Str(id.to_string())) => Some(r),
+            _ => None,
+        })
+        .expect("the flow has a flow.table row");
+    assert_eq!(
+        row.get("duration_ms"),
+        Some(&Value::Int(i64::MAX)),
+        "flow.table saturates the same way"
+    );
+}
