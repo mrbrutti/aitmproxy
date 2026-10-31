@@ -181,7 +181,8 @@ final class BusService: FlowActions {
     /// The only writer of `scope.json` (D4). Snapshot semantics: the file is the embedded
     /// core's `scope.list` as of the operator's last Scope action — written from
     /// `addScope`/`removeScope` only after the verb and the refresh both succeeded; never
-    /// on connect or poll, never while the client points at an external core, never in
+    /// on connect or poll, never while the client points at an external core (the callers
+    /// also require that intent to have held across the whole round trip), never in
     /// fixture/snapshot/self-test runs. A failed save is swallowed like `Pins`: the
     /// in-memory scope stays right for this run.
     private func persistEmbeddedScope() {
@@ -249,13 +250,18 @@ final class BusService: FlowActions {
     }
 
     func addScope(_ host: String) async throws {
+        // Snapshot the embedded intent before the round trip: a Settings ▸ Bus switch while the
+        // verb and the refresh are in flight must not persist the other core's list, so the
+        // write needs `preferEmbedded` to hold both before and after.
+        let embedded = preferEmbedded
         _ = try await call("scope.add", ["host": .string(host)])
-        if await refreshScope() { persistEmbeddedScope() }
+        if await refreshScope(), embedded, preferEmbedded { persistEmbeddedScope() }
     }
 
     func removeScope(_ host: String) async throws {
+        let embedded = preferEmbedded
         _ = try await call("scope.remove", ["host": .string(host)])
-        if await refreshScope() { persistEmbeddedScope() }
+        if await refreshScope(), embedded, preferEmbedded { persistEmbeddedScope() }
     }
 
     func mark(_ id: FlowID, color: MarkColor?) async throws {

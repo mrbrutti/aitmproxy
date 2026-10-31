@@ -201,8 +201,8 @@ import Testing
     }
 
     @Test func aHugeHostListRoundTripsWholeAndInOrder() throws {
-        // Oversized input: no silent cap or truncation — a long, valid list round-trips whole and
-        // in order, and its duplicates collapse to one each.
+        // A long, valid list under the 10 000-entry cap round-trips whole and in order, and its
+        // duplicates collapse to one each (the cap itself is pinned in the fix-wave section below).
         let hosts = (0..<5_000).map { "h\($0).example.test" }
         let url = tempURL()
         defer { try? FileManager.default.removeItem(at: url) }
@@ -254,5 +254,90 @@ import Testing
         try EmbeddedScope(hosts: ["ok.test", "evil.test\nlisten: 0.0.0.0:1", "a\tb.test"]).save(to: url)
 
         #expect(EmbeddedScope.load(from: url).hosts == ["ok.test"])
+    }
+
+    // MARK: Fix wave — libyaml-printable allow-list (spec D1 amendment; security S1)
+
+    @Test func isPersistableRejectsScalarsTheCoreYAMLReaderRefuses() {
+        // libyaml (the core's serde_yaml reader) refuses U+FFFE and U+FFFF, which `Scope.validate`,
+        // the Cc/Cf clause and the core's own `scope.add` all accept. Persisted, such a host would
+        // make the core refuse every spawn's config and wedge it in a restart loop.
+        #expect(Scope.validate("foo\u{FFFF}.test") == nil)
+
+        #expect(!EmbeddedScope.isPersistable("foo\u{FFFF}.test"))
+        #expect(!EmbeddedScope.isPersistable("foo\u{FFFE}.test"))
+        #expect(EmbeddedScope.sanitized(["foo\u{FFFE}.test", "ok.test", "foo\u{FFFF}.test"]) == ["ok.test"])
+        #expect(loaded(fromBytes: #"{"hosts": ["foo\uFFFE.test", "ok.test", "foo\uFFFF.test"]}"#).hosts == ["ok.test"])
+    }
+
+    @Test func isPersistableAllowListIsLibyamlsNotASCII() {
+        // The edges of libyaml's printable ranges: non-ASCII letters, punycode, the last BMP scalar
+        // it accepts (U+FFFD) and the first supplementary one (U+10000) all stay persistable.
+        #expect(EmbeddedScope.isPersistable("bücher.example"))
+        #expect(EmbeddedScope.isPersistable("xn--bcher-kva.example"))
+        #expect(EmbeddedScope.isPersistable("日本.example"))
+        #expect(EmbeddedScope.isPersistable("\u{FFFD}.example"))
+        #expect(EmbeddedScope.isPersistable("\u{10000}.example"))
+    }
+
+    // MARK: Fix wave — size, type, count and length caps (spec D1 amendment; security S2)
+
+    @Test func aFileOverOneMebibyteLoadsEmptyAndOneAtTheLimitLoads() {
+        // The padding sits in an ignored key, so the only difference between the two files is one
+        // byte of length: exactly 1 MiB is read, 1 MiB + 1 is not.
+        let head = #"{"hosts": ["ok.test"], "pad": ""#
+        let tail = #""}"#
+        func file(ofBytes n: Int) -> String {
+            head + String(repeating: "x", count: n - head.utf8.count - tail.utf8.count) + tail
+        }
+        let atLimit = file(ofBytes: 1_048_576)
+        let overLimit = file(ofBytes: 1_048_577)
+        #expect(atLimit.utf8.count == 1_048_576)
+        #expect(overLimit.utf8.count == 1_048_577)
+
+        #expect(loaded(fromBytes: atLimit).hosts == ["ok.test"])
+        #expect(loaded(fromBytes: overLimit) == EmbeddedScope())
+    }
+
+    @Test func aSymlinkAtThePathLoadsEmpty() throws {
+        // Only a regular file is read: a link at the path is not followed (the per-launch config's
+        // no-follow posture); a directory is covered above, and a FIFO would block the read.
+        let target = tempURL()
+        let link = tempURL()
+        defer {
+            try? FileManager.default.removeItem(at: link)
+            try? FileManager.default.removeItem(at: target)
+        }
+        try Data(#"{"hosts": ["ok.test"]}"#.utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: target)
+
+        #expect(EmbeddedScope.load(from: target).hosts == ["ok.test"])
+        #expect(EmbeddedScope.load(from: link) == EmbeddedScope())
+    }
+
+    @Test func sanitizedKeepsAtMostTenThousandHostsTheFirstOnesInOrder() {
+        let hosts = (0..<10_001).map { "h\($0).example.test" }
+
+        let kept = EmbeddedScope.sanitized(hosts)
+
+        #expect(kept.count == 10_000)
+        #expect(kept == Array(hosts.prefix(10_000)))
+        #expect(kept.last == "h9999.example.test")
+        // Dropped and duplicate entries do not use up the cap.
+        #expect(EmbeddedScope.sanitized(["", "h0.example.test"] + hosts) == Array(hosts.prefix(10_000)))
+        // And through the file (about 300 KB, well under the size cap).
+        let json = #"{"hosts": [""# + hosts.joined(separator: #"", ""#) + #""]}"#
+        #expect(loaded(fromBytes: json).hosts == Array(hosts.prefix(10_000)))
+    }
+
+    @Test func sanitizedDropsAHostLongerThan1024Characters() {
+        let atLimit = String(repeating: "a", count: 1_024 - ".test".count) + ".test"
+        let overLimit = String(repeating: "a", count: 1_025 - ".test".count) + ".test"
+        #expect(atLimit.count == 1_024)
+        #expect(overLimit.count == 1_025)
+        #expect(Scope.validate(overLimit) == nil)   // the page validator has no length rule
+
+        #expect(EmbeddedScope.sanitized([overLimit, atLimit, "ok.test"]) == [atLimit, "ok.test"])
+        #expect(loaded(fromBytes: #"{"hosts": [""# + overLimit + #"", ""# + atLimit + #""]}"#).hosts == [atLimit])
     }
 }

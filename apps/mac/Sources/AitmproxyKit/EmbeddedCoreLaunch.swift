@@ -298,15 +298,17 @@ public enum EmbeddedCoreLaunch {
 
     /// Escapes a value (a filesystem path, or a scope host) for embedding inside a
     /// double-quoted YAML scalar: backslashes and double-quotes are backslash-escaped.
-    /// A value containing a newline (`\n` or `\r`) is rejected with `onNewline(value)`
-    /// — a newline cannot be represented inside a double-quoted scalar on one line,
-    /// and allowing it would let a crafted value inject arbitrary YAML (S3). Returns
-    /// the inner text to splice between quotes.
+    /// A value containing a newline scalar (`\n` or `\r`, alone or as CRLF) is rejected
+    /// with `onNewline(value)` — a newline cannot be represented inside a double-quoted
+    /// scalar on one line, and allowing it would let a crafted value inject arbitrary
+    /// YAML (S3). Returns the inner text to splice between quotes.
     static func yamlDoubleQuoted(
         _ value: String,
         onNewline: (String) -> ConfigError = ConfigError.pathContainsNewline
     ) throws -> String {
-        guard !value.contains("\n"), !value.contains("\r") else {
+        // Scalars, not Characters: `"\r\n"` is one Swift grapheme, so a Character-level
+        // `contains("\n")` let a CRLF value through.
+        guard !value.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) else {
             throw onNewline(value)
         }
         return value

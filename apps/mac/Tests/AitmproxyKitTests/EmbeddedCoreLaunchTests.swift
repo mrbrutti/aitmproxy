@@ -348,7 +348,9 @@ import Testing
         #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\nlisten: 0.0.0.0:1")) {
             try config(scopeHosts: ["ok.test", "evil.test\nlisten: 0.0.0.0:1"]).yaml()
         }
-        #expect(throws: (any Error).self) { try config(scopeHosts: ["evil.test\rx"]).yaml() }
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\rx")) {
+            try config(scopeHosts: ["evil.test\rx"]).yaml()
+        }
     }
 
     @Test func scope_block_follows_the_ssl_and_capture_tails() throws {
