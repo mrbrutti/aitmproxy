@@ -105,6 +105,11 @@ Terminal panel, after merge-readiness.
   - `crates/aitm/src/web/mod.rs` (modify: add `WebState` field)
   - `crates/aitm/src/main.rs` (modify: construct the field in the `WebState`
     literal)
+  - `crates/aitm/tests/{discover_e2e,web_bus_governance,web,web_bus_concurrency,web_bus_push,web_bus_roles}.rs`
+    (modify: `WebState` has no `Default`, so every `WebState { … }` literal must
+    add `bad_token_throttle: Default::default(),` — one line each. Found during
+    implementation; required for `cargo clippy --all-targets`/`cargo test` to
+    compile.)
 - **Change:**
   - In `bridge.rs`: `pub const BAD_TOKEN_WINDOW: Duration = Duration::from_secs(60);`;
     `#[derive(Default)] pub struct BadTokenThrottle` over a `std::sync::Mutex` of

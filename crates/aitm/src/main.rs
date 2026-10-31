@@ -534,6 +534,7 @@ async fn run() -> anyhow::Result<()> {
                     mcp: bus,
                     agent_token: settings.token.clone(),
                     operator_token: operator_token.clone(),
+                    bad_token_throttle: Default::default(),
                 });
                 if settings.insecure_bind {
                     warn!(

@@ -117,6 +117,56 @@ pub const UNAUTHORIZED: i64 = -32001;
 pub const UNAUTHORIZED_REPLY: &str =
     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"unauthorized"}}"#;
 
+/// The bad-token refusal warn is logged at most once per this window, carrying
+/// the count of refusals accumulated since the last emit. A browser tab left open
+/// from a prior `aitm web` run reconnects every few seconds with its now-stale
+/// token; without a throttle every attempt logs a line and floods the console.
+pub const BAD_TOKEN_WINDOW: Duration = Duration::from_secs(60);
+
+/// Rate-limiter for the bad-token refusal warn ([`BAD_TOKEN_WINDOW`]). The
+/// decision lives in a pure, clock-injectable unit ([`BadTokenThrottle::record`]);
+/// the interior `Mutex` lets one throttle be shared behind `&WebState` across all
+/// connections. Default-constructed with no window open.
+#[derive(Default)]
+pub struct BadTokenThrottle {
+    inner: std::sync::Mutex<ThrottleState>,
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    /// Refusals seen since the last emit, including the one being recorded.
+    pending: u64,
+    /// When the current window opened; `None` until the first refusal.
+    window_start: Option<std::time::Instant>,
+}
+
+impl BadTokenThrottle {
+    /// Record one bad-token refusal observed at `now`. Returns `Some(count)` when
+    /// this refusal should be logged — the first ever and the first in each new
+    /// window — where `count` is the number of refusals accumulated since the last
+    /// emit; returns `None` when it falls inside the current window and should be
+    /// suppressed. On an emit the window restarts at `now` and the count resets.
+    pub fn record(&self, now: std::time::Instant) -> Option<u64> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending += 1;
+        let emit = match state.window_start {
+            None => true,
+            Some(start) => now.saturating_duration_since(start) >= BAD_TOKEN_WINDOW,
+        };
+        if emit {
+            let count = state.pending;
+            state.pending = 0;
+            state.window_start = Some(now);
+            Some(count)
+        } else {
+            None
+        }
+    }
+}
+
 /// The outcome of validating an upgrade request.
 pub enum Handshake {
     /// Send this `101 Switching Protocols` and take the connection over.
@@ -216,7 +266,12 @@ async fn relay(mut ws: Ws, state: &WebState) -> anyhow::Result<()> {
                     continue; // whitespace only; wait for a real first line
                 };
                 let Some(resolved) = classify_token(first, state) else {
-                    warn!("web bus: refused a connection with a bad token");
+                    if let Some(n) = state.bad_token_throttle.record(std::time::Instant::now()) {
+                        warn!(
+                            refusals = n,
+                            "web bus: refused connections with a bad token (suppressing repeats)"
+                        );
+                    }
                     ws.send(Message::text(UNAUTHORIZED_REPLY)).await?;
                     return close(ws, CloseCode::Policy, "unauthorized").await;
                 };
@@ -706,5 +761,19 @@ mod tests {
         let v: JsonValue = serde_json::from_str(UNAUTHORIZED_REPLY).unwrap();
         assert_eq!(v["error"]["code"], UNAUTHORIZED);
         assert!(v["id"].is_null());
+    }
+
+    /// AC6: the bad-token refusal warn is rate-limited to at most one line per
+    /// [`BAD_TOKEN_WINDOW`], each carrying the count accumulated since the last
+    /// emit. The first-ever refusal and the first after the window emit; refusals
+    /// inside the window are suppressed.
+    #[test]
+    fn bad_token_throttle_emits_then_suppresses_until_the_window() {
+        let t = BadTokenThrottle::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(t.record(t0), Some(1));
+        assert_eq!(t.record(t0 + Duration::from_secs(1)), None);
+        assert_eq!(t.record(t0 + Duration::from_secs(2)), None);
+        assert_eq!(t.record(t0 + Duration::from_secs(61)), Some(3));
     }
 }

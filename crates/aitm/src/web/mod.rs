@@ -74,6 +74,10 @@ pub struct WebState {
     /// configured (operator role exists at all). `None` ⇒ the web UI is
     /// agent-only, exactly as before this change.
     pub operator_token: Option<String>,
+    /// Rate-limiter for the bad-token refusal warn, shared across every
+    /// connection via the `Arc`-shared `WebState` so a stale tab reconnecting
+    /// across connections logs at most one line per [`bridge::BAD_TOKEN_WINDOW`].
+    pub bad_token_throttle: bridge::BadTokenThrottle,
 }
 
 /// `aitm web …` after argument parsing.
