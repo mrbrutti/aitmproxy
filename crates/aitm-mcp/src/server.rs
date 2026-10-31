@@ -1217,9 +1217,11 @@ impl McpServer {
     ///
     /// A change does not stop a call that already passed the gate. Its reply is
     /// still delivered, and work it started (an armed intercept, a running scan)
-    /// carries on. A server that does not share the `Arc` sees none of this:
-    /// `aitm tui` builds its agent server with a private `AgentState`, so
-    /// `agent.set` there reaches no other server.
+    /// carries on. A server that is not given the shared `Arc` sees none of this:
+    /// it keeps its own `AgentState`, so an `agent.set` on it reaches no other
+    /// server and one made elsewhere does not reach it. The agent servers of
+    /// bare `aitm`, `aitm web` and `aitm tui` all share the core's `Arc`
+    /// through `tui::with_shared_governance`.
     pub fn with_agent_state(mut self, agent_state: Arc<AgentState>) -> Self {
         self.agent_state = agent_state;
         self
