@@ -2319,25 +2319,34 @@ mod tests {
     }
 
     /// A corpus pin, not a theorem: over its own output the wide scrub gives the
-    /// same text on every input of the three corpora, so a change that makes the
-    /// second scan read what the first one wrote shows up here. (An unclosed quote
-    /// can read differently once its value is masked, so the property is not
-    /// claimed for arbitrary text.)
+    /// same text on every input of the three corpora, and the first scrub changes
+    /// at least a hundred of them, so a scrub that leaves text alone does not meet
+    /// the pin. A change that makes the second scan read what the first one wrote
+    /// shows up here. (An unclosed quote can read differently once its value is
+    /// masked, so the property is not claimed for arbitrary text.)
     #[test]
     fn scrub_text_wide_is_stable_on_its_own_output_across_the_corpora() {
         let inputs = corpus_inputs();
-        let bad: Vec<(&str, String, String)> = inputs
-            .iter()
-            .filter_map(|&input| {
-                let once = scrub_text_wide(input);
-                let twice = scrub_text_wide(&once);
-                (once != twice).then_some((input, once, twice))
-            })
-            .collect();
+        let mut changed = 0;
+        let mut bad: Vec<(&str, String, String)> = Vec::new();
+        for &input in &inputs {
+            let once = scrub_text_wide(input);
+            let twice = scrub_text_wide(&once);
+            if once != input {
+                changed += 1;
+            }
+            if once != twice {
+                bad.push((input, once, twice));
+            }
+        }
         assert!(
             inputs.len() >= 100,
             "only {} inputs are checked",
             inputs.len()
+        );
+        assert!(
+            changed >= 100,
+            "only {changed} inputs are changed by the first scrub: the test is vacuous"
         );
         assert!(
             bad.is_empty(),
