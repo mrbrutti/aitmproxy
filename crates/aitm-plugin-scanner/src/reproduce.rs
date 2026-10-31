@@ -2036,4 +2036,54 @@ mod tests {
             assert!(var.required && var.default.is_none(), "{var:?}");
         }
     }
+
+    /// Each of the five short words is read as a substring, by the name decision
+    /// and by the embedded-value scrub alike, inside a key that is no whole
+    /// segment (`myjwt2`, `JWTX`, `ajwt`). The expected output is literal.
+    #[test]
+    fn scrub_embedded_masks_a_key_that_merely_contains_each_segment_word() {
+        let mut bad: Vec<(String, bool, String)> = Vec::new();
+        for word in ["sid", "jwt", "csrf", "session", "auth"] {
+            let upper = word.to_ascii_uppercase();
+            for key in [
+                format!("my{word}2"),
+                format!("{upper}X"),
+                format!("a{word}"),
+            ] {
+                let actual = scrub_embedded(&format!("{key}=VALUE9&page=2"));
+                let expected = format!("{key}=[redacted]&page=2");
+                let named = is_secret_name(&key);
+                if !named || actual != expected {
+                    bad.push((key, named, actual));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "(key, is_secret_name, scrub_embedded output): {bad:#?}"
+        );
+    }
+
+    /// The part of a PoC URL before the `?` is free text and keeps the standard
+    /// reading: a host:port in the path stays readable. The same text as a query
+    /// value is an embedded value, read the wide way, so its port is masked.
+    #[test]
+    fn build_poc_reads_the_url_path_by_the_standard_reading() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with_query("/go/auth.example.com:8443/x?q=hello&u=auth.example.com:8443");
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let url = &http_step(&poc).url;
+        assert!(
+            url.starts_with("{{target}}/go/auth.example.com:8443/x?"),
+            "{url}"
+        );
+        assert!(
+            url.ends_with("&u=auth.example.com%3A%5Bredacted%5D"),
+            "{url}"
+        );
+    }
 }
