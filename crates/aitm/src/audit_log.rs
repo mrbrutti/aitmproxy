@@ -32,6 +32,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use aitm_core::{AuditEntry, AuditLane, DurableAudit, DurableAuditStatus, Frontend};
 use tracing::{info, warn};
 
+mod registry;
+
+pub use registry::{Registration, SecretRegistry};
+
 /// One of the three audit streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
