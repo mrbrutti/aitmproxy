@@ -1,0 +1,1127 @@
+//! The `capture.status` handle: what the core knows about the macOS NE capture
+//! path, recorded by the feeder (`feeder.rs`) and read by the bus verb.
+//!
+//! The handle is split into a [`CaptureStatusWriter`] (the feeder's side; its
+//! mutators are `pub(super)`, so only `macos_capture` can record a transition)
+//! and a [`CaptureStatusReader`] (the verb's side; one method,
+//! [`CaptureStatusReader::snapshot`]), so "read-only from the bus" is a
+//! type-level fact rather than a review convention (spec D1, CS-AC16; precedent:
+//! the sealed `Governance` in `wire.rs`).
+//!
+//! Storage is one mutex over the small, rarely-changing facts (feeder state,
+//! provider state, scope tokens) plus atomics for the per-flow counters and the
+//! last-handoff time, so the hot path — one flow handed off — is two relaxed
+//! atomic operations and takes no lock (spec Anti-goals). `snapshot()` takes the
+//! mutex and then reads the atomics: a consistent view at that granularity, not a
+//! transaction (spec D2).
+//!
+//! Timestamps are Unix-epoch milliseconds (spec D9). `0` is the internal "none"
+//! sentinel and is emitted as `null`; a real epoch-millisecond value is never 0,
+//! so a pre-1970 clock reads as none.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use aitm_core::Value;
+
+use super::capability::CaptureCapability;
+use super::listener::{FlowKind, ScopeSpec};
+
+/// Why the feeder is off: the closed vocabulary `feeder.reason` carries when
+/// `feeder.state == "off"` (spec D7, CS-AC4). Exactly four values; clients may
+/// match on [`as_str`](Self::as_str).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffReason {
+    /// `macos_capture.enabled` is false in the config file.
+    Disabled,
+    /// Enabled, but this is not a macOS build.
+    NotMacos,
+    /// macOS and enabled, but the feeder has not bound yet — the window before
+    /// `run`, or the one-shot CLI mode where it never runs.
+    NotStarted,
+    /// The feeder ran and returned.
+    Stopped,
+}
+
+impl OffReason {
+    /// The wire string, in vocabulary order.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "macos_capture.enabled is false",
+            Self::NotMacos => "not a macOS build",
+            Self::NotStarted => "not started",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// Where the feeder is (spec D2 `feeder`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeederState {
+    /// Not running, for the carried reason.
+    Off(OffReason),
+    /// The sockets are bound and the rendezvous is published.
+    Listening,
+    /// The sockets could not be bound or the rendezvous could not be published;
+    /// terminal for the session. The reason is `io::ErrorKind` text, never a path.
+    BindFailed(String),
+}
+
+/// Whether a verified provider is attached (spec D2 `provider`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderState {
+    /// No provider holds the scope.
+    Detached,
+    /// A provider passed the code-signature check and received its initial scope.
+    Attached {
+        /// When the initial scope was sent, Unix-epoch milliseconds (`0` = unknown).
+        attached_at_ms: u64,
+        /// The team the verifier's requirement pins ([`PeerVerifier::team_id`]),
+        /// not a value read from the peer.
+        ///
+        /// [`PeerVerifier::team_id`]: super::peer_auth::PeerVerifier::team_id
+        team_id: Option<String>,
+    },
+}
+
+/// One consistent read of the handle (spec D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureStatusSnapshot {
+    /// `macos_capture.enabled`, fixed for the process.
+    pub enabled: bool,
+    /// Feeder state.
+    pub feeder: FeederState,
+    /// Provider state.
+    pub provider: ProviderState,
+    /// The tokens of the scope spec most recently sent to the attached provider;
+    /// empty when detached.
+    pub scope_tokens: Vec<String>,
+    /// TCP flows handed off during the current attachment.
+    pub tcp_handed_off: u64,
+    /// UDP flows handed off during the current attachment.
+    pub udp_handed_off: u64,
+    /// When the last flow was handed off, Unix-epoch milliseconds; `None` when no
+    /// flow has been handed off in this attachment.
+    pub last_handoff_at_ms: Option<u64>,
+}
+
+impl CaptureStatusSnapshot {
+    /// The derived capability (spec D5), in precedence order: a bind failure is
+    /// `Degraded`; an attached provider is `Capturing` once a flow has been handed
+    /// off in this attachment and `ApprovedAttached` before; a listening feeder
+    /// with no provider is `AwaitingProvider`; an off feeder is `FeederOff` with the
+    /// off reason. The verb never produces the two app-side variants.
+    pub fn capability(&self) -> CaptureCapability {
+        match (&self.feeder, &self.provider) {
+            (FeederState::BindFailed(reason), _) => CaptureCapability::Degraded(reason.clone()),
+            (_, ProviderState::Attached { .. }) => {
+                if self.tcp_handed_off.saturating_add(self.udp_handed_off) > 0 {
+                    CaptureCapability::Capturing
+                } else {
+                    CaptureCapability::ApprovedAttached
+                }
+            }
+            (FeederState::Listening, ProviderState::Detached) => {
+                CaptureCapability::AwaitingProvider
+            }
+            (FeederState::Off(reason), ProviderState::Detached) => {
+                CaptureCapability::FeederOff(reason.as_str().to_string())
+            }
+        }
+    }
+
+    /// The exact wire shape (spec D7): nine top-level keys, nested `feeder`,
+    /// `provider` and `flows_handed_off` objects, nullable fields as `Null`.
+    pub fn to_value(&self) -> Value {
+        let capability = self.capability();
+        let capability_reason = match &capability {
+            CaptureCapability::Degraded(reason) | CaptureCapability::FeederOff(reason) => {
+                Value::Str(reason.clone())
+            }
+            _ => Value::Null,
+        };
+        let (feeder_state, feeder_reason) = match &self.feeder {
+            FeederState::Off(reason) => ("off", Value::Str(reason.as_str().to_string())),
+            FeederState::Listening => ("listening", Value::Null),
+            FeederState::BindFailed(reason) => ("bind_failed", Value::Str(reason.clone())),
+        };
+        let (provider_state, attached_at, team_id) = match &self.provider {
+            ProviderState::Detached => ("detached", Value::Null, Value::Null),
+            ProviderState::Attached {
+                attached_at_ms,
+                team_id,
+            } => (
+                "attached",
+                millis_value(*attached_at_ms),
+                team_id.clone().map_or(Value::Null, Value::Str),
+            ),
+        };
+        object([
+            ("capability", Value::Str(capability.wire_name().to_string())),
+            ("capability_reason", capability_reason),
+            ("enabled", Value::Bool(self.enabled)),
+            (
+                "feeder",
+                object([
+                    ("reason", feeder_reason),
+                    ("state", Value::Str(feeder_state.to_string())),
+                ]),
+            ),
+            (
+                "flows_handed_off",
+                object([
+                    ("tcp", count_value(self.tcp_handed_off)),
+                    ("udp", count_value(self.udp_handed_off)),
+                ]),
+            ),
+            (
+                "last_handoff_at",
+                millis_value(self.last_handoff_at_ms.unwrap_or(0)),
+            ),
+            (
+                "provider",
+                object([
+                    ("attached_at", attached_at),
+                    ("state", Value::Str(provider_state.to_string())),
+                    ("team_id", team_id),
+                ]),
+            ),
+            (
+                "scope_entries",
+                Value::Int(i64::try_from(self.scope_tokens.len()).unwrap_or(i64::MAX)),
+            ),
+            (
+                "scope_tokens",
+                Value::Array(
+                    self.scope_tokens
+                        .iter()
+                        .map(|token| Value::Str(token.clone()))
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+}
+
+/// A `Value::Object` from `(key, value)` pairs.
+fn object<const N: usize>(pairs: [(&str, Value); N]) -> Value {
+    Value::Object(
+        pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<BTreeMap<_, _>>(),
+    )
+}
+
+/// An epoch-millisecond stamp as the wire emits it: `Null` for the `0` sentinel
+/// (or a value that does not fit `i64`), else `Int`.
+fn millis_value(ms: u64) -> Value {
+    if ms == 0 {
+        return Value::Null;
+    }
+    i64::try_from(ms).map_or(Value::Null, Value::Int)
+}
+
+/// A counter as the wire emits it; saturates at `i64::MAX`.
+fn count_value(n: u64) -> Value {
+    Value::Int(i64::try_from(n).unwrap_or(i64::MAX))
+}
+
+/// Now, as Unix-epoch milliseconds; `0` (the none sentinel) for a pre-1970 clock
+/// or a count that does not fit.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|since_epoch| u64::try_from(since_epoch.as_millis()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+/// Lock `m`, recovering from a poisoned lock: the state is plain data and no
+/// critical section here can leave it inconsistent.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The facts behind the mutex: rarely written, never on the per-flow path.
+struct Inner {
+    feeder: FeederState,
+    provider: ProviderState,
+    tokens: Vec<String>,
+}
+
+/// The state both halves of the handle share.
+struct Shared {
+    enabled: bool,
+    inner: Mutex<Inner>,
+    tcp_handed_off: AtomicU64,
+    udp_handed_off: AtomicU64,
+    /// `0` = no handoff in this attachment.
+    last_handoff_at_ms: AtomicU64,
+}
+
+impl Shared {
+    /// Zero the per-attachment counters and the last-handoff time.
+    fn reset_counters(&self) {
+        self.tcp_handed_off.store(0, Ordering::Relaxed);
+        self.udp_handed_off.store(0, Ordering::Relaxed);
+        self.last_handoff_at_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a detach: provider `Detached`, tokens cleared, counters zeroed. The
+    /// caller holds the lock; idempotent.
+    fn clear_attachment(&self, inner: &mut Inner) {
+        inner.provider = ProviderState::Detached;
+        inner.tokens.clear();
+        self.reset_counters();
+    }
+}
+
+/// The shared capture-status state; built only through [`CaptureStatus::channel`],
+/// which hands out the two halves.
+pub struct CaptureStatus;
+
+impl CaptureStatus {
+    /// A writer/reader pair over fresh state. The initial feeder state is `Off`
+    /// with the reason the constructor can derive from its inputs: `Disabled` when
+    /// `!enabled`, `NotMacos` off a macOS build, else `NotStarted` (spec D1). Reads
+    /// `cfg!(target_os = "macos")` itself; see [`channel_on`](Self::channel_on).
+    pub fn channel(enabled: bool) -> (CaptureStatusWriter, CaptureStatusReader) {
+        Self::channel_on(enabled, cfg!(target_os = "macos"))
+    }
+
+    /// [`channel`](Self::channel) with the build target passed in, so a test on any
+    /// platform can exercise both branches.
+    pub(crate) fn channel_on(
+        enabled: bool,
+        macos: bool,
+    ) -> (CaptureStatusWriter, CaptureStatusReader) {
+        let reason = if !enabled {
+            OffReason::Disabled
+        } else if !macos {
+            OffReason::NotMacos
+        } else {
+            OffReason::NotStarted
+        };
+        let shared = Arc::new(Shared {
+            enabled,
+            inner: Mutex::new(Inner {
+                feeder: FeederState::Off(reason),
+                provider: ProviderState::Detached,
+                tokens: Vec::new(),
+            }),
+            tcp_handed_off: AtomicU64::new(0),
+            udp_handed_off: AtomicU64::new(0),
+            last_handoff_at_ms: AtomicU64::new(0),
+        });
+        (
+            CaptureStatusWriter(Arc::clone(&shared)),
+            CaptureStatusReader(shared),
+        )
+    }
+}
+
+/// The feeder's half: records transitions. Every mutator is `pub(super)`, so only
+/// `macos_capture` can call one; `wire.rs`, `main.rs`, other crates and the
+/// integration tests can only move the writer into the feeder.
+#[derive(Clone)]
+pub struct CaptureStatusWriter(Arc<Shared>);
+
+#[allow(dead_code)] // scaffolding: removed by plan Task 2, which wires feeder.rs
+impl CaptureStatusWriter {
+    /// The sockets are bound and the rendezvous is published.
+    pub(super) fn listening(&self) {
+        lock(&self.0.inner).feeder = FeederState::Listening;
+    }
+
+    /// The session could not start; `reason` must carry no path (spec D3).
+    pub(super) fn bind_failed(&self, reason: String) {
+        lock(&self.0.inner).feeder = FeederState::BindFailed(reason);
+    }
+
+    /// The session returned: feeder `Off(Stopped)` and the provider forced
+    /// `Detached` with tokens and counters cleared. A later [`Attachment`] drop
+    /// re-clears the same fields and changes nothing else.
+    pub(super) fn stopped(&self) {
+        let mut inner = lock(&self.0.inner);
+        inner.feeder = FeederState::Off(OffReason::Stopped);
+        self.0.clear_attachment(&mut inner);
+    }
+
+    /// A verified provider received its initial scope: stamp the attach time and
+    /// the verifier's team, replace the tokens, and start the per-attachment
+    /// counters from zero. Hold the returned guard for the life of the
+    /// attachment; dropping it records the detach.
+    #[must_use]
+    pub(super) fn attached(&self, team_id: Option<String>, tokens: Vec<String>) -> Attachment {
+        {
+            let mut inner = lock(&self.0.inner);
+            inner.provider = ProviderState::Attached {
+                attached_at_ms: now_ms(),
+                team_id,
+            };
+            inner.tokens = tokens;
+            self.0.reset_counters();
+        }
+        Attachment(Arc::clone(&self.0))
+    }
+
+    /// A re-pushed scope reached the provider: replace the tokens.
+    pub(super) fn scope_pushed(&self, tokens: Vec<String>) {
+        lock(&self.0.inner).tokens = tokens;
+    }
+
+    /// One flow of `kind` was handed to a pump. Two relaxed atomic operations; no
+    /// lock (spec Anti-goals).
+    pub(super) fn handed_off(&self, kind: FlowKind) {
+        let counter = match kind {
+            FlowKind::Tcp => &self.0.tcp_handed_off,
+            FlowKind::Udp => &self.0.udp_handed_off,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.0.last_handoff_at_ms.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+/// RAII proof that a provider is attached. Dropping it records the detach
+/// (provider `Detached`, tokens cleared, counters and last-handoff time zeroed),
+/// so an attachment task that is cancelled at shutdown detaches too (spec D3).
+pub struct Attachment(Arc<Shared>);
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        let mut inner = lock(&self.0.inner);
+        self.0.clear_attachment(&mut inner);
+    }
+}
+
+/// The bus verb's half: reads only. Its one public method is
+/// [`snapshot`](Self::snapshot); the writer's mutators are not reachable through
+/// it. A writer call on the reader does not compile:
+///
+/// ```compile_fail
+/// use aitm::macos_capture::status::CaptureStatus;
+/// let (_w, reader) = CaptureStatus::channel(true);
+/// reader.listening();
+/// ```
+///
+/// The same lines with a read compile and run:
+///
+/// ```
+/// use aitm::macos_capture::status::CaptureStatus;
+/// let (_w, reader) = CaptureStatus::channel(true);
+/// let _ = reader.snapshot();
+/// ```
+#[derive(Clone)]
+pub struct CaptureStatusReader(Arc<Shared>);
+
+impl CaptureStatusReader {
+    /// One consistent read: takes the mutex, then reads the atomics. No I/O.
+    pub fn snapshot(&self) -> CaptureStatusSnapshot {
+        let inner = lock(&self.0.inner);
+        let last_handoff_at_ms = self.0.last_handoff_at_ms.load(Ordering::Relaxed);
+        CaptureStatusSnapshot {
+            enabled: self.0.enabled,
+            feeder: inner.feeder.clone(),
+            provider: inner.provider.clone(),
+            scope_tokens: inner.tokens.clone(),
+            tcp_handed_off: self.0.tcp_handed_off.load(Ordering::Relaxed),
+            udp_handed_off: self.0.udp_handed_off.load(Ordering::Relaxed),
+            last_handoff_at_ms: (last_handoff_at_ms != 0).then_some(last_handoff_at_ms),
+        }
+    }
+}
+
+/// The tokens of a provider scope spec, exactly as the emitter joined them.
+/// `provider_scope_spec` never emits a token containing whitespace, so this
+/// round-trips: `scope_tokens(&spec).join(" ") == spec.spec` (spec D2).
+#[allow(dead_code)] // scaffolding: removed by plan Task 2, which wires feeder.rs
+pub(crate) fn scope_tokens(spec: &ScopeSpec) -> Vec<String> {
+    spec.spec
+        .split_ascii_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use aitm_core::{ScopeEntry, Value};
+    use aitm_proto_l4::types::{
+        IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
+        RateCap,
+    };
+
+    use super::super::adapter::CAPTURE_INTERFACE;
+    use super::super::capability::CaptureCapability;
+    use super::super::feeder::DEFAULT_SOCKET_DIR;
+    use super::super::listener::{FlowKind, ScopeSpec};
+    use super::super::scope_spec::provider_scope_spec;
+    use super::{
+        scope_tokens, CaptureStatus, CaptureStatusSnapshot, FeederState, OffReason, ProviderState,
+    };
+
+    // ---- helpers (Task 3 of the plan reuses these by name) ----------------------
+
+    /// Now, as Unix-epoch milliseconds — the same clock the handle stamps with.
+    fn now_ms() -> u64 {
+        let since_epoch = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock is after 1970");
+        u64::try_from(since_epoch.as_millis()).expect("millisecond count fits in u64")
+    }
+
+    fn s(v: &str) -> Value {
+        Value::Str(v.to_string())
+    }
+
+    fn obj(pairs: Vec<(&str, Value)>) -> Value {
+        Value::Object(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    }
+
+    /// `value[key]`: the member of an object; panics on a missing key or a
+    /// non-object so a test reads like the literal it checks.
+    fn at<'a>(value: &'a Value, key: &str) -> &'a Value {
+        match value {
+            Value::Object(map) => map
+                .get(key)
+                .unwrap_or_else(|| panic!("no key {key:?} in {value:?}")),
+            other => panic!("{key:?} indexed into a non-object: {other:?}"),
+        }
+    }
+
+    /// Spec D7, "Disabled".
+    fn disabled_literal() -> Value {
+        obj(vec![
+            ("capability", s("feeder_off")),
+            ("capability_reason", s("macos_capture.enabled is false")),
+            ("enabled", Value::Bool(false)),
+            (
+                "feeder",
+                obj(vec![
+                    ("reason", s("macos_capture.enabled is false")),
+                    ("state", s("off")),
+                ]),
+            ),
+            (
+                "flows_handed_off",
+                obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))]),
+            ),
+            ("last_handoff_at", Value::Null),
+            (
+                "provider",
+                obj(vec![
+                    ("attached_at", Value::Null),
+                    ("state", s("detached")),
+                    ("team_id", Value::Null),
+                ]),
+            ),
+            ("scope_entries", Value::Int(0)),
+            ("scope_tokens", Value::Array(vec![])),
+        ])
+    }
+
+    /// Spec D7, "Listening, no provider yet".
+    fn listening_literal() -> Value {
+        obj(vec![
+            ("capability", s("awaiting_provider")),
+            ("capability_reason", Value::Null),
+            ("enabled", Value::Bool(true)),
+            (
+                "feeder",
+                obj(vec![("reason", Value::Null), ("state", s("listening"))]),
+            ),
+            (
+                "flows_handed_off",
+                obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))]),
+            ),
+            ("last_handoff_at", Value::Null),
+            (
+                "provider",
+                obj(vec![
+                    ("attached_at", Value::Null),
+                    ("state", s("detached")),
+                    ("team_id", Value::Null),
+                ]),
+            ),
+            ("scope_entries", Value::Int(0)),
+            ("scope_tokens", Value::Array(vec![])),
+        ])
+    }
+
+    /// Spec D7, "Bind failed".
+    fn bind_failed_literal() -> Value {
+        obj(vec![
+            ("capability", s("degraded")),
+            (
+                "capability_reason",
+                s("cannot bind the capture sockets (not a directory)"),
+            ),
+            ("enabled", Value::Bool(true)),
+            (
+                "feeder",
+                obj(vec![
+                    (
+                        "reason",
+                        s("cannot bind the capture sockets (not a directory)"),
+                    ),
+                    ("state", s("bind_failed")),
+                ]),
+            ),
+            (
+                "flows_handed_off",
+                obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))]),
+            ),
+            ("last_handoff_at", Value::Null),
+            (
+                "provider",
+                obj(vec![
+                    ("attached_at", Value::Null),
+                    ("state", s("detached")),
+                    ("team_id", Value::Null),
+                ]),
+            ),
+            ("scope_entries", Value::Int(0)),
+            ("scope_tokens", Value::Array(vec![])),
+        ])
+    }
+
+    /// Spec D7, "Attached and capturing".
+    fn capturing_literal() -> Value {
+        obj(vec![
+            ("capability", s("capturing")),
+            ("capability_reason", Value::Null),
+            ("enabled", Value::Bool(true)),
+            (
+                "feeder",
+                obj(vec![("reason", Value::Null), ("state", s("listening"))]),
+            ),
+            (
+                "flows_handed_off",
+                obj(vec![("tcp", Value::Int(12)), ("udp", Value::Int(3))]),
+            ),
+            ("last_handoff_at", Value::Int(1_761_907_305_123)),
+            (
+                "provider",
+                obj(vec![
+                    ("attached_at", Value::Int(1_761_907_200_000)),
+                    ("state", s("attached")),
+                    ("team_id", s("995PCLM9KH")),
+                ]),
+            ),
+            ("scope_entries", Value::Int(3)),
+            (
+                "scope_tokens",
+                Value::Array(vec![
+                    s("example.com"),
+                    s("*.example.com"),
+                    s("198.51.100.7"),
+                ]),
+            ),
+        ])
+    }
+
+    /// Every `FeederState` (the four `Off` reasons, `Listening`, `BindFailed`) ×
+    /// `ProviderState` {`Detached`, `Attached`} × handoffs {(0,0), (1,0), (0,1)}:
+    /// 36 snapshots, the CS-AC12 matrix.
+    fn matrix() -> Vec<CaptureStatusSnapshot> {
+        let feeders = [
+            FeederState::Off(OffReason::Disabled),
+            FeederState::Off(OffReason::NotMacos),
+            FeederState::Off(OffReason::NotStarted),
+            FeederState::Off(OffReason::Stopped),
+            FeederState::Listening,
+            FeederState::BindFailed("cannot bind the capture sockets (not a directory)".into()),
+        ];
+        let providers = [
+            ProviderState::Detached,
+            ProviderState::Attached {
+                attached_at_ms: 1_761_907_200_000,
+                team_id: Some("995PCLM9KH".into()),
+            },
+        ];
+        let handoffs = [(0u64, 0u64), (1, 0), (0, 1)];
+        let mut rows = Vec::new();
+        for feeder in &feeders {
+            for provider in &providers {
+                for (tcp, udp) in handoffs {
+                    let attached = matches!(provider, ProviderState::Attached { .. });
+                    rows.push(CaptureStatusSnapshot {
+                        enabled: true,
+                        feeder: feeder.clone(),
+                        provider: provider.clone(),
+                        scope_tokens: if attached {
+                            vec!["example.com".into()]
+                        } else {
+                            Vec::new()
+                        },
+                        tcp_handed_off: tcp,
+                        udp_handed_off: udp,
+                        last_handoff_at_ms: if tcp + udp > 0 {
+                            Some(1_761_907_305_123)
+                        } else {
+                            None
+                        },
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    fn attached_at(snapshot: &CaptureStatusSnapshot) -> u64 {
+        match &snapshot.provider {
+            ProviderState::Attached { attached_at_ms, .. } => *attached_at_ms,
+            ProviderState::Detached => panic!("expected an attached provider: {snapshot:?}"),
+        }
+    }
+
+    // ---- tests --------------------------------------------------------------------
+
+    /// **CS-AC4.** The constructor's three `off` reasons, from its two inputs; the
+    /// disabled one is the D7 literal byte for byte.
+    #[test]
+    fn channel_reports_the_three_initial_off_reasons() {
+        let (_w, r) = CaptureStatus::channel(false);
+        let snap = r.snapshot();
+        assert_eq!(snap.feeder, FeederState::Off(OffReason::Disabled));
+        assert!(!snap.enabled);
+        assert_eq!(snap.to_value(), disabled_literal());
+
+        let (_w, r) = CaptureStatus::channel_on(true, false);
+        let snap = r.snapshot();
+        assert_eq!(snap.feeder, FeederState::Off(OffReason::NotMacos));
+        let v = snap.to_value();
+        assert_eq!(at(at(&v, "feeder"), "reason"), &s("not a macOS build"));
+        assert_eq!(at(&v, "capability_reason"), &s("not a macOS build"));
+        assert_eq!(at(&v, "enabled"), &Value::Bool(true));
+
+        let (_w, r) = CaptureStatus::channel_on(true, true);
+        let snap = r.snapshot();
+        assert_eq!(snap.feeder, FeederState::Off(OffReason::NotStarted));
+        assert_eq!(
+            at(at(&snap.to_value(), "feeder"), "reason"),
+            &s("not started")
+        );
+
+        // `channel` reads the build target itself.
+        let (_w, r) = CaptureStatus::channel(true);
+        let expected = if cfg!(target_os = "macos") {
+            OffReason::NotStarted
+        } else {
+            OffReason::NotMacos
+        };
+        assert_eq!(r.snapshot().feeder, FeederState::Off(expected));
+    }
+
+    /// **CS-AC4.** The closed vocabulary clients may match on.
+    #[test]
+    fn off_reason_vocabulary_is_exactly_four() {
+        assert_eq!(
+            [
+                OffReason::Disabled,
+                OffReason::NotMacos,
+                OffReason::NotStarted,
+                OffReason::Stopped,
+            ]
+            .map(OffReason::as_str),
+            [
+                "macos_capture.enabled is false",
+                "not a macOS build",
+                "not started",
+                "stopped",
+            ]
+        );
+    }
+
+    /// **CS-AC4, CS-AC6 (writer level).** `listening()` is the D7 listening
+    /// literal; `stopped()` is `off`/`stopped`.
+    #[test]
+    fn listening_then_stopped() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+        let snap = r.snapshot();
+        assert_eq!(snap.to_value(), listening_literal());
+        assert_eq!(snap.capability(), CaptureCapability::AwaitingProvider);
+
+        w.stopped();
+        let snap = r.snapshot();
+        assert_eq!(snap.feeder, FeederState::Off(OffReason::Stopped));
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::FeederOff("stopped".into())
+        );
+        assert_eq!(
+            at(&snap.to_value(), "feeder"),
+            &obj(vec![("reason", s("stopped")), ("state", s("off"))])
+        );
+    }
+
+    /// **CS-AC5 (writer level).** A bind failure is `degraded` with the reason in
+    /// both places. (The feeder never calls `stopped()` on this path; Task 2
+    /// proves that at the feeder.)
+    #[test]
+    fn bind_failed_is_degraded_and_terminal() {
+        let reason = "cannot bind the capture sockets (not a directory)";
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.bind_failed(reason.into());
+        let snap = r.snapshot();
+        assert_eq!(snap.to_value(), bind_failed_literal());
+        assert_eq!(snap.feeder, FeederState::BindFailed(reason.into()));
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::Degraded(reason.into())
+        );
+    }
+
+    /// **CS-AC7/8/9/10 (writer level), CS-AC19.** Attach stamps the time and team
+    /// and replaces the tokens; handoffs count by kind and stamp the time; a scope
+    /// push replaces the tokens; dropping the guard resets everything to
+    /// `awaiting_provider`.
+    #[test]
+    fn attach_records_facts_and_detach_resets() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+
+        let before = now_ms();
+        let a = w.attached(Some("995PCLM9KH".into()), vec!["example.com".into()]);
+        let after = now_ms();
+        let snap = r.snapshot();
+        let t = attached_at(&snap);
+        assert_eq!(
+            snap.provider,
+            ProviderState::Attached {
+                attached_at_ms: t,
+                team_id: Some("995PCLM9KH".into()),
+            }
+        );
+        assert!(before <= t && t <= after, "{before} <= {t} <= {after}");
+        assert_eq!(snap.scope_tokens, vec!["example.com".to_string()]);
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
+        assert_eq!(snap.capability(), CaptureCapability::ApprovedAttached);
+        let v = snap.to_value();
+        assert_eq!(at(&v, "scope_entries"), &Value::Int(1));
+        assert_eq!(at(&v, "last_handoff_at"), &Value::Null);
+        assert_eq!(
+            at(at(&v, "provider"), "attached_at"),
+            &Value::Int(i64::try_from(t).unwrap())
+        );
+        assert_eq!(at(at(&v, "provider"), "state"), &s("attached"));
+        assert_eq!(at(at(&v, "provider"), "team_id"), &s("995PCLM9KH"));
+        assert_eq!(at(&v, "capability"), &s("approved_attached"));
+
+        let before = now_ms();
+        for _ in 0..12 {
+            w.handed_off(FlowKind::Tcp);
+        }
+        for _ in 0..3 {
+            w.handed_off(FlowKind::Udp);
+        }
+        let after = now_ms();
+        let snap = r.snapshot();
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (12, 3));
+        let last = snap.last_handoff_at_ms.expect("a handoff time");
+        assert!(
+            before <= last && last <= after,
+            "{before} <= {last} <= {after}"
+        );
+        assert_eq!(snap.capability(), CaptureCapability::Capturing);
+        let v = snap.to_value();
+        assert_eq!(
+            at(&v, "flows_handed_off"),
+            &obj(vec![("tcp", Value::Int(12)), ("udp", Value::Int(3))])
+        );
+        assert_eq!(
+            at(&v, "last_handoff_at"),
+            &Value::Int(i64::try_from(last).unwrap())
+        );
+        assert_eq!(at(&v, "capability"), &s("capturing"));
+
+        w.scope_pushed(vec!["example.com".into(), "api.test".into()]);
+        assert_eq!(
+            r.snapshot().scope_tokens,
+            vec!["example.com".to_string(), "api.test".to_string()]
+        );
+
+        drop(a);
+        let snap = r.snapshot();
+        assert_eq!(snap.provider, ProviderState::Detached);
+        assert_eq!(snap.scope_tokens, Vec::<String>::new());
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
+        assert_eq!(snap.feeder, FeederState::Listening);
+        assert_eq!(snap.capability(), CaptureCapability::AwaitingProvider);
+        assert_eq!(
+            at(&snap.to_value(), "provider"),
+            &obj(vec![
+                ("attached_at", Value::Null),
+                ("state", s("detached")),
+                ("team_id", Value::Null),
+            ])
+        );
+    }
+
+    /// **CS-AC4/11 (writer level).** `stopped()` forces the detach even while the
+    /// guard is alive, and the guard's later drop changes nothing.
+    #[test]
+    fn stopped_forces_detached_while_attached() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+        let guard = w.attached(Some("995PCLM9KH".into()), vec!["example.com".into()]);
+        w.handed_off(FlowKind::Tcp);
+        w.handed_off(FlowKind::Udp);
+
+        w.stopped();
+        let snap = r.snapshot();
+        assert_eq!(snap.provider, ProviderState::Detached);
+        assert_eq!(snap.scope_tokens, Vec::<String>::new());
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
+        assert_eq!(snap.feeder, FeederState::Off(OffReason::Stopped));
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::FeederOff("stopped".into())
+        );
+
+        drop(guard);
+        assert_eq!(r.snapshot(), snap);
+    }
+
+    /// **CS-AC19.** The D7 capturing literal, then the same attachment with no
+    /// handoffs (`approved_attached`, `null` never `0`), then the incident state
+    /// (attached, empty scope).
+    #[test]
+    fn to_value_matches_the_capturing_literal() {
+        let capturing = CaptureStatusSnapshot {
+            enabled: true,
+            feeder: FeederState::Listening,
+            provider: ProviderState::Attached {
+                attached_at_ms: 1_761_907_200_000,
+                team_id: Some("995PCLM9KH".into()),
+            },
+            scope_tokens: vec![
+                "example.com".into(),
+                "*.example.com".into(),
+                "198.51.100.7".into(),
+            ],
+            tcp_handed_off: 12,
+            udp_handed_off: 3,
+            last_handoff_at_ms: Some(1_761_907_305_123),
+        };
+        assert_eq!(capturing.to_value(), capturing_literal());
+
+        let idle = CaptureStatusSnapshot {
+            tcp_handed_off: 0,
+            udp_handed_off: 0,
+            last_handoff_at_ms: None,
+            ..capturing.clone()
+        };
+        let v = idle.to_value();
+        assert_eq!(at(&v, "capability"), &s("approved_attached"));
+        assert_eq!(at(&v, "capability_reason"), &Value::Null);
+        assert_eq!(at(&v, "last_handoff_at"), &Value::Null);
+        assert_eq!(
+            at(&v, "flows_handed_off"),
+            &obj(vec![("tcp", Value::Int(0)), ("udp", Value::Int(0))])
+        );
+
+        let incident = CaptureStatusSnapshot {
+            scope_tokens: Vec::new(),
+            ..idle
+        };
+        let v = incident.to_value();
+        assert_eq!(at(&v, "scope_entries"), &Value::Int(0));
+        assert_eq!(at(&v, "scope_tokens"), &Value::Array(vec![]));
+        assert_eq!(at(&v, "capability"), &s("approved_attached"));
+        assert_eq!(at(at(&v, "provider"), "state"), &s("attached"));
+    }
+
+    /// **CS-AC12.** The D5 precedence over the whole matrix, with the three
+    /// spelled-out rows the plan names, and never an app-side variant.
+    #[test]
+    fn capability_derivation_table() {
+        let rows = matrix();
+        assert_eq!(rows.len(), 36);
+        for snap in &rows {
+            let handoffs = snap.tcp_handed_off + snap.udp_handed_off;
+            let (expected, wire): (CaptureCapability, &str) = match (&snap.feeder, &snap.provider) {
+                (FeederState::BindFailed(r), _) => {
+                    (CaptureCapability::Degraded(r.clone()), "degraded")
+                }
+                (_, ProviderState::Attached { .. }) if handoffs > 0 => {
+                    (CaptureCapability::Capturing, "capturing")
+                }
+                (_, ProviderState::Attached { .. }) => {
+                    (CaptureCapability::ApprovedAttached, "approved_attached")
+                }
+                (FeederState::Listening, ProviderState::Detached) => {
+                    (CaptureCapability::AwaitingProvider, "awaiting_provider")
+                }
+                (FeederState::Off(r), ProviderState::Detached) => (
+                    CaptureCapability::FeederOff(r.as_str().into()),
+                    "feeder_off",
+                ),
+            };
+            let got = snap.capability();
+            assert_eq!(got, expected, "{snap:?}");
+            assert_eq!(got.wire_name(), wire, "{snap:?}");
+            assert_eq!(at(&snap.to_value(), "capability"), &s(wire), "{snap:?}");
+            assert!(
+                !matches!(
+                    got,
+                    CaptureCapability::ExtensionNotInstalled | CaptureCapability::PendingApproval
+                ),
+                "the verb never claims app-side knowledge: {snap:?}"
+            );
+        }
+
+        // The plan's spelled-out rows.
+        let attached = ProviderState::Attached {
+            attached_at_ms: 1_761_907_200_000,
+            team_id: Some("995PCLM9KH".into()),
+        };
+        let row = |feeder: FeederState, provider: ProviderState, tcp: u64, udp: u64| {
+            CaptureStatusSnapshot {
+                enabled: true,
+                feeder,
+                provider,
+                scope_tokens: Vec::new(),
+                tcp_handed_off: tcp,
+                udp_handed_off: udp,
+                last_handoff_at_ms: None,
+            }
+        };
+        let bind_failed = "cannot bind the capture sockets (not a directory)";
+        let degraded = row(
+            FeederState::BindFailed(bind_failed.into()),
+            attached.clone(),
+            1,
+            0,
+        );
+        assert_eq!(
+            degraded.capability(),
+            CaptureCapability::Degraded(bind_failed.into())
+        );
+        assert_eq!(degraded.capability().wire_name(), "degraded");
+        let stopped_but_attached = row(FeederState::Off(OffReason::Stopped), attached, 0, 1);
+        assert_eq!(
+            stopped_but_attached.capability(),
+            CaptureCapability::Capturing
+        );
+        for (tcp, udp) in [(0, 0), (1, 0), (0, 1)] {
+            assert_eq!(
+                row(FeederState::Listening, ProviderState::Detached, tcp, udp).capability(),
+                CaptureCapability::AwaitingProvider
+            );
+        }
+    }
+
+    /// **CS-AC15.** No socket directory, socket name, rendezvous name, or path
+    /// separator in any result.
+    #[test]
+    fn result_never_leaks_paths_or_sockets() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.bind_failed("cannot bind the capture sockets (not a directory)".into());
+        let mut snapshots = matrix();
+        snapshots.push(r.snapshot());
+        assert_eq!(snapshots.len(), 37);
+        for snap in &snapshots {
+            let rendered = format!("{:?}", snap.to_value());
+            for needle in [
+                DEFAULT_SOCKET_DIR,
+                "control.sock",
+                "data.sock",
+                ".rendezvous",
+            ] {
+                assert!(!rendered.contains(needle), "{needle:?} leaked: {rendered}");
+            }
+            assert!(
+                !rendered.contains('/'),
+                "a path separator leaked: {rendered}"
+            );
+        }
+    }
+
+    /// **CS-AC8.** `scope_tokens` inverts the emitter's join over the pinned fixture
+    /// (L7 `example.com`, `*.example.com`; L4 `198.51.100.7/32` any port).
+    #[test]
+    fn scope_tokens_round_trips_the_emitter() {
+        let l7 = [
+            ScopeEntry {
+                host: "example.com".into(),
+            },
+            ScopeEntry {
+                host: "*.example.com".into(),
+            },
+        ];
+        let l4 = [L4ScopeEntry {
+            id: L4ScopeId::new(),
+            cidr: IpCidr {
+                addr: "198.51.100.7".parse().unwrap(),
+                prefix: 32,
+            },
+            ports: PortRange { lo: 0, hi: 65535 },
+            interface: CAPTURE_INTERFACE.to_string(),
+            direction: L4Direction::Outbound,
+            capability: L4Capability::Capture,
+            inject_rate: RateCap { pps: 0, burst: 0 },
+            source: L4ScopeSource::Config,
+        }];
+        let spec = provider_scope_spec(&l7, &l4);
+        assert_eq!(
+            scope_tokens(&spec),
+            vec![
+                "example.com".to_string(),
+                "*.example.com".to_string(),
+                "198.51.100.7".to_string(),
+            ]
+        );
+        assert_eq!(scope_tokens(&spec).join(" "), spec.spec);
+        assert_eq!(
+            scope_tokens(&ScopeSpec {
+                spec: String::new()
+            }),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The `impl <header>` block of this file's source, up to its column-0 close.
+    fn impl_block<'a>(source: &'a str, header: &str) -> &'a str {
+        let start = source
+            .find(header)
+            .unwrap_or_else(|| panic!("{header:?} not found in status.rs"));
+        let body = &source[start..];
+        let end = body.find("\n}").expect("an impl block closes at column 0");
+        &body[..end]
+    }
+
+    /// **CS-AC16 (structural).** The reader's only `pub fn` is `snapshot`; the
+    /// writer has no `pub fn` at all (its mutators are `pub(super)`).
+    #[test]
+    fn reader_has_exactly_one_pub_method() {
+        let source = include_str!("status.rs");
+        let reader = impl_block(source, "impl CaptureStatusReader {");
+        assert_eq!(reader.matches("pub fn ").count(), 1, "{reader}");
+        assert!(reader.contains("pub fn snapshot("), "{reader}");
+        let writer = impl_block(source, "impl CaptureStatusWriter {");
+        assert_eq!(writer.matches("pub fn ").count(), 0, "{writer}");
+        assert!(writer.contains("pub(super) fn listening("), "{writer}");
+    }
+
+    /// **CS-AC17 (structural).** This module adds no way to build or run a session.
+    #[test]
+    fn status_module_names_no_session_builder() {
+        let source = include_str!("status.rs");
+        assert!(!source.contains(concat!("build_capture_", "session(")));
+        assert!(!source.contains(concat!("CaptureSession", "::")));
+    }
+}

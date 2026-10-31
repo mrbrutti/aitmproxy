@@ -36,6 +36,15 @@ pub trait PeerVerifier: Send + Sync {
     /// The descriptor is borrowed for the duration of the call; the verifier must
     /// not close it.
     fn verify(&self, fd: RawFd) -> bool;
+
+    /// The Apple team identifier a peer that passes [`verify`](Self::verify) was
+    /// checked against — the team the verifier's requirement pins, **not** a value
+    /// read from the peer's signing information (the safe `SecCode` API has no
+    /// accessor for that). `None` when the verifier pins no team; the default, so
+    /// a verifier that only implements `verify` still compiles.
+    fn team_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The code requirement the System Extension provider must satisfy. Byte-identical
@@ -51,33 +60,50 @@ pub trait PeerVerifier: Send + Sync {
 pub const PROVIDER_REQUIREMENT: &str =
     "anchor apple generic and certificate leaf[subject.OU] = \"995PCLM9KH\"";
 
+/// The Developer ID team [`PROVIDER_REQUIREMENT`] pins (its `leaf[subject.OU]`).
+/// What [`CodeSignatureVerifier::default`] reports from
+/// [`PeerVerifier::team_id`]; a test pins that the requirement contains it.
+pub const PROVIDER_TEAM_ID: &str = "995PCLM9KH";
+
 /// A [`PeerVerifier`] that resolves the peer's audit token to a running `SecCode`
 /// and checks it against a code-signing requirement via Security.framework.
 #[derive(Debug, Clone)]
 pub struct CodeSignatureVerifier {
     requirement: String,
+    /// The team `requirement` pins, reported by [`PeerVerifier::team_id`]. Set only
+    /// by [`Default`] (the production requirement); an arbitrary requirement need
+    /// not pin a team and the verifier never parses one out of it.
+    team_id: Option<String>,
 }
 
 impl CodeSignatureVerifier {
     /// A verifier that checks peers against `req` instead of
     /// [`PROVIDER_REQUIREMENT`]. A requirement that does not parse rejects every
-    /// peer (fail-closed).
+    /// peer (fail-closed). Pins no team: [`PeerVerifier::team_id`] is `None`.
     #[must_use]
     pub fn with_requirement(req: impl Into<String>) -> Self {
         Self {
             requirement: req.into(),
+            team_id: None,
         }
     }
 }
 
 impl Default for CodeSignatureVerifier {
-    /// Verify against [`PROVIDER_REQUIREMENT`].
+    /// Verify against [`PROVIDER_REQUIREMENT`], which pins [`PROVIDER_TEAM_ID`].
     fn default() -> Self {
-        Self::with_requirement(PROVIDER_REQUIREMENT)
+        Self {
+            requirement: PROVIDER_REQUIREMENT.into(),
+            team_id: Some(PROVIDER_TEAM_ID.into()),
+        }
     }
 }
 
 impl PeerVerifier for CodeSignatureVerifier {
+    fn team_id(&self) -> Option<String> {
+        self.team_id.clone()
+    }
+
     #[cfg(target_os = "macos")]
     fn verify(&self, fd: RawFd) -> bool {
         macos::verify_peer(fd, &self.requirement)
@@ -146,11 +172,11 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
 
     use super::super::listener::ControlChannel;
-    use super::{CodeSignatureVerifier, PeerVerifier, PROVIDER_REQUIREMENT};
+    use super::{CodeSignatureVerifier, PeerVerifier, PROVIDER_REQUIREMENT, PROVIDER_TEAM_ID};
 
     #[test]
     fn unsigned_peer_is_rejected() {
@@ -184,6 +210,44 @@ mod tests {
             PROVIDER_REQUIREMENT,
             "anchor apple generic and certificate leaf[subject.OU] = \"995PCLM9KH\""
         );
+    }
+
+    /// **CS-AC18.** The production verifier reports the team its requirement pins.
+    #[test]
+    fn default_verifier_pins_the_provider_team() {
+        assert_eq!(
+            CodeSignatureVerifier::default().team_id(),
+            Some("995PCLM9KH".to_string())
+        );
+    }
+
+    /// **CS-AC18.** An arbitrary requirement need not pin a team, and the verifier
+    /// must not guess one by parsing it.
+    #[test]
+    fn custom_requirement_pins_no_team() {
+        assert_eq!(
+            CodeSignatureVerifier::with_requirement("identifier \"x\"").team_id(),
+            None
+        );
+    }
+
+    /// **CS-AC18.** The constant cannot drift from the requirement it describes.
+    #[test]
+    fn team_id_constant_matches_the_requirement() {
+        assert!(PROVIDER_REQUIREMENT.contains(PROVIDER_TEAM_ID));
+    }
+
+    /// **CS-AC18.** `team_id` is additive with a `None` default; an implementor
+    /// that only writes `verify` (its signature unchanged) still compiles.
+    #[test]
+    fn team_id_defaults_to_none() {
+        struct Bare;
+        impl PeerVerifier for Bare {
+            fn verify(&self, _fd: RawFd) -> bool {
+                false
+            }
+        }
+        assert_eq!(Bare.team_id(), None);
     }
 
     /// The signing identifier the linker stamped on this very test binary (an
