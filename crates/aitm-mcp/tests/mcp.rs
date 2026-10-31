@@ -1865,9 +1865,10 @@ fn http_flow_with_method(authority: &str, path: &str, method: &str) -> Flow {
 
 /// Web `/bus` push AC11: a `filter.host` or `filter.method` over 1024 bytes is a
 /// tool error naming the field and registers nothing. The stored and pushed flows
-/// carry the over-long value themselves, so a filter that had been registered
-/// (whole or truncated) would have matched: neither the `since` replay nor a live
-/// push may land in the sink.
+/// carry the over-long value themselves, so a filter registered whole would have
+/// matched: neither the `since` replay nor a live push may land in the sink. The
+/// literal refusal text is what rules out a truncating implementation, since a
+/// filter cut to 1024 bytes equals none of those flows.
 #[test]
 fn an_over_long_filter_value_is_refused_and_registers_nothing() {
     const OVER: usize = 1025;

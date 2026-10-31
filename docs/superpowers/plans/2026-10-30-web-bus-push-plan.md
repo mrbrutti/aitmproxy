@@ -14,7 +14,7 @@ No `apps/web` change (spec D7), so the web gate is not part of this PR.
 
 ### Task 1: aitm-mcp prerequisites
 
-- **Satisfies:** AC8, AC9 (and the foundation for AC3/AC4)
+- **Satisfies:** AC8, AC9 (and the foundation for AC3/AC4). As built after the panel: `Subscriptions::add` returns `Result<u64, SubscribeRefused>` (`Closed`, `TooMany`) and `spawn_push_dispatcher` is idempotent; AC11 (the per-connection subscription and filter caps) was added in the fix commit, not in this task.
 - **Depends on:** none
 - **Files:** `crates/aitm-mcp/src/server.rs` (modify; unit tests in its `mod tests`, or `crates/aitm-mcp/tests/` where the existing push tests live)
 - **Change:**
@@ -61,8 +61,41 @@ No `apps/web` change (spec D7), so the web gate is not part of this PR.
 
 Kept by the main session during stage 6. One row per finding.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+Round 1 ran on head 26437ad (security FAIL, spec FAIL, quality PASS). Dispositions are the orchestrator's, under Matt's autonomous-approve mode; "accepted" rows are self-accepted and flagged in the PR body for Matt.
+
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 1-2 | security | Important | One connection can register unlimited subscriptions with unbounded filter strings (reachable over `/bus` now, already over TCP) | fixed in 80ee2ed (AC11: 32 subscriptions per connection, 1024-byte filter values; unit tests) |
+| 1-2 | security | Minor | An agent-role connection receives the `notifications/aitm/agent` audit stream, including the operator UI's calls | accepted 2026-10-30 (existing property over TCP, deliberate in `push_agent`, now stated in spec D5); follow-up: narrow it to operators after checking the MCP Apps plugin does not rely on it |
+| 1-2 | security | Minor | A subscribed non-reading peer keeps `any_role(Operator)` true until the kernel fails the write; no write timeout | accepted 2026-10-30 (spec non-goal; memory stays bounded, liveness only); follow-up: write timeout on both send sites |
+| 1-2 | spec | Important | No test that `serve` still pushes (AC9 second clause) | fixed in a9c106e (`serve_still_spawns_the_push_dispatcher`); mutation run: removing the call turns it red |
+| 1-2 | spec | Minor | Spec D1 last sentence wrong (each server asks its own registry) | fixed in 80ee2ed (spec text) |
+| 1-2 | spec | Minor | Spec D5 omits the audit lines; AC6 test matched on method, not event | fixed in 80ee2ed (spec text; AC6 asserts on `approval_requested`) |
+| 1-2 | spec | Minor | No test for "push arm not gated at the cap" | fixed in a9c106e (`pushes_flow_while_the_read_branch_is_paused_at_the_cap`); mutation run red |
+| 1-2 | spec | Minor | Main.rs wiring is covered only by the e2e canary, whose failure branches `skip()` | accepted: the canary passed on a real binary (AC10); the e2e owner makes it a hard fail (told the PR number) |
+| 2 | spec | Minor | `dispatch_frame` takes `&Arc<ConnCtx>` (plan said `Arc`) | accepted (private, matches the sibling `&Arc<McpServer>` parameter) |
+| 2 | spec | Minor | Task 2 ran as 2a tests then 2b implementation; orchestrator edited one test (AC2 tolerates audit lines) | accepted (recorded in the 2b commit message) |
+| 1-2 | quality | Minor | Module doc says a push burst "never delays" replies | fixed in 80ee2ed |
+| 1-2 | quality | Minor | AC4 test never waits for the late subscribe; a vacuous assertion | fixed in a9c106e + 80ee2ed (tick line after the subscribe; mutation run red) |
+| 1-2 | quality | Minor | AC6 and AC2 match on method/any agent line, fixed 500 ms wait | fixed in 80ee2ed |
+| 1 | quality | Minor | `spawn_push_dispatcher` once-only is a comment; false end-condition doc | fixed in 80ee2ed (idempotent `AtomicBool`; test) |
+| 1-2 | quality | Minor | Ambiguous "(spec D4)" references | fixed in 80ee2ed |
+| 2 | quality | Minor | `/bus` test harness copied a third time | accepted (AC7 keeps the older files unchanged); follow-up: extract `tests/support/web_bus.rs` |
+| 1-2 | quality | Minor | Close-before-drop is enforced only by a private guard in `aitm`; `serve_lines` uses the reverse order | accepted (no race there, frames not detached); follow-up: move the guard into `aitm-mcp` |
+| 1 | quality | Minor | `aitm-mcp` dispatcher test copies `push_server` and polls | accepted |
+
+Round 2 ran on head 80ee2ed (security PASS, spec PASS, quality PASS); the three Minors below it were fixed or accepted in the closing commit.
+
+| Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| 1-2 | security | Minor | The 32-per-connection cap is bypassable by opening many connections; no global registry bound, O(subs x connections) fan-out under the registry lock | accepted 2026-10-30 (needs the token and many sockets; the same class is reachable over TCP; liveness only); follow-up: `MAX_SUBS_TOTAL` in `add`, `HashSet` for `seen`, and a connection cap in the web listener |
+| 1-2 | security | Minor | Audit stream to agent roles; no write timeout (both re-judged) | accepted stands; follow-ups reworded: scope `agent.activity` and `push_agent` by role together; one `WRITE_TIMEOUT` at both bridge send sites and the TCP `write_loop` |
+| 1-2 | spec | Minor | Spec and plan text still described `add -> Option`, a non-idempotent dispatcher, an absolute TCP non-goal; AC9 named no `serve` test | fixed in the closing commit (spec D4, Non-goals, AC9; plan Task 1) |
+| 2 | spec | Minor | The AC4 mutation run predates the final test version; the AC6 final version was never mutation-run | fixed in the closing commit: `add-ignores-closed` re-run on the final head (push-mutations2.log) |
+| 1-2 | quality | Minor | Truncation rationale implied prefix matching (it is equality) | fixed in the closing commit (constant doc, test doc) |
+| 2 | quality | Minor | AC4 doc stale, `completed == 0` vacuous, module doc missing the tester's three tests | fixed in the closing commit |
+| 1 | quality | Minor | `spawn_push_dispatcher` panics outside a runtime, undocumented | fixed in the closing commit (`# Panics`); not hardened further (both real callers are async) |
+| 1 | quality | Minor | `mcp.rs` push-server builder copied three times, `sub_id_of` bypassed | accepted; folded into the `tests/support` extraction follow-up |
 
 ## Shipped
 

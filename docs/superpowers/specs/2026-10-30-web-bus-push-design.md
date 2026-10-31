@@ -22,7 +22,7 @@
 - No web UI change in this PR (see Design D7). The UI keeps polling.
 - No state-push producer: `McpServer::push_state` still has no caller; this change does not add one.
 - No write timeout on slow websocket clients beyond the existing bounds (accepted residual, see Constraints).
-- No change to the TCP, stdio, or streamable-HTTP transports' behaviour.
+- No change to the TCP, stdio, or streamable-HTTP transports' behaviour, except the AC11 subscription limits, which live in the shared registry and so apply to every transport.
 
 ## Anti-goals
 
@@ -47,7 +47,7 @@
 
 **D3. Drain arm.** The relay `select!` gains a third arm, `_ = sink.wait()`, which drains the sink and sends each line as one text frame. Replies keep going straight to `ws.send` from the frame-done arm in line order; the sink's reply lane is unused by the bridge, so notifications never sit behind replies and replies are never queued twice. `Notify` stores a permit, so a push while another arm is mid-`send` is not lost. The arm is not gated on `MAX_IN_FLIGHT`, so pushes flow even while the read arm is paused at the cap. `select!` chooses among ready arms at random, so neither replies nor pushes starve the other. The `lagged` marker (`notifications/aitm/state {lagged:true}`) is emitted by `drain` as for TCP.
 
-**D4. Teardown on every exit path.** A guard created right after auth runs, in this order, `sink.close()` then `mcp.drop_connection(conn_id)` when `relay` returns by any path (client close, error, refusal, a panicked frame), so the close handshake's bounded drain does not keep subscriptions alive indefinitely. Because frames are detached and can outlive the connection (a blocking `invoke` cannot be cancelled), a frame can run `flow.subscribe` *after* teardown. So `NotificationSink` gains `is_closed()`, and `Subscriptions::add` refuses (returns `None`, surfaced as a tool error) when the sink is closed, checked under the registry lock. Close-before-drop plus check-under-lock means a late subscribe is either refused or removed by the already-pending `drop_connection`.
+**D4. Teardown on every exit path.** A guard created right after auth runs, in this order, `sink.close()` then `mcp.drop_connection(conn_id)` when `relay` returns by any path (client close, error, refusal, a panicked frame), so the close handshake's bounded drain does not keep subscriptions alive indefinitely. Because frames are detached and can outlive the connection (a blocking `invoke` cannot be cancelled), a frame can run `flow.subscribe` *after* teardown. So `NotificationSink` gains `is_closed()`, and `Subscriptions::add` refuses (returns `Err(SubscribeRefused::Closed)`, surfaced as a tool error) when the sink is closed, checked under the registry lock. Close-before-drop plus check-under-lock means a late subscribe is either refused or removed by the already-pending `drop_connection`.
 
 **D5. Roles.** Fan-out is unchanged: flow events go to every matching subscription of any role (as over TCP); state lines to every subscribed connection; `approval_requested` only to `Operator`-role subscriptions (`fanout_role`). Over the bridge an agent-token connection is `Frontend::Mcp`, so it never receives operator-only lines. The `notifications/aitm/agent` audit line (one per finished tool call: origin role, command, redacted args, scrubbed error) is fanned to every subscribed connection whatever its role, by design (`push_agent`); so an agent-token bridge connection sees the operator UI's calls as metadata. That already holds over loopback TCP and is accepted here; narrowing it to operators is a follow-up.
 
@@ -67,7 +67,7 @@
 6. AC6: With an operator and an agent connection both subscribed, an agent `Ask`-policy Sensitive call produces `notifications/aitm/agent {event:"approval_requested"}` on the operator connection only; the agent connection never receives it; `agent.approve` from the operator connection resolves it.
 7. AC7: Every PR #103 property still holds (`web_bus_concurrency` tests pass unchanged), and `web_bus_roles` passes unchanged.
 8. AC8: `NotificationSink::is_closed()` is true after `close()`; `Subscriptions::add` on a closed sink registers nothing (unit tests in `aitm-mcp`).
-9. AC9: `McpServer::spawn_push_dispatcher` delivers a broadcast `Event` as a flow notification to a subscriber of that server (test without `serve`), and `serve` still does (existing push tests pass).
+9. AC9: `McpServer::spawn_push_dispatcher` delivers a broadcast `Event` as a flow notification to a subscriber of that server (test without `serve`), and `serve` still does (`serve_still_spawns_the_push_dispatcher`, a loopback test of `serve` itself; the older push tests never go through `serve`). A second `spawn_push_dispatcher` call on one server spawns nothing.
 10. AC10: Against a built `target/debug/aitm`, `python3 tests/e2e/run.py web` flips `test_bus_live_stream.py` from SKIP to PASS.
 11. AC11 (added after the security review): one connection can hold at most 32 subscriptions (the 33rd `flow.subscribe` is a tool error; `flow.unsubscribe` frees a slot; another connection is unaffected), and a `filter.host` or `filter.method` over 1024 bytes is refused (exactly 1024 is accepted) and registers nothing. Unit tests in `aitm-mcp`.
 

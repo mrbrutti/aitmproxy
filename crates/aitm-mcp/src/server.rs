@@ -40,7 +40,8 @@ const MAX_SUBS_PER_CONN: usize = 32;
 
 /// The longest `filter.host` or `filter.method` a subscribe may carry, in bytes
 /// (web-bus-push spec AC11). A longer value is refused, never truncated: a
-/// truncated filter would silently match more than the client asked for.
+/// truncated filter would silently watch a different host or method than the
+/// client asked for.
 const MAX_FILTER_VALUE_BYTES: usize = 1024;
 
 /// The default capacity of the core→server event broadcast ring.
@@ -963,6 +964,10 @@ impl McpServer {
     /// the runtime: the server's own registry retains a sender (the
     /// `SubscriptionPlugin`'s), so the task, and the server with it, lives until
     /// the runtime shuts down.
+    ///
+    /// # Panics
+    ///
+    /// Outside a Tokio runtime, like `tokio::spawn`.
     pub fn spawn_push_dispatcher(self: &Arc<Self>) {
         let Some(tx) = &self.push_tx else {
             return;

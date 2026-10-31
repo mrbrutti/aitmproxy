@@ -9,8 +9,12 @@
 //!   dispatcher `main.rs` relies on (AC1/AC9);
 //! - replies keep arriving, in line order within a frame, while pushes flow, and
 //!   a parked command does not hold pushes back (AC2);
-//! - a connection's subscriptions end with it: on a Close (AC3), and when a frame
-//!   still running at disconnect subscribes afterwards (AC4);
+//! - pushes keep flowing while the read side is paused at the in-flight cap (D3);
+//! - a connection's subscriptions end with it: on a Close (AC3), on a refusal
+//!   before the close handshake (D4), and when a frame still running at
+//!   disconnect subscribes afterwards (AC4);
+//! - `flow.unsubscribe` in a later frame stops the pushes, since one `ConnCtx`
+//!   lives for the whole connection;
 //! - a subscriber that stops reading is bounded: it lags, is told so, and still
 //!   gets the newest event when it resumes (AC5);
 //! - an agent-role connection never receives operator-only notifications (AC6).
@@ -92,12 +96,11 @@ impl ProxyClient for UnusedClient {
 }
 
 /// What `test.block` parks on: a one-shot latch that stays open once opened, and
-/// a count of how many have started and finished.
+/// a count of how many have started.
 struct Parking {
     open: Mutex<bool>,
     opened: Condvar,
     entered: AtomicUsize,
-    completed: AtomicUsize,
 }
 
 impl Parking {
@@ -106,16 +109,11 @@ impl Parking {
             open: Mutex::new(false),
             opened: Condvar::new(),
             entered: AtomicUsize::new(0),
-            completed: AtomicUsize::new(0),
         })
     }
 
     fn entered(&self) -> usize {
         self.entered.load(Ordering::SeqCst)
-    }
-
-    fn completed(&self) -> usize {
-        self.completed.load(Ordering::SeqCst)
     }
 
     fn open(&self) {
@@ -180,7 +178,6 @@ impl Command for BlockCmd {
     fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         self.0.entered.fetch_add(1, Ordering::SeqCst);
         self.0.park()?;
-        self.0.completed.fetch_add(1, Ordering::SeqCst);
         Ok(Value::Str("released".into()))
     }
 }
@@ -851,10 +848,11 @@ async fn disconnect_drops_the_subscription() {
     assert_eq!(commands.sensitive_runs(), 0, "no probe ever ran");
 }
 
-/// AC4 (the late-subscribe race): a frame `[test.block, flow.subscribe]` is still
-/// running when its operator connection drops; the subscribe runs only after the
-/// teardown and must register nothing, so for a good while afterwards every
-/// `Ask`-policy probe is refused at once rather than parked.
+/// AC4 (the late-subscribe race): a frame `[test.block, flow.subscribe,
+/// test.tick]` is still running when its operator connection drops. One probe
+/// proves the teardown ran before the frame is released; after the release the
+/// tick proves the late `flow.subscribe` has returned, and a second probe shows
+/// it registered nothing (the `Ask`-policy call is refused at once, not parked).
 #[tokio::test]
 async fn a_frame_still_running_at_disconnect_cannot_resubscribe() {
     let commands = TestCommands::new();
@@ -890,11 +888,6 @@ async fn a_frame_still_running_at_disconnect_cannot_resubscribe() {
     // below the cap, so the bridge is reading and sees the drop at once.
     drop(operator);
     tokio::time::sleep(SETTLE).await;
-    assert_eq!(
-        commands.parking.completed(),
-        0,
-        "test.block is still parked"
-    );
     // The teardown has already run: the subscription made above is gone. So the
     // `flow.subscribe` released below really runs after it, against the closed
     // sink, rather than before a slow teardown that would then sweep it.
