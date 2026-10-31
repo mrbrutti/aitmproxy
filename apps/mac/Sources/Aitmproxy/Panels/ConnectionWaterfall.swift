@@ -11,7 +11,7 @@ struct ConnectionWaterfall: View {
     @Environment(Session.self) private var session
 
     var body: some View {
-        let model = Self.build(rows: session.rows)
+        let model = Self.build(rows: session.visibleRows)
         VStack(alignment: .leading, spacing: Space.sm) {
             HStack(spacing: Space.sm) {
                 TrackedLabel("Connections").accessibilityAddTraits(.isHeader)
@@ -42,51 +42,61 @@ struct ConnectionWaterfall: View {
     }
 
     private func chart(_ model: Model) -> some View {
-        Chart(model.segments) { seg in
-            BarMark(
-                xStart: .value("Start", seg.start),
-                xEnd: .value("End", seg.end),
-                y: .value("Connection", seg.lane)
-            )
-            .foregroundStyle(seg.color)
-            .cornerRadius(2)
-        }
-        .chartYScale(domain: model.lanes)
-        .chartYAxis {
-            AxisMarks(position: .leading) { value in
-                AxisValueLabel {
-                    if let lane = value.as(String.self), let display = model.laneLabel[lane] {
-                        Text(display)
-                            .font(Tok.Face.data(Tok.Typography.Size.xs))
-                            .foregroundStyle(Tok.Ink.secondary.color)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+        // A fixed row height per lane keeps each Gantt bar a readable thickness
+        // instead of collapsing to a hairline when there are many lanes; the chart
+        // scrolls when the lanes outgrow the band.
+        ScrollView(.vertical) {
+            Chart(model.segments) { seg in
+                BarMark(
+                    xStart: .value("Start", seg.start),
+                    xEnd: .value("End", seg.end),
+                    y: .value("Connection", seg.lane),
+                    height: .fixed(Self.barThickness)
+                )
+                .foregroundStyle(seg.color)
+                .cornerRadius(2)
+            }
+            .chartYScale(domain: model.lanes)
+            .chartYAxis {
+                AxisMarks(position: .leading) { value in
+                    AxisValueLabel {
+                        if let lane = value.as(String.self), let display = model.laneLabel[lane] {
+                            Text(display)
+                                .font(Tok.Face.data(Tok.Typography.Size.xs))
+                                .foregroundStyle(Tok.Ink.secondary.color)
+                                // A fixed label gutter so a long authority can't spill
+                                // over the earliest segments at the plot's left edge.
+                                .frame(width: Self.laneLabelWidth, alignment: .trailing)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                     }
                 }
             }
-        }
-        .chartXAxis {
-            AxisMarks { value in
-                AxisGridLine().foregroundStyle(Tok.Line.rule.color)
-                AxisValueLabel {
-                    if let date = value.as(Date.self) {
-                        Text(Format.time(date))
-                            .font(Tok.Face.data(Tok.Typography.Size.xs))
-                            .foregroundStyle(Tok.Ink.tertiary.color)
+            .chartXAxis {
+                AxisMarks { value in
+                    AxisGridLine().foregroundStyle(Tok.Line.rule.color)
+                    AxisValueLabel {
+                        if let date = value.as(Date.self) {
+                            Text(Format.time(date))
+                                .font(Tok.Face.data(Tok.Typography.Size.xs))
+                                .foregroundStyle(Tok.Ink.tertiary.color)
+                        }
                     }
                 }
             }
-        }
-        .chartOverlay { proxy in
-            GeometryReader { geo in
-                Rectangle()
-                    .fill(Color.clear)
-                    .contentShape(Rectangle())
-                    .onTapGesture { location in select(at: location, proxy: proxy, geo: geo, model: model) }
+            .chartOverlay { proxy in
+                GeometryReader { geo in
+                    Rectangle()
+                        .fill(Color.clear)
+                        .contentShape(Rectangle())
+                        .onTapGesture { location in select(at: location, proxy: proxy, geo: geo, model: model) }
+                }
             }
+            .frame(height: max(Self.minChartHeight, CGFloat(model.lanes.count) * Self.laneHeight))
+            .padding(.horizontal, Space.md)
+            .padding(.bottom, Space.md)
         }
-        .padding(.horizontal, Space.md)
-        .padding(.bottom, Space.md)
     }
 
     /// Map a tap to the (time, lane) it lands on and select the flow whose segment
@@ -121,6 +131,12 @@ struct ConnectionWaterfall: View {
     }
 
     private static let maxLanes = 16
+    /// A fixed per-lane row height and bar thickness so the Gantt stays legible
+    /// however many lanes there are; the chart scrolls past the band.
+    private static let laneHeight: CGFloat = 28
+    private static let barThickness: CGFloat = 20
+    private static let minChartHeight: CGFloat = 240
+    private static let laneLabelWidth: CGFloat = 152
 
     /// One lane per authority (host), ordered earliest-first and capped to the
     /// busiest lanes so the axis stays legible. Each flow becomes a segment; a

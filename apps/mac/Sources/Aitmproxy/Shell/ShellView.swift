@@ -171,6 +171,12 @@ struct MainView: View {
 
     private var flows: some View {
         VStack(spacing: 0) {
+            // A failed embedded core captures nothing; surface it everywhere, not just
+            // in the status-bar dot, with the reason and the two recovery actions.
+            if session.coreHealth.health == .failed {
+                CoreFailedBanner()
+                Rule()
+            }
             if session.page == .scope {
                 ScopePanel()
                 Rule()
@@ -259,6 +265,39 @@ struct MainView: View {
         }
         .environment(session)
         .themed()
+    }
+}
+
+/// Shown above the flow area when the embedded core has failed (Wave 11): a dead
+/// core captures nothing, so the status-bar dot alone is too quiet — say it plainly
+/// with the failure reason and the two recovery actions.
+private struct CoreFailedBanner: View {
+    @Environment(Session.self) private var session
+
+    var body: some View {
+        HStack(spacing: Space.sm) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Tok.Severity.high.fg.color)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("Embedded core failed — not capturing")
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
+                    .foregroundStyle(Tok.Ink.primary.color)
+                if let reason = session.coreHealth.connection?.status.degradedReason {
+                    Text(reason)
+                        .font(Tok.Face.ui(Tok.Typography.Size.xs))
+                        .foregroundStyle(Tok.Ink.secondary.color)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: Space.sm)
+            SmallButton("Show Log") { session.coreLogVisible = true }
+            SmallButton("Restart Core") { session.restartCoreTick += 1 }
+        }
+        .padding(.horizontal, Space.md)
+        .padding(.vertical, Space.sm)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Tok.Severity.high.bg.color)
+        .accessibilityElement(children: .combine)
     }
 }
 

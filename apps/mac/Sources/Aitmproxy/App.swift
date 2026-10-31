@@ -216,6 +216,9 @@ struct FlowCommands: Commands {
             Divider()
             Button("Reconnect Bus") { session.reconnectBus() }
                 .keyboardShortcut("r", modifiers: [.command, .control])
+            Button("Restart Core") { session.restartCoreTick += 1 }
+                .keyboardShortcut("r", modifiers: [.command, .control, .shift])
+                .disabled(session.coreHealth.connection == nil)
         }
         CommandMenu("Agent") {
             Picker("Policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {
