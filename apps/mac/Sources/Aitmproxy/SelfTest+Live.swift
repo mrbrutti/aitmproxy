@@ -147,6 +147,24 @@ extension SelfTest {
             // Leave the core capturing for the next run, and only quit once that landed.
             await resumeCapture(session)
 
+            // D2 on a live bus: an undone Clear survives the poll (the core has dropped the flows;
+            // the app keeps its copy ahead of the core's list for at least four 500 ms polls).
+            if names.contains("flow.clear") {
+                await settle(timeout: .seconds(5)) { session.rows.isEmpty && session.clearNotice != nil }
+                let cleared = session.clearedFlows?.rows.map(\.id) ?? []
+                check("flow.clear empties the list and offers Undo Clear (\(cleared.count) flows)",
+                      session.rows.isEmpty && !cleared.isEmpty && session.flowUndoManager.canUndo, session.lastError ?? "")
+                session.flowUndoManager.undo()
+                // Four of BusService's 500 ms polls.
+                try? await Task.sleep(for: .seconds(2))
+                let present = cleared.filter { id in session.rows.contains { $0.id == id } }
+                check("Undo Clear puts the \(cleared.count) flows back and they survive four polls (\(present.count) present)",
+                      !cleared.isEmpty && present.count == cleared.count, "rows \(session.rows.map(\.seq))")
+                session.forgetClearedFlows()
+            } else {
+                print("SKIP Undo Clear: flow.clear not on the bus")
+            }
+
             let recorded = session.activity.entries.filter { $0.origin == .operator }.count
             check("every action is in the activity log (\(recorded) operator entries)", recorded >= 11)
 

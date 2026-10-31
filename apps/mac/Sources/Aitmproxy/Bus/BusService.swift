@@ -157,12 +157,17 @@ final class BusService: FlowActions {
             summaries = summaries.filter { known.contains($0.key) }
             refetch.retain(known)
             let coreID = session.activeCoreID
-            let rows = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }
-                .map { row in
-                    var row = row
-                    row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
-                    return row
-                }
+            func scoped(_ row: FlowRow) -> FlowRow {
+                var row = row
+                row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
+                return row
+            }
+            let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
+            // Rows an undone Clear put back stay ahead of the core's list and follow the live
+            // scope like any other row; new flows number after them.
+            let restored = session.restoredFlows.map(scoped)
+            if restored != session.restoredFlows { session.restoredFlows = restored }
+            let rows = ClearedFlows.merge(restored: restored, newer: polled)
             if rows != session.rows { session.rows = rows }
             let rate = throughput.sample(at: .now)
             if session.upBytesPerSecond != rate.up { session.upBytesPerSecond = rate.up }

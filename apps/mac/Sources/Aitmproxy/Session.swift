@@ -116,6 +116,23 @@ final class Session {
             select(last.id)
         }
     }
+    /// Rows an undone Clear put back. The core no longer holds them, so the live poll keeps them
+    /// ahead of what it lists (`ClearedFlows.merge`); a later Clear or Delete drops them for good.
+    var restoredFlows: [FlowRow] = []
+    /// "Cleared n flows — Undo" in the status bar, for a few seconds after a Clear.
+    var clearNotice: ClearNotice?
+    /// What the last Clear dropped, until it is undone or the notice lapses (then it is released).
+    @ObservationIgnored var clearedFlows: ClearedFlows?
+    @ObservationIgnored var clearNoticeTask: Task<Void, Never>?
+    /// The flow list's undo manager: Clear's one step lives here, and `FlowKeyTable` hands it to
+    /// AppKit as the list's responder, so Edit ▸ Undo Clear (⌘Z) reaches it while the list has
+    /// focus and a text field keeps its own typing undo. No event grouping: a step is registered
+    /// and withdrawn whole, which the headless self-test can prove.
+    @ObservationIgnored let flowUndoManager: UndoManager = {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        return manager
+    }()
     /// The sidebar sub-item narrowing the list, if any.
     var group: FlowGroup?
     var details: [FlowID: FlowDetail] = [:] {
