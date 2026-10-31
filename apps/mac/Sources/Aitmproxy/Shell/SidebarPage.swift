@@ -59,8 +59,8 @@ enum SidebarPage: String, CaseIterable, Identifiable {
         }
     }
 
-    /// CA and Configuration open from the Proxy menu and the palette; Status from the brand row,
-    /// the pill, the status bar and ⌘0; Saved waits for the core to save (S-066). None are list rows.
+    /// CA and Configuration open from the Proxy menu and the palette; Status from the toolbar
+    /// pill, ⌘0 and the palette; Saved waits for the core to save (S-066). None are list rows.
     var isInSidebar: Bool {
         switch self {
         case .ca, .config, .status, .saved: false

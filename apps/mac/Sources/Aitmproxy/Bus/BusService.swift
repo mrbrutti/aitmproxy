@@ -141,6 +141,10 @@ final class BusService: FlowActions {
             // banner) read `scopeHosts`, and a host added from the CLI or another client must
             // not leave them claiming an empty scope.
             await refreshScope()
+            // The proxy's recording state is the core's fact, not this client's memory: a pause
+            // from any other client (agent, TUI, web) reaches the toolbar's Proxy switch within
+            // one poll, and a relaunch against an already-paused core starts out saying so.
+            await refreshProxyStatus()
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
             for id in ids {
                 let cached = summaries[id]
@@ -203,6 +207,19 @@ final class BusService: FlowActions {
             try EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
         } catch {
             throw BusError.tool(message: "Scope change not saved: \(error.localizedDescription)")
+        }
+    }
+
+    /// `proxy.status` → `Session.capturing` and `Session.interceptArmed`: both are the core's
+    /// facts (another client can pause or arm), so the Proxy switch and the pill's "intercept
+    /// armed" follow the core, not this client's memory. A core without the verb leaves both alone.
+    private func refreshProxyStatus() async {
+        guard let client, let status = try? await client.call("proxy.status") else { return }
+        if let capturing = status["capturing"]?.boolValue, capturing != session.capturing {
+            session.capturing = capturing
+        }
+        if let armed = status["intercept_armed"]?.boolValue, armed != session.interceptArmed {
+            session.interceptArmed = armed
         }
     }
 
@@ -297,8 +314,9 @@ final class BusService: FlowActions {
     }
 
     func setCapturing(_ on: Bool) async throws {
-        _ = try await call(on ? "proxy.resume" : "proxy.pause")
-        session.capturing = on
+        // The reply carries the state the core actually took; believe it over the request.
+        let reply = try await call(on ? "proxy.resume" : "proxy.pause")
+        session.capturing = reply["capturing"]?.boolValue ?? on
     }
 
     func clear() async throws {

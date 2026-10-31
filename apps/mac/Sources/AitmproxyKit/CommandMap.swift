@@ -123,7 +123,7 @@ public enum CommandMap {
             return [I(VerbTable.titles(v), item.shortcut ?? item.key.map { Shortcut($0) })]
         }
         func listKey(_ v: FlowVerb) -> String? { VerbTable.item(v, for: nil).key }
-        let chips = ["All", "HTTP", "HTTPS", "WebSocket", "h1", "h2", "JSON", "Form", "XML"]
+        let chips = ContentCategory.shortcutChips.map(\.title)
         return [
             E("File", "Compose Request…", "⌘N (`n`)", items: one("Compose Request…", "⌘N"), listKey: "n"),
             E("File", "Import…", "⌘O", items: one("Import…", "⌘O")),
@@ -162,7 +162,7 @@ public enum CommandMap {
             E("View", "Inspector Below / Right / Detached / Split View", "⌘⌥1…4",
               items: [I("Inspector Below", "⌥⌘1"), I("Inspector Right", "⌥⌘2"), I("Inspector Detached", "⌥⌘3"), I("Split View", "⌥⌘4")]),
             E("View", "Toggle Sidebar", "⌃⌘S", items: one("Toggle Sidebar", "⌃⌘S")),
-            E("View", "Pause/Resume Capture", "⇧⌘R", items: toggle(["Pause Capture", "Resume Capture"], "⇧⌘R")),
+            E("View", "Pause/Resume Proxy", "⇧⌘R", items: toggle(["Pause Proxy", "Resume Proxy"], "⇧⌘R")),
             E("View", "Auto-select", "⇧⌘A", items: one("Auto-select", "⇧⌘A")),
             E("View", "Density", "Dense/Default/Comfortable", items: [I(["Dense"]), I(["Default"]), I(["Comfortable"])]),
 
@@ -177,6 +177,9 @@ public enum CommandMap {
             E("Proxy", "Configuration…", nil, items: one("Configuration…", nil)),
             E("Proxy", "Browser", "⇧⌘W", items: one("Browser", "⇧⌘W")),
             E("Proxy", "Core Log…", "⌃⌘L", items: toggle(["Core Log…", "Hide Core Log"], "⌃⌘L")),
+            E("Proxy", "Reconnect Bus", "⌃⌘R", items: one("Reconnect Bus", "⌃⌘R")),
+            E("Proxy", "Restart Core", "⌃⇧⌘R", items: one("Restart Core", "⌃⇧⌘R")),
+            E("Proxy", "Capture / Stop Capturing All Apps", "⌃⌘A", items: toggle(["Capture All Apps", "Stop Capturing All Apps"], "⌃⌘A")),
         ]
     }()
 

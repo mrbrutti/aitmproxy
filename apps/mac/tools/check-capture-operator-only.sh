@@ -2,8 +2,8 @@
 # The operator-only tripwire for macOS capture (spec 2026-10-30-macos-ne-ship-and-toggle,
 # TG-AC4 and TG-AC9).
 #
-# Capture is the operator's choice: Settings > Capture or Proxy > Enable/Disable Capture,
-# and nowhere else. No bus/MCP verb, Session action or command-palette entry may reach the
+# Capture is the operator's choice: Settings > Capture, Proxy > Turn On/Off Capture, the Status
+# page's card or the toolbar's Capture switch, and nowhere else. No bus/MCP verb, Session action or command-palette entry may reach the
 # toggle, enable()/disable(), the system-extension activation/deactivation request, or the
 # persisted capture.enabled choice. This script reads the Swift source and fails closed.
 # Core-side twin: crates/aitm/tests/macos_capture_gate.rs (agent_cannot_trigger_sysex_install).
@@ -27,9 +27,9 @@
 # The seven rules, as built:
 #   1. The activation/deactivation request and submitRequest live in ExtensionController.swift only.
 #   2. Dotted .enable()/.disable() calls appear only in SettingsView.swift (the CaptureSwitch
-#      glue) and ExtensionController.swift. App.swift and Panels/StatusPanel.swift (the Status
-#      page's lane card, an operator surface like Settings) call CaptureSwitch.set/uninstall,
-#      never these. Same for the published controller handle (extensionController) and
+#      glue) and ExtensionController.swift. App.swift, Panels/StatusPanel.swift (the Status
+#      page's lane card) and Shell/ShellToolbar.swift (the Capture switch) — operator surfaces
+#      like Settings — call CaptureSwitch.set/uninstall, never these. Same for the published controller handle (extensionController) and
 #      CaptureSwitch itself.
 #   3. The "capture.enabled" key appears only in EmbeddedCore.swift (spawn reads it),
 #      ExtensionController.swift (start() reads it), SettingsView.swift (the toggle + CaptureSwitch)
@@ -72,6 +72,10 @@ shell_view=Sources/Aitmproxy/Shell/ShellView.swift
 # the same Turn On/Off Capture, Uninstall and Restart Core controls Settings and the Proxy menu
 # have, reached only by clicking the page. Allowed alongside them, with expects, for rules 2 and 6.
 status_panel=Sources/Aitmproxy/Panels/StatusPanel.swift
+# The toolbar's Capture switch (same spec, §4 revision 2): the operator's visible on/off for the
+# extension, the same CaptureSwitch.set steps as Settings, the menu and the Status page, reached
+# by a click on the toolbar only. Allowed for rule 2's glue scan, with an expect.
+shell_toolbar=Sources/Aitmproxy/Shell/ShellToolbar.swift
 
 violations=0
 checked=0
@@ -162,10 +166,16 @@ expect "2 controller handle" "$settings_view" 'extensionController' 'the handle 
 expect "2 controller handle" "$ext_controller" 'extensionController' 'the handle it publishes'
 
 # The one glue type behind the Settings toggle and the menu command.
-scan "2 toggle glue" 'CaptureSwitch' "$settings_view" "$app_swift" "$status_panel"
+scan "2 toggle glue" 'CaptureSwitch' "$settings_view" "$app_swift" "$status_panel" "$shell_toolbar"
 expect "2 toggle glue" "$settings_view" 'CaptureSwitch' 'CaptureSwitch'
 expect "2 toggle glue" "$app_swift" 'CaptureSwitch' 'the menu command calling CaptureSwitch'
 expect "2 toggle glue" "$status_panel" 'CaptureSwitch\.(set|uninstall)' 'the Status page lane card calling CaptureSwitch.set/uninstall'
+expect "2 toggle glue" "$shell_toolbar" 'CaptureSwitch\.set' 'the toolbar Capture switch calling CaptureSwitch.set'
+
+# The toolbar's alias for that call (ToolbarSwitches.flipCapture): a second spelling of the
+# entry point, so it gets the same guard — defined and called in ShellToolbar.swift only.
+scan "2 toggle glue alias" 'flipCapture' "$shell_toolbar"
+expect "2 toggle glue alias" "$shell_toolbar" 'static func flipCapture' 'the alias definition'
 
 # ---- 3. the persisted choice ---------------------------------------------------------
 scan "3 capture.enabled key" "$key_re" \
@@ -178,7 +188,7 @@ done
 # FixtureBus.swift is the bus's stand-in in fixture, snapshot and self-test runs (the test
 # adapter behind Session.commandRunner, where BusService is the live one), so it is held to the
 # same rule as BusService.swift.
-deny "$key_re|captureEnabled|CaptureSwitch|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|restartCoreTick|\.(enable|disable)[[:space:]]*\(" \
+deny "$key_re|captureEnabled|CaptureSwitch|ToolbarSwitches|flipCapture|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|restartCoreTick|\.(enable|disable)[[:space:]]*\(" \
   Sources/Aitmproxy/Bus/BusService.swift \
   Sources/Aitmproxy/Bus/FixtureBus.swift \
   Sources/AitmproxyKit/CommandMap.swift \

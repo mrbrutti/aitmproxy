@@ -6,8 +6,8 @@ import SwiftUI
 /// session shows. Three lane cards — Core, Bus, Capture — each a state dot + word, the
 /// one fact under it, the remedy when something needs doing, and its actions; then the
 /// Getting-started checklist and the last five flows. Every word comes from
-/// `Session.connectionSummary`, so this page, the pill, the status bar and the sidebar
-/// row can never disagree. Hue only on the state dot; hairline rules, no cards-with-shadows.
+/// `Session.connectionSummary`, so this page, the toolbar's connection cluster, the Core
+/// Log header and the Settings rows can never disagree. Hue only on the state dot; hairline rules, no cards-with-shadows.
 struct StatusPanel: View {
     @Environment(Session.self) private var session
     @Environment(\.openSettings) private var openSettings
@@ -64,13 +64,13 @@ struct StatusPanel: View {
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Status")
         .confirmationDialog(
-            "Uninstall the capture extension?", isPresented: $confirmingUninstall, titleVisibility: .visible
+            "Uninstall the extension?", isPresented: $confirmingUninstall, titleVisibility: .visible
         ) {
             Button("Uninstall", role: .destructive) {
                 Task { await CaptureSwitch.uninstall(session: session) }
             }
         } message: {
-            Text("Capture stops, and the extension and its proxy configuration are removed. Turning capture on again installs the extension again and asks for approval again.")
+            Text("Other apps' traffic stops being captured, and the extension and its proxy configuration are removed. Turning the extension on again installs it again and asks for approval again.")
         }
     }
 

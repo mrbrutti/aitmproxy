@@ -121,7 +121,7 @@ Not yet on the bus: `flow.subscribe` (F4 live push), `ws.send` (F9),
 | Certificate Authority | ✅ live | — |
 | Configuration | ✅ live | `config.get` (F7) |
 | Overview, Connection Log | ✅ (derived) | richer = F4 |
-| Pause/Resume capture; Clear session | ✅ live | F7 |
+| Pause/Resume proxy (the toolbar's Proxy switch); Clear session | ✅ live | F7 |
 | Import/Export (HAR, CSV, cURL) + drop | ✅ app-side | full formats/sessions = F10 |
 
 ## 4. Proxyman parity matrix

@@ -113,7 +113,7 @@ struct FlowCommands: Commands {
     /// The persisted capture choice (Settings ▸ Capture), read here for the Enable/Disable label.
     @AppStorage("capture.enabled", store: Store.defaults) private var captureEnabled = false
     /// The active core kind (Settings ▸ Bus), read exactly as `ProxySettings` reads it: capture
-    /// belongs to the embedded core, so the Enable/Disable Capture command stands down unless
+    /// belongs to the embedded core, so the Turn On/Off Capture command stands down unless
     /// that is the active one.
     @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
 
@@ -228,13 +228,13 @@ struct FlowCommands: Commands {
                 .keyboardShortcut("r", modifiers: [.command, .control, .shift])
                 .disabled(session.coreHealth.connection == nil)
             Divider()
-            // The same steps as Settings ▸ Capture's toggle (CaptureSwitch). ⌃⌘C: none of
+            // The same steps as Settings ▸ All Apps' toggle (CaptureSwitch). ⌃⌘A: none of
             // the reconnect/restart/pause/replay chords on R, and no other C chord but ⇧⌘C.
-            Button((session.coreHealth.captureChoice ?? captureEnabled) ? "Disable Capture" : "Enable Capture") {
+            Button((session.coreHealth.captureChoice ?? captureEnabled) ? "Stop Capturing All Apps" : "Capture All Apps") {
                 let on = !(session.coreHealth.captureChoice ?? captureEnabled)
                 Task { await CaptureSwitch.set(on, session: session) }
             }
-            .keyboardShortcut("c", modifiers: [.command, .control])
+            .keyboardShortcut("a", modifiers: [.command, .control])
             .disabled(!session.coreHealth.captureControlsAvailable || session.coreHealth.captureBusy || !usesEmbedded)
         }
         CommandMenu("Agent") {
@@ -267,7 +267,7 @@ struct FlowCommands: Commands {
             Divider()
             // ⌘1…⌘9: the first nine chips, in chip-bar order (foundation §2.7).
             Menu("Chip") {
-                ForEach(Array(ContentCategory.groups.flatMap { $0 }.prefix(9).enumerated()), id: \.offset) { index, chip in
+                ForEach(Array(ContentCategory.shortcutChips.enumerated()), id: \.offset) { index, chip in
                     Toggle(chip.title, isOn: Binding(get: { session.chip == chip }, set: { _ in session.chip = chip }))
                         .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }
@@ -289,7 +289,7 @@ struct FlowCommands: Commands {
             }
             Toggle("Auto-select", isOn: Binding(get: { session.autoSelect }, set: { session.autoSelect = $0 }))
                 .keyboardShortcut("a", modifiers: [.command, .shift])
-            Button(session.capturing ? "Pause Capture" : "Resume Capture") { session.setCapturing(!session.capturing) }
+            Button(session.capturing ? "Pause Proxy" : "Resume Proxy") { session.setCapturing(!session.capturing) }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
         }
     }
