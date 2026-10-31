@@ -28,7 +28,9 @@ export const StatusBar: Component<{ class?: string }> = (props) => {
   const [menu, setMenu] = createSignal<{ anchor: AnchorRect; kb: boolean } | null>(null);
   const busHue = () => {
     const s = app.bus.state();
-    return s === 'open' ? 'success' : s === 'connecting' || s === 'reconnecting' ? 'pending' : 'server-error';
+    if (s === 'open') return 'success';
+    if (s === 'connecting' || s === 'reconnecting') return 'pending';
+    return 'server-error'; // 'unauthorized', 'closed', 'idle'
   };
   const items = (): MenuEntry[] => [
     { label: 'Theme', disabled: true },
@@ -65,7 +67,7 @@ export const StatusBar: Component<{ class?: string }> = (props) => {
         <span title="Downstream">↓ {fmtRate(app.proxy.throughput.down)}</span>
         <span class={css.bus} title={app.bus.lastError() ?? `bus ${app.bus.state()}`}>
           <StatusDot hue={busHue()} />
-          bus {app.bus.address}
+          {app.bus.state() === 'unauthorized' ? 'bus token expired' : `bus ${app.bus.address}`}
         </span>
         <Button
           variant="toolbar"

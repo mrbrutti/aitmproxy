@@ -302,6 +302,7 @@ async fn start(tag: &str, commands: &TestCommands) -> Server {
         mcp: Arc::new(mcp),
         agent_token: AGENT_TOKEN.to_owned(),
         operator_token: None,
+        bad_token_throttle: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

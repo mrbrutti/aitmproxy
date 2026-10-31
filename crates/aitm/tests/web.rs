@@ -74,6 +74,7 @@ async fn start(tag: &str) -> Server {
         mcp: Arc::new(mcp),
         agent_token: TOKEN.to_owned(),
         operator_token: None,
+        bad_token_throttle: Default::default(),
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local addr");

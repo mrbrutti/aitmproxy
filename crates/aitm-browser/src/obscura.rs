@@ -257,22 +257,101 @@ pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
     std::fs::create_dir(dir)
 }
 
-/// Log any per-run directory an earlier `aitm` left behind (it was killed, so no
-/// destructor ran); the operator decides whether an obscura is still running.
-fn warn_stale_run_dirs() {
-    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
-        return;
+/// Reap per-run directories an earlier `aitm` left behind (it was killed, so no
+/// destructor ran) — but *only* when the owning `aitm` is provably dead. When any
+/// were removed, emit exactly one `info!` line; `n == 0` stays silent.
+///
+/// Called before [`make_run_dir`] in [`ObscuraProcess::start`].
+fn reap_stale_run_dirs() {
+    let n = reap_stale_run_dirs_in(&std::env::temp_dir(), pid_is_alive);
+    if n > 0 {
+        info!(removed = n, "removed stale obscura run directories");
+    }
+}
+
+/// Pure, testable core: scan `base`, and for each entry whose name starts with
+/// [`RUN_DIR_PREFIX`] **and is a directory**, parse the owning `aitm` pid (the
+/// integer between `aitm-obscura-` and the next `-`). When the pid parses *and*
+/// `is_alive(pid)` is `false`, remove the directory and count it. Returns the
+/// number removed. Logs nothing (deterministic).
+///
+/// Conservative by construction: an unparseable name, a non-directory entry, or
+/// an ambiguous/alive `kill` leaves the directory in place. PID reuse at worst
+/// leaves a stale dir; it never deletes a live sibling's. We never scan processes
+/// and never touch an obscura process.
+fn reap_stale_run_dirs_in(base: &Path, is_alive: impl Fn(u32) -> bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return 0;
     };
+    let mut removed = 0;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.starts_with(RUN_DIR_PREFIX) && entry.path().is_dir() {
-            warn!(
-                path = %entry.path().display(),
-                "stale obscura run directory from an earlier run; remove it if no obscura is running"
-            );
+        let Some(rest) = name.strip_prefix(RUN_DIR_PREFIX) else {
+            continue;
+        };
+        // Skip anything that is not a real directory. `file_type()` does NOT follow
+        // symlinks (unlike `Path::is_dir`, which stats the target), so a symlink
+        // planted under our prefix is left alone and the gate matches exactly what
+        // `remove_run_dir` would unlink.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        // Parse the owning `aitm` pid; reject 0 and anything past `i32::MAX` so the
+        // `pid as i32` liveness probe can never wrap to a negative value (which would
+        // target a process *group*, not a process). A malformed name is left in place.
+        let Some(pid) = rest
+            .split('-')
+            .next()
+            .and_then(|pid| pid.parse::<u32>().ok())
+            .filter(|&pid| pid != 0 && pid <= i32::MAX as u32)
+        else {
+            continue;
+        };
+        if !is_alive(pid) {
+            remove_run_dir(&entry.path());
+            // Count only a confirmed removal: `remove_run_dir` is best-effort (it
+            // just `debug!`s on a real error), so re-check the dir is gone before
+            // claiming it in the one summary line.
+            if !entry.path().exists() {
+                removed += 1;
+            }
         }
     }
+    removed
+}
+
+/// Is a process with `pid` alive? The liveness probe for [`reap_stale_run_dirs`],
+/// deliberately *not* a process scan.
+///
+/// On unix this is `kill(pid, None)` — the null-signal existence probe: it sends
+/// no signal, only tests whether the process exists and is signallable. `nix`
+/// wraps the one `unsafe` libc call, so this crate keeps the workspace
+/// `unsafe_code = "forbid"` (no local `unsafe`, no leaf crate needed). `true` on
+/// success (it exists — us, a sibling, or a recycled pid → LEAVE the dir), `true`
+/// on `EPERM` (it exists under another uid → LEAVE), and `false` **only** on
+/// `ESRCH` (no such process — the owner is dead → REMOVE). Any other errno is
+/// treated as alive (LEAVE), so the reap only ever removes when provably dead.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    use nix::errno::Errno;
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    match kill(Pid::from_raw(pid as i32), None) {
+        Ok(()) => true,             // exists (us, a sibling, or a recycled pid) → LEAVE
+        Err(Errno::ESRCH) => false, // no such process → owner dead → REMOVE
+        Err(_) => true,             // EPERM or any other errno → conservatively alive → LEAVE
+    }
+}
+
+/// Conservative fallback on non-unix: without a `kill(pid, 0)` probe we cannot
+/// prove the owner dead, so we never reap.
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
 }
 
 /// Remove the per-run directory and its ready-file; a missing one is fine
@@ -402,7 +481,7 @@ impl ObscuraProcess {
         let probed = probe(&binary).await?;
         info!(binary = %binary.display(), version = %probed.version, "obscura probed");
 
-        warn_stale_run_dirs();
+        reap_stale_run_dirs();
         let cdp_port = free_loopback_port()?;
         // A fresh 0700 directory with an unpredictable name: the ready-file path
         // inside it cannot pre-exist (so a leftover cannot read as "ready" before
@@ -797,6 +876,138 @@ mod tests {
                 mode & 0o777
             );
         }
+    }
+
+    /// AC1/AC2: the reap removes only a run dir whose owning pid is *provably*
+    /// dead (the injected predicate returns `false`). A dir whose owner is alive,
+    /// a non-matching dir, and a matching *file* are all left untouched, and the
+    /// return value is the count removed. Hermetic: an injected liveness
+    /// predicate, no real processes, no process scan.
+    #[test]
+    fn reap_removes_only_provably_dead_dirs() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "aitm-reap-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).expect("create reap base");
+
+        struct Cleanup<'a>(&'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(self.0);
+            }
+        }
+        let _guard = Cleanup(&base);
+
+        let dead_dir = base.join("aitm-obscura-111-aaa");
+        let alive_dir = base.join("aitm-obscura-222-bbb");
+        let other_dir = base.join("not-ours");
+        let matching_file = base.join("aitm-obscura-333-ccc");
+        std::fs::create_dir(&dead_dir).unwrap();
+        std::fs::create_dir(&alive_dir).unwrap();
+        std::fs::create_dir(&other_dir).unwrap();
+        std::fs::write(&matching_file, b"not a dir").unwrap();
+
+        // Only pid 222 is alive; 111 (and 333) are dead.
+        let removed = reap_stale_run_dirs_in(&base, |pid| pid == 222);
+
+        assert_eq!(
+            removed, 1,
+            "exactly one provably-dead dir should be removed"
+        );
+        assert!(
+            !dead_dir.exists(),
+            "the dead owner's dir should be removed: {}",
+            dead_dir.display()
+        );
+        assert!(
+            alive_dir.is_dir(),
+            "the live owner's dir must be kept: {}",
+            alive_dir.display()
+        );
+        assert!(
+            other_dir.is_dir(),
+            "a non-matching dir must be kept: {}",
+            other_dir.display()
+        );
+        assert!(
+            matching_file.is_file(),
+            "a matching *file* (not a dir) must be kept: {}",
+            matching_file.display()
+        );
+    }
+
+    /// Regression guards for the two stage-6 security fixes: a symlink planted
+    /// under the prefix is never followed or removed (the gate is `file_type()`,
+    /// not `Path::is_dir()`), and a pid that is `0` or past `i32::MAX` is left in
+    /// place (so the `pid as i32` liveness probe can never wrap to a negative value
+    /// and signal a process *group*). Every owner is reported dead, yet nothing is
+    /// reaped.
+    #[cfg(unix)]
+    #[test]
+    fn reap_skips_symlinks_and_out_of_range_pids() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let base = std::env::temp_dir().join(format!(
+            "aitm-reap-sym-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&base).expect("create reap base");
+
+        struct Cleanup<'a>(&'a Path);
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(self.0);
+            }
+        }
+        let _guard = Cleanup(&base);
+
+        // A real dir, and a symlink named with a "dead" pid that points at it.
+        let target = base.join("target-dir");
+        std::fs::create_dir(&target).unwrap();
+        let symlink = base.join("aitm-obscura-444-ddd");
+        std::os::unix::fs::symlink(&target, &symlink).unwrap();
+
+        // Pids that parse as u32 but must be left alone: one past i32::MAX
+        // (<= u32::MAX so it parses), and zero.
+        let too_big = base.join("aitm-obscura-3000000000-eee");
+        let zero_pid = base.join("aitm-obscura-0-fff");
+        std::fs::create_dir(&too_big).unwrap();
+        std::fs::create_dir(&zero_pid).unwrap();
+
+        // Report every owner dead; nothing above is a reapable (real-dir, in-range) entry.
+        let removed = reap_stale_run_dirs_in(&base, |_pid| false);
+
+        assert_eq!(
+            removed, 0,
+            "no symlink or out-of-range-pid entry may be reaped"
+        );
+        assert!(
+            symlink.symlink_metadata().is_ok(),
+            "the symlink itself must be left in place: {}",
+            symlink.display()
+        );
+        assert!(
+            target.is_dir(),
+            "the symlink target must never be followed or removed: {}",
+            target.display()
+        );
+        assert!(
+            too_big.is_dir(),
+            "a pid past i32::MAX must be left in place: {}",
+            too_big.display()
+        );
+        assert!(
+            zero_pid.is_dir(),
+            "a pid of 0 must be left in place: {}",
+            zero_pid.display()
+        );
     }
 
     /// The token has real entropy: a batch of them is all-distinct.
