@@ -19,8 +19,11 @@ What "clean" means here, asserted on a real core (never fixtures):
   * NOTHING happened as a side effect: the ORIGIN (an echo-record upstream this
     test owns, or the seeded aitm-testtarget read directly) received exactly the
     one control request and nothing from `flow.replay` of a missing id; the one
-    REAL flow this test captured is byte-identical before/after (no mark, no
-    comment, no mutation landed on "some other" flow); no flow was added and
+    REAL flow this test captured is byte-identical before/after apart from
+    `meta.marks` (no comment, no mutation landed on "some other" flow). Marks are
+    checked on their own: the bundled passive detectors add marks to a live flow
+    at any moment, so they may only GROW -- every earlier mark is still there, and
+    the barrage's own label (BARRAGE_MARK) never appears; no flow was added and
     none was lost (proxy.status still counts the control flow; its `paused` /
     `capturing` fields are NOT asserted equal -- on a shared runner core a
     concurrent suite may legitimately park a flow or pause the proxy);
@@ -54,6 +57,7 @@ Touches no global state; the only write is one captured control flow.
 
 from __future__ import annotations
 
+import copy
 import http.client
 import json
 import os
@@ -84,6 +88,7 @@ NOISE = (  # none of this belongs in an error shown to an agent or operator
 ROW_WAIT_S = 10.0  # for the control flow to appear in flow.table
 SETTLE_S = 0.5  # grace for any hypothetical async leak to land at the origin
 FLOOD_N = 100
+BARRAGE_MARK = "e2e-missing"  # the label the barrage's flow.mark would write; must never land on the REAL flow
 FLOOD_MAX_RTT_S = 2.0
 DEFAULT_WRITE_POLICIES = ("auto", "all", "ask")  # Write runs for the agent
 READ_POLICIES = DEFAULT_WRITE_POLICIES + ("readonly",)
@@ -340,6 +345,26 @@ def flip_last_hex(fid: str) -> str:
     return fid[:-1] + repl
 
 
+def marks_of(detail: Any) -> List[str]:
+    """`flow.detail`'s `meta.marks`. Fails loudly if the shape moved, so a renamed
+    field cannot turn without_marks() below into a silent no-op."""
+    meta = detail.get("meta") if isinstance(detail, dict) else None
+    marks = meta.get("marks") if isinstance(meta, dict) else None
+    if not isinstance(marks, list) or not all(isinstance(m, str) for m in marks):
+        fail(f"flow.detail has no meta.marks list of strings: {str(detail)[:200]}")
+    return marks
+
+
+def without_marks(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """A deep copy of `detail` with ONLY `meta.marks` removed (never mutates its
+    argument): the bundled passive detectors add marks to a live flow, nothing else."""
+    out = copy.deepcopy(detail)
+    meta = out.get("meta")
+    if isinstance(meta, dict):
+        meta.pop("marks", None)
+    return out
+
+
 # --- the id-taking commands -------------------------------------------------------
 
 # (tool, args-for-id, need) -- `need` is the role class that may run it:
@@ -350,7 +375,7 @@ MISSING_ID_CALLS: List[Tuple[str, Callable[[str], Dict[str, Any]], str]] = [
     ("flow.get", lambda i: {"id": i}, "read"),
     ("flow.detail", lambda i: {"id": i, "body": "inline"}, "read"),
     ("flow.replay", lambda i: {"id": i}, "write"),
-    ("flow.mark", lambda i: {"id": i, "marks": ["e2e-missing"]}, "write"),
+    ("flow.mark", lambda i: {"id": i, "marks": [BARRAGE_MARK]}, "write"),
     ("flow.comment", lambda i: {"id": i, "text": "e2e missing-flow probe"}, "write"),
     ("flow.resume", lambda i: {"id": i}, "write"),
     ("flow.kill", lambda i: {"id": i}, "write"),
@@ -438,6 +463,7 @@ def main() -> int:
         detail_before = rd.call("flow.detail", {"id": real_id, "body": "inline"})
         check(isinstance(detail_before, dict) and (detail_before.get("response") or {}).get("status") == status,
               f"flow.detail on the REAL id carries the origin's response ({(detail_before.get('response') or {}).get('status')})")
+        marks_before = marks_of(detail_before)  # not asserted empty: bundled passive detectors may add marks at any moment
         status_before = rd.call("proxy.status")
         flows_before = int(status_before.get("flows") or 0)
         check(flows_before >= 1, f"proxy.status counts the store ({flows_before} flows, control included)")
@@ -535,7 +561,17 @@ def main() -> int:
         hits = observer.hits()
         check(hits == 1, f"origin's OWN record still shows exactly 1 request for {tag} (got {hits}) -- no replay leaked")
         detail_after = rd.call("flow.detail", {"id": real_id, "body": "inline"})
-        check(detail_after == detail_before, "flow.detail of the REAL flow is byte-identical: no mark/comment/mutation landed elsewhere")
+        marks_after = marks_of(detail_after)
+        delta = f"(marks {marks_before!r} -> {marks_after!r})"
+        # The bundled passive detectors (on_response Rhai hooks) add marks to a live flow shortly
+        # after it completes, so meta.marks may legitimately GROW between the two reads: compare
+        # everything else strictly, and check marks on their own (they only ever grow).
+        check(without_marks(detail_after) == without_marks(detail_before),
+              f"flow.detail of the REAL flow is byte-identical apart from meta.marks: no comment/mutation landed elsewhere {delta}")
+        check(BARRAGE_MARK not in marks_after,
+              f"the barrage's mark label {BARRAGE_MARK!r} is absent from the REAL flow's marks: no flow.mark landed elsewhere {delta}")
+        check(set(marks_before) <= set(marks_after),
+              f"marks only grew: every mark present before the barrage is still present: none was replaced or wiped {delta}")
         tagged = [r for r in table_rows(rd) if tag in (r.get("path") or "")]
         check(len(tagged) == 1 and tagged[0]["id"] == real_id, f"flow.table holds exactly the one control flow for {tag} ({len(tagged)})")
         list_after = set(rd.call("flow.list"))
