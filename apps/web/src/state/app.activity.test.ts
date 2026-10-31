@@ -1,10 +1,10 @@
 // Activity intake (push spec D6, D7): every audit line, pushed on `notifications/aitm/agent` or read
 // as the `agent.activity` snapshot, goes through one intake that normalizes the server's wire shape
-// to the model the log renders, numbers what it keeps, and keeps the newest ACTIVITY_CAP. Only the
-// PUSH path drops this UI's own successful background reads (the bridge echoes every call back to
-// us); the snapshot is the primary server's ring, which never holds this UI's calls, so it is never
-// filtered. The bridge role is `operator`, so the UI's own origin is `operator`. The push path for
-// flows is `app.push.test.ts`.
+// to the model the log renders, drops this UI's own successful background reads (the bridge echoes
+// every call back to us, and since PR #145 the web server shares the primary's audit ring, so the
+// snapshot holds them too; spec D7 fifth amendment), numbers what it keeps, and keeps the newest
+// ACTIVITY_CAP. The bridge role is `operator`, so the UI's own origin is `operator`. The push path
+// for flows is `app.push.test.ts`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAppStore } from './app';
@@ -95,6 +95,14 @@ describe('app store — activity intake', () => {
       'mcp/claude-code/flow.list/ok',
       'mcp/-/flow.list/error',
     ]);
+
+    // The same own origin decides the snapshot: on the agent token the shared ring records this UI's
+    // bridge calls with origin `mcp` (the server records origin by role), and those are the ones dropped.
+    bus.ctl.activityWire = [mcpPoll(10), ownPoll(11), mcpPoll(12), { ...mcpPoll(13), command: 'flow.kill' }];
+    const refreshed = app.refreshSide();
+    await tick(50);
+    await refreshed;
+    expect(app.proxy.activity.map((e) => `${e.origin}/${e.command}`)).toEqual(['operator/flow.list', 'mcp/flow.kill']);
   });
 
   it('with no resolved role nothing is ours by origin, so nothing is dropped', async () => {
@@ -153,15 +161,17 @@ describe('app store — activity intake', () => {
     expect(app.proxy.activity).toHaveLength(0);
   });
 
-  // The snapshot is the primary server's ring: it holds other transports' calls and never this UI's, so a
-  // line in it that LOOKS like our poll is some other client's and is shown (spec D7, third amendment).
-  it('the snapshot is normalized and capped but not filtered', async () => {
+  // Since PR #145 the web server shares the primary's audit ring, so the snapshot holds this UI's own
+  // polling (up to 4096 lines of it) next to everyone else's calls: the same noise rule as the push
+  // path applies, then the cap (spec D7, fifth amendment).
+  it('the snapshot is normalized, filtered and capped', async () => {
     const { bus, app } = start();
     await tick(200);
 
-    // 700 wire lines: every seventh looks like this UI's own `flow.list` (100 of them), the other 600
-    // are kills numbered k_0 .. k_599 in ring order. All 700 are kept; the newest 500 are wire
-    // indices 200 .. 699, which hold 72 of the polls.
+    // 700 wire lines: every seventh is this UI's own `flow.list` (100 of them), the other 600 are
+    // kills numbered k_0 .. k_599 in ring order. The polls are dropped and take no number; the 600
+    // kills are numbered 1 .. 600 and the newest 500 stay: k_100 (wire index 116, 16 polls before
+    // it) .. k_599 (wire index 698; index 699 is a poll).
     const wire: unknown[] = [];
     let kills = 0;
     for (let i = 0; i < 700; i++) {
@@ -178,14 +188,51 @@ describe('app store — activity intake', () => {
     const list = app.proxy.activity;
     expect(list).toHaveLength(500);
     for (const e of list) expect(e.at).toMatch(ISO);
-    expect(list.filter((e) => e.command === 'flow.list')).toHaveLength(72);
-    expect(list[0]).toMatchObject({ seq: 201, command: 'flow.kill', args: { id: 'k_172' }, at: new Date(T0 + 200).toISOString() }); // wire index 200: 28 polls before it
-    expect(list[499]).toMatchObject({ seq: 700, command: 'flow.list', origin: 'operator', clientLabel: null, args: {}, at: new Date(T0 + 699).toISOString() }); // wire index 699 is a poll
+    expect(list.filter((e) => e.command === 'flow.list')).toHaveLength(0);
+    expect(list[0]).toMatchObject({ seq: 101, command: 'flow.kill', args: { id: 'k_100' }, at: new Date(T0 + 116).toISOString() });
+    expect(list[499]).toMatchObject({ seq: 600, command: 'flow.kill', origin: 'operator', clientLabel: null, args: { id: 'k_599' }, at: new Date(T0 + 698).toISOString() });
   });
 
-  // Over `aitm web` the ring `agent.activity` reads is empty (the web server's own ring is not the one
-  // it reads), so the log is fed by push alone there; a snapshot that keeps nothing must not replace it,
-  // or every side refresh (scope.add, poc.run, the catalogue heal) wipes the Activity panel.
+  // On `aitm web` the shared ring is mostly this UI's own polling. A snapshot that is ALL noise keeps
+  // nothing and must leave the push-fed log alone, like an empty one (second amendment): otherwise
+  // every side refresh (scope.add, poc.run, the catalogue heal) would wipe the Activity panel.
+  it('a snapshot of only own polling does not wipe the pushed log', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    bus.emit('notifications/aitm/agent', AGENT_LINE);
+    expect(app.proxy.activity).toHaveLength(1);
+    const wire: unknown[] = [];
+    for (let i = 0; i < 50; i++) wire.push(ownPoll(i));
+    bus.ctl.activityWire = wire;
+
+    const refreshed = app.refreshSide();
+    await tick(50);
+    await refreshed;
+
+    expect(app.proxy.activity).toEqual([
+      { seq: 1, at: '2024-10-27T03:33:20.000Z', origin: 'mcp', clientLabel: 'claude-code', command: 'flow.replay', args: { id: 'f_1' }, result: 'ok' },
+    ]);
+  });
+
+  // The shared ring holds other transports' calls too. A labelled line is never ours (the bridge labels
+  // nothing), so another client's `flow.list` in the snapshot stays visible while our own is dropped.
+  it('a snapshot line with a label is kept', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    bus.ctl.activityWire = [ownPoll(1), { ...ownPoll(2), client_label: 'claude-code' }, ownPoll(3)];
+
+    const refreshed = app.refreshSide();
+    await tick(50);
+    await refreshed;
+
+    expect(app.proxy.activity).toEqual([
+      { seq: 1, at: '2024-10-27T03:33:20.002Z', origin: 'operator', clientLabel: 'claude-code', command: 'flow.list', args: {}, result: 'ok' },
+    ]);
+  });
+
+  // A snapshot that keeps nothing must not replace the push-fed log, or every side refresh (scope.add,
+  // poc.run, the catalogue heal) wipes the Activity panel; before PR #145 the ring over `aitm web` was
+  // always empty, now it is empty on a fresh core.
   it('an empty snapshot does not wipe the pushed log', async () => {
     const { bus, app } = start();
     await tick(200);
@@ -372,6 +419,22 @@ describe('app store — activity intake', () => {
     bus.emit('notifications/aitm/state', { lagged: true });
     expect(app.proxy.activity).toHaveLength(1);
     expect(app.proxy.activity[0]).toMatchObject({ seq: 2, args: { note: RECONNECT_NOTE, count: 2 } });
+  });
+
+  // The row is appended in ANY bus state; only the flow resync the marker also asks for waits for an
+  // open bus (a poll issued into a reconnecting bus would park on `ready` and stall the loop).
+  it('a lagged marker appends a gap row even when the bus is not open', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    bus.ctl.setState('reconnecting');
+    const lists = bus.count('flow.list');
+
+    bus.emit('notifications/aitm/state', { lagged: true });
+    await tick(50);
+
+    expect(app.proxy.activity).toHaveLength(1);
+    expect(app.proxy.activity[0]).toMatchObject({ seq: 1, command: 'audit-log', result: 'error', args: { note: LAG_NOTE, count: 1 } });
+    expect(bus.count('flow.list')).toBe(lists);
   });
 
   it('gap rows are capped like every other line', async () => {

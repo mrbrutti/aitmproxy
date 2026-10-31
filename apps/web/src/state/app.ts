@@ -369,28 +369,27 @@ export function createAppStore(bus: BusClient) {
       return true;
     }
 
-    /** Newest lines kept (after the push-path filter); a snapshot is capped unfiltered. */
+    /** Newest lines kept, after the noise filter, on both paths. */
     const ACTIVITY_CAP = 500;
     /**
      * The one intake behind the live push (`append`) and the `agent.activity` snapshot (`replace`)
      * (push spec D6, D7). Each line is normalized from the server's wire shape (`toAgentEntry`; an
-     * `approval_requested` line is not an audit entry and is skipped), what is kept is numbered, and
-     * the newest ACTIVITY_CAP stay. Only the PUSH path drops this UI's own successful background
-     * reads: the web server echoes every call made over `/bus` back to us, and own-ness is inferred
-     * from this connection's role because the bridge labels nothing. The snapshot is the PRIMARY
-     * server's ring, which never holds this UI's calls (`crates/aitm/src/main.rs` attaches it to the
-     * primary alone), so filtering it could only hide another client's reads; it is shown whole. A
-     * batch that keeps nothing changes nothing, in either mode: over `aitm web` that ring is empty, so
-     * the log is fed by push alone there and a snapshot must not replace it with nothing on every side
-     * refresh (scope.add, poc.run, the catalogue heal).
+     * `approval_requested` line is not an audit entry and is skipped), this UI's own successful
+     * background reads are dropped, what is kept is numbered, and the newest ACTIVITY_CAP stay. The
+     * filter runs on BOTH paths: the web server echoes every call made over `/bus` back to us, and
+     * since PR #145 it shares the primary's audit ring (`tui::with_shared_governance`), so the
+     * snapshot holds this UI's own polling too, up to the ring's 4096 lines; own-ness is inferred from
+     * this connection's role because the bridge labels nothing (D7, fifth amendment). A batch that
+     * keeps nothing changes nothing, in either mode: a snapshot that is empty (a fresh core) or all
+     * our own polling must not replace the push-fed log with nothing on every side refresh (scope.add,
+     * poc.run, the catalogue heal).
      */
     function intakeActivity(raw: readonly unknown[], mode: 'append' | 'replace') {
       const own = { origin: ownOriginOf(untrack(bus.role)) };
       const kept: ActivityEntry[] = [];
       for (const item of raw) {
         const e = toAgentEntry(item);
-        if (!e) continue;
-        if (mode === 'append' && isUiPollNoise(e, own)) continue;
+        if (!e || isUiPollNoise(e, own)) continue;
         kept.push({ ...e, seq: ++activitySeq });
       }
       commitActivity(kept, mode);
@@ -865,8 +864,9 @@ export function createAppStore(bus: BusClient) {
         jobs.push(
           bus
             .call<unknown>('agent.activity')
-            // No `limit`: the ring is the snapshot, and the intake caps it (never filters it). Over
-            // `aitm web` it is empty today (the web server's own ring is not the one agent.activity reads).
+            // No `limit`: the ring is the snapshot, and the intake filters and caps it. Over `aitm web`
+            // the ring was empty before PR #145 (the web server's own ring was not the one agent.activity
+            // read); since then it is the primary's, shared, and holds this UI's own polling.
             .then((list) => {
               if (Array.isArray(list)) intakeActivity(list, 'replace');
             })

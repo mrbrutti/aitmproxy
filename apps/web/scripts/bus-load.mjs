@@ -16,9 +16,10 @@
 // `origin`, `command`, ...) and pushes each entry as a `notifications/aitm/agent` line to every
 // subscribed connection. This script is a SEPARATE bridge connection that subscribes once with
 // `flow.subscribe {}` and then just listens, so it counts the UI's calls from that stream. It does
-// NOT read `agent.activity`: over `aitm web` that ring is empty, because the web server is a second
-// McpServer with its own audit ring while `AgentActivity` reads the primary server's ring
-// (crates/aitm/src/main.rs:429 attaches the ring to the primary only). The script's own calls are
+// NOT read `agent.activity`: when this was written, over `aitm web` that ring was empty (the web
+// server was a second McpServer with its own audit ring while `AgentActivity` read the primary's);
+// since PR #145 the web server shares the primary's ring, but the notification stream is the same
+// instrument either way, and the script counts that. The script's own calls are
 // `flow.subscribe` (not audited; pinned by the e2e contract) and one `flow.list` after the last
 // window (its line is stamped after the window end, so the time filter drops it); nothing it does
 // lands inside a window.
