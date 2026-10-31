@@ -100,6 +100,12 @@ struct FlowCommands: Commands {
     let session: Session
     /// The persisted capture choice (Settings ▸ Capture), read here for the Enable/Disable label.
     @AppStorage("capture.enabled") private var captureEnabled = false
+    /// The active core kind (Settings ▸ Bus), read exactly as `ProxySettings` reads it: capture
+    /// belongs to the embedded core, so the Enable/Disable Capture command stands down unless
+    /// that is the active one.
+    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+
+    private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
@@ -232,7 +238,7 @@ struct FlowCommands: Commands {
                 Task { await CaptureSwitch.set(on, session: session) }
             }
             .keyboardShortcut("c", modifiers: [.command, .control])
-            .disabled(!session.coreHealth.captureControlsAvailable || session.coreHealth.captureBusy)
+            .disabled(!session.coreHealth.captureControlsAvailable || session.coreHealth.captureBusy || !usesEmbedded)
         }
         CommandMenu("Agent") {
             Picker("Policy", selection: Binding(get: { session.agentPolicy }, set: { session.activity.choose($0) })) {

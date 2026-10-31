@@ -106,7 +106,9 @@ extension CaptureCapability {
     }
 
     /// Whether there is an extension to report on at all. `false` for a build with no
-    /// embedded extension (and after an uninstall), so the capture section stays hidden.
+    /// embedded extension, before the first activation and after an uninstall. It is one
+    /// input to whether the capture controls are live: a capture-capable build shows them
+    /// (the toggle, to turn capture on) even while this is `false`.
     public var isInstalledOrInstalling: Bool {
         self != .extensionNotInstalled
     }

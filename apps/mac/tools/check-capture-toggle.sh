@@ -3,7 +3,10 @@
 # docs/superpowers/specs/2026-10-30-macos-ne-ship-and-toggle-design.md):
 # TG-AC3 spawn reads the choice fresh, TG-AC4 first run OFF asks nothing, TG-AC5 ON,
 # TG-AC6 OFF, TG-AC8 persisted OFF default and idempotent, TG-AC10 menu + shortcut,
-# TG-AC11 the four snapshot states.
+# TG-AC11 the four snapshot states; and the stage-6 fixes: disable() honest and stops capture first,
+# an OFF launch converges the tunnel to off, the toggle and the menu command stand down unless the
+# embedded core is active, spawn() never opens the gate in a build without the extension,
+# CaptureSwitch reads the choice as spawn() does, and Uninstall's ratified clear-and-restart.
 #
 # Why this exists: the toggle's glue (CaptureSwitch, ExtensionController start/enable/disable,
 # EmbeddedCore.spawn) lives in the app target, which has no unit-test target, and the
@@ -133,6 +136,8 @@ found "TG-AC3 EmbeddedCore.spawn()" "$spawn"
 has "TG-AC3 spawn() reads capture.enabled from UserDefaults" "$spawn" 'forKey: "capture.enabled"'
 spawn_read=$(grep -F 'forKey: "capture.enabled"' <<<"$spawn" | head -n 1)
 has "TG-AC3/TG-AC8 the spawn read is false when the key is absent or not a Bool" "$spawn_read" 'as? Bool ?? false'
+has "TG-AC3/#5 the spawn read is ANDed with CaptureExtension.isEmbedded, so a dev build sharing the defaults never opens the gate" \
+    "$spawn_read" '&& CaptureExtension.isEmbedded(inApp: Bundle.main.bundleURL)'
 has "TG-AC3 spawn() threads the choice into the core Config" "$spawn" 'captureEnabled: captureEnabled'
 equals "TG-AC3 capture.enabled is read only inside spawn(), never cached across spawns" \
     "$(code_lines "$core" | grep -c -F 'capture.enabled')" "$(grep -c -F 'capture.enabled' <<<"$spawn")"
@@ -168,15 +173,19 @@ fi
 detect=$(body_of "$ext" '^[[:space:]]*(private )?func detectInactiveExtension[(][)]')
 found "TG-AC4 detectInactiveExtension()" "$detect"
 has "TG-AC4 the off-at-launch detection only reads saved configurations" "$detect" 'loadAllFromPreferences'
-hasnt "TG-AC4 the off-at-launch detection submits and saves nothing" "$detect" "$prompting"
+hasnt "TG-AC4 the off-at-launch detection submits no request, creates no configuration and starts no tunnel itself" "$detect" "$prompting"
+has "TG-AC4/#4 an OFF launch converges a saved configuration that is still enabled or whose tunnel is not disconnected to off" \
+    "$detect" 'ours.isEnabled || ours.connection.status != .disconnected'
+has "TG-AC4/#4 the convergence is the idempotent switch-off, and only of the configuration that exists" "$detect" 'switchOff([ours])'
 only_in "TG-AC4 the activation request is built only in enable()" "$ext" '[.]activationRequest[[:space:]]*[(]' \
     '^[[:space:]]*func enable[(][)] [{]'
 only_in "TG-AC4 submitRequest is called only in enable() and deactivate()" "$ext" 'submitRequest[[:space:]]*[(]' \
     '^[[:space:]]*func enable[(][)] [{]' '^[[:space:]]*(private )?func deactivate[(][)]'
 only_in "TG-AC4 a new proxy configuration (the second prompt) is created only in the reconcile" "$ext" \
     'NETransparentProxyManager[(][)]' '^[[:space:]]*(private )?func enableAndStartTunnel[(][)]'
-only_in "TG-AC4 configurations are saved only by the reconcile and by disable()" "$ext" 'saveToPreferences' \
-    '^[[:space:]]*(private )?func enableAndStartTunnel[(][)]' '^[[:space:]]*func disable[(][)] async'
+only_in "TG-AC4 configurations are saved only by the reconcile and by the switch-off (disable() and the OFF-launch convergence)" \
+    "$ext" 'saveToPreferences' \
+    '^[[:space:]]*(private )?func enableAndStartTunnel[(][)]' '^[[:space:]]*(private )?func switchOff[(]'
 only_in "TG-AC4 the tunnel is started only by the reconcile" "$ext" 'startVPNTunnel' \
     '^[[:space:]]*(private )?func enableAndStartTunnel[(][)]'
 
@@ -206,20 +215,42 @@ hasnt "TG-AC6 OFF never calls enable()" "$off_block" '[.]enable[[:space:]]*[(]'
 l_disable=$(line_of "$off_block" 'disable[(][)]')
 l_off_set=$(line_of "$off_block" 'set[(]false, forKey: "capture[.]enabled"[)]')
 l_off_tick=$(line_of "$off_block" 'restartCoreTick')
-ordered "TG-AC6 OFF stops the tunnel before it clears the choice" "$l_disable" "$l_off_set"
-ordered "TG-AC6 OFF clears the choice before the restart reads it" "$l_off_set" "$l_off_tick"
+ordered "TG-AC6/#6 OFF persists the choice before it awaits disable() (a crash mid-OFF fails toward off)" "$l_off_set" "$l_disable"
+ordered "TG-AC6 OFF finishes disable() before the restart reads the choice" "$l_disable" "$l_off_tick"
 has "TG-AC6 OFF waits for disable() to finish (await)" "$(grep -F 'disable()' <<<"$off_block")" 'await'
 
 disable=$(body_of "$ext" '^[[:space:]]*func disable[(][)] async')
 found "TG-AC6 ExtensionController.disable()" "$disable"
 has "TG-AC6 disable() stops the tunnel" "$disable" 'stopVPNTunnel()'
-has "TG-AC6 disable() switches the saved configuration off so the system cannot restart it" "$disable" 'isEnabled = false'
+has "TG-AC6 disable() switches the saved configuration off (switchOff) so the system cannot restart it" "$disable" 'switchOff('
+ordered "TG-AC6/#2 disable() stops the tunnel before it loads or saves any configuration, so capture ceases at once" \
+    "$(line_of "$disable" 'stopVPNTunnel[(][)]')" "$(line_of "$disable" 'loadAllFromPreferences')"
+ordered "TG-AC6/#2 disable() loads the configurations before it switches them off" \
+    "$(line_of "$disable" 'loadAllFromPreferences')" "$(line_of "$disable" 'switchOff[(]')"
+hasnt "TG-AC6/#2 disable() swallows no preferences error (no try?)" "$disable" 'try[?]'
+has "TG-AC6/#2 disable() reports a configuration it could not switch off as a failure, not as Off" "$disable" \
+    'apply(.failed("Capture is stopped, but its proxy configuration could not be switched off:'
 has "TG-AC6 disable() cancels the reconcile so a late save cannot restart the tunnel" "$disable" 'reconcileTask?.cancel()'
 has "TG-AC6 disable() records that capture is no longer wanted" "$disable" 'captureWanted = false'
 hasnt "TG-AC6 disable() removes nothing and submits no deactivation (the sysex stays installed)" "$disable" \
     'deactivationRequest|deactivate[(]|removeFromPreferences|removeSavedConfiguration|submitRequest|activationRequest'
-# The last statement of the body (the line before the closing brace) is the state change.
-has "TG-AC6 disable() ends in apply(.disabled)" "$(tail -n 2 <<<"$disable" | head -n 1)" 'apply(.disabled)'
+# .inactive ("Off") is reported only on the success branch: the line before apply(.disabled) is the else.
+l_ok=$(line_of "$disable" 'apply[(][.]disabled[)]')
+if [ -n "$l_ok" ] && grep -q -E '^[[:space:]]*[}] else [{][[:space:]]*$' <<<"$(sed -n "$((l_ok - 1))p" "$ext")"; then
+    pass "TG-AC6/#2 disable() reports apply(.disabled) only in the else of a failure check (line $l_ok)"
+else
+    fail "TG-AC6/#2 disable() must reach apply(.disabled) only through the else of its failure check (line '${l_ok:-missing}')"
+fi
+switch_off=$(body_of "$ext" '^[[:space:]]*(private )?func switchOff[(]')
+found "TG-AC6/#2 ExtensionController.switchOff()" "$switch_off"
+has "TG-AC6 switchOff() stops the tunnel" "$switch_off" 'stopVPNTunnel()'
+has "TG-AC6 switchOff() switches the configuration off" "$switch_off" 'isEnabled = false'
+has "TG-AC6 switchOff() saves it" "$switch_off" 'saveToPreferences()'
+ordered "TG-AC6/#2 switchOff() stops the tunnel before it saves" \
+    "$(line_of "$switch_off" 'stopVPNTunnel[(][)]')" "$(line_of "$switch_off" 'saveToPreferences')"
+hasnt "TG-AC6/#2 switchOff() swallows no save error (no try?)" "$switch_off" 'try[?]'
+hasnt "TG-AC6 switchOff() creates nothing, starts nothing, removes nothing" "$switch_off" \
+    'NETransparentProxyManager[(][)]|startVPNTunnel|removeFromPreferences|submitRequest|activationRequest|deactivationRequest'
 enable=$(body_of "$ext" '^[[:space:]]*func enable[(][)] [{]')
 found "TG-AC5 ExtensionController.enable()" "$enable"
 has "TG-AC5 enable() records that capture is wanted (so a late approval brings the tunnel up)" "$enable" 'captureWanted = true'
@@ -230,6 +261,20 @@ found "TG-AC6 ExtensionController.uninstall()" "$uninstall"
 has "TG-AC6 uninstall() still removes the saved configuration" "$uninstall" 'removeSavedConfiguration()'
 has "TG-AC6 uninstall() still deactivates the extension" "$uninstall" 'deactivate()'
 has "TG-AC6 uninstall() still ends at not-installed" "$uninstall" 'apply(.uninstalled)'
+has "#9 uninstall() refuses while a disable() runs" "$uninstall" '!disabling'
+has "#9 uninstall() refuses while an activation request is still outstanding" "$uninstall" 'if pendingActivity != nil, deactivation == nil { return }'
+ordered "#9 uninstall() checks for an outstanding activation before it starts" \
+    "$(line_of "$uninstall" 'pendingActivity != nil')" "$(line_of "$uninstall" 'uninstalling = true')"
+sw_uninstall=$(body_of "$settings" '^[[:space:]]*static func uninstall[(]session: Session')
+found "finding 1 CaptureSwitch.uninstall" "$sw_uninstall"
+has "finding 1 Uninstall waits for the extension's removal" "$sw_uninstall" 'await health.extensionController?.uninstall()'
+has "finding 1 a finished Uninstall persists capture.enabled = false" "$sw_uninstall" 'set(false, forKey: "capture.enabled")'
+has "finding 1 a finished Uninstall bumps restartCoreTick so the core's gate closes" "$sw_uninstall" 'restartCoreTick += 1'
+has "finding 1 Uninstall clears the choice only once nothing is installed" "$sw_uninstall" 'health.captureCapability == .extensionNotInstalled'
+ordered "finding 1 Uninstall removes the extension before it clears the choice" \
+    "$(line_of "$sw_uninstall" 'extensionController[?][.]uninstall[(][)]')" "$(line_of "$sw_uninstall" 'set[(]false, forKey: "capture[.]enabled"[)]')"
+ordered "finding 1 Uninstall clears the choice before the restart reads it" \
+    "$(line_of "$sw_uninstall" 'set[(]false, forKey: "capture[.]enabled"[)]')" "$(line_of "$sw_uninstall" 'restartCoreTick')"
 remove_cfg=$(body_of "$ext" '^[[:space:]]*(private )?func removeSavedConfiguration[(][)]')
 has "TG-AC6 removeSavedConfiguration() removes the configuration" "$remove_cfg" 'removeFromPreferences()'
 deactivate=$(body_of "$ext" '^[[:space:]]*(private )?func deactivate[(][)]')
@@ -262,7 +307,15 @@ fi
 ordered "TG-AC8 the guard is the first thing set() does (before the busy flag is raised)" \
     "$l_return" "$(line_of "$sw" 'captureBusy = true')"
 has "TG-AC8 set() ignores a request made while another capture action runs" "$sw_guard" '!health.captureBusy'
-has "TG-AC8 set() ignores a request for the state already in force" "$sw_guard" 'on != UserDefaults.standard.bool(forKey: "capture.enabled")'
+has "TG-AC8/#6 set() ignores a request for the state already in force, reading the key as spawn() does" "$sw_guard" \
+    'on != (UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false)'
+hasnt "#6 CaptureSwitch never reads capture.enabled with bool(forKey:) (a non-Bool stored value must read as off)" \
+    "$(code_lines "$settings")" 'bool[(]forKey: "capture[.]enabled"'
+has "#3 set() does nothing unless the embedded core is the active kind" "$sw_guard" 'embeddedCoreActive'
+active_kind=$(body_of "$settings" '^[[:space:]]*static var embeddedCoreActive')
+found "#3 CaptureSwitch.embeddedCoreActive" "$active_kind"
+has "#3 embeddedCoreActive reads the persisted active kind the way ActiveConnectionModel does (embedded when unset)" \
+    "$active_kind" '(UserDefaultsActiveKindPersistence().load() ?? .embedded) == .embedded'
 has "TG-AC8 enable() submits no second request while one is outstanding or capture is on" "$enable" \
     'guard pendingActivity == nil, !health.captureCapability.isCaptureOn'
 has "TG-AC8 enable() refuses while a disable() or uninstall() runs" "$enable" '!uninstalling, !disabling'
@@ -285,6 +338,14 @@ l_toggle=$(line_of "$cs_body" 'Toggle[(]"Capture L4 traffic"')
 l_note=$(line_of "$cs_body" 'Not available in this build')
 ordered "visibility the live Toggle sits inside the captureControlsAvailable branch" "$l_avail" "$l_toggle"
 ordered "visibility the 'Not available in this build' note follows the live Toggle (else branch)" "$l_toggle" "$l_note"
+has "#3 the Capture view reads the active core kind exactly as ProxySettings does" "$cs_body" \
+    '@AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
+has "#3 the Capture view's usesEmbedded is ProxySettings's" "$cs_body" \
+    'private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }'
+toggle_text=$(sed -n "${l_toggle:-1},$((${l_toggle:-1} + 6))p" "$settings")
+has "#3 the Capture toggle is disabled unless the embedded core is the active kind" \
+    "$(grep -F '.disabled(' <<<"$toggle_text")" '!usesEmbedded'
+has "#3 the Capture tab says why the toggle is disabled when the core is not embedded" "$cs_body" 'if !usesEmbedded {'
 hasnt "TG-AC5 the Settings status line never hard-codes 'Capturing' (it shows CaptureCapability.title)" \
     "$cs_body" '"Capturing"'
 has "TG-AC5 the Settings status line shows CaptureCapability.title" "$cs_body" 'Text(capability.title)'
@@ -312,6 +373,12 @@ if [ -n "$menu_item" ]; then
     has "TG-AC10 the command stands down in a build with no extension and while an action runs" "$item_text" \
         'captureControlsAvailable'
     has "TG-AC10 the command stands down while an action runs" "$item_text" 'captureBusy'
+    has "#3 the command stands down unless the embedded core is the active kind" \
+        "$(grep -F '.disabled(' <<<"$item_text")" '!usesEmbedded'
+    has "#3 the menu reads the active core kind exactly as ProxySettings does" "$(code_lines "$app")" \
+        '@AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue'
+    has "#3 the menu's usesEmbedded is ProxySettings's" "$(code_lines "$app")" \
+        'private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }'
 else
     shortcut_line=""
 fi

@@ -15,10 +15,13 @@ import SystemExtensions
 ///       → approvedAttached  (didFinishWithResult .completed; the transparent-proxy
 ///                            manager is then reconciled, saved, loaded and started)
 ///       → capturing         (the tunnel reaches `.connected`)
-///     degraded(reason)      (activation failed, restart needed, or the tunnel failed)
+///     degraded(reason)      (activation failed, restart needed, the tunnel failed, or
+///                            disable() stopped the tunnel but could not switch its saved
+///                            configuration off)
 ///     inactive              (disable(): the operator turned capture off; the tunnel is
 ///                            stopped but the extension and its saved configuration stay,
-///                            so enable() resumes without a new approval)
+///                            so enable() resumes without a new approval; also a launch
+///                            with capture off that finds the extension already approved)
 ///     extensionNotInstalled (uninstall(): deactivated, configuration removed)
 ///
 /// **Inert unless the extension is embedded.** A development build has no
@@ -142,13 +145,23 @@ final class ExtensionController: NSObject {
     /// Settings Uninstall reach it); no configuration, or one that cannot be read, leaves
     /// `.extensionNotInstalled` and the first `enable()` reconciles. Loading preferences
     /// shows no prompt. Does nothing if the operator turned capture on while it loaded.
+    ///
+    /// A launch with capture off also converges the tunnel to off: if that saved
+    /// configuration is still enabled, or its tunnel is not disconnected (the app crashed
+    /// or was force-quit mid-capture, or capture was switched off while the app was not
+    /// running), it is switched off with the same idempotent steps as `disable()`. This is
+    /// fail-safe, not authoritative: it adds no prompt and no activation, and a failure
+    /// to switch the configuration off leaves the state exactly as reported here.
     private func detectInactiveExtension() async {
         guard let managers = try? await NETransparentProxyManager.loadAllFromPreferences(),
-              managers.contains(where: Self.isOurs),
+              let ours = managers.first(where: Self.isOurs),
               !managingExtension, health.captureCapability == .extensionNotInstalled
         else { return }
         managingExtension = true
         apply(.disabled)
+        if ours.isEnabled || ours.connection.status != .disconnected {
+            _ = await switchOff([ours])
+        }
     }
 
     /// The operator's ON: submits the activation request for the embedded extension.
@@ -348,22 +361,23 @@ final class ExtensionController: NSObject {
     // MARK: disable
 
     /// The operator's OFF (spec TG-AC6): stops capture and leaves everything installed.
-    /// Cancels the reconcile, then switches this extension's saved
-    /// `NETransparentProxyManager` configuration off and stops the tunnel, and reports
-    /// `.inactive`. It submits no deactivation request, so the system extension stays
-    /// installed and approved, and it keeps the saved configuration (unlike `uninstall()`,
-    /// which removes both), so `enable()` later needs no new approval and no "Add Proxy
-    /// Configurations" prompt.
+    /// Cancels the reconcile, stops the tunnel at once, then switches this extension's saved
+    /// `NETransparentProxyManager` configuration off and reports `.inactive`. It submits no
+    /// deactivation request, so the system extension stays installed and approved, and it
+    /// keeps the saved configuration (unlike `uninstall()`, which removes both), so
+    /// `enable()` later needs no new approval and no "Add Proxy Configurations" prompt.
     ///
     /// Operator-only: the Capture settings toggle and its menu command are its callers
     /// (see the type comment). A no-op unless this controller is managing a real
     /// extension, and while a disable or an uninstall is already running. Idempotent:
     /// calling it when capture is already off converges on the same state.
     ///
-    /// The configuration is saved with `isEnabled = false` so the system has no enabled
-    /// configuration to restart the stopped tunnel from. Whether `stopVPNTunnel()` alone
-    /// would suffice is a live check (TG-AC6). The stop is attempted whatever happens to
-    /// the save or the load, so that capture being off never hinges on a preferences write.
+    /// The tunnel is stopped before any preferences call, so capture ceases whatever
+    /// happens next. The configuration is then saved with `isEnabled = false` so the system
+    /// has no enabled configuration to restart the stopped tunnel from (whether
+    /// `stopVPNTunnel()` alone would suffice is a live check, TG-AC6). If that load or save
+    /// fails, capture is still stopped but may come back by itself, so the state is
+    /// `.degraded` with the reason, never `.inactive` ("Off").
     func disable() async {
         guard managingExtension, !disabling, !uninstalling else { return }
         disabling = true
@@ -377,19 +391,41 @@ final class ExtensionController: NSObject {
         await reconcileTask?.value
         reconcileTask = nil
         removeTunnelObserver()
+        // Stop the tunnel this controller started before touching any preferences, so
+        // capture ceases at once; stopping an already-stopped tunnel is harmless.
         let startedManager = tunnelManager
         tunnelManager = nil
-        if let saved = try? await NETransparentProxyManager.loadAllFromPreferences() {
-            for manager in saved where Self.isOurs(manager) {
-                manager.isEnabled = false
-                try? await manager.saveToPreferences()
-                manager.connection.stopVPNTunnel()
+        startedManager?.connection.stopVPNTunnel()
+        let problem: String?
+        do {
+            let saved = try await NETransparentProxyManager.loadAllFromPreferences()
+            problem = await switchOff(saved.filter(Self.isOurs))
+        } catch {
+            problem = error.localizedDescription
+        }
+        if let problem {
+            apply(.failed("Capture is stopped, but its proxy configuration could not be switched off: \(problem)"))
+        } else {
+            apply(.disabled)
+        }
+    }
+
+    /// Stops each given configuration's tunnel, then saves it with `isEnabled = false`, so
+    /// the system has no enabled configuration to restart a tunnel from. Idempotent. Creates,
+    /// starts and removes nothing, so it never raises a prompt. The first failure's text, or
+    /// `nil` when every configuration was switched off (including when there were none).
+    private func switchOff(_ managers: [NETransparentProxyManager]) async -> String? {
+        var problem: String?
+        for manager in managers {
+            manager.connection.stopVPNTunnel()
+            manager.isEnabled = false
+            do {
+                try await manager.saveToPreferences()
+            } catch {
+                problem = problem ?? error.localizedDescription
             }
         }
-        // Also stop the tunnel this controller started, in case the preferences could not
-        // be loaded; stopping an already-stopped tunnel is harmless.
-        startedManager?.connection.stopVPNTunnel()
-        apply(.disabled)
+        return problem
     }
 
     // MARK: uninstall
@@ -401,15 +437,18 @@ final class ExtensionController: NSObject {
     ///
     /// Operator-only: the Settings Uninstall button is its one caller (see the type
     /// comment). A no-op unless this controller is managing a real extension that the
-    /// capability says can be removed (`CaptureCapability.canUninstall`), and while an
-    /// uninstall is already running.
+    /// capability says can be removed (`CaptureCapability.canUninstall`), while an
+    /// uninstall or a `disable()` is running, and while an activation request is still
+    /// outstanding (it cannot be cancelled, so removing the extension under it would leave
+    /// its late result describing an extension that is gone).
     ///
     /// The configuration goes first: removing it stops the tunnel, and the deactivation
     /// is then not tearing down a provider that is mid-connection. The extension being
     /// already gone (`extensionNotFound`) counts as removed, so a leftover configuration
     /// from a failed earlier uninstall can be cleaned up by running this again.
     func uninstall() async {
-        guard managingExtension, !uninstalling, health.captureCapability.canUninstall else { return }
+        guard managingExtension, !uninstalling, !disabling, health.captureCapability.canUninstall else { return }
+        if pendingActivity != nil, deactivation == nil { return }
         uninstalling = true
         beginKeepingAlive(reason: "Removing the capture extension")
         defer {

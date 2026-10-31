@@ -214,13 +214,21 @@ struct ProxySettings: View {
 /// Turning capture on or off, and uninstalling, are the operator's controls and nothing
 /// else: there is no bus, MCP or `Session` verb for them (the controller documents why).
 /// `CaptureSwitch` holds the steps, shared with the menu command.
+///
+/// Like Settings ▸ Proxy, the toggle is live only while the embedded core is the active
+/// one: capture is the embedded core's `macos_capture` gate, and turning it on restarts
+/// that core, which an external choice must not do. With an external core active the toggle
+/// is disabled and a note says where to change it.
 struct CaptureSettings: View {
     @Environment(Session.self) private var session
+    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
     /// The persisted choice, `false` until the operator turns capture on. Read here only:
     /// `CaptureSwitch` writes it, at the point in its steps where it must be written.
     @AppStorage("capture.enabled") private var captureEnabled = false
     @State private var confirming = false
     @State private var removing = false
+
+    private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
     var body: some View {
         let health = session.coreHealth
@@ -231,7 +239,12 @@ struct CaptureSettings: View {
                     get: { health.captureChoice ?? captureEnabled },
                     set: { on in Task { await CaptureSwitch.set(on, session: session) } }
                 ))
-                .disabled(health.captureBusy)
+                .disabled(health.captureBusy || !usesEmbedded)
+                if !usesEmbedded {
+                    Text("The active core is external, so capture is not controlled from here. Switch to the embedded core in Bus to turn it on or off.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
                 Text("The first time you turn this on, macOS asks twice in System Settings: approve the extension under Network Extensions, then allow Add Proxy Configurations.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -309,16 +322,29 @@ struct CaptureSettings: View {
 /// in force does nothing, so there is no second activation request and no needless core
 /// restart. Each action ends by bumping `restartCoreTick`, which `ShellView` maps to an
 /// embedded-core restart, so the respawned core re-reads `capture.enabled` and opens or
-/// closes its capture gate.
+/// closes its capture gate. Only while the embedded core is the active one: with an external
+/// core active the toggle does nothing and an uninstall bumps no restart, because that
+/// restart would start the embedded core the operator switched away from.
 enum CaptureSwitch {
+    /// Whether the embedded core is the active kind: the choice Settings ▸ Bus persists,
+    /// read the way `ActiveConnectionModel` and `ProxySettings.usesEmbedded` read it
+    /// (embedded when unset). The toggle and the menu command, which cannot see the views'
+    /// `@AppStorage`, gate on this.
+    static var embeddedCoreActive: Bool {
+        (UserDefaultsActiveKindPersistence().load() ?? .embedded) == .embedded
+    }
+
     /// ON: persist the choice, activate the extension, then respawn the core so its capture
-    /// gate opens. OFF: stop the tunnel first so capture ceases at once, then persist the
-    /// choice and respawn the core so the gate closes. Returns when the steps are done.
-    /// Does nothing without an extension controller (no embedded extension in this run).
+    /// gate opens. OFF: persist the choice first, so a crash part-way fails toward off, then
+    /// stop the tunnel, then respawn the core so the gate closes. Returns when the steps are
+    /// done. Does nothing without an extension controller (no embedded extension in this
+    /// run), or unless the embedded core is the active kind. The same-value check reads the
+    /// key as `spawn()` and `start()` do, so a stored value that is not a Bool reads as off
+    /// and cannot lock turning capture on out.
     static func set(_ on: Bool, session: Session) async {
         let health = session.coreHealth
-        guard !health.captureBusy, health.extensionController != nil,
-              on != UserDefaults.standard.bool(forKey: "capture.enabled")
+        guard !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
+              on != (UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false)
         else { return }
         health.captureBusy = true
         health.captureChoice = on
@@ -331,8 +357,8 @@ enum CaptureSwitch {
             health.extensionController?.enable()
             session.restartCoreTick += 1
         } else {
-            await health.extensionController?.disable()
             UserDefaults.standard.set(false, forKey: "capture.enabled")
+            await health.extensionController?.disable()
             session.restartCoreTick += 1
         }
     }
@@ -340,7 +366,8 @@ enum CaptureSwitch {
     /// Removes the extension and its proxy configuration. A finished uninstall also switches
     /// the persisted choice off and respawns the core, so the toggle, the menu command and
     /// the next launch agree that nothing is installed; left on, the choice would install
-    /// the extension again at the next launch and ask for approval.
+    /// the extension again at the next launch and ask for approval. The respawn happens only
+    /// while the embedded core is the active one; the choice is cleared either way.
     static func uninstall(session: Session) async {
         let health = session.coreHealth
         guard !health.captureBusy else { return }
@@ -348,9 +375,9 @@ enum CaptureSwitch {
         defer { health.captureBusy = false }
         await health.extensionController?.uninstall()
         guard health.captureCapability == .extensionNotInstalled,
-              UserDefaults.standard.bool(forKey: "capture.enabled")
+              UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false
         else { return }
         UserDefaults.standard.set(false, forKey: "capture.enabled")
-        session.restartCoreTick += 1
+        if embeddedCoreActive { session.restartCoreTick += 1 }
     }
 }
