@@ -263,7 +263,7 @@ pub fn init_tracing() -> TuiLog {
 pub fn build_servers(
     cfg: &Config,
     services: Services,
-    _governance: Governance,
+    governance: Governance,
 ) -> (Option<McpServer>, InProcessHandler) {
     let agent = match &cfg.mcp.transport {
         // The loopback transport is agent-facing, so it carries the M4 policy gate
@@ -275,14 +275,12 @@ pub fn build_servers(
         // gate and the operator/agent token classes exactly as on the bare-`aitm`
         // server path.
         McpTransport::LoopbackTcp { .. } | McpTransport::StreamableHttp { .. } => Some(
-            server(cfg, cfg.mcp.transport.clone(), &services)
-                // Not yet on `with_shared_governance`: this is a fresh
-                // `AgentState`, not the `AgentPlugin`'s, so in `aitm tui` an
-                // operator's `agent.set` does not reach this gate. Known gap,
-                // follow-up "tui-mode governance" (spec
-                // 2026-10-30-web-bus-agent-governance, Design 7).
-                .with_agent_state(Arc::new(AgentState::new(cfg.mcp.policy)))
-                .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role),
+            with_shared_governance(
+                server(cfg, cfg.mcp.transport.clone(), &services),
+                &governance.agent_state,
+                &governance.audit_ring,
+            )
+            .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role),
         ),
         McpTransport::Stdio => {
             warn!("mcp.transport is stdio, which would share the terminal with the TUI; the agent transport is not served");

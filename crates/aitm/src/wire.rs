@@ -191,10 +191,6 @@ pub struct Assembled {
 /// }
 /// ```
 #[derive(Clone)]
-#[expect(
-    dead_code,
-    reason = "not read until build_servers applies it to the agent arm"
-)]
 pub struct Governance {
     pub(crate) agent_state: Arc<AgentState>,
     pub(crate) audit_ring: Arc<AuditRing>,
@@ -720,6 +716,36 @@ mod tests {
         cfg.ca.dir = temp_ca_dir("l4-guard-off");
         let disabled = assemble_with(&cfg, &Features::default()).expect("assemble, l4 disabled");
         assert!(disabled.l4_guard.is_none());
+    }
+
+    /// `Assembled::governance` hands out the assembly's own `agent_state` and
+    /// `audit_ring` `Arc`s, not copies, and `Clone` keeps that identity: a
+    /// policy set through the `Governance` is the policy the core reads.
+    #[test]
+    fn governance_carries_the_assemblys_own_state_and_ring() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("governance-identity");
+        let assembled = assemble(&cfg).expect("assemble with default features");
+        let governance = assembled.governance();
+        let cloned = governance.clone();
+        for (what, held) in [("governance", &governance), ("its clone", &cloned)] {
+            assert!(
+                Arc::ptr_eq(&held.agent_state, &assembled.agent_state),
+                "{what}: agent_state is a copy"
+            );
+            assert!(
+                Arc::ptr_eq(&held.audit_ring, &assembled.audit_ring),
+                "{what}: audit_ring is a copy"
+            );
+        }
+        governance
+            .agent_state
+            .set_policy(aitm_core::AgentPolicy::Paused);
+        assert_eq!(
+            assembled.agent_state.policy(),
+            aitm_core::AgentPolicy::Paused
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
     }
 
     /// Every `*.rs` file under `dir`, recursively.

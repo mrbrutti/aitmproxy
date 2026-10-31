@@ -4,6 +4,12 @@
 **Spec:** `docs/superpowers/specs/2026-10-30-tui-mode-governance-design.md`
 **Branch / worktree:** `claude/cranky-shamir-6c9cfc` in `/Users/matt/Security/aitmproxy/.claude/worktrees/cranky-shamir-6c9cfc`, base `bd0f9b7` on `main` (PR 141; PR 145's `with_shared_governance` is already on it). Base SHA for every diff and Tester/panel dispatch: `bd0f9b7`. The spec is untracked on `bd0f9b7`; the orchestrator commits the spec and this plan before Task 1.
 
+**Plan amendments (orchestrator, during execution; these override the text below where they differ):**
+
+- **Base SHA is now `5ddc533`.** Current `origin/main` was merged at `4cd0d1a` after Task 1 (it carries PR 153, the fix for `web_bus_ask_split::a_malformed_approve_resolves_nothing_and_the_call_stays_parked`, which was already red on `bd0f9b7`, so `web_bus_ask_split` is 7 passed). Every `bd0f9b7..HEAD` diff in Task 4 and every Tester/panel base reads `5ddc533..HEAD`. `git show bd0f9b7:crates/aitm/src/{tui,main}.rs` stay valid, because main's changes did not touch those two files.
+- **Task 2 pass B also adds `wire::tests::governance_carries_the_assemblys_own_state_and_ring`** (Task 1 Tester finding F2: `Arc::ptr_eq` on both fields of `Assembled::governance()` and its clone, then a `set_policy` round-trip). It could only compile once the temporary `#[expect(dead_code)]` was deleted.
+- **The Task 2 Tester added six tests to `tui_mode_governance.rs`**, so that binary has 12 tests, not 6. Where the plan says `tui_mode_governance (6)` or `6 passed`, read 12. The Task 4 AC9 mutation expectation becomes `test result: FAILED. 5 passed; 7 failed`: FAILED = AC1, AC2, AC5, `malformed_and_empty_agent_input_is_a_protocol_error_that_is_never_audited`, `an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_capped_and_redacted`, `an_operator_on_the_agent_server_resolves_what_the_tui_cannot_and_a_drop_ends_asking`, `the_streamable_http_agent_server_is_governed_by_the_same_live_state_and_ring`; ok = AC3, AC4, AC6, `the_loopback_agent_cannot_rewrite_the_policy_that_governs_it`, `a_paused_loopback_agent_still_gets_initialize_tools_list_and_ping`. The live test still fails under the mutation.
+
 ## Overview
 
 `wire.rs` gains a sealed `Governance`: two `pub(crate)` `Arc`s, with `Assembled::governance()` as
