@@ -1527,4 +1527,182 @@ mod tests {
         assert!(!source.contains(concat!("build_capture_", "session(")));
         assert!(!source.contains(concat!("CaptureSession", "::")));
     }
+
+    // ---- tester additions: edge cases the handle must survive -----------------------
+
+    /// **Tester (CS-AC10 under contention).** `handed_off` is lock-free and must
+    /// not lose a count: eight threads each record 1 000 handoffs (three TCP to one
+    /// UDP) while a reader snapshots continuously; every one is counted and every
+    /// intermediate read is a well-formed, attached D7 object.
+    #[test]
+    fn concurrent_handoffs_are_all_counted_while_snapshots_read() {
+        const THREADS: u64 = 8;
+        const PER_THREAD: u64 = 1_000;
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+        let _attachment = w.attached(Some("995PCLM9KH".into()), vec!["example.com".into()]);
+
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let w = w.clone();
+                scope.spawn(move || {
+                    for i in 0..PER_THREAD {
+                        w.handed_off(if i % 4 == 0 {
+                            FlowKind::Udp
+                        } else {
+                            FlowKind::Tcp
+                        });
+                    }
+                });
+            }
+            let r = r.clone();
+            scope.spawn(move || {
+                for _ in 0..200 {
+                    let v = r.snapshot().to_value();
+                    assert_eq!(at(at(&v, "provider"), "state"), &s("attached"));
+                    assert_eq!(at(&v, "enabled"), &Value::Bool(true));
+                }
+            });
+        });
+
+        let snap = r.snapshot();
+        assert_eq!(snap.tcp_handed_off, THREADS * PER_THREAD * 3 / 4);
+        assert_eq!(snap.udp_handed_off, THREADS * PER_THREAD / 4);
+        assert!(snap.last_handoff_at_ms.is_some());
+        assert_eq!(snap.capability(), CaptureCapability::Capturing);
+    }
+
+    /// **Tester.** A thread that panics while holding the handle's lock poisons it;
+    /// both halves recover (`PoisonError::into_inner`, as the module promises), so
+    /// one bad critical section can neither wedge the verb nor silence the
+    /// feeder's later transitions.
+    #[test]
+    fn both_halves_recover_from_a_poisoned_lock() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+
+        let shared = std::sync::Arc::clone(&w.0);
+        let poisoner = std::thread::spawn(move || {
+            let _guard = shared.inner.lock().expect("not yet poisoned");
+            panic!("poisoning the capture-status lock on purpose");
+        });
+        assert!(poisoner.join().is_err(), "the poisoning thread panicked");
+        assert!(w.0.inner.is_poisoned());
+
+        assert_eq!(
+            r.snapshot().feeder,
+            FeederState::Listening,
+            "the reader recovers"
+        );
+        let attachment = w.attached(None, vec!["example.com".into()]);
+        assert!(
+            matches!(r.snapshot().provider, ProviderState::Attached { .. }),
+            "the writer recovers"
+        );
+        w.scope_pushed(vec!["api.test".into()]);
+        assert_eq!(r.snapshot().scope_tokens, vec!["api.test".to_string()]);
+        drop(attachment);
+        assert_eq!(r.snapshot().provider, ProviderState::Detached);
+        w.stopped();
+        assert_eq!(r.snapshot().feeder, FeederState::Off(OffReason::Stopped));
+    }
+
+    /// **Tester (CS-AC9).** The RAII guard holds its own reference to the shared
+    /// state, not a borrow of the writer: with every writer gone the attachment
+    /// still reads as attached, its drop still records the detach, and the reader
+    /// still answers.
+    #[test]
+    fn attachment_guard_outlives_its_writer_and_still_records_the_detach() {
+        let (w, r) = CaptureStatus::channel_on(true, true);
+        w.listening();
+        let attachment = w.attached(Some("995PCLM9KH".into()), vec!["example.com".into()]);
+        w.handed_off(FlowKind::Tcp);
+        drop(w);
+
+        let snap = r.snapshot();
+        assert!(
+            matches!(snap.provider, ProviderState::Attached { .. }),
+            "{snap:?}"
+        );
+        assert_eq!(snap.capability(), CaptureCapability::Capturing);
+
+        drop(attachment);
+        let snap = r.snapshot();
+        assert_eq!(snap.provider, ProviderState::Detached);
+        assert_eq!(snap.scope_tokens, Vec::<String>::new());
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
+        assert_eq!(snap.capability(), CaptureCapability::AwaitingProvider);
+    }
+
+    /// **Tester (CS-AC19).** The emitter's saturation branches: a count past
+    /// `i64::MAX` saturates instead of wrapping negative, a stamp that does not fit
+    /// `i64` reads as `null` rather than a negative time, and the capability sum
+    /// does not overflow. A client never sees a negative integer.
+    #[test]
+    fn to_value_saturates_counts_and_nulls_unrepresentable_stamps() {
+        fn assert_no_negative(v: &Value) {
+            match v {
+                Value::Int(n) => assert!(*n >= 0, "negative integer on the wire: {n}"),
+                Value::Object(m) => m.values().for_each(assert_no_negative),
+                Value::Array(a) => a.iter().for_each(assert_no_negative),
+                _ => {}
+            }
+        }
+        let snap = CaptureStatusSnapshot {
+            enabled: true,
+            feeder: FeederState::Listening,
+            provider: ProviderState::Attached {
+                attached_at_ms: u64::MAX,
+                team_id: None,
+            },
+            scope_tokens: Vec::new(),
+            tcp_handed_off: u64::MAX,
+            udp_handed_off: 1,
+            last_handoff_at_ms: Some(u64::MAX),
+        };
+        assert_eq!(snap.capability(), CaptureCapability::Capturing);
+        let v = snap.to_value();
+        assert_eq!(at(at(&v, "flows_handed_off"), "tcp"), &Value::Int(i64::MAX));
+        assert_eq!(at(at(&v, "flows_handed_off"), "udp"), &Value::Int(1));
+        assert_eq!(at(at(&v, "provider"), "attached_at"), &Value::Null);
+        assert_eq!(at(&v, "last_handoff_at"), &Value::Null);
+        assert_eq!(at(&v, "capability"), &s("capturing"));
+        assert_no_negative(&v);
+    }
+
+    /// **Tester (CS-AC8).** `scope_tokens` over blank and ragged specs: empty,
+    /// whitespace-only, tabs, runs of spaces and a trailing newline tokenize to
+    /// exactly the non-empty words, never an empty token, and `scope_entries`
+    /// follows the tokens, not the raw spec.
+    #[test]
+    fn scope_tokens_over_blank_and_ragged_specs() {
+        for blank in ["", " ", "   ", "\t", "\n", " \t\n "] {
+            assert_eq!(
+                scope_tokens(&ScopeSpec { spec: blank.into() }),
+                Vec::<String>::new(),
+                "{blank:?}"
+            );
+        }
+        let ragged = ScopeSpec {
+            spec: "  example.com\t*.example.com   198.51.100.7\n".into(),
+        };
+        let tokens = scope_tokens(&ragged);
+        assert_eq!(tokens, ["example.com", "*.example.com", "198.51.100.7"]);
+        assert!(tokens.iter().all(|t| !t.is_empty()));
+
+        let snap = CaptureStatusSnapshot {
+            enabled: true,
+            feeder: FeederState::Listening,
+            provider: ProviderState::Attached {
+                attached_at_ms: 1,
+                team_id: None,
+            },
+            scope_tokens: tokens,
+            tcp_handed_off: 0,
+            udp_handed_off: 0,
+            last_handoff_at_ms: None,
+        };
+        assert_eq!(at(&snap.to_value(), "scope_entries"), &Value::Int(3));
+    }
 }

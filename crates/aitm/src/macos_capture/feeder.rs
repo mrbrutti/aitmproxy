@@ -1861,4 +1861,183 @@ mod tests {
         let fut = session.run(std::future::pending::<()>());
         assert_send(&fut);
     }
+
+    // ---- tester additions: the two "cannot start" reasons never carry a path ----
+
+    /// **Tester (CS-AC5, CS-AC15).** The one bind error whose `Display` embeds the
+    /// socket directory — `refuse_symlink`'s — reaches the handle as its
+    /// `io::ErrorKind` text only. The test first proves the full error does carry
+    /// the path (so the no-path assertion on the status reason discriminates), then
+    /// runs the session against the same symlinked dir. No socket is bound: the
+    /// refusal comes first.
+    #[tokio::test]
+    async fn bind_failure_reason_carries_the_error_kind_not_the_path() {
+        let scratch = TempPath::new();
+        std::fs::create_dir(scratch.path()).unwrap();
+        let target = scratch.path().join("squatter");
+        std::fs::create_dir(&target).unwrap();
+        let link = scratch.path().join("capture.d");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.display().to_string();
+
+        let logged = CaptureListener::bind(&link)
+            .err()
+            .expect("a symlinked socket dir is refused");
+        assert_eq!(logged.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            logged.to_string().contains(&link_text),
+            "the operator-log error names the path: {logged}"
+        );
+
+        let (w, r) = CaptureStatus::channel(true);
+        let session = CaptureSession::new(
+            Arc::new(CoreIngress::empty()),
+            TestGuard::with_hosts(&[]),
+            None,
+            StubVerifier::new(true),
+            link.clone(),
+            w,
+        );
+        timeout(PROMPT, session.run(std::future::pending::<()>()))
+            .await
+            .expect("run returns at once when the bind is refused");
+
+        let snap = r.snapshot();
+        let FeederState::BindFailed(reason) = &snap.feeder else {
+            panic!("expected bind_failed, got {:?}", snap.feeder);
+        };
+        assert_eq!(
+            reason,
+            &format!(
+                "cannot bind the capture sockets ({})",
+                io::ErrorKind::InvalidInput
+            )
+        );
+        assert!(
+            !reason.contains(&link_text),
+            "the status reason must not carry the path: {reason}"
+        );
+        assert!(!reason.contains('/'), "{reason}");
+        assert!(
+            !reason.contains("symlink"),
+            "nor the full error text: {reason}"
+        );
+        let rendered = format!("{:?}", snap.to_value());
+        assert!(
+            !rendered.contains(&link_text) && !rendered.contains('/'),
+            "{rendered}"
+        );
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::Degraded(reason.clone())
+        );
+        assert_ne!(
+            snap.feeder,
+            FeederState::Off(OffReason::Stopped),
+            "a bind failure is terminal"
+        );
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing was created in the link target"
+        );
+
+        let _ = std::fs::remove_dir_all(scratch.path());
+    }
+
+    /// **Tester (CS-AC5, the second "cannot start" step).** A socket dir whose
+    /// canonical path is too long for `sun_path` binds fine under a short spelling
+    /// (a symlinked *parent*, the system's own `/tmp` → `/private/tmp` shape, which
+    /// `refuse_symlink` allows) but cannot be published: `publish_rendezvous` fails
+    /// on its length check before it touches the rendezvous path, and the handle
+    /// reports `bind_failed` with the rendezvous wording and the error kind only.
+    /// Needs a real UDS bind, so it self-skips where the sandbox refuses one and
+    /// runs on Linux CI and in the Terminal panel.
+    #[tokio::test]
+    async fn rendezvous_publish_failure_is_reported_as_bind_failed() {
+        let scratch = TempPath::new();
+        std::fs::create_dir(scratch.path()).unwrap();
+        let probe = scratch.path().join("probe.sock");
+        match std::os::unix::net::UnixListener::bind(&probe) {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                ) =>
+            {
+                eprintln!("skipped: UDS bind unavailable (run via Terminal panel)");
+                let _ = std::fs::remove_dir_all(scratch.path());
+                return;
+            }
+            Err(e) => panic!("the probe bind failed unexpectedly: {e}"),
+        }
+        let _ = std::fs::remove_file(&probe);
+
+        // A real directory whose canonical path is far past the `sun_path` budget,
+        // reached through a short symlinked parent so the bind path itself fits.
+        let real_parent = scratch.path().join(format!("real-{}", "x".repeat(120)));
+        std::fs::create_dir(&real_parent).unwrap();
+        let short_parent = scratch.path().join("p");
+        std::os::unix::fs::symlink(&real_parent, &short_parent).unwrap();
+        let socket_dir = short_parent.join("s");
+        let bind_path_len = socket_dir
+            .join(crate::macos_capture::listener::CONTROL_SOCK)
+            .as_os_str()
+            .len();
+        if bind_path_len >= 104 {
+            eprintln!(
+                "skipped: the temp dir is too long for a sun_path bind ({bind_path_len} bytes)"
+            );
+            let _ = std::fs::remove_dir_all(scratch.path());
+            return;
+        }
+
+        let (w, r) = CaptureStatus::channel(true);
+        let session = CaptureSession::new(
+            Arc::new(CoreIngress::empty()),
+            TestGuard::with_hosts(&[]),
+            None,
+            StubVerifier::new(true),
+            socket_dir.clone(),
+            w,
+        );
+        timeout(PROMPT, session.run(std::future::pending::<()>()))
+            .await
+            .expect("run returns at once when the rendezvous cannot be published");
+
+        let snap = r.snapshot();
+        let FeederState::BindFailed(reason) = &snap.feeder else {
+            panic!("expected bind_failed, got {:?}", snap.feeder);
+        };
+        assert_eq!(
+            reason,
+            &format!(
+                "cannot publish the rendezvous file ({})",
+                io::ErrorKind::InvalidInput
+            )
+        );
+        assert!(!reason.contains('/'), "{reason}");
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::Degraded(reason.clone())
+        );
+        let v = snap.to_value();
+        assert_eq!(at(at(&v, "feeder"), "state"), &s("bind_failed"));
+        assert_eq!(at(&v, "capability"), &s("degraded"));
+        assert_eq!(at(&v, "capability_reason"), at(at(&v, "feeder"), "reason"));
+        assert_ne!(
+            snap.feeder,
+            FeederState::Off(OffReason::Stopped),
+            "a publish failure is terminal"
+        );
+        assert!(
+            !socket_dir
+                .join(crate::macos_capture::listener::CONTROL_SOCK)
+                .exists(),
+            "the sockets bound under the short path were removed when the listener dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(scratch.path());
+    }
 }

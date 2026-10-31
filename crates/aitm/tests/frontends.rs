@@ -590,3 +590,75 @@ fn assemble_rejects_out_dir_containing_ca_dir() {
     cfg2.poc.out_dir = cfg2.ca.dir.parent().map(|p| p.to_path_buf());
     assert!(assemble_err(&cfg2).contains("poc.out_dir"));
 }
+
+/// Tester (CS-AC1, CS-AC2 at the wire). `capture.status` is not only listed but
+/// callable the way the e2e cell `tests/e2e/mcp/test_tool_list_complete.py` calls
+/// every tool — as the agent, with empty arguments — and under the strictest
+/// agent policy, `ReadOnly`, which admits only `Sensitivity::Read` commands. The
+/// `structuredContent` is exactly the spec's D7 disabled object for a default
+/// (capture-off) assembly, and the server with no agent state at all agrees.
+#[test]
+fn capture_status_is_callable_by_the_agent_under_read_only() {
+    let disabled = json!({
+        "capability": "feeder_off",
+        "capability_reason": "macos_capture.enabled is false",
+        "enabled": false,
+        "feeder": { "reason": "macos_capture.enabled is false", "state": "off" },
+        "flows_handed_off": { "tcp": 0, "udp": 0 },
+        "last_handoff_at": null,
+        "provider": { "attached_at": null, "state": "detached", "team_id": null },
+        "scope_entries": 0,
+        "scope_tokens": [],
+    });
+
+    let proxy = build_proxy(&config("capture-status-ro")).expect("build proxy");
+    let store = proxy.store();
+    let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio)
+        .with_services(store, client, proxy.guard(), None)
+        .with_agent_state(Arc::new(AgentState::new(AgentPolicy::ReadOnly)));
+    let resp = rpc(
+        &server,
+        1,
+        "tools/call",
+        json!({"name": "capture.status", "arguments": {}}),
+    );
+    assert_eq!(
+        resp["result"]["isError"],
+        json!(false),
+        "a Read command runs under ReadOnly: {resp}"
+    );
+    assert_eq!(
+        resp["result"]["structuredContent"], disabled,
+        "the D7 disabled object, exactly: {resp}"
+    );
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text content");
+    for needle in ["feeder_off", "macos_capture.enabled is false", "detached"] {
+        assert!(text.contains(needle), "{needle:?} missing from {text:?}");
+    }
+    assert!(
+        !text.contains('/'),
+        "no path in the transcript rendering: {text:?}"
+    );
+
+    // No agent state attached (the bare registry server): same answer.
+    let proxy = build_proxy(&config("capture-status-bare")).expect("build proxy");
+    let store = proxy.store();
+    let client: Arc<dyn ProxyClient> = Arc::new(UnusedClient);
+    let server = McpServer::new(proxy.registry_arc(), McpTransport::Stdio).with_services(
+        store,
+        client,
+        proxy.guard(),
+        None,
+    );
+    let resp = rpc(
+        &server,
+        2,
+        "tools/call",
+        json!({"name": "capture.status", "arguments": {}}),
+    );
+    assert_eq!(resp["result"]["isError"], json!(false), "{resp}");
+    assert_eq!(resp["result"]["structuredContent"], disabled, "{resp}");
+}
