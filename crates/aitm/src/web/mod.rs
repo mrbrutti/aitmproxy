@@ -12,6 +12,15 @@
 //! `McpServer::handle_on` under that role; all command policy lives in the core.
 //! An operator bridge token exists only when `mcp.operator_token` is configured;
 //! otherwise the bridge is agent-only (`Frontend::Mcp`).
+//!
+//! The `McpServer` in [`WebState`] is agent-facing: the agent bridge token
+//! resolves to `Frontend::Mcp`, so it is subject to the agent policy gate and
+//! the audit ring like any other agent. Build it with
+//! `tui::with_shared_governance`, so it reads the policy `agent.set` writes and
+//! records into the ring `agent.activity` reads. The `Ask` split applies: under
+//! the `ask` policy a web agent's `Sensitive` call parks only for an operator
+//! bridge connection subscribed on this server, and `agent.approve` must be sent
+//! on this server (an approve sent to the primary finds nothing parked).
 
 pub mod assets;
 pub mod bridge;
