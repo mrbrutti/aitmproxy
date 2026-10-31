@@ -255,6 +255,20 @@ import Testing
         #expect(ContentCategory.classify(contentType: nil) == .other)
     }
 
+    /// ST-AC11: the transport chips keep raw-L4 rows by protocol; L4 is the "All" of packets.
+    @Test func l4ChipsMatchByTransport() {
+        func keeps(_ chip: ContentCategory, _ rows: [FlowRow]) -> [FlowRow] {
+            rows.filter { chip.matches(row: $0, contentType: nil, httpVersion: nil) }
+        }
+        let l4 = Fixtures.l4Rows
+        #expect(keeps(.tcp, l4).map { $0.l4?.proto } == [.tcp])
+        #expect(keeps(.udp, l4).count == 2 && keeps(.udp, l4).allSatisfy { $0.l4?.proto == .udp })
+        #expect(keeps(.l4, l4).count == l4.count)
+        #expect(keeps(.l4, Fixtures.rows).isEmpty && keeps(.tcp, Fixtures.rows).isEmpty)
+        #expect(ContentCategory.groups[2] == [.tcp, .udp, .l4])
+        #expect(ContentCategory.allCases.allSatisfy { !$0.help.isEmpty })
+    }
+
     @Test func fixturesMatchTheMockup() {
         #expect(Fixtures.rows.count == 14)
         #expect(Fixtures.rows.map(\.seq) == Array(41...54))

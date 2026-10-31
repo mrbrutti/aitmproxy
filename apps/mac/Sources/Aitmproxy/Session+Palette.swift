@@ -32,7 +32,7 @@ extension Session {
         let locals: [(String, String, String?, () -> Void)] = [
             (interceptArmed ? "Disarm Intercept" : "Arm Intercept", "Stop or start parking every request", "i", { [self] in arm(!interceptArmed) }),
             ("Compose Request…", "Write and send a new request", "⌘N", { [self] in openCompose() }),
-            (capturing ? "Pause Capture" : "Resume Capture", "Stop or start recording flows", "⇧⌘R", { [self] in setCapturing(!capturing) }),
+            (capturing ? "Pause Proxy" : "Resume Proxy", "Stop or start recording flows; traffic still passes", "⇧⌘R", { [self] in setCapturing(!capturing) }),
             ("Clear Session", "Drop every flow", "⌘⌫", { [self] in clearSession(confirm: ClearConfirmation.ask) }),
             (autoSelect ? "Stop Auto-select" : "Auto-select New Flows", "Follow the newest flow as it arrives", "⇧⌘A", { [self] in autoSelect.toggle() }),
             ("Filter Bar", "Stack filters over the list", "⌘F", { [self] in filterBarVisible.toggle() }),

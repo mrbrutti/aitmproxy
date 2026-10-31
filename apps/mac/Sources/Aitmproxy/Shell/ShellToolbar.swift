@@ -1,8 +1,10 @@
 import AitmproxyKit
 import SwiftUI
 
-/// The window toolbar (foundation §2.7 "Toolbar"): record/pause, compose,
-/// clear · the listening pill · the Agent toggle, palette, layout.
+/// The window toolbar (foundation §2.7 "Toolbar"; spec 2026-10-31 status page §4): compose,
+/// clear · the connection cluster — pill, Proxy switch, Capture switch — · the Agent toggle,
+/// palette, layout. The cluster is the ONE home of connection state: the sidebar's brand row
+/// and the status bar carry none (`tools/check-connection-words.sh` pins it).
 struct ShellToolbar: ToolbarContent {
     @Environment(Session.self) private var session
     @Binding var sidebarVisible: Bool
@@ -13,11 +15,6 @@ struct ShellToolbar: ToolbarContent {
                 Label("Toggle Sidebar", systemImage: Tok.Glyph.sidebar)
             }
             .help(sidebarVisible ? "Hide the sidebar (⌃⌘S)" : "Show the sidebar (⌃⌘S)")
-            Button { session.setCapturing(!session.capturing) } label: {
-                Label(session.capturing ? "Pause Capture" : "Resume Capture",
-                      systemImage: session.capturing ? Tok.Glyph.pause : Tok.Glyph.record)
-            }
-            .help(session.capturing ? "Pause capture (⇧⌘R)" : "Resume capture (⇧⌘R)")
             Button { session.openCompose() } label: { Label("Compose", systemImage: Tok.Glyph.compose) }
                 .help("Compose a request (⌘N)")
             Button { session.clearSession(confirm: ClearConfirmation.ask) } label: { Label("Clear Session", systemImage: Tok.Glyph.clear) }
@@ -25,7 +22,7 @@ struct ShellToolbar: ToolbarContent {
         }
         .sharedBackgroundVisibility(.hidden)
         ToolbarItem(placement: .principal) {
-            ListeningPill()
+            ConnectionCluster()
         }
         .sharedBackgroundVisibility(.hidden)
         ToolbarItemGroup(placement: .primaryAction) {
@@ -41,15 +38,31 @@ struct ShellToolbar: ToolbarContent {
     }
 }
 
-/// `● aitmproxy · 127.0.0.1:8080 · ● bus · ◐ on, nothing in scope`: the three connection
-/// lanes in the words the Status page uses, calm (dot only) while a lane is fine, worded
-/// when it needs attention. Clicking opens the Status page. The core lane carries the
-/// bound proxy address; "paused" and "intercept armed" stay as the capture-state words.
-struct ListeningPill: View {
+/// `● aitmproxy · 127.0.0.1:8080  Proxy [●━]  Capture [━●]`: the three connection lanes and
+/// the two switches that change them, in the words the Status page uses. One
+/// `connectionSummary` read feeds the whole cluster.
+struct ConnectionCluster: View {
     @Environment(Session.self) private var session
 
     var body: some View {
         let summary = session.connectionSummary
+        HStack(spacing: Space.sm) {
+            ListeningPill(summary: summary)
+            ProxySwitch(summary: summary)
+            CaptureExtensionSwitch(summary: summary)
+        }
+    }
+}
+
+/// The pill: core dot + bound address, calm (dot only) while the bus and capture lanes are
+/// fine, worded when one needs attention. Clicking opens the Status page; drawn on `active`
+/// while Status is showing, so the page has a selected entry without being a sidebar row.
+struct ListeningPill: View {
+    @Environment(Session.self) private var session
+    var summary: ConnectionSummary
+
+    var body: some View {
+        let selected = session.page == .status
         Button { session.show(.status) } label: {
             HStack(spacing: Space.sm) {
                 HStack(spacing: Tok.Metric.gapTight) {
@@ -74,13 +87,152 @@ struct ListeningPill: View {
             .padding(.leading, Tok.Metric.padInner)
             .padding(.trailing, Space.md)
             .frame(height: Tok.Size.control)
-            .background(Tok.Ground.raised.color, in: Capsule())
+            .background(selected ? Tok.Ground.active.color : Tok.Ground.raised.color, in: Capsule())
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
         .help(summary.tooltip + "\nOpens Status (⌘0)")
         .accessibilityElement(children: .combine)
         .accessibilityLabel("aitmproxy: \(summary.spoken)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// On = the proxy records flows; off = paused (`proxy.pause`: traffic still passes, new flows
+/// are not recorded). The same entry as View ▸ Pause Proxy / Resume Proxy (⇧⌘R) and the
+/// palette. Live while the bus is connected — pause is a bus call, whichever core answers.
+struct ProxySwitch: View {
+    @Environment(Session.self) private var session
+    var summary: ConnectionSummary
+
+    var body: some View {
+        let live = ToolbarSwitches.proxyLive(summary)
+        ToolbarSwitch(
+            title: "Proxy", on: live && session.capturing, tint: Tok.Status.success.color, enabled: live,
+            help: ToolbarSwitches.proxyHelp(summary, capturing: session.capturing)
+        ) { session.setCapturing(!session.capturing) }
+    }
+}
+
+/// The capture extension's switch. Its position is the published fact, not the preference
+/// (spec §1): on whenever the capture lane is doing anything — capturing, waiting for approval,
+/// degraded — off when the lane is off; `captureChoice` carries it through a switch in flight.
+/// Its colour is the lane's state, so "on, nothing in scope" shows the warning hue and
+/// "waiting for approval" the working hue. Flips through `CaptureSwitch.set` — the same steps as Settings ▸
+/// Capture, Proxy ▸ Turn On / Turn Off Capture (⌃⌘C) and the Status card. Operator-only:
+/// reached by a click here and nowhere else (`tools/check-capture-operator-only.sh` lists this
+/// file beside those three).
+struct CaptureExtensionSwitch: View {
+    @Environment(Session.self) private var session
+    var summary: ConnectionSummary
+
+    var body: some View {
+        let health = session.coreHealth
+        let embedded = (session.connection?.activeKind ?? .embedded) == .embedded
+        let on = health.captureChoice ?? ToolbarSwitches.captureOn(summary.capture)
+        ToolbarSwitch(
+            title: "Capture", on: on, tint: summary.capture.state.color.color,
+            enabled: ToolbarSwitches.captureLive(health, embedded: embedded),
+            help: ToolbarSwitches.captureHelp(summary.capture, controlsAvailable: health.captureControlsAvailable,
+                                              embedded: embedded, busy: health.captureBusy, choice: on)
+        ) { Task { await CaptureSwitch.set(!on, session: session) } }
+    }
+}
+
+/// The switches' enabled rules and help text as plain functions, so the self-test can pin
+/// them (ST-AC9) without a view.
+enum ToolbarSwitches {
+    /// Pause/resume is a bus call: live while the bus is connected (as operator or as agent).
+    static func proxyLive(_ summary: ConnectionSummary) -> Bool {
+        summary.bus.state == .ok || summary.bus.state == .warning
+    }
+
+    static func proxyHelp(_ summary: ConnectionSummary, capturing: Bool) -> String {
+        guard proxyLive(summary) else { return "Bus \(summary.bus.word) — connect to pause or resume the proxy" }
+        return capturing
+            ? "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
+            : "Resume recording flows (⇧⌘R)"
+    }
+
+    /// The switch's resting position: the extension is on unless its lane is off.
+    static func captureOn(_ lane: ConnectionLane) -> Bool { lane.state != .off }
+
+    /// The same gate as Settings ▸ Capture's toggle and Proxy ▸ Turn On / Turn Off Capture.
+    static func captureLive(_ health: CoreHealthState, embedded: Bool) -> Bool {
+        health.captureControlsAvailable && !health.captureBusy && embedded
+    }
+
+    static func captureHelp(_ lane: ConnectionLane, controlsAvailable: Bool, embedded: Bool, busy: Bool,
+                            choice: Bool) -> String {
+        if busy { return "Switching the capture extension…" }
+        if !controlsAvailable { return "The capture extension is not in this build" }
+        if !embedded { return "The active core is external — switch to the embedded core in Settings ▸ Bus to control capture" }
+        var lines = [choice
+            ? "Turn off the capture extension (⌃⌘C)"
+            : "Turn on the capture extension: it captures other apps' traffic without proxy settings (⌃⌘C)"]
+        lines.append("\(lane.compact) — \(lane.detail)")
+        if let remedy = lane.remedy { lines.append(remedy) }
+        return lines.joined(separator: "\n")
+    }
+}
+
+/// A word and a small switch: the toolbar's control for one on/off thing. A real `Toggle` under
+/// a custom style, so VoiceOver gets a checkbox titled "Proxy" / "Capture" with an on/off value
+/// and AXPress flips it (a plain `Button` here exposed an untitled "toggle button" and swallowed
+/// System Events clicks — found live, 2026-10-31). The track takes its owner's colour when on
+/// (a lane's state colour, the agent teal) and tertiary when off; disabled drops the word to
+/// tertiary and says why in `help`.
+struct ToolbarSwitch: View {
+    var title: String
+    var on: Bool
+    var tint: Color
+    var enabled = true
+    var help: String
+    var action: () -> Void
+
+    var body: some View {
+        Toggle(title, isOn: Binding(get: { on }, set: { _ in action() }))
+            .toggleStyle(ToolbarSwitchStyle(tint: enabled ? tint : Tok.Ink.tertiary.color, enabled: enabled))
+            .disabled(!enabled)
+            .help(help)
+    }
+}
+
+/// Draws a `Toggle` as `[●━] Word`: the shared `SwitchGlyph` and the title in ink (tertiary when
+/// disabled). Tapping anywhere on it flips the binding.
+struct ToolbarSwitchStyle: ToggleStyle {
+    var tint: Color
+    var enabled: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        Button { configuration.isOn.toggle() } label: {
+            HStack(spacing: Space.sm) {
+                SwitchGlyph(on: configuration.isOn, tint: tint)
+                configuration.label
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                    .foregroundStyle(enabled ? Tok.Ink.primary.color : Tok.Ink.tertiary.color)
+            }
+            .padding(.horizontal, Space.sm)
+            .frame(height: Tok.Size.control)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+/// The 26 × 16 track and 12 pt knob every toolbar switch shares (Proxy, Capture, Agent).
+struct SwitchGlyph: View {
+    var on: Bool
+    var tint: Color
+
+    var body: some View {
+        Capsule()
+            .fill(on ? tint : Tok.Ink.tertiary.color)
+            .frame(width: Tok.Metric.switchWidth, height: Tok.Metric.switchHeight)
+            .overlay(alignment: on ? .trailing : .leading) {
+                Circle().fill(.white).frame(width: Tok.Metric.switchKnob, height: Tok.Metric.switchKnob).padding(2)
+            }
+            .accessibilityHidden(true)
     }
 }
 
@@ -100,12 +252,7 @@ struct AgentToggle: View {
             Button("Activity Log…") { session.activityLogVisible.toggle() }
         } label: {
             HStack(spacing: Space.sm) {
-                Capsule()
-                    .fill(session.agentPolicy == .paused ? Tok.Ink.tertiary.color : Tok.Agent.base.color)
-                    .frame(width: Tok.Metric.switchWidth, height: Tok.Metric.switchHeight)
-                    .overlay(alignment: session.agentPolicy == .paused ? .leading : .trailing) {
-                        Circle().fill(.white).frame(width: Tok.Metric.switchKnob, height: Tok.Metric.switchKnob).padding(2)
-                    }
+                SwitchGlyph(on: session.agentPolicy != .paused, tint: Tok.Agent.base.color)
                 Text("Agent").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
                 if session.agentActionsLastMinute > 0 {
                     Text("\(session.agentActionsLastMinute)")

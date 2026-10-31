@@ -208,9 +208,8 @@ the operator's **jobs** (brief: watch/inspect, intercept, test, supervise), the 
 window comes first, and the connection state has **one** home.
 
 ```text
- ›•‹ aitmproxy  ● ok            ← the brand row IS the status entry: worst lane glyph + lane
-                                    name when something needs attention ("⚠ Capture",
-                                    "✕ Core"); click → Status page. No separate group/row.
+ ›•‹ aitmproxy                  ← the brand row is the product mark only (revision 2: the
+                                    connection state has ONE home, the toolbar, §4)
  TRAFFIC                        ← the main work window: the flow list + inspector
    Flows                  104   all flows (the default page once connected)
    Apps                     0   flows grouped by source app (sub-rows per app)
@@ -230,15 +229,15 @@ window comes first, and the connection state has **one** home.
 
 - **Saved** leaves the sidebar until saving exists (S-066): a dead row at the top of the list
   was the first thing a new operator saw. It returns under Traffic when the core can save.
-- **Status** is reached from the brand row, the toolbar pill, the status bar's one connection
-  item, Proxy ▸ Status (⌘0), and the palette. It is not a sidebar list row: it is the place the
-  app sends you when something is wrong, not a place in the work hierarchy (rule 59).
-- **Status bar** shows counts, throughput and ONE connection item: the worst lane's glyph +
-  lane name + word when a lane needs attention (`⚠ capture: on, nothing in scope`), or a single
-  `● connected` when all is well. Click → Status. The three-lane strip is gone; the bar never
-  duplicates the sidebar.
-- **Toolbar pill** stays the core/proxy address; its bus and capture dots show only when those
-  lanes need attention (as built).
+- **Status** is reached from the toolbar's connection pill, Proxy ▸ Status (⌘0), and the
+  palette. It is not a sidebar list row: it is the place the app sends you when something is
+  wrong, not a place in the work hierarchy (rule 59). *Revision 2 (Matt, 2026-10-31): "you
+  already have status in the top and in the sidebar and in the status bar below … pick a proper
+  place and stick to it; the top, you already have a designated place."* So the brand row and
+  the status bar carry no connection state at all; the toolbar is the one home (§4).
+- **Status bar** shows the list's small facts only: counts, selection, paused, scope and
+  findings counts, Undo after Clear, the last error, memory and throughput. No connection item
+  (it was the third copy of the toolbar's state); the bottom stays free for other information.
 - **Landing**: a fresh install lands on **Status** and stays there until the operator navigates
   once; after that the last list page is restored (a session that ended on Status or Saved
   comes back on Flows). Apps is no longer the default (its empty state was the second thing a
@@ -249,18 +248,76 @@ window comes first, and the connection state has **one** home.
 `SidebarPage` gains `.flows` (all flows, no group) and the `.status` case stays for routing
 and the menu; `.saved` stays in the enum (routing to `SavedPanel`) but `isInSidebar` is false.
 
-### 4. Toolbar pill and status bar read the same model
+### 4. The toolbar is the one home for connection state — and its two switches (revision 2)
 
-- `ListeningPill` is a `Button` to `.status`: the core dot + bound proxy address (and "paused",
-  "intercept armed" as today), then the bus and capture `LaneDot`s only while they need
-  attention; `.help` is `summary.tooltip`.
-- The status bar's right group shows ONE connection item, `summary.overallWord` ("connected", or
-  the worst lane's compact form), a `Button` to `.status`. Role mismatch is the bus lane's
-  warning, not a separate badge. `CoreHealthDot` is deleted; the Core Log header shows the core
-  lane's `LaneDot`.
-- Settings ▸ Capture's Status row reads the capture lane word; Settings ▸ Bus gains a
-  "Connection" row with the bus lane word and detail. `tools/check-connection-words.sh` fails
-  when any view spells a lane word itself.
+```text
+ [≡] [✎] [🗑]      ● aitmproxy · 127.0.0.1:8080   Proxy [●━]   Capture [━●]      [Agent ●━] [⌘] [▭ ▯ ⧉]
+      leading                    principal: the connection cluster                 trailing
+```
+
+Three groups, as before; the record/pause button leaves the leading group because its job moves
+into the cluster. Everything in the cluster reads `Session.connectionSummary`.
+
+- **Pill** (`ListeningPill`): a `Button` to `.status`. Core dot + `aitmproxy` + the bound proxy
+  address; ` · paused` while the proxy is paused and ` · intercept armed` while it is; then the
+  bus and capture `LaneDot`s only while those lanes need attention. `.help` is `summary.tooltip`
+  + "Opens Status (⌘0)". Drawn on `active` instead of `raised` while the Status page is showing,
+  so the page has a selected entry even though it is not a sidebar row.
+- **Proxy switch** (`ToolbarSwitch("Proxy")`): on = the proxy records flows, off = paused. Flips
+  through `Session.setCapturing`, the same entry as View ▸ Pause Proxy / Resume Proxy (⇧⌘R) and
+  the palette; the core answers `proxy.pause` / `proxy.resume` (traffic still passes, new flows
+  are not recorded — the core has no verb that stops the listener). Track colour: the core lane's
+  colour when on, tertiary when paused. Disabled, with the core lane's word in its help, while the
+  core lane is not `ok` (nothing to pause). Help: "Pause the proxy: traffic still passes and new
+  flows are not recorded (⇧⌘R)" / "Resume recording flows (⇧⌘R)".
+- **Capture switch** (`ToolbarSwitch("Capture")`): the capture extension's on/off. Its position
+  is the published fact, never the preference key (§1): on whenever the capture lane is not
+  `off` — capturing, waiting for approval, degraded — off when the lane is off;
+  `coreHealth.captureChoice` carries it through a switch in flight. It flips through
+  `CaptureSwitch.set`, the same
+  steps as Settings ▸ Capture, Proxy ▸ Turn On Capture / Turn Off Capture (⌃⌘C) and the Status
+  card. Its track colour is the **capture lane's state colour** when on — so "on, nothing in
+  scope" shows the warning hue, "waiting for approval" the working hue, "capture degraded" the
+  error hue — and tertiary when off; the help carries the lane's word, detail and remedy. Disabled
+  when the controls are unavailable (no extension in this build, an external core is active, a
+  switch is in flight), with the reason in the help. Operator-only: `Shell/ShellToolbar.swift`
+  joins Settings, the Proxy menu and the Status page in the capture tripwire's allow-list with an
+  `expect`; no bus verb, `Session` action or palette entry reaches it.
+- **Words**: one word per idea. *Proxy* is the listener (on / paused); *Capture* is the
+  extension (GLOSSARY "Capture extension"; its switch and menu say Turn On / Turn Off Capture).
+  "Pause Capture / Resume Capture" → "Pause Proxy / Resume Proxy" everywhere (menu, palette,
+  command map, stories); "Enable Capture / Disable Capture" → "Turn On Capture / Turn Off
+  Capture" (the `ConnectionAction` titles already said so).
+- **Sidebar brand row**: `›•‹ aitmproxy`, a label, not a button; no badge, no summary.
+- **Status bar**: no connection item (§3).
+- **Why the top and not the bottom** (Matt asked, on seeing the first screenshots, whether the
+  two switches belong in the status bar). Grouped by function: the toolbar holds what the
+  operator *turns on* — the traffic sources (Proxy, Capture) and who may act (Agent) — plus the
+  session actions; the status bar holds what *came out* — rows, paused, scope, findings, bytes
+  and memory. Three reasons the controls stay up: (1) HIG and the trade: toolbars carry the
+  frequent controls, bottom bars carry counts and view toggles (Finder, Mail, Xcode; Proxyman,
+  Charles and Wireshark all put record/capture at the top and counts at the bottom);
+  (2) Turn On Capture triggers macOS system-extension approval dialogs — a consequential action
+  that should not look like a footer toggle; (3) the first-run flow lands on Status with the pill
+  directly above the page it opens and the Getting-started row "Turn on the capture extension"
+  pointing at a switch in view, not at the far corner. The bottom variant (`● 127.0.0.1:8080 ·
+  Proxy [●] Capture [○] · 196 MB ↑ ↓`) stays documented here as the alternative; it would also
+  need a 28 pt pill in a 28 pt bar.
+- **Structural check** (`tools/check-connection-words.sh`, second rule): only
+  `Shell/ShellToolbar.swift`, `Panels/StatusPanel.swift`, `Panels/CoreLogPanel.swift`,
+  `SettingsView.swift`, `Session+Connection.swift`, `SelfTest.swift` and `SnapshotScenes.swift`
+  may read `connectionSummary`; `Shell/SidebarView.swift` and `Shell/StatusBar.swift` must not
+  mention it, `LaneDot`, `LaneState` or `ConnectionSummary`. Settings ▸ Capture's Status row and
+  Settings ▸ Bus's Connection row keep reading the lane words (as built).
+
+### 4b. Chip bar: raw-L4 protocols (revision 2)
+
+Matt: "in the top where we filter by protocol we are still missing L4 type of packet traffic."
+`ContentCategory` gains `tcp`, `udp` and `l4` in their own group after the application-layer
+protocols: `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON …`. `tcp`/`udp` match
+`row.l4?.proto`; `l4` matches every `kind == .l4` row (ICMP, raw and other included — the
+"All" of packet traffic, the word the L4 badge already uses). The ⌘1…⌘9 chip shortcuts follow
+bar order as before (h1 is now ⌘7). Chips get `.help` for the three new ones.
 
 ### 5. Words (GLOSSARY additions)
 
@@ -320,6 +377,15 @@ Embedded… (opens Settings ▸ Bus).
    Scope… ticks the step; the first flow ticks the last step and Recent fills.
 8. **ST-AC8 [manual]** A local unnotarized NE build shows the Capture card as `capture
    degraded` with the reason and the remedy "install the signed app"; nothing claims it works.
+9. **ST-AC9 [self-test]** The toolbar's Proxy switch flips `Session.capturing` through the same
+   entry as View ▸ Pause Proxy; the Capture switch's position follows the operator's choice and
+   its enabled state follows `captureControlsAvailable`/`captureBusy`/embedded; the pill is the
+   only route to Status besides ⌘0 and the palette (`isInSidebar` false).
+10. **ST-AC10 [structural]** `check-connection-words.sh` fails if `Shell/SidebarView.swift` or
+    `Shell/StatusBar.swift` mentions `connectionSummary`, `LaneDot`, `LaneState` or
+    `ConnectionSummary`, or if any file outside the allow-list reads `connectionSummary`.
+11. **ST-AC11 [unit + self-test]** `ContentCategory.tcp/.udp/.l4` match the fixture L4 rows by
+    protocol (the lo0 UDP capture and craft, the en0 TCP session); the chip narrows the list.
 
 ## Facts from the other sessions folded in (2026-10-31)
 
@@ -341,6 +407,29 @@ Embedded… (opens Settings ▸ Bus).
   restored into the embedded config / re-pushed on connect. The Status page keeps reading
   `scope.list` as the truth; no change here.
 
+## Live proof of revision 2 (2026-10-31, dev bundle with a real core, real traffic)
+
+Matt: "the 150 self-test passes are fake … I would not rely on them for anything but UI look and
+feel … test it with real live flow data you capture." So the switches were proven on a dev bundle
+carrying the repo's release `aitm` (no extension, so its core never enables `macos_capture` and
+leaves the installed app's rendezvous alone), with `curl -x` traffic through its proxy and real
+input on its toolbar:
+
+- 5 GETs → 5 rows, Response 577 B each, status bar ↓ 183 B/s; the pill showed the real bound
+  address and `● no extension`; Proxy on (green), Capture disabled (grey, help "not in this build").
+- A real click on the Proxy switch (CGEvent at the switch's AX-reported centre): the switch went
+  grey, the pill read `· paused`, ↓ fell to 0 B/s, and 4 GETs sent while paused recorded nothing
+  (26 rows before and after). A second click: green again, 2 GETs → 28 rows, ↓ 368 B/s.
+- Finding, fixed: the first `ToolbarSwitch` was a plain `Button` with `.isToggle`; System Events
+  saw an untitled "toggle button" and its `click` did nothing. It is now a real `Toggle` under
+  `ToolbarSwitchStyle`, so VoiceOver gets a titled checkbox with an on/off value and AXPress flips
+  it.
+- Live gaps the fixtures hide (not this PR's; routed): Time and Duration are `—` on every live row
+  (`flow.get` carries no timing — orchestrator follow-up); Request is `0 B` on GETs (body bytes
+  only; header bytes are a core follow-up); Client is `—` without the extension (expected until
+  attribution); a run with `APP_STORE` set lands on Apps because `Store.isOverridden` forces it
+  (harness rule — the Status landing is for real installs only).
+
 ## Left to the builder
 
 - Exact card widths/breakpoint (side by side ≥ 900 pt, stacked below), icon choices per lane
@@ -351,8 +440,9 @@ Embedded… (opens Settings ▸ Bus).
 
 ## Open questions
 
-- Matt: Status as the **first sidebar row in its own "Proxy" group** vs the first row of "All"?
-  (Default: own group.)
+- ~~Matt: Status as the **first sidebar row in its own "Proxy" group** vs the first row of "All"?~~
+  Resolved 2026-10-31: neither. Connection state lives in the toolbar only (§4); Status is a
+  page reached from the pill, ⌘0 and the palette, not a list row.
 - Matt: should Status replace Overview as the landing page even when flows exist? (Default:
   no — restore the last page; Status only when there is nothing to show yet.)
 
@@ -378,3 +468,16 @@ FAIL with 2 Critical + 5 Important). Dispositions, all applied on the branch:
 | 13 | Quality | Minor | Landing read side unfiltered; raw `13` | FIXED |
 | 14 | Quality | Minor | `RecentFlowRow` repeats `FlowListRow`'s shell | ACCEPTED (the two pages may drift; a `HoverRowButton` is a wave-3 cleanup) |
 | 15 | Security | Minor | Both capture tripwires red on main since #183 | FIXED here — scripts follow the `Store.defaults` shapes; Kit doc comment no longer spells the key |
+
+Matt's review 2 (2026-10-31, on the first cut of this branch): "you already have status in the top
+and in the sidebar and in the status bar below … pick a proper place and stick to it; I think they
+should belong in the top … leave the bottom for other important information. We also need a toggle
+for the Network extension and for enabling/disabling the proxy that the user can see and easily
+use. … In the top where we filter by protocol we are still missing L4 type of packet traffic."
+
+| # | Point | Disposition |
+|---|---|---|
+| R2-1 | Status shown three times | FIXED — §3/§4: the toolbar cluster is the one home; brand row is a label; status bar has no connection item; structural rule in `check-connection-words.sh` |
+| R2-2 | Visible toggles for the extension and the proxy | FIXED — §4: `ToolbarSwitch` ×2 in the cluster, wired to the existing operator-only entries (`CaptureSwitch.set`, `Session.setCapturing`); tripwire allow-list widened with an `expect` |
+| R2-3 | Protocol chips miss L4 | FIXED — §4b: TCP / UDP / L4 chips, unit + self-test |
+| R2-4 | Vocabulary: "Capture" meant both the proxy's recording and the extension | FIXED — Proxy (pause/resume) vs Capture (the extension); GLOSSARY, menus, palette, command map, S-018 |

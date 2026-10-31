@@ -212,7 +212,7 @@ struct ProxySettings: View {
 
 /// Settings ▸ Capture: the operator's switch for L4 capture on this Mac, what the capture
 /// extension is doing, and its uninstall (Task 17, NE-AC15). Capture is off until the
-/// operator turns it on here or with Proxy ▸ Enable Capture. Reads the capability the
+/// operator turns it on here, with Proxy ▸ Turn On Capture or the toolbar's Capture switch. Reads the capability the
 /// `ExtensionController` pushes into `CoreHealthState`. With no extension in this build
 /// (a development build, fixture and snapshot runs) the controls give way to a note: a
 /// toggle that does nothing is never shown.
@@ -339,9 +339,9 @@ struct CaptureSettings: View {
     }
 }
 
-/// The operator's capture on, off and uninstall, in one place so Settings ▸ Capture and
-/// Proxy ▸ Enable/Disable Capture run identical steps. Operator-only: those two callers
-/// are all there is. No bus verb, `Session` action or palette entry reaches `enable()`,
+/// The operator's capture on, off and uninstall, in one place so Settings ▸ Capture, Proxy ▸
+/// Turn On / Turn Off Capture, the Status page and the toolbar's Capture switch run identical
+/// steps. Operator-only: those callers are all there is. No bus verb, `Session` action or palette entry reaches `enable()`,
 /// `disable()`, `uninstall()` or the persisted `capture.enabled` choice (see
 /// `ExtensionController`).
 ///

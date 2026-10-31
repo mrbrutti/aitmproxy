@@ -1,8 +1,8 @@
 import AitmproxyKit
 import SwiftUI
 
-/// How a `LaneState` looks, once, for every connection indicator (sidebar row, toolbar
-/// pill, status bar, Status page). Hue only on state; the word always travels with it.
+/// How a `LaneState` looks, once, for every connection indicator (the toolbar's connection
+/// cluster, the Status page, the Core Log header). Hue only on state; the word always travels with it.
 extension LaneState {
     var color: DynamicColor {
         switch self {
@@ -14,7 +14,7 @@ extension LaneState {
         }
     }
 
-    /// The glyph for places that cannot draw a dot (the sidebar chip).
+    /// The glyph for places that cannot draw a dot.
     var symbol: String {
         switch self {
         case .ok: "checkmark.circle.fill"

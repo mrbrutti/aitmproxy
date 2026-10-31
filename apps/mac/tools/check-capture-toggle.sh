@@ -354,11 +354,11 @@ has "TG-AC5 a running action reads Working, never Capturing" "$cs_body" 'Text("W
 # ============================ TG-AC10: menu command + non-colliding shortcut ===========
 proxy_menu_start=$(grep -n -F 'CommandMenu("Proxy")' "$app" | head -n 1 | cut -d: -f1)
 next_menu=$(awk -v a="${proxy_menu_start:-0}" 'NR > a && /CommandMenu[(]/ { print NR; exit }' "$app")
-menu_item=$(grep -n -E 'Button[(].*"Disable Capture" : "Enable Capture"|Button[(].*"Enable Capture" : "Disable Capture"' "$app" | head -n 1 | cut -d: -f1)
+menu_item=$(grep -n -E 'Button[(].*"Turn Off Capture" : "Turn On Capture"|Button[(].*"Turn On Capture" : "Turn Off Capture"' "$app" | head -n 1 | cut -d: -f1)
 if [ -n "$menu_item" ]; then
-    pass "TG-AC10 App.swift has the Enable/Disable Capture menu command (line $menu_item)"
+    pass "TG-AC10 App.swift has the Turn On/Off Capture menu command (line $menu_item)"
 else
-    fail "TG-AC10 App.swift has no 'Enable Capture' / 'Disable Capture' menu Button"
+    fail "TG-AC10 App.swift has no 'Turn On Capture' / 'Turn Off Capture' menu Button"
 fi
 if [ -n "$proxy_menu_start" ] && [ -n "$next_menu" ] && [ -n "$menu_item" ] \
     && [ "$menu_item" -gt "$proxy_menu_start" ] && [ "$menu_item" -lt "$next_menu" ]; then
