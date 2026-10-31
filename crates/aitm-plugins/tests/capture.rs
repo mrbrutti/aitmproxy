@@ -114,6 +114,60 @@ fn flow_list_and_get() {
     assert_eq!(obj.get("status"), Some(&Value::Int(201)));
 }
 
+/// `flow.get` reports the buffered body sizes so a UI can total the traffic it has
+/// seen without fetching bodies: an empty body is 0, a buffered one its length, a
+/// response not yet seen is null (and so is a body still streaming).
+#[test]
+fn flow_get_reports_body_sizes() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let store = MemFlowStore::new();
+
+    let mut sized = http_flow("POST", "/upload", Some(200));
+    if let Flow::Http(f) = &mut sized {
+        f.request.body = Body::Bytes(vec![b'x'; 412]);
+        f.response.as_mut().expect("response").body = Body::Bytes(vec![0u8; 2048]);
+    }
+    let sized_id = store.insert(sized);
+    let pending_id = store.insert(http_flow("GET", "/a", None));
+    let mut streaming = http_flow("GET", "/stream", Some(200));
+    if let Flow::Http(f) = &mut streaming {
+        f.response.as_mut().expect("response").body = Body::Streamed(aitm_core::StreamBody);
+    }
+    let streaming_id = store.insert(streaming);
+
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+    let get = |id: FlowId| -> BTreeMap<String, Value> {
+        match reg
+            .command("flow.get")
+            .expect("flow.get registered")
+            .invoke(id_params(id), &host)
+            .expect("flow.get ok")
+        {
+            Value::Object(obj) => obj,
+            other => panic!("flow.get must return an object, got {other:?}"),
+        }
+    };
+
+    let sized = get(sized_id);
+    assert_eq!(sized.get("request_bytes"), Some(&Value::Int(412)));
+    assert_eq!(sized.get("response_bytes"), Some(&Value::Int(2048)));
+
+    let pending = get(pending_id);
+    assert_eq!(pending.get("request_bytes"), Some(&Value::Int(0)));
+    assert_eq!(pending.get("response_bytes"), Some(&Value::Null));
+
+    let streaming = get(streaming_id);
+    assert_eq!(streaming.get("request_bytes"), Some(&Value::Int(0)));
+    assert_eq!(
+        streaming.get("response_bytes"),
+        Some(&Value::Null),
+        "a streaming body has no known size yet"
+    );
+}
+
 #[test]
 fn flow_get_unknown_id_is_an_error() {
     let mut reg = Registry::new();

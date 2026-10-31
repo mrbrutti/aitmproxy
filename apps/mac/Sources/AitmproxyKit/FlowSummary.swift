@@ -18,11 +18,16 @@ public struct FlowSummary: Hashable, Sendable {
     /// The upgrade flow of a WebSocket flow.
     public var handshake: FlowID?
     public var messages: Int?
+    /// Buffered body sizes in bytes (`request_bytes` / `response_bytes`): nil while a
+    /// body is still streaming, before the response arrives, and for a WebSocket flow.
+    /// The status bar's ↑ / ↓ rate is the change in their totals over time.
+    public var requestBytes: Int64?
+    public var responseBytes: Int64?
 
     public init(
         id: FlowID, kind: FlowKind, intercept: InterceptLabel, isReplay: Bool, method: String? = nil,
         scheme: String? = nil, authority: String? = nil, path: String? = nil, status: Int? = nil,
-        handshake: FlowID? = nil, messages: Int? = nil
+        handshake: FlowID? = nil, messages: Int? = nil, requestBytes: Int64? = nil, responseBytes: Int64? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -35,6 +40,8 @@ public struct FlowSummary: Hashable, Sendable {
         self.status = status
         self.handshake = handshake
         self.messages = messages
+        self.requestBytes = requestBytes
+        self.responseBytes = responseBytes
     }
 
     /// Decodes the `structuredContent` of a `flow.get` result. Unknown
@@ -53,6 +60,8 @@ public struct FlowSummary: Hashable, Sendable {
         self.status = json["status"]?.intValue
         self.handshake = json["handshake"]?.stringValue.map(FlowID.init)
         self.messages = json["messages"]?.intValue
+        self.requestBytes = json["request_bytes"]?.intValue.map(Int64.init)
+        self.responseBytes = json["response_bytes"]?.intValue.map(Int64.init)
     }
 
     /// A row with the fields the summary carries; the rest stay nil and draw as
@@ -72,6 +81,7 @@ public struct FlowSummary: Hashable, Sendable {
             scheme: scheme, authority: authority ?? "", path: p, query: q,
             status: kind == .websocket && status == nil ? 101 : status,
             state: state, isReplay: isReplay, origin: isReplay ? .human : .client,
+            requestBytes: requestBytes, responseBytes: responseBytes,
             tls: scheme == "https" || scheme == "wss" ? .decrypted : .none,
             edited: intercept == .resumed,
             wsFrames: messages.map { (sent: $0, received: 0) },

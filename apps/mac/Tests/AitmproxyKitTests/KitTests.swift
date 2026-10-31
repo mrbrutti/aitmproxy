@@ -36,7 +36,7 @@ import Testing
         let json: JSONValue = [
             "id": "3f1c0d2e-0000-4000-8000-000000000001", "kind": "http", "intercept": "intercepted",
             "is_replay": false, "method": "POST", "scheme": "https", "authority": "auth.shop-staging.test",
-            "path": "/api/auth/login?x=1", "status": .null,
+            "path": "/api/auth/login?x=1", "status": .null, "request_bytes": 412,
         ]
         let summary = try #require(FlowSummary(json: json))
         #expect(summary.intercept == .intercepted)
@@ -48,6 +48,24 @@ import Testing
         #expect(row.state == .paused)
         #expect(row.tls == .decrypted)
         #expect(row.url == "https://auth.shop-staging.test/api/auth/login?x=1")
+        // The sizes the core reports reach the row; a response not yet seen has none.
+        #expect(row.requestBytes == 412)
+        #expect(row.responseBytes == nil)
+    }
+
+    @Test func bodySizesAreOptionalOnTheWire() throws {
+        // An older core (or a streaming body) sends no sizes: the row stays nil, not 0.
+        let without: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                  "method": "GET", "scheme": "http", "authority": "h", "path": "/", "status": 200]
+        let bare = try #require(FlowSummary(json: without)).row(seq: 1)
+        #expect(bare.requestBytes == nil)
+        #expect(bare.responseBytes == nil)
+        let with: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                               "method": "GET", "scheme": "http", "authority": "h", "path": "/", "status": 200,
+                               "request_bytes": 0, "response_bytes": 2_048]
+        let sized = try #require(FlowSummary(json: with)).row(seq: 1)
+        #expect(sized.requestBytes == 0)
+        #expect(sized.responseBytes == 2_048)
     }
 
     @Test func decodesWebSocketSummary() throws {

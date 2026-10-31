@@ -18,6 +18,9 @@ final class BusService: FlowActions {
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private var notificationTask: Task<Void, Never>?
     @ObservationIgnored private var summaries: [FlowID: FlowSummary] = [:]
+    /// The status bar's ↑ / ↓ rate, from the change in the summaries' byte totals
+    /// between polls. Reset with each connection so a new core starts from zero.
+    @ObservationIgnored private var throughput = ThroughputMeter()
     /// The embedded core's bus (Task 6), once it has published its address. When
     /// set it supersedes the config.yaml / Settings endpoint resolution.
     @ObservationIgnored private var endpointOverride: BusEndpoint?
@@ -69,6 +72,9 @@ final class BusService: FlowActions {
         client = nil
         session.bus = .disconnected
         session.applyResolvedRole(nil)
+        // No connection, no traffic: a stale rate must not keep showing.
+        session.upBytesPerSecond = 0
+        session.downBytesPerSecond = 0
     }
 
     private func run() async {
@@ -122,6 +128,7 @@ final class BusService: FlowActions {
     /// Polls `flow.list`, fetches summaries for new and in-flight flows, and
     /// rebuilds the rows oldest-first. Finished flows are not re-fetched.
     private func pollLoop(_ client: BusClient) async throws {
+        throughput.reset()
         while !Task.isCancelled {
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
             for id in ids {
@@ -142,6 +149,14 @@ final class BusService: FlowActions {
                     return row
                 }
             if rows != session.rows { session.rows = rows }
+            // ↑ is what clients sent (request bodies), ↓ what came back (response bodies),
+            // as the core reports them; the meter turns the running totals into a rate.
+            let rate = throughput.sample(
+                up: summaries.values.reduce(0) { $0 + ($1.requestBytes ?? 0) },
+                down: summaries.values.reduce(0) { $0 + ($1.responseBytes ?? 0) },
+                at: Date())
+            if session.upBytesPerSecond != rate.up { session.upBytesPerSecond = rate.up }
+            if session.downBytesPerSecond != rate.down { session.downBytesPerSecond = rate.down }
             try await Task.sleep(for: pollInterval)
         }
     }
