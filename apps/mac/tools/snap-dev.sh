@@ -31,7 +31,20 @@ dev="/tmp/$name-dev$tag.app"
 # app's and computer-use scripts (System Events, cgclick) can target this build while the real
 # one keeps running. The bundle id stays the same so the fixture/snapshot defaults are shared.
 exe="$name$tag"
-installed="$HOME/Applications/$name.app"
+# The installed bundle to borrow Info.plist, icons and the embedded core from: INSTALLED_APP, else
+# the first of ~/Applications and /Applications (the DMG install) that carries Resources/core,
+# else whichever exists (a stale coreless dev install must not win over the real app).
+installed="${INSTALLED_APP:-}"
+if [[ -z "$installed" ]]; then
+  for candidate in "$HOME/Applications/$name.app" "/Applications/$name.app"; do
+    [[ -d "$candidate/Contents/Resources/core" ]] && { installed="$candidate"; break; }
+  done
+fi
+if [[ -z "$installed" ]]; then
+  for candidate in "$HOME/Applications/$name.app" "/Applications/$name.app"; do
+    [[ -d "$candidate" ]] && { installed="$candidate"; break; }
+  done
+fi
 rm -rf "$dev"
 mkdir -p "$dev/Contents/MacOS" "$dev/Contents/Resources"
 cp "$bin" "$dev/Contents/MacOS/$exe"
@@ -43,6 +56,18 @@ else
   sed -e "s/__BUILD__/0/" -e "s/__VERSION__/0.0.0-dev/" "$here/Info.plist.in" > "$dev/Contents/Info.plist"
 fi
 plutil -replace CFBundleExecutable -string "$exe" "$dev/Contents/Info.plist"
+# The installed bundle's embedded core (aitm + obscura), when present, so the dev build can also
+# run LIVE (no APP_FIXTURES) against its own core for end-to-end checks; snapshots never spawn it.
+# CORE_DIR=<dir with aitm + obscura> (e.g. the repo's target/release) overrides the installed
+# bundle's core, so a dev build can run live against a core built from the current main.
+if [[ -n "${CORE_DIR:-}" && -x "$CORE_DIR/aitm" ]]; then
+  mkdir -p "$dev/Contents/Resources/core"
+  cp "$CORE_DIR/aitm" "$dev/Contents/Resources/core/aitm"
+  [[ -x "$CORE_DIR/obscura" ]] && cp "$CORE_DIR/obscura" "$dev/Contents/Resources/core/obscura"
+  echo "== core from $CORE_DIR"
+elif [[ -d "$installed/Contents/Resources/core" ]]; then
+  cp -R "$installed/Contents/Resources/core" "$dev/Contents/Resources/core"
+fi
 echo "== bundle $dev ($exe)"
 
 store="/tmp/$name-dev-state$tag"
