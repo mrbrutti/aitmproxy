@@ -792,6 +792,14 @@ fn role_str(role: Frontend) -> &'static str {
     }
 }
 
+/// The per-server salt behind [`McpServer::connection_id`]: a v4 UUID (OS
+/// randomness) folded to 64 bits. The fixed version and variant bits sit at
+/// different positions in the two halves, so the xor leaves all 64 bits random.
+fn draw_conn_salt() -> u64 {
+    let (hi, lo) = uuid::Uuid::new_v4().as_u64_pair();
+    hi ^ lo
+}
+
 /// Registry handle + transport selection + the services commands run against.
 pub struct McpServer {
     registry: Arc<Registry>,
@@ -830,6 +838,11 @@ pub struct McpServer {
     /// Monotonic source of per-connection ids, so each streaming connection's
     /// subscriptions can be dropped when it ends.
     conn_seq: Arc<AtomicU64>,
+    /// 64 bits of OS randomness drawn once in [`McpServer::new`] and rendered,
+    /// with `conn_id`, by [`McpServer::connection_id`]. It keeps two servers that
+    /// share one audit ring (each counts connections from 1) from ever minting
+    /// the same id, and a restart from repeating one.
+    conn_salt: u64,
     /// Set by the first [`McpServer::spawn_push_dispatcher`] call, so a second
     /// call is a no-op rather than a second dispatcher delivering every event
     /// twice.
@@ -894,6 +907,7 @@ impl McpServer {
             push_tx: None,
             push_capacity: DEFAULT_PUSH_CAPACITY,
             conn_seq: Arc::new(AtomicU64::new(0)),
+            conn_salt: draw_conn_salt(),
             dispatcher_spawned: AtomicBool::new(false),
             confirm_tokens: Arc::new(ConfirmTokens::default()),
             confirm_ttl: DEFAULT_CONFIRM_TTL,
@@ -1003,6 +1017,19 @@ impl McpServer {
     /// subscriptions are dropped when it ends).
     pub fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The opaque, server-assigned id of `conn`, the one an audit line and the
+    /// `initialize` reply carry; `None` when `conn` is not a streaming connection
+    /// (`conn_id == 0`: in-process, HTTP POST, the embedded TUI).
+    ///
+    /// A pure function of this server's random salt and the connection's
+    /// `conn_id`, rendered `conn_<16 lowercase hex>-<decimal>` (at most 64 bytes
+    /// of printable ASCII). Nothing a request carries is read into it: not
+    /// `clientInfo`, not `_meta`, not an argument, not the client label. Callers
+    /// compare it for equality only, and no policy decision keys off it.
+    pub fn connection_id(&self, conn: &ConnCtx) -> Option<String> {
+        (conn.conn_id != 0).then(|| format!("conn_{:016x}-{}", self.conn_salt, conn.conn_id))
     }
 
     /// Drop every subscription a connection held (called by the transport when
@@ -1153,6 +1180,7 @@ impl McpServer {
             push_tx,
             push_capacity,
             conn_seq,
+            conn_salt,
             dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
@@ -1179,6 +1207,7 @@ impl McpServer {
             push_tx,
             push_capacity,
             conn_seq,
+            conn_salt,
             dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
@@ -1295,6 +1324,11 @@ impl McpServer {
                     // show it and warn on mismatch (Decision C). Additive and
                     // top-level — it describes this connection, not the server.
                     "role": role_str(conn.role),
+                    // This connection's server-assigned id (a string), or `null`
+                    // when the caller is not a streaming connection. Additive and
+                    // top-level like `role`, never inside `serverInfo`; read from
+                    // the transport-built `ConnCtx`, never from `params`.
+                    "connection_id": self.connection_id(conn),
                     // Additive (W2): advertise `resources` so MCP Apps hosts fetch
                     // the widget templates, plus the MCP Apps extension id. Clients
                     // that don't know these keys ignore them (research 08 §3.3).
@@ -1632,8 +1666,8 @@ impl McpServer {
             at: SystemTime::now(),
             origin: conn.role,
             client_label: conn.client_label.clone(),
-            // Interim (plan task 1): task 6 stamps the server-assigned id here.
-            connection_id: None,
+            // Stamped from the transport-built `ConnCtx`, never from the request.
+            connection_id: self.connection_id(conn),
             command: name.to_string(),
             args_summary: redact_args(arguments),
             result: outcome,

@@ -4186,3 +4186,213 @@ fn approve_role_gate_precedes_schema_for_the_agent() {
         "refused for the role, not the arguments: {resp}"
     );
 }
+
+// ------------- server-assigned connection id (plan 2026-10-30-bus-audit-connection-id)
+
+/// A streaming connection of `role` as a transport builds it after auth: a minted
+/// non-zero `conn_id`, no client label, no push sink.
+fn minted(srv: &McpServer, role: Frontend) -> ConnCtx {
+    ConnCtx {
+        role,
+        client_label: None,
+        conn_id: srv.next_conn_id(),
+        out: None,
+    }
+}
+
+/// `tools/call name args` on `conn`; the whole parsed reply.
+fn call_on(srv: &McpServer, conn: &ConnCtx, name: &str, args: JsonValue) -> JsonValue {
+    let req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": name, "arguments": args}});
+    let resp = srv
+        .handle_on(conn, &req.to_string())
+        .expect("a request gets a response");
+    serde_json::from_str(&resp).expect("response is JSON")
+}
+
+/// `initialize` with `params` on `conn`; the whole parsed reply.
+fn initialize_on(srv: &McpServer, conn: &ConnCtx, params: JsonValue) -> JsonValue {
+    let req = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params});
+    let resp = srv
+        .handle_on(conn, &req.to_string())
+        .expect("initialize gets a reply");
+    serde_json::from_str(&resp).expect("response is JSON")
+}
+
+/// The connection id `initialize` hands `conn`, as a string; panics if the reply
+/// carries anything else.
+fn init_id(srv: &McpServer, conn: &ConnCtx) -> String {
+    let reply = initialize_on(srv, conn, json!({}));
+    reply["result"]["connection_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("initialize carries no string connection_id: {reply}"))
+        .to_string()
+}
+
+/// A subscribed watcher: a minted connection of `role` with a push sink, already
+/// `flow.subscribe {}`d, so every audit line the server pushes lands in its sink.
+fn watcher(srv: &McpServer, role: Frontend) -> ConnCtx {
+    let conn = ConnCtx {
+        out: Some(NotificationSink::new(64)),
+        ..minted(srv, role)
+    };
+    let reply = call_on(srv, &conn, "flow.subscribe", json!({}));
+    assert!(!is_refused(&reply), "the watcher subscribes: {reply}");
+    conn
+}
+
+/// The `notifications/aitm/agent` lines in `conn`'s sink, parsed, oldest first.
+fn agent_lines(conn: &ConnCtx) -> Vec<JsonValue> {
+    conn.out
+        .as_ref()
+        .expect("a watcher has a sink")
+        .drain()
+        .iter()
+        .map(|l| serde_json::from_str::<JsonValue>(l).expect("a pushed line is JSON"))
+        .filter(|v| v["method"] == "notifications/aitm/agent")
+        .collect()
+}
+
+/// AC7: `initialize` tells a streaming connection its own id, at the top level of
+/// the result (never inside `serverInfo`), stable across repeats and different for
+/// another connection of the same server.
+#[test]
+fn initialize_echoes_connection_id() {
+    let srv = server();
+    let a = minted(&srv, Frontend::Mcp);
+
+    let first = initialize_on(&srv, &a, json!({}));
+    let id = first["result"]["connection_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("connection_id is a string: {first}"))
+        .to_string();
+    assert!(!id.is_empty(), "the id is not empty");
+    assert!(id.len() <= 64, "the id is at most 64 bytes: {id}");
+    assert!(
+        id.bytes().all(|b| b.is_ascii_graphic()),
+        "the id is printable ASCII: {id}"
+    );
+    assert!(
+        first["result"]["serverInfo"]["connection_id"].is_null(),
+        "the id describes the connection, not the server: {first}"
+    );
+
+    assert_eq!(
+        init_id(&srv, &a),
+        id,
+        "a repeated initialize repeats the id"
+    );
+
+    let b = minted(&srv, Frontend::Mcp);
+    assert_ne!(init_id(&srv, &b), id, "another connection has another id");
+}
+
+/// AC7: a caller that is not a streaming connection (`conn_id == 0`: in-process,
+/// HTTP POST, the embedded TUI) gets `null`, and the key is still present so every
+/// reply has one shape.
+#[test]
+fn initialize_connection_id_is_null_without_a_connection() {
+    let srv = server();
+    let reply = initialize_on(&srv, &ConnCtx::new(Frontend::Operator), json!({}));
+    assert_eq!(reply["result"]["connection_id"], JsonValue::Null);
+    assert!(
+        reply["result"]
+            .as_object()
+            .expect("the result is an object")
+            .contains_key("connection_id"),
+        "the key is present even when null: {reply}"
+    );
+}
+
+/// AC8: every audit entry carries the id of the connection that made the call,
+/// the same id that connection's `initialize` returned; a call with no connection
+/// carries `None`; the pushed line carries exactly the entry's id.
+#[test]
+fn audit_entries_carry_the_connections_id() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let op = watcher(&srv, Frontend::Operator);
+
+    let a = minted(&srv, Frontend::Mcp);
+    let b = minted(&srv, Frontend::Mcp);
+    let a_id = init_id(&srv, &a);
+    let b_id = init_id(&srv, &b);
+    assert_ne!(a_id, b_id);
+
+    assert!(!is_refused(&call_on(&srv, &a, "demo.read", json!({}))));
+    assert!(!is_refused(&call_on(&srv, &b, "demo.read", json!({}))));
+    let anon = ConnCtx::new(Frontend::Mcp);
+    assert!(!is_refused(&call_on(&srv, &anon, "demo.read", json!({}))));
+
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 3, "three audited calls: {entries:?}");
+    assert_eq!(entries[0].connection_id, Some(a_id));
+    assert_eq!(entries[1].connection_id, Some(b_id));
+    assert_eq!(entries[2].connection_id, None);
+
+    let lines = agent_lines(&op);
+    assert_eq!(lines.len(), 3, "three pushed lines: {lines:?}");
+    for (line, entry) in lines.iter().zip(&entries) {
+        assert_eq!(
+            line["params"]["connection_id"],
+            json!(entry.connection_id),
+            "the pushed line carries the entry's id: {line}"
+        );
+    }
+    assert!(lines[0]["params"]["connection_id"].is_string());
+    assert!(lines[1]["params"]["connection_id"].is_string());
+    assert!(lines[2]["params"]["connection_id"].is_null());
+}
+
+/// AC9: two servers each count connections from 1, so the raw counter collides;
+/// the per-server salt keeps their ids apart.
+#[test]
+fn connection_ids_are_distinct_across_servers() {
+    let one = server();
+    let two = server();
+    let a = minted(&one, Frontend::Mcp);
+    let b = minted(&two, Frontend::Mcp);
+    assert_eq!(a.conn_id, 1);
+    assert_eq!(b.conn_id, 1);
+    assert_ne!(
+        init_id(&one, &a),
+        init_id(&two, &b),
+        "the same conn_id on two servers must not render the same id"
+    );
+}
+
+/// AC10: nothing a request carries reaches the id. A forged `connection_id` in
+/// `clientInfo`, in `_meta` and at the top of the params, and a forged client
+/// label, change neither the `initialize` id nor the id the connection's audit
+/// entries carry.
+#[test]
+fn forged_claims_never_change_the_connection_id() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let conn = ConnCtx {
+        client_label: Some("conn_victim".into()),
+        ..minted(&srv, Frontend::Mcp)
+    };
+
+    let plain = init_id(&srv, &conn);
+    let forged = initialize_on(
+        &srv,
+        &conn,
+        json!({
+            "clientInfo": {"name": "conn_victim", "connection_id": "conn_victim"},
+            "_meta": {"connection_id": "conn_victim"},
+            "connection_id": "conn_victim",
+        }),
+    );
+    let forged_id = forged["result"]["connection_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("connection_id is a string: {forged}"));
+    assert_ne!(forged_id, "conn_victim");
+    assert_eq!(forged_id, plain);
+
+    assert!(!is_refused(&call_on(&srv, &conn, "demo.read", json!({}))));
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].connection_id.as_deref(), Some(plain.as_str()));
+    assert_eq!(entries[0].client_label.as_deref(), Some("conn_victim"));
+}
