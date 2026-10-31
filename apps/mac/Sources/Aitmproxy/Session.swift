@@ -336,62 +336,9 @@ final class Session {
         if !Store.usesFixtures { breakpointRules = BreakpointRules.load(from: rulesURL) }
         loadSavedFilters()
         if Store.usesFixtures {
-            // Fixture commands: the ones the shell already models act; the rest echo.
-            commandRunner = { [weak self] name, args in
-                guard let self else { throw BusError.disconnected }
-                switch name {
-                case "flow.intercept": interceptArmed = args["enabled"]?.boolValue ?? true; return .bool(interceptArmed)
-                case "flow.resume": if let id = args["id"]?.stringValue { resume(FlowID(id)) }; return .null
-                case "flow.kill": if let id = args["id"]?.stringValue { kill(FlowID(id)) }; return .null
-                case "flow.replay": if let id = args["id"]?.stringValue { replay(FlowID(id)) }; return .string("replayed")
-                case "flow.list": return .array(rows.map { .string($0.id.raw) })
-                case "scope.list": return .array(scopeHosts.map { .string($0) })
-                case "scope.add": if let h = args["host"]?.stringValue { addScope(h) }; return .string(args["host"]?.stringValue ?? "")
-                case "l4.flow.list": return .array(l4Details.keys.map { .string($0.raw) })
-                case "l4.flow.get":
-                    guard let id = args["id"]?.stringValue, let flow = l4Details[FlowID(id)] else { throw BusError.tool(message: "no such L4 flow") }
-                    return Fixtures.l4FlowJSON(flow)
-                case "l4.craft":
-                    return .object([
-                        "length": .number(Double(Fixtures.l4CraftBytes.count)),
-                        "bytes": .string(Fixtures.l4CraftBytes.base64EncodedString()),
-                        "summary": .object(["layers": .array([.string("IPv4"), .string("UDP")]),
-                                            "length": .number(Double(Fixtures.l4CraftBytes.count))]),
-                    ])
-                case "l4.inject", "l4.send_recv":
-                    // The guard refuses an out-of-scope target before any confirm token.
-                    let dst = args["dst"]?.stringValue ?? ""
-                    guard dst == "127.0.0.1" else {
-                        throw BusError.tool(message: "\(name) refused: OutOfL4Scope — \(dst) is not in the L4 scope "
-                            + "(deny-by-default). Add it with l4.scope.add (operator-confirmed).")
-                    }
-                    if args["_confirm"] != nil { return .object(["status": .string("ok"), "sent": .number(1)]) }
-                    let count = args["count"]?.intValue ?? 1
-                    return .object([
-                        "status": .string("needs_confirmation"),
-                        "prompt": .string("Inject \(count)× IPv4/UDP (37 B) to \(dst):\(args["port"]?.intValue ?? 9) "
-                            + "on \(args["interface"]?.stringValue ?? "lo0") — in scope \(Fixtures.l4Scope) · permit budget "
-                            + "64 pps. Re-send with _confirm to put it on the wire."),
-                        "confirm_token": .string("l4-\(UUID().uuidString.prefix(8))"),
-                    ])
-                case "scan.discover":
-                    // The scanner gates the seed before its first navigation: an out-of-scope target is refused, never crawled.
-                    let target = args["target"]?.stringValue ?? ""
-                    guard let authority = ScanForm.authority(of: target), Scope.contains(authority, in: scopeHosts) else {
-                        throw BusError.tool(message: "scan.discover refused: OutOfScope — \(target) is not in scope (deny-by-default).")
-                    }
-                    return Fixtures.scanDiscover
-                case "l4.agent.status": return l4AgentGatesJSON()
-                case "l4.agent.set":
-                    if let cap = args["capability"]?.stringValue, let allowed = args["allowed"]?.boolValue {
-                        setL4Gate(cap, allowed)
-                    }
-                    return l4AgentGatesJSON()
-                case "l4.capture.start", "l4.capture.stop", "l4.scope.add", "l4.scope.list", "l4.interfaces", "l4.capture.status":
-                    return .string("ok (fixture)")
-                default: return .string("ok (fixture)")
-                }
-            }
+            // The fixture bus (Bus/FixtureBus.swift): what `BusService.call` is live.
+            let bus = FixtureBus(session: self)
+            commandRunner = { name, args in try await bus.call(name, args) }
         }
     }
 
@@ -565,15 +512,6 @@ final class Session {
     var composeURL: URL { Store.url.appending(path: "compose.json") }
     /// The operator's unsent edits per paused flow; nil = as the proxy holds it.
     var editDrafts: [FlowID: HTTPMessage] = [:]
-
-    /// The current L4 agent gates as the `l4.agent.status` / `.set` JSON object.
-    func l4AgentGatesJSON() -> JSONValue {
-        let gates = l4AgentGates ?? L4AgentGates(capture: false, inject: false, intercept: false, widen: false)
-        return .object([
-            "capture": .bool(gates.capture), "inject": .bool(gates.inject),
-            "intercept": .bool(gates.intercept), "widen": .bool(gates.widen),
-        ])
-    }
 
     /// Flip one fixture L4 agent gate (the operator act `l4.agent.set` performs).
     func setL4Gate(_ capability: String, _ allowed: Bool) {

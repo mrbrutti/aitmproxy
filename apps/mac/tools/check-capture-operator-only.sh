@@ -175,8 +175,12 @@ for f in "$embedded_core" "$ext_controller" "$settings_view" "$app_swift"; do
 done
 
 # ---- 4. the agent-reachable surfaces reference none of it ----------------------------
+# FixtureBus.swift is the bus's stand-in in fixture, snapshot and self-test runs (the test
+# adapter behind Session.commandRunner, where BusService is the live one), so it is held to the
+# same rule as BusService.swift.
 deny "$key_re|captureEnabled|CaptureSwitch|ExtensionController|extensionController|OSSystemExtension|(activation|deactivation)Request|submitRequest|restartCoreTick|\.(enable|disable)[[:space:]]*\(" \
   Sources/Aitmproxy/Bus/BusService.swift \
+  Sources/Aitmproxy/Bus/FixtureBus.swift \
   Sources/AitmproxyKit/CommandMap.swift \
   Sources/Aitmproxy/Shell/CommandPalette.swift \
   Sources/Aitmproxy/Session+Palette.swift \

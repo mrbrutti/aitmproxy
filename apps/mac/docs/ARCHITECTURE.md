@@ -30,7 +30,8 @@ actor, JSON-RPC       values only          SwiftUI + AppKit, main actor by defau
 | Seam | Production adapter | Test adapter |
 | --- | --- | --- |
 | `FlowActions` (every proxy action) | `BusService` (polls `flow.list`/`flow.get`, records to the activity log) | `FixtureActions` (mutates the session in place) |
-| `Session.commandRunner` / `commandRecorder` / `notificationSink` | `BusService` | the fixture closure in `Session.init` |
+| `Session.commandRunner` (every palette and panel command) | `BusService.call` | `FixtureBus.call` (`Bus/FixtureBus.swift`), installed by `Session.init` |
+| `Session.notificationSink` (server push into the activity log) | `BusService` | none: fixtures push nothing, `Fixtures+Agent` seeds the log |
 | `BusClient` transport | loopback TCP | `FakeBusServer` |
 | Panel state (`PocPanelState`, `BrowserState`, `ActivityState`) | bus commands through `Session.runCommand` | `Fixtures+Poc/Agent/Streams` |
 
