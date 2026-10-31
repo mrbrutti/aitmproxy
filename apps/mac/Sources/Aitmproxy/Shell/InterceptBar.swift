@@ -86,18 +86,22 @@ struct InterceptBar: View {
     /// The paused-bar actions. `compact` keeps only Resume and folds the rest into
     /// an overflow menu; `ViewThatFits` picks it when the full row would not fit.
     @ViewBuilder private func actions(compact: Bool) -> some View {
-        let resumeTitle = target.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume"
+        // The verb table titles Resume vs Apply & Resume and says whether Edit applies (one predicate
+        // with the Flow menu and the row menu, B3).
+        let resume = session.verbItem(.resume, for: target?.id)
+        let edit = session.verbItem(.edit, for: target?.id)
+        let kill = session.verbItem(.kill, for: target?.id)
         HStack(spacing: Tok.Metric.gapTight) {
-            PrimaryButton(resumeTitle, hint: "⌘⏎") { if let target { session.applyAndResume(target.id) } }
+            PrimaryButton(resume.title, hint: resume.hint) { if let target { session.applyAndResume(target.id) } }
                 .accessibilityIdentifier("resume-button")
                 .disabled(coreFailed)
             if compact {
                 Menu {
-                    if let target, row(target).state == .paused {
-                        Button("Edit Paused Request") { session.editPaused(target.id) }.disabled(coreFailed)
+                    if let target, edit.enabled {
+                        Button(edit.title) { session.perform(.edit, on: target.id) }.disabled(coreFailed)
                     }
                     Button("Resume All") { session.resumeAll() }.disabled(coreFailed)
-                    Menu("Kill") {
+                    Menu(kill.title) {
                         ForEach(KillMode.allCases, id: \.self) { mode in
                             Button(mode.title) { session.killMode = mode; if let target { session.kill(target.id) } }
                         }
@@ -113,8 +117,8 @@ struct InterceptBar: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
             } else {
-                if let target, row(target).state == .paused {
-                    GhostButton("Edit", hint: "e") { session.editPaused(target.id) }
+                if let target, edit.enabled {
+                    GhostButton("Edit", hint: edit.hint) { session.perform(.edit, on: target.id) }
                         .accessibilityIdentifier("edit-button")
                         .disabled(coreFailed)
                 }
@@ -130,7 +134,7 @@ struct InterceptBar: View {
                         }
                     }
                 } label: {
-                    GhostButton("Kill", hint: "⌘\\", menu: true) { if let target { session.kill(target.id) } }
+                    GhostButton(kill.title, hint: kill.hint, menu: true) { if let target { session.kill(target.id) } }
                 } primaryAction: {
                     if let target { session.kill(target.id) }
                 }
@@ -144,8 +148,6 @@ struct InterceptBar: View {
             }
         }
     }
-
-    private func row(_ r: FlowRow) -> FlowRow { r }
 
     /// "edited"/"pending" comes from `pendingEditCount` alone, the same predicate
     /// the Resume title and the editor footer use, so the three never disagree (B3).

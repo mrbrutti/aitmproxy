@@ -142,7 +142,7 @@ struct OverviewListsRow: View {
 
 /// One compact list row: optional mono time, method in its badge colour, the URL
 /// in primary ink (middle-truncated), a mono value on the right, and a chevron
-/// that appears on hover. A Button in the plain style, like the host rows above.
+/// that appears on hover. A `HoverRowStyle` button, like the host rows above.
 private struct FlowListRow: View {
     var row: FlowRow
     var leading: String? = nil
@@ -155,7 +155,6 @@ private struct FlowListRow: View {
     var help: String? = nil
     var hint = "Opens the flow"
     var action: () -> Void
-    @State private var hovered = false
 
     private static let leadingWidth: CGFloat = 64
     private static let methodWidth: CGFloat = 56
@@ -187,20 +186,10 @@ private struct FlowListRow: View {
                     .foregroundStyle(trailingColor.color)
                     .lineLimit(1)
                     .frame(width: Self.trailingWidth, alignment: .trailing)
-                Image(systemName: Tok.Glyph.chevron)
-                    .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
-                    .foregroundStyle(Tok.Ink.tertiary.color)
-                    .opacity(hovered ? 1 : 0)
-                    .accessibilityHidden(true)
+                HoverChevron()
             }
-            .padding(.horizontal, Space.xs)
-            .frame(height: Tok.Size.Row.dense)
-            .background(hovered ? Tok.Ground.hover.color : .clear,
-                        in: RoundedRectangle(cornerRadius: Tok.Radius.badge))
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
-        .onHover { hovered = $0 }
+        .buttonStyle(HoverRowStyle())
         .help(help ?? row.url)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityText)
