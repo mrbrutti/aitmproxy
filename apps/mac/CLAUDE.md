@@ -15,7 +15,8 @@ SwiftData database and no server.
 ## Build and check
 
 - Build and install: `./build.sh` (release) or `./build.sh --debug`, into `~/Applications`. Add `--open` to restart the app with the new build. The build shows warnings; fix them.
-  - `--ne` is the only way to get the Network Extension build (Developer ID signing, sysex embedded, installed to `/Applications`). It is never inferred from the NE profiles being present, so a plain build cannot replace the released app in `/Applications`.
+  - `--ne` is the only way to get the Network Extension build (Developer ID signing, sysex embedded, installed to `/Applications`). It is never inferred from the NE profiles being present, so a plain build cannot replace the released app in `/Applications`. `tools/ne-preflight.sh` picks the Developer ID identity that both profiles authorise (or checks `NE_SIGN_IDENTITY`); a sysex signed with a certificate its profile does not list fails activation with "code signature invalid".
+  - A local `--ne` build can never activate capture: macOS refuses an unnotarized Developer ID system extension. build.sh prints that warning last and exits 1 unless `--allow-unnotarized` is passed, which the release recipe does because the build is the input to `scripts/notarize-dmg.sh` (`docs/RELEASE.md` step 3). The notarized DMG is the only path to a working extension.
   - Before installing, the script prints the bundle it is about to replace with its version and build. It refuses when the installed `CFBundleShortVersionString` differs from the version being built unless you pass `--replace` (`CFBundleVersion` is a per-build timestamp, so it is printed, not compared).
   - Iterate without installing anything: `DEV_TAG=<tag> tools/snap-dev.sh` builds to its own scratch dir and runs a throwaway bundle `/tmp/Aitmproxy-dev-<tag>.app` with process name `Aitmproxy-<tag>`.
 - Unit tests: `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build`.

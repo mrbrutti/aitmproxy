@@ -14,6 +14,12 @@
 #                              CFBundleShortVersionString differs from the one being built
 #                              (without it the build refuses, and says what it would have
 #                              overwritten). Same-version rebuilds need no flag.
+#        ./build.sh --ne --allow-unnotarized
+#                              accept that the embedded system extension is not notarized.
+#                              macOS refuses an unnotarized Developer ID sysex ("code
+#                              signature invalid"), so an --ne build on its own can never
+#                              activate capture: it is the INPUT to scripts/notarize-dmg.sh,
+#                              and without this flag it exits 1 after installing to say so.
 # Day-to-day iteration without installing anything: tools/snap-dev.sh (DEV_TAG=<tag>).
 set -euo pipefail
 here=${0:A:h}
@@ -23,6 +29,7 @@ config=release
 [[ " $* " == *" --debug "* ]] && config=debug
 want_ne=0; [[ " $* " == *" --ne "* ]] && want_ne=1
 allow_replace=0; [[ " $* " == *" --replace "* ]] && allow_replace=1
+allow_unnotarized=0; [[ " $* " == *" --allow-unnotarized "* ]] && allow_unnotarized=1
 
 # Sign with your Apple Development certificate when you have one (Xcode >
 # Settings > Accounts). Otherwise sign ad hoc, which is fine for your own Mac.
@@ -33,19 +40,19 @@ fi
 [[ -n "$identity" ]] || identity=-
 
 # A Network/System Extension build is an explicit --ne opt-in: it needs a Developer ID
-# identity (resolved by SHA — a team can hold two same-named certs, and codesign needs
-# it unambiguous) and both A1 provisioning profiles, and it installs to /Applications
-# (the Task-1 spike proved the sysex is rejected from ~/Applications with
-# OSSystemExtensionError Code=3). Inferring it from the presence of the profiles made a
-# plain `--debug` build replace the released app in /Applications (2026-10-31), so
-# without --ne the profiles are ignored and the build stays in ~/Applications.
+# identity that both A1 provisioning profiles authorise (tools/ne-preflight.sh resolves
+# it by SHA — a team can hold several same-named certs, and a sysex signed with one the
+# embedded profile does not list fails activation with "code signature invalid"), and it
+# installs to /Applications (the Task-1 spike proved the sysex is rejected from
+# ~/Applications with OSSystemExtensionError Code=3). Inferring it from the presence of
+# the profiles made a plain `--debug` build replace the released app in /Applications
+# (2026-10-31), so without --ne the profiles are ignored and the build stays in
+# ~/Applications.
 ne_app_profile="${NE_APP_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy Host DeveloperID.provisionprofile}"
 ne_sysex_profile="${NE_SYSEX_PROFILE:-$HOME/Library/MobileDevice/Provisioning Profiles/Aitmproxy NE DeveloperID.provisionprofile}"
 ne_identity=""
 if (( want_ne )); then
-  [[ -f "$ne_app_profile" && -f "$ne_sysex_profile" ]] || { echo "--ne needs both NE profiles: $ne_app_profile, $ne_sysex_profile"; exit 1; }
-  ne_identity="${NE_SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null | awk '/Developer ID Application/ {print $2; exit}')}"
-  [[ -n "$ne_identity" ]] || { echo "--ne needs a Developer ID Application identity (or NE_SIGN_IDENTITY)"; exit 1; }
+  ne_identity=$("$here/tools/ne-preflight.sh" "$ne_app_profile" "$ne_sysex_profile") || exit 1
 fi
 
 # An NE build (--ne) installs to /Applications (required for sysex activation); the
@@ -199,6 +206,17 @@ if [[ -n "$sysex_bundle" ]]; then
 fi
 cs "${app_sign_opts[@]}" --sign "$sign_identity" "$app"
 echo "installed $app (signed: ${sign_identity})"
+
+# Nothing here notarizes, and macOS refuses an unnotarized Developer ID system
+# extension at activation (Settings ▸ Capture: "Degraded — Extension activation failed:
+# code signature invalid", measured 2026-10-31). Say so where it cannot be missed.
+if [[ -n "$sysex_bundle" ]]; then
+  echo "WARNING: system extension embedded but NOT notarized — activation will fail with 'code signature invalid' until scripts/notarize-dmg.sh runs; the notarized DMG is the only path to a working capture extension"
+  if (( ! allow_unnotarized )); then
+    echo "build.sh: exit 1 — pass --allow-unnotarized when this build is the input to scripts/notarize-dmg.sh (APP=$app)"
+    exit 1
+  fi
+fi
 
 if [[ " $* " == *" --open "* ]]; then
   osascript -e "quit app \"$name\"" 2>/dev/null || true
