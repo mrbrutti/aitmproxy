@@ -7,7 +7,8 @@ struct SavedPanel: View {
         ContentUnavailableView {
             Label("No Saved Sessions", systemImage: "tray.full")
         } description: {
-            Text("Saving a capture to disk and reopening it later needs the core's session.save. Export Selection… (⌘E) writes the selected flows as HAR, CSV or a cURL batch today.")
+            // Saving and reopening a capture waits on the core (S-066, F10).
+            Text("Saving a capture to disk and reopening it later is not available yet. Export Selection… (⌘E) writes the selected flows as HAR, CSV or a cURL batch.")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)

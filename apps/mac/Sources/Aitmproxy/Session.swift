@@ -455,10 +455,13 @@ final class Session {
         resolvedRole = role
         let expected = ExpectedRole(rawValue: UserDefaults.standard.string(forKey: "bus.expectedRole") ?? "")
         // The embedded core always connects the app as operator; the Expected-role setting
-        // describes an external core, so it cannot warn here (a stale "agent" default would
-        // otherwise show a permanent triangle on a plain install).
-        let embedded = coreHealth.connection?.kind == .embedded
-        roleWarning = !embedded && roleMismatch(expected: expected, resolved: role)
+        // describes an external core. Suppressed only while the embedded core is the ACTIVE
+        // connection (a stale "agent" default would otherwise show a permanent triangle on a
+        // plain install); an external connection keeps the warning even though the dormant
+        // embedded controller still reports a connection.
+        let applies = roleWarningApplies(activeKind: connection?.activeKind ?? .embedded,
+                                         embeddedConnectionPresent: coreHealth.connection?.kind == .embedded)
+        roleWarning = applies && roleMismatch(expected: expected, resolved: role)
     }
 
     /// Proxy ▸ Reconnect Bus: drop and re-open the connection so a newly pasted
@@ -557,7 +560,8 @@ final class Session {
         interceptArmed = true
         scopeHosts = Fixtures.scope
         pins = Pins(hosts: ["api.shop-staging.test", "auth.shop-staging.test"])
-        savedSessions = 3
+        // No saved sessions exist until the core can save a capture (S-066); say so.
+        savedSessions = 0
         findingsCount = 2
         browserTabs = 1
         // The same predicate the Scripts page uses (enabled and no error), so the sidebar count never disagrees with it.

@@ -167,7 +167,7 @@ final class ActivityState {
         }
         guard hasTool("agent.set") else {
             intendedPolicy = policy
-            session.lastError = "agent.set needs F1"
+            session.lastError = "The core cannot change the agent policy yet" // core F1
             return
         }
         confirming = true

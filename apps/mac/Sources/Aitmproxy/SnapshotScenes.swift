@@ -206,7 +206,7 @@ enum SnapshotScene: String, CaseIterable {
         session.sidebarQuery = ""
         session.paletteVisible = false
         if session.layout == .detached {
-            NSApp.windows.first { $0.title == "Inspector" }?.close()
+            Snapshot.inspectorWindow()?.close()
             session.layout = .horizontal
         }
         session.activityLogVisible = false

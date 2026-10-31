@@ -62,7 +62,7 @@ enum SelfTest {
 
             // S-009: sorting never moves the selection; status puts rows without a code last.
             session.sort = FlowSort(key: .status, ascending: false)
-            check("sorting by status puts 502 first and paused last",
+            check("sorting by status puts 502 first and rows without a code last",
                   session.visibleRows.first?.status == 502 && session.visibleRows.last?.status == nil)
             check("sorting keeps the selection", session.focusedRow?.seq == 41 && session.selection.count == 1)
             session.sort = .captureOrder

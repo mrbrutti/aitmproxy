@@ -208,8 +208,7 @@ struct ScopePanel: View {
         .contextMenu {
             Button("Remove from Scope") { remove(entry.host) }
             Button("Copy Host") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(entry.host, forType: .string)
+                Pasteboard.copy(entry.host)
             }
             // Show Flows narrows the Domains page to this host; a wildcard or a host
             // with no captured flows has no group to show, so the item stays out.

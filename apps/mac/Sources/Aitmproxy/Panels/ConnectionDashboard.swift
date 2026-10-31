@@ -20,7 +20,7 @@ struct ConnectionDashboard: View {
         let stats = OverviewStats(rows: rows)
         let series = TrafficSeries(rows: rows)
         HStack(alignment: .top, spacing: Space.md) {
-            DashCard(title: "Traffic over time", trailing: series.total == 1 ? "1 request" : "\(series.total) requests") {
+            DashCard(title: "Traffic over time", trailing: series.total == 1 ? "1 flow" : "\(series.total) flows") {
                 TrafficChart(series: series)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -245,7 +245,7 @@ private struct TrafficChart: View {
                     }
                 }
             }
-            .accessibilityLabel("Traffic over time, \(series.total) requests")
+            .accessibilityLabel("Traffic over time, \(series.total) flows")
         }
     }
 }

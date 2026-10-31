@@ -78,8 +78,7 @@ struct SummaryStrip: View {
                 ExportMenu(detail: detail, row: row)
             } else {
                 Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(row.url, forType: .string)
+                    Pasteboard.copy(row.url, sensitive: true)
                 } label: {
                     Image(systemName: Tok.Glyph.copy).font(.system(size: 12)).foregroundStyle(Tok.Ink.secondary.color)
                         .frame(width: Space.xxl, height: Space.xxl)

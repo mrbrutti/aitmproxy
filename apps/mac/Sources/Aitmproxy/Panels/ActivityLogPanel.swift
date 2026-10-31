@@ -137,20 +137,8 @@ private struct ActivityRow: View {
     }
 
     private func copy(_ text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-    }
-
-    /// The first clause of an error — up to the first sentence break — so a row
-    /// says what went wrong without the whole message; hover has the rest.
-    private static func firstClause(_ message: String) -> String {
-        let oneLine = message.split(whereSeparator: \.isNewline).first.map(String.init) ?? message
-        for separator in [". ", "; ", " — "] {
-            if let range = oneLine.range(of: separator) {
-                return String(oneLine[..<range.lowerBound])
-            }
-        }
-        return oneLine
+        // Arguments carry whatever the command carried (headers, bodies): concealed.
+        Pasteboard.copy(text, sensitive: true)
     }
 
     /// Approve / Deny: full labels on the wide Agent page, compact icon buttons in
@@ -198,7 +186,7 @@ private struct ActivityRow: View {
                     .foregroundStyle(Tok.Status.serverError.color)
                     .fixedSize()
                 if !message.isEmpty {
-                    Text(Self.firstClause(message))
+                    Text(message.firstClause)
                         .font(Tok.Face.data(Tok.Typography.Size.sm))
                         .foregroundStyle(Tok.Ink.secondary.color)
                         .lineLimit(1)

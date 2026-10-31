@@ -345,6 +345,7 @@ private struct L4PacketDetail: View {
                 // bytes (bounded M5 store). The craft editor's build() preview shows
                 // crafted bytes in hex; captured bytes are not transported.
                 Hint(text: "The captured bytes aren't kept here. Use Craft → Build to see crafted bytes in hex.")
+                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             }
             .padding(Space.md)
             .frame(maxWidth: .infinity, alignment: .topLeading)

@@ -117,8 +117,7 @@ struct ScriptsPanel: View {
         .contextMenu {
             Button(script.enabled ? "Disable" : "Enable") { setEnabled(script, !script.enabled) }
             Button("Copy Rule") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(script.ruleSummary, forType: .string)
+                Pasteboard.copy(script.ruleSummary)
             }
         }
         .accessibilityAddTraits(script.id == selected ? .isSelected : [])

@@ -162,8 +162,7 @@ final class PocPanelState {
 
     /// Copy the finding's target URL to the clipboard.
     func copyTarget(_ finding: Finding) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(finding.target, forType: .string)
+        Pasteboard.copy(finding.target, sensitive: true)
     }
 
     /// Move the selection up or down one row (arrow keys on the list).

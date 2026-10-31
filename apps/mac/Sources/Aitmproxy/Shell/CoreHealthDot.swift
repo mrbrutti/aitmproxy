@@ -43,16 +43,3 @@ struct CoreHealthDot: View {
         return lines.joined(separator: "\n")
     }
 }
-
-extension CoreHealth {
-    /// The one status-bar word per core state, shared by the toolbar pill and
-    /// the health dot so they never disagree (B10). Lower case: it follows a
-    /// dot or a "·" mid-sentence.
-    var statusWord: String {
-        switch self {
-        case .running: "core running"
-        case .restarting: "restarting…"
-        case .failed: "core failed"
-        }
-    }
-}

@@ -277,12 +277,6 @@ struct FlatSegment<Value: Hashable>: View {
     var disabledOptions: Set<Value> = []
     @Environment(\.isEnabled) private var isEnabled
 
-    init(options: [(Value, String)], selection: Binding<Value>, disabledOptions: Set<Value> = []) {
-        self.options = options
-        _selection = selection
-        self.disabledOptions = disabledOptions
-    }
-
     var body: some View {
         HStack(spacing: 2) {
             ForEach(options, id: \.0) { value, title in

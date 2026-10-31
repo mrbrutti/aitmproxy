@@ -68,7 +68,7 @@ enum Snapshot {
                     scene.apply(to: session)
                     try? await Task.sleep(for: .seconds(0.8))
                     capture(to: "\(dir)/\(scene.rawValue)-\(mode).png")
-                    if scene == .detached, let inspector = NSApp.windows.first(where: { $0.title == "Inspector" }) {
+                    if scene == .detached, let inspector = Snapshot.inspectorWindow() {
                         inspector.setContentSize(NSSize(width: 1100, height: 620))
                         try? await Task.sleep(for: .seconds(0.4))
                         capture(to: "\(dir)/\(scene.rawValue)-window-\(mode).png", window: inspector)
@@ -112,6 +112,14 @@ enum Snapshot {
             // An open sheet refuses terminate, and the run would wait forever.
             for window in NSApp.windows { if let sheet = window.attachedSheet { window.endSheet(sheet) } }
             NSApp.terminate(nil)
+        }
+    }
+
+    /// The detached inspector window, found by its scene id: its title names the focused
+    /// flow (rule 19), so a title match would miss it.
+    static func inspectorWindow() -> NSWindow? {
+        NSApp.windows.first { window in
+            (window.identifier?.rawValue.hasPrefix("inspector") ?? false) || window.title == "Inspector"
         }
     }
 

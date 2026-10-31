@@ -59,7 +59,7 @@ public struct OverviewBreakdowns: Hashable, Sendable {
             .map { MethodCount($0.key, $0.value) }
 
         var byClient: [String: Int] = [:]
-        for row in rows { if let name = row.client?.name { byClient[name, default: 0] += 1 } }
+        for row in http { if let name = row.client?.name { byClient[name, default: 0] += 1 } }
         clients = byClient
             .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
             .map { ClientCount($0.key, $0.value) }

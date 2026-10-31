@@ -24,6 +24,9 @@ struct FlowTableView: NSViewRepresentable {
     var onFocus: (FlowID?) -> Void
     /// A verb from the keyboard or the context menu, with the row it targets.
     var onAction: (FlowRowAction, FlowID) -> Void = { _, _ in }
+    /// Pending draft edits per flow: the row menu titles Resume vs Apply & Resume from the same
+    /// predicate as the intercept bar and the Flow menu.
+    @Environment(Session.self) private var session
     var onToggleIntercept: () -> Void = {}
     var onCompose: () -> Void = {}
 
@@ -96,6 +99,7 @@ struct FlowTableView: NSViewRepresentable {
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         let coordinator = context.coordinator
         coordinator.parent = self
+        coordinator.pendingEdits = { [session] id in session.pendingEditCount(id) }
         guard let table = coordinator.table else { return }
         if coordinator.density != density {
             coordinator.density = density
@@ -134,6 +138,7 @@ struct FlowTableView: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
         var parent: FlowTableView
+        var pendingEdits: (FlowID) -> Int = { _ in 0 }
         var rows: [FlowRow] = []
         var density: Density
         var appliedSort: FlowSort = .captureOrder
@@ -334,7 +339,8 @@ struct FlowTableView: NSViewRepresentable {
                 menu.addItem(item)
             }
             let paused = row.state == .paused
-            add(row.edited ? "Apply & Resume" : "Resume", .resume, enabled: paused)
+            // One predicate with the bar and the Flow menu: pending drafts, not the applied flag.
+            add(pendingEdits(row.id) > 0 ? "Apply & Resume" : "Resume", .resume, enabled: paused)
             add("Edit Paused Request", .edit, key: "e", enabled: paused)
             add(paused || row.state == .pending ? "Kill" : "Delete", .delete, key: "d")
             menu.addItem(.separator())

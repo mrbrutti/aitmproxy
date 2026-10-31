@@ -39,11 +39,15 @@ public enum Format {
 
     /// `11:04:58.120` — wall-clock time with milliseconds, local zone.
     public static func time(_ date: Date, zone: TimeZone = .current) -> String {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = zone
-        let c = calendar.dateComponents([.hour, .minute, .second, .nanosecond], from: date)
+        let c = clock(date, zone: zone)
         return String(format: "%02d:%02d:%02d.%03d", c.hour ?? 0, c.minute ?? 0, c.second ?? 0,
                       (c.nanosecond ?? 0) / 1_000_000)
+    }
+
+    private static func clock(_ date: Date, zone: TimeZone) -> DateComponents {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        return calendar.dateComponents([.hour, .minute, .second, .nanosecond], from: date)
     }
 
     public static func time(_ date: Date?) -> String { date.map { time($0) } ?? dash }
@@ -51,9 +55,7 @@ public enum Format {
     /// `11:04:58` — wall-clock time to the second, local zone. For chart axis
     /// ticks and narrow panels where the milliseconds of `time` would truncate.
     public static func clockTime(_ date: Date, zone: TimeZone = .current) -> String {
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = zone
-        let c = calendar.dateComponents([.hour, .minute, .second], from: date)
+        let c = clock(date, zone: zone)
         return String(format: "%02d:%02d:%02d", c.hour ?? 0, c.minute ?? 0, c.second ?? 0)
     }
 
@@ -91,5 +93,17 @@ public enum Format {
         if digits.count > 3 { digits = String(digits.prefix(3)) }
         else { digits += String(repeating: "0", count: 3 - digits.count) }
         return String(s[..<start]) + digits + String(s[end...])
+    }
+}
+
+extension String {
+    /// The first clause of a message — the first line, cut at the first sentence break — so a
+    /// row can say what went wrong without the whole text; the rest belongs in a tooltip.
+    public var firstClause: String {
+        let oneLine = split(whereSeparator: \.isNewline).first.map(String.init) ?? self
+        for separator in [". ", "; ", " — "] {
+            if let range = oneLine.range(of: separator) { return String(oneLine[..<range.lowerBound]) }
+        }
+        return oneLine
     }
 }

@@ -12,6 +12,7 @@
 set -u
 here=${0:A:h:h}
 name=Aitmproxy
+[[ -z ${DEV_TAG:-} || $DEV_TAG =~ ^[A-Za-z0-9_-]+$ ]] || { echo "DEV_TAG must match [A-Za-z0-9_-]+"; exit 1; }
 tag=${DEV_TAG:+-$DEV_TAG}
 scratch="$HOME/Library/Developer/$name/ui-redesign$tag"
 pages=${1:-}

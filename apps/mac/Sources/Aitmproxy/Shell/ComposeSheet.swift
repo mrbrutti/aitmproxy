@@ -93,13 +93,8 @@ struct ComposeSheet: View {
         .frame(width: 880, height: 560)
         .background(Tok.Ground.surface.color)
         // Open calm (rule 51): nothing selected. The one exception is an empty URL, which
-        // takes focus a beat after the sheet is key so the calm-open hook does not clear it.
-        .noInitialFocus()
-        .task {
-            guard session.composeDraft.url.isEmpty else { return }
-            try? await Task.sleep(for: .milliseconds(80))
-            urlFocused = true
-        }
+        // takes focus right after the calm-open hook has cleared the first responder.
+        .noInitialFocus { if session.composeDraft.url.isEmpty { urlFocused = true } }
     }
 
     private var templates: some View {

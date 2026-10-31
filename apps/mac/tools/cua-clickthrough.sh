@@ -26,6 +26,9 @@ fail=0
 pass() { print "PASS $1" }
 bad()  { print "FAIL $1"; fail=1 }
 se() { osascript -e "tell application \"System Events\" to tell process \"$PROC\" to $1" 2>/dev/null }
+# Only ever drive the process this script launched: a name clash (the installed app running
+# beside a dev build) must not move its window or click Resume on a real paused flow.
+owner=$(se 'return unix id'); [ "${owner:-}" = "$PID" ] || { bad "process $PROC is pid ${owner:-none}, not the launched $PID"; kill $PID 2>/dev/null; exit 1 }
 se 'set frontmost to true' >/dev/null; sleep 1
 
 # --- normalize window to a known origin so pixel math is deterministic ---

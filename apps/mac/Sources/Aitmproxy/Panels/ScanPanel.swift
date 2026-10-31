@@ -367,8 +367,7 @@ struct ScanEndpointRow: View {
                 Button("Open Flow", action: open).disabled(!openable)
             }
             Button("Copy URL") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(url, forType: .string)
+                Pasteboard.copy(url, sensitive: true)
             }
         }
         .accessibilityElement(children: .ignore)

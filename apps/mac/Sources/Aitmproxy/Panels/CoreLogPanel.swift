@@ -70,7 +70,7 @@ struct CoreLogPanel: View {
                 HStack(spacing: Tok.Metric.gapTight) {
                     Circle().fill(connection.health.dotColor.color)
                         .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                    Text(connection.status.healthTitle)
+                    Text(connection.health.statusWord)
                         .font(Tok.Face.data(Tok.Typography.Size.sm))
                         .foregroundStyle(Tok.Ink.secondary.color)
                 }

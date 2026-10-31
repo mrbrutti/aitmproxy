@@ -17,10 +17,14 @@ let candidates = list.filter { info in
 guard let win = candidates.first, let number = win[kCGWindowNumber as String] as? Int else {
     FileHandle.standardError.write(Data("no on-screen window for \(owner)\n".utf8)); exit(1)
 }
+// A stale PNG from an earlier run must never pass as this run's proof.
+try? FileManager.default.removeItem(atPath: out)
 let shot = Process()
 shot.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
 shot.arguments = ["-x", "-o", "-l", String(number), out]
-try? shot.run(); shot.waitUntilExit()
+do { try shot.run() } catch { FileHandle.standardError.write(Data("screencapture failed to start: \(error)\n".utf8)); exit(1) }
+shot.waitUntilExit()
+guard shot.terminationStatus == 0 else { exit(Int32(shot.terminationStatus)) }
 // window number, then the window's screen bounds in points (x y w h) for pixel-path clicks.
 let b = win[kCGWindowBounds as String] as? [String: Any] ?? [:]
 print(number, Int(b["X"] as? Double ?? 0), Int(b["Y"] as? Double ?? 0), Int(b["Width"] as? Double ?? 0), Int(b["Height"] as? Double ?? 0))

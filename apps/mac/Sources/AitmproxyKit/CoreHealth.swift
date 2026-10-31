@@ -20,12 +20,14 @@ public enum CoreHealth: Hashable, Sendable, CaseIterable {
         }
     }
 
-    /// The health word, matching the three dot states the spec names.
-    public var title: String {
+    /// The one status-bar word per core state, shared by the toolbar pill and the health
+    /// dot so they never disagree. Lower case: it follows a dot or a "·" mid-sentence.
+    /// `CoreConnection.Status.healthTitle` keeps the finer per-status word for the log.
+    public var statusWord: String {
         switch self {
-        case .running: "Running"
-        case .restarting: "Restarting"
-        case .failed: "Failed"
+        case .running: "core running"
+        case .restarting: "restarting…"
+        case .failed: "core failed"
         }
     }
 }

@@ -19,8 +19,8 @@ import Testing
     @Test func pinnedQueryNarrowsToPinnedHostsAndApps() {
         let pins = Pins(hosts: ["auth.shop-staging.test"], apps: ["curl"])
         let rows = FlowQuery(pins: pins).apply(Fixtures.rows + Fixtures.l4Rows, details: [:])
-        #expect(!rows.isEmpty)
-        #expect(rows.allSatisfy { $0.authority == "auth.shop-staging.test" || $0.client?.name == "curl" })
+        // curl's three flows (45, 49, 50) plus the auth host (50, already in): capture order.
+        #expect(rows.map(\.seq) == [45, 49, 50])
         #expect(FlowQuery(pins: Pins()).apply(Fixtures.rows, details: [:]).isEmpty)
     }
 }

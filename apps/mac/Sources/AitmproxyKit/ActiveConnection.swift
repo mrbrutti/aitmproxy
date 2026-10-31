@@ -48,6 +48,14 @@ public protocol ActiveKindPersistence: AnyObject {
 }
 
 /// `UserDefaults`-backed persistence for the active-core choice, under
+/// Whether the status bar's Expected-role warning applies. The embedded core always
+/// connects the app as operator, so the warning describes an external core: it is
+/// suppressed only while the embedded core is the ACTIVE connection and present. An
+/// external connection with a dormant embedded controller still warns.
+public func roleWarningApplies(activeKind: ActiveCoreKind, embeddedConnectionPresent: Bool) -> Bool {
+    !(activeKind == .embedded && embeddedConnectionPresent)
+}
+
 /// `bus.activeKind` (the key `BusSettings` binds to as well).
 public final class UserDefaultsActiveKindPersistence: ActiveKindPersistence {
     public static let key = "bus.activeKind"
