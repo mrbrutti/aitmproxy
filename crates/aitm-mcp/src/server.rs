@@ -423,6 +423,13 @@ struct Subscriptions {
 struct SubState {
     next_sub: u64,
     subs: Vec<Subscription>,
+    /// The connections that had a line suppressed under a muted policy and have
+    /// not yet been told (so the first delivery after the mute is preceded by the
+    /// `lagged` marker). Per connection, never a single registry-wide flag: the
+    /// first delivery would clear a flag and a second connection would never be
+    /// told. Written and cleared only inside [`Subscriptions::fanout`] and
+    /// [`Subscriptions::drop_connection`], under the registry lock.
+    gapped: Vec<u64>,
 }
 
 impl Subscriptions {
@@ -473,17 +480,82 @@ impl Subscriptions {
         self.lock().subs.iter().any(|s| s.role == role)
     }
 
-    /// Push `line` to each subscribed connection of `role` (once per connection).
-    fn fanout_role(&self, role: Frontend, line: &str) {
-        let st = self.lock();
+    /// The one fan-out. Every `fanout_*` entry point is a thin wrapper that supplies
+    /// only its own `wants` test ("does this subscription take this line"), so this
+    /// is the **only** code that enqueues to a subscription's sink on a fan-out: a
+    /// future fourth fan-out cannot forget the mute, because `pushes_muted` is a
+    /// required argument here and not something each caller remembers.
+    ///
+    /// Per call, in order: take the registry lock; **then** call `pushes_muted()`
+    /// once, so one policy snapshot covers every subscription in the call and the
+    /// read is as late as it can be. Then walk the subscriptions in registry order,
+    /// at most once per connection, skipping a subscription `wants` rejects (which
+    /// does not mark its connection as seen) and then:
+    ///
+    /// - a subscription whose role is not trusted control
+    ///   ([`Frontend::is_trusted_control`]) while pushes are muted gets nothing, and
+    ///   its connection is recorded in `gapped` (once);
+    /// - anything else gets the line, preceded by one `lagged` state line iff its
+    ///   connection is recorded in `gapped` (which is cleared then).
+    ///
+    /// The `wants` test runs before the mute check, so a connection is marked only
+    /// when a line it would have received was suppressed. The gap is per connection
+    /// (see [`SubState::gapped`]). The marker rides the first delivery after the
+    /// gap; it is never sent while muted, and it is deliberately **not** the sink's
+    /// own overflow flag: setting that at suppression time would be written by the
+    /// next `drain` while the policy is still muted and leak a bit under pause.
+    ///
+    /// Accepted residuals of the live-policy guarantee, each stated so a reviewer can
+    /// disagree with it:
+    ///
+    /// - R1: lines already queued in an agent sink may still be written; they were
+    ///   granted when queued, nothing is purged, and the bound is the sink capacity.
+    /// - R2: a `flow.subscribe {since}` past the gate just before the flip may replay
+    ///   just after it (the replay is not a fan-out and is untouched).
+    /// - R3: a policy flap shorter than one parked-waiter slice is not seen.
+    /// - R4: a parked call past its post-wake recheck is in flight.
+    /// - R5: a fan-out that read the policy just before the flip may enqueue just
+    ///   after it; the read is taken inside the registry lock to keep that window to
+    ///   the loop body.
+    fn fanout(
+        &self,
+        pushes_muted: &dyn Fn() -> bool,
+        wants: &dyn Fn(&Subscription) -> bool,
+        line: &str,
+    ) {
+        let mut guard = self.lock();
+        let muted = pushes_muted();
+        let st = &mut *guard;
         let mut seen: Vec<u64> = Vec::new();
         for sub in &st.subs {
-            if sub.role != role || seen.contains(&sub.conn_id) {
+            if seen.contains(&sub.conn_id) || !wants(sub) {
                 continue;
             }
             seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
+            if muted && !sub.role.is_trusted_control() {
+                if !st.gapped.contains(&sub.conn_id) {
+                    st.gapped.push(sub.conn_id);
+                }
+                continue;
+            }
+            let marker = match st.gapped.iter().position(|c| *c == sub.conn_id) {
+                Some(at) => {
+                    st.gapped.swap_remove(at);
+                    Some(lagged_state_line())
+                }
+                None => None,
+            };
+            for out in marker.into_iter().chain(std::iter::once(line.to_string())) {
+                sub.sink.push(out);
+            }
         }
+    }
+
+    /// Push `line` to each subscribed connection of `role` (once per connection),
+    /// through [`Subscriptions::fanout`]: an agent-role connection is not enqueued
+    /// the line while `pushes_muted` says so.
+    fn fanout_role(&self, role: Frontend, line: &str, pushes_muted: &dyn Fn() -> bool) {
+        self.fanout(pushes_muted, &|sub| sub.role == role, line);
     }
 
     /// Remove `sub_id` if it belongs to `conn_id`. Returns whether it existed.
@@ -495,37 +567,29 @@ impl Subscriptions {
         st.subs.len() != before
     }
 
-    /// Drop every subscription belonging to `conn_id` (connection ended).
+    /// Drop every subscription belonging to `conn_id` (connection ended), and its
+    /// recorded gap if it has one, under the same lock: connection ids are never
+    /// reused, so a gap left behind could never be cleared and would leak.
     fn drop_connection(&self, conn_id: u64) {
-        self.lock().subs.retain(|s| s.conn_id != conn_id);
+        let mut st = self.lock();
+        st.subs.retain(|s| s.conn_id != conn_id);
+        st.gapped.retain(|c| *c != conn_id);
     }
 
     /// Push `line` to each connection with at least one subscription matching
-    /// `flow` (at most once per connection, even with several matching subs).
-    fn fanout_flow(&self, flow: &Flow, line: &str) {
-        let st = self.lock();
-        let mut seen: Vec<u64> = Vec::new();
-        for sub in &st.subs {
-            if seen.contains(&sub.conn_id) || !sub.filter.matches(flow) {
-                continue;
-            }
-            seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
-        }
+    /// `flow` (at most once per connection, even with several matching subs),
+    /// through [`Subscriptions::fanout`]: an agent-role connection is not enqueued
+    /// the line while `pushes_muted` says so.
+    fn fanout_flow(&self, flow: &Flow, line: &str, pushes_muted: &dyn Fn() -> bool) {
+        self.fanout(pushes_muted, &|sub| sub.filter.matches(flow), line);
     }
 
     /// Push `line` to every subscribed connection (once each), regardless of
-    /// filter — state changes concern the whole session.
-    fn fanout_state(&self, line: &str) {
-        let st = self.lock();
-        let mut seen: Vec<u64> = Vec::new();
-        for sub in &st.subs {
-            if seen.contains(&sub.conn_id) {
-                continue;
-            }
-            seen.push(sub.conn_id);
-            sub.sink.push(line.to_string());
-        }
+    /// filter — state changes concern the whole session — through
+    /// [`Subscriptions::fanout`]: an agent-role connection is not enqueued the line
+    /// while `pushes_muted` says so.
+    fn fanout_state(&self, line: &str, pushes_muted: &dyn Fn() -> bool) {
+        self.fanout(pushes_muted, &|_sub| true, line);
     }
 }
 
@@ -1006,14 +1070,33 @@ impl McpServer {
     }
 
     /// Drop every subscription a connection held (called by the transport when
-    /// the connection ends).
+    /// the connection ends), and the record that it had a push suppressed while
+    /// the agent policy was `paused` (see [`McpServer::push_flow_event`]), so the
+    /// per-connection gap set cannot outlive the connection.
     pub fn drop_connection(&self, conn_id: u64) {
         self.subscriptions.drop_connection(conn_id);
+    }
+
+    /// Whether pushes to a non-trusted-control (agent-role) subscription are
+    /// suppressed right now: the live agent policy, read from the shared
+    /// [`AgentState`] at the moment of the push. It is the same decision
+    /// `read_refusal` makes for a fresh `flow.subscribe`, through the one predicate
+    /// `agent_reads_allowed`, so "may subscribe" and "receives pushes" cannot drift.
+    fn agent_pushes_muted(&self) -> bool {
+        !agent_reads_allowed(self.agent_state.policy())
     }
 
     /// Render `ev` as a `notifications/aitm/flow` line and fan it to every
     /// subscription whose filter matches the event's flow. Non-blocking; a slow
     /// subscriber's sink absorbs or drops the line without stalling the caller.
+    ///
+    /// While the agent policy is `paused` the line is **not enqueued** for a
+    /// non-trusted-control (agent-role) subscription; that connection is recorded
+    /// as having a gap, and the first line delivered to it after the policy relaxes
+    /// is preceded by one `notifications/aitm/state {"lagged":true}` marker ("catch
+    /// up via `flow.list`"). Operator and CLI subscriptions are never muted. The
+    /// policy is read at the push, from the state this server shares with every
+    /// other server on it, so an `agent.set` run anywhere takes effect here.
     pub fn push_flow_event(&self, ev: &Event) {
         let Some(id) = event_flow_id(ev) else {
             return;
@@ -1034,11 +1117,17 @@ impl McpServer {
             },
         })
         .to_string();
-        self.subscriptions.fanout_flow(&flow, &line);
+        self.subscriptions
+            .fanout_flow(&flow, &line, &|| self.agent_pushes_muted());
     }
 
     /// Render a `notifications/aitm/state` line from `state` (a params object)
     /// and fan it to every subscribed connection. Non-blocking.
+    ///
+    /// Under the `paused` agent policy the line is not enqueued for an agent-role
+    /// subscription (a gap is recorded and the marker rides the first delivery
+    /// after resume, exactly as for [`McpServer::push_flow_event`]); operator and
+    /// CLI subscriptions always receive it.
     pub fn push_state(&self, state: JsonValue) {
         let line = json!({
             "jsonrpc": "2.0",
@@ -1046,7 +1135,8 @@ impl McpServer {
             "params": state,
         })
         .to_string();
-        self.subscriptions.fanout_state(&line);
+        self.subscriptions
+            .fanout_state(&line, &|| self.agent_pushes_muted());
     }
 
     /// The shared agent-policy state the policy gate reads and `agent.set` writes.
@@ -1647,6 +1737,13 @@ impl McpServer {
     /// subscribed connection (the agent stream concerns the whole session, so it
     /// is not flow-filtered). Non-blocking; a slow subscriber's sink absorbs or
     /// drops the line without stalling the caller (spec D3a.3).
+    ///
+    /// Under the `paused` agent policy the line is not enqueued for an agent-role
+    /// subscription, which includes the audit line of the `agent.set paused` that
+    /// caused the pause (it is pushed after the policy flipped); a gap is recorded
+    /// and the marker rides the first delivery after resume (see
+    /// [`McpServer::push_flow_event`]). Operator and CLI subscriptions always
+    /// receive it.
     pub fn push_agent(&self, entry: &AuditEntry) {
         let line = json!({
             "jsonrpc": "2.0",
@@ -1654,7 +1751,8 @@ impl McpServer {
             "params": to_json(&entry.to_value()),
         })
         .to_string();
-        self.subscriptions.fanout_state(&line);
+        self.subscriptions
+            .fanout_state(&line, &|| self.agent_pushes_muted());
     }
 
     /// The D2 policy decision for one command on one connection. Every role that is
@@ -1792,7 +1890,8 @@ impl McpServer {
             },
         })
         .to_string();
-        self.subscriptions.fanout_role(Frontend::Operator, &line);
+        self.subscriptions
+            .fanout_role(Frontend::Operator, &line, &|| self.agent_pushes_muted());
     }
 
     /// Resolve a parked `Ask` request (`agent.approve`, spec D4). Operator/CLI only:
@@ -1831,17 +1930,24 @@ impl McpServer {
     /// `Some(reason)` only when the agent policy is `Paused` (which refuses all) and
     /// the role is not trusted control ([`Frontend::is_trusted_control`]), `None`
     /// otherwise. Operator/CLI always pass.
+    ///
+    /// This is the read-side half of the one predicate `agent_reads_allowed`; the
+    /// push side asks the same predicate through `McpServer::agent_pushes_muted`, so
+    /// a fresh subscribe is accepted exactly when a push would be delivered. The
+    /// refusal text is unchanged.
     fn read_refusal(&self, conn: &ConnCtx, name: &str) -> Option<String> {
         if conn.role.is_trusted_control() {
             return None;
         }
-        match self.agent_state.policy() {
-            AgentPolicy::Paused => Some(format!(
-                "`{name}` refused: the agent policy is `paused`; no agent command runs. An operator \
-                 can change it with agent.set."
-            )),
-            _ => None,
+        let policy = self.agent_state.policy();
+        if agent_reads_allowed(policy) {
+            return None;
         }
+        Some(format!(
+            "`{name}` refused: the agent policy is `{}`; no agent command runs. An operator \
+             can change it with agent.set.",
+            policy.label()
+        ))
     }
 
     /// Enforce a server-handled verb's published schema. `flow.subscribe`,
@@ -2096,6 +2202,21 @@ fn defers_to_command_gate(name: &str) -> bool {
 /// (and any future operator-only Sensitive command) from being parked.
 fn is_operator_only(name: &str) -> bool {
     matches!(name, "agent.set" | "agent.approve" | "l4.agent.set")
+}
+
+/// The one decision behind both "may an agent-role caller subscribe now"
+/// (`read_refusal`) and "does an agent-role subscription receive pushes now"
+/// (`McpServer::agent_pushes_muted`): a push is a read channel, so pushes are
+/// allowed to exactly the extent that reads are. `false` for `Paused`, `true` for
+/// every other value.
+///
+/// `true` includes an unknown future posture (`AgentPolicy` is
+/// `#[non_exhaustive]`). That fail-open is deliberate and is the one place this
+/// repo's "a future posture fails closed" doctrine is not followed: it is exactly
+/// what `read_refusal` always did, and the push side follows it so the two cannot
+/// drift. Whoever adds a variant decides its posture here, once.
+fn agent_reads_allowed(policy: AgentPolicy) -> bool {
+    policy != AgentPolicy::Paused
 }
 
 /// The agent-policy gate's decision for one command (spec D2/D4).
@@ -2356,5 +2477,255 @@ mod tests {
     #[test]
     fn mcp_host_without_wiring_carries_no_posture() {
         assert_eq!(probe(&probe_server()), json!("absent"));
+    }
+
+    // ------------------- agent policy revocation, Task 1 (plan 2026-10-30)
+
+    /// A server whose agent policy is `policy`, with nothing else attached.
+    fn revoke_server_under(policy: AgentPolicy) -> McpServer {
+        McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_agent_state(Arc::new(AgentState::new(policy)))
+    }
+
+    /// AC21 (guard, passes before and after the predicate is extracted): the
+    /// `paused` refusal for the two subscription verbs is byte for byte the text it
+    /// always was, and `read_refusal` still refuses only a non-trusted-control role,
+    /// only under `Paused`.
+    #[test]
+    fn revoke_read_refusal_text_is_unchanged() {
+        let paused = revoke_server_under(AgentPolicy::Paused);
+        assert_eq!(
+            paused.read_refusal(&ConnCtx::agent(), "flow.subscribe"),
+            Some(
+                "`flow.subscribe` refused: the agent policy is `paused`; no agent command runs. \
+                 An operator can change it with agent.set."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            paused.read_refusal(&ConnCtx::agent(), "flow.unsubscribe"),
+            Some(
+                "`flow.unsubscribe` refused: the agent policy is `paused`; no agent command runs. \
+                 An operator can change it with agent.set."
+                    .to_string()
+            )
+        );
+        for role in [Frontend::Operator, Frontend::Cli] {
+            assert_eq!(
+                paused.read_refusal(&ConnCtx::new(role), "flow.subscribe"),
+                None,
+                "{role:?} is never refused under Paused"
+            );
+        }
+        for policy in [
+            AgentPolicy::All,
+            AgentPolicy::Auto,
+            AgentPolicy::Ask,
+            AgentPolicy::ReadOnly,
+        ] {
+            assert_eq!(
+                revoke_server_under(policy).read_refusal(&ConnCtx::agent(), "flow.subscribe"),
+                None,
+                "the agent is not refused under {policy:?}"
+            );
+        }
+    }
+
+    use aitm_core::{Body, ConnInfo, FlowMeta, HeaderMap, HttpVersion, InterceptState};
+
+    /// Insert a minimal HTTP flow into `store`; returns its id.
+    fn revoke_insert_flow(store: &MemFlowStore) -> FlowId {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        store.insert(Flow::Http(HttpFlow {
+            id: FlowId::new(),
+            request: HttpRequest {
+                method: "GET".into(),
+                scheme: "http".into(),
+                authority: "example.com:443".into(),
+                path: "/x".into(),
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            },
+            response: None,
+            client_conn: ConnInfo {
+                peer: addr,
+                sni: None,
+                alpn: None,
+                tls: false,
+                established: SystemTime::now(),
+            },
+            server_conn: None,
+            metadata: FlowMeta::default(),
+            intercept: InterceptState::Observed,
+        }))
+    }
+
+    /// Design 3 ("required, or it leaks"): the per-connection gap record is removed
+    /// by `drop_connection`. Connection ids are monotonic and never reused, so a
+    /// leaked entry could never be cleared again; it is observable only through the
+    /// private field, which this in-file module can read.
+    #[test]
+    fn revoke_gap_is_dropped_with_its_connection() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let store = Arc::new(MemFlowStore::new());
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_agent_state(state.clone())
+            .with_services(
+                store.clone(),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+        // An agent-role connection with a push sink, subscribed through the real verb
+        // (an unregistered verb has no published schema, so it is not schema-checked).
+        let conn = ConnCtx {
+            conn_id: srv.next_conn_id(),
+            out: Some(NotificationSink::new(16)),
+            ..ConnCtx::agent()
+        };
+        let reply = srv
+            .handle_on(
+                &conn,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "flow.subscribe", "arguments": {}}})
+                .to_string(),
+            )
+            .expect("flow.subscribe replies");
+        let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+        assert!(
+            reply["result"]["structuredContent"]["sub_id"].is_u64(),
+            "setup: the agent subscribes under Auto: {reply}"
+        );
+
+        // One suppressed flow push records the connection's gap.
+        state.set_policy(AgentPolicy::Paused);
+        let id = revoke_insert_flow(&store);
+        srv.push_flow_event(&Event::RequestHeaders(id));
+        assert_eq!(
+            srv.subscriptions.lock().gapped,
+            vec![conn.conn_id],
+            "setup: a suppressed push records the connection's gap"
+        );
+
+        srv.drop_connection(conn.conn_id);
+        assert!(
+            srv.subscriptions.lock().gapped.is_empty(),
+            "gapped must be empty after drop_connection"
+        );
+    }
+
+    // ------------------- Tester additions (stage 5): the gap record's bounds
+
+    /// A server over `state` and a fresh store, with an empty registry (an
+    /// unregistered verb is not schema-checked, so `flow.subscribe` is served by
+    /// the server itself, as in the test above).
+    fn revoke_server_with_store(state: &Arc<AgentState>) -> (McpServer, Arc<MemFlowStore>) {
+        let store = Arc::new(MemFlowStore::new());
+        let srv = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+            .with_agent_state(state.clone())
+            .with_services(
+                store.clone(),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+        (srv, store)
+    }
+
+    /// A new connection (a role taken from `base`, its own sink and id) subscribed
+    /// through the real `flow.subscribe` verb with no filter.
+    fn revoke_subscribe(srv: &McpServer, base: ConnCtx) -> ConnCtx {
+        let conn = ConnCtx {
+            conn_id: srv.next_conn_id(),
+            out: Some(NotificationSink::new(16)),
+            ..base
+        };
+        let reply = srv
+            .handle_on(
+                &conn,
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": "flow.subscribe", "arguments": {}}})
+                .to_string(),
+            )
+            .expect("flow.subscribe replies");
+        let reply: JsonValue = serde_json::from_str(&reply).expect("the reply is JSON");
+        assert!(
+            reply["result"]["structuredContent"]["sub_id"].is_u64(),
+            "setup: the subscribe is accepted: {reply}"
+        );
+        conn
+    }
+
+    /// The gap record is one entry per connection, however many pushes were
+    /// suppressed (so a long pause cannot grow it, and a connection is not marked
+    /// more than once), and `drop_connection` removes only its own connection's
+    /// entry.
+    #[test]
+    fn revoke_gap_is_one_entry_per_connection_however_many_pushes() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let (srv, store) = revoke_server_with_store(&state);
+        let first = revoke_subscribe(&srv, ConnCtx::agent());
+        let second = revoke_subscribe(&srv, ConnCtx::agent());
+
+        state.set_policy(AgentPolicy::Paused);
+        for n in 0..500 {
+            let id = revoke_insert_flow(&store);
+            srv.push_flow_event(&Event::RequestHeaders(id));
+            srv.push_state(json!({ "n": n }));
+        }
+        let mut gapped = srv.subscriptions.lock().gapped.clone();
+        assert_eq!(
+            gapped.len(),
+            2,
+            "1000 suppressed pushes leave exactly one record per connection"
+        );
+        gapped.sort_unstable();
+        assert_eq!(
+            gapped,
+            vec![first.conn_id, second.conn_id],
+            "the two records are the two subscribed connections"
+        );
+
+        srv.drop_connection(first.conn_id);
+        assert_eq!(
+            srv.subscriptions.lock().gapped,
+            vec![second.conn_id],
+            "drop_connection removes only its own connection's record"
+        );
+    }
+
+    /// A gap is recorded only for a connection that lost a line: not when nobody is
+    /// subscribed, and never for a trusted-control (operator or CLI) subscription,
+    /// which is not muted and so receives every push under `Paused`.
+    #[test]
+    fn revoke_gap_is_never_recorded_for_nobody_or_for_trusted_control() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Paused));
+        let (srv, store) = revoke_server_with_store(&state);
+
+        srv.push_flow_event(&Event::RequestHeaders(revoke_insert_flow(&store)));
+        srv.push_state(json!({"n": 0}));
+        assert!(
+            srv.subscriptions.lock().gapped.is_empty(),
+            "no subscriber, so no gap"
+        );
+
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+        let cli = revoke_subscribe(&srv, ConnCtx::new(Frontend::Cli));
+        srv.push_flow_event(&Event::RequestHeaders(revoke_insert_flow(&store)));
+        srv.push_state(json!({"n": 1}));
+        assert!(
+            srv.subscriptions.lock().gapped.is_empty(),
+            "operator and CLI subscriptions are never muted, so never gapped"
+        );
+        for (name, conn) in [("operator", &operator), ("cli", &cli)] {
+            let sink = conn.out.as_ref().expect("the connection has a sink");
+            assert_eq!(
+                sink.drain().len(),
+                2,
+                "the {name} subscription received the flow and the state line under Paused"
+            );
+        }
     }
 }
