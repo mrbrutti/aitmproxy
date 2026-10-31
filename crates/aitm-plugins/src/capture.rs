@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aitm_core::{
     Body, Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
@@ -183,36 +182,20 @@ fn summary_fields() -> Vec<ParamDef> {
     ]
 }
 
-/// A buffered body's size in bytes, or `Null` while it is still streaming from the
-/// wire and the size is not known yet. Lets a UI total the traffic it has seen
-/// (the macOS status bar's ↑ / ↓ rate) without fetching a single body.
+/// A body's reported size ([`Body::buffered_len`]) as a `Value`: the byte count,
+/// or `Null` while it is still streaming from the wire and the size is not known
+/// yet. Lets a UI total the traffic it has seen (the macOS status bar's ↑ / ↓
+/// rate) without fetching a single body.
 fn body_bytes(body: &Body) -> Value {
-    match body {
-        Body::Empty => Value::Int(0),
-        Body::Bytes(bytes) => Value::Int(bytes.len() as i64),
-        Body::Streamed(_) => Value::Null,
-    }
+    opt_int(body.buffered_len().map(|n| n as i64))
 }
 
-/// A wall-clock instant as whole milliseconds since the Unix epoch, saturated at
-/// `i64::MAX`; `Null` if the clock is before the epoch. The one rule `flow.get`
-/// uses for `started_at`, so every frontend places a flow at the same time.
-fn epoch_ms(t: SystemTime) -> Value {
-    match t.duration_since(UNIX_EPOCH) {
-        Ok(d) => whole_ms(d),
-        Err(_) => Value::Null,
-    }
-}
-
-/// A flow duration as whole milliseconds, saturated at `i64::MAX`; `Null` while
-/// the flow is in flight or its end is unknown. Shared by `flow.get` and
-/// `flow.table` so the two commands cannot drift on `duration_ms`.
-fn duration_ms(d: Option<Duration>) -> Value {
-    d.map_or(Value::Null, whole_ms)
-}
-
-fn whole_ms(d: Duration) -> Value {
-    Value::Int(d.as_millis().min(i64::MAX as u128) as i64)
+/// An optional count as a `Value`: the number, or `Null` when it is unknown. The
+/// timing and size rules themselves live on the core types
+/// (`FlowMeta::started_at_ms`, `FlowMeta::duration_ms`, `Body::buffered_len`);
+/// this only renders their answer.
+fn opt_int(n: Option<i64>) -> Value {
+    n.map_or(Value::Null, Value::Int)
 }
 
 /// A transport-neutral summary of a flow: identity, timing, and the per-kind
@@ -225,8 +208,8 @@ fn summarize(flow: &Flow) -> Value {
         obj.insert(k.to_string(), v);
     };
     put("id", Value::Str(flow.id().to_string()));
-    put("started_at", epoch_ms(flow.metadata().created));
-    put("duration_ms", duration_ms(flow.metadata().duration));
+    put("started_at", opt_int(flow.metadata().started_at_ms()));
+    put("duration_ms", opt_int(flow.metadata().duration_ms()));
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
@@ -364,7 +347,7 @@ fn flow_row(flow: &Flow) -> Value {
                 .collect(),
         ),
     );
-    put("duration_ms", duration_ms(flow.metadata().duration));
+    put("duration_ms", opt_int(flow.metadata().duration_ms()));
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));

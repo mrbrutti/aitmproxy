@@ -96,8 +96,8 @@ public struct FlowSummary: Hashable, Sendable {
         self.reportsBodySizes = json["request_bytes"] != nil || json["response_bytes"] != nil
         // Timing is a count of milliseconds: a negative or fractional value from the
         // wire is not one and reads as unknown (nil), never as a date before 1970.
-        self.startedAt = Self.epochMillis(json["started_at"]).map { Date(timeIntervalSince1970: Double($0) / 1000) }
-        self.duration = Self.epochMillis(json["duration_ms"]).map { .milliseconds($0) }
+        self.startedAt = Self.wholeMillis(json["started_at"]).map { Date(timeIntervalSince1970: Double($0) / 1000) }
+        self.duration = Self.wholeMillis(json["duration_ms"]).map { .milliseconds($0) }
     }
 
     private static func size(_ value: JSONValue?) -> Int64? {
@@ -107,7 +107,7 @@ public struct FlowSummary: Hashable, Sendable {
 
     /// A non-negative whole number of milliseconds, else nil: absent, `null`, negative
     /// or fractional (`intValue` already rejects a non-integral number).
-    private static func epochMillis(_ value: JSONValue?) -> Int? {
+    private static func wholeMillis(_ value: JSONValue?) -> Int? {
         guard let ms = value?.intValue, ms >= 0 else { return nil }
         return ms
     }

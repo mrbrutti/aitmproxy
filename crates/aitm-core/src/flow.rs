@@ -6,7 +6,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
 
@@ -266,6 +266,30 @@ impl Default for FlowMeta {
             edited: false,
         }
     }
+}
+
+impl FlowMeta {
+    /// When the flow started: `created` as whole milliseconds since the Unix
+    /// epoch, saturated at `i64::MAX`; `None` if the clock is before the epoch.
+    /// The one `started_at` rule, so every command surface and push places a
+    /// flow at the same time.
+    pub fn started_at_ms(&self) -> Option<i64> {
+        self.created.duration_since(UNIX_EPOCH).ok().map(whole_ms)
+    }
+
+    /// The flow's duration in whole milliseconds, saturated at `i64::MAX`;
+    /// `None` while the flow is in flight or its end is unknown. The one
+    /// `duration_ms` rule, so `flow.get`, `flow.table` and the pushes cannot
+    /// drift.
+    pub fn duration_ms(&self) -> Option<i64> {
+        self.duration.map(whole_ms)
+    }
+}
+
+/// A duration as whole milliseconds (the fraction dropped), saturated at
+/// `i64::MAX` rather than wrapped or truncated.
+fn whole_ms(d: Duration) -> i64 {
+    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Lifecycle of interception for a single flow.

@@ -10,11 +10,10 @@ import Foundation
 /// interception, no response head yet, marked stale by Resume/Kill, or — on a core
 /// that reports sizes — a body still streaming after the response head
 /// (`FlowSummary.awaitsBodySize`). That last wait is bounded as a safety net: a core
-/// since the flow-finish change finalises a response the upstream abandoned mid-body
-/// (buffered, truncated, with a duration), so its size lands and the wait ends on its
-/// own; an older core left such a response `Streamed` for good, and there the flow is
-/// left alone after `bodySizePollLimit` polls rather than asked about every poll for
-/// the life of the session.
+/// that finalises an abandoned response (buffered, truncated, with a duration) makes
+/// its size land and the wait end on its own; an older core left such a response
+/// `Streamed` for good, and there the flow is left alone after `bodySizePollLimit`
+/// polls rather than asked about every poll for the life of the session.
 public struct FlowRefetchPolicy: Sendable {
     /// Polls a flow may spend waiting for a streaming body's size; a minute at the
     /// 500 ms poll. Long enough for any download that finishes, short enough that an

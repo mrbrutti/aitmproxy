@@ -888,7 +888,7 @@ async fn serve(
         // Every exit of the loop, `?` and `bail!` alike, lands after this block,
         // so a response that ended early is finalised in the store before the
         // error about it is dispatched or returned.
-        let streamed = async {
+        let forwarded = async {
             while !done {
                 let n = match tokio::time::timeout(READ_TIMEOUT, up.read(&mut buf)).await {
                     Ok(r) => r?,
@@ -1021,7 +1021,7 @@ async fn serve(
             Ok::<(), anyhow::Error>(())
         }
         .await;
-        if let Err(e) = streamed {
+        if let Err(e) = forwarded {
             // However the response ended (the origin closed or timed out, its
             // bytes were refused, an I/O error on either side), the bytes captured
             // so far, bounded by `max_body` like a completed body, become the
@@ -1030,8 +1030,7 @@ async fn serve(
             // size. With no head stored yet this changes nothing. The store is
             // final before the error is dispatched, so a push or refetch built on
             // that event sees the finished flow.
-            ctx.store()
-                .abandon_response(id, std::mem::take(&mut captured));
+            ctx.store().abandon_response(id, captured);
             if let Some(words) = fault {
                 ctx.emit(Event::Error {
                     flow: id,
