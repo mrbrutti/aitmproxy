@@ -246,8 +246,9 @@ import Testing
     }
 
     @Test func aHostOnlyLoadCanRefuseNeverSurvivesALoad() throws {
-        // `save` writes what it is given; `load` is the single validation point (D1). So even a
-        // host that would make `Config.yaml()` throw can sit in the file yet never reach a spawn.
+        // `load` validates on its own (D1), whatever wrote the file, so a host that would make
+        // `Config.yaml()` throw never reaches a spawn. `save` drops it too (pinned on the raw bytes
+        // below); `loadDropsInvalidAndDuplicateEntries` pins load against a hand-written file.
         let url = tempURL()
         defer { try? FileManager.default.removeItem(at: url) }
 
@@ -339,5 +340,47 @@ import Testing
 
         #expect(EmbeddedScope.sanitized([overLimit, atLimit, "ok.test"]) == [atLimit, "ok.test"])
         #expect(loaded(fromBytes: #"{"hosts": [""# + overLimit + #"", ""# + atLimit + #""]}"#).hosts == [atLimit])
+    }
+
+    // MARK: Save applies load's caps (spec D1 amendment; SP-AC14, SP-AC18)
+
+    @Test func saveWritesOnlyWhatLoadWouldKeep() throws {
+        // The file only ever holds what `load` keeps, so what an action persisted is exactly what
+        // the next launch seeds. Decoded raw — not via `load`, which would sanitise again — to pin
+        // the bytes on disk.
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try EmbeddedScope(hosts: ["ok.test", "bad\nhost.test", "ok.test"]).save(to: url)
+
+        let onDisk = try JSONDecoder().decode(EmbeddedScope.self, from: Data(contentsOf: url))
+        #expect(onDisk.hosts == ["ok.test"])
+        #expect(!(try String(contentsOf: url, encoding: .utf8)).contains("bad"))
+    }
+
+    @Test func saveRefusesAFileOverOneMebibyteAndWritesNothing() throws {
+        // `load` reads nothing over 1 MiB, so a save that produced such a file would wipe the scope
+        // at the next launch with no signal. `sanitized` caps the count at 10 000 first, so the
+        // overflow is 10 000 distinct ~200-character hosts (each under the 1 024 cap): about 2 MiB.
+        let hosts = (0..<10_000).map { String(repeating: "a", count: 190) + "\($0).test" }
+        #expect(EmbeddedScope.sanitized(hosts).count == 10_000)
+        let url = tempURL()
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let error = #expect(throws: EmbeddedScope.SaveError.self) {
+            try EmbeddedScope(hosts: hosts).save(to: url)
+        }
+
+        guard case .tooLarge(let bytes)? = error else { Issue.record("expected .tooLarge, got \(String(describing: error))"); return }
+        #expect(bytes > 1_048_576)
+        #expect(!FileManager.default.fileExists(atPath: url.path))
+    }
+
+    @Test func saveErrorNamesTheSizeAndTheLimit() {
+        // Surfaces through `BusService.persistEmbeddedScope` as "Scope change not saved: …".
+        let error = EmbeddedScope.SaveError.tooLarge(bytes: 2_000_000)
+
+        #expect(error.errorDescription == "scope.json would be 2000000 bytes; the limit is 1048576")
+        #expect(error.localizedDescription == "scope.json would be 2000000 bytes; the limit is 1048576")
     }
 }

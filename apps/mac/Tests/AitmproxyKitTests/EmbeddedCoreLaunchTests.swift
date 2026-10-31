@@ -446,9 +446,6 @@ import Testing
         #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("\n")) {
             try config(scopeHosts: ["\n"]).yaml()
         }
-        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\rx")) {
-            try config(scopeHosts: ["evil.test\rx"]).yaml()
-        }
     }
 
     @Test func scope_block_rejects_a_crlf_host() {

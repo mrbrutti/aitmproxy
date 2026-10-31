@@ -256,19 +256,23 @@ final class BusService: FlowActions {
         try await call("request.send", request.arguments).stringValue.map(FlowID.init)
     }
 
-    func addScope(_ host: String) async throws {
-        // Snapshot the embedded intent before the round trip: a Settings ▸ Bus switch while the
-        // verb and the refresh are in flight must not persist the other core's list, so the
-        // write needs `preferEmbedded` to hold both before and after.
-        let embedded = preferEmbedded
-        _ = try await call("scope.add", ["host": .string(host)])
-        if await refreshScope(), embedded, preferEmbedded { try persistEmbeddedScope() }
-    }
+    func addScope(_ host: String) async throws { try await scopeVerb("scope.add", host: host) }
 
-    func removeScope(_ host: String) async throws {
+    func removeScope(_ host: String) async throws { try await scopeVerb("scope.remove", host: host) }
+
+    /// Snapshot the embedded intent before the round trip (a Settings ▸ Bus switch mid-flight
+    /// must not persist the other core's list), run the verb, refresh, then persist only for
+    /// the embedded core. For the embedded core a failed refresh is an error of the action: the
+    /// core has applied the change but `scope.json` is now stale, and a stale file reported as
+    /// success would resurrect a removed host at the next launch. An external core has no file,
+    /// so its refresh failure stays a poll-recoverable display lag, as before.
+    private func scopeVerb(_ name: String, host: String) async throws {
         let embedded = preferEmbedded
-        _ = try await call("scope.remove", ["host": .string(host)])
-        if await refreshScope(), embedded, preferEmbedded { try persistEmbeddedScope() }
+        _ = try await call(name, ["host": .string(host)])
+        let refreshed = await refreshScope()
+        guard embedded, preferEmbedded else { return }
+        guard refreshed else { throw BusError.tool(message: "Scope change applied but not saved: scope.list failed") }
+        try persistEmbeddedScope()
     }
 
     func mark(_ id: FlowID, color: MarkColor?) async throws {

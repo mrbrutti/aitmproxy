@@ -13,13 +13,28 @@ import Foundation
 /// at most `maxHosts` (10 000) entries, the first ones in order. The read runs on the
 /// main actor at launch and inside the core actor at every spawn, and the core seeds
 /// its guard with a linear-scan de-dup, so the file must stay small and bounded.
+/// `save` applies the same caps on the way out — it writes `sanitized(hosts)` and refuses
+/// a file over `maxFileBytes` — so the file only ever holds what `load` keeps and a Scope
+/// action can never persist a list that loads empty at the next launch.
 public struct EmbeddedScope: Codable, Hashable, Sendable {
-    /// The largest `scope.json` that `load` reads, in bytes.
-    public static let maxFileBytes: UInt64 = 1_048_576
+    /// `save` refused to write; the Scope action that asked for it reports this as the reason.
+    public enum SaveError: Error, Equatable, LocalizedError {
+        /// The pretty-printed file would exceed `maxFileBytes`, which `load` reads as empty.
+        case tooLarge(bytes: Int)
+
+        public var errorDescription: String? {
+            switch self {
+            case .tooLarge(let bytes): "scope.json would be \(bytes) bytes; the limit is \(EmbeddedScope.maxFileBytes)"
+            }
+        }
+    }
+
+    /// The largest `scope.json` that `load` reads and `save` writes, in bytes.
+    static let maxFileBytes: UInt64 = 1_048_576
     /// The most hosts `sanitized` keeps.
-    public static let maxHosts = 10_000
+    static let maxHosts = 10_000
     /// The longest host, in characters, that `sanitized` keeps.
-    public static let maxHostLength = 1_024
+    static let maxHostLength = 1_024
 
     public var hosts: [String]
 
@@ -51,12 +66,16 @@ public struct EmbeddedScope: Codable, Hashable, Sendable {
 
     /// Pretty + sortedKeys, creates the directory, writes atomically. Unlike `Pins`,
     /// atomic: a crash mid-write must not leave a truncated file that loads as empty
-    /// and silently wipes the scope at the next launch.
+    /// and silently wipes the scope at the next launch. Writes `sanitized(hosts)`, and
+    /// throws `SaveError.tooLarge` — touching nothing on disk — rather than write a file
+    /// `load` would read as empty.
     public func save(to url: URL) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(EmbeddedScope(hosts: Self.sanitized(hosts)))
+        guard UInt64(data.count) <= Self.maxFileBytes else { throw SaveError.tooLarge(bytes: data.count) }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try encoder.encode(self).write(to: url, options: .atomic)
+        try data.write(to: url, options: .atomic)
     }
 
     /// Trim `.whitespacesAndNewlines`, drop what `isPersistable` rejects and any host over
