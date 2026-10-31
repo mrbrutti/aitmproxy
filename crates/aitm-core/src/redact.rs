@@ -95,9 +95,10 @@ fn holds_segment_word(lower: &str) -> bool {
     SECRET_KEY_SEGMENTS.iter().any(|word| lower.contains(word))
 }
 
-/// The compiled regex passes of [`scrub_text`], applied in order. The `key=value`
-/// pair pass is [`mask_secret_pairs`], not a regex, because it must call
-/// [`is_secret_key`] and handle quoted values.
+/// The compiled regex passes that [`scrub_text`] and [`scrub_text_wide`] both
+/// apply, in order. The `key=value` pair pass is [`mask_secret_pairs`], not a
+/// regex, because it must judge each key with [`is_secret_key`] or
+/// [`is_secret_key_wide`], as the entry point requires, and handle quoted values.
 fn patterns() -> &'static [(Regex, &'static str)] {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
