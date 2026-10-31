@@ -2,7 +2,7 @@
 
 **Status:** Approved (self-approved in autonomous-approve mode, 2026-10-30)
 **Spec:** `docs/superpowers/specs/2026-10-30-agent-policy-revocation-design.md` (Approved 2026-10-30)
-**Branch / worktree:** `claude/ecstatic-lehmann-199e83` in `/Users/matt/Security/aitmproxy/.claude/worktrees/ecstatic-lehmann-199e83`, cut from `main` `bd0f9b7`. Base SHA for every diff and Tester/panel dispatch: `bd0f9b7`. For a per-task Tester, the base is the previous task's commit.
+**Branch / worktree:** `claude/ecstatic-lehmann-199e83` in `/Users/matt/Security/aitmproxy/.claude/worktrees/ecstatic-lehmann-199e83`, first cut from `main` `bd0f9b7`, then rebased onto `origin/main` v0.5.2. **Base SHA for every diff and Tester/panel dispatch: `592a377`.** The branch commits after the rebase are `574ede3` (docs: spec and plan), `68579ab` (task 1), `4546a44` (task 2), `4789b56` (task 3), and `01415f7` (tester duplex tests). Wherever this plan says "the previous task's commit" or `<task-N-sha>`, read the post-rebase SHA above. For a per-task Tester, the base is the previous task's commit.
 
 ## Overview
 
@@ -237,6 +237,61 @@ once").
 12. `agent.approve allow:false` under a non-`ask` policy takes the unchanged
     resolve-and-succeed path (spec Design 5.1), with no policy read needed for it.
 
+### Deviations (as executed; added after the stage-6 panel, 2026-10-30)
+
+Where the run departed from this plan, so a reviewer does not have to find out from the logs.
+
+1. **No separate whole-branch Tester pass.** Each task had its own Tester pass; the
+   "Whole-branch stage 5" item below was not run as a separate dispatch. What stands in for it: the
+   per-task Testers; the orchestrator's final-head full gate and the AC22 mutation runs, logged at
+   `/tmp/apr-gate.log`, `/tmp/apr-mut-a.log`, `/tmp/apr-mut-b.log`, and `/tmp/apr-final-revoke.log`; and
+   the Task 3 socket logs, `/tmp/apr-t3-*.log`. The panel built its own AC-to-test map. (These
+   logs use the short `/tmp/apr-*` names, not the `/tmp/agent-policy-revocation-*` names Task 4 writes.)
+2. **One panel for the whole branch**, as Call 9 said; there were no per-task panels.
+3. **The Testers added 32 of the 55 `revoke_` tests** (Task 1: 10, Task 2: 19, and 3 more duplex tests in
+   `01415f7`). They were committed inside the `feat(mcp): task N` commits, except the three in `01415f7`.
+   The Coders wrote the other 23 (the 7 unit and 16 integration tests this plan names). The counts in Task 4
+   are the true totals; the per-task red summaries in Tasks 1 and 2 describe the Coders' tests only.
+4. **AC22(b), the clause "AC16 passes either way", was accepted on reasoning, not run.** The five existing `Ask`
+   tests keep the policy at `ask` and are not selected by the `revoke_` filter, so the mutation run never
+   executes them; they cannot fail on the mutation because it only changes behaviour when the policy leaves
+   `ask`.
+5. **Spec amended after the panel** (see the spec's "Amendments after panel"): the read predicate
+   `agent_reads_allowed` is an allow-list (Task 1's bullet and Task 2's parenthetical are corrected in place);
+   there are now six residuals, R1 to R6, stated in plain words in the source, with the labels living in the
+   spec. Wherever Task 1, Loose end 5, or Task 4 as first written say "R1 to R5" or ask for R-labelled source
+   docs, read R1 to R6 and plain words. AC21's grep is "no `sink.push` outside `Subscriptions::fanout` and
+   `replay_since`". Task 4 steps 4 and 5 are updated to match.
+6. **Base rebased** onto `origin/main` v0.5.2 (`592a377`); see the header.
+
+### PR description checklist (requested by the panel)
+
+The PR body states each of these, in plain words, so a reader does not have to open the spec:
+
+- [ ] **Residuals R1 to R6** (spec Design 6), one line each: R1 lines already queued in an agent sink (and a
+  sink's own overflow `lagged` marker set before the pause) may still be written; R2 a `flow.subscribe
+  {since}` past the gate just before the flip may replay just after; R3 a flap shorter than one parked-waiter
+  slice is not seen; R4 a parked call past its post-wake recheck is in flight; R5 a fan-out that read the policy
+  just before the flip may enqueue just after; R6 a call that passed the gate before the pause keeps running
+  and its reply is delivered, and work already started (an armed intercept, a running scan) is not stopped by
+  a pause.
+- [ ] **`ask` to `all` (or to any non-`ask` policy) denies a parked request**, and the agent must re-issue the
+  call under the new policy.
+- [ ] **The other spec Risks:** the read side now fails closed for an unknown future posture (a behaviour
+  change, no shipped policy affected, pinned by reading because no test can construct the variant); **TUI mode
+  is not covered** (`aitm tui`'s loopback agent server has a private `AgentState`, so a pause there mutes and
+  denies nothing; the tui-mode governance follow-up); the agent link goes quiet under `paused` (the operator
+  link does not); a pause during a parked wait ends it early; and the agent-visible reason after
+  `agent.approve allow:true` outside `ask` can read "an operator denied ..." or "the agent policy changed".
+- [ ] **AC18 is Terminal-panel-only.** It binds `127.0.0.1:0`, so it ran outside the sandbox; attach or quote
+  its red run (AC22(a) at task scope) and its green run, `/tmp/apr-t3-*.log`.
+- [ ] **The true counts, as measured at `01415f7`, before the post-panel fix commit** (the fix commit may add
+  or change tests; if it does, the orchestrator re-measures and the Review log, not this plan, carries the new
+  figures): `cargo test -p aitm-mcp --lib revoke_` is 24 passed; `cargo test -p aitm-mcp --test mcp revoke_`
+  is 31 passed (23 `revoke_push_*`, 7 `revoke_park_*`, 1 `revoke_socket_*`); 55 in all, 32 of them added by
+  the Testers. Mutation (a) fails 2 unit and 20 integration tests (22 unit and 11 integration pass);
+  mutation (b) fails 10 unit and 6 integration tests (14 unit and 25 integration pass).
+
 ## Tasks
 
 ### Task 1: mute agent pushes under `paused`, with the gap marker (AC1-AC10, AC12(ii), AC21 push half)
@@ -256,12 +311,17 @@ once").
 **Change (production, `server.rs`).**
 
 - `fn agent_reads_allowed(policy: AgentPolicy) -> bool` (private free fn, next to
-  `is_operator_only`). Returns `false` for `Paused` and `true` for every other value,
-  including an unknown future posture (exactly `read_refusal`'s present behaviour;
-  `policy != AgentPolicy::Paused` is enough). Doc: the one decision behind "may an
-  agent-role caller subscribe now" and "does it receive pushes now"; the unknown-posture
-  fail-open is deliberate and is the one place the repo's fail-closed doctrine is not
-  followed; whoever adds a variant decides it here.
+  `is_operator_only`). **Amended after the panel (spec Design 1, Amendments 2):** it is
+  an allow-list. It returns `true` for exactly `All`, `Auto`, `Ask`, and `ReadOnly`, and
+  `false` for `Paused` and for any posture it does not name, including a future
+  `#[non_exhaustive]` variant, so the read side fails closed like `policy_decision` and
+  `ask_still_in_force`. (The first draft, "`true` for every other value, exactly
+  `read_refusal`'s present behaviour, `policy != AgentPolicy::Paused` is enough", is
+  superseded: a deny-list of one posture compiles silently when a variant is added.) The
+  `paused` refusal text and the five known policies' behaviour are unchanged; no test can
+  construct an unknown variant, so this is pinned by reading and by the doc. Doc: the one
+  decision behind "may an agent-role caller subscribe now" and "does it receive pushes
+  now"; it is an allow-list, so a new variant is not allowed until it is added here.
 - `McpServer::agent_pushes_muted(&self) -> bool`: one-line body, exactly
   `!agent_reads_allowed(self.agent_state.policy())` (trap 7a).
 - `read_refusal(&self, conn: &ConnCtx, name: &str) -> Option<String>`: same role gate;
@@ -420,12 +480,12 @@ is wrong, not red.
    --numstat`, below).
 
 - **Orchestrator checkpoint (Terminal panel, after the Tester passes):**
-  `git diff --numstat bd0f9b7 -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..`
+  `git diff --numstat 592a377 -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..`
   (zero removed lines); `touch` both sources; then
   `cargo test -p aitm-mcp > /tmp/agent-policy-revocation-t1.log 2>&1; echo "exit=$?"`
   prints `exit=0` (the whole crate, including the existing socket tests). Then commit.
 - **Tester (stage 5, after the Coder):** inputs per the dispatch contract (spec, plan,
-  worktree, base `bd0f9b7`, head SHA, "Task 1"). Map AC1-AC10 and AC12(ii) to the tests
+  worktree, base `592a377`, head SHA, "Task 1"). Map AC1-AC10 and AC12(ii) to the tests
   in the table; re-run steps 4-7 in the sandbox and quote them; confirm the shapes in
   trap 7a, the single `sub.sink.push`, the helper doc names R1-R5, no comparison against
   `Frontend::Mcp` was written, and the helper reads the policy once after the lock. The
@@ -458,7 +518,7 @@ is wrong, not red.
 - `fn ask_still_in_force(policy: AgentPolicy) -> bool` (private free fn): one-line
   body `policy == AgentPolicy::Ask` (trap 7b). Doc: the one test for "the policy a
   request was parked under still holds"; an unknown future posture is **not** `Ask`, so
-  it fails closed (the deliberate opposite of `agent_reads_allowed`).
+  it fails closed (as `agent_reads_allowed` does too, after the panel amendment).
 - `ParkSlot::wait` is **replaced** by `fn wait(&self, timeout: Duration, recheck: Duration,
   still_ask: &dyn Fn() -> bool) -> ParkWait`. Behaviour, in order: compute the deadline
   once on entry; lock the slot state; loop: (1) if the state is `Some(allow)` return
@@ -686,7 +746,11 @@ Steps, as AC18, with these refinements:
 - **Depends on:** Tasks 1-3 committed.
 - **Files:** none retained. The AC22 steps temporarily edit `server.rs` and restore it.
 
-Steps and required output (orchestrator, Terminal panel; `touch` both sources before each run):
+Steps and required output (orchestrator, Terminal panel; `touch` both sources before each run). Counts below are
+the true totals measured at `01415f7`, before the post-panel fix commit; the fix commit may add or change tests,
+in which case the orchestrator re-measures and the Review log carries the new figures. The run used the short log
+names `/tmp/apr-gate.log`, `/tmp/apr-mut-a.log`, `/tmp/apr-mut-b.log`, `/tmp/apr-final-revoke.log` where this
+section writes `/tmp/agent-policy-revocation-*.log` (see Deviations).
 
 1. **Full gate** on the final head:
    `(cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test) > /tmp/agent-policy-revocation-gate.log 2>&1; echo "gate exit=$?"`
@@ -698,24 +762,32 @@ Steps and required output (orchestrator, Terminal panel; `touch` both sources be
    **must print** `webbus exit=0`; record the five `test result:` counts (all `ok`, zero failed).
 3. **Final-head `revoke_` run (all green, with the socket test):**
    `cargo test -p aitm-mcp --lib --test mcp revoke_ > /tmp/agent-policy-revocation-revoke.log 2>&1; echo "exit=$?"`
-   **must print** `exit=0`, `7 passed` for the unit binary (`revoke_read_refusal_text_is_unchanged`,
-   `revoke_gap_is_dropped_with_its_connection`, and the five `revoke_park_*` unit tests), and `16 passed` for
-   `tests/mcp.rs` (12 `revoke_push_*`, 3 `revoke_park_*`, 1 `revoke_socket_*`).
-4. **Scope (AC19, AC20), explicit base SHA (`origin/main` moves):**
-   a. `git diff --name-only bd0f9b7..HEAD` lists exactly four paths: `crates/aitm-mcp/src/server.rs`,
+   **must print** `exit=0`, `24 passed` for the unit binary (the Coders' 7 plus 17 added by the Testers), and
+   `31 passed` for `tests/mcp.rs` (23 `revoke_push_*`, 7 `revoke_park_*`, 1 `revoke_socket_*`; the Coders'
+   16 plus 15 added by the Testers): 55 `revoke_` tests in all.
+4. **Scope (AC19, AC20), explicit base SHA (`origin/main` moves); the base is `592a377`:**
+   a. `git diff --name-only 592a377..HEAD` lists exactly four paths: `crates/aitm-mcp/src/server.rs`,
       `crates/aitm-mcp/tests/mcp.rs`,
       `docs/superpowers/plans/2026-10-30-agent-policy-revocation-plan.md`, and
       `docs/superpowers/specs/2026-10-30-agent-policy-revocation-design.md`.
-   b. `git diff --stat bd0f9b7..HEAD -- crates/aitm-core crates/aitm crates/aitm-plugins` prints nothing.
-   c. `git diff --numstat bd0f9b7..HEAD -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..` (zero removed).
-      For `server.rs`, no removal inside the existing test module (it starts at base line 2219):
-      `git diff -U0 bd0f9b7..HEAD -- crates/aitm-mcp/src/server.rs | grep '^@@' | awk '{split($2,a,","); n=(a[2]==""?1:a[2]); s=substr(a[1],2); if (n>0 && (s+0)>=2219) print "REMOVAL IN TEST REGION: " $0}'`
-      prints nothing.
-5. **AC21 checks.** `grep -c 'sub\.sink\.push' crates/aitm-mcp/src/server.rs` prints `1`;
-   `grep -n 'agent_reads_allowed(' ..` shows `read_refusal` and `agent_pushes_muted` as callers;
+   b. `git diff --stat 592a377..HEAD -- crates/aitm-core crates/aitm crates/aitm-plugins` prints nothing.
+   c. `git diff --numstat 592a377..HEAD -- crates/aitm-mcp/tests/mcp.rs` shows `<N>\t0\t..` (zero removed).
+      For `server.rs`, no removal inside the existing test module. Do not hard-code its line: read where
+      `mod tests` starts in the base, and use the line before it (the `#[cfg(test)]` attribute) as the
+      threshold, `st-1`. At `592a377` `mod tests` is at line 2220, so `st-1` is 2219:
+      `st=$(git show 592a377:crates/aitm-mcp/src/server.rs | grep -n '^mod tests' | cut -d: -f1); echo "base mod tests line=$st"`
+      prints `base mod tests line=2220`, then
+      `git diff -U0 592a377..HEAD -- crates/aitm-mcp/src/server.rs | grep '^@@' | awk -v t=$((st-1)) '{split($2,a,","); n=(a[2]==""?1:a[2]); s=substr(a[1],2); if (n>0 && (s+0)>=t) print "REMOVAL IN TEST REGION: " $0}'`
+      prints nothing. (Run both in one shell invocation so `st` is still set.)
+5. **AC21 checks (as amended).** `grep -n 'sink\.push' crates/aitm-mcp/src/server.rs`: every hit is inside
+   `Subscriptions::fanout` or `replay_since`, and none is in the `mod tests` module (inside `fanout` the marker
+   and the line may be one loop or two pushes; the check is where, not how many);
+   `grep -n 'agent_reads_allowed(' ..` shows `read_refusal` and `agent_pushes_muted` as callers, and the function
+   itself is an allow-list (`true` for exactly `All`, `Auto`, `Ask`, `ReadOnly`);
    `grep -n 'ask_still_in_force(' ..` shows `handle_approve`, the waiter, and `settle_park`;
    `grep -n 'PARK_POLICY_RECHECK' ..` shows the doc'd definition and the use;
-   `grep -n '\bR[1-5]\b' ..` lists R1-R5 in the helper's doc and R3, R4 again in `park_for_approval`'s;
+   the helper's doc (and `park_for_approval`'s, for the parked ones) states the six residuals of spec Design 6
+   in plain words (no grep: the labels R1 to R6 live in the spec and the source need not carry them);
    `cargo test -p aitm-core --test trust_gate_scan` is `ok` (also inside the gate). The Tester reads the
    docs on `push_flow_event`, `push_state`, `push_agent`, `read_refusal`, `park_for_approval`,
    `handle_approve`, `ParkSlot::wait`, the helper, and `PARK_POLICY_RECHECK`, and the `paused` text.
@@ -723,12 +795,13 @@ Steps and required output (orchestrator, Terminal panel; `touch` both sources be
    one-body-line check, replace the body line with `false`). Run
    `cargo test -p aitm-mcp --no-fail-fast --lib --test mcp revoke_ > /tmp/agent-policy-revocation-mut-a.log 2>&1; echo "exit=$?"; grep -E "^test |^test result" /tmp/agent-policy-revocation-mut-a.log`
    **Must show** `exit=101` and:
-   - `tests/mcp.rs`: `test result: FAILED. 6 passed; 10 failed`. The ten FAILED are AC1, AC2, AC4, AC5,
-     AC6, AC7, AC8(ii), AC9, AC10 and the socket test AC18. The six `ok` are the guards and the parked
-     tests, which the mute does not affect: `revoke_push_trusted_control_is_never_muted`,
+   - `tests/mcp.rs`: `test result: FAILED. 11 passed; 20 failed`. The failures include AC1, AC2, AC4, AC5,
+     AC6, AC7, AC8(ii), AC9, AC10 and the socket test AC18, plus the Testers' additional push tests that assert
+     a suppression. The eleven `ok` are the guards and the parked tests, which the mute does not affect (named
+     guards: `revoke_push_trusted_control_is_never_muted`,
      `revoke_push_direct_flip_without_a_suppressed_push_has_no_marker`,
-     `revoke_push_queued_lines_are_not_purged`, and the three `revoke_park_*` integration tests.
-   - unit binary: `test result: FAILED. 6 passed; 1 failed`; the one failure is
+     `revoke_push_queued_lines_are_not_purged`; the per-test list is in the log).
+   - unit binary: `test result: FAILED. 22 passed; 2 failed`; the failures include
      `revoke_gap_is_dropped_with_its_connection` (no gap is ever recorded).
    Each failure message names the missing suppression, a policy cause (a line where `[]` was expected, a
    missing marker, F2 reaching A), never a compile or connect error. Restore, prove with `diff` against the
@@ -737,18 +810,20 @@ Steps and required output (orchestrator, Terminal panel; `touch` both sources be
    'fn ask_still_in_force' .. | cut -d: -f1); sed -n "${n},$((n+2))p" ..` shows the signature, one body line,
    `}`. Backup, `sed -i.bak "$((n+1))s/.*/        true/" ..`, then the same command into
    `/tmp/agent-policy-revocation-mut-b.log`. **Must show** `exit=101` and:
-   - `tests/mcp.rs`: `test result: FAILED. 14 passed; 2 failed`; the two FAILED are AC14 and AC17 (each fails
-     on "did not return within 5s", the waiter never wakes and the helper releases it); AC15 and every
-     `revoke_push_*` and the socket test are `ok`.
-   - unit binary: `test result: FAILED. 4 passed; 3 failed`; the three FAILED are
+   - `tests/mcp.rs`: `test result: FAILED. 25 passed; 6 failed`; the failures include AC14 and AC17 (each fails
+     on "did not return within 5s", the waiter never wakes and the helper releases it) and the Testers'
+     additional `revoke_park_*` integration tests that assert a denial; AC15 and every `revoke_push_*` and the
+     socket test are `ok`.
+   - unit binary: `test result: FAILED. 14 passed; 10 failed`; the failures include
      `revoke_park_approve_after_leaving_ask_is_refused_and_denies` (AC11),
-     `revoke_park_settle_decision_table` and `revoke_park_approve_then_pause_is_denied_end_to_end` (AC13);
-     `revoke_park_deny_after_leaving_ask_is_honoured` (AC12(i)),
-     `revoke_park_slot_wait_honours_timeout_resolve_and_recheck`, `revoke_read_refusal_text_is_unchanged`,
-     and `revoke_gap_is_dropped_with_its_connection` are `ok`.
-   Restore and prove as in step 6. Then re-run step 3's command: `exit=0`, `7 passed` and `16 passed`.
-   (If the Coder's tests differ in count from this prediction, the Tester reconciles the numbers against the
-   test list before the run and corrects this plan; a mismatch that is not a counting difference is a finding.)
+     `revoke_park_settle_decision_table` and `revoke_park_approve_then_pause_is_denied_end_to_end` (AC13), and
+     the Testers' additional unit tests that assert a denial; `revoke_park_deny_after_leaving_ask_is_honoured`
+     (AC12(i)), `revoke_park_slot_wait_honours_timeout_resolve_and_recheck`,
+     `revoke_read_refusal_text_is_unchanged`, and `revoke_gap_is_dropped_with_its_connection` are `ok`.
+   Restore and prove as in step 6. Then re-run step 3's command: `exit=0`, `24 passed` and `31 passed`.
+   (These are measured counts, not predictions. If a later commit changes the number of tests, the orchestrator
+   re-measures and records the new figures in the Review log; a mismatch that is not a counting difference is a
+   finding.)
 8. The Tester report for the whole branch quotes steps 1-7 with the logs attached.
 
 - **Done when:** all eight steps print what is stated, the logs are saved and quoted in the whole-branch
@@ -757,23 +832,26 @@ Steps and required output (orchestrator, Terminal panel; `touch` both sources be
 ## Whole-branch stage 5 and stage 6
 
 1. **Whole-branch Tester** (after Task 4): inputs per the dispatch contract (spec, plan, worktree, base
-   `bd0f9b7`, head SHA, "whole branch"), with the Task 4 logs attached. Every criterion AC1-AC22 maps to a
+   `592a377`, head SHA, "whole branch"), with the Task 4 logs attached. Every criterion AC1-AC22 maps to a
    test, a literal check, or a mutation run; the Tester quotes the gate output. PASS or FAIL with reasons.
+   (As executed this was not a separate dispatch; see Deviations, item 1.)
 2. **Panel, in parallel, fresh contexts:** `security-reviewer`, `quality-reviewer`, `spec-reviewer`, each given
-   the spec, plan, worktree, base `bd0f9b7`, head SHA, "whole branch", the Coders' reports, and the Tester
+   the spec, plan, worktree, base `592a377`, head SHA, "whole branch", the Coders' reports, and the Tester
    report. Suggested focus, not a limit.
-   Security: G1 and G2 hold on every surface (loopback, stdio, `/bus`), including a second `McpServer` sharing
-   state; trusted control is never muted (allow-list through `is_trusted_control`, including a future
-   `Frontend` variant); nothing leaks under `paused` (no marker, no notice, no audit line); the parked path
-   fails closed (an unknown future posture denies); lock order (registry lock outside, sink lock inside, the
-   policy read lock-free, the slot mutex never held across the table lock); the 200 ms wakeups are bounded
-   (at most 64 waiters); residuals R1-R5 are accurately stated and acceptable.
+   Security: G1 and G2 hold on every surface whose server shares the `AgentState` (loopback, stdio, `/bus`,
+   including a second `McpServer` sharing state; not `aitm tui`, whose loopback agent server has a private
+   state, a stated Non-goal); trusted control is never muted (allow-list through `is_trusted_control`, including
+   a future `Frontend` variant); nothing leaks under `paused` (no marker, no notice, no audit line, bar the
+   sink's own earlier overflow marker, R1); both sides fail closed (the parked path denies an unknown future
+   posture, and the read predicate is an allow-list that refuses one); lock order (registry lock outside, sink
+   lock inside, the policy read lock-free, the slot mutex never held across the table lock); the 200 ms
+   wakeups are bounded (at most 64 waiters); residuals R1-R6 are accurately stated and acceptable.
    Quality: one predicate on each side; one send site; names and docs; determinism of the new tests (bounded
    waits, the fence, no sleeps standing in for synchronisation except the stated 250 ms and 800 ms negative
    checks); the additions-only rule held; test-section layout in `tests/mcp.rs`.
    Spec: AC1-AC22 against the tests; the file fence (only `server.rs`, `tests/mcp.rs`, the spec and this plan);
-   the spec's `Status` line untouched; R1-R5 and the "`ask` to `all` denies a parked request" consequence are
-   in the PR description.
+   the spec's `Status` line untouched; R1-R6 and the "`ask` to `all` denies a parked request" consequence are
+   in the PR description (the "PR description checklist" above, before Task 1, lists everything the PR body states).
 3. The orchestrator records every finding and disposition in the Review log below. Critical and Important
    findings go to a fresh Coder as a fix task (input: the findings report), then Tester and panel run again on
    the fix with the prior report. No merge with an open finding.
