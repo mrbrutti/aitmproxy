@@ -42,6 +42,7 @@ struct ChipBar: View {
         .frame(height: Tok.Size.filterBar)
         .frame(maxWidth: .infinity, alignment: .leading)
         .overlay(alignment: .bottom) { Rule() }
+        .dimsWhenInactive()
     }
 }
 
