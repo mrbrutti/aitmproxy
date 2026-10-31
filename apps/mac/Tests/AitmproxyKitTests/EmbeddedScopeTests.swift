@@ -245,7 +245,7 @@ import Testing
         #expect(!(try String(contentsOf: url, encoding: .utf8)).contains("shop.test"))
     }
 
-    @Test func aHostOnlyLoadCanRefuseNeverSurvivesALoad() throws {
+    @Test func aHostTheCoreAcceptsButTheFileRefusesNeverSurvivesARoundTrip() throws {
         // `load` validates on its own (D1), whatever wrote the file, so a host that would make
         // `Config.yaml()` throw never reaches a spawn. `save` drops it too (pinned on the raw bytes
         // below); `loadDropsInvalidAndDuplicateEntries` pins load against a hand-written file.

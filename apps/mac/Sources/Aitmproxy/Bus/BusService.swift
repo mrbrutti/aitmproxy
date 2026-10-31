@@ -262,16 +262,19 @@ final class BusService: FlowActions {
 
     /// Snapshot the embedded intent before the round trip (a Settings ▸ Bus switch mid-flight
     /// must not persist the other core's list), run the verb, refresh, then persist only for
-    /// the embedded core. For the embedded core a failed refresh is an error of the action: the
-    /// core has applied the change but `scope.json` is now stale, and a stale file reported as
-    /// success would resurrect a removed host at the next launch. An external core has no file,
-    /// so its refresh failure stays a poll-recoverable display lag, as before.
+    /// the embedded core. A verb the embedded core applied must either reach `scope.json` or be
+    /// reported: a failed refresh, or a Bus switch to External inside the round trip, leaves the
+    /// file stale, and a stale file reported as success would resurrect a removed host at the
+    /// next launch, so both throw. An external core has no file, so its refresh failure stays a
+    /// poll-recoverable display lag, as before.
     private func scopeVerb(_ name: String, host: String) async throws {
         let embedded = preferEmbedded
         _ = try await call(name, ["host": .string(host)])
         let refreshed = await refreshScope()
-        guard embedded, preferEmbedded else { return }
-        guard refreshed else { throw BusError.tool(message: "Scope change applied but not saved: scope.list failed") }
+        guard embedded else { return }
+        guard preferEmbedded, refreshed else {
+            throw BusError.tool(message: "Scope change applied but not saved: \(preferEmbedded ? "scope.list failed" : "the active core changed")")
+        }
         try persistEmbeddedScope()
     }
 

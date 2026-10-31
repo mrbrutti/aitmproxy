@@ -48,8 +48,8 @@ public struct EmbeddedScope: Codable, Hashable, Sendable {
     }
 
     /// Missing, unreadable, undecodable, not a regular file, or over `maxFileBytes` → empty.
-    /// Hosts pass through `sanitized`: load is the single validation point for what may
-    /// reach the emitted config.
+    /// Hosts pass through `sanitized` here too: `load` validates on its own, whatever wrote
+    /// the file, so a hand-edited `scope.json` cannot reach the emitted config.
     public static func load(from url: URL) -> EmbeddedScope {
         // Type and size are checked before the read: `Data(contentsOf:)` would block on a
         // FIFO and balloon on a huge file. `attributesOfItem` does not follow a symlink, so
