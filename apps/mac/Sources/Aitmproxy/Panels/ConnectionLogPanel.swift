@@ -9,7 +9,7 @@ struct ConnectionLogPanel: View {
     @Environment(Session.self) private var session
     @State private var selected: String?
 
-    static let note = "Derived from captured flows until flow.detail (F5) reports connections"
+    static let note = "Derived from captured flows until the core reports connections" // core F5
 
     private static let columns: [(title: String, width: CGFloat?)] = [
         ("Time", 96), ("Client", 128), ("Host", 200), ("TLS", 56), ("ALPN", 40), ("SNI", 200), ("Result", nil),

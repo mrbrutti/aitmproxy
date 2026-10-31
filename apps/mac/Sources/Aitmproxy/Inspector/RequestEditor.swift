@@ -14,18 +14,33 @@ struct RawRequestEditor: View {
     private var draft: HTTPMessage { session.editDrafts[row.id] ?? detail.request }
 
     var body: some View {
+        // The editor is clipped to its frame and the footer is a bottom safe-area
+        // inset, so in a short inspector the lines scroll under the footer instead
+        // of the footer painting over them.
+        CodeTextView(text: text, contentType: "message/http", bodySize: session.density.bodySize, editable: true,
+                     onTextChange: { new in
+            text = new
+            do {
+                let message = try RawHTTP.parse(new)
+                parseError = nil
+                session.updateDraft(row.id, message)
+            } catch {
+                parseError = error as? RawHTTP.ParseError ?? RawHTTP.ParseError(line: 1, message: error.localizedDescription)
+            }
+        })
+        .frame(minHeight: 60)
+        .clipped()
+        .safeAreaInset(edge: .bottom, spacing: 0) { footer }
+        .onAppear { text = RawHTTP.render(draft) }
+        .onChange(of: row.id) { text = RawHTTP.render(draft); parseError = nil }
+        // The Headers table (or a revert) changed the draft: re-render unless the text already says the same.
+        .onChange(of: session.editDrafts[row.id]) {
+            if (try? RawHTTP.parse(text)) != draft { text = RawHTTP.render(draft); parseError = nil }
+        }
+    }
+
+    private var footer: some View {
         VStack(spacing: 0) {
-            CodeTextView(text: text, contentType: "message/http", bodySize: session.density.bodySize, editable: true,
-                         onTextChange: { new in
-                text = new
-                do {
-                    let message = try RawHTTP.parse(new)
-                    parseError = nil
-                    session.updateDraft(row.id, message)
-                } catch {
-                    parseError = error as? RawHTTP.ParseError ?? RawHTTP.ParseError(line: 1, message: error.localizedDescription)
-                }
-            })
             Rule(color: Tok.Line.rule)
             HStack(spacing: Space.md) {
                 if let parseError {
@@ -61,12 +76,7 @@ struct RawRequestEditor: View {
             .padding(.horizontal, Space.md)
             .frame(height: Tok.Size.control)
         }
-        .onAppear { text = RawHTTP.render(draft) }
-        .onChange(of: row.id) { text = RawHTTP.render(draft); parseError = nil }
-        // The Headers table (or a revert) changed the draft: re-render unless the text already says the same.
-        .onChange(of: session.editDrafts[row.id]) {
-            if (try? RawHTTP.parse(text)) != draft { text = RawHTTP.render(draft); parseError = nil }
-        }
+        .background(Tok.Ground.surface.color)
     }
 }
 

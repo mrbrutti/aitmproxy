@@ -57,7 +57,11 @@ enum SelfTest {
         if live { return runLive(session: session) }
         Task {
             try? await Task.sleep(for: .seconds(0.5))
-            check("fixtures load 14 rows", session.rows.count == 14)
+            // The fixture set is Fixtures.rows + Fixtures.l4Rows; derive every count from it so
+            // the self-test follows the fixtures instead of pinning a stale literal.
+            let fixtureCount = Fixtures.rows.count + Fixtures.l4Rows.count
+            let inScopeCount = (Fixtures.rows + Fixtures.l4Rows).filter(\.inScope).count
+            check("fixtures load \(fixtureCount) rows", session.rows.count == fixtureCount)
             check("two flows are paused", session.paused.count == 2)
             check("the paused login is selected", session.focusedRow?.seq == 50)
             check("the inspector has the login detail", session.focusedDetail?.request.header("x-forwarded-for") == "127.0.0.1")
@@ -69,7 +73,7 @@ enum SelfTest {
             session.chip = .all
 
             session.page = .scope
-            check("Scope filters to in-scope flows", session.visibleRows.allSatisfy(\.inScope) && session.visibleRows.count == 13)
+            check("Scope filters to in-scope flows", session.visibleRows.allSatisfy(\.inScope) && session.visibleRows.count == inScopeCount)
             session.page = .apps
 
             session.select(session.rows[0].id)
@@ -89,8 +93,8 @@ enum SelfTest {
 
             // S-009: sorting never moves the selection; status puts rows without a code last.
             session.sort = FlowSort(key: .status, ascending: false)
-            check("sorting by status puts 502 first and paused last",
-                  session.visibleRows.first?.status == 502 && session.visibleRows.last?.state != .complete)
+            check("sorting by status puts 502 first and rows without a code last",
+                  session.visibleRows.first?.status == 502 && session.visibleRows.last?.status == nil)
             check("sorting keeps the selection", session.focusedRow?.seq == 41 && session.selection.count == 1)
             session.sort = .captureOrder
             check("capture order is the default sort", session.visibleRows.map(\.seq) == session.rows.map(\.seq))
@@ -120,7 +124,7 @@ enum SelfTest {
             session.show(.domains, group: .host("cdn.shop-staging.test"))
             check("selecting a host under Domains narrows to it", session.visibleRows.allSatisfy { $0.authority == "cdn.shop-staging.test" })
             session.show(.apps)
-            check("the group header shows all flows again", session.visibleRows.count == 14)
+            check("the group header shows all flows again", session.visibleRows.count == fixtureCount)
 
             // S-014: pins persist and never duplicate.
             session.pin(.host("cdn.shop-staging.test"))
@@ -169,7 +173,7 @@ enum SelfTest {
             session.filterText = "~m POST & ~c 2"
             check("the Advanced text filters", session.filterError == nil && session.visibleRows.map(\.seq) == [44])
             session.filterText = "~m POST &"
-            check("a parse error reports an offset", session.filterError != nil && session.visibleRows.count == 14)
+            check("a parse error reports an offset", session.filterError != nil && session.visibleRows.count == fixtureCount)
             session.setFilterAdvanced(false)
             session.clearFilter()
             session.filterStack = FilterStack(rows: [FilterRow(.host, .contains, "cdn")])
@@ -185,7 +189,9 @@ enum SelfTest {
             session.sidebarQuery = ""
             let items = session.paletteItems(for: "repl")
             check("the palette ranks flow.replay first for 'repl'", items.first?.title == "flow.replay")
-            check("every tool appears in the palette", session.paletteItems(for: "").filter { if case .command = $0.kind { return true }; return false }.count == Fixtures.tools.count)
+            // Recent entries duplicate a command under the Recent section; count the Commands section only.
+            check("every tool appears in the palette",
+                  Set(session.paletteItems(for: "").filter { $0.section == .commands }.map(\.id)).count == session.tools.count)
             let flows = session.paletteItems(for: "auth/login")
             check("a URL fragment finds its flow", flows.contains { if case .flow = $0.kind { return $0.title.contains("auth/login") }; return false })
             // M4: compose, edit & replay, kill modes, bulk.
@@ -238,7 +244,7 @@ enum SelfTest {
             session.loadFixtures()
             session.splitView = true
             session.secondQuery.chip = .websocket
-            check("the second pane has its own chip", session.secondVisibleRows.count == 1 && session.visibleRows.count == 14)
+            check("the second pane has its own chip", session.secondVisibleRows.count == 1 && session.visibleRows.count == fixtureCount)
             session.focus(pane: 1, on: session.secondVisibleRows.first?.id)
             check("selecting in pane 2 focuses it and the inspector", session.focusedPane == 1 && session.focusedRow?.kind == .websocket)
             session.splitView = false
@@ -263,7 +269,7 @@ enum SelfTest {
             let worst = batches.dropFirst().max() ?? .zero
             check("500 appended rows keep every warm batch under 50 ms (worst \(Format.duration(worst)))", worst < .milliseconds(50), Format.duration(worst))
             check("appends keep the selection", session.focusedRow?.seq == 50)
-            check("the list holds 514 rows", session.rows.count == 514)
+            check("the list holds \(fixtureCount + 500) rows", session.rows.count == fixtureCount + 500)
 
             // S-040: rules validate, test against the list, persist, and change the armed notice.
             let rule = BreakpointRule(name: "login", url: "*/api/auth/*", method: "POST")

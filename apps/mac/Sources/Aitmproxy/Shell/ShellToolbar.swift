@@ -12,7 +12,7 @@ struct ShellToolbar: ToolbarContent {
             Button { sidebarVisible.toggle() } label: {
                 Label("Toggle Sidebar", systemImage: Tok.Glyph.sidebar)
             }
-            .help("Toggle sidebar")
+            .help(sidebarVisible ? "Hide the sidebar (⌃⌘S)" : "Show the sidebar (⌃⌘S)")
             Button { session.setCapturing(!session.capturing) } label: {
                 Label(session.capturing ? "Pause Capture" : "Resume Capture",
                       systemImage: session.capturing ? Tok.Glyph.pause : Tok.Glyph.record)
@@ -68,10 +68,11 @@ struct ListeningPill: View {
                 // The pill must tell the truth about the core: a failed embedded core
                 // is not listening, so it must not keep reading "listening …".
                 switch coreHealth {
+                // One word per core state, shared with `CoreHealthDot` (B10).
                 case .failed:
-                    Text(" · core failed — not listening")
+                    Text(" · \(CoreHealth.failed.statusWord) — not listening")
                 case .restarting:
-                    Text(" · restarting…")
+                    Text(" · \(CoreHealth.restarting.statusWord)")
                 default:
                     Text(" · \(session.capturing ? "listening" : "paused") ")
                     Text(session.coreHealth.connection?.proxyAddress ?? session.listenAddress)
@@ -143,7 +144,7 @@ struct LayoutPicker: View {
     var body: some View {
         HStack(spacing: Space.xs) {
             ForEach(InspectorLayout.allCases, id: \.self) { layout in
-                layoutButton(layout, symbol: layout.symbol, help: layout.title)
+                layoutButton(layout, symbol: layout.symbol, help: layoutHelp(layout))
             }
             Button { session.splitView.toggle() } label: {
                 Image(systemName: "square.split.2x1")
@@ -153,8 +154,17 @@ struct LayoutPicker: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help(session.splitView ? "Single list" : "Split view (⌥⌘4)")
+            .help(session.splitView ? "Show one list (⌥⌘4)" : "Show two lists side by side (⌥⌘4)")
             .accessibilityAddTraits(session.splitView ? .isSelected : [])
+        }
+    }
+
+    /// Verb + shortcut, not the menu title (C3).
+    private func layoutHelp(_ layout: InspectorLayout) -> String {
+        switch layout {
+        case .horizontal: "Show the inspector below the list (⌥⌘1)"
+        case .vertical: "Show the inspector beside the list (⌥⌘2)"
+        case .detached: "Detach the inspector into its own window (⌥⌘3)"
         }
     }
 

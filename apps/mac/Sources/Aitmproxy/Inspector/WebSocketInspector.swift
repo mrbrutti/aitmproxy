@@ -105,13 +105,12 @@ private struct WSFramesList: View {
     private var header: some View {
         HStack(spacing: Tok.Metric.gapMeta) {
             Text("Messages").font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
-            Picker("Direction", selection: $direction) {
-                ForEach(WSDirectionFilter.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .accessibilityIdentifier("ws-direction-filter")
+            // The flat segment keeps the inspector's tab language; a system segmented
+            // picker would be the one accent-filled capsule in the pane.
+            FlatSegment(options: WSDirectionFilter.allCases.map { ($0, $0.rawValue) }, selection: $direction)
+                .fixedSize()
+                .accessibilityIdentifier("ws-direction-filter")
+                .accessibilityLabel("Direction")
             Spacer(minLength: 0)
             Text([detail.connection.httpVersion, detail.connection.tlsVersion, detail.connection.alpn]
                 .compactMap { $0 }.joined(separator: " · "))

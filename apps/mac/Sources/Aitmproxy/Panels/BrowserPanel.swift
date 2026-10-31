@@ -89,7 +89,9 @@ struct BrowserPanel: View {
     private var toolbar: some View {
         HStack(spacing: Space.sm) {
             glyphButton("chevron.left", help: "Back") { Task { await state.back() } }
+                .disabled(!(state.current?.canGoBack ?? false))
             glyphButton("chevron.right", help: "Forward") { Task { await state.forward() } }
+                .disabled(!(state.current?.canGoForward ?? false))
             glyphButton("arrow.clockwise", help: "Reload") { Task { await state.reload() } }
             TextField("https://", text: $state.urlText)
                 .textFieldStyle(.plain)
@@ -125,7 +127,8 @@ struct BrowserPanel: View {
                 .frame(width: Tok.Size.control, height: Tok.Size.control)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        // PressStyle dims a disabled glyph (Back with no history), where .plain would not.
+        .buttonStyle(PressStyle())
         .help(help)
         .accessibilityLabel(help)
     }
@@ -307,7 +310,7 @@ struct DOMDrawer: View {
     var body: some View {
         ScrollView([.vertical, .horizontal]) {
             VStack(alignment: .leading, spacing: 0) {
-                if lines.isEmpty { Hint(text: "No DOM yet — click DOM to fetch it.") }
+                if lines.isEmpty { Hint(text: "No outline yet — click Outline to fetch it.") }
                 ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
                     Text(line)
                         .font(Tok.Face.data(Tok.Typography.Size.sm))

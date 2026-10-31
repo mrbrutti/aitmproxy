@@ -42,7 +42,7 @@ enum FlowColumn: String, CaseIterable {
         case .url: 300
         case .client: 96
         case .method: 72
-        case .status: 72
+        case .status: 84
         case .time: 124
         case .duration: 88
         case .request: 80

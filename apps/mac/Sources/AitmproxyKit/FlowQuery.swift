@@ -13,20 +13,23 @@ public enum FlowGroup: Hashable, Sendable {
 public struct FlowQuery: Hashable, Sendable {
     public var inScopeOnly = false
     public var group: FlowGroup?
+    /// The sidebar's Pinned page with no sub-item: only flows whose host or client app is pinned.
+    public var pins: Pins?
     public var chip: ContentCategory = .all
     public var filter: FilterExpression = .matchAll
     public var sort: FlowSort = .captureOrder
 
-    public init(inScopeOnly: Bool = false, group: FlowGroup? = nil, chip: ContentCategory = .all,
+    public init(inScopeOnly: Bool = false, group: FlowGroup? = nil, pins: Pins? = nil, chip: ContentCategory = .all,
                 filter: FilterExpression = .matchAll, sort: FlowSort = .captureOrder) {
         self.inScopeOnly = inScopeOnly
         self.group = group
+        self.pins = pins
         self.chip = chip
         self.filter = filter
         self.sort = sort
     }
 
-    public var isNarrowing: Bool { inScopeOnly || group != nil || chip != .all || filter != .matchAll }
+    public var isNarrowing: Bool { inScopeOnly || group != nil || pins != nil || chip != .all || filter != .matchAll }
 
     /// The rows this list shows. Compiles the filter once per call; callers
     /// that run on every keystroke should cache via `compiled()`.
@@ -53,6 +56,10 @@ public struct FlowQuery: Hashable, Sendable {
             case .host(let host)?: out = out.filter { $0.authority == host }
             case .client(let name)?: out = out.filter { $0.client?.name == name }
             case nil: break
+            }
+            if let pins = query.pins {
+                let hosts = Set(pins.hosts), apps = Set(pins.apps)
+                out = out.filter { hosts.contains($0.authority) || $0.client.map { apps.contains($0.name) } == true }
             }
             if query.chip != .all {
                 out = out.filter { row in

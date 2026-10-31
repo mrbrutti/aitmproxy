@@ -19,6 +19,12 @@ struct RulesSheet: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            Text("Edit Breakpoint Rules")
+                .font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold))
+                .foregroundStyle(Tok.Ink.primary.color)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, Space.lg).padding(.top, Space.xl).padding(.bottom, Space.md)
+            Rule()
             HStack(spacing: 0) {
                 table
                 VRule()
@@ -36,7 +42,9 @@ struct RulesSheet: View {
             }
             .padding(Space.lg)
         }
-        .frame(width: 820, height: 480)
+        // Two scroll views (the table and the grouped form) share this sheet, so
+        // `fitsContent` has no single content height to follow: a fixed height.
+        .frame(width: 640, height: 440)
         .background(Tok.Ground.surface.color)
         .onAppear {
             draft = session.breakpointRules
@@ -46,9 +54,9 @@ struct RulesSheet: View {
 
     private var table: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("BREAKPOINT RULES").font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
+            Text("RULES").font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
                 .foregroundStyle(Tok.Ink.tertiary.color)
-                .padding(.horizontal, Space.lg).padding(.top, Space.xl).padding(.bottom, Space.sm)
+                .padding(.horizontal, Space.lg).padding(.top, Space.md).padding(.bottom, Space.sm)
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(draft.rules) { rule in
@@ -95,7 +103,7 @@ struct RulesSheet: View {
             }
             .padding(Space.sm)
         }
-        .frame(width: 300)
+        .frame(width: 240)
         .background(Tok.Ground.page.color)
     }
 
@@ -128,7 +136,7 @@ struct RulesSheet: View {
                 }
                 LabeledContent("Test your rule") {
                     HStack(spacing: Space.sm) {
-                        Button("Test against the list") {
+                        Button("Test Against List") {
                             let n = draft.matchCount(of: rule.wrappedValue, in: session.rows)
                             testResult = "\(n) of \(session.rows.count) flows match"
                         }

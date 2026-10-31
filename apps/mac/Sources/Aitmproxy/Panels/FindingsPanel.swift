@@ -139,11 +139,38 @@ final class PocPanelState {
         }
     }
 
+    /// Export… — ask for a folder, then write the selected finding's bundle into it
+    /// (S-051). Shared by the detail header and the row's context menu.
+    func exportViaPanel() {
+        guard selectedFinding != nil else { return }
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = "Export"
+        panel.message = "Choose a folder for the YAML, screenshot and HAR"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        exportBundle(to: url)
+    }
+
     /// Open the finding capture in the inspector: select the flow, switch to Apps.
     func openCapture() {
         guard let id = selectedFinding?.captureID else { return }
         session.select(id)
         session.show(.apps)
+    }
+
+    /// Copy the finding's target URL to the clipboard.
+    func copyTarget(_ finding: Finding) {
+        Pasteboard.copy(finding.target, sensitive: true)
+    }
+
+    /// Move the selection up or down one row (arrow keys on the list).
+    func moveSelection(by offset: Int) {
+        guard !findings.isEmpty else { return }
+        let index = findings.firstIndex { $0.id == selected } ?? (offset > 0 ? -1 : findings.count)
+        let next = min(max(index + offset, 0), findings.count - 1)
+        select(findings[next].id)
     }
 
     // MARK: Helpers
@@ -211,6 +238,9 @@ extension Severity {
 /// PoC runs on the left, the selected finding's detail on the right.
 struct FindingsPanel: View {
     @Bindable var state: PocPanelState
+    @FocusState private var listFocused: Bool
+    /// The row whose Run Again… popover is open (from its context menu).
+    @State private var runAgainID: Finding.ID?
 
     var body: some View {
         HStack(spacing: 0) {
@@ -244,11 +274,56 @@ struct FindingsPanel: View {
                     ForEach(state.findings) { finding in
                         FindingRow(finding: finding, selected: finding.id == state.selected)
                             .contentShape(Rectangle())
-                            .onTapGesture { state.select(finding.id) }
+                            .onTapGesture {
+                                state.select(finding.id)
+                                listFocused = true
+                            }
+                            .contextMenu { rowMenu(finding) }
+                            .popover(isPresented: runAgainBinding(finding.id), arrowEdge: .trailing) {
+                                RunAgainPopover(state: state, finding: finding, isPresented: runAgainBinding(finding.id))
+                            }
                     }
                 }
             }
+            // Arrow keys walk the selection once the list has focus (rule 33, as Scope does).
+            .focusable()
+            .focused($listFocused)
+            .focusEffectDisabled()
+            .onMoveCommand { direction in
+                switch direction {
+                case .up: state.moveSelection(by: -1)
+                case .down: state.moveSelection(by: 1)
+                default: break
+                }
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Findings")
         }
+    }
+
+    /// The row's verbs — the same four actions as the detail header, acting on
+    /// this row (selecting it first, since the state's intents act on the selection).
+    @ViewBuilder private func rowMenu(_ finding: Finding) -> some View {
+        Button("Open Capture") {
+            state.select(finding.id)
+            state.openCapture()
+        }
+        .disabled(finding.captureID == nil)
+        Button("Run Again…") {
+            state.select(finding.id)
+            runAgainID = finding.id
+        }
+        Button("Export…") {
+            state.select(finding.id)
+            state.exportViaPanel()
+        }
+        Divider()
+        Button("Copy Target URL") { state.copyTarget(finding) }
+            .disabled(finding.target.isEmpty)
+    }
+
+    private func runAgainBinding(_ id: Finding.ID) -> Binding<Bool> {
+        Binding(get: { runAgainID == id }, set: { if !$0, runAgainID == id { runAgainID = nil } })
     }
 }
 

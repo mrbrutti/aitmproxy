@@ -141,7 +141,7 @@ extension Session {
             return
         }
         switch action {
-        case .resume: row.edited ? applyAndResume(id) : resume(id)
+        case .resume: pendingEditCount(id) > 0 ? applyAndResume(id) : resume(id)
         case .kill: kill(id)
         case .delete: deleteOrKill(id)
         case .replay: replay(id)
@@ -155,8 +155,7 @@ extension Session {
         case .buildPoC: buildPoCFlowID = id
         case .pinHost: isPinned(.host(row.authority)) ? unpin(.host(row.authority)) : pin(.host(row.authority))
         case .copyURL:
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(row.url, forType: .string)
+            Pasteboard.copy(row.url, sensitive: true)
         case .quickLook:
             if let detail = details[id], BodyQuickLook.shared.prepare(detail, row: row) {
                 quickLookTick += 1

@@ -24,6 +24,9 @@ struct FlowTableView: NSViewRepresentable {
     var onFocus: (FlowID?) -> Void
     /// A verb from the keyboard or the context menu, with the row it targets.
     var onAction: (FlowRowAction, FlowID) -> Void = { _, _ in }
+    /// Pending draft edits per flow: the row menu titles Resume vs Apply & Resume from the same
+    /// predicate as the intercept bar and the Flow menu.
+    @Environment(Session.self) private var session
     var onToggleIntercept: () -> Void = {}
     var onCompose: () -> Void = {}
 
@@ -57,7 +60,10 @@ struct FlowTableView: NSViewRepresentable {
         for column in order {
             let c = NSTableColumn(identifier: column.identifier)
             c.title = column.title
-            c.width = layout.width(for: column.rawValue, default: column.width)
+            // URL is the flexible column: it takes whatever the pane leaves, so its width is
+            // never restored from the saved layout (a width saved from a wider pane would be
+            // replayed verbatim and push the table past its clip into a horizontal scroll).
+            c.width = column == .url ? column.width : layout.width(for: column.rawValue, default: column.width)
             c.minWidth = column.minWidth
             c.resizingMask = column == .url ? .autoresizingMask : .userResizingMask
             c.headerCell = FlowHeaderCell(textCell: column.title)
@@ -86,12 +92,14 @@ struct FlowTableView: NSViewRepresentable {
         scroll.borderType = .noBorder
         scroll.drawsBackground = true
         scroll.backgroundColor = Tok.Ground.surface.nsColor
+        coordinator.observeClip(scroll)
         return scroll
     }
 
     func updateNSView(_ scroll: NSScrollView, context: Context) {
         let coordinator = context.coordinator
         coordinator.parent = self
+        coordinator.pendingEdits = { [session] id in session.pendingEditCount(id) }
         guard let table = coordinator.table else { return }
         if coordinator.density != density {
             coordinator.density = density
@@ -130,6 +138,7 @@ struct FlowTableView: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
         var parent: FlowTableView
+        var pendingEdits: (FlowID) -> Int = { _ in 0 }
         var rows: [FlowRow] = []
         var density: Density
         var appliedSort: FlowSort = .captureOrder
@@ -330,7 +339,8 @@ struct FlowTableView: NSViewRepresentable {
                 menu.addItem(item)
             }
             let paused = row.state == .paused
-            add(row.edited ? "Apply & Resume" : "Resume", .resume, enabled: paused)
+            // One predicate with the bar and the Flow menu: pending drafts, not the applied flag.
+            add(pendingEdits(row.id) > 0 ? "Apply & Resume" : "Resume", .resume, enabled: paused)
             add("Edit Paused Request", .edit, key: "e", enabled: paused)
             add(paused || row.state == .pending ? "Kill" : "Delete", .delete, key: "d")
             menu.addItem(.separator())
@@ -373,6 +383,7 @@ struct FlowTableView: NSViewRepresentable {
             guard let id = sender.representedObject as? String, let column = FlowColumn(rawValue: id), !column.alwaysVisible,
                   let tableColumn = table?.tableColumn(withIdentifier: column.identifier) else { return }
             tableColumn.isHidden.toggle()
+            fitURLColumn()
             saveLayoutSoon()
         }
 
@@ -386,6 +397,31 @@ struct FlowTableView: NSViewRepresentable {
                 if current != index, current >= 0 { table.moveColumn(current, toColumn: index) }
             }
             if let url = parent.layoutURL { try? FileManager.default.removeItem(at: url) }
+            fitURLColumn()
+        }
+
+        /// The URL column takes whatever width the other visible columns leave, so the table
+        /// always fits its clip: no horizontal scroll bar after a side panel opens, a layout
+        /// change, or a column toggle. AppKit's own column autoresizing only re-tiles on some
+        /// frame changes and never when a saved layout is replayed, so the fit is explicit.
+        func fitURLColumn() {
+            guard let table, let clip = table.enclosingScrollView?.contentView,
+                  let url = table.tableColumn(withIdentifier: FlowColumn.url.identifier), !url.isHidden else { return }
+            let visible = table.tableColumns.filter { !$0.isHidden }
+            let others = visible.filter { $0 !== url }.reduce(CGFloat(0)) { $0 + $1.width }
+            let spacing = CGFloat(visible.count) * table.intercellSpacing.width
+            let target = max(url.minWidth, clip.bounds.width - others - spacing)
+            if abs(url.width - target) > 0.5 { url.width = target }
+        }
+
+        func observeClip(_ scroll: NSScrollView) {
+            scroll.contentView.postsFrameChangedNotifications = true
+            NotificationCenter.default.addObserver(self, selector: #selector(clipResized), name: NSView.frameDidChangeNotification,
+                                                   object: scroll.contentView)
+        }
+
+        @objc private func clipResized(_ note: Notification) {
+            fitURLColumn()
         }
 
         func observeColumns(_ table: NSTableView) {
@@ -413,7 +449,8 @@ struct FlowTableView: NSViewRepresentable {
             var layout = ColumnLayout()
             for column in table.tableColumns {
                 layout.order.append(column.identifier.rawValue)
-                layout.widths[column.identifier.rawValue] = column.width
+                // The flexible URL column's width is derived from the pane, never persisted.
+                if column.identifier != FlowColumn.url.identifier { layout.widths[column.identifier.rawValue] = column.width }
                 if column.isHidden { layout.hidden.insert(column.identifier.rawValue) }
             }
             return layout
