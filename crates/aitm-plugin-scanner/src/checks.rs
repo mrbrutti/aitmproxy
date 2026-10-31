@@ -12,7 +12,7 @@
 //! declarative PoC's `success` would use.
 
 use aitm_poc::matcher::{evaluate, MatchContext};
-use aitm_poc::{Assertion, MatchPart};
+use aitm_poc::{Assertion, MatchPart, Severity};
 
 use crate::discover::Location;
 
@@ -123,12 +123,6 @@ impl CheckDefinition {
         headers: &[(String, String)],
         payload: &Payload,
     ) -> Option<Evidence> {
-        // Open-redirect only fires on a real redirect: a stray off-origin URL
-        // echoed into a non-redirect response's headers is not a redirect. Gate
-        // on the statuses a user agent actually follows (not 300/304/305/306).
-        if self.class == CLASS_OPEN_REDIRECT && !matches!(status, 301 | 302 | 303 | 307 | 308) {
-            return None;
-        }
         let assertion = self.success_assertion(payload);
         // An empty word matches every response; never confirm on one (a
         // hand-built `Payload` with an empty value and no marker would
@@ -161,14 +155,26 @@ impl CheckDefinition {
     /// The `success` assertion this class confirms with, for one payload — the
     /// exact assertion a recorded PoC's `success` reuses (`build_poc`, Wave 2).
     /// Reflected-XSS looks for the payload's own marker (each payload judged
-    /// independently); open-redirect looks for the sentinel host in the
-    /// `Location` header of a redirect (one assertion covers every payload).
+    /// independently); open-redirect requires both a redirect status a user
+    /// agent actually follows (not 300/304/305/306/309+) *and* the sentinel
+    /// host in the `Location` header (one assertion covers every payload).
+    /// `confirm` judges a hit by evaluating exactly this assertion, so the two
+    /// can never drift apart.
     pub(crate) fn success_assertion(&self, payload: &Payload) -> Assertion {
         if self.class == CLASS_OPEN_REDIRECT {
-            Assertion::Regex {
-                regex: OPEN_REDIRECT_LOCATION_REGEX.to_string(),
-                part: MatchPart::Header,
-            }
+            Assertion::All(vec![
+                Assertion::Any(vec![
+                    Assertion::Status(301),
+                    Assertion::Status(302),
+                    Assertion::Status(303),
+                    Assertion::Status(307),
+                    Assertion::Status(308),
+                ]),
+                Assertion::Regex {
+                    regex: OPEN_REDIRECT_LOCATION_REGEX.to_string(),
+                    part: MatchPart::Header,
+                },
+            ])
         } else {
             Assertion::Word {
                 word: payload
@@ -237,6 +243,26 @@ impl CheckDefinition {
             CLASS_OPEN_REDIRECT => Some(Self::open_redirect()),
             _ => None,
         }
+    }
+
+    /// Every class `for_class` resolves, in a stable order whose first two
+    /// entries are the two shipped classes — the class dispatch table
+    /// `scan.inject`/`campaign` list, and the vocabulary an "unknown class"
+    /// error names.
+    pub fn registered_classes() -> &'static [&'static str] {
+        &[CLASS_REFLECTED_XSS, CLASS_OPEN_REDIRECT]
+    }
+}
+
+/// Severity assigned to a built PoC, keyed by class — the single mapping
+/// `reproduce::build_poc` reuses, so a class's severity cannot drift between
+/// callers. `None` for a class `for_class` does not resolve: the caller
+/// chooses the default rather than this function silently inventing one.
+pub fn severity_for(class: &str) -> Option<Severity> {
+    match class {
+        CLASS_REFLECTED_XSS => Some(Severity::High),
+        CLASS_OPEN_REDIRECT => Some(Severity::Medium),
+        _ => None,
     }
 }
 
@@ -434,6 +460,133 @@ mod tests {
             "//aitm-scan-sentinel.invalid/x".to_string(),
         )];
         assert!(def.confirm(302, "", &real, payload).is_some());
+    }
+
+    #[test]
+    fn registered_classes_starts_with_the_shipped_two() {
+        let classes = CheckDefinition::registered_classes();
+        assert_eq!(classes[0], "reflected-xss");
+        assert_eq!(classes[1], "open-redirect");
+        assert!(classes.len() >= 2);
+    }
+
+    #[test]
+    fn every_registered_class_resolves() {
+        for class in CheckDefinition::registered_classes() {
+            let def = CheckDefinition::for_class(class)
+                .unwrap_or_else(|| panic!("`{class}` is registered but does not resolve"));
+            assert!(
+                def.payloads.len() <= 25,
+                "`{class}` exceeds the payload cap: {}",
+                def.payloads.len()
+            );
+            assert!(
+                severity_for(class).is_some(),
+                "`{class}` has no severity mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn open_redirect_success_assertion_requires_a_redirect_status() {
+        let def = CheckDefinition::open_redirect();
+        let payload = def.payloads.first().expect("a payload");
+        match def.success_assertion(payload) {
+            Assertion::All(items) => {
+                assert_eq!(
+                    items[0],
+                    Assertion::Any(vec![
+                        Assertion::Status(301),
+                        Assertion::Status(302),
+                        Assertion::Status(303),
+                        Assertion::Status(307),
+                        Assertion::Status(308),
+                    ])
+                );
+                assert!(
+                    matches!(
+                        &items[1],
+                        Assertion::Regex {
+                            part: MatchPart::Header,
+                            ..
+                        }
+                    ),
+                    "{:?}",
+                    items[1]
+                );
+            }
+            other => panic!("expected Assertion::All: {other:?}"),
+        }
+
+        let xss = CheckDefinition::reflected_xss();
+        let xss_payload = xss.payloads.first().expect("a payload");
+        assert!(matches!(
+            xss.success_assertion(xss_payload),
+            Assertion::Word {
+                part: MatchPart::Body,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn confirm_matches_the_success_assertion() {
+        let def = CheckDefinition::open_redirect();
+        let payload = def.payloads.first().expect("a payload");
+        let loc = vec![(
+            "Location".to_string(),
+            "https://aitm-scan-sentinel.invalid/x".to_string(),
+        )];
+
+        for status in [301, 302, 303, 307, 308] {
+            assert!(
+                def.confirm(status, "", &loc, payload).is_some(),
+                "status {status} must confirm"
+            );
+        }
+        for status in [300, 304, 399, 200] {
+            assert!(
+                def.confirm(status, "", &loc, payload).is_none(),
+                "status {status} must not confirm"
+            );
+        }
+
+        for status in [301, 302, 303, 307, 308] {
+            if def.confirm(status, "", &loc, payload).is_some() {
+                let assertion = def.success_assertion(payload);
+                let mut ctx = MatchContext::new(status, String::new());
+                for (name, value) in &loc {
+                    ctx = ctx.with_header(name.clone(), value.clone());
+                }
+                assert!(
+                    evaluate(&assertion, &ctx),
+                    "confirm hit but the success assertion itself does not evaluate true"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn payloads_are_wire_safe() {
+        for class in CheckDefinition::registered_classes() {
+            let def = CheckDefinition::for_class(class).expect("registered");
+            for payload in &def.payloads {
+                for byte in payload.value.bytes() {
+                    assert!(
+                        byte > 0x20 && byte != 0x7f,
+                        "`{class}` payload {:?} carries a control/space byte",
+                        payload.value
+                    );
+                }
+                for forbidden in ['&', '#', '+', '%', '"', '\\', ';'] {
+                    assert!(
+                        !payload.value.contains(forbidden),
+                        "`{class}` payload {:?} carries `{forbidden}`",
+                        payload.value
+                    );
+                }
+            }
+        }
     }
 
     #[test]

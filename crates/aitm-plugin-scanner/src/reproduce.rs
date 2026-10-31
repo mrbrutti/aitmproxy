@@ -62,17 +62,6 @@ const CATCH_ALL_VAR: &str = "redacted";
 /// that was encoded more than once (`next=%252Fcb%253Fsid%253D…`).
 const MAX_DECODE_PASSES: usize = 3;
 
-/// Severity assigned to a built PoC, keyed by class. A class with no mapping
-/// here (a future `CheckDefinition::for_class` addition) defaults to `Medium`
-/// rather than silently under- or over-stating it.
-fn severity_for(class: &str) -> Severity {
-    match class {
-        "reflected-xss" => Severity::High,
-        "open-redirect" => Severity::Medium,
-        _ => Severity::Medium,
-    }
-}
-
 /// The first `max` characters of `s`.
 fn cap_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
@@ -131,7 +120,10 @@ pub fn build_poc(
     let spec = PocSpec {
         info: PocInfo {
             name: format!("{} via {point_name}", def.class),
-            severity: severity_for(def.class),
+            // The single mapping shared with `checks::registered_classes`;
+            // an unmapped class (none exist today) defaults to `Medium`
+            // rather than silently under- or over-stating severity.
+            severity: crate::checks::severity_for(def.class).unwrap_or(Severity::Medium),
             references: Vec::new(),
             tags: vec![def.class.to_string()],
             cwe: None,
