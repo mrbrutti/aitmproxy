@@ -1,0 +1,72 @@
+== Sat Oct 31 13:27:27 PDT 2026 tag=baseline ==
+== sysex state ==
+*	*	MLZF7K7B5R	at.obdev.littlesnitch.networkextension (6.5/7303)	Little Snitch Network Extension	[activated enabled]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.1/1)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610310840)	AitmproxyNE	[activated enabled]
+*	*	MLZF7K7B5R	at.obdev.littlesnitch.endpointsecurity (6.5/7303)	Little Snitch Endpoint Security	[activated enabled]
+== rendezvous present? ==
+ls: /private/tmp/aitmproxy-capture.rendezvous: No such file or directory
+== DNS: dig UDP to 1.1.1.1 ==
+example.com.		88	IN	A	172.66.147.243
+example.com.		88	IN	A	104.20.23.154
+;; Query time: 14 msec
+;; SERVER: 1.1.1.1#53(1.1.1.1)
+
+real	0m0.042s
+user	0m0.004s
+sys	0m0.016s
+== DNS: dig UDP to 8.8.8.8 ==
+cloudflare-quic.com.	300	IN	A	104.18.27.14
+cloudflare-quic.com.	300	IN	A	104.18.26.14
+;; Query time: 30 msec
+== DNS: dig TCP control ==
+example.com.		2	IN	A	104.20.23.154
+example.com.		2	IN	A	172.66.147.243
+;; Query time: 4 msec
+== DNS: system resolver (mDNSResponder) ==
+name: e6858.dsce9.akamaiedge.net
+alias: www.apple.com www-apple-com.v.aaplimg.com www.apple.com.edgekey.net 
+ipv6_address: 2600:1409:3c00:38a::1aca
+Address:	10.9.10.1#53
+Address: 18.193.151.235
+Address: 3.125.64.247
+
+real	0m0.042s
+user	0m0.005s
+sys	0m0.016s
+== DNS: dig to the LAN resolver ==
+example.org.		175	IN	A	172.66.157.237
+example.org.		175	IN	A	104.20.26.136
+;; Query time: 10 msec
+;; SERVER: 10.9.10.1#53(10.9.10.1)
+== curl TCP sanity ==
+curl: (6) Could not resolve host: example.com
+h1 0 code 000 30.023176s
+== Chrome headless, QUIC forced on cloudflare-quic.com (no TCP fallback) ==
+-- exit=0
+== Chrome headless, QUIC forced on quic.nginx.org ==
+-- exit=0
+== Chrome headless, normal (Alt-Svc) second load of cloudflare-quic.com ==
+-- exit=0
+== Chrome netlog: protocol used for cloudflare-quic.com ==
+== Firefox headless screenshot of cloudflare-quic.com (two loads, persistent temp profile) ==
+/tmp/claude/ne-survey/udp-baseline.sh: line 36: timeout: command not found
+/tmp/claude/ne-survey/udp-baseline.sh: line 37: timeout: command not found
+ls: /tmp/claude/ne-survey/ff-quic*-baseline.png: No such file or directory
+== UDP datagram flows the provider saw during this run (framework log, last 4 min) ==
+  18 app = com.google.Chrome.helper <-> 10.9.10.1:53
+  10 app = com.openai.codex.helper <-> 10.9.10.1:53
+   7 app = aitm <-> 10.9.10.1:53
+   6 app = com.google.Chrome.helper <-> 173.194.43.95:443
+   6 app = com.anthropic.claudefordesktop.helper <-> 10.9.10.1:53
+   3 app = com.google.Chrome.helper <-> 142.250.73.110:443
+   3 app = com.apple.exchangesyncd <-> 10.9.10.1:53
+   2 app = syncthing <-> 10.9.10.1:53
+   2 app = org.mozilla.firefox <-> 10.9.10.1:53
+   2 app = com.apple.dscacheutil <-> 10.9.10.1:53
+   2 app = com.apple.SafariPlatformSupport.Helper <-> 10.9.10.1:53
+   1 app = limactl <-> 185.125.190.57:123
+   1 app = com.apple.nslookup <-> 10.9.10.1:53
+   1 app = com.apple.mail <-> 10.9.10.1:53
+   1 app = com.apple.mDNSResponder <-> 10.9.10.1:53
+== UDP BASELINE DONE ==

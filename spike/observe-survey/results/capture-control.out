@@ -1,0 +1,41 @@
+== Sat Oct 31 13:44:08 PDT 2026 ==
+-- before: provider flows in last 30s: 13
+-- clicking Proxy > Disable Capture
+menu item Disable Capture of menu Proxy of menu bar item Proxy of menu bar 1 of application process Aitmproxy
+-- provider log after disable:
+Timestamp               Ty Process[PID:TID]
+2026-10-31 13:44:10.589 Df AitmproxyNE[58141:871f17d] [com.mrbrutti.aitmproxy.ne:provider] stopProxy 1
+-- provider flows in the 12 s after disable (expect 0): 0
+== IP_DONTFRAG with capture OFF ==
+-- IPv4, connected UDP sockets --
+  cloudflare-quic 104.18.27.14:443   connect ok | setsockopt(DONTFRAG) ok | send ok | send2 ok
+  same, no DONTFRAG                  connect ok | send ok | send2 ok
+  google quic 142.250.73.110:443     connect ok | setsockopt(DONTFRAG) ok | send ok | send2 ok
+  1.1.1.1:53 (DNS)                   connect ok | setsockopt(DONTFRAG) ok | send ok | send2 ok
+  LAN resolver 10.9.10.1:53          connect ok | setsockopt(DONTFRAG) ok | send ok | send2 ok
+  time.apple.com 17.253.16.125:123   connect ok | setsockopt(DONTFRAG) ok | send ok | send2 ok
+  loopback 127.0.0.1:443             connect ok | setsockopt(DONTFRAG) ok | send ok | send2 ok
+-- IPv6 --
+  cloudflare v6 [2606:4700::6812:1b0e]:443 connect EHOSTUNREACH | setsockopt(DONTFRAG) ok | send EDESTADDRREQ | send2 EDESTADDRREQ
+-- real DNS query over a CONNECTED UDP socket WITH DONTFRAG (does a reply arrive?) --
+  1.1.1.1: DONTFRAG set; reply 61 bytes in 6 ms
+  10.9.10.1: DONTFRAG set; reply 61 bytes in 1 ms
+== Chrome forced QUIC with capture OFF ==
+-- exit=0 bytes=  126015
+your browser used HTTP/3 . This page is HTTP/3 &amp; QUIC enabled. Try reloading a few times to spring it into action. N
+-- nginx exit=0 bytes=    2511
+ NGINX QUIC Preview Home QUIC Test Checking if your client supports QUIC... Congratulations! You're connected over QUIC. You're not using QUIC right now, but don't despair, check the documentation to 
+== turning capture back ON ==
+menu item Enable Capture of menu Proxy of menu bar item Proxy of menu bar 1 of application process Aitmproxy
+-- provider log after enable:
+2026-10-31 13:44:40.227 Df AitmproxyNE[58141:871f2af] [com.mrbrutti.aitmproxy.ne:survey] SURVEY k=U why=unclaimed ep=10.9.10.1:53 hn=27 sid=1 tok=1 euid=501 pid=1474 ffid=1 if=en15 self_ns=3902125 pp_
+2026-10-31 13:44:40.300 Df AitmproxyNE[58141:871fe1b] [com.mrbrutti.aitmproxy.ne:survey] SURVEY k=T why=unclaimed ep=17.156.208.23:993 hn=16 sid=1 tok=1 euid=501 pid=1474 ffid=1 if=en15 self_ns=342370
+2026-10-31 13:44:42.700 Df AitmproxyNE[58141:871f2af] [com.mrbrutti.aitmproxy.ne:survey] SURVEY k=U why=unclaimed ep=1.1.1.1:53 hn=-1 sid=1 tok=1 euid=501 pid=81243 ffid=1 if=en15 self_ns=4749500 pp_n
+-- provider flows in last 15 s (expect >0): 24
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[activated enabled]
+== IP_DONTFRAG with capture back ON (expect ECONNRESET again) ==
+-- IPv4, connected UDP sockets --
+  cloudflare-quic 104.18.27.14:443   connect ok | setsockopt(DONTFRAG) ECONNRESET | send ok | send2 ok
+  same, no DONTFRAG                  connect ok | send ok | send2 ok
+  google quic 142.250.73.110:443     connect ok | setsockopt(DONTFRAG) ECONNRESET | send ok | send2 ok
+CONTROL DONE Sat Oct 31 13:44:52 PDT 2026

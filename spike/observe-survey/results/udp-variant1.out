@@ -1,0 +1,44 @@
+== Sat Oct 31 13:36:23 PDT 2026 tag=variant1 ==
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[activated enabled]
+== DNS over UDP from user processes ==
+quic.nginx.org.		3540	IN	CNAME	demo.nginx.com. demo.nginx.com.		60	IN	A	3.125.64.247 demo.nginx.com.		60	IN	A	18.193.151.235 ;; Query time: 16 msec ;; SERVER: 1.1.1.1#53(1.1.1.1) 
+quic.nginx.org.		3200	IN	CNAME	demo.nginx.com. demo.nginx.com.		120	IN	A	18.193.151.235 demo.nginx.com.		120	IN	A	3.125.64.247 ;; Query time: 41 msec ;; SERVER: 8.8.8.8#53(8.8.8.8) 
+quic.nginx.org.		3565	IN	CNAME	demo.nginx.com. demo.nginx.com.		85	IN	A	18.193.151.235 demo.nginx.com.		85	IN	A	3.125.64.247 ;; Query time: 19 msec ;; SERVER: 10.9.10.1#53(10.9.10.1) 
+== system resolver ==
+name: cloudflare-quic.com
+ipv6_address: 2606:4700::6812:1b0e
+getaddrinfo ('18.193.151.235', 443)
+== curl resolver loop: 30 connect-by-name HTTPS fetches (curl does its own UDP DNS) ==
+-- curl loop: 30 names, failures=0, namelookup>2s=0
+== NTP (sntp, UDP 123) ==
++0.000642 +/- 0.025258 time.apple.com 17.253.16.125
+== Chrome: QUIC forced (no TCP fallback), fresh profile ==
+-- exit=0 bytes=       0
+
+-- exit=0 bytes=       0
+
+== Chrome: netlog of a normal load pair (Alt-Svc discovery then h3) ==
+-- 2nd load exit=0
+ QUIC | Cloudflare --> This content is currently available in english only. We are constantly working to provide more content in english. Thank you for your patience. Contact Sales: +1 (888) 99 FLARE +1 650 319 8930 English ▶ ▼ English Deutsch Español Français Italiano 日本語 한국어 Português Performance 
+-- netlog exit=0 size= 1104037
+netlog parse failed: Extra data: line 3670 column 2 (char 1104036)
+== Firefox: two loads, persistent temp profile, screenshots ==
+/tmp/claude/ne-survey/udp-test.sh: line 8: 62884 Alarm clock: 14            perl -e 'alarm shift; exec @ARGV' "$@"
+/tmp/claude/ne-survey/udp-test.sh: line 8: 65834 Alarm clock: 14            perl -e 'alarm shift; exec @ARGV' "$@"
+ls: /tmp/claude/ne-survey/ff-quic*-variant1.png: No such file or directory
+== UDP flows the provider saw in this run (framework log, last 5 min) ==
+  94 com.google.Chrome.helper -> 10.9.10.1:53
+  28 com.apple.curl -> 10.9.10.1:53
+  17 com.apple.mDNSResponder -> 10.9.10.1:53
+  15 com.apple.dataaccess.dataaccessd -> 142.251.34.206:443
+  14 com.openai.codex.helper -> 10.9.10.1:53
+  10 aitm -> 10.9.10.1:53
+   6 com.apple.gke.notary.tool -> 10.9.10.1:53
+   6 com.apple.cloudd -> 17.248.194.65:443
+   5 com.apple.stapler -> 10.9.10.1:53
+   4 com.google.Chrome.helper -> 142.250.73.110:443
+   4 com.google.Chrome.helper -> 104.18.26.14:443
+   4 com.apple.Safari -> 10.9.10.1:53
+   3 syncthing -> 10.9.10.1:53
+   3 com.google.Chrome.helper -> 142.251.157.119:443
+== UDP TEST DONE ==

@@ -1,0 +1,22 @@
+== Sat Oct 31 13:46:22 PDT 2026 tag=variant1 ==
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[activated enabled]
+-- Firefox (own instance, temp profile): load, wait, reload twice
+   firefox pid 82491
+27213 4 39 1280 1017
+-- Safari: open the page in a tab, reload twice, shoot
+33:44: execution error: Safari got an error: AppleEvent timed out. (-1712)
+169 2453 -1001 1440 1590
+-- UDP :443 flows the provider saw from the browsers (last 3 min)
+  13 com.apple.dataaccess.dataaccessd calendar.google.com -> 142.250.73.78:443
+   3 com.apple.nsurlsessiond gateway.icloud.com -> 17.248.194.66:443
+   2 com.apple.cloudd gateway.icloud.com -> 17.248.194.66:443
+   1 org.mozilla.firefox  -> 34.3.1.27:443
+   1 org.mozilla.firefox  -> 34.107.243.93:443
+   1 org.mozilla.firefox  -> 173.194.43.95:443
+   1 org.mozilla.firefox  -> 104.18.28.7:443
+   1 org.mozilla.firefox  -> 104.18.27.14:443
+-- TCP :443 flows from the browsers to cloudflare-quic (last 3 min)
+   1 com.apple.Safari cloudflare-quic.com -> 104.18.26.14:443
+-rw-r--r--@ 1 matt  wheel  499270 Oct 31 13:46 /tmp/claude/ne-survey/ff-gui-variant1.png
+-rw-r--r--@ 1 matt  wheel  318912 Oct 31 13:49 /tmp/claude/ne-survey/safari-variant1.png
+GUI QUIC DONE

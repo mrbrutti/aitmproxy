@@ -1,0 +1,40 @@
+== Sat Oct 31 13:51:39 PDT 2026 ==
+-- compiling
+== capture ON ==
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[activated enabled]
+  metrics: cloudflare-quic.com protocol=h3 reused=false remote=104.18.26.14:443
+https://cloudflare-quic.com/ -> 200 ok 125959 bytes
+  metrics: cloudflare-quic.com protocol=h3 reused=true remote=104.18.26.14:443
+https://cloudflare-quic.com/ -> 200 ok 125959 bytes
+  metrics: cloudflare-quic.com protocol=h3 reused=true remote=104.18.26.14:443
+https://cloudflare-quic.com/ -> 200 ok 125959 bytes
+  metrics: quic.nginx.org protocol=h3 reused=false remote=3.125.64.247:443
+https://quic.nginx.org/ -> 200 ok 2523 bytes
+  metrics: quic.nginx.org protocol=nil reused=false remote=?:0
+https://quic.nginx.org/ -> 200 ok 2523 bytes
+-- Safari once more (open -> Alt-Svc known now?)
+-- UDP:443 flows from Apple's stack / Safari in the last 90 s:
+   2 com.apple.Safari www.youtube.com -> 10.9.10.1:53
+   2 apple-h3 demo.nginx.com -> 10.9.10.1:53
+   2 apple-h3 cloudflare-quic.com -> 10.9.10.1:53
+   1 com.apple.Safari www.youtube.com -> 142.251.156.4:443
+   1 com.apple.Safari www.cloudflare.com -> 104.16.123.96:443
+   1 com.apple.Safari web.archive.org -> 10.9.10.1:53
+   1 com.apple.Safari cloudflare-quic.com -> 104.18.26.14:443
+   1 apple-h3 quic.nginx.org -> 3.125.64.247:443
+== capture OFF ==
+-- flows in last 6 s (expect 0): 0
+  metrics: cloudflare-quic.com protocol=h3 reused=false remote=104.18.26.14:443
+https://cloudflare-quic.com/ -> 200 ok 125959 bytes
+  metrics: cloudflare-quic.com protocol=h3 reused=true remote=104.18.26.14:443
+https://cloudflare-quic.com/ -> 200 ok 125959 bytes
+  metrics: cloudflare-quic.com protocol=h3 reused=true remote=104.18.26.14:443
+https://cloudflare-quic.com/ -> 200 ok 125959 bytes
+  metrics: quic.nginx.org protocol=h3 reused=false remote=18.193.151.235:443
+https://quic.nginx.org/ -> 200 ok 2523 bytes
+  metrics: quic.nginx.org protocol=nil reused=false remote=?:0
+https://quic.nginx.org/ -> 200 ok 2523 bytes
+== capture back ON ==
+-- flows in last 15 s (expect >0): 1
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[activated enabled]
+APPLE-H3 DONE Sat Oct 31 13:52:24 PDT 2026

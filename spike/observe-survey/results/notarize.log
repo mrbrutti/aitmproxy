@@ -1,0 +1,11 @@
+Conducting pre-submission checks for Aitmproxy-survey.zip and initiating connection to the Apple notary service...
+Submission ID received
+  id: a00f5a6f-482d-42ef-a0ba-f6c4ee28166d
+Successfully uploaded file
+  id: a00f5a6f-482d-42ef-a0ba-f6c4ee28166d
+  path: /tmp/claude/ne-survey/Aitmproxy-survey.zip
+Waiting for processing to complete.
+Current status: In Progress...Current status: In Progress....Current status: In Progress.....Current status: In Progress......Current status: Accepted.......Processing complete
+  id: a00f5a6f-482d-42ef-a0ba-f6c4ee28166d
+  status: Accepted
+

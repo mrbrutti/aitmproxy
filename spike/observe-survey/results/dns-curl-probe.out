@@ -1,0 +1,83 @@
+== Sat Oct 31 13:33:30 PDT 2026 ==
+== which curl ==
+/usr/bin/curl
+curl 8.7.1 (x86_64-apple-darwin26.0) libcurl/8.7.1 (SecureTransport) LibreSSL/3.3.6 zlib/1.2.12 nghttp2/1.69.0
+Release-Date: 2024-03-27
+== curl -v example.com (10s max) ==
+* Host example.com:443 was resolved.
+*   Trying 172.66.147.243:443...
+* Connected to example.com (172.66.147.243) port 443
+* using HTTP/2
+* [HTTP/2] [1] OPENED stream for https://example.com/
+* [HTTP/2] [1] [:method: GET]
+* [HTTP/2] [1] [:scheme: https]
+* [HTTP/2] [1] [:authority: example.com]
+== curl by IP (bypass DNS) ==
+code 200 0.027736s
+== curl http://1.1.1.1/ ==
+code 301 0.013025s
+== getaddrinfo via python ==
+('172.66.147.243', 443)
+
+real	0m0.055s
+user	0m0.016s
+sys	0m0.009s
+== host / dscacheutil ==
+example.com has address 172.66.147.243
+example.com has address 104.20.23.154
+name: example.com
+ipv6_address: 2606:4700:10::6814:179a
+ipv6_address: 2606:4700:10::ac42:93f3
+== ping (resolver via mDNSResponder) ==
+PING example.com (172.66.147.243): 56 data bytes
+64 bytes from 172.66.147.243: icmp_seq=0 ttl=57 time=5.233 ms
+== scutil --dns (resolvers) ==
+resolver #1
+  nameserver[0] : 10.9.10.1
+  if_index : 34 (en15)
+  flags    : Request A records
+resolver #2
+  flags    : Request A records
+resolver #3
+  flags    : Request A records
+resolver #4
+  flags    : Request A records
+resolver #5
+  flags    : Request A records
+== curl again ==
+code 200 0.047344s
+== provider flows for curl/mDNSResponder, last 20 min ==
+13:16:02.992 datagram com.apple.mDNSResponder name=calendar.google.com 10.9.10.1:53
+13:16:02.996 datagram com.apple.mDNSResponder name=calendar.google.com 10.9.10.1:53
+13:16:06.935 datagram com.apple.mDNSResponder name=mask.apple-dns.net 10.9.10.1:53
+13:16:07.005 datagram com.apple.mDNSResponder name=mask.icloud.com 17.248.242.101:443
+13:21:55.709 datagram com.apple.mDNSResponder name=calendar.google.com 10.9.10.1:53
+13:21:55.713 datagram com.apple.mDNSResponder name=calendar.google.com 10.9.10.1:53
+13:22:46.803 datagram com.apple.curl name=analytics.brew.sh 10.9.10.1:53
+13:22:46.843 stream com.apple.curl name=analytics.brew.sh 18.65.238.34:443
+13:26:19.138 datagram com.apple.mDNSResponder name=b._dns-sd._udp.s9labs.com 10.9.10.1:53
+13:27:27.467 datagram com.apple.dig name= 1.1.1.1:53
+13:27:27.499 datagram com.apple.dig name= 8.8.8.8:53
+13:27:27.537 stream com.apple.dig name= 1.1.1.1:53
+13:27:27.702 datagram com.apple.dscacheutil name=www.apple.com 10.9.10.1:53
+13:27:27.939 datagram com.apple.dscacheutil name=e6858.dsce9.akamaiedge.net 10.9.10.1:53
+13:27:28.007 datagram com.apple.nslookup name= 10.9.10.1:53
+13:27:28.040 datagram com.apple.dig name= 10.9.10.1:53
+13:27:28.091 datagram com.apple.curl name=example.com 10.9.10.1:53
+13:28:16.215 datagram com.apple.mDNSResponder name=lb._dns-sd._udp.s9labs.com 10.9.10.1:53
+13:28:33.651 datagram com.apple.mDNSResponder name=db._dns-sd._udp.s9labs.com 10.9.10.1:53
+13:29:55.053 datagram com.apple.mDNSResponder name=mask.apple-dns.net 10.9.10.1:53
+13:29:55.087 datagram com.apple.mDNSResponder name=mask.icloud.com 17.248.242.51:443
+13:29:57.042 datagram com.apple.mDNSResponder name=calendar.google.com 10.9.10.1:53
+13:29:57.046 datagram com.apple.mDNSResponder name=calendar.google.com 10.9.10.1:53
+13:31:48.980 datagram com.apple.mDNSResponder name=mask.apple-dns.net 10.9.10.1:53
+13:31:49.026 datagram com.apple.mDNSResponder name=mask.icloud.com 17.248.242.68:443
+13:33:30.067 datagram com.apple.curl name=example.com 10.9.10.1:53
+13:33:30.087 stream com.apple.curl name=example.com 172.66.147.243:443
+13:33:30.120 stream com.apple.curl name=example.com 104.20.23.154:443
+13:33:30.159 stream com.apple.curl name= 1.1.1.1:80
+13:33:30.289 datagram com.apple.dscacheutil name=example.com 10.9.10.1:53
+13:33:30.392 stream com.apple.curl name=example.com 172.66.147.243:443
+== mDNSResponder log mentioning example.com, last 20 min ==
+== Little Snitch denies, last 20 min (if logged) ==
+== PROBE DONE ==

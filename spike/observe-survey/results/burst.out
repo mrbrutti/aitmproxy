@@ -1,0 +1,48 @@
+== Chrome headless https://www.theverge.com/ at 2026-10-31 14:04:11 ==
+-- Chrome.helper new flows per second (first 20 s):
+   2 14:04:21
+ 101 14:04:22
+ 187 14:04:23
+ 235 14:04:24
+ 336 14:04:25
+ 122 14:04:26
+  92 14:04:27
+ 141 14:04:28
+  24 14:04:29
+   3 14:04:42
+-- total Chrome flows in window: 1243
+== Chrome headless https://www.cnn.com/ at 2026-10-31 14:04:49 ==
+-- Chrome.helper new flows per second (first 20 s):
+  34 14:04:49
+ 108 14:04:50
+  34 14:04:51
+-- total Chrome flows in window: 176
+== Chrome headless https://www.nytimes.com/ at 2026-10-31 14:05:08 ==
+-- Chrome.helper new flows per second (first 20 s):
+  55 14:05:08
+  11 14:05:09
+-- total Chrome flows in window: 66
+== Safari https://www.theverge.com/ at 2026-10-31 14:05:24 ==
+-- Safari/WebKit new flows per second:
+  15 14:05:24
+  23 14:05:25
+  38 14:05:26
+  50 14:05:27
+  42 14:05:28
+  34 14:05:29
+  66 14:05:30
+  59 14:05:31
+  17 14:05:32
+  18 14:05:33
+  34 14:05:34
+  36 14:05:35
+  23 14:05:36
+   5 14:05:39
+-- all apps, flows per second in that window:
+  67 14:05:30
+  59 14:05:31
+  53 14:05:27
+  48 14:05:28
+  44 14:05:34
+-- provider SURVEY-RATE lines since the bursts:
+BURST DONE Sat Oct 31 14:05:48 PDT 2026

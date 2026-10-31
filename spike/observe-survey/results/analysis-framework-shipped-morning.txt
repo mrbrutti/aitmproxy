@@ -1,0 +1,24 @@
+framework per-flow lines: New flow=16957  Calling={('handleNewUDPFlow', 'UDP'): 6554, ('handleNewFlow', 'TCP'): 10403}  rejected={'UDP': 6549, 'TCP': 10396}
+by type: {'datagram': 6554, 'stream': 10403}
+remote hostname set (framework 'name ='): {'datagram:unset': 2967, 'datagram:set': 3587, 'stream:unset': 3334, 'stream:set': 7069}
+app signing id empty: {'datagram:set': 6554, 'stream:set': 10403}
+filter_id nil: {'datagram:set': 4503, 'datagram:nil': 2051, 'stream:set': 10403}
+interfaces: {'en15': 12934, 'en15(bound)': 2426, 'en0(bound)': 1000, 'utun12(bound)': 222, 'utun10(bound)': 222, 'en0': 151, 'bridge101(bound)': 1, 'lo0': 1}
+remote with port 0: 0
+unique-identifier byte length in 'Calling' lines: {'20': 16957}
+top remote ports (type, port): [('stream:443', 4998), ('datagram:53', 3969), ('datagram:443', 1517), ('stream:7a1e.62078', 1514), ('stream:80', 1424), ('stream:49152', 971), ('datagram:3722', 920), ('stream:62078', 510), ('stream:c03b.1024', 222), ('stream:d083.1024', 222), ('stream:7a1e.49152', 218), ('datagram:123', 125)]
+UDP remote ports: {'53': 3969, '443': 1517, '3722': 920, '123': 125, '5351': 9, '7a1e.3722': 5, '3482': 3, '67': 2, '328d.5353': 1, '58484': 1}
+top apps: [('aitm', 3080), ('com.apple.CoreDevice.remotepairingd', 2114), ('com.apple.usbmuxd', 1683), ('com.anthropic.claude-code', 1653), ('codex', 933), ('com.anthropic.claudefordesktop.helper', 882), ('com.google.Chrome.helper', 833), ('com.openai.codex.helper', 771), ('com.apple.dataaccess.dataaccessd', 750), ('com.apple.AMPDeviceDiscoveryAgent', 516), ('com.apple.identityservicesd', 471), ('com.apple.mDNSResponder', 420), ('com.apple.Safari', 364), ('com.apple.AddressBookSourceSync', 353), ('com.apple.mail', 205)]
+rates:
+  window: 2026-10-31 08:49:40 .. 2026-10-31 13:27:28  flows: 16957
+  per hour:
+    2026-10-31 08:00    1276  (0.35/s avg)
+    2026-10-31 09:00    2642  (0.73/s avg)
+    2026-10-31 10:00    3855  (1.07/s avg)
+    2026-10-31 11:00    4076  (1.13/s avg)
+    2026-10-31 12:00    3421  (0.95/s avg)
+    2026-10-31 13:00    1687  (0.47/s avg)
+  busiest minutes: 2026-10-31 10:29 = 634 (10.6/s), 2026-10-31 10:28 = 538 (9.0/s), 2026-10-31 11:27 = 465 (7.8/s), 2026-10-31 08:51 = 374 (6.2/s), 2026-10-31 12:52 = 339 (5.7/s)
+  busiest seconds: 13:17:46 = 60, 13:17:42 = 56, 13:17:57 = 56, 13:21:05 = 53, 11:27:14 = 51, 11:15:59 = 50, 13:21:06 = 50, 11:13:43 = 47
+  per-second (over seconds that had >=1 flow, n=4631): p50=2 p90=7 p99=25 max=60
+  busiest 10 s window: 282 flows starting 2026-10-31 08:50:58 (28.2/s)

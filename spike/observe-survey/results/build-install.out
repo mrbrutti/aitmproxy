@@ -1,0 +1,54 @@
+== Sat Oct 31 13:32:45 PDT 2026 tree 5a7bc02 ==
+== installed before: app build 202610310840, sysex build 202610310840 ==
+sha1 Fingerprint=1D:24:F9:5F:CA:65:C0:61:29:13:4F:A5:AB:E1:14:DF:9C:72:8B:98
+== quit the running app ==
+== build --ne --allow-unnotarized ==
+ne-preflight: signing with Developer ID 1D24F95FCA65C06129134FA5ABE114DF9C728B98 (in both profiles)
+replacing /Applications/Aitmproxy.app (version 0.5.3, build 202610310840) with version 0.5.3 (release)
+/Users/matt/Security/aitmproxy/.claude/worktrees/cranky-vaughan-0e27b2/apps/mac/Sources/AitmproxyKit/LanguageCompletion.swift:157:13: [1;33mwarning: [1;39mvariable 'top' was never mutated; consider changing to 'let' constant[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/variable-never-mutated\VariableNeverMutated]8;;\]
+    [0;36m|[0;0m             `- [1;33mwarning: [1;39mvariable 'top' was never mutated; consider changing to 'let' constant[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/variable-never-mutated\VariableNeverMutated]8;;\]
+/Users/matt/Security/aitmproxy/.claude/worktrees/cranky-vaughan-0e27b2/apps/mac/Sources/Aitmproxy/Inspector/InspectorView.swift:123:13: [1;33mwarning: [1;39m'+' was deprecated in macOS 26.0: Use string interpolation on `Text` instead: `Text("Hello \(name)")`[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\DeprecatedDeclaration]8;;\]
+    [0;36m|[0;0m             `- [1;33mwarning: [1;39m'+' was deprecated in macOS 26.0: Use string interpolation on `Text` instead: `Text("Hello \(name)")`[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\DeprecatedDeclaration]8;;\]
+/Users/matt/Security/aitmproxy/.claude/worktrees/cranky-vaughan-0e27b2/apps/mac/Sources/Aitmproxy/Inspector/InspectorView.swift:125:25: [1;33mwarning: [1;39m'+' was deprecated in macOS 26.0: Use string interpolation on `Text` instead: `Text("Hello \(name)")`[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\DeprecatedDeclaration]8;;\]
+    [0;36m|[0;0m                         `- [1;33mwarning: [1;39m'+' was deprecated in macOS 26.0: Use string interpolation on `Text` instead: `Text("Hello \(name)")`[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\DeprecatedDeclaration]8;;\]
+/Users/matt/Security/aitmproxy/.claude/worktrees/cranky-vaughan-0e27b2/apps/mac/Sources/Aitmproxy/UI/AppearanceSettings.swift:121:17: [1;33mwarning: [1;39m'+' was deprecated in macOS 26.0: Use string interpolation on `Text` instead: `Text("Hello \(name)")`[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\DeprecatedDeclaration]8;;\]
+    [0;36m|[0;0m                 `- [1;33mwarning: [1;39m'+' was deprecated in macOS 26.0: Use string interpolation on `Text` instead: `Text("Hello \(name)")`[0;0m [#]8;;https://docs.swift.org/compiler/documentation/diagnostics/deprecated-declaration\DeprecatedDeclaration]8;;\]
+Build complete! (74.86 sec)
+wrote Resources/Assets.car and Resources/AppIcon.icns
+bundled embedded core: /Applications/Aitmproxy.app/Contents/Resources/core/{aitm,obscura}
+built + embedded system extension: /Applications/Aitmproxy.app/Contents/Library/SystemExtensions/com.mrbrutti.aitmproxy.ne.systemextension
+installed /Applications/Aitmproxy.app (signed: 1D24F95FCA65C06129134FA5ABE114DF9C728B98)
+WARNING: system extension embedded but NOT notarized — activation will fail with 'code signature invalid' until scripts/notarize-dmg.sh runs; the notarized DMG is the only path to a working capture extension
+== built: app build 202610311334, sysex build 202610311334 ==
+CodeDirectory v=20500 size=1221 flags=0x10000(runtime) hashes=27+7 location=embedded
+Authority=Developer ID Application: Section 9 Labs LLC (995PCLM9KH)
+Authority=Developer ID Certification Authority
+TeamIdentifier=995PCLM9KH
+survey strings in the sysex binary: 3
+== notarize the app bundle (zip -> notarytool --wait -> staple) ==
+-rw-r--r--@ 1 matt  wheel    56M Oct 31 13:34 /tmp/claude/ne-survey/Aitmproxy-survey.zip
+Conducting pre-submission checks for Aitmproxy-survey.zip and initiating connection to the Apple notary service...
+Submission ID received
+  id: a00f5a6f-482d-42ef-a0ba-f6c4ee28166d
+Successfully uploaded file
+  id: a00f5a6f-482d-42ef-a0ba-f6c4ee28166d
+  path: /tmp/claude/ne-survey/Aitmproxy-survey.zip
+Waiting for processing to complete.
+Current status: In Progress...Current status: In Progress....Current status: In Progress.....Current status: In Progress......Current status: Accepted.......Processing complete
+  id: a00f5a6f-482d-42ef-a0ba-f6c4ee28166d
+  status: Accepted
+
+Processing: /Applications/Aitmproxy.app
+The staple and validate action worked!
+== verify ==
+/Applications/Aitmproxy.app: accepted
+source=Notarized Developer ID
+origin=Developer ID Application: Section 9 Labs LLC (995PCLM9KH)
+The validate action worked!
+/Applications/Aitmproxy.app: valid on disk
+/Applications/Aitmproxy.app: satisfies its Designated Requirement
+== launch ==
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.1/1)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+		995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610310840)	AitmproxyNE	[terminated waiting to uninstall on reboot]
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[activated enabled]
+BUILD-INSTALL DONE Sat Oct 31 13:35:02 PDT 2026

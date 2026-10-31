@@ -1,0 +1,6 @@
+survey lines: 15846  rate lines: 130  framework new-flow lines: 17636
+first: 2026-10-31 13:34:56.400  last: 2026-10-31 15:43:19.137
+2026-10-31 13:34:56.400 Df AitmproxyNE[58141:86fd8a6] [com.mrbrutti.aitmproxy.ne:provider] startProxy
+2026-10-31 13:34:56.400 Df AitmproxyNE[58141:86fd8a6] [com.mrbrutti.aitmproxy.ne:survey] SURVEY-START variant=observe-survey pid=58141
+2026-10-31 13:44:32.721 Df AitmproxyNE[58141:871f2af] [com.mrbrutti.aitmproxy.ne:provider] startProxy
+PULL DONE final

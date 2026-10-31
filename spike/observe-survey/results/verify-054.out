@@ -1,0 +1,23 @@
+ver 0.5.4 build 202610311454
+/Applications/Aitmproxy.app: accepted
+source=Notarized Developer ID
+origin=Developer ID Application: Section 9 Labs LLC (995PCLM9KH)
+Aitmproxy.app does not have a ticket stapled to it.
+codesign-ok
+drwxr-xr-x@ 5 matt  admin        160 Oct 31 14:54 ..
+-rwxr-xr-x@ 1 matt  admin   33714016 Oct 31 15:01 aitm
+-rwxr-xr-x@ 1 matt  admin  108054304 Oct 31 15:01 obscura
+==> aitmproxy (Aitmproxy): 0.5.3 → 0.5.4
+2d6ac7e1e961c540b28ee97dc47fbea12d43aa0ca1abb5df2158517ab9d75daa--Aitmproxy-0.5.3.dmg
+dd63eefdf3ee2da70ac8f69b0e2e90e8086969a04b6f8d6af762aee86b64700c--Aitmproxy-0.5.4.dmg
+v0.5.4 2026-10-31T22:01:13Z
+v0.5.0
+v0.5.1
+v0.5.2
+v0.5.3
+v0.5.4
+2026-10-31 15:43:19.032 Df sysextd[476:88d963b] [com.apple.sx:XPC] client activation request for com.mrbrutti.aitmproxy.ne
+2026-10-31 15:43:19.058 Df sysextd[476:88d963b] [com.apple.sx:Upgrade] activateDecision found entry to replace: com.mrbrutti.aitmproxy.ne, BundleVersion(CFBundleShortVersionString: "0.5.3", CFBundleVe
+2026-10-31 15:43:19.058 Df sysextd[476:88d963b] initial activation decision: requestAppReplaceAction(<sysextd.Extension: 0x7bc30ba080>)
+2026-10-31 15:43:19.087 Df sysextd[476:88d963b] [com.apple.sx:Upgrade] activateDecision found entry to replace: com.mrbrutti.aitmproxy.ne, BundleVersion(CFBundleShortVersionString: "0.5.3", CFBundleVe
+VERIFY-DONE

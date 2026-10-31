@@ -1,0 +1,55 @@
+SURVEY lines: 15846
+kind: {'U': 7477, 'T': 8369}
+why: {'unclaimed': 15394, 'self': 452}
+endpoint class: {'ip:port': 15846}
+remoteHostname: nil 5887 (37.2%)  set 9959 (62.8%)  empty-string 0 (0.0%)
+  T: hostname set 6367/8369
+  U: hostname set 3592/7477
+sourceAppSigningIdentifier empty: 0 (0.0%)
+sourceAppAuditToken: nil 0 (0.0%)  present 15846 (100.0%)  wrong-size 0 (0.0%)
+filterFlowIdentifier nil: 1878 (11.9%)
+interface: {'en15': 13994, 'en0': 1613, 'utun12': 103, 'utun10': 103, 'bridge101': 33}
+euid distribution (token present): {501: 14764, 213: 755, 65: 236, 0: 71, 266: 16, 278: 2, 205: 1, 262: 1}
+euid names: {0: 'root', 65: '_mdnsresponder', 205: '_locationd', 213: '_usbmuxd', 262: '_cmiodalassistants', 266: '_timed', 278: '_accessoryupdater', 501: 'matt'}
+isSelf first flow of a pid: n=333 p50=4011us p90=7562us; later flows: n=15513 p50=3625us p90=5947us
+per-pid isSelf medians (us, n) for pids with >=15 flows: [(112, 33), (116, 33), (116, 36), (117, 33), (118, 45), (120, 33), (121, 36), (122, 36), (123, 43), (123, 41), (125, 337), (125, 36), (128, 41), (855, 35), (1342, 42), (2247, 755), (2358, 359), (2416, 207), (2481, 70), (2504, 29), (2522, 19), (2732, 21), (2774, 171), (2822, 143), (2873, 4164), (3021, 129), (3046, 35), (3081, 27), (3191, 15), (3266, 236), (3500, 243), (3552, 60), (3597, 46), (3625, 43), (3762, 66), (3886, 66), (4060, 4023), (4079, 16), (4332, 16), (4411, 81), (4511, 1240), (4671, 176), (4724, 16), (5605, 144), (5606, 66), (5618, 32), (5667, 549), (5701, 62), (5735, 69), (5949, 65), (6315, 15), (6513, 183), (6868, 78), (6947, 74), (7682, 15), (7774, 23), (7803, 31), (7849, 17), (7934, 17), (10857, 30), (11147, 402)]
+pp_len==0 by euid: {501: 777} distinct pids: 13
+pp_len==0 rows isSelf p50 (us): 120.292
+hostname set by kind+euid: {('T', 501, True): 6331, ('U', 501, False): 3885, ('U', 501, True): 3301, ('T', 501, False): 1247, ('T', 213, False): 755, ('U', 65, True): 216, ('U', 0, True): 58, ('T', 65, True): 20}
+self flows by kind: {'U': 81, 'T': 371}
+sid empty by euid: {}
+pp_len==0 (proc_pidpath_audittoken failed): 777 (4.9%) of token-present rows 15846
+distinct pids: 333
+top remote ports: {'443': 5574, '53': 4352, '49152': 2159, '3722': 2005, '62078': 891, '80': 391, '1024': 206, '993': 78, '123': 69, '3483': 34, '853': 10, '5351': 4}
+UDP remote ports: {'53': 4340, '3722': 2005, '443': 1023, '123': 69, '3483': 34, '5351': 4, '60071': 1, '61497': 1}
+timings:
+  isSelf (us): n=15846 p50=3632.5 p90=5983.6 p99=11362.3 max=32236.7 mean=3863.6
+  isSelf (token present) (us): n=15846 p50=3632.5 p90=5983.6 p99=11362.3 max=32236.7 mean=3863.6
+  isSelf (token nil): no samples
+  proc_pidpath_audittoken (us): n=15846 p50=12.5 p90=19.4 p99=37.3 max=317.4 mean=13.7
+  claim path (handleTCP/handleUDP) (us): n=15394 p50=50.9 p90=79.7 p99=258.9 max=1675.5 mean=63.1
+  total handleNewFlow to log (us): n=15846 p50=3747.1 p90=6092.5 p99=11470.1 max=32313.0 mean=3979.9
+rates:
+  window: 2026-10-31 13:35:01 .. 2026-10-31 15:43:18  flows: 15846
+  per hour:
+    2026-10-31 13:00    1278  (0.35/s avg)
+    2026-10-31 14:00    8905  (2.47/s avg)
+    2026-10-31 15:00    5663  (1.57/s avg)
+  busiest minutes: 2026-10-31 14:04 = 1508 (25.1/s), 2026-10-31 14:05 = 809 (13.5/s), 2026-10-31 15:14 = 790 (13.2/s), 2026-10-31 15:13 = 535 (8.9/s), 2026-10-31 15:42 = 477 (8.0/s)
+  busiest seconds: 14:04:27 = 203, 14:04:25 = 200, 14:04:26 = 199, 14:04:24 = 197, 14:04:23 = 158, 14:04:28 = 156, 14:04:50 = 113, 14:04:22 = 103
+  per-second (over seconds that had >=1 flow, n=3053): p50=2 p90=11 p99=39 max=203
+  busiest 10 s window: 1241 flows starting 2026-10-31 14:04:21 (124.1/s)
+SURVEY-RATE lines (in-process counters):
+  2026-10-31 15:33:11  final=0 uptime_s=6061 total=13234 tcp=7066 udp=6168 self=242 last60s=19 max_1s=201 max_1s_last60s=3 self_ns_avg=3892396 self_ns_max=25477083 pp_ns_avg=13753 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:34:11  final=0 uptime_s=6121 total=13274 tcp=7090 udp=6184 self=242 last60s=40 max_1s=201 max_1s_last60s=7 self_ns_avg=3891749 self_ns_max=25477083 pp_ns_avg=13753 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:35:11  final=0 uptime_s=6181 total=13319 tcp=7109 udp=6210 self=242 last60s=45 max_1s=201 max_1s_last60s=11 self_ns_avg=3897254 self_ns_max=25477083 pp_ns_avg=13755 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:36:11  final=0 uptime_s=6241 total=13372 tcp=7132 udp=6240 self=242 last60s=53 max_1s=201 max_1s_last60s=6 self_ns_avg=3894271 self_ns_max=25477083 pp_ns_avg=13755 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:37:11  final=0 uptime_s=6301 total=13387 tcp=7140 udp=6247 self=242 last60s=15 max_1s=201 max_1s_last60s=4 self_ns_avg=3895102 self_ns_max=25477083 pp_ns_avg=13752 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:38:11  final=0 uptime_s=6361 total=13432 tcp=7163 udp=6269 self=242 last60s=45 max_1s=201 max_1s_last60s=6 self_ns_avg=3893889 self_ns_max=25477083 pp_ns_avg=13746 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:39:11  final=0 uptime_s=6421 total=13613 tcp=7247 udp=6366 self=242 last60s=181 max_1s=201 max_1s_last60s=23 self_ns_avg=3881229 self_ns_max=25477083 pp_ns_avg=13720 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:40:11  final=0 uptime_s=6481 total=13840 tcp=7363 udp=6477 self=242 last60s=227 max_1s=201 max_1s_last60s=19 self_ns_avg=3865912 self_ns_max=25477083 pp_ns_avg=13700 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:41:11  final=0 uptime_s=6541 total=14046 tcp=7472 udp=6574 self=242 last60s=206 max_1s=201 max_1s_last60s=20 self_ns_avg=3858334 self_ns_max=25477083 pp_ns_avg=13702 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:42:11  final=0 uptime_s=6601 total=14197 tcp=7539 udp=6658 self=242 last60s=151 max_1s=201 max_1s_last60s=13 self_ns_avg=3851925 self_ns_max=25477083 pp_ns_avg=13728 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:43:11  final=0 uptime_s=6661 total=14761 tcp=7808 udp=6953 self=242 last60s=564 max_1s=201 max_1s_last60s=28 self_ns_avg=3828236 self_ns_max=25477083 pp_ns_avg=13780 pp_ns_max=317375 total_ns_max=25594125
+  2026-10-31 15:43:19  final=1 uptime_s=6668 total=14810 tcp=7831 udp=6979 self=242 last60s=49 max_1s=201 max_1s_last60s=18 self_ns_avg=3826474 self_ns_max=25477083 pp_ns_avg=13779 pp_ns_max=317375 total_ns_max=25594125
+  in-process max flows in one second: 201

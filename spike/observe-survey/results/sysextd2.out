@@ -1,0 +1,61 @@
+Timestamp               Ty Process[PID:TID]
+2026-10-31 13:34:54.028 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.028 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.028 A  sysextd[476:86fa31c] (Security) SecTrustEvaluateIfNecessary
+2026-10-31 13:34:54.029 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.030 A  sysextd[476:86fa31c] (Security) SecTrustEvaluateIfNecessary
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.033 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.035 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.035 Df sysextd[476:86fa31c] [com.apple.sx:DaemonIPC] dispatchRequest(cmd: nsxpc)
+2026-10-31 13:34:54.035 Df sysextd[476:86fa31c] upgrading connection to nsxpc
+2026-10-31 13:34:54.042 Df sysextd[476:86fa31c] [com.apple.sx:XPC] client activation request for com.mrbrutti.aitmproxy.ne
+2026-10-31 13:34:54.042 Df sysextd[476:86fa31c] attempting to realize extension with identifier com.mrbrutti.aitmproxy.ne
+2026-10-31 13:34:54.042 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.042 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.042 A  sysextd[476:86fa31c] (Security) SecTrustEvaluateIfNecessary
+2026-10-31 13:34:54.043 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.045 A  sysextd[476:86fa31c] (Security) SecTrustEvaluateIfNecessary
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.047 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.049 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.049 Df sysextd[476:86fa31c] no policy, cannot allow apps outside /Applications
+2026-10-31 13:34:54.049 Df sysextd[476:86fa31c] realizing target path: file:///Applications/Aitmproxy.app/Contents/Library/SystemExtensions/com.mrbrutti.aitmproxy.ne.systemextension/
+2026-10-31 13:34:54.049 Df sysextd[476:86fa31c] bundle class: UncachedBundle
+2026-10-31 13:34:54.050 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.050 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.050 A  sysextd[476:86fa31c] (Security) SecTrustEvaluateIfNecessary
+2026-10-31 13:34:54.051 A  sysextd[476:86fa31c] (Security) SecKeyVerifySignature
+2026-10-31 13:34:54.052 A  sysextd[476:86fa31c] (Security) SecTrustEvaluateIfNecessary
+2026-10-31 13:34:54.053 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 A  sysextd[476:86fa31c] (Security) SecTrustCopyAppleTrustAnchors
+2026-10-31 13:34:54.054 Df sysextd[476:86fa31c] retrieved bundle code signing info: SecStaticCodeSigningInfo(entitlements: ["com.apple.application-identifier": 995PCLM9KH.com.mrbrutti.aitmproxy.ne, "com.apple.developer.networking.networkextension": <__NSArrayM
+app-proxy-provider-systemextension
+)
+, "com.apple.developer.team-identifier": 995PCLM9KH], teamID: sysextd.TeamIDType.teamID("995PCLM9KH"), cdHashes: ["6b1d2183e6e69a5c05ffe1d12177887aea5c45a2": sysextd.ArchInfo(name: "arm64", cputype: 16777228, cpusubtype: 0)], signingIdentifier: "com.mrbrutti.a
+2026-10-31 13:34:54.054 Df sysextd[476:86fa31c] /Applications/Aitmproxy.app/Contents/Library/SystemExtensions/com.mrbrutti.aitmproxy.ne.systemextension: package type not `DEXT`
+2026-10-31 13:34:54.054 Df sysextd[476:86fa31c] /Applications/Aitmproxy.app/Contents/Library/SystemExtensions/com.mrbrutti.aitmproxy.ne.systemextension: entitlement `com.apple.developer.endpoint-security.client` not present or not true
+2026-10-31 13:34:54.054 Df sysextd[476:86fa31c] activateDecision found existing entry of same version: state activated_enabled, ID 79878B88-A3DE-4C3D-9D4C-81825BE75A5F
+2026-10-31 13:34:54.054 Df sysextd[476:86fa31c] [com.apple.sx:Upgrade] activateDecision found entry to replace: com.mrbrutti.aitmproxy.ne, BundleVersion(CFBundleShortVersionString: "0.5.3", CFBundleVersion: "202610310840")
+2026-10-31 13:34:54.054 Df sysextd[476:86fa31c] initial activation decision: requestAppReplaceAction(<sysextd.Extension: 0x7bc30ba1c0>)
+2026-10-31 13:34:54.054 Df sysextd[476:86fa31c] [com.apple.sx:XPC] notifying client of activation conflict
+SYSEXTD2 DONE

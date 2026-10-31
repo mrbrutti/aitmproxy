@@ -1,0 +1,16 @@
+== Sat Oct 31 13:41:00 PDT 2026 tag=variant1 ==
+*	*	995PCLM9KH	com.mrbrutti.aitmproxy.ne (0.5.3/202610311334)	AitmproxyNE	[activated enabled]
+-- IPv4, connected UDP sockets --
+  cloudflare-quic 104.18.27.14:443   connect ok | setsockopt(DONTFRAG) ECONNRESET | send ok | send2 ok
+  same, no DONTFRAG                  connect ok | send ok | send2 ok
+  google quic 142.250.73.110:443     connect ok | setsockopt(DONTFRAG) ECONNRESET | send ok | send2 ok
+  1.1.1.1:53 (DNS)                   connect ok | setsockopt(DONTFRAG) ECONNRESET | send ok | send2 ok
+  LAN resolver 10.9.10.1:53          connect ok | setsockopt(DONTFRAG) ECONNRESET | send ok | send2 ok
+  time.apple.com 17.253.16.125:123   connect ok | setsockopt(DONTFRAG) ECONNRESET | send ok | send2 ok
+  loopback 127.0.0.1:443             connect ok | setsockopt(DONTFRAG) ok | send ok | send2 ok
+-- IPv6 --
+  cloudflare v6 [2606:4700::6812:1b0e]:443 connect EHOSTUNREACH | setsockopt(DONTFRAG) ECONNRESET | send EDESTADDRREQ | send2 EDESTADDRREQ
+-- real DNS query over a CONNECTED UDP socket WITH DONTFRAG (does a reply arrive?) --
+  1.1.1.1: DONTFRAG ECONNRESET; reply 61 bytes in 6 ms
+  10.9.10.1: DONTFRAG ECONNRESET; reply 61 bytes in 5 ms
+DONTFRAG DONE
