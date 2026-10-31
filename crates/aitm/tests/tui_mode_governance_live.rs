@@ -135,12 +135,12 @@ async fn a_live_pause_reaches_an_open_loopback_connection_without_reconnecting()
     // One agent connection, held open for the whole test.
     let transport = timeout(STEP, TcpTransport::connect(addr, AGENT_TOKEN))
         .await
-        .expect("connect within 5 s")
+        .unwrap_or_else(|_| panic!("connect within {STEP:?}"))
         .expect("connect to the loopback agent server");
     let client = BusClient::new(Box::new(transport));
     let info = timeout(STEP, client.initialize("tui-mode-governance-live", "test"))
         .await
-        .expect("initialize within 5 s")
+        .unwrap_or_else(|_| panic!("initialize within {STEP:?}"))
         .expect("initialize");
     assert_eq!(
         info.role.as_deref(),
@@ -150,7 +150,7 @@ async fn a_live_pause_reaches_an_open_loopback_connection_without_reconnecting()
 
     let first = timeout(STEP, client.call("flow.list", json!({})))
         .await
-        .expect("flow.list within 5 s");
+        .unwrap_or_else(|_| panic!("flow.list within {STEP:?}"));
     assert!(
         matches!(&first, Ok(v) if *v == json!([])),
         "the agent's first flow.list runs over an empty store: {first:?}"
@@ -167,7 +167,7 @@ async fn a_live_pause_reaches_an_open_loopback_connection_without_reconnecting()
     // The same connection's next call: refused, no reconnect.
     let second = timeout(STEP, client.call("flow.list", json!({})))
         .await
-        .expect("flow.list after agent.set paused within 5 s");
+        .unwrap_or_else(|_| panic!("flow.list after agent.set paused within {STEP:?}"));
     match second {
         Err(BusError::Tool(t)) if t.contains("the agent policy is `paused`") => {}
         other => panic!(

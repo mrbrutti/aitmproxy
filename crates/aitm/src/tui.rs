@@ -8,8 +8,10 @@
 //! the terminal with the UI. It is agent-facing and gated, and it runs on the
 //! core's own shared `AgentState` and `AuditRing`, which [`build_servers`]
 //! receives as a sealed `wire::Governance` (`Assembled::governance` is its
-//! only source): a live `agent.set` governs that agent on its next call, and
-//! its calls land in the trail `agent.activity` reads. The other is wrapped as
+//! only public source): a live `agent.set` governs that agent on its next
+//! call, and its calls, allowed or refused, land in the trail `agent.activity`
+//! reads (not audited: a successful `flow.subscribe`, a `needs_confirmation`
+//! handshake step, and protocol-level JSON-RPC errors). The other is wrapped as
 //! `Arc<McpServer>` so its `handle` becomes the TUI's in-process bus handler:
 //! the bus contract is unchanged, the TUI is a bus client like the others,
 //! there is just no socket between them. That server is the operator, ungated
@@ -186,9 +188,9 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
 /// request" error and approves nothing.
 ///
 /// How a caller gets here differs by mode. In TUI mode it is compile-enforced:
-/// [`build_servers`] cannot be called without a `wire::Governance`, which only
-/// `Assembled::governance` makes, and its agent arm applies this function to
-/// that pair. The bare-`aitm` path (the primary server and the `aitm web`
+/// [`build_servers`] cannot be called without a `wire::Governance`, whose only
+/// public source is `Assembled::governance`, and its agent arm applies this
+/// function to that pair. The bare-`aitm` path (the primary server and the `aitm web`
 /// bridge server in `main.rs`) applies it by convention: nothing in the types
 /// makes it do so.
 ///
@@ -276,41 +278,28 @@ pub fn init_tracing() -> TuiLog {
 /// The two servers `aitm tui` runs over one proxy: the agent-facing one on the
 /// configured transport (`None` when that is stdio, which would share the
 /// terminal with the UI) and the TUI-facing one behind an in-process handler.
-/// Both are built by [`server`], exactly as the server path builds its one.
+/// Both are built by [`server`], the one way every server in this binary is
+/// built.
 ///
 /// `governance` is the core's own policy state and audit ring as a sealed
-/// `wire::Governance`, which only `Assembled::governance` makes, so this
-/// function cannot be called without them or with a fresh state in their
-/// place. The agent arm goes through [`with_shared_governance`]; the TUI-facing
-/// arm does not. What follows for `aitm tui`:
+/// `wire::Governance`, whose only public source is `Assembled::governance`, so
+/// this function cannot be called without them or with a fresh state in their
+/// place. The agent arm goes through [`with_shared_governance`]: a live
+/// `agent.set`, from the TUI or from any operator-token client, governs the
+/// agent on its next call, and the agent's calls are recorded in the shared
+/// ring. The TUI-facing arm deliberately does not: it is the operator, and its
+/// polling would flood the ring (see the module doc).
 ///
-/// - Under the default `auto` the gate decides as before (same seed, same
-///   decisions); what changes is that the loopback agent's calls, allowed or
-///   refused, now show in the TUI Agent panel's `actions_last_minute` and in
-///   `agent.activity`.
-/// - `agent.set`, from the TUI or from any operator-token client, governs the
-///   agent on its next call, in both directions and with no reconnect:
-///   `paused` refuses every agent tool call (`initialize`, `tools/list` and
-///   `ping` still answer), `readonly` allows Read only, and `all` relaxes it
-///   while per-command gates such as `scope.allow_agent_widen` still apply.
-/// - The operator keeps full control while the agent is paused: the TUI and
-///   operator-token clients bypass the gate by role and can `agent.set` back.
-/// - `push_tx` is not fed to the agent server (follow-up "tui-mode push"):
-///   governance does not depend on it. A loopback subscriber still receives
-///   the `notifications/aitm/agent` lines (audit to every subscriber,
-///   `approval_requested` to operator-role ones), but no
-///   `notifications/aitm/flow`.
-/// - Under `ask`, only an operator-token client connected to this same server
-///   and subscribed via `flow.subscribe` can approve a parked Sensitive agent
-///   call, because the `Ask` machinery is per server. The TUI cannot: its
-///   in-process server is a different `McpServer`, and its connection has no
-///   push sink to subscribe on. So with only the TUI attached a Sensitive
-///   agent call is refused at once ("no operator is connected to approve it")
-///   and never parks.
-/// - The TUI's own operator calls stay out of `agent.activity`, as before;
-///   operator-token clients on the agent server are recorded, with origin
-///   `"operator"`. Parking stays capped per server (`MAX_PARKED_REQUESTS`)
-///   plus the approval timeout, as on the primary; no new bound is needed.
+/// `push_tx` is not fed to the agent server (follow-up "tui-mode push"), so a
+/// loopback subscriber receives the `notifications/aitm/agent` lines but no
+/// `notifications/aitm/flow`.
+///
+/// Under `ask`, only an operator-token client connected to this same server
+/// and subscribed via `flow.subscribe` can approve a parked Sensitive agent
+/// call: the `Ask` machinery is per server, and the TUI's in-process server is
+/// a different `McpServer` with no push sink to subscribe on. With only the
+/// TUI attached, a Sensitive agent call is therefore refused at once ("no
+/// operator is connected to approve it") and never parks.
 pub fn build_servers(
     cfg: &Config,
     services: Services,

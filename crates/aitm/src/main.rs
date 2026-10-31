@@ -297,6 +297,8 @@ async fn run() -> anyhow::Result<()> {
         // `l4.capture.*`'s own and nothing calls `accept`.
         l4_ingress,
         l4_guard,
+        // The private sealed `Governance` was already taken above.
+        ..
     } = assembled;
 
     if let Mode::Cli(argv) = &mode {

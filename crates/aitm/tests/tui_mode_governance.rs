@@ -1,5 +1,6 @@
 //! `aitm tui` agent governance, in process (spec
-//! `2026-10-30-tui-mode-governance-design.md`, AC1-AC6).
+//! `2026-10-30-tui-mode-governance-design.md`, AC1-AC6, plus the edge cases
+//! around them).
 //!
 //! The loopback agent server that `tui::build_servers` builds must run on the
 //! core's own `AgentState` and `AuditRing`, so that:
@@ -13,22 +14,45 @@
 //! - the TUI's own in-process operator server stays ungated, unrecorded, and
 //!   unable to approve (AC6).
 //!
+//! Around those, the edge cases a proxy must survive on the governed agent
+//! server:
+//!
+//! - the agent cannot lift or widen the policy that governs it: its
+//!   `agent.set` and `agent.approve` are refused under every posture;
+//! - a paused agent still gets `initialize`, `tools/list` and `ping`;
+//! - malformed and empty input is a protocol error that is never audited;
+//! - an oversized, secret-bearing refused call reaches the TUI's trail as one
+//!   row, and the secret is never shown;
+//! - under `ask`, an operator-token client subscribed on the agent server
+//!   resolves what the TUI cannot, and its connection drop ends the asking;
+//! - the streamable-HTTP agent transport is governed by the same live state
+//!   and ring;
+//! - an operator-token client governs the agent as the TUI does and is
+//!   recorded as `"operator"`;
+//! - with `push_tx` unfed, a subscribed operator is still pushed one audit
+//!   line per agent call.
+//!
+//! Each test's doc says whether it is a **red-set** test (it fails against the
+//! pre-switch wiring, a private `AgentState` and a private ring in
+//! `build_servers`' agent arm) or a **guard** (it passes against both wirings
+//! and pins behaviour the switch must not disturb).
+//!
 //! No sockets and no async runtime. The rig builds through the production path
 //! only (`assemble` → `governance()` → `services` → `build_servers`), never a
 //! hand-built server: agent calls go through the agent server's `handle_on` as
 //! `Frontend::Mcp`, TUI calls through the `InProcessHandler` the TUI itself
-//! uses. A call that may park runs on its own thread under a 5 s bound.
+//! uses. A call that may park runs on its own thread under [`PARK_BOUND`].
 
 mod support;
 
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use aitm::tui::{self, TuiLog};
 use aitm::wire::{assemble, Assembled};
 use aitm_bus_client::InProcessHandler;
-use aitm_core::{AgentPolicy, Config, Frontend, McpTransport, DEFAULT_ARGS_SUMMARY_CAP};
+use aitm_core::{AgentPolicy, Config, Frontend, McpTransport};
 use aitm_mcp::{ConnCtx, McpServer, NotificationSink};
 use serde_json::{json, Value};
 
@@ -38,8 +62,16 @@ const AGENT_TOKEN: &str = "tui-mode-governance-agent-token";
 /// tui` does. No test connects with it: the TUI is the in-process operator.
 const OPERATOR_TOKEN: &str = "tui-mode-governance-operator-token";
 /// The most a call that must be refused at once is given before it is judged
-/// to have parked for operator approval instead.
+/// to have parked for operator approval instead; also the most a parked call
+/// is given to return once an operator has resolved it.
 const PARK_BOUND: Duration = Duration::from_secs(5);
+/// The most an approval request is given to be announced to a subscribed
+/// operator before the call is judged to have been refused instead.
+const ANNOUNCE_BOUND: Duration = Duration::from_secs(5);
+/// One argument far larger than any audit entry's argument summary.
+const OVERSIZED: usize = 1 << 20;
+/// A secret an agent might smuggle into a call's arguments.
+const SECRET: &str = "hunter2-super-secret";
 
 /// The two servers `aitm tui` builds over one `Assembled`, exactly as
 /// `build_servers` builds them. `assembled` stays alive for the whole test so
@@ -97,22 +129,33 @@ fn rig_on(tag: &str, policy: Option<AgentPolicy>, transport: McpTransport) -> Ri
     }
 }
 
+/// One JSON-RPC request line.
+fn rpc_line(method: &str, params: Value) -> String {
+    json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string()
+}
+
 /// One `tools/call` request line.
 fn call_line(name: &str, arguments: Value) -> String {
-    json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": name, "arguments": arguments}
-    })
-    .to_string()
+    rpc_line("tools/call", json!({"name": name, "arguments": arguments}))
+}
+
+/// The whole JSON-RPC reply to `method` on the agent server, as `conn`.
+fn agent_rpc(rig: &Rig, conn: &ConnCtx, method: &str, params: Value) -> Value {
+    let reply = rig
+        .agent
+        .handle_on(conn, &rpc_line(method, params))
+        .unwrap_or_else(|| panic!("the agent server replies to `{method}`"));
+    serde_json::from_str(&reply).expect("the reply is JSON")
 }
 
 /// The whole JSON-RPC reply to a `tools/call` on the agent server, as `conn`.
 fn agent_call(rig: &Rig, conn: &ConnCtx, name: &str, arguments: Value) -> Value {
-    let reply = rig
-        .agent
-        .handle_on(conn, &call_line(name, arguments))
-        .unwrap_or_else(|| panic!("the agent server replies to `{name}`"));
-    serde_json::from_str(&reply).expect("the reply is JSON")
+    agent_rpc(
+        rig,
+        conn,
+        "tools/call",
+        json!({"name": name, "arguments": arguments}),
+    )
 }
 
 /// The whole JSON-RPC reply to a `tools/call` through the TUI's in-process
@@ -123,11 +166,11 @@ fn tui_call(rig: &Rig, name: &str, arguments: Value) -> Value {
     serde_json::from_str(&reply).expect("the reply is JSON")
 }
 
-/// An agent `tools/call` that must return within [`PARK_BOUND`]. A call that
-/// parks for operator approval blocks its thread and never replies in time,
-/// so a timeout here is that failure.
-fn agent_call_within(rig: &Rig, name: &str, arguments: Value) -> Value {
-    let (tx, rx) = mpsc::channel();
+/// An agent `tools/call`, as a fresh `ConnCtx::new(Frontend::Mcp)`, on its
+/// own thread; the thread's result is the whole JSON-RPC reply. A call that
+/// parks for operator approval blocks its thread until an operator resolves
+/// it, so the caller reads the reply through [`reply_within`].
+fn spawn_agent_call(rig: &Rig, name: &str, arguments: Value) -> JoinHandle<Value> {
     let agent = Arc::clone(&rig.agent);
     let line = call_line(name, arguments);
     let what = name.to_string();
@@ -135,20 +178,37 @@ fn agent_call_within(rig: &Rig, name: &str, arguments: Value) -> Value {
         let reply = agent
             .handle_on(&ConnCtx::new(Frontend::Mcp), &line)
             .unwrap_or_else(|| panic!("the agent server replies to `{what}`"));
-        let reply: Value = serde_json::from_str(&reply).expect("the reply is JSON");
-        let _ = tx.send(reply);
-    });
-    match rx.recv_timeout(PARK_BOUND) {
-        Ok(reply) => reply,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            panic!("`{name}` did not return within 5s: the agent call parked instead of refusing")
-        }
-        // The thread ended without sending: it panicked (no reply from the
-        // server, or a reply that was not JSON). That is not a park.
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("`{name}`: the agent thread ended without a reply (see its panic above)")
-        }
+        serde_json::from_str(&reply).expect("the reply is JSON")
+    })
+}
+
+/// The reply of the agent call running on `handle`, which must arrive within
+/// [`PARK_BOUND`]. `still_running` says what it means when it does not.
+fn reply_within(handle: JoinHandle<Value>, name: &str, still_running: &str) -> Value {
+    let deadline = Instant::now() + PARK_BOUND;
+    while !handle.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "`{name}` did not return within {PARK_BOUND:?}: {still_running}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
+    // A thread that ended without a reply panicked (no reply from the server,
+    // or a reply that was not JSON). That is not a park.
+    handle.join().unwrap_or_else(|_| {
+        panic!("`{name}`: the agent thread ended without a reply (see its panic above)")
+    })
+}
+
+/// An agent `tools/call` that must be refused at once. A call that parks for
+/// operator approval never replies within [`PARK_BOUND`], so a timeout here is
+/// that failure.
+fn agent_call_within(rig: &Rig, name: &str, arguments: Value) -> Value {
+    reply_within(
+        spawn_agent_call(rig, name, arguments),
+        name,
+        "the agent call parked instead of refusing",
+    )
 }
 
 /// The text of a tool result's first content item, or "" when there is none.
@@ -164,15 +224,22 @@ fn assert_ok(reply: &Value) {
 }
 
 /// The tool was refused: `result.isError` is `true` and the refusal text
-/// contains every needle.
-fn assert_refused(reply: &Value, needles: &[&str]) {
-    assert_eq!(reply["result"]["isError"], json!(true), "{reply}");
+/// contains every needle. `context` prefixes every message (empty for none);
+/// a test that loops over postures passes the one it expected the refusal
+/// under.
+fn assert_refused_in(context: &str, reply: &Value, needles: &[&str]) {
+    assert_eq!(reply["result"]["isError"], json!(true), "{context}{reply}");
     for needle in needles {
         assert!(
             text_of(reply).contains(needle),
-            "refusal text lacks {needle:?}: {reply}"
+            "{context}the refusal text lacks {needle:?}: {reply}"
         );
     }
+}
+
+/// [`assert_refused_in`] with no context.
+fn assert_refused(reply: &Value, needles: &[&str]) {
+    assert_refused_in("", reply, needles);
 }
 
 /// The TUI's `agent.set {policy}`; asserts the reply echoes `policy`.
@@ -346,45 +413,6 @@ fn the_tui_operator_surface_stays_ungated_unrecorded_and_cannot_approve() {
     assert_eq!(rig.assembled.audit_ring.len(), 0);
 }
 
-// ---------------------------------------------------------------------------
-// Tester additions (stage 5, Task 2): edge cases a proxy must survive on the
-// governed agent server. Each test says whether it is a red-set test (it fails
-// against the pre-switch wiring: a private `AgentState` and a private ring) or
-// a guard (it passes against both wirings).
-// ---------------------------------------------------------------------------
-
-/// The most an approval request is given to be announced to a subscribed
-/// operator before the call is judged to have been refused instead.
-const ANNOUNCE_BOUND: Duration = Duration::from_secs(5);
-/// One argument far larger than an audit entry may be (the cap is 512 bytes).
-const OVERSIZED: usize = 1 << 20;
-/// A secret an agent might smuggle into a call's arguments.
-const SECRET: &str = "hunter2-super-secret";
-
-/// A non-`tools/call` request on the agent server, as `conn`; the whole reply.
-fn agent_rpc(rig: &Rig, conn: &ConnCtx, method: &str, params: Value) -> Value {
-    let line = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).to_string();
-    let reply = rig
-        .agent
-        .handle_on(conn, &line)
-        .unwrap_or_else(|| panic!("the agent server replies to `{method}`"));
-    serde_json::from_str(&reply).expect("the reply is JSON")
-}
-
-/// [`assert_refused`] for one needle, naming the policy the refusal was
-/// expected under, for the tests that loop over every policy.
-fn assert_refused_under(policy: &str, reply: &Value, needle: &str) {
-    assert_eq!(
-        reply["result"]["isError"],
-        json!(true),
-        "under `{policy}`: {reply}"
-    );
-    assert!(
-        text_of(reply).contains(needle),
-        "under `{policy}`, the refusal text lacks {needle:?}: {reply}"
-    );
-}
-
 /// An operator-role connection with a push sink, subscribed on the agent
 /// server (`flow.subscribe {}`), as an operator-token loopback client is.
 fn subscribe_operator(rig: &Rig) -> (ConnCtx, NotificationSink) {
@@ -401,19 +429,6 @@ fn subscribe_operator(rig: &Rig) -> (ConnCtx, NotificationSink) {
         "the operator's flow.subscribe returns a sub_id: {reply}"
     );
     (conn, sink)
-}
-
-/// The agent's sensitive call, `scope.add {host: "example.com"}`, on its own
-/// thread: a call that parks blocks its thread until an operator resolves it.
-fn spawn_scope_add(rig: &Rig) -> JoinHandle<Value> {
-    let agent = Arc::clone(&rig.agent);
-    let line = call_line("scope.add", json!({"host": "example.com"}));
-    std::thread::spawn(move || {
-        let reply = agent
-            .handle_on(&ConnCtx::new(Frontend::Mcp), &line)
-            .expect("the agent server replies to `scope.add`");
-        serde_json::from_str(&reply).expect("the reply is JSON")
-    })
 }
 
 /// Wait for the `approval_requested` push that announces `parked` to `sink`.
@@ -439,7 +454,7 @@ fn announced_request(
         }
         assert!(
             Instant::now() < deadline,
-            "no approval_requested within 5s, and the agent call is still running"
+            "no approval_requested within {ANNOUNCE_BOUND:?}, and the agent call is still running"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -456,24 +471,25 @@ fn the_loopback_agent_cannot_rewrite_the_policy_that_governs_it() {
     let rig = rig("self-lift", None);
     for policy in ["paused", "readonly", "auto", "ask", "all"] {
         tui_set_policy(&rig, policy);
+        let under = format!("under `{policy}`: ");
         // A target that differs from the current posture, so a change shows.
         let target = if policy == "all" { "readonly" } else { "all" };
 
         let set = agent_call_within(&rig, "agent.set", json!({"policy": target}));
-        assert_refused_under(policy, &set, "`agent.set` refused");
+        assert_refused_in(&under, &set, &["`agent.set` refused"]);
 
         let approve = agent_call_within(
             &rig,
             "agent.approve",
             json!({"request_id": "apr_never_parked", "allow": true}),
         );
-        assert_refused_under(policy, &approve, "cannot approve its own requests");
+        assert_refused_in(&under, &approve, &["cannot approve its own requests"]);
 
         // The role gate decides before the arguments are looked at, so a
         // malformed approve is the same refusal, not a schema error that
         // would tell the agent how to shape a valid one.
         let malformed = agent_call_within(&rig, "agent.approve", json!({"bogus": 1}));
-        assert_refused_under(policy, &malformed, "cannot approve its own requests");
+        assert_refused_in(&under, &malformed, &["cannot approve its own requests"]);
 
         assert_eq!(
             tui_policy(&rig),
@@ -519,7 +535,8 @@ fn a_paused_loopback_agent_still_gets_initialize_tools_list_and_ping() {
 
 /// Red-set. Malformed and empty input on the agent server is a JSON-RPC
 /// protocol error: it never runs a command and is never audited, it changes no
-/// policy, and the server keeps serving afterwards. The last two assertions are
+/// policy, and the server keeps serving afterwards. (Which error code each
+/// malformed shape gets is `aitm-mcp`'s to pin.) The last two assertions are
 /// the control that makes "never audited" mean something: one valid call lands
 /// in the core's shared ring (red against the pre-switch wiring, whose ring is
 /// private).
@@ -528,73 +545,24 @@ fn malformed_and_empty_agent_input_is_a_protocol_error_that_is_never_audited() {
     let rig = rig("malformed", None);
     let agent = ConnCtx::new(Frontend::Mcp);
 
-    let cases: [(&str, &str, i64); 14] = [
-        ("an empty line", "", -32700),
-        (
-            "truncated JSON",
-            r#"{"jsonrpc":"2.0","id":1,"method":"#,
-            -32700,
-        ),
-        ("a bare number", "42", -32600),
-        ("a JSON array", "[]", -32600),
-        ("a JSON null", "null", -32600),
-        ("no method", r#"{"jsonrpc":"2.0","id":1}"#, -32600),
-        (
-            "a non-string method",
-            r#"{"jsonrpc":"2.0","id":1,"method":7}"#,
-            -32600,
-        ),
-        (
-            "an unknown method",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/destroy"}"#,
-            -32601,
-        ),
-        (
-            "tools/call with no params",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
-            -32602,
-        ),
-        (
-            "tools/call with no tool name",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{}}}"#,
-            -32602,
-        ),
-        (
-            "tools/call with a non-string tool name",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":7}}"#,
-            -32602,
-        ),
-        (
-            "tools/call with arguments that are not an object",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"flow.list","arguments":"x"}}"#,
-            -32602,
-        ),
-        (
-            "tools/call for a tool that does not exist",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"no.such.tool"}}"#,
-            -32602,
-        ),
-        (
-            "an undeclared argument on a read the policy allows",
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"flow.list","arguments":{"bogus":1}}}"#,
-            -32602,
-        ),
-    ];
-    for (what, line, code) in cases {
+    for (what, line) in [
+        ("an empty line", ""),
+        ("truncated JSON", r#"{"jsonrpc":"2.0","id":1,"method":"#),
+    ] {
         let reply = rig
             .agent
             .handle_on(&agent, line)
             .unwrap_or_else(|| panic!("{what}: a request gets a reply"));
         let reply: Value = serde_json::from_str(&reply).expect("the reply is JSON");
-        assert_eq!(reply["error"]["code"], json!(code), "{what}: {reply}");
+        assert!(
+            reply["error"]["code"].is_i64(),
+            "{what}: a JSON-RPC error with a code: {reply}"
+        );
         assert!(
             reply.get("result").is_none(),
             "{what}: a malformed request ran something: {reply}"
         );
     }
-    // A notification (no id) is answered with nothing, not an error.
-    let note = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-    assert_eq!(rig.agent.handle_on(&agent, note), None);
 
     assert_eq!(
         rig.assembled.audit_ring.len(),
@@ -613,15 +581,13 @@ fn malformed_and_empty_agent_input_is_a_protocol_error_that_is_never_audited() {
 }
 
 /// Red-set. A refused call whose arguments are enormous and carry secrets
-/// reaches the TUI's `agent.activity` capped and redacted: the shared ring is
-/// now written by a loopback client the operator does not trust, so one entry
-/// must stay within the audit cap and never hold the secret, in the argument
-/// summary or anywhere else in what the TUI is shown. Seeded `Paused` so the
-/// call is refused and nothing runs; the secret-bearing keys come first in the
-/// argument map (whatever its order) and the huge one last, so the redaction
-/// is exercised inside the truncation window.
+/// reaches the TUI's `agent.activity` as exactly one `"mcp"` row, and the
+/// secret appears nowhere in that reply or in the refusal: the shared ring is
+/// written by a loopback client the operator does not trust. (How the
+/// argument summary is capped and redacted is `aitm-mcp`'s to pin.) Seeded
+/// `Paused` so the call is refused and nothing runs.
 #[test]
-fn an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_capped_and_redacted() {
+fn an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_without_the_secret() {
     let rig = rig("oversized", Some(AgentPolicy::Paused));
     let arguments = json!({
         "api_token": SECRET,
@@ -654,22 +620,6 @@ fn an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_capped_and_redac
         json!("flow.list"),
         "{}",
         short(&activity)
-    );
-    let args = rows[0]["args"]
-        .as_str()
-        .unwrap_or_else(|| panic!("the entry has a string args summary: {}", short(&activity)));
-    assert!(
-        args.len() <= DEFAULT_ARGS_SUMMARY_CAP + '…'.len_utf8(),
-        "the args summary is {} bytes, over the {DEFAULT_ARGS_SUMMARY_CAP}-byte cap",
-        args.len()
-    );
-    assert!(
-        args.ends_with('…'),
-        "the oversized argument was truncated: {args}"
-    );
-    assert!(
-        args.contains("<redacted>"),
-        "a secret-named key is dropped whole: {args}"
     );
     assert!(
         !activity.to_string().contains(SECRET),
@@ -705,7 +655,7 @@ fn an_operator_on_the_agent_server_resolves_what_the_tui_cannot_and_a_drop_ends_
     tui_set_policy(&rig, "ask");
     let (operator, sink) = subscribe_operator(&rig);
 
-    let parked = spawn_scope_add(&rig);
+    let parked = spawn_agent_call(&rig, "scope.add", json!({"host": "example.com"}));
     let (request, parked) = announced_request(&sink, parked);
     assert_eq!(
         request["params"]["command"],
@@ -740,7 +690,11 @@ fn an_operator_on_the_agent_server_resolves_what_the_tui_cannot_and_a_drop_ends_
         json!({"request_id": request_id, "allow": false}),
     );
     assert_ok(&denied);
-    let outcome = parked.join().expect("the agent thread");
+    let outcome = reply_within(
+        parked,
+        "scope.add",
+        "the operator's denial did not release the parked call",
+    );
     assert_refused(
         &outcome,
         &["an operator denied the parked sensitive command"],
