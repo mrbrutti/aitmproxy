@@ -4,9 +4,12 @@
 //! one a policy or confirm gate refused — is recorded as one [`AuditEntry`]:
 //! who ran what, with what (redacted) arguments, and whether it ran or was
 //! refused. The entries land in a bounded in-memory [`AuditRing`] that is always
-//! on (the *live* view the operator "Agent" page and `agent.activity` read) and,
-//! when a durable sink is attached, in a JSONL [`AuditSink`] as well — the same
-//! one format the CA plugin's log is a subset of (spec D3a.2).
+//! on: the bounded *live* view the operator "Agent" page and `agent.activity`
+//! read. The `aitm` binary attaches a [`DurableAudit`] file writer to the ring by
+//! default (config `mcp.audit_log`), and that file keeps the complete best-effort
+//! record. The CA plugin's log is a separate, differently shaped file, not a
+//! subset of it. `McpServer::with_durable_audit` remains a per-server
+//! [`AuditSink`] tap that tests use.
 //!
 //! `args_summary` is a redacted, size-capped rendering produced by the caller:
 //! tokens, auth headers, and the CA key material never reach an entry, matching
@@ -57,8 +60,9 @@
 //!   `(mcp, web-bridge)`, whichever client is behind it.
 //! - A source can erase its own history, and a restart empties the ring.
 //!
-//! Origin still separates `mcp` from `operator` and `cli`. Only a durable JSONL
-//! sink, once one is attached, keeps a complete record; the ring is a live view.
+//! Origin still separates `mcp` from `operator` and `cli`. The ring is the bounded
+//! live view; the durable file the `aitm` binary attaches by default (config
+//! `mcp.audit_log`) is what keeps the complete best-effort record.
 //!
 //! # Who reads an entry
 //!
@@ -71,7 +75,7 @@
 //! label (every agent-token bridge connection is `web-bridge`) stay tellable apart.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::command::Sensitivity;
@@ -377,6 +381,32 @@ pub trait AuditSink: Send + Sync {
     fn append(&self, entry: AuditEntry);
 }
 
+/// A snapshot of a durable audit writer's health: what a status surface reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DurableAuditStatus {
+    /// Whether the writer is currently failing to persist entries.
+    pub degraded: bool,
+    /// How many entries the writer has dropped (a full queue).
+    pub dropped: u64,
+    /// How many writes to the file have failed.
+    pub write_failures: u64,
+}
+
+/// A durable sink the ring forwards every entry to once one is attached with
+/// [`AuditRing::attach_durable`] (the `aitm` binary's JSONL file writer).
+///
+/// An implementation must not block and must not panic. [`DurableAudit::record`]
+/// runs on the appending caller's thread **after** the ring's lock is released,
+/// so calling back into the ring from it is safe. [`DurableAudit::status`] reads
+/// atomics only.
+pub trait DurableAudit: Send + Sync + std::fmt::Debug {
+    /// Take one entry, already routed to `lane` by the ring's caller.
+    fn record(&self, lane: AuditLane, entry: AuditEntry);
+
+    /// The writer's current health. Reads atomics only; never blocks.
+    fn status(&self) -> DurableAuditStatus;
+}
+
 /// The identity of one bucket in a lane's source table.
 #[derive(Debug, PartialEq, Eq)]
 enum SourceKey {
@@ -519,11 +549,15 @@ impl RingState {
 ///
 /// Memory is bounded in entries and, because every entry field is capped by its
 /// producer, in bytes. The ring is a live view, not a complete record: a source
-/// can erase its own history and a restart empties it. A durable JSONL
-/// [`AuditSink`], once one is attached, is the complete answer.
+/// can erase its own history and a restart empties it. The complete best-effort
+/// record is the durable file the `aitm` binary attaches by default (config
+/// `mcp.audit_log`) through [`AuditRing::attach_durable`].
 #[derive(Debug)]
 pub struct AuditRing {
     inner: Mutex<RingState>,
+    /// The durable sink, set once by [`AuditRing::attach_durable`]. Read with one
+    /// lock-free `get` on every append.
+    durable: OnceLock<Arc<dyn DurableAudit>>,
 }
 
 impl AuditRing {
@@ -541,6 +575,7 @@ impl AuditRing {
                 evidence: Lane::new(evidence),
                 routine: Lane::new(routine),
             }),
+            durable: OnceLock::new(),
         }
     }
 
@@ -552,11 +587,36 @@ impl AuditRing {
 
     /// Record `entry` in `lane`. [`AuditSink::append`] is this with the evidence
     /// lane; use [`lane_for`] to choose the lane for a command's outcome.
+    ///
+    /// When a [`DurableAudit`] sink is attached it also receives one clone of the
+    /// entry, **after** the ring's lock is released. With none attached the only
+    /// extra work is one lock-free read.
     pub fn append_in(&self, lane: AuditLane, entry: AuditEntry) {
-        let mut state = self.lock();
-        let seq = state.next_seq;
-        state.next_seq = seq.saturating_add(1);
-        state.lane_mut(lane).insert(seq, entry);
+        let sink = self.durable.get();
+        // The clone is taken before the lock, so the critical section is as short
+        // as it was without a sink, and only when a sink is attached.
+        let for_sink = sink.map(|_| entry.clone());
+        {
+            let mut state = self.lock();
+            let seq = state.next_seq;
+            state.next_seq = seq.saturating_add(1);
+            state.lane_mut(lane).insert(seq, entry);
+        }
+        if let (Some(sink), Some(copy)) = (sink, for_sink) {
+            sink.record(lane, copy);
+        }
+    }
+
+    /// Attach the durable sink. Set-once: the first call returns `true`; a second
+    /// call returns `false`, drops its sink, and keeps the first.
+    pub fn attach_durable(&self, sink: Arc<dyn DurableAudit>) -> bool {
+        self.durable.set(sink).is_ok()
+    }
+
+    /// The attached sink's status, or `None` when none is attached. It reads
+    /// atomics only and never takes the ring's lock.
+    pub fn durable_status(&self) -> Option<DurableAuditStatus> {
+        self.durable.get().map(|sink| sink.status())
     }
 
     /// Recent entries of both lanes in call order, oldest first. `since` keeps

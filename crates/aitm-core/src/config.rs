@@ -338,6 +338,9 @@ pub struct McpConfig {
     /// Default [`Frontend::Mcp`] — stdio is the agent-attach transport; an
     /// operator attached over stdio sets this to [`Frontend::Operator`].
     pub stdio_role: Frontend,
+    /// Where the durable audit log is written; see [`AuditLogSetting`]. The
+    /// default is the per-user `audit.jsonl`.
+    pub audit_log: AuditLogSetting,
 }
 
 impl Default for McpConfig {
@@ -348,6 +351,35 @@ impl Default for McpConfig {
             operator_token: None,
             policy: AgentPolicy::Auto,
             stdio_role: Frontend::Mcp,
+            audit_log: AuditLogSetting::Default,
+        }
+    }
+}
+
+/// Where the durable audit log (the JSONL file the `aitm` binary appends every
+/// command invocation to) is written: the `mcp.audit_log` setting.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AuditLogSetting {
+    /// The operator said nothing: the per-user `audit.jsonl` beside the CA
+    /// audit log, written on a best-effort basis.
+    #[default]
+    Default,
+    /// The operator turned the file off.
+    Off,
+    /// An explicit path: the operator asked for this file, so a failure to use it
+    /// is theirs to hear about (the spellings are in Design 2 of the durable
+    /// audit spec).
+    Path(PathBuf),
+}
+
+impl AuditLogSetting {
+    /// The file to write, or `None` when the log is off. `Default` is
+    /// `<config_dir>/aitmproxy/audit.jsonl`, a sibling of the CA audit log.
+    pub fn resolved_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Default => Some(default_aitm_dir().join("audit.jsonl")),
+            Self::Off => None,
+            Self::Path(path) => Some(path.clone()),
         }
     }
 }
