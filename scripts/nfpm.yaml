@@ -59,6 +59,11 @@ contents:
     dst: "/usr/lib/aitmproxy/aitm-tui"
     file_info:
       mode: 0o755
+  # The default detection catalogue, discovered beside the binary.
+  - src: "${STAGEDIR}/usr/lib/aitmproxy/share/aitm/scripts"
+    dst: "/usr/lib/aitmproxy/share/aitm/scripts"
+    file_info:
+      mode: 0o644
   - src: "/usr/lib/aitmproxy/aitm"
     dst: "/usr/bin/aitm"
     type: symlink

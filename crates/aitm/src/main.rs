@@ -160,6 +160,10 @@ async fn run() -> anyhow::Result<()> {
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
+    // Ship-by-default detection catalogue (scripts/bundled → share/aitm/scripts):
+    // passive OWASP/vuln detectors plus operator-invoked active/L4 command scripts.
+    // Observe-only passives keep deny-by-default; `AITM_NO_BUNDLED_SCRIPTS` turns it off.
+    aitm::bundled::apply(&mut rhai_cfg, |k| std::env::var(k).ok());
     // `--bus-endpoint-file` wins over the config's `endpoint_file`; it only means
     // anything for the loopback-TCP bus, so asking for it over stdio is an error.
     apply_bus_endpoint_file(&mut cfg.mcp.transport, bus_endpoint_file)?;
