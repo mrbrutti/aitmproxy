@@ -387,6 +387,19 @@ listed in **Manual verification (Terminal panel)** at the end.
 - **Depends on:** Task 4 (`start()` conditional-resume) and Task 6 (the Capture UI +
   menu are in the tripwire's allow-list). **Runs after Task 6** (its allow-list greps
   need Task 6's files present), so it is **not** parallel with Task 6.
+- **Plan amendment (orchestrator, 2026-10-30):** the tripwire's allow-list below was
+  written before the code existed; it must match reality. As actually built:
+  `ExtensionController.swift` legitimately contains `"capture.enabled"` (read in
+  `start()`) AND the `enable()`/`disable()` definitions + the `start()`→`enable()`
+  self-call; Task 6 homed the ON/OFF glue in a `CaptureSwitch` enum inside
+  `SettingsView.swift` (NOT `Session.swift`), and `App.swift` holds the menu label/
+  command. So the legitimate locations are `EmbeddedCore.swift`,
+  `ExtensionController.swift`, `SettingsView.swift`, and `App.swift`; there is no
+  `Session*.swift` glue file. The coder MUST read the real files and build the
+  allow-list from them; the invariant that matters is that NO agent-reachable surface
+  (BusService / CommandMap / CommandPalette / Session+Palette / Session+Verbs /
+  AgentPanel / Fixtures+Agent / Fixtures+Tools) references the toggle,
+  `enable()`/`disable()`, the activation/deactivation requests, or `capture.enabled`.
 - **Files:**
   - `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (modify only if needed).
   - `apps/mac/tools/check-capture-operator-only.sh` (create) — the committed TG-AC9
