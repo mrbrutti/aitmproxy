@@ -6,6 +6,8 @@ import UniformTypeIdentifiers
 @Observable
 final class DiffViewState {
     var unified = false
+    /// True until the operator picks a mode: a narrow pane then defaults to unified.
+    var autoMode = true
     var collapsed: Set<FlowDiffSection.Part> = []
 }
 
@@ -17,22 +19,31 @@ struct DiffView: View {
     var bodySize: CGFloat = Tok.Typography.Size.md
     var state: DiffViewState
 
+    /// Side-by-side needs room for two columns; below ~700 pt it defaults to unified
+    /// (until the operator picks a mode), so a narrow pane isn't two squeezed columns.
+    private static let unifiedBelow: CGFloat = 700
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                ForEach(result.sections) { section in
-                    sectionHeader(section)
-                    if section.diff.hasChanges, !state.collapsed.contains(section.part) {
-                        if state.unified {
-                            UnifiedDiff(diff: section.diff, bodySize: bodySize)
-                        } else {
-                            SideBySideDiff(pairs: section.diff.sideBySide(), bodySize: bodySize)
+        GeometryReader { geo in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(result.sections) { section in
+                        sectionHeader(section)
+                        if section.diff.hasChanges, !state.collapsed.contains(section.part) {
+                            if state.unified {
+                                UnifiedDiff(diff: section.diff, bodySize: bodySize)
+                            } else {
+                                SideBySideDiff(pairs: section.diff.sideBySide(), bodySize: bodySize)
+                            }
                         }
                     }
                 }
+                .padding(.vertical, Space.sm)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.vertical, Space.sm)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .onChange(of: geo.size.width < Self.unifiedBelow, initial: true) { _, narrow in
+                if state.autoMode { state.unified = narrow }
+            }
         }
     }
 
@@ -177,48 +188,51 @@ private struct DiffCell: View {
     }
 }
 
-/// The Diff tab's trailing controls: Side by side | Unified, Export Patch…, the truncated chip.
+/// The Diff tab's trailing controls: a "Comparing #A → #B" label, the compact
+/// Side-by-side / Unified segment, and an overflow menu (Export Patch…, truncation).
 struct DiffControls: View {
     var result: FlowDiffResult
-    var state: DiffViewState
+    @Bindable var state: DiffViewState
+    /// `#45 → #46` for the two flows, when the caller knows their numbers.
+    var compareLabel: String?
+
+    /// Picking a mode turns off the width-driven default so the choice sticks.
+    private var modeBinding: Binding<Bool> {
+        Binding(get: { state.unified }, set: { state.unified = $0; state.autoMode = false })
+    }
 
     var body: some View {
         HStack(spacing: Space.sm) {
-            if result.truncated {
-                Text("truncated")
-                    .font(Tok.Face.ui(Tok.Typography.Size.xs))
-                    .foregroundStyle(Tok.Ink.primary.color)
-                    .padding(.horizontal, Tok.Metric.gapTight)
-                    .frame(minHeight: Tok.Metric.countChip)
-                    .background(Tok.Ground.raised.color, in: Capsule())
-                    .help("Each side is compared up to \(Format.bytes(Int64(TextDiff.maxBytesPerSide)))")
-                    .accessibilityLabel("truncated")
+            if let compareLabel {
+                Text(compareLabel)
+                    .font(Tok.Face.data(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                    .lineLimit(1)
+                    .fixedSize()
+                    .accessibilityLabel("Comparing \(compareLabel)")
             }
-            HStack(spacing: 2) {
-                mode("Side by side", unified: false)
-                mode("Unified", unified: true)
+            FlatSegment(options: [(false, "Side by side"), (true, "Unified")], selection: modeBinding)
+            Menu {
+                Button("Export Patch…") { exportPatch() }
+                    .disabled(!result.hasChanges)
+                if result.truncated {
+                    Divider()
+                    Text("Each side compared up to \(Format.bytes(Int64(TextDiff.maxBytesPerSide)))")
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: Tok.Size.iconInline))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                    .frame(width: Space.xxl, height: Space.xxl)
+                    .contentShape(Rectangle())
             }
-            Button("Export Patch…") { exportPatch() }
-                .buttonStyle(.plain)
-                .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(result.hasChanges ? Tok.Ink.secondary.color : Tok.Ink.tertiary.color)
-                .disabled(!result.hasChanges)
-                .help("Save the unified diff as a .patch file")
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More diff options")
+            .accessibilityLabel("Diff options")
         }
-    }
-
-    private func mode(_ title: String, unified: Bool) -> some View {
-        let on = state.unified == unified
-        return Button { state.unified = unified } label: {
-            Text(title)
-                .font(Tok.Face.ui(Tok.Typography.Size.sm, on ? .medium : .regular))
-                .foregroundStyle(on ? Tok.Ink.primary.color : Tok.Ink.tertiary.color)
-                .padding(.horizontal, Space.sm)
-                .frame(height: Tok.Metric.chip)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(on ? .isSelected : [])
     }
 
     private func exportPatch() {
@@ -234,9 +248,11 @@ struct DiffControls: View {
 /// One row selected: the words from S-026's UX block.
 struct DiffEmpty: View {
     var body: some View {
-        Text("Select a second flow with ⌘-click to compare")
-            .font(Tok.Face.ui(Tok.Typography.Size.md))
-            .foregroundStyle(Tok.Ink.tertiary.color)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        ContentUnavailableView {
+            Label("Nothing to Compare", systemImage: "plusminus")
+        } description: {
+            Text("⌘-click a second flow in the list to compare it with this one.")
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

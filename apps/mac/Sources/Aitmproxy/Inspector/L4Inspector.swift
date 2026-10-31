@@ -65,7 +65,7 @@ struct L4Inspector: View {
 
     @ViewBuilder private func detailPane(_ detail: L4Flow) -> some View {
         VStack(spacing: 0) {
-            PaneTabs(title: tab == .packet ? "Packet" : "Craft", tabs: L4Tab.allCases, selected: $tab) {
+            PaneTabs(title: tab == .packet ? "Layers" : "Craft", tabs: L4Tab.allCases, selected: $tab) {
                 EmptyView()
             }
             switch tab {
@@ -239,7 +239,7 @@ struct L4Inspector: View {
 }
 
 enum L4Tab: String, CaseIterable, CustomStringConvertible {
-    case packet = "Packet", craft = "Craft"
+    case packet = "Layers", craft = "Craft"
     var description: String { rawValue }
 }
 
@@ -344,8 +344,7 @@ private struct L4PacketDetail: View {
                 // l4.flow.get is a summary — it carries layers + length, not the raw
                 // bytes (bounded M5 store). The craft editor's build() preview shows
                 // crafted bytes in hex; captured bytes are not transported.
-                Hint(text: "Raw bytes are not transported with l4.flow.get (M5 summary). "
-                    + "Use Craft → build() to see crafted bytes in hex.")
+                Hint(text: "The captured bytes aren't kept here. Use Craft → Build to see crafted bytes in hex.")
             }
             .padding(Space.md)
             .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -399,15 +398,15 @@ struct L4InterceptBar: View {
         if !present {
             HStack(spacing: Space.sm) {
                 Image(systemName: "hand.raised.slash").font(.system(size: 12)).foregroundStyle(Tok.Ink.tertiary.color)
-                Text("In-path intercept (Forward / Mutate / Drop) needs a Linux core with l4.intercept.* (NFQUEUE / CAP_NET_ADMIN). "
-                    + "Documented-limited here — capture, craft and guarded inject still work.")
+                Text("Forwarding and dropping packets in-path isn't available here — capture, craft and guarded inject still work.")
                     .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(1).truncationMode(.tail)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, Space.md).padding(.vertical, Space.xs)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Tok.Ground.raised.color)
+            .help("In-path intercept (Forward / Mutate / Drop) needs a Linux core with the l4.intercept.* verbs (NFQUEUE / CAP_NET_ADMIN).")
             .accessibilityIdentifier("l4-intercept-limited")
         } else if session {
             HStack(spacing: Space.sm) {
@@ -428,20 +427,19 @@ struct L4DegradedBanner: View {
     var reason: String
 
     var body: some View {
-        HStack(alignment: .top, spacing: Space.sm) {
+        HStack(spacing: Space.sm) {
             Image(systemName: "exclamationmark.triangle").foregroundStyle(Tok.Intercept.deep.color)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("L4 wire verbs unavailable").font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
-                    .foregroundStyle(Tok.Ink.primary.color)
-                Text(reason).font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            Text("Sending and injecting packets isn't available here.")
+                .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
+                .lineLimit(1).truncationMode(.tail)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, Space.md).padding(.vertical, Space.sm)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Tok.Intercept.tint.color)
+        .help(reason)
         .accessibilityIdentifier("l4-degraded-banner")
+        .accessibilityValue(reason)
     }
 }
 
