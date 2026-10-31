@@ -453,7 +453,7 @@ final class Session {
     /// to the server). Called by the bus service on connect; `nil` on disconnect.
     func applyResolvedRole(_ role: String?) {
         resolvedRole = role
-        let expected = ExpectedRole(rawValue: UserDefaults.standard.string(forKey: "bus.expectedRole") ?? "")
+        let expected = ExpectedRole(rawValue: Store.defaults.string(forKey: BusEndpointSettings.Key.expectedRole) ?? "")
         // The embedded core always connects the app as operator; the Expected-role setting
         // describes an external core. Suppressed only while the embedded core is the ACTIVE
         // connection (a stale "agent" default would otherwise show a permanent triangle on a

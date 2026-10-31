@@ -1,6 +1,7 @@
 import AitmBusClient
 import AitmproxyKit
 import AppKit
+import Synchronization
 
 /// Self-test for agents: drives the real session model on fixture data,
 /// prints PASS or FAIL per check, and quits with exit code 0 or 1.
@@ -14,8 +15,38 @@ enum SelfTest {
     static var failures = 0
     static var count = 0
 
+    /// The window scene's `.task` starts the self-test. AppKit opens a bare
+    /// command-line word (one that is neither `--selftest` nor part of a
+    /// `-key value` pair) as a document, and SwiftUI then never opens the main
+    /// window, so that `.task` never fires and the process would idle forever
+    /// (seen 2026-10-31 with `--selftest -bus.activeKind external`). The watchdog
+    /// turns that, and a check that never settles, into a failed run: FAIL and
+    /// exit 1 when the self-test has not started by `startDeadline` or finished by
+    /// `runDeadline`. It runs off the main actor so a busy main thread cannot stall it.
+    nonisolated static let startDeadline: Duration = .seconds(15)
+    nonisolated static let runDeadline: Duration = .seconds(240)
+    nonisolated private static let started = Mutex(false)
+    nonisolated private static let finished = Mutex(false)
+
+    static func armWatchdog() {
+        guard requested else { return }
+        Task.detached {
+            try? await Task.sleep(for: startDeadline)
+            guard started.withLock({ $0 }) else {
+                print("SELFTEST FAIL: not started within \(startDeadline): the main window never appeared. A bare command-line word is opened as a document; pass settings through APP_DEFAULTS_SUITE, not -key value arguments.")
+                exit(1)
+            }
+            try? await Task.sleep(for: runDeadline - startDeadline)
+            guard finished.withLock({ $0 }) else {
+                print("SELFTEST FAIL: not finished within \(runDeadline)")
+                exit(1)
+            }
+        }
+    }
+
     static func runIfRequested(session: Session) {
         guard requested else { return }
+        started.withLock { $0 = true }
         setvbuf(stdout, nil, _IOLBF, 0)
         guard Store.isOverridden else {
             print("SELFTEST refused: set APP_STORE to a folder in /tmp")
@@ -402,6 +433,7 @@ enum SelfTest {
 
     /// Quits through NSApp.terminate, never exit(), and closes sheets first.
     static func finish(code: Int32) {
+        finished.withLock { $0 = true }
         exitCode = code
         for window in NSApp.windows { if let sheet = window.attachedSheet { window.endSheet(sheet) } }
         NSApp.terminate(nil)

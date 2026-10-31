@@ -131,7 +131,7 @@ final class ExtensionController: NSObject {
             return
         }
         health.extensionController = self
-        if UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false {
+        if Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false {
             enable()
         } else {
             health.captureCapability = .extensionNotInstalled

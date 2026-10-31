@@ -87,18 +87,18 @@ struct GeneralSettings: View {
 /// (Task 7, AC10).
 struct BusSettings: View {
     @Environment(Session.self) private var session
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
-    @AppStorage("bus.host") private var host = "127.0.0.1"
-    @AppStorage("bus.port") private var port = 9090
-    @AppStorage("bus.tokenFile") private var tokenFile = ""
-    @AppStorage("bus.fromConfig") private var fromConfig = true
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage(BusEndpointSettings.Key.host, store: Store.defaults) private var host = "127.0.0.1"
+    @AppStorage(BusEndpointSettings.Key.port, store: Store.defaults) private var port = 9090
+    @AppStorage(BusEndpointSettings.Key.tokenFile, store: Store.defaults) private var tokenFile = ""
+    @AppStorage(BusEndpointSettings.Key.fromConfig, store: Store.defaults) private var fromConfig = true
     /// The operator token, pasted by a human. Empty ⇒ connect as agent with the
     /// config token (spec Decision E). A `SecureField` keeps it off the screen;
     /// it is never printed or logged.
-    @AppStorage("bus.operatorToken") private var operatorToken = ""
+    @AppStorage(BusEndpointSettings.Key.operatorToken, store: Store.defaults) private var operatorToken = ""
     /// What role the operator expects the connection to resolve to. Client-side
     /// only — it never travels to the server, it only drives the warning.
-    @AppStorage("bus.expectedRole") private var expectedRole = ExpectedRole.agent.rawValue
+    @AppStorage(BusEndpointSettings.Key.expectedRole, store: Store.defaults) private var expectedRole = ExpectedRole.agent.rawValue
 
     private var activeKind: ActiveCoreKind { ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded }
     private var usesExternal: Bool { activeKind == .external }
@@ -153,9 +153,9 @@ struct BusSettings: View {
 /// its own config.yaml, so the controls are read-only then.
 struct ProxySettings: View {
     @Environment(Session.self) private var session
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
-    @AppStorage("proxy.preferredPort") private var port = 8080
-    @AppStorage("proxy.verifyUpstreamTLS") private var verifyTLS = true
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage("proxy.preferredPort", store: Store.defaults) private var port = 8080
+    @AppStorage("proxy.verifyUpstreamTLS", store: Store.defaults) private var verifyTLS = true
 
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
@@ -221,10 +221,10 @@ struct ProxySettings: View {
 /// is disabled and a note says where to change it.
 struct CaptureSettings: View {
     @Environment(Session.self) private var session
-    @AppStorage(UserDefaultsActiveKindPersistence.key) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
+    @AppStorage(UserDefaultsActiveKindPersistence.key, store: Store.defaults) private var activeKindRaw = ActiveCoreKind.embedded.rawValue
     /// The persisted choice, `false` until the operator turns capture on. Read here only:
     /// `CaptureSwitch` writes it, at the point in its steps where it must be written.
-    @AppStorage("capture.enabled") private var captureEnabled = false
+    @AppStorage("capture.enabled", store: Store.defaults) private var captureEnabled = false
     @State private var confirming = false
     @State private var removing = false
 
@@ -352,7 +352,7 @@ enum CaptureSwitch {
     /// (embedded when unset). The toggle and the menu command, which cannot see the views'
     /// `@AppStorage`, gate on this.
     static var embeddedCoreActive: Bool {
-        (UserDefaultsActiveKindPersistence().load() ?? .embedded) == .embedded
+        (UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded) == .embedded
     }
 
     /// ON: persist the choice, activate the extension, then respawn the core so its capture
@@ -365,7 +365,7 @@ enum CaptureSwitch {
     static func set(_ on: Bool, session: Session) async {
         let health = session.coreHealth
         guard !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
-              on != (UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false)
+              on != (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false)
         else { return }
         health.captureBusy = true
         health.captureChoice = on
@@ -374,11 +374,11 @@ enum CaptureSwitch {
             health.captureBusy = false
         }
         if on {
-            UserDefaults.standard.set(true, forKey: "capture.enabled")
+            Store.defaults.set(true, forKey: "capture.enabled")
             health.extensionController?.enable()
             session.restartCoreTick += 1
         } else {
-            UserDefaults.standard.set(false, forKey: "capture.enabled")
+            Store.defaults.set(false, forKey: "capture.enabled")
             await health.extensionController?.disable()
             session.restartCoreTick += 1
         }
@@ -396,9 +396,9 @@ enum CaptureSwitch {
         defer { health.captureBusy = false }
         await health.extensionController?.uninstall()
         guard health.captureCapability == .extensionNotInstalled,
-              UserDefaults.standard.object(forKey: "capture.enabled") as? Bool ?? false
+              Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false
         else { return }
-        UserDefaults.standard.set(false, forKey: "capture.enabled")
+        Store.defaults.set(false, forKey: "capture.enabled")
         if embeddedCoreActive { session.restartCoreTick += 1 }
     }
 }
