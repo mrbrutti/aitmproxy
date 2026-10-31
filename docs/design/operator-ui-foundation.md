@@ -386,7 +386,7 @@ The shared feature set every surface implements. **Source**: m = mitmproxy, P = 
 | Command | Params → result | Drives |
 |---|---|---|
 | `flow.list` | `{}` → `[FlowId]` oldest first | flow list ids (today the whole list every poll) |
-| `flow.get` | `{id}` → summary `{id, kind: http\|websocket, intercept, is_replay, method, scheme, authority, path, status?, request_bytes?, response_bytes?, handshake?, messages?}` | a row's cells. **No headers, body, timing, conn or metadata** → F5 |
+| `flow.get` | `{id}` → summary `{id, kind: http\|websocket, intercept, is_replay, method, scheme, authority, path, status?, request_bytes?, response_bytes?, started_at?, duration_ms?, handshake?, messages?}` | a row's cells. **No headers, body, conn or metadata** → F5 |
 | `flow.intercept` | `{enabled?: bool}` → `bool` | arm/disarm; parks **every request** while armed |
 | `flow.resume` | `{id}` → ok | the bar's Resume |
 | `flow.kill` | `{id}` → ok | Kill (connection reset) |

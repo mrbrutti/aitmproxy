@@ -321,9 +321,11 @@ export function createAppStore(bus: BusClient) {
     }
 
     /**
-     * A real bus: the push is a trigger, never data. The server's summary is sparse (`kind:"ws"`,
-     * no times, no sizes) and would regress a rich row, so it is ignored; the id is queued and the
-     * coalescer refetches it through the same helper the poll uses.
+     * A real bus: the push is a trigger, never data. The server's summary is the full `flow.get`
+     * object (same keys, `kind:"websocket"`), but it is still not applied: refetching by id keeps
+     * one fetch path for push and poll, a deliberate choice rather than a workaround for a sparse
+     * summary (applying it is follow-up F4). The id is queued and the coalescer refetches it
+     * through the same helper the poll uses.
      */
     function onFlowTrigger(n: FlowNotification) {
       if (n.event === 'cleared') {
@@ -495,16 +497,16 @@ export function createAppStore(bus: BusClient) {
     // ---- live updates: push as a trigger, poll unless push is demonstrably flowing -------------
     // The bus client subscribes (`flow.subscribe`, in ws.ts) on every open, and a flow notification
     // is treated as a trigger: the id is queued and refetched (`onFlowTrigger`, `flushPush`), never
-    // applied from the push's sparse summary. The outcome of the subscribe is not surfaced, and a
-    // confirmed subscription cannot be told from a dispatcher that is not fed until a push arrives, so
-    // every real bus is still polled. The loop skips the flow poll only while a FLOW notification
-    // arrived within PUSH_FRESH_MS, and the status poll only while a STATE one did (a bridge that
-    // pushes just throughput ticks must not slow the list down). Even then a heartbeat runs every
-    // PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. When the bus
-    // (re)opens both clocks are reset and the pending set dropped, so the first tick after an outage
-    // takes a fresh snapshot; a `lagged` marker resyncs at once (`requestPollNow`), single-flight with
-    // the tick's own poll. The loop touches the bus only while it is `open` (a call into a bus that is
-    // reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
+    // applied from the push's summary (`onFlowTrigger` says why). The outcome of the subscribe is not
+    // surfaced, and a confirmed subscription cannot be told from a dispatcher that is not fed until a
+    // push arrives, so every real bus is still polled. The loop skips the flow poll only while a FLOW
+    // notification arrived within PUSH_FRESH_MS, and the status poll only while a STATE one did (a
+    // bridge that pushes just throughput ticks must not slow the list down). Even then a heartbeat
+    // runs every PUSH_FRESH_MS, so a push that dies quietly or loses events cannot freeze either. When
+    // the bus (re)opens both clocks are reset and the pending set dropped, so the first tick after an
+    // outage takes a fresh snapshot; a `lagged` marker resyncs at once (`requestPollNow`), single-flight
+    // with the tick's own poll. The loop touches the bus only while it is `open` (a call into a bus
+    // that is reconnecting can wait on it indefinitely), and heals a bootstrap that never got the tool
     // catalogue. The static `fixtures` bus is a snapshot and is never polled.
     const POLL_MS = 500;
     const STATUS_EVERY_MS = 2000; // while the state stream is not pushing
