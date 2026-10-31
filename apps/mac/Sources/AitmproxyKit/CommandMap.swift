@@ -170,6 +170,7 @@ public enum CommandMap {
             E("Agent", "Activity Log…", "⇧⌘L", items: toggle(["Activity Log…", "Hide Activity Log"], "⇧⌘L")),
             E("Agent", "Approve Pending Request", "⌥⏎", items: one("Approve Pending Request", "⌥⏎")),
 
+            E("Proxy", "Status", "⌘0", items: one("Status", "⌘0")),
             E("Proxy", "Scope…", "⇧⌘O", items: one("Scope…", "⇧⌘O")),
             E("Proxy", "Breakpoint Rules…", "⇧⌘B", items: one("Breakpoint Rules…", "⇧⌘B")),
             E("Proxy", "Certificate Authority…", nil, items: one("Certificate Authority…", nil)),

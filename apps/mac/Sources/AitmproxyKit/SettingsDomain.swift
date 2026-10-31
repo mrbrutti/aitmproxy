@@ -2,8 +2,9 @@ import AitmBusClient
 import Foundation
 
 /// Which `UserDefaults` the connection settings come from: Settings ▸ Bus
-/// (`bus.*`), Settings ▸ Proxy (`proxy.*`) and the capture toggle
-/// (`capture.enabled`). A normal launch reads the operator's real defaults. A
+/// (`bus.*`), Settings ▸ Proxy (`proxy.*`) and the capture toggle's on/off key
+/// (named only where it is read and written, so the operator-only tripwire can
+/// list those files). A normal launch reads the operator's real defaults. A
 /// self-test, snapshot or fixture run reads an isolated suite instead, so stale
 /// residue (a pasted operator token from an earlier session, an `external` core
 /// choice) can neither steer the run nor be overwritten by it.

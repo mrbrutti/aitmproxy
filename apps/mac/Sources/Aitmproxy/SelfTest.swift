@@ -62,6 +62,26 @@ enum SelfTest {
             let fixtureCount = Fixtures.rows.count + Fixtures.l4Rows.count
             let inScopeCount = (Fixtures.rows + Fixtures.l4Rows).filter(\.inScope).count
             check("fixtures load \(fixtureCount) rows", session.rows.count == fixtureCount)
+            // ST-AC4/ST-AC6: the Status page and the one connection vocabulary. Fixtures run no
+            // embedded core and connect the bus as operator, so the lanes must say exactly that.
+            let summary = session.connectionSummary
+            check("the core lane says the fixture core is not running", summary.core.word == "not running" && summary.core.state == .off)
+            check("the bus lane reads the fixture bus as connected", summary.bus.word == "connected" && summary.bus.state == .ok)
+            check("the capture lane says this build has no extension", summary.capture.word == "no extension")
+            check("Status is reached from the brand row, the pill and ⌘0, not a list row", !SidebarPage.status.isInSidebar && !SidebarPage.status.showsFlows)
+            check("Open Scope from Status shows the Scope page", { session.perform(connection: .openScope); return session.page == .scope }())
+            check("Open Browser from Status shows the Browser page", { session.perform(connection: .openBrowser); return session.page == .browser }())
+            check("Core Log from Status opens the core log", { session.perform(connection: .showCoreLog); return session.coreLogVisible }())
+            session.coreLogVisible = false
+            check("Settings actions are left to the view", !session.perform(connection: .openCaptureSettings) && !session.perform(connection: .turnCaptureOn))
+            check("Copy Address from Status copies the listen address", { session.perform(connection: .copyListenAddress); return NSPasteboard.general.string(forType: .string) == session.listenAddress }())
+            check("Reconnect from Status bumps the bus reconnect", { let before = session.reconnectTick; session.perform(connection: .reconnectBus); return session.reconnectTick == before + 1 }())
+            // ST-AC4: the landing rule — Status on a fresh install, the last list page otherwise.
+            check("a fresh install lands on Status", Session.landingPage(saved: nil) == .status)
+            check("a remembered list page is restored", Session.landingPage(saved: "domains") == .domains)
+            check("a session that ended on Status or Saved comes back on Flows", Session.landingPage(saved: "status") == .flows && Session.landingPage(saved: "saved") == .flows)
+            check("an unknown saved page lands on Status", Session.landingPage(saved: "nope") == .status)
+            session.page = .apps
             check("two flows are paused", session.paused.count == 2)
             check("the paused login is selected", session.focusedRow?.seq == 50)
             check("the inspector has the login detail", session.focusedDetail?.request.header("x-forwarded-for") == "127.0.0.1")

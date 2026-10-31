@@ -27,8 +27,10 @@
 # The seven rules, as built:
 #   1. The activation/deactivation request and submitRequest live in ExtensionController.swift only.
 #   2. Dotted .enable()/.disable() calls appear only in SettingsView.swift (the CaptureSwitch
-#      glue) and ExtensionController.swift. App.swift calls CaptureSwitch.set, never these.
-#      Same for the published controller handle (extensionController) and CaptureSwitch itself.
+#      glue) and ExtensionController.swift. App.swift and Panels/StatusPanel.swift (the Status
+#      page's lane card, an operator surface like Settings) call CaptureSwitch.set/uninstall,
+#      never these. Same for the published controller handle (extensionController) and
+#      CaptureSwitch itself.
 #   3. The "capture.enabled" key appears only in EmbeddedCore.swift (spawn reads it),
 #      ExtensionController.swift (start() reads it), SettingsView.swift (the toggle + CaptureSwitch)
 #      and App.swift (the menu label).
@@ -36,7 +38,9 @@
 #   5. ShellView.swift constructs the ExtensionController once and calls start() on it once.
 #      (It also has `bus?.start()`, so this counts by receiver, not every .start().)
 #   6. restartCoreTick is bumped (any mutation; only `var restartCoreTick` is exempt) in
-#      SettingsView.swift, App.swift and Shell/ShellView.swift only. Session.swift declares it.
+#      SettingsView.swift, App.swift, Shell/ShellView.swift and Panels/StatusPanel.swift (the
+#      Status page's Restart Core button, the twin of Proxy ▸ Restart Core) only. Session.swift
+#      declares it; Session+Connection.swift deliberately returns the action to the view.
 #      Bumping it restarts the embedded core, which re-reads capture.enabled and opens or
 #      closes the capture path, so it counts as "apply the capture choice". The agent-reachable
 #      surfaces of rule 4 do not mention it at all.
@@ -64,6 +68,10 @@ core_health=Sources/Aitmproxy/Bus/CoreHealthState.swift
 settings_view=Sources/Aitmproxy/SettingsView.swift
 app_swift=Sources/Aitmproxy/App.swift
 shell_view=Sources/Aitmproxy/Shell/ShellView.swift
+# The Status page (spec 2026-10-31-macos-status-page-and-first-run-design): operator UI with
+# the same Turn On/Off Capture, Uninstall and Restart Core controls Settings and the Proxy menu
+# have, reached only by clicking the page. Allowed alongside them, with expects, for rules 2 and 6.
+status_panel=Sources/Aitmproxy/Panels/StatusPanel.swift
 
 violations=0
 checked=0
@@ -154,9 +162,10 @@ expect "2 controller handle" "$settings_view" 'extensionController' 'the handle 
 expect "2 controller handle" "$ext_controller" 'extensionController' 'the handle it publishes'
 
 # The one glue type behind the Settings toggle and the menu command.
-scan "2 toggle glue" 'CaptureSwitch' "$settings_view" "$app_swift"
+scan "2 toggle glue" 'CaptureSwitch' "$settings_view" "$app_swift" "$status_panel"
 expect "2 toggle glue" "$settings_view" 'CaptureSwitch' 'CaptureSwitch'
 expect "2 toggle glue" "$app_swift" 'CaptureSwitch' 'the menu command calling CaptureSwitch'
+expect "2 toggle glue" "$status_panel" 'CaptureSwitch\.(set|uninstall)' 'the Status page lane card calling CaptureSwitch.set/uninstall'
 
 # ---- 3. the persisted choice ---------------------------------------------------------
 scan "3 capture.enabled key" "$key_re" \
@@ -212,9 +221,9 @@ fi
 # `var restartCoreTick` (Session.swift) is the declaration and is the only line exempted.
 SCAN_IGNORE='(^|[[:space:]])var[[:space:]]+restartCoreTick([[:space:]]|:|=|$)'
 scan "6 restartCoreTick bump" 'restartCoreTick[[:space:]]*[-+*/%&|^]*=([^=]|$)' \
-  "$settings_view" "$app_swift" "$shell_view"
+  "$settings_view" "$app_swift" "$shell_view" "$status_panel"
 SCAN_IGNORE=
-for f in "$settings_view" "$app_swift" "$shell_view"; do
+for f in "$settings_view" "$app_swift" "$shell_view" "$status_panel"; do
   expect "6 restartCoreTick bump" "$f" 'restartCoreTick[[:space:]]*\+=' 'a restartCoreTick += bump'
 done
 

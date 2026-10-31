@@ -19,17 +19,6 @@ public enum CoreHealth: Hashable, Sendable, CaseIterable {
         case .degraded, .stopped: self = .failed
         }
     }
-
-    /// The one status-bar word per core state, shared by the toolbar pill and the health
-    /// dot so they never disagree. Lower case: it follows a dot or a "·" mid-sentence.
-    /// `CoreConnection.Status.healthTitle` keeps the finer per-status word for the log.
-    public var statusWord: String {
-        switch self {
-        case .running: "core running"
-        case .restarting: "restarting…"
-        case .failed: "core failed"
-        }
-    }
 }
 
 extension CoreConnection.Status {

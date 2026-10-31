@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 /// Which core the app talks to, as a persisted, user-changeable choice (spec O1).
 /// `embedded` is the default: the app runs and manages its own bundled core.
@@ -81,8 +82,10 @@ public final class UserDefaultsActiveKindPersistence: ActiveKindPersistence {
 /// Construction is side-effect-free: call `activate()` once at launch to apply the
 /// restored choice. The UI exposes exactly one active choice today; the registry
 /// seam (Task 4) keeps the door open for several at once.
-@MainActor
+@MainActor @Observable
 public final class ActiveConnectionModel {
+    /// Observed: the connection indicators branch on it (`ConnectionSummary`), so a kind
+    /// switch alone must invalidate them, not only the bus state change that follows.
     public private(set) var activeKind: ActiveCoreKind
 
     private let driver: ActiveConnectionDriver

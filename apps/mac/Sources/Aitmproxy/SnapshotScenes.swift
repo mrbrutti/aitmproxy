@@ -42,9 +42,42 @@ enum SnapshotScene: String, CaseIterable {
     case inspectL4 = "inspect-l4"
     case inspectL4OutOfScope = "inspect-l4-oos"
     case appsNoAttribution = "apps-noattribution"
+    // The Status page (spec 2026-10-31 status page, ST-AC3), one scene per lane state worth seeing.
+    case statusOK = "status-ok"
+    case statusFresh = "status-fresh"
+    case statusCoreFailed = "status-core-failed"
+    case statusBusToken = "status-bus-token"
+    case statusCoreStarting = "status-core-starting"
+    case statusCoreStopped = "status-core-stopped"
+    case statusBusConnecting = "status-bus-connecting"
+    case statusBusAgent = "status-bus-agent"
+    case statusScopeEmpty = "status-scope-empty"
+    case statusWaiting = "status-waiting"
+    case statusDegraded = "status-degraded"
+    case statusExternal = "status-external"
 
-    /// The fixture rows the `appsNoAttribution` scene strips of their client, restored by `reset`.
+    /// The fixture rows the `appsNoAttribution` and `statusFresh` scenes replace, restored by `reset`.
     private static var savedRows: [FlowRow]?
+    /// The fixture bus state, role and warning a Status scene overrides, restored by `reset`.
+    private static var savedBus: (bus: BusState, role: String?, warning: Bool)?
+
+    /// Seeds the Status page: page, embedded core, bus, role and the capture state. Every Status
+    /// scene goes through here so the restore in `reset` has one shape to undo.
+    private static func status(_ session: Session, core: CoreConnection?, bus: BusState, role: String?,
+                               roleWarning: Bool = false, capability: CaptureCapability,
+                               scope: [String] = Fixtures.scope) {
+        Self.savedBus = Self.savedBus ?? (session.bus, session.resolvedRole, session.roleWarning)
+        session.page = .status
+        session.coreHealth.connection = core
+        session.bus = bus
+        session.resolvedRole = role
+        session.roleWarning = roleWarning
+        session.coreHealth.captureSupported = true
+        session.coreHealth.captureCapability = capability
+        session.scopeHosts = scope
+    }
+
+    private static let readyCore = core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080")
 
     /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
     /// core-log panel render without a live core (snapshots use fixtures).
@@ -207,6 +240,60 @@ enum SnapshotScene: String, CaseIterable {
         case .inspectL4OutOfScope:
             // The out-of-L4-scope session: dimmed, mutating actions disabled (AC9).
             session.select(session.rows.first { $0.kind == .l4 && !$0.inScope }?.id)
+        case .statusOK:
+            // Everything green: three ok lanes, the Getting-started list collapsed to one line.
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .capturing)
+        case .statusFresh:
+            // First launch: core and bus up, no extension, empty scope, no flows; Recent is empty.
+            Self.savedRows = Self.savedRows ?? session.rows
+            session.rows = []
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .extensionNotInstalled, scope: [])
+        case .statusCoreFailed:
+            // The core died: the Core lane is the error, the bus is offline, nothing on the page is blank.
+            Self.status(session,
+                        core: Self.core(.degraded(reason: "the core exited unexpectedly (status 1)\naitm: address already in use (os error 48)"),
+                                        label: "Embedded core"),
+                        bus: .disconnected, role: nil, capability: .inactive)
+        case .statusCoreStarting:
+            Self.status(session, core: Self.core(.starting, label: "Embedded core · starting"), bus: .connecting("127.0.0.1:60745"), role: nil,
+                   capability: .inactive)
+        case .statusCoreStopped:
+            Self.status(session, core: Self.core(.stopped, label: "Embedded core · stopped"), bus: .disconnected, role: nil,
+                   capability: .inactive)
+        case .statusBusConnecting:
+            Self.status(session, core: Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080"),
+                   bus: .connecting("127.0.0.1:60745"), role: nil, capability: .capturing)
+        case .statusBusAgent:
+            Self.status(session, core: Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080"),
+                   bus: .connected("127.0.0.1:60745"), role: "agent", roleWarning: true, capability: .capturing)
+        case .statusBusToken:
+            // The bus rejected the token: the Bus lane names the token remedy.
+            Self.status(session, core: Self.readyCore,
+                        bus: .failed("the bus rejected the token (401 unauthorized)"), role: nil,
+                        capability: .inactive)
+        case .statusScopeEmpty:
+            // The trap (PR #181): capture on, scope empty — a warning, never a green "Capturing".
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .capturing, scope: [])
+        case .statusWaiting:
+            // Activation submitted, the two System Settings approvals outstanding.
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .pendingApproval)
+        case .statusDegraded:
+            // An unnotarized build: macOS refused the extension's signature; the remedy says install the signed app.
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .degraded("macOS refused the extension: invalid code signature (OSSystemExtensionErrorDomain 8)"))
+        case .statusExternal:
+            // An external core the operator runs: the Core lane is "external", Capture offers Switch to Embedded.
+            // Seeded through a throw-away model (no-op driver, in-memory persistence) so nothing is started
+            // or written; `reset` drops it again.
+            let model = ActiveConnectionModel(driver: SnapshotCoreDriver(), persistence: SnapshotActiveKindPersistence())
+            model.select(.external)
+            session.connection = model
+            Self.status(session, core: nil, bus: .connected("10.0.0.12:9090"), role: "operator",
+                        capability: .inactive)
         }
     }
 
@@ -238,10 +325,34 @@ enum SnapshotScene: String, CaseIterable {
         if let rows = savedRows {
             session.rows = rows
             savedRows = nil
-            CaptureSnapshotState.reset(session)
         }
+        if let saved = savedBus {
+            session.bus = saved.bus
+            session.resolvedRole = saved.role
+            session.roleWarning = saved.warning
+            savedBus = nil
+        }
+        // Fixture runs have no live active-core model; the external Status scene seeds one.
+        session.connection = nil
+        // Back to no extension and the fixture scope, whatever a scene seeded.
+        CaptureSnapshotState.reset(session)
         session.select(session.rows.first { $0.seq == 50 }?.id)
     }
+}
+
+/// A driver for the `statusExternal` scene: switching the active kind starts and stops nothing.
+private final class SnapshotCoreDriver: ActiveConnectionDriver {
+    var isEmbeddedRunning: Bool { false }
+    func activateEmbedded() {}
+    func activateExternal() {}
+}
+
+/// In-memory persistence for the `statusExternal` scene: the operator's real choice is never written.
+/// `nonisolated` because the protocol is: no isolated-conformance inference to lean on.
+private nonisolated final class SnapshotActiveKindPersistence: ActiveKindPersistence {
+    private var kind: ActiveCoreKind?
+    func load() -> ActiveCoreKind? { kind }
+    func save(_ kind: ActiveCoreKind) { self.kind = kind }
 }
 
 /// The states Settings ▸ Capture shows the operator, walked by snapshot mode (TG-AC11):

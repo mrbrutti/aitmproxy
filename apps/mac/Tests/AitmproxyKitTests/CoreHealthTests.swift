@@ -17,12 +17,6 @@ import Testing
         #expect(CoreHealth(.stopped) == .failed)
     }
 
-    @Test func everyHealthStateHasAWord() {
-        #expect(CoreHealth.running.statusWord == "core running")
-        #expect(CoreHealth.restarting.statusWord == "restarting…")
-        #expect(CoreHealth.failed.statusWord == "core failed")
-    }
-
     @Test func statusTitleIsPreciseWhereHealthIsCoarse() {
         // The dot's colour buckets .starting and .connecting both into
         // `.restarting`, but the word stays honest: a first launch is not a restart.

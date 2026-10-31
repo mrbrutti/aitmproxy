@@ -1152,6 +1152,26 @@ UX:
 Notes: two Strong cards done as pure moves — `Session` split into state + `Session+Verbs/Editing/Filters/Palette` (809 → 406 lines), `FlowColumn`/`Density` out of `FlowTableView.swift` (542 → 430). No file past 600. Carried: one verb table for row actions (next Strong, before S-041/S-045), viewers behind one `ViewerKind` (with S-045). `docs/ARCHITECTURE.md` and `docs/FIXLOG.md` started.
 Status: done
 
+### S-072 See what is running and what to do first
+As the operator, on a fresh launch I land on a Status page that shows the core, the bus and the capture extension — each with a state word, one fact and its control — and a live Getting-started list, so I never have to guess which sidebar item to look at or why no flows appear.
+Screens: status, status-ok, status-fresh, status-external, status-core-starting, status-core-stopped, status-core-failed, status-bus-connecting, status-bus-agent, status-bus-token, status-scope-empty, status-waiting, status-degraded
+Depends: S-063, S-070, core F1
+Spec: `docs/superpowers/specs/2026-10-31-macos-status-page-and-first-run-design.md`
+Acceptance:
+- [unit] `ConnectionSummary.make` yields the spec's word table for every core × bus × capture state; no lane word says "Capturing" while the scope is empty (ST-AC1/2).
+- [snapshot] The Status page renders every lane state in light + dark with no clipping; grid-lint + check-layout PASS (ST-AC3).
+- [self-test] A fixture session's lanes read "not running / connected / no extension"; Open Scope, Open Browser and Core Log from Status call the same entries as their menu items; Proxy ▸ Status (⌘0) is in the menu bar and the command map (ST-AC4/6).
+- [structural] The sidebar row, toolbar pill, status bar and Status page take their words only from `ConnectionSummary` (ST-AC5).
+- [manual] On the notarized app: fresh launch lands on Status; the cards read the real state; Turn Off/On Capture from the card changes Settings ▸ Capture within one poll; adding a host ticks the step; the first flow ticks the last step (ST-AC7).
+UX:
+- Flow: launch (fresh install) → Status → read the three lanes → click the one remedy (Turn On Capture / Open Scope… / Restart Core) → the step ticks → first flow appears in Recent → click it → Domains with the flow selected. Returning: launch → last page; ⌘0, the pill or the sidebar row → Status.
+- Surface: sidebar page (a place the operator comes back to); controls inline on the lane cards; destructive Uninstall behind ⋯ with a confirmation dialog.
+- States: each lane ok / working / off / warning / error with word + detail + remedy; Getting started rows done (✓, stays) or pending (○ + one action), collapsing to one line when all done; Recent "No flows yet — point a client at <address>".
+- Words: Status, Core, Bus, Capture extension, Turn On Capture / Turn Off Capture, Restart Core, Reconnect, Open Scope…, Core Log…, Open Browser, Copy Address, Uninstall Capture Extension…, Getting started (GLOSSARY).
+- Access: every card action has a menu-bar twin with a shortcut; dots carry "Core: running" labels; the sidebar row's chip is glyph + word, never colour alone.
+Notes: the capture lane maps PR #181's `CaptureAdvice` 1:1; until the provider stops claiming DNS, the scope step says to add `host:443`. A core `capture.status` verb (proposed) will sharpen the capture detail through `CoreCaptureStatus` without a UI change.
+Status: in progress
+
 ---
 
 ## Core follow-ups
