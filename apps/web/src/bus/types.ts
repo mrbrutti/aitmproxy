@@ -96,15 +96,31 @@ export type FlowEventKind =
 export interface FlowNotification {
   event: FlowEventKind;
   id: string;
+  /**
+   * Sparse, and a trigger only. The server sends `{id, kind:"http", method, authority, path,
+   * status}` or `{id, kind:"ws", handshake, messages}` (`"ws"` is not the model's `websocket`);
+   * the store refetches the row instead of applying it. Only the fixture bus sends a full model.
+   */
   summary?: unknown;
 }
 
+/**
+ * One audit line, in the model the Activity log renders. The server's wire shape differs
+ * (`crates/aitm-core/src/audit.rs`): `at` is epoch ms, the label is `client_label`, `args` is a
+ * redacted JSON string and `result` is `"ok"` or `{error}`; `toAgentEntry` in `bus/normalize.ts`
+ * converts it. The fixture bus emits this model directly.
+ */
 export interface AgentNotification {
-  origin: 'mcp' | 'cli' | 'mac' | 'web' | 'tui';
+  /** `operator`, `mcp` and `cli` are what the server records; the rest are fixture frontends. */
+  origin: 'mcp' | 'cli' | 'operator' | 'mac' | 'web' | 'tui';
+  /** The caller's `initialize.clientInfo.name`; `null` for an unlabelled connection (the bridge today). */
+  clientLabel?: string | null;
   command: string;
   args?: unknown;
   result: 'ok' | 'error';
+  /** ISO 8601. */
   at: string;
+  /** The error reason when `result` is `error`. */
   detail?: string;
 }
 

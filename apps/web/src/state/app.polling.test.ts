@@ -2,133 +2,18 @@
 // advertises `flow.subscribe`, and only backs off while notifications are actually arriving.
 //
 // Regression: the core started advertising `flow.subscribe`, the old bootstrap took that as "push
-// works", fetched `flow.list` once and never polled — but nothing in the UI calls flow.subscribe and
-// the /bus bridge pushes nothing, so the list froze at its load-time snapshot.
+// works", fetched `flow.list` once and never polled — but nothing in the UI called flow.subscribe and
+// the /bus bridge pushed nothing, so the list froze at its load-time snapshot.
+//
+// The store now subscribes (ws.ts) and treats each push as a trigger to refetch; those cases live in
+// `app.push.test.ts`. The bridge-shaped test bus is shared from `bridgeBus.testkit.ts`.
 
-import { createSignal } from 'solid-js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createMockBus, type MockControls } from '~/bus/mock';
-import { generateRequest, generateResponse, mulberry32 } from '~/bus/fixtures';
-import { BusError, type BusClient, type BusState, type NotificationHandler, type StateNotification, type ToolDef } from '~/bus/types';
+import type { StateNotification } from '~/bus/types';
 import { createAppStore } from './app';
-
-const SUBSCRIBE: ToolDef = {
-  name: 'flow.subscribe',
-  description: 'Stream flow events (streaming MCP connections only).',
-  inputSchema: { type: 'object', properties: {} },
-};
-
-type TestBus = BusClient &
-  MockControls & {
-    /** Every tool called through the store, in order (`tools/list` included). */
-    calls: string[];
-    count(tool: string): number;
-    /** The most `flow.detail` calls that were ever in flight at once. */
-    peak: { detail: number };
-    /** Deliver a server notification to the store, as a streaming bus would. */
-    emit(method: string, params: unknown): void;
-    /**
-     * Failure / latency injection: `flow.list` fails or is held, the next `tools/list` rejects, and
-     * the next `failStatus` `proxy.status` calls throw (set these BEFORE `start()` to fail bootstrap);
-     * `setState` moves the bus through open / reconnecting / closed, and `failDetail` lists flow ids
-     * whose `flow.detail` / `flow.get` always error (a flow the core cannot render).
-     */
-    ctl: {
-      failDetail: Set<string>;
-      failFlowList: boolean;
-      holdFlowList: Promise<void> | null;
-      failToolsOnce: boolean;
-      failStatus: number;
-      setState(s: BusState): void;
-    };
-  };
-
-/**
- * A real-looking bus (not the `fixtures` one): the mock command set, an address that is not
- * `fixtures`, `flow.subscribe` advertised, and NO notifications of its own — like the /bus bridge.
- * It starts `open`; `ctl.setState` plays out an outage.
- */
-function bridgeBus(address = '127.0.0.1:8082'): TestBus {
-  const mock = createMockBus({ initial: 0, rate: 0, agentActive: false });
-  const handlers = new Set<NotificationHandler>();
-  const calls: string[] = [];
-  const peak = { detail: 0 };
-  let detailInFlight = 0;
-  const [state, setState] = createSignal<BusState>('open');
-  const ctl: TestBus['ctl'] = { failDetail: new Set(), failFlowList: false, holdFlowList: null, failToolsOnce: false, failStatus: 0, setState };
-  return {
-    ...mock,
-    address,
-    state,
-    close() {
-      mock.close();
-      setState('closed');
-    },
-    calls,
-    peak,
-    ctl,
-    count: (tool) => calls.filter((c) => c === tool).length,
-    async tools() {
-      calls.push('tools/list');
-      if (ctl.failToolsOnce) {
-        ctl.failToolsOnce = false;
-        throw new BusError('tools/list: bus closed (1006)');
-      }
-      return [...(await mock.tools()), SUBSCRIBE];
-    },
-    async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
-      calls.push(tool);
-      if (tool === 'flow.list') {
-        if (ctl.holdFlowList) await ctl.holdFlowList;
-        if (ctl.failFlowList) throw new BusError('bus unreachable');
-      }
-      if (tool === 'proxy.status' && ctl.failStatus > 0) {
-        ctl.failStatus--;
-        throw new BusError('proxy.status: bus closed (1006)');
-      }
-      if ((tool === 'flow.detail' || tool === 'flow.get') && ctl.failDetail.has(args.id as string)) throw new BusError(`${tool}: flow ${String(args.id)} cannot be read`);
-      if (tool !== 'flow.detail') return mock.call<T>(tool, args);
-      peak.detail = Math.max(peak.detail, ++detailInFlight);
-      try {
-        return await mock.call<T>(tool, args);
-      } finally {
-        detailInFlight--;
-      }
-    },
-    onNotification(h) {
-      handlers.add(h);
-      return () => handlers.delete(h);
-    },
-    emit(method, params) {
-      for (const h of handlers) h(method, params);
-    },
-  };
-}
-
-/** A flow appears in the core with no notification — what the bridge does for every capture. */
-function captureSilently(bus: TestBus, seq: number): string {
-  const now = Date.now();
-  const flow = generateResponse(generateRequest({ rng: mulberry32(seq), seq, now, armed: false, scope: [] }), mulberry32(seq), now);
-  bus.flowsById().set(flow.id, flow);
-  return flow.id;
-}
-
-/** A flow still waiting for its response: `status` is null, so the loop keeps re-reading it. */
-function captureInFlight(bus: TestBus, seq: number): string {
-  const flow = generateRequest({ rng: mulberry32(seq), seq, now: Date.now(), armed: false, scope: [] });
-  bus.flowsById().set(flow.id, flow);
-  return flow.id;
-}
-
-/** The core answers that in-flight flow's request, so its next read has a status. */
-function complete(bus: TestBus, id: string) {
-  bus.flowsById().set(id, generateResponse(bus.flowsById().get(id)!, mulberry32(1), Date.now()));
-}
+import { FLOW_PING, bridgeBus, captureInFlight, captureSilently, complete, tick, type TestBus } from './bridgeBus.testkit';
 
 const STATE: StateNotification = { listening: true, intercept_armed: false, paused: 0, agent: 'all' };
-/** A flow notification that changes nothing (no summary) but proves the flow stream is alive. */
-const FLOW_PING = { event: 'meta', id: 'f_none' };
-const tick = (ms: number) => vi.advanceTimersByTimeAsync(ms);
 
 let open: TestBus[] = [];
 const start = (bus: TestBus = bridgeBus()) => {
