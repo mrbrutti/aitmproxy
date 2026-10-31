@@ -144,4 +144,62 @@ describe('app store — activity intake', () => {
     expect(app.proxy.activity[0]!.command).toBe('flow.replay');
     expect(app.proxy.activity[0]!.seq).toBe(1);
   });
+
+  // The server's `agent.activity` is the whole ring every time. A refresh must REPLACE the log with it, or
+  // every side refresh (a scope edit, a PoC run) would stack another copy of the ring on the last.
+  it('a second snapshot replaces the first instead of stacking on it', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    bus.ctl.activityWire = [ownKill(1), ownKill(2), ownKill(3)];
+
+    for (let i = 0; i < 2; i++) {
+      const refreshed = app.refreshSide();
+      await tick(50);
+      await refreshed;
+    }
+
+    expect(app.proxy.activity.map((e) => (e.args as { id: string }).id)).toEqual(['f_1', 'f_2', 'f_3']);
+  });
+
+  it('a snapshot that is not a list changes nothing', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    bus.emit('notifications/aitm/agent', AGENT_LINE);
+    bus.ctl.activityWire = { error: 'not a list' } as unknown as unknown[];
+
+    const refreshed = app.refreshSide();
+    await tick(50);
+    await refreshed;
+
+    expect(app.proxy.activity).toHaveLength(1);
+    expect(app.proxy.activity[0]!.command).toBe('flow.replay');
+  });
+
+  // Audit lines carry what other clients sent (`args` echoes an agent's tool arguments), so the intake
+  // meets arbitrary shapes: none of these may throw, retain a row, or write anywhere else.
+  it('malformed audit lines are ignored', async () => {
+    const { bus, app } = start();
+    await tick(200);
+
+    for (const junk of [null, undefined, 'flow.list', 42, true, [], [AGENT_LINE], {}, { command: 5, origin: 'mcp', result: 'ok' }, { command: 'flow.kill', result: 'ok' }, { command: '', origin: 'mcp' }]) {
+      expect(() => bus.emit('notifications/aitm/agent', junk)).not.toThrow();
+    }
+
+    expect(app.proxy.activity).toEqual([]);
+  });
+
+  it('hostile args are kept as data and pollute nothing', async () => {
+    const { bus, app } = start();
+    await tick(200);
+
+    bus.emit('notifications/aitm/agent', { ...AGENT_LINE, args: '{"__proto__":{"polluted":true},"constructor":{"prototype":{"polluted":true}}}' });
+    bus.emit('notifications/aitm/agent', { ...AGENT_LINE, args: '['.repeat(200_000) }); // far deeper than any parser will take: stays text
+    bus.emit('notifications/aitm/agent', { ...AGENT_LINE, args: 'x'.repeat(1_000_000), result: { error: 'y'.repeat(100_000) } });
+
+    expect(app.proxy.activity).toHaveLength(3);
+    expect(typeof app.proxy.activity[1]!.args).toBe('string');
+    expect(app.proxy.activity[2]!.result).toBe('error');
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'polluted')).toBe(false);
+  });
 });

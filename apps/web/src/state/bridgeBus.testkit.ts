@@ -35,6 +35,10 @@ export type TestBus = BusClient &
      * `hideTools` names tools removed from the catalogue (set before `start()`). `activityWire`,
      * when set, is what `agent.activity` returns instead of the mock's own log: the server's wire
      * shape (epoch ms, `client_label`, `args` as JSON text), un-normalized and un-filtered.
+     * `stripSeq`, when true, removes `seq` from every `flow.detail` / `flow.get` reply, as the real
+     * core's reply carries none (`aitm-plugins/src/detail.rs`): the fixture flows do, and `toSummary`
+     * prefers a reply's own `seq` to the store's position, so without this a test cannot tell the
+     * store's numbering from the fixture's.
      */
     ctl: {
       failDetail: Set<string>;
@@ -45,6 +49,7 @@ export type TestBus = BusClient &
       failToolsOnce: boolean;
       failStatus: number;
       activityWire: unknown[] | null;
+      stripSeq: boolean;
       setState(s: BusState): void;
     };
   };
@@ -71,6 +76,7 @@ export function bridgeBus(address = '127.0.0.1:8082'): TestBus {
     failToolsOnce: false,
     failStatus: 0,
     activityWire: null,
+    stripSeq: false,
     setState,
   };
   return {
@@ -95,29 +101,8 @@ export function bridgeBus(address = '127.0.0.1:8082'): TestBus {
       return [...(await mock.tools()), SUBSCRIBE].filter((t) => !ctl.hideTools.has(t.name));
     },
     async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
-      calls.push(tool);
-      log.push({ tool, args });
-      if (tool === 'flow.list') {
-        if (ctl.holdFlowList) await ctl.holdFlowList;
-        if (ctl.failFlowList) throw new BusError('bus unreachable');
-      }
-      if (tool === 'proxy.status' && ctl.failStatus > 0) {
-        ctl.failStatus--;
-        throw new BusError('proxy.status: bus closed (1006)');
-      }
-      if ((tool === 'flow.detail' || tool === 'flow.get') && ctl.failDetail.has(args.id as string)) throw new BusError(`${tool}: flow ${String(args.id)} cannot be read`);
-      if (tool === 'agent.activity' && ctl.activityWire) return ctl.activityWire as T;
-      if (tool !== 'flow.detail') return mock.call<T>(tool, args);
-      peak.detail = Math.max(peak.detail, ++detailInFlight);
-      try {
-        const gate = ctl.holdReply.get(args.id as string);
-        if (gate) ctl.holdReply.delete(args.id as string);
-        const reply = await mock.call<T>(tool, args);
-        if (gate) await gate;
-        return reply;
-      } finally {
-        detailInFlight--;
-      }
+      const reply = await answer<T>(tool, args);
+      return ctl.stripSeq && (tool === 'flow.detail' || tool === 'flow.get') ? (withoutSeq(reply) as T) : reply;
     },
     onNotification(h) {
       handlers.add(h);
@@ -127,6 +112,40 @@ export function bridgeBus(address = '127.0.0.1:8082'): TestBus {
       for (const h of handlers) h(method, params);
     },
   };
+
+  async function answer<T>(tool: string, args: Record<string, unknown>): Promise<T> {
+    calls.push(tool);
+    log.push({ tool, args });
+    if (tool === 'flow.list') {
+      if (ctl.holdFlowList) await ctl.holdFlowList;
+      if (ctl.failFlowList) throw new BusError('bus unreachable');
+    }
+    if (tool === 'proxy.status' && ctl.failStatus > 0) {
+      ctl.failStatus--;
+      throw new BusError('proxy.status: bus closed (1006)');
+    }
+    if ((tool === 'flow.detail' || tool === 'flow.get') && ctl.failDetail.has(args.id as string)) throw new BusError(`${tool}: flow ${String(args.id)} cannot be read`);
+    if (tool === 'agent.activity' && ctl.activityWire) return ctl.activityWire as T;
+    if (tool !== 'flow.detail') return mock.call<T>(tool, args);
+    peak.detail = Math.max(peak.detail, ++detailInFlight);
+    try {
+      const gate = ctl.holdReply.get(args.id as string);
+      if (gate) ctl.holdReply.delete(args.id as string);
+      const reply = await mock.call<T>(tool, args);
+      if (gate) await gate;
+      return reply;
+    } finally {
+      detailInFlight--;
+    }
+  }
+}
+
+/** A copy of a flow reply without its `seq`, which is what the real core sends. */
+function withoutSeq(reply: unknown): unknown {
+  if (!reply || typeof reply !== 'object' || Array.isArray(reply)) return reply;
+  const copy: Record<string, unknown> = { ...reply };
+  delete copy.seq;
+  return copy;
 }
 
 /** A flow appears in the core with no notification — what the bridge does for every capture. */

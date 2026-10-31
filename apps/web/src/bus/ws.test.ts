@@ -380,6 +380,63 @@ describe('createWsBus subscribes on every open', () => {
     expect(FakeWebSocket.count).toBe(1);
   });
 
+  // The belt and braces behind `ws !== sock`: a browser flips `readyState` before it delivers the close
+  // event, and `close()` does not deliver it synchronously either. A reply landing in that gap must not
+  // open a dead or user-closed socket.
+  it('a_socket_that_is_closing_when_the_subscribe_reply_lands_is_not_marked_open', async () => {
+    const client = bus();
+    const sock = await handshake(client);
+    await toolCallSent(sock, 'flow.subscribe');
+
+    sock.readyState = 2; // CLOSING; `onclose` has not run, so the client still holds this socket
+    await answerTool(sock, 'flow.subscribe', { structuredContent: { sub_id: 1 } });
+    await sleep(50);
+    expect(client.state()).toBe('connecting');
+
+    sock.readyState = 3;
+    sock.onclose?.({ code: 1006 }); // the close event arrives late: now the reconnect is scheduled
+    expect(client.state()).toBe('reconnecting');
+  });
+
+  it('a_user_close_whose_close_event_is_still_pending_stays_closed_when_the_reply_lands', async () => {
+    const client = bus();
+    const sock = await handshake(client);
+    await toolCallSent(sock, 'flow.subscribe');
+
+    sock.close = () => {}; // the close event is delivered later, as in a browser; the socket still reads OPEN
+    client.close();
+    expect(client.state()).toBe('closed');
+    await answerTool(sock, 'flow.subscribe', { structuredContent: { sub_id: 1 } });
+    await sleep(50);
+
+    expect(client.state()).toBe('closed');
+    expect(FakeWebSocket.count).toBe(1);
+  });
+
+  // The bridge may batch several newline-delimited lines in one frame, and the subscribe reply now gates
+  // `open`: a notification and a garbage line riding in the same frame must not lose it.
+  it('a_frame_batching_a_notification_a_garbage_line_and_the_subscribe_reply_still_opens', async () => {
+    const client = bus();
+    const h = vi.fn();
+    client.onNotification(h);
+    const sock = await handshake(client);
+    const { id } = await toolCallSent(sock, 'flow.subscribe');
+
+    sock.onmessage?.({
+      data:
+        [
+          JSON.stringify({ jsonrpc: '2.0', method: 'notifications/aitm/flow', params: { event: 'created', id: 'f_1' } }),
+          '{"jsonrpc":"2.0","id":', // cut mid-line
+          'not json at all',
+          JSON.stringify({ jsonrpc: '2.0', id, result: { structuredContent: { sub_id: 1 } } }),
+        ].join('\n') + '\n',
+    });
+
+    await vi.waitFor(() => expect(client.state()).toBe('open'));
+    expect(h).toHaveBeenCalledTimes(1);
+    expect(client.lastError()).toBe(null);
+  });
+
   it('notifications_before_the_subscribe_reply_reach_handlers', async () => {
     const client = bus();
     const h = vi.fn();

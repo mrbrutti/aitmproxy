@@ -203,4 +203,34 @@ describe('toAgentEntry (audit line)', () => {
     expect(toAgentEntry(null)).toBeNull();
     expect(toAgentEntry('flow.list')).toBeNull();
   });
+
+  it('rejects an event line whatever else it carries', () => {
+    // `event` alone marks it: even a line that also has an origin and a command is not an audit entry.
+    expect(toAgentEntry({ ...wire, event: 'approval_requested' })).toBeNull();
+    // A line that cannot be attributed to a frontend is not an entry either (it could not be filtered or labelled).
+    expect(toAgentEntry({ at: wire.at, command: 'flow.replay', args: wire.args, result: 'ok' })).toBeNull();
+  });
+
+  it('survives hostile and oversized fields', () => {
+    // A timestamp outside Date's range is not a time: the entry is still produced, stamped now.
+    for (const at of [1e20, -1e20, Number.NaN, Number.POSITIVE_INFINITY, undefined, null, {}]) {
+      const e = toAgentEntry({ ...wire, at });
+      expect(e, String(at)).not.toBeNull();
+      expect(Number.isFinite(Date.parse(e!.at)), String(at)).toBe(true);
+    }
+    // The server caps `args` at 512 bytes, so a long one is cut mid-JSON; a client must still take far more.
+    const big = '{"x":"' + 'a'.repeat(1_000_000);
+    expect(toAgentEntry({ ...wire, args: big })?.args).toBe(big);
+    // Nesting no parser will take stays text; a prototype key stays plain data.
+    expect(toAgentEntry({ ...wire, args: '['.repeat(200_000) })?.args).toBe('['.repeat(200_000));
+    const proto = toAgentEntry({ ...wire, args: '{"__proto__":{"polluted":true}}' });
+    expect(typeof proto?.args).toBe('object');
+    expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
+    // A result that is neither "ok" nor an error object is an error, with no reason to show.
+    for (const result of [null, undefined, 'fine', 7, {}, { error: 5 }]) {
+      const e = toAgentEntry({ ...wire, result });
+      expect(e?.result, JSON.stringify(result)).toBe('error');
+      expect(e?.detail, JSON.stringify(result)).toBeUndefined();
+    }
+  });
 });

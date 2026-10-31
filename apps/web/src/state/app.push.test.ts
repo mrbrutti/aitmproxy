@@ -26,6 +26,11 @@ function gate() {
 let open: TestBus[] = [];
 const start = (bus: TestBus = bridgeBus()) => {
   open.push(bus);
+  // The real core's flow.detail / flow.get replies carry no `seq`; the fixture flows do, and
+  // `toSummary` prefers a reply's own `seq` to the store's position. Strip it, so the `seq`
+  // assertions below prove the store's numbering (`entries.length + 1` / the poll's position)
+  // and not the fixture's.
+  bus.ctl.stripSeq = true;
   return { bus, app: createAppStore(bus) };
 };
 
@@ -46,6 +51,7 @@ describe('app store — a flow push is a trigger, never data', () => {
     captureSilently(bus, 1);
 
     bus.emit('notifications/aitm/flow', { event: 'created', id: 'f_1', summary: { id: 'f_1', kind: 'ws', method: 'GET', authority: 'x.test', path: '/p', status: null } });
+    expect(app.byId.has('f_1')).toBe(false); // the summary itself is never written: no row until the refetch answers
     await tick(150); // one coalescing window plus the call's few ms
 
     expect(bus.callArgs('flow.detail')).toEqual([{ id: 'f_1', body: 'none' }]);
@@ -63,6 +69,9 @@ describe('app store — a flow push is a trigger, never data', () => {
     expect(before.seq).toBe(1);
 
     push(bus, 'meta', 'f_1');
+    // Not even for an instant: the sparse summary (`kind:"ws"`, no times, no sizes) is never written, so
+    // the row is intact before the refetch answers, not merely repaired by it.
+    expect(app.byId.get('f_1')!.raw).toEqual(before);
     await tick(250);
 
     expect(app.byId.get('f_1')!.raw).toEqual(before);
@@ -116,6 +125,37 @@ describe('app store — a flow push is a trigger, never data', () => {
 
     expect(app.entries.map((e) => e.id)).toEqual(['f_1', 'f_2', 'f_3']);
     expect(app.entries.map((e) => e.raw.seq)).toEqual([1, 2, 3]);
+  });
+
+  it('a steady stream of pushes is flushed every window, not starved by a debounce', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    const ids = Array.from({ length: 20 }, (_, i) => captureSilently(bus, i + 1)); // (fixture ids are base 36)
+
+    // A new flow every 40 ms for 800 ms. A debounce would re-arm on each push and flush only once the
+    // stream went quiet; the throttle's first timer is not re-armed by traffic, so ids[0] lands in ~100 ms.
+    for (let i = 0; i < ids.length; i++) {
+      push(bus, 'created', ids[i]!);
+      await tick(40);
+      if (i === 4) expect(app.byId.has(ids[0]!)).toBe(true); // t = 200 ms: the stream is still running
+    }
+    expect(app.entries.length).toBeLessThan(ids.length); // (and it really is a stream, not one late flush of all 20)
+    await tick(300);
+
+    expect(app.entries.map((e) => e.id)).toEqual(ids);
+    expect(app.entries.map((e) => e.raw.seq)).toEqual(ids.map((_, i) => i + 1));
+  });
+
+  it('a push that names no flow is ignored', async () => {
+    const { bus, app } = start();
+    await tick(200);
+
+    push(bus, 'created', '');
+    bus.emit('notifications/aitm/flow', { event: 'created' });
+    await tick(300);
+
+    expect(bus.callArgs('flow.detail')).toEqual([]);
+    expect(app.entries).toHaveLength(0);
   });
 
   it('a known flow keeps its seq', async () => {
@@ -254,11 +294,35 @@ describe('app store — a flow push is a trigger, never data', () => {
     const before = bus.callArgs('flow.detail').length;
 
     push(bus, 'response', 'f_1');
+    expect(app.details['f_1']).toBeUndefined(); // stale detail is dropped at once, before the reload answers
     await tick(150);
 
     const since = bus.callArgs('flow.detail').slice(before);
     expect(since).toContainEqual({ id: 'f_1' }); // the inspector reload (no `body`)
     expect(since).toContainEqual({ id: 'f_1', body: 'none' }); // the row refetch
+    expect(app.details['f_1']).toBeDefined(); // and the reload put a fresh one back
+  });
+
+  it('a response push drops the cached detail of a flow nobody is inspecting, without reloading it', async () => {
+    const bus = bridgeBus();
+    captureSilently(bus, 1);
+    captureSilently(bus, 2);
+    const { app } = start(bus);
+    await tick(200);
+    app.select('f_1');
+    await tick(50);
+    app.select('f_2'); // f_2 is the inspected flow now; f_1's detail is still cached
+    await tick(50);
+    expect(app.details['f_1']).toBeDefined();
+    const before = bus.callArgs('flow.detail').length;
+
+    push(bus, 'response', 'f_1');
+    expect(app.details['f_1']).toBeUndefined();
+    await tick(150);
+
+    const since = bus.callArgs('flow.detail').slice(before);
+    expect(since).toEqual([{ id: 'f_1', body: 'none' }]); // the row refetch only: no inspector reload for an unselected flow
+    expect(app.details['f_1']).toBeUndefined();
   });
 
   it('an intercepted push marks the flow paused after the refetch', async () => {
@@ -335,6 +399,21 @@ describe('app store — a flow push is a trigger, never data', () => {
     bus.ctl.setState('open');
     await tick(700); // one tick: the reopened bus takes a fresh snapshot, pending push or not
 
+    expect(app.entries.map((e) => e.id)).toEqual(['f_1']);
+  });
+
+  it('a reconnect drops the ids queued for the old socket; the snapshot covers them', async () => {
+    const { bus, app } = start();
+    await tick(200);
+    captureSilently(bus, 1);
+
+    push(bus, 'created', 'f_1'); // queued; the 100 ms timer is armed
+    bus.ctl.setState('reconnecting');
+    bus.ctl.setState('open'); // back inside the window: the queued id belongs to the connection that is gone
+    await tick(150);
+    expect(bus.callArgs('flow.detail')).toEqual([]); // the stale timer did not fire a flush
+
+    await tick(700); // the first tick after the reopen takes a fresh snapshot, which finds the flow
     expect(app.entries.map((e) => e.id)).toEqual(['f_1']);
   });
 

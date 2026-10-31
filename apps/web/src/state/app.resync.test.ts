@@ -117,6 +117,25 @@ describe('app store — the lagged marker', () => {
   });
 });
 
+describe('app store — the lagged marker and the loop share one poll', () => {
+  it('the loop joins a running resync poll instead of overlapping it', async () => {
+    const { bus } = start();
+    await tick(200);
+    const lists = bus.count('flow.list');
+    const g = gate();
+    bus.ctl.holdFlowList = g.promise;
+
+    bus.emit('notifications/aitm/state', LAGGED); // the resync poll starts and is held
+    await tick(1600); // lagged distrusted push, so the loop wants a poll at its next ticks: it must join this one
+    expect(bus.count('flow.list')).toBe(lists + 1); // a single-flight poll: no second, overlapping flow.list
+
+    g.release();
+    bus.ctl.holdFlowList = null;
+    await tick(100);
+    expect(bus.count('flow.list')).toBeGreaterThanOrEqual(lists + 1); // and the loop carries on afterwards
+  });
+});
+
 describe('app store — state payloads and freshness', () => {
   it('a partial state payload writes nothing', async () => {
     const { bus, app } = start();
