@@ -10,6 +10,8 @@
 - **Task 2 pass B also adds `wire::tests::governance_carries_the_assemblys_own_state_and_ring`** (Task 1 Tester finding F2: `Arc::ptr_eq` on both fields of `Assembled::governance()` and its clone, then a `set_policy` round-trip). It could only compile once the temporary `#[expect(dead_code)]` was deleted.
 - **The Task 2 Tester added six tests to `tui_mode_governance.rs`**, so that binary has 12 tests, not 6. Where the plan says `tui_mode_governance (6)` or `6 passed`, read 12. The Task 4 AC9 mutation expectation becomes `test result: FAILED. 5 passed; 7 failed`: FAILED = AC1, AC2, AC5, `malformed_and_empty_agent_input_is_a_protocol_error_that_is_never_audited`, `an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_capped_and_redacted`, `an_operator_on_the_agent_server_resolves_what_the_tui_cannot_and_a_drop_ends_asking`, `the_streamable_http_agent_server_is_governed_by_the_same_live_state_and_ring`; ok = AC3, AC4, AC6, `the_loopback_agent_cannot_rewrite_the_policy_that_governs_it`, `a_paused_loopback_agent_still_gets_initialize_tools_list_and_ping`. The live test still fails under the mutation.
 
+- **Stage 6 round 1 (panel on `646dd8c`) led to a fix task, and `origin/main` was merged a second time.** The base is now `711aa26` (it carries PR 161, the fix for the two `aitm-tui` token tests that were red on main and had made the full gate fail). `tui_mode_governance` now has 14 tests (the whole-branch Tester added `an_operator_token_client_governs_the_loopback_agent_and_is_recorded_as_operator`, red-set, and `a_subscribed_operator_is_still_pushed_each_agent_call_with_push_unfed`, guard). One test was renamed to `an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_without_the_secret`. The AC9 mutation expectation is `test result: FAILED. 6 passed; 8 failed`: FAILED = AC1, AC2, AC5, the malformed-input test, the oversized-secret test, the operator-approval test, the streamable-HTTP test and the operator-token test; ok = AC3, AC4, AC6, the self-lift guard, the paused-handshake guard and the push-unfed guard. `Assembled` also keeps `Governance` in a private field filled at assembly (security finding F1), so the Design 2 limitation "a hand-built server can still be given a fresh state" no longer extends to `governance()`.
+
 ## Overview
 
 `wire.rs` gains a sealed `Governance`: two `pub(crate)` `Arc`s, with `Assembled::governance()` as
@@ -725,6 +727,19 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| whole branch (round 1, `646dd8c`) | spec | Important | AC12: the full gate exits non-zero because `aitm-tui` token tests were already red on main (PR 154 token drift), not caused by this diff | Resolved by merging main with PR 161's fix (`2303b15`); full gate on `02ef931` exits 0 (223 test binaries ok, 0 failed) |
+| whole branch (round 1) | spec | Minor | The `Arc::ptr_eq` unit test lives in `crates/aitm/src/wire.rs`, against the spec's test-placement constraint | Accepted (orchestrator, under the autonomous-approve mode): it reads `pub(crate)` fields so it must live in the crate; `trust_gate_scan` passes; recorded as plan amendment |
+| whole branch (round 1) | spec | Minor | A comment was added on the TUI-facing arm, a place Task 3 does not list | Accepted (orchestrator): accurate, restates Design 2's deliberate-ungoverned decision, comment-only |
+| whole branch (round 1) | spec, quality | Minor | The malformed-input test pins aitm-mcp-owned JSON-RPC error codes | Fixed in `02ef931` (table cut to the governance core); follow-up: move the full table into aitm-mcp tests |
+| whole branch (round 1) | spec | Minor | The PR description must state all six Design 5 consequences | Done in the PR body (stage 7) |
+| whole branch (round 1) | security | Minor | `Governance` is sealed but `Assembled`'s `pub` fields let outside code choose what `governance()` returns | Fixed in `02ef931`: private `governance` field filled at assembly; new red-then-green unit test `governance_is_fixed_at_assembly_not_read_from_the_public_fields` |
+| whole branch (round 1) | security | note (pre-existing) | `AuditEntry.client_label` and the error reason are uncapped (a 16 MiB `clientInfo.name` is cloned into every audited entry; the ring can hold about 64 GiB) | Out of scope, outside this diff; filed in the PR description under the "audit signal-to-noise" follow-up |
+| whole branch (round 1) | quality | Minor | `parked.join()` is unbounded (120 s hang instead of a 5 s failure) | Fixed in `02ef931` (bounded by `PARK_BOUND`, shared spawn helper) |
+| whole branch (round 1) | quality | Minor | The oversized/redacted test pins aitm-mcp redaction and cap rules | Fixed in `02ef931` (keeps one shared-ring row, origin, and no secret in the trail; renamed); follow-up: move the cap/marker assertions into aitm-mcp tests |
+| whole branch (round 1) | quality | Minor | The `build_servers` doc restates aitm-mcp rules, uses change-relative wording, and says "builds its one" | Fixed in `02ef931` (trimmed to its contract) |
+| whole branch (round 1) | quality | Minor | Helpers duplicated inside `tui_mode_governance.rs`; timeout messages hard-code "5s" | Fixed in `02ef931` (delegating helpers, one spawner, `{PARK_BOUND:?}`/`{STEP:?}`) |
+| whole branch (round 1) | quality | Minor | Module doc lists only AC1-AC6; a stage/task banner left in source | Fixed in `02ef931` |
+| whole branch (round 1) | tester | Minor | Docs say "its only source" (overstates the seal) and "allowed or refused ... land in `agent.activity`" (a successful `flow.subscribe`, a `needs_confirmation` step and protocol errors are not audited) | Fixed in `02ef931` |
 
 ## Shipped
 
