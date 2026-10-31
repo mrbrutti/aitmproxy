@@ -4013,7 +4013,12 @@ fn non_widget_tools_byte_identical() {
 #[test]
 fn subscribe_rejects_undeclared_argument() {
     let srv = push_server(Arc::new(MemFlowStore::new()), 16);
-    let resp = call_as_args(&srv, Frontend::Operator, "flow.subscribe", json!({"bogus": 1}));
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "flow.subscribe",
+        json!({"bogus": 1}),
+    );
     assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
 }
 
@@ -4168,7 +4173,10 @@ fn approve_role_gate_precedes_schema_for_the_agent() {
         "agent.approve",
         json!({"bogus": 1, "allow": "not-a-bool"}),
     );
-    assert!(resp.get("error").is_none(), "a role refusal, not a protocol error: {resp}");
+    assert!(
+        resp.get("error").is_none(),
+        "a role refusal, not a protocol error: {resp}"
+    );
     assert!(is_refused(&resp), "the agent is refused: {resp}");
     let text = resp["result"]["content"][0]["text"]
         .as_str()
