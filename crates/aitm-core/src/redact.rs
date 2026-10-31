@@ -2182,4 +2182,260 @@ mod tests {
         let bad = mismatches_wide(LINE_BREAK_IS_A_BOUNDARY);
         assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
+
+    // ---- Edges of the blank rule and of the two scans: the helper at its
+    // ---- boundaries, a pair read on one line beside non-ASCII spaces, a text cut
+    // ---- short, and oversized runs of line breaks.
+
+    /// Every input of the three corpora above, the recorded ones and the two
+    /// tables of the line-break and nesting shapes.
+    fn corpus_inputs() -> Vec<&'static str> {
+        RECORDED_SCRUB_TEXT
+            .iter()
+            .map(|&(input, _, _)| input)
+            .chain(NESTED_UNDER_A_WIDE_ONLY_KEY.iter().map(|&(input, _)| input))
+            .chain(LINE_BREAK_IS_A_BOUNDARY.iter().map(|&(input, _)| input))
+            .collect()
+    }
+
+    /// The blank rule on the helper itself, at its boundaries. Each row is `(text,
+    /// from, standard, wide)`: the byte index each reading returns. The standard
+    /// reading skips every whitespace character, a line break included. The wide
+    /// reading stops at an ASCII `\n`, `\r` or `\x0c` and skips every other one, so
+    /// a non-ASCII space on either side of a line break is skipped and the line
+    /// break is not. U+00A0 and U+0085 are two bytes, U+2009, U+2028, U+2029,
+    /// U+3000, U+1680 and U+200A are three.
+    #[test]
+    fn skip_pair_blanks_leaves_only_the_three_line_breaks_to_the_wide_reading() {
+        let rows: &[(&str, usize, usize, usize)] = &[
+            // Nothing to skip, and the ends of the text.
+            ("", 0, 0, 0),
+            ("x", 0, 0, 0),
+            ("ab", 2, 2, 2),
+            ("ab", 9, 9, 9),
+            // A start inside a two-byte character is not a blank.
+            ("\u{a0}", 1, 1, 1),
+            // Blanks that both readings skip, the vertical tab among them.
+            (" ", 0, 1, 1),
+            ("\u{a0}x", 0, 2, 2),
+            ("\t\u{b} \u{a0}x", 0, 5, 5),
+            ("\u{85}\u{2029}x", 0, 5, 5),
+            // Each of the three line breaks, alone and with a space beside it.
+            ("\n", 0, 1, 0),
+            ("\r", 0, 1, 0),
+            ("\u{c}", 0, 1, 0),
+            ("\r\n", 0, 2, 0),
+            ("\n\u{a0}", 0, 3, 0),
+            (" \t\n", 0, 3, 2),
+            ("\u{a0}\n", 0, 3, 2),
+            ("\u{2009}\u{a0}\r\u{a0}x", 0, 8, 5),
+            ("\u{2028}\u{c}", 0, 4, 3),
+            ("\u{3000}\u{1680}\u{200a}\n", 0, 10, 9),
+            // From the middle of a text.
+            ("a \n b", 1, 4, 2),
+            ("a \n b", 2, 4, 2),
+            ("a \n b", 3, 4, 4),
+        ];
+        let bad: Vec<String> = rows
+            .iter()
+            .filter_map(|&(text, from, standard, wide)| {
+                let got = (
+                    skip_pair_blanks(text, from, Reading::Standard),
+                    skip_pair_blanks(text, from, Reading::Wide),
+                );
+                (got != (standard, wide)).then(|| {
+                    format!(
+                        "{text:?} from {from}: expected {:?}, got {got:?}",
+                        (standard, wide)
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "(standard, wide) indices are wrong: {bad:#?}"
+        );
+
+        // A megabyte of non-ASCII blanks that a line break ends: the wide reading
+        // stops on the line break and the standard reading reads on past it.
+        let run = "\u{a0}".repeat(1 << 19);
+        let text = format!("{run}\nx");
+        assert_eq!(skip_pair_blanks(&text, 0, Reading::Wide), run.len());
+        assert_eq!(skip_pair_blanks(&text, 0, Reading::Standard), run.len() + 1);
+    }
+
+    /// A pair is read on one line by the wide scan, with a non-ASCII space before
+    /// or after the line break as much as without one, and the standard scan still
+    /// reads a standard key across the line break. The expected texts follow from
+    /// the scan's rules (a wide-only key with a line break at its separator has no
+    /// value; the next line's key is read as a key), not from a recording.
+    #[test]
+    fn scrub_text_wide_reads_a_pair_on_one_line_beside_non_ascii_spaces() {
+        let bad = mismatches_wide(&[
+            // A wide-only key: no value is found across a line break, and a
+            // non-ASCII space before or after it does not carry the scan over.
+            ("sidebar:\u{a0}\nJohn", "sidebar:\u{a0}\nJohn"),
+            ("author\u{a0}\n:John", "author\u{a0}\n:John"),
+            ("author\u{c}=John", "author\u{c}=John"),
+            // A key on the next line, after a non-ASCII space, is read as a key:
+            // wide-only, then standard.
+            (
+                "sidebar:\n\u{a0}sessionKey: abc123",
+                "sidebar:\n\u{a0}sessionKey: [redacted]",
+            ),
+            (
+                "authentication:\u{2009}\r\n\u{2009}jwt:\u{a0}J1",
+                "authentication:\u{2009}\r\n\u{2009}jwt:\u{a0}[redacted]",
+            ),
+            // The standard scan reads a standard key across a line break, with a
+            // non-ASCII space on either side of it.
+            (
+                "sid\u{a0}\n\u{a0}:\u{a0}\n\u{a0}abc",
+                "sid\u{a0}\n\u{a0}:\u{a0}\n\u{a0}[redacted]",
+            ),
+            ("jwt:\u{2028}\u{c}J1", "jwt:\u{2028}\u{c}[redacted]"),
+            ("sid\u{c}=abc", "sid\u{c}=[redacted]"),
+            // Windows line endings: a nested standard pair and a header block.
+            (
+                "authentication:\r\n  password: hunter2",
+                "authentication:\r\n  password: [redacted]",
+            ),
+            (
+                "X-Authority: example.com\r\nX-Sid: S1\r\n",
+                "X-Authority: [redacted]\r\nX-Sid: [redacted]\r\n",
+            ),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+
+        // A nested standard pair under a wide-only key, inside JSON text where the
+        // line break is the two characters `\n`: no credential survives.
+        let json = r#"{"authentication":"x","note":"authentication:\n  password: hunter2"}"#;
+        let out = scrub_text_wide(json);
+        assert!(
+            !out.contains("hunter2"),
+            "a nested credential leaked: {out}"
+        );
+        assert!(out.contains("password: [redacted]"), "{out}");
+    }
+
+    /// A corpus pin, not a theorem: over its own output the wide scrub gives the
+    /// same text on every input of the three corpora, so a change that makes the
+    /// second scan read what the first one wrote shows up here. (An unclosed quote
+    /// can read differently once its value is masked, so the property is not
+    /// claimed for arbitrary text.)
+    #[test]
+    fn scrub_text_wide_is_stable_on_its_own_output_across_the_corpora() {
+        let inputs = corpus_inputs();
+        let bad: Vec<(&str, String, String)> = inputs
+            .iter()
+            .filter_map(|&input| {
+                let once = scrub_text_wide(input);
+                let twice = scrub_text_wide(&once);
+                (once != twice).then_some((input, once, twice))
+            })
+            .collect();
+        assert!(
+            inputs.len() >= 100,
+            "only {} inputs are checked",
+            inputs.len()
+        );
+        assert!(
+            bad.is_empty(),
+            "(input, once, twice) differ on {} inputs: {bad:#?}",
+            bad.len()
+        );
+    }
+
+    /// A connection that drops mid-stream hands over a prefix of the text. The
+    /// superset property of `scrub_text_wide_masks_everything_scrub_text_masks`
+    /// holds on every char-boundary prefix of every corpus input, nested shapes and
+    /// line breaks included, and no cut makes the scrub panic.
+    #[test]
+    fn scrub_text_wide_masks_everything_scrub_text_masks_on_every_prefix() {
+        let mut prefixes = 0;
+        let mut with_a_masked_run = 0;
+        let mut bad: Vec<(&str, Vec<&str>, String)> = Vec::new();
+        for input in corpus_inputs() {
+            let cuts = input
+                .char_indices()
+                .map(|(at, _)| at)
+                .chain(std::iter::once(input.len()));
+            for cut in cuts {
+                let prefix = &input[..cut];
+                prefixes += 1;
+                let standard = scrub_text(prefix);
+                let wide = scrub_text_wide(prefix);
+                let masked: Vec<&str> = alnum_runs(prefix)
+                    .into_iter()
+                    .filter(|run| !"redacted".contains(run) && !standard.contains(run))
+                    .collect();
+                if !masked.is_empty() {
+                    with_a_masked_run += 1;
+                }
+                let left: Vec<&str> = masked
+                    .into_iter()
+                    .filter(|run| wide.contains(run))
+                    .collect();
+                if !left.is_empty() {
+                    bad.push((prefix, left, wide));
+                }
+            }
+        }
+        assert!(prefixes >= 3000, "only {prefixes} prefixes are checked");
+        assert!(
+            with_a_masked_run >= 300,
+            "only {with_a_masked_run} prefixes have a run that scrub_text masks: the test is vacuous"
+        );
+        assert!(
+            bad.is_empty(),
+            "(prefix, runs scrub_text masks but scrub_text_wide leaves, scrub_text_wide) on {} prefixes: {bad:#?}",
+            bad.len()
+        );
+    }
+
+    /// Oversized runs of line breaks and of line-ended pairs: the scan reads each
+    /// byte a constant number of times, so these finish, and each comes out as the
+    /// scan's rules say.
+    #[test]
+    fn scrub_text_wide_stays_linear_on_line_break_shapes() {
+        // A wide-only key whose separator ends its line, half a million times: no
+        // value on any line, so nothing changes.
+        let input = "author:\n".repeat(1 << 19);
+        assert!(
+            scrub_text_wide(&input) == input,
+            "a wide-only key with a line break at its separator changed"
+        );
+
+        // A wide-only parent over a wide-only child, and over a standard child.
+        let input = "authentication:\n  sessionKey: x\n".repeat(100_000);
+        assert!(
+            scrub_text_wide(&input)
+                == "authentication:\n  sessionKey: [redacted]\n".repeat(100_000),
+            "a wide-only child on the next line was not masked"
+        );
+        let input = "authentication:\n  password: x\n".repeat(100_000);
+        assert!(
+            scrub_text_wide(&input) == "authentication:\n  password: [redacted]\n".repeat(100_000),
+            "a standard child on the next line was not masked"
+        );
+
+        // A standard key reads across the line break, so a value is the next
+        // line's first token; the scan resumes after it, so the lines pair off.
+        let input = "sid:\n".repeat(200_000);
+        assert!(
+            scrub_text_wide(&input) == "sid:\n[redacted]\n".repeat(100_000),
+            "standard keys on consecutive lines were not masked in pairs"
+        );
+
+        // A million line breaks between a key and its separator: the wide scan
+        // stops at the first one, the standard scan reads through them all.
+        let breaks = "\n".repeat(1 << 20);
+        let input = format!("sidebar{breaks}=v");
+        assert!(scrub_text_wide(&input) == input, "a wide-only key changed");
+        let input = format!("sid{breaks}=v");
+        assert!(
+            scrub_text_wide(&input) == format!("sid{breaks}=[redacted]"),
+            "a standard key was not masked across a million line breaks"
+        );
+    }
 }
