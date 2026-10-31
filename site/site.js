@@ -122,6 +122,39 @@
     document.addEventListener("keydown", function (e) { if (e.key === "Escape") menu.removeAttribute("open"); });
   }
 
+  /* Operating system: install steps are tagged [data-for-os="macos"|"linux"], and
+     html[data-os] decides which show (CSS hides the other; "all" shows both). The
+     default comes from the visitor's platform, and each [data-os-switch] lets them
+     override it. Without JS every path stays visible and the switch stays hidden. */
+  var detectOS = function () {
+    var plat = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+    var ua = navigator.userAgent || "";
+    if (/mac/i.test(plat) || /Macintosh/.test(ua)) return "macos";
+    if (/Android/.test(ua)) return "all";
+    if (/linux/i.test(plat) || /Linux/.test(ua)) return "linux";
+    return "all";
+  };
+  var detectArch = function () {
+    return /aarch64|arm64|armv8/i.test(navigator.userAgent || "") ? "aarch64" : "x86_64";
+  };
+  var setOS = function (os) {
+    document.documentElement.setAttribute("data-os", os);
+    document.querySelectorAll("[data-os-pick]").forEach(function (b) {
+      b.setAttribute("aria-pressed", b.getAttribute("data-os-pick") === os ? "true" : "false");
+    });
+  };
+  var osSwitches = document.querySelectorAll("[data-os-switch]");
+  if (osSwitches.length) {
+    setOS(detectOS());
+    osSwitches.forEach(function (sw) {
+      sw.removeAttribute("hidden");
+      sw.addEventListener("click", function (e) {
+        var pick = e.target.closest("[data-os-pick]");
+        if (pick) setOS(pick.getAttribute("data-os-pick"));
+      });
+    });
+  }
+
   /* Release manifest: resolve the latest release and let the page derive its
      version string, the "Get aitmproxy vX.Y.Z" label, the release-page link and
      the per-platform download table from it — so nothing here is pinned to a
@@ -134,7 +167,8 @@
   var dlHost = document.querySelector("[data-downloads]");
   var tagEls = document.querySelectorAll("[data-release-tag]");
   var urlEls = document.querySelectorAll("[data-release-url]");
-  if ((dlHost || tagEls.length || urlEls.length) && window.fetch) {
+  var assetEls = document.querySelectorAll("[data-asset], [data-asset-url]");
+  if ((dlHost || tagEls.length || urlEls.length || assetEls.length) && window.fetch) {
     var GH_LATEST = "https://api.github.com/repos/mrbrutti/homebrew-aitmproxy/releases/latest";
 
     var td = function (text) {
@@ -240,6 +274,38 @@
       dlHost.removeAttribute("hidden");
     };
 
+    /* Install commands name real assets: [data-asset="deb"] takes the file name and
+       [data-asset-url="deb"] the download URL of the asset of that format for the
+       platform of the enclosing [data-for-os] block (Linux when there is none) and
+       the visitor's CPU. macOS assets exist for aarch64 only. */
+    var assetFor = function (list, format, platform, arch) {
+      var exact = null, loose = null;
+      list.forEach(function (a) {
+        if (!a || a.format !== format || a.platform !== platform) return;
+        if (a.arch === arch) exact = exact || a;
+        loose = loose || a;
+      });
+      return exact || loose;
+    };
+    var fillAssets = function (data) {
+      if (!data.assets || !data.assets.length) return;
+      var arch = detectArch();
+      document.querySelectorAll("[data-asset], [data-asset-url]").forEach(function (el) {
+        var wantUrl = el.hasAttribute("data-asset-url");
+        var format = el.getAttribute(wantUrl ? "data-asset-url" : "data-asset");
+        var scope = el.closest("[data-for-os]");
+        var platform = scope ? scope.getAttribute("data-for-os") : "linux";
+        var a = assetFor(data.assets, format, platform, platform === "macos" ? "aarch64" : arch);
+        if (!a) return;
+        if (wantUrl) {
+          if (!a.url || !/^https?:\/\//i.test(a.url)) return;
+          if (el.tagName === "A") el.setAttribute("href", a.url); else el.textContent = a.url;
+        } else if (a.name) {
+          el.textContent = a.name;
+        }
+      });
+    };
+
     /* Apply a resolved manifest to every version/link/table consumer on the page.
        Each field is optional: a missing one leaves its markup fallback untouched. */
     var applyManifest = function (data) {
@@ -253,6 +319,7 @@
           if (el.tagName === "A") el.setAttribute("href", data.release_url);
         });
       }
+      fillAssets(data);
       renderDownloads(data);
     };
 

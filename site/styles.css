@@ -758,3 +758,11 @@ html.intro-on.intro-reveal :is(.nav, main, .footer) { animation: fade-in 900ms v
   .live::after, .ui-bar .dot::after, .pulse::after { display: none; }
   .scene-canvas { display: none; }
 }
+
+/* OS-aware install: site.js sets html[data-os] from the visitor's platform and
+   reveals the switch; without it every path shows. */
+html[data-os="macos"] [data-for-os="linux"], html[data-os="linux"] [data-for-os="macos"] { display: none; }
+.os-switch { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1rem; margin: 1rem 0 1.25rem; font-family: var(--serif); font-size: var(--fs-small); color: var(--ink-2); }
+.os-switch button { background: none; border: 0; padding: 0; font: inherit; color: var(--ink); cursor: pointer; text-underline-offset: 0.25em; }
+.os-switch button:hover { text-decoration: underline; text-decoration-color: var(--ink-3); }
+.os-switch button[aria-pressed="true"] { text-decoration: underline; text-decoration-color: var(--accent); text-decoration-thickness: 2px; }

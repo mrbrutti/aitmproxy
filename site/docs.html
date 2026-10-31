@@ -80,7 +80,9 @@
     <div class="prose">
       <h2 id="install">Install</h2>
       <p>aitmproxy ships for macOS and Linux; Windows is not supported. The <code>aitm</code> command is the core: it runs the proxy, serves the web UI (<code>aitm web</code>), the terminal UI (<code>aitm tui</code>) and the MCP server, and runs one-shot commands. The embedded browser is a separate engine that <code>aitm</code> finds beside itself; the macOS app, the Linux packages and the release tarballs bundle it. Pick the path for your OS — the <a href="download.html">download page</a> lists every package and checksum for <span data-release-tag>v0.5.2</span>.</p>
+      <p class="os-switch" data-os-switch hidden><span>Showing</span><button type="button" data-os-pick="macos">macOS</button><button type="button" data-os-pick="linux">Linux</button><button type="button" data-os-pick="all">both</button></p>
 
+      <div data-for-os="macos">
       <h3 id="install-macos">macOS (Apple Silicon)</h3>
       <p>Install from the project's public Homebrew tap — no account or token needed. The formula and the app are Apple Silicon only, and the app needs macOS 26 or later. The app bundles its own core, so it does not need the formula.</p>
       <figure class="code" data-reveal>
@@ -89,14 +91,19 @@
 <span class="pr">$ </span>brew install aitm                 <span class="out"># the core: CLI, web UI, TUI, MCP</span>
 <span class="pr">$ </span>brew install --cask aitmproxy     <span class="out"># the macOS app, self-contained</span></code></pre>
       </figure>
+      </div>
 
+      <div data-for-os="linux">
       <h3 id="install-linux">Linux (x86-64 and aarch64)</h3>
-      <p>Download the package for your distribution and CPU from the <a href="download.html">download page</a> (the <code>.deb</code> comes as <code>amd64</code> or <code>arm64</code>, the <code>.rpm</code> as <code>x86_64</code> or <code>aarch64</code>), then install it. It places <code>aitm</code> and <code>aitm-tui</code> on your <code>PATH</code> (installed under <code>/usr/lib/aitmproxy</code>, symlinked from <code>/usr/bin</code>), with the embedded browser alongside.</p>
+      <p>Download the package for your distribution and CPU from the <a href="download.html">download page</a> (the <code>.deb</code> comes as <code>amd64</code> or <code>arm64</code>, the <code>.rpm</code> as <code>x86_64</code> or <code>aarch64</code>), then install it. It places <code>aitm</code> and <code>aitm-tui</code> on your <code>PATH</code> (installed under <code>/usr/lib/aitmproxy</code>, symlinked from <code>/usr/bin</code>), with the embedded browser alongside. The file names below follow the current release and your CPU.</p>
       <figure class="code" data-reveal>
         <figcaption><span>terminal</span><button class="copy" type="button" data-copy aria-label="Copy"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.5" y="5.5" width="8" height="8" rx="1"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg><span class="copy-label"></span></button></figcaption>
-<pre><code><span class="pr">$ </span>sudo apt install ./aitm-0.5.0-amd64.deb     <span class="out"># Debian / Ubuntu</span>
-<span class="pr">$ </span>sudo dnf install ./aitm-0.5.0-x86_64.rpm    <span class="out"># Fedora / RHEL</span></code></pre>
+<pre><code><span class="pr">$ </span>curl -LO <span data-asset-url="deb">https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.2/aitm-0.5.2-amd64.deb</span>
+<span class="pr">$ </span>sudo apt install ./<span data-asset="deb">aitm-0.5.2-amd64.deb</span>     <span class="out"># Debian / Ubuntu</span>
+<span class="pr">$ </span>curl -LO <span data-asset-url="rpm">https://github.com/mrbrutti/homebrew-aitmproxy/releases/download/v0.5.2/aitm-0.5.2-x86_64.rpm</span>
+<span class="pr">$ </span>sudo dnf install ./<span data-asset="rpm">aitm-0.5.2-x86_64.rpm</span>    <span class="out"># Fedora / RHEL</span></code></pre>
       </figure>
+      </div>
 
       <h3 id="install-cargo">Cargo, or from source</h3>
       <p>The source repository is private, so this needs git credentials with access to it, and Rust 1.97 or newer. A bare build produces only <code>aitm</code>: no <code>aitm-tui</code>, no browser engine, and no built web UI (<code>aitm web</code> serves a placeholder until the web app is built). Prefer the packages above unless you are developing.</p>

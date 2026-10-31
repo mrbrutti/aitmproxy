@@ -220,6 +220,9 @@ jobs:
             "$TAG" "$TAP_REPO" SHA256SUMS "${names[@]}" > site/downloads.json
           echo "site/downloads.json:"
           cat site/downloads.json
+          # The markup's no-JS fallbacks and the README carry literal versions;
+          # keep them in step with the manifest.
+          bash scripts/sync-release-version.sh "$TAG"
 
       - name: Commit the refreshed manifest to main
         env:
@@ -227,13 +230,13 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add site/downloads.json
+          git add site/downloads.json README.md site/*.html
           if git diff --cached --quiet; then
             echo "site/downloads.json unchanged; nothing to commit"
             exit 0
           fi
-          git commit -m "chore(site): refresh downloads manifest for ${TAG}"
-          # main may have advanced while this release ran; rebase the one-file
+          git commit -m "chore(site): refresh downloads manifest and version strings for ${TAG}"
+          # main may have advanced while this release ran; rebase the small
           # commit and retry the push a few times rather than fail the release.
           for attempt in 1 2 3; do
             if git push origin HEAD:main; then
