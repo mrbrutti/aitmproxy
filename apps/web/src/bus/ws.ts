@@ -150,7 +150,16 @@ export function createWsBus(opts: WsBusOptions): BusClient {
         continue;
       }
       if (typeof msg.method === 'string' && msg.id === undefined) {
-        for (const h of handlers) h(msg.method, msg.params);
+        for (const h of handlers) {
+          // A handler is the store's code. One that throws must not take the other handlers down, nor
+          // the rest of this frame (it may carry the subscribe reply or a call's reply). Swallowed: this
+          // client has no log, and the store's poll loop re-reads whatever the notification was about.
+          try {
+            h(msg.method, msg.params);
+          } catch {
+            // see above
+          }
+        }
         continue;
       }
       if (typeof msg.id === 'number') {

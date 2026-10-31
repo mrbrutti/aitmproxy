@@ -353,10 +353,15 @@ describe('createWsBus subscribes on every open', () => {
 
     refuse(first); // closes before the subscribe reply
     expect(client.state()).toBe('reconnecting');
-    await sleep(50);
+
+    // Wait for the back-off to bring the next attempt up (not for a fixed time); the dead first socket's
+    // pending subscribe has settled by then and must not have opened the bus.
+    await vi.waitFor(() => {
+      if (FakeWebSocket.last === first) throw new Error('next attempt not started');
+    });
     expect(client.state()).toBe('reconnecting');
 
-    // The back-off brought the next attempt up; it subscribes on its own socket and opens.
+    // The next attempt subscribes on its own socket and opens.
     const second = FakeWebSocket.last!;
     expect(second).not.toBe(first);
     second.onopen?.();
@@ -435,6 +440,37 @@ describe('createWsBus subscribes on every open', () => {
     await vi.waitFor(() => expect(client.state()).toBe('open'));
     expect(h).toHaveBeenCalledTimes(1);
     expect(client.lastError()).toBe(null);
+  });
+
+  // Handler isolation: a handler is the store's code, not this client's. One that throws must not take the
+  // other handlers down, nor the rest of a batched frame, which may carry the subscribe reply or a call's reply.
+  it('a_throwing_handler_does_not_stop_other_handlers_or_the_rest_of_the_frame', async () => {
+    const client = bus();
+    const bad = vi.fn(() => {
+      throw new Error('handler blew up');
+    });
+    const good = vi.fn();
+    client.onNotification(bad); // registered first, so it runs first
+    client.onNotification(good);
+    const sock = await handshake(client);
+    const { id } = await toolCallSent(sock, 'flow.subscribe');
+    const flow = JSON.stringify({ jsonrpc: '2.0', method: 'notifications/aitm/flow', params: { event: 'created', id: 'f_1' } });
+
+    // One frame: the notification, then the subscribe reply that gates `open`.
+    sock.onmessage?.({ data: flow + '\n' + JSON.stringify({ jsonrpc: '2.0', id, result: { structuredContent: { sub_id: 1 } } }) + '\n' });
+    expect(bad).toHaveBeenCalledTimes(1);
+    expect(good).toHaveBeenCalledTimes(1);
+    expect(good).toHaveBeenCalledWith('notifications/aitm/flow', { event: 'created', id: 'f_1' });
+    await vi.waitFor(() => expect(client.state()).toBe('open'));
+    expect(client.lastError()).toBe(null);
+
+    // The same frame shape once open: a call's reply behind the notification still resolves the call.
+    const call = client.call<string[]>('flow.list');
+    const { id: listId } = await toolCallSent(sock, 'flow.list');
+    sock.onmessage?.({ data: flow + '\n' + JSON.stringify({ jsonrpc: '2.0', id: listId, result: { structuredContent: ['f_1'] } }) + '\n' });
+    expect(bad).toHaveBeenCalledTimes(2);
+    expect(good).toHaveBeenCalledTimes(2);
+    expect(await outcome(call)).toEqual({ ok: ['f_1'] });
   });
 
   it('notifications_before_the_subscribe_reply_reach_handlers', async () => {

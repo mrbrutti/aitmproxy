@@ -218,11 +218,12 @@ describe('toAgentEntry (audit line)', () => {
       expect(e, String(at)).not.toBeNull();
       expect(Number.isFinite(Date.parse(e!.at)), String(at)).toBe(true);
     }
-    // The server caps `args` at 512 bytes, so a long one is cut mid-JSON; a client must still take far more.
+    // The server caps `args` at 512 bytes, so a long one is cut mid-JSON; a client must still survive far
+    // more, and keeps no more than its own cap of it (see the cap cases below).
     const big = '{"x":"' + 'a'.repeat(1_000_000);
-    expect(toAgentEntry({ ...wire, args: big })?.args).toBe(big);
+    expect(toAgentEntry({ ...wire, args: big })?.args).toBe(big.slice(0, 2048));
     // Nesting no parser will take stays text; a prototype key stays plain data.
-    expect(toAgentEntry({ ...wire, args: '['.repeat(200_000) })?.args).toBe('['.repeat(200_000));
+    expect(toAgentEntry({ ...wire, args: '['.repeat(200_000) })?.args).toBe('['.repeat(2048));
     const proto = toAgentEntry({ ...wire, args: '{"__proto__":{"polluted":true}}' });
     expect(typeof proto?.args).toBe('object');
     expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
@@ -232,5 +233,38 @@ describe('toAgentEntry (audit line)', () => {
       expect(e?.result, JSON.stringify(result)).toBe('error');
       expect(e?.detail, JSON.stringify(result)).toBeUndefined();
     }
+  });
+
+  // The 500-entry cap bounds how many lines the log keeps, not how big each is: `client_label` is a
+  // self-declared `clientInfo.name` the server does not cap, and `args`/`error` are server text. Each
+  // string the model keeps is cut to a fixed size; a line within the caps is untouched (the cases above).
+  it('caps clientLabel at 128 chars', () => {
+    expect(toAgentEntry({ ...wire, client_label: 'L'.repeat(128) })?.clientLabel).toBe('L'.repeat(128));
+    expect(toAgentEntry({ ...wire, client_label: 'L'.repeat(129) })?.clientLabel).toBe('L'.repeat(128));
+    expect(toAgentEntry({ ...wire, client_label: 'L'.repeat(10_000) })?.clientLabel).toBe('L'.repeat(128));
+  });
+
+  it('caps detail at 2048 chars', () => {
+    expect(toAgentEntry({ ...wire, result: { error: 'e'.repeat(2048) } })?.detail).toBe('e'.repeat(2048));
+    expect(toAgentEntry({ ...wire, result: { error: 'e'.repeat(2049) } })?.detail).toBe('e'.repeat(2048));
+    // The model shape's `detail` is cut the same way.
+    const model = toAgentEntry({ origin: 'cli', command: 'scope.add', result: 'error', detail: 'd'.repeat(5000), at: '2024-10-27T03:33:20.000Z' });
+    expect(model?.detail).toBe('d'.repeat(2048));
+  });
+
+  it('caps a string args at 2048 chars before parsing it', () => {
+    // Exactly at the cap: still parsed.
+    const atCap = '{"id":"' + 'f'.repeat(2039) + '"}';
+    expect(atCap).toHaveLength(2048);
+    expect(toAgentEntry({ ...wire, args: atCap })?.args).toEqual({ id: 'f'.repeat(2039) });
+    // One over: valid JSON on the wire, but the cut text (the closing brace is gone) no longer parses, so
+    // it stays text, 2048 chars of it.
+    const over = '{"id":"' + 'f'.repeat(2040) + '"}';
+    expect(over).toHaveLength(2049);
+    const cut = '{"id":"' + 'f'.repeat(2040) + '"';
+    expect(cut).toHaveLength(2048);
+    expect(toAgentEntry({ ...wire, args: over })?.args).toBe(cut);
+    // A non-string args (the fixture model's object) is not text and is passed through.
+    expect(toAgentEntry({ ...wire, args: { id: 'f_1' } })?.args).toEqual({ id: 'f_1' });
   });
 });

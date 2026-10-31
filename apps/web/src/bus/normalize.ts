@@ -303,22 +303,39 @@ function isoOf(v: unknown): string {
   return str(v) ?? new Date().toISOString();
 }
 
-/** The audit `args` is redacted JSON text; an object or array is shown structured, anything else as the text it is. */
+/**
+ * Caps on the strings one audit line may put into the model. The Activity log's 500-entry cap bounds how
+ * many lines are kept, not how big each is: `client_label` is a self-declared `clientInfo.name` the server
+ * does not cap, and the error reason and `args` are server text. Lengths are in UTF-16 code units.
+ */
+const LABEL_MAX = 128;
+const TEXT_MAX = 2048;
+const clip = (s: string, max: number): string => (s.length > max ? s.slice(0, max) : s);
+
+/**
+ * The audit `args` is redacted JSON text; an object or array is shown structured, anything else as the
+ * text it is. Cut to `TEXT_MAX` BEFORE parsing, so an oversized line yields a bounded string (a cut JSON
+ * text no longer parses and simply stays text), never an unbounded object.
+ */
 function argsOf(v: unknown): unknown {
   if (typeof v !== 'string') return v;
+  const text = clip(v, TEXT_MAX);
   try {
-    const parsed: unknown = JSON.parse(v);
-    return parsed !== null && typeof parsed === 'object' ? parsed : v;
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === 'object' ? parsed : text;
   } catch {
-    return v;
+    return text;
   }
 }
 
 /**
  * One audit line (`notifications/aitm/agent`, `agent.activity`) to the Activity model. Accepts the
  * server's wire shape (crates/aitm-core/src/audit.rs) and the fixture bus's model shape alike.
- * Returns null for what is not an audit entry: an `approval_requested` line (it carries `event`)
- * or a line without a command.
+ * Returns null for what is not an audit entry: an `approval_requested` line (it carries `event`),
+ * a line without a string `command`, or one without a string `origin` (the model requires it and the
+ * server always sends it; without it the line could be neither attributed nor filtered). Any `result`
+ * other than `'ok'` is shown as `'error'` (web-ui-bus-push D6: shown, never hidden), with the reason as
+ * `detail` when the server gave one. The strings kept are capped (`LABEL_MAX`, `TEXT_MAX`).
  */
 export function toAgentEntry(raw: unknown): AgentNotification | null {
   const r = rec(raw);
@@ -333,8 +350,11 @@ export function toAgentEntry(raw: unknown): AgentNotification | null {
     result: r.result === 'ok' ? 'ok' : 'error',
     at: isoOf(r.at),
   };
-  if ('client_label' in r || 'clientLabel' in r) out.clientLabel = str(r.client_label ?? r.clientLabel);
+  if ('client_label' in r || 'clientLabel' in r) {
+    const label = str(r.client_label ?? r.clientLabel);
+    out.clientLabel = label === null ? null : clip(label, LABEL_MAX);
+  }
   if (r.args !== undefined) out.args = argsOf(r.args);
-  if (detail !== null) out.detail = detail;
+  if (detail !== null) out.detail = clip(detail, TEXT_MAX);
   return out;
 }
