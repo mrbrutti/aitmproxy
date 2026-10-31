@@ -177,9 +177,21 @@ fn uds_bind_available(socket_dir: &Path) -> bool {
 
 /// The L7 scope guard, shared by the session (which lists its scope to push to the
 /// provider) and by the ingress (which enforces it) — as in production. `in_scope`
-/// is an exact host match against the seeded list, so a flow's scope comes from the
-/// SNI it carries, as it does in the real guard.
+/// delegates to a real [`StdGuard`](aitm_core::StdGuard) seeded with the same list,
+/// so the test asserts the real matching contract (`host:port` authority, a portless
+/// entry admits any port) rather than a copy of it; `check_active` stays unreachable
+/// because the feeder and the ingress must consume no rate or concurrency budget.
 struct SeededScope(Vec<ScopeEntry>);
+
+impl SeededScope {
+    fn real_guard(&self) -> aitm_core::StdGuard {
+        let guard = aitm_core::StdGuard::default();
+        for entry in &self.0 {
+            guard.add_scope(entry.clone());
+        }
+        guard
+    }
+}
 
 impl ScopeRateGuard for SeededScope {
     fn check_active(&self, _host: &str) -> Result<ActionPermit, GuardError> {
@@ -193,12 +205,7 @@ impl ScopeRateGuard for SeededScope {
         self.0.clone()
     }
     fn in_scope(&self, host: &str) -> bool {
-        // The ingress gates on `host:port` (the same shape a proxied request is gated
-        // on), so match the way the real guard does — `Authority::matches_scope_entry`,
-        // where a portless entry admits any port — not by exact string equality.
-        aitm_core::Authority::parse_with_default(host, 0)
-            .map(|a| self.0.iter().any(|e| a.matches_scope_entry(&e.host)))
-            .unwrap_or(false)
+        self.real_guard().in_scope(host)
     }
 }
 
