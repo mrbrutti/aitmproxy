@@ -115,6 +115,56 @@ import Testing
         #expect(!yaml.contains("upstream"))              // no wrapper object the core would reject
     }
 
+    // MARK: Capture gate (TG-AC1 / TG-AC2)
+
+    private func config(captureEnabled: Bool) -> EmbeddedCoreLaunch.Config {
+        EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            captureEnabled: captureEnabled
+        )
+    }
+
+    @Test func capture_gate_emitted_only_when_enabled() throws {
+        // The Network Extension feeder is the core's deny-by-default on-switch:
+        // the app writes the `macos_capture` section only when the operator has
+        // turned capture on, and writes nothing at all when it is off so the core
+        // parses its disabled default (TG-AC1).
+        #expect(try config(captureEnabled: true).yaml().contains("macos_capture:\n  enabled: true"))
+        #expect(!(try config(captureEnabled: false).yaml()).contains("macos_capture"))
+    }
+
+    @Test func capture_gate_defaults_off() throws {
+        // A Config built without `captureEnabled:` — every pre-existing call site —
+        // is off: the field is false and no `macos_capture` text reaches the file,
+        // so shipping the field cannot silently arm capture (TG-AC2 default-off).
+        let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        #expect(config.captureEnabled == false)
+        #expect(!(try config.yaml()).contains("macos_capture"))
+    }
+
+    @Test func capture_gate_is_byte_identical_to_the_core_parse_input() throws {
+        // The core's `config_file.rs` `macos_capture_enable_round_trips` test parses
+        // exactly "macos_capture:\n  enabled: true\n" into an enabled feeder config.
+        // The emitted block must be that text byte-for-byte — a top-level
+        // `macos_capture:` at column 0 (sibling of `listen`/`mcp`/`browser`, since
+        // `deny_unknown_fields` rejects any wrapper) with `enabled: true` indented
+        // two spaces and newline-terminated — so what the app writes is what the
+        // core is proven to accept (TG-AC2 core-compatible).
+        let coreParseInput = "macos_capture:\n  enabled: true\n"
+        let yaml = try config(captureEnabled: true).yaml()
+        #expect(yaml.contains("macos_capture:\n  enabled: true"))
+        #expect(yaml.contains(coreParseInput))
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.contains("macos_capture:"))          // exact line: column 0, no indent
+        #expect(lines.contains("  enabled: true"))         // exact line: two-space indent
+        let key = lines.firstIndex(of: "macos_capture:")
+        let valueLine = key.flatMap { lines.indices.contains($0 + 1) ? lines[$0 + 1] : nil }
+        #expect(valueLine == "  enabled: true")            // directly under the key, nothing between
+    }
+
     @Test func swift_stop_grace_exceeds_the_embedded_core_obscura_budget() {
         // The SIGTERM→SIGKILL grace must outlast the core's whole obscura teardown
         // budget (stop_timeout + the core's 1 s reap margin) so a clean SIGTERM is
