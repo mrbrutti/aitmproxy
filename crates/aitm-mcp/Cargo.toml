@@ -13,7 +13,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 serde_json = "1"
-tokio = { workspace = true, features = ["io-util", "io-std", "net", "rt", "sync"] }
+tokio = { workspace = true, features = ["io-util", "io-std", "net", "rt", "sync", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 
