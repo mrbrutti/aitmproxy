@@ -771,3 +771,114 @@ fn the_streamable_http_agent_server_is_governed_by_the_same_live_state_and_ring(
 
     assert_eq!(rig.assembled.audit_ring.len(), 2);
 }
+
+/// Red-set (spec Goal 1; Design 5, consequences 2, 3 and 5). An operator-token
+/// client of the agent server governs the loopback agent exactly as the TUI
+/// does: its `agent.set paused` refuses the agent's very next call, it is not
+/// itself governed by the posture it set (its own `flow.list` still runs and it
+/// can `agent.set` back), and every call on the agent server is in the core's
+/// shared trail with the origin of the connection that made it, `"mcp"` for the
+/// agent and `"operator"` for the operator-token client. The refusal is
+/// asserted before the trail, so against the pre-switch wiring (a private
+/// `AgentState`, which the operator's `agent.set` never reaches) the red cause
+/// is the unrefused agent call.
+#[test]
+fn an_operator_token_client_governs_the_loopback_agent_and_is_recorded_as_operator() {
+    let rig = rig("operator-client", None);
+    let agent = ConnCtx::new(Frontend::Mcp);
+    let operator = ConnCtx::new(Frontend::Operator);
+
+    assert_ok(&agent_call(&rig, &agent, "flow.list", json!({})));
+
+    let pause = agent_call(&rig, &operator, "agent.set", json!({"policy": "paused"}));
+    assert_ok(&pause);
+    assert_eq!(
+        pause["result"]["structuredContent"]["policy"],
+        json!("paused"),
+        "{pause}"
+    );
+    let refused = agent_call(&rig, &agent, "flow.list", json!({}));
+    assert_refused(&refused, &["the agent policy is `paused`"]);
+    assert_eq!(tui_policy(&rig), json!("paused"));
+
+    // The operator keeps full control while the agent is paused.
+    assert_ok(&agent_call(&rig, &operator, "flow.list", json!({})));
+    let resume = agent_call(&rig, &operator, "agent.set", json!({"policy": "auto"}));
+    assert_ok(&resume);
+    assert_ok(&agent_call(&rig, &agent, "flow.list", json!({})));
+
+    let activity = tui_call(&rig, "agent.activity", json!({}));
+    assert_ok(&activity);
+    let rows = activity["result"]["structuredContent"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent.activity returns an array: {activity}"));
+    // (origin, command, whether the call ran) in call order.
+    let expected = [
+        ("mcp", "flow.list", true),
+        ("operator", "agent.set", true),
+        ("mcp", "flow.list", false),
+        ("operator", "flow.list", true),
+        ("operator", "agent.set", true),
+        ("mcp", "flow.list", true),
+    ];
+    assert_eq!(
+        rows.len(),
+        expected.len(),
+        "exactly the six calls on the agent server: {activity}"
+    );
+    for (i, (row, (origin, command, ran))) in rows.iter().zip(expected).enumerate() {
+        assert_eq!(row["origin"], json!(origin), "row {i}: {activity}");
+        assert_eq!(row["command"], json!(command), "row {i}: {activity}");
+        if ran {
+            assert_eq!(row["result"], json!("ok"), "row {i}: {activity}");
+        } else {
+            let error = row["result"]["error"]
+                .as_str()
+                .unwrap_or_else(|| panic!("row {i} is a refusal with a string error: {activity}"));
+            assert!(error.contains("paused"), "row {i}: {activity}");
+        }
+    }
+    assert_eq!(rig.assembled.audit_ring.len(), expected.len());
+}
+
+/// Guard (spec Design 4; the `main.rs` comment). With `push_tx` unfed, an
+/// operator subscribed on the agent server is still pushed one
+/// `notifications/aitm/agent` line per agent call, allowed or refused, and
+/// nothing else: the audit stream does not depend on `push_tx`. The operator's
+/// own successful `flow.subscribe` is connection management and is neither
+/// audited nor pushed. Passes against both wirings: the subscription registry
+/// and the push are the agent server's own either way.
+#[test]
+fn a_subscribed_operator_is_still_pushed_each_agent_call_with_push_unfed() {
+    let rig = rig("audit-push", None);
+    let (_operator, sink) = subscribe_operator(&rig);
+    assert_eq!(
+        sink.drain(),
+        Vec::<String>::new(),
+        "a successful flow.subscribe is not pushed back to its subscriber"
+    );
+
+    let agent = ConnCtx::new(Frontend::Mcp);
+    assert_ok(&agent_call(&rig, &agent, "flow.list", json!({})));
+    let add = agent_call(&rig, &agent, "scope.add", json!({}));
+    assert_refused(&add, &["the agent policy is `auto`"]);
+
+    let lines = sink.drain();
+    assert_eq!(lines.len(), 2, "one push per agent call: {lines:?}");
+    let pushes: Vec<Value> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).expect("a pushed line is JSON"))
+        .collect();
+    for push in &pushes {
+        assert_eq!(push["jsonrpc"], json!("2.0"), "{push}");
+        assert_eq!(push["method"], json!("notifications/aitm/agent"), "{push}");
+        assert_eq!(push["params"]["origin"], json!("mcp"), "{push}");
+    }
+    assert_eq!(pushes[0]["params"]["command"], json!("flow.list"));
+    assert_eq!(pushes[0]["params"]["result"], json!("ok"));
+    assert_eq!(pushes[1]["params"]["command"], json!("scope.add"));
+    let error = pushes[1]["params"]["result"]["error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the refused scope.add has a string error: {}", pushes[1]));
+    assert!(error.contains("auto"), "{}", pushes[1]);
+}
