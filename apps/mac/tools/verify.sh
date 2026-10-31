@@ -19,3 +19,6 @@ APP_KIT_GALLERY=1 APP_STORE=/tmp/Aitmproxy-gallery-state APP_SNAPSHOT=/tmp/Aitmp
   ~/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy 2>&1 | grep -E 'SNAPSHOT done|error|fallback'
 echo "== grid"
 tools/grid-lint.sh | tail -1
+echo "== capture guards"
+tools/check-capture-operator-only.sh >/dev/null && echo "operator-only: PASS" || echo "operator-only: FAIL"
+tools/check-capture-toggle.sh >/dev/null && echo "toggle wiring: PASS" || echo "toggle wiring: FAIL"
