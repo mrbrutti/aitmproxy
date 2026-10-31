@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aitm_core::{
     Body, Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
@@ -69,7 +70,8 @@ impl Command for FlowList {
     }
 }
 
-/// `flow.get {id}` → a summary object for one flow.
+/// `flow.get {id}` → a summary object for one flow: kind, request line, status,
+/// body sizes, timing (`started_at`, `duration_ms`) and interception state.
 struct FlowGet;
 
 impl Command for FlowGet {
@@ -162,6 +164,22 @@ fn summary_fields() -> Vec<ParamDef> {
             "HTTP response body size in bytes; null until the response arrives or while \
              it is still streaming.",
         ),
+        field(
+            "started_at",
+            TypeDesc::Int,
+            false,
+            "When the flow started, in milliseconds since the Unix epoch: the moment the \
+             proxy created the flow (the request head for HTTP, the upgrade for \
+             WebSocket); null if the clock is before the epoch.",
+        ),
+        field(
+            "duration_ms",
+            TypeDesc::Int,
+            false,
+            "Flow duration in whole milliseconds, from start to the end of the response, \
+             or to the point a failed response was abandoned; null while in flight or \
+             unknown.",
+        ),
     ]
 }
 
@@ -176,13 +194,39 @@ fn body_bytes(body: &Body) -> Value {
     }
 }
 
-/// A transport-neutral summary of a flow.
+/// A wall-clock instant as whole milliseconds since the Unix epoch, saturated at
+/// `i64::MAX`; `Null` if the clock is before the epoch. The one rule `flow.get`
+/// uses for `started_at`, so every frontend places a flow at the same time.
+fn epoch_ms(t: SystemTime) -> Value {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => whole_ms(d),
+        Err(_) => Value::Null,
+    }
+}
+
+/// A flow duration as whole milliseconds, saturated at `i64::MAX`; `Null` while
+/// the flow is in flight or its end is unknown. Shared by `flow.get` and
+/// `flow.table` so the two commands cannot drift on `duration_ms`.
+fn duration_ms(d: Option<Duration>) -> Value {
+    d.map_or(Value::Null, whole_ms)
+}
+
+fn whole_ms(d: Duration) -> Value {
+    Value::Int(d.as_millis().min(i64::MAX as u128) as i64)
+}
+
+/// A transport-neutral summary of a flow: identity, timing, and the per-kind
+/// fields (request line, status and body sizes for HTTP; handshake and message
+/// count for WebSocket). `started_at` is `metadata.created` for both kinds, so
+/// `started_at + duration_ms` is the flow's end.
 fn summarize(flow: &Flow) -> Value {
     let mut obj = BTreeMap::new();
     let mut put = |k: &str, v: Value| {
         obj.insert(k.to_string(), v);
     };
     put("id", Value::Str(flow.id().to_string()));
+    put("started_at", epoch_ms(flow.metadata().created));
+    put("duration_ms", duration_ms(flow.metadata().duration));
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
@@ -320,12 +364,7 @@ fn flow_row(flow: &Flow) -> Value {
                 .collect(),
         ),
     );
-    put(
-        "duration_ms",
-        flow.metadata().duration.map_or(Value::Null, |d| {
-            Value::Int(d.as_millis().min(i64::MAX as u128) as i64)
-        }),
-    );
+    put("duration_ms", duration_ms(flow.metadata().duration));
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
