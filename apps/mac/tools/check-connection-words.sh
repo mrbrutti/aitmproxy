@@ -11,13 +11,15 @@
 #         must not mention it, `LaneDot`, `LaneState` or `ConnectionSummary` at all.
 # Exit 0 + PASS on a clean tree; exit 1 listing each offence otherwise.
 set -u
+set -o pipefail
+export LC_ALL=C
 cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 status=0
 
 words='"(running|not running|starting…|restarting…|stopped|failed|external|connected|connecting…|offline|bus failed|capture on|capture off|capture degraded|waiting for approval|on, nothing in scope|no extension|Capturing|Approved|Awaiting approval|core running|core failed)"'
 # Skipped: comments, the self-test (it ASSERTS the words), and filter values (`FilterRow(.state, …, "failed")`
 # is a flow-state query, not a connection word).
-hits=$(grep -rnE --include='*.swift' -e "$words" Sources/Aitmproxy | grep -vE ':[0-9]+:[[:space:]]*///?' | grep -v 'SelfTest' | grep -v 'FilterRow(' || true)
+hits=$(grep -rnE --include='*.swift' -e "$words" Sources/Aitmproxy | grep -vE ':[0-9]+:[[:space:]]*///?' | grep -vE '^Sources/Aitmproxy/SelfTest' | grep -vE ':[0-9]+:.*FilterRow\(' || true)
 if [ -n "$hits" ]; then
   printf '%s\n' "$hits"
   echo "FAIL check-connection-words: a view spells a connection state word; read it from ConnectionSummary instead"
@@ -33,9 +35,15 @@ if [ -n "$others" ]; then
   status=1
 fi
 for f in Sources/Aitmproxy/Shell/SidebarView.swift Sources/Aitmproxy/Shell/StatusBar.swift; do
-  bad=$(grep -nE -e 'connectionSummary|LaneDot|LaneState|ConnectionSummary' "$f" || true)
+  # A missing file is not a passing file: if it moved, the rule must move with it.
+  if [ ! -f "$f" ]; then
+    echo "FAIL check-connection-words: $f not found; update this script to the file that replaced it"
+    status=1
+    continue
+  fi
+  bad=$(grep -nHE -e 'connectionSummary|LaneDot|LaneState|ConnectionSummary' "$f" || true)
   if [ -n "$bad" ]; then
-    printf '%s:%s\n' "$f" "$bad"
+    printf '%s\n' "$bad"
     echo "FAIL check-connection-words: $f carries connection state; it belongs to the toolbar only"
     status=1
   fi

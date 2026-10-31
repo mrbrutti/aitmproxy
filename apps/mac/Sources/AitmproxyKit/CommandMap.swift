@@ -123,8 +123,7 @@ public enum CommandMap {
             return [I(VerbTable.titles(v), item.shortcut ?? item.key.map { Shortcut($0) })]
         }
         func listKey(_ v: FlowVerb) -> String? { VerbTable.item(v, for: nil).key }
-        // ⌘1…⌘9 follow chip-bar order (ContentCategory.groups), so a new chip moves the later ones.
-        let chips = ContentCategory.groups.flatMap { $0 }.prefix(9).map(\.title)
+        let chips = ContentCategory.shortcutChips.map(\.title)
         return [
             E("File", "Compose Request…", "⌘N (`n`)", items: one("Compose Request…", "⌘N"), listKey: "n"),
             E("File", "Import…", "⌘O", items: one("Import…", "⌘O")),

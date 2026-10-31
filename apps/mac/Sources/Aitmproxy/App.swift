@@ -267,7 +267,7 @@ struct FlowCommands: Commands {
             Divider()
             // ⌘1…⌘9: the first nine chips, in chip-bar order (foundation §2.7).
             Menu("Chip") {
-                ForEach(Array(ContentCategory.groups.flatMap { $0 }.prefix(9).enumerated()), id: \.offset) { index, chip in
+                ForEach(Array(ContentCategory.shortcutChips.enumerated()), id: \.offset) { index, chip in
                     Toggle(chip.title, isOn: Binding(get: { session.chip == chip }, set: { _ in session.chip = chip }))
                         .keyboardShortcut(KeyEquivalent(Character("\(index + 1)")), modifiers: .command)
                 }

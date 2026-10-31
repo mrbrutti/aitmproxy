@@ -13,17 +13,6 @@ extension LaneState {
         case .error: Tok.Status.serverError
         }
     }
-
-    /// The glyph for places that cannot draw a dot.
-    var symbol: String {
-        switch self {
-        case .ok: "checkmark.circle.fill"
-        case .working: "hourglass"
-        case .off: "circle"
-        case .warning: "exclamationmark.circle.fill"
-        case .error: "xmark.circle.fill"
-        }
-    }
 }
 
 /// A status dot and its word, the compact form of one lane.

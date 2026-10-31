@@ -1,6 +1,6 @@
 # macOS Status page and first-run flow design
 
-**Status:** implemented on `claude/macos-connection-ux` (2026-10-31); panel-reviewed, revisions below; Matt approves the two open questions
+**Status:** implemented on `claude/macos-connection-ux` (2026-10-31); panel-reviewed twice, revisions below; one open question left for Matt (the landing rule once flows exist)
 **Research inputs:** `apps/mac/docs/review-2026-10-31.md` (live findings L1–L9), PR #181 spec
 `2026-10-31-ne-no-scope-honest-state-design.md` (`CaptureAdvice`), the bama `mac-design`
 (rules 3, 5, 27, 28, 56, 59, 64, 76) and `ux-design` (surface table, states, words) skills.
@@ -110,7 +110,7 @@ public struct ConnectionSummary: Equatable, Sendable {
     public let core: ConnectionLane
     public let bus: ConnectionLane
     public let capture: ConnectionLane
-    /// Worst lane state, for the sidebar's Status row glyph and the toolbar pill's dot.
+    /// Worst lane state.
     public var overall: LaneState
     /// Getting-started steps with their done flag, in order.
     public let steps: [GettingStartedStep]
@@ -120,8 +120,6 @@ public struct ConnectionSummary: Equatable, Sendable {
                             captureSupported: Bool, scopeHostCount: Int, flowCount: Int,
                             listenAddress: String, coreCapture: CoreCaptureStatus? = nil) -> ConnectionSummary
     // builds the CaptureAdvice itself from capability + supported + scope count (one call site)
-    public var overallWord: String   // "connected" | worst.compact — the status bar's one word
-    public var badge: String         // "ok" | worst lane title — the sidebar brand chip
     public var tooltip: String; public var spoken: String   // the three lanes, for .help / a11y
 }
 
@@ -197,7 +195,7 @@ Surface (ux-design table): a sidebar page — a place the operator comes back to
 - Empty/offline: when the bus is offline the Core and Capture cards still render their last
   known state and the Bus card carries the remedy; nothing on the page is blank.
 - Keyboard: Proxy ▸ Status (⌘0) opens it; every card action is also a Proxy-menu item (Restart
-  Core, Reconnect Bus, Enable/Disable Capture, Scope…, Core Log…, Browser) — all exist today.
+  Core, Reconnect Bus, Turn On/Off Capture, Scope…, Core Log…, Browser) — all exist today.
 
 ### 3. Sidebar information architecture and landing page (revised after Matt's review)
 
@@ -263,13 +261,19 @@ into the cluster. Everything in the cluster reads `Session.connectionSummary`.
   bus and capture `LaneDot`s only while those lanes need attention. `.help` is `summary.tooltip`
   + "Opens Status (⌘0)". Drawn on `active` instead of `raised` while the Status page is showing,
   so the page has a selected entry even though it is not a sidebar row.
-- **Proxy switch** (`ToolbarSwitch("Proxy")`): on = the proxy records flows, off = paused. Flips
-  through `Session.setCapturing`, the same entry as View ▸ Pause Proxy / Resume Proxy (⇧⌘R) and
-  the palette; the core answers `proxy.pause` / `proxy.resume` (traffic still passes, new flows
-  are not recorded — the core has no verb that stops the listener). Track colour: the core lane's
-  colour when on, tertiary when paused. Disabled, with the core lane's word in its help, while the
-  core lane is not `ok` (nothing to pause). Help: "Pause the proxy: traffic still passes and new
-  flows are not recorded (⇧⌘R)" / "Resume recording flows (⇧⌘R)".
+- **Proxy switch** (`ToolbarSwitch("Proxy")`): on = the proxy records flows, off = paused. Its
+  position is the **core's** `capturing` fact: `BusService` reads `proxy.status.capturing` every
+  poll and takes the value from each `proxy.pause` / `proxy.resume` reply, so a pause by any other
+  client (agent, TUI, web) or a relaunch against an already-paused core shows here within one poll
+  (panel round 2, security Important). Flips through `ToolbarSwitches.flipProxy` →
+  `Session.setCapturing`, the same entry as View ▸ Pause Proxy / Resume Proxy (⇧⌘R) and the
+  palette (traffic still passes, new flows are not recorded — the core has no verb that stops the
+  listener). Track colour: the success colour when on, tertiary when paused or disabled. Pause is
+  a bus call whichever core answers, so the switch is live while the **bus lane is `ok`**
+  (connected as operator) and disabled otherwise — connected as agent included, so a pause is
+  never logged as an agent action — with "Bus <word> — connect as operator to pause or resume the
+  proxy" in its help. Help when live: "Pause the proxy: traffic still passes and new flows are not
+  recorded (⇧⌘R)" / "Resume recording flows (⇧⌘R)".
 - **Capture switch** (`ToolbarSwitch("Capture")`): the capture extension's on/off. Its position
   is the published fact, never the preference key (§1): on whenever the capture lane is not
   `off` — capturing, waiting for approval, degraded — off when the lane is off;
@@ -280,14 +284,18 @@ into the cluster. Everything in the cluster reads `Session.connectionSummary`.
   scope" shows the warning hue, "waiting for approval" the working hue, "capture degraded" the
   error hue — and tertiary when off; the help carries the lane's word, detail and remedy. Disabled
   when the controls are unavailable (no extension in this build, an external core is active, a
-  switch is in flight), with the reason in the help. Operator-only: `Shell/ShellToolbar.swift`
+  switch is in flight), with the reason in the help. When the lane's fact and the persisted choice
+  disagree (the choice says on, the tunnel dropped), a click asks for what is already chosen;
+  `CaptureSwitch.set` then says so in the status bar instead of doing nothing. Operator-only: `Shell/ShellToolbar.swift`
   joins Settings, the Proxy menu and the Status page in the capture tripwire's allow-list with an
   `expect`; no bus verb, `Session` action or palette entry reaches it.
 - **Words**: one word per idea. *Proxy* is the listener (on / paused); *Capture* is the
   extension (GLOSSARY "Capture extension"; its switch and menu say Turn On / Turn Off Capture).
   "Pause Capture / Resume Capture" → "Pause Proxy / Resume Proxy" everywhere (menu, palette,
-  command map, stories); "Enable Capture / Disable Capture" → "Turn On Capture / Turn Off
-  Capture" (the `ConnectionAction` titles already said so).
+  command map, the status-bar error prefix, stories); "Enable Capture / Disable Capture" → "Turn
+  On Capture / Turn Off Capture" (the `ConnectionAction` titles already said so). The command map
+  also gains the Proxy menu's Reconnect Bus (⌃⌘R) and Restart Core (⌃⇧⌘R), which it had been
+  missing, so the map lists every Proxy-menu item the Status cards twin.
 - **Sidebar brand row**: `›•‹ aitmproxy`, a label, not a button; no badge, no summary.
 - **Status bar**: no connection item (§3).
 - **Why the top and not the bottom** (Matt asked, on seeing the first screenshots, whether the
@@ -340,9 +348,9 @@ Embedded… (opens Settings ▸ Bus).
 | `ConnectionSummary`, `ConnectionLane`, `GettingStartedStep` + tests | `AitmproxyKit/ConnectionSummary.swift`, `Tests/…/ConnectionSummaryTests.swift` | mac-review session |
 | `StatusPanel` + its snapshot scenes (every lane state × light/dark) | `Panels/StatusPanel.swift`, `SnapshotScenes.swift`, `Snapshot.swift` | mac-review session |
 | `SidebarPage.status` + landing rule | `Session.swift` | mac-review session |
-| Sidebar groups + brand-row status entry | `Shell/SidebarView.swift` | mac-review session |
+| Sidebar groups; brand row a plain label (rev 2) | `Shell/SidebarView.swift` | mac-review session |
 | `Session+Connection.swift` (summary + action glue), `UI/ConnectionLook.swift` (LaneState look, `LaneDot`), `SelfTest.swift` checks, `tools/check-capture-operator-only.sh` allow-list, `tools/check-connection-words.sh`, `Panels/CoreLogPanel.swift`, `Panels/ScopePanel.swift` prompt | — | mac-review session |
-| Pill + status bar from the summary | `Shell/ShellToolbar.swift`, `Shell/StatusBar.swift`, `Shell/CoreHealthDot.swift` | mac-review session |
+| Connection cluster (pill + Proxy/Capture switches); status bar without connection state (rev 2) | `Shell/ShellToolbar.swift`, `Shell/StatusBar.swift`, `UI/TokenMapping.swift` (`switchKnobInset`), `UI/AppearanceSettings.swift` (shares `SwitchGlyph`), `Bus/BusService.swift` (`proxy.status` poll), `Session+Verbs.swift` (error prefix) | mac-review session |
 | Proxy ▸ Status (⌘0) + CommandMap entry | `App.swift`, `AitmproxyKit/CommandMap.swift` | mac-review session (wave 3 touches App.swift's Flow menu only — coordinate) |
 | `case .status` / `case .saved` in `MainView.content` | `Shell/ShellView.swift` | mac-review session (after #181 merged) |
 | Settings rows reading lane words | `SettingsView.swift` | mac-review session (after #181 merged) |
@@ -373,19 +381,24 @@ Embedded… (opens Settings ▸ Bus).
 7. **ST-AC7 [manual, real app]** On Matt's Mac with the notarized DMG: fresh launch lands on
    Status; the three cards read the real state (core running on the bound port, bus connected
    as operator, capture state per the extension); turning capture off and on from the card
-   changes Settings ▸ Capture and the sidebar glyph within one poll; adding a host from Open
+   changes Settings ▸ Capture and the toolbar's Capture switch within one poll; adding a host from Open
    Scope… ticks the step; the first flow ticks the last step and Recent fills.
 8. **ST-AC8 [manual]** A local unnotarized NE build shows the Capture card as `capture
    degraded` with the reason and the remedy "install the signed app"; nothing claims it works.
-9. **ST-AC9 [self-test]** The toolbar's Proxy switch flips `Session.capturing` through the same
-   entry as View ▸ Pause Proxy; the Capture switch's position follows the operator's choice and
-   its enabled state follows `captureControlsAvailable`/`captureBusy`/embedded; the pill is the
-   only route to Status besides ⌘0 and the palette (`isInSidebar` false).
+9. **ST-AC9 [self-test]** Flipping the toolbar's Proxy switch (`ToolbarSwitches.flipProxy`)
+   pauses and resumes through `Session.setCapturing`, the same entry as View ▸ Pause Proxy; the
+   Capture switch's position is the lane's fact (on for capturing / waiting / degraded, off for
+   inactive / not installed) with the in-flight choice overriding it, and its enabled state
+   follows `captureControlsAvailable`/`captureBusy`/embedded; the pill is the only route to
+   Status besides ⌘0 and the palette (`isInSidebar` false).
 10. **ST-AC10 [structural]** `check-connection-words.sh` fails if `Shell/SidebarView.swift` or
     `Shell/StatusBar.swift` mentions `connectionSummary`, `LaneDot`, `LaneState` or
     `ConnectionSummary`, or if any file outside the allow-list reads `connectionSummary`.
 11. **ST-AC11 [unit + self-test]** `ContentCategory.tcp/.udp/.l4` match the fixture L4 rows by
     protocol (the lo0 UDP capture and craft, the en0 TCP session); the chip narrows the list.
+12. **ST-AC12 [manual, open]** With VoiceOver or the Accessibility Inspector, the toolbar switches
+    read "Proxy, on" / "Capture, off" (label + value), not "toggle button". System Events cannot
+    show this for SwiftUI-rendered elements; verified so far: value, AXPress, help.
 
 ## Facts from the other sessions folded in (2026-10-31)
 
@@ -421,9 +434,18 @@ input on its toolbar:
   grey, the pill read `· paused`, ↓ fell to 0 B/s, and 4 GETs sent while paused recorded nothing
   (26 rows before and after). A second click: green again, 2 GETs → 28 rows, ↓ 368 B/s.
 - Finding, fixed: the first `ToolbarSwitch` was a plain `Button` with `.isToggle`; System Events
-  saw an untitled "toggle button" and its `click` did nothing. It is now a real `Toggle` under
-  `ToolbarSwitchStyle`, so VoiceOver gets a titled checkbox with an on/off value and AXPress flips
-  it.
+  saw a "toggle button" whose `click` did nothing. It is now a real `Toggle` under
+  `ToolbarSwitchStyle`: System Events reads its value (1/0), its `click` flips it (pill reads
+  "paused", value 0; click again, value 1) and its help carries the tooltip. The accessibility
+  label is set on the rendered element (`accessibilityElement(children: .ignore)` +
+  `accessibilityLabel`), the pattern every custom control here uses, but System Events exposes
+  no AXTitle/AXDescription for any SwiftUI-rendered element in this toolbar (the pill included),
+  so the spoken name is left to a VoiceOver / Accessibility Inspector check (ST-AC12 below).
+- Panel round 2's Important, proven fixed the same way: with the dev app showing `Proxy` on, a
+  second bus client (`tests/e2e/aitm_e2e` `BusClient`, operator token from the core's own
+  config) called `proxy.pause` → the core answered `capturing: false` and, with no click in the
+  app, the toolbar switch went grey and the pill read `· paused` within one poll; `proxy.resume`
+  from the same client turned it green again.
 - Live gaps the fixtures hide (not this PR's; routed): Time and Duration are `—` on every live row
   (`flow.get` carries no timing — orchestrator follow-up); Request is `0 B` on GETs (body bytes
   only; header bytes are a core follow-up); Client is `—` without the extension (expected until
@@ -481,3 +503,35 @@ use. … In the top where we filter by protocol we are still missing L4 type of 
 | R2-2 | Visible toggles for the extension and the proxy | FIXED — §4: `ToolbarSwitch` ×2 in the cluster, wired to the existing operator-only entries (`CaptureSwitch.set`, `Session.setCapturing`); tripwire allow-list widened with an `expect` |
 | R2-3 | Protocol chips miss L4 | FIXED — §4b: TCP / UDP / L4 chips, unit + self-test |
 | R2-4 | Vocabulary: "Capture" meant both the proxy's recording and the extension | FIXED — Proxy (pause/resume) vs Capture (the extension); GLOSSARY, menus, palette, command map, S-018 |
+
+Stage-6 panel round 2 (2026-10-31) on `591e1d0..9fe8b1d`: security FAIL (1 Important, 3 Minor),
+quality PASS (11 Minor), spec FAIL (5 Important, 4 Minor). Dispositions, applied in the follow-up
+commit on the branch:
+
+| # | Reviewer | Sev | Finding | Disposition |
+|---|---|---|---|---|
+| P2-1 | Security | Important | The Proxy switch — now the one home — showed `Session.capturing`, a client flag, not the core's published fact; a pause by another client left it green | FIXED — `BusService` polls `proxy.status.capturing` each pass and takes the pause/resume reply's value; §4 amended; proven live (pause from a second bus client flips the switch) |
+| P2-2 | Security | Minor | Lane/choice mismatch made the Capture switch a silent dead control | FIXED — `CaptureSwitch.set` reports the already-chosen state in the status bar; §4 amended |
+| P2-3 | Security | Minor | `check-connection-words.sh` passed silently on a missing guarded file; no `pipefail`; unanchored exclusions | FIXED — file-exists check, `pipefail` + `LC_ALL=C`, path-anchored exclusions, `grep -nH` |
+| P2-4 | Security | Minor | Proxy switch live on a connected-as-agent bus → pause logged as an agent action | FIXED — live only while the bus lane is `ok`; help says "connect as operator" |
+| P2-5 | Quality | Minor | `ToolbarSwitch` discarded the Toggle's value; two callers negated different things | FIXED — `action: (Bool) -> Void`; `flipProxy`/`flipCapture` in `ToolbarSwitches` |
+| P2-6 | Quality | Minor | Style carried an `enabled` flag `.disabled` already publishes | FIXED — `@Environment(\.isEnabled)` in the style |
+| P2-7 | Quality | Minor | Proxy knob position encoded bus liveness | FIXED — `on: session.capturing`, `enabled: live` |
+| P2-8 | Quality | Minor | Fourth spelling of "embedded core active" | FIXED for the app (`Session.embeddedCoreActive`); `CaptureSwitch` keeps its own read of the persisted kind on purpose — the tripwire pins that file as the one reader |
+| P2-9 | Quality | Minor | Dead Kit API (`overallWord`, `badge`, `LaneState.symbol`) and stale comments | FIXED — deleted; comments name the surfaces that exist |
+| P2-10 | Quality | Minor | `SwitchGlyph` hard-coded knob inset and colour; Appearance preview a fourth copy | FIXED — `Tok.Metric.switchKnobInset`; preview renders `SwitchGlyph`. The knob stays white in both appearances as the system switch draws it (the track is a status colour or grey, never the accent) — ACCEPTED with a comment |
+| P2-11 | Quality | Minor | ⌘1…9 order derived twice | FIXED — `ContentCategory.shortcutChips` is the one owner |
+| P2-12 | Quality | Minor | `.l4` matched `kind`, `tcp/udp` matched `l4?.proto` | FIXED — all three read `row.l4` |
+| P2-13 | Quality | Minor | ST-AC9 checks restated the helpers | FIXED — the self-test drives `flipProxy` and settles on `capturing`; position checks per capability |
+| P2-14 | Quality | Minor | Compound `#expect`s | FIXED — one fact per expectation |
+| P2-15 | Quality | Minor | Tripwire file prefix on the first hit only | FIXED — `grep -nH` |
+| P2-16 | Spec | Important | Proxy gate/colour deviated from §4 unamended | FIXED — §4 now states the shipped rule (bus lane `ok`, success tint) and why |
+| P2-17 | Spec | Important | ST-AC9 only partly asserted | FIXED — flip driven; `captureOn` per capability; `capturePosition` in-flight override pinned |
+| P2-18 | Spec | Important | Live proof claimed a VoiceOver result the range did not establish | FIXED — a11y label/value on the rendered element landed; claim softened to what System Events showed (value, AXPress, help); ST-AC12 added as an open manual check |
+| P2-19 | Spec | Important | "pause capture" survived in the status-bar error prefix | FIXED — `Session+Verbs` says "pause proxy / resume proxy" |
+| P2-20 | Spec | Important | Reconnect Bus / Restart Core command-map entries unrequested | ACCEPTED — §4 Words now asks for them (the map lists every Proxy item the Status cards twin) |
+| P2-21 | Spec | Minor | Stale spec text (status line, §1 API, §2 words, §6 rows, ST-AC7, ST-AC9 wording) | FIXED |
+| P2-22 | Spec | Minor | Undeclared files (comment ripples, gallery, `check-capture-toggle.sh`, and now `BusService`, `TokenMapping`, `AppearanceSettings`, `Session+Verbs`) | ACCEPTED — listed in §6 |
+| P2-23 | Spec | Minor | Unrequested non-functional additions (`AgentToggle` shares `SwitchGlyph`; `isSelected` traits on the pill and chips) | ACCEPTED — one glyph, one selection idiom |
+| P2-24 | Spec | Minor | S-001 / S-018 / CAPABILITIES still carried the old toolbar and words | FIXED |
+

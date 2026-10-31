@@ -371,6 +371,12 @@ enum CaptureSwitch {
     /// and cannot lock turning capture on out.
     static func set(_ on: Bool, session: Session) async {
         let health = session.coreHealth
+        // The toolbar switch shows the extension's state, Settings shows the choice; when the two
+        // disagree a click asks for what is already chosen. Say so instead of doing nothing.
+        if !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
+           on == (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false) {
+            session.lastError = "Capture is already \(on ? "on" : "off") in Settings ▸ Capture; the extension reports otherwise — turn it off and on again there"
+        }
         guard !health.captureBusy, health.extensionController != nil, embeddedCoreActive,
               on != (Store.defaults.object(forKey: "capture.enabled") as? Bool ?? false)
         else { return }
