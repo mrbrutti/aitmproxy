@@ -18,8 +18,8 @@ public enum LaneState: Int, Comparable, Sendable {
     public static func < (a: LaneState, b: LaneState) -> Bool { a.rawValue < b.rawValue }
 }
 
-/// One thing a surface may offer to change a lane. The view maps each to the same
-/// `Session`/`CaptureSwitch` entry its menu-bar item calls; the model only names it.
+/// One thing a surface may offer to change a lane. The view maps each to the same call
+/// its menu-bar item makes; the model only names it.
 public enum ConnectionAction: Hashable, Sendable {
     case startCore, stopCore, restartCore, showCoreLog, switchToEmbedded
     case reconnectBus, openBusSettings

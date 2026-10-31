@@ -22,16 +22,15 @@ extension Session {
         )
     }
 
-    /// Runs an action from a lane card or a Getting-started row. Settings-opening actions and
-    /// the capture switch are handled by the view (`StatusPanel`): they need `openSettings` from
-    /// the environment and `CaptureSwitch`'s operator-only steps; `perform` returns `false` for
-    /// those so the caller knows to take them.
+    /// Runs a navigation or copy action from a lane card or a Getting-started row. The
+    /// operator-only actions — the core restart, the capture switch, the extension uninstall and
+    /// the Settings openers — are handled by the view (`StatusPanel`), which is one of the few
+    /// surfaces the capture tripwire allows to reach them; `perform` returns `false` for those so
+    /// the caller knows to take them.
     @discardableResult
     func perform(connection action: ConnectionAction) -> Bool {
         switch action {
-        case .startCore, .restartCore:
-            restartCoreTick += 1
-        case .stopCore:
+        case .startCore, .restartCore, .stopCore:
             return false
         case .showCoreLog:
             coreLogVisible = true

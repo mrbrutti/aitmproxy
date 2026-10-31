@@ -68,7 +68,7 @@ enum SelfTest {
             check("the core lane says the fixture core is not running", summary.core.word == "not running" && summary.core.state == .off)
             check("the bus lane reads the fixture bus as connected", summary.bus.word == "connected" && summary.bus.state == .ok)
             check("the capture lane says this build has no extension", summary.capture.word == "no extension")
-            check("Status is a sidebar page without a flow list", SidebarPage.status.isInSidebar && !SidebarPage.status.showsFlows)
+            check("Status is reached from the brand row, the pill and ⌘0, not a list row", !SidebarPage.status.isInSidebar && !SidebarPage.status.showsFlows)
             check("Open Scope from Status shows the Scope page", { session.perform(connection: .openScope); return session.page == .scope }())
             check("Open Browser from Status shows the Browser page", { session.perform(connection: .openBrowser); return session.page == .browser }())
             check("Core Log from Status opens the core log", { session.perform(connection: .showCoreLog); return session.coreLogVisible }())

@@ -48,17 +48,27 @@ struct StatusBar: View {
                 if session.memoryBytes > 0 { Text(Format.bytes(session.memoryBytes)) }
                 Text("↑ \(Format.rate(session.upBytesPerSecond))")
                 Text("↓ \(Format.rate(session.downBytesPerSecond))")
-                // The three connection lanes, worded by the same table as the Status page; each
-                // opens it. A role mismatch is the bus lane's warning, not a fourth item.
-                ForEach(session.connectionSummary.lanes, id: \.kind) { lane in
-                    Button { session.show(.status) } label: {
-                        LaneDot(lane: lane)
-                            .foregroundStyle(lane.state == .ok || lane.state == .off ? Tok.Ink.secondary.color : lane.state.color.color)
-                            .contentShape(Rectangle())
+                // One connection item, from the same table as the Status page: the worst lane's
+                // name and word while something needs attention, a single "connected" dot when all
+                // is well. The sidebar's brand row and the Status page carry the rest; the bar
+                // never repeats them (rule 64: small facts only, down here).
+                let summary = session.connectionSummary
+                let worst = summary.worst
+                Button { session.show(.status) } label: {
+                    HStack(spacing: Tok.Metric.gapTight) {
+                        Circle().fill(worst.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+                        // "capture off" already names its lane; "failed" needs "core: failed".
+                        Text(summary.overall == .ok ? "connected"
+                             : worst.word.hasPrefix(worst.kind.title.lowercased()) ? worst.word
+                             : "\(worst.kind.title.lowercased()): \(worst.word)")
+                            .lineLimit(1)
                     }
-                    .buttonStyle(.plain)
-                    .help([lane.kind.title.capitalized + ": " + lane.word, lane.detail, lane.remedy].compactMap { $0 }.joined(separator: "\n"))
+                    .foregroundStyle(summary.overall == .ok ? Tok.Ink.secondary.color : worst.state.color.color)
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .help(summary.lanes.map { "\($0.kind.title): \($0.word) — \($0.detail)" }.joined(separator: "\n") + "\nOpens Status (⌘0)")
+                .accessibilityLabel("Connection: core \(summary.core.word), bus \(summary.bus.word), capture \(summary.capture.word)")
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))
         }

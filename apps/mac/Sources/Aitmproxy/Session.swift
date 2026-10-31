@@ -6,13 +6,14 @@ import Observation
 
 /// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
 enum SidebarPage: String, CaseIterable, Identifiable {
-    case status, pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
+    case status, flows, pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .status: "Status"
+        case .flows: "Flows"
         case .pinned: "Pinned"
         case .saved: "Saved"
         case .apps: "Apps"
@@ -33,6 +34,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
     var symbol: String {
         switch self {
         case .status: "waveform.path.ecg"
+        case .flows: "list.bullet"
         case .pinned: Tok.Glyph.pin
         case .saved: "tray.full"
         case .apps: "app.badge"
@@ -53,13 +55,19 @@ enum SidebarPage: String, CaseIterable, Identifiable {
     /// Pages that show the flow list (the rest open their own panel).
     var showsFlows: Bool {
         switch self {
-        case .pinned, .saved, .apps, .domains, .scope, .connections: true
+        case .flows, .pinned, .saved, .apps, .domains, .scope, .connections: true
         case .status, .overview, .scan, .findings, .browser, .scripts, .agent, .ca, .config: false
         }
     }
 
-    /// CA and Configuration open from the Proxy menu and the palette, not the sidebar list.
-    var isInSidebar: Bool { self != .ca && self != .config }
+    /// CA and Configuration open from the Proxy menu and the palette; Status from the brand row,
+    /// the pill, the status bar and ⌘0; Saved waits for the core to save (S-066). None are list rows.
+    var isInSidebar: Bool {
+        switch self {
+        case .ca, .config, .status, .saved: false
+        default: true
+        }
+    }
 }
 
 /// Where the inspector sits (Proxyman's layouts): below, right, or in its own window.
@@ -169,13 +177,15 @@ final class Session {
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
     /// The landing page: the page the operator last used, or Status on a fresh install (nothing
-    /// to show yet, so show what is running and what to do first). Fixture, snapshot and
-    /// self-test runs start on Apps as before so their scenes stay deterministic.
+    /// to show yet, so show what is running and what to do first). Only list pages are
+    /// remembered, so a session that ends on Status or Saved comes back on Flows. Fixture,
+    /// snapshot and self-test runs start on Apps as before so their scenes stay deterministic.
     var page: SidebarPage? = Store.isOverridden
         ? .apps
         : (SidebarPage(rawValue: UserDefaults.standard.string(forKey: "page") ?? "") ?? .status) {
         didSet {
-            if !Store.isOverridden, let page, page.isInSidebar { UserDefaults.standard.set(page.rawValue, forKey: "page") }
+            guard !Store.isOverridden, let page else { return }
+            UserDefaults.standard.set((page.isInSidebar ? page : .flows).rawValue, forKey: "page")
         }
     }
     var chip: ContentCategory = .all

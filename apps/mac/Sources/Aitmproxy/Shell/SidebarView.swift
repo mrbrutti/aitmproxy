@@ -24,27 +24,9 @@ struct SidebarView: View {
             Rule()
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    // The first row answers "is it working, and what do I do next" (rule 56): the
-                    // worst connection lane's glyph and word, from the same table as the Status page.
-                    group("Proxy")
-                    statusItem()
-                    group("Working")
-                    item(.pinned, count: session.pins.hosts.count + session.pins.apps.count)
-                    ForEach(session.pins.hosts.filter(matches), id: \.self) { host in
-                        subItem(.host(host), title: host, monogram: "◎", count: session.hosts.first { $0.0 == host }?.1, page: .pinned)
-                    }
-                    ForEach(session.pins.apps.filter(matches), id: \.self) { app in
-                        subItem(.client(app), title: app, monogram: String(app.prefix(1)),
-                                count: session.clients.first { $0.0.name == app }?.1, page: .pinned)
-                    }
-                    if session.page == .pinned, session.pins.isEmpty {
-                        hint("Nothing pinned — press ⇧P on a row.")
-                    }
-                    item(.saved, count: session.savedSessions)
-
-                    group("All")
-                    item(.overview)
-                    item(.connections)
+                    // Groups by the operator's jobs (spec §3): the main work window first.
+                    group("Traffic")
+                    item(.flows, count: session.rows.count)
                     item(.apps, count: session.clients.count)
                     if session.page == .apps || querying {
                         let visible = session.clients.filter { matches($0.0.name) }
@@ -62,13 +44,28 @@ struct SidebarView: View {
                             subItem(.host(host), title: host, monogram: "◎", count: count, page: .domains)
                         }
                     }
+                    item(.pinned, count: session.pins.hosts.count + session.pins.apps.count)
+                    ForEach(session.pins.hosts.filter(matches), id: \.self) { host in
+                        subItem(.host(host), title: host, monogram: "◎", count: session.hosts.first { $0.0 == host }?.1, page: .pinned)
+                    }
+                    ForEach(session.pins.apps.filter(matches), id: \.self) { app in
+                        subItem(.client(app), title: app, monogram: String(app.prefix(1)),
+                                count: session.clients.first { $0.0.name == app }?.1, page: .pinned)
+                    }
+                    if session.page == .pinned, session.pins.isEmpty {
+                        hint("Nothing pinned — press ⇧P on a row.")
+                    }
+                    item(.connections)
+                    item(.overview)
 
-                    group("aitmproxy")
+                    group("Testing")
                     item(.scope, count: session.scopeHosts.count, queue: true)
                     // Offered only when the core lists scan.discover; the count is the injection points found.
                     if session.scanEnabled { item(.scan, count: session.scan.points.count, queue: true) }
                     item(.findings, count: session.findingsCount, queue: true)
                     item(.browser, text: session.browserTabs == 1 ? "1 tab" : "\(session.browserTabs) tabs")
+
+                    group("Automation")
                     item(.scripts, text: "\(session.activeScripts) active")
                     item(.agent, text: "\(session.agentActionsLastMinute)/min", agent: true)
                 }
@@ -81,16 +78,37 @@ struct SidebarView: View {
         .dimsWhenInactive()
     }
 
-    /// `›•‹ aitmproxy  0.1` — the product mark in the accent, the wordmark in the UI face.
+    /// `›•‹ aitmproxy  ● ok` — the product mark and wordmark, and the one place in the sidebar
+    /// that says whether the proxy is working: the worst connection lane's glyph and name when
+    /// something needs attention ("⚠ Capture", "✕ Core"), "ok" otherwise. Clicking opens the
+    /// Status page (also ⌘0, the toolbar pill and the status bar's connection item).
     private var brand: some View {
-        HStack(spacing: Space.sm) {
-            ProductMark().frame(width: 16, height: 16)
-            Text("aitmproxy").font(Tok.Face.ui(Tok.Typography.Size.md, .medium)).foregroundStyle(Tok.Ink.primary.color)
-            Spacer()
-            Text(session.version).font(Tok.Face.data(Tok.Typography.Size.xs)).foregroundStyle(Tok.Ink.tertiary.color)
+        let summary = session.connectionSummary
+        let worst = summary.worst
+        let selected = session.page == .status
+        return Button {
+            session.show(.status)
+        } label: {
+            HStack(spacing: Space.sm) {
+                ProductMark().frame(width: 16, height: 16)
+                Text("aitmproxy").font(Tok.Face.ui(Tok.Typography.Size.md, .medium)).foregroundStyle(Tok.Ink.primary.color)
+                Spacer(minLength: Space.xs)
+                HStack(spacing: Tok.Metric.gapTight) {
+                    Image(systemName: worst.state.symbol).font(.system(size: Tok.Size.iconInline))
+                    Text(summary.overall == .ok ? "ok" : worst.kind.title).lineLimit(1)
+                }
+                .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                .foregroundStyle(summary.overall == .ok ? Tok.Ink.tertiary.color : worst.state.color.color)
+            }
+            .padding(.horizontal, Space.lg)
+            .frame(height: Tok.Size.toolbar)
+            .background(selected ? Tok.Ground.active.color : .clear)
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, Space.lg)
-        .frame(height: Tok.Size.toolbar)
+        .buttonStyle(.plain)
+        .help("Status: core \(summary.core.word) · bus \(summary.bus.word) · capture \(summary.capture.word) (⌘0)")
+        .accessibilityLabel("Status, \(summary.overall == .ok ? "ok" : worst.kind.title + " " + worst.word)")
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     /// Editorial section labels: small, tracked capitals in the tertiary tier.
@@ -139,41 +157,6 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    /// The Status row: its chip is the worst lane's glyph + word, in that lane's colour.
-    private func statusItem() -> some View {
-        let selected = session.page == .status
-        let summary = session.connectionSummary
-        let worst = summary.worst
-        return Button {
-            session.show(.status)
-        } label: {
-            HStack(spacing: Space.sm) {
-                Image(systemName: SidebarPage.status.symbol)
-                    .font(.system(size: 12, weight: .regular))
-                    .foregroundStyle(Tok.Ink.secondary.color)
-                    .frame(width: 16)
-                Text(SidebarPage.status.title)
-                    .font(Tok.Face.ui(Tok.Typography.Size.md, selected ? .medium : .regular))
-                    .foregroundStyle(Tok.Ink.primary.color)
-                Spacer(minLength: Space.xs)
-                HStack(spacing: Tok.Metric.gapTight) {
-                    Image(systemName: worst.state.symbol).font(.system(size: Tok.Size.iconInline))
-                    Text(summary.overall == .ok ? "ok" : worst.word).lineLimit(1)
-                }
-                .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(worst.state.color.color)
-            }
-            .padding(.horizontal, Space.sm)
-            .frame(height: Tok.Size.control)
-            .background(selected ? Tok.Ground.active.color : .clear, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(summary.lanes.map { "\($0.kind.title): \($0.word)" }.joined(separator: " · "))
-        .accessibilityLabel("Status, \(worst.kind.title) \(worst.word)")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 

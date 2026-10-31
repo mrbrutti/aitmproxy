@@ -193,16 +193,54 @@ Surface (ux-design table): a sidebar page — a place the operator comes back to
 - Keyboard: Proxy ▸ Status (⌘0) opens it; every card action is also a Proxy-menu item (Restart
   Core, Reconnect Bus, Enable/Disable Capture, Scope…, Core Log…, Browser) — all exist today.
 
-### 3. Landing page and sidebar
+### 3. Sidebar information architecture and landing page (revised after Matt's review)
 
-- `SidebarPage.status` is the first row, in its own group **Proxy** above Working (noun, rule
-  59); its trailing chip is the overall state glyph + word (`● running`, `◐ scope empty`,
-  `✕ core failed`) in the lane's status colour, so the sidebar itself says when something is
-  wrong (rule 56). No count.
-- Landing (`Session.init`): the restored last page when the session had flows last time
-  (`@SceneStorage("page")`); otherwise `.status`. A fresh install lands on Status; an operator
-  mid-test lands where they left off. Apps stops being the default. **(Architect's call.)**
-- The Apps and Domains rows keep their counts; the Status row never shows a count.
+Matt's reading of the first cut: "the sidebars … are completely in a weird order or
+priorities — what is the main work window, what are other things; now you have a Proxy
+sidebar item and you also show the status in the bottom." The groups below are organised by
+the operator's **jobs** (brief: watch/inspect, intercept, test, supervise), the main work
+window comes first, and the connection state has **one** home.
+
+```text
+ ›•‹ aitmproxy  ● ok            ← the brand row IS the status entry: worst lane glyph + lane
+                                    name when something needs attention ("⚠ Capture",
+                                    "✕ Core"); click → Status page. No separate group/row.
+ TRAFFIC                        ← the main work window: the flow list + inspector
+   Flows                  104   all flows (the default page once connected)
+   Apps                     0   flows grouped by source app (sub-rows per app)
+   Domains                  3   flows grouped by host (sub-rows per host)
+   Pinned                   2   the operator's working set (sub-rows)
+   Connections                  the waterfall/dashboard view of the same flows
+   Overview                     the statistics view of the same flows
+ TESTING                        ← the security work on that traffic
+   Scope                    1
+   Scan                     6
+   Findings                 3
+   Browser              1 tab
+ AUTOMATION                     ← what acts on the operator's behalf
+   Scripts             1 active
+   Agent                14/min
+```
+
+- **Saved** leaves the sidebar until saving exists (S-066): a dead row at the top of the list
+  was the first thing a new operator saw. It returns under Traffic when the core can save.
+- **Status** is reached from the brand row, the toolbar pill, the status bar's one connection
+  item, Proxy ▸ Status (⌘0), and the palette. It is not a sidebar list row: it is the place the
+  app sends you when something is wrong, not a place in the work hierarchy (rule 59).
+- **Status bar** shows counts, throughput and ONE connection item: the worst lane's glyph +
+  lane name + word when a lane needs attention (`⚠ capture: on, nothing in scope`), or a single
+  `● connected` when all is well. Click → Status. The three-lane strip is gone; the bar never
+  duplicates the sidebar.
+- **Toolbar pill** stays the core/proxy address; its bus and capture dots show only when those
+  lanes need attention (as built).
+- **Landing**: a fresh install lands on **Status**; afterwards the last page is restored, and
+  the default for an operator who never navigated is **Flows**. Apps is no longer the default
+  (its empty state was the second thing a new operator saw).
+- Counts: Flows/Apps/Domains/Pinned show their flow counts; Scope/Scan/Findings show queue
+  counts in the raised chip; Browser/Scripts/Agent keep their words.
+
+`SidebarPage` gains `.flows` (all flows, no group) and the `.status` case stays for routing
+and the menu; `.saved` stays in the enum (routing to `SavedPanel`) but `isInSidebar` is false.
 
 ### 4. Toolbar pill and status bar read the same model
 
