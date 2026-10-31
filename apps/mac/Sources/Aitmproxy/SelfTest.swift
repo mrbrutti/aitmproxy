@@ -103,6 +103,15 @@ enum SelfTest {
             session.unpin(.host("cdn.shop-staging.test"))
             check("unpinning removes the host", !session.pins.hosts.contains("cdn.shop-staging.test"))
 
+            // SP-AC10: a Scope action on the fixture session must leave no scope.json behind —
+            // fixture mode never writes the operator's store.
+            session.addScope("persist-probe.test")
+            await settle { session.scopeHosts.contains("persist-probe.test") }
+            check("fixture mode never persists scope (no scope.json under Store.url)",
+                  !FileManager.default.fileExists(atPath: session.scopeURL.path) && EmbeddedScope.load(from: session.scopeURL).hosts.isEmpty)
+            session.removeScope("persist-probe.test")
+            await settle { !session.scopeHosts.contains("persist-probe.test") }
+
             // S-015: Auto-select follows the newest flow, except from a paused row.
             session.autoSelect = true
             session.select(session.rows[0].id)

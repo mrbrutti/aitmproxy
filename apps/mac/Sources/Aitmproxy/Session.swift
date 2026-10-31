@@ -263,6 +263,8 @@ final class Session {
         didSet { if pins != oldValue { try? pins.save(to: pinsURL) } }
     }
     var pinsURL: URL { Store.url.appending(path: "pins.json") }
+    /// The embedded core's persisted operator scope (`scope.json`, beside `pins.json`).
+    var scopeURL: URL { EmbeddedScope.url(in: Store.url) }
     var savedSessions = 0
     var memoryBytes: Int64 = 0
     var upBytesPerSecond: Int64 = 0
@@ -286,6 +288,13 @@ final class Session {
 
     init() {
         if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
+        // The Scope page shows the embedded core's persisted scope before the bus
+        // connects; `refreshScope()` replaces it with the core's `scope.list` on connect (D5).
+        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence().load() ?? .embedded,
+                                       bundledCorePresent: EmbeddedCore.discoverBundled() != nil,
+                                       usesFixtures: Store.usesFixtures) {
+            scopeHosts = EmbeddedScope.load(from: scopeURL).hosts
+        }
         composeHistory = ComposeHistory.load(from: composeURL)
         if !Store.usesFixtures { breakpointRules = BreakpointRules.load(from: rulesURL) }
         loadSavedFilters()

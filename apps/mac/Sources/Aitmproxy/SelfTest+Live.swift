@@ -28,10 +28,15 @@ extension SelfTest {
             check("tools/list has flow.intercept, flow.list, flow.get, request.send, scope.add",
                   ["flow.intercept", "flow.list", "flow.get", "request.send", "scope.add"].allSatisfy(names.contains))
 
+            // SP-AC9: connecting re-pushes nothing — no scope.add may precede the self-test's
+            // own first Scope action.
+            check("connecting issues no scope.add", !session.activity.visible.contains { $0.origin == .operator && $0.command == "scope.add" })
             // scope.add through the actions seam; scope.list refreshes.
             session.addScope(upstream)
             await settle { session.scopeHosts.contains(upstream) }
             check("scope.add lands in scope.list", session.scopeHosts.contains(upstream), "scope \(session.scopeHosts) err \(session.lastError ?? "-")")
+            // SP-AC8(b): this is an external core (AITM_CONFIG), so scope.json is never written.
+            check("an external core never writes scope.json", !FileManager.default.fileExists(atPath: session.scopeURL.path))
 
             // flow.intercept both ways: the call that recursed in b7d3163.
             session.arm(true)

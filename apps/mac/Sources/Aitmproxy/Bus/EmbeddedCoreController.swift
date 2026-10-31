@@ -40,7 +40,7 @@ final class EmbeddedCoreController {
         guard let binaries = EmbeddedCore.discoverBundled() else { return nil }
         self.bus = bus
         self.health = health
-        self.core = EmbeddedCore(binaries: binaries)
+        self.core = EmbeddedCore(binaries: binaries, scopeURL: EmbeddedScope.url(in: Store.url))
         self.connection = CoreConnection(
             id: coreID,
             kind: .embedded,

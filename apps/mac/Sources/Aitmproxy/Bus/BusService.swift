@@ -167,11 +167,26 @@ final class BusService: FlowActions {
         }
     }
 
-    private func refreshScope() async {
-        guard let client else { return }
-        if let entries = try? await client.call("scope.list").arrayValue?.compactMap(\.stringValue) {
-            session.scopeHosts = entries
-        }
+    /// Re-reads the core's `scope.list` into `session.scopeHosts`. True iff the call
+    /// succeeded and the list was assigned, so a caller never persists a stale list
+    /// after a verb whose follow-up refresh failed (SP-AC19).
+    @discardableResult
+    private func refreshScope() async -> Bool {
+        guard let client else { return false }
+        guard let entries = try? await client.call("scope.list").arrayValue?.compactMap(\.stringValue) else { return false }
+        session.scopeHosts = entries
+        return true
+    }
+
+    /// The only writer of `scope.json` (D4). Snapshot semantics: the file is the embedded
+    /// core's `scope.list` as of the operator's last Scope action — written from
+    /// `addScope`/`removeScope` only after the verb and the refresh both succeeded; never
+    /// on connect or poll, never while the client points at an external core, never in
+    /// fixture/snapshot/self-test runs. A failed save is swallowed like `Pins`: the
+    /// in-memory scope stays right for this run.
+    private func persistEmbeddedScope() {
+        guard preferEmbedded, !Store.usesFixtures else { return }
+        try? EmbeddedScope(hosts: session.scopeHosts).save(to: session.scopeURL)
     }
 
     // MARK: FlowActions
@@ -235,12 +250,12 @@ final class BusService: FlowActions {
 
     func addScope(_ host: String) async throws {
         _ = try await call("scope.add", ["host": .string(host)])
-        await refreshScope()
+        if await refreshScope() { persistEmbeddedScope() }
     }
 
     func removeScope(_ host: String) async throws {
         _ = try await call("scope.remove", ["host": .string(host)])
-        await refreshScope()
+        if await refreshScope() { persistEmbeddedScope() }
     }
 
     func mark(_ id: FlowID, color: MarkColor?) async throws {
