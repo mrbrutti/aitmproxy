@@ -73,8 +73,9 @@ import Testing
         #expect(config.token != config.operatorToken)
         #expect(yaml.contains("operator_token: \"\(config.operatorToken)\""))
         #expect(yaml.contains("token: \"\(config.token)\""))        // agent token still present
-        // Startup stays deny-by-default: no `scope:` block is emitted, so the core
-        // comes up with empty scope and only a present operator may widen it.
+        // Startup stays deny-by-default: no `scope:` block is emitted — none for the default,
+        // empty scope (a persisted operator scope is the only thing that adds one) — and
+        // `allow_agent_widen` is never emitted, so only a present operator may widen scope.
         #expect(!yaml.contains("scope:"))
         #expect(!yaml.contains("allow_agent_widen"))
     }
@@ -276,6 +277,127 @@ import Testing
         // always enough and SIGKILL never orphans obscura mid-teardown (S1 / AC7).
         let coreBudget = EmbeddedCoreLaunch.obscuraStopTimeoutSeconds + 1
         #expect(EmbeddedCoreLaunch.childStopGraceSeconds > coreBudget)
+    }
+
+    // MARK: Scope block (SP-AC4 … SP-AC7, SP-AC16, SP-AC17)
+
+    private func config(scopeHosts: [String]) -> EmbeddedCoreLaunch.Config {
+        EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            scopeHosts: scopeHosts
+        )
+    }
+
+    @Test func scope_block_is_byte_identical_to_the_core_parse_input() throws {
+        // The core's `tests/config_file.rs` `scope_entries_block_round_trips` test parses exactly
+        // this text into three scope entries. The emitted block must be that text byte-for-byte:
+        // a top-level `scope:` at column 0 (sibling of `listen`/`mcp`/`browser`, since
+        // `deny_unknown_fields` rejects any wrapper), `  entries:` directly under it, then one
+        // double-quoted `- "<host>"` line per host indented four, in array order,
+        // newline-terminated — so what the app writes is what the core is proven to accept (SP-AC4).
+        let yaml = try config(scopeHosts: ["api.example.test", "*.shop.test", "localhost:8099"]).yaml()
+        #expect(yaml.hasSuffix("scope:\n  entries:\n    - \"api.example.test\"\n    - \"*.shop.test\"\n    - \"localhost:8099\"\n"))
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "scope:" }.count == 1)
+        let key = try #require(lines.firstIndex(of: "scope:"))
+        #expect(Array(lines.dropFirst(key + 1).prefix(4)) == [
+            "  entries:",
+            "    - \"api.example.test\"",
+            "    - \"*.shop.test\"",
+            "    - \"localhost:8099\"",
+        ])
+    }
+
+    @Test func scope_block_defaults_to_nothing() throws {
+        // A Config built without `scopeHosts:` — every pre-existing call site — carries an empty
+        // scope and emits no `scope` text of any kind, so the core keeps its deny-by-default
+        // empty startup scope (SP-AC6).
+        let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        #expect(config.scopeHosts == [])
+        let yaml = try config.yaml()
+        #expect(!yaml.contains("scope:"))
+        #expect(!yaml.contains("entries"))
+    }
+
+    @Test func scope_block_never_emits_allow_agent_widen() throws {
+        // Widening stays operator-only: restoring the operator's scope must never turn into
+        // letting agents widen it, whether or not a scope is restored (SP-AC5).
+        let defaultYAML = try sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint")).yaml()
+        let scopedYAML = try config(scopeHosts: ["api.example.test", "*.shop.test", "localhost:8099"]).yaml()
+        #expect(!defaultYAML.contains("allow_agent_widen"))
+        #expect(!scopedYAML.contains("allow_agent_widen"))
+    }
+
+    @Test func scope_block_escapes_quotes_and_backslashes() throws {
+        // A quote or a backslash in a host is backslash-escaped the way paths are, so it cannot
+        // break out of its double-quoted scalar: one backslash before the quote, two for the
+        // backslash (SP-AC17).
+        let yaml = try config(scopeHosts: [#"a"b.test"#, #"c\d.test"#]).yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.contains(#"    - "a\"b.test""#))
+        #expect(lines.contains(#"    - "c\\d.test""#))
+    }
+
+    @Test func scope_block_rejects_a_host_with_a_newline() {
+        // A newline cannot live inside a one-line double-quoted scalar; rather than let a crafted
+        // host inject YAML into the token-bearing config, rendering throws and names the host
+        // (SP-AC16).
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\nlisten: 0.0.0.0:1")) {
+            try config(scopeHosts: ["ok.test", "evil.test\nlisten: 0.0.0.0:1"]).yaml()
+        }
+        #expect(throws: (any Error).self) { try config(scopeHosts: ["evil.test\rx"]).yaml() }
+    }
+
+    @Test func scope_block_follows_the_ssl_and_capture_tails() throws {
+        // All three tails at once: each top-level key appears exactly once, at column 0, and the
+        // scope block comes last — so every byte-exact `hasSuffix` on a scope-less config still
+        // holds (SP-AC4).
+        let all = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true, scopeHosts: ["api.example.test"]
+        )
+        let lines = try all.yaml().split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "ssl_insecure: true" }.count == 1)
+        #expect(lines.filter { $0 == "macos_capture:" }.count == 1)
+        #expect(lines.filter { $0 == "scope:" }.count == 1)
+        let ssl = try #require(lines.firstIndex(of: "ssl_insecure: true"))
+        let capture = try #require(lines.firstIndex(of: "macos_capture:"))
+        let scope = try #require(lines.firstIndex(of: "scope:"))
+        #expect(ssl < capture)
+        #expect(capture < scope)
+        // Scope-less configs are unchanged.
+        #expect(try config(captureEnabled: true).yaml().hasSuffix("macos_capture:\n  enabled: true\n"))
+    }
+
+    @Test func scope_block_text_is_what_the_core_round_trip_test_parses() throws {
+        // `scope_block_is_byte_identical_to_the_core_parse_input` compares against a literal copied
+        // from the core's test. Pin the copy to its source: the Rust test must still spell this
+        // exact text and the round-trip test the spec cites (SP-AC7) must still exist. This file
+        // lives at apps/mac/Tests/AitmproxyKitTests/, so the repo root is five levels up.
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let source = root.appending(path: "crates/aitm/tests/config_file.rs")
+        try #require(
+            FileManager.default.fileExists(atPath: source.path),
+            "cannot find the core's tests/config_file.rs at \(source.path)")
+        let rust = try String(contentsOf: source, encoding: .utf8)
+
+        let block = "scope:\n  entries:\n    - \"api.example.test\"\n    - \"*.shop.test\"\n    - \"localhost:8099\"\n"
+        #expect(try config(scopeHosts: ["api.example.test", "*.shop.test", "localhost:8099"]).yaml().hasSuffix(block))
+        // Rust spells the same text as one plain string literal with `\"` and `\n` escapes.
+        let rustLiteral = "\"" + block
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n") + "\""
+        #expect(rust.contains(rustLiteral), "tests/config_file.rs no longer contains the literal \(rustLiteral)")
+        #expect(rust.contains("fn scope_entries_block_round_trips"),
+                "the core's scope_entries_block_round_trips test is gone")
     }
 
     // MARK: Config path escaping (S3)
