@@ -21,4 +21,4 @@ requests       600 sent · 600 ok · 0 failed · 0 skipped (window includes a 10
 flow.detail    1.02 per new flow (spec R3 threshold 2.5)
 
 flow.list now: 1100 ids · 42901 bytes (result JSON) · 92514 bytes (reply frame)
-json: /Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_442560dc-64f0-46e9-b1dc-1eebb93b3f88/after.json
+json: $TMPDIR/after.json

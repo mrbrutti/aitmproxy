@@ -3,11 +3,11 @@
 **Spec:** `docs/superpowers/specs/2026-10-30-web-ui-bus-push-design.md` (D9, AC25)
 **Plan:** `docs/superpowers/plans/2026-10-30-web-ui-bus-push-plan.md` (Task 0 is the instrument, Task 7 fills this note)
 **Instrument:** `apps/web/scripts/bus-load.mjs` (`--help` for the flags; `--selftest` for the pure counters; `--seed N` to fill the store)
-**Status:** measured 2026-10-30 (one run per variant; see the caveats under Reading the result).
+**Status:** measured 2026-10-30 at two commits (see Results); the headline is the final head's.
 
 ## Headline
 
-Under 20 req/s of live traffic the UI's `flow.list` rate falls from **1.97/s to 0.13/s** (about 93% fewer, bar was at most 0.3/s) because it now subscribes over `/bus` and learns of new flows by push; `flow.detail` stays at about one call per new flow (1.00 before, 1.02 after); idle is NOT reduced, by design (the poll runs every 500 ms until a push proves the stream alive; 2.50 calls/s before, 2.17 after in single 30 s runs, a difference this note does not attribute to anything). In a real browser a flow captured into an already-open page was visible 172 ms later, with no reload.
+Under 20 req/s of live traffic the UI's `flow.list` rate falls from **1.97/s to 0.10/s** (about 95% fewer; the bar was at most 0.3/s) because it now subscribes over `/bus` and learns of new flows by push; `flow.detail` stays at about one call per new flow (1.00 before, 1.07 after); idle is NOT reduced, by design (the poll runs every 500 ms until a push proves the stream alive: 2.50 calls/s before, 2.17 and 1.93 after). In a real browser a flow captured into an already-open page was visible 172 ms later with no reload, and after about 20 minutes of continuous polling and traffic the Activity log held one row.
 
 ## Method
 
@@ -40,9 +40,8 @@ Two windows per binary, both with the page open in a real browser:
 
 A run is reported as unusable (exit code 3; `valid: false` and the reasons in `warnings` in the
 JSON; the tables still print) when a window received no audit line with the UI's origin (page not
-open, not on this server, or a wrong `--ui-origin`), when no request got through the proxy, or
-when the script's own subscription reported `lagged` during a window (dropped lines make the
-counts a floor). A run with only advisory warnings (some requests failed) stays valid and lists
+open, not on this server, or a wrong `--ui-origin`), when no request got through the proxy, when the script's own subscription reported `lagged` during a window (dropped lines make the
+counts a floor), or when both windows were skipped (nothing was measured). A run with only advisory warnings (some requests failed) stays valid and lists
 them. The bus URL is printed and saved without userinfo, query and fragment.
 
 Window bounds are the script's clock; audit lines are stamped by the server at record time and
@@ -103,70 +102,77 @@ exit codes).
 ## Results
 
 Rates are UI calls per second by command (origin `mcp`, i.e. the page opened at `aitm web`'s default
-agent URL), counted from the audit lines the measuring script's own subscription received. Runs:
-`aitm-before` = the UI at `e887ad1` (PR #137's server, no UI subscribe); `aitm-after` = this branch
-at `33e3600` (the push/poll/Activity production code at that commit; review-round-1 fixes landed afterwards and are covered by the unit suites and a re-run of the e2e web suite, not by a second measurement). Real browser: headless Chrome 1248 (`chrome-headless-shell`) holding the page open,
-`aitm web` on loopback, 20 req/s for 30 s through the proxy to a loopback origin; the store held
-about 600 flows (before) and 500 (after) when each traffic window began. Raw output is committed next to this note in
-`web-ui-bus-push-measurement-data/` (`before.txt` / `after.txt` and their `--json`).
+agent URL), counted from the audit lines the measuring script's own subscription received. Three
+runs, all on one machine with debug builds, a real browser (headless Chrome 1248,
+`chrome-headless-shell`) holding the page open, `aitm web` on loopback, and 20 req/s for 30 s through
+the proxy to a loopback origin:
 
-### Before (`aitm-before`)
+- **before**: `aitm-before`, the UI at `e887ad1` (PR #137's server, no UI subscribe).
+- **after (33e3600)**: the first complete implementation, measured before the review rounds.
+- **final**: `aitm-final`, built at branch head `4e28994`; its push/poll/Activity production code is
+  that of `804d3e5` (later commits are docs and tests). This is the number to quote.
 
-| command | idle calls/s | traffic calls/s |
-|---|---|---|
-| `flow.list` | 2.00 | 1.97 |
-| `proxy.status` | 0.50 | 0.48 |
-| `flow.detail` | 0.00 | 19.34 |
-| **total** | **2.50** (75 calls / 30.0 s) | **21.79** (676 calls / 31.0 s) |
+Raw output, `--json` and screenshots are committed next to this note in
+`web-ui-bus-push-measurement-data/` (the JSON of `before` and `after` predates the `valid` and
+`warnings` fields the script gained in review round 1; the `$TMPDIR` in the `json:` lines replaces the
+session path the runs wrote to).
 
-- `flow.list` after traffic: 1200 ids, 46801 bytes (result JSON), 100914 bytes (reply frame)
-- Subscriber notifications/s (idle / traffic): flow 0.00 / 77.36 · agent 2.50 / 21.79 · state 0.00 / 0.00
-- Requests: 600 sent / 600 ok / 0 failed; `flow.detail` per new flow: 1.00
-- Subscription lagged during a window: no
+| command | before idle | before traffic | after (33e3600) idle | after traffic | **final idle** | **final traffic** |
+|---|---|---|---|---|---|---|
+| `flow.list` | 2.00 | 1.97 | 1.67 | 0.13 | **1.67** (second sample 1.43) | **0.10** |
+| `proxy.status` | 0.50 | 0.48 | 0.50 | 0.48 | **0.50** (0.50) | **0.52** |
+| `flow.detail` | 0.00 | 19.34 | 0.00 | 19.75 | **0.00** | **20.62** |
+| **total** | **2.50** | **21.79** | **2.17** | **20.37** | **2.17** (1.93) | **21.24** |
 
-### After (`aitm-after`)
+- Calls counted: before 75 / 676, after (33e3600) 65 / 632, final 65 / 659 (and 58 for the second idle
+  sample), over 30.0 s idle and 31.0 s traffic windows.
+- `flow.detail` per new flow: before 1.00, after (33e3600) 1.02, **final 1.07** (spec R3 threshold 2.5:
+  not reached, `PUSH_COALESCE_MS` stays 100).
+- `flow.list` after traffic: before 1200 ids, 46801 bytes (result JSON), 100914 bytes (reply frame);
+  final 1100 ids, 42901 bytes, 92514 bytes.
+- Subscriber notifications/s (idle / traffic): before flow 0.00 / 77.36, agent 2.50 / 21.79; final flow
+  0.00 / 77.34, agent 2.17 / 21.24; state 0.00 throughout.
+- Requests: 600 sent, 600 ok, 0 failed in every traffic window. No subscription lagged. Every run valid.
 
-| command | idle calls/s | traffic calls/s |
-|---|---|---|
-| `flow.list` | 1.67 | **0.13** |
-| `proxy.status` | 0.50 | 0.48 |
-| `flow.detail` | 0.00 | 19.75 |
-| **total** | **2.17** (65 calls / 30.0 s) | **20.37** (632 calls / 31.0 s) |
+### Real-browser checks (no reload)
 
-- `flow.list` after traffic: 1100 ids, 42901 bytes (result JSON), 92514 bytes (reply frame)
-- Subscriber notifications/s (idle / traffic): flow 0.00 / 77.34 · agent 2.17 / 20.37 · state 0.00 / 0.00
-- Requests: 600 sent / 600 ok / 0 failed; `flow.detail` per new flow: 1.02 (spec R3 threshold 2.5: not reached, `PUSH_COALESCE_MS` stays 100)
-- Subscription lagged during a window: no
-
-### Real-browser live check (no reload)
-
-With the `aitm-after` page already open, 5 requests were sent through the proxy with a unique path
-marker. The marker was absent from the page text before and present 172 ms after the requests
-started, the footer read `1105 / 1105 rows`, and the new rows were fully populated (status 200,
-timings, sizes), i.e. refetched through `flow.detail`, not painted from the sparse push summary.
-Screenshot: `web-ui-bus-push-measurement-data/live-after.png`.
+- **A flow captured into an open page is visible in 172 ms.** At 33e3600, with the page already open,
+  5 requests were sent through the proxy with a unique path marker. The marker was absent from the
+  page text before and present 172 ms after the requests started; the footer read `1105 / 1105 rows`
+  and the new rows were fully populated (status 200, timings, sizes), i.e. refetched through
+  `flow.detail`, not painted from the sparse push summary. Screenshot `live-after.png`.
+- **The Activity log is not flooded (final head).** The same page was left open at `aitm-final` for
+  about 20 minutes: about 2 background calls/s the whole time, two 30 s windows at about 21 calls/s, a
+  500-request seed, and a latency probe, i.e. several thousand audit lines pushed to the page. The
+  Agent panel's Activity log then held exactly one row (a `script.list` call). Screenshot
+  `activity-final.png`.
+- **Subscribing adds no per-call latency.** A sequential `proxy.status` probe on one connection
+  measured 0.3 ms mean, median and p90 both before and after `flow.subscribe` on the same connection
+  (`rtt-probe.txt`), so the audit echo does not slow replies.
 
 ## Reading the result
 
-- **`flow.list` under traffic: 1.97/s to 0.13/s.** The remaining 0.13/s is the 10 s heartbeat plus
-  the bootstrap and reconnect snapshots. At the end-of-window list sizes the reply bytes/s
-  go from about 1.97 x 100.9 kB = 199 kB/s to 0.13 x 92.5 kB = 12 kB/s (upper bounds: the list grew
-  during the window). AC25's bar (at most 0.3/s) is met.
-- **`flow.detail` per new flow is unchanged (1.00 to 1.02):** a push triggers one refetch per
+- **`flow.list` under traffic: 1.97/s to 0.10/s.** The remaining rate is the 10 s heartbeat plus the
+  bootstrap and reconnect snapshots. At the end-of-window list sizes the reply bytes/s go from about
+  1.97 x 100.9 kB = 199 kB/s to 0.10 x 92.5 kB = 9 kB/s (upper bounds: the list grew during the
+  window). AC25's bar (at most 0.3/s) is met, at both measured commits.
+- **`flow.detail` per new flow is unchanged (1.00 to 1.07):** a push triggers one refetch per
   coalesced flow, replacing the poll's one-time discovery fetch. Total calls/s under traffic fall
-  only 7% (21.79 to 20.37), as predicted: the win is the list scan, its payload and the latency
-  (a new flow is visible about 100 ms plus one round trip after capture, not up to a poll tick later).
+  only 3% (21.79 to 21.24), as predicted: the win is the list scan, its payload and the latency (a
+  new flow is visible about 100 ms plus one round trip after capture, not up to a poll tick later).
 - **Idle is not reduced, by design (spec R1):** with no traffic no flow notification arrives, so
-  freshness is never proven and the loop keeps its 500 ms cadence. The measured idle difference
-  (2.50 to 2.17, `flow.list` 2.00 to 1.67) is not explained by any code path that changed at idle
-  and is taken as run-to-run variance (one 30 s window per variant); do not read it as a gain.
+  freshness is never proven and the loop keeps its 500 ms cadence. The observed idle rate was lower
+  after (2.17, 2.17, 1.93 against 2.50) with `flow.list` periods of about 600 to 700 ms instead of
+  500 ms. No code path that changed at idle explains it and the latency probe above rules out slower
+  replies, so it is most likely timer slip in the headless page on a machine that was running other
+  test suites at the time; a controlled idle A/B on a quiet machine was not run. Do not read it as a
+  gain.
 - **What the UI now receives that it did not:** about 77 flow notifications/s and the audit echo of
-  its own calls (about 20/s) under traffic. Flow lines are coalesced into one refetch per flow; audit
+  its own calls (about 21/s) under traffic. Flow lines are coalesced into one refetch per flow; audit
   lines for its own background reads are dropped on arrival (spec D7). The audit echo is a server
   behaviour (every audited call is pushed to every subscriber) the client can only filter.
-- **Caveats.** Single run per variant on one machine, debug builds, loopback origin (0 ms upstream,
-  so flows complete before the first fetch and the "pending re-read" path is not exercised here).
-  The `before` store was larger at the start of its traffic window (about 600 vs 500 flows).
-  Headless Chrome, not a desktop browser. The audit-line instrument counts every audited call on the
-  web server, so another client on the same server would be counted with its own origin (none was
-  connected).
+- **Caveats.** One run per variant (two idle samples for final), debug builds, loopback origin (0 ms
+  upstream, so flows complete before the first fetch and the "pending re-read" path is not exercised).
+  The `before` store was larger at the start of its traffic window (about 600 vs 500 flows). Headless
+  Chrome, not a desktop browser. The instrument counts every audited call on the web server, so
+  another client on the same server would be counted with its own origin (none was connected).
