@@ -73,6 +73,50 @@ describe('app store — activity intake', () => {
     expect(list[499]!.seq).toBe(600);
   });
 
+  // Own-ness is decided from THIS connection's role (`bus.role()`): `aitm web`'s default token is the agent
+  // token, so the production default is origin `mcp`, not the `operator` every other case here runs as.
+  it('on the agent role our own origin is mcp, not operator', async () => {
+    const { bus, app } = start({ ...bridgeBus(), role: () => 'agent' });
+    await tick(200);
+    const mcpPoll = (i: number) => ({ ...ownPoll(i), origin: 'mcp' });
+
+    for (let i = 0; i < 20; i++) bus.emit('notifications/aitm/agent', mcpPoll(i)); // ours: dropped
+    expect(app.proxy.activity).toEqual([]);
+
+    bus.emit('notifications/aitm/agent', ownPoll(1)); // an unlabelled `operator` read is somebody else's here
+    bus.emit('notifications/aitm/agent', { ...mcpPoll(2), command: 'flow.kill' }); // our own write
+    bus.emit('notifications/aitm/agent', { ...mcpPoll(3), client_label: 'claude-code' }); // a labelled client
+    bus.emit('notifications/aitm/agent', { ...mcpPoll(4), result: { error: 'boom' } }); // a failing poll
+
+    expect(app.proxy.activity.map((e) => `${e.origin}/${e.clientLabel ?? '-'}/${e.command}/${e.result}`)).toEqual([
+      'operator/-/flow.list/ok',
+      'mcp/-/flow.kill/ok',
+      'mcp/claude-code/flow.list/ok',
+      'mcp/-/flow.list/error',
+    ]);
+  });
+
+  it('with no resolved role nothing is ours by origin, so nothing is dropped', async () => {
+    const { bus, app } = start({ ...bridgeBus(), role: () => null });
+    await tick(200);
+
+    bus.emit('notifications/aitm/agent', ownPoll(1)); // origin operator, unlabelled, a background read
+    bus.emit('notifications/aitm/agent', { ...ownPoll(2), origin: 'mcp' });
+
+    expect(app.proxy.activity.map((e) => e.origin)).toEqual(['operator', 'mcp']);
+  });
+
+  it('a forged aitm-web label does not hide a read from the log', async () => {
+    const { bus, app } = start();
+    await tick(200);
+
+    bus.emit('notifications/aitm/agent', { ...ownPoll(1), client_label: 'aitm-web' }); // same origin, the UI's own name
+    bus.emit('notifications/aitm/agent', { ...ownPoll(2), origin: 'mcp', client_label: 'aitm-web' }); // another origin
+    bus.emit('notifications/aitm/agent', ownPoll(3)); // the genuine unlabelled bridge line is still dropped
+
+    expect(app.proxy.activity.map((e) => `${e.origin}/${e.clientLabel}/${e.command}`)).toEqual(['operator/aitm-web/flow.list', 'mcp/aitm-web/flow.list']);
+  });
+
   it('an approval request line is ignored', async () => {
     const { bus, app } = start();
     await tick(200);

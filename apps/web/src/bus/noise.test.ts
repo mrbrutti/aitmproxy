@@ -44,28 +44,51 @@ describe('isUiPollNoise / ownOriginOf', () => {
     expect(isUiPollNoise({ ...ownRead, command: 'browser.navigate' }, own)).toBe(false);
   });
 
+  // The literal list the spec names (D7). The pin below compares the set to it; the loop after it walks the
+  // LITERAL (not the set under test, which would pass for any contents) so every one of the 17 reads is
+  // proven to be dropped by the rule, not just the three the matrix happens to name.
+  const SPEC_READS = [
+    'flow.list',
+    'flow.get',
+    'flow.detail',
+    'proxy.status',
+    'agent.status',
+    'agent.activity',
+    'scope.list',
+    'poc.list',
+    'l4.flow.list',
+    'l4.flow.get',
+    'l4.scope.list',
+    'l4.capture.status',
+    'l4.agent.status',
+    'l4.intercept.status',
+    'l4.intercept.list',
+    'browser.tabs',
+    'browser.screenshot',
+  ];
+
   it('UI_BACKGROUND_READS is exactly the reads the UI issues on timers or in bulk refreshes', () => {
-    expect([...UI_BACKGROUND_READS].sort()).toEqual(
-      [
-        'flow.list',
-        'flow.get',
-        'flow.detail',
-        'proxy.status',
-        'agent.status',
-        'agent.activity',
-        'scope.list',
-        'poc.list',
-        'l4.flow.list',
-        'l4.flow.get',
-        'l4.scope.list',
-        'l4.capture.status',
-        'l4.agent.status',
-        'l4.intercept.status',
-        'l4.intercept.list',
-        'browser.tabs',
-        'browser.screenshot',
-      ].sort(),
-    );
+    expect(SPEC_READS).toHaveLength(17);
+    expect([...UI_BACKGROUND_READS].sort()).toEqual([...SPEC_READS].sort());
+  });
+
+  it('every one of the 17 spec reads is dropped when it is ours, and kept when it is not', () => {
+    for (const command of SPEC_READS) {
+      expect(isUiPollNoise({ ...ownRead, command }, own), command).toBe(true);
+      // The same read is kept the moment any one of the other conditions fails.
+      expect(isUiPollNoise({ ...ownRead, command, result: 'error' }, own), `${command} (error)`).toBe(false);
+      expect(isUiPollNoise({ ...ownRead, command, clientLabel: 'claude-code' }, own), `${command} (labelled)`).toBe(false);
+      expect(isUiPollNoise({ ...ownRead, command, origin: 'mcp' }, own), `${command} (other origin)`).toBe(false);
+    }
+  });
+
+  it('an unknown own origin matches nothing, even a line that carries no origin at all', () => {
+    // `toAgentEntry` never lets an origin-less line through, so this is the rule's own guard: with the role
+    // unknown (`own.origin === null`) an absent or null origin must not satisfy `e.origin === own.origin`.
+    const originless = { ...ownRead, origin: null } as unknown as Parameters<typeof isUiPollNoise>[0];
+    expect(isUiPollNoise(originless, { origin: null })).toBe(false);
+    const undef = { ...ownRead, origin: undefined } as unknown as Parameters<typeof isUiPollNoise>[0];
+    expect(isUiPollNoise(undef, { origin: null })).toBe(false);
   });
 
   it('ownOriginOf maps roles', () => {

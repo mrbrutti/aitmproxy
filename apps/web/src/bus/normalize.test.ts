@@ -267,4 +267,25 @@ describe('toAgentEntry (audit line)', () => {
     // A non-string args (the fixture model's object) is not text and is passed through.
     expect(toAgentEntry({ ...wire, args: { id: 'f_1' } })?.args).toEqual({ id: 'f_1' });
   });
+
+  // The cap is also a bound on what the parser can be made to build: nothing deeper than 1024 levels can
+  // fit in 2048 characters, so a hostile balanced nesting either parses to a shallow-enough structure the
+  // panel can stringify, or is cut and stays text. It never reaches the engine's recursion limit.
+  it('keeps a balanced nesting bounded by the args cap', () => {
+    const fits = '['.repeat(1024) + ']'.repeat(1024);
+    expect(fits).toHaveLength(2048);
+    const parsed = toAgentEntry({ ...wire, args: fits })?.args;
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(() => JSON.stringify(parsed)).not.toThrow();
+    expect(JSON.stringify(parsed)).toBe(fits);
+
+    const tooDeep = '['.repeat(1025) + ']'.repeat(1025);
+    expect(tooDeep).toHaveLength(2050);
+    expect(toAgentEntry({ ...wire, args: tooDeep })?.args).toBe(tooDeep.slice(0, 2048)); // cut mid-nesting: text
+  });
+
+  it('measures the label cap in UTF-16 code units, as documented', () => {
+    const label = toAgentEntry({ ...wire, client_label: '😀'.repeat(200) })?.clientLabel; // 400 code units
+    expect(label).toHaveLength(128);
+  });
 });

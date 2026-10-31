@@ -328,6 +328,35 @@ describe('createWsBus subscribes on every open', () => {
     expect(FakeWebSocket.count).toBe(1);
   });
 
+  // Each open arms a subscribe timer; one that is answered in time must not be left running (a leak per
+  // reconnect, and a fake "late timeout" against an id that already settled). Tracked by its odd delay.
+  it('the_subscribe_timer_is_cleared_once_the_subscribe_settles', async () => {
+    const realSet = globalThis.setTimeout;
+    const realClear = globalThis.clearTimeout;
+    const armed: unknown[] = [];
+    const cleared: unknown[] = [];
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) => {
+      const h = realSet(fn, ms, ...rest);
+      if (ms === 4321) armed.push(h);
+      return h;
+    }) as unknown as typeof setTimeout);
+    vi.spyOn(globalThis, 'clearTimeout').mockImplementation(((h?: Parameters<typeof clearTimeout>[0]) => {
+      cleared.push(h);
+      return realClear(h);
+    }) as typeof clearTimeout);
+    try {
+      const client = bus({ subscribeTimeoutMs: 4321 });
+      const sock = await handshake(client);
+      await answerTool(sock, 'flow.subscribe', { structuredContent: { sub_id: 1 } });
+      await vi.waitFor(() => expect(client.state()).toBe('open'));
+
+      expect(armed).toHaveLength(1);
+      expect(cleared).toContain(armed[0]);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   it('a_silent_subscribe_times_out_and_opens', async () => {
     const client = bus({ subscribeTimeoutMs: 20 });
     const sock = await handshake(client);
@@ -401,6 +430,24 @@ describe('createWsBus subscribes on every open', () => {
     sock.readyState = 3;
     sock.onclose?.({ code: 1006 }); // the close event arrives late: now the reconnect is scheduled
     expect(client.state()).toBe('reconnecting');
+  });
+
+  // The other half of the same belt and braces: the close event ran (the client dropped this socket and
+  // scheduled the reconnect) while the socket object still reads OPEN, so only the identity check
+  // (`ws !== sock`) can tell this attempt is dead. `refuse()` in the case above flips `readyState` first,
+  // which would let the readyState test alone pass. The long back-off keeps the reconnect out of the way,
+  // so nothing but the guard decides the state.
+  it('a_socket_whose_close_event_ran_while_it_still_reads_open_is_not_marked_open', async () => {
+    const client = bus({ backoff: [10_000] });
+    const sock = await handshake(client);
+    await toolCallSent(sock, 'flow.subscribe');
+
+    sock.onclose?.({ code: 1006 }); // readyState is still OPEN; the pending subscribe is failed by the close
+    expect(client.state()).toBe('reconnecting');
+    await sleep(30); // the failed subscribe settles and its continuation runs
+    expect(client.state()).toBe('reconnecting');
+    expect(client.lastError()).toBe(null);
+    expect(FakeWebSocket.count).toBe(1); // and nothing re-opened it
   });
 
   it('a_user_close_whose_close_event_is_still_pending_stays_closed_when_the_reply_lands', async () => {

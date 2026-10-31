@@ -206,6 +206,66 @@ describe('app store — a flow push is a trigger, never data', () => {
     expect(bus.count('flow.list')).toBeGreaterThan(lists); // the surplus set `backlog`, so the poll ran
   });
 
+  // The cap is 256 exactly (spec D3): 256 distinct ids all fit, so nothing is left for the poll (push is
+  // fresh, the heartbeat is 10 s away) and `flow.list` stays quiet; the 257th is the first one dropped, which
+  // sets `backlog` and makes the poll run. Pins both sides of the boundary, not just "300 is too many".
+  it('the pending cap is exactly 256 ids: the 257th is left to the poll', async () => {
+    const fits = start();
+    await tick(200);
+    const listsFits = fits.bus.count('flow.list');
+    for (let s = 1; s <= 256; s++) push(fits.bus, 'created', captureSilently(fits.bus, s));
+    await tick(3000);
+    expect(fits.app.entries).toHaveLength(256);
+    expect(fits.bus.count('flow.detail')).toBe(256);
+    expect(fits.bus.count('flow.list')).toBe(listsFits); // no surplus, no backlog, no poll
+
+    const over = start();
+    await tick(200);
+    const listsOver = over.bus.count('flow.list');
+    for (let s = 1; s <= 257; s++) push(over.bus, 'created', captureSilently(over.bus, s));
+    await tick(3000);
+    expect(over.app.entries).toHaveLength(257); // the poll delivered the one the coalescer dropped
+    expect(over.bus.count('flow.list')).toBeGreaterThan(listsOver);
+  });
+
+  // The flush runs from a timer and nobody awaits it: an error thrown while applying a reply (here a row that
+  // blows up in `toSummary`) must not escape as an unhandled rejection, and must not wedge the flusher.
+  it('an apply that throws does not escape the flush timer or stop later pushes', async () => {
+    // The web tsconfig carries no node types; the runner is node, and that is where rejections are reported.
+    const proc = (globalThis as unknown as { process: { on(e: 'unhandledRejection', h: (r: unknown) => void): void; off(e: 'unhandledRejection', h: (r: unknown) => void): void } }).process;
+    const { bus, app } = start();
+    // `start` strips `seq` by spreading each reply (the kit's `withoutSeq`), which would run the getter below inside
+    // the bus call, where `.catch` turns it into a failed read: not the apply error this case is about.
+    bus.ctl.stripSeq = false;
+    await tick(200);
+    captureSilently(bus, 1);
+    captureSilently(bus, 2);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    proc.on('unhandledRejection', onUnhandled);
+    try {
+      bus.ctl.replyWith.set('f_1', {
+        id: 'f_1',
+        get method(): string {
+          throw new Error('toSummary blew up');
+        },
+      });
+
+      push(bus, 'created', 'f_1');
+      await tick(300); // `advanceTimersByTimeAsync` yields to the real event loop between timers, where rejections surface
+      await tick(300);
+      expect(unhandled).toEqual([]);
+      expect(app.byId.has('f_1')).toBe(false);
+
+      // The flusher is free: a later push for a healthy flow is fetched and applied.
+      push(bus, 'created', 'f_2');
+      await tick(150);
+      expect(app.byId.has('f_2')).toBe(true);
+    } finally {
+      proc.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('a reply that is not the requested flow makes no row and is held off', async () => {
     const { bus, app } = start();
     await tick(200);
@@ -424,6 +484,62 @@ describe('app store — a flow push is a trigger, never data', () => {
     expect(bus.count('flow.detail')).toBe(0);
   });
 
+  // The fixtures bus keeps the pre-push direct-apply path (spec D3): complete summaries land synchronously
+  // and the same post-event work still runs from them (`cleared`, detail invalidation, `pausedIds`).
+  describe('on the fixtures bus', () => {
+    /** The mock's own flow as the summary of a push: complete and correctly spelled, as the fixtures bus sends it. */
+    const fx = (bus: TestBus, event: FlowEventKind, id: string, over: Record<string, unknown> = {}) =>
+      bus.emit('notifications/aitm/flow', { event, id, summary: { ...bus.flowsById().get(id), ...over } });
+
+    it('a cleared push empties the list, and a later push applies again', async () => {
+      const { bus, app } = start(bridgeBus('fixtures'));
+      await tick(200);
+      const id = captureSilently(bus, 1);
+      fx(bus, 'created', id);
+      expect(app.entries.map((e) => e.id)).toEqual([id]);
+
+      bus.emit('notifications/aitm/flow', { event: 'cleared', id: '' });
+      expect(app.entries).toHaveLength(0);
+      expect(app.byId.size).toBe(0);
+
+      fx(bus, 'created', id);
+      expect(app.entries.map((e) => e.id)).toEqual([id]);
+    });
+
+    it('a response push drops the cached detail and reloads the inspected flow', async () => {
+      const { bus, app } = start(bridgeBus('fixtures'));
+      await tick(200);
+      const id = captureSilently(bus, 1);
+      fx(bus, 'created', id);
+      app.select(id);
+      await tick(50);
+      expect(app.details[id]).toBeDefined();
+      const before = bus.callArgs('flow.detail').length;
+
+      fx(bus, 'response', id);
+      expect(app.details[id]).toBeUndefined(); // dropped at once, before the reload answers
+      await tick(50);
+
+      expect(bus.callArgs('flow.detail').slice(before)).toEqual([{ id }]); // the inspector reload only: no row refetch
+      expect(app.details[id]).toBeDefined();
+    });
+
+    it('intercepted and released pushes recompute pausedIds from the applied row', async () => {
+      const { bus, app } = start(bridgeBus('fixtures'));
+      await tick(200);
+      const id = captureSilently(bus, 1);
+      fx(bus, 'created', id);
+      expect(app.proxy.pausedIds).toEqual([]);
+
+      fx(bus, 'intercepted', id, { intercept: 'paused' });
+      expect(app.proxy.pausedIds).toEqual([id]); // synchronous: the summary is applied, not fetched
+
+      fx(bus, 'released', id, { intercept: 'resumed' });
+      expect(app.proxy.pausedIds).toEqual([]);
+      expect(bus.count('flow.detail')).toBe(0);
+    });
+  });
+
   it('a flush does nothing while the bus is not open', async () => {
     const { bus, app } = start();
     await tick(200);
@@ -477,6 +593,25 @@ describe('app store — a flow push is a trigger, never data', () => {
 });
 
 describe('app store — push and the poll loop together', () => {
+  // `pollOnce` and the flush share one fetcher, so they share its id check: a reply names the flow it is for
+  // or it is a failed read (no ghost row `''`, no row written under a foreign id), held off like any other.
+  it('the poll applies the same id check as the flush', async () => {
+    const bus = bridgeBus();
+    for (let s = 1; s <= 3; s++) captureSilently(bus, s);
+    bus.ctl.replyWith.set('f_1', {}); // no id at all
+    bus.ctl.replyWith.set('f_2', { ...bus.flowsById().get('f_3'), id: 'f_zzz' }); // another flow's row
+    const { app } = start(bus);
+
+    await tick(1500); // the bootstrap poll and two more ticks
+
+    expect(app.entries.map((e) => e.id)).toEqual(['f_3']); // only the flow that answered as itself
+    expect(app.byId.has('')).toBe(false);
+    expect(app.byId.has('f_zzz')).toBe(false);
+    // Both are held off for FAILED_RETRY_MS: the poll asked once each, not on every 500 ms tick.
+    expect(bus.callArgs('flow.detail').filter((a) => a.id === 'f_1')).toHaveLength(1);
+    expect(bus.callArgs('flow.detail').filter((a) => a.id === 'f_2')).toHaveLength(1);
+  });
+
   it('with healthy push, flow.list runs only on the heartbeat', async () => {
     const { bus, app } = start();
     await tick(200);
