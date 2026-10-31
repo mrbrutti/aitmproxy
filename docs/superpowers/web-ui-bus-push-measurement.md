@@ -7,7 +7,7 @@
 
 ## Headline
 
-Under 20 req/s of live traffic the UI's `flow.list` rate falls from **1.97/s to 0.13/s** (about 93% fewer, bar was at most 0.3/s) because it now subscribes over `/bus` and learns of new flows by push; `flow.detail` stays at about one call per new flow (1.00 before, 1.02 after); idle is unchanged by design (the poll runs every 500 ms until a push proves the stream alive: 2.50 calls/s before, 2.17 after in single runs). In a real browser a flow captured into an already-open page was visible 172 ms later, with no reload.
+Under 20 req/s of live traffic the UI's `flow.list` rate falls from **1.97/s to 0.13/s** (about 93% fewer, bar was at most 0.3/s) because it now subscribes over `/bus` and learns of new flows by push; `flow.detail` stays at about one call per new flow (1.00 before, 1.02 after); idle is NOT reduced, by design (the poll runs every 500 ms until a push proves the stream alive; 2.50 calls/s before, 2.17 after in single 30 s runs, a difference this note does not attribute to anything). In a real browser a flow captured into an already-open page was visible 172 ms later, with no reload.
 
 ## Method
 
@@ -105,10 +105,10 @@ exit codes).
 Rates are UI calls per second by command (origin `mcp`, i.e. the page opened at `aitm web`'s default
 agent URL), counted from the audit lines the measuring script's own subscription received. Runs:
 `aitm-before` = the UI at `e887ad1` (PR #137's server, no UI subscribe); `aitm-after` = this branch
-at `33e3600`. Real browser: headless Chrome 1248 (`chrome-headless-shell`) holding the page open,
+at `33e3600` (the push/poll/Activity production code at that commit; review-round-1 fixes landed afterwards and are covered by the unit suites and a re-run of the e2e web suite, not by a second measurement). Real browser: headless Chrome 1248 (`chrome-headless-shell`) holding the page open,
 `aitm web` on loopback, 20 req/s for 30 s through the proxy to a loopback origin; the store held
-about 600 flows (before) and 500 (after) when each traffic window began. Raw output is in
-`before.txt` / `after.txt` (and their `--json`) in the session notes folder.
+about 600 flows (before) and 500 (after) when each traffic window began. Raw output is committed next to this note in
+`web-ui-bus-push-measurement-data/` (`before.txt` / `after.txt` and their `--json`).
 
 ### Before (`aitm-before`)
 
@@ -144,7 +144,7 @@ With the `aitm-after` page already open, 5 requests were sent through the proxy 
 marker. The marker was absent from the page text before and present 172 ms after the requests
 started, the footer read `1105 / 1105 rows`, and the new rows were fully populated (status 200,
 timings, sizes), i.e. refetched through `flow.detail`, not painted from the sparse push summary.
-Screenshot `live-after.png` in the session notes folder.
+Screenshot: `web-ui-bus-push-measurement-data/live-after.png`.
 
 ## Reading the result
 
@@ -156,7 +156,7 @@ Screenshot `live-after.png` in the session notes folder.
   coalesced flow, replacing the poll's one-time discovery fetch. Total calls/s under traffic fall
   only 7% (21.79 to 20.37), as predicted: the win is the list scan, its payload and the latency
   (a new flow is visible about 100 ms plus one round trip after capture, not up to a poll tick later).
-- **Idle is unchanged by design (spec R1):** with no traffic no flow notification arrives, so
+- **Idle is not reduced, by design (spec R1):** with no traffic no flow notification arrives, so
   freshness is never proven and the loop keeps its 500 ms cadence. The measured idle difference
   (2.50 to 2.17, `flow.list` 2.00 to 1.67) is not explained by any code path that changed at idle
   and is taken as run-to-run variance (one 30 s window per variant); do not read it as a gain.
