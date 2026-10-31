@@ -4534,3 +4534,50 @@ fn command_host_carries_the_connection_id() {
         "no streaming connection, no id: {reply}"
     );
 }
+
+// ------------- role-filtered audit push (plan 2026-10-30-bus-audit-connection-id, T9)
+
+/// AC12: an agent-role subscriber never receives an operator-origin audit line,
+/// while an operator subscriber receives every line, in order. The filter is
+/// the shared `AuditEntry::visible_to`, applied per subscription inside the
+/// fan-out, so the line is still rendered once.
+#[test]
+fn an_agent_subscriber_never_receives_operator_audit_lines() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let op = watcher(&srv, Frontend::Operator);
+    let agent = watcher(&srv, Frontend::Mcp);
+
+    assert!(!is_refused(&call_on(&srv, &op, "demo.read", json!({}))));
+    assert!(!is_refused(&call_on(&srv, &agent, "demo.read", json!({}))));
+
+    let op_lines = agent_lines(&op);
+    let op_origins: Vec<&str> = op_lines
+        .iter()
+        .map(|l| l["params"]["origin"].as_str().expect("origin is a string"))
+        .collect();
+    assert_eq!(
+        op_origins,
+        ["operator", "mcp"],
+        "the operator sees both lines: {op_lines:?}"
+    );
+
+    let agent_seen = agent_lines(&agent);
+    assert_eq!(
+        agent_seen.len(),
+        1,
+        "the agent sees only its own line: {agent_seen:?}"
+    );
+    assert_eq!(agent_seen[0]["params"]["origin"], json!("mcp"));
+    assert_eq!(
+        agent_seen[0]["params"]["connection_id"],
+        json!(init_id(&srv, &agent)),
+        "and it is the agent's own line: {agent_seen:?}"
+    );
+
+    assert_eq!(
+        ring.recent(None, None).len(),
+        2,
+        "the ring is never filtered, only the push"
+    );
+}

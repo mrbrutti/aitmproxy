@@ -530,6 +530,25 @@ impl Subscriptions {
             sub.sink.push(line.to_string());
         }
     }
+
+    /// Push the already-rendered audit `line` for `entry` to each subscribed
+    /// connection (once each, regardless of filter) whose role may see it, as
+    /// decided by [`AuditEntry::visible_to`]: an agent-role subscriber never
+    /// receives a line an operator or the CLI made. The role is handed to the
+    /// predicate, never compared here, so a role added later is classified in
+    /// one place. The decision runs under the registry lock with the push, so
+    /// a subscription cannot change between the check and the send.
+    fn fanout_audit(&self, entry: &AuditEntry, line: &str) {
+        let st = self.lock();
+        let mut seen: Vec<u64> = Vec::new();
+        for sub in &st.subs {
+            if seen.contains(&sub.conn_id) || !entry.visible_to(sub.role) {
+                continue;
+            }
+            seen.push(sub.conn_id);
+            sub.sink.push(line.to_string());
+        }
+    }
 }
 
 /// The operator confirm-over-the-wire token store (spec D4). A `needs_confirmation`
@@ -1688,10 +1707,14 @@ impl McpServer {
         self.push_agent(&entry);
     }
 
-    /// Render `entry` as a `notifications/aitm/agent` line and fan it to every
-    /// subscribed connection (the agent stream concerns the whole session, so it
-    /// is not flow-filtered). Non-blocking; a slow subscriber's sink absorbs or
-    /// drops the line without stalling the caller (spec D3a.3).
+    /// Render `entry` once as a `notifications/aitm/agent` line and fan it to
+    /// every subscribed connection whose role may see it
+    /// ([`AuditEntry::visible_to`]: trusted control sees all, any other role
+    /// only entries made by a non-trusted caller). The agent stream concerns the
+    /// whole session, so it is not flow-filtered. The role filter lives here, in
+    /// the one `pub` entry point, so every caller is covered. Non-blocking; a
+    /// slow subscriber's sink absorbs or drops the line without stalling the
+    /// caller (spec D3a.3).
     pub fn push_agent(&self, entry: &AuditEntry) {
         let line = json!({
             "jsonrpc": "2.0",
@@ -1699,7 +1722,7 @@ impl McpServer {
             "params": to_json(&entry.to_value()),
         })
         .to_string();
-        self.subscriptions.fanout_state(&line);
+        self.subscriptions.fanout_audit(entry, &line);
     }
 
     /// The D2 policy decision for one command on one connection. Every role that is
