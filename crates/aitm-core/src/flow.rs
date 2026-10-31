@@ -148,7 +148,7 @@ pub struct HttpResponse {
     /// order with duplicates kept. Held apart from `headers` on purpose and
     /// never merged into them. This is a capture field: no code path writes it
     /// to a wire without the forbidden-name filter. Only HTTP/1.1 chunked
-    /// responses produce trailers today; h2 trailers are still dropped.
+    /// responses populate it; h2 trailers are dropped.
     pub trailers: HeaderMap,
     pub body: Body,
     pub timestamp: SystemTime,

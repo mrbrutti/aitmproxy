@@ -90,13 +90,6 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
-/// A loopback port nobody is listening on right now.
-fn free_port() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("pick a free port")
-}
-
 /// `len` bytes that are not all alike, so a body that arrives truncated,
 /// repeated or shifted differs from it.
 fn pattern(len: usize) -> Vec<u8> {
@@ -327,10 +320,10 @@ async fn spawn_over_cap_origin(go: Arc<Notify>) -> Origin {
 // ---------------------------------------------------------------------------
 
 /// Run a `Proxy` (the passive listener, which relays to any address without a
-/// scope gate) with the HTTP module (a fresh CA) and no plugins, on a free
-/// loopback port, and wait until it accepts connections. Returns the proxy
-/// address and the proxy's flow store (taken before the proxy moves into its
-/// task).
+/// scope gate) with the HTTP module (a fresh CA) and no plugins, on a loopback
+/// listener bound here before the proxy starts, so connections made at once
+/// queue until it accepts them. Returns the proxy address and the proxy's flow
+/// store (taken before the proxy moves into its task).
 async fn run_proxy() -> (SocketAddr, Arc<dyn FlowStore>) {
     let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
     let module = HttpModule::with_ca(ca).with_insecure(true);
@@ -340,18 +333,13 @@ async fn run_proxy() -> (SocketAddr, Arc<dyn FlowStore>) {
         .build()
         .expect("build proxy");
     let store = proxy.store();
-    let addr = free_port();
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the proxy listener");
+    let addr = listener.local_addr().expect("proxy listener address");
     tokio::spawn(async move {
-        let _ = proxy.run(addr).await;
+        let _ = proxy.run_on(listener).await;
     });
-    let deadline = Instant::now() + IO_TIMEOUT;
-    while !matches!(
-        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(addr)).await,
-        Ok(Ok(_))
-    ) {
-        assert!(Instant::now() < deadline, "proxy never started listening");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     (addr, store)
 }
 

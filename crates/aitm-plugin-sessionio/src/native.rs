@@ -89,7 +89,7 @@ pub struct RespRec {
     pub headers: Vec<(String, String)>,
     /// Chunked trailers, in wire order. Additive and optional: a response
     /// without trailers writes no key (the document is byte-identical to one
-    /// saved before this field existed), and a document without the key loads
+    /// written before trailers existed), and a document without the key loads
     /// with none, so the `aitm-session/1` tag needs no bump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trailers: Vec<(String, String)>,

@@ -84,11 +84,11 @@ const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 /// whose meaning is framing, routing, authentication, a request modifier,
 /// response control data, payload processing or connection management cannot
 /// work there (RFC 9110 6.5.1), and an origin must not be able to use one to
-/// steer the client. The groups are that section's categories and the names are
-/// the fields RFC 9110 defines for each. A deny-list, not an allow-list: the
-/// fields that do permit trailers (`x-*`, `server-timing`, `digest`, ...) are
-/// open-ended. This is the wire only: the capture on `HttpResponse::trailers`
-/// keeps every field the origin sent.
+/// steer the client. The groups are RFC 9110 6.5.1's categories; the names under
+/// each are this project's expansion of them, not a list the RFC gives. A
+/// deny-list, not an allow-list: the fields that do permit trailers (`x-*`,
+/// `server-timing`, `digest`, ...) are open-ended. This is the wire only: the
+/// capture on `HttpResponse::trailers` keeps every field the origin sent.
 const FORBIDDEN_TRAILERS: &[&str] = &[
     // Message framing.
     "transfer-encoding",
@@ -388,8 +388,8 @@ impl Http1Machine {
     }
 
     /// Terminate a streamed body for `to` (the chunked terminator, if chunked).
-    /// It carries no trailers: that is [`Self::enqueue_body_end_with_trailers`]
-    /// with an empty section.
+    /// It carries no trailers: that is `enqueue_body_end_with_trailers` with an
+    /// empty section.
     pub fn enqueue_body_end(&mut self, to: Side) {
         self.enqueue_body_end_with_trailers(to, &HeaderMap::new());
     }
@@ -480,8 +480,7 @@ impl Http1Machine {
                     self.continue_pending = !http_1_0
                         && expects_100_continue(&req.headers)
                         && match framing {
-                            Framing::Chunked => true,
-                            Framing::Length(n) => n > 0,
+                            Framing::Chunked | Framing::Length(_) => true,
                             Framing::None | Framing::UntilClose => false,
                         }
                         && self.client.buf.is_empty();
@@ -929,8 +928,9 @@ fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Result<HeaderMap> 
 }
 
 /// Parse one `name: value` field line and append it to `into`. Used for head
-/// header lines and for trailer lines alike, so the two accept exactly the same
-/// syntax.
+/// header lines and for trailer lines alike, so the two share one field-line
+/// grammar. (The trailer path also rejects a leading SP/HT, non-UTF-8 and
+/// over-cap sections before a line gets here.)
 fn parse_field_line(line: &str, into: &mut HeaderMap) -> Result<()> {
     let Some((name, value)) = line.split_once(':') else {
         bail!("malformed header line {line:?}");
@@ -984,7 +984,7 @@ fn expects_100_continue(headers: &HeaderMap) -> bool {
 /// `Content-Length` as a number, if present and well-formed. More than one
 /// header with *distinct* values is rejected: silently trusting the first is a
 /// request/response-smuggling vector (RFC 7230 §3.3.3).
-fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
+pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
     let parse = |v: &str| {
         let t = v.trim();
         if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
@@ -1659,9 +1659,10 @@ mod tests {
         (m.poll_outbound(Side::Client), withheld)
     }
 
-    /// The deny-set the spec lists (37 names), spelled out here independently of
-    /// `FORBIDDEN_TRAILERS` so a name dropped from the constant is caught.
-    const SPEC_DENY_SET: [&str; 37] = [
+    /// The 37 names that are never written as a trailer, spelled out here
+    /// independently of `FORBIDDEN_TRAILERS` so a name dropped from the constant
+    /// is caught.
+    const GOLDEN_DENY_SET: [&str; 37] = [
         // Message framing
         "transfer-encoding",
         "content-length",
@@ -1754,11 +1755,11 @@ mod tests {
     }
 
     #[test]
-    fn the_deny_set_is_exactly_the_specs_37_names() {
+    fn the_deny_set_is_exactly_these_37_names() {
         assert_eq!(FORBIDDEN_TRAILERS.len(), 37);
         let have: std::collections::BTreeSet<&str> = FORBIDDEN_TRAILERS.iter().copied().collect();
-        let want: std::collections::BTreeSet<&str> = SPEC_DENY_SET.iter().copied().collect();
-        assert_eq!(want.len(), 37, "the spec's list has no duplicate");
+        let want: std::collections::BTreeSet<&str> = GOLDEN_DENY_SET.iter().copied().collect();
+        assert_eq!(want.len(), 37, "the golden list has no duplicate");
         assert_eq!(have, want);
         for name in FORBIDDEN_TRAILERS {
             assert_eq!(
@@ -1771,7 +1772,7 @@ mod tests {
 
     #[test]
     fn every_forbidden_trailer_name_is_withheld() {
-        for name in SPEC_DENY_SET {
+        for name in GOLDEN_DENY_SET {
             for spelled in [name.to_string(), name.to_ascii_uppercase()] {
                 let (bytes, withheld) = trailer_bytes(&[(spelled.as_str(), "1"), ("x-ok", "1")]);
                 assert_eq!(

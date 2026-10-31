@@ -230,6 +230,7 @@ fn mitm_response(r: &Tns) -> anyhow::Result<HttpResponse> {
         status,
         version: mitm_version(r),
         headers: mitm_headers(r),
+        // The trailers mitmproxy records on a response are not imported.
         trailers: HeaderMap::new(),
         body: mitm_body(r),
         timestamp: UNIX_EPOCH,

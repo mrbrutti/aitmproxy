@@ -33,7 +33,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use x509_parser::prelude::*;
 
 use crate::ca::{CertAuthority, LeafCert};
-use crate::sansio::{Http1Machine, HttpSansIoEvent, HttpStateMachine, Side};
+use crate::sansio::{content_length, Http1Machine, HttpSansIoEvent, HttpStateMachine, Side};
 
 /// First byte of a TLS handshake record.
 const TLS_HANDSHAKE: u8 = 0x16;
@@ -604,8 +604,13 @@ async fn serve(
                         // waiting. The machine reports the expectation at most once
                         // per request, so this cannot write a second interim.
                         if machine.expects_continue() {
-                            let declared =
-                                machine.request().and_then(|r| declared_length(&r.headers));
+                            // The machine's own parse of `Content-Length`, so this
+                            // decision cannot drift from the framing it applies. It
+                            // has already rejected a malformed or conflicting value
+                            // before the head got here, so `None` means no length.
+                            let declared = machine
+                                .request()
+                                .and_then(|r| content_length(&r.headers).ok().flatten());
                             if declared.is_some_and(|n| n > max_body as u64) {
                                 // The body would be refused anyway: say nothing, so
                                 // the client does not upload it. The oversize branch
@@ -878,7 +883,25 @@ async fn serve(
             let events = if n == 0 {
                 machine.on_eof(Side::Server)
             } else {
-                machine.on_bytes(Side::Server, &buf[..n])?
+                match machine.on_bytes(Side::Server, &buf[..n]) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        // The machine refused the origin's bytes (a bad trailer
+                        // line, an over-cap section, malformed framing). Event
+                        // consumers see a response only through its events, so
+                        // say so before failing the connection; the words are
+                        // fixed because the machine's own text can quote the
+                        // origin's bytes.
+                        ctx.emit(Event::Error {
+                            flow: id,
+                            kind: aitm_core::FlowError::Upstream(
+                                "malformed response from upstream".to_string(),
+                            ),
+                        })
+                        .await;
+                        return Err(e);
+                    }
+                }
             };
             for ev in events {
                 match ev {
@@ -1149,15 +1172,6 @@ async fn flush<S: AsyncWrite + Unpin>(
         stream.flush().await?;
     }
     Ok(())
-}
-
-/// The length a head's `Content-Length` declares, when it has one. The machine
-/// has already rejected a malformed or conflicting value before the head reaches
-/// `serve`, so `None` means there is no length (a chunked body declares none).
-fn declared_length(headers: &aitm_core::HeaderMap) -> Option<u64> {
-    headers
-        .get("content-length")
-        .and_then(|v| v.trim().parse().ok())
 }
 
 /// Whether a `Connection:` header asks to close after this exchange.
@@ -2082,28 +2096,9 @@ mod tests {
     /// Read one 200 response, consuming `pending` before the stream, and return
     /// its `Content-Length`-framed body. Bytes read past it stay in `pending`.
     async fn read_response_keep(io: &mut DuplexStream, pending: &mut Vec<u8>) -> String {
-        let mut chunk = [0u8; 512];
-        loop {
-            if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&pending[..end]).to_ascii_lowercase();
-                let status = head.split(' ').nth(1).unwrap_or_default();
-                assert_eq!(status, "200", "unexpected response head {head:?}");
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length: "))
-                    .and_then(|v| v.parse().ok())
-                    .expect("response Content-Length");
-                if pending.len() >= end + 4 + len {
-                    let body =
-                        String::from_utf8_lossy(&pending[end + 4..end + 4 + len]).into_owned();
-                    pending.drain(..end + 4 + len);
-                    return body;
-                }
-            }
-            let n = io.read(&mut chunk).await.expect("read response");
-            assert!(n > 0, "connection closed before a full response arrived");
-            pending.extend_from_slice(&chunk[..n]);
-        }
+        let (status, body) = read_status_response_keep(io, pending).await;
+        assert_eq!(status, 200, "unexpected response status, body {body:?}");
+        body
     }
 
     // ---- `Expect: 100-continue` helpers -----------------------------------
@@ -5260,6 +5255,79 @@ mod tests {
             TRAILER_HEAD,
             "the client has the head and the chunk, and never a terminator"
         );
+    }
+
+    #[tokio::test]
+    async fn serve_reports_a_malformed_trailer_section_as_one_typed_error() {
+        // Event consumers (the scanner, findings, scripts) learn of a response
+        // from its events, so a response the machine refuses must still reach
+        // them as an error, or one bad trailer line would hide a body from them.
+        let mut section = String::from("0\r\n");
+        for n in 0..65 {
+            section.push_str(&format!("x-evil-91c2-{n}: v\r\n"));
+        }
+        section.push_str("\r\n");
+        let one_read = format!("{TRAILER_HEAD}{section}");
+        let deliveries = [
+            (
+                "head, then section",
+                vec![TRAILER_HEAD.to_string(), section],
+            ),
+            ("head and section together", vec![one_read]),
+        ];
+        for (delivery, segments) in deliveries {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+            let _origin = tokio::spawn(origin_replying(
+                origin_end,
+                Arc::new(Mutex::new(Vec::new())),
+                vec![segments],
+            ));
+
+            let (served, _) = with_serve(
+                &ctx,
+                Conn::plain(unknown_peer(), None),
+                None,
+                MAX_BODY,
+                |mut client| async move {
+                    client
+                        .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                        .await
+                        .expect("send");
+                    read_to_close(&mut client, Duration::from_secs(2)).await
+                },
+            )
+            .await;
+
+            let err = served.expect_err("an over-cap trailer section fails the connection");
+            assert!(err.to_string().contains("trailer"), "error: {err}");
+            let flow = stored_http(&ctx, "/t");
+            let events = sink.events.lock().expect("events lock");
+            let errors: Vec<&aitm_core::FlowError> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Error { flow: f, kind } if *f == flow.id => Some(kind),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                errors,
+                vec![&aitm_core::FlowError::Upstream(
+                    "malformed response from upstream".to_string()
+                )],
+                "one typed error, in fixed words ({delivery}): {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Event::Response(f) if *f == flow.id)),
+                "a refused response is never dispatched as complete: {events:?}"
+            );
+            assert!(
+                !format!("{events:?}").contains("evil-91c2"),
+                "the origin's field names must not reach an event: {events:?}"
+            );
+        }
     }
 
     #[tokio::test]

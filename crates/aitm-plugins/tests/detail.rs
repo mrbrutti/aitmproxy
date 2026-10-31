@@ -483,7 +483,7 @@ fn http_detail_response_has_no_trailers_key_when_there_are_none() {
     let id = store.insert(flow_with_bodies());
     let d = detail(&store, id, Some("inline"));
 
-    // A flow without trailers renders exactly today's six keys.
+    // A flow without trailers renders exactly these six keys.
     let keys: Vec<&str> = obj(&d, "response").keys().map(String::as_str).collect();
     assert_eq!(
         keys,

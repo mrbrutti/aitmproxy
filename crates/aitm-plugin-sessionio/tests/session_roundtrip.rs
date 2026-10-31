@@ -291,7 +291,7 @@ fn import_native(store: &MemFlowStore, bytes: Vec<u8>) -> Vec<FlowId> {
         .collect()
 }
 
-/// AC26 — `session.save` then `session.load` into a fresh store restores the
+/// `session.save` then `session.load` into a fresh store restores the
 /// response trailers, including a repeated name (differing only in case) in order.
 #[test]
 fn native_session_roundtrips_response_trailers() {
@@ -345,7 +345,7 @@ fn native_session_roundtrips_response_trailers() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// AC26 — a flow with trailers serialises them as an array of `[name, value]`
+/// A flow with trailers serialises them as an array of `[name, value]`
 /// pairs in wire order under `response.trailers`.
 #[test]
 fn a_flow_with_trailers_serialises_a_trailers_array_of_pairs() {
@@ -365,7 +365,7 @@ fn a_flow_with_trailers_serialises_a_trailers_array_of_pairs() {
     assert_eq!(doc["flows"][0]["kind"], "http", "the flow tag is unchanged");
 }
 
-/// AC26 — a flow without trailers serialises exactly as before: no `trailers` key.
+/// A flow without trailers serialises with no `trailers` key at all.
 #[test]
 fn a_flow_without_trailers_serialises_without_a_trailers_key() {
     let store = MemFlowStore::new();
@@ -378,8 +378,8 @@ fn a_flow_without_trailers_serialises_without_a_trailers_key() {
         "a response with no trailers writes no `trailers` key, got: {text}"
     );
 
-    // The response object is exactly today's five fields, so the document is the
-    // pre-change shape. The keys are compared sorted: whether serde_json's map
+    // The response object is exactly these five fields, so the document is the
+    // shape written before trailers existed. The keys are compared sorted: whether serde_json's map
     // iterates sorted or in insertion order depends on whether another workspace
     // crate (aitm-tui) enables `preserve_order`, which differs between
     // `cargo test -p aitm-plugin-sessionio` and a whole-workspace run.
@@ -394,8 +394,8 @@ fn a_flow_without_trailers_serialises_without_a_trailers_key() {
     assert_eq!(keys, ["body", "headers", "status", "timestamp", "version"]);
 }
 
-/// AC26 — a document saved before this change (no `trailers` key) still loads,
-/// with empty trailers. The export of a no-trailers flow IS the old shape.
+/// A document without the key (the shape written before trailers existed) still
+/// loads, with empty trailers. The export of a flow without trailers is that shape.
 #[test]
 fn an_older_document_loads_with_empty_trailers() {
     let store = MemFlowStore::new();
@@ -405,7 +405,7 @@ fn an_older_document_loads_with_empty_trailers() {
         !String::from_utf8(old_shape.clone())
             .expect("export is UTF-8")
             .contains("\"trailers\""),
-        "the fixture is the pre-change shape, with no `trailers` key"
+        "the fixture is a document without the `trailers` key"
     );
 
     let fresh = MemFlowStore::new();

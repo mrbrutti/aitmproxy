@@ -997,9 +997,10 @@ fn trailer_caps_fail_closed() {
 
 #[test]
 fn trailer_syntax_fails_closed() {
-    let cases: [(&str, &[u8]); 8] = [
+    let cases: [(&str, &[u8]); 9] = [
         ("control byte in a value", b"x-a: v\x01\r\n\r\n"),
         ("space inside a name", b"bad name: v\r\n\r\n"),
+        ("non-token byte in a name", b"x@a: v\r\n\r\n"),
         ("no colon", b"no-colon\r\n\r\n"),
         ("empty name", b": v\r\n\r\n"),
         ("leading space (obs-fold)", b" x-a: v\r\n\r\n"),
@@ -1024,6 +1025,7 @@ fn trailer_errors_never_echo_the_field() {
     for section in [
         &b"x-leaktoken-7: v\x01\r\n\r\n"[..],
         b"bad leaktoken-7: v\r\n\r\n",
+        b"x@leaktoken-7: v\r\n\r\n",
         b"no-colon-leaktoken-7\r\n\r\n",
         b" x-leaktoken-7: v\r\n\r\n",
     ] {
