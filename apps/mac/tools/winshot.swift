@@ -6,10 +6,14 @@ let args = CommandLine.arguments
 guard args.count >= 3 else {
     FileHandle.standardError.write(Data("usage: winshot.swift <ownerName> <out.png> [titleContains]\n".utf8)); exit(2)
 }
+// <ownerName> is the bundle's display name (a tagged dev build is still "Aitmproxy"); pass a
+// numeric pid instead to pick one process when two builds of the same app are running.
 let owner = args[1], out = args[2], titleNeedle = args.count > 3 ? args[3] : nil
+let ownerPID = Int(owner)
 let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
 let candidates = list.filter { info in
-    (info[kCGWindowOwnerName as String] as? String) == owner
+    (ownerPID.map { (info[kCGWindowOwnerPID as String] as? Int) == $0 }
+        ?? ((info[kCGWindowOwnerName as String] as? String) == owner))
         && (info[kCGWindowLayer as String] as? Int) == 0
         && ((info[kCGWindowBounds as String] as? [String: Any])?["Width"] as? Double ?? 0) > 400
         && (titleNeedle.map { ((info[kCGWindowName as String] as? String) ?? "").contains($0) } ?? true)
