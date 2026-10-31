@@ -216,9 +216,25 @@ So with capture on, Chrome (and anything on Chromium's QUIC stack) silently lose
 falls back to HTTP/2; QUIC-only destinations fail. The provider did see the attempts (UDP:443
 flows from `com.google.Chrome.helper` were declined). Firefox and Safari: see R4b.
 
-### R4b. Safari and Firefox (GUI)
+### R4b. Firefox, Safari and Apple's URLSession (GUI + a Swift probe), capture ON
 
-_Filled in from `gui-quic.sh` (window screenshots `safari-variant1.png`, `ff-gui-variant1.png`)._
+- **Firefox works.** A separate Firefox instance with a throwaway profile
+  (`open -na Firefox --args --no-remote -profile … https://cloudflare-quic.com/`, two ⌘R
+  reloads, window shot `ff-gui-variant1.png`) rendered "your browser used **HTTP/3**" while
+  the provider was declining its UDP:443 flow to 104.18.27.14 (seen in the framework log as
+  `org.mozilla.firefox -> 104.18.27.14:443`, datagram). So Firefox's QUIC stack tolerates
+  the `IP_DONTFRAG` failure that Chromium treats as fatal.
+- **Safari: HTTP/2 on the first load**, no UDP:443 attempt seen from Safari in that window
+  (`safari-variant1.png`; the scripted ⌘R reloads failed with an AppleEvent timeout, so only
+  the first, always-TCP load is proven). The Apple-stack probe below is the controlled test.
+- **Apple's stack works.** A Swift `URLSession` probe (`spike/observe-survey/apple-h3.swift`,
+  `assumesHTTP3Capable`, `URLSessionTaskMetrics.networkProtocolName`) negotiated **h3** to
+  cloudflare-quic.com (three loads, connection reused) and to quic.nginx.org with capture
+  **on**, identically with capture **off**; the provider log shows its UDP:443 flows declined
+  (`apple-h3 cloudflare-quic.com -> 10.9.10.1:53` then `-> 3.125.64.247:443` datagram). Safari
+  shares that stack: after Alt-Svc was known it opened `com.apple.Safari cloudflare-quic.com ->
+  104.18.26.14:443` as a datagram flow too. So Safari and Firefox keep HTTP/3; only Chromium's
+  QUIC (Chrome, Electron apps) fails on the `IP_DONTFRAG` error.
 
 ### R5. Restore
 
