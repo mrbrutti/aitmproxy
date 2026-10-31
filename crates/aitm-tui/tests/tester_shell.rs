@@ -921,11 +921,10 @@ fn inspector_frames_with_a_five_megabyte_body_do_not_freeze() {
 }
 
 /// The honest second snapshot (`aitm-tui --snapshot-core`): the fixture
-/// limited to the 61 commands the bus serves today (the 2026-10-29 M4 merge on
-/// top of the M6 parity additions, plus the scanner commands). F5/F6/F7/F12/F13,
-/// the M3 commands, the M6 F9/F10/F11/Map commands and the M4 F1 agent / F4
-/// subscription commands are all lit — with M4 merged nothing in the fixture is
-/// ahead of the core.
+/// limited to the 59 commands the bus serves today (the 2026-10-29 M4 merge on
+/// top of the M6 parity additions). F5/F6/F7/F12/F13, the M3 commands, the M6
+/// F9/F10/F11/Map commands and the M4 F1 agent / F4 subscription commands are
+/// all lit — with M4 merged nothing in the fixture is ahead of the core.
 #[test]
 fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     let app = fixture_app_core(200, 50);

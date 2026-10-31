@@ -279,8 +279,8 @@ fn ac7_exact_tool_set() {
 /// AC18: every `scan.*` tool the proxy lists carries an input schema an MCP
 /// client can build a call from: an object whose `properties` is non-empty.
 /// It iterates whatever `scan.*` tools are registered, so a new scan verb is
-/// covered without editing this test; it first asserts the two verbs that must
-/// always be there, so an unregistered command fails it rather than slipping
+/// covered without editing this test; it first asserts the three verbs that
+/// must always be there, so an unregistered command fails it rather than slipping
 /// through an empty loop.
 #[test]
 fn scan_tools_have_non_empty_input_schemas() {
@@ -297,7 +297,7 @@ fn scan_tools_have_non_empty_input_schemas() {
         .iter()
         .map(|t| t["name"].as_str().expect("tool name"))
         .collect();
-    for required in ["scan.discover", "scan.passive"] {
+    for required in ["scan.discover", "scan.passive", "scan.report"] {
         assert!(
             names.contains(&required),
             "`{required}` must be listed; scan.* tools listed: {names:?}"

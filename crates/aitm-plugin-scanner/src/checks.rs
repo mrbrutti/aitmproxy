@@ -5,14 +5,15 @@
 //! reflected-XSS uses a unique benign marker that carries HTML metacharacters
 //! (an unknown `<aitm-canary-...>` element, never an executing `<script>`), so
 //! an output encoder rewrites it and a raw match proves *unencoded* reflection
-//! — a correctly escaped (patched) response does not confirm. Open-redirect
-//! uses an off-origin sentinel host under the reserved `.invalid` TLD, matched
+//! — a correctly escaped (patched) response does not confirm — and only in a
+//! response typed as HTML, since a JSON echo is not browser-exploitable.
+//! Open-redirect uses an off-origin sentinel host under the reserved `.invalid` TLD, matched
 //! only in the `Location` header of a 3xx redirect. Confirmation reuses the
 //! `aitm_poc` matcher vocabulary — the exact same `Assertion`/`evaluate` a
 //! declarative PoC's `success` would use.
 
 use aitm_poc::matcher::{evaluate, MatchContext};
-use aitm_poc::{Assertion, MatchPart, Severity};
+use aitm_poc::{Assertion, MatchPart};
 
 use crate::discover::Location;
 
@@ -58,9 +59,20 @@ pub(crate) const OPEN_REDIRECT_SENTINEL: &str = "aitm-scan-sentinel.invalid";
 /// authority position, so a same-origin bounce that merely echoes the sentinel
 /// in a query string — or the sentinel appearing in any other header — never
 /// matches. Case-insensitive, because host names are. Paired with a 3xx status
-/// check in `confirm`.
+/// clause in [`CheckDefinition::success_assertion`].
 const OPEN_REDIRECT_LOCATION_REGEX: &str =
     r"(?im)^location:[ \t]*(?:https?:)?//aitm-scan-sentinel\.invalid(?:[:/?#]|$)";
+
+/// The `Content-Type` clause of the reflected-XSS confirming assertion: the
+/// response is a document a browser renders as HTML (`text/html` or
+/// `application/xhtml+xml`) — the only context a reflected marker could
+/// execute in. A correctly-typed JSON or plain-text API response that echoes
+/// the marker is not browser-exploitable, so it is not a confirmed hit.
+/// Anchored to the `Content-Type` header line (spaces/tabs only between the
+/// name and the value, as with the `Location` regex), so a differently named
+/// header that merely carries the media type never matches.
+const REFLECTED_XSS_CONTENT_TYPE_REGEX: &str =
+    r"(?im)^content-type:[ \t]*.*(text/html|application/xhtml\+xml)";
 
 /// One vulnerability class: where to inject, the inert payloads to try, and
 /// how `confirm` judges a response.
@@ -100,17 +112,15 @@ const REFLECTED_XSS_MARKERS: &[&str] = &[
 /// does not collapse them.
 const OPEN_REDIRECT_PATHS: &[&str] = &["/", "/x", "/a/b", "/?n=1", "/redir", "/go"];
 
-/// Whether a response's `Content-Type` marks it as a document a browser renders
-/// as HTML — the only context a reflected marker could execute in. A
-/// correctly-typed JSON or plain-text API response is not HTML-exploitable, so a
-/// marker echoed there is not a confirmed reflected-XSS hit.
-fn response_is_html(headers: &[(String, String)]) -> bool {
-    headers.iter().any(|(name, value)| {
-        name.eq_ignore_ascii_case("content-type") && {
-            let v = value.to_ascii_lowercase();
-            v.contains("text/html") || v.contains("application/xhtml+xml")
-        }
-    })
+/// Whether `assertion` contains a `Word` matcher with an empty word, which
+/// matches every response. Looks through `All`/`Any` only: a `Not` around an
+/// empty word can never turn a miss into a hit.
+fn has_empty_word(assertion: &Assertion) -> bool {
+    match assertion {
+        Assertion::Word { word, .. } => word.is_empty(),
+        Assertion::All(items) | Assertion::Any(items) => items.iter().any(has_empty_word),
+        _ => false,
+    }
 }
 
 impl CheckDefinition {
@@ -126,17 +136,9 @@ impl CheckDefinition {
         let assertion = self.success_assertion(payload);
         // An empty word matches every response; never confirm on one (a
         // hand-built `Payload` with an empty value and no marker would
-        // otherwise report every response as a hit). Checked before the HTML
-        // gate below so the empty-word guard is what rejects it.
-        if let Assertion::Word { word, .. } = &assertion {
-            if word.is_empty() {
-                return None;
-            }
-        }
-        // Reflected-XSS only matters where the marker renders as HTML: an API
-        // that echoes it into a correctly-typed JSON/text response is not
-        // browser-exploitable, so it is not a confirmed hit.
-        if self.class == CLASS_REFLECTED_XSS && !response_is_html(headers) {
+        // otherwise report every response as a hit). This is the only check
+        // `confirm` makes beyond evaluating `success_assertion`.
+        if has_empty_word(&assertion) {
             return None;
         }
         let mut ctx = MatchContext::new(status, body.to_string());
@@ -153,13 +155,17 @@ impl CheckDefinition {
     }
 
     /// The `success` assertion this class confirms with, for one payload — the
-    /// exact assertion a recorded PoC's `success` reuses (`build_poc`, Wave 2).
-    /// Reflected-XSS looks for the payload's own marker (each payload judged
-    /// independently); open-redirect requires both a redirect status a user
-    /// agent actually follows (not 300/304/305/306/309+) *and* the sentinel
-    /// host in the `Location` header (one assertion covers every payload).
-    /// `confirm` judges a hit by evaluating exactly this assertion, so the two
-    /// can never drift apart.
+    /// exact assertion a recorded PoC's `success` reuses (`build_poc`).
+    /// Reflected-XSS requires both the payload's own marker in the body (each
+    /// payload judged independently) *and* an HTML `Content-Type`; open-redirect
+    /// requires both a redirect status a user agent actually follows (not
+    /// 300/304/305/306/309+) *and* the sentinel host in the `Location` header
+    /// (one assertion covers every payload).
+    ///
+    /// `confirm` judges a hit by evaluating exactly this assertion — its only
+    /// extra check is rejecting an empty word, which the scanner never builds a
+    /// payload for — so a recorded PoC's `success` passes on precisely the
+    /// responses `confirm` accepts, and the two cannot drift apart.
     pub(crate) fn success_assertion(&self, payload: &Payload) -> Assertion {
         if self.class == CLASS_OPEN_REDIRECT {
             Assertion::All(vec![
@@ -176,13 +182,19 @@ impl CheckDefinition {
                 },
             ])
         } else {
-            Assertion::Word {
-                word: payload
-                    .marker
-                    .clone()
-                    .unwrap_or_else(|| payload.value.clone()),
-                part: MatchPart::Body,
-            }
+            Assertion::All(vec![
+                Assertion::Word {
+                    word: payload
+                        .marker
+                        .clone()
+                        .unwrap_or_else(|| payload.value.clone()),
+                    part: MatchPart::Body,
+                },
+                Assertion::Regex {
+                    regex: REFLECTED_XSS_CONTENT_TYPE_REGEX.to_string(),
+                    part: MatchPart::Header,
+                },
+            ])
         }
     }
 
@@ -201,7 +213,7 @@ impl CheckDefinition {
     }
 
     /// Reflected-XSS: a unique benign marker reflected verbatim (unencoded) in
-    /// the response body. Locations: query and body parameters.
+    /// the body of an HTML response. Locations: query and body parameters.
     pub fn reflected_xss() -> Self {
         let payloads = REFLECTED_XSS_MARKERS
             .iter()
@@ -251,18 +263,6 @@ impl CheckDefinition {
     /// error names.
     pub fn registered_classes() -> &'static [&'static str] {
         &[CLASS_REFLECTED_XSS, CLASS_OPEN_REDIRECT]
-    }
-}
-
-/// Severity assigned to a built PoC, keyed by class — the single mapping
-/// `reproduce::build_poc` reuses, so a class's severity cannot drift between
-/// callers. `None` for a class `for_class` does not resolve: the caller
-/// chooses the default rather than this function silently inventing one.
-pub fn severity_for(class: &str) -> Option<Severity> {
-    match class {
-        CLASS_REFLECTED_XSS => Some(Severity::High),
-        CLASS_OPEN_REDIRECT => Some(Severity::Medium),
-        _ => None,
     }
 }
 
@@ -428,8 +428,9 @@ mod tests {
             value: String::new(),
             marker: None,
         };
-        // An HTML Content-Type, so the HTML gate passes and the empty-word guard
-        // is the only thing standing between this payload and a false hit.
+        // An HTML Content-Type, so the Content-Type clause passes and the
+        // empty-word guard is the only thing standing between this payload and a
+        // false hit.
         let html = vec![("Content-Type".to_string(), "text/html".to_string())];
         assert!(def.confirm(200, "anything at all", &html, &empty).is_none());
     }
@@ -480,10 +481,6 @@ mod tests {
                 "`{class}` exceeds the payload cap: {}",
                 def.payloads.len()
             );
-            assert!(
-                severity_for(class).is_some(),
-                "`{class}` has no severity mapping"
-            );
         }
     }
 
@@ -517,22 +514,51 @@ mod tests {
             }
             other => panic!("expected Assertion::All: {other:?}"),
         }
-
-        let xss = CheckDefinition::reflected_xss();
-        let xss_payload = xss.payloads.first().expect("a payload");
-        assert!(matches!(
-            xss.success_assertion(xss_payload),
-            Assertion::Word {
-                part: MatchPart::Body,
-                ..
-            }
-        ));
     }
 
     #[test]
+    fn reflected_xss_success_assertion_requires_the_marker_and_an_html_content_type() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = &def.payloads[0];
+        assert_eq!(
+            def.success_assertion(payload),
+            Assertion::All(vec![
+                Assertion::Word {
+                    word: "<aitm-canary-0001>".to_string(),
+                    part: MatchPart::Body,
+                },
+                Assertion::Regex {
+                    regex: r"(?im)^content-type:[ \t]*.*(text/html|application/xhtml\+xml)"
+                        .to_string(),
+                    part: MatchPart::Header,
+                },
+            ])
+        );
+    }
+
+    /// Evaluate `assertion` against a response, the way a PoC runner would.
+    fn assertion_holds(
+        assertion: &Assertion,
+        status: u16,
+        body: &str,
+        headers: &[(String, String)],
+    ) -> bool {
+        let mut ctx = MatchContext::new(status, body.to_string());
+        for (name, value) in headers {
+            ctx = ctx.with_header(name.clone(), value.clone());
+        }
+        evaluate(assertion, &ctx)
+    }
+
+    /// `confirm` and the recorded PoC's `success` assertion must agree on every
+    /// response, for both shipped classes: a hit `confirm` accepts must satisfy
+    /// the assertion, and a response `confirm` rejects must fail it.
+    #[test]
     fn confirm_matches_the_success_assertion() {
+        // Open-redirect: the redirect status and the Location clause.
         let def = CheckDefinition::open_redirect();
         let payload = def.payloads.first().expect("a payload");
+        let assertion = def.success_assertion(payload);
         let loc = vec![(
             "Location".to_string(),
             "https://aitm-scan-sentinel.invalid/x".to_string(),
@@ -543,27 +569,76 @@ mod tests {
                 def.confirm(status, "", &loc, payload).is_some(),
                 "status {status} must confirm"
             );
+            assert!(
+                assertion_holds(&assertion, status, "", &loc),
+                "status {status}: confirm hit but the success assertion is false"
+            );
         }
         for status in [300, 304, 399, 200] {
             assert!(
                 def.confirm(status, "", &loc, payload).is_none(),
                 "status {status} must not confirm"
             );
+            assert!(
+                !assertion_holds(&assertion, status, "", &loc),
+                "status {status}: confirm rejects it but the success assertion passes"
+            );
         }
 
-        for status in [301, 302, 303, 307, 308] {
-            if def.confirm(status, "", &loc, payload).is_some() {
-                let assertion = def.success_assertion(payload);
-                let mut ctx = MatchContext::new(status, String::new());
-                for (name, value) in &loc {
-                    ctx = ctx.with_header(name.clone(), value.clone());
-                }
-                assert!(
-                    evaluate(&assertion, &ctx),
-                    "confirm hit but the success assertion itself does not evaluate true"
-                );
-            }
+        // Reflected-XSS: the marker in the body *and* an HTML Content-Type.
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let marker = payload.marker.clone().expect("a marker");
+        let assertion = def.success_assertion(payload);
+        let body = format!("{{\"q\":\"{marker}\"}}");
+        let typed =
+            |content_type: &str| vec![("Content-Type".to_string(), content_type.to_string())];
+
+        // An HTML response reflecting the marker: both agree it is a hit.
+        for content_type in [
+            "text/html",
+            "text/html; charset=utf-8",
+            "TEXT/HTML",
+            "application/xhtml+xml",
+        ] {
+            let headers = typed(content_type);
+            assert!(
+                def.confirm(200, &body, &headers, payload).is_some(),
+                "`{content_type}` must confirm"
+            );
+            assert!(
+                assertion_holds(&assertion, 200, &body, &headers),
+                "`{content_type}`: confirm hit but the success assertion is false"
+            );
         }
+
+        // The same marker echoed into JSON, plain text, or an untyped response:
+        // `confirm` rejects it, and a recorded PoC's `success` must not pass it.
+        for (label, headers) in [
+            ("application/json", typed("application/json")),
+            ("text/plain", typed("text/plain")),
+            ("no Content-Type", Vec::new()),
+            // The HTML media type under a different header name is not the
+            // response's Content-Type.
+            (
+                "X-Content-Type: text/html",
+                vec![("X-Content-Type".to_string(), "text/html".to_string())],
+            ),
+        ] {
+            assert!(
+                def.confirm(200, &body, &headers, payload).is_none(),
+                "{label} must not confirm"
+            );
+            assert!(
+                !assertion_holds(&assertion, 200, &body, &headers),
+                "{label}: confirm rejects it but the success assertion passes"
+            );
+        }
+
+        // An HTML response that does not reflect the marker: neither passes.
+        let html = typed("text/html");
+        assert!(def.confirm(200, "nothing here", &html, payload).is_none());
+        assert!(!assertion_holds(&assertion, 200, "nothing here", &html));
     }
 
     #[test]

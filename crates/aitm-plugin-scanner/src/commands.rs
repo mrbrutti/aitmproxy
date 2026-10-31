@@ -1,7 +1,8 @@
 //! The scanner's MCP commands: `scan.discover` (endpoint discovery, below), and
 //! the two read-only verbs `scan.passive` (passive checks over captured flows)
 //! and `scan.report` (the findings report and index). All result shaping lives
-//! here; the engine modules build no [`Value`].
+//! here; the engine modules build no [`Value`] (bar the one JSON-to-[`Value`]
+//! bridge, [`report::index_to_value`]).
 //!
 //! `scan.discover` crawls one operator-authorized, in-scope target (same-origin, scope-bound,
 //! budget-capped — see [`crate::crawl`]) and enumerates the parameter names
@@ -209,8 +210,8 @@ impl Command for ScanDiscover {
 /// `injection_points` enumerated from the captured requests that served them,
 /// the `endpoint_flows` links, `pages_crawled` and `stopped_reason`.
 ///
-/// Shared by [`ScanDiscover`] and the `scan.run` driver, so the two shape the
-/// discovery half of their results identically. Reads only the host's store;
+/// Shared by [`ScanDiscover`] and, later, the `scan.run` driver, so the two
+/// shape the discovery half of their results identically. Reads only the host's store;
 /// every free-text string is run through [`scrub_text`].
 pub(crate) fn discover_value(
     host: &CommandHost<'_>,
@@ -386,8 +387,8 @@ impl Command for ScanPassive {
 /// Every string goes through [`scrub_text`], whatever the engine put in it: the
 /// passive checks never carry a request value, and this is the second line of
 /// defence if one ever did. A finding with no location or name (a missing-header
-/// finding) reports them as `Null`. Shared by [`ScanPassive`] and the `scan.run`
-/// driver.
+/// finding) reports them as `Null`. Shared by [`ScanPassive`] and, later, the
+/// `scan.run` driver.
 pub(crate) fn passive_value(findings: &[PassiveFinding]) -> Value {
     let text = |s: &str| Value::Str(scrub_text(s));
     let items = findings
@@ -473,22 +474,22 @@ impl Command for ScanReport {
 }
 
 /// The `scan.report` result: `{ "report_md": Str, "index": Array }`, where
-/// `report_md` is [`render_report`] over every record given and `index` is
-/// [`render_index`] converted to the transport-neutral [`Value`], capped at
-/// [`MAX_RESULT_ITEMS`] entries.
+/// `report_md` is [`render_report`] and `index` is [`render_index`] converted
+/// to the transport-neutral [`Value`], both over the same leading
+/// [`MAX_RESULT_ITEMS`] records, so the two halves describe the same findings.
 ///
 /// A shareable report carries no credential (AC11/AC24): the markdown and every
 /// string of the index are run through [`scrub_text`]. The store masks a
 /// finding's `title`, `notes` and `target` when it writes them, but not
 /// `poc_ref` or the artifact paths, and a record may predate the masking or be
 /// edited by hand, so the output is scrubbed here whatever the record holds.
-/// Shared by [`ScanReport`] and the `scan.run` driver.
+/// Shared by [`ScanReport`] and, later, the `scan.run` driver.
 pub(crate) fn report_value(recs: &[FindingRecord]) -> Value {
-    let capped = recs.get(..MAX_RESULT_ITEMS).unwrap_or(recs);
+    let capped = &recs[..recs.len().min(MAX_RESULT_ITEMS)];
     let mut result = BTreeMap::new();
     result.insert(
         "report_md".into(),
-        Value::Str(scrub_text(&render_report(recs))),
+        Value::Str(scrub_text(&render_report(capped))),
     );
     result.insert(
         "index".into(),
@@ -2298,23 +2299,45 @@ mod tests {
         assert_eq!(index[0]["passed"], Value::Bool(true));
     }
 
-    /// `index` is capped at `MAX_RESULT_ITEMS` like every other array the scanner
-    /// returns; `report_md` still reports every finding it was given.
+    /// `report_md` and `index` are both capped at `MAX_RESULT_ITEMS`, over the
+    /// SAME leading slice of records, so the two halves of one result agree on
+    /// which findings they describe.
     #[test]
-    fn report_value_caps_the_index() {
+    fn report_value_caps_the_report_and_the_index_to_the_same_slice() {
         let recs: Vec<FindingRecord> = (0..MAX_RESULT_ITEMS + 6)
-            .map(|i| finding(&format!("f-{i}"), "Reflected XSS", "http://t.test/x"))
+            .map(|i| {
+                finding(
+                    &format!("f-{i}"),
+                    &format!("Finding {i}"),
+                    "http://t.test/x",
+                )
+            })
             .collect();
 
         let result = report_value(&recs);
 
         let (md, index) = report_parts(&result);
         assert_eq!(index.len(), MAX_RESULT_ITEMS);
-        assert_eq!(section_count(&md), MAX_RESULT_ITEMS + 6);
-        assert!(
-            md.contains(&format!("{} findings,", MAX_RESULT_ITEMS + 6)),
-            "{md}"
+        assert_eq!(
+            section_count(&md),
+            MAX_RESULT_ITEMS,
+            "report_md is capped too"
         );
+        assert!(
+            md.contains(&format!("{MAX_RESULT_ITEMS} findings,")),
+            "the summary line counts the capped slice: {}",
+            md.lines().nth(2).unwrap_or_default()
+        );
+
+        // The last finding inside the cap is in both halves; the first one past
+        // it is in neither.
+        let last = MAX_RESULT_ITEMS - 1;
+        assert!(md.contains(&format!("## Finding {last}\n")));
+        assert_eq!(
+            index[last]["poc_path"],
+            Value::Str(format!("f-{last}.poc.yaml"))
+        );
+        assert!(!md.contains(&format!("## Finding {MAX_RESULT_ITEMS}\n")));
     }
 
     /// The dedupe key includes the URL: the same `(location, name)` on two

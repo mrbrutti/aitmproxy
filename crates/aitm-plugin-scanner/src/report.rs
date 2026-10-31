@@ -8,15 +8,15 @@ use aitm_findings::{DiskFindingStore, FindingFilter, FindingRecord, FindingStore
 /// Load every recorded finding, optionally filtered to `target`. Returns an
 /// **empty** vec (not an error) when no `findings.dir` is configured — the
 /// deny-by-default posture: `scan.report` with no findings store wired has
-/// nothing to show, not a failure. A listed finding whose record cannot be read
-/// or parsed is silently skipped; surfacing that count difference is the job of
-/// `scan.report`, not of this helper.
+/// nothing to show, not a failure. A record that cannot be read or parsed is
+/// skipped.
 ///
 /// `target` is matched through [`target_matches`], not
 /// [`FindingFilter::target`]'s exact string equality: a campaign base URL
 /// (`http://t.test:8080`) must relate to a recorded endpoint
 /// (`http://t.test:8080/search`), so every record is listed unfiltered and
-/// matched here instead.
+/// matched here instead, on the listing's `target` and before the full record
+/// is read, so a record for another target is never loaded.
 pub fn load_records(host: &CommandHost<'_>, target: Option<&str>) -> Vec<FindingRecord> {
     let Some(dir) = host.config().and_then(|c| c.findings.dir.clone()) else {
         return Vec::new();
@@ -25,11 +25,8 @@ pub fn load_records(host: &CommandHost<'_>, target: Option<&str>) -> Vec<Finding
     store
         .list(&FindingFilter::default())
         .iter()
+        .filter(|summary| target.is_none_or(|t| target_matches(t, &summary.target)))
         .filter_map(|summary| store.get(&summary.id))
-        .filter(|record| match target {
-            Some(t) => target_matches(t, &record.target),
-            None => true,
-        })
         .collect()
 }
 
