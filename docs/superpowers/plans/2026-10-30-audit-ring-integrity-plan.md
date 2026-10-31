@@ -134,7 +134,7 @@ the Coder stops and reports rather than editing the test.
 | AC6 | 2 | `redact::tests::scrub_text_sees_pairs_nested_in_a_non_secret_value` |
 | AC7 | 2 | `redact::tests::scrub_text_does_not_mask_a_host_port` |
 | AC8 | 2 | `redact::tests::scrub_text_and_is_secret_key_share_one_vocabulary` |
-| AC9 | 2 | `redact::tests::scrub_text_survives_hostile_inputs` (first assertion red, rest guard) |
+| AC9 | 2 | `redact::tests::scrub_text_survives_hostile_inputs` (first assertion red, rest guard), `redact::tests::scrub_text_stays_linear_when_quotes_open_but_never_close` (red) |
 | AC10 | 2, 3 | oracle runs of the scanner, poc, findings, plugins, mcp suites (guard) |
 | AC11 | 3 | grep count `0` plus `crates/aitm-poc/tests/builder.rs` (guard) |
 | AC12 | 4 | `audit::tests::sanitize_client_label_bounds_a_hostile_label` |
@@ -161,13 +161,33 @@ the Coder stops and reports rather than editing the test.
 | AC33 | 2, 4, 5, 11 | review-checked doc updates |
 | AC34 | 11 | mutation runs |
 | AC35 | 11 | the Rust gate |
-| *Fix tasks 1 and 2 (panel rounds 1 and 2, whole branch)* | | |
+| *Fix tasks 1 to 3 (panel rounds 1 to 3, whole branch)* | | |
 | AC36 | Fix tasks 1, 2 | `redact::tests::scrub_text_masks_a_quoted_secret_after_an_unclosed_quote`, `redact::tests::scrub_text_never_leaves_a_credential_after_an_unclosed_quote`, `redact::tests::scrub_text_closes_a_padded_value_at_its_own_quote` |
 | AC37 | Fix tasks 1, 2 | `redact::tests::scrub_text_reads_unicode_whitespace_as_blank` |
 | AC38 | Fix tasks 1, 2 | `audit::tests::declared_client_label_rewrites_a_reserved_name_hidden_by_invisible_characters`, `audit::tests::sanitize_client_label_drops_every_invisible_character` |
+| AC39 | Fix task 3 | `a_padded_reserved_name_keeps_its_declared_suffix_through_the_server` (`audit_integrity.rs`, red) |
+| AC40 | Fix task 3 | `audit::tests::declared_client_label_survives_the_consumption_pass` (red) |
 
 Tests in `audit_integrity.rs` are run with `cargo test -p aitm-mcp --test
 audit_integrity`.
+
+**Fix task 3 (panel round 3, whole branch).** Input: the round-3 security, spec and
+Tester findings in the Review log (one finding: a padded lookalike of `web-bridge`, 62 to
+64 chars, lost its ` (declared)` suffix when the server's consumption pass cut the stored
+label to 64 chars). Files touched: `crates/aitm-core/src/audit.rs` (the body and doc
+comment of `declared_client_label`, signature unchanged, plus the AC40 test) and
+`crates/aitm-mcp/tests/audit_integrity.rs` (the AC39 test). `crates/aitm-mcp/src/server.rs`
+is not touched: `conn_audit_label` and `sanitize_client_label` stay as they are, and the
+fix makes the consumption pass a no-op on a reserved-name rewrite instead of adding a
+guard there. Test first: both tests fail on the code at the start of the task. Expected
+values: `declared_client_label("web-bridge")` is exactly `Some("web-bridge (declared)")`;
+`web-bridge` + 54 U+17B4 yields `web-bridge` + 43 U+17B4 + ` (declared)` (64 chars) and is
+the same label on the ring entry and at the host; `web` + 54 U+17B4 + `-bridge` yields
+`web` + 50 U+17B4 with no suffix (the cut head no longer reads as the name). Independent
+of every other task (all are done); the spec and plan text amendments of the same round
+(AC9, AC33, AC36, Intent, Residuals 4, 11, 13, 14, Review log) are the Architect's and
+touch only these two documents. After it: Tester and the panel run again, with the
+round-3 reports in hand.
 
 ### Calls made in this plan (Architect's calls, for Matt to correct)
 
@@ -286,8 +306,13 @@ audit_integrity`.
     `api_key`, `apikey`, `api-key`, `bearer`, `credential`, assert `is_secret_key(k)` equals
     `scrub_text(&format!("{k}=VALUE9")) != format!("{k}=VALUE9")`.
   - `scrub_text_survives_hostile_inputs`: `"sid=".repeat(1 << 20)` returns exactly
-    `sid=[redacted]`; `"a".repeat(4 << 20)`, `"\"".repeat(2 << 20)`,
-    `"\\".repeat(2 << 20)`, and `"sid='x ".repeat(150_000)` return without panicking.
+    `sid=[redacted]`; `"a".repeat(4 << 20)`, `"\"".repeat(2 << 20)` and
+    `"\\".repeat(2 << 20)` come back unchanged, without panicking. It keeps a pointer
+    comment to the next test.
+  - `scrub_text_stays_linear_when_quotes_open_but_never_close`:
+    `"sid='x ".repeat(150_000)` returns exactly `"sid='[redacted] ".repeat(150_000)`
+    (every quote opens and none closes; each failed closing-quote search is remembered,
+    so the scan stays linear).
   The six original tests listed under Task 1 are not edited and must pass.
 - **Red:** `cargo test -p aitm-core --lib redact::tests` fails on: the first row of
   `scrub_text_masks_unframed_session_credentials` (got `sid=abc123`);
@@ -296,7 +321,9 @@ audit_integrity`.
   (got `next=/cb?sid=S1`); `scrub_text_does_not_mask_a_host_port` (the `token.` row got
   `token.example.com:[redacted]`); `scrub_text_and_is_secret_key_share_one_vocabulary`
   (key `sid`); the first assertion of `..._survives_hostile_inputs` (the old regex does
-  not mask `sid`, so the 4 MiB input comes back unchanged). `..._leaves_lookalike_pairs_alone`
+  not mask `sid`, so the 4 MiB input comes back unchanged) and
+  `scrub_text_stays_linear_when_quotes_open_but_never_close` (the old regex leaves
+  `sid='x ` unmasked, so its exact-output assertion fails). `..._leaves_lookalike_pairs_alone`
   and the remaining `..._survives_hostile_inputs` assertions pass before and after
   (guards).
 - **Green, then the oracle (AC10).** `cargo test -p aitm-core --lib redact::tests` prints
@@ -354,7 +381,11 @@ audit_integrity`.
   ASCII case-insensitive) an entry of `RESERVED_CLIENT_LABELS`, return
   `format!("{label} (declared)")`. (Fix task 2 later replaced that equality with a
   skeleton comparison: the label reduced to its lowercased ASCII alphanumerics equals
-  the skeleton of an entry of `RESERVED_CLIENT_LABELS`; spec Design 2 item 3, AC38.)
+  the skeleton of an entry of `RESERVED_CLIENT_LABELS`; spec Design 2 item 3, AC38.
+  Fix task 3 then kept the result within `MAX_CLIENT_LABEL_CHARS` including the
+  ` (declared)` suffix: a reserved-looking label is cut to 53 chars and trimmed, and the
+  suffix is appended only if the cut head still has the reserved skeleton; spec Design 2
+  item 3, AC39, AC40; see "Fix task 3" below the AC coverage table.)
   Re-export the three constants and two functions from
   `lib.rs`. Do not edit `origin_label` or any existing item.
 - **Tests (written first)**, in `audit.rs` `mod tests`:
@@ -658,7 +689,10 @@ audit_integrity`.
   share, an unlimited call can return up to 6144 entries, and `limit` is advisable; the
   `client_label` result description says it is the server-minted `web-bridge` for the web
   bridge, otherwise the client's declared `initialize.clientInfo.name`, sanitised to at
-  most 64 characters, display-only (`origin` is authoritative). No code change, no
+  most 64 characters, display-only (`origin` is authoritative). (Fix task 2 later
+  shortened the `agent.activity` description to the caller-relevant points and moved the
+  lane, fair-share and label-rule detail into the `AgentActivity` doc comment and the two
+  module docs; spec AC33.) No code change, no
   signature change. README: run `grep -n "audit\|agent.activity" README.md`, and edit it
   only if a line is now factually wrong (the table row at about line 472 is not).
   **Mutation checks (AC34), in the sandbox, each reverted by hand.** The Coder runs no
@@ -725,16 +759,27 @@ Kept by the main session during stage 6. One row per finding.
 | whole branch (round 1) | spec | Minor | Residual risk not documented | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): residuals added |
 | whole branch (round 1) | spec | Minor | Extra tests and a doc clause beyond the spec | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: tests and doc only |
 | whole branch (round 1) | spec | Minor | Spec and plan statements not literally true | fixed in 7b36826 (fix task 1; spec amendment a8f0c0b): wording |
-| whole branch (round 2) | spec | Important | AC36, AC37 and AC38 test names in the spec and plan differ from the tests as built | fixed in fix task 2 (sha filled at integration): spec and plan aligned to the built names (AC36 lists all three tests, AC38 both) |
-| whole branch (round 2) | spec | Important | AC38 test gap: no negative control and no check over the whole dropped set | fixed in fix task 2 (sha filled at integration): negative controls (`webbridges`, `aitm-mac\u{3164}`) and a loop over the dropped set added (`sanitize_client_label_drops_every_invisible_character`) |
-| whole branch (round 2) | spec | Minor | Design 4 and plan Task 2 text out of step with the code (key run, end-of-value set, "stricter of the two" claim, built signatures) | fixed in fix task 2 (sha filled at integration): spec Design 4, plan Task 2 note |
-| whole branch (round 2) | spec | Minor | Isolation overclaims in the spec itself | fixed in fix task 2 (sha filled at integration): spec Goals, Design 1 (floor, why both lanes), Semantics table, Residual risks 2, Summary |
-| whole branch (round 2) | spec | Minor | Wording leftovers (doc strings) | fixed in fix task 2 (sha filled at integration) |
-| whole branch (round 2) | security | Minor | A quoted key opener directly after an unclosed quote that ends in `=` or `:` can still be swallowed | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: the old regex leaked the adjacent variant, no new capability; Residual risks 12 |
-| whole branch (round 2) | security | Minor | Reserved-name guard bypassable with invisible code points outside the dropped set | fixed in fix task 2 (sha filled at integration): skeleton comparison, spec Design 2 item 3, AC38 |
-| whole branch (round 2) | quality | Minor | Findings 1 to 5, 8 and 9 of the round-2 quality report (Minors 1 to 9, less 6 and 7 below) | fixed in fix task 2 (sha filled at integration) |
-| whole branch (round 2) | quality | Minor | Finding 6: a next key with only a closing quote (`password='x password'=S3CR3T` leaves `S3CR3T`) | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: malformed input only (five regressions in a 1.5M-input differential), the doc is softened; Residual risks 13 |
-| whole branch (round 2) | quality | Minor | Finding 7 of the round-2 quality report | fixed in fix task 2 (sha filled at integration): doc-only |
+| whole branch (round 2) | spec | Important | AC36, AC37 and AC38 test names in the spec and plan differ from the tests as built | fixed in 56819ce (fix task 2; docs 0ca66fe): spec and plan aligned to the built names (AC36 lists all three tests, AC38 both) |
+| whole branch (round 2) | spec | Important | AC38 test gap: no negative control and no check over the whole dropped set | fixed in 56819ce (fix task 2; docs 0ca66fe): negative controls (`webbridges`, `aitm-mac\u{3164}`) and a loop over the dropped set added (`sanitize_client_label_drops_every_invisible_character`) |
+| whole branch (round 2) | spec | Minor | Design 4 and plan Task 2 text out of step with the code (key run, end-of-value set, "stricter of the two" claim, built signatures) | fixed in 56819ce (fix task 2; docs 0ca66fe): spec Design 4, plan Task 2 note |
+| whole branch (round 2) | spec | Minor | Isolation overclaims in the spec itself | fixed in 56819ce (fix task 2; docs 0ca66fe): spec Goals, Design 1 (floor, why both lanes), Semantics table, Residual risks 2, Summary |
+| whole branch (round 2) | spec | Minor | Wording leftovers (doc strings) | fixed in 56819ce (fix task 2; docs 0ca66fe) |
+| whole branch (round 2) | security | Minor | A quoted key opener directly after an unclosed quote that ends in `=` or `:` can still be swallowed | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: a narrow regression versus the old regex for text where an unclosed `=`/`:`-ending quote sits directly before a victim's quoted key; accepted as Residual risks 12 (the old regex leaked the simpler adjacent `token= "password":"V"` identically) |
+| whole branch (round 2) | security | Minor | Reserved-name guard bypassable with invisible code points outside the dropped set | fixed in 56819ce (fix task 2; docs 0ca66fe): skeleton comparison, spec Design 2 item 3, AC38 |
+| whole branch (round 2) | quality | Minor | Q1: the padded-value table did not pin the end-of-value set (5 mutants survived) | fixed in 56819ce (fix task 2; docs 0ca66fe): five rows added, all five mutants killed |
+| whole branch (round 2) | quality | Minor | Q2: the per-quote-character memo was untested | fixed in 56819ce (fix task 2; docs 0ca66fe): two-quote rows added (`a_token="x b_token='y z' c` and its mirror) |
+| whole branch (round 2) | quality | Minor | Q3: the memo soundness comment omitted the invariant | fixed in 56819ce (fix task 2; docs 0ca66fe) |
+| whole branch (round 2) | quality | Minor | Q4: the "keep in step" comments were inaccurate | fixed in 56819ce (fix task 2; docs 0ca66fe) |
+| whole branch (round 2) | quality | Minor | Q5: the reason-cap docs said 1024 where the stored reason can be 1027 bytes | fixed in 56819ce (fix task 2; docs 0ca66fe): docs say "plus a one-character marker" |
+| whole branch (round 2) | quality | Minor | Q6: a next key with only a closing quote (`password'=`; `password='x password'=S3CR3T` leaves `S3CR3T`) | accepted by the orchestrator under Matt's standing autonomous-approve instruction (lead session brief, 2026-10-30); Matt to countersign in the PR: malformed input only (11 regressions in a differential of 3M random malformed strings, all of one shape: an unclosed value quote then a later key with only a closing quote, `password'=` or `api_key"=`), the doc is softened; Residual risks 13 |
+| whole branch (round 2) | quality | Minor | Q7: `is_host_port` accepts only ASCII terminators | fixed in 56819ce (fix task 2; docs 0ca66fe): doc-only, the behaviour is stated (now recorded in spec Residual risks 11) |
+| whole branch (round 2) | quality | Minor | Q8: new-test hygiene | fixed in 56819ce (fix task 2; docs 0ca66fe) |
+| whole branch (round 2) | quality | Minor | Q9: the `agent.activity` description was full of jargon | fixed in 56819ce (fix task 2; docs 0ca66fe): shortened to the caller-relevant points, detail moved to doc comments (spec AC33) |
+| whole branch (round 3) | security | Minor | The ` (declared)` suffix is cut away at consumption: a padded lookalike of 62 to 64 chars loses it when the server re-sanitises the stored label to 64 chars | fixed in fix task 3 (sha filled at integration): `declared_client_label` stays within 64 chars including the suffix; spec Design 2 item 3, AC39, AC40 |
+| whole branch (round 3) | spec | Important | The same finding (suffix cut at consumption, found independently) | fixed in fix task 3 (sha filled at integration): spec Design 2 item 3, AC39, AC40 |
+| whole branch (round 3) | spec | Minor | Minors 2 to 7 of the round-3 spec report: wording leftovers; AC9, AC36, Intent and AC33 out of step with the tests and docs as built; Residual risks 13 and 14 (a count, and a new behaviour filed as pre-existing); the Residual 12 log row ("no new capability"); Review log traceability | fixed in fix task 3 (sha filled at integration): spec and plan text only (AC9, AC36, Intent, AC33, Residual risks 11, 13 and 14, the Residual 12 log row, one Review log row per finding) |
+| whole branch (round 3) | tester | Important | F1: the same finding (suffix cut at consumption), found independently | fixed in fix task 3 (sha filled at integration): AC39, AC40 |
+| whole branch (round 3) | tester | n/a | Added 33 tests that kill 49 surviving mutants of the ring, labels, caps and redaction | added in 29980be (tests only) |
 
 ## Shipped
 
@@ -752,6 +797,8 @@ text), "agent-stream filtering" (the
 remain ("tui-mode governance", "unified agent hub", "configurable startup policy").
 Follow-ups found by the panel: the `server.rs` doc comments still say the durable sink
 is "opt-in by config", but no such config key exists (fix them in the "durable audit
-wiring" spec); and consider tightening `is_host_port` in `redact.rs` so that it
-requires the last dotted label of the key to be non-secret (spec Residual risks 11 and
-14).
+wiring" spec); consider tightening `is_host_port` in `redact.rs` so that it
+requires the last dotted label of the key to be non-secret (spec Residual risks 11,
+which also records its ASCII-only terminators); and re-mark a directly assigned
+reserved label at consumption (`conn_audit_label`) if a transport ever sets the `pub`
+`ConnCtx.client_label` field itself (spec Design 2, Residual risks 4).

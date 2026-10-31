@@ -31,9 +31,10 @@ string that is cloned into every entry, every finding and the durable JSONL.
 that carries the *agent* token) turns the ring over in ~27 minutes. (4) The shared
 redaction vocabulary misses `sid=`, `session=`, `auth=`, `jwt=` and `csrf=`, so they
 pass through `args_summary`. This change makes the ring a bounded, fair, attributable
-record that polling and floods cannot erase, bounds every field of an entry, and
-widens redaction, with the smallest diff that does it: no field is added to
-`ConnCtx` or `AuditEntry`.
+record that polling cannot erase and that a flood from one source cannot erase for
+sources that already hold a table slot (a source can still overwrite its own history),
+bounds every field of an entry, and widens redaction, with the smallest diff that does
+it: no field is added to `ConnCtx` or `AuditEntry`.
 
 ## Goals
 
@@ -259,7 +260,15 @@ every surface.
    becomes `"<sanitised label> (declared)"`. So any invisible-character, space,
    underscore or punctuation padding is rewritten (`web bridge`, `web_bridge`,
    `web\u{17B4}-bridge`, `web-bridge\u{E0100}`), while `webbridges` and
-   `aitm-mac\u{3164}` are not. `sanitize_client_label` itself still passes
+   `aitm-mac\u{3164}` are not. The result stays within `MAX_CLIENT_LABEL_CHARS` (64)
+   **including** the 11-character ` (declared)` suffix: when the skeleton is reserved,
+   the sanitised label is first cut to 53 chars (64 minus the suffix) and trimmed; if
+   the cut head still has the reserved skeleton the suffix is appended, and otherwise
+   (the padding was most of the label, so the head no longer reads as the reserved
+   name) the head is returned as is. That makes the consumption-time
+   `sanitize_client_label` a no-op on a reserved-name rewrite, so the suffix cannot be
+   truncated away there (found in panel round 3: a padded lookalike of 62 to 64 chars
+   lost its suffix at consumption; AC39, AC40). `sanitize_client_label` itself still passes
    `web-bridge` unchanged, because the server mints that label. Applied **only where
    a client declares a label** (`transport.rs` capture), never to the server-minted
    one.
@@ -272,8 +281,13 @@ start; and again on **consumption**, through one private helper in `server.rs`,
 where the `AuditEntry` is built (`record_audit`). `ConnCtx.client_label` is a `pub`
 field that tests and future transports set directly, so capture-only sanitising can
 be bypassed; consumption-time sanitising cannot. On the capture path the re-sanitise
-costs O(64). The reserved-name guard is not applied on consumption, so `web-bridge`
-passes through unchanged.
+costs O(64) and leaves a reserved-name rewrite untouched (item 3, AC40). The
+reserved-name guard is not applied on consumption, so `web-bridge` passes through
+unchanged. A label assigned directly to the `pub` `ConnCtx.client_label` (a test, a
+future transport) is therefore bounded and scrubbed but not given the reserved-name
+guard, and can present `web-bridge`; that is why nothing may grant trust by label
+(Residual risks 4). Re-marking such a label in `conn_audit_label` is a named
+follow-up (plan, Shipped).
 
 **Interaction with findings (decided, with the code paths).** A finding's
 `client_label` comes from `host.client_label()` in `findings.record`
@@ -536,10 +550,15 @@ rebases the branch on `main` before dispatching Task 6 and again before the pane
 4. **Labels are display strings.** The reserved-name guard compares skeletons (the
    sanitised label reduced to its lowercased ASCII alphanumerics, Design 2), so
    invisible, space, underscore and punctuation padding is rewritten; the extended
-   dropped invisible set is defence in depth. Homoglyph LETTERS from other scripts
-   (a Cyrillic `е` for `e`) and a first-party name such as `aitm-mac` can still be
-   declared by any client. Accepted: the label is display-only, nothing may grant
-   trust by label, and `origin` is the only authoritative field.
+   dropped invisible set is defence in depth. The rewrite stays within 64 chars
+   including the ` (declared)` suffix (a padded lookalike longer than 53 chars is cut
+   to 53 first), so the consumption pass cannot cut the suffix off (AC39, AC40).
+   Homoglyph LETTERS from other scripts (a Cyrillic `е` for `e`) and a first-party
+   name such as `aitm-mac` can still be declared by any client. A label assigned
+   directly to the `pub` `ConnCtx.client_label` (a test, a future transport) is not
+   given the reserved-name guard at consumption, only `sanitize_client_label`
+   (Design 2), so it can present `web-bridge`. Accepted: the label is display-only,
+   nothing may grant trust by label, and `origin` is the only authoritative field.
 5. **`actions_last_minute` is inflated by polling UIs** and saturates under extreme
    rates (documented).
 6. **Redaction is conservative and bounded.** Prose such as `session: expired` or
@@ -561,7 +580,12 @@ rebases the branch on `main` before dispatching Task 6 and again before the pane
 11. **The host:port exemption also exempts credential-shaped keys** such as
     `db.password:1234` and `a.token:1234` (the old code masked them). Accepted: a
     credential written as a dotted key with `:` and 1-5 digits is rare, and the
-    exemption is what keeps `auth.example.com:8443` readable.
+    exemption is what keeps `auth.example.com:8443` readable. Conversely,
+    `is_host_port` accepts only ASCII terminators, so a host:port followed by a
+    non-ASCII whitespace character is not exempted: `auth.example.com:8443\u{a0}x`
+    becomes `auth.example.com:[redacted]\u{a0}x`. That is new behaviour (the old regex
+    never masked this key), over-redacting, and the safe direction; a tightening of
+    `is_host_port` may settle both points (plan, Shipped).
 12. **A quoted key opener directly after an unclosed quote can still be swallowed.** An
     unclosed or escaped-closer quote that ends in `=` or `:` plus blanks (or in a
     backslash) directly before a victim's QUOTED KEY OPENER can still swallow it:
@@ -569,14 +593,14 @@ rebases the branch on `main` before dispatching Task 6 and again before the pane
     adjacent `token= "password":"V"` identically. Exploiting it needs attacker text
     directly adjacent to the victim key. Accepted.
 13. **A next key with only a closing quote.** `password='x password'=S3CR3T` leaves
-    `S3CR3T`. A 1.5M-input differential against the old regex found five such
-    regressions, all malformed input. Accepted.
+    `S3CR3T`. A differential of 3M random malformed strings against the old regex
+    found 11 regressions, all of one shape: an unclosed value quote, then a later key
+    with only a closing quote (`password'=`, `api_key"=`). Malformed input only.
+    Accepted.
 14. **Pre-existing and unchanged.** `token="token="S3CR3T` leaves `S3CR3T` (the old
     output is identical). `Cookie: sid="S3CR3T"` and `Set-Cookie: JSESSIONID="S3CR3T";
     Path=/` leak the quoted cookie value (the `Cookie` pair's unquoted value stops at
     the quote). YAML block scalars (`key: |` then an indented value) are not masked.
-    `is_host_port` accepts only ASCII terminators, so a non-ASCII-whitespace
-    terminator over-redacts (the safe direction).
 
 ## Acceptance criteria
 
@@ -622,8 +646,13 @@ that must not change. Test names are exact. No existing test is edited.
 9. **AC9** `[red]` for its first assertion (the old regex does not mask `sid`), the
    rest `[guard]`, `scrub_text_survives_hostile_inputs`: 4 MiB of `sid=` repeated
    returns exactly `sid=[redacted]` (the whole remainder is one unquoted value); 4 MiB
-   of `a`, 2 MiB of `"`, 2 MiB of `\`, and 1 MiB of `sid='x ` repeated each return
-   without panicking (a guard against a quadratic scan, not a timing assertion).
+   of `a`, 2 MiB of `"` and 2 MiB of `\` each come back unchanged, without panicking
+   (a guard against a quadratic scan, not a timing assertion). The quotes-that-never-
+   close shape has its own test, `scrub_text_stays_linear_when_quotes_open_but_never_close`
+   (`[red]`: the old regex leaves `sid` unmasked): 1 MiB of `sid='x ` repeated returns
+   exactly `sid='[redacted] ` repeated (every quote opens and none closes, so each
+   failed closing-quote search is remembered and the scan stays linear).
+   `scrub_text_survives_hostile_inputs` keeps a pointer comment to it.
 10. **AC10** `[guard]` The scanner, PoC, findings, plugins, and MCP suites pass
     unmodified after Tasks 1 and 2, in particular
     `reproduce::tests::scrub_embedded_handles_quotes_and_escapes` and
@@ -747,11 +776,17 @@ that must not change. Test names are exact. No existing test is edited.
 32. **AC32** `[guard]` Diff scope: only the files listed under Constraints change; the
     `pub struct ConnCtx` and `pub struct AuditEntry` field set and field types are
     identical to `bd0f9b7` (doc comments on `client_label` may change).
-33. **AC33** Review-checked: the `audit.rs` module doc, the `agent.activity` and
-    `agent.status` description strings and the `agent.rs` module doc describe the two
-    lanes, fair share, the label rules, and that `actions_last_minute` counts both
-    lanes and every surface; `redact.rs` docs describe the one vocabulary, the quote
-    rule, and the host:port exemption.
+33. **AC33** Review-checked: the `audit.rs` module doc, the `agent.rs` module doc and
+    the `AgentActivity` doc comment describe the two lanes, fair share, the label
+    rules, and that `actions_last_minute` counts both lanes and every surface (the
+    `agent.status` description says the same of `actions_last_minute`). The shortened
+    `agent.activity` description, which callers read, carries only what a caller acts
+    on: it is a live view and not a complete record; a high-volume source can flush
+    others; `origin` is authoritative and `client_label` is a display string; pass
+    `limit`; and the 6144-entry ceiling, taken from the constants. The lane,
+    fair-share and label-rule detail lives in those three doc locations, not in the
+    description string. `redact.rs` docs describe the one vocabulary, the quote rule,
+    and the host:port exemption.
 34. **AC34** Mutation check (orchestrator, Task 11): replacing `append_in(lane, ..)` in
     `record_audit` with `append(..)` turns AC24 and AC26 red on an assertion; replacing
     `conn_audit_label(conn)` with `conn.client_label.clone()` turns AC16 red on an
@@ -761,15 +796,20 @@ that must not change. Test names are exact. No existing test is edited.
 35. **AC35** The Rust gate passes: `cargo fmt --check && cargo clippy --all-targets --
     -D warnings && cargo test`.
 
-**Panel round 1 fixes (fix task 1), amended by round 2 (fix task 2)**
+**Panel round 1 fixes (fix task 1), amended by rounds 2 and 3 (fix tasks 2 and 3)**
 
 36. **AC36** `[red]` (`redact.rs`, `mod tests`) three tests:
-    - `scrub_text_masks_a_quoted_secret_after_an_unclosed_quote`: the four panel
-      inputs give exactly these outputs: `password='abc def token='S3CR3T'` gives
+    - `scrub_text_masks_a_quoted_secret_after_an_unclosed_quote`: six rows, the four
+      panel inputs and the two-quote memo row with its mirror. The four panel inputs
+      give exactly these outputs: `password='abc def token='S3CR3T'` gives
       `password='[redacted]'`; `x-api-key="oops see sessionid="S3CR3T" end` gives
       `x-api-key="[redacted]" end`; `token: "a b\nsession: "S3CR3T"` (a real newline)
       gives `token: "[redacted]"`; `password="C:\dir\" token="S3"` gives
-      `password="[redacted]"`.
+      `password="[redacted]"`. The memo row `a_token="x b_token='y z' c` gives
+      `a_token="[redacted] b_token='[redacted]' c` and its mirror
+      `a_token='x b_token="y z" c` gives `a_token='[redacted] b_token="[redacted]" c`
+      (a failed closing-quote search for one quote character says nothing about the
+      other).
     - `scrub_text_never_leaves_a_credential_after_an_unclosed_quote`: for a table of
       unclosed-quote and escaped-closer shapes (the four panel inputs and further
       rows with `=`, `:`, a newline, or a backslash before the next pair), the
@@ -778,9 +818,13 @@ that must not change. Test names are exact. No existing test is edited.
     - `scrub_text_closes_a_padded_value_at_its_own_quote`: a value that ends in `=`
       or `:` (base64 padding) stays closed at its own quote when an end-of-value
       follows it: `{"token":"YWJj=","user":"bob"}` gives
-      `{"token":"[redacted]","user":"bob"}`; and for each of `;`, `&`, `}`, `]` and a
-      no-break space (U+00A0) as `c`, `token="YWJj="{c}"user":"bob"` (a quoted pair
-      follows) gives `token="[redacted]"{c}"user":"bob"`.
+      `{"token":"[redacted]","user":"bob"}`; and, among its rows, these five (each
+      stays closed at its own quote, and `x="y"` or the rest of the text is
+      untouched): `token="YWJj=";x="y"` gives `token="[redacted]";x="y"`;
+      `?token="YWJj="&x="y"` gives `?token="[redacted]"&x="y"`;
+      `{"o":{"token":"YWJj="},"b":"c"}` gives `{"o":{"token":"[redacted]"},"b":"c"}`;
+      `[token="YWJj="] x="y"` gives `[token="[redacted]"] x="y"`; and
+      `token="YWJj="\u{a0}x="y"` gives `token="[redacted]"\u{a0}x="y"`.
 37. **AC37** `[red]` (`redact.rs`, `mod tests`) `scrub_text_reads_unicode_whitespace_as_blank`:
     `password\x0b=hunter2` gives `password\x0b=[redacted]`;
     `credentials=\u{a0}"CNRY0"` gives `credentials=\u{a0}"[redacted]"`;
@@ -797,13 +841,40 @@ that must not change. Test names are exact. No existing test is edited.
       (characters outside the dropped set, caught only by the skeleton comparison)
       yields `Some(format!("{raw} (declared)"))`; and the negative controls
       `webbridges` yields `Some("webbridges")` and `aitm-mac\u{3164}` yields
-      `Some("aitm-mac")`.
+      `Some("aitm-mac")`. Every result is at most 64 chars including the suffix
+      (AC40).
     - `sanitize_client_label_drops_every_invisible_character`: for every code point
       that Design 2 item 2 lists on its own (U+00AD, U+034F, U+061C, U+115F, U+1160,
       U+2800, U+3164, U+FEFF, U+FFA0) and the first and last code point of each range
       in it, `format!("a{c}b")` sanitises to `Some("ab")`; the
       failure message lists every code point that was kept; and `"caf\u{e9}"` (a
       visible non-ASCII letter) yields `Some("caf\u{e9}")`.
+39. **AC39** `[red]` (`crates/aitm-mcp/tests/audit_integrity.rs`)
+    `a_padded_reserved_name_keeps_its_declared_suffix_through_the_server`: each row
+    passes a raw padded lookalike of `web-bridge` through `declared_client_label` (what
+    the transport stores), puts the result on a `ConnCtx`, and makes a call that
+    reports `host.client_label()`. The stored label, the label the host sees and the
+    one ring entry's `client_label` all equal the same literal, where `P(n)` is `n`
+    U+17B4 characters:
+    - `web-bridge` + `P(54)` (64 chars) gives `web-bridge` + `P(43)` + ` (declared)`
+      (cut to 53 chars, still reads as the name, marked, 64 chars in all);
+    - `web` + `P(54)` + `-bridge` (64 chars) gives `web` + `P(50)` (cut to 53 chars,
+      the head is `web` and no longer reads as the name, so it is returned as is,
+      without the suffix);
+    - `web` + `P(40)` + `-bridge` (50 chars) gives `web` + `P(40)` +
+      `-bridge (declared)` (nothing is cut, marked whole).
+
+    The first and third rows end with ` (declared)`; before the fix the first row's
+    suffix was cut away at consumption, so the entry showed the server's own name.
+40. **AC40** `[red]` (`audit.rs`, `mod tests`)
+    `declared_client_label_survives_the_consumption_pass`: for each pad character
+    U+17B4, U+FFF0, U+206A and `_`, and each raw length from 10 to 70 chars (the
+    reserved name `web-bridge` padded with that character to that length, once after
+    the name and once inside it as `web{padding}-bridge`), the result of
+    `declared_client_label` is at most 64 chars, `sanitize_client_label(result)`
+    equals the result, and the result either ends with ` (declared)` or its skeleton
+    is no longer the reserved one; the failure message lists every offending row. The
+    literal `web-bridge` gives exactly `web-bridge (declared)`.
 
 ## Left to the builder
 
@@ -861,7 +932,8 @@ survives). Durable audit stays a named follow-up.
 4. `web-bridge` for every bridge connection (operator too); the bridge never honours
    `clientInfo`; a declared label whose skeleton (lowercased ASCII alphanumerics)
    equals `webbridge` gets a ` (declared)` suffix at capture only (round-2 fix; it
-   was an exact match).
+   was an exact match), and the result stays within 64 chars including the suffix
+   (round-3 fix).
 5. Sanitise at capture **and** at consumption (`conn_audit_label`), including the
    `CommandHost` label that feeds findings; invisible and bidi characters stripped.
 6. `entry_to_jsonl` and `aitm-findings` are not edited.
