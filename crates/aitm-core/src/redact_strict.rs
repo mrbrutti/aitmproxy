@@ -4,8 +4,10 @@
 //! the scanner, the findings store and the PoC builder, so they are not edited for
 //! the audit log. This module calls them and adds to them, for the audit path only:
 //!
-//! - [`scrub_strict`]: `scrub_text` first, then the strict text passes. This task
-//!   holds P2 (header lines) and P3 (Basic, Negotiate and NTLM credentials).
+//! - [`scrub_strict`]: `scrub_text` first, then the strict text passes: P2 (header
+//!   lines), P3 (Basic, Negotiate and NTLM credentials), P4 (URL userinfo), P5
+//!   (credential shapes with a distinctive prefix) and P6 (the extra key words as
+//!   `key=value` pairs).
 //! - [`is_secret_key_strict`]: the shared vocabulary plus a few extra key words.
 //! - [`is_benign_header`]: the header names whose value is evidence, not a
 //!   credential (the default-deny list of header collections).
@@ -111,9 +113,13 @@ const BENIGN_HEADER_PREFIXES: &[&str] = &["sec-fetch-", "sec-ch-"];
 /// The extras are deliberately not added to the shared `is_secret_key`: that would
 /// change the scanner's, the findings store's and the PoC builder's output.
 pub fn is_secret_key_strict(key: &str) -> bool {
-    if is_secret_key(key) {
-        return true;
-    }
+    is_secret_key(key) || has_extra_vocabulary(key)
+}
+
+/// Whether `key` carries one of the audit-only extra words, whatever the shared
+/// vocabulary says. P6 masks the pairs of exactly these keys: `scrub_text` has
+/// already masked the rest.
+fn has_extra_vocabulary(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     EXTRA_KEY_NEEDLES
         .iter()
@@ -143,7 +149,7 @@ pub fn is_benign_header(name: &str) -> bool {
 
 /// Mask credential material in plain text: [`scrub_text`] first (unchanged), then
 /// the strict passes in order: P2 header lines, P3 Basic, Negotiate and NTLM
-/// credentials.
+/// credentials, P4 URL userinfo, P5 credential shapes, P6 the extra key words.
 ///
 /// - **P2.** The name `authorization`, `proxy-authorization`, `cookie`, `cookie2`
 ///   or `set-cookie` (ASCII case-insensitive, a whole name: not preceded by an
@@ -158,14 +164,45 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   required) to bytes that contain `:`, the `user:pass` shape. `negotiate` or
 ///   `ntlm` followed by blanks and a token of 16 or more such characters masks the
 ///   token.
+/// - **P4.** In `scheme://userinfo@host` (the userinfo is the text up to the first
+///   `@`, with no `/`, `?`, `#`, blank or quote in it): with a `:` the part after
+///   the first `:` is masked and the user name stays
+///   (`https://user:[redacted]@host`); with no `:` the whole userinfo is masked
+///   only when it is 20 or more bytes long or holds a P5 shape (`ssh://git@host`
+///   stays).
+/// - **P5.** A credential with a distinctive prefix, a fixed alphabet and a minimum
+///   length: a JWT, a PEM private key block, an AWS access key id, GitHub, GitLab,
+///   Slack, Stripe, `sk-` and Google API keys. It must start at a boundary, a byte
+///   that is not an ASCII alphanumeric (`_` included, so `KEY_ghp_...` is still
+///   masked, and `task-<uuid>` is not an `sk-` key). A run shape ends at a boundary
+///   by construction; an exact-length one (AWS, Google) must be followed by one,
+///   unless an alphanumeric that opens another credential follows it.
+/// - **P6.** A `key=value`, `key: value` or `"key":"value"` pair whose key carries
+///   one of the audit-only extra words (and no shared one) is masked with the value
+///   rule of `scrub_text`. P2 has already taken a `pass: value` that starts a line.
 ///
 /// Plain text only: never call this over JSON text, where a line break is the two
 /// characters `\r\n` and a value is followed by `"}`. Linear in the length of
-/// `text`, and idempotent.
+/// `text`.
+///
+/// Idempotent: a second call over the output changes nothing, for every row of the
+/// tests and for all but a handful of the dense, hostile strings a fuzz produced
+/// (23 distinct shapes in 30 million). The exceptions are all of one kind, one mask
+/// changing how a neighbour reads, and the second call masks more, never less:
+///
+/// - A value that ends in a backslash before a quote (`otp=\"`): masking it takes the
+///   backslash, so the quote is no longer escaped. `scrub_text` does the same, so it
+///   is not idempotent there on its own.
+/// - A mask that takes away what made an earlier pass hold back: the `.` that made
+///   `scrub_text` read `a.b_c:8443` as a host and a port, a `/` or a blank that ended
+///   a P4 userinfo, the delimiter between a P4 password and the rest of a value.
 pub fn scrub_strict(text: &str) -> String {
     let scrubbed = scrub_text(text);
     let headers_masked = mask_header_lines(&scrubbed);
-    mask_basic_credentials(&headers_masked)
+    let basic_masked = mask_basic_credentials(&headers_masked);
+    let userinfo_masked = mask_url_userinfo(&basic_masked);
+    let shapes_masked = mask_credential_shapes(&userinfo_masked);
+    mask_extra_pairs(&shapes_masked)
 }
 
 /// Whether `b` can be part of a header name run: an ASCII alphanumeric, `_`, `.`
@@ -388,6 +425,544 @@ fn mask_basic_credentials(text: &str) -> String {
         } else {
             i += 1;
         }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// Whether `b` can end the scheme in front of `://`: an ASCII alphanumeric, `+`,
+/// `.` or `-`.
+fn is_scheme_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'.' | b'-')
+}
+
+/// The index of the `@` that ends the userinfo of an authority starting at `from`,
+/// or `None` when a `/`, `?`, `#`, quote or whitespace character, or the end of the
+/// text, comes first. Reads no further than that character. Whitespace is Unicode
+/// whitespace, as `scrub_text` reads it: it ends the value of a `key:value` pair
+/// there, so a pass that masked across one (a no-break space inside a "password")
+/// would let the next call read that value further than this one did.
+fn userinfo_end(text: &str, from: usize) -> Option<usize> {
+    for (offset, c) in text.get(from..)?.char_indices() {
+        match c {
+            '@' => return Some(from + offset),
+            '/' | '?' | '#' | '"' | '\'' => return None,
+            c if c.is_whitespace() => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// P4. See [`scrub_strict`]. The text is searched for `://` once, left to right.
+/// The userinfo scan after a `://` stops at the first `/` at the latest, and a later
+/// `://` has a `/` in it, so two scans never overlap and the work is linear.
+fn mask_url_userinfo(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    // Start of the text not yet copied into `out`.
+    let mut copied = 0;
+    let mut search_from = 0;
+    while let Some(found) = text.get(search_from..).and_then(|rest| rest.find("://")) {
+        let separator = search_from + found;
+        let authority = separator + 3;
+        // `authority` follows ASCII, so it is a char boundary.
+        search_from = authority;
+        if separator == 0 || !is_scheme_byte(bytes[separator - 1]) {
+            continue;
+        }
+        let Some(at) = userinfo_end(text, authority) else {
+            continue;
+        };
+        // `authority` and `at` (an ASCII `@`) are char boundaries.
+        let userinfo = &text[authority..at];
+        let mask_from = match userinfo.find(':') {
+            // The part after the first colon; an empty one is no secret.
+            Some(colon) => (colon + 1 < userinfo.len()).then_some(authority + colon + 1),
+            None => (userinfo.len() >= 20 || contains_shape(userinfo)).then_some(authority),
+        };
+        if let Some(from) = mask_from {
+            out.push_str(&text[copied..from]);
+            out.push_str(REDACTED);
+            copied = at;
+        }
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+/// A P5 credential made of a distinctive prefix and a body of bytes of one alphabet.
+struct Shape {
+    prefixes: &'static [&'static str],
+    body: fn(u8) -> bool,
+    /// The shortest body, or the exact body length when `exact`.
+    min: usize,
+    /// The body is exactly `min` bytes and the next byte is not an ASCII
+    /// alphanumeric, unless it starts another credential (see [`starts_shape`]).
+    /// (Every other body alphabet holds all ASCII alphanumerics, so a maximal run
+    /// ends at a boundary by construction.)
+    exact: bool,
+}
+
+fn body_alnum(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+}
+
+fn body_alnum_underscore(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn body_alnum_dash(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'-'
+}
+
+/// The base64url alphabet without padding.
+fn body_base64url(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')
+}
+
+fn body_upper_digit(b: u8) -> bool {
+    b.is_ascii_uppercase() || b.is_ascii_digit()
+}
+
+/// The prefix-and-body shapes of P5. The JWT and the PEM block have their own scans.
+const SHAPES: &[Shape] = &[
+    // AWS access key id.
+    Shape {
+        prefixes: &["AKIA", "ASIA", "AGPA", "AIDA", "AROA", "ANPA", "ANVA"],
+        body: body_upper_digit,
+        min: 16,
+        exact: true,
+    },
+    // GitHub tokens.
+    Shape {
+        prefixes: &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"],
+        body: body_alnum,
+        min: 36,
+        exact: false,
+    },
+    Shape {
+        prefixes: &["github_pat_"],
+        body: body_alnum_underscore,
+        min: 22,
+        exact: false,
+    },
+    // GitLab personal access token.
+    Shape {
+        prefixes: &["glpat-"],
+        body: body_base64url,
+        min: 20,
+        exact: false,
+    },
+    // Slack tokens.
+    Shape {
+        prefixes: &["xoxa-", "xoxb-", "xoxp-", "xoxr-", "xoxs-"],
+        body: body_alnum_dash,
+        min: 10,
+        exact: false,
+    },
+    // Stripe keys.
+    Shape {
+        prefixes: &["sk_live_", "sk_test_", "rk_live_", "rk_test_"],
+        body: body_alnum,
+        min: 16,
+        exact: false,
+    },
+    // `sk-` API keys (`sk-proj-`, `sk-ant-`).
+    Shape {
+        prefixes: &["sk-"],
+        body: body_base64url,
+        min: 32,
+        exact: false,
+    },
+    // Google API key.
+    Shape {
+        prefixes: &["AIza"],
+        body: body_base64url,
+        min: 35,
+        exact: true,
+    },
+];
+
+/// Whether the prefix of a [`SHAPES`] credential or of a JWT starts at `at`. An
+/// exact-length shape is not held back by a following alphanumeric that opens one:
+/// that neighbour is masked in the same scan, and a boundary that waited for it
+/// would be met by the second call and not by the first.
+fn starts_shape(bytes: &[u8], at: usize) -> bool {
+    let rest = bytes.get(at..).unwrap_or_default();
+    rest.starts_with(b"eyJ")
+        || SHAPES.iter().any(|shape| {
+            shape
+                .prefixes
+                .iter()
+                .any(|prefix| rest.starts_with(prefix.as_bytes()))
+        })
+}
+
+/// The end of the [`SHAPES`] credential starting at `at`, or `None`.
+///
+/// A body shorter than `min` is read to its end, which is under `min` bytes away
+/// (a longer one is a match, and the scan resumes after it), so a failed attempt
+/// costs a constant.
+fn table_shape_end(bytes: &[u8], at: usize) -> Option<usize> {
+    let rest = bytes.get(at..)?;
+    SHAPES.iter().find_map(|shape| {
+        let prefix = shape
+            .prefixes
+            .iter()
+            .find(|prefix| rest.starts_with(prefix.as_bytes()))?;
+        let body_start = at + prefix.len();
+        let limit = if shape.exact { shape.min } else { usize::MAX };
+        let run = bytes
+            .get(body_start..)?
+            .iter()
+            .take(limit)
+            .take_while(|&&b| (shape.body)(b))
+            .count();
+        if run < shape.min {
+            return None;
+        }
+        let end = body_start + run;
+        let glued = bytes.get(end).is_some_and(u8::is_ascii_alphanumeric);
+        if shape.exact && glued && !starts_shape(bytes, end) {
+            return None;
+        }
+        Some(end)
+    })
+}
+
+/// The end of the JWT starting at `at` (on `eyJ`, at a boundary), or `None`: a
+/// first segment of at least 8 base64url characters (the `eyJ` included), a dot, a
+/// second segment of at least 8, a dot, and a third segment of any length, the
+/// signature, which an unsecured token leaves empty.
+///
+/// A failed attempt reads the first segment to its end, `first_end`, and the
+/// verdict of any attempt that starts inside that segment is the same (it ends at
+/// the same dot and meets the same second segment, with a shorter first one), so
+/// `dead_until` is set and those attempts are skipped: without that, `eyJ-eyJ-...`
+/// would cost a pass over the rest of the text at every `eyJ`.
+fn jwt_end(bytes: &[u8], at: usize, dead_until: &mut usize) -> Option<usize> {
+    if at < *dead_until {
+        return None;
+    }
+    let first_end = skip_while(bytes, at, body_base64url);
+    let end = jwt_after_first(bytes, at, first_end);
+    if end.is_none() {
+        *dead_until = first_end;
+    }
+    end
+}
+
+/// The rest of [`jwt_end`], given the end of the first segment.
+fn jwt_after_first(bytes: &[u8], at: usize, first_end: usize) -> Option<usize> {
+    if first_end - at < 8 || bytes.get(first_end) != Some(&b'.') {
+        return None;
+    }
+    let second_start = first_end + 1;
+    let second_end = skip_while(bytes, second_start, body_base64url);
+    if second_end - second_start < 8 || bytes.get(second_end) != Some(&b'.') {
+        return None;
+    }
+    Some(skip_while(bytes, second_end + 1, body_base64url))
+}
+
+/// The most label bytes a PEM private key marker line may carry between the
+/// keyword and the closing dashes (`RSA PRIVATE KEY` is 15).
+const PEM_LABEL_MAX: usize = 48;
+
+/// If a PEM marker line starts at `at` with `keyword` (`-----BEGIN ` or
+/// `-----END `), a label of capital letters, digits and spaces that ends in
+/// `PRIVATE KEY`, and the closing dashes, the index just past those dashes.
+fn pem_marker_end(bytes: &[u8], at: usize, keyword: &str) -> Option<usize> {
+    let rest = bytes.get(at..)?;
+    if !rest.starts_with(keyword.as_bytes()) {
+        return None;
+    }
+    let label_start = at + keyword.len();
+    let after_keyword = bytes.get(label_start..)?;
+    let label_len = after_keyword
+        .iter()
+        .take(PEM_LABEL_MAX + 1)
+        .take_while(|&&b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' ')
+        .count();
+    if label_len > PEM_LABEL_MAX || !after_keyword[..label_len].ends_with(b"PRIVATE KEY") {
+        return None;
+    }
+    let dashes = label_start + label_len;
+    bytes
+        .get(dashes..)?
+        .starts_with(b"-----")
+        .then_some(dashes + 5)
+}
+
+/// The end of the PEM private key block that starts at `at`, or `None` when no
+/// `-----BEGIN ... PRIVATE KEY-----` line starts there. The block runs through the
+/// first `-----END ... PRIVATE KEY-----` line after it, or to the end of the text
+/// when there is none, so an unterminated block masks everything after its header.
+/// Each marker candidate costs a bounded read and the search resumes after it.
+///
+/// A name byte glued to the end of the closing line belongs to the block. P2 reads a
+/// header name as a whole run of name bytes, and the closing dashes are name bytes:
+/// `-----END PRIVATE KEY-----cookie: x` is one run to it, not a header. Masking only
+/// up to the dashes would leave `[redacted]cookie: x`, where `cookie` starts a run
+/// and is one, so a second call would mask what the first left.
+fn pem_block_end(text: &str, at: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let header_end = pem_marker_end(bytes, at, "-----BEGIN ")?;
+    let mut from = header_end;
+    while let Some(found) = text.get(from..).and_then(|rest| rest.find("-----END ")) {
+        let marker = from + found;
+        if let Some(end) = pem_marker_end(bytes, marker, "-----END ") {
+            return Some(skip_while(bytes, end, is_name_byte));
+        }
+        from = marker + 1;
+    }
+    Some(text.len())
+}
+
+/// The end of the P5 credential that starts at `at`, or `None`. `from` is where the
+/// scan started: the start of the text, or the end of the credential masked just
+/// before, whose last byte the candidate at `from` is glued to. `jwt_dead_until` is
+/// the JWT scan's memory (see [`jwt_end`]).
+fn shape_end_at(text: &str, at: usize, from: usize, jwt_dead_until: &mut usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    match bytes[at] {
+        // A PEM block needs no boundary: its header is distinctive.
+        b'-' => pem_block_end(text, at),
+        // First bytes of the other shapes. The previous byte must not be an ASCII
+        // alphanumeric, so a prefix in the middle of a word (`task-` for `sk-`) is
+        // not one. At `from` the previous byte is the end of a credential that is
+        // masked by then, and `]` is a boundary: judging the candidate by the byte
+        // that stood there would leave it for the next call.
+        b'e' | b'A' | b'g' | b'x' | b's' | b'r' => {
+            if at > from && bytes[at - 1].is_ascii_alphanumeric() {
+                return None;
+            }
+            if bytes[at..].starts_with(b"eyJ") {
+                jwt_end(bytes, at, jwt_dead_until)
+            } else {
+                table_shape_end(bytes, at)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The first P5 credential at or after `from`, as `(start, end)`.
+fn next_shape(text: &str, from: usize, jwt_dead_until: &mut usize) -> Option<(usize, usize)> {
+    (from..text.len())
+        .find_map(|at| shape_end_at(text, at, from, jwt_dead_until).map(|end| (at, end)))
+}
+
+/// Whether `text` holds a P5 credential anywhere.
+fn contains_shape(text: &str) -> bool {
+    next_shape(text, 0, &mut 0).is_some()
+}
+
+/// P5. See [`scrub_strict`]. One left-to-right scan: a credential is masked whole
+/// and the scan resumes after it.
+fn mask_credential_shapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    // Start of the text not yet copied into `out`.
+    let mut copied = 0;
+    let mut jwt_dead_until = 0;
+    while let Some((start, end)) = next_shape(text, copied, &mut jwt_dead_until) {
+        // A shape starts on an ASCII byte and ends on one or at the end of the
+        // text, so both slice points are char boundaries.
+        out.push_str(&text[copied..start]);
+        out.push_str(REDACTED);
+        copied = end;
+    }
+    out.push_str(&text[copied..]);
+    out
+}
+
+// P6 reads a pair the way `scrub_text` does, so that a value is masked to the same
+// end. `redact.rs` keeps its scanner private and is not edited for the audit log,
+// so the helpers below are copies of its own: `run_end`, `blank_len`,
+// `skip_blanks`, `ends_value`, `unquoted_value_end`, `is_opening_quote` and
+// `closing_quote`. A change to the value rule there is a change here.
+
+/// The index where the run of characters starting at `from` ends: at the first
+/// ASCII byte for which `ascii_continues` is false, at the first whitespace
+/// character, or at the end of `text`. Any other non-ASCII character continues the
+/// run. `from` must be on a char boundary.
+fn run_end(text: &str, from: usize, ascii_continues: fn(u8) -> bool) -> usize {
+    let bytes = text.as_bytes();
+    let mut end = from;
+    while end < bytes.len() {
+        let b = bytes[end];
+        if b < 0x80 {
+            if !ascii_continues(b) {
+                break;
+            }
+            end += 1;
+        } else {
+            match text.get(end..).and_then(|rest| rest.chars().next()) {
+                Some(c) if !c.is_whitespace() => end += c.len_utf8(),
+                _ => break,
+            }
+        }
+    }
+    end
+}
+
+/// The byte length of the whitespace character at `i` (as [`char::is_whitespace`]
+/// reads it), or 0 when the character there is not whitespace, `i` is the end of
+/// `text`, or `i` is not on a char boundary.
+fn blank_len(text: &str, i: usize) -> usize {
+    match text.as_bytes().get(i) {
+        None => 0,
+        Some(&b) if b < 0x80 => usize::from(is_ascii_space(b)),
+        Some(_) => text
+            .get(i..)
+            .and_then(|rest| rest.chars().next())
+            .filter(|c| c.is_whitespace())
+            .map_or(0, char::len_utf8),
+    }
+}
+
+/// The index of the first byte at or after `i` that does not start a whitespace
+/// character.
+fn skip_blanks(text: &str, mut i: usize) -> usize {
+    loop {
+        match blank_len(text, i) {
+            0 => return i,
+            n => i += n,
+        }
+    }
+}
+
+/// Whether `b` ends an unquoted value: ASCII whitespace or a pair, list, quote or
+/// JSON delimiter.
+fn ends_value(b: u8) -> bool {
+    is_ascii_space(b) || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
+}
+
+/// The index where an unquoted value starting at `from` ends.
+fn unquoted_value_end(text: &str, from: usize) -> usize {
+    run_end(text, from, |b| !ends_value(b))
+}
+
+/// Whether the unescaped quote at `quote_at` reads as the opening quote of a value
+/// rather than the closing quote of the one being searched: the last character
+/// before it that is not whitespace is `=` or `:`, and the character after it does
+/// not end a value.
+fn is_opening_quote(text: &str, quote_at: usize) -> bool {
+    // `quote_at` indexes an ASCII byte, so both slices are on char boundaries.
+    let after_separator = matches!(
+        text[..quote_at]
+            .trim_end_matches(char::is_whitespace)
+            .chars()
+            .next_back(),
+        Some('=' | ':')
+    );
+    after_separator
+        && text[quote_at + 1..]
+            .chars()
+            .next()
+            .is_some_and(|c| !(c.is_whitespace() || matches!(c, '&' | ';' | ',' | '}' | ']')))
+}
+
+/// The index of the unescaped `quote` byte that closes a quoted value starting at
+/// `from`, or `None` if it never closes.
+fn closing_quote(text: &str, from: usize, quote: u8) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut k = from;
+    while k < bytes.len() {
+        match bytes[k] {
+            b'\\' => k += 2,
+            b if b == quote && !is_opening_quote(text, k) => return Some(k),
+            _ => k += 1,
+        }
+    }
+    None
+}
+
+/// P6. See [`scrub_strict`]. One linear scan, structured as the pair pass of
+/// `scrub_text`: a key run is followed by an optional closing quote, whitespace and
+/// `=` or `:`; after a masked pair the scan resumes after the value, after any
+/// other key run right after the run, so a pair nested in a value is still seen.
+///
+/// A failed search for a closing quote reads to the end of the text, and a later
+/// search for the same quote character would fail too (a candidate is judged on
+/// the characters around it alone), so it is not run: the cost is one pass per
+/// quote character, not one per pair.
+fn mask_extra_pairs(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    // Start of the text not yet copied into `out`.
+    let mut copied = 0;
+    // Whether a search for a closing `"` (index 0) or `'` (index 1) has failed.
+    let mut quote_unclosed = [false; 2];
+    let mut i = 0;
+    while i < len {
+        let key_start = i;
+        let key_end = run_end(text, key_start, is_name_byte);
+        if key_end == key_start {
+            // A delimiter or a whitespace char: step over the whole char.
+            i += blank_len(text, i).max(1);
+            continue;
+        }
+        i = key_end;
+
+        // Key run, optional closing quote, whitespace, then `=` or `:`.
+        let mut j = key_end;
+        if j < len && matches!(bytes[j], b'"' | b'\'') {
+            j += 1;
+        }
+        j = skip_blanks(text, j);
+        if j >= len || !matches!(bytes[j], b'=' | b':') {
+            continue;
+        }
+        let separator = bytes[j];
+        j += 1;
+
+        // The scan only stops on char boundaries and `run_end` steps whole chars,
+        // so `key_start..key_end` is on char boundaries.
+        let key = &text[key_start..key_end];
+        if is_secret_key(key) || !has_extra_vocabulary(key) {
+            continue;
+        }
+        if separator == b':' && is_host_port(bytes, key_start, key_end) {
+            continue;
+        }
+
+        // Whitespace, an optional opening quote, then the value.
+        j = skip_blanks(text, j);
+        let quote = match bytes.get(j) {
+            Some(&q) if matches!(q, b'"' | b'\'') => {
+                j += 1;
+                Some(q)
+            }
+            _ => None,
+        };
+        let value_start = j;
+        let closer = quote.and_then(|q| {
+            let unclosed = &mut quote_unclosed[usize::from(q == b'\'')];
+            if *unclosed {
+                return None;
+            }
+            let found = closing_quote(text, value_start, q);
+            *unclosed = found.is_none();
+            found
+        });
+        let value_end = match closer {
+            Some(end) => end,
+            // Unquoted, or an opening quote that never closes: the plain rule.
+            None => unquoted_value_end(text, value_start),
+        };
+        if value_end == value_start {
+            continue;
+        }
+        // `value_start` follows an ASCII byte or a whole whitespace char and
+        // `value_end` is a quote, a delimiter, a whitespace char, or the end of the
+        // text, so both are char boundaries.
+        out.push_str(&text[copied..value_start]);
+        out.push_str(REDACTED);
+        copied = value_end;
+        i = value_end;
     }
     out.push_str(&text[copied..]);
     out

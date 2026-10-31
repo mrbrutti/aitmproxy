@@ -85,6 +85,44 @@ impl Table {
         }
     }
 
+    /// One hostile shape on a thread that is given 20 s: the pass must return, and
+    /// return exactly `expected`.
+    fn hostile(&mut self, label: &str, input: String, expected: String) {
+        match within(20, move || scrub_strict(&input)) {
+            Ok(out) if out == expected => {}
+            Ok(out) => self.failures.push(format!(
+                "{label}: wrong output, {} bytes out (want {} bytes)",
+                out.len(),
+                expected.len()
+            )),
+            Err(e) => self.failures.push(format!("{label}: {e}")),
+        }
+    }
+
+    /// Hostile shapes of P4 and P5, 4 MiB each. A bare `eyJ` run has no dot, an
+    /// unterminated PEM block is masked once to the end of the text, and a scheme
+    /// with a colon but no `@` is no credential.
+    fn hostile_shapes(&mut self) {
+        let jwt = "eyJ".repeat((4 << 20) / 3 + 1);
+        let pem = "-----BEGIN PRIVATE KEY-----".repeat((4 << 20) / 27 + 1);
+        let url = "https://a:".repeat((4 << 20) / 10 + 1);
+        self.hostile("`eyJ` x N", jwt.clone(), jwt);
+        self.hostile("unterminated PEM x N", pem, "[redacted]".to_string());
+        self.hostile("`https://a:` x N", url.clone(), url);
+
+        // Shapes that would cost a pass over the rest of the text at every
+        // candidate if a failed scan were not remembered: a first JWT segment that
+        // runs on through `-`, and an unclosed quote after every key word.
+        let jwt_dash = "eyJ-".repeat((4 << 20) / 4 + 1);
+        self.hostile("`eyJ-` x N", jwt_dash.clone(), jwt_dash);
+        let pairs = (4 << 20) / 9 + 1;
+        self.hostile(
+            "`pass=\"x ` x N",
+            "pass=\"x ".repeat(pairs),
+            "pass=\"[redacted] ".repeat(pairs),
+        );
+    }
+
     fn finish(self) {
         assert!(
             self.failures.is_empty(),
@@ -148,20 +186,210 @@ fn scrub_strict_masks_every_pass_and_keeps_the_benign() {
     t.unchanged(&format!("ntlm {}", "A".repeat(15)));
     t.row(&format!("NTLM\t{}.", "A".repeat(16)), "NTLM\t[redacted].");
 
-    // Unchanged byte for byte (P2 and P3 must not touch any of them).
+    // P4: URL userinfo.
+    t.row(
+        "https://user:hunter2@host.test/p",
+        "https://user:[redacted]@host.test/p",
+    );
+    t.row(
+        &format!("https://ghp_{}@github.com/", "a".repeat(36)),
+        "https://[redacted]@github.com/",
+    );
+
+    // P5: credential shapes. Each is the whole text and becomes `[redacted]`.
+    for shape in [
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl".to_string(),
+        format!("AKIA{}", "A".repeat(16)),
+        format!("ghp_{}", "a".repeat(36)),
+        format!("github_pat_{}", "a".repeat(22)),
+        format!("glpat-{}", "a".repeat(20)),
+        format!("xoxb-{}", "1".repeat(12)),
+        format!("sk_live_{}", "a".repeat(16)),
+        format!("sk-{}", "a".repeat(32)),
+        format!("AIza{}", "a".repeat(35)),
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----".to_string(),
+    ] {
+        t.row(&shape, "[redacted]");
+    }
+    t.row("x\n-----BEGIN PRIVATE KEY-----\nMII", "x\n[redacted]");
+
+    // P6: the audit-only key words, as pairs, quoted pairs and JSON members.
+    t.row("passphrase=hunter2&x=1", "passphrase=[redacted]&x=1");
+    t.row("x=1&private_key=K&y=2", "x=1&private_key=[redacted]&y=2");
+    t.row(
+        "{\"pass\":\"p\",\"user\":\"u\"}",
+        "{\"pass\":\"[redacted]\",\"user\":\"u\"}",
+    );
+    // AC44 gives the `key: value` form as `"otp: 123456 done"` -> `"otp: [redacted]
+    // done"`. That cannot hold beside P2: `otp` is a strict key at the start of the
+    // text, so P2 masks the whole line first (`"otp: [redacted]"`, as `pass: a b`
+    // above). P6 sees the same pair once it is not at a line start.
+    t.row("x otp: 123456 done", "x otp: [redacted] done");
+    t.row("a totp: 654321, b=1", "a totp: [redacted], b=1");
+
+    // P4 gates: an empty password is no secret; a user name alone stays unless it
+    // is 20 bytes or more or holds a shape; the scan stops at `/`, `?` and `#`.
+    t.unchanged("https://user:@host.test/");
+    t.row("https://:pw@host.test/", "https://:[redacted]@host.test/");
+    t.row(
+        "https://abcdefghijklmnopqrst@host.test/",
+        "https://[redacted]@host.test/",
+    );
+    t.unchanged("https://abcdefghijklmnopqrs@host.test/");
+    t.row(
+        "https://xoxb-1234567890@host.test/",
+        "https://[redacted]@host.test/",
+    );
+    t.unchanged("https://host.test/a@b");
+    t.unchanged("https://host.test?x=a:b@c");
+    t.row(
+        "a https://u:p1@h1/x b http://v:p2@h2/y",
+        "a https://u:[redacted]@h1/x b http://v:[redacted]@h2/y",
+    );
+
+    // P5 in context, and its gates.
+    t.row(
+        "jwt is eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl.",
+        "jwt is [redacted].",
+    );
+    t.unchanged("eyJabc.eyJabc.sig");
+    t.unchanged("eyJabcd.eyJzdWIiOiJ4In0.sig");
+    t.unchanged("eyJhbGciOiJIUzI1NiJ9.abcdefg.sig");
+    t.row("eyJhbGciOiJIUzI1NiJ9.abcdefgh.sig", "[redacted]");
+    t.unchanged("eyJhbGciOiJIUzI1NiJ9.abcdefgh");
+    t.row(
+        &format!("ghp_{} and AKIA{}", "a".repeat(40), "B".repeat(16)),
+        "[redacted] and [redacted]",
+    );
+    t.row(&format!("KEY_ghp_{}", "a".repeat(36)), "KEY_[redacted]");
+    t.row(&format!("AKIA{}_x", "B".repeat(16)), "[redacted]_x");
+    t.unchanged(&format!("myghp_{}", "a".repeat(36)));
+    t.unchanged(&format!("ghp_{}", "a".repeat(35)));
+    t.unchanged(&format!("AKIA{}", "A".repeat(15)));
+    // An exact-length shape needs a boundary after it, unless what follows is the
+    // start of another credential, which is masked in the same scan.
+    t.unchanged(&format!("AKIA{}", "A".repeat(17)));
+    t.unchanged(&format!("AKIA{}auth:p", "A".repeat(16)));
+    t.row(
+        &format!("AKIA{}ghp_{}", "B".repeat(16), "a".repeat(36)),
+        "[redacted][redacted]",
+    );
+    t.unchanged(&format!("sk-{}", "a".repeat(31)));
+    t.unchanged("task-0f8fad5b-d9cb-469f-a165-9b4f5e5a1d3c");
+    t.row(
+        "k:\n-----BEGIN EC PRIVATE KEY-----\nAAA\n-----END EC PRIVATE KEY-----\nafter",
+        "k:\n[redacted]\nafter",
+    );
+    t.row(
+        "-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----\nmid\n\
+         -----BEGIN PRIVATE KEY-----\nB\n-----END PRIVATE KEY-----",
+        "[redacted]\nmid\n[redacted]",
+    );
+    t.unchanged("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----");
+
+    // Regressions found by fuzzing, each a case where one mask changed how a
+    // neighbour read, so that a second call masked what the first left. A name glued
+    // to the closing dashes is part of the block (P2 reads `KEY-----cookie` as one
+    // name until the dashes are masked).
+    t.row(
+        "-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----cookie: x",
+        "[redacted]: [redacted]",
+    );
+    // A no-break space ends a P4 userinfo as it ends a `scrub_text` value; masking
+    // across it joined the value to the text after it.
+    t.unchanged("x://auth.com:[redacted]\u{a0}@h y");
+    t.row(
+        "x://auth.com://k\u{a0}@h y",
+        "x://auth.com:[redacted]\u{a0}@h y",
+    );
+    // An exact-length shape glued to the start of another credential, and a
+    // credential glued to the end of a masked one.
+    t.row(
+        &format!("AIza{}_xoxb-0123456789", "a".repeat(34)),
+        "[redacted][redacted]",
+    );
+
+    // P6 gates: a quoted value, an empty value, a host:port, a pair nested in a
+    // value, a key that ends in the word.
+    t.row("pass='a b' z=1", "pass='[redacted]' z=1");
+    t.unchanged("pw=&x=1");
+    t.unchanged("pass.example.com:8443");
+    t.row("x_pass=1;y=2", "x_pass=[redacted];y=2");
+    t.row("user.pw=abc&q=1", "user.pw=[redacted]&q=1");
+    t.row("PW=abc", "PW=[redacted]");
+    t.row("next=/cb?pass=abc&x=1", "next=/cb?pass=[redacted]&x=1");
+
+    // Every pass at once.
+    t.row(
+        &format!(
+            "fetch https://user:hunter2@host.test/p with ghp_{} and passphrase=zz",
+            "a".repeat(36)
+        ),
+        "fetch https://user:[redacted]@host.test/p with [redacted] and passphrase=[redacted]",
+    );
+
+    // Unchanged byte for byte (no pass may touch any of them).
     t.unchanged("0f8fad5b-d9cb-469f-a165-9b4f5e5a1d3c");
     t.unchanged(&"0123456789abcdef".repeat(4));
     t.unchanged("auth.example.com:8443");
+    t.unchanged("https://example.test/a/b?x=1&y=two#frag");
+    t.unchanged("ssh://git@github.com/o/r");
+    t.unchanged("git@github.com:o/r.git");
     t.unchanged("basic information");
     t.unchanged("the Cookie header is described in RFC 6265");
+    t.unchanged("sk-prod-eu-1.example.test");
     t.unchanged("Accept: text/html");
     t.unchanged("X-Forwarded-For: 203.0.113.9");
     t.unchanged("author=bob&authority=example.com&inside=1&bypass=1&passed=true");
     t.unchanged("{\"a\":1,\"b\":[true,null],\"c\":\"d\"}");
     t.unchanged("{{target}}/login?user={{user}}");
+    t.unchanged("AKIA");
+    t.unchanged("AKIAFOO");
+    t.unchanged("ghp_short");
+    t.unchanged("eyJ");
 
     t.hostile_inputs();
+    t.hostile_shapes();
     t.finish();
+}
+
+#[test]
+fn the_strict_vocabulary_is_audit_only() {
+    // AC63: the extra key words reach the audit path only. The shared scrubber and
+    // the shared predicate (the scanner's, the findings store's, the PoC builder's)
+    // are exactly what they were.
+    let mut failures = Vec::new();
+    if aitm_core::redact::is_secret_key("passphrase") {
+        failures.push("redact::is_secret_key(\"passphrase\") must stay false".to_string());
+    }
+    if !is_secret_key_strict("passphrase") {
+        failures.push("is_secret_key_strict(\"passphrase\") must be true".to_string());
+    }
+    let shared = aitm_core::redact::scrub_text("pass=x");
+    if shared != "pass=x" {
+        failures.push(format!(
+            "scrub_text(\"pass=x\"): want \"pass=x\", got {shared:?}"
+        ));
+    }
+    let strict = scrub_strict("pass=x");
+    if strict != "pass=[redacted]" {
+        failures.push(format!(
+            "scrub_strict(\"pass=x\"): want \"pass=[redacted]\", got {strict:?}"
+        ));
+    }
+    for key in [
+        "author",
+        "authority",
+        "inside",
+        "bypass",
+        "passed",
+        "sessions",
+    ] {
+        if is_secret_key_strict(key) {
+            failures.push(format!("`{key}` must not be a strict secret key"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]
