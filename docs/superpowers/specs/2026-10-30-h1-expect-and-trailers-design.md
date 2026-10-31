@@ -29,6 +29,14 @@ build made are recorded in "Deviations accepted at review" (calls 21 to 24); (5)
 wording of Bug 2 item 5 now follows item 2, the `F4` cross-reference in item 4 is corrected,
 and F9 is new. Calls 21 to 28 are the additions to the index.
 
+**Wording amended after Stage 6 panel round 2 (2026-10-30).** No criterion changed and none was
+renumbered. AC13 now quotes the lines the passing e2e run really printed and records which
+script version passed (full sha256) and that the 21-problem baseline came from an earlier
+version; AC1 notes that the final run was verbose; AC35, Bug 2 item 4 and call 26 name the real
+in-tree consumers of `Event::Error` (the Rhai `on_error` hook and `flow.subscribe` subscribers)
+and say a refused response is still not scanned; F9 gains one sentence on plugins and trailers;
+F10 is new.
+
 RFC points this spec leans on, written from memory (no network in the sandbox) and
 NOT verified against the RFC text; the Coder and reviewers should check them before
 quoting section numbers anywhere durable:
@@ -502,9 +510,14 @@ body chunks but never the terminator, so it sees an incomplete chunked message, 
 is the honest signal, never a `0\r\n\r\n` that claims success. If the head, the body and the
 over-cap section all arrive in ONE read, `on_bytes` returns `Err` for that whole read, so the
 events built in it are dropped and the client receives nothing before the close; that is
-fail-closed too, and the `Event::Error` is emitted the same way. Event consumers (the
-scanner, findings, Rhai hooks) learn of a response only through events, so without that
-event a refused response was invisible to them. The error event closes the response-parse
+fail-closed too, and the `Event::Error` is emitted the same way. The in-tree consumers of
+`Event::Error` are the Rhai `on_error` hook (`crates/aitm-plugin-rhai/src/plugin.rs`) and
+`flow.subscribe` bus subscribers (`crates/aitm-plugins/src/subscription.rs`, delivered as an
+MCP flow notification labelled `killed`, on which the web UI refreshes the flow). Without the
+event a refused response was invisible to both. The passive scanner
+(`crates/aitm-plugin-scanner/src/plugin.rs`) observes no events and `aitm-findings` does not
+consume them, so a refused response is still not scanned: the scanner sees only a head-only
+flow. The error event closes the response-parse
 half of the gap this spec first attributed to "F4 of the hardening spec"; that F4's own text
 covers only a failed first dial or reconnect, which still emits no `Event::Error` and still
 stands (a non-goal here).
@@ -650,8 +663,9 @@ Bug 1: `Expect: 100-continue`
    with `AITM_BIN` and `AITM_TESTTARGET_BIN` set; the script is not added to the branch),
    exits 0: the runner prints `PASS proto/test_h1_100_continue.py` and the script's output
    has no `[FAIL]` line. The exit status is the proof; the lines quoted next are what the
-   script prints when its output is shown (the runner itself prints only `PASS` or `FAIL`
-   per script). The baseline's single defect, "the proxy answered the 100-continue expectation within 2.0s
+   script prints when its output is shown (without `-v` the runner itself prints only `PASS`
+   or `FAIL` per script; the final run was verbose, and its log holds every line quoted here).
+   The script version that ran is identified by sha256 under AC13. The baseline's single defect, "the proxy answered the 100-continue expectation within 2.0s
    (nothing arrived in 2.005s; ...)", becomes a passing line reading "the proxy answered
    `HTTP/1.1 100 Continue` N ms after the head, before any body byte was sent" with N well
    below 2000, and the verdict line is "Expect: 100-continue handled and captured correctly
@@ -716,15 +730,46 @@ Bug 2: chunked trailers
 13. AC13 (e2e): `tests/e2e/proto/test_chunked_trailers.py`, run the same way (unchanged, against
     a core built from this branch, not added to it), exits 0: the runner prints `PASS
     proto/test_chunked_trailers.py` and the script's output has no `[!!]` line and no `[FAIL]`
-    line. The exit status is the proof, as for AC1. The baseline's 21 problem lines (3 declared-but-dropped and
-    3 not-forwarded for each of responses 1 and 3, and 3 not-visible-over-the-bus for each of
-    the `first`, `again` and `send` flows) all disappear: the last check reads "trailer
-    fidelity: every trailer field the origin sent reaches the client intact and is visible over
-    the bus (0 problem(s))". Every other check keeps passing, in particular the
-    exact-consumption checks ("after response 1 the socket held NO stray bytes (0)", "response 2
-    on the same connection is the intact plain body", "the proxy kept the client connection open
-    across all three exchanges") and the body byte-identity checks (including the decoy
-    terminator).
+    line. The exit status is the proof, as for AC1. The final run was verbose (`-v`), so its log
+    shows the lines the script printed; the ones this criterion rests on, quoted from it
+    (`<m>` stands for the run's random marker, `ct-` plus 12 hex digits):
+    - Trailer fidelity, for each of responses 1 and 3: `[ok] response 1: forwarded trailer
+      X-Checksum-SHA256 unaltered in transit` (the same for `X-E2E-Trailer` and `Server-Timing`);
+      `[ok] response 1: no trailer field the origin never sent (none; a desync symptom)`;
+      "[ok] response 1: all 3 origin trailer fields reached the `TE: trailers` client (forwarded:
+      ['X-Checksum-SHA256', 'X-E2E-Trailer', 'Server-Timing'])"; and the declared-but-dropped
+      result, "[ok] response 1: every field named in the forwarded `Trailer:` header arrived in the
+      trailer section (declared-but-dropped: [])".
+    - Over the bus, for each of the three flows `first`, `again` and `reissue` (the
+      `request.send` flow is named `reissue` in the passing version, not `send`): a `[note]` line
+      showing the response keys include `trailers` and the trailer names visible
+      (`['server-timing', 'x-checksum-sha256', 'x-e2e-trailer']`), then `[ok] flow.detail
+      /chunked/<m>/first: the origin's trailer fields are visible over the bus (as response.trailers
+      or merged into response.headers, RFC 9110 s6.5.1)`.
+    - Exact consumption and byte identity: `[ok] response 1: NO stray bytes on the socket after
+      the framed response (0): the trailer section was consumed exactly, nothing leaked into the
+      next exchange` (and the same for response 3); `[ok] after response 2 the socket held NO
+      stray bytes (0)`; `[ok] response 2 on the same connection is the intact plain body (200, 24
+      bytes) -- no desync`; `[ok] the proxy kept the client connection open across all three
+      exchanges (reconnects=0)`; and for responses 1 and 3 `body byte-identical to what the
+      origin sent` and `the decoy terminator inside chunk data survived (size-driven decode)`.
+    - The verdict, the script's last line: `[ok] chunked response with trailers decoded,
+      forwarded and captured correctly (171165 bytes, 6 chunks, 3 trailer fields; marker <m>)`.
+
+    Which version of the scripts. The 21-problem baseline in `e2e-baseline.log` (3
+    declared-but-dropped and 3 not-forwarded lines for each of responses 1 and 3, and 3
+    not-visible-over-the-bus lines for each of the `first`, `again` and `send` flows, ending
+    `[FAIL] trailer fidelity: ... (21 problem(s))`) was measured with an EARLIER version of the
+    two scripts. They were edited in the main checkout after that run (file times, 2026-10-30:
+    `test_h1_100_continue.py` at 17:06, `test_chunked_trailers.py` at 17:08), so the baseline's
+    wording and its count of 21 are not what the passing version prints. The version that passed
+    is identified by full sha256: `test_h1_100_continue.py`
+    `5e18b7d369d40629104ca8a0bf413d1421ab11948d9e66e5296c7808c437a962` and
+    `test_chunked_trailers.py` `f872bd861e157246f11dd3dd47033e43c2c0dfd8ad90f20f1e3684c5daebedc5`;
+    both equal the scratch copies that ran, and both equal the main checkout's files when this
+    was written. The passing version was not run against the pre-fix base, so the red-to-green
+    record for both bugs rests on the unit and loopback tests; the e2e run shows the built core
+    behaves correctly over real sockets, and nothing more.
 14. AC14: After `GET`, the machine fed `HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer:
     X-A, X-B\r\n\r\n4\r\nwxyz\r\n0\r\nX-A: 1\r\nx-b: two words\r\nX-A: 3\r\n\r\n` yields exactly
     `[ResponseHeaders(id), ResponseBodyChunk{id, "wxyz"}, ResponseComplete(id)]`;
@@ -835,8 +880,10 @@ Added after the Stage 6 panel (appended, nothing renumbered)
 35. AC35: When the machine returns an error while `serve` reads an origin response (a malformed
     head or framing, or a malformed or over-cap trailer section), `serve` emits exactly one
     `Event::Error { flow, kind: FlowError::Upstream("malformed response from upstream") }` for
-    that flow before the connection ends, so event consumers (the scanner, findings, Rhai
-    hooks) see the failed response (call 26). The text is fixed: never the machine error's text,
+    that flow before the connection ends, so the Rhai `on_error` hook and `flow.subscribe` bus
+    subscribers (the in-tree consumers of `Event::Error`) see the failed response (call 26). The
+    passive scanner and `aitm-findings` consume no events, so a refused response is still not
+    scanned; the scanner sees only a head-only flow. The text is fixed: never the machine error's text,
     never a trailer name or value. Client-visible behaviour is unchanged: the connection ends,
     the client never receives a terminator, and `serve` still returns the machine's own error
     to its caller (the `trailer` message of AC16). Tests in `module.rs`, for an origin that
@@ -887,6 +934,19 @@ Found while reading; each is a candidate follow-up, none is fixed here.
   6.5.1 and processes trailers apart from headers is not affected, and the capture and the
   store never merge a trailer into `headers` regardless. Adding them to the set is optional
   hardening for later: one `const` edit and its table test (the list would then be 46).
+  Plugins cannot touch trailers on the wire (the writer takes them from `machine.response()`),
+  so an operator's header-stripping rule does not cover a trailer-borne field; this matters
+  only for non-compliant clients.
+- **F10. A flow whose streamed response fails never becomes terminal in the store (pre-existing,
+  observed while building AC35).** A flow whose response head was streamed (`Body::Streamed`)
+  and then fails stays non-terminal: `is_terminal` (`crates/aitm-core/src/store.rs`, about line
+  229) is true only for a killed flow or one whose response body is no longer `Streamed`, so
+  eviction and `clear` never remove it. EOF in the middle of a body and chunk-framing errors
+  already did this at the base; the fail-closed trailer parse (AC16, AC35) adds one more way to
+  reach it. A possible fix: mark the flow terminal at both `Event::Error` sites in `serve()`
+  (`module.rs`: the machine refusing origin bytes, and the upstream closing before the response
+  completes). Not done here: it changes the store's retention of a whole class of flows, not
+  just the trailer case.
 
 ## Left to the builder
 
@@ -968,6 +1028,6 @@ Added after the Stage 6 panel:
 23. Deviation accepted: Task 2 removed the temporary dead-code allowance Task 1 added to the two new machine methods.
 24. Deviation accepted: the early-`413` decision reuses the machine's `content_length` parser (made crate-visible) instead of a parser of its own in `serve`.
 25. The flow store's `flow_size` counts a response's `trailers` like its headers (AC34), because with `max_flows = 0` the byte budget is the only bound and a hostile origin controls up to 16 KiB and 64 fields per response.
-26. A machine error while an origin response is read emits one `Event::Error` with `FlowError::Upstream("malformed response from upstream")`, fixed words, before the connection ends (AC35); client-visible behaviour is unchanged.
+26. A machine error while an origin response is read emits one `Event::Error` with `FlowError::Upstream("malformed response from upstream")`, fixed words, before the connection ends (AC35); client-visible behaviour is unchanged. The in-tree consumers are the Rhai `on_error` hook and `flow.subscribe` subscribers only; the passive scanner and `aitm-findings` consume no events, so a refused response is still not scanned.
 27. The two e2e scripts are run for real against a core built from this branch and are not added to it: another session owns them and lands them test-only after this change merges. AC1 and AC13 rest on that run's exit status; AC32's checksum clause moves to the landing PR. Supersedes the "copied unchanged" half of call 19.
 28. The deny-set's residual (F9) is accepted: names outside the 37 can still reach a client that wrongly treats trailers as headers; adding them is optional later hardening.

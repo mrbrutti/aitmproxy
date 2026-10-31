@@ -46,7 +46,7 @@ aitm-proto-http --lib` 68 passed; `cargo test -p aitm-proto-http --test sansio` 
 | T8 | `crates/aitm-proto-http/tests/h1_conformance.rs` (new) | none |
 | T9 | none (a run, not a change: the scripts stay in the main checkout and are not added to the branch) | none |
 | T10 | none expected (tests only, if it must strengthen any) | none |
-| T11 | `crates/aitm-core/src/store.rs`, `crates/aitm-core/tests/store.rs`, `crates/aitm-proto-http/src/module.rs`, `crates/aitm-proto-http/src/sansio.rs` (one visibility keyword), `crates/aitm-plugin-sessionio/src/har.rs`, `crates/aitm-plugin-sessionio/src/mitmproxy.rs` (a comment each), plus whatever test or comment clean-ups the findings report names | T1, T2, T3, T5 (`module.rs`, `sansio.rs`, `tests/store.rs`), T7 (`har.rs`, `mitmproxy.rs`) |
+| T11 | Production: `crates/aitm-core/src/store.rs`, `crates/aitm-proto-http/src/module.rs`, `crates/aitm-proto-http/src/sansio.rs` (`content_length` made `pub(crate)`, three doc-comment fixes, one behaviour-neutral match-arm collapse), `crates/aitm-plugin-sessionio/src/har.rs` and `mitmproxy.rs` (a comment each), and comment-only wording edits in `crates/aitm-core/src/flow.rs` and `crates/aitm-plugin-sessionio/src/native.rs`. Tests: `crates/aitm-core/tests/store.rs`, `crates/aitm-proto-http/tests/sansio.rs`, `crates/aitm-proto-http/tests/h1_conformance.rs`, `crates/aitm-plugin-sessionio/tests/session_roundtrip.rs`, `crates/aitm-plugins/tests/detail.rs`, and the `mod tests` of `module.rs` and `sansio.rs` (the const `SPEC_DENY_SET` to `GOLDEN_DENY_SET` and its test renamed) | Every earlier task that edited those files: T1 to T5 (`module.rs`, `sansio.rs`, `tests/sansio.rs`, `flow.rs`, `tests/store.rs`), T6 (`tests/detail.rs`), T7 (`har.rs`, `mitmproxy.rs`, `native.rs`, `session_roundtrip.rs`), T8 (`h1_conformance.rs`) |
 
 **Serial, one coder at a time in this worktree:** T1, T2, T3, T4, T5. They all edit
 `sansio.rs` or `module.rs`, and T3 edits both (literal sites) as well as 33 other files, so it
@@ -626,18 +626,38 @@ now a run, with no repository file created or changed.
      "/Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_9ea8a296-48d1-40bb-8f9e-76f4046f1419/e2e-proto.sh"
      h1c-after-task2`. Expect `test_h1_100_continue.py` to pass and `test_chunked_trailers.py` to still fail on the
      trailer-fidelity check only.
-  2. **Final run, on the final head (after Task 11):** the same script with label `final`. It touches every crate source,
+  2. **Final run, on the final head (after Task 11):** the same script with label `final` and `-v` as its second argument
+     (`e2e-proto.sh final -v`), so the log holds every line the scripts print. It touches every crate source,
      builds `aitm` and `aitm-testtarget` from this worktree, copies the runner (`run_all.py`, `_lib`), `tests/e2e/aitm_e2e`
      and the two scripts from the fanout backup and the MAIN checkout into its scratch directory, exports `AITM_BIN` and
      `AITM_TESTTARGET_BIN` at the binaries it just built, boots a real core with `python3 .../run_all.py --boot
      --no-build -j 1 proto`, and runs both scripts. Logs are `e2e-build-final.log` and `e2e-final.log` in the notes
      directory. Paste the grep summary the script prints and the tail of `e2e-final.log`.
   Evidence already held: `e2e-baseline.log` (before any fix: both scripts fail) and `e2e-fixed1.log` (after Tasks 1 to 5, head
-  `c11ee84`: both pass); the production code at the final head must be re-run, not assumed.
-- **Test (the literal expected output).** In `e2e-final.log`: `PASS proto/test_chunked_trailers.py`, `PASS
-  proto/test_h1_100_continue.py`, `TOTAL 2 passed, 0 failed, 0 skipped`, and the script's `E2E exit=0`. The runner prints
-  only `PASS` or `FAIL` per script, so the sentences AC1 and AC13 quote (the 100 "N ms after the head", "trailer fidelity
-  ... (0 problem(s))") are not expected in this log; the exit status is the proof.
+  `c11ee84`: both pass); the production code at the final head must be re-run, not assumed. `e2e-baseline.log` was measured
+  with an EARLIER version of the two scripts: they were edited in the main checkout after that run (17:06 and 17:08 on
+  2026-10-30), so its 21-problem count is not what the passing version prints (AC13). The version that passed is
+  `test_h1_100_continue.py` sha256 `5e18b7d369d40629104ca8a0bf413d1421ab11948d9e66e5296c7808c437a962` and
+  `test_chunked_trailers.py` sha256 `f872bd861e157246f11dd3dd47033e43c2c0dfd8ad90f20f1e3684c5daebedc5`, equal to the scratch
+  copies that ran. That version was not run against the pre-fix base, so the red-to-green record rests on the unit tests of
+  Tasks 1 to 7 and 11 and the loopback tests of Task 8; this task shows the built core is correct over real sockets,
+  nothing more.
+- **Test (the literal expected output).** The final run is VERBOSE (`-v`), so `e2e-final.log` holds the scripts' own lines
+  and the sentences AC1 and AC13 quote do appear in it. It contains `PASS proto/test_chunked_trailers.py`, `PASS
+  proto/test_h1_100_continue.py` and `TOTAL 2 passed, 0 failed, 0 skipped`, has no `[!!]` and no `[FAIL]` line, and the
+  script prints `E2E exit=0`. Literal lines in it:
+  - `test_h1_100_continue.py`: "[ok] the proxy answered `HTTP/1.1 100 Continue` N ms after the head, before any body byte was
+    sent" (N well below 2000; the final run printed 0.2) and the verdict "[ok] Expect: 100-continue handled and captured
+    correctly (strict + eager, 262177-byte bodies)".
+  - `test_chunked_trailers.py`: for responses 1 and 3, "[ok] response 1: all 3 origin trailer fields reached the `TE:
+    trailers` client (forwarded: ['X-Checksum-SHA256', 'X-E2E-Trailer', 'Server-Timing'])", "[ok] response 1: every field named
+    in the forwarded `Trailer:` header arrived in the trailer section (declared-but-dropped: [])" and "[ok] response 1: NO
+    stray bytes on the socket after the framed response (0): ..."; for each of the flows `first`, `again` and `reissue`
+    (the third flow is `reissue`, not `send`), `[ok] flow.detail /chunked/<marker>/first: the origin's trailer fields are
+    visible over the bus (as response.trailers or merged into response.headers, RFC 9110 s6.5.1)`; and the verdict `[ok]
+    chunked response with trailers decoded, forwarded and captured correctly (171165 bytes, 6 chunks, 3 trailer fields;
+    marker ct-<12 hex digits>)`.
+  The runner without `-v` prints only `PASS` or `FAIL` per script; the exit status is the proof either way.
 - **Done when:** both logs are pasted and show the above, on the final head. Record in the Review log that the scripts and
   the harness they import were run from outside the branch and are not on it.
 
@@ -687,9 +707,16 @@ it afterwards.
   produces), AC30 as amended (`src/store.rs` joins `aitm-core`'s diff), and the documented-drop comments Task 7 specified;
   implements Architect's call 24.
 - **Depends on:** Tasks 1 to 10 (serial: it edits `module.rs` and `sansio.rs`, which Tasks 1 to 5 also edited)
-- **Files:** `crates/aitm-core/src/store.rs`, `crates/aitm-core/tests/store.rs`, `crates/aitm-proto-http/src/module.rs`,
-  `crates/aitm-proto-http/src/sansio.rs` (one visibility keyword), `crates/aitm-plugin-sessionio/src/har.rs` and
-  `crates/aitm-plugin-sessionio/src/mitmproxy.rs` (a comment each). No other production file.
+- **Files (as built in 420b815):**
+  - Production: `crates/aitm-core/src/store.rs` (A); `crates/aitm-proto-http/src/module.rs` (B, C);
+    `crates/aitm-proto-http/src/sansio.rs` (C: `content_length` made `pub(crate)`; and, under E, three doc-comment fixes and
+    one match-arm collapse); `crates/aitm-plugin-sessionio/src/har.rs` and
+    `crates/aitm-plugin-sessionio/src/mitmproxy.rs` (D: a comment each); comment-only wording edits (E) in
+    `crates/aitm-core/src/flow.rs` and `crates/aitm-plugin-sessionio/src/native.rs`. No other production file, and the only
+    behaviour changes are A and B.
+  - Tests: `crates/aitm-core/tests/store.rs` (A); the `mod tests` of `module.rs` (B) and of `sansio.rs` (the const and test rename); and, under
+    E, `crates/aitm-proto-http/tests/sansio.rs`, `crates/aitm-proto-http/tests/h1_conformance.rs`,
+    `crates/aitm-plugin-sessionio/tests/session_roundtrip.rs` and `crates/aitm-plugins/tests/detail.rs`.
 - **Change:**
   - **A. Store accounting (AC34).** In `store.rs`, `fn flow_size(flow: &Flow) -> usize`: the `Flow::Http` response term
     counts `header_bytes(&r.trailers)` as well as the headers and the body, with the same `header_bytes` helper (the sum of
@@ -709,8 +736,21 @@ it afterwards.
   - **D. Documented drops.** `har.rs` and `mitmproxy.rs`: a comment at the response literal's empty `trailers` initialiser
     saying HAR 1.2 has no trailers field so export does not write them, and the mitmproxy importer does not map them, so the
     field is empty on import. Comments only.
-  - **E. Test and provenance clean-ups.** Exactly the ones the findings report lists (test helpers, test comments, and
-    comments that name a task or a source), each noted in the Coder's report; no behaviour change and no new production code.
+  - **E. Test, comment and provenance clean-ups.** Exactly the ones the findings report lists, each noted in the Coder's
+    report; none changes behaviour and none adds production code:
+    - `sansio.rs`: three doc-comment fixes (comments that over-claimed); in `on_client_bytes`, the match arm that computes
+      `continue_pending` collapsed to `Framing::Chunked | Framing::Length(_) => true`, replacing a dead
+      `Framing::Length(n) => n > 0` arm (behaviour-neutral: `request_framing` already maps `Content-Length: 0` to
+      `Framing::None`, so a zero length never reaches it); and, in its `mod tests`, the const `SPEC_DENY_SET` renamed
+      `GOLDEN_DENY_SET` with its test renamed (now `the_deny_set_is_exactly_these_37_names`).
+    - `flow.rs` and `native.rs`: comment-only wording edits.
+    - Tests: `crates/aitm-proto-http/tests/h1_conformance.rs` (`run_proxy` binds its listener up front and uses
+      `Proxy::run_on`, instead of racing a dropped port); `crates/aitm-proto-http/tests/sansio.rs` (one more non-token
+      trailer-name case, `x@a: v`, for AC17); `crates/aitm-plugin-sessionio/tests/session_roundtrip.rs` and
+      `crates/aitm-plugins/tests/detail.rs` (wording only: test names and comments that named the spec or the process). One
+      duplicated test helper was also removed.
+  - **Commit.** The fix commit is `fix: ...` without a scope, not the `<type>(<scope>): ...` form of the execution notes
+    (cosmetic, accepted).
 - **Test.**
   *`crates/aitm-core/tests/store.rs` (sandbox-runnable; names free).*
   - `trailers_count_toward_resident_bytes` (RED today: the difference is `0`): two stores each holding one terminal flow with
@@ -744,10 +784,10 @@ Kept by the main session during stage 6. One row per finding. "Accepted" means a
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| T9, AC1, AC13, AC32 | Spec (round 1) | Important | The spec and plan said the two e2e scripts are copied into `tests/e2e/proto/` on this branch; they are not. Their owner session (e2e-test-arch) lands them test-only after this merges, because the main-checkout copies changed during this work (a copy here would go stale or conflict add/add). | Recorded as a deliberate supersession (Architect's call 27): the scripts are run for real against a core built from this branch (fanout `run_all.py --boot --no-build`) and their exit status proves AC1/AC13; the AC32 `shasum` comparison moves to the landing PR. The copies that ran have sha256 `5e18b7d369d4...` (100-continue) and `f872bd861e15...` (trailers) at the time of the final run. Spec and plan text amended. |
-| whole | Spec (round 1) | Important | AC33: the only full gate on the range was red (one failing test); the head had not been gated. | The one failure was a defect in the T7 test (`a_flow_without_trailers_serialises_without_a_trailers_key` compared JSON keys in iteration order; `aitm-tui` enables `serde_json/preserve_order` only in a whole-workspace build): fixed in bae612b, re-checked in workspace context. The full gate is re-run at the final head (see Shipped). |
+| T9, AC1, AC13, AC32 | Spec (round 1) | Important | The spec and plan said the two e2e scripts are copied into `tests/e2e/proto/` on this branch; they are not. Their owner session (e2e-test-arch) lands them test-only after this merges, because the main-checkout copies changed during this work (a copy here would go stale or conflict add/add). | Recorded as a deliberate supersession (Architect's call 27): the scripts are run for real against a core built from this branch (fanout `run_all.py --boot --no-build`) and their exit status proves AC1/AC13; the AC32 `shasum` comparison moves to the landing PR. The copies that ran (identical to the main checkout's at the time of the final run) have sha256 `5e18b7d369d40629104ca8a0bf413d1421ab11948d9e66e5296c7808c437a962` (`test_h1_100_continue.py`) and `f872bd861e157246f11dd3dd47033e43c2c0dfd8ad90f20f1e3684c5daebedc5` (`test_chunked_trailers.py`). The scripts, the harness (`run_all.py` and `_lib` from `/Users/matt/aitm-fanout-backup/tests/e2e`) and `aitm_e2e` (from the main checkout) were run from outside this branch and are not on it. Spec and plan text amended. |
+| whole | Spec (round 1) | Important | AC33: the only full gate on the range was red (one failing test); the head had not been gated. | The one failure was a defect in the T7 test (`a_flow_without_trailers_serialises_without_a_trailers_key` compared JSON keys in iteration order; `aitm-tui` enables `serde_json/preserve_order` only in a whole-workspace build): fixed in bae612b, re-checked in workspace context. Full gate at head `6a23ac9`: `GATE fmt=0 clippy=0 test=0` (1808 passed, 0 failed, 18 ignored; both known load-flakes passed). The later commits after it change only the two docs. |
 | whole | Security (round 1) | Important | The flow store's resident-byte budget (`aitm-core/src/store.rs` `flow_size`) did not count `HttpResponse.trailers`: a hostile origin could attach up to 16 KiB of trailers to every response outside the budget (unbounded with `max_flows = 0`). | fixed in 420b815 (`flow_size` charges trailers like headers; 3 tests: red first). AC34. |
-| whole | Security (round 1) | Minor | A trailer-section (or any response-parse) failure ended the connection with no `Event::Error`, so scanner, findings and Rhai hooks never saw the response. | fixed in 420b815 (one `Event::Error` with fixed wording before the connection ends; test red first). AC35. |
+| whole | Security (round 1) | Minor | A trailer-section (or any response-parse) failure ended the connection with no `Event::Error`, so Rhai `on_error` hooks and `flow.subscribe` bus subscribers never saw the response (the passive scanner and findings consume no events, so a refused response is still not scanned). | fixed in 420b815 (one `Event::Error` with fixed wording before the connection ends; test red first). AC35. |
 | whole | Security (round 1) | Minor | The 37-name deny-set leaves other fields a non-compliant client could treat as headers (`set-cookie2`, `content-disposition`, `content-security-policy`, `strict-transport-security`, `alt-svc`, `link`, `refresh`, `content-location`, `clear-site-data`). | Accepted: residual risk the spec already states (F9); optional hardening later. |
 | T5 | Tester | Minor | The sessionio test failure above; plus weak or missing tests (HTTP/1.x versions, partial body with the head, chunked upload with Expect, failed interim write, request-trailer caps per read, EOF inside the trailer section, empty trailer value). | fixed in bae612b and a28105d (9 tests added; 38 production mutations run: 36 killed, 2 equivalent survivors: an unreachable writer branch (`HeaderMap` cannot hold an invalid pair) and a writer call that writes nothing for a non-chunk-framed body). |
 | whole | Quality (round 1) | Minor | The plan's documented-drop comments missing in `har.rs`/`mitmproxy.rs`; a second Content-Length parser in `serve` (`declared_length`); a port race in the loopback `run_proxy`; one duplicated test helper; spec/process wording in test names and comments; three over-claiming doc comments; a dead `Framing::Length(n) => n > 0` arm. | fixed in 420b815. |
@@ -757,8 +797,12 @@ Kept by the main session during stage 6. One row per finding. "Accepted" means a
 | T2 | Spec (round 1) | Minor | T2's commit touched `sansio.rs` (removing the dead-code allowance T1 added). | Accepted and recorded (call 23). |
 | T4 | Spec (round 1) | Minor | AC17's non-token-name clause had no direct test. | fixed in 420b815 (`x@a: v` case). |
 | T10 | Spec (round 1) | Minor | The mac `FlowDetailWireTests` result is required by the plan and was not produced; the MCP flow-detail widget also reads `flow.detail`. | Not run (Swift, outside the Rust gate, needs the Terminal and a mac build). The change is additive (a new key that is omitted when empty), the widget reads named keys and ignores the rest, and the e2e `proto` suites read the key over the bus. Recorded as not run. |
-| T6 | Spec (round 1) | Minor | The e2e evidence is the non-verbose runner summary (exit 0), so the literal check lines are not captured. | A verbose run of both scripts is captured at the final head (see Shipped). |
+| T6 | Spec (round 1) | Minor | The e2e evidence is the non-verbose runner summary (exit 0), so the literal check lines are not captured. | A verbose run of both scripts against a core built from the head: `e2e-final.log`, both PASS, 156 `[ok]` checks and 0 `[FAIL]`/`[!!]`; the strict client's 100 arrives 0.2 ms after the head. The AC1/AC13 wording was corrected to the lines that run printed. |
 | T4 | Quality (round 1) | Minor | HEAD/204/304 with a mis-declared chunked head still get a stray `0\r\n\r\n` (the hardening spec's F2). | Accepted, unchanged by this work (the tester confirmed the writer emits the same 5 bytes the base did). |
+| whole | Security (round 2) | Minor | The spec, AC35, call 26 and the Review log said the scanner and findings now see a refused response; they consume no events (the consumers are Rhai `on_error` and bus subscribers). | fixed in the docs commit after 6a23ac9 (wording corrected in all four places; the plain statement that a refused response is still not scanned added). |
+| whole | Security (round 2) | Observation | A flow whose response head was streamed and then fails stays non-terminal in the store (pre-existing for EOF mid-body and chunk-framing errors; the fail-closed trailer parse adds one trigger); the read-timeout arm emits no `Event::Error`; machine errors reach `proxy.rs` as a `warn` quoting head bytes (Debug-escaped). | Recorded as adjacent finding F10 (and the hardening spec's F4); not fixed here. |
+| T9, AC13 | Spec (round 2) | Important | AC13 quoted literal lines (`(0 problem(s))`, `after response 1 the socket held NO stray bytes`, flow name `send`) that the script version that passed does not print; the baseline was measured with an earlier script version. | fixed in the docs commit after 6a23ac9: AC13 now quotes the lines the final run printed (`e2e-final.log`), says the 21-problem baseline used an earlier script version, records the full sha256 of the version that passed, and notes that version was not run against the pre-fix base (the red-to-green record rests on the unit and loopback tests). |
+| T9, T11 | Spec (round 2) | Minor | Row 1 held truncated digests and did not name the harness provenance; two rows said "see Shipped" with nothing there; Task 11's description did not match commit 420b815; commit 420b815 has no scope. | fixed: full digests and provenance in row 1, the results written into the rows, Task 11 rewritten to describe the commit; the missing scope is cosmetic and accepted. |
 
 ## Shipped
 
