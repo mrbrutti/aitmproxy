@@ -14,9 +14,15 @@
 //! never merged into its headers, and are there by the time `ResponseComplete`
 //! is returned. A request's trailers are parsed and bounded the same way, then
 //! dropped: the request model has nowhere to keep them.
+//!
+//! The writer sends a response's captured trailers after a chunk-framed body
+//! (`enqueue_body_end_with_trailers`), minus the fields that cannot work as
+//! trailers (a fixed deny-set, on the wire only; the capture keeps them all),
+//! and checks each name and value is wire-safe as it writes.
 
 use std::fmt::Write as _;
 
+use aitm_core::header::{is_valid_name, is_valid_value};
 use aitm_core::{Body, FlowId, HeaderMap, HttpRequest, HttpResponse, HttpVersion};
 use anyhow::{anyhow, bail, Result};
 
@@ -72,6 +78,81 @@ const MAX_TRAILER_BYTES: usize = 16 * 1024;
 const MAX_TRAILER_FIELDS: usize = 64;
 /// The interim response that answers a `100-continue` expectation (25 bytes).
 const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Field names that are never written as a trailer on the client wire, in lower
+/// case. A trailer arrives after the recipient has acted on the head, so a field
+/// whose meaning is framing, routing, authentication, a request modifier,
+/// response control data, payload processing or connection management cannot
+/// work there (RFC 9110 6.5.1), and an origin must not be able to use one to
+/// steer the client. The groups are that section's categories and the names are
+/// the fields RFC 9110 defines for each. A deny-list, not an allow-list: the
+/// fields that do permit trailers (`x-*`, `server-timing`, `digest`, ...) are
+/// open-ended. This is the wire only: the capture on `HttpResponse::trailers`
+/// keeps every field the origin sent.
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    // Message framing.
+    "transfer-encoding",
+    "content-length",
+    // Routing.
+    "host",
+    // Request modifiers (controls and conditionals).
+    "cache-control",
+    "expect",
+    "max-forwards",
+    "pragma",
+    "range",
+    "te",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    // Authentication.
+    "authorization",
+    "proxy-authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+    "authentication-info",
+    "proxy-authentication-info",
+    "cookie",
+    "set-cookie",
+    // Response control data (and `cache-control`, above).
+    "age",
+    "date",
+    "expires",
+    "location",
+    "retry-after",
+    "vary",
+    "warning",
+    // Payload processing.
+    "content-encoding",
+    "content-type",
+    "content-range",
+    "trailer",
+    // Connection management (hop-by-hop, and meaningless after the body).
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "upgrade",
+];
+
+/// Whether `name` is in [`FORBIDDEN_TRAILERS`]: the whole name, ASCII
+/// case-insensitively (`x-content-length` and `set-cookie2` are not).
+fn is_forbidden_trailer(name: &str) -> bool {
+    FORBIDDEN_TRAILERS
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+}
+
+/// Whether a trailer field may be written to a wire: not on the deny-set, the
+/// name a token and the value free of control bytes. A `HeaderMap` only ever
+/// holds pairs that pass the second and third checks (it accepts a pair through
+/// `try_set` or `set`, which validate), so they are defence in depth: if a name
+/// or value with a CR or LF ever got in, it would be dropped here and could
+/// never end the field line early and write bytes of the origin's choosing.
+fn writable_trailer(name: &str, value: &str) -> bool {
+    !is_forbidden_trailer(name) && is_valid_name(name) && is_valid_value(value)
+}
 
 /// How a message body is delimited on the wire.
 #[derive(Debug, Clone, Copy)]
@@ -307,14 +388,53 @@ impl Http1Machine {
     }
 
     /// Terminate a streamed body for `to` (the chunked terminator, if chunked).
+    /// It carries no trailers: that is [`Self::enqueue_body_end_with_trailers`]
+    /// with an empty section.
     pub fn enqueue_body_end(&mut self, to: Side) {
-        if self.out_framing(to) == OutFraming::Chunked {
-            self.out_mut(to).extend_from_slice(b"0\r\n\r\n");
-        }
+        self.enqueue_body_end_with_trailers(to, &HeaderMap::new());
+    }
+
+    /// Terminate a streamed body for `to` and forward `trailers` after it.
+    ///
+    /// A chunk-framed body ends with `0\r\n`, then `name: value\r\n` for each
+    /// field of `trailers` that may be written, in order, then `\r\n`; with none
+    /// that is exactly `0\r\n\r\n`. A field is not written when its name is on the
+    /// deny-set ([`FORBIDDEN_TRAILERS`]) or it is not wire-safe
+    /// ([`writable_trailer`]). A body that is not chunk-framed has no trailer
+    /// section, so nothing is written for it, and the framing is reset either way.
+    ///
+    /// Returns how many fields were not written: the withheld ones, or all of
+    /// `trailers` for a body that is not chunk-framed. The caller may report the
+    /// count; it must never report a name or value.
+    pub(crate) fn enqueue_body_end_with_trailers(
+        &mut self,
+        to: Side,
+        trailers: &HeaderMap,
+    ) -> usize {
+        let withheld = if self.out_framing(to) == OutFraming::Chunked {
+            let out = self.out_mut(to);
+            out.extend_from_slice(b"0\r\n");
+            let mut withheld = 0;
+            for (name, value) in trailers.iter() {
+                if writable_trailer(name, value) {
+                    out.extend_from_slice(name.as_bytes());
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(value.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    withheld += 1;
+                }
+            }
+            out.extend_from_slice(b"\r\n");
+            withheld
+        } else {
+            trailers.len()
+        };
         match to {
             Side::Client => self.out_framing_client = OutFraming::Raw,
             Side::Server => self.out_framing_server = OutFraming::Raw,
         }
+        withheld
     }
 
     fn reader_mut(&mut self, side: Side) -> &mut Reader {
@@ -1456,5 +1576,298 @@ mod tests {
                 "a plain GET after a request that expected 100-continue (answered: {answered})"
             );
         }
+    }
+
+    // ---- writing a response's trailers ------------------------------------
+
+    /// A response head carrying `headers` with a streamed body.
+    fn streamed_response(headers: HeaderMap) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers,
+            trailers: HeaderMap::new(),
+            body: Body::Streamed(StreamBody),
+            version: HttpVersion::Http11,
+            timestamp: std::time::SystemTime::now(),
+        }
+    }
+
+    /// A machine whose client-bound body is framed chunked: a streamed response
+    /// head carrying `Transfer-Encoding: chunked` is queued and drained, so the
+    /// next thing `poll_outbound(Side::Client)` returns is what the test enqueues.
+    fn chunk_framed_machine() -> Http1Machine {
+        let mut m = Http1Machine::new();
+        m.enqueue_response(&streamed_response(headers(&[(
+            "Transfer-Encoding",
+            "chunked",
+        )])));
+        assert!(
+            m.poll_outbound(Side::Client).is_some(),
+            "the head was queued"
+        );
+        m
+    }
+
+    /// What `enqueue_body_end_with_trailers(Side::Client, ..)` queues for a
+    /// chunk-framed body given `pairs`, and the number of fields it reports as
+    /// not written.
+    fn trailer_bytes(pairs: &[(&str, &str)]) -> (Option<Vec<u8>>, usize) {
+        let mut m = chunk_framed_machine();
+        let withheld = m.enqueue_body_end_with_trailers(Side::Client, &headers(pairs));
+        (m.poll_outbound(Side::Client), withheld)
+    }
+
+    /// The deny-set the spec lists (37 names), spelled out here independently of
+    /// `FORBIDDEN_TRAILERS` so a name dropped from the constant is caught.
+    const SPEC_DENY_SET: [&str; 37] = [
+        // Message framing
+        "transfer-encoding",
+        "content-length",
+        // Routing
+        "host",
+        // Request modifiers
+        "cache-control",
+        "expect",
+        "max-forwards",
+        "pragma",
+        "range",
+        "te",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "if-range",
+        // Authentication
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+        "proxy-authenticate",
+        "authentication-info",
+        "proxy-authentication-info",
+        "cookie",
+        "set-cookie",
+        // Response control data
+        "age",
+        "date",
+        "expires",
+        "location",
+        "retry-after",
+        "vary",
+        "warning",
+        // Payload processing
+        "content-encoding",
+        "content-type",
+        "content-range",
+        "trailer",
+        // Connection management
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "upgrade",
+    ];
+
+    #[test]
+    fn trailer_terminator_without_fields_is_unchanged() {
+        let (bytes, withheld) = trailer_bytes(&[]);
+        assert_eq!(bytes, Some(b"0\r\n\r\n".to_vec()));
+        assert_eq!(withheld, 0);
+
+        // The public form, which carries no trailers, writes the same bytes.
+        let mut m = chunk_framed_machine();
+        m.enqueue_body_end(Side::Client);
+        assert_eq!(m.poll_outbound(Side::Client), Some(b"0\r\n\r\n".to_vec()));
+    }
+
+    #[test]
+    fn trailer_terminator_writes_allowed_fields_in_order() {
+        let (bytes, withheld) = trailer_bytes(&[("x-sum", "abc"), ("X-E2E", "m1")]);
+        assert_eq!(
+            bytes,
+            Some(b"0\r\nx-sum: abc\r\nX-E2E: m1\r\n\r\n".to_vec())
+        );
+        assert_eq!(withheld, 0);
+
+        // Order, case and a repeated name are kept as captured.
+        let (bytes, withheld) = trailer_bytes(&[("X-A", "1"), ("x-b", "2"), ("x-a", "3")]);
+        assert_eq!(
+            bytes,
+            Some(b"0\r\nX-A: 1\r\nx-b: 2\r\nx-a: 3\r\n\r\n".to_vec())
+        );
+        assert_eq!(withheld, 0);
+    }
+
+    #[test]
+    fn the_terminator_resets_the_framing_like_enqueue_body_end_does() {
+        let mut m = chunk_framed_machine();
+        m.enqueue_body_chunk(Side::Client, b"hi");
+        m.enqueue_body_end_with_trailers(Side::Client, &headers(&[("x-sum", "abc")]));
+        // After the terminator nothing is chunk-framed any more: a further slice
+        // goes out raw, and a second terminator writes nothing.
+        m.enqueue_body_chunk(Side::Client, b"raw");
+        m.enqueue_body_end_with_trailers(Side::Client, &headers(&[("x-sum", "abc")]));
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            Some(b"2\r\nhi\r\n0\r\nx-sum: abc\r\n\r\nraw".to_vec())
+        );
+    }
+
+    #[test]
+    fn the_deny_set_is_exactly_the_specs_37_names() {
+        assert_eq!(FORBIDDEN_TRAILERS.len(), 37);
+        let have: std::collections::BTreeSet<&str> = FORBIDDEN_TRAILERS.iter().copied().collect();
+        let want: std::collections::BTreeSet<&str> = SPEC_DENY_SET.iter().copied().collect();
+        assert_eq!(want.len(), 37, "the spec's list has no duplicate");
+        assert_eq!(have, want);
+        for name in FORBIDDEN_TRAILERS {
+            assert_eq!(
+                *name,
+                name.to_ascii_lowercase(),
+                "names are held lower case"
+            );
+        }
+    }
+
+    #[test]
+    fn every_forbidden_trailer_name_is_withheld() {
+        for name in SPEC_DENY_SET {
+            for spelled in [name.to_string(), name.to_ascii_uppercase()] {
+                let (bytes, withheld) = trailer_bytes(&[(spelled.as_str(), "1"), ("x-ok", "1")]);
+                assert_eq!(
+                    bytes,
+                    Some(b"0\r\nx-ok: 1\r\n\r\n".to_vec()),
+                    "{spelled} must not reach the wire"
+                );
+                assert_eq!(withheld, 1, "{spelled} is one withheld field");
+            }
+        }
+    }
+
+    #[test]
+    fn withheld_fields_are_counted_and_the_rest_keep_their_order() {
+        let (bytes, withheld) = trailer_bytes(&[
+            ("X-First", "1"),
+            ("Content-Length", "0"),
+            ("Set-Cookie", "s=1"),
+            ("X-Last", "2"),
+            ("Host", "evil.test"),
+        ]);
+        assert_eq!(
+            bytes,
+            Some(b"0\r\nX-First: 1\r\nX-Last: 2\r\n\r\n".to_vec())
+        );
+        assert_eq!(withheld, 3);
+
+        // Only forbidden fields: the section is empty, and the count is all of them.
+        let (bytes, withheld) = trailer_bytes(&[("Location", "/x"), ("Content-Type", "x/y")]);
+        assert_eq!(bytes, Some(b"0\r\n\r\n".to_vec()));
+        assert_eq!(withheld, 2);
+    }
+
+    #[test]
+    fn denial_is_by_whole_name_not_by_prefix_or_substring() {
+        let allowed = [
+            "x-host",
+            "hostname",
+            "content-lengths",
+            "x-content-length",
+            "set-cookie2",
+            "tee",
+            "server-timing",
+            "digest",
+            "content-digest",
+            "x-checksum-sha256",
+        ];
+        for name in allowed {
+            let (bytes, withheld) = trailer_bytes(&[(name, "1")]);
+            assert_eq!(
+                bytes,
+                Some(format!("0\r\n{name}: 1\r\n\r\n").into_bytes()),
+                "{name} is not on the deny-set"
+            );
+            assert_eq!(withheld, 0);
+        }
+    }
+
+    #[test]
+    fn trailers_are_not_written_for_an_unframed_body() {
+        let pairs = [("x-sum", "abc"), ("X-E2E", "m1")];
+
+        // No response head queued yet: the client framing is raw.
+        let mut m = Http1Machine::new();
+        assert_eq!(
+            m.enqueue_body_end_with_trailers(Side::Client, &headers(&pairs)),
+            2
+        );
+        assert_eq!(m.poll_outbound(Side::Client), None);
+
+        // A streamed body framed by length, and a buffered body, are raw too.
+        for resp in [
+            streamed_response(headers(&[("Content-Length", "5")])),
+            HttpResponse {
+                body: Body::Bytes(b"hello".to_vec()),
+                ..streamed_response(HeaderMap::new())
+            },
+        ] {
+            let mut m = Http1Machine::new();
+            m.enqueue_response(&resp);
+            let _head = m.poll_outbound(Side::Client);
+            assert_eq!(
+                m.enqueue_body_end_with_trailers(Side::Client, &headers(&pairs)),
+                2,
+                "every field is reported as not written"
+            );
+            assert_eq!(m.poll_outbound(Side::Client), None, "and none is written");
+        }
+    }
+
+    #[test]
+    fn a_trailer_is_writable_only_when_name_and_value_are_wire_safe() {
+        assert!(writable_trailer("x-sum", "abc"));
+        assert!(writable_trailer("X-E2E", "two words; and\ttab"));
+        assert!(writable_trailer("x-empty", ""));
+        // A line break in either half would end the field line early and let the
+        // origin write framing or routing bytes of its own.
+        assert!(!writable_trailer("x-a\r\nHost: evil.test", "v"));
+        assert!(!writable_trailer("x-a", "v\r\nHost: evil.test"));
+        assert!(!writable_trailer("x-a", "v\nSet-Cookie: s=1"));
+        assert!(!writable_trailer("x-a", "v\rinjected"));
+        assert!(!writable_trailer("x-a", "v\0"));
+        assert!(!writable_trailer("x-a", "v\x7f"));
+        assert!(!writable_trailer("x-a", " v"));
+        assert!(!writable_trailer("x-a", "v "));
+        assert!(!writable_trailer("", "v"));
+        assert!(!writable_trailer("x a", "v"));
+        assert!(!writable_trailer("x-a:", "v"));
+        assert!(!writable_trailer("x\ta", "v"));
+        // And the deny-set applies through the same gate.
+        assert!(!writable_trailer("Set-Cookie", "s=1"));
+    }
+
+    #[test]
+    fn trailers_the_machine_captured_are_what_the_writer_emits() {
+        // The two halves together: parse a response's trailer section off the
+        // wire, then write that capture back out after a chunk-framed body.
+        let mut m = Http1Machine::new();
+        m.on_bytes(Side::Client, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+            .unwrap();
+        m.on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              2\r\nhi\r\n0\r\nX-Sum: abc\r\nSet-Cookie: s=1\r\nx-sum: def\r\n\r\n",
+        )
+        .unwrap();
+        let captured = m.response().expect("response").trailers.clone();
+        assert_eq!(captured.len(), 3, "the capture keeps every field");
+
+        m.enqueue_response(&streamed_response(headers(&[(
+            "Transfer-Encoding",
+            "chunked",
+        )])));
+        let _head = m.poll_outbound(Side::Client);
+        assert_eq!(m.enqueue_body_end_with_trailers(Side::Client, &captured), 1);
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            Some(b"0\r\nX-Sum: abc\r\nx-sum: def\r\n\r\n".to_vec())
+        );
     }
 }

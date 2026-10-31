@@ -533,6 +533,14 @@ impl Conn {
 /// larger than `max_body` is refused with the `413` instead, with no `100`. The
 /// `Expect` header itself is forwarded to the origin untouched, with the whole
 /// body in one write, and the origin's own optional `100` is skipped.
+///
+/// The trailer section of a chunked response is forwarded after the body when
+/// the client-bound body is chunk-framed (never after a body a plugin replaced,
+/// and without the fields that cannot work as trailers), and is stored on the
+/// flow's response, every field of it, when the response completes: before
+/// `Event::Response`, so a plugin reads it there, and never merged into the
+/// headers. A section over its caps ends the connection with an error, with the
+/// terminator unwritten, so the client sees an incomplete message.
 async fn serve(
     ctx: &ModuleCtx,
     mut client: ByteStream,
@@ -882,6 +890,12 @@ async fn serve(
                             wants_close(&head.headers) || close_delimited(&request.method, &head);
                         let streamed = HttpResponse {
                             body: Body::Streamed(StreamBody),
+                            // A response that arrived in one read already has its
+                            // trailer section on the machine's model. The stored
+                            // head holds none until `ResponseComplete` stores
+                            // them, so a plugin sees the same at this event
+                            // however the origin's bytes were split.
+                            trailers: HeaderMap::new(),
                             ..head
                         };
                         let mut staged = Some(streamed.clone());
@@ -913,11 +927,32 @@ async fn serve(
                         }
                     }
                     HttpSansIoEvent::ResponseComplete(id) => {
+                        // The trailer section the origin sent after a chunked
+                        // body, parsed and bounded by the machine, which holds it
+                        // on its response model by now. Empty for any other body.
+                        let trailers = machine
+                            .response()
+                            .map(|r| r.trailers.clone())
+                            .unwrap_or_default();
                         if forward_chunks {
-                            machine.enqueue_body_end(Side::Client);
+                            // Only a chunk-framed client body has a section to put
+                            // them in, and the writer withholds the fields that
+                            // cannot work as trailers. A plugin that replaced the
+                            // body (`forward_chunks` false) gets none of them.
+                            let withheld =
+                                machine.enqueue_body_end_with_trailers(Side::Client, &trailers);
                             flush(&mut machine, Side::Client, &mut client).await?;
+                            if withheld > 0 {
+                                // A count only: trailer names and values are the
+                                // origin's bytes and never go in a log.
+                                tracing::debug!(
+                                    withheld,
+                                    "trailer fields were not forwarded to the client"
+                                );
+                            }
                         }
                         let mut bytes = Some(std::mem::take(&mut captured));
+                        let mut trailers = Some(trailers);
                         ctx.store().update(id, &mut |f: &mut Flow| {
                             if let (Flow::Http(h), Some(bytes)) = (f, bytes.take()) {
                                 if let Some(resp) = h.response.as_mut() {
@@ -926,6 +961,10 @@ async fn serve(
                                     } else {
                                         Body::Bytes(bytes)
                                     };
+                                    // The capture keeps every field the origin
+                                    // sent, whether or not it was forwarded, and
+                                    // replaces whatever a plugin left here.
+                                    resp.trailers = trailers.take().unwrap_or_default();
                                 }
                                 h.metadata.truncated |= response_truncated;
                                 h.metadata.duration = h.metadata.created.elapsed().ok();
@@ -2166,10 +2205,10 @@ mod tests {
     /// body, and only then writes that exchange's reply segments, with a pause
     /// between them so the proxy reads them separately. After the last exchange it
     /// holds the connection open until the proxy hangs up.
-    async fn origin_replying(
+    async fn origin_replying<S: AsRef<str>>(
         mut io: DuplexStream,
         seen: Arc<Mutex<Vec<u8>>>,
-        exchanges: Vec<Vec<&'static str>>,
+        exchanges: Vec<Vec<S>>,
     ) {
         let mut held: Vec<u8> = Vec::new();
         let mut chunk = [0u8; 512];
@@ -2201,7 +2240,9 @@ mod tests {
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                if io.write_all(segment.as_bytes()).await.is_err() || io.flush().await.is_err() {
+                if io.write_all(segment.as_ref().as_bytes()).await.is_err()
+                    || io.flush().await.is_err()
+                {
                     return;
                 }
             }
@@ -4660,6 +4701,492 @@ mod tests {
         assert_eq!(
             *dialed.lock().expect("dialed lock"),
             vec![dial("127.0.0.1:8080", "127.0.0.1:8080")]
+        );
+    }
+
+    // ---- chunked trailers through `serve` -----------------------------------
+
+    /// The head of a chunked response that announces two trailer fields, and its one
+    /// chunk. The trailer section, if any, follows on the wire.
+    const TRAILER_HEAD: &str = "HTTP/1.1 200 OK\r\nTrailer: x-sum, x-e2e\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+
+    /// A trailer section of two fields that may be forwarded.
+    const TRAILER_SECTION: &str = "0\r\nx-sum: abc\r\nx-e2e: m1\r\n\r\n";
+
+    /// The two ways an origin can deliver [`TRAILER_HEAD`] followed by `section`:
+    /// as one write, and in pieces (the head and its chunk, then each line of the
+    /// section alone, 10 ms apart), so the proxy reads the trailers in reads that
+    /// come after the one that held the head.
+    fn trailer_deliveries(section: &str) -> [Vec<String>; 2] {
+        let whole = vec![format!("{TRAILER_HEAD}{section}")];
+        let mut pieces = vec![TRAILER_HEAD.to_string()];
+        pieces.extend(section.split_inclusive("\r\n").map(str::to_string));
+        [whole, pieces]
+    }
+
+    /// Read until `n` bytes have arrived or `within` has passed, and return what
+    /// arrived. A short answer is a result to compare, not a hang.
+    async fn read_up_to(io: &mut DuplexStream, n: usize, within: Duration) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 512];
+        let _ = tokio::time::timeout(within, async {
+            while got.len() < n {
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => got.extend_from_slice(&chunk[..read]),
+                }
+            }
+        })
+        .await;
+        got
+    }
+
+    /// Read until the peer closes or `within` has passed: everything that
+    /// arrived, and whether the close came.
+    async fn read_to_close(io: &mut DuplexStream, within: Duration) -> (Vec<u8>, bool) {
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 512];
+        let closed = tokio::time::timeout(within, async {
+            loop {
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => got.extend_from_slice(&chunk[..read]),
+                }
+            }
+        })
+        .await
+        .is_ok();
+        (got, closed)
+    }
+
+    /// One cleartext `GET /t` through `serve`, answered by an in-memory origin that
+    /// writes `segments` (10 ms apart). The client reads up to `want_len` bytes,
+    /// checks that nothing more follows, and hangs up. Returns `serve`'s result and
+    /// the bytes the client read.
+    async fn trailer_get(
+        ctx: &ModuleCtx,
+        origin_end: DuplexStream,
+        segments: Vec<String>,
+        want_len: usize,
+    ) -> (Result<()>, Vec<u8>) {
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            Arc::new(Mutex::new(Vec::new())),
+            vec![segments],
+        ));
+        with_serve(
+            ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                    .await
+                    .expect("send");
+                let got = read_up_to(&mut client, want_len, Duration::from_secs(1)).await;
+                assert_quiet(&mut client, Duration::from_millis(100)).await;
+                got
+            },
+        )
+        .await
+    }
+
+    /// Edits the stored response when `Event::ResponseHeaders` is dispatched, as a
+    /// plugin rewriting a response head would. Shares `store` with the context it is
+    /// built into, so the edit lands in what `serve` reads back.
+    struct EditAtResponseHeaders {
+        store: Arc<MemFlowStore>,
+        edit: fn(&mut HttpResponse),
+    }
+
+    impl EventSink for EditAtResponseHeaders {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            if let Event::ResponseHeaders(id) = ev {
+                self.store.update(id, &mut |f: &mut Flow| {
+                    if let Flow::Http(h) = f {
+                        if let Some(resp) = h.response.as_mut() {
+                            (self.edit)(resp);
+                        }
+                    }
+                });
+            }
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    /// One look a [`TrailerProbe`] took: the event, how many trailer fields the
+    /// stored response held then, and its `x-sum` header.
+    type ProbeLook = (&'static str, usize, Option<String>);
+
+    /// Records what the stored response holds when `Event::ResponseHeaders` and
+    /// `Event::Response` are dispatched, as a plugin reading the store would see it.
+    struct TrailerProbe {
+        store: Arc<MemFlowStore>,
+        looks: Mutex<Vec<ProbeLook>>,
+    }
+
+    impl EventSink for TrailerProbe {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            let (when, id) = match ev {
+                Event::ResponseHeaders(id) => ("ResponseHeaders", id),
+                Event::Response(id) => ("Response", id),
+                _ => return Box::pin(async { Verdict::Continue }),
+            };
+            if let Some(Flow::Http(HttpFlow {
+                response: Some(resp),
+                ..
+            })) = self.store.get(id)
+            {
+                self.looks.lock().expect("looks lock").push((
+                    when,
+                    resp.trailers.len(),
+                    resp.headers.get("x-sum").map(str::to_string),
+                ));
+            }
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_forwards_the_origin_trailers_in_order() {
+        let want = format!("{TRAILER_HEAD}{TRAILER_SECTION}");
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "the origin wrote {segments:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_the_connection_in_sync_after_a_response_with_trailers() {
+        let want = format!("{TRAILER_HEAD}{TRAILER_SECTION}");
+        for first in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+            let _origin = tokio::spawn(origin_replying(
+                origin_end,
+                Arc::new(Mutex::new(Vec::new())),
+                vec![first.clone(), vec![REPLY_OK.to_string()]],
+            ));
+            let want_len = want.len();
+
+            let (served, (got, body, pending)) = with_serve(
+                &ctx,
+                Conn::plain(unknown_peer(), None),
+                None,
+                MAX_BODY,
+                |mut client| async move {
+                    client
+                        .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                        .await
+                        .expect("send");
+                    let got = read_up_to(&mut client, want_len, Duration::from_secs(1)).await;
+                    // The next request on the same connection is answered intact.
+                    let mut pending = Vec::new();
+                    let body = client_send_keep(
+                        &mut client,
+                        &mut pending,
+                        &get_request("/next", "127.0.0.1:8080"),
+                    )
+                    .await;
+                    (got, body, pending)
+                },
+            )
+            .await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "the origin wrote {first:?}"
+            );
+            assert_eq!(body, "ok");
+            assert!(
+                pending.is_empty(),
+                "nothing follows the second response: {pending:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_without_trailers_still_ends_the_body_with_a_bare_terminator() {
+        let want = format!("{TRAILER_HEAD}0\r\n\r\n");
+        for segments in trailer_deliveries("0\r\n\r\n") {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "the origin wrote {segments:?}"
+            );
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert!(response.trailers.is_empty(), "no trailer fields were sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_withholds_forbidden_trailers_from_the_wire_but_captures_them() {
+        let section = "0\r\nContent-Length: 0\r\nHost: evil.test\r\nSet-Cookie: s=1\r\nAuthorization: Bearer x\r\nX-Keep: yes\r\nLocation: /x\r\n\r\n";
+        let want = format!("{TRAILER_HEAD}0\r\nX-Keep: yes\r\n\r\n");
+        for segments in trailer_deliveries(section) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "only the allowed field is forwarded (origin wrote {segments:?})"
+            );
+            // The capture keeps all six, in the order the origin sent them.
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert_eq!(
+                response.trailers.iter().collect::<Vec<_>>(),
+                vec![
+                    ("Content-Length", "0"),
+                    ("Host", "evil.test"),
+                    ("Set-Cookie", "s=1"),
+                    ("Authorization", "Bearer x"),
+                    ("X-Keep", "yes"),
+                    ("Location", "/x"),
+                ]
+            );
+            // And none of them leaked into the headers.
+            for name in [
+                "content-length",
+                "host",
+                "set-cookie",
+                "authorization",
+                "x-keep",
+                "location",
+            ] {
+                assert_eq!(response.headers.get(name), None, "{name} is a trailer only");
+            }
+            assert_eq!(response.headers.get("trailer"), Some("x-sum, x-e2e"));
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_does_not_forward_origin_trailers_after_a_replaced_body() {
+        // A plugin swaps the streamed body for its own and drops the chunked
+        // framing, so the client gets a `Content-Length` response.
+        let want = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nreplaced";
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let sink = Arc::new(EditAtResponseHeaders {
+                store: store.clone(),
+                edit: |resp| {
+                    resp.body = Body::Bytes(b"replaced".to_vec());
+                    resp.headers.remove("transfer-encoding");
+                    resp.headers.remove("trailer");
+                },
+            });
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "no terminator and no trailer follows a replaced body (origin wrote {segments:?})"
+            );
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert_eq!(
+                response.trailers.iter().collect::<Vec<_>>(),
+                vec![("x-sum", "abc"), ("x-e2e", "m1")],
+                "the capture still holds what the origin sent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_writes_no_trailers_when_the_client_body_is_not_chunk_framed() {
+        // A plugin reframes the still-streamed body by length: the client-bound
+        // framing is no longer chunked, so there is no section to put trailers in.
+        let want = "HTTP/1.1 200 OK\r\nTrailer: x-sum, x-e2e\r\nContent-Length: 5\r\n\r\nhello";
+        let (_guard, captured) = capture_events(tracing::Level::DEBUG);
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            captured.lock().expect("events lock").clear();
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let sink = Arc::new(EditAtResponseHeaders {
+                store: store.clone(),
+                edit: |resp| {
+                    resp.headers.remove("transfer-encoding");
+                    resp.headers.set("Content-Length", "5");
+                },
+            });
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "origin wrote {segments:?}"
+            );
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert_eq!(response.trailers.len(), 2, "the capture is unaffected");
+            // Both fields went unwritten, and that is reported once, as a count.
+            let events = captured.lock().expect("events lock");
+            let reports: Vec<&Captured> = events
+                .iter()
+                .filter(|e| e.fields.contains_key("withheld"))
+                .collect();
+            assert_eq!(reports.len(), 1, "events: {events:?}");
+            assert_eq!(reports[0].level, tracing::Level::DEBUG);
+            assert_eq!(reports[0].fields, field_set(&[("withheld", "2")]));
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_exposes_trailers_to_plugins_at_response_time() {
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let probe = Arc::new(TrailerProbe {
+                store: store.clone(),
+                looks: Mutex::new(Vec::new()),
+            });
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, probe.clone());
+            let want_len = TRAILER_HEAD.len() + TRAILER_SECTION.len();
+
+            let (served, _got) = trailer_get(&ctx, origin_end, segments.clone(), want_len).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            // The head is dispatched with no trailers yet, whatever has already been
+            // read; by `Event::Response` the origin's two fields are stored, and the
+            // headers are the origin's head, unmerged.
+            assert_eq!(
+                *probe.looks.lock().expect("looks lock"),
+                vec![("ResponseHeaders", 0, None), ("Response", 2, None)],
+                "the origin wrote {segments:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_fails_closed_on_an_oversized_trailer_section() {
+        let mut section = String::from("0\r\n");
+        for n in 0..65 {
+            section.push_str(&format!("f{n}: v\r\n"));
+        }
+        section.push_str("\r\n");
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        // The head and its chunk are written alone and first, so they are read,
+        // forwarded and flushed before the over-cap section arrives. (Were all of it
+        // in one read, `on_bytes` would fail for the whole read and the client would
+        // get nothing before the close: fail-closed as well, not asserted here.)
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            Arc::new(Mutex::new(Vec::new())),
+            vec![vec![TRAILER_HEAD.to_string(), section]],
+        ));
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                    .await
+                    .expect("send");
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an over-cap trailer section fails the connection");
+        assert!(err.to_string().contains("trailer"), "error: {err}");
+        assert!(
+            closed,
+            "the proxy must hang up, not keep the client waiting"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            TRAILER_HEAD,
+            "the client has the head and the chunk, and never a terminator"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_never_logs_trailer_names_or_values() {
+        let (_guard, captured) = capture_events(tracing::Level::TRACE);
+        let token = "x-trailertoken-91c2: val-trailertoken-91c2\r\n";
+
+        // Every field is forwarded: nothing to report.
+        let section = format!("0\r\n{token}\r\n");
+        let want = format!("{TRAILER_HEAD}{section}");
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let segments = trailer_deliveries(&section)[1].clone();
+        let (served, got) = trailer_get(&ctx, origin_end, segments, want.len()).await;
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(String::from_utf8_lossy(&got), want);
+        {
+            let events = captured.lock().expect("events lock");
+            assert!(
+                !format!("{events:?}")
+                    .to_ascii_lowercase()
+                    .contains("trailertoken"),
+                "a trailer name or value reached the log: {events:?}"
+            );
+            assert!(
+                events.iter().all(|e| !e.fields.contains_key("withheld")),
+                "a response whose trailers are all forwarded has nothing to report: {events:?}"
+            );
+        }
+        captured.lock().expect("events lock").clear();
+
+        // One field is withheld: one debug event, carrying a count and nothing else.
+        let section = format!("0\r\n{token}Set-Cookie: s=1\r\n\r\n");
+        let want = format!("{TRAILER_HEAD}0\r\n{token}\r\n");
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let segments = trailer_deliveries(&section)[1].clone();
+        let (served, got) = trailer_get(&ctx, origin_end, segments, want.len()).await;
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(String::from_utf8_lossy(&got), want);
+        let events = captured.lock().expect("events lock");
+        assert!(
+            !format!("{events:?}")
+                .to_ascii_lowercase()
+                .contains("trailertoken"),
+            "a trailer name or value reached the log: {events:?}"
+        );
+        let reports: Vec<&Captured> = events
+            .iter()
+            .filter(|e| e.fields.contains_key("withheld"))
+            .collect();
+        assert_eq!(reports.len(), 1, "events: {events:?}");
+        assert_eq!(reports[0].level, tracing::Level::DEBUG);
+        assert_eq!(reports[0].fields, field_set(&[("withheld", "1")]));
+        assert!(
+            !format!("{events:?}")
+                .to_ascii_lowercase()
+                .contains("cookie"),
+            "a withheld field's name must not be logged either: {events:?}"
         );
     }
 }
