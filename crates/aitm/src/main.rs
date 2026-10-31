@@ -297,7 +297,8 @@ async fn run() -> anyhow::Result<()> {
         // `l4.capture.*`'s own and nothing calls `accept`.
         l4_ingress,
         l4_guard,
-        // The private sealed `Governance` was already taken above.
+        // `..` stands only for the private `governance` (taken above). Any new
+        // `pub` field of `Assembled` must be named here, not absorbed by it.
         ..
     } = assembled;
 

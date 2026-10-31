@@ -52,7 +52,7 @@ use std::time::{Duration, Instant};
 use aitm::tui::{self, TuiLog};
 use aitm::wire::{assemble, Assembled};
 use aitm_bus_client::InProcessHandler;
-use aitm_core::{AgentPolicy, Config, Frontend, McpTransport};
+use aitm_core::{AgentPolicy, Config, Frontend, McpTransport, DEFAULT_ARGS_SUMMARY_CAP};
 use aitm_mcp::{ConnCtx, McpServer, NotificationSink};
 use serde_json::{json, Value};
 
@@ -260,9 +260,9 @@ fn tui_policy(rig: &Rig) -> Value {
     reply["result"]["structuredContent"]["policy"].clone()
 }
 
-/// AC1: a live `agent.set paused` from the TUI refuses the loopback agent on
-/// its very next call, on the connection it already holds, and `agent.set
-/// auto` lets it run again.
+/// Red-set. AC1: a live `agent.set paused` from the TUI refuses the loopback
+/// agent on its very next call, on the connection it already holds, and
+/// `agent.set auto` lets it run again.
 #[test]
 fn a_tui_pause_refuses_the_loopback_agent_on_its_next_call() {
     let rig = rig("pause", None);
@@ -282,9 +282,10 @@ fn a_tui_pause_refuses_the_loopback_agent_on_its_next_call() {
     assert_ok(&agent_call(&rig, &agent, "flow.list", json!({})));
 }
 
-/// AC2: a live `agent.set readonly` allows the agent's reads and refuses its
-/// writes; a live `agent.set ask` refuses a sensitive call at once when no
-/// operator is connected to the agent server to approve it (the TUI cannot).
+/// Red-set. AC2: a live `agent.set readonly` allows the agent's reads and
+/// refuses its writes; a live `agent.set ask` refuses a sensitive call at once
+/// when no operator is connected to the agent server to approve it (the TUI
+/// cannot).
 #[test]
 fn tui_readonly_and_ask_govern_the_loopback_agent_live() {
     let rig = rig("readonly-ask", None);
@@ -336,8 +337,8 @@ fn default_auto_still_refuses_a_sensitive_loopback_agent_call() {
     assert_eq!(tui_policy(&rig), json!("auto"));
 }
 
-/// AC5: the loopback agent's calls, allowed and refused, are counted and
-/// listed by the TUI's `agent.status` / `agent.activity`, and are in the
+/// Red-set. AC5: the loopback agent's calls, allowed and refused, are counted
+/// and listed by the TUI's `agent.status` / `agent.activity`, and are in the
 /// core's own `audit_ring`. The audit assertions run first so the red cause
 /// is the count.
 #[test]
@@ -535,10 +536,14 @@ fn a_paused_loopback_agent_still_gets_initialize_tools_list_and_ping() {
 
 /// Red-set. Malformed and empty input on the agent server is a JSON-RPC
 /// protocol error: it never runs a command and is never audited, it changes no
-/// policy, and the server keeps serving afterwards. (Which error code each
-/// malformed shape gets is `aitm-mcp`'s to pin.) The last two assertions are
-/// the control that makes "never audited" mean something: one valid call lands
-/// in the core's shared ring (red against the pre-switch wiring, whose ring is
+/// policy, and the server keeps serving afterwards. Two classes are covered:
+/// lines that are not a request at all, and well-formed `tools/call` requests
+/// whose tool or arguments are invalid (an unknown tool, `arguments` that are
+/// not an object, an undeclared argument on an allowed read), which are the
+/// protocol errors `call_tool` itself decides not to audit. (Which error code
+/// each shape gets is `aitm-mcp`'s to pin.) The last two assertions are the
+/// control that makes "never audited" mean something: one valid call lands in
+/// the core's shared ring (red against the pre-switch wiring, whose ring is
 /// private).
 #[test]
 fn malformed_and_empty_agent_input_is_a_protocol_error_that_is_never_audited() {
@@ -561,6 +566,36 @@ fn malformed_and_empty_agent_input_is_a_protocol_error_that_is_never_audited() {
         assert!(
             reply.get("result").is_none(),
             "{what}: a malformed request ran something: {reply}"
+        );
+    }
+
+    for (what, params) in [
+        (
+            "an unknown tool",
+            json!({"name": "no.such.tool", "arguments": {}}),
+        ),
+        (
+            "arguments that are not an object",
+            json!({"name": "flow.list", "arguments": [1, 2]}),
+        ),
+        (
+            "an undeclared argument on an allowed read",
+            json!({"name": "flow.list", "arguments": {"bogus_arg": 1}}),
+        ),
+    ] {
+        let reply = agent_rpc(&rig, &agent, "tools/call", params);
+        assert!(
+            reply.get("error").is_some(),
+            "{what}: a JSON-RPC error: {reply}"
+        );
+        assert!(
+            reply.get("result").is_none(),
+            "{what}: an invalid tools/call ran something: {reply}"
+        );
+        assert_eq!(
+            rig.assembled.audit_ring.len(),
+            0,
+            "{what}: a protocol error was audited"
         );
     }
 
@@ -589,6 +624,9 @@ fn malformed_and_empty_agent_input_is_a_protocol_error_that_is_never_audited() {
 #[test]
 fn an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_without_the_secret() {
     let rig = rig("oversized", Some(AgentPolicy::Paused));
+    // Key order matters: the secret-bearing keys come first and the huge one
+    // last, so the secrets fall inside the summary cap and the no-secret
+    // assertion tests redaction, not truncation.
     let arguments = json!({
         "api_token": SECRET,
         "authorization": format!("Bearer {SECRET}"),
@@ -620,6 +658,18 @@ fn an_oversized_secret_bearing_agent_call_reaches_the_tui_trail_without_the_secr
         json!("flow.list"),
         "{}",
         short(&activity)
+    );
+    // The row's `args` is the ring entry's argument summary. Its size bounds
+    // what an untrusted loopback agent can store in the shared ring per call:
+    // at most the cap plus the one ellipsis a truncation may append.
+    let args = rows[0]["args"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the row has a string args summary: {}", short(&activity)));
+    assert!(
+        args.len() <= DEFAULT_ARGS_SUMMARY_CAP + '…'.len_utf8(),
+        "the args summary is {} bytes, over the {DEFAULT_ARGS_SUMMARY_CAP}-byte cap: an \
+         untrusted loopback agent grew a shared ring entry past the bound",
+        args.len()
     );
     assert!(
         !activity.to_string().contains(SECRET),

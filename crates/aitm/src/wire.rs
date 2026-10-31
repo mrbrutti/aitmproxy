@@ -141,11 +141,8 @@ pub struct Assembled {
     /// divergent copy. Read-only use: the feeder only lists scope here; every
     /// authorization still goes through the ingress's own `L4Guard::check`.
     pub l4_guard: Option<Arc<L4Guard>>,
-    /// The sealed [`Governance`] that [`Assembled::governance`] hands out. It is
-    /// fixed at assembly from the very `agent_state` and `audit_ring` `Arc`s the
-    /// `AgentPlugin` was registered over, and it is private: overwriting the two
-    /// `pub` fields above afterwards does not change it, so the `aitm tui` agent
-    /// server cannot be built on a substituted state.
+    /// The sealed [`Governance`] that [`Assembled::governance`] hands out;
+    /// private so the `pub` fields above cannot substitute it.
     governance: Governance,
 }
 
@@ -160,8 +157,11 @@ pub struct Assembled {
 /// `Assembled` keeps it in a private field, so no later write to the `pub`
 /// `Assembled::agent_state` / `Assembled::audit_ring` fields can substitute a
 /// fresh state. `tui::build_servers` and `tui::run` require one, so `aitm tui`
-/// cannot be wired without it, nor with a fresh state in its place. It carries
-/// no push sender.
+/// cannot be wired without one, and no outside code can substitute the pair an
+/// assembly made. It is not tied to the `Proxy` in the `Services` passed beside
+/// it: a `Governance` from a second `assemble()` would pass (in-process code
+/// only; nothing on the network, in a plugin, or over MCP can reach that). It
+/// carries no push sender.
 ///
 /// A `Governance` cannot be built outside this crate:
 ///
@@ -211,12 +211,7 @@ pub struct Governance {
 }
 
 impl Assembled {
-    /// The core's governance for `tui::build_servers`: a clone of the
-    /// [`Governance`] fixed at assembly, which holds this assembly's own
-    /// `agent_state` and `audit_ring` `Arc`s. The only public source of a
-    /// [`Governance`]. It is read from the private field, not from the `pub`
-    /// `agent_state` / `audit_ring` fields, so reassigning those does not reach
-    /// it.
+    /// A clone of the [`Governance`] fixed at assembly; its only public source.
     pub fn governance(&self) -> Governance {
         self.governance.clone()
     }
@@ -371,10 +366,7 @@ pub fn assemble_with_scripts(
     // agent.status.actions_last_minute) and the MCP server's `call_tool`, which
     // appends one entry per invocation.
     let audit_ring = Arc::new(AuditRing::default());
-    // The sealed governance `Assembled::governance` hands out, fixed here from
-    // the very pair the `AgentPlugin` below is registered over. It lives in a
-    // private field, so a later write to the `pub` `agent_state` / `audit_ring`
-    // fields cannot put the `aitm tui` agent server on a fresh state.
+    // The sealed `Governance`, fixed from the pair the `AgentPlugin` below is registered over.
     let governance = Governance {
         agent_state: Arc::clone(&agent_state),
         audit_ring: Arc::clone(&audit_ring),

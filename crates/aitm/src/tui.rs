@@ -8,10 +8,12 @@
 //! the terminal with the UI. It is agent-facing and gated, and it runs on the
 //! core's own shared `AgentState` and `AuditRing`, which [`build_servers`]
 //! receives as a sealed `wire::Governance` (`Assembled::governance` is its
-//! only public source): a live `agent.set` governs that agent on its next
-//! call, and its calls, allowed or refused, land in the trail `agent.activity`
-//! reads (not audited: a successful `flow.subscribe`, a `needs_confirmation`
-//! handshake step, and protocol-level JSON-RPC errors). The other is wrapped as
+//! only public source, so no outside code can hand it a substitute pair; see
+//! [`build_servers`] for what that does not tie down): a live `agent.set`
+//! governs that agent on its next call, and its calls, allowed or refused,
+//! land in the trail `agent.activity` reads (not audited: a successful
+//! `flow.subscribe`/`flow.unsubscribe`, a `needs_confirmation` handshake step,
+//! and protocol-level JSON-RPC errors). The other is wrapped as
 //! `Arc<McpServer>` so its `handle` becomes the TUI's in-process bus handler:
 //! the bus contract is unchanged, the TUI is a bus client like the others,
 //! there is just no socket between them. That server is the operator, ungated
@@ -283,8 +285,11 @@ pub fn init_tracing() -> TuiLog {
 ///
 /// `governance` is the core's own policy state and audit ring as a sealed
 /// `wire::Governance`, whose only public source is `Assembled::governance`, so
-/// this function cannot be called without them or with a fresh state in their
-/// place. The agent arm goes through [`with_shared_governance`]: a live
+/// this function cannot be called without one, and no outside code can
+/// substitute the pair an assembly made. It is not tied to the `Proxy` in
+/// `services`: a `Governance` from a second `assemble()` would pass (in-process
+/// code only; not reachable from the network, a plugin, or MCP). The agent arm
+/// goes through [`with_shared_governance`]: a live
 /// `agent.set`, from the TUI or from any operator-token client, governs the
 /// agent on its next call, and the agent's calls are recorded in the shared
 /// ring. The TUI-facing arm deliberately does not: it is the operator, and its
