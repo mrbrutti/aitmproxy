@@ -90,7 +90,7 @@ rm -rf ~/Library/Saved\ Application\ State/com.mrbrutti.aitmproxy.savedState
 store=/tmp/Aitmproxy-live-embedded-state
 rm -rf "$store"; mkdir -p "$store"
 note "launching the app (embedded, no external core)"
-APP_STORE="$store" "$app_bin" &
+AITM_AUDIT_LOG="${AITM_AUDIT_LOG:-off}" APP_STORE="$store" "$app_bin" &
 app_pid=$!
 
 # 6. Wait for the embedded core to come up: its process, its rendezvous file, and

@@ -129,6 +129,7 @@ class Aitm:
         self._stdout_file = open(self._stdout_path, "wb")
         env = dict(os.environ)
         env.setdefault("RUST_LOG", "info")
+        env["AITM_AUDIT_LOG"] = os.environ.get("AITM_E2E_AUDIT_LOG") or os.path.join(self.workdir, "audit.jsonl")
         self.proc = subprocess.Popen(
             argv, stdout=self._stdout_file, stderr=self._stderr_file,
             stdin=subprocess.DEVNULL, env=env,
