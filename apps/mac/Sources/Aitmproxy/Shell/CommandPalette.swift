@@ -8,6 +8,7 @@ import SwiftUI
 /// open/close never animates.
 struct CommandPalette: View {
     @Environment(Session.self) private var session
+    @Environment(\.colorScheme) private var colorScheme
     @State private var query = ""
     @State private var highlighted = 0
     @State private var form: PaletteForm?
@@ -43,8 +44,13 @@ struct CommandPalette: View {
         .frame(maxHeight: 440)
         .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.floating))
         .overlay(RoundedRectangle(cornerRadius: Tok.Radius.floating).strokeBorder(Tok.Line.border.color))
-        .shadow(color: .black.opacity(Tok.Shadow.floating.lightOpacity), radius: Tok.Shadow.floating.radius, y: Tok.Shadow.floating.y)
-        .onAppear { fieldFocused = true }
+        .shadow(color: .black.opacity(colorScheme == .dark ? Tok.Shadow.floating.darkOpacity : Tok.Shadow.floating.lightOpacity),
+                radius: Tok.Shadow.floating.radius, y: Tok.Shadow.floating.y)
+        .onAppear {
+            fieldFocused = true
+            // A scene can hand the palette an opening query (palette-flows snapshot); consumed once.
+            if let seed = session.paletteSeedQuery { query = seed; session.paletteSeedQuery = nil }
+        }
         .onExitCommand { if form != nil { form = nil } else { session.paletteVisible = false } }
         .onKeyPress(.downArrow) { highlighted = min(highlighted + 1, max(items.count - 1, 0)); return .handled }
         .onKeyPress(.upArrow) { highlighted = max(highlighted - 1, 0); return .handled }
@@ -124,6 +130,7 @@ struct CommandPalette: View {
 struct PaletteRow: View {
     var item: PaletteItem
     var highlighted: Bool
+    @State private var hovered = false
 
     var body: some View {
         HStack(spacing: Space.md) {
@@ -141,8 +148,10 @@ struct PaletteRow: View {
         }
         .padding(.horizontal, Space.lg)
         .frame(height: Tok.Size.toolbar)
-        .background(highlighted ? Tok.Ground.active.color : .clear)
+        // Keyboard highlight wins; the pointer only tints an unhighlighted row (D3).
+        .background(highlighted ? Tok.Ground.active.color : (hovered ? Tok.Ground.hover.color : .clear))
         .contentShape(Rectangle())
+        .onHover { hovered = $0 }
     }
 }
 

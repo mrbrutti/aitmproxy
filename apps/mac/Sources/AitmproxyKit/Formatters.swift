@@ -48,6 +48,15 @@ public enum Format {
 
     public static func time(_ date: Date?) -> String { date.map { time($0) } ?? dash }
 
+    /// `11:04:58` — wall-clock time to the second, local zone. For chart axis
+    /// ticks and narrow panels where the milliseconds of `time` would truncate.
+    public static func clockTime(_ date: Date, zone: TimeZone = .current) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = zone
+        let c = calendar.dateComponents([.hour, .minute, .second], from: date)
+        return String(format: "%02d:%02d:%02d", c.hour ?? 0, c.minute ?? 0, c.second ?? 0)
+    }
+
     /// `6 KB/s`.
     public static func rate(_ bytesPerSecond: Int64) -> String { "\(bytes(bytesPerSecond))/s" }
 

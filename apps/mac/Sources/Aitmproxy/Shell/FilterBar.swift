@@ -51,8 +51,11 @@ struct FilterBar: View {
             FlatSegment(options: FilterStack.Combinator.allCases.map { ($0, $0.title) }, selection: $session.filterStack.combinator)
                 .disabled(session.filterAdvanced && session.filterStackFromText == nil)
             Spacer()
+            // "Rows" alone is disabled while the Advanced text has no row form, so
+            // switching back can never silently drop a nested filter (B5).
             FlatSegment(options: [(false, "Rows"), (true, "Advanced")], selection: Binding(
-                get: { session.filterAdvanced }, set: { session.setFilterAdvanced($0) }))
+                get: { session.filterAdvanced }, set: { session.setFilterAdvanced($0) }),
+                disabledOptions: rowsHaveNoForm ? [false] : [])
             if session.filterAdvanced, session.filterStackFromText == nil, !session.filterText.isEmpty, session.filterError == nil {
                 Text("Nested filter — edit as text").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
             }
@@ -61,9 +64,10 @@ struct FilterBar: View {
                     .frame(width: Tok.Size.control, height: Tok.Size.control).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Saved filters")
+            .help("Show saved filters")
             .popover(isPresented: $showingSaved, arrowEdge: .bottom) { SavedFiltersPopover() }
-            FlatButton("Clear") { session.clearFilter() }
+            FlatButton("Reset") { session.clearFilter() }
+                .help("Reset the filter rows")
             Button { session.filterBarVisible = false } label: {
                 Image(systemName: "xmark").font(.system(size: 11, weight: .medium)).foregroundStyle(Tok.Ink.secondary.color)
                     .frame(width: Tok.Size.control, height: Tok.Size.control).contentShape(Rectangle())
@@ -73,10 +77,31 @@ struct FilterBar: View {
         }
     }
 
+    /// True while Advanced is on with a non-empty text that has no rows form
+    /// (nested, or still invalid): "Rows" would lose it.
+    private var rowsHaveNoForm: Bool {
+        session.filterAdvanced && !session.filterText.isEmpty && session.filterStackFromText == nil
+    }
+
     private func filterRow(_ index: Int) -> some View {
         @Bindable var session = session
         let row = session.filterStack.rows[index]
         let error = row.validationError
+        return VStack(alignment: .leading, spacing: Space.xs) {
+            filterRowControls(index, row: row, error: error)
+            // The border alone is not a report: say what is wrong under the row (B5).
+            if let error {
+                Text(error)
+                    .font(Tok.Face.ui(Tok.Typography.Size.xs))
+                    .foregroundStyle(Tok.Intercept.deep.color)
+                    .lineLimit(1)
+                    .padding(.leading, Space.sm)
+            }
+        }
+    }
+
+    private func filterRowControls(_ index: Int, row: FilterRow, error: String?) -> some View {
+        @Bindable var session = session
         return HStack(spacing: Space.sm) {
             FlatMenu(title: row.field.title, width: 148) {
                 ForEach(FilterField.allCases, id: \.self) { field in
@@ -186,6 +211,8 @@ struct SavedFiltersPopover: View {
                             Image(systemName: "minus.circle").foregroundStyle(Tok.Ink.tertiary.color)
                         }
                         .buttonStyle(.plain)
+                        .help("Delete this saved filter")
+                        .accessibilityLabel("Delete saved filter")
                     }
                 }
             }
@@ -197,7 +224,7 @@ struct SavedFiltersPopover: View {
                 Button(session.savedFilters.contains { $0.name == name } ? "Replace" : "Save") { save() }
                     .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || session.currentFilterExpressionText.isEmpty)
             }
-            FlatToggle(managing ? "Done" : "Manage…", isOn: $managing)
+            FlatToggle(managing ? "Done" : "Edit", isOn: $managing)
         }
         .padding(Space.lg)
         .frame(width: 360)
@@ -240,26 +267,47 @@ struct FlatButton: View {
 }
 
 /// Two or three words; the active one in ink on `raised`, the others secondary.
+/// Rounded-rect, not a capsule, so it reads as a control and not a chip (C5).
+/// Disabled (whole segment via `.disabled`, or one option via
+/// `disabledOptions`) drops to tertiary ink with no fill (B5).
 struct FlatSegment<Value: Hashable>: View {
     var options: [(Value, String)]
     @Binding var selection: Value
+    /// Options that cannot be chosen right now; the rest stay live.
+    var disabledOptions: Set<Value> = []
+    @Environment(\.isEnabled) private var isEnabled
+
+    init(options: [(Value, String)], selection: Binding<Value>, disabledOptions: Set<Value> = []) {
+        self.options = options
+        _selection = selection
+        self.disabledOptions = disabledOptions
+    }
 
     var body: some View {
         HStack(spacing: 2) {
             ForEach(options, id: \.0) { value, title in
                 let on = value == selection
+                let live = isEnabled && !disabledOptions.contains(value)
                 Button { selection = value } label: {
                     Text(title)
                         .font(Tok.Face.ui(Tok.Typography.Size.sm, on ? .medium : .regular))
-                        .foregroundStyle(on ? Tok.Ink.primary.color : Tok.Ink.secondary.color)
+                        .foregroundStyle(ink(on: on, live: live))
                         .padding(.horizontal, Space.sm)
                         .frame(height: Tok.Metric.chip)
-                        .background(on ? Tok.Ground.raised.color : .clear, in: Capsule())
-                        .contentShape(Capsule())
+                        .background(on && live ? Tok.Ground.raised.color : .clear,
+                                    in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+                        .contentShape(RoundedRectangle(cornerRadius: Tok.Radius.control))
                 }
                 .buttonStyle(.plain)
+                .disabled(!live)
+                .accessibilityAddTraits(on ? .isSelected : [])
             }
         }
+    }
+
+    private func ink(on: Bool, live: Bool) -> Color {
+        if !live { return Tok.Ink.tertiary.color }
+        return on ? Tok.Ink.primary.color : Tok.Ink.secondary.color
     }
 }
 

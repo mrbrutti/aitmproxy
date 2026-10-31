@@ -92,7 +92,8 @@ struct ComposeSheet: View {
         }
         .frame(width: 880, height: 560)
         .background(Tok.Ground.surface.color)
-        .onAppear { urlFocused = session.composeDraft.url.isEmpty || session.composeDraft.url.hasSuffix("://") }
+        // Focus only an empty URL field; a template's URL must never open selected.
+        .onAppear { urlFocused = session.composeDraft.url.isEmpty }
     }
 
     private var templates: some View {
@@ -120,34 +121,43 @@ struct ComposeSheet: View {
                 .foregroundStyle(Tok.Ink.tertiary.color)
                 .padding(.horizontal, Space.lg).padding(.top, Space.xl).padding(.bottom, Space.sm)
             if session.composeHistory.entries.isEmpty {
-                Text("Nothing sent yet").font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
-                    .padding(.horizontal, Space.lg)
-            }
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(session.composeHistory.entries.enumerated()), id: \.offset) { _, entry in
-                        Button {
-                            session.composeDraft = entry
-                            importedFromCurl = false
-                        } label: {
-                            HStack(spacing: Space.sm) {
-                                Badge(text: entry.method, pair: HTTPMethod(entry.method).badge)
-                                Text(entry.url).font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
-                                    .lineLimit(1).truncationMode(.middle)
-                            }
-                            .padding(.horizontal, Space.lg)
-                            .frame(height: Tok.Size.Row.default)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                        .help(entry.sentAt.map { "Sent \(Format.time($0))" } ?? "")
-                    }
-                }
+                ContentUnavailableView(
+                    "No Requests Sent",
+                    systemImage: "clock",
+                    description: Text("Requests you send appear here. Pick a template or paste a cURL command to start."))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                historyList
             }
         }
         .frame(width: 260)
         .background(Tok.Ground.page.color)
+    }
+
+    private var historyList: some View {
+        @Bindable var session = session
+        return ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(session.composeHistory.entries.enumerated()), id: \.offset) { _, entry in
+                    Button {
+                        session.composeDraft = entry
+                        importedFromCurl = false
+                    } label: {
+                        HStack(spacing: Space.sm) {
+                            Badge(text: entry.method, pair: HTTPMethod(entry.method).badge)
+                            Text(entry.url).font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                        .padding(.horizontal, Space.lg)
+                        .frame(height: Tok.Size.Row.default)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help(entry.sentAt.map { "Sent \(Format.time($0))" } ?? "")
+                }
+            }
+        }
     }
 
     private func editor(_ text: Binding<String>, placeholder: String) -> some View {

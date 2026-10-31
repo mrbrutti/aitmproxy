@@ -222,6 +222,8 @@ final class Session {
     var paletteVisible = false
     /// Opened with the mouse → animates; with ⌘K → does not (foundation §2.8).
     var paletteOpenedByKeyboard = true
+    /// A query the palette starts with the next time it opens (snapshot scenes); cleared on use.
+    var paletteSeedQuery: String?
     var tools: [ToolDescriptor] = Store.usesFixtures ? Fixtures.tools : []
     var recentPaletteIDs: [String] = UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
     /// A generic bus call for the palette; nil until a bus is attached.
@@ -357,7 +359,9 @@ final class Session {
 
     /// The list's query: scope page, group, chip, filter expression, sort (one Kit value, S-062 ready).
     var query: FlowQuery {
-        FlowQuery(inScopeOnly: page == .scope, group: group, chip: chip, filter: filterExpression, sort: sort)
+        FlowQuery(inScopeOnly: page == .scope, group: group,
+                  pins: page == .pinned && group == nil ? pins : nil,
+                  chip: chip, filter: filterExpression, sort: sort)
     }
 
     /// Rows after the query. Compiled once per query change, not per access.
@@ -450,7 +454,11 @@ final class Session {
     func applyResolvedRole(_ role: String?) {
         resolvedRole = role
         let expected = ExpectedRole(rawValue: UserDefaults.standard.string(forKey: "bus.expectedRole") ?? "")
-        roleWarning = roleMismatch(expected: expected, resolved: role)
+        // The embedded core always connects the app as operator; the Expected-role setting
+        // describes an external core, so it cannot warn here (a stale "agent" default would
+        // otherwise show a permanent triangle on a plain install).
+        let embedded = coreHealth.connection?.kind == .embedded
+        roleWarning = !embedded && roleMismatch(expected: expected, resolved: role)
     }
 
     /// Proxy ▸ Reconnect Bus: drop and re-open the connection so a newly pasted
@@ -552,7 +560,8 @@ final class Session {
         savedSessions = 3
         findingsCount = 2
         browserTabs = 1
-        activeScripts = 2
+        // The same predicate the Scripts page uses (enabled and no error), so the sidebar count never disagrees with it.
+        activeScripts = Fixtures.scripts.filter(\.isActive).count
         agentActionsLastMinute = 14
         memoryBytes = 196_000_000
         upBytesPerSecond = 6_000

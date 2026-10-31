@@ -86,6 +86,7 @@ struct SummaryStrip: View {
                 }
                 .buttonStyle(.plain)
                 .help("Copy URL")
+                .accessibilityLabel("Copy URL")
             }
             Spacer(minLength: Space.sm)
             // The meta keeps its full size; the URL truncates instead of the numbers.
@@ -177,26 +178,41 @@ struct PaneTabs<Tab: Hashable & CustomStringConvertible, Trailing: View>: View {
     var tabs: [Tab]
     @Binding var selected: Tab
     @ViewBuilder var trailing: Trailing
+    /// The tab row's natural width and the width it was given; when the row is
+    /// wider than its frame the overflow menu appears so no tab is unreachable.
+    @State private var tabsContentWidth: CGFloat = 0
+    @State private var tabsFrameWidth: CGFloat = 0
+
+    private var tabsOverflow: Bool { tabsContentWidth > tabsFrameWidth + 1 }
 
     var body: some View {
         HStack(spacing: Space.sm) {
+            // The title sits outside the tab scroller at its full size, so it can
+            // never be scrolled away or clipped by a narrow pane.
+            Text(title).font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
+                .lineLimit(1)
+                .fixedSize()
+                .layoutPriority(1)
+                .padding(.trailing, 2)
             // The tabs scroll when the pane is narrow; they never wrap and never widen
-            // the window. The selected tab is always scrolled into view, so a late tab
-            // (JSON, Diff) can never be the one pushed off-screen by the trailing controls.
+            // the window. The selected tab is scrolled into view from the leading edge,
+            // so a late tab (JSON, Diff) can never be pushed off-screen by the trailing controls.
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 2) {
-                        Text(title).font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold)).foregroundStyle(Tok.Ink.primary.color)
-                            .padding(.trailing, Tok.Metric.padInner)
-                            .fixedSize()
                         ForEach(tabs, id: \.self) { tab in
                             tabButton(tab).id(tab)
                         }
                     }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { tabsContentWidth = $0 }
                 }
                 .frame(minWidth: 72, minHeight: Tok.Size.tabBar, maxHeight: Tok.Size.tabBar)
-                .onAppear { proxy.scrollTo(selected, anchor: .center) }
-                .onChange(of: selected) { _, tab in proxy.scrollTo(tab, anchor: .center) }
+                .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { tabsFrameWidth = $0 }
+                .onAppear { proxy.scrollTo(selected, anchor: .leading) }
+                .onChange(of: selected) { _, tab in proxy.scrollTo(tab, anchor: .leading) }
+            }
+            if tabsOverflow {
+                overflowMenu
             }
             Spacer(minLength: Space.sm)
             trailing
@@ -205,6 +221,37 @@ struct PaneTabs<Tab: Hashable & CustomStringConvertible, Trailing: View>: View {
         .frame(height: Tok.Size.tabBar)
         .frame(minWidth: 0)
         .overlay(alignment: .bottom) { Rule() }
+    }
+
+    /// A flat chevron listing every tab, shown only when the tab row is wider than
+    /// its frame; the selected tab carries a checkmark.
+    private var overflowMenu: some View {
+        Menu {
+            ForEach(tabs, id: \.self) { tab in
+                Button {
+                    selected = tab
+                } label: {
+                    if tab == selected {
+                        Label(tab.description, systemImage: "checkmark")
+                    } else {
+                        Text(tab.description)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "chevron.down")
+                .symbolRenderingMode(.monochrome)
+                .font(.system(size: Tok.Size.iconInline, weight: .medium))
+                .foregroundStyle(Tok.Ink.secondary.color)
+                .frame(width: Tok.Size.control, height: Tok.Size.control)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("More tabs")
+        .accessibilityLabel("More tabs")
     }
 
     private func tabButton(_ tab: Tab) -> some View {
@@ -260,8 +307,13 @@ enum BodyLines {
             let edited = original != nil && !originalNames.contains(header.name)
             lines.append(CodeLine(runs: Syntax.header(line: "\(header.name): \(header.value)"), edited: edited, current: edited))
         }
-        lines.append(CodeLine(runs: []))
-        lines += body(message)
+        // The blank header/body separator only when there is a body to separate;
+        // a bodiless message would otherwise end in a phantom empty line.
+        let bodyLines = body(message)
+        if !bodyLines.isEmpty {
+            lines.append(CodeLine(runs: []))
+            lines += bodyLines
+        }
         return lines
     }
 }
@@ -396,7 +448,7 @@ struct RequestPane: View {
                     } else {
                         HeaderTable(headers: detail.request.headers)
                     }
-                case .cookies: CookieTable(cookies: Cookie.cookies(in: detail.request), bodySize: bodySize)
+                case .cookies: CookieTable(cookies: Cookie.cookies(in: detail.request), bodySize: bodySize, isRequest: true)
                 case .query: QueryTable(query: row.query)
                 case .body: BodyHost(message: detail.request, extent: detail.requestBodyExtent, bodySize: bodySize, sseState: sseState, state: bodyState)
                 case .summary:
@@ -480,9 +532,17 @@ struct ResponsePane: View {
             } else if tab == .diff {
                 diff
             } else if row.state == .paused, let previous = previousResponse {
-                CodeView(lines: BodyLines.body(previous),
-                         header: "No response yet — the request is paused. Showing the last response to this endpoint for reference.",
-                         footer: nil)
+                // The previous response is a reference, not this flow's content: the
+                // badge says so beside the caption, and the trailing slot stays empty.
+                VStack(alignment: .leading, spacing: 0) {
+                    HStack(alignment: .firstTextBaseline, spacing: Space.sm) {
+                        Badge(text: "Reference", pair: ColorPair(fg: Tok.Ink.secondary, bg: Tok.Ground.raised), uppercase: false)
+                        Hint(text: "No response yet — the request is paused. Showing the last response to this endpoint for reference.")
+                    }
+                    .padding(.leading, Space.md)
+                    .padding(.top, Space.xs)
+                    CodeView(lines: BodyLines.body(previous), header: nil, footer: nil)
+                }
             } else if row.state == .pending || detail == nil {
                 LoadingLines()
             } else {
@@ -517,10 +577,10 @@ struct ResponsePane: View {
         case .diff:
             if let pair = diffPair { DiffControls(result: FlowDiff.compare(pair.0, pair.1), state: diffState, compareLabel: compareLabel) }
         case .body:
+            // While the request is paused there is no response to format or search,
+            // so the slot shows nothing rather than dead controls.
             if let response = detail?.response {
                 BodyHost.controls(message: response, extent: detail?.responseBodyExtent, state: bodyState, sseState: sseState)
-            } else if row.state == .paused {
-                FormatLabel(title: "JSON")
             }
         default:
             EmptyView()
@@ -541,23 +601,6 @@ struct ResponsePane: View {
     private var previousResponse: HTTPMessage? {
         guard Store.usesFixtures else { return nil }
         return row.authority == "auth.shop-staging.test" && row.path == "/api/auth/login" ? Fixtures.previousLoginResponse : nil
-    }
-}
-
-/// The `JSON ▾` format label in the tab bar's trailing slot (the picker arrives with the pretty body viewer).
-struct FormatLabel: View {
-    var title: String
-    var body: some View {
-        HStack(spacing: 4) {
-            Text("\(title) ▾")
-                .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(Tok.Ink.primary.color)
-                .padding(.horizontal, Space.sm)
-                .frame(height: Space.xxl)
-                .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.control.color))
-            Image(systemName: Tok.Glyph.search).font(.system(size: 12)).foregroundStyle(Tok.Ink.secondary.color)
-                .frame(width: Space.xxl, height: Space.xxl)
-        }
     }
 }
 

@@ -36,7 +36,7 @@ struct ChipBar: View {
                 .frame(height: Tok.Metric.chip)
             }
             .buttonStyle(.plain)
-            .help("Filter bar (⌘F)")
+            .help(filterActive ? "Hide the filter bar (⌘F)" : "Show the filter bar (⌘F)")
         }
         .padding(.horizontal, Tok.Metric.padInner)
         .frame(height: Tok.Size.filterBar)

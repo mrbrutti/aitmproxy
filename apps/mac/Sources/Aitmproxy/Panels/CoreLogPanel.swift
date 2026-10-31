@@ -40,7 +40,8 @@ struct CoreLogPanel: View {
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.vertical, Space.xs)
-                                    .padding(.horizontal, Space.md)
+                                    // Shares the PageHeader's leading edge.
+                                    .padding(.horizontal, Space.margin)
                                     .id(line.id)
                             }
                         }
@@ -83,7 +84,7 @@ struct CoreLogPanel: View {
             .foregroundStyle(Tok.Status.serverError.color)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, Space.md)
+            .padding(.horizontal, Space.margin)
             .padding(.vertical, Space.sm)
     }
 

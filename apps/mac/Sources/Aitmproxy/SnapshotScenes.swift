@@ -73,6 +73,7 @@ enum SnapshotScene: String, CaseIterable {
             session.paletteVisible = true
         case .paletteFlows:
             session.paletteOpenedByKeyboard = true
+            session.paletteSeedQuery = "shop"
             session.paletteVisible = true
         case .multiSelect:
             session.selection = Set(session.rows.prefix(3).map(\.id))

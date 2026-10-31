@@ -13,7 +13,8 @@
 # Writes proof screenshots to /tmp/cua-*.png. Exit 0 when all asserted steps pass.
 set -u
 cd "${0:A:h}"
-APP="$HOME/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy"
+# APP=<binary> runs another build (e.g. the snap-dev bundle /tmp/Aitmproxy-dev.app/Contents/MacOS/Aitmproxy).
+APP="${APP:-$HOME/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy}"
 rm -rf "$HOME/Library/Saved Application State/com.mrbrutti.aitmproxy.savedState"
 APP_FIXTURES=1 APP_STORE=/tmp/Aitmproxy-cua "$APP" >/tmp/aitm-app-cua.log 2>&1 &
 PID=$!

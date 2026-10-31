@@ -1,9 +1,11 @@
+import AitmBusClient
 import AitmproxyKit
+import AppKit
 import SwiftUI
 
 /// The activity log (S-057): a right-side panel, header kept in view, rows
 /// `time · origin · command · args · result` at 28 pt, agent rows with a
-/// 2 pt teal edge, pending gated requests with Approve once / Deny.
+/// 2 pt teal edge, pending gated requests with Approve Once / Deny.
 struct ActivityLogPanel: View {
     @Bindable var state: ActivityState
     /// On the Agent page the log fills the width; as a side panel it is 360 wide behind a rule.
@@ -95,6 +97,8 @@ private struct ActivityRow: View {
                 .foregroundStyle(Tok.Ink.primary.color)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                // The narrow panel hides the args, so hover shows them on the command.
+                .help(!inline && !entry.argsSummary.isEmpty ? entry.argsSummary : "")
             if inline, !entry.argsSummary.isEmpty {
                 Text(entry.argsSummary)
                     .font(Tok.Face.data(Tok.Typography.Size.sm))
@@ -107,7 +111,7 @@ private struct ActivityRow: View {
             if isPending {
                 actions
             } else {
-                result.fixedSize().layoutPriority(1)
+                result.layoutPriority(1)
             }
         }
         .padding(.horizontal, Space.md)
@@ -118,8 +122,35 @@ private struct ActivityRow: View {
             if entry.origin == .agent { Rectangle().fill(Tok.Agent.base.color).frame(width: 2) }
         }
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
+        .contextMenu {
+            Button("Copy Command") { copy(entry.command) }
+            Button("Copy Arguments") { copy(JSONValue.object(entry.args).serialized(prettyPrinted: true)) }
+                .disabled(entry.args.isEmpty)
+            if isPending {
+                Divider()
+                Button("Approve Once") { state.approve(entry) }
+                Button("Deny") { state.deny(entry) }
+            }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(entry.origin.title) \(entry.command) \(entry.result.text)")
+    }
+
+    private func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// The first clause of an error — up to the first sentence break — so a row
+    /// says what went wrong without the whole message; hover has the rest.
+    private static func firstClause(_ message: String) -> String {
+        let oneLine = message.split(whereSeparator: \.isNewline).first.map(String.init) ?? message
+        for separator in [". ", "; ", " — "] {
+            if let range = oneLine.range(of: separator) {
+                return String(oneLine[..<range.lowerBound])
+            }
+        }
+        return oneLine
     }
 
     /// Approve / Deny: full labels on the wide Agent page, compact icon buttons in
@@ -129,12 +160,12 @@ private struct ActivityRow: View {
         Group {
             if inline {
                 HStack(spacing: Space.sm) {
-                    PrimaryButton("Approve once") { state.approve(entry) }
+                    PrimaryButton("Approve Once") { state.approve(entry) }
                     FlatButton("Deny") { state.deny(entry) }
                 }
             } else {
                 HStack(spacing: Space.xs) {
-                    iconButton("checkmark", help: "Approve once — run this command one time") { state.approve(entry) }
+                    iconButton("checkmark", help: "Approve Once — run this command one time") { state.approve(entry) }
                     iconButton("xmark", help: "Deny this request") { state.deny(entry) }
                 }
             }
@@ -158,13 +189,26 @@ private struct ActivityRow: View {
     @ViewBuilder private var result: some View {
         switch entry.result {
         case .ok:
-            Text("ok").font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color)
+            Text("ok").font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.secondary.color).fixedSize()
         case .error(let message):
-            Text("error").font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
-                .foregroundStyle(Tok.Status.serverError.color)
-                .help(message)
+            // The reason's first clause inline, so error rows stop reading identically;
+            // the word holds its size, the clause truncates inside a capped frame.
+            HStack(spacing: Space.xs) {
+                Text("error").font(Tok.Face.data(Tok.Typography.Size.sm, .medium))
+                    .foregroundStyle(Tok.Status.serverError.color)
+                    .fixedSize()
+                if !message.isEmpty {
+                    Text(Self.firstClause(message))
+                        .font(Tok.Face.data(Tok.Typography.Size.sm))
+                        .foregroundStyle(Tok.Ink.secondary.color)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: inline ? 320 : 120, alignment: .leading)
+                }
+            }
+            .help(message)
         case .pending:
-            Text("pending").font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
+            Text("pending").font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color).fixedSize()
         }
     }
 }

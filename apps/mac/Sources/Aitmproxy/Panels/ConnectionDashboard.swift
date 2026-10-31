@@ -20,7 +20,7 @@ struct ConnectionDashboard: View {
         let stats = OverviewStats(rows: rows)
         let series = TrafficSeries(rows: rows)
         HStack(alignment: .top, spacing: Space.md) {
-            DashCard(title: "Traffic over time", trailing: "\(series.total)") {
+            DashCard(title: "Traffic over time", trailing: series.total == 1 ? "1 request" : "\(series.total) requests") {
                 TrafficChart(series: series)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -187,8 +187,9 @@ struct TrafficSeries {
             }
         }
         marks = out
+        // Whole seconds: millisecond ticks truncated at the plot edges.
         ticks = [0, n / 3, 2 * n / 3, n - 1].map {
-            (label($0), Format.time(lo.addingTimeInterval(size * Double($0))))
+            (label($0), Format.clockTime(lo.addingTimeInterval(size * Double($0))))
         }
     }
 }

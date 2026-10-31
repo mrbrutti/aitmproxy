@@ -55,6 +55,9 @@ enum Snapshot {
             }
             for mode in ["light", "dark"] {
                 NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
+                // Scenes mutate the session (imports, sends, selections); start each appearance
+                // pass from the same fixture state so a light/dark pair differs only in appearance.
+                if Store.usesFixtures { session.loadFixtures() }
                 for page in SidebarPage.allCases where only?.contains(page.rawValue) ?? true {
                     session.page = page
                     try? await Task.sleep(for: .seconds(0.8))

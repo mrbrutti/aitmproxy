@@ -351,7 +351,7 @@ struct ScanEndpointRow: View {
                 }
                 .buttonStyle(PressStyle())
                 .disabled(!openable)
-                .help(openable ? "Open flow" : "This flow is no longer in the flow list (cleared, or not captured here).")
+                .help(openable ? "Open Flow" : "This flow is no longer in the flow list (cleared, or not captured here).")
             } else {
                 label.textSelection(.enabled)
             }
@@ -375,7 +375,7 @@ struct ScanEndpointRow: View {
         .accessibilityLabel(url)
         .accessibilityAddTraits(linked ? .isButton : [])
         .accessibilityActions {
-            if linked { Button("Open flow", action: open) }
+            if linked { Button("Open Flow", action: open) }
         }
     }
 
@@ -559,7 +559,7 @@ struct ScanPointDetail: View {
                 .lineLimit(1)
             Badge(text: point.location, pair: Tok.Severity.info, uppercase: false)
             Spacer(minLength: Space.sm)
-            FlatButton("Open flow") { state.open(point) }
+            FlatButton("Open Flow") { state.open(point) }
                 .disabled(!state.canOpen(point))
         }
         .padding(.horizontal, Space.md)
