@@ -1,10 +1,12 @@
 # HTTP/1 `Expect: 100-continue` and chunked-trailer conformance design
 
-**Status:** approved (2026-10-30, self-approved by the orchestrating session under Matt's standing autonomous-mode instruction; Matt can reverse any Architect's call in the index). Base note: the branch is rebased onto `main` plus the re-landed HTTP/1 hardening (PR 133); where the text says `fix/http1-path-hardening` or PR 129 as the base, read `main`.
+**Status:** approved (2026-10-30, self-approved by the orchestrating session under Matt's standing autonomous-mode instruction; Matt can reverse any Architect's call in the index). Amended 2026-10-30 after the Stage 6 panel: Architect's calls 21 to 28, AC34, AC35 and F9 are new; the two e2e scripts are verified for real against a core built from this branch but are NOT landed by this change (call 27; their owner session lands them test-only after the merge). Base note: the branch is rebased onto `main` plus the re-landed HTTP/1 hardening (PR 133); where the text says `fix/http1-path-hardening` or PR 129 as the base, read `main`.
 **Research inputs:** none new in `docs/research/` (`docs/research/MEMORY.md` for the
 project facts). The acceptance tests are the two real-traffic e2e scripts
 `tests/e2e/proto/test_h1_100_continue.py` and `tests/e2e/proto/test_chunked_trailers.py`
-(untracked in the main checkout, `/Users/matt/Security/aitmproxy/tests/e2e/proto/`)
+(untracked in the main checkout, `/Users/matt/Security/aitmproxy/tests/e2e/proto/`; another
+session owns them and lands them test-only after this change merges, so they are run
+against this branch and never added to it, Architect's call 27)
 and their baseline run on this branch's head, quoted in the criteria below.
 Code read for this spec, at `2884ec0` on `fix/http1-conformance` (cut from
 `fix/http1-path-hardening`, PR #129, which is stacked on PR #108):
@@ -15,6 +17,17 @@ Code read for this spec, at `2884ec0` on `fix/http1-conformance` (cut from
 `crates/aitm-plugin-sessionio/src/{native,har,mitmproxy}.rs`, and the vendored `h2`
 0.4.19 `src/server.rs`. Origin of the two defects: the real-traffic e2e suite; the
 baseline run fails exactly those two scripts and nothing else in the `proto` cell.
+
+**Amended after the Stage 6 panel (2026-10-30).** The text below was brought in line with
+what was built and reviewed. What changed, so a reader of the earlier version can find it:
+(1) the two e2e scripts are run for real against this branch but are not added to it (Intent,
+Goals, Constraints, Test strategy, AC1, AC13, AC32, calls 19 and 27); (2) two new criteria, AC34
+(the flow store charges trailers to its byte budget) and AC35 (a typed `Event::Error` for an
+origin response the machine refuses), both appended so no criterion was renumbered; (3)
+`crates/aitm-core` is no longer `flow.rs` alone (AC30, Constraints); (4) four deviations the
+build made are recorded in "Deviations accepted at review" (calls 21 to 24); (5) the writer
+wording of Bug 2 item 5 now follows item 2, the `F4` cross-reference in item 4 is corrected,
+and F9 is new. Calls 21 to 28 are the additions to the index.
 
 RFC points this spec leans on, written from memory (no network in the sandbox) and
 NOT verified against the RFC text; the Coder and reviewers should check them before
@@ -60,9 +73,13 @@ decoded correctly but the trailers are consumed and discarded: the proxy forward
 `Trailer: x-checksum-sha256, x-e2e-trailer, server-timing` in the head and then ends the
 body with a bare `0\r\n\r\n`, so the declared fields never arrive, and the captured flow
 shows no trailers at all. This change answers the expectation at head time, forwards and
-captures the trailers, and lands the two e2e scripts as the regression guard, without
-changing behaviour for traffic that has neither an expectation nor trailers and without
-touching the scope/SSRF guard.
+captures the trailers, and proves both with the two e2e scripts, run unchanged against a
+core built from this branch (the scripts land separately, test-only, after this change
+merges, so they are not added here), without changing behaviour for traffic that has
+neither an expectation nor trailers and without touching the scope/SSRF guard. It also
+keeps the new field inside the flow store's byte budget (AC34) and reports an origin
+response the machine refuses, including a bad trailer section, to event consumers as a
+typed `Event::Error` (AC35).
 
 ## Goals
 
@@ -82,9 +99,14 @@ touching the scope/SSRF guard.
   `HttpResponse.trailers` and as `response.trailers` in `flow.detail`, for proxied flows
   and for `request.send` / replay flows. They are never merged into `response.headers`.
 - Trailer parsing is bounded (16 KiB, 64 fields) and fails closed.
+- Captured trailers count against the flow store's byte budget like headers do, so a hostile
+  origin cannot grow the store past it through trailers (AC34).
+- A response the machine refuses while it is read from the origin, a malformed or over-cap
+  trailer section included, reaches event consumers as one `Event::Error` in fixed words;
+  the client still sees the connection end without a terminator (AC35).
 - The framing of the next exchange on a keep-alive connection stays exactly right.
-- Both e2e scripts are copied unchanged into `tests/e2e/proto/` on this branch and pass
-  against a real core built from it, and every behaviour has a sandbox-runnable unit test.
+- Both e2e scripts, run unchanged against a real core built from this branch, pass (they are
+  run, not added to the branch), and every behaviour has a sandbox-runnable unit test.
 
 ## Non-goals
 
@@ -108,6 +130,9 @@ touching the scope/SSRF guard.
   `Transfer-Encoding: chunked` (Adjacent findings F2).
 - Retrying, buffering policy, streaming the request to the origin before the body
   arrives, or any change to when `Event::Request` is emitted.
+- Emitting `Event::Error` for a failed first dial or reconnect. That is the hardening spec's
+  F4 and it stands; AC35 covers only a machine error while an origin response is read.
+- Landing the two e2e scripts in this repository on this branch (Architect's call 27).
 
 ## Anti-goals
 
@@ -127,13 +152,16 @@ touching the scope/SSRF guard.
   path; nothing in `crates/aitm-core/src/{guard,proxy,authority,egress}.rs` changes.
 - New dependencies, new crate features, `unsafe`, or new public API beyond the one data
   field the model decision needs and the persistence mirror of it (call 18).
-- Logging attacker-controlled bytes: no trailer name or value in any log line.
+- Logging attacker-controlled bytes: no trailer name or value in any log line, and none in an
+  `Event::Error` (its text is fixed, AC35).
 
 ## Constraints
 
 - Memory: the trailer capture of one response is bounded at 16 KiB and 64 fields, by the
   same limits that bound parsing. A response with no trailers allocates nothing extra
-  (`HeaderMap::new()` is an empty `Vec`).
+  (`HeaderMap::new()` is an empty `Vec`). The flow store's resident-byte estimate counts
+  them like headers (AC34), because with `max_flows = 0` that estimate is the store's only
+  bound.
 - No behaviour change for well-behaved traffic: keep-alive reuse, `Content-Length`,
   close-delimited and chunked-without-trailers bodies, HEAD / 204 / 304, the 101 handoff,
   the stale-upstream replacement, the surplus handling, tunnels and the oversized 413
@@ -146,10 +174,15 @@ touching the scope/SSRF guard.
 - Rust gate: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`.
 - `unsafe` is forbidden workspace-wide; none is needed.
 - Files that change: the two `aitm-proto-http` sources (`module.rs`, `sansio.rs`) and
-  their tests; `sender.rs` (tests only); `crates/aitm-core/src/flow.rs` (one field);
-  `crates/aitm-plugins/src/detail.rs`; `crates/aitm-plugin-sessionio/src/native.rs`; one
-  new loopback test file; the two e2e scripts; and, mechanically, every file that builds
-  an `HttpResponse` by struct literal (the ripple table below: 35 files in 9 crates).
+  their tests; `sender.rs` (tests only); in `aitm-core`, `src/flow.rs` (one field, and the
+  `large_enum_variant` allowance of call 21), `src/store.rs` (`flow_size` counts the
+  trailers, AC34) and `tests/store.rs` (the AC34 tests; `tests/store_control.rs` gains only a
+  test-literal initialiser); `crates/aitm-plugins/src/detail.rs`;
+  `crates/aitm-plugin-sessionio/src/native.rs` (and `har.rs`, `mitmproxy.rs` for a comment
+  each); one new loopback test file; and, mechanically, every file that builds an
+  `HttpResponse` by struct literal (the ripple table below: 35 files in 9 crates when
+  counted at `2884ec0`, 42 literals in 36 files on the rebased tree). The two e2e scripts
+  are not in this list: they are run against the branch, not added to it (call 27).
 
 ## Design
 
@@ -223,7 +256,12 @@ complete body; the built-in intercept parks at that same point. So a flow parked
 review has already been told to continue, has already sent its body, and waits for its
 final response, which is what a breakpoint means. A kill after the 100 drops the
 connection (the client sees `100` then a close), the same observable result as a kill
-without it.
+without it. `serve` discards the verdict of `emit(Event::RequestHeaders)`, so a kill or a
+park at that event has no effect until `Event::Request`, after the whole body; a client
+already told to continue therefore uploads up to `max_body` (10 MiB by default) first.
+The scope guard behaves the same way: it runs at dial time, after the body, so a client
+aimed at a blocked authority is also told to continue before it is refused (noted by the
+Stage 5 tester). An eager client, which sends its body unasked, has always behaved so.
 
 A failed write of the interim means the client went away: `serve` returns `Ok(())`
 quietly, like the existing "client finished mid-request" exit, instead of an error that
@@ -277,7 +315,10 @@ that; it is not done.
 **The oversized body (Architect's call 6): included, because it is the reason Expect
 exists and it is about six lines.** When an expectation is pending and the head declares
 a `Content-Length` larger than the configured cap (`max_body`), `serve` sets
-`request_oversized` instead of writing the 100. The existing oversize branch then writes
+`request_oversized` instead of writing the 100. It reads that declared length with the
+machine's own `content_length` parser (`sansio::content_length`, made crate-visible;
+Architect's call 24), so the early refusal and the framing the machine applies cannot
+disagree. The existing oversize branch then writes
 the `413` and closes, and the strict client, which never sent a byte of content, never
 uploads it. Chunked uploads declare no length and cannot be refused early; they get the
 100 and the existing cap enforcement as the body arrives. A request WITHOUT a pending
@@ -359,6 +400,9 @@ and 27 are in `tests/` directories. Per crate: `aitm-core` 2 (both tests), `aitm
 `aitm-plugin-sessionio` 6, `aitm-plugins` 9, `aitm-poc` 6 (all tests), `aitm-proto-http`
 7. Every edit is one line and compiler-guided, and none changes behaviour. The
 consumers that need a decision rather than a line are listed in the next paragraph.
+These figures are as counted at `2884ec0`. On the rebased tree (base `4eb6cb5`) the sweep
+counted 42 literals in 36 files in the same 9 crates; the two extra literals are in
+`aitm-plugin-scanner/src/inject.rs`.
 
 Consumers of the response model, and what each does with the new field:
 
@@ -380,7 +424,7 @@ Consumers of the response model, and what each does with the new field:
 - There is no descriptor crate in the tree to update.
 
 **Matt should be told before this is built.** The change itself is mechanical, additive and
-behaviour-neutral, but it touches 35 files in 9 crates outside the crate this change is
+behaviour-neutral, but it touches 35 files in 9 crates (36 on the rebased tree) outside the crate this change is
 about, and any parallel branch that adds an `HttpResponse { ... }` literal will fail to
 compile after a merge until it adds one line. The plan isolates the sweep as one early
 commit (Task 3) so it can be split into its own PR on request.
@@ -415,7 +459,9 @@ are open-ended (`x-*`, `server-timing`, `digest`, `content-digest`, ...) and a p
 maintain that list. Residual risk, stated: a field outside the list whose semantics need
 header-time evaluation passes through. It reaches a client that must, per RFC, process
 trailers separately from headers, so it cannot change the framing, routing or
-authentication the client already decided. The set lives in one `const` in `sansio.rs`.
+authentication the client already decided. A client that wrongly treats trailers as headers
+is not covered by that argument; F9 names the fields it could still be reached by, an
+accepted residual (call 28). The set lives in one `const` in `sansio.rs`.
 The count of withheld fields is returned to `serve`, which logs it once at `debug`,
 never a name or value (Constraints).
 
@@ -448,13 +494,20 @@ numbers: real trailers are digests, timings and signatures of tens to a few hund
 bytes; Apache's default limits (from memory) are 100 fields and 8 KiB per line; 16 KiB and 64 are
 generous for any legitimate use and a quarter of the 64 KiB head cap. The capture is
 bounded by the same limits, so no separate capture cap exists. What `serve` does with the
-`Err`: it propagates (`on_bytes(...)?`), the connection ends, the client has received the
+`Err`: it first emits `Event::Error { flow, kind: FlowError::Upstream("malformed response
+from upstream") }` for the flow (AC35; fixed words, never the machine's error text and never
+a trailer byte, because the machine's own text can quote the origin), then returns the
+machine's error, the connection ends, the client has received the
 body chunks but never the terminator, so it sees an incomplete chunked message, which
 is the honest signal, never a `0\r\n\r\n` that claims success. If the head, the body and the
 over-cap section all arrive in ONE read, `on_bytes` returns `Err` for that whole read, so the
 events built in it are dropped and the client receives nothing before the close; that is
-fail-closed too. No `Event::Error` is emitted (the same gap as any mid-response machine
-error, recorded as F4 of the hardening spec).
+fail-closed too, and the `Event::Error` is emitted the same way. Event consumers (the
+scanner, findings, Rhai hooks) learn of a response only through events, so without that
+event a refused response was invisible to them. The error event closes the response-parse
+half of the gap this spec first attributed to "F4 of the hardening spec"; that F4's own text
+covers only a failed first dial or reconnect, which still emits no `Event::Error` and still
+stands (a non-goal here).
 
 Field syntax uses the same rules as heads: the accumulator calls one helper extracted
 from `parse_headers` (name is a token, no whitespace, value has no control byte, through
@@ -471,7 +524,8 @@ Header names and values reach the `HeaderMap` only through `try_set` (the parser
 stored name or value cannot contain CR, LF, NUL or any control byte, and a name is a
 token. `encode_message` does not re-validate headers as it writes them (it relies on that
 invariant, although `header.rs` calls the encoder a last line of defence); the trailer
-writer follows the same pattern and adds the deny filter. A test pins that a trailer
+writer does not copy that: it follows item 2, re-checking every name and value on write
+(defence in depth) and applying the deny filter. A test pins that a trailer
 value with a control byte fails the parse.
 
 **6. The machine API and event shape (Architect's call 10): no new event, no change to
@@ -496,7 +550,11 @@ it with an empty map and keeps its signature and behaviour. Decision rejected: a
 **7. Plugins, the bus and persistence.**
 
 - Event ordering for plugins. `ResponseHeaders` arrives first (the store holds the head,
-  `trailers` empty, body `Streamed`); body chunks stream; at `ResponseComplete` `serve`
+  `trailers` empty, body `Streamed`; `serve` clears `trailers` on the stored head in the
+  `ResponseHeaders` arm, because a whole response that arrives in one read has already
+  parsed its trailer section into the machine's `response()` by the time that event is
+  handled, and without the clearing a plugin would see trailers before `Event::Response`.
+  Architect's call 22); body chunks stream; at `ResponseComplete` `serve`
   writes the terminator, then updates the stored response (body, `trailers`, truncation,
   duration), then emits `Event::Response`. A plugin therefore sees the trailers in the
   stored flow from `Event::Response` on. There is no event for them mid-stream and the
@@ -509,6 +567,12 @@ it with an empty map and keeps its signature and behaviour. Decision rejected: a
   the wire (`forward_chunks` is false; the replacement is `Content-Length` framed). The
   capture still holds the origin's trailers, consistent with how the capture already holds
   the origin's body in that case.
+- Store accounting (Architect's call 25). The flow store's `flow_size` charges a response's
+  `trailers` like its `headers` (AC34). Trailers arrive on a store `update`, so the update's
+  size delta counts them and can trigger byte eviction. This matters because a store with
+  `max_flows = 0` has the byte budget as its only bound, and a hostile origin can attach up
+  to 16 KiB and 64 fields to every response; uncounted, those would grow the store without
+  limit.
 - `flow.detail`: `response.trailers` is an array of `[name, value]` pairs in wire order,
   the same shape as `headers`, present only when the response has at least one captured
   trailer (Architect's call 17). A response without trailers renders exactly today's six
@@ -549,7 +613,7 @@ trailer fields ends with exactly `0\r\n\r\n` as before.
 
 Every behaviour gets sandbox-runnable unit tests (in-memory streams) that carry the
 red/green evidence; a loopback file and the two e2e scripts corroborate in the Terminal
-panel.
+panel. The e2e scripts are run, not committed (call 27).
 
 - Bug 1: the machine matrix (in-file `sansio.rs` tests, since the methods are
   crate-private) is written first against stub methods so it compiles and fails
@@ -564,20 +628,30 @@ panel.
   `response().trailers` through the public API; the sender tests drive `drive` over a
   `DuplexStream` in an in-file module in `sender.rs`; the writer and deny-set are tested
   in-file in `sansio.rs`; `serve` is tested for the exact forwarded bytes, the store, the
-  keep-alive follow-up and the logs. Red today: empty `trailers`, a bare `0\r\n\r\n`.
+  keep-alive follow-up, the logs and the typed `Event::Error` of a refused response
+  (AC35); the store's byte accounting is tested in `aitm-core`'s `tests/store.rs`
+  (AC34). Red today: empty `trailers`, a bare `0\r\n\r\n`.
 - Loopback (`tests/h1_conformance.rs`, Terminal panel only): a strict client over real
   sockets, a cleartext tunnel with an eager client, trailers end to end, and the cap.
-- E2E (Terminal panel only): the two scripts, run with
-  `e2e-proto.sh`, which builds `aitm` and `aitm-testtarget` from this worktree and drives a
-  real core.
+- E2E (Terminal panel only): the two scripts, run unchanged and for real against a core
+  built from this branch, with the e2e fanout harness (`run_all.py --boot`, with
+  `--no-build`, and `AITM_BIN` / `AITM_TESTTARGET_BIN` pointing at the `aitm` and
+  `aitm-testtarget` binaries built from this worktree). The scripts and the harness
+  stay outside the branch; the evidence is the runner's exit status and its
+  per-script `PASS` lines. They land, test-only, in the owning session's PR after this
+  change merges.
 
 ## Acceptance criteria
 
 Bug 1: `Expect: 100-continue`
 
-1. AC1 (e2e): `tests/e2e/proto/test_h1_100_continue.py` run against a real core built from
-   this branch (the plan's Task 9) exits 0, and its output has no `[FAIL]` line. The
-   baseline's single defect, "the proxy answered the 100-continue expectation within 2.0s
+1. AC1 (e2e): `tests/e2e/proto/test_h1_100_continue.py`, run unchanged and for real against a
+   core built from this branch (the plan's Task 9: the fanout harness, `--boot --no-build`,
+   with `AITM_BIN` and `AITM_TESTTARGET_BIN` set; the script is not added to the branch),
+   exits 0: the runner prints `PASS proto/test_h1_100_continue.py` and the script's output
+   has no `[FAIL]` line. The exit status is the proof; the lines quoted next are what the
+   script prints when its output is shown (the runner itself prints only `PASS` or `FAIL`
+   per script). The baseline's single defect, "the proxy answered the 100-continue expectation within 2.0s
    (nothing arrived in 2.005s; ...)", becomes a passing line reading "the proxy answered
    `HTTP/1.1 100 Continue` N ms after the head, before any body byte was sent" with N well
    below 2000, and the verdict line is "Expect: 100-continue handled and captured correctly
@@ -639,8 +713,10 @@ Bug 1: `Expect: 100-continue`
 
 Bug 2: chunked trailers
 
-13. AC13 (e2e): `tests/e2e/proto/test_chunked_trailers.py` run the same way exits 0, with no
-    `[!!]` line and no `[FAIL]` line. The baseline's 21 problem lines (3 declared-but-dropped and
+13. AC13 (e2e): `tests/e2e/proto/test_chunked_trailers.py`, run the same way (unchanged, against
+    a core built from this branch, not added to it), exits 0: the runner prints `PASS
+    proto/test_chunked_trailers.py` and the script's output has no `[!!]` line and no `[FAIL]`
+    line. The exit status is the proof, as for AC1. The baseline's 21 problem lines (3 declared-but-dropped and
     3 not-forwarded for each of responses 1 and 3, and 3 not-visible-over-the-bus for each of
     the `first`, `again` and `send` flows) all disappear: the last check reads "trailer
     fidelity: every trailer field the origin sent reaches the client intact and is visible over
@@ -666,7 +742,8 @@ Bug 2: chunked trailers
     the line that crosses 16384 bytes, whatever the read sizes: it is never consumed forever.
     Through `serve`, a response with 65 trailer fields, whose head and first chunk the origin
     wrote before the trailer section, returns `Err` mentioning the trailer limit, and the client
-    has received the head and the body chunk but not `0\r\n`, then sees EOF.
+    has received the head and the body chunk but not `0\r\n`, then sees EOF; the one
+    `Event::Error` this scenario also produces is AC35's, asserted by AC35's own test.
 17. AC17: A trailer line with a control byte in its value, a name containing a space or a
     non-token byte, no colon, or a leading space or tab is `Err`; none is silently dropped.
 18. AC18: `serve` forwards the origin's allowed trailers: for an origin response `HTTP/1.1 200
@@ -723,17 +800,54 @@ Cross-cutting
     `aitm-plugin-scanner`, `aitm-poc` all pass. A flow with no trailers and no expectation has
     the same stored response, `flow.detail` JSON and session JSON as before.
 30. AC30: The guard and every dial path are untouched. `git diff <base>..HEAD --stat -- crates/aitm-core`
-    lists only `src/flow.rs`, `tests/store.rs` and `tests/store_control.rs` (so nothing in
+    lists only `src/flow.rs`, `src/store.rs` (the AC34 `flow_size` change), `tests/store.rs` and
+    `tests/store_control.rs` (so nothing in
     `guard.rs`, `proxy.rs`, `authority.rs`, `egress.rs` or `ctx.rs`); `grep -c 'connect_upstream('
     crates/aitm-proto-http/src/module.rs` still prints 3; `grep -c 'TcpStream::connect'
     crates/aitm-proto-http/src/module.rs` prints 0; `sender.rs` has no production-code change.
 31. AC31: No new dependencies: `git diff <base>..HEAD --stat -- Cargo.toml Cargo.lock
     'crates/*/Cargo.toml'` prints nothing.
-32. AC32: The two e2e scripts exist under `tests/e2e/proto/` on this branch, byte-identical to
-    the main checkout's copies (`shasum -a 256` of each pair matches), and the loopback file
-    `crates/aitm-proto-http/tests/h1_conformance.rs` passes in the Terminal panel.
+32. AC32: The loopback file `crates/aitm-proto-http/tests/h1_conformance.rs` passes in the Terminal
+    panel (its six tests), and no file under `tests/e2e/` is in `git diff <base>..HEAD --stat`.
+    The criterion's earlier first clause, the two e2e scripts byte-identical to the main
+    checkout's copies, is not a criterion of this branch: it moves to the landing PR of the session
+    that owns the scripts, where the `shasum -a 256` comparison happens (call 27).
 33. AC33: The Rust gate exits 0: `cargo fmt --check && cargo clippy --all-targets -- -D warnings
     && cargo test --no-fail-fast`.
+
+Added after the Stage 6 panel (appended, nothing renumbered)
+
+34. AC34: The flow store charges a response's `trailers` to its resident-byte estimate exactly as
+    it charges the response's `headers` (the sum of every pair's name length and value length):
+    `flow_size` in `crates/aitm-core/src/store.rs`. Reason: with `max_flows = 0`
+    (`MemFlowStore::with_limits(0, budget)`) the byte budget is the store's only bound, and a
+    hostile origin can attach up to 16 KiB and 64 fields of trailers to every response, which
+    would otherwise be uncounted (call 25). Tests in `crates/aitm-core/tests/store.rs`: (a) a
+    flow whose response carries trailers `[("X-Sum", "abc"), ("x-sum", "def")]` has
+    `resident_bytes()` at least 16 greater (5 + 3 + 5 + 3 bytes of field text) than the same flow
+    with no trailers; (b) the same pairs as trailers on one flow and as headers on another give
+    equal `resident_bytes()` (together with (a), this pins the charge as exactly the headers'
+    charge); (c) trailers written by `update`, as `serve` writes them at `Event::Response`, count
+    and can trigger byte eviction: with `MemFlowStore::with_limits(10_000, 10_000)`, 20 terminal
+    flows each updated to gain a trailer of 1000 bytes of field text leave `resident_bytes()` at
+    most 10_000 and fewer than 20 flows listed (the count cap is never reached, so the byte
+    budget is what evicts).
+35. AC35: When the machine returns an error while `serve` reads an origin response (a malformed
+    head or framing, or a malformed or over-cap trailer section), `serve` emits exactly one
+    `Event::Error { flow, kind: FlowError::Upstream("malformed response from upstream") }` for
+    that flow before the connection ends, so event consumers (the scanner, findings, Rhai
+    hooks) see the failed response (call 26). The text is fixed: never the machine error's text,
+    never a trailer name or value. Client-visible behaviour is unchanged: the connection ends,
+    the client never receives a terminator, and `serve` still returns the machine's own error
+    to its caller (the `trailer` message of AC16). Tests in `module.rs`, for an origin that
+    sends a 65-field trailer section (a) in a write after the head and first chunk and (b) in
+    one write with the head and the chunk: the recording sink holds exactly one `Event::Error`
+    for the flow and it equals `FlowError::Upstream("malformed response from upstream".to_string())`,
+    holds no `Event::Response` for it, and no trailer field name appears in the `Debug` text of any
+    event the sink saw. One match arm serves every machine error on the response read, so no
+    separate malformed-head test is required. This closes the response-parse half of the gap
+    this spec first attributed to the hardening spec's F4; a failed first dial or reconnect
+    still emits no `Event::Error` (a non-goal here).
 
 ## Adjacent findings (not in this change)
 
@@ -753,7 +867,9 @@ Found while reading; each is a candidate follow-up, none is fixed here.
   chunk-framed body. Some origins do send `Transfer-Encoding: chunked` on HEAD responses. The
   extra bytes would sit in front of the client's next response. This change leaves it as it
   is (a no-trailer terminator is byte-identical to today's); the first test of a follow-up
-  should reproduce it.
+  should reproduce it. The Stage 5 tester and the Stage 6 panel re-noticed it on the built
+  code: a HEAD, 204 or 304 response whose head mis-declares `Transfer-Encoding: chunked`
+  still gets the stray `0\r\n\r\n`, unchanged by this work.
 - **F3. Request-side trailers** (call 15): `HttpRequest.trailers` and a re-framing rule.
 - **F4. Unknown expectations** (call 5): an early `417` would unblock clients that wait.
 - **F5. Strip-versus-forward `Expect`** (call 4): revisit if an origin that answers every
@@ -763,6 +879,14 @@ Found while reading; each is a candidate follow-up, none is fixed here.
 - **F7. Trailer display** in the TUI, web UI and mac app.
 - **F8. `h2.rs` literal sites**: the model sweep touches `h2.rs`, which the hardening change
   left alone; fold that into the `serve_h2` follow-up's diff when it lands.
+- **F9. The deny-set's residual (accepted, call 28).** A deny-list cannot name every field
+  that needs header-time evaluation. These names are not in the 37 and can still be forwarded
+  as trailers to a client that wrongly treats trailers as headers: `set-cookie2`,
+  `content-disposition`, `content-security-policy`, `strict-transport-security`, `alt-svc`,
+  `link`, `refresh`, `content-location`, `clear-site-data`. A client that follows RFC 9110
+  6.5.1 and processes trailers apart from headers is not affected, and the capture and the
+  store never merge a trailer into `headers` regardless. Adding them to the set is optional
+  hardening for later: one `const` edit and its table test (the list would then be 46).
 
 ## Left to the builder
 
@@ -777,16 +901,42 @@ Found while reading; each is a candidate follow-up, none is fixed here.
   substring `trailer` in the limit errors (AC16) and that no name or value appears in a log.
 - Whether the deny-set `const` is a slice scanned linearly or a sorted array, provided the
   match is ASCII case-insensitive on the whole name and the 37 names are exactly those listed.
-- How the early-`413` check reads the declared `Content-Length` (header parse in `serve` or a
-  helper), provided the machine already rejected a malformed or conflicting value before the
-  `RequestHeaders` event and the pending expectation is the only trigger.
+- How the early-`413` check reads the declared `Content-Length`, provided the machine already
+  rejected a malformed or conflicting value before the `RequestHeaders` event and the pending
+  expectation is the only trigger. Decided at review: it reuses the machine's `content_length`
+  parser (call 24), not a second parser in `serve`.
 
 ## Open questions
 
 None. Every decision above that Matt could reasonably reverse is marked
 **(Architect's call)** and indexed below. The one item Matt should hear about before the
 build, because it widens the footprint rather than because it is undecided, is the model
-field's ripple (35 files in 9 crates, mechanical).
+field's ripple (35 files in 9 crates, 36 on the rebased tree; mechanical).
+
+## Deviations accepted at review
+
+Four places where the build differs from what this spec or the plan said, accepted at the
+Stage 6 panel and recorded as further Architect's calls so Matt can reverse any of them.
+
+- **Call 21: `#[allow(clippy::large_enum_variant)]` on `aitm_core::Flow` and on
+  `aitm-plugin-sessionio`'s `FlowRecord`.** The 24-byte `trailers` field takes the `Http`
+  variant to 224 bytes, over clippy's 200-byte threshold for the difference between the two
+  variants. `FlowRecord` is the session format's mirror of `Flow`, so it gets the same
+  allowance and the same reason in a comment. Rejected: boxing `Flow::Http`, which ripples
+  through every use of the variant in the workspace; boxing only the new field, which saves
+  16 bytes and does not clear the threshold.
+- **Call 22: the `ResponseHeaders` arm of `serve` clears `trailers` on the stored head.** It
+  is what spec Bug 2 item 7 already implies (the store holds the head with `trailers` empty
+  until `Event::Response`); the build made it explicit because a whole response arriving in one
+  read has the trailers on the machine's `response()` before the `ResponseHeaders` event is
+  handled. It is the reason a plugin still sees no trailers until `Event::Response` in that case.
+- **Call 23: Task 2 removed the dead-code allowance Task 1 added.** Task 1 introduced
+  `expects_continue` and `enqueue_continue` before anything called them, so they carried a
+  temporary `allow(dead_code)`; Task 2, their first caller, removed it. No allowance remains.
+- **Call 24: the early-`413` decision reuses the machine's `content_length` parser.** Task 2
+  first read the declared length with a small parser of its own in `module.rs`; the fix task
+  replaced it with `sansio::content_length`, now crate-visible, so the refusal and the framing
+  agree by construction. A source change in the panel's fix task.
 
 ## Index of Architect's calls
 
@@ -798,7 +948,7 @@ field's ripple (35 files in 9 crates, mechanical).
 6. Bug 1: include the early `413` for a declared `Content-Length` over the cap when the expectation is pending.
 7. Bug 1: h2 is out of scope, with the correction that `serve_h2` does not delegate to hyper and the stall exists there (F1).
 8. Bug 1: two crate-private machine methods (`expects_continue`, `enqueue_continue`); no new event, no new public API.
-9. Bug 2: trailers live in a new `HttpResponse.trailers: HeaderMap`, never merged into `headers`; ripple of 40 literals in 35 files in 9 crates, isolated in one early task.
+9. Bug 2: trailers live in a new `HttpResponse.trailers: HeaderMap`, never merged into `headers`; ripple of 40 literals in 35 files in 9 crates at `2884ec0` (42 in 36 on the rebased tree), isolated in one early task.
 10. Bug 2: trailers ride on the machine's own `response()`; no new event, no change to `Event`, the plugin API or any existing signature.
 11. Bug 2: capture every field the origin sent (within the caps); withhold forbidden fields from the wire only.
 12. Bug 2: the 37-name deny-set, a deny-list expanding RFC 9110 6.5.1's categories, matched case-insensitively, enforced in the writer.
@@ -808,5 +958,16 @@ field's ripple (35 files in 9 crates, mechanical).
 16. Bug 2: h2 gets one-line field initialisers and otherwise stays as it is.
 17. Bug 2: `flow.detail` renders `response.trailers` as `[name, value]` pairs, only when non-empty.
 18. Bug 2: native session persistence of trailers is in scope (additive optional field); the first item to cut.
-19. Test strategy: sandbox unit tests carry red to green; a loopback file and the two e2e scripts, copied unchanged, corroborate in the Terminal panel; the e2e scripts only become a guard in-repo once the harness `tests/e2e/aitm_e2e` is on the branch's base.
+19. Test strategy: sandbox unit tests carry red to green; a loopback file and the two e2e scripts, run unchanged against a core built from the branch (not copied into it, call 27), corroborate in the Terminal panel; the e2e scripts only become a guard in-repo once the harness `tests/e2e/aitm_e2e` is on the base of the PR that lands them.
 20. Logging: one new `debug` site (a count of withheld trailer fields); never a name or value.
+
+Added after the Stage 6 panel:
+
+21. Deviation accepted: `#[allow(clippy::large_enum_variant)]` on `aitm_core::Flow` and `aitm-plugin-sessionio`'s `FlowRecord` (the `trailers` field takes the `Http` variant to 224 bytes); boxing rejected.
+22. Deviation accepted: `serve` clears `trailers` on the stored head in the `ResponseHeaders` arm, so a whole response arriving in one read still shows no trailers to plugins until `Event::Response`.
+23. Deviation accepted: Task 2 removed the temporary dead-code allowance Task 1 added to the two new machine methods.
+24. Deviation accepted: the early-`413` decision reuses the machine's `content_length` parser (made crate-visible) instead of a parser of its own in `serve`.
+25. The flow store's `flow_size` counts a response's `trailers` like its headers (AC34), because with `max_flows = 0` the byte budget is the only bound and a hostile origin controls up to 16 KiB and 64 fields per response.
+26. A machine error while an origin response is read emits one `Event::Error` with `FlowError::Upstream("malformed response from upstream")`, fixed words, before the connection ends (AC35); client-visible behaviour is unchanged.
+27. The two e2e scripts are run for real against a core built from this branch and are not added to it: another session owns them and lands them test-only after this change merges. AC1 and AC13 rest on that run's exit status; AC32's checksum clause moves to the landing PR. Supersedes the "copied unchanged" half of call 19.
+28. The deny-set's residual (F9) is accepted: names outside the 37 can still reach a client that wrongly treats trailers as headers; adding them is optional later hardening.

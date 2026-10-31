@@ -1,6 +1,6 @@
 # HTTP/1 `Expect: 100-continue` and chunked-trailer conformance implementation plan
 
-**Status:** approved (2026-10-30, self-approved by the orchestrating session under Matt's standing autonomous-mode instruction). Base note: PR 129 was merged into PR 108's already-squash-merged branch, so its hardening was re-landed on `main` as PR 133; this branch is rebased onto that work and its PR has base `main` (the Branch/worktree paragraph below predates this; the 40-literal sweep in Task 3 must be done against the rebased tree, since `main` has literals the older base lacks).
+**Status:** approved (2026-10-30, self-approved by the orchestrating session under Matt's standing autonomous-mode instruction). Amended 2026-10-30 after the Stage 6 panel: Task 9 is "run the two e2e scripts for real, do not land them" (their owner session lands them test-only after the merge) and Task 11 is the panel fix task; see the Review log. Base note: PR 129 was merged into PR 108's already-squash-merged branch, so its hardening was re-landed on `main` as PR 133; this branch is rebased onto that work and its PR has base `main` (the Branch/worktree paragraph below predates this; the 40-literal sweep in Task 3 must be done against the rebased tree, since `main` has literals the older base lacks).
 **Spec:** `docs/superpowers/specs/2026-10-30-h1-expect-and-trailers-design.md`
 **Branch / worktree:** `fix/http1-conformance` in
 `/Users/matt/Security/aitmproxy/.claude/worktrees/pbb-sec-review-1c8088`, cut from
@@ -15,12 +15,18 @@ the body is read and before any plugin dispatch. Bug 2 (Tasks 3 to 7): `HttpResp
 separate `trailers` field (a mechanical sweep of 40 struct literals in 35 files, Task 3), the
 machine captures the trailer section within caps (Task 4), the writer forwards the
 non-forbidden fields and `serve` stores them (Task 5), and the bus and the native session
-format carry them (Tasks 6 and 7). Task 8 adds loopback tests, Task 9 lands the two e2e
-scripts and runs them for real (Terminal panel only), Task 10 is the whole-branch tester pass.
+format carry them (Tasks 6 and 7). Task 8 adds loopback tests, Task 9 runs the two e2e
+scripts for real against a core built from this branch (Terminal panel only; the scripts are
+not added to the branch, Architect's call 27), Task 10 is the whole-branch tester pass, and
+Task 11 is the fix task for the Stage 6 panel (the flow store's byte accounting, a typed
+`Event::Error` for a refused origin response, and smaller items).
 
-**Base SHA** for diffs and the AC30/AC31 checks: the branch HEAD immediately before Task 1's
-commit (currently `2884ec0` plus the spec and plan commits). Record the actual SHA in the
-Review log when Task 1 is dispatched.
+**Base SHA** for diffs and the AC30/AC31 checks: `4eb6cb5`, the docs-only commit (spec and
+plan) on top of `main` at `112e9e8`, which already carries the HTTP/1 hardening change;
+`git diff 4eb6cb5..HEAD` is exactly this change. The branch was cut at `2884ec0` and rebased
+onto it; the baselines below are as measured at `2884ec0`. The Task 3 sweep counted 42
+struct literals in 36 files on the rebased tree, not the 40 in 35 files counted at `2884ec0`:
+the two extra literals are in `crates/aitm-plugin-scanner/src/inject.rs`.
 
 **Baselines at `2884ec0`** (sandbox, for "existing tests unchanged"): `cargo test -p
 aitm-proto-http --lib` 68 passed; `cargo test -p aitm-proto-http --test sansio` 27 passed;
@@ -32,14 +38,15 @@ aitm-proto-http --lib` 68 passed; `cargo test -p aitm-proto-http --test sansio` 
 |---|---|---|
 | T1 | `crates/aitm-proto-http/src/sansio.rs` | T3, T4, T5 |
 | T2 | `crates/aitm-proto-http/src/module.rs` | T3, T5 |
-| T3 | 35 files in 9 crates (the sweep; listed in the task), including `sansio.rs`, `module.rs`, `h2.rs`, `translate.rs`, `tests/h2_mitm.rs`, `aitm-plugins/tests/detail.rs`, and `sessionio/{src/native.rs,tests/session_roundtrip.rs}` | T1, T2, T4, T5, T6, T7 |
+| T3 | 35 files in 9 crates at `2884ec0`, 36 on the rebased tree (the sweep; listed in the task), including `sansio.rs`, `module.rs`, `h2.rs`, `translate.rs`, `tests/h2_mitm.rs`, `aitm-plugins/tests/detail.rs`, and `sessionio/{src/native.rs,tests/session_roundtrip.rs}` | T1, T2, T4, T5, T6, T7 |
 | T4 | `crates/aitm-proto-http/src/sansio.rs`, `crates/aitm-proto-http/tests/sansio.rs`, `crates/aitm-proto-http/src/sender.rs` (in-file tests only) | T1, T3, T5 |
 | T5 | `crates/aitm-proto-http/src/sansio.rs`, `crates/aitm-proto-http/src/module.rs` | T1, T2, T3, T4 |
 | T6 | `crates/aitm-plugins/src/detail.rs`, `crates/aitm-plugins/tests/detail.rs` | T3 (`tests/detail.rs`) |
 | T7 | `crates/aitm-plugin-sessionio/src/native.rs`, `crates/aitm-plugin-sessionio/tests/session_roundtrip.rs` | T3 |
 | T8 | `crates/aitm-proto-http/tests/h1_conformance.rs` (new) | none |
-| T9 | `tests/e2e/proto/test_h1_100_continue.py`, `tests/e2e/proto/test_chunked_trailers.py` (new, copied) | none |
+| T9 | none (a run, not a change: the scripts stay in the main checkout and are not added to the branch) | none |
 | T10 | none expected (tests only, if it must strengthen any) | none |
+| T11 | `crates/aitm-core/src/store.rs`, `crates/aitm-core/tests/store.rs`, `crates/aitm-proto-http/src/module.rs`, `crates/aitm-proto-http/src/sansio.rs` (one visibility keyword), `crates/aitm-plugin-sessionio/src/har.rs`, `crates/aitm-plugin-sessionio/src/mitmproxy.rs` (a comment each), plus whatever test or comment clean-ups the findings report names | T1, T2, T3, T5 (`module.rs`, `sansio.rs`, `tests/store.rs`), T7 (`har.rs`, `mitmproxy.rs`) |
 
 **Serial, one coder at a time in this worktree:** T1, T2, T3, T4, T5. They all edit
 `sansio.rs` or `module.rs`, and T3 edits both (literal sites) as well as 33 other files, so it
@@ -51,12 +58,18 @@ the new methods). T4 and T5 need T3 (they read and write `HttpResponse.trailers`
 edits after T3, in different crates, and neither depends on T4 or T5 (they render and persist the
 field from hand-built flows). Run them in child worktrees on branches cut from this one, each
 merged back when its panel passes, in parallel with the T4 then T5 lane. T8 needs T2 and T5.
-T9 needs T8 (and T2 for the optional checkpoint run). T10 is last.
+T9 needs T8 (and T2 for the optional checkpoint run) and is a run, not a change: it has no
+files, so nothing can conflict with it; it is run again on the final head after Task 11.
+T10 is the whole-branch tester pass. Task 11 is the Stage 6 fix task: it is serial after T10
+(it edits `module.rs` and `sansio.rs`), and the Tester and the panel run again on it. Inside T11
+the parts are independent by file (the store accounting in `aitm-core`; the two comments in
+`har.rs` and `mitmproxy.rs`; the `serve` and `sansio.rs` edits) and could fan out; they ride
+in one fix task because each is a few lines.
 
 ```
-T1 (sansio) --> T2 (module) --> T3 (sweep, 35 files) --+--> T4 (sansio, tests, sender) --> T5 (sansio, module) --+
+T1 (sansio) --> T2 (module) --> T3 (sweep, 36 files) --+--> T4 (sansio, tests, sender) --> T5 (sansio, module) --+
                                                        |                                                        |
-                                                       +--> T6 (detail.rs)   [parallel with the T4/T5 lane]     +--> T8 (new loopback file) --> T9 (e2e) --> T10
+                                                       +--> T6 (detail.rs)   [parallel with the T4/T5 lane]     +--> T8 (new loopback file) --> T9 (e2e run, no files) --> T10 --> T11 (panel fix) --> T9 re-run
                                                        +--> T7 (native.rs)   [parallel with the T4/T5 lane] ----+
 ```
 
@@ -127,6 +140,9 @@ dependency on it.
   - `pub(crate) fn enqueue_continue(&mut self)`: when the flag is set, append `CONTINUE_RESPONSE` to
     `out_client` and clear the flag; otherwise do nothing.
   - No change to `HttpSansIoEvent`, to any `pub` signature, or to how heads parse.
+  - Nothing calls the two new methods until Task 2, so each carries a temporary
+    `#[cfg_attr(not(test), allow(dead_code))]` with a comment naming Task 2; Task 2 removes
+    both (Architect's call 23).
 - **Test (in-file `mod tests` of `sansio.rs`, sandbox-runnable).** A helper
   `fn after_request(raw: &[u8]) -> (Http1Machine, Vec<HttpSansIoEvent>)` feeds `raw` on
   `Side::Client`. Heads below are `POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n` plus the
@@ -166,14 +182,18 @@ dependency on it.
 
 - **Satisfies:** AC2, AC3, AC4, AC5, AC6, AC7, AC8, AC9, AC10 (AC1 by Tasks 8 and 9, AC11 by Task 4)
 - **Depends on:** Task 1 (same crate; calls its methods)
-- **Files:** `crates/aitm-proto-http/src/module.rs` (modify: `serve`, plus `mod tests`)
+- **Files:** `crates/aitm-proto-http/src/module.rs` (modify: `serve`, plus `mod tests`);
+  `crates/aitm-proto-http/src/sansio.rs` (only to delete the two temporary `allow(dead_code)`
+  attributes Task 1 added)
 - **Change:** in `serve`'s request loop, in the `HttpSansIoEvent::RequestHeaders` arm, after
   `ctx.store().insert(...)` and before `ctx.emit(Event::RequestHeaders(id)).await`:
   - when `machine.expects_continue()`:
-    - read the declared length from the head's `Content-Length` header (`headers.get(..)` then parse; the
-      machine already rejected a malformed or conflicting value before this event); if it is larger than
+    - read the declared length with the machine's own parser, `sansio::content_length(headers: &HeaderMap)
+      -> Result<Option<u64>>` (made `pub(crate)`; the machine already rejected a malformed or conflicting
+      value before this event, so `.ok().flatten()` yields the length or none); if it is larger than
       `max_body`, set `request_oversized = true` and write nothing (the existing oversize branch then writes
-      the `413` and closes);
+      the `413` and closes). Task 2 first built a private `declared_length` helper in `module.rs`; Task 11
+      replaced it with this call and deleted it (Architect's call 24);
     - otherwise `machine.enqueue_continue()` and `flush(&mut machine, Side::Client, &mut client).await`;
       if the flush fails, `return Ok(())` (the client went away; no error is logged).
   - Update the `serve` doc comment to say the proxy answers a `100-continue` expectation at head time.
@@ -257,7 +277,8 @@ dependency on it.
   - `aitm-plugin-maprules`: `src/lib.rs` (430)
   - `aitm-plugin-rhai`: `src/flow_state.rs` (185), `tests/flow_state.rs` (212), `tests/budget.rs` (108),
     `tests/command.rs` (231), `tests/poc_step.rs` (69), `tests/host_net.rs` (88, 330)
-  - `aitm-plugin-scanner`: `src/passive.rs` (236, inside its `mod tests`)
+  - `aitm-plugin-scanner`: `src/passive.rs` (236, inside its `mod tests`); on the rebased tree also
+    `src/inject.rs` (two literals, which the `2884ec0` count did not have)
   - `aitm-plugin-sessionio`: `src/native.rs` (259), `src/har.rs` (268), `src/mitmproxy.rs` (229),
     `tests/har_roundtrip.rs` (64), `tests/session_roundtrip.rs` (64, 98)
   - `aitm-plugins`: `src/intercept.rs` (434), `tests/scope_rate.rs` (23), `tests/control.rs` (56),
@@ -275,7 +296,11 @@ dependency on it.
   `headers`, with a doc comment: trailer fields received after a chunked body (RFC 9110 6.5), in wire order
   with duplicates kept; held apart from `headers` on purpose and never merged into them; a capture field
   that no code path writes to a wire without the forbidden-name filter; only HTTP/1.1 chunked responses
-  produce trailers today (h2 trailers are still dropped). Every literal gets `trailers: HeaderMap::new()`.
+  produce trailers today (h2 trailers are still dropped). The field takes `Flow`'s `Http` variant to 224
+  bytes, over clippy's `large_enum_variant` threshold of 200, so `pub enum Flow` gets
+  `#[allow(clippy::large_enum_variant)]` with a comment giving the reason (Architect's call 21; boxing
+  `Flow::Http` ripples through every use of the variant in the workspace, and boxing only the new field
+  saves 16 bytes). Every literal gets `trailers: HeaderMap::new()`.
   Every value is empty in this task, including `native.rs` (Task 7 maps it) and `sansio.rs:674` (Task 4
   fills it). The `h2.rs` and `translate.rs` edits are exactly the one-line initialisers (and the
   `translate.rs` test literal); nothing else in those files changes. No behaviour changes anywhere.
@@ -411,6 +436,11 @@ dependency on it.
     with a `withheld` count field and a fixed message, no names or values; in the store update, set
     `resp.trailers = trailers` beside the body. Everything else in the arm (order: wire write, then store
     update, then `Event::Response`) is unchanged.
+  - `module.rs` `serve`, in the `HttpSansIoEvent::ResponseHeaders` arm: the head stored for the streamed
+    response has its `trailers` cleared (an empty `HeaderMap`) whatever the machine's `response()` holds. A
+    response that arrives whole in one read has already parsed its trailer section into the machine's model
+    by the time this event is handled; without the clearing a plugin would see trailers at
+    `Event::ResponseHeaders` for one split of the origin's bytes and not for another (Architect's call 22).
 - **Test.**
   *In-file `sansio.rs` tests (sandbox-runnable).* A helper builds a machine whose client-bound framing is
   chunked by calling `enqueue_response` with a `Body::Streamed(StreamBody)` response whose headers carry
@@ -457,12 +487,15 @@ dependency on it.
     `0\r\n` anywhere); `stored_http(..)` `response.trailers` still holds the origin's two fields.
   - `serve_exposes_trailers_to_plugins_at_response_time` (RED today): a sink holding the store that, on
     `Event::Response(id)`, records `response.trailers.len()` and `response.headers.get("x-sum")`: expect `2` and
-    `None`.
+    `None`. The same sink also records at `Event::ResponseHeaders(id)` and expects `0` and `None` there, for
+    every delivery shape (the whole response in one read, and the trailer fields in later reads): this pins the
+    `ResponseHeaders` clearing of call 22.
   - `serve_fails_closed_on_an_oversized_trailer_section` (RED today: the lines are dropped and the response
     completes): origin segments `[OH, "0\r\n" + 65 lines "f{n}: v\r\n" + "\r\n"]` (the head and the first chunk in
     an earlier write than the trailer section, so they are processed and flushed first); `serve` returns `Err`
     whose text contains `trailer`; the client has read `HTTP/1.1 200 OK\r\nTrailer: x-sum,
-    x-e2e\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n` and never `0\r\n`, and then sees EOF. A companion
+    x-e2e\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n` and never `0\r\n`, and then sees EOF (the one
+    `Event::Error` this scenario also produces is asserted by Task 11's AC35 test, not here). A companion
     assertion in the same test file notes, in a comment, that when head, chunk and the over-cap section arrive in
     ONE read `on_bytes` returns `Err` for the whole read and the client receives nothing before the close; that
     case is fail-closed too and is not asserted separately.
@@ -512,8 +545,12 @@ dependency on it.
 - **Change:** `RespRec` gains `pub trailers: Vec<(String, String)>` with `#[serde(default, skip_serializing_if =
   "Vec::is_empty")]`; `resp_to_rec` fills it with `headers_to_rec(&r.trailers)`; `rec_to_resp` rebuilds the map
   with `rec_to_headers(&r.trailers)` (the trusted-source `set` path, which drops an invalid pair). `SCHEMA` stays
-  `aitm-session/1`. `har.rs` and `mitmproxy.rs` keep their empty initialisers from Task 3 (HAR 1.2 has no trailers
-  field; mitmproxy import is not mapped); say so in a comment at each.
+  `aitm-session/1`. The session format's `FlowRecord` mirrors `Flow`, so it gets the same
+  `#[allow(clippy::large_enum_variant)]` and reason that `Flow` got in Task 3 (Architect's call 21).
+  `har.rs` and `mitmproxy.rs` keep their empty initialisers from Task 3 (HAR 1.2 has no trailers
+  field; mitmproxy import is not mapped); say so in a comment at each. The Task 7 Coder did not
+  add those two comments (the files were outside its ownership), so the drop was undocumented in
+  code; Task 11 adds them.
 - **Test (`tests/session_roundtrip.rs`, sandbox-runnable).**
   - `native_session_roundtrips_response_trailers` (RED today: restored trailers are empty): a flow whose response
     has `trailers` `[("X-A", "1"), ("x-a", "2")]`; `session.save` to a temp path then `session.load` into a fresh
@@ -559,49 +596,56 @@ dependency on it.
   - `the_replay_sender_returns_the_trailers_of_a_chunked_response`: `Http1Sender::new().send(&request)` against a raw
     origin answering the chunked-with-trailers response then closing: the returned `HttpResponse.trailers` equal the
     origin's pairs and the body is `hello`.
+  - `a_forbidden_trailer_is_withheld_from_the_wire_but_kept_in_the_store` (a sixth test, added at implementation): an
+    origin trailer section that carries a forbidden field next to an allowed one reaches the client without the
+    forbidden field, and the store's `response.trailers` holds both.
   - **Red evidence:** copy only the new test file into a scratch worktree at the base SHA, run it there in the Terminal
     panel and paste the failures (the strict test times out waiting for the 100; the trailer tests see no trailers);
     then paste the green run on the branch. The sender test does not compile at base only if it names `.trailers`; in
     that case paste the compile error and run the rest.
   - Also run, in the Terminal panel, the existing `cargo test -p aitm-proto-http` integration files and paste the
     result: nothing here may regress them.
-- **Done when:** all five tests pass on the branch, fmt and clippy are clean, and the full gate passes in the Terminal
+- **Done when:** all six tests pass on the branch, fmt and clippy are clean, and the full gate passes in the Terminal
   panel.
 
-### Task 9: Land the two e2e scripts and run them against a real core (Terminal panel only)
+### Task 9: Run the two e2e scripts against a real core; do not land them (Terminal panel only)
 
-- **Satisfies:** AC1, AC13, AC32
-- **Depends on:** Task 8 (and Task 2 for the optional checkpoint run)
-- **Files:** `tests/e2e/proto/test_h1_100_continue.py` (create, copied), `tests/e2e/proto/test_chunked_trailers.py` (create,
-  copied). No other file. Do not edit either script.
-- **Change:**
-  1. `mkdir -p tests/e2e/proto` in the worktree, then `cp` both scripts from
-     `/Users/matt/Security/aitmproxy/tests/e2e/proto/`. Prove they are unchanged: `shasum -a 256` of each pair prints
-     the same digest; paste both lines.
-  2. **Checkpoint run, after Task 2** (optional but recommended; it shows Bug 1 fixed while Bug 2 is still open): `zsh
+Superseded scope (Architect's call 27). This task used to copy the two scripts into `tests/e2e/proto/` on this
+branch. Another session owns those scripts and lands them test-only after this change merges; the copies in the
+main checkout changed while this work was under way, so copies here would go stale or collide add/add. The task is
+now a run, with no repository file created or changed.
+
+- **Satisfies:** AC1, AC13 (by the exit status of the run); the loopback half of AC32 is Task 8's. AC32's checksum
+  clause is not checked on this branch: it moves to the landing PR, where the `shasum -a 256` comparison happens.
+- **Depends on:** Task 8 (and Task 2 for the optional checkpoint run); run again on the final head after Task 11
+- **Files:** none. Do not add, copy or edit either script, `tests/e2e/aitm_e2e`, or the runner; `git status` and
+  `git diff <base>..HEAD --stat -- tests/e2e` show nothing from this task.
+- **Change:** run the scripts for real, unchanged, against a core built from this worktree, with the e2e fanout
+  harness assembled in a scratch directory outside the repository:
+  1. **Checkpoint run, after Task 2** (optional but recommended; it shows Bug 1 fixed while Bug 2 is still open): `zsh
      "/Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_9ea8a296-48d1-40bb-8f9e-76f4046f1419/e2e-proto.sh"
      h1c-after-task2`. Expect `test_h1_100_continue.py` to pass and `test_chunked_trailers.py` to still fail on the
      trailer-fidelity check only.
-  3. **Final run, after Task 8:** the same script with label `final`. It touches every crate source, builds `aitm` and
-     `aitm-testtarget` from this worktree, boots a real core and runs both scripts; logs are
-     `e2e-build-final.log` and `e2e-final.log` in the notes directory. Paste the grep summary the script prints and the
-     tail of `e2e-final.log`.
-  Note that `e2e-proto.sh` copies the two tests from the MAIN checkout into its scratch directory, not from this
-  worktree; the checksum step in 1 is what proves the branch's copies are the ones that ran.
+  2. **Final run, on the final head (after Task 11):** the same script with label `final`. It touches every crate source,
+     builds `aitm` and `aitm-testtarget` from this worktree, copies the runner (`run_all.py`, `_lib`), `tests/e2e/aitm_e2e`
+     and the two scripts from the fanout backup and the MAIN checkout into its scratch directory, exports `AITM_BIN` and
+     `AITM_TESTTARGET_BIN` at the binaries it just built, boots a real core with `python3 .../run_all.py --boot
+     --no-build -j 1 proto`, and runs both scripts. Logs are `e2e-build-final.log` and `e2e-final.log` in the notes
+     directory. Paste the grep summary the script prints and the tail of `e2e-final.log`.
+  Evidence already held: `e2e-baseline.log` (before any fix: both scripts fail) and `e2e-fixed1.log` (after Tasks 1 to 5, head
+  `c11ee84`: both pass); the production code at the final head must be re-run, not assumed.
 - **Test (the literal expected output).** In `e2e-final.log`: `PASS proto/test_chunked_trailers.py`, `PASS
-  proto/test_h1_100_continue.py`, `TOTAL 2 passed, 0 failed, 0 skipped`, the script's `E2E exit=0`, and `grep -c
-  '\[FAIL\]\|\[!!\]' e2e-final.log` prints `0`. The two lines AC1 and AC13 quote appear: "the proxy answered `HTTP/1.1 100
-  Continue` ... ms after the head, before any body byte was sent" and "trailer fidelity: every trailer field the origin sent
-  reaches the client intact and is visible over the bus (0 problem(s))".
-- **Done when:** both logs are pasted and show the above. Record in the Review log that the scripts reach the repo before
-  the harness they import (`tests/e2e/aitm_e2e`) is an ancestor of this branch: on this branch they are inert (they exit 77
-  or fail on import) until it is rebased onto a `main` that carries `tests/e2e/aitm_e2e`; the scratch-directory run above is
-  what proves them today.
+  proto/test_h1_100_continue.py`, `TOTAL 2 passed, 0 failed, 0 skipped`, and the script's `E2E exit=0`. The runner prints
+  only `PASS` or `FAIL` per script, so the sentences AC1 and AC13 quote (the 100 "N ms after the head", "trailer fidelity
+  ... (0 problem(s))") are not expected in this log; the exit status is the proof.
+- **Done when:** both logs are pasted and show the above, on the final head. Record in the Review log that the scripts and
+  the harness they import were run from outside the branch and are not on it.
 
 ### Task 10: Whole-branch tester pass
 
-- **Satisfies:** AC27 (suites), AC29, AC30, AC31, AC33 (and confirms every other AC maps to a test)
-- **Depends on:** Tasks 1 to 9
+- **Satisfies:** AC27 (suites), AC29, AC30, AC31, AC32 (loopback file; no `tests/e2e` file in the diff), AC33 (and
+  confirms every other AC, AC34 and AC35 included, maps to a test)
+- **Depends on:** Tasks 1 to 9; the Tester runs it again on the whole branch after Task 11
 - **Files:** none expected; the Tester may add or strengthen tests only.
 - **Change:** run as the Tester engine (spec, plan, worktree, base and head SHA, "whole branch"). Touch every crate source
   first (`find crates -name '*.rs' -exec touch {} +`). Then, quoting actual output:
@@ -611,17 +655,18 @@ dependency on it.
   - the named suites from AC29, each on its own: `cargo test -p aitm-proto-http`, `-p aitm-core`, `-p aitm-findings`, `-p
     aitm-plugins`, `-p aitm-plugin-sessionio`, `-p aitm-plugin-maprules`, `-p aitm-plugin-rhai`, `-p aitm-plugin-scanner`, `-p
     aitm-poc`, `-p aitm-proto-ws`, `-p aitm-plugin-wsctl`, `-p aitm-plugin-passthrough`;
-  - AC30: `git diff <base>..HEAD --stat -- crates/aitm-core` lists exactly `src/flow.rs`, `tests/store.rs`,
-    `tests/store_control.rs`; `git diff <base>..HEAD --stat -- crates/aitm-proto-http/src/sender.rs` shows only the added
+  - AC30: `git diff <base>..HEAD --stat -- crates/aitm-core` lists exactly `src/flow.rs`, `src/store.rs`,
+    `tests/store.rs`, `tests/store_control.rs`; `git diff <base>..HEAD --stat -- crates/aitm-proto-http/src/sender.rs` shows only the added
     in-file test module (`git diff <base>..HEAD -- crates/aitm-proto-http/src/sender.rs` has no hunk above the new `mod
     tests`); the `h2.rs` and `translate.rs` hunks are exactly the one-line initialisers, the test literal and the two new `translate.rs` tests; `grep -c
     'connect_upstream(' crates/aitm-proto-http/src/module.rs` prints `3` and `grep -c 'TcpStream::connect'
     crates/aitm-proto-http/src/module.rs` prints `0`;
   - AC31: `git diff <base>..HEAD --stat -- Cargo.toml Cargo.lock 'crates/*/Cargo.toml'` prints nothing;
-  - AC32: the two `shasum -a 256` pairs match;
+  - AC32: `git diff <base>..HEAD --stat -- tests/e2e` prints nothing (the scripts are run, not landed, and their
+    checksum comparison belongs to the landing PR), and the loopback file's six tests pass;
   - the mac decoder claim from the spec: if `swift test` for the `AitmproxyKit` package is cheap to run in the Terminal
     panel, run `FlowDetailWireTests` and record the result; otherwise record "not run" (it is not part of the gate);
-  - a table mapping AC1 to AC33 to the test that proves each, flagging any AC with only a weak or indirect test and
+  - a table mapping AC1 to AC35 to the test that proves each (AC1 and AC13 map to Task 9's run, not to a file), flagging any AC with only a weak or indirect test and
     strengthening it (in particular: every one of the 37 deny-set names is exercised, the 64/65 and 16384/16385 boundaries
     are exercised, the interim is checked for exactly-once, and no test passes against a `serve` that writes the 100
     after `Event::RequestHeaders`);
@@ -632,13 +677,89 @@ dependency on it.
 - **Done when:** the report is accepted, and the panel (security, quality, spec reviewers in parallel, on the whole branch)
   has no open findings.
 
+### Task 11: Stage 6 fix task (store accounting, typed error, early 413, documented drops)
+
+Added after the Stage 6 panel, which reviewed the work of Tasks 1 to 10. Its input is the panel's findings report (the
+workflow's fix-task rule); this entry fixes the scope and the literal expected values. Tester and the panel run again on
+it afterwards.
+
+- **Satisfies:** AC34, AC35 (its test drives AC16's `serve` scenario, so it also covers the `Event::Error` that scenario
+  produces), AC30 as amended (`src/store.rs` joins `aitm-core`'s diff), and the documented-drop comments Task 7 specified;
+  implements Architect's call 24.
+- **Depends on:** Tasks 1 to 10 (serial: it edits `module.rs` and `sansio.rs`, which Tasks 1 to 5 also edited)
+- **Files:** `crates/aitm-core/src/store.rs`, `crates/aitm-core/tests/store.rs`, `crates/aitm-proto-http/src/module.rs`,
+  `crates/aitm-proto-http/src/sansio.rs` (one visibility keyword), `crates/aitm-plugin-sessionio/src/har.rs` and
+  `crates/aitm-plugin-sessionio/src/mitmproxy.rs` (a comment each). No other production file.
+- **Change:**
+  - **A. Store accounting (AC34).** In `store.rs`, `fn flow_size(flow: &Flow) -> usize`: the `Flow::Http` response term
+    counts `header_bytes(&r.trailers)` as well as the headers and the body, with the same `header_bytes` helper (the sum of
+    every pair's name length and value length). No signature changes; nothing else in the file changes.
+  - **B. A typed error for a refused response (AC35).** In `module.rs`, `serve`'s response read loop, where the read bytes
+    are fed with `machine.on_bytes(Side::Server, &buf[..n])` (the `n > 0` path; `on_eof` is untouched and keeps its own
+    "upstream closed before completing the response" event): on `Err`, first `ctx.emit(Event::Error { flow: id, kind:
+    aitm_core::FlowError::Upstream("malformed response from upstream".to_string()) }).await`, then return the machine's
+    error unchanged. The string is a literal in `serve`, never built from the error or from any read byte. `Event` and
+    `FlowError` are not changed (the variant exists). A comment says why: event consumers see a response only through its
+    events, and the machine's text can quote the origin.
+  - **C. The early 413 reuses the machine's parser (call 24).** In `sansio.rs` `fn content_length(headers: &HeaderMap) ->
+    Result<Option<u64>>` becomes `pub(crate)`, with no behaviour change. In `module.rs`, `serve`'s `expects_continue()` block
+    reads the declared length with it (`.ok().flatten()`), and the private `declared_length` helper is deleted. Nothing
+    else in that block changes, and Task 2's boundary test (a declared length equal to the cap gets the 100, one byte over
+    gets the `413`) keeps passing.
+  - **D. Documented drops.** `har.rs` and `mitmproxy.rs`: a comment at the response literal's empty `trailers` initialiser
+    saying HAR 1.2 has no trailers field so export does not write them, and the mitmproxy importer does not map them, so the
+    field is empty on import. Comments only.
+  - **E. Test and provenance clean-ups.** Exactly the ones the findings report lists (test helpers, test comments, and
+    comments that name a task or a source), each noted in the Coder's report; no behaviour change and no new production code.
+- **Test.**
+  *`crates/aitm-core/tests/store.rs` (sandbox-runnable; names free).*
+  - `trailers_count_toward_resident_bytes` (RED today: the difference is `0`): two stores each holding one terminal flow with
+    no body that differs only in its response's `trailers`, `[("X-Sum", "abc"), ("x-sum", "def")]` against none:
+    `resident_bytes()` is at least `16` greater (5 + 3 + 5 + 3) for the one with trailers.
+  - `a_trailer_costs_what_the_same_header_costs` (RED today): the same pairs as `trailers` on one flow and as `headers` on
+    another give equal `resident_bytes()`.
+  - `update_adding_trailers_counts_toward_byte_budget` (RED today: nothing is evicted): `MemFlowStore::with_limits(10_000,
+    10_000)` holding 20 terminal flows; `update` each flow's response to gain one trailer of 1000 bytes of field text (name
+    `X-Pad` and a 995-byte value); afterwards `resident_bytes() <= 10_000` and `list().len() < 20`.
+  *`module.rs` `mod tests` (sandbox-runnable).*
+  - `serve_reports_a_malformed_trailer_section_as_one_typed_error` (RED today: no `Event::Error`): the origin sends the head,
+    a first chunk and a 65-field trailer section, once in a write after the head and chunk and once with all three in one
+    write; in each case `serve` returns `Err` whose text contains `trailer`; the recording sink's `Event::Error`s for the
+    flow equal exactly `[FlowError::Upstream("malformed response from upstream".to_string())]`; the sink holds no
+    `Event::Response` for the flow; and the `Debug` text of every event the sink saw contains none of the origin's trailer
+    field names.
+  - **Red run:** write the four tests first; paste them failing (the byte differences are `0`, nothing is evicted, the typed
+    error is absent); then make changes A and B and paste them passing. Changes C and D have no red test of their own: C is
+    held by the existing 413 tests, D is comments.
+- **Done when:** the four tests pass; `cargo test -p aitm-core --test store`, `cargo test -p aitm-proto-http --lib` and `cargo
+  test -p aitm-plugin-sessionio` pass; `cargo fmt --check` and `cargo clippy -p aitm-core -p aitm-proto-http -p
+  aitm-plugin-sessionio --all-targets -- -D warnings` are clean; `grep -c 'connect_upstream(' crates/aitm-proto-http/src/module.rs`
+  prints `3` and `grep -c 'TcpStream::connect' crates/aitm-proto-http/src/module.rs` prints `0`; `git diff <base>..HEAD
+  --stat -- crates/aitm-core` lists exactly `src/flow.rs`, `src/store.rs`, `tests/store.rs`, `tests/store_control.rs`. Then
+  Task 9's final run (Terminal panel), the whole-branch Tester pass of Task 10 and the panel run again.
+
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Kept by the main session during stage 6. One row per finding. "Accepted" means accepted by the orchestrating session under Matt's standing autonomous-mode instruction (2026-10-30); Matt can reverse any of them. Base SHA for the whole branch: `4eb6cb5`.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| T9, AC1, AC13, AC32 | Spec (round 1) | Important | The spec and plan said the two e2e scripts are copied into `tests/e2e/proto/` on this branch; they are not. Their owner session (e2e-test-arch) lands them test-only after this merges, because the main-checkout copies changed during this work (a copy here would go stale or conflict add/add). | Recorded as a deliberate supersession (Architect's call 27): the scripts are run for real against a core built from this branch (fanout `run_all.py --boot --no-build`) and their exit status proves AC1/AC13; the AC32 `shasum` comparison moves to the landing PR. The copies that ran have sha256 `5e18b7d369d4...` (100-continue) and `f872bd861e15...` (trailers) at the time of the final run. Spec and plan text amended. |
+| whole | Spec (round 1) | Important | AC33: the only full gate on the range was red (one failing test); the head had not been gated. | The one failure was a defect in the T7 test (`a_flow_without_trailers_serialises_without_a_trailers_key` compared JSON keys in iteration order; `aitm-tui` enables `serde_json/preserve_order` only in a whole-workspace build): fixed in bae612b, re-checked in workspace context. The full gate is re-run at the final head (see Shipped). |
+| whole | Security (round 1) | Important | The flow store's resident-byte budget (`aitm-core/src/store.rs` `flow_size`) did not count `HttpResponse.trailers`: a hostile origin could attach up to 16 KiB of trailers to every response outside the budget (unbounded with `max_flows = 0`). | fixed in 420b815 (`flow_size` charges trailers like headers; 3 tests: red first). AC34. |
+| whole | Security (round 1) | Minor | A trailer-section (or any response-parse) failure ended the connection with no `Event::Error`, so scanner, findings and Rhai hooks never saw the response. | fixed in 420b815 (one `Event::Error` with fixed wording before the connection ends; test red first). AC35. |
+| whole | Security (round 1) | Minor | The 37-name deny-set leaves other fields a non-compliant client could treat as headers (`set-cookie2`, `content-disposition`, `content-security-policy`, `strict-transport-security`, `alt-svc`, `link`, `refresh`, `content-location`, `clear-site-data`). | Accepted: residual risk the spec already states (F9); optional hardening later. |
+| T5 | Tester | Minor | The sessionio test failure above; plus weak or missing tests (HTTP/1.x versions, partial body with the head, chunked upload with Expect, failed interim write, request-trailer caps per read, EOF inside the trailer section, empty trailer value). | fixed in bae612b and a28105d (9 tests added; 38 production mutations run: 36 killed, 2 equivalent survivors: an unreachable writer branch (`HeaderMap` cannot hold an invalid pair) and a writer call that writes nothing for a non-chunk-framed body). |
+| whole | Quality (round 1) | Minor | The plan's documented-drop comments missing in `har.rs`/`mitmproxy.rs`; a second Content-Length parser in `serve` (`declared_length`); a port race in the loopback `run_proxy`; one duplicated test helper; spec/process wording in test names and comments; three over-claiming doc comments; a dead `Framing::Length(n) => n > 0` arm. | fixed in 420b815. |
+| whole | Quality (round 1) | Minor | Test-helper copies across the two loopback files and about 120 lines of scaffolding duplicated; `mod tests` is about 70 percent of `module.rs`; some redundant tests (the store round trip, the serve-level case-insensitive match, a leftover-length assertion, an old-document test built from the new exporter). | Accepted and deferred: a `tests/common` module and moving `mod tests` out are one mechanical follow-up (also noted by the hardening change's Review log); the redundant tests are cheap and each pins a distinct failure. |
+| T2 | Quality (round 1) | Minor | A failed interim write leaves a head-only flow in the store with no `RequestHeaders` event. | Accepted: the spec states a quiet `Ok` (call 2); the same orphan already exists for a client that leaves mid-request. |
+| T3, T7 | Spec (round 1) | Minor | The two `#[allow(clippy::large_enum_variant)]` (`aitm_core::Flow`, sessionio `FlowRecord`) were not in the spec or plan. | Accepted: the minimal consequence of the required 24-byte field under `-D warnings` (224 bytes against a 200 threshold); boxing `Flow::Http` ripples workspace-wide, boxing the field saves only 16 bytes. Recorded as Architect's call 21 (the `FlowRecord` allow mirrors `Flow`; approval stated there). |
+| T2 | Spec (round 1) | Minor | T2's commit touched `sansio.rs` (removing the dead-code allowance T1 added). | Accepted and recorded (call 23). |
+| T4 | Spec (round 1) | Minor | AC17's non-token-name clause had no direct test. | fixed in 420b815 (`x@a: v` case). |
+| T10 | Spec (round 1) | Minor | The mac `FlowDetailWireTests` result is required by the plan and was not produced; the MCP flow-detail widget also reads `flow.detail`. | Not run (Swift, outside the Rust gate, needs the Terminal and a mac build). The change is additive (a new key that is omitted when empty), the widget reads named keys and ignores the rest, and the e2e `proto` suites read the key over the bus. Recorded as not run. |
+| T6 | Spec (round 1) | Minor | The e2e evidence is the non-verbose runner summary (exit 0), so the literal check lines are not captured. | A verbose run of both scripts is captured at the final head (see Shipped). |
+| T4 | Quality (round 1) | Minor | HEAD/204/304 with a mis-declared chunked head still get a stray `0\r\n\r\n` (the hardening spec's F2). | Accepted, unchanged by this work (the tester confirmed the writer emits the same 5 bytes the base did). |
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+Filled at stage 7 (the merge): see the PR. Follow-ups, none done here: HTTP/2 `Expect: 100-continue` (`send_informational` in the vendored `h2`), request-side trailers, h2 trailers, rendering trailers in the TUI, web UI and mac app, the shared-constant and `Tunnel` struct debts from the hardening spec, `tests/common` for the integration-test helpers.
