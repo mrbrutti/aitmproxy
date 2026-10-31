@@ -237,15 +237,11 @@ impl Command for AgentActivity {
         ParamSchema {
             description: format!(
                 "Recent command-invocation audit entries (who ran what, with what redacted \
-                 arguments, and the outcome), merged oldest first across the ring's two lanes. \
-                 The ring is a live view, not a complete record. A source that already holds \
-                 one of a lane's table slots keeps a floor of its entries against a flood; a \
-                 source that arrives after the slots are taken, or that shares a label with a \
-                 flooder, can be flushed, and every agent-token bridge connection is ONE \
-                 source (`mcp`, `web-bridge`). Labels are unauthenticated display strings; \
-                 `origin` is authoritative. A call with no `limit` can return up to {} \
-                 entries (both lanes full, default sizes), so passing `limit` is advisable. \
-                 Read-only and readable by any role.",
+                 arguments, and the outcome), oldest first. A live view, not a complete \
+                 record: a high-volume source can flush other sources' entries. `origin` is \
+                 authoritative; `client_label` is an unauthenticated display string. A call \
+                 with no `limit` can return up to {} entries at the default sizes, so pass \
+                 `limit`. Read-only and readable by any role.",
                 DEFAULT_AUDIT_CAPACITY + DEFAULT_ROUTINE_AUDIT_CAPACITY
             ),
             params: vec![

@@ -49,8 +49,8 @@ const SECRET_KEY_NEEDLES: &[&str] = &[
 const SECRET_KEY_SEGMENTS: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
 
 /// Whether an argument key names a secret whose value must never be recorded:
-/// true when the ASCII-lowercased key contains any [`SECRET_KEY_NEEDLES`] entry,
-/// or when any whole segment of it equals a [`SECRET_KEY_SEGMENTS`] entry.
+/// true when the ASCII-lowercased key contains any `SECRET_KEY_NEEDLES` entry, or
+/// when any whole segment of it equals a `SECRET_KEY_SEGMENTS` entry.
 pub fn is_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_KEY_NEEDLES
@@ -90,10 +90,13 @@ fn patterns() -> &'static [(Regex, &'static str)] {
 /// A quoted value is masked whole, up to its matching unescaped quote, so a value
 /// holding spaces or an escaped quote leaks nothing. A quote that follows `=` or
 /// `:` (blanks aside) and has a value character after it is the opener of the next
-/// value, not the closer of this one, so an unclosed quote cannot swallow the next
-/// pair's key and leave its value in the clear (`password='a b token='S3'` masks
-/// through `S3`); a padded value (`"token":"YWJj=","user":"bob"`) still closes,
-/// because a delimiter follows its quote. An unquoted value, or one whose opening
+/// value, not the closer of this one, so an unclosed quote does not swallow the
+/// next pair's key and leave its value in the clear while that pair's opening
+/// quote is present (`password='a b token='S3'` masks through `S3`); a padded
+/// value (`"token":"YWJj=","user":"bob"`) still closes, because a delimiter
+/// follows its quote. A next key with only a closing quote is a residual: in
+/// `password='x password'=S3CR3T` the first value closes at that quote and
+/// `S3CR3T` is left in the clear. An unquoted value, or one whose opening
 /// quote never closes, runs to the first whitespace, `&`, `;`, `,`, quote, or `}`.
 /// Whitespace is Unicode whitespace (`char::is_whitespace`), as the regex `\s`
 /// this replaces was. An empty value is left alone. A pair nested inside a
@@ -185,8 +188,10 @@ fn skip_blanks(text: &str, mut i: usize) -> usize {
 /// Whether `b` ends an unquoted value: ASCII whitespace or a pair, list, quote,
 /// or JSON delimiter. A non-ASCII byte never does here (the caller decodes it to
 /// find Unicode whitespace), so a value is over- rather than under-redacted.
-// Keep in step with `ends_value` in `aitm-plugin-scanner`'s `reproduce.rs` until
-// the scanner vocabulary consolidation follow-up.
+// The scanner's copy (`ends_value` in `crates/aitm-plugin-scanner/src/reproduce.rs`)
+// is not in step: it deliberately reads ASCII whitespace only (no vertical tab, no
+// Unicode whitespace). It stays until the scanner vocabulary consolidation
+// follow-up removes it.
 fn ends_value(b: u8) -> bool {
     is_ascii_blank(b) || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
 }
@@ -225,8 +230,10 @@ fn is_opening_quote(text: &str, quote_at: usize) -> bool {
 /// quote that [`is_opening_quote`] does not close the value: it is the opener of
 /// the next pair, and closing there would swallow that pair's key and leave its
 /// value in the clear.
-// Keep in step with `closing_quote` in `aitm-plugin-scanner`'s `reproduce.rs`
-// until the scanner vocabulary consolidation follow-up.
+// The scanner's copy (`closing_quote` in `crates/aitm-plugin-scanner/src/reproduce.rs`)
+// is not in step: it deliberately lacks the opener-shaped rule and so closes at the
+// next pair's opening quote. It stays until the scanner vocabulary consolidation
+// follow-up removes it.
 fn closing_quote(text: &str, from: usize, quote: u8) -> Option<usize> {
     let bytes = text.as_bytes();
     let mut k = from;
@@ -243,7 +250,10 @@ fn closing_quote(text: &str, from: usize, quote: u8) -> Option<usize> {
 /// Whether a key run is the host of a `host:port` rather than a credential key:
 /// `run` contains a `.`, `after` (the bytes straight after the run) opens with
 /// `:`, and one to five ASCII digits follow that colon, then `/`, `?`, `#`, a
-/// value delimiter, or the end. Reads at most seven bytes of `after`.
+/// value delimiter, or the end. Reads at most seven bytes of `after`. Only an ASCII
+/// terminator exempts a host:port: a non-ASCII whitespace terminator (a no-break
+/// space after `auth.example.com:8443`) does not, so the pair is masked, which
+/// over-redacts, the safe direction.
 fn is_host_port(run: &[u8], after: &[u8]) -> bool {
     if !run.contains(&b'.') || after.first() != Some(&b':') {
         return false;
@@ -275,9 +285,12 @@ fn is_host_port(run: &[u8], after: &[u8]) -> bool {
 /// failed search for a quote character reads to the end of the text once, and is
 /// remembered: a later search for the same character starts further on and so
 /// considers a subset of the candidates, and a candidate is judged on its
-/// neighbouring characters alone, so it would fail too and is not run. The
-/// vocabulary is consulted only for a key run that is followed by a separator, so
-/// no allocation is spent on the rest of the text.
+/// neighbouring characters alone, so it would fail too and is not run. That holds
+/// because every later search starts just after an opening quote that the failed
+/// search already passed as a non-closing candidate, so from there the two scans
+/// coincide; [`is_opening_quote`] must therefore stay a pure function of the text
+/// around the quote. The vocabulary is consulted only for a key run that is
+/// followed by a separator, so no allocation is spent on the rest of the text.
 fn mask_secret_pairs(text: &str) -> String {
     let bytes = text.as_bytes();
     let len = bytes.len();
@@ -361,6 +374,18 @@ fn mask_secret_pairs(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run [`scrub_text`] over every `(input, expected)` row and return the rows
+    /// that came out different, as `(input, expected, actual)`, so one failure
+    /// shows every bad row instead of the first.
+    fn mismatches<'a>(rows: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str, String)> {
+        rows.iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_text(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect()
+    }
 
     #[test]
     fn secret_keys_matched_as_substring_case_insensitively() {
@@ -650,26 +675,8 @@ mod tests {
             "2 MiB of backslashes is unchanged"
         );
 
-        // A quote after `=` that has a value character after it opens the next
-        // value, it does not close this one, so no quote closes: every value is
-        // masked (the old expectation, masking in twos, left every second `x` in
-        // the clear) and every byte is read a constant number of times.
-        assert!(
-            scrub_text(&"sid='x ".repeat(150_000)) == "sid='[redacted] ".repeat(150_000),
-            "1 MiB of `sid='x ` masks every value"
-        );
-    }
-
-    /// Run [`scrub_text`] over every `(input, expected)` row and return the rows
-    /// that came out different, as `(input, expected, actual)`, so one failure
-    /// shows every bad row instead of the first.
-    fn mismatches<'a>(rows: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str, String)> {
-        rows.iter()
-            .filter_map(|&(input, expected)| {
-                let actual = scrub_text(input);
-                (actual != expected).then_some((input, expected, actual))
-            })
-            .collect()
+        // Quotes that open but never close are in
+        // `scrub_text_stays_linear_when_quotes_open_but_never_close`.
     }
 
     #[test]
@@ -690,6 +697,16 @@ mod tests {
             (
                 r#"password="C:\dir\" token="S3""#,
                 r#"password="[redacted]""#,
+            ),
+            // A failed search for one quote character says nothing about the other:
+            // the `'` pair after an unclosed `"` still closes at its own quote.
+            (
+                r#"a_token="x b_token='y z' c"#,
+                r#"a_token="[redacted] b_token='[redacted]' c"#,
+            ),
+            (
+                r#"a_token='x b_token="y z" c"#,
+                r#"a_token='[redacted] b_token="[redacted]" c"#,
             ),
         ]);
         assert!(bad.is_empty(), "wrong output: {bad:#?}");
@@ -759,6 +776,20 @@ mod tests {
                 "token=\"YWJj=\"\u{a0}user=bob",
                 "token=\"[redacted]\"\u{a0}user=bob",
             ),
+            // Each delimiter that can follow the closing quote, with a quoted
+            // pair after it: a delimiter wrongly read as a value character would
+            // run this value on to that pair's quote and swallow its key.
+            (r#"token="YWJj=";x="y""#, r#"token="[redacted]";x="y""#),
+            (r#"?token="YWJj="&x="y""#, r#"?token="[redacted]"&x="y""#),
+            (
+                r#"{"o":{"token":"YWJj="},"b":"c"}"#,
+                r#"{"o":{"token":"[redacted]"},"b":"c"}"#,
+            ),
+            (r#"[token="YWJj="] x="y""#, r#"[token="[redacted]"] x="y""#),
+            (
+                "token=\"YWJj=\"\u{a0}x=\"y\"",
+                "token=\"[redacted]\"\u{a0}x=\"y\"",
+            ),
         ]);
         assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
@@ -814,7 +845,7 @@ mod tests {
             // A Unicode blank ends a key run, as it did for the old regex's key
             // class: `token` here is not a pair (a quote, not a separator, follows
             // the blank), so the pair after it is found; and `password` after
-            // `secret…é\n=` is a key, not the tail of that pair's value.
+            // `secret\u{2028}é\n=` is a key, not the tail of that pair's value.
             (
                 "token\u{a0}'\n:\n]xapi_key:\u{b}S3CR3T",
                 "token\u{a0}'\n:\n]xapi_key:\u{b}[redacted]",

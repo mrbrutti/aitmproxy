@@ -21,11 +21,12 @@
 //! bidirectional-override characters dropped, credential material masked by
 //! [`crate::redact::scrub_text`], at most [`MAX_CLIENT_LABEL_CHARS`] = 64
 //! characters) and, where a client declares it, [`declared_client_label`], which
-//! rewrites a reserved name such as `web-bridge` to `web-bridge (declared)`. A
-//! label is unauthenticated: a client can still declare any other name, a
-//! first-party one included. An error reason is scrubbed with
-//! [`crate::redact::scrub_text`] and capped at [`DEFAULT_RESULT_REASON_CAP`]
-//! (1024 bytes) before it is recorded.
+//! suffixes a label that reads as a reserved name (`web-bridge`, `Web Bridge`,
+//! `web_bridge`) with ` (declared)`. A label is unauthenticated: a client can
+//! still declare any other name, a first-party one included. An error reason is
+//! scrubbed with [`crate::redact::scrub_text`] and kept to at most
+//! [`DEFAULT_RESULT_REASON_CAP`] (1024) bytes plus a one-character `…` truncation
+//! marker before it is recorded.
 //!
 //! # The ring keeps a fair, bounded record
 //!
@@ -93,8 +94,11 @@ pub const WEB_BRIDGE_CLIENT_LABEL: &str = "web-bridge";
 /// client-declared label cannot grow an entry without bound.
 pub const MAX_CLIENT_LABEL_CHARS: usize = 64;
 
-/// The longest error reason an audit entry keeps, in bytes, before it is
-/// truncated. A verbose or hostile reason cannot grow an entry without bound.
+/// How many bytes of an error reason an audit entry keeps before it is truncated:
+/// a recorded reason is at most this many bytes plus a one-character `…`
+/// truncation marker (three bytes in UTF-8), and the marker is added only when
+/// something was cut. A verbose or hostile reason cannot grow an entry without
+/// bound.
 pub const DEFAULT_RESULT_REASON_CAP: usize = 1024;
 
 /// Labels only the server may mint; a client that declares one is rewritten by
@@ -112,8 +116,9 @@ pub enum AuditResult {
     /// The command ran to a successful result.
     Ok,
     /// The command was refused (a policy/confirm gate, a bad argument) or its
-    /// `invoke` failed; the string is a scrubbed copy of the reason, capped at
-    /// [`DEFAULT_RESULT_REASON_CAP`] bytes.
+    /// `invoke` failed; the string is a scrubbed copy of the reason, at most
+    /// [`DEFAULT_RESULT_REASON_CAP`] bytes plus a one-character `…` truncation
+    /// marker.
     Error(String),
 }
 
@@ -222,7 +227,7 @@ fn is_label_noise(c: char) -> bool {
 
 /// The one sanitiser for a client label, whatever its source.
 ///
-/// It reads only the first [`LABEL_SCAN_CHARS`] characters of `raw`, so its work
+/// It reads only the first `LABEL_SCAN_CHARS` characters of `raw`, so its work
 /// is bounded however large the input. It drops control, invisible, and
 /// bidirectional-override characters, masks credential material with
 /// [`crate::redact::scrub_text`], trims, and truncates to
@@ -252,15 +257,30 @@ pub fn sanitize_client_label(raw: &str) -> Option<String> {
     }
 }
 
+/// The skeleton of a label: its ASCII letters and digits, lower-cased. Two labels
+/// with one skeleton read alike (`web-bridge`, `Web Bridge`, `web_bridge`, and
+/// `web-bridge` with any invisible or punctuation character slipped in), whatever
+/// padding sits between the letters.
+fn label_skeleton(label: &str) -> String {
+    label
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
 /// Sanitise a label a client declared (see [`sanitize_client_label`]) and keep it
-/// from posing as a server-minted one: a label equal, ignoring ASCII case and
-/// surrounding blanks, to a reserved name gets a ` (declared)` suffix. Apply it
-/// only where a client declares its label, never to a label the server mints.
+/// from posing as a server-minted one: a label whose skeleton (its ASCII letters
+/// and digits, lower-cased) equals a reserved name's gets a ` (declared)` suffix,
+/// so case, blanks, punctuation, and any invisible character the sanitiser keeps
+/// cannot make a client look like the server's `web-bridge`. Apply it only where a
+/// client declares its label, never to a label the server mints.
 pub fn declared_client_label(raw: &str) -> Option<String> {
     let label = sanitize_client_label(raw)?;
+    let skeleton = label_skeleton(&label);
     let reserved = RESERVED_CLIENT_LABELS
         .iter()
-        .any(|name| label.trim().eq_ignore_ascii_case(name));
+        .any(|name| label_skeleton(name) == skeleton);
     if reserved {
         Some(format!("{label} (declared)"))
     } else {
@@ -689,7 +709,7 @@ mod tests {
     #[test]
     fn declared_client_label_rewrites_a_reserved_name_hidden_by_invisible_characters() {
         // Each of these renders as `web-bridge`; none may pass as the real one.
-        let bad: Vec<(&str, Option<String>)> = [
+        let mut bad: Vec<(String, Option<String>)> = [
             "web-bridge\u{AD}",
             "web\u{AD}-bridge",
             "web-bridge\u{FE0F}",
@@ -698,9 +718,61 @@ mod tests {
             "web-bridge\u{E0020}",
         ]
         .into_iter()
-        .map(|raw| (raw, declared_client_label(raw)))
+        .map(|raw| (raw.to_string(), declared_client_label(raw)))
         .filter(|(_, label)| label.as_deref() != Some("web-bridge (declared)"))
         .collect();
+
+        // Literal rows. A character the sanitiser keeps stays in the label; the
+        // suffix is what tells a reader it is not the server's `web-bridge`.
+        let rows: &[(&str, &str)] = &[
+            ("web-bridge\u{FFF0}", "web-bridge\u{FFF0} (declared)"),
+            ("web\u{17B4}-bridge", "web\u{17B4}-bridge (declared)"),
+            ("web\u{2009}-bridge", "web\u{2009}-bridge (declared)"),
+            ("web bridge", "web bridge (declared)"),
+            ("web_bridge", "web_bridge (declared)"),
+            ("webbridge", "webbridge (declared)"),
+            ("WEB-BRIDGE", "WEB-BRIDGE (declared)"),
+            ("Web  -  Bridge", "Web  -  Bridge (declared)"),
+        ];
+        for &(raw, want) in rows {
+            let got = declared_client_label(raw);
+            if got.as_deref() != Some(want) {
+                bad.push((raw.to_string(), got));
+            }
+        }
+
+        // `web-bridge` with one more code point at the end, and one inside the
+        // name: a format, filler, variation-selector, tag, or space character the
+        // sanitiser may or may not drop. Either way the label is the sanitised one
+        // plus ` (declared)`.
+        let hidden = "\u{061C}\u{00AD}\u{034F}\u{115F}\u{1160}\u{3164}\u{FFA0}\u{2800}\
+                      \u{17B4}\u{17B5}\u{180B}\u{180E}\u{180F}\u{206A}\u{206F}\
+                      \u{FFF0}\u{FFFB}\u{FE00}\u{FE0F}\u{1BCA0}\u{1D173}\
+                      \u{E0000}\u{E007F}\u{E0080}\u{E0100}\u{E01EF}\u{2009}\u{200A}";
+        assert_eq!(hidden.chars().count(), 28, "one row per code point");
+        for c in hidden.chars() {
+            for raw in [format!("web-bridge{c}"), format!("web{c}-bridge")] {
+                let got = declared_client_label(&raw);
+                let want = sanitize_client_label(&raw).map(|label| format!("{label} (declared)"));
+                if want.is_none() || got != want {
+                    bad.push((raw, got));
+                }
+            }
+        }
+
+        // Negative controls: another name is not rewritten, whatever invisible
+        // character trails it, and a longer name that merely starts with the
+        // reserved one is not the reserved name.
+        for (raw, want) in [
+            ("aitm-mac\u{3164}", "aitm-mac"),
+            ("webbridges", "webbridges"),
+            ("web-bridges", "web-bridges"),
+        ] {
+            let got = declared_client_label(raw);
+            if got.as_deref() != Some(want) {
+                bad.push((raw.to_string(), got));
+            }
+        }
         assert!(bad.is_empty(), "a reserved name got through: {bad:#?}");
     }
 
@@ -750,31 +822,39 @@ mod tests {
 
     #[test]
     fn sanitising_twice_only_ever_masks_more() {
-        // A masked escape, and a truncation inside a mask, are the two ways the
-        // second pass sees different text from the first.
-        let once = sanitize_client_label("password:' auth:\\'");
-        assert_eq!(once.as_deref(), Some("password:' auth:[redacted]'"));
-        let twice = once.as_deref().and_then(sanitize_client_label);
-        assert_eq!(twice.as_deref(), Some("password:'[redacted]'"));
-        // The second pass revealed nothing the first hid: no credential text, and
-        // no more characters than before.
-        let (once, twice) = (once.unwrap_or_default(), twice.unwrap_or_default());
-        assert!(twice.len() <= once.len(), "grew: {once:?} -> {twice:?}");
-        assert!(!twice.contains("auth"), "revealed text: {twice:?}");
+        // A masked escape, and a cut inside a mask, are the two ways the second
+        // pass sees different text from the first. Each row is (raw label, label
+        // after one pass, label after two): the second pass hides more, or the same,
+        // and never shows what the first hid.
+        let cut_raw = format!("{}Bearer abc123", "x".repeat(50));
+        // The 64-character cut lands inside `Bearer [redacted]`.
+        let cut = format!("{}Bearer [redact", "x".repeat(50));
+        let rows = [
+            (
+                "password:' auth:\\'",
+                "password:' auth:[redacted]'",
+                "password:'[redacted]'",
+            ),
+            (cut_raw.as_str(), cut.as_str(), cut.as_str()),
+        ];
+        let mut bad = Vec::new();
+        for (raw, once_want, twice_want) in rows {
+            let once = sanitize_client_label(raw);
+            let twice = once.as_deref().and_then(sanitize_client_label);
+            if once.as_deref() != Some(once_want) || twice.as_deref() != Some(twice_want) {
+                bad.push((raw, once, twice));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "wrong label after one and two passes (raw, once, twice): {bad:#?}"
+        );
 
-        // A cut at 64 characters lands inside `Bearer [redacted]`.
-        let raw = format!("{}Bearer abc123", "x".repeat(50));
-        let cut = sanitize_client_label(&raw).unwrap_or_default();
-        assert_eq!(cut, format!("{}Bearer [redact", "x".repeat(50)));
-        assert_eq!(cut.chars().count(), MAX_CLIENT_LABEL_CHARS);
-        // A later `scrub_text` completes the mask: 3 characters over the cap.
-        let later = crate::redact::scrub_text(&cut);
-        assert_eq!(later, format!("{}Bearer [redacted]", "x".repeat(50)));
-        assert_eq!(later.chars().count(), MAX_CLIENT_LABEL_CHARS + 3);
-        // Sanitising the cut label again stays bounded and shows nothing new.
-        let again = sanitize_client_label(&cut).unwrap_or_default();
-        assert_eq!(again, cut);
-        assert!(!again.contains("abc123") && !later.contains("abc123"));
+        // A later `scrub_text` completes the cut mask: 3 characters over the cap.
+        assert_eq!(
+            crate::redact::scrub_text(&cut),
+            format!("{}Bearer [redacted]", "x".repeat(50))
+        );
     }
 
     /// An entry recorded `secs` seconds after the Unix epoch, running `command`.
