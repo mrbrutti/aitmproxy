@@ -169,7 +169,7 @@ Shared facts for every coder:
   `crates/aitm-mcp/tests/mcp.rs` (modify: one new test).
 - **Change** (spec D4): both `json!` arms add
   `"source_app": f.metadata.source_app, "capture_interface": f.metadata.capture_interface`.
-  Nothing else in `flow_summary` changes (the `"kind": "ws"` divergence stays).
+  Nothing else in `flow_summary` changes.
 - **Test** (`crates/aitm-mcp/tests/mcp.rs`, using `push_server`, `conn_over`, `subscribe_on`,
   `NotificationSink` as `subscribe_on_an_open_sink_still_works` does):
   `pushed_summary_mirrors_source_app_and_capture_interface` — insert
@@ -248,6 +248,13 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| all | Tester (stage 5) | — | PASS (sandbox scope): every SA-AC mapped (SA-AC6 manual on the v0.5.5 DMG); 10/11 mutants killed, the survivor (`#[serde(default)]` on an `Option` field) equivalent; 781 test-only lines added; fmt/clippy exit 0; tripwire PASS on branch and base | Terminal gates on the merged tree 985c00f: see the rows below |
+| 0 | Tester | Minor (test depth) | The coder suite left the TLS `mitm` `Conn` literal, the h2 `stream_task` stamping and the WS `drive` wiring unpinned — mutants b2/b3/c2 survived against it; these are the paths a live Safari capture takes | FIXED by the tester (test code only): real TLS/h2/duplex harness tests + WS wiring tests, commit 4584310 |
+| 1 | Tester | Info | The core passes an empty `source_app` (`Some("")`) through verbatim; unreachable from the real provider (`FlowHandoff.swift` sends `nonEmpty(...)` → null) and the Kit normalises `""` → nil | ACCEPTED: no core change; both ends already guard it |
+| 2 | Tester | Info | Spec non-goal and plan text still mention the `"kind": "ws"` push divergence that #191 removed; `push_summary_equals_flow_get_for_http_and_websocket_flows` now enforces equality | FIXED — wording removed from the plan's Task 2 note (this commit) |
+| 0 | Tester | Info | `#[serde(default)]` on the two `MetaRec` `Option<String>` fields is redundant for JSON (serde already defaults a missing `Option`) | ACCEPTED: harmless, documents intent |
+| all | Tester | Note | Replayed and imported flows carry None/None — consistent with the spec (not opened by an app) | — |
+| all | Tester | — | New e2e cell `tests/e2e/flow/test_source_app_null_on_proxied.py` (canonical `aitm_e2e` harness) boots a real core and asserts both keys null on `flow.get`, the `flow.table` row and the `created` push | run by the main session in the Terminal (result below) |
 
 ## Shipped
 
