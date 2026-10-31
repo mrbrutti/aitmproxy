@@ -1,9 +1,11 @@
 import AitmBusClient
 import Foundation
 
-/// The request fields `flow.mutate {edits}` and `request.send` accept
-/// (`crates/aitm-plugins/src/mutate.rs::request_fields`). Headers replace
-/// any existing header of the same name; a nil field is left alone.
+/// The fields `flow.mutate {edits}` and `request.send` accept
+/// (`crates/aitm-plugins/src/mutate.rs::edit_fields`). Headers replace
+/// any existing header of the same name; a nil field is left alone. `status`
+/// is valid only for a flow parked at the response phase (S-041), where the
+/// core applies the edits to the response instead of the request.
 public struct RequestEdits: Hashable, Sendable {
     public var method: String?
     public var scheme: String?
@@ -12,19 +14,22 @@ public struct RequestEdits: Hashable, Sendable {
     public var path: String?
     public var headers: [String: String]?
     public var body: Data?
+    /// Response status code; only for a response parked at the response phase.
+    public var status: Int?
 
     public init(method: String? = nil, scheme: String? = nil, authority: String? = nil, path: String? = nil,
-                headers: [String: String]? = nil, body: Data? = nil) {
+                headers: [String: String]? = nil, body: Data? = nil, status: Int? = nil) {
         self.method = method
         self.scheme = scheme
         self.authority = authority
         self.path = path
         self.headers = headers
         self.body = body
+        self.status = status
     }
 
     public var isEmpty: Bool {
-        method == nil && scheme == nil && authority == nil && path == nil && headers == nil && body == nil
+        method == nil && scheme == nil && authority == nil && path == nil && headers == nil && body == nil && status == nil
     }
 
     /// The `edits` object / `request.send` arguments. A UTF-8 body crosses as
@@ -35,6 +40,7 @@ public struct RequestEdits: Hashable, Sendable {
         if let scheme { args["scheme"] = .string(scheme) }
         if let authority { args["authority"] = .string(authority) }
         if let path { args["path"] = .string(path) }
+        if let status { args["status"] = .number(Double(status)) }
         if let headers { args["headers"] = .object(headers.mapValues { .string($0) }) }
         if let body {
             if let text = String(data: body, encoding: .utf8) {
@@ -48,13 +54,7 @@ public struct RequestEdits: Hashable, Sendable {
 
     /// The edits that turn `original` into `edited` (headers added or changed, body if different).
     public static func diff(from original: HTTPMessage, to edited: HTTPMessage) -> RequestEdits {
-        var edits = RequestEdits()
-        var changed: [String: String] = [:]
-        for header in edited.headers where original.header(header.name) != header.value {
-            changed[header.name] = header.value
-        }
-        if !changed.isEmpty { edits.headers = changed }
-        if original.body != edited.body { edits.body = edited.body ?? Data() }
+        var edits = headersAndBody(from: original, to: edited)
         if original.startLine != edited.startLine {
             let parts = edited.startLine.split(separator: " ").map(String.init)
             if parts.count >= 2 {
@@ -62,6 +62,26 @@ public struct RequestEdits: Hashable, Sendable {
                 edits.path = parts[1]
             }
         }
+        return edits
+    }
+
+    /// The edits that turn a parked response `original` into `edited` (S-041):
+    /// headers and body as for a request, plus `status` when the code changed. A
+    /// reason phrase alone is not an edit; the core writes its own.
+    public static func diff(fromResponse original: HTTPMessage, to edited: HTTPMessage) -> RequestEdits {
+        var edits = headersAndBody(from: original, to: edited)
+        if let code = edited.statusCode, code != original.statusCode { edits.status = code }
+        return edits
+    }
+
+    private static func headersAndBody(from original: HTTPMessage, to edited: HTTPMessage) -> RequestEdits {
+        var edits = RequestEdits()
+        var changed: [String: String] = [:]
+        for header in edited.headers where original.header(header.name) != header.value {
+            changed[header.name] = header.value
+        }
+        if !changed.isEmpty { edits.headers = changed }
+        if original.body != edited.body { edits.body = edited.body ?? Data() }
         return edits
     }
 

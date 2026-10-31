@@ -138,7 +138,9 @@ struct SummaryStrip: View {
     @ViewBuilder private var statusPill: some View {
         switch row.state {
         case .paused:
-            Badge(text: "Paused · request", pair: ColorPair(fg: Tok.Intercept.deep, bg: Tok.Intercept.tint), uppercase: false)
+            // `Paused · request` or, once the detail carries the parked response head, `Paused · response` (S-041).
+            Badge(text: InterceptPhase.parked(row, detail: detail)?.title ?? "Paused",
+                  pair: ColorPair(fg: Tok.Intercept.deep, bg: Tok.Intercept.tint), uppercase: false)
         case .killed:
             Badge(text: "Killed", pair: ColorPair(fg: Tok.Status.killed, bg: Tok.Ground.raised), uppercase: false)
         case .pending:
@@ -418,6 +420,9 @@ struct RequestPane: View {
     @State private var bodyState = BodyViewState()
     private var tab: RequestTab { session.requestTab }
     private var bodySize: CGFloat { session.density.bodySize }
+    /// The request is editable only while the flow is parked at the request; parked at
+    /// the response it has already gone upstream and the Response pane edits instead (S-041).
+    private var editsRequest: Bool { InterceptPhase.parked(row, detail: detail) == .request }
 
     var body: some View {
         @Bindable var session = session
@@ -426,10 +431,8 @@ struct RequestPane: View {
             PaneTabs(title: "Request", tabs: RequestTab.allCases, selected: $session.requestTab) {
                 if tab == .body, let detail {
                     BodyHost.controls(message: detail.request, extent: detail.requestBodyExtent, state: bodyState, sseState: sseState)
-                } else if row.state == .paused {
-                    let n = session.pendingEditCount(row.id)
-                    Text(n > 0 ? "\(n) pending" : "editing").font(Tok.Face.ui(Tok.Typography.Size.sm))
-                        .foregroundStyle(n > 0 ? Tok.Intercept.deep.color : Tok.Ink.tertiary.color)
+                } else if editsRequest {
+                    PendingEditsLabel(count: session.pendingEditCount(row.id))
                 }
             }
             if tab == .body, bodyState.findShown {
@@ -438,13 +441,13 @@ struct RequestPane: View {
             if let detail {
                 switch tab {
                 case .raw:
-                    if row.state == .paused {
+                    if editsRequest {
                         RawRequestEditor(row: row, detail: detail)
                     } else {
                         CodeView(lines: BodyLines.raw(detail.request, original: detail.originalRequest), footer: nil)
                     }
                 case .headers:
-                    if row.state == .paused {
+                    if editsRequest {
                         EditableHeaderTable(row: row, detail: detail)
                     } else {
                         HeaderTable(headers: detail.request.headers)
@@ -513,14 +516,26 @@ struct ResponsePane: View {
             if tab == .body, bodyState.findShown {
                 FindRow(state: bodyState.find, isPresented: $bodyState.findShown)
             }
-            if let response = detail?.response {
+            if let detail, let response = detail.response {
                 switch tab {
-                case .headers: HeaderTable(headers: response.headers)
+                case .headers:
+                    // Parked at the response head (S-041): status, headers and body are editable
+                    // like a paused request, before any byte reaches the client.
+                    if editsResponse {
+                        EditableHeaderTable(row: row, detail: detail, phase: .response)
+                    } else {
+                        HeaderTable(headers: response.headers)
+                    }
                 case .setCookie: CookieTable(cookies: Cookie.cookies(in: response), bodySize: bodySize)
                 case .body:
-                    BodyHost(message: response, extent: detail?.responseBodyExtent, bodySize: bodySize, sseState: sseState,
+                    BodyHost(message: response, extent: detail.responseBodyExtent, bodySize: bodySize, sseState: sseState,
                              state: bodyState, onLoadMore: { try await session.loadMoreBody(for: row.id) })
-                case .raw: CodeView(lines: BodyLines.raw(response), footer: nil)
+                case .raw:
+                    if editsResponse {
+                        RawRequestEditor(row: row, detail: detail, phase: .response)
+                    } else {
+                        CodeView(lines: BodyLines.raw(response), footer: nil)
+                    }
                 case .json:
                     if let state = treeState {
                         JSONTreeView(state: state, bodySize: bodySize)
@@ -532,6 +547,10 @@ struct ResponsePane: View {
                 }
             } else if tab == .diff {
                 diff
+            } else if editsResponse {
+                // Parked at the response head, but the cached detail predates the park:
+                // the refreshed detail is on its way (`refreshParkedResponse`).
+                LoadingLines()
             } else if row.state == .paused, let previous = previousResponse {
                 // The previous response is a reference, not this flow's content: the
                 // badge says so beside the caption, and the trailing slot stays empty.
@@ -560,6 +579,9 @@ struct ResponsePane: View {
         .onChange(of: row.id, initial: true) { rebuildTree(); bodyState.format = .auto; bodyState.findShown = false; bodyState.imageZoom = .fit }
         .onChange(of: detail?.response?.body) { rebuildTree() }
         .onChange(of: session.findRequestTick) { if tab == .body { bodyState.findShown = true } }
+        // The summary says the flow reached its response park (a status while paused) before the
+        // detail does: fetch the parked response so the editor has something to edit.
+        .onChange(of: editsResponse, initial: true) { if editsResponse { session.refreshParkedResponse(row.id) } }
     }
 
     @ViewBuilder private var diff: some View {
@@ -584,9 +606,14 @@ struct ResponsePane: View {
                 BodyHost.controls(message: response, extent: detail?.responseBodyExtent, state: bodyState, sseState: sseState)
             }
         default:
-            EmptyView()
+            if editsResponse {
+                PendingEditsLabel(count: session.pendingEditCount(row.id))
+            }
         }
     }
+
+    /// Whether the flow is parked at the response head, so this pane edits it (S-041).
+    private var editsResponse: Bool { InterceptPhase.parked(row, detail: detail) == .response }
 
     private func rebuildTree() {
         guard let data = detail?.response?.body, let root = try? JSONTree.parse(data) else {
@@ -602,6 +629,16 @@ struct ResponsePane: View {
     private var previousResponse: HTTPMessage? {
         guard Store.usesFixtures else { return nil }
         return row.authority == "auth.shop-staging.test" && row.path == "/api/auth/login" ? Fixtures.previousLoginResponse : nil
+    }
+}
+
+/// The editing pane's trailing word: `editing`, or `N pending` in the intercept ink.
+struct PendingEditsLabel: View {
+    var count: Int
+
+    var body: some View {
+        Text(count > 0 ? "\(count) pending" : "editing").font(Tok.Face.ui(Tok.Typography.Size.sm))
+            .foregroundStyle(count > 0 ? Tok.Intercept.deep.color : Tok.Ink.tertiary.color)
     }
 }
 

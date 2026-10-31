@@ -30,14 +30,22 @@ public enum RawHTTP {
         let normalized = text.replacingOccurrences(of: "\r\n", with: "\n")
         let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard let first = lines.first?.trimmingCharacters(in: .whitespaces), !first.isEmpty else {
-            throw ParseError(line: 1, message: "the first line must be the request line, like POST /path HTTP/2")
+            throw ParseError(line: 1, message: "the first line must be the request line, like POST /path HTTP/2, or the status line, like HTTP/2 200")
         }
         let parts = first.split(separator: " ").map(String.init)
-        guard parts.count >= 2 else {
-            throw ParseError(line: 1, message: "the request line needs a method and a path")
-        }
-        guard parts[0].allSatisfy({ $0.isUppercase || $0.isNumber || $0 == "-" }) else {
-            throw ParseError(line: 1, message: "\(parts[0]) is not an HTTP method")
+        // A response (S-041) starts with its version and a three-digit status; a request with its method.
+        let isResponse = parts[0].hasPrefix("HTTP/")
+        if isResponse {
+            guard parts.count >= 2, parts[1].count == 3, let code = Int(parts[1]), (100...999).contains(code) else {
+                throw ParseError(line: 1, message: "the status line needs a version and a three-digit status, like HTTP/2 200")
+            }
+        } else {
+            guard parts.count >= 2 else {
+                throw ParseError(line: 1, message: "the request line needs a method and a path")
+            }
+            guard parts[0].allSatisfy({ $0.isUppercase || $0.isNumber || $0 == "-" }) else {
+                throw ParseError(line: 1, message: "\(parts[0]) is not an HTTP method")
+            }
         }
         var headers: [HTTPMessage.Header] = []
         var index = 1
@@ -60,14 +68,14 @@ public enum RawHTTP {
             let rest = lines[(index + 1)...].joined(separator: "\n")
             body = rest.isEmpty ? nil : Data(rest.utf8)
         }
-        let startLine = parts.count >= 3 ? first : first + " HTTP/2"
+        let startLine = isResponse || parts.count >= 3 ? first : first + " HTTP/2"
         return HTTPMessage(startLine: startLine, headers: headers, body: body)
     }
 }
 
 extension RequestEdits {
-    /// How many things the diff changes: each header, the body, the start line.
+    /// How many things the diff changes: each header, the body, the start line (request line or status).
     public var changeCount: Int {
-        (headers?.count ?? 0) + (body == nil ? 0 : 1) + (method == nil && path == nil ? 0 : 1)
+        (headers?.count ?? 0) + (body == nil ? 0 : 1) + (method == nil && path == nil ? 0 : 1) + (status == nil ? 0 : 1)
     }
 }

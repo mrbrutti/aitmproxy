@@ -1,0 +1,41 @@
+HTTP/1.1 203 OK
+Server: SimpleHTTP/0.6 Python/3.14.7
+Date: Sat, 31 Oct 2026 23:23:34 GMT
+Content-type: text/html; charset=utf-8
+Content-Length: 947
+x-aitm-edited: 1
+
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style type="text/css">
+:root {
+color-scheme: light dark;
+}
+</style>
+<title>Directory listing for /</title>
+</head>
+<body>
+<h1>Directory listing for /</h1>
+<hr>
+<ul>
+<li><a href=".claude/">.claude/</a></li>
+<li><a href=".gitignore">.gitignore</a></li>
+<li><a href="Aitmproxy.entitlements">Aitmproxy.entitlements</a></li>
+<li><a href="build.sh">build.sh</a></li>
+<li><a href="CLAUDE.md">CLAUDE.md</a></li>
+<li><a href="design/">design/</a></li>
+<li><a href="docs/">docs/</a></li>
+<li><a href="EmbeddedObscura.entitlements">EmbeddedObscura.entitlements</a></li>
+<li><a href="Extension/">Extension/</a></li>
+<li><a href="Icon/">Icon/</a></li>
+<li><a href="Info.plist.in">Info.plist.in</a></li>
+<li><a href="Package.swift">Package.swift</a></li>
+<li><a href="Sources/">Sources/</a></li>
+<li><a href="Tests/">Tests/</a></li>
+<li><a href="tools/">tools/</a></li>
+</ul>
+<hr>
+</body>
+</html>

@@ -1,3 +1,4 @@
+import AitmBusClient
 import Foundation
 
 /// A breakpoint rule (foundation §2.7 "Rules…", Proxyman's form; F3 carries
@@ -69,12 +70,27 @@ public struct BreakpointRule: Identifiable, Hashable, Sendable, Codable {
         return re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) != nil
     }
 
-    /// The wire form F3 will take.
-    public var arguments: [String: String] {
-        var a = ["url": url, "match": matching.rawValue, "phase": onRequest && onResponse ? "both" : onResponse ? "response" : "request"]
-        if !method.isEmpty { a["method"] = method.uppercased() }
-        if let flag { a["flag"] = flag.rawValue }
-        if !name.isEmpty { a["name"] = name }
+    /// The wire form of one `flow.intercept {rules}` entry: only the fields the core
+    /// knows (`crates/aitm-plugins/src/intercept.rs::rule_param_fields`), since one
+    /// unknown key rejects the whole call and leaves intercept armed on the old
+    /// rules — `match` and `flag` stay in the app. Phases are `request`, `response`
+    /// and `any` (both). `url` is the core's object form, `{wildcard}` or `{regex}`
+    /// (`crates/aitm-rules/src/bus.rs::parse_url_match`). A wildcard without `*` or
+    /// `?` matches as a substring here and anchored on the core, so it travels
+    /// wrapped in `*`.
+    public var arguments: [String: JSONValue] {
+        var a: [String: JSONValue] = [
+            "id": .string(id.uuidString),
+            "phase": .string(onRequest && onResponse ? "any" : onResponse ? "response" : "request"),
+        ]
+        switch matching {
+        case .wildcard:
+            a["url"] = .object(["wildcard": .string(url.contains("*") || url.contains("?") ? url : "*\(url)*")])
+        case .regex:
+            a["url"] = .object(["regex": .string(url)])
+        }
+        if !method.isEmpty { a["method"] = .string(method.uppercased()) }
+        if !name.isEmpty { a["name"] = .string(name) }
         return a
     }
 }

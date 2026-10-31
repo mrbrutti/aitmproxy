@@ -639,7 +639,7 @@ Status: done
 
 ### S-041 Intercept and edit a response
 As the operator, I pause at the response phase and change status, headers or body before the client sees it.
-Screens: edit-paused
+Screens: apps
 Depends: S-037, S-040
 Core: F3
 Acceptance:
@@ -651,7 +651,8 @@ UX:
 - States: before F3 nothing pauses at the response; the pill never shows
 - Words: pill "Paused · response"; footer as the request editor's
 - Access: same as S-037
-Status: todo
+Live: 2026-10-31, dev bundle with the release core, a curl parked at the response head under a response rule, edited in the Raw editor by real keystrokes, Apply & Resume (⌘⏎): curl received `HTTP/1.1 203` + `x-aitm-edited: 1` (`docs/evidence/S-041/`). Body edits reach the client too (live self-test). Rules… had never reached a live core before this (FIXLOG 2026-10-31).
+Status: done
 
 ### S-042 Compose a request
 As the operator, I press ⌘N (or `n`) and fill method, URL, headers, query and body in a sheet, pick a template, and Send; the result appears as a new flow.
