@@ -459,4 +459,21 @@ surfaced, filed as a follow-up.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**Status at hand-off (2026-10-31):** branch `claude/nostalgic-grothendieck-467410` ready for
+integration by the orchestrator; PR against `main` opened from this session (number recorded in
+the PR comment and the shared notes `scope-persistence-STATUS.md`). Merge SHA: filled by the
+integrator.
+
+- **Merged content:** Tasks 1–4 as planned (`b1b7dd7`, `f47e891`, `ef34eec`, `be251fb`), the
+  tester's 21 tests (`967115c`), three panel fix waves (`68989ee`, `55d0e9c`, `3101a7e`,
+  `e14272f`) and the docs commits. Final gates: `swift test` 423 Kit + 27 bus-client green; Rust
+  gate green; fixture self-test 123/123; live self-test (external core) 23/23; live proof PASS
+  (relaunch display + banner, config block, `scope.list`, remove → `{"hosts": []}`, Restart
+  Core respawns from the file).
+- **Cut:** nothing from the spec. SP-AC12 (NE first Scope frame) was not observed live this
+  session (concurrent NE session owned the installed extension build) — accepted by reasoning.
+- **Follow-ups:** #192 (pre-existing `BusService.run` reconnect race after Restart Core);
+  observe the NE provider's first Scope frame with a restored scope on the next NE live
+  session; consolidate the seven `UserDefaultsActiveKindPersistence().load() ?? .embedded`
+  copies into one Kit helper (row 7); optional fd-based `load` to close the same-user TOCTOU
+  (row 15).
