@@ -1773,6 +1773,13 @@ impl McpServer {
     /// never reaches the ring, the durable log, or the pushed `agent` line. Each
     /// entry goes to the always-on ring, the optional durable sink, and the F4
     /// agent stream.
+    ///
+    /// The ring keeps the entry in the lane [`aitm_core::lane_for`] picks from the
+    /// command's registered sensitivity and the outcome: a successful `Read` is
+    /// routine, everything else (refused, failed, `Write`, `Sensitive`, and a name
+    /// the registry does not know) is evidence, so a polling burst cannot evict a
+    /// refusal. The lane only chooses where the ring keeps the entry; the durable
+    /// sink and the agent stream still get every entry.
     fn record_audit(
         &self,
         conn: &ConnCtx,
@@ -1807,7 +1814,9 @@ impl McpServer {
             args_summary: redact_args(arguments),
             result: outcome,
         };
-        self.audit_ring.append(entry.clone());
+        let sensitivity = self.registry.command(name).map(|c| c.sensitivity());
+        let lane = aitm_core::lane_for(sensitivity, &entry.result);
+        self.audit_ring.append_in(lane, entry.clone());
         if let Some(durable) = &self.durable_audit {
             durable.append(entry.clone());
         }
