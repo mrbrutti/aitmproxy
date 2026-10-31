@@ -144,12 +144,26 @@ enum SelfTest {
             check("a mark colour on an out-of-scope row is refused with the reason",
                   session.rows.first { $0.id == outOfScope.id }?.mark == nil && session.lastError == VerbTable.outOfScopeReason(outOfScope.authority))
             session.lastError = nil
+            // A refused flow.clear offers no Undo and no notice; the rows stay.
+            let fixtureActions = session.actions as? FixtureActions
+            fixtureActions?.clearFails = true
+            session.clearSession(confirm: { _ in true })
+            await settle { session.lastError != nil }
+            check("a refused clear keeps the rows and offers neither Undo nor the notice",
+                  !session.rows.isEmpty && session.clearNotice == nil && session.clearedFlows == nil && !session.flowUndoManager.canUndo
+                      && session.lastError == "clear: flow.clear refused (fixture)", session.lastError ?? "no error")
+            fixtureActions?.clearFails = false
+            session.lastError = nil
+            // The notice lapses on its own timer and takes the copy and the step with it.
+            Session.clearNoticeSeconds = 0.2
             session.clearSession(confirm: { _ in true })
             await settle { session.rows.isEmpty && session.clearNotice != nil }
-            session.forgetClearedFlows()
+            check("the notice shows after the clear", session.clearNotice != nil && session.flowUndoManager.canUndo)
+            await settle { session.clearNotice == nil }
             check("letting the notice lapse releases the copy and the step",
                   session.clearedFlows == nil && session.clearNotice == nil && !session.flowUndoManager.canUndo,
                   "copy \(session.clearedFlows == nil) notice \(session.clearNotice == nil) canUndo \(session.flowUndoManager.canUndo)")
+            Session.clearNoticeSeconds = 8
 
             // M3: filters, saved filters, sidebar query, palette.
             session.loadFixtures()

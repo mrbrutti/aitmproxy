@@ -38,7 +38,7 @@ actor, JSON-RPC       values only          SwiftUI + AppKit, main actor by defau
 
 ## Checks that hold the shape
 
-- `tools/verify.sh`: unit tests, self-test (126 checks, incl. menu-bar coverage from
+- `tools/verify.sh`: unit tests, self-test (128 checks, incl. menu-bar coverage from
   `CommandMap`), snapshots light + dark, parts gallery, grid-lint.
 - Kit tests parse `docs/BRIEF.md` (`CommandMapTests`): the brief, the map and the menus stay one
   list.

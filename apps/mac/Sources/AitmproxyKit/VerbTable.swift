@@ -118,19 +118,19 @@ public enum VerbTable {
         ]
     }
 
-    /// One verb's row for a context (`nil` context: the default, disabled row). Every `FlowVerb`
-    /// has a row (`.mark(color)` shares `Mark`'s), so this cannot miss.
+    /// One verb's row for a context (`nil` context: the default, disabled row).
     public static func item(_ verb: FlowVerb, for context: VerbContext?) -> VerbItem {
+        item(verb, in: items(for: context))
+    }
+
+    /// One verb's row out of a table already built. Every `FlowVerb` has a row (`.mark(color)`
+    /// shares `Mark`'s), so this cannot miss.
+    public static func item(_ verb: FlowVerb, in items: [VerbItem]) -> VerbItem {
         let key = verb.tableKey
-        guard let item = items(for: context).first(where: { $0.verb == key }) else {
+        guard let item = items.first(where: { $0.verb == key }) else {
             preconditionFailure("VerbTable has no row for \(verb)")
         }
         return item
-    }
-
-    /// The verb a bare key fires, if any of `items` claims it (enabled or not: the caller reports).
-    public static func verb(forKey key: String, in items: [VerbItem]) -> FlowVerb? {
-        items.first { $0.key == key }?.verb
     }
 
     /// The verb a bare key fires on the focused list; keys are the same for every row.

@@ -199,9 +199,9 @@ making it a value lets `VerbTableTests` pin the literal titles the six copies di
   returns; otherwise dispatches as today (`.resume` → `applyAndResume` iff `pendingEdits > 0`
   else `resume`; `.edit` → `editPaused`; `.pinHost` from `context.pinned`; the rest unchanged).
   Helpers, all `@MainActor` on `Session`:
-  `func verbContext(for id: FlowID, pane: Int = 0) -> VerbContext?` (nil when the id is not in
-  `rows`; `pane == 1` reads `secondSelection`), `func verbItems(for id: FlowID?, pane: Int = 0)
-  -> [VerbItem]`, `func verbItem(_ verb: FlowVerb, for id: FlowID?, pane: Int = 0) -> VerbItem`
+  `func verbContext(for id: FlowID) -> VerbContext?` (nil when the id is not in
+  `rows`; the selection is the focused pane's, `Session.focusedSelectedRows`, so a verb on the split view's second list counts that list), `func verbItems(for id: FlowID?)
+  -> [VerbItem]`, `func verbItem(_ verb: FlowVerb, for id: FlowID?) -> VerbItem`
   (falls back to the nil-context default item). The `ShellView` closures compile unchanged
   because `FlowTableView.onAction` becomes `(FlowVerb, FlowID) -> Void`.
 - **`FlowRowActions.swift`** — `FlowRowAction` deleted. `FlowKeyTable.keyDown` keeps `i`
@@ -214,8 +214,7 @@ making it a value lets `VerbTableTests` pin the literal titles the six copies di
   become internal). `buildRowMenu` iterates `VerbTable.items(for: context)` where the
   Coordinator builds the context from its own table: `selectedCount` /
   `selectedPausedCount` from `table.selectedRowIndexes`, `pendingEdits` from the existing
-  closure, `pinned` from `parent.isPinned`, `isInterceptTarget` from
-  `session.interceptTarget`. Rendering rules: a separator at each group change; `.mark` as a
+  closure, `pinned` from `parent.isPinned`. Rendering rules: a separator at each group change; `.mark` as a
   submenu (today's `markMenu`); the `.selection` group only when `selectedCount > 1`; `.kill`
   skipped in the row menu **(Architect's call: the row's `d` item already reads "Kill" for a
   paused or pending row; two adjacent "Kill" items would be noise — ⌘\ stays in the Flow
@@ -275,7 +274,7 @@ to the baseline; S-069 checks green.
   (`Session.flowUndoManager`, returned by `FlowKeyTable.undoManager` so Edit ▸ Undo Clear and
   ⌘Z reach it while the list has focus) with action name "Clear" and sets
   `clearNotice = ClearNotice(count:)` (the bar's Undo calls `undoClear()`), scheduling a task that after 8 s
-  releases the dropped copy, withdraws the undo step (`removeAllActions(withTarget:)`) and nils the
+  releases the dropped copy, withdraws the undo step (`flowUndoManager.removeAllActions()`) and nils the
   notice: captured traffic never outlives what the operator was told (stage-6 security finding). A failed clear registers nothing and shows no notice. `undoClear()`
   restores `rows = ClearedFlows.merge(restored:, newer: rows)`, merges `details`, sets
   `selection` and `focused`, sets `restoredFlows = cleared.rows`, cancels the timer, nils
@@ -304,7 +303,7 @@ to the baseline; S-069 checks green.
   path, not a closure. Two more
   checks from the stage-6 panel: a mark colour on an out-of-scope row is refused with the
   scope reason, and letting the notice lapse releases the copy and withdraws the step. Count
-  rises from 121 to 126.
+  rises from 121 to 128 (a refused clear offers nothing; the notice shows, then lapses on its timer).
 
 ### 4. HoverRowStyle
 
@@ -372,7 +371,7 @@ columns gone; `apps` (full width, 1199 pt ≥ 1096 pt minimum sum) byte-identica
    nothing (every row-verb title literal lives in `VerbTable.swift`); `Shell/ShellView.swift`
    is not in the diff.
 7. AC7: `swift test` is green with `VerbTableTests`, `ClearedFlowsTests` and
-   `ColumnLayoutTests` added; the self-test is 126 of 126 including every S-069 "menu has"
+   `ColumnLayoutTests` added; the self-test is 128 of 128 including every S-069 "menu has"
    check.
 8. AC8: `apps`, `edit-paused`, `filter-bar`, `overview` light and dark PNGs are byte-identical
    (`cmp`) to `/tmp/Aitmproxy-shots-dev-w3base`.
@@ -403,8 +402,6 @@ columns gone; `apps` (full width, 1199 pt ≥ 1096 pt minimum sum) byte-identica
 ## Left to the builder
 
 - The `Shortcut → KeyboardShortcut` helper's name and home (the app target).
-- How the Coordinator stores the context closure for `isInterceptTarget` (it already holds
-  `pendingEdits` as a closure set in `updateNSView`).
 - The exact `@Entry` declaration for `rowHovered` and whether `HoverRowStyle` takes a
   `height` parameter (default `Tok.Size.Row.dense`) — all three rows use dense today.
 - Which `Session` extension file holds `undoClear()` (`Session+Verbs.swift` is the default).

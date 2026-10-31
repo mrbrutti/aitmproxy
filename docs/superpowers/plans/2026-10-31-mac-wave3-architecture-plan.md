@@ -81,9 +81,9 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
   InterceptBar.swift` (modify), `Sources/AitmproxyKit/CommandMap.swift` (modify: Flow row
   entries from `VerbTable.titles`/`items(for: nil)`), `docs/ARCHITECTURE.md` (modify: Kit
   list + "Checks that hold the shape"). NOT `Shell/ShellView.swift`.
-- **Change:** on `Session`: `func verbContext(for id: FlowID, pane: Int = 0) -> VerbContext?`,
-  `func verbItems(for id: FlowID?, pane: Int = 0) -> [VerbItem]`, `func verbItem(_ verb:
-  FlowVerb, for id: FlowID?, pane: Int = 0) -> VerbItem`, `func perform(_ verb: FlowVerb, on id:
+- **Change:** on `Session`: `func verbContext(for id: FlowID) -> VerbContext?`,
+  `func verbItems(for id: FlowID?) -> [VerbItem]`, `func verbItem(_ verb:
+  FlowVerb, for id: FlowID?) -> VerbItem`, `func perform(_ verb: FlowVerb, on id:
   FlowID)` gating on `item.enabled` and reporting `disabledReason` as `lastError`.
   `FlowKeyTable.onVerb: ((FlowVerb) -> Void)?`; `keyDown` keeps `i`/`n`/Return and routes the
   rest through `VerbTable.verb(forKey:in: VerbTable.items(for: nil))`. `buildRowMenu` iterates
@@ -106,7 +106,7 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
 
 ### Task 3: Clear with Undo
 
-- **Satisfies:** AC7 (`ClearedFlowsTests`, 126 of 126), AC9, AC10, AC11
+- **Satisfies:** AC7 (`ClearedFlowsTests`, 128 of 128), AC9, AC10, AC11
 - **Depends on:** Task 2 (shares `Session+Verbs.swift`)
 - **Files:** `Sources/AitmproxyKit/ClearedFlows.swift` (create),
   `Tests/AitmproxyKitTests/ClearedFlowsTests.swift` (create), `Sources/Aitmproxy/Session.swift`
@@ -117,7 +117,7 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
   `restoredFlows`), `Sources/Aitmproxy/Bus/BusService.swift` (modify: one assignment in
   `pollLoop`), `Sources/Aitmproxy/Shell/StatusBar.swift` (modify: centre slot),
   `Sources/Aitmproxy/SelfTest.swift` (modify: three checks after "clearing empties the
-  session").
+  session"), `Sources/Aitmproxy/SelfTest+Live.swift` (modify: the AC11 live check).
 - **Change:** Kit `public struct ClearedFlows: Sendable { rows, details, selection, focused;
   var count: Int; static func merge(restored: [FlowRow], newer: [FlowRow]) -> [FlowRow] }`
   and `public struct ClearNotice: Equatable, Sendable { count: Int; text: String }`.
@@ -142,7 +142,7 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
   (`AITM_CONFIG=… ./target/release/aitm`, `curl -x 127.0.0.1:8080 http://127.0.0.1:8099/`
   a few times), press Clear → status bar reads "Cleared n flows — Undo" → click Undo → the n
   rows are back and still present after 2 s; Edit ▸ Undo reads "Undo Clear" after a Clear.
-- **Done when:** `swift test` green, the self-test is 126 of 126, the live check passes, and
+- **Done when:** `swift test` green, the self-test is 128 of 128, the live check passes, and
   the `apps` snapshot is still byte-identical (no notice in a snapshot).
 
 ### Task 4: `HoverRowStyle`
@@ -232,7 +232,7 @@ for s in apps edit-paused filter-bar overview; do for m in light dark; do
 - **Test:** the whole gate block in the Overview: `swift test` green (349 + new suites:
   `VerbTableTests` 10, `ClearedFlowsTests` ≥ 3, `ColumnLayoutTests` moved + 6);
   `grid-lint.sh` PASS; `check-layout.swift` PASS on every `*-layout.json` in
-  `/tmp/Aitmproxy-shots-dev-w3`; self-test 126 of 126; the four `cmp` pairs silent; the
+  `/tmp/Aitmproxy-shots-dev-w3`; self-test 128 of 128; the four `cmp` pairs silent; the
   `split` and `activity-log` PNGs looked at in light and dark.
 - **Done when:** every command's output is quoted in the task's report and the branch is
   ready for the stage-6 panel.
@@ -248,7 +248,10 @@ Kept by the main session during stage 6. One row per finding.
 | 3 | spec | Critical | AC11 (live-bus Clear → Undo survives four polls) had no evidence | fixed: `SelfTest+Live.runLive` gains "flow.clear empties the list and offers Undo Clear" and "Undo Clear puts the flows back and they survive four polls"; run against a private `aitm` (see Shipped) |
 | 2 | security, quality | Minor/Important | `perform(.mark(color))` missed the table row (only `.mark(nil)` exists) and so bypassed the scope gate; `m` popped the mark menu without a gate | fixed: `FlowVerb.tableKey`, `VerbTable.item(_:for:)` used by every lookup; the Coordinator checks the row before popping; self-test check "a mark colour on an out-of-scope row is refused with the reason" |
 | 3 | security | Minor | Restored rows kept a frozen `inScope` | fixed: the poll re-scopes `restoredFlows` like polled rows |
-| 3 | security, quality | Minor | Stale "Undo Clear" steps stacked on the undo manager; key-window manager could be a secondary window's | fixed: `removeAllActions(withTarget:)` before each registration; the main window's manager first |
+| 3 | security, quality | Minor | Stale "Undo Clear" steps stacked on the undo manager; key-window manager could be a secondary window's | fixed: Clear's step lives on `Session.flowUndoManager` (own manager, `groupsByEvent = false`), which `FlowKeyTable.undoManager` hands to AppKit; `removeAllActions()` before each registration and on lapse. (`removeAllActions(withTarget:)` on the window's manager could not withdraw a step inside the event group AppKit keeps open, which the headless self-test exposed.) |
+| 2 | quality (re-review) | Minor | `VerbButton` carried dead state and a fallback that could not fire; `clearSession` re-rolled `perform`; the lapse check bypassed the timer; `verb(forKey:in:)` had no caller; `registerClearUndo` sat in the state file; `undoManagerProvider` was a closure for a constant; `urlSpacing` counted a set the fit did not | fixed: `VerbTable.item(_:in:)` + `VerbButton(item:action:)`; `perform("clear")`; `clearNoticeSeconds` is a `static var` the self-test sets to 0.2 and waits out; `verb(forKey:in:)` deleted; `registerClearUndo` private in `Session+Verbs`; `FlowKeyTable.listUndoManager`; spacing term dropped (intercell spacing is zero, noted at the table) |
+| 3 | spec (re-review) | Minor | No check walked the failed-clear path; spec/plan still printed `pane:` and `isInterceptTarget`; `SelfTest+Live.swift` undeclared | fixed: `FixtureActions.clearFails` + self-test "a refused clear keeps the rows and offers neither Undo nor the notice"; docs amended; file declared in Task 3 |
+| 3 | security (re-review) | Minor | The live-test script wrote the operator's real `bus.operatorToken` into a plaintext `/tmp` config and left it there | fixed: file deleted, script runs under `umask 077` and removes the config on exit; a token override for the live self-test (so a run never needs the real credential) is the harness session's item |
 | 1 | quality | Minor | `VerbContext.isInterceptTarget` read by no rule | fixed: removed from Kit and the spec |
 | 1 | quality | Minor | `VerbTable.order` hand-duplicated the items order, test compared sets | fixed: `order` derived from `items(for: nil)`; test asserts equality |
 | 1, 2 | quality | Minor | Force-unwrapped lookups in `CommandMap.verb` and `Session.verbItem` | fixed: `VerbTable.item(_:for:)`, non-optional by construction (`preconditionFailure` names the verb) |
@@ -258,7 +261,7 @@ Kept by the main session during stage 6. One row per finding.
 | 6 | quality | Minor | Auto-hide threshold ignored the intercell spacing the URL fit subtracts | fixed: spacing folded into `flexibleMin`; Kit test `theFlexibleMinimumIsPartOfTheSum` |
 | 2 | quality | Minor | Flow menu rebuilt the table per item; `FlowKeyTable` rebuilt it per keypress | fixed: items computed once per menu body; `VerbTable.verb(forKey:)` static map |
 | 2 | quality | Minor | `KeyboardShortcut(Shortcut)` trapped on a multi-character key | fixed: failable initialiser |
-| 7 | quality, spec | Important/Minor | `ARCHITECTURE.md` said 105 checks and named no next card | fixed: 126 checks; next cards named (bus poll when hidden, `Session` split) |
+| 7 | quality, spec | Important/Minor | `ARCHITECTURE.md` said 105 checks and named no next card | fixed: the real count (128 at ship); next cards named (bus poll when hidden, `Session` split) |
 | 7 | spec | Important | `apps/mac/docs/review-2026-10-31.md` changed without being declared | accepted (orchestrator, 2026-10-31): the review doc is where every wave's status lives; added to Task 7's files |
 | 5 | spec | Minor | `ColumnLayoutTests` suite not moved from `ListTests.swift`; AC13's own values and `priority: []` untested | fixed: suite moved; `theSpecsOwnBoundaries` tests 1000/800/500, a user-hidden comment column and an empty priority |
 | 3 | spec | Minor | `ClearedFlows.merge` renumbers gap-free from the newer minimum and drops newer rows with a restored id; AC10 said "add max(R.seq)" | accepted (orchestrator): AC10 amended to the implemented rule; it is what the self-test and the live check exercise |
@@ -277,8 +280,8 @@ step plus the stage-6 fix round (`80f06d6`). Everything in the spec landed; noth
 
 Gate on the final head (2026-10-31): `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build`
 exit 0 (new suites `VerbTableTests` 12, `ClearedFlowsTests` 5, `ColumnFitTests` 7, `ColumnLayoutTests`
-moved); self-test `SELFTEST PASS 126 checks` (121 + 5: the three Clear/Undo checks, the mark-colour
-scope check, the notice-lapse check); `check-layout.swift` 12 PASS / 0 other on
+moved); self-test `SELFTEST PASS 128 checks` (121 + 7: the three Clear/Undo checks, the mark-colour
+scope check, the refused-clear check, the notice-shows and timer-lapse checks); `check-layout.swift` 12 PASS / 0 other on
 `/tmp/Aitmproxy-shots-dev-w3/*-layout.json` (`/tmp/w3-check-layout.log`); `grid-lint` PASS; live
 self-test against a private `aitm` `LIVE SELFTEST PASS 22 checks` including the two Undo Clear
 checks (`/tmp/claude-501/w3/live/live-selftest.log`). Snapshots `apps`, `overview`, `edit-paused`,

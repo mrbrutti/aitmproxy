@@ -144,18 +144,14 @@ extension Session {
                                    selection: selection, focused: focused)
         restoredFlows = []
         forgetClearedFlows()
-        Task { [self] in
-            do {
-                try await actions.clear()
-                lastError = nil
-                if !dropped.rows.isEmpty { offerUndo(for: dropped) }
-            } catch {
-                lastError = "clear: \(BusService.describe(error))"
-            }
+        perform("clear") { [self] in
+            try await actions.clear()
+            if !dropped.rows.isEmpty { offerUndo(for: dropped) }
         }
     }
 
-    static let clearNoticeSeconds: Double = 8
+    /// How long Undo is offered; the self-test shortens it to prove the lapse.
+    static var clearNoticeSeconds: Double = 8
 
     private func offerUndo(for dropped: ClearedFlows) {
         clearedFlows = dropped
@@ -166,6 +162,20 @@ extension Session {
             guard !Task.isCancelled else { return }
             self?.forgetClearedFlows()
         }
+    }
+
+    /// Registers the one "Undo Clear" step on the flow list's undo manager. Any step still there
+    /// (a second Clear racing the first's round trip) is withdrawn first: one step at a time.
+    private func registerClearUndo() {
+        flowUndoManager.removeAllActions()
+        flowUndoManager.beginUndoGrouping()
+        flowUndoManager.registerUndo(withTarget: self) { session in
+            // AppKit runs undo handlers on the thread that called undo(): the responder chain
+            // and the self-test both do so on the main thread.
+            MainActor.assumeIsolated { session.undoClear() }
+        }
+        flowUndoManager.setActionName("Clear")
+        flowUndoManager.endUndoGrouping()
     }
 
     /// Releases the dropped copy, withdraws the undo step and hides the notice.

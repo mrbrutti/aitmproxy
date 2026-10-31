@@ -13,9 +13,9 @@ final class FlowKeyTable: NSTableView {
     var onEnter: (() -> Void)?
     /// The list's undo manager (Clear's step), so Edit ▸ Undo and ⌘Z reach it while the list is
     /// first responder; a text field in front keeps its own.
-    var undoManagerProvider: (() -> UndoManager?)?
+    var listUndoManager: UndoManager?
 
-    override var undoManager: UndoManager? { undoManagerProvider?() ?? super.undoManager }
+    override var undoManager: UndoManager? { listUndoManager ?? super.undoManager }
 
     override func keyDown(with event: NSEvent) {
         guard event.modifierFlags.intersection([.command, .option, .control]).isEmpty,

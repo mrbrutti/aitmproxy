@@ -88,16 +88,15 @@ import Testing
     }
 
     @Test func keysMapToVerbs() {
-        let items = VerbTable.items(for: VerbContext(row: Self.paused))
-        #expect(VerbTable.verb(forKey: "e", in: items) == .edit)
-        #expect(VerbTable.verb(forKey: "d", in: items) == .delete)
-        #expect(VerbTable.verb(forKey: "r", in: items) == .replay)
-        #expect(VerbTable.verb(forKey: "p", in: items) == .buildPoC)
-        #expect(VerbTable.verb(forKey: "m", in: items) == .mark(nil))
-        #expect(VerbTable.verb(forKey: "c", in: items) == .comment)
-        #expect(VerbTable.verb(forKey: " ", in: items) == .quickLook)
-        #expect(VerbTable.verb(forKey: "x", in: items) == nil)
-        #expect(VerbTable.verb(forKey: "i", in: items) == nil)
+        #expect(VerbTable.verb(forKey: "e") == .edit)
+        #expect(VerbTable.verb(forKey: "d") == .delete)
+        #expect(VerbTable.verb(forKey: "r") == .replay)
+        #expect(VerbTable.verb(forKey: "p") == .buildPoC)
+        #expect(VerbTable.verb(forKey: "m") == .mark(nil))
+        #expect(VerbTable.verb(forKey: "c") == .comment)
+        #expect(VerbTable.verb(forKey: " ") == .quickLook)
+        #expect(VerbTable.verb(forKey: "x") == nil)
+        #expect(VerbTable.verb(forKey: "i") == nil)
     }
 
     @Test func groupsAreOrderedAndTitlesComplete() {
@@ -114,6 +113,7 @@ import Testing
         let outOfScope = VerbContext(row: Self.outOfScope)
         #expect(FlowVerb.mark(.red).tableKey == .mark(nil))
         #expect(VerbTable.item(.mark(.red), for: outOfScope).title == "Mark")
+        #expect(VerbTable.item(.mark(.red), in: VerbTable.items(for: outOfScope)).title == "Mark")
         #expect(VerbTable.item(.mark(.red), for: outOfScope).enabled == false)
         #expect(VerbTable.item(.mark(.green), for: VerbContext(row: Self.finished)).enabled)
         #expect(VerbTable.titles(.mark(.blue)) == ["Mark"])

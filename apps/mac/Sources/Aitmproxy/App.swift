@@ -133,8 +133,8 @@ struct FlowCommands: Commands {
             let target = session.interceptTarget?.id
             let focusedItems = session.verbItems(for: focused)
             let targetItems = session.verbItems(for: target)
-            let verb: (FlowVerb, FlowID?, [VerbItem]) -> VerbButton = { verb, id, items in
-                VerbButton(item: VerbTable.item(verb, for: nil), items: items, verb: verb) { if let id { session.perform(verb, on: id) } }
+            let verb: (FlowVerb, FlowID?, [VerbItem]) -> VerbButton = { v, id, items in
+                VerbButton(item: VerbTable.item(v, in: items)) { if let id { session.perform(v, on: id) } }
             }
             Button(session.interceptArmed ? "Disarm Intercept" : "Arm Intercept") {
                 session.arm(!session.interceptArmed)
@@ -158,7 +158,7 @@ struct FlowCommands: Commands {
             verb(.delete, focused, focusedItems)
             verb(.buildPoC, focused, focusedItems)
             Divider()
-            let mark = focusedItems.first { $0.verb == .mark(nil) } ?? VerbTable.item(.mark(nil), for: nil)
+            let mark = VerbTable.item(.mark(nil), in: focusedItems)
             Menu(mark.title) {
                 ForEach(MarkColor.allCases, id: \.self) { color in
                     Button(color.title) { if let focused { session.perform(.mark(color), on: focused) } }
@@ -282,20 +282,10 @@ struct FlowCommands: Commands {
 }
 
 /// One Flow-menu item for a row verb: title, key equivalent and enabled state from `VerbTable`,
-/// so the menu bar can never drift from the row menu or the intercept bar. `items` is the
-/// table for the row the verb acts on, computed once per menu; `item` the default row.
+/// so the menu bar can never drift from the row menu or the intercept bar.
 private struct VerbButton: View {
-    var item: VerbItem
-    let items: [VerbItem]
-    let verb: FlowVerb
+    let item: VerbItem
     let action: () -> Void
-
-    init(item: VerbItem, items: [VerbItem], verb: FlowVerb, action: @escaping () -> Void) {
-        self.item = items.first { $0.verb == verb.tableKey } ?? item
-        self.items = items
-        self.verb = verb
-        self.action = action
-    }
 
     var body: some View {
         Button(item.title, action: action)

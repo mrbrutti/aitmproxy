@@ -38,9 +38,10 @@ struct FlowTableView: NSViewRepresentable {
         table.onVerb = { [weak coordinator] verb in coordinator?.perform(verb) }
         table.onToggleIntercept = { [weak coordinator] in coordinator?.parent.onToggleIntercept() }
         table.onCompose = { [weak coordinator] in coordinator?.parent.onCompose() }
-        table.undoManagerProvider = { [session] in session.flowUndoManager }
+        table.listUndoManager = session.flowUndoManager
         table.menu = coordinator.makeRowMenu()
         table.rowHeight = density.rowHeight
+        // Zero spacing: the column fit below sums widths alone.
         table.intercellSpacing = .zero
         table.style = .plain
         table.usesAlternatingRowBackgroundColors = false
@@ -299,9 +300,7 @@ struct FlowTableView: NSViewRepresentable {
                 guard let column = FlowColumn(rawValue: c.identifier.rawValue), column != .url else { return nil }
                 return ColumnFit.Column(id: column.rawValue, width: c.width, userHidden: userHidden.contains(column))
             }
-            // The URL minimum carries the intercell spacing the fit below subtracts, so the two agree.
-            let urlSpacing = CGFloat(fixed.count + 1) * table.intercellSpacing.width
-            let hide = ColumnFit.autoHidden(available: clip.bounds.width, columns: fixed, flexibleMin: url.minWidth + urlSpacing,
+            let hide = ColumnFit.autoHidden(available: clip.bounds.width, columns: fixed, flexibleMin: url.minWidth,
                                             priority: FlowColumn.autoHidePriority.map(\.rawValue))
             autoHidden = Set(hide.compactMap(FlowColumn.init(rawValue:)))
             for c in table.tableColumns {

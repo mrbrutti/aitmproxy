@@ -151,6 +151,7 @@ extension SelfTest {
                 check("flow.clear empties the list and offers Undo Clear (\(cleared.count) flows)",
                       session.rows.isEmpty && !cleared.isEmpty && session.flowUndoManager.canUndo, session.lastError ?? "")
                 session.flowUndoManager.undo()
+                // Four of BusService's 500 ms polls.
                 try? await Task.sleep(for: .seconds(2))
                 let present = cleared.filter { id in session.rows.contains { $0.id == id } }
                 check("Undo Clear puts the \(cleared.count) flows back and they survive four polls (\(present.count) present)",

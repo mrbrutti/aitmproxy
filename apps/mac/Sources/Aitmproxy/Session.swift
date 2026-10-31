@@ -465,20 +465,6 @@ final class Session {
         ensureDetail(for: id)
     }
 
-    /// Registers the one "Undo Clear" step on the flow list's undo manager; an earlier step is
-    /// withdrawn first, so the list offers one Clear step at a time.
-    func registerClearUndo() {
-        flowUndoManager.removeAllActions()
-        flowUndoManager.beginUndoGrouping()
-        flowUndoManager.registerUndo(withTarget: self) { session in
-            // AppKit runs undo handlers on the thread that called undo(): the responder chain
-            // and the self-test both do so on the main thread.
-            MainActor.assumeIsolated { session.undoClear() }
-        }
-        flowUndoManager.setActionName("Clear")
-        flowUndoManager.endUndoGrouping()
-    }
-
     /// Records the role the bus reported for this connection and flags a mismatch
     /// against the operator's Expected-role setting (client-side only, never sent
     /// to the server). Called by the bus service on connect; `nil` on disconnect.
