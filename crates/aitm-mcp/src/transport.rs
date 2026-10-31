@@ -136,15 +136,21 @@ where
     Ok(())
 }
 
-/// The `initialize.clientInfo.name`, if `message` is an `initialize` request that
-/// carries a non-empty name; `None` otherwise.
+/// The label a client declares in `initialize.clientInfo.name`, if `message` is an
+/// `initialize` request that carries one; `None` otherwise.
+///
+/// The name is client-controlled, so it passes through
+/// [`aitm_core::declared_client_label`]: bounded, stripped of control and bidi
+/// characters, credential-scrubbed, and a server-minted name such as `web-bridge`
+/// is rewritten to `web-bridge (declared)` so a client cannot pose as it. A name
+/// that is empty after that yields `None`.
 fn client_label_from_initialize(message: &str) -> Option<String> {
     let v: JsonValue = serde_json::from_str(message).ok()?;
     if v.get("method").and_then(JsonValue::as_str)? != "initialize" {
         return None;
     }
     let name = v.get("params")?.get("clientInfo")?.get("name")?.as_str()?;
-    (!name.is_empty()).then(|| name.to_string())
+    aitm_core::declared_client_label(name)
 }
 
 /// Serve over this process's stdin/stdout until stdin closes. The stdio
@@ -415,6 +421,46 @@ mod tests {
         // Nothing to assert beyond: there is no path, so nothing is written or
         // leaked; dropping must not panic.
         drop(listener);
+    }
+
+    /// An `initialize` request whose `clientInfo.name` is `name`.
+    fn initialize_with_name(name: &str) -> String {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "clientInfo": { "name": name } },
+        })
+        .to_string()
+    }
+
+    /// AC14: the label captured from `initialize` is bounded (a 10 MiB name
+    /// becomes 64 chars), a client cannot claim the server-minted `web-bridge`
+    /// name, an ordinary name is kept, and an empty or absent name is `None`.
+    #[test]
+    fn client_label_from_initialize_is_bounded_and_unforgeable() {
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name(&"A".repeat(10 << 20))),
+            Some("A".repeat(64))
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("web-bridge")),
+            Some("web-bridge (declared)".to_string())
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("aitm-mac")),
+            Some("aitm-mac".to_string())
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("")),
+            None
+        );
+        assert_eq!(
+            client_label_from_initialize(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+            ),
+            None
+        );
     }
 
     #[test]
