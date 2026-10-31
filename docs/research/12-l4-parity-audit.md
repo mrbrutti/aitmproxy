@@ -72,14 +72,16 @@ See "Live capture" below.
 Legend: **live** = proven with real captured packets on this rig (none in this audit);
 **blocked** = needs privileged capture the product does not yet obtain itself; **live-unpriv** =
 proven on the real bus but only the honest `L4Unavailable` path could be exercised;
-**fixture-only** = exists only on sample data; **missing** = no path to the verb;
+**fixture-only** = at audit time it existed only on sample data; Matt's ruling the same evening
+is that no fixture can stand in and the fixture modes of all three frontends are being deleted,
+so every **fixture-only** cell reads as **missing live**; **missing** = no path to the verb;
 **n/a (platform)** = Linux-only verb, cannot be exercised on macOS; **wrong** = reaches
 the verb with arguments the core rejects.
 
 | Capability | MCP tools (agent) | CLI | TUI | Web UI | macOS app |
 |---|---|---|---|---|---|
 | List L4 flows | live-unpriv (`l4.flow.list` → `[]`); **blocked** (no privileged capture) | one-shot `aitm l4.flow.list` runs its own in-process core, never the running one: **missing** against a live core | polls `l4.flow.list`+`get` (`bus.rs`); **blocked** | polls every 1.5 s (`store.ts`); **blocked** | **fixture-only**: no live caller of `l4.flow.*` |
-| Kind badge / TCP-UDP sub-label / chips | n/a | n/a | L4 badge + sub-label in `ui/flows.rs`; **no L4 chip**, help lists no L4 keys, filter hint omits `~l4 ~tcp ~udp` (filter accepts `~tcp`, seen) | L4 row component; **no L4/TCP/UDP quick-filter chip** (seen: All HTTP HTTPS WebSocket h1 h2 JSON …) | badge/sub-label in `FlowCellView`; **no L4/TCP/UDP chips** on main (seen) |
+| Kind badge / TCP-UDP sub-label / chips | n/a | n/a | L4 badge + sub-label in `ui/flows.rs`; **no L4 chip**, help lists no L4 keys, filter hint omits `~l4 ~tcp ~udp` (filter accepts `~tcp`, seen) | L4 row component; **no L4/TCP/UDP quick-filter chip** (seen: All HTTP HTTPS WebSocket h1 h2 JSON …) | badge/sub-label in `FlowCellView`; no chips at 1854fae (seen); `TCP UDP L4` chips landed in PR #196 (5eac2a5); seen live on a dev bundle rebuilt at 5eac2a5 against the rig core (chips present, 0 rows); they filter `row.l4?.proto`, which no live row ever carries while D1 stands |
 | Inspect packets (layers, hex, timeline) | `l4.flow.get` returns `layers`, `length`, `dir`, `injected` only: no bytes, time, addresses | missing | text layer tree; no hex (bus has no bytes) | LayerTree, no hex | fixture-only |
 | L4 scope view | `l4.scope.list` live | `aitm l4.scope.list` in-process only | **missing** (scope panel is HTTP only, seen) | read-only list on the L4 page (seen) | fixture-only |
 | L4 scope add (confirm) | operator refused unless Widen gate on (seen) | n/a | missing (`:scope add` → HTTP `scope.add`) | missing (run record admits it) | missing |
@@ -144,10 +146,10 @@ From `docs/superpowers/specs/2026-10-28-aitmproxy-l4-operator-surfaces-design.md
 | # | Severity | Surface | Defect | Evidence |
 |---|---|---|---|---|
 | D0 | Critical | product | No self-obtained capture privilege on any OS: the core only probes `/dev/bpf*` / `CAP_NET_RAW` and tells the operator to "install ChmodBPF or run with privilege"; no frontend offers an "Allow packet capture" action, so L4 is unreachable without a command line | `module.rs` `probe()`; live `L4 unavailable: no read+write access to any /dev/bpf* device`; `/dev/bpf*` 0600 root measured 16:25 PDT |
-| D1 | Critical | macOS | No live L4 rows: `l4.flow.list/get` never called outside fixtures; the whole L4 surface is sample data | `Session.swift:350-390` (fixture runner), `BusService.swift:144-148`; live dev bundle shows 0 rows against an `l4.enabled` core |
+| D1 | Critical | macOS | No live L4 rows: `l4.flow.list/get` never called outside fixtures; the whole L4 surface is sample data (the fixture rows are being deleted; what remains is "missing live") | `Session.swift:350-390` (fixture runner), `BusService.swift:144-148`; live dev bundle shows 0 rows against an `l4.enabled` core |
 | D2 | Critical | TUI, macOS | Forward / Drop send the flow id; core wants the parked-packet id → every verdict fails against a real intercept | `app.rs` `l4_intercept_verb` `json!({"id": flow.id})`; `L4Inspector.swift` `interceptVerb`; `intercept.rs` `ParamDef id: "The parked packet id (from l4.intercept.list)"` |
 | D3 | Important | web | Filtered capture sends `filter`, rejected `unknown param`; no Stop capture control | live `-32602`; `CaptureControls.tsx` |
-| D4 | Important | macOS | Craft sample spec uses `sport/dport` and `raw: {data}`; the core rejects it | live `invalid PacketSpec: invalid type: map, expected a sequence` |
+| D4 | Important | macOS | Craft editor's starting text (`L4Inspector.sampleSpec`, not fixture data) uses `sport/dport` and `raw: {data}`; the core rejects it | live `invalid PacketSpec: invalid type: map, expected a sequence` |
 | D5 | Important | core + all UIs | Operator cannot add L4 scope without flipping the agent Widen gate; no UI has L4 scope add; TUI scope panel has no L4 view | live refusal; `guard.rs add_runtime_scope`; TUI screen |
 | D6 | Important | all UIs | Intercept bar drawn where the verb is unavailable and Mutate is unreachable (web stub, TUI/mac none) | `L4InspectorPanel.tsx:92`; `app.rs:1598` |
 | D7 | Important | core | `l4.flow.get` lacks bytes, timestamps, src/dst: no hex, no timeline, no target column from data | `commands/flow.rs:170-229` |
