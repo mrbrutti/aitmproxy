@@ -33,7 +33,7 @@ use aitm_poc::{
     HttpStep, Poc, PocBuilder, PocInfo, PocSpec, Severity, StdPocBuilder, Step, Variable,
 };
 
-use crate::checks::{CheckDefinition, Payload};
+use crate::checks::{CheckDefinition, Payload, CLASS_OPEN_REDIRECT, CLASS_REFLECTED_XSS};
 use crate::crawl::strip_userinfo;
 use crate::discover::{is_secret_name, InjectionPoint, EXTRA_SECRET_NEEDLES};
 
@@ -62,17 +62,6 @@ const CATCH_ALL_VAR: &str = "redacted";
 /// that was encoded more than once (`next=%252Fcb%253Fsid%253D…`).
 const MAX_DECODE_PASSES: usize = 3;
 
-/// Severity assigned to a built PoC, keyed by class. A class with no mapping
-/// here (a future `CheckDefinition::for_class` addition) defaults to `Medium`
-/// rather than silently under- or over-stating it.
-fn severity_for(class: &str) -> Severity {
-    match class {
-        "reflected-xss" => Severity::High,
-        "open-redirect" => Severity::Medium,
-        _ => Severity::Medium,
-    }
-}
-
 /// The first `max` characters of `s`.
 fn cap_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
@@ -96,6 +85,18 @@ fn body_text(body: &Body) -> Option<String> {
         Body::Bytes(bytes) if !bytes.is_empty() => {
             Some(String::from_utf8_lossy(bytes).into_owned())
         }
+        _ => None,
+    }
+}
+
+/// The severity a built PoC carries for `class`: reflected-XSS is `Medium`,
+/// open-redirect is `Low`. `None` for a class this mapping does not cover, so
+/// [`build_poc`] chooses the default instead of this function inventing one; a
+/// test pins that every `CheckDefinition::registered_classes` entry is covered.
+fn severity_for(class: &str) -> Option<Severity> {
+    match class {
+        CLASS_REFLECTED_XSS => Some(Severity::Medium),
+        CLASS_OPEN_REDIRECT => Some(Severity::Low),
         _ => None,
     }
 }
@@ -131,7 +132,9 @@ pub fn build_poc(
     let spec = PocSpec {
         info: PocInfo {
             name: format!("{} via {point_name}", def.class),
-            severity: severity_for(def.class),
+            // An unmapped class (none exists today: a test pins every
+            // registered class) is `Info` rather than an invented severity.
+            severity: severity_for(def.class).unwrap_or(Severity::Info),
             references: Vec::new(),
             tags: vec![def.class.to_string()],
             cwe: None,
@@ -800,6 +803,60 @@ mod tests {
         let json = serde_json::to_string(&poc).expect("poc serializes");
         let back: Poc = serde_json::from_str(&json).expect("poc deserializes");
         assert_eq!(back.success, poc.success);
+    }
+
+    /// A built PoC carries the pinned severity for its class: reflected-XSS is
+    /// `Medium`, open-redirect is `Low`, and a class the mapping does not know
+    /// falls back to `Info` — never a silent over-statement.
+    #[test]
+    fn build_poc_severity_follows_the_class_mapping() {
+        let flow = flow_with_query("/search?q=hello");
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let xss = CheckDefinition::reflected_xss();
+        let poc = build_poc(&flow, &xss, &q, &xss.payloads[0]).expect("xss poc builds");
+        assert_eq!(poc.info.severity, Severity::Medium);
+
+        let redirect_flow = flow_with_query("/go?next=http%3A%2F%2Fapp.test%2F");
+        let next = point(
+            &redirect_flow,
+            Location::Redirect,
+            "next",
+            "http://app.test/",
+        );
+        let open = CheckDefinition::open_redirect();
+        let poc = build_poc(&redirect_flow, &open, &next, &open.payloads[0])
+            .expect("open-redirect poc builds");
+        assert_eq!(poc.info.severity, Severity::Low);
+
+        // A hand-built definition for a class no mapping covers.
+        let unmapped = CheckDefinition {
+            class: "not-a-registered-class",
+            locations: &[Location::Query],
+            payloads: vec![Payload {
+                value: "aitm-unmapped".to_string(),
+                marker: None,
+            }],
+            mode: crate::checks::AttackMode::BatteringRam,
+        };
+        let poc = build_poc(&flow, &unmapped, &q, &unmapped.payloads[0])
+            .expect("unmapped-class poc builds");
+        assert_eq!(poc.info.severity, Severity::Info);
+    }
+
+    /// Every class `checks::registered_classes` lists has a severity, so a new
+    /// class cannot ship and silently build as `Info`.
+    #[test]
+    fn severity_mapping_covers_every_registered_class() {
+        for class in CheckDefinition::registered_classes() {
+            assert!(
+                severity_for(class).is_some(),
+                "`{class}` is registered but has no severity mapping"
+            );
+        }
+        assert_eq!(severity_for("reflected-xss"), Some(Severity::Medium));
+        assert_eq!(severity_for("open-redirect"), Some(Severity::Low));
+        assert_eq!(severity_for("nope"), None);
     }
 
     #[test]
