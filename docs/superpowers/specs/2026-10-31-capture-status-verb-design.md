@@ -60,8 +60,10 @@ verb is separate and that field is untouched.
 ## Non-goals
 
 - No UI change: nothing under `apps/mac/Sources/Aitmproxy/`, nothing in
-  `apps/web`, nothing in `crates/aitm-tui`. The Kit decoder is the only Swift
-  change. The Kit's `CaptureCapability.swift` and `CaptureAdvice.swift` are not
+  `apps/web`, nothing in `crates/aitm-tui` beyond the `CORE_TOOLS` entry, the
+  bus-fixture entry and the `tester_shell` count pins that the tool-set
+  contract requires (Constraints; orchestrator amendment 2026-10-31 after the
+  spec reviewer's finding). The Kit decoder is the only Swift change. The Kit's `CaptureCapability.swift` and `CaptureAdvice.swift` are not
   modified; the core's facts are not folded into the app's enum here (the UI
   session does that).
 - No new `unsafe`, and no `kSecCodeInfoTeamIdentifier`. The safe
