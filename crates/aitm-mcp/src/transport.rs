@@ -518,4 +518,117 @@ mod tests {
         );
         assert_eq!(classify_token(r#"{"token":"no"}"#, "ag", Some("op")), None);
     }
+
+    // ---- Stage 5 tester additions: what a hostile client can put in `initialize`. ----
+
+    /// A message with `method` and `params`, as JSON text.
+    fn message(method: serde_json::Value, params: serde_json::Value) -> String {
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            .to_string()
+    }
+
+    #[test]
+    fn client_label_from_initialize_gives_no_label_for_malformed_messages() {
+        use serde_json::json;
+        let deep_array = "[".repeat(200_000);
+        let deep_params = format!(r#"{{"method":"initialize","params":{deep_array}"#);
+        let mut rows: Vec<(String, String)> = vec![
+            ("empty".into(), String::new()),
+            ("blank".into(), "  \n ".into()),
+            ("not JSON".into(), "not json".into()),
+            (
+                "truncated object".into(),
+                r#"{"method":"initialize""#.into(),
+            ),
+            ("null".into(), "null".into()),
+            ("array".into(), "[]".into()),
+            ("number".into(), "42".into()),
+            ("string".into(), r#""initialize""#.into()),
+            ("200k-deep array".into(), deep_array),
+            ("200k-deep params".into(), deep_params),
+            (
+                "no method".into(),
+                json!({"params": {"clientInfo": {"name": "x"}}}).to_string(),
+            ),
+        ];
+        // The method must be exactly the string `initialize`.
+        for method in [
+            json!("tools/call"),
+            json!("Initialize"),
+            json!(" initialize"),
+            json!(1),
+            json!(null),
+            json!(["initialize"]),
+        ] {
+            rows.push((
+                format!("method {method}"),
+                message(method, json!({"clientInfo": {"name": "x"}})),
+            ));
+        }
+        // `params.clientInfo.name` must be a string.
+        for (what, params) in [
+            ("no params", json!(null)),
+            ("array params", json!([{"clientInfo": {"name": "x"}}])),
+            ("string params", json!("clientInfo")),
+            ("no clientInfo", json!({})),
+            ("null clientInfo", json!({"clientInfo": null})),
+            ("string clientInfo", json!({"clientInfo": "x"})),
+            ("array clientInfo", json!({"clientInfo": ["x"]})),
+            ("no name", json!({"clientInfo": {}})),
+            ("null name", json!({"clientInfo": {"name": null}})),
+            ("number name", json!({"clientInfo": {"name": 7}})),
+            ("bool name", json!({"clientInfo": {"name": true}})),
+            ("array name", json!({"clientInfo": {"name": ["x"]}})),
+            ("object name", json!({"clientInfo": {"name": {"a": "x"}}})),
+        ] {
+            rows.push((what.into(), message(json!("initialize"), params)));
+        }
+        let leaked: Vec<&str> = rows
+            .iter()
+            .filter(|(_, text)| client_label_from_initialize(text).is_some())
+            .map(|(what, _)| what.as_str())
+            .collect();
+        assert!(leaked.is_empty(), "these gave a label: {leaked:?}");
+    }
+
+    #[test]
+    fn client_label_from_initialize_cleans_a_hostile_name() {
+        // Blank, invisible, and control-only names leave nothing to label with.
+        for name in [
+            "   ".to_string(),
+            "\t\n".to_string(),
+            "\u{200B}\u{FEFF}\u{202E}".to_string(),
+            "\u{0}\u{7}\u{1b}".to_string(),
+            "\u{200B}".repeat(1 << 20),
+            "\u{0}".repeat(1 << 18),
+        ] {
+            assert_eq!(
+                client_label_from_initialize(&initialize_with_name(&name)),
+                None,
+                "a name of {} chars made a label",
+                name.chars().count()
+            );
+        }
+        // Control characters go, a credential is masked, blanks are trimmed.
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("agent\u{0}-x token=abc123zz")),
+            Some("agent-x token=[redacted]".to_string())
+        );
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("  aitm-tui  ")),
+            Some("aitm-tui".to_string())
+        );
+        // Dressing the reserved name up does not get it past the guard.
+        assert_eq!(
+            client_label_from_initialize(&initialize_with_name("WEB\u{200B} bridge")),
+            Some("WEB bridge (declared)".to_string())
+        );
+        // JSON allows a name twice; the parser keeps the last, and the guard sees it.
+        assert_eq!(
+            client_label_from_initialize(
+                r#"{"method":"initialize","params":{"clientInfo":{"name":"a","name":"web-bridge"}}}"#
+            ),
+            Some("web-bridge (declared)".to_string())
+        );
+    }
 }

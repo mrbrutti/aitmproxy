@@ -506,3 +506,179 @@ fn args_summary_hides_unframed_credentials() {
         entry.args_summary
     );
 }
+
+// ---------------------------------------------- stage 5 tester additions
+//
+// Each test below kills a mutant of the entry-size caps, the label helper, or the
+// per-call bookkeeping that the tests above let survive.
+
+/// The `AuditResult::Error` text the ring keeps for a `demo.errecho` call whose
+/// reason is `reason`; it checks the call failed and was audited exactly once.
+fn audited_reason(reason: &str) -> String {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let conn = ConnCtx::new(Frontend::Mcp);
+    let reply = call(&srv, &conn, "demo.errecho", json!({ "reason": reason }));
+    assert!(is_error(&reply), "demo.errecho always fails");
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1, "one call, one entry");
+    match &entries[0].result {
+        AuditResult::Error(r) => r.clone(),
+        other => panic!("expected an error result, got {other:?}"),
+    }
+}
+
+/// The error reason is recorded whole up to the cap and marked only past it. The
+/// cap is the full 1024 bytes (not the 512 of `args_summary`).
+#[test]
+fn an_error_reason_is_kept_whole_up_to_the_cap_and_marked_beyond_it() {
+    const CAP: usize = DEFAULT_RESULT_REASON_CAP;
+    assert_eq!(CAP, 1024);
+    assert_eq!(audited_reason("x"), "x", "a short reason is untouched");
+
+    let at_cap = "y".repeat(CAP);
+    let kept = audited_reason(&at_cap);
+    assert_eq!(kept.len(), CAP, "a reason of exactly the cap is not cut");
+    assert!(!kept.ends_with('…'), "and carries no truncation marker");
+    assert_eq!(kept, at_cap);
+
+    let one_over = "y".repeat(CAP + 1);
+    assert_eq!(audited_reason(&one_over), format!("{}…", "y".repeat(CAP)));
+
+    let huge = audited_reason(&"z".repeat(1 << 20));
+    assert_eq!(
+        huge.len(),
+        CAP + '…'.len_utf8(),
+        "cut at the cap, then marked"
+    );
+    assert!(huge.starts_with("zzzz") && huge.ends_with('…'));
+}
+
+/// The cut backs off to a char boundary, so a multi-byte character straddling the
+/// cap is dropped whole rather than split (which would panic) or kept past the cap.
+#[test]
+fn a_multibyte_error_reason_is_cut_on_a_char_boundary() {
+    // `x` then two-byte chars: the boundaries are odd, so byte 1024 is mid-char.
+    let two_byte = format!("x{}", "é".repeat(2000));
+    let kept = audited_reason(&two_byte);
+    assert!(kept.starts_with("xéé") && kept.ends_with('…'));
+    assert_eq!(kept.len(), 1023 + '…'.len_utf8());
+
+    // `xx` then four-byte chars: the boundaries are 2 + 4k, so 1024 is mid-char.
+    let four_byte = format!("xx{}", "😀".repeat(1000));
+    let kept = audited_reason(&four_byte);
+    assert!(kept.starts_with("xx😀") && kept.ends_with('…'));
+    assert_eq!(kept.len(), 1022 + '…'.len_utf8());
+}
+
+/// `args_summary` has its own, smaller cap (512 bytes) and the same marker rule.
+#[test]
+fn an_oversized_argument_is_capped_in_args_summary() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let conn = ConnCtx::new(Frontend::Mcp);
+    let summaries = |note: &str| -> String {
+        let reply = call(&srv, &conn, "demo.echo", json!({ "note": note }));
+        assert!(!is_error(&reply), "demo.echo runs: {reply}");
+        ring.recent(None, Some(1))
+            .pop()
+            .expect("the call was audited")
+            .args_summary
+    };
+
+    assert_eq!(
+        summaries("hi"),
+        r#"{"note":"hi"}"#,
+        "short args are untouched"
+    );
+
+    let long = summaries(&"n".repeat(100_000));
+    assert_eq!(
+        long.len(),
+        aitm_core::DEFAULT_ARGS_SUMMARY_CAP + '…'.len_utf8()
+    );
+    assert!(long.starts_with(r#"{"note":"nnnn"#) && long.ends_with('…'));
+
+    // `{"note":"` is 9 bytes, so the two-byte chars start at odd offsets and byte
+    // 512 is mid-char: the cut backs off by one.
+    let multibyte = summaries(&"é".repeat(5000));
+    assert!(multibyte.ends_with('…'));
+    assert_eq!(multibyte.len(), 511 + '…'.len_utf8());
+}
+
+/// The label is sanitised where the server consumes it, whatever set it: control
+/// and bidi characters are dropped and a credential is masked, in the host a
+/// command runs under and in the ring entry alike (not merely cut to 64 chars).
+#[test]
+fn a_directly_assigned_label_is_stripped_and_scrubbed_at_the_server() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let conn = labelled("agent\u{202E}-x\n token=abc123zz");
+
+    let reply = call(&srv, &conn, "demo.client", json!({}));
+    let host_label = reply["result"]["structuredContent"]
+        .as_str()
+        .expect("demo.client returns its label as a string");
+    assert_eq!(host_label, "agent-x token=[redacted]", "the host's label");
+
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].client_label.as_deref(),
+        Some("agent-x token=[redacted]"),
+        "the ring entry's label"
+    );
+
+    // A label with nothing visible left is no label: the host sees `<none>` and the
+    // entry carries `None`.
+    let blank = labelled("\u{200B}\u{0}  ");
+    let reply = call(&srv, &blank, "demo.client", json!({}));
+    assert_eq!(reply["result"]["structuredContent"], json!("<none>"));
+    assert_eq!(ring.recent(None, Some(1))[0].client_label, None);
+}
+
+/// Calls from several threads at once are each audited exactly once, in the lane
+/// they belong in, and no source loses or gains an entry.
+#[test]
+fn concurrent_calls_are_each_audited_exactly_once() {
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 100;
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    std::thread::scope(|scope| {
+        for t in 0..THREADS {
+            let srv = &srv;
+            scope.spawn(move || {
+                let conn = labelled(&format!("worker-{t}"));
+                for _ in 0..PER_THREAD {
+                    let reply = call(srv, &conn, "demo.read", json!({}));
+                    assert!(!is_error(&reply), "a Read runs: {reply}");
+                    let reply = call(srv, &conn, "demo.sensitive", json!({}));
+                    assert!(is_error(&reply), "a Sensitive call is refused");
+                }
+            });
+        }
+    });
+    // 800 of each: below both lane capacities, so nothing was evicted.
+    assert_eq!(
+        (ring.evidence_len(), ring.routine_len()),
+        (THREADS * PER_THREAD, THREADS * PER_THREAD)
+    );
+    let entries = ring.recent(None, None);
+    for t in 0..THREADS {
+        let label = format!("worker-{t}");
+        let reads = entries
+            .iter()
+            .filter(|e| {
+                e.client_label.as_deref() == Some(label.as_str()) && e.command == "demo.read"
+            })
+            .count();
+        let refusals = entries
+            .iter()
+            .filter(|e| {
+                e.client_label.as_deref() == Some(label.as_str()) && e.command == "demo.sensitive"
+            })
+            .count();
+        assert_eq!((reads, refusals), (PER_THREAD, PER_THREAD), "{label}");
+    }
+}

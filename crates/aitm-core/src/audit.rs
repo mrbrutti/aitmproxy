@@ -1077,4 +1077,371 @@ mod tests {
         assert_eq!(flood.len(), 67);
         assert_eq!(flood.last().copied(), Some("x199"));
     }
+
+    // ---- Stage 5 tester additions: each one kills a mutant of the ring or the
+    // label functions that the tests above let survive. ----
+
+    /// One entry from each of `MAX_AUDIT_SOURCES` `mcp` sources (`m0`..`m31`, the
+    /// label doubling as the command), so the evidence lane's source table is full.
+    fn fill_source_table(ring: &AuditRing) {
+        for i in 0..MAX_AUDIT_SOURCES {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some(&format!("m{i}")), &format!("m{i}")),
+            );
+        }
+    }
+
+    #[test]
+    fn a_tracked_source_keeps_its_own_bucket_once_the_table_is_full() {
+        let ring = AuditRing::with_lane_capacities(100, 1);
+        fill_source_table(&ring);
+        // `m31` already holds a slot, so its later entries stay in its own bucket
+        // even though the table is now full.
+        for n in 0..3 {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some("m31"), &format!("late{n}")),
+            );
+        }
+        // A flood of fresh labels shares the overflow bucket and is evicted from it.
+        for i in 0..500 {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some(&format!("x{i}")), "x"),
+            );
+        }
+        assert_eq!(ring.evidence_len(), 100);
+        let kept = ring.recent(None, None);
+        let m31: Vec<&str> = kept
+            .iter()
+            .filter(|e| e.client_label.as_deref() == Some("m31"))
+            .map(|e| e.command.as_str())
+            .collect();
+        assert_eq!(m31, ["m31", "late0", "late1", "late2"]);
+    }
+
+    #[test]
+    fn a_slot_freed_by_eviction_goes_to_the_next_new_source() {
+        // The lane is exactly full of 32 singleton sources.
+        let ring = AuditRing::with_lane_capacities(MAX_AUDIT_SOURCES, 1);
+        fill_source_table(&ring);
+        // `late1` finds the table full and shares the overflow bucket; the lane is
+        // now over capacity and the tie evicts the oldest singleton, `m0`, which
+        // frees its slot.
+        ring.append_in(
+            AuditLane::Evidence,
+            sourced(Frontend::Mcp, Some("late1"), "late1"),
+        );
+        // `late2` must take that free slot as its own bucket. Then every bucket is
+        // a singleton again and the tie evicts `m1`; had `late2` joined `late1` in
+        // the overflow bucket, that two-entry bucket would lose `late1` instead.
+        ring.append_in(
+            AuditLane::Evidence,
+            sourced(Frontend::Mcp, Some("late2"), "late2"),
+        );
+        let mut want: Vec<String> = (2..MAX_AUDIT_SOURCES).map(|i| format!("m{i}")).collect();
+        want.push("late1".to_string());
+        want.push("late2".to_string());
+        let kept: Vec<String> = ring
+            .recent(None, None)
+            .into_iter()
+            .map(|e| e.command)
+            .collect();
+        assert_eq!(kept, want);
+    }
+
+    #[test]
+    fn the_thirty_third_source_shares_its_origins_overflow_bucket() {
+        let ring = AuditRing::with_lane_capacities(100, 1);
+        fill_source_table(&ring);
+        // The 33rd source finds no slot: it shares the `mcp` overflow bucket with
+        // whatever floods in after it, and is flushed with them.
+        ring.append_in(
+            AuditLane::Evidence,
+            sourced(Frontend::Mcp, Some("s32"), "s32"),
+        );
+        for i in 0..200 {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some(&format!("x{i}")), &format!("x{i}")),
+            );
+        }
+        let kept = ring.recent(None, None);
+        assert_eq!(ring.evidence_len(), 100);
+        assert!(
+            kept.iter().all(|e| e.command != "s32"),
+            "the 33rd source got its own slot"
+        );
+        let holders = kept.iter().filter(|e| e.command.starts_with('m')).count();
+        assert_eq!(holders, MAX_AUDIT_SOURCES, "a slot holder was flushed");
+        let flood = kept.iter().filter(|e| e.command.starts_with('x')).count();
+        assert_eq!(flood, 100 - MAX_AUDIT_SOURCES);
+        assert_eq!(kept.last().map(|e| e.command.as_str()), Some("x199"));
+    }
+
+    #[test]
+    fn the_same_label_under_two_origins_is_two_sources() {
+        let ring = AuditRing::with_lane_capacities(8, 1);
+        for name in ["m1", "m2", "m3"] {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some("ui"), name),
+            );
+        }
+        for i in 1..=100 {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Operator, Some("ui"), &format!("o{i}")),
+            );
+        }
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["m1", "m2", "m3", "o96", "o97", "o98", "o99", "o100"]
+        );
+    }
+
+    #[test]
+    fn a_zero_capacity_ring_still_keeps_the_newest_entry_of_each_lane() {
+        for ring in [AuditRing::new(0), AuditRing::with_lane_capacities(0, 0)] {
+            ring.append_in(AuditLane::Evidence, entry("e1", AuditResult::Ok));
+            ring.append_in(AuditLane::Evidence, entry("e2", AuditResult::Ok));
+            ring.append_in(AuditLane::Routine, entry("r1", AuditResult::Ok));
+            ring.append_in(AuditLane::Routine, entry("r2", AuditResult::Ok));
+            assert_eq!((ring.evidence_len(), ring.routine_len()), (1, 1));
+            assert_eq!(commands(&ring.recent(None, None)), ["e2", "r2"]);
+        }
+    }
+
+    #[test]
+    fn new_gives_the_routine_lane_half_the_evidence_capacity_rounded_down() {
+        // (evidence capacity asked for, routine capacity expected). Zero and one
+        // are clamped to one lane slot each.
+        for (capacity, want_routine) in [(0, 1), (1, 1), (2, 1), (3, 1), (5, 2), (7, 3), (100, 50)]
+        {
+            let ring = AuditRing::new(capacity);
+            for i in 0..capacity + 10 {
+                ring.append_in(
+                    AuditLane::Evidence,
+                    entry(&format!("e{i}"), AuditResult::Ok),
+                );
+                ring.append_in(AuditLane::Routine, entry(&format!("r{i}"), AuditResult::Ok));
+            }
+            assert_eq!(
+                (ring.evidence_len(), ring.routine_len()),
+                (capacity.max(1), want_routine),
+                "AuditRing::new({capacity})"
+            );
+        }
+        // The default ring: 4096 evidence entries, 2048 routine entries.
+        assert_eq!(DEFAULT_ROUTINE_AUDIT_CAPACITY, 2048);
+        let ring = AuditRing::default();
+        for i in 0..DEFAULT_AUDIT_CAPACITY + 904 {
+            ring.append_in(
+                AuditLane::Evidence,
+                entry(&format!("e{i}"), AuditResult::Ok),
+            );
+            ring.append_in(AuditLane::Routine, entry(&format!("r{i}"), AuditResult::Ok));
+        }
+        assert_eq!(
+            (ring.evidence_len(), ring.routine_len()),
+            (DEFAULT_AUDIT_CAPACITY, DEFAULT_ROUTINE_AUDIT_CAPACITY)
+        );
+    }
+
+    #[test]
+    fn a_poisoned_lock_does_not_brick_the_ring() {
+        let ring = AuditRing::with_lane_capacities(4, 2);
+        ring.append(entry("before", AuditResult::Ok));
+        // A thread that panics while it holds the ring's lock poisons the mutex.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = ring.lock();
+            panic!("poison the audit ring on purpose");
+        }));
+        assert!(panicked.is_err());
+        assert!(ring.inner.is_poisoned(), "the lock must really be poisoned");
+        // The audit record keeps working, and keeps what was recorded before.
+        ring.append(entry("after", AuditResult::Ok));
+        ring.append_in(AuditLane::Routine, entry("polled", AuditResult::Ok));
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["before", "after", "polled"]
+        );
+        assert_eq!(ring.len(), 3);
+        assert_eq!((ring.evidence_len(), ring.routine_len()), (2, 1));
+        assert_eq!(ring.count_since(UNIX_EPOCH), 3);
+        assert!(!ring.is_empty());
+    }
+
+    #[test]
+    fn recent_orders_by_call_not_by_timestamp_and_applies_since_before_limit() {
+        // A clock that steps backwards, or two callers that took their timestamps
+        // before racing to the ring: call order and timestamp order disagree.
+        let ring = AuditRing::with_lane_capacities(8, 8);
+        ring.append_in(AuditLane::Evidence, entry_at("first", 100));
+        ring.append_in(AuditLane::Routine, entry_at("second", 50));
+        ring.append_in(AuditLane::Evidence, entry_at("third", 75));
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["first", "second", "third"]
+        );
+        assert_eq!(
+            commands(&ring.recent(None, Some(2))),
+            ["second", "third"],
+            "limit keeps the most recently CALLED entries"
+        );
+        // `since` selects by timestamp (first, third), then `limit` keeps the last
+        // of those. Applying `limit` first would keep (second, third) and leave
+        // only `third`.
+        let t = UNIX_EPOCH + Duration::from_secs(60);
+        assert_eq!(commands(&ring.recent(Some(t), Some(2))), ["first", "third"]);
+        assert_eq!(commands(&ring.recent(Some(t), Some(1))), ["third"]);
+    }
+
+    #[test]
+    fn an_empty_ring_and_extreme_limits_are_handled() {
+        let ring = AuditRing::default();
+        assert!(ring.is_empty());
+        assert!(ring.recent(None, None).is_empty());
+        assert!(ring.recent(None, Some(0)).is_empty());
+        assert!(ring.recent(Some(UNIX_EPOCH), Some(usize::MAX)).is_empty());
+        assert_eq!(ring.count_since(UNIX_EPOCH), 0);
+        assert_eq!((ring.evidence_len(), ring.routine_len()), (0, 0));
+
+        ring.append(entry("a", AuditResult::Ok));
+        ring.append_in(AuditLane::Routine, entry("b", AuditResult::Ok));
+        assert!(ring.recent(None, Some(0)).is_empty(), "limit 0 is nothing");
+        assert_eq!(commands(&ring.recent(None, Some(usize::MAX))), ["a", "b"]);
+        assert_eq!(commands(&ring.recent(None, Some(2))), ["a", "b"]);
+        // A `since` in the far future matches nothing; one at the epoch matches all.
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        assert!(ring.recent(Some(future), None).is_empty());
+        assert_eq!(ring.count_since(future), 0);
+    }
+
+    #[test]
+    fn concurrent_appends_stay_bounded_and_keep_each_callers_order() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 500;
+        let ring = AuditRing::with_lane_capacities(64, 32);
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let ring = &ring;
+                scope.spawn(move || {
+                    let label = format!("t{t}");
+                    for i in 0..PER_THREAD {
+                        let lane = if i % 2 == 0 {
+                            AuditLane::Evidence
+                        } else {
+                            AuditLane::Routine
+                        };
+                        ring.append_in(
+                            lane,
+                            sourced(Frontend::Mcp, Some(&label), &format!("{t}:{i}")),
+                        );
+                    }
+                });
+            }
+        });
+        // Far more was appended than either lane holds, so both are exactly full.
+        assert_eq!((ring.evidence_len(), ring.routine_len()), (64, 32));
+        assert_eq!(ring.len(), 96);
+        // Each thread's surviving entries are in the order that thread appended
+        // them, and no entry appears twice.
+        let kept = ring.recent(None, None);
+        for t in 0..THREADS {
+            let own: Vec<usize> = kept
+                .iter()
+                .filter_map(|e| e.command.strip_prefix(&format!("{t}:")))
+                .map(|i| i.parse().expect("an index"))
+                .collect();
+            assert!(
+                own.windows(2).all(|w| w[0] < w[1]),
+                "thread {t}'s entries are out of order or duplicated: {own:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_client_label_leaves_names_that_merely_contain_the_reserved_one_alone() {
+        // None of these has the skeleton `webbridge`.
+        for raw in [
+            "web-bridge2",
+            "2web-bridge",
+            "web-bridge-2",
+            "my-web-bridge",
+            "web-bridge-ui",
+            "xweb-bridge",
+            "bridge-web",
+            "web",
+            "bridge",
+        ] {
+            assert_eq!(
+                declared_client_label(raw),
+                Some(raw.to_string()),
+                "{raw:?} is not the reserved name"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_client_label_drops_c1_controls_and_delete() {
+        let bad: Vec<(char, Option<String>)> = ['\u{7F}', '\u{80}', '\u{85}', '\u{9B}', '\u{9F}']
+            .into_iter()
+            .map(|c| (c, sanitize_client_label(&format!("a{c}b"))))
+            .filter(|(_, label)| label.as_deref() != Some("ab"))
+            .collect();
+        assert!(bad.is_empty(), "a control character was kept: {bad:#?}");
+        // The characters next to the C1 block are letters and symbols, not controls.
+        assert_eq!(
+            sanitize_client_label("a\u{A1}b"),
+            Some("a\u{A1}b".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_client_label_trims_blanks_that_the_cut_exposes() {
+        // The 64-character cut lands right after a space: none may be left over.
+        let cut_at_blank = format!("{} B", "A".repeat(63));
+        assert_eq!(sanitize_client_label(&cut_at_blank), Some("A".repeat(63)));
+        // Leading blanks do not use up the 64-character budget.
+        let padded = format!("{}label", " ".repeat(100));
+        assert_eq!(sanitize_client_label(&padded), Some("label".to_string()));
+        let mixed = format!("\t \u{A0}{}label\t\n", " ".repeat(70));
+        assert_eq!(sanitize_client_label(&mixed), Some("label".to_string()));
+    }
+
+    #[test]
+    fn sanitize_client_label_reads_only_the_first_1024_chars() {
+        // 1024 invisible characters use up the whole scan: the label behind them is
+        // never read, so a hostile client cannot make the sanitiser scan far.
+        let hidden = format!("{}tail", "\u{200B}".repeat(1024));
+        assert_eq!(sanitize_client_label(&hidden), None);
+        // One fewer and the first visible character is still inside the scan.
+        let just_inside = format!("{}ab", "\u{200B}".repeat(1023));
+        assert_eq!(sanitize_client_label(&just_inside), Some("a".to_string()));
+        // A reserved name behind 1024 blanks never reaches the label either.
+        let blanks = format!("{}web-bridge", " ".repeat(1024));
+        assert_eq!(sanitize_client_label(&blanks), None);
+        assert_eq!(declared_client_label(&blanks), None);
+    }
+
+    #[test]
+    fn sanitize_client_label_masks_a_credential_hidden_by_invisible_characters() {
+        // The invisible character is dropped first, so it cannot split a secret key
+        // in two and hide its value from the scrubber.
+        for (raw, secret) in [
+            ("pass\u{200B}word=hunter2", "hunter2"),
+            ("to\u{AD}ken=SECRET9", "SECRET9"),
+            ("api\u{E0020}_key: abc123xyz", "abc123xyz"),
+            ("Bearer\u{FEFF} tok3nvalue", "tok3nvalue"),
+        ] {
+            let label = sanitize_client_label(raw).expect("a label remains");
+            assert!(!label.contains(secret), "{raw:?} leaked {secret}: {label}");
+            assert!(
+                label.contains("[redacted]"),
+                "{raw:?} was not masked: {label}"
+            );
+        }
+    }
 }

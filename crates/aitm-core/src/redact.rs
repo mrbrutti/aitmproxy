@@ -857,4 +857,221 @@ mod tests {
         ]);
         assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
+
+    // ---- Stage 5 tester additions: each one kills a mutant of the vocabulary or
+    // the pair scan that the tests above let survive. ----
+
+    #[test]
+    fn is_secret_key_names_every_substring_needle() {
+        // Spelled out, not read from the const: a needle dropped from the list must
+        // fail here (the vocabulary-consistency test cannot see it, because
+        // `is_secret_key` and `scrub_text` would both stop knowing it).
+        let mut bad: Vec<String> = Vec::new();
+        for needle in [
+            "authorization",
+            "token",
+            "password",
+            "passwd",
+            "pwd",
+            "secret",
+            "cookie",
+            "api_key",
+            "apikey",
+            "api-key",
+            "bearer",
+            "credential",
+            "sessionid",
+            "phpsessid",
+        ] {
+            for key in [
+                needle.to_string(),
+                needle.to_ascii_uppercase(),
+                format!("x-{needle}-y"),
+                format!("my{needle}2"),
+            ] {
+                if !is_secret_key(&key) {
+                    bad.push(format!("is_secret_key({key:?}) is false"));
+                }
+            }
+            let pair = format!("{needle}=VALUE9");
+            if !scrub_text(&pair).contains("[redacted]") {
+                bad.push(format!("scrub_text({pair:?}) kept the value"));
+            }
+        }
+        assert!(bad.is_empty(), "the vocabulary lost a needle: {bad:#?}");
+    }
+
+    #[test]
+    fn is_secret_key_segments_are_whole_alphanumeric_runs_digits_included() {
+        for key in [
+            "auth2", "sid1", "jwt0", "x-csrf9", "session2", "2sid", "sid2x",
+        ] {
+            assert!(
+                !is_secret_key(key),
+                "`{key}` is one segment, not `sid`/`auth`"
+            );
+        }
+        for key in ["sid-2", "auth_2", "x.sid.2", "1-jwt", "session.9"] {
+            assert!(is_secret_key(key), "`{key}` has a whole secret segment");
+        }
+    }
+
+    #[test]
+    fn scrub_text_masks_an_authorization_line_in_any_case() {
+        // The regex pass has to be case-insensitive: the pair pass alone would mask
+        // only the scheme (`Basic`) and leave the credential after it.
+        let bad = mismatches(&[
+            (
+                "AUTHORIZATION: Basic dXNlcjpwYXNz",
+                "AUTHORIZATION: [redacted]",
+            ),
+            (
+                "authorization: basic dXNlcjpwYXNz",
+                "authorization: [redacted]",
+            ),
+            ("Authorization=Digest a=b c=d", "Authorization=[redacted]"),
+            (
+                "x: 1\nAuthorization:  Basic dXNlcjpwYXNz tail\ny: 2",
+                "x: 1\nAuthorization:  [redacted]\ny: 2",
+            ),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_masks_a_bearer_token_in_any_spacing_and_case() {
+        let bad = mismatches(&[
+            ("Bearer  tok3n", "Bearer  [redacted]"),
+            ("Bearer\ttok3n", "Bearer\t[redacted]"),
+            ("BEARER tok3n", "BEARER [redacted]"),
+            ("bearer\ntok3n", "bearer\n[redacted]"),
+            ("see Bearer tok3n here", "see Bearer [redacted] here"),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_masks_a_bearer_credential_given_as_a_pair_value() {
+        // The `Bearer` pass runs before the pair pass: the pair pass alone would
+        // mask the scheme word and leave the token behind it.
+        let out = scrub_text("token=Bearer abc123");
+        assert!(!out.contains("abc123"), "the bearer token leaked: {out}");
+        assert_eq!(out, "token=[redacted] [redacted]");
+    }
+
+    #[test]
+    fn scrub_text_masks_a_dotted_key_whose_secret_word_is_not_last() {
+        // The key run keeps its dots, so the whole run is judged, not its last part.
+        let bad = mismatches(&[
+            ("password.hash=S3CR3T", "password.hash=[redacted]"),
+            ("x.api_key.v1=K1&n=2", "x.api_key.v1=[redacted]&n=2"),
+            ("connect.sid.v2=abc; a=b", "connect.sid.v2=[redacted]; a=b"),
+            ("a-token-b=T1", "a-token-b=[redacted]"),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_treats_non_ascii_letters_as_part_of_a_key() {
+        let bad = mismatches(&[
+            ("token_é=S3CR3T", "token_é=[redacted]"),
+            ("passwordé: S3CR3T", "passwordé: [redacted]"),
+            ("日本_secret=XYZ", "日本_secret=[redacted]"),
+            ("é-sid=ABC", "é-sid=[redacted]"),
+            // A non-secret key with non-ASCII letters is left alone.
+            ("café=latte", "café=latte"),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_reads_every_ascii_whitespace_as_blank() {
+        // Space, tab, newline, vertical tab, form feed and carriage return: each
+        // may pad the separator and each ends an unquoted value.
+        let mut bad: Vec<(char, String)> = Vec::new();
+        for c in [' ', '\t', '\n', '\u{b}', '\u{c}', '\r'] {
+            let input = format!("password{c}={c}hunter2{c}tail");
+            let want = format!("password{c}={c}[redacted]{c}tail");
+            let got = scrub_text(&input);
+            if got != want {
+                bad.push((c, got));
+            }
+        }
+        assert!(bad.is_empty(), "wrong output for these blanks: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_ends_an_unquoted_value_at_a_comma_or_a_stray_quote() {
+        let bad = mismatches(&[
+            ("token=abc,user=bob", "token=[redacted],user=bob"),
+            ("token=abc\"def", "token=[redacted]\"def"),
+            ("token=abc'def", "token=[redacted]'def"),
+        ]);
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
+
+    #[test]
+    fn scrub_text_stays_linear_on_oversized_inputs_of_other_shapes() {
+        // A quadratic scan turns each of these (1 to 4 MiB) into a hang, so the
+        // test finishing is the check. `assert!` on `==`, not `assert_eq!`: a
+        // failure must not print megabytes.
+        let unchanged = [
+            ("secret keys with no separator", "password ".repeat(200_000)),
+            ("separators with no key", "=".repeat(2 << 20)),
+            ("colons with no key", ":".repeat(2 << 20)),
+            ("multi-byte letters", "é".repeat(1 << 20)),
+            ("no-break spaces", "\u{a0}".repeat(1 << 20)),
+            (
+                "a secret key then only blanks",
+                format!("token={}", " ".repeat(2 << 20)),
+            ),
+            ("dotted non-secret keys", "a.b:".repeat(500_000)),
+            ("host:port after host:port", "auth.x:1 ".repeat(300_000)),
+            ("empty quoted values", "x=\"\" ".repeat(400_000)),
+        ];
+        for (what, text) in &unchanged {
+            assert!(scrub_text(text) == *text, "{what} came back changed");
+        }
+        // These do hold a secret pair per repeat, each of which is masked.
+        assert!(
+            scrub_text(&"sid:1 ".repeat(300_000)) == "sid:[redacted] ".repeat(300_000),
+            "300k short pairs are each masked"
+        );
+        assert!(
+            scrub_text(&"token=\"a\" ".repeat(200_000)) == "token=\"[redacted]\" ".repeat(200_000),
+            "200k quoted pairs are each masked"
+        );
+        assert!(
+            scrub_text(&"Bearer x ".repeat(300_000)) == "Bearer [redacted] ".repeat(300_000),
+            "300k bearer tokens are each masked"
+        );
+    }
+
+    #[test]
+    fn scrub_text_exempts_only_a_dotted_key_with_a_one_to_five_digit_port() {
+        // Left alone: a host with a port of one to five digits and a terminator.
+        let mut bad = mismatches(
+            &[
+                "auth.example.com:1",
+                "auth.example.com:65535",
+                "auth.example.com:8443?x=1",
+                "auth.example.com:8443#frag",
+                "auth.example.com:8443&x=1",
+                "auth.example.com:8443;x=1",
+                "auth.example.com:8443,next",
+                "connect to auth.example.com:8443 now",
+            ]
+            .map(|text| (text, text)),
+        );
+        // Masked: everything that is not exactly that shape, or that uses `=`.
+        bad.extend(mismatches(&[
+            ("auth.example.com:123456", "auth.example.com:[redacted]"),
+            ("auth.example.com: x", "auth.example.com: [redacted]"),
+            ("auth.example.com:/x", "auth.example.com:[redacted]"),
+            ("auth.example.com:8443abc", "auth.example.com:[redacted]"),
+            ("auth.example.com=8443", "auth.example.com=[redacted]"),
+            ("db.password=1234", "db.password=[redacted]"),
+        ]));
+        assert!(bad.is_empty(), "wrong output: {bad:#?}");
+    }
 }
