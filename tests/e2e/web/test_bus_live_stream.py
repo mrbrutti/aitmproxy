@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # e2e: tier=T1 surface=web
-"""Future guard: the web /bus bridge should PUSH live flow events to a subscriber.
+"""Regression guard: the web /bus bridge PUSHES live flow events to a subscriber.
 
-Note on the shipped un-freeze: PR #124 fixed the user-visible freeze CLIENT-SIDE
-(apps/web polls flow.list) — guarded here by test_bus_poll_reflects_traffic.py —
-NOT by adding push to the bridge. So flow.subscribe over /bus is still refused and
-this canary stays a loud SKIP. Push-over-bridge (a per-connection NotificationSink
-drained onto the WS) is a separate, larger change on top of PR #103 (the
-concurrent-frames rewrite of the /bus relay loop). This canary drives the real
-/bus WebSocket the way a push-capable UI would — subscribe, generate traffic,
-expect a `notifications/aitm/flow` push — and auto-flips from SKIP to PASS the
-moment that lands; flip the SKIP to fail() then to make it a hard guard.
+PR #137 wired a per-connection NotificationSink onto the /bus WebSocket (on top of
+PR #103's concurrent-frames relay loop and PR #124's client-side un-freeze), so a
+/bus connection can flow.subscribe and then receive `notifications/aitm/flow`
+pushes live. This canary drives the real /bus WebSocket the way a push-capable UI
+does — subscribe, generate traffic, expect a push — and HARD-FAILS if either step
+regresses: the main.rs wiring that feeds the web server's own subscription registry
+is guarded only by this test, so a SKIP here would hide a regression.
+
+PR #137 also delivers `notifications/aitm/agent` (audit) on a subscribed /bus
+connection for each finished tool call; this canary filters by method, so that is
+harmless here. Limits it added: 32 subscriptions per connection, filter values at
+most 1024 bytes.
 """
 
 import sys
@@ -18,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aitm_e2e import check, fail, free_port, ok, section, skip  # noqa: E402
+from aitm_e2e import check, fail, free_port, ok, section  # noqa: E402
 from aitm_e2e.bus import ToolError  # noqa: E402
 from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
@@ -43,13 +46,12 @@ def main() -> int:
         try:
             sub = ws.call("flow.subscribe", {})
         except ToolError as e:
-            # Push-over-bridge gap: the /bus bridge connection carries no push sink,
-            # so the core refuses to subscribe, reproduced at the real boundary with
-            # the core's own error. The shipped un-freeze (PR #124) is client-side
-            # polling (see test_bus_poll_reflects_traffic), not push.
-            skip(f"DESIGN GAP (push-over-bridge): the /bus bridge rejects flow.subscribe — {e} "
-                 "Shipped un-freeze is client-side polling (PR #124); push-over-bridge is a "
-                 "separate change on PR #103. Flip this SKIP to fail() when the bridge gains a sink.")
+            # PR #137 gave each /bus bridge connection a NotificationSink, so the core
+            # must accept flow.subscribe here. A refusal is a regression of exactly that
+            # wiring (reproduced at the real boundary with the core's own error).
+            fail(f"REGRESSION (push-over-bridge): the /bus bridge refused flow.subscribe — {e} "
+                 "PR #137 wired a per-connection NotificationSink onto the /bus WebSocket; a "
+                 "refusal here means that wiring regressed.")
         ok(f"flow.subscribe over /bus succeeded: {sub}")
 
         section("generate real traffic, then wait for a LIVE push")
@@ -60,9 +62,9 @@ def main() -> int:
             ok(f"/bus pushed a live flow notification: {note.get('method')}")
             ok("web live-streaming works over /bus — regression guarded")
         else:
-            skip("KNOWN BUG (F4 web /bus freeze): /bus accepted flow.subscribe but pushed no "
-                 "notifications/aitm/flow within 8s under live traffic. Flip this SKIP to "
-                 "fail() once the /bus push path works.")
+            fail("REGRESSION (F4 web /bus push): /bus accepted flow.subscribe but pushed no "
+                 "notifications/aitm/flow within 8s under live traffic. PR #137 made this push "
+                 "path live; no push here means it regressed.")
     finally:
         if ws:
             ws.close()
