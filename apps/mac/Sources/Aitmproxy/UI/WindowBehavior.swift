@@ -6,8 +6,8 @@ extension View {
     /// cursor until the person clicks or presses Tab. Use it on every window
     /// and sheet, except one whose only job is typing (a search or quick-add
     /// panel focuses its field on purpose).
-    func noInitialFocus() -> some View {
-        background(WindowHook())
+    func noInitialFocus(then follow: (() -> Void)? = nil) -> some View {
+        background(WindowHook(follow: follow))
     }
 
     /// Dims custom chrome when its window is not the active one, matching the
@@ -54,13 +54,22 @@ private struct FitsContent: ViewModifier {
 
 /// A zero-size view that reaches the NSWindow it sits in.
 private struct WindowHook: NSViewRepresentable {
+    /// Runs right after the first responder is cleared, in the same run-loop turn, so a
+    /// window whose one job is typing can focus its field without racing the clear.
+    var follow: (() -> Void)?
+
     func makeNSView(context: Context) -> Probe {
-        Probe()
+        let probe = Probe()
+        probe.follow = follow
+        return probe
     }
 
-    func updateNSView(_ probe: Probe, context: Context) {}
+    func updateNSView(_ probe: Probe, context: Context) {
+        probe.follow = follow
+    }
 
     final class Probe: NSView {
+        var follow: (() -> Void)?
         private var reopened = false
 
         override func viewDidMoveToWindow() {
@@ -87,7 +96,10 @@ private struct WindowHook: NSViewRepresentable {
 
         /// AppKit picks a first control right after the window shows. Clear it after that.
         private func clear(_ window: NSWindow) {
-            DispatchQueue.main.async { window.makeFirstResponder(nil) }
+            DispatchQueue.main.async { [weak self] in
+                window.makeFirstResponder(nil)
+                self?.follow?()
+            }
         }
     }
 }

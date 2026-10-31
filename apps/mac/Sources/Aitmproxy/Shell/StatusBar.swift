@@ -17,7 +17,12 @@ struct StatusBar: View {
             Spacer()
             HStack(spacing: Tok.Metric.gapMeta) {
                 if let error = session.lastError {
-                    Text(error).foregroundStyle(Tok.Status.serverError.color).lineLimit(1)
+                    Label(error, systemImage: "exclamationmark.triangle")
+                        .labelStyle(.titleAndIcon)
+                        .foregroundStyle(Tok.Status.serverError.color)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(error)
                 }
                 if let summary = session.selectionSummary {
                     Text(summary.text).font(Tok.Face.data(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.primary.color)

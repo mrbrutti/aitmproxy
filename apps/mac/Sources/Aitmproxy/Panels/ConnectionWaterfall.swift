@@ -66,6 +66,7 @@ struct ConnectionWaterfall: View {
                                 .frame(width: Self.laneLabelWidth, alignment: .trailing)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
+                                .help(display)
                         }
                     }
                 }
@@ -75,7 +76,7 @@ struct ConnectionWaterfall: View {
                     AxisGridLine().foregroundStyle(Tok.Line.rule.color)
                     AxisValueLabel {
                         if let date = value.as(Date.self) {
-                            Text(Format.time(date))
+                            Text(Format.clockTime(date))
                                 .font(Tok.Face.data(Tok.Typography.Size.xs))
                                 .foregroundStyle(Tok.Ink.tertiary.color)
                         }

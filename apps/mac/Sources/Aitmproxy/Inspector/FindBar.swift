@@ -85,6 +85,8 @@ struct FindBar: View {
                 .textFieldStyle(.plain)
                 .font(Tok.Face.ui(Tok.Typography.Size.md))
                 .foregroundStyle(Tok.Ink.primary.color)
+                // The field gives way first, so the counter, arrows and regex toggle never truncate.
+                .layoutPriority(-1)
                 .focused($focused)
                 .onKeyPress(.return, phases: .down) { press in
                     if press.modifiers.contains(.shift) { state.previous() } else { state.next() }
@@ -102,6 +104,8 @@ struct FindBar: View {
                 .fixedSize()
                 .accessibilityLabel("Matches")
                 .accessibilityValue(state.matches.isEmpty ? "No matches" : "Match \(state.counterText)")
+            stepButton(symbol: "chevron.up", help: "Previous match (⇧⏎)") { state.previous() }
+            stepButton(symbol: "chevron.down", help: "Next match (⏎)") { state.next() }
             Button {
                 state.isRegex.toggle()
             } label: {
@@ -118,7 +122,9 @@ struct FindBar: View {
         }
         .padding(.leading, Space.sm)
         .padding(.trailing, 2)
-        .frame(width: 240, height: Tok.Size.control) // grid: ok the 28 pt find field (S-029), 240 wide
+        // The 28 pt find field (S-029): at least 240 wide, growing to 360 when the pane has room.
+        .frame(minWidth: 240, maxWidth: 360)
+        .frame(height: Tok.Size.control)
         .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
         .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control)
             .strokeBorder((state.isInvalid ? Tok.Intercept.deep : Tok.Line.control).color))
@@ -127,6 +133,21 @@ struct FindBar: View {
             if shown { focused = true }
         }
         .onExitCommand { dismiss() }
+    }
+
+    /// A flat chevron that steps to the previous or next match; dimmed when there is nothing to step to.
+    private func stepButton(symbol: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: Tok.Size.iconInline, weight: .medium))
+                .foregroundStyle((state.matches.isEmpty ? Tok.Ink.tertiary : Tok.Ink.secondary).color)
+                .frame(width: Space.xxl, height: Space.xxl)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(state.matches.isEmpty)
+        .help(help)
+        .accessibilityLabel(help)
     }
 
     private func dismiss() {

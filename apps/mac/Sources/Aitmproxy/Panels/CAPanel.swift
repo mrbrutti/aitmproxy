@@ -145,8 +145,8 @@ struct CAPanel: View {
 
     private func buttons(_ status: CAStatus) -> some View {
         HStack(spacing: Space.sm) {
-            FlatButton("Export PEM") { export(format: "pem") }.disabled(busy || !status.exists)
-            FlatButton("Export DER") { export(format: "der") }.disabled(busy || !status.exists)
+            FlatButton("Export PEM…") { export(format: "pem") }.disabled(busy || !status.exists)
+            FlatButton("Export DER…") { export(format: "der") }.disabled(busy || !status.exists)
             Spacer()
             if status.installed {
                 FlatButton("Uninstall…") { change(install: false, status: status) }.disabled(busy)

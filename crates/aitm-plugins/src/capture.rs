@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aitm_core::{
-    Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value,
+    Body, Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
+    Value,
 };
 
 /// Registers `flow.list` and `flow.get`. Observes no events.
@@ -148,7 +149,31 @@ fn summary_fields() -> Vec<ParamDef> {
             false,
             "WebSocket frames captured so far.",
         ),
+        field(
+            "request_bytes",
+            TypeDesc::Int,
+            false,
+            "HTTP request body size in bytes; null while it is still streaming.",
+        ),
+        field(
+            "response_bytes",
+            TypeDesc::Int,
+            false,
+            "HTTP response body size in bytes; null until the response arrives or while \
+             it is still streaming.",
+        ),
     ]
+}
+
+/// A buffered body's size in bytes, or `Null` while it is still streaming from the
+/// wire and the size is not known yet. Lets a UI total the traffic it has seen
+/// (the macOS status bar's ↑ / ↓ rate) without fetching a single body.
+fn body_bytes(body: &Body) -> Value {
+    match body {
+        Body::Empty => Value::Int(0),
+        Body::Bytes(bytes) => Value::Int(bytes.len() as i64),
+        Body::Streamed(_) => Value::Null,
+    }
 }
 
 /// A transport-neutral summary of a flow.
@@ -170,6 +195,13 @@ fn summarize(flow: &Flow) -> Value {
                 f.response
                     .as_ref()
                     .map_or(Value::Null, |r| Value::Int(i64::from(r.status))),
+            );
+            put("request_bytes", body_bytes(&f.request.body));
+            put(
+                "response_bytes",
+                f.response
+                    .as_ref()
+                    .map_or(Value::Null, |r| body_bytes(&r.body)),
             );
             put("is_replay", Value::Bool(f.metadata.is_replay));
             put("intercept", Value::Str(f.intercept.label().into()));

@@ -214,7 +214,8 @@ public struct FlowRow: Identifiable, Hashable, Sendable {
     public static func == (lhs: FlowRow, rhs: FlowRow) -> Bool {
         lhs.id == rhs.id && lhs.seq == rhs.seq && lhs.status == rhs.status && lhs.state == rhs.state
             && lhs.edited == rhs.edited && lhs.comment == rhs.comment && lhs.mark == rhs.mark
-            && lhs.duration == rhs.duration && lhs.responseBytes == rhs.responseBytes
+            && lhs.duration == rhs.duration && lhs.requestBytes == rhs.requestBytes
+            && lhs.responseBytes == rhs.responseBytes
             && lhs.inScope == rhs.inScope && lhs.wsFrames?.sent == rhs.wsFrames?.sent
             && lhs.wsFrames?.received == rhs.wsFrames?.received && lhs.l4 == rhs.l4
             && lhs.client == rhs.client
