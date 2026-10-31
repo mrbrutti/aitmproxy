@@ -1154,7 +1154,7 @@ Status: done
 
 ### S-072 See what is running and what to do first
 As the operator, on a fresh launch I land on a Status page that shows the core, the bus and the capture extension — each with a state word, one fact and its control — and a live Getting-started list, so I never have to guess which sidebar item to look at or why no flows appear.
-Screens: status, status-fresh, status-core-failed, status-bus-token, status-scope-empty, status-waiting, status-degraded
+Screens: status, status-ok, status-fresh, status-external, status-core-starting, status-core-stopped, status-core-failed, status-bus-connecting, status-bus-agent, status-bus-token, status-scope-empty, status-waiting, status-degraded
 Depends: S-063, S-070, core F1
 Spec: `docs/superpowers/specs/2026-10-31-macos-status-page-and-first-run-design.md`
 Acceptance:

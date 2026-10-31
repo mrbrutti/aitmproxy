@@ -121,6 +121,12 @@ struct BusSettings: View {
                  : "The app runs its own bundled core. Choose External to use your own.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            // The bus lane as the Status page words it; the detail carries the address and role.
+            LabeledContent("Connection") {
+                let lane = session.connectionSummary.bus
+                Text("\(lane.word) · \(lane.detail)")
+                    .foregroundStyle(lane.state == .ok ? Color.secondary : lane.state.color.color)
+            }
         }
         Section("External connection") {
             Toggle("Read address and token from aitmproxy's config.yaml", isOn: $fromConfig)
@@ -268,8 +274,9 @@ struct CaptureSettings: View {
                                 .foregroundStyle(Color.secondary)
                         }
                     } else {
+                        // The capture lane's word, the same one the Status page shows.
                         Label {
-                            Text(capability.title)
+                            Text(session.connectionSummary.capture.word)
                         } icon: {
                             Image(systemName: symbol(for: capability))
                                 .foregroundStyle(capability.isCaptureOn ? Palette.accent : Color.secondary)

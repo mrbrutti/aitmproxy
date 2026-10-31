@@ -1,6 +1,6 @@
 # macOS Status page and first-run flow design
 
-**Status:** draft (2026-10-31, mac-review session; for the NE session + orchestrator to review, Matt approves)
+**Status:** implemented on `claude/macos-connection-ux` (2026-10-31); panel-reviewed, revisions below; Matt approves the two open questions
 **Research inputs:** `apps/mac/docs/review-2026-10-31.md` (live findings L1–L9), PR #181 spec
 `2026-10-31-ne-no-scope-honest-state-design.md` (`CaptureAdvice`), the bama `mac-design`
 (rules 3, 5, 27, 28, 56, 59, 64, 76) and `ux-design` (surface table, states, words) skills.
@@ -81,7 +81,7 @@ shows the state.
 ### 1. One model: `ConnectionSummary` (Kit, pure, tested)
 
 ```swift
-public enum LaneState: Sendable { case ok, working, warning, off, error }
+public enum LaneState: Int, Comparable, Sendable { case ok, working, off, warning, error }  // off = intended absence, ranks below "on but wrong"
 
 public struct ConnectionLane: Equatable, Sendable {
     public enum Kind: Sendable { case core, bus, capture }
@@ -100,9 +100,9 @@ public struct ConnectionLane: Equatable, Sendable {
 }
 
 public enum ConnectionAction: Equatable, Sendable {
-    case startCore, stopCore, restartCore, showCoreLog, switchCore
+    case startCore, restartCore, showCoreLog, switchToEmbedded
     case reconnectBus, openBusSettings
-    case captureOn, captureOff, openScope, approveInSystemSettings, uninstallExtension, openCaptureSettings
+    case turnCaptureOn, turnCaptureOff, openScope, approveInSystemSettings, uninstallExtension, openCaptureSettings
     case openBrowser, copyListenAddress
 }
 
@@ -116,9 +116,13 @@ public struct ConnectionSummary: Equatable, Sendable {
     public let steps: [GettingStartedStep]
 
     public static func make(core: CoreConnection?, activeKind: ActiveCoreKind, bus: BusState,
-                            role: String?, roleWarning: Bool, capture: CaptureAdvice,
+                            role: String?, roleWarning: Bool, capability: CaptureCapability,
                             captureSupported: Bool, scopeHostCount: Int, flowCount: Int,
-                            listenAddress: String) -> ConnectionSummary
+                            listenAddress: String, coreCapture: CoreCaptureStatus? = nil) -> ConnectionSummary
+    // builds the CaptureAdvice itself from capability + supported + scope count (one call site)
+    public var overallWord: String   // "connected" | worst.compact — the status bar's one word
+    public var badge: String         // "ok" | worst lane title — the sidebar brand chip
+    public var tooltip: String; public var spoken: String   // the three lanes, for .help / a11y
 }
 
 public struct GettingStartedStep: Equatable, Sendable {
@@ -136,19 +140,21 @@ Word table (the only place these strings live; the TUI/web may copy it):
 |---|---|---|---|---|
 | Core | embedded `.ready` | ok | running | — |
 | Core | `.starting`/`.connecting` | working | starting… | — |
-| Core | `.degraded(reason)` / `.stopped` | error | failed | "Restart the core" (reason as detail) |
-| Core | external kind, no connection | off | external | "Configure the address in Settings ▸ Bus" |
+| Core | `.degraded(reason)` | error | failed | "Restart the core" (reason as detail) |
+| Core | `.stopped` / no connection | off | stopped / not running | "Start the core" |
+| Core | external kind | off | external | "The app does not manage this core; start and stop it yourself" (detail carries the bus address or "set the address in Settings ▸ Bus") |
 | Bus | `.connected`, role ok | ok | connected | — |
 | Bus | `.connected`, roleWarning | warning | connected as agent | "Paste the operator token in Settings ▸ Bus" |
 | Bus | `.connecting` | working | connecting… | — |
-| Bus | `.failed(why)` | error | bus failed | why |
-| Bus | `.disconnected` | off | offline | "Start the core" / "Reconnect" |
+| Bus | `.failed(why)` | error | bus failed | why as detail; remedy "Paste the operator token…" when why mentions the token, else "Reconnect, or check the address in Settings ▸ Bus" |
+| Bus | `.disconnected` | off | offline | "Start the core" (embedded core down) / "Reconnect" |
 | Capture | `.unsupported` | off | no extension | "This build has no capture extension; the signed app has it" |
 | Capture | `.off` | off | capture off | "Turn on capture to see other apps' traffic" |
 | Capture | `.awaitingApproval` | working | waiting for approval | "Approve the extension in System Settings" |
 | Capture | `.degraded(reason)` | error | capture degraded | reason |
 | Capture | `.onEmptyScope` | warning | on, nothing in scope | "Add a host to Scope" |
-| Capture | `.on(n)` | ok | capture on · n hosts | — |
+| Capture | `.on(n)` | ok | capture on · n hosts in scope | — (with `coreCapture.providerAttached == false`: warning, "on, core not attached", "Restart the core") |
+| Capture | any, external core active | off | capture off | "Switch to the embedded core to capture other apps' traffic" |
 
 `CaptureAdvice` (PR #181) stays the capture source; `ConnectionSummary.make` maps it so the
 advice's headline/detail and the lane word agree (the lane word is a shortened form; a Kit test
@@ -233,9 +239,10 @@ window comes first, and the connection state has **one** home.
   duplicates the sidebar.
 - **Toolbar pill** stays the core/proxy address; its bus and capture dots show only when those
   lanes need attention (as built).
-- **Landing**: a fresh install lands on **Status**; afterwards the last page is restored, and
-  the default for an operator who never navigated is **Flows**. Apps is no longer the default
-  (its empty state was the second thing a new operator saw).
+- **Landing**: a fresh install lands on **Status** and stays there until the operator navigates
+  once; after that the last list page is restored (a session that ended on Status or Saved
+  comes back on Flows). Apps is no longer the default (its empty state was the second thing a
+  new operator saw).
 - Counts: Flows/Apps/Domains/Pinned show their flow counts; Scope/Scan/Findings show queue
   counts in the raised chip; Browser/Scripts/Agent keep their words.
 
@@ -244,14 +251,16 @@ and the menu; `.saved` stays in the enum (routing to `SavedPanel`) but `isInSide
 
 ### 4. Toolbar pill and status bar read the same model
 
-- `ListeningPill` becomes a `Button` to `.status` with three dots+words from the summary:
-  `● core 8080 · ● bus · ◐ capture` (word only when not ok, to stay calm); `.help` lists all
-  three lanes with their details. Intercept armed stays as today.
-- The status bar's right group shows `core <word> · bus <word> · capture <word>` from the
-  summary, each a `Button` to `.status` (the CoreHealthDot's click keeps opening the Core Log
-  via the Status page card instead). Role mismatch is the bus lane's warning, not a fourth item.
-- Settings ▸ Capture's Status row and Settings ▸ Bus's connection line read the lane words
-  (NE session's files; one-line changes once #181 merges).
+- `ListeningPill` is a `Button` to `.status`: the core dot + bound proxy address (and "paused",
+  "intercept armed" as today), then the bus and capture `LaneDot`s only while they need
+  attention; `.help` is `summary.tooltip`.
+- The status bar's right group shows ONE connection item, `summary.overallWord` ("connected", or
+  the worst lane's compact form), a `Button` to `.status`. Role mismatch is the bus lane's
+  warning, not a separate badge. `CoreHealthDot` is deleted; the Core Log header shows the core
+  lane's `LaneDot`.
+- Settings ▸ Capture's Status row reads the capture lane word; Settings ▸ Bus gains a
+  "Connection" row with the bus lane word and detail. `tools/check-connection-words.sh` fails
+  when any view spells a lane word itself.
 
 ### 5. Words (GLOSSARY additions)
 
@@ -274,11 +283,12 @@ Embedded… (opens Settings ▸ Bus).
 | `ConnectionSummary`, `ConnectionLane`, `GettingStartedStep` + tests | `AitmproxyKit/ConnectionSummary.swift`, `Tests/…/ConnectionSummaryTests.swift` | mac-review session |
 | `StatusPanel` + its snapshot scenes (every lane state × light/dark) | `Panels/StatusPanel.swift`, `SnapshotScenes.swift`, `Snapshot.swift` | mac-review session |
 | `SidebarPage.status` + landing rule | `Session.swift` | mac-review session |
-| Sidebar Proxy group + Status row glyph | `Shell/SidebarView.swift` | mac-review session, after #181 |
+| Sidebar groups + brand-row status entry | `Shell/SidebarView.swift` | mac-review session |
+| `Session+Connection.swift` (summary + action glue), `UI/ConnectionLook.swift` (LaneState look, `LaneDot`), `SelfTest.swift` checks, `tools/check-capture-operator-only.sh` allow-list, `tools/check-connection-words.sh`, `Panels/CoreLogPanel.swift`, `Panels/ScopePanel.swift` prompt | — | mac-review session |
 | Pill + status bar from the summary | `Shell/ShellToolbar.swift`, `Shell/StatusBar.swift`, `Shell/CoreHealthDot.swift` | mac-review session |
 | Proxy ▸ Status (⌘0) + CommandMap entry | `App.swift`, `AitmproxyKit/CommandMap.swift` | mac-review session (wave 3 touches App.swift's Flow menu only — coordinate) |
-| `case .status: StatusPanel()` in `MainView.content` | `Shell/ShellView.swift` | NE session (one line in #181's follow-up) or mac-review after #181 |
-| Settings rows reading lane words | `SettingsView.swift` | NE session |
+| `case .status` / `case .saved` in `MainView.content` | `Shell/ShellView.swift` | mac-review session (after #181 merged) |
+| Settings rows reading lane words | `SettingsView.swift` | mac-review session (after #181 merged) |
 | Glossary, brief IA line, docs | `apps/mac/docs/*` | mac-review session |
 
 ## Acceptance criteria
@@ -290,15 +300,17 @@ Embedded… (opens Settings ▸ Bus).
 2. **ST-AC2 [kit-unit]** Getting-started steps are done exactly when the facts say so (core
    ready; bus connected without role warning; capture `.on`/`.onEmptyScope`; scope count > 0;
    flowCount > 0), and all-done collapses.
-3. **ST-AC3 [mac-snapshot]** The Status page renders every lane state (15 scenes) in light and
-   dark with no clipping; `grid-lint` and `check-layout` PASS; nothing on the page is blank when
+3. **ST-AC3 [mac-snapshot]** The Status page renders every lane state (12 `status-*` scenes +
+   the page walk) in light and dark with no clipping; `grid-lint` and `check-layout` PASS; nothing on the page is blank when
    the bus is offline.
-4. **ST-AC4 [self-test]** A fresh fixture session with `rows.isEmpty` lands on `.status`; a
-   session restored with a saved page lands there; `Proxy ▸ Status` (⌘0) is in the menu bar and
-   the `CommandMap`.
-5. **ST-AC5 [structural]** The toolbar pill, status bar, sidebar Status row and Status page draw
-   their words only from `ConnectionSummary` (grep: no other file defines core/bus/capture state
-   words; the tripwire lists the allowed files). Both capture tripwires exit 0.
+4. **ST-AC4 [self-test]** The landing rule is a pure function (`Session.landingPage(saved:)`)
+   pinned by the self-test: no saved page → `.status`; a saved list page → that page; a saved
+   non-list page (Status, Saved) → `.flows`; an unknown value → `.status`. Fixture, snapshot and
+   self-test runs start on Apps so their scenes stay deterministic. `Proxy ▸ Status` (⌘0) is in
+   the menu bar and the `CommandMap`.
+5. **ST-AC5 [structural]** No view spells a connection state word (`tools/check-connection-words.sh`
+   exits 0: the lane words appear as literals only in the Kit models); both capture tripwires
+   exit 0.
 6. **ST-AC6 [self-test]** Each Status-page action calls the same `Session`/`CaptureSwitch` entry
    as its menu item (menu audit extended with Status's actions).
 7. **ST-AC7 [manual, real app]** On Matt's Mac with the notarized DMG: fresh launch lands on
@@ -343,3 +355,26 @@ Embedded… (opens Settings ▸ Bus).
   (Default: own group.)
 - Matt: should Status replace Overview as the landing page even when flows exist? (Default:
   no — restore the last page; Status only when there is nothing to show yet.)
+
+## Review log
+
+Stage-6 panel 2026-10-31 on `341b68a..07c6772` (security PASS, quality PASS with 10 Minors, spec
+FAIL with 2 Critical + 5 Important). Dispositions, all applied on the branch:
+
+| # | Reviewer | Sev | Finding | Disposition |
+|---|---|---|---|---|
+| 1 | Spec | Critical | No structural check for ST-AC5; Core Log header, Settings ▸ Capture row and the orphaned `CoreHealthDot` still spelled their own words | FIXED — `check-connection-words.sh`; `CoreHealthDot.swift` + `CoreHealth.statusWord` deleted; Core Log header and both Settings rows read the lanes |
+| 2 | Spec | Critical | Landing rule untested; ST-AC4 contradicted "Left to the builder" | FIXED — `Session.landingPage(saved:)` pinned by four self-test checks; ST-AC4 and §3 reworded (Status until the operator navigates once) |
+| 3 | Spec | Important | 8 scenes, not every lane state | FIXED — `status-core-starting/-stopped`, `status-bus-connecting/-agent` added (12 + page walk) |
+| 4 | Spec | Important | Word table / signatures deviated from §1 unexplained | FIXED — §1 amended to the shipped words (stopped is off not failed; off ranks below warning; action names) |
+| 5 | Spec | Important | Scope prompt lacked the `host:443` hint | FIXED — prompt reads "host:443 or host:80 (for now), …" |
+| 6 | Spec | Important | Settings rows not reading lane words | FIXED (file free after #181) |
+| 7 | Spec | Important | Undeclared files / `CoreHealthDot` untouched | FIXED — §6 lists them; the dot is deleted |
+| 8 | Quality | Minor | `steps` read "external" back out of a display word | FIXED — `activeKind` passed in |
+| 9 | Quality | Minor | `activeKind` unobserved | FIXED — `ActiveConnectionModel` is `@Observable` |
+| 10 | Quality | Minor | `default:` in `StatusPanel.run`; dead `.stopCore`, `feederListening` | FIXED — exhaustive switch; both removed |
+| 11 | Quality | Minor | Remedies sniff free-text reasons | ACCEPTED for now (the two enums are the NE session's); fallback branches pinned by tests |
+| 12 | Quality | Minor | Tooltip/spoken/compact strings built per surface; pluralisation ×4 | FIXED — `tooltip`, `spoken`, `compact`, `overallWord`, `badge` on the model; `Format.count` |
+| 13 | Quality | Minor | Landing read side unfiltered; raw `13` | FIXED |
+| 14 | Quality | Minor | `RecentFlowRow` repeats `FlowListRow`'s shell | ACCEPTED (the two pages may drift; a `HoverRowButton` is a wave-3 cleanup) |
+| 15 | Security | Minor | Both capture tripwires red on main since #183 | FIXED here — scripts follow the `Store.defaults` shapes; Kit doc comment no longer spells the key |

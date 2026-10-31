@@ -95,7 +95,7 @@ struct SidebarView: View {
                 Spacer(minLength: Space.xs)
                 HStack(spacing: Tok.Metric.gapTight) {
                     Image(systemName: worst.state.symbol).font(.system(size: Tok.Size.iconInline))
-                    Text(summary.overall == .ok ? "ok" : worst.kind.title).lineLimit(1)
+                    Text(summary.badge).lineLimit(1)
                 }
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
                 .foregroundStyle(summary.overall == .ok ? Tok.Ink.tertiary.color : worst.state.color.color)
@@ -106,7 +106,7 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("Status: core \(summary.core.word) · bus \(summary.bus.word) · capture \(summary.capture.word) (⌘0)")
+        .help(summary.tooltip + "\nOpens Status (⌘0)")
         .accessibilityLabel("Status, \(summary.overall == .ok ? "ok" : worst.kind.title + " " + worst.word)")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }

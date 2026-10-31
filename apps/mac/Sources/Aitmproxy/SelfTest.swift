@@ -74,6 +74,13 @@ enum SelfTest {
             check("Core Log from Status opens the core log", { session.perform(connection: .showCoreLog); return session.coreLogVisible }())
             session.coreLogVisible = false
             check("Settings actions are left to the view", !session.perform(connection: .openCaptureSettings) && !session.perform(connection: .turnCaptureOn))
+            check("Copy Address from Status copies the listen address", { session.perform(connection: .copyListenAddress); return NSPasteboard.general.string(forType: .string) == session.listenAddress }())
+            check("Reconnect from Status bumps the bus reconnect", { let before = session.reconnectTick; session.perform(connection: .reconnectBus); return session.reconnectTick == before + 1 }())
+            // ST-AC4: the landing rule — Status on a fresh install, the last list page otherwise.
+            check("a fresh install lands on Status", Session.landingPage(saved: nil) == .status)
+            check("a remembered list page is restored", Session.landingPage(saved: "domains") == .domains)
+            check("a session that ended on Status or Saved comes back on Flows", Session.landingPage(saved: "status") == .flows && Session.landingPage(saved: "saved") == .flows)
+            check("an unknown saved page lands on Status", Session.landingPage(saved: "nope") == .status)
             session.page = .apps
             check("two flows are paused", session.paused.count == 2)
             check("the paused login is selected", session.focusedRow?.seq == 50)

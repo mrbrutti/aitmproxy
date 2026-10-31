@@ -47,6 +47,10 @@ enum SnapshotScene: String, CaseIterable {
     case statusFresh = "status-fresh"
     case statusCoreFailed = "status-core-failed"
     case statusBusToken = "status-bus-token"
+    case statusCoreStarting = "status-core-starting"
+    case statusCoreStopped = "status-core-stopped"
+    case statusBusConnecting = "status-bus-connecting"
+    case statusBusAgent = "status-bus-agent"
     case statusScopeEmpty = "status-scope-empty"
     case statusWaiting = "status-waiting"
     case statusDegraded = "status-degraded"
@@ -252,6 +256,18 @@ enum SnapshotScene: String, CaseIterable {
                         core: Self.core(.degraded(reason: "the core exited unexpectedly (status 1)\naitm: address already in use (os error 48)"),
                                         label: "Embedded core"),
                         bus: .disconnected, role: nil, capability: .inactive)
+        case .statusCoreStarting:
+            Self.status(session, core: Self.core(.starting, label: "Embedded core · starting"), bus: .connecting("127.0.0.1:60745"), role: nil,
+                   capability: .inactive)
+        case .statusCoreStopped:
+            Self.status(session, core: Self.core(.stopped, label: "Embedded core · stopped"), bus: .disconnected, role: nil,
+                   capability: .inactive)
+        case .statusBusConnecting:
+            Self.status(session, core: Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080"),
+                   bus: .connecting("127.0.0.1:60745"), role: nil, capability: .capturing)
+        case .statusBusAgent:
+            Self.status(session, core: Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080"),
+                   bus: .connected("127.0.0.1:60745"), role: "agent", roleWarning: true, capability: .capturing)
         case .statusBusToken:
             // The bus rejected the token: the Bus lane names the token remedy.
             Self.status(session, core: Self.readyCore,

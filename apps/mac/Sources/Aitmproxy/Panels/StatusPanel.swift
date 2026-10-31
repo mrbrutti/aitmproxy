@@ -98,7 +98,7 @@ struct StatusPanel: View {
         VStack(alignment: .leading, spacing: Space.md) {
             TrackedLabel("Getting started").accessibilityAddTraits(.isHeader)
             if summary.allStepsDone {
-                Text("Everything is connected — \(Self.flowsWord(session.rows.count)) captured")
+                Text("Everything is connected — \(Format.count(session.rows.count, "flow")) captured")
                     .font(Tok.Face.ui(Tok.Typography.Size.md))
                     .foregroundStyle(Tok.Ink.secondary.color)
                     .frame(height: Tok.Size.Row.default)
@@ -165,10 +165,6 @@ struct StatusPanel: View {
         return top
     }
 
-    private static func flowsWord(_ n: Int) -> String {
-        n == 1 ? "1 flow" : "\(n) flows"
-    }
-
     // MARK: Actions
 
     /// Every card and step action goes through `Session.perform(connection:)` — the same
@@ -193,8 +189,8 @@ struct StatusPanel: View {
             Task { await CaptureSwitch.set(false, session: session) }
         case .uninstallExtension:
             confirmingUninstall = true
-        default:
-            break
+        case .showCoreLog, .reconnectBus, .openScope, .openBrowser, .copyListenAddress, .approveInSystemSettings:
+            break // handled by Session.perform(connection:) above
         }
     }
 }
@@ -268,7 +264,7 @@ private struct LaneCard: View {
                     }
                 } label: {
                     Image(systemName: "ellipsis")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
                         .foregroundStyle(Tok.Ink.secondary.color)
                         .frame(width: Tok.Size.control, height: Tok.Size.control)
                         .contentShape(Rectangle())
@@ -293,7 +289,7 @@ private struct StepRow: View {
     var body: some View {
         HStack(spacing: Space.md) {
             Image(systemName: step.done ? "checkmark.circle.fill" : "circle")
-                .font(.system(size: 13, weight: .medium))
+                .font(Tok.Face.ui(Tok.Typography.Size.md, .medium))
                 .foregroundStyle(step.done ? Tok.Status.success.color : Tok.Ink.tertiary.color)
                 .frame(width: Tok.Size.icon)
                 .accessibilityHidden(true)

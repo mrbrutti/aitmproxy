@@ -21,7 +21,7 @@ public enum LaneState: Int, Comparable, Sendable {
 /// One thing a surface may offer to change a lane. The view maps each to the same call
 /// its menu-bar item makes; the model only names it.
 public enum ConnectionAction: Hashable, Sendable {
-    case startCore, stopCore, restartCore, showCoreLog, switchToEmbedded
+    case startCore, restartCore, showCoreLog, switchToEmbedded
     case reconnectBus, openBusSettings
     case turnCaptureOn, turnCaptureOff, openScope, approveInSystemSettings, uninstallExtension, openCaptureSettings
     case openBrowser, copyListenAddress
@@ -30,7 +30,6 @@ public enum ConnectionAction: Hashable, Sendable {
     public var title: String {
         switch self {
         case .startCore: "Start Core"
-        case .stopCore: "Stop Core"
         case .restartCore: "Restart Core"
         case .showCoreLog: "Core Log…"
         case .switchToEmbedded: "Switch to Embedded…"
@@ -47,8 +46,8 @@ public enum ConnectionAction: Hashable, Sendable {
         }
     }
 
-    /// Actions that remove or stop something; the view styles them as such and confirms.
-    public var isDestructive: Bool { self == .uninstallExtension || self == .stopCore }
+    /// Actions that remove something; the view styles them as such and confirms.
+    public var isDestructive: Bool { self == .uninstallExtension }
 }
 
 /// One of the three lanes the operator must understand: the core (the proxy process), the
@@ -81,6 +80,12 @@ public struct ConnectionLane: Hashable, Sendable {
     public let remedy: String?
     /// What the surface may offer, primary first.
     public let actions: [ConnectionAction]
+
+    /// The word with its lane named where the word alone would be ambiguous: "capture off" as is,
+    /// "failed" → "core: failed". For the one-item surfaces (status bar).
+    public var compact: String {
+        word.hasPrefix(kind.title.lowercased()) ? word : "\(kind.title.lowercased()): \(word)"
+    }
 
     public init(kind: Kind, state: LaneState, word: String, detail: String, remedy: String? = nil,
                 actions: [ConnectionAction] = []) {
@@ -117,12 +122,10 @@ public struct GettingStartedStep: Hashable, Sendable {
 /// `capture.status` bus verb exists (proposed 2026-10-31). Optional input: when present it
 /// sharpens the capture lane's detail; the app's own tunnel status stays the fallback.
 public struct CoreCaptureStatus: Hashable, Sendable {
-    public var feederListening: Bool
     public var providerAttached: Bool
     public var flowsHandedOff: Int
 
-    public init(feederListening: Bool, providerAttached: Bool, flowsHandedOff: Int) {
-        self.feederListening = feederListening
+    public init(providerAttached: Bool, flowsHandedOff: Int) {
         self.providerAttached = providerAttached
         self.flowsHandedOff = flowsHandedOff
     }
@@ -149,6 +152,23 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     public var allStepsDone: Bool { steps.allSatisfy(\.done) }
 
+    /// The status bar's one connection word: "connected" while every lane is fine, else the
+    /// worst lane's compact form ("capture off", "core: failed").
+    public var overallWord: String { overall == .ok ? "connected" : worst.compact }
+
+    /// The sidebar badge beside the brand: "ok", or the lane that needs attention ("Capture").
+    public var badge: String { overall == .ok ? "ok" : worst.kind.title }
+
+    /// The three lanes in one line, for tooltips: "Core: running — Embedded · proxy …\nBus: …".
+    public var tooltip: String {
+        lanes.map { "\($0.kind.title): \($0.word) — \($0.detail)" }.joined(separator: "\n")
+    }
+
+    /// The three lanes as one spoken sentence, for accessibility labels.
+    public var spoken: String {
+        "core \(core.word), bus \(bus.word), capture \(capture.word)"
+    }
+
     /// The hint for a Scope entry while the provider still claims a bare host's DNS lookup:
     /// a port-qualified entry claims only the TCP flow. Removed with the provider fix.
     public static let scopeEntryHint = "example.com:443"
@@ -173,8 +193,8 @@ public struct ConnectionSummary: Hashable, Sendable {
         let advice = CaptureAdvice.make(capability: capability, supported: captureSupported, scopeHostCount: scopeHostCount)
         let capture = captureLane(advice, capability: capability, activeKind: activeKind,
                                   scopeHostCount: scopeHostCount, coreCapture: coreCapture)
-        let steps = self.steps(core: core, bus: busLane, advice: advice, scopeHostCount: scopeHostCount,
-                               flowCount: flowCount, listenAddress: listenAddress)
+        let steps = self.steps(core: core, bus: busLane, activeKind: activeKind, advice: advice,
+                               scopeHostCount: scopeHostCount, flowCount: flowCount, listenAddress: listenAddress)
         return ConnectionSummary(core: core, bus: busLane, capture: capture, steps: steps, listenAddress: listenAddress)
     }
 
@@ -246,7 +266,7 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     private static func captureLane(_ advice: CaptureAdvice, capability: CaptureCapability, activeKind: ActiveCoreKind,
                                     scopeHostCount: Int, coreCapture: CoreCaptureStatus?) -> ConnectionLane {
-        let hosts = scopeHostCount == 1 ? "1 host in scope" : "\(scopeHostCount) hosts in scope"
+        let hosts = Format.count(scopeHostCount, "host") + " in scope"
         // Capture is the embedded core's gate: with an external core the switch is not ours.
         if activeKind == .external, advice != .unsupported {
             return ConnectionLane(kind: .capture, state: .off, word: "capture off",
@@ -304,9 +324,10 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     // MARK: Steps
 
-    private static func steps(core: ConnectionLane, bus: ConnectionLane, advice: CaptureAdvice,
+    private static func steps(core: ConnectionLane, bus: ConnectionLane, activeKind: ActiveCoreKind, advice: CaptureAdvice,
                               scopeHostCount: Int, flowCount: Int, listenAddress: String) -> [GettingStartedStep] {
-        let coreDone = core.state == .ok || (core.word == "external" && bus.state == .ok)
+        // An external core is the operator's; it counts as running once the bus reaches it.
+        let coreDone = core.state == .ok || (activeKind == .external && bus.state == .ok)
         let busDone = bus.state == .ok
         let extensionDone: Bool
         let extensionTitle: String
@@ -324,7 +345,7 @@ public struct ConnectionSummary: Hashable, Sendable {
             extensionDone = false; extensionTitle = "Turn on the capture extension"; extensionAction = .turnCaptureOn
         }
         let scopeDone = scopeHostCount > 0
-        let hosts = scopeHostCount == 1 ? "1 host" : "\(scopeHostCount) hosts"
+        let hosts = Format.count(scopeHostCount, "host")
         return [
             GettingStartedStep(kind: .coreRunning,
                                title: coreDone ? "Core is running" : "Start the core",
@@ -337,7 +358,7 @@ public struct ConnectionSummary: Hashable, Sendable {
                                title: scopeDone ? "Scope has \(hosts)" : "Add a host to Scope (for now as \(scopeEntryHint))",
                                done: scopeDone, action: scopeDone ? nil : .openScope),
             GettingStartedStep(kind: .firstFlow,
-                               title: flowCount > 0 ? "\(flowCount == 1 ? "1 flow" : "\(flowCount) flows") captured"
+                               title: flowCount > 0 ? "\(Format.count(flowCount, "flow")) captured"
                                                     : "Point a client at \(listenAddress), or open the browser",
                                done: flowCount > 0, action: flowCount > 0 ? nil : .openBrowser),
         ]

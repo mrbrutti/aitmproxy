@@ -100,10 +100,10 @@ import Testing
 
     @Test func coreCaptureStatusSharpensTheOnLane() {
         let attached = make(capability: .capturing, hosts: 2,
-                            coreCapture: CoreCaptureStatus(feederListening: true, providerAttached: true, flowsHandedOff: 7)).capture
+                            coreCapture: CoreCaptureStatus(providerAttached: true, flowsHandedOff: 7)).capture
         #expect(attached.state == .ok && attached.detail == "attached · 2 hosts in scope · 7 flows handed off")
         let detached = make(capability: .capturing, hosts: 2,
-                            coreCapture: CoreCaptureStatus(feederListening: true, providerAttached: false, flowsHandedOff: 0)).capture
+                            coreCapture: CoreCaptureStatus(providerAttached: false, flowsHandedOff: 0)).capture
         #expect(detached.state == .warning && detached.word == "on, core not attached")
         #expect(detached.actions.first == .restartCore)
     }
@@ -145,7 +145,29 @@ import Testing
     @Test func actionTitlesAreTitleCaseWithEllipsesWhereAViewOpens() {
         #expect(ConnectionAction.openScope.title == "Open Scope…")
         #expect(ConnectionAction.turnCaptureOn.title == "Turn On Capture")
-        #expect(ConnectionAction.uninstallExtension.isDestructive && ConnectionAction.stopCore.isDestructive)
+        #expect(ConnectionAction.uninstallExtension.isDestructive)
         #expect(!ConnectionAction.restartCore.isDestructive)
+    }
+
+    @Test func remediesFallBackWhenTheReasonIsNotRecognised() {
+        let refused = make(bus: .failed("connection refused")).bus
+        #expect(refused.remedy == "Reconnect, or check the address in Settings ▸ Bus")
+        let degraded = make(capability: .degraded("tunnel setup failed")).capture
+        #expect(degraded.remedy == "Turn capture off and on again; if it stays degraded, uninstall and reinstall the extension")
+    }
+
+    @Test func laneStatesRankOffBelowWarningAndTheWorstTieBreaksToTheFirstLane() {
+        #expect(LaneState.ok < LaneState.working && LaneState.working < LaneState.off
+                && LaneState.off < LaneState.warning && LaneState.warning < LaneState.error)
+        let bothOff = make(core: nil, kind: .embedded, bus: .connected("x"), role: "operator", capability: .extensionNotInstalled)
+        #expect(bothOff.worst.kind == .core, "core and capture are both off; the first lane names the row")
+    }
+
+    @Test func compactTooltipAndSpokenComeFromTheLanes() {
+        let s = make(core: core(.degraded(reason: "boom")), bus: .connected("127.0.0.1:1"), role: "operator", capability: .extensionNotInstalled)
+        #expect(s.core.compact == "core: failed")
+        #expect(s.capture.compact == "capture off")
+        #expect(s.tooltip == "Core: failed — boom\nBus: connected — operator · 127.0.0.1:1\nCapture: capture off — extension not installed")
+        #expect(s.spoken == "core failed, bus connected, capture capture off")
     }
 }

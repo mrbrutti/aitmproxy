@@ -66,14 +66,11 @@ struct CoreLogPanel: View {
 
     private var header: some View {
         PageHeader("Core Log") {
-            if let connection = state.connection {
-                HStack(spacing: Tok.Metric.gapTight) {
-                    Circle().fill(connection.health.dotColor.color)
-                        .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                    Text(connection.health.statusWord)
-                        .font(Tok.Face.data(Tok.Typography.Size.sm))
-                        .foregroundStyle(Tok.Ink.secondary.color)
-                }
+            if state.connection != nil {
+                // The same word the Status page, pill and status bar use for the core.
+                LaneDot(lane: session.connectionSummary.core)
+                    .font(Tok.Face.data(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
             }
         }
     }

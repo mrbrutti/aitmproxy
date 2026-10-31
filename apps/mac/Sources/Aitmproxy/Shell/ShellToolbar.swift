@@ -78,9 +78,9 @@ struct ListeningPill: View {
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
-        .help(summary.lanes.map { "\($0.kind.title): \($0.word) — \($0.detail)" }.joined(separator: "\n") + "\nOpens Status (⌘0)")
+        .help(summary.tooltip + "\nOpens Status (⌘0)")
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("aitmproxy: core \(summary.core.word), bus \(summary.bus.word), capture \(summary.capture.word)")
+        .accessibilityLabel("aitmproxy: \(summary.spoken)")
     }
 }
 

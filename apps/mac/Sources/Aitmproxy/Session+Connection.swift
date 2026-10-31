@@ -30,7 +30,7 @@ extension Session {
     @discardableResult
     func perform(connection action: ConnectionAction) -> Bool {
         switch action {
-        case .startCore, .restartCore, .stopCore:
+        case .startCore, .restartCore:
             return false
         case .showCoreLog:
             coreLogVisible = true

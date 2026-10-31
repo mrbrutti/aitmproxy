@@ -348,7 +348,7 @@ has "#3 the Capture toggle is disabled unless the embedded core is the active ki
 has "#3 the Capture tab says why the toggle is disabled when the core is not embedded" "$cs_body" 'if !usesEmbedded {'
 hasnt "TG-AC5 the Settings status line never hard-codes 'Capturing' (it shows CaptureCapability.title)" \
     "$cs_body" '"Capturing"'
-has "TG-AC5 the Settings status line shows CaptureCapability.title" "$cs_body" 'Text(capability.title)'
+has "TG-AC5 the Settings status line shows the capture lane word (ConnectionSummary, one vocabulary)" "$cs_body" 'Text(session.connectionSummary.capture.word)'
 has "TG-AC5 a running action reads Working, never Capturing" "$cs_body" 'Text("Working…")'
 
 # ============================ TG-AC10: menu command + non-colliding shortcut ===========
@@ -592,9 +592,9 @@ poll_flows=$(line_of "$poll_body" 'flow[.]list')
 ordered "security-3 pollLoop refreshes the scope on every pass, before it reads flows (inScope reads scopeHosts)" "$poll_refresh" "$poll_flows"
 status_empty=$(line_of "$cap_body" '[}] else if advice[.]offersScope [{]')
 status_text=$(line_of "$cap_body" 'Text[(]"On, nothing in scope"[)]')
-status_title=$(line_of "$cap_body" 'Text[(]capability[.]title[)]')
+status_title=$(line_of "$cap_body" 'Text[(]session[.]connectionSummary[.]capture[.]word[)]')
 ordered "NS-AC2 the Status row's empty-scope branch is tested first" "$status_empty" "$status_text"
-ordered "NS-AC2 the Status row reads 'On, nothing in scope' before the generic capability title branch" "$status_text" "$status_title"
+ordered "NS-AC2 the Status row reads 'On, nothing in scope' before the generic lane-word branch" "$status_text" "$status_title"
 has "NS-AC3 the Apps banner stays on one line and truncates (a long degraded reason must not wrap into the fixed-height row)" "$banner_body" '.lineLimit(1)'
 has "NS-AC3 the Apps banner truncates at the tail" "$banner_body" '.truncationMode(.tail)'
 

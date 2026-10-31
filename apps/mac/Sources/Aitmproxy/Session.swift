@@ -176,13 +176,17 @@ final class Session {
     var selection: Set<FlowID> = []
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
-    /// The landing page: the page the operator last used, or Status on a fresh install (nothing
-    /// to show yet, so show what is running and what to do first). Only list pages are
-    /// remembered, so a session that ends on Status or Saved comes back on Flows. Fixture,
-    /// snapshot and self-test runs start on Apps as before so their scenes stay deterministic.
-    var page: SidebarPage? = Store.isOverridden
-        ? .apps
-        : (SidebarPage(rawValue: UserDefaults.standard.string(forKey: "page") ?? "") ?? .status) {
+    /// The landing page (spec §3): the list page the operator last used; Status until they
+    /// have navigated once (a fresh install has nothing to show yet, so show what is running
+    /// and what to do first). Only list pages are remembered, so a session that ends on Status
+    /// or Saved comes back on Flows. Fixture, snapshot and self-test runs start on Apps so their
+    /// scenes stay deterministic.
+    static func landingPage(saved: String?) -> SidebarPage {
+        guard let saved, let page = SidebarPage(rawValue: saved) else { return .status }
+        return page.isInSidebar ? page : .flows
+    }
+
+    var page: SidebarPage? = Store.isOverridden ? .apps : Session.landingPage(saved: UserDefaults.standard.string(forKey: "page")) {
         didSet {
             guard !Store.isOverridden, let page else { return }
             UserDefaults.standard.set((page.isInSidebar ? page : .flows).rawValue, forKey: "page")

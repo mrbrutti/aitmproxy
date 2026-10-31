@@ -57,18 +57,15 @@ struct StatusBar: View {
                 Button { session.show(.status) } label: {
                     HStack(spacing: Tok.Metric.gapTight) {
                         Circle().fill(worst.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                        // "capture off" already names its lane; "failed" needs "core: failed".
-                        Text(summary.overall == .ok ? "connected"
-                             : worst.word.hasPrefix(worst.kind.title.lowercased()) ? worst.word
-                             : "\(worst.kind.title.lowercased()): \(worst.word)")
+                        Text(summary.overallWord)
                             .lineLimit(1)
                     }
                     .foregroundStyle(summary.overall == .ok ? Tok.Ink.secondary.color : worst.state.color.color)
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .help(summary.lanes.map { "\($0.kind.title): \($0.word) — \($0.detail)" }.joined(separator: "\n") + "\nOpens Status (⌘0)")
-                .accessibilityLabel("Connection: core \(summary.core.word), bus \(summary.bus.word), capture \(summary.capture.word)")
+                .help(summary.tooltip + "\nOpens Status (⌘0)")
+                .accessibilityLabel("Connection: \(summary.spoken)")
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))
         }
