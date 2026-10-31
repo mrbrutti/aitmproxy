@@ -320,6 +320,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::time::Duration;
+
+    use aitm_core::{
+        Body, ConnInfo, FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpVersion, MemFlowStore,
+        Verdict,
+    };
+    use aitm_plugin::{EventSink, UpstreamConnector};
+    use tokio::io::duplex;
+
     use super::*;
 
     /// SA-AC0: a WebSocket flow inherits exactly the handshake's capture attribution.
@@ -342,5 +352,136 @@ mod tests {
         assert!(meta.marks.is_empty());
         assert_eq!(meta.comment, None);
         assert!(!meta.is_replay);
+    }
+
+    // ---- Tester additions (whole-branch stage 5) -----------------------------
+
+    /// Lets every event continue; these tests do not look at events.
+    struct NoSink;
+
+    impl EventSink for NoSink {
+        fn emit(&self, _ev: Event) -> BoxFuture<'_, Verdict> {
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    /// The WebSocket module never dials: it is handed the upgraded upstream.
+    struct NoDial;
+
+    impl UpstreamConnector for NoDial {
+        fn connect(&self, _authority: &str, _dst: SocketAddr) -> BoxFuture<'_, Result<ByteStream>> {
+            Box::pin(async { Err(anyhow!("the WebSocket module never dials")) })
+        }
+    }
+
+    /// Store a handshake `HttpFlow` carrying `meta`, hand the module an upgrade
+    /// context for it (as `ModuleCtx::handoff_upgrade` would), run `drive` until
+    /// the client hangs up, and return the `WsFlow` it stored.
+    ///
+    /// The hint's own `peer_identity` / `capture_interface` are left `None` on
+    /// purpose: spec D3 has the WebSocket flow inherit from the stored handshake's
+    /// `FlowMeta`, so this is what proves `drive` reads it from there.
+    async fn ws_flow_after_drive(meta: FlowMeta) -> WsFlow {
+        let store = Arc::new(MemFlowStore::new());
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51000);
+        let handshake = store.insert(Flow::Http(HttpFlow {
+            id: FlowId::new(),
+            request: HttpRequest {
+                method: "GET".into(),
+                scheme: "http".into(),
+                authority: "chat.test".into(),
+                path: "/chat".into(),
+                version: HttpVersion::Http11,
+                headers: HeaderMap::new(),
+                body: Body::Empty,
+                timestamp: SystemTime::now(),
+            },
+            response: None,
+            client_conn: ConnInfo {
+                peer,
+                sni: None,
+                alpn: None,
+                tls: false,
+                established: SystemTime::now(),
+            },
+            server_conn: None,
+            metadata: meta,
+            intercept: InterceptState::Observed,
+        }));
+        let hint = NextLayerHint {
+            dst: peer,
+            is_tls: false,
+            client_hello_sni: None,
+            alpn: vec!["websocket".to_string()],
+            first_bytes: Vec::new(),
+            from_upgrade: true,
+            peer_identity: None,
+            capture_interface: None,
+        };
+        let (client_end, proxy_client) = duplex(1024);
+        let (_upstream_end, proxy_upstream) = duplex(1024);
+        let parent = ModuleCtx::new(store.clone(), Arc::new(NoSink), Arc::new(NoDial));
+        let ctx = parent.for_upgrade(handshake, Box::pin(proxy_upstream), hint);
+        let module = WsModule::new();
+        assert!(module.matches(ctx.hint().expect("an upgrade hint")));
+
+        // The client hangs up at once: `drive` stores the flow, reads EOF, ends.
+        // The upstream end stays open, so the EOF is unambiguously the client's.
+        drop(client_end);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            module.spawn(Box::pin(proxy_client), ctx),
+        )
+        .await
+        .expect("drive must end when the client hangs up")
+        .expect("drive ends cleanly");
+
+        let ws = store
+            .list()
+            .into_iter()
+            .find_map(|id| match store.get(id) {
+                Some(Flow::WebSocket(w)) => Some(w),
+                _ => None,
+            })
+            .expect("drive stored a WsFlow");
+        assert_eq!(ws.handshake, handshake, "linked to its handshake");
+        ws
+    }
+
+    /// SA-AC0, the live wiring: `drive` stores the `WsFlow` with the attribution of
+    /// the handshake flow it reads back from the store, so a captured Safari
+    /// WebSocket is attributed to Safari and `macos-ne` — with none of the
+    /// handshake's own marks or comment. The unit test above pins the helper; this
+    /// pins that `drive` actually applies it to the handshake's metadata.
+    #[tokio::test]
+    async fn drive_stores_the_ws_flow_with_the_handshakes_attribution() {
+        let ws = ws_flow_after_drive(FlowMeta {
+            source_app: Some("com.apple.Safari".into()),
+            capture_interface: Some("macos-ne".into()),
+            marks: vec!["handshake-mark".into()],
+            comment: Some("handshake comment".into()),
+            ..FlowMeta::default()
+        })
+        .await;
+        assert_eq!(ws.metadata.source_app.as_deref(), Some("com.apple.Safari"));
+        assert_eq!(ws.metadata.capture_interface.as_deref(), Some("macos-ne"));
+        assert!(
+            ws.metadata.marks.is_empty(),
+            "marks are the WebSocket flow's own"
+        );
+        assert_eq!(
+            ws.metadata.comment, None,
+            "the comment is the WebSocket flow's own"
+        );
+        assert!(!ws.metadata.is_replay);
+    }
+
+    /// A proxied handshake (no attribution) yields a WebSocket flow with
+    /// `None`/`None`: never a placeholder.
+    #[tokio::test]
+    async fn drive_stores_a_proxied_ws_flow_with_no_attribution() {
+        let ws = ws_flow_after_drive(FlowMeta::default()).await;
+        assert_eq!(ws.metadata.source_app, None);
+        assert_eq!(ws.metadata.capture_interface, None);
     }
 }

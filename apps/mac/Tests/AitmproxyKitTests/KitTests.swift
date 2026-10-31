@@ -264,6 +264,54 @@ import Testing
         #expect(row.client?.bundleID == "com.apple.Safari")
         #expect(row.client?.name == "Safari")
     }
+
+    // MARK: Tester additions (whole-branch stage 5): SA-AC3 edges
+
+    @Test func sourceAppOfTheWrongTypeLeavesClientNil() throws {
+        // A number, bool, array or object where an identifier belongs is not an
+        // app: nil, never a stringified value shown as a fake group.
+        let base: [String: JSONValue] = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                         "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200]
+        let wrong: [JSONValue] = [42, true, ["com.apple.Safari"], ["bundle": "com.apple.Safari"]]
+        for value in wrong {
+            var json = base
+            json["source_app"] = value
+            json["capture_interface"] = value
+            let summary = try #require(FlowSummary(json: .object(json)))
+            #expect(summary.sourceApp == nil, "\(value)")
+            #expect(summary.captureInterface == nil, "\(value)")
+            #expect(summary.row(seq: 1).client == nil, "\(value)")
+        }
+    }
+
+    @Test func displayNameEdgesAndTheClientKeepsTheRawIdentifier() {
+        // D5 rule 2 at its edges: a lone dot and a leading dot.
+        #expect(ClientInfo.displayName(forSourceApp: ".") == ".")
+        #expect(ClientInfo.displayName(forSourceApp: ".hidden") == "hidden")
+        #expect(ClientInfo.displayName(forSourceApp: "a..b") == "b")
+        // The known map wins, and the raw identifier is kept as bundleID either way.
+        let safari = ClientInfo(sourceApp: "com.apple.WebKit.Networking")
+        #expect(safari.name == "Safari")
+        #expect(safari.monogram == "S")
+        #expect(safari.bundleID == "com.apple.WebKit.Networking")
+        #expect(safari.pid == nil)
+        // Two identifiers with the same display name are two clients (bundleID is
+        // part of Hashable), so two apps never merge into one group by name alone.
+        #expect(ClientInfo(sourceApp: "com.apple.Safari") != safari)
+    }
+
+    @Test func anOversizedSourceAppStillDecodesAndGroups() throws {
+        let long = "com.example." + String(repeating: "x", count: 64 * 1024)
+        let json: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                               "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                               "source_app": .string(long), "capture_interface": "macos-ne"]
+        let summary = try #require(FlowSummary(json: json))
+        #expect(summary.sourceApp == long)
+        let row = summary.row(seq: 1)
+        #expect(row.client?.bundleID == long)
+        #expect(row.client?.name == String(repeating: "x", count: 64 * 1024))
+        #expect(row.client?.monogram == "x")
+    }
 }
 
 /// Sizes reach every sum in the Kit from the bus, imports and fixtures: none may trap.

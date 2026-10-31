@@ -850,3 +850,62 @@ fn schemas_declare_source_app_and_capture_interface() {
         }
     }
 }
+
+/// Tester addition (whole-branch stage 5). `source_app` is text a capture backend
+/// supplied about a client. The read commands pass it through verbatim as a
+/// string: quotes, CR/LF, a NUL, non-ASCII and a 64 KiB identifier all survive
+/// untouched — no truncation, escaping or interpretation — on both `flow.get` and
+/// `flow.table`. Escaping for a wire is the transport's job; what to show is the
+/// UI's.
+#[test]
+fn source_app_text_passes_through_verbatim_on_flow_get_and_flow_table() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+
+    let hostile = format!(
+        "com.evil.\"quoted\"\r\n\u{0}日本語.{}",
+        "x".repeat(64 * 1024)
+    );
+    let mut flow = http_flow("GET", "/hostile", Some(200));
+    flow.metadata_mut().source_app = Some(hostile.clone());
+    flow.metadata_mut().capture_interface = Some("macos-ne\n".into());
+    let store = MemFlowStore::new();
+    let id = store.insert(flow);
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let got = reg
+        .command("flow.get")
+        .expect("flow.get registered")
+        .invoke(id_params(id), &host)
+        .expect("flow.get ok");
+    let Value::Object(obj) = got else {
+        panic!("flow.get must return an object, got {got:?}");
+    };
+    assert_eq!(obj.get("source_app"), Some(&Value::Str(hostile.clone())));
+    assert_eq!(
+        obj.get("capture_interface"),
+        Some(&Value::Str("macos-ne\n".into()))
+    );
+
+    let table = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .invoke(Params::default(), &host)
+        .expect("flow.table ok");
+    let Value::Object(obj) = table else {
+        panic!("flow.table must return an object, got {table:?}");
+    };
+    let Some(Value::Array(rows)) = obj.get("flows") else {
+        panic!("flow.table result must have a `flows` array: {obj:?}");
+    };
+    let Some(Value::Object(row)) = rows.first() else {
+        panic!("one row expected, got {rows:?}");
+    };
+    assert_eq!(row.get("source_app"), Some(&Value::Str(hostile)));
+    assert_eq!(
+        row.get("capture_interface"),
+        Some(&Value::Str("macos-ne\n".into()))
+    );
+}

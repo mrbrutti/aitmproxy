@@ -8633,3 +8633,44 @@ async fn push_summary_equals_flow_get_on_the_null_and_saturated_paths() {
     let _ = w.shutdown().await;
     let _ = task.await;
 }
+
+/// Tester addition (whole-branch stage 5, SA-AC2 edge). The push is line-delimited
+/// JSON and `source_app` is text a capture backend supplied about a client. A
+/// value carrying CR/LF, a quote, a NUL and non-ASCII must still arrive as exactly
+/// one line that parses back to the identical string — never a second line (which
+/// a reader would take for another notification), never a truncated or altered one.
+#[test]
+fn pushed_summary_keeps_a_hostile_source_app_on_one_line() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    assert_subscribed(&subscribe_on(&srv, &conn, json!({})));
+
+    let hostile = format!("com.evil.\"q\"\r\n\u{0}日本語.{}", "x".repeat(4096));
+    let mut flow = http_flow("example.com:443", "/hostile");
+    flow.metadata_mut().source_app = Some(hostile.clone());
+    flow.metadata_mut().capture_interface = Some("macos-ne\n".into());
+    let id = store.insert(flow);
+
+    srv.push_flow_event(&Event::RequestHeaders(id));
+    let lines = sink.drain();
+    assert_eq!(lines.len(), 1, "exactly one line was pushed: {lines:?}");
+    let line = lines[0].trim_end_matches(['\r', '\n']);
+    assert!(
+        !line.contains('\n') && !line.contains('\r'),
+        "the line carries no raw line break: {line:?}"
+    );
+    let note: JsonValue = serde_json::from_str(line).expect("the push is JSON");
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["id"], id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"]["source_app"],
+        JsonValue::String(hostile),
+        "{note}"
+    );
+    assert_eq!(
+        note["params"]["summary"]["capture_interface"], "macos-ne\n",
+        "{note}"
+    );
+}

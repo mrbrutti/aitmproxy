@@ -460,4 +460,70 @@ mod tests {
         assert_eq!(back.source_app.as_deref(), Some("com.apple.Safari"));
         assert_eq!(back.capture_interface.as_deref(), Some("macos-ne"));
     }
+
+    // ---- Tester additions (whole-branch stage 5) -----------------------------
+
+    /// SA-AC7 edge: an explicit `null` for either key — what this version writes
+    /// for a proxied flow — loads as `None` as well.
+    #[test]
+    fn meta_rec_with_explicit_null_attribution_loads_as_none() {
+        let doc = PRE_ATTRIBUTION_META.replacen(
+            "\"edited\": false",
+            "\"edited\": false, \"source_app\": null, \"capture_interface\": null",
+            1,
+        );
+        let rec: MetaRec = serde_json::from_str(&doc).expect("explicit nulls parse");
+        let meta = rec_to_meta(&rec);
+        assert_eq!(meta.source_app, None);
+        assert_eq!(meta.capture_interface, None);
+    }
+
+    /// Malformed input: a non-string value for either key is a parse error the
+    /// loader reports — not a panic, and not a value coerced into an identifier.
+    #[test]
+    fn meta_rec_rejects_a_non_string_attribution() {
+        for bad in [
+            "42",
+            "true",
+            "[\"com.apple.Safari\"]",
+            "{\"id\": \"com.apple.Safari\"}",
+        ] {
+            let doc = PRE_ATTRIBUTION_META.replacen(
+                "\"edited\": false",
+                &format!("\"edited\": false, \"source_app\": {bad}"),
+                1,
+            );
+            assert!(
+                serde_json::from_str::<MetaRec>(&doc).is_err(),
+                "source_app = {bad} must not parse"
+            );
+            let doc = PRE_ATTRIBUTION_META.replacen(
+                "\"edited\": false",
+                &format!("\"edited\": false, \"capture_interface\": {bad}"),
+                1,
+            );
+            assert!(
+                serde_json::from_str::<MetaRec>(&doc).is_err(),
+                "capture_interface = {bad} must not parse"
+            );
+        }
+    }
+
+    /// The attribution text round-trips byte for byte: quotes, CR/LF, a NUL,
+    /// non-ASCII and a 64 KiB identifier come back exactly as stored — nothing is
+    /// escaped twice, trimmed or truncated.
+    #[test]
+    fn attribution_round_trips_hostile_text() {
+        let hostile = format!("com.evil.\"q\"\r\n\u{0}日本語.{}", "x".repeat(64 * 1024));
+        let meta = FlowMeta {
+            source_app: Some(hostile.clone()),
+            capture_interface: Some(" macos-ne\t".into()),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&meta_to_rec(&meta)).expect("serialises");
+        let rec: MetaRec = serde_json::from_str(&text).expect("deserialises");
+        let back = rec_to_meta(&rec);
+        assert_eq!(back.source_app.as_deref(), Some(hostile.as_str()));
+        assert_eq!(back.capture_interface.as_deref(), Some(" macos-ne\t"));
+    }
 }
