@@ -77,13 +77,13 @@ enum Tok {
     }
     enum Line {
         /// Panel edges, pane splitters, the rule under tab bars.
-        static let border = DynamicColor(light: 0xE5E7EB, dark: 0x2E2E31)
+        static let border = DynamicColor(light: 0xE5E7EB, dark: 0x2E2E31, highContrastLight: 0x9CA3AF, highContrastDark: 0x5A5A60)
         /// Input, select and outlined-button borders; one step darker than border.
-        static let control = DynamicColor(light: 0xD1D5DB, dark: 0x45454A)
+        static let control = DynamicColor(light: 0xD1D5DB, dark: 0x45454A, highContrastLight: 0x6B7280, highContrastDark: 0x6E6E74)
         /// 2px focus ring = accent.
         static let focus = DynamicColor(light: 0x2563EB, dark: 0x60A5FA)
         /// Row separators in tables and key-value lists; one step lighter than border.
-        static let rule = DynamicColor(light: 0xF0F1F3, dark: 0x303033)
+        static let rule = DynamicColor(light: 0xF0F1F3, dark: 0x303033, highContrastLight: 0xCBD0D6, highContrastDark: 0x4A4A4E)
     }
     /// The 11 flow mark colours (Proxyman's set = the macOS system colours, light/dark).
     enum Mark {
