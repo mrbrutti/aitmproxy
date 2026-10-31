@@ -19,11 +19,18 @@ What "clean" means here, asserted on a real core (never fixtures):
   * NOTHING happened as a side effect: the ORIGIN (an echo-record upstream this
     test owns, or the seeded aitm-testtarget read directly) received exactly the
     one control request and nothing from `flow.replay` of a missing id; the one
-    REAL flow this test captured is byte-identical before/after (no mark, no
-    comment, no mutation landed on "some other" flow); no flow was added and
-    none was lost (proxy.status still counts the control flow; its `paused` /
-    `capturing` fields are NOT asserted equal -- on a shared runner core a
-    concurrent suite may legitimately park a flow or pause the proxy);
+    REAL flow this test captured is byte-identical before/after apart from
+    `meta.marks` (no comment, no mutation landed on it); marks get their own checks:
+      - the REAL flow's marks may only GROW: every earlier mark survives (the
+        bundled passive detectors add marks to a live flow at any moment, so marks
+        are checked on their own);
+      - BARRAGE_MARK (the barrage's own label) appears on no listed flow in the
+        store -- flows captured during a capture pause (and not parked) are not
+        listed by flow.table.
+    Also: no flow was lost (proxy.status still counts the control flow) and the
+    missing ids were not created; proxy.status's `paused` / `capturing` fields are
+    NOT asserted equal -- on a shared runner core a concurrent suite may
+    legitimately park a flow or pause the proxy;
   * the core and the connection survive a barrage: hostile ids (path traversal,
     SQLi, 10 KB, unicode, non-string types) and a flood of FLOOD_N distinct missing
     ids on ONE connection all answer cleanly, fast, with the socket still open and
@@ -54,6 +61,7 @@ Touches no global state; the only write is one captured control flow.
 
 from __future__ import annotations
 
+import copy
 import http.client
 import json
 import os
@@ -76,6 +84,7 @@ NOT_VALID = "not a valid flow id"  # json.rs TypeDesc::FlowId coercion failure
 INVALID_PARAMS = -32602  # JSON-RPC: the command never ran
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 MAX_UUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+BARRAGE_MARK = "e2e-missing"  # flow.mark's label in the barrage; reserved: the store-wide scan fails on any listed flow carrying it, so no other suite may use it
 MAX_ERROR_CHARS = 400  # a clean refusal is short; a dump is not
 NOISE = (  # none of this belongs in an error shown to an agent or operator
     "panicked", "RUST_BACKTRACE", "stack backtrace", "unwrap()", "called `Option",
@@ -340,6 +349,48 @@ def flip_last_hex(fid: str) -> str:
     return fid[:-1] + repl
 
 
+def marks_of(detail: Any) -> List[str]:
+    """`flow.detail`'s `meta.marks`. Fails loudly if the shape moved, so a renamed
+    field cannot turn without_marks() below into a silent no-op."""
+    meta = detail.get("meta") if isinstance(detail, dict) else None
+    marks = meta.get("marks") if isinstance(meta, dict) else None
+    if not isinstance(marks, list) or not all(isinstance(m, str) for m in marks):
+        fail(f"flow.detail has no meta.marks list of strings: {str(detail)[:200]}")
+    return marks
+
+
+def without_marks(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """A deep copy of `detail` with ONLY `meta.marks` removed; never mutates its argument."""
+    out = copy.deepcopy(detail)
+    meta = out.get("meta")
+    if isinstance(meta, dict):
+        meta.pop("marks", None)
+    return out
+
+
+_ABSENT = object()
+
+
+def differing_keys(a: Dict[str, Any], b: Dict[str, Any]) -> List[str]:
+    """Names of what differs between two flow.detail dicts: the top-level keys,
+    and for `meta` the individual `meta.<key>`s. Only for failure messages."""
+    names: List[str] = []
+    for k in sorted(set(a) | set(b)):
+        va, vb = a.get(k, _ABSENT), b.get(k, _ABSENT)
+        if va == vb:
+            continue
+        if k == "meta" and isinstance(va, dict) and isinstance(vb, dict):
+            names += [f"meta.{m}" for m in sorted(set(va) | set(vb)) if va.get(m, _ABSENT) != vb.get(m, _ABSENT)]
+        else:
+            names.append(k)
+    return names
+
+
+def barrage_carriers(rows: List[dict]) -> List[Any]:
+    """Ids of the flow.table rows whose `marks` carry BARRAGE_MARK."""
+    return [r.get("id") for r in rows if BARRAGE_MARK in (r.get("marks") or [])]
+
+
 # --- the id-taking commands -------------------------------------------------------
 
 # (tool, args-for-id, need) -- `need` is the role class that may run it:
@@ -350,7 +401,7 @@ MISSING_ID_CALLS: List[Tuple[str, Callable[[str], Dict[str, Any]], str]] = [
     ("flow.get", lambda i: {"id": i}, "read"),
     ("flow.detail", lambda i: {"id": i, "body": "inline"}, "read"),
     ("flow.replay", lambda i: {"id": i}, "write"),
-    ("flow.mark", lambda i: {"id": i, "marks": ["e2e-missing"]}, "write"),
+    ("flow.mark", lambda i: {"id": i, "marks": [BARRAGE_MARK]}, "write"),
     ("flow.comment", lambda i: {"id": i, "text": "e2e missing-flow probe"}, "write"),
     ("flow.resume", lambda i: {"id": i}, "write"),
     ("flow.kill", lambda i: {"id": i}, "write"),
@@ -438,6 +489,11 @@ def main() -> int:
         detail_before = rd.call("flow.detail", {"id": real_id, "body": "inline"})
         check(isinstance(detail_before, dict) and (detail_before.get("response") or {}).get("status") == status,
               f"flow.detail on the REAL id carries the origin's response ({(detail_before.get('response') or {}).get('status')})")
+        # Not asserted empty: bundled passive detectors may add marks at any moment. So the 'marks only
+        # grew' check below only binds when marks existed before the barrage; it is a tripwire for future
+        # barrage entries. docs/superpowers/specs/2026-10-31-neg-nonexistent-flow-marks-design.md AC3
+        # (fault injection F2) proves that it binds.
+        marks_before = marks_of(detail_before)
         status_before = rd.call("proxy.status")
         flows_before = int(status_before.get("flows") or 0)
         check(flows_before >= 1, f"proxy.status counts the store ({flows_before} flows, control included)")
@@ -535,9 +591,29 @@ def main() -> int:
         hits = observer.hits()
         check(hits == 1, f"origin's OWN record still shows exactly 1 request for {tag} (got {hits}) -- no replay leaked")
         detail_after = rd.call("flow.detail", {"id": real_id, "body": "inline"})
-        check(detail_after == detail_before, "flow.detail of the REAL flow is byte-identical: no mark/comment/mutation landed elsewhere")
-        tagged = [r for r in table_rows(rd) if tag in (r.get("path") or "")]
+        marks_after = marks_of(detail_after)
+        marks_delta = f"(marks {marks_before!r} -> {marks_after!r})"
+        # Detectors add marks after the response is stored, so compare everything else strictly.
+        rest_before, rest_after = without_marks(detail_before), without_marks(detail_after)
+        differs = ", ".join(differing_keys(rest_before, rest_after))
+        check(rest_after == rest_before,
+              "flow.detail of the REAL flow is byte-identical apart from meta.marks -- no comment or mutation landed on it"
+              + (f" (differs in: {differs})" if differs else ""))
+        check(BARRAGE_MARK not in marks_after,
+              f"the barrage's mark label {BARRAGE_MARK!r} is absent from the REAL flow's marks -- no flow.mark landed on it {marks_delta}")
+        check(set(marks_before) <= set(marks_after),
+              f"marks only grew: every mark present before the barrage is still present -- none was replaced or wiped {marks_delta}"
+              + (" -- vacuous: no marks before the barrage, so only the label checks and the rest-of-detail comparison bound"
+                 if not marks_before else ""))
+        rows = table_rows(rd)
+        tagged = [r for r in rows if tag in (r.get("path") or "")]
         check(len(tagged) == 1 and tagged[0]["id"] == real_id, f"flow.table holds exactly the one control flow for {tag} ({len(tagged)})")
+        if not isinstance(tagged[0].get("marks"), list):  # a renamed field must not turn the scan below into a no-op
+            fail(f"flow.table row of the REAL flow has no marks list: {str(tagged[0])[:200]}")
+        carriers = barrage_carriers(rows)
+        check(not carriers,
+              f"no flow in the store carries the barrage's mark label {BARRAGE_MARK!r} -- no flow.mark landed on any listed flow "
+              f"(scanned {len(rows)} flows; carriers: {carriers})")
         list_after = set(rd.call("flow.list"))
         for _, mid in missing_ids:
             check(mid not in list_after, f"{mid} still does not exist: refusing did not create it")
