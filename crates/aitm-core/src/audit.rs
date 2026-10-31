@@ -17,9 +17,10 @@
 //! `client_label` is a display string, not an identity: `origin` is the only
 //! authoritative field. The web bridge's connections carry the server-minted
 //! [`WEB_BRIDGE_CLIENT_LABEL`] (`web-bridge`). Every other label is whatever the
-//! client declared, run through [`sanitize_client_label`] (control, invisible, and
-//! bidirectional-override characters dropped, credential material masked by
-//! [`crate::redact::scrub_text`], at most [`MAX_CLIENT_LABEL_CHARS`] = 64
+//! client declared, run through [`sanitize_client_label`] (a whitespace control
+//! such as a tab or a newline becomes one blank, every other control, invisible,
+//! and bidirectional-override character is dropped, credential material is masked
+//! by [`crate::redact::scrub_text`], at most [`MAX_CLIENT_LABEL_CHARS`] = 64
 //! characters) and, where a client declares it, [`declared_client_label`], which
 //! suffixes a label that reads as a reserved name (`web-bridge`, `Web Bridge`,
 //! `web_bridge`) with ` (declared)`. A label is unauthenticated: a client can
@@ -58,6 +59,16 @@
 //!
 //! Origin still separates `mcp` from `operator` and `cli`. Only a durable JSONL
 //! sink, once one is attached, keeps a complete record; the ring is a live view.
+//!
+//! # Who reads an entry
+//!
+//! A role only reads the entries [`AuditEntry::visible_to`] allows it (an agent
+//! never sees what the operator or the CLI did); the ring and the durable log
+//! themselves are never filtered, and neither is what the ring keeps: the filter
+//! is applied on read only, so a hidden entry holds its slot and counts in its
+//! source's share exactly as a visible one does. Each streaming connection's
+//! entries carry a server-assigned `connection_id`, so two clients that share one
+//! label (every agent-token bridge connection is `web-bridge`) stay tellable apart.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -133,6 +144,11 @@ pub struct AuditEntry {
     /// for the web bridge, otherwise the sanitised name the client declared, if it
     /// declared one. Display-only; `origin` is authoritative.
     pub client_label: Option<String>,
+    /// The server-assigned, opaque id of the streaming connection that made the
+    /// call. `None` means the call is not attributable to a streaming connection
+    /// (an in-process caller, a request/response transport). Minted by the
+    /// server; see `McpServer::connection_id` in `aitm-mcp`.
+    pub connection_id: Option<String>,
     /// The dotted command name, e.g. `"flow.replay"`.
     pub command: String,
     /// A redacted, size-capped rendering of the arguments — never secrets.
@@ -151,6 +167,15 @@ impl AuditEntry {
             .unwrap_or(0)
     }
 
+    /// Whether `viewer` may see this entry. Trusted control (the operator, the CLI)
+    /// sees every entry; any other viewer sees only entries made by callers that
+    /// are not trusted control, so an agent never reads what the operator did.
+    /// Both sides ask [`Frontend::is_trusted_control`], the one definition of
+    /// "trusted" in the workspace, never a comparison against a role.
+    pub fn visible_to(&self, viewer: Frontend) -> bool {
+        viewer.is_trusted_control() || !self.origin.is_trusted_control()
+    }
+
     /// The transport-neutral rendering of the entry, used identically by
     /// `agent.activity` (its `[AuditEntry]` result), the `notifications/aitm/agent`
     /// line, and the durable JSONL — so every surface shows one shape.
@@ -165,6 +190,13 @@ impl AuditEntry {
             "client_label".to_string(),
             match &self.client_label {
                 Some(label) => Value::Str(label.clone()),
+                None => Value::Null,
+            },
+        );
+        m.insert(
+            "connection_id".to_string(),
+            match &self.connection_id {
+                Some(id) => Value::Str(id.clone()),
                 None => Value::Null,
             },
         );
@@ -228,9 +260,11 @@ fn is_label_noise(c: char) -> bool {
 /// The one sanitiser for a client label, whatever its source.
 ///
 /// It reads only the first `LABEL_SCAN_CHARS` characters of `raw`, so its work
-/// is bounded however large the input. It drops control, invisible, and
-/// bidirectional-override characters, masks credential material with
-/// [`crate::redact::scrub_text`], trims, and truncates to
+/// is bounded however large the input. It turns a whitespace control (a tab,
+/// a newline, NEL, a line or paragraph separator) into one blank, so
+/// `Bearer\tabc` keeps the blank the scrubber's `Bearer` pattern needs, and drops
+/// every other control, invisible, and bidirectional-override character. It masks
+/// credential material with [`crate::redact::scrub_text`], trims, and truncates to
 /// [`MAX_CLIENT_LABEL_CHARS`] characters. It returns `None` when nothing is left.
 /// A second application can only mask more (masking can remove an escape, and the
 /// cut can land inside a mask), never reveal more; the label stays bounded, up to
@@ -241,7 +275,11 @@ pub fn sanitize_client_label(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .take(LABEL_SCAN_CHARS)
-        .filter(|c| !is_label_noise(*c))
+        .filter_map(|c| match (is_label_noise(c), c.is_whitespace()) {
+            (true, true) => Some(' '),
+            (true, false) => None,
+            (false, _) => Some(c),
+        })
         .collect();
     let scrubbed = crate::redact::scrub_text(&cleaned);
     let bounded: String = scrubbed
@@ -525,13 +563,45 @@ impl AuditRing {
     /// only entries strictly after it; `limit` keeps the most recent `limit` of
     /// those (presented oldest first), so a reconnecting surface catches up
     /// without replaying the whole ring.
+    ///
+    /// This is the **unfiltered** read: it returns every entry whatever its
+    /// origin, so it is for in-process tests only. Never use it on a surface a
+    /// role reads; use [`AuditRing::recent_for`] there.
     pub fn recent(&self, since: Option<SystemTime>, limit: Option<usize>) -> Vec<AuditEntry> {
+        self.recent_where(since, limit, |_| true)
+    }
+
+    /// [`AuditRing::recent`] as `viewer` may see it: an entry is kept only when
+    /// [`AuditEntry::visible_to`] says so. The visibility filter runs **before**
+    /// `limit`, so `limit` counts the entries the viewer can see, never the
+    /// hidden ones (a limit of 1 for an agent never returns the operator's
+    /// entry, and never returns nothing because the newest entry was hidden).
+    /// Both lanes are read and the result is in call order, as for `recent`.
+    pub fn recent_for(
+        &self,
+        viewer: Frontend,
+        since: Option<SystemTime>,
+        limit: Option<usize>,
+    ) -> Vec<AuditEntry> {
+        self.recent_where(since, limit, |e| e.visible_to(viewer))
+    }
+
+    /// The shared body of [`AuditRing::recent`] and [`AuditRing::recent_for`]:
+    /// both lanes, `since` (strictly after), then `keep`, then sort by call order,
+    /// then `limit` (the most recent entries), oldest first.
+    fn recent_where(
+        &self,
+        since: Option<SystemTime>,
+        limit: Option<usize>,
+        keep: impl Fn(&AuditEntry) -> bool,
+    ) -> Vec<AuditEntry> {
         let state = self.lock();
         let mut held: Vec<&(u64, AuditEntry)> = state
             .evidence
             .entries()
             .chain(state.routine.entries())
             .filter(|(_, e)| since.is_none_or(|s| e.at > s))
+            .filter(|(_, e)| keep(e))
             .collect();
         held.sort_unstable_by_key(|(seq, _)| *seq);
         let skip = limit.map_or(0, |limit| held.len().saturating_sub(limit));
@@ -541,15 +611,39 @@ impl AuditRing {
             .collect()
     }
 
-    /// How many entries, across both lanes, were recorded at or after `since` —
-    /// the source of `agent.status.actions_last_minute`.
+    /// How many entries, across both lanes, were recorded at or after `since`,
+    /// whatever their origin.
+    ///
+    /// This is the **unfiltered** count, compiled for in-process tests only: no
+    /// surface a role reads may call it. It is [`AuditRing::count_since_for`] as the
+    /// operator, who sees every entry. Use `count_since_for` everywhere else.
+    #[cfg(test)]
     pub fn count_since(&self, since: SystemTime) -> usize {
+        self.count_since_for(Frontend::Operator, since, None)
+    }
+
+    /// How many entries, across both lanes, were recorded at or after `since` that
+    /// `viewer` may see (the source of `agent.status.actions_last_minute`): only
+    /// entries that are [`AuditEntry::visible_to`] the viewer, and, when
+    /// `exclude_connection` is `Some(id)`, not made by the connection `id`. An
+    /// entry with no `connection_id` is never excluded: an id the server did not
+    /// assign cannot match one it did.
+    pub fn count_since_for(
+        &self,
+        viewer: Frontend,
+        since: SystemTime,
+        exclude_connection: Option<&str>,
+    ) -> usize {
         let state = self.lock();
         state
             .evidence
             .entries()
             .chain(state.routine.entries())
             .filter(|(_, e)| e.at >= since)
+            .filter(|(_, e)| {
+                e.visible_to(viewer)
+                    && !exclude_connection.is_some_and(|id| e.connection_id.as_deref() == Some(id))
+            })
             .count()
     }
 
@@ -600,10 +694,75 @@ mod tests {
             at: SystemTime::now(),
             origin: Frontend::Mcp,
             client_label: None,
+            connection_id: None,
             command: command.to_string(),
             args_summary: "{}".to_string(),
             result,
         }
+    }
+
+    fn entry_of(origin: Frontend, connection_id: Option<&str>, command: &str) -> AuditEntry {
+        AuditEntry {
+            origin,
+            connection_id: connection_id.map(str::to_string),
+            ..entry(command, AuditResult::Ok)
+        }
+    }
+
+    #[test]
+    fn visible_to_matrix() {
+        let origins = [Frontend::Cli, Frontend::Operator, Frontend::Mcp];
+        let entries = origins.map(|o| entry_of(o, None, "x"));
+
+        let seen_by = |viewer: Frontend| entries.clone().map(|e| e.visible_to(viewer));
+        assert_eq!(seen_by(Frontend::Cli), [true, true, true]);
+        assert_eq!(seen_by(Frontend::Operator), [true, true, true]);
+        assert_eq!(seen_by(Frontend::Mcp), [false, false, true]);
+    }
+
+    #[test]
+    fn recent_for_applies_the_limit_after_the_filter() {
+        let ring = AuditRing::new(8);
+        ring.append(entry_of(Frontend::Operator, None, "op1"));
+        ring.append(entry_of(Frontend::Mcp, None, "ag1"));
+        ring.append(entry_of(Frontend::Operator, None, "op2"));
+        ring.append(entry_of(Frontend::Mcp, None, "ag2"));
+        ring.append(entry_of(Frontend::Operator, None, "op3"));
+
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, Some(2))),
+            ["ag1", "ag2"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Operator, None, Some(2))),
+            ["ag2", "op3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
+            ["ag1", "ag2"]
+        );
+    }
+
+    #[test]
+    fn count_since_for_filters_and_excludes() {
+        let t0 = SystemTime::now();
+        let ring = AuditRing::new(32);
+        for _ in 0..3 {
+            ring.append(entry_of(Frontend::Mcp, Some("A"), "x"));
+        }
+        for _ in 0..2 {
+            ring.append(entry_of(Frontend::Mcp, Some("B"), "x"));
+        }
+        for _ in 0..4 {
+            ring.append(entry_of(Frontend::Operator, Some("O"), "x"));
+        }
+        ring.append(entry_of(Frontend::Mcp, None, "x"));
+
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, None), 6);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, Some("A")), 3);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, Some("nope")), 6);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, None), 10);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, Some("O")), 6);
     }
 
     #[test]
@@ -630,6 +789,43 @@ mod tests {
     }
 
     #[test]
+    fn to_value_carries_connection_id() {
+        let with_id = AuditEntry {
+            connection_id: Some("conn_ab-1".to_string()),
+            ..entry("x", AuditResult::Ok)
+        };
+        let Value::Object(m) = with_id.to_value() else {
+            panic!("expected object")
+        };
+        assert_eq!(
+            m.get("connection_id"),
+            Some(&Value::Str("conn_ab-1".to_string()))
+        );
+        assert_eq!(
+            m.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "args",
+                "at",
+                "client_label",
+                "command",
+                "connection_id",
+                "origin",
+                "result"
+            ]
+        );
+
+        let without_id = AuditEntry {
+            connection_id: None,
+            ..entry("x", AuditResult::Ok)
+        };
+        let Value::Object(m) = without_id.to_value() else {
+            panic!("expected object")
+        };
+        assert_eq!(m.get("connection_id"), Some(&Value::Null));
+        assert_eq!(m.len(), 7);
+    }
+
+    #[test]
     fn error_renders_with_reason() {
         let v = entry("x", AuditResult::Error("nope".into())).to_value();
         let Value::Object(m) = v else {
@@ -645,6 +841,25 @@ mod tests {
         );
     }
 
+    /// The instant `ms` milliseconds after the epoch, so a window edge can be
+    /// placed exactly instead of racing `SystemTime::now()`.
+    fn at_ms(ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    /// An entry made at the explicit instant `ms` after the epoch ([`at_ms`]).
+    fn entry_at_ms(
+        origin: Frontend,
+        connection_id: Option<&str>,
+        command: &str,
+        ms: u64,
+    ) -> AuditEntry {
+        AuditEntry {
+            at: at_ms(ms),
+            ..entry_of(origin, connection_id, command)
+        }
+    }
+
     #[test]
     fn sanitize_client_label_bounds_a_hostile_label() {
         assert_eq!(
@@ -654,7 +869,7 @@ mod tests {
         assert_eq!(sanitize_client_label(&"\u{0}".repeat(10 << 20)), None);
         assert_eq!(
             sanitize_client_label("a\u{0}b\nc\u{202E}d"),
-            Some("abcd".to_string())
+            Some("ab cd".to_string())
         );
         let scrubbed = sanitize_client_label("token=abc123").expect("a label remains");
         assert!(!scrubbed.contains("abc123"), "secret leaked: {scrubbed}");
@@ -859,7 +1074,6 @@ mod tests {
             '\u{180E}',
             '\u{200B}',
             '\u{200F}',
-            '\u{2028}',
             '\u{202E}',
             '\u{2060}',
             '\u{2069}',
@@ -880,6 +1094,8 @@ mod tests {
             .filter(|(_, label)| label.as_deref() != Some("ab"))
             .collect();
         assert!(bad.is_empty(), "an invisible character was kept: {bad:#?}");
+        // The line separator is whitespace: it becomes a blank, not nothing.
+        assert_eq!(sanitize_client_label("a\u{2028}b"), Some("a b".to_string()));
         // A visible non-ASCII letter is not noise.
         assert_eq!(
             sanitize_client_label("caf\u{e9}"),
@@ -960,6 +1176,7 @@ mod tests {
             at: SystemTime::now(),
             origin,
             client_label: label.map(str::to_string),
+            connection_id: None,
             command: command.to_string(),
             args_summary: "{}".to_string(),
             result: AuditResult::Ok,
@@ -1453,12 +1670,14 @@ mod tests {
 
     #[test]
     fn sanitize_client_label_drops_c1_controls_and_delete() {
-        let bad: Vec<(char, Option<String>)> = ['\u{7F}', '\u{80}', '\u{85}', '\u{9B}', '\u{9F}']
+        let bad: Vec<(char, Option<String>)> = ['\u{7F}', '\u{80}', '\u{9B}', '\u{9F}']
             .into_iter()
             .map(|c| (c, sanitize_client_label(&format!("a{c}b"))))
             .filter(|(_, label)| label.as_deref() != Some("ab"))
             .collect();
         assert!(bad.is_empty(), "a control character was kept: {bad:#?}");
+        // NEL is a whitespace control: it becomes a blank, not nothing.
+        assert_eq!(sanitize_client_label("a\u{85}b"), Some("a b".to_string()));
         // The characters next to the C1 block are letters and symbols, not controls.
         assert_eq!(
             sanitize_client_label("a\u{A1}b"),
@@ -1510,5 +1729,496 @@ mod tests {
                 "{raw:?} was not masked: {label}"
             );
         }
+    }
+
+    /// The scrubber's `Bearer` frame needs a blank between the word and its token.
+    /// A whitespace control (tab, newline, NEL, line separator) is noise, but
+    /// deleting it would join `Bearer` to the token and leave nothing to match, so
+    /// it becomes a blank instead.
+    #[test]
+    fn sanitize_client_label_masks_a_bearer_token_after_a_whitespace_control() {
+        for raw in [
+            "agent Bearer\tabc123",
+            "agent Bearer\nabc123",
+            "Bearer\u{85}abc123",
+            "Bearer\u{2028}abc123",
+        ] {
+            let label = sanitize_client_label(raw).expect("a label remains");
+            assert!(!label.contains("abc123"), "{raw:?} leaked abc123: {label}");
+            assert!(
+                label.contains("Bearer [redacted]"),
+                "{raw:?} was not masked as a bearer token: {label}"
+            );
+        }
+        // These pair frames need no blank, so they were masked before the port too.
+        for (raw, secret) in [
+            ("agent token\t=abc123", "abc123"),
+            ("password\n: hunter2", "hunter2"),
+        ] {
+            let label = sanitize_client_label(raw).expect("a label remains");
+            assert!(!label.contains(secret), "{raw:?} leaked {secret}: {label}");
+            assert!(
+                label.contains("[redacted]"),
+                "{raw:?} was not masked: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_client_label_turns_whitespace_controls_into_a_blank() {
+        assert_eq!(sanitize_client_label("a\tb\nc"), Some("a b c".to_string()));
+    }
+
+    /// The viewer filter is read-side only (plan 2026-10-30-bus-audit-connection-id,
+    /// spec A4 and AC28). `append_in`, eviction and the source table never look at
+    /// who may read an entry, so an operator flood that an agent may not read still
+    /// holds slots and still costs the agent its entries exactly as a visible flood
+    /// would: here the agent's `m1` is evicted although the flood is hidden from it.
+    #[test]
+    fn the_viewer_filter_does_not_change_what_the_ring_keeps() {
+        let ring = AuditRing::with_lane_capacities(4, 1);
+        for command in ["m1", "m2", "m3"] {
+            ring.append(sourced(Frontend::Mcp, None, command));
+        }
+        for i in 0..100 {
+            ring.append(sourced(Frontend::Operator, None, &format!("o{i}")));
+        }
+
+        assert_eq!(ring.evidence_len(), 4);
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["m2", "m3", "o98", "o99"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
+            ["m2", "m3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, Some(1))),
+            ["m3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Operator, None, None)),
+            ["m2", "m3", "o98", "o99"]
+        );
+    }
+
+    /// `recent_for` and `count_since_for` read both lanes in one lock (spec A4 and
+    /// AC29): `since`, then the viewer filter, then call order, then `limit`, so
+    /// `limit` counts the entries the viewer may see across the evidence and the
+    /// routine lane alike; and the count adds the viewer filter and the
+    /// connection exclusion on top of `at >= since`.
+    #[test]
+    fn recent_for_and_count_since_for_span_both_lanes() {
+        let t0 = SystemTime::now();
+        let ring = AuditRing::with_lane_capacities(8, 8);
+        ring.append_in(
+            AuditLane::Evidence,
+            entry_of(Frontend::Operator, None, "op-e1"),
+        );
+        ring.append_in(
+            AuditLane::Routine,
+            entry_of(Frontend::Mcp, Some("A"), "ag-r1"),
+        );
+        ring.append_in(
+            AuditLane::Evidence,
+            entry_of(Frontend::Mcp, Some("B"), "ag-e2"),
+        );
+        ring.append_in(
+            AuditLane::Routine,
+            entry_of(Frontend::Operator, None, "op-r2"),
+        );
+        ring.append_in(
+            AuditLane::Evidence,
+            entry_of(Frontend::Mcp, Some("A"), "ag-e3"),
+        );
+
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
+            ["ag-r1", "ag-e2", "ag-e3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, Some(2))),
+            ["ag-e2", "ag-e3"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Operator, None, Some(3))),
+            ["ag-e2", "op-r2", "ag-e3"]
+        );
+        assert_eq!(commands(&ring.recent(None, Some(2))), ["op-r2", "ag-e3"]);
+
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, None), 3);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, None), 5);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, Some("A")), 1);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, Some("A")), 3);
+    }
+
+    /// Eight entries over both lanes with explicit instants and ids, in call order
+    /// (`E` is the evidence lane, `R` the routine lane; the id is the connection):
+    ///
+    /// | seq | lane | origin   | id  | command | at (ms) |
+    /// |-----|------|----------|-----|---------|---------|
+    /// | 0   | E    | Mcp      | A   | e-ag0   | 1000    |
+    /// | 1   | R    | Operator | O   | r-op1   | 2000    |
+    /// | 2   | R    | Mcp      | B   | r-ag2   | 3000    |
+    /// | 3   | E    | Operator | O   | e-op3   | 4000    |
+    /// | 4   | E    | Mcp      | A   | e-ag4   | 5000    |
+    /// | 5   | R    | Mcp      | B   | r-ag5   | 6000    |
+    /// | 6   | E    | Operator | O   | e-op6   | 7000    |
+    /// | 7   | R    | Mcp      | A   | r-ag7   | 8000    |
+    ///
+    /// Connection A has entries in both lanes (seq 0, 4 in E; 7 in R), so does O
+    /// (seq 1 in R; 3, 6 in E); B is routine only. Call order interleaves the
+    /// lanes, so a read that concatenated one lane after the other would reorder.
+    fn two_lane_ring() -> AuditRing {
+        let ring = AuditRing::with_lane_capacities(8, 8);
+        for (lane, origin, id, command, ms) in [
+            (AuditLane::Evidence, Frontend::Mcp, "A", "e-ag0", 1000),
+            (AuditLane::Routine, Frontend::Operator, "O", "r-op1", 2000),
+            (AuditLane::Routine, Frontend::Mcp, "B", "r-ag2", 3000),
+            (AuditLane::Evidence, Frontend::Operator, "O", "e-op3", 4000),
+            (AuditLane::Evidence, Frontend::Mcp, "A", "e-ag4", 5000),
+            (AuditLane::Routine, Frontend::Mcp, "B", "r-ag5", 6000),
+            (AuditLane::Evidence, Frontend::Operator, "O", "e-op6", 7000),
+            (AuditLane::Routine, Frontend::Mcp, "A", "r-ag7", 8000),
+        ] {
+            ring.append_in(lane, entry_at_ms(origin, Some(id), command, ms));
+        }
+        ring
+    }
+
+    /// `recent_for` with `since`, the viewer filter and `limit` all active over
+    /// entries held in both lanes. A `recent_for` that ignored `since`, read it as
+    /// inclusive, applied `limit` before the filter, or skipped the call-order sort
+    /// across the lanes fails here;
+    /// `recent_for_and_count_since_for_span_both_lanes` pins the filter and the
+    /// limit over both lanes without `since`.
+    #[test]
+    fn recent_for_across_both_lanes_combines_since_the_filter_and_the_limit() {
+        let ring = two_lane_ring();
+
+        // No `since`, no `limit`: call order across the two lanes, not lane order
+        // (lane order would put e-ag4 before r-ag2).
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
+            ["e-ag0", "r-ag2", "e-ag4", "r-ag5", "r-ag7"]
+        );
+        // `since` is strictly after: r-ag2 sits exactly at 3000 and is out.
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), None)),
+            ["e-ag4", "r-ag5", "r-ag7"]
+        );
+        // One millisecond earlier and it is back in.
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(2999)), None)),
+            ["r-ag2", "e-ag4", "r-ag5", "r-ag7"]
+        );
+        // `limit` counts what survives `since` AND the filter, newest kept. Taking
+        // the last 2 before the filter would give the operator's e-op6 and r-ag7,
+        // and so only ["r-ag7"].
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), Some(2))),
+            ["r-ag5", "r-ag7"]
+        );
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), Some(1))),
+            ["r-ag7"]
+        );
+        // A limit above what is visible pads nothing.
+        assert_eq!(
+            commands(&ring.recent_for(Frontend::Mcp, Some(at_ms(3000)), Some(50))),
+            ["e-ag4", "r-ag5", "r-ag7"]
+        );
+        // A window that starts at the newest entry holds nothing, for every viewer.
+        for viewer in [Frontend::Mcp, Frontend::Operator, Frontend::Cli] {
+            assert_eq!(
+                commands(&ring.recent_for(viewer, Some(at_ms(8000)), None)),
+                Vec::<&str>::new()
+            );
+        }
+        // Trusted control sees both lanes' operator entries, same window and limit.
+        for viewer in [Frontend::Operator, Frontend::Cli] {
+            assert_eq!(
+                commands(&ring.recent_for(viewer, Some(at_ms(4000)), None)),
+                ["e-ag4", "r-ag5", "e-op6", "r-ag7"]
+            );
+            assert_eq!(
+                commands(&ring.recent_for(viewer, Some(at_ms(4000)), Some(3))),
+                ["r-ag5", "e-op6", "r-ag7"]
+            );
+        }
+        // The unfiltered read is unchanged by all of the above.
+        assert_eq!(ring.recent(None, None).len(), 8);
+    }
+
+    /// `count_since_for` with the window edge, the viewer filter and the connection
+    /// exclusion over both lanes, where the excluded connection's entries sit in
+    /// both. AC29 pins the exclusion over both lanes at `t0` (every entry in the
+    /// window); a count that dropped an entry from one lane when excluding, or
+    /// mixed the edge up with `recent_for`'s strict one, passes it.
+    #[test]
+    fn count_since_for_across_both_lanes_combines_the_window_the_filter_and_the_exclusion() {
+        let ring = two_lane_ring();
+
+        // The window edge is inclusive: r-ag2 at 3000 counts at 3000, not at 3001.
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(3000), None), 4);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(3001), None), 3);
+        // A is in both lanes (e-ag4 evidence, r-ag7 routine): both go.
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, at_ms(3000), Some("A")),
+            2
+        );
+        // B is routine only (r-ag2, r-ag5).
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, at_ms(3000), Some("B")),
+            2
+        );
+        // Trusted control counts everything in the window, then drops its own id
+        // from both lanes: O has r-op1 (routine) and e-op3, e-op6 (evidence).
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(2000), None),
+            7
+        );
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(2000), Some("O")),
+            4
+        );
+        // From 4000 the window holds 5 entries: O's e-op3 and e-op6, A's e-ag4 and
+        // r-ag7, B's r-ag5. Excluding O leaves A's two and B's one.
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(4000), Some("O")),
+            3
+        );
+        // The Cli viewer counts as the operator does.
+        assert_eq!(
+            ring.count_since_for(Frontend::Cli, at_ms(2000), Some("O")),
+            4
+        );
+        // Excluding an id the viewer may not see changes nothing: an agent that
+        // names the operator's id learns nothing and lowers nothing.
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(0), Some("O")), 5);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, at_ms(0), None), 5);
+        // An empty id names no connection: it must not match the entries that have
+        // no id, so nothing is excluded.
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(0), Some("")),
+            8
+        );
+        // ...including when the ring does hold an entry with no id: an in-process or
+        // HTTP-POST call is `None`, and an empty excluded id must not match it.
+        let mixed = AuditRing::new(8);
+        mixed.append_in(
+            AuditLane::Evidence,
+            entry_at_ms(Frontend::Mcp, None, "anon-e", 1000),
+        );
+        mixed.append_in(
+            AuditLane::Routine,
+            entry_at_ms(Frontend::Mcp, None, "anon-r", 2000),
+        );
+        mixed.append_in(
+            AuditLane::Routine,
+            entry_at_ms(Frontend::Mcp, Some("A"), "own", 3000),
+        );
+        assert_eq!(mixed.count_since_for(Frontend::Mcp, at_ms(0), Some("")), 3);
+        assert_eq!(mixed.count_since_for(Frontend::Mcp, at_ms(0), Some("A")), 2);
+        assert_eq!(mixed.count_since_for(Frontend::Mcp, at_ms(0), None), 3);
+        // A window after every entry counts nothing.
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, at_ms(9000), Some("A")),
+            0
+        );
+        assert_eq!(
+            ring.count_since_for(Frontend::Operator, at_ms(9000), None),
+            0
+        );
+    }
+
+    /// An entry's `connection_id` belongs to the entry: eviction removes whole
+    /// entries and never rewrites a survivor's id, and the id is not part of the
+    /// source key. Two connections of one `(origin, label)` source (the web
+    /// bridge's case: every agent-token connection is `(mcp, web-bridge)`) share
+    /// one bucket, so the lane evicts the oldest entry of the pair, whichever
+    /// connection made it, yet every survivor still names its own connection. A
+    /// ring that bucketed by id would evict from the connection with more entries
+    /// instead (spec A3: "the id is a read-side attribute").
+    #[test]
+    fn a_connection_id_survives_lane_eviction_and_is_not_a_bucket_key() {
+        let bridge = |id: &str, command: &str| AuditEntry {
+            client_label: Some(WEB_BRIDGE_CLIENT_LABEL.to_string()),
+            ..entry_of(Frontend::Mcp, Some(id), command)
+        };
+        let ids = |entries: &[AuditEntry]| -> Vec<Option<String>> {
+            entries.iter().map(|e| e.connection_id.clone()).collect()
+        };
+        let some = |id: &str| Some(id.to_string());
+        let ring = AuditRing::with_lane_capacities(4, 2);
+
+        // Evidence lane, capacity 4. C1 a1; C2 b1 b2 b3; C1 a2: the fifth entry
+        // evicts the oldest of the one shared bucket, a1 (C1's). A bucket per
+        // connection would hold C2's three against C1's two and evict b1.
+        for (id, command) in [
+            ("C1", "a1"),
+            ("C2", "b1"),
+            ("C2", "b2"),
+            ("C2", "b3"),
+            ("C1", "a2"),
+        ] {
+            ring.append(bridge(id, command));
+        }
+        let held = ring.recent(None, None);
+        assert_eq!(commands(&held), ["b1", "b2", "b3", "a2"]);
+        assert_eq!(ids(&held), [some("C2"), some("C2"), some("C2"), some("C1")]);
+
+        // Routine lane, capacity 2, same source: r1 is evicted, r2 and r3 keep
+        // their own ids and the evidence lane is untouched.
+        for (id, command) in [("C1", "r1"), ("C2", "r2"), ("C1", "r3")] {
+            ring.append_in(AuditLane::Routine, bridge(id, command));
+        }
+        assert_eq!(ring.evidence_len(), 4);
+        assert_eq!(ring.routine_len(), 2);
+        let held = ring.recent(None, None);
+        assert_eq!(commands(&held), ["b1", "b2", "b3", "a2", "r2", "r3"]);
+        assert_eq!(
+            ids(&held),
+            [
+                some("C2"),
+                some("C2"),
+                some("C2"),
+                some("C1"),
+                some("C2"),
+                some("C1")
+            ]
+        );
+        // The viewer-filtered read and the count see the same survivors and ids.
+        assert_eq!(ids(&ring.recent_for(Frontend::Mcp, None, None)), ids(&held));
+        // Six survivors: C1 made a2 and r3, C2 made the other four.
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, UNIX_EPOCH, Some("C1")),
+            4
+        );
+        assert_eq!(
+            ring.count_since_for(Frontend::Mcp, UNIX_EPOCH, Some("C2")),
+            2
+        );
+
+        // Past the source table (the overflow bucket shares entries of many
+        // sources) every entry still carries the id of the connection that made it.
+        let sources = MAX_AUDIT_SOURCES + 8;
+        let wide = AuditRing::with_lane_capacities(sources * 2, 1);
+        for i in 0..sources {
+            wide.append(AuditEntry {
+                client_label: Some(format!("src-{i}")),
+                ..entry_of(Frontend::Mcp, Some(&format!("id-{i}")), &format!("c{i}"))
+            });
+        }
+        let held = wide.recent(None, None);
+        assert_eq!(held.len(), sources);
+        assert_eq!(
+            ids(&held),
+            (0..sources)
+                .map(|i| Some(format!("id-{i}")))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Every whitespace character the sanitiser treats as noise (the five ASCII
+    /// whitespace controls, NEL, and the line and paragraph separators).
+    const WHITESPACE_NOISE: [char; 8] = [
+        '\t', '\n', '\u{B}', '\u{C}', '\r', '\u{85}', '\u{2028}', '\u{2029}',
+    ];
+
+    /// The R2 port, for every whitespace noise character. The plan's literals pin
+    /// `\t`, `\n`, U+0085 and U+2028 for the `Bearer` frame; `\r`, U+000B (vertical
+    /// tab), U+000C (form feed) and U+2029 (paragraph separator) are the same bug
+    /// if the blank substitution misses them: `Bearer\u{B}abc123` would be joined
+    /// into `Bearerabc123`, which no scrubber frame matches, and the token would
+    /// reach the ring, the push, `agent.activity` and the findings store.
+    #[test]
+    fn sanitize_client_label_masks_a_credential_after_every_whitespace_control() {
+        for c in WHITESPACE_NOISE {
+            let bearer = format!("agent Bearer{c}abc123");
+            let label = sanitize_client_label(&bearer).expect("a label remains");
+            assert!(
+                !label.contains("abc123"),
+                "{bearer:?} leaked the token: {label:?}"
+            );
+            assert!(
+                label.contains("Bearer [redacted]"),
+                "{bearer:?} was not masked as a bearer token: {label:?}"
+            );
+            // The pair frames do not need the blank, so they hold either way; they
+            // must keep holding with the blank in place.
+            for (raw, secret) in [
+                (format!("agent token{c}=abc123"), "abc123"),
+                (format!("password{c}: hunter2"), "hunter2"),
+            ] {
+                let label = sanitize_client_label(&raw).expect("a label remains");
+                assert!(!label.contains(secret), "{raw:?} leaked: {label:?}");
+                assert!(
+                    label.contains("[redacted]"),
+                    "{raw:?} not masked: {label:?}"
+                );
+            }
+        }
+    }
+
+    /// A whitespace control is one blank, wherever it sits, and the blank counts
+    /// toward the 64-character cut like any other character. The blank is what the
+    /// existing `trim()` calls then act on at the edges: a whitespace control at the
+    /// start or end of a label never survives as a blank, and a label made only of
+    /// them is no label.
+    #[test]
+    fn sanitize_client_label_whitespace_controls_are_one_blank_each_and_count_toward_the_cap() {
+        for c in WHITESPACE_NOISE {
+            // Inside: one blank, never nothing (the label would be joined) and never
+            // collapsed (two controls make two blanks).
+            assert_eq!(
+                sanitize_client_label(&format!("a{c}b")),
+                Some("a b".to_string()),
+                "{c:?} inside a label"
+            );
+            assert_eq!(
+                sanitize_client_label(&format!("a{c}{c}b")),
+                Some("a  b".to_string()),
+                "two {c:?} inside a label"
+            );
+            // At the edges: the substituted blank is trimmed, so the label is bare.
+            for raw in [
+                format!("{c}label"),
+                format!("label{c}"),
+                format!("{c}{c}label{c}{c}"),
+            ] {
+                assert_eq!(
+                    sanitize_client_label(&raw),
+                    Some("label".to_string()),
+                    "{raw:?}"
+                );
+            }
+        }
+        // Nothing but whitespace controls leaves nothing.
+        assert_eq!(
+            sanitize_client_label(&WHITESPACE_NOISE.iter().collect::<String>()),
+            None
+        );
+
+        // The substituted blanks are characters of the label: 30 + 3 + 40 is 73
+        // characters, cut to 64, keeps the three blanks and 31 of the 40 `B`s. Had
+        // the controls been deleted the label would hold 34 `B`s and no blanks.
+        let raw = format!("{}\t\r\u{2029}{}", "A".repeat(30), "B".repeat(40));
+        assert_eq!(
+            sanitize_client_label(&raw),
+            Some(format!("{}   {}", "A".repeat(30), "B".repeat(31)))
+        );
+        // A cut that lands on a substituted blank leaves no trailing blank.
+        let raw = format!("{}\u{B}B", "A".repeat(63));
+        assert_eq!(sanitize_client_label(&raw), Some("A".repeat(63)));
+
+        // The 1024-character scan window counts raw characters, before any
+        // substitution: 1024 controls use it all up, and one fewer leaves room for
+        // the first visible character.
+        let spent = format!("{}tail", "\t".repeat(1024));
+        assert_eq!(sanitize_client_label(&spent), None);
+        let room = format!("{}ab", "\u{C}".repeat(1023));
+        assert_eq!(sanitize_client_label(&room), Some("a".to_string()));
     }
 }

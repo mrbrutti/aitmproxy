@@ -107,7 +107,10 @@ pub struct ConnCtx {
     pub client_label: Option<String>,
     /// A per-connection id, assigned by the transport, used to drop this
     /// connection's subscriptions when it ends. `0` means "not a streaming
-    /// connection" (an in-process `handle` call).
+    /// connection" (an in-process `handle` call): `connection_id` is `null` for
+    /// it. It is also the sole per-connection input of `McpServer::connection_id`
+    /// (the server's own random salt is the other input), so it must stay unique
+    /// per server.
     pub conn_id: u64,
     /// The bounded push sink the transport's writer task drains to the socket;
     /// `None` for in-process callers that have no writer task.
@@ -618,6 +621,24 @@ impl Subscriptions {
     fn fanout_state(&self, line: &str, pushes_muted: &dyn Fn() -> bool) {
         self.fanout(&|_sub| true, line, pushes_muted);
     }
+
+    /// Push the already-rendered audit `line` for `entry` to each subscribed
+    /// connection whose role may see it, as decided by [`AuditEntry::visible_to`]:
+    /// an agent-role subscriber never receives a line an operator or the CLI made.
+    /// A connection gets the line at most once, however many subscriptions it
+    /// holds, and a subscription's flow filter does not apply to an audit line;
+    /// only the role's visibility does. The role is handed to the predicate, never
+    /// compared here, so a role added later is classified in one place.
+    ///
+    /// The visibility predicate is the `wants` of [`Subscriptions::fanout`], which
+    /// runs before the pause mute accounting. So a line a subscriber may not see
+    /// neither reaches it nor **gaps** it while pushes are muted, and never causes
+    /// a later `lagged` marker: the marker would otherwise tell a paused agent that
+    /// the operator had acted. A marker follows only a push the subscriber could
+    /// have seen.
+    fn fanout_audit(&self, entry: &AuditEntry, line: &str, pushes_muted: &dyn Fn() -> bool) {
+        self.fanout(&|sub| entry.visible_to(sub.role), line, pushes_muted);
+    }
 }
 
 /// The operator confirm-over-the-wire token store (spec D4). A `needs_confirmation`
@@ -967,6 +988,14 @@ fn role_str(role: Frontend) -> &'static str {
     }
 }
 
+/// The per-server salt behind [`McpServer::connection_id`]: a v4 UUID (OS
+/// randomness) folded to 64 bits. The fixed version and variant bits sit at
+/// different positions in the two halves, so the xor leaves all 64 bits random.
+fn draw_conn_salt() -> u64 {
+    let (hi, lo) = uuid::Uuid::new_v4().as_u64_pair();
+    hi ^ lo
+}
+
 /// Registry handle + transport selection + the services commands run against.
 pub struct McpServer {
     registry: Arc<Registry>,
@@ -1007,6 +1036,11 @@ pub struct McpServer {
     /// Monotonic source of per-connection ids, so each streaming connection's
     /// subscriptions can be dropped when it ends.
     conn_seq: Arc<AtomicU64>,
+    /// 64 bits of OS randomness drawn once in [`McpServer::new`] and rendered,
+    /// with `conn_id`, by [`McpServer::connection_id`]. It keeps two servers that
+    /// share one audit ring (each counts connections from 1) from ever minting
+    /// the same id, and a restart from repeating one.
+    conn_salt: u64,
     /// Set by the first [`McpServer::spawn_push_dispatcher`] call, so a second
     /// call is a no-op rather than a second dispatcher delivering every event
     /// twice.
@@ -1072,6 +1106,7 @@ impl McpServer {
             push_capacity: DEFAULT_PUSH_CAPACITY,
             write_timeout: DEFAULT_WRITE_TIMEOUT,
             conn_seq: Arc::new(AtomicU64::new(0)),
+            conn_salt: draw_conn_salt(),
             dispatcher_spawned: AtomicBool::new(false),
             confirm_tokens: Arc::new(ConfirmTokens::default()),
             confirm_ttl: DEFAULT_CONFIRM_TTL,
@@ -1212,6 +1247,22 @@ impl McpServer {
     /// subscriptions are dropped when it ends).
     pub fn next_conn_id(&self) -> u64 {
         self.conn_seq.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The opaque, server-assigned id of `conn`, the one an audit line and the
+    /// `initialize` reply carry; `None` when `conn` is not a streaming connection
+    /// (`conn_id == 0`: in-process, HTTP POST, the embedded TUI).
+    ///
+    /// A pure function of this server's random salt and the connection's
+    /// `conn_id`, rendered `conn_<16 lowercase hex>-<decimal>` (at most 64 bytes
+    /// of printable ASCII). Nothing a request carries is read into it: not
+    /// `clientInfo`, not `_meta`, not an argument, not the client label. Callers
+    /// compare it for equality only, and no policy decision keys off it. It is not
+    /// a secret (an agent that reads its own id can compute the lower-numbered
+    /// ones on this server): nothing accepts it as input, and it cannot be forged
+    /// because the server stamps it from the `ConnCtx`, not because it is hidden.
+    fn connection_id(&self, conn: &ConnCtx) -> Option<String> {
+        (conn.conn_id != 0).then(|| format!("conn_{:016x}-{}", self.conn_salt, conn.conn_id))
     }
 
     /// Drop every subscription a connection held (called by the transport when
@@ -1404,6 +1455,7 @@ impl McpServer {
             push_capacity,
             write_timeout,
             conn_seq,
+            conn_salt,
             dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
@@ -1431,6 +1483,7 @@ impl McpServer {
             push_capacity,
             write_timeout,
             conn_seq,
+            conn_salt,
             dispatcher_spawned,
             confirm_tokens,
             confirm_ttl,
@@ -1547,6 +1600,10 @@ impl McpServer {
                     // show it and warn on mismatch (Decision C). Additive and
                     // top-level — it describes this connection, not the server.
                     "role": role_str(conn.role),
+                    // This connection's id (a string), or `null` when the caller
+                    // is not a streaming connection. Additive and top-level like
+                    // `role`, never inside `serverInfo`.
+                    "connection_id": self.connection_id(conn),
                     // Additive (W2): advertise `resources` so MCP Apps hosts fetch
                     // the widget templates, plus the MCP Apps extension id. Clients
                     // that don't know these keys ignore them (research 08 §3.3).
@@ -1818,6 +1875,11 @@ impl McpServer {
             Some(label) => host.with_client_label(label),
             None => host,
         };
+        // So a command can tell whose call it is.
+        let host = match self.connection_id(conn) {
+            Some(id) => host.with_connection_id(id),
+            None => host,
+        };
         let host = match &self.config {
             Some(cfg) => host.with_config(cfg.clone()),
             None => host,
@@ -1897,6 +1959,7 @@ impl McpServer {
             at: SystemTime::now(),
             origin: conn.role,
             client_label: conn_audit_label(conn),
+            connection_id: self.connection_id(conn),
             command: name.to_string(),
             args_summary: redact_args(arguments),
             result: outcome,
@@ -1916,11 +1979,17 @@ impl McpServer {
     /// drops the line without stalling the caller (spec D3a.3).
     ///
     /// Under the `paused` agent policy the line is not enqueued for an agent-role
-    /// subscription, which includes the audit line of the `agent.set paused` that
-    /// caused the pause (it is pushed after the policy flipped); a gap is recorded
-    /// and the marker rides the first delivery after resume (see
-    /// [`McpServer::push_flow_event`]). Operator and CLI subscriptions always
-    /// receive it.
+    /// subscription that may see it; a gap is recorded and the marker rides the
+    /// first delivery after resume (see [`McpServer::push_flow_event`]). Operator
+    /// and CLI subscriptions always receive it.
+    ///
+    /// Only a subscription whose role may see the entry receives it
+    /// ([`AuditEntry::visible_to`]: trusted control sees all, any other role only
+    /// entries made by a non-trusted caller). The role filter lives here, in the one
+    /// `pub` entry point, so every caller is covered, and it is applied before the
+    /// mute accounting: an operator's audit line neither reaches an agent nor gaps
+    /// it, so the audit line of the operator's own `agent.set paused` leaves no
+    /// marker for the agent (see `Subscriptions::fanout_audit`).
     pub fn push_agent(&self, entry: &AuditEntry) {
         let line = json!({
             "jsonrpc": "2.0",
@@ -1929,7 +1998,7 @@ impl McpServer {
         })
         .to_string();
         self.subscriptions
-            .fanout_state(&line, &|| self.agent_pushes_muted());
+            .fanout_audit(entry, &line, &|| self.agent_pushes_muted());
     }
 
     /// The D2 policy decision for one command on one connection. Every role that is

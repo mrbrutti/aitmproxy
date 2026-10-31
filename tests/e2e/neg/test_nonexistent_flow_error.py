@@ -547,7 +547,8 @@ def main() -> int:
               f"paused {status_after.get('paused')!r}, capturing {status_after.get('capturing')!r} (reported, shared-core safe)")
 
         section("ground truth: the audit ring recorded every refusal that RAN, and nothing for what never ran")
-        entries = activity_since(rd, t0_ms)
+        # An agent-role reader no longer receives trusted-control (operator) entries (spec D3), so read as the operator when there is one.
+        entries = activity_since(op or rd, t0_ms)
         check(len(entries) >= len(ran), f"agent.activity has >= {len(ran)} entries since the barrage began ({len(entries)})")
         origin_of = {"agent": "mcp", "operator": "operator"}
         for tool, role, mid in ran:
