@@ -90,8 +90,9 @@ pub struct ConnCtx {
     /// A per-connection id, assigned by the transport, used to drop this
     /// connection's subscriptions when it ends. `0` means "not a streaming
     /// connection" (an in-process `handle` call): `connection_id` is `null` for
-    /// it. It is also the sole input of `McpServer::connection_id`, so it must
-    /// stay unique per server.
+    /// it. It is also the sole per-connection input of `McpServer::connection_id`
+    /// (the server's own random salt is the other input), so it must stay unique
+    /// per server.
     pub conn_id: u64,
     /// The bounded push sink the transport's writer task drains to the socket;
     /// `None` for in-process callers that have no writer task.
@@ -583,11 +584,12 @@ impl Subscriptions {
     }
 
     /// Push the already-rendered audit `line` for `entry` to each subscribed
-    /// connection (once each, regardless of filter) whose role may see it, as
-    /// decided by [`AuditEntry::visible_to`]: an agent-role subscriber never
-    /// receives a line an operator or the CLI made. The role is handed to the
-    /// predicate, never compared here, so a role added later is classified in
-    /// one place.
+    /// connection whose role may see it, as decided by [`AuditEntry::visible_to`]:
+    /// an agent-role subscriber never receives a line an operator or the CLI made.
+    /// A connection gets the line at most once, however many subscriptions it
+    /// holds, and a subscription's flow filter does not apply to an audit line;
+    /// only the role's visibility does. The role is handed to the predicate, never
+    /// compared here, so a role added later is classified in one place.
     ///
     /// The visibility predicate is the `wants` of [`Subscriptions::fanout`], which
     /// runs before the pause mute accounting. So a line a subscriber may not see

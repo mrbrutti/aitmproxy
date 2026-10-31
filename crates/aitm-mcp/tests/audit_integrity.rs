@@ -606,9 +606,12 @@ fn an_oversized_argument_is_capped_in_args_summary() {
     assert_eq!(multibyte.len(), 511 + '…'.len_utf8());
 }
 
-/// The label is sanitised where the server consumes it, whatever set it: control
-/// and bidi characters are dropped and a credential is masked, in the host a
-/// command runs under and in the ring entry alike (not merely cut to 64 chars).
+/// The label is sanitised where the server consumes it, whatever set it: a
+/// whitespace control (here a newline) becomes one blank, every other control and
+/// bidi character is dropped, and a credential is masked, in the host a command
+/// runs under and in the ring entry alike (not merely cut to 64 chars). The
+/// newline's blank sits next to the space that follows it, so two blanks stand
+/// between `agent-x` and `token=`; the bidi override leaves no blank.
 #[test]
 fn a_directly_assigned_label_is_stripped_and_scrubbed_at_the_server() {
     let ring = Arc::new(AuditRing::default());

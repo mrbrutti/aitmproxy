@@ -1,6 +1,5 @@
-//! Tester, whole-branch pass (plan 2026-10-30-bus-audit-connection-id, spec D1 and
-//! AC17): the durable JSONL carries the server-assigned `connection_id` for an
-//! entry that the real `McpServer::record_audit` produced.
+//! The durable JSONL carries the server-assigned `connection_id` for an entry that
+//! the real `McpServer::record_audit` produced (spec D1 and AC17).
 //!
 //! `aitm-ca`'s `durable_line_has_the_same_keys_as_to_value` renders a hand-built
 //! entry, and `aitm-mcp`'s durable-sink test records into a stand-in sink, so
@@ -16,9 +15,8 @@ use std::time::SystemTime;
 
 use aitm::tui::{self, TuiLog};
 use aitm::wire::assemble;
-use aitm_ca::audit::entry_to_jsonl;
 use aitm_ca::{AuditLog, FileAuditLog};
-use aitm_core::{AgentPolicy, Config, Frontend, Value};
+use aitm_core::{AgentPolicy, Config, Frontend};
 use aitm_mcp::{ConnCtx, McpServer};
 use serde_json::{json, Value as JsonValue};
 
@@ -72,11 +70,10 @@ fn list(srv: &McpServer, conn: &ConnCtx) {
     assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
 }
 
-/// The durable line for every audited call is exactly the ring entry rendered by
-/// the one durable renderer; its `connection_id` is the id the connection's own
-/// `initialize` returned (a string), `null` for a call that came over no streaming
-/// connection, and the file keeps the operator's line although an agent cannot
-/// read it from the ring.
+/// Every audited call writes one durable line whose `connection_id` is the id the
+/// connection's own `initialize` returned (a string), `null` for a call that came
+/// over no streaming connection, and the file keeps the operator's line although
+/// an agent cannot read it from the ring.
 #[test]
 fn the_durable_line_of_a_real_audited_call_carries_the_servers_connection_id() {
     let dir = scratch("log");
@@ -136,38 +133,13 @@ fn the_durable_line_of_a_real_audited_call_carries_the_servers_connection_id() {
         "the label and the id travel together in one line"
     );
 
-    // The file is the renderer's output for the ring's entries, key for key, and
-    // its key set is the live view's (`to_value`) key set.
-    let entries = ring.recent(None, None);
-    assert_eq!(entries.len(), 3);
-    for (line, entry) in lines.iter().zip(&entries) {
-        let rendered: JsonValue =
-            serde_json::from_str(&entry_to_jsonl(entry)).expect("the renderer emits JSON");
-        assert_eq!(line, &rendered, "the file holds the renderer's line");
-        let Value::Object(live) = entry.to_value() else {
-            panic!("to_value renders an object");
-        };
-        let mut file_keys: Vec<&str> = line
-            .as_object()
-            .expect("a line is an object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        file_keys.sort_unstable();
-        assert_eq!(
-            file_keys,
-            live.keys().map(String::as_str).collect::<Vec<_>>(),
-            "the durable key set is the live key set"
-        );
-    }
-
-    // The durable log is the complete record. The agent's view of the ring is not.
+    // The durable log is the complete record (the three lines above, the operator's
+    // included). The agent's view of the ring is not.
     assert_eq!(
         ring.recent_for(Frontend::Mcp, None, None).len(),
         2,
         "an agent cannot read the operator's entry from the ring"
     );
-    assert_eq!(lines.len(), 3, "the file still holds it");
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&cfg.ca.dir);

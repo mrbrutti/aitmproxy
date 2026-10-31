@@ -17,9 +17,10 @@
 //! `client_label` is a display string, not an identity: `origin` is the only
 //! authoritative field. The web bridge's connections carry the server-minted
 //! [`WEB_BRIDGE_CLIENT_LABEL`] (`web-bridge`). Every other label is whatever the
-//! client declared, run through [`sanitize_client_label`] (control, invisible, and
-//! bidirectional-override characters dropped, credential material masked by
-//! [`crate::redact::scrub_text`], at most [`MAX_CLIENT_LABEL_CHARS`] = 64
+//! client declared, run through [`sanitize_client_label`] (a whitespace control
+//! such as a tab or a newline becomes one blank, every other control, invisible,
+//! and bidirectional-override character is dropped, credential material is masked
+//! by [`crate::redact::scrub_text`], at most [`MAX_CLIENT_LABEL_CHARS`] = 64
 //! characters) and, where a client declares it, [`declared_client_label`], which
 //! suffixes a label that reads as a reserved name (`web-bridge`, `Web Bridge`,
 //! `web_bridge`) with ` (declared)`. A label is unauthenticated: a client can
@@ -613,10 +614,12 @@ impl AuditRing {
     /// How many entries, across both lanes, were recorded at or after `since`,
     /// whatever their origin.
     ///
-    /// This is the **unfiltered** count, for in-process tests only: no surface a
-    /// role reads may call it. Use [`AuditRing::count_since_for`] there.
+    /// This is the **unfiltered** count, compiled for in-process tests only: no
+    /// surface a role reads may call it. It is [`AuditRing::count_since_for`] as the
+    /// operator, who sees every entry. Use `count_since_for` everywhere else.
+    #[cfg(test)]
     pub fn count_since(&self, since: SystemTime) -> usize {
-        self.count_where(since, |_| true)
+        self.count_since_for(Frontend::Operator, since, None)
     }
 
     /// How many entries, across both lanes, were recorded at or after `since` that
@@ -631,22 +634,16 @@ impl AuditRing {
         since: SystemTime,
         exclude_connection: Option<&str>,
     ) -> usize {
-        self.count_where(since, |e| {
-            e.visible_to(viewer)
-                && !exclude_connection.is_some_and(|id| e.connection_id.as_deref() == Some(id))
-        })
-    }
-
-    /// The shared body of [`AuditRing::count_since`] and
-    /// [`AuditRing::count_since_for`]: both lanes, `at >= since`, then `keep`.
-    fn count_where(&self, since: SystemTime, keep: impl Fn(&AuditEntry) -> bool) -> usize {
         let state = self.lock();
         state
             .evidence
             .entries()
             .chain(state.routine.entries())
             .filter(|(_, e)| e.at >= since)
-            .filter(|(_, e)| keep(e))
+            .filter(|(_, e)| {
+                e.visible_to(viewer)
+                    && !exclude_connection.is_some_and(|id| e.connection_id.as_deref() == Some(id))
+            })
             .count()
     }
 
@@ -732,19 +729,16 @@ mod tests {
         ring.append(entry_of(Frontend::Mcp, None, "ag2"));
         ring.append(entry_of(Frontend::Operator, None, "op3"));
 
-        let commands = |entries: Vec<AuditEntry>| -> Vec<String> {
-            entries.into_iter().map(|e| e.command).collect()
-        };
         assert_eq!(
-            commands(ring.recent_for(Frontend::Mcp, None, Some(2))),
+            commands(&ring.recent_for(Frontend::Mcp, None, Some(2))),
             ["ag1", "ag2"]
         );
         assert_eq!(
-            commands(ring.recent_for(Frontend::Operator, None, Some(2))),
+            commands(&ring.recent_for(Frontend::Operator, None, Some(2))),
             ["ag2", "op3"]
         );
         assert_eq!(
-            commands(ring.recent_for(Frontend::Mcp, None, None)),
+            commands(&ring.recent_for(Frontend::Mcp, None, None)),
             ["ag1", "ag2"]
         );
     }
@@ -847,8 +841,13 @@ mod tests {
         );
     }
 
-    /// An entry made at the explicit instant `ms` after the epoch, so a window edge
-    /// can be placed exactly instead of racing `SystemTime::now()`.
+    /// The instant `ms` milliseconds after the epoch, so a window edge can be
+    /// placed exactly instead of racing `SystemTime::now()`.
+    fn at_ms(ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(ms)
+    }
+
+    /// An entry made at the explicit instant `ms` after the epoch ([`at_ms`]).
     fn entry_at_ms(
         origin: Frontend,
         connection_id: Option<&str>,
@@ -856,113 +855,9 @@ mod tests {
         ms: u64,
     ) -> AuditEntry {
         AuditEntry {
-            at: UNIX_EPOCH + std::time::Duration::from_millis(ms),
+            at: at_ms(ms),
             ..entry_of(origin, connection_id, command)
         }
-    }
-
-    fn at_ms(ms: u64) -> SystemTime {
-        UNIX_EPOCH + std::time::Duration::from_millis(ms)
-    }
-
-    /// `recent_for` runs `since` (strictly after), then the visibility filter, then
-    /// `limit`, oldest first. The AC3 test pins filter-before-limit but never gives
-    /// `since`, so a `recent_for` that ignored `since`, treated it as inclusive, or
-    /// applied `limit` before the filter on this combination would still pass it.
-    #[test]
-    fn recent_for_combines_since_the_filter_and_the_limit() {
-        let ring = AuditRing::new(16);
-        for (origin, command, ms) in [
-            (Frontend::Mcp, "ag1", 1000),
-            (Frontend::Operator, "op1", 2000),
-            (Frontend::Mcp, "ag2", 3000),
-            (Frontend::Operator, "op2", 4000),
-            (Frontend::Mcp, "ag3", 5000),
-            (Frontend::Operator, "op3", 6000),
-        ] {
-            ring.append(entry_at_ms(origin, None, command, ms));
-        }
-        let commands = |entries: Vec<AuditEntry>| -> Vec<String> {
-            entries.into_iter().map(|e| e.command).collect()
-        };
-
-        // The agent after 2000: ag2, ag3 are visible; op2 and op3 are not.
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(2000)), None)),
-            ["ag2", "ag3"]
-        );
-        // limit 1 of what it may see after `since` is the newest visible, ag3, not
-        // the operator's op3 and not an empty result.
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(2000)), Some(1))),
-            ["ag3"]
-        );
-        // A limit above the visible count returns every visible entry, no padding.
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(2000)), Some(5))),
-            ["ag2", "ag3"]
-        );
-        // `since` is strictly after: an entry stamped exactly at it is out, so the
-        // agent whose newest visible entry is at 5000 gets nothing after 5000.
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Mcp, Some(at_ms(5000)), None)),
-            Vec::<String>::new()
-        );
-        // The operator sees everything after 2000, and limit 2 keeps the newest two.
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Operator, Some(at_ms(2000)), None)),
-            ["ag2", "op2", "ag3", "op3"]
-        );
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Operator, Some(at_ms(2000)), Some(2))),
-            ["ag3", "op3"]
-        );
-        // limit 0 is an empty read for every viewer, never "no limit".
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Mcp, None, Some(0))),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            commands(ring.recent_for(Frontend::Operator, None, Some(0))),
-            Vec::<String>::new()
-        );
-    }
-
-    /// `count_since_for` counts entries at or after `since`. The AC4 test places
-    /// every entry after `since`, so a `count_since_for` that dropped the time
-    /// filter altogether still passes it; this one puts entries on both sides of
-    /// the edge and exactly on it.
-    #[test]
-    fn count_since_for_keeps_the_edge_and_drops_what_is_older() {
-        let ring = AuditRing::new(16);
-        for (origin, id, ms) in [
-            (Frontend::Mcp, Some("A"), 9_999),  // one tick before the window
-            (Frontend::Mcp, Some("A"), 10_000), // exactly on the edge: counted
-            (Frontend::Mcp, Some("B"), 10_001), // inside
-            (Frontend::Operator, Some("O"), 9_000), // before the window
-            (Frontend::Operator, Some("O"), 10_500), // inside
-        ] {
-            ring.append(entry_at_ms(origin, id, "x", ms));
-        }
-        let since = at_ms(10_000);
-
-        assert_eq!(ring.count_since_for(Frontend::Mcp, since, None), 2);
-        assert_eq!(ring.count_since_for(Frontend::Mcp, since, Some("A")), 1);
-        assert_eq!(ring.count_since_for(Frontend::Mcp, since, Some("B")), 1);
-        assert_eq!(ring.count_since_for(Frontend::Operator, since, None), 3);
-        assert_eq!(
-            ring.count_since_for(Frontend::Operator, since, Some("O")),
-            2
-        );
-        // A window that starts after every entry counts nothing, for every viewer.
-        assert_eq!(
-            ring.count_since_for(Frontend::Mcp, at_ms(1_000_000), None),
-            0
-        );
-        assert_eq!(
-            ring.count_since_for(Frontend::Operator, at_ms(1_000_000), None),
-            0
-        );
     }
 
     #[test]
@@ -1958,10 +1853,6 @@ mod tests {
         assert_eq!(ring.count_since_for(Frontend::Operator, t0, Some("A")), 3);
     }
 
-    // ---- tester, whole-branch pass on the merged tree (plan
-    // 2026-10-30-bus-audit-connection-id, spec A4, AC29): the combinations the
-    // per-AC tests keep apart. ----
-
     /// Eight entries over both lanes with explicit instants and ids, in call order
     /// (`E` is the evidence lane, `R` the routine lane; the id is the connection):
     ///
@@ -1997,11 +1888,11 @@ mod tests {
     }
 
     /// `recent_for` with `since`, the viewer filter and `limit` all active over
-    /// entries held in both lanes. The existing tests give `since` and the filter
-    /// over one lane (`recent_for_combines_since_the_filter_and_the_limit`) or both
-    /// lanes without `since` (`recent_for_and_count_since_for_span_both_lanes`); a
-    /// `recent_for` that applied `limit` before the filter, skipped the call-order
-    /// sort across the lanes, or read `since` as inclusive passes both of those.
+    /// entries held in both lanes. A `recent_for` that ignored `since`, read it as
+    /// inclusive, applied `limit` before the filter, or skipped the call-order sort
+    /// across the lanes fails here;
+    /// `recent_for_and_count_since_for_span_both_lanes` pins the filter and the
+    /// limit over both lanes without `since`.
     #[test]
     fn recent_for_across_both_lanes_combines_since_the_filter_and_the_limit() {
         let ring = two_lane_ring();
@@ -2092,7 +1983,8 @@ mod tests {
             ring.count_since_for(Frontend::Operator, at_ms(2000), Some("O")),
             4
         );
-        // At 4000 only O's evidence entries remain in the window: 5 held, 2 are O's.
+        // From 4000 the window holds 5 entries: O's e-op3 and e-op6, A's e-ag4 and
+        // r-ag7, B's r-ag5. Excluding O leaves A's two and B's one.
         assert_eq!(
             ring.count_since_for(Frontend::Operator, at_ms(4000), Some("O")),
             3

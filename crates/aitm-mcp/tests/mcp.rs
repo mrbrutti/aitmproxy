@@ -4807,10 +4807,12 @@ fn pair(command: &str, origin: &str) -> (String, String) {
     (command.to_string(), origin.to_string())
 }
 
-/// `fanout_audit` sends each line once per *connection*, however many
-/// subscriptions the connection holds. AC12 subscribes each watcher once, so a
-/// `fanout_audit` that lost its `seen` dedup (one line per subscription) passes
-/// it; here each connection holds three subscriptions and must still get one line.
+/// The audit push sends each line once per *connection*, however many
+/// subscriptions the connection holds (the `seen` dedup lives in
+/// `Subscriptions::fanout`, which `fanout_audit` delegates to). AC12 subscribes
+/// each watcher once, so a `fanout` that lost its dedup (one line per
+/// subscription) passes it; here each connection holds three subscriptions and
+/// must still get one line.
 /// The agent's three subscriptions also get zero lines for an operator call, not
 /// three.
 #[test]
@@ -5329,8 +5331,8 @@ fn the_durable_audit_sink_keeps_every_entry_even_those_an_agent_may_not_read() {
 /// (its subscriptions dropped) neither stops the fan-out from reaching the
 /// subscribers after it in the registry nor hears a later line. The dead operator
 /// connection subscribed first, so the loop reaches it before the live ones. This is
-/// a regression guard for `fanout_audit` (no current-code mutation but an abort at a
-/// dead subscriber fails it).
+/// a regression guard for `Subscriptions::fanout` (the loop `fanout_audit` runs
+/// through; no current-code mutation but an abort at a dead subscriber fails it).
 #[test]
 fn a_closed_or_dropped_subscriber_neither_starves_the_others_nor_hears_further_lines() {
     let ring = Arc::new(AuditRing::default());
@@ -5547,9 +5549,15 @@ fn rv_flow(srv: &McpServer, store: &Arc<MemFlowStore>, authority: &str, path: &s
     id.to_string()
 }
 
-/// An audit push: an operator `agent.status` call on a separate, sinkless
-/// connection. Its audit line is fanned to every subscriber, and the subscriber
-/// under test is not the caller.
+/// An audit push no agent subscription may see: an operator `agent.status` call on
+/// a separate, sinkless connection. Its audit line has origin `operator`, so it is
+/// fanned to the operator and CLI subscribers and is never sent to an agent
+/// subscription, paused or not (an agent is never sent what the operator did). A
+/// test that uses it for an agent subscriber asserts hiddenness, not the pause
+/// mute. Use [`rv_audit_as_agent`] for a line an agent may see; the audit-line
+/// mute is pinned by
+/// `a_visible_agent_line_gaps_a_paused_agent_a_hidden_one_does_not_and_trusted_control_is_never_muted`
+/// and `a_hidden_audit_line_neither_reaches_nor_gaps_a_paused_agent`.
 fn rv_audit(srv: &McpServer) {
     let reply = call_as(srv, Frontend::Operator, "agent.status");
     assert!(
@@ -5562,7 +5570,9 @@ fn rv_audit(srv: &McpServer) {
 /// call on a separate, sinkless connection. Its audit line has origin `mcp`, so it
 /// is delivered to every agent subscriber (the caller is not the subscriber under
 /// test), unlike [`rv_audit`]'s operator line, which an agent is never sent. The
-/// policy must allow the call (a Read), so it is not usable under `Paused`.
+/// policy must allow the call (a Read), so it is not usable under `Paused`: a
+/// paused agent's call is refused, and the refusal's audit line is itself a line
+/// the agent may see (and so is muted and leaves a gap while paused).
 fn rv_audit_as_agent(srv: &McpServer) {
     let reply = call_as(srv, Frontend::Mcp, "agent.status");
     assert!(
@@ -5641,8 +5651,13 @@ fn revoke_push_paused_mutes_flow_pushes() {
     rv_assert_silent(&agent.sink, "a flow push under Paused");
 }
 
-/// AC2: under `Paused`, state and agent (audit) pushes are not enqueued for an
-/// agent subscription, while the operator subscription receives both.
+/// AC2: under `Paused`, a state push is not enqueued for an agent subscription,
+/// while the operator subscription receives it and the audit line. The audit leg
+/// is the operator's call, a line an agent never receives with or without the
+/// pause, so for the agent it asserts hiddenness; the mute of an audit line the
+/// agent may see is pinned by
+/// `a_visible_agent_line_gaps_a_paused_agent_a_hidden_one_does_not_and_trusted_control_is_never_muted`
+/// and `a_hidden_audit_line_neither_reaches_nor_gaps_a_paused_agent`.
 #[test]
 fn revoke_push_paused_mutes_state_and_agent_pushes() {
     let rig = RvRig::new(AgentPolicy::Auto);
@@ -5655,7 +5670,7 @@ fn revoke_push_paused_mutes_state_and_agent_pushes() {
 
     rv_assert_silent(
         &agent.sink,
-        "a state push and an operator-run audited call under Paused",
+        "a state push (muted by the pause) and an operator-run audited call (hidden from an agent) under Paused",
     );
     assert_eq!(
         rv_drain(&operator.sink),
@@ -5721,11 +5736,13 @@ fn revoke_push_policy_table_and_resume() {
     rig.state.set_policy(AgentPolicy::Paused);
     let _suppressed = rig.flow("example.com:443", "/paused");
     rig.srv.push_state(json!({"k": 1}));
+    // The operator's audit line: hidden from an agent under every policy, so it
+    // adds nothing to the mute here (see `rv_audit`).
     rv_audit(&rig.srv);
     assert_eq!(
         rv_drain(&agent.sink),
         Vec::<String>::new(),
-        "policy Paused: the agent receives none of the three pushes"
+        "policy Paused: the agent receives neither the muted flow and state pushes nor the operator's audit line (hidden from it under every policy)"
     );
 
     rig.state.set_policy(AgentPolicy::Auto);
@@ -5835,9 +5852,17 @@ fn revoke_push_no_marker_while_paused() {
     rv_assert_silent(&agent.sink, "after a suppressed state push");
     rv_assert_silent(&agent.sink, "after a state push, drained a second time");
 
+    // The operator's audit line is hidden from an agent, so this leg asserts that
+    // it is not delivered and records no gap, not that a mute suppressed it.
     rv_audit(&rig.srv);
-    rv_assert_silent(&agent.sink, "after a suppressed agent push");
-    rv_assert_silent(&agent.sink, "after an agent push, drained a second time");
+    rv_assert_silent(
+        &agent.sink,
+        "after an operator's audit line (hidden from an agent)",
+    );
+    rv_assert_silent(
+        &agent.sink,
+        "after an operator's audit line, drained a second time",
+    );
 }
 
 /// AC8(i): `Paused` then `Auto` flipped directly on `AgentState`, with no push in
@@ -6051,7 +6076,10 @@ fn revoke_push_queued_lines_are_not_purged() {
 
 /// A burst of suppressed pushes records one gap, not one per push: after resume
 /// the first delivery carries exactly one marker and the next deliveries carry
-/// none. (Also pins that nothing accumulates in the sink while paused.)
+/// none. (Also pins that nothing accumulates in the sink while paused.) The burst
+/// is 50 flow pushes and 50 state pushes, 100 suppressed pushes in all; the 50
+/// operator audit lines beside them are hidden from the agent, so they are neither
+/// suppressed nor part of the gap.
 #[test]
 fn revoke_push_a_burst_while_paused_yields_exactly_one_marker() {
     let rig = RvRig::new(AgentPolicy::Auto);
@@ -6063,7 +6091,10 @@ fn revoke_push_a_burst_while_paused_yields_exactly_one_marker() {
         rig.srv.push_state(json!({ "k": n }));
         rv_audit(&rig.srv);
     }
-    rv_assert_silent(&agent.sink, "after a burst of 150 suppressed pushes");
+    rv_assert_silent(
+        &agent.sink,
+        "after a burst of 100 suppressed pushes (50 flow, 50 state) and 50 hidden operator audit lines",
+    );
 
     rig.state.set_policy(AgentPolicy::Auto);
     let first = rig.flow("example.com:443", "/first");
@@ -7194,9 +7225,10 @@ async fn revoke_socket_paused_agent_goes_quiet_and_resumes_with_a_marker() {
         "step 2: O (never muted) receives F2's flow line: {fence}\n{}",
         o.dump()
     );
-    // O is a subscriber and the audit push of the pause is fanned to every
-    // subscriber, FIFO ahead of F2's line: O must already hold it, or A's
-    // absence of it below would prove nothing.
+    // O (trusted control) is sent the audit line of its own agent.set, FIFO ahead
+    // of F2's line, so it must already hold it here. An agent is never sent that
+    // line (an operator's), so this is a check on O's own stream, not a fence for
+    // what A holds: A's sink is fenced by O's receipt of F2 alone.
     assert!(
         o.seen.iter().any(rv_sock_is_agent_set_audit),
         "step 2: O received the audit line of its own agent.set before F2's line\n{}",
@@ -7216,9 +7248,13 @@ async fn revoke_socket_paused_agent_goes_quiet_and_resumes_with_a_marker() {
         "step 2: no line A received names F2 ({f2})\n{}",
         a.dump()
     );
+    // The operator's agent.set audit line is hidden from an agent with or without
+    // the pause, so this checks hiddenness over a real socket, not the mute. The
+    // mute of an audit line the agent may see is pinned in process by
+    // `a_visible_agent_line_gaps_a_paused_agent_a_hidden_one_does_not_and_trusted_control_is_never_muted`.
     assert!(
         !a.seen.iter().any(rv_sock_is_agent_set_audit),
-        "step 2: A received no agent.set audit line while paused\n{}",
+        "step 2: A is never sent the operator's agent.set audit line (hidden from an agent, paused or not)\n{}",
         a.dump()
     );
     assert!(
@@ -7246,13 +7282,17 @@ async fn revoke_socket_paused_agent_goes_quiet_and_resumes_with_a_marker() {
         .await;
     let since: Vec<String> = a.seen[mark..].iter().map(rv_sock_kind).collect();
     let f3_flow = format!("flow {f3}");
+    // Only the first shape can occur: an agent is never sent the operator's
+    // agent.set audit line (`a_hidden_audit_line_neither_reaches_nor_gaps_a_paused_agent`
+    // and `revoke_push_real_verb_pause_then_resume_without_a_visible_push_has_no_marker`
+    // pin that in process). The second shape is a guard, not an expectation.
     let allowed = [
         vec!["marker".to_string(), f3_flow.clone()],
         vec!["marker".to_string(), "agent agent.set".to_string(), f3_flow],
     ];
     assert!(
         allowed.contains(&since),
-        "step 3: A's lines since step 2 are the marker first, the agent.set audit line optionally, then F3's flow line: got {since:?}\n{}",
+        "step 3: A's lines since step 2 are the marker, then F3's flow line (the agent.set audit line is never expected, the second allowed shape is a guard): got {since:?}\n{}",
         a.dump()
     );
     let markers = a.seen.iter().filter(|l| rv_is_marker(l)).count();
@@ -7736,8 +7776,6 @@ async fn revoke_push_a_paused_agent_still_gets_every_reply_but_no_push() {
         a.dump()
     );
 }
-
-// ------------- tester, whole-branch pass on the merged tree (plan 2026-10-30-bus-audit-connection-id)
 
 /// `(command, client_label, connection_id)` of each entry in an `agent.activity`
 /// reply, oldest first; panics if the reply is not an array of entries.
