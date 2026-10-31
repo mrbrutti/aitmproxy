@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 58] = [
+const EXPECTED_TOOLS: [&str; 59] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -42,6 +42,8 @@ const EXPECTED_TOOLS: [&str; 58] = [
     "flow.comment",
     "flow.clear",
     "proxy.status",
+    // capture.status (spec 2026-10-31-capture-status-verb-design): the macOS NE capture feeder's read-only state, registered on every platform.
+    "capture.status",
     "proxy.pause",
     "proxy.resume",
     "config.get",

@@ -1,5 +1,6 @@
-//! The `capture.status` handle: what the core knows about the macOS NE capture
-//! path, recorded by the feeder (`feeder.rs`) and read by the bus verb.
+//! The `capture.status` handle and verb: what the core knows about the macOS NE
+//! capture path, recorded by the feeder (`feeder.rs`) and read by the bus verb
+//! [`CaptureStatusPlugin`] registers (spec D1, D6).
 //!
 //! The handle is split into a [`CaptureStatusWriter`] (the feeder's side; its
 //! mutators are `pub(super)`, so only `macos_capture` can record a transition)
@@ -24,7 +25,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aitm_core::Value;
+use aitm_core::{
+    Command, CommandHost, ParamDef, ParamSchema, Params, Plugin, Registry, Sensitivity, TypeDesc,
+    Value,
+};
 
 use super::capability::CaptureCapability;
 use super::listener::{FlowKind, ScopeSpec};
@@ -442,16 +446,212 @@ pub(crate) fn scope_tokens(spec: &ScopeSpec) -> Vec<String> {
         .collect()
 }
 
+/// The `capture.status` plugin (spec D6): a command-only provider that holds the
+/// handle's read half and registers the verb. It observes no events. `wire.rs`
+/// registers it on every platform and for every `Features`, so a client can
+/// always ask and the answer is honest about why nothing is captured.
+pub struct CaptureStatusPlugin {
+    reader: CaptureStatusReader,
+}
+
+impl CaptureStatusPlugin {
+    /// A plugin over the read half of a [`CaptureStatus::channel`] (CS-AC16: a
+    /// reader, never a writer).
+    pub fn new(reader: CaptureStatusReader) -> Self {
+        Self { reader }
+    }
+}
+
+impl Plugin for CaptureStatusPlugin {
+    fn name(&self) -> &str {
+        "capture_status"
+    }
+
+    fn load(&mut self, reg: &mut Registry) {
+        reg.add_command(Arc::new(CaptureStatusCommand {
+            reader: self.reader.clone(),
+        }));
+    }
+}
+
+/// `capture.status`: one snapshot of the handle as the D7 wire shape. Read-only
+/// (`Sensitivity::Read`, so callable under the agent's `ReadOnly` policy),
+/// parameterless, and infallible: `invoke` reads nothing from its arguments or
+/// the host and never errors.
+struct CaptureStatusCommand {
+    reader: CaptureStatusReader,
+}
+
+impl Command for CaptureStatusCommand {
+    fn name(&self) -> &str {
+        "capture.status"
+    }
+
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "What the core knows about the macOS Network/System Extension \
+                          capture path: whether `macos_capture.enabled` is set, whether \
+                          the capture feeder is listening, whether a code-signature-verified \
+                          extension provider is attached, the scope it holds, and the flows \
+                          it has handed off during the current attachment. Read-only and \
+                          parameterless. Times are Unix epoch milliseconds. When \
+                          `feeder.state` is `off`, `feeder.reason` is exactly one of \
+                          `macos_capture.enabled is false`, `not a macOS build`, \
+                          `not started`, `stopped`. This is not the record toggle: \
+                          `proxy.status.capturing` reports whether the proxy records flows."
+                .into(),
+            params: vec![],
+            result: TypeDesc::Object(result_fields()),
+        }
+    }
+
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+
+    fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(self.reader.snapshot().to_value())
+    }
+}
+
+/// The fields `capture.status` emits (spec D6/D7), every one described. The five
+/// nullable fields are `required: false` and emitted as `Null` when absent
+/// (precedent: `summary_fields()` in `aitm-plugins/src/capture.rs`).
+fn result_fields() -> Vec<ParamDef> {
+    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
+        name: name.into(),
+        ty,
+        required,
+        description: description.into(),
+    };
+    vec![
+        field(
+            "enabled",
+            TypeDesc::Bool,
+            true,
+            "Whether `macos_capture.enabled` is true in the config file; fixed for the process.",
+        ),
+        field(
+            "feeder",
+            TypeDesc::Object(vec![
+                field(
+                    "state",
+                    TypeDesc::Str,
+                    true,
+                    "`off`, `listening`, or `bind_failed`.",
+                ),
+                field(
+                    "reason",
+                    TypeDesc::Str,
+                    false,
+                    "Why the feeder is off or could not start. When `state` is `off`, \
+                     exactly one of `macos_capture.enabled is false`, `not a macOS build`, \
+                     `not started`, `stopped`; when `bind_failed`, the step that failed and \
+                     the I/O error kind, never a path. Null when `listening`.",
+                ),
+            ]),
+            true,
+            "The core-side capture feeder: whether its Unix sockets are bound and its \
+             rendezvous is published.",
+        ),
+        field(
+            "provider",
+            TypeDesc::Object(vec![
+                field("state", TypeDesc::Str, true, "`detached` or `attached`."),
+                field(
+                    "attached_at",
+                    TypeDesc::Int,
+                    false,
+                    "When the attached provider received its initial scope, Unix epoch \
+                     milliseconds. Null when detached.",
+                ),
+                field(
+                    "team_id",
+                    TypeDesc::Str,
+                    false,
+                    "The Apple team identifier the provider's code signature was verified \
+                     against (the requirement's pinned OU); not read from the peer's signing \
+                     information. Null when detached or when the verifier pins no team.",
+                ),
+            ]),
+            true,
+            "The Network/System Extension provider: whether one has passed the \
+             code-signature check and holds a scope.",
+        ),
+        field(
+            "scope_entries",
+            TypeDesc::Int,
+            true,
+            "The number of scope tokens the attached provider holds (`scope_tokens.len()`); \
+             0 when detached.",
+        ),
+        field(
+            "scope_tokens",
+            TypeDesc::Array(Box::new(TypeDesc::Str)),
+            true,
+            "The tokens of the scope spec most recently sent to the attached provider (host \
+             names, wildcard hosts, L4 capture addresses), in the order sent; empty when \
+             detached.",
+        ),
+        field(
+            "flows_handed_off",
+            TypeDesc::Object(vec![
+                field(
+                    "tcp",
+                    TypeDesc::Int,
+                    true,
+                    "TCP flows the provider handed to the core during the current attachment.",
+                ),
+                field(
+                    "udp",
+                    TypeDesc::Int,
+                    true,
+                    "UDP flows the provider handed to the core during the current attachment.",
+                ),
+            ]),
+            true,
+            "Flows handed to the core during the current attachment, by kind. Zeroed when a \
+             provider attaches and when it detaches, so a detached provider shows zeros.",
+        ),
+        field(
+            "last_handoff_at",
+            TypeDesc::Int,
+            false,
+            "When the last flow was handed off, Unix epoch milliseconds. Null when no flow \
+             has been handed off in the current attachment.",
+        ),
+        field(
+            "capability",
+            TypeDesc::Str,
+            true,
+            "The derived capture capability: `feeder_off`, `degraded`, `awaiting_provider`, \
+             `approved_attached`, or `capturing`. Combine with `scope_entries == 0` for an \
+             \"on, nothing in scope\" reading.",
+        ),
+        field(
+            "capability_reason",
+            TypeDesc::Str,
+            false,
+            "Why the capability is `feeder_off` (the off reason) or `degraded` (the bind \
+             failure); null for every other capability.",
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use aitm_core::{ScopeEntry, Value};
+    use aitm_core::{
+        Command, CommandHost, HttpFlow, HttpRequest, MemFlowStore, ParamDef, Params, Plugin,
+        ProxyClient, Registry, ScopeEntry, Sensitivity, StdGuard, TypeDesc, Value,
+    };
     use aitm_proto_l4::types::{
         IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
         RateCap,
     };
+    use futures::future::BoxFuture;
 
     use super::super::adapter::CAPTURE_INTERFACE;
     use super::super::capability::CaptureCapability;
@@ -459,7 +659,8 @@ mod tests {
     use super::super::listener::{FlowKind, ScopeSpec};
     use super::super::scope_spec::provider_scope_spec;
     use super::{
-        scope_tokens, CaptureStatus, CaptureStatusSnapshot, FeederState, OffReason, ProviderState,
+        scope_tokens, CaptureStatus, CaptureStatusCommand, CaptureStatusPlugin,
+        CaptureStatusSnapshot, FeederState, OffReason, ProviderState,
     };
 
     // ---- helpers (Task 3 of the plan reuses these by name) ----------------------
@@ -1089,6 +1290,210 @@ mod tests {
                 spec: String::new()
             }),
             Vec::<String>::new()
+        );
+    }
+
+    // ---- the verb (plan Task 3) -----------------------------------------------------
+
+    /// A `ProxyClient` the verb must never reach (precedent:
+    /// `aitm-plugins/tests/control.rs`).
+    struct StubClient;
+    impl ProxyClient for StubClient {
+        fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async { anyhow::bail!("stub client") })
+        }
+    }
+
+    /// **CS-AC2.** Read-only, parameterless, inert: `Read` sensitivity, no params,
+    /// the same literal with and without junk arguments, and the handle untouched.
+    #[test]
+    fn command_is_read_only_and_parameterless() -> anyhow::Result<()> {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let before = r.snapshot();
+        let command = CaptureStatusCommand { reader: r.clone() };
+        assert_eq!(command.name(), "capture.status");
+        assert_eq!(command.sensitivity(), Sensitivity::Read);
+        assert!(!command.mutates());
+        assert!(command.schema().params.is_empty());
+
+        let store = MemFlowStore::new();
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &StubClient, &guard, None);
+        let a = command.invoke(Params::default(), &host)?;
+        let junk = Params::new(BTreeMap::from([
+            ("enabled".to_string(), Value::Bool(true)),
+            ("feeder".to_string(), s("listening")),
+            ("provider".to_string(), s("attached")),
+        ]));
+        let b = command.invoke(junk, &host)?;
+        assert_eq!(a, listening_literal());
+        assert_eq!(b, listening_literal());
+        assert_eq!(r.snapshot(), before, "invoking changed the handle");
+        Ok(())
+    }
+
+    /// **CS-AC3.** Through a `Registry`, as a frontend reaches it: the plugin
+    /// registers `capture.status`, and over a disabled handle it returns the D7
+    /// disabled literal.
+    #[test]
+    fn registry_invocation_returns_the_disabled_literal() -> anyhow::Result<()> {
+        let (_w, r) = CaptureStatus::channel(false);
+        let plugin = CaptureStatusPlugin::new(r);
+        assert_eq!(plugin.name(), "capture_status");
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(plugin));
+        let command = reg
+            .command("capture.status")
+            .expect("the plugin registers capture.status");
+        let store = MemFlowStore::new();
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &StubClient, &guard, None);
+        assert_eq!(
+            command.invoke(Params::default(), &host)?,
+            disabled_literal()
+        );
+        Ok(())
+    }
+
+    /// Walk a schema object against an emitted object: the same key set at this
+    /// level and every description non-empty; collects the optional names and the
+    /// names emitted as `Null`, recursing into nested objects.
+    fn walk_schema(
+        fields: &[ParamDef],
+        value: &Value,
+        optional: &mut BTreeSet<String>,
+        nullable: &mut BTreeSet<String>,
+    ) {
+        let Value::Object(map) = value else {
+            panic!("the schema describes an object but the verb emitted {value:?}");
+        };
+        let described: BTreeSet<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+        let emitted: BTreeSet<&str> = map.keys().map(String::as_str).collect();
+        assert_eq!(described, emitted, "schema fields vs emitted keys");
+        for field in fields {
+            assert!(
+                !field.description.trim().is_empty(),
+                "{} has an empty description",
+                field.name
+            );
+            if !field.required {
+                optional.insert(field.name.clone());
+            }
+            let emitted = at(value, &field.name);
+            if *emitted == Value::Null {
+                nullable.insert(field.name.clone());
+            }
+            if let TypeDesc::Object(inner) = &field.ty {
+                walk_schema(inner, emitted, optional, nullable);
+            }
+        }
+    }
+
+    /// The field at `path` (nested through `TypeDesc::Object`s).
+    fn field_at<'a>(mut fields: &'a [ParamDef], path: &[&str]) -> &'a ParamDef {
+        let (last, parents) = path.split_last().expect("a non-empty path");
+        let find = |fields: &'a [ParamDef], name: &str| -> &'a ParamDef {
+            fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("no field {name:?} in {path:?}"))
+        };
+        for name in parents {
+            match &find(fields, name).ty {
+                TypeDesc::Object(inner) => fields = inner,
+                other => panic!("{name:?} is not an object: {other:?}"),
+            }
+        }
+        find(fields, last)
+    }
+
+    /// **CS-AC14.** The schema describes every emitted key at every level with a
+    /// non-empty description; exactly the five nullable fields are optional; the
+    /// declared types match the wire (D6) and `team_id` carries D4's fixed text.
+    #[test]
+    fn schema_describes_every_emitted_key() {
+        let (_w, r) = CaptureStatus::channel(true);
+        let schema = CaptureStatusCommand { reader: r }.schema();
+        for must_name in [
+            "Unix epoch milliseconds",
+            "macos_capture.enabled is false",
+            "not a macOS build",
+            "not started",
+            "stopped",
+            "proxy.status.capturing",
+        ] {
+            assert!(
+                schema.description.contains(must_name),
+                "schema description lacks {must_name:?}: {}",
+                schema.description
+            );
+        }
+        let TypeDesc::Object(fields) = &schema.result else {
+            panic!("the result is an object: {:?}", schema.result);
+        };
+
+        let mut optional = BTreeSet::new();
+        let mut nullable = BTreeSet::new();
+        for snapshot in matrix() {
+            walk_schema(fields, &snapshot.to_value(), &mut optional, &mut nullable);
+        }
+        let expected: BTreeSet<String> = [
+            "reason",
+            "attached_at",
+            "team_id",
+            "last_handoff_at",
+            "capability_reason",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        assert_eq!(optional, expected, "the optional (nullable) fields");
+        assert!(
+            nullable.is_subset(&optional),
+            "emitted null for a required field: {:?}",
+            nullable.difference(&optional).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            nullable, expected,
+            "the matrix exercises every nullable field"
+        );
+
+        assert!(matches!(
+            &field_at(fields, &["scope_tokens"]).ty,
+            TypeDesc::Array(inner) if matches!(**inner, TypeDesc::Str)
+        ));
+        assert!(matches!(field_at(fields, &["enabled"]).ty, TypeDesc::Bool));
+        for path in [
+            &["scope_entries"][..],
+            &["last_handoff_at"],
+            &["flows_handed_off", "tcp"],
+            &["flows_handed_off", "udp"],
+            &["provider", "attached_at"],
+        ] {
+            assert!(
+                matches!(field_at(fields, path).ty, TypeDesc::Int),
+                "{path:?} is Int"
+            );
+        }
+        for path in [
+            &["capability"][..],
+            &["capability_reason"],
+            &["feeder", "state"],
+            &["feeder", "reason"],
+            &["provider", "state"],
+            &["provider", "team_id"],
+        ] {
+            assert!(
+                matches!(field_at(fields, path).ty, TypeDesc::Str),
+                "{path:?} is Str"
+            );
+        }
+        assert_eq!(
+            field_at(fields, &["provider", "team_id"]).description,
+            "The Apple team identifier the provider's code signature was verified against \
+             (the requirement's pinned OU); not read from the peer's signing information. \
+             Null when detached or when the verifier pins no team."
         );
     }
 
