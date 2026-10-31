@@ -252,6 +252,16 @@ pub struct FlowMeta {
     /// inspector's "Edited" flag; the original is recoverable while the flow is
     /// still intercepted (`InterceptState::Intercepted { backup }`).
     pub edited: bool,
+    /// Arrives as `NextLayerHint::peer_identity` from a capture ingress; `None` for a
+    /// proxied, replayed or imported flow.
+    /// The signing identifier of the process that opened the client connection, as a
+    /// capture backend observed it (macOS NE: `com.apple.Safari`). `None` for a
+    /// proxied flow. Backend-supplied text about a client: data to store and show,
+    /// never a scope or guard input.
+    pub source_app: Option<String>,
+    /// The capture backend that delivered the client connection (`"macos-ne"`). `None`
+    /// for a proxied flow.
+    pub capture_interface: Option<String>,
 }
 
 impl Default for FlowMeta {
@@ -264,11 +274,25 @@ impl Default for FlowMeta {
             duration: None,
             truncated: false,
             edited: false,
+            source_app: None,
+            capture_interface: None,
         }
     }
 }
 
 impl FlowMeta {
+    /// A fresh `FlowMeta` carrying only the client's attribution — the two fields a
+    /// flow inherits from the connection (HTTP) or from its handshake flow (WebSocket).
+    /// Everything else is the default, so a new attribution field is added in one place.
+    #[must_use]
+    pub fn with_attribution(source_app: Option<String>, capture_interface: Option<String>) -> Self {
+        Self {
+            source_app,
+            capture_interface,
+            ..Self::default()
+        }
+    }
+
     /// When the flow started: `created` as whole milliseconds since the Unix
     /// epoch, saturated at `i64::MAX`; `None` if the clock is before the epoch.
     /// The one `started_at` rule, so every command surface and push places a
