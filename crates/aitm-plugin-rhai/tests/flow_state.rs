@@ -213,6 +213,7 @@ fn response_edits_and_marks_apply_back() {
             status: 200,
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Bytes(b"ok".to_vec()),
             timestamp: SystemTime::now(),
         });

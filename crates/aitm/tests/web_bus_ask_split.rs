@@ -453,7 +453,15 @@ fn a_malformed_approve_resolves_nothing_and_the_call_stays_parked() {
     ];
     for (what, arguments) in malformed {
         let reply = call(&rig.web, &w_operator, "agent.approve", arguments);
-        assert_eq!(reply["result"]["isError"], json!(true), "{what}: {reply}");
+        // A malformed approve must fail and resolve nothing. It may fail two
+        // ways: a JSON-RPC schema error (-32602) for a missing/wrong-typed
+        // param (now enforced on the server-handled verbs), or an application
+        // `isError` result for a well-formed-but-unresolvable request id.
+        let errored = reply.get("error").is_some() || reply["result"]["isError"] == json!(true);
+        assert!(
+            errored,
+            "{what}: a malformed approve must error, not succeed: {reply}"
+        );
     }
     std::thread::sleep(SETTLE);
     assert!(

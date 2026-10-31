@@ -30,6 +30,7 @@ fn http_flow(method: &str, path: &str, status: Option<u16>) -> Flow {
             status,
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
         }),

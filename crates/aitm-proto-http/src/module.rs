@@ -33,7 +33,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use x509_parser::prelude::*;
 
 use crate::ca::{CertAuthority, LeafCert};
-use crate::sansio::{Http1Machine, HttpSansIoEvent, HttpStateMachine, Side};
+use crate::sansio::{content_length, Http1Machine, HttpSansIoEvent, HttpStateMachine, Side};
 
 /// First byte of a TLS handshake record.
 const TLS_HANDSHAKE: u8 = 0x16;
@@ -525,6 +525,22 @@ impl Conn {
 /// `upstream`) redoes its TLS connection; the cleartext paths pass `None` and
 /// redial through the ordinary connect step, which for a cleartext tunnel dials
 /// the `CONNECT` target again.
+///
+/// The proxy answers a `100-continue` expectation itself, at head time: once the
+/// head is parsed and its flow stored, and before `Event::RequestHeaders` is
+/// dispatched or any body byte is read, it writes `100 Continue` to the client
+/// (see `Http1Machine::expects_continue` for when). A head that declares a body
+/// larger than `max_body` is refused with the `413` instead, with no `100`. The
+/// `Expect` header itself is forwarded to the origin untouched, with the whole
+/// body in one write, and the origin's own optional `100` is skipped.
+///
+/// The trailer section of a chunked response is forwarded after the body when
+/// the client-bound body is chunk-framed (never after a body a plugin replaced,
+/// and without the fields that cannot work as trailers), and is stored on the
+/// flow's response, every field of it, when the response completes: before
+/// `Event::Response`, so a plugin reads it there, and never merged into the
+/// headers. A section over its caps ends the connection with an error, with the
+/// terminator unwritten, so the client sees an incomplete message.
 async fn serve(
     ctx: &ModuleCtx,
     mut client: ByteStream,
@@ -581,6 +597,36 @@ async fn serve(
                             metadata: FlowMeta::default(),
                             intercept: InterceptState::Observed,
                         }));
+                        // A client that sent `Expect: 100-continue` holds its body
+                        // back until it is told to go ahead. Tell it here, before
+                        // `Event::RequestHeaders` is dispatched, so a plugin that
+                        // parks the flow at its head cannot leave the client
+                        // waiting. The machine reports the expectation at most once
+                        // per request, so this cannot write a second interim.
+                        if machine.expects_continue() {
+                            // The machine's own parse of `Content-Length`, so this
+                            // decision cannot drift from the framing it applies. It
+                            // has already rejected a malformed or conflicting value
+                            // before the head got here, so `None` means no length.
+                            let declared = machine
+                                .request()
+                                .and_then(|r| content_length(&r.headers).ok().flatten());
+                            if declared.is_some_and(|n| n > max_body as u64) {
+                                // The body would be refused anyway: say nothing, so
+                                // the client does not upload it. The oversize branch
+                                // below writes the 413 and closes.
+                                request_oversized = true;
+                            } else {
+                                machine.enqueue_continue();
+                                if flush(&mut machine, Side::Client, &mut client)
+                                    .await
+                                    .is_err()
+                                {
+                                    // The client went away; nothing to report.
+                                    return Ok(());
+                                }
+                            }
+                        }
                         ctx.emit(Event::RequestHeaders(id)).await;
                         flow_id = Some(id);
                     }
@@ -837,7 +883,25 @@ async fn serve(
             let events = if n == 0 {
                 machine.on_eof(Side::Server)
             } else {
-                machine.on_bytes(Side::Server, &buf[..n])?
+                match machine.on_bytes(Side::Server, &buf[..n]) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        // The machine refused the origin's bytes (a bad trailer
+                        // line, an over-cap section, malformed framing). Event
+                        // consumers see a response only through its events, so
+                        // say so before failing the connection; the words are
+                        // fixed because the machine's own text can quote the
+                        // origin's bytes.
+                        ctx.emit(Event::Error {
+                            flow: id,
+                            kind: aitm_core::FlowError::Upstream(
+                                "malformed response from upstream".to_string(),
+                            ),
+                        })
+                        .await;
+                        return Err(e);
+                    }
+                }
             };
             for ev in events {
                 match ev {
@@ -849,6 +913,12 @@ async fn serve(
                             wants_close(&head.headers) || close_delimited(&request.method, &head);
                         let streamed = HttpResponse {
                             body: Body::Streamed(StreamBody),
+                            // A response that arrived in one read already has its
+                            // trailer section on the machine's model. The stored
+                            // head holds none until `ResponseComplete` stores
+                            // them, so a plugin sees the same at this event
+                            // however the origin's bytes were split.
+                            trailers: HeaderMap::new(),
                             ..head
                         };
                         let mut staged = Some(streamed.clone());
@@ -880,11 +950,32 @@ async fn serve(
                         }
                     }
                     HttpSansIoEvent::ResponseComplete(id) => {
+                        // The trailer section the origin sent after a chunked
+                        // body, parsed and bounded by the machine, which holds it
+                        // on its response model by now. Empty for any other body.
+                        let trailers = machine
+                            .response()
+                            .map(|r| r.trailers.clone())
+                            .unwrap_or_default();
                         if forward_chunks {
-                            machine.enqueue_body_end(Side::Client);
+                            // Only a chunk-framed client body has a section to put
+                            // them in, and the writer withholds the fields that
+                            // cannot work as trailers. A plugin that replaced the
+                            // body (`forward_chunks` false) gets none of them.
+                            let withheld =
+                                machine.enqueue_body_end_with_trailers(Side::Client, &trailers);
                             flush(&mut machine, Side::Client, &mut client).await?;
+                            if withheld > 0 {
+                                // A count only: trailer names and values are the
+                                // origin's bytes and never go in a log.
+                                tracing::debug!(
+                                    withheld,
+                                    "trailer fields were not forwarded to the client"
+                                );
+                            }
                         }
                         let mut bytes = Some(std::mem::take(&mut captured));
+                        let mut trailers = Some(trailers);
                         ctx.store().update(id, &mut |f: &mut Flow| {
                             if let (Flow::Http(h), Some(bytes)) = (f, bytes.take()) {
                                 if let Some(resp) = h.response.as_mut() {
@@ -893,6 +984,10 @@ async fn serve(
                                     } else {
                                         Body::Bytes(bytes)
                                     };
+                                    // The capture keeps every field the origin
+                                    // sent, whether or not it was forwarded, and
+                                    // replaces whatever a plugin left here.
+                                    resp.trailers = trailers.take().unwrap_or_default();
                                 }
                                 h.metadata.truncated |= response_truncated;
                                 h.metadata.duration = h.metadata.created.elapsed().ok();
@@ -1060,6 +1155,7 @@ fn oversized_response() -> HttpResponse {
         status: 413,
         version: HttpVersion::Http11,
         headers,
+        trailers: HeaderMap::new(),
         body: Body::Bytes(b"request body exceeds the configured limit".to_vec()),
         timestamp: SystemTime::now(),
     }
@@ -1375,6 +1471,7 @@ mod tests {
     //! is in `tests/stale_upstream.rs`.
 
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -1999,12 +2096,87 @@ mod tests {
     /// Read one 200 response, consuming `pending` before the stream, and return
     /// its `Content-Length`-framed body. Bytes read past it stay in `pending`.
     async fn read_response_keep(io: &mut DuplexStream, pending: &mut Vec<u8>) -> String {
+        let (status, body) = read_status_response_keep(io, pending).await;
+        assert_eq!(status, 200, "unexpected response status, body {body:?}");
+        body
+    }
+
+    // ---- `Expect: 100-continue` helpers -----------------------------------
+
+    /// A strict client's head: five body bytes to come, and an expectation to be
+    /// answered first. `Content-Length` precedes `Expect` here; the machine
+    /// re-appends the length last when it forwards the request.
+    const STRICT_HEAD: &str = "POST /up HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n";
+
+    /// The interim the proxy itself writes.
+    const CONTINUE: &str = "HTTP/1.1 100 Continue\r\n\r\n";
+
+    /// A keep-alive 200 with a two-byte body, as an origin writes it and as the
+    /// proxy forwards it.
+    const REPLY_OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+
+    /// What the origin must receive for [`STRICT_HEAD`] followed by `hello`: head
+    /// and body together, `Expect` untouched, the length last.
+    const FORWARDED_STRICT: &str = "POST /up HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello";
+
+    /// The body of the proxy's own `413`.
+    const OVERSIZED_BODY: &str = "request body exceeds the configured limit";
+
+    /// Read one head (up to and including the blank line) from `io`, a byte at a
+    /// time so nothing past it is consumed. `None` when no complete head arrives
+    /// within `within`; a partial head at that point, or EOF, panics.
+    async fn read_interim(io: &mut DuplexStream, within: Duration) -> Option<String> {
+        let mut got: Vec<u8> = Vec::new();
+        let reading = async {
+            let mut byte = [0u8; 1];
+            while !got.ends_with(b"\r\n\r\n") {
+                let n = io.read(&mut byte).await.expect("read a head");
+                assert!(n > 0, "connection closed while reading a head: {got:?}");
+                got.push(byte[0]);
+            }
+        };
+        let complete = tokio::time::timeout(within, reading).await.is_ok();
+        assert!(
+            complete || got.is_empty(),
+            "only part of a head arrived: {got:?}"
+        );
+        complete.then(|| String::from_utf8_lossy(&got).into_owned())
+    }
+
+    /// Read exactly `n` bytes from `io`.
+    async fn read_exact_bytes(io: &mut DuplexStream, n: usize) -> Vec<u8> {
+        let mut got = vec![0u8; n];
+        io.read_exact(&mut got).await.expect("read exact bytes");
+        got
+    }
+
+    /// Assert that no byte arrives on `io` within `within`. EOF counts as a
+    /// failure: every caller expects the connection to stay open.
+    async fn assert_quiet(io: &mut DuplexStream, within: Duration) {
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(within, io.read(&mut byte)).await {
+            Err(_) => {}
+            Ok(Ok(0)) => panic!("the connection closed when it was expected to stay quiet"),
+            Ok(Ok(_)) => panic!("an unexpected byte arrived: {:?}", byte[0]),
+            Ok(Err(e)) => panic!("read failed: {e}"),
+        }
+    }
+
+    /// Like [`read_response_keep`], for any status: returns the status and the
+    /// `Content-Length`-framed body, and leaves bytes read past them in `pending`.
+    async fn read_status_response_keep(
+        io: &mut DuplexStream,
+        pending: &mut Vec<u8>,
+    ) -> (u16, String) {
         let mut chunk = [0u8; 512];
         loop {
             if let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&pending[..end]).to_ascii_lowercase();
-                let status = head.split(' ').nth(1).unwrap_or_default();
-                assert_eq!(status, "200", "unexpected response head {head:?}");
+                let status: u16 = head
+                    .split(' ')
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .expect("response status");
                 let len: usize = head
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length: "))
@@ -2014,13 +2186,176 @@ mod tests {
                     let body =
                         String::from_utf8_lossy(&pending[end + 4..end + 4 + len]).into_owned();
                     pending.drain(..end + 4 + len);
-                    return body;
+                    return (status, body);
                 }
             }
             let n = io.read(&mut chunk).await.expect("read response");
             assert!(n > 0, "connection closed before a full response arrived");
             pending.extend_from_slice(&chunk[..n]);
         }
+    }
+
+    /// An in-memory origin that records everything it receives into `seen`. For
+    /// each of `exchanges` it reads one request head and its `Content-Length`
+    /// body, and only then writes that exchange's reply segments, with a pause
+    /// between them so the proxy reads them separately. After the last exchange it
+    /// holds the connection open until the proxy hangs up.
+    async fn origin_replying<S: AsRef<str>>(
+        mut io: DuplexStream,
+        seen: Arc<Mutex<Vec<u8>>>,
+        exchanges: Vec<Vec<S>>,
+    ) {
+        let mut held: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 512];
+        for segments in exchanges {
+            let request_len = loop {
+                if let Some(end) = held.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&held[..end]).to_ascii_lowercase();
+                    let body_len: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length: "))
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    if held.len() >= end + 4 + body_len {
+                        break end + 4 + body_len;
+                    }
+                }
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        seen.lock()
+                            .expect("seen lock")
+                            .extend_from_slice(&chunk[..n]);
+                        held.extend_from_slice(&chunk[..n]);
+                    }
+                }
+            };
+            held.drain(..request_len);
+            for (i, segment) in segments.iter().enumerate() {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                if io.write_all(segment.as_ref().as_bytes()).await.is_err()
+                    || io.flush().await.is_err()
+                {
+                    return;
+                }
+            }
+        }
+        while let Ok(n) = io.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            seen.lock()
+                .expect("seen lock")
+                .extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// Parks every `Event::RequestHeaders` until `release` fires, as a plugin
+    /// that holds a flow at its head would. `entered` is set when the proxy
+    /// reaches the park, `released` when the park ends. Every other event passes.
+    struct ParkRequestHeaders {
+        release: Arc<tokio::sync::Notify>,
+        entered: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+    }
+
+    impl EventSink for ParkRequestHeaders {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            if matches!(ev, Event::RequestHeaders(_)) {
+                return Box::pin(async move {
+                    self.entered.store(true, AtomicOrdering::SeqCst);
+                    self.release.notified().await;
+                    self.released.store(true, AtomicOrdering::SeqCst);
+                    Verdict::Continue
+                });
+            }
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    /// Run `serve` on `conn` over a fresh in-memory client connection and run
+    /// `script` against the client end, which `script` owns: dropping it hangs up
+    /// and lets `serve` finish. Returns `serve`'s result and the script's value.
+    async fn with_serve<T, F, Fut>(
+        ctx: &ModuleCtx,
+        conn: Conn,
+        upstream: Option<ByteStream>,
+        max_body: usize,
+        script: F,
+    ) -> (Result<()>, T)
+    where
+        F: FnOnce(DuplexStream) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (client, proxy_side) = duplex(64 * 1024);
+        let serving = serve(ctx, Box::pin(proxy_side), upstream, None, conn, max_body);
+        tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script(client)) })
+            .await
+            .expect("serve hung")
+    }
+
+    /// What one client and its origin saw in a [`head_first_exchange`].
+    struct HeadFirst {
+        /// The head the client read before it sent any body, if one came in time.
+        interim: Option<String>,
+        status: u16,
+        body: String,
+        /// Bytes the client read past the final response.
+        pending: Vec<u8>,
+        /// Everything the origin received, as text.
+        origin_saw: String,
+    }
+
+    /// A cleartext forward-proxy exchange in which the client sends `head` alone,
+    /// waits up to `within` for a head from the proxy, then sends `body` and reads
+    /// the final response. The one in-memory origin answers `reply`.
+    async fn head_first_exchange(
+        head: &str,
+        within: Duration,
+        body: &[u8],
+        reply: &'static str,
+    ) -> HeadFirst {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![reply]],
+        ));
+        let (served, (interim, status, body, pending)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client.write_all(head.as_bytes()).await.expect("send head");
+                let interim = read_interim(&mut client, within).await;
+                client.write_all(body).await.expect("send body");
+                let mut pending = Vec::new();
+                let (status, body) = read_status_response_keep(&mut client, &mut pending).await;
+                (interim, status, body, pending)
+            },
+        )
+        .await;
+        served.expect("serve ends cleanly when the client hangs up");
+        let origin_saw =
+            String::from_utf8_lossy(&origin_saw.lock().expect("seen lock")).into_owned();
+        HeadFirst {
+            interim,
+            status,
+            body,
+            pending,
+            origin_saw,
+        }
+    }
+
+    /// A `POST /up` head with `Content-Length: 5` and `extra` header lines (each
+    /// ending in CRLF) after it.
+    fn post_head(extra: &str) -> String {
+        format!("POST /up HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nContent-Length: 5\r\n{extra}\r\n")
     }
 
     fn dial(authority: &str, addr: &str) -> (String, SocketAddr) {
@@ -3751,5 +4086,1381 @@ mod tests {
         let err = result.err().expect("cleartext HTTP is not a TLS handshake");
         assert_eq!(err.to_string(), "TLS to upstream origin.test:8443");
         let _origin = origin_task.await.expect("origin task");
+    }
+
+    // ---- `Expect: 100-continue` -------------------------------------------
+
+    #[tokio::test]
+    async fn serve_answers_a_100_continue_expectation_before_the_body_arrives() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, (interim, body, pending)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                // The client now waits for the go-ahead and sends nothing more
+                // until it has it.
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client.write_all(b"hello").await.expect("send body");
+                let mut pending = Vec::new();
+                let body = read_response_keep(&mut client, &mut pending).await;
+                (interim, body, pending)
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(
+            interim.as_deref(),
+            Some("HTTP/1.1 100 Continue\r\n\r\n"),
+            "the 25-byte interim must reach the client before it sends the body"
+        );
+        assert_eq!(body, "ok");
+        assert!(
+            pending.is_empty(),
+            "nothing follows the response: {pending:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_sends_the_interim_once_when_the_body_trickles_in() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, stream) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let mut stream = read_interim(&mut client, Duration::from_secs(1))
+                    .await
+                    .unwrap_or_default();
+                // The body arrives in two writes, apart.
+                client.write_all(b"hel").await.expect("send first part");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                client.write_all(b"lo").await.expect("send second part");
+                let reply = read_exact_bytes(&mut client, REPLY_OK.len()).await;
+                stream.push_str(&String::from_utf8_lossy(&reply));
+                // Nothing, in particular no second interim, follows.
+                assert_quiet(&mut client, Duration::from_millis(100)).await;
+                stream
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(
+            stream,
+            format!("{CONTINUE}HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"),
+            "the client reads one interim, then the final response"
+        );
+        assert_eq!(stream.matches("100 Continue").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn serve_omits_the_interim_when_the_body_arrived_with_the_head() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, got) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                // Head and body in one write: the go-ahead would be pointless.
+                client
+                    .write_all(format!("{STRICT_HEAD}hello").as_bytes())
+                    .await
+                    .expect("send head and body");
+                let got = read_exact_bytes(&mut client, REPLY_OK.len()).await;
+                assert_quiet(&mut client, Duration::from_millis(100)).await;
+                got
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            REPLY_OK,
+            "the first bytes the client reads are the final response, with no 1xx before it"
+        );
+        let origin_saw =
+            String::from_utf8_lossy(&origin_saw.lock().expect("seen lock")).into_owned();
+        assert_eq!(origin_saw, FORWARDED_STRICT);
+    }
+
+    #[tokio::test]
+    async fn serve_ignores_an_expectation_on_an_http_1_0_request() {
+        let head = STRICT_HEAD.replace("POST /up HTTP/1.1", "POST /up HTTP/1.0");
+        let seen = head_first_exchange(&head, Duration::from_millis(300), b"hello", REPLY_OK).await;
+
+        assert_eq!(
+            seen.interim, None,
+            "an HTTP/1.0 request is never answered with a 100"
+        );
+        assert_eq!((seen.status, seen.body.as_str()), (200, "ok"));
+        assert!(
+            seen.pending.is_empty(),
+            "no 1xx follows: {:?}",
+            seen.pending
+        );
+        assert!(
+            seen.origin_saw.ends_with("Content-Length: 5\r\n\r\nhello"),
+            "the origin still gets the whole request: {:?}",
+            seen.origin_saw
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_sends_no_interim_when_no_content_follows() {
+        let head = STRICT_HEAD.replace("Content-Length: 5", "Content-Length: 0");
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, (first_head, body)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client.write_all(head.as_bytes()).await.expect("send head");
+                // The request is already complete: the first head to arrive is
+                // the origin's answer.
+                let first_head = read_interim(&mut client, Duration::from_secs(1)).await;
+                let body = read_exact_bytes(&mut client, 2).await;
+                assert_quiet(&mut client, Duration::from_millis(100)).await;
+                (first_head, body)
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        let first_head = first_head.expect("the final response never arrived");
+        assert_eq!(first_head, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n");
+        assert_eq!(body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn serve_matches_the_expectation_case_insensitively_inside_a_list() {
+        for lines in [
+            "Expect: 100-Continue\r\n",
+            "Expect: foo, 100-continue\r\n",
+            "Expect: foo\r\nExpect: 100-continue\r\n",
+        ] {
+            let seen = head_first_exchange(
+                &post_head(lines),
+                Duration::from_secs(1),
+                b"hello",
+                REPLY_OK,
+            )
+            .await;
+            assert_eq!(
+                seen.interim.as_deref(),
+                Some(CONTINUE),
+                "the 100 for {lines:?}"
+            );
+            assert_eq!((seen.status, seen.body.as_str()), (200, "ok"));
+            assert!(
+                seen.origin_saw.contains(lines),
+                "the origin must see {lines:?} unchanged: {:?}",
+                seen.origin_saw
+            );
+        }
+        for lines in [
+            "Expect: 100-continue-ish\r\n",
+            "Expect: 100-continue;x=1\r\n",
+        ] {
+            let seen = head_first_exchange(
+                &post_head(lines),
+                Duration::from_millis(300),
+                b"hello",
+                REPLY_OK,
+            )
+            .await;
+            assert_eq!(seen.interim, None, "no 100 for {lines:?}");
+            assert_eq!((seen.status, seen.body.as_str()), (200, "ok"));
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_does_not_answer_an_unknown_expectation_and_forwards_it() {
+        let seen = head_first_exchange(
+            &post_head("Expect: bogus\r\n"),
+            Duration::from_millis(300),
+            b"hello",
+            "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+
+        assert_eq!(seen.interim, None, "the proxy answers only a 100-continue");
+        assert_eq!(
+            (seen.status, seen.body.as_str()),
+            (417, ""),
+            "the origin's own refusal reaches the client as sent"
+        );
+        assert!(seen.pending.is_empty(), "pending: {:?}", seen.pending);
+        assert!(
+            seen.origin_saw.contains("Expect: bogus\r\n"),
+            "the origin sees the expectation: {:?}",
+            seen.origin_saw
+        );
+    }
+
+    /// The origin's first exchange is its own optional `100` then a `302`, in
+    /// `first_exchange`'s segments; the second exchange answers a plain `GET`.
+    async fn assert_origin_interim_is_skipped(first_exchange: Vec<&'static str>) {
+        const REDIRECT: &str = "HTTP/1.1 302 Found\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n";
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![first_exchange, vec![REPLY_OK]],
+        ));
+
+        let (served, (interim, redirect, saw_after_post, next, pending)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client.write_all(b"hello").await.expect("send body");
+                let redirect = read_exact_bytes(&mut client, REDIRECT.len()).await;
+                let saw_after_post =
+                    String::from_utf8_lossy(&origin_saw.lock().expect("seen lock")).into_owned();
+                // The same client connection carries a plain request next; it
+                // must be answered by its own response, with nothing before it.
+                let mut pending = Vec::new();
+                let next =
+                    client_get_keep(&mut client, &mut pending, "/next", "127.0.0.1:8080").await;
+                (interim, redirect, saw_after_post, next, pending)
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(
+            interim.as_deref(),
+            Some(CONTINUE),
+            "the proxy's own 100 comes first"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&redirect),
+            REDIRECT,
+            "then the 302, and no second interim from the origin"
+        );
+        assert_eq!(saw_after_post, FORWARDED_STRICT);
+        assert_eq!(next, "ok");
+        assert!(pending.is_empty(), "pending: {pending:?}");
+
+        let flow = stored_http(&ctx, "/up");
+        let events = sink.events.lock().expect("events lock");
+        let for_post = |matches: fn(&Event, FlowId) -> bool| {
+            events.iter().filter(|e| matches(e, flow.id)).count()
+        };
+        assert_eq!(
+            for_post(|e, id| matches!(e, Event::ResponseHeaders(f) if *f == id)),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            for_post(|e, id| matches!(e, Event::Response(f) if *f == id)),
+            1,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            for_post(|e, id| matches!(e, Event::Error { flow, .. } if *flow == id)),
+            0,
+            "events: {events:?}"
+        );
+        assert_eq!(
+            flow.response.as_ref().map(|r| r.status),
+            Some(302),
+            "no 1xx is stored as the response"
+        );
+        assert_eq!(flow.request.headers.get("expect"), Some("100-continue"));
+        assert!(
+            matches!(flow.request.body, Body::Bytes(ref b) if b.as_slice() == b"hello"),
+            "stored request body: {:?}",
+            flow.request.body
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_forwards_the_expect_header_untouched_and_skips_the_origin_interim() {
+        // The origin's own 100 and the 302 in one write, and in two.
+        assert_origin_interim_is_skipped(vec![
+            "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 302 Found\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+        assert_origin_interim_is_skipped(vec![
+            "HTTP/1.1 100 Continue\r\n\r\n",
+            "HTTP/1.1 302 Found\r\nLocation: /c\r\nContent-Length: 0\r\n\r\n",
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_sends_the_interim_before_the_request_headers_event_returns() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let sink = Arc::new(ParkRequestHeaders {
+            release: release.clone(),
+            entered: entered.clone(),
+            released: released.clone(),
+        });
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], Arc::new(MemFlowStore::new()), sink);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, (interim, parked, still_parked, body, pending)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                // Wait until the proxy has reached the park, then check it is
+                // still in it: the client had its answer while the flow was held.
+                let mut parked = false;
+                for _ in 0..200 {
+                    if entered.load(AtomicOrdering::SeqCst) {
+                        parked = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let still_parked = !released.load(AtomicOrdering::SeqCst);
+                release.notify_one();
+                client.write_all(b"hello").await.expect("send body");
+                let mut pending = Vec::new();
+                let body = read_response_keep(&mut client, &mut pending).await;
+                (interim, parked, still_parked, body, pending)
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(
+            interim.as_deref(),
+            Some(CONTINUE),
+            "the client must be answered while the RequestHeaders dispatch is still parked"
+        );
+        assert!(parked, "the proxy never reached the parked sink");
+        assert!(
+            still_parked,
+            "the sink was released before the client had its answer"
+        );
+        assert_eq!(body, "ok");
+        assert!(pending.is_empty(), "pending: {pending:?}");
+    }
+
+    /// The head of the oversize tests: ten bytes declared, against a cap of four.
+    fn oversize_head(extra: &str) -> String {
+        format!("POST /up HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nContent-Length: 10\r\n{extra}\r\n")
+    }
+
+    #[tokio::test]
+    async fn serve_refuses_a_declared_length_over_the_cap_before_asking_for_the_body() {
+        let (ctx, dialed) = ctx_with(Vec::new());
+        let head = oversize_head("Expect: 100-continue\r\n");
+
+        let (served, (first_head, rest)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            4,
+            |mut client| async move {
+                // The client sends the head and then waits; it never writes a body.
+                client.write_all(head.as_bytes()).await.expect("send head");
+                let first_head = read_interim(&mut client, Duration::from_secs(1))
+                    .await
+                    .expect(
+                        "neither a 100 nor a 413 arrived: the proxy is waiting for a body \
+                         it was never going to accept",
+                    );
+                let mut rest = Vec::new();
+                client.read_to_end(&mut rest).await.expect("read to EOF");
+                (first_head, rest)
+            },
+        )
+        .await;
+
+        served.expect("a refused request ends cleanly");
+        assert!(
+            first_head.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "the first and only head the client reads is the refusal: {first_head:?}"
+        );
+        assert!(!first_head.contains("100"), "first head: {first_head:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&rest),
+            OVERSIZED_BODY,
+            "the refusal's body, then EOF"
+        );
+        assert!(
+            dialed.lock().expect("dialed lock").is_empty(),
+            "nothing may be dialed for a refused request"
+        );
+        assert!(
+            stored_http(&ctx, "/up").metadata.truncated,
+            "the stored request is marked truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_still_reads_an_oversized_body_without_an_expectation() {
+        let (ctx, dialed) = ctx_with(Vec::new());
+        let head = oversize_head("");
+
+        let (served, got) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            4,
+            |mut client| async move {
+                client.write_all(head.as_bytes()).await.expect("send head");
+                client.write_all(b"0123456789").await.expect("send body");
+                let mut got = Vec::new();
+                client.read_to_end(&mut got).await.expect("read to EOF");
+                got
+            },
+        )
+        .await;
+
+        served.expect("a refused request ends cleanly");
+        let got = String::from_utf8_lossy(&got).into_owned();
+        assert!(
+            got.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "response: {got:?}"
+        );
+        assert!(got.ends_with(OVERSIZED_BODY), "response: {got:?}");
+        assert_eq!(got.matches("HTTP/1.1").count(), 1, "one response: {got:?}");
+        assert!(dialed.lock().expect("dialed lock").is_empty());
+        assert!(stored_http(&ctx, "/up").metadata.truncated);
+    }
+
+    #[tokio::test]
+    async fn serve_answers_an_expectation_whose_declared_length_equals_the_cap() {
+        // The boundary of the early refusal: a body exactly at the cap is
+        // accepted, so the client is told to go ahead.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, (interim, body)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            5,
+            |mut client| async move {
+                client
+                    .write_all(STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client.write_all(b"hello").await.expect("send body");
+                let mut pending = Vec::new();
+                let body = read_response_keep(&mut client, &mut pending).await;
+                (interim, body)
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(interim.as_deref(), Some(CONTINUE));
+        assert_eq!(body, "ok");
+    }
+
+    /// One strict exchange on `conn`, whose origin is `origin_end` (reached
+    /// through `upstream` when given, else through the connector), with the
+    /// request naming `host`: the client reads the 100 first and the exchange
+    /// completes.
+    async fn assert_strict_exchange_on(
+        ctx: &ModuleCtx,
+        conn: Conn,
+        upstream: Option<ByteStream>,
+        origin_end: DuplexStream,
+        host: &str,
+    ) {
+        let head = format!(
+            "POST /up HTTP/1.1\r\nHost: {host}\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+        );
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, (interim, body, pending)) =
+            with_serve(ctx, conn, upstream, MAX_BODY, |mut client| async move {
+                client.write_all(head.as_bytes()).await.expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client.write_all(b"hello").await.expect("send body");
+                let mut pending = Vec::new();
+                let body = read_response_keep(&mut client, &mut pending).await;
+                (interim, body, pending)
+            })
+            .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(interim.as_deref(), Some(CONTINUE), "host {host}");
+        assert_eq!(body, "ok", "host {host}");
+        assert!(pending.is_empty(), "host {host}: {pending:?}");
+    }
+
+    #[tokio::test]
+    async fn serve_answers_the_expectation_in_a_tls_tunnel_and_a_cleartext_tunnel() {
+        // A TLS-shaped tunnel: `serve` is handed an already-handshaken upstream.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(Vec::new());
+        assert_strict_exchange_on(
+            &ctx,
+            tunnel_conn(),
+            Some(Box::pin(up)),
+            origin_end,
+            "origin.test:8443",
+        )
+        .await;
+
+        // A cleartext `CONNECT` tunnel: `serve` dials the `CONNECT` target.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
+        assert_strict_exchange_on(
+            &ctx,
+            cleartext_tunnel_conn("127.0.0.1:8080", "127.0.0.1:8080"),
+            None,
+            origin_end,
+            "127.0.0.1:8080",
+        )
+        .await;
+        assert_eq!(
+            *dialed.lock().expect("dialed lock"),
+            vec![dial("127.0.0.1:8080", "127.0.0.1:8080")]
+        );
+    }
+
+    /// A chunked upload's head with an expectation: no `Content-Length`, so no
+    /// declared size to refuse it on.
+    const CHUNKED_STRICT_HEAD: &str = "POST /up HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+
+    #[tokio::test]
+    async fn serve_answers_a_chunked_upload_expectation_and_forwards_it_reframed() {
+        // A chunked head declares no length, so it is never refused early on size:
+        // it gets the go-ahead, and the origin receives the body framed by length.
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let origin_saw = Arc::new(Mutex::new(Vec::new()));
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            origin_saw.clone(),
+            vec![vec![REPLY_OK]],
+        ));
+
+        let (served, (interim, body, pending)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(CHUNKED_STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client
+                    .write_all(b"3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n")
+                    .await
+                    .expect("send body");
+                let mut pending = Vec::new();
+                let body = read_response_keep(&mut client, &mut pending).await;
+                (interim, body, pending)
+            },
+        )
+        .await;
+
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(
+            interim.as_deref(),
+            Some(CONTINUE),
+            "the go-ahead for a chunked upload"
+        );
+        assert_eq!(body, "ok");
+        assert!(pending.is_empty(), "pending: {pending:?}");
+        let origin_saw =
+            String::from_utf8_lossy(&origin_saw.lock().expect("seen lock")).into_owned();
+        assert!(
+            origin_saw.contains("Expect: 100-continue\r\n"),
+            "the expectation is forwarded untouched: {origin_saw:?}"
+        );
+        assert!(
+            origin_saw.ends_with("Content-Length: 5\r\n\r\nhello"),
+            "the origin gets the whole body, framed by length: {origin_saw:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_caps_a_chunked_upload_with_an_expectation_as_its_bytes_arrive() {
+        // With no declared length the head cannot be refused, so the client is
+        // told to go ahead; the cap then bites as the body crosses it.
+        let (ctx, dialed) = ctx_with(Vec::new());
+
+        let (served, (interim, rest)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            4,
+            |mut client| async move {
+                client
+                    .write_all(CHUNKED_STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                let interim = read_interim(&mut client, Duration::from_secs(1)).await;
+                client
+                    .write_all(b"5\r\nhello\r\n0\r\n\r\n")
+                    .await
+                    .expect("send body");
+                let mut rest = Vec::new();
+                client.read_to_end(&mut rest).await.expect("read to EOF");
+                (interim, rest)
+            },
+        )
+        .await;
+
+        served.expect("a refused request ends cleanly");
+        assert_eq!(
+            interim.as_deref(),
+            Some(CONTINUE),
+            "a chunked head is not refused before its body, whatever the cap"
+        );
+        let rest = String::from_utf8_lossy(&rest).into_owned();
+        assert!(
+            rest.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "response: {rest:?}"
+        );
+        assert!(rest.ends_with(OVERSIZED_BODY), "response: {rest:?}");
+        assert!(dialed.lock().expect("dialed lock").is_empty());
+        assert!(stored_http(&ctx, "/up").metadata.truncated);
+    }
+
+    #[tokio::test]
+    async fn serve_ends_quietly_when_the_client_leaves_before_it_can_be_answered() {
+        // The client sends its head and hangs up. The write of the interim fails;
+        // that is the client going away, not a fault for the accept loop to log,
+        // and nothing is dialed for a request that never finished.
+        let (ctx, dialed) = ctx_with(Vec::new());
+
+        let (served, ()) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(STRICT_HEAD.as_bytes())
+                    .await
+                    .expect("send head");
+                // Dropping the client end hangs up before the proxy can answer.
+            },
+        )
+        .await;
+
+        served.expect("a client that leaves before the interim is not an error");
+        assert!(
+            dialed.lock().expect("dialed lock").is_empty(),
+            "nothing may be dialed"
+        );
+    }
+
+    // ---- chunked trailers through `serve` -----------------------------------
+
+    /// The head of a chunked response that announces two trailer fields, and its one
+    /// chunk. The trailer section, if any, follows on the wire.
+    const TRAILER_HEAD: &str = "HTTP/1.1 200 OK\r\nTrailer: x-sum, x-e2e\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+
+    /// A trailer section of two fields that may be forwarded.
+    const TRAILER_SECTION: &str = "0\r\nx-sum: abc\r\nx-e2e: m1\r\n\r\n";
+
+    /// The two ways an origin can deliver [`TRAILER_HEAD`] followed by `section`:
+    /// as one write, and in pieces (the head and its chunk, then each line of the
+    /// section alone, 10 ms apart), so the proxy reads the trailers in reads that
+    /// come after the one that held the head.
+    fn trailer_deliveries(section: &str) -> [Vec<String>; 2] {
+        let whole = vec![format!("{TRAILER_HEAD}{section}")];
+        let mut pieces = vec![TRAILER_HEAD.to_string()];
+        pieces.extend(section.split_inclusive("\r\n").map(str::to_string));
+        [whole, pieces]
+    }
+
+    /// Read until `n` bytes have arrived or `within` has passed, and return what
+    /// arrived. A short answer is a result to compare, not a hang.
+    async fn read_up_to(io: &mut DuplexStream, n: usize, within: Duration) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 512];
+        let _ = tokio::time::timeout(within, async {
+            while got.len() < n {
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => got.extend_from_slice(&chunk[..read]),
+                }
+            }
+        })
+        .await;
+        got
+    }
+
+    /// Read until the peer closes or `within` has passed: everything that
+    /// arrived, and whether the close came.
+    async fn read_to_close(io: &mut DuplexStream, within: Duration) -> (Vec<u8>, bool) {
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 512];
+        let closed = tokio::time::timeout(within, async {
+            loop {
+                match io.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => got.extend_from_slice(&chunk[..read]),
+                }
+            }
+        })
+        .await
+        .is_ok();
+        (got, closed)
+    }
+
+    /// One cleartext `GET /t` through `serve`, answered by an in-memory origin that
+    /// writes `segments` (10 ms apart). The client reads up to `want_len` bytes,
+    /// checks that nothing more follows, and hangs up. Returns `serve`'s result and
+    /// the bytes the client read.
+    async fn trailer_get(
+        ctx: &ModuleCtx,
+        origin_end: DuplexStream,
+        segments: Vec<String>,
+        want_len: usize,
+    ) -> (Result<()>, Vec<u8>) {
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            Arc::new(Mutex::new(Vec::new())),
+            vec![segments],
+        ));
+        with_serve(
+            ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                    .await
+                    .expect("send");
+                let got = read_up_to(&mut client, want_len, Duration::from_secs(1)).await;
+                assert_quiet(&mut client, Duration::from_millis(100)).await;
+                got
+            },
+        )
+        .await
+    }
+
+    /// Edits the stored response when `Event::ResponseHeaders` is dispatched, as a
+    /// plugin rewriting a response head would. Shares `store` with the context it is
+    /// built into, so the edit lands in what `serve` reads back.
+    struct EditAtResponseHeaders {
+        store: Arc<MemFlowStore>,
+        edit: fn(&mut HttpResponse),
+    }
+
+    impl EventSink for EditAtResponseHeaders {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            if let Event::ResponseHeaders(id) = ev {
+                self.store.update(id, &mut |f: &mut Flow| {
+                    if let Flow::Http(h) = f {
+                        if let Some(resp) = h.response.as_mut() {
+                            (self.edit)(resp);
+                        }
+                    }
+                });
+            }
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    /// One look a [`TrailerProbe`] took: the event, how many trailer fields the
+    /// stored response held then, and its `x-sum` header.
+    type ProbeLook = (&'static str, usize, Option<String>);
+
+    /// Records what the stored response holds when `Event::ResponseHeaders` and
+    /// `Event::Response` are dispatched, as a plugin reading the store would see it.
+    struct TrailerProbe {
+        store: Arc<MemFlowStore>,
+        looks: Mutex<Vec<ProbeLook>>,
+    }
+
+    impl EventSink for TrailerProbe {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            let (when, id) = match ev {
+                Event::ResponseHeaders(id) => ("ResponseHeaders", id),
+                Event::Response(id) => ("Response", id),
+                _ => return Box::pin(async { Verdict::Continue }),
+            };
+            if let Some(Flow::Http(HttpFlow {
+                response: Some(resp),
+                ..
+            })) = self.store.get(id)
+            {
+                self.looks.lock().expect("looks lock").push((
+                    when,
+                    resp.trailers.len(),
+                    resp.headers.get("x-sum").map(str::to_string),
+                ));
+            }
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_forwards_the_origin_trailers_in_order() {
+        let want = format!("{TRAILER_HEAD}{TRAILER_SECTION}");
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "the origin wrote {segments:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_the_connection_in_sync_after_a_response_with_trailers() {
+        let want = format!("{TRAILER_HEAD}{TRAILER_SECTION}");
+        for first in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+            let _origin = tokio::spawn(origin_replying(
+                origin_end,
+                Arc::new(Mutex::new(Vec::new())),
+                vec![first.clone(), vec![REPLY_OK.to_string()]],
+            ));
+            let want_len = want.len();
+
+            let (served, (got, body, pending)) = with_serve(
+                &ctx,
+                Conn::plain(unknown_peer(), None),
+                None,
+                MAX_BODY,
+                |mut client| async move {
+                    client
+                        .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                        .await
+                        .expect("send");
+                    let got = read_up_to(&mut client, want_len, Duration::from_secs(1)).await;
+                    // The next request on the same connection is answered intact.
+                    let mut pending = Vec::new();
+                    let body = client_send_keep(
+                        &mut client,
+                        &mut pending,
+                        &get_request("/next", "127.0.0.1:8080"),
+                    )
+                    .await;
+                    (got, body, pending)
+                },
+            )
+            .await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "the origin wrote {first:?}"
+            );
+            assert_eq!(body, "ok");
+            assert!(
+                pending.is_empty(),
+                "nothing follows the second response: {pending:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_without_trailers_still_ends_the_body_with_a_bare_terminator() {
+        let want = format!("{TRAILER_HEAD}0\r\n\r\n");
+        for segments in trailer_deliveries("0\r\n\r\n") {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "the origin wrote {segments:?}"
+            );
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert!(response.trailers.is_empty(), "no trailer fields were sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_withholds_forbidden_trailers_from_the_wire_but_captures_them() {
+        let section = "0\r\nContent-Length: 0\r\nHost: evil.test\r\nSet-Cookie: s=1\r\nAuthorization: Bearer x\r\nX-Keep: yes\r\nLocation: /x\r\n\r\n";
+        let want = format!("{TRAILER_HEAD}0\r\nX-Keep: yes\r\n\r\n");
+        for segments in trailer_deliveries(section) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "only the allowed field is forwarded (origin wrote {segments:?})"
+            );
+            // The capture keeps all six, in the order the origin sent them.
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert_eq!(
+                response.trailers.iter().collect::<Vec<_>>(),
+                vec![
+                    ("Content-Length", "0"),
+                    ("Host", "evil.test"),
+                    ("Set-Cookie", "s=1"),
+                    ("Authorization", "Bearer x"),
+                    ("X-Keep", "yes"),
+                    ("Location", "/x"),
+                ]
+            );
+            // And none of them leaked into the headers.
+            for name in [
+                "content-length",
+                "host",
+                "set-cookie",
+                "authorization",
+                "x-keep",
+                "location",
+            ] {
+                assert_eq!(response.headers.get(name), None, "{name} is a trailer only");
+            }
+            assert_eq!(response.headers.get("trailer"), Some("x-sum, x-e2e"));
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_does_not_forward_origin_trailers_after_a_replaced_body() {
+        // A plugin swaps the streamed body for its own and drops the chunked
+        // framing, so the client gets a `Content-Length` response.
+        let want = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nreplaced";
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let sink = Arc::new(EditAtResponseHeaders {
+                store: store.clone(),
+                edit: |resp| {
+                    resp.body = Body::Bytes(b"replaced".to_vec());
+                    resp.headers.remove("transfer-encoding");
+                    resp.headers.remove("trailer");
+                },
+            });
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "no terminator and no trailer follows a replaced body (origin wrote {segments:?})"
+            );
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert_eq!(
+                response.trailers.iter().collect::<Vec<_>>(),
+                vec![("x-sum", "abc"), ("x-e2e", "m1")],
+                "the capture still holds what the origin sent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_writes_no_trailers_when_the_client_body_is_not_chunk_framed() {
+        // A plugin reframes the still-streamed body by length: the client-bound
+        // framing is no longer chunked, so there is no section to put trailers in.
+        let want = "HTTP/1.1 200 OK\r\nTrailer: x-sum, x-e2e\r\nContent-Length: 5\r\n\r\nhello";
+        let (_guard, captured) = capture_events(tracing::Level::DEBUG);
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            captured.lock().expect("events lock").clear();
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let sink = Arc::new(EditAtResponseHeaders {
+                store: store.clone(),
+                edit: |resp| {
+                    resp.headers.remove("transfer-encoding");
+                    resp.headers.set("Content-Length", "5");
+                },
+            });
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink);
+
+            let (served, got) = trailer_get(&ctx, origin_end, segments.clone(), want.len()).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                want,
+                "origin wrote {segments:?}"
+            );
+            let response = stored_http(&ctx, "/t").response.expect("stored response");
+            assert_eq!(response.trailers.len(), 2, "the capture is unaffected");
+            // Both fields went unwritten, and that is reported once, as a count.
+            let events = captured.lock().expect("events lock");
+            let reports: Vec<&Captured> = events
+                .iter()
+                .filter(|e| e.fields.contains_key("withheld"))
+                .collect();
+            assert_eq!(reports.len(), 1, "events: {events:?}");
+            assert_eq!(reports[0].level, tracing::Level::DEBUG);
+            assert_eq!(reports[0].fields, field_set(&[("withheld", "2")]));
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_exposes_trailers_to_plugins_at_response_time() {
+        for segments in trailer_deliveries(TRAILER_SECTION) {
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let probe = Arc::new(TrailerProbe {
+                store: store.clone(),
+                looks: Mutex::new(Vec::new()),
+            });
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, probe.clone());
+            let want_len = TRAILER_HEAD.len() + TRAILER_SECTION.len();
+
+            let (served, _got) = trailer_get(&ctx, origin_end, segments.clone(), want_len).await;
+
+            served.expect("serve ends cleanly when the client hangs up");
+            // The head is dispatched with no trailers yet, whatever has already been
+            // read; by `Event::Response` the origin's two fields are stored, and the
+            // headers are the origin's head, unmerged.
+            assert_eq!(
+                *probe.looks.lock().expect("looks lock"),
+                vec![("ResponseHeaders", 0, None), ("Response", 2, None)],
+                "the origin wrote {segments:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_fails_closed_on_an_oversized_trailer_section() {
+        let mut section = String::from("0\r\n");
+        for n in 0..65 {
+            section.push_str(&format!("f{n}: v\r\n"));
+        }
+        section.push_str("\r\n");
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        // The head and its chunk are written alone and first, so they are read,
+        // forwarded and flushed before the over-cap section arrives. (Were all of it
+        // in one read, `on_bytes` would fail for the whole read and the client would
+        // get nothing before the close: fail-closed as well, not asserted here.)
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            Arc::new(Mutex::new(Vec::new())),
+            vec![vec![TRAILER_HEAD.to_string(), section]],
+        ));
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                    .await
+                    .expect("send");
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an over-cap trailer section fails the connection");
+        assert!(err.to_string().contains("trailer"), "error: {err}");
+        assert!(
+            closed,
+            "the proxy must hang up, not keep the client waiting"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            TRAILER_HEAD,
+            "the client has the head and the chunk, and never a terminator"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_reports_a_malformed_trailer_section_as_one_typed_error() {
+        // Event consumers (the Rhai `on_error` hook and `flow.subscribe` bus
+        // subscribers) learn of a response from its events, so a response the
+        // machine refuses must still reach them as an error, or one bad trailer
+        // line would hide a body from them.
+        let mut section = String::from("0\r\n");
+        for n in 0..65 {
+            section.push_str(&format!("x-evil-91c2-{n}: v\r\n"));
+        }
+        section.push_str("\r\n");
+        let one_read = format!("{TRAILER_HEAD}{section}");
+        let deliveries = [
+            (
+                "head, then section",
+                vec![TRAILER_HEAD.to_string(), section],
+            ),
+            ("head and section together", vec![one_read]),
+        ];
+        for (delivery, segments) in deliveries {
+            let (up, origin_end) = duplex(64 * 1024);
+            let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+            let _origin = tokio::spawn(origin_replying(
+                origin_end,
+                Arc::new(Mutex::new(Vec::new())),
+                vec![segments],
+            ));
+
+            let (served, _) = with_serve(
+                &ctx,
+                Conn::plain(unknown_peer(), None),
+                None,
+                MAX_BODY,
+                |mut client| async move {
+                    client
+                        .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                        .await
+                        .expect("send");
+                    read_to_close(&mut client, Duration::from_secs(2)).await
+                },
+            )
+            .await;
+
+            let err = served.expect_err("an over-cap trailer section fails the connection");
+            assert!(err.to_string().contains("trailer"), "error: {err}");
+            let flow = stored_http(&ctx, "/t");
+            let events = sink.events.lock().expect("events lock");
+            let errors: Vec<&aitm_core::FlowError> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Error { flow: f, kind } if *f == flow.id => Some(kind),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                errors,
+                vec![&aitm_core::FlowError::Upstream(
+                    "malformed response from upstream".to_string()
+                )],
+                "one typed error, in fixed words ({delivery}): {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Event::Response(f) if *f == flow.id)),
+                "a refused response is never dispatched as complete: {events:?}"
+            );
+            assert!(
+                !format!("{events:?}").contains("evil-91c2"),
+                "the origin's field names must not reach an event: {events:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_never_logs_trailer_names_or_values() {
+        let (_guard, captured) = capture_events(tracing::Level::TRACE);
+        let token = "x-trailertoken-91c2: val-trailertoken-91c2\r\n";
+
+        // Every field is forwarded: nothing to report.
+        let section = format!("0\r\n{token}\r\n");
+        let want = format!("{TRAILER_HEAD}{section}");
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let segments = trailer_deliveries(&section)[1].clone();
+        let (served, got) = trailer_get(&ctx, origin_end, segments, want.len()).await;
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(String::from_utf8_lossy(&got), want);
+        {
+            let events = captured.lock().expect("events lock");
+            assert!(
+                !format!("{events:?}")
+                    .to_ascii_lowercase()
+                    .contains("trailertoken"),
+                "a trailer name or value reached the log: {events:?}"
+            );
+            assert!(
+                events.iter().all(|e| !e.fields.contains_key("withheld")),
+                "a response whose trailers are all forwarded has nothing to report: {events:?}"
+            );
+        }
+        captured.lock().expect("events lock").clear();
+
+        // One field is withheld: one debug event, carrying a count and nothing else.
+        let section = format!("0\r\n{token}Set-Cookie: s=1\r\n\r\n");
+        let want = format!("{TRAILER_HEAD}0\r\n{token}\r\n");
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed) = ctx_with(vec![Box::pin(up)]);
+        let segments = trailer_deliveries(&section)[1].clone();
+        let (served, got) = trailer_get(&ctx, origin_end, segments, want.len()).await;
+        served.expect("serve ends cleanly when the client hangs up");
+        assert_eq!(String::from_utf8_lossy(&got), want);
+        let events = captured.lock().expect("events lock");
+        assert!(
+            !format!("{events:?}")
+                .to_ascii_lowercase()
+                .contains("trailertoken"),
+            "a trailer name or value reached the log: {events:?}"
+        );
+        let reports: Vec<&Captured> = events
+            .iter()
+            .filter(|e| e.fields.contains_key("withheld"))
+            .collect();
+        assert_eq!(reports.len(), 1, "events: {events:?}");
+        assert_eq!(reports[0].level, tracing::Level::DEBUG);
+        assert_eq!(reports[0].fields, field_set(&[("withheld", "1")]));
+        assert!(
+            !format!("{events:?}")
+                .to_ascii_lowercase()
+                .contains("cookie"),
+            "a withheld field's name must not be logged either: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_fails_closed_when_the_origin_drops_inside_the_trailer_section() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        // The origin sends the head, the chunk and a section cut off mid-field, then
+        // hangs up. Nothing in it is a complete trailer section.
+        let _origin = tokio::spawn(async move {
+            let mut io = origin_end;
+            let mut request = [0u8; 512];
+            let _ = io.read(&mut request).await;
+            for segment in [TRAILER_HEAD, "0\r\nx-sum: abc\r\nx-e2e: m"] {
+                io.write_all(segment.as_bytes())
+                    .await
+                    .expect("origin write");
+                io.flush().await.expect("origin flush");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // `io` is dropped here: the connection closes inside the section.
+        });
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                client
+                    .write_all(get_request("/t", "127.0.0.1:8080").as_bytes())
+                    .await
+                    .expect("send");
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an origin that drops mid-section fails the connection");
+        assert!(
+            err.to_string().contains("closed before completing"),
+            "error: {err}"
+        );
+        assert!(
+            closed,
+            "the proxy must hang up, not keep the client waiting"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            TRAILER_HEAD,
+            "the client has the head and the chunk, and never a terminator"
+        );
+        let flow = stored_http(&ctx, "/t");
+        assert!(
+            flow.response
+                .as_ref()
+                .is_some_and(|r| r.trailers.is_empty()),
+            "half a section is not captured as the origin's trailers"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::Error { flow: f, .. } if *f == flow.id))
+                .count(),
+            1,
+            "one typed error for the broken response: {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::Response(f) if *f == flow.id)),
+            "an incomplete response is never dispatched as complete: {events:?}"
+        );
     }
 }

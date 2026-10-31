@@ -15,6 +15,7 @@ fn http_flow_terminal(authority: &str, path: &str, body_len: usize) -> Flow {
             status: 200,
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Bytes(vec![b'x'; body_len]),
             timestamp: SystemTime::now(),
         });
@@ -131,6 +132,101 @@ fn update_growth_counts_toward_byte_budget() {
     );
 }
 
+/// A terminal flow whose response carries `headers` and `trailers` and no body,
+/// so any difference in `resident_bytes` between two such flows is the fields.
+fn http_flow_with_fields(path: &str, headers: HeaderMap, trailers: HeaderMap) -> Flow {
+    let mut flow = http_flow("a.test", path);
+    if let Flow::Http(h) = &mut flow {
+        h.response = Some(HttpResponse {
+            status: 200,
+            version: HttpVersion::Http11,
+            headers,
+            trailers,
+            body: Body::Empty,
+            timestamp: SystemTime::now(),
+        });
+    }
+    flow
+}
+
+/// A response's trailers are resident memory: with the byte budget as the only
+/// bound (`max_flows = 0`), a hostile origin attaching trailers to every
+/// response must be charged for them like any other field text.
+#[test]
+fn trailers_count_toward_resident_bytes() {
+    let mut trailers = HeaderMap::new();
+    trailers.set("X-Sum", "abc");
+    trailers.set("x-sum", "def");
+
+    let bare = MemFlowStore::new();
+    bare.insert(http_flow_with_fields(
+        "/p",
+        HeaderMap::new(),
+        HeaderMap::new(),
+    ));
+    let with = MemFlowStore::new();
+    with.insert(http_flow_with_fields("/p", HeaderMap::new(), trailers));
+
+    // "X-Sum" + "abc" + "x-sum" + "def" = 16 bytes of field text.
+    assert!(
+        with.resident_bytes() >= bare.resident_bytes() + 16,
+        "trailers must be charged: {} bytes with vs {} without",
+        with.resident_bytes(),
+        bare.resident_bytes()
+    );
+}
+
+/// Trailers are charged exactly as headers are, so a field costs the same
+/// wherever the response carries it.
+#[test]
+fn a_trailer_costs_what_the_same_header_costs() {
+    let mut fields = HeaderMap::new();
+    fields.set("X-Sum", "abc");
+    fields.set("x-sum", "def");
+
+    let as_headers = MemFlowStore::new();
+    as_headers.insert(http_flow_with_fields(
+        "/p",
+        fields.clone(),
+        HeaderMap::new(),
+    ));
+    let as_trailers = MemFlowStore::new();
+    as_trailers.insert(http_flow_with_fields("/p", HeaderMap::new(), fields));
+
+    assert_eq!(as_trailers.resident_bytes(), as_headers.resident_bytes());
+}
+
+/// Trailers stored by an `update` (the response gets them at Response time,
+/// after the head was inserted) are counted and can trigger byte eviction.
+#[test]
+fn update_adding_trailers_counts_toward_byte_budget() {
+    let store = MemFlowStore::with_limits(10_000, 10_000);
+    let mut ids = Vec::new();
+    for i in 0..20 {
+        ids.push(store.insert(http_flow_terminal("a.test", &format!("/{i}"), 0)));
+    }
+    // Each response gains 1000 bytes of trailer text (20 flows: 20,000 bytes).
+    for id in &ids {
+        store.update(*id, &mut |f: &mut Flow| {
+            if let Flow::Http(h) = f {
+                if let Some(r) = &mut h.response {
+                    r.trailers.set("X-Pad", &"x".repeat(995));
+                }
+            }
+        });
+    }
+    assert!(
+        store.resident_bytes() <= 10_000,
+        "trailer growth must be evicted to stay within budget ({} bytes)",
+        store.resident_bytes()
+    );
+    assert!(
+        store.list().len() < 20,
+        "the byte budget must have evicted some of the 20 flows (kept {})",
+        store.list().len()
+    );
+}
+
 #[test]
 fn insert_get_roundtrip() {
     let store = MemFlowStore::new();
@@ -140,6 +236,43 @@ fn insert_get_roundtrip() {
         Flow::Http(f) => assert_eq!(f.request.path, "/a"),
         other => panic!("expected http flow, got {other:?}"),
     }
+}
+
+/// Trailer fields ride beside a response's headers, never in them: the store
+/// hands back the same two lists, in wire order, with case and the duplicate kept.
+#[test]
+fn a_response_keeps_trailers_beside_its_headers_never_in_them() {
+    let mut headers = HeaderMap::new();
+    headers.set("Content-Type", "text/plain");
+    let mut trailers = HeaderMap::new();
+    trailers.set("X-Sum", "abc");
+    trailers.set("x-sum", "def");
+
+    let mut flow = http_flow("a.test", "/t");
+    if let Flow::Http(h) = &mut flow {
+        h.response = Some(HttpResponse {
+            status: 200,
+            version: HttpVersion::Http11,
+            headers,
+            trailers,
+            body: Body::Bytes(b"hello".to_vec()),
+            timestamp: SystemTime::now(),
+        });
+    }
+
+    let store = MemFlowStore::new();
+    let id = store.insert(flow);
+    let Some(Flow::Http(got)) = store.get(id) else {
+        panic!("expected the http flow back from the store");
+    };
+    let response = got.response.expect("the response was stored");
+
+    assert_eq!(
+        response.trailers.iter().collect::<Vec<_>>(),
+        [("X-Sum", "abc"), ("x-sum", "def")]
+    );
+    assert_eq!(response.headers.get("x-sum"), None);
+    assert_eq!(response.headers.len(), 1);
 }
 
 #[test]

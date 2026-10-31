@@ -20,7 +20,7 @@ struct OverviewPanel: View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.xl) {
                 TrackedLabel("Overview").accessibilityAddTraits(.isHeader)
-                StatTiles(stats: stats) { showStatus(.serverError) }
+                StatTiles(stats: stats, onPaused: { showPaused() }, onErrors: { showErrors() })
                 sections(stats)
             }
             .padding(Space.margin)
@@ -64,7 +64,7 @@ struct OverviewPanel: View {
                     ForEach([("p50", p.p50), ("p90", p.p90), ("p99", p.p99)], id: \.0) { name, value in
                         BarRow(label: name, labelColor: Tok.Ink.secondary, labelWidth: Self.codeWidth,
                                value: Format.duration(value), fraction: Self.seconds(value) / top,
-                               barColor: Palette.accent)
+                               barColor: Tok.Ink.secondary.color)
                             .accessibilityLabel("\(name), \(Format.duration(value))")
                     }
                 }
@@ -77,16 +77,35 @@ struct OverviewPanel: View {
         return stats.percentiles == nil ? "No completed flows yet" : nil
     }
 
-    /// Narrows the Connection Log to one status class (a status row or the Errors
-    /// tile). The `none` bucket is "no status yet" — the negation of `~s`. There is
-    /// no flow-state filter field, so the Paused tile has nothing to jump to.
+    /// Narrows the Connection Log to one status class (a status row). The `none`
+    /// bucket is "no status yet" — the negation of `~s`.
     private func showStatus(_ statusClass: StatusClass?) {
-        session.show(.connections)
         let row = statusClass
             .map { FilterRow(.status, .equals, String($0.rangeLabel.prefix(1))) }
             ?? FilterRow(.status, .contains, "", negated: true)
+        applyFilter(FilterStack(rows: [row]))
+    }
+
+    /// The Paused tile: a single flow-state filter.
+    private func showPaused() {
+        applyFilter(FilterStack(rows: [FilterRow(.state, .equals, "paused")]))
+    }
+
+    /// The Errors tile: transport failures, killed flows, or 5xx — the exact set the
+    /// Errors stat counts, as an OR of state and status terms.
+    private func showErrors() {
+        applyFilter(FilterStack(rows: [
+            FilterRow(.state, .equals, "failed"),
+            FilterRow(.state, .equals, "killed"),
+            FilterRow(.status, .equals, "5"),
+        ], combinator: .or))
+    }
+
+    /// Jumps to the Connection Log narrowed to `stack`, with the filter bar shown.
+    private func applyFilter(_ stack: FilterStack) {
+        session.show(.connections)
         session.filterAdvanced = false
-        session.filterStack = FilterStack(rows: [row])
+        session.filterStack = stack
         session.filterBarVisible = true
     }
 
@@ -117,8 +136,8 @@ struct OverviewPanel: View {
 /// hairline grid: no fills, no shadows; a tracked label over a mono number.
 private struct StatTiles: View {
     var stats: OverviewStats
-    /// Jump from the Errors tile to the 5xx filter — the only tile with a filter to
-    /// jump to (Paused has no flow-state filter field to narrow on).
+    /// The Paused and Errors tiles jump to the matching flow filter.
+    var onPaused: () -> Void
     var onErrors: () -> Void
 
     private struct Tile {
@@ -132,7 +151,7 @@ private struct StatTiles: View {
             Tile(title: "Flows", value: String(stats.flows)),
             Tile(title: "Hosts", value: String(stats.hosts)),
             Tile(title: "Clients", value: String(stats.clients)),
-            Tile(title: "Paused", value: String(stats.paused)),
+            Tile(title: "Paused", value: String(stats.paused), action: onPaused),
             Tile(title: "Errors", value: String(stats.errors), action: onErrors),
             Tile(title: "↑ Bytes", value: Format.bytes(stats.requestBytes)),
             Tile(title: "↓ Bytes", value: Format.bytes(stats.responseBytes)),

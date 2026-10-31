@@ -34,6 +34,11 @@ pub struct SessionDoc {
 
 /// One flow, tagged by protocol so new protocols slot in without breaking old
 /// documents.
+// Mirrors `aitm_core::Flow`, which accepts the same size gap for the same
+// reason: the Http variant holds the whole decoded exchange, and boxing it would
+// only move the lint onto `WebSocket` (the response `trailers` field is what
+// widened the gap past clippy's threshold).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FlowRecord {
@@ -82,6 +87,12 @@ pub struct RespRec {
     pub status: u16,
     pub version: VersionRec,
     pub headers: Vec<(String, String)>,
+    /// Chunked trailers, in wire order. Additive and optional: a response
+    /// without trailers writes no key (the document is byte-identical to one
+    /// written before trailers existed), and a document without the key loads
+    /// with none, so the `aitm-session/1` tag needs no bump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trailers: Vec<(String, String)>,
     pub body: BodyRec,
     pub timestamp: SystemTime,
 }
@@ -250,6 +261,7 @@ fn resp_to_rec(r: &HttpResponse) -> RespRec {
         status: r.status,
         version: version_to_rec(r.version),
         headers: headers_to_rec(&r.headers),
+        trailers: headers_to_rec(&r.trailers),
         body: body_to_rec(&r.body),
         timestamp: r.timestamp,
     }
@@ -260,6 +272,7 @@ fn rec_to_resp(r: &RespRec) -> HttpResponse {
         status: r.status,
         version: rec_to_version(r.version),
         headers: rec_to_headers(&r.headers),
+        trailers: rec_to_headers(&r.trailers),
         body: rec_to_body(&r.body),
         timestamp: r.timestamp,
     }

@@ -9,7 +9,7 @@ import Foundation
 public enum FilterField: String, CaseIterable, Hashable, Sendable, Codable {
     case url, host, path, query, method, status
     case requestHeader, responseHeader, requestBody, responseBody, contentType
-    case client, duration, size, mark, comment, origin, scope
+    case client, duration, size, mark, comment, origin, scope, state
     /// WebSocket frame direction (`sent` / `received`). Frames are not part of
     /// `FlowDetail` yet, so terms on this field match nothing until they are.
     case wsDirection
@@ -34,6 +34,7 @@ public enum FilterField: String, CaseIterable, Hashable, Sendable, Codable {
         case .comment: "Comment"
         case .origin: "Origin"
         case .scope: "Scope"
+        case .state: "State"
         case .wsDirection: "WebSocket direction"
         }
     }
@@ -55,7 +56,7 @@ public enum FilterField: String, CaseIterable, Hashable, Sendable, Codable {
         if isNumeric { return [.equals, .greaterThan, .lessThan, .contains, .wildcard, .regex] }
         if isBody { return [.contains, .equals, .wildcard, .regex, .jsonPath, .fullText] }
         switch self {
-        case .method, .mark, .origin, .scope, .wsDirection:
+        case .method, .mark, .origin, .scope, .state, .wsDirection:
             return [.equals, .contains, .wildcard, .regex]
         default:
             return [.contains, .equals, .wildcard, .regex, .fullText]
@@ -83,6 +84,7 @@ public enum FilterField: String, CaseIterable, Hashable, Sendable, Codable {
         case .comment: "comment"
         case .origin: "origin"
         case .scope: "scope"
+        case .state: "state"
         case .wsDirection: "ws"
         }
     }
@@ -91,7 +93,7 @@ public enum FilterField: String, CaseIterable, Hashable, Sendable, Codable {
     /// equals for enumerated fields, greater-than for duration and size.
     var defaultOperator: FilterOperator {
         switch self {
-        case .method, .status, .mark, .origin, .scope, .wsDirection: .equals
+        case .method, .status, .mark, .origin, .scope, .state, .wsDirection: .equals
         case .duration, .size: .greaterThan
         default: .regex
         }

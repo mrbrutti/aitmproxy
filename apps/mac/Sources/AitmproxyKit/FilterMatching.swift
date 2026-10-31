@@ -218,7 +218,7 @@ struct CompiledTerm: Sendable {
                 }
                 guard let text = context.text(for: field) else { return false }
                 return matchesText(text, status: field == .status)
-            case .url, .host, .path, .query, .method, .client, .mark, .comment, .origin, .scope:
+            case .url, .host, .path, .query, .method, .client, .mark, .comment, .origin, .scope, .state:
                 guard let text = context.text(for: field) else { return false }
                 return matchesText(text, status: false)
             }
@@ -383,6 +383,7 @@ struct MatchContext {
             case .imported: return "imported"
             }
         case .scope: return row.inScope ? "in" : "out"
+        case .state: return row.state.label
         case .requestHeader, .responseHeader, .requestBody, .responseBody, .contentType, .wsDirection:
             return nil
         }

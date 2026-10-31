@@ -80,6 +80,7 @@ pub(crate) fn response_from_h2(head: &http::response::Parts) -> HttpResponse {
         status: head.status.as_u16(),
         version: HttpVersion::H2,
         headers: headers_from_h2(&head.headers),
+        trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: SystemTime::now(),
     }
@@ -207,6 +208,7 @@ mod tests {
             status: 418,
             version: HttpVersion::H2,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
         };
@@ -214,5 +216,32 @@ mod tests {
             h2_response_from(&model).status(),
             http::StatusCode::IM_A_TEAPOT
         );
+    }
+
+    #[test]
+    fn a_translated_h2_response_has_no_trailers() {
+        let (parts, _) = http::Response::builder()
+            .status(200)
+            .body(())
+            .unwrap()
+            .into_parts();
+
+        assert!(response_from_h2(&parts).trailers.is_empty());
+    }
+
+    #[test]
+    fn h2_response_from_ignores_trailers() {
+        let mut trailers = HeaderMap::new();
+        trailers.set("X-Sum", "abc");
+        let model = HttpResponse {
+            status: 200,
+            version: HttpVersion::H2,
+            headers: HeaderMap::new(),
+            trailers,
+            body: Body::Empty,
+            timestamp: SystemTime::now(),
+        };
+
+        assert!(!h2_response_from(&model).headers().contains_key("x-sum"));
     }
 }

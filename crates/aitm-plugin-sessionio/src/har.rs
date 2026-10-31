@@ -269,6 +269,8 @@ fn entry_to_http(entry: &HarEntry) -> anyhow::Result<HttpFlow> {
         status: entry.response.status,
         version: parse_version(&entry.response.http_version),
         headers: har_headers(&entry.response.headers),
+        // HAR 1.2 has no trailers field, so an imported response has none.
+        trailers: HeaderMap::new(),
         body: content_to_body(&entry.response.content)?,
         timestamp: UNIX_EPOCH,
     };
@@ -326,6 +328,8 @@ fn resp_to_har(r: &HttpResponse) -> HarResponse {
         status: r.status,
         status_text: reason(r.status),
         http_version: version_str(r.version),
+        // Only `headers` are written: HAR 1.2 has no trailers field, so
+        // `r.trailers` is not exported.
         headers: headers_to_har(&r.headers),
         cookies: Vec::new(),
         content: HarContent {
