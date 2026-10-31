@@ -9,37 +9,27 @@
 //! its example — a cookie value is session or credential material whatever its
 //! name (`PHPSESSID`, `sid`, `JSESSIONID`), so no name list is trusted to spot
 //! it. A header, query or body point whose *name* reads as a secret
-//! ([`aitm_core::redact::is_secret_key`] — `Authorization`, `token`, `api-key`,
-//! `password`, … — widened locally by [`is_secret_name`] with the common auth
-//! parameter names) is redacted the same way. So an auth header or session
-//! cookie seen in captured traffic cannot reach a structured `scan.*` result.
+//! ([`aitm_core::redact::is_secret_key_wide`], the wide reading of the shared
+//! vocabulary: `Authorization`, `token`, `api-key`, `password`, … and any name
+//! that merely contains one of the short auth words, `author` and `sidebar`
+//! included) is redacted the same way. So an auth header or session cookie seen
+//! in captured traffic cannot reach a structured `scan.*` result.
 
 use std::collections::HashSet;
 
-use aitm_core::redact::is_secret_key;
+use aitm_core::redact::is_secret_key_wide;
 use aitm_core::Body;
 
 /// The example value a secret-named injection point carries.
 pub const REDACTED: &str = "<redacted>";
 
-/// Auth-parameter name fragments the shared vocabulary in `aitm_core::redact`
-/// does not carry, matched the same way (case-insensitive substring). They
-/// over-match on purpose (`sid` catches `subsidiary`): a redacted example costs
-/// nothing, a leaked session id does. `pub(crate)` so `reproduce`'s embedded-value
-/// scrub is built from this very slice rather than a second copy of the list.
-pub(crate) const EXTRA_SECRET_NEEDLES: &[&str] = &["sid", "jwt", "csrf", "session", "auth"];
-
-/// Whether a header / query / body parameter name reads as a secret: the shared
-/// vocabulary plus [`EXTRA_SECRET_NEEDLES`]. `pub(crate)` so `reproduce`'s PoC
-/// scrubber masks exactly the names `enumerate` redacts here — one vocabulary.
+/// Whether a header / query / body parameter name reads as a secret. A delegate
+/// to [`is_secret_key_wide`], which over-matches on purpose (`sid` catches
+/// `subsidiary`): a redacted example costs nothing, a leaked session id does.
+/// `pub(crate)` so `reproduce`'s PoC scrubber masks exactly the names `enumerate`
+/// redacts here.
 pub(crate) fn is_secret_name(name: &str) -> bool {
-    if is_secret_key(name) {
-        return true;
-    }
-    let lower = name.to_ascii_lowercase();
-    EXTRA_SECRET_NEEDLES
-        .iter()
-        .any(|needle| lower.contains(needle))
+    is_secret_key_wide(name)
 }
 
 /// Upper bound on the injection points enumerated from one flow. A hostile
@@ -534,8 +524,9 @@ mod tests {
         assert_eq!(points.len(), 4, "the cookie *names* survive: {points:?}");
     }
 
-    /// Common auth parameter names outside the shared vocabulary are caught
-    /// for headers, query and body parameters too.
+    /// Common auth parameter names (`sid`, `jwt`, `session`, `X-CSRF-Token`,
+    /// `X-Auth`) are redacted for headers and query parameters as well as
+    /// cookies, and a plain parameter keeps its value.
     #[test]
     fn enumerate_redacts_common_auth_parameter_names() {
         let mut headers = HeaderMap::new();

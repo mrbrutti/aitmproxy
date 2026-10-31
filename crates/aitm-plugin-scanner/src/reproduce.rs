@@ -16,17 +16,18 @@
 //! it copies, itself (see `Scrubber`): every secret-named
 //! header, query parameter, form field and JSON key becomes a required `{{var}}`
 //! placeholder the runner must be given at run time, and every other value is
-//! passed through `scrub_embedded` — [`aitm_core::redact::scrub_text`] plus the
-//! same widened name vocabulary ([`is_secret_name`]) the name scrub uses, so a
-//! credential embedded in an innocuously named value cannot slip past a
-//! narrower list. `record_finding` is a thin
+//! passed through `scrub_embedded` — URL userinfo stripped, then
+//! [`aitm_core::redact::scrub_text_wide`], the wide reading of the same
+//! vocabulary [`is_secret_name`] applies to a name, so a credential embedded in
+//! an innocuously named value cannot slip past a narrower list.
+//! `record_finding` is a thin
 //! wrapper over [`aitm_findings::DiskFindingStore`]: the store itself scrubs
 //! `title`/`notes` of credential material before anything reaches disk, and the
 //! record's `target` is scrubbed here.
 
 use std::collections::HashSet;
 
-use aitm_core::redact::scrub_text;
+use aitm_core::redact::{scrub_text, scrub_text_wide};
 use aitm_core::{Body, CommandHost, HttpFlow, HttpRequest};
 use aitm_findings::{DiskFindingStore, FindingRecord, FindingStore};
 use aitm_poc::{
@@ -35,7 +36,7 @@ use aitm_poc::{
 
 use crate::checks::{CheckDefinition, Payload, CLASS_OPEN_REDIRECT, CLASS_REFLECTED_XSS};
 use crate::crawl::strip_userinfo;
-use crate::discover::{is_secret_name, InjectionPoint, EXTRA_SECRET_NEEDLES};
+use crate::discover::{is_secret_name, InjectionPoint};
 
 /// Characters of the (network-supplied) injection-point name that feed the PoC
 /// name and, through its slug, the PoC id. Bounded so the id always fits
@@ -362,149 +363,16 @@ impl<'a> Scrubber<'a> {
 /// Mask credential material embedded in a value that is *not* itself under a
 /// secret name, using the one vocabulary the name scrub uses.
 ///
-/// [`scrub_text`] alone only knows `api_key` / `token` / `secret` / `password` /
-/// `pwd` / `credential` / `cookie` and `Bearer`, so a `sid=`, `jwt=`, `csrf=`,
-/// `session=` or `auth=` pair — all of which [`is_secret_name`] masks when they
-/// are the *name* of a header or parameter — passed straight through when
-/// embedded in a `Referer`-style or URL-valued value. This closes that gap in
-/// three steps:
-///
-/// 1. URL userinfo is stripped ([`strip_userinfo`]: `//user:pw@host` →
-///    `//host`) — first, so a `user:pw@` prefix cannot make the next steps
-///    swallow the host;
-/// 2. [`scrub_text`] masks its own base vocabulary;
-/// 3. every `key=value` / `key: value` whose *key* contains an
-///    [`EXTRA_SECRET_NEEDLES`] needle has its value replaced by `[redacted]`
-///    ([`redact_needle_pairs`]).
+/// URL userinfo is stripped first ([`strip_userinfo`]: `//user:pw@host` →
+/// `//host`), so a `user:pw@` prefix cannot make the scan swallow the host. Then
+/// [`scrub_text_wide`] masks every `key=value` / `key: value` pair whose key
+/// reads as a secret under the wide reading, the same reading [`is_secret_name`]
+/// applies to the *name* of a header or parameter. A `sid=`, `auth=` or `author=`
+/// pair embedded in a `Referer`-style or URL-valued value is therefore masked
+/// exactly as it would be under a name, and the two scrubs cannot disagree about
+/// which names are secret.
 fn scrub_embedded(text: &str) -> String {
-    redact_needle_pairs(&scrub_text(&strip_userinfo(text)))
-}
-
-/// Whether `b` can be part of a `key` in a `key=value` pair.
-fn is_key_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
-}
-
-/// Whether `b` ends an unquoted value: ASCII whitespace or a pair, list or JSON
-/// delimiter. A non-ASCII byte never does, so a value is over- rather than
-/// under-redacted.
-fn ends_value(b: u8) -> bool {
-    b.is_ascii_whitespace() || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
-}
-
-/// Whether `key` contains an [`EXTRA_SECRET_NEEDLES`] needle (ASCII
-/// case-insensitive, as a substring — exactly how `discover::is_secret_name`
-/// matches the same slice).
-fn names_a_secret(key: &str) -> bool {
-    let key = key.as_bytes();
-    // No per-key allocation: this runs once per key run of a body that may be
-    // megabytes long. (`windows(0)` would panic, so an empty needle is skipped.)
-    EXTRA_SECRET_NEEDLES.iter().any(|needle| {
-        let needle = needle.as_bytes();
-        !needle.is_empty()
-            && key
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle))
-    })
-}
-
-/// Redact the value of every `key=value` / `key: value` pair in `text` whose key
-/// reads as a secret under [`EXTRA_SECRET_NEEDLES`].
-///
-/// Equivalent to replacing, case-insensitively,
-/// `(["']?[a-z0-9_.-]*(?:needle…)[a-z0-9_.-]*["']?[ \t]*[=:][ \t]*["']?)<value>`
-/// with `${1}[redacted]`, where `<value>` is a run up to `[\s&;,"'}]` — or, when
-/// it opens with a quote, everything up to the matching unescaped quote, so a
-/// JSON value holding spaces is masked whole. Optional quotes around the key
-/// and value make a JSON-encoded pair (`"sid":"…"`) match the way
-/// `scrub_text`'s own pass does.
-///
-/// Written as one linear scan, not a regex: the crate carries no `regex`
-/// dependency, and each key run and each value is consumed exactly once, so a
-/// hostile ~10 MiB body cannot make this quadratic. An empty value is left
-/// alone (nothing to leak).
-fn redact_needle_pairs(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut out = String::with_capacity(text.len());
-    // Start of the text not yet copied into `out`.
-    let mut copied = 0;
-    let mut i = 0;
-    while i < len {
-        if !is_key_byte(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let key_start = i;
-        while i < len && is_key_byte(bytes[i]) {
-            i += 1;
-        }
-        // `key_start..i` is all ASCII, so these are char boundaries.
-        if !names_a_secret(&text[key_start..i]) {
-            continue;
-        }
-
-        // key, optional closing quote, blanks, `=` or `:`, blanks, optional
-        // opening quote, then the value.
-        let mut j = i;
-        if j < len && matches!(bytes[j], b'"' | b'\'') {
-            j += 1;
-        }
-        while j < len && matches!(bytes[j], b' ' | b'\t') {
-            j += 1;
-        }
-        if j >= len || !matches!(bytes[j], b'=' | b':') {
-            continue;
-        }
-        j += 1;
-        while j < len && matches!(bytes[j], b' ' | b'\t') {
-            j += 1;
-        }
-        let quote = match bytes.get(j) {
-            Some(&q) if matches!(q, b'"' | b'\'') => {
-                j += 1;
-                Some(q)
-            }
-            _ => None,
-        };
-        let value_start = j;
-        let value_end = match quote.and_then(|q| closing_quote(bytes, value_start, q)) {
-            Some(end) => end,
-            // Unquoted, or an opening quote that never closes: the plain rule.
-            None => {
-                let mut end = value_start;
-                while end < len && !ends_value(bytes[end]) {
-                    end += 1;
-                }
-                end
-            }
-        };
-        if value_end == value_start {
-            continue;
-        }
-        // `value_start` follows an ASCII byte and `value_end` precedes one (or
-        // is the end of the text), so both are char boundaries.
-        out.push_str(&text[copied..value_start]);
-        out.push_str("[redacted]");
-        copied = value_end;
-        i = value_end;
-    }
-    out.push_str(&text[copied..]);
-    out
-}
-
-/// The index of the unescaped `quote` byte that closes a quoted value starting
-/// at `from`, or `None` if it never closes.
-fn closing_quote(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
-    let mut k = from;
-    while k < bytes.len() {
-        match bytes[k] {
-            b'\\' => k += 2,
-            b if b == quote => return Some(k),
-            _ => k += 1,
-        }
-    }
-    None
+    scrub_text_wide(&strip_userinfo(text))
 }
 
 /// `value` with a `Referer` / `Referrer` header cut back to origin + path: the
@@ -1311,9 +1179,10 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The reviewer's measured leak: every one of these names is in the shared
-    /// name vocabulary, but none is in `scrub_text`'s, so a `Referer` carrying
-    /// them was emitted verbatim.
+    /// The reviewer's measured leak: before PR 171 none of these names was in
+    /// the shared set, so a `Referer` carrying them was emitted verbatim. The
+    /// shared vocabulary now holds all of them, and the embedded-value scrub and
+    /// the name scrub read it the same way.
     #[test]
     fn build_poc_drops_the_referer_query_and_leaks_no_session_id() {
         let def = CheckDefinition::reflected_xss();
@@ -1369,8 +1238,8 @@ mod tests {
         assert_eq!(poc.success, def.success_assertion(payload));
     }
 
-    /// The needle layer on its own: a non-`Referer` header whose name is not a
-    /// secret, so only the embedded-value scrub can mask what it carries.
+    /// The embedded-value scrub on its own: a non-`Referer` header whose name is
+    /// not a secret, so only the embedded-value scrub can mask what it carries.
     #[test]
     fn build_poc_scrubs_session_ids_embedded_in_a_non_secret_header() {
         let def = CheckDefinition::reflected_xss();
@@ -1507,7 +1376,8 @@ mod tests {
             scrub_embedded(r#"{"session":"a b c","n":1}"#),
             r#"{"session":"[redacted]","n":1}"#
         );
-        // The base vocabulary still applies (one pass, two vocabularies).
+        // The long words of the shared list apply in the same scan as the short
+        // ones (one scan, one list).
         assert_eq!(
             scrub_embedded("access_token=T&sid=S"),
             "access_token=[redacted]&sid=[redacted]"
@@ -1519,17 +1389,18 @@ mod tests {
         );
     }
 
-    /// One vocabulary: the embedded-value scrub is built from the very slice
-    /// `is_secret_name` matches, so a needle added there is masked here too.
+    /// One vocabulary: the embedded-value scrub masks every short secret word
+    /// `is_secret_name` matches. The list is spelled out here on purpose, so a
+    /// word dropped from core's vocabulary fails this test instead of passing it.
     #[test]
-    fn scrub_embedded_covers_every_extra_secret_needle() {
-        for needle in EXTRA_SECRET_NEEDLES {
-            assert!(is_secret_name(needle), "`{needle}` is a secret name");
+    fn scrub_embedded_covers_every_segment_word() {
+        for word in ["sid", "jwt", "csrf", "session", "auth"] {
+            assert!(is_secret_name(word), "`{word}` is a secret name");
             assert_eq!(
-                scrub_embedded(&format!("x_{needle}_y=V1&z=2")),
-                format!("x_{needle}_y=[redacted]&z=2")
+                scrub_embedded(&format!("x_{word}_y=V1&z=2")),
+                format!("x_{word}_y=[redacted]&z=2")
             );
-            let upper = needle.to_ascii_uppercase();
+            let upper = word.to_ascii_uppercase();
             assert_eq!(
                 scrub_embedded(&format!("{upper}: V1")),
                 format!("{upper}: [redacted]")
@@ -1977,6 +1848,51 @@ mod tests {
         assert!(
             bad.is_empty(),
             "rows that differ from the recorded output (input, recorded, actual): {bad:#?}"
+        );
+    }
+
+    /// The deliberate output changes of the one-scan pipeline, one row per
+    /// change (DC1 to DC6 of the spec), each with the old two-scan pipeline's
+    /// output in a comment. These inputs are the only ones whose
+    /// `scrub_embedded` output differs from what that pipeline printed; every
+    /// row of [`RECORDED_SCRUB_EMBEDDED`] is unchanged. DC5 and DC6 mask less
+    /// than before, and only on malformed input (a vertical tab or a non-ASCII
+    /// space inside an unquoted value, a quote that never closes).
+    #[test]
+    fn scrub_embedded_deliberate_changes_are_exactly_these() {
+        let rows: &[(&str, &str)] = &[
+            // old pipeline: `xsid\u{e9}y=v`, unchanged (DC1)
+            ("xsid\u{e9}y=v", "xsid\u{e9}y=[redacted]"),
+            // old pipeline: `author:\nJohn`, unchanged (DC2)
+            ("author:\nJohn", "author:\n[redacted]"),
+            // old pipeline: `sidebar\u{a0}:\u{a0}v`, unchanged (DC2)
+            ("sidebar\u{a0}:\u{a0}v", "sidebar\u{a0}:\u{a0}[redacted]"),
+            // old pipeline: `token.example.com:8443/x`, unchanged (DC3)
+            ("token.example.com:8443/x", "token.example.com:[redacted]"),
+            // old pipeline: `sidebar='[redacted]'[redacted]'` (DC4)
+            ("sidebar='abc def token='S3'", "sidebar='[redacted]'"),
+            // old pipeline: `sid=[redacted]` (DC5)
+            ("sid=abc\u{a0}def", "sid=[redacted]\u{a0}def"),
+            // old pipeline: `sidebar=[redacted]` (DC5)
+            ("sidebar=abc\u{b}def", "sidebar=[redacted]\u{b}def"),
+            // old pipeline: `sid='[redacted]'[redacted]` (DC6)
+            (
+                "sid='abc def token='S3",
+                "sid='[redacted] def token='[redacted]",
+            ),
+        ];
+        assert!(rows.len() >= 8, "the table shrank: {} rows", rows.len());
+
+        let bad: Vec<(&str, &str, String)> = rows
+            .iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_embedded(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect();
+        assert!(
+            bad.is_empty(),
+            "rows that differ from the new output (input, expected, actual): {bad:#?}"
         );
     }
 }
