@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, Notify};
 
 use crate::http::{StreamableHttp, StreamableHttpCfg};
 use crate::json::{params_from_json, to_json};
+use crate::redact_args::redact_value;
 use crate::schema::{McpSchemaDerive, StdSchemaDerive};
 use crate::transport::{self, LoopbackTcp};
 
@@ -1951,7 +1952,7 @@ impl McpServer {
             // that quotes the offending value, a coercion error), so it is scrubbed
             // by content before it reaches the ring/durable log/pushed line (RF#3),
             // then capped so an echoed megabyte cannot fill the ring.
-            AuditResult::Error(cap_reason(aitm_core::redact::scrub_text(reason)))
+            AuditResult::Error(cap_reason(aitm_core::redact_strict::scrub_strict(reason)))
         } else {
             AuditResult::Ok
         };
@@ -2443,38 +2444,6 @@ fn conn_audit_label(conn: &ConnCtx) -> Option<String> {
     conn.client_label
         .as_deref()
         .and_then(aitm_core::sanitize_client_label)
-}
-
-/// Redact a value for the audit entry, by key *and* by content. A secret-named
-/// key's value is dropped whole (`"<redacted>"`); every surviving string leaf is
-/// run through the shared content scrubber, so a secret carried inside a
-/// non-secret-named value — a token in a `path` query string, a credential in a
-/// `body` — is masked too (RF#3). Recurses into objects and arrays.
-fn redact_value(value: &JsonValue) -> JsonValue {
-    match value {
-        JsonValue::Object(map) => JsonValue::Object(
-            map.iter()
-                .map(|(key, val)| {
-                    if is_secret_key(key) {
-                        (key.clone(), JsonValue::from("<redacted>"))
-                    } else {
-                        (key.clone(), redact_value(val))
-                    }
-                })
-                .collect(),
-        ),
-        JsonValue::Array(items) => JsonValue::Array(items.iter().map(redact_value).collect()),
-        JsonValue::String(s) => JsonValue::String(aitm_core::redact::scrub_text(s)),
-        other => other.clone(),
-    }
-}
-
-/// Whether an argument key names a secret whose value must never be audited. The
-/// vocabulary is the shared one in `aitm-core` (so audit and findings redaction
-/// never diverge again); the reserved `_confirm` acknowledgment is an MCP-local
-/// addition (it is already stripped before redaction, so this is belt and braces).
-fn is_secret_key(key: &str) -> bool {
-    aitm_core::redact::is_secret_key(key) || key.to_ascii_lowercase().contains("_confirm")
 }
 
 /// Whether a Sensitive command carries its own per-command agent config gate, so
