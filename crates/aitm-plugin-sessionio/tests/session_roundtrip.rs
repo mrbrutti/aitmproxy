@@ -493,3 +493,67 @@ fn import_is_passive() {
         "no egress for the whole test"
     );
 }
+
+/// Tester addition (whole-branch stage 5, SA-AC7 at the document level, through
+/// the real `flow.export` / `flow.import` surface rather than `MetaRec` alone): an
+/// attributed flow exports with both keys and imports with both values intact, and
+/// the same document with the two keys removed — the shape of every
+/// pre-attribution session file — imports with `None`/`None`.
+#[test]
+fn attribution_exports_imports_and_an_older_document_loads_as_none() {
+    let store = MemFlowStore::new();
+    let mut flow = seeded_flow();
+    flow.metadata_mut().source_app = Some("com.apple.Safari".into());
+    flow.metadata_mut().capture_interface = Some("macos-ne".into());
+    store.insert(flow);
+    let exported = export_native(&store);
+
+    // Round trip: the values survive the document.
+    let fresh = MemFlowStore::new();
+    let ids = import_native(&fresh, exported.clone());
+    assert_eq!(ids.len(), 1);
+    let restored = fresh.get(ids[0]).expect("imported flow present");
+    assert_eq!(
+        restored.metadata().source_app.as_deref(),
+        Some("com.apple.Safari")
+    );
+    assert_eq!(
+        restored.metadata().capture_interface.as_deref(),
+        Some("macos-ne")
+    );
+
+    // The older shape: the same document without the two keys.
+    let mut doc: serde_json::Value = serde_json::from_slice(&exported).expect("the export is JSON");
+    let flows = doc["flows"].as_array_mut().expect("a flows array");
+    assert_eq!(flows.len(), 1);
+    for rec in flows.iter_mut() {
+        let meta = rec["metadata"].as_object_mut().expect("a metadata object");
+        assert_eq!(
+            meta.remove("source_app"),
+            Some(serde_json::Value::String("com.apple.Safari".into())),
+            "the export wrote source_app"
+        );
+        assert_eq!(
+            meta.remove("capture_interface"),
+            Some(serde_json::Value::String("macos-ne".into())),
+            "the export wrote capture_interface"
+        );
+    }
+    let older = serde_json::to_vec(&doc).expect("re-serialise");
+    assert!(!String::from_utf8_lossy(&older).contains("source_app"));
+
+    let fresh = MemFlowStore::new();
+    let ids = import_native(&fresh, older);
+    assert_eq!(ids.len(), 1, "the older document imports its flow");
+    let restored = fresh.get(ids[0]).expect("imported flow present");
+    assert_eq!(restored.metadata().source_app, None);
+    assert_eq!(restored.metadata().capture_interface, None);
+    let Flow::Http(r) = &restored else {
+        panic!("expected http flow");
+    };
+    assert_eq!(
+        r.response.as_ref().expect("response").status,
+        201,
+        "the rest loads"
+    );
+}

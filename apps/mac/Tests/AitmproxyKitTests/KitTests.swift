@@ -186,6 +186,142 @@ import Testing
         #expect(row.edited)
         #expect(row.tls == .none)
     }
+
+    // MARK: source_app -> FlowRow.client (spec 2026-10-31-ne-source-app-on-the-wire, D5 / SA-AC3)
+
+    @Test func sourceAppBecomesTheClient() throws {
+        let json: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                               "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                               "source_app": "com.apple.Safari", "capture_interface": "macos-ne"]
+        let summary = try #require(FlowSummary(json: json))
+        #expect(summary.sourceApp == "com.apple.Safari")
+        #expect(summary.captureInterface == "macos-ne")
+        let row = summary.row(seq: 1)
+        #expect(row.client == ClientInfo(name: "Safari", monogram: "S", bundleID: "com.apple.Safari"))
+        #expect(row.client?.pid == nil)
+    }
+
+    @Test func sourceAppAbsentNullOrEmptyLeavesClientNil() throws {
+        // A proxied flow (null), an older core (absent) and a provider that sent nothing
+        // ("") all mean "no app": never an empty or placeholder app group.
+        let absent: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                 "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200]
+        let null: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                               "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                               "source_app": .null, "capture_interface": .null]
+        let empty: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                                "source_app": "", "capture_interface": ""]
+        for json in [absent, null, empty] {
+            let summary = try #require(FlowSummary(json: json))
+            #expect(summary.sourceApp == nil)
+            #expect(summary.captureInterface == nil)
+            #expect(summary.row(seq: 1).client == nil)
+        }
+    }
+
+    @Test func displayNameStripsControlAndBidiCharactersButKeepsTheRawIdentifier() {
+        // U+202E (RTL override) and C0/C1 controls never reach the shown name; `bundleID` stays raw.
+        let spoof = "com.evil.\u{202E}irafaS\u{0007}"
+        #expect(ClientInfo.displayName(forSourceApp: spoof) == "irafaS")
+        let client = ClientInfo(sourceApp: spoof)
+        #expect(client.bundleID == spoof)
+        #expect(client.name == "irafaS")
+        #expect(ClientInfo.displayName(forSourceApp: "\u{202E}\u{0001}") == ClientInfo.unnamedSourceApp)
+        #expect(ClientInfo.displayName(forSourceApp: "com.apple.Safari") == "Safari")
+    }
+
+    @Test func displayNameRule() {
+        // Known map first, else the text after the last dot, casing kept; no dot or a
+        // trailing dot keeps the whole identifier.
+        #expect(ClientInfo.displayName(forSourceApp: "com.apple.Safari") == "Safari")
+        #expect(ClientInfo.displayName(forSourceApp: "com.apple.curl") == "curl")
+        #expect(ClientInfo.displayName(forSourceApp: "obscura") == "obscura")
+        #expect(ClientInfo.displayName(forSourceApp: "com.google.Chrome") == "Chrome")
+        #expect(ClientInfo.displayName(forSourceApp: "com.apple.WebKit.Networking") == "Safari")
+        #expect(ClientInfo.displayName(forSourceApp: "org.mozilla.firefox") == "Firefox")
+        #expect(ClientInfo.displayName(forSourceApp: "trailing.") == "trailing.")
+    }
+
+    @Test func sameIdentifierGroupsAsOneClient() throws {
+        // Session.clients counts rows by ClientInfo (Hashable): the same identifier on two
+        // flows must be one key, so the Apps sidebar shows one group with a count of 2.
+        let first: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                "method": "GET", "scheme": "https", "authority": "h", "path": "/one", "status": 200,
+                                "source_app": "com.apple.curl", "capture_interface": "macos-ne"]
+        let second: JSONValue = ["id": "b", "kind": "http", "intercept": "observed", "is_replay": false,
+                                 "method": "POST", "scheme": "https", "authority": "h2", "path": "/two", "status": 404,
+                                 "source_app": "com.apple.curl", "capture_interface": "macos-ne"]
+        let rows = [try #require(FlowSummary(json: first)).row(seq: 1),
+                    try #require(FlowSummary(json: second)).row(seq: 2)]
+        #expect(rows[0].client == rows[1].client)
+        var counts: [ClientInfo: Int] = [:]
+        for row in rows { if let c = row.client { counts[c, default: 0] += 1 } }
+        #expect(counts.count == 1)
+        #expect(counts[ClientInfo(name: "curl", monogram: "c", bundleID: "com.apple.curl")] == 2)
+    }
+
+    @Test func webSocketSummaryCarriesClientToo() throws {
+        let json: JSONValue = [
+            "id": "3f1c0d2e-0000-4000-8000-000000000002", "kind": "websocket", "intercept": "observed",
+            "is_replay": false, "handshake": "3f1c0d2e-0000-4000-8000-000000000001", "messages": 3,
+            "source_app": "com.apple.Safari", "capture_interface": "macos-ne",
+        ]
+        let summary = try #require(FlowSummary(json: json))
+        #expect(summary.captureInterface == "macos-ne")
+        let row = summary.row(seq: 1)
+        #expect(row.kind == .websocket)
+        #expect(row.client?.bundleID == "com.apple.Safari")
+        #expect(row.client?.name == "Safari")
+    }
+
+    // MARK: Tester additions (whole-branch stage 5): SA-AC3 edges
+
+    @Test func sourceAppOfTheWrongTypeLeavesClientNil() throws {
+        // A number, bool, array or object where an identifier belongs is not an
+        // app: nil, never a stringified value shown as a fake group.
+        let base: [String: JSONValue] = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                         "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200]
+        let wrong: [JSONValue] = [42, true, ["com.apple.Safari"], ["bundle": "com.apple.Safari"]]
+        for value in wrong {
+            var json = base
+            json["source_app"] = value
+            json["capture_interface"] = value
+            let summary = try #require(FlowSummary(json: .object(json)))
+            #expect(summary.sourceApp == nil, "\(value)")
+            #expect(summary.captureInterface == nil, "\(value)")
+            #expect(summary.row(seq: 1).client == nil, "\(value)")
+        }
+    }
+
+    @Test func displayNameEdgesAndTheClientKeepsTheRawIdentifier() {
+        // D5 rule 2 at its edges: a lone dot and a leading dot.
+        #expect(ClientInfo.displayName(forSourceApp: ".") == ".")
+        #expect(ClientInfo.displayName(forSourceApp: ".hidden") == "hidden")
+        #expect(ClientInfo.displayName(forSourceApp: "a..b") == "b")
+        // The known map wins, and the raw identifier is kept as bundleID either way.
+        let safari = ClientInfo(sourceApp: "com.apple.WebKit.Networking")
+        #expect(safari.name == "Safari")
+        #expect(safari.monogram == "S")
+        #expect(safari.bundleID == "com.apple.WebKit.Networking")
+        #expect(safari.pid == nil)
+        // Two identifiers with the same display name are two clients (bundleID is
+        // part of Hashable), so two apps never merge into one group by name alone.
+        #expect(ClientInfo(sourceApp: "com.apple.Safari") != safari)
+    }
+
+    @Test func anOversizedSourceAppStillDecodesAndGroups() throws {
+        let long = "com.example." + String(repeating: "x", count: 64 * 1024)
+        let json: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                               "method": "GET", "scheme": "https", "authority": "h", "path": "/", "status": 200,
+                               "source_app": .string(long), "capture_interface": "macos-ne"]
+        let summary = try #require(FlowSummary(json: json))
+        #expect(summary.sourceApp == long)
+        let row = summary.row(seq: 1)
+        #expect(row.client?.bundleID == long)
+        #expect(row.client?.name == String(repeating: "x", count: 64 * 1024))
+        #expect(row.client?.monogram == "x")
+    }
 }
 
 /// Sizes reach every sum in the Kit from the bus, imports and fixtures: none may trap.
