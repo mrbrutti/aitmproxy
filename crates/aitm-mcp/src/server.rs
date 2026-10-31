@@ -2680,4 +2680,25 @@ mod tests {
         }
         assert_eq!(operators[0].drain(), vec!["operator-line".to_string()]);
     }
+
+    /// Bus-hardening D2, added by the tester: in `fanout_role` the connection is
+    /// recorded as seen only after one of its subscriptions has passed the role
+    /// test (the same trap as the filter one in `fanout_flow`). The real transports
+    /// never mix roles on one connection id, so the registry is driven directly:
+    /// connection 1 holds an agent subscription first and an operator one second,
+    /// and an operator-only line must still reach it, once.
+    #[test]
+    fn fanout_role_does_not_let_another_roles_subscription_mask_a_matching_one() {
+        let reg = Subscriptions::default();
+        let sink = NotificationSink::new(4);
+        for role in [Frontend::Mcp, Frontend::Operator] {
+            assert!(reg
+                .add(1, role, sink.clone(), FlowFilter::default())
+                .is_ok());
+        }
+
+        reg.fanout_role(Frontend::Operator, "operator-line");
+
+        assert_eq!(sink.drain(), vec!["operator-line".to_string()]);
+    }
 }

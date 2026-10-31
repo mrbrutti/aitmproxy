@@ -789,6 +789,30 @@ mod tests {
         assert!(received == expected, "the message arrives intact");
     }
 
+    /// Added by the tester: a peer that is gone (its end dropped) fails the send at
+    /// once with the transport's own error, not after the limit and not as a
+    /// timeout. `relay` ends the connection on any `Err`, so what matters is that a
+    /// dead socket is reported promptly instead of being waited on, and that the
+    /// error is not mislabelled as the write deadline (which would send an operator
+    /// hunting for a slow reader).
+    #[tokio::test]
+    async fn send_within_reports_a_gone_peer_as_a_send_error_not_a_timeout() {
+        let (mut server, client) = socket_pair().await;
+        drop(client);
+        let message = Message::text("z".repeat(1 << 20));
+        let sent = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_within(&mut server, message, Duration::from_secs(30)),
+        )
+        .await
+        .expect("a gone peer fails the send at once, far inside the 30 s limit");
+        let err = sent.expect_err("a send to a gone peer must fail");
+        assert!(
+            !err.to_string().contains("timed out"),
+            "a transport error passes through unchanged, not as a timeout: {err}"
+        );
+    }
+
     #[test]
     fn unauthorized_reply_is_valid_json_rpc() {
         let v: JsonValue = serde_json::from_str(UNAUTHORIZED_REPLY).unwrap();

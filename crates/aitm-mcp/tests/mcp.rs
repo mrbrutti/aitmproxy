@@ -2073,6 +2073,66 @@ fn a_non_matching_subscription_does_not_mask_a_matching_one() {
     assert_eq!(note["params"]["id"], id.to_string());
 }
 
+/// Bus-hardening AC5 / D2, added by the tester: `fanout_state` is the fan-out under
+/// both `push_state` and the per-tool-call audit line (`push_agent`), and it must
+/// deliver once per connection however many subscriptions the connection holds.
+/// The server-side `fanout_state` test uses one subscription per connection, so it
+/// cannot see a de-dup that was dropped; this one holds 32 and 3 on two
+/// connections, as `a_connection_with_many_matching_subscriptions_gets_one_push`
+/// does for flow events.
+#[test]
+fn state_and_audit_pushes_reach_a_connection_once_however_many_subscriptions_it_holds() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store, 64);
+
+    let full_sink = NotificationSink::new(64);
+    let full = conn_over(&srv, &full_sink);
+    for _ in 0..32 {
+        sub_id_of(&subscribe_on(&srv, &full, json!({})));
+    }
+    let few_sink = NotificationSink::new(64);
+    let few = conn_over(&srv, &few_sink);
+    for _ in 0..3 {
+        sub_id_of(&subscribe_on(&srv, &few, json!({})));
+    }
+    let sinks = [
+        ("32 subscriptions", &full_sink),
+        ("3 subscriptions", &few_sink),
+    ];
+
+    srv.push_state(json!({"intercept_armed": true}));
+    for (label, sink) in sinks {
+        assert_eq!(
+            sink.queued_len(),
+            1,
+            "the connection with {label} gets one state push for one `push_state`"
+        );
+        let note: JsonValue = serde_json::from_str(&sink.drain()[0]).expect("the push is JSON");
+        assert_eq!(note["method"], "notifications/aitm/state");
+        assert_eq!(note["params"]["intercept_armed"], true);
+    }
+
+    // One audited tool call (a non-subscription verb, so it is audited) on another
+    // connection fans one `notifications/aitm/agent` line to the subscribers.
+    let reply = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "demo.capture",
+        json!({"authority": "example.com:443", "path": "/audited"}),
+    );
+    assert!(!is_refused(&reply), "demo.capture runs: {reply}");
+    for (label, sink) in sinks {
+        assert_eq!(
+            sink.queued_len(),
+            1,
+            "the connection with {label} gets one audit line for one tool call"
+        );
+        let note: JsonValue = serde_json::from_str(&sink.drain()[0]).expect("the push is JSON");
+        assert_eq!(note["method"], "notifications/aitm/agent");
+        assert_eq!(note["params"]["command"], "demo.capture");
+    }
+}
+
 /// Web `/bus` push, spec Goals (bounded push memory), added by the tester: the
 /// `since` replay rides the same bounded notification lane as live pushes. A
 /// subscribe that replays more flows than `push_capacity` keeps only the newest

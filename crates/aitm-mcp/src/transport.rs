@@ -768,6 +768,152 @@ mod tests {
         ended.expect("a client that closes ends the connection cleanly");
     }
 
+    /// A writer that takes every byte at once but whose `flush` never completes,
+    /// like a stdout whose consumer has stopped. Neither a duplex pipe nor a TCP
+    /// socket can make `flush` block (theirs finish at once), so the duplex and TCP
+    /// tests cannot tell whether the flush is under the write deadline.
+    struct StuckFlush;
+
+    impl AsyncWrite for StuckFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Added by the tester (spec D3, "each `write_all` and the `flush`"): the
+    /// `flush` after a batch is under the write deadline too. The AC14 duplex test
+    /// only reaches `write_all`; this one is the stdio shape, where `flush` is what
+    /// waits on a parent that has stopped reading our stdout.
+    #[tokio::test]
+    async fn a_flush_that_never_completes_hits_the_write_deadline() {
+        let sink = NotificationSink::new(4);
+        sink.push("a line".into());
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            write_loop(StuckFlush, sink, Duration::from_millis(100)),
+        )
+        .await
+        .expect("write_loop returned within 5 s of a 100 ms deadline instead of parking in flush");
+        let err = ended.expect_err("a flush that never completes ends the writer in error");
+        assert!(
+            err.to_string().contains("write timed out"),
+            "the error names the write deadline: {err}"
+        );
+    }
+
+    /// Added by the tester: the stop AC14 does not cover, a client that keeps
+    /// sending requests and never reads the replies. The writer stalls on the full
+    /// pipe, replies pile up to the reply lane's high-water mark (4 here), so the
+    /// read loop is normally held back by that backpressure rather than parked in
+    /// `read_line` (the test does not assert which of the two it is in). The client
+    /// never closes, so only the writer's failure can end the connection, and it
+    /// must.
+    #[tokio::test]
+    async fn a_client_that_floods_requests_and_never_reads_replies_is_disconnected() {
+        let server = server_with_deadline(Duration::from_millis(200));
+        let (client, server_side) = duplex(256);
+        let (server_read, server_write) = split(server_side);
+        let sink = NotificationSink::with_limits(64, 4);
+        let mut conn = ConnCtx::new(Frontend::Operator);
+        conn.out = Some(sink.clone());
+        let task = tokio::spawn(serve_lines(
+            server.clone(),
+            BufReader::new(server_read),
+            server_write,
+            conn,
+        ));
+
+        // Both client halves stay alive to the end, so the pipe never closes. The
+        // flood is its own task: once the server stops reading, its writes block.
+        let (client_read, mut client_write) = split(client);
+        let flood = tokio::spawn(async move {
+            for id in 0..64 {
+                let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/list"}}"#) + "\n";
+                if client_write.write_all(line.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            client_write
+        });
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("serve_lines returned within 5 s (the deadline is 200 ms) though the client never closed")
+            .expect("the serve_lines task did not panic");
+        let err = ended.expect_err("a writer that hit its deadline ends the connection in error");
+        assert!(
+            err.to_string().contains("write timed out"),
+            "the error names the write deadline: {err}"
+        );
+        assert!(
+            sink.is_closed(),
+            "the connection's sink is closed when it ends"
+        );
+        flood.abort();
+        drop(client_read);
+    }
+
+    /// Added by the tester: a client that vanishes while the writer is blocked on a
+    /// full pipe ends the connection at once through the I/O error, long before the
+    /// write deadline (30 s here), and its subscription goes with it. This is the
+    /// "connection drop mid-stream" case for the reworked `serve_lines` race, which
+    /// must still treat a dead peer as the end whichever of the reader or the writer
+    /// notices it first.
+    #[tokio::test]
+    async fn a_client_that_disconnects_mid_write_ends_the_connection_at_once() {
+        let server = server_with_deadline(Duration::from_secs(30));
+        let mut client = serve_over_tiny_pipe(&server, 64);
+        client.subscribe().await;
+        for seq in 0..16 {
+            push_padded(&server, seq);
+        }
+        // Let the writer park in `write_all` on the full pipe, then vanish.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop((client.writer, client.lines));
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), client.task)
+            .await
+            .expect(
+                "serve_lines returned within 5 s of the disconnect, far inside the 30 s deadline",
+            )
+            .expect("the serve_lines task did not panic");
+        if let Err(err) = ended {
+            assert!(
+                !err.to_string().contains("write timed out"),
+                "a dead peer is an I/O error, not the write deadline: {err}"
+            );
+        }
+        assert!(
+            client.sink.is_closed(),
+            "the connection's sink is closed when it ends"
+        );
+        let before = client.sink.queued_len();
+        push_padded(&server, 99);
+        assert_eq!(
+            client.sink.queued_len(),
+            before,
+            "the subscription was dropped, so a later push reaches nothing"
+        );
+    }
+
     /// AC16 (needs a real loopback socket): the same stop over TCP. The client's
     /// receive buffer is 4096 bytes, it sends the token and a `flow.subscribe`,
     /// reads the reply, and stops reading while the test pushes 16 MiB of state
