@@ -24,6 +24,7 @@ impl RequestSender for EchoSender {
                 status: 200,
                 version: HttpVersion::Http11,
                 headers: HeaderMap::new(),
+                trailers: HeaderMap::new(),
                 body: Body::Empty,
                 timestamp: SystemTime::now(),
             })

@@ -11,6 +11,12 @@
 //! WebSocket, `client_conn`/`server_conn`, `meta`, `intercept` and `edited`.
 //! Peer→process resolution and per-flow origin are deferred (Q6 / F2) and reported
 //! as `null` rather than omitted, so a surface renders a stable shape.
+//!
+//! `response.trailers` is the one key that is omitted rather than `null`: it is an
+//! array of `[name, value]` pairs (the shape of `headers`, in wire order, duplicates
+//! and name case kept) present only when the response captured at least one trailer
+//! field, so a response without trailers renders exactly as before. Trailers are
+//! never merged into `response.headers`.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -200,6 +206,12 @@ fn response(resp: Option<&HttpResponse>, mode: BodyMode, truncated: bool) -> Val
             obj.insert("status".into(), Value::Int(i64::from(r.status)));
             obj.insert("version".into(), Value::Str(version(r.version).into()));
             obj.insert("headers".into(), headers(&r.headers));
+            // Trailer fields (RFC 9110 6.5) ride beside `headers`, never inside
+            // them, and the key is absent when there are none so a response
+            // without trailers renders exactly as it always has.
+            if !r.trailers.is_empty() {
+                obj.insert("trailers".into(), headers(&r.trailers));
+            }
             put_body(&mut obj, &r.body, mode, truncated);
             Value::Object(obj)
         }

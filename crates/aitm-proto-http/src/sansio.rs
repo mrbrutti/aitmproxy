@@ -7,9 +7,22 @@
 //! `*BodyChunk` event as soon as it is available. The machine handles one
 //! exchange at a time; after `ResponseComplete` it is ready for the next request
 //! on the same connection.
+//!
+//! A chunked body's trailer section is parsed like a header block, within
+//! 16 KiB and 64 fields, and fails closed. A response's trailers are captured
+//! on the response model ([`Http1Machine::response`], `HttpResponse::trailers`),
+//! never merged into its headers, and are there by the time `ResponseComplete`
+//! is returned. A request's trailers are parsed and bounded the same way, then
+//! dropped: the request model has nowhere to keep them.
+//!
+//! The writer sends a response's captured trailers after a chunk-framed body
+//! (`enqueue_body_end_with_trailers`), minus the fields that cannot work as
+//! trailers (a fixed deny-set, on the wire only; the capture keeps them all),
+//! and checks each name and value is wire-safe as it writes.
 
 use std::fmt::Write as _;
 
+use aitm_core::header::{is_valid_name, is_valid_value};
 use aitm_core::{Body, FlowId, HeaderMap, HttpRequest, HttpResponse, HttpVersion};
 use anyhow::{anyhow, bail, Result};
 
@@ -57,6 +70,89 @@ pub enum HttpSansIoEvent {
 pub(crate) const MAX_HEAD_BYTES: usize = 64 * 1024;
 /// Largest chunk-size line (hex size plus extensions) accepted.
 const MAX_CHUNK_LINE_BYTES: usize = 1024;
+/// Largest chunked trailer section accepted, in bytes: the sum of every field
+/// line's length plus its CRLF. The blank line that ends the section is not
+/// counted, so a section of exactly this many bytes is still accepted.
+const MAX_TRAILER_BYTES: usize = 16 * 1024;
+/// Most field lines a chunked trailer section may hold.
+const MAX_TRAILER_FIELDS: usize = 64;
+/// The interim response that answers a `100-continue` expectation (25 bytes).
+const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
+
+/// Field names that are never written as a trailer on the client wire, in lower
+/// case. A trailer arrives after the recipient has acted on the head, so a field
+/// whose meaning is framing, routing, authentication, a request modifier,
+/// response control data, payload processing or connection management cannot
+/// work there (RFC 9110 6.5.1), and an origin must not be able to use one to
+/// steer the client. The groups are RFC 9110 6.5.1's categories; the names under
+/// each are this project's expansion of them, not a list the RFC gives. A
+/// deny-list, not an allow-list: the fields that do permit trailers (`x-*`,
+/// `server-timing`, `digest`, ...) are open-ended. This is the wire only: the
+/// capture on `HttpResponse::trailers` keeps every field the origin sent.
+const FORBIDDEN_TRAILERS: &[&str] = &[
+    // Message framing.
+    "transfer-encoding",
+    "content-length",
+    // Routing.
+    "host",
+    // Request modifiers (controls and conditionals).
+    "cache-control",
+    "expect",
+    "max-forwards",
+    "pragma",
+    "range",
+    "te",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+    "if-range",
+    // Authentication.
+    "authorization",
+    "proxy-authorization",
+    "www-authenticate",
+    "proxy-authenticate",
+    "authentication-info",
+    "proxy-authentication-info",
+    "cookie",
+    "set-cookie",
+    // Response control data (and `cache-control`, above).
+    "age",
+    "date",
+    "expires",
+    "location",
+    "retry-after",
+    "vary",
+    "warning",
+    // Payload processing.
+    "content-encoding",
+    "content-type",
+    "content-range",
+    "trailer",
+    // Connection management (hop-by-hop, and meaningless after the body).
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "upgrade",
+];
+
+/// Whether `name` is in [`FORBIDDEN_TRAILERS`]: the whole name, ASCII
+/// case-insensitively (`x-content-length` and `set-cookie2` are not).
+fn is_forbidden_trailer(name: &str) -> bool {
+    FORBIDDEN_TRAILERS
+        .iter()
+        .any(|forbidden| name.eq_ignore_ascii_case(forbidden))
+}
+
+/// Whether a trailer field may be written to a wire: not on the deny-set, the
+/// name a token and the value free of control bytes. A `HeaderMap` only ever
+/// holds pairs that pass the second and third checks (it accepts a pair through
+/// `try_set` or `set`, which validate), so they are defence in depth: if a name
+/// or value with a CR or LF ever got in, it would be dropped here and could
+/// never end the field line early and write bytes of the origin's choosing.
+fn writable_trailer(name: &str, value: &str) -> bool {
+    !is_forbidden_trailer(name) && is_valid_name(name) && is_valid_value(value)
+}
 
 /// How a message body is delimited on the wire.
 #[derive(Debug, Clone, Copy)]
@@ -76,7 +172,9 @@ enum ChunkPhase {
     Data(u64),
     /// Expecting the `\r\n` that closes a chunk's data.
     DataEnd,
-    /// After the zero-size chunk: trailer lines until an empty one.
+    /// After the zero-size chunk: trailer lines until an empty one. Each line is
+    /// parsed like a header field and held in the reader's [`Trailers`], within
+    /// [`MAX_TRAILER_BYTES`] and [`MAX_TRAILER_FIELDS`].
     Trailers,
 }
 
@@ -99,10 +197,21 @@ enum Phase {
     Upgraded,
 }
 
+/// The trailer fields of a chunked body parsed so far, and the bytes they took.
+/// Lives on the reader so a section split across reads accumulates; emptied when
+/// the section ends.
+#[derive(Default)]
+struct Trailers {
+    fields: HeaderMap,
+    /// Each field line's length plus its CRLF, summed (the cap's unit).
+    bytes: usize,
+}
+
 /// One side's receive buffer and parse phase.
 struct Reader {
     buf: Vec<u8>,
     phase: Phase,
+    trailers: Trailers,
 }
 
 impl Reader {
@@ -110,6 +219,7 @@ impl Reader {
         Self {
             buf: Vec::new(),
             phase: Phase::Head,
+            trailers: Trailers::default(),
         }
     }
 }
@@ -142,6 +252,8 @@ pub struct Http1Machine {
     /// The `Upgrade:` protocol the current request asked for, if any.
     pending_upgrade: Option<String>,
     upgraded: bool,
+    /// The current request carries an unanswered `Expect: 100-continue`.
+    continue_pending: bool,
 }
 
 impl Default for Http1Machine {
@@ -165,6 +277,7 @@ impl Http1Machine {
             response: None,
             pending_upgrade: None,
             upgraded: false,
+            continue_pending: false,
         }
     }
 
@@ -179,7 +292,11 @@ impl Http1Machine {
         self.request.as_ref()
     }
 
-    /// The response head of the current exchange, once parsed.
+    /// The response head of the current exchange, once parsed (body `Empty`;
+    /// chunks come as events). Once the machine has returned `ResponseComplete`
+    /// for a chunked body, its `trailers` hold the trailer section the origin
+    /// sent, in wire order with duplicates kept; they are empty before that and
+    /// for every response without a trailer section.
     pub fn response(&self) -> Option<&HttpResponse> {
         self.response.as_ref()
     }
@@ -187,6 +304,25 @@ impl Http1Machine {
     /// Whether a 101 completed and the connection now belongs to another protocol.
     pub fn is_upgraded(&self) -> bool {
         self.upgraded
+    }
+
+    /// Whether the current request carries a `100-continue` expectation that
+    /// has not been answered: an HTTP/1.1 head with `Expect: 100-continue`,
+    /// content still to come (a positive `Content-Length` or chunked framing),
+    /// and no content byte buffered with the head. Set when the head is parsed
+    /// and cleared by [`Self::enqueue_continue`] or by the next request's head.
+    pub(crate) fn expects_continue(&self) -> bool {
+        self.continue_pending
+    }
+
+    /// Queue the interim `100 Continue` for the client, once: with no
+    /// expectation pending this does nothing, and answering clears it, so a
+    /// second call queues nothing.
+    pub(crate) fn enqueue_continue(&mut self) {
+        if self.continue_pending {
+            self.out_client.extend_from_slice(CONTINUE_RESPONSE);
+            self.continue_pending = false;
+        }
     }
 
     /// Bytes received from `side` that this machine will not parse: anything
@@ -252,14 +388,53 @@ impl Http1Machine {
     }
 
     /// Terminate a streamed body for `to` (the chunked terminator, if chunked).
+    /// It carries no trailers: that is `enqueue_body_end_with_trailers` with an
+    /// empty section.
     pub fn enqueue_body_end(&mut self, to: Side) {
-        if self.out_framing(to) == OutFraming::Chunked {
-            self.out_mut(to).extend_from_slice(b"0\r\n\r\n");
-        }
+        self.enqueue_body_end_with_trailers(to, &HeaderMap::new());
+    }
+
+    /// Terminate a streamed body for `to` and forward `trailers` after it.
+    ///
+    /// A chunk-framed body ends with `0\r\n`, then `name: value\r\n` for each
+    /// field of `trailers` that may be written, in order, then `\r\n`; with none
+    /// that is exactly `0\r\n\r\n`. A field is not written when its name is on the
+    /// deny-set ([`FORBIDDEN_TRAILERS`]) or it is not wire-safe
+    /// ([`writable_trailer`]). A body that is not chunk-framed has no trailer
+    /// section, so nothing is written for it, and the framing is reset either way.
+    ///
+    /// Returns how many fields were not written: the withheld ones, or all of
+    /// `trailers` for a body that is not chunk-framed. The caller may report the
+    /// count; it must never report a name or value.
+    pub(crate) fn enqueue_body_end_with_trailers(
+        &mut self,
+        to: Side,
+        trailers: &HeaderMap,
+    ) -> usize {
+        let withheld = if self.out_framing(to) == OutFraming::Chunked {
+            let out = self.out_mut(to);
+            out.extend_from_slice(b"0\r\n");
+            let mut withheld = 0;
+            for (name, value) in trailers.iter() {
+                if writable_trailer(name, value) {
+                    out.extend_from_slice(name.as_bytes());
+                    out.extend_from_slice(b": ");
+                    out.extend_from_slice(value.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                } else {
+                    withheld += 1;
+                }
+            }
+            out.extend_from_slice(b"\r\n");
+            withheld
+        } else {
+            trailers.len()
+        };
         match to {
             Side::Client => self.out_framing_client = OutFraming::Raw,
             Side::Server => self.out_framing_server = OutFraming::Raw,
         }
+        withheld
     }
 
     fn reader_mut(&mut self, side: Side) -> &mut Reader {
@@ -292,13 +467,23 @@ impl Http1Machine {
                     let Some(head) = take_head(&mut self.client.buf)? else {
                         break;
                     };
-                    let req = parse_request(&head)?;
+                    let (req, http_1_0) = parse_request(&head)?;
                     let id = FlowId::new();
                     self.flow = Some(id);
                     self.response = None;
                     self.upgraded = false;
                     self.pending_upgrade = upgrade_protocol(&req.headers);
                     let framing = request_framing(&req.headers)?;
+                    // Assigned for every request so the flag never outlives the
+                    // request it was computed for. `head` is already out of the
+                    // buffer, so an empty buffer means no content came with it.
+                    self.continue_pending = !http_1_0
+                        && expects_100_continue(&req.headers)
+                        && match framing {
+                            Framing::Chunked | Framing::Length(_) => true,
+                            Framing::None | Framing::UntilClose => false,
+                        }
+                        && self.client.buf.is_empty();
                     self.request = Some(req);
                     events.push(HttpSansIoEvent::RequestHeaders(id));
                     match framing {
@@ -326,14 +511,21 @@ impl Http1Machine {
                 Phase::Chunked(phase) => {
                     let id = self.current_flow()?;
                     let mut phase = phase;
-                    let step = step_chunked(&mut self.client.buf, &mut phase)?;
+                    let step =
+                        step_chunked(&mut self.client.buf, &mut phase, &mut self.client.trailers)?;
                     self.client.phase = Phase::Chunked(phase);
                     match step {
                         Step::NeedMore => break,
                         Step::Data(bytes) => {
                             events.push(HttpSansIoEvent::RequestBodyChunk { flow: id, bytes })
                         }
-                        Step::Done => self.finish_request(id, &mut events),
+                        Step::Done => {
+                            // Request trailers were parsed and bounded above;
+                            // the request model has nowhere to keep them, so
+                            // they are dropped here.
+                            self.client.trailers = Trailers::default();
+                            self.finish_request(id, &mut events)
+                        }
                     }
                 }
                 // A request body never runs to close; anything else parks the
@@ -417,14 +609,24 @@ impl Http1Machine {
                 Phase::Chunked(phase) => {
                     let id = self.current_flow()?;
                     let mut phase = phase;
-                    let step = step_chunked(&mut self.server.buf, &mut phase)?;
+                    let step =
+                        step_chunked(&mut self.server.buf, &mut phase, &mut self.server.trailers)?;
                     self.server.phase = Phase::Chunked(phase);
                     match step {
                         Step::NeedMore => break,
                         Step::Data(bytes) => {
                             events.push(HttpSansIoEvent::ResponseBodyChunk { flow: id, bytes })
                         }
-                        Step::Done => self.finish_response(id, &mut events),
+                        Step::Done => {
+                            // The section is complete: hand it to the response
+                            // model (and leave the accumulator empty for the
+                            // next response) just before `ResponseComplete`.
+                            let section = std::mem::take(&mut self.server.trailers);
+                            if let Some(resp) = self.response.as_mut() {
+                                resp.trailers = section.fields;
+                            }
+                            self.finish_response(id, &mut events)
+                        }
                     }
                 }
                 Phase::UntilClose => {
@@ -523,8 +725,14 @@ fn step_length(buf: &mut Vec<u8>, remaining: u64) -> Step {
     Step::Data(buf.drain(..take).collect())
 }
 
-/// Advance a chunked-encoding decoder by one step over `buf`.
-fn step_chunked(buf: &mut Vec<u8>, phase: &mut ChunkPhase) -> Result<Step> {
+/// Advance a chunked-encoding decoder by one step over `buf`. A trailer section
+/// accumulates in `trailers` until its blank line returns `Step::Done`; the
+/// caller then takes the fields (or discards them).
+fn step_chunked(
+    buf: &mut Vec<u8>,
+    phase: &mut ChunkPhase,
+    trailers: &mut Trailers,
+) -> Result<Step> {
     match *phase {
         ChunkPhase::Size => {
             let Some(line) = take_line(buf, MAX_CHUNK_LINE_BYTES)? else {
@@ -537,7 +745,7 @@ fn step_chunked(buf: &mut Vec<u8>, phase: &mut ChunkPhase) -> Result<Step> {
                 ChunkPhase::Data(size)
             };
             // Loop back to carry on with the data already buffered.
-            step_chunked(buf, phase)
+            step_chunked(buf, phase, trailers)
         }
         ChunkPhase::Data(remaining) => {
             if buf.is_empty() {
@@ -564,16 +772,38 @@ fn step_chunked(buf: &mut Vec<u8>, phase: &mut ChunkPhase) -> Result<Step> {
             }
             buf.drain(..2);
             *phase = ChunkPhase::Size;
-            step_chunked(buf, phase)
+            step_chunked(buf, phase, trailers)
         }
         ChunkPhase::Trailers => loop {
-            let Some(line) = take_line(buf, MAX_HEAD_BYTES)? else {
+            // A partial line past the cap can never become a legal one, so it
+            // fails now rather than buffering until its CRLF shows up.
+            let Some(line) = take_line(buf, MAX_TRAILER_BYTES)
+                .map_err(|_| anyhow!("trailer section exceeds {MAX_TRAILER_BYTES} bytes"))?
+            else {
                 return Ok(Step::NeedMore);
             };
+            // The blank line ends the section and is not counted.
             if line.is_empty() {
                 return Ok(Step::Done);
             }
-            // Trailer fields are consumed and dropped.
+            trailers.bytes += line.len() + 2;
+            if trailers.bytes > MAX_TRAILER_BYTES {
+                bail!("trailer section exceeds {MAX_TRAILER_BYTES} bytes");
+            }
+            // An obs-fold line (RFC 9112 5.2) is refused, not unfolded: a proxy
+            // may reject it, and folding would let a trailer line extend another.
+            if line.first().is_some_and(|b| matches!(b, b' ' | b'\t')) {
+                bail!("trailer field line starts with whitespace");
+            }
+            let text =
+                std::str::from_utf8(&line).map_err(|_| anyhow!("non-UTF-8 trailer field"))?;
+            if trailers.fields.len() >= MAX_TRAILER_FIELDS {
+                bail!("trailer section exceeds {MAX_TRAILER_FIELDS} fields");
+            }
+            // Trailer names and values are attacker-controlled and this error
+            // can reach a log, so it names the problem, never the field.
+            parse_field_line(text, &mut trailers.fields)
+                .map_err(|_| anyhow!("malformed trailer field"))?;
         },
     }
 }
@@ -603,8 +833,11 @@ fn parse_chunk_size(line: &[u8]) -> Result<u64> {
     u64::from_str_radix(size, 16).map_err(|_| anyhow!("invalid chunk size {size:?}"))
 }
 
-/// Parse a request head: request line plus header fields.
-fn parse_request(head: &[u8]) -> Result<HttpRequest> {
+/// Parse a request head: request line plus header fields. The second value is
+/// whether the request line's version token is exactly `HTTP/1.0`: the model
+/// records every accepted request as `HttpVersion::Http11`, so the token is read
+/// here, where it is still available.
+fn parse_request(head: &[u8]) -> Result<(HttpRequest, bool)> {
     let text = std::str::from_utf8(head).map_err(|_| anyhow!("non-UTF-8 request head"))?;
     let mut lines = text.split("\r\n");
     let line = lines.next().unwrap_or("");
@@ -622,7 +855,7 @@ fn parse_request(head: &[u8]) -> Result<HttpRequest> {
     }
     let headers = parse_headers(lines)?;
     let (scheme, authority, path) = split_target(method, target, &headers);
-    Ok(HttpRequest {
+    let request = HttpRequest {
         method: method.to_string(),
         scheme,
         authority,
@@ -631,7 +864,8 @@ fn parse_request(head: &[u8]) -> Result<HttpRequest> {
         headers,
         body: Body::Empty,
         timestamp: std::time::SystemTime::now(),
-    })
+    };
+    Ok((request, version == "HTTP/1.0"))
 }
 
 /// Scheme, authority and path for a request target in origin, absolute or
@@ -675,6 +909,7 @@ fn parse_response(head: &[u8]) -> Result<HttpResponse> {
         status,
         version: HttpVersion::Http11,
         headers,
+        trailers: HeaderMap::new(),
         body: Body::Empty,
         timestamp: std::time::SystemTime::now(),
     })
@@ -687,21 +922,27 @@ fn parse_headers<'a>(lines: impl Iterator<Item = &'a str>) -> Result<HeaderMap> 
         if line.is_empty() {
             continue;
         }
-        let Some((name, value)) = line.split_once(':') else {
-            bail!("malformed header line {line:?}");
-        };
-        let name = name.trim();
-        if name.is_empty() || name.contains(' ') {
-            bail!("malformed header name {name:?}");
-        }
-        // Fail closed on an invalid name/value (control byte, embedded CR/LF).
-        // `set` would *drop* it silently; dropping a framing header such as
-        // `Content-Length` desynchronises us from the peer (request smuggling).
-        headers
-            .try_set(name, value.trim())
-            .map_err(|e| anyhow!("{e}"))?;
+        parse_field_line(line, &mut headers)?;
     }
     Ok(headers)
+}
+
+/// Parse one `name: value` field line and append it to `into`. Used for head
+/// header lines and for trailer lines alike, so the two share one field-line
+/// grammar. (The trailer path also rejects a leading SP/HT, non-UTF-8 and
+/// over-cap sections before a line gets here.)
+fn parse_field_line(line: &str, into: &mut HeaderMap) -> Result<()> {
+    let Some((name, value)) = line.split_once(':') else {
+        bail!("malformed header line {line:?}");
+    };
+    let name = name.trim();
+    if name.is_empty() || name.contains(' ') {
+        bail!("malformed header name {name:?}");
+    }
+    // Fail closed on an invalid name/value (control byte, embedded CR/LF).
+    // `set` would *drop* it silently; dropping a framing header such as
+    // `Content-Length` desynchronises us from the peer (request smuggling).
+    into.try_set(name, value.trim()).map_err(|e| anyhow!("{e}"))
 }
 
 /// The protocol named by `Upgrade:` when `Connection:` lists `upgrade`.
@@ -723,10 +964,27 @@ fn upgrade_protocol(headers: &HeaderMap) -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// Whether any `Expect` field line lists `100-continue`. Every line counts (the
+/// field may repeat), each is split on commas, and a member matches only when
+/// the whole of it, minus optional surrounding SP/HT, equals `100-continue`
+/// ASCII case-insensitively: `100-continue-ish` and `100-continue;x=1` do not.
+fn expects_100_continue(headers: &HeaderMap) -> bool {
+    headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("expect"))
+        .any(|(_, value)| {
+            value.split(',').any(|member| {
+                member
+                    .trim_matches([' ', '\t'])
+                    .eq_ignore_ascii_case("100-continue")
+            })
+        })
+}
+
 /// `Content-Length` as a number, if present and well-formed. More than one
 /// header with *distinct* values is rejected: silently trusting the first is a
 /// request/response-smuggling vector (RFC 7230 §3.3.3).
-fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
+pub(crate) fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {
     let parse = |v: &str| {
         let t = v.trim();
         if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
@@ -1048,6 +1306,7 @@ mod tests {
         m.enqueue_response(&HttpResponse {
             status: 200,
             headers: HeaderMap::new(),
+            trailers: HeaderMap::new(),
             body: Body::Empty,
             version: HttpVersion::Http11,
             timestamp: std::time::SystemTime::now(),
@@ -1094,5 +1353,597 @@ mod tests {
         assert_eq!(reason_phrase(599), "Server Error");
         assert_eq!(reason_phrase(799), "Unknown Status");
         assert!(!reason_phrase(218).is_empty());
+    }
+
+    // ---- an unanswered `Expect: 100-continue` ----------------------------------
+
+    /// A machine fed `raw` on the client side, and the events it produced.
+    fn after_request(raw: &[u8]) -> (Http1Machine, Vec<HttpSansIoEvent>) {
+        let mut m = Http1Machine::new();
+        let events = m.on_bytes(Side::Client, raw).unwrap();
+        (m, events)
+    }
+
+    /// The flow id of a request's first event, which must be `RequestHeaders`.
+    fn request_id(events: &[HttpSansIoEvent]) -> FlowId {
+        match events.first() {
+            Some(HttpSansIoEvent::RequestHeaders(id)) => *id,
+            other => panic!("first event was {other:?}, want RequestHeaders"),
+        }
+    }
+
+    /// `POST /u` with `Content-Length: 5`, then `expect_lines` (each CRLF
+    /// terminated), then the blank line.
+    fn expect_head(expect_lines: &str) -> Vec<u8> {
+        format!("POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n{expect_lines}\r\n")
+            .into_bytes()
+    }
+
+    #[test]
+    fn expectation_is_pending_when_the_body_has_not_arrived() {
+        let (m, events) = after_request(&expect_head("Expect: 100-continue\r\n"));
+        let id = request_id(&events);
+        assert_eq!(events, vec![HttpSansIoEvent::RequestHeaders(id)]);
+        assert!(m.expects_continue());
+    }
+
+    #[test]
+    fn expectation_is_not_pending_when_the_body_arrived_with_the_head() {
+        let mut raw = expect_head("Expect: 100-continue\r\n");
+        raw.extend_from_slice(b"hello");
+        let (m, events) = after_request(&raw);
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestBodyChunk {
+                    flow: id,
+                    bytes: b"hello".to_vec()
+                },
+                HttpSansIoEvent::RequestComplete(id),
+            ]
+        );
+        assert!(!m.expects_continue());
+    }
+
+    #[test]
+    fn expectation_is_ignored_on_http_1_0() {
+        let (m, events) = after_request(
+            b"POST /u HTTP/1.0\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+        );
+        let id = request_id(&events);
+        assert_eq!(events, vec![HttpSansIoEvent::RequestHeaders(id)]);
+        assert!(!m.expects_continue());
+    }
+
+    #[test]
+    fn expectation_is_not_pending_when_no_content_follows() {
+        let (m, events) = after_request(
+            b"POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\nExpect: 100-continue\r\n\r\n",
+        );
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestComplete(id),
+            ]
+        );
+        assert!(!m.expects_continue(), "Content-Length: 0 has no content");
+
+        let (m, events) =
+            after_request(b"POST /u HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\n\r\n");
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestComplete(id),
+            ]
+        );
+        assert!(!m.expects_continue(), "no length at all has no content");
+    }
+
+    #[test]
+    fn a_chunked_request_has_a_pending_expectation_until_a_chunk_arrives() {
+        let head = b"POST /u HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n";
+        let (m, events) = after_request(head);
+        let id = request_id(&events);
+        assert_eq!(events, vec![HttpSansIoEvent::RequestHeaders(id)]);
+        assert!(m.expects_continue(), "chunked with no body bytes yet");
+
+        let mut raw = head.to_vec();
+        raw.extend_from_slice(b"5\r\nhello\r\n");
+        let (m, events) = after_request(&raw);
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestBodyChunk {
+                    flow: id,
+                    bytes: b"hello".to_vec()
+                },
+            ]
+        );
+        assert!(!m.expects_continue(), "a chunk arrived with the head");
+    }
+
+    #[test]
+    fn expectation_matching_is_case_insensitive_and_whole_member() {
+        let one_line: &[(&str, bool)] = &[
+            ("100-Continue", true),
+            ("foo, 100-continue", true),
+            ("100-continue, foo", true),
+            ("foo", false),
+            ("100-continue-ish", false),
+            ("100-continue;x=1", false),
+            ("", false),
+        ];
+        for (value, want) in one_line {
+            let (m, _) = after_request(&expect_head(&format!("Expect: {value}\r\n")));
+            assert_eq!(
+                m.expects_continue(),
+                *want,
+                "Expect value {value:?} should give {want}"
+            );
+        }
+        // Every field line counts, not only the first.
+        let (m, _) = after_request(&expect_head("Expect: foo\r\nExpect: 100-continue\r\n"));
+        assert!(
+            m.expects_continue(),
+            "a 100-continue on the second Expect line must match"
+        );
+    }
+
+    #[test]
+    fn enqueue_continue_queues_the_interim_once() {
+        let (mut m, _) = after_request(&expect_head("Expect: 100-continue\r\n"));
+        assert!(m.expects_continue());
+
+        m.enqueue_continue();
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            Some(b"HTTP/1.1 100 Continue\r\n\r\n".to_vec())
+        );
+        assert!(!m.expects_continue(), "answering clears the expectation");
+
+        m.enqueue_continue();
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            None,
+            "a second call must queue nothing"
+        );
+        assert_eq!(m.poll_outbound(Side::Server), None, "nothing goes upstream");
+    }
+
+    #[test]
+    fn enqueue_continue_with_nothing_pending_queues_nothing() {
+        let (mut m, _) = after_request(b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n");
+        m.enqueue_continue();
+        assert_eq!(m.poll_outbound(Side::Client), None);
+    }
+
+    #[test]
+    fn the_expectation_flag_resets_for_the_next_request() {
+        // Once answered (the flag is cleared by `enqueue_continue`) and once left
+        // unanswered (only the head-time reset can clear it): either way the next
+        // request on the connection starts with nothing pending.
+        for answered in [true, false] {
+            let (mut m, events) = after_request(&expect_head("Expect: 100-continue\r\n"));
+            let id = request_id(&events);
+            assert!(m.expects_continue());
+            if answered {
+                m.enqueue_continue();
+                assert_eq!(
+                    m.poll_outbound(Side::Client),
+                    Some(CONTINUE_RESPONSE.to_vec())
+                );
+            }
+            let body = m.on_bytes(Side::Client, b"hello").unwrap();
+            assert_eq!(
+                body,
+                vec![
+                    HttpSansIoEvent::RequestBodyChunk {
+                        flow: id,
+                        bytes: b"hello".to_vec()
+                    },
+                    HttpSansIoEvent::RequestComplete(id),
+                ]
+            );
+            let resp = m
+                .on_bytes(
+                    Side::Server,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+                )
+                .unwrap();
+            assert_eq!(
+                resp,
+                vec![
+                    HttpSansIoEvent::ResponseHeaders(id),
+                    HttpSansIoEvent::ResponseComplete(id),
+                ]
+            );
+
+            let next = m
+                .on_bytes(Side::Client, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+                .unwrap();
+            let id2 = request_id(&next);
+            assert_ne!(id2, id);
+            assert!(
+                !m.expects_continue(),
+                "a plain GET after a request that expected 100-continue (answered: {answered})"
+            );
+        }
+    }
+
+    #[test]
+    fn expectation_is_not_pending_when_part_of_the_body_arrived_with_the_head() {
+        // Any content byte buffered with the head makes the go-ahead pointless,
+        // not only a whole body: five bytes are declared and three came with it.
+        let mut raw = expect_head("Expect: 100-continue\r\n");
+        raw.extend_from_slice(b"hel");
+        let (m, events) = after_request(&raw);
+        let id = request_id(&events);
+        assert_eq!(
+            events,
+            vec![
+                HttpSansIoEvent::RequestHeaders(id),
+                HttpSansIoEvent::RequestBodyChunk {
+                    flow: id,
+                    bytes: b"hel".to_vec()
+                },
+            ]
+        );
+        assert!(
+            !m.expects_continue(),
+            "a partial body arrived with the head"
+        );
+    }
+
+    #[test]
+    fn expectation_holds_for_every_http_1_x_but_1_0() {
+        // The machine accepts any `HTTP/1.x` request line; only the exact token
+        // `HTTP/1.0` is exempt, every later minor version counts as 1.1 or later.
+        for (version, want) in [
+            ("HTTP/1.1", true),
+            ("HTTP/1.2", true),
+            ("HTTP/1.9", true),
+            ("HTTP/1.0", false),
+        ] {
+            let raw = format!(
+                "POST /u {version}\r\nHost: h\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"
+            );
+            let (m, _) = after_request(raw.as_bytes());
+            assert_eq!(m.expects_continue(), want, "request line version {version}");
+        }
+    }
+
+    // ---- writing a response's trailers ------------------------------------
+
+    /// A response head carrying `headers` with a streamed body.
+    fn streamed_response(headers: HeaderMap) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            headers,
+            trailers: HeaderMap::new(),
+            body: Body::Streamed(StreamBody),
+            version: HttpVersion::Http11,
+            timestamp: std::time::SystemTime::now(),
+        }
+    }
+
+    /// A machine whose client-bound body is framed chunked: a streamed response
+    /// head carrying `Transfer-Encoding: chunked` is queued and drained, so the
+    /// next thing `poll_outbound(Side::Client)` returns is what the test enqueues.
+    fn chunk_framed_machine() -> Http1Machine {
+        let mut m = Http1Machine::new();
+        m.enqueue_response(&streamed_response(headers(&[(
+            "Transfer-Encoding",
+            "chunked",
+        )])));
+        assert!(
+            m.poll_outbound(Side::Client).is_some(),
+            "the head was queued"
+        );
+        m
+    }
+
+    /// What `enqueue_body_end_with_trailers(Side::Client, ..)` queues for a
+    /// chunk-framed body given `pairs`, and the number of fields it reports as
+    /// not written.
+    fn trailer_bytes(pairs: &[(&str, &str)]) -> (Option<Vec<u8>>, usize) {
+        let mut m = chunk_framed_machine();
+        let withheld = m.enqueue_body_end_with_trailers(Side::Client, &headers(pairs));
+        (m.poll_outbound(Side::Client), withheld)
+    }
+
+    /// The 37 names that are never written as a trailer, spelled out here
+    /// independently of `FORBIDDEN_TRAILERS` so a name dropped from the constant
+    /// is caught.
+    const GOLDEN_DENY_SET: [&str; 37] = [
+        // Message framing
+        "transfer-encoding",
+        "content-length",
+        // Routing
+        "host",
+        // Request modifiers
+        "cache-control",
+        "expect",
+        "max-forwards",
+        "pragma",
+        "range",
+        "te",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "if-range",
+        // Authentication
+        "authorization",
+        "proxy-authorization",
+        "www-authenticate",
+        "proxy-authenticate",
+        "authentication-info",
+        "proxy-authentication-info",
+        "cookie",
+        "set-cookie",
+        // Response control data
+        "age",
+        "date",
+        "expires",
+        "location",
+        "retry-after",
+        "vary",
+        "warning",
+        // Payload processing
+        "content-encoding",
+        "content-type",
+        "content-range",
+        "trailer",
+        // Connection management
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "upgrade",
+    ];
+
+    #[test]
+    fn trailer_terminator_without_fields_is_unchanged() {
+        let (bytes, withheld) = trailer_bytes(&[]);
+        assert_eq!(bytes, Some(b"0\r\n\r\n".to_vec()));
+        assert_eq!(withheld, 0);
+
+        // The public form, which carries no trailers, writes the same bytes.
+        let mut m = chunk_framed_machine();
+        m.enqueue_body_end(Side::Client);
+        assert_eq!(m.poll_outbound(Side::Client), Some(b"0\r\n\r\n".to_vec()));
+    }
+
+    #[test]
+    fn trailer_terminator_writes_allowed_fields_in_order() {
+        let (bytes, withheld) = trailer_bytes(&[("x-sum", "abc"), ("X-E2E", "m1")]);
+        assert_eq!(
+            bytes,
+            Some(b"0\r\nx-sum: abc\r\nX-E2E: m1\r\n\r\n".to_vec())
+        );
+        assert_eq!(withheld, 0);
+
+        // Order, case and a repeated name are kept as captured.
+        let (bytes, withheld) = trailer_bytes(&[("X-A", "1"), ("x-b", "2"), ("x-a", "3")]);
+        assert_eq!(
+            bytes,
+            Some(b"0\r\nX-A: 1\r\nx-b: 2\r\nx-a: 3\r\n\r\n".to_vec())
+        );
+        assert_eq!(withheld, 0);
+    }
+
+    #[test]
+    fn the_terminator_resets_the_framing_like_enqueue_body_end_does() {
+        let mut m = chunk_framed_machine();
+        m.enqueue_body_chunk(Side::Client, b"hi");
+        m.enqueue_body_end_with_trailers(Side::Client, &headers(&[("x-sum", "abc")]));
+        // After the terminator nothing is chunk-framed any more: a further slice
+        // goes out raw, and a second terminator writes nothing.
+        m.enqueue_body_chunk(Side::Client, b"raw");
+        m.enqueue_body_end_with_trailers(Side::Client, &headers(&[("x-sum", "abc")]));
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            Some(b"2\r\nhi\r\n0\r\nx-sum: abc\r\n\r\nraw".to_vec())
+        );
+    }
+
+    #[test]
+    fn the_deny_set_is_exactly_these_37_names() {
+        assert_eq!(FORBIDDEN_TRAILERS.len(), 37);
+        let have: std::collections::BTreeSet<&str> = FORBIDDEN_TRAILERS.iter().copied().collect();
+        let want: std::collections::BTreeSet<&str> = GOLDEN_DENY_SET.iter().copied().collect();
+        assert_eq!(want.len(), 37, "the golden list has no duplicate");
+        assert_eq!(have, want);
+        for name in FORBIDDEN_TRAILERS {
+            assert_eq!(
+                *name,
+                name.to_ascii_lowercase(),
+                "names are held lower case"
+            );
+        }
+    }
+
+    #[test]
+    fn every_forbidden_trailer_name_is_withheld() {
+        for name in GOLDEN_DENY_SET {
+            for spelled in [name.to_string(), name.to_ascii_uppercase()] {
+                let (bytes, withheld) = trailer_bytes(&[(spelled.as_str(), "1"), ("x-ok", "1")]);
+                assert_eq!(
+                    bytes,
+                    Some(b"0\r\nx-ok: 1\r\n\r\n".to_vec()),
+                    "{spelled} must not reach the wire"
+                );
+                assert_eq!(withheld, 1, "{spelled} is one withheld field");
+            }
+        }
+    }
+
+    #[test]
+    fn withheld_fields_are_counted_and_the_rest_keep_their_order() {
+        let (bytes, withheld) = trailer_bytes(&[
+            ("X-First", "1"),
+            ("Content-Length", "0"),
+            ("Set-Cookie", "s=1"),
+            ("X-Last", "2"),
+            ("Host", "evil.test"),
+        ]);
+        assert_eq!(
+            bytes,
+            Some(b"0\r\nX-First: 1\r\nX-Last: 2\r\n\r\n".to_vec())
+        );
+        assert_eq!(withheld, 3);
+
+        // Only forbidden fields: the section is empty, and the count is all of them.
+        let (bytes, withheld) = trailer_bytes(&[("Location", "/x"), ("Content-Type", "x/y")]);
+        assert_eq!(bytes, Some(b"0\r\n\r\n".to_vec()));
+        assert_eq!(withheld, 2);
+    }
+
+    #[test]
+    fn denial_is_by_whole_name_not_by_prefix_or_substring() {
+        let allowed = [
+            "x-host",
+            "hostname",
+            "content-lengths",
+            "x-content-length",
+            "set-cookie2",
+            "tee",
+            "server-timing",
+            "digest",
+            "content-digest",
+            "x-checksum-sha256",
+        ];
+        for name in allowed {
+            let (bytes, withheld) = trailer_bytes(&[(name, "1")]);
+            assert_eq!(
+                bytes,
+                Some(format!("0\r\n{name}: 1\r\n\r\n").into_bytes()),
+                "{name} is not on the deny-set"
+            );
+            assert_eq!(withheld, 0);
+        }
+    }
+
+    #[test]
+    fn trailers_are_not_written_for_an_unframed_body() {
+        let pairs = [("x-sum", "abc"), ("X-E2E", "m1")];
+
+        // No response head queued yet: the client framing is raw.
+        let mut m = Http1Machine::new();
+        assert_eq!(
+            m.enqueue_body_end_with_trailers(Side::Client, &headers(&pairs)),
+            2
+        );
+        assert_eq!(m.poll_outbound(Side::Client), None);
+
+        // A streamed body framed by length, and a buffered body, are raw too.
+        for resp in [
+            streamed_response(headers(&[("Content-Length", "5")])),
+            HttpResponse {
+                body: Body::Bytes(b"hello".to_vec()),
+                ..streamed_response(HeaderMap::new())
+            },
+        ] {
+            let mut m = Http1Machine::new();
+            m.enqueue_response(&resp);
+            let _head = m.poll_outbound(Side::Client);
+            assert_eq!(
+                m.enqueue_body_end_with_trailers(Side::Client, &headers(&pairs)),
+                2,
+                "every field is reported as not written"
+            );
+            assert_eq!(m.poll_outbound(Side::Client), None, "and none is written");
+        }
+    }
+
+    #[test]
+    fn a_trailer_is_writable_only_when_name_and_value_are_wire_safe() {
+        assert!(writable_trailer("x-sum", "abc"));
+        assert!(writable_trailer("X-E2E", "two words; and\ttab"));
+        assert!(writable_trailer("x-empty", ""));
+        // A line break in either half would end the field line early and let the
+        // origin write framing or routing bytes of its own.
+        assert!(!writable_trailer("x-a\r\nHost: evil.test", "v"));
+        assert!(!writable_trailer("x-a", "v\r\nHost: evil.test"));
+        assert!(!writable_trailer("x-a", "v\nSet-Cookie: s=1"));
+        assert!(!writable_trailer("x-a", "v\rinjected"));
+        assert!(!writable_trailer("x-a", "v\0"));
+        assert!(!writable_trailer("x-a", "v\x7f"));
+        assert!(!writable_trailer("x-a", " v"));
+        assert!(!writable_trailer("x-a", "v "));
+        assert!(!writable_trailer("", "v"));
+        assert!(!writable_trailer("x a", "v"));
+        assert!(!writable_trailer("x-a:", "v"));
+        assert!(!writable_trailer("x\ta", "v"));
+        // And the deny-set applies through the same gate.
+        assert!(!writable_trailer("Set-Cookie", "s=1"));
+    }
+
+    #[test]
+    fn trailers_the_machine_captured_are_what_the_writer_emits() {
+        // The two halves together: parse a response's trailer section off the
+        // wire, then write that capture back out after a chunk-framed body.
+        let mut m = Http1Machine::new();
+        m.on_bytes(Side::Client, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+            .unwrap();
+        m.on_bytes(
+            Side::Server,
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n\
+              2\r\nhi\r\n0\r\nX-Sum: abc\r\nSet-Cookie: s=1\r\nx-sum: def\r\n\r\n",
+        )
+        .unwrap();
+        let captured = m.response().expect("response").trailers.clone();
+        assert_eq!(captured.len(), 3, "the capture keeps every field");
+
+        m.enqueue_response(&streamed_response(headers(&[(
+            "Transfer-Encoding",
+            "chunked",
+        )])));
+        let _head = m.poll_outbound(Side::Client);
+        assert_eq!(m.enqueue_body_end_with_trailers(Side::Client, &captured), 1);
+        assert_eq!(
+            m.poll_outbound(Side::Client),
+            Some(b"0\r\nX-Sum: abc\r\nx-sum: def\r\n\r\n".to_vec())
+        );
+    }
+
+    #[test]
+    fn an_empty_trailer_value_survives_capture_and_forwarding() {
+        // A field with no value is legal. It is captured as an empty string, and
+        // what the writer emits for it parses back to the same capture, so a
+        // forwarded empty field is still the field the origin sent.
+        const CHUNKED_HEAD: &[u8] =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n";
+        let parse = |wire: &[u8]| {
+            let mut m = Http1Machine::new();
+            m.on_bytes(Side::Client, b"GET /x HTTP/1.1\r\nHost: h\r\n\r\n")
+                .unwrap();
+            m.on_bytes(Side::Server, wire).unwrap();
+            m.response().expect("response").trailers.clone()
+        };
+        let mut wire = CHUNKED_HEAD.to_vec();
+        wire.extend_from_slice(b"0\r\nx-empty:\r\nx-sum: abc\r\n\r\n");
+        let captured = parse(&wire);
+        assert_eq!(
+            captured.iter().collect::<Vec<_>>(),
+            vec![("x-empty", ""), ("x-sum", "abc")]
+        );
+
+        let mut m = chunk_framed_machine();
+        assert_eq!(m.enqueue_body_end_with_trailers(Side::Client, &captured), 0);
+        let written = m.poll_outbound(Side::Client).expect("a terminator");
+        let mut again = CHUNKED_HEAD.to_vec();
+        again.extend_from_slice(&written);
+        assert_eq!(
+            parse(&again).iter().collect::<Vec<_>>(),
+            captured.iter().collect::<Vec<_>>()
+        );
     }
 }
