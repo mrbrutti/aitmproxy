@@ -72,6 +72,15 @@ impl AuditEntry {
             .unwrap_or(0)
     }
 
+    /// Whether `viewer` may see this entry. Trusted control (the operator, the CLI)
+    /// sees every entry; any other viewer sees only entries made by callers that
+    /// are not trusted control, so an agent never reads what the operator did.
+    /// Both sides ask [`Frontend::is_trusted_control`], the one definition of
+    /// "trusted" in the workspace, never a comparison against a role.
+    pub fn visible_to(&self, viewer: Frontend) -> bool {
+        viewer.is_trusted_control() || !self.origin.is_trusted_control()
+    }
+
     /// The transport-neutral rendering of the entry, used identically by
     /// `agent.activity` (its `[AuditEntry]` result), the `notifications/aitm/agent`
     /// line, and the durable JSONL — so every surface shows one shape.
@@ -164,11 +173,41 @@ impl AuditRing {
     /// Recent entries, oldest first. `since` keeps only entries strictly after it;
     /// `limit` keeps the most recent `limit` of those (presented oldest first), so
     /// a reconnecting surface catches up without replaying the whole ring.
+    ///
+    /// This is the **unfiltered** view: it returns every entry whatever its
+    /// origin. No surface a role reads may use it (use [`AuditRing::recent_for`]);
+    /// the in-process tests and the durable sink keep it.
     pub fn recent(&self, since: Option<SystemTime>, limit: Option<usize>) -> Vec<AuditEntry> {
+        self.recent_where(since, limit, |_| true)
+    }
+
+    /// [`AuditRing::recent`] as `viewer` may see it: an entry is kept only when
+    /// [`AuditEntry::visible_to`] says so. The visibility filter runs **before**
+    /// `limit`, so `limit` counts the entries the viewer can see, never the
+    /// hidden ones (a limit of 1 for an agent never returns the operator's
+    /// entry, and never returns nothing because the newest entry was hidden).
+    pub fn recent_for(
+        &self,
+        viewer: Frontend,
+        since: Option<SystemTime>,
+        limit: Option<usize>,
+    ) -> Vec<AuditEntry> {
+        self.recent_where(since, limit, |e| e.visible_to(viewer))
+    }
+
+    /// The shared body of [`AuditRing::recent`] and [`AuditRing::recent_for`]:
+    /// `since` (strictly after), then `keep`, then `limit`, oldest first.
+    fn recent_where(
+        &self,
+        since: Option<SystemTime>,
+        limit: Option<usize>,
+        keep: impl Fn(&AuditEntry) -> bool,
+    ) -> Vec<AuditEntry> {
         let q = self.lock();
         let mut out: Vec<AuditEntry> = q
             .iter()
             .filter(|e| since.is_none_or(|s| e.at > s))
+            .filter(|e| keep(e))
             .cloned()
             .collect();
         if let Some(limit) = limit {
@@ -181,8 +220,33 @@ impl AuditRing {
 
     /// How many entries were recorded at or after `since` — the source of
     /// `agent.status.actions_last_minute`.
+    ///
+    /// This is the **unfiltered** count: it includes every entry whatever its
+    /// origin. No surface a role reads may use it (use
+    /// [`AuditRing::count_since_for`]); the in-process tests keep it.
     pub fn count_since(&self, since: SystemTime) -> usize {
         self.lock().iter().filter(|e| e.at >= since).count()
+    }
+
+    /// [`AuditRing::count_since`] as `viewer` may see it: only entries recorded at
+    /// or after `since` that are [`AuditEntry::visible_to`] the viewer, and, when
+    /// `exclude_connection` is `Some(id)`, not made by the connection `id`. An
+    /// entry with no `connection_id` is never excluded: an id the server did not
+    /// assign cannot match one it did.
+    pub fn count_since_for(
+        &self,
+        viewer: Frontend,
+        since: SystemTime,
+        exclude_connection: Option<&str>,
+    ) -> usize {
+        self.lock()
+            .iter()
+            .filter(|e| e.at >= since)
+            .filter(|e| e.visible_to(viewer))
+            .filter(|e| {
+                !exclude_connection.is_some_and(|id| e.connection_id.as_deref() == Some(id))
+            })
+            .count()
     }
 
     /// The number of entries currently held.
@@ -226,6 +290,73 @@ mod tests {
             args_summary: "{}".to_string(),
             result,
         }
+    }
+
+    fn entry_of(origin: Frontend, connection_id: Option<&str>, command: &str) -> AuditEntry {
+        AuditEntry {
+            origin,
+            connection_id: connection_id.map(str::to_string),
+            ..entry(command, AuditResult::Ok)
+        }
+    }
+
+    #[test]
+    fn visible_to_matrix() {
+        let origins = [Frontend::Cli, Frontend::Operator, Frontend::Mcp];
+        let entries = origins.map(|o| entry_of(o, None, "x"));
+
+        let seen_by = |viewer: Frontend| entries.clone().map(|e| e.visible_to(viewer));
+        assert_eq!(seen_by(Frontend::Cli), [true, true, true]);
+        assert_eq!(seen_by(Frontend::Operator), [true, true, true]);
+        assert_eq!(seen_by(Frontend::Mcp), [false, false, true]);
+    }
+
+    #[test]
+    fn recent_for_applies_the_limit_after_the_filter() {
+        let ring = AuditRing::new(8);
+        ring.append(entry_of(Frontend::Operator, None, "op1"));
+        ring.append(entry_of(Frontend::Mcp, None, "ag1"));
+        ring.append(entry_of(Frontend::Operator, None, "op2"));
+        ring.append(entry_of(Frontend::Mcp, None, "ag2"));
+        ring.append(entry_of(Frontend::Operator, None, "op3"));
+
+        let commands = |entries: Vec<AuditEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.command).collect()
+        };
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Mcp, None, Some(2))),
+            ["ag1", "ag2"]
+        );
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Operator, None, Some(2))),
+            ["ag2", "op3"]
+        );
+        assert_eq!(
+            commands(ring.recent_for(Frontend::Mcp, None, None)),
+            ["ag1", "ag2"]
+        );
+    }
+
+    #[test]
+    fn count_since_for_filters_and_excludes() {
+        let t0 = SystemTime::now();
+        let ring = AuditRing::new(32);
+        for _ in 0..3 {
+            ring.append(entry_of(Frontend::Mcp, Some("A"), "x"));
+        }
+        for _ in 0..2 {
+            ring.append(entry_of(Frontend::Mcp, Some("B"), "x"));
+        }
+        for _ in 0..4 {
+            ring.append(entry_of(Frontend::Operator, Some("O"), "x"));
+        }
+        ring.append(entry_of(Frontend::Mcp, None, "x"));
+
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, None), 6);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, Some("A")), 3);
+        assert_eq!(ring.count_since_for(Frontend::Mcp, t0, Some("nope")), 6);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, None), 10);
+        assert_eq!(ring.count_since_for(Frontend::Operator, t0, Some("O")), 6);
     }
 
     #[test]
