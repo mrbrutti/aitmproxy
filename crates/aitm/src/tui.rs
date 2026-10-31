@@ -178,9 +178,9 @@ pub fn server(cfg: &Config, transport: McpTransport, services: &Services) -> Mcp
 /// request" error and approves nothing.
 ///
 /// Residual risk: this makes tests and production share a function, not a
-/// guarantee. The tests never run `main.rs` itself, so deleting the wrapper
-/// there would leave them green, and the function cannot force a future third
-/// server to call it.
+/// guarantee. No test exercises the governance wiring in `main.rs`, so deleting
+/// the wrapper there would leave them green, and the function cannot force a
+/// future third server to call it.
 pub fn with_shared_governance(
     server: McpServer,
     agent_state: &Arc<AgentState>,

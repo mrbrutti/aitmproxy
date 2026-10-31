@@ -447,18 +447,21 @@ are `pub`. The one new symbol, `tui::with_shared_governance`, is created in Task
   2. **AC12 mutation (final head).**
      `sed -i.bak '/MUTATION-POINT/d' crates/aitm/tests/web_bus_governance.rs crates/aitm/tests/web_bus_ask_split.rs`
      then
-     `cargo test -p aitm --test web_bus_governance --test web_bus_ask_split > /tmp/web-bus-governance-mutated.log 2>&1; echo "exit=$?"; grep -E "^test |^test result" /tmp/web-bus-governance-mutated.log`
-     **Must show** `exit=101` and ten tests in all (seven socket, three in-process):
-     exactly eight `FAILED`, namely AC1, AC2, AC3, AC5, AC16 (socket) and AC9, AC10,
-     AC11 (in-process), with the two guards (AC4, AC6) `ok`. The summary lines read
+     `cargo test -p aitm --no-fail-fast --test web_bus_governance --test web_bus_ask_split > /tmp/web-bus-governance-mutated.log 2>&1; echo "exit=$?"; grep -E "^test |^test result" /tmp/web-bus-governance-mutated.log`
+     (`--no-fail-fast`, so the second binary runs after the first fails.)
+     **Must show** `exit=101` and fourteen tests in all (seven socket, seven in-process;
+     the Tester added four in-process edge tests and an AC9 control after this plan was
+     written, so the original "ten tests, eight FAILED, `3 failed`" counts are superseded):
+     exactly twelve `FAILED`, namely AC1, AC2, AC3, AC5, AC16 (socket) and all seven
+     in-process tests, with the two guards (AC4, AC6) `ok`. The summary lines read
      `test result: FAILED. 2 passed; 5 failed` for `web_bus_governance` and `test result:
-     FAILED. 0 passed; 3 failed` for `web_bus_ask_split`. Each failure message must name
+     FAILED. 0 passed; 7 failed` for `web_bus_ask_split`. Each failure message must name
      the policy or audit cause (the `"auto"` policy, a missing refusal,
      `actions_last_minute` `0`, no `approval_requested`), not a connect or compile
      error. Then restore:
      `mv crates/aitm/tests/web_bus_governance.rs.bak crates/aitm/tests/web_bus_governance.rs && mv crates/aitm/tests/web_bus_ask_split.rs.bak crates/aitm/tests/web_bus_ask_split.rs`
      and `git status --short` prints nothing for those two files and no `.bak` file
-     remains; re-run the same cargo command: `exit=0`, `7 passed` and `3 passed`.
+     remains; re-run the same cargo command: `exit=0`, `7 passed` and `7 passed`.
   3. **AC15 and AC14 diff checks** (explicit base SHA, since `origin/main` moves):
      `git diff --stat 2bdcb07..HEAD -- crates/aitm-mcp crates/aitm-core` prints nothing;
      `git diff --stat 2bdcb07..HEAD -- crates/aitm/tests/web_bus_roles.rs crates/aitm/tests/web_bus_concurrency.rs crates/aitm/tests/web_bus_push.rs`
@@ -500,6 +503,23 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1 | Tester | Important (gate) | AC8 unit test in `tui.rs` compared `e.origin == Frontend::Mcp`, the deny-list shape `aitm-core`'s `trust_gate_scan` rejects in any `src`; the full gate exited 101 on head `3de6b00`. | Fixed in `2d2a932` (exact origin-list assertion, stricter). Gate re-run green: `gate2 exit=0`. |
+| 1-3 | Tester | n/a | Four new `Ask` edge tests (agent cannot approve its own call; agent cannot `agent.set` under `ask`; malformed approve resolves nothing; web call refused at once after the operator disconnects) plus an AC9 control. | Added in `2d2a932`, inside the declared test file. |
+| all | Spec | none | PASS; no findings. Notes: plan counts stale after the four extra tests (mutated `web_bus_ask_split` expects `0 passed; 7 failed`, 12 FAILED of 14 with AC4/AC6 ok); plan Task 2 red expectation for AC1 names the policy where the actual red is `flow.kill`. | Plan-text drift recorded here; no defect. |
+| all | Quality | Minor | Helper doc claims a test rig cannot pass while the binary is wired differently; its own last paragraph says otherwise. | Fixed in b11c510 (doc reworded). |
+| all | Quality + Security | Minor | "every agent-facing server" in `tui.rs`/`wire.rs` docs is false for the `aitm tui` loopback agent server (spec Design 7). | Fixed in b11c510 (docs say "both servers the bare-`aitm` run builds"; comment at `build_servers`). Underlying gap is the named follow-up "tui-mode governance" (proposed as a task card). |
+| 2 | Quality | Minor | `state` shadowed by an unrelated type in the socket rig; `Arc::clone`s not needed. | Fixed in b11c510. |
+| 1 | Quality | Minor | `assert_denied` doc wrong and defined after use; thread/`mpsc`/`recv_timeout` block copied. | Fixed in b11c510 (see the fix task report for what was folded). |
+| 1 | Quality | Minor | Hard-coded "5s" in panic messages; `is_none()` assertions drop the offending push. | Fixed in b11c510. |
+| 2 | Quality | Minor | Socket tests leave throwaway CA keys in the temp dir. | Fixed in b11c510 (`Server::drop` removes the CA dir). |
+| 1-2 | Quality | Minor | "Tester:" role labels in comments; `MUTATION-POINT` markers carry no reason. | Fixed in b11c510. |
+| 3 | Quality | Minor | The `Ask`-hub caveat is repeated in four places. | Fixed in b11c510 (full statement on the helper only). |
+| 3 | Quality | Minor (optional) | Bind `main.rs`'s two near-identical wrapper call sites in one local closure. | Not adopted: two call sites, different builder tails, and it widens the `main.rs` diff that PR 137 and its follow-ups also edit. Accepted (autonomous-approve mode). |
+| all | Quality | Residual | Tests would not catch a third server (or a reverted `main.rs`) that skips the helper. | Accepted: the spec states this residual risk (Design 3); a real-binary e2e canary is a named follow-up. |
+| 3 | Security | Minor | Tightening the policy (`paused`, or leaving `ask`) does not revoke standing push subscriptions or already-parked requests; identical on every agent surface; an `aitm-mcp` change (AC15 forbids it here). | Accepted for this change (autonomous-approve mode): pre-existing on every surface, not a bypass of the primary's gate. Stated in the PR description; follow-up proposed as a task card. |
+| 3 | Security | Minor | Shared ring: a web agent can flood it (4096 calls in one burst) and evict other surfaces' evidence; web-bridge entries (`origin: mcp`, `client_label: null`) are indistinguishable from a TCP agent that sent no `clientInfo`. | Accepted for this change (autonomous-approve mode): same class as Design 6.4, the cheap fix (a fixed bridge `client_label`) changes persisted findings and CA-audit labels and edits `bridge.rs` outside this spec. Stated in the PR description; follow-up proposed as a task card. |
+| all | Security | Minor | Nothing guards that `main.rs` actually calls the helper. | Accepted: spec Design 3 residual risk; a real-binary e2e canary is a named follow-up. |
+| fix | Quality (re-review of b11c510) | none open | PASS: all 8 Minors verified fixed, no assertion weakened, production `src` delta comments only. One new Minor: "The tests never run `main.rs` itself" overstates (`shutdown.rs` spawns the real binary under `AITM_OBSCURA=1`). | Fixed in the next commit (reworded to "No test exercises the governance wiring in `main.rs`"; comment only). |
 
 ## Shipped
 
