@@ -62,6 +62,7 @@ struct StatusBar: View {
         .frame(maxWidth: .infinity)
         .background(Tok.Ground.raised.color)
         .overlay(alignment: .top) { Rule() }
+        .dimsWhenInactive()
     }
 
     private var busColor: DynamicColor {

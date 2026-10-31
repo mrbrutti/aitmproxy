@@ -10,11 +10,27 @@ extension View {
         background(WindowHook())
     }
 
+    /// Dims custom chrome when its window is not the active one, matching the
+    /// system's own controls (rule 62). Desaturates rather than fading, so opaque
+    /// chrome backgrounds stay opaque and only the colour (accent, status, agent
+    /// tints) greys out; the active state is unchanged. Chrome only — never content.
+    func dimsWhenInactive() -> some View {
+        modifier(DimsWhenInactive())
+    }
+
     /// Sizes a Form, List, or ScrollView to its content, up to `max` points.
     /// A Settings page or sheet then grows to fit, and scrolls only when its
     /// content is taller than `max`.
     func fitsContent(max: CGFloat = 640) -> some View {
         modifier(FitsContent(max: max))
+    }
+}
+
+private struct DimsWhenInactive: ViewModifier {
+    @Environment(\.controlActiveState) private var activeState
+
+    func body(content: Content) -> some View {
+        content.saturation(activeState == .inactive ? 0 : 1)
     }
 }
 

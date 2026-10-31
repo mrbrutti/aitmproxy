@@ -8,7 +8,10 @@ import SwiftUI
 struct DynamicColor: Hashable, Sendable {
     let light: UInt32
     let dark: UInt32
-    var nsColor: NSColor { NSColor.dynamic(light: light, dark: dark) }
+    /// Increase-Contrast overrides; nil falls back to light/dark.
+    var highContrastLight: UInt32? = nil
+    var highContrastDark: UInt32? = nil
+    var nsColor: NSColor { NSColor.dynamic(light: light, dark: dark, highContrastLight: highContrastLight, highContrastDark: highContrastDark) }
     var color: Color { Color(nsColor: nsColor) }
 }
 
@@ -74,13 +77,13 @@ enum Tok {
     }
     enum Line {
         /// Panel edges, pane splitters, the rule under tab bars.
-        static let border = DynamicColor(light: 0xE5E7EB, dark: 0x2E2E31)
+        static let border = DynamicColor(light: 0xE5E7EB, dark: 0x2E2E31, highContrastLight: 0x9CA3AF, highContrastDark: 0x5A5A60)
         /// Input, select and outlined-button borders; one step darker than border.
-        static let control = DynamicColor(light: 0xD1D5DB, dark: 0x45454A)
+        static let control = DynamicColor(light: 0xD1D5DB, dark: 0x45454A, highContrastLight: 0x6B7280, highContrastDark: 0x6E6E74)
         /// 2px focus ring = accent.
         static let focus = DynamicColor(light: 0x2563EB, dark: 0x60A5FA)
         /// Row separators in tables and key-value lists; one step lighter than border.
-        static let rule = DynamicColor(light: 0xF0F1F3, dark: 0x303033)
+        static let rule = DynamicColor(light: 0xF0F1F3, dark: 0x303033, highContrastLight: 0xCBD0D6, highContrastDark: 0x4A4A4E)
     }
     /// The 11 flow mark colours (Proxyman's set = the macOS system colours, light/dark).
     enum Mark {
@@ -212,12 +215,12 @@ enum Tok {
         static let onAccent = DynamicColor(light: 0xFFFFFF, dark: 0x0B1220)
         /// Text on the primary (inverse) button.
         static let onInverse = DynamicColor(light: 0xFFFFFF, dark: 0x111111)
-        /// Identity text: URL host, header names, values, titles.
-        static let primary = DynamicColor(light: 0x111827, dark: 0xE6E6E8)
+        /// Identity text: URL host, header names, values, titles. Increase-Contrast pushes it to pure black/white.
+        static let primary = DynamicColor(light: 0x111827, dark: 0xE6E6E8, highContrastLight: 0x000000, highContrastDark: 0xFFFFFF)
         /// Column headers, labels, timestamps, durations.
-        static let secondary = DynamicColor(light: 0x4B5563, dark: 0xB4B4B8)
+        static let secondary = DynamicColor(light: 0x4B5563, dark: 0xB4B4B8, highContrastLight: 0x1F2937, highContrastDark: 0xD9D9DC)
         /// Placeholders, meta, disabled labels. Floor of the readable tiers (4.7:1 on raised, 5.3:1 on surface in light).
-        static let tertiary = DynamicColor(light: 0x616A78, dark: 0x8E8E93)
+        static let tertiary = DynamicColor(light: 0x616A78, dark: 0x8E8E93, highContrastLight: 0x374151, highContrastDark: 0xBFBFC4)
     }
     /// Two faces, each with one job.
     enum Typography {

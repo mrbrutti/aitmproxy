@@ -1,0 +1,14 @@
+bus-load (final-idle2) · ui origin mcp · bus ws://127.0.0.1:18082/bus · proxy 127.0.0.1:18080 · script role agent
+subscribed: sub_id 3
+
+idle: 30 s, hands off the page
+
+idle window: 30.0 s · 58 ui calls (origin mcp) · 0 other-origin
+flow.list      1.43/s
+proxy.status   0.50/s
+total          1.93/s
+notifications  flow 0.00/s · agent 1.93/s · state 0.00/s
+
+flow.list now: 1100 ids · 42901 bytes (result JSON) · 92514 bytes (reply frame)
+json: $TMPDIR/final-idle2.json
+run: valid

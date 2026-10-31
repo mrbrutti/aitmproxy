@@ -338,9 +338,7 @@ async fn tui_l4_cua_against_a_live_core() {
     // capture/inject unavailable, so the wire verbs fail closed honestly — the
     // required macOS scenario (AC18). The ingress is the module's shared guard +
     // store (AC17), so an ingress-fed packet is what `l4.flow.*` reads.
-    let Assembled {
-        proxy, l4_ingress, ..
-    } = assemble_with(
+    let assembled = assemble_with(
         &cfg,
         &Features {
             l4: l4.clone(),
@@ -349,6 +347,10 @@ async fn tui_l4_cua_against_a_live_core() {
         },
     )
     .expect("assemble a core with l4 enabled");
+    let governance = assembled.governance();
+    let Assembled {
+        proxy, l4_ingress, ..
+    } = assembled;
     let ingress = l4_ingress.expect("l4.enabled wires the capture ingress (AC17)");
 
     // (B) Scope-as-authorisation, enforced below the UI: the real `L4Guard`
@@ -381,7 +383,7 @@ async fn tui_l4_cua_against_a_live_core() {
     // builds it (`services` → `build_servers`). Skip cleanly if the sandbox
     // refuses the bind.
     let services = tui::services(&proxy, &cfg, None, tui::TuiLog::Off);
-    let server = build_servers(&cfg, services)
+    let server = build_servers(&cfg, services, governance)
         .0
         .expect("a loopback-TCP transport yields an agent server");
     let Some((addr, server_task)) = start_server(server)

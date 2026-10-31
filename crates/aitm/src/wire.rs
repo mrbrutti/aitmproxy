@@ -106,7 +106,9 @@ pub struct Assembled {
     /// The agent policy state, seeded from `cfg.mcp.policy` and shared with the
     /// `AgentPlugin` already registered, so a server's policy gate reads the same
     /// policy `agent.set` writes. Apply it to both servers the bare-`aitm` server
-    /// run builds (the primary and the `aitm web` bridge server). The `Ask`
+    /// run builds (the primary and the `aitm web` bridge server). The `aitm tui`
+    /// loopback agent server receives this same `Arc` through
+    /// `Assembled::governance`, which `tui::build_servers` requires. The `Ask`
     /// approval hub is not shared; see `tui::with_shared_governance`.
     pub agent_state: Arc<AgentState>,
     /// The F4 push broadcast: the `SubscriptionPlugin` registered in the chain
@@ -117,7 +119,9 @@ pub struct Assembled {
     /// already registered (which serves `agent.activity`/`agent.status` from it),
     /// so a server's `call_tool` records into the same ring. Apply it to both
     /// servers the bare-`aitm` server run builds (the primary and the `aitm web`
-    /// bridge server). The `Ask` approval hub is not shared; see
+    /// bridge server). The `aitm tui` loopback agent server receives this same
+    /// `Arc` through `Assembled::governance`, which `tui::build_servers`
+    /// requires. The `Ask` approval hub is not shared; see
     /// `tui::with_shared_governance`.
     pub audit_ring: Arc<AuditRing>,
     /// The protocol-general capture/ingress boundary (L4OPS-AC17). Its stream/TCP half
@@ -137,6 +141,80 @@ pub struct Assembled {
     /// divergent copy. Read-only use: the feeder only lists scope here; every
     /// authorization still goes through the ingress's own `L4Guard::check`.
     pub l4_guard: Option<Arc<L4Guard>>,
+    /// The sealed [`Governance`] that [`Assembled::governance`] hands out;
+    /// private so the `pub` fields above cannot substitute it.
+    governance: Governance,
+}
+
+/// The core's own agent governance: the `AgentState` and `AuditRing` that the
+/// registered `AgentPlugin` writes (`agent.set`) and reads (`agent.status`,
+/// `agent.activity`), so a server built over them is gated by the policy the
+/// operator sets and records into the trail the operator reads.
+///
+/// The type is sealed. It has no constructor and no accessor, and
+/// `Assembled::governance` is its only public source. It is fixed when the
+/// proxy is assembled, from the pair the `AgentPlugin` is registered over, and
+/// `Assembled` keeps it in a private field, so no later write to the `pub`
+/// `Assembled::agent_state` / `Assembled::audit_ring` fields can substitute a
+/// fresh state. `tui::build_servers` and `tui::run` require one, so `aitm tui`
+/// cannot be wired without one, and no outside code can substitute the pair an
+/// assembly made. It is not tied to the `Proxy` in the `Services` passed beside
+/// it: a `Governance` from a second `assemble()` would pass (in-process code
+/// only; nothing on the network, in a plugin, or over MCP can reach that). It
+/// carries no push sender.
+///
+/// A `Governance` cannot be built outside this crate:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use aitm::tui::{build_servers, services, TuiLog};
+/// use aitm::wire::{assemble, Governance};
+/// use aitm_core::{AgentPolicy, AgentState, AuditRing, Config};
+///
+/// fn main() -> anyhow::Result<()> {
+///     let agent_state = Arc::new(AgentState::new(AgentPolicy::Auto));
+///     let audit_ring = Arc::new(AuditRing::default());
+///     let cfg = Config::default();
+///     let assembled = assemble(&cfg)?;
+///     let governance: Governance = Governance { agent_state, audit_ring };
+///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let _servers = build_servers(&cfg, services, governance);
+///     Ok(())
+/// }
+/// ```
+///
+/// With the same imports and the same two locals, the one that comes from
+/// `Assembled::governance` compiles:
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use aitm::tui::{build_servers, services, TuiLog};
+/// use aitm::wire::{assemble, Governance};
+/// use aitm_core::{AgentPolicy, AgentState, AuditRing, Config};
+///
+/// fn main() -> anyhow::Result<()> {
+///     let agent_state = Arc::new(AgentState::new(AgentPolicy::Auto));
+///     let audit_ring = Arc::new(AuditRing::default());
+///     let cfg = Config::default();
+///     let assembled = assemble(&cfg)?;
+///     drop((agent_state, audit_ring));
+///     let governance: Governance = assembled.governance();
+///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let _servers = build_servers(&cfg, services, governance);
+///     Ok(())
+/// }
+/// ```
+#[derive(Clone)]
+pub struct Governance {
+    pub(crate) agent_state: Arc<AgentState>,
+    pub(crate) audit_ring: Arc<AuditRing>,
+}
+
+impl Assembled {
+    /// A clone of the [`Governance`] fixed at assembly; its only public source.
+    pub fn governance(&self) -> Governance {
+        self.governance.clone()
+    }
 }
 
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
@@ -288,6 +366,11 @@ pub fn assemble_with_scripts(
     // agent.status.actions_last_minute) and the MCP server's `call_tool`, which
     // appends one entry per invocation.
     let audit_ring = Arc::new(AuditRing::default());
+    // The sealed `Governance`, fixed from the pair the `AgentPlugin` below is registered over.
+    let governance = Governance {
+        agent_state: Arc::clone(&agent_state),
+        audit_ring: Arc::clone(&audit_ring),
+    };
     builder = builder
         // Command providers: the browser, poc, ca and agent commands.
         .register_plugin(Box::new(BrowserPlugin::new(cfg.browser.ssrf.clone())))
@@ -378,6 +461,7 @@ pub fn assemble_with_scripts(
         audit_ring,
         l4_ingress,
         l4_guard,
+        governance,
     })
 }
 
@@ -647,6 +731,64 @@ mod tests {
         cfg.ca.dir = temp_ca_dir("l4-guard-off");
         let disabled = assemble_with(&cfg, &Features::default()).expect("assemble, l4 disabled");
         assert!(disabled.l4_guard.is_none());
+    }
+
+    /// `Assembled::governance` hands out the assembly's own `agent_state` and
+    /// `audit_ring` `Arc`s, not copies, and `Clone` keeps that identity: a
+    /// policy set through the `Governance` is the policy the core reads.
+    #[test]
+    fn governance_carries_the_assemblys_own_state_and_ring() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("governance-identity");
+        let assembled = assemble(&cfg).expect("assemble with default features");
+        let governance = assembled.governance();
+        let cloned = governance.clone();
+        for (what, held) in [("governance", &governance), ("its clone", &cloned)] {
+            assert!(
+                Arc::ptr_eq(&held.agent_state, &assembled.agent_state),
+                "{what}: agent_state is a copy"
+            );
+            assert!(
+                Arc::ptr_eq(&held.audit_ring, &assembled.audit_ring),
+                "{what}: audit_ring is a copy"
+            );
+        }
+        governance
+            .agent_state
+            .set_policy(aitm_core::AgentPolicy::Paused);
+        assert_eq!(
+            assembled.agent_state.policy(),
+            aitm_core::AgentPolicy::Paused
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// The `Governance` is fixed at assembly, from the pair the `AgentPlugin`
+    /// was registered over. Overwriting the `pub` `agent_state` / `audit_ring`
+    /// fields afterwards (which a caller outside the crate can do) does not
+    /// change what `governance()` hands out, so the agent server built from it
+    /// still reads the state `agent.set` writes.
+    #[test]
+    fn governance_is_fixed_at_assembly_not_read_from_the_public_fields() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("governance-fixed");
+        let mut assembled = assemble(&cfg).expect("assemble with default features");
+        let original_state = Arc::clone(&assembled.agent_state);
+        let original_ring = Arc::clone(&assembled.audit_ring);
+
+        assembled.agent_state = Arc::new(AgentState::new(aitm_core::AgentPolicy::Auto));
+        assembled.audit_ring = Arc::new(AuditRing::default());
+
+        let governance = assembled.governance();
+        assert!(
+            Arc::ptr_eq(&governance.agent_state, &original_state),
+            "governance() read the substituted agent_state, not the assembly's own"
+        );
+        assert!(
+            Arc::ptr_eq(&governance.audit_ring, &original_ring),
+            "governance() read the substituted audit_ring, not the assembly's own"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
     }
 
     /// Every `*.rs` file under `dir`, recursively.
