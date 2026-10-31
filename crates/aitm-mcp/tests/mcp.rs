@@ -8257,3 +8257,191 @@ fn a_visible_agent_line_gaps_a_paused_agent_a_hidden_one_does_not_and_trusted_co
         "no marker: the only line suppressed was one the agent may not see"
     );
 }
+
+// ------------------------------------------------ flow finish and timing, Task 5: push mirrors flow.get
+
+use aitm_core::{FlowError, HttpResponse, StreamBody, WsDir, WsFlow, WsMessage, WsOpcode};
+use aitm_plugins::CapturePlugin;
+use std::time::UNIX_EPOCH;
+
+/// `flow.get` for `id`, computed by the real `CapturePlugin` through a `Registry`
+/// over `store`, rendered the way the MCP tool path renders it (`to_json`). The
+/// value the push summary is locked to.
+fn capture_flow_get(store: &MemFlowStore, id: aitm_core::FlowId) -> JsonValue {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let client = StubClient;
+    let guard = StdGuard::default();
+    let host = CommandHost::new(store, &client, &guard, None);
+    let mut args = BTreeMap::new();
+    args.insert("id".to_string(), Value::Str(id.to_string()));
+    let got = reg
+        .command("flow.get")
+        .expect("flow.get is registered by the capture plugin")
+        .invoke(Params::new(args), &host)
+        .expect("flow.get ok");
+    to_json(&got)
+}
+
+/// Subscribe with `{}` on an open push connection and check the reply.
+async fn subscribe_all(w: &mut WriteHalf<DuplexStream>, lines: &mut ClientReader) {
+    write_req(
+        w,
+        &json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                "params":{"name":"flow.subscribe","arguments":{}}}),
+    )
+    .await;
+    let reply = next_json(lines).await;
+    assert_eq!(reply["id"], 1);
+    assert_subscribed(&reply);
+}
+
+/// Spec AC12: the `summary` of a `notifications/aitm/flow` line is field for
+/// field the `flow.get` object, for an HTTP flow with every field populated and
+/// for a WebSocket flow. `flow_summary` is a hand-written mirror of `summarize`
+/// (aitm-mcp must not depend on aitm-plugins); this is the lock that fails on any
+/// drift on either side. The literal `started_at`/`duration_ms`/`kind` checks on
+/// the expected side keep the comparison from passing on two empty objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_summary_equals_flow_get_for_http_and_websocket_flows() {
+    let created = UNIX_EPOCH + Duration::from_millis(1_761_908_698_120);
+    let store = Arc::new(MemFlowStore::new());
+
+    let mut http = http_flow("example.com:443", "/mirror?q=1");
+    let Flow::Http(f) = &mut http else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.request.body = Body::Bytes(vec![b'x'; 412]);
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Bytes(vec![0u8; 2048]),
+        timestamp: SystemTime::now(),
+    });
+    f.metadata.created = created;
+    f.metadata.duration = Some(Duration::from_millis(412));
+    f.metadata.is_replay = true;
+    let http_id = store.insert(http);
+
+    let message = |dir: WsDir| WsMessage {
+        dir,
+        opcode: WsOpcode::Text,
+        data: b"hi".to_vec(),
+        timestamp: SystemTime::now(),
+        injected: false,
+    };
+    let ws_id = store.insert(Flow::WebSocket(WsFlow {
+        id: aitm_core::FlowId::new(),
+        handshake: http_id,
+        messages: vec![
+            message(WsDir::ClientToServer),
+            message(WsDir::ServerToClient),
+        ],
+        client_conn: ConnInfo {
+            peer: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: FlowMeta {
+            created,
+            ..FlowMeta::default()
+        },
+        intercept: InterceptState::Observed,
+    }));
+
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+    subscribe_all(&mut w, &mut lines).await;
+
+    // HTTP: the expected side is the real flow.get, with its values pinned.
+    let expected_http = capture_flow_get(&store, http_id);
+    assert_eq!(expected_http["kind"], "http");
+    assert_eq!(expected_http["started_at"], json!(1_761_908_698_120_i64));
+    assert_eq!(expected_http["duration_ms"], json!(412));
+    assert_eq!(expected_http["request_bytes"], json!(412));
+    assert_eq!(expected_http["response_bytes"], json!(2048));
+    assert_eq!(expected_http["is_replay"], json!(true));
+    srv.push_flow_event(&Event::RequestHeaders(http_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["id"], http_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_http,
+        "the HTTP push summary is the flow.get object, field for field"
+    );
+
+    // WebSocket: kind is spelled `websocket` (not the old `ws`), duration is null.
+    let expected_ws = capture_flow_get(&store, ws_id);
+    assert_eq!(expected_ws["kind"], "websocket");
+    assert_eq!(expected_ws["started_at"], json!(1_761_908_698_120_i64));
+    assert_eq!(expected_ws["duration_ms"], JsonValue::Null);
+    assert_eq!(expected_ws["messages"], json!(2));
+    assert_eq!(expected_ws["handshake"], http_id.to_string());
+    srv.push_flow_event(&Event::WsStart(ws_id));
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["params"]["id"], ws_id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"], expected_ws,
+        "the WebSocket push summary is the flow.get object, field for field"
+    );
+
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}
+
+/// Spec AC13: a response the upstream abandoned mid-body is finalised in the
+/// store (`FlowStore::abandon_response`) before the error event about it is
+/// dispatched, so the `killed` push built from the store carries the concrete
+/// `response_bytes`, the status, and a duration instead of nulls.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_on_error_carries_the_abandoned_response_sizes() {
+    let store = Arc::new(MemFlowStore::new());
+    let mut flow = http_flow("example.com:443", "/stream");
+    let Flow::Http(f) = &mut flow else {
+        unreachable!("http_flow builds an HTTP flow")
+    };
+    f.response = Some(HttpResponse {
+        status: 200,
+        version: HttpVersion::Http11,
+        headers: HeaderMap::new(),
+        trailers: HeaderMap::new(),
+        body: Body::Streamed(StreamBody),
+        timestamp: SystemTime::now(),
+    });
+    let id = store.insert(flow);
+
+    let srv = push_server(store.clone(), 1024);
+    let (mut w, mut lines, _sink, task) =
+        open_push_conn(srv.clone(), Frontend::Operator, 64 * 1024, 1024);
+    subscribe_all(&mut w, &mut lines).await;
+
+    assert!(
+        store.abandon_response(id, vec![1, 2, 3]),
+        "a streamed response is finalised"
+    );
+    srv.push_flow_event(&Event::Error {
+        flow: id,
+        kind: FlowError::Upstream("x".into()),
+    });
+
+    let note = next_json(&mut lines).await;
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["event"], "killed", "{note}");
+    assert_eq!(note["params"]["id"], id.to_string(), "{note}");
+    let summary = &note["params"]["summary"];
+    assert_eq!(summary["response_bytes"], json!(3), "{summary}");
+    assert_eq!(summary["status"], json!(200), "{summary}");
+    assert!(
+        summary["duration_ms"].is_i64(),
+        "duration_ms is an integer once the response is abandoned: {summary}"
+    );
+
+    let _ = w.shutdown().await;
+    let _ = task.await;
+}

@@ -11,11 +11,11 @@ use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aitm_core::{
-    AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink, BrowserDriver, Command,
-    CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery, FlowStore, Frontend,
+    AgentPolicy, AgentState, AuditEntry, AuditResult, AuditRing, AuditSink, Body, BrowserDriver,
+    Command, CommandHost, EgressConfinement, Event, Flow, FlowId, FlowQuery, FlowStore, Frontend,
     McpTransport, ProxyClient, Registry, ScopeRateGuard, Sensitivity, SsrfPolicy,
 };
 use serde_json::{json, Map, Value as JsonValue};
@@ -2626,25 +2626,69 @@ fn event_label(ev: &Event) -> &'static str {
     }
 }
 
-/// The `flow.get`-shaped summary a notification carries (full detail stays a
-/// `flow.detail` pull, F5).
+/// The summary a `notifications/aitm/flow` line carries: field for field the
+/// `flow.get` object (`summarize` in `aitm-plugins`' capture module), with the
+/// same null rules (a `Streamed` body is `null`; no response is a `null` status
+/// and `null` `response_bytes`; an in-flight flow has a `null` `duration_ms`).
+/// Full detail stays a `flow.detail` pull (F5).
+///
+/// Kept hand-written because `aitm-mcp` must not depend on `aitm-plugins`. The
+/// two renderings are locked together by
+/// `push_summary_equals_flow_get_for_http_and_websocket_flows` in
+/// `tests/mcp.rs`, which compares a pushed summary with the real `flow.get`
+/// value and fails on any drift on either side.
 fn flow_summary(flow: &Flow) -> JsonValue {
     match flow {
         Flow::Http(f) => json!({
             "id": f.id.to_string(),
             "kind": "http",
+            "intercept": f.intercept.label(),
+            "is_replay": f.metadata.is_replay,
             "method": f.request.method,
+            "scheme": f.request.scheme,
             "authority": f.request.authority,
             "path": f.request.path,
             "status": f.response.as_ref().map(|r| r.status),
+            "request_bytes": body_len(&f.request.body),
+            "response_bytes": f.response.as_ref().and_then(|r| body_len(&r.body)),
+            "started_at": epoch_ms(f.metadata.created),
+            "duration_ms": whole_ms(f.metadata.duration),
         }),
         Flow::WebSocket(f) => json!({
             "id": f.id.to_string(),
-            "kind": "ws",
+            "kind": "websocket",
+            "intercept": f.intercept.label(),
+            "is_replay": f.metadata.is_replay,
             "handshake": f.handshake.to_string(),
             "messages": f.messages.len(),
+            "started_at": epoch_ms(f.metadata.created),
+            "duration_ms": whole_ms(f.metadata.duration),
         }),
     }
+}
+
+/// A buffered body's size in bytes; `None` (serialised `null`) while it is still
+/// streaming from the wire. The `request_bytes`/`response_bytes` rule of `flow.get`.
+fn body_len(body: &Body) -> Option<u64> {
+    match body {
+        Body::Empty => Some(0),
+        Body::Bytes(bytes) => Some(bytes.len() as u64),
+        Body::Streamed(_) => None,
+    }
+}
+
+/// A wall-clock instant as whole milliseconds since the Unix epoch, saturated at
+/// `i64::MAX`; `None` (serialised `null`) if the clock is before the epoch. The
+/// `started_at` rule of `flow.get`.
+fn epoch_ms(t: SystemTime) -> Option<i64> {
+    whole_ms(t.duration_since(UNIX_EPOCH).ok())
+}
+
+/// A duration as whole milliseconds, saturated at `i64::MAX`; `None` (serialised
+/// `null`) while the flow is in flight or its end is unknown. The `duration_ms`
+/// rule of `flow.get`.
+fn whole_ms(d: Option<Duration>) -> Option<i64> {
+    d.map(|d| d.as_millis().min(i64::MAX as u128) as i64)
 }
 
 #[cfg(test)]
