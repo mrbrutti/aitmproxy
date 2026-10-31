@@ -141,8 +141,9 @@ pub fn stream_for(lane: AuditLane, origin: Frontend) -> StreamKind {
     }
 }
 
-/// Schema version carried by every `start` marker (and, from a later task, every
-/// `gap` marker). A reader that sees a higher number than it knows should stop.
+/// Schema version carried by every `start` marker (a `gap` marker has no
+/// `schema` key: it always follows a `start` marker in its file). A reader that
+/// sees a higher number than it knows should stop.
 pub const MARKER_SCHEMA: u32 = 1;
 
 /// Mode a log file is created with, and tightened to when it is found with any
@@ -636,6 +637,79 @@ pub struct ShutdownReport {
     pub estimated_left: usize,
 }
 
+/// What a stream's file does not hold yet: the entries the queue refused and the
+/// entries a failed write lost, with the span of their `at`. The producers add
+/// to it and the stream's thread takes it, so it sits behind a lock that only
+/// ever guards a few integer operations.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct GapState {
+    /// Entries refused by a full queue (or by a stream that is closing or gone).
+    dropped: u64,
+    /// Entries lost to a write error.
+    failed: u64,
+    /// The `at` (epoch milliseconds) of the earliest lost entry.
+    from: Option<i64>,
+    /// The `at` (epoch milliseconds) of the latest lost entry.
+    to: Option<i64>,
+}
+
+impl GapState {
+    /// Stretches the span to cover `at_ms`, whichever side it falls on.
+    fn widen(&mut self, at_ms: i64) {
+        self.from = Some(self.from.map_or(at_ms, |from| from.min(at_ms)));
+        self.to = Some(self.to.map_or(at_ms, |to| to.max(at_ms)));
+    }
+
+    /// An entry refused, whose `at` was `at_ms`.
+    fn note_drop(&mut self, at_ms: i64) {
+        self.dropped = self.dropped.saturating_add(1);
+        self.widen(at_ms);
+    }
+
+    /// An entry lost to a write error, whose `at` was `at_ms`.
+    #[allow(dead_code)] // used from Task W7
+    fn note_fail(&mut self, at_ms: i64) {
+        self.failed = self.failed.saturating_add(1);
+        self.widen(at_ms);
+    }
+
+    /// Adds `other`, a gap that was taken and could not be written, back in.
+    fn merge(&mut self, other: GapState) {
+        self.dropped = self.dropped.saturating_add(other.dropped);
+        self.failed = self.failed.saturating_add(other.failed);
+        if let Some(from) = other.from {
+            self.widen(from);
+        }
+        if let Some(to) = other.to {
+            self.widen(to);
+        }
+    }
+
+    /// The pending gap, leaving none behind; `None` when nothing is pending.
+    fn take(&mut self) -> Option<GapState> {
+        if self.dropped == 0 && self.failed == 0 {
+            return None;
+        }
+        Some(std::mem::take(self))
+    }
+}
+
+/// The `gap` marker line (no newline), written before the next entry that gets
+/// written after a hole: `from` and `to` are the `at` of the first and last lost
+/// entry, `at` is when the marker was written. The keys are in alphabetical
+/// order, as in [`start_marker_line`].
+fn gap_marker_line(now_ms: i64, from: i64, to: i64, dropped: u64, failed: u64) -> String {
+    serde_json::json!({
+        "at": now_ms,
+        "dropped": dropped,
+        "failed": failed,
+        "from": from,
+        "marker": "gap",
+        "to": to,
+    })
+    .to_string()
+}
+
 /// A message to a stream's thread.
 enum Msg {
     /// One entry to write.
@@ -645,11 +719,13 @@ enum Msg {
 }
 
 /// One stream's counters and flags, shared between the producers and the
-/// stream's thread. Atomics only: nothing here is a lock, so a producer never
-/// waits on a thread that is blocked in file I/O.
+/// stream's thread. Atomics, and the one lock of `gap`, which guards a few
+/// integer operations and is never held across I/O: a producer never waits on a
+/// thread that is blocked in file I/O.
 #[derive(Default)]
 struct StreamShared {
-    /// Entries refused: the queue was full, or the thread is gone.
+    /// Entries refused: the queue was full, the stream is closing, or the thread
+    /// is gone.
     dropped: AtomicU64,
     /// Entries the thread could not write.
     write_failures: AtomicU64,
@@ -661,6 +737,35 @@ struct StreamShared {
     dead: AtomicBool,
     /// Entries accepted by `record` and not yet written.
     queued: AtomicUsize,
+    /// A shutdown has begun: `record` refuses every entry from now on, so none
+    /// can be queued behind the `Close` (which would never be written). Set
+    /// before the `Close` is sent and never cleared.
+    closing: AtomicBool,
+    /// `record` calls between announcing themselves and the end of their
+    /// `try_send`. A shutdown that has set `closing` waits for this to reach
+    /// zero before it sends the `Close`: a call that read `closing` as false has
+    /// announced itself first, so the shutdown sees it and its entry is queued
+    /// ahead of the `Close`. Every operation on this and on `closing` that takes
+    /// part in that hand-shake is `SeqCst`.
+    in_flight: AtomicUsize,
+    /// The hole in this stream's file that is not yet written as a `gap` line.
+    gap: Mutex<GapState>,
+}
+
+impl StreamShared {
+    /// The pending gap. A lock that a panicking thread poisoned still holds
+    /// plain integers, so it is used as it is.
+    fn lock_gap(&self) -> MutexGuard<'_, GapState> {
+        self.gap.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Takes back an entry `record` counted as queued but the queue refused:
+    /// it is dropped, and its `at` goes into the pending gap.
+    fn refuse(&self, at_ms: i64) {
+        self.queued.fetch_sub(1, Ordering::Relaxed);
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        self.lock_gap().note_drop(at_ms);
+    }
 }
 
 /// Sets `dead` when a stream's thread ends without a `Close`.
@@ -678,6 +783,39 @@ impl Drop for DeadGuard<'_> {
 struct StreamEnds {
     tx: SyncSender<Msg>,
     shared: Arc<StreamShared>,
+}
+
+impl StreamEnds {
+    /// Queues `entry` unless the stream is closing, its queue is full or its
+    /// thread is gone, and says whether it did. Never blocks and does no I/O.
+    ///
+    /// The cheap check comes first so that a flood arriving after a shutdown
+    /// began does not keep `in_flight` from reaching zero. The second check,
+    /// after announcing the call, is the one that matters: see
+    /// [`StreamShared::in_flight`].
+    fn offer(&self, entry: AuditEntry) -> bool {
+        self.offer_after_check(entry, || {})
+    }
+
+    /// [`offer`](Self::offer) that runs `between` once the entry has passed
+    /// every check and before it is sent: the one point at which a shutdown can
+    /// begin without the entry knowing. A test holds a call there; `offer`
+    /// passes nothing.
+    fn offer_after_check(&self, entry: AuditEntry, between: impl FnOnce()) -> bool {
+        let shared = &self.shared;
+        if shared.closing.load(Ordering::SeqCst) {
+            return false;
+        }
+        shared.in_flight.fetch_add(1, Ordering::SeqCst);
+        let accepted = if shared.closing.load(Ordering::SeqCst) {
+            false
+        } else {
+            between();
+            self.tx.try_send(Msg::Entry(entry)).is_ok()
+        };
+        shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+        accepted
+    }
 }
 
 /// The body of a stream's thread: writes what it is sent, in order, until a
@@ -701,13 +839,38 @@ fn run_stream(rx: Receiver<Msg>, mut spec: StreamSpec, shared: &StreamShared) {
     }
 }
 
-/// Writes one entry as its JSONL line. A failure (or a stream with no file) is
-/// counted, marks the stream degraded and loses this entry; the next write that
-/// succeeds clears `degraded`.
+/// Writes the pending `gap` marker, if any, and then `line`. A marker whose own
+/// write fails goes back into the pending gap, so the hole is still reported by
+/// the next entry that gets written, and the error is returned for the entry
+/// to be counted as failed.
+fn write_with_gap(file: &mut dyn LogFile, line: &str, shared: &StreamShared) -> io::Result<()> {
+    // The guard lives for this statement only: the lock is never held across I/O.
+    let pending = shared.lock_gap().take();
+    if let Some(gap) = pending {
+        let now_ms = unix_ms(SystemTime::now());
+        let marker = gap_marker_line(
+            now_ms,
+            gap.from.unwrap_or(now_ms),
+            gap.to.unwrap_or(now_ms),
+            gap.dropped,
+            gap.failed,
+        );
+        if let Err(error) = file.append_line(&marker) {
+            shared.lock_gap().merge(gap);
+            return Err(error);
+        }
+    }
+    file.append_line(line)
+}
+
+/// Writes one entry as its JSONL line, behind the pending `gap` marker if there
+/// is one. A failure (or a stream with no file) is counted, marks the stream
+/// degraded and loses this entry; the next write that succeeds clears
+/// `degraded`.
 fn write_entry(spec: &mut StreamSpec, entry: &AuditEntry, shared: &StreamShared) {
     let line = aitm_ca::audit::entry_to_jsonl(entry);
     let written = match spec.file.as_mut() {
-        Some(file) => file.append_line(&line),
+        Some(file) => write_with_gap(&mut **file, &line, shared),
         None => Err(io::Error::new(
             io::ErrorKind::NotFound,
             "the stream has no open file",
@@ -801,12 +964,13 @@ impl AuditLogWriter {
         })
     }
 
-    /// Flushes and stops the writer within `budget`: sends each stream a `Close`
-    /// (retrying while its queue is full), then waits for the threads. Each
-    /// thread writes everything queued before its `Close`, syncs its file and
-    /// exits. A thread still running when the budget ends (a write that is
-    /// stuck) is left behind and the report says so; the caller exits
-    /// regardless. A second call finds nothing to wait for and reports complete.
+    /// Flushes and stops the writer within `budget`: stops `record` taking
+    /// entries, sends each stream a `Close` (retrying while its queue is full),
+    /// then waits for the threads. Each thread writes everything queued before
+    /// its `Close`, syncs its file and exits. A thread still running when the
+    /// budget ends (a write that is stuck) is left running and the report says
+    /// so; the caller exits regardless. A later call waits for the threads
+    /// still left and reports on them; once none is left it reports complete.
     pub fn shutdown(&self, budget: Duration) -> ShutdownReport {
         let handles = std::mem::take(&mut *self.lock_threads());
         if handles.is_empty() {
@@ -816,6 +980,22 @@ impl AuditLogWriter {
             };
         }
         let deadline = Deadline::after(budget);
+        // From here `record` refuses every entry, so none is queued behind the
+        // `Close` below, where no thread would ever write it.
+        for stream in &self.streams {
+            stream.shared.closing.store(true, Ordering::SeqCst);
+        }
+        // A `record` that read `closing` as false is mid-call. It never blocks,
+        // so this wait is over in moments (the budget bounds it regardless);
+        // its entry is then queued ahead of the `Close` and gets written.
+        while self
+            .streams
+            .iter()
+            .any(|stream| stream.shared.in_flight.load(Ordering::SeqCst) != 0)
+            && !deadline.passed()
+        {
+            thread::sleep(POLL);
+        }
         for stream in &self.streams {
             // Never a blocking `send`: a full queue behind a stuck write must not
             // hold the caller past the budget. A gone receiver means the thread
@@ -830,16 +1010,21 @@ impl AuditLogWriter {
         while !handles.iter().all(JoinHandle::is_finished) && !deadline.passed() {
             thread::sleep(POLL);
         }
-        let mut complete = true;
+        let mut unfinished = Vec::new();
         for handle in handles {
             if handle.is_finished() {
                 // A thread that panicked has nothing more to say here; its
                 // stream already reads as dead.
                 let _ = handle.join();
             } else {
-                // Dropping the handle detaches the thread.
-                complete = false;
+                unfinished.push(handle);
             }
+        }
+        let complete = unfinished.is_empty();
+        if !complete {
+            // Kept, so that a later shutdown still finds the thread that is
+            // stuck instead of reporting it away.
+            self.lock_threads().extend(unfinished);
         }
         let estimated_left = if complete {
             0
@@ -870,14 +1055,18 @@ impl fmt::Debug for AuditLogWriter {
 
 impl DurableAudit for AuditLogWriter {
     /// Hands `entry` to its stream's queue. Never blocks, never panics and
-    /// does no file I/O: a full queue, or a stream whose thread has ended, counts
-    /// the entry as dropped instead.
+    /// does no file I/O: a full queue (the newest entry, this one, is the one
+    /// refused), a shutdown that has begun, or a stream whose thread has ended
+    /// counts the entry as dropped instead, and notes its `at` in the stream's
+    /// pending gap.
     fn record(&self, lane: AuditLane, entry: AuditEntry) {
         let stream = &self.streams[stream_for(lane, entry.origin).index()];
+        let at_ms = entry.at_millis();
+        // Counted before it is sent: the thread may write the entry and take it
+        // off again before this call gets any further.
         stream.shared.queued.fetch_add(1, Ordering::Relaxed);
-        if stream.tx.try_send(Msg::Entry(entry)).is_err() {
-            stream.shared.queued.fetch_sub(1, Ordering::Relaxed);
-            stream.shared.dropped.fetch_add(1, Ordering::Relaxed);
+        if !stream.offer(entry) {
+            stream.shared.refuse(at_ms);
         }
     }
 
@@ -2250,5 +2439,665 @@ mod tests {
         let report = writer.shutdown(FLUSH_BUDGET);
         assert!(report.complete, "a dead thread is finished: {report:?}");
         assert_eq!(states[0].lines().len(), 1, "the control stream still wrote");
+    }
+
+    // ---- drop-newest and gap markers (Task W6) -------------------------
+
+    /// The clock the gap tests build their entries' `at` from, so a marker's
+    /// `from` and `to` can be asserted exactly.
+    const BASE_MS: u64 = 1_700_000_000_000;
+
+    /// Lets a gated fake's blocked write go when dropped, so a test that fails an
+    /// assertion does not leave its stream thread stuck behind the gate.
+    struct ReleaseOnDrop(Arc<FakeState>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    /// The agent-origin entry `a<i>`, whose `at` is `BASE_MS + i`.
+    fn agent_entry(i: u64) -> AuditEntry {
+        entry(&format!("a{i}"), Frontend::Mcp, BASE_MS + i)
+    }
+
+    /// `tuning` with the agent stream's queue holding `queue` entries.
+    fn agent_queue(queue: usize) -> Tuning {
+        Tuning {
+            queue: [4, queue, 4],
+            ..Tuning::production()
+        }
+    }
+
+    /// A fake writer whose agent stream blocks inside its first write, with `a0`
+    /// already in that write: the queue is empty and the stream is stuck until
+    /// the returned guard (or the test) lets it go.
+    fn stuck_agent_writer(
+        tuning: Tuning,
+    ) -> ([Arc<FakeState>; 3], Arc<AuditLogWriter>, ReleaseOnDrop) {
+        let states = [FakeState::plain(), FakeState::gated(), FakeState::plain()];
+        let release = ReleaseOnDrop(states[1].clone());
+        let writer = fake_writer(&states, tuning);
+        writer.record(AuditLane::Evidence, agent_entry(0));
+        assert!(
+            wait_until(Duration::from_secs(2), || states[1].inside()),
+            "the agent writer never reached its write"
+        );
+        (states, writer, release)
+    }
+
+    /// Every line a fake file holds, parsed; panics on a line that is not JSON.
+    fn fake_json(state: &FakeState) -> Vec<Value> {
+        state
+            .lines()
+            .iter()
+            .map(|line| {
+                serde_json::from_str(line)
+                    .unwrap_or_else(|e| panic!("a fake line is not JSON ({e}): {line:?}"))
+            })
+            .collect()
+    }
+
+    /// A fake file's lines, one word each: the entry's command, or `gap` for a
+    /// gap marker (`start` and any other marker read as its own name).
+    fn fake_shape(state: &FakeState) -> Vec<String> {
+        fake_json(state)
+            .iter()
+            .map(|line| {
+                let command = line.get("command").and_then(Value::as_str);
+                let marker = line.get("marker").and_then(Value::as_str);
+                command.or(marker).unwrap_or("?").to_string()
+            })
+            .collect()
+    }
+
+    /// The gap markers a fake file holds.
+    fn fake_gaps(state: &FakeState) -> Vec<Value> {
+        fake_json(state)
+            .into_iter()
+            .filter(|line| line["marker"] == "gap")
+            .collect()
+    }
+
+    /// How many entries (not markers) a fake file holds.
+    fn fake_entry_count(state: &FakeState) -> usize {
+        fake_shape(state)
+            .iter()
+            .filter(|word| *word != "gap" && *word != "start")
+            .count()
+    }
+
+    /// `prefix0` to `prefix{n - 1}`.
+    fn names(prefix: &str, n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{prefix}{i}")).collect()
+    }
+
+    /// AC18: a stalled disk never blocks the call path. The agent stream's first
+    /// write does not return; its queue fills, every later entry is refused at
+    /// once and counted, and when the disk answers the file holds the accepted
+    /// prefix and one gap marker that says what is missing.
+    #[test]
+    fn a_stalled_disk_never_blocks_the_call_path() {
+        let (states, writer, _release) = stuck_agent_writer(agent_queue(4096));
+        let ring = Arc::new(AuditRing::new(8192));
+        assert!(
+            ring.attach_durable(writer.clone()),
+            "a fresh ring takes its first sink"
+        );
+
+        let flood = ring.clone();
+        within(
+            Duration::from_secs(2),
+            "5095 appends behind a stalled disk",
+            move || {
+                for i in 1..=5095 {
+                    flood.append_in(AuditLane::Evidence, agent_entry(i));
+                }
+            },
+        );
+        let status = ring.durable_status().expect("a sink is attached");
+        assert_eq!(status.dropped, 999, "queue of 4096 behind one stuck write");
+
+        states[1].release();
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let shape = fake_shape(&states[1]);
+        let entries: Vec<&String> = shape.iter().filter(|word| *word != "gap").collect();
+        let want = names("a", 4097);
+        assert_eq!(entries.len(), want.len(), "entry lines in the agent file");
+        let first_difference = entries
+            .iter()
+            .zip(&want)
+            .position(|(got, want)| *got != want);
+        assert_eq!(first_difference, None, "first entry out of order");
+
+        let gaps = fake_gaps(&states[1]);
+        assert_eq!(
+            gaps.len(),
+            1,
+            "expected exactly one gap line, found {}",
+            gaps.len()
+        );
+        let gap = &gaps[0];
+        assert_eq!(gap["dropped"], 999);
+        assert_eq!(gap["failed"], 0);
+        assert_eq!(gap["from"], BASE_MS + 4097);
+        assert_eq!(gap["to"], BASE_MS + 5095);
+        assert!(gap["at"].is_i64(), "the marker carries its own time: {gap}");
+    }
+
+    /// AC19: one stream flooded and stuck does not stop another. The agent
+    /// stream is stuck with its queue full while the control and reads streams,
+    /// real files, take everything they are given.
+    #[test]
+    fn a_flooded_stream_cannot_starve_another() {
+        let dir = scratch("starve");
+        let base = dir.join("audit.jsonl");
+        let paths = StreamKind::ALL.map(|kind| stream_path(&base, kind));
+        let agent_state = FakeState::gated();
+        let _release = ReleaseOnDrop(agent_state.clone());
+        let specs = StreamKind::ALL.map(|kind| {
+            let path = stream_path(&base, kind);
+            match kind {
+                StreamKind::Agent => StreamSpec {
+                    path,
+                    backend: Box::new(FakeBackend(agent_state.clone())),
+                    file: Some(Box::new(FakeFile(agent_state.clone()))),
+                },
+                StreamKind::Control | StreamKind::Reads => {
+                    let file = preflight(&path, kind).unwrap_or_else(|e| {
+                        panic!("preflight of the {} stream failed: {e}", kind.label())
+                    });
+                    StreamSpec {
+                        path,
+                        backend: Box::new(FsBackend),
+                        file: Some(Box::new(file)),
+                    }
+                }
+            }
+        });
+        let writer = Arc::new(
+            AuditLogWriter::from_specs(specs, Tuning::production())
+                .unwrap_or_else(|e| panic!("start: {e}")),
+        );
+        let ring = Arc::new(AuditRing::new(8192));
+        assert!(ring.attach_durable(writer.clone()));
+
+        ring.append_in(AuditLane::Evidence, agent_entry(0));
+        assert!(
+            wait_until(Duration::from_secs(2), || agent_state.inside()),
+            "the agent writer never reached its write"
+        );
+        let flood = ring.clone();
+        within(
+            Duration::from_secs(2),
+            "5095 appends behind a stalled disk",
+            move || {
+                for i in 1..=5095 {
+                    flood.append_in(AuditLane::Evidence, agent_entry(i));
+                }
+            },
+        );
+        for i in 0..10 {
+            ring.append_in(
+                AuditLane::Evidence,
+                entry(&format!("c{i}"), Frontend::Operator, BASE_MS + i),
+            );
+            ring.append_in(
+                AuditLane::Routine,
+                entry(&format!("r{i}"), Frontend::Mcp, BASE_MS + i),
+            );
+        }
+
+        // Counted without parsing, so a read that races a write cannot panic.
+        let entries_in = |path: &Path| {
+            fs::read_to_string(path)
+                .map(|text| text.lines().filter(|l| l.contains("\"command\"")).count())
+                .unwrap_or(0)
+        };
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                entries_in(&paths[0]) == 10 && entries_in(&paths[2]) == 10
+            }),
+            "control holds {} entries and reads {}, expected 10 each",
+            entries_in(&paths[0]),
+            entries_in(&paths[2])
+        );
+        assert!(
+            agent_state.lines().is_empty(),
+            "the agent stream was meant to still be stuck"
+        );
+        let status = ring.durable_status().expect("a sink is attached");
+        assert_eq!(status.dropped, 999, "only the flooded stream dropped");
+
+        agent_state.release();
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+        assert_eq!(entry_commands(&paths[0]), names("c", 10), "control file");
+        assert_eq!(entry_commands(&paths[2]), names("r", 10), "reads file");
+    }
+
+    /// The marker is one JSON object with exactly these keys, in alphabetical
+    /// order, and no newline.
+    #[test]
+    fn gap_marker_line_has_exactly_the_documented_keys() {
+        let line = gap_marker_line(
+            1_700_000_000_999,
+            1_700_000_000_100,
+            1_700_000_000_200,
+            3,
+            2,
+        );
+        let parsed: Value = serde_json::from_str(&line).expect("a gap line is JSON");
+        let mut keys: Vec<&str> = parsed
+            .as_object()
+            .expect("a gap line is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["at", "dropped", "failed", "from", "marker", "to"]);
+        assert_eq!(parsed["marker"], "gap");
+        assert_eq!(
+            line,
+            "{\"at\":1700000000999,\"dropped\":3,\"failed\":2,\"from\":1700000000100,\"marker\":\"gap\",\"to\":1700000000200}"
+        );
+        assert!(!line.contains('\n'), "a marker is one line");
+    }
+
+    /// Notes widen `from` and `to` whatever order they arrive in; `take` hands
+    /// back what is pending and leaves nothing behind.
+    #[test]
+    fn gap_state_merges_and_resets() {
+        let mut gap = GapState::default();
+        assert_eq!(gap.take(), None, "nothing is pending yet");
+
+        gap.note_drop(10);
+        gap.note_drop(30);
+        gap.note_fail(20);
+        assert_eq!(
+            gap.take(),
+            Some(GapState {
+                dropped: 2,
+                failed: 1,
+                from: Some(10),
+                to: Some(30)
+            })
+        );
+        assert_eq!(gap.take(), None, "a second take finds nothing");
+
+        // Out of order: the span still runs from the earliest to the latest.
+        gap.note_drop(30);
+        gap.note_fail(10);
+        gap.note_drop(20);
+        assert_eq!(
+            gap.take(),
+            Some(GapState {
+                dropped: 2,
+                failed: 1,
+                from: Some(10),
+                to: Some(30)
+            })
+        );
+    }
+
+    /// Putting a gap back adds its counts and widens the span, whatever was
+    /// noted meanwhile; putting back nothing changes nothing.
+    #[test]
+    fn gap_state_merge_adds_counts_and_widens() {
+        let mut gap = GapState::default();
+        gap.note_drop(20);
+        gap.note_drop(30);
+        let earlier = GapState {
+            dropped: 0,
+            failed: 2,
+            from: Some(10),
+            to: Some(25),
+        };
+        gap.merge(earlier);
+        let want = GapState {
+            dropped: 2,
+            failed: 2,
+            from: Some(10),
+            to: Some(30),
+        };
+        assert_eq!(gap, want);
+
+        gap.merge(GapState::default());
+        assert_eq!(gap, want, "merging nothing changes nothing");
+
+        let mut empty = GapState::default();
+        empty.merge(want.clone());
+        assert_eq!(empty, want, "merging into nothing gives the other");
+    }
+
+    /// A full queue refuses the newest entry: what was accepted stays, in order,
+    /// and the gap marker names the refused ones. (Where the marker sits is
+    /// pinned by the idle-hole test above: here the hole is noted while a write
+    /// is in progress, which reads the same either way.)
+    #[test]
+    fn a_full_queue_refuses_the_newest_entry_and_keeps_the_accepted_prefix() {
+        let (states, writer, _release) = stuck_agent_writer(agent_queue(3));
+        for i in 1..=5 {
+            writer.record(AuditLane::Evidence, agent_entry(i));
+        }
+        // a1 to a3 fill the queue; a4 and a5 are the newest, and are refused.
+        assert_eq!(writer.status().dropped, 2);
+
+        states[1].release();
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(fake_shape(&states[1]), ["a0", "gap", "a1", "a2", "a3"]);
+        let gaps = fake_gaps(&states[1]);
+        assert_eq!(gaps[0]["dropped"], 2);
+        assert_eq!(gaps[0]["failed"], 0);
+        assert_eq!(gaps[0]["from"], BASE_MS + 4, "the first refused entry");
+        assert_eq!(gaps[0]["to"], BASE_MS + 5, "the last refused entry");
+    }
+
+    /// A hole noted while the stream is idle is written before the next entry
+    /// that gets written, not after it (spec Design 6: "before the next
+    /// successful entry"). A full queue means a busy thread, so the hole is
+    /// noted by hand: the producers' own path into the pending gap.
+    #[test]
+    fn a_hole_noted_while_the_stream_is_idle_is_written_before_the_next_entry() {
+        let states = FakeState::three();
+        let writer = fake_writer(&states, Tuning::production());
+        let agent = &writer.streams[StreamKind::Agent.index()];
+        agent.shared.lock_gap().note_drop((BASE_MS + 7) as i64);
+        agent.shared.lock_gap().note_drop((BASE_MS + 9) as i64);
+
+        writer.record(AuditLane::Evidence, agent_entry(10));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        assert_eq!(fake_shape(&states[1]), ["gap", "a10"]);
+        let gap = &fake_gaps(&states[1])[0];
+        assert_eq!(gap["dropped"], 2);
+        assert_eq!(gap["from"], BASE_MS + 7);
+        assert_eq!(gap["to"], BASE_MS + 9);
+    }
+
+    /// `record` returns at once on a full queue, however many entries it is
+    /// given: it never waits for room.
+    #[test]
+    fn record_returns_at_once_on_a_full_queue() {
+        let (_states, writer, _release) = stuck_agent_writer(agent_queue(1));
+        writer.record(AuditLane::Evidence, agent_entry(1));
+
+        let flood = writer.clone();
+        within(
+            Duration::from_secs(1),
+            "fifty records into a full queue",
+            move || {
+                for i in 2..52 {
+                    flood.record(AuditLane::Evidence, agent_entry(i));
+                }
+            },
+        );
+        assert_eq!(writer.status().dropped, 50);
+    }
+
+    /// An entry refused for a full queue leaves the estimate of entries left:
+    /// only what was accepted and is not yet written counts.
+    #[test]
+    fn a_refused_entry_is_not_left_in_the_estimate() {
+        let (_states, writer, _release) = stuck_agent_writer(agent_queue(3));
+        for i in 1..=5 {
+            writer.record(AuditLane::Evidence, agent_entry(i));
+        }
+        let report = writer.shutdown(Duration::from_millis(100));
+        // The stuck a0 and the three queued entries, not the two refused ones.
+        assert_eq!(
+            report,
+            ShutdownReport {
+                complete: false,
+                estimated_left: 4
+            }
+        );
+    }
+
+    /// `Tuning.queue` sizes each stream's queue: with every stream stuck, each
+    /// takes its own number of entries and refuses the rest.
+    #[test]
+    fn tuning_queue_sizes_each_streams_queue() {
+        let states = [FakeState::gated(), FakeState::gated(), FakeState::gated()];
+        let _releases: Vec<ReleaseOnDrop> = states
+            .iter()
+            .map(|state| ReleaseOnDrop(state.clone()))
+            .collect();
+        let tuning = Tuning {
+            queue: [2, 3, 4],
+            ..Tuning::production()
+        };
+        let writer = fake_writer(&states, tuning);
+        let rows = [
+            (AuditLane::Evidence, Frontend::Operator, "c"),
+            (AuditLane::Evidence, Frontend::Mcp, "a"),
+            (AuditLane::Routine, Frontend::Mcp, "r"),
+        ];
+        for (lane, origin, name) in rows {
+            writer.record(lane, entry(&format!("{name}0"), origin, BASE_MS));
+        }
+        assert!(
+            wait_until(Duration::from_secs(2), || states
+                .iter()
+                .all(|state| state.inside())),
+            "a writer never reached its write"
+        );
+        for (lane, origin, name) in rows {
+            for i in 1..=10 {
+                writer.record(lane, entry(&format!("{name}{i}"), origin, BASE_MS + i));
+            }
+        }
+        assert_eq!(writer.status().dropped, (10 - 2) + (10 - 3) + (10 - 4));
+
+        for state in &states {
+            state.release();
+        }
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+        let written: Vec<usize> = states.iter().map(|state| fake_entry_count(state)).collect();
+        // The entry in the stuck write plus a full queue, per stream.
+        assert_eq!(written, [1 + 2, 1 + 3, 1 + 4]);
+    }
+
+    /// The marker for a hole is not lost when its own write fails: it stays
+    /// pending, and the next entry that is written is preceded by it. The entry
+    /// whose turn the failed write was is a failed write, not a dropped one.
+    #[test]
+    fn a_gap_line_that_fails_to_write_is_kept_for_the_next_entry() {
+        // No wait between a failed write and the next attempt: this test is
+        // about what happens to the marker, not about timing.
+        let tuning = Tuning {
+            reopen: Duration::ZERO,
+            ..agent_queue(1)
+        };
+        let (states, writer, _release) = stuck_agent_writer(tuning);
+        writer.record(AuditLane::Evidence, agent_entry(1));
+        writer.record(AuditLane::Evidence, agent_entry(2));
+        // a1 is queued and a2 refused: a gap is pending.
+        assert_eq!(writer.status().dropped, 1);
+
+        // a0 is already past the failure check, so this fails the next write,
+        // which is the gap line in front of a1.
+        states[1].fail_next.store(1, Ordering::SeqCst);
+        states[1].release();
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                writer.status().write_failures == 1
+            }),
+            "the failed gap write was not counted: {:?}",
+            writer.status()
+        );
+
+        writer.record(AuditLane::Evidence, agent_entry(3));
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert!(report.complete, "the flush did not finish: {report:?}");
+        assert_eq!(fake_shape(&states[1]), ["a0", "gap", "a3"]);
+        assert_eq!(fake_gaps(&states[1])[0]["dropped"], 1);
+        let status = writer.status();
+        assert_eq!(status.dropped, 1);
+        assert_eq!(status.write_failures, 1);
+    }
+
+    /// Spec Design 7: a record after shutdown began is counted as dropped. The
+    /// writer here is stuck in a write, so after the first shutdown gives up its
+    /// `Close` is still queued and the thread still alive: an entry accepted now
+    /// would sit behind the `Close` and never be written, nor counted.
+    #[test]
+    fn a_record_after_shutdown_began_is_dropped_not_stranded_behind_close() {
+        let (states, writer, _release) = stuck_agent_writer(agent_queue(8));
+        let first = writer.shutdown(Duration::from_millis(100));
+        assert!(!first.complete, "the stuck writer cannot have finished");
+
+        writer.record(AuditLane::Evidence, agent_entry(1));
+        assert_eq!(
+            writer.status().dropped,
+            1,
+            "an entry sent after shutdown began is counted as dropped"
+        );
+
+        states[1].release();
+        let report = writer.shutdown(FLUSH_BUDGET);
+        assert_eq!(
+            report,
+            ShutdownReport {
+                complete: true,
+                estimated_left: 0
+            }
+        );
+        assert_eq!(
+            fake_shape(&states[1]),
+            ["a0"],
+            "the refused entry is not on disk"
+        );
+        assert_eq!(writer.status().dropped, 1);
+    }
+
+    /// A `record` that has passed its checks when a shutdown begins is still on
+    /// its way to `try_send`; its entry must land ahead of the `Close`, where it
+    /// is written, not behind it, where it never is. The test holds a real call
+    /// at exactly that point until the shutdown has started. The writer is stuck
+    /// in a write, so a `Close` queued first would sit in front of the entry for
+    /// good.
+    #[test]
+    fn a_record_caught_by_a_shutdown_mid_call_is_written_not_stranded() {
+        let (states, writer, _release) = stuck_agent_writer(agent_queue(8));
+        let agent = &writer.streams[StreamKind::Agent.index()];
+
+        let mut closer = None;
+        agent.shared.queued.fetch_add(1, Ordering::Relaxed);
+        let accepted = agent.offer_after_check(agent_entry(1), || {
+            let writer = writer.clone();
+            closer = Some(std::thread::spawn(move || writer.shutdown(FLUSH_BUDGET)));
+            assert!(
+                wait_until(Duration::from_secs(2), || {
+                    agent.shared.closing.load(Ordering::SeqCst)
+                }),
+                "the shutdown never began"
+            );
+        });
+        assert!(accepted, "the record was refused after passing its checks");
+
+        states[1].release();
+        let report = closer
+            .expect("the shutdown was started")
+            .join()
+            .expect("the shutdown thread panicked");
+        assert_eq!(
+            report,
+            ShutdownReport {
+                complete: true,
+                estimated_left: 0
+            }
+        );
+        assert_eq!(
+            fake_shape(&states[1]),
+            ["a0", "a1"],
+            "the entry the shutdown caught mid-call is written"
+        );
+    }
+
+    /// Four threads record without pause while a shutdown runs: every record is
+    /// either on disk or counted as dropped, exactly. Nothing is accepted into
+    /// a queue that will not be read, and a flood does not keep the `Close` out.
+    #[test]
+    fn every_record_around_a_shutdown_is_written_or_counted() {
+        let states = FakeState::three();
+        let writer = fake_writer(&states, agent_queue(64));
+        let stop = Arc::new(AtomicBool::new(false));
+        let producers: Vec<JoinHandle<u64>> = (0..4)
+            .map(|_| {
+                let writer = writer.clone();
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut issued = 0_u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        writer.record(AuditLane::Evidence, agent_entry(issued));
+                        issued += 1;
+                    }
+                    issued
+                })
+            })
+            .collect();
+        let started = wait_until(Duration::from_secs(5), || {
+            fake_entry_count(&states[1]) >= 200
+        });
+
+        let report = writer.shutdown(FLUSH_BUDGET);
+        stop.store(true, Ordering::Relaxed);
+        let issued: u64 = producers
+            .into_iter()
+            .map(|producer| producer.join().expect("a producer panicked"))
+            .sum();
+        assert!(started, "the producers never got going");
+        assert!(report.complete, "the flush did not finish: {report:?}");
+
+        let written = fake_entry_count(&states[1]) as u64;
+        assert_eq!(
+            written + writer.status().dropped,
+            issued,
+            "records neither written nor counted"
+        );
+    }
+
+    /// A second shutdown of a writer that is still stuck is as incomplete as
+    /// the first; once the writer is let go a later one completes.
+    #[test]
+    fn a_second_shutdown_of_a_stuck_writer_is_still_incomplete() {
+        let (states, writer, _release) = stuck_agent_writer(agent_queue(8));
+        let first = writer.shutdown(Duration::from_millis(100));
+        assert_eq!(
+            first,
+            ShutdownReport {
+                complete: false,
+                estimated_left: 1
+            }
+        );
+
+        let second = writer.shutdown(Duration::from_millis(100));
+        assert_eq!(
+            second,
+            ShutdownReport {
+                complete: false,
+                estimated_left: 1
+            },
+            "the stuck thread is still there"
+        );
+
+        states[1].release();
+        let third = writer.shutdown(FLUSH_BUDGET);
+        assert_eq!(
+            third,
+            ShutdownReport {
+                complete: true,
+                estimated_left: 0
+            }
+        );
+        assert_eq!(fake_shape(&states[1]), ["a0"]);
     }
 }
