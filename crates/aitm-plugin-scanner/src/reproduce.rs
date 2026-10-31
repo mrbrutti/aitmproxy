@@ -2266,4 +2266,98 @@ mod tests {
             "http://t/x?authority=[redacted]&author=[redacted]&side=[redacted]"
         );
     }
+
+    /// A standard-secret pair nested under a wide-only key is masked wherever a
+    /// PoC carries free text: a JSON string leaf (the line break is a real one once
+    /// the JSON is parsed), a form value (`%0A`), an untyped body and a header
+    /// value. No canary survives in the serialized PoC, and each text is exactly
+    /// what the wide scrub makes of it.
+    #[test]
+    fn build_poc_masks_a_nested_standard_pair_under_a_wide_only_key() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let build = |headers: &[(&str, &str)], body: Option<&str>| {
+            let flow = flow_with("POST", "/search?q=hello", headers, body);
+            let q = point(&flow, Location::Query, "q", "hello");
+            build_poc(&flow, &def, &q, payload).expect("poc builds")
+        };
+
+        // JSON string leaves, one of them inside an array.
+        let poc = build(
+            &[("Content-Type", "application/json")],
+            Some(
+                r#"{"note":"authentication:\n  password: JSONPW1","memo":"sidebar=sid=\"JSONSID2\"","list":["author:\n  token: JSONTOK3"]}"#,
+            ),
+        );
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        for canary in ["JSONPW1", "JSONSID2", "JSONTOK3"] {
+            assert!(
+                !serialized.contains(canary),
+                "leaked `{canary}`: {serialized}"
+            );
+        }
+        let body: serde_json::Value =
+            serde_json::from_str(http_step(&poc).body.as_deref().expect("a json body"))
+                .expect("valid json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "note": "authentication:\n  password: [redacted]",
+                "memo": "sidebar=[redacted]\"[redacted]\"",
+                "list": ["author:\n  token: [redacted]"],
+            })
+        );
+
+        // Form values, percent-encoded: `%0A` is a line break, `+` a space.
+        let poc = build(
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            Some(
+                "note=authentication%3A%0A++password%3A+FORMPW4\
+                 &memo=sidebar%3Dsid%3D%22FORMSID5%22&page=2",
+            ),
+        );
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        for canary in ["FORMPW4", "FORMSID5"] {
+            assert!(
+                !serialized.contains(canary),
+                "leaked `{canary}`: {serialized}"
+            );
+        }
+        let body = http_step(&poc).body.clone().expect("a form body");
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("note", "authentication:\n  password: [redacted]"),
+                ("memo", "sidebar=[redacted]\"[redacted]\""),
+                ("page", "2"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+
+        // A body with no content type is scrubbed whole.
+        let poc = build(&[], Some("authentication:\n  password: RAWPW6"));
+        assert_eq!(
+            http_step(&poc).body.as_deref(),
+            Some("authentication:\n  password: [redacted]")
+        );
+
+        // A header value.
+        let poc = build(&[("X-Note", "sidebar=sid=\"HDRSID7\"")], None);
+        assert_eq!(
+            header_of(http_step(&poc), "X-Note"),
+            Some("sidebar=[redacted]\"[redacted]\"")
+        );
+
+        // A JSON body cut short by a dropped connection does not parse, so it is
+        // scrubbed as text, and the credential still goes.
+        let poc = build(
+            &[("Content-Type", "application/json")],
+            Some(r#"{"note":"authentication:\n  password: TRUNCPW8"#),
+        );
+        let body = http_step(&poc).body.clone().expect("a body");
+        assert!(!body.contains("TRUNCPW8"), "a cut JSON body leaked: {body}");
+    }
 }
