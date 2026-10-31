@@ -24,6 +24,9 @@ import Testing
     @Test func theLiveSelfTestDefaultsToTheExternalCore() {
         #expect(SettingsDomain.registration(environment: ["APP_LIVE": "1"]) == ["bus.activeKind": "external"])
         #expect(SettingsDomain.registration(environment: ["APP_STORE": "/tmp/x"]) == [:])
+        #expect(SettingsDomain.registration(environment: ["APP_LIVE": "1", "APP_LIVE_OPERATOR_TOKEN": "op-1"])
+            == ["bus.activeKind": "external", "bus.operatorToken": "op-1"])
+        #expect(SettingsDomain.registration(environment: ["APP_STORE": "/tmp/x", "APP_LIVE_OPERATOR_TOKEN": "op-1"]) == [:])
     }
 
     /// The failure this guards against: Settings ▸ Bus residue in the operator's

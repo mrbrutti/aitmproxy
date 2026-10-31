@@ -17,7 +17,11 @@ import Foundation
 ///
 /// Under `APP_LIVE=1` the live self-test connects to the core at `AITM_CONFIG`, so
 /// `bus.activeKind` is registered as `external` (a default, not a stored value):
-/// the embedded core is never spawned and a stored choice still wins.
+/// the embedded core is never spawned and a stored choice still wins. The run
+/// connects as operator when `APP_LIVE_OPERATOR_TOKEN` carries the core's
+/// `mcp.operator_token` (an agent connection is refused `flow.intercept`, a
+/// sensitive command, under the default `auto` policy); the token comes from the
+/// environment, never from residue.
 public enum SettingsDomain: Equatable, Sendable {
     case standard
     /// `wipe`: remove the suite's stored values before use.
@@ -39,9 +43,16 @@ public enum SettingsDomain: Equatable, Sendable {
         return .standard
     }
 
+    public static let liveOperatorTokenVariable = "APP_LIVE_OPERATOR_TOKEN"
+
     /// Default values registered for the run (overridable by stored values).
     public static func registration(environment env: [String: String]) -> [String: String] {
-        env["APP_LIVE"] == "1" ? [UserDefaultsActiveKindPersistence.key: ActiveCoreKind.external.rawValue] : [:]
+        guard env["APP_LIVE"] == "1" else { return [:] }
+        var values = [UserDefaultsActiveKindPersistence.key: ActiveCoreKind.external.rawValue]
+        if let token = env[liveOperatorTokenVariable], !token.isEmpty {
+            values[BusEndpointSettings.Key.operatorToken] = token
+        }
+        return values
     }
 
     /// The store for this domain, wiped and seeded as the domain says. Returns the
