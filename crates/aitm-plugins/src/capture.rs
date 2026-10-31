@@ -70,7 +70,9 @@ impl Command for FlowList {
 }
 
 /// `flow.get {id}` → a summary object for one flow: kind, request line, status,
-/// body sizes, timing (`started_at`, `duration_ms`) and interception state.
+/// body sizes, timing (`started_at`, `duration_ms`), capture attribution
+/// (`source_app`, `capture_interface`; null for a proxied flow) and interception
+/// state.
 struct FlowGet;
 
 impl Command for FlowGet {
@@ -179,6 +181,20 @@ fn summary_fields() -> Vec<ParamDef> {
              or to the point a failed response was abandoned; null while in flight or \
              unknown.",
         ),
+        field(
+            "source_app",
+            TypeDesc::Str,
+            false,
+            "Signing identifier of the app that opened the connection, as the capture \
+             backend observed it; null for a proxied flow.",
+        ),
+        field(
+            "capture_interface",
+            TypeDesc::Str,
+            false,
+            "Capture backend that delivered the connection (`macos-ne`); null for a \
+             proxied flow.",
+        ),
     ]
 }
 
@@ -198,7 +214,15 @@ fn opt_int(n: Option<i64>) -> Value {
     n.map_or(Value::Null, Value::Int)
 }
 
-/// A transport-neutral summary of a flow: identity, timing, and the per-kind
+/// An optional attribution string as a `Value`: the text a capture backend
+/// recorded (`FlowMeta::source_app`, `FlowMeta::capture_interface`), or `Null`
+/// for a proxied flow. Never a placeholder: a UI must not show a fake app group.
+fn opt_str(v: &Option<String>) -> Value {
+    v.as_ref().map_or(Value::Null, |s| Value::Str(s.clone()))
+}
+
+/// A transport-neutral summary of a flow: identity, timing, capture attribution
+/// (`source_app` / `capture_interface`, null on a proxied flow), and the per-kind
 /// fields (request line, status and body sizes for HTTP; handshake and message
 /// count for WebSocket). `started_at` is `metadata.created` for both kinds, so
 /// `started_at + duration_ms` is the flow's end.
@@ -210,6 +234,11 @@ fn summarize(flow: &Flow) -> Value {
     put("id", Value::Str(flow.id().to_string()));
     put("started_at", opt_int(flow.metadata().started_at_ms()));
     put("duration_ms", opt_int(flow.metadata().duration_ms()));
+    put("source_app", opt_str(&flow.metadata().source_app));
+    put(
+        "capture_interface",
+        opt_str(&flow.metadata().capture_interface),
+    );
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
@@ -325,11 +354,26 @@ fn row_fields() -> Vec<ParamDef> {
             false,
             "Flow duration in whole milliseconds; null if unknown.",
         ),
+        field(
+            "source_app",
+            TypeDesc::Str,
+            false,
+            "Signing identifier of the app that opened the connection, as the capture \
+             backend observed it; null for a proxied flow.",
+        ),
+        field(
+            "capture_interface",
+            TypeDesc::Str,
+            false,
+            "Capture backend that delivered the connection (`macos-ne`); null for a \
+             proxied flow.",
+        ),
     ]
 }
 
-/// A single flows-table row: identity, state, marks, and (HTTP only) the request
-/// line and response status. No headers, no bodies.
+/// A single flows-table row: identity, state, marks, capture attribution
+/// (`source_app` / `capture_interface`, null on a proxied flow), and (HTTP only)
+/// the request line and response status. No headers, no bodies.
 fn flow_row(flow: &Flow) -> Value {
     let mut obj = BTreeMap::new();
     let mut put = |k: &str, v: Value| {
@@ -348,6 +392,11 @@ fn flow_row(flow: &Flow) -> Value {
         ),
     );
     put("duration_ms", opt_int(flow.metadata().duration_ms()));
+    put("source_app", opt_str(&flow.metadata().source_app));
+    put(
+        "capture_interface",
+        opt_str(&flow.metadata().capture_interface),
+    );
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
