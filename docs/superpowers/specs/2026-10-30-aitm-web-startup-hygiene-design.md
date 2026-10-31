@@ -181,10 +181,19 @@ in the directory name (not obscura's pid).
     `msg.error?.code === -32001` as an auth failure → `markAuthFailed(); continue;`.
     (Notifications — `method` set, `id` undefined — are still handled by their
     own earlier branch and are unaffected.)
-  - **Signal B (close):** in `onclose`, when `ev.code === 1008` (Policy),
-    `markAuthFailed()` before the reconnect decision.
+  - **The close code is NOT used to detect auth failure.** (Revised after the
+    stage-6 security review.) The bridge closes with `CloseCode::Policy` (1008) for
+    *both* a bad token *and* an authentication **timeout** (`HANDSHAKE_TIMEOUT`,
+    bridge.rs). Latching on a bare 1008 would wrongly freeze a valid current-run tab
+    whose first send was delayed (e.g. a backgrounded/frozen tab) into a permanent
+    `unauthorized` — the spec's anti-goal. Signal A is sufficient and unambiguous:
+    for a genuine bad token the bridge always sends the `-32001` reply *before* it
+    closes (and the browser dispatches `onmessage` before `onclose`), so `authFailed`
+    is already latched by the time `onclose` runs. A 1008 with no preceding `-32001`
+    is a timeout and reconnects.
   - `scheduleReconnect()` returns early when `authFailed` (as it already does for
-    `closedByUser`), so no further connect happens.
+    `closedByUser`), so no further connect happens; every non-latched close
+    (including a bare 1008 timeout, 1006, 1001) still reconnects.
   - The `onopen` catch guards `if (authFailed) return;` so a rejected pending
     `initialize` does not overwrite the unauthorized `lastError`/state.
   - `connect()` resets `authFailed = false` so an explicit reconnect can retry.
@@ -216,14 +225,18 @@ in the directory name (not obscura's pid).
    (absent when `None`). The token never appears in a tracing sink. *Proven by a
    unit test on `startup_summary` plus the retained `log_listening_never_carries_the_token`
    test.*
-4. **AC4 — stale token fails fast and clear.** On a rejected token (a 1008 close
-   *or* an `id:null` / code `-32001` reply) the client stops reconnecting, sets
-   state `'unauthorized'`, and sets `lastError` to the reopen-the-URL message.
-   *Proven by two `ws.test.ts` cases asserting state, `lastError` contains
-   "reopen", and `FakeWebSocket.count` stays `1`.*
-5. **AC5 — transient blips still recover.** A non-auth close (1006) still
-   schedules a reconnect. *Proven by a `ws.test.ts` case asserting state
-   `'reconnecting'` after a 1006 close.*
+4. **AC4 — stale token fails fast and clear.** On the definitive refusal reply
+   (`id:null` / code `-32001`, which the bridge sends before it closes) the client
+   stops reconnecting, sets state `'unauthorized'`, and sets `lastError` to the
+   reopen-the-URL message — including when the `-32001` reply is followed by the
+   1008 close (the real bad-token sequence). *Proven by `ws.test.ts` cases
+   (`a_minus32001_reply_stops_reconnecting`, `a_bad_token_reply_then_1008_stays_unauthorized`)
+   asserting state, `lastError` contains "reopen", and `FakeWebSocket.count` stays `1`.*
+5. **AC5 — transient blips still recover.** A non-auth close still schedules a
+   reconnect — both an abnormal 1006 close *and* a bare 1008 (Policy) close with no
+   preceding `-32001` reply (an auth timeout, not a bad token). *Proven by
+   `ws.test.ts` cases `a_1006_close_still_reconnects` and `a_bare_1008_close_reconnects`
+   asserting state `'reconnecting'`.*
 6. **AC6 — server warn is rate-limited.** The bad-token refusal logs at most once
    per `BAD_TOKEN_WINDOW` with an accumulated count; the refusal reply and close
    are unchanged. *Proven by a unit test on `BadTokenThrottle::record` returning

@@ -150,23 +150,30 @@ Terminal panel, after merge-readiness.
     and `markAuthFailed()` (sets `authFailed`, state `'unauthorized'`, `lastError`
     to the message, `failAllPending`, `settleReady`). In `onMessage`, add a branch
     before the numeric-id branch: `(msg.id === null || msg.id === undefined) &&
-    msg.error?.code === -32001 → markAuthFailed(); continue;`. In `onclose`, call
-    `markAuthFailed()` when `ev.code === 1008`. Guard `scheduleReconnect()` with
-    `if (closedByUser || authFailed) return;`. Guard the `onopen` catch with
-    `if (authFailed) return;`. Reset `authFailed = false` in `connect()`.
+    msg.error?.code === -32001 → markAuthFailed(); continue;`. Do NOT key auth
+    failure on the close code (revised after stage-6 security review: 1008 is also
+    the auth-*timeout* code, so a bare 1008 must reconnect, not latch; the `-32001`
+    reply always precedes the close for a real bad token). Guard
+    `scheduleReconnect()` with `if (closedByUser || authFailed) return;`. Guard the
+    `onopen` catch with `if (authFailed) return;`. Reset `authFailed = false` in
+    `connect()`.
   - `StatusBar.tsx`: `busHue()` maps `'unauthorized'` → `'server-error'`; show a
     short `bus token expired` label when `state() === 'unauthorized'` (full
     message stays in the existing `title` tooltip from `lastError`).
 - **Test:** add to `ws.test.ts` a `describe('createWsBus auth failure')` block:
-  1. `a_1008_close_stops_reconnecting`: connect, `sock.onopen?.()`, then
-     `sock.onclose?.({ code: 1008 })`; assert `client.state() === 'unauthorized'`,
-     `client.lastError()` contains `"reopen"`, and after a short sleep
-     `FakeWebSocket.count === 1`.
-  2. `a_minus32001_reply_stops_reconnecting`: connect, `sock.onopen?.()`, deliver
+  1. `a_bad_token_reply_then_1008_stays_unauthorized`: connect, `sock.onopen?.()`,
+     deliver the `-32001` reply via `sock.onmessage`, THEN `sock.onclose?.({ code: 1008 })`
+     (the real bad-token sequence); assert state `'unauthorized'`, `lastError`
+     contains `"reopen"`, and `FakeWebSocket.count === 1` after a short sleep.
+  2. `a_bare_1008_close_reconnects`: connect, `sock.onopen?.()`,
+     `sock.onclose?.({ code: 1008 })` with NO preceding `-32001` (an auth timeout);
+     assert `client.state() === 'reconnecting'` and not `'unauthorized'` (the
+     security-finding regression guard).
+  3. `a_minus32001_reply_stops_reconnecting`: connect, `sock.onopen?.()`, deliver
      `{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"unauthorized"}}`
      via `sock.onmessage`; assert state `'unauthorized'` and
      `FakeWebSocket.count === 1` after a short sleep.
-  3. `a_1006_close_still_reconnects`: connect, `sock.onopen?.()`,
+  4. `a_1006_close_still_reconnects`: connect, `sock.onopen?.()`,
      `sock.onclose?.({ code: 1006 })`; assert `client.state() === 'reconnecting'`
      (regression guard — a non-auth close must not be treated as auth failure).
 - **Done when:** the three new cases pass, the existing `ws.test.ts` cases stay
@@ -174,10 +181,20 @@ Terminal panel, after merge-readiness.
 
 ## Review log
 
-Kept by the main session during stage 6. One row per finding.
+Kept by the main session during stage 6. Panel ran in parallel on `9fb8cfa..26eeaa2`.
+Spec review: PASS (no findings). Quality: PASS (4 Minor). Security: FAIL (1 Important, 2 Minor).
+All fixed in `6523b0f`; re-gate + focused security re-review green.
 
-| Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
+| Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 4 | Security | Important | Client latched a valid tab into permanent `unauthorized` on any 1008 close, but 1008 is also the auth-*timeout* code | Fixed in 6523b0f: removed the 1008 (Signal B) latch; rely only on the `-32001` reply (Signal A), which precedes the close for a real bad token; a bare 1008 reconnects. Tests reworked. |
+| 1 | Security | Minor | Reap gated on `Path::is_dir()` (follows symlinks) while removal is name-based | Fixed in 6523b0f: gate on `entry.file_type()` (no symlink follow). |
+| 1 | Security | Minor | `pid as i32` could wrap negative → `kill` targets a process group | Fixed in 6523b0f: reject pid `0` and `> i32::MAX` before probing. |
+| 1 | Quality | Minor | Reap count was "attempted", not confirmed removals | Fixed in 6523b0f: count only after re-checking the dir is gone. |
+| 2 | Quality | Minor | `startup_summary` built with `push_str(&format!())` | Fixed in 6523b0f: `writeln!` into the `String`. |
+| 4 | Quality | Minor | 1008 onclose rejected in-flight calls with a generic message | Resolved by the Important fix: `-32001`/`markAuthFailed` now fails pending with the reopen message before `onclose`. |
+| 2 | Quality | Minor | `startup_summary`'s `bus` param is always `"ready"` today | Accepted (orchestrator): keeps the formatter pure/unit-testable; not load-bearing. |
+| — | Security | Note | Run `cargo audit` for the newly-direct `nix` dep before merge | Orchestrator to run in the Terminal panel. |
 
 ## Shipped
 
