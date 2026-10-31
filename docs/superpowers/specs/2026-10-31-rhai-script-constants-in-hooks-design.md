@@ -88,7 +88,7 @@ Never `Full` (anti-goal). This is determinism only; D2 does not depend on
 the optimizer.
 
 **D2. A variable resolver answers a script's literal constants inside its
-functions.** `engine::ScriptConstants::of(&ast)` reads the top-level
+functions.** The engine module reads a script's top-level
 literal constants (`ast.iter_literal_variables(true, false)`: `const`s whose
 value is a string, number, bool, char, unit, or an array/map of literals)
 into a table. `engine::enter_constants(&ast)` installs that table in a

@@ -60,17 +60,19 @@ three-reviewer panel.
   `crates/aitm-plugin-rhai/tests/loader.rs` (modify)
 - **Change:**
   - `build_engine`: `engine.set_optimization_level(OptimizationLevel::Simple)`.
-  - `engine.rs`: `pub struct ScriptConstants(BTreeMap<String, Dynamic>)`
-    with `pub fn of(ast: &AST) -> Self` (from
+  - `engine.rs`: private `struct ScriptConstants(BTreeMap<String, Dynamic>)`
+    with `fn of(ast: &AST) -> Self` (from
     `ast.iter_literal_variables(true, false)`); a thread-local
-    `CONSTANTS: RefCell<Option<Arc<ScriptConstants>>>`;
+    `CONSTANTS: RefCell<Option<ScriptConstants>>`;
     `pub fn enter_constants(ast: &AST) -> ConstantsGuard` (installs, the
     guard restores the previous table on drop); `fn script_constant(name:
-    &str, index: usize) -> Option<Dynamic>` (`None` when `index != 0` or the
-    name is not in the table); `fn install_constant_resolver(engine)` calling
-    `engine.on_var(|name, index, _| Ok(script_constant(name, index)))`
-    (under `#[allow(deprecated)]`: rhai flags `on_var` volatile, not
-    deprecated), called from `build_engine`.
+    &str, index: usize, scope: &rhai::Scope) -> Option<Dynamic>` (`None`
+    when `index != 0`, when the live scope already contains `name` — a
+    closure-captured local or parameter — or when the name is not in the
+    table); `fn install_constant_resolver(engine)` calling
+    `engine.on_var(|name, index, ctx| Ok(script_constant(name, index,
+    ctx.scope())))` (under `#[allow(deprecated)]`: rhai flags `on_var`
+    volatile, not deprecated), called from `build_engine`.
   - `plugin.rs` `call_hook`, `command.rs` `ScriptRegHandle::run_load` and
     `ScriptCommand::invoke`, `poc_step.rs` `run`: `let _constants =
     enter_constants(&ast);` beside the existing `begin_run`/seed guards.
@@ -91,7 +93,11 @@ three-reviewer panel.
   X = 1; fn pick(X) { X }` used from `on_request` → header `"2"`.
   In `tests/engine.rs`: `script_constants_resolve_inside_functions_while_entered`
   — `f` reading `K * x + WORDS.len()` fails with `Variable not found: K`
-  bare and returns `16` under `enter_constants`; `g(K)` returns its argument.
+  bare and returns `16` under `enter_constants`; `g(K)` returns its argument;
+  `captured_locals_still_shadow_constants` (AC5) — `via_closure` 5,
+  `param_closure(7)` 7, `unshadowed` 1; `constants_reached_inside_functions_stay_constant`
+  (AC5) — `push` and assignment refused, read unchanged, `let` copy `"2/1"`;
+  `enter_constants_nests_and_restores_the_previous_table` — guard restore.
   `computed_const_is_not_visible_in_functions` (AC6) — `const Z = [1,
   2].len();` → `on_request` reading `Z` records a `last_error` containing
   `Variable not found: Z`.
@@ -128,7 +134,8 @@ three-reviewer panel.
 - **Change:** one short paragraph (and a four-line example) stating: a
   top-level `const` with a literal value is visible inside hooks and
   `load(reg)` closures; a computed constant is not (compute it in a
-  function); a closure captures every outer name when it is created, so an
+  function); inside a function the constant is read-only (mutate a `let`
+  copy); a closure captures every outer name when it is created, so an
   optional namespace (`l4`) must be called from a named function.
 - **Test:** none (prose); the spec reviewer checks presence.
 - **Done when:** both files carry the rules.
@@ -152,11 +159,13 @@ three-reviewer panel.
 | 1 | spec | Minor | Task 1 Done-when described a red shape the test cannot produce on `main` | fixed: Done-when rewritten to the missing-command list |
 | 2 | spec | Minor | spec/plan leftovers: warning clause, D6/D7 order, `RhaiPlugin` (no such type) | fixed in the docs; code unchanged |
 | 2, 4 | spec | Minor | unrequested `Default` derive on `ScriptConstants`; untested "works on a copy" doc claim | fixed: derive dropped, sentence removed |
-| 4 | quality | Important | guide claimed a mutating method on a constant "works on a copy"; rhai refuses it (`ErrorNonPureMethodCallOnConstant`, probed) | fixed: guide and README state the read-only rule and the `let` copy; pinned by a test in `tests/engine.rs` |
+| 4 | quality | Important | guide claimed a mutating method on a constant "works on a copy"; rhai refuses it (`ErrorNonPureMethodCallOnConstant`, probed) | fixed: guide and README state the read-only rule and the `let` copy; pinned by `tests/engine.rs::constants_reached_inside_functions_stay_constant` |
 | 2 | quality | Minor | per-run table wrapped in an unshared `Arc`, `ScriptConstants`/`of` needlessly `pub` | fixed: `RefCell<Option<ScriptConstants>>`, type and constructor private |
-| 2 | quality | Minor | `ConstantsGuard` restore-on-drop untested | fixed: nesting/restore assertions in `script_constants_resolve_inside_functions_while_entered` |
+| 2 | quality | Minor | `ConstantsGuard` restore-on-drop untested | fixed: `tests/engine.rs::enter_constants_nests_and_restores_the_previous_table` (tester) |
 | 1 | quality | Minor | `EXPECTED_COMMANDS` asserted as a subset, could drift stale | fixed: whole-set `assert_eq` naming both differences |
-| 2 | security | Minor | a closure-captured local/parameter of a constant's name read unindexed in the closure body, so the table won over it (probed: 1 instead of 5 / 7) | fixed: resolver returns `None` for any name the live scope contains; AC5 extended and tested |
+| 2 | security | Minor | a closure-captured local/parameter of a constant's name read unindexed in the closure body, so the table won over it (probed: 1 instead of 5 / 7) | fixed: resolver returns `None` for any name the live scope contains; AC5 extended, `captured_locals_still_shadow_constants` |
+| — | spec (round 2) | Minor | Review log row named the wrong test for the guard-restore disposition; read-only test unnamed | fixed: rows name the tester's tests |
+| — | spec, quality (round 2) | Minor | plan Task 2/4 text stale against the fixed code (`script_constant` signature, private type, read-only rule) | fixed: Task 2 and 4 rewritten to the code as shipped |
 
 ## Shipped
 
