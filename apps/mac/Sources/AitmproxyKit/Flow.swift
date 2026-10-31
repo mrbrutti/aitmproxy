@@ -145,9 +145,26 @@ extension ClientInfo {
     /// (`trailing.`), the whole identifier.
     public static func displayName(forSourceApp identifier: String) -> String {
         if let known = knownSourceApps[identifier] { return known }
-        guard let dot = identifier.lastIndex(of: ".") else { return identifier }
-        let tail = identifier[identifier.index(after: dot)...]
-        return tail.isEmpty ? identifier : String(tail)
+        // The identifier is signer-chosen text: strip C0/C1 controls and Unicode bidi
+        // formatting characters from what is SHOWN (never from `bundleID`), so a name
+        // cannot carry an RTL override or a control sequence into the sidebar.
+        let shown = Self.withoutControlAndBidi(identifier)
+        guard !shown.isEmpty else { return "unknown app" }
+        guard let dot = shown.lastIndex(of: ".") else { return shown }
+        let tail = shown[shown.index(after: dot)...]
+        return tail.isEmpty ? shown : String(tail)
+    }
+
+    /// `text` without C0/C1 control characters and the Unicode bidi formatting
+    /// characters (U+061C, U+200E/F, U+202A–U+202E, U+2066–U+2069).
+    static func withoutControlAndBidi(_ text: String) -> String {
+        String(text.unicodeScalars.filter { scalar in
+            let v = scalar.value
+            if v < 0x20 || (0x7F...0x9F).contains(v) { return false }
+            if v == 0x061C || v == 0x200E || v == 0x200F { return false }
+            if (0x202A...0x202E).contains(v) || (0x2066...0x2069).contains(v) { return false }
+            return true
+        }.map(Character.init))
     }
 }
 

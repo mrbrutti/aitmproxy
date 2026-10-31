@@ -220,6 +220,17 @@ import Testing
         }
     }
 
+    @Test func displayNameStripsControlAndBidiCharactersButKeepsTheRawIdentifier() {
+        // U+202E (RTL override) and C0/C1 controls never reach the shown name; `bundleID` stays raw.
+        let spoof = "com.evil.\u{202E}irafaS\u{0007}"
+        #expect(ClientInfo.displayName(forSourceApp: spoof) == "irafaS")
+        let client = ClientInfo(sourceApp: spoof)
+        #expect(client.bundleID == spoof)
+        #expect(client.name == "irafaS")
+        #expect(ClientInfo.displayName(forSourceApp: "\u{202E}\u{0001}") == "unknown app")
+        #expect(ClientInfo.displayName(forSourceApp: "com.apple.Safari") == "Safari")
+    }
+
     @Test func displayNameRule() {
         // Known map first, else the text after the last dot, casing kept; no dot or a
         // trailing dot keeps the whole identifier.

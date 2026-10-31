@@ -51,8 +51,8 @@ app's UI changes; the Apps page lights up because the data arrives.
 - A `capture_interface` column or badge in the app. `FlowRow` has no suitable field
   (`FlowOrigin` is `client/human/agent/imported`; `TLSState` is unrelated), and inventing one
   is UI work. The Kit decodes the field; the row does not carry it (D5).
-- Fixing the pre-existing push/pull divergence (`flow_summary` says `"kind": "ws"`,
-  `summarize` says `"websocket"`). Mirror the new fields; touch nothing else there.
+- Changing anything else in `flow_summary`: #191 already made the push summary equal `flow.get` field for
+  field (`push_summary_equals_flow_get_for_http_and_websocket_flows` enforces it).
 - The web UI, TUI, or Rhai surfaces showing the new fields. They receive them for free on
   `flow.get`/`flow.table`; rendering is theirs later.
 - Changing the `CaptureAdvice` banner logic. It keys on `session.clients.isEmpty` and goes
@@ -88,7 +88,7 @@ app's UI changes; the Apps page lights up because the data arrives.
   macOS-gated; `CAPTURE_INTERFACE` is referenced only from `macos_capture/adapter.rs`, as today.
 - No new dependencies, no new crates.
 - Live verification is impossible before release (an unnotarized sysext does not activate on
-  Matt's Mac): SA-AC6 is verified on the v0.5.4 DMG.
+  Matt's Mac): SA-AC6 is verified on the v0.5.5 DMG.
 
 ## Design
 
@@ -284,7 +284,7 @@ group. `FlowRow ==` already includes `client`. No change there, and none is perm
    green; `swift test --package-path apps/mac ...` green;
    `apps/mac/tools/check-capture-operator-only.sh` exits 0 on the branch (it is green on main
    ff35cb4 after #189; output quoted in the Tester's report).
-7. **SA-AC6 (manual, v0.5.4 DMG).** With capture working and an in-scope host, a Safari
+7. **SA-AC6 (manual, v0.5.5 DMG).** With capture working and an in-scope host, a Safari
    page load produces rows whose `flow.get` shows `"source_app"` set and
    `"capture_interface": "macos-ne"`, and the Apps page shows a `Safari` group (the banner is
    gone). A `curl` to the same host adds a `curl` group. A request through the explicit proxy

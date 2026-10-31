@@ -235,7 +235,7 @@ T1, T2, T3 share no file and may run as three parallel coders once T0 is on the 
 
 ## Whole-branch verification (stage 5)
 
-- Every SA-AC mapped to a test (SA-AC6 → manual on the v0.5.4 DMG, recorded in Shipped).
+- Every SA-AC mapped to a test (SA-AC6 → manual on the v0.5.5 DMG, recorded in Shipped).
 - Full Rust gate, Swift gate, and the tripwire count comparison, output quoted.
 - One end-to-end check the Tester can run without the NE: start `aitm` with a config, store a
   flow via `flow.get` after `curl -x`, confirm `"source_app": null, "capture_interface": null`
@@ -255,6 +255,16 @@ Kept by the main session during stage 6. One row per finding.
 | 0 | Tester | Info | `#[serde(default)]` on the two `MetaRec` `Option<String>` fields is redundant for JSON (serde already defaults a missing `Option`) | ACCEPTED: harmless, documents intent |
 | all | Tester | Note | Replayed and imported flows carry None/None — consistent with the spec (not opened by an app) | — |
 | all | Tester | — | New e2e cell `tests/e2e/flow/test_source_app_null_on_proxied.py` (canonical `aitm_e2e` harness) boots a real core and asserts both keys null on `flow.get`, the `flow.table` row and the `created` push | run by the main session in the Terminal (result below) |
+| all | Security (stage 6) | — | PASS: identifier is untrusted text end to end (JSON-escaped on the way out, serde-decoded, never interpolated into logs/HTML, never read by any scope/guard/policy); session format forward and backward compatible (`aitm-session/1`, no `deny_unknown_fields`); no cross-connection leakage (one `Conn` per client connection, h2 streams share it); `capture_interface` is a fixed adapter string; no `unsafe` | — |
+| 0 | Security | Minor | `source_app` was bounded only by the 1 MiB handoff frame and invisible to the store budget, so a hostile local signer with a huge identifier could bloat every stored flow clone | FIXED — `adapter.rs bounded_source_app`: empty or > `MAX_SOURCE_APP_BYTES` (256) → `None`, TCP and UDP, unit test. Counting the two strings in `store.rs meta_bytes` is a follow-up (outside the plan's files) |
+| 3 | Security | Minor | The shown Apps-group name was signer-chosen text rendered verbatim (bidi override / C0 controls could mislead the sidebar); `sourceAppSigningIdentifier` attests signing, not honesty | FIXED — `ClientInfo.displayName(forSourceApp:)` strips C0/C1 and Unicode bidi formatting characters from the SHOWN name, keeps `bundleID` raw, falls back to "unknown app"; Swift test. Spoofing a known identifier remains display-only by design (recorded for SA-AC6: a `Safari` group proves nothing about the signer) |
+| all | Spec (stage 6) | — | PASS: every SA-AC met or dispositioned; scope per commit exact; architect's calls implemented as written; non-goals and anti-goals honoured | — |
+| 1,2 | Spec | Minor | T1 and T2 landed in one commit (6e70126) | ACCEPTED: #191's lock test `push_summary_equals_flow_get_for_http_and_websocket_flows` makes either half alone red at its own commit, which the gate rule forbids |
+| 2 | Spec | Minor | Plan Task 2 / spec non-goal still described the `"kind": "ws"` push divergence #191 removed | FIXED — both texts updated |
+| all | Spec | Minor | SA-AC6 and the constraint section said "v0.5.5 DMG"; the carrying release is v0.5.5 | FIXED — wording updated to v0.5.5; Shipped records the observation when the DMG exists |
+| all | Spec | Minor | Branch is `fix/ne-source-app`, plan said `feat/ne-source-app-on-the-wire` | ACCEPTED: cosmetic |
+| all | Spec | Minor | Tester additions were uncommitted and two files (`session_roundtrip.rs`, the e2e cell) are outside the plan's list | FIXED — committed as 4584310 (`test(...)`); the e2e cell is the plan's own stage-5 end-to-end check |
+| 0 | Security (note) | Info | Tunnelled (passthrough) NE flows and `client.rs` flows build `FlowMeta` without attribution and report null/null | ACCEPTED as follow-up: pass the hint's values through the passthrough module when the Apps page needs tunnelled flows grouped |
 
 ## Shipped
 
