@@ -4396,3 +4396,69 @@ fn forged_claims_never_change_the_connection_id() {
     assert_eq!(entries[0].connection_id.as_deref(), Some(plain.as_str()));
     assert_eq!(entries[0].client_label.as_deref(), Some("conn_victim"));
 }
+
+// ------------- connection id reaches CommandHost (plan 2026-10-30-bus-audit-connection-id, T7)
+
+/// `demo.connection`: reports the host's server-assigned connection id (`<none>`
+/// when the call came over no streaming connection), so a test can prove
+/// `run_tool` plumbs `McpServer::connection_id` into `CommandHost`.
+struct ConnectionIdCmd;
+
+impl Command for ConnectionIdCmd {
+    fn name(&self) -> &str {
+        "demo.connection"
+    }
+    fn sensitivity(&self) -> Sensitivity {
+        Sensitivity::Read
+    }
+    fn schema(&self) -> ParamSchema {
+        ParamSchema {
+            description: "Names the connection's server-assigned id.".into(),
+            params: vec![],
+            result: TypeDesc::Str,
+        }
+    }
+    fn invoke(&self, _args: Params, host: &CommandHost) -> anyhow::Result<Value> {
+        Ok(Value::Str(host.connection_id().unwrap_or("<none>").into()))
+    }
+}
+
+/// A stdio-configured server whose registry carries only `demo.connection`.
+fn connection_server() -> McpServer {
+    let mut reg = Registry::new();
+    reg.add_command(Arc::new(ConnectionIdCmd));
+    McpServer::new(Arc::new(reg), McpTransport::Stdio)
+        .with_agent_state(ungated())
+        .with_services(
+            Arc::new(MemFlowStore::new()),
+            Arc::new(StubClient),
+            Arc::new(StdGuard::default()),
+            None,
+        )
+}
+
+/// AC15 (plumbing): a command sees the id the server assigned to the calling
+/// connection, the same one `initialize` returned, and sees none when the call
+/// came over no streaming connection.
+#[test]
+fn command_host_carries_the_connection_id() {
+    let srv = connection_server();
+
+    let conn = minted(&srv, Frontend::Mcp);
+    let id = init_id(&srv, &conn);
+    let reply = call_on(&srv, &conn, "demo.connection", json!({}));
+    assert_eq!(reply["result"]["isError"], json!(false), "{reply}");
+    assert_eq!(
+        reply["result"]["structuredContent"],
+        json!(id),
+        "the command sees the id initialize returned: {reply}"
+    );
+
+    let anon = ConnCtx::new(Frontend::Mcp);
+    let reply = call_on(&srv, &anon, "demo.connection", json!({}));
+    assert_eq!(
+        reply["result"]["structuredContent"],
+        json!("<none>"),
+        "no streaming connection, no id: {reply}"
+    );
+}

@@ -1599,6 +1599,12 @@ impl McpServer {
             Some(label) => host.with_client_label(label.clone()),
             None => host,
         };
+        // The server-assigned id of this connection (never the label, never
+        // anything the request carried), so a command can tell whose call it is.
+        let host = match self.connection_id(conn) {
+            Some(id) => host.with_connection_id(id),
+            None => host,
+        };
         let host = match &self.config {
             Some(cfg) => host.with_config(cfg.clone()),
             None => host,
