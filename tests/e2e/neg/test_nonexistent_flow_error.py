@@ -20,14 +20,16 @@ What "clean" means here, asserted on a real core (never fixtures):
     test owns, or the seeded aitm-testtarget read directly) received exactly the
     one control request and nothing from `flow.replay` of a missing id; the one
     REAL flow this test captured is byte-identical before/after apart from
-    `meta.marks` (no comment, no mutation landed on it). The bundled passive
-    detectors add marks to a live flow at any moment, so marks are checked alone:
-      - marks may only GROW: every earlier mark survives, and BARRAGE_MARK (the
-        barrage's own label) never appears on ANY flow in the store.
-    Also: no flow was added and none was lost (proxy.status still counts the
-    control flow; its `paused` / `capturing` fields are NOT asserted equal -- on a
-    shared runner core a concurrent suite may legitimately park a flow or pause
-    the proxy);
+    `meta.marks` (no comment, no mutation landed on it); marks get their own checks:
+      - the REAL flow's marks may only GROW: every earlier mark survives (the
+        bundled passive detectors add marks to a live flow at any moment, so marks
+        are checked on their own);
+      - BARRAGE_MARK (the barrage's own label) appears on no listed flow in the
+        store -- flows captured during a capture pause are not listed by flow.table.
+    Also: none was lost (proxy.status still counts the control flow) and the
+    missing ids were not created; proxy.status's `paused` / `capturing` fields are
+    NOT asserted equal -- on a shared runner core a concurrent suite may
+    legitimately park a flow or pause the proxy;
   * the core and the connection survive a barrage: hostile ids (path traversal,
     SQLi, 10 KB, unicode, non-string types) and a flood of FLOOD_N distinct missing
     ids on ONE connection all answer cleanly, fast, with the socket still open and
@@ -81,7 +83,7 @@ NOT_VALID = "not a valid flow id"  # json.rs TypeDesc::FlowId coercion failure
 INVALID_PARAMS = -32602  # JSON-RPC: the command never ran
 NIL_UUID = "00000000-0000-0000-0000-000000000000"
 MAX_UUID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
-BARRAGE_MARK = "e2e-missing"  # flow.mark's label in the barrage; must never reach any flow
+BARRAGE_MARK = "e2e-missing"  # flow.mark's label in the barrage; reserved: the store-wide scan fails on any listed flow carrying it, so no other suite may use it
 MAX_ERROR_CHARS = 400  # a clean refusal is short; a dump is not
 NOISE = (  # none of this belongs in an error shown to an agent or operator
     "panicked", "RUST_BACKTRACE", "stack backtrace", "unwrap()", "called `Option",
@@ -486,9 +488,10 @@ def main() -> int:
         detail_before = rd.call("flow.detail", {"id": real_id, "body": "inline"})
         check(isinstance(detail_before, dict) and (detail_before.get("response") or {}).get("status") == status,
               f"flow.detail on the REAL id carries the origin's response ({(detail_before.get('response') or {}).get('status')})")
-        # Not asserted empty: bundled passive detectors may add marks at any moment. So (ii) below only
-        # binds when marks existed before the barrage; it is a tripwire for future barrage entries
-        # (fault injection F2 in the spec proves the wipe case).
+        # Not asserted empty: bundled passive detectors may add marks at any moment. So the 'marks only
+        # grew' check below only binds when marks existed before the barrage; it is a tripwire for future
+        # barrage entries. docs/superpowers/specs/2026-10-31-neg-nonexistent-flow-marks-design.md AC3
+        # (fault injection F2) proves that it binds.
         marks_before = marks_of(detail_before)
         status_before = rd.call("proxy.status")
         flows_before = int(status_before.get("flows") or 0)
@@ -597,11 +600,10 @@ def main() -> int:
               + (f" (differs in: {differs})" if differs else ""))
         check(BARRAGE_MARK not in marks_after,
               f"the barrage's mark label {BARRAGE_MARK!r} is absent from the REAL flow's marks -- no flow.mark landed on it {marks_delta}")
-        if not marks_before:
-            ok("note: no marks before the barrage, so 'only grew' is vacuous this run; "
-               "the label checks and the rest-of-detail comparison still bind")
         check(set(marks_before) <= set(marks_after),
-              f"marks only grew: every mark present before the barrage is still present -- none was replaced or wiped {marks_delta}")
+              f"marks only grew: every mark present before the barrage is still present -- none was replaced or wiped {marks_delta}"
+              + (" -- vacuous: no marks before the barrage, so only the label checks and the rest-of-detail comparison bound"
+                 if not marks_before else ""))
         rows = table_rows(rd)
         tagged = [r for r in rows if tag in (r.get("path") or "")]
         check(len(tagged) == 1 and tagged[0]["id"] == real_id, f"flow.table holds exactly the one control flow for {tag} ({len(tagged)})")
@@ -609,7 +611,7 @@ def main() -> int:
             fail(f"flow.table row of the REAL flow has no marks list: {str(tagged[0])[:200]}")
         carriers = barrage_carriers(rows)
         check(not carriers,
-              f"no flow in the store carries the barrage's mark label {BARRAGE_MARK!r} -- no flow.mark landed on ANY flow "
+              f"no flow in the store carries the barrage's mark label {BARRAGE_MARK!r} -- no flow.mark landed on any listed flow "
               f"(scanned {len(rows)} flows; carriers: {carriers})")
         list_after = set(rd.call("flow.list"))
         for _, mid in missing_ids:

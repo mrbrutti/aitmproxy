@@ -1,6 +1,6 @@
 # neg/nonexistent-flow test: tolerate detector marks, still catch leaks
 
-**Status:** approved (2026-10-31 by Matt via the delegating orchestrator, autonomous-approve mode); amended 2026-10-31 after panel review (Design 6, AC8, F4 edit type)
+**Status:** approved (2026-10-31 by Matt via the delegating orchestrator, autonomous-approve mode); amended 2026-10-31 by the orchestrator (self-approved, autonomous-approve mode) after panel review: Goals, Constraints, Design 3 (what messages print), Design 5 (vacuity signposted in the test), Design 6 and AC8 (store-wide scan), AC3 (one copy per run; F4 is a request header edit), AC4 (base is f979040), the chosen-option label
 **Research inputs:** none. The root cause was established in the orchestrating session (below); source cited inline.
 
 ## Intent
@@ -23,8 +23,8 @@ whole-detail comparison is now too coarse. Production behaviour must not change.
 - The test passes on a core with the catalogue ON (the production default), every time.
 - It still fails if a missing-id command leaks a mark, comment, mutation, or
   intercept change onto the real flow, or wipes its marks.
-- It also fails if the barrage's mark label lands on ANY flow in the store (a
-  missing id that falls back to some other flow), not just the control flow.
+- It also fails if the barrage's mark label lands on any LISTED flow in the store
+  (a missing id that falls back to some other flow), not just the control flow.
 
 ## Non-goals
 
@@ -66,8 +66,9 @@ and `intercept` (`crates/aitm-plugins/src/detail.rs`).
    `flow.mark` would surface the label (i) or drop earlier marks (ii).
 3. **Failure messages name what differed.** Checks (i) and (ii) print the marks
    diff (`before -> after`); check 1 prints the names of the differing keys
-   (`differs in: comment, meta.edited`), because a marks diff there would point at
-   the wrong field. Order of checks: detail-minus-marks, then (i), then (ii). Message prefixes are fixed here so evidence is greppable (the builder may
+   (`differs in: meta.comment, edited`), because a marks diff there would point at
+   the wrong field. Order of checks: detail-minus-marks, then (i), then (ii).
+   Message prefixes are fixed here so evidence is greppable (the builder may
    append detail after them):
    - `flow.detail of the REAL flow is byte-identical apart from meta.marks`
    - `the barrage's mark label 'e2e-missing' is absent from the REAL flow's marks`
@@ -79,18 +80,24 @@ and `intercept` (`crates/aitm-plugins/src/detail.rs`).
    race went the other way), (ii) is trivially true; (i) and the rest-of-detail
    comparison still bind. The wipe case is therefore only provable deterministically
    under fault injection (AC3 seeds a sentinel mark first). The test says so in
-   its own text: a comment at `marks_before`, and an `ok` note on a run where (ii)
-   is vacuous, so a green line is not read as a wipe proof.
+   its own text: a comment at `marks_before`, and a suffix on the 'marks only grew'
+   message when `marks_before` is empty (that check is vacuous), so a green line
+   is not read as a wipe proof.
 6. **Store-wide label scan (added after panel review).** Checks 1 and (i) read only
    the control flow, so a missing id that fell back to some OTHER flow would pass.
    After the existing `tagged` check, assert that no row of the same `flow.table`
    read carries `BARRAGE_MARK` in its `marks` (the literal is used by no other
-   test, so a concurrent suite cannot trip it). `flow.table` rows list every stored
-   flow's `marks` (`crates/aitm-plugins/src/capture.rs`); the control flow's row must
-   carry a `marks` list or the test fails loudly. Prefix:
+   test, so a concurrent suite cannot trip it; the constant is commented as
+   reserved). `flow.table` rows list every LISTED flow's `marks`
+   (`crates/aitm-plugins/src/capture.rs`); flows captured while capture is paused
+   are not listed (`crates/aitm-core/src/store.rs`), so the scan covers listed flows
+   only. The control flow's row must carry a `marks` list or the test fails
+   loudly. Prefix:
    `no flow in the store carries the barrage's mark label`.
 
-**Chosen: (a)**, compare detail minus marks and check marks separately (Design 1 to 6). **Rejected.** (b) `AITM_NO_BUNDLED_SCRIPTS` in `run.py::_boot_shared_core`: it moves
+**Chosen: (a)**, compare detail minus marks and check marks separately (Design 1 to 6).
+
+**Rejected.** (b) `AITM_NO_BUNDLED_SCRIPTS` in `run.py::_boot_shared_core`: it moves
 every shared-core suite off the production default, hides catalogue/suite
 interactions, and this test (contract: "a core the runner booted") would still fail
 against any core with the catalogue on. (c) Poll marks until stable before taking
