@@ -11,19 +11,47 @@
 //! `args_summary` is a redacted, size-capped rendering produced by the caller:
 //! tokens, auth headers, and the CA key material never reach an entry, matching
 //! the M2 CA posture (the bounded-memory + secret-handling constraints).
+//!
+//! # The ring keeps a fair, bounded record
+//!
+//! The ring is split into two bounded lanes (see [`AuditLane`]). The *evidence*
+//! lane holds every entry that is not a successful `Read`: refusals, failures,
+//! and every `Write` or `Sensitive` run. The *routine* lane holds only successful
+//! `Read` calls, so a polling UI can never push evidence out. [`lane_for`] is the
+//! one routing rule.
+//!
+//! Inside each lane a full ring evicts the oldest entry of the *source* holding
+//! the most entries, where a source is an origin plus a client label. A lone busy
+//! source still uses the whole lane, but a flood only ever eats the flooder's
+//! own oldest entries. Each lane tracks at most [`MAX_AUDIT_SOURCES`] sources and
+//! files the rest under one overflow source per origin, so a flooder minting a
+//! fresh label per connection cannot shrink an honest source below a fixed floor
+//! of about `capacity / (MAX_AUDIT_SOURCES + 3)` entries.
+//!
+//! A source can still overwrite its own history, and a restart empties the ring.
+//! Only the durable JSONL sink keeps a complete record; the ring is a live view.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::command::Sensitivity;
 use crate::ctx::Frontend;
 use crate::value::Value;
 
-/// The default audit-ring capacity (entries) before the oldest is evicted. A few
+/// The default capacity (entries) of the evidence lane before it evicts. A few
 /// thousand entries is enough for the live "Agent" view; durable audit keeps the
 /// full history when it is configured.
 pub const DEFAULT_AUDIT_CAPACITY: usize = 4096;
 
+/// The default capacity (entries) of the routine lane, half the evidence lane:
+/// about thirteen minutes of one polling UI by itself.
+pub const DEFAULT_ROUTINE_AUDIT_CAPACITY: usize = DEFAULT_AUDIT_CAPACITY / 2;
+
+/// How many distinct sources (an origin plus a client label) each lane tracks by
+/// name. A source beyond this shares its origin's overflow source, which bounds
+/// the work of an append and sets a floor under what any source keeps.
+pub const MAX_AUDIT_SOURCES: usize = 32;
 /// How long `args_summary` may be before it is truncated (bytes of its JSON
 /// rendering). A hostile or verbose argument set cannot grow an entry without
 /// bound.
@@ -194,6 +222,26 @@ pub fn declared_client_label(raw: &str) -> Option<String> {
     }
 }
 
+/// Which lane of the [`AuditRing`] an entry is kept in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditLane {
+    /// Everything that is not a successful `Read`: refusals, failures, and every
+    /// `Write` or `Sensitive` run. Polling never touches this lane.
+    Evidence,
+    /// Successful `Read` calls only: UI polling and status checks.
+    Routine,
+}
+
+/// The one routing rule: a successful `Read` is [`AuditLane::Routine`]; anything
+/// else is [`AuditLane::Evidence`]. An unknown sensitivity (`None`) and any
+/// outcome other than success fail closed into the evidence lane.
+pub fn lane_for(sensitivity: Option<Sensitivity>, result: &AuditResult) -> AuditLane {
+    match (sensitivity, result) {
+        (Some(Sensitivity::Read), AuditResult::Ok) => AuditLane::Routine,
+        _ => AuditLane::Evidence,
+    }
+}
+
 /// Where audit entries go. The in-memory [`AuditRing`] implements it (always on);
 /// a durable JSONL log (opt-in by config) implements it too, so one `append`
 /// fans to both without the caller knowing which sinks are attached.
@@ -203,62 +251,234 @@ pub trait AuditSink: Send + Sync {
     fn append(&self, entry: AuditEntry);
 }
 
-/// A bounded, in-memory ring of recent audit entries — the always-on live view.
-/// Oldest entries are evicted once `capacity` is reached, so a long session has
-/// bounded memory (the bounded-memory constraint).
-#[derive(Debug)]
-pub struct AuditRing {
-    inner: Mutex<VecDeque<AuditEntry>>,
-    capacity: usize,
+/// The identity of one bucket in a lane's source table.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceKey {
+    /// A source tracked under its own name: its origin label and client label.
+    Tracked(&'static str, Option<String>),
+    /// The shared bucket for every untracked source of one origin.
+    Overflow(&'static str),
 }
 
-impl AuditRing {
-    /// A ring holding at most `capacity` entries (clamped to at least 1).
-    pub fn new(capacity: usize) -> Self {
+/// One source's entries in a lane, oldest first, each with its sequence number.
+#[derive(Debug)]
+struct Bucket {
+    key: SourceKey,
+    entries: VecDeque<(u64, AuditEntry)>,
+}
+
+impl Bucket {
+    /// The sequence number of the oldest entry, or the maximum when empty.
+    fn oldest_seq(&self) -> u64 {
+        self.entries.front().map_or(u64::MAX, |(seq, _)| *seq)
+    }
+}
+
+/// One bounded lane: a table of per-source buckets sharing one capacity.
+#[derive(Debug)]
+struct Lane {
+    capacity: usize,
+    buckets: Vec<Bucket>,
+}
+
+impl Lane {
+    fn new(capacity: usize) -> Self {
         Self {
-            inner: Mutex::new(VecDeque::new()),
             capacity: capacity.max(1),
+            buckets: Vec::new(),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<AuditEntry>> {
+    fn len(&self) -> usize {
+        self.buckets.iter().map(|b| b.entries.len()).sum()
+    }
+
+    /// Every held entry with its sequence number, in no particular order.
+    fn entries(&self) -> impl Iterator<Item = &(u64, AuditEntry)> {
+        self.buckets.iter().flat_map(|b| b.entries.iter())
+    }
+
+    fn find(&self, key: &SourceKey) -> Option<usize> {
+        self.buckets.iter().position(|b| b.key == *key)
+    }
+
+    /// File `entry` under its source (or its origin's overflow source when the
+    /// table is full), then evict while the lane is over capacity.
+    fn insert(&mut self, seq: u64, entry: AuditEntry) {
+        let origin = origin_label(entry.origin);
+        let tracked = SourceKey::Tracked(origin, entry.client_label.clone());
+        let tracked_sources = self
+            .buckets
+            .iter()
+            .filter(|b| matches!(b.key, SourceKey::Tracked(..)))
+            .count();
+        let key = if self.find(&tracked).is_some() || tracked_sources < MAX_AUDIT_SOURCES {
+            tracked
+        } else {
+            SourceKey::Overflow(origin)
+        };
+        let at = match self.find(&key) {
+            Some(at) => at,
+            None => {
+                self.buckets.push(Bucket {
+                    key,
+                    entries: VecDeque::new(),
+                });
+                self.buckets.len() - 1
+            }
+        };
+        self.buckets[at].entries.push_back((seq, entry));
+        if self.len() > self.capacity {
+            self.evict_one();
+        }
+    }
+
+    /// Drop the oldest entry of the bucket holding the most entries; between
+    /// equally full buckets, the one whose oldest entry is the oldest overall. A
+    /// bucket left empty leaves the table. The entry just inserted is never the
+    /// victim: it is the newest, so it is the oldest of its bucket only when that
+    /// bucket is the lone bucket, and then the lane is not over capacity.
+    fn evict_one(&mut self) {
+        let victim = self
+            .buckets
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.entries
+                    .len()
+                    .cmp(&b.entries.len())
+                    .then(b.oldest_seq().cmp(&a.oldest_seq()))
+            })
+            .map(|(at, _)| at);
+        let Some(at) = victim else { return };
+        self.buckets[at].entries.pop_front();
+        if self.buckets[at].entries.is_empty() {
+            self.buckets.remove(at);
+        }
+    }
+}
+
+/// Everything the ring's one mutex guards.
+#[derive(Debug)]
+struct RingState {
+    /// The sequence number the next entry gets; it orders entries across lanes.
+    next_seq: u64,
+    evidence: Lane,
+    routine: Lane,
+}
+
+impl RingState {
+    fn lane_mut(&mut self, lane: AuditLane) -> &mut Lane {
+        match lane {
+            AuditLane::Evidence => &mut self.evidence,
+            AuditLane::Routine => &mut self.routine,
+        }
+    }
+}
+
+/// A bounded, in-memory record of recent audit entries — the always-on live view.
+///
+/// It has two bounded lanes, an evidence lane and a routine lane (see
+/// [`AuditLane`]), so successful `Read` polling never evicts a refusal or a
+/// state-changing call. When a lane is full it evicts the oldest entry of the
+/// source holding the most entries, so one source cannot flush another's entries
+/// however many calls it makes; each lane tracks at most [`MAX_AUDIT_SOURCES`]
+/// sources and files the rest under a per-origin overflow source. Nothing is
+/// evicted while a lane has room, and the newest entry is always kept.
+///
+/// Memory is bounded in entries and, because every entry field is capped by its
+/// producer, in bytes. The ring is a live view, not a complete record: a source
+/// can still overwrite its own history and a restart empties it. The durable
+/// JSONL [`AuditSink`] is the complete answer.
+#[derive(Debug)]
+pub struct AuditRing {
+    inner: Mutex<RingState>,
+}
+
+impl AuditRing {
+    /// A ring whose evidence lane holds at most `capacity` entries and whose
+    /// routine lane holds at most half that (each clamped to at least 1).
+    pub fn new(capacity: usize) -> Self {
+        Self::with_lane_capacities(capacity, (capacity / 2).max(1))
+    }
+
+    /// A ring with an explicit capacity for each lane (each clamped to at least 1).
+    pub fn with_lane_capacities(evidence: usize, routine: usize) -> Self {
+        Self {
+            inner: Mutex::new(RingState {
+                next_seq: 0,
+                evidence: Lane::new(evidence),
+                routine: Lane::new(routine),
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RingState> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Recent entries, oldest first. `since` keeps only entries strictly after it;
-    /// `limit` keeps the most recent `limit` of those (presented oldest first), so
-    /// a reconnecting surface catches up without replaying the whole ring.
+    /// Record `entry` in `lane`. [`AuditSink::append`] is this with the evidence
+    /// lane; use [`lane_for`] to choose the lane for a command's outcome.
+    pub fn append_in(&self, lane: AuditLane, entry: AuditEntry) {
+        let mut state = self.lock();
+        let seq = state.next_seq;
+        state.next_seq = seq.saturating_add(1);
+        state.lane_mut(lane).insert(seq, entry);
+    }
+
+    /// Recent entries of both lanes in call order, oldest first. `since` keeps
+    /// only entries strictly after it; `limit` keeps the most recent `limit` of
+    /// those (presented oldest first), so a reconnecting surface catches up
+    /// without replaying the whole ring.
     pub fn recent(&self, since: Option<SystemTime>, limit: Option<usize>) -> Vec<AuditEntry> {
-        let q = self.lock();
-        let mut out: Vec<AuditEntry> = q
-            .iter()
-            .filter(|e| since.is_none_or(|s| e.at > s))
-            .cloned()
+        let state = self.lock();
+        let mut held: Vec<&(u64, AuditEntry)> = state
+            .evidence
+            .entries()
+            .chain(state.routine.entries())
+            .filter(|(_, e)| since.is_none_or(|s| e.at > s))
             .collect();
-        if let Some(limit) = limit {
-            if out.len() > limit {
-                out = out.split_off(out.len() - limit);
-            }
-        }
-        out
+        held.sort_unstable_by_key(|(seq, _)| *seq);
+        let skip = limit.map_or(0, |limit| held.len().saturating_sub(limit));
+        held.into_iter()
+            .skip(skip)
+            .map(|(_, e)| e.clone())
+            .collect()
     }
 
-    /// How many entries were recorded at or after `since` — the source of
-    /// `agent.status.actions_last_minute`.
+    /// How many entries, across both lanes, were recorded at or after `since` —
+    /// the source of `agent.status.actions_last_minute`.
     pub fn count_since(&self, since: SystemTime) -> usize {
-        self.lock().iter().filter(|e| e.at >= since).count()
+        let state = self.lock();
+        state
+            .evidence
+            .entries()
+            .chain(state.routine.entries())
+            .filter(|(_, e)| e.at >= since)
+            .count()
     }
 
-    /// The number of entries currently held.
+    /// The number of entries currently held, across both lanes.
     pub fn len(&self) -> usize {
-        self.lock().len()
+        let state = self.lock();
+        state.evidence.len() + state.routine.len()
     }
 
     /// Whether the ring holds no entries.
     pub fn is_empty(&self) -> bool {
-        self.lock().is_empty()
+        self.len() == 0
+    }
+
+    /// The number of entries currently held in the evidence lane.
+    pub fn evidence_len(&self) -> usize {
+        self.lock().evidence.len()
+    }
+
+    /// The number of entries currently held in the routine lane.
+    pub fn routine_len(&self) -> usize {
+        self.lock().routine.len()
     }
 }
 
@@ -269,12 +489,10 @@ impl Default for AuditRing {
 }
 
 impl AuditSink for AuditRing {
+    /// Records into the evidence lane: a caller that does not know the command's
+    /// sensitivity gets the lane that fails closed.
     fn append(&self, entry: AuditEntry) {
-        let mut q = self.lock();
-        if q.len() >= self.capacity {
-            q.pop_front();
-        }
-        q.push_back(entry);
+        self.append_in(AuditLane::Evidence, entry);
     }
 }
 
@@ -399,5 +617,196 @@ mod tests {
             declared_client_label("aitm-mac"),
             Some("aitm-mac".to_string())
         );
+    }
+
+    /// An entry from a chosen source (origin and label) running `command`.
+    fn sourced(origin: Frontend, label: Option<&str>, command: &str) -> AuditEntry {
+        AuditEntry {
+            at: SystemTime::now(),
+            origin,
+            client_label: label.map(str::to_string),
+            command: command.to_string(),
+            args_summary: "{}".to_string(),
+            result: AuditResult::Ok,
+        }
+    }
+
+    /// The commands of `entries`, in the order given.
+    fn commands(entries: &[AuditEntry]) -> Vec<&str> {
+        entries.iter().map(|e| e.command.as_str()).collect()
+    }
+
+    #[test]
+    fn lane_for_routes_only_successful_reads_to_routine() {
+        assert_eq!(
+            lane_for(Some(Sensitivity::Read), &AuditResult::Ok),
+            AuditLane::Routine
+        );
+        assert_eq!(
+            lane_for(Some(Sensitivity::Read), &AuditResult::Error("x".into())),
+            AuditLane::Evidence
+        );
+        assert_eq!(
+            lane_for(Some(Sensitivity::Write), &AuditResult::Ok),
+            AuditLane::Evidence
+        );
+        assert_eq!(
+            lane_for(Some(Sensitivity::Sensitive), &AuditResult::Ok),
+            AuditLane::Evidence
+        );
+        assert_eq!(lane_for(None, &AuditResult::Ok), AuditLane::Evidence);
+    }
+
+    #[test]
+    fn recent_merges_both_lanes_oldest_first() {
+        let ring = AuditRing::with_lane_capacities(8, 8);
+        ring.append_in(AuditLane::Evidence, entry("E1", AuditResult::Ok));
+        ring.append_in(AuditLane::Routine, entry("R1", AuditResult::Ok));
+        ring.append_in(AuditLane::Evidence, entry("E2", AuditResult::Ok));
+        ring.append_in(AuditLane::Routine, entry("R2", AuditResult::Ok));
+        assert_eq!(commands(&ring.recent(None, None)), ["E1", "R1", "E2", "R2"]);
+        assert_eq!(commands(&ring.recent(None, Some(3))), ["R1", "E2", "R2"]);
+        assert_eq!(ring.len(), 4);
+        assert_eq!(ring.evidence_len(), 2);
+        assert_eq!(ring.routine_len(), 2);
+        assert_eq!(ring.count_since(UNIX_EPOCH), 4);
+    }
+
+    #[test]
+    fn a_routine_flood_never_evicts_evidence() {
+        let ring = AuditRing::with_lane_capacities(4, 2);
+        for name in ["e1", "e2", "e3"] {
+            ring.append_in(AuditLane::Evidence, entry(name, AuditResult::Ok));
+        }
+        for i in 1..=100 {
+            ring.append_in(AuditLane::Routine, entry(&format!("r{i}"), AuditResult::Ok));
+        }
+        assert_eq!(ring.evidence_len(), 3);
+        assert_eq!(ring.routine_len(), 2);
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["e1", "e2", "e3", "r99", "r100"]
+        );
+    }
+
+    #[test]
+    fn a_lone_source_uses_the_whole_lane_then_evicts_its_own_oldest() {
+        let ring = AuditRing::with_lane_capacities(5, 1);
+        for name in ["c1", "c2", "c3", "c4", "c5"] {
+            ring.append_in(AuditLane::Evidence, entry(name, AuditResult::Ok));
+        }
+        assert_eq!(ring.evidence_len(), 5);
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["c1", "c2", "c3", "c4", "c5"]
+        );
+        ring.append_in(AuditLane::Evidence, entry("c6", AuditResult::Ok));
+        assert_eq!(ring.evidence_len(), 5);
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["c2", "c3", "c4", "c5", "c6"]
+        );
+    }
+
+    #[test]
+    fn fair_share_protects_a_quiet_source_from_a_flooder() {
+        let ring = AuditRing::with_lane_capacities(8, 1);
+        for name in ["a1", "a2", "a3"] {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some("agent-a"), name),
+            );
+        }
+        for i in 1..=100 {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some("agent-b"), &format!("b{i}")),
+            );
+        }
+        assert_eq!(
+            commands(&ring.recent(None, None)),
+            ["a1", "a2", "a3", "b96", "b97", "b98", "b99", "b100"]
+        );
+    }
+
+    #[test]
+    fn fair_share_ties_evict_the_globally_oldest() {
+        let ring = AuditRing::with_lane_capacities(3, 1);
+        for name in ["s1", "s2", "s3", "s4"] {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some(name), name),
+            );
+        }
+        assert_eq!(commands(&ring.recent(None, None)), ["s2", "s3", "s4"]);
+    }
+
+    #[test]
+    fn a_source_flood_of_distinct_labels_cannot_flush_a_tracked_source() {
+        let ring = AuditRing::with_lane_capacities(330, 1);
+        for _ in 0..200 {
+            ring.append_in(AuditLane::Evidence, sourced(Frontend::Mcp, Some("a"), "a"));
+        }
+        for i in 0..5000 {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some(&format!("flood-{i}")), "flood"),
+            );
+        }
+        assert_eq!(ring.evidence_len(), 330);
+        let held_by_a = ring
+            .recent(None, None)
+            .iter()
+            .filter(|e| origin_label(e.origin) == "mcp" && e.client_label.as_deref() == Some("a"))
+            .count();
+        let floor = 330 / (MAX_AUDIT_SOURCES + 3) - 1;
+        assert_eq!(floor, 8);
+        assert!(
+            held_by_a >= floor,
+            "source A kept {held_by_a} entries, the floor is {floor}"
+        );
+    }
+
+    #[test]
+    fn overflow_is_per_origin_and_the_table_is_bounded() {
+        let ring = AuditRing::with_lane_capacities(100, 1);
+        // Fill the whole table with single-entry `mcp` sources.
+        for i in 0..MAX_AUDIT_SOURCES {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some(&format!("m{i}")), &format!("m{i}")),
+            );
+        }
+        // An `operator` source arriving after the table is full shares only its
+        // own origin's overflow bucket.
+        ring.append_in(
+            AuditLane::Evidence,
+            sourced(Frontend::Operator, Some("op"), "op"),
+        );
+        // A flood of distinct `mcp` labels lands in the `mcp` overflow bucket.
+        for i in 0..200 {
+            ring.append_in(
+                AuditLane::Evidence,
+                sourced(Frontend::Mcp, Some(&format!("x{i}")), &format!("x{i}")),
+            );
+        }
+        let kept = ring.recent(None, None);
+        assert_eq!(ring.evidence_len(), 100);
+        let tracked = kept.iter().filter(|e| e.command.starts_with('m')).count();
+        assert_eq!(tracked, MAX_AUDIT_SOURCES, "a tracked source was flushed");
+        let operator: Vec<&str> = kept
+            .iter()
+            .filter(|e| origin_label(e.origin) == "operator")
+            .map(|e| e.command.as_str())
+            .collect();
+        assert_eq!(operator, ["op"]);
+        // The flood keeps only its own newest entries: 100 - 32 - 1 = 67.
+        let flood: Vec<&str> = kept
+            .iter()
+            .filter(|e| e.command.starts_with('x'))
+            .map(|e| e.command.as_str())
+            .collect();
+        assert_eq!(flood.len(), 67);
+        assert_eq!(flood.last().copied(), Some("x199"));
     }
 }
