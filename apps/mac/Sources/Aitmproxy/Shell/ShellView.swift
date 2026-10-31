@@ -346,17 +346,21 @@ struct AppsAttributionBanner: View {
             capability: health.captureCapability, supported: health.captureSupported,
             scopeHostCount: session.scopeHosts.count)
         HStack(spacing: Space.sm) {
-            Image(systemName: "app.badge").font(.system(size: Tok.Size.iconInline))
-            Text(advice.banner)
+            HStack(spacing: Space.sm) {
+                Image(systemName: "app.badge").font(.system(size: Tok.Size.iconInline))
+                Text(advice.banner)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            .accessibilityElement(children: .combine)
             Spacer(minLength: Space.sm)
             if advice.offersScope {
-                Button("Open Scope…") { session.show(.scope) }
-                    .buttonStyle(.link)
-                    .controlSize(.small)
+                SmallButton("Open Scope…") { session.show(.scope) }
             } else if advice.offersSettings {
-                Button("Open Settings…") { openSettings() }
-                    .buttonStyle(.link)
-                    .controlSize(.small)
+                SmallButton("Open Settings…") {
+                    session.settingsTab = .capture
+                    openSettings()
+                }
             }
         }
         .font(Tok.Face.ui(Tok.Typography.Size.sm))
@@ -364,8 +368,6 @@ struct AppsAttributionBanner: View {
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.Row.dense)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
-        .accessibilityElement(children: .combine)
     }
 }
 
@@ -391,7 +393,10 @@ struct AppsEmptyState: View {
             if advice.offersScope {
                 Button("Open Scope…") { session.show(.scope) }
             } else if advice.offersSettings {
-                Button("Open Settings…") { openSettings() }
+                Button("Open Settings…") {
+                    session.settingsTab = .capture
+                    openSettings()
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

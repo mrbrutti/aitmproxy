@@ -32,11 +32,15 @@ both surfaces say the one true thing and point at the one action (add a host to 
 
 - **`AitmproxyKit/CaptureAdvice`** (pure, tested): `make(capability:supported:scopeHostCount:)`
   → `unsupported | off | awaitingApproval | degraded(reason) | onEmptyScope | on(hosts:)`,
-  with `headline`, `detail`, `offersScope` (only `onEmptyScope`), `offersSettings` (only `off`).
+  with `headline`, `detail`, a one-line `banner`, `offersScope` (only `onEmptyScope`), `offersSettings`
+  (only `off`). `.on` is worded "Capture is on", never "Capturing": `.approvedAttached` maps there
+  too and its tunnel may still be connecting; the capability's own `title` is the one place that
+  says "Capturing".
   Derives on/off from the published `CaptureCapability`, never from the `capture.enabled`
   key (keeps `check-capture-operator-only.sh`'s allow-list intact).
-- **Settings ▸ Capture** (`SettingsView.swift`): when the advice is `onEmptyScope`, a callout
-  under Status: "Capture is on, but the scope is empty …" with **Open Scope…** →
+- **Settings ▸ Capture** (`SettingsView.swift`): when the advice is `onEmptyScope`, the Status
+  row itself reads "On, nothing in scope" with a warning glyph (not "Capturing"), and a callout
+  under it: "Capture is on, but the scope is empty …" with **Open Scope…** →
   `session.show(.scope)` (the same action as the Proxy ▸ Scope… menu item).
 - **Apps page never hides captured flows** (`ShellView.swift`). The Apps page is the default
   landing page, and `session.clients` is fixture-only live (no source-app attribution on the
@@ -48,12 +52,16 @@ both surfaces say the one true thing and point at the one action (add a host to 
   `ContentUnavailableView`) show. The "extension missing" wording appears only for
   `unsupported`. Neither view toggles capture (operator-only stays with the Settings toggle).
   Changing the default landing page is a product call left for v0.5.4.
+- **Live scope count** (`Bus/BusService.swift`): `scopeHosts` was refreshed only at connect and
+  after the app's own add/remove, so a host added from the CLI or another client would leave the
+  advice claiming an empty scope; the poll loop now refreshes `scope.list` too.
 - **Tripwire** (`apps/mac/tools/check-capture-toggle.sh`): pins the callout + Open Scope in
   SettingsView, the advice-driven Apps empty state in ShellView, and that ShellView gained no
   `capture.enabled` read, no `CaptureSwitch` call and no `extensionController` handle.
 - **Snapshots**: `settings-capture-noscope-{light,dark}` (capability `.capturing`,
   `captureSupported = true`, `scopeHosts = []`) and `apps-noattribution-{light,dark}` (fixture
-  rows with their `client` stripped, capture off: the banner over a full table).
+  rows with their `client` stripped and the `noscope` capture state: the banner over a full
+  table). Every capture state starts from the fixture scope; only `noscope` empties it.
 
 ## Non-goals (follow-ups)
 
@@ -91,5 +99,30 @@ both surfaces say the one true thing and point at the one action (add a host to 
 
 ## Review log
 
+Stage-6 panel 2026-10-31 on `6ba89d2..9b0bdea`: Security PASS (3 Minor), Spec FAIL (1 Important,
+3 Minor), Quality + Tester: see below. Dispositions by the orchestrator (autonomous mode).
+
 | # | Reviewer | Sev | Finding | Disposition |
 |---|---|---|---|---|
+| 1 | Spec | Important | `noscope` leaves `scopeHosts = []` for the next states; dark `active` showed the callout | FIXED — `apply` resets to `Fixtures.scope` per state; pin added |
+| 2 | Security | Minor | `.approvedAttached` read "Capturing" while its tunnel may be down | FIXED — `.on` worded "Capture is on"; test pins no advice starts with "Capturing" |
+| 3 | Security | Minor | `scopeHosts` refreshed only at connect → stale count could make the advice lie | FIXED — poll loop refreshes `scope.list` |
+| 4 | Security + Spec | Minor | Status row still read "Capturing" beside the empty-scope callout | FIXED — row reads "On, nothing in scope" with a warning glyph when `onEmptyScope` |
+| 5 | Spec | Minor | `banner` not named in the spec; apps scene said "capture off" | FIXED — spec amended (this revision) |
+| 6 | Spec | Minor | `Snapshot.swift:9` comment omitted `noscope` | FIXED |
+| 7 | Quality | Important | Snapshot scope leak (same as #1) | FIXED (same) |
+| 8 | Quality | Important | `apps-noattribution` shots showed no banner + stale CLIENT column | FIXED via row 19 (`FlowRow ==` ignored `client`); re-rendered shots verified |
+| 9 | Quality | Important | Banner/detail copy promised app attribution that no flow carries on the wire yet | FIXED — copy says only what is true now; test pins no "attribute" wording |
+| 10 | Quality | Minor | Open Settings… landed on the last tab, not Capture | FIXED — `settingsTab = .capture` first |
+| 11 | Quality | Minor | `.link` buttons, no `lineLimit`, double hairline, a11y combine over the button | FIXED — `SmallButton`, `lineLimit(1)`, overlay rule dropped, combine on icon+text |
+| 12 | Quality | Minor | `savedRows` overwritten if applied twice | FIXED — `Self.savedRows ?? session.rows` |
+| 13 | Quality | Minor | Advice built 3×, Open Scope spelled 2 ways, booleans vs an action enum, `clients` computed twice, banner may stack with ScopeBanner | ACCEPTED (follow-up with the v0.5.4 onboarding: a `Session.captureAdvice`/`openScope()` + one `OneLineBanner`) |
+| 14 | Quality | Minor | Test/pin polish (hoisted lists, per-view pins, NS-AC4 duplicates) | FIXED (per-view `body_of` pins, hoisted `everyAdvice`); NS-AC4 duplicates kept as defence in depth |
+| 15 | Tester | Blocking | Three coder test pins contradicted copy that changed under review (`.on(1).detail` wording, `unsupported.banner` said "capture extension", `.on` banner said "not attributed") | FIXED — pins follow the copy; `.on` banner now reads "flows carry no source app yet" so no advice uses the word "attribute" |
+| 16 | Tester | Minor | `.degraded("")` yields an empty detail and a banner ending in a dangling dash | ACCEPTED (follow-up with v0.5.4: fallback sentence, and guard `CaptureCapabilityEvent.failed` against an empty reason) |
+| 17 | Tester | Minor | An unknown scope reads as empty: `scopeHosts` starts `[]` and `refreshScope` is `try?`, so before the first `scope.list` reply or with the bus down the callout can say "the scope is empty" | ACCEPTED (follow-up: `scopeHostCount: Int?` or a bus-connected gate; the poll-loop refresh keeps the window under one poll) |
+| 18 | Tester | Minor | Apps-page routing (banner / empty state / table) is an inline predicate in `MainView`; a pure `AppsPageMode` would make NS-AC8 executable | ACCEPTED (follow-up with the `Session.captureAdvice` refactor, row 13) |
+| 19 | Orchestrator (debugging row 8) | Important | `apps-noattribution` rendered no banner and a stale CLIENT column: the scene changed only `client` on each row, and `FlowRow ==` ignored `client`, so the new `rows` compared equal to the old — SwiftUI skipped the main view's update (confirmed with body prints: no re-evaluation between the scene and the reset) and `FlowTableView` skipped its reload | FIXED — `FlowRow ==` now includes `client` (Kit test pins it); row 8 closes once the re-rendered shots show the banner |
+| 20 | Orchestrator | Minor | In the `settings-capture-{active,noscope}` snapshots the Capture L4 traffic toggle draws OFF and dimmed while the Status row says on; the binding reads `health.captureChoice ?? captureEnabled` and the scene sets `captureChoice = true`, so this is a fixture-render question (likely `.disabled(!usesEmbedded)` under the test store), not the live toggle, which the mac-review session saw ON against a real extension | ACCEPTED (follow-up with the v0.5.4 onboarding snapshots) |
+
+Tester (stage 5) added `CaptureAdviceExhaustiveTests` (15 tests: the full capability × scope table, `isCaptureOn` oracle, exhaustive-switch witnesses so a new case fails to compile) and scoped tripwire pins; mutation runs killed 30/30 tripwire mutants and 17/17 kit mutants. Tripwire: 227 ok.

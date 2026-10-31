@@ -259,6 +259,14 @@ struct CaptureSettings: View {
                         } icon: {
                             ProgressView().controlSize(.small)
                         }
+                    } else if advice.offersScope {
+                        // On, but nothing in scope: the row must not read as a working "Capturing".
+                        Label {
+                            Text("On, nothing in scope")
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(Color.secondary)
+                        }
                     } else {
                         Label {
                             Text(capability.title)

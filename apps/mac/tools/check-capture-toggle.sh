@@ -399,6 +399,10 @@ chord_of() {
     key=${key// /}
     echo "$key|$(grep -o -E '[.][a-zA-Z]+' <<<"$mods" | sort -u | paste -s -d + -)"
 }
+
+# Comment-stripped sources the NS-AC pins read; defined once so every section may use them.
+settings_code=$(code_lines "$settings")
+shell_code=$(code_lines "$shell")
 if [ -n "${shortcut_line:-}" ]; then
     mine=$(chord_of "${shortcut_line#*.keyboardShortcut(}")
     pass "TG-AC10 the command has a keyboard shortcut ($mine)"
@@ -423,6 +427,17 @@ fi
 has "TG-AC11 the snapshot states are off, awaiting, active, failed and noscope" "$(code_lines "$scenes")" 'case off, awaiting, active, failed, noscope'
 has "NS-AC5 the noscope state seeds an empty scope" "$(code_lines "$scenes")" 'session.scopeHosts = []'
 has "NS-AC5 reset restores the fixture scope" "$(code_lines "$scenes")" 'session.scopeHosts = Fixtures.scope'
+# Two enums in this file declare `func apply(to session: Session)`; cut the capture-state enum
+# first so the pins below cannot drift onto SnapshotScene.apply.
+cs_body=$(body_of "$scenes" 'enum CaptureSnapshotState')
+found "NS-AC5 CaptureSnapshotState body" "$cs_body"
+ordered "NS-AC5 every capture state starts from the fixture scope before the switch (no light-to-dark leak)" \
+    "$(line_of "$cs_body" 'session.scopeHosts = Fixtures.scope')" "$(line_of "$cs_body" 'switch self')"
+ordered "NS-AC5 only noscope empties the scope, after the per-state restore" \
+    "$(line_of "$cs_body" 'session.scopeHosts = Fixtures.scope')" "$(line_of "$cs_body" 'session.scopeHosts = \[\]')"
+has "NS-AC5 the apps scene keeps the first saved rows if applied twice" "$(code_lines "$scenes")" 'Self.savedRows ?? session.rows'
+has "NS-AC4 the Settings status row stops reading Capturing when the scope is empty" "$settings_code" 'Text("On, nothing in scope")'
+has "security-3 the poll loop refreshes the scope so the advice never argues with the core" "$(code_lines Sources/Aitmproxy/Bus/BusService.swift)" 'await refreshScope()'
 for seeded in '.inactive' '.pendingApproval' '.capturing' '.degraded('; do
     has "TG-AC11 a snapshot state seeds $seeded" "$(code_lines "$scenes")" "captureCapability = $seeded"
 done
@@ -435,18 +450,27 @@ has "TG-AC11 the capture loop runs in light and dark" "$(code_lines "$snap")" 'f
 # Spec docs/superpowers/specs/2026-10-31-ne-no-scope-honest-state-design.md. The extension is
 # deny-by-default on scope, so capture ON with an EMPTY scope captures nothing; both operator
 # surfaces must say so, and the Apps page must never hide captured flows behind a placeholder.
-settings_code=$(code_lines "$settings")
-shell_code=$(code_lines "$shell")
 has "NS-AC2 Settings computes the advice from the published capability, support and live scope" "$settings_code" 'CaptureAdvice.make('
 has "NS-AC2 Settings shows the empty-scope callout only when the advice offers Scope" "$settings_code" 'if advice.offersScope {'
 has "NS-AC2 Settings offers Open Scope" "$settings_code" 'Button("Open Scope'
 has "NS-AC2 Open Scope goes to the Scope page like Proxy > Scope" "$settings_code" 'session.show(.scope)'
 has "NS-AC3 the Apps banner view exists" "$shell_code" 'struct AppsAttributionBanner: View'
 has "NS-AC3 the Apps empty state view exists" "$shell_code" 'struct AppsEmptyState: View'
-has "NS-AC3 the Apps surfaces compute the advice" "$shell_code" 'CaptureAdvice.make('
-has "NS-AC3 the Apps surfaces offer Scope when the advice says so" "$shell_code" 'if advice.offersScope {'
-has "NS-AC3 the Apps surfaces offer Settings when capture is off" "$shell_code" 'advice.offersSettings'
-has "NS-AC3 Open Settings opens Settings" "$shell_code" 'openSettings()'
+banner_body=$(body_of "$shell" 'struct AppsAttributionBanner: View')
+empty_body=$(body_of "$shell" 'struct AppsEmptyState: View')
+found "NS-AC3 AppsAttributionBanner body" "$banner_body"
+found "NS-AC3 AppsEmptyState body" "$empty_body"
+for view in banner empty; do
+    eval "body=\$${view}_body"
+    has "NS-AC3 the Apps $view view computes the advice itself" "$body" 'CaptureAdvice.make('
+    has "NS-AC3 the Apps $view view offers Scope when the advice says so" "$body" 'if advice.offersScope {'
+    has "NS-AC3 the Apps $view view offers Settings when capture is off" "$body" 'advice.offersSettings'
+    has "NS-AC3 the Apps $view view's Open Settings lands on the Capture tab" "$body" 'session.settingsTab = .capture'
+    has "NS-AC3 the Apps $view view's Open Settings opens Settings" "$body" 'openSettings()'
+    hasnt "NS-AC3 the Apps $view view never toggles capture" "$body" 'CaptureSwitch|capture\.enabled|extensionController'
+done
+has "NS-AC3 the banner never promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'carry no source app'
+hasnt "NS-AC3 no advice copy promises app attribution" "$(code_lines Sources/AitmproxyKit/CaptureAdvice.swift)" 'attribute flows to apps|flows are attributed|needs the (macOS )?capture extension'
 has "NS-AC8 with flows present the Apps page keeps the table and shows the banner" "$shell_code" 'session.clients.isEmpty, !session.rows.isEmpty'
 has "NS-AC8 the full empty state shows only when there are no flows at all" "$shell_code" 'session.clients.isEmpty, session.rows.isEmpty'
 hasnt "NS-AC4 ShellView reads no capture.enabled key" "$shell_code" 'capture\.enabled'
@@ -455,6 +479,124 @@ hasnt "NS-AC4 ShellView never touches the controller handle" "$shell_code" 'exte
 has "NS-AC5 an apps-noattribution scene exists" "$(code_lines "$scenes")" 'case appsNoAttribution = "apps-noattribution"'
 has "NS-AC5 the apps scene strips the fixture clients" "$(code_lines "$scenes")" 'row.client = nil'
 has "NS-AC5 the apps scene seeds the empty-scope trap" "$(code_lines "$scenes")" 'CaptureSnapshotState.noscope.apply(to: session)'
+
+# ---- NS-AC2/3/5/8 scoped pins (Tester, stage 5) ---------------------------------------------
+# The file-level pins above cannot tell the Apps banner from the Apps empty state, Settings from
+# the rest of its file, a view that exists from a view that is rendered, or one switch case from
+# its siblings. Each check below is cut to the one struct, function or case it is about.
+# Mutation-tested against 25 realistic regressions (see the Tester report for stage 5).
+case_body() { # case_body FILE ERE: one switch case, from its label to the next case or the switch's closing brace
+    awk -v lab="$2" '
+        !f && $0 ~ lab { f = 1 }
+        f {
+            if (started && $0 ~ /^[[:space:]]*(case |default:|[}])/) exit
+            started = 1
+            code = $0
+            sub(/\/\/.*/, "", code)
+            print NR ":" code
+        }
+    ' "$1"
+}
+
+# NS-AC2: Settings > Capture. The callout sits under the Status row, only for the empty-scope advice.
+cap_body=$(body_of "$settings" '^struct CaptureSettings: View')
+found "NS-AC2 CaptureSettings" "$cap_body"
+has "NS-AC2 Settings feeds the advice the published capability" "$cap_body" 'capability: capability,'
+has "NS-AC2 Settings feeds the advice whether this build embeds the extension" "$cap_body" 'supported: health.captureSupported'
+has "NS-AC2 Settings feeds the advice the live scope size, not a constant" "$cap_body" 'scopeHostCount: session.scopeHosts.count'
+has "NS-AC2 the callout reads the advice headline" "$cap_body" 'advice.headline'
+has "NS-AC2 the callout reads the advice detail" "$cap_body" 'advice.detail'
+cap_status=$(line_of "$cap_body" 'LabeledContent[(]"Status"[)]')
+cap_gate=$(line_of "$cap_body" 'if advice[.]offersScope [{]')
+cap_button=$(line_of "$cap_body" 'Button[(]"Open Scope')
+cap_show=$(line_of "$cap_body" 'session[.]show[(][.]scope[)]')
+cap_reason=$(line_of "$cap_body" 'if let reason = capability[.]degradedReason')
+ordered "NS-AC2 the callout comes after the Status row" "$cap_status" "$cap_gate"
+ordered "NS-AC2 Open Scope sits inside the callout's offersScope gate" "$cap_gate" "$cap_button"
+ordered "NS-AC2 Open Scope calls session.show(.scope)" "$cap_button" "$cap_show"
+ordered "NS-AC2 the callout closes before the degraded reason line" "$cap_show" "$cap_reason"
+
+# NS-AC3/4: the two Apps surfaces. Each is advice-driven, offers each action only through its gate,
+# carries no hard-coded "extension" wording of its own, and never reaches the capture toggle.
+apps_surface() { # apps_surface <label> <struct body>
+    local label=$1 body=$2 g b sg sb
+    found "NS-AC3 $label" "$body"
+    has "NS-AC3 $label feeds the advice the published capability" "$body" 'capability: health.captureCapability'
+    has "NS-AC3 $label feeds the advice whether this build embeds the extension" "$body" 'supported: health.captureSupported'
+    has "NS-AC3 $label feeds the advice the live scope size, not a constant" "$body" 'scopeHostCount: session.scopeHosts.count'
+    g=$(line_of "$body" 'if advice[.]offersScope [{]')
+    b=$(line_of "$body" 'Button[(]"Open Scope')
+    sg=$(line_of "$body" 'else if advice[.]offersSettings [{]')
+    sb=$(line_of "$body" 'Button[(]"Open Settings')
+    ordered "NS-AC3 $label offers Open Scope only inside the offersScope gate" "$g" "$b"
+    ordered "NS-AC3 $label's Settings branch follows the Scope branch" "$b" "$sg"
+    ordered "NS-AC3 $label offers Open Settings only inside the offersSettings gate" "$sg" "$sb"
+    has "NS-AC3 $label's Open Scope opens the Scope page" "$(grep -F 'Button("Open Scope' <<<"$body")" 'session.show(.scope)'
+    has "NS-AC3 $label's Open Settings opens Settings (from its button on, in whatever shape the closure takes)" "$(awk -F: -v a="$sb" '$1 >= a' <<<"$body")" 'openSettings()'
+    hasnt "NS-AC3 $label has no hard-coded extension wording (the advice owns the words)" "$body" '"[^"]*[Ee]xtension'
+    hasnt "NS-AC4 $label never toggles capture or reads its stored choice" "$body" \
+        'CaptureSwitch|extensionController|capture[.]enabled|UserDefaults|AppStorage|[.]enable[(]|[.]disable[(]|restartCoreTick|captureChoice'
+}
+banner_body=$(body_of "$shell" '^struct AppsAttributionBanner: View')
+empty_body=$(body_of "$shell" '^struct AppsEmptyState: View')
+apps_surface "the Apps banner" "$banner_body"
+apps_surface "the Apps empty state" "$empty_body"
+has "NS-AC3 the Apps banner shows the one-line banner text" "$banner_body" 'Text(advice.banner)'
+has "NS-AC3 the Apps empty state shows the advice headline" "$empty_body" 'Label(advice.headline,'
+has "NS-AC3 the Apps empty state shows the advice detail" "$empty_body" 'Text(advice.detail)'
+
+# NS-AC8: MainView renders the banner above the table when flows exist, the empty state only when
+# there are none, and the flow table is the fallback. A view that exists but is never rendered fails here.
+main_body=$(body_of "$shell" '^struct MainView: View')
+found "NS-AC8 MainView" "$main_body"
+equals "NS-AC8 the banner is rendered exactly once" "$(grep -c -F 'AppsAttributionBanner()' <<<"$main_body")" "1"
+equals "NS-AC8 the empty state is rendered exactly once" "$(grep -c -F 'AppsEmptyState()' <<<"$main_body")" "1"
+main_bcond=$(line_of "$main_body" 'session[.]page == [.]apps, session[.]clients[.]isEmpty, !session[.]rows[.]isEmpty [{]')
+main_bcall=$(line_of "$main_body" 'AppsAttributionBanner[(][)]')
+main_split=$(line_of "$main_body" 'if session[.]splitView [{]')
+main_econd=$(line_of "$main_body" 'else if session[.]page == [.]apps, session[.]clients[.]isEmpty, session[.]rows[.]isEmpty [{]')
+main_ecall=$(line_of "$main_body" 'AppsEmptyState[(][)]')
+main_table=$(line_of "$main_body" '^[0-9]+:[[:space:]]*flowTable[[:space:]]*$')
+ordered "NS-AC8 the banner condition (flows present) guards the banner" "$main_bcond" "$main_bcall"
+ordered "NS-AC8 the banner sits above the flow table" "$main_bcall" "$main_split"
+ordered "NS-AC8 the empty-state condition (no flows) guards the empty state" "$main_econd" "$main_ecall"
+ordered "NS-AC8 the flow table is the fallback after the empty state" "$main_ecall" "$main_table"
+
+# NS-AC5: the two scenes are seeded as the spec says, restored afterwards (the apps scene edits the
+# shared fixture rows), and both are in the light + dark capture loops.
+noscope_body=$(case_body "$scenes" 'case [.]noscope:')
+found "NS-AC5 the noscope snapshot state" "$noscope_body"
+has "NS-AC5 noscope seeds capture ON (.capturing)" "$noscope_body" 'captureCapability = .capturing'
+has "NS-AC5 noscope seeds the persisted choice on" "$noscope_body" 'captureChoice = true'
+has "NS-AC5 noscope seeds an EMPTY scope" "$noscope_body" 'session.scopeHosts = []'
+apps_scene_body=$(case_body "$scenes" 'case [.]appsNoAttribution:')
+found "NS-AC5 the apps-noattribution scene" "$apps_scene_body"
+has "NS-AC5 the apps scene keeps the fixture rows to restore" "$apps_scene_body" 'Self.savedRows = '
+has "NS-AC5 the apps scene strips the client from every row" "$apps_scene_body" 'row.client = nil'
+has "NS-AC5 the apps scene lands on the Apps page" "$apps_scene_body" 'session.page = .apps'
+has "NS-AC5 the apps scene applies the noscope state" "$apps_scene_body" 'CaptureSnapshotState.noscope.apply(to: session)'
+scene_reset=$(body_of "$scenes" 'static func reset[(]_ session: Session[)]')
+found "NS-AC5 SnapshotScene.reset" "$scene_reset"
+has "NS-AC5 reset restores the fixture rows" "$scene_reset" 'session.rows = rows'
+has "NS-AC5 reset forgets the saved rows" "$scene_reset" 'savedRows = nil'
+has "NS-AC5 reset restores the capture snapshot state" "$scene_reset" 'CaptureSnapshotState.reset(session)'
+has "NS-AC5 every scene (apps-noattribution included) is captured in the light and dark loop" "$(code_lines "$snap")" 'for scene in SnapshotScene.allCases'
+has "NS-AC5 every capture state (noscope included) is captured in the light and dark loop" "$(code_lines "$snap")" 'for state in CaptureSnapshotState.allCases'
+
+# Scoped companions for the stage-6 fixes (Tester): the file-level pins above cannot tell a call in
+# pollLoop from the other refreshScope() callers, or the Status row branch from the generic one.
+poll_body=$(body_of Sources/Aitmproxy/Bus/BusService.swift 'private func pollLoop[(]')
+found "security-3 BusService.pollLoop" "$poll_body"
+poll_refresh=$(line_of "$poll_body" 'await refreshScope[(][)]')
+poll_flows=$(line_of "$poll_body" 'flow[.]list')
+ordered "security-3 pollLoop refreshes the scope on every pass, before it reads flows (inScope reads scopeHosts)" "$poll_refresh" "$poll_flows"
+status_empty=$(line_of "$cap_body" '[}] else if advice[.]offersScope [{]')
+status_text=$(line_of "$cap_body" 'Text[(]"On, nothing in scope"[)]')
+status_title=$(line_of "$cap_body" 'Text[(]capability[.]title[)]')
+ordered "NS-AC2 the Status row's empty-scope branch is tested first" "$status_empty" "$status_text"
+ordered "NS-AC2 the Status row reads 'On, nothing in scope' before the generic capability title branch" "$status_text" "$status_title"
+has "NS-AC3 the Apps banner stays on one line and truncates (a long degraded reason must not wrap into the fixed-height row)" "$banner_body" '.lineLimit(1)'
+has "NS-AC3 the Apps banner truncates at the tail" "$banner_body" '.truncationMode(.tail)'
 
 echo
 if [ "$failures" -eq 0 ]; then

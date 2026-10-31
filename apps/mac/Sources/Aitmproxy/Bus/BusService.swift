@@ -123,6 +123,10 @@ final class BusService: FlowActions {
     /// rebuilds the rows oldest-first. Finished flows are not re-fetched.
     private func pollLoop(_ client: BusClient) async throws {
         while !Task.isCancelled {
+            // Scope first: `inScope` below and the capture advice (Settings ▸ Capture, the Apps
+            // banner) read `scopeHosts`, and a host added from the CLI or another client must
+            // not leave them claiming an empty scope.
+            await refreshScope()
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
             for id in ids {
                 let cached = summaries[id]

@@ -20,7 +20,9 @@ public enum CaptureAdvice: Equatable, Sendable {
     case degraded(String)
     /// Capture is on but the scope is empty: nothing is captured until a host is added.
     case onEmptyScope
-    /// Capture is on with `hosts` hosts in scope; flows appear as they are contacted.
+    /// Capture is on with `hosts` hosts in scope; flows appear as they are contacted. Worded
+    /// "on", not "Capturing": `.approvedAttached` reaches here too, and its tunnel may still be
+    /// connecting — the capability's own `title` says which.
     case on(hosts: Int)
 
     /// `supported` is whether the running build embeds the extension
@@ -47,17 +49,17 @@ public enum CaptureAdvice: Equatable, Sendable {
     public var banner: String {
         switch self {
         case .unsupported:
-            "No app attribution \u{2014} grouping flows by app needs the capture extension."
+            "Flows carry no source app yet, so this page cannot group them."
         case .off:
-            "Capture is off \u{2014} turn it on in Settings \u{25B8} Capture to attribute flows to apps."
+            "Capture is off — turn it on in Settings ▸ Capture to capture other apps' traffic."
         case .awaitingApproval:
-            "Waiting for approval in System Settings \u{2014} flows are attributed once the extension is approved."
+            "Waiting for approval in System Settings — approve the extension to start capturing."
         case .degraded(let reason):
-            "Capture is degraded \u{2014} \(reason)"
+            "Capture is degraded — \(reason)"
         case .onEmptyScope:
-            "Capture is on, but the scope is empty \u{2014} add hosts to capture other apps' traffic."
+            "Capture is on, but the scope is empty — add hosts to capture other apps' traffic."
         case .on(let hosts):
-            "Capturing \(hosts == 1 ? "1 host" : "\(hosts) hosts") \u{2014} flows are not attributed to apps yet, so this page cannot group them."
+            "Capture is on, \(hosts == 1 ? "1 host" : "\(hosts) hosts") in scope — flows carry no source app yet, so this page cannot group them."
         }
     }
 
@@ -69,7 +71,7 @@ public enum CaptureAdvice: Equatable, Sendable {
         case .awaitingApproval: "Waiting for approval"
         case .degraded: "Capture is degraded"
         case .onEmptyScope: "Capture is on, but the scope is empty"
-        case .on: "Capturing"
+        case .on: "Capture is on"
         }
     }
 
@@ -77,7 +79,7 @@ public enum CaptureAdvice: Equatable, Sendable {
     public var detail: String {
         switch self {
         case .unsupported:
-            "Grouping flows by source app needs the macOS capture extension. Proxy capture alone cannot tell which app each flow came from."
+            "This build has no capture extension, and flows carry no source app yet, so there is nothing to group here."
         case .off:
             "Turn on Capture L4 traffic in Settings ▸ Capture to capture other apps' traffic."
         case .awaitingApproval:
@@ -85,10 +87,10 @@ public enum CaptureAdvice: Equatable, Sendable {
         case .degraded(let reason):
             reason
         case .onEmptyScope:
-            "Nothing is captured until you add the hosts to capture. Open Scope and add a host or a *.wildcard."
+            "Nothing is captured until you add a host to capture, such as example.com or *.example.com."
         case .on(let hosts):
             hosts == 1
-                ? "1 host is in scope. Flows appear here as it is contacted."
+                ? "1 host is in scope. Flows appear here as that host is contacted."
                 : "\(hosts) hosts are in scope. Flows appear here as they are contacted."
         }
     }

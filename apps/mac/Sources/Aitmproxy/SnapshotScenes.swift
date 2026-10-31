@@ -91,7 +91,7 @@ enum SnapshotScene: String, CaseIterable {
         case .appsNoAttribution:
             // Live reality (NS-AC8): captured flows carry no source app, so the Apps page
             // cannot group them. The table must stay, with the capture-state banner above it.
-            Self.savedRows = session.rows
+            Self.savedRows = Self.savedRows ?? session.rows
             session.rows = session.rows.map { var row = $0; row.client = nil; return row }
             session.page = .apps
             CaptureSnapshotState.noscope.apply(to: session)
@@ -254,6 +254,9 @@ enum CaptureSnapshotState: String, CaseIterable {
 
     func apply(to session: Session) {
         session.coreHealth.captureSupported = true
+        // Every state starts from the fixture scope; only `noscope` empties it, so a state
+        // never inherits the previous one's scope (the light pass must not leak into dark).
+        session.scopeHosts = Fixtures.scope
         switch self {
         case .off:
             session.coreHealth.captureCapability = .inactive
