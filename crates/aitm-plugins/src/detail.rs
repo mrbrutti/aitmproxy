@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use aitm_core::{
     Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse, HttpVersion,
@@ -337,8 +337,7 @@ fn meta(m: &FlowMeta) -> Value {
     obj.insert("created".into(), rfc3339(m.created));
     obj.insert(
         "duration_ms".into(),
-        m.duration
-            .map_or(Value::Null, |d| Value::Int(duration_ms(d))),
+        m.duration_ms().map_or(Value::Null, Value::Int),
     );
     obj.insert("truncated".into(), Value::Bool(m.truncated));
     obj.insert("edited".into(), Value::Bool(m.edited));
@@ -356,10 +355,6 @@ fn version(v: HttpVersion) -> &'static str {
         HttpVersion::Http11 => "HTTP/1.1",
         HttpVersion::H2 => "HTTP/2",
     }
-}
-
-fn duration_ms(d: Duration) -> i64 {
-    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// A `SystemTime` as an RFC3339 UTC string, or `Null` for a time outside the

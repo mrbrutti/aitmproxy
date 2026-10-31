@@ -125,3 +125,27 @@ fn flow_meta_duration_ms_is_whole_millis_saturated_or_none() {
     };
     assert_eq!(absurd.duration_ms(), Some(i64::MAX));
 }
+
+/// Tester addition (spec D7: `started_at_ms` is `created` since `UNIX_EPOCH` in
+/// whole ms, "saturated to `i64::MAX`"). Oversized input: a clock so far in the
+/// future that its millisecond count exceeds `i64` is `Some(i64::MAX)`, never a
+/// wrapped or truncated number. `duration_ms` has its own saturation test; this
+/// pins the rule for `started_at` so the two cannot drift apart.
+#[test]
+fn flow_meta_started_at_ms_saturates_a_far_future_clock() {
+    // ~1.1 billion years. Unix-like `SystemTime` (i64 seconds) represents it; a
+    // platform whose clock type cannot has no way to reach the path, so there
+    // is nothing to check there.
+    let Some(far_future) = UNIX_EPOCH.checked_add(Duration::from_secs(1 << 55)) else {
+        return;
+    };
+    assert!(
+        Duration::from_secs(1 << 55).as_millis() > i64::MAX as u128,
+        "fixture must overflow i64 milliseconds to exercise saturation"
+    );
+    let meta = FlowMeta {
+        created: far_future,
+        ..FlowMeta::default()
+    };
+    assert_eq!(meta.started_at_ms(), Some(i64::MAX));
+}
