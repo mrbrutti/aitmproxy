@@ -23,14 +23,18 @@ struct ScopePanel: View {
     init(showsLabel: Bool = true) { self.showsLabel = showsLabel }
 
     /// Fixed columns after Host; Host takes what is left, at least `hostMin`.
-    private static let limitWidth: CGFloat = 220
+    private static let limitWidth: CGFloat = 160
     private static let backoffWidth: CGFloat = 88
     private static let flowsWidth: CGFloat = 44
     private static let hostMin: CGFloat = 176
     private static let maxVisibleRows = 4
 
     private var hostWidth: CGFloat {
-        let fixed = Self.limitWidth + Self.backoffWidth + Self.flowsWidth + Tok.Size.control + Space.md * 6
+        // The row's real trailing consumption beyond Host: the three fixed columns,
+        // the ✕ button, the five inter-cell gaps, and the row's own side padding —
+        // seven Space.md gaps in all. Undercounting this overflowed the sheet and
+        // clipped the leading edge ("HOST" → "OST").
+        let fixed = Self.limitWidth + Self.backoffWidth + Self.flowsWidth + Tok.Size.control + Space.md * 7
         return max(Self.hostMin, width - fixed)
     }
 
@@ -49,19 +53,25 @@ struct ScopePanel: View {
             if showsLabel {
                 Text("SCOPE").font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
                     .foregroundStyle(Tok.Ink.tertiary.color)
+                    .gridProbe("scope-title", area: "scope-panel")
                     .padding(.horizontal, Space.lg).padding(.top, Space.lg).padding(.bottom, Space.sm)
                     .accessibilityAddTraits(.isHeader)
             }
             addRow
             if entries.isEmpty {
-                Text("No hosts in scope — add one to authorise testing; everything stays read-only until then.")
-                    .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
-                    .padding(.horizontal, Space.lg).padding(.bottom, Space.lg)
+                ContentUnavailableView {
+                    Label("No hosts in scope", systemImage: Tok.Glyph.scope)
+                } description: {
+                    Text("Add a host above to authorise testing. Everything stays read-only until then.")
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.bottom, Space.lg)
             } else {
                 table
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .gridArea("scope-panel", inset: 0)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .onAppear {
             // Flow ▸ Add Host to Scope… (⇧S) opens with the focused row's host typed in.
@@ -101,6 +111,7 @@ struct ScopePanel: View {
                 Text(validation).font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Intercept.deep.color)
             }
         }
+        .gridProbe("scope-add", area: "scope-panel")
         .padding(.horizontal, Space.lg).padding(.bottom, Space.md)
     }
 
@@ -117,7 +128,8 @@ struct ScopePanel: View {
 
     private var table: some View {
         VStack(spacing: 0) {
-            ColumnHeads(columns: [("Host", hostWidth), ("Limit", Self.limitWidth), ("Back-off", Self.backoffWidth), ("Flows", Self.flowsWidth)])
+            tableHeader
+                .gridProbe("scope-table", area: "scope-panel", edge: nil)
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(entries) { entry in row(entry) }
@@ -131,6 +143,29 @@ struct ScopePanel: View {
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Scope entries")
         }
+    }
+
+    /// Local header so the Flows column can trailing-align with its numbers; the
+    /// first three columns match the row's leading cells one-for-one.
+    private var tableHeader: some View {
+        HStack(spacing: Space.md) {
+            headCell("Host", width: hostWidth)
+            headCell("Limit", width: Self.limitWidth)
+            headCell("Back-off", width: Self.backoffWidth)
+            headCell("Flows", width: Self.flowsWidth, alignment: .trailing)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Space.md)
+        .frame(height: Tok.Size.columnHeader)
+        .overlay(alignment: .bottom) { Rule() }
+        .accessibilityHidden(true)
+    }
+
+    private func headCell(_ title: String, width: CGFloat, alignment: Alignment = .leading) -> some View {
+        Text(title.uppercased())
+            .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.5)
+            .foregroundStyle(Tok.Ink.tertiary.color).lineLimit(1)
+            .frame(width: width, alignment: alignment)
     }
 
     private func row(_ entry: ScopeEntry) -> some View {
@@ -147,7 +182,7 @@ struct ScopePanel: View {
                     .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
                 cell(entry.limit?.backoffText ?? Format.dash, width: Self.backoffWidth)
                     .foregroundStyle(entry.limit == nil ? Tok.Ink.tertiary.color : Tok.Ink.secondary.color)
-                cell(String(entry.flowCount(in: session.rows)), width: Self.flowsWidth)
+                cell(String(entry.flowCount(in: session.rows)), width: Self.flowsWidth, alignment: .trailing)
                     .foregroundStyle(ink).monospacedDigit()
                 Spacer(minLength: 0)
                 Button { remove(entry.host) } label: {
@@ -176,8 +211,8 @@ struct ScopePanel: View {
         .accessibilityAddTraits(isSelected ? .isSelected : [])
     }
 
-    private func cell(_ text: String, width: CGFloat) -> some View {
-        Text(text).lineLimit(1).truncationMode(.tail).frame(width: width, alignment: .leading).help(text)
+    private func cell(_ text: String, width: CGFloat, alignment: Alignment = .leading) -> some View {
+        Text(text).lineLimit(1).truncationMode(.tail).frame(width: width, alignment: alignment).help(text)
     }
 
     // MARK: Remove

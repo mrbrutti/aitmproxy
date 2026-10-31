@@ -216,22 +216,25 @@ struct FindingsPanel: View {
         HStack(spacing: 0) {
             list
                 .frame(width: 320)
+                .gridProbe("findings-list", area: "findings", edge: nil)
             VRule()
             FindingDetail(state: state)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        .gridArea("findings")
+        .gridArea("findings", inset: 0)
         .onAppear { if state.findings.isEmpty { state.load() } }
     }
 
     @ViewBuilder private var list: some View {
         if state.findings.isEmpty {
-            VStack(spacing: Space.sm) {
-                Text("No findings").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
-                Text("Build a PoC from any flow with p.").font(Tok.Face.ui(Tok.Typography.Size.md))
-                    .foregroundStyle(Tok.Ink.tertiary.color)
+            ContentUnavailableView {
+                Label("No findings", systemImage: Tok.Glyph.poc)
+            } description: {
+                Text("Build a PoC from any flow (press p) to record a finding here.")
+            } actions: {
+                FlatButton("Open Flows") { state.session.show(.apps) }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Tok.Ground.surface.color)
@@ -288,7 +291,7 @@ struct FindingRow: View {
 
     @ViewBuilder private var result: some View {
         if finding.hasRun {
-            Image(systemName: finding.passed ? "checkmark" : "xmark")
+            Image(systemName: finding.passed ? "checkmark.circle" : "xmark.circle")
                 .font(.system(size: Tok.Size.iconInline, weight: .medium))
                 .foregroundStyle((finding.passed ? Tok.Ink.secondary : Tok.Status.serverError).color)
         } else {
