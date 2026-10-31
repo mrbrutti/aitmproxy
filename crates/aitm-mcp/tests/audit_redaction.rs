@@ -780,3 +780,70 @@ fn multi_line_and_multi_value_headers_are_default_deny() {
         failures.join("\n")
     );
 }
+
+// ------------- collection keys, plain maps, nesting, names (R4 fix 2)
+
+/// Header-collection shapes added by R4 fix 2, as `(arguments, expected audit
+/// args)`. They sit under the accepted `a` parameter so the fixture stays as it is.
+/// The secret-bearing values are canaries.
+fn collection_context_rows() -> Vec<(JsonValue, JsonValue)> {
+    let c = canary;
+    vec![
+        // a key that merely contains `headers`.
+        (
+            json!({"a": {"extra_headers": {"X-Debug": c(50), "Host": "h"}}}),
+            json!({"a": {"extra_headers": {"X-Debug": R, "Host": "h"}}}),
+        ),
+        (
+            json!({"a": {"custom_headers": [["X-Debug", c(51)]]}}),
+            json!({"a": {"custom_headers": [["X-Debug", R]]}}),
+        ),
+        // a plain map inside an array.
+        (
+            json!({"headers": [{"X-Debug": c(52), "Host": "h"}]}),
+            json!({"headers": [{"X-Debug": R, "Host": "h"}]}),
+        ),
+        // nesting: a pair three arrays deep, an object under a benign name.
+        (
+            json!({"headers": [[["X-Zed", c(53)]]]}),
+            json!({"headers": [[["X-Zed", R]]]}),
+        ),
+        (
+            json!({"headers": {"Host": {"k": c(54)}}}),
+            json!({"headers": {"Host": R}}),
+        ),
+        // a header line after a benign first element of a direct array.
+        (
+            json!({"headers": ["Host", format!("X-Debug: {}", c(55))]}),
+            json!({"headers": ["Host", format!("X-Debug: {T}")]}),
+        ),
+        // a header name that is a credential, and one that carries a header line.
+        (
+            json!({"headers": {format!("ghp_{}{}", c(56), "a".repeat(30)): "v"}}),
+            json!({"headers": {T: R}}),
+        ),
+        (
+            json!({"headers": {format!("X-A\r\nX-Debug: {}", c(57)): "v"}}),
+            json!({"headers": {format!("X-A\r\nX-Debug: {T}"): R}}),
+        ),
+        // scalars and plain strings under header-like keys are not touched.
+        (
+            json!({"a": {"include_headers": true, "header_name": "X-Foo", "headers_count": 5}}),
+            json!({"a": {"include_headers": true, "header_name": "X-Foo", "headers_count": 5}}),
+        ),
+    ]
+}
+
+/// Keys that name headers, plain maps, nested arrays, direct-array header lines and
+/// credential-shaped names are default-deny through the real server, with the ring,
+/// the pushed line and `agent.activity` in agreement and no canary on any of them.
+#[test]
+fn header_collection_context_is_default_deny() {
+    let failures = row_failures(collection_context_rows());
+    assert!(
+        failures.is_empty(),
+        "{} row(s) wrong:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

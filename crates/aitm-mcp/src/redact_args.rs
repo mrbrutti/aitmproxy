@@ -18,12 +18,23 @@
 //!    `keys` and `string` replaced (`{"selector":"#password","text":"x"}`). Names
 //!    and every other member stay.
 //! 3. **Rule D** (default-deny, inside a header collection only). A header
-//!    collection is an object or an array under a key named `headers`, `header`,
-//!    `request_headers`, `response_headers`, `req_headers`, `resp_headers` or
-//!    `http_headers` (case-insensitive), at any depth. Inside one, a header's value
-//!    is kept only when its name is on the benign list and is not a strict secret
-//!    key; every other value is replaced by `"<redacted>"` whatever its type. The
-//!    names stay. The shapes a header takes in an array:
+//!    collection is what sits under a key whose ASCII-lowercased name contains
+//!    `header` or `hdr`, or is `trailer` or `trailers` (`headers`, `extra_headers`,
+//!    `custom_headers`, `hdrs`, `req_hdrs`, `trailers`, ...), at any depth. Everything
+//!    below such a key keeps the header context: an array of arrays, an array of
+//!    maps, a map of maps. A boolean, a number or a string with no header shape under
+//!    such a key (`include_headers: true`, `header_name: "X-Foo"`) is left as it is.
+//!    Inside a collection, a header's value is kept only when its name is on the
+//!    benign list and is not a strict secret key; every other value is replaced by
+//!    `"<redacted>"` whatever its type. A value that is kept (the value of a **kept**
+//!    name) must be a string or a number, boolean or null: an object is replaced, and
+//!    so is a container nested in a list of values (a list of scalars and strings is
+//!    the multi-value form of the header and stays). The names stay, but each name
+//!    inside a collection (a map key, a pair name, a `name`/`key`/`header` member, the
+//!    keys of a header object) passes the strict text pass and is cut at
+//!    [`NAME_EXAMINE_BYTES`] bytes. The shapes a header takes:
+//!    - a plain map (an object with no name member) in an array, or a map under a
+//!      collection key: each member is a header, rule D by key;
 //!    - an array of two or more elements whose first element is a string, **whatever
 //!      the types of the rest** (`["X-N", 5]`, `["X-Zed", "a", "b"]`): the first
 //!      element is the name and rule D decides **every** later element by it. It is
@@ -31,7 +42,9 @@
 //!      (`"headers": ["X-Debug", "v"]`) and its first element is a header token (a
 //!      line such as `["Cookie: a=b", "X-Debug: c"]` is two lines, below; a bare
 //!      list of two header names reads as a name and its value, an accepted
-//!      over-redaction);
+//!      over-redaction). In that direct form, a later element that is a raw header
+//!      line (`token:` then a blank or the end, so `https://x/` is not one) is judged
+//!      as a line by its name;
 //!    - an object with a `name`, `key` or `header` member: its members other than
 //!      the name members keep their value only when the name keeps its value, and
 //!      are otherwise **all** replaced by `"<redacted>"` (a `values` list and any
@@ -54,8 +67,8 @@
 //!
 //! Every string that is kept (a leaf, a kept header value) passes
 //! `aitm_core::redact_strict::scrub_strict`, so a credential inside prose, a URL or
-//! a free-text body is masked by content too. Numbers, booleans, nulls and the
-//! object keys themselves are untouched.
+//! a free-text body is masked by content too. Numbers, booleans and nulls are
+//! untouched, and so are object keys outside header collections.
 //!
 //! **The work is bounded** (Design 14.6): a string leaf is examined only up to its
 //! first [`LEAF_EXAMINE_BYTES`] bytes and the whole value only up to
@@ -63,7 +76,14 @@
 //! (the object's own iteration order, so the same arguments always give the same
 //! entry). Text beyond the bound is dropped and shown as the single character `…`;
 //! once the total is spent every later string leaf is `…`. Numbers, booleans, nulls,
-//! object keys and values that are replaced by `"<redacted>"` cost nothing.
+//! object keys outside header collections and values that are replaced by
+//! `"<redacted>"` cost nothing. A name string inside a header collection (a pair
+//! name, a `name` member) is a string leaf, cut at [`NAME_EXAMINE_BYTES`] and charged
+//! to that budget; the object keys inside header collections are charged to a pool of
+//! their own, [`TOTAL_EXAMINE_BYTES`] bytes with the same cut, so they cost the leaves
+//! nothing. Two names that become the same text after the cut or the mask share one
+//! key in the output: the later one overwrites the earlier (a collision can lose a
+//! name, never reveal a value).
 //!
 //! The function is `pub`, and not private to the server, because the durable
 //! writer reuses it: for an `args` text that parses as JSON it applies this same
@@ -94,17 +114,9 @@ const LEAF_EXAMINE_BYTES: usize = 4096;
 /// (Design 14.6).
 const TOTAL_EXAMINE_BYTES: usize = 64 * 1024;
 
-/// Keys whose object or array value is a header collection (compared
-/// ASCII-case-insensitively).
-const HEADER_COLLECTION_KEYS: [&str; 7] = [
-    "headers",
-    "header",
-    "request_headers",
-    "response_headers",
-    "req_headers",
-    "resp_headers",
-    "http_headers",
-];
+/// The most bytes of one name inside a header collection that are examined: a map
+/// key, a pair name, a `name` member (cut on a char boundary, with `…`).
+const NAME_EXAMINE_BYTES: usize = 256;
 
 /// Sibling keys that name a thing (a header, a form field, a selector): when the
 /// name is a strict secret key, the sibling value keys hold its secret.
@@ -135,7 +147,10 @@ pub fn redact_value(value: &Value) -> Value {
 /// How much string text the traversal may still examine. One per
 /// [`redact_value`] call, spent in the order the walk visits the value.
 struct Budget {
+    /// Bytes of string leaves (and name strings) still to examine.
     left: usize,
+    /// Bytes of object keys inside header collections still to examine.
+    keys_left: usize,
 }
 
 /// What [`Budget::take`] grants a string leaf.
@@ -150,33 +165,52 @@ impl Budget {
     fn new() -> Budget {
         Budget {
             left: TOTAL_EXAMINE_BYTES,
+            keys_left: TOTAL_EXAMINE_BYTES,
         }
     }
 
-    /// Grant `text` its examined start: at most [`LEAF_EXAMINE_BYTES`] and at most
-    /// what is left of the total, cut back to a char boundary, and charge that
-    /// many bytes. A spent budget grants nothing, even to an empty string.
+    /// Grant a string leaf its examined start (see [`grant`]): at most
+    /// [`LEAF_EXAMINE_BYTES`] and what is left of the leaf budget.
     fn take<'a>(&mut self, text: &'a str) -> Granted<'a> {
-        if self.left == 0 {
-            return Granted::Nothing;
-        }
-        let allowed = LEAF_EXAMINE_BYTES.min(self.left);
-        if text.len() <= allowed {
-            self.left -= text.len();
-            return Granted::Head {
-                head: text,
-                cut: false,
-            };
-        }
-        let mut end = allowed;
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        self.left -= end;
-        Granted::Head {
-            head: &text[..end],
-            cut: true,
-        }
+        grant(&mut self.left, LEAF_EXAMINE_BYTES, text)
+    }
+
+    /// Grant a name string (a pair name, a `name` member) its examined start: at most
+    /// [`NAME_EXAMINE_BYTES`], charged to the leaf budget.
+    fn take_name<'a>(&mut self, text: &'a str) -> Granted<'a> {
+        grant(&mut self.left, NAME_EXAMINE_BYTES, text)
+    }
+
+    /// Grant an object key inside a header collection its examined start: at most
+    /// [`NAME_EXAMINE_BYTES`], charged to the pool of keys.
+    fn take_key<'a>(&mut self, text: &'a str) -> Granted<'a> {
+        grant(&mut self.keys_left, NAME_EXAMINE_BYTES, text)
+    }
+}
+
+/// Grant `text` its examined start: at most `cap` bytes and at most what is `left` in
+/// its pool, cut back to a char boundary, and charge that many bytes to the pool. A
+/// spent pool grants nothing, even to an empty string.
+fn grant<'a>(left: &mut usize, cap: usize, text: &'a str) -> Granted<'a> {
+    if *left == 0 {
+        return Granted::Nothing;
+    }
+    let allowed = cap.min(*left);
+    if text.len() <= allowed {
+        *left -= text.len();
+        return Granted::Head {
+            head: text,
+            cut: false,
+        };
+    }
+    let mut end = allowed;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    *left -= end;
+    Granted::Head {
+        head: &text[..end],
+        cut: true,
     }
 }
 
@@ -197,6 +231,24 @@ fn redacted() -> Value {
 /// Whether `key` is one of `wanted`, ignoring ASCII case.
 fn key_is(key: &str, wanted: &[&str]) -> bool {
     wanted.iter().any(|w| key.eq_ignore_ascii_case(w))
+}
+
+/// Whether `haystack` contains `needle` (non-empty, ASCII), ignoring ASCII case.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
+/// Whether a key makes what is below it a header collection: its name contains
+/// `header` or `hdr` (`headers`, `extra_headers`, `hdrs`, `req_hdrs`), or is
+/// `trailer` or `trailers`, whatever the case.
+fn is_header_collection_key(key: &str) -> bool {
+    contains_ignore_ascii_case(key, "header")
+        || contains_ignore_ascii_case(key, "hdr")
+        || key.eq_ignore_ascii_case("trailer")
+        || key.eq_ignore_ascii_case("trailers")
 }
 
 /// The strict text pass over the examined start of a leaf. A cut start carries the
@@ -247,7 +299,8 @@ fn walk(value: &Value, budget: &mut Budget) -> Value {
 
 /// An object's members. `header_entry` says the object is one element of a header
 /// collection that has a name member, so rule D decides its members: when no name
-/// member keeps its value, every member other than the name members is hidden.
+/// member keeps its value, every member other than the name members is hidden. The
+/// keys of such an object are names inside a header collection ([`key_text`]).
 fn walk_object(
     map: &Map<String, Value>,
     header_entry: bool,
@@ -262,10 +315,10 @@ fn walk_object(
                 || (hide_members && !key_is(key, &HEADER_NAME_KEYS));
             let out = if hidden {
                 redacted()
-            } else if key_is(key, &HEADER_COLLECTION_KEYS) {
-                walk_header_collection(val, budget)
             } else if header_entry && key_is(key, &HEADER_NAME_KEYS) {
                 walk_name(val, budget)
+            } else if is_header_collection_key(key) {
+                walk_header_collection(val, budget)
             } else if header_entry {
                 // A member of a header object that was not hidden: the name keeps
                 // its value, so this member holds a kept value.
@@ -273,7 +326,12 @@ fn walk_object(
             } else {
                 walk(val, budget)
             };
-            (key.clone(), out)
+            let shown = if header_entry {
+                key_text(key, budget)
+            } else {
+                key.clone()
+            };
+            (shown, out)
         })
         .collect()
 }
@@ -340,32 +398,21 @@ fn is_header_token(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(is_token_byte)
 }
 
-/// A header collection (rule D): the value of a header-collection key.
+/// A header collection (rule D): what sits under a header-collection key, and
+/// everything below it (see [`is_header_collection_key`]).
 ///
-/// An object maps header names to values. An array holds header arrays
-/// `[name, value, ..]`, header objects `{name, value, ..}` and raw header lines
-/// `"Name: value"` (see [`walk_header_entry`]); an element of none of these shapes
-/// takes the general walk. An array that is itself a header array whose first
-/// element is a header token (`"headers": ["X-Debug", "v"]`) is read as one. A string
-/// is a block of header text (see [`header_block`]). Anything else (a number) takes
-/// the general walk.
+/// An object is a header map ([`walk_header_map`]). An array holds header arrays
+/// `[name, value, ..]`, header objects `{name, value, ..}`, plain maps, raw header
+/// lines `"Name: value"` and further arrays, each by its shape (see
+/// [`walk_header_entry`]). An array that is itself a header array whose first element
+/// is a header token (`"headers": ["X-Debug", "v"]`) is read as one. A string is a
+/// block of header text (see [`header_block`]). A number, a boolean or a null stays.
 fn walk_header_collection(value: &Value, budget: &mut Budget) -> Value {
     match value {
-        Value::Object(map) => Value::Object(
-            map.iter()
-                .map(|(name, val)| {
-                    let out = if keeps_value_of(name) {
-                        walk_kept(val, budget)
-                    } else {
-                        redacted()
-                    };
-                    (name.clone(), out)
-                })
-                .collect(),
-        ),
+        Value::Object(map) => Value::Object(walk_header_map(map, budget)),
         Value::Array(items) => match items.as_slice() {
             [Value::String(name), rest @ ..] if !rest.is_empty() && is_header_token(name) => {
-                header_values(name, rest, budget)
+                header_values(name, rest, true, budget)
             }
             _ => Value::Array(
                 items
@@ -375,62 +422,105 @@ fn walk_header_collection(value: &Value, budget: &mut Budget) -> Value {
             ),
         },
         Value::String(text) => header_block(text, budget),
-        other => walk(other, budget),
+        other => other.clone(),
     }
+}
+
+/// A map of headers: each member is a header, rule D by its key, and the key is a name
+/// ([`key_text`]). A kept value is a scalar, a string or a list of them
+/// ([`walk_kept`]); any other value is hidden.
+///
+/// Two keys that are the same text after the cut or the mask share one output key, and
+/// the later one overwrites the earlier (a collision can lose a name, never reveal a
+/// value).
+fn walk_header_map(map: &Map<String, Value>, budget: &mut Budget) -> Map<String, Value> {
+    map.iter()
+        .map(|(name, val)| {
+            let out = if keeps_value_of(name) {
+                walk_kept(val, budget)
+            } else {
+                redacted()
+            };
+            (key_text(name, budget), out)
+        })
+        .collect()
 }
 
 /// The value of a header the name of which keeps its value: a string reads its later
-/// lines as header lines ([`kept_value`]), an array does so per element (rule S still
-/// applies to a pair inside it), anything else takes the general walk.
+/// lines as header lines ([`kept_value`]); a number, a boolean or a null stays; an
+/// array is the multi-value form, each string element read the same way, rule S still
+/// applying to a pair inside it, and a container inside it hidden; an object is hidden.
 fn walk_kept(value: &Value, budget: &mut Budget) -> Value {
     match value {
         Value::String(text) => kept_value(text, budget),
-        Value::Array(items) => Value::Array(walk_array_with(items, budget, walk_kept)),
-        other => walk(other, budget),
+        Value::Array(items) => Value::Array(walk_array_with(items, budget, walk_kept_scalar)),
+        Value::Object(_) => redacted(),
+        other => other.clone(),
     }
 }
 
-/// A name member of a header object: a string is a block of header text (a name
-/// that carries a line break and a header line is judged like any block).
+/// An element of a list of kept values: a string is read as a kept value, a number, a
+/// boolean or a null stays, and an object or a list is hidden.
+fn walk_kept_scalar(value: &Value, budget: &mut Budget) -> Value {
+    match value {
+        Value::String(text) => kept_value(text, budget),
+        Value::Array(_) | Value::Object(_) => redacted(),
+        other => other.clone(),
+    }
+}
+
+/// A name member of a header object: a string is a name ([`name_string`]); anything
+/// else keeps the header context ([`walk_header_collection`]).
 fn walk_name(value: &Value, budget: &mut Budget) -> Value {
     match value {
-        Value::String(text) => header_block(text, budget),
-        other => walk(other, budget),
+        Value::String(text) => name_string(text, budget),
+        other => walk_header_collection(other, budget),
     }
 }
 
-/// A header array `[name, value, ..]`: the name is a block of header text, and rule D
+/// A header array `[name, value, ..]`: the name is a name ([`name_string`]), and rule D
 /// decides **every** later element by it, whatever its type: kept (as a kept value)
-/// for a name that keeps its value, replaced by `"<redacted>"` otherwise.
-fn header_values(name: &str, rest: &[Value], budget: &mut Budget) -> Value {
-    let mut shown = vec![header_block(name, budget)];
+/// for a name that keeps its value, replaced by `"<redacted>"` otherwise. With
+/// `lines_after` (the array is the whole value of a header key) a kept element that is
+/// a raw header line is judged as a line by its name ([`is_header_line_text`]).
+fn header_values(name: &str, rest: &[Value], lines_after: bool, budget: &mut Budget) -> Value {
+    let mut shown = vec![name_string(name, budget)];
     let kept = keeps_value_of(name);
-    shown.extend(rest.iter().map(|value| {
-        if kept {
-            walk_kept(value, budget)
-        } else {
-            redacted()
-        }
-    }));
+    for value in rest {
+        shown.push(match value {
+            _ if !kept => redacted(),
+            Value::String(text) if lines_after && is_header_line_text(text) => {
+                header_line(text, budget)
+            }
+            other => walk_kept(other, budget),
+        });
+    }
     Value::Array(shown)
 }
 
 /// One element of a header-collection array: an array of two or more elements whose
-/// first element is a string (a name and its values), an object with a name member,
-/// or a raw header line; anything else takes the general walk.
+/// first element is a string (a name and its values), an object with a name member (a
+/// header object), any other object (a header map), a raw header line, or any other
+/// array (a nested header collection); a number, a boolean or a null stays.
 fn walk_header_entry(entry: &Value, budget: &mut Budget) -> Value {
     match entry {
         Value::Array(items) => match items.as_slice() {
             [Value::String(name), rest @ ..] if !rest.is_empty() => {
-                header_values(name, rest, budget)
+                header_values(name, rest, false, budget)
             }
-            _ => walk(entry, budget),
+            _ => Value::Array(
+                items
+                    .iter()
+                    .map(|item| walk_header_entry(item, budget))
+                    .collect(),
+            ),
         },
         Value::Object(map) if is_header_object(map) => {
             Value::Object(walk_object(map, true, budget))
         }
+        Value::Object(map) => Value::Object(walk_header_map(map, budget)),
         Value::String(line) => header_line(line, budget),
-        other => walk(other, budget),
+        other => other.clone(),
     }
 }
 
@@ -486,7 +576,40 @@ fn header_line(line: &str, budget: &mut Budget) -> Value {
     })
 }
 
-/// A block of header text: a string under a header-collection key, a header name, an
+/// The text a name is shown as: its examined start (see [`Budget::take_name`] and
+/// [`Budget::take_key`]) with the header lines in it judged by name and then the strict
+/// text pass, so a credential used as a name and a name that carries a line break and
+/// a header line are masked. `…` once the pool is spent.
+fn name_text(granted: Granted<'_>) -> String {
+    match granted {
+        Granted::Nothing => ELLIPSIS.to_string(),
+        Granted::Head { head, cut } => scrub_header_text(head, cut, false),
+    }
+}
+
+/// A name string inside a header collection (a pair name, a `name` member): cut at
+/// [`NAME_EXAMINE_BYTES`] and charged to the leaf budget.
+fn name_string(name: &str, budget: &mut Budget) -> Value {
+    Value::String(name_text(budget.take_name(name)))
+}
+
+/// An object key inside a header collection: cut at [`NAME_EXAMINE_BYTES`] and charged
+/// to the pool of keys, which leaves the leaf budget alone.
+fn key_text(key: &str, budget: &mut Budget) -> String {
+    name_text(budget.take_key(key))
+}
+
+/// Whether `text` is a raw header line: `Name:` with a header token for the name,
+/// followed by a blank or the end of the text. `https://x/` is not one (no blank after
+/// its colon); `X-Debug: v` and `X-Debug:` are.
+fn is_header_line_text(text: &str) -> bool {
+    split_header_line(text).is_some_and(|parts| {
+        let after = &text[parts.name_part.len() + 1..];
+        after.is_empty() || after.starts_with([' ', '\t'])
+    })
+}
+
+/// A block of header text: a string under a header-collection key, an
 /// element that is not a `Name: value` line. It is examined within the budget, its
 /// header lines are judged by name ([`hide_header_lines`]), and the whole text then
 /// takes the strict text pass (so a private key block that has header lines inside is
@@ -734,8 +857,11 @@ mod tests {
                     {"name": "Referer", "value": "https://x.test/?token=[redacted]", "note": "a"},
                 ]}),
             ),
+            // Changed by R4 fix 2 (item 2): an object element with no name member used to
+            // take the general walk, so `{"anything": "else"}` stayed. It is a header map
+            // now: rule D applies to its members by key.
             (
-                "an element of neither shape takes the general walk",
+                "an object with no name member is a header map, the rest by shape",
                 json!({"headers": [
                     ["X-Zed", "z"],
                     "Cookie: a=b",
@@ -746,7 +872,7 @@ mod tests {
                     ["X-Zed", KEY_REDACTED],
                     "Cookie: [redacted]",
                     ["Accept", "t", "extra"],
-                    {"anything": "else"},
+                    {"anything": KEY_REDACTED},
                 ]}),
             ),
         ]);
@@ -1557,6 +1683,403 @@ mod tests {
                 json!({"a": nearly(), "headers": "X-Debug: [redacted]\r\n…"}),
             ),
         ]);
+    }
+
+    // ----------- collection keys, plain maps, nesting, names (R4 fix 2)
+
+    /// A key is a header collection when it contains `header` or `hdr` (any case) or
+    /// is `trailer` or `trailers`; scalars and plain strings under such a key without
+    /// a header shape stay byte for byte.
+    fn collection_key_rows() -> Vec<(&'static str, Value, Value)> {
+        let c = CANARY;
+        let r = KEY_REDACTED;
+        vec![
+            (
+                "extra_headers, a map",
+                json!({"extra_headers": {"X-Debug": c, "Host": "h"}}),
+                json!({"extra_headers": {"X-Debug": r, "Host": "h"}}),
+            ),
+            (
+                "custom_headers, pairs",
+                json!({"custom_headers": [["X-Debug", c], ["Accept", "a"]]}),
+                json!({"custom_headers": [["X-Debug", r], ["Accept", "a"]]}),
+            ),
+            (
+                "hdrs",
+                json!({"hdrs": {"X-Debug": c}}),
+                json!({"hdrs": {"X-Debug": r}}),
+            ),
+            (
+                "req_hdrs and two mixed-case keys",
+                json!({
+                    "req_hdrs": ["X-Debug: c"],
+                    "RequestHeaders": {"X-Debug": c},
+                    "x_HDR_list": [["X-Zed", "z"]],
+                }),
+                json!({
+                    "req_hdrs": ["X-Debug: [redacted]"],
+                    "RequestHeaders": {"X-Debug": r},
+                    "x_HDR_list": [["X-Zed", r]],
+                }),
+            ),
+            (
+                "trailers, Trailer and TRAILERS in any case",
+                json!({
+                    "trailers": {"X-Checksum": c},
+                    "Trailer": [["X-Sig", c]],
+                    "TRAILERS": "X-Sig: c",
+                }),
+                json!({
+                    "trailers": {"X-Checksum": r},
+                    "Trailer": [["X-Sig", r]],
+                    "TRAILERS": "X-Sig: [redacted]",
+                }),
+            ),
+            (
+                "a key that only starts like trailers, or like header, is not one",
+                json!({"trailer_count": {"X-Debug": "plain"}, "heads": {"X-Debug": "plain"}}),
+                json!({"trailer_count": {"X-Debug": "plain"}, "heads": {"X-Debug": "plain"}}),
+            ),
+            (
+                "scalars and plain strings under such keys stay byte for byte",
+                json!({
+                    "include_headers": true,
+                    "header_name": "X-Foo",
+                    "headers_count": 5,
+                    "hdr": null,
+                    "trailer": false,
+                    "trailers": 3,
+                    "Max_Header_Size": 8192,
+                    "header": "Content-Type",
+                }),
+                json!({
+                    "include_headers": true,
+                    "header_name": "X-Foo",
+                    "headers_count": 5,
+                    "hdr": null,
+                    "trailer": false,
+                    "trailers": 3,
+                    "Max_Header_Size": 8192,
+                    "header": "Content-Type",
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn keys_naming_headers_or_trailers_are_header_collections() {
+        check(collection_key_rows());
+    }
+
+    /// An object element of an array under a header collection that is not a header
+    /// object (no name member) is a header map: rule D by key.
+    fn plain_map_rows() -> Vec<(&'static str, Value, Value)> {
+        let c = CANARY;
+        let r = KEY_REDACTED;
+        vec![
+            (
+                "a plain map in an array",
+                json!({"headers": [{"X-Debug": c, "Host": "h"}]}),
+                json!({"headers": [{"X-Debug": r, "Host": "h"}]}),
+            ),
+            (
+                "a plain map with no benign key",
+                json!({"headers": [{"anything": "else"}]}),
+                json!({"headers": [{"anything": r}]}),
+            ),
+            (
+                "a plain map's scalars under benign keys stay",
+                json!({"headers": [{"Content-Length": 5, "Host": null, "Expect": true}]}),
+                json!({"headers": [{"Content-Length": 5, "Host": null, "Expect": true}]}),
+            ),
+            (
+                "a map in an array in an array",
+                json!({"headers": [[{"X-Debug": c}]]}),
+                json!({"headers": [[{"X-Debug": r}]]}),
+            ),
+            (
+                "a map under a hidden key of a plain map",
+                json!({"headers": [{"a": {"X-Debug": c}}]}),
+                json!({"headers": [{"a": r}]}),
+            ),
+            (
+                "a map of maps",
+                json!({"headers": {"X": {"Host": "h"}}}),
+                json!({"headers": {"X": r}}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_plain_map_in_a_header_array_is_a_header_map() {
+        check(plain_map_rows());
+    }
+
+    /// Everything below a header-collection key keeps the header context, and a value
+    /// under a KEPT benign name is a string or a number, boolean or null; an object, or
+    /// a container nested in a list, is hidden. A list of scalars and strings is the
+    /// multi-value form of the header and stays (each string judged like a single one).
+    fn nesting_rows() -> Vec<(&'static str, Value, Value)> {
+        let c = CANARY;
+        let r = KEY_REDACTED;
+        vec![
+            (
+                "a pair three arrays deep",
+                json!({"headers": [[["X-Zed", c]]]}),
+                json!({"headers": [[["X-Zed", r]]]}),
+            ),
+            // An inner array whose first element is a string is a name and its values, so
+            // the later element of `["X-Debug: c", "Host: h"]` is hidden (accepted
+            // over-redaction); a one-element inner array is a line.
+            (
+                "an array of arrays: a name and its values, and a line",
+                json!({"headers": [["X-Debug: c", "Host: h"], ["Accept: a"]]}),
+                json!({"headers": [["X-Debug: [redacted]", r], ["Accept: a"]]}),
+            ),
+            (
+                "a benign name with an object value",
+                json!({"headers": {"Host": {"k": c}}}),
+                json!({"headers": {"Host": r}}),
+            ),
+            (
+                "a benign name with scalars",
+                json!({"headers": {"Host": 5, "Expect": true, "Accept": null}}),
+                json!({"headers": {"Host": 5, "Expect": true, "Accept": null}}),
+            ),
+            (
+                "a benign name with a list of strings stays",
+                json!({"headers": {"Accept": ["a", "b"]}}),
+                json!({"headers": {"Accept": ["a", "b"]}}),
+            ),
+            (
+                "an object or a nested list inside that list is hidden",
+                json!({"headers": {"Accept": ["a", {"k": c}, ["b"]]}}),
+                json!({"headers": {"Accept": ["a", r, r]}}),
+            ),
+            (
+                "an extra element that is an object",
+                json!({"headers": [["Host", "x", {"k": c}]]}),
+                json!({"headers": [["Host", "x", r]]}),
+            ),
+            (
+                "an extra element that is a list of strings stays, in a direct array",
+                json!({"headers": ["Host", "x", ["a", "b"]]}),
+                json!({"headers": ["Host", "x", ["a", "b"]]}),
+            ),
+            (
+                "an extra element that is a list holding a list is hidden inside",
+                json!({"headers": ["Host", "x", [[c], "b"]]}),
+                json!({"headers": ["Host", "x", [r, "b"]]}),
+            ),
+            (
+                "a pair whose value is an object",
+                json!({"headers": [["Host", {"k": c}]]}),
+                json!({"headers": [["Host", r]]}),
+            ),
+            (
+                "a header object's value, and its other member, are objects",
+                json!({"headers": [{"name": "Host", "value": {"k": c}, "note": {"k": c}}]}),
+                json!({"headers": [{"name": "Host", "value": r, "note": r}]}),
+            ),
+            (
+                "a name member that is a map keeps the header context",
+                json!({"headers": [{"name": {"X-Debug": c}, "value": "v"}]}),
+                json!({"headers": [{"name": {"X-Debug": r}, "value": r}]}),
+            ),
+            (
+                "a header object nested in a list of a kept member",
+                json!({"headers": [{"name": "Host", "value": "h", "values": [{"k": c}]}]}),
+                json!({"headers": [{"name": "Host", "value": "h", "values": [r]}]}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn everything_below_a_header_key_keeps_the_header_context() {
+        check(nesting_rows());
+    }
+
+    /// In a direct array (the whole value of a header key), an element after the first
+    /// that is a raw header line (`token:` then a blank or the end) is judged by its
+    /// name; `https://x/` has no blank after its colon, so it is a value.
+    fn direct_line_rows() -> Vec<(&'static str, Value, Value)> {
+        let c = CANARY;
+        let r = KEY_REDACTED;
+        vec![
+            (
+                "a header line after a benign first element",
+                json!({"headers": ["Host", format!("X-Debug: {c}")]}),
+                json!({"headers": ["Host", "X-Debug: [redacted]"]}),
+            ),
+            (
+                "several lines, a benign one stays, an empty value is a line too",
+                json!({"headers": ["Host", "Accept: a", "X-Zed:", format!("Cookie: a={c}")]}),
+                json!({"headers": ["Host", "Accept: a", "X-Zed: [redacted]", "Cookie: [redacted]"]}),
+            ),
+            (
+                "a URL after a benign first element is a value",
+                json!({"headers": ["Referer", "https://x/"]}),
+                json!({"headers": ["Referer", "https://x/"]}),
+            ),
+            (
+                "a hidden first element hides every later element, lines included",
+                json!({"headers": ["X-Zed", "Host: h", "https://x/"]}),
+                json!({"headers": ["X-Zed", r, r]}),
+            ),
+            (
+                "in a pair (not a direct array) the second element is a value",
+                json!({"headers": [["Host", "X-Debug: plain"]]}),
+                json!({"headers": [["Host", "X-Debug: plain"]]}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_header_line_after_a_benign_first_element_is_judged_by_name() {
+        check(direct_line_rows());
+    }
+
+    /// Names inside header collections (map keys, pair names, name members, the keys of
+    /// a header object) take the strict text pass, cut at 256 bytes on a char boundary
+    /// with `…`; ordinary names are unchanged byte for byte.
+    fn name_text_rows() -> Vec<(&'static str, Value, Value)> {
+        let c = CANARY;
+        let r = KEY_REDACTED;
+        let token = format!("ghp_{c}{}", "a".repeat(30));
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        vec![
+            (
+                "ordinary map keys are unchanged",
+                json!({"headers": {
+                    "Content-Type": "application/json",
+                    "X-Forwarded-For": "1.2.3.4",
+                    "Sec-Fetch-Mode": "cors",
+                    uuid: "v",
+                }}),
+                json!({"headers": {
+                    "Content-Type": "application/json",
+                    "X-Forwarded-For": "1.2.3.4",
+                    "Sec-Fetch-Mode": "cors",
+                    uuid: r,
+                }}),
+            ),
+            (
+                "ordinary pair names are unchanged",
+                json!({"headers": [["Content-Type", "a"], ["X-Forwarded-For", "b"], [uuid, "v"]]}),
+                json!({"headers": [["Content-Type", "a"], ["X-Forwarded-For", "b"], [uuid, r]]}),
+            ),
+            (
+                "a credential used as a map key",
+                json!({"headers": {token.clone(): "v"}}),
+                json!({"headers": {"[redacted]": r}}),
+            ),
+            (
+                "a map key with a break and a header line",
+                json!({"headers": {format!("X-A\r\nX-Debug: {c}"): "v"}}),
+                json!({"headers": {"X-A\r\nX-Debug: [redacted]": r}}),
+            ),
+            (
+                "a key of a plain map",
+                json!({"headers": [{token.clone(): "v"}]}),
+                json!({"headers": [{"[redacted]": r}]}),
+            ),
+            (
+                "a pair name that is a credential",
+                json!({"headers": [[token.clone(), "v"]]}),
+                json!({"headers": [["[redacted]", r]]}),
+            ),
+            (
+                "a name member that is a credential",
+                json!({"headers": [{"name": token.clone(), "value": "v"}]}),
+                json!({"headers": [{"name": "[redacted]", "value": r}]}),
+            ),
+            (
+                "the keys of a header object are names too",
+                json!({"headers": [{"name": "X-Zed", "value": "v", token.clone(): 1}]}),
+                json!({"headers": [{"name": "X-Zed", "value": r, "[redacted]": r}]}),
+            ),
+            (
+                "a long map key is cut at 256 bytes",
+                json!({"headers": {"k".repeat(300): "v"}}),
+                json!({"headers": {format!("{}{CUT}", "k".repeat(256)): r}}),
+            ),
+            (
+                "a long name is cut on a char boundary",
+                json!({"headers": [["€".repeat(100), "v"]]}),
+                json!({"headers": [[format!("{}{CUT}", "€".repeat(85)), r]]}),
+            ),
+            // Two names that are the same after the cut (or the mask) share one key in the
+            // output, and the later one overwrites the earlier. Accepted: both values are
+            // hidden here, and a collision can only lose a name, never reveal a value.
+            (
+                "two names that collide after the cut keep one key",
+                json!({"headers": {"k".repeat(300): "a", format!("{}z", "k".repeat(300)): "b"}}),
+                json!({"headers": {format!("{}{CUT}", "k".repeat(256)): r}}),
+            ),
+            (
+                "outside a header key a key is left alone",
+                json!({"x": {token.clone(): "v"}}),
+                json!({"x": {token.clone(): "v"}}),
+            ),
+        ]
+    }
+
+    #[test]
+    fn names_inside_header_collections_take_the_text_pass_and_a_cap() {
+        check(name_text_rows());
+    }
+
+    /// Object keys inside header collections are charged to their own 64 KiB pool, so
+    /// they stay free for the leaf budget: 300 keys of 253 bytes use 259 whole names, a
+    /// nine-byte rest and then `…`, and 16 whole 4096-byte leaves still fit after them.
+    #[test]
+    fn header_keys_are_charged_to_their_own_pool() {
+        let mut keys = serde_json::Map::new();
+        for i in 0..300 {
+            keys.insert(format!("{}{i:03}", "n".repeat(250)), json!("v"));
+        }
+        let leaves = || json!(vec!["a".repeat(4096); 16]);
+        let got = redact_value(&json!({"headers": Value::Object(keys), "leaves": leaves()}));
+        let headers = got["headers"].as_object().expect("headers stays a map");
+        assert_eq!(headers.len(), 259 + 1 + 1, "259 whole names, the rest, `…`");
+        assert!(headers.contains_key(&format!("{}{CUT}", "n".repeat(9))));
+        assert!(headers.contains_key(CUT));
+        assert!(headers.values().all(|v| v == KEY_REDACTED));
+        assert_eq!(got["leaves"], leaves(), "the leaf budget is untouched");
+    }
+
+    /// A name string (a pair name, a name member) is charged to the leaf budget and cut
+    /// at 256 bytes: ahead of 16 leaves it takes 256 bytes from the sixteenth.
+    #[test]
+    fn a_name_string_is_charged_to_the_leaf_budget() {
+        let r = KEY_REDACTED;
+        let mut expected = vec![json!("a".repeat(4096)); 15];
+        expected.push(json!(format!("{}{CUT}", "a".repeat(4096 - 256))));
+        check(vec![(
+            "a 300-byte pair name ahead of the leaves",
+            json!({"aa_headers": [["n".repeat(300), "v"]], "leaves": vec!["a".repeat(4096); 16]}),
+            json!({
+                "aa_headers": [[format!("{}{CUT}", "n".repeat(256)), r]],
+                "leaves": Value::Array(expected),
+            }),
+        )]);
+    }
+
+    /// Every row of the collection-key, plain-map, nesting, direct-line and name rows
+    /// that redaction changes is a fixed point.
+    #[test]
+    fn the_collection_context_shapes_are_fixed_points() {
+        let rows: Vec<(&str, Value)> = collection_key_rows()
+            .into_iter()
+            .chain(plain_map_rows())
+            .chain(nesting_rows())
+            .chain(direct_line_rows())
+            .chain(name_text_rows())
+            .filter(|(_, input, expected)| input != expected)
+            .map(|(label, input, _)| (label, input))
+            .collect();
+        assert!(rows.len() >= 30, "only {} rows change", rows.len());
+        check_fixed_points(rows);
     }
 
     /// Every row of the line-break and multi-value shapes that redaction changes is
