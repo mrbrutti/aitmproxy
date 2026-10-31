@@ -81,7 +81,10 @@ pub const UNAUTHORIZED: i64 = -32001;
 pub struct ConnCtx {
     /// The frontend this connection speaks as.
     pub role: Frontend,
-    /// The human-readable client label from `initialize.clientInfo.name`.
+    /// The human-readable client label from `initialize.clientInfo.name`. Client
+    /// controlled: set only through [`aitm_core::cap_client_label`], which bounds
+    /// its length and strips control characters and secrets. A transport that
+    /// writes this field any other way puts unbounded text into every audit entry.
     pub client_label: Option<String>,
     /// A per-connection id, assigned by the transport, used to drop this
     /// connection's subscriptions when it ends. `0` means "not a streaming

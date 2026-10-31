@@ -1158,6 +1158,78 @@ async fn client_label_captured_from_initialize() {
     assert_eq!(call["result"]["structuredContent"], json!("aitm-mac"));
 }
 
+/// AC11: the client label is cut at ingestion, in the real `serve_lines` loop, so
+/// a 1 MiB `clientInfo.name` reaches the command host and the audit entry as
+/// 128 bytes. Assertions are on lengths so a red run prints short numbers.
+#[tokio::test]
+async fn client_label_is_capped_at_ingestion() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = Arc::new(
+        McpServer::new(role_registry(), McpTransport::Stdio)
+            .with_agent_state(ungated())
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            )
+            .with_audit_ring(ring.clone()),
+    );
+
+    // The pipe holds the whole 1 MiB `initialize` line, so the client's write
+    // never waits on the server's read.
+    let (client_side, server_side) = tokio::io::duplex(4 * 1024 * 1024);
+    let (srv_r, srv_w) = tokio::io::split(server_side);
+    let conn = ConnCtx::new(srv.stdio_role());
+    let task = tokio::spawn(aitm_mcp::transport::serve_lines(
+        srv,
+        BufReader::new(srv_r),
+        srv_w,
+        conn,
+    ));
+
+    let (cli_r, mut cli_w) = tokio::io::split(client_side);
+    let mut lines = BufReader::new(cli_r).lines();
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "a".repeat(1 << 20), "version": "0"}}});
+    let call = json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "demo.client", "arguments": {}}});
+    cli_w
+        .write_all(format!("{init}\n{call}\n").as_bytes())
+        .await
+        .expect("write");
+
+    let init_reply: JsonValue =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("init reply"))
+            .expect("json");
+    assert_eq!(init_reply["id"], json!(1));
+    let call_reply: JsonValue =
+        serde_json::from_str(&lines.next_line().await.expect("io").expect("call reply"))
+            .expect("json");
+    assert_eq!(call_reply["id"], json!(2));
+    let seen = call_reply["result"]["structuredContent"]
+        .as_str()
+        .unwrap_or_else(|| panic!("demo.client returns a string: {call_reply}"));
+    assert_eq!(seen.len(), 128, "the command host sees a capped label");
+    assert_eq!(seen, "a".repeat(128));
+
+    let entries = ring.recent(None, None);
+    assert_eq!(entries.len(), 1, "one tools/call, one audit entry");
+    assert_eq!(
+        entries[0]
+            .client_label
+            .as_ref()
+            .expect("the entry carries the label")
+            .len(),
+        128,
+        "the audit entry carries the same capped label"
+    );
+
+    cli_w.shutdown().await.expect("shutdown");
+    task.await.expect("join").expect("loop ends cleanly at EOF");
+}
+
 // ------------------------------------------------- M4 Task 4: policy gate
 
 /// A no-op command of a declared [`Sensitivity`], so the policy matrix can be

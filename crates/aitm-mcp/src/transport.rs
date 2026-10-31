@@ -137,14 +137,17 @@ where
 }
 
 /// The `initialize.clientInfo.name`, if `message` is an `initialize` request that
-/// carries a non-empty name; `None` otherwise.
+/// carries a non-empty name; `None` otherwise. The name is client-controlled, so
+/// it goes through [`aitm_core::cap_client_label`] (control characters replaced,
+/// secrets masked, at most [`aitm_core::MAX_CLIENT_LABEL_BYTES`] bytes) before it
+/// can reach the connection. This is the only place a label is ingested.
 fn client_label_from_initialize(message: &str) -> Option<String> {
     let v: JsonValue = serde_json::from_str(message).ok()?;
     if v.get("method").and_then(JsonValue::as_str)? != "initialize" {
         return None;
     }
     let name = v.get("params")?.get("clientInfo")?.get("name")?.as_str()?;
-    (!name.is_empty()).then(|| name.to_string())
+    aitm_core::cap_client_label(name)
 }
 
 /// Serve over this process's stdin/stdout until stdin closes. The stdio
