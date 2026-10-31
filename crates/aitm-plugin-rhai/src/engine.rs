@@ -17,7 +17,8 @@
 //! thread stack, so a host runs script evaluation on threads of at least
 //! [`WORKER_STACK_SIZE`] (the `aitm` binary sizes its tokio workers so).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,7 @@ use rhai::packages::{
     BasicArrayPackage, BasicBlobPackage, BasicMapPackage, BasicMathPackage, BitFieldPackage,
     CorePackage, LogicPackage, MoreStringPackage, Package,
 };
-use rhai::{Dynamic, Engine, EvalAltResult, Position};
+use rhai::{Dynamic, Engine, EvalAltResult, OptimizationLevel, Position, AST};
 
 use crate::config::{RhaiConfig, RhaiLimits};
 
@@ -210,11 +211,96 @@ pub fn extend_deadline() {
     });
 }
 
+/// A script's top-level literal constants (`const TAG = "v"`, `const PATHS =
+/// [...]`), read off its AST without running it.
+///
+/// Rhai functions cannot see script-level variables, and a closure captures
+/// every outer name it mentions when it is *created*, so `fn on_request(flow)
+/// { … TAG … }`, or a `load(reg)` closure naming `TAG`, fails with `Variable
+/// not found: TAG` under the empty scope hooks run with — the closure at
+/// load, before any `try` inside it runs. The engine's variable resolver
+/// ([`install_constant_resolver`]) answers such names from the table
+/// [`enter_constants`] installs for the duration of a run. Only literal values
+/// are in it: a constant computed by a call stays invisible inside functions,
+/// as in plain Rhai. Rebuilt per run from the AST: a handful of top-level
+/// statements, which Rhai itself re-evaluates on every `call_fn` anyway.
+#[derive(Debug)]
+struct ScriptConstants(BTreeMap<String, Dynamic>);
+
+impl ScriptConstants {
+    fn of(ast: &AST) -> Self {
+        Self(
+            ast.iter_literal_variables(true, false)
+                .map(|(name, _, value)| (name.to_string(), value))
+                .collect(),
+        )
+    }
+}
+
+thread_local! {
+    /// The constants of the script evaluating on this thread (see
+    /// [`enter_constants`]); scripts evaluate synchronously on the thread that
+    /// dispatched them, like [`RUN`].
+    static CONSTANTS: RefCell<Option<ScriptConstants>> = const { RefCell::new(None) };
+}
+
+/// Restores the table that was installed before, when dropped.
+#[must_use = "the constants are visible only while the guard lives"]
+pub struct ConstantsGuard {
+    previous: Option<ScriptConstants>,
+}
+
+/// Make `ast`'s top-level literal constants visible to its functions on this
+/// thread until the guard drops. Every dispatcher that evaluates a script —
+/// hook, `load`, command, PoC step — opens this around the evaluation.
+pub fn enter_constants(ast: &AST) -> ConstantsGuard {
+    let previous = CONSTANTS.with(|cell| cell.replace(Some(ScriptConstants::of(ast))));
+    ConstantsGuard { previous }
+}
+
+impl Drop for ConstantsGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CONSTANTS.with(|cell| cell.replace(previous));
+    }
+}
+
+/// The current script's constant `name`, for a name that is neither bound to
+/// a local slot by the parser (`index != 0`: a parameter or `let` read
+/// directly) nor present in the live scope (a name a closure captured, which
+/// its body reads unindexed). Either way the local wins, as in plain Rhai. A
+/// name that is not a constant falls through to Rhai's own lookup (the scope,
+/// global constants such as `http`, function pointers), so nothing else
+/// changes meaning. Rhai hands the answer back read-only: a mutating method
+/// on it is refused, as on any constant.
+fn script_constant(name: &str, index: usize, scope: &rhai::Scope) -> Option<Dynamic> {
+    if index != 0 || scope.contains(name) {
+        return None;
+    }
+    CONSTANTS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|table| table.0.get(name).cloned())
+    })
+}
+
+// rhai marks `on_var` deprecated only to flag the API as volatile; its own
+// docs say it is not deprecated.
+#[allow(deprecated)]
+fn install_constant_resolver(engine: &mut Engine) {
+    engine.on_var(|name, index, ctx| Ok(script_constant(name, index, ctx.scope())));
+}
+
 /// A fresh engine with every sandbox limit applied; the one engine shared by
 /// every script and PoC step.
 pub fn build_engine(limits: &RhaiLimits, hook_timeout: Duration) -> Engine {
     let mut engine = Engine::new_raw();
     engine.set_max_strings_interned(MAX_STRINGS_INTERNED);
+    // One pinned level for every script, so a debug and a release core (and a
+    // future rhai default) compile a script identically. Never `Full`: it
+    // evaluates functions at compile time.
+    engine.set_optimization_level(OptimizationLevel::Simple);
+    install_constant_resolver(&mut engine);
     // The standard packages, except `BasicTimePackage`: scripts get no clock.
     engine
         .register_global_module(CorePackage::new().as_shared_module())
