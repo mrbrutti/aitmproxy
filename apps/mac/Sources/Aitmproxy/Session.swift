@@ -116,6 +116,17 @@ final class Session {
             select(last.id)
         }
     }
+    /// Rows an undone Clear put back. The core no longer holds them, so the live poll keeps them
+    /// ahead of what it lists; a later Clear or Delete drops them for good.
+    var retainedRows: [FlowRow] = []
+    /// "Cleared n flows — Undo" in the status bar, for a few seconds after a Clear.
+    var clearNotice: ClearNotice?
+    /// What the last Clear dropped, until it is undone or the notice lapses.
+    @ObservationIgnored var clearedFlows: ClearedFlows?
+    @ObservationIgnored var clearNoticeTask: Task<Void, Never>?
+    /// The undo manager the last Clear registered with (the key window's, or the session's own).
+    @ObservationIgnored private(set) var clearUndoManager: UndoManager?
+    @ObservationIgnored private lazy var ownUndoManager = UndoManager()
     /// The sidebar sub-item narrowing the list, if any.
     var group: FlowGroup?
     var details: [FlowID: FlowDetail] = [:] {
@@ -448,6 +459,17 @@ final class Session {
         ensureDetail(for: id)
     }
 
+    /// Registers one undo step named `name` on the key window's undo manager (Edit ▸ Undo, ⌘Z),
+    /// falling back to the session's own when no window is key (tests, headless runs).
+    func registerUndo(_ name: String, _ handler: @escaping @MainActor (Session) -> Void) {
+        let manager = NSApp.keyWindow?.undoManager ?? NSApp.mainWindow?.undoManager ?? ownUndoManager
+        manager.registerUndo(withTarget: self) { session in
+            MainActor.assumeIsolated { handler(session) }
+        }
+        manager.setActionName(name)
+        clearUndoManager = manager
+    }
+
     /// Records the role the bus reported for this connection and flags a mismatch
     /// against the operator's Expected-role setting (client-side only, never sent
     /// to the server). Called by the bus service on connect; `nil` on disconnect.
@@ -577,4 +599,19 @@ final class Session {
         findingsCount = poc.findings.count
         scan.loadFixture()
     }
+}
+
+/// What Clear dropped, kept for one undo step (review D2, rule 43).
+struct ClearedFlows {
+    var rows: [FlowRow]
+    var details: [FlowID: FlowDetail]
+    var wsDetails: [FlowID: WSDetail]
+    var l4Details: [FlowID: L4Flow]
+    var selection: Set<FlowID>
+    var focused: FlowID?
+}
+
+struct ClearNotice: Equatable {
+    var count: Int
+    var text: String { "Cleared \(count) flow\(count == 1 ? "" : "s")" }
 }

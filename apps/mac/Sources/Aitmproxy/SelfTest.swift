@@ -123,9 +123,21 @@ enum SelfTest {
             session.setCapturing(false)
             await settle { !session.capturing }
             check("pausing capture flips the state", !session.capturing)
+            let beforeClear = session.rows
+            let focusBeforeClear = session.focused
             session.clearSession(confirm: { _ in true })
             await settle { session.rows.isEmpty }
             check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
+            // D2: Clear keeps one undo step and says so in the status bar.
+            check("Clear registers Undo Clear and the notice", session.clearUndoManager?.canUndo == true
+                && session.clearUndoManager?.undoActionName == "Clear" && session.clearNotice?.count == beforeClear.count)
+            session.clearUndoManager?.undo()
+            check("Undo Clear restores the rows, selection and focus",
+                  session.rows == beforeClear && session.focused == focusBeforeClear
+                      && session.selection == [focusBeforeClear!] && session.clearNotice == nil,
+                  "rows \(session.rows.count) of \(beforeClear.count), focused \(String(describing: session.focused))")
+            session.clearSession(confirm: { _ in true })
+            await settle { session.rows.isEmpty }
 
             // M3: filters, saved filters, sidebar query, palette.
             session.loadFixtures()

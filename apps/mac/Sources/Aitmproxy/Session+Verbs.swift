@@ -126,11 +126,46 @@ extension Session {
         perform(on ? "resume capture" : "pause capture") { [self] in try await actions.setCapturing(on) }
     }
 
-    /// Clear asks first when flows are paused (they would be dropped mid-flight).
+    /// Clear asks first when flows are paused (they would be dropped mid-flight). What it drops
+    /// stays in the app for one undo step: Edit ▸ Undo Clear (⌘Z) or the status bar's Undo, which
+    /// shows for `clearNoticeSeconds` (review D2, rule 43).
     func clearSession(confirm: (Int) -> Bool = { _ in true }) {
         let pausedCount = paused.count
         if pausedCount > 0, !confirm(pausedCount) { return }
+        let dropped = ClearedFlows(rows: rows, details: details, wsDetails: wsDetails, l4Details: l4Details,
+                                   selection: selection, focused: focused)
+        retainedRows = []
         perform("clear") { [self] in try await actions.clear() }
+        guard !dropped.rows.isEmpty else { return }
+        clearedFlows = dropped
+        registerUndo("Clear") { $0.undoClear() }
+        clearNotice = ClearNotice(count: dropped.rows.count)
+        clearNoticeTask?.cancel()
+        clearNoticeTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.clearNoticeSeconds))
+            guard !Task.isCancelled else { return }
+            self?.clearNotice = nil
+        }
+    }
+
+    static let clearNoticeSeconds: Double = 8
+
+    /// Puts back what the last Clear dropped. The rows and their cached details are the app's
+    /// copy: the core has already dropped the flows, so the list and the inspector show them
+    /// again, while a verb that needs the core (replay, resume) reports the core's answer.
+    func undoClear() {
+        guard let dropped = clearedFlows else { return }
+        clearedFlows = nil
+        clearNoticeTask?.cancel()
+        clearNotice = nil
+        let restoredIDs = Set(dropped.rows.map(\.id))
+        retainedRows = dropped.rows
+        rows = dropped.rows + rows.filter { !restoredIDs.contains($0.id) }
+        details.merge(dropped.details) { current, _ in current }
+        wsDetails.merge(dropped.wsDetails) { current, _ in current }
+        l4Details.merge(dropped.l4Details) { current, _ in current }
+        selection = dropped.selection
+        focused = dropped.focused
     }
 
     /// What the verb table needs to know about a row: its drafts, pin state and the
@@ -198,6 +233,7 @@ extension Session {
             kill(id)
         } else {
             rows.removeAll { $0.id == id }
+            retainedRows.removeAll { $0.id == id }
             selection.remove(id)
             if focused == id { focused = nil }
         }

@@ -16,6 +16,16 @@ struct StatusBar: View {
                 .help("Follow the newest flow as it arrives (⇧⌘A)")
             Spacer()
             HStack(spacing: Tok.Metric.gapMeta) {
+                if let notice = session.clearNotice {
+                    HStack(spacing: Tok.Metric.gapTight) {
+                        Text("\(notice.text) —")
+                        Button("Undo") { session.undoClear() }
+                            .buttonStyle(.plain)
+                            .foregroundStyle(Tok.Ink.primary.color)
+                            .help("Put the cleared flows back (⌘Z)")
+                    }
+                    .accessibilityIdentifier("clear-notice")
+                }
                 if let error = session.lastError {
                     Label(error, systemImage: "exclamationmark.triangle")
                         .labelStyle(.titleAndIcon)
