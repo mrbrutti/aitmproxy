@@ -14,7 +14,9 @@ struct ConnectionDashboard: View {
     private static let sideWidth: CGFloat = 280
 
     var body: some View {
-        let rows = session.rows
+        // Follow the filtered view so the chip bar and filter bar drive the band,
+        // not just the full capture.
+        let rows = session.visibleRows
         let stats = OverviewStats(rows: rows)
         let series = TrafficSeries(rows: rows)
         HStack(alignment: .top, spacing: Space.md) {
@@ -339,7 +341,7 @@ private struct LatencyMini: View {
                 .frame(width: 36, alignment: .leading)
             GeometryReader { geo in
                 RoundedRectangle(cornerRadius: Tok.Radius.badge)
-                    .fill(Palette.accent)
+                    .fill(Tok.Ink.secondary.color)
                     .frame(width: max(2, geo.size.width * min(1, Self.seconds(value) / top)))
             }
             .frame(height: 8)

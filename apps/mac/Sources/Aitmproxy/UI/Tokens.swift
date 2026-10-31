@@ -45,13 +45,13 @@ enum Tok {
         /// Selected row in a list that drives a detail pane; selected sidebar item. A quiet accent tint, never the full accent.
         static let active = DynamicColor(light: 0xE8EEFB, dark: 0x2B3344)
         /// Row/item hover. Never moves a selection.
-        static let hover = DynamicColor(light: 0xF3F4F6, dark: 0x232325)
+        static let hover = DynamicColor(light: 0xF3F4F6, dark: 0x2A2A2C)
         /// Near-black primary button fill (light) / inverted white (dark).
         static let inverse = DynamicColor(light: 0x1D1F20, dark: 0xF5F5F7)
         /// Window/page background behind panels (WebUI off-white; native near-black).
         static let page = DynamicColor(light: 0xF7F8FA, dark: 0x161618)
         /// Chips, inset wells, the status bar, sidebar group headers.
-        static let raised = DynamicColor(light: 0xF3F4F6, dark: 0x262628)
+        static let raised = DynamicColor(light: 0xF3F4F6, dark: 0x2C2C2F)
         /// Panels, the flow table, inspector panes.
         static let surface = DynamicColor(light: 0xFFFFFF, dark: 0x1E1E20)
     }
@@ -80,7 +80,7 @@ enum Tok {
         /// 2px focus ring = accent.
         static let focus = DynamicColor(light: 0x2563EB, dark: 0x60A5FA)
         /// Row separators in tables and key-value lists; one step lighter than border.
-        static let rule = DynamicColor(light: 0xF0F1F3, dark: 0x252527)
+        static let rule = DynamicColor(light: 0xF0F1F3, dark: 0x303033)
     }
     /// The 11 flow mark colours (Proxyman's set = the macOS system colours, light/dark).
     enum Mark {
@@ -142,6 +142,21 @@ enum Tok {
             fg: DynamicColor(light: 0x1D4ED8, dark: 0x93C5FD),
             bg: DynamicColor(light: 0xDBEAFE, dark: 0x1E2A44))
         static let medium = ColorPair(
+            fg: DynamicColor(light: 0xB45309, dark: 0xFCD34D),
+            bg: DynamicColor(light: 0xFEF3C7, dark: 0x3A2E12))
+    }
+    /// Semantic state badges (CA trust, script status): success/warning/danger/neutral.
+    enum State {
+        static let danger = ColorPair(
+            fg: DynamicColor(light: 0xB91C1C, dark: 0xFCA5A5),
+            bg: DynamicColor(light: 0xFEE2E2, dark: 0x3B1C1C))
+        static let neutral = ColorPair(
+            fg: DynamicColor(light: 0x4B5563, dark: 0xB4B4B8),
+            bg: DynamicColor(light: 0xF3F4F6, dark: 0x2A2A2D))
+        static let success = ColorPair(
+            fg: DynamicColor(light: 0x15803D, dark: 0x86EFAC),
+            bg: DynamicColor(light: 0xDCFCE7, dark: 0x14322A))
+        static let warning = ColorPair(
             fg: DynamicColor(light: 0xB45309, dark: 0xFCD34D),
             bg: DynamicColor(light: 0xFEF3C7, dark: 0x3A2E12))
     }

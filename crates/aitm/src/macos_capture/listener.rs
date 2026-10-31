@@ -35,12 +35,15 @@
 
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
 
 use super::rendezvous;
@@ -53,6 +56,13 @@ const DATA_SOCK: &str = "data.sock";
 /// `u32` length prefix. Control frames are metadata (a [`Hello`], a [`ScopeSpec`],
 /// a [`FlowOpen`]) — kilobytes, not megabytes; 1 MiB is ample headroom.
 const MAX_FRAME_LEN: usize = 1 << 20;
+
+/// How long [`CaptureListener::accept_data`] waits for a freshly accepted data
+/// socket's [`DataHandshake`]. The handshake is read **before** the peer can be
+/// verified (the verifier needs the finished connection), so without a bound one
+/// silent same-uid peer would pin the accepting task forever. A real provider sends
+/// the handshake immediately after connecting; seconds is generous.
+const DATA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Upper bound on a length-delimited datagram body. A UDP datagram cannot exceed
 /// 64 KiB, so any larger declared length is corrupt or hostile.
@@ -143,10 +153,16 @@ impl CaptureListener {
     /// so the bind does not fail with `EADDRINUSE`.
     ///
     /// # Errors
-    /// Fails if the directory cannot be created or locked, or either socket cannot
-    /// be bound.
+    /// Fails ([`io::ErrorKind::InvalidInput`]) if `dir` already exists as a symlink,
+    /// which is refused rather than followed. Fails if the directory cannot be
+    /// created or locked, or either socket cannot be bound.
     pub fn bind(dir: impl AsRef<Path>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
+        // The socket directory sits at a well-known path in a world-writable parent
+        // (`/private/tmp`), so another process can plant a symlink there before we
+        // run. `set_permissions` below would follow it and chmod, and we would then
+        // create our sockets in, a directory the squatter chose. Refuse it up front.
+        refuse_symlink(&dir)?;
         // Create the directory **atomically private** (mode 0700 at creation), so
         // there is no create→chmod window in which another uid could reach it.
         // `recursive(true)` makes an existing directory a no-op (it does not widen
@@ -214,16 +230,12 @@ impl CaptureListener {
     /// independent socket — its own buffers and backpressure.
     ///
     /// # Errors
-    /// Fails if accepting the connection fails, or the peer closes before sending a
-    /// handshake.
+    /// Fails if accepting the connection fails, the peer closes before sending a
+    /// handshake, or the handshake does not arrive within a few seconds
+    /// ([`io::ErrorKind::TimedOut`]).
     pub async fn accept_data(&self) -> io::Result<DataConnection> {
         let (mut stream, _addr) = self.data.accept().await?;
-        let handshake: DataHandshake = read_frame(&mut stream).await?.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "data socket closed before its handshake",
-            )
-        })?;
+        let handshake = read_handshake(&mut stream, DATA_HANDSHAKE_TIMEOUT).await?;
         Ok(DataConnection {
             flow_id: handshake.flow_id,
             stream,
@@ -236,6 +248,27 @@ impl Drop for CaptureListener {
         // Best-effort: don't leave the bound socket files behind.
         let _ = fs::remove_file(self.dir.join(CONTROL_SOCK));
         let _ = fs::remove_file(self.dir.join(DATA_SOCK));
+    }
+}
+
+/// Fail with [`io::ErrorKind::InvalidInput`] if `dir` already exists **as a
+/// symlink** (to anything, including nothing). Looks at the path itself, not what it
+/// points to (`symlink_metadata`); a missing path or an ordinary directory passes.
+/// Any other failure to inspect the path is returned too, fail-closed. Only the final
+/// path component is checked: the system's own parents (`/tmp` → `/private/tmp`) may
+/// legitimately be links.
+fn refuse_symlink(dir: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "capture socket directory {} is a symlink; refusing to follow it",
+                dir.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -268,16 +301,14 @@ impl ControlChannel {
 
     /// Read the next control message, or `None` at a clean end of stream.
     ///
+    /// Not cancel-safe: dropping this future mid-frame loses the bytes already
+    /// read. A caller that must also write on a timer uses
+    /// [`into_halves`](Self::into_halves) instead of racing this in a `select!`.
+    ///
     /// # Errors
     /// Fails on a short read mid-frame or a malformed frame.
     pub async fn recv(&mut self) -> io::Result<Option<ControlMessage>> {
-        let Some(buf) = read_capped(&mut self.stream, MAX_FRAME_LEN).await? else {
-            return Ok(None);
-        };
-        self.bytes_read += 4 + buf.len() as u64;
-        let msg = serde_json::from_slice(&buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(Some(msg))
+        recv_control(&mut self.stream, &mut self.bytes_read).await
     }
 
     /// Total bytes read off the control channel so far — used to prove the control
@@ -285,6 +316,90 @@ impl ControlChannel {
     #[must_use]
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read
+    }
+
+    /// Split into an independent reader and writer over the one socket, so a
+    /// caller can read frames in one future and write frames in another without
+    /// either borrowing the other (and without ever cancelling a read mid-frame).
+    /// The byte count read so far carries over to the reader. The peer-verification
+    /// fd ([`AsRawFd`]) is only available before the split.
+    #[must_use]
+    pub fn into_halves(self) -> (ControlReader, ControlWriter) {
+        let (read, write) = self.stream.into_split();
+        (
+            ControlReader {
+                read,
+                bytes_read: self.bytes_read,
+            },
+            ControlWriter { write },
+        )
+    }
+}
+
+/// The read half of a split [`ControlChannel`]: the same frame codec and byte
+/// count, over the read side only.
+pub struct ControlReader {
+    read: OwnedReadHalf,
+    bytes_read: u64,
+}
+
+impl ControlReader {
+    /// Read the next control message, or `None` at a clean end of stream. Not
+    /// cancel-safe (see [`ControlChannel::recv`]): run it in a loop that is only
+    /// ever dropped as a whole.
+    ///
+    /// # Errors
+    /// Fails on a short read mid-frame or a malformed frame.
+    pub async fn recv(&mut self) -> io::Result<Option<ControlMessage>> {
+        recv_control(&mut self.read, &mut self.bytes_read).await
+    }
+
+    /// Total bytes read off the control channel so far (including before the
+    /// split).
+    #[must_use]
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+}
+
+/// The write half of a split [`ControlChannel`].
+pub struct ControlWriter {
+    write: OwnedWriteHalf,
+}
+
+impl ControlWriter {
+    /// Send one control message.
+    ///
+    /// # Errors
+    /// Fails on a serialization or write error.
+    pub async fn send(&mut self, msg: &ControlMessage) -> io::Result<()> {
+        write_frame(&mut self.write, msg).await
+    }
+}
+
+/// Read one control frame off `r`, adding its wire size to `bytes_read`. Shared by
+/// [`ControlChannel::recv`] and [`ControlReader::recv`] so the two cannot drift.
+async fn recv_control<R>(r: &mut R, bytes_read: &mut u64) -> io::Result<Option<ControlMessage>>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(buf) = read_capped(r, MAX_FRAME_LEN).await? else {
+        return Ok(None);
+    };
+    *bytes_read += 4 + buf.len() as u64;
+    let msg =
+        serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(msg))
+}
+
+/// The control stream's file descriptor, so a [`PeerVerifier`] can read the peer's
+/// audit token off the socket. The descriptor stays owned by the channel; callers
+/// must not close it or use it past the channel's lifetime.
+///
+/// [`PeerVerifier`]: super::peer_auth::PeerVerifier
+impl AsRawFd for ControlChannel {
+    fn as_raw_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 }
 
@@ -305,6 +420,16 @@ impl DataConnection {
     /// Borrow the raw data stream.
     pub fn stream_mut(&mut self) -> &mut UnixStream {
         &mut self.stream
+    }
+
+    /// The data stream's file descriptor, so a [`PeerVerifier`] can read the peer's
+    /// audit token off the socket. The descriptor stays owned by this connection;
+    /// callers must not close it or use it past the connection's lifetime.
+    ///
+    /// [`PeerVerifier`]: super::peer_auth::PeerVerifier
+    #[must_use]
+    pub fn peer_fd(&self) -> RawFd {
+        self.stream.as_raw_fd()
     }
 
     /// Read the next length-delimited datagram (UDP), or `None` at end of stream.
@@ -398,6 +523,28 @@ where
     Ok(Some(msg))
 }
 
+/// Read the [`DataHandshake`] off a just-accepted data socket within `within`.
+/// A peer that stays silent or sends half a frame is cut off with
+/// [`io::ErrorKind::TimedOut`]; one that closes first is
+/// [`io::ErrorKind::UnexpectedEof`].
+async fn read_handshake<R>(r: &mut R, within: Duration) -> io::Result<DataHandshake>
+where
+    R: AsyncRead + Unpin,
+{
+    match tokio::time::timeout(within, read_frame(r)).await {
+        Ok(Ok(Some(handshake))) => Ok(handshake),
+        Ok(Ok(None)) => Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "data socket closed before its handshake",
+        )),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "data socket sent no handshake in time",
+        )),
+    }
+}
+
 /// Read a `u32`-big-endian length prefix and that many bytes.
 ///
 /// Rejects any declared length above `max` with `InvalidData` **before
@@ -424,4 +571,252 @@ where
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).await?;
     Ok(Some(buf))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+
+    use super::{
+        read_handshake, refuse_symlink, write_data_handshake, AsRawFd, CaptureListener,
+        ControlChannel, ControlMessage, DataConnection, DataHandshake, Hello, ScopeSpec,
+    };
+
+    /// A unique scratch directory, removed on drop. Kept short: `$TMPDIR` on macOS is
+    /// already long and a Unix socket path must stay under `SUN_LEN`.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "aml-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// A squatter who plants the socket directory path as a symlink to a directory
+    /// they control must not be followed: `bind` refuses outright, so it neither
+    /// chmods the target to 0700 (which `set_permissions` would do through the link)
+    /// nor creates the sockets inside it. The refusal happens before any socket is
+    /// bound, so this needs no real bind.
+    #[tokio::test]
+    async fn bind_refuses_a_symlinked_socket_dir() {
+        let tmp = TempDir::new("symlink");
+        let target = tmp.path().join("attacker-dir");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = tmp.path().join("capture.d");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = CaptureListener::bind(&link)
+            .err()
+            .expect("a symlinked socket dir must be refused, not followed");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("symlink"),
+            "the refusal says why: {err}"
+        );
+        assert_eq!(mode_of(&target), 0o755, "the link target was not chmodded");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "no socket was created in the link target"
+        );
+    }
+
+    /// A dangling symlink at the path is refused the same way (it is still a
+    /// squatter-planted link, whatever it points at).
+    #[tokio::test]
+    async fn bind_refuses_a_dangling_symlink_at_the_socket_dir() {
+        let tmp = TempDir::new("dangle");
+        let link = tmp.path().join("capture.d");
+        std::os::unix::fs::symlink(tmp.path().join("not-there"), &link).unwrap();
+
+        let err = CaptureListener::bind(&link)
+            .err()
+            .expect("a dangling symlink must be refused");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// The guard looks only at the path itself: a path that does not exist yet and
+    /// an ordinary directory both pass (the normal fresh-start and restart cases),
+    /// while a symlink to a plain file is refused like any other link.
+    #[test]
+    fn refuse_symlink_passes_only_non_links() {
+        let tmp = TempDir::new("guard");
+
+        assert!(refuse_symlink(&tmp.path().join("missing")).is_ok());
+        assert!(refuse_symlink(tmp.path()).is_ok(), "an ordinary directory");
+
+        let file = tmp.path().join("plain-file");
+        std::fs::write(&file, b"x").unwrap();
+        let link = tmp.path().join("link-to-file");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        let err = refuse_symlink(&link).expect_err("a link to a file is still a link");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // A path whose parent is a regular file cannot be inspected: that error is
+        // returned, not treated as "no symlink here".
+        assert!(refuse_symlink(&file.join("sub")).is_err());
+    }
+
+    /// A data socket that connects and never sends its handshake is cut off at the
+    /// deadline with `TimedOut`, not waited on forever: otherwise one silent
+    /// same-uid peer (not yet verified — the handshake is read first) pins an
+    /// accept slot indefinitely.
+    #[tokio::test]
+    async fn silent_data_peer_times_out_instead_of_hanging() {
+        let (_silent_peer, mut core) = tokio::io::duplex(64);
+        let err = read_handshake(&mut core, Duration::from_millis(50))
+            .await
+            .expect_err("a silent peer must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// A peer that sends only part of the handshake frame (the length prefix, then
+    /// nothing) is cut off the same way.
+    #[tokio::test]
+    async fn half_sent_handshake_times_out() {
+        let (mut peer, mut core) = tokio::io::duplex(64);
+        peer.write_all(&[0, 0, 0, 20]).await.unwrap();
+        let err = read_handshake(&mut core, Duration::from_millis(50))
+            .await
+            .expect_err("a half-sent handshake must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// A prompt handshake inside the deadline is read normally, and a peer that
+    /// closes without sending one is `UnexpectedEof`, not a timeout.
+    #[tokio::test]
+    async fn prompt_handshake_is_read_and_early_close_is_eof() {
+        let (mut peer, mut core) = tokio::io::duplex(64);
+        write_data_handshake(&mut peer, DataHandshake { flow_id: 42 })
+            .await
+            .unwrap();
+        assert_eq!(
+            read_handshake(&mut core, Duration::from_secs(5))
+                .await
+                .unwrap(),
+            DataHandshake { flow_id: 42 }
+        );
+
+        let (peer, mut core) = tokio::io::duplex(64);
+        drop(peer);
+        let err = read_handshake(&mut core, Duration::from_secs(5))
+            .await
+            .expect_err("closing before the handshake is an error");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// After a split, the reader and the writer work independently over the one
+    /// socket: the reader yields what the provider sent (and counts its bytes), the
+    /// writer's frames reach the provider. This is what lets the feeder read
+    /// `FlowOpen`s while a timer re-sends `Scope` on the same control channel.
+    #[tokio::test]
+    async fn into_halves_reads_and_writes_independently() {
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let (mut reader, mut writer) = ControlChannel::from_stream(core).into_halves();
+
+        provider
+            .send(&ControlMessage::Hello(Hello {
+                protocol_version: 1,
+            }))
+            .await
+            .unwrap();
+        writer
+            .send(&ControlMessage::Scope(ScopeSpec {
+                spec: "example.com".to_string(),
+            }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader.recv().await.unwrap(),
+            Some(ControlMessage::Hello(Hello {
+                protocol_version: 1
+            }))
+        );
+        // 4-byte length prefix + the 32-byte JSON body.
+        assert_eq!(reader.bytes_read(), 36);
+        assert_eq!(
+            provider.recv().await.unwrap(),
+            Some(ControlMessage::Scope(ScopeSpec {
+                spec: "example.com".to_string()
+            }))
+        );
+    }
+
+    /// The bytes already read on the unsplit channel (the Hello the feeder gates on)
+    /// carry over to the reader, so the control/data-separation count stays whole.
+    #[tokio::test]
+    async fn into_halves_keeps_the_bytes_read_so_far() {
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let mut core = ControlChannel::from_stream(core);
+        provider
+            .send(&ControlMessage::Hello(Hello {
+                protocol_version: 1,
+            }))
+            .await
+            .unwrap();
+        core.recv().await.unwrap();
+        assert_eq!(core.bytes_read(), 36);
+
+        let (reader, _writer) = core.into_halves();
+        assert_eq!(reader.bytes_read(), 36);
+    }
+
+    /// Dropping both halves closes the socket: the provider sees a clean end of
+    /// stream, not a hang.
+    #[tokio::test]
+    async fn dropping_both_halves_gives_the_provider_a_clean_eof() {
+        let (provider, core) = tokio::net::UnixStream::pair().unwrap();
+        let mut provider = ControlChannel::from_stream(provider);
+        let (reader, writer) = ControlChannel::from_stream(core).into_halves();
+        drop(writer);
+        drop(reader);
+        assert_eq!(provider.recv().await.unwrap(), None);
+    }
+
+    /// A `DataConnection` over a connected pair (no path bind) exposes the very
+    /// descriptor of its stream, so a peer verifier reads the right socket.
+    #[tokio::test]
+    async fn data_connection_peer_fd_is_the_stream_fd() {
+        let (a, _b) = tokio::net::UnixStream::pair().unwrap();
+        let raw = a.as_raw_fd();
+        let conn = DataConnection {
+            flow_id: 7,
+            stream: a,
+        };
+        assert!(conn.peer_fd() >= 0);
+        assert_eq!(conn.peer_fd(), raw);
+    }
 }

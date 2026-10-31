@@ -115,12 +115,21 @@ final class EmbeddedCoreController {
         case .status(let status):
             update { $0.status = status }
         case .ready(let runtime):
+            // Snapshot the Settings ▸ Proxy values this core was started with, so the
+            // Proxy tab can disable Apply & Restart until an edit actually diverges.
+            // Read the same keys and defaults EmbeddedCore reads at spawn.
+            let defaults = UserDefaults.standard
+            // 8080 matches Settings ▸ Proxy's @AppStorage default and EmbeddedCore's default port.
+            let appliedPort = defaults.object(forKey: "proxy.preferredPort") as? Int ?? 8080
+            let appliedVerifyTLS = defaults.object(forKey: "proxy.verifyUpstreamTLS") as? Bool ?? true
             update {
                 $0.endpoint = runtime.endpoint
                 $0.status = .ready
                 let proxy = "127.0.0.1:\(runtime.proxyPort)"
                 $0.proxyAddress = proxy
                 $0.label = "Embedded core · proxy \(proxy)"
+                $0.appliedPort = appliedPort
+                $0.appliedVerifyUpstreamTLS = appliedVerifyTLS
             }
             // Point the live bus client at the core we just brought up.
             bus.useEmbeddedEndpoint(runtime.endpoint)

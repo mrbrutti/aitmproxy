@@ -8,23 +8,64 @@ use aitm_findings::{DiskFindingStore, FindingFilter, FindingRecord, FindingStore
 /// Load every recorded finding, optionally filtered to `target`. Returns an
 /// **empty** vec (not an error) when no `findings.dir` is configured — the
 /// deny-by-default posture: `scan.report` with no findings store wired has
-/// nothing to show, not a failure. A listed finding whose record cannot be read
-/// or parsed is silently skipped; surfacing that count difference is the job of
-/// `scan.report`, not of this helper.
+/// nothing to show, not a failure. A record that cannot be read or parsed is
+/// skipped.
+///
+/// `target` is matched through [`target_matches`], not
+/// [`FindingFilter::target`]'s exact string equality: a campaign base URL
+/// (`http://t.test:8080`) must relate to a recorded endpoint
+/// (`http://t.test:8080/search`), so every record is listed unfiltered and
+/// matched here instead, on the listing's `target` and before the full record
+/// is read, so a record for another target is never loaded.
 pub fn load_records(host: &CommandHost<'_>, target: Option<&str>) -> Vec<FindingRecord> {
     let Some(dir) = host.config().and_then(|c| c.findings.dir.clone()) else {
         return Vec::new();
     };
     let store = DiskFindingStore::new(dir);
-    let filter = FindingFilter {
-        target: target.map(str::to_string),
-        ..FindingFilter::default()
-    };
     store
-        .list(&filter)
+        .list(&FindingFilter::default())
         .iter()
+        .filter(|summary| target.is_none_or(|t| target_matches(t, &summary.target)))
         .filter_map(|summary| store.get(&summary.id))
         .collect()
+}
+
+/// Whether `record_target` relates to `filter` for `scan.report`'s `target`
+/// argument: both parse as absolute [`url::Url`]s with the same scheme, host
+/// and effective port ([`url::Url::port_or_known_default`]), and
+/// `record_target`'s path equals `filter`'s path or extends it on a `/`
+/// boundary, after removing one trailing `/` from `filter`'s path (so an empty
+/// or `/` filter path matches every path); query and fragment are ignored.
+///
+/// When `filter` does not parse as a URL at all, this falls back to exact
+/// string equality. A URL that parses but has no host (`mailto:a`,
+/// `javascript:x`), on either side, never matches — never panics either.
+pub(crate) fn target_matches(filter: &str, record_target: &str) -> bool {
+    let Ok(filter_url) = url::Url::parse(filter) else {
+        return filter == record_target;
+    };
+    let Some(filter_host) = filter_url.host_str() else {
+        return false;
+    };
+    let Ok(record_url) = url::Url::parse(record_target) else {
+        return false;
+    };
+    let Some(record_host) = record_url.host_str() else {
+        return false;
+    };
+    if filter_url.scheme() != record_url.scheme() {
+        return false;
+    }
+    if filter_host != record_host {
+        return false;
+    }
+    if filter_url.port_or_known_default() != record_url.port_or_known_default() {
+        return false;
+    }
+    let filter_path = filter_url.path();
+    let filter_path = filter_path.strip_suffix('/').unwrap_or(filter_path);
+    let record_path = record_url.path();
+    record_path == filter_path || record_path.starts_with(&format!("{filter_path}/"))
 }
 
 /// Convert a `serde_json::Value` (as `aitm_findings::render_index` returns)
@@ -190,6 +231,115 @@ mod tests {
             assert!(
                 none.is_empty(),
                 "an unmatched target yields nothing: {none:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn target_matches_table() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("http://t.test:8080", "http://t.test:8080/search", true),
+            ("http://t.test:8080/", "http://t.test:8080/a/b", true),
+            (
+                "http://t.test:8080/search",
+                "http://t.test:8080/search",
+                true,
+            ),
+            (
+                "http://t.test:8080/search",
+                "http://t.test:8080/searchx",
+                false,
+            ),
+            (
+                "http://t.test:8080/search",
+                "http://t.test:8080/other",
+                false,
+            ),
+            ("http://t.test:8080", "http://t.test:9090/search", false),
+            ("http://t.test", "http://t.test:80/search", true),
+            ("https://t.test", "http://t.test/search", false),
+            (
+                "http://t.test:8080/search?x=1",
+                "http://t.test:8080/search",
+                true,
+            ),
+            ("not a url", "not a url", true),
+            ("not a url", "http://t.test/", false),
+            // Hostile shapes.
+            (
+                "http://T.TEST:8080",
+                "http://t.test:8080/search",
+                true, // host case
+            ),
+            (
+                "http://t.test:8080/search/",
+                "http://t.test:8080/search",
+                true, // trailing slash
+            ),
+            (
+                "http://t.test:8080/search/",
+                "http://t.test:8080/search/x",
+                true, // trailing slash
+            ),
+            (
+                "http://t.test/a",
+                "http://t.test/a/../b",
+                false, // dot-segments resolve to /b
+            ),
+            (
+                "http://t.test/a",
+                "http://t.test/a%2Fb",
+                false, // %2F is not a boundary
+            ),
+            (
+                "http://u:p@t.test:8080/search",
+                "http://t.test:8080/search",
+                true, // userinfo ignored
+            ),
+            ("http://[::1]:8080", "http://[::1]:8080/search", true),
+            ("http://[::1]:8080", "http://[::2]:8080/search", false),
+        ];
+        for (filter, record, expected) in cases {
+            assert_eq!(
+                target_matches(filter, record),
+                *expected,
+                "target_matches({filter:?}, {record:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn target_matches_hostless_urls_never_match() {
+        for (filter, record) in [
+            ("mailto:a", "mailto:a"),
+            ("javascript:x", "http://t.test/"),
+            ("http://t.test", "mailto:a"),
+        ] {
+            assert!(
+                !target_matches(filter, record),
+                "target_matches({filter:?}, {record:?}) must be false"
+            );
+        }
+    }
+
+    #[test]
+    fn load_records_matches_endpoint_records_by_base() {
+        let dir = ScratchDir::new();
+        let store = DiskFindingStore::new(dir.path());
+        store
+            .record(record("finding-a", "http://t.test:8080/search"))
+            .expect("record a");
+        store
+            .record(record("finding-b", "http://other.test:8080/search"))
+            .expect("record b");
+        let config = config_with_findings_dir(Some(dir.path().to_path_buf()));
+
+        with_host(Some(config), |host| {
+            let matched = load_records(host, Some("http://t.test:8080"));
+            assert_eq!(
+                matched.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                vec!["finding-a"],
+                "the base URL must match only its own endpoint record"
             );
         });
     }

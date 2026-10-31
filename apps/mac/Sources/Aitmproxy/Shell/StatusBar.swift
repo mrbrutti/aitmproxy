@@ -8,8 +8,10 @@ struct StatusBar: View {
 
     var body: some View {
         HStack(spacing: Space.sm) {
-            SmallButton("Clear") {}
-            SmallButton("Filter") {}
+            SmallButton("Clear") { session.clearSession(confirm: ClearConfirmation.ask) }
+                .help("Clear every flow from the session (⌘⌫)")
+            SmallButton("Filter", on: session.filterBarVisible) { session.filterBarVisible.toggle() }
+                .help("Show or hide the filter bar (⌘F)")
             SmallButton("Auto-select", on: session.autoSelect) { session.autoSelect.toggle() }
                 .help("Follow the newest flow as it arrives (⇧⌘A)")
             Spacer()

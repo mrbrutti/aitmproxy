@@ -2,7 +2,8 @@ import AitmproxyKit
 import SwiftUI
 
 /// Scope as a sheet (S-047; Proxy ▸ Scope… ⇧⌘O): the same panel for when
-/// the list is on another page. 560 wide, content-sized, one `Done`.
+/// the list is on another page. 640 wide (the fixed columns + host need it,
+/// else the leading edge clips), content-sized, one `Done`.
 struct ScopeSheet: View {
     @Environment(Session.self) private var session
     @Environment(\.dismiss) private var dismiss
@@ -26,7 +27,7 @@ struct ScopeSheet: View {
             }
             .padding(.horizontal, Space.md).padding(.vertical, Space.sm)
         }
-        .frame(width: 560)
+        .frame(width: 640)
         .background(Tok.Ground.surface.color)
     }
 

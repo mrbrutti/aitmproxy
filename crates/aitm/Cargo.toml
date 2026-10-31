@@ -64,6 +64,23 @@ tokio-tungstenite = "0.28"
 # Bridge token generation (two v4 UUIDs).
 uuid.workspace = true
 
+# macOS NE live-capture feeder, peer-auth seam (`macos_capture::peer_auth`): the
+# core verifies the System Extension provider's code signature before it sends
+# scope or feeds bytes. Security.framework is macOS-only, so every dependency here
+# is behind the target cfg and nothing new links on Linux.
+#   - `security-framework`: `os::macos::code_signing` (`SecCode` / `SecRequirement`).
+#   - `aitm-peer-token`: reads the peer audit token off the socket. It holds the one
+#     `unsafe` `getsockopt(SOL_LOCAL, LOCAL_PEERTOKEN)` call so that this crate can
+#     keep the workspace `unsafe_code = "forbid"`.
+#   - `core-foundation`: `CFData`, the carrier the `GuestAttributes` audit-token
+#     setter requires. `security-framework` pulls it in regardless (same `0.10`
+#     it pins), so it adds no new crate to the tree; named here because it is
+#     used directly.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+core-foundation = "0.10"
+aitm-peer-token.workspace = true
+
 [dev-dependencies]
 # The hermetic multi-vuln target the M4 browser-capture e2e drives (Task 14).
 aitm-testtarget.workspace = true

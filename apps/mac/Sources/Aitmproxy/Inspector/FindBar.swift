@@ -134,3 +134,26 @@ struct FindBar: View {
         isPresented = false
     }
 }
+
+/// The find field on its own 28 pt row, directly under a pane's tab strip
+/// (S-029). Pulled out of the tab bar's trailing slot so the `n of m` counter
+/// and the regex toggle are never crushed when the pane is narrow.
+struct FindRow: View {
+    var state: FindState
+    @Binding var isPresented: Bool
+
+    init(state: FindState, isPresented: Binding<Bool>) {
+        self.state = state
+        _isPresented = isPresented
+    }
+
+    var body: some View {
+        HStack(spacing: 0) {
+            FindBar(state: state, isPresented: $isPresented)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, Space.md)
+        .frame(height: Tok.Size.control)
+        .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
+    }
+}

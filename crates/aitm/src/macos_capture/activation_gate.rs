@@ -16,7 +16,8 @@ use aitm_core::Frontend;
 ///
 /// The one knob, [`allow_agent_sysex_install`](Self::allow_agent_sysex_install),
 /// defaults to `false`: deny-by-default, exactly like `ca.allow_agent_install`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SysexActivationConfig {
     /// Allow an untrusted (agent) caller, any origin `Frontend::is_trusted_control`
     /// does not trust, to trigger the sysex install/activation. **Default false**

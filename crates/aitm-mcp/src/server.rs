@@ -1512,6 +1512,14 @@ impl McpServer {
             if let Some(reason) = self.read_refusal(conn, name) {
                 return ToolOutcome::Done(tool_error(reason));
             }
+            // These verbs are answered here, before the normal `params_from_json`
+            // path, so enforce their published schema explicitly — otherwise they
+            // bypass the `additionalProperties:false`, type, and flow-id checks
+            // every other tool gets (an undeclared key, a non-string `method`, or
+            // a non-flow-id `since` would slip through, the last silently).
+            if let Err(e) = self.enforce_verb_schema(name, arguments) {
+                return ToolOutcome::Rpc(e);
+            }
             return ToolOutcome::Done(self.handle_subscription(conn, name, arguments));
         }
         // `agent.approve` is server-handled (spec D4): it resolves a parked `Ask`
@@ -1519,6 +1527,16 @@ impl McpServer {
         // cannot carry. It is registered (for `tools/list`) but intercepted here,
         // before the registry/policy path. The agent role can never approve (RF#2).
         if name == "agent.approve" {
+            // The role gate decides on the role alone, *before* any argument
+            // validation: the agent can never approve, and its argument shape must
+            // never become an oracle around the gate (RF#2). Only once the caller
+            // is trusted control do we enforce the verb's published schema, like
+            // any other command past its gate.
+            if conn.role.is_trusted_control() {
+                if let Err(e) = self.enforce_verb_schema(name, arguments) {
+                    return ToolOutcome::Rpc(e);
+                }
+            }
             return ToolOutcome::Done(self.handle_approve(conn, arguments));
         }
         let cmd = match self.registry.command(name) {
@@ -1859,6 +1877,10 @@ impl McpServer {
                     .to_string(),
             );
         }
+        // Fallback param checks for a server that intercepts `agent.approve`
+        // without registering the command: on the normal path `enforce_verb_schema`
+        // has already validated `request_id`/`allow` against the published schema
+        // before this runs, so these only fire when there is no schema to enforce.
         let Some(request_id) = arguments.get("request_id").and_then(JsonValue::as_str) else {
             return tool_error("agent.approve requires a string `request_id`.".to_string());
         };
@@ -1890,6 +1912,29 @@ impl McpServer {
             )),
             _ => None,
         }
+    }
+
+    /// Enforce a server-handled verb's published schema. `flow.subscribe`,
+    /// `flow.unsubscribe`, and `agent.approve` are answered in [`McpServer::run_tool`]
+    /// before the normal [`params_from_json`] path, so without this they would
+    /// bypass the very `additionalProperties:false`, type, and flow-id checks every
+    /// registry command gets. Validate the raw arguments against the command's own
+    /// registered schema and surface a violation as the same `INVALID_PARAMS`
+    /// envelope a mistyped regular command returns (so live and replay — and every
+    /// frontend — see one validation contract). If the verb is not registered in
+    /// this server, `tools/list` published no schema for it, so there is nothing to
+    /// enforce and the call proceeds unchanged.
+    fn enforce_verb_schema(
+        &self,
+        name: &str,
+        arguments: &Map<String, JsonValue>,
+    ) -> Result<(), RpcError> {
+        let Some(cmd) = self.registry.command(name) else {
+            return Ok(());
+        };
+        params_from_json(arguments, &cmd.schema(), name)
+            .map(|_| ())
+            .map_err(|e| RpcError::new(INVALID_PARAMS, e.to_string()))
     }
 
     /// Run `flow.subscribe`/`flow.unsubscribe` against the connection and the
@@ -1930,6 +1975,9 @@ impl McpServer {
             Ok(filter) => filter,
             Err(reason) => return tool_error(reason),
         };
+        // A malformed `since` is already rejected by `enforce_verb_schema` on the
+        // registered path, so this `.ok()` only silently drops one when the verb is
+        // unregistered (no published schema) — never on the normal path.
         let since = args
             .get("since")
             .and_then(JsonValue::as_str)
@@ -1964,6 +2012,9 @@ impl McpServer {
     /// Remove a subscription this connection owns. Returns `{}` whether or not it
     /// existed (idempotent).
     fn unsubscribe(&self, conn_id: u64, args: &Map<String, JsonValue>) -> JsonValue {
+        // Fallback for an unregistered `flow.unsubscribe`: on the normal path
+        // `enforce_verb_schema` has already required a well-typed `sub_id` against
+        // the published schema before this runs.
         let Some(sub_id) = args.get("sub_id").and_then(JsonValue::as_u64) else {
             return tool_error("flow.unsubscribe requires an integer `sub_id`".to_string());
         };

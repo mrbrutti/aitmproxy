@@ -47,6 +47,20 @@ final class ScanPanelState {
 
     // MARK: Intents
 
+    /// The in-flight crawl, held so Cancel can stop waiting on it.
+    @ObservationIgnored private var scanTask: Task<Void, Never>?
+
+    /// Start a crawl and keep its task so the running state can be cancelled.
+    func start() { scanTask = Task { await launch() } }
+
+    /// Stop waiting on the crawl and clear the running state. The bus call cannot be
+    /// recalled, so a late result is dropped (the `Task.isCancelled` guard in `launch`).
+    func cancelScan() {
+        scanTask?.cancel()
+        scanTask = nil
+        model.running = false
+    }
+
     /// `scan.discover {target, max_depth?, max_pages?}` → the endpoints and injection points it found.
     func launch() async {
         guard let args = model.beginLaunch(form: form, scopeHosts: session.scopeHosts, tools: session.tools) else { return }
@@ -54,9 +68,11 @@ final class ScanPanelState {
         do {
             value = try await session.runCommand(ScanForm.toolName, args)
         } catch {
+            if Task.isCancelled { return }
             model.fail(BusService.describe(error))
             return
         }
+        guard !Task.isCancelled else { return }
         do {
             model.finish(try ScanResult(json: value))
         } catch {
@@ -112,10 +128,12 @@ struct ScanPanel: View {
         VStack(spacing: 0) {
             if state.offered {
                 launchBar
+                    .gridProbe("scan-launch", area: "scan", edge: nil)
                 Rule()
                 HStack(spacing: 0) {
                     lists
                         .frame(width: 320)
+                        .gridProbe("scan-lists", area: "scan", edge: nil)
                     VRule()
                     ScanPointDetail(state: state)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -126,7 +144,7 @@ struct ScanPanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        .gridArea("scan")
+        .gridArea("scan", inset: 0)
         // Opening the page seeds the form; it never starts a crawl.
         .onAppear { state.syncForm() }
         .onChange(of: state.session.tools) { state.syncForm() }
@@ -177,7 +195,9 @@ struct ScanPanel: View {
     private var status: some View {
         HStack(spacing: Space.sm) {
             if state.running {
+                ProgressView().controlSize(.small)
                 Text("Crawling \(state.model.target ?? "")…").foregroundStyle(Tok.Ink.secondary.color)
+                FlatButton("Cancel") { state.cancelScan() }
             } else if let error = state.error {
                 Text(error).foregroundStyle(Tok.Status.serverError.color)
             } else if let refusal = state.refusal {
@@ -203,7 +223,7 @@ struct ScanPanel: View {
         .frame(minHeight: Tok.Size.control)
     }
 
-    private func launch() { Task { await state.launch() } }
+    private func launch() { state.start() }
 
     private func field<Content: View>(_ label: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: Space.xs) {
@@ -214,11 +234,19 @@ struct ScanPanel: View {
 
     // MARK: Results
 
+    /// Endpoints is a supporting list: cap it to its rows (up to a few) so a short
+    /// crawl leaves no dead band, and let the injection-points list take the rest.
+    private static let maxEndpointRows = 8
+
+    private var endpointListHeight: CGFloat {
+        CGFloat(min(max(state.endpoints.count, 2), Self.maxEndpointRows)) * Tok.Size.Row.dense
+    }
+
     private var lists: some View {
         VStack(spacing: 0) {
             sectionHead("Endpoints", count: state.endpoints.count)
             endpointList
-                .frame(maxHeight: .infinity)
+                .frame(height: endpointListHeight)
             Rule()
             sectionHead("Injection points", count: state.points.count)
             pointList
@@ -288,10 +316,10 @@ struct ScanPanel: View {
 
     /// The core does not list `scan.discover` (no scanner plugin): degraded, never broken.
     private var unavailable: some View {
-        VStack(spacing: Space.sm) {
-            Text("Scan is unavailable").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
-            Text("scan.discover is not on this bus (needs the scanner plugin).")
-                .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+        ContentUnavailableView {
+            Label("Scan is unavailable", systemImage: Tok.Glyph.search)
+        } description: {
+            Text("scan.discover is not on this bus (it needs the scanner plugin).")
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -418,9 +446,6 @@ struct ScanPointDetail: View {
                         if !state.canOpen(point) {
                             Hint(text: "This flow is no longer in the flow list (cleared, or not captured here).")
                         }
-
-                        section("Injection points by type")
-                        typeBreakdown
                     }
                     .padding(Space.md)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -430,11 +455,14 @@ struct ScanPointDetail: View {
         } else if state.model.hasResult {
             scanSummary
         } else {
-            VStack(spacing: Space.sm) {
-                Text("No scan yet").font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
-                    .foregroundStyle(Tok.Ink.primary.color)
+            ContentUnavailableView {
+                Label("No scan yet", systemImage: Tok.Glyph.search)
+            } description: {
                 Text("Scan an in-scope target above to crawl its endpoints and injection points.")
-                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+            } actions: {
+                PrimaryButton(state.running ? "Scanning…" : "Scan") { state.start() }
+                    .disabled(!state.canLaunch)
+                    .help(state.refusal ?? "Crawl the target above (⌘⏎)")
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -471,6 +499,7 @@ struct ScanPointDetail: View {
             .map { (location: $0.key, count: $0.value.count) }
             .sorted { $0.count == $1.count ? $0.location < $1.location : $0.count > $1.count }
         let total = max(1, state.points.count)
+        // Kept narrow so each count sits by its bar's end, not 500 pt away.
         return VStack(alignment: .leading, spacing: Space.sm) {
             ForEach(Array(groups.enumerated()), id: \.offset) { item in
                 let group = item.element
@@ -492,12 +521,10 @@ struct ScanPointDetail: View {
                 .accessibilityLabel("\(group.location), \(group.count)")
             }
         }
+        .frame(maxWidth: 320, alignment: .leading)
     }
 
-    private static let typeColors: [Color] = [
-        Tok.Mark.blue.color, Tok.Mark.green.color, Tok.Mark.orange.color,
-        Tok.Mark.purple.color, Tok.Mark.teal.color, Tok.Mark.pink.color,
-    ]
+    private static let typeColors: [Color] = ChartPalette.categorical
 
     private static func typeColor(_ index: Int) -> Color { typeColors[index % typeColors.count] }
 

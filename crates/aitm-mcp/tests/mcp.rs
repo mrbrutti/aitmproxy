@@ -4098,3 +4098,191 @@ fn non_widget_tools_byte_identical() {
         "no result _meta: {call}"
     );
 }
+
+// ---- Schema enforcement on the server-handled verbs -----------------------
+//
+// `flow.subscribe`/`flow.unsubscribe`/`agent.approve` are answered in
+// `run_tool` before the normal `params_from_json` path, so without explicit
+// enforcement they would bypass their own published schema: undeclared keys,
+// wrong-typed values, and a non-flow-id `since` would all slip through the
+// validation every other tool gets. Each bad call must be the same
+// INVALID_PARAMS JSON-RPC error a mistyped regular command returns.
+
+/// An undeclared argument to `flow.subscribe` is rejected (`additionalProperties:
+/// false`), not silently accepted.
+#[test]
+fn subscribe_rejects_undeclared_argument() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "flow.subscribe",
+        json!({"bogus": 1}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// A wrong-typed value inside the nested `filter` object is rejected.
+#[test]
+fn subscribe_rejects_nonstring_method_in_filter() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "flow.subscribe",
+        json!({"filter": {"method": 123}}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// An undeclared key *inside* the nested `filter` object is rejected too (the
+/// schema is enforced recursively, like any other object param).
+#[test]
+fn subscribe_rejects_undeclared_key_inside_filter() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "flow.subscribe",
+        json!({"filter": {"bogus": "x"}}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// A non-flow-id `since` is rejected instead of being silently dropped (before
+/// the fix `since.parse::<FlowId>().ok()` swallowed a bad value, so a client's
+/// typo produced a full live stream with no catch-up and no error).
+#[test]
+fn subscribe_rejects_non_flow_id_since() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "flow.subscribe",
+        json!({"since": "not-a-flow-id"}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// A well-formed `filter` + `since` still passes validation and subscribes
+/// (the enforcement rejects only genuinely invalid arguments).
+#[test]
+fn subscribe_accepts_valid_filter_and_since() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let since = aitm_core::FlowId::new().to_string();
+    let conn = ConnCtx {
+        role: Frontend::Operator,
+        client_label: None,
+        conn_id: srv.next_conn_id(),
+        out: Some(aitm_mcp::NotificationSink::new(16)),
+    };
+    let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+        "params":{"name":"flow.subscribe",
+            "arguments":{"filter":{"host":"a.test","method":"post"},"since":since}}});
+    let resp: JsonValue =
+        serde_json::from_str(&srv.handle_on(&conn, &req.to_string()).expect("reply"))
+            .expect("json");
+    assert_eq!(
+        resp["result"]["isError"],
+        json!(false),
+        "a valid subscribe succeeds: {resp}"
+    );
+    assert!(
+        resp["result"]["structuredContent"]["sub_id"]
+            .as_u64()
+            .is_some(),
+        "returns a sub_id: {resp}"
+    );
+}
+
+/// An undeclared argument to `flow.unsubscribe` is rejected even alongside a
+/// valid `sub_id`.
+#[test]
+fn unsubscribe_rejects_undeclared_argument() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "flow.unsubscribe",
+        json!({"sub_id": 1, "bogus": 2}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// `flow.unsubscribe` requires its declared `sub_id` — a missing required param
+/// is rejected (before the fix an absent `sub_id` reached the hand-rolled handler
+/// as a tool error rather than the INVALID_PARAMS every other tool returns).
+#[test]
+fn unsubscribe_rejects_missing_sub_id() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let resp = call_as_args(&srv, Frontend::Operator, "flow.unsubscribe", json!({}));
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// A wrong-typed `sub_id` (the verb's one declared param, an `Int`) is rejected
+/// by the schema, like any mistyped regular command.
+#[test]
+fn unsubscribe_rejects_nonint_sub_id() {
+    let srv = push_server(Arc::new(MemFlowStore::new()), 16);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "flow.unsubscribe",
+        json!({"sub_id": "not-an-int"}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// An undeclared argument to `agent.approve` (from an operator — a trusted
+/// control role past the role gate) is rejected.
+#[test]
+fn approve_rejects_undeclared_argument() {
+    let srv = policy_server(ungated(), None);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": "apr_deadbeef", "allow": true, "bogus": 1}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// A wrong-typed `allow` for `agent.approve` is rejected by the schema.
+#[test]
+fn approve_rejects_wrong_typed_allow() {
+    let srv = policy_server(ungated(), None);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": "apr_deadbeef", "allow": "yes"}),
+    );
+    assert_eq!(resp["error"]["code"], json!(INVALID_PARAMS), "{resp}");
+}
+
+/// Security: for `agent.approve` the role gate decides on the role alone, *before*
+/// any argument validation. An agent sending malformed `agent.approve` is refused
+/// for being the agent (a tool error) — it is never told its arguments were bad,
+/// so argument shape can never become an oracle around the role gate (RF#2).
+#[test]
+fn approve_role_gate_precedes_schema_for_the_agent() {
+    let srv = policy_server(ungated(), None);
+    let resp = call_as_args(
+        &srv,
+        Frontend::Mcp,
+        "agent.approve",
+        json!({"bogus": 1, "allow": "not-a-bool"}),
+    );
+    assert!(
+        resp.get("error").is_none(),
+        "a role refusal, not a protocol error: {resp}"
+    );
+    assert!(is_refused(&resp), "the agent is refused: {resp}");
+    let text = resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("cannot approve"),
+        "refused for the role, not the arguments: {resp}"
+    );
+}

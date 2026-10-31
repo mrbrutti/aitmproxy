@@ -112,8 +112,8 @@ struct BusSettings: View {
                 ForEach(ActiveCoreKind.allCases) { Text($0.title).tag($0) }
             }
             Text(usesExternal
-                 ? "Connect to an aitm core you run yourself. Enter its address below, or launch the app with `--bus host:port` and `--token`/`--token-file`. The embedded core stops while External is active and starts again when you switch back."
-                 : "Embedded is the default: the app bundles its own aitm core and manages it, starting it on launch and stopping it on quit. Nothing to install separately. Choose External to point the app at a core you run yourself.")
+                 ? "Connects to a core you run yourself; the embedded core stops."
+                 : "The app runs its own bundled core. Choose External to use your own.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -123,6 +123,9 @@ struct BusSettings: View {
             TextField("Port", value: $port, format: .number.grouping(.never)).disabled(fromConfig)
             TextField("Token file", text: $tokenFile, prompt: Text("~/Library/Application Support/aitmproxy/mcp.token"))
                 .disabled(fromConfig)
+            Text("Used when the active core is External.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
         .disabled(!usesExternal)
         Section("Role") {
@@ -132,14 +135,7 @@ struct BusSettings: View {
                     Text(role.title).tag(role.rawValue)
                 }
             }
-        }
-        Section {
-            Text("""
-                With no operator token the app connects as an agent using the token in config.yaml, \
-                and is gated exactly as an agent. Paste the operator token to connect as operator; \
-                reconnect (Proxy ▸ Reconnect Bus, ⌃⌘R) to apply it. The role the bus assigns is \
-                shown in the status bar, with a warning when it differs from the expected role.
-                """)
+            Text("Paste an operator token and reconnect (⌃⌘R) to connect as operator.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -158,10 +154,26 @@ struct ProxySettings: View {
 
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
+    /// Apply & Restart is live only for the embedded core and only once an edit
+    /// diverges from what the running core was started with. With no applied
+    /// snapshot yet (no core up, or a fixture) it stays live so a first Apply can
+    /// start the core.
+    private var canApply: Bool {
+        guard usesEmbedded else { return false }
+        guard let connection = session.coreHealth.connection,
+              let appliedPort = connection.appliedPort,
+              let appliedVerifyTLS = connection.appliedVerifyUpstreamTLS else { return true }
+        return port != appliedPort || verifyTLS != appliedVerifyTLS
+    }
+
     var body: some View {
         @Bindable var session = session
         Section("Embedded proxy") {
             TextField("Listen port", value: $port, format: .number.grouping(.never))
+            if usesEmbedded, let bound = session.coreHealth.connection?.proxyAddress,
+               Self.port(from: bound) != port {
+                LabeledContent("Bound address", value: bound)
+            }
             Toggle("Verify upstream TLS", isOn: $verifyTLS)
             if !verifyTLS {
                 Text("Disabling TLS verification lets the proxy trust any upstream certificate. Use it only to reach a server with a self-signed or mismatched cert — never on an untrusted network.")
@@ -171,14 +183,19 @@ struct ProxySettings: View {
         }
         .disabled(!usesEmbedded)
         Section {
-            Button("Apply & Restart Core") { session.restartCoreTick += 1 }
-                .disabled(!usesEmbedded)
+            Button("Apply and Restart Core") { session.restartCoreTick += 1 }
+                .disabled(!canApply)
             Text(usesEmbedded
-                 ? "The bundled core restarts to apply these — the proxy and bus briefly drop and rebind. If the chosen port is taken, the core picks a free one and the toolbar shows the real address."
+                 ? "The bundled core restarts to apply these — the proxy and bus briefly drop and rebind. If the chosen port is taken, the core picks a free one, shown above as the bound address."
                  : "The active core is external; its port and TLS come from the config.yaml it was launched with. Switch to the embedded core in Bus to manage them here.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
+    }
+
+    /// The port in a `host:port` bound address, for comparing against the preferred port.
+    private static func port(from address: String) -> Int? {
+        Int(address.split(separator: ":").last ?? "")
     }
 }
 
