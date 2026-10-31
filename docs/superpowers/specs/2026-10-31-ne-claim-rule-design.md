@@ -19,7 +19,7 @@ orchestrator in PR #185 and is **out of this PR**. See "Handled elsewhere".
 Capture never works for an operator who adds a host to Scope on v0.5.3, because the
 provider claims the app's **DNS lookup**. macOS attributes an app's resolver datagram to
 the app with the looked-up name attached:
-`New flow: NEFlow type = datagram, app = com.apple.curl, name = www.example.com, 10.9.11.162:0 <-> 10.9.10.1:53`
+`New flow: NEFlow type = datagram, app = com.apple.curl, name = www.example.com, 192.0.2.10:0 <-> 192.0.2.1:53`
 → `handleNewUDPFlow` → `provider accepted new flow UDP com.apple.curl` → `Destroying,
 client tx 0, client rx 29, kernel tx 0`; curl: "Resolving timed out". `FlowHandoff.handleUDP`
 routes UDP through the same `claim(descriptor)` → `ScopeMatcher.matches(hostname:ip:port:)`
@@ -75,10 +75,10 @@ to a DNS port is never claimed, whatever the scope says.
 ## Constraints
 
 - Swift 6.2, macOS 26 target, no new frameworks. The Extension is compiled by
-  `apps/mac/build.sh` as `swiftc Sources/*.swift` without `-D DEBUG`.
+  `apps/mac/build.sh` as `swiftc Sources/*.swift` without `-DDEBUG`.
 - The Extension has **no SwiftPM test target**. Its tests are `enum HandoffSelfCheck`
   (`#if DEBUG`, `static func run() -> [String]`) at the bottom of `FlowHandoff.swift`,
-  run by compiling the sources plus a one-line driver with `-D DEBUG`. They need no
+  run by compiling the sources plus a one-line driver with `-DDEBUG`. They need no
   root, no entitlement, no NE: real `socketpair`s, fake flows, `$TMPDIR` only.
 - The runner must work from the Claude sandbox (writes only under `$TMPDIR` / the
   chosen scratch dir) and from the Terminal panel.
@@ -148,7 +148,7 @@ New file. It:
 - compiles every `Extension/Sources/*.swift` **except `Sources/main.swift`** (the real
   entry point parks on `NEProvider.startSystemExtensionMode()` and would never return)
   plus the driver, with exactly:
-  `xcrun swiftc -sdk "$(xcrun --show-sdk-path --sdk macosx)" -target "$(uname -m)-apple-macos26.0" -D DEBUG -framework NetworkExtension -module-name AitmproxyNESelfCheck`
+  `xcrun swiftc -sdk "$(xcrun --show-sdk-path --sdk macosx)" -target "$(uname -m)-apple-macos26.0" -DDEBUG -framework NetworkExtension -module-name AitmproxyNESelfCheck`
   and `-module-cache-path "$scratch/ModuleCache"` so nothing is written outside the
   scratch dir;
 - runs the binary; exit `0` = all checks pass, `1` = at least one `FAIL` line (printed
@@ -168,6 +168,20 @@ target is a build-system change with its own review, not a hotfix.
   from the emitter's side — the L7 host/suffix tokens it emits gate TCP only, the L4 IP
   tokens (`l4_token`) are the only way a UDP flow is claimed, and DNS ports are never
   claimed by the provider. Doc-only; the four byte-assertion tests are unaffected.
+
+### D7. `decodeCore` rejects a `Scope` frame whose payload is not an object (found by the new gate)
+
+Running the Extension's self-checks for the first time (D5) exposed one pre-existing red check,
+`decode rejects {"Scope":"x"}` in `HandoffSelfCheck`: since #100 it has required a `Scope` frame
+with a non-object payload to be rejected, while `HandoffMessages.decodeCore` returned `.ignored`
+for it. The check states the intended contract — the one variant the provider acts on must be
+well-formed; only *unknown* variants are ignored for forward compatibility — so `decodeCore` now
+throws `HandoffError.malformed("Scope payload is not an object")`, tearing the control channel
+down so the provider fails open, exactly as for a `Scope` without a string `spec`. The core's
+serde encoding (`{"Scope":{"spec":…}}`) never produces this frame, so there is no live behaviour
+change. This is not a claim-rule change; D4 holds for everything else. (Recorded after the spec
+review: the builder made this edit to get the gate green instead of stopping on the gap; the
+change is kept because reverting it re-reds the gate and the check is the stated contract.)
 
 ### Handled elsewhere
 
@@ -238,6 +252,8 @@ target is a build-system change with its own review, not a hotfix.
    it exits `2`. Proven by running it on the branch (exit 0) and once with a temporary,
    uncommitted `r.fail("FAIL probe")` added to `HandoffSelfCheck.run()` (exit 1, line
    printed), both outputs quoted in the Coder's report.
+8. **CR-AC8 (D7).** `decode rejects {"Scope":"x"}` passes under CR-AC7; `decodeCore` still
+   returns `.ignored` for an unknown single-key variant (pinned by the existing `Hello` check).
 
 ## Left to the builder
 

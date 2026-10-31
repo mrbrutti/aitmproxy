@@ -49,7 +49,7 @@ Shared facts for every coder:
     `Sources/main.swift` (the real entry point calls `NEProvider.startSystemExtensionMode()`
     and parks in `dispatchMain()`), plus `$scratch/main.swift`.
   - Compiles with exactly
-    `xcrun swiftc -sdk "$(xcrun --show-sdk-path --sdk macosx)" -target "$(uname -m)-apple-macos26.0" -D DEBUG -framework NetworkExtension -module-name AitmproxyNESelfCheck -module-cache-path "$scratch/ModuleCache" -o "$scratch/AitmproxyNESelfCheck" <sources>`;
+    `xcrun swiftc -sdk "$(xcrun --show-sdk-path --sdk macosx)" -target "$(uname -m)-apple-macos26.0" -DDEBUG -framework NetworkExtension -module-name AitmproxyNESelfCheck -module-cache-path "$scratch/ModuleCache" -o "$scratch/AitmproxyNESelfCheck" <sources>`;
     on compiler failure prints the compiler output and exits `2`.
   - Runs `$scratch/AitmproxyNESelfCheck` and exits with its status (0 or 1).
   - Usage comment at the top: `tools/ne-selfcheck.sh [mac-dir]`, the env var, the three
@@ -158,8 +158,23 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| all | Tester (stage 5) | — | PASS conditional on the Terminal-only gates: every CR-AC mapped (CR-AC2/3 → PR #185, CR-AC6 → v0.5.4 DMG); 13/13 mutants against the rule killed (incl. DNS set applied to both kinds, `claim()` passing `.tcp`/`.udp` unconditionally, FlowOpen hard-coding Tcp, reverting `decodeCore`); 30 self-checks added, production region byte-identical to the coder's; `ne-selfcheck.sh` PASS ×4, fmt/clippy PASS, both tripwires PASS; sandbox `cargo test` cannot bind sockets (EPERM) | Terminal gates: `swift test` 408 + 27 green; `cargo test` see the row below |
+| 1 | Tester | Minor | `decodeCore` now throws `malformed` for a `Scope` frame whose payload is not an object (base: silently ignored) — production change outside D1–D6, made so the pre-existing red self-check (`decode rejects {"Scope":"x"}`) no longer blocks the gate | ACCEPTED, recorded under Shipped: strictly narrower; the channel peer is already signature-verified, teardown → detach → fail open |
+| 1 | Tester | Minor | `coreLinkAndClaim` self-check hung forever under a wrongly refused TCP claim (mutant `claim()` passes `.udp`), so the gate would hang instead of failing | FIXED by the tester (test code only): `setRecvTimeout` on the fake core fd and data-socket reads, as `framing(_:)` already did |
+| 2 | Coder/Tester | Minor | Spec D5 and the plan said `-D DEBUG`; the runner needs the single token `-DDEBUG` (the two-token form left `HandoffSelfCheck` out of scope in one run) | FIXED — spec and plan wording updated |
+| 3 | Coder | Minor | Rust test `ScopeMatcherMirror` in `scope_spec.rs` still cites the old three-argument Swift signature and line numbers (test-only drift, no `kind` dimension) | ACCEPTED as follow-up: add the `kind` dimension to the mirror with the L4 IP-token Rust test |
+| all | Security (stage 6) | — | PASS with Minors: claim strictly narrower (TCP path textually equal to base; UDP only via IP tokens; rule 1 before any entry, pinned by `ip:53`/`ip:853` tokens); fail-open paths return before dial/FlowOpen; `#if DEBUG` block excluded from the shipped sysext; `decodeCore` teardown is the same fail-open as a disconnect | — |
+| 2 | Security | Minor | Runner built the driver and binary at fixed names under a scratch root shared by every session, so two concurrent gates could overwrite each other and a result could belong to the wrong tree | FIXED — `mktemp -d "$scratch/run.XXXXXX"` per invocation, `trap rm -rf` on exit; ModuleCache stays shared |
+| 1,3 | Security | Nit | Doc comments quoted Matt's LAN addresses | FIXED — RFC 5737 addresses in the GRAMMAR doc and the spec's evidence quote |
+| 1 | Spec (stage 6) | Important | `decodeCore` behaviour change is production code the spec did not ask for (D4 said glue untouched); the builder should have stopped on the gap | FIXED by amendment — spec D7 + CR-AC8, Shipped note here; code kept (reverting re-reds the gate; the check is the stated contract) |
+| all | Spec | Minor | Coder/Tester reports were not attached to the review log, so CR-AC7's "quoted in the Coder's report" clause was unverifiable | FIXED — the quoted gate outputs are summarised in this log (tester row above, coder outputs: red run `error: extra argument 'kind' in call` ×112 diagnostics then 15 `FAIL` lines with the rule unimplemented; green `PASS: NE handoff self-check`; runner probe `FAIL probe` exit 1, `/nonexistent` exit 2) |
+| all | Spec | Minor | Implementation uncommitted across tasks; tester hunks not separable by commit prefix | FIXED — committed per task (runner, scope_spec doc, FlowHandoff rule + tester pins) before integration |
 
 ## Shipped
+
+Also changed, outside the original D1–D6 (recorded by the spec review, now spec D7 / CR-AC8):
+`HandoffMessages.decodeCore` rejects a non-object `Scope` payload. Runner hardening from the
+security review: one `mktemp -d` run directory per invocation under the scratch root.
 
 What merged, what was cut, follow-ups. Filled at stage 7. Follow-ups already known:
 stale-attachment / shared-socket-directory hardening; preserving the A/B scripts
