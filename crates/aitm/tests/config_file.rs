@@ -229,6 +229,40 @@ fn operator_gate_knobs_load() {
     assert!(parse("poc:\n  bogus: 1\n").is_err());
 }
 
+/// SP-AC7 of the macOS Scope-persistence spec
+/// (`docs/superpowers/specs/2026-10-31-macos-scope-persistence-design.md`): the
+/// core parses the exact bytes the macOS app's `EmbeddedCoreLaunch.Config.yaml()`
+/// emits for a persisted embedded scope. The literal below is the shared block the
+/// Swift mirror test
+/// `EmbeddedCoreLaunchTests.scope_block_is_byte_identical_to_the_core_parse_input`
+/// asserts as the YAML suffix; its sibling tripwire
+/// `scope_block_text_is_what_the_core_round_trip_test_parses` greps this file for
+/// this exact spelling, so keep it one plain string literal (no concatenation, no
+/// raw string). Also SP-AC5 `[rust]`: the block never turns on `allow_agent_widen`.
+#[test]
+fn scope_entries_block_round_trips() {
+    redirect_home();
+    let cfg = parse(
+        "scope:\n  entries:\n    - \"api.example.test\"\n    - \"*.shop.test\"\n    - \"localhost:8099\"\n",
+    )
+    .expect("parse scope entries");
+    let hosts: Vec<&str> = cfg.scope.entries.iter().map(|e| e.host.as_str()).collect();
+    assert_eq!(hosts, ["api.example.test", "*.shop.test", "localhost:8099"]);
+    assert!(!cfg.scope.allow_agent_widen);
+    // An explicit empty list is accepted and yields no entries.
+    assert!(parse("scope:\n  entries: []\n")
+        .expect("parse empty entries")
+        .scope
+        .entries
+        .is_empty());
+    // Composition with a sibling top-level key the app also emits.
+    let both = parse("ssl_insecure: true\nscope:\n  entries:\n    - \"api.example.test\"\n")
+        .expect("parse");
+    assert!(both.ssl_insecure);
+    let both_hosts: Vec<&str> = both.scope.entries.iter().map(|e| e.host.as_str()).collect();
+    assert_eq!(both_hosts, ["api.example.test"]);
+}
+
 /// Panel finding #2: the additive `session_io.allow_agent_file_io` gate parses from
 /// config (off by default), the way `Config.tls`/`Config.maps` do, and an unknown
 /// key under it is rejected (deny_unknown_fields).
