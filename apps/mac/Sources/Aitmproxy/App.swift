@@ -200,6 +200,8 @@ struct FlowCommands: Commands {
             verb(.quickLook, focused, focusedItems)
         }
         CommandMenu("Proxy") {
+            Button("Status") { session.show(.status) }
+                .keyboardShortcut("0", modifiers: .command)
             Button("Breakpoint Rules…") { session.rulesVisible = true }
                 .keyboardShortcut("b", modifiers: [.command, .shift])
             Button("Scope…") { if session.page == .scope { session.scopeSheetVisible = true } else { session.show(.scope) } }

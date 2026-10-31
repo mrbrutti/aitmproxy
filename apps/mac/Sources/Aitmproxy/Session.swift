@@ -6,12 +6,13 @@ import Observation
 
 /// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
 enum SidebarPage: String, CaseIterable, Identifiable {
-    case pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
+    case status, pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
+        case .status: "Status"
         case .pinned: "Pinned"
         case .saved: "Saved"
         case .apps: "Apps"
@@ -31,6 +32,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
 
     var symbol: String {
         switch self {
+        case .status: "waveform.path.ecg"
         case .pinned: Tok.Glyph.pin
         case .saved: "tray.full"
         case .apps: "app.badge"
@@ -52,7 +54,7 @@ enum SidebarPage: String, CaseIterable, Identifiable {
     var showsFlows: Bool {
         switch self {
         case .pinned, .saved, .apps, .domains, .scope, .connections: true
-        case .overview, .scan, .findings, .browser, .scripts, .agent, .ca, .config: false
+        case .status, .overview, .scan, .findings, .browser, .scripts, .agent, .ca, .config: false
         }
     }
 
@@ -94,12 +96,7 @@ enum AgentPolicy: String, CaseIterable {
     }
 }
 
-enum BusState: Hashable {
-    case disconnected
-    case connecting(String)
-    case connected(String)
-    case failed(String)
-}
+// `BusState` lives in AitmproxyKit (ConnectionSummary.swift) so the connection indicators share it.
 
 /// Everything the shell shows. One object, shared through the environment.
 /// This file holds the state; the actions sit in one extension file per
@@ -171,7 +168,16 @@ final class Session {
     var selection: Set<FlowID> = []
     /// The flow the inspector shows: the last clicked row.
     var focused: FlowID?
-    var page: SidebarPage? = .apps
+    /// The landing page: the page the operator last used, or Status on a fresh install (nothing
+    /// to show yet, so show what is running and what to do first). Fixture, snapshot and
+    /// self-test runs start on Apps as before so their scenes stay deterministic.
+    var page: SidebarPage? = Store.isOverridden
+        ? .apps
+        : (SidebarPage(rawValue: UserDefaults.standard.string(forKey: "page") ?? "") ?? .status) {
+        didSet {
+            if !Store.isOverridden, let page, page.isInSidebar { UserDefaults.standard.set(page.rawValue, forKey: "page") }
+        }
+    }
     var chip: ContentCategory = .all
     var layout: InspectorLayout = Store.isOverridden ? .horizontal
         : InspectorLayout(rawValue: UserDefaults.standard.string(forKey: "layout") ?? "") ?? .horizontal {

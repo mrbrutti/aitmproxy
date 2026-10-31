@@ -24,6 +24,10 @@ struct SidebarView: View {
             Rule()
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
+                    // The first row answers "is it working, and what do I do next" (rule 56): the
+                    // worst connection lane's glyph and word, from the same table as the Status page.
+                    group("Proxy")
+                    statusItem()
                     group("Working")
                     item(.pinned, count: session.pins.hosts.count + session.pins.apps.count)
                     ForEach(session.pins.hosts.filter(matches), id: \.self) { host in
@@ -135,6 +139,41 @@ struct SidebarView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+
+    /// The Status row: its chip is the worst lane's glyph + word, in that lane's colour.
+    private func statusItem() -> some View {
+        let selected = session.page == .status
+        let summary = session.connectionSummary
+        let worst = summary.worst
+        return Button {
+            session.show(.status)
+        } label: {
+            HStack(spacing: Space.sm) {
+                Image(systemName: SidebarPage.status.symbol)
+                    .font(.system(size: 12, weight: .regular))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                    .frame(width: 16)
+                Text(SidebarPage.status.title)
+                    .font(Tok.Face.ui(Tok.Typography.Size.md, selected ? .medium : .regular))
+                    .foregroundStyle(Tok.Ink.primary.color)
+                Spacer(minLength: Space.xs)
+                HStack(spacing: Tok.Metric.gapTight) {
+                    Image(systemName: worst.state.symbol).font(.system(size: Tok.Size.iconInline))
+                    Text(summary.overall == .ok ? "ok" : worst.word).lineLimit(1)
+                }
+                .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                .foregroundStyle(worst.state.color.color)
+            }
+            .padding(.horizontal, Space.sm)
+            .frame(height: Tok.Size.control)
+            .background(selected ? Tok.Ground.active.color : .clear, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(summary.lanes.map { "\($0.kind.title): \($0.word)" }.joined(separator: " · "))
+        .accessibilityLabel("Status, \(worst.kind.title) \(worst.word)")
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 

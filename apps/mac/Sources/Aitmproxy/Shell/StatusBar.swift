@@ -48,22 +48,16 @@ struct StatusBar: View {
                 if session.memoryBytes > 0 { Text(Format.bytes(session.memoryBytes)) }
                 Text("↑ \(Format.rate(session.upBytesPerSecond))")
                 Text("↓ \(Format.rate(session.downBytesPerSecond))")
-                // The embedded core's health (Task 8): present only when the app
-                // manages its own core; an external connection shows the bus dot alone.
-                if let connection = session.coreHealth.connection {
-                    CoreHealthDot(connection: connection) { session.coreLogVisible.toggle() }
-                }
-                HStack(spacing: Tok.Metric.gapTight) {
-                    Circle().fill(busColor.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                    Text(busText)
-                }
-                if let role = session.resolvedRole {
-                    Label(role, systemImage: roleSymbol(role))
-                        .labelStyle(.titleAndIcon)
-                        .foregroundStyle(session.roleWarning ? Tok.Status.serverError.color : Tok.Ink.secondary.color)
-                        .help(session.roleWarning
-                            ? "Connected as \(role), not the role you expected (Settings ▸ Bus)"
-                            : "Connected as \(role)")
+                // The three connection lanes, worded by the same table as the Status page; each
+                // opens it. A role mismatch is the bus lane's warning, not a fourth item.
+                ForEach(session.connectionSummary.lanes, id: \.kind) { lane in
+                    Button { session.show(.status) } label: {
+                        LaneDot(lane: lane)
+                            .foregroundStyle(lane.state == .ok || lane.state == .off ? Tok.Ink.secondary.color : lane.state.color.color)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help([lane.kind.title.capitalized + ": " + lane.word, lane.detail, lane.remedy].compactMap { $0 }.joined(separator: "\n"))
                 }
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))
@@ -76,30 +70,6 @@ struct StatusBar: View {
         .background(Tok.Ground.raised.color)
         .overlay(alignment: .top) { Rule() }
         .dimsWhenInactive()
-    }
-
-    private var busColor: DynamicColor {
-        switch session.bus {
-        case .connected: Tok.Status.success
-        case .connecting: Tok.Intercept.base
-        case .disconnected: Tok.Ink.tertiary
-        case .failed: Tok.Status.serverError
-        }
-    }
-
-    /// A key badge for operator, a plain person for agent, a warning triangle on mismatch.
-    private func roleSymbol(_ role: String) -> String {
-        if session.roleWarning { return "exclamationmark.triangle.fill" }
-        return role == "operator" ? "person.badge.key.fill" : "person.fill"
-    }
-
-    private var busText: String {
-        switch session.bus {
-        case .connected(let addr): "bus \(addr)"
-        case .connecting(let addr): "connecting \(addr)"
-        case .disconnected: "bus offline"
-        case .failed(let why): "bus: \(why)"
-        }
     }
 }
 

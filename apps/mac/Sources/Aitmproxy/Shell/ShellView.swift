@@ -134,6 +134,7 @@ struct MainView: View {
     /// The page's own panel, or the flow list with the inspector.
     @ViewBuilder private var content: some View {
         switch session.page ?? .apps {
+        case .status: StatusPanel()
         case .overview: OverviewPanel()
         case .scan: ScanPanel(state: session.scan)
         case .findings: FindingsPanel(state: session.poc)
