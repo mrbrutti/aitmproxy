@@ -428,18 +428,28 @@ PASS (3 Minor). Spec = PASS on the diff (1 Important verification gate: the `[ma
 Dispositions by the owning session (autonomous mode). **Fixed in the panel fix wave** (one
 Coder fix task over the findings report `scope-persistence-FIX-FINDINGS.md` in the shared notes
 folder; commit recorded in Shipped). The spec's "Panel amendments" subsection records the
-ratified behaviour changes.
+ratified behaviour changes. **Re-review of the fix range `be251fb..60273db`:** security PASS
+(2 new Minor), quality PASS (3 new Minor), spec FAIL (1 Important: unrequested public API; 2 doc
+Minor) → fix wave 2 (rows 9–16).
 
 | # | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|---|
 | 1 | 2 | Tester | Important (SP-AC16 contract) | `yamlDoubleQuoted` guards with Character-based `contains("\n")`; a CRLF grapheme passes, so a CRLF host does not throw | FIX — scalar-based guard; red test `scope_block_rejects_a_crlf_host` goes green — fix wave |
 | 2 | 1 | Security | Important | `isPersistable` lets U+FFFE/U+FFFF through (Cn, not Cc/Cf); libyaml refuses them → config parse fails → 5 restarts → `failPermanently`, unrecoverable from the UI | FIX — libyaml-printable allow-list in `isPersistable` + Kit tests — fix wave |
 | 3 | 1 | Security | Minor | `scope.json` read with no type/size/count/length cap (FIFO or multi-GB file; quadratic guard seeding) | FIX — regular-file + 1 MiB check in `load`; 10 000-entry / 1 024-char caps in `sanitized` — fix wave |
-| 4 | 4 | Security | Minor | Swallowed save failure after a remove resurrects the host next launch | FIX — surface via `session.lastError` ("Scope change not saved: …") — fix wave; supersedes OQ1's default |
-| 5 | 4 | Quality | Minor | `preferEmbedded` read after two suspension points; a Bus switch mid-action could persist the other core's list | FIX — snapshot before the verb, require both — fix wave |
+| 4 | 4 | Security | Minor | Swallowed save failure after a remove resurrects the host next launch | FIX — `persistEmbeddedScope() throws BusError.tool("Scope change not saved: …")`, landing in `lastError` as `"<action>: Scope change not saved: …"` via `Session.perform` — `55d0e9c`; supersedes OQ1's default; `[review]` (no app-target unit tests; chain verified by the spec and security re-reviews) |
+| 5 | 4 | Quality | Minor | `preferEmbedded` read after two suspension points; a Bus switch mid-action could persist the other core's list | FIX — snapshot before the verb, require both — `68989ee`; `[review]` |
 | 6 | 2 | Quality | Minor | The `\r` assertion accepts any error | FIX — assert `hostContainsNewline("evil.test\rx")` — fix wave |
 | 7 | 4 | Quality | Minor | Seventh copy of `UserDefaultsActiveKindPersistence().load() ?? .embedded` | ACCEPTED — follow-up: add `loadOrDefault()` in Kit and point all seven sites at it (consolidation touches `SettingsView.swift`, owned by a concurrent session) |
 | 8 | 4 | Spec | Important (gate) | `[manual]` SP-AC1/3/11/12/13 halves not evidenced in the logs at review time | RUN — `scope-persist-live-proof.sh` (shared notes): keystroke add → `scope.json`; Cmd-Q + relaunch → block + `scope.list` + screenshot with no banner (SP-AC1 display after connect, SP-AC11); Proxy ▸ Restart Core (same `restartCoreTick` path as Settings' Apply and Restart Core) keeps scope (SP-AC13); row ✕ remove → `scope.list []`, file kept as `{"hosts": []}` (SP-AC3). PASS, `/tmp/scope-persist-live-proof-full.log`. SP-AC12 ACCEPTED by reasoning: feeder sends `Scope(current_scope_spec())` right after Hello from `l7_guard.list_scope()`, which the config seeded and `scope.list` proved; the installed extension build belongs to the concurrent NE session's live run, so no second capture-enabled core was started — follow-up: observe the first Scope frame on the next NE live session. The pre-connect instant of SP-AC1 was not captured on screen; the seed is pinned by `seedsAtLaunch…` and the post-connect display by the screenshot |
+| 9 | 1 | Spec (re-review) | Important | `maxFileBytes`/`maxHosts`/`maxHostLength` added as `public static let` — unrequested public API | FIX — internal `static let` — fix wave 2 |
+| 10 | 4 | Security (re-review) | Minor | A failed `scope.list` after a successful verb returns normally (`lastError` cleared) while `scope.json` stays stale | FIX — the Scope action throws `"Scope change applied but not saved: scope.list failed"` when embedded — fix wave 2 |
+| 11 | 1 | Security (re-review) | Minor | `save` applies none of `load`'s caps; a list whose JSON exceeds 1 MiB loads empty at the next launch with no signal | FIX — `save` writes `sanitized(hosts)` and throws `SaveError.tooLarge` over 1 MiB (surfaces via row 4's path) — fix wave 2 |
+| 12 | 4 | Quality (re-review) | Minor | `addScope`/`removeScope` duplicate a three-line sequence; the why is commented once | FIX — one private `scopeVerb(_:host:)` helper — fix wave 2 |
+| 13 | 2 | Quality (re-review) | Minor | `\r` assertion duplicated verbatim in two tests after the Q2 tightening | FIX — deleted from `scope_block_rejects_a_newline_anywhere_in_the_list` — fix wave 2 |
+| 14 | 1,2,3,4 | Quality (re-review) | Minor | Provenance tags ("Tester —", "Fix wave —") in test MARKs and doc comments | ACCEPTED — cosmetic; git blame records authorship |
+| 15 | 1 | Security (re-review) | residual | TOCTOU between `attributesOfItem` and `Data(contentsOf:)` in `load` | ACCEPTED — same-user only; future fd-based read mirroring `writeConfig` |
+| 16 | — | Spec (re-review) | Minor | D4 bullet and row 4 understated the surfaced `lastError` text; rows 4–5 lacked a `[review]` basis | FIXED here (docs) |
 
 ## Shipped
 

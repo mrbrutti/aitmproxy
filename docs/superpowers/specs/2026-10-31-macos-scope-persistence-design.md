@@ -396,11 +396,22 @@ corresponding sentence above.
   return as Unicode scalars, not Characters: Swift treats `"\r\n"` as one
   grapheme, so the Character-based `contains` let a CRLF host through (tester
   F1; SP-AC16 now also covers CRLF).
-- **D4, failed save.** A failed `scope.json` save is surfaced as
-  `session.lastError` ("Scope change not saved: …") instead of being swallowed:
-  a silently failed save after a remove would resurrect the host at the next
-  launch (security Minor; supersedes OQ1's default). The in-memory scope is
-  unchanged.
+- **D4, failed save.** A failed `scope.json` save is an error of the Scope
+  action: `persistEmbeddedScope()` throws `BusError.tool("Scope change not
+  saved: …")` and `Session.perform` lands it in `session.lastError` as
+  `"<action>: Scope change not saved: …"` (`add to scope: …` / `remove from
+  scope: …`) instead of being swallowed: a silently failed save after a remove
+  would resurrect the host at the next launch (security Minor; supersedes OQ1's
+  default). Likewise, when the embedded core accepted the verb but the follow-up
+  `scope.list` failed, the action throws `"Scope change applied but not saved:
+  scope.list failed"` rather than reporting success over a stale file
+  (re-review Minor). The in-memory scope is unchanged either way.
+- **D1, `save`.** `save` writes `sanitized(hosts)` (the file only ever holds
+  what `load` keeps) and throws `EmbeddedScope.SaveError.tooLarge(bytes:)` when
+  the encoded JSON would exceed the 1 MiB `load` cap, so a list the next launch
+  would refuse is reported now through the D4 path instead of vanishing
+  silently (re-review Minor). The three caps are internal constants, not public
+  API.
 - **D4, embedded intent.** `addScope`/`removeScope` snapshot `preferEmbedded`
   before the verb and persist only if it was and still is true after the
   refresh, so a Settings ▸ Bus switch mid-action cannot persist the other
