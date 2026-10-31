@@ -24,6 +24,8 @@ struct AitmproxyApp: App {
                 .overlay { if GridOverlay.enabled { GridOverlay() } }
                 .frame(minWidth: 1100, minHeight: 640)
                 .toolbar(removing: .title)
+                // Open calm: no sidebar-filter focus ring stealing attention on launch.
+                .noInitialFocus()
         }
         .defaultSize(width: 1440, height: 900)
         .windowToolbarStyle(.unified)
@@ -37,6 +39,7 @@ struct AitmproxyApp: App {
                 .environment(session)
                 .themed()
                 .frame(minWidth: 720, minHeight: 360)
+                .noInitialFocus()
         }
         .defaultSize(width: 1100, height: 620)
         .windowToolbarStyle(.unifiedCompact)

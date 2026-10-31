@@ -39,7 +39,7 @@ struct ScriptsPanel: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        .gridArea("scripts")
+        .gridArea("scripts", inset: 0)
         .task { await load() }
         .onChange(of: session.tools) { Task { await load() } }
     }
@@ -54,6 +54,7 @@ struct ScriptsPanel: View {
         }
         .padding(.horizontal, Space.margin)
         .frame(height: Tok.Size.filterBar)
+        .gridProbe("scripts.title", area: "scripts")
     }
 
     private var empty: some View {

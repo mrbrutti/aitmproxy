@@ -22,6 +22,7 @@ struct ConnectionWaterfall: View {
             }
             .padding(.horizontal, Space.md)
             .frame(height: Tok.Size.filterBar)
+            .gridProbe("waterfall.title", area: "connection-waterfall")
 
             if model.segments.isEmpty {
                 ContentUnavailableView {

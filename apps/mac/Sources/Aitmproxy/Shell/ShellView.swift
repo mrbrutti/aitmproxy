@@ -65,10 +65,10 @@ struct ShellView: View {
             ComposeSheet().environment(session).themed()
         }
         .sheet(isPresented: Binding(get: { session.rulesVisible }, set: { session.rulesVisible = $0 })) {
-            RulesSheet().environment(session).themed()
+            RulesSheet().environment(session).themed().noInitialFocus()
         }
         .sheet(isPresented: Binding(get: { session.scopeSheetVisible }, set: { session.scopeSheetVisible = $0 })) {
-            ScopeSheet().environment(session).themed()
+            ScopeSheet().environment(session).themed().noInitialFocus()
         }
         .toolbar { ShellToolbar(sidebarVisible: $session.sidebarVisible) }
         .onChange(of: session.detachRequestTick) { openWindow(id: "inspector") }
@@ -127,7 +127,7 @@ struct MainView: View {
             }
         }
         .sheet(item: Binding(get: { session.buildPoCFlowID.map(BuildPoCTarget.init) }, set: { session.buildPoCFlowID = $0?.id })) { target in
-            BuildPoCSheet(flowID: target.id).environment(session).themed()
+            BuildPoCSheet(flowID: target.id).environment(session).themed().noInitialFocus()
         }
     }
 
