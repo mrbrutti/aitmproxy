@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use aitm_core::{
     Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, Plugin,
-    ProxyClient, Registry, StdGuard, Value, WsFlow,
+    ProxyClient, Registry, StdGuard, TypeDesc, Value, WsFlow,
 };
 use aitm_plugins::CapturePlugin;
 use futures::future::BoxFuture;
@@ -135,6 +135,7 @@ fn flow_get_reports_body_sizes() {
         f.response.as_mut().expect("response").body = Body::Streamed(aitm_core::StreamBody);
     }
     let streaming_id = store.insert(streaming);
+    let ws_id = store.insert(ws_flow(sized_id));
 
     let guard = StdGuard::default();
     let client = StubClient;
@@ -166,6 +167,51 @@ fn flow_get_reports_body_sizes() {
         Some(&Value::Null),
         "a streaming body has no known size yet"
     );
+
+    // A WebSocket flow has no request/response bodies: it reports neither field.
+    let ws = get(ws_id);
+    assert_eq!(ws.get("kind"), Some(&Value::Str("websocket".into())));
+    assert!(!ws.contains_key("request_bytes"), "got {ws:?}");
+    assert!(!ws.contains_key("response_bytes"), "got {ws:?}");
+}
+
+/// The declared `flow.get` schema lists both size fields as optional integers, so
+/// a frontend reading the schema learns about them and a WebSocket summary (which
+/// omits them) is still conformant.
+#[test]
+fn flow_get_schema_declares_body_sizes() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let schema = reg
+        .command("flow.get")
+        .expect("flow.get registered")
+        .schema();
+    let TypeDesc::Object(fields) = schema.result else {
+        panic!(
+            "flow.get result must be an object schema, got {:?}",
+            schema.result
+        );
+    };
+    for name in ["request_bytes", "response_bytes"] {
+        let field = fields
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from the flow.get schema"));
+        assert!(
+            matches!(field.ty, TypeDesc::Int),
+            "{name} is an integer, got {:?}",
+            field.ty
+        );
+        assert!(
+            !field.required,
+            "{name} is optional (absent for WebSocket flows)"
+        );
+        assert!(
+            field.description.contains("bytes"),
+            "{name} says what it counts: {}",
+            field.description
+        );
+    }
 }
 
 #[test]

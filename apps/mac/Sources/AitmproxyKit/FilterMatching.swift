@@ -401,7 +401,8 @@ struct MatchContext {
             return Double(seconds) * 1_000 + Double(attoseconds) / 1e15
         case .size:
             guard row.requestBytes != nil || row.responseBytes != nil else { return nil }
-            return Double((row.requestBytes ?? 0) + (row.responseBytes ?? 0))
+            // Summed as doubles: sizes come from the bus and must never trap the app.
+            return Double(row.requestBytes ?? 0) + Double(row.responseBytes ?? 0)
         default:
             return nil
         }

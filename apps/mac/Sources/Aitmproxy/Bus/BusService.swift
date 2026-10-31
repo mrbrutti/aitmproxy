@@ -72,9 +72,6 @@ final class BusService: FlowActions {
         client = nil
         session.bus = .disconnected
         session.applyResolvedRole(nil)
-        // No connection, no traffic: a stale rate must not keep showing.
-        session.upBytesPerSecond = 0
-        session.downBytesPerSecond = 0
     }
 
     private func run() async {
@@ -129,13 +126,26 @@ final class BusService: FlowActions {
     /// rebuilds the rows oldest-first. Finished flows are not re-fetched.
     private func pollLoop(_ client: BusClient) async throws {
         throughput.reset()
+        // However this connection ends — stop(), or a core that went away — no
+        // connection means no traffic: a stale rate must not sit under a failed badge.
+        defer {
+            session.upBytesPerSecond = 0
+            session.downBytesPerSecond = 0
+        }
         while !Task.isCancelled {
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
             for id in ids {
                 let cached = summaries[id]
-                let inFlight = cached.map { $0.intercept == .intercepted || ($0.status == nil && $0.kind == .http) } ?? true
+                // Still worth re-fetching: parked, no response yet, or (a core that
+                // reports sizes) a body still streaming after the response head.
+                let inFlight = cached.map {
+                    $0.intercept == .intercepted || ($0.status == nil && $0.kind == .http) || $0.awaitsBodySize
+                } ?? true
                 guard cached == nil || inFlight else { continue }
                 if let json = try? await client.call("flow.get", ["id": .string(id.raw)]), let summary = FlowSummary(json: json) {
+                    // ↑ is what clients sent (request bodies), ↓ what came back (response
+                    // bodies): each flow's growth since its last summary joins the totals.
+                    throughput.record(previous: cached, current: summary)
                     summaries[id] = summary
                 }
             }
@@ -149,13 +159,7 @@ final class BusService: FlowActions {
                     return row
                 }
             if rows != session.rows { session.rows = rows }
-            // ↑ is what clients sent (request bodies), ↓ what came back (response bodies),
-            // as the core reports them; the meter turns the running totals into a rate.
-            // Saturating sums: the sizes are peer-supplied and must never trap the app.
-            let rate = throughput.sample(
-                up: ThroughputMeter.total(summaries.values.lazy.map(\.requestBytes)),
-                down: ThroughputMeter.total(summaries.values.lazy.map(\.responseBytes)),
-                at: Date())
+            let rate = throughput.sample(at: .now)
             if session.upBytesPerSecond != rate.up { session.upBytesPerSecond = rate.up }
             if session.downBytesPerSecond != rate.down { session.downBytesPerSecond = rate.down }
             try await Task.sleep(for: pollInterval)

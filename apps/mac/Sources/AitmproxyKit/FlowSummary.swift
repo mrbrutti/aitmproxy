@@ -23,11 +23,28 @@ public struct FlowSummary: Hashable, Sendable {
     /// The status bar's ↑ / ↓ rate is the change in their totals over time.
     public var requestBytes: Int64?
     public var responseBytes: Int64?
+    /// Whether the core's `flow.get` carried the body-size fields at all (present,
+    /// even as `null`): an older core omits them, and then a nil size is unknown for
+    /// good rather than still streaming.
+    public var reportsBodySizes: Bool
+
+    /// No body a real core buffers approaches this (the default cap is 10 MiB); a size
+    /// past it is a lie from the peer, read as unknown so it is neither shown nor summed.
+    public static let maxBodyBytes: Int64 = 1 << 40
+
+    /// An HTTP flow whose response head is here while a body is still streaming: the
+    /// core reports sizes and one of them is still unknown. The poll keeps re-fetching
+    /// such a flow so the final sizes land once the core buffers them. Never true for
+    /// an older core that reports no sizes — there is nothing to wait for.
+    public var awaitsBodySize: Bool {
+        kind == .http && reportsBodySizes && status != nil && (requestBytes == nil || responseBytes == nil)
+    }
 
     public init(
         id: FlowID, kind: FlowKind, intercept: InterceptLabel, isReplay: Bool, method: String? = nil,
         scheme: String? = nil, authority: String? = nil, path: String? = nil, status: Int? = nil,
-        handshake: FlowID? = nil, messages: Int? = nil, requestBytes: Int64? = nil, responseBytes: Int64? = nil
+        handshake: FlowID? = nil, messages: Int? = nil, requestBytes: Int64? = nil, responseBytes: Int64? = nil,
+        reportsBodySizes: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -42,6 +59,7 @@ public struct FlowSummary: Hashable, Sendable {
         self.messages = messages
         self.requestBytes = requestBytes
         self.responseBytes = responseBytes
+        self.reportsBodySizes = reportsBodySizes || requestBytes != nil || responseBytes != nil
     }
 
     /// Decodes the `structuredContent` of a `flow.get` result. Unknown
@@ -60,14 +78,16 @@ public struct FlowSummary: Hashable, Sendable {
         self.status = json["status"]?.intValue
         self.handshake = json["handshake"]?.stringValue.map(FlowID.init)
         self.messages = json["messages"]?.intValue
-        // A size is a count: a negative value from the wire is not one and reads as
-        // unknown (nil), so it is neither shown nor counted.
+        // A size is a count: a negative or absurd value from the wire is not one and
+        // reads as unknown (nil), so it is neither shown nor counted. The keys being
+        // present at all (even as null) says this core reports sizes.
         self.requestBytes = Self.size(json["request_bytes"])
         self.responseBytes = Self.size(json["response_bytes"])
+        self.reportsBodySizes = json["request_bytes"] != nil || json["response_bytes"] != nil
     }
 
     private static func size(_ value: JSONValue?) -> Int64? {
-        guard let size = value?.intValue, size >= 0 else { return nil }
+        guard let size = value?.intValue, size >= 0, Int64(size) <= Self.maxBodyBytes else { return nil }
         return Int64(size)
     }
 

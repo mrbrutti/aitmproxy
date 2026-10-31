@@ -62,8 +62,9 @@ public struct OverviewStats: Hashable, Sendable {
         errors = rows.filter { row in
             row.state == .failed || row.state == .killed || row.status.flatMap(StatusClass.init) == .serverError
         }.count
-        requestBytes = rows.reduce(0) { $0 + ($1.requestBytes ?? 0) }
-        responseBytes = rows.reduce(0) { $0 + ($1.responseBytes ?? 0) }
+        // Sizes come from the bus: saturating sums, so a hostile size cannot trap the app.
+        requestBytes = rows.reduce(0) { ThroughputMeter.saturatingSum($0, max($1.requestBytes ?? 0, 0)) }
+        responseBytes = rows.reduce(0) { ThroughputMeter.saturatingSum($0, max($1.responseBytes ?? 0, 0)) }
 
         var byClass: [StatusClass?: Int] = [:]
         for row in rows { byClass[row.status.flatMap(StatusClass.init), default: 0] += 1 }

@@ -73,6 +73,13 @@ import Testing
         let rejected = try #require(FlowSummary(json: negative)).row(seq: 1)
         #expect(rejected.requestBytes == nil)
         #expect(rejected.responseBytes == nil)
+        // Nor is a size no real body can reach: it is a lie from the peer, read as unknown.
+        let absurd: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                 "method": "GET", "scheme": "http", "authority": "h", "path": "/", "status": 200,
+                                 "request_bytes": 9_000_000_000_000_000_000, "response_bytes": 1_099_511_627_776]
+        let capped = try #require(FlowSummary(json: absurd)).row(seq: 1)
+        #expect(capped.requestBytes == nil)
+        #expect(capped.responseBytes == FlowSummary.maxBodyBytes)
     }
 
     @Test func decodesWebSocketSummary() throws {
@@ -80,11 +87,46 @@ import Testing
             "id": "3f1c0d2e-0000-4000-8000-000000000002", "kind": "websocket", "intercept": "observed",
             "is_replay": false, "handshake": "3f1c0d2e-0000-4000-8000-000000000001", "messages": 21,
         ]
-        let row = try #require(FlowSummary(json: json)).row(seq: 47)
+        let summary = try #require(FlowSummary(json: json))
+        let row = summary.row(seq: 47)
         #expect(row.kind == .websocket)
         #expect(row.method == .ws)
         #expect(row.status == 101)
         #expect(row.wsFrames?.sent == 21)
+        // A WebSocket flow carries no body sizes and never waits for one.
+        #expect(row.requestBytes == nil)
+        #expect(row.responseBytes == nil)
+        #expect(!summary.reportsBodySizes)
+        #expect(!summary.awaitsBodySize)
+    }
+
+    @Test func streamingResponseStillAwaitsItsSize() throws {
+        // The core sets the status before it buffers the body, sending the size as
+        // null meanwhile: such a flow is still in flight and must be fetched again.
+        let streaming: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                    "method": "GET", "scheme": "https", "authority": "h", "path": "/big", "status": 200,
+                                    "request_bytes": 0, "response_bytes": .null]
+        let awaiting = try #require(FlowSummary(json: streaming))
+        #expect(awaiting.reportsBodySizes)
+        #expect(awaiting.responseBytes == nil)
+        #expect(awaiting.awaitsBodySize)
+        // Once the body is buffered the size lands and the flow is finished.
+        let buffered: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                   "method": "GET", "scheme": "https", "authority": "h", "path": "/big", "status": 200,
+                                   "request_bytes": 0, "response_bytes": 52_428_800]
+        #expect(!(try #require(FlowSummary(json: buffered))).awaitsBodySize)
+        // An older core sends no size keys at all: nil means unknown for good, not
+        // streaming, so the poll must not re-fetch every finished flow forever.
+        let older: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                "method": "GET", "scheme": "https", "authority": "h", "path": "/big", "status": 200]
+        let legacy = try #require(FlowSummary(json: older))
+        #expect(!legacy.reportsBodySizes)
+        #expect(!legacy.awaitsBodySize)
+        // No response head yet: in flight already by its missing status, not by size.
+        let pending: JSONValue = ["id": "a", "kind": "http", "intercept": "observed", "is_replay": false,
+                                  "method": "GET", "scheme": "https", "authority": "h", "path": "/big", "status": .null,
+                                  "request_bytes": 10, "response_bytes": .null]
+        #expect(!(try #require(FlowSummary(json: pending))).awaitsBodySize)
     }
 
     @Test func replayIsOperatorOrigin() throws {
