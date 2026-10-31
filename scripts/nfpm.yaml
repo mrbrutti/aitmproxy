@@ -59,9 +59,14 @@ contents:
     dst: "/usr/lib/aitmproxy/aitm-tui"
     file_info:
       mode: 0o755
-  # The default detection catalogue, discovered beside the binary.
+  # The default detection catalogue, discovered beside the binary. `type: tree`
+  # copies the directory recursively and gives the intermediate directories the
+  # 0755 traverse bit (files keep their staged 0644), so `read_dir` discovery
+  # can descend the installed tree — a plain file_info.mode would risk clamping
+  # the directories to 0644 and making discovery find nothing (OQ1).
   - src: "${STAGEDIR}/usr/lib/aitmproxy/share/aitm/scripts"
     dst: "/usr/lib/aitmproxy/share/aitm/scripts"
+    type: tree
     file_info:
       mode: 0o644
   - src: "/usr/lib/aitmproxy/aitm"

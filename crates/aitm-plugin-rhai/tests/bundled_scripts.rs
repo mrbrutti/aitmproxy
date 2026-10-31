@@ -182,6 +182,17 @@ async fn every_bundled_script_compiles() {
         "expected the bundled catalogue to ship at least 20 scripts, found {}",
         files.len()
     );
+    // Per-directory floors, so deleting most of one protocol's detectors cannot
+    // pass on the strength of the others.
+    for (sub, floor) in [("http", 20), ("ws", 3), ("active", 10), ("l4", 2)] {
+        let mut d = Vec::new();
+        rhai_files(&bundled_dir().join(sub), &mut d);
+        assert!(
+            d.len() >= floor,
+            "expected scripts/bundled/{sub} to ship at least {floor} scripts, found {}",
+            d.len()
+        );
+    }
 
     let mut failures = Vec::new();
     for path in &files {
@@ -260,10 +271,17 @@ async fn passive_scripts_run_without_error_and_record_findings() {
         "passive scripts raised runtime errors:\n{}",
         errors.join("\n")
     );
+    // Measure distinct detectors that fired, not aggregate volume: a few
+    // over-firing scripts must not mask many that stopped detecting. With ~31
+    // passive detectors over the http+https+ws vulnerable flows, a healthy run
+    // trips well over this floor.
+    let distinct: std::collections::BTreeSet<String> =
+        findings.list().into_iter().map(|f| f.name).collect();
     assert!(
-        findings.list().len() >= 10,
-        "expected the vulnerable flows to trip many detectors, got {}",
-        findings.list().len()
+        distinct.len() >= 15,
+        "expected at least 15 distinct passive detectors to fire, got {}: {:?}",
+        distinct.len(),
+        distinct
     );
 }
 

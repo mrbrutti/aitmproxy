@@ -16,9 +16,9 @@ fn url_with(url, raw) {
 }
 
 fn load(reg) {
-    reg.add_command("check.nosqli", "Confirm NoSQL operator injection in { url, param }", |args| {
+    reg.add_command("check.nosqli", "Confirm NoSQL operator injection in { url, param, value? }", |args| {
         if type_of(args.url) != "string" || type_of(args.param) != "string" {
-            return "usage: check.nosqli { url, param }";
+            return "usage: check.nosqli { url, param, value? }";
         }
         let base = if type_of(args.value) == "string" { args.value } else { "1" };
         let p = url_encode(args.param);

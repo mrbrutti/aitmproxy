@@ -216,9 +216,18 @@ would be ordered after them; as authored it depends only on those files existing
 
 Kept by the main session during stage 6. One row per finding.
 
+Panel ran 2026-10-30 on `main...df2d141` — security, quality, spec all **PASS**, no Critical or Important findings. Minor dispositions:
+
 | Finding | Severity | Disposition |
 |---|---|---|
-| | | |
+| Security/Spec — nfpm maps the `share/aitm/scripts` tree with `file_info.mode: 0o644`; installed dirs may lose the traverse bit and discovery load nothing (OQ1) | Minor | Fixed — `scripts/nfpm.yaml` now uses `type: tree` so directories get 0755 (files stay 0644). Still verify on a built `.deb`/`.rpm` (sandbox cannot build packages); OQ1 stays open until then. |
+| Security — `collect_rhai` skips symlinked `.rhai` entries (`file_type` does not follow links) | Minor | Accepted — no symlink-following is a mild defensive positive; bundled dirs are trusted plain files. Behaviour noted. |
+| Quality — the canonicalize + declared-wins dedup loop is duplicated in `bundled.rs` and `config_file.rs` | Minor | Fixed — extracted `bundled::append_undeclared`; `config_file::append_scripts_dir_entries` now calls it. Covered by the existing `config_rhai` integration tests. |
+| Quality — `fn q(url,param,value)` names two different behaviours (encoding vs raw) across active scripts | Minor | Fixed — the two raw-value scripts (`check-path-traversal`, `check-crlf-injection`) renamed their helper to `q_raw`. |
+| Quality — `hget`/`abs`/`q` helpers duplicated across active scripts | Minor | Accepted — per-file duplication is acceptable for isolated one-check-per-file catalogue scripts; moving `hget` to `prelude.rhai` is deferred to avoid touching the shared prelude and its api-catalog bijection guard. |
+| Quality — `secret-in-response` carries a `where`/header path its `on_response` never used | Minor | Fixed — `on_response` now also scans response header values, matching the script's stated coverage. |
+| Quality — the runtime test's finding floor (`>= 10` aggregate) could mask half-broken detectors | Minor | Fixed — added per-directory script-count floors and switched the detection assertion to `>= 15` **distinct** finding names. |
+| Quality — `check.nosqli` reads an optional `value` its usage string omits | Minor | Fixed — description and usage now read `{ url, param, value? }`. |
 
 ## Shipped
 

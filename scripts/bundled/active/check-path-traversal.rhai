@@ -9,7 +9,7 @@
 const NAME = "check-path-traversal";
 const API  = "1";
 
-fn q(url, param, value) {
+fn q_raw(url, param, value) {
     let sep = if url.contains("?") { "&" } else { "?" };
     `${url}${sep}${url_encode(param)}=${value}`
 }
@@ -30,7 +30,7 @@ fn load(reg) {
             "../../../../../../windows/win.ini",
         ];
         for pl in payloads {
-            let r = http.send(#{ method: "GET", url: q(args.url, args.param, pl) });
+            let r = http.send(#{ method: "GET", url: q_raw(args.url, args.param, pl) });
             if r.status == () { continue; }
             if regex_match(nix, r.body) || regex_match(win, r.body) {
                 finding(#{

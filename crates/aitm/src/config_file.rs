@@ -130,8 +130,6 @@ fn append_scripts_dir_entries(rhai: &mut RhaiConfig) {
     let Ok(read) = std::fs::read_dir(&dir) else {
         return;
     };
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let mut declared: Vec<PathBuf> = rhai.scripts.iter().map(|e| canon(&e.path)).collect();
     let mut found: Vec<PathBuf> = read
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
@@ -139,14 +137,9 @@ fn append_scripts_dir_entries(rhai: &mut RhaiConfig) {
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rhai"))
         .collect();
     found.sort();
-    for path in found {
-        let resolved = canon(&path);
-        if declared.contains(&resolved) {
-            continue;
-        }
-        declared.push(resolved);
-        rhai.scripts.push(ScriptEntry::new(path));
-    }
+    // One implementation of the canonicalize + declared-wins dedup, shared with
+    // the bundled catalogue's recursive scan so the two cannot drift.
+    crate::bundled::append_undeclared(rhai, found);
 }
 
 /// Overwrite `slot` only when the file set the key.

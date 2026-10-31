@@ -7,7 +7,7 @@
 const NAME = "check-crlf-injection";
 const API  = "1";
 
-fn q(url, param, value) {
+fn q_raw(url, param, value) {
     let sep = if url.contains("?") { "&" } else { "?" };
     `${url}${sep}${url_encode(param)}=${value}`
 }
@@ -29,7 +29,7 @@ fn load(reg) {
             `x%E5%98%8D%E5%98%8AX-Aitm-Crlf:${canary}`, // unicode CRLF overlong
         ];
         for pl in encodings {
-            let r = http.send(#{ method: "GET", url: q(args.url, args.param, pl) });
+            let r = http.send(#{ method: "GET", url: q_raw(args.url, args.param, pl) });
             if r.status == () { continue; }
             if contains_ci(hget(r.headers, "X-Aitm-Crlf"), canary) {
                 finding(#{

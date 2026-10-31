@@ -33,4 +33,10 @@ fn scan(flow, where, text) {
 
 fn on_response(flow) {
     if scan(flow, "body", flow.response.body) { return; }
+    // Also scan response header values (e.g. a token echoed into a custom
+    // header or Set-Cookie), matching this script's stated coverage.
+    let h = flow.response.headers;
+    for k in h.keys() {
+        if scan(flow, `header ${k}`, h.get(k)) { return; }
+    }
 }

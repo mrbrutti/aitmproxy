@@ -82,11 +82,21 @@ fn candidates(exe_dir: Option<&Path>) -> Vec<PathBuf> {
 /// canonicalized, so the operator's entry and its options win). A missing or
 /// unreadable directory appends nothing.
 pub fn append(cfg: &mut RhaiConfig, dir: &Path) {
-    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let mut declared: Vec<PathBuf> = cfg.scripts.iter().map(|e| canon(&e.path)).collect();
     let mut found = Vec::new();
     collect_rhai(dir, &mut found);
     found.sort();
+    append_undeclared(cfg, found);
+}
+
+/// Append each path in `found` (already name-sorted) to `cfg.scripts` as an
+/// enabled entry, skipping any a declared entry already names. Paths are
+/// compared canonicalized, so `./a.rhai` and an absolute spelling are one
+/// script and the declared entry's options/`enabled` win. Shared by the
+/// bundled catalogue here and `config_file`'s `scripts_dir` scan, so the
+/// dedup rule has one implementation.
+pub fn append_undeclared(cfg: &mut RhaiConfig, found: Vec<PathBuf>) {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let mut declared: Vec<PathBuf> = cfg.scripts.iter().map(|e| canon(&e.path)).collect();
     for path in found {
         let resolved = canon(&path);
         if declared.contains(&resolved) {
