@@ -139,6 +139,79 @@ pub struct Assembled {
     pub l4_guard: Option<Arc<L4Guard>>,
 }
 
+/// The core's own agent governance: the `AgentState` and `AuditRing` that the
+/// registered `AgentPlugin` writes (`agent.set`) and reads (`agent.status`,
+/// `agent.activity`), so a server built over them is gated by the policy the
+/// operator sets and records into the trail the operator reads.
+///
+/// The type is sealed. It has no constructor and no accessor, and
+/// `Assembled::governance` is its only public source. `tui::build_servers` and
+/// `tui::run` require one, so `aitm tui` cannot be wired without it, nor with a
+/// fresh state in its place. It carries no push sender.
+///
+/// A `Governance` cannot be built outside this crate:
+///
+/// ```compile_fail
+/// use std::sync::Arc;
+/// use aitm::tui::{build_servers, services, TuiLog};
+/// use aitm::wire::{assemble, Governance};
+/// use aitm_core::{AgentPolicy, AgentState, AuditRing, Config};
+///
+/// fn main() -> anyhow::Result<()> {
+///     let agent_state = Arc::new(AgentState::new(AgentPolicy::Auto));
+///     let audit_ring = Arc::new(AuditRing::default());
+///     let cfg = Config::default();
+///     let assembled = assemble(&cfg)?;
+///     let governance: Governance = Governance { agent_state, audit_ring };
+///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let _servers = build_servers(&cfg, services, governance);
+///     Ok(())
+/// }
+/// ```
+///
+/// With the same imports and the same two locals, the one that comes from
+/// `Assembled::governance` compiles:
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use aitm::tui::{build_servers, services, TuiLog};
+/// use aitm::wire::{assemble, Governance};
+/// use aitm_core::{AgentPolicy, AgentState, AuditRing, Config};
+///
+/// fn main() -> anyhow::Result<()> {
+///     let agent_state = Arc::new(AgentState::new(AgentPolicy::Auto));
+///     let audit_ring = Arc::new(AuditRing::default());
+///     let cfg = Config::default();
+///     let assembled = assemble(&cfg)?;
+///     drop((agent_state, audit_ring));
+///     let governance: Governance = assembled.governance();
+///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let _servers = build_servers(&cfg, services, governance);
+///     Ok(())
+/// }
+/// ```
+#[derive(Clone)]
+#[expect(
+    dead_code,
+    reason = "not read until build_servers applies it to the agent arm"
+)]
+pub struct Governance {
+    pub(crate) agent_state: Arc<AgentState>,
+    pub(crate) audit_ring: Arc<AuditRing>,
+}
+
+impl Assembled {
+    /// The core's governance for `tui::build_servers`: clones of this assembly's
+    /// `agent_state` and `audit_ring` `Arc`s. The only public source of a
+    /// [`Governance`].
+    pub fn governance(&self) -> Governance {
+        Governance {
+            agent_state: Arc::clone(&self.agent_state),
+            audit_ring: Arc::clone(&self.audit_ring),
+        }
+    }
+}
+
 /// The scripting tier, ready to take its place in the chain (M3 spec §8).
 #[derive(Default)]
 pub struct ScriptWiring {

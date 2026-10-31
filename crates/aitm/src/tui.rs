@@ -34,7 +34,7 @@ use aitm_mcp::{ConnCtx, McpServer};
 use aitm_tui::{RunOptions, TransportChoice};
 use tracing::{info, warn};
 
-use crate::wire::Http1Sender;
+use crate::wire::{Governance, Http1Sender};
 
 /// The usage line printed (exit status 2) when `tui` is given arguments.
 pub const USAGE: &str = "usage: aitm [--config <path>] tui (takes no further arguments)";
@@ -260,7 +260,11 @@ pub fn init_tracing() -> TuiLog {
 /// configured transport (`None` when that is stdio, which would share the
 /// terminal with the UI) and the TUI-facing one behind an in-process handler.
 /// Both are built by [`server`], exactly as the server path builds its one.
-pub fn build_servers(cfg: &Config, services: Services) -> (Option<McpServer>, InProcessHandler) {
+pub fn build_servers(
+    cfg: &Config,
+    services: Services,
+    _governance: Governance,
+) -> (Option<McpServer>, InProcessHandler) {
     let agent = match &cfg.mcp.transport {
         // The loopback transport is agent-facing, so it carries the M4 policy gate
         // seeded from `mcp.policy` (default `auto`) and the operator/agent token
@@ -309,11 +313,12 @@ pub async fn run(
     cfg: &Config,
     proxy: &Proxy,
     services: Services,
+    governance: Governance,
     main_listener: tokio::net::TcpListener,
     browser_listener: tokio::net::TcpListener,
 ) -> anyhow::Result<()> {
     let startup_note = services.log.startup_note();
-    let (agent, handler) = build_servers(cfg, services);
+    let (agent, handler) = build_servers(cfg, services, governance);
     let agent_serve = async move {
         match agent {
             Some(server) => server.serve().await,

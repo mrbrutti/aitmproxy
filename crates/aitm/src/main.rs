@@ -265,21 +265,7 @@ async fn run() -> anyhow::Result<()> {
         macos_capture,
         ..Features::default()
     };
-    let Assembled {
-        proxy,
-        ca,
-        listening,
-        agent_state,
-        push_tx,
-        audit_ring,
-        // The protocol-general capture ingress and the live L4 guard feed the macOS
-        // Network/System Extension capture session below (macOS builds with
-        // `macos_capture.enabled` only). On every other build, or with it disabled
-        // (the default), they are dropped unused: the pcap capture path is
-        // `l4.capture.*`'s own and nothing calls `accept`.
-        l4_ingress,
-        l4_guard,
-    } = assemble_with_scripts(
+    let assembled = assemble_with_scripts(
         &cfg,
         &features,
         ScriptWiring {
@@ -296,6 +282,22 @@ async fn run() -> anyhow::Result<()> {
             commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
         },
     )?;
+    let governance = assembled.governance();
+    let Assembled {
+        proxy,
+        ca,
+        listening,
+        agent_state,
+        push_tx,
+        audit_ring,
+        // The protocol-general capture ingress and the live L4 guard feed the macOS
+        // Network/System Extension capture session below (macOS builds with
+        // `macos_capture.enabled` only). On every other build, or with it disabled
+        // (the default), they are dropped unused: the pcap capture path is
+        // `l4.capture.*`'s own and nothing calls `accept`.
+        l4_ingress,
+        l4_guard,
+    } = assembled;
 
     if let Mode::Cli(argv) = &mode {
         // One-shot CLI dispatch (no browser needed): the same service
@@ -459,7 +461,7 @@ async fn run() -> anyhow::Result<()> {
     listening.store(true, std::sync::atomic::Ordering::Relaxed);
     let result = if mode == Mode::Tui {
         tokio::select! {
-            result = tui::run(&cfg, &proxy, services, proxy_listener, browser_listener) => result,
+            result = tui::run(&cfg, &proxy, services, governance, proxy_listener, browser_listener) => result,
             never = capture_run => match never {},
         }
     } else {

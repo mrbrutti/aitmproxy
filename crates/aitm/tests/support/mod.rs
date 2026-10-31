@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use aitm::tui::{self, Services, TuiLog};
-use aitm::wire::{assemble, Assembled};
+use aitm::wire::{assemble, Assembled, Governance};
 use aitm_core::{Config, Proxy};
 
 /// A fresh, unique directory under the system temp dir for one test's CA.
@@ -32,9 +32,12 @@ pub fn config(tag: &str) -> Config {
 
 /// `assemble`, then the service handles exactly as `main` builds them for the
 /// frontends (`tui::services`): the registry, store and guard from the proxy,
-/// the replay client over `Http1Sender`; no browser, no log file.
-pub fn assemble_services(cfg: &Config) -> (Proxy, Services) {
-    let Assembled { proxy, .. } = assemble(cfg).expect("assemble");
+/// the replay client over `Http1Sender`; no browser, no log file. It also
+/// returns the core's `Governance` for `build_servers`.
+pub fn assemble_services(cfg: &Config) -> (Proxy, Services, Governance) {
+    let assembled = assemble(cfg).expect("assemble");
+    let governance = assembled.governance();
+    let Assembled { proxy, .. } = assembled;
     let services = tui::services(&proxy, cfg, None, TuiLog::Off);
-    (proxy, services)
+    (proxy, services, governance)
 }
