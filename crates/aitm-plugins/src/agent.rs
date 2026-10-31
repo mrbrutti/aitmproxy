@@ -11,7 +11,8 @@
 //! source (the connection registry) lands in a later M4 task, so it reports `[]`
 //! for now. `actions_last_minute` is sourced from the F2 audit ring (Task 8).
 //! `agent.activity` (Read, any role) reads the same ring so a surface or a
-//! reconnecting agent can catch up on recent activity (spec D3a.4).
+//! reconnecting agent can catch up on recent activity (spec D3a.4); a caller that
+//! is not trusted control gets only the entries it may see (`AuditEntry::visible_to`).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -205,6 +206,12 @@ impl Command for AgentSet {
 /// recent command activity without replaying the whole `notifications/aitm/agent`
 /// stream (spec D3a.4). `since` is Unix-epoch milliseconds (entries strictly
 /// after it); `limit` keeps the most recent `limit` of those.
+///
+/// Callable by any role, but the result is the caller's view of the ring
+/// ([`AuditRing::recent_for`] with the caller's frontend): a caller that is not
+/// trusted control never receives an entry made by trusted control (operator,
+/// CLI), and `limit` counts only the entries it may see. The ring itself, and
+/// the durable log, are never filtered.
 struct AgentActivity(Arc<AuditRing>);
 
 impl Command for AgentActivity {
@@ -220,7 +227,8 @@ impl Command for AgentActivity {
         ParamSchema {
             description: "Recent command-invocation audit entries (who ran what, with what \
                           redacted arguments, and the outcome), oldest first. Read-only and \
-                          readable by any role."
+                          callable by any role, but a caller that is not trusted control does \
+                          not see entries made by trusted control (operator, CLI)."
                 .to_string(),
             params: vec![
                 param(
@@ -245,6 +253,13 @@ impl Command for AgentActivity {
                     false,
                     "The client label, when one was declared.",
                 ),
+                param(
+                    "connection_id",
+                    TypeDesc::Str,
+                    false,
+                    "The server-assigned id of the connection that made the call; null when not \
+                     attributable.",
+                ),
                 param("command", TypeDesc::Str, true, "The dotted command name."),
                 param(
                     "args",
@@ -262,7 +277,7 @@ impl Command for AgentActivity {
         }
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let since = match args.get("since") {
             Some(Value::Int(ms)) if *ms >= 0 => {
                 Some(UNIX_EPOCH + Duration::from_millis(*ms as u64))
@@ -275,7 +290,7 @@ impl Command for AgentActivity {
         };
         let entries = self
             .0
-            .recent(since, limit)
+            .recent_for(host.frontend(), since, limit)
             .iter()
             .map(|e| e.to_value())
             .collect();
@@ -340,6 +355,58 @@ impl Command for AgentApprove {
         bail!(
             "agent.approve is resolved by the MCP server against its parked-request table; it \
              cannot be invoked in this context."
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry carrying the real `AgentPlugin` over a fresh state.
+    fn registry() -> Registry {
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(AgentPlugin::new(Arc::new(AgentState::new(
+            AgentPolicy::Auto,
+        )))));
+        reg
+    }
+
+    /// AC16 (activity half): the `agent.activity` result object declares an optional
+    /// string `connection_id`, and its description says a caller that is not trusted
+    /// control does not see trusted-control entries.
+    #[test]
+    fn agent_activity_schema_declares_connection_id() {
+        let reg = registry();
+        let schema = reg
+            .command("agent.activity")
+            .expect("agent.activity is registered")
+            .schema();
+
+        let TypeDesc::Array(item) = &schema.result else {
+            panic!("agent.activity returns an array, got {:?}", schema.result);
+        };
+        let TypeDesc::Object(fields) = item.as_ref() else {
+            panic!("agent.activity items are objects, got {item:?}");
+        };
+        let field = fields
+            .iter()
+            .find(|f| f.name == "connection_id")
+            .unwrap_or_else(|| panic!("no connection_id field in {fields:?}"));
+        assert!(
+            matches!(field.ty, TypeDesc::Str),
+            "connection_id is a string, got {:?}",
+            field.ty
+        );
+        assert!(
+            !field.required,
+            "connection_id is optional (null when unattributable)"
+        );
+
+        assert!(
+            schema.description.contains("trusted control"),
+            "the description names the viewer filter: {}",
+            schema.description
         );
     }
 }

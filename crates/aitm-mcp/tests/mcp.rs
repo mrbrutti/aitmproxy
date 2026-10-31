@@ -4581,3 +4581,74 @@ fn an_agent_subscriber_never_receives_operator_audit_lines() {
         "the ring is never filtered, only the push"
     );
 }
+
+// ------------- role-filtered agent.activity (plan 2026-10-30-bus-audit-connection-id, T10)
+
+/// The `(command, origin)` of each entry in an `agent.activity` reply, oldest
+/// first; panics if the reply is not an array of entries.
+fn activity_rows(reply: &JsonValue) -> Vec<(String, String)> {
+    reply["result"]["structuredContent"]
+        .as_array()
+        .unwrap_or_else(|| panic!("agent.activity returns an array: {reply}"))
+        .iter()
+        .map(|e| {
+            (
+                e["command"].as_str().expect("command is a string").into(),
+                e["origin"].as_str().expect("origin is a string").into(),
+            )
+        })
+        .collect()
+}
+
+/// AC13: `agent.activity` is callable by any role but returns only what the
+/// caller may see. An agent never reads operator-origin entries, and its `limit`
+/// counts the entries it can see (the operator's newest entry is skipped, not
+/// returned and not an empty result); the operator reads everything.
+#[test]
+fn agent_activity_hides_trusted_control_entries_from_agents() {
+    let ring = Arc::new(AuditRing::default());
+    let srv = audit_server(ring.clone());
+    let op = minted(&srv, Frontend::Operator);
+    let agent = minted(&srv, Frontend::Mcp);
+
+    assert!(!is_refused(&call_on(&srv, &op, "demo.read", json!({}))));
+    assert!(!is_refused(&call_on(&srv, &op, "demo.read", json!({}))));
+    assert!(!is_refused(&call_on(&srv, &agent, "demo.read", json!({}))));
+
+    // The agent sees one entry: its own demo.read. The two operator entries are
+    // in the ring but not in its view.
+    let rows = activity_rows(&call_on(&srv, &agent, "agent.activity", json!({})));
+    assert_eq!(rows.len(), 1, "the agent sees only its own entry: {rows:?}");
+    assert_eq!(rows, [("demo.read".to_string(), "mcp".to_string())]);
+
+    // The operator sees all four: its two reads, the agent's read, and the
+    // agent's own agent.activity call (audited when it returned).
+    let rows = activity_rows(&call_on(&srv, &op, "agent.activity", json!({})));
+    let origins: Vec<&str> = rows.iter().map(|(_, o)| o.as_str()).collect();
+    assert_eq!(
+        origins,
+        ["operator", "operator", "mcp", "mcp"],
+        "the operator sees every entry: {rows:?}"
+    );
+
+    // The operator's agent.activity is now the newest ring entry. An agent
+    // asking for the last one gets the last it may see: its own earlier
+    // agent.activity call, not the operator's.
+    let rows = activity_rows(&call_on(
+        &srv,
+        &agent,
+        "agent.activity",
+        json!({"limit": 1}),
+    ));
+    assert_eq!(
+        rows,
+        [("agent.activity".to_string(), "mcp".to_string())],
+        "limit counts visible entries, never the operator's"
+    );
+
+    assert_eq!(
+        ring.recent(None, None).len(),
+        6,
+        "the ring itself is never filtered, only the read"
+    );
+}
