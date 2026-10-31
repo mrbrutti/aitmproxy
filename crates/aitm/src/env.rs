@@ -3,8 +3,15 @@
 //! Runs after the config file, so `AITM_CA_ALLOW_AGENT_INSTALL` still works
 //! as the bridge the `ca.*` refusal text names, and wins over the file. The
 //! lookup is injected so tests never touch the process environment.
+//!
+//! `AITM_AUDIT_LOG` also wins over the file (`mcp.audit_log`), but it fails safe
+//! where the `ALLOW_AGENT` family treats "anything else" as false: a value it
+//! cannot read leaves the file's setting exactly as it was, so a typo such as
+//! `AITM_AUDIT_LOG=ofd` cannot silently turn the audit trail off.
 
-use aitm_core::Config;
+use std::path::{Path, PathBuf};
+
+use aitm_core::{AuditLogSetting, Config};
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 use aitm_proto_l4::config::L4Config;
 
@@ -34,15 +41,47 @@ pub const SCRIPTS: &str = "AITM_SCRIPTS";
 /// Fail startup on a script that does not compile, instead of skipping it.
 pub const SCRIPTS_STRICT: &str = "AITM_SCRIPTS_STRICT";
 
+/// The durable audit log: `off|false|0|no` turns it off, `on|true|1|yes|default`
+/// selects the default file, an absolute path names the file (overrides
+/// `mcp.audit_log`).
+pub const AUDIT_LOG: &str = "AITM_AUDIT_LOG";
+
 /// Apply the environment to `cfg`. Each `AITM_*_ALLOW_AGENT_*`: `1`, `true`
 /// or `yes` (case-insensitive) → `true`; any other value → `false`; unset →
 /// `cfg` is left as it was.
+///
+/// `AITM_AUDIT_LOG` wins over the file's `mcp.audit_log` but does **not** follow
+/// that rule: its spellings are in [`AUDIT_LOG`], matched ASCII
+/// case-insensitively and not trimmed, and any other value (a typo, a relative
+/// path, the empty string) leaves `cfg.mcp.audit_log` exactly as it was and logs
+/// one warning, so the variable fails safe (stays on) rather than false.
 pub fn apply(cfg: &mut Config, lookup: impl Fn(&str) -> Option<String>) {
     if let Some(raw) = lookup(CA_ALLOW_AGENT_INSTALL) {
         cfg.ca.allow_agent_install = is_truthy(&raw);
     }
     if let Some(raw) = lookup(SCOPE_ALLOW_AGENT_WIDEN) {
         cfg.scope.allow_agent_widen = is_truthy(&raw);
+    }
+    if let Some(raw) = lookup(AUDIT_LOG) {
+        match audit_log_from_env(&raw) {
+            Some(setting) => cfg.mcp.audit_log = setting,
+            None => tracing::warn!(
+                target: "aitm::audit",
+                "{AUDIT_LOG}={raw:?} is not off, on, default or an absolute path; \
+                 the audit log setting is unchanged"
+            ),
+        }
+    }
+}
+
+/// The setting `AITM_AUDIT_LOG=<raw>` asks for, or `None` when `raw` means
+/// nothing (the caller then leaves the setting alone). `raw` is not trimmed.
+fn audit_log_from_env(raw: &str) -> Option<AuditLogSetting> {
+    match raw.to_ascii_lowercase().as_str() {
+        "off" | "false" | "0" | "no" => Some(AuditLogSetting::Off),
+        "on" | "true" | "1" | "yes" | "default" => Some(AuditLogSetting::Default),
+        _ if Path::new(raw).is_absolute() => Some(AuditLogSetting::Path(PathBuf::from(raw))),
+        _ => None,
     }
 }
 
