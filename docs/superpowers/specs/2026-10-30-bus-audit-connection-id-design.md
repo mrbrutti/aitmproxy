@@ -316,7 +316,7 @@ The predicate is unchanged. The filter is **read-side only**: `append_in`, `Lane
 |---|---|
 | 1-4, 6-10, 12-18, 21, 23 | Stand as written; names unchanged. AC12-AC15 run in-process over `audit_server`; their entries share one source and never evict. |
 | 5 | **Retired** with D2; the 17 `cap_client_label_*` tests go (R1). Replaced by AC26, AC27. |
-| 11 | Retargeted: same rig; `demo.client` returns `"a".repeat(64)` and the entry label has `len() == 64` (was 128). Now a wiring pin main already passes: shown red by mutating `client_label_from_initialize` to `Some(name.to_string())` (`left: 1048576, right: 64`). |
+| 11 | Retargeted: same rig; `demo.client` returns `"a".repeat(64)` and the entry label has `len() == 64` (was 128). Now a wiring pin main already passes: shown red only by mutating both points, because the server re-sanitises at consumption (`conn_audit_label`, `server.rs`) and mutating `client_label_from_initialize` alone leaves the test green: ingestion returns `Some(name.to_string())` AND `conn_audit_label` returns `conn.client_label.clone()` (`left: 1048576, right: 64`). |
 | 19 | `client_label == null` in steps 3-4 is `"web-bridge"`. |
 | 20 | Each `client_label is None` / null pin is `== "web-bridge"` (three sites); the re-`initialize` with `clientInfo.name == "aitm-web"` leaves the id and the label `"web-bridge"` unchanged. |
 | 22 | Label literals: `client_label == "x" * 64`, `len == 64`; the constant `MAX_LABEL_BYTES = 128` becomes `MAX_LABEL_CHARS = 64`. |

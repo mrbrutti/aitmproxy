@@ -259,9 +259,11 @@ fn is_label_noise(c: char) -> bool {
 /// The one sanitiser for a client label, whatever its source.
 ///
 /// It reads only the first `LABEL_SCAN_CHARS` characters of `raw`, so its work
-/// is bounded however large the input. It drops control, invisible, and
-/// bidirectional-override characters, masks credential material with
-/// [`crate::redact::scrub_text`], trims, and truncates to
+/// is bounded however large the input. It turns a whitespace control (a tab,
+/// a newline, NEL, a line or paragraph separator) into one blank, so
+/// `Bearer\tabc` keeps the blank the scrubber's `Bearer` pattern needs, and drops
+/// every other control, invisible, and bidirectional-override character. It masks
+/// credential material with [`crate::redact::scrub_text`], trims, and truncates to
 /// [`MAX_CLIENT_LABEL_CHARS`] characters. It returns `None` when nothing is left.
 /// A second application can only mask more (masking can remove an escape, and the
 /// cut can land inside a mask), never reveal more; the label stays bounded, up to
@@ -272,7 +274,11 @@ pub fn sanitize_client_label(raw: &str) -> Option<String> {
     let cleaned: String = raw
         .chars()
         .take(LABEL_SCAN_CHARS)
-        .filter(|c| !is_label_noise(*c))
+        .filter_map(|c| match (is_label_noise(c), c.is_whitespace()) {
+            (true, true) => Some(' '),
+            (true, false) => None,
+            (false, _) => Some(c),
+        })
         .collect();
     let scrubbed = crate::redact::scrub_text(&cleaned);
     let bounded: String = scrubbed
@@ -968,7 +974,7 @@ mod tests {
         assert_eq!(sanitize_client_label(&"\u{0}".repeat(10 << 20)), None);
         assert_eq!(
             sanitize_client_label("a\u{0}b\nc\u{202E}d"),
-            Some("abcd".to_string())
+            Some("ab cd".to_string())
         );
         let scrubbed = sanitize_client_label("token=abc123").expect("a label remains");
         assert!(!scrubbed.contains("abc123"), "secret leaked: {scrubbed}");
@@ -1173,7 +1179,6 @@ mod tests {
             '\u{180E}',
             '\u{200B}',
             '\u{200F}',
-            '\u{2028}',
             '\u{202E}',
             '\u{2060}',
             '\u{2069}',
@@ -1194,6 +1199,8 @@ mod tests {
             .filter(|(_, label)| label.as_deref() != Some("ab"))
             .collect();
         assert!(bad.is_empty(), "an invisible character was kept: {bad:#?}");
+        // The line separator is whitespace: it becomes a blank, not nothing.
+        assert_eq!(sanitize_client_label("a\u{2028}b"), Some("a b".to_string()));
         // A visible non-ASCII letter is not noise.
         assert_eq!(
             sanitize_client_label("caf\u{e9}"),
@@ -1768,12 +1775,14 @@ mod tests {
 
     #[test]
     fn sanitize_client_label_drops_c1_controls_and_delete() {
-        let bad: Vec<(char, Option<String>)> = ['\u{7F}', '\u{80}', '\u{85}', '\u{9B}', '\u{9F}']
+        let bad: Vec<(char, Option<String>)> = ['\u{7F}', '\u{80}', '\u{9B}', '\u{9F}']
             .into_iter()
             .map(|c| (c, sanitize_client_label(&format!("a{c}b"))))
             .filter(|(_, label)| label.as_deref() != Some("ab"))
             .collect();
         assert!(bad.is_empty(), "a control character was kept: {bad:#?}");
+        // NEL is a whitespace control: it becomes a blank, not nothing.
+        assert_eq!(sanitize_client_label("a\u{85}b"), Some("a b".to_string()));
         // The characters next to the C1 block are letters and symbols, not controls.
         assert_eq!(
             sanitize_client_label("a\u{A1}b"),
@@ -1825,5 +1834,43 @@ mod tests {
                 "{raw:?} was not masked: {label}"
             );
         }
+    }
+
+    /// The scrubber's `Bearer` frame needs a blank between the word and its token.
+    /// A whitespace control (tab, newline, NEL, line separator) is noise, but
+    /// deleting it would join `Bearer` to the token and leave nothing to match, so
+    /// it becomes a blank instead.
+    #[test]
+    fn sanitize_client_label_masks_a_bearer_token_after_a_whitespace_control() {
+        for raw in [
+            "agent Bearer\tabc123",
+            "agent Bearer\nabc123",
+            "Bearer\u{85}abc123",
+            "Bearer\u{2028}abc123",
+        ] {
+            let label = sanitize_client_label(raw).expect("a label remains");
+            assert!(!label.contains("abc123"), "{raw:?} leaked abc123: {label}");
+            assert!(
+                label.contains("Bearer [redacted]"),
+                "{raw:?} was not masked as a bearer token: {label}"
+            );
+        }
+        // These pair frames need no blank, so they were masked before the port too.
+        for (raw, secret) in [
+            ("agent token\t=abc123", "abc123"),
+            ("password\n: hunter2", "hunter2"),
+        ] {
+            let label = sanitize_client_label(raw).expect("a label remains");
+            assert!(!label.contains(secret), "{raw:?} leaked {secret}: {label}");
+            assert!(
+                label.contains("[redacted]"),
+                "{raw:?} was not masked: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_client_label_turns_whitespace_controls_into_a_blank() {
+        assert_eq!(sanitize_client_label("a\tb\nc"), Some("a b c".to_string()));
     }
 }

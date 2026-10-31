@@ -619,13 +619,13 @@ fn a_directly_assigned_label_is_stripped_and_scrubbed_at_the_server() {
     let host_label = reply["result"]["structuredContent"]
         .as_str()
         .expect("demo.client returns its label as a string");
-    assert_eq!(host_label, "agent-x token=[redacted]", "the host's label");
+    assert_eq!(host_label, "agent-x  token=[redacted]", "the host's label");
 
     let entries = ring.recent(None, None);
     assert_eq!(entries.len(), 1);
     assert_eq!(
         entries[0].client_label.as_deref(),
-        Some("agent-x token=[redacted]"),
+        Some("agent-x  token=[redacted]"),
         "the ring entry's label"
     );
 
