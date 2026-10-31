@@ -10,8 +10,8 @@ public enum BusState: Hashable, Sendable {
     case failed(String)
 }
 
-/// How well one lane of the connection is doing. Ordered worst-last so the sidebar's
-/// Status row and the toolbar pill can show the worst lane.
+/// How well one lane of the connection is doing. Ordered worst-last so the toolbar pill
+/// can show the worst lane.
 public enum LaneState: Int, Comparable, Sendable {
     case ok, working, off, warning, error
 
@@ -35,12 +35,12 @@ public enum ConnectionAction: Hashable, Sendable {
         case .switchToEmbedded: "Switch to Embedded…"
         case .reconnectBus: "Reconnect"
         case .openBusSettings: "Bus Settings…"
-        case .turnCaptureOn: "Turn On Capture"
-        case .turnCaptureOff: "Turn Off Capture"
+        case .turnCaptureOn: "Capture All Apps"
+        case .turnCaptureOff: "Stop Capturing All Apps"
         case .openScope: "Open Scope…"
         case .approveInSystemSettings: "Open System Settings…"
-        case .uninstallExtension: "Uninstall Capture Extension…"
-        case .openCaptureSettings: "Capture Settings…"
+        case .uninstallExtension: "Uninstall Extension…"
+        case .openCaptureSettings: "All Apps Settings…"
         case .openBrowser: "Open Browser"
         case .copyListenAddress: "Copy Address"
         }
@@ -52,8 +52,8 @@ public enum ConnectionAction: Hashable, Sendable {
 
 /// One of the three lanes the operator must understand: the core (the proxy process), the
 /// bus (the app's link to it) and the capture extension (system-wide capture). Every word
-/// a connection indicator shows comes from here, so the toolbar pill, the status bar, the
-/// sidebar row, the Status page and the Settings rows can never disagree.
+/// a connection indicator shows comes from here, so the toolbar's connection cluster, the
+/// Status page, the Core Log header and the Settings rows can never disagree.
 public struct ConnectionLane: Hashable, Sendable {
     public enum Kind: String, Hashable, Sendable, CaseIterable {
         case core, bus, capture
@@ -63,7 +63,7 @@ public struct ConnectionLane: Hashable, Sendable {
             switch self {
             case .core: "Core"
             case .bus: "Bus"
-            case .capture: "Capture"
+            case .capture: "All Apps"
             }
         }
     }
@@ -82,9 +82,9 @@ public struct ConnectionLane: Hashable, Sendable {
     public let actions: [ConnectionAction]
 
     /// The word with its lane named where the word alone would be ambiguous: "capture off" as is,
-    /// "failed" → "core: failed". For the one-item surfaces (status bar).
+    /// "failed" → "core: failed". For one-line surfaces (the switch help, `spoken`).
     public var compact: String {
-        word.hasPrefix(kind.title.lowercased()) ? word : "\(kind.title.lowercased()): \(word)"
+        word.localizedCaseInsensitiveContains(kind.title) ? word : "\(kind.title.lowercased()): \(word)"
     }
 
     public init(kind: Kind, state: LaneState, word: String, detail: String, remedy: String? = nil,
@@ -144,20 +144,13 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     public var lanes: [ConnectionLane] { [core, bus, capture] }
 
-    /// The worst lane state: what the sidebar's Status row glyph and the pill's dot show.
+    /// The worst lane state.
     public var overall: LaneState { lanes.map(\.state).max() ?? .ok }
 
     /// The worst lane, for the compact surfaces that show one word.
     public var worst: ConnectionLane { lanes.max { $0.state < $1.state } ?? core }
 
     public var allStepsDone: Bool { steps.allSatisfy(\.done) }
-
-    /// The status bar's one connection word: "connected" while every lane is fine, else the
-    /// worst lane's compact form ("capture off", "core: failed").
-    public var overallWord: String { overall == .ok ? "connected" : worst.compact }
-
-    /// The sidebar badge beside the brand: "ok", or the lane that needs attention ("Capture").
-    public var badge: String { overall == .ok ? "ok" : worst.kind.title }
 
     /// The three lanes in one line, for tooltips: "Core: running — Embedded · proxy …\nBus: …".
     public var tooltip: String {
@@ -166,7 +159,7 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     /// The three lanes as one spoken sentence, for accessibility labels.
     public var spoken: String {
-        "core \(core.word), bus \(bus.word), capture \(capture.word)"
+        lanes.map(\.compact).joined(separator: ", ")
     }
 
     /// The hint for a Scope entry while the provider still claims a bare host's DNS lookup:
@@ -269,23 +262,23 @@ public struct ConnectionSummary: Hashable, Sendable {
         let hosts = Format.count(scopeHostCount, "host") + " in scope"
         // Capture is the embedded core's gate: with an external core the switch is not ours.
         if activeKind == .external, advice != .unsupported {
-            return ConnectionLane(kind: .capture, state: .off, word: "capture off",
-                                  detail: "The external core does not run the capture extension",
+            return ConnectionLane(kind: .capture, state: .off, word: "all apps off",
+                                  detail: "The external core does not run the extension",
                                   remedy: "Switch to the embedded core to capture other apps' traffic",
                                   actions: [.switchToEmbedded])
         }
         switch advice {
         case .unsupported:
             return ConnectionLane(kind: .capture, state: .off, word: "no extension",
-                                  detail: "This build has no capture extension",
-                                  remedy: "Install the signed Aitmproxy app; its capture extension is built in",
+                                  detail: "This build has no extension",
+                                  remedy: "Install the signed Aitmproxy app; its extension is built in",
                                   actions: [])
         case .off:
             let installed = capability.isInstalledOrInstalling
-            return ConnectionLane(kind: .capture, state: .off, word: "capture off",
+            return ConnectionLane(kind: .capture, state: .off, word: "all apps off",
                                   detail: installed ? "extension installed · \(hosts)" : "extension not installed",
-                                  remedy: installed ? "Turn on capture to see other apps' traffic"
-                                                    : "Turn on capture; macOS asks you to approve the extension",
+                                  remedy: installed ? "Turn on All Apps to see every Mac app's traffic"
+                                                    : "Turn on All Apps; macOS asks you to approve its extension",
                                   actions: installed ? [.turnCaptureOn, .uninstallExtension, .openCaptureSettings]
                                                      : [.turnCaptureOn, .openCaptureSettings])
         case .awaitingApproval:
@@ -295,10 +288,10 @@ public struct ConnectionSummary: Hashable, Sendable {
                                   actions: [.approveInSystemSettings, .turnCaptureOff])
         case .degraded(let reason):
             let unnotarized = reason.localizedCaseInsensitiveContains("signature")
-            return ConnectionLane(kind: .capture, state: .error, word: "capture degraded", detail: reason,
+            return ConnectionLane(kind: .capture, state: .error, word: "all apps degraded", detail: reason,
                                   remedy: unnotarized
                                       ? "macOS refused this build's extension; install the signed Aitmproxy app"
-                                      : "Turn capture off and on again; if it stays degraded, uninstall and reinstall the extension",
+                                      : "Turn All Apps off and on again; if it stays degraded, uninstall and reinstall the extension",
                                   actions: [.turnCaptureOff, .uninstallExtension, .openCaptureSettings])
         case .onEmptyScope:
             return ConnectionLane(kind: .capture, state: .warning, word: "on, nothing in scope",
@@ -314,7 +307,7 @@ public struct ConnectionSummary: Hashable, Sendable {
             }
             let attached = coreCapture?.providerAttached ?? true
             return ConnectionLane(kind: .capture, state: attached ? .ok : .warning,
-                                  word: attached ? "capture on · \(hosts)" : "on, core not attached",
+                                  word: attached ? "all apps on · \(hosts)" : "on, core not attached",
                                   detail: detail,
                                   remedy: attached ? nil : "Restart the core so the extension can attach to it",
                                   actions: attached ? [.turnCaptureOff, .openScope, .uninstallExtension]
@@ -336,13 +329,13 @@ public struct ConnectionSummary: Hashable, Sendable {
         case .on, .onEmptyScope:
             extensionDone = true; extensionTitle = "Capture extension is on"; extensionAction = nil
         case .unsupported:
-            extensionDone = false; extensionTitle = "Capture extension is not in this build"; extensionAction = nil
+            extensionDone = false; extensionTitle = "All Apps capture is not in this build"; extensionAction = nil
         case .awaitingApproval:
-            extensionDone = false; extensionTitle = "Approve the capture extension in System Settings"; extensionAction = .approveInSystemSettings
+            extensionDone = false; extensionTitle = "Approve the extension in System Settings"; extensionAction = .approveInSystemSettings
         case .degraded:
             extensionDone = false; extensionTitle = "Fix the capture extension"; extensionAction = .openCaptureSettings
         case .off:
-            extensionDone = false; extensionTitle = "Turn on the capture extension"; extensionAction = .turnCaptureOn
+            extensionDone = false; extensionTitle = "Capture all apps (macOS asks you to approve the extension)"; extensionAction = .turnCaptureOn
         }
         let scopeDone = scopeHostCount > 0
         let hosts = Format.count(scopeHostCount, "host")

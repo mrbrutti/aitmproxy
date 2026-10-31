@@ -81,7 +81,7 @@ public enum CaptureAdvice: Equatable, Sendable {
         case .unsupported:
             "This build has no capture extension, and flows carry no source app yet, so there is nothing to group here."
         case .off:
-            "Turn on Capture L4 traffic in Settings ▸ Capture to capture other apps' traffic."
+            "Turn on Capture traffic from all apps in Settings ▸ All Apps."
         case .awaitingApproval:
             "Approve the extension in System Settings under Network Extensions, then allow Add Proxy Configurations."
         case .degraded(let reason):

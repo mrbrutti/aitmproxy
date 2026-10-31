@@ -68,7 +68,51 @@ enum SelfTest {
             check("the core lane says the fixture core is not running", summary.core.word == "not running" && summary.core.state == .off)
             check("the bus lane reads the fixture bus as connected", summary.bus.word == "connected" && summary.bus.state == .ok)
             check("the capture lane says this build has no extension", summary.capture.word == "no extension")
-            check("Status is reached from the brand row, the pill and ⌘0, not a list row", !SidebarPage.status.isInSidebar && !SidebarPage.status.showsFlows)
+            check("Status is reached from the toolbar pill and ⌘0, not a list row", !SidebarPage.status.isInSidebar && !SidebarPage.status.showsFlows)
+            // ST-AC9: the toolbar switches follow the facts. Fixtures connect the bus, so the Proxy
+            // switch is live; this build has no extension, so the Capture switch stands down and says why.
+            check("the toolbar's Proxy switch is live while the bus is connected as operator", ToolbarSwitches.proxyLive(summary, role: session.resolvedRole))
+            check("the Proxy switch stands down on an agent-token connection even with no role expectation",
+                  !ToolbarSwitches.proxyLive(summary, role: "agent") && !ToolbarSwitches.proxyLive(summary, role: nil))
+            ToolbarSwitches.flipProxy(session, on: false)
+            await settle { !session.capturing }
+            check("flipping the Proxy switch pauses the proxy", !session.capturing)
+            ToolbarSwitches.flipProxy(session, on: true)
+            await settle { session.capturing }
+            check("flipping it again resumes", session.capturing)
+            check("the Proxy switch help names pause (⇧⌘R)", ToolbarSwitches.proxyHelp(summary, role: "operator", capturing: true).contains("⇧⌘R"))
+            // ST-AC9's enabled clause: each of the three terms flips the Capture switch's liveness.
+            let liveHealth = CoreHealthState()
+            liveHealth.captureCapability = .capturing
+            check("the Capture switch is live with an installed extension on the embedded core", ToolbarSwitches.captureLive(liveHealth, embedded: true))
+            check("the Capture switch stands down with an external core", !ToolbarSwitches.captureLive(liveHealth, embedded: false))
+            liveHealth.captureBusy = true
+            check("the Capture switch stands down while a switch is in flight", !ToolbarSwitches.captureLive(liveHealth, embedded: true))
+            check("the toolbar's Capture switch stands down with no extension in this build",
+                  !ToolbarSwitches.captureLive(session.coreHealth, embedded: true))
+            check("the Capture switch says why it is off", ToolbarSwitches.captureHelp(
+                summary.capture, controlsAvailable: session.coreHealth.captureControlsAvailable, embedded: true,
+                busy: false, choice: false).contains("not in this build"))
+            check("the Capture switch rests off while the lane is off", !ToolbarSwitches.captureOn(summary.capture))
+            // The position follows the lane for every state the extension can be in, and the
+            // in-flight choice wins while a switch runs.
+            let fixtureBus = session.bus
+            let fixtureAddress = session.listenAddress
+            func laneFor(_ capability: CaptureCapability, hosts: Int = 1) -> ConnectionLane {
+                ConnectionSummary.make(core: nil, activeKind: .embedded, bus: fixtureBus, role: "operator", roleWarning: false,
+                                       capability: capability, captureSupported: true, scopeHostCount: hosts,
+                                       flowCount: 0, listenAddress: fixtureAddress).capture
+            }
+            check("the Capture switch is on while capturing, waiting for approval or degraded",
+                  ToolbarSwitches.captureOn(laneFor(.capturing)) && ToolbarSwitches.captureOn(laneFor(.pendingApproval))
+                      && ToolbarSwitches.captureOn(laneFor(.degraded("tunnel setup failed"))) && ToolbarSwitches.captureOn(laneFor(.capturing, hosts: 0)))
+            check("the Capture switch is off while the extension is installed but inactive or not installed",
+                  !ToolbarSwitches.captureOn(laneFor(.inactive)) && !ToolbarSwitches.captureOn(laneFor(.extensionNotInstalled)))
+            check("an in-flight choice overrides the lane", ToolbarSwitches.capturePosition(choice: true, lane: laneFor(.inactive))
+                      && !ToolbarSwitches.capturePosition(choice: false, lane: laneFor(.capturing))
+                      && ToolbarSwitches.capturePosition(choice: nil, lane: laneFor(.capturing)))
+            check("the Capture switch help carries the lane's word when live", ToolbarSwitches.captureHelp(
+                summary.capture, controlsAvailable: true, embedded: true, busy: false, choice: true).contains(summary.capture.word))
             check("Open Scope from Status shows the Scope page", { session.perform(connection: .openScope); return session.page == .scope }())
             check("Open Browser from Status shows the Browser page", { session.perform(connection: .openBrowser); return session.page == .browser }())
             check("Core Log from Status opens the core log", { session.perform(connection: .showCoreLog); return session.coreLogVisible }())
@@ -90,6 +134,13 @@ enum SelfTest {
             check("the JSON chip narrows the list", session.visibleRows.count < session.rows.count && !session.visibleRows.isEmpty)
             session.chip = .websocket
             check("the WebSocket chip keeps only WS flows", session.visibleRows.allSatisfy { $0.kind == .websocket } && session.visibleRows.count == 1)
+            // ST-AC11: the transport chips keep the raw-L4 fixture rows by protocol.
+            session.chip = .tcp
+            check("the TCP chip keeps only raw TCP sessions", session.visibleRows.allSatisfy { $0.l4?.proto == .tcp } && session.visibleRows.count == 1)
+            session.chip = .udp
+            check("the UDP chip keeps only raw UDP flows", session.visibleRows.allSatisfy { $0.l4?.proto == .udp } && session.visibleRows.count == 2)
+            session.chip = .l4
+            check("the L4 chip keeps every packet flow", session.visibleRows.count == Fixtures.l4Rows.count && session.visibleRows.allSatisfy { $0.kind == .l4 })
             session.chip = .all
 
             session.page = .scope
@@ -184,7 +235,7 @@ enum SelfTest {
             // S-018: pause and clear.
             session.setCapturing(false)
             await settle { !session.capturing }
-            check("pausing capture flips the state", !session.capturing)
+            check("pausing the proxy flips the state", !session.capturing)
             let beforeClear = session.rows
             let focusBeforeClear = session.focused
             let selectionBeforeClear = session.selection

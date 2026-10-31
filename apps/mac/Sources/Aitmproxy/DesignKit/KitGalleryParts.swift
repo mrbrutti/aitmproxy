@@ -14,11 +14,11 @@ struct GalleryToolbarParts: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.xxl) {
-            KitSection("Listening pill", caption: "Green dot listening · grey capture paused · amber intercept armed. Raised capsule, 28 tall.") {
+            KitSection("Connection cluster", caption: "The pill (core dot + address) and the Proxy and Capture switches: the one home of connection state. Green dot listening · grey proxy paused · amber intercept armed. Raised capsule, 28 tall.") {
                 VStack(alignment: .leading, spacing: Space.sm) {
-                    ListeningPill().environment(fx.listening)
-                    ListeningPill().environment(fx.captureOff)
-                    ListeningPill().environment(fx.paused)
+                    ConnectionCluster().environment(fx.listening)
+                    ConnectionCluster().environment(fx.captureOff)
+                    ConnectionCluster().environment(fx.paused)
                 }
             }
             KitSection("Agent toggle · layout switch",

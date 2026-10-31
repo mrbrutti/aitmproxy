@@ -1,8 +1,9 @@
 import AitmproxyKit
 import SwiftUI
 
-/// Left: Clear · Filter · Auto-select. Centre: counts. Right: memory,
-/// throughput, the bus connection (foundation §2.7 "Status bar").
+/// Left: Clear · Filter · Auto-select. Centre: counts, Undo after Clear, the last error.
+/// Right: memory, throughput (foundation §2.7 "Status bar"). The list's small facts only:
+/// connection state lives in the toolbar's cluster and nowhere else (spec §4, revision 2).
 struct StatusBar: View {
     @Environment(Session.self) private var session
 
@@ -48,24 +49,6 @@ struct StatusBar: View {
                 if session.memoryBytes > 0 { Text(Format.bytes(session.memoryBytes)) }
                 Text("↑ \(Format.rate(session.upBytesPerSecond))")
                 Text("↓ \(Format.rate(session.downBytesPerSecond))")
-                // One connection item, from the same table as the Status page: the worst lane's
-                // name and word while something needs attention, a single "connected" dot when all
-                // is well. The sidebar's brand row and the Status page carry the rest; the bar
-                // never repeats them (rule 64: small facts only, down here).
-                let summary = session.connectionSummary
-                let worst = summary.worst
-                Button { session.show(.status) } label: {
-                    HStack(spacing: Tok.Metric.gapTight) {
-                        Circle().fill(worst.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                        Text(summary.overallWord)
-                            .lineLimit(1)
-                    }
-                    .foregroundStyle(summary.overall == .ok ? Tok.Ink.secondary.color : worst.state.color.color)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(summary.tooltip + "\nOpens Status (⌘0)")
-                .accessibilityLabel("Connection: \(summary.spoken)")
             }
             .font(Tok.Face.data(Tok.Typography.Size.sm))
         }
