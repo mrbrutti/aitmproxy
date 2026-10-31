@@ -602,3 +602,31 @@ fn constants_reached_inside_functions_stay_constant() {
         "a local copy may be mutated and the constant is untouched"
     );
 }
+
+/// A local or parameter a closure captures keeps shadowing a constant of the
+/// same name: the closure body reads the captured name unindexed, and the
+/// resolver defers to the live scope, where the capture is a parameter. An
+/// uncaptured read of the constant from a closure still resolves.
+#[test]
+fn captured_locals_still_shadow_constants() {
+    let engine = build_engine(&RhaiLimits::default(), Duration::from_secs(2));
+    let ast = engine
+        .compile(
+            r#"
+            const X = 1;
+            fn via_closure() { let X = 5; let c = || X; c.call() }
+            fn param_closure(X) { let c = || X; c.call() }
+            fn unshadowed() { let c = || X; c.call() }
+            "#,
+        )
+        .expect("compiles");
+    let _constants = enter_constants(&ast);
+    let call = |name: &str, args: Vec<rhai::Dynamic>| {
+        engine
+            .call_fn::<i64>(&mut Scope::new(), &ast, name, args)
+            .expect(name)
+    };
+    assert_eq!(call("via_closure", vec![]), 5);
+    assert_eq!(call("param_closure", vec![rhai::Dynamic::from(7_i64)]), 7);
+    assert_eq!(call("unshadowed", vec![]), 1);
+}

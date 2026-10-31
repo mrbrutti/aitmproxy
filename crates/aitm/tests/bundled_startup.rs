@@ -138,14 +138,13 @@ fn assert_catalogue_loaded(tier: &ScriptTier, registry: &Registry, failures: &[S
         failures.join("\n")
     );
     let registered: BTreeSet<&str> = registry.commands().map(|c| c.name()).collect();
-    let missing: Vec<&str> = EXPECTED_COMMANDS
-        .iter()
-        .copied()
-        .filter(|name| !registered.contains(name))
-        .collect();
-    assert!(
-        missing.is_empty(),
-        "commands the catalogue should register are missing: {missing:?}"
+    let expected: BTreeSet<&str> = EXPECTED_COMMANDS.iter().copied().collect();
+    assert_eq!(
+        registered,
+        expected,
+        "missing from the registry: {:?}; registered but not in EXPECTED_COMMANDS: {:?}",
+        expected.difference(&registered).collect::<Vec<_>>(),
+        registered.difference(&expected).collect::<Vec<_>>()
     );
 }
 

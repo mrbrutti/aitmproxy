@@ -40,9 +40,12 @@ three-reviewer panel.
   assertion message lists each `name: error`); the registry has every
   command the `active/` and `l4/` scripts register (`check.sqli`,
   `l4.recon`, … — 18 names, pinned as a literal list).
-- **Done when:** the test compiles and fails on current `main` listing
-  exactly the 7 scripts, with `Variable not found: …` for each (the red
-  evidence in the PR), and passes after Tasks 2 and 3.
+- **Done when:** the test compiles and fails on current `main` naming the
+  seven scripts' commands as missing from the registry (on `main` a failed
+  `load` is not yet recorded as `last_error`, so the per-script list is
+  empty and the missing-command assertion is the one that fires; the L4-on
+  run fails earlier, on 49 compile-time capability denials), and passes
+  after Tasks 2 and 3.
 
 ### Task 2: pin the optimizer, resolve literal constants inside functions
 
@@ -71,13 +74,13 @@ three-reviewer panel.
   - `plugin.rs` `call_hook`, `command.rs` `ScriptRegHandle::run_load` and
     `ScriptCommand::invoke`, `poc_step.rs` `run`: `let _constants =
     enter_constants(&ast);` beside the existing `begin_run`/seed guards.
-  - `plugin.rs` `RhaiPlugin::run_load`: on `Err`, also
+  - `plugin.rs` `LoadedScript::run_load`: on `Err`, also
     `self.errors.record(&self.meta.name, err.to_string())`.
   - `loader.rs` `api_satisfies`: compare dotted integer versions
     component-wise via `fn version_parts(&str) -> Option<Vec<u32>>`, padding
     the shorter with zeros; non-numeric still exact-match (D7).
 - **Test:** in `tests/loader.rs`:
-  `top_level_const_is_visible_in_hooks_and_closures` (AC2, AC3, AC4) — a
+  `top_level_literal_consts_are_visible_in_hooks_and_closures` (AC2, AC3, AC4) — a
   script with `const TAG = "v"`, `const PATHS = ["/a", "/b", "/c"]`, an
   `on_request` that sets header `X-Tag` to `TAG`, `X-N` to `PATHS.len()`
   and `X-Has` to `PATHS.contains("/b")`, and a `load(reg)` registering
@@ -145,6 +148,15 @@ three-reviewer panel.
 
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| 2 | spec | Minor | AC2-AC4 test named differently from the plan | fixed: plan now names `top_level_literal_consts_are_visible_in_hooks_and_closures` |
+| 1 | spec | Minor | Task 1 Done-when described a red shape the test cannot produce on `main` | fixed: Done-when rewritten to the missing-command list |
+| 2 | spec | Minor | spec/plan leftovers: warning clause, D6/D7 order, `RhaiPlugin` (no such type) | fixed in the docs; code unchanged |
+| 2, 4 | spec | Minor | unrequested `Default` derive on `ScriptConstants`; untested "works on a copy" doc claim | fixed: derive dropped, sentence removed |
+| 4 | quality | Important | guide claimed a mutating method on a constant "works on a copy"; rhai refuses it (`ErrorNonPureMethodCallOnConstant`, probed) | fixed: guide and README state the read-only rule and the `let` copy; pinned by a test in `tests/engine.rs` |
+| 2 | quality | Minor | per-run table wrapped in an unshared `Arc`, `ScriptConstants`/`of` needlessly `pub` | fixed: `RefCell<Option<ScriptConstants>>`, type and constructor private |
+| 2 | quality | Minor | `ConstantsGuard` restore-on-drop untested | fixed: nesting/restore assertions in `script_constants_resolve_inside_functions_while_entered` |
+| 1 | quality | Minor | `EXPECTED_COMMANDS` asserted as a subset, could drift stale | fixed: whole-set `assert_eq` naming both differences |
+| 2 | security | Minor | a closure-captured local/parameter of a constant's name read unindexed in the closure body, so the table won over it (probed: 1 instead of 5 / 7) | fixed: resolver returns `None` for any name the live scope contains; AC5 extended and tested |
 
 ## Shipped
 

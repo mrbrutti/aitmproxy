@@ -137,7 +137,8 @@ value (`const SQL_ERR = "(?i)…"`, `const PATHS = [...]`) may be read inside
 hooks and inside `load(reg)` command closures: the engine resolves such names
 inside functions from the script's constants. A constant computed by a call is
 not visible in functions; a parameter or `let` of the same name shadows the
-constant. Second, a closure captures every outer name when it is *created*, so a
+constant; and the constant is read-only there, so mutate a copy (`let p =
+PATHS; p.push(x)`). Second, a closure captures every outer name when it is *created*, so a
 command closure that names an optional namespace (`l4` with the L4 layer off)
 fails at load before its `try` can catch anything; the `l4/` scripts call `l4`
 from a named function and keep the `try` in the closure.

@@ -222,14 +222,13 @@ pub fn extend_deadline() {
 /// ([`install_constant_resolver`]) answers such names from the table
 /// [`enter_constants`] installs for the duration of a run. Only literal values
 /// are in it: a constant computed by a call stays invisible inside functions,
-/// as in plain Rhai.
-#[derive(Debug, Default)]
-pub struct ScriptConstants(BTreeMap<String, Dynamic>);
+/// as in plain Rhai. Rebuilt per run from the AST: a handful of top-level
+/// statements, which Rhai itself re-evaluates on every `call_fn` anyway.
+#[derive(Debug)]
+struct ScriptConstants(BTreeMap<String, Dynamic>);
 
 impl ScriptConstants {
-    /// The literal constants of `ast`'s top level.
-    #[must_use]
-    pub fn of(ast: &AST) -> Self {
+    fn of(ast: &AST) -> Self {
         Self(
             ast.iter_literal_variables(true, false)
                 .map(|(name, _, value)| (name.to_string(), value))
@@ -242,21 +241,20 @@ thread_local! {
     /// The constants of the script evaluating on this thread (see
     /// [`enter_constants`]); scripts evaluate synchronously on the thread that
     /// dispatched them, like [`RUN`].
-    static CONSTANTS: RefCell<Option<Arc<ScriptConstants>>> = const { RefCell::new(None) };
+    static CONSTANTS: RefCell<Option<ScriptConstants>> = const { RefCell::new(None) };
 }
 
 /// Restores the table that was installed before, when dropped.
 #[must_use = "the constants are visible only while the guard lives"]
 pub struct ConstantsGuard {
-    previous: Option<Arc<ScriptConstants>>,
+    previous: Option<ScriptConstants>,
 }
 
 /// Make `ast`'s top-level literal constants visible to its functions on this
 /// thread until the guard drops. Every dispatcher that evaluates a script —
 /// hook, `load`, command, PoC step — opens this around the evaluation.
 pub fn enter_constants(ast: &AST) -> ConstantsGuard {
-    let table = Arc::new(ScriptConstants::of(ast));
-    let previous = CONSTANTS.with(|cell| cell.replace(Some(table)));
+    let previous = CONSTANTS.with(|cell| cell.replace(Some(ScriptConstants::of(ast))));
     ConstantsGuard { previous }
 }
 
@@ -267,13 +265,16 @@ impl Drop for ConstantsGuard {
     }
 }
 
-/// The current script's constant `name`, for a name the parser could not bind
-/// to a local slot. A parameter or `let` of the same name has a slot
-/// (`index != 0`) and wins; a name that is not a constant falls through to
-/// Rhai's own lookup (the scope, global constants such as `http`, function
-/// pointers), so nothing else changes meaning.
-fn script_constant(name: &str, index: usize) -> Option<Dynamic> {
-    if index != 0 {
+/// The current script's constant `name`, for a name that is neither bound to
+/// a local slot by the parser (`index != 0`: a parameter or `let` read
+/// directly) nor present in the live scope (a name a closure captured, which
+/// its body reads unindexed). Either way the local wins, as in plain Rhai. A
+/// name that is not a constant falls through to Rhai's own lookup (the scope,
+/// global constants such as `http`, function pointers), so nothing else
+/// changes meaning. Rhai hands the answer back read-only: a mutating method
+/// on it is refused, as on any constant.
+fn script_constant(name: &str, index: usize, scope: &rhai::Scope) -> Option<Dynamic> {
+    if index != 0 || scope.contains(name) {
         return None;
     }
     CONSTANTS.with(|cell| {
@@ -287,7 +288,7 @@ fn script_constant(name: &str, index: usize) -> Option<Dynamic> {
 // docs say it is not deprecated.
 #[allow(deprecated)]
 fn install_constant_resolver(engine: &mut Engine) {
-    engine.on_var(|name, index, _ctx| Ok(script_constant(name, index)));
+    engine.on_var(|name, index, ctx| Ok(script_constant(name, index, ctx.scope())));
 }
 
 /// A fresh engine with every sandbox limit applied; the one engine shared by

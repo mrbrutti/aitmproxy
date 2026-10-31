@@ -77,7 +77,7 @@ top-level `const`s are never in that set because the loader calls
 `engine.compile(src)`. `l4` is a global-module constant only while the L4
 language is installed (`l4.enabled`), so on a plain config the same capture
 fails for it. The existing catalogue test compiles every script and runs the
-passive hooks; it never runs `load`, and `RhaiPlugin::run_load` only logs a
+passive hooks; it never runs `load`, and `LoadedScript::run_load` only logs a
 failure.
 
 **D1. Pin the optimization level.** `engine::build_engine` calls
@@ -93,14 +93,19 @@ literal constants (`ast.iter_literal_variables(true, false)`: `const`s whose
 value is a string, number, bool, char, unit, or an array/map of literals)
 into a table. `engine::enter_constants(&ast)` installs that table in a
 thread-local for the duration of a run (a guard restores the previous one),
-and every dispatcher opens it around its evaluation: `RhaiPlugin::call_hook`,
+and every dispatcher opens it around its evaluation: `LoadedScript::call_hook`,
 `ScriptRegHandle::run_load`, `ScriptCommand::invoke`, and the PoC step
 executor. `build_engine` registers an `on_var` resolver that, for a name the
 parser could not bind to a local slot (`index == 0`), returns the current
 table's value when the name is a constant, and `None` otherwise so Rhai's own
 lookup proceeds (scope, global constants such as `http`, function pointers).
-A parameter or `let` of the same name has a slot and wins, so shadowing is
-unchanged and no warning is needed. The resolver also covers closure
+A parameter or `let` of the same name has a slot and wins; a name a closure
+captured is read unindexed inside the closure body but is then a parameter
+in the live scope, so the resolver also returns `None` for any name the
+scope already contains. Shadowing is therefore unchanged in every shape and
+no warning is needed. Rhai hands a resolver's answer back read-only, so a
+mutating method on the constant inside a function is refused (`cannot be
+called on constant`), as at top level; the guide says to copy it first. The resolver also covers closure
 creation: `curry(fn, SQL_ERR)` resolves through it, and Rhai skips a
 resolver-provided name in the capture's `Share` step (it cannot be made
 shared), so `load(reg)` closures work too. Why not the optimizer: rhai's
@@ -113,7 +118,7 @@ handful of top-level statements, already re-evaluated by Rhai on each
 `call_fn` with `eval_ast`); a cached table can come later if a profile asks
 for it.
 
-**D3. A failed `load(reg)` is recorded.** `RhaiPlugin::run_load` records the
+**D3. A failed `load(reg)` is recorded.** `LoadedScript::run_load` records the
 error in the script's `ErrorSink` (the same `record` a failed hook uses), so
 `script.list` reports it as `last_error` and a test can observe it. The
 log line stays.
@@ -138,6 +143,12 @@ loaded count equals the number of `.rhai` files on disk, zero `last_error`
 across every script, and every `check.*` / `l4.*` command present in the
 registry.
 
+**D6. Documentation.** The published scripting guide (`site/scripting.html`,
+Hooks section) and the catalogue's "Writing your own" section state the two
+rules: literal top-level constants are visible in hooks and closures
+(computed ones are not); closures capture at creation, so call an optional
+namespace from a named function.
+
 **D7. The version gate reads dotted versions.** Found by D5's L4-on run:
 `api_satisfies` compared only plain integers and fell back to exact string
 match, so the L4 namespace's `api_version` `"0.1.0"` refused every API-`"1"`
@@ -149,12 +160,6 @@ version that is not dotted integers still has to match exactly
 `api_version` "semver-ish, like script `const API`", and this is the numeric
 rule extended to that shape. **(Architect's call)** fix the comparison rather
 than relabel L4 to `"1"`: the catalogue and drift guard advertise `"0.1.0"`.
-
-**D6. Documentation.** The published scripting guide (`site/scripting.html`,
-Hooks section) and the catalogue's "Writing your own" section state the two
-rules: literal top-level constants are visible in hooks and closures
-(computed ones are not); closures capture at creation, so call an optional
-namespace from a named function.
 
 ## Acceptance criteria
 
@@ -168,8 +173,11 @@ namespace from a named function.
 4. AC4: a top-level `const` array literal works inside a function as a method
    receiver (`PATHS.len()` is the literal count, `PATHS.contains("/b")` is
    true).
-5. AC5: `const X = 1; fn f(X) { X }` keeps `f(2) == 2` (a parameter shadows
-   the constant, as any local does).
+5. AC5: `const X = 1; fn f(X) { X }` keeps `f(2) == 2`, and a local or
+   parameter a closure captures still shadows it (`fn g() { let X = 5; let c
+   = || X; c.call() }` is 5, `fn h(X) { let c = || X; c.call() }` with 7 is
+   7); a mutating method on a constant inside a function is refused and the
+   constant is unchanged afterwards.
 6. AC6: a non-literal `const` is not visible inside a function; the hook fails
    with the plain `Variable not found` error (the documented limit).
 7. AC7: `build_engine(..).optimization_level()` is `OptimizationLevel::Simple`.
@@ -185,7 +193,7 @@ namespace from a named function.
 
 ## Left to the builder
 
-- Exact wording of the warning in D2 and the doc paragraphs in D6.
+- Exact wording of the doc paragraphs in D6.
 - Whether the three L4 scripts share one helper shape or each keep a
   function named for the command.
 - Test file layout inside `crates/aitm-plugin-rhai/tests/` for AC2-AC8.
