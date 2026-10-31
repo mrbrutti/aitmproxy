@@ -523,4 +523,12 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+Branch `claude/loving-cartwright-2e400f`, cut from `origin/main` `2bdcb07` (PR 137), opened as a PR against `main`; no open Critical or Important finding, every Minor fixed or accepted above.
+
+**What shipped.** `tui::with_shared_governance` (one function, `crates/aitm/src/tui.rs`) puts the `aitm web` bridge server on the primary's `AgentState` and `AuditRing`; `main.rs` calls it for both servers. Tests: `tui.rs` unit tests (AC7, AC8), `web_bus_ask_split.rs` (7 in-process, AC9-AC11 plus four edge tests), `web_bus_governance.rs` (7 real-socket, AC1-AC6, AC16). Doc comments in `tui.rs`, `wire.rs`, `web/mod.rs`, and the rewritten comment in `main.rs`.
+
+**Evidence.** Socket tests red without the helper (`5 failed; 2 passed`, the 2 are the guards) and green with it (`7 passed`). Full gate `gate3 exit=0` on `b11c510` (1767 passed, 0 failed); the head `d7e7efa` differs from it by one doc comment and this plan, with `cargo fmt --check` and `cargo clippy -p aitm --all-targets -- -D warnings` re-run clean. Final-head AC12 mutation (helper line deleted from both rigs): `0 passed; 7 failed` for `web_bus_ask_split`, `2 passed; 5 failed` for `web_bus_governance` (the 2 are the AC4/AC6 guards), every failure on the private-`auto` gate or the empty ring, none a compile or connect error; files restored, tree clean. AC14: `web_bus_roles` 5, `web_bus_concurrency` 11, `web_bus_push` 10, unmodified. AC15: nothing under `crates/aitm-mcp` or `crates/aitm-core`.
+
+**Cut / deviations.** Per-task Tester passes were consolidated into one whole-branch Tester pass (Tasks 1-3 are small and file-disjoint); the panel ran once on the branch, plus a quality re-review of the fix.
+
+**Follow-ups (each a proposed task card).** (1) "tui-mode governance": `aitm tui`'s loopback agent server has a private `AgentState` and ring, so `agent.set` does not reach its gate (Design 7). (2) `paused` / leaving `ask` should revoke standing push subscriptions and already-parked requests (an `aitm-mcp` change). (3) Audit signal-to-noise: ring flooding by one web agent, web-bridge attribution (a fixed bridge `client_label` changes persisted findings and CA-audit labels, so it needs its own change). Also named in the spec, not proposed: a real-binary e2e canary for the `main.rs` wiring; the unified `Ask` hub (now unblocked by PR 137); a configurable startup policy (open question for Matt: should `mcp.policy` be a real config key / env / flag).
