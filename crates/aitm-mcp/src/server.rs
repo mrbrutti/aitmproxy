@@ -480,48 +480,43 @@ impl Subscriptions {
         self.lock().subs.iter().any(|s| s.role == role)
     }
 
-    /// The one fan-out. Every `fanout_*` entry point is a thin wrapper that supplies
-    /// only its own `wants` test ("does this subscription take this line"), so this
-    /// is the **only** code that enqueues to a subscription's sink on a fan-out: a
-    /// future fourth fan-out cannot forget the mute, because `pushes_muted` is a
-    /// required argument here and not something each caller remembers.
+    /// The only code that enqueues to a subscription's sink on a fan-out. The
+    /// `fanout_*` entry points just say which subscriptions want the line, and
+    /// `pushes_muted` is a required argument, so a new fan-out cannot forget the
+    /// mute.
     ///
-    /// Per call, in order: take the registry lock; **then** call `pushes_muted()`
-    /// once, so one policy snapshot covers every subscription in the call and the
-    /// read is as late as it can be. Then walk the subscriptions in registry order,
-    /// at most once per connection, skipping a subscription `wants` rejects (which
-    /// does not mark its connection as seen) and then:
+    /// While pushes are muted, a subscription whose role is not trusted control
+    /// ([`Frontend::is_trusted_control`]) gets nothing and its connection is
+    /// recorded in `gapped`. The next delivery to a recorded connection is preceded
+    /// by one `lagged` state line. This function sends that marker itself instead of
+    /// setting the sink's own overflow flag, because the next `drain` would write
+    /// that flag while the policy is still muted and leak a bit under pause. The
+    /// policy is read once, under the registry lock, so one snapshot covers every
+    /// subscription and the read is as late as it can be. `wants` is tested first,
+    /// so a connection is marked only when a line it would have received was
+    /// suppressed. A connection gets at most one line per call.
     ///
-    /// - a subscription whose role is not trusted control
-    ///   ([`Frontend::is_trusted_control`]) while pushes are muted gets nothing, and
-    ///   its connection is recorded in `gapped` (once);
-    /// - anything else gets the line, preceded by one `lagged` state line iff its
-    ///   connection is recorded in `gapped` (which is cleared then).
+    /// A mute stops new lines, not everything already in motion. These are accepted:
     ///
-    /// The `wants` test runs before the mute check, so a connection is marked only
-    /// when a line it would have received was suppressed. The gap is per connection
-    /// (see [`SubState::gapped`]). The marker rides the first delivery after the
-    /// gap; it is never sent while muted, and it is deliberately **not** the sink's
-    /// own overflow flag: setting that at suppression time would be written by the
-    /// next `drain` while the policy is still muted and leak a bit under pause.
-    ///
-    /// Accepted residuals of the live-policy guarantee, each stated so a reviewer can
-    /// disagree with it:
-    ///
-    /// - R1: lines already queued in an agent sink may still be written; they were
-    ///   granted when queued, nothing is purged, and the bound is the sink capacity.
-    /// - R2: a `flow.subscribe {since}` past the gate just before the flip may replay
-    ///   just after it (the replay is not a fan-out and is untouched).
-    /// - R3: a policy flap shorter than one parked-waiter slice is not seen.
-    /// - R4: a parked call past its post-wake recheck is in flight.
-    /// - R5: a fan-out that read the policy just before the flip may enqueue just
-    ///   after it; the read is taken inside the registry lock to keep that window to
-    ///   the loop body.
+    /// - Lines already queued in an agent sink may still be written. Nothing is
+    ///   purged, and the bound is the sink capacity. That includes the sink's own
+    ///   overflow `lagged` marker if an overflow happened before the pause.
+    /// - A `flow.subscribe {since}` that passed the gate just before the flip may
+    ///   replay just after it (a replay is not a fan-out).
+    /// - A fan-out that read the policy just before the flip may enqueue just after
+    ///   it.
+    /// - A call that passed the gate before the pause keeps running, and its reply
+    ///   is delivered (replies are never dropped). Work already started, such as an
+    ///   armed intercept or a running scan, is not stopped by a pause: only new
+    ///   calls, pushes and parked approvals are cut.
+    /// - `aitm tui` gives its agent server a private `AgentState`, so `agent.set`
+    ///   there reaches none of this. Muting and revocation apply only to servers
+    ///   that share the state (the `aitm web` pair do).
     fn fanout(
         &self,
-        pushes_muted: &dyn Fn() -> bool,
         wants: &dyn Fn(&Subscription) -> bool,
         line: &str,
+        pushes_muted: &dyn Fn() -> bool,
     ) {
         let mut guard = self.lock();
         let muted = pushes_muted();
@@ -538,16 +533,11 @@ impl Subscriptions {
                 }
                 continue;
             }
-            let marker = match st.gapped.iter().position(|c| *c == sub.conn_id) {
-                Some(at) => {
-                    st.gapped.swap_remove(at);
-                    Some(lagged_state_line())
-                }
-                None => None,
-            };
-            for out in marker.into_iter().chain(std::iter::once(line.to_string())) {
-                sub.sink.push(out);
+            if let Some(at) = st.gapped.iter().position(|c| *c == sub.conn_id) {
+                st.gapped.swap_remove(at);
+                sub.sink.push(lagged_state_line());
             }
+            sub.sink.push(line.to_string());
         }
     }
 
@@ -555,7 +545,7 @@ impl Subscriptions {
     /// through [`Subscriptions::fanout`]: an agent-role connection is not enqueued
     /// the line while `pushes_muted` says so.
     fn fanout_role(&self, role: Frontend, line: &str, pushes_muted: &dyn Fn() -> bool) {
-        self.fanout(pushes_muted, &|sub| sub.role == role, line);
+        self.fanout(&|sub| sub.role == role, line, pushes_muted);
     }
 
     /// Remove `sub_id` if it belongs to `conn_id`. Returns whether it existed.
@@ -581,7 +571,7 @@ impl Subscriptions {
     /// through [`Subscriptions::fanout`]: an agent-role connection is not enqueued
     /// the line while `pushes_muted` says so.
     fn fanout_flow(&self, flow: &Flow, line: &str, pushes_muted: &dyn Fn() -> bool) {
-        self.fanout(pushes_muted, &|sub| sub.filter.matches(flow), line);
+        self.fanout(&|sub| sub.filter.matches(flow), line, pushes_muted);
     }
 
     /// Push `line` to every subscribed connection (once each), regardless of
@@ -589,7 +579,7 @@ impl Subscriptions {
     /// [`Subscriptions::fanout`]: an agent-role connection is not enqueued the line
     /// while `pushes_muted` says so.
     fn fanout_state(&self, line: &str, pushes_muted: &dyn Fn() -> bool) {
-        self.fanout(pushes_muted, &|_sub| true, line);
+        self.fanout(&|_sub| true, line, pushes_muted);
     }
 }
 
@@ -711,11 +701,10 @@ fn needs_confirmation(prompt: &str, token: &str) -> JsonValue {
 const MAX_PARKED_REQUESTS: usize = 64;
 
 /// How often a parked waiter re-reads the agent policy while it waits for an
-/// operator. A parked call whose policy has left `ask` is therefore denied within
-/// one slice plus scheduling, not at the approval timeout (the G2(iii) bound).
-/// The cost is bounded: at most [`MAX_PARKED_REQUESTS`] waiters, each waking five
-/// times a second to do one atomic load. See `McpServer::park_for_approval` and
-/// `ParkSlot::wait`.
+/// operator. Short enough that a call whose policy has left `ask` is denied about
+/// one slice later rather than at the approval timeout, long enough to cost almost
+/// nothing: at most [`MAX_PARKED_REQUESTS`] waiters, each doing one atomic load
+/// five times a second. See `McpServer::park_for_approval` and `ParkSlot::wait`.
 const PARK_POLICY_RECHECK: Duration = Duration::from_millis(200);
 
 struct ParkedRequests {
@@ -764,27 +753,19 @@ impl ParkSlot {
         self.cv.notify_all();
     }
 
-    /// Block until the slot is resolved, `timeout` elapses, or the policy the call
-    /// was parked under stops holding. Never hangs (Review Focus #4).
+    /// Block until the slot is resolved, `timeout` elapses, or `still_ask` says the
+    /// policy the call was parked under no longer holds, whichever comes first.
     ///
-    /// The wait is cut into slices of at most `recheck`, the last one shortened to
-    /// the time remaining, so the total never exceeds `timeout`. The deadline is
-    /// computed once on entry. In order, each pass: (1) a resolved slot returns
-    /// [`ParkWait::Resolved`]; (2) no time left returns [`ParkWait::TimedOut`];
-    /// (3) wait on the condvar for one slice, while the slot is unresolved;
-    /// (4) a slot resolved meanwhile returns [`ParkWait::Resolved`]; (5) otherwise
-    /// `still_ask()` is asked and a `false` returns [`ParkWait::PolicyChanged`].
-    ///
-    /// `Resolved` always wins over `PolicyChanged`: the slot is checked before the
-    /// policy is, every time. The policy is not read before the first slice has run
-    /// (a call that was parked under `ask` is not second-guessed in the instant it
-    /// parks), so a flap shorter than one slice is invisible (residual R3).
-    /// `still_ask` must be lock-free: it runs with the slot's mutex held.
+    /// The wait is cut into slices of at most `recheck`, so the policy is read about
+    /// that often rather than only at the timeout. A resolved slot is checked before
+    /// the policy on every pass, so an approval that landed wins over a policy change
+    /// seen in the same pass. The policy is not read before the first slice has run
+    /// (a call is not second-guessed in the instant it parks), so a flap shorter than
+    /// one slice is not seen. `still_ask` must be lock-free: it runs with the slot's
+    /// mutex held. A `timeout` too large to matter, such as `Duration::MAX`, is
+    /// effectively unbounded and does not panic.
     fn wait(&self, timeout: Duration, recheck: Duration, still_ask: &dyn Fn() -> bool) -> ParkWait {
-        // `None` only for a timeout so large that it overflows `Instant`: then the
-        // wait is unbounded, as it always was for such a timeout, and only a
-        // resolve or a policy change ends it.
-        let deadline = Instant::now().checked_add(timeout);
+        let start = Instant::now();
         let mut state = self
             .state
             .lock()
@@ -793,10 +774,7 @@ impl ParkSlot {
             if let Some(allow) = *state {
                 return ParkWait::Resolved(allow);
             }
-            let remaining = match deadline {
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-                None => timeout,
-            };
+            let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 return ParkWait::TimedOut;
             }
@@ -897,9 +875,7 @@ enum ParkWait {
 /// cannot disagree. A parked request exists only under `ask`.
 ///
 /// An unknown future posture (`AgentPolicy` is `#[non_exhaustive]`) is not `Ask`,
-/// so it fails closed and denies the request. This is deliberately the opposite of
-/// [`agent_reads_allowed`], which lets an unknown posture through to match
-/// `read_refusal`.
+/// so it fails closed and denies the request, as [`agent_reads_allowed`] does.
 fn ask_still_in_force(policy: AgentPolicy) -> bool {
     policy == AgentPolicy::Ask
 }
@@ -1912,22 +1888,19 @@ impl McpServer {
     /// approval the caller runs the command as the agent; otherwise the agent call
     /// is refused with a clear reason.
     ///
-    /// The policy is live here, not a snapshot. The waiter blocks in slices of
-    /// `PARK_POLICY_RECHECK` and reads the policy after each, so a call whose policy
-    /// has left `ask` is denied within one slice plus scheduling, naming the change,
-    /// whether or not anyone approves. After the wait returns and the slot's guard is
-    /// released, the policy is read **again** and [`settle_park`] decides, so an
-    /// approval that landed just before the policy moved is denied rather than run.
-    /// Both reads go through `ask_still_in_force`, and the policy comes from the
-    /// shared [`AgentState`], so an `agent.set` on any server sharing it (the `aitm
-    /// web` `/bus` server and the primary) reaches this waiter.
+    /// The policy is live here, not a snapshot, because an approval is a grant for
+    /// the posture it was given under: once the policy has left `ask`, the call must
+    /// not run even if someone approves it. So the waiter re-reads the policy every
+    /// `PARK_POLICY_RECHECK` and once more after the wait returns (the slot's guard
+    /// already released), which catches an approval that landed just before a pause.
+    /// Both reads use `ask_still_in_force` over the shared [`AgentState`], so an
+    /// `agent.set` on any server sharing it reaches this waiter.
     ///
-    /// Accepted residuals, as in `Subscriptions::fanout`. R3: a policy flap shorter
-    /// than one `PARK_POLICY_RECHECK` slice is not seen (the state is one atomic
-    /// with no generation), so the request stays parked and any approval is applied
-    /// under the policy then in force. R4: a call that has passed its post-wake
-    /// recheck is in flight (argument coercion, then `invoke`), exactly like a call
-    /// that passed the gate; the window is microseconds.
+    /// Accepted: a policy flap shorter than one recheck slice is not seen (the state
+    /// is one atomic with no generation), so the request stays parked and an
+    /// approval is applied under the policy then in force. A call past its post-wake
+    /// recheck is in flight, like one that passed the gate; the window is
+    /// microseconds.
     fn park_for_approval(
         &self,
         cmd: &dyn Command,
@@ -2001,6 +1974,7 @@ impl McpServer {
             },
         })
         .to_string();
+        // Required by the fan-out, but trusted control is never muted, so it cannot suppress this.
         self.subscriptions
             .fanout_role(Frontend::Operator, &line, &|| self.agent_pushes_muted());
     }
@@ -2061,14 +2035,12 @@ impl McpServer {
     }
 
     /// The policy decision for a `Read` command (`flow.subscribe`/`unsubscribe`):
-    /// `Some(reason)` only when the agent policy is `Paused` (which refuses all) and
-    /// the role is not trusted control ([`Frontend::is_trusted_control`]), `None`
-    /// otherwise. Operator/CLI always pass.
+    /// `Some(reason)` when the role is not trusted control
+    /// ([`Frontend::is_trusted_control`]) and the live policy does not pass
+    /// `agent_reads_allowed`, `None` otherwise. Operator/CLI always pass.
     ///
-    /// This is the read-side half of the one predicate `agent_reads_allowed`; the
-    /// push side asks the same predicate through `McpServer::agent_pushes_muted`, so
-    /// a fresh subscribe is accepted exactly when a push would be delivered. The
-    /// refusal text is unchanged.
+    /// Pushes ask the same predicate through `McpServer::agent_pushes_muted`, so a
+    /// fresh subscribe is accepted exactly when a push would be delivered.
     fn read_refusal(&self, conn: &ConnCtx, name: &str) -> Option<String> {
         if conn.role.is_trusted_control() {
             return None;
@@ -2341,16 +2313,17 @@ fn is_operator_only(name: &str) -> bool {
 /// The one decision behind both "may an agent-role caller subscribe now"
 /// (`read_refusal`) and "does an agent-role subscription receive pushes now"
 /// (`McpServer::agent_pushes_muted`): a push is a read channel, so pushes are
-/// allowed to exactly the extent that reads are. `false` for `Paused`, `true` for
-/// every other value.
+/// allowed to exactly the extent that reads are.
 ///
-/// `true` includes an unknown future posture (`AgentPolicy` is
-/// `#[non_exhaustive]`). That fail-open is deliberate and is the one place this
-/// repo's "a future posture fails closed" doctrine is not followed: it is exactly
-/// what `read_refusal` always did, and the push side follows it so the two cannot
-/// drift. Whoever adds a variant decides its posture here, once.
+/// An allow-list of the four postures that are not `Paused`. `Paused` and any
+/// posture added later (`AgentPolicy` is `#[non_exhaustive]`) are refused, so this
+/// fails closed like `policy_decision` and `ask_still_in_force`. Whoever adds a
+/// variant must decide it here, once.
 fn agent_reads_allowed(policy: AgentPolicy) -> bool {
-    policy != AgentPolicy::Paused
+    matches!(
+        policy,
+        AgentPolicy::All | AgentPolicy::Auto | AgentPolicy::Ask | AgentPolicy::ReadOnly
+    )
 }
 
 /// The agent-policy gate's decision for one command (spec D2/D4).
@@ -2474,6 +2447,10 @@ fn flow_summary(flow: &Flow) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use aitm_core::{Body, ConnInfo, FlowMeta, HeaderMap, HttpVersion, InterceptState};
+    use aitm_plugins::AgentPlugin;
+    use std::sync::atomic::AtomicUsize;
 
     /// RF#5: the parked-request table refuses to park beyond its cap, so a flood
     /// of Sensitive `Ask` calls cannot grow the table (and the blocking pool)
@@ -2613,7 +2590,7 @@ mod tests {
         assert_eq!(probe(&probe_server()), json!("absent"));
     }
 
-    // ------------------- agent policy revocation, Task 1 (plan 2026-10-30)
+    // ------------------- agent policy revocation: the read refusal and the gap record
 
     /// A server whose agent policy is `policy`, with nothing else attached.
     fn revoke_server_under(policy: AgentPolicy) -> McpServer {
@@ -2664,8 +2641,6 @@ mod tests {
             );
         }
     }
-
-    use aitm_core::{Body, ConnInfo, FlowMeta, HeaderMap, HttpVersion, InterceptState};
 
     /// Insert a minimal HTTP flow into `store`; returns its id.
     fn revoke_insert_flow(store: &MemFlowStore) -> FlowId {
@@ -2750,7 +2725,7 @@ mod tests {
         );
     }
 
-    // ------------------- Tester additions (stage 5): the gap record's bounds
+    // ------------------- the gap record's bounds
 
     /// A server over `state` and a fresh store, with an empty registry (an
     /// unregistered verb is not schema-checked, so `flow.subscribe` is served by
@@ -2863,10 +2838,7 @@ mod tests {
         }
     }
 
-    // ------------------- agent policy revocation, Task 2 (plan 2026-10-30)
-
-    use aitm_plugins::AgentPlugin;
-    use std::sync::atomic::AtomicUsize;
+    // ------------------- agent policy revocation: parked requests follow the live policy
 
     /// A Sensitive stub (`demo.sensitive`) that counts how often it really ran, so a
     /// test can tell "the call was refused" from "the call ran and was reported".
@@ -3272,11 +3244,7 @@ mod tests {
         );
     }
 
-    // ------------- agent policy revocation, Task 2: Tester additions (stage 5)
-    //
-    // Edge cases, races and mutation killers for the parked-request path. Appended
-    // only; nothing above this banner was edited. Every test is in-process (threads
-    // and `std::sync::mpsc`, no ports) and every wait on another thread is bounded.
+    // ------------- parked-request edge cases and races (in-process, every wait bounded)
 
     /// A server under `policy` with the counting Sensitive stub, the real `agent.*`
     /// verbs, an operator subscription registered directly (so a Sensitive call can
@@ -4039,12 +4007,12 @@ mod tests {
         );
     }
 
-    /// `ParkSlot::wait` edges the Coder's test leaves open: (e) a resolve that wakes
-    /// the wait wins over a recheck that would say the policy moved; (f) a resolved
-    /// slot beats a zero timeout, and an unresolved zero timeout is `TimedOut` with
-    /// no recheck; (g) a timeout too large for `Instant` arithmetic does not panic and
-    /// is ended by the recheck or by a resolve; (h) the recheck runs on a cadence: not
-    /// once at the end, and not continuously.
+    /// `ParkSlot::wait` edge cases: (e) a resolve that wakes the wait wins over a
+    /// recheck that would say the policy moved; (f) a resolved slot beats a zero
+    /// timeout, and an unresolved zero timeout is `TimedOut` with no recheck; (g) a
+    /// timeout too large for `Instant` arithmetic does not panic and is ended by the
+    /// recheck or by a resolve; (h) the recheck runs on a cadence: not once at the
+    /// end, and not continuously.
     #[test]
     fn revoke_park_slot_wait_edge_cases() {
         // (e) The slice is 10 s and the recheck would say "moved"; a resolve from

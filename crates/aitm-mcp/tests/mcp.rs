@@ -22,6 +22,7 @@ use aitm_plugins::AgentPlugin;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
 // ---------------------------------------------------------------- fixtures
@@ -4187,13 +4188,7 @@ fn approve_role_gate_precedes_schema_for_the_agent() {
     );
 }
 
-// ===========================================================================
-// Agent policy revocation, Task 1 (plan 2026-10-30-agent-policy-revocation):
-// agent pushes follow the live policy. Everything below this banner is new and
-// appended only; no line above it was edited. All of it is in-process (no ports,
-// no runtime) and the tests carry the `revoke_push_` prefix, so
-// `cargo test -p aitm-mcp --test mcp revoke_push` selects exactly these.
-// ===========================================================================
+// ----------------------- agent policy revocation: pushes follow the live policy
 
 /// A registry holding the subscription verbs (so `flow.subscribe` has its
 /// published schema) and the real `agent.*` verbs over `state`.
@@ -4739,15 +4734,7 @@ fn revoke_push_queued_lines_are_not_purged() {
     );
 }
 
-// ===========================================================================
-// Agent policy revocation, Task 1: Tester additions (stage 5, appended only).
-// In-process, no ports. The `revoke_push_` prefix keeps them selected by the
-// sandbox filter. They reuse the `rv_*` rig above and pin edge cases the twelve
-// tests above do not: a burst of suppressed pushes, a connection dropped while it
-// has a gap, several subscriptions on one connection, repeated pause/resume
-// cycles, a full sink, a subscriber that joins after the gap, and odd
-// `push_state` payloads.
-// ===========================================================================
+// ----------- pushes under pause: bursts, drops, several subs, cycles, full sink, late join
 
 /// A burst of suppressed pushes records one gap, not one per push: after resume
 /// the first delivery carries exactly one marker and the next deliveries carry
@@ -5040,16 +5027,7 @@ fn revoke_push_odd_state_payloads_are_muted_for_agents_and_intact_for_operators(
     );
 }
 
-// ===========================================================================
-// Agent policy revocation, Task 2 (plan 2026-10-30-agent-policy-revocation):
-// parked requests follow the live policy. Everything below this banner is new
-// and appended only; no line above it was edited. All of it is in-process
-// (threads and `std::sync::mpsc`, no ports, no runtime) and the tests carry the
-// `revoke_park_` prefix, so `cargo test -p aitm-mcp --test mcp revoke_park`
-// selects exactly these. Every wait is bounded by `recv_timeout`, and a failing
-// run denies the parked request so no thread outlives the test by the approval
-// timeout.
-// ===========================================================================
+// ----------------------- agent policy revocation: parked requests follow the live policy
 
 /// A registry holding one Sensitive stub (`demo.sensitive`, which returns `"ran"`
 /// if the gate lets it through) and the real `agent.*` verbs over `state`.
@@ -5351,12 +5329,7 @@ fn revoke_park_cross_server_pause_denies_the_other_servers_call() {
     );
 }
 
-// ===========================================================================
-// Agent policy revocation, Task 2: Tester additions (stage 5). Appended only;
-// nothing above this banner was edited. In-process (threads and `std::sync::mpsc`,
-// no ports), `revoke_park_` prefix, every wait bounded by `recv_timeout` or a
-// capped poll, and a `RevokeRelease` guard denies the parked request on any panic.
-// ===========================================================================
+// ----------------- parked-request edge cases and races (in-process, every wait bounded)
 
 /// A waiter that was denied (for the policy change, and for a timeout) has removed
 /// its entry from the parked-request table, so a late `agent.approve`, either way, is
@@ -5637,16 +5610,7 @@ fn revoke_park_after_a_revocation_the_agent_can_reissue_under_a_fresh_id() {
     );
 }
 
-// ===========================================================================
-// Agent policy revocation, Task 3 (plan 2026-10-30-agent-policy-revocation):
-// the one real-socket test (AC18). Appended only; nothing above this banner was
-// edited. It binds `127.0.0.1:0`, so it runs from the Terminal panel, never the
-// sandbox. Its name starts `revoke_socket_`, which no in-process filter
-// (`revoke_push`, `revoke_park`) selects; its helpers are `RvSock` and
-// `rv_sock_*`, so a `revoke_socket` filter selects exactly the one test.
-// ===========================================================================
-
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+// ------------ agent policy revocation: the real-socket test, AC18 (binds a port)
 
 /// How long the socket test waits for a line or a reply it expects.
 const RV_SOCK_EXPECT: Duration = Duration::from_secs(5);
@@ -5992,19 +5956,7 @@ async fn revoke_socket_paused_agent_goes_quiet_and_resumes_with_a_marker() {
     );
 }
 
-// ===========================================================================
-// Agent policy revocation, Task 3, Tester additions (plan
-// 2026-10-30-agent-policy-revocation). Appended only. The real transport
-// (`serve_lines`: the read loop and the writer task that drains each sink) over
-// in-memory duplex streams, so these bind no port and run in the sandbox. The
-// in-process `revoke_push_*` tests above read `sink.drain()` and so bypass the
-// writer; AC18 covers the writer but only from the Terminal panel. These cover the
-// writer in the sandbox, with stricter stream assertions than AC18's, and the
-// edge cases the socket test does not reach: two agents, a connection that drops
-// mid-pause, a malformed line and a refused call while muted. Their names start
-// `revoke_push_`, so the `revoke_push` filter selects them and `revoke_socket`
-// does not.
-// ===========================================================================
+// ------------ pushes through the real writer over in-memory duplex streams (no port)
 
 type RvTask = tokio::task::JoinHandle<anyhow::Result<()>>;
 
@@ -6154,14 +6106,13 @@ async fn rv_wire_set_policy(op: &mut RvWire, id: u64, policy: &str) {
     );
 }
 
-/// Tester addition, strengthening AC18 and runnable in the sandbox: two agents A1
-/// and A2 and an operator O over the real writer. Under `paused` a burst (two flow
-/// pushes and a state push) reaches O in full and reaches neither agent, which
-/// receive exactly their own replies and nothing else (the whole stream is
-/// compared, not only "no F2"). On resume each agent gets exactly
-/// `[marker, agent.set audit, F4]`: one marker per connection, in front of its own
-/// first post-gap line, and none of the suppressed pushes. O is never marked and
-/// receives every push in order.
+/// Strengthens AC18 and runs in the sandbox: two agents A1 and A2 and an operator
+/// O over the real writer. Under `paused` a burst (two flow pushes and a state
+/// push) reaches O in full and reaches neither agent, which receive exactly their
+/// own replies and nothing else (the whole stream is compared, not only "no F2").
+/// On resume each agent gets exactly `[marker, agent.set audit, F4]`: one marker
+/// per connection, in front of its own first post-gap line, and none of the
+/// suppressed pushes. O is never marked and receives every push in order.
 ///
 /// Why `rv_flow` is a fence here: it runs the fan-out synchronously, so when it
 /// returns each agent's sink already holds whatever it was going to hold. O is
@@ -6295,13 +6246,13 @@ async fn revoke_push_real_writer_two_agents_pause_quiet_then_one_marker_each() {
     );
 }
 
-/// Tester addition, edge case: a connection dropped mid-stream. Agent A1 is gapped
-/// by a push under `paused` and then disconnects while the policy is still
-/// `paused`. The transport must sweep its subscription (A1's sink is closed and
-/// stays empty through the rest of the test, including after resume, when a
-/// leaked subscription would be handed the marker and the next flow), and the
-/// surviving agent A2 and the operator O must be undisturbed: A2 stays quiet,
-/// then gets exactly one marker in front of its own first post-gap line.
+/// A connection dropped mid-stream. Agent A1 is gapped by a push under `paused`
+/// and then disconnects while the policy is still `paused`. The transport must
+/// sweep its subscription (A1's sink is closed and stays empty through the rest of
+/// the test, including after resume, when a leaked subscription would be handed
+/// the marker and the next flow), and the surviving agent A2 and the operator O
+/// must be undisturbed: A2 stays quiet, then gets exactly one marker in front of
+/// its own first post-gap line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_push_an_agent_dropping_while_paused_leaves_the_others_intact() {
     let RvRig { srv, store, .. } = RvRig::new(AgentPolicy::Auto);
@@ -6394,13 +6345,13 @@ async fn revoke_push_an_agent_dropping_while_paused_leaves_the_others_intact() {
     );
 }
 
-/// Tester addition, edge case: malformed input and a refused call while muted.
-/// The mute is about pushes only. A paused agent's replies ride a different lane
-/// and must keep flowing: a malformed line gets its parse error, a command gets the
-/// policy refusal, a `ping` gets `{}`. If muting were ever done in the writer
-/// instead of at the fan-out (a rejected design) these replies would stop and the
-/// agent would hang. Meanwhile the agent receives no push (no line with a
-/// `method`), and on resume its first push is the marker.
+/// Malformed input and a refused call while muted. The mute is about pushes only.
+/// A paused agent's replies ride a different lane and must keep flowing: a
+/// malformed line gets its parse error, a command gets the policy refusal, a
+/// `ping` gets `{}`. If muting were ever done in the writer instead of at the
+/// fan-out (a rejected design) these replies would stop and the agent would hang.
+/// Meanwhile the agent receives no push (no line with a `method`), and on resume
+/// its first push is the marker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_push_a_paused_agent_still_gets_every_reply_but_no_push() {
     let RvRig { srv, store, .. } = RvRig::new(AgentPolicy::Auto);
