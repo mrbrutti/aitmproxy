@@ -139,32 +139,37 @@ extension ClientInfo {
         self.init(name: ClientInfo.displayName(forSourceApp: identifier), bundleID: identifier)
     }
 
-    /// The name shown for a source-app identifier: `knownSourceApps` first; else the text
-    /// after the last `.`, casing kept as sent (`com.apple.curl` → `curl`,
-    /// `com.apple.Safari` → `Safari`); with no `.`, or nothing after the last one
-    /// (`trailing.`), the whole identifier.
+    /// The name shown for a source-app identifier. Rule: `knownSourceApps` first; else
+    /// control and format characters (Unicode categories Cc and Cf: C0/C1 controls, bidi
+    /// overrides, zero-width marks) are removed from a copy — `bundleID` keeps the raw
+    /// text; then the text after the last `.`, casing kept as sent (`com.apple.curl` →
+    /// `curl`, `com.apple.Safari` → `Safari`); with no `.`, or nothing after the last one
+    /// (`trailing.`), the whole cleaned identifier; if nothing printable is left,
+    /// `unnamedSourceApp`.
     public static func displayName(forSourceApp identifier: String) -> String {
         if let known = knownSourceApps[identifier] { return known }
         // The identifier is signer-chosen text: strip C0/C1 controls and Unicode bidi
         // formatting characters from what is SHOWN (never from `bundleID`), so a name
         // cannot carry an RTL override or a control sequence into the sidebar.
         let shown = Self.withoutControlAndBidi(identifier)
-        guard !shown.isEmpty else { return "unknown app" }
+        guard !shown.isEmpty else { return unnamedSourceApp }
         guard let dot = shown.lastIndex(of: ".") else { return shown }
         let tail = shown[shown.index(after: dot)...]
         return tail.isEmpty ? shown : String(tail)
     }
 
-    /// `text` without C0/C1 control characters and the Unicode bidi formatting
-    /// characters (U+061C, U+200E/F, U+202A–U+202E, U+2066–U+2069).
-    static func withoutControlAndBidi(_ text: String) -> String {
-        String(text.unicodeScalars.filter { scalar in
-            let v = scalar.value
-            if v < 0x20 || (0x7F...0x9F).contains(v) { return false }
-            if v == 0x061C || v == 0x200E || v == 0x200F { return false }
-            if (0x202A...0x202E).contains(v) || (0x2066...0x2069).contains(v) { return false }
-            return true
-        }.map(Character.init))
+    /// Shown when an identifier has no printable character left after cleaning.
+    public static let unnamedSourceApp = "unknown app"
+
+    /// `text` without control (Cc) and format (Cf) characters — the C0/C1 controls and
+    /// the bidi overrides, marks and zero-width characters that could disguise a name.
+    private static func withoutControlAndBidi(_ text: String) -> String {
+        String(String.UnicodeScalarView(text.unicodeScalars.filter { scalar in
+            switch scalar.properties.generalCategory {
+            case .control, .format: return false
+            default: return true
+            }
+        }))
     }
 }
 

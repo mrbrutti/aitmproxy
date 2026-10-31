@@ -233,8 +233,8 @@ impl CoreIngress {
             // The attribution the backend observed rides the hint to the claiming
             // module, which stamps it on the flows it stores. Copied, not interpreted:
             // the identity is data about the client, never a scope input.
-            peer_identity: flow.peer_identity.take(),
-            capture_interface: Some(flow.interface.clone()),
+            peer_identity: flow.peer_identity,
+            capture_interface: Some(flow.interface),
         };
 
         match sd.modules.iter().find(|m| m.matches(&hint)).cloned() {

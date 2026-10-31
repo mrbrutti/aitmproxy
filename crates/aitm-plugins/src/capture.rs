@@ -217,8 +217,8 @@ fn opt_int(n: Option<i64>) -> Value {
 /// An optional attribution string as a `Value`: the text a capture backend
 /// recorded (`FlowMeta::source_app`, `FlowMeta::capture_interface`), or `Null`
 /// for a proxied flow. Never a placeholder: a UI must not show a fake app group.
-fn opt_str(v: &Option<String>) -> Value {
-    v.as_ref().map_or(Value::Null, |s| Value::Str(s.clone()))
+fn opt_str(v: Option<&str>) -> Value {
+    v.map_or(Value::Null, |s| Value::Str(s.to_owned()))
 }
 
 /// A transport-neutral summary of a flow: identity, timing, capture attribution
@@ -234,10 +234,10 @@ fn summarize(flow: &Flow) -> Value {
     put("id", Value::Str(flow.id().to_string()));
     put("started_at", opt_int(flow.metadata().started_at_ms()));
     put("duration_ms", opt_int(flow.metadata().duration_ms()));
-    put("source_app", opt_str(&flow.metadata().source_app));
+    put("source_app", opt_str(flow.metadata().source_app.as_deref()));
     put(
         "capture_interface",
-        opt_str(&flow.metadata().capture_interface),
+        opt_str(flow.metadata().capture_interface.as_deref()),
     );
     match flow {
         Flow::Http(f) => {
@@ -392,10 +392,10 @@ fn flow_row(flow: &Flow) -> Value {
         ),
     );
     put("duration_ms", opt_int(flow.metadata().duration_ms()));
-    put("source_app", opt_str(&flow.metadata().source_app));
+    put("source_app", opt_str(flow.metadata().source_app.as_deref()));
     put(
         "capture_interface",
-        opt_str(&flow.metadata().capture_interface),
+        opt_str(flow.metadata().capture_interface.as_deref()),
     );
     match flow {
         Flow::Http(f) => {

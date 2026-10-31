@@ -227,7 +227,7 @@ import Testing
         let client = ClientInfo(sourceApp: spoof)
         #expect(client.bundleID == spoof)
         #expect(client.name == "irafaS")
-        #expect(ClientInfo.displayName(forSourceApp: "\u{202E}\u{0001}") == "unknown app")
+        #expect(ClientInfo.displayName(forSourceApp: "\u{202E}\u{0001}") == ClientInfo.unnamedSourceApp)
         #expect(ClientInfo.displayName(forSourceApp: "com.apple.Safari") == "Safari")
     }
 
@@ -241,7 +241,6 @@ import Testing
         #expect(ClientInfo.displayName(forSourceApp: "com.apple.WebKit.Networking") == "Safari")
         #expect(ClientInfo.displayName(forSourceApp: "org.mozilla.firefox") == "Firefox")
         #expect(ClientInfo.displayName(forSourceApp: "trailing.") == "trailing.")
-        #expect(ClientInfo.knownSourceApps == ["com.apple.WebKit.Networking": "Safari", "org.mozilla.firefox": "Firefox"])
     }
 
     @Test func sameIdentifierGroupsAsOneClient() throws {

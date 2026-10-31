@@ -84,12 +84,11 @@ impl ProtocolModule for WsModule {
 /// inherited, so the conversation is attributed to the same client process and
 /// backend as the 101 that opened it. Marks, comment, replay flag and timing are
 /// the WebSocket flow's own and start fresh.
-pub(crate) fn inherit_attribution(handshake: &FlowMeta) -> FlowMeta {
-    FlowMeta {
-        source_app: handshake.source_app.clone(),
-        capture_interface: handshake.capture_interface.clone(),
-        ..FlowMeta::default()
-    }
+fn inherit_attribution(handshake: &FlowMeta) -> FlowMeta {
+    FlowMeta::with_attribution(
+        handshake.source_app.clone(),
+        handshake.capture_interface.clone(),
+    )
 }
 
 /// Relay frames between the client and the already-upgraded upstream,

@@ -35,9 +35,10 @@ pub trait ProtocolModule: Send + Sync {
     fn spawn(&self, io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>>;
 }
 
-/// What the acceptor peeks before choosing a module. On an upgrade hand-off
-/// `from_upgrade` is `true` and `alpn` names the upgraded protocol
-/// (`"websocket"`).
+/// What is known about a connection before a module is chosen: the bytes and TLS
+/// facts the acceptor peeks, and — from a capture backend — the client's attribution.
+/// On an upgrade hand-off `from_upgrade` is `true` and `alpn` names the upgraded
+/// protocol (`"websocket"`).
 #[derive(Debug, Clone)]
 pub struct NextLayerHint {
     pub dst: SocketAddr,
@@ -51,7 +52,7 @@ pub struct NextLayerHint {
     /// The signing identifier of the process that opened the client connection, as
     /// a capture backend observed it. `None` on the explicit-proxy path; set by a
     /// capture ingress. Backend-supplied text about a client: carried as data, never
-    /// a scope or guard input.
+    /// a scope or guard input. Stored on the flow as `FlowMeta::source_app`.
     pub peer_identity: Option<String>,
     /// The capture backend that delivered the client connection (its interface
     /// name, `"macos-ne"`). `None` on the explicit-proxy path; set by a capture

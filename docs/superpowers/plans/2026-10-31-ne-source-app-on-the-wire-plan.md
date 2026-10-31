@@ -265,6 +265,18 @@ Kept by the main session during stage 6. One row per finding.
 | all | Spec | Minor | Branch is `fix/ne-source-app`, plan said `feat/ne-source-app-on-the-wire` | ACCEPTED: cosmetic |
 | all | Spec | Minor | Tester additions were uncommitted and two files (`session_roundtrip.rs`, the e2e cell) are outside the plan's list | FIXED — committed as 4584310 (`test(...)`); the e2e cell is the plan's own stage-5 end-to-end check |
 | 0 | Security (note) | Info | Tunnelled (passthrough) NE flows and `client.rs` flows build `FlowMeta` without attribution and report null/null | ACCEPTED as follow-up: pass the hint's values through the passthrough module when the Apps page needs tunnelled flows grouped |
+| all | Quality (stage 6) | — | PASS: plumbing shape right (`String` interface matches the L4 types; ingress stays backend-agnostic), all three `Conn` sites via one helper incl. h2, WS reads the stored handshake, push/pull lock sufficient, every seam pinned by a literal test, tester touched no production line | — |
+| 0 | Quality | Minor | The attribution-only `FlowMeta` was hand-built in two crates (HTTP `flow_meta`, WS `inherit_attribution`) | FIXED — `FlowMeta::with_attribution(source_app, capture_interface)` in aitm-core; both helpers call it; `inherit_attribution` is now private |
+| 0 | Quality | Minor | One concept, two names (`NextLayerHint.peer_identity` ↔ `FlowMeta.source_app`) | ACCEPTED (architect's D2 kept the pre-existing `CapturedTcpFlow.peer_identity`); FIXED the readability half: both docs cross-reference each other |
+| 0 | Quality | Minor | `NextLayerHint` header doc said only "what the acceptor peeks" | FIXED — names the capture-backend attribution too |
+| 0 | Quality | Minor | `dispatch_tcp` used `take()` + `clone()` where moves read better | FIXED — plain moves |
+| 1 | Quality | Minor | `opt_str(&Option<String>)` | FIXED — `opt_str(Option<&str>)` with `as_deref()` callers |
+| 3 | Quality | Minor | Kit test asserted the `knownSourceApps` literal against itself | FIXED — line removed; the seven behaviour cases remain |
+| 3 | Quality | Minor | `knownSourceApps` is `public` with no consumer outside the Kit | ACCEPTED — spec D5 writes `public static let`; the Status/UX session may read it |
+| 3 | Quality | Minor | Sanitiser: hand-listed code points, non-private helper, inline fallback literal, rule doc stale | FIXED — filters Unicode categories Cc and Cf (covers ZWSP/WJ/BOM too), `private`, `ClientInfo.unnamedSourceApp`, `displayName` doc states the four-step rule |
+| 0 | Quality | Minor | `MAX_SOURCE_APP_BYTES` was `pub(crate)` with no other user; test drove `tcp_flow` ×4 and skipped the UDP caller; doc cited "security review" | FIXED — plain `const`, test calls `bounded_source_app` directly + one `tcp_flow` wiring check, doc states the reason |
+| all | Quality | Minor | e2e cell copies `env_core`/`collect_until` helpers from a sibling cell and reaches `BusClient` privates | ACCEPTED as follow-up: lift them into `aitm_e2e` (pre-existing pattern across six cells) |
+| all | Quality | Minor | Tester's `read_one_200` re-implements `read_status_response_keep` for a generic stream; `test_ca` leaks a temp dir per run | ACCEPTED as follow-up (test-only): widen `read_status_response_keep<S: AsyncRead>` and add a `Drop` guard |
 
 ## Shipped
 

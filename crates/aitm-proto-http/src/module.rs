@@ -535,11 +535,7 @@ impl Conn {
     /// attribution is carried over; marks, comment, replay flag and timing are
     /// the flow's own.
     pub(crate) fn flow_meta(&self) -> FlowMeta {
-        FlowMeta {
-            source_app: self.source_app.clone(),
-            capture_interface: self.capture_interface.clone(),
-            ..FlowMeta::default()
-        }
+        FlowMeta::with_attribution(self.source_app.clone(), self.capture_interface.clone())
     }
 }
 
