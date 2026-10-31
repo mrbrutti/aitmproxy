@@ -6,6 +6,7 @@
 // notifications may send the client model directly; both are accepted. Missing stays null.
 
 import { base64ToBytes } from '~/lib/bytes';
+import type { AgentNotification } from '~/bus/types';
 import type {
   Body,
   Client,
@@ -287,4 +288,53 @@ export function toDetail(raw: unknown, seqFallback: number): FlowDetail {
         }
       : null,
   };
+}
+
+/** Epoch ms (the server) or an ISO string (the fixture bus) to ISO; anything else is now. */
+function isoOf(v: unknown): string {
+  const n = num(v);
+  if (n !== null) {
+    try {
+      return new Date(n).toISOString();
+    } catch {
+      // Out of Date's range: not a timestamp we can show.
+    }
+  }
+  return str(v) ?? new Date().toISOString();
+}
+
+/** The audit `args` is redacted JSON text; an object or array is shown structured, anything else as the text it is. */
+function argsOf(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  try {
+    const parsed: unknown = JSON.parse(v);
+    return parsed !== null && typeof parsed === 'object' ? parsed : v;
+  } catch {
+    return v;
+  }
+}
+
+/**
+ * One audit line (`notifications/aitm/agent`, `agent.activity`) to the Activity model. Accepts the
+ * server's wire shape (crates/aitm-core/src/audit.rs) and the fixture bus's model shape alike.
+ * Returns null for what is not an audit entry: an `approval_requested` line (it carries `event`)
+ * or a line without a command.
+ */
+export function toAgentEntry(raw: unknown): AgentNotification | null {
+  const r = rec(raw);
+  if (r.event !== undefined) return null;
+  const command = str(r.command);
+  const origin = str(r.origin);
+  if (!command || !origin) return null;
+  const detail = str(rec(r.result).error) ?? str(r.detail);
+  const out: AgentNotification = {
+    origin: origin as AgentNotification['origin'],
+    command,
+    result: r.result === 'ok' ? 'ok' : 'error',
+    at: isoOf(r.at),
+  };
+  if ('client_label' in r || 'clientLabel' in r) out.clientLabel = str(r.client_label ?? r.clientLabel);
+  if (r.args !== undefined) out.args = argsOf(r.args);
+  if (detail !== null) out.detail = detail;
+  return out;
 }

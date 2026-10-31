@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ActivityEntry } from '~/state/app';
-import { atMs, filterActivity, fullArgs, originLabel, summarizeArgs } from './activity';
+import { UI_BACKGROUND_READS, atMs, filterActivity, fullArgs, isUiPollNoise, originLabel, ownOriginOf, summarizeArgs } from './activity';
 
 const entry = (seq: number, p: Partial<ActivityEntry> = {}): ActivityEntry => ({
   seq,
@@ -62,5 +62,66 @@ describe('summarizeArgs / fullArgs / labels', () => {
     expect(originLabel('web')).toBe('web');
     expect(atMs({ at: '2026-10-27T10:00:00.000Z' })).toBe(Date.parse('2026-10-27T10:00:00.000Z'));
     expect(atMs({ at: 'garbage' })).toBeNull();
+  });
+});
+
+// The flood rule (push spec D7): a line is this UI's own background read, and dropped, only when
+// it succeeded, names one of the reads the UI issues on timers, and came from us — labelled
+// `aitm-web`, or unlabelled (the bridge does not label its connections) from our own origin.
+describe('isUiPollNoise / ownOriginOf', () => {
+  const own = { origin: 'operator' } as const;
+  const ownRead = { origin: 'operator', clientLabel: null, command: 'flow.list', result: 'ok' } as const;
+
+  it('isUiPollNoise matrix', () => {
+    // (1) our origin, unlabelled, a successful background read: noise.
+    expect(isUiPollNoise(ownRead, own)).toBe(true);
+    // (2) the label absent rather than null is the same thing.
+    expect(isUiPollNoise({ origin: 'operator', command: 'flow.list', result: 'ok' }, own)).toBe(true);
+    // (3) a labelled bridge would say `aitm-web`: ours from any origin.
+    expect(isUiPollNoise({ origin: 'mcp', clientLabel: 'aitm-web', command: 'flow.detail', result: 'ok' }, own)).toBe(true);
+    // (4) an action from our origin is what the panel exists to show.
+    expect(isUiPollNoise({ ...ownRead, command: 'flow.kill' }, own)).toBe(false);
+    // (5) a failing poll is signal.
+    expect(isUiPollNoise({ ...ownRead, result: 'error' }, own)).toBe(false);
+    // (6) a real agent labels itself; never ours.
+    expect(isUiPollNoise({ origin: 'mcp', clientLabel: 'claude-code', command: 'flow.list', result: 'ok' }, own)).toBe(false);
+    // (7) an unlabelled read from another origin is somebody else's.
+    expect(isUiPollNoise({ origin: 'mcp', clientLabel: null, command: 'flow.list', result: 'ok' }, own)).toBe(false);
+    // (8) an unknown own origin matches nothing by origin.
+    expect(isUiPollNoise(ownRead, { origin: null })).toBe(false);
+    // (9) …but when we run on the agent token, our origin is `mcp`.
+    expect(isUiPollNoise({ origin: 'mcp', clientLabel: null, command: 'flow.list', result: 'ok' }, { origin: 'mcp' })).toBe(true);
+    // (10) another frontend's polling is that frontend's activity.
+    expect(isUiPollNoise({ ...ownRead, clientLabel: 'aitm-mac' }, own)).toBe(false);
+    // Every background read is covered; a navigation is an action.
+    for (const command of UI_BACKGROUND_READS) expect(isUiPollNoise({ ...ownRead, command }, own), command).toBe(true);
+    expect(isUiPollNoise({ ...ownRead, command: 'browser.navigate' }, own)).toBe(false);
+    expect([...UI_BACKGROUND_READS].sort()).toEqual(
+      [
+        'flow.list',
+        'flow.get',
+        'flow.detail',
+        'proxy.status',
+        'agent.status',
+        'agent.activity',
+        'scope.list',
+        'poc.list',
+        'l4.flow.list',
+        'l4.flow.get',
+        'l4.scope.list',
+        'l4.capture.status',
+        'l4.agent.status',
+        'l4.intercept.status',
+        'l4.intercept.list',
+        'browser.tabs',
+        'browser.screenshot',
+      ].sort(),
+    );
+  });
+
+  it('ownOriginOf maps roles', () => {
+    expect(ownOriginOf('operator')).toBe('operator');
+    expect(ownOriginOf('agent')).toBe('mcp');
+    expect(ownOriginOf(null)).toBeNull();
   });
 });

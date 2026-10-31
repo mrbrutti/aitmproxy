@@ -2,7 +2,7 @@
 // branch (crates/aitm-plugins/src/{capture,detail,meta}.rs): if the core changes, change this.
 import { describe, expect, it } from 'vitest';
 import { bytesToBase64, utf8Encode } from '~/lib/bytes';
-import { toDetail, toSummary } from './normalize';
+import { toAgentEntry, toDetail, toSummary } from './normalize';
 
 const b64 = (s: string) => bytesToBase64(utf8Encode(s));
 
@@ -147,5 +147,60 @@ describe('toDetail (bus flow.detail)', () => {
     expect(fx.request.body.text).toBe('hi');
     expect(fx.request.headers[0]).toEqual({ name: 'a', value: 'b' });
     expect(fx.client.name).toBe('curl');
+  });
+});
+
+// The audit line the server pushes on `notifications/aitm/agent` and returns from `agent.activity`
+// (crates/aitm-core/src/audit.rs): `at` epoch ms, `client_label`, `args` a redacted JSON string,
+// `result` `"ok"` or `{error}`. The fixture bus sends the UI model directly.
+describe('toAgentEntry (audit line)', () => {
+  const wire = { at: 1730000000000, origin: 'mcp', client_label: 'claude-code', command: 'flow.replay', args: '{"id":"f_1"}', result: 'ok' };
+
+  it('maps the server shape', () => {
+    expect(toAgentEntry(wire)).toStrictEqual({
+      at: '2024-10-27T03:33:20.000Z',
+      origin: 'mcp',
+      clientLabel: 'claude-code',
+      command: 'flow.replay',
+      args: { id: 'f_1' },
+      result: 'ok',
+    });
+    // An unlabelled connection (the bridge today) keeps the explicit null, so own-ness can be inferred.
+    expect(toAgentEntry({ ...wire, client_label: null })?.clientLabel).toBeNull();
+  });
+
+  it('maps an error result', () => {
+    const e = toAgentEntry({ ...wire, result: { error: 'refused: x' } });
+    expect(e?.result).toBe('error');
+    expect(e?.detail).toBe('refused: x');
+    // An already-model error (fixture bus) stays as it is.
+    const model = toAgentEntry({ origin: 'cli', command: 'scope.add', result: 'error', detail: 'refused', at: '2024-10-27T03:33:20.000Z' });
+    expect(model?.result).toBe('error');
+    expect(model?.detail).toBe('refused');
+  });
+
+  it('keeps unparseable args as text', () => {
+    expect(toAgentEntry({ ...wire, args: '{"id":"f_' })?.args).toBe('{"id":"f_');
+    // A JSON scalar is not an args object either; the redacted text stays as text.
+    expect(toAgentEntry({ ...wire, args: '"f_1"' })?.args).toBe('"f_1"');
+  });
+
+  it('accepts the fixture model', () => {
+    const fx = { origin: 'web', command: 'flow.kill', args: { id: 'f_2' }, result: 'ok', at: '2024-10-27T03:33:20.000Z' };
+    const e = toAgentEntry(fx);
+    expect(e?.origin).toBe('web');
+    expect(e?.args).toEqual({ id: 'f_2' });
+    expect(e?.at).toBe('2024-10-27T03:33:20.000Z');
+    expect(e?.command).toBe('flow.kill');
+    expect(e?.result).toBe('ok');
+  });
+
+  it('rejects non-audit lines', () => {
+    // The operator-role approval request rides the same notification but is not an audit entry.
+    expect(toAgentEntry({ event: 'approval_requested', command: 'ca.install', args_summary: '{}', prompt: 'x', request_id: 'apr_1' })).toBeNull();
+    expect(toAgentEntry({ origin: 'mcp', result: 'ok' })).toBeNull();
+    expect(toAgentEntry({ ...wire, command: '' })).toBeNull();
+    expect(toAgentEntry(null)).toBeNull();
+    expect(toAgentEntry('flow.list')).toBeNull();
   });
 });
