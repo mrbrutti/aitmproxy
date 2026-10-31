@@ -176,6 +176,14 @@ async fn run() -> anyhow::Result<()> {
         .scripts
         .extend(script_args.into_iter().map(ScriptEntry::new));
 
+    // Ship-by-default detection catalogue (scripts/bundled → share/aitm/scripts):
+    // passive OWASP/vuln detectors plus operator-invoked active/L4 command scripts.
+    // Appended last and deduped by path, so a config `scripts:`, `AITM_SCRIPTS`,
+    // or `--script` entry naming the same file wins (the bundled copy is skipped);
+    // observe-only passives keep deny-by-default. `AITM_NO_BUNDLED_SCRIPTS` turns
+    // the whole catalogue off, `AITM_BUNDLED_SCRIPTS` points it at another dir.
+    aitm::bundled::apply(&mut rhai_cfg, |k| std::env::var(k).ok());
+
     // The tier is built before the proxy — a script compiles against the shared
     // engine, and the engine's host verbs close over these handles — so they are
     // bound to the proxy's real ones below, before anything is served.
