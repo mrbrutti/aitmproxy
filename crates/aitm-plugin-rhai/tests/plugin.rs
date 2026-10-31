@@ -613,7 +613,8 @@ async fn on_response_headers_mutation_still_applies() {
 }
 
 /// AC5: `on_response` stays fully usable as an observe-only hook — reading the
-/// response, marking, and commenting all run without error.
+/// response, marking, commenting, and `halt()` all run without error (none of
+/// these touch the client-bound response, so none is gated by the phase).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn on_response_observe_only_is_allowed() {
     let h = Harness::default(
@@ -621,6 +622,7 @@ async fn on_response_observe_only_is_allowed() {
             if flow.response.status == 200 {
                 flow.mark("ok");
                 flow.comment = flow.response.body;
+                halt();
             }
         }"#,
     );
@@ -628,14 +630,21 @@ async fn on_response_observe_only_is_allowed() {
 
     let verdict = h.dispatch(Event::Response(id)).await;
 
-    assert_eq!(verdict, Verdict::Continue);
+    // `halt()` is an observe-only control action, not a response mutation, so it
+    // still short-circuits the chain from `on_response`.
+    assert_eq!(verdict, Verdict::Halt);
     let flow = h.flow(id);
     let f = http(&flow);
     assert_eq!(f.metadata.marks, vec!["ok".to_string()]);
     assert_eq!(f.metadata.comment.as_deref(), Some("upstream-body"));
+    assert_eq!(
+        f.response.as_ref().expect("response present").status,
+        200,
+        "observe-only must not change the response"
+    );
     assert!(
         h.probe.errors().is_empty(),
-        "reading the response and marking must not error: {:?}",
+        "reading the response, marking, commenting, and halt() must not error: {:?}",
         h.probe.errors()
     );
 }

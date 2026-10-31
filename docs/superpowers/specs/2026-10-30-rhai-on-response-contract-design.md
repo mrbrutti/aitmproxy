@@ -106,6 +106,18 @@ edit.
     observe-only; editing the response here is refused — mutate in
     `on_response_headers`.
 
+**One nuance (uniform by design):** on the normal streamed path `Event::Response`
+is strictly post-forward. On the HTTP/1 plugin-answered *short-circuit* path
+(`module.rs` ~579-588, a request answered by `set_response` in a request-phase
+hook) `Event::Response` is emitted just *before* the committed response is
+flushed, so a response edit in `on_response` there could technically still be
+read back. The contract refuses it there too, on purpose: one rule the author can
+rely on ("mutate in `on_response_headers`, observe in `on_response`") is better
+than a path-dependent one that works only after a short-circuit. The refusal is
+fail-closed and `on_response_headers` fires on that path as well, so nothing is
+lost. The error wording says "committed to the client" rather than "forwarded" to
+stay accurate for both paths.
+
 **Why the setter, not the apply step:** throwing at the setter points the error
 at the exact offending line, fires immediately, and flows through the existing
 hook-error path with zero new control flow. It is the same shape as the existing

@@ -167,7 +167,7 @@
     {
       "name": "on_response",
       "signature": "on_response(flow)",
-      "description": "Fires on the Response event, once the full response is available. Observe-only: the response has already been forwarded to the client, so editing flow.response here is refused -- read it, mark, comment, or record findings, and mutate the response in on_response_headers.",
+      "description": "Fires on the Response event, once the full response is available. Observe-only: the response is already committed to the client, so editing flow.response here is refused -- read it, mark, comment, or record findings, and mutate the response in on_response_headers.",
       "snippet": "fn on_response(flow) {\n    $0\n}"
     },
     {

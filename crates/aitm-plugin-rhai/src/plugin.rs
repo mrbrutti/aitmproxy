@@ -382,9 +382,10 @@ impl LoadedScript {
         blocking(|| {
             let _run = begin_run(RunKind::Hook, self.budget);
             let _active = ActiveFlow::enter(Arc::clone(state));
-            // on_response fires post-forward: enter the observe-only response phase
-            // so a response write in it is refused loudly, not silently dropped.
-            let _phase = response_forwarded.then(ResponsePhase::forwarded);
+            // Enter this hook's response phase (always, like `ActiveFlow`): for
+            // on_response it is the observe-only post-forward phase, so a response
+            // write is refused loudly; every other hook enters the writable phase.
+            let _phase = ResponsePhase::enter(response_forwarded);
             let _seed = seed_call_context(authoring, Some(tag), source);
             self.engine
                 .call_fn_with_options::<Dynamic>(

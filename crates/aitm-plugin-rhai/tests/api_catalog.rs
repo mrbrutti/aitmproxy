@@ -266,6 +266,42 @@ async fn diff_rejects_a_mutated_catalog() {
     );
 }
 
+/// The `hooks` section is excluded from the engine bijection above (hooks are
+/// author-defined, not host callables), so this pins the one piece of hook
+/// documentation the on_response contract depends on: `on_response` must read as
+/// observe-only and name `on_response_headers`, and `on_response_headers` must
+/// read as the response-mutation hook. A silent revert of either description fails
+/// here (spec AC7).
+#[test]
+fn hook_catalog_documents_the_on_response_contract() {
+    let text = std::fs::read_to_string(catalog_path()).expect("the catalog is readable");
+    let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("the catalog is valid JSON");
+    let hooks = doc
+        .get("hooks")
+        .and_then(serde_yaml::Value::as_sequence)
+        .expect("the catalog has a hooks array");
+    let description = |name: &str| -> String {
+        hooks
+            .iter()
+            .find(|h| h.get("name").and_then(|v| v.as_str()) == Some(name))
+            .and_then(|h| h.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("hook `{name}` is in the catalog"))
+            .to_lowercase()
+    };
+
+    let on_response = description("on_response");
+    assert!(
+        on_response.contains("observe-only") && on_response.contains("on_response_headers"),
+        "on_response must be documented as observe-only and name on_response_headers: {on_response:?}"
+    );
+    let on_response_headers = description("on_response_headers");
+    assert!(
+        on_response_headers.contains("mutate") || on_response_headers.contains("replace"),
+        "on_response_headers must be documented as the response mutation hook: {on_response_headers:?}"
+    );
+}
+
 // ===========================================================================
 // Task 4 (spec AC6 / AC7 / AC8, Review Focus) — the SEAM drift guard.
 //

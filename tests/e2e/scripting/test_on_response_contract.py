@@ -79,6 +79,10 @@ def main() -> int:
                 f"exit={code} http={http} body={body[:120]!r}")
 
         # --- wrong hook: on_response attempt does NOT reach the client -------- #
+        # Sanity check of pre-existing behaviour: the on_response edit never
+        # reached the client even before this fix (that was the silent no-op), so
+        # this alone does not prove the refusal -- the loud-signal check below
+        # (script.list last_error) is what discriminates "refused" from "silent".
         code, http, body = curl(f"{target}/", proxy=h.proxy_url())
         r.check("on_response_attempt_not_on_the_wire",
                 code == 0 and http == 200 and TAMPERED not in body,

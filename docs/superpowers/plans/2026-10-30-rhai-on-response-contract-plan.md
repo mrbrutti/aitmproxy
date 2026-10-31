@@ -98,9 +98,37 @@ setters cannot be tested without it; implemented and committed together.
 
 ## Review log
 
+Stage 6 panel ran in parallel on commit `d4843d5` (security, quality, spec). All
+three returned **PASS — no Critical, no Important**. Eight Minors; dispositions
+below (fixes in the follow-up commit on this branch).
+
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
+| whole | security | Minor | `RESPONSE_FORWARDED_ERR` / spec said "already forwarded", inaccurate for the h1 plugin short-circuit path where `Event::Response` fires just before flush | Fixed: reworded error/doc/spec to "committed to the client"; refusal kept uniform by design |
+| whole | security | Minor | `ResponsePhase` entered only when `true` (`.then`), so a future nested non-Response hook would inherit the outer phase (unreachable today, fail-closed) | Fixed: `ResponsePhase::enter(bool)` always saves/restores, mirroring `ActiveFlow` |
+| whole | security | Minor | `on_error` response edits are still a silent no-op (same footgun class, out of scope) | Accepted — follow-up F1 (see Shipped); pre-existing, unchanged by this diff |
+| 1 | quality | Minor | header-syntax check preceded the phase check in `ScriptHeaders::set`, so an invalid response header name in `on_response` got the token error, not the phase message | Fixed: phase check hoisted above syntax validation in `set` |
+| 3 | quality | Minor | e2e `on_response_attempt_not_on_the_wire` passes with or without the fix (loud-signal poll is the real discriminator) | Fixed: comment added marking it a sanity check; discriminator documented |
+| 1 | quality | Minor | request mutation in `on_response` still a silent no-op (declared non-goal) | Accepted — follow-up F2; correct scoping |
+| 4 | spec | Minor | AC7 hook descriptions had no automated literal assertion | Fixed: `api_catalog.rs::hook_catalog_documents_the_on_response_contract` pins both descriptions |
+| 1 | spec | Minor | AC5 did not exercise `halt()` in `on_response` | Fixed: `on_response_observe_only_is_allowed` now calls `halt()` and asserts `Verdict::Halt` |
 
 ## Shipped
 
-Pending.
+Landed on `claude/rhai-onresponse-fix-fb8217`: the loud observe-only `on_response`
+contract (flow_api.rs phase marker + three gated write paths; plugin.rs phase
+wiring), the catalog doc, 6 dispatch-level unit tests (plugin.rs) + the AC7
+catalog guard (api_catalog.rs), and the real-traffic e2e
+(tests/e2e/scripting/test_on_response_contract.py). Full gate green; scripting
+e2e green. Panel: all three PASS, no open findings (all Minors fixed or accepted
+above).
+
+Follow-ups (tracked, out of this change's scope):
+
+- **F1** — `on_error` can fire for a flow whose response is already committed; a
+  response edit there is still a silent no-op. Either gate it like `on_response`
+  (its phase is ambiguous — an `on_error` from the request phase is pre-forward)
+  or document `on_error` response access as observe-only. Needs an architect call.
+- **F2** — request mutation in `on_response` / `on_response_headers` is also
+  post-forward (the request is already sent upstream) and silently no-ops. Same
+  loud-contract treatment, scoped separately.
