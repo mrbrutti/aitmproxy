@@ -4381,8 +4381,7 @@ fn revoke_push_paused_mutes_state_and_agent_pushes() {
     );
 }
 
-/// AC3 (guard, passes without the fix): operator and CLI subscriptions are never
-/// muted, even under `Paused`.
+/// AC3: operator and CLI subscriptions are never muted, even under `Paused`.
 #[test]
 fn revoke_push_trusted_control_is_never_muted() {
     for role in [Frontend::Operator, Frontend::Cli] {
@@ -4558,8 +4557,8 @@ fn revoke_push_no_marker_while_paused() {
     rv_assert_silent(&agent.sink, "after an agent push, drained a second time");
 }
 
-/// AC8(i) (guard, passes without the fix): `Paused` then `Auto` flipped directly on
-/// `AgentState`, with no push in between, suppresses nothing, so there is no marker.
+/// AC8(i): `Paused` then `Auto` flipped directly on `AgentState`, with no push in
+/// between, suppresses nothing, so there is no marker.
 #[test]
 fn revoke_push_direct_flip_without_a_suppressed_push_has_no_marker() {
     let rig = RvRig::new(AgentPolicy::Auto);
@@ -4711,7 +4710,7 @@ fn revoke_push_cross_server_pause_mutes_the_other_server() {
     );
 }
 
-/// AC12(ii) (guard, passes without the fix; pins residual R1): a line enqueued
+/// AC12(ii) (pins that lines already queued are not purged): a line enqueued
 /// while `Auto` and not yet drained is still returned after the policy goes
 /// `Paused`. Nothing is purged.
 #[test]
@@ -5225,8 +5224,8 @@ fn revoke_park_waiter_denies_promptly_when_the_policy_leaves_ask() {
     }
 }
 
-/// AC15 (guard, passes without the fix): `ask` to `ask` is not a change. The
-/// parked call is still parked four slices later and is still approvable.
+/// AC15: `ask` to `ask` is not a change. The parked call is still parked four
+/// slices later and is still approvable.
 #[test]
 fn revoke_park_ask_to_ask_does_not_deny() {
     let (srv, _state) = revoke_ask_rig(Duration::from_secs(60));

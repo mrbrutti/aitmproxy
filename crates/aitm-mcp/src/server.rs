@@ -494,7 +494,8 @@ impl Subscriptions {
     /// policy is read once, under the registry lock, so one snapshot covers every
     /// subscription and the read is as late as it can be. `wants` is tested first,
     /// so a connection is marked only when a line it would have received was
-    /// suppressed. A connection gets at most one line per call.
+    /// suppressed. A connection gets the line at most once per call, and a due
+    /// `lagged` marker precedes it.
     ///
     /// A mute stops new lines, not everything already in motion. These are accepted:
     ///
@@ -505,13 +506,6 @@ impl Subscriptions {
     ///   replay just after it (a replay is not a fan-out).
     /// - A fan-out that read the policy just before the flip may enqueue just after
     ///   it.
-    /// - A call that passed the gate before the pause keeps running, and its reply
-    ///   is delivered (replies are never dropped). Work already started, such as an
-    ///   armed intercept or a running scan, is not stopped by a pause: only new
-    ///   calls, pushes and parked approvals are cut.
-    /// - `aitm tui` gives its agent server a private `AgentState`, so `agent.set`
-    ///   there reaches none of this. Muting and revocation apply only to servers
-    ///   that share the state (the `aitm web` pair do).
     fn fanout(
         &self,
         wants: &dyn Fn(&Subscription) -> bool,
@@ -760,10 +754,9 @@ impl ParkSlot {
     /// that often rather than only at the timeout. A resolved slot is checked before
     /// the policy on every pass, so an approval that landed wins over a policy change
     /// seen in the same pass. The policy is not read before the first slice has run
-    /// (a call is not second-guessed in the instant it parks), so a flap shorter than
-    /// one slice is not seen. `still_ask` must be lock-free: it runs with the slot's
-    /// mutex held. A `timeout` too large to matter, such as `Duration::MAX`, is
-    /// effectively unbounded and does not panic.
+    /// (a call is not second-guessed in the instant it parks). `still_ask` must be
+    /// lock-free: it runs with the slot's mutex held. A `timeout` too large to
+    /// matter, such as `Duration::MAX`, is effectively unbounded and does not panic.
     fn wait(&self, timeout: Duration, recheck: Duration, still_ask: &dyn Fn() -> bool) -> ParkWait {
         let start = Instant::now();
         let mut state = self
@@ -1217,6 +1210,16 @@ impl McpServer {
     /// The shared agent-policy state the policy gate reads and `agent.set` writes.
     /// Wiring seeds it from `McpConfig.policy` and hands the same `Arc` to the
     /// `AgentPlugin`.
+    ///
+    /// Sharing the `Arc` shares the policy live. A policy change on it cuts agent
+    /// pushes and parked approvals on every server that shares the `Arc`, as it
+    /// happens, with no hook to call.
+    ///
+    /// A change does not stop a call that already passed the gate. Its reply is
+    /// still delivered, and work it started (an armed intercept, a running scan)
+    /// carries on. A server that does not share the `Arc` sees none of this:
+    /// `aitm tui` builds its agent server with a private `AgentState`, so
+    /// `agent.set` there reaches no other server.
     pub fn with_agent_state(mut self, agent_state: Arc<AgentState>) -> Self {
         self.agent_state = agent_state;
         self
@@ -1600,7 +1603,8 @@ impl McpServer {
         // push sink and the server's subscription registry — neither of which a
         // `CommandHost` can carry — so the server handles them directly instead
         // of through `Command::invoke`. They are `Read`: gated like any read
-        // (blocked only under `Paused`; only trusted control —
+        // (refused when `agent_reads_allowed` says no: `Paused` today, and any
+        // posture added later; only trusted control —
         // `Frontend::is_trusted_control`: Operator, Cli — bypasses, every other
         // role, including any variant added later, is gated as an agent).
         if name == "flow.subscribe" || name == "flow.unsubscribe" {
@@ -2598,10 +2602,9 @@ mod tests {
             .with_agent_state(Arc::new(AgentState::new(policy)))
     }
 
-    /// AC21 (guard, passes before and after the predicate is extracted): the
-    /// `paused` refusal for the two subscription verbs is byte for byte the text it
-    /// always was, and `read_refusal` still refuses only a non-trusted-control role,
-    /// only under `Paused`.
+    /// AC21: the `paused` refusal for the two subscription verbs is byte for byte
+    /// the text it always was, and `read_refusal` still refuses only a
+    /// non-trusted-control role, only under `Paused`.
     #[test]
     fn revoke_read_refusal_text_is_unchanged() {
         let paused = revoke_server_under(AgentPolicy::Paused);
@@ -2985,9 +2988,8 @@ mod tests {
         assert_eq!(srv.parked.len(), 0, "the table is empty after the approve");
     }
 
-    /// AC12(i) (guard, passes before and after the fix): a denial is always
-    /// honoured. `agent.approve allow:false` after the policy left `ask` still
-    /// resolves the request as denied and reports success.
+    /// AC12(i): a denial is always honoured. `agent.approve allow:false` after the
+    /// policy left `ask` still resolves the request as denied and reports success.
     #[test]
     fn revoke_park_deny_after_leaving_ask_is_honoured() {
         let (srv, state, _runs) = revoke_park_server(AgentPolicy::Ask);
@@ -4172,8 +4174,8 @@ mod tests {
         }
     }
 
-    /// The recheck slice is the spec's 100 to 250 ms band (G2(iii): a call is denied
-    /// within one slice plus scheduling). A slice of minutes would defeat the
+    /// The recheck slice is the spec's 100 to 250 ms band, so a call is denied
+    /// within one slice plus scheduling. A slice of minutes would defeat the
     /// bound, a slice of microseconds would make `MAX_PARKED_REQUESTS` waiters spin.
     #[test]
     fn revoke_park_recheck_slice_is_within_the_specified_band() {
