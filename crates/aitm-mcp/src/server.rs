@@ -1632,6 +1632,8 @@ impl McpServer {
             at: SystemTime::now(),
             origin: conn.role,
             client_label: conn.client_label.clone(),
+            // Interim (plan task 1): task 6 stamps the server-assigned id here.
+            connection_id: None,
             command: name.to_string(),
             args_summary: redact_args(arguments),
             result: outcome,

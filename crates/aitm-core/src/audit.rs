@@ -49,6 +49,11 @@ pub struct AuditEntry {
     pub origin: Frontend,
     /// The connection's human-readable client label, when it declared one.
     pub client_label: Option<String>,
+    /// The server-assigned, opaque id of the streaming connection that made the
+    /// call. `None` means the call is not attributable to a streaming connection
+    /// (an in-process caller, a request/response transport). Never derived from
+    /// anything the client sent.
+    pub connection_id: Option<String>,
     /// The dotted command name, e.g. `"flow.replay"`.
     pub command: String,
     /// A redacted, size-capped rendering of the arguments — never secrets.
@@ -81,6 +86,13 @@ impl AuditEntry {
             "client_label".to_string(),
             match &self.client_label {
                 Some(label) => Value::Str(label.clone()),
+                None => Value::Null,
+            },
+        );
+        m.insert(
+            "connection_id".to_string(),
+            match &self.connection_id {
+                Some(id) => Value::Str(id.clone()),
                 None => Value::Null,
             },
         );
@@ -209,6 +221,7 @@ mod tests {
             at: SystemTime::now(),
             origin: Frontend::Mcp,
             client_label: None,
+            connection_id: None,
             command: command.to_string(),
             args_summary: "{}".to_string(),
             result,
@@ -236,6 +249,43 @@ mod tests {
         let last_two = ring.recent(None, Some(2));
         assert_eq!(last_two.len(), 2);
         assert_eq!(last_two[1].command, "c");
+    }
+
+    #[test]
+    fn to_value_carries_connection_id() {
+        let with_id = AuditEntry {
+            connection_id: Some("conn_ab-1".to_string()),
+            ..entry("x", AuditResult::Ok)
+        };
+        let Value::Object(m) = with_id.to_value() else {
+            panic!("expected object")
+        };
+        assert_eq!(
+            m.get("connection_id"),
+            Some(&Value::Str("conn_ab-1".to_string()))
+        );
+        assert_eq!(
+            m.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "args",
+                "at",
+                "client_label",
+                "command",
+                "connection_id",
+                "origin",
+                "result"
+            ]
+        );
+
+        let without_id = AuditEntry {
+            connection_id: None,
+            ..entry("x", AuditResult::Ok)
+        };
+        let Value::Object(m) = without_id.to_value() else {
+            panic!("expected object")
+        };
+        assert_eq!(m.get("connection_id"), Some(&Value::Null));
+        assert_eq!(m.len(), 7);
     }
 
     #[test]

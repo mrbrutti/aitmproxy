@@ -137,6 +137,7 @@ fn ca_status_entry() -> AuditEntry {
         at: SystemTime::now(),
         origin: Frontend::Mcp,
         client_label: Some("aitm-mac".to_string()),
+        connection_id: None,
         command: "ca.status".to_string(),
         args_summary: "{}".to_string(),
         result: AuditResult::Ok,
