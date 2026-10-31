@@ -18,10 +18,12 @@
 //! a client that stops reading cannot grow server memory.
 //!
 //! Replies do not ride the sink: a finished frame's replies go straight to the
-//! socket in line order, so a notification burst never delays them and a reply is
-//! never queued twice or dropped. The two paths share one socket, so a
-//! notification can arrive before the reply carrying its `sub_id`; clients
-//! correlate replies by JSON-RPC `id`, as over TCP.
+//! socket in line order, so a reply is never dropped or queued twice. A push
+//! burst can delay a reply by at most one drain batch (at most `push_capacity`
+//! lines plus the lag marker), since the drain arm sends its whole batch before
+//! the loop selects again. The two paths share one socket, so a notification can
+//! arrive before the reply carrying its `sub_id`; clients correlate replies by
+//! JSON-RPC `id`, as over TCP.
 //!
 //! A frame is the unit of work. The lines inside one frame run in order and are
 //! answered in order, one text frame per reply, once the whole frame is done. A
@@ -34,9 +36,9 @@
 //! order and clients correlate them by JSON-RPC `id`. Clients that need one
 //! request's effect before the next must wait for its reply; a Close or disconnect
 //! discards replies still in flight. At the in-flight cap the loop stops reading,
-//! so a client Close or disconnect is only noticed once a frame finishes — bounded
-//! by those in-flight frames' own completion. All policy stays in the core: the
-//! bridge authenticates, splits lines, and forwards.
+//! so a client Close or disconnect is noticed once a frame finishes or a push send
+//! fails, bounded by those in-flight frames' own completion. All policy stays in
+//! the core: the bridge authenticates, splits lines, and forwards.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -86,8 +88,9 @@ const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// sends. Each frame holds one blocking-pool thread while its commands run.
 ///
 /// The cost of that backpressure: at the cap the loop is not reading at all, so a
-/// client Close or disconnect is only noticed once a frame finishes — bounded by
-/// the in-flight frames' own completion, however long their commands run.
+/// client Close or disconnect is noticed once a frame finishes or a push send
+/// fails, bounded by the in-flight frames' own completion, however long their
+/// commands run.
 pub const MAX_IN_FLIGHT: usize = 16;
 
 // With a zero cap the relay's read branch would never be enabled, so an
@@ -360,7 +363,7 @@ fn dispatch_frame(mcp: &Arc<McpServer>, conn: &Arc<ConnCtx>, lines: Vec<String>)
 /// matters: a detached frame may run `flow.subscribe` after this; the registry
 /// refuses a subscribe on a closed sink under its own lock, and one that slipped
 /// in before the close is swept by the drop, so no subscription outlives its
-/// connection (spec D4).
+/// connection (web-bus-push spec D4).
 struct ConnGuard {
     mcp: Arc<McpServer>,
     conn_id: u64,

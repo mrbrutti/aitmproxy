@@ -1738,6 +1738,255 @@ fn subscribe_on_an_open_sink_still_works() {
     assert_eq!(note["params"]["id"], id.to_string());
 }
 
+/// `tools/call flow.unsubscribe {sub_id}` on `conn`, parsed.
+fn unsubscribe_on(srv: &McpServer, conn: &ConnCtx, sub_id: u64) -> JsonValue {
+    let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"flow.unsubscribe","arguments":{"sub_id": sub_id}}});
+    let reply = srv
+        .handle_on(conn, &req.to_string())
+        .expect("flow.unsubscribe replies");
+    serde_json::from_str(&reply).expect("the reply is JSON")
+}
+
+/// The `sub_id` a successful subscribe reply carries.
+fn sub_id_of(reply: &JsonValue) -> u64 {
+    reply["result"]["structuredContent"]["sub_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("subscribe returns a sub_id: {reply}"))
+}
+
+/// The literal refusal for a connection at the per-connection subscription cap.
+const TOO_MANY_SUBS_TEXT: &str =
+    "flow.subscribe refused: too many subscriptions on this connection (max 32); flow.unsubscribe first";
+
+/// Web `/bus` push AC11: one connection holds at most 32 subscriptions. The 33rd
+/// `flow.subscribe` is a tool error that mints no `sub_id` and replays nothing,
+/// and a second connection on the same server is unaffected (the `sub_id` it gets
+/// is the one the refusal did not consume).
+#[test]
+fn the_33rd_subscribe_is_refused_while_another_connection_still_subscribes() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 64);
+    let since = store.insert(http_flow("example.com:443", "/since"));
+    store.insert(http_flow("example.com:443", "/replayable"));
+    let sink = NotificationSink::new(64);
+    let conn = conn_over(&srv, &sink);
+
+    let ids: Vec<u64> = (0..32)
+        .map(|_| sub_id_of(&subscribe_on(&srv, &conn, json!({}))))
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=32).collect::<Vec<u64>>(),
+        "32 subscribes on one connection succeed"
+    );
+
+    let refused = subscribe_on(&srv, &conn, json!({"since": since.to_string()}));
+    assert!(
+        is_refused(&refused),
+        "the 33rd subscribe is a tool error: {refused}"
+    );
+    assert_eq!(refused["result"]["content"][0]["text"], TOO_MANY_SUBS_TEXT);
+    assert!(
+        refused["result"].get("structuredContent").is_none(),
+        "no sub_id is minted past the cap: {refused}"
+    );
+    // The refusal is audited to every subscriber, this connection included, so
+    // the sink is not empty; what must be absent is any replayed flow line.
+    let lines: Vec<JsonValue> = sink
+        .drain()
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("a drained line is JSON"))
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .all(|l| l["method"] != "notifications/aitm/flow"),
+        "the since replay must not run for a refused subscribe: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l["method"] == "notifications/aitm/agent"
+                && l["params"]["command"] == "flow.subscribe"),
+        "the refusal itself is audited to the connection's subscribers: {lines:?}"
+    );
+
+    let other_sink = NotificationSink::new(64);
+    let other = conn_over(&srv, &other_sink);
+    let reply = subscribe_on(&srv, &other, json!({}));
+    assert!(
+        !is_refused(&reply),
+        "the cap is per connection, so another connection still subscribes: {reply}"
+    );
+    assert_eq!(sub_id_of(&reply), 33, "the refusal consumed no sub_id");
+}
+
+/// Web `/bus` push AC11: `flow.unsubscribe` frees a slot under the cap, and only
+/// one.
+#[test]
+fn unsubscribe_frees_a_subscription_slot() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store, 64);
+    let sink = NotificationSink::new(64);
+    let conn = conn_over(&srv, &sink);
+    let ids: Vec<u64> = (0..32)
+        .map(|_| sub_id_of(&subscribe_on(&srv, &conn, json!({}))))
+        .collect();
+    let at_cap = subscribe_on(&srv, &conn, json!({}));
+    assert_eq!(
+        at_cap["result"]["content"][0]["text"], TOO_MANY_SUBS_TEXT,
+        "the connection is at the cap: {at_cap}"
+    );
+
+    let reply = unsubscribe_on(&srv, &conn, ids[0]);
+    assert!(!is_refused(&reply), "{reply}");
+    let reply = subscribe_on(&srv, &conn, json!({}));
+    assert!(
+        !is_refused(&reply),
+        "after flow.unsubscribe one more subscribe fits: {reply}"
+    );
+    assert_eq!(sub_id_of(&reply), 33);
+    let at_cap = subscribe_on(&srv, &conn, json!({}));
+    assert_eq!(
+        at_cap["result"]["content"][0]["text"], TOO_MANY_SUBS_TEXT,
+        "one unsubscribe frees exactly one slot: {at_cap}"
+    );
+}
+
+/// `http_flow` with `method` in place of `GET`.
+fn http_flow_with_method(authority: &str, path: &str, method: &str) -> Flow {
+    let mut flow = http_flow(authority, path);
+    if let Flow::Http(f) = &mut flow {
+        f.request.method = method.into();
+    }
+    flow
+}
+
+/// Web `/bus` push AC11: a `filter.host` or `filter.method` over 1024 bytes is a
+/// tool error naming the field and registers nothing. The stored and pushed flows
+/// carry the over-long value themselves, so a filter that had been registered
+/// (whole or truncated) would have matched: neither the `since` replay nor a live
+/// push may land in the sink.
+#[test]
+fn an_over_long_filter_value_is_refused_and_registers_nothing() {
+    const OVER: usize = 1025;
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let long_host = "h".repeat(OVER);
+    let long_method = "m".repeat(OVER);
+    let since = store.insert(http_flow(&long_host, "/since"));
+    store.insert(http_flow(&long_host, "/replayable-host"));
+    store.insert(http_flow_with_method(
+        "example.com:443",
+        "/replayable-method",
+        &long_method,
+    ));
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+
+    let cases = [
+        (
+            json!({"host": long_host}),
+            "flow.subscribe refused: filter.host is longer than 1024 bytes",
+        ),
+        (
+            json!({"method": long_method}),
+            "flow.subscribe refused: filter.method is longer than 1024 bytes",
+        ),
+    ];
+    for (filter, text) in cases {
+        let reply = subscribe_on(
+            &srv,
+            &conn,
+            json!({"filter": filter, "since": since.to_string()}),
+        );
+        assert!(
+            is_refused(&reply),
+            "a filter value of {OVER} bytes is refused: {reply}"
+        );
+        assert_eq!(reply["result"]["content"][0]["text"], text);
+        assert!(
+            reply["result"].get("structuredContent").is_none(),
+            "no sub_id is minted for a refused filter: {reply}"
+        );
+    }
+    assert_eq!(
+        sink.queued_len(),
+        0,
+        "the since replay must not run for a refused filter"
+    );
+
+    let live_host = store.insert(http_flow(&long_host, "/live-host"));
+    srv.push_flow_event(&Event::RequestHeaders(live_host));
+    let live_method = store.insert(http_flow_with_method(
+        "example.com:443",
+        "/live-method",
+        &long_method,
+    ));
+    srv.push_flow_event(&Event::RequestHeaders(live_method));
+    assert_eq!(
+        sink.queued_len(),
+        0,
+        "nothing was registered, so a live push has nowhere to land"
+    );
+}
+
+/// Web `/bus` push AC11: the bound is inclusive. A `filter.host` and a
+/// `filter.method` of exactly 1024 bytes are accepted, and each is retained whole:
+/// a flow carrying that value is pushed.
+#[test]
+fn a_filter_value_of_exactly_1024_bytes_is_accepted() {
+    const EXACT: usize = 1024;
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let host = "h".repeat(EXACT);
+    let method = "m".repeat(EXACT);
+
+    let host_sink = NotificationSink::new(16);
+    let host_conn = conn_over(&srv, &host_sink);
+    let reply = subscribe_on(&srv, &host_conn, json!({"filter": {"host": host}}));
+    assert!(
+        !is_refused(&reply),
+        "a filter.host of {EXACT} bytes is within the bound: {reply}"
+    );
+    assert_eq!(sub_id_of(&reply), 1);
+
+    let method_sink = NotificationSink::new(16);
+    let method_conn = conn_over(&srv, &method_sink);
+    let reply = subscribe_on(&srv, &method_conn, json!({"filter": {"method": method}}));
+    assert!(
+        !is_refused(&reply),
+        "a filter.method of {EXACT} bytes is within the bound: {reply}"
+    );
+    assert_eq!(sub_id_of(&reply), 2);
+
+    let by_host = store.insert(http_flow(&host, "/by-host"));
+    srv.push_flow_event(&Event::RequestHeaders(by_host));
+    let by_method = store.insert(http_flow_with_method(
+        "example.com:443",
+        "/by-method",
+        &method,
+    ));
+    srv.push_flow_event(&Event::RequestHeaders(by_method));
+    assert_eq!(
+        host_sink.queued_len(),
+        1,
+        "the host filter matched its flow"
+    );
+    assert_eq!(
+        method_sink.queued_len(),
+        1,
+        "the method filter matched its flow"
+    );
+    let host_note: JsonValue =
+        serde_json::from_str(&host_sink.drain()[0]).expect("the push is JSON");
+    assert_eq!(host_note["params"]["id"], by_host.to_string());
+    let method_note: JsonValue =
+        serde_json::from_str(&method_sink.drain()[0]).expect("the push is JSON");
+    assert_eq!(method_note["params"]["id"], by_method.to_string());
+}
+
 /// Web `/bus` push, spec Goals (bounded push memory), added by the tester: the
 /// `since` replay rides the same bounded notification lane as live pushes. A
 /// subscribe that replays more flows than `push_capacity` keeps only the newest
@@ -1855,6 +2104,51 @@ async fn spawn_push_dispatcher_delivers_a_broadcast_event() {
     let note: JsonValue = serde_json::from_str(&lines[0]).expect("the push is JSON");
     assert_eq!(note["method"], "notifications/aitm/flow");
     assert_eq!(note["params"]["event"], "created");
+    assert_eq!(note["params"]["id"], id.to_string());
+}
+
+/// `spawn_push_dispatcher` is idempotent: a second call on the same server spawns
+/// nothing, so the broadcast keeps one receiver and a subscriber receives each
+/// event once rather than once per call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_push_dispatcher_twice_delivers_each_event_once() {
+    let store = Arc::new(MemFlowStore::new());
+    let (tx, _) = broadcast::channel::<Event>(16);
+    let srv = Arc::new(
+        McpServer::new(push_registry(), McpTransport::Stdio)
+            .with_agent_state(ungated())
+            .with_services(
+                store.clone(),
+                Arc::new(StubClient),
+                Arc::new(StdGuard::default()),
+                None,
+            )
+            .with_push(tx.clone()),
+    );
+    srv.spawn_push_dispatcher();
+    srv.spawn_push_dispatcher();
+    assert_eq!(
+        tx.receiver_count(),
+        1,
+        "the second call spawns no second dispatcher"
+    );
+
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    sub_id_of(&subscribe_on(&srv, &conn, json!({})));
+    let id = store.insert(http_flow("example.com:443", "/once"));
+    tx.send(Event::RequestHeaders(id))
+        .expect("the dispatcher holds a broadcast receiver");
+    tokio::time::timeout(Duration::from_secs(5), sink.wait())
+        .await
+        .expect("the dispatcher delivered within the deadline");
+    // A second dispatcher would push its own copy moments after the first; give
+    // it that moment so a duplicate is seen, not missed.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let lines = sink.drain();
+    assert_eq!(lines.len(), 1, "each event is delivered once: {lines:?}");
+    let note: JsonValue = serde_json::from_str(&lines[0]).expect("the push is JSON");
+    assert_eq!(note["method"], "notifications/aitm/flow");
     assert_eq!(note["params"]["id"], id.to_string());
 }
 

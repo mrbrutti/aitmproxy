@@ -433,8 +433,7 @@ async fn run() -> anyhow::Result<()> {
         // It is fed the core event stream too, with its own dispatcher: each
         // server keeps its own subscription registry and only `serve` spawns a
         // dispatcher, so without this a `/bus` subscription would sit in a
-        // registry nothing feeds. Exactly one dispatcher per server, or every
-        // subscriber receives each event twice.
+        // registry nothing feeds.
         let web_server = match (web_settings, web_listener) {
             (Some(settings), Some(listener)) => {
                 let bus = Arc::new(

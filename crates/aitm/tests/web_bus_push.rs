@@ -446,6 +446,16 @@ async fn recv_within(ws: &mut Ws, bound: Duration, what: &str) -> JsonValue {
 /// Frames until one satisfies `pred`, within [`TIMEOUT`]. The frames skipped on
 /// the way are in the failure message, so a wrong frame is diagnosable.
 async fn recv_until(ws: &mut Ws, what: &str, pred: impl Fn(&JsonValue) -> bool) -> JsonValue {
+    recv_until_collecting(ws, what, pred).await.0
+}
+
+/// [`recv_until`], also returning the frames skipped on the way in arrival order,
+/// for a test that must check what reached the socket before the awaited frame.
+async fn recv_until_collecting(
+    ws: &mut Ws,
+    what: &str,
+    pred: impl Fn(&JsonValue) -> bool,
+) -> (JsonValue, Vec<JsonValue>) {
     let deadline = Instant::now() + TIMEOUT;
     let mut skipped: Vec<JsonValue> = Vec::new();
     loop {
@@ -456,7 +466,7 @@ async fn recv_until(ws: &mut Ws, what: &str, pred: impl Fn(&JsonValue) -> bool) 
                     "the stream ended while waiting for {what}; frames seen meanwhile: {skipped:?}"
                 )
             }
-            Ok(Some(frame)) if pred(&frame) => return frame,
+            Ok(Some(frame)) if pred(&frame) => return (frame, skipped),
             Ok(Some(frame)) => skipped.push(frame),
         }
     }
@@ -760,8 +770,12 @@ async fn replies_stay_in_order_while_pushes_flow() {
             );
         } else if frame["method"] == "notifications/aitm/agent" {
             // Every finished tool call is audited and fanned to all subscribers, so
-            // this frame's own commands show up on the stream. Neither a reply nor
-            // a flow push.
+            // this frame's own commands show up on the stream; nothing else may.
+            let command = frame["params"]["command"].as_str().unwrap_or_default();
+            assert!(
+                matches!(command, "test.block" | "test.tick" | "flow.list"),
+                "an agent-stream line that is not this frame's own audit: {frame}"
+            );
         } else {
             panic!("unexpected frame: {frame}");
         }
@@ -858,12 +872,15 @@ async fn a_frame_still_running_at_disconnect_cannot_resubscribe() {
     // Subscriptions work on this bridge, so a missing one below means teardown.
     subscribe(&mut operator).await;
 
+    // One frame: the parked line, the late subscribe, then a tick. Lines in a
+    // frame run in order, so the tick is proof that the subscribe has returned.
     send_text(
         &mut operator,
         format!(
-            "{}\n{}",
+            "{}\n{}\n{}",
             call_line(10, "test.block"),
-            call_line(11, "flow.subscribe")
+            call_line(11, "flow.subscribe"),
+            call_line(12, "test.tick")
         ),
     )
     .await;
@@ -883,23 +900,16 @@ async fn a_frame_still_running_at_disconnect_cannot_resubscribe() {
     // sink, rather than before a slow teardown that would then sweep it.
     assert_refused_without_operator(&probe_ask_gate(&server.mcp).await);
 
-    // The detached frame finishes: test.block returns, then flow.subscribe runs
-    // against the torn-down connection.
+    // The detached frame finishes: test.block returns, flow.subscribe runs
+    // against the torn-down connection, and the tick after it shows the
+    // subscribe has certainly run before the probe below.
     release.release();
-    wait_until("the detached frame to finish test.block", || {
-        commands.parking.completed() == 1
+    wait_until("the detached frame to run its test.tick", || {
+        commands.ticks() == 1
     })
     .await;
 
-    let until = Instant::now() + Duration::from_secs(1);
-    let mut probes = 0;
-    while Instant::now() < until {
-        let probe = probe_ask_gate(&server.mcp).await;
-        assert_refused_without_operator(&probe);
-        probes += 1;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(probes > 0, "at least one probe ran");
+    assert_refused_without_operator(&probe_ask_gate(&server.mcp).await);
     assert_eq!(commands.sensitive_runs(), 0, "no probe ever ran");
 }
 
@@ -1019,7 +1029,10 @@ async fn agent_role_never_gets_operator_only_pushes() {
         .to_owned();
 
     // A flow push reaches the agent connection; the approval request never does,
-    // and the parked call has no reply yet.
+    // and the parked call has no reply yet. The approval request was fanned out
+    // before this push (the operator has already read it) and a sink delivers in
+    // order, so anything that leaked to the agent connection arrives before its
+    // flow push: no quiet wait is needed.
     let id = push_flow(&server, "/both");
     let on_operator = recv_until(
         &mut operator,
@@ -1028,30 +1041,21 @@ async fn agent_role_never_gets_operator_only_pushes() {
     )
     .await;
     assert_eq!(on_operator["params"]["id"], id.to_string(), "{on_operator}");
-    let on_agent = drain_for(&mut agent, QUIET).await;
-    let flow_pushes: Vec<&JsonValue> = on_agent
-        .iter()
-        .filter(|f| f["method"] == "notifications/aitm/flow")
-        .collect();
-    assert_eq!(
-        flow_pushes.len(),
-        1,
-        "the agent connection receives the one flow push: {on_agent:?}"
-    );
-    assert_eq!(
-        flow_pushes[0]["params"]["id"],
-        id.to_string(),
-        "{on_agent:?}"
-    );
+    let (on_agent, before_it) =
+        recv_until_collecting(&mut agent, "the flow push on the agent connection", |v| {
+            v["method"] == "notifications/aitm/flow"
+        })
+        .await;
+    assert_eq!(on_agent["params"]["id"], id.to_string(), "{on_agent}");
     assert!(
-        on_agent
+        before_it
             .iter()
-            .all(|f| f["method"] != "notifications/aitm/agent"),
-        "the agent connection must never receive an operator-only notification: {on_agent:?}"
+            .all(|f| f["params"]["event"] != "approval_requested"),
+        "the agent connection must never receive the operator-only approval request: {before_it:?}"
     );
     assert!(
-        on_agent.iter().all(|f| f["id"] != 5),
-        "the Sensitive call must still be parked while the operator has not answered: {on_agent:?}"
+        before_it.iter().all(|f| f["id"] != 5),
+        "the Sensitive call must still be parked while the operator has not answered: {before_it:?}"
     );
 
     // The operator denies; the parked call is refused and never ran.
