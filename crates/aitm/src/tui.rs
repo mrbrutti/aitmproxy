@@ -597,12 +597,16 @@ mod tests {
             serde_json::json!([]),
             "{listed}"
         );
-        let from_agent = ring
-            .recent(None, None)
-            .iter()
-            .filter(|e| e.origin == Frontend::Mcp)
-            .count();
-        assert_eq!(from_agent, 1, "the operator's call is not an agent entry");
+        // The operator's own call is audited too, under its own origin: the ring
+        // holds the agent's refusal, then the operator's call, and only the first
+        // is an agent entry. Compared as a list rather than by `== Frontend::Mcp`,
+        // the deny-list shape `aitm-core`'s `trust_gate_scan` rejects in any `src`.
+        let origins: Vec<Frontend> = ring.recent(None, None).iter().map(|e| e.origin).collect();
+        assert_eq!(
+            origins,
+            vec![Frontend::Mcp, Frontend::Operator],
+            "the operator's call is its own entry, not an agent one"
+        );
     }
 
     /// AC7: two servers built through the helper from one `Assembled` write one
