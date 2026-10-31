@@ -128,6 +128,12 @@ verb is separate and that field is untouched.
   constant and calls every tool as the agent with empty arguments. Adding the
   verb means adding `"capture.status"` there (count 59); the e2e cell then
   classifies it `callable`.
+  *Orchestrator amendment after the Terminal gate (2026-10-31):* a second
+  contract exists. `crates/aitm/tests/tui_live_bus.rs` asserts every tool the
+  live core serves is in `aitm_tui::CORE_TOOLS` (`crates/aitm-tui/src/lib.rs`),
+  and `crates/aitm-tui/tests/tester_shell.rs` asserts the TUI bus fixture
+  (`crates/aitm-tui/fixtures/bus-fixture.json`) filtered by `CORE_TOOLS` equals
+  `CORE_TOOLS` (count 62 with this verb). Both must list `capture.status`.
 - **No new third-party crate.** Timestamps use `std::time::SystemTime` only;
   `crates/aitm/Cargo.toml` gains no dependency.
 - **`unsafe_code = "forbid"`** stays in force for the `aitm` crate.
@@ -669,7 +675,10 @@ Tags: **[sandbox]** runs under `cargo test` in the Bash sandbox;
 1. **CS-AC1 Registered everywhere.** The default assembly's `tools/list`
    contains `capture.status`; `EXPECTED_TOOLS` is `[&str; 59]` including
    `"capture.status"`; `ac7_exact_tool_set` passes on macOS and on
-   `ubuntu-latest`. **[sandbox]**
+   `ubuntu-latest`. **[sandbox]** `aitm_tui::CORE_TOOLS` and the TUI bus
+   fixture list it too, so `tui_live_bus` **[terminal]** and
+   `tester_shell::fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit`
+   **[sandbox]** pass (orchestrator amendment, 2026-10-31).
 2. **CS-AC2 Read-only, parameterless, inert.** `sensitivity() == Sensitivity::Read`,
    `mutates() == false`, `schema().params.is_empty()`. Invoking with
    `Params` containing `enabled: true`, `feeder: "listening"` and

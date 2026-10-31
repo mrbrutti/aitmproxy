@@ -604,6 +604,9 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 3 | Terminal gate (orchestrator) | Important | `tui_live_bus::tui_bus_task_runs_against_the_live_loopback_server` panics: `live tool capture.status is missing from aitm_tui::CORE_TOOLS`. A second tool-set contract (TUI `CORE_TOOLS` + `fixtures/bus-fixture.json`, pinned at 61 by `tester_shell`) the spec did not name. | fixed in d59abdb (CORE_TOOLS + fixture entry + pins 61→62); spec Constraints and CS-AC1 amended by the orchestrator |
+| whole branch | Tester | Minor | `CaptureSession::run`'s `catch_unwind` → `status.stopped()` branch has no test; unreachable without a production seam (the feeder must bind before anything can panic). | accepted by the orchestrator 2026-10-31 (autonomous mode): a test would need a production-only panic seam; the normal `stopped()` path is proven live by the loopback test |
+| whole branch | Tester | Minor (observation) | `CaptureStatusWriter::attached` while an older `Attachment` guard is alive would let the older guard's drop clear the newer attachment; unreachable today because `run_session` awaits `serve_attachment` to completion before the next accept. | handed to the quality reviewer for a verdict; see the panel rows below |
 
 ## Shipped
 
