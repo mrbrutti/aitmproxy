@@ -527,7 +527,12 @@ xcrun stapler validate dist/Aitmproxy-*.dmg              # SH-AC5
 
 Stage-6 panel, 2026-10-30. Security = PASS (6 Minor). Quality = FAIL (2 Important,
 9 Minor). Spec = FAIL (1 Important, 5 Minor). Dispositions by the orchestrator
-(autonomous mode). "Fixed" SHAs added after the fix wave + re-gate.
+(autonomous mode). **Fixed in the stage-6 fix wave:** Swift findings (1-test, 2, 3,
+4, 5, 6, 9) in `c56cd59`; shell/release (7, 8, 10, 11) in `8b921b9`; this log in
+`96124de`. **Second-pass re-review (fix diff `45c8189..96124de`), 2026-10-31:
+security = PASS, quality = PASS** — both Important fixes confirmed correct, no new
+Critical/Important; the new Minors they raised are accepted as follow-ups (see
+"Second-pass follow-ups" below).
 
 | # | Reviewer | Sev | Finding | Disposition |
 |---|---|---|---|---|
@@ -535,7 +540,7 @@ Stage-6 panel, 2026-10-30. Security = PASS (6 Minor). Quality = FAIL (2 Importan
 | 2 | Quality | Important | `disable()` swallows load/save errors, reports `.inactive` regardless; tunnel stop after the save | FIX — collect errors, `.failed(...)` on failure, stop tunnel before save — fix wave |
 | 3 | Quality | Important | Toggle/menu ignore active core kind; ON spawns the embedded core against an External choice | FIX — gate toggle+menu on embedded-active (mirror `ProxySettings.canApply`) — fix wave |
 | 4 | Security | Minor | OFF indicator dishonest on save failure + launch doesn't converge a running tunnel to off | FIX (same as #2) + `detectInactiveExtension` converges to off — fix wave |
-| 5 | Security | Minor | `spawn()` emits the gate even in a non-embedded (dev) build sharing the defaults domain | FIX — `captureEnabled = persisted && CaptureExtension.isEmbedded` + kit test — fix wave |
+| 5 | Security | Minor | `spawn()` emits the gate even in a non-embedded (dev) build sharing the defaults domain | FIX (`c56cd59`) — `captureEnabled = persisted && CaptureExtension.isEmbedded`; covered by a `check-capture-toggle.sh` assertion (`CaptureExtension.isEmbedded` itself is already unit-tested in `CaptureCapabilityTests`) |
 | 6 | Quality | Minor | `capture.enabled` read 3 ways; `bool(forKey:)` in `CaptureSwitch` can lock out ON for a non-Bool stored value (tester F3) | FIX (minimal) — `CaptureSwitch` reads `object(forKey:) as? Bool ?? false`; full Kit-helper dedup ACCEPTED as follow-up — fix wave |
 | 7 | Security | Minor | Operator-only tripwire blind spots: `restartCoreTick`/`UserDefaults.set`/bare `"capture"` not denied outside allow-list (no present hole; regression guard) | FIX — harden `check-capture-operator-only.sh` + header note — fix wave |
 | 8 | Security | Minor | `notarize-dmg.sh` verifies entitlements/hardening/authority but not `TeamIdentifier`/profile; `--entitlements :-` deprecated | FIX — add TeamIdentifier assertions, switch to `--entitlements -`, assert `find` exit — fix wave |
@@ -572,6 +577,21 @@ the next launch with no prompt. The menu command (⌃⌘C) is reachable by UI au
 Both are bounded by deny-by-default scope + the extension's peer authentication, and
 the first-activation OS approval stays human-gated. This is a net improvement over the
 prior unconditional auto-activation; recorded as accepted residual risk.
+
+### Second-pass follow-ups (new Minors from the fix-diff re-review, 2026-10-31)
+Both re-reviewers returned PASS; these new Minors are **accepted as follow-ups**
+(bundled into the v0.5.4 guided-approval PR, which already reworks this area) per the
+orchestrator's ship-now / don't-re-open-scope direction. None is a security hole; the
+kill-switch edge fails open (no leak) and is surfaced in the UI note.
+
+| # | Reviewer(s) | Finding | Disposition |
+|---|---|---|---|
+| 25 | Security + Quality | OFF-path / launch active-core cluster: OFF doesn't re-check `embeddedCoreActive` after its await (TOCTOU on the restart bump), and `start()` at launch calls `enable()` without consulting the active kind — so with an External core active, capture can't be toggled off from the UI and a relaunch re-enables it | ACCEPTED → v0.5.4: let OFF run for any kind (bump `restartCoreTick` only if embedded) and gate `start()`'s `enable()` on the active kind |
+| 26 | Security + Quality | `detectInactiveExtension` launch-convergence discards its `switchOff` failure and reports Off (honest-OFF gap on the launch path only); converges `first` not all `isOurs` | ACCEPTED → v0.5.4: `apply(.failed)` on non-nil, use `filter(isOurs)` |
+| 27 | Security | A failed OFF can't be retried from the toggle (OFF persists false before `disable()`, so the same-value guard no-ops further OFFs while `.degraded`) | ACCEPTED → v0.5.4: allow `set(false)` when `.degraded` |
+| 28 | Quality | `uninstall()` guard's `deactivation == nil` conjunct is dead; a refused Uninstall in the OFF-while-pending window is silent | ACCEPTED → v0.5.4: simplify the guard + give feedback/disable the button in that window |
+| 29 | Quality | Tripwire gaps: the "swallows no save error" check only greps `try?` (a `_ = error` in `switchOff` still passes); the `usesEmbedded` labels pin a literal rather than comparing with `ProxySettings` | ACCEPTED → v0.5.4: pin `switchOff` records the error; soften the labels |
+| 30 | Quality | New `usesEmbedded` duplication ×3 (`ProxySettings`/`CaptureSettings`/`FlowCommands`) from the gating fix | ACCEPTED → v0.5.4 (same class as #19): extract `ActiveCoreKind.isEmbedded(raw:)` in AitmproxyKit |
 
 ## Shipped
 
