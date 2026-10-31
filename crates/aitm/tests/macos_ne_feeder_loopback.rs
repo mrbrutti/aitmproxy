@@ -193,7 +193,12 @@ impl ScopeRateGuard for SeededScope {
         self.0.clone()
     }
     fn in_scope(&self, host: &str) -> bool {
-        self.0.iter().any(|e| e.host.eq_ignore_ascii_case(host))
+        // The ingress gates on `host:port` (the same shape a proxied request is gated
+        // on), so match the way the real guard does — `Authority::matches_scope_entry`,
+        // where a portless entry admits any port — not by exact string equality.
+        aitm_core::Authority::parse_with_default(host, 0)
+            .map(|a| self.0.iter().any(|e| a.matches_scope_entry(&e.host)))
+            .unwrap_or(false)
     }
 }
 
