@@ -430,7 +430,9 @@ Coder fix task over the findings report `scope-persistence-FIX-FINDINGS.md` in t
 folder; commit recorded in Shipped). The spec's "Panel amendments" subsection records the
 ratified behaviour changes. **Re-review of the fix range `be251fb..60273db`:** security PASS
 (2 new Minor), quality PASS (3 new Minor), spec FAIL (1 Important: unrequested public API; 2 doc
-Minor) → fix wave 2 (rows 9–16).
+Minor) → fix wave 2 (rows 9–16). **Wave-2 review (`60273db..3101a7e`):** security PASS (1 Minor), quality PASS
+(1 Minor), spec PASS (2 Minor) → fix wave 3 (rows 17–19); row 20 is a pre-existing bug the live proof
+surfaced, filed as a follow-up.
 
 | # | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|---|
@@ -442,14 +444,18 @@ Minor) → fix wave 2 (rows 9–16).
 | 6 | 2 | Quality | Minor | The `\r` assertion accepts any error | FIX — assert `hostContainsNewline("evil.test\rx")` — fix wave |
 | 7 | 4 | Quality | Minor | Seventh copy of `UserDefaultsActiveKindPersistence().load() ?? .embedded` | ACCEPTED — follow-up: add `loadOrDefault()` in Kit and point all seven sites at it (consolidation touches `SettingsView.swift`, owned by a concurrent session) |
 | 8 | 4 | Spec | Important (gate) | `[manual]` SP-AC1/3/11/12/13 halves not evidenced in the logs at review time | RUN — `scope-persist-live-proof.sh` (shared notes): keystroke add → `scope.json`; Cmd-Q + relaunch → block + `scope.list` + screenshot with no banner (SP-AC1 display after connect, SP-AC11); Proxy ▸ Restart Core (same `restartCoreTick` path as Settings' Apply and Restart Core) keeps scope (SP-AC13); row ✕ remove → `scope.list []`, file kept as `{"hosts": []}` (SP-AC3). PASS, `/tmp/scope-persist-live-proof-full.log`. SP-AC12 ACCEPTED by reasoning: feeder sends `Scope(current_scope_spec())` right after Hello from `l7_guard.list_scope()`, which the config seeded and `scope.list` proved; the installed extension build belongs to the concurrent NE session's live run, so no second capture-enabled core was started — follow-up: observe the first Scope frame on the next NE live session. The pre-connect instant of SP-AC1 was not captured on screen; the seed is pinned by `seedsAtLaunch…` and the post-connect display by the screenshot |
-| 9 | 1 | Spec (re-review) | Important | `maxFileBytes`/`maxHosts`/`maxHostLength` added as `public static let` — unrequested public API | FIX — internal `static let` — fix wave 2 |
-| 10 | 4 | Security (re-review) | Minor | A failed `scope.list` after a successful verb returns normally (`lastError` cleared) while `scope.json` stays stale | FIX — the Scope action throws `"Scope change applied but not saved: scope.list failed"` when embedded — fix wave 2 |
-| 11 | 1 | Security (re-review) | Minor | `save` applies none of `load`'s caps; a list whose JSON exceeds 1 MiB loads empty at the next launch with no signal | FIX — `save` writes `sanitized(hosts)` and throws `SaveError.tooLarge` over 1 MiB (surfaces via row 4's path) — fix wave 2 |
-| 12 | 4 | Quality (re-review) | Minor | `addScope`/`removeScope` duplicate a three-line sequence; the why is commented once | FIX — one private `scopeVerb(_:host:)` helper — fix wave 2 |
-| 13 | 2 | Quality (re-review) | Minor | `\r` assertion duplicated verbatim in two tests after the Q2 tightening | FIX — deleted from `scope_block_rejects_a_newline_anywhere_in_the_list` — fix wave 2 |
+| 9 | 1 | Spec (re-review) | Important | `maxFileBytes`/`maxHosts`/`maxHostLength` added as `public static let` — unrequested public API | FIX — internal `static let` — `3101a7e`; `[review]` (no reference outside the file) |
+| 10 | 4 | Security (re-review) | Minor | A failed `scope.list` after a successful verb returns normally (`lastError` cleared) while `scope.json` stays stale | FIX — the Scope action throws `"Scope change applied but not saved: scope.list failed"` when embedded — `3101a7e`; `[review]` (chain `Session+Verbs.swift` `perform` → `BusService.describe` → `BusError.description`) |
+| 11 | 1 | Security (re-review) | Minor | `save` applies none of `load`'s caps; a list whose JSON exceeds 1 MiB loads empty at the next launch with no signal | FIX — `save` writes `sanitized(hosts)` and throws `SaveError.tooLarge` over 1 MiB (surfaces via row 4's path) — `3101a7e`; tests `saveWritesOnlyWhatLoadWouldKeep`, `saveRefusesAFileOverOneMebibyteAndWritesNothing`, `saveErrorNamesTheSizeAndTheLimit` |
+| 12 | 4 | Quality (re-review) | Minor | `addScope`/`removeScope` duplicate a three-line sequence; the why is commented once | FIX — one private `scopeVerb(_:host:)` helper — `3101a7e`; `[review]`, `grep -c '"scope.add"'` = 1 |
+| 13 | 2 | Quality (re-review) | Minor | `\r` assertion duplicated verbatim in two tests after the Q2 tightening | FIX — deleted from `scope_block_rejects_a_newline_anywhere_in_the_list` — `3101a7e`; `scope_block_rejects_a_host_with_a_newline` keeps the `\r` literal once |
 | 14 | 1,2,3,4 | Quality (re-review) | Minor | Provenance tags ("Tester —", "Fix wave —") in test MARKs and doc comments | ACCEPTED — cosmetic; git blame records authorship |
 | 15 | 1 | Security (re-review) | residual | TOCTOU between `attributesOfItem` and `Data(contentsOf:)` in `load` | ACCEPTED — same-user only; future fd-based read mirroring `writeConfig` |
 | 16 | — | Spec (re-review) | Minor | D4 bullet and row 4 understated the surfaced `lastError` text; rows 4–5 lacked a `[review]` basis | FIXED here (docs) |
+| 17 | 4 | Security + Spec (wave-2 review) | Minor | A Settings ▸ Bus switch to External inside a Scope action's round trip returns normally while `scope.json` stays stale (the merged `guard embedded, preferEmbedded` hid it) | FIX — split the guard: a verb the embedded core applied either reaches the file or throws `"Scope change applied but not saved: the active core changed"` — fix wave 3 (`[review]`) |
+| 18 | 1 | Quality (wave-2 review) | Minor | `load`'s doc comment still calls itself the "single validation point"; test name `aHostOnlyLoadCanRefuseNeverSurvivesALoad` stale after `save` sanitises | FIX — reworded; test renamed `aHostTheCoreAcceptsButTheFileRefusesNeverSurvivesARoundTrip` — fix wave 3 |
+| 19 | — | Spec (wave-2 review) | Minor | Rows 9–13 lacked the closing SHA and evidence kind | FIXED here (docs) |
+| 20 | — | Owner (live proof) | follow-up | Pre-existing: after Proxy ▸ Restart Core (or a crash-restart) a Scope action can fail with "the bus connection closed" although the status bar shows the new core connected — `BusService.run`'s old connection task finishes its cleanup (`self.client = nil` / `.failed`) after the new task has assigned its client; polling keeps working on the local client while actions hit the nil/stale one until the next reconnect | OUT OF SCOPE for this spec (reconnect lifecycle, pre-dates the branch); filed as a GitHub issue from this session; the live proof removes BEFORE restarting and asserts the respawn honours the emptied file |
 
 ## Shipped
 
