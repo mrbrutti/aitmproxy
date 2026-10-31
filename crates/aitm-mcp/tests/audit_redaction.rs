@@ -713,3 +713,70 @@ fn redaction_work_is_bounded() {
         }
     }
 }
+
+// ------------------------------- line breaks and multi-value headers (R4 fix)
+
+/// Header shapes that carry a line break or several values, as `(arguments,
+/// expected audit args)`: a block of header lines in one string, a header array of
+/// three or more items, and a kept header value whose later lines are headers. The
+/// secret-bearing values are canaries.
+fn multi_line_rows() -> Vec<(JsonValue, JsonValue)> {
+    let c = canary;
+    vec![
+        // a string of header lines, CRLF and bare LF: judged line by line.
+        (
+            json!({"headers": format!("X-Debug: {}\r\nHost: x", c(30))}),
+            json!({"headers": format!("X-Debug: {T}\r\nHost: x")}),
+        ),
+        (
+            json!({"headers": format!("Cookie: a={}\nHost: x\nX-Zed: z", c(31))}),
+            json!({"headers": format!("Cookie: {T}\nHost: x\nX-Zed: {T}")}),
+        ),
+        // a header array of three items: rule D by the first element over the rest.
+        (
+            json!({"headers": [["X-Zed", c(32), "b"], ["Accept", "t", "extra"]]}),
+            json!({"headers": [["X-Zed", R, R], ["Accept", "t", "extra"]]}),
+        ),
+        (
+            json!({"headers": ["X-Zed", c(33), "b"]}),
+            json!({"headers": ["X-Zed", R, R]}),
+        ),
+        // a kept value with a header line after its first line break.
+        (
+            json!({"headers": [["Host", format!("x\r\nX-Debug: {}", c(34))]]}),
+            json!({"headers": [["Host", format!("x\r\nX-Debug: {T}")]]}),
+        ),
+        (
+            json!({"headers": {"Host": format!("x\r\nAccept: a\r\nX-Debug: {}", c(35))}}),
+            json!({"headers": {"Host": format!("x\r\nAccept: a\r\nX-Debug: {T}")}}),
+        ),
+        (
+            json!({"headers": [{
+                "name": "Host", "value": "h", "values": [format!("a\r\nX-Debug: {}", c(36))],
+            }]}),
+            json!({"headers": [{
+                "name": "Host", "value": "h", "values": [format!("a\r\nX-Debug: {T}")],
+            }]}),
+        ),
+        // a header name that carries a header line.
+        (
+            json!({"headers": [[format!("X-A\r\nX-Debug: {}", c(37)), "v"]]}),
+            json!({"headers": [[format!("X-A\r\nX-Debug: {T}"), R]]}),
+        ),
+    ]
+}
+
+/// A string of header lines, a header array of three or more items and a kept value
+/// with header lines after a line break are default-deny, through the real server,
+/// with the ring, the pushed line and `agent.activity` in agreement and no canary
+/// on any of them.
+#[test]
+fn multi_line_and_multi_value_headers_are_default_deny() {
+    let failures = row_failures(multi_line_rows());
+    assert!(
+        failures.is_empty(),
+        "{} row(s) wrong:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
