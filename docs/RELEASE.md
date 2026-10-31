@@ -117,7 +117,9 @@ scripts/package.sh
 #    dist/aitm-*-<target>.tar.gz from step a. --ne is required for the extension
 #    (never inferred); --allow-unnotarized acknowledges that this intermediate
 #    cannot activate the extension until step c notarizes it. The script refuses
-#    to replace an installed app of another version without --replace.
+#    to replace an installed app of another version without --replace. It also
+#    bundles the detection catalogue from the tarball (share/aitm/scripts,
+#    beside the core).
 apps/mac/build.sh --ne --allow-unnotarized --replace
 
 # c. Re-sign with the Developer ID + hardened runtime, build the DMG,
@@ -125,8 +127,9 @@ apps/mac/build.sh --ne --allow-unnotarized --replace
 APP=/Applications/Aitmproxy.app ASC_ISSUER_ID=<issuer-id> scripts/notarize-dmg.sh
 ```
 
-`notarize-dmg.sh` refuses to notarize a core-less app, so step (a) and (b) must
-run first. Then upload the two macOS assets to the Release **[Terminal]**:
+`notarize-dmg.sh` refuses to notarize a core-less app, or one without the
+detection catalogue, so step (a) and (b) must run first. Then upload the two
+macOS assets to the Release **[Terminal]**:
 
 ```bash
 gh release upload v<ver> \
