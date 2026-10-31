@@ -5991,3 +5991,495 @@ async fn revoke_socket_paused_agent_goes_quiet_and_resumes_with_a_marker() {
         a.dump()
     );
 }
+
+// ===========================================================================
+// Agent policy revocation, Task 3, Tester additions (plan
+// 2026-10-30-agent-policy-revocation). Appended only. The real transport
+// (`serve_lines`: the read loop and the writer task that drains each sink) over
+// in-memory duplex streams, so these bind no port and run in the sandbox. The
+// in-process `revoke_push_*` tests above read `sink.drain()` and so bypass the
+// writer; AC18 covers the writer but only from the Terminal panel. These cover the
+// writer in the sandbox, with stricter stream assertions than AC18's, and the
+// edge cases the socket test does not reach: two agents, a connection that drops
+// mid-pause, a malformed line and a refused call while muted. Their names start
+// `revoke_push_`, so the `revoke_push` filter selects them and `revoke_socket`
+// does not.
+// ===========================================================================
+
+type RvTask = tokio::task::JoinHandle<anyhow::Result<()>>;
+
+/// One client of `serve_lines` over an in-memory duplex. Like `RvSock`, every line
+/// received is collected in arrival order in `seen`, and every read and write
+/// carries a deadline.
+struct RvWire {
+    label: &'static str,
+    w: WriteHalf<DuplexStream>,
+    lines: ClientReader,
+    seen: Vec<JsonValue>,
+}
+
+impl RvWire {
+    /// A connection of `role` to `srv`, over a fresh `NotificationSink::new(64)`;
+    /// also returns that sink and the server's task for the connection.
+    fn open(
+        srv: &Arc<McpServer>,
+        role: Frontend,
+        label: &'static str,
+    ) -> (Self, NotificationSink, RvTask) {
+        let (w, lines, sink, task) = open_push_conn(srv.clone(), role, 64 * 1024, 64);
+        let wire = Self {
+            label,
+            w,
+            lines,
+            seen: Vec::new(),
+        };
+        (wire, sink, task)
+    }
+
+    /// Every line received so far, one per row, for an assertion message.
+    fn dump(&self) -> String {
+        let mut out = format!("{} received {} line(s):", self.label, self.seen.len());
+        for (i, line) in self.seen.iter().enumerate() {
+            out.push_str(&format!("\n  [{i}] {line}"));
+        }
+        out
+    }
+
+    /// `rv_sock_kind` of every line received from index `from`.
+    fn kinds(&self, from: usize) -> Vec<String> {
+        self.seen[from..].iter().map(rv_sock_kind).collect()
+    }
+
+    /// Write `raw` as one line, as given (it need not be JSON).
+    async fn send_raw(&mut self, raw: &str) {
+        let mut line = raw.to_string();
+        line.push('\n');
+        let sent = tokio::time::timeout(RV_SOCK_EXPECT, async {
+            self.w.write_all(line.as_bytes()).await?;
+            self.w.flush().await
+        })
+        .await;
+        match sent {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("{}: writing {raw} failed: {e}\n{}", self.label, self.dump()),
+            Err(_) => panic!("{}: writing {raw} timed out\n{}", self.label, self.dump()),
+        }
+    }
+
+    /// The next line, collected; `None` if none arrives within `within`. A closed
+    /// connection, an I/O error, or a non-JSON line is a failure, never a `None`.
+    async fn next_within(&mut self, within: Duration) -> Option<JsonValue> {
+        match tokio::time::timeout(within, self.lines.next_line()).await {
+            Err(_elapsed) => None,
+            Ok(Ok(Some(raw))) => {
+                let line: JsonValue = serde_json::from_str(&raw).unwrap_or_else(|e| {
+                    panic!(
+                        "{}: a received line is not JSON ({e}): {raw}\n{}",
+                        self.label,
+                        self.dump()
+                    )
+                });
+                self.seen.push(line.clone());
+                Some(line)
+            }
+            Ok(Ok(None)) => panic!("{}: the connection closed\n{}", self.label, self.dump()),
+            Ok(Err(e)) => panic!("{}: reading failed: {e}\n{}", self.label, self.dump()),
+        }
+    }
+
+    /// Read, collecting every line, until `pred` matches one. One
+    /// `RV_SOCK_EXPECT` budget covers the whole wait.
+    async fn read_until(&mut self, what: &str, pred: impl Fn(&JsonValue) -> bool) -> JsonValue {
+        let deadline = tokio::time::Instant::now() + RV_SOCK_EXPECT;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match self.next_within(left).await {
+                Some(line) if pred(&line) => return line,
+                Some(_) => {}
+                None => panic!(
+                    "{}: no {what} within {RV_SOCK_EXPECT:?}\n{}",
+                    self.label,
+                    self.dump()
+                ),
+            }
+        }
+    }
+
+    /// `tools/call` `name` with `args` as request `id`; returns its reply.
+    async fn call(&mut self, id: u64, name: &str, args: JsonValue) -> JsonValue {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": args},
+        });
+        self.send_raw(&req.to_string()).await;
+        self.read_until(&format!("reply to {name} (id {id})"), |l| {
+            l["id"] == json!(id)
+        })
+        .await
+    }
+
+    /// `ping` as request `id`; returns its reply.
+    async fn ping(&mut self, id: u64) -> JsonValue {
+        let req = json!({"jsonrpc": "2.0", "id": id, "method": "ping"});
+        self.send_raw(&req.to_string()).await;
+        self.read_until(&format!("reply to ping (id {id})"), |l| {
+            l["id"] == json!(id)
+        })
+        .await
+    }
+
+    /// `flow.subscribe {}` as request 1; the reply must carry a `sub_id` (setup).
+    async fn subscribe(&mut self) {
+        let reply = self.call(1, "flow.subscribe", json!({})).await;
+        assert!(
+            reply["result"]["structuredContent"]["sub_id"]
+                .as_u64()
+                .is_some(),
+            "setup: the subscribe returns a u64 sub_id: {reply}\n{}",
+            self.dump()
+        );
+    }
+}
+
+/// `agent.set {"policy": policy}` run by `op`; the reply must report `policy`.
+async fn rv_wire_set_policy(op: &mut RvWire, id: u64, policy: &str) {
+    let reply = op.call(id, "agent.set", json!({"policy": policy})).await;
+    assert_eq!(
+        reply["result"]["structuredContent"]["policy"],
+        json!(policy),
+        "the operator's agent.set {policy} ran: {reply}\n{}",
+        op.dump()
+    );
+}
+
+/// Tester addition, strengthening AC18 and runnable in the sandbox: two agents A1
+/// and A2 and an operator O over the real writer. Under `paused` a burst (two flow
+/// pushes and a state push) reaches O in full and reaches neither agent, which
+/// receive exactly their own replies and nothing else (the whole stream is
+/// compared, not only "no F2"). On resume each agent gets exactly
+/// `[marker, agent.set audit, F4]`: one marker per connection, in front of its own
+/// first post-gap line, and none of the suppressed pushes. O is never marked and
+/// receives every push in order.
+///
+/// Why `rv_flow` is a fence here: it runs the fan-out synchronously, so when it
+/// returns each agent's sink already holds whatever it was going to hold. O is
+/// last in registry order, and its receipt of the final push is what the test
+/// waits on; the pings then flush each agent's sink through its writer before the
+/// quiet window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_push_real_writer_two_agents_pause_quiet_then_one_marker_each() {
+    let RvRig { srv, store, .. } = RvRig::new(AgentPolicy::Auto);
+    let srv = Arc::new(srv);
+    let host = "example.com:443";
+
+    // Registry order: A1, A2, O.
+    let (mut a1, _a1_sink, _a1_task) = RvWire::open(&srv, Frontend::Mcp, "A1 (agent)");
+    a1.subscribe().await;
+    let (mut a2, _a2_sink, _a2_task) = RvWire::open(&srv, Frontend::Mcp, "A2 (agent)");
+    a2.subscribe().await;
+    let (mut o, _o_sink, _o_task) = RvWire::open(&srv, Frontend::Operator, "O (operator)");
+    o.subscribe().await;
+
+    // Under `Auto` everyone receives F1: the subscriptions are live.
+    let f1 = rv_flow(&srv, &store, host, "/one");
+    for conn in [&mut a1, &mut a2, &mut o] {
+        let line = conn
+            .read_until("F1's flow line", |l| rv_sock_is_flow(l, &f1))
+            .await;
+        assert_eq!(
+            line["params"]["summary"]["path"],
+            json!("/one"),
+            "F1's flow line carries its path: {line}\n{}",
+            conn.dump()
+        );
+    }
+
+    // Pause, then a burst of three pushes while paused.
+    rv_wire_set_policy(&mut o, 2, "paused").await;
+    let f2 = rv_flow(&srv, &store, host, "/two");
+    let f3 = rv_flow(&srv, &store, host, "/three");
+    srv.push_state(json!({"k": 1}));
+    o.read_until("the burst's last push (the fence)", |l| {
+        l["method"] == "notifications/aitm/state" && l["params"] == json!({"k": 1})
+    })
+    .await;
+    for agent in [&mut a1, &mut a2] {
+        let pong = agent.ping(2).await;
+        assert_eq!(
+            pong["result"],
+            json!({}),
+            "a paused agent's ping is answered: {pong}\n{}",
+            agent.dump()
+        );
+    }
+    let (quiet1, quiet2) =
+        tokio::join!(a1.next_within(RV_SOCK_QUIET), a2.next_within(RV_SOCK_QUIET));
+    for (agent, extra) in [(&a1, quiet1), (&a2, quiet2)] {
+        assert!(
+            extra.is_none(),
+            "no line may reach a paused agent within {RV_SOCK_QUIET:?} of the fence, got {extra:?}\n{}",
+            agent.dump()
+        );
+        assert_eq!(
+            agent.kinds(0),
+            vec![
+                "reply 1".to_string(),
+                format!("flow {f1}"),
+                "reply 2".to_string()
+            ],
+            "while paused an agent's whole stream is its own replies and F1\n{}",
+            agent.dump()
+        );
+    }
+
+    // Resume, then one more flow.
+    let marks = [a1.seen.len(), a2.seen.len()];
+    rv_wire_set_policy(&mut o, 3, "auto").await;
+    let f4 = rv_flow(&srv, &store, host, "/four");
+    for (agent, mark) in [(&mut a1, marks[0]), (&mut a2, marks[1])] {
+        agent
+            .read_until("F4's flow line", |l| rv_sock_is_flow(l, &f4))
+            .await;
+        assert_eq!(
+            agent.kinds(mark),
+            vec![
+                "marker".to_string(),
+                "agent agent.set".to_string(),
+                format!("flow {f4}")
+            ],
+            "after resume: the marker, the agent.set audit line, then F4\n{}",
+            agent.dump()
+        );
+        let markers = agent.seen.iter().filter(|l| rv_is_marker(l)).count();
+        assert_eq!(
+            markers,
+            1,
+            "exactly one marker per connection\n{}",
+            agent.dump()
+        );
+        for suppressed in [&f2, &f3] {
+            assert!(
+                !agent
+                    .seen
+                    .iter()
+                    .any(|l| l.to_string().contains(suppressed.as_str())),
+                "a suppressed flow ({suppressed}) must never reach the agent\n{}",
+                agent.dump()
+            );
+        }
+    }
+
+    // O is never muted and never marked: every push, in order.
+    o.read_until("F4's flow line", |l| rv_sock_is_flow(l, &f4))
+        .await;
+    let o_pushes: Vec<String> = o
+        .kinds(0)
+        .into_iter()
+        .filter(|k| !k.starts_with("reply "))
+        .collect();
+    assert_eq!(
+        o_pushes,
+        vec![
+            format!("flow {f1}"),
+            "agent agent.set".to_string(),
+            format!("flow {f2}"),
+            format!("flow {f3}"),
+            "other notifications/aitm/state".to_string(),
+            "agent agent.set".to_string(),
+            format!("flow {f4}"),
+        ],
+        "the operator receives every push, in order, with no marker\n{}",
+        o.dump()
+    );
+}
+
+/// Tester addition, edge case: a connection dropped mid-stream. Agent A1 is gapped
+/// by a push under `paused` and then disconnects while the policy is still
+/// `paused`. The transport must sweep its subscription (A1's sink is closed and
+/// stays empty through the rest of the test, including after resume, when a
+/// leaked subscription would be handed the marker and the next flow), and the
+/// surviving agent A2 and the operator O must be undisturbed: A2 stays quiet,
+/// then gets exactly one marker in front of its own first post-gap line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_push_an_agent_dropping_while_paused_leaves_the_others_intact() {
+    let RvRig { srv, store, .. } = RvRig::new(AgentPolicy::Auto);
+    let srv = Arc::new(srv);
+    let host = "example.com:443";
+
+    let (mut a1, a1_sink, a1_task) = RvWire::open(&srv, Frontend::Mcp, "A1 (agent, drops)");
+    a1.subscribe().await;
+    let (mut a2, _a2_sink, _a2_task) = RvWire::open(&srv, Frontend::Mcp, "A2 (agent)");
+    a2.subscribe().await;
+    let (mut o, _o_sink, _o_task) = RvWire::open(&srv, Frontend::Operator, "O (operator)");
+    o.subscribe().await;
+
+    rv_wire_set_policy(&mut o, 2, "paused").await;
+    let f2 = rv_flow(&srv, &store, host, "/two");
+    assert!(
+        !a1_sink.is_closed(),
+        "setup: A1's connection is still open before it drops"
+    );
+
+    // A1 drops with a gap recorded; wait for the transport to finish its teardown.
+    drop(a1);
+    tokio::time::timeout(RV_SOCK_EXPECT, a1_task)
+        .await
+        .expect("A1's connection task ends within the deadline once the client is gone")
+        .expect("A1's connection task did not panic")
+        .expect("A1's connection task ends cleanly at EOF");
+    assert!(
+        a1_sink.is_closed(),
+        "the transport closes a dropped connection's sink"
+    );
+
+    // Still paused, now with A1 gone: O receives it, A2 stays quiet.
+    let f3 = rv_flow(&srv, &store, host, "/three");
+    o.read_until("F3's flow line (the fence)", |l| rv_sock_is_flow(l, &f3))
+        .await;
+    let pong = a2.ping(2).await;
+    assert_eq!(pong["result"], json!({}), "{pong}\n{}", a2.dump());
+    let extra = a2.next_within(RV_SOCK_QUIET).await;
+    assert!(
+        extra.is_none(),
+        "A2 stays quiet while paused, got {extra:?}\n{}",
+        a2.dump()
+    );
+    assert_eq!(
+        a2.kinds(0),
+        vec!["reply 1".to_string(), "reply 2".to_string()],
+        "A2's whole stream while paused is its own replies\n{}",
+        a2.dump()
+    );
+
+    // Resume: A2 is marked once; the dropped A1 is neither marked nor fed.
+    let mark = a2.seen.len();
+    rv_wire_set_policy(&mut o, 3, "auto").await;
+    let f4 = rv_flow(&srv, &store, host, "/four");
+    a2.read_until("F4's flow line", |l| rv_sock_is_flow(l, &f4))
+        .await;
+    assert_eq!(
+        a2.kinds(mark),
+        vec![
+            "marker".to_string(),
+            "agent agent.set".to_string(),
+            format!("flow {f4}")
+        ],
+        "after resume A2 gets the marker, the audit line, then F4\n{}",
+        a2.dump()
+    );
+    o.read_until("F4's flow line", |l| rv_sock_is_flow(l, &f4))
+        .await;
+    let o_pushes: Vec<String> = o
+        .kinds(0)
+        .into_iter()
+        .filter(|k| !k.starts_with("reply "))
+        .collect();
+    assert_eq!(
+        o_pushes,
+        vec![
+            "agent agent.set".to_string(),
+            format!("flow {f2}"),
+            format!("flow {f3}"),
+            "agent agent.set".to_string(),
+            format!("flow {f4}"),
+        ],
+        "the operator's stream is undisturbed by A1 dropping\n{}",
+        o.dump()
+    );
+    rv_assert_silent(
+        &a1_sink,
+        "the dropped A1's sink after the resume, the audit line, and F4",
+    );
+}
+
+/// Tester addition, edge case: malformed input and a refused call while muted.
+/// The mute is about pushes only. A paused agent's replies ride a different lane
+/// and must keep flowing: a malformed line gets its parse error, a command gets the
+/// policy refusal, a `ping` gets `{}`. If muting were ever done in the writer
+/// instead of at the fan-out (a rejected design) these replies would stop and the
+/// agent would hang. Meanwhile the agent receives no push (no line with a
+/// `method`), and on resume its first push is the marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn revoke_push_a_paused_agent_still_gets_every_reply_but_no_push() {
+    let RvRig { srv, store, .. } = RvRig::new(AgentPolicy::Auto);
+    let srv = Arc::new(srv);
+    let host = "example.com:443";
+
+    let (mut a, _a_sink, _a_task) = RvWire::open(&srv, Frontend::Mcp, "A (agent)");
+    a.subscribe().await;
+    let (mut o, _o_sink, _o_task) = RvWire::open(&srv, Frontend::Operator, "O (operator)");
+    o.subscribe().await;
+
+    rv_wire_set_policy(&mut o, 2, "paused").await;
+    let f2 = rv_flow(&srv, &store, host, "/two");
+    o.read_until("F2's flow line (the fence)", |l| rv_sock_is_flow(l, &f2))
+        .await;
+
+    // Malformed input: answered with a parse error, not swallowed, not a push.
+    a.send_raw("{this is not json").await;
+    let parse = a
+        .read_until("the parse-error reply", |l| {
+            l["error"]["code"] == json!(aitm_mcp::server::PARSE_ERROR)
+        })
+        .await;
+    assert!(
+        parse["id"].is_null(),
+        "a parse error carries a null id: {parse}\n{}",
+        a.dump()
+    );
+    // A command: refused by the policy gate, and the refusal still comes back.
+    let refused = a.call(3, "agent.status", json!({})).await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "a paused agent's command is refused: {refused}\n{}",
+        a.dump()
+    );
+    let text = refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("the agent policy is `paused`"),
+        "the refusal names the policy: {refused}\n{}",
+        a.dump()
+    );
+    let pong = a.ping(4).await;
+    assert_eq!(pong["result"], json!({}), "{pong}\n{}", a.dump());
+
+    let extra = a.next_within(RV_SOCK_QUIET).await;
+    assert!(
+        extra.is_none(),
+        "no push reaches the paused agent, got {extra:?}\n{}",
+        a.dump()
+    );
+    assert_eq!(
+        a.seen.len(),
+        4,
+        "exactly four lines so far: the subscribe reply, the parse error, the refusal, the pong\n{}",
+        a.dump()
+    );
+    assert!(
+        a.seen.iter().all(|l| l.get("method").is_none()),
+        "every line the paused agent received is a reply, none a push\n{}",
+        a.dump()
+    );
+
+    // Resume: the first push the agent gets is the marker.
+    let mark = a.seen.len();
+    rv_wire_set_policy(&mut o, 3, "auto").await;
+    let f3 = rv_flow(&srv, &store, host, "/three");
+    a.read_until("F3's flow line", |l| rv_sock_is_flow(l, &f3))
+        .await;
+    assert_eq!(
+        a.kinds(mark),
+        vec![
+            "marker".to_string(),
+            "agent agent.set".to_string(),
+            format!("flow {f3}")
+        ],
+        "after resume the agent's pushes are the marker, the audit line, then F3\n{}",
+        a.dump()
+    );
+}
