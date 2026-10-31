@@ -88,6 +88,28 @@ core="$app/Contents/Resources/core"
 for bin in obscura aitm; do
     [ -f "$core/$bin" ] || { echo "notarize-dmg.sh: $app is missing its embedded core ($core/$bin). Run scripts/package.sh then apps/mac/build.sh so the app bundles aitm + obscura, then re-run." >&2; exit 1; }
 done
+# The core's default detection catalogue must ship beside it: aitm discovers the
+# bundled Rhai scripts at <exe_dir>/share/aitm/scripts (crates/aitm/src/bundled.rs),
+# so without core/share/aitm/scripts the embedded core loads zero detections and
+# the app's Scripts page shows 0 active. The 0.5.4 DMG shipped exactly that.
+# build.sh stages the catalogue from the package.sh tarball; refuse to notarize
+# an app that lacks it rather than ship it silently again.
+catalogue="$core/share/aitm/scripts"
+rhai_count=0
+special=""
+if [ -d "$catalogue" ]; then
+    # Both finds check their own status, like the nested-code find below: under
+    # pipefail an errored find would otherwise end the script through set -e with
+    # no line naming the cause or the fix.
+    rhai_count=$(find "$catalogue" -type f -name '*.rhai' | wc -l | tr -d ' ') || { echo "notarize-dmg.sh: listing the detection catalogue in $catalogue failed (find exited non-zero)" >&2; exit 1; }
+    # Only regular files and directories ship in the sealed bundle: a symlink or a
+    # special file in the catalogue is not something the signature should seal
+    # (build.sh refuses to stage one; the core's loader never follows symlinks).
+    special=$(find "$catalogue" ! -type f ! -type d -print -quit) || { echo "notarize-dmg.sh: listing the detection catalogue in $catalogue failed (find exited non-zero)" >&2; exit 1; }
+fi
+[ "$rhai_count" -gt 0 ] || { echo "notarize-dmg.sh: $app has no bundled detection catalogue ($catalogue holds no *.rhai). Run scripts/package.sh then apps/mac/build.sh so the catalogue is bundled beside the core, then re-run." >&2; exit 1; }
+[ -z "$special" ] || { echo "notarize-dmg.sh: $catalogue contains a symlink or special file ($special); only regular files ship in the bundle. Re-run apps/mac/build.sh from a clean catalogue (it refuses to stage one like this), then re-run." >&2; exit 1; }
+echo "notarize-dmg.sh: catalogue  $rhai_count scripts in $catalogue"
 
 # Hardened runtime + secure timestamp: the Developer ID is a real identity, so the
 # timestamp is always wanted (build.sh drops it only for an ad-hoc dev identity).

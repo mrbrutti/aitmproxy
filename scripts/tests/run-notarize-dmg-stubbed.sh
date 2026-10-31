@@ -4,7 +4,11 @@
 # (SH-AC1, SH-AC2, SH-AC4, SH-AC6 and the "silent codesign success" anti-goal), plus the
 # stage-6 review fixes in docs/superpowers/plans/2026-10-30-macos-ne-ship-and-toggle-plan.md:
 # #8 (the app and the sysex must both carry TeamIdentifier 995PCLM9KH; cases 3g-3j) and
-# #10 (an errored find over the nested code aborts before anything is signed; case 4d).
+# #10 (an errored find over the nested code aborts before anything is signed; case 4d), and
+# the bundled detection catalogue guard (the 0.5.4 DMG shipped without core/share/aitm/scripts):
+# an app whose catalogue is missing, empty, or carries a symlink is refused before anything is
+# signed (cases 5f-5h), and an errored find over the catalogue says so instead of dying silently
+# (case 4e).
 #
 # check-notarize-dmg.sh reads the script's text. This one RUNS it. It builds a scratch copy
 # of the repo layout around the real notarize-dmg.sh, a fake Aitmproxy.app, and puts shims
@@ -113,16 +117,23 @@ cat >"$stub/bin/xcrun" <<'EOF'
 echo "xcrun $*" >>"$FAKE_LOG"
 exit 99
 EOF
-# The real find, then (FAKE_FIND_FAIL set) a non-zero status like find has after a read error. It
-# still lists everything it could read, so a script that ignores the status carries on with a
-# partial list and leaves the rest of the nested code unsigned.
+# The real find, then (FAKE_FIND_FAIL=<path>, for a find rooted at or under that path) a non-zero
+# status like find has after a read error. It still lists everything it could read, so a script
+# that ignores the status carries on with a partial list and leaves the rest of the nested code
+# unsigned. Scoped by root, like FAKE_FAIL_SIGN is by path: the script runs several finds (the
+# catalogue count, then the nested code), and failing them all would stop it at the first one,
+# whichever a case meant to test.
 cat >"$stub/bin/find" <<'EOF'
 #!/usr/bin/env bash
 /usr/bin/find "$@"
 rc=$?
 if [ -n "${FAKE_FIND_FAIL-}" ]; then
-    echo "find: simulated read error while listing nested code" >&2
-    exit 1
+    case $1 in
+    "$FAKE_FIND_FAIL" | "$FAKE_FIND_FAIL"/*)
+        echo "find: simulated read error while listing $1" >&2
+        exit 1
+        ;;
+    esac
 fi
 exit $rc
 EOF
@@ -132,7 +143,7 @@ chmod +x "$stub/bin/codesign" "$stub/bin/spctl" "$stub/bin/xcrun" "$stub/bin/fin
 sysex_name=com.mrbrutti.aitmproxy.ne.systemextension
 
 # mk_case <name> <ne|plain>: a scratch repo around the script under test plus a fake app.
-# Sets case_dir, app, sysex, log.
+# Sets case_dir, app, catalogue, sysex, log.
 mk_case() {
     case_dir=$work/$1
     mkdir -p "$case_dir/repo/scripts" "$case_dir/repo/apps/mac/Extension"
@@ -145,6 +156,10 @@ mk_case() {
     mkdir -p "$app/Contents/Resources/core"
     : >"$app/Contents/Resources/core/aitm"
     : >"$app/Contents/Resources/core/obscura"
+    # The bundled detection catalogue, beside the core, where build.sh stages it.
+    catalogue=$app/Contents/Resources/core/share/aitm/scripts
+    mkdir -p "$catalogue/http"
+    echo 'fn on_response(flow) { }' >"$catalogue/http/fixture.rhai"
     sysex=$app/Contents/Library/SystemExtensions/$sysex_name
     if [ "$2" = ne ]; then
         mkdir -p "$sysex/Contents/MacOS" "$sysex/Contents/Frameworks/Nested.framework"
@@ -363,10 +378,19 @@ expect_not "the app is not signed after a failed aitm sign" signed "$app"
 # status and signs whatever was listed; the release must stop before anything is signed.
 echo "--- case 4d: find fails while listing the code nested in the sysex"
 mk_case ne-find-fails ne
-run_case FAKE_FIND_FAIL=1
+run_case FAKE_FIND_FAIL="$sysex"
 rc_nonzero_not_dmg "an errored nested-code find"
 said "the failure says the nested-code listing failed" "listing the code nested in"
 expect_not "nothing is signed after the errored find" called "--sign"
+
+# The catalogue count is a `find | wc -l` under pipefail: an errored find there must stop the
+# release with its own message (cause and fix), not a silent set -e exit.
+echo "--- case 4e: find fails while listing the detection catalogue"
+mk_case ne-catalogue-find-fails ne
+run_case FAKE_FIND_FAIL="$catalogue"
+rc_nonzero_not_dmg "an errored catalogue find"
+said "the failure says the catalogue listing failed" "listing the detection catalogue"
+expect_not "nothing is signed after the errored catalogue find" called "--sign"
 
 # ============ Case 5: a bundle that cannot carry the entitlements is refused ===============
 echo "--- case 5a: no app provisioning profile"
@@ -398,6 +422,37 @@ rm -f "$app/Contents/Resources/core/obscura"
 run_case
 rc_nonzero_not_dmg "an app with no embedded obscura"
 expect_not "nothing is signed for a core-less app" called "--sign"
+
+# The 0.5.4 DMG shipped with core/ holding only aitm + obscura and no share/aitm/scripts, so
+# the embedded core loaded zero default detections. Refused here, before anything is signed.
+echo "--- case 5f: no bundled catalogue"
+mk_case plain-no-catalogue plain
+rm -rf "$app/Contents/Resources/core/share"
+run_case
+rc_nonzero_not_dmg "an app with no bundled catalogue"
+expect_not "nothing is signed for a catalogue-less app" called "--sign"
+said "the failure names the catalogue" "detection catalogue"
+
+# The guard counts *.rhai, not the directory: a catalogue holding only its README is as empty.
+echo "--- case 5g: a catalogue directory with no scripts in it"
+mk_case plain-empty-catalogue plain
+rm -rf "$catalogue/http"
+echo '# bundled detection catalogue' >"$catalogue/README.md"
+run_case
+rc_nonzero_not_dmg "an app whose catalogue holds no *.rhai"
+expect_not "nothing is signed for an app with an empty catalogue" called "--sign"
+said "the failure names the catalogue" "detection catalogue"
+said "the failure says the catalogue holds no scripts" "holds no *.rhai"
+
+# Only regular files ship in the sealed bundle: a symlink in the catalogue is refused, so what
+# the signature seals is exactly what the core reads.
+echo "--- case 5h: a symlink inside the catalogue"
+mk_case plain-symlink-catalogue plain
+ln -s fixture.rhai "$catalogue/http/link.rhai"
+run_case
+rc_nonzero_not_dmg "an app whose catalogue contains a symlink"
+expect_not "nothing is signed for an app with a symlink in its catalogue" called "--sign"
+said "the failure names symlinks/special files" "symlink"
 
 echo "--- case 5e: no app"
 mk_case no-app plain
