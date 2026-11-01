@@ -580,6 +580,8 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | coder note | Minor | at 90 columns the status bar keeps only the leftmost hints (`Esc back` drops first) | accepted (builder's call per D11) |
 | 14 | coder note | Minor | `profiles.rs` `FOOTER` reads `w save as`, the bar hint reads `w save` | fix round G-B (G84) |
 | 14 | coder note | Minor | pre-existing em dashes in `overlays.rs`, the flow list and the status bar | out of track; noted for the coordinator |
+| 14 | security | Minor | help overlay's Scan section cut off under 42 rows, no scroll; 100x30 is a T7-14 size | fix round G-B (G85): help scroll + 100x30 pin |
+| 14 | security | Minor | legacy-bus Profiles/Issues hints advertise inert keys | fix round G-B (G86) |
 
 ## Shipped
 
