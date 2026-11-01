@@ -370,10 +370,15 @@ fn split_command(host: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// `s` without a case-insensitive `prefix`.
+/// `s` without a case-insensitive ASCII `prefix`. Compared on bytes: `s` is
+/// request text, and a byte-indexed `str` slice panics when the index lands
+/// inside a multi-byte character (`slee\u{e9}` against `sleep`).
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    (s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then(|| &s[prefix.len()..])
+    let head = s.as_bytes().get(..prefix.len())?;
+    if !head.eq_ignore_ascii_case(prefix.as_bytes()) {
+        return None;
+    }
+    s.get(prefix.len()..)
 }
 
 // --- Seed 5: SSTI (`GET /greet?name=`) ---------------------------------------
@@ -876,6 +881,26 @@ mod tests {
         let elapsed = started.elapsed();
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn cmdi_non_ascii_after_separator_never_panics() {
+        // `slee\u{e9}` is six bytes whose fifth falls inside the `\u{e9}`: a
+        // byte-indexed prefix compare against `sleep` must not slice the str
+        // there. `sle\u{e9}p` lands on a boundary but still is not `sleep`.
+        for cmd in ["slee%C3%A9", "sle%C3%A9p"] {
+            let target = format!("/ping?host=a;{cmd}");
+            let (status, _, body) = get(V, &target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert!(body.contains("command not found"), "{target}: {body}");
+            // P refuses the `;` on its hostname allowlist (400), not a panic.
+            let (status, _, body) = get(P, &target).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{target}");
+            assert_eq!(body, "invalid host");
+        }
+        assert_eq!(strip_prefix_ci("slee\u{e9}", "sleep"), None);
+        assert_eq!(strip_prefix_ci("SLEEP 3", "sleep"), Some(" 3"));
+        assert_eq!(strip_prefix_ci("sl", "sleep"), None);
     }
 
     #[tokio::test]

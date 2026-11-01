@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
-use hyper::header::HeaderMap;
+use hyper::header::{HeaderMap, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -670,12 +670,18 @@ pub(crate) fn html(status: StatusCode, body: String) -> Resp {
         .expect("valid response")
 }
 
+/// A 302 to `location`. The value may be request-derived (the open-redirect
+/// seed): one hyper refuses is retried without CR/LF, so the seed keeps its
+/// semantics while a header split stays impossible; anything still invalid
+/// falls back to `/`. Nothing here can panic on the caller's text.
 pub(crate) fn redirect(location: &str) -> Resp {
-    Response::builder()
-        .status(StatusCode::FOUND)
-        .header("location", location)
-        .body(Full::new(Bytes::new()))
-        .expect("valid response")
+    let value = HeaderValue::from_str(location)
+        .or_else(|_| HeaderValue::from_str(&location.replace(['\r', '\n'], "")))
+        .unwrap_or_else(|_| HeaderValue::from_static("/"));
+    let mut resp = Response::new(Full::new(Bytes::new()));
+    *resp.status_mut() = StatusCode::FOUND;
+    resp.headers_mut().insert("location", value);
+    resp
 }
 
 pub(crate) fn not_found() -> Resp {
@@ -1082,6 +1088,34 @@ mod tests {
         assert!(e["headers"].get("authorization").is_none(), "{e}");
         assert_eq!(e["cookie_sha256"].as_str().map(str::len), Some(16), "{e}");
         assert_eq!(e["auth_sha256"].as_str().map(str::len), Some(16), "{e}");
+    }
+
+    #[tokio::test]
+    async fn redirect_with_crlf_in_next_never_panics() {
+        let location = |resp: &Resp| {
+            resp.headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        // V honours any `next`, but a CR/LF is not a header value hyper will
+        // carry: it is stripped, the rest of the open redirect survives.
+        let (state, conn) = fresh(SeedMode::Vulnerable);
+        let resp = get_on(&state, &conn, "/redirect?next=%0d%0aSet-Cookie:x=y").await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(location(&resp).as_deref(), Some("Set-Cookie:x=y"));
+        // Still a request, still logged with its status.
+        assert_eq!(state.log.http_json()["entries"][0]["status"], 302);
+        // Something hyper refuses even without CR/LF (a NUL) falls back to `/`.
+        let resp = get_on(&state, &conn, "/redirect?next=/%00x").await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(location(&resp).as_deref(), Some("/"));
+
+        // P: `/\r\nX` passes the same-origin allowlist; the CR/LF is stripped.
+        let (state, conn) = fresh(SeedMode::Patched);
+        let resp = get_on(&state, &conn, "/redirect?next=/%0d%0aX").await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(location(&resp).as_deref(), Some("/X"));
     }
 
     #[tokio::test]
