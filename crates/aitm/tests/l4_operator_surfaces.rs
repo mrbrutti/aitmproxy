@@ -9,13 +9,14 @@
 //! confirm-token lifecycle, and the audit ring.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aitm_core::McpTransport;
 use aitm_core::{
     AgentPolicy, AgentState, AuditResult, AuditRing, Frontend, HttpFlow, HttpRequest, MemFlowStore,
     ProxyClient, Registry, StdGuard,
 };
-use aitm_mcp::{ConnCtx, McpServer};
+use aitm_mcp::{ConnCtx, McpServer, NotificationSink};
 use aitm_plugins::AgentPlugin;
 use aitm_proto_l4::config::{InterceptConfig, L4Config};
 use aitm_proto_l4::types::{
@@ -516,6 +517,113 @@ fn agent_scope_add_not_offered_confirmation() {
     );
     assert!(res["structuredContent"]["confirm_token"].is_null());
     assert_eq!(scope_sources(&srv), before);
+}
+
+/// Security panel (unit (a')) — an operator's **approval** of a parked agent call is
+/// not an operator **confirmation**: under policy `ask` with widen OFF, the agent's
+/// `l4.scope.add` parks, the operator `agent.approve`s it, the call then runs *as the
+/// agent* and is still refused by the widen gate (the `OperatorConfirmed` proof is
+/// minted only on a trusted-control dispatch, never for an approved agent). The
+/// approval card's prompt carries no "re-issue with `_confirm`" instruction, and the
+/// list is unchanged.
+#[test]
+fn agent_scope_add_ask_approved_still_widen_gated() {
+    let cfg = l4_cfg();
+    assert!(!cfg.allow_agent_widen, "widen stays off");
+    let (srv, _r) = server(&cfg, AgentPolicy::Ask);
+    let srv = Arc::new(srv.with_approval_timeout(Duration::from_secs(60)));
+    let before = scope_sources(&srv);
+
+    // An operator connection with a push sink, subscribed so the agent's call can
+    // park (a Sensitive `ask` call with no operator connected is refused at once).
+    let sink = NotificationSink::new(64);
+    let operator = ConnCtx {
+        role: Frontend::Operator,
+        client_label: None,
+        conn_id: srv.next_conn_id(),
+        out: Some(sink.clone()),
+    };
+    let sub = json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": {"name": "flow.subscribe", "arguments": {}}});
+    let reply = srv
+        .handle_on(&operator, &sub.to_string())
+        .expect("flow.subscribe replies");
+    let reply: JsonValue = serde_json::from_str(&reply).expect("json");
+    assert!(
+        reply["result"]["structuredContent"]["sub_id"].is_u64(),
+        "the operator subscription registers: {reply}"
+    );
+
+    // The agent's call parks on its own thread.
+    let agent_srv = Arc::clone(&srv);
+    let agent = std::thread::spawn(move || {
+        call(&agent_srv, Frontend::Mcp, "l4.scope.add", scope_add_args())
+    });
+
+    // The operator is announced the parked call.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let request = loop {
+        let found = sink.drain().into_iter().find_map(|line| {
+            let v: JsonValue = serde_json::from_str(&line).expect("a pushed line is JSON");
+            (v["method"] == "notifications/aitm/agent"
+                && v["params"]["event"] == "approval_requested")
+                .then_some(v)
+        });
+        if let Some(v) = found {
+            break v;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no approval_requested within 5 s (agent finished: {})",
+            agent.is_finished()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(request["params"]["command"], json!("l4.scope.add"));
+    let prompt = request["params"]["prompt"].as_str().expect("prompt");
+    for word in ["127.0.0.1/32", "9100-9199", "lo0", "inbound", "capture"] {
+        assert!(prompt.contains(word), "the card names `{word}`: {prompt}");
+    }
+    assert!(
+        !prompt.contains("_confirm"),
+        "the approval card must not tell the operator to re-issue with `_confirm`: {prompt}"
+    );
+    let request_id = request["params"]["request_id"]
+        .as_str()
+        .expect("request_id")
+        .to_string();
+    assert!(
+        !agent.is_finished(),
+        "the agent call is parked, not answered"
+    );
+
+    // The operator approves. The call now runs as the agent.
+    let approved = call(
+        &srv,
+        Frontend::Operator,
+        "agent.approve",
+        json!({"request_id": request_id, "allow": true}),
+    );
+    assert!(
+        !is_error(&approved),
+        "approve succeeds: {}",
+        text(&approved)
+    );
+
+    let res = agent.join().expect("the agent thread");
+    assert!(is_error(&res), "the approved agent call is still refused");
+    assert!(
+        text(&res).contains("runtime L4 scope widening is disabled"),
+        "the refusal is the widen text, not a policy or approval text, got: {}",
+        text(&res)
+    );
+    assert_ne!(
+        res["structuredContent"]["status"],
+        json!("needs_confirmation"),
+        "an approved agent is still never offered a handshake"
+    );
+    assert_eq!(scope_sources(&srv), before, "approval widened nothing");
+    assert_eq!(widen(&srv), json!(false), "widen still off");
 }
 
 /// L4PAR-AC5 — `tools/list` reports `l4.scope.add` `confirmable: true` to the

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # e2e: tier=T1 surface=l4 serial needs=l4
-"""l4/l4_parity_core -- the L4 parity contract on an UNPRIVILEGED core (plan task A9).
+"""l4/l4_parity_core -- the L4 parity contract on an UNPRIVILEGED core (plan tasks A9, A6).
 
 Everything here is provable on a core that cannot capture (this Mac: /dev/bpf* is
 root-only), so it is the "[now]" half of the L4 parity spec, driven over the real MCP bus
@@ -369,8 +369,10 @@ def main() -> int:
         expect(scope_add_confirmable(tools),
                "tools/list shows l4.scope.add with confirmable: true (the UIs render their add control on it)",
                tool_by_name(tools, "l4.scope.add"))
-        expect(scope_add_confirmable(agent.tools()),
-               "the agent's tools/list shows the same confirmable: true (static per tool, never per role)")
+        agent_tools = agent.tools()
+        expect(scope_add_confirmable(agent_tools),
+               "the agent's tools/list shows the same confirmable: true (static per tool, never per role)",
+               tool_by_name(agent_tools, "l4.scope.add"))
 
         section("(2) AC3: l4.capture.status is honest for operator and agent; capture.start still refuses")
         check_status_verb(op, agent, "l4.capture.status", "l4.capture.start", "captures", ("needs_privilege",), iface)
@@ -397,10 +399,10 @@ def main() -> int:
         if scope_add_confirmable(tools):
             run_operator_scope_add(op, before_ids)
         else:
-            # (1b) already failed the cell; do not also send an un-confirmable add.
-            skipped_check("AC5 operator l4.scope.add confirm handshake, runtime provenance, widen unchanged, remove",
-                          "tools/list shows l4.scope.add confirmable=false: this core lacks unit (a') "
-                          "(fix/l4-parity-core-scope, task A6) -- already a FAIL at (1b)")
+            # (1b) already failed the cell for this; do not also send an un-confirmable add,
+            # and do not count the same defect twice.
+            print("note: (5) not run: tools/list shows l4.scope.add confirmable=false (this core lacks "
+                  "unit (a'), fix/l4-parity-core-scope task A6) -- already a FAIL at (1b)", flush=True)
 
         section("(6) AC6 agents unchanged: the widen gate, not a handshake")
         run_agent_scope_add(op, agent, before_ids)

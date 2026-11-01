@@ -55,10 +55,10 @@ know about the family:
   true` in `tools/list`); an operator call answers `needs_confirmation` with a
   prompt summarising the entry (cidr, ports or `all ports`, interface,
   direction, capability, inject rate or `inject refused (rate 0)`, and a
-  `WARNING` for a prefix wider than /16 or /48) and proceeds when re-issued
-  with `_confirm`; the CLI asks its confirmer unless `--yes`. The entry is
-  stored with `source: runtime` and never lifts the dangerous-destination
-  denylist; only `config.yaml` entries can.
+  `WARNING` for a prefix wider than /16 (IPv4) or /48 (IPv6)) and proceeds
+  when re-issued with `_confirm`; the CLI asks its confirmer unless `--yes`.
+  The entry is stored with `source: runtime` and never lifts the
+  dangerous-destination denylist; only `config.yaml` entries can.
 
 ## `flow.*`
 

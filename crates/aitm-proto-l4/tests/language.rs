@@ -442,13 +442,17 @@ impl HostCallContextSource for NoSource {
     }
 }
 
-/// L4PAR-AC6 (plan A6) — the Rhai face keeps calling `add_runtime_scope`: a script
-/// cannot be confirmed, so even a **trusted-control** caller (`Operator`) is still
-/// refused by the widen gate when it is off, and so is an `Agent`. Only the
-/// `l4.scope.add` *command* (behind the operator handshake / CLI confirmer) reaches
-/// the ungated path. Driven through the production `register_host_fns` seam.
+/// L4PAR-AC6 (plan A6) — the language face (Rhai and the PoC `l4:` step share it)
+/// keeps calling `add_runtime_scope`: a script cannot be confirmed, so even a
+/// **trusted-control** caller (`Operator`) is still refused by the widen gate when
+/// it is off, and so is an `Agent`. Only the `l4.scope.add` *command* (behind the
+/// operator handshake / CLI confirmer) reaches the ungated path. Driven through the
+/// production `register_host_fns` seam.
+///
+/// pin: green before and after A6; the compiler forbids this path from minting
+/// `OperatorConfirmed`.
 #[test]
-fn rhai_scope_add_trusted_caller_still_widen_gated() {
+fn language_scope_add_trusted_caller_still_widen_gated() {
     let guard = loopback_guard(false); // allow_agent_widen defaults to false
     let lang = L4Language::new(
         guard.clone(),

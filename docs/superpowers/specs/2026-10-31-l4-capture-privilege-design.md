@@ -1,9 +1,6 @@
 # L4 capture privilege, obtained by the product design
 
 **Status:** Approved (Matt, 2026-11-01: the recommended defaults for forks i–v). Decided: (i) macOS phase 1 ships B2, the SMAppService-registered permission daemon, with the single privileged helper (candidate 1) as phase 2; (ii) device group `access_bpf` (switch to `admin` only if spike S4 shows a re-login is needed); (iii) the Linux helper + polkit policy ship in deb/rpm only, no Homebrew cask pkg; (iv) "Allow packet capture" stays a separate switch from All Apps; (v) the first-run card keeps line 4 ("Any app you run can then capture and send raw packets"). Open: Matt's written acceptance of the headless `setcap` doc pointer. The orchestrator's bundle-layout conditions are folded into the body; the spikes run under the spike rule before phase 1 code.
-conditions (2026-10-31, approved in principle) are folded into §2.3, §2.4, §3.2, §4.4, §4.5 and §10; the
-release-pipeline files stay claimed through the orchestrator, which reviews those diffs. Panel fixes of 2026-10-31
-folded in.
 **Research inputs:** `docs/research/13-l4-capture-privilege-without-cli.md` (primary), `12-l4-parity-audit.md` (D0,
 D11a, the rig), `08-l4-packet-rust.md` (privilege model, candidate F), `10-macos-network-extension.md` and
 `experiments/2026-10-29-macos-ne-spike.md` (the sysex), `docs/RELEASE.md`, `scripts/notarize-dmg.sh`,
@@ -53,7 +50,7 @@ app, TUI, web UI, CLI) able to show the state honestly and offer the one action 
 
 - A reply, toast, label, log line or doc string in the product that tells the operator to run `sudo`, `setcap`,
   `chmod`, `chgrp`, `dseditgroup`, `launchctl` or `pkexec` as the way forward. (Whether the docs may describe the
-  headless Linux fallback is open question 6; the product never points at it as the default.)
+  headless Linux fallback is the open item (headless `setcap` doc); the product never points at it as the default.)
 - A privilege request that fires without a human operator's act: from an agent, from a gated verb that failed, from a
   URL a web page opened, or from a background poll.
 - A privileged component that checks less than today's `L4Guard` where it writes.
@@ -552,8 +549,8 @@ pkexec is never run. **(Architect's call.)**
 - `docs/packet-capture.md` (new) would document, for admins of headless hosts only: copy the helper to a root-owned
   path, restrict it to a group (0750 `root:aitm-l4`), give it `cap_net_raw+ep`, and set `l4.privilege.helper_path`.
   Caps go on the helper, never on `aitm`. Upgrades replace the file and drop the caps, so the step is redone after
-  each upgrade. **This doc, and any product message pointing at it, needs Matt's written acceptance first** (open
-  question 6): it is a command-line step. Until then the `cannot_prompt` message names no doc.
+  each upgrade. **This doc, and any product message pointing at it, needs Matt's written acceptance first** (the
+  open item, the headless `setcap` doc): it is a command-line step. Until then the `cannot_prompt` message names no doc.
 - NixOS: the same doc gives a `security.wrappers.aitm-l4-helper` entry (`source` = the package's helper, `capabilities
   = "cap_net_raw+ep"`, owner root, group `aitm-l4`, permissions group-execute only). Discovery already checks
   `/run/wrappers/bin`. The CVE-2026-25740 lesson is why the helper has no scripting or exec surface.
@@ -630,21 +627,48 @@ backend/helper}.rs`; `crates/aitm-l4-helper/` (workspace crate, `version.workspa
 helper carry one version); `apps/mac/LaunchDaemons/com.mrbrutti.aitmproxy.l4-helper{,-revert}.plist`;
 `apps/mac/Sources/AitmproxyKit/PacketCapture.swift` and tests; `apps/mac/Sources/Aitmproxy/{Privilege/
 PacketCaptureHelper,Panels/PacketCaptureCard}.swift`; `apps/mac/tools/check-packet-helper.sh` (tripwires);
-`scripts/packaging/com.mrbrutti.aitmproxy.l4-helper.policy`; `docs/packet-capture.md` (only after open question 6);
+`scripts/packaging/com.mrbrutti.aitmproxy.l4-helper.policy`; `docs/packet-capture.md` (only after the open item, the
+headless `setcap` doc, is accepted);
 `tests/e2e/l4/test_privilege_*.py` (on the canonical `tests/e2e/aitm_e2e` harness).
 
 Changed:
 
 - `crates/aitm-proto-l4/src/{module,capture,sendrecv,language,config}.rs`, `commands/{capture,intercept,mod}.rs`
 - `crates/aitm/src/{wire,main}.rs`; `crates/aitm-mcp/src/server.rs` (`is_operator_only` only)
-- `apps/mac/Info.plist.in` (URL type), `ConnectionSummary.swift`, `L4.swift` (privilege decoding),
-  `EmbeddedCoreLaunch.swift`, `StatusPanel.swift`, `SettingsView.swift`, `App.swift` (URL handler), the L4 surface
-  file that hosts the capture controls (named in the plan)
+- `apps/mac/Info.plist.in` (URL type), `ConnectionSummary.swift`, `EmbeddedCoreLaunch.swift`, `StatusPanel.swift`,
+  `SettingsView.swift`, `App.swift` (URL handler), the L4 surface file that hosts the capture controls (named in the
+  plan: `Panels/L4CaptureControls.swift`, new). Privilege decoding lives in the new `PacketCapture.swift` (plan
+  P3.1); `L4.swift` is not changed.
 - `apps/mac/build.sh`, `scripts/notarize-dmg.sh` and its stub test, `scripts/package.sh`, `scripts/nfpm.yaml`,
   `scripts/package-linux.sh`, `docs/RELEASE.md`; the tap repo's `Casks/aitmproxy.rb`
 - `crates/aitm-tui/src/{app,l4,keys}.rs`, `ui/l4.rs`
 - `apps/web/src/panels/l4/L4PrivilegeBanner.tsx` (new) and the L4 store
 - the three tool contracts (`EXPECTED_TOOLS`, `CORE_TOOLS`, `bus-fixture.json`)
+
+Also claimed by the plan (Architect's call, plan 2026-10-31), per unit; the files marked **behaviour surfaces, flagged
+for Matt** carry user-visible change this spec did not list:
+
+- (p1a) new `crates/aitm-proto-l4/src/privilege/contract.rs`, `helper/{frame,enforce}.rs`; changed
+  `crates/aitm-proto-l4/src/lib.rs`, `crates/aitm-proto-l4/Cargo.toml` (none expected)
+- (p1b) new `crates/aitm-proto-l4/src/privilege/{report,availability,state}.rs`, `backend/routed.rs`,
+  `crates/aitm-proto-l4/tests/privilege.rs`; changed `crates/aitm-proto-l4/src/{lib,guard}.rs`, `helper/mod.rs`,
+  `backend/mod.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing`, Linux `nix`), `crates/aitm/tests/frontends.rs`,
+  `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only), `crates/aitm-tui/tests/tester_shell.rs` (two count pins),
+  `tests/e2e/l4/{test_l4_parity_core,test_l4_parity_priv}.py`, `docs/research/mcp-tool-catalog.txt`,
+  `aitmproxy-plugin/docs/tool-reference.md`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`
+- (p2) new `tests/e2e/l4/linux-privilege-rig.sh`; changed the root `Cargo.toml` (`members`, workspace dep),
+  `Cargo.lock`
+- (p3) new `apps/mac/Sources/AitmproxyKit/L4Capture.swift`, `apps/mac/Tests/AitmproxyKitTests/L4CaptureTests.swift`,
+  `apps/mac/Sources/Aitmproxy/Panels/L4CaptureControls.swift`, `apps/mac/tools/{check-packet-capture-ui,
+  cua-packet-capture}.sh`; changed `apps/mac/Tests/AitmproxyKitTests/{ConnectionSummaryTests,
+  EmbeddedCoreLaunchTests}.swift`, `apps/mac/tools/check-connection-words.sh`, and — **behaviour surfaces, flagged for
+  Matt** — `apps/mac/Sources/Aitmproxy/Session.swift`, `apps/mac/Sources/Aitmproxy/Panels/ScopePanel.swift`,
+  `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (L4 empty state)
+- (p5) new `scripts/tests/check-linux-packaging.sh`
+- (p6) new `crates/aitm-tui/tests/l4_privilege.rs`, `apps/web/src/panels/l4/{privilege.ts,privilege.test.ts}`,
+  `apps/web/scripts/cua-l4-privilege.mjs`; changed `crates/aitm-tui/src/{action,bus,lib}.rs`, and — **behaviour
+  surfaces, flagged for Matt** — `crates/aitm/src/tui.rs` (in-process flag only),
+  `apps/web/src/panels/l4/CaptureControls.tsx`, `apps/web/src/panels/l4/PacketList.tsx`
 
 ## Acceptance criteria
 
@@ -768,7 +792,7 @@ these run on Matt's Mac via the Terminal and CUA recipe. **[linux-desk]** a Linu
     the banner is gone with capture `available`.
 23. **L4PRIV-AC23 [linux-ci]** With `DISPLAY` and `WAYLAND_DISPLAY` unset and stdin not a tty, the request returns
     `cannot_prompt` and no pkexec runs. Its message names `docs/packet-capture.md` only if Matt accepted that doc
-    (question 6), and otherwise names no doc.
+    (the open item, the headless `setcap` doc), and otherwise names no doc.
 24. **L4PRIV-AC24 [linux-ci, mac-any, trip]** With L4 enabled and capture not available, the start-up log has exactly
     one line `L4 enabled; packet capture needs approval: …`, matching neither the AC3 regex nor the operator token.
     The three tool contracts list `l4.privilege` and `l4.privilege.request`.

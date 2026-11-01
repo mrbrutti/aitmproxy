@@ -198,7 +198,7 @@ The prepared privileged walk (capture lo0, real HTTP/TCP/UDP traffic, `l4.flow.g
 ### 8. Order
 
 - (b), (d) and (e) are independent of each other. (c) reads `l4.capture.status` today and would break on the new shape, so (c) merges **before** (a), or on the same day; (c) tolerates both shapes.
-- (a') is cut from `main` after (a) merges and merges after Matt answers fork (ii). Because every UI shows its scope-add control only when `tools/list` reports `l4.scope.add` `confirmable: true`, the UI units may merge before (a').
+- (a') is cut from `main` after (a) merges; fork (ii) was decided 2026-11-01 (operator confirm), so (a') merges on its own panel. Because every UI shows its scope-add control only when `tools/list` reports `l4.scope.add` `confirmable: true`, the UI units may merge before (a').
 - Every UI unit's live checks that depend on (a) or (a') run on a local integration of that unit with them. (e) documents (a)/(a') behaviour and merges after them.
 - The privilege spec's core branch is cut after (a) merges; its TUI, web and mac branches after (b), (c) and (d) merge.
 
@@ -277,7 +277,8 @@ Snapshot, fixture self-test and mock-bus steps are **not** accepted as proof for
 
 Decided on 2026-10-31 (routine calls; Matt may override): **(i)** keep `InMemoryL4FlowStore` with UI polling; folding L4 into the core `FlowStore` (D8, an `aitm-core` change and the natural home for D9) is its own spec after D0. **(iii)** the macOS intercept bar is one documented-limited line with the core's reason and no buttons (L4OPS-AC12).
 
+Decided on 2026-11-01 (Matt): **(ii) Operator scope add** — operator confirm-over-the-wire (§3), not the agent Widen gate. It matches §2.3/§3.3 of the operator-surfaces spec and leaves the Widen gate meaning exactly "may the agent widen"; reusing the gate would have forced the operator to open the agent's door to add scope themselves. Shipped as unit (a') (plan task A6).
+
 Still with Matt:
 
-1. **(ii) Operator scope add.** Operator confirm-over-the-wire (§3), or reuse the agent Widen gate? **Recommended: operator confirm.** It matches §2.3/§3.3 of the operator-surfaces spec and leaves the Widen gate meaning exactly "may the agent widen"; reusing the gate forces the operator to open the agent's door to add scope themselves. It ships as (a'), so (a) does not wait on this answer.
-2. **`content` text without base64.** The orchestrator asked that `l4.flow.get`'s MCP `content` text omit the base64 `bytes`. The `content` text is rendered generically by `aitm-mcp` (`render::render_content`, summary plus the whole value); a per-verb omission needs either a new `Command` hook (an `aitm-core` edit, which this spec forbids) or a generic `aitm-mcp` render rule (for example: a string under a key named `bytes` longer than 64 characters renders as `<N bytes, base64, in structuredContent>`, which would also shorten `l4.craft`). **Recommended: the generic `aitm-mcp` rule, in its own small change after (a).** The 4 MiB budget already keeps the duplicated reply under the cap without it.
+1. **`content` text without base64.** The orchestrator asked that `l4.flow.get`'s MCP `content` text omit the base64 `bytes`. The `content` text is rendered generically by `aitm-mcp` (`render::render_content`, summary plus the whole value); a per-verb omission needs either a new `Command` hook (an `aitm-core` edit, which this spec forbids) or a generic `aitm-mcp` render rule (for example: a string under a key named `bytes` longer than 64 characters renders as `<N bytes, base64, in structuredContent>`, which would also shorten `l4.craft`). **Recommended: the generic `aitm-mcp` rule, in its own small change after (a).** The 4 MiB budget already keeps the duplicated reply under the cap without it.

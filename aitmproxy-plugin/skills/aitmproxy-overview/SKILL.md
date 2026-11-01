@@ -105,22 +105,22 @@ Re-read the status verbs instead of remembering them: privilege can change while
 the core runs.
 
 **Scope and the agent gates.** L4 scope is separate from HTTP scope.
-`l4.scope.list` shows the entries, each with `source: config | runtime`; scope is
-normally declared in `config.yaml`. A runtime `l4.scope.add` from an agent is refused
-(`runtime L4 scope widening is disabled; declare scope in the l4.scope config
-…`) unless the operator opened the Widen gate with
+`l4.scope.list` shows the entries, each with `source: config | runtime`; scope
+is normally declared in `config.yaml`. A runtime `l4.scope.add` from an agent
+is refused (`runtime L4 scope widening is disabled; declare scope in the
+l4.scope config …`) unless the operator opened the Widen gate with
 `l4.agent.set {capability: widen, allowed: true}`. The operator adds scope
-without the Widen gate: an operator (or CLI) `l4.scope.add` is a confirmed
-call (`confirmable: true` in `tools/list`; the core answers
-`needs_confirmation` with a prompt summarising the entry, and the operator
-re-issues it with `_confirm`); the entry is stored with `source: runtime` and
-never lifts the dangerous-destination denylist. An agent is never offered that
-handshake, so ask the operator to add the entry (or to open the Widen gate).
-Narrowing with `l4.scope.remove` is never Widen-gated (agent policy still
-applies). Four per-capability gates govern the
-agent path: `inject`, `capture`, `intercept` and `widen`. `l4.agent.status`
-reads them; only the operator can flip them with `l4.agent.set`. The agent can
-never open its own gates; respect a closed one.
+without the Widen gate: `l4.scope.add` is confirmable (`confirmable: true` in
+`tools/list`); the operator call answers `needs_confirmation` with a prompt
+summarising the entry and proceeds when re-issued with `_confirm`, and the CLI
+asks its confirmer unless `--yes`. The entry is stored with `source: runtime`
+and never lifts the dangerous-destination denylist. An agent is never offered
+that handshake, so ask the operator to add the entry (or to open the Widen
+gate). Narrowing with `l4.scope.remove` is never Widen-gated (agent policy
+still applies). Four per-capability gates govern the agent path: `inject`,
+`capture`, `intercept` and `widen`. `l4.agent.status` reads them; only the
+operator can flip them with `l4.agent.set`. The agent can never open its own
+gates; respect a closed one.
 
 **Capture and read packets.** `l4.capture.start {interface, direction?}`
 (Capture gate) returns a capture flow id; `l4.capture.stop {id}` ends it.

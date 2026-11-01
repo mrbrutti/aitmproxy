@@ -16,27 +16,24 @@ use aitm_core::{
 use crate::guard::L4Guard;
 use crate::types::{L4ScopeEntry, L4ScopeId, L4ScopeSource, RateCap};
 
-/// Proof that a present human confirmed an `l4.scope.add` (spec §3, fork (ii)).
+/// Proof that `l4.scope.add` was dispatched on a **trusted-control** path (spec §3,
+/// fork (ii)): the MCP server's `Frontend::Operator` or the CLI's `Frontend::Cli`.
 ///
-/// A zero-sized token [`L4Guard::add_operator_scope`] demands. Its only constructor
-/// is private to this module, so the one place that can mint it is
-/// [`ScopeAdd::invoke`] on the trusted-control branch — after the MCP server's
-/// confirm-over-the-wire handshake (`Frontend::Operator`) or the CLI's `Confirmer`
-/// (`Frontend::Cli`) has asked the human. Rhai, the PoC `l4:` step and every other
-/// in-process caller cannot name a value of this type, so they cannot reach the
-/// ungated path: the compiler enforces it, not a source grep.
-pub struct OperatorConfirmed(());
+/// A zero-sized token [`L4Guard::add_operator_scope`] demands. It proves exactly
+/// one thing — that the call reached [`ScopeAdd::invoke`] with
+/// `caller_is_trusted_control()` true — and nothing about the human: the
+/// confirmation step itself is the dispatcher's (the MCP server's
+/// confirm-over-the-wire handshake, the CLI's `Confirmer`), which runs before
+/// `invoke` is ever called. Its only constructor is private to this module and the
+/// type is crate-private, so Rhai, the PoC `l4:` step and every other in-process
+/// caller cannot name a value of it and cannot reach the ungated path: the compiler
+/// enforces it, not a source grep.
+pub(crate) struct OperatorConfirmed(());
 
 impl OperatorConfirmed {
-    /// Mint the proof. Reachable only from this module (see the type docs).
+    /// Mint the proof. Reachable only from this module (see the type docs); the unit
+    /// tests below are inside it, so no test-only constructor exists.
     pub(in crate::commands::scope) fn new() -> Self {
-        Self(())
-    }
-
-    /// A proof for **unit tests of the guard** (absent from every non-test build, so
-    /// the production invariant — only this module mints one — is untouched).
-    #[cfg(test)]
-    pub(crate) fn test_only() -> Self {
         Self(())
     }
 }
@@ -50,9 +47,13 @@ fn wide_range_warning(cidr: &crate::types::IpCidr) -> Option<String> {
 
 /// The operator confirm prompt for a parsed entry (spec §3): capability, cidr, ports
 /// (`all ports` for the full range), interface, direction and the inject rate
-/// (`inject refused (rate 0)` when 0), the denylist rule, and how to proceed.
+/// (`inject refused (rate 0)` when 0), and the denylist rule. It says nothing about
+/// *how* to confirm: the dispatcher that shows it (the MCP server's
+/// confirm-over-the-wire reply, the CLI `Confirmer`) explains its own handshake, and
+/// under policy `ask` the same text is the agent approval card, where a "re-issue
+/// with `_confirm`" instruction would mislead the operator.
 fn confirm_prompt_for(entry: &L4ScopeEntry) -> String {
-    let ports = if entry.ports.lo == 0 && entry.ports.hi == 65535 {
+    let ports = if entry.ports.is_any() {
         "all ports".to_string()
     } else {
         format!("ports {}", super::ports_to_string(&entry.ports))
@@ -67,7 +68,7 @@ fn confirm_prompt_for(entry: &L4ScopeEntry) -> String {
     };
     let mut prompt = format!(
         "Confirm l4.scope.add: {} scope for {} {ports} on {} ({}), {rate}. A runtime entry \
-         never lifts the dangerous-destination denylist. Re-issue with `_confirm` to add.",
+         never lifts the dangerous-destination denylist.",
         super::capability_to_string(entry.capability),
         super::cidr_to_string(&entry.cidr),
         entry.interface,
@@ -171,10 +172,7 @@ impl Command for ScopeAdd {
     fn confirm_prompt(&self, args: &Params) -> Option<String> {
         Some(match entry_from_params(args) {
             Ok(entry) => confirm_prompt_for(&entry),
-            Err(e) => format!(
-                "Confirm l4.scope.add: add an L4 scope entry ({e:#}). Re-issue with \
-                 `_confirm` to add."
-            ),
+            Err(e) => format!("Confirm l4.scope.add: add an L4 scope entry ({e:#})."),
         })
     }
 
@@ -285,10 +283,28 @@ impl Command for ScopeList {
     }
 }
 
+/// The longest interface name the OS accepts (`IFNAMSIZ` is 16 including the NUL).
+const IFNAMSIZ_MAX: usize = 15;
+
+/// Accept an `interface` only if it is an OS interface name:
+/// `^[A-Za-z0-9._:-]{1,15}$`. Both add paths (operator-confirmed and agent) build
+/// their entry through [`entry_from_params`], so both are covered; a rejected value
+/// is echoed escaped (`{:?}`), never raw, so a control or ANSI sequence cannot reach
+/// a terminal or a UI through the error text.
+fn validate_interface(s: &str) -> anyhow::Result<String> {
+    let name_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-');
+    if s.is_empty() || s.len() > IFNAMSIZ_MAX || !s.chars().all(name_char) {
+        anyhow::bail!(
+            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got {s:?}"
+        );
+    }
+    Ok(s.to_string())
+}
+
 /// Build a scope entry from the flattened, human-friendly `scope.add` params.
 fn entry_from_params(args: &Params) -> anyhow::Result<L4ScopeEntry> {
     let cidr = super::parse_cidr(args.get_str("cidr")?)?;
-    let interface = args.get_str("interface")?.to_string();
+    let interface = validate_interface(args.get_str("interface")?)?;
     let direction = super::parse_direction(args.get_str("direction")?)?;
     let capability = super::parse_capability(args.get_str("capability")?)?;
     let ports = match args.get("ports") {
@@ -447,10 +463,11 @@ mod tests {
         )
     }
 
+    /// The L4PAR-AC5 entry without `ports` (the base every prompt test extends);
+    /// the one ports case adds `("ports", "9100-9199")` explicitly.
     fn ac5_params() -> Vec<(&'static str, Value)> {
         vec![
             ("cidr", Value::Str("127.0.0.1/32".into())),
-            ("ports", Value::Str("9100-9199".into())),
             ("interface", Value::Str("lo0".into())),
             ("direction", Value::Str("inbound".into())),
             ("capability", Value::Str("capture".into())),
@@ -461,6 +478,59 @@ mod tests {
         ScopeAdd::new(Arc::new(L4Guard::new(&L4Config::default())))
     }
 
+    /// Security panel (unit (a')): `interface` is an OS interface name, so both add
+    /// paths (operator-confirmed and agent) accept only `^[A-Za-z0-9._:-]{1,15}$`
+    /// (IFNAMSIZ). Empty, over-long, control and ANSI-escape names are refused with
+    /// an error naming the param and the rule; real names pass through verbatim.
+    #[test]
+    fn interface_is_validated() {
+        let with_interface = |iface: &str| -> anyhow::Result<L4ScopeEntry> {
+            let mut p = ac5_params();
+            p.retain(|(k, _)| *k != "interface");
+            p.push(("interface", Value::Str(iface.to_string())));
+            entry_from_params(&params(&p))
+        };
+
+        let err = with_interface("").expect_err("an empty interface is refused");
+        assert_eq!(
+            err.to_string(),
+            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \"\""
+        );
+        let err = with_interface("abcdefghijklmnop").expect_err("16 characters is refused");
+        assert_eq!(
+            err.to_string(),
+            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \
+             \"abcdefghijklmnop\""
+        );
+        let err = with_interface("lo0\n").expect_err("a control character is refused");
+        assert_eq!(
+            err.to_string(),
+            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \
+             \"lo0\\n\""
+        );
+        let err = with_interface("\x1b[31mlo0").expect_err("an ANSI escape is refused");
+        assert_eq!(
+            err.to_string(),
+            "param `interface` must be 1-15 characters of [A-Za-z0-9._:-] (IFNAMSIZ), got \
+             \"\\u{1b}[31mlo0\""
+        );
+        assert!(with_interface("lo 0").is_err(), "a space is refused");
+        assert!(with_interface("en0/1").is_err(), "a slash is refused");
+
+        for ok in [
+            "lo0",
+            "en0",
+            "utun3",
+            "br-1",
+            "eth0.100",
+            "wg_0:1",
+            "abcdefghijklmno",
+        ] {
+            let entry = with_interface(ok).unwrap_or_else(|e| panic!("`{ok}` is accepted: {e}"));
+            assert_eq!(entry.interface, ok);
+        }
+    }
+
     /// Spec §3 / plan A6: `confirm_prompt` is `Some` even with empty args, so
     /// `tools/list` (which probes with `Params::default()`) reports `confirmable:
     /// true` and every UI renders its scope-add control.
@@ -469,35 +539,33 @@ mod tests {
         let prompt = scope_add()
             .confirm_prompt(&Params::default())
             .expect("l4.scope.add is always confirmable");
-        assert!(
-            prompt.starts_with("Confirm l4.scope.add: add an L4 scope entry ("),
-            "the no-args prompt names the verb and the missing-arg error, got: {prompt}"
-        );
-        assert!(
-            prompt.ends_with("Re-issue with `_confirm` to add."),
-            "the prompt tells the operator how to proceed, got: {prompt}"
+        // The verb, the missing-arg error, and nothing else: the handshake itself is
+        // the dispatcher's to explain (MCP server / CLI confirmer), so the prompt
+        // carries no "re-issue with `_confirm`" sentence that would mislead when the
+        // same text is shown on an agent approval card under policy `ask`.
+        assert_eq!(
+            prompt,
+            "Confirm l4.scope.add: add an L4 scope entry (missing required param `cidr`)."
         );
     }
 
-    /// L4PAR-AC5: with the AC5 arguments the prompt summarises the entry — it names
-    /// the cidr, ports, interface, direction and capability, and the denylist rule.
+    /// L4PAR-AC5: with the AC5 arguments (the base plus `ports: 9100-9199`) the prompt
+    /// summarises the entry — the five AC5 strings (cidr, ports, interface, direction,
+    /// capability), the rate, and the denylist rule — and ends there: no "re-issue
+    /// with `_confirm`" sentence (the dispatcher explains its own handshake).
     #[test]
     fn confirm_prompt_summarises_entry() {
+        let mut p = ac5_params();
+        p.push(("ports", Value::Str("9100-9199".into())));
         let prompt = scope_add()
-            .confirm_prompt(&params(&ac5_params()))
+            .confirm_prompt(&params(&p))
             .expect("valid args are confirmable");
         assert_eq!(
             prompt,
             "Confirm l4.scope.add: capture scope for 127.0.0.1/32 ports 9100-9199 on lo0 \
              (inbound), inject refused (rate 0). A runtime entry never lifts the \
-             dangerous-destination denylist. Re-issue with `_confirm` to add."
+             dangerous-destination denylist."
         );
-        for word in ["127.0.0.1/32", "9100-9199", "lo0", "inbound", "capture"] {
-            assert!(
-                prompt.contains(word),
-                "prompt must contain `{word}`: {prompt}"
-            );
-        }
     }
 
     /// L4PAR-AC5 (unit): ports omitted ⇒ `all ports`; `inject_rate_pps: 0` ⇒
@@ -509,7 +577,7 @@ mod tests {
         let cmd = scope_add();
         let prompt_for = |overrides: &[(&str, Value)]| -> String {
             let mut p = ac5_params();
-            p.retain(|(k, _)| !overrides.iter().any(|(ok, _)| ok == k) && *k != "ports");
+            p.retain(|(k, _)| !overrides.iter().any(|(ok, _)| ok == k));
             p.extend(overrides.iter().cloned());
             cmd.confirm_prompt(&params(&p))
                 .expect("valid args are confirmable")
@@ -539,7 +607,7 @@ mod tests {
         let p = prompt_for(&[("cidr", Value::Str("10.0.0.0/8".into()))]);
         assert!(p.contains("WARNING: /8 is a wide range"), "got: {p}");
         assert!(
-            p.ends_with("Re-issue with `_confirm` to add. WARNING: /8 is a wide range."),
+            p.ends_with("dangerous-destination denylist. WARNING: /8 is a wide range."),
             "got: {p}"
         );
         let p = prompt_for(&[("cidr", Value::Str("10.0.0.0/16".into()))]);
@@ -560,6 +628,67 @@ mod tests {
                 "Confirm l4.scope.add: add an L4 scope entry (bad CIDR address `nonsense`"
             ),
             "got: {p}"
+        );
+    }
+
+    /// L4PAR-AC7 (plan A6) — the operator-confirmed path (`add_operator_scope`)
+    /// skips the widen gate but, like every runtime add, funnels through
+    /// `push_runtime`: the stored entry is `Runtime` even when the caller passed
+    /// `Config`, so an operator runtime add of the cloud-metadata address never lifts
+    /// the dangerous-destination denylist, `dangerous_dst_override` notwithstanding.
+    /// Lives here because only this module can mint the `OperatorConfirmed` proof.
+    #[test]
+    fn operator_scope_cannot_lift_denylist() {
+        use crate::guard::L4GuardError;
+        use crate::types::{L4Action, L4Proto, L4Target};
+
+        let cfg = L4Config {
+            dangerous_dst_override: true,
+            ..L4Config::default()
+        };
+        assert!(
+            !cfg.allow_agent_widen,
+            "widen stays off: the operator path skips it"
+        );
+        let guard = L4Guard::new(&cfg);
+
+        let spoofed = L4ScopeEntry {
+            id: L4ScopeId::new(),
+            cidr: IpCidr {
+                addr: "169.254.169.254".parse().expect("literal v4 address"),
+                prefix: 32,
+            },
+            ports: PortRange::ANY,
+            interface: "eth0".to_string(),
+            direction: L4Direction::Outbound,
+            capability: L4Capability::Inject,
+            inject_rate: RateCap {
+                pps: 100,
+                burst: 100,
+            },
+            source: L4ScopeSource::Config,
+        };
+        let id = guard.add_operator_scope(spoofed, OperatorConfirmed::new());
+
+        let stored = guard.list_scope();
+        assert_eq!(stored.len(), 1, "the operator add stored exactly one entry");
+        assert_eq!(stored[0].id, id);
+        assert_eq!(
+            stored[0].source,
+            L4ScopeSource::Runtime,
+            "an operator runtime add is stored as Runtime, never Config"
+        );
+        let target = L4Target {
+            interface: "eth0".to_string(),
+            direction: L4Direction::Outbound,
+            dst: Some("169.254.169.254".parse().expect("literal v4 address")),
+            dst_port: Some(80),
+            proto: L4Proto::Tcp,
+        };
+        assert_eq!(
+            guard.check(L4Action::Inject, &target).unwrap_err(),
+            L4GuardError::DangerousDestinationBlocked("169.254.169.254".into()),
+            "an operator runtime add must not lift the denylist"
         );
     }
 }

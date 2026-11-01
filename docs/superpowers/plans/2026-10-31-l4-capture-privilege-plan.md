@@ -1,6 +1,6 @@
 # L4 capture privilege implementation plan
 
-**Status:** Approved (Matt, 2026-11-01, defaults); spikes first
+**Status:** Approved (Matt, 2026-11-01, defaults for the spec's forks); tasks P7.1 and the AC5 `all`-case half of P1b.17 blocked on Question 2; spikes first
 **Spec:** `docs/superpowers/specs/2026-10-31-l4-capture-privilege-design.md` (approved 2026-11-01, forks i–v on the
 recommended defaults; acceptance criteria L4PRIV-AC1 … L4PRIV-AC29). Still open: Matt's written acceptance of the
 headless `setcap` doc (spec open question; blocks Task P5.4 only).
@@ -14,7 +14,7 @@ its own PR against `main`. Worktrees are created by the orchestrator in the Term
 | Unit | Branch | Worktree | Cut after | Tasks |
 |---|---|---|---|---|
 | (p1a) shared contracts | `feat/l4priv-contracts` | `.claude/worktrees/l4priv-contracts` | now | P1a.1–P1a.4 |
-| (p1b) core | `feat/l4priv-core` | `.claude/worktrees/l4priv-core` | p1a merged | P1b.1–P1b.18 |
+| (p1b) core | `feat/l4priv-core` | `.claude/worktrees/l4priv-core` | p1a merged and parity (a') merged | P1b.1–P1b.18 |
 | (p2) helper crate | `feat/l4priv-helper` | `.claude/worktrees/l4priv-helper` | p1a merged | P2.1–P2.9 |
 | (p3) macOS app | `feat/l4priv-mac` | `.claude/worktrees/l4priv-mac` | parity (d) merged; S3, S5 written up | P3.1–P3.13 |
 | (p4) release pipeline | `feat/l4priv-release` | `.claude/worktrees/l4priv-release` | S3 written up; orchestrator's go on §4 layout | P4.1–P4.7 |
@@ -74,10 +74,10 @@ fresh Coder, is test-first, and ends in one commit. The independent sets are lis
 4. **Helper and extension bundle-layout changes go to the orchestrator (release driver) before implementation.**
    This covers p4 entirely, plus `apps/mac/Info.plist.in` (P3.9). The Coder sends the task's Files list and the
    exact paths, keys and sign order. The Coder waits for the orchestrator's go before the first edit.
-5. **The spike rule (HARD RULE, verbatim):** any spike that changes system state on Matt's Mac (chmod /dev/bpf*,
-   group creation or membership, installing a LaunchDaemon, Login Items prompts) is announced to the orchestrator
-   BEFORE it runs with its exact revert steps, runs only on its go after Matt has been told, and is reverted in the
-   same session; spikes that can run in a VM run there.
+5. **The spike rule (HARD RULE, verbatim from the spec's Constraints):** Any spike that changes system state on
+   Matt's Mac (chmod `/dev/bpf*`, group creation or membership, installing a LaunchDaemon, Login Items prompts) is
+   announced to the orchestrator before it runs, with its exact revert steps; it runs only on the orchestrator's go
+   after Matt has been told, and is reverted in the same session. Spikes that can run in a VM run there.
 6. **The live checks tagged [mac-signed] change machine state.** They install a LaunchDaemon, change `/dev/bpf*`,
    change group membership, and raise a Login Items prompt. They follow the same rule: announce with the revert
    steps (Remove Packet Capture…, then the AC14 read-back), run only on the orchestrator's go after Matt says yes
@@ -177,7 +177,11 @@ A file in two units is never open in both at once. The "after" column says why.
 Overlaps, all sequential: `crates/aitm-tui/src/lib.rs` is touched by p1b (`CORE_TOOLS`) and then by p6 (cut after p1b
 merges). `crates/aitm-proto-l4/src/{lib.rs, privilege/mod.rs, helper/mod.rs}` are touched by p1a and then by p1b (cut
 after p1a merges). `crates/aitm/src/{wire,main,tui}.rs` were touched by parity unit (a), which is merged.
-`crates/aitm-mcp/src/server.rs` was touched by system-proxy PR 1, which is merged: p7 is cut from current `main`.
+`crates/aitm-proto-l4/src/guard.rs`, `crates/aitm-proto-l4/src/commands/mod.rs`,
+`tests/e2e/l4/test_l4_parity_core.py`, `aitmproxy-plugin/docs/tool-reference.md` and
+`aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md` are touched by parity (a') and then by p1b, which is why p1b
+is cut only after (a') merges. `crates/aitm-mcp/src/server.rs` was touched by system-proxy PR 1, which is merged: p7
+is cut from current `main`.
 
 ---
 
