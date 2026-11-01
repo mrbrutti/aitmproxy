@@ -3,7 +3,7 @@
 //! Everything a check reads out of a response passes through here, and
 //! everything here is bounded and scrubbed. A response body is matched at most
 //! [`MAX_MATCH_BODY`] bytes deep and every excerpt a check quotes into an
-//! [`Evidence`] goes through [`scrub`] and is then cut by
+//! [`Evidence`] goes through the crate-private `scrub` and is then cut by
 //! [`Evidence::excerpt`], so a hostile target cannot grow an issue, a log line
 //! or a bus message without limit, and a credential it printed next to the
 //! match does not become evidence (spec D8.1 and D8.2, "Redaction").
@@ -102,8 +102,12 @@ pub fn length_differs(a: usize, b: usize, baseline: usize) -> bool {
 /// store, the push stream and the UIs see `[redacted]` where the credential
 /// was. It is deliberately the core's vocabulary and not a local list: one
 /// scanner-shaped exception is how the two diverge.
+///
+/// Crate-private: every caller is a check in this crate, and a scrub that
+/// other crates could reach for would be a second entry point to keep in
+/// step with the core's (spec re-review SP2-1).
 #[must_use]
-pub fn scrub(text: &str) -> String {
+pub(crate) fn scrub(text: &str) -> String {
     aitm_core::redact::scrub_text(text)
 }
 
@@ -112,7 +116,7 @@ pub fn scrub(text: &str) -> String {
 ///
 /// Two things happen here, in this order (spec D8.1, "Redaction"):
 ///
-/// 1. `hay` goes through [`scrub`], the one shared credential vocabulary, so a
+/// 1. `hay` goes through `scrub`, the one shared credential vocabulary, so a
 ///    session cookie or an API key the target happened to print next to the
 ///    match never becomes evidence;
 /// 2. the result is cut to [`MAX_EXCERPT_BYTES`] on character boundaries,

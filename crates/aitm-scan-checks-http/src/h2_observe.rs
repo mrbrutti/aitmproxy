@@ -446,7 +446,7 @@ impl H2Check {
             plan: RawH2Plan {
                 target: RawH2Target {
                     scheme: target.scheme.clone(),
-                    authority: target.wire_authority(),
+                    authority: target.wire_authority.clone(),
                 },
                 headers,
                 mode,
@@ -528,7 +528,7 @@ impl Check for H2Check {
                 return inconclusive(NOT_A_PROFILE_ORIGIN);
             }
             let key = target.origin_key();
-            if self.guard.seen(&key, Instant::now()) {
+            if self.guard.seen(key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
             // The scope gate: the guarded job client must reach this authority
@@ -549,7 +549,7 @@ impl Check for H2Check {
             }
             // Claimed only now, so a refused baseline does not burn the
             // authority; atomic, so two concurrent points open one connection.
-            if !self.guard.claim(&key, Instant::now()) {
+            if !self.guard.claim(key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
             match self.runner.run(plan).await {
@@ -568,13 +568,25 @@ const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
 const BUDGET_TOO_LOW: &str = "budget too low for the raw probe";
 
 /// Where a raw probe goes, cut from a point's URL by [`crate::url`].
-#[derive(Debug, PartialEq, Eq)]
+///
+/// Everything here is a plain string computed once in [`Target::parse`],
+/// which is the one place the URL's optional parts are handled: a `Target`
+/// that exists has a scheme, a wire authority and a canonical origin, so no
+/// accessor needs a fallback (quality re-review Q2-5).
+#[derive(Debug)]
 struct Target {
-    /// The point's authority, parsed once: lower-case host, the port as the
-    /// URL wrote it, userinfo dropped.
-    authority: crate::url::Authority,
     /// `http` or `https`, lower-cased.
     scheme: String,
+    /// `host[:port]` as a client writes it: the form that goes in the
+    /// `:authority` pseudo-header and in [`RawH2Target`], with the scheme's
+    /// default port left out as every HTTP client leaves it out; userinfo
+    /// dropped, host lower-cased.
+    wire_authority: String,
+    /// The canonical `scheme://host:port`, the scheme's default port filled
+    /// in. Both the profile-origin gate and the once-per-authority guard key
+    /// on this one string, so two spellings of one origin can never be
+    /// compared as two (security review SEC-C3).
+    origin_key: String,
     /// The request path without its query, or `/`.
     path: String,
 }
@@ -588,6 +600,9 @@ impl Target {
         if scheme != "http" && scheme != "https" {
             return None;
         }
+        // An absolute `http(s)` URL always has a canonical origin; the `?`
+        // is for the type, not for a case this branch can reach.
+        let origin_key = authority.origin_key()?;
         let path = rest.split(['?', '#']).next().unwrap_or("");
         let path = if path.starts_with('/') && path.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
             path.to_string()
@@ -595,8 +610,9 @@ impl Target {
             "/".to_string()
         };
         Some(Self {
-            authority,
             scheme,
+            wire_authority: authority.as_written(),
+            origin_key,
             path,
         })
     }
@@ -608,27 +624,16 @@ impl Target {
         let mut headers = vec![
             RawHeader::new(":method", "GET"),
             RawHeader::new(":scheme", &self.scheme),
-            RawHeader::new(":authority", &self.wire_authority()),
+            RawHeader::new(":authority", &self.wire_authority),
             RawHeader::new(":path", &self.path),
         ];
         headers.extend(extra);
         headers
     }
 
-    /// `host[:port]` as a client writes it: the form that goes in the
-    /// `:authority` pseudo-header and in [`RawH2Target`], with the scheme's
-    /// default port left out as every HTTP client leaves it out.
-    fn wire_authority(&self) -> String {
-        self.authority.as_written()
-    }
-
-    /// The canonical `scheme://host:port`. Both the profile-origin gate and
-    /// the once-per-authority guard key on this one string, so two spellings
-    /// of one origin can never be compared as two (security review SEC-C3).
-    fn origin_key(&self) -> String {
-        self.authority
-            .origin_key()
-            .unwrap_or_else(|| format!("{}://{}", self.scheme, self.authority.as_written()))
+    /// See [`Self::origin_key`] (the field).
+    fn origin_key(&self) -> &str {
+        &self.origin_key
     }
 
     /// Whether the job's profile names this origin.
@@ -640,12 +645,11 @@ impl Target {
     /// origin the profile wrote without a scheme names no origin and
     /// authorises nothing (interim gate for sender finding SEC-1, item C6).
     fn is_a_profile_origin(&self, origins: &[String]) -> bool {
-        let key = self.origin_key();
         origins
             .iter()
             .filter_map(|origin| crate::url::authority_of(origin))
             .filter_map(|origin| origin.origin_key())
-            .any(|origin| origin == key)
+            .any(|origin| origin == self.origin_key)
     }
 }
 
@@ -1025,9 +1029,19 @@ mod tests {
     fn target_parse_cuts_scheme_authority_and_path() {
         let t = Target::parse("https://origin.test/x?y=1").expect("a usable url");
         assert_eq!(t.scheme, "https");
-        assert_eq!(t.wire_authority(), "origin.test");
+        assert_eq!(t.wire_authority, "origin.test");
         assert_eq!(t.path, "/x");
         assert_eq!(t.origin_key(), "https://origin.test:443");
+
+        // A written port stays on the wire form and in the key; userinfo and
+        // case go; a non-http(s) scheme is not dialable.
+        let t = Target::parse("HTTP://User:pw@Origin.TEST:8080/a/b#f").expect("a usable url");
+        assert_eq!(t.scheme, "http");
+        assert_eq!(t.wire_authority, "origin.test:8080");
+        assert_eq!(t.path, "/a/b");
+        assert_eq!(t.origin_key(), "http://origin.test:8080");
+        assert!(Target::parse("ftp://origin.test/").is_none());
+        assert!(Target::parse("//origin.test/").is_none());
     }
 
     /// The gate compares canonical origins, so every spelling of the one

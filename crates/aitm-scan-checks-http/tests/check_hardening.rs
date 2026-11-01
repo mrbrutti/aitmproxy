@@ -29,8 +29,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aitm_scan_model::{
-    Check, Confidence, InsertionKind, InsertionPoint, Outcome, ProbeHost, ProbeResponse, Speed,
-    Verdict, MAX_EXCERPT_BYTES, MAX_MATCH_BODY,
+    Check, Confidence, InsertionKind, InsertionPoint, Outcome, ProbeHost, ProbeResponse, RawProbe,
+    Speed, Verdict, MAX_EXCERPT_BYTES, MAX_MATCH_BODY,
 };
 
 use support::{html, point, redirect, response, ScriptedHost, TARGET_URL};
@@ -1070,4 +1070,54 @@ async fn a_deadline_that_passes_mid_run_stops_after_the_probe_in_flight() {
         assert_eq!(verdict.confidence, Confidence::Tentative, "{id}");
         assert!(verdict.poc_hint.is_none(), "{id}");
     }
+}
+
+/// The scripted host's refusal script is one script for both kinds of
+/// stimulus (quality re-review Q2-5): the n-th probe is refused whether a
+/// check sends it shaped (`probe`) or raw (`probe_raw`), and "fail after n"
+/// counts both too. A harness that refused only shaped probes would let a
+/// raw-probing check pass a mid-series refusal test it should fail.
+#[tokio::test]
+async fn the_scripted_host_refuses_a_raw_probe_by_the_same_script() {
+    fn raw(path: &str) -> RawProbe {
+        RawProbe {
+            method: "GET".to_string(),
+            url: format!("http://127.0.0.1:8099{path}"),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }
+    }
+
+    let host = ScriptedHost::new().with_probe_refused_at(2);
+    assert!(
+        host.probe_raw(raw("/a")).await.is_ok(),
+        "the first is answered"
+    );
+    assert!(
+        host.probe_raw(raw("/b")).await.is_err(),
+        "the second raw probe is the refused one"
+    );
+    assert!(
+        host.probe_raw(raw("/c")).await.is_ok(),
+        "the third is answered"
+    );
+    assert_eq!(host.sent_targets().len(), 3, "every attempt is recorded");
+
+    // Shaped and raw stimuli share one count: the refused "second" may be a
+    // raw probe after a shaped one.
+    let host = ScriptedHost::new().with_probe_refused_at(2);
+    let shaped = aitm_scan_model::Payload {
+        value: "x".to_string(),
+        mode: aitm_scan_model::PayloadMode::Replace,
+        bytes: None,
+    };
+    assert!(host.probe(&shaped).await.is_ok());
+    assert!(host.probe_raw(raw("/b")).await.is_err());
+
+    let host = ScriptedHost::new().with_probes_failing_after(1);
+    assert!(host.probe_raw(raw("/a")).await.is_ok());
+    assert!(
+        host.probe_raw(raw("/b")).await.is_err(),
+        "raw probes past the failure point are refused"
+    );
 }

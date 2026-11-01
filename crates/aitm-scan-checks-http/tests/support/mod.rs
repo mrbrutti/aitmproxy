@@ -362,10 +362,10 @@ impl ScriptedHost {
         hit
     }
 
-    /// Whether the probe now being sent is refused: past
-    /// [`Self::with_probes_failing_after`], or exactly the one
-    /// [`Self::with_probe_refused_at`] names.
-    fn past_the_failure_point(&self) -> bool {
+    /// Whether the stimulus now being sent — shaped or raw, they share one
+    /// count — is refused: past [`Self::with_probes_failing_after`], or
+    /// exactly the one [`Self::with_probe_refused_at`] names.
+    fn refuses_this_probe(&self) -> bool {
         let so_far = self.sent_probes().len();
         self.probes_fail_after.is_some_and(|n| so_far > n)
             || self.probe_refused_at.contains(&so_far)
@@ -395,7 +395,7 @@ impl ProbeHost for ScriptedHost {
                     target: self.target.clone(),
                 });
             self.spend()?;
-            if self.probes_fail || self.past_the_failure_point() {
+            if self.probes_fail || self.refuses_this_probe() {
                 anyhow::bail!("the scripted host refused this probe");
             }
             Ok(self.answer(&payload.value))
@@ -413,7 +413,7 @@ impl ProbeHost for ScriptedHost {
                     target: req.url.clone(),
                 });
             self.spend()?;
-            if self.probes_fail {
+            if self.probes_fail || self.refuses_this_probe() {
                 anyhow::bail!("the scripted host refused this raw probe");
             }
             Ok(self.answer(&req.url))

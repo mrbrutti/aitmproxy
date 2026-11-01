@@ -326,10 +326,12 @@ fn no_sleep_call_in_the_source() {
             "blind_timing.rs must never call {call}: the check reads elapsed_ms"
         );
     }
-    // And the payload is written out, not assembled: an operator reading the
-    // module sees exactly what goes on the wire.
+    // And the payload is spelled in the source, not hidden behind a constant
+    // or assembled from pieces: an operator reading the module sees what goes
+    // on the wire. (The rendered series itself is pinned by the probe test;
+    // this does not pin the `format!` spelling, Q2-6.)
     assert!(
-        src.contains(r#"format!("'||pg_sleep({n})--")"#),
+        src.contains("pg_sleep("),
         "the postgres payload must be written inline"
     );
 }
