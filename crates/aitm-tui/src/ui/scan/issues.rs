@@ -7,30 +7,32 @@
 //!
 //! Row layout (builder's call, from the D11 mockup): `>` cursor mark, the
 //! confidence glyph pair, the name, `METHOD path_template`, `kind:name` and
-//! the status, in columns measured from the rows and cut from the right when
-//! the pane is narrow. Hue only on data (D13): the headers in
-//! `Theme::severity`, everything else text tokens.
+//! the status, in columns measured from the rows the model already bounded
+//! (D6 hostile-core bounds); when the pane is narrow the name gives way
+//! first, then the location, then the point column is dropped. Hue only on
+//! data (D13): the headers in `Theme::severity`, everything else text
+//! tokens.
 
+use aitm_poc::Severity;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::scan::{count_of, grouped, issue_row, severity_header, IssuePane, IssueRow, ScanOffer};
+use crate::scan::{
+    count_of, grouped, severity_header, IssuePane, IssueRow, ScanOffer, LOCATION_MAX, NAME_MAX,
+    POINT_MAX,
+};
 use crate::theme::Theme;
 use crate::ui::bars::put;
-use crate::ui::scan::{note, pane_rule, panes, Panes};
+use crate::ui::scan::{note, pane_rule, panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, fit, truncate, width};
 
 /// Blank cells between columns.
 const GAP: usize = 2;
-/// The widest a `name` cell grows before it is cut.
-const NAME_MAX: usize = 40;
-/// The widest a location cell grows before it is cut.
-const LOCATION_MAX: usize = 32;
-/// The widest a `kind:name` cell grows before it is cut.
-const POINT_MAX: usize = 24;
+/// The widest a status cell grows (`false_positive` is fourteen cells).
+const STATUS_MAX: usize = 14;
 /// The narrowest a cut column is allowed to get before the next one goes.
 const COLUMN_MIN: usize = 8;
 /// The list pane's footer (D11): the filter keys.
@@ -43,11 +45,12 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         ScanOffer::None | ScanOffer::Legacy => {}
         ScanOffer::V2 if !app.has_tool("scan.issues") => {}
         ScanOffer::V2 if app.scan.issues.list.is_empty() => empty(app, theme, area, buf),
+        // The detail pane is the Issues detail task's; until it lands the
+        // pane is left blank so nothing on screen claims to be the issue.
         ScanOffer::V2 => {
             let split = panes(area);
             pane_rule(theme, &split, buf);
             list(app, theme, split.list, buf);
-            detail(app, theme, &split, buf);
         }
     }
 }
@@ -87,7 +90,7 @@ fn banner(theme: &Theme, text: String, area: Rect, buf: &mut Buffer) {
 
 /// One line of the grouped list: a severity header or a row index.
 enum Entry {
-    Header(aitm_poc::Severity),
+    Header(Severity),
     Row(usize),
 }
 
@@ -100,10 +103,10 @@ struct Columns {
 }
 
 impl Columns {
-    /// Measure the rows, each column at least its narrowest content up to
-    /// its cap; when the whole row does not fit `avail`, the name, then the
-    /// location, give way down to [`COLUMN_MIN`], then the point column is
-    /// dropped (the detail pane carries it).
+    /// Measure the rows, each column its widest content up to its cap (at
+    /// least one cell); when the whole row does not fit `avail`, the name,
+    /// then the location, give way down to [`COLUMN_MIN`], then the point
+    /// column is dropped (the detail pane carries it).
     fn measure(rows: &[IssueRow], avail: usize) -> Self {
         let widest = |f: fn(&IssueRow) -> &str, cap: usize| -> usize {
             rows.iter()
@@ -116,7 +119,7 @@ impl Columns {
             name: widest(|r| &r.name, NAME_MAX),
             location: widest(|r| &r.location, LOCATION_MAX),
             point: Some(widest(|r| &r.point, POINT_MAX)),
-            status: widest(|r| &r.status, 14),
+            status: widest(|r| r.status, STATUS_MAX),
         };
         if c.total() > avail {
             c.name = c.name.saturating_sub(c.total() - avail).max(COLUMN_MIN);
@@ -162,8 +165,9 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if body_h == 0 {
         return;
     }
-    let rows: Vec<IssueRow> = issues.list.iter().map(issue_row).collect();
-    let cols = Columns::measure(&rows, usize::from(area.width));
+    // The rows were bounded and built when the page was folded (D6).
+    let rows = &issues.rows;
+    let cols = Columns::measure(rows, usize::from(area.width));
     let mut entries: Vec<Entry> = Vec::with_capacity(rows.len() + 5);
     for (severity, members) in grouped(&issues.list) {
         entries.push(Entry::Header(severity));
@@ -182,15 +186,19 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         match entry {
             Entry::Header(severity) => {
                 let n = count_of(&issues.by_severity, *severity);
-                let label = format!(" {} {n}", severity_header(*severity));
+                let header = severity_header(*severity);
                 // A zero header is greyed, not hidden (spec call 11); a
                 // counted one wears its severity hue (D13: hue on data).
                 let style = if n == 0 {
                     theme.text_tertiary()
                 } else {
-                    theme.severity(&severity_header(*severity))
+                    theme.severity(header)
                 };
-                put(buf, line_area, Line::styled(label, style));
+                put(
+                    buf,
+                    line_area,
+                    Line::styled(format!(" {header} {n}"), style),
+                );
             }
             Entry::Row(idx) => {
                 if *idx == cursor && focused {
@@ -222,7 +230,7 @@ fn row_line(theme: &Theme, cols: &Columns, row: &IssueRow, under_cursor: bool) -
     let gap = " ".repeat(GAP);
     let mark = if under_cursor { ">" } else { " " };
     let mut spans = vec![
-        Span::styled(mark.to_string(), theme.accent()),
+        Span::styled(mark, theme.accent()),
         Span::styled(format!("{} ", row.glyphs), theme.text_secondary()),
         Span::styled(fit(&row.name, cols.name), theme.text_primary()),
         Span::styled(
@@ -237,15 +245,11 @@ fn row_line(theme: &Theme, cols: &Columns, row: &IssueRow, under_cursor: bool) -
         ));
     }
     spans.push(Span::styled(
-        format!("{gap}{}", fit(&row.status, cols.status)),
+        format!("{gap}{}", fit(row.status, cols.status)),
         theme.text_tertiary(),
     ));
     Line::from(spans)
 }
-
-/// The detail pane is the Issues detail task's; until it lands the pane is
-/// left blank so nothing on screen claims to be the issue.
-fn detail(_app: &App, _theme: &Theme, _panes: &Panes, _buf: &mut Buffer) {}
 
 #[cfg(test)]
 mod tests {
@@ -257,12 +261,13 @@ mod tests {
             name: name.into(),
             location: "GET /search".into(),
             point: "query:q".into(),
-            status: "open".into(),
+            status: "open",
         }
     }
 
     /// Wide: every column at its content; narrow: the name gives way first,
-    /// then the point column is dropped, and the row always fits.
+    /// then the location, then the point column is dropped, and the row
+    /// always fits.
     #[test]
     fn columns_shrink_from_the_name_then_drop_the_point() {
         let rows = vec![row("Reflected cross-site scripting")];

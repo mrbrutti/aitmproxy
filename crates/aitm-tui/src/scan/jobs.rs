@@ -9,7 +9,7 @@ use aitm_scan_model::{
     Phase, StoppedReason,
 };
 
-use super::is_job_id;
+use super::{is_job_id, lane_token, severity_counts, severity_token, SEVERITY_ORDER};
 use crate::ui::text::truncate;
 
 /// Which pane of the Jobs tab holds the cursor.
@@ -349,24 +349,20 @@ pub fn probe_bar(sent: u64, budget: u64, cells: usize) -> String {
     bar
 }
 
-/// The severity bar's levels, gravest first: the `Theme::severity` label and
-/// the cell glyph. Block heights encode the level so the stack reads on a
-/// terminal without colour (builder's call; the spec leaves the glyphs open).
-pub const SEVERITY_LEVELS: [(&str, &str); 5] = [
-    ("critical", "█"),
-    ("high", "▆"),
-    ("medium", "▄"),
-    ("low", "▂"),
-    ("info", "▁"),
-];
+/// The severity bar's cell glyph per level, indexed like
+/// [`SEVERITY_ORDER`] (gravest first). Block heights encode the level so
+/// the stack reads on a terminal without colour (builder's call; the spec
+/// leaves the glyphs open); the `Theme::severity` label of a run is its
+/// severity's [`severity_token`].
+pub const SEVERITY_LEVELS: [&str; 5] = ["█", "▆", "▄", "▂", "▁"];
 
 /// How many of `cells` each severity of `b` gets, gravest first (the order
-/// of [`SEVERITY_LEVELS`]): every non-zero severity gets one cell, the rest
+/// of [`SEVERITY_ORDER`]): every non-zero severity gets one cell, the rest
 /// are shared in proportion by largest remainder (ties to the graver), so a
 /// single critical among a hundred lows still shows. With fewer cells than
 /// non-zero severities the gravest ones take them. All zero: all zero.
 pub fn severity_segments(b: &BySeverity, cells: usize) -> [usize; 5] {
-    let counts = [b.critical, b.high, b.medium, b.low, b.info];
+    let counts = severity_counts(b);
     let total: u128 = counts.iter().map(|c| u128::from(*c)).sum();
     let mut seg = [0usize; 5];
     if total == 0 || cells == 0 {
@@ -413,11 +409,12 @@ pub fn severity_runs(b: &BySeverity, cells: usize) -> Vec<(&'static str, String)
     if seg.iter().all(|n| *n == 0) {
         return vec![("", BAR_NONE.repeat(cells))];
     }
-    SEVERITY_LEVELS
+    SEVERITY_ORDER
         .iter()
+        .zip(SEVERITY_LEVELS)
         .zip(seg)
         .filter(|(_, n)| *n > 0)
-        .map(|((label, glyph), n)| (*label, glyph.repeat(n)))
+        .map(|((severity, glyph), n)| (severity_token(*severity), glyph.repeat(n)))
         .collect()
 }
 
@@ -460,7 +457,7 @@ pub fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
         let skipped: Vec<String> = lanes
             .skipped
             .iter()
-            .map(|s| format!("{} ({})", lane_name(s.lane), s.reason))
+            .map(|s| format!("{} ({})", lane_token(s.lane), s.reason))
             .collect();
         lane_text.push_str(" · skipped ");
         lane_text.push_str(&skipped.join(", "));
@@ -483,7 +480,7 @@ pub fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
         let by_lane: Vec<String> = p
             .by_lane
             .iter()
-            .map(|(lane, n)| format!("{} {n}", lane_name(*lane)))
+            .map(|(lane, n)| format!("{} {n}", lane_token(*lane)))
             .collect();
         probes.push_str(" · by lane ");
         probes.push_str(&by_lane.join(", "));
@@ -575,16 +572,6 @@ fn session_text(status: &JobStatus) -> String {
     parts.join(" · ")
 }
 
-/// A lane's wire name.
-fn lane_name(lane: LaneKind) -> &'static str {
-    match lane {
-        LaneKind::Http => "http",
-        LaneKind::Ws => "ws",
-        LaneKind::L4Packet => "l4_packet",
-        LaneKind::L4Stream => "l4_stream",
-    }
-}
-
 /// Lanes joined by a space, `none` when empty.
 fn lanes_text(lanes: &[LaneKind]) -> String {
     if lanes.is_empty() {
@@ -592,7 +579,7 @@ fn lanes_text(lanes: &[LaneKind]) -> String {
     }
     lanes
         .iter()
-        .map(|l| lane_name(*l))
+        .map(|l| lane_token(*l))
         .collect::<Vec<_>>()
         .join(" ")
 }

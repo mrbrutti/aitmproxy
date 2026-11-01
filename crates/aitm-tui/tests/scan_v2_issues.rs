@@ -541,3 +541,39 @@ fn issues_refresh_every_twenty_ticks_while_a_job_is_live() {
     }
     assert_eq!(after, 0, "a terminal job does not drive the issues timer");
 }
+
+/// D2: row strings are bounded once at fold time. A 1 MiB `name` becomes a
+/// row name of at most 40 cells ending in an ellipsis, drawn as 39 `N`s and
+/// `…` at 200x50; a 600-row page is cut to `ISSUES_PAGE_LIMIT`.
+#[test]
+fn rows_are_bounded_at_fold_time() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let mut page = fixture("scan.issues.json");
+    page["issues"][0]["name"] = json!("N".repeat(1 << 20));
+    let _ = app.on_bus(issues_reply(page));
+    assert_eq!(app.scan.issues.rows.len(), 2);
+    let name = app.scan.issues.rows[0].name.as_str();
+    assert_eq!(name.chars().count(), 40, "{name:?}");
+    assert!(name.ends_with('…'), "{name:?}");
+    let text = screen(&app);
+    let line = line_with(&text, "NNNN").unwrap_or_else(|| panic!("no row: {text}"));
+    assert_eq!(line.matches('N').count(), 39, "{line:?}");
+    assert!(line.contains("N…"), "{line:?}");
+
+    let template = fixture("scan.issues.json")["issues"][0].clone();
+    let rows: Vec<Value> = (0..600u32)
+        .map(|k| {
+            let mut row = template.clone();
+            row["id"] = json!(format!("issue-{k:08x}"));
+            row
+        })
+        .collect();
+    let _ = app.on_bus(issues_reply(json!({
+        "issues": rows,
+        "next_cursor": null,
+        "by_severity": { "critical": 0, "high": 600, "medium": 0, "low": 0, "info": 0 },
+    })));
+    assert_eq!(app.scan.issues.list.len(), 512);
+    assert_eq!(app.scan.issues.rows.len(), 512);
+}
