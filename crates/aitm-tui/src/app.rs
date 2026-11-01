@@ -4144,11 +4144,19 @@ impl App {
     }
 
     /// Issues `P` (spec D11): switch to Findings with the cursor on the
-    /// first finding whose `poc_path` contains the cursor issue's `poc_ref`
-    /// or whose title equals the issue's name; without one, toast
-    /// `PoC <ref> is not in the Findings list`, and without a `poc_ref`,
-    /// `this issue has no PoC`. The row's summary carries both fields, so
-    /// the key works before the `scan.issue` read lands.
+    /// first finding whose PoC file is the cursor issue's `poc_ref` or
+    /// whose title equals the issue's name; without one, toast `PoC <ref>
+    /// is not in the Findings list`, and without a `poc_ref`, `this issue
+    /// has no PoC`. The row's summary carries both fields, so the key works
+    /// before the `scan.issue` read lands.
+    ///
+    /// The ref matches the finding's `poc_path` by its file stem or its
+    /// file name (`poc-3b1c` and `poc-3b1c.yaml` both name
+    /// `/pocs/poc-3b1c.yaml`), never by substring, and a ref that is blank
+    /// after trimming counts as no PoC, so `""`, `/` or `.yaml` from a
+    /// hostile core cannot land on an unrelated finding (fix round F, F3).
+    /// The match is computed before anything is changed (F10), and the
+    /// toast cuts the ref to 80 cells (F4).
     fn scan_open_poc(&mut self) {
         if self.scan.tab != ScanTab::Issues {
             return;
@@ -4156,25 +4164,31 @@ impl App {
         let Some(row) = self.scan.issues.cursor_issue() else {
             return;
         };
-        let Some(poc_ref) = row.poc_ref.clone() else {
+        let poc_ref = row.poc_ref.as_deref().map(str::trim).unwrap_or_default();
+        if poc_ref.is_empty() {
             self.toast(Level::Info, "this issue has no PoC");
             return;
-        };
-        let name = row.name.clone();
-        let found = self
-            .findings
-            .iter()
-            .position(|f| f.poc_path.contains(&poc_ref) || f.title == name);
+        }
+        let wanted = std::ffi::OsStr::new(poc_ref);
+        let found = self.findings.iter().position(|f| {
+            let path = std::path::Path::new(&f.poc_path);
+            path.file_stem() == Some(wanted)
+                || path.file_name() == Some(wanted)
+                || f.title == row.name
+        });
         match found {
             Some(k) => {
                 self.finding_cursor = k;
                 self.mode = Mode::Findings;
                 self.sidebar = SidebarItem::Findings;
             }
-            None => self.toast(
-                Level::Warn,
-                format!("PoC {poc_ref} is not in the Findings list"),
-            ),
+            None => {
+                let text = format!(
+                    "PoC {} is not in the Findings list",
+                    crate::text::truncate(poc_ref, 80)
+                );
+                self.toast(Level::Warn, text);
+            }
         }
     }
 

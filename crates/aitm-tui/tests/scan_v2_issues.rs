@@ -1094,8 +1094,9 @@ fn enter_on_a_known_probe_flow_opens_the_inspector() {
 }
 
 /// T7-9, D11: `P` opens Findings with the cursor on the first finding whose
-/// `poc_path` contains the issue's `poc_ref`; without such a finding it
-/// toasts the ref; an issue without a `poc_ref` toasts that.
+/// `poc_path` names the issue's `poc_ref` (file stem or file name, fix
+/// round F, F3); without such a finding it toasts the ref; an issue
+/// without a `poc_ref` toasts that.
 #[test]
 fn open_poc_switches_to_findings_or_toasts() {
     let mut app = app_with_xss_read();
@@ -1388,5 +1389,68 @@ fn paging_keys_reach_the_top_of_a_tall_detail_and_down_follows_the_flow() {
     assert!(
         line_with(&text, FLOW_2).is_none(),
         "PageUp scrolls away from the flow again: {text}"
+    );
+}
+
+/// [`app_with_xss_read`] with the XSS row's `poc_ref` replaced on the page
+/// and in the read issue, and two findings in the list: an unrelated one
+/// and `/pocs/poc-3b1c.yaml`.
+fn app_with_poc_ref(poc_ref: Value) -> App {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let mut page = fixture("scan.issues.json");
+    page["issues"][0]["poc_ref"] = poc_ref.clone();
+    let _ = app.on_bus(issues_reply(page));
+    let mut issue = fixture("scan.issue.json");
+    issue["poc_ref"] = poc_ref;
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        value: issue,
+    });
+    let other = Finding::from_json(&json!({ "poc_path": "/pocs/open-redirect.yaml" }))
+        .unwrap_or_else(|| panic!("a finding"));
+    let matching = Finding::from_json(&json!({ "poc_path": "/pocs/poc-3b1c.yaml" }))
+        .unwrap_or_else(|| panic!("a finding"));
+    app.findings = vec![other, matching];
+    app
+}
+
+/// Fix round F, F3: a degenerate `poc_ref` never jumps to an unrelated
+/// finding. An empty (or blank) ref is "no PoC"; `/`, `.yaml` and `poc`
+/// (a substring of every PoC path) toast and stay in Scan; the ref is
+/// matched on the file stem or the file name, so `poc-3b1c` and
+/// `poc-3b1c.yaml` both find `/pocs/poc-3b1c.yaml`; a 1000-char ref is cut
+/// to 80 cells in the toast (F4).
+#[test]
+fn degenerate_poc_refs_toast_and_never_switch_to_findings() {
+    for blank in ["", "   "] {
+        let mut app = app_with_poc_ref(json!(blank));
+        let _ = app.update(Action::ScanOpenPoc);
+        assert_eq!(app.mode, Mode::Scan, "{blank:?}");
+        assert_eq!(toast(&app), "this issue has no PoC", "{blank:?}");
+    }
+    for degenerate in ["/", ".yaml", "poc", "pocs", "3b1c"] {
+        let mut app = app_with_poc_ref(json!(degenerate));
+        let _ = app.update(Action::ScanOpenPoc);
+        assert_eq!(app.mode, Mode::Scan, "{degenerate:?}");
+        assert_eq!(
+            toast(&app),
+            format!("PoC {degenerate} is not in the Findings list")
+        );
+    }
+    for real in ["poc-3b1c", "poc-3b1c.yaml", " poc-3b1c "] {
+        let mut app = app_with_poc_ref(json!(real));
+        let _ = app.update(Action::ScanOpenPoc);
+        assert_eq!(app.mode, Mode::Findings, "{real:?}");
+        assert_eq!(app.finding_cursor, 1, "{real:?}");
+    }
+    let long = "x".repeat(1000);
+    let mut app = app_with_poc_ref(json!(long));
+    let _ = app.update(Action::ScanOpenPoc);
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(
+        toast(&app),
+        format!("PoC {}… is not in the Findings list", "x".repeat(79))
     );
 }
