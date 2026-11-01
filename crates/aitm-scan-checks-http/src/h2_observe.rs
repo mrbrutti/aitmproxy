@@ -68,8 +68,8 @@ use aitm_proto_http::raw_h2::{
     TlsVerify, MAX_RAW_STREAMS,
 };
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
-    Intensity, LaneKind, Outcome, ProbeHost, Technique, Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, HttpVersionPolicy,
+    InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -560,6 +560,13 @@ impl Check for H2Check {
             if !crate::gate::may_send(host, 1) {
                 return stopped();
             }
+            // The profile forced HTTP/1.1 (spec D8.2 `http.version`): an HTTP/2
+            // observe probe would contradict it, so none is sent. Found live
+            // (T3-2 cell, 2026-11-01): these checks were the only h2 traffic
+            // in a forced-h1 job.
+            if matches!(host.profile().http.version, HttpVersionPolicy::H1) {
+                return inconclusive(FORCED_H1);
+            }
             // The profile gate, before anything at all is sent: a raw probe
             // bypasses the lane's guarded client, so the authority it would
             // dial must be one the operator named in the job's profile.
@@ -591,7 +598,19 @@ impl Check for H2Check {
                 return inconclusive(ALREADY_OBSERVED);
             }
             match self.runner.run(plan).await {
-                Ok(obs) => self.verdict(&labels, &obs),
+                Ok(obs) => {
+                    // Shape only: stream outcomes, GOAWAY codes and the two
+                    // end flags. The observation carries no peer text.
+                    tracing::debug!(
+                        check = %self.meta.id,
+                        streams = ?obs.streams,
+                        goaway = ?obs.goaway,
+                        closed = obs.connection_closed,
+                        silent = obs.peer_silent,
+                        "raw h2 observation"
+                    );
+                    self.verdict(&labels, &obs)
+                }
                 Err(error) => {
                     tracing::debug!(%error, check = %self.meta.id, "raw h2 probe did not complete");
                     inconclusive(NO_H2)
@@ -602,6 +621,7 @@ impl Check for H2Check {
 }
 
 const ALREADY_OBSERVED: &str = "already observed for this authority";
+const FORCED_H1: &str = "skipped: the profile forces http.version h1, so no HTTP/2 probe is sent";
 const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
 const BUDGET_TOO_LOW: &str = "budget too low for the raw probe";
 
@@ -782,29 +802,36 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
             ),
         );
     }
-    // Fewer than eight observed pairs is not the "complete repeated
-    // observation" the `firm` verdict below stands on (spec review SP-3).
-    if observed < usize::from(RESET_PAIRS) {
-        return inconclusive(format!(
-            "only {observed} of {RESET_PAIRS} reset pairs reached an outcome before the probe \
-             stopped"
-        ));
-    }
+    // The connection is still open after all eight pairs: no GOAWAY, no
+    // refused stream, no hang-up. A correct server discards a cancelled
+    // stream without a word, so the realistic shape of "no mitigation" is
+    // eight pairs written and then silence (live run against hyper,
+    // 2026-11-01); a server racing the cancel may answer or reset some of
+    // them, which is no mitigation either. All eight pairs were written —
+    // the batch mode writes every HEADERS before it reads, and a write
+    // error is a probe error, not an observation — and the peer had the
+    // whole read timeout to react, so this is the complete observation
+    // the meta's `firm` ceiling stands on (spec review SP-3). It is still
+    // not `certain`: a mitigation could exist above this threshold.
+    let detail = if obs.peer_silent {
+        format!(
+            "no reset-rate mitigation observed in {RESET_PAIRS} reset pairs: the peer \
+             neither reset, refused nor closed, and stayed silent with the connection \
+             open"
+        )
+    } else {
+        format!("no reset-rate mitigation observed in {RESET_PAIRS} reset pairs")
+    };
     Verdict {
         outcome: Outcome::Vulnerable,
-        // A complete repeated observation — all eight pairs sent, every one
-        // answered or reset, nothing at all from the peer and the connection
-        // still open — so the meta's `firm` ceiling is reachable (review
-        // SP-3). It is still not `certain`: a mitigation could exist above
-        // this threshold.
         confidence: Confidence::Firm,
         evidence: Evidence {
             matched: Some(format!(
-                "{RESET_PAIRS} reset pairs, no GOAWAY, no refused stream"
+                "{RESET_PAIRS} reset pairs, no GOAWAY, no refused stream, connection open"
             )),
             ..Evidence::default()
         },
-        detail: format!("no reset-rate mitigation observed in {RESET_PAIRS} reset pairs"),
+        detail,
         poc_hint: None,
         location: None,
         more: Vec::new(),
@@ -839,9 +866,24 @@ fn read_stream(outcome: &StreamOutcome) -> Reading {
 fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
     let mut tolerated = Vec::new();
     let mut unobserved = labels.len().saturating_sub(obs.streams.len());
+    // A GOAWAY with an error code while the sequential blocks were in
+    // flight is the peer rejecting the variant it was reading at the
+    // connection level — the strictest rejection there is, and what a
+    // conforming server does with a malformed header block (live run
+    // against hyper, 2026-11-01). The rejected variant is the first slot
+    // without an outcome; the slots after it were never written, since the
+    // driver opens one connection per probe and the peer took it down.
+    let connection_rejected =
+        obs.connection_closed && matches!(obs.goaway, Some((_, code)) if code != 0);
+    let mut at_connection: Option<usize> = None;
+    let mut not_tried = 0usize;
     for (index, outcome) in obs.streams.iter().enumerate().take(labels.len()) {
         match read_stream(outcome) {
             Reading::Rejected => {}
+            Reading::Unobserved if connection_rejected && at_connection.is_none() => {
+                at_connection = Some(index);
+            }
+            Reading::Unobserved if at_connection.is_some() => not_tried += 1,
             Reading::Unobserved => unobserved += 1,
             Reading::Tolerated(how) => tolerated.push((index, how)),
         }
@@ -875,11 +917,26 @@ fn malformed_verdict(labels: &[&str], obs: &RawH2Observation) -> Verdict {
             more: Vec::new(),
         };
     }
+    if let (Some(index), 0) = (at_connection, unobserved) {
+        let code = obs.goaway.map_or(0, |(_, code)| code);
+        return no_finding(
+            Outcome::Clean,
+            format!(
+                "variant {index} ({}) was rejected at the connection level (GOAWAY \
+                 error_code={code}); {not_tried} later variant(s) could not be tried on \
+                 that connection",
+                labels[index]
+            ),
+        );
+    }
+    let unobserved = unobserved + not_tried + usize::from(at_connection.is_some());
     if unobserved > 0 {
-        return inconclusive(format!(
-            "{unobserved} of {} variants did not reach an outcome before the probe stopped",
-            labels.len()
-        ));
+        let why = if obs.peer_silent {
+            "were not answered within the read timeout; the peer stayed silent"
+        } else {
+            "did not reach an outcome before the probe stopped"
+        };
+        return inconclusive(format!("{unobserved} of {} variants {why}", labels.len()));
     }
     no_finding(
         Outcome::Clean,

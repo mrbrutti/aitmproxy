@@ -123,16 +123,108 @@ fn body_len(resp: &ProbeResponse) -> usize {
     body_text(resp).len()
 }
 
-/// Whether the three lengths are the boolean signature.
+/// How a pair's responses are compared against the baseline.
 ///
-/// All three clauses must hold: the true arm reproduces the baseline, the false
-/// arm diverges from the baseline, **and** the false arm diverges from the true
-/// arm. The third is what rules out a page that simply reacts to any appended
-/// text — there both arms move together and nothing is proven.
-fn is_hit(baseline_len: usize, true_len: usize, false_len: usize) -> bool {
-    !length_differs(true_len, baseline_len, baseline_len)
-        && length_differs(false_len, baseline_len, baseline_len)
-        && length_differs(false_len, true_len, baseline_len)
+/// Decided once per point, at the control re-send: a page that answers the
+/// same request with the same bytes is compared by **content**, a page that
+/// does not (a nonce, a timestamp, a rotating advert) by **length**. The
+/// live run of 2026-11-01 is why both exist: the seeded `/items` answers
+/// `<p>items: 1</p>` to the true arm and `<p>items: 0</p>` to the false one,
+/// the same fifteen bytes, and the length rule alone could never see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Signature {
+    /// Byte-for-byte, with every echo of the sent value scrubbed out first
+    /// so a page that merely reflects the parameter is not different from
+    /// itself.
+    Content,
+    /// ZAP's rule: lengths, with the shipped tolerance
+    /// ([`crate::matching::length_differs`]).
+    Length,
+}
+
+/// The baseline a pair is compared against: its length, and its body with
+/// the point's own value scrubbed out.
+struct Baseline {
+    len: usize,
+    body: String,
+}
+
+/// The marker every echo of the sent value becomes before two bodies are
+/// compared. A control character no HTML page carries.
+const ECHO_MARK: &str = "\u{1}";
+
+/// A response body with every echo of `sent` — raw, percent-encoded (both
+/// `%20` and `+` for a space) and HTML-escaped — replaced by [`ECHO_MARK`],
+/// bounded like [`body_len`] is.
+fn normalized(resp: &ProbeResponse, sent: &str) -> String {
+    let mut text = body_text(resp).into_owned();
+    if sent.is_empty() {
+        return text;
+    }
+    let mut forms = vec![
+        sent.to_string(),
+        percent_encode(sent, false),
+        percent_encode(sent, true),
+        html_escape(sent),
+    ];
+    // Longest first, so a form that contains another is replaced whole.
+    forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
+    forms.dedup();
+    for form in forms {
+        text = text.replace(&form, ECHO_MARK);
+    }
+    text
+}
+
+/// `value` as a query component would carry it: unreserved bytes kept,
+/// everything else `%XX` (upper-case), and a space as `+` when `plus` is set.
+fn percent_encode(value: &str, plus: bool) -> String {
+    let mut out = String::with_capacity(value.len() * 3);
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            b' ' if plus => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// `value` as an HTML-escaping page would print it.
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Whether a pair's run is the boolean signature under `signature`.
+///
+/// Content: the true arm reproduces the baseline body and the false arm does
+/// not (so the two arms differ from each other too). Length: all three
+/// clauses must hold — the true arm reproduces the baseline, the false arm
+/// diverges from the baseline, **and** the false arm diverges from the true
+/// arm. The third is what rules out a page that simply reacts to any
+/// appended text — there both arms move together and nothing is proven.
+fn is_hit(signature: Signature, baseline: &Baseline, run: &PairRun) -> bool {
+    match signature {
+        Signature::Content => run.true_body == baseline.body && run.false_body != baseline.body,
+        Signature::Length => {
+            !length_differs(run.true_len, baseline.len, baseline.len)
+                && length_differs(run.false_len, baseline.len, baseline.len)
+                && length_differs(run.false_len, run.true_len, baseline.len)
+        }
+    }
 }
 
 /// The catalogue entry for the boolean SQL-injection check (session call S3).
@@ -176,9 +268,10 @@ impl SqliBoolean {
                 cwe: Some(89),
                 description: "Re-sends the point's own value as a control, then appends an \
                               always-true and an always-false SQL condition and compares the \
-                              three response lengths. Reports when the true arm reproduces the \
-                              baseline and the false arm diverges from both, repeated as many \
-                              times as the profile's accuracy demands."
+                              three responses: by content on a page that answers the control \
+                              byte for byte, by length otherwise. Reports when the true arm \
+                              reproduces the baseline and the false arm diverges from both, \
+                              repeated as many times as the profile's accuracy demands."
                     .to_string(),
                 remediation: Some(
                     "Pass the value to the database as a bound parameter of a prepared \
@@ -203,18 +296,21 @@ fn may_send(host: &dyn ProbeHost, spent: u32, need: u32) -> bool {
     gate::may_send(host, need) && spent.saturating_add(need) <= MAX_BOOLEAN_PROBES
 }
 
-/// The lengths of one run of a pair, kept so the reported evidence is the run
-/// that was actually observed rather than a recomputed guess.
+/// One run of a pair — the lengths and the scrubbed bodies of both arms —
+/// kept so the reported evidence is the run that was actually observed
+/// rather than a recomputed guess.
 struct PairRun {
     true_len: usize,
     false_len: usize,
+    true_body: String,
+    false_body: String,
     true_flow: Option<aitm_scan_model::FlowRef>,
     false_flow: Option<aitm_scan_model::FlowRef>,
 }
 
 /// What one attempt at a pair concluded.
 enum PairOutcome {
-    /// The three lengths are the boolean signature.
+    /// The run is the boolean signature.
     Hit(PairRun),
     /// The pair ran and did not show the signature.
     Miss,
@@ -223,12 +319,16 @@ enum PairOutcome {
 }
 
 impl SqliBoolean {
-    /// Send both arms of one pair once and classify the result.
+    /// Send both arms of one pair once and classify the result. `example` is
+    /// the point's own value the arms are appended to, so the bodies are
+    /// scrubbed of exactly what was sent.
     async fn run_pair(
         host: &dyn ProbeHost,
+        example: &str,
         true_arm: &str,
         false_arm: &str,
-        baseline_len: usize,
+        baseline: &Baseline,
+        signature: Signature,
     ) -> PairOutcome {
         let Some(t) = send_condition(host, true_arm).await else {
             return PairOutcome::Failed;
@@ -239,10 +339,12 @@ impl SqliBoolean {
         let run = PairRun {
             true_len: body_len(&t),
             false_len: body_len(&f),
+            true_body: normalized(&t, &format!("{example}{true_arm}")),
+            false_body: normalized(&f, &format!("{example}{false_arm}")),
             true_flow: t.flow,
             false_flow: f.flow,
         };
-        if is_hit(baseline_len, run.true_len, run.false_len) {
+        if is_hit(signature, baseline, &run) {
             PairOutcome::Hit(run)
         } else {
             PairOutcome::Miss
@@ -261,17 +363,39 @@ async fn send_condition(host: &dyn ProbeHost, condition: &str) -> Option<ProbeRe
     host.probe(&payload).await.ok()
 }
 
+/// One confirmed pair: the run that hit, how many runs agreed, the signature
+/// it was read with, and the baseline's flow for the evidence.
+struct Hit<'a> {
+    run: &'a PairRun,
+    runs: u32,
+    signature: Signature,
+    baseline_flow: Option<aitm_scan_model::FlowRef>,
+}
+
 /// The verdict for a pair that hit and reproduced.
 fn confirmed(
     point: &InsertionPoint,
-    true_arm: &str,
-    false_arm: &str,
-    baseline_len: usize,
-    run: &PairRun,
-    baseline_flow: Option<aitm_scan_model::FlowRef>,
-    runs: u32,
+    (true_arm, false_arm): (&str, &str),
+    baseline: &Baseline,
+    hit: Hit<'_>,
 ) -> Verdict {
     let to_u32 = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+    let run = hit.run;
+    let baseline_len = baseline.len;
+    let compared = match hit.signature {
+        Signature::Content => format!(
+            "with a body identical to its {baseline_len}-byte baseline (the sent value \
+             scrubbed out), and the always-false \"{false_arm}\" with a different body of \
+             {false_len} bytes",
+            false_len = run.false_len,
+        ),
+        Signature::Length => format!(
+            "with {true_len} bytes, matching its {baseline_len}-byte baseline, and the \
+             always-false \"{false_arm}\" with {false_len} bytes",
+            true_len = run.true_len,
+            false_len = run.false_len,
+        ),
+    };
     Verdict {
         outcome: Outcome::Vulnerable,
         confidence: Confidence::Firm,
@@ -283,7 +407,7 @@ fn confirmed(
                 .into_iter()
                 .chain(run.false_flow)
                 .collect::<Vec<_>>(),
-            baseline_flow,
+            baseline_flow: hit.baseline_flow,
             diff: Some(Diff {
                 baseline_len: to_u32(baseline_len),
                 true_len: to_u32(run.true_len),
@@ -293,13 +417,11 @@ fn confirmed(
         },
         detail: format!(
             "the {kind:?} point \"{name}\" answered the always-true condition \"{true_arm}\" \
-             with {true_len} bytes, matching its {baseline_len}-byte baseline, and the \
-             always-false \"{false_arm}\" with {false_len} bytes; the pair reproduced {runs} \
-             time(s), so the value is being evaluated as SQL",
+             {compared}; the pair reproduced {runs} time(s), so the value is being \
+             evaluated as SQL",
             kind = point.kind,
             name = point_label(point),
-            true_len = run.true_len,
-            false_len = run.false_len,
+            runs = hit.runs,
         ),
         poc_hint: None,
         location: None,
@@ -358,7 +480,7 @@ impl Check for SqliBoolean {
             };
             spent += 1;
             let control_payload = Payload {
-                value: example,
+                value: example.clone(),
                 mode: PayloadMode::Replace,
                 bytes: None,
             };
@@ -379,6 +501,20 @@ impl Check for SqliBoolean {
                     ),
                 );
             }
+            // The signature this point is read with: content when the control
+            // reproduced the baseline byte for byte (the sent value scrubbed
+            // out of both), length when the page varies between identical
+            // requests but stays within the tolerance.
+            let baseline_flow = baseline.flow;
+            let baseline = Baseline {
+                len: baseline_len,
+                body: normalized(&baseline, &example),
+            };
+            let signature = if normalized(&control, &example) == baseline.body {
+                Signature::Content
+            } else {
+                Signature::Length
+            };
 
             // Step 3: the pairs, in order, as many as `Speed` allows.
             let pairs = condition_pairs();
@@ -394,16 +530,19 @@ impl Check for SqliBoolean {
                 }
                 spent += 2;
                 tally.attempted();
-                let first =
-                    match SqliBoolean::run_pair(host, true_arm, false_arm, baseline_len).await {
-                        PairOutcome::Hit(run) => run,
-                        PairOutcome::Miss => continue,
-                        PairOutcome::Failed => {
-                            // One refused arm is not a verdict; try the next pair.
-                            tally.refused();
-                            continue;
-                        }
-                    };
+                let first = match SqliBoolean::run_pair(
+                    host, &example, true_arm, false_arm, &baseline, signature,
+                )
+                .await
+                {
+                    PairOutcome::Hit(run) => run,
+                    PairOutcome::Miss => continue,
+                    PairOutcome::Failed => {
+                        // One refused arm is not a verdict; try the next pair.
+                        tally.refused();
+                        continue;
+                    }
+                };
 
                 // Step 4: repeat the candidate until `Accuracy` is satisfied.
                 // Every repeat must agree; one disagreement makes it noise.
@@ -415,7 +554,11 @@ impl Check for SqliBoolean {
                         break;
                     }
                     spent += 2;
-                    match SqliBoolean::run_pair(host, true_arm, false_arm, baseline_len).await {
+                    match SqliBoolean::run_pair(
+                        host, &example, true_arm, false_arm, &baseline, signature,
+                    )
+                    .await
+                    {
                         PairOutcome::Hit(_) => agreed += 1,
                         // A repeat that *disagreed* says the difference was
                         // noise: drop the candidate and try the next pair.
@@ -439,12 +582,14 @@ impl Check for SqliBoolean {
                 if agreed >= wanted {
                     return confirmed(
                         point,
-                        true_arm,
-                        false_arm,
-                        baseline_len,
-                        &first,
-                        baseline.flow,
-                        agreed,
+                        (true_arm, false_arm),
+                        &baseline,
+                        Hit {
+                            run: &first,
+                            runs: agreed,
+                            signature,
+                            baseline_flow,
+                        },
                     );
                 }
                 if stopped_early {
@@ -472,7 +617,8 @@ mod tests {
     use aitm_scan_model::{Accuracy, Speed};
 
     use super::{
-        condition_pairs, confirmations, is_hit, length_differs, pairs_allowed, MAX_BOOLEAN_PROBES,
+        condition_pairs, confirmations, is_hit, length_differs, normalized, pairs_allowed,
+        Baseline, PairRun, Signature, MAX_BOOLEAN_PROBES,
     };
 
     /// The order is the plan's: four base pairs, then the same four with a
@@ -532,23 +678,125 @@ mod tests {
         assert_eq!(confirmations(Accuracy::FewerFalsePositives), 3);
     }
 
+    /// A run of a pair under the length signature, from its three lengths.
+    fn hit_by_length(baseline: usize, true_len: usize, false_len: usize) -> bool {
+        let base = Baseline {
+            len: baseline,
+            body: String::new(),
+        };
+        let run = PairRun {
+            true_len,
+            false_len,
+            true_body: String::new(),
+            false_body: String::new(),
+            true_flow: None,
+            false_flow: None,
+        };
+        is_hit(Signature::Length, &base, &run)
+    }
+
+    /// A run of a pair under the content signature, from the scrubbed bodies.
+    fn hit_by_content(baseline: &str, true_body: &str, false_body: &str) -> bool {
+        let base = Baseline {
+            len: baseline.len(),
+            body: baseline.to_string(),
+        };
+        let run = PairRun {
+            true_len: true_body.len(),
+            false_len: false_body.len(),
+            true_body: true_body.to_string(),
+            false_body: false_body.to_string(),
+            true_flow: None,
+            false_flow: None,
+        };
+        is_hit(Signature::Content, &base, &run)
+    }
+
+    /// The content signature: the true arm reproduces the baseline body and the
+    /// false arm does not — however small the difference, and whatever the
+    /// lengths (the live seed answers `items: 1` / `items: 0`, fifteen bytes
+    /// either way).
+    #[test]
+    fn a_content_hit_is_a_reproduced_true_arm_and_a_changed_false_arm() {
+        assert!(hit_by_content(
+            "<p>items: 1</p>",
+            "<p>items: 1</p>",
+            "<p>items: 0</p>"
+        ));
+        assert!(
+            !hit_by_content("<p>items: 1</p>", "<p>items: 2</p>", "<p>items: 0</p>"),
+            "the true arm changed the page: a reaction to any suffix"
+        );
+        assert!(
+            !hit_by_content("<p>items: 1</p>", "<p>items: 1</p>", "<p>items: 1</p>"),
+            "the false arm changed nothing"
+        );
+    }
+
+    /// Every echo of the sent value — raw, percent-encoded with `%20` or `+`,
+    /// HTML-escaped — becomes one marker, so an echoing page compares equal to
+    /// itself; the rest of the body is untouched.
+    #[test]
+    fn normalized_scrubs_every_form_of_the_echo() {
+        use aitm_scan_model::ProbeResponse;
+        let resp = |body: &str| ProbeResponse {
+            status: Some(200),
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+            elapsed_ms: 1,
+            flow: None,
+            l4: None,
+            ws_frames: None,
+        };
+        let sent = "1' AND '1'='1";
+        assert_eq!(
+            normalized(&resp("<p>1' AND '1'='1</p>"), sent),
+            "<p>\u{1}</p>",
+            "raw"
+        );
+        assert_eq!(
+            normalized(&resp("<p>1%27%20AND%20%271%27%3D%271</p>"), sent),
+            "<p>\u{1}</p>",
+            "percent-encoded"
+        );
+        assert_eq!(
+            normalized(&resp("<p>1%27+AND+%271%27%3D%271</p>"), sent),
+            "<p>\u{1}</p>",
+            "form-encoded"
+        );
+        assert_eq!(
+            normalized(&resp("<p>1&#39; AND &#39;1&#39;=&#39;1</p>"), sent),
+            "<p>\u{1}</p>",
+            "html-escaped"
+        );
+        assert_eq!(
+            normalized(&resp("<p>items: 1</p>"), sent),
+            "<p>items: 1</p>"
+        );
+        assert_eq!(
+            normalized(&resp("<p>x</p>"), ""),
+            "<p>x</p>",
+            "an empty value scrubs nothing"
+        );
+    }
+
     /// All three clauses of the signature, each failed in turn. The third one —
     /// the false arm must differ from the true arm too — is the clause that
     /// rules out a page reacting to any appended text.
     #[test]
     fn a_hit_needs_all_three_length_clauses() {
-        assert!(is_hit(600, 600, 120), "the textbook case");
+        assert!(hit_by_length(600, 600, 120), "the textbook case");
 
         assert!(
-            !is_hit(600, 120, 60),
+            !hit_by_length(600, 120, 60),
             "the true arm did not reproduce the baseline"
         );
         assert!(
-            !is_hit(600, 600, 600),
+            !hit_by_length(600, 600, 600),
             "the false arm did not diverge from the baseline"
         );
         assert!(
-            !is_hit(600, 120, 120),
+            !hit_by_length(600, 120, 120),
             "both arms moved together: the page reacts to any suffix"
         );
         // The third clause on its own. Above, the first clause already refuses
@@ -561,18 +809,21 @@ mod tests {
         assert!(!length_differs(640, 600, 600), "clause 1 holds");
         assert!(length_differs(660, 600, 600), "clause 2 holds");
         assert!(
-            !is_hit(600, 640, 660),
+            !hit_by_length(600, 640, 660),
             "the false arm must diverge from the true arm too"
         );
-        assert!(is_hit(600, 640, 681), "41 bytes apart is a divergence");
+        assert!(
+            hit_by_length(600, 640, 681),
+            "41 bytes apart is a divergence"
+        );
 
         // The threshold is `matching::length_differs`, so a difference inside
         // the noise floor is not a difference.
         assert!(
-            !is_hit(600, 600, 570),
+            !hit_by_length(600, 600, 570),
             "30 bytes is below the 40-byte floor"
         );
-        assert!(is_hit(600, 600, 559), "41 bytes is above it");
+        assert!(hit_by_length(600, 600, 559), "41 bytes is above it");
     }
 
     /// A thorough run asks for a control plus eight pairs, which is seventeen

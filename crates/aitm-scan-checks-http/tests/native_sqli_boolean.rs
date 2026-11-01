@@ -646,3 +646,147 @@ async fn the_cap_refuses_the_repeat_that_would_be_the_eleventh_probe() {
     );
     assert!(host.sent().len() <= MAX_BOOLEAN_PROBES);
 }
+
+// ---------------------------------------------------------------------------
+// The content signature (F8, live run 2026-11-01)
+// ---------------------------------------------------------------------------
+
+/// T10's seeded `/items` answers the true arm with `<p>items: 1</p>` and the
+/// false arm with `<p>items: 0</p>`: fifteen bytes either way. On a page that
+/// answers the control byte for byte the check compares content, so the one
+/// changed digit is the finding, `firm`, with the lengths still in the `Diff`.
+#[tokio::test]
+async fn a_one_character_difference_at_equal_length_is_firm_on_a_stable_page() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>items: 1</p>"))
+        .on("1=1", html(200, "<p>items: 1</p>"))
+        .on("1=2", html(200, "<p>items: 0</p>"))
+        .with_fallback(html(200, "<p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(
+        verdict.evidence.diff,
+        Some(Diff {
+            baseline_len: 15,
+            true_len: 15,
+            false_len: 15,
+        })
+    );
+    assert_eq!(verdict.evidence.payload, Some(FALSE_ARM.to_string()));
+    assert!(
+        verdict.detail.contains(
+            "with a body identical to its 15-byte baseline (the sent value scrubbed out), \
+             and the always-false \" AND 1=2\" with a different body of 15 bytes"
+        ),
+        "{}",
+        verdict.detail
+    );
+}
+
+/// A page that only echoes the parameter is not different from itself: the
+/// echo of the sent value is scrubbed before the bodies are compared, so the
+/// two arms match the baseline and nothing is reported.
+#[tokio::test]
+async fn a_page_that_only_echoes_the_value_is_clean() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>you sent seed</p>"))
+        .on(EXAMPLE, html(200, "<p>you sent seed</p>"))
+        .on("1=1", html(200, "<p>you sent seed AND 1=1</p>"))
+        .on("1=2", html(200, "<p>you sent seed AND 1=2</p>"))
+        .with_fallback(html(200, "<p>you sent seed</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(verdict.evidence.payload, None);
+}
+
+/// An echoing page with a real reaction behind the echo — HTML-escaped echo,
+/// and the row count that changes — is still found.
+#[tokio::test]
+async fn an_echoing_page_with_a_reaction_behind_the_echo_is_firm() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>you sent seed</p><p>items: 1</p>"))
+        .on(
+            "' AND '1'='1",
+            html(
+                200,
+                "<p>you sent seed&#39; AND &#39;1&#39;=&#39;1</p><p>items: 1</p>",
+            ),
+        )
+        .on(
+            "' AND '1'='2",
+            html(
+                200,
+                "<p>you sent seed&#39; AND &#39;1&#39;=&#39;2</p><p>items: 0</p>",
+            ),
+        )
+        .with_fallback(html(200, "<p>you sent seed</p><p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(verdict.confidence, Confidence::Firm);
+    assert_eq!(verdict.evidence.payload, Some("' AND '1'='2".to_string()));
+}
+
+/// A page that varies between identical requests (a nonce) cannot be compared
+/// by content, so the check falls back to ZAP's length rule — the shipped
+/// behaviour — and the detail reads in bytes.
+#[tokio::test]
+async fn a_page_with_a_nonce_falls_back_to_the_length_signature() {
+    let nonce_a = format!("{}A", body(599));
+    let nonce_b = format!("{}B", body(599));
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, &nonce_a))
+        .on(EXAMPLE, html(200, &nonce_b))
+        .on("1=1", html(200, &nonce_a))
+        .on("1=2", html(200, &body(120)))
+        .with_fallback(html(200, &nonce_a));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert_eq!(
+        verdict.evidence.diff,
+        Some(Diff {
+            baseline_len: 600,
+            true_len: 600,
+            false_len: 120,
+        })
+    );
+    assert!(
+        verdict
+            .detail
+            .contains("with 600 bytes, matching its 600-byte baseline, and the always-false"),
+        "{}",
+        verdict.detail
+    );
+}
+
+/// On a content-compared page a true arm that does not reproduce the baseline
+/// is a miss even when the lengths would have passed: the page reacted to the
+/// appended text, not to the condition.
+#[tokio::test]
+async fn a_true_arm_that_changes_a_stable_page_is_not_a_hit() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>items: 1</p>"))
+        .on(EXAMPLE, html(200, "<p>items: 1</p>"))
+        .on("1=1", html(200, "<p>items: 2</p>"))
+        .on("1=2", html(200, "<p>items: 0</p>"))
+        .with_fallback(html(200, "<p>items: 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+}
