@@ -1043,7 +1043,7 @@ never evidence; Kit unit tests and the live run are. Do not edit `Fixtures.rows`
   existing `ConnectionSummaryTests` still passing.
 
 
-> PR 4a (2026-11-01) shipped `SystemProxyState` as a struct of two endpoints plus `SystemProxyRoute { off, thisCore(http:https:), other(host:port:) }` and `init?(compact:listenAddress:)`; `SystemProxyFacts` carries `route: SystemProxyRoute`, not an enum `state`. Expected literal: `.route == .other(host: "127.0.0.1", port: 9090)`.
+> PR 4a (2026-11-01) shipped `SystemProxyState` as a struct of two endpoints plus `SystemProxyRoute { off, thisCore(http:https:), other(host:port:) }` and `init?(compact:listenAddress:)`; `SystemProxyFacts` carries `route: SystemProxyRoute`, not an enum `state`. Expected literal: `.route == .other(host: "127.0.0.1", port: 9090)`. Files: `apps/mac/Sources/AitmproxyKit/SystemProxyState.swift`, `apps/mac/Tests/AitmproxyKitTests/SystemProxyStateTests.swift` (PR #246). Tests shipped (Swift Testing): `anEndpointRendersAsHostColonPort`, the `settings*` family, `offHasNoEndpointsAndRoutesToOff`, `bothProtocolsAtOurAddressRouteToThisCore`, `localhostSpellingsMatchOurLoopbackAddress`, `aWildcardListenAddressMatchesALoopbackProxy`, `aDifferentPortIsAnotherProxy`, `aDifferentHostOnOurPortIsAnotherProxy`, `hostnameCaseDoesNotMatter`, `httpAtUsWithHttpsOffIsThisCoreForHttpOnly`, `oneProtocolAtUsAndTheOtherElsewhereIsStillThisCore`, `otherTakesTheHttpEndpointElseTheHttpsOne`, `anUnparsableListenAddressNeverMatches`, the `compact*` family incl. `other` at our own endpoint → nil, `aMalformedCompactObjectIsNil`, `theFullStatusObjectOfTheSpecParsesLikeTheCompactOne`.
 
 ### Task 25: Kit — `EmbeddedCoreLaunch.Config` emits the `system_proxy:` block
 
