@@ -44,9 +44,7 @@
 //! log lines, and those are asserted. Whether the cookie is in a held flow is
 //! printed as a fact, not asserted either way.
 
-use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
-use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,6 +58,7 @@ use aitm_scan_model::{Confidence, InsertionKind, InsertionPoint, JobCtx, Lane, O
 use aitm_scan_ws::checks;
 use aitm_scan_ws::dialer::WsDialer;
 use aitm_scan_ws::lane::WsLane;
+use aitm_scan_ws::testing::live::{control_json, strip_scheme, Target};
 use aitm_scan_ws::testing::TestJob;
 use aitm_scan_ws::transport::TcpTransport;
 use aitm_scan_ws::types::{TlsPolicy, MAX_CONNECTIONS};
@@ -71,9 +70,6 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
-
-/// What a run without `$AITM_TESTTARGET_BIN` panics with (plan call 35).
-const SKIP: &str = "SKIP: set AITM_TESTTARGET_BIN to a serve binary that has /ws (T10 branch)";
 
 /// The fixture login `POST /login` accepts on the seeded target.
 const LOGIN_FORM: &str = "user=alice&pass=wonderland";
@@ -90,85 +86,6 @@ const SWEEP_BUDGET: u32 = 4_000;
 /// purpose: the point of the concurrency observation is that the lane's own
 /// semaphore, not the test's pacing, is what bounds the target's connections.
 const SWEEP_CONCURRENCY: usize = 12;
-
-// --- the real target process -------------------------------------------------
-
-/// T10's `aitm-testtarget-serve`, running with its control origin.
-struct Target {
-    child: Child,
-    /// Keeps the stdout pipe open for the child's lifetime.
-    _stdout: BufReader<ChildStdout>,
-    /// `http://127.0.0.1:<port>` of the seeded origin.
-    origin: String,
-    /// `http://127.0.0.1:<port>` of the control origin.
-    control: String,
-}
-
-impl Target {
-    /// Spawn the binary in `mode` and read its listen lines up to `ready`.
-    fn start(mode: &str) -> Self {
-        let Ok(bin) = std::env::var("AITM_TESTTARGET_BIN") else {
-            panic!("{SKIP}");
-        };
-        let mut child = Command::new(&bin)
-            .args(["--mode", mode, "--port", "0", "--control-port", "0"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|err| panic!("{SKIP} (spawning {bin} failed: {err})"));
-        let stdout = child.stdout.take().expect("the child's stdout is piped");
-        let mut reader = BufReader::new(stdout);
-
-        let mut origin = None;
-        let mut control = None;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .expect("read the target's stdout");
-            assert!(
-                read != 0,
-                "{SKIP} (the target exited before `ready`; it reported {origin:?} / {control:?})"
-            );
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("listening ") {
-                origin = Some(rest.to_string());
-            } else if let Some(rest) = trimmed.strip_prefix("control ") {
-                control = Some(rest.to_string());
-            } else if trimmed == "ready" {
-                break;
-            }
-        }
-
-        let origin = origin.expect("the target printed a `listening` line");
-        let control =
-            control.expect("the target printed a `control` line (it needs --control-port)");
-        println!("target[{mode}] origin={origin} control={control}");
-        Self {
-            child,
-            _stdout: reader,
-            origin,
-            control,
-        }
-    }
-
-    /// `127.0.0.1:<port>` of the seeded origin.
-    fn authority(&self) -> String {
-        strip_scheme(&self.origin).to_string()
-    }
-}
-
-impl Drop for Target {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// `http://host:port` without its scheme.
-fn strip_scheme(origin: &str) -> &str {
-    origin.split_once("://").map_or(origin, |(_, rest)| rest)
-}
 
 // --- a dependency-free HTTP/1.1 client for the control origin -----------------
 
@@ -207,13 +124,6 @@ async fn http(
         || (text.clone(), String::new()),
         |(h, b)| (h.to_string(), b.to_string()),
     )
-}
-
-/// `GET <path>` on the control origin, parsed as JSON.
-async fn control_json(control: &str, path: &str) -> Value {
-    let (head, body) = http(control, "GET", path, &[], "").await;
-    serde_json::from_str(&body)
-        .unwrap_or_else(|err| panic!("{path} is not JSON ({err}); head was {head:?}"))
 }
 
 /// `POST /reset` on the control origin: every log ring is cleared.
@@ -568,7 +478,7 @@ async fn prove(mode: &str) -> Proof {
     }
 
     // The observers, for the whole sweep.
-    let ws_log = control_json(&target.control, "/log/ws").await;
+    let ws_log = control_json(&target.control, "/log/ws");
     for entry in entries_of(&ws_log, "handshake") {
         println!(
             "handshake[{mode}]: origin={} key={} cookies={} session_valid={} status={} subprotocol={}",
@@ -614,7 +524,7 @@ async fn prove(mode: &str) -> Proof {
         );
     }
 
-    let conns = control_json(&target.control, "/log/conns").await;
+    let conns = control_json(&target.control, "/log/conns");
     for entry in conns["entries"]
         .as_array()
         .map(Vec::as_slice)
@@ -650,7 +560,7 @@ async fn prove(mode: &str) -> Proof {
         "oversize[{mode}]: {:?}/{:?} — {}",
         oversize_verdict.outcome, oversize_verdict.confidence, oversize_verdict.detail
     );
-    let pad_log = control_json(&target.control, "/log/ws").await;
+    let pad_log = control_json(&target.control, "/log/ws");
     let frames = entries_of(&pad_log, "frame");
     for entry in &frames {
         println!(

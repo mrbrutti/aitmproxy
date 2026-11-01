@@ -18,7 +18,6 @@
 //! can travel in a verdict (the redaction rule).
 
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, FlowRef, InsertionKind,
@@ -27,6 +26,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::checks::common;
 use crate::payloads::{cmdi_hit, cmdi_probes};
 
 /// The catalogue id of this check, also its manual `check.<id>` verb suffix.
@@ -98,8 +98,8 @@ impl Check for CmdiEcho {
             for payload in cmdi_probes(&marker) {
                 // Re-checked before every form, not once: the budget, the
                 // deadline and the cancel flag are the job's and move under us.
-                if let Some(reason) = stop_reason(host) {
-                    return inconclusive(reason, flows);
+                if let Some(reason) = common::stop_reason(host) {
+                    return common::inconclusive(reason, flows);
                 }
 
                 let probe = Payload {
@@ -111,7 +111,11 @@ impl Check for CmdiEcho {
                     Ok(response) => response,
                     // The dialer's error text names the transport failure and
                     // never a header value (plan tasks 9-16, "Shape").
-                    Err(error) => return inconclusive(format!("connect error: {error}"), flows),
+                    Err(error) => {
+                        let mut verdict = common::connect_error(&error);
+                        verdict.evidence.probe_flows = flows;
+                        return verdict;
+                    }
                 };
                 flows.extend(response.flow);
 
@@ -152,73 +156,22 @@ impl Check for CmdiEcho {
     }
 }
 
-/// Why the check must send nothing more, or `None` while it may probe.
-fn stop_reason(host: &dyn ProbeHost) -> Option<&'static str> {
-    if host.cancelled() {
-        Some("cancelled")
-    } else if host.budget_left() == 0 {
-        Some("budget exhausted")
-    } else if host.deadline() <= Instant::now() {
-        Some("deadline passed")
-    } else {
-        None
-    }
-}
-
-/// A verdict that concludes nothing, keeping the flows already produced.
-fn inconclusive(detail: impl Into<String>, flows: Vec<FlowRef>) -> Verdict {
-    Verdict {
-        outcome: Outcome::Inconclusive,
-        confidence: Confidence::Tentative,
-        evidence: Evidence {
-            probe_flows: flows,
-            ..Evidence::default()
-        },
-        detail: detail.into(),
-        poc_hint: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use aitm_core::ByteStream;
     use aitm_scan_model::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, JobCtx, LaneKind, Outcome,
-        ProbeHost, Technique,
+        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, ProbeHost,
+        Technique,
     };
     use futures::future::BoxFuture;
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{check, ID};
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
-    use crate::host::WsProbeHost;
-    use crate::testing::{captured_conversation, echo_handler, ws_server, ServerConn, TestJob};
+    use crate::testing::{echo_handler, point_and_host_for, ws_server, ServerConn, TestJob};
     use crate::transport::WsTransport;
-
-    /// A probe host over the fixture conversation's `msg` JSON point.
-    fn host_for(job: &Arc<TestJob>, transport: Arc<dyn WsTransport>) -> WsProbeHost {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == "msg")
-            .expect("the fixture has a point named msg");
-        WsProbeHost::new(
-            found.points[at].clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host")
-    }
 
     /// The seeded vulnerable target: the `msg` field reaches a shell, so
     /// `;echo <text>` prints `<text>` and nothing else — the payload's own
@@ -349,7 +302,7 @@ mod tests {
     async fn vulnerable_server_runs_echo() {
         let (transport, log) = ws_server(None, shell_handler);
         let job = TestJob::new(100);
-        let host = host_for(&job, transport as Arc<dyn WsTransport>);
+        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
         let marker = host.marker();
         let point = host.point().clone();
 
@@ -384,7 +337,7 @@ mod tests {
     async fn echoing_the_literal_is_clean() {
         let (transport, log) = ws_server(None, echo_handler);
         let job = TestJob::new(100);
-        let host = host_for(&job, transport as Arc<dyn WsTransport>);
+        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -406,7 +359,7 @@ mod tests {
     async fn patched_escaping_echo_is_clean() {
         let (transport, log) = ws_server(None, patched_echo_handler);
         let job = TestJob::new(100);
-        let host = host_for(&job, transport as Arc<dyn WsTransport>);
+        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -430,7 +383,7 @@ mod tests {
     async fn budget_zero_sends_nothing() {
         let (transport, log) = ws_server(None, shell_handler);
         let job = TestJob::new(0);
-        let host = host_for(&job, transport as Arc<dyn WsTransport>);
+        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -448,7 +401,7 @@ mod tests {
         let (transport, log) = ws_server(None, shell_handler);
         let job = TestJob::new(100);
         job.cancel();
-        let host = host_for(&job, transport as Arc<dyn WsTransport>);
+        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -464,7 +417,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_error_is_inconclusive() {
         let job = TestJob::new(100);
-        let host = host_for(&job, Arc::new(DeadTransport) as Arc<dyn WsTransport>);
+        let host =
+            point_and_host_for("msg", &job, Arc::new(DeadTransport) as Arc<dyn WsTransport>).1;
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;

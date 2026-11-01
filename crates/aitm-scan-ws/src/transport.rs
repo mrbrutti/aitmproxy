@@ -89,8 +89,12 @@ impl TcpTransport {
     }
 
     /// The certificate policy this transport was built with.
+    ///
+    /// Crate-internal: the policy is chosen by `lane::build_with` /
+    /// `language::build_with` and read back only for the connect log, so a live
+    /// run's trace says whether that dial verified the chain.
     #[must_use]
-    pub fn tls_policy(&self) -> TlsPolicy {
+    pub(crate) fn tls_policy(&self) -> TlsPolicy {
         self.tls
     }
 
@@ -113,7 +117,7 @@ impl WsTransport for TcpTransport {
     ) -> BoxFuture<'a, anyhow::Result<ByteStream>> {
         Box::pin(async move {
             let limit = self.connect_timeout;
-            tracing::debug!(%addr, tls, "ws transport connect");
+            tracing::debug!(%addr, tls, policy = ?self.tls_policy(), "ws transport connect");
             let tcp = tokio::time::timeout(limit, TcpStream::connect(addr))
                 .await
                 .map_err(|_| anyhow!("tcp connect to {addr} timed out after {limit:?}"))?

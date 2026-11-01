@@ -12,9 +12,14 @@
 //!
 //! - **The lane is the registry.** An `InsertionPoint` on the wire carries no
 //!   way back to the capture it came from, so `discover` keeps the
-//!   [`PointSpec`] and the two flows behind every point it minted and
-//!   `probe_host_for` looks the point up by id (plan call 4). An id this lane
-//!   never issued is an error, never a quietly empty probe.
+//!   [`PointSpec`] of every point it minted, under the id of the job it minted
+//!   it for, and `probe_host_for` looks the point up by `(job id, point id)`
+//!   and re-reads the two flows the spec names out of that job's store (plan
+//!   call 4). An id this lane never issued for this job is an error, never a
+//!   quietly empty probe; so is a point whose conversation the store has since
+//!   dropped. Only the specs are held, and only for the last
+//!   [`REGISTERED_JOBS`] jobs, so a lane that lives as long as the process does
+//!   not grow with every job it serves.
 //! - **One dialer per lane.** The 4-permit semaphore lives in the
 //!   [`WsDialer`], and every probe host the lane builds shares this one dialer,
 //!   so a job holds at most 4 WebSocket connections open — and two concurrent
@@ -25,11 +30,11 @@
 //!   conversation whose handshake origin is outside `target.origins` is skipped
 //!   before anything is read out of it (plan call 4).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use aitm_core::{Flow, FlowKind, FlowQuery, HttpFlow, WsFlow};
+use aitm_core::{Flow, FlowKind, FlowQuery};
 use aitm_scan_model::{
     Check, Discovery, InsertionPoint, JobCtx, Lane, LaneKind, ProbeHost, ProfileTarget, SiteNode,
 };
@@ -46,15 +51,25 @@ use crate::types::{PointSpec, TlsPolicy};
 /// How long the production transport waits for a TCP connect or TLS handshake.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What the lane remembers about one point so it can re-drive it later.
-#[derive(Debug, Clone)]
-struct Registered {
-    /// Where in the conversation the payload goes.
-    spec: PointSpec,
-    /// The captured upgrade request the probe replays.
-    handshake: HttpFlow,
-    /// The captured conversation whose frames the probe replays.
-    ws: WsFlow,
+/// How many jobs' point specs the lane keeps before it drops the oldest.
+///
+/// A lane is built once and lives as long as the process, so the registry is
+/// bounded: the seventeenth job to discover evicts the first, whose points then
+/// read as unknown (quality finding Q2).
+pub const REGISTERED_JOBS: usize = 16;
+
+/// The point specs of the jobs the lane has discovered for.
+///
+/// Specs only — a few hundred bytes a point. The flows a spec names are read
+/// back out of the job's own store when a probe is built, so a conversation is
+/// never cloned per point and the lane never pins a flow the store has dropped.
+#[derive(Debug, Default)]
+struct Registry {
+    /// Job id -> point id -> where in the conversation that point sits.
+    jobs: HashMap<String, HashMap<String, PointSpec>>,
+    /// The registered job ids in first-registration order; the front is the
+    /// oldest and is what eviction drops.
+    order: VecDeque<String>,
 }
 
 /// The WebSocket lane: discovery, probe hosting and the eight native checks.
@@ -62,8 +77,8 @@ pub struct WsLane {
     /// Shared by every probe host this lane builds, so its 4 permits bound the
     /// whole lane (plan calls 2 and 23).
     dialer: Arc<WsDialer>,
-    /// Point id -> everything needed to re-drive that point.
-    registry: Mutex<HashMap<String, Registered>>,
+    /// What each job's points were, bounded at [`REGISTERED_JOBS`] jobs.
+    registry: Mutex<Registry>,
 }
 
 impl WsLane {
@@ -72,24 +87,47 @@ impl WsLane {
     pub fn new(dialer: Arc<WsDialer>) -> Self {
         Self {
             dialer,
-            registry: Mutex::new(HashMap::new()),
+            registry: Mutex::new(Registry::default()),
         }
     }
 
-    /// Remember `specs` (parallel to the points just minted) for `handshake`
-    /// and `ws`, so `probe_host_for` can find them by point id.
-    fn register(&self, specs: Vec<(String, PointSpec)>, handshake: &HttpFlow, ws: &WsFlow) {
-        let mut registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+    /// Remember `specs` (the points just minted) under `job_id`, so
+    /// `probe_host_for` can find them again by `(job id, point id)`.
+    ///
+    /// Registering a job the lane has not seen before may evict the oldest one.
+    fn register(&self, job_id: &str, specs: Vec<(String, PointSpec)>) {
+        let mut guard = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        let registry = &mut *guard;
+        let points = match registry.jobs.get_mut(job_id) {
+            Some(points) => points,
+            None => {
+                registry.order.push_back(job_id.to_string());
+                registry.jobs.entry(job_id.to_string()).or_default()
+            }
+        };
         for (id, spec) in specs {
-            registry.insert(
-                id,
-                Registered {
-                    spec,
-                    handshake: handshake.clone(),
-                    ws: ws.clone(),
-                },
-            );
+            points.insert(id, spec);
         }
+        while registry.order.len() > REGISTERED_JOBS {
+            match registry.order.pop_front() {
+                Some(oldest) => {
+                    registry.jobs.remove(&oldest);
+                }
+                // Unreachable while `len() > 16`, but a `break` is cheaper than
+                // an `expect` in a path that holds a lock.
+                None => break,
+            }
+        }
+    }
+
+    /// The spec registered for `point` under `job_id`, if this lane minted it.
+    fn spec_for(&self, job_id: &str, point_id: &str) -> Option<PointSpec> {
+        let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
+        registry
+            .jobs
+            .get(job_id)
+            .and_then(|points| points.get(point_id))
+            .cloned()
     }
 }
 
@@ -152,7 +190,7 @@ impl Lane for WsLane {
                 }
 
                 let found = discover_flow(&ws, &handshake, &mut ids);
-                self.register(found.specs, &handshake, &ws);
+                self.register(job.job_id(), found.specs);
 
                 match nodes.iter_mut().find(|node| {
                     node.scheme == found.node.scheme
@@ -180,17 +218,32 @@ impl Lane for WsLane {
         point: &InsertionPoint,
         job: Arc<dyn JobCtx>,
     ) -> anyhow::Result<Box<dyn ProbeHost>> {
-        let registered = {
-            let registry = self.registry.lock().unwrap_or_else(PoisonError::into_inner);
-            registry.get(&point.id).cloned()
+        let spec = self
+            .spec_for(job.job_id(), &point.id)
+            .ok_or_else(|| anyhow!("unknown ws point {}", point.id))?;
+
+        // The registry holds no flows: the conversation and its handshake are
+        // read back out of the job's store, which may have dropped either of
+        // them since discovery ran.
+        let store = job.store();
+        let Some(Flow::WebSocket(ws)) = store.get(spec.ws_flow) else {
+            return Err(anyhow!(
+                "the point's flow is no longer in the store: {}",
+                point.id
+            ));
         };
-        let registered = registered.ok_or_else(|| anyhow!("unknown ws point {}", point.id))?;
+        let Some(Flow::Http(handshake)) = store.get(spec.handshake) else {
+            return Err(anyhow!(
+                "the point's flow is no longer in the store: {} (handshake)",
+                point.id
+            ));
+        };
 
         let host = WsProbeHost::new(
             point.clone(),
-            registered.spec,
-            registered.handshake,
-            registered.ws,
+            spec,
+            handshake,
+            ws,
             Arc::clone(&self.dialer),
             job,
         )?;
@@ -232,8 +285,8 @@ pub fn build_with(tls: TlsPolicy) -> Option<Arc<dyn Lane>> {
 mod tests {
     use std::sync::Arc;
 
-    use aitm_core::{Flow, FlowId};
-    use aitm_scan_model::{CheckOrigin, InsertionKind, JobCtx, Lane, LaneKind};
+    use aitm_core::{Flow, FlowId, InterceptState};
+    use aitm_scan_model::{CheckOrigin, InsertionKind, InsertionPoint, JobCtx, Lane, LaneKind};
 
     use super::WsLane;
     use crate::dialer::WsDialer;
@@ -340,6 +393,117 @@ mod tests {
         };
         assert!(
             err.to_string().contains("unknown ws point"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    /// A job named `job_id` whose store holds one fixture conversation.
+    fn job_with_one_conversation(job_id: &str) -> Arc<TestJob> {
+        let job = TestJob::named(job_id, 64);
+        let (handshake, ws) = captured_conversation();
+        job.store().insert(Flow::Http(handshake));
+        job.store().insert(Flow::WebSocket(ws));
+        job
+    }
+
+    /// `probe_host_for`'s error, or a panic naming `why` when it built a host
+    /// (`Box<dyn ProbeHost>` is not `Debug`, so `expect_err` is unavailable).
+    fn host_err(lane: &WsLane, point: &InsertionPoint, job: Arc<TestJob>, why: &str) -> String {
+        match lane.probe_host_for(point, job) {
+            Ok(_) => panic!("{why}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// Assert `probe_host_for` builds a host for `point` under `job`.
+    fn hosts(lane: &WsLane, point: &InsertionPoint, job: Arc<TestJob>) {
+        assert!(
+            lane.probe_host_for(point, job).is_ok(),
+            "a point the lane registered for this job must still host a probe"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_job_does_not_see_the_first_jobs_points() {
+        let lane = lane();
+        let first = job_with_one_conversation("job-a");
+        let second = job_with_one_conversation("job-b");
+
+        let found = lane
+            .discover(&first.profile().target, &*first)
+            .await
+            .expect("discovery for the first job");
+        lane.discover(&second.profile().target, &*second)
+            .await
+            .expect("discovery for the second job");
+
+        let point = &found.points[0];
+        let err = host_err(
+            &lane,
+            point,
+            Arc::clone(&second),
+            "a job must not host another job's point",
+        );
+        assert!(
+            err.contains("unknown ws point"),
+            "unexpected error text: {err}"
+        );
+        hosts(&lane, point, first);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn registry_evicts_the_oldest_job_past_sixteen() {
+        let lane = lane();
+        let mut jobs = Vec::new();
+        let mut points = Vec::new();
+        for nth in 0..17 {
+            let job = job_with_one_conversation(&format!("job-{nth}"));
+            let found = lane
+                .discover(&job.profile().target, &*job)
+                .await
+                .unwrap_or_else(|err| panic!("discovery for job {nth}: {err}"));
+            points.push(found.points[0].clone());
+            jobs.push(job);
+        }
+
+        let err = host_err(
+            &lane,
+            &points[0],
+            Arc::clone(&jobs[0]),
+            "the seventeenth job must have evicted the first",
+        );
+        assert!(
+            err.contains("unknown ws point"),
+            "unexpected error text: {err}"
+        );
+        hosts(&lane, &points[16], Arc::clone(&jobs[16]));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_point_whose_flow_left_the_store_is_err() {
+        let lane = lane();
+        let job = TestJob::new(64);
+        let (handshake, mut ws) = captured_conversation();
+        // A killed conversation is terminal, so `clear` removes it — this is
+        // the store dropping a flow the registry still names.
+        ws.intercept = InterceptState::Killed;
+        job.store().insert(Flow::Http(handshake));
+        job.store().insert(Flow::WebSocket(ws));
+
+        let found = lane
+            .discover(&job.profile().target, &*job)
+            .await
+            .expect("discovery over the fixture");
+        job.store().clear();
+
+        let err = host_err(
+            &lane,
+            &found.points[0],
+            Arc::clone(&job),
+            "a point whose conversation left the store must not host a probe",
+        );
+        assert!(
+            err.contains("the point's flow is no longer in the store"),
             "unexpected error text: {err}"
         );
     }

@@ -16,15 +16,16 @@
 //! [`aitm_core::redact::scrub_text`] then [`Evidence::excerpt`]).
 
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 use aitm_core::redact::scrub_text;
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, Frame, FrameKind,
-    InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost,
-    ProbeResponse, Technique, Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
+    Intensity, LaneKind, Outcome, Payload, PayloadMode, ProbeHost, ProbeResponse, Technique,
+    Verdict,
 };
 use futures::future::BoxFuture;
+
+use crate::checks::common;
 
 /// The catalogue identifier, also the suffix of the manual `check.cswsh` verb.
 pub const ID: &str = "cswsh";
@@ -80,44 +81,37 @@ impl Check for Cswsh {
     ) -> BoxFuture<'a, Verdict> {
         Box::pin(async move {
             if point.name != "origin" {
-                return verdict(
-                    Outcome::Clean,
-                    Confidence::Tentative,
-                    "not the Origin point",
-                    Evidence::default(),
-                );
+                return common::clean("not the Origin point", Evidence::default());
             }
-            if let Some(stop) = stop_verdict(host) {
-                return stop;
+            if let Some(reason) = common::stop_reason(host) {
+                return common::inconclusive(reason, Vec::new());
             }
 
             let baseline = match host.baseline().await {
                 Ok(response) => response,
-                Err(e) => return connect_error(e),
+                Err(e) => return common::connect_error(&e),
             };
 
-            if let Some(stop) = stop_verdict(host) {
-                return stop;
+            if let Some(reason) = common::stop_reason(host) {
+                return common::inconclusive(reason, Vec::new());
             }
 
             let probe = match host.probe(&foreign_origin_payload()).await {
                 Ok(response) => response,
-                Err(e) => return connect_error(e),
+                Err(e) => return common::connect_error(&e),
             };
 
             if probe.status != Some(101) {
                 let status = probe
                     .status
                     .map_or_else(|| "none".to_string(), |code| code.to_string());
-                return verdict(
-                    Outcome::Clean,
-                    Confidence::Tentative,
+                return common::clean(
                     format!("upgrade refused with status {status} for a foreign Origin"),
                     evidence(Some(&baseline), Some(&probe), None),
                 );
             }
 
-            let probe_first = first_data_frame(&probe);
+            let probe_first = common::first_data_frame(probe.ws_frames.as_deref().unwrap_or(&[]));
             let Some(probe_first) = probe_first else {
                 return verdict(
                     Outcome::Inconclusive,
@@ -127,7 +121,8 @@ impl Check for Cswsh {
                 );
             };
 
-            let baseline_first = first_data_frame(&baseline);
+            let baseline_first =
+                common::first_data_frame(baseline.ws_frames.as_deref().unwrap_or(&[]));
             if baseline_first.is_some_and(|frame| frame.payload == probe_first.payload) {
                 verdict(
                     Outcome::Vulnerable,
@@ -166,47 +161,6 @@ fn foreign_origin_payload() -> Payload {
         mode: PayloadMode::Replace,
         bytes: None,
     }
-}
-
-/// The first text or binary server frame of `response`, skipping control frames.
-fn first_data_frame(response: &ProbeResponse) -> Option<&Frame> {
-    response
-        .ws_frames
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .find(|frame| matches!(frame.kind, FrameKind::Text | FrameKind::Binary))
-}
-
-/// The pre-probe stop check: cancellation, exhausted budget or a passed
-/// deadline, each an `Inconclusive` verdict naming why.
-fn stop_verdict(host: &dyn ProbeHost) -> Option<Verdict> {
-    let detail = if host.cancelled() {
-        "cancelled"
-    } else if host.budget_left() == 0 {
-        "budget exhausted"
-    } else if host.deadline() <= Instant::now() {
-        "deadline passed"
-    } else {
-        return None;
-    };
-    Some(verdict(
-        Outcome::Inconclusive,
-        Confidence::Tentative,
-        detail,
-        Evidence::default(),
-    ))
-}
-
-/// The verdict for a dialer error: `Inconclusive`, with the dialer's error text
-/// (which carries no header value, by the probe host's contract).
-fn connect_error(e: anyhow::Error) -> Verdict {
-    verdict(
-        Outcome::Inconclusive,
-        Confidence::Tentative,
-        format!("connect error: {e}"),
-        Evidence::default(),
-    )
 }
 
 /// Evidence linking the probe and baseline flows the host recorded (empty under
@@ -249,60 +203,20 @@ fn verdict(
 mod tests {
     use std::sync::Arc;
 
-    use aitm_scan_model::{Check, Confidence, JobCtx, Outcome};
+    use aitm_scan_model::{Check, Confidence, Outcome};
     use futures::SinkExt;
     use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
     use tokio_tungstenite::tungstenite::http::StatusCode;
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{check, Cswsh};
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
     use crate::testing::{
-        captured_conversation, ws_server, DuplexTransport, HandshakeDecision, ServerConn,
-        ServerLog, TestJob,
+        handshake_header, host_for, ws_server, HandshakeDecision, ServerConn, TestJob,
     };
-    use crate::transport::WsTransport;
 
     /// The authenticated greeting the seeded target sends right after the
     /// upgrade when the session cookie is present.
     const GREETING: &str = r#"{"type":"hello","user":"alice"}"#;
-
-    /// A host over the fixture conversation's point named `name`, dialling
-    /// through `transport`.
-    fn host_for(
-        name: &str,
-        job: &Arc<TestJob>,
-        transport: Arc<DuplexTransport>,
-    ) -> crate::host::WsProbeHost {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == name)
-            .unwrap_or_else(|| panic!("the fixture has a point named {name}"));
-        crate::host::WsProbeHost::new(
-            found.points[at].clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host")
-    }
-
-    /// The value of one (lowercase) header of the server's `nth` handshake.
-    fn handshake_header(log: &ServerLog, nth: usize, name: &str) -> Option<String> {
-        log.handshakes().get(nth).and_then(|headers| {
-            headers
-                .iter()
-                .find(|(header, _)| header == name)
-                .map(|(_, value)| value.clone())
-        })
-    }
 
     /// The seeded "vulnerable" target: completes any upgrade and greets with the
     /// authenticated frame whenever the session cookie rode along.

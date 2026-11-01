@@ -27,6 +27,8 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
+use crate::checks::common;
+
 use crate::payloads::{sql_error_signature, SQL_ERROR_PAYLOADS, SQL_ERROR_SIGNATURES};
 
 /// The catalogue id of this check, also its `check.<id>` verb suffix.
@@ -96,24 +98,21 @@ impl Check for WsSqlError {
 
 /// The check's whole body: baseline, then one probe per payload.
 async fn run(host: &dyn ProbeHost) -> Verdict {
-    if let Some(reason) = stop_reason(host) {
-        return inconclusive(reason.to_string());
+    if let Some(reason) = common::stop_reason(host) {
+        return common::inconclusive(reason, Vec::new());
     }
 
     let baseline = match host.baseline().await {
         Ok(response) => response,
-        Err(error) => return inconclusive(format!("connect error: {error}")),
+        Err(error) => return common::connect_error(&error),
     };
     if sql_error_signature(&body_text(&baseline)).is_some() {
-        return clean(
-            "baseline already carries a SQL error signature".to_string(),
-            &baseline,
-        );
+        return clean("baseline already carries a SQL error signature", &baseline);
     }
 
     for payload in SQL_ERROR_PAYLOADS {
-        if let Some(reason) = stop_reason(host) {
-            return inconclusive(reason.to_string());
+        if let Some(reason) = common::stop_reason(host) {
+            return common::inconclusive(reason, Vec::new());
         }
         let probe = Payload {
             value: payload.to_string(),
@@ -122,7 +121,7 @@ async fn run(host: &dyn ProbeHost) -> Verdict {
         };
         let response = match host.probe(&probe).await {
             Ok(response) => response,
-            Err(error) => return inconclusive(format!("connect error: {error}")),
+            Err(error) => return common::connect_error(&error),
         };
         if let Some(signature) = sql_error_signature(&body_text(&response)) {
             return Verdict {
@@ -142,26 +141,9 @@ async fn run(host: &dyn ProbeHost) -> Verdict {
     }
 
     clean(
-        "no SQL error signature in any reply to an unbalanced quote".to_string(),
+        "no SQL error signature in any reply to an unbalanced quote",
         &baseline,
     )
-}
-
-/// Why the check must send nothing more, if it must.
-///
-/// Checked before the baseline and again between payloads, so a cancel or an
-/// exhausted budget ends the run at the next gap rather than three dials later.
-fn stop_reason(host: &dyn ProbeHost) -> Option<&'static str> {
-    if host.cancelled() {
-        return Some("cancelled");
-    }
-    if host.budget_left() == 0 {
-        return Some("budget exhausted");
-    }
-    if host.deadline() <= std::time::Instant::now() {
-        return Some("deadline passed");
-    }
-    None
 }
 
 /// The operator-facing line for a hit, naming the signature and its DBMS.
@@ -188,71 +170,28 @@ fn body_text(response: &ProbeResponse) -> String {
     String::from_utf8_lossy(&response.body).into_owned()
 }
 
-/// A `Clean` verdict, which is `Tentative` by the plan's shape rule.
-fn clean(detail: String, baseline: &ProbeResponse) -> Verdict {
-    Verdict {
-        outcome: Outcome::Clean,
-        confidence: Confidence::Tentative,
-        evidence: Evidence {
+/// [`common::clean`] linking the baseline conversation it was reached from.
+fn clean(detail: impl Into<String>, baseline: &ProbeResponse) -> Verdict {
+    common::clean(
+        detail,
+        Evidence {
             baseline_flow: baseline.flow,
             ..Evidence::default()
         },
-        detail,
-        poc_hint: None,
-    }
-}
-
-/// An `Inconclusive` verdict: nothing was concluded, so nothing is evidenced.
-fn inconclusive(detail: String) -> Verdict {
-    Verdict {
-        outcome: Outcome::Inconclusive,
-        confidence: Confidence::Tentative,
-        evidence: Evidence::default(),
-        detail,
-        poc_hint: None,
-    }
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use aitm_scan_model::{Confidence, JobCtx, Outcome};
+    use aitm_scan_model::{Confidence, Outcome};
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{check, ID};
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
-    use crate::host::WsProbeHost;
-    use crate::testing::{
-        captured_conversation, echo_handler, ws_server, DuplexTransport, ServerConn, TestJob,
-    };
-    use crate::transport::WsTransport;
+    use crate::testing::{echo_handler, host_for, ws_server, ServerConn, TestJob};
 
     /// What a MySQL-backed server leaks when an unbalanced quote reaches it.
     const MYSQL_ERROR: &str = r#"{"error":"You have an error in your SQL syntax near '''"}"#;
-
-    /// A host over the fixture conversation's point named `name`.
-    fn host_for(name: &str, job: &Arc<TestJob>, transport: Arc<DuplexTransport>) -> WsProbeHost {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == name)
-            .unwrap_or_else(|| panic!("the fixture has a point named {name}"));
-        WsProbeHost::new(
-            found.points[at].clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host")
-    }
 
     /// The seeded vulnerable target: a quote in the frame provokes the database
     /// error, anything else is echoed as the patched build echoes it.

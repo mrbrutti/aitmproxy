@@ -52,7 +52,7 @@ use crate::types::{authority_with_port, default_port, HandshakeOverrides, MAX_CO
 /// fresh nonce per dial (replaying the captured one would make the server's
 /// `Sec-WebSocket-Accept` meaningless); `Sec-WebSocket-Accept` is a *response*
 /// header and is never sent by a client (spec D8.3).
-pub const REGENERATED_HEADERS: [&str; 6] = [
+pub(crate) const REGENERATED_HEADERS: [&str; 6] = [
     "host",
     "connection",
     "upgrade",

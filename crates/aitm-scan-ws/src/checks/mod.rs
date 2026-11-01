@@ -9,6 +9,7 @@ use aitm_scan_model::Check;
 
 pub mod auth_bypass;
 pub mod cmdi_echo;
+pub(crate) mod common;
 pub mod cswsh;
 pub mod oversize;
 pub mod reflection;

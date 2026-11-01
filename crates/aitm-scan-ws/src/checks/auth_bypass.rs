@@ -20,15 +20,15 @@
 //! `Evidence::excerpt` bounds it.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 use aitm_core::redact::scrub_text;
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, Frame, FrameKind,
-    InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, ProbeResponse,
-    RawProbe, Technique, Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, Frame, InsertionKind,
+    InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, RawProbe, Technique, Verdict,
 };
 use futures::future::BoxFuture;
+
+use crate::checks::common;
 
 /// The check's catalogue identifier, also its `check.<id>` verb suffix.
 pub const ID: &str = "ws-auth-bypass-handshake";
@@ -93,29 +93,9 @@ fn stripped_credentials() -> RawProbe {
     }
 }
 
-/// The first Text or Binary frame of a reply; control frames are not the oracle.
-fn first_data_frame(response: &ProbeResponse) -> Option<&Frame> {
-    response
-        .ws_frames
-        .as_ref()?
-        .iter()
-        .find(|frame| matches!(frame.kind, FrameKind::Text | FrameKind::Binary))
-}
-
 /// Two replies are "the same reply" when the opcode and the bytes both match.
 fn same_reply(probe: &Frame, baseline: &Frame) -> bool {
     probe.kind == baseline.kind && probe.payload == baseline.payload
-}
-
-/// A verdict with no evidence, for the outcomes reached before any probe.
-fn bare(outcome: Outcome, detail: impl Into<String>) -> Verdict {
-    Verdict {
-        outcome,
-        confidence: Confidence::Tentative,
-        evidence: Evidence::default(),
-        detail: detail.into(),
-        poc_hint: None,
-    }
 }
 
 impl Check for WsAuthBypassHandshake {
@@ -130,29 +110,25 @@ impl Check for WsAuthBypassHandshake {
     ) -> BoxFuture<'a, Verdict> {
         Box::pin(async move {
             if !matches!(point.name.as_str(), "cookie" | "authorization") {
-                return bare(
-                    Outcome::Clean,
+                return common::clean(
                     "acts on the cookie/authorization handshake points",
+                    Evidence::default(),
                 );
             }
-            if let Some(stop) = stop_reason(host) {
-                return bare(Outcome::Inconclusive, stop);
+            if let Some(stop) = common::stop_reason(host) {
+                return common::inconclusive(stop, Vec::new());
             }
 
             let baseline = match host.baseline().await {
                 Ok(response) => response,
-                Err(error) => {
-                    return bare(Outcome::Inconclusive, format!("connect error: {error}"))
-                }
+                Err(error) => return common::connect_error(&error),
             };
-            if let Some(stop) = stop_reason(host) {
-                return bare(Outcome::Inconclusive, stop);
+            if let Some(stop) = common::stop_reason(host) {
+                return common::inconclusive(stop, Vec::new());
             }
             let probe = match host.probe_raw(stripped_credentials()).await {
                 Ok(response) => response,
-                Err(error) => {
-                    return bare(Outcome::Inconclusive, format!("connect error: {error}"))
-                }
+                Err(error) => return common::connect_error(&error),
             };
 
             let evidence = Evidence {
@@ -164,7 +140,10 @@ impl Check for WsAuthBypassHandshake {
             };
 
             match probe.status {
-                Some(101) => match (first_data_frame(&probe), first_data_frame(&baseline)) {
+                Some(101) => match (
+                    common::first_data_frame(probe.ws_frames.as_deref().unwrap_or(&[])),
+                    common::first_data_frame(baseline.ws_frames.as_deref().unwrap_or(&[])),
+                ) {
                     (Some(reply), Some(authenticated)) if same_reply(reply, authenticated) => {
                         Verdict {
                             outcome: Outcome::Vulnerable,
@@ -213,28 +192,12 @@ impl Check for WsAuthBypassHandshake {
     }
 }
 
-/// Why the check must send nothing more, when it must: the three stop
-/// conditions every check polls between probes.
-fn stop_reason(host: &dyn ProbeHost) -> Option<&'static str> {
-    if host.cancelled() {
-        return Some("cancelled");
-    }
-    if host.budget_left() == 0 {
-        return Some("budget exhausted");
-    }
-    if host.deadline() <= Instant::now() {
-        return Some("deadline passed");
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use aitm_scan_model::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, JobCtx, LaneKind, Outcome,
-        Technique,
+        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
     };
     use futures::SinkExt;
     use tokio_tungstenite::tungstenite::handshake::server::{
@@ -244,14 +207,9 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{check, ID};
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
-    use crate::host::WsProbeHost;
     use crate::testing::{
-        captured_conversation, echo_handler, ws_server, DuplexTransport, HandshakeDecision,
-        ServerConn, ServerLog, TestJob,
+        echo_handler, handshake_header, host_for, ws_server, HandshakeDecision, ServerConn, TestJob,
     };
-    use crate::transport::WsTransport;
 
     /// The seeded target's authenticated greeting, sent right after the upgrade.
     const ALICE: &str = r#"{"type":"hello","user":"alice"}"#;
@@ -259,37 +217,7 @@ mod tests {
     /// The same greeting for a connection that carried no session.
     const ANONYMOUS: &str = r#"{"type":"hello","user":"anonymous"}"#;
 
-    /// A host over the fixture conversation's point named `name`.
-    fn host_for(name: &str, job: &Arc<TestJob>, transport: Arc<DuplexTransport>) -> WsProbeHost {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == name)
-            .unwrap_or_else(|| panic!("the fixture has a point named {name}"));
-        WsProbeHost::new(
-            found.points[at].clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host")
-    }
-
     /// The value of one (lowercase) header of the server's `nth` handshake.
-    fn handshake_header(log: &ServerLog, nth: usize, name: &str) -> Option<String> {
-        log.handshakes().get(nth).and_then(|headers| {
-            headers
-                .iter()
-                .find(|(header, _)| header == name)
-                .map(|(_, value)| value.clone())
-        })
-    }
-
     /// The patched seeded target: the greeting names the cookie's user, and an
     /// unauthenticated connection is greeted as `anonymous`.
     async fn hello_by_cookie(conn: ServerConn) {

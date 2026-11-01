@@ -23,13 +23,14 @@
 //! constant and no detail carries a header value.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
     Intensity, LaneKind, Outcome, ProbeHost, ProbeResponse, RawProbe, Technique, Verdict,
 };
 use futures::future::BoxFuture;
+
+use crate::checks::common;
 
 /// The catalogue id of this check, also its `check.<id>` verb suffix.
 pub const ID: &str = "ws-subprotocol-observe";
@@ -101,10 +102,10 @@ impl Check for SubprotocolObserve {
     ) -> BoxFuture<'a, Verdict> {
         Box::pin(async move {
             if !is_negotiation_point(point) {
-                return clean("not a negotiation point".to_string(), Evidence::default());
+                return common::clean("not a negotiation point", Evidence::default());
             }
-            if let Some(stop) = stopped(host) {
-                return stop;
+            if let Some(reason) = common::stop_reason(host) {
+                return common::inconclusive(reason, Vec::new());
             }
 
             let requested = format!("aitm-{}", host.marker());
@@ -120,7 +121,7 @@ impl Check for SubprotocolObserve {
                 Ok(response) => response,
                 // The dialer's error text names the authority and the failure,
                 // never a header (plan task 9-16 common shape).
-                Err(err) => return inconclusive(format!("connect error: {err}")),
+                Err(err) => return common::connect_error(&err),
             };
 
             let evidence = Evidence {
@@ -131,25 +132,24 @@ impl Check for SubprotocolObserve {
                 ..Evidence::default()
             };
             let Some(status) = response.status else {
-                return inconclusive("the probe recorded no upgrade status".to_string());
+                return common::inconclusive("the probe recorded no upgrade status", Vec::new());
             };
             if status != 101 {
-                return clean(
+                return common::clean(
                     format!("upgrade refused with status {status} for an arbitrary subprotocol"),
                     evidence,
                 );
             }
 
             match selected(&response) {
-                None => clean(
+                None => common::clean(
                     "upgrade completed without selecting a subprotocol; RFC 6455 lets a server \
                      decline every offered subprotocol, the client is expected to fail such a \
-                     connection"
-                        .to_string(),
+                     connection",
                     evidence,
                 ),
                 Some(protocol) if protocol == requested => vulnerable(
-                    "server echoed an arbitrary subprotocol".to_string(),
+                    "server echoed an arbitrary subprotocol",
                     Evidence {
                         matched: Some(ECHOED.to_string()),
                         ..evidence
@@ -157,10 +157,7 @@ impl Check for SubprotocolObserve {
                 ),
                 // The probe offered exactly one token, so anything else the
                 // server names was never on offer (call 33).
-                Some(_) => vulnerable(
-                    "server selected an unrequested subprotocol".to_string(),
-                    evidence,
-                ),
+                Some(_) => vulnerable("server selected an unrequested subprotocol", evidence),
             }
         })
     }
@@ -186,52 +183,14 @@ fn selected(response: &ProbeResponse) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-/// The reason this check must not probe, if there is one.
-fn stopped(host: &dyn ProbeHost) -> Option<Verdict> {
-    if host.cancelled() {
-        return Some(inconclusive("cancelled".to_string()));
-    }
-    if host.budget_left() == 0 {
-        return Some(inconclusive("budget exhausted".to_string()));
-    }
-    if host.deadline() <= Instant::now() {
-        return Some(inconclusive("deadline passed".to_string()));
-    }
-    None
-}
-
-/// A `Vulnerable` verdict at this check's `confidence_max`.
-fn vulnerable(detail: String, evidence: Evidence) -> Verdict {
-    verdict(Outcome::Vulnerable, Confidence::Firm, detail, evidence)
-}
-
-/// A `Clean` verdict, always `Tentative` (the common check shape).
-fn clean(detail: String, evidence: Evidence) -> Verdict {
-    verdict(Outcome::Clean, Confidence::Tentative, detail, evidence)
-}
-
-/// An `Inconclusive` verdict with no evidence to show.
-fn inconclusive(detail: String) -> Verdict {
-    verdict(
-        Outcome::Inconclusive,
-        Confidence::Tentative,
-        detail,
-        Evidence::default(),
-    )
-}
-
-/// One verdict; `poc_hint` is always `None` for a WS check (plan call 19).
-fn verdict(
-    outcome: Outcome,
-    confidence: Confidence,
-    detail: String,
-    evidence: Evidence,
-) -> Verdict {
+/// A `Vulnerable` verdict at this check's `confidence_max`; `poc_hint` is
+/// always `None` for a WS check (plan call 19).
+fn vulnerable(detail: impl Into<String>, evidence: Evidence) -> Verdict {
     Verdict {
-        outcome,
-        confidence,
+        outcome: Outcome::Vulnerable,
+        confidence: Confidence::Firm,
         evidence,
-        detail,
+        detail: detail.into(),
         poc_hint: None,
     }
 }
@@ -242,52 +201,20 @@ mod tests {
 
     use aitm_core::{MemFlowStore, StdGuard};
     use aitm_scan_model::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, InsertionPoint, Intensity, JobCtx,
-        LaneKind, Outcome, Technique, Verdict,
+        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
+        Verdict,
     };
     use tokio_tungstenite::tungstenite::handshake::server::{create_response, ErrorResponse};
     use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 
     use super::{check, ID};
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
-    use crate::host::WsProbeHost;
     use crate::testing::{
-        captured_conversation, echo_handler, ws_server, DuplexTransport, HandshakeDecision,
-        ServerLog, TestJob,
+        echo_handler, point_and_host_for, ws_server, HandshakeDecision, ServerLog, TestJob,
     };
     use crate::transport::WsTransport;
 
     /// The subprotocol the check asks for, over a [`TestJob`]'s fixed marker.
     const REQUESTED: &str = "aitm-mk7f3a9e";
-
-    /// The fixture point `name`, with a host that re-drives it through
-    /// `transport`.
-    fn host_for(
-        name: &str,
-        job: &Arc<TestJob>,
-        transport: Arc<DuplexTransport>,
-    ) -> (InsertionPoint, WsProbeHost) {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == name)
-            .unwrap_or_else(|| panic!("the fixture has a point named {name}"));
-        let point = found.points[at].clone();
-        let host = WsProbeHost::new(
-            point.clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host");
-        (point, host)
-    }
 
     /// Run the check against the fixture point `name`, over a server that
     /// answers every upgrade with `decide` and echoes every frame.
@@ -297,7 +224,7 @@ mod tests {
         job: &Arc<TestJob>,
     ) -> (Verdict, Arc<ServerLog>) {
         let (transport, log) = ws_server(decide, echo_handler);
-        let (point, host) = host_for(name, job, transport);
+        let (point, host) = point_and_host_for(name, job, transport as Arc<dyn WsTransport>);
         let verdict = check().run(&point, &host).await;
         (verdict, log)
     }

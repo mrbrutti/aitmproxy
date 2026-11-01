@@ -129,7 +129,7 @@ pub fn ssti_probes(marker: &str) -> Vec<(String, String)> {
 /// This is the escaping a patched target applies before echoing a field back,
 /// and it is why [`payload_present`] has to look for the escaped form too.
 #[must_use]
-pub fn html_escape_min(s: &str) -> String {
+pub(crate) fn html_escape_min(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

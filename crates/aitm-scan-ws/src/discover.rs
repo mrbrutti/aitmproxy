@@ -7,7 +7,9 @@
 //! one point per binary frame (spec D8.3 "Insertion points", plan call 4).
 //!
 //! Nothing here dials anything. Discovery reads a capture and produces wire
-//! types, so every observed value it carries out is redacted first: a point's
+//! types, so every observed value it carries out is redacted first: the query
+//! string is dropped from a point's `url` and the node's `path_template` (it is
+//! captured data, often a token); a point's
 //! `example` is `<redacted>` when the point's name reads as a secret or it is a
 //! `Cookie`/`Authorization` handshake header, and otherwise
 //! [`aitm_core::redact::scrub_text`] of the value, bounded to
@@ -22,6 +24,7 @@ use aitm_scan_model::ids::FlowRef;
 use aitm_scan_model::point::{InsertionPoint, ParamRef, SiteNode};
 use aitm_scan_model::vocab::{InsertionKind, LaneKind, PointTrait};
 
+use crate::dialer::REGENERATED_HEADERS;
 use crate::types::{authority_with_port, default_port, Locator, PointSpec};
 
 /// What a point's `example` reads when its value must never be recorded.
@@ -41,16 +44,13 @@ const ALWAYS_POINT_HEADERS: &[&str] = &[
     "sec-websocket-extensions",
 ];
 
-/// Handshake request headers that never become an insertion point: the ones the
-/// dialer regenerates per connection, and the ambient client headers that carry
+/// The ambient client headers that never become an insertion point: they carry
 /// nothing a target branches on.
-const SKIP_HEADERS: &[&str] = &[
-    "host",
-    "connection",
-    "upgrade",
-    "sec-websocket-key",
-    "sec-websocket-version",
-    "sec-websocket-accept",
+///
+/// The other half of the skip list is [`crate::dialer::REGENERATED_HEADERS`] —
+/// the headers the dialer writes itself, which a point could not change
+/// anyway — and [`header_is_point`] walks both (quality finding Q4).
+const AMBIENT_HEADERS: &[&str] = &[
     "user-agent",
     "accept",
     "accept-encoding",
@@ -193,13 +193,16 @@ pub fn discover_flow(ws: &WsFlow, handshake: &HttpFlow, ids: &mut IdGen) -> Disc
     let request = &handshake.request;
     let scheme = normalise_scheme(&request.scheme);
     let (host, port) = split_authority(&authority_with_port(&scheme, &request.authority), &scheme);
+    // The query is dropped from both the node and the points: a captured
+    // `?token=...` is observed data, and neither a site-map path nor a point's
+    // `url` is a place for it (security finding S7).
     let path_template = request
         .path
         .split('?')
         .next()
         .unwrap_or(&request.path)
         .to_string();
-    let url = format!("{scheme}://{}{}", request.authority, request.path);
+    let url = format!("{scheme}://{}{path_template}", request.authority);
     let node_id = format!(
         "wsnode-{:08x}",
         digest(&[&scheme, &host, &port.to_string(), &path_template])
@@ -479,7 +482,11 @@ fn form_pairs(text: &str) -> Option<Vec<(String, String)>> {
 /// Whether a handshake request header becomes an insertion point.
 fn header_is_point(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    ALWAYS_POINT_HEADERS.contains(&lower.as_str()) || !SKIP_HEADERS.contains(&lower.as_str())
+    let skipped = AMBIENT_HEADERS
+        .iter()
+        .chain(REGENERATED_HEADERS.iter())
+        .any(|skip| *skip == lower);
+    ALWAYS_POINT_HEADERS.contains(&lower.as_str()) || !skipped
 }
 
 /// Whether a lowercase header name is one that carries session material.
@@ -627,13 +634,13 @@ mod tests {
     use std::time::SystemTime;
 
     use aitm_core::{
-        Body, ConnInfo, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
-        HttpVersion, InterceptState, WsDir, WsFlow, WsMessage, WsOpcode,
+        ConnInfo, FlowId, FlowMeta, HttpFlow, InterceptState, WsDir, WsFlow, WsMessage, WsOpcode,
     };
     use aitm_scan_model::point::InsertionPoint;
     use aitm_scan_model::vocab::{InsertionKind, LaneKind, PointTrait};
 
     use crate::discover::{discover_flow, origin_matches, Discovered, IdGen};
+    use crate::testing::captured_conversation;
     use crate::types::{Locator, PointSpec};
 
     fn peer() -> SocketAddr {
@@ -650,60 +657,11 @@ mod tests {
         }
     }
 
-    /// The canonical captured handshake: `GET /ws` on `127.0.0.1:8080` carrying
-    /// an `Origin`, a session `Cookie` and a subprotocol. Built here rather than
-    /// taken from `testing.rs`, which task 2 owns.
+    /// The canonical captured handshake, from the shared harness fixture:
+    /// `GET /ws` on `127.0.0.1:8080` carrying an `Origin`, a session `Cookie`
+    /// and a subprotocol.
     fn handshake_flow() -> HttpFlow {
-        let mut headers = HeaderMap::new();
-        for (name, value) in [
-            ("Host", "127.0.0.1:8080"),
-            ("Connection", "Upgrade"),
-            ("Upgrade", "websocket"),
-            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
-            ("Sec-WebSocket-Version", "13"),
-            ("Origin", "https://app.test"),
-            ("Cookie", "sid=s3cr3t-cookie"),
-            ("Sec-WebSocket-Protocol", "chat"),
-            ("User-Agent", "fixture/1"),
-        ] {
-            headers.set(name, value);
-        }
-
-        let mut response_headers = HeaderMap::new();
-        for (name, value) in [
-            ("Upgrade", "websocket"),
-            ("Connection", "Upgrade"),
-            ("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
-            ("Sec-WebSocket-Protocol", "chat"),
-        ] {
-            response_headers.set(name, value);
-        }
-
-        HttpFlow {
-            id: FlowId::new(),
-            request: HttpRequest {
-                method: "GET".into(),
-                scheme: "http".into(),
-                authority: "127.0.0.1:8080".into(),
-                path: "/ws".into(),
-                version: HttpVersion::Http11,
-                headers,
-                body: Body::Empty,
-                timestamp: SystemTime::UNIX_EPOCH,
-            },
-            response: Some(HttpResponse {
-                status: 101,
-                version: HttpVersion::Http11,
-                headers: response_headers,
-                trailers: HeaderMap::new(),
-                body: Body::Empty,
-                timestamp: SystemTime::UNIX_EPOCH,
-            }),
-            client_conn: conn(),
-            server_conn: Some(conn()),
-            metadata: FlowMeta::default(),
-            intercept: InterceptState::Observed,
-        }
+        captured_conversation().0
     }
 
     fn message(dir: WsDir, opcode: WsOpcode, data: Vec<u8>) -> WsMessage {
@@ -728,14 +686,6 @@ mod tests {
         message(WsDir::ClientToServer, WsOpcode::Binary, bytes)
     }
 
-    fn server_text(text: &str) -> WsMessage {
-        message(
-            WsDir::ServerToClient,
-            WsOpcode::Text,
-            text.as_bytes().into(),
-        )
-    }
-
     fn ws_flow(handshake: &HttpFlow, messages: Vec<WsMessage>) -> WsFlow {
         WsFlow {
             id: FlowId::new(),
@@ -750,16 +700,7 @@ mod tests {
 
     /// The canonical conversation: two client text frames and one server reply.
     fn fixture() -> (HttpFlow, WsFlow) {
-        let handshake = handshake_flow();
-        let ws = ws_flow(
-            &handshake,
-            vec![
-                client_text(r#"{"type":"hello"}"#),
-                client_text(r#"{"msg":"hi","user":"bob"}"#),
-                server_text(r#"{"ok":true,"echo":"hi"}"#),
-            ],
-        );
-        (handshake, ws)
+        captured_conversation()
     }
 
     /// `discover_flow` over one client text frame, for the single-frame cases.
@@ -862,6 +803,22 @@ mod tests {
             found.node.flows.iter().map(|f| f.0).collect::<Vec<_>>(),
             vec![handshake.id, ws.id]
         );
+    }
+
+    #[test]
+    fn point_url_and_node_path_drop_the_query() {
+        // A captured upgrade whose query carries a credential: neither the
+        // point's `url` nor the node's `path_template` may repeat it (S7).
+        let mut handshake = handshake_flow();
+        handshake.request.path = "/ws?token=s3cr3t-query&room=1".to_string();
+        let ws = ws_flow(&handshake, vec![client_text(r#"{"msg":"hi"}"#)]);
+        let found = discover_flow(&ws, &handshake, &mut IdGen::new("job-1"));
+
+        assert_eq!(found.node.path_template, "/ws");
+        assert!(!found.points.is_empty(), "the fixture discovers points");
+        for point in &found.points {
+            assert_eq!(point.url.as_deref(), Some("http://127.0.0.1:8080/ws"));
+        }
     }
 
     #[test]

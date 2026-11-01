@@ -21,13 +21,14 @@
 //! in words and never carries the padding itself.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, Frame, FrameKind,
     InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, Technique, Verdict,
 };
 use futures::future::BoxFuture;
+
+use crate::checks::common;
 
 use crate::host::pad_payload;
 
@@ -100,21 +101,15 @@ impl Check for OversizeFrame {
         host: &'a dyn ProbeHost,
     ) -> BoxFuture<'a, Verdict> {
         Box::pin(async move {
-            if host.cancelled() {
-                return stopped("cancelled");
-            }
-            if host.budget_left() == 0 {
-                return stopped("budget exhausted");
-            }
-            if host.deadline() <= Instant::now() {
-                return stopped("deadline passed");
+            if let Some(reason) = common::stop_reason(host) {
+                return common::inconclusive(reason, Vec::new());
             }
 
             let response = match host.probe(&pad_payload()).await {
                 Ok(response) => response,
                 // The dialer's error text names hosts, ports and timeouts, never
                 // a header value, so it is safe to put in front of an operator.
-                Err(err) => return stopped(&format!("connect error: {err}")),
+                Err(err) => return common::connect_error(&err),
             };
 
             let evidence = Evidence {
@@ -134,9 +129,7 @@ impl Check for OversizeFrame {
             let closed = frames.iter().any(|frame| frame.kind == FrameKind::Close);
 
             if let Some(code) = limit_close {
-                return verdict(
-                    Outcome::Clean,
-                    Confidence::Tentative,
+                return common::clean(
                     format!("server closed with {code} (frame-size limit enforced)"),
                     evidence,
                 );
@@ -181,16 +174,6 @@ fn close_code(frame: &Frame) -> Option<u16> {
     }
 }
 
-/// A verdict reached before anything was sent: nothing to evidence.
-fn stopped(detail: &str) -> Verdict {
-    verdict(
-        Outcome::Inconclusive,
-        Confidence::Tentative,
-        detail.to_string(),
-        Evidence::default(),
-    )
-}
-
 /// Assemble a verdict. No WS check carries a PoC hint in v2 (plan call 19).
 fn verdict(
     outcome: Outcome,
@@ -212,8 +195,7 @@ mod tests {
     use std::sync::Arc;
 
     use aitm_scan_model::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, InsertionPoint, Intensity, JobCtx,
-        LaneKind, Outcome, Technique,
+        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
     };
     use futures::{SinkExt, StreamExt};
     use tokio::io::AsyncWriteExt;
@@ -222,12 +204,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::check;
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
-    use crate::host::WsProbeHost;
-    use crate::testing::{
-        captured_conversation, echo_handler, ws_server, DuplexTransport, ServerConn, TestJob,
-    };
+    use crate::testing::{echo_handler, point_and_host_for, ws_server, ServerConn, TestJob};
     use crate::transport::WsTransport;
 
     /// The fixture's chosen client frame, `{"msg":"hi","user":"bob"}`.
@@ -237,32 +214,6 @@ mod tests {
     const PADDED_LEN: usize = 2 * CHOSEN_LEN;
 
     /// The fixture's `msg` point and a host over it, as the lane would build them.
-    fn host_for(
-        name: &str,
-        job: &Arc<TestJob>,
-        transport: Arc<DuplexTransport>,
-    ) -> (InsertionPoint, WsProbeHost) {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == name)
-            .unwrap_or_else(|| panic!("the fixture has a point named {name}"));
-        let point = found.points[at].clone();
-        let host = WsProbeHost::new(
-            point.clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host");
-        (point, host)
-    }
-
     /// A server that answers small frames and closes with 1009 above 40 bytes.
     async fn closes_1009_above_40(conn: ServerConn) {
         let mut ws = conn.ws().await;
@@ -362,7 +313,7 @@ mod tests {
     async fn vulnerable_server_processes_oversize_frame() {
         let (transport, log) = ws_server(None, echo_handler);
         let job = TestJob::new(100);
-        let (point, host) = host_for("msg", &job, transport);
+        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
 
         let verdict = check().run(&point, &host).await;
 
@@ -392,7 +343,7 @@ mod tests {
     async fn patched_server_closes_1009() {
         let (transport, _log) = ws_server(None, closes_1009_above_40);
         let job = TestJob::new(100);
-        let (point, host) = host_for("msg", &job, transport);
+        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
 
         let verdict = check().run(&point, &host).await;
 
@@ -412,7 +363,7 @@ mod tests {
     async fn dropped_connection_is_flagged() {
         let (transport, _log) = ws_server(None, drops_above_40);
         let job = TestJob::new(100);
-        let (point, host) = host_for("msg", &job, transport);
+        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
 
         let verdict = check().run(&point, &host).await;
 
@@ -434,7 +385,7 @@ mod tests {
         let job = TestJob::with(100, |profile| {
             profile.ws.reply_window_ms = 300;
         });
-        let (point, host) = host_for("msg", &job, transport);
+        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
 
         let verdict = check().run(&point, &host).await;
 

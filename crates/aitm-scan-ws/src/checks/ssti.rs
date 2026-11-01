@@ -21,7 +21,6 @@
 //! captured cookie, header or reply body can leave the check in a verdict.
 
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, FlowRef, InsertionKind,
@@ -29,6 +28,8 @@ use aitm_scan_model::{
     Verdict,
 };
 use futures::future::BoxFuture;
+
+use crate::checks::common;
 
 use crate::payloads::{ssti_hit, ssti_probes, SSTI_A, SSTI_B};
 
@@ -104,8 +105,8 @@ async fn probe_each_template(host: &dyn ProbeHost) -> Verdict {
     let mut probe_flows: Vec<FlowRef> = Vec::new();
 
     for (payload, expected) in &probes {
-        if let Some(reason) = stopped(host) {
-            return inconclusive(reason, probe_flows);
+        if let Some(reason) = common::stop_reason(host) {
+            return common::inconclusive(reason, probe_flows);
         }
         let sent = Payload {
             value: payload.clone(),
@@ -117,7 +118,9 @@ async fn probe_each_template(host: &dyn ProbeHost) -> Verdict {
             // The dialer's error text names the host and the failure, never a
             // header: a connect failure is "could not tell", not "clean".
             Err(error) => {
-                return inconclusive(&format!("connect error: {error}"), probe_flows);
+                let mut verdict = common::connect_error(&error);
+                verdict.evidence.probe_flows = probe_flows;
+                return verdict;
             }
         };
         probe_flows.extend(response.flow);
@@ -154,82 +157,22 @@ async fn probe_each_template(host: &dyn ProbeHost) -> Verdict {
     }
 }
 
-/// Why the check must send no further probe, when it must not.
-///
-/// A job that was cancelled, has spent its budget or has run past its deadline
-/// gets no more traffic from this check, whatever it has seen so far.
-fn stopped(host: &dyn ProbeHost) -> Option<&'static str> {
-    if host.cancelled() {
-        Some("cancelled")
-    } else if host.budget_left() == 0 {
-        Some("budget exhausted")
-    } else if host.deadline() <= Instant::now() {
-        Some("deadline passed")
-    } else {
-        None
-    }
-}
-
-/// A "could not tell" verdict carrying the probes that did run.
-fn inconclusive(reason: &str, probe_flows: Vec<FlowRef>) -> Verdict {
-    Verdict {
-        outcome: Outcome::Inconclusive,
-        confidence: Confidence::Tentative,
-        evidence: Evidence {
-            probe_flows,
-            ..Evidence::default()
-        },
-        detail: reason.to_string(),
-        poc_hint: None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use aitm_scan_model::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, JobCtx, LaneKind, Outcome,
-        Technique,
+        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
     };
     use futures::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{check, ID};
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
-    use crate::host::WsProbeHost;
-    use crate::testing::{
-        captured_conversation, echo_handler, ws_server, DuplexTransport, ServerConn, TestJob,
-    };
-    use crate::transport::WsTransport;
+    use crate::testing::{echo_handler, host_for, ws_server, ServerConn, TestJob};
 
     /// The first payload `payloads::ssti_probes` builds for the fixture marker.
     const MUSTACHE: &str = "mk7f3a9e{{1543*7}}";
 
     /// What every SSTI probe looks for in a reply, for that marker.
     const EXPECTED: &str = "mk7f3a9e10801";
-
-    /// A host over the fixture conversation's `msg` JSON point.
-    fn host_for(job: &Arc<TestJob>, transport: Arc<DuplexTransport>) -> WsProbeHost {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == "msg")
-            .expect("the fixture has a point named msg");
-        WsProbeHost::new(
-            found.points[at].clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host")
-    }
 
     /// The seeded vulnerable target: a template engine renders the field.
     ///
@@ -314,7 +257,7 @@ mod tests {
     async fn vulnerable_server_evaluates_mustache() {
         let (transport, log) = ws_server(None, renders_mustache);
         let job = TestJob::new(100);
-        let host = host_for(&job, transport);
+        let host = host_for("msg", &job, transport);
         let ssti = check();
 
         let verdict = ssti.run(host.point(), &host).await;
@@ -345,7 +288,7 @@ mod tests {
     async fn patched_echo_is_clean() {
         let (transport, log) = ws_server(None, echo_handler);
         let job = TestJob::new(100);
-        let host = host_for(&job, transport);
+        let host = host_for("msg", &job, transport);
         let ssti = check();
 
         let verdict = ssti.run(host.point(), &host).await;
@@ -370,7 +313,7 @@ mod tests {
     async fn bare_49_never_fires() {
         let (transport, _log) = ws_server(None, always_49);
         let job = TestJob::new(100);
-        let host = host_for(&job, transport);
+        let host = host_for("msg", &job, transport);
         let ssti = check();
 
         let verdict = ssti.run(host.point(), &host).await;
@@ -385,7 +328,7 @@ mod tests {
     async fn the_product_without_the_marker_never_fires() {
         let (transport, _log) = ws_server(None, always_product);
         let job = TestJob::new(100);
-        let host = host_for(&job, transport);
+        let host = host_for("msg", &job, transport);
         let ssti = check();
 
         let verdict = ssti.run(host.point(), &host).await;
@@ -403,7 +346,7 @@ mod tests {
         let (transport, log) = ws_server(None, echo_handler);
         let job = TestJob::new(100);
         job.cancel();
-        let host = host_for(&job, transport);
+        let host = host_for("msg", &job, transport);
         let ssti = check();
 
         let verdict = ssti.run(host.point(), &host).await;

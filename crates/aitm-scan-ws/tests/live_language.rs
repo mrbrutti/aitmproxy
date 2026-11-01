@@ -23,9 +23,6 @@
 //! and the control origin speaks plain HTTP/1.1 — so the test needs no async
 //! runtime of its own and no HTTP client dependency.
 
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
-use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,118 +30,15 @@ use aitm_core::{CallerTrust, ScopeEntry, ScopeRateGuard, StdGuard};
 use aitm_plugin_rhai::config::RhaiLimits;
 use aitm_plugin_rhai::engine::build_engine_with_languages;
 use aitm_plugin_rhai::host_registry::seed_call_context;
+use aitm_scan_ws::testing::live::{control_json, Target};
 use rhai::{Dynamic, Engine};
 use serde_json::Value;
-
-/// What a run without `$AITM_TESTTARGET_BIN` panics with (plan call 35).
-const SKIP: &str = "SKIP: set AITM_TESTTARGET_BIN to a serve binary that has /ws (T10 branch)";
 
 /// An address nothing listens on and the guard was never told about.
 const OUT_OF_SCOPE_URL: &str = "ws://127.0.0.2:1/ws";
 
 /// How long the engine may spend in one script.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
-
-// --- the real target process -------------------------------------------------
-
-/// T10's `aitm-testtarget-serve`, running with its control origin.
-struct Target {
-    child: Child,
-    /// Keeps the stdout pipe open for the child's lifetime.
-    _stdout: BufReader<ChildStdout>,
-    /// `http://127.0.0.1:<port>` of the seeded origin.
-    origin: String,
-    /// `http://127.0.0.1:<port>` of the control origin.
-    control: String,
-}
-
-impl Target {
-    /// Spawn the binary in `mode` and read its listen lines up to `ready`.
-    fn start(mode: &str) -> Self {
-        let Ok(bin) = std::env::var("AITM_TESTTARGET_BIN") else {
-            panic!("{SKIP}");
-        };
-        let mut child = Command::new(&bin)
-            .args(["--mode", mode, "--port", "0", "--control-port", "0"])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap_or_else(|err| panic!("{SKIP} (spawning {bin} failed: {err})"));
-        let stdout = child.stdout.take().expect("the child's stdout is piped");
-        let mut reader = BufReader::new(stdout);
-
-        let mut origin = None;
-        let mut control = None;
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let read = reader
-                .read_line(&mut line)
-                .expect("read the target's stdout");
-            assert!(
-                read != 0,
-                "{SKIP} (the target exited before `ready`; it reported {origin:?} / {control:?})"
-            );
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("listening ") {
-                origin = Some(rest.to_string());
-            } else if let Some(rest) = trimmed.strip_prefix("control ") {
-                control = Some(rest.to_string());
-            } else if trimmed == "ready" {
-                break;
-            }
-        }
-
-        let origin = origin.expect("the target printed a `listening` line");
-        let control =
-            control.expect("the target printed a `control` line (it needs --control-port)");
-        println!("target[{mode}] origin={origin} control={control}");
-        Self {
-            child,
-            _stdout: reader,
-            origin,
-            control,
-        }
-    }
-
-    /// `127.0.0.1:<port>` of the seeded origin.
-    fn authority(&self) -> String {
-        strip_scheme(&self.origin).to_string()
-    }
-}
-
-impl Drop for Target {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// `http://host:port` without its scheme.
-fn strip_scheme(origin: &str) -> &str {
-    origin.split_once("://").map_or(origin, |(_, rest)| rest)
-}
-
-/// `GET <path>` on the control origin, parsed as JSON.
-fn control_json(control: &str, path: &str) -> Value {
-    let authority = strip_scheme(control);
-    let mut stream = TcpStream::connect(authority)
-        .unwrap_or_else(|err| panic!("connect the control origin {authority}: {err}"));
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
-    stream
-        .write_all(request.as_bytes())
-        .unwrap_or_else(|err| panic!("send GET {path}: {err}"));
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .unwrap_or_else(|err| panic!("read GET {path}: {err}"));
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    let body = text
-        .split_once("\r\n\r\n")
-        .map_or("", |(_, body)| body)
-        .to_string();
-    serde_json::from_str(&body)
-        .unwrap_or_else(|err| panic!("{path} is not JSON ({err}); response was {text:?}"))
-}
 
 /// How many rows `/log/conns` holds.
 fn conn_rows(control: &str) -> usize {

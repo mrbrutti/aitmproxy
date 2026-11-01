@@ -292,14 +292,7 @@ mod tests {
         assert_eq!(replaced, b"a=1&b=x+y".to_vec());
         let suffixed = place(b"a=1&b=h%20i", &locator, &p("!", PayloadMode::Suffix))
             .expect("suffixing a present form pair succeeds");
-        // NOTE (T4 plan, task 4): the plan's test list writes this expectation
-        // as `b"a=1&b=h+i!"`, which contradicts the same task's implementation
-        // sentence "re-encode every pair in order with
-        // `form_urlencoded::Serializer` (space -> `+`)". That serializer leaves
-        // only `[A-Za-z0-9*\-._]` unencoded (`byte_serialized_unchanged` in
-        // form_urlencoded 1.2.2), so `!` is written `%21`. The implementation
-        // sentence names a concrete API and wins; the literal below is what it
-        // actually produces. Raised for the architect to confirm.
+        // `!` is `%21` per `form_urlencoded`'s unreserved set.
         assert_eq!(suffixed, b"a=1&b=h+i%21".to_vec());
     }
 
