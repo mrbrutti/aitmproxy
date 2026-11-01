@@ -483,6 +483,17 @@ impl PointRunner {
         Some((seed, mutation))
     }
 
+    /// The id of the seed case `index` cycles to, for a case whose seed does
+    /// not build and so has no [`SeedSpec`] to read it from. Empty for a plan
+    /// with no seed at all, which `seed_payloads` never produces.
+    fn seed_id_at(&self, index: u32) -> String {
+        let nth = usize::try_from(index).unwrap_or(usize::MAX);
+        self.plan
+            .seeds
+            .get(nth % self.plan.seeds.len().max(1))
+            .map_or_else(String::new, |seed| seed.id.clone())
+    }
+
     /// Stop the job's sending with `reason` (first stop wins) and report the
     /// counters, as call C1b requires of every stop this runner raises.
     fn stop(&self, reason: StopReason) {
@@ -737,7 +748,19 @@ impl PointRunner {
             }
             let liveness_before = alive;
             let Some((seed, mutation)) = self.case_at(index, &boundary, &mut rng) else {
-                break;
+                // Discovery builds every seed, so a case whose seed does not
+                // build should not exist. If one does it is counted apart as
+                // unsendable and recorded, exactly as a case the builder
+                // refuses, instead of ending the run in silence (tester
+                // finding T1).
+                self.shared.state.record_unsendable(job_id);
+                run.cases.push(CaseRecord::unsent(
+                    index,
+                    self.seed_id_at(index),
+                    Vec::new(),
+                    String::new(),
+                ));
+                continue;
             };
             let chain = vec![mutation.label()];
             let Ok(spec) = mutation.apply(&seed.spec, timing.max_raw_bytes) else {
@@ -1353,7 +1376,10 @@ mod tests {
         Timing,
     };
     use crate::codec::hex_encode;
+    use crate::discover::max_payload_for;
+    use crate::fields::FieldPath;
     use crate::oracle::CaseClass;
+    use crate::plan::{SeedOrigin, SeedPayload};
     use crate::state::{Candidate, StopReason};
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
@@ -2795,5 +2821,59 @@ mod tests {
             craft_stop("the replayed case", "no such layer").to_string(),
             "l4 unavailable: the replayed case no longer builds: no such layer"
         );
+    }
+
+    /// Tester finding T1, belt and braces: discovery builds every seed, so
+    /// the fuzz loop should never meet one the builder refuses. If it ever
+    /// does, the case is counted apart as unsendable and recorded, instead of
+    /// the loop breaking in silence — no stop, no unsendable, a run that
+    /// reads as a clean point that simply ran out of cases.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_seed_the_builder_refuses_is_an_unsendable_case() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 2);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // Discovery refuses this corpus, so the plan is bent by hand: seed 0
+        // builds, seed 1 is one byte more than the frame can carry.
+        let mut plan = plans[0].clone();
+        plan.seeds.push(SeedPayload {
+            id: "127.0.0.1:9/udp#1".to_string(),
+            bytes: vec![0x41; max_payload_for(&plan.target) + 1],
+            origin: SeedOrigin::Profile,
+        });
+        let point = disc.points.first().expect("one point").clone();
+        let runner = Arc::new(
+            PointRunner::new(
+                Arc::clone(&shared),
+                Arc::clone(&job) as Arc<dyn JobCtx>,
+                point,
+                plan,
+                FieldPath::Raw,
+            )
+            .expect("seed 0 builds"),
+        );
+
+        let run = runner.run_point().await;
+
+        assert_eq!(run.cases.len(), 2);
+        assert!(run.cases[0].sent(), "case 0 cycles to seed 0 and goes out");
+        let refused = &run.cases[1];
+        assert!(!refused.sent());
+        assert_eq!(refused.class(), None);
+        assert_eq!(refused.index, 1);
+        assert_eq!(refused.seed_id, "127.0.0.1:9/udp#1");
+        assert_eq!(refused.sent_hex, "");
+        assert_eq!(refused.chain, Vec::<String>::new());
+        assert_eq!(
+            shared
+                .state
+                .stats(job.job_id())
+                .expect("the job's stats")
+                .cases_unsendable,
+            1
+        );
+        // 1 baseline + the one case that built; the refused seed never went
+        // out and never charged.
+        assert_eq!(mock.inject_count(), 2);
     }
 }

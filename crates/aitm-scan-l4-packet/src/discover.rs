@@ -393,11 +393,58 @@ pub const MAX_CAPTURED_SEEDS: usize = 8;
 /// How many bytes [`default_payload`] carries.
 pub const DEFAULT_SEED_LEN: usize = 16;
 
-/// The largest seed payload a case can carry: the IPv4 `total_length` ceiling
-/// (65535) less the 20-byte IPv4 and 8-byte UDP headers the lane puts in front
-/// of it. A longer seed cannot be crafted at all, so the profile that names it
-/// is refused at discovery rather than at send time.
-pub const MAX_SEED_BYTES: usize = 65_535 - 28;
+/// The largest frame `PacketSpec::build` will craft: `aitm_proto_l4::craft`'s
+/// own `MAX_PACKET_BYTES`, which that crate does not export. Pinned against
+/// the builder by `max_payload_for_is_the_frame_the_builder_accepts`.
+pub const MAX_FRAME_BYTES: usize = 65_535;
+
+/// The IPv4 header the lane puts in front of a seed (never any options).
+const IPV4_HEADER_BYTES: usize = 20;
+
+/// The IPv6 header the lane puts in front of a seed (no extension headers).
+const IPV6_HEADER_BYTES: usize = 40;
+
+/// The UDP header the lane puts in front of a seed.
+const UDP_HEADER_BYTES: usize = 8;
+
+/// The TCP header the lane puts in front of a seed (never any options).
+const TCP_HEADER_BYTES: usize = 20;
+
+/// The framing-blind upper bound on a seed payload: [`MAX_FRAME_BYTES`] less
+/// the 20-byte IPv4 and 8-byte UDP headers, and nothing for the link header.
+/// No target can carry more than this, and most carry less, so it is the
+/// cheap pre-check; [`max_payload_for`] is the ceiling a target really has.
+pub const MAX_SEED_BYTES: usize = MAX_FRAME_BYTES - IPV4_HEADER_BYTES - UDP_HEADER_BYTES;
+
+/// The largest seed payload `target`'s frames can actually carry: the
+/// builder's frame ceiling less the link, IP and transport headers
+/// [`crate::plan::seed_spec`] puts in front of every seed.
+///
+/// [`MAX_SEED_BYTES`] ignores the link header (4 bytes on a macOS loopback,
+/// 14 on Ethernet) and assumes IPv4 and UDP, so it over-states what an IPv6
+/// or a TCP target can carry. This is the number a refusal quotes, so
+/// "the largest payload is <n>" is true on this host (tester finding T1).
+#[must_use]
+pub fn max_payload_for(target: &ResolvedTarget) -> usize {
+    let ip = match target.ip {
+        IpAddr::V4(_) => IPV4_HEADER_BYTES,
+        IpAddr::V6(_) => IPV6_HEADER_BYTES,
+    };
+    let transport = match target.proto {
+        L4Transport::Udp => UDP_HEADER_BYTES,
+        L4Transport::Tcp => TCP_HEADER_BYTES,
+    };
+    MAX_FRAME_BYTES.saturating_sub(target.framing.header_len() + ip + transport)
+}
+
+/// The refusal for a seed the builder will not craft, naming the seed.
+fn uncraftable_seed(id: &str, err: &PlanError) -> DiscoverError {
+    let why = match err {
+        PlanError::Craft(message) => message.clone(),
+        other => bare_invalid_profile(other.to_string()),
+    };
+    DiscoverError::InvalidProfile(format!("seed {id} cannot be crafted: {why}"))
+}
 
 /// The lane's built-in seed payload: the job's marker, padded with spaces or
 /// truncated to [`DEFAULT_SEED_LEN`] bytes, so every case is attributable to
@@ -476,9 +523,10 @@ pub fn seed_payloads(
      -> Result<(), DiscoverError> {
         if bytes.len() > MAX_SEED_BYTES {
             return Err(DiscoverError::InvalidProfile(format!(
-                "seed {key}#{} is {} bytes; the largest payload is {MAX_SEED_BYTES}",
+                "seed {key}#{} is {} bytes; the largest payload is {}",
                 out.len(),
-                bytes.len()
+                bytes.len(),
+                max_payload_for(target)
             )));
         }
         push(bytes, origin, out);
@@ -696,10 +744,28 @@ pub fn discover_all(
             seeds,
             src_port,
         };
-        // The seed corpus is never empty, so case 0 always has a seed; a seed
-        // that does not build is the operator's bytes, and is refused here
-        // rather than at send time.
-        let seed = plan.seed_spec(0).map_err(DiscoverError::from)?;
+        // Every seed is built, not just seed 0: the fuzz loop cycles through
+        // the whole corpus, and a seed the frame cannot carry is the
+        // operator's bytes — named here rather than ending a point's run in
+        // silence at send time (tester finding T1). Only seed 0's spec is
+        // kept; the rest are built to prove they build and dropped.
+        let mut first: Option<SeedSpec> = None;
+        for (n, payload) in plan.seeds.iter().enumerate() {
+            let built = plan
+                .seed_spec(n)
+                .map_err(|err| uncraftable_seed(&payload.id, &err))?;
+            if n == 0 {
+                first = Some(built);
+            }
+        }
+        // `seed_payloads` never returns an empty corpus, so case 0 always has
+        // a seed; an empty one is refused rather than unwrapped.
+        let Some(seed) = first else {
+            return Err(DiscoverError::InvalidProfile(format!(
+                "no seed for {}",
+                plan.key()
+            )));
+        };
         let origin = plan
             .seeds
             .first()
@@ -739,11 +805,12 @@ mod tests {
     use aitm_scan_model::vocab::{InsertionKind, L4Transport, LaneKind};
 
     use super::{
-        choose_src_port, default_payload, discover_all, loopback_interface, points_for,
-        probe_privilege, resolve_target, seed_payloads, DiscoverError, MAX_SEED_BYTES,
+        choose_src_port, default_payload, discover_all, loopback_interface, max_payload_for,
+        points_for, probe_privilege, resolve_target, seed_payloads, DiscoverError, MAX_FRAME_BYTES,
+        MAX_SEED_BYTES,
     };
-    use crate::fields::{default_fields, IpVersion};
-    use crate::plan::{link_framing, SeedOrigin, TargetPlan};
+    use crate::fields::{default_fields, FieldPath, IpVersion};
+    use crate::plan::{link_framing, PlanError, SeedOrigin, SeedPayload, TargetPlan};
     use crate::testing::{
         fields, l4_profile, loopback_guard, tcp_target, udp_target, MockBackend, MockReply,
     };
@@ -998,10 +1065,16 @@ mod tests {
     /// A profile seed longer than [`MAX_SEED_BYTES`] cannot be crafted into a
     /// packet (the IPv4 `total_length` would overflow), so it is refused at
     /// discovery as the operator's mistake, naming the seed and the ceiling.
+    ///
+    /// The ceiling the message quotes is this host's, not [`MAX_SEED_BYTES`]:
+    /// the frame carries a link header too (tester finding T1).
     #[test]
     fn oversize_seed_is_invalid_profile() {
         let guard = loopback_guard("*", 100);
         let target = resolve_target(&guard, &udp_target(9)).expect("resolves");
+        // 65535 less this host's loopback link header, the IPv4 header and
+        // the UDP header.
+        let ceiling = 65_535 - link_framing(loopback_interface()).header_len() - 20 - 8;
 
         let at_ceiling = L4Options {
             seeds: vec![L4Seed::Hex {
@@ -1026,7 +1099,7 @@ mod tests {
         assert_eq!(
             message,
             &format!(
-                "seed 127.0.0.1:9/udp#0 is {} bytes; the largest payload is {MAX_SEED_BYTES}",
+                "seed 127.0.0.1:9/udp#0 is {} bytes; the largest payload is {ceiling}",
                 MAX_SEED_BYTES + 1
             )
         );
@@ -1710,9 +1783,10 @@ mod tests {
         .expect_err("one byte too many");
         assert_eq!(
             err,
-            DiscoverError::InvalidProfile(
-                "seed 127.0.0.1:9/udp#1 is 65508 bytes; the largest payload is 65507".to_string()
-            )
+            DiscoverError::InvalidProfile(format!(
+                "seed 127.0.0.1:9/udp#1 is 65508 bytes; the largest payload is {}",
+                65_535 - link_framing(loopback_interface()).header_len() - 20 - 8
+            ))
         );
 
         // A captured IPv6 UDP datagram carrying 65527 payload bytes (the
@@ -1759,9 +1833,10 @@ mod tests {
         .expect_err("a captured payload over the ceiling is refused by name");
         assert_eq!(
             err,
-            DiscoverError::InvalidProfile(
-                "seed [::1]:53/udp#0 is 65527 bytes; the largest payload is 65507".to_string()
-            )
+            DiscoverError::InvalidProfile(format!(
+                "seed [::1]:53/udp#0 is 65527 bytes; the largest payload is {}",
+                65_535 - link_framing(&v6_target.interface).header_len() - 40 - 8
+            ))
         );
     }
 
@@ -1811,5 +1886,99 @@ mod tests {
             }
         }
         assert_eq!(backend.inject_count(), 0);
+    }
+
+    /// Tester finding T1: only seed 0 was built at discovery, so a later
+    /// profile seed the frame cannot carry survived planning and the fuzz
+    /// loop met it at send time, where `case_at` answered `None` and the loop
+    /// broke in silence — no stop reason, no unsendable case, a `Clean` crash
+    /// check over a point that stopped early. Every seed is built here, and
+    /// the one that does not build is named.
+    #[test]
+    fn every_seed_is_built_at_discovery() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.seeds = vec![
+            L4Seed::Hex {
+                hex: "00".to_string(),
+            },
+            L4Seed::Hex {
+                // Inside `MAX_SEED_BYTES`, so the framing-blind pre-check
+                // passes it: only building it refuses it.
+                hex: "41".repeat(MAX_SEED_BYTES),
+            },
+        ];
+
+        let err = discover_all(
+            &guard,
+            backend.as_ref(),
+            None,
+            &profile.target,
+            &profile,
+            &fields(&["raw"]),
+            "aitm7f3a",
+        )
+        .expect_err("seed 1 does not build");
+
+        assert_eq!(
+            err,
+            DiscoverError::InvalidProfile(
+                "seed 127.0.0.1:9/udp#1 cannot be crafted: crafted packet exceeds 65535 bytes"
+                    .to_string()
+            )
+        );
+        assert!(err.to_string().starts_with("invalid_profile: "), "{err}");
+        assert_eq!(backend.inject_count(), 0);
+    }
+
+    /// Tester finding T1: the ceiling a refusal quotes has to be true on this
+    /// host, so it is the builder's frame ceiling less this target's link, IP
+    /// and transport headers. Pinned against the builder itself: a seed of
+    /// exactly that many bytes crafts a full 65535-byte frame, and one byte
+    /// more does not craft at all.
+    #[test]
+    fn max_payload_for_is_the_frame_the_builder_accepts() {
+        let v4_guard = loopback_guard("*", 100);
+        let v6_guard = guard_over(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128, "*", &BOTH);
+        let v6_spec = aitm_scan_model::profile::L4TargetSpec {
+            ip: "::1".to_string(),
+            port: 53,
+            proto: L4Transport::Udp,
+            grammar: None,
+        };
+        let targets = [
+            resolve_target(&v4_guard, &udp_target(9)).expect("127.0.0.1 udp resolves"),
+            resolve_target(&v4_guard, &tcp_target(80)).expect("127.0.0.1 tcp resolves"),
+            resolve_target(&v6_guard, &v6_spec).expect("::1 udp resolves"),
+        ];
+
+        for target in targets {
+            let ceiling = max_payload_for(&target);
+            assert!(ceiling <= MAX_SEED_BYTES, "{ceiling} for {}", target.ip);
+            let plan = |len: usize| TargetPlan {
+                seeds: vec![SeedPayload {
+                    id: "seed".to_string(),
+                    bytes: vec![0x41; len],
+                    origin: SeedOrigin::Profile,
+                }],
+                fields: vec![FieldPath::Raw],
+                src_port: 40_000,
+                target: target.clone(),
+            };
+            let frame = plan(ceiling)
+                .seed_spec(0)
+                .expect("the ceiling crafts")
+                .spec
+                .build()
+                .expect("the ceiling builds");
+            assert_eq!(frame.len(), MAX_FRAME_BYTES, "ceiling for {}", target.ip);
+            assert_eq!(
+                plan(ceiling + 1).seed_spec(0).expect_err("one byte over"),
+                PlanError::Craft("crafted packet exceeds 65535 bytes".to_string()),
+                "ceiling + 1 for {}",
+                target.ip
+            );
+        }
     }
 }
