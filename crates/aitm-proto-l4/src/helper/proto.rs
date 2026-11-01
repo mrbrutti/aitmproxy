@@ -1612,4 +1612,188 @@ mod tests {
             }
         }
     }
+
+    /// Tester re-run on F1. The fix's sweep stops at 200 000 frame bytes and
+    /// uses one over-long name. This one takes the frame length through
+    /// `MAX_FRAME - 1`, `MAX_FRAME` and `MAX_FRAME + 1` (where the `u16::MAX`
+    /// marker and the `u32` length path meet) and several over-long names,
+    /// ASCII and multi-byte. For every pair the wire is exactly the 15-byte
+    /// header (so it can never exceed `MAX_FRAME`), the request id is intact,
+    /// the peer answers `BadBinary`, and the refusal consumes exactly one
+    /// message: a second refused message is read from the boundary and the
+    /// stream then ends in `Eof`.
+    #[test]
+    fn tester_rerun_f1_oversized_name_sweep_reaches_max_frame_and_keeps_the_boundary() {
+        let euro = "\u{20ac}".repeat(21_846);
+        assert_eq!(
+            euro.len(),
+            65_538,
+            "three-byte chars, one past the u16 marker"
+        );
+        let names: [(&str, String); 4] = [
+            ("65_536 ascii", "a".repeat(65_536)),
+            ("65_537 ascii", "b".repeat(65_537)),
+            ("65_538 bytes as 21_846 euro signs", euro),
+            ("1_000_000 ascii", "c".repeat(1_000_000)),
+        ];
+        let frame_lens = [
+            0usize,
+            1,
+            65_534,
+            65_535,
+            65_536,
+            200_000,
+            MAX_FRAME - 1,
+            MAX_FRAME,
+            MAX_FRAME + 1,
+        ];
+        let request_id: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        for (label, name) in &names {
+            for &frame_len in &frame_lens {
+                let wire = encode(&Msg::Inject {
+                    request_id,
+                    interface: name.clone(),
+                    bytes: vec![0x45; frame_len],
+                });
+                assert_eq!(
+                    wire.len(),
+                    15,
+                    "{label}, frame_len {frame_len}: wire length"
+                );
+                assert!(
+                    wire.len() <= 4 + MAX_FRAME,
+                    "{label}, frame_len {frame_len}: the wire must fit MAX_FRAME"
+                );
+                assert_eq!(
+                    &wire[..4],
+                    &11u32.to_be_bytes(),
+                    "{label}, frame_len {frame_len}: length field"
+                );
+                assert_eq!(wire[4], TYPE_INJECT, "{label}, frame_len {frame_len}");
+                assert_eq!(
+                    &wire[5..13],
+                    &request_id.to_be_bytes(),
+                    "{label}, frame_len {frame_len}: request id"
+                );
+                assert_eq!(
+                    &wire[13..15],
+                    &[0xff, 0xff],
+                    "{label}, frame_len {frame_len}: u16::MAX marker"
+                );
+
+                let mut two = wire.clone();
+                two.extend_from_slice(&wire);
+                let mut reader = Cursor::new(two);
+                assert_eq!(
+                    read_msg(&mut reader),
+                    Err(ProtoError::BadBinary),
+                    "{label}, frame_len {frame_len}: first message"
+                );
+                assert_eq!(
+                    read_msg(&mut reader),
+                    Err(ProtoError::BadBinary),
+                    "{label}, frame_len {frame_len}: second message from the boundary"
+                );
+                assert_eq!(
+                    read_msg(&mut reader),
+                    Err(ProtoError::Eof),
+                    "{label}, frame_len {frame_len}: clean end after both"
+                );
+            }
+        }
+    }
+
+    /// Tester re-run on F2. The fix's bodies put the stray key last. serde
+    /// must refuse an unknown key wherever it sits and whatever it holds:
+    /// first or last, with a `null`, an empty name, or a case variant of a
+    /// real key; and a duplicated known key is refused too. Checked for
+    /// `ScopeSet` and all six control types, each against its canonical body,
+    /// which still decodes. Inside a scope entry the same stray keys stay
+    /// ignored (`L4ScopeEntry` is the core's type).
+    #[test]
+    fn tester_rerun_f2_unknown_key_is_bad_json_in_any_position_and_shape() {
+        let set = scope_set();
+        let set_json = String::from_utf8(to_json(&set)).expect("UTF-8");
+        let set_inner = set_json
+            .strip_prefix('{')
+            .and_then(|s| s.strip_suffix('}'))
+            .expect("a JSON object");
+        // (type, the canonical body without its braces, the name of one real
+        // key whose case variant must count as unknown).
+        let bodies: [(u8, &str, &str); 7] = [
+            (TYPE_HELLO, r#""proto":1,"core_version":"0.5.9""#, "proto"),
+            (
+                TYPE_HELLO_ACK,
+                r#""proto":1,"helper_version":"0.5.9","caps":[]"#,
+                "caps",
+            ),
+            (
+                TYPE_CAPTURE_OPEN,
+                r#""id":11,"interface":"lo0","direction":"inbound","read_timeout_ms":250"#,
+                "interface",
+            ),
+            (TYPE_CAPTURE_CLOSE, r#""id":11"#, "id"),
+            (
+                TYPE_CAPTURE_CLOSED,
+                r#""capture_id":11,"reason":"x""#,
+                "reason",
+            ),
+            (
+                TYPE_INJECT_RESULT,
+                r#""request_id":1,"error":null"#,
+                "error",
+            ),
+            (TYPE_SCOPE_SET, set_inner, "scope"),
+        ];
+        for (ty, body, real_key) in bodies {
+            let canonical = format!("{{{body}}}");
+            let mut reader = Cursor::new(framed(ty, canonical.as_bytes()));
+            assert!(
+                read_msg(&mut reader).is_ok(),
+                "{ty:#04x}: canonical body must decode: {canonical}"
+            );
+
+            let upper = real_key.to_ascii_uppercase();
+            let strays: [(&str, String); 4] = [
+                ("stray", r#""stray":null"#.to_string()),
+                ("stray", r#""stray":{"deep":[1,{"x":true}]}"#.to_string()),
+                ("", r#""":0"#.to_string()),
+                (upper.as_str(), format!(r#""{upper}":1"#)),
+            ];
+            for (key, stray) in &strays {
+                for doc in [format!("{{{stray},{body}}}"), format!("{{{body},{stray}}}")] {
+                    let mut reader = Cursor::new(framed(ty, doc.as_bytes()));
+                    match read_msg(&mut reader) {
+                        Err(ProtoError::BadJson(msg)) => assert!(
+                            msg.starts_with(&format!("unknown field `{key}`")),
+                            "{ty:#04x}: {doc}: {msg}"
+                        ),
+                        other => panic!("{ty:#04x}: {doc} must be BadJson, got {other:?}"),
+                    }
+                }
+            }
+
+            // A real key given twice is refused as well, not last-wins.
+            let dup = format!("{{{body},{body}}}");
+            let mut reader = Cursor::new(framed(ty, dup.as_bytes()));
+            match read_msg(&mut reader) {
+                Err(ProtoError::BadJson(msg)) => {
+                    assert!(
+                        msg.starts_with("duplicate field `"),
+                        "{ty:#04x}: {dup}: {msg}"
+                    );
+                }
+                other => panic!("{ty:#04x}: {dup} must be BadJson, got {other:?}"),
+            }
+        }
+
+        // The same stray keys inside a scope entry are ignored and the set
+        // decodes to the literal value.
+        let mut v: serde_json::Value = serde_json::from_str(&set_json).expect("object");
+        v["scope"][0]["stray"] = serde_json::json!({"deep": [1, {"x": true}]});
+        v["scope"][0][""] = serde_json::json!(0);
+        v["scope"][0]["INTERFACE"] = serde_json::json!(1);
+        let mut reader = Cursor::new(framed(TYPE_SCOPE_SET, v.to_string().as_bytes()));
+        assert_eq!(read_msg(&mut reader), Ok(Msg::ScopeSet(set)));
+    }
 }
