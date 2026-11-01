@@ -13,7 +13,9 @@
 //! only (400 over h2), `Origin` (403 in P), the login cookie (401 in P), the
 //! subprotocol echo (V only). Every outcome writes a `handshake` entry; the
 //! accepted connection's frames are logged in both directions and the loop's
-//! end writes a `close` entry and stamps the connection closed.
+//! end writes a `close` entry and stamps the connection closed (the 101 marks
+//! the connection upgraded, so the listener's own close after hyper hands
+//! the socket off does not stamp it first).
 
 use std::sync::Arc;
 
@@ -356,6 +358,9 @@ pub(crate) fn serve_upgrade(
         Ok(accept) => accept,
         Err((status, body)) => return html(status, body.to_string()),
     };
+    // From here the connection belongs to the frame loop: the listener's
+    // close right after this 101 must not stamp it (see `finish`).
+    info.conn.mark_upgraded();
 
     let mut resp = Response::builder()
         .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -448,8 +453,9 @@ where
     code
 }
 
-/// Log the `close` entry and stamp the connection closed (last write wins,
-/// so this overrides the listener's close stamped at the 101).
+/// Log the `close` entry and stamp the connection closed. This is the only
+/// closer of an upgraded connection: the listener's `close_conn` right after
+/// the 101 is a no-op once `serve_upgrade` marked the connection upgraded.
 fn finish(state: &AppState, conn: &ConnInfo, code: Option<u16>) {
     state.log.log_ws(WsLogEntry::Close(WsCloseEntry {
         seq: 0,
@@ -457,7 +463,7 @@ fn finish(state: &AppState, conn: &ConnInfo, code: Option<u16>) {
         conn_id: conn.conn_id.clone(),
         code,
     }));
-    state.log.close_conn(conn);
+    state.log.close_conn_upgraded(conn);
 }
 
 /// What the loop does after handling one decoded frame.
@@ -1141,15 +1147,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upgraded_conn_closes_only_when_the_loop_ends() {
+        let v = state(Vulnerable);
+        // The 101 marks the connection upgraded; a refused handshake does not.
+        let info = ws_request(&[]);
+        assert!(!info.conn.is_upgraded());
+        let resp = serve_upgrade(&info, never_upgraded(), v.clone());
+        assert_eq!(resp.status().as_u16(), 101);
+        assert!(info.conn.is_upgraded());
+        let refused = RequestInfo::test_request("GET", "/ws", &[("host", "127.0.0.1:1")], b"");
+        let resp = serve_upgrade(&refused, never_upgraded(), v.clone());
+        assert_eq!(resp.status().as_u16(), 400);
+        assert!(!refused.conn.is_upgraded());
+
+        // hyper resolves `serve_h1` as soon as the upgrade is handed off, so
+        // the listener stamps a close right after the 101: on an upgraded
+        // connection that stamp must be a no-op until the frame loop ends.
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:9".parse().expect("peer"));
+        conn.mark_upgraded();
+        v.log.close_conn(&conn);
+        assert_eq!(*conn.closed_ms.lock().expect("closed_ms"), None);
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+        let _hello = read_frame(&mut client).await;
+        v.log.close_conn(&conn);
+        assert_eq!(*conn.closed_ms.lock().expect("closed_ms"), None);
+        // (`test_request` mints its connections on its own log; this is the
+        // only row on `v.log`.)
+        let row = v.log.conns_json()["entries"][0].clone();
+        assert_eq!(row["conn_id"], serde_json::json!(conn.conn_id.clone()));
+        assert_eq!(row["closed_ms"], serde_json::Value::Null);
+        client
+            .write_all(&masked(Opcode::Close, &1000u16.to_be_bytes()))
+            .await
+            .expect("write close");
+        let _close = read_frame(&mut client).await;
+        assert_eq!(task.await.expect("loop task"), Some(1000));
+        let closed = *conn.closed_ms.lock().expect("closed_ms");
+        assert!(closed.is_some_and(|c| c >= conn.opened_ms), "{closed:?}");
+        assert_eq!(
+            v.log.conns_json()["entries"][0]["closed_ms"],
+            serde_json::json!(closed)
+        );
+    }
+
+    #[tokio::test]
     async fn frame_loop_logs_frames_close_and_closed_ms() {
         let v = state(Vulnerable);
         let conn = v
             .log
             .open_conn(Listener::Plain, None, "127.0.0.1:5".parse().expect("peer"));
         // The listener closes the connection as soon as hyper hands off the
-        // upgrade; the loop's close must win.
+        // upgrade; on an upgraded connection only the loop's end counts.
+        conn.mark_upgraded();
         v.log.close_conn(&conn);
-        *conn.closed_ms.lock().expect("closed_ms") = Some(1);
+        assert_eq!(*conn.closed_ms.lock().expect("closed_ms"), None);
 
         let (server, mut client) = tokio::io::duplex(1 << 20);
         let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
@@ -1206,8 +1260,7 @@ mod tests {
         );
 
         let closed = *conn.closed_ms.lock().expect("closed_ms");
-        assert_ne!(closed, Some(1));
-        assert!(closed.is_some_and(|c| c >= conn.opened_ms));
+        assert!(closed.is_some_and(|c| c >= conn.opened_ms), "{closed:?}");
     }
 
     // --- Tester additions (stage 5): close without code, pong, fragments, EOF ---

@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,6 +133,9 @@ pub(crate) struct ConnInfo {
     pub(crate) peer: SocketAddr,
     pub(crate) opened_ms: u64,
     pub(crate) requests: AtomicU32,
+    /// Set when `/ws` answered 101 on this connection: from then on only the
+    /// frame loop's end closes it ([`ControlLog::close_conn_upgraded`]).
+    pub(crate) upgraded: AtomicBool,
     pub(crate) closed_ms: Mutex<Option<u64>>,
 }
 
@@ -140,6 +143,16 @@ impl ConnInfo {
     /// Per-connection 1-based request counter (`conn_req_index`, AC T3-3).
     pub(crate) fn next_request_index(&self) -> u32 {
         self.requests.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Record that `/ws` took this connection over (the 101 was produced).
+    pub(crate) fn mark_upgraded(&self) {
+        self.upgraded.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether `/ws` took this connection over.
+    pub(crate) fn is_upgraded(&self) -> bool {
+        self.upgraded.load(Ordering::SeqCst)
     }
 
     fn to_json(&self) -> Value {
@@ -573,17 +586,28 @@ impl ControlLog {
             peer,
             opened_ms: Self::now_ms(),
             requests: AtomicU32::new(0),
+            upgraded: AtomicBool::new(false),
             closed_ms: Mutex::new(None),
         });
         lock(&self.conns).push(conn.clone());
         conn
     }
 
-    /// Stamp `closed_ms` on the connection. Last write wins: hyper resolves an
-    /// upgraded h1 connection as soon as the `/ws` upgrade is handed off, so
-    /// the listener stamps a close right after the 101 and the frame loop
-    /// stamps the real end when it finishes.
+    /// Stamp `closed_ms` on a connection the listener is done with. A no-op
+    /// for an upgraded connection: hyper resolves `serve_h1` as soon as the
+    /// `/ws` upgrade is handed off, so the listener gets here right after
+    /// the 101 while the frame loop is still running; that loop's end
+    /// ([`close_conn_upgraded`](Self::close_conn_upgraded)) is the close.
     pub(crate) fn close_conn(&self, conn: &ConnInfo) {
+        if conn.is_upgraded() {
+            return;
+        }
+        *lock(&conn.closed_ms) = Some(Self::now_ms());
+    }
+
+    /// Stamp `closed_ms` on an upgraded connection: the `/ws` frame loop's
+    /// end, the only close that counts once the 101 went out.
+    pub(crate) fn close_conn_upgraded(&self, conn: &ConnInfo) {
         *lock(&conn.closed_ms) = Some(Self::now_ms());
     }
 
@@ -1025,21 +1049,33 @@ mod tests {
     }
 
     #[test]
-    fn close_conn_last_write_wins() {
+    fn close_conn_skips_an_upgraded_conn_until_the_ws_loop_closes_it() {
         // hyper resolves an upgraded h1 connection as soon as the upgrade is
-        // handed off, so the listener stamps `closed_ms` right after the 101;
-        // the `/ws` frame loop must be able to overwrite it when it ends.
+        // handed off, so the listener calls `close_conn` right after the 101;
+        // that must not stamp `closed_ms`. Only the `/ws` loop's
+        // `close_conn_upgraded` does.
         let log = ControlLog::new(SeedMode::Vulnerable);
         let conn = log.open_conn(Listener::Plain, None, peer());
-        *lock(&conn.closed_ms) = Some(1);
+        assert!(!conn.is_upgraded());
+        conn.mark_upgraded();
+        assert!(conn.is_upgraded());
         log.close_conn(&conn);
+        assert_eq!(*lock(&conn.closed_ms), None);
+        assert_eq!(
+            log.conns_json()["entries"][0]["closed_ms"],
+            serde_json::Value::Null
+        );
+        log.close_conn_upgraded(&conn);
         let closed = *lock(&conn.closed_ms);
-        assert_ne!(closed, Some(1));
-        assert!(closed.is_some_and(|c| c >= conn.opened_ms));
+        assert!(closed.is_some_and(|c| c >= conn.opened_ms), "{closed:?}");
         assert_eq!(
             log.conns_json()["entries"][0]["closed_ms"],
             serde_json::json!(closed)
         );
+        // A connection that was never upgraded is stamped by `close_conn`.
+        let plain = log.open_conn(Listener::Plain, None, peer());
+        log.close_conn(&plain);
+        assert!(lock(&plain.closed_ms).is_some());
     }
 
     #[test]
