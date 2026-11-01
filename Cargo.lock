@@ -418,7 +418,17 @@ dependencies = [
 name = "aitm-scan-checks-http"
 version = "0.5.8"
 dependencies = [
+ "aitm-core",
+ "aitm-poc",
+ "aitm-proto-http",
  "aitm-scan-model",
+ "anyhow",
+ "futures",
+ "regex",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

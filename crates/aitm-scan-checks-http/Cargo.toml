@@ -10,6 +10,33 @@ description = "Scanner v2 native HTTP checks (track T3): checks contributed to t
 # The `Check` trait this crate's `checks()` slot returns. This crate contributes
 # native checks to the HTTP lane's catalogue; it is not a lane of its own (A16).
 aitm-scan-model.workspace = true
+# Flow identity and the redaction vocabulary every `detail` and excerpt passes
+# through before it reaches an `Evidence` (spec D8.2, "Redaction").
+aitm-core.workspace = true
+# `Assertion` and `Severity`: a check's PoC hint speaks the PoC engine's
+# matcher vocabulary rather than minting a parallel one (spec D6).
+aitm-poc.workspace = true
+# The h2 sender and raw-h2 codec the observe-only h2 checks drive (spec D8.2).
+aitm-proto-http.workspace = true
+anyhow.workspace = true
+# `BoxFuture`: the `Check` trait is object-safe, so every check body is boxed.
+futures.workspace = true
+# Reflection-context and error-signature matching in the native checks.
+regex.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# The `Check` bodies are async; their unit tests drive them on a current-thread
+# runtime with time paused, never a real clock (spec D4, "Timing without sleep").
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "time",
+  "test-util",
+] }
+serde_json.workspace = true
+# PoC hints are operator-readable YAML; the hint tests read them that way.
+serde_yaml.workspace = true
 
 [lints]
 workspace = true
