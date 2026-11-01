@@ -16,3 +16,16 @@ the crawl at `navigation_failed`, which the first run showed).
 
 Driver: `/tmp/claude/t9-live.sh` (up / relaunch / shot / bus / down), window shots by pid via `tools/winshot.swift`,
 clicks via the guarded click helper. No snapshot scene, no fixture data.
+
+## After the fake-data removal merge (main 621cbcc0 / v0.5.10, 2026-11-01)
+
+The keystone PR (#249, live-only app) touched `Panels/ScanPanel.swift` (the fixture load hook went) and Kit
+`Panels/Scan.swift` (the fixture result went); the merge resolved both toward live-only with no Scan view change
+beyond those deletions. Re-proof of the touched path on the merged tree: the dev bundle built with main's
+`NO_LAUNCH=1 tools/snap-dev.sh`, its embedded core = `aitm` built from main at that point (lists `scan.discover`,
+no `scan.start`), the target in the store's `scope.json`, testtarget vulnerable on 8097.
+
+- `03-after-keystone-merge-legacy-form.png` — the Scan page still renders the legacy form.
+- `04-after-keystone-merge-crawl-result.png` — one Scan: 29 endpoints · 384 injection points · 29 pages;
+  `flow.list` held 41 flows. Gate on the merged tree: swift test 651 + 31 green (the surface tests now carry their
+  own scope and tool stand-ins), grid-lint PASS, the three tripwires PASS.
