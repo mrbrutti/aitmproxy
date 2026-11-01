@@ -249,6 +249,59 @@ mod tests {
         }
     }
 
+    /// The minimal HTML escaping the patched seed applies to the echoed field:
+    /// `& < > " '`, in that order. Spelled out here rather than reused from
+    /// `payloads` so the server side of this test cannot agree with a wrong
+    /// escaper in the matcher it is testing.
+    fn seed_escape(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match c {
+                '&' => out.push_str("&amp;"),
+                '<' => out.push_str("&lt;"),
+                '>' => out.push_str("&gt;"),
+                '"' => out.push_str("&quot;"),
+                '\'' => out.push_str("&#x27;"),
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// The patched handler, modelled on T10's Patched `/ws` seed: it reads
+    /// `msg`, HTML-escapes it and sends it back in both a JSON field and an
+    /// HTML fragment. It runs no command, so no verdict may call it
+    /// vulnerable — and `& echo <marker>` returning as `&amp; echo <marker>`
+    /// is exactly the escaped-literal case (plan call 37).
+    async fn patched_echo_handler(conn: ServerConn) {
+        let mut ws = conn.ws().await;
+        while let Some(Ok(message)) = ws.next().await {
+            match message {
+                Message::Text(text) => {
+                    conn.record(text.as_bytes().to_vec());
+                    let reply = match serde_json::from_str::<serde_json::Value>(&text)
+                        .ok()
+                        .and_then(|value| {
+                            value.get("msg").and_then(|m| m.as_str()).map(seed_escape)
+                        }) {
+                        Some(escaped) => serde_json::json!({
+                            "type": "echo",
+                            "msg": escaped,
+                            "html": format!("<b>{escaped}</b>"),
+                        })
+                        .to_string(),
+                        None => r#"{"ok":true}"#.to_string(),
+                    };
+                    if ws.send(Message::text(reply)).await.is_err() {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    }
+
     /// A transport whose connect always fails, standing in for a refused dial.
     struct DeadTransport;
 
@@ -340,6 +393,30 @@ mod tests {
         assert_eq!(
             (verdict.outcome, verdict.confidence),
             (Outcome::Clean, Confidence::Tentative)
+        );
+        assert_eq!(verdict.evidence.payload, None);
+        assert_eq!(verdict.evidence.matched, None);
+        assert_eq!(
+            log.connections(),
+            5,
+            "one dial per echo form, all five sent"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn patched_escaping_echo_is_clean() {
+        let (transport, log) = ws_server(None, patched_echo_handler);
+        let job = TestJob::new(100);
+        let host = host_for(&job, transport as Arc<dyn WsTransport>);
+        let point = host.point().clone();
+
+        let verdict = check().run(&point, &host as &dyn ProbeHost).await;
+
+        assert_eq!(
+            (verdict.outcome, verdict.confidence),
+            (Outcome::Clean, Confidence::Tentative),
+            "an escaped echo is a reflection, not a command: {}",
+            verdict.detail
         );
         assert_eq!(verdict.evidence.payload, None);
         assert_eq!(verdict.evidence.matched, None);

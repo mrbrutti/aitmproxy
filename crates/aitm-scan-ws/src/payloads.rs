@@ -123,13 +123,70 @@ pub fn ssti_probes(marker: &str) -> Vec<(String, String)> {
     .collect()
 }
 
+/// HTML-escape the five characters a safe rendering path replaces: `&`, `<`,
+/// `>`, `"` and `'`, in that order.
+///
+/// This is the escaping a patched target applies before echoing a field back,
+/// and it is why [`payload_present`] has to look for the escaped form too.
+#[must_use]
+pub fn html_escape_min(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether `body` carries `payload` as the server would have echoed it:
+/// raw, HTML-escaped, or escaped as a JSON string.
+///
+/// A plain `body.contains(payload)` is not enough, and getting this wrong
+/// invents vulnerabilities. Against a patched target that echoes the field and
+/// HTML-escapes it, `& echo <marker>` comes back as `&amp; echo <marker>`: the
+/// literal is absent while the marker is present, which is exactly the shape
+/// [`cmdi_hit`] reads as a command having run (plan call 37 — this fired
+/// `Vulnerable/Firm` on the hardened seed in a real-target run). Encoding an
+/// echo is not executing it, so every encoding a reflection can arrive in has
+/// to count as the payload being present.
+fn payload_present(body: &str, payload: &str) -> bool {
+    if body.contains(payload) {
+        return true;
+    }
+    let escaped = html_escape_min(payload);
+    if body.contains(&escaped) {
+        return true;
+    }
+    // `&#39;` is the other common spelling of an escaped apostrophe.
+    if escaped.contains("&#x27;") && body.contains(&escaped.replace("&#x27;", "&#39;")) {
+        return true;
+    }
+    // JSON string escaping (`"` -> `\"`, control characters -> `\uXXXX`) for a
+    // payload echoed into a JSON field. Serialising a `&str` cannot fail, but
+    // this path returns a verdict, so a failure means "not present" rather
+    // than a panic.
+    serde_json::to_string(payload)
+        .ok()
+        .as_deref()
+        .and_then(|json| json.strip_prefix('"').and_then(|j| j.strip_suffix('"')))
+        .is_some_and(|inner| body.contains(inner))
+}
+
 /// Whether `body` evaluated an SSTI probe rather than echoing it.
 ///
-/// True only when the expectation is present *and* the literal payload is not:
-/// a server that reflects the template source unchanged has not evaluated it.
+/// True only when the expectation is present *and* the payload is not — in any
+/// encoding a reflection could arrive in, see [`payload_present`]: a server
+/// that reflects the template source has not evaluated it, however it escaped
+/// the reflection on the way out.
 #[must_use]
 pub fn ssti_hit(body: &str, payload: &str, expected: &str) -> bool {
-    body.contains(expected) && !body.contains(payload)
+    body.contains(expected) && !payload_present(body, payload)
 }
 
 /// The five command-separator forms `ws-cmdi-echo` tries, in order.
@@ -150,12 +207,13 @@ pub fn cmdi_probes(marker: &str) -> Vec<String> {
 
 /// Whether `body` ran a command-injection probe rather than echoing it.
 ///
-/// True only when the marker is present *and* the literal payload is not: a
-/// server that reflects `;echo mk` unchanged has reflected input, not run a
-/// command.
+/// True only when the marker is present *and* the payload is not — in any
+/// encoding a reflection could arrive in, see [`payload_present`]: a server
+/// that sends `;echo mk` back, raw or as `&amp; echo mk`, has reflected input,
+/// not run a command.
 #[must_use]
 pub fn cmdi_hit(body: &str, payload: &str, marker: &str) -> bool {
-    body.contains(marker) && !body.contains(payload)
+    body.contains(marker) && !payload_present(body, payload)
 }
 
 #[cfg(test)]
@@ -213,6 +271,36 @@ mod tests {
     fn cmdi_hit_requires_marker_without_literal() {
         assert!(cmdi_hit("mk\n", ";echo mk", "mk"));
         assert!(!cmdi_hit(";echo mk", ";echo mk", "mk"));
+    }
+
+    #[test]
+    fn cmdi_hit_sees_an_html_escaped_payload_as_present() {
+        // The patched seed echoes the field and HTML-escapes it: `& echo mk`
+        // comes back as `&amp; echo mk`. The literal is "absent" only in the
+        // narrowest sense — the server reflected, it did not run a command —
+        // so this must not read as a hit (plan call 37, real-target run).
+        let body = r#"{"msg":"&amp; echo mk7f3a9e","html":"<b>&amp; echo mk7f3a9e</b>"}"#;
+        assert!(!cmdi_hit(body, "& echo mk7f3a9e", "mk7f3a9e"));
+    }
+
+    #[test]
+    fn escaped_payload_forms_count_as_present() {
+        assert_eq!(
+            html_escape_min("& < > \" ' x"),
+            "&amp; &lt; &gt; &quot; &#x27; x"
+        );
+        // The `&#39;` spelling of the apostrophe is accepted too.
+        assert!(!cmdi_hit("it&#39;s mk", "it's mk", "mk"));
+        // A payload echoed into a JSON string comes back with its quotes and
+        // backslashes escaped; that is still an echo.
+        assert!(!cmdi_hit(r#"{"msg":"say \"mk\""}"#, r#"say "mk""#, "mk"));
+        // An SSTI template reflected HTML-escaped is a reflection, not a
+        // render, even when the body happens to carry the product as well.
+        assert!(!ssti_hit(
+            "mk&lt;%= 1543*7 %&gt; mk10801",
+            "mk<%= 1543*7 %>",
+            "mk10801"
+        ));
     }
 
     #[test]
