@@ -11,13 +11,15 @@
 //! mutation sets past the end of the datagram (umbrella T6-2).
 //!
 //! One note on the YAML: the `questions` repeat is written `count_from:
-//! questions`, not `count_from: qdcount`. [`crate::tree`]'s parser keys a
-//! declared count by the name of the *repeat* it counts — the `of` of
-//! `qdcount`'s `count: { of: questions }` — and [`crate::spec`]'s validator
-//! resolves a name against the field's own level and outwards, so `qdcount`,
-//! which sits inside the `header` group, is not a name the top-level
-//! `questions` field can reach. `count_from: questions` is therefore the one
-//! spelling that both validates and makes `qdcount` bound the repeat;
+//! qdcount`, naming the **count field**, and `qdcount` in the `header` group
+//! carries `count: { of: questions }`, naming the repeat back. The two
+//! spellings must agree: [`crate::spec`]'s validator requires `count_from` to
+//! name a field declared earlier in document order — its own level, an
+//! ancestor, or a descendant of an earlier sibling, which is where `qdcount`
+//! sits — and that field must carry `count: { of: questions }`, so a repeat
+//! naming itself (`count_from: questions`) is refused. [`crate::tree`]'s
+//! parser records a declared count under both names, the count field's own
+//! and the repeat it counts, so `count_from: qdcount` bounds the repeat;
 //! `dns_qdcount_bounds_the_questions` pins that it does.
 
 use std::sync::Arc;
