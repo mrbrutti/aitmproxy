@@ -1,7 +1,10 @@
-# 14 — macOS "Set as system proxy" toggle (Developer ID, hardened runtime, not sandboxed)
+# 22 — macOS "Set as system proxy" toggle (Developer ID, hardened runtime, not sandboxed)
 
 Stage 1 research for the apps/mac Status page follow-up. All sources read 2026-10-31.
-Tags: **(H)** SDK header read locally (`MacOSX27.0.sdk`), **(M)** man page read locally,
+See also `docs/research/16-system-proxy.md` (on `main`; the same topic from the core's side:
+`networksetup`'s entitlement and authorization right, per-service read/restore formats, the
+`system-configuration` crate's gap, helper cost, Linux) — this note adds the mac-app route choice,
+the NE interplay and the live observations in §5a/§5b. Tags: **(H)** SDK header read locally (`MacOSX27.0.sdk`), **(M)** man page read locally,
 **(P)** primary vendor doc/page, **(S)** secondary (forum, blog, search snippet, issue
 thread), **(I)** inference by the researcher, **(U)** unverified.
 
@@ -41,7 +44,7 @@ this Mac's proxy state. The probes need the Terminal panel to be meaningful.
 | 1.8 | Proxyman: default is `networksetup` ("slow and can delay starting or quitting the app"; fails for guest/non-admin users). Optional "Proxy Helper Tool" installed at `/Library/PrivilegedHelperTools/com.proxyman.NSProxy.HelperTool`; asked on first launch, skippable (Settings → Advanced); macOS 13+ needs it enabled under Login Items; MDM install `sudo …/proxyman --install-privileged-components` (4.12.0+). Maintainer: installed with `SMJobBless`; a CLI-only install is hard because it needs the app's plist. | (P) proxyman.com/docs/basic-features/proxy-setting-tool; (S) github.com/ProxymanApp/Proxyman/issues/1767 |
 | 1.9 | Charles: "When you first install Charles you will be prompted to grant permissions to Charles to autoconfigure the proxy settings." Helper name `com.xk72.charles.ProxyHelper` copied to `/Library/PrivilegedHelperTools` with a LaunchDaemon plist (Jamf thread, ~2000 days old; page itself returned 403, from a search snippet). | (P) charlesproxy.com/documentation/configuration/browser-and-system-configuration/; (S, stale) community.jamf.com thread 232970 |
 | 1.10 | Helper-security precedent: Proxyman helper XPC (`overrideProxySystemWithAuthorization`, `revertProxySystemWithAuthorization`, `legacySetProxySystemPreferencesWithAuthorization`) accepted callers by code-signing requirement but not hardened runtime / library validation, so a `DYLD_INSERT_LIBRARIES` build could silently set a MITM proxy (CVE-2023-45732, fixed in helper 1.5.0: callers must be notarized, signed with the vendor cert, with Library Validation and the hardened flag). | (S) nccgroup.com technical advisory (2023-10-31); (P) Proxyman helper changelog |
-| 1.11 | Entitlements/notarization: no header or doc I read lists an entitlement for SCPreferences or `networksetup`. Proxyman ships a hardened-runtime app plus the helper (NCC: "current builds use the hardened runtime"). Our `Aitmproxy.entitlements` carries only NE + system-extension keys; `build.sh` signs with `--options runtime`. A helper would be a new nested binary to sign before the app. | (I) from the above; `apps/mac/*.entitlements`, `apps/mac/build.sh:169-205` |
+| 1.11 | Entitlements/notarization: no header or doc I read lists an entitlement for SCPreferences or `networksetup`. Proxyman ships a hardened-runtime app plus the helper (NCC: "current builds use the hardened runtime"). Our `Aitmproxy.entitlements` carries only NE + system-extension keys; `build.sh` signs with `--options runtime`. A helper would be a new nested binary to sign before the app. | (I) from the above; `apps/mac/*.entitlements`, `apps/mac/build.sh:241` (`runtime_opts=(--options runtime)`) |
 | 1.12 | Apple does not state a recommendation between (a) and (b) in anything I could read; the only Apple-staff statement is 1.4 (SCPreferences-with-authorization is workable but short-lived; helper if that is not acceptable). Apple's doc pages are JS-rendered and returned no body, so `developer.apple.com/documentation` text is **not** cited. | (U) |
 
 ### Q2. Read-back and notifications
@@ -86,7 +89,7 @@ this Mac's proxy state. The probes need the Terminal panel to be meaningful.
 | 5.1 | Proxyman: NE `enable` "starts capture and turns off the helper-based system proxy. The system proxy cannot be enabled while Network Extension capture is on." After NE disable/uninstall "the system proxy follows Auto Override System Proxy Settings at Launch". Its VPN page says NE "works independently of the system proxy". Its docs say nothing about double capture or loops. | (P) proxyman.com/docs/command-line; (P) …/proxyman-does-not-work-with-vpn-apps; (P) …/2026-10-06-introducing-network-extension |
 | 5.2 | Our provider: one catch-all outbound rule (`remoteNetworkEndpoint: nil`, protocol any); loopback is not delivered for wildcard rules (header: wildcard "will match all destinations except for loopback"); DevForums reports on explicit loopback rules conflict. Self-exclusion = audit-token → Developer ID team requirement, fail-open (`isSelf`), covers aitm and obscura. The core listens on `127.0.0.1:<proxyPort>`. | `apps/mac/Extension/Sources/TransparentProxyProvider.swift:35-47,74`; `FlowHandoff.swift:145-185`; `EmbeddedCoreLaunch.swift:245`; research 10 §3.2 |
 | 5.3 | Inference with both on: an app that honours the system proxy dials `127.0.0.1:<port>`, a loopback flow the NE should not see (no double capture at that hop); the core's upstream dial is `isSelf` so it fails open (no loop); apps that ignore the system proxy are picked up by the NE if in scope. This rests on the loopback exclusion holding on macOS 27 (research 10 open question 4) and has **not been measured**. | (I) |
-| 5.4 | Coverage differs: the core's passive proxy "is not gated by the scope allowlist (an intercepting proxy must relay what the client sends)"; the NE lane is deny-by-default scoped. System proxy ON therefore sends **every** proxy-aware app's traffic through the core regardless of Scope, while NE only sends in-scope hosts. | `crates/aitm-core/src/proxy.rs:331-336`; PR #181 notes in MEMORY |
+| 5.4 | Coverage differs: the core's passive proxy "is not gated by the scope allowlist (an intercepting proxy must relay what the client sends)"; the NE lane is deny-by-default scoped. System proxy ON therefore sends **every** proxy-aware app's traffic through the core regardless of Scope, while NE only sends in-scope hosts. | `crates/aitm-core/src/proxy.rs:360`; PR #181 notes in MEMORY |
 
 ### Q6. UX conventions
 
@@ -159,10 +162,12 @@ Mac shows `com.apple.private.AuthorizationServices = [system.services.systemconf
 and `com.apple.private.admin.writeconfig`; the right's rule is k-of-1 of `[is-root, entitled,
 _mbsetupuser-nonshared, authenticate-admin-nonshared]`. Measured: `networksetup -setwebproxystate
 "Display Ethernet" off` run as the admin user without sudo exited 0, changed the state and showed
-NO dialog (restored within three minutes). So `networksetup` from a non-root admin user never
-prompts and has no five-minute credential; only raw `SCPreferences` writes from our own process hit
-`authenticate-admin`. The privileged helper is a follow-up for standard users and for
-`SCPreferences` speed, not a prerequisite. Service names on this Mac: "Display Ethernet" (en15)
+NO dialog (restored within three minutes). So in this one run (n = 1 — not generalised) `networksetup`
+from a non-root admin user did not prompt and showed no five-minute credential; the right's rule
+includes `authenticate-admin-nonshared`, so a standard user, or "Require an administrator password to
+access system-wide settings" switched on, is expected to prompt **(U)**. Only raw `SCPreferences`
+writes from our own process are known to hit `authenticate-admin`. The privileged helper is a
+follow-up for standard users and for `SCPreferences` speed, not a prerequisite. Service names on this Mac: "Display Ethernet" (en15)
 and "Wi-Fi" (en0), both enabled; at the time of the probe both carried Proxyman's
 `127.0.0.1:9090` HTTP+HTTPS, so a `SystemProxyState.other(host, port)` reading is a real case,
 not a hypothetical. The spec for this work lives with the system-proxy-automation session.
