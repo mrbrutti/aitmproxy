@@ -122,6 +122,16 @@ G49. Typed profile names are file-ish keys with no shape check (`crates/aitm-tui
 
 G50. `request_session_preview` returns early when `previews` already holds the origin (`crates/aitm-tui/src/app.rs`): drop the `contains_key` early return; the in-flight tag dedupe stops duplicates, and re-opening a profile re-reads the session (D11 as amended). Test (`tests/scan_v2_profiles.rs`): open `standard`, fold the preview, Esc, `Enter` again: a second `scan.session.preview:<origin>` request leaves.
 
+## Task 11 security panel
+
+G51. **Important, priority with G20/G22/G45.** `scan.profile.list` lane vectors are unbounded at fold and re-joined per row per frame (`crates/aitm-tui/src/scan/profiles.rs` `fold_list`; `crates/aitm-tui/src/ui/scan/profiles.rs` `Columns::measure`, `lanes_text`, `row_line`): in `fold_list`, `p.summary.lanes.sort(); p.summary.lanes.dedup();` per row (at most the four `LaneKind`s), and precompute each row's lanes text and the column measure at fold (a `ProfileRow { summary, lanes_text }` or a `lanes_text: String` beside the summary) so the view only copies. Test: a list reply with one row carrying 100_000 `http` lanes folds to `lanes == [Http]` and renders `http` once at 200x50; a row with `[ws, http, http]` renders `http ws`.
+
+G52. `field_lines` clones the whole editor every frame to drive `field_text()` (`crates/aitm-tui/src/ui/scan/profiles.rs`, `crates/aitm-tui/src/scan/profiles.rs`): `ProfileEditor::text_of(&self, field: EditorField) -> String` holds today's match, `field_text()` becomes `self.text_of(self.field())`, the view calls `text_of(field)` and the clone goes. Unit test: for every `EDITOR_FIELDS` entry, `text_of(f)` equals the old probe's `field_text()`.
+
+G53. Addendum to G45: `fold_profile` also refuses when any `target.l4[].ip` fails to parse as `IpAddr` (bracket-stripped, as `parse_l4_target` does) or `grammar` is `Some` and over `SELECTOR_MAX` bytes or carries a control character. Test: a `scan.profile.get:standard` reply with `l4: [{ip: "x".repeat(1 MiB), port: 7000}]` leaves `editor.is_none()`.
+
+G54. Addendum to G36: the cached `TreeNode` carries its `TriState`, recomputed on toggle and on `fold_checks`, so `check_summary` and `tree_line` do no per-node scan of `include`/`exclude` per frame; `tri_state` stays for the toggle path. Test rides with G36's.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).

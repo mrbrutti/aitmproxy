@@ -514,6 +514,10 @@ Kept by the main session during stage 6. One row per finding.
 | 11 | coder note | Minor | check tree built per frame for the Checks pane and the Fields summary line | fix round G (G36 cached tree covers both call sites) |
 | 11 | coder note | Minor | `tester_pass2::browser_outline_survives_malformed_html_through_the_app` is time-bounded and fails under load | known-flake list; not changed |
 | 11 | coder note | Minor | warning hue drawn with `status::CLIENT_ERROR` (byte-identical to `state.warning` fg on both schemes) because `Theme` exposes no pair foreground | accepted; Task 14 may add a `Theme` accessor |
+| 11 | security | Important | `scan.profile.list` lane vectors unbounded at fold, re-joined per row per frame | fix round G (G51, priority): sort+dedup at fold, lanes text precomputed |
+| 11 | security | Minor | `field_lines` clones the whole editor per frame | fix round G (G52): `text_of(field)` |
+| 11 | security | Minor | `L4TargetSpec.ip`/`grammar` bytes unbounded through `scan.profile.get`; reach `launch.blocked` and the `l4` line | fix round G (G53, addendum to G45) |
+| 11 | security | Minor | `tri_state` linear scan per node per frame in `check_summary`/`tree_line` | fix round G (G54, addendum to G36): cached `TriState` per node |
 
 ## Shipped
 
