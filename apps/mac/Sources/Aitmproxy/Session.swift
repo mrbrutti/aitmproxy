@@ -108,7 +108,8 @@ final class Session {
     var requestTab: RequestTab = .raw
     var responseTab: ResponseTab = .body
     var sort: FlowSort = .captureOrder
-    var density: Density = Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .dense {
+    var density: Density = Store.isOverridden ? .dense
+        : Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .dense {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(density.rawValue, forKey: "density") } }
     }
     var interceptArmed = false
@@ -162,7 +163,7 @@ final class Session {
     /// A query the palette starts with the next time it opens (snapshot scenes); cleared on use.
     var paletteSeedQuery: String?
     var tools: [ToolDescriptor] = Store.usesFixtures ? Fixtures.tools : []
-    var recentPaletteIDs: [String] = UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
+    var recentPaletteIDs: [String] = Store.isOverridden ? [] : UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
     /// A generic bus call for the palette; nil until a bus is attached.
     @ObservationIgnored var commandRunner: ((String, [String: JSONValue]) async throws -> JSONValue)?
     /// Every command this app runs, for the activity log (S-057): name, args, result text or nil on success.
@@ -207,8 +208,9 @@ final class Session {
     var upBytesPerSecond: Int64 = 0
     var downBytesPerSecond: Int64 = 0
     var version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1"
-    /// Settings reopens on the last tab. Test and snapshot runs leave it alone.
-    var settingsTab: SettingsTab = SettingsTab(rawValue: UserDefaults.standard.string(forKey: "settings.tab") ?? "") ?? .general {
+    /// Settings reopens on the last tab. Test and snapshot runs neither read nor write it.
+    var settingsTab: SettingsTab = Store.isOverridden ? .general
+        : SettingsTab(rawValue: UserDefaults.standard.string(forKey: "settings.tab") ?? "") ?? .general {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(settingsTab.rawValue, forKey: "settings.tab") } }
     }
 
@@ -227,7 +229,7 @@ final class Session {
         if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
         // The Scope page shows the embedded core's persisted scope before the bus
         // connects; `refreshScope()` replaces it with the core's `scope.list` on connect (D5).
-        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence().load() ?? .embedded,
+        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded,
                                        bundledCorePresent: EmbeddedCore.discoverBundled() != nil,
                                        usesFixtures: Store.usesFixtures) {
             scopeHosts = EmbeddedScope.load(from: scopeURL).hosts

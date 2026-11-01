@@ -62,7 +62,10 @@ public final class UserDefaultsActiveKindPersistence: ActiveKindPersistence {
     public static let key = "bus.activeKind"
     private let defaults: UserDefaults
 
-    public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    /// The store is the caller's to name: the app passes `Store.defaults` (the operator's
+    /// defaults in a normal launch, the isolated harness suite under `APP_STORE`), so no
+    /// `.standard` default can leak the operator's `bus.activeKind` into a harness run.
+    public init(defaults: UserDefaults) { self.defaults = defaults }
 
     public func load() -> ActiveCoreKind? {
         defaults.string(forKey: Self.key).flatMap(ActiveCoreKind.init(rawValue:))
