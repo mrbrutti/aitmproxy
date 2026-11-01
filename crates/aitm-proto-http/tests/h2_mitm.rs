@@ -556,6 +556,30 @@ fn tunnel_rows(store: &dyn FlowStore) -> Vec<HttpFlow> {
         .collect()
 }
 
+/// Poll up to 3 s until the store holds a tunnel row that has closed
+/// (`metadata.duration` set: the connection it recorded has ended, spec D5), and
+/// return it.
+async fn wait_for_closed_tunnel_row(store: &dyn FlowStore) -> HttpFlow {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(row) = tunnel_rows(store)
+            .into_iter()
+            .find(|row| row.metadata.duration.is_some())
+        {
+            return row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no tunnel row closed; tunnel rows: {:?}",
+            tunnel_rows(store)
+                .iter()
+                .map(|row| (row.metadata.tunnel.clone(), row.metadata.duration))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 // --- AC-H2.1 -----------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1434,10 +1458,28 @@ async fn upstream_dropping_mid_body_finalises_the_flow_as_truncated() {
         "an abandoned response gets a duration"
     );
 
-    // Terminal for the store: `clear` removes it instead of skipping it in flight.
+    // The CONNECT that carried the stream is its own row (spec D5), in flight —
+    // and so kept by `clear` — until the connection closes. Hang up: dropping the
+    // last h2 handle sends GOAWAY, the proxy's `serve_h2` returns, and the row
+    // closes with its duration.
+    drop(send_req);
+    let tunnel = wait_for_closed_tunnel_row(store.as_ref()).await;
+    assert_eq!(tunnel.metadata.tunnel, Some(TunnelInfo::decrypted()));
+    assert_eq!(
+        store.count(),
+        2,
+        "the store holds the abandoned flow and its tunnel row"
+    );
+
+    // Terminal for the store: `clear` removes the abandoned flow — and the closed
+    // tunnel row — instead of skipping either in flight.
     let outcome = store.clear();
-    assert_eq!(outcome.cleared, 1, "the abandoned flow is terminal");
+    assert_eq!(
+        outcome.cleared, 2,
+        "the abandoned flow and the closed tunnel row are terminal"
+    );
     assert_eq!(outcome.skipped_in_flight, 0);
+    assert!(store.list().is_empty(), "nothing is left after clear");
 
     // And the failure was still dispatched on the error bus for that flow.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1839,7 +1881,10 @@ async fn h2_flow_session_round_trips() {
 
 /// AC-H2.11 (HAR) — `flow.export {format:"har"}` of an h2 flow tags both the
 /// request and the response `httpVersion` as `"HTTP/2"`, and `flow.import` of those
-/// same HAR bytes round-trips the flow back as `HttpVersion::H2`.
+/// same HAR bytes round-trips the flow back as `HttpVersion::H2`. The export holds
+/// the whole store, so the `CONNECT` tunnel row that carried the stream (spec D5)
+/// is an entry of its own — tagged `HTTP/1.1`, as the CONNECT exchange was on the
+/// wire — and every version check is scoped to its entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn h2_flow_har_version_tag() {
     let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
@@ -1874,19 +1919,53 @@ async fn h2_flow_har_version_tag() {
         other => panic!("flow.export must return an object, got {other:?}"),
     };
     let doc = String::from_utf8(bytes.clone()).expect("HAR document is UTF-8 JSON");
-    // The one entry carries httpVersion on BOTH its request and response, so the
-    // exact pretty-printed tag must appear twice and the h1 tag never.
+    // One pretty-printed entry per flow, each opening with its `startedDateTime`:
+    // the tunnel row and the h2 flow. Every version check is scoped to its entry.
+    let entries: Vec<&str> = doc.split("\"startedDateTime\"").skip(1).collect();
     assert_eq!(
-        doc.matches("\"httpVersion\": \"HTTP/2\"").count(),
+        entries.len(),
         2,
-        "HAR must tag the h2 request and response as HTTP/2: {doc}"
+        "the export holds the CONNECT tunnel row and the h2 flow: {doc}"
+    );
+    let connect: Vec<&&str> = entries
+        .iter()
+        .filter(|entry| entry.contains("\"method\": \"CONNECT\""))
+        .collect();
+    assert_eq!(
+        connect.len(),
+        1,
+        "exactly one CONNECT entry, the tunnel that carried the stream: {doc}"
     );
     assert!(
-        !doc.contains("\"httpVersion\": \"HTTP/1.1\""),
-        "no part of an h2 flow may be tagged HTTP/1.1: {doc}"
+        connect[0].contains(&format!("\"url\": \"https://{origin}\"")),
+        "the tunnel entry names the origin it was opened to: {}",
+        connect[0]
+    );
+    assert_eq!(
+        connect[0].matches("\"httpVersion\": \"HTTP/1.1\"").count(),
+        2,
+        "the CONNECT exchange is HTTP/1.1 on the wire, request and response: {}",
+        connect[0]
+    );
+    let h2_entry = entries
+        .iter()
+        .find(|entry| entry.contains(&format!("\"url\": \"https://{origin}/har\"")))
+        .unwrap_or_else(|| panic!("no entry for the h2 flow: {doc}"));
+    assert!(h2_entry.contains("\"method\": \"GET\""));
+    // The entry carries httpVersion on BOTH its request and response, so the
+    // exact pretty-printed tag must appear twice and the h1 tag never.
+    assert_eq!(
+        h2_entry.matches("\"httpVersion\": \"HTTP/2\"").count(),
+        2,
+        "HAR must tag the h2 request and response as HTTP/2: {h2_entry}"
+    );
+    assert!(
+        !h2_entry.contains("\"httpVersion\": \"HTTP/1.1\""),
+        "no part of an h2 flow may be tagged HTTP/1.1: {h2_entry}"
     );
 
-    // The same HAR bytes import back into a fresh store as an h2 flow.
+    // The same HAR bytes import back into a fresh store: the h2 flow as h2, and
+    // the tunnel entry as the CONNECT it was (HAR carries no tunnel outcome).
     let fresh = MemFlowStore::new();
     sessionio_invoke(
         &reg,
@@ -1897,7 +1976,25 @@ async fn h2_flow_har_version_tag() {
             ("format", Value::Str("har".into())),
         ]),
     );
-    let imported = only_http_flow(&fresh);
+    let imported: Vec<HttpFlow> = fresh
+        .list()
+        .into_iter()
+        .filter_map(|id| match fresh.get(id) {
+            Some(Flow::Http(f)) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(imported.len(), 2, "both entries import as flows");
+    let connect = imported
+        .iter()
+        .find(|f| f.request.method == "CONNECT")
+        .expect("the tunnel entry imports as a CONNECT flow");
+    assert_eq!(connect.request.authority, origin.to_string());
+    assert_eq!(connect.request.version, HttpVersion::Http11);
+    let imported = imported
+        .iter()
+        .find(|f| f.request.path == "/har")
+        .expect("the h2 entry imports as the /har flow");
     assert_eq!(
         imported.request.version,
         HttpVersion::H2,
