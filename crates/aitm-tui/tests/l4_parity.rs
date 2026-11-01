@@ -16,7 +16,7 @@ use aitm_tui::l4::{
     slow_l4_reads, status_ids, supports_operator_scope_add, supports_window, L4Availability,
     L4Confirm, L4Flow, L4Pane, L4Parked, L4State,
 };
-use aitm_tui::model::FlowRow;
+use aitm_tui::model::{AgentPolicy, AgentState, FlowRow};
 use aitm_tui::theme::Theme;
 use aitm_tui::ui::complete::l4_command_candidates;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2276,4 +2276,184 @@ fn no_http_verbs_on_l4_http_row_still_replays_and_marks() {
             param: None,
         }]
     );
+}
+
+// ------------------------------------------------- agent overlay (AC17, D10c)
+
+/// D10c's root cause: the core's policies are `all | auto | ask | readonly |
+/// paused`; the TUI parses and labels all five (`"auto"`, `"ask"` as the core
+/// spells them) so `apply_status` keeps `auto` instead of dropping to `None`.
+#[test]
+fn agent_overlay_parses_the_core_auto_and_ask_policies() {
+    assert_eq!(AgentPolicy::parse("auto"), Some(AgentPolicy::Auto));
+    assert_eq!(AgentPolicy::parse("ask"), Some(AgentPolicy::Ask));
+    assert_eq!(AgentPolicy::Auto.label(), "auto");
+    assert_eq!(AgentPolicy::Ask.label(), "ask");
+    assert_eq!(AgentPolicy::Auto.wire(), "auto");
+    assert_eq!(AgentPolicy::Ask.wire(), "ask");
+    // The three the TUI could already set are unchanged.
+    assert_eq!(AgentPolicy::parse("all"), Some(AgentPolicy::All));
+    assert_eq!(AgentPolicy::parse("readonly"), Some(AgentPolicy::ReadOnly));
+    assert_eq!(AgentPolicy::parse("paused"), Some(AgentPolicy::Paused));
+
+    let mut a = AgentState::default();
+    a.apply_status(&json!({"policy":"auto","actions_last_minute":0,"connected_clients":[]}));
+    assert_eq!(a.policy, Some(AgentPolicy::Auto));
+    a.apply_status(&json!({"policy":"ask","actions_last_minute":3,"connected_clients":1}));
+    assert_eq!(a.policy, Some(AgentPolicy::Ask));
+    assert_eq!(a.actions_last_minute, 3);
+    assert_eq!(a.connected_clients, 1);
+}
+
+fn render_agent(app: &App) -> Vec<String> {
+    let theme = Theme::new(true);
+    let area = Rect::new(0, 0, 140, 30);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::overlays::agent(app, &theme, area, &mut buf);
+    buffer_text(&buf)
+}
+
+/// AC17: on a core whose policy is `auto` the Agent overlay's first line is
+/// `policy: auto · …`, not the stale "core follow-up F1" banner.
+#[test]
+fn agent_overlay_first_line_reports_the_auto_policy() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    app.agent
+        .apply_status(&json!({"policy":"auto","actions_last_minute":0,"connected_clients":[]}));
+    let rows = render_agent(&app);
+    // Row 0 is the box border; row 1 is the overlay's first line.
+    let first = &rows[1];
+    let at = first
+        .find("policy: ")
+        .unwrap_or_else(|| panic!("first line has no policy: {first:?}"));
+    assert!(
+        first[at..].starts_with("policy: auto · 0 actions in the last minute · 0 client(s)"),
+        "{first:?}"
+    );
+    let text = rows.join("\n");
+    assert!(!text.contains("core follow-up F1"), "{text}");
+    assert!(!text.contains("the toggle is read-only here"), "{text}");
+}
+
+/// Without `agent.status` the first line says exactly that, and the CA panel's
+/// y/N note no longer promises a core follow-up.
+#[test]
+fn agent_overlay_none_line_and_ca_note_are_honest() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert_eq!(app.agent.policy, None);
+    let rows = render_agent(&app);
+    let first = &rows[1];
+    assert!(
+        first.contains("agent policy not reported by agent.status"),
+        "{first:?}"
+    );
+    assert!(!first.contains("F1"), "{first:?}");
+
+    let theme = Theme::new(true);
+    let area = Rect::new(0, 0, 140, 30);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::overlays::ca(&app, &theme, area, &mut buf);
+    let rows = buffer_text(&buf);
+    assert!(
+        rows.iter().any(|r| r.trim_matches(['│', ' '])
+            == "install/uninstall ask for a local y/N before the call."),
+        "{}",
+        rows.join("\n")
+    );
+    assert!(!rows.join("\n").contains("core follow-up F1"));
+}
+
+/// Display only: `auto` and `ask` are never set from the TUI. No key in the
+/// Agent view maps to them; `Action::AgentSet` of either sends nothing even
+/// with `agent.set` on the bus; `:agent auto` likewise. The three settable
+/// policies keep their keys, and without `agent.set` the toast names the verb.
+#[test]
+fn agent_overlay_auto_and_ask_are_display_only() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert!(app.update(Action::AgentSet(AgentPolicy::Paused)).is_empty());
+    assert_eq!(toast_text(&app), "agent.set is not on this bus");
+
+    app.tools.push(ToolInfo {
+        name: "agent.set".into(),
+        description: String::new(),
+        input_schema: json!({}),
+        confirmable: false,
+    });
+    assert_eq!(
+        app.update(Action::AgentSet(AgentPolicy::Paused)),
+        vec![BusRequest::AgentSet(AgentPolicy::Paused)]
+    );
+    for p in [AgentPolicy::Auto, AgentPolicy::Ask] {
+        assert!(
+            app.update(Action::AgentSet(p)).is_empty(),
+            "{p:?} must not reach the bus"
+        );
+        let t = toast_text(&app);
+        assert!(t.contains(p.label()) && t.contains("display"), "{t}");
+    }
+    assert!(app.run_command("agent auto").is_empty());
+    assert!(app.run_command("agent ask").is_empty());
+
+    assert_eq!(
+        keys::map(press('1'), Mode::Agent),
+        Some(Action::AgentSet(AgentPolicy::All))
+    );
+    assert_eq!(
+        keys::map(press('2'), Mode::Agent),
+        Some(Action::AgentSet(AgentPolicy::ReadOnly))
+    );
+    assert_eq!(
+        keys::map(press('3'), Mode::Agent),
+        Some(Action::AgentSet(AgentPolicy::Paused))
+    );
+    for c in (0x20u8..0x7f).map(char::from) {
+        let a = keys::map(press(c), Mode::Agent);
+        assert!(
+            !matches!(
+                a,
+                Some(Action::AgentSet(AgentPolicy::Auto | AgentPolicy::Ask))
+            ),
+            "key {c:?} sets a display-only policy"
+        );
+    }
+}
+
+/// Tripwire (AC17): the stale "core follow-up F1" text is gone from the TUI
+/// source. `F10`–`F15` notes are live and stay, so a match is only `F1`
+/// followed by a non-digit or the end of the file.
+#[test]
+fn no_stale_f1_in_tui_src() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+    let mut files = Vec::new();
+    walk(root, &mut files);
+    assert!(files.len() > 10, "walked {} files", files.len());
+    const NEEDLE: &str = "core follow-up F1";
+    let mut hits = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path).expect("read source");
+        for (i, line) in text.lines().enumerate() {
+            let mut rest = line;
+            while let Some(at) = rest.find(NEEDLE) {
+                let after = &rest[at + NEEDLE.len()..];
+                if !after.starts_with(|c: char| c.is_ascii_digit()) {
+                    hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                }
+                rest = after;
+            }
+        }
+    }
+    assert!(hits.is_empty(), "stale F1 text:\n{}", hits.join("\n"));
 }

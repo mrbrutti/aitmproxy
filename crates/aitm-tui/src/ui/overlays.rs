@@ -738,7 +738,7 @@ pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         theme.text_tertiary(),
     ));
     lines.push(Line::styled(
-        " install/uninstall ask for a local y/N first: the bus has no confirm step until core follow-up F1.",
+        " install/uninstall ask for a local y/N before the call.",
         theme.text_tertiary(),
     ));
     lines_into(buf, inner, &lines, 0);
@@ -803,16 +803,29 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             Span::styled(format!(" {} ", glyph::AGENT), theme.agent()),
             Span::styled(
                 match app.agent.policy {
-                    Some(p) => format!("policy: {} · {} actions in the last minute · {} client(s)", p.label(), app.agent.actions_last_minute, app.agent.connected_clients),
-                    None => "agent.status is not on this bus (core follow-up F1) — the toggle is read-only here".to_string(),
+                    Some(p) => format!(
+                        "policy: {} · {} actions in the last minute · {} client(s)",
+                        p.label(),
+                        app.agent.actions_last_minute,
+                        app.agent.connected_clients
+                    ),
+                    None => "agent policy not reported by agent.status".to_string(),
                 },
                 theme.text_primary(),
             ),
         ]),
         Line::raw(""),
         policy_line(AgentPolicy::All, "1", "the agent may call every tool"),
-        policy_line(AgentPolicy::ReadOnly, "2", "list/get/status only; mutations are refused"),
-        policy_line(AgentPolicy::Paused, "3", "every tools/call from MCP returns \"paused by operator\""),
+        policy_line(
+            AgentPolicy::ReadOnly,
+            "2",
+            "list/get/status only; mutations are refused",
+        ),
+        policy_line(
+            AgentPolicy::Paused,
+            "3",
+            "every tools/call from MCP returns \"paused by operator\"",
+        ),
         Line::raw(""),
     ];
     l4_capabilities(app, theme, &mut lines);

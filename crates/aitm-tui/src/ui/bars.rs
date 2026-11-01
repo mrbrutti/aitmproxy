@@ -96,9 +96,10 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     ]);
 
     let agent_style = match app.agent.policy {
-        Some(AgentPolicy::All) | Some(AgentPolicy::ReadOnly) => {
-            theme.agent().add_modifier(Modifier::BOLD)
-        }
+        Some(AgentPolicy::All)
+        | Some(AgentPolicy::Auto)
+        | Some(AgentPolicy::Ask)
+        | Some(AgentPolicy::ReadOnly) => theme.agent().add_modifier(Modifier::BOLD),
         Some(AgentPolicy::Paused) | None => theme.text_tertiary().add_modifier(Modifier::BOLD),
     };
     let agent_label = match app.agent.policy {

@@ -1874,13 +1874,20 @@ impl App {
                 };
             }
             Action::AgentSet(p) => {
-                if self.has_tool("agent.set") {
-                    out.push(BusRequest::AgentSet(p));
-                } else {
+                // `auto` and `ask` are the core's to set: the TUI shows them
+                // but never sends them (plan 2026-10-31 decision 7).
+                if !p.settable() {
                     self.toast(
                         Level::Warn,
-                        "Agent policy needs core follow-up F1 (agent.set)",
+                        format!(
+                            "policy {} is display-only here; set it in the core config",
+                            p.label()
+                        ),
                     );
+                } else if self.has_tool("agent.set") {
+                    out.push(BusRequest::AgentSet(p));
+                } else {
+                    self.toast(Level::Warn, "agent.set is not on this bus");
                 }
             }
             Action::PaletteOpen => self.open_prompt(PromptKind::Palette),
@@ -5034,7 +5041,11 @@ mod tests {
     fn features_absent_from_the_bus_degrade_to_a_toast() {
         let mut app = app_with_flows();
         assert!(app.update(Action::AgentSet(AgentPolicy::Paused)).is_empty());
-        assert!(app.current_toast().unwrap().text.contains("F1"));
+        assert!(app
+            .current_toast()
+            .unwrap()
+            .text
+            .contains("agent.set is not on this bus"));
         assert!(app.run_command("clear").is_empty());
         assert!(app.current_toast().unwrap().text.contains("F7"));
         app.tools.push(ToolInfo {

@@ -1058,7 +1058,11 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     };
     expect_toast(&mut app, Action::Mark, "F6");
     expect_toast(&mut app, Action::Comment, "F6");
-    expect_toast(&mut app, Action::AgentSet(AgentPolicy::Paused), "F1");
+    expect_toast(
+        &mut app,
+        Action::AgentSet(AgentPolicy::Paused),
+        "agent.set is not on this bus",
+    );
     for (cmd, f) in [
         ("clear", "F7"),
         ("pause", "F7"),
@@ -1791,7 +1795,10 @@ fn a_bus_that_offers_no_tools_renders_every_mode_and_sends_nothing() {
     for (action, label) in [
         (Action::Mark, "F6"),
         (Action::Comment, "F6"),
-        (Action::AgentSet(AgentPolicy::Paused), "F1"),
+        (
+            Action::AgentSet(AgentPolicy::Paused),
+            "agent.set is not on this bus",
+        ),
     ] {
         assert!(
             app.update(action.clone()).is_empty(),
