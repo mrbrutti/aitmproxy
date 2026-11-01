@@ -172,6 +172,17 @@ pub enum BusRequest {
         name: String,
         args: Value,
     },
+    /// Any tool by name with an opaque `tag` the reply echoes (scanner v2
+    /// D4): the bus task runs it exactly like [`BusRequest::Call`] and
+    /// answers with [`BusEvent::CallTaggedOk`] or
+    /// [`BusEvent::CallTaggedFailed`] carrying the same tag, so the reducer
+    /// can match a reply to the job or record it was issued for even when
+    /// the call failed. The task never reads the tag.
+    CallTagged {
+        tag: String,
+        name: String,
+        args: Value,
+    },
 }
 
 /// Severity of a status-line toast.
@@ -218,6 +229,20 @@ pub enum BusEvent {
     /// server answered with a JSON-RPC error or a malformed reply, or the bus
     /// does not offer `name` at all. `message` is the operator-facing text.
     CallFailed {
+        name: String,
+        message: String,
+    },
+    /// A [`BusRequest::CallTagged`] completed; `tag` is the request's tag
+    /// verbatim, `name` the tool and `value` its structured result.
+    CallTaggedOk {
+        tag: String,
+        name: String,
+        value: Value,
+    },
+    /// A [`BusRequest::CallTagged`] did not complete, for the same reasons
+    /// as [`BusEvent::CallFailed`]; `tag` is the request's tag verbatim.
+    CallTaggedFailed {
+        tag: String,
         name: String,
         message: String,
     },

@@ -259,7 +259,8 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
         "forms are built from the schema"
     );
 
-    // The wire, in order: initialize (named), initialized notice, tools/list, proxy.status.
+    // The wire, in order: initialize (named), initialized notice, tools/list,
+    // proxy.status, flow.subscribe (D5: the one push subscription).
     let wire = sent(&r.lines);
     assert_eq!(wire[0]["jsonrpc"], "2.0");
     assert_eq!(wire[0]["method"], "initialize");
@@ -291,9 +292,10 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
     assert_eq!(s[14]["id"], "f54");
     assert_eq!(s[10]["intercept"], "intercepted");
     let wire = sent(&r.lines);
-    assert_eq!(wire[4]["params"]["name"], "flow.list");
-    assert_eq!(wire[5]["params"]["name"], "flow.get");
-    assert_eq!(wire[5]["params"]["arguments"], json!({"id": "f40"}));
+    assert_eq!(wire[4]["params"]["name"], "flow.subscribe");
+    assert_eq!(wire[5]["params"]["name"], "flow.list");
+    assert_eq!(wire[6]["params"]["name"], "flow.get");
+    assert_eq!(wire[6]["params"]["arguments"], json!({"id": "f40"}));
     assert_eq!(
         wire.iter().filter(|w| w["method"] == "tools/list").count(),
         1,
@@ -771,9 +773,9 @@ fn start_flaky(budget: usize, poll: Duration) -> Running {
 
 #[tokio::test]
 async fn a_transport_failure_mid_session_reconnects_and_resumes_polling() {
-    // initialize, initialized, tools/list, proxy.status, flow.list,
-    // flow.get f41 — then the socket "resets".
-    let mut r = start_flaky(6, Duration::from_millis(20));
+    // initialize, initialized, tools/list, proxy.status, flow.subscribe,
+    // flow.list, flow.get f40 (7 lines succeed), then the socket "resets".
+    let mut r = start_flaky(7, Duration::from_millis(20));
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     let lost = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Disconnected(_))).await;
     assert!(
@@ -790,9 +792,9 @@ async fn a_transport_failure_mid_session_reconnects_and_resumes_polling() {
 /// not the remaining panels on a dead socket.
 #[tokio::test]
 async fn a_transport_failure_in_a_slow_panel_reconnects_at_once() {
-    // initialize, initialized, tools/list, proxy.status, flow.list, 15 × flow.get
-    // = 20 lines succeed; the 21st, scope.list, "resets".
-    let mut r = start_flaky(20, Duration::from_millis(20));
+    // initialize, initialized, tools/list, proxy.status, flow.subscribe,
+    // flow.list, 15 × flow.get = 21 lines succeed; the 22nd, scope.list, "resets".
+    let mut r = start_flaky(21, Duration::from_millis(20));
     let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
     let flows = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
     assert!(
@@ -995,5 +997,183 @@ async fn a_request_during_an_outage_is_not_lost_silently() {
     r.req_tx.send(BusRequest::Intercept(true)).await.unwrap();
     let second = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
     assert!(matches!(second, BusEvent::Disconnected(_)), "{second:?}");
+    finish(r).await;
+}
+
+/// Scanner v2 T7, spec D5: after the handshake, when the bus offers
+/// `flow.subscribe`, the task subscribes exactly once so job and flow lines
+/// reach it as pushes. It follows `proxy.status` and precedes the first poll.
+#[tokio::test]
+async fn the_handshake_subscribes_once_when_the_bus_offers_flow_subscribe() {
+    let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Flows(_))).await;
+    let wire = sent(&r.lines);
+    assert_eq!(wire[3]["params"]["name"], "proxy.status");
+    assert_eq!(wire[4]["method"], "tools/call");
+    assert_eq!(wire[4]["params"]["name"], "flow.subscribe");
+    assert_eq!(wire[4]["params"]["arguments"], json!({}));
+    assert_eq!(wire[5]["params"]["name"], "flow.list");
+    assert_eq!(
+        wire.iter()
+            .filter(|w| tool_name(w) == "flow.subscribe")
+            .count(),
+        1,
+        "subscribed once across the handshake and the first poll: {wire:?}"
+    );
+    finish(r).await;
+}
+
+/// Scanner v2 T7, Constraints finding and T7-15: `prune()` keeps the reserved
+/// `_confirm` key although no tool schema declares it (the server strips it
+/// itself); every other undeclared key is still dropped.
+#[tokio::test]
+async fn prune_keeps_the_reserved_confirm_key() {
+    let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    let before = sent(&r.lines).len();
+    r.req_tx
+        .send(BusRequest::Call {
+            name: "flow.get".into(),
+            args: json!({"id": "f40", "_confirm": "tok-1", "bogus": true}),
+        })
+        .await
+        .unwrap();
+    let ev = next_where(
+        &mut r.ev_rx,
+        |e| matches!(e, BusEvent::CallOk { name, .. } if name == "flow.get"),
+    )
+    .await;
+    assert!(
+        matches!(&ev, BusEvent::CallOk { value, .. } if value["id"] == "f40"),
+        "{ev:?}"
+    );
+    let wire = sent(&r.lines);
+    let gets: Vec<&Value> = wire[before..]
+        .iter()
+        .filter(|w| tool_name(w) == "flow.get")
+        .map(|w| &w["params"]["arguments"])
+        .collect();
+    let confirmed: Vec<&&Value> = gets
+        .iter()
+        .filter(|a| a.get("_confirm").is_some())
+        .collect();
+    assert_eq!(
+        confirmed.len(),
+        1,
+        "exactly one flow.get carries _confirm (the poll's never do): {gets:?}"
+    );
+    assert_eq!(*confirmed[0], &json!({"id": "f40", "_confirm": "tok-1"}));
+    finish(r).await;
+}
+
+/// Scanner v2 T7, spec D4 and T7-15: a `CallTagged` is run exactly like a
+/// `Call` and its reply echoes the tag, whether the call succeeded, the tool
+/// reported an error, or the bus does not offer the tool at all. The task
+/// stays verb-agnostic: the tag is opaque to it.
+#[tokio::test]
+async fn a_tagged_call_answers_with_the_same_tag() {
+    let mut r = start(Fixture::builtin().shared(), Duration::from_millis(50));
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+
+    r.req_tx
+        .send(BusRequest::CallTagged {
+            tag: "scan.status:scan-1a2b3c4d".into(),
+            name: "flow.get".into(),
+            args: json!({"id": "f40"}),
+        })
+        .await
+        .unwrap();
+    let ev = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::CallTaggedOk { .. })).await;
+    let BusEvent::CallTaggedOk { tag, name, value } = ev else {
+        unreachable!()
+    };
+    assert_eq!(tag, "scan.status:scan-1a2b3c4d");
+    assert_eq!(name, "flow.get");
+    assert_eq!(value["id"], "f40");
+    assert_eq!(value["method"], "GET");
+
+    // A tool the bus does not offer is refused locally, under the same tag,
+    // and never reaches the wire.
+    r.req_tx
+        .send(BusRequest::CallTagged {
+            tag: "scan.list".into(),
+            name: "scan.list".into(),
+            args: json!({}),
+        })
+        .await
+        .unwrap();
+    let ev = next_where(&mut r.ev_rx, |e| {
+        matches!(e, BusEvent::CallTaggedFailed { .. })
+    })
+    .await;
+    assert_eq!(
+        ev,
+        BusEvent::CallTaggedFailed {
+            tag: "scan.list".into(),
+            name: "scan.list".into(),
+            message: "scan.list is not on this bus".into(),
+        }
+    );
+    assert!(
+        !sent(&r.lines).iter().any(|w| tool_name(w) == "scan.list"),
+        "never sent to the bus"
+    );
+
+    // A tool error (isError) is a tagged failure carrying the tool's message.
+    r.req_tx
+        .send(BusRequest::CallTagged {
+            tag: "scan.cancel:f41".into(),
+            name: "flow.resume".into(),
+            args: json!({"id": "f41"}),
+        })
+        .await
+        .unwrap();
+    let ev = next_where(&mut r.ev_rx, |e| {
+        matches!(e, BusEvent::CallTaggedFailed { .. })
+    })
+    .await;
+    assert_eq!(
+        ev,
+        BusEvent::CallTaggedFailed {
+            tag: "scan.cancel:f41".into(),
+            name: "flow.resume".into(),
+            message: "flow is not intercepted".into(),
+        }
+    );
+    finish(r).await;
+}
+
+/// Scanner v2 T7, spec D5: a tool error from `flow.subscribe` is one Warn
+/// toast with the fixed wording and the session carries on into its first
+/// poll; it is never a `Disconnected`.
+#[tokio::test]
+async fn a_failed_subscribe_is_a_warn_toast_not_a_session_loss() {
+    let rewrite: Rewrite = Arc::new(|req, reply| {
+        if tool_name(req) == "flow.subscribe" {
+            Some(tool_error_reply(req, "nope"))
+        } else {
+            reply
+        }
+    });
+    let mut r = start_rewriting(Duration::from_millis(50), rewrite);
+    let _ = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Connected { .. })).await;
+    let mut toasts = Vec::new();
+    let flows = loop {
+        let ev = timeout(WAIT, r.ev_rx.recv()).await.unwrap().unwrap();
+        match ev {
+            BusEvent::Flows(s) => break s,
+            BusEvent::Toast(level, text) => toasts.push((level, text)),
+            BusEvent::Disconnected(why) => panic!("a failed subscribe lost the session: {why}"),
+            _ => {}
+        }
+    };
+    assert_eq!(
+        toasts,
+        vec![(
+            Level::Warn,
+            "flow.subscribe failed: nope; scan progress will poll only".to_string()
+        )]
+    );
+    assert_eq!(flows.len(), 15, "the first poll follows the warning");
     finish(r).await;
 }

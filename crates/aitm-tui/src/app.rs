@@ -3893,6 +3893,8 @@ impl App {
             BusEvent::Toast(level, text) => self.toast(level, text),
             // An F4 push: whatever it says, the list is stale; poll now.
             BusEvent::Notification(_) => out.push(BusRequest::Refresh),
+            // folded by the scan reducer (Task 5)
+            BusEvent::CallTaggedOk { .. } | BusEvent::CallTaggedFailed { .. } => {}
         }
         out
     }

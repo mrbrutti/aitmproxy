@@ -280,6 +280,10 @@ impl Fixture {
                 self.flows.iter().map(|f| f["id"].clone()).collect(),
             )),
             "flow.table" => Ok(json!({ "flows": self.flows.clone() })),
+            // The TUI subscribes once per connection (scanner v2 D5) and
+            // ignores the value; the fixture has no push sink, so this only
+            // keeps the developer fixture from warning on every connect.
+            "flow.subscribe" => Ok(json!({ "subscribed": true })),
             "flow.get" => Ok(Self::summary(self.flow(&id_arg()?)?)),
             "flow.detail" => Ok(Self::detail(self.flow(&id_arg()?)?)),
             "flow.intercept" => {
