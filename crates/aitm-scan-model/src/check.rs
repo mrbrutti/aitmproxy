@@ -488,4 +488,21 @@ mod tests {
         let back: L4Evidence = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(back, evidence);
     }
+
+    /// Tester: an unknown `scope` token on a catalogue entry is a parse error,
+    /// not a silent fall-back to `point` — the scheduler must never run a check
+    /// at the wrong cadence because a script misspelt its scope.
+    #[test]
+    fn check_meta_with_an_unknown_scope_token_is_an_error() {
+        let json = r#"{
+            "id": "x", "name": "x", "class": "x",
+            "lanes": ["http"], "kinds": ["query"],
+            "intensity": "passive", "cost": "light", "technique": "passive",
+            "severity": "info", "confidence_max": "tentative",
+            "description": "x", "origin": {"kind": "native"},
+            "scope": "everywhere"
+        }"#;
+        let err = serde_json::from_str::<CheckMeta>(json).expect_err("an unknown scope is refused");
+        assert!(err.to_string().contains("everywhere"), "{err}");
+    }
 }

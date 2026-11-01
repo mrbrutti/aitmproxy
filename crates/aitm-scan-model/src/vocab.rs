@@ -720,4 +720,65 @@ mod tests {
             );
         }
     }
+
+    /// Tester: `scan_error` with an empty, multi-line, separator-laden or
+    /// space-padded message produces a string `parse_message` reads back whole:
+    /// the message is never trimmed, re-split or dropped.
+    #[test]
+    fn scan_error_round_trips_edge_messages() {
+        for msg in [
+            "",
+            "a: b: c",
+            "line one\nline two",
+            " padded ",
+            "scan: busy: nested",
+        ] {
+            let text = scan_error(ScanErrorCode::InvalidProfile, msg).to_string();
+            assert_eq!(text, format!("scan: invalid_profile: {msg}"));
+            assert_eq!(
+                ScanErrorCode::parse_message(&text),
+                Some((ScanErrorCode::InvalidProfile, msg)),
+                "{msg:?} must come back whole"
+            );
+        }
+    }
+
+    /// Tester: `UnknownScanErrorCode` is a real `std::error::Error`: it boxes,
+    /// wraps into `anyhow` and is recoverable by downcast with its token.
+    #[test]
+    fn unknown_code_is_a_std_error() {
+        let boxed: Box<dyn std::error::Error> =
+            Box::new("x".parse::<ScanErrorCode>().expect_err("not a code"));
+        assert_eq!(boxed.to_string(), "unknown scan error code `x`");
+
+        let wrapped = anyhow::Error::from("y".parse::<ScanErrorCode>().expect_err("not a code"));
+        assert_eq!(
+            wrapped.downcast_ref::<UnknownScanErrorCode>(),
+            Some(&UnknownScanErrorCode("y".to_string()))
+        );
+    }
+
+    /// Tester (coordinator decision 4): `CheckScope` has exactly three snake_case
+    /// tokens, each round-trips, and anything else — including a wrongly cased
+    /// one — is refused rather than defaulted.
+    #[test]
+    fn check_scope_tokens_are_exactly_three() {
+        for (scope, token) in [
+            (CheckScope::Point, "\"point\""),
+            (CheckScope::Node, "\"node\""),
+            (CheckScope::Origin, "\"origin\""),
+        ] {
+            assert_eq!(serde_json::to_string(&scope).expect("serializes"), token);
+            assert_eq!(
+                serde_json::from_str::<CheckScope>(token).expect("deserializes"),
+                scope
+            );
+        }
+        for junk in ["\"everywhere\"", "\"Point\"", "\"\"", "null", "0"] {
+            assert!(
+                serde_json::from_str::<CheckScope>(junk).is_err(),
+                "{junk} must not read as a scope"
+            );
+        }
+    }
 }

@@ -123,4 +123,112 @@ mod tests {
         let _rx = bus.subscribe();
         assert_eq!(bus.publish(event(1)), 1);
     }
+
+    /// Tester: a subscriber slower than the buffer is told how many events it
+    /// lost (`Lagged(n)`) and then resumes at the newest survivors — progress is
+    /// dropped, never back-pressured, and `seq` lets it see the gap.
+    #[tokio::test]
+    async fn lagged_subscriber_is_told_what_it_missed_then_sees_the_newest() {
+        let bus = JobBus::new(2);
+        let mut rx = bus.subscribe();
+        for seq in 1..=5 {
+            assert_eq!(
+                bus.publish(event(seq)),
+                1,
+                "a full buffer never fails publish"
+            );
+        }
+
+        match rx.recv().await {
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => assert_eq!(n, 3),
+            other => panic!("expected Lagged(3), got {other:?}"),
+        }
+        assert_eq!(rx.recv().await.expect("open").seq, 4);
+        assert_eq!(rx.recv().await.expect("open").seq, 5);
+    }
+
+    /// Tester: every attached subscriber gets every event, a dropped one stops
+    /// counting, and the job keeps publishing after its last listener leaves.
+    #[tokio::test]
+    async fn every_subscriber_receives_every_event_and_dropping_one_is_harmless() {
+        let bus = JobBus::default();
+        let mut a = bus.subscribe();
+        let mut b = bus.subscribe();
+        assert_eq!(bus.receiver_count(), 2);
+
+        assert_eq!(bus.publish(event(1)), 2);
+        assert_eq!(a.recv().await.expect("open"), event(1));
+        assert_eq!(b.recv().await.expect("open"), event(1));
+
+        drop(a);
+        assert_eq!(bus.receiver_count(), 1);
+        assert_eq!(bus.publish(event(2)), 1);
+        assert_eq!(b.recv().await.expect("open").seq, 2);
+
+        drop(b);
+        assert_eq!(bus.receiver_count(), 0);
+        assert_eq!(bus.publish(event(3)), 0, "no listener is not an error");
+    }
+
+    /// Tester: a subscriber sees only what is published after it attached; a
+    /// late UI polls `scan.status` for truth rather than replaying history.
+    #[tokio::test]
+    async fn a_late_subscriber_does_not_see_earlier_events() {
+        let bus = JobBus::default();
+        assert_eq!(bus.publish(event(1)), 0);
+        let mut rx = bus.subscribe();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(bus.publish(event(2)), 1);
+        assert_eq!(rx.recv().await.expect("open").seq, 2);
+    }
+
+    /// Tester: publishing into a full buffer nobody drains never blocks the
+    /// publisher — ten thousand events against a one-slot buffer return at once.
+    #[test]
+    fn publish_never_blocks_on_an_unread_full_buffer() {
+        let bus = JobBus::new(1);
+        let _rx = bus.subscribe();
+        let started = std::time::Instant::now();
+        for seq in 0..10_000 {
+            assert_eq!(bus.publish(event(seq)), 1);
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "publish must not wait on a slow subscriber"
+        );
+    }
+
+    /// Tester: the payload and every field arrive verbatim, nested structure
+    /// included — the bus forwards a `kind` it does not understand untouched.
+    #[tokio::test]
+    async fn event_fields_and_payload_arrive_verbatim() {
+        let bus = JobBus::default();
+        let mut rx = bus.subscribe();
+        let payload = Value::Object(BTreeMap::from([
+            ("state".to_string(), Value::Str("running".to_string())),
+            (
+                "probes".to_string(),
+                Value::Object(BTreeMap::from([
+                    ("sent".to_string(), Value::Int(12)),
+                    ("budget".to_string(), Value::Int(2000)),
+                ])),
+            ),
+            (
+                "lanes".to_string(),
+                Value::Array(vec![Value::Str("http".to_string()), Value::Null]),
+            ),
+        ]));
+        let sent = JobEvent {
+            job: "ld-0001".to_string(),
+            kind: "session.load".to_string(),
+            event: "progress".to_string(),
+            seq: u64::MAX,
+            payload,
+        };
+        assert_eq!(bus.publish(sent.clone()), 1);
+        assert_eq!(rx.recv().await.expect("open"), sent);
+    }
 }

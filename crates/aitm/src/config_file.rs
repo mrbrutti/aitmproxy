@@ -946,6 +946,142 @@ mod tests {
         assert_eq!(s.scanner, ScannerConfig::default());
     }
 
+    /// Tester (spec D11): every key of the `scanner:` section reaches its
+    /// `ScannerConfig` field, all six ceilings included, and the two fields the
+    /// file never sets (`findings_dir`, `l4_allow_agent_inject`) stay at their
+    /// defaults — they are copied from elsewhere by `wire.rs`, not read here.
+    #[test]
+    fn scanner_section_applies_every_key() {
+        let s = parse_settings(concat!(
+            "scanner:\n",
+            "  allow_agent_active: true\n",
+            "  allow_agent_l4_fuzz: true\n",
+            "  max_jobs: 4\n",
+            "  history: 7\n",
+            "  check_timeout_s: 90\n",
+            "  ceilings:\n",
+            "    probes: 1\n",
+            "    time_s: 2\n",
+            "    l4_cases: 3\n",
+            "    l4_bytes_per_s: 4\n",
+            "    ws_frame_bytes: 5\n",
+            "    max_issues: 6\n",
+            "  default_profile: my-api\n",
+            "  profiles:\n",
+            "    my-api:\n",
+            "      name: my-api\n",
+            "      intensity: light\n",
+            "      budget:\n",
+            "        probes: 50\n",
+        ))
+        .expect("the scanner section parses");
+        assert!(s.scanner.allow_agent_active);
+        assert!(s.scanner.allow_agent_l4_fuzz);
+        assert_eq!(s.scanner.max_jobs, 4);
+        assert_eq!(s.scanner.history, 7);
+        assert_eq!(s.scanner.check_timeout_s, 90);
+        assert_eq!(
+            s.scanner.ceilings,
+            aitm_plugin_scanner::Ceilings {
+                probes: 1,
+                time_s: 2,
+                l4_cases: 3,
+                l4_bytes_per_s: 4,
+                ws_frame_bytes: 5,
+                max_issues: 6,
+            }
+        );
+        assert_eq!(s.scanner.default_profile, "my-api");
+        let profile = &s.scanner.profiles["my-api"];
+        assert_eq!(profile.name, "my-api");
+        assert_eq!(profile.intensity, aitm_scan_model::Intensity::Light);
+        assert_eq!(profile.budget.probes, 50);
+        assert!(s.scanner.findings_dir.is_none(), "not a file key");
+        assert!(!s.scanner.l4_allow_agent_inject, "not a file key");
+        // The Stage 1 crawl budgets are not file keys either and keep their defaults.
+        assert_eq!(s.scanner.max_depth, ScannerConfig::default().max_depth);
+    }
+
+    /// Tester: `deny_unknown_fields` holds one level down too — a typo inside
+    /// `ceilings:` or inside a declared profile is refused naming the key, and a
+    /// value of the wrong type is refused rather than coerced.
+    #[test]
+    fn scanner_nested_typos_and_wrong_types_are_errors() {
+        let err = parse_settings("scanner:\n  ceilings:\n    probe: 10\n")
+            .expect_err("a ceilings typo must be refused");
+        assert!(format!("{err:#}").contains("probe"), "{err:#}");
+
+        let err = parse_settings(concat!(
+            "scanner:\n",
+            "  profiles:\n",
+            "    my-api:\n",
+            "      name: my-api\n",
+            "      lane: [http]\n",
+        ))
+        .expect_err("a profile typo must be refused");
+        assert!(format!("{err:#}").contains("lane"), "{err:#}");
+
+        let err = parse_settings(concat!(
+            "scanner:\n",
+            "  profiles:\n",
+            "    my-api:\n",
+            "      name: my-api\n",
+            "      intensity: nuclear\n",
+        ))
+        .expect_err("an unknown enum token must be refused");
+        assert!(format!("{err:#}").contains("nuclear"), "{err:#}");
+
+        assert!(
+            parse_settings("scanner:\n  max_jobs: many\n").is_err(),
+            "a non-integer max_jobs is refused"
+        );
+        assert!(
+            parse_settings("scanner:\n  max_jobs: -1\n").is_err(),
+            "a negative max_jobs is refused, not wrapped"
+        );
+        assert!(
+            parse_settings("scanner:\n  allow_agent_active: yes please\n").is_err(),
+            "a non-boolean gate is refused"
+        );
+    }
+
+    /// Tester: an empty `scanner:` section — the mapping form and the bare key —
+    /// is the engine default, exactly like no section at all.
+    #[test]
+    fn empty_scanner_section_is_default() {
+        for yaml in ["scanner: {}\n", "scanner:\n", "scanner: ~\n"] {
+            let s = parse_settings(yaml).expect("an empty section parses");
+            assert_eq!(s.scanner, ScannerConfig::default(), "{yaml:?}");
+        }
+    }
+
+    /// Tester: a `scanner:` section that only sets one ceiling leaves the other
+    /// five at the engine default and does not disturb the rest of the file.
+    #[test]
+    fn scanner_section_is_independent_of_the_core_sections() {
+        let s = parse_settings(concat!(
+            "listen: 127.0.0.1:9090\n",
+            "scanner:\n",
+            "  ceilings:\n",
+            "    max_issues: 9\n",
+        ))
+        .expect("parses");
+        assert_eq!(s.core.listen.to_string(), "127.0.0.1:9090");
+        assert_eq!(s.scanner.ceilings.max_issues, 9);
+        let defaults = ScannerConfig::default();
+        assert_eq!(s.scanner.ceilings.probes, defaults.ceilings.probes);
+        assert_eq!(s.scanner.ceilings.time_s, defaults.ceilings.time_s);
+        assert_eq!(s.scanner.ceilings.l4_cases, defaults.ceilings.l4_cases);
+        assert_eq!(
+            s.scanner.ceilings.l4_bytes_per_s,
+            defaults.ceilings.l4_bytes_per_s
+        );
+        assert_eq!(
+            s.scanner.ceilings.ws_frame_bytes,
+            defaults.ceilings.ws_frame_bytes
+        );
+    }
+
     /// LF-AC1: a config file with no `macos_capture` section parses to a disabled
     /// feeder config — the deny-by-default on-switch stays off.
     #[test]

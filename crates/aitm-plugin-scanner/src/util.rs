@@ -166,4 +166,82 @@ mod tests {
             Value::Object([("k".to_string(), Value::Int(1))].into_iter().collect())
         );
     }
+
+    /// Tester: the one scrubbing entry point survives the edges every excerpt
+    /// path will feed it — empty input, text with nothing secret in it (returned
+    /// unchanged, so evidence is not mangled) and a megabyte of body.
+    #[test]
+    fn scrub_survives_empty_plain_and_oversized_input() {
+        assert_eq!(scrub(""), "");
+
+        let plain = "GET /search?q=rust HTTP/1.1";
+        assert_eq!(
+            scrub(plain),
+            plain,
+            "text without a secret is returned as is"
+        );
+
+        let big = "x".repeat(1 << 20);
+        assert_eq!(scrub(&big), big, "a plain megabyte comes back whole");
+    }
+
+    /// Tester: a secret in the middle of a large body is still masked — the
+    /// scrubber is not bypassed by surrounding bulk.
+    #[test]
+    fn scrub_masks_a_token_buried_in_a_large_body() {
+        let body = format!(
+            "{}\nAuthorization: Bearer s3cr3tt0k3n\n{}",
+            "a".repeat(100_000),
+            "b".repeat(100_000)
+        );
+        let out = scrub(&body);
+        assert!(!out.contains("s3cr3tt0k3n"), "token survived scrubbing");
+        assert!(
+            out.starts_with("aaaa") && out.ends_with("bbbb"),
+            "the bulk is kept"
+        );
+    }
+
+    /// Tester: numbers at the edges of the JSON model map without wrapping —
+    /// a `u64` past `i64::MAX` becomes a `Float`, `i64::MIN` stays an `Int`,
+    /// and deep nesting is preserved.
+    #[test]
+    fn json_to_value_handles_numbers_at_the_edges_and_nesting() {
+        use aitm_core::Value;
+        assert_eq!(
+            json_to_value(serde_json::json!(u64::MAX)),
+            Value::Float(u64::MAX as f64),
+            "a u64 past i64::MAX is a Float, never a wrapped Int"
+        );
+        assert_eq!(
+            json_to_value(serde_json::json!(i64::MIN)),
+            Value::Int(i64::MIN)
+        );
+        assert_eq!(json_to_value(serde_json::json!(-0.0)), Value::Float(-0.0));
+        assert_eq!(
+            json_to_value(serde_json::json!([[{ "k": [null] }]])),
+            Value::Array(vec![Value::Array(vec![Value::Object(
+                [("k".to_string(), Value::Array(vec![Value::Null]))]
+                    .into_iter()
+                    .collect()
+            )])])
+        );
+        assert_eq!(
+            json_to_value(serde_json::json!({})),
+            Value::Object(Default::default())
+        );
+        assert_eq!(json_to_value(serde_json::json!([])), Value::Array(vec![]));
+    }
+
+    /// Tester: `scan_dir` is a pure join — a relative findings dir stays
+    /// relative and every documented `sub` lands under `scan/`.
+    #[test]
+    fn scan_dir_is_a_pure_join_for_every_documented_sub() {
+        for sub in ["jobs", "issues", "profiles"] {
+            assert_eq!(
+                scan_dir(Path::new("findings"), sub),
+                PathBuf::from(format!("findings/scan/{sub}"))
+            );
+        }
+    }
 }

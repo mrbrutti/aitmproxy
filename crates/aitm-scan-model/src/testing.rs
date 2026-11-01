@@ -470,4 +470,48 @@ mod tests {
         assert_eq!(NullLane.lane(), crate::vocab::LaneKind::Http);
         assert!(NullLane.checks().is_empty());
     }
+
+    /// Tester: the recorder's budget saturates at zero and it keeps answering —
+    /// it is a recorder, not an enforcer, so a check that overspends is visible
+    /// in `payloads()` rather than hidden behind an error.
+    #[test]
+    fn recording_host_budget_saturates_at_zero_and_keeps_answering() {
+        let host = RecordingHost::new(200, "ok");
+        for i in 0..20 {
+            block_on(host.probe(&payload(&i.to_string()))).expect("the recorder keeps answering");
+        }
+        assert_eq!(host.budget_left(), 0);
+        assert_eq!(host.payloads().len(), 20);
+    }
+
+    /// Tester: `probe_raw` is recorded (by URL) and charged like a probe, so a
+    /// handshake-style check's sends are visible to a test too.
+    #[test]
+    fn recording_host_probe_raw_records_the_url_and_charges() {
+        let host = RecordingHost::new(200, "ok");
+        let response = block_on(host.probe_raw(RawProbe {
+            method: "OPTIONS".to_string(),
+            url: "http://127.0.0.1:8080/raw".to_string(),
+            headers: vec![("X-Test".to_string(), "1".to_string())],
+            body: Vec::new(),
+        }))
+        .expect("the stub answers");
+
+        assert_eq!(response.status, Some(200));
+        assert_eq!(
+            host.payloads(),
+            vec!["http://127.0.0.1:8080/raw".to_string()]
+        );
+        assert_eq!(host.budget_left(), 15);
+    }
+
+    /// Tester: an empty payload is a payload — recorded as `""`, charged once.
+    #[test]
+    fn recording_host_records_an_empty_payload() {
+        let host = RecordingHost::new(200, "");
+        let response = block_on(host.probe(&payload(""))).expect("the stub answers");
+        assert!(response.body.is_empty());
+        assert_eq!(host.payloads(), vec![String::new()]);
+        assert_eq!(host.budget_left(), 15);
+    }
 }
