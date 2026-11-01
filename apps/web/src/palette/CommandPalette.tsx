@@ -47,6 +47,8 @@ export const CommandPalette: Component = () => {
   const previous = document.activeElement as HTMLElement | null;
 
   let disposed = false;
+  /** Bumped by every `run`; a reply whose run is no longer the latest ends that run without touching the stage. */
+  let runSeq = 0;
   const close = () => app.openPalette(false);
   onCleanup(() => {
     disposed = true;
@@ -91,7 +93,7 @@ export const CommandPalette: Component = () => {
       const value = await app.call(tool.name, phase.kind === 'begin' ? args : { ...args, _confirm: phase.token });
       if (!isNeedsConfirm(value)) return { kind: 'done', value };
       if (phase.kind === 'confirm') return { kind: 'stale' };
-      return { kind: 'ask', prompt: value.prompt ?? tool.confirm ?? `Confirm ${tool.name}?`, token: value.confirm_token };
+      return { kind: 'ask', prompt: value.prompt, token: value.confirm_token };
     } catch (e) {
       return { kind: 'failed', message: (e as Error).message };
     }
@@ -99,30 +101,35 @@ export const CommandPalette: Component = () => {
 
   /**
    * Where a call's outcome takes the palette. The server's prompt is only shown to a palette still
-   * waiting for it; one that was closed or left meanwhile treats the reply as the end of the run.
-   * A CA run (§D17.12) is released on every ending, never while the prompt is up.
+   * waiting for this very run; one that was closed, left, or moved on to a newer run meanwhile
+   * treats the reply as the end of the run, and a reply from a superseded run never writes the
+   * stage. A CA run (§D17.12) is released on every ending, never while the prompt is up.
    */
-  const settle = async (tool: ToolDef, args: Record<string, unknown>, outcome: Outcome, t0: number) => {
+  const settle = async (tool: ToolDef, args: Record<string, unknown>, outcome: Outcome, t0: number, seq: number) => {
     const ca = isCATrustTool(tool.name);
+    const current = seq === runSeq;
+    const show = (s: Stage) => {
+      if (current) setStage(s);
+    };
     const result = (ok: boolean, value: unknown): Stage => ({ kind: 'result', tool, ok, value, ms: performance.now() - t0, args });
     switch (outcome.kind) {
       case 'ask':
-        if (!disposed && stage().kind === 'running') setStage({ kind: 'confirm', tool, args, prompt: outcome.prompt, token: outcome.token });
+        if (!disposed && current && stage().kind === 'running') setStage({ kind: 'confirm', tool, args, prompt: outcome.prompt, token: outcome.token });
         else if (ca) await releaseCA();
         return;
       case 'done':
-        setStage(result(true, outcome.value));
+        show(result(true, outcome.value));
         if (tool.mutates !== false) void app.refreshSide();
         break;
       case 'stale':
-        setStage(result(false, STALE_CONFIRM_MESSAGE));
+        show(result(false, STALE_CONFIRM_MESSAGE));
         break;
       case 'failed':
         if (ca && isCACancelled(outcome.message)) {
           // The operator dismissed the OS dialog: calm (D17.4), nothing to inspect.
           app.notice(outcome.message, 'info');
-          setStage({ kind: 'list' });
-        } else setStage(result(false, outcome.message));
+          show({ kind: 'list' });
+        } else show(result(false, outcome.message));
         break;
     }
     if (ca) await releaseCA();
@@ -131,10 +138,11 @@ export const CommandPalette: Component = () => {
 
   /** One call of a command: the first by default, the confirming re-send when `phase` carries the token. */
   const run = async (tool: ToolDef, args: Record<string, unknown>, phase: Phase = { kind: 'begin' }) => {
+    const seq = ++runSeq;
     setStage({ kind: 'running', tool });
     const t0 = performance.now();
     if (phase.kind === 'begin' && isCATrustTool(tool.name)) app.setCAInstalling(true);
-    await settle(tool, args, await callFor(tool, args, phase), t0);
+    await settle(tool, args, await callFor(tool, args, phase), t0, seq);
   };
 
   /** The operator declined the bus's prompt: nothing ran, nothing more is sent. */

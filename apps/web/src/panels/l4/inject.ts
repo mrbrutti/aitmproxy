@@ -36,7 +36,7 @@ export type GuardedOutcome =
 export async function beginGuarded(call: Call, tool: string, params: Record<string, unknown>): Promise<GuardedOutcome> {
   try {
     const result = await call(tool, params);
-    if (isNeedsConfirm(result)) return { kind: 'confirm', prompt: result.prompt ?? `Confirm ${tool}?`, token: result.confirm_token };
+    if (isNeedsConfirm(result)) return { kind: 'confirm', prompt: result.prompt, token: result.confirm_token };
     return { kind: 'done', result };
   } catch (e) {
     return { kind: 'refused', message: (e as Error).message };
@@ -78,7 +78,7 @@ function asSent(result: unknown): InjectOutcome | null {
 export async function beginInject(call: Call, args: InjectArgs): Promise<InjectOutcome> {
   try {
     const result = await call('l4.inject', wire(args));
-    if (isNeedsConfirm(result)) return { kind: 'confirm', prompt: result.prompt ?? 'Confirm l4.inject?', token: result.confirm_token };
+    if (isNeedsConfirm(result)) return { kind: 'confirm', prompt: result.prompt, token: result.confirm_token };
     const sent = asSent(result);
     if (sent) return sent;
     return { kind: 'refused', message: 'l4.inject returned an unexpected result' };

@@ -215,11 +215,6 @@ export function placeholderRow(id: string, kind: string): UnionRow {
   };
 }
 
-// ---- operator confirm-over-the-wire (§3.4) ------------------------------------------------------
-
-/** The non-error `needs_confirmation` envelope an operator `l4.inject` returns first (shared with every confirm-gated verb). */
-export { isNeedsConfirm, type NeedsConfirm } from '~/bus/confirm';
-
 // ---- human-friendly PacketSpec YAML (§3.2) ------------------------------------------------------
 //
 // The craft editor authors a `PacketSpec` as human-friendly YAML; this parses the constrained

@@ -7,11 +7,12 @@ import { isRecord } from '~/lib/isRecord';
 
 export interface NeedsConfirm {
   status: 'needs_confirmation';
-  prompt?: string;
+  prompt: string;
   confirm_token: string;
 }
 
-export const isNeedsConfirm = (v: unknown): v is NeedsConfirm => isRecord(v) && v.status === 'needs_confirmation' && typeof v.confirm_token === 'string';
+export const isNeedsConfirm = (v: unknown): v is NeedsConfirm =>
+  isRecord(v) && v.status === 'needs_confirmation' && typeof v.prompt === 'string' && typeof v.confirm_token === 'string';
 
 /** The error shown when the confirming call is answered with another `needs_confirmation`. */
 export const STALE_CONFIRM_MESSAGE = 'confirmation was not accepted (stale or reused token)';

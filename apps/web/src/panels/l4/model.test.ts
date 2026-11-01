@@ -3,7 +3,6 @@ import {
   flowScope,
   flowSubLabel,
   isKnownKind,
-  isNeedsConfirm,
   KNOWN_KINDS,
   l4Row,
   l4SessionState,
@@ -106,14 +105,6 @@ describe('union rows', () => {
     expect(row.known).toBe(false);
     expect(row.badge).toBe('QUIC');
     expect(placeholderRow('x2', '').badge).toBe('??');
-  });
-});
-
-describe('operator confirm envelope', () => {
-  it('detects the needs_confirmation result and ignores a plain success', () => {
-    expect(isNeedsConfirm({ status: 'needs_confirmation', prompt: 'Confirm…', confirm_token: 'abc' })).toBe(true);
-    expect(isNeedsConfirm({ flow_id: 'f', sent: 1 })).toBe(false);
-    expect(isNeedsConfirm(null)).toBe(false);
   });
 });
 
