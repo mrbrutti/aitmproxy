@@ -707,10 +707,29 @@ pub(crate) fn not_found() -> Resp {
     html(StatusCode::NOT_FOUND, "not found")
 }
 
-/// A relative, same-origin path: starts with a single `/` (not `//`, which is a
-/// protocol-relative URL to another host).
+/// A relative, same-origin path: starts with `/` and the second character is
+/// neither `/` nor `\` (browsers read `//host` AND `/\host` as scheme-relative
+/// URLs to another host), nor a percent-encoded `/` or `\` that a second decode
+/// would turn into one (`/%2fhost`, `/%5chost`; the query parser decoded once
+/// already, so these are the double-encoded forms). T3 finding, 2026-11-01.
 fn is_safe_relative(next: &str) -> bool {
-    next.starts_with('/') && !next.starts_with("//")
+    let mut chars = next.chars();
+    if chars.next() != Some('/') {
+        return false;
+    }
+    match chars.next() {
+        None => true,
+        Some('/') | Some('\\') => false,
+        Some('%') => {
+            let enc: String = next[1..]
+                .chars()
+                .take(3)
+                .collect::<String>()
+                .to_ascii_lowercase();
+            !(enc == "%2f" || enc == "%5c")
+        }
+        Some(_) => true,
+    }
 }
 
 /// Hosts an SSRF guard treats as internal: loopback, link-local metadata, and
@@ -1163,6 +1182,52 @@ mod tests {
         let resp = get_on(&state, &conn, "/redirect?next=/%0d%0aX").await;
         assert_eq!(resp.status(), StatusCode::FOUND);
         assert_eq!(location(&resp).as_deref(), Some("/X"));
+    }
+
+    /// T3 (2026-11-01): browsers read `/\host` like `//host`, so the Patched
+    /// allowlist must reject a `\` or `/` second character, also when it arrives
+    /// percent-encoded (once: decoded by the query parser; twice: still literal).
+    #[tokio::test]
+    async fn patched_redirect_rejects_scheme_relative_forms() {
+        let location = |resp: &Resp| {
+            resp.headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let (state, conn) = fresh(SeedMode::Patched);
+        for next in [
+            "//evil.example/",
+            "/\\evil.example/",
+            "/%5cevil.example/",   // one decode -> `/\evil.example/`
+            "/%2fevil.example/",   // one decode -> `//evil.example/`
+            "/%255cevil.example/", // one decode -> `/%5cevil.example/`, still rejected
+            "/%252fevil.example/",
+            "/%5Cevil.example/",
+            "https://evil.example/",
+            "evil.example",
+            "",
+        ] {
+            let resp = get_on(&state, &conn, &format!("/redirect?next={next}")).await;
+            assert_eq!(resp.status(), StatusCode::FOUND, "{next}");
+            assert_eq!(
+                location(&resp).as_deref(),
+                Some("/"),
+                "P must fall back to `/` for {next:?}"
+            );
+        }
+        for next in ["/account?tab=overview", "/", "/a%2fb", "/%41"] {
+            let resp = get_on(&state, &conn, &format!("/redirect?next={next}")).await;
+            assert_eq!(
+                location(&resp).as_deref(),
+                Some(percent_decode(next).as_str()),
+                "P honours a same-origin path {next:?}"
+            );
+        }
+        // Vulnerable still honours every one of them (the seed is the bug).
+        let (state, conn) = fresh(SeedMode::Vulnerable);
+        let resp = get_on(&state, &conn, "/redirect?next=/%5cevil.example/").await;
+        assert_eq!(location(&resp).as_deref(), Some("/\\evil.example/"));
     }
 
     #[tokio::test]
