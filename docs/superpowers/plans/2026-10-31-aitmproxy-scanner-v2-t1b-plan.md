@@ -1649,7 +1649,8 @@ Kept by the main session during stage 6. One row per finding.
 | 13 | Live run 2 | Minor | A failed script load is not visible on the core's stderr (`test_t1_catalogue` core C) | fix dispatched 2026-11-01: one `warn!` line naming the script and the key; subscriber lets warn through |
 | T10 harness | Live run 2 | Important | `aitm_e2e.scan._ERROR_CODE_RE` was `[a-z_]+`, so `refused_l4` never parsed (`test_t6_gates` all `?`) | fixed in 6ec7e0b7 (integration-shared helper; one character) |
 | T10 cell | Live run 2 | Minor | `test_t1_finding_link` counted the issue/job JSON under `scan/` as finding files | fixed in d3867d40: FindingRecord files only |
-| T4 lane | Live run 2 | Important | `test_t4_cswsh`/`test_t4_injection_oversize` finish `done` with 0 issues under the engine (`test_t4_points` passes) | diagnostic driver p13 in progress |
+| T4 lane | Live run 2 | Important | `test_t4_cswsh`/`test_t4_injection_oversize` finish `done` with 0 issues under the engine (`test_t4_points` passes) | p13 shows the engine raises 5 WS issues (`cswsh`, `ws-input-reflection`, `ws-oversize-frame`, `ws-subprotocol`); the cells assert the pinned `ws-cswsh`/`ws-injection` names: T4-vs-T10 vocabulary mismatch, raised with the coordinator 2026-11-01 |
+| 14 | Live run 2 (p13) | Important | WS stimuli charged through `JobCtx::charge` are not counted in `probes.sent`/`probes.by_lane` (a 13-check WS job reports `sent: 0`, `by_lane: {}`) | whole-branch fix round: `charge(units)` adds to `probes.sent` and `by_lane[<lane being run>]` |
 | T2/T3 cells | Live run 2 | Note | `test_t2_*` (5) and `test_t3_version_override` FAIL rather than SKIP: they need T2's lane / T3's HttpSender, not on this build | expected until those PRs merge; stated in the PR body |
 
 ## Shipped
