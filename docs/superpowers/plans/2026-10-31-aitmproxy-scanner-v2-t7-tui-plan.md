@@ -677,6 +677,11 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | quality | Minor | H6's justification off by one at exactly `COLUMN_MIN` | fix round H (H17) |
 | H | security | Important (TUI) | `Mode::WireConfirm` has no body arm; the Scan launch confirm draws over the Flows view | fix round H Rust (H18) |
 | H | security | Important (core) | `l4.scope.add` refuses `interface: "*"` (`validate_interface`, #218); blocks the live UI-3 cleared-gate proof | relayed to the coordinator for the core track; the cell notes the refusal honestly |
+| H (cell) | fix round | done | H12-H17 in `d2b3c7bf`; `--selftest` 30 ok; py_compile and discovery clean | cell complete pending the Terminal run (with the combined panel's spec look) |
+| H (cell) | coder note | Minor | H13 matches the uncut `node_row_head` rather than the 40-cut needle plus `  flows` | ratified |
+| H (cell) | coder note | Minor | H15 paints the overlay over three bodies (inspector, flows, Scan) and asserts the secret prefix is visible beside the box over the inspector body | ratified; the Scan-body row proves H18's effect |
+| H (cell) | coder note | note | other harness reads still catch `(ToolError, BusError)` only; a socket timeout surfaces as a redacted FAIL | accepted |
+| H | core | resolved | `l4.scope.add` accepts `interface: "*"` on T1b's PR #232 at abaf5264 (coordinator, 2026-11-01) | proof core re-pointed at abaf5264 |
 
 ## Shipped
 

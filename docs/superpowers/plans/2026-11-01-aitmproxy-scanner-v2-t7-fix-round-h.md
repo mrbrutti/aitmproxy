@@ -49,6 +49,10 @@ H16. H2's lost-reply path is a socket timeout (`OSError`), not a `BusError`: cat
 
 H17. H6's justification is off by one (`fit` renders 7 chars plus `…` at exactly `COLUMN_MIN`): make the row-name comparison ellipsis-tolerant (`cell.endswith("…") and needle.startswith(cell[:-1])`) and state the 200-column arithmetic in the comment.
 
+## Round H cell H12-H17 result (2026-11-01)
+
+Done, one commit `d2b3c7bf` (+197/-44); `--selftest` 30 ok (8 new rows: n=13 marker negative, root-node exact match, path matched whole, three WireConfirm bodies incl. the secret-prefix visibility beside the box, `OSError` scope read, COLUMN_MIN name cell); py_compile and discovery clean; the sandbox run dies at the bind denial before any claim. H13 uses the uncut `node_row_head` (`"{:<4} {}  flows"`) instead of the 40-cut needle (ratified: strictly more faithful). The cell is complete pending the Terminal run; the live run's core carries the `interface "*"` fix (T1b abaf5264), so the cleared-gate sub-steps run for real.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
