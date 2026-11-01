@@ -14,6 +14,7 @@
 //! `aitm web [--listen ADDR] [--token TOKEN] [--no-open]` is the server path
 //! plus the embedded web UI and its `/bus` bridge (`aitm::web`, F15).
 
+use std::future::Future;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Pl
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
-use aitm_sysproxy::Recovery;
+use aitm_sysproxy::{Recovery, SystemProxy};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
@@ -140,6 +141,30 @@ fn parse_sysproxy_watchdog(rest: &[String]) -> Result<Mode, String> {
 /// never touch the system proxy from `main` (spec §D10).
 fn manages_system_proxy(mode: &Mode) -> bool {
     matches!(mode, Mode::Server | Mode::Tui | Mode::Web)
+}
+
+/// Pre-bind every service port, then — and only then — run the §D9 (c)
+/// startup recovery (plan 2026-10-31-system-proxy-automation, fix F2). `bind`
+/// is the whole pre-bind block of `run`; when it fails (the "already in use"
+/// error) that error is returned and the system proxy is untouched: a core
+/// that cannot serve must never point the OS at itself, so nothing is left
+/// for the watchdog or the exit path to undo. Serving modes only (plan C5);
+/// a one-shot process never reaches this.
+async fn bind_then_recover_system_proxy<T, F>(
+    mode: &Mode,
+    sysproxy: &SystemProxy,
+    auto: bool,
+    bind: F,
+) -> anyhow::Result<T>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    let bound = bind.await?;
+    if manages_system_proxy(mode) {
+        let recovery = sysproxy.recover_at_startup(auto);
+        log_recovery("startup", &recovery);
+    }
+    Ok(bound)
 }
 
 /// One log line per recovery outcome: `warn!` when it failed, `info!`
@@ -475,64 +500,81 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // §D9 (c): before serving, judge any leftover state file (reboot, power
-    // loss, a killed watchdog) and, with `system_proxy.auto`, point the system
-    // proxy at this core. Serving modes only (plan C5); a one-shot process
-    // returned above. Blocking shell-outs, but nothing is served yet.
-    if manages_system_proxy(&mode) {
-        let recovery = sysproxy.recover_at_startup(system_proxy.auto);
-        log_recovery("startup", &recovery);
-    }
-
     // Pre-bind every service port up front, before obscura is spawned and before
     // any "listening" success line. A port conflict is then ONE clear, actionable
     // error here — which port, who likely holds it, how to change it — never a
     // cryptic os-error-48 printed after `aitm web` already announced the UI. This
     // covers bare `aitm`, `aitm tui` and `aitm web` alike: the proxy and the
     // browser's proxy port here, and the web UI port just below for `aitm web`.
+    //
+    // Only once every port is ours does §D9 (c) run (`bind_then_recover_system_proxy`,
+    // fix F2): judge any leftover state file (reboot, power loss, a killed
+    // watchdog) and, with `system_proxy.auto`, point the system proxy at this
+    // core. A bind failure returns before that, so a core that cannot serve never
+    // points the OS at itself. Serving modes only (plan C5); a one-shot process
+    // returned above. Blocking shell-outs, but nothing is served yet.
+    //
+    // The bound addresses are read inside this block too: after the startup set,
+    // no `?` remains before the `select!`, so the §D9 (a) restore below is reached
+    // on every path.
     let config_display = config_path
         .unwrap_or_else(config_file::default_config_path)
         .display()
         .to_string();
-    let proxy_listener = bind_service_port(
-        cfg.listen,
-        "the proxy",
-        &format!("Free it, or set `listen:` to another address in {config_display}."),
-    )
-    .await?;
-    let browser_listener = bind_service_port(
-        cfg.browser.proxy_addr,
-        "the embedded browser's proxy",
-        &format!("Free it, or set `browser.proxy_addr:` to another address in {config_display}."),
-    )
-    .await?;
-    // `aitm web`: the UI port is pre-bound here too, so a web-port conflict is
-    // caught before obscura spawns, not after. The collision against the proxy /
-    // browser ports is named here because a shared address would otherwise
-    // surface only as a bare "address in use".
-    let web_listener = match &web_settings {
-        Some(settings) => {
-            for (what, addr) in [
-                ("proxy listen", cfg.listen),
-                ("browser.proxy_addr", cfg.browser.proxy_addr),
-            ] {
-                anyhow::ensure!(
-                    settings.listen != addr,
-                    "web UI --listen {} collides with {what} ({addr}); pick another port",
-                    settings.listen
-                );
-            }
-            Some(
-                bind_service_port(
-                    settings.listen,
-                    "the web UI",
-                    "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN).",
-                )
-                .await?,
+    let (proxy_listener, browser_listener, web_listener, proxy_addr, browser_addr) =
+        bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
+            let proxy_listener = bind_service_port(
+                cfg.listen,
+                "the proxy",
+                &format!("Free it, or set `listen:` to another address in {config_display}."),
             )
-        }
-        None => None,
-    };
+            .await?;
+            let browser_listener = bind_service_port(
+                cfg.browser.proxy_addr,
+                "the embedded browser's proxy",
+                &format!(
+                    "Free it, or set `browser.proxy_addr:` to another address in {config_display}."
+                ),
+            )
+            .await?;
+            // `aitm web`: the UI port is pre-bound here too, so a web-port conflict is
+            // caught before obscura spawns, not after. The collision against the proxy /
+            // browser ports is named here because a shared address would otherwise
+            // surface only as a bare "address in use".
+            let web_listener = match &web_settings {
+                Some(settings) => {
+                    for (what, addr) in [
+                        ("proxy listen", cfg.listen),
+                        ("browser.proxy_addr", cfg.browser.proxy_addr),
+                    ] {
+                        anyhow::ensure!(
+                            settings.listen != addr,
+                            "web UI --listen {} collides with {what} ({addr}); pick another port",
+                            settings.listen
+                        );
+                    }
+                    let listener = bind_service_port(
+                        settings.listen,
+                        "the web UI",
+                        "Free it, or pass `--listen 127.0.0.1:<port>` (env AITM_WEB_LISTEN).",
+                    )
+                    .await?;
+                    let bound = listener.local_addr()?;
+                    Some((listener, bound))
+                }
+                None => None,
+            };
+            let proxy_addr = proxy_listener.local_addr()?;
+            let browser_addr = browser_listener.local_addr()?;
+            Ok((
+                proxy_listener,
+                browser_listener,
+                web_listener,
+                proxy_addr,
+                browser_addr,
+            ))
+        })
+        .await?;
 
     // Server path: launch the configured engine so the browser.* commands reach
     // a live driver. No fallback to the other engine.
@@ -652,14 +694,11 @@ async fn run() -> anyhow::Result<()> {
         // server keeps its own subscription registry and only `serve` spawns a
         // dispatcher, so without this a `/bus` subscription would sit in a
         // registry nothing feeds.
-        // Read both pre-bound listen addresses before the `web_server` block;
-        // the listeners are still owned here and move into `proxy.run_on` /
-        // `proxy.run_browser_on` below, so the startup summary captures their
-        // addresses now.
-        let proxy_addr = proxy_listener.local_addr()?;
-        let browser_addr = browser_listener.local_addr()?;
+        // Both pre-bound listen addresses were read in the pre-bind block above
+        // (the listeners move into `proxy.run_on` / `proxy.run_browser_on`
+        // below), so the startup summary has them without another fallible step.
         let web_server = match (web_settings, web_listener) {
-            (Some(settings), Some(listener)) => {
+            (Some(settings), Some((listener, bound))) => {
                 let bus = Arc::new(
                     tui::with_shared_governance(
                         tui::server(&cfg, cfg.mcp.transport.clone(), &services),
@@ -698,8 +737,7 @@ async fn run() -> anyhow::Result<()> {
                     );
                 }
                 // The UI listener was pre-bound up front (collision checks and
-                // all), so here we just read its address and serve on it.
-                let bound = listener.local_addr()?;
+                // all) and its address read there, so here we just serve on it.
                 let url = web::ui_url(bound, &settings.token);
                 // Log only the bound address; the token must never reach a
                 // tracing sink. The one-time summary println is the operator's
@@ -745,10 +783,11 @@ async fn run() -> anyhow::Result<()> {
         }
     };
 
-    // §D9 (a): whichever arm ended the run, give the system proxy back before
-    // anything else — a dead port is never acceptable — whether or not `auto`
-    // set it. Runs ahead of the browser reap so the restore lands inside the
-    // mac app's stop grace even when the browser is slow to close.
+    // §D9 (a): whichever arm ended the run, and whether `result` is `Ok` or
+    // `Err`, give the system proxy back before anything else — a dead port is
+    // never acceptable — whether or not `auto` set it. Runs ahead of the browser
+    // reap so the restore lands inside the mac app's stop grace even when the
+    // browser is slow to close. (`result` is only returned after this; fix F2.)
     if manages_system_proxy(&mode) {
         let recovery = sysproxy.on_orderly_exit();
         log_recovery("exit", &recovery);
@@ -918,16 +957,24 @@ async fn bind_service_port(
 ) -> anyhow::Result<TcpListener> {
     match TcpListener::bind(addr).await {
         Ok(listener) => Ok(listener),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => anyhow::bail!(
-            "cannot start: {role} port {addr} is already in use.\n\
-             It is most likely held by another running `aitm`, the aitmproxy macOS app's \
-             embedded core, or another program.\n\
-             {remedy}\n\
-             Find the holder with:  lsof -nP -iTCP:{port} -sTCP:LISTEN",
-            port = addr.port(),
-        ),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            Err(addr_in_use_error(addr, role, remedy))
+        }
         Err(e) => Err(anyhow::Error::new(e).context(format!("binding {role} on {addr}"))),
     }
+}
+
+/// The one "already in use" error [`bind_service_port`] returns: the port, who
+/// most likely holds it, and how to change it.
+fn addr_in_use_error(addr: std::net::SocketAddr, role: &str, remedy: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "cannot start: {role} port {addr} is already in use.\n\
+         It is most likely held by another running `aitm`, the aitmproxy macOS app's \
+         embedded core, or another program.\n\
+         {remedy}\n\
+         Find the holder with:  lsof -nP -iTCP:{port} -sTCP:LISTEN",
+        port = addr.port(),
+    )
 }
 
 #[cfg(test)]
@@ -942,10 +989,14 @@ mod tests {
 
     use aitm::wire::{build_proxy_with, Features};
 
+    use aitm_ca::exec::Executor;
+    use aitm_ca::testing::ScriptedExecutor;
+    use aitm_sysproxy::{Endpoint, Mechanism, SystemProxy, SystemProxyConfig, STATE_FILE_NAME};
+
     use super::{
-        apply_bus_endpoint_file, build_env_filter, manages_system_proxy, parse_mode,
-        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Mode,
-        OPERATOR_TOKEN_USAGE,
+        addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
+        build_env_filter, manages_system_proxy, parse_mode, split_bus_endpoint_file_arg,
+        split_config_arg, split_script_args, Mode, OPERATOR_TOKEN_USAGE,
     };
 
     fn args(a: &[&str]) -> Vec<String> {
@@ -1357,6 +1408,146 @@ mod tests {
             state: PathBuf::from("/x"),
             no_pipe: false,
         }));
+    }
+
+    /// A scripted macOS engine for `127.0.0.1:18080` with one enabled service
+    /// (`Wi-Fi`, proxy off) and its state file in a fresh temp dir. Every read a
+    /// `set` makes is answered, so a `set` that runs renders the `-set*` lines.
+    fn scripted_sysproxy(tag: &str) -> (Arc<ScriptedExecutor>, SystemProxy, PathBuf) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("aitm-main-sysproxy-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let off = "Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0\n";
+        let exec = Arc::new(
+            ScriptedExecutor::new()
+                .respond(
+                    "/usr/sbin/networksetup -listallnetworkservices",
+                    0,
+                    "An asterisk (*) denotes that a network service is disabled.\nWi-Fi\n",
+                    "",
+                )
+                .respond("/usr/sbin/networksetup -getwebproxy Wi-Fi", 0, off, "")
+                .respond(
+                    "/usr/sbin/networksetup -getsecurewebproxy Wi-Fi",
+                    0,
+                    off,
+                    "",
+                )
+                .respond(
+                    "/usr/sbin/networksetup -getproxybypassdomains Wi-Fi",
+                    0,
+                    "*.local\n169.254/16\n",
+                    "",
+                )
+                .with_real_fs(),
+        );
+        let cfg = SystemProxyConfig {
+            auto: true,
+            bypass: vec![],
+            state_file: Some(dir.join(STATE_FILE_NAME)),
+        };
+        let as_exec: Arc<dyn Executor> = exec.clone();
+        let ours = Endpoint {
+            host: "127.0.0.1".into(),
+            port: 18080,
+        };
+        let sp = SystemProxy::with_mechanism(as_exec, &cfg, ours, None, Mechanism::Networksetup);
+        (exec, sp, dir)
+    }
+
+    fn mutating_lines(exec: &ScriptedExecutor) -> Vec<String> {
+        exec.runs()
+            .into_iter()
+            .filter(|l| l.contains(" -set") || l.contains("gsettings set"))
+            .collect()
+    }
+
+    /// Fix F2 (live proof, Task 14): with `system_proxy.auto` on and the proxy
+    /// port already taken, the core must fail with the "already in use" error
+    /// and leave the system proxy untouched — it never points the OS at a port
+    /// it cannot serve. The bind future here fails exactly as
+    /// `bind_service_port` does on `AddrInUse` (the sandbox cannot bind a real
+    /// port, so the conflict is not staged with a second listener).
+    #[tokio::test]
+    async fn port_conflict_never_sets_the_system_proxy() {
+        let (exec, sp, dir) = scripted_sysproxy("conflict");
+        let addr: std::net::SocketAddr = "127.0.0.1:18080".parse().unwrap();
+        let err = bind_then_recover_system_proxy(&Mode::Server, &sp, true, async {
+            Err::<(), _>(addr_in_use_error(
+                addr,
+                "the proxy",
+                "Free it, or set `listen:` to another address in aitm.yaml.",
+            ))
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot start: the proxy port 127.0.0.1:18080 is already in use."),
+            "{err}"
+        );
+        assert_eq!(
+            mutating_lines(&exec),
+            Vec::<String>::new(),
+            "a core that cannot bind must not set the system proxy"
+        );
+        assert_eq!(
+            exec.runs(),
+            Vec::<String>::new(),
+            "recovery never ran: not even a read"
+        );
+        assert!(
+            !dir.join(STATE_FILE_NAME).exists(),
+            "no state file: nothing for the watchdog or the exit path to undo"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the ordering: once the ports are bound, the §D9 (c)
+    /// recovery runs and `auto` points the system proxy at this core — and in
+    /// a serving mode only (plan C5).
+    #[tokio::test]
+    async fn startup_recovery_sets_the_system_proxy_once_the_ports_are_bound() {
+        let (exec, sp, dir) = scripted_sysproxy("bound");
+        let bound =
+            bind_then_recover_system_proxy(&Mode::Cli(args(&["flow", "list"])), &sp, true, async {
+                Ok(("proxy", "browser"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(bound, ("proxy", "browser"));
+        assert_eq!(
+            exec.runs(),
+            Vec::<String>::new(),
+            "a one-shot mode never recovers"
+        );
+
+        let bound = bind_then_recover_system_proxy(&Mode::Server, &sp, true, async {
+            Ok(("proxy", "browser"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            bound,
+            ("proxy", "browser"),
+            "the bound listeners come back untouched"
+        );
+        assert_eq!(
+            mutating_lines(&exec),
+            [
+                "/usr/sbin/networksetup -setwebproxy Wi-Fi 127.0.0.1 18080",
+                "/usr/sbin/networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 18080",
+                "/usr/sbin/networksetup -setproxybypassdomains Wi-Fi *.local 169.254/16 localhost 127.0.0.1 ::1",
+            ]
+        );
+        assert!(
+            dir.join(STATE_FILE_NAME).is_file(),
+            "the state file is on disk for the exit path to restore from"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
