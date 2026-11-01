@@ -118,3 +118,151 @@ describe('Toolbar system-proxy pill', () => {
     await waitFor(() => expect(written).toEqual([UNSUPPORTED.guidance]));
   });
 });
+
+// ---- tester additions (stage 5): the in-flight word and title, the operator gate, word order, the empty detail row ----
+
+/** Like `mount`, with the knobs the cases below need: the bus role, the armed flag, a mutable status, and a held set reply. */
+function mountWith(opts: { status: unknown; role?: 'operator' | 'agent' | null; armed?: boolean; hold?: Promise<unknown> }) {
+  const mem = memoryBus();
+  const calls: string[] = [];
+  const ctl = { status: opts.status as unknown };
+  const bus: BusClient = {
+    ...mem,
+    role: () => (opts.role === undefined ? 'operator' : opts.role),
+    async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
+      if (tool === 'proxy.system.set' || tool === 'proxy.system.unset') {
+        calls.push(tool);
+        if (opts.hold) return (await opts.hold) as T;
+        return POINTS_AT_US as T;
+      }
+      const result = await mem.call<T>(tool, args);
+      if (tool === 'proxy.status') {
+        const r = result as Record<string, unknown>;
+        return { ...r, system_proxy: ctl.status, ...(opts.armed ? { intercept_armed: true } : {}) } as T;
+      }
+      return result;
+    },
+  };
+  const app = createAppStore(bus);
+  render(() => (
+    <AppProvider store={app}>
+      <Toolbar />
+    </AppProvider>
+  ));
+  return { bus, app, calls, ctl };
+}
+
+const OFF = { state: 'off', host: null, port: null, managed_by_us: false, setting: false, supported: true, detail: 'HTTP and HTTPS off' };
+const NEEDS_ADMIN = { state: 'needs_privilege', host: null, port: null, managed_by_us: false, setting: false, supported: true, detail: 'HTTP and HTTPS off', remedy: 'The system proxy needs an administrator.' };
+
+describe('Toolbar system-proxy pill (tester)', () => {
+  it('shows · sys-proxy setting… and the disabled in-flight item until the reply, then the new word', async () => {
+    let release!: (v: unknown) => void;
+    const hold = new Promise<unknown>((r) => (release = r));
+    let app, calls: string[], ctl: { status: unknown };
+    ({ bus, app, calls, ctl } = mountWith({ status: OFF, hold }));
+    await waitFor(() => expect(app.proxy.systemProxy?.state).toBe('off'));
+    expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy off');
+
+    fireEvent.click(pill());
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Set as system proxy' }));
+    await waitFor(() => expect(calls).toEqual(['proxy.system.set']));
+
+    // In flight: the pill word is the D12 working row, and the reopened menu's item is disabled with its title.
+    await waitFor(() => expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy setting…'));
+    expect(app.proxy.systemProxySetting).toBe(true);
+    fireEvent.click(pill());
+    const item = screen.getByRole('menuitemradio', { name: 'Set as system proxy' }) as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+    expect(item.title).toBe('setting system proxy…');
+    fireEvent.click(item); // a disabled item sends nothing
+    expect(calls).toEqual(['proxy.system.set']);
+
+    ctl.status = POINTS_AT_US; // the core's next poll agrees with the reply
+    release(POINTS_AT_US);
+    await waitFor(() => expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy → us'));
+    expect(app.proxy.systemProxySetting).toBe(false);
+  });
+
+  it('on a non-operator connection the item is disabled with the operator-token title and sends nothing', async () => {
+    let app, calls: string[];
+    ({ bus, app, calls } = mountWith({ status: OFF, role: 'agent' }));
+    await waitFor(() => expect(app.proxy.systemProxy?.state).toBe('off'));
+
+    fireEvent.click(pill());
+    const item = screen.getByRole('menuitemradio', { name: 'Set as system proxy' }) as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+    expect(item.title).toBe('connect with the operator token to change the system proxy');
+    expect(item.getAttribute('aria-checked')).toBe('false');
+    fireEvent.click(item);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(calls).toEqual([]);
+    // The word itself does not depend on the role.
+    expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy off');
+  });
+
+  it('puts the pill word after the address and before · intercept armed (D14/D15 order)', async () => {
+    let app;
+    ({ bus, app } = mountWith({ status: OTHER, armed: true }));
+    await waitFor(() => expect(app.proxy.systemProxy?.state).toBe('other'));
+    await waitFor(() => expect(app.proxy.armed).toBe(true));
+
+    expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy → 127.0.0.1:9090 · intercept armed');
+  });
+
+  it('needs_privilege: the pill says needs admin; the item is disabled with the remedy as its title', async () => {
+    let app;
+    ({ bus, app } = mountWith({ status: NEEDS_ADMIN }));
+    await waitFor(() => expect(app.proxy.systemProxy?.state).toBe('needs_privilege'));
+    expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy needs admin');
+
+    fireEvent.click(pill());
+    const item = screen.getByRole('menuitemradio', { name: 'Set as system proxy' }) as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+    expect(item.title).toBe('The system proxy needs an administrator.');
+    expect(screen.queryByRole('menuitem', { name: 'Copy env line' })).toBeNull();
+  });
+
+  it('an empty detail suppresses the detail row: the menu is the checkbox alone', async () => {
+    let app;
+    ({ bus, app } = mountWith({ status: { ...OFF, detail: '' } }));
+    await waitFor(() => expect(app.proxy.systemProxy?.state).toBe('off'));
+
+    fireEvent.click(pill());
+    const menu = screen.getByRole('menu', { name: 'System proxy' });
+    expect(menu.querySelectorAll('[role^="menuitem"]').length).toBe(1);
+    expect(screen.getByRole('menuitemradio', { name: 'Set as system proxy' })).toBeTruthy();
+  });
+
+  it('a core older than the field: no word, the menu still opens, its only item is disabled without a title', async () => {
+    let app;
+    ({ bus, app } = mountWith({ status: undefined }));
+    // The bootstrap read has landed once the address is on the store; system_proxy is absent from it.
+    await waitFor(() => expect(app.proxy.address).toBe('127.0.0.1:8080'));
+    expect(app.proxy.systemProxy).toBeNull();
+    expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080');
+
+    fireEvent.click(pill());
+    const menu = screen.getByRole('menu', { name: 'System proxy' });
+    expect(menu.querySelectorAll('[role^="menuitem"]').length).toBe(1);
+    const item = screen.getByRole('menuitemradio', { name: 'Set as system proxy' }) as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+    expect(item.title).toBe('');
+  });
+
+  it('a refused set does not leave the pill stuck on setting…: the word returns and the error is on the toast', async () => {
+    let app, calls: string[];
+    const hold = Promise.reject(new Error('a system-proxy change is already in flight'));
+    hold.catch(() => {}); // the store consumes it; keep node quiet about the early rejection
+    ({ bus, app, calls } = mountWith({ status: OFF, hold }));
+    await waitFor(() => expect(app.proxy.systemProxy?.state).toBe('off'));
+
+    fireEvent.click(pill());
+    fireEvent.click(screen.getByRole('menuitemradio', { name: 'Set as system proxy' }));
+    await waitFor(() => expect(calls).toEqual(['proxy.system.set']));
+
+    await waitFor(() => expect(app.toast()).toEqual({ text: 'system proxy: a system-proxy change is already in flight', kind: 'error' }));
+    expect(app.proxy.systemProxySetting).toBe(false);
+    expect(pill().textContent).toBe('aitmproxy · listening 127.0.0.1:8080 · sys-proxy off');
+  });
+});

@@ -204,3 +204,103 @@ describe('app store — setSystemProxy / unsetSystemProxy', () => {
     expect(app.toast()?.text).toBe('system proxy: proxy.system.unset: not serving');
   });
 });
+
+// ---- tester additions (stage 5): the two flags are distinct, a failed poll keeps the last status, malformed replies ----
+
+describe('app store — system proxy edge cases (tester)', () => {
+  it('another client’s in-flight set arrives as systemProxy.setting, and our own flag stays false', async () => {
+    const { bus, app } = start(sysproxyBus({ status: { ...OFF, setting: true } }));
+
+    await tick(200);
+
+    expect(app.proxy.systemProxy?.setting).toBe(true);
+    expect(app.proxy.systemProxy?.state).toBe('off');
+    expect(app.proxy.systemProxySetting).toBe(false);
+    expect(bus.sys.calls).toEqual([]); // nothing of ours was sent
+  });
+
+  it('a failed proxy.status poll keeps the last system-proxy status (the catch path does not wipe it)', async () => {
+    const { bus, app } = start(sysproxyBus({ status: OTHER }));
+    await tick(200);
+    expect(app.proxy.systemProxy?.state).toBe('other');
+    const statuses = bus.count('proxy.status');
+
+    bus.ctl.failStatus = 1;
+    await tick(2500);
+
+    expect(bus.count('proxy.status')).toBeGreaterThan(statuses); // the poll ran and threw
+    expect(app.proxy.systemProxy?.state).toBe('other');
+    expect(app.proxy.systemProxy?.port).toBe(9090);
+  });
+
+  it('a system_proxy that is not an object (a string, an array) leaves the store at null', async () => {
+    const { bus, app } = start(sysproxyBus({ status: 'points_at_us' }));
+    await tick(200);
+    expect(app.proxy.systemProxy).toBeNull();
+
+    bus.sys.status = [POINTS_AT_US];
+    await tick(2500);
+    expect(app.proxy.systemProxy).toBeNull();
+
+    bus.sys.status = POINTS_AT_US; // and recovers on the next well-formed poll
+    await tick(2500);
+    expect(app.proxy.systemProxy?.state).toBe('points_at_us');
+  });
+
+  it('a state string the client does not know is stored as unknown (no word, no crash), detail kept', async () => {
+    const { app } = start(sysproxyBus({ status: { ...OFF, state: 'teleported', detail: 'from a newer core' } }));
+
+    await tick(200);
+
+    expect(app.proxy.systemProxy?.state).toBe('unknown');
+    expect(app.proxy.systemProxy?.detail).toBe('from a newer core');
+  });
+
+  it('a set whose reply is not a status object clears the flag, stores null, raises no error, and the next poll refills', async () => {
+    const { bus, app } = start(sysproxyBus({ status: OFF }));
+    await tick(200);
+    bus.sys.reply = 'ok';
+    bus.sys.status = POINTS_AT_US; // what the core will say on the next poll
+
+    const done = app.setSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(app.proxy.systemProxySetting).toBe(false);
+    expect(app.proxy.systemProxy).toBeNull();
+    expect(app.toast()).toBeNull();
+
+    await tick(2500);
+    expect(app.proxy.systemProxy?.state).toBe('points_at_us');
+  });
+
+  it('a set reply with a newer state string is stored as unknown rather than dropped', async () => {
+    const { bus, app } = start(sysproxyBus({ status: OFF }));
+    await tick(200);
+    bus.sys.reply = { ...POINTS_AT_US, state: 'half_set', changed: true, commands: [] };
+
+    const done = app.setSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(app.proxy.systemProxy?.state).toBe('unknown');
+    expect(app.proxy.systemProxy?.detail).toBe(POINTS_AT_US.detail);
+    expect(app.proxy.systemProxySetting).toBe(false);
+  });
+
+  it('the refusal toast carries the core’s message verbatim after the "system proxy: " prefix (an agent-token refusal)', async () => {
+    const { bus, app } = start(sysproxyBus({ status: OFF }));
+    await tick(200);
+    bus.sys.fail = 'proxy.system.set: operator only';
+
+    const done = app.setSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(app.toast()).toEqual({ text: 'system proxy: proxy.system.set: operator only', kind: 'error' });
+    // An error toast lives 6 s, then clears; the flag was already down.
+    await tick(6100);
+    expect(app.toast()).toBeNull();
+    expect(app.proxy.systemProxySetting).toBe(false);
+  });
+});

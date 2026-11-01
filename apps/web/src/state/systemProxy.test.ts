@@ -169,3 +169,114 @@ describe('menuState (D15 menu button)', () => {
     expect(menuState(unsupported, false, 'operator').showCopyEnv).toBe(false);
   });
 });
+
+// ---- tester additions (stage 5): degenerate inputs, the fallback fields, and the menu's precedence ----
+
+describe('parseSystemProxy — degenerate fields (tester)', () => {
+  it('drops a non-finite port and a non-object detail; a string "true" is not a boolean', () => {
+    const s = parseSystemProxy({ state: 'other', host: '10.0.0.1', port: Number.NaN, managed_by_us: 'true', setting: 'yes', detail: 42 });
+    expect(s).toEqual({
+      state: 'other',
+      host: '10.0.0.1',
+      port: null,
+      managed_by_us: false,
+      setting: false,
+      supported: true,
+      detail: '',
+      guidance: null,
+      remedy: null,
+    });
+    expect(parseSystemProxy({ state: 'other', port: Number.POSITIVE_INFINITY })?.port).toBeNull();
+    expect(parseSystemProxy({ state: 'other', port: -1 })?.port).toBe(-1); // passed through: the core owns the range
+  });
+
+  it('derives `supported` from the state only when the field is absent', () => {
+    expect(parseSystemProxy({ state: 'unsupported' })?.supported).toBe(false);
+    expect(parseSystemProxy({ state: 'other' })?.supported).toBe(true);
+    expect(parseSystemProxy({ state: 'unknown' })?.supported).toBe(true);
+    // Explicit wins over the derivation, in both directions.
+    expect(parseSystemProxy({ state: 'off', supported: false })?.supported).toBe(false);
+    expect(parseSystemProxy({ state: 'unsupported', supported: true })?.supported).toBe(true);
+  });
+
+  it('an empty object is a status with state unknown, not null', () => {
+    expect(parseSystemProxy({})).toEqual({
+      state: 'unknown',
+      host: null,
+      port: null,
+      managed_by_us: false,
+      setting: false,
+      supported: true,
+      detail: '',
+      guidance: null,
+      remedy: null,
+    });
+  });
+
+  it('never returns a word for a status that is not a plain object (a function, a Date are not statuses)', () => {
+    expect(parseSystemProxy(() => 1)).toBeNull();
+    // A Date is an object: it parses to a status with state unknown and no detail; the pill then shows nothing.
+    const fromDate = parseSystemProxy(new Date(0));
+    expect(fromDate?.state).toBe('unknown');
+    expect(fromDate?.detail).toBe('');
+    expect(pillWord(fromDate, false)).toBeNull();
+  });
+});
+
+describe('pillWord — the `other` row without an endpoint (tester)', () => {
+  it('falls back to ? for a missing host or port rather than inventing one', () => {
+    expect(pillWord({ ...other, host: null, port: null }, false)).toBe('· sys-proxy → ?:?');
+    expect(pillWord({ ...other, port: null }, false)).toBe('· sys-proxy → 127.0.0.1:?');
+    expect(pillWord({ ...other, host: null }, false)).toBe('· sys-proxy → ?:9090');
+  });
+
+  it('is either null or a D12 word for every state — never an empty string', () => {
+    const states = ['off', 'points_at_us', 'other', 'unsupported', 'needs_privilege', 'unknown'] as const;
+    for (const state of states) {
+      const w = pillWord({ ...base, state }, false);
+      expect(w === null || w.startsWith('· sys-proxy ')).toBe(true);
+    }
+    // Only the three "nothing" cases are null; the table has four words plus setting….
+    expect(states.filter((state) => pillWord({ ...base, state }, false) === null)).toEqual(['unsupported', 'unknown']);
+  });
+
+  it('setting… wins over every state, including the ones that otherwise show nothing', () => {
+    for (const s of [off, pointsAtUs, other, needsPrivilege, unsupported, unknown]) {
+      expect(pillWord(s, true)).toBe('· sys-proxy setting…');
+      expect(pillWord({ ...s, setting: true }, false)).toBe('· sys-proxy setting…');
+    }
+  });
+});
+
+describe('menuState — needs_privilege title and the precedence of the three titles (tester)', () => {
+  it('needs_privilege: disabled, unchecked, the title is the remedy sentence when the core sent one', () => {
+    const remedy = 'The system proxy needs an administrator; run the core as one.';
+    const m = menuState({ ...needsPrivilege, remedy }, false, 'operator');
+    expect(m).toEqual({ checked: false, disabled: true, title: remedy, showCopyEnv: false });
+    expect(menuState(needsPrivilege, false, 'operator').title).toBeUndefined();
+  });
+
+  it('in flight beats unsupported beats non-operator beats nothing-to-do', () => {
+    // in flight > unsupported
+    expect(menuState(unsupported, true, 'operator').title).toBe('setting system proxy…');
+    // unsupported > non-operator
+    expect(menuState(unsupported, false, 'agent').title).toBe('system proxy not available here');
+    // non-operator > needs_privilege / unknown / null
+    expect(menuState({ ...needsPrivilege, remedy: 'r' }, false, 'agent').title).toBe('connect with the operator token to change the system proxy');
+    expect(menuState(null, false, 'agent').title).toBe('connect with the operator token to change the system proxy');
+    // `supported: false` with any other state is the unsupported title too
+    expect(menuState({ ...off, supported: false }, false, 'operator').title).toBe('system proxy not available here');
+  });
+
+  it('checked follows the state regardless of who is connected or what is in flight', () => {
+    expect(menuState(pointsAtUs, true, 'operator').checked).toBe(true);
+    expect(menuState(pointsAtUs, false, 'agent').checked).toBe(true);
+    expect(menuState({ ...pointsAtUs, supported: false }, false, 'operator').checked).toBe(true);
+    expect(menuState(other, false, 'operator').checked).toBe(false);
+  });
+
+  it('showCopyEnv needs a non-empty guidance string, whatever the state', () => {
+    expect(menuState({ ...off, guidance: 'export HTTP_PROXY=http://127.0.0.1:8080' }, false, 'agent').showCopyEnv).toBe(true);
+    expect(menuState(off, false, 'operator').showCopyEnv).toBe(false); // the compact status has no guidance key at all
+  });
+});
