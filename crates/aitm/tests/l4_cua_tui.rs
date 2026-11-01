@@ -69,7 +69,8 @@ use aitm_tui::theme::Theme;
 use aitm_tui::TransportChoice;
 use anyhow::Context as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{buffer::Buffer, layout::Rect};
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::Rect;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
@@ -226,14 +227,13 @@ fn text_of(app: &App, cols: u16, rows: u16) -> String {
     let area = Rect::new(0, 0, cols, rows);
     let mut buf = Buffer::empty(area);
     aitm_tui::ui::render(app, &Theme::new(true), area, &mut buf);
+    if cols == 0 {
+        return "\n".repeat(usize::from(rows));
+    }
+    // The cells are row-major, so each `cols`-long chunk is one row.
     let mut out = String::new();
-    for y in area.y..area.bottom() {
-        let mut line = String::new();
-        for x in area.x..area.right() {
-            if let Some(c) = buf.cell((x, y)) {
-                line.push_str(c.symbol());
-            }
-        }
+    for row in buf.content().chunks(usize::from(cols)) {
+        let line: String = row.iter().map(Cell::symbol).collect();
         out.push_str(line.trim_end());
         out.push('\n');
     }

@@ -32,91 +32,6 @@ fn lines_text(lines: &[ratatui::text::Line<'_>]) -> Vec<String> {
         .collect()
 }
 
-/// A 200×50 app on today's bus with two flows and their details, both in
-/// scope — `f41`, a completed GET, and `f50`, a POST paused at intercept
-/// (selected) — plus one library PoC, so every mode and prompt is reachable
-/// the way the operator reaches it.
-fn sample_app() -> App {
-    let mut app = connected_app(200, 50);
-    let _ = app.on_bus(BusEvent::Scope(vec![
-        "api.shop-staging.test".into(),
-        "auth.shop-staging.test".into(),
-    ]));
-    let _ = app.on_bus(BusEvent::Flows(vec![
-        summary(
-            "f41",
-            "GET",
-            "api.shop-staging.test",
-            "/api/products?category=electronics&limit=20",
-            Some(200),
-            "observed",
-        ),
-        summary(
-            "f50",
-            "POST",
-            "auth.shop-staging.test",
-            "/api/auth/login",
-            None,
-            "intercepted",
-        ),
-    ]));
-    let products = br#"{"items":[{"id":101,"name":"USB-C dock","price":89.5}],"page":1,"total":1}"#;
-    let f41 = FlowDetail::from_json(&json!({
-        "id": "f41", "kind": "http", "intercept": "observed", "edited": false,
-        "request": {
-            "method": "GET", "scheme": "https", "authority": "api.shop-staging.test",
-            "path": "/api/products?category=electronics&limit=20", "version": "HTTP/2",
-            "headers": [["host", "api.shop-staging.test"], ["accept", "application/json"]],
-            "body": null, "body_size": 0, "body_truncated": false
-        },
-        "response": {
-            "status": 200, "version": "HTTP/2",
-            "headers": [["content-type", "application/json; charset=utf-8"]],
-            "body": base64::encode(products), "body_size": products.len(),
-            "body_truncated": false
-        },
-        "client_conn": {"peer": "127.0.0.1:52101", "sni": "api.shop-staging.test",
-                        "alpn": "h2", "tls": true, "process": "curl"},
-        "server_conn": {"peer": "203.0.113.10:443", "sni": "api.shop-staging.test",
-                        "alpn": "h2", "tls": true},
-        "meta": {"marks": [], "comment": null, "is_replay": false,
-                 "created": "2026-10-27T11:04:58.120Z", "duration_ms": 89,
-                 "truncated": false, "origin": "human"}
-    }))
-    .unwrap();
-    let login = br#"{"email":"ops@shop-staging.test","password":"correct-horse-battery"}"#;
-    let f50 = FlowDetail::from_json(&json!({
-        "id": "f50", "kind": "http", "intercept": "intercepted", "edited": false,
-        "request": {
-            "method": "POST", "scheme": "https", "authority": "auth.shop-staging.test",
-            "path": "/api/auth/login", "version": "HTTP/2",
-            "headers": [["host", "auth.shop-staging.test"],
-                        ["content-type", "application/json"], ["accept", "*/*"]],
-            "body": base64::encode(login), "body_size": login.len(),
-            "body_truncated": false
-        },
-        "response": null,
-        "client_conn": {"peer": "127.0.0.1:52114", "sni": "auth.shop-staging.test",
-                        "alpn": "h2", "tls": true, "process": "curl"},
-        "server_conn": null,
-        "meta": {"marks": [], "comment": null, "is_replay": false,
-                 "created": "2026-10-27T11:05:22.994Z", "duration_ms": null,
-                 "truncated": false, "origin": "human"}
-    }))
-    .unwrap();
-    let _ = app.on_bus(BusEvent::Detail(Box::new(f41)));
-    let _ = app.on_bus(BusEvent::Detail(Box::new(f50)));
-    // One library PoC (`poc.list`), never run, so `r` in Findings has a
-    // file to offer; the `poc.get` it asks for is left unanswered.
-    let _ = app.on_bus(BusEvent::Findings(vec![Finding::from_json(&json!({
-        "poc_path": "pocs/open-redirect-next.yaml", "id": "open-redirect-next",
-        "title": "Open redirect via next=", "severity": "low"
-    }))
-    .unwrap()]));
-    app.selected = Some("f50".into());
-    app
-}
-
 // ------------------------------------------------------------ model parsers
 
 #[test]
@@ -179,7 +94,7 @@ fn flow_detail_from_json_tolerates_empty_and_wrongly_typed_input() {
     assert_eq!(d.messages[2].dir, None);
 
     // Through the app: a malformed detail for a known flow leaves the row as it was.
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     let before = app.row("f41").unwrap().clone();
     assert!(
         before.time.is_some() && before.req_size.is_some(),
@@ -300,26 +215,26 @@ fn base64_and_percent_decoding_survive_odd_input() {
 /// sends `GET /x?%aé=1` through the proxy crashes the operator's TUI.
 #[test]
 fn percent_decoding_survives_a_multibyte_character_after_the_percent_sign() {
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let direct = catch_unwind(|| viewers::percent_decode("%aé=1"));
-    let mut app = connected_app(200, 50);
-    let _ = app.on_bus(aitm_tui::action::BusEvent::Flows(vec![summary(
-        "evil",
-        "GET",
-        "api.shop-staging.test",
-        "/search?q=%aé&x=1",
-        Some(200),
-        "observed",
-    )]));
-    app.selected = Some("evil".into());
-    app.mode = Mode::Inspector;
-    app.inspector.request_tab = aitm_tui::app::REQUEST_TABS
-        .iter()
-        .position(|t| *t == "Query")
-        .unwrap();
-    let via_query_tab = catch_unwind(AssertUnwindSafe(|| text_of(&app, 200, 50)));
-    std::panic::set_hook(previous_hook);
+    let (direct, via_query_tab) = quietly(|| {
+        let direct = catch_unwind(|| viewers::percent_decode("%aé=1"));
+        let mut app = connected_app(200, 50);
+        let _ = app.on_bus(BusEvent::Flows(vec![summary(
+            "evil",
+            "GET",
+            "api.shop-staging.test",
+            "/search?q=%aé&x=1",
+            Some(200),
+            "observed",
+        )]));
+        app.selected = Some("evil".into());
+        app.mode = Mode::Inspector;
+        app.inspector.request_tab = aitm_tui::app::REQUEST_TABS
+            .iter()
+            .position(|t| *t == "Query")
+            .unwrap();
+        let via_query_tab = catch_unwind(AssertUnwindSafe(|| text_of(&app, 200, 50)));
+        (direct, via_query_tab)
+    });
     assert!(direct.is_ok(), "percent_decode(\"%aé=1\") panicked");
     assert!(
         via_query_tab.is_ok(),
@@ -577,7 +492,7 @@ fn every_mode() -> Vec<Mode> {
 
 /// The sample app put into `mode` the way the operator would get there.
 fn app_in(mode: Mode) -> App {
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     match mode {
         Mode::Edit => {
             let _ = app.update(Action::Edit);
@@ -683,41 +598,40 @@ fn key_map_returns_an_option_for_every_key_in_every_mode() {
 #[test]
 fn reducer_and_renderer_survive_every_key_in_every_mode() {
     let codes = every_key_code();
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let mut applied = 0usize;
-    for mode in every_mode() {
-        let base = app_in(mode);
-        assert_eq!(
-            text_of(&base, 200, 50).lines().count(),
-            50,
-            "{mode:?} draws the whole 200×50 screen"
-        );
-        for code in &codes {
-            for m in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
-                let Some(action) = keys::map(KeyEvent::new(*code, m), mode) else {
-                    continue;
-                };
-                let mut app = base.clone();
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    let _ = app.update(action.clone());
-                    let _ = app.update(Action::Resize(100, 30));
-                    let _ = text_of(&app, 100, 30);
-                }));
-                applied += 1;
-                if let Err(e) = outcome {
-                    let msg = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                        .unwrap_or_default();
-                    failures.push(format!("{mode:?} + {code:?} {m:?} → {action:?}: {msg}"));
+    quietly(|| {
+        for mode in every_mode() {
+            let base = app_in(mode);
+            assert_eq!(
+                text_of(&base, 200, 50).lines().count(),
+                50,
+                "{mode:?} draws the whole 200×50 screen"
+            );
+            for code in &codes {
+                for m in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+                    let Some(action) = keys::map(KeyEvent::new(*code, m), mode) else {
+                        continue;
+                    };
+                    let mut app = base.clone();
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        let _ = app.update(action.clone());
+                        let _ = app.update(Action::Resize(100, 30));
+                        let _ = text_of(&app, 100, 30);
+                    }));
+                    applied += 1;
+                    if let Err(e) = outcome {
+                        let msg = e
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                            .unwrap_or_default();
+                        failures.push(format!("{mode:?} + {code:?} {m:?} → {action:?}: {msg}"));
+                    }
                 }
             }
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(applied > 500, "{applied}");
     assert!(
         failures.is_empty(),
@@ -731,7 +645,7 @@ fn reducer_and_renderer_survive_every_key_in_every_mode() {
 #[test]
 fn a_random_key_walk_never_panics() {
     let codes = every_key_code();
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
     let mut next = || {
         seed ^= seed << 13;
@@ -739,48 +653,47 @@ fn a_random_key_walk_never_panics() {
         seed ^= seed << 17;
         seed
     };
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failure = None;
-    for step in 0..3000usize {
-        let code = codes[(next() as usize) % codes.len()];
-        let m = if next() % 7 == 0 {
-            KeyModifiers::CONTROL
-        } else {
-            KeyModifiers::NONE
-        };
-        let key = KeyEvent::new(code, m);
-        // Ctrl-C would only set should_quit; keep walking.
-        let Some(action) = keys::map(key, app.mode) else {
-            continue;
-        };
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            let _ = app.update(action.clone());
-            if step % 25 == 0 {
-                let (c, r) = match next() % 4 {
-                    0 => (80, 24),
-                    1 => (120, 30),
-                    2 => (200, 50),
-                    _ => (41, 5),
-                };
-                let _ = app.update(Action::Resize(c, r));
-                let _ = text_of(&app, c, r);
+    quietly(|| {
+        for step in 0..3000usize {
+            let code = codes[(next() as usize) % codes.len()];
+            let m = if next() % 7 == 0 {
+                KeyModifiers::CONTROL
+            } else {
+                KeyModifiers::NONE
+            };
+            let key = KeyEvent::new(code, m);
+            // Ctrl-C would only set should_quit; keep walking.
+            let Some(action) = keys::map(key, app.mode) else {
+                continue;
+            };
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                let _ = app.update(action.clone());
+                if step % 25 == 0 {
+                    let (c, r) = match next() % 4 {
+                        0 => (80, 24),
+                        1 => (120, 30),
+                        2 => (200, 50),
+                        _ => (41, 5),
+                    };
+                    let _ = app.update(Action::Resize(c, r));
+                    let _ = text_of(&app, c, r);
+                }
+            }));
+            if let Err(e) = outcome {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_default();
+                failure = Some(format!(
+                    "step {step}: {key:?} in {:?} → {action:?}: {msg}",
+                    app.mode
+                ));
+                break;
             }
-        }));
-        if let Err(e) = outcome {
-            let msg = e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                .unwrap_or_default();
-            failure = Some(format!(
-                "step {step}: {key:?} in {:?} → {action:?}: {msg}",
-                app.mode
-            ));
-            break;
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(failure.is_none(), "{}", failure.unwrap());
     let _ = app.update(Action::Resize(200, 50));
     assert_eq!(
@@ -792,7 +705,7 @@ fn a_random_key_walk_never_panics() {
 
 #[test]
 fn run_command_survives_odd_lines_and_reports_each_problem() {
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     // Two verbs carry their `tools/list` input schema, because the asserts
     // below ride on it: `flow.get` requires `id`; `flow.intercept` takes a
     // boolean `enabled`. Every other tool keeps the empty schema.
@@ -1039,7 +952,7 @@ fn compose_kv_and_edit_buffer_edge_cases() {
     bin_edited.lines[2] = "typed over".into();
     assert!(bin_edited.to_edits().get("body").is_none());
     // Editing at the ends of lines and across lines.
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     let _ = app.update(Action::Edit);
     for _ in 0..40 {
         let _ = app.update(Action::Right);

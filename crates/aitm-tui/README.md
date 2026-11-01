@@ -305,7 +305,8 @@ never hidden and never fails silently. The follow-ups were:
 | F13 (rest) | findings export | export of a finding (YAML + PNG + HAR) |
 | F14 | `browser.tabs`, `browser.screencast` | a live browser viewport and the tab count in the sidebar (the Browser view itself is built; see **Browser** above) |
 
-The current core (`CORE_TOOLS`, 59 commands) serves the tools for every row
+The current core (`CORE_TOOLS`, pinned against the running server by
+`crates/aitm/tests/tui_live_bus.rs`) serves the tools for every row
 above except F5 (rest), F13 (rest) and F14. A few surfaces still show their
 `needs core follow-up` label anyway, because the TUI itself has not built the
 feature, not because the core lacks the tool: the `Rules…` breakpoint editor (F3),
@@ -382,11 +383,17 @@ Detected once at start from the environment (`caps.rs`):
 Three kinds of check, and nothing else counts as evidence:
 
 - **Unit and integration tests with inline inputs.** `cargo test -p aitm-tui`.
-  Every test builds its `App` from literals in the core's wire shapes:
-  `tests/common/mod.rs` has `App::new` + `connect` (a bus offering the
-  `CORE_TOOLS` names, or `PRE_MERGE_TOOLS` to prove degradation), `summary`
-  for a `flow.get` row, and `draw` / `text_of` to read the screen through
-  `ui::render` into an off-screen buffer.
+  Every test builds its `App` from literals in the core's wire shapes. The
+  starting point is `tests/common/mod.rs`'s `connected_app(cols, rows)`: an
+  `App` of that size on a bus offering every `CORE_TOOLS` name and nothing
+  else — no flows, details, scope or findings; the test feeds those as
+  `BusEvent` literals (`summary` builds a `flow.get` row, `sample_app` two
+  in-scope flows with details). For a degradation case — what a *missing*
+  tool does — use `App::new` + `connect` with `PRE_MERGE_TOOLS` (the bus
+  before the newer tools) or any list. `draw` / `text_of` read the screen
+  through `ui::render` into an off-screen buffer. The wall-clock-bounded
+  tests are their own binary, `tests/perf.rs`; the bus task's are
+  `tests/bus_task.rs`, against a transport whose replies are literals.
 - **The real-server contract.** `cargo test -p aitm --test tui_live_bus`
   spawns a real core and pins `CORE_TOOLS` against its `tools/list`. It binds
   a port, so it runs in a real shell (the Terminal panel), never the sandbox.

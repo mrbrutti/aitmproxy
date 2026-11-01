@@ -199,18 +199,17 @@ pub(crate) fn render_buffer(app: &App, cols: u16, rows: u16) -> Buffer {
 
 /// Test-only: [`render_buffer`] as text, styles dropped — one symbol per
 /// cell, each line trimmed of trailing spaces, `\n`-joined, ending in `\n`.
+/// One line per row even at zero width (no cells, so every line is empty).
+/// The cells are row-major, so each `cols`-long chunk is one row.
 #[cfg(test)]
 pub(crate) fn render_text(app: &App, cols: u16, rows: u16) -> String {
+    if cols == 0 {
+        return "\n".repeat(usize::from(rows));
+    }
     let buf = render_buffer(app, cols, rows);
-    let area = buf.area;
     let mut out = String::new();
-    for y in area.y..area.bottom() {
-        let mut line = String::new();
-        for x in area.x..area.right() {
-            if let Some(c) = buf.cell((x, y)) {
-                line.push_str(c.symbol());
-            }
-        }
+    for row in buf.content().chunks(usize::from(cols)) {
+        let line: String = row.iter().map(ratatui::buffer::Cell::symbol).collect();
         out.push_str(line.trim_end());
         out.push('\n');
     }
@@ -234,22 +233,8 @@ mod tests {
     use super::*;
     use crate::action::BusEvent;
     use crate::app::Mode;
+    use crate::summary;
     use ratatui::style::Modifier;
-    use serde_json::{json, Value};
-
-    /// A `flow.get` summary in the core's wire shape.
-    fn summary(
-        id: &str,
-        method: &str,
-        authority: &str,
-        path: &str,
-        status: Option<u16>,
-        intercept: &str,
-    ) -> Value {
-        json!({"id": id, "kind": "http", "method": method, "scheme": "https",
-               "authority": authority, "path": path, "status": status,
-               "is_replay": false, "intercept": intercept})
-    }
 
     /// S8: a compose field whose body area is zero cells wide must not
     /// underflow; `overlays::compose` is reachable with any `Rect`.

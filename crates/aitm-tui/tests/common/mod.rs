@@ -6,10 +6,14 @@
 
 #![allow(dead_code)]
 
+use std::fmt::Write as _;
+use std::sync::Once;
+use std::time::Instant;
+
 use aitm_tui::action::{Action, BusEvent, BusRequest, ToolInfo};
-use aitm_tui::app::App;
+use aitm_tui::app::{App, Mode, Pane, RESPONSE_TABS};
 use aitm_tui::caps::TermCaps;
-use aitm_tui::model::ProxyStatus;
+use aitm_tui::model::{Finding, FlowDetail, ProxyStatus};
 use aitm_tui::theme::Theme;
 use aitm_tui::ui::render;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -32,17 +36,18 @@ pub fn draw(app: &App, cols: u16, rows: u16) -> Buffer {
 }
 
 /// A drawn buffer as text, styles dropped: one symbol per cell, each line
-/// trimmed of trailing spaces, `\n`-joined and ending in `\n`.
+/// trimmed of trailing spaces, `\n`-joined and ending in `\n` — one line
+/// per row, even for a zero-width buffer (no cells, so every line is
+/// empty). The cells are row-major: each `width`-long chunk of `content()`
+/// is one row.
 pub fn to_text(buf: &Buffer) -> String {
-    let area = buf.area;
+    let (width, height) = (usize::from(buf.area.width), usize::from(buf.area.height));
+    if width == 0 {
+        return "\n".repeat(height);
+    }
     let mut out = String::new();
-    for y in area.y..area.bottom() {
-        let mut line = String::new();
-        for x in area.x..area.right() {
-            if let Some(c) = buf.cell((x, y)) {
-                line.push_str(c.symbol());
-            }
-        }
+    for row in buf.content().chunks(width) {
+        let line: String = row.iter().map(Cell::symbol).collect();
         out.push_str(line.trim_end());
         out.push('\n');
     }
@@ -63,6 +68,182 @@ pub fn connected_app(cols: u16, rows: u16) -> App {
     let _ = app.update(Action::Resize(cols, rows));
     let _ = connect(&mut app, CORE_TOOLS, None);
     app
+}
+
+/// A `cols`×`rows` app on today's bus with two flows and their details, both
+/// in scope — `f41`, a completed GET with a JSON response, and `f50`, a POST
+/// paused at intercept (selected) — plus one library PoC, so every mode and
+/// prompt is reachable the way the operator reaches it.
+pub fn sample_app(cols: u16, rows: u16) -> App {
+    let mut app = connected_app(cols, rows);
+    let _ = app.on_bus(BusEvent::Scope(vec![
+        "api.shop-staging.test".into(),
+        "auth.shop-staging.test".into(),
+    ]));
+    let _ = app.on_bus(BusEvent::Flows(vec![
+        summary(
+            "f41",
+            "GET",
+            "api.shop-staging.test",
+            "/api/products?category=electronics&limit=20",
+            Some(200),
+            "observed",
+        ),
+        summary(
+            "f50",
+            "POST",
+            "auth.shop-staging.test",
+            "/api/auth/login",
+            None,
+            "intercepted",
+        ),
+    ]));
+    let products = br#"{"items":[{"id":101,"name":"USB-C dock","price":89.5}],"page":1,"total":1}"#;
+    let f41 = FlowDetail::from_json(&json!({
+        "id": "f41", "kind": "http", "intercept": "observed", "edited": false,
+        "request": {
+            "method": "GET", "scheme": "https", "authority": "api.shop-staging.test",
+            "path": "/api/products?category=electronics&limit=20", "version": "HTTP/2",
+            "headers": [["host", "api.shop-staging.test"], ["accept", "application/json"]],
+            "body": null, "body_size": 0, "body_truncated": false
+        },
+        "response": {
+            "status": 200, "version": "HTTP/2",
+            "headers": [["content-type", "application/json; charset=utf-8"]],
+            "body": aitm_tui::base64::encode(products), "body_size": products.len(),
+            "body_truncated": false
+        },
+        "client_conn": {"peer": "127.0.0.1:52101", "sni": "api.shop-staging.test",
+                        "alpn": "h2", "tls": true, "process": "curl"},
+        "server_conn": {"peer": "203.0.113.10:443", "sni": "api.shop-staging.test",
+                        "alpn": "h2", "tls": true},
+        "meta": {"marks": [], "comment": null, "is_replay": false,
+                 "created": "2026-10-27T11:04:58.120Z", "duration_ms": 89,
+                 "truncated": false, "origin": "human"}
+    }))
+    .unwrap();
+    let login = br#"{"email":"ops@shop-staging.test","password":"correct-horse-battery"}"#;
+    let f50 = FlowDetail::from_json(&json!({
+        "id": "f50", "kind": "http", "intercept": "intercepted", "edited": false,
+        "request": {
+            "method": "POST", "scheme": "https", "authority": "auth.shop-staging.test",
+            "path": "/api/auth/login", "version": "HTTP/2",
+            "headers": [["host", "auth.shop-staging.test"],
+                        ["content-type", "application/json"], ["accept", "*/*"]],
+            "body": aitm_tui::base64::encode(login), "body_size": login.len(),
+            "body_truncated": false
+        },
+        "response": null,
+        "client_conn": {"peer": "127.0.0.1:52114", "sni": "auth.shop-staging.test",
+                        "alpn": "h2", "tls": true, "process": "curl"},
+        "server_conn": null,
+        "meta": {"marks": [], "comment": null, "is_replay": false,
+                 "created": "2026-10-27T11:05:22.994Z", "duration_ms": null,
+                 "truncated": false, "origin": "human"}
+    }))
+    .unwrap();
+    let _ = app.on_bus(BusEvent::Detail(Box::new(f41)));
+    let _ = app.on_bus(BusEvent::Detail(Box::new(f50)));
+    // One library PoC (`poc.list`), never run, so `r` in Findings has a
+    // file to offer; the `poc.get` it asks for is left unanswered.
+    let _ = app.on_bus(BusEvent::Findings(vec![Finding::from_json(&json!({
+        "poc_path": "pocs/open-redirect-next.yaml", "id": "open-redirect-next",
+        "title": "Open redirect via next=", "severity": "low"
+    }))
+    .unwrap()]));
+    app.selected = Some("f50".into());
+    app
+}
+
+/// Five megabytes of JSON — an array of small objects — for the body-viewer
+/// volume tests.
+pub fn five_mb_json() -> String {
+    let mut body = String::with_capacity(5 * 1024 * 1024 + 128);
+    body.push('[');
+    let mut i = 0usize;
+    while body.len() < 5 * 1024 * 1024 {
+        let _ = write!(
+            body,
+            "{{\"id\":{i},\"name\":\"item-{i}\",\"price\":{}.5,\"tags\":[\"a\",\"b\"],\"in_stock\":{}}},",
+            i % 1000,
+            i.is_multiple_of(2)
+        );
+        i += 1;
+    }
+    body.pop();
+    body.push(']');
+    body
+}
+
+/// An app on the Response pane of a flow whose response body is 5 MB of
+/// JSON, and that body's text.
+pub fn big_body_app() -> (App, String) {
+    let text = five_mb_json();
+    let mut app = App::new(TermCaps::full(), "x");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &["flow.list", "flow.get", "flow.detail"], None);
+    let _ = app.on_bus(BusEvent::Flows(vec![summary(
+        "big",
+        "GET",
+        "api.test",
+        "/big",
+        Some(200),
+        "observed",
+    )]));
+    let detail = FlowDetail::from_json(&json!({
+        "id": "big", "kind": "http",
+        "request": {"method":"GET","path":"/big","headers":[]},
+        "response": {"status":200,"headers":[["content-type","application/json"]],
+                     "body": aitm_tui::base64::encode(text.as_bytes())},
+    }))
+    .unwrap();
+    let t = Instant::now();
+    let _ = app.on_bus(BusEvent::Detail(Box::new(detail)));
+    eprintln!(
+        "tester: 5 MB body base64-decoded through on_bus in {:?}",
+        t.elapsed()
+    );
+    app.mode = Mode::Inspector;
+    app.inspector.pane = Pane::Response;
+    (app, text)
+}
+
+/// Select the inspector's response tab `name` (`Body`, `Raw`, `JSON`, `Hex`).
+pub fn response_tab(app: &mut App, name: &str) {
+    app.inspector.response_tab = RESPONSE_TABS.iter().position(|t| *t == name).unwrap();
+}
+
+thread_local! {
+    /// Set while this thread is inside [`quietly`].
+    static SUPPRESS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+static QUIET_HOOK: Once = Once::new();
+
+/// Run `f` with panic messages from *this thread* suppressed, so a sweep
+/// that `catch_unwind`s hundreds of renders does not spray the log. The
+/// panic hook is one process-global slot: the old per-test `take_hook` /
+/// `set_hook(|_| {})` / `set_hook(previous)` dance raced the other test
+/// threads and could eat a real failure's message. This installs ONE hook,
+/// once, that forwards to the default hook unless the panicking thread is
+/// inside `quietly`; every other thread's panic prints as usual.
+pub fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    QUIET_HOOK.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !SUPPRESS.with(std::cell::Cell::get) {
+                default(info);
+            }
+        }));
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SUPPRESS.with(|s| s.set(false));
+        }
+    }
+    let _reset = Reset;
+    SUPPRESS.with(|s| s.set(true));
+    f()
 }
 
 /// The first line containing `needle`.

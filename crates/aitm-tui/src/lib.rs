@@ -313,6 +313,24 @@ pub(crate) fn connected_app(cols: u16, rows: u16) -> App {
     app
 }
 
+/// A `flow.get` summary in the core's wire shape, for in-crate tests: the
+/// one builder the `app`, `ui` and `ui::flows` test modules share.
+#[cfg(test)]
+pub(crate) fn summary(
+    id: &str,
+    method: &str,
+    authority: &str,
+    path: &str,
+    status: Option<u16>,
+    intercept: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "kind": "http", "method": method, "scheme": "https",
+        "authority": authority, "path": path, "status": status,
+        "is_replay": false, "intercept": intercept,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

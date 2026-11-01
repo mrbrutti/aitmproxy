@@ -524,14 +524,8 @@ mod tests {
     use super::*;
     use crate::action::BusEvent;
     use crate::model::FlowDetail;
-    use serde_json::{json, Value};
-
-    /// A `flow.get` summary in the core's wire shape.
-    fn summary(id: &str, method: &str, path: &str, status: Option<u16>, intercept: &str) -> Value {
-        json!({"id": id, "kind": "http", "method": method, "scheme": "https",
-               "authority": "api.example.test", "path": path, "status": status,
-               "is_replay": false, "intercept": intercept})
-    }
+    use crate::summary;
+    use serde_json::json;
 
     /// A `flow.detail` carrying only the metadata the Tick column reads.
     fn detail(id: &str, marks: &[&str], origin: &str) -> FlowDetail {
@@ -554,13 +548,35 @@ mod tests {
             summary(
                 "f41",
                 "GET",
+                "api.example.test",
                 "/api/products?category=widgets",
                 Some(200),
                 "observed",
             ),
-            summary("f42", "PUT", "/api/cart/items/42", Some(200), "observed"),
-            summary("f48", "GET", "/api/search?q=test", Some(200), "observed"),
-            summary("f50", "POST", "/api/auth/login", None, "intercepted"),
+            summary(
+                "f42",
+                "PUT",
+                "api.example.test",
+                "/api/cart/items/42",
+                Some(200),
+                "observed",
+            ),
+            summary(
+                "f48",
+                "GET",
+                "api.example.test",
+                "/api/search?q=test",
+                Some(200),
+                "observed",
+            ),
+            summary(
+                "f50",
+                "POST",
+                "api.example.test",
+                "/api/auth/login",
+                None,
+                "intercepted",
+            ),
         ]));
         for d in [
             detail("f42", &["sky"], "human"),

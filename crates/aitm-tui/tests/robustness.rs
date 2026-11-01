@@ -9,10 +9,9 @@
 mod common;
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aitm_tui::action::ToolSchema as _;
 use aitm_tui::action::{Action, BusEvent, BusRequest, Level, Param, ToolInfo};
@@ -27,20 +26,6 @@ use aitm_tui::viewers;
 use common::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::json;
-
-/// Bound for the interactive paths over 5 000 flows (render, filter, palette).
-/// The plan's target is "a flow list of 5 000 rows rendering under 50 ms";
-/// these tests run unoptimised (debug), so the bound is 5× that. A
-/// regression that makes a frame cost the 250 ms tick still fails.
-const INTERACTIVE: Duration = Duration::from_millis(250);
-/// Generous, CI-tolerant ceiling for the 5 MB body paths (a frame render).
-/// These tests run unoptimised (debug): locally one frame is ~0.75 s, but a
-/// loaded or parallel GitHub runner reaches ~2.7 s, so a tight 2 s bound
-/// false-fails intermittently. 10 s still catches a pathological regression
-/// (an O(n²) parse, or the per-frame full-rebuild freeze the FINDING on
-/// `inspector_frames_with_a_five_megabyte_body_do_not_freeze` documents)
-/// without flaking under CI load.
-const BULK: Duration = Duration::from_secs(10);
 
 // ------------------------------------------------------------------ helpers
 
@@ -79,96 +64,6 @@ fn test_png() -> Vec<u8> {
     png
 }
 
-/// A `cols`×`rows` app on today's bus with two flows and their details, both
-/// in scope — `f41`, a completed GET with a JSON response, and `f50`, a POST
-/// paused at intercept (selected) — plus one library PoC, so every mode and
-/// prompt is reachable the way the operator reaches it.
-fn sample_app_at(cols: u16, rows: u16) -> App {
-    let mut app = connected_app(cols, rows);
-    let _ = app.on_bus(BusEvent::Scope(vec![
-        "api.shop-staging.test".into(),
-        "auth.shop-staging.test".into(),
-    ]));
-    let _ = app.on_bus(BusEvent::Flows(vec![
-        summary(
-            "f41",
-            "GET",
-            "api.shop-staging.test",
-            "/api/products?category=electronics&limit=20",
-            Some(200),
-            "observed",
-        ),
-        summary(
-            "f50",
-            "POST",
-            "auth.shop-staging.test",
-            "/api/auth/login",
-            None,
-            "intercepted",
-        ),
-    ]));
-    let products = br#"{"items":[{"id":101,"name":"USB-C dock","price":89.5}],"page":1,"total":1}"#;
-    let f41 = FlowDetail::from_json(&json!({
-        "id": "f41", "kind": "http", "intercept": "observed", "edited": false,
-        "request": {
-            "method": "GET", "scheme": "https", "authority": "api.shop-staging.test",
-            "path": "/api/products?category=electronics&limit=20", "version": "HTTP/2",
-            "headers": [["host", "api.shop-staging.test"], ["accept", "application/json"]],
-            "body": null, "body_size": 0, "body_truncated": false
-        },
-        "response": {
-            "status": 200, "version": "HTTP/2",
-            "headers": [["content-type", "application/json; charset=utf-8"]],
-            "body": aitm_tui::base64::encode(products), "body_size": products.len(),
-            "body_truncated": false
-        },
-        "client_conn": {"peer": "127.0.0.1:52101", "sni": "api.shop-staging.test",
-                        "alpn": "h2", "tls": true, "process": "curl"},
-        "server_conn": {"peer": "203.0.113.10:443", "sni": "api.shop-staging.test",
-                        "alpn": "h2", "tls": true},
-        "meta": {"marks": [], "comment": null, "is_replay": false,
-                 "created": "2026-10-27T11:04:58.120Z", "duration_ms": 89,
-                 "truncated": false, "origin": "human"}
-    }))
-    .unwrap();
-    let login = br#"{"email":"ops@shop-staging.test","password":"correct-horse-battery"}"#;
-    let f50 = FlowDetail::from_json(&json!({
-        "id": "f50", "kind": "http", "intercept": "intercepted", "edited": false,
-        "request": {
-            "method": "POST", "scheme": "https", "authority": "auth.shop-staging.test",
-            "path": "/api/auth/login", "version": "HTTP/2",
-            "headers": [["host", "auth.shop-staging.test"],
-                        ["content-type", "application/json"], ["accept", "*/*"]],
-            "body": aitm_tui::base64::encode(login), "body_size": login.len(),
-            "body_truncated": false
-        },
-        "response": null,
-        "client_conn": {"peer": "127.0.0.1:52114", "sni": "auth.shop-staging.test",
-                        "alpn": "h2", "tls": true, "process": "curl"},
-        "server_conn": null,
-        "meta": {"marks": [], "comment": null, "is_replay": false,
-                 "created": "2026-10-27T11:05:22.994Z", "duration_ms": null,
-                 "truncated": false, "origin": "human"}
-    }))
-    .unwrap();
-    let _ = app.on_bus(BusEvent::Detail(Box::new(f41)));
-    let _ = app.on_bus(BusEvent::Detail(Box::new(f50)));
-    // One library PoC (`poc.list`), never run, so `r` in Findings has a
-    // file to offer; the `poc.get` it asks for is left unanswered.
-    let _ = app.on_bus(BusEvent::Findings(vec![Finding::from_json(&json!({
-        "poc_path": "pocs/open-redirect-next.yaml", "id": "open-redirect-next",
-        "title": "Open redirect via next=", "severity": "low"
-    }))
-    .unwrap()]));
-    app.selected = Some("f50".into());
-    app
-}
-
-/// [`sample_app_at`] at the design size, 200×50.
-fn sample_app() -> App {
-    sample_app_at(200, 50)
-}
-
 // ------------------------------------------------------- shell: sizes
 
 #[test]
@@ -203,7 +98,7 @@ fn no_mode_panics_at_any_terminal_size() {
     ];
     let rows = [1u16, 2, 3, 4, 5, 6, 7, 8, 10, 12, 20, 50, 100];
 
-    let base = sample_app();
+    let base = sample_app(200, 50);
     let mut states: Vec<(&str, App)> = Vec::new();
     states.push(("flows", base.clone()));
     let mut a = base.clone();
@@ -251,32 +146,31 @@ fn no_mode_panics_at_any_terminal_size() {
     let _ = connect(&mut empty, CORE_TOOLS, None);
     states.push(("empty", empty));
 
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
     let mut renders = 0usize;
-    for (name, state) in &states {
-        for &c in &cols {
-            for &r in &rows {
-                let mut app = state.clone();
-                let _ = app.update(Action::Resize(c, r));
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    let buf = draw(&app, c, r);
-                    let _ = to_text(&buf);
-                }));
-                renders += 1;
-                if let Err(e) = outcome {
-                    let msg = e
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                        .unwrap_or_else(|| "non-string panic".into());
-                    failures.push(format!("{name} at {c}×{r}: {msg}"));
+    quietly(|| {
+        for (name, state) in &states {
+            for &c in &cols {
+                for &r in &rows {
+                    let mut app = state.clone();
+                    let _ = app.update(Action::Resize(c, r));
+                    let outcome = catch_unwind(AssertUnwindSafe(|| {
+                        let buf = draw(&app, c, r);
+                        let _ = to_text(&buf);
+                    }));
+                    renders += 1;
+                    if let Err(e) = outcome {
+                        let msg = e
+                            .downcast_ref::<String>()
+                            .cloned()
+                            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                            .unwrap_or_else(|| "non-string panic".into());
+                        failures.push(format!("{name} at {c}×{r}: {msg}"));
+                    }
                 }
             }
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(
         failures.is_empty(),
         "{} of {renders} renders panicked:\n{}",
@@ -292,7 +186,7 @@ fn no_mode_panics_at_any_terminal_size() {
 /// terminal crashed the TUI.
 #[test]
 fn palette_overlay_survives_short_terminals() {
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     let _ = app.update(Action::PaletteOpen);
     for c in "fl".chars() {
         let _ = app.update(Action::Input(c));
@@ -303,23 +197,22 @@ fn palette_overlay_survives_short_terminals() {
     assert!(text.contains(" palette "), "{text}");
     assert!(text.contains("flow.list"), "{text}");
 
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
-    for (c, r) in [
-        (80u16, 4u16),
-        (80, 6),
-        (80, 8),
-        (80, 10),
-        (120, 11),
-        (200, 5),
-    ] {
-        let _ = app.update(Action::Resize(c, r));
-        if catch_unwind(AssertUnwindSafe(|| draw(&app, c, r))).is_err() {
-            failures.push(format!("{c}×{r}"));
+    quietly(|| {
+        for (c, r) in [
+            (80u16, 4u16),
+            (80, 6),
+            (80, 8),
+            (80, 10),
+            (120, 11),
+            (200, 5),
+        ] {
+            let _ = app.update(Action::Resize(c, r));
+            if catch_unwind(AssertUnwindSafe(|| draw(&app, c, r))).is_err() {
+                failures.push(format!("{c}×{r}"));
+            }
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(
         failures.is_empty(),
         "the palette overlay panics at: {}",
@@ -328,155 +221,6 @@ fn palette_overlay_survives_short_terminals() {
 }
 
 // ------------------------------------------------------- volume edge cases
-
-#[test]
-fn five_thousand_flows_ingest_and_render_within_bounds() {
-    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
-    let _ = app.update(Action::Resize(200, 50));
-    // A bus without `flow.detail`, so ingest is measured without the 5000
-    // detail fetches the lit core would ask for.
-    let _ = connect(&mut app, PRE_MERGE_TOOLS, Some("127.0.0.1:8080"));
-    let _ = app.on_bus(BusEvent::Scope(vec!["*.shop-staging.test".into()]));
-    let methods = ["GET", "POST", "PUT", "DELETE"];
-    let summaries: Vec<_> = (0..5000usize)
-        .map(|i| {
-            summary(
-                &format!("f{i}"),
-                methods[i % 4],
-                &format!("h{}.shop-staging.test", i % 37),
-                &format!("/api/items/{i}?page={}", i % 9),
-                if i % 5 == 0 {
-                    None
-                } else {
-                    Some(200 + (i % 3) as u16 * 100)
-                },
-                if i % 97 == 0 {
-                    "intercepted"
-                } else {
-                    "observed"
-                },
-            )
-        })
-        .collect();
-
-    let t = Instant::now();
-    let reqs = app.on_bus(BusEvent::Flows(summaries.clone()));
-    let ingest = t.elapsed();
-    assert!(
-        reqs.is_empty(),
-        "no flow.detail on this bus, so no detail fetches"
-    );
-    assert_eq!(app.flows.len(), 5000);
-    assert_eq!(app.next_seq, 5001);
-
-    let t = Instant::now();
-    let _ = app.on_bus(BusEvent::Flows(summaries.clone()));
-    let refresh = t.elapsed();
-    assert_eq!(
-        app.flows.len(),
-        5000,
-        "a refresh with the same ids keeps every row"
-    );
-
-    let t = Instant::now();
-    let buf = draw(&app, 200, 50);
-    let render_time = t.elapsed();
-    let text = to_text(&buf);
-    assert!(
-        text.contains("5000 / 5000 rows"),
-        "auto-selected the newest: {text}"
-    );
-    assert!(
-        text.contains("/api/items/4999"),
-        "the list scrolled to the selection: {text}"
-    );
-    assert!(
-        text.contains(&format!("· {} paused", 5000 / 97 + 1)),
-        "{text}"
-    );
-
-    let t = Instant::now();
-    let _ = app.run_command("filter ~m POST & ~s 2xx");
-    let n = app.visible().len();
-    let filter_time = t.elapsed();
-    assert!(n > 0 && n < 5000, "{n}");
-
-    let t = Instant::now();
-    let _ = app.update(Action::PaletteOpen);
-    for c in "items/49".chars() {
-        let _ = app.update(Action::Input(c));
-    }
-    let items = app.palette_items().len();
-    let palette_time = t.elapsed();
-    assert!(items > 0);
-
-    eprintln!(
-        "tester: 5000 flows — ingest {ingest:?}, refresh {refresh:?}, render 200×50 {render_time:?}, filter {filter_time:?} ({n} rows), palette {palette_time:?} ({items} items)"
-    );
-    for (what, d) in [
-        ("ingest", ingest),
-        ("refresh", refresh),
-        ("render", render_time),
-        ("filter", filter_time),
-        ("palette", palette_time),
-    ] {
-        assert!(d < INTERACTIVE, "{what} took {d:?} (bound {INTERACTIVE:?})");
-    }
-}
-
-fn five_mb_json() -> String {
-    let mut body = String::with_capacity(5 * 1024 * 1024 + 128);
-    body.push('[');
-    let mut i = 0usize;
-    while body.len() < 5 * 1024 * 1024 {
-        let _ = write!(
-            body,
-            "{{\"id\":{i},\"name\":\"item-{i}\",\"price\":{}.5,\"tags\":[\"a\",\"b\"],\"in_stock\":{}}},",
-            i % 1000,
-            i.is_multiple_of(2)
-        );
-        i += 1;
-    }
-    body.pop();
-    body.push(']');
-    body
-}
-
-/// An app on the Response pane of a flow whose response body is 5 MB of JSON.
-fn big_body_app() -> (App, String) {
-    let text = five_mb_json();
-    let mut app = App::new(TermCaps::full(), "x");
-    let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, &["flow.list", "flow.get", "flow.detail"], None);
-    let _ = app.on_bus(BusEvent::Flows(vec![summary(
-        "big",
-        "GET",
-        "api.test",
-        "/big",
-        Some(200),
-        "observed",
-    )]));
-    let detail = FlowDetail::from_json(&json!({
-        "id": "big", "kind": "http",
-        "request": {"method":"GET","path":"/big","headers":[]},
-        "response": {"status":200,"headers":[["content-type","application/json"]],
-                     "body": aitm_tui::base64::encode(text.as_bytes())},
-    }))
-    .unwrap();
-    let t = Instant::now();
-    let _ = app.on_bus(BusEvent::Detail(Box::new(detail)));
-    eprintln!(
-        "tester: 5 MB body base64-decoded through on_bus in {:?}",
-        t.elapsed()
-    );
-    app.mode = Mode::Inspector;
-    app.inspector.pane = Pane::Response;
-    (app, text)
-}
-
-fn response_tab(app: &mut App, name: &str) {
-    app.inspector.response_tab = RESPONSE_TABS.iter().position(|t| *t == name).unwrap();
-}
 
 #[test]
 fn a_five_megabyte_json_body_renders_without_panicking() {
@@ -524,34 +268,8 @@ fn a_five_megabyte_json_body_renders_without_panicking() {
     // asserts above; the per-stage wall-clock is logged for diagnostics only, not
     // gated here. A strict bound in a debug build false-fails under loaded/parallel
     // CI runners (local ~0.75 s, CI ~2.7 s); frame timing is gated by the dedicated
-    // `inspector_frames_with_a_five_megabyte_body_do_not_freeze` test instead.
-}
-
-/// FINDING (fixed): the inspector rebuilt the whole viewer on every frame
-/// (and the JSON tab rebuilt the tree three times: `json_cursor_path` for the
-/// tab row, `content`, and again for the cursor). With a 5 MB body selected a
-/// single frame cost more than the 250 ms tick, so the UI froze while that
-/// flow was selected. §2.7: "Large bodies stream in pages". The bound is the
-/// generous CI-tolerant `BULK` ceiling (see its doc), not a tight 2 s, so the
-/// regression guard survives loaded CI runners.
-#[test]
-fn inspector_frames_with_a_five_megabyte_body_do_not_freeze() {
-    let (mut app, _) = big_body_app();
-    let mut report = String::new();
-    let mut slow = Vec::new();
-    for tab in ["Body", "Raw", "JSON", "Hex"] {
-        response_tab(&mut app, tab);
-        let t = Instant::now();
-        let frame = text_of(&app, 200, 50);
-        let d = t.elapsed();
-        assert!(frame.contains("Response  Headers"), "{tab}: {frame}");
-        let _ = write!(report, "{tab} {d:?}  ");
-        if d >= BULK {
-            slow.push(format!("{tab} tab frame {d:?}"));
-        }
-    }
-    eprintln!("tester: one inspector frame at 200×50 with a 5 MB body — {report}");
-    assert!(slow.is_empty(), "{}", slow.join(", "));
+    // `inspector_frames_with_a_five_megabyte_body_do_not_freeze` test in
+    // `tests/perf.rs` instead.
 }
 
 // ------------------------------------------------------- the random walk
@@ -571,7 +289,7 @@ fn a_random_walk_through_every_mode_including_browser_ca_and_confirm_never_panic
 
 fn walk(seed0: u64, cols: u16, rows: u16) {
     let codes = key_codes();
-    let mut app = sample_app_at(cols, rows);
+    let mut app = sample_app(cols, rows);
     let mut seed = seed0;
     let mut next = move || {
         seed ^= seed << 13;
@@ -579,108 +297,108 @@ fn walk(seed0: u64, cols: u16, rows: u16) {
         seed ^= seed << 17;
         seed
     };
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failure = None;
     let mut visited: HashSet<String> = HashSet::new();
     let (mut c, mut r) = (cols, rows);
-    for step in 0..3000usize {
-        visited.insert(format!("{:?}", app.mode));
-        let roll = next() % 20;
-        let outcome = catch_unwind(AssertUnwindSafe(|| {
-            match roll {
-                // Steer into the new modes and feed the bus events their
-                // calls would produce.
-                0 => {
-                    let _ = app.run_command("ca");
-                }
-                1 => {
-                    let _ = app.run_command("ca.install");
-                }
-                2 => {
-                    let _ = app.update(Action::OpenBrowser);
-                }
-                3 => {
-                    let _ = app.on_bus(ok(
-                        "browser.get_dom",
-                        json!("<div><p id=x>a < b<span class='y'>"
-                            .repeat(usize::try_from(next() % 300).unwrap_or(1))),
-                    ));
-                }
-                4 => {
-                    let _ = app.on_bus(ok(
-                        "browser.screenshot",
-                        json!(aitm_tui::base64::encode(
-                            b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x03"
-                        )),
-                    ));
-                }
-                5 => {
-                    let _ = app.on_bus(BusEvent::Toast(Level::Error, "engine gone".into()));
-                }
-                6 => {
-                    let _ = app.on_bus(ok("ca.status", json!({"installed": true, "path": "/x"})));
-                }
-                7 => {
-                    let _ = app.on_bus(BusEvent::DetailFailed("f41".into()));
-                }
-                8 => {
-                    let _ = app.on_bus(BusEvent::Flows(vec![
-                        summary(
-                            "f41",
-                            "GET",
-                            "api.shop-staging.test",
-                            "/api/products",
-                            Some(200),
-                            "observed",
-                        ),
-                        summary("z1", "POST", "new.test", "/n", None, "intercepted"),
-                    ]));
-                }
-                9 => {
-                    let _ = app.on_bus(BusEvent::Disconnected("reset".into()));
-                    let _ = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
-                }
-                _ => {
-                    let code = codes[(next() as usize) % codes.len()];
-                    let m = if next() % 7 == 0 {
-                        KeyModifiers::CONTROL
-                    } else {
-                        KeyModifiers::NONE
-                    };
-                    if let Some(action) = keys::map(KeyEvent::new(code, m), app.mode) {
-                        if action != Action::Quit {
-                            let _ = app.update(action);
+    quietly(|| {
+        for step in 0..3000usize {
+            visited.insert(format!("{:?}", app.mode));
+            let roll = next() % 20;
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                match roll {
+                    // Steer into the new modes and feed the bus events their
+                    // calls would produce.
+                    0 => {
+                        let _ = app.run_command("ca");
+                    }
+                    1 => {
+                        let _ = app.run_command("ca.install");
+                    }
+                    2 => {
+                        let _ = app.update(Action::OpenBrowser);
+                    }
+                    3 => {
+                        let _ = app.on_bus(ok(
+                            "browser.get_dom",
+                            json!("<div><p id=x>a < b<span class='y'>"
+                                .repeat(usize::try_from(next() % 300).unwrap_or(1))),
+                        ));
+                    }
+                    4 => {
+                        let _ = app.on_bus(ok(
+                            "browser.screenshot",
+                            json!(aitm_tui::base64::encode(
+                                b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x02\0\0\0\x03"
+                            )),
+                        ));
+                    }
+                    5 => {
+                        let _ = app.on_bus(BusEvent::Toast(Level::Error, "engine gone".into()));
+                    }
+                    6 => {
+                        let _ =
+                            app.on_bus(ok("ca.status", json!({"installed": true, "path": "/x"})));
+                    }
+                    7 => {
+                        let _ = app.on_bus(BusEvent::DetailFailed("f41".into()));
+                    }
+                    8 => {
+                        let _ = app.on_bus(BusEvent::Flows(vec![
+                            summary(
+                                "f41",
+                                "GET",
+                                "api.shop-staging.test",
+                                "/api/products",
+                                Some(200),
+                                "observed",
+                            ),
+                            summary("z1", "POST", "new.test", "/n", None, "intercepted"),
+                        ]));
+                    }
+                    9 => {
+                        let _ = app.on_bus(BusEvent::Disconnected("reset".into()));
+                        let _ = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
+                    }
+                    _ => {
+                        let code = codes[(next() as usize) % codes.len()];
+                        let m = if next() % 7 == 0 {
+                            KeyModifiers::CONTROL
+                        } else {
+                            KeyModifiers::NONE
+                        };
+                        if let Some(action) = keys::map(KeyEvent::new(code, m), app.mode) {
+                            if action != Action::Quit {
+                                let _ = app.update(action);
+                            }
                         }
                     }
                 }
+                if step % 25 == 0 {
+                    (c, r) = match next() % 5 {
+                        0 => (80, 24),
+                        1 => (120, 11),
+                        2 => (cols, rows),
+                        3 => (41, 5),
+                        _ => (200, 50),
+                    };
+                    let _ = app.update(Action::Resize(c, r));
+                }
+                let _ = text_of(&app, c, r);
+            }));
+            if let Err(e) = outcome {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                    .unwrap_or_default();
+                failure = Some(format!(
+                    "seed {seed0:#x} step {step} roll {roll} in {:?} at {c}×{r}: {msg}",
+                    app.mode
+                ));
+                break;
             }
-            if step % 25 == 0 {
-                (c, r) = match next() % 5 {
-                    0 => (80, 24),
-                    1 => (120, 11),
-                    2 => (cols, rows),
-                    3 => (41, 5),
-                    _ => (200, 50),
-                };
-                let _ = app.update(Action::Resize(c, r));
-            }
-            let _ = text_of(&app, c, r);
-        }));
-        if let Err(e) = outcome {
-            let msg = e
-                .downcast_ref::<String>()
-                .cloned()
-                .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
-                .unwrap_or_default();
-            failure = Some(format!(
-                "seed {seed0:#x} step {step} roll {roll} in {:?} at {c}×{r}: {msg}",
-                app.mode
-            ));
-            break;
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(failure.is_none(), "{}", failure.unwrap());
     for mode in [
         "Browser",
@@ -1076,12 +794,12 @@ fn status_bar_total_is_a_dash_until_a_size_is_known() {
         "no size is known without flow.detail: {status}"
     );
     assert!(!status.contains("0 B ↑"), "{status}");
-    // With details, the sum is real: `f50`'s request body and `f41`'s
-    // response body are both non-empty.
-    let full = sample_app();
+    // With details the total is the known body bytes — `f50`'s 68-byte
+    // request body plus `f41`'s 74-byte response body — in front of the F4
+    // throughput placeholder.
+    let full = sample_app(200, 50);
     let status = text_of(&full, 200, 50).lines().last().unwrap().to_string();
-    assert!(!status.contains("— ↑ — ↓ —"), "{status}");
-    assert!(!status.contains("0 B ↑"), "{status}");
+    assert!(status.contains("142 B ↑ — ↓ — (F4)"), "{status}");
     // With details whose bodies are all empty, `0 B` is the honest number.
     let mut empty = App::new(TermCaps::full(), "x");
     let _ = empty.update(Action::Resize(200, 50));
@@ -1225,7 +943,13 @@ fn tools_list_drives_detail_fetching() {
         vec![BusRequest::Refresh]
     );
     assert_eq!(toast(&app), "Killed");
-    // `ToolInfo::params` reads the schema a form is built from (§4.2 step 3).
+}
+
+/// `ToolInfo::params` reads the schema a form is built from (§4.2 step 3):
+/// one `Param` per property in schema order, with its type, whether
+/// `required` lists it, and its description (empty when absent).
+#[test]
+fn tool_info_params_reads_the_input_schema() {
     let t = ToolInfo {
         name: "x".into(),
         description: String::new(),
@@ -1468,7 +1192,7 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
 /// inspector back in the inspector.
 #[test]
 fn a_prompt_returns_to_the_mode_it_was_opened_from() {
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     let _ = app.update(Action::OpenScope);
     assert_eq!(app.mode, Mode::Scope);
     let _ = app.update(Action::PaletteOpen);
@@ -1584,7 +1308,7 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
         (PromptKind::BrowserEval, Mode::Browser),
     ];
     for (kind, home) in cases {
-        let mut app = sample_app();
+        let mut app = sample_app(200, 50);
         open(&mut app, kind);
         let _ = app.update(Action::Back);
         assert_eq!(app.mode, home, "Esc from {kind:?}");
@@ -1599,7 +1323,7 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
         (PromptKind::PocName, Mode::Flows, PromptKind::PocParam),
         (PromptKind::PocTarget, Mode::Findings, PromptKind::PocVars),
     ] {
-        let mut app = sample_app();
+        let mut app = sample_app(200, 50);
         open(&mut app, kind);
         let _ = app.update(Action::Back);
         assert_eq!(app.mode, home, "Esc from {kind:?}");
@@ -1608,7 +1332,7 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
         assert_eq!(app.mode, Mode::Prompt(next), "Enter from {kind:?}");
     }
     // Confirm: Enter on the blank line is a "no", like Esc — nothing is sent.
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     open(&mut app, PromptKind::Confirm);
     assert!(app.update(Action::Submit).is_empty());
     assert_eq!(toast(&app), "ca.install cancelled");
@@ -1688,7 +1412,7 @@ fn findings_o_opens_only_a_regular_file_that_is_an_image() {
     let real = dir.join("real.png");
     std::fs::write(&real, test_png()).unwrap();
 
-    let mut app = sample_app();
+    let mut app = sample_app(200, 50);
     // A local path is only opened from a loopback bus (C10): elsewhere the
     // bytes come through `poc.artifact`.
     app.bus_address = "127.0.0.1:9090".into();
@@ -2098,40 +1822,39 @@ fn a_bus_that_offers_no_tools_renders_every_mode_and_sends_nothing() {
     );
     let _ = app.update(Action::Back);
     // Every mode draws, at the design size and in an 80×24 terminal.
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
-    for mode in [
-        Mode::Flows,
-        Mode::Inspector,
-        Mode::QuickLook,
-        Mode::Scope,
-        Mode::Findings,
-        Mode::Agent,
-        Mode::Ca,
-        Mode::Browser,
-        Mode::Help,
-        Mode::Config,
-        Mode::Compose,
-        Mode::Prompt(PromptKind::Palette),
-        Mode::Prompt(PromptKind::Filter),
-        Mode::Prompt(PromptKind::Confirm),
-    ] {
-        for (c, r) in [(200u16, 50u16), (80, 24)] {
-            let mut a = app.clone();
-            a.mode = mode;
-            let _ = a.update(Action::Resize(c, r));
-            match catch_unwind(AssertUnwindSafe(|| text_of(&a, c, r))) {
-                Ok(text) if text.lines().count() == usize::from(r) => {}
-                Ok(text) => failures.push(format!(
-                    "{mode:?} at {c}×{r}: {} lines",
-                    text.lines().count()
-                )),
-                Err(_) => failures.push(format!("{mode:?} at {c}×{r}: panicked")),
+    quietly(|| {
+        for mode in [
+            Mode::Flows,
+            Mode::Inspector,
+            Mode::QuickLook,
+            Mode::Scope,
+            Mode::Findings,
+            Mode::Agent,
+            Mode::Ca,
+            Mode::Browser,
+            Mode::Help,
+            Mode::Config,
+            Mode::Compose,
+            Mode::Prompt(PromptKind::Palette),
+            Mode::Prompt(PromptKind::Filter),
+            Mode::Prompt(PromptKind::Confirm),
+        ] {
+            for (c, r) in [(200u16, 50u16), (80, 24)] {
+                let mut a = app.clone();
+                a.mode = mode;
+                let _ = a.update(Action::Resize(c, r));
+                match catch_unwind(AssertUnwindSafe(|| text_of(&a, c, r))) {
+                    Ok(text) if text.lines().count() == usize::from(r) => {}
+                    Ok(text) => failures.push(format!(
+                        "{mode:?} at {c}×{r}: {} lines",
+                        text.lines().count()
+                    )),
+                    Err(_) => failures.push(format!("{mode:?} at {c}×{r}: panicked")),
+                }
             }
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     // The inspector on a row without a detail says why, instead of an empty pane.
     app.mode = Mode::Inspector;
@@ -2186,17 +1909,16 @@ fn a_ten_thousand_entry_tools_list_with_an_empty_and_a_duplicate_name_still_rend
         "{:?}",
         items.iter().map(|i| &i.label).collect::<Vec<_>>()
     );
-    let previous_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let mut failures = Vec::new();
-    for (c, r) in [(200u16, 50u16), (80, 24), (80, 6), (41, 5)] {
-        let _ = app.update(Action::Resize(c, r));
-        match catch_unwind(AssertUnwindSafe(|| text_of(&app, c, r))) {
-            Ok(text) => assert_eq!(text.lines().count(), usize::from(r), "{c}×{r}"),
-            Err(_) => failures.push(format!("{c}×{r}")),
+    quietly(|| {
+        for (c, r) in [(200u16, 50u16), (80, 24), (80, 6), (41, 5)] {
+            let _ = app.update(Action::Resize(c, r));
+            match catch_unwind(AssertUnwindSafe(|| text_of(&app, c, r))) {
+                Ok(text) => assert_eq!(text.lines().count(), usize::from(r), "{c}×{r}"),
+                Err(_) => failures.push(format!("{c}×{r}")),
+            }
         }
-    }
-    std::panic::set_hook(previous_hook);
+    });
     assert!(
         failures.is_empty(),
         "the palette over 10 003 tools panics at: {}",
@@ -2304,4 +2026,228 @@ fn a_bus_drop_after_the_list_landed_keeps_the_rows_and_recovers_on_reconnect() {
         vec![BusRequest::Detail("b".into())]
     );
     assert!(text_of(&app, 200, 50).contains("loading detail…"));
+}
+
+// ------------------------------------- scope gates and untrusted bytes
+
+/// The `scan.discover` requests among `reqs`, as their `target` arguments.
+fn discover_targets(reqs: &[BusRequest]) -> Vec<String> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            BusRequest::Call { name, args } if name == "scan.discover" => Some(
+                args.get("target")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `:scan <target>` is scope-gated (deny-by-default): an out-of-scope host
+/// is refused with a toast that names it and nothing reaches the wire; an
+/// in-scope host — typed with a scheme, port, path and query — is reduced
+/// to its host and sent as exactly one `scan.discover`.
+#[test]
+fn scan_command_with_target_is_scope_gated() {
+    let mut app = connected_app(200, 50);
+    let _ = app.on_bus(BusEvent::Scope(vec!["api.shop-staging.test".into()]));
+    let reqs = app.run_command("scan evil.example");
+    assert_eq!(app.mode, Mode::Scan, "the view still opens");
+    assert!(!app.scan.running, "an out-of-scope target is not launched");
+    assert!(
+        discover_targets(&reqs).is_empty(),
+        "nothing reaches the wire for an out-of-scope host: {reqs:?}"
+    );
+    assert_eq!(
+        toast(&app),
+        "Out of scope — add `evil.example` to scope to scan it"
+    );
+
+    let mut app = connected_app(200, 50);
+    let _ = app.on_bus(BusEvent::Scope(vec!["api.shop-staging.test".into()]));
+    let reqs = app.run_command("scan https://api.shop-staging.test:8443/admin?x=1");
+    assert_eq!(app.mode, Mode::Scan);
+    assert!(app.scan.running);
+    assert_eq!(
+        discover_targets(&reqs),
+        vec!["http://api.shop-staging.test/".to_string()],
+        "the typed target is reduced to its in-scope host: {reqs:?}"
+    );
+    assert_eq!(
+        app.scan.target.as_deref(),
+        Some("http://api.shop-staging.test/")
+    );
+}
+
+/// A `browser.screenshot` reply that is not a PNG — other image magic, bytes
+/// that are no image, bad base64, a non-string — is labelled honestly with
+/// a typed placeholder, never trusted as an image, and never panics; `o`
+/// still hands the real bytes over; a 4 MiB PNG puts no byte on screen.
+#[test]
+fn browser_screenshot_of_non_png_bytes_is_labelled_not_trusted() {
+    let shot_facts = |app: &App| -> Option<(u32, u32, &'static str, usize)> {
+        app.browser
+            .screenshot
+            .as_ref()
+            .map(|s| (s.width, s.height, s.format, s.bytes.len()))
+    };
+    let mut app = connected_app(200, 50);
+    let _ = app.update(Action::OpenBrowser);
+    // JPEG magic: format from the bytes, dimensions unknown → no `W×H`.
+    let _ = app.on_bus(ok(
+        "browser.screenshot",
+        json!(aitm_tui::base64::encode(
+            b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"
+        )),
+    ));
+    assert_eq!(shot_facts(&app), Some((0, 0, "JPEG", 11)));
+    let text = text_of(&app, 200, 50);
+    assert!(
+        text.contains("[screenshot JPEG · 11 B · o to open]"),
+        "{text}"
+    );
+    assert!(!text.contains("0×0"), "{text}");
+    // Bytes that are no image at all.
+    let _ = app.on_bus(ok(
+        "browser.screenshot",
+        json!(aitm_tui::base64::encode(b"hello")),
+    ));
+    assert_eq!(shot_facts(&app), Some((0, 0, "image", 5)));
+    assert_eq!(app.browser.error, None);
+    let text = text_of(&app, 200, 50);
+    assert!(
+        text.contains("[screenshot image · 5 B · o to open]"),
+        "{text}"
+    );
+    let _ = app.update(Action::OpenExternally);
+    let target = app.take_open_target().expect("bytes are bytes");
+    assert_eq!(std::fs::read(&target.path).unwrap(), b"hello");
+    let _ = std::fs::remove_file(&target.path);
+    // Bad base64, an empty string, a number, an object: an error in the
+    // panel, the previous screenshot kept (no layout shift).
+    for bad in [
+        json!("!!!not base64!!!"),
+        json!(""),
+        json!(42),
+        json!({"png": "x"}),
+    ] {
+        let _ = app.update(Action::BrowserScreenshot);
+        assert_eq!(app.browser.error, None, "a new call clears the error");
+        let _ = app.on_bus(ok("browser.screenshot", bad.clone()));
+        assert_eq!(
+            app.browser.error.as_deref(),
+            Some("browser.screenshot: the result is not image bytes"),
+            "{bad}"
+        );
+        assert_eq!(app.browser.busy, None);
+        assert_eq!(shot_facts(&app), Some((0, 0, "image", 5)));
+        let text = text_of(&app, 200, 50);
+        assert!(
+            text.contains("error: browser.screenshot: the result is not image bytes"),
+            "{bad}: {text}"
+        );
+    }
+    // A 1×1 PNG with a 4 MiB tail: dimensions read from the header, no copy
+    // of the bytes into the screen. The wall-clock is logged, not gated —
+    // the timed tests live in `tests/perf.rs`.
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png.extend_from_slice(&1u32.to_be_bytes());
+    png.extend(std::iter::repeat_n(0xAAu8, 4 << 20));
+    let t = Instant::now();
+    let _ = app.on_bus(ok(
+        "browser.screenshot",
+        json!(aitm_tui::base64::encode(&png)),
+    ));
+    let text = text_of(&app, 200, 50);
+    eprintln!(
+        "tester: a 4 MiB screenshot folded and drawn in {:?}",
+        t.elapsed()
+    );
+    // `human_bytes` is decimal: 4 194 328 B → 4.2 MB.
+    assert!(
+        text.contains("[screenshot 1×1 PNG · 4.2 MB · o to open]"),
+        "{text}"
+    );
+    assert!(!text.contains('\u{aa}'), "no bytes on screen");
+}
+
+/// L4 inject is scope-gated before anything is sent and confirmed over the
+/// wire before the packet goes (L4OPS-AC10). Without an `inject` scope entry
+/// covering the flow's interface, `s` sends nothing and says so. With one,
+/// `s` sends exactly one `l4.inject` without `_confirm` (the probe); the
+/// server's `needs_confirmation` reply opens the confirm overlay and sends
+/// nothing; `n` cancels and sends nothing; `y` re-issues exactly one
+/// `l4.inject` with the identical arguments plus the server's token.
+#[test]
+fn l4_inject_is_scope_gated_and_confirmed_over_the_wire() {
+    let mut tools: Vec<&str> = CORE_TOOLS.to_vec();
+    tools.extend(["l4.flow.list", "l4.flow.get", "l4.scope.list", "l4.inject"]);
+    let mut app = App::new(TermCaps::full(), "x");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &tools, None);
+    let _ = app.on_bus(BusEvent::L4Flows(vec![json!({
+        "id": "l4-1", "kind": "capture", "interface": "lo0", "filter": "udp port 7",
+        "packet_count": 1, "injected_count": 0,
+        "packets": [{"dir": "inbound", "length": 33, "injected": false,
+                     "layers": ["IPv4", "UDP", "Raw"]}]
+    })]));
+    app.selected = Some("l4-1".into());
+    // A capture-only scope entry: refused locally, nothing on the wire.
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "interface": "lo0", "capability": "capture", "cidr": "127.0.0.1/32",
+        "ports": "0-65535", "direction": "outbound"
+    })]));
+    assert!(app.update(Action::L4Inject).is_empty());
+    assert_eq!(
+        toast(&app),
+        "Out of L4 scope — add an inject entry for `lo0` to inject"
+    );
+    assert_ne!(app.mode, Mode::L4Confirm);
+    // An inject entry covering lo0: the probe goes out, once, without `_confirm`.
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "interface": "lo0", "capability": "inject", "cidr": "127.0.0.1/32",
+        "ports": "7-7", "direction": "outbound"
+    })]));
+    let reqs = app.update(Action::L4Inject);
+    let [BusRequest::Call { name, args }] = reqs.as_slice() else {
+        panic!("exactly one call: {reqs:?}");
+    };
+    assert_eq!(name, "l4.inject");
+    assert_eq!(args["interface"], "lo0");
+    assert_eq!(args["dst"], "127.0.0.1");
+    assert_eq!(args["spec"]["layers"][1]["udp"]["dst_port"], 7);
+    assert!(args.get("_confirm").is_none(), "{args}");
+    assert_ne!(
+        app.mode,
+        Mode::L4Confirm,
+        "the overlay waits for the server's reply"
+    );
+    // The server asks for confirmation: the overlay opens, nothing is sent.
+    let reply = json!({
+        "status": "needs_confirmation",
+        "prompt": "Inject 1 UDP to 127.0.0.1:7 on lo0?",
+        "confirm_token": "tok-9"
+    });
+    assert!(app.on_bus(ok("l4.inject", reply)).is_empty());
+    assert_eq!(app.mode, Mode::L4Confirm);
+    assert!(
+        text_of(&app, 200, 50).contains("Inject 1 UDP to 127.0.0.1:7 on lo0?"),
+        "{}",
+        text_of(&app, 200, 50)
+    );
+    // `n`: cancelled, nothing sent.
+    let mut cancelled = app.clone();
+    let no = keys::map(press(KeyCode::Char('n')), cancelled.mode).unwrap();
+    assert!(cancelled.update(no).is_empty());
+    assert_eq!(cancelled.mode, Mode::Inspector);
+    assert_eq!(toast(&cancelled), "l4.inject cancelled");
+    // `y`: exactly one l4.inject, the identical arguments plus the token.
+    let yes = keys::map(press(KeyCode::Char('y')), app.mode).unwrap();
+    let mut confirmed = args.clone();
+    confirmed["_confirm"] = json!("tok-9");
+    assert_eq!(app.update(yes), vec![call("l4.inject", confirmed)]);
+    assert_eq!(app.mode, Mode::Inspector);
 }

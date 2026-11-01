@@ -4224,6 +4224,7 @@ pub fn parse_kv_args(rest: &str, tool: Option<&ToolInfo>) -> Result<Value, Strin
 mod tests {
     use super::*;
     use crate::model::ProxyStatus;
+    use crate::summary;
     use serde_json::json;
 
     fn tools(names: &[&str]) -> Vec<ToolInfo> {
@@ -4272,18 +4273,6 @@ mod tests {
         let _ = app.on_bus(connected(Some("agent")));
         assert!(!app.role_mismatch());
         assert_eq!(app.resolved_role(), Some("agent"));
-    }
-
-    fn summary(
-        id: &str,
-        method: &str,
-        authority: &str,
-        path: &str,
-        status: Option<u16>,
-        intercept: &str,
-    ) -> Value {
-        json!({"id":id,"kind":"http","method":method,"scheme":"https","authority":authority,"path":path,
-               "status":status,"is_replay":false,"intercept":intercept})
     }
 
     fn app_with_flows() -> App {
@@ -5192,7 +5181,7 @@ mod tests {
         let _ = remote.on_bus(BusEvent::Findings(findings(&path)));
         assert!(remote.findings[0].yaml.is_none());
         assert!(remote.findings[1].yaml_error.is_none());
-        assert!(!App::new(TermCaps::full(), "fixture").is_loopback_bus());
+        assert!(!App::new(TermCaps::full(), "remote.test:9090").is_loopback_bus());
         let _ = std::fs::remove_file(&path);
     }
 
