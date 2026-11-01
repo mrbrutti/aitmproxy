@@ -16,10 +16,14 @@
 //!   material, and `https://target.example@canary/` goes to the canary;
 //! - the host is lower-cased and an IPv6 literal loses its brackets in
 //!   [`Authority::host`] and gets them back in [`Authority::host_literal`];
-//! - a port that is not a number makes the whole URL unusable, rather than
-//!   being quietly ignored;
-//! - a host with anything but ASCII letters, digits, `.`, `-`, `_` or (for an
-//!   IPv6 literal) `:` is unusable.
+//! - a port that is not a number, or is `0`, makes the whole URL unusable,
+//!   rather than being quietly ignored or read as "no port";
+//! - a host with anything but ASCII letters, digits, `.`, `-`, `_` is
+//!   unusable, except an IPv6 literal, which must be **bracketed** and must
+//!   parse as an address: `::1` without brackets and `host:p:p` (two colons,
+//!   not an address) are both unusable;
+//! - an authority that is not its own trimmed form (`origin.test\r\n`) is
+//!   unusable; only the URL as a whole may be padded.
 //!
 //! [`Authority::origin_key`] is the **canonical** form: lower-case host, the
 //! scheme's default port filled in, one string. Anything that compares two
@@ -104,15 +108,22 @@ pub(crate) fn split_url(url: &str) -> Option<(Authority, &str)> {
     let (authority, rest) = after.split_at(end);
     // Userinfo is credential material; it names no host and never travels.
     let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
-    if authority.is_empty() {
+    // The core parser trims what it is given, so `origin.test\r\n` would come
+    // back as `origin.test`; an authority with padding inside the URL is not
+    // one a client wrote, and it is refused rather than tidied.
+    if authority.is_empty() || authority != authority.trim() {
         return None;
     }
 
     // Port 0 is the core parser's "no port was written" sentinel, the same one
-    // `Authority::matches_scope_entry` uses; a URL that really writes `:0`
-    // names no port a client could dial.
+    // `Authority::matches_scope_entry` uses. A URL that really writes `:0`
+    // names no port a client could dial, so a written port that parses to the
+    // sentinel is refused too.
     let parsed = CoreAuthority::parse_with_default(authority, 0).ok()?;
-    if !host_is_usable(&parsed.host) {
+    if !host_is_usable(authority, &parsed.host) {
+        return None;
+    }
+    if wrote_a_port(authority) && parsed.port == 0 {
         return None;
     }
     Some((
@@ -125,13 +136,36 @@ pub(crate) fn split_url(url: &str) -> Option<(Authority, &str)> {
     ))
 }
 
-/// Whether `host` is something a client could dial: non-empty ASCII letters,
-/// digits, `.`, `-`, `_`, or the colons of an IPv6 literal.
-fn host_is_usable(host: &str) -> bool {
+/// Whether `written` (the authority as the URL spelt it, userinfo dropped)
+/// carries a port: `[v6]:port`, or `host:port`. Everything with two or more
+/// bare colons was already refused by [`host_is_usable`], so a bare colon
+/// here is the port separator.
+fn wrote_a_port(written: &str) -> bool {
+    match written.strip_prefix('[') {
+        Some(rest) => rest
+            .split_once(']')
+            .is_some_and(|(_, after)| after.starts_with(':')),
+        None => written.contains(':'),
+    }
+}
+
+/// Whether `host` (as the core parser read it out of `written`) is something
+/// a client could dial: non-empty ASCII letters, digits, `.`, `-`, `_`; or an
+/// IPv6 literal, which must have been **bracketed** in the URL and must parse
+/// as an address. Brackets hold nothing else: `[1.2.3.4]` is not a host.
+///
+/// The core parser reads any multi-colon authority as a bare IPv6 literal
+/// (`::1`, but also `origin.test:8443:9443`); here that heuristic buys
+/// nothing, because a URL that names a raw-socket target spells an IPv6 host
+/// in brackets or not at all (security re-review S2-1, tester T2-1).
+fn host_is_usable(written: &str, host: &str) -> bool {
+    if written.starts_with('[') || host.contains(':') {
+        return written.starts_with('[') && host.parse::<std::net::Ipv6Addr>().is_ok();
+    }
     !host.is_empty()
         && host
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':'))
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
 }
 
 #[cfg(test)]
@@ -190,6 +224,8 @@ mod tests {
             "///",
             "https://exa mple.test/",
             "https://origin.test:https/x",
+            "https://origin.test:443:443/x",
+            "https://a:b:c/",
         ] {
             assert_eq!(parts(url), None, "{url}");
         }
@@ -301,75 +337,57 @@ mod tests {
         );
     }
 
-    /// The core parser reads a multi-colon authority as an unbracketed IPv6
-    /// literal, so `https://::1/x` is accepted — **as the same origin as the
-    /// bracketed form**, never as a host with a port cut from the middle. An
-    /// unterminated bracket is unusable. (The strict reading, that an
-    /// unbracketed literal is no URL at all, is the tester finding pinned in
-    /// `lenient_authorities_should_be_unusable`.)
+    /// An IPv6 literal is a host only in brackets. The core parser would read
+    /// a multi-colon authority as a bare literal; here `https://::1/x` names
+    /// nothing, and so cannot be mistaken for a port cut from the middle of
+    /// an address, while the bracketed spelling of the same address parses.
+    /// An unterminated bracket is unusable too.
     #[test]
-    fn an_unbracketed_ipv6_literal_is_read_as_the_bracketed_one() {
+    fn an_unbracketed_ipv6_literal_is_unusable_and_the_bracketed_one_parses() {
         for (loose, bracketed) in [
             ("https://::1/x", "https://[::1]/x"),
             ("https://2001:db8::1/x", "https://[2001:db8::1]/x"),
         ] {
-            let a = authority_of(loose).expect("accepted");
-            assert_eq!(a.port, None, "{loose}: no colon may be read as a port");
-            assert_eq!(
-                a.origin_key(),
-                authority_of(bracketed).and_then(|b| b.origin_key()),
-                "{loose} must be the origin {bracketed} names or nothing"
-            );
-            assert!(
-                a.host_literal().starts_with('['),
-                "{loose}: {}",
-                a.host_literal()
-            );
+            assert_eq!(parts(loose), None, "{loose}");
+            let a = authority_of(bracketed).expect("the bracketed literal parses");
+            assert_eq!(a.port, None, "{bracketed}");
+            assert!(a.host_literal().starts_with('['), "{}", a.host_literal());
         }
         assert_eq!(parts("https://[::1/x"), None);
+        // Brackets do not make an address of something that is not one.
+        assert_eq!(parts("https://[origin.test:8443]/x"), None);
+        assert_eq!(parts("https://[1.2.3.4]/x"), None);
     }
 
     /// A host that is not an IPv6 address but carries two colons
-    /// (`origin.test:8443:9443`) is accepted as a literal by the core parser.
-    /// What must hold is that it can never be mistaken for the real origin
-    /// spelt any ordinary way: its canonical key is the bracketed garbage, so
-    /// the h2 gate refuses it against every profile that names the host.
+    /// (`origin.test:8443:9443`) names nothing: it is neither a host with a
+    /// port nor an address, so no profile origin can authorise it and no
+    /// raw socket is ever opened towards it.
     #[test]
-    fn a_doubled_port_never_collides_with_a_real_origin() {
-        let a = authority_of("https://origin.test:8443:9443/x").expect("accepted");
-        let key = a.origin_key().expect("has a key");
-        assert_eq!(key, "https://[origin.test:8443:9443]:443");
-        for real in [
-            "https://origin.test",
-            "https://origin.test:8443",
-            "https://origin.test:9443",
-            "https://origin.test:443",
+    fn a_doubled_port_is_unusable() {
+        for url in [
+            "https://origin.test:8443:9443/x",
+            "https://origin.test:443:443/x",
+            "https://origin.test:8443:/x",
         ] {
-            assert_ne!(
-                authority_of(real).and_then(|r| r.origin_key()).as_deref(),
-                Some(key.as_str()),
-                "{real} must not authorise origin.test:8443:9443"
-            );
+            assert_eq!(parts(url), None, "{url}");
         }
     }
 
-    /// Tester finding (F3 pass, Minor): four authorities the parser accepts
-    /// should be unusable — an IPv6 literal without brackets, a non-address
-    /// host with two colons (`host_is_usable` admits `:` for any host, not
-    /// only for one that parses as an `Ipv6Addr`), an authority whose
-    /// trailing CR/LF the core parser trims away, and `:0`, which the parser
-    /// reads as "no port" and so dials the scheme's default. Each is contained
-    /// today: the gated key is the dialled key, the wire authority is rebuilt
-    /// from the parsed host, and no plainly written profile origin equals the
-    /// garbage. Un-ignore with the fix.
+    /// Tester finding (F3 pass, Minor), fixed in F5: four authorities the
+    /// parser used to accept are unusable — an IPv6 literal without brackets,
+    /// a non-address host with two colons, an authority whose trailing CR/LF
+    /// the core parser would trim away, and `:0`, which the core parser reads
+    /// as "no port" and would so have dialled the scheme's default.
     #[test]
-    #[ignore = "tester finding: url.rs accepts unbracketed IPv6, host:p:p, a CR/LF-trailed authority and :0"]
     fn lenient_authorities_should_be_unusable() {
         for url in [
             "https://::1/x",
             "https://origin.test:8443:9443/x",
             "https://origin.test\r\n/x",
             "https://origin.test:0/x",
+            "https://[::1]:0/x",
+            "https://origin.test:00/x",
         ] {
             assert_eq!(parts(url), None, "{url:?}");
         }
@@ -421,17 +439,17 @@ mod tests {
         );
     }
 
-    /// Control bytes and whitespace inside the authority are not a host; the
-    /// URL as a whole may be padded with whitespace, which is trimmed. A CR/LF
-    /// that *trails* the authority is trimmed by the core parser too (the
-    /// finding above); what must hold then is that the host that comes back,
-    /// and therefore anything written to the wire from it, carries none of it.
+    /// Control bytes and whitespace inside or around the authority are not a
+    /// host; only the URL as a whole may be padded with whitespace, which is
+    /// trimmed. A CR/LF that *trails* the authority is what the core parser
+    /// would quietly trim away, so it is refused here before the parser sees
+    /// it.
     #[test]
     fn control_bytes_in_the_authority_are_unusable_and_padding_is_trimmed() {
-        let trailed = authority_of("https://origin.test\r\n/x").expect("accepted");
-        assert_eq!(trailed.host, "origin.test");
-        assert!(!trailed.as_written().contains(['\r', '\n', ' ']));
         for url in [
+            "https://origin.test\r\n/x",
+            "https://origin.test /x",
+            "https:// origin.test/x",
             "https://origin\ttest/x",
             "https://origin.test\u{0}/x",
             "https://origin.test%0d%0a/x",
