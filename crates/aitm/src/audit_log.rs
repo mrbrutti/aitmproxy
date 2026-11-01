@@ -2532,6 +2532,22 @@ mod tests {
         );
     }
 
+    /// A file `open_private` creates is `0600` from the moment it exists, not
+    /// only after `restrict_to_owner` has run: a local process that opens it in
+    /// between would keep a read descriptor that survives the later `chmod`.
+    #[cfg(unix)]
+    #[test]
+    fn open_private_creates_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("create-mode");
+        let path = dir.join("audit.jsonl");
+        let _file = open_private(&path, true)
+            .unwrap_or_else(|e| panic!("creating a private file failed: {e}"));
+        let mode = fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "mode of a file straight out of open_private");
+    }
+
     /// Mechanism for AC5: a missing nested parent is created `0700`, the file is
     /// created `0600`, and it holds exactly the `start` marker, with the keys,
     /// values and size the spec fixes.
