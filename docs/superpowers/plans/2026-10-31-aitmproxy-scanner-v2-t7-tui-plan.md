@@ -762,6 +762,7 @@ Kept by the main session during stage 6. One row per finding.
 | 17 | core gap | relayed | `poc.list` cannot see the engine's per-run PoC subdirectories; `P`'s strong branch unreachable on every UI | coordinator (core track); the fallback toast passes |
 | 15 | live smoke | run 8 | 57 ok, 1 noted, 3 failed: all three are the two-second scan racing the "while running" observations (run 7 passed those); everything else live incl. `P`'s fallback toast | ruling asked: target latency option (T10) or timing-sensitive checks recorded per run |
 | 15 | ruling | (a) | T10 adds `--latency-ms` on the target and `Target(latency_ms=)`; the cell boots with 40 ms (H81): the fix for the "sampling races a fast job" class | PR opens under (b) stated honestly; definitive run before "ready" |
+| 17 | integration | draft PR | `claude/scanner-v2-t7-c8c950` pushed at `0ded0aeb`; draft PR #255 against main (depends on #232; body carries the eight runs, the (b) caveat, the panel so far and the plan to leave draft) | merge main after #232, port tests, H60/H61, gates, run 9, definitive run, panel comment, un-draft |
 
 ## Shipped
 
