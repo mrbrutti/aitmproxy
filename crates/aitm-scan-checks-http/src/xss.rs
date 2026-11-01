@@ -60,7 +60,10 @@ impl XssReflected {
             meta: CheckMeta {
                 id: "xss-reflected".to_string(),
                 name: "Reflected cross-site scripting".to_string(),
-                class: "xss".to_string(),
+                // D6's taxonomy token, which the engine's HTTP lane emits for
+                // the same class; dedupe groups issues by it, so the two must
+                // agree (cross-track vocabulary decision, 2026-11-01).
+                class: "reflected-xss".to_string(),
                 lanes: vec![LaneKind::Http],
                 kinds: vec![
                     InsertionKind::Query,

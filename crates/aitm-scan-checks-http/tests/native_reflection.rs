@@ -157,7 +157,7 @@ async fn xss_reflected_meta_is_the_session_call_s3_entry() {
     let meta = check.meta();
 
     assert_eq!(meta.id, "xss-reflected");
-    assert_eq!(meta.class, "xss");
+    assert_eq!(meta.class, "reflected-xss");
     assert_eq!(meta.lanes, vec![LaneKind::Http]);
     assert_eq!(
         meta.kinds,

@@ -22,7 +22,10 @@
 //! A check's `class` carries the taxonomy token rather than its id, so the two
 //! SQL-injection techniques (and the Rhai `sqli` script beside them) dedupe
 //! into one issue, while the five h2 observations keep five distinct classes
-//! and stay five issues (spec D6, session call S3).
+//! and stay five issues (spec D6, session call S3). The tokens are `sqli`,
+//! `cmdi`, `reflected-xss`, `open-redirect` and the five `h2-*`; they are
+//! D6's spelling, shared with the engine's own lane, because an issue is
+//! deduped by class and a token that differs by a word is a second issue.
 //!
 //! The layout is one module per technique, plus two shared, dependency-light
 //! toolboxes every technique draws on:

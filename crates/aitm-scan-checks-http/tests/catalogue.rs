@@ -104,7 +104,9 @@ fn the_shared_classes_match_the_taxonomy() {
     // boolean differential and by the timing oracle yields one issue, not two.
     assert_eq!(class_of("sqli-boolean"), "sqli");
     assert_eq!(class_of("sqli-time"), "sqli");
-    assert_eq!(class_of("xss-reflected"), "xss");
+    // D6's spelling, which the engine's interim lane emits; dedupe is by
+    // class, so the native check and the lane must agree on the token.
+    assert_eq!(class_of("xss-reflected"), "reflected-xss");
     assert_eq!(class_of("open-redirect"), "open-redirect");
 }
 
