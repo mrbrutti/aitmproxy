@@ -68,6 +68,8 @@ __all__ = [
     "issues",
     "issue",
     "ScanTarget",
+    "boot_target",
+    "until",
     "TargetLogs",
     "Canary",
     "ledger_flush",
@@ -641,6 +643,30 @@ class ScanTarget:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+def until(pred, timeout: float, interval: float = 0.05) -> bool:
+    """Poll `pred()` until it is truthy or `timeout` seconds pass; return the last
+    result. A deadline poll replaces fixed sleeps so cells wait exactly as long as
+    the condition needs."""
+    deadline = time.monotonic() + timeout
+    while True:
+        result = pred()
+        if result:
+            return result
+        if time.monotonic() >= deadline:
+            return result
+        time.sleep(interval)
+
+
+def boot_target(mode: str = "vulnerable", **kw) -> "ScanTarget":
+    """`ScanTarget(mode, **kw)`, except a missing serve binary is one consistent
+    loud SKIP (exit 77) instead of a traceback or a per-cell except block."""
+    try:
+        return ScanTarget(mode, **kw)
+    except FileNotFoundError as e:
+        skip(str(e))
+        raise  # unreachable: skip() exits; keeps the return type honest for readers
 
 
 # ---------------------------------------------------------------------------
