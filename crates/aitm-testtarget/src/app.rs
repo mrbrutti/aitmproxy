@@ -1197,13 +1197,13 @@ mod tests {
 
     /// `--latency-ms` (T7 ruling): every HTTP response, routed or 404, in V and
     /// P alike, waits the configured time; zero adds nothing.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn latency_delays_every_response_and_zero_is_a_noop() {
         let latency = Duration::from_millis(150);
         for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
             let (state, conn) = fresh_with_latency(mode, latency);
             for path in ["/", "/nope", "/search?q=x"] {
-                let t0 = std::time::Instant::now();
+                let t0 = tokio::time::Instant::now();
                 let resp = get_on(&state, &conn, path).await;
                 let took = t0.elapsed();
                 assert!(took >= latency, "{mode:?} {path}: {took:?} < {latency:?}");
@@ -1213,7 +1213,7 @@ mod tests {
                 );
             }
             let (state, conn) = fresh(mode);
-            let t0 = std::time::Instant::now();
+            let t0 = tokio::time::Instant::now();
             get_on(&state, &conn, "/").await;
             assert!(
                 t0.elapsed() < latency,
