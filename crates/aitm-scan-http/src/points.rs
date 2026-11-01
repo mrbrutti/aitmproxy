@@ -435,9 +435,12 @@ fn finish(
     }
 }
 
-/// The request's URL as captured: `scheme://authority/path?query`.
+/// The URL every point of this request carries: `scheme://authority/path?query`
+/// as captured, passed through [`redact::safe_url`] so a credential in the
+/// query (`?token=…`) or the userinfo never reaches `scan.sitemap` results.
+/// The origin and path stay parseable, which is all `probe_host_for` needs.
 fn request_url_text(req: &HttpRequest) -> String {
-    format!("{}://{}{}", req.scheme, req.authority, req.path)
+    redact::safe_url(&format!("{}://{}{}", req.scheme, req.authority, req.path))
 }
 
 /// Whether this header name is never an insertion point.
@@ -936,6 +939,40 @@ mod tests {
             Err(err) => err.to_string(),
         };
         assert!(message.contains('('), "{message}");
+    }
+
+    /// The URL a point carries is the captured one with its credentials removed
+    /// (orchestrator ruling on stage-5 F2): a secret-keyed query value becomes
+    /// `<redacted>`, the origin and path stay parseable for `probe_host_for`.
+    #[test]
+    fn point_url_is_the_safe_url() {
+        let flow = captured_flow(
+            request("GET", "http://t:8080/cb?token=abc&q=1", &[], None),
+            200,
+            &[],
+            b"",
+        );
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let out = enumerate_v2(
+            &flow,
+            &EnumerateOptions::from_profile(&profile, &ignore, None),
+        );
+        assert!(!out.points.is_empty());
+        for p in &out.points {
+            assert_eq!(
+                p.url.as_deref(),
+                Some("http://t:8080/cb?token=<redacted>&q=1"),
+                "{}",
+                p.id
+            );
+        }
+        // The credential itself is session material: never a point, only seen.
+        assert!(!has_named(&out, Query, "token"));
+        assert!(out.seen.contains(&ParamRef {
+            kind: Query,
+            name: "token".to_string(),
+        }));
     }
 
     /// A body parser's error names the markup it choked on; the log line that
