@@ -12,6 +12,9 @@ use std::io::{Read as _, Write as _};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use aitm_scan_model::{
+    JobEvent, JobNotification, JobStatus, ListResult, JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
+};
 use serde_json::{json, Map, Value};
 
 use crate::action::ToolSchema as _;
@@ -23,7 +26,10 @@ use crate::model::{
     FlowKind, FlowRow, Message, Severity,
 };
 use crate::open::{self, OpenTarget};
-use crate::scan::{ScanOffer, ScanState, ScanTab};
+use crate::scan::{
+    parse_result, tag_keyed, ScanError, ScanOffer, ScanState, ScanTab, LIST_POLL_TICKS,
+    STATUS_POLL_TICKS,
+};
 use crate::theme::Theme;
 use crate::viewers::json;
 
@@ -894,6 +900,9 @@ pub struct App {
     /// and `l4_intercept_verb` set `Mode::Inspector`, the scanner launch (Task
     /// 12) sets `Mode::Scan`.
     pub wire_confirm_from: Mode,
+    /// A non-job push line arrived since the last `Tick` (spec D5): the flow
+    /// list is stale and the next tick issues one `Refresh` for all of them.
+    pub flows_dirty: bool,
 }
 
 impl App {
@@ -958,6 +967,7 @@ impl App {
             scan: ScanState::default(),
             wire_confirm: None,
             wire_confirm_from: Mode::Flows,
+            flows_dirty: false,
         }
     }
 
@@ -1331,6 +1341,14 @@ impl App {
                 self.ticks += 1;
                 let t = self.ticks;
                 self.toasts.retain(|x| x.expires_at_tick > t);
+                // Every push line since the last tick collapses into one
+                // flow sweep (spec D5): a subscribed bus can deliver many
+                // lines per second and the list only needs one refresh.
+                if self.flows_dirty {
+                    self.flows_dirty = false;
+                    out.push(BusRequest::Refresh);
+                }
+                self.scan_tick(t, &mut out);
             }
             Action::Resize(w, h) => {
                 self.width = w;
@@ -1738,6 +1756,10 @@ impl App {
                         self.scan.legacy.target = Some(format!("http://{host}/"));
                     }
                 }
+                // D6, first row: opening the view lists the jobs. Quiet when
+                // the bus has no `scan.list` (a legacy bus): the Jobs tab's
+                // degraded text says so, a toast on every open would not.
+                self.request_scan_list(&mut out);
             }
             Action::ScanLaunch => {
                 if self.scan.legacy.running {
@@ -3377,6 +3399,10 @@ impl App {
             BusEvent::Disconnected(why) => {
                 self.bus = BusStatus::Disconnected(why.clone());
                 self.browser_forget_inflight();
+                // Nothing tagged before the drop will be answered (D4), and
+                // a launch in flight is lost with the connection.
+                self.scan.inflight.clear();
+                self.scan.launch.pending = None;
                 self.toast(Level::Error, format!("bus: {why}"));
             }
             BusEvent::Flows(summaries) => {
@@ -3880,12 +3906,219 @@ impl App {
                 self.toast(Level::Error, message);
             }
             BusEvent::Toast(level, text) => self.toast(level, text),
-            // An F4 push: whatever it says, the list is stale; poll now.
-            BusEvent::Notification(_) => out.push(BusRequest::Refresh),
-            // folded by the scan reducer (Task 5)
-            BusEvent::CallTaggedOk { .. } | BusEvent::CallTaggedFailed { .. } => {}
+            BusEvent::Notification(v) => self.on_notification(&v, &mut out),
+            // Every tagged call is a `scan.*` call (spec D4); the tag is
+            // settled whatever the verb, the fold is per verb.
+            BusEvent::CallTaggedOk { tag, name, value } => {
+                self.on_scan_ok(&tag, &name, value, &mut out)
+            }
+            BusEvent::CallTaggedFailed { tag, name, message } => {
+                self.on_scan_failed(&tag, &name, message, &mut out)
+            }
         }
         out
+    }
+
+    // ------------------------------------------------------ scan (v2) bus
+
+    /// Route a push line (spec D5). A `notifications/aitm/job` line for a
+    /// scan job is a trigger for the D6 reads and never touches the flow
+    /// list; a job line of another kind, or one that does not parse, is
+    /// ignored; any other method marks the flow list dirty for the next tick.
+    fn on_notification(&mut self, v: &Value, out: &mut Vec<BusRequest>) {
+        if v.get("method").and_then(Value::as_str) != Some(JOB_NOTIFICATION_METHOD) {
+            self.flows_dirty = true;
+            return;
+        }
+        let Some(params) = v.get("params") else {
+            return;
+        };
+        if params.get("kind").and_then(Value::as_str) != Some(JOB_KIND_SCAN) {
+            return;
+        }
+        let Ok(line) = serde_json::from_value::<JobNotification>(params.clone()) else {
+            return;
+        };
+        self.on_job_line(&line, out);
+    }
+
+    /// The D6 reads a job line triggers: `scan.status {job}` for every event;
+    /// the terminal and `issue` events also refresh the issue list when the
+    /// operator has looked at Issues (the sidebar count reads `summaries`,
+    /// which `scan.status` refreshes, so it never needs `scan.issues`).
+    fn on_job_line(&mut self, line: &JobNotification, out: &mut Vec<BusRequest>) {
+        let job = line.job.as_str();
+        self.scan_poll(
+            tag_keyed("scan.status", job),
+            "scan.status",
+            json!({ "job": job }),
+            out,
+        );
+        let settles = matches!(
+            line.event,
+            JobEvent::Issue | JobEvent::Finished | JobEvent::Cancelled | JobEvent::Failed
+        );
+        if settles && self.issues_wanted() {
+            let args = self.scan_issues_args();
+            self.scan_poll("scan.issues".to_string(), "scan.issues", args, out);
+        }
+    }
+
+    /// Whether the Issues list is on screen or was fetched before: Task 7
+    /// stamps `fetched_at_tick` on entering Issues, so a non-zero stamp is
+    /// "ever opened" (the TUI has ticked before an operator can get there).
+    fn issues_wanted(&self) -> bool {
+        (self.mode == Mode::Scan && self.scan.tab == ScanTab::Issues)
+            || self.scan.issues.fetched_at_tick > 0
+    }
+
+    /// The `scan.issues` arguments: the current filters (umbrella contract
+    /// names, `None` omitted) and the D6 page size.
+    fn scan_issues_args(&self) -> Value {
+        let f = &self.scan.issues.filters;
+        let mut args = Map::new();
+        if let Some(s) = f.severity_min {
+            args.insert("severity_min".into(), json!(s.label()));
+        }
+        if let Some(c) = f.confidence_min {
+            if let Ok(v) = serde_json::to_value(c) {
+                args.insert("confidence_min".into(), v);
+            }
+        }
+        if let Some(l) = f.lane {
+            if let Ok(v) = serde_json::to_value(l) {
+                args.insert("lane".into(), v);
+            }
+        }
+        if let Some(st) = f.status {
+            if let Ok(v) = serde_json::to_value(st) {
+                args.insert("status".into(), v);
+            }
+        }
+        if let Some(j) = &f.job {
+            args.insert("job".into(), json!(j));
+        }
+        args.insert("limit".into(), json!(512));
+        Value::Object(args)
+    }
+
+    /// The D6 timers, run from every `Tick`: every [`STATUS_POLL_TICKS`] one
+    /// `scan.status` per live job, every [`LIST_POLL_TICKS`] a `scan.list`
+    /// while the Scan view is shown. Tasks 7 and 9 add the Issues and Site
+    /// map timers here.
+    fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
+        if t.is_multiple_of(STATUS_POLL_TICKS) {
+            for job in self.scan.jobs.live() {
+                self.scan_poll(
+                    tag_keyed("scan.status", &job),
+                    "scan.status",
+                    json!({ "job": job }),
+                    out,
+                );
+            }
+        }
+        if t.is_multiple_of(LIST_POLL_TICKS) && self.mode == Mode::Scan {
+            self.request_scan_list(out);
+        }
+    }
+
+    /// `scan.list {}` under its single-slot tag, stamping `listed_at_tick`.
+    fn request_scan_list(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan_poll("scan.list".to_string(), "scan.list", json!({}), out) {
+            self.scan.jobs.listed_at_tick = self.ticks;
+        }
+    }
+
+    /// A timer- or push-driven `scan.*` read: silent when the bus lacks the
+    /// verb (the tab's degraded text already says so, and a toast four times
+    /// a second would not help), otherwise [`App::scan_call`].
+    fn scan_poll(
+        &mut self,
+        tag: String,
+        name: &str,
+        args: Value,
+        out: &mut Vec<BusRequest>,
+    ) -> bool {
+        self.has_tool(name) && self.scan_call(tag, name, args, out)
+    }
+
+    /// The one way a `scan.*` call leaves the reducer (spec D4). A verb the
+    /// bus lacks is recorded as `<name> is not on this bus` in the owning
+    /// tab's error line and toasted; a tag already in flight is not
+    /// re-issued. Returns whether the call was pushed.
+    fn scan_call(
+        &mut self,
+        tag: String,
+        name: &str,
+        args: Value,
+        out: &mut Vec<BusRequest>,
+    ) -> bool {
+        if !self.has_tool(name) {
+            let detail = format!("{name} is not on this bus");
+            self.scan.set_error(ScanError {
+                verb: name.to_string(),
+                code: None,
+                detail: detail.clone(),
+            });
+            self.toast(Level::Warn, detail);
+            return false;
+        }
+        if self.scan.inflight.contains(&tag) {
+            return false;
+        }
+        self.scan.inflight.insert(tag.clone());
+        out.push(BusRequest::CallTagged {
+            tag,
+            name: name.to_string(),
+            args,
+        });
+        true
+    }
+
+    /// A tagged `scan.*` call answered: settle the tag and fold the reply by
+    /// verb (spec D10). A reply that does not match the contract leaves the
+    /// state and records a `ScanError { code: None }`. No `Refresh` is ever
+    /// pushed from here (D4). Later tasks add their verbs to this match.
+    fn on_scan_ok(&mut self, tag: &str, name: &str, value: Value, out: &mut Vec<BusRequest>) {
+        self.scan.inflight.remove(tag);
+        match name {
+            "scan.status" | "scan.cancel" => match parse_result::<JobStatus>(name, &value) {
+                Ok(status) => {
+                    self.scan.clear_error(name);
+                    self.scan.jobs.fold_status(status);
+                }
+                Err(e) => self.scan.set_error(e),
+            },
+            "scan.list" => match parse_result::<ListResult>(name, &value) {
+                Ok(list) => {
+                    self.scan.clear_error(name);
+                    for job in self.scan.jobs.fold_list(list) {
+                        self.scan_poll(
+                            tag_keyed("scan.status", &job),
+                            "scan.status",
+                            json!({ "job": job }),
+                            out,
+                        );
+                    }
+                }
+                Err(e) => self.scan.set_error(e),
+            },
+            _ => {}
+        }
+    }
+
+    /// A tagged `scan.*` call failed: settle the tag and record the error on
+    /// its tab. Task 13 adds the D9 wording display and the `not_found`
+    /// self-heal.
+    fn on_scan_failed(
+        &mut self,
+        tag: &str,
+        name: &str,
+        message: String,
+        _out: &mut Vec<BusRequest>,
+    ) {
+        self.scan.inflight.remove(tag);
+        self.scan.set_error(ScanError::from_message(name, &message));
     }
 
     /// A `browser.*` call answered: fill the view. A navigate re-reads the

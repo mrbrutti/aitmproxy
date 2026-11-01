@@ -1866,13 +1866,14 @@ fn tools_list_drives_detail_fetching() {
     let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
     let _ = app.update(Action::Back);
     assert!(app.update(Action::Enter).is_empty());
-    // A bus notification (F4) triggers a refresh; CallOk too.
-    assert_eq!(
-        app.on_bus(BusEvent::Notification(
+    // A bus notification (F4) marks the list stale and the next tick
+    // refreshes it once (scanner v2 D5 coalescing); CallOk refreshes at once.
+    assert!(app
+        .on_bus(BusEvent::Notification(
             json!({"method":"notifications/aitm/state","params":{"paused":1}})
-        )),
-        vec![BusRequest::Refresh]
-    );
+        ))
+        .is_empty());
+    assert_eq!(app.update(Action::Tick), vec![BusRequest::Refresh]);
     assert_eq!(
         app.on_bus(BusEvent::CallOk {
             name: "flow.kill".into(),

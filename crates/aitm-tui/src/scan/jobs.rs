@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use aitm_scan_model::{JobId, JobState, JobStatus, JobSummary, Phase};
+use aitm_scan_model::{JobId, JobState, JobStatus, JobSummary, ListResult, Phase};
 
 /// Which pane of the Jobs tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,6 +29,73 @@ pub struct JobsState {
     pub detail_scroll: u16,
     /// The tick of the last `scan.list` request.
     pub listed_at_tick: u64,
+}
+
+impl JobsState {
+    /// Fold a `scan.status` / `scan.cancel` reply (spec D10): the full view
+    /// replaces `full[job]`, its summary replaces `summaries[job]`, and a job
+    /// not yet in `order` goes to the front (newest first).
+    pub fn fold_status(&mut self, status: JobStatus) {
+        let id = status.job.clone();
+        if !self.order.contains(&id) {
+            self.order.insert(0, id.clone());
+        }
+        self.summaries.insert(id.clone(), status.summary());
+        self.full.insert(id, status);
+    }
+
+    /// Fold a `scan.list` reply (spec D3, D10): `order` becomes the result's
+    /// order, `summaries` is replaced, `full` entries are kept. Returns the
+    /// listed ids that have no `full` entry yet, for one `scan.status` each.
+    ///
+    /// A job this TUI started that the list does not carry yet stays at the
+    /// front. The plan does not say how such a job is told apart from one the
+    /// core has since forgotten, and the state carries no "started here" mark;
+    /// the builder's rule is "in `order`, absent from the list, with a `full`
+    /// entry that is not terminal": a launch (Task 12) folds its `StartResult`
+    /// status into `full` before any list carries it, while a forgotten job
+    /// only ever reaches a terminal state before it leaves the retained list.
+    pub fn fold_list(&mut self, list: ListResult) -> Vec<JobId> {
+        let listed: Vec<JobId> = list.jobs.iter().map(|j| j.job.clone()).collect();
+        let kept: Vec<JobId> = self
+            .order
+            .iter()
+            .filter(|id| {
+                !listed.contains(id) && self.full.get(*id).is_some_and(|s| !s.state.is_terminal())
+            })
+            .cloned()
+            .collect();
+        self.order = kept;
+        self.order.extend(listed.iter().cloned());
+        self.summaries = list.jobs.into_iter().map(|j| (j.job.clone(), j)).collect();
+        self.cursor = self.cursor.min(self.order.len().saturating_sub(1));
+        listed
+            .into_iter()
+            .filter(|id| !self.full.contains_key(id))
+            .collect()
+    }
+
+    /// The last state known for a job: the summary (refreshed by both
+    /// `scan.list` and `scan.status`) first, the full view otherwise.
+    pub fn state_of(&self, id: &str) -> Option<JobState> {
+        self.summaries
+            .get(id)
+            .map(|s| s.state)
+            .or_else(|| self.full.get(id).map(|s| s.state))
+    }
+
+    /// Every job in `summaries` or `full` whose state is not terminal, in
+    /// `order` (D6: the jobs the status timer polls).
+    pub fn live(&self) -> Vec<JobId> {
+        let mut ids: Vec<JobId> = self.order.clone();
+        for id in self.summaries.keys().chain(self.full.keys()) {
+            if !ids.contains(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids.retain(|id| self.state_of(id).is_some_and(|s| !s.is_terminal()));
+        ids
+    }
 }
 
 /// A job's elapsed time for the row: `42s`, `2m05s`, `1h02m`.

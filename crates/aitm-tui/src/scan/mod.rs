@@ -43,7 +43,32 @@ pub enum ScanTab {
     Issues,
 }
 
+/// How many `Tick`s (250 ms each) between two `scan.status` polls of a live
+/// job (spec D6: about one second).
+pub const STATUS_POLL_TICKS: u64 = 4;
+
+/// How many `Tick`s between two `scan.list` polls while the Scan view is
+/// shown (spec D6: ten seconds).
+pub const LIST_POLL_TICKS: u64 = 40;
+
 impl ScanTab {
+    /// The tab a `scan.*` verb's error line belongs to (spec D9: "the owning
+    /// tab"). Launch, list, status and cancel are the Jobs tab's; the Jobs
+    /// tab keeps no error of its own and reads `ScanState::last_error`.
+    pub fn owning(verb: &str) -> ScanTab {
+        match verb {
+            "scan.profile.list"
+            | "scan.profile.get"
+            | "scan.profile.save"
+            | "scan.profile.delete"
+            | "scan.checks"
+            | "scan.session.preview" => ScanTab::Profiles,
+            "scan.sitemap" => ScanTab::SiteMap,
+            "scan.issues" | "scan.issue" | "scan.issue.update" => ScanTab::Issues,
+            _ => ScanTab::Jobs,
+        }
+    }
+
     /// Every tab, in the order the strip shows them (`1` to `4`).
     pub const ALL: [ScanTab; 4] = [
         ScanTab::Profiles,
@@ -95,6 +120,34 @@ pub struct ScanState {
 }
 
 impl ScanState {
+    /// Record a `scan.*` failure where its tab shows it: the owning tab's
+    /// error line (the Jobs tab has none of its own) and `last_error`, the
+    /// view-wide fallback the banner reads.
+    pub fn set_error(&mut self, err: ScanError) {
+        match ScanTab::owning(&err.verb) {
+            ScanTab::Profiles => self.profiles.error = Some(err.clone()),
+            ScanTab::SiteMap => self.sitemap.error = Some(err.clone()),
+            ScanTab::Issues => self.issues.error = Some(err.clone()),
+            ScanTab::Jobs => {}
+        }
+        self.last_error = Some(err);
+    }
+
+    /// A successful reply of `verb` clears the error it had left behind
+    /// (`last_error` is "shown until the next successful reply of that verb").
+    pub fn clear_error(&mut self, verb: &str) {
+        let same = |e: &Option<ScanError>| e.as_ref().is_some_and(|e| e.verb == verb);
+        if same(&self.last_error) {
+            self.last_error = None;
+        }
+        match ScanTab::owning(verb) {
+            ScanTab::Profiles if same(&self.profiles.error) => self.profiles.error = None,
+            ScanTab::SiteMap if same(&self.sitemap.error) => self.sitemap.error = None,
+            ScanTab::Issues if same(&self.issues.error) => self.issues.error = None,
+            _ => {}
+        }
+    }
+
     /// The focused pane's cursor and its row count, for the shared `nav()`
     /// keys (spec D11). `None` when the focused pane has no walkable list
     /// here: the Jobs detail scroll is the Jobs task's and the Issues detail
