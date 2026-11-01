@@ -4,14 +4,29 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Scanner v2 L4 packet lane (track T5): packet-level discovery and checks behind the deny-by-default L4 guard. Skeleton slot handed over at T1a."
+description = "Scanner v2 L4 packet lane (track T5): packet-level discovery and checks behind the deny-by-default L4 guard."
 
 [dependencies]
 # The L4 handles `wire.rs` passes from `Features::l4_shared`: the deny-by-default
 # `L4Guard` and the `L4FlowStore`. Both are `None` when L4 is disabled (call A18).
+# Also the crate that owns every packet view the lane reads (`icmp.rs`, Task 1).
 aitm-proto-l4.workspace = true
-# The `Lane` trait this crate's `lane()` slot returns.
+# The `Lane` trait this crate's `lane()` slot returns, plus the shared vocabulary.
 aitm-scan-model.workspace = true
+# `Severity` for the two checks' `CheckMeta`.
+aitm-poc.workspace = true
+# `aitm_core::Flow` for `ProbeHost::held_flows`.
+aitm-core.workspace = true
+anyhow.workspace = true
+# `BoxFuture`, so the lane's trait impls stay object-safe.
+futures.workspace = true
+serde_json.workspace = true
+# `spawn_blocking` for the blocking `send_recv`, plus the lane's timers and locks.
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+
+[dev-dependencies]
+# The unit tests and `tests/live_loopback.rs` drive the lane's async surface.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

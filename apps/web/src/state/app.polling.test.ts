@@ -11,7 +11,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StateNotification } from '~/bus/types';
 import { createAppStore } from './app';
-import { FLOW_PING, bridgeBus, captureInFlight, captureSilently, complete, tick, type TestBus } from './bridgeBus.testkit';
+import { FLOW_PING, TEST_VERSION, bridgeBus, captureInFlight, captureSilently, complete, tick, type TestBus } from './bridgeBus.testkit';
 
 const STATE: StateNotification = { listening: true, intercept_armed: false, paused: 0, agent: 'all' };
 
@@ -25,7 +25,7 @@ beforeEach(() => {
   vi.useFakeTimers();
 });
 afterEach(() => {
-  // Closing the bus stops the store's poll loop and the mock's own timers.
+  // Closing the bus stops the store's poll loop.
   for (const b of open) b.close();
   open = [];
   vi.useRealTimers();
@@ -42,7 +42,7 @@ describe('app store — live flow list', () => {
     await tick(1000); // one poll interval is 500 ms
 
     expect(app.entries.map((e) => e.id)).toEqual([id]);
-    expect(app.byId.get(id)?.raw).toMatchObject({ id: 'f_1', method: 'GET', authority: 'cdn.shop-staging.test', path: '/assets/app.css', status: 304 });
+    expect(app.byId.get(id)?.raw).toMatchObject({ id: 'f_1', method: 'GET', authority: 'api.example.test', path: '/v1/items', status: 200 });
     // No notification ever arrived, so the poll loop is the live source.
     expect(app.proxy.polling).toBe(true);
   });
@@ -155,7 +155,7 @@ describe('app store — live flow list', () => {
     await tick(1000); // the next tick retries tools/list, then refreshSide
 
     expect(app.proxy.tools.some((t) => t.name === 'flow.detail')).toBe(true);
-    expect(app.proxy.version).toBe('0.0.0-fixtures');
+    expect(app.proxy.version).toBe(TEST_VERSION);
     expect(app.proxy.armed).toBe(true);
     await tick(5000);
     expect(bus.count('tools/list')).toBe(2); // one failure, one success — then it stops asking
@@ -413,16 +413,5 @@ describe('app store — push-capable bus stays cheap', () => {
     // t = 12.2 s with both streams live throughout: exactly one heartbeat, covering both polls.
     expect(bus.count('flow.list') - lists).toBe(1);
     expect(bus.count('proxy.status') - statuses).toBe(1);
-  });
-});
-
-describe('app store — the static fixtures bus', () => {
-  it('fetches the snapshot once and never polls', async () => {
-    const { bus, app } = start(bridgeBus('fixtures'));
-
-    await tick(10_000);
-
-    expect(bus.count('flow.list')).toBe(1);
-    expect(app.proxy.polling).toBe(false);
   });
 });
