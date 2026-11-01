@@ -158,13 +158,31 @@ impl ScanState {
     /// error slot (every tab has one) and `last_error`, which the toast
     /// path and the tests read.
     pub fn set_error(&mut self, err: ScanError) {
-        match owning_tab(&err.verb) {
-            ScanTab::Profiles => self.profiles.error = Some(err.clone()),
-            ScanTab::Jobs => self.jobs.error = Some(err.clone()),
-            ScanTab::SiteMap => self.sitemap.error = Some(err.clone()),
-            ScanTab::Issues => self.issues.error = Some(err.clone()),
-        }
+        *self.error_slot_mut(owning_tab(&err.verb)) = Some(err.clone());
         self.last_error = Some(err);
+    }
+
+    /// The error slot of `tab` (every tab has one; spec D13 as ruled
+    /// 2026-11-01, fix round H, H56): the one tab-to-slot dispatch
+    /// (fix round H, H68), read by the banner and the tests.
+    pub fn error_slot(&self, tab: ScanTab) -> &Option<ScanError> {
+        match tab {
+            ScanTab::Profiles => &self.profiles.error,
+            ScanTab::Jobs => &self.jobs.error,
+            ScanTab::SiteMap => &self.sitemap.error,
+            ScanTab::Issues => &self.issues.error,
+        }
+    }
+
+    /// [`ScanState::error_slot`], to write ([`ScanState::set_error`] and
+    /// [`ScanState::clear_error`]).
+    pub fn error_slot_mut(&mut self, tab: ScanTab) -> &mut Option<ScanError> {
+        match tab {
+            ScanTab::Profiles => &mut self.profiles.error,
+            ScanTab::Jobs => &mut self.jobs.error,
+            ScanTab::SiteMap => &mut self.sitemap.error,
+            ScanTab::Issues => &mut self.issues.error,
+        }
     }
 
     /// A successful reply under `tag` clears the error that exact tag left
@@ -176,12 +194,9 @@ impl ScanState {
         if same(&self.last_error) {
             self.last_error = None;
         }
-        match owning_tab(tag_parts(tag).0) {
-            ScanTab::Profiles if same(&self.profiles.error) => self.profiles.error = None,
-            ScanTab::Jobs if same(&self.jobs.error) => self.jobs.error = None,
-            ScanTab::SiteMap if same(&self.sitemap.error) => self.sitemap.error = None,
-            ScanTab::Issues if same(&self.issues.error) => self.issues.error = None,
-            _ => {}
+        let slot = self.error_slot_mut(owning_tab(tag_parts(tag).0));
+        if same(slot) {
+            *slot = None;
         }
     }
 
@@ -770,6 +785,44 @@ mod tests {
         assert_eq!(scan_host("fe80::1"), "fe80::1");
         assert_eq!(scan_host("[fe80::1]"), "fe80::1");
         assert_eq!(scan_host("host:abc"), "host:abc");
+    }
+
+    /// Fix round H, H68: one error slot per tab, reached through
+    /// `error_slot` / `error_slot_mut`. A failure under a tab's verb fills
+    /// that tab's slot and no other; writing `None` through the mutable
+    /// accessor empties the same slot `set_error` filled.
+    #[test]
+    fn error_slot_is_the_owning_tabs_and_no_other() {
+        for (verb, tab) in [
+            ("scan.start", ScanTab::Profiles),
+            ("scan.list", ScanTab::Jobs),
+            ("scan.sitemap", ScanTab::SiteMap),
+            ("scan.issues", ScanTab::Issues),
+        ] {
+            let mut state = ScanState::default();
+            state.set_error(ScanError::uncoded(verb, "boom"));
+            for other in ScanTab::ALL {
+                assert_eq!(
+                    state.error_slot(other).as_ref().map(|e| e.tag.as_str()),
+                    (other == tab).then_some(verb),
+                    "{verb}: the {tab:?} slot alone, read on {other:?}"
+                );
+            }
+            *state.error_slot_mut(tab) = None;
+            assert!(
+                ScanTab::ALL.iter().all(|t| state.error_slot(*t).is_none()),
+                "{verb}: emptied through the mutable slot"
+            );
+            // The same slot the tab's own state field holds.
+            *state.error_slot_mut(tab) = Some(ScanError::uncoded(verb, "again"));
+            let held = match tab {
+                ScanTab::Profiles => &state.profiles.error,
+                ScanTab::Jobs => &state.jobs.error,
+                ScanTab::SiteMap => &state.sitemap.error,
+                ScanTab::Issues => &state.issues.error,
+            };
+            assert_eq!(held.as_ref().map(|e| e.detail.as_str()), Some("again"));
+        }
     }
 
     /// Plan task 13: every D3 verb has an owning tab; the launch verbs are

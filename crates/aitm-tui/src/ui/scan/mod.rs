@@ -183,11 +183,11 @@ fn legacy_jobs_error(app: &App) -> Option<ScanError> {
 /// banner; `ScanState::last_error` feeds the toast alone). `legacy` is
 /// [`legacy_jobs_error`], the Jobs tab's on a legacy bus.
 fn tab_error<'a>(app: &'a App, legacy: Option<&'a ScanError>) -> Option<&'a ScanError> {
-    match app.scan.tab {
-        ScanTab::Profiles => app.scan.profiles.error.as_ref(),
-        ScanTab::Jobs => legacy.or(app.scan.jobs.error.as_ref()),
-        ScanTab::SiteMap => app.scan.sitemap.error.as_ref(),
-        ScanTab::Issues => app.scan.issues.error.as_ref(),
+    let own = app.scan.error_slot(app.scan.tab).as_ref();
+    if app.scan.tab == ScanTab::Jobs {
+        legacy.or(own)
+    } else {
+        own
     }
 }
 
