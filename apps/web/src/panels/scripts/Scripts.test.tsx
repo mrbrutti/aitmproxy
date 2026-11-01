@@ -1,18 +1,18 @@
-// The Scripts panel against the fixture bus (src/bus/mock.ts `script.*`, which mirrors the core's
-// crates/aitm-plugin-rhai/src/commands.rs shapes): list, row actions, the new-script editor
+// The Scripts panel on the testkit's in-memory bus plus the `script.*` host written below in the core's
+// reply shapes (crates/aitm-plugin-rhai/src/commands.rs): list, row actions, the new-script editor
 // (validate / save), the console, capability gating and the not-offered state. The store is the real
 // one, so the panel runs through `app.call`, `app.notice` and `app.proxy.tools` exactly as in the UI.
 import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@solidjs/testing-library';
-import { createMockBus, type MockControls } from '~/bus/mock';
 import { BusError, type BusClient, type BusRole, type ToolDef } from '~/bus/types';
 import { createAppStore } from '~/state/app';
+import { memoryBus } from '~/state/bridgeBus.testkit';
 import { AppProvider } from '~/state/context';
 import { ScriptsPanel } from '../ScriptsPanel';
 import { scriptsStore } from './store';
 
 interface MountOpts {
-  /** Replace one tool's reply: return a value to answer with it, an Error to reject, `undefined` to fall through to the fixture. */
+  /** Replace one tool's reply: return a value to answer with it, an Error to reject, `undefined` to fall through to the script host, then the memory bus. */
   reply?: (tool: string, args: Record<string, unknown>) => unknown;
   /** Narrow the advertised tool list. */
   tools?: (all: ToolDef[]) => ToolDef[];
@@ -21,14 +21,38 @@ interface MountOpts {
 
 const buses: BusClient[] = [];
 
+/** One `script.list` row as the core sends it (`List::invoke` in crates/aitm-plugin-rhai/src/commands.rs). */
+interface ScriptInfo {
+  name: string;
+  path: string;
+  api: string;
+  hooks: string[];
+  enabled: boolean;
+  last_error: string | null;
+}
+
+const SCRIPT_DIR = '/home/operator/.aitm/scripts';
+
+/** The scripts a mount starts with: two enabled (one of them with a hook error), one disabled. Fresh copies: the test's host mutates them. */
+const loadedScripts = (): ScriptInfo[] => [
+  { name: 'redact-auth', path: `${SCRIPT_DIR}/redact-auth.rhai`, api: '1', hooks: ['on_request', 'on_response'], enabled: true, last_error: null },
+  { name: 'tag-admin', path: `${SCRIPT_DIR}/tag-admin.rhai`, api: '1', hooks: ['on_request'], enabled: false, last_error: null },
+  { name: 'flaky-parser', path: `${SCRIPT_DIR}/flaky-parser.rhai`, api: '1', hooks: ['on_response'], enabled: true, last_error: 'on_response: Property not found: content_type (line 12)' },
+];
+
+/** The `script.*` tools this core advertises beyond the memory bus's own `script.list` and `script.findings`. */
+const SCRIPT_TOOLS = ['script.enable', 'script.disable', 'script.reload', 'script.validate', 'script.save'];
+
 function mount(opts: MountOpts = {}) {
-  const mock = createMockBus({ initial: 0, rate: 0, agentActive: false });
+  const scripts = loadedScripts();
+  const host = scriptHost(scripts, findingsOldestFirst());
+  const mem = memoryBus({ scripts, extraTools: SCRIPT_TOOLS });
   const calls: { tool: string; args: Record<string, unknown> }[] = [];
-  const bus: BusClient & MockControls = {
-    ...mock,
+  const bus: BusClient = {
+    ...mem,
     role: () => (opts.role === undefined ? 'operator' : opts.role),
     async tools() {
-      const all = await mock.tools();
+      const all = await mem.tools();
       return opts.tools ? opts.tools(all) : all;
     },
     async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {
@@ -36,10 +60,12 @@ function mount(opts: MountOpts = {}) {
       const r = opts.reply?.(tool, args);
       if (r instanceof Error) throw r;
       if (r !== undefined) return r as T;
-      return mock.call<T>(tool, args);
+      const hosted = host(tool, args);
+      if (hosted) return (await hosted) as T;
+      return mem.call<T>(tool, args);
     },
   };
-  buses.push(mock);
+  buses.push(mem);
   const app = createAppStore(bus);
   const view = () =>
     render(() => (
@@ -85,6 +111,79 @@ fn on_request(flow) {
 }
 `;
 const BAD_SRC = 'fn on_request(flow) {\n  flow.tag("x");\n';
+
+/** What the core answers `script.validate` and `script.save` for the two sources the editor tests type, keyed by the exact text. */
+const REPORTS: Record<string, { name: string; api: string; hooks: string[]; registers: { commands: string[]; options: string[] } }> = {
+  [GOOD_SRC]: { name: 'probe', api: '1', hooks: ['on_request'], registers: { commands: [], options: [] } },
+  [REG_SRC]: { name: 'probe', api: '1', hooks: ['on_request'], registers: { commands: ['probe.run'], options: ['probe.depth'] } },
+};
+/** The core's pinned compile-error text (`ScriptError::Compile`, crates/aitm-plugin-rhai/src/error.rs) for BAD_SRC, whose `{` at 1:21 is never closed. The panel shows it verbatim, the `<source>:3:1` position included, not stripped. */
+const BAD_SRC_ERROR = "error: <source>:3:1 — expecting '}' to end the block opened at 1:21\n  help: the file ends mid-statement; look for an unclosed brace, bracket, or string";
+
+/** Script findings as the core's in-memory sink lists them: oldest first, `at` in Unix milliseconds. */
+const findingsOldestFirst = () => [
+  { name: 'Bearer token sent over cleartext HTTP', severity: 'high', flow_id: 'flow_0007', detail: 'Authorization header on http://api.shop-staging.test/v1/cart', tags: ['auth', 'cleartext'], source: 'redact-auth', at: 1_700_000_000_000 },
+  { name: 'Admin path probed', severity: 'info', flow_id: null, detail: null, tags: ['admin'], source: 'tag-admin', at: 1_700_000_180_000 },
+  { name: 'Verbose error body', severity: 'medium', flow_id: 'flow_0031', detail: 'Stack trace in a 500 response', tags: [], source: 'flaky-parser', at: 1_700_000_270_000 },
+];
+
+/** What `scriptHost` answers: the advertised `script.*` tools plus `script.findings`, which the memory bus also serves but the host answers from the test's own list. */
+const HOST_TOOLS = new Set([...SCRIPT_TOOLS, 'script.findings']);
+
+/**
+ * The rhai host's side of the `script.*` commands the panel drives, over the mount's own `scripts`, in
+ * the reply shapes of crates/aitm-plugin-rhai/src/commands.rs: enable / disable flip the flag and
+ * answer `{ name, enabled }`; reload clears `last_error` and answers the metadata; validate answers
+ * the report (no `path`, no `restart_required`); save adds or replaces the script and answers the
+ * report with both; findings answers the newest `limit`, oldest first. A loopback round trip of a few
+ * ms, like the memory bus, so in-flight states are real. `undefined` for any other tool.
+ */
+function scriptHost(scripts: ScriptInfo[], findings: ReturnType<typeof findingsOldestFirst>) {
+  const named = (name: unknown): ScriptInfo => {
+    const s = scripts.find((x) => x.name === name);
+    if (!s) throw new BusError(`no loaded script is named \`${String(name)}\`; loaded: ${scripts.map((x) => x.name).join(', ')}`);
+    return s;
+  };
+  const compiled = (source: unknown) => {
+    if (source === BAD_SRC) throw new BusError(BAD_SRC_ERROR);
+    const report = typeof source === 'string' ? REPORTS[source] : undefined;
+    if (!report) throw new Error('scriptHost: no reply is written for this source');
+    return report;
+  };
+  const answer = (tool: string, args: Record<string, unknown>): unknown => {
+    switch (tool) {
+      case 'script.enable':
+      case 'script.disable': {
+        const s = named(args.name);
+        s.enabled = tool === 'script.enable';
+        return { name: s.name, enabled: s.enabled };
+      }
+      case 'script.reload': {
+        const s = named(args.name);
+        s.last_error = null;
+        return { name: s.name, path: s.path, api: s.api, hooks: [...s.hooks] };
+      }
+      case 'script.validate':
+        return { ...compiled(args.source) };
+      case 'script.save': {
+        const name = String(args.name);
+        const { api, hooks, registers } = compiled(args.source);
+        const enable = typeof args.enable === 'boolean' ? args.enable : true;
+        const path = `${SCRIPT_DIR}/${name}.rhai`;
+        const loaded = scripts.find((x) => x.name === name);
+        if (loaded) Object.assign(loaded, { api, hooks: [...hooks], enabled: enable, last_error: null });
+        else scripts.push({ name, path, api, hooks: [...hooks], enabled: enable, last_error: null });
+        return { name, path, api, hooks, registers, restart_required: registers.commands.length > 0 || registers.options.length > 0 };
+      }
+      case 'script.findings': {
+        const keep = typeof args.limit === 'number' ? Math.min(Math.max(0, args.limit), findings.length) : findings.length;
+        return { findings: findings.slice(findings.length - keep), dropped: 0 };
+      }
+    }
+  };
+  return (tool: string, args: Record<string, unknown>): Promise<unknown> | undefined =>
+    HOST_TOOLS.has(tool) ? new Promise((r) => setTimeout(r, 5)).then(() => answer(tool, args)) : undefined;
+}
 
 const row = (name: string) => document.querySelector<HTMLElement>(`[data-script="${name}"]`)!;
 const text = (el: Element | null | undefined) => el?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
@@ -336,19 +435,14 @@ describe('ScriptsPanel — new-script editor', () => {
   });
 
   it('shows the core compile error text verbatim, positioned, and writes nothing', async () => {
-    const { bus, calls } = mount();
+    const { calls } = mount();
     await ready();
-    const expected = await bus.call('script.validate', { source: BAD_SRC }).then(
-      () => '',
-      (e: Error) => e.message,
-    );
-    expect(expected).toMatch(/^error: <source>:3:1 — /);
 
     type('Script source', BAD_SRC);
     fireEvent.click(screen.getByRole('button', { name: 'Validate' }));
 
     const alert = await within(await screen.findByLabelText('Result')).findByRole('alert');
-    expect(alert.textContent).toBe(expected);
+    expect(alert.textContent).toBe(BAD_SRC_ERROR);
     expect(calls.some((c) => c.tool === 'script.save')).toBe(false);
   });
 
@@ -527,7 +621,7 @@ describe('ScriptsPanel — console', () => {
     expect(screen.getByText('7 dropped')).toBeTruthy();
   });
 
-  it('shows the fixture findings and each failing script latest error', async () => {
+  it("shows the core's findings newest first and each failing script's latest error", async () => {
     mount();
     await ready();
     await waitFor(() => expect(document.querySelectorAll('[data-finding]')).toHaveLength(3));

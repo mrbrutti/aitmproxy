@@ -1,14 +1,19 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { createMockBus } from '~/bus/mock';
+import type { BusClient } from '~/bus/types';
 import { createAppStore } from './app';
+import { memoryBus } from './bridgeBus.testkit';
+
+const buses: BusClient[] = [];
 
 function store() {
-  const bus = createMockBus({ initial: 0, agentActive: false });
+  const bus = memoryBus();
+  buses.push(bus);
   return createAppStore(bus);
 }
 
 afterEach(() => {
-  /* each test builds its own root-owned store */
+  // Each test builds its own root-owned store; closing its bus stops the poll loop that store started.
+  while (buses.length) buses.pop()!.close();
 });
 
 describe('app store — L4 selection routing', () => {

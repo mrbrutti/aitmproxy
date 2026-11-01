@@ -1,0 +1,87 @@
+{
+  "job": "scan-1a2b3c4d",
+  "status": {
+    "job": "scan-1a2b3c4d",
+    "state": "running",
+    "phase": "crawling",
+    "profile_name": "standard",
+    "targets": [
+      "http://127.0.0.1:8080"
+    ],
+    "started_by": {
+      "frontend": "operator",
+      "client_label": "web-ui"
+    },
+    "started_at": 1761900000000,
+    "finished_at": null,
+    "elapsed_ms": 1500,
+    "stopped_reason": null,
+    "probes": {
+      "sent": 0,
+      "budget": 0,
+      "errors": 0,
+      "timeouts": 0,
+      "rate_waits": 0,
+      "by_lane": {}
+    },
+    "crawl": {
+      "pages": 0,
+      "queued": 0,
+      "depth": 0,
+      "forms_submitted": 0
+    },
+    "points": {
+      "found": 0,
+      "queued": 0,
+      "audited": 0,
+      "skipped": {
+        "ignored": 0,
+        "frequent": 0,
+        "limit": 0
+      }
+    },
+    "checks": {
+      "scheduled": 0,
+      "done": 0,
+      "running": []
+    },
+    "issues": {
+      "total": 0,
+      "by_severity": {
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "info": 0
+      },
+      "by_confidence": {
+        "certain": 0,
+        "firm": 0,
+        "tentative": 0
+      }
+    },
+    "l4": null,
+    "session": null,
+    "lanes": {
+      "requested": [
+        "http"
+      ],
+      "run": [
+        "http"
+      ],
+      "skipped": []
+    },
+    "clamped": [],
+    "error": null
+  },
+  "clamped": [],
+  "lanes": {
+    "requested": [
+      "http"
+    ],
+    "run": [
+      "http"
+    ],
+    "skipped": []
+  }
+}

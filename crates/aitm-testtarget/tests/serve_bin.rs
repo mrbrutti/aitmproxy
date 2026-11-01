@@ -104,12 +104,21 @@ const XSS_MARKER: &str = "<svg/onload>";
 
 #[test]
 fn serves_vulnerable_target_over_a_real_port() {
-    let serve = start(SeedMode::Vulnerable);
+    let mut serve = start(SeedMode::Vulnerable);
 
     // The index is served.
     let (status, body) = request(&serve.base_url, "GET", "/");
     assert_eq!(status, 200);
     assert!(body.contains("aitm test target"), "index body: {body}");
+
+    // `start` read one stdout line and dropped the reader, so the child's
+    // later `ready` line hit a closed pipe: it must ignore EPIPE and keep
+    // serving, not panic (`failed printing to stdout: Broken pipe`).
+    assert_eq!(
+        serve.child.try_wait().expect("try_wait"),
+        None,
+        "serve bin must still be alive after its stdout reader went away"
+    );
 
     // Vulnerable reflected XSS: the marker comes back raw (unescaped).
     let (status, body) = request(
@@ -155,4 +164,67 @@ fn serve_bin_does_not_expose_the_manifest() {
             vuln.id
         );
     }
+}
+
+/// `line` is exactly `<prefix> <scheme>://127.0.0.1:<digits>` (spec D1 stdout).
+fn assert_addr_line(line: &str, prefix: &str, scheme: &str) -> String {
+    let want = format!("{prefix} {scheme}://127.0.0.1:");
+    let port = line
+        .strip_prefix(&want)
+        .unwrap_or_else(|| panic!("expected {want:?}<port>, got {line:?}"));
+    assert!(
+        !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+        "port must be digits only in {line:?}"
+    );
+    format!("{scheme}://127.0.0.1:{port}")
+}
+
+#[test]
+fn serve_bin_prints_every_line_in_order() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_aitm-testtarget-serve"))
+        .args([
+            "--mode",
+            "vulnerable",
+            "--port",
+            "0",
+            "--tls-port",
+            "0",
+            "--tls-h1-port",
+            "0",
+            "--control-port",
+            "0",
+            "--l4",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn aitm-testtarget-serve with every flag");
+    let stdout = child.stdout.take().expect("child stdout");
+    let mut reader = BufReader::new(stdout);
+    let mut lines = Vec::new();
+    for _ in 0..5 {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read a stdout line");
+        assert!(n > 0, "serve bin closed stdout after {lines:?}");
+        lines.push(line.trim_end_matches(['\r', '\n']).to_string());
+    }
+    // Keep the child alive until the assertions are done; kill on every path.
+    let serve = Serve {
+        child,
+        base_url: String::new(),
+    };
+
+    assert_addr_line(&lines[0], "listening", "http");
+    assert_addr_line(&lines[1], "tls", "https");
+    assert_addr_line(&lines[2], "tls_h1", "https");
+    let control = assert_addr_line(&lines[3], "control", "http");
+    assert_eq!(lines[4], "ready");
+
+    // The printed control port is the real one: `/services` answers there and
+    // lists the plain listener as `http` (D2) plus at least one `l4` row.
+    let (status, body) = request(&control, "GET", "/services");
+    assert_eq!(status, 200, "control /services body: {body}");
+    assert!(body.contains(r#""name":"http""#), "services: {body}");
+    assert!(body.contains(r#""name":"tls_h1""#), "services: {body}");
+    assert!(body.contains(r#""role":"l4""#), "services: {body}");
+    drop(serve);
 }

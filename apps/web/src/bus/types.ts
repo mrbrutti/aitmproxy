@@ -80,7 +80,7 @@ export interface ServerInfo {
   role?: BusRole;
 }
 
-/** Push events (§4.4, F4). The bridge relays them verbatim; the mock bus emits the same shapes. */
+/** Push events (§4.4, F4). The bridge relays them verbatim. */
 export type FlowEventKind =
   | 'created'
   | 'request'
@@ -101,8 +101,7 @@ export interface FlowNotification {
    * scheme, authority, path, status, request_bytes, response_bytes, started_at, duration_ms;
    * `kind:"websocket"` with handshake, messages, started_at, duration_ms). On a real bus the store
    * still treats the push as a trigger and refetches the row by id; that is a deliberate choice
-   * (one fetch path for push and poll), not a workaround for a sparse summary. Only the fixture bus
-   * has its summary applied directly.
+   * (one fetch path for push and poll), not a workaround for a sparse summary.
    */
   summary?: unknown;
 }
@@ -111,10 +110,10 @@ export interface FlowNotification {
  * One audit line, in the model the Activity log renders. The server's wire shape differs
  * (`crates/aitm-core/src/audit.rs`): `at` is epoch ms, the label is `client_label`, `args` is a
  * redacted JSON string and `result` is `"ok"` or `{error}`; `toAgentEntry` in `bus/normalize.ts`
- * converts it. The fixture bus emits this model directly.
+ * converts it; a line already in this model shape is accepted as it is.
  */
 export interface AgentNotification {
-  /** `operator`, `mcp` and `cli` are what the server records; the rest are fixture frontends. */
+  /** `operator`, `mcp` and `cli` are what the server records; `mac`, `web` and `tui` are frontend labels the model shape may carry, shown by name (only `mcp` renders as the agent). */
   origin: 'mcp' | 'cli' | 'operator' | 'mac' | 'web' | 'tui';
   /** The caller's `initialize.clientInfo.name`; `null` for an unlabelled connection (the bridge today). */
   clientLabel?: string | null;
@@ -153,7 +152,7 @@ export class BusError extends Error {
 export type NotificationHandler = (method: string, params: unknown) => void;
 
 export interface BusClient {
-  /** Human-readable endpoint for the status bar (`bus 127.0.0.1:9090` or `fixtures`). */
+  /** Human-readable endpoint for the status bar: the bridge's host (`127.0.0.1:8082`). */
   readonly address: string;
   readonly state: Accessor<BusState>;
   /** Last connection error text, for the status bar tooltip. */
@@ -194,4 +193,29 @@ export const PROTOCOL_VERSION = '2025-06-18';
  */
 export function asRole(v: string | null | undefined): BusRole | null {
   return v === 'operator' || v === 'agent' ? v : null;
+}
+
+/**
+ * One PoC as the Findings panel models it: a `poc.list` library entry, with its `poc.get` source
+ * and the latest `poc.run` result of this session folded in by the store.
+ */
+export interface PocRun {
+  id: string;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  target: string;
+  passed: boolean;
+  at: number;
+  origin: 'human' | 'agent';
+  poc_path: string;
+  yaml: string;
+  finding_capture: string;
+  screenshot_path: string | null;
+  evaluated: { assertion: string; matched: boolean }[];
+  /** Built in this session but not yet saved under poc.dir (the core returns YAML text only). */
+  local?: boolean;
+  /** The PoC's description text, when its `poc.list` entry carries one (`poc.get` answers it too, but only its YAML is kept); absent when none exists. */
+  description?: string;
+  /** Set when this entry has a run result in this session (poc.run keeps no history). */
+  ran?: boolean;
 }

@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use aitm_core::{
-    Body, Command, CommandHost, Flow, ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc,
-    Value,
+    saturating_i64, Body, Command, CommandHost, Flow, FlowMeta, ParamDef, ParamSchema, Params,
+    Plugin, Registry, TypeDesc, Value,
 };
 
 /// Registers `flow.list` and `flow.get`. Observes no events.
@@ -71,8 +71,9 @@ impl Command for FlowList {
 
 /// `flow.get {id}` → a summary object for one flow: kind, request line, status,
 /// body sizes, timing (`started_at`, `duration_ms`), capture attribution
-/// (`source_app`, `capture_interface`; null for a proxied flow) and interception
-/// state.
+/// (`source_app`, `capture_interface`; null for a proxied flow), the per-host
+/// decryption keys (`tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down`, `passive`;
+/// spec D7) and interception state.
 struct FlowGet;
 
 impl Command for FlowGet {
@@ -107,7 +108,8 @@ impl Command for FlowGet {
 }
 
 /// The fields `summarize` emits. HTTP-only fields are optional: a WebSocket flow
-/// reports `handshake` and `messages` instead of a request line.
+/// reports `handshake` and `messages` instead of a request line. The per-host
+/// decryption keys come from `tunnel_field_defs`, shared with `row_fields`.
 fn summary_fields() -> Vec<ParamDef> {
     let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
         name: name.into(),
@@ -196,6 +198,88 @@ fn summary_fields() -> Vec<ParamDef> {
              proxied flow.",
         ),
     ]
+    .into_iter()
+    .chain(tunnel_field_defs())
+    .collect()
+}
+
+/// The per-host decryption keys of spec D7, declared once for both `flow.get`
+/// (`summary_fields`) and `flow.table` rows (`row_fields`) so the two schemas
+/// cannot drift. The four tunnel keys are nullable; `passive` is always a boolean.
+fn tunnel_field_defs() -> Vec<ParamDef> {
+    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
+        name: name.into(),
+        ty,
+        required,
+        description: description.into(),
+    };
+    vec![
+        field(
+            "tunnel",
+            TypeDesc::Str,
+            false,
+            "Outcome of a `CONNECT` tunnel row: `decrypted` (TLS terminated with the \
+             proxy's leaf; the inner requests are their own rows), `passthrough` \
+             (relayed byte for byte, the client saw the origin's certificate) or \
+             `failed` (never established); null for a flow that is not a tunnel row.",
+        ),
+        field(
+            "tunnel_reason",
+            TypeDesc::Str,
+            false,
+            "Why the tunnel was not decrypted. Passthrough: `out_of_scope` or `pinned`. \
+             Failed: `client_rejected_certificate`, `client_closed`, `client_tls_error`, \
+             `upstream_unreachable`, `upstream_tls_failed` or `protocol_error`; null \
+             for a decrypted tunnel and for a flow that is not a tunnel row.",
+        ),
+        field(
+            "bytes_up",
+            TypeDesc::Int,
+            false,
+            "Client-to-origin bytes a passthrough tunnel relayed, set when it closes; \
+             null while it is open and for every other flow.",
+        ),
+        field(
+            "bytes_down",
+            TypeDesc::Int,
+            false,
+            "Origin-to-client bytes a passthrough tunnel relayed, set when it closes; \
+             null while it is open and for every other flow.",
+        ),
+        field(
+            "passive",
+            TypeDesc::Bool,
+            true,
+            "Observed only, nothing acted on it: plain HTTP to a host outside Scope. No \
+             intercept rule parks it, no script sees it, no scanner touches it; a \
+             frontend renders it read-only. False for every tunnel row.",
+        ),
+    ]
+}
+
+/// The per-host decryption keys of spec D7 for one flow's metadata, in the order
+/// `tunnel`, `tunnel_reason`, `bytes_up`, `bytes_down`, `passive`: the tunnel
+/// outcome's wire codes (`TunnelMode::label`, `TunnelReason::label`) and byte
+/// counts when the flow is a tunnel row, null otherwise; `passive` as stamped.
+/// Shared by `summarize` and `flow_row` so the two verbs agree by construction.
+fn tunnel_fields(meta: &FlowMeta) -> [(&'static str, Value); 5] {
+    let tunnel = meta.tunnel.as_ref();
+    [
+        ("tunnel", opt_str(tunnel.map(|t| t.mode.label()))),
+        (
+            "tunnel_reason",
+            opt_str(tunnel.and_then(|t| t.reason).map(|r| r.label())),
+        ),
+        (
+            "bytes_up",
+            opt_int(tunnel.and_then(|t| t.bytes_up).map(saturating_i64)),
+        ),
+        (
+            "bytes_down",
+            opt_int(tunnel.and_then(|t| t.bytes_down).map(saturating_i64)),
+        ),
+        ("passive", Value::Bool(meta.passive)),
+    ]
 }
 
 /// A body's reported size ([`Body::buffered_len`]) as a `Value`: the byte count,
@@ -239,6 +323,9 @@ fn summarize(flow: &Flow) -> Value {
         "capture_interface",
         opt_str(flow.metadata().capture_interface.as_deref()),
     );
+    for (k, v) in tunnel_fields(flow.metadata()) {
+        put(k, v);
+    }
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
@@ -316,7 +403,9 @@ impl Command for FlowTable {
 }
 
 /// The fields `flow_row` emits. HTTP-only fields are nullable: a WebSocket row
-/// reports `id`/`kind`/`state`/`marks` and leaves the HTTP fields null.
+/// reports `id`/`kind`/`state`/`marks` and leaves the HTTP fields null. The
+/// per-host decryption keys come from `tunnel_field_defs`, shared with
+/// `summary_fields`.
 fn row_fields() -> Vec<ParamDef> {
     let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
         name: name.into(),
@@ -369,6 +458,9 @@ fn row_fields() -> Vec<ParamDef> {
              proxied flow.",
         ),
     ]
+    .into_iter()
+    .chain(tunnel_field_defs())
+    .collect()
 }
 
 /// A single flows-table row: identity, state, marks, capture attribution
@@ -397,6 +489,9 @@ fn flow_row(flow: &Flow) -> Value {
         "capture_interface",
         opt_str(flow.metadata().capture_interface.as_deref()),
     );
+    for (k, v) in tunnel_fields(flow.metadata()) {
+        put(k, v);
+    }
     match flow {
         Flow::Http(f) => {
             put("kind", Value::Str("http".into()));
