@@ -571,6 +571,10 @@ Kept by the main session during stage 6. One row per finding.
 | PR C whole branch | quality | Minor x6 | `idle()` doc vs re-poll; `IdleOutcome::Step` payload; `Fault` docs; test rename + duplicate rows; `patched_flow` inline lookup; `Malformed`/`HighBit` + `RowInfo` boilerplate | 5 fixed in 6f9e136f; `IdleOutcome::Step(CloseReason)` accepted by the orchestrator 2026-11-01 (the table stays) |
 | PR C tester (stage 5) | tester | Minor | a complete inline RESP line > 1 MiB was dispatched as a command (`parse_inline` had no length check) | fixed in 6f9e136f (`Fault(TOO_BIG_INLINE)` both modes, unit + live row) |
 | PR C tester live row | orchestrator (Terminal gate) | Important | tester's "inline line one byte past 1 MiB, no CRLF" row read empty on P: the debug-build RESP rescan costs >1.2 s before the 200 ms idle, the row's reader gave up at 1 s | fixed in 6f9e136f (`LARGE_LINE_WITHIN` 10 s for the two 1 MiB rows; production path unchanged) |
+| PR C fix round 1 (defdfb5a..6f9e136f) | security (re-review) | PASS, Minor | RESP's stateless inline scan rescans the whole buffer on every 8 KiB read (O(n^2); attacker-paced one-byte writes cost minutes of CPU per connection) | fixed in fix round 2 (`scanned` memo in `Resp`, O(n) absorb) |
+| PR C fix round 1 | spec (re-review) | PASS, Minor x2 | the `$1048577` bulk-cap boundary pin was dropped with the duplicate rows; `MAX_CONNS` evidence is unit-only and the Review log did not say so | `$1048577` pair restored in `resp_huge_bulk` (fix round 2); Review log row amended in 4029c7f9 |
+| PR C fix round 1 | quality (re-review) | Important | the "exactly 1 MiB inline line waits" live row's reply budget (1 s hold + 300 ms idle) is smaller than the measured debug-build absorb (2.4-5.2 s): flaky under load | fixed in fix round 2 (per-row `reply_within`, two-phase reply read; the memo removes the rescan cost itself) |
+| PR C fix round 1 | quality (re-review) | Minor x2 | `LARGE_LINE_WITHIN` rationale understated the cost and cited a /tmp file; `accepting`/`MAX_CONNS` `pub(crate)` with no outside user, test mirrors the body | fixed in fix round 2 |
 
 ## Shipped
 
