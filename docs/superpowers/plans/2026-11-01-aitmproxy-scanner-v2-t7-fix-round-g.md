@@ -22,6 +22,14 @@ G8. Test-file size and a lying module doc (`tests/scan_v2_issues.rs`): split the
 
 G9. Small hygiene: `fn scroll(at: &mut u16, ..)` (`app.rs`); import `OsStr`, `Path`, `truncate` and name `POC_TOAST_MAX = 80` (`app.rs`); retire the `ui::text` shim by moving the 13 view imports to `crate::text` and deleting `pub use crate::text;` (`ui/mod.rs` and the view files); `ui/scan/issues.rs` module doc mentions `follow_flow`; the Jobs `labelled()` width and `flow_line`'s `id_w` lose their spare cell (the one-cell difference deferred after round F).
 
+## Security residuals (fix rounds E+F re-review)
+
+G10. **`truncate` counts control characters as 0 cells while `width()` counts them as 1** (`crates/aitm-tui/src/text.rs`; `crates/aitm-tui/src/scan/issues.rs` `bound_issue`, `crates/aitm-tui/src/scan/jobs.rs` `fold_status`): strip `char::is_control` characters at fold time in one place (a `clean(s) -> String` in `text.rs` used by `bound_issue`, `fold_status` and `issue_row`), and make `truncate` charge a control char one cell (`unwrap_or(1)` for `None`) so the "at most `w` cells" contract holds for any input. Test: `width(&truncate(&"\t".repeat(1000), 8)) <= 8`; a 1 MiB tab `name` renders without shifting the other columns.
+
+G11. **The Jobs Detail pane formats unbounded free-text fields every frame** (`crates/aitm-tui/src/scan/jobs.rs` `fold_status`): cut `error`, `started_by.frontend`, `client_label`, each `clamped[].field`, each `lanes.skipped[].reason`, each `checks.running[]` and the session canary path to `DETAIL_VALUE_MAX` cells at fold, and cap the `running`/`clamped`/`skipped` vectors at a display limit with a `+n`, mirroring `bound_issue`; fix the `fold_status` doc. Test: a status with a 1 MiB `error` renders at 200x50 and `full[job].error.chars().count() <= 4 * DETAIL_VALUE_MAX`.
+
+G12. **Retained capacity after `truncate`; timing vectors never cut** (`crates/aitm-tui/src/scan/issues.rs` `bound_issue`): `shrink_to_fit()` after the mutation-chain and flow truncations; cut `timing.requested_s/observed_ms/baseline_ms` to `TIMING_ROWS_MAX + 1` at fold and keep the original row count in `ReadIssue.dropped` (G6's struct) so `... n more` stays right. Test: an issue with 10^6 timing samples folds to 13 rows with `dropped.timing == 999_987`.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).

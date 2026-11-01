@@ -452,6 +452,11 @@ Kept by the main session during stage 6. One row per finding.
 | fix E+F | quality | Minor | `IssuesState` detail-view trio reset at one site, clamped at another | fix round G (G7): `DetailView` |
 | fix E+F | quality | Minor | `scan_v2_issues.rs` module doc lies; two bundled tests | fix round G (G8): split into `scan_v2_issue_detail.rs` |
 | fix E+F | quality | Minor | small hygiene (`scroll` shadowing, inline paths, `ui::text` shim, module doc, spare cell) | fix round G (G9) |
+| fix E+F | security | re-review | E1, E10, E11, E19, F3, F4, F5, F6 closed; bounds stated (detail <= ~250 KB per frame, `read` <= ~19 MB bounded part) | closed |
+| fix E+F | security | Minor | `truncate` and `width()` disagree on control characters; a tab-only name shifts columns | fix round G (G10) |
+| fix E+F | security | Minor | Jobs Detail free-text fields (`error`, `client_label`, reasons, running ids) unbounded per frame | fix round G (G11) |
+| fix E+F | security | Minor | `Vec::truncate` keeps capacity; timing vectors never cut | fix round G (G12) |
+| fix E+F | security | note | `scan.list` length is not capped client-side; no reply-size cap below the bus client's 64 MiB line | accepted for v2 (the status fan-out is capped; rows per frame are bounded in text); candidate for the T1b/bus-client follow-up |
 
 ## Shipped
 
