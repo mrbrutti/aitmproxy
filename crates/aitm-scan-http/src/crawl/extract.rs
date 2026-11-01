@@ -113,6 +113,32 @@ impl fmt::Debug for Extracted {
     }
 }
 
+impl FormSpec {
+    /// A form from its raw attributes, normalised the one way the crawler reads
+    /// a form (R-M6): `action` trimmed with an empty one read as "this page",
+    /// `method` trimmed and upper-cased with `GET` when absent or blank,
+    /// `enctype` trimmed and lower-cased, and no fields yet. The extractor
+    /// builds every `<form>` through here and the browser engine reads a live
+    /// form back through it, so [`crate::crawl::values::form_action`] judges
+    /// both by the same shape.
+    pub(crate) fn from_attrs(
+        index: usize,
+        action: Option<&str>,
+        method: Option<&str>,
+        enctype: Option<&str>,
+    ) -> Self {
+        Self {
+            index,
+            action: trimmed(action),
+            method: trimmed(method)
+                .map(|method| method.to_ascii_uppercase())
+                .unwrap_or_else(|| "GET".to_string()),
+            enctype: trimmed(enctype).map(|enctype| enctype.to_ascii_lowercase()),
+            fields: Vec::new(),
+        }
+    }
+}
+
 impl fmt::Debug for FormSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FormSpec")
@@ -352,16 +378,12 @@ impl<'a> Walk<'a> {
     fn open_form(&mut self, attrs: &[Attr]) {
         self.close_select();
         self.close_form();
-        self.form = Some(FormSpec {
-            index: self.forms_seen,
-            action: trimmed(attr(attrs, "action")),
-            method: attr(attrs, "method")
-                .map(|m| m.trim().to_ascii_uppercase())
-                .filter(|m| !m.is_empty())
-                .unwrap_or_else(|| "GET".to_string()),
-            enctype: trimmed(attr(attrs, "enctype")).map(|e| e.to_ascii_lowercase()),
-            fields: Vec::new(),
-        });
+        self.form = Some(FormSpec::from_attrs(
+            self.forms_seen,
+            attr(attrs, "action"),
+            attr(attrs, "method"),
+            attr(attrs, "enctype"),
+        ));
         self.forms_seen += 1;
     }
 
@@ -701,7 +723,7 @@ fn decode_one(tail: &str) -> Option<(char, usize)> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{extract, refresh_target, FieldKind};
+    use super::{extract, refresh_target, FieldKind, FormSpec};
     use crate::limits::{
         MAX_FIELDS_PER_FORM, MAX_FORMS_PER_PAGE, MAX_LINKS_PER_PAGE, MAX_OPTIONS_PER_SELECT,
     };
@@ -903,6 +925,47 @@ mod tests {
         assert_eq!(out.forms.len(), 1, "{out:?}");
         assert_eq!(out.forms[0].index, 0);
         assert_eq!(out.forms[0].action.as_deref(), Some("/real"));
+    }
+
+    /// The one normalisation of a form's attributes (R-M6), shared by the
+    /// extractor and the browser engine's live-form read: `action` trimmed
+    /// (empty is none), `method` trimmed and upper-cased with `GET` when absent
+    /// or blank, `enctype` trimmed and lower-cased, no fields.
+    #[test]
+    fn form_spec_from_attrs_pins() {
+        let spec = FormSpec::from_attrs(
+            3,
+            Some("  /search "),
+            Some(" post "),
+            Some(" MULTIPART/Form-Data "),
+        );
+        assert_eq!(spec.index, 3);
+        assert_eq!(spec.action.as_deref(), Some("/search"));
+        assert_eq!(spec.method, "POST");
+        assert_eq!(spec.enctype.as_deref(), Some("multipart/form-data"));
+        assert!(spec.fields.is_empty());
+
+        let bare = FormSpec::from_attrs(0, None, None, None);
+        assert_eq!(bare.action, None);
+        assert_eq!(bare.method, "GET");
+        assert_eq!(bare.enctype, None);
+
+        let blank = FormSpec::from_attrs(1, Some("  "), Some(""), Some(" "));
+        assert_eq!(blank.action, None);
+        assert_eq!(blank.method, "GET");
+        assert_eq!(blank.enctype, None);
+
+        // The extractor builds its forms through the same function.
+        let out = extract(r#"<form action=" /x " method="PoSt" enctype=" A/B "></form>"#);
+        assert_eq!(
+            out.forms,
+            vec![FormSpec::from_attrs(
+                0,
+                Some("/x"),
+                Some("post"),
+                Some("a/b")
+            )]
+        );
     }
 
     /// Controls the plan excludes stay out; the ones it keeps carry their

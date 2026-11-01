@@ -326,25 +326,16 @@ impl LiveForm {
         })
     }
 
-    /// The live form in the extractor's shape, so [`form_action`] judges it by
-    /// exactly the rule that admitted the extracted form.
+    /// The live form in the extractor's shape, normalised by the extractor's
+    /// own [`FormSpec::from_attrs`], so [`form_action`] judges it by exactly
+    /// the rule that admitted the extracted form.
     fn as_spec(&self, index: usize) -> FormSpec {
-        let trimmed = |value: &Option<String>| {
-            value
-                .as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        };
-        FormSpec {
+        FormSpec::from_attrs(
             index,
-            action: trimmed(&self.action),
-            method: trimmed(&self.method)
-                .map(|method| method.to_ascii_uppercase())
-                .unwrap_or_else(|| "GET".to_string()),
-            enctype: trimmed(&self.enctype).map(|enctype| enctype.to_ascii_lowercase()),
-            fields: Vec::new(),
-        }
+            self.action.as_deref(),
+            self.method.as_deref(),
+            self.enctype.as_deref(),
+        )
     }
 
     /// Whether this live form is the form the extractor read as `form`: its
