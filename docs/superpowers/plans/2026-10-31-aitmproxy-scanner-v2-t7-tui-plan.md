@@ -344,6 +344,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix B | coder note | Minor | under the 16-cap, jobs past position 16 are starved while earlier ones answer fast | fix round C: rotating start index for the timer's follow-ups (Architect's number stays 16) |
 | fix B | coder note | Minor | `tests/scan_v2_matrix.rs` still has its own `fixture!` macro | fix round C: use `common::fixture` |
 | fix B | coder note | note | `a_terminal_line_on_the_issues_tab_requests_issues` will need re-pinning once Task 7 fetches on entering Issues | Task 7 settles the entering-Issues fetch first in that test |
+| fix B | security | re-review | B1, B2, B3, B4, B7 closed; worst case against a hostile core is about 18 `scan.status` per second plus one per push line, no amplification | closed |
+| fix B | security | Minor | outside `Mode::Scan` push-driven unknown jobs are never pruned (no `scan.list` arrives), so state grows one entry per pushed id | fix round C: in `on_job_line`, a job not in `order`/`started_here` gets a `scan.status` only in `Mode::Scan`; elsewhere the line is a trigger for the next list |
 
 ## Shipped
 
