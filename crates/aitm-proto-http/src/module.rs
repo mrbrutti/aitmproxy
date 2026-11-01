@@ -264,7 +264,8 @@ impl HttpModule {
             if next.first() == Some(&TLS_HANDSHAKE) {
                 self.mitm(client, ctx, peer, Some(target)).await
             } else {
-                let conn = Conn::plain(peer, Some((target.authority(), target.addr)));
+                let conn = Conn::plain(peer, Some((target.authority(), target.addr)))
+                    .with_attribution(ctx.hint());
                 serve(
                     &ctx,
                     Box::pin(client),
@@ -283,7 +284,7 @@ impl HttpModule {
                 Box::pin(client),
                 None,
                 None,
-                Conn::plain(peer, None),
+                Conn::plain(peer, None).with_attribution(ctx.hint()),
                 self.max_body_bytes,
             )
             .await
@@ -385,7 +386,10 @@ impl HttpModule {
                 tls: true,
                 established: now,
             }),
-        };
+            source_app: None,
+            capture_interface: None,
+        }
+        .with_attribution(ctx.hint());
 
         // Branch on the negotiated protocol: h2 runs the per-stream `serve_h2`
         // driver; everything else runs the h1 `serve` loop.
@@ -480,12 +484,20 @@ pub(crate) struct Conn {
     pub(crate) tunnel_addr: Option<SocketAddr>,
     pub(crate) client_conn: ConnInfo,
     pub(crate) server_conn: Option<ConnInfo>,
+    /// The signing identifier of the client process, as the capture backend that
+    /// delivered this connection observed it (the hint's `peer_identity`). `None`
+    /// on a proxied connection. Stamped on every flow the connection carries.
+    pub(crate) source_app: Option<String>,
+    /// The capture backend that delivered this connection (the hint's
+    /// `capture_interface`). `None` on a proxied connection.
+    pub(crate) capture_interface: Option<String>,
 }
 
 impl Conn {
     /// A cleartext connection. `tunnel` is the `CONNECT` authority and the
     /// address it resolved to, for a connection inside a tunnel, and `None` for
-    /// a forward-proxy connection.
+    /// a forward-proxy connection. No capture attribution; see
+    /// [`Conn::with_attribution`].
     fn plain(peer: SocketAddr, tunnel: Option<(String, SocketAddr)>) -> Self {
         let (tunnel_authority, tunnel_addr) = match tunnel {
             Some((authority, addr)) => (Some(authority), Some(addr)),
@@ -503,7 +515,27 @@ impl Conn {
                 established: SystemTime::now(),
             },
             server_conn: None,
+            source_app: None,
+            capture_interface: None,
         }
+    }
+
+    /// Take the capture attribution the acceptor's hint carries (`peer_identity`,
+    /// `capture_interface`). With no hint, or a hint from the explicit-proxy path,
+    /// both stay `None`.
+    fn with_attribution(mut self, hint: Option<&NextLayerHint>) -> Self {
+        if let Some(h) = hint {
+            self.source_app = h.peer_identity.clone();
+            self.capture_interface = h.capture_interface.clone();
+        }
+        self
+    }
+
+    /// A fresh [`FlowMeta`] for a flow on this connection: exactly the capture
+    /// attribution is carried over; marks, comment, replay flag and timing are
+    /// the flow's own.
+    pub(crate) fn flow_meta(&self) -> FlowMeta {
+        FlowMeta::with_attribution(self.source_app.clone(), self.capture_interface.clone())
     }
 }
 
@@ -541,6 +573,12 @@ impl Conn {
 /// `Event::Response`, so a plugin reads it there, and never merged into the
 /// headers. A section over its caps ends the connection with an error, with the
 /// terminator unwritten, so the client sees an incomplete message.
+///
+/// A response that ends early once its head is stored (the origin closed or
+/// timed out, sent bytes the machine refused, failed with an I/O error, or the
+/// client went away mid-body) is stored as a truncated, finished response
+/// holding the bytes captured so far, before any error about it is dispatched
+/// or returned (`FlowStore::abandon_response`); nothing changes on the wire.
 async fn serve(
     ctx: &ModuleCtx,
     mut client: ByteStream,
@@ -594,7 +632,7 @@ async fn serve(
                             response: None,
                             client_conn: conn.client_conn.clone(),
                             server_conn: conn.server_conn.clone(),
-                            metadata: FlowMeta::default(),
+                            metadata: conn.flow_meta(),
                             intercept: InterceptState::Observed,
                         }));
                         // A client that sent `Expect: 100-continue` holds its body
@@ -875,144 +913,164 @@ async fn serve(
         // Set when a plugin replaced the streamed body with its own on
         // ResponseHeaders; upstream chunks are then captured but not forwarded.
         let mut forward_chunks = true;
-        while !done {
-            let n = match tokio::time::timeout(READ_TIMEOUT, up.read(&mut buf)).await {
-                Ok(r) => r?,
-                Err(_) => bail!("upstream read timed out"),
-            };
-            let events = if n == 0 {
-                machine.on_eof(Side::Server)
-            } else {
-                match machine.on_bytes(Side::Server, &buf[..n]) {
-                    Ok(events) => events,
-                    Err(e) => {
-                        // The machine refused the origin's bytes (a bad trailer
-                        // line, an over-cap section, malformed framing). Event
-                        // consumers see a response only through its events, so
-                        // say so before failing the connection; the words are
-                        // fixed because the machine's own text can quote the
-                        // origin's bytes.
-                        ctx.emit(Event::Error {
-                            flow: id,
-                            kind: aitm_core::FlowError::Upstream(
-                                "malformed response from upstream".to_string(),
-                            ),
-                        })
-                        .await;
-                        return Err(e);
+        // The fixed words of the typed error a failed response owes event
+        // consumers, set by the two exits that dispatch one (the origin closing
+        // early; bytes the machine refused). The other exits dispatch none.
+        let mut fault: Option<&'static str> = None;
+        // Every exit of the loop, `?` and `bail!` alike, lands after this block,
+        // so a response that ended early is finalised in the store before the
+        // error about it is dispatched or returned.
+        let forwarded = async {
+            while !done {
+                let n = match tokio::time::timeout(READ_TIMEOUT, up.read(&mut buf)).await {
+                    Ok(r) => r?,
+                    Err(_) => bail!("upstream read timed out"),
+                };
+                let events = if n == 0 {
+                    machine.on_eof(Side::Server)
+                } else {
+                    match machine.on_bytes(Side::Server, &buf[..n]) {
+                        Ok(events) => events,
+                        Err(e) => {
+                            // The machine refused the origin's bytes (a bad trailer
+                            // line, an over-cap section, malformed framing). Event
+                            // consumers see a response only through its events, so
+                            // one is owed once the store is finalised below; the
+                            // words are fixed because the machine's own text can
+                            // quote the origin's bytes.
+                            fault = Some("malformed response from upstream");
+                            return Err(e);
+                        }
+                    }
+                };
+                for ev in events {
+                    match ev {
+                        HttpSansIoEvent::ResponseHeaders(id) => {
+                            let Some(head) = machine.response().cloned() else {
+                                bail!("ResponseHeaders without a parsed response");
+                            };
+                            response_close = wants_close(&head.headers)
+                                || close_delimited(&request.method, &head);
+                            let streamed = HttpResponse {
+                                body: Body::Streamed(StreamBody),
+                                // A response that arrived in one read already has its
+                                // trailer section on the machine's model. The stored
+                                // head holds none until `ResponseComplete` stores
+                                // them, so a plugin sees the same at this event
+                                // however the origin's bytes were split.
+                                trailers: HeaderMap::new(),
+                                ..head
+                            };
+                            let mut staged = Some(streamed.clone());
+                            ctx.store().update(id, &mut |f: &mut Flow| {
+                                if let (Flow::Http(h), Some(r)) = (f, staged.take()) {
+                                    h.response = Some(r);
+                                }
+                            });
+                            ctx.emit(Event::ResponseHeaders(id)).await;
+                            let to_send = match ctx.store().get(id) {
+                                Some(Flow::Http(f)) => f.response.unwrap_or(streamed),
+                                _ => streamed,
+                            };
+                            forward_chunks = matches!(to_send.body, Body::Streamed(_));
+                            machine.enqueue_response(&to_send);
+                            flush(&mut machine, Side::Client, &mut client).await?;
+                        }
+                        HttpSansIoEvent::ResponseBodyChunk { bytes, .. } => {
+                            let room = max_body.saturating_sub(captured.len());
+                            if bytes.len() > room {
+                                captured.extend_from_slice(&bytes[..room]);
+                                response_truncated = true;
+                            } else {
+                                captured.extend_from_slice(&bytes);
+                            }
+                            if forward_chunks {
+                                machine.enqueue_body_chunk(Side::Client, &bytes);
+                                flush(&mut machine, Side::Client, &mut client).await?;
+                            }
+                        }
+                        HttpSansIoEvent::ResponseComplete(id) => {
+                            // The trailer section the origin sent after a chunked
+                            // body, parsed and bounded by the machine, which holds it
+                            // on its response model by now. Empty for any other body.
+                            let trailers = machine
+                                .response()
+                                .map(|r| r.trailers.clone())
+                                .unwrap_or_default();
+                            if forward_chunks {
+                                // Only a chunk-framed client body has a section to put
+                                // them in, and the writer withholds the fields that
+                                // cannot work as trailers. A plugin that replaced the
+                                // body (`forward_chunks` false) gets none of them.
+                                let withheld =
+                                    machine.enqueue_body_end_with_trailers(Side::Client, &trailers);
+                                flush(&mut machine, Side::Client, &mut client).await?;
+                                if withheld > 0 {
+                                    // A count only: trailer names and values are the
+                                    // origin's bytes and never go in a log.
+                                    tracing::debug!(
+                                        withheld,
+                                        "trailer fields were not forwarded to the client"
+                                    );
+                                }
+                            }
+                            let mut bytes = Some(std::mem::take(&mut captured));
+                            let mut trailers = Some(trailers);
+                            ctx.store().update(id, &mut |f: &mut Flow| {
+                                if let (Flow::Http(h), Some(bytes)) = (f, bytes.take()) {
+                                    if let Some(resp) = h.response.as_mut() {
+                                        resp.body = if bytes.is_empty() {
+                                            Body::Empty
+                                        } else {
+                                            Body::Bytes(bytes)
+                                        };
+                                        // The capture keeps every field the origin
+                                        // sent, whether or not it was forwarded, and
+                                        // replaces whatever a plugin left here.
+                                        resp.trailers = trailers.take().unwrap_or_default();
+                                    }
+                                    h.metadata.truncated |= response_truncated;
+                                    h.metadata.duration = h.metadata.created.elapsed().ok();
+                                }
+                            });
+                            ctx.emit(Event::Response(id)).await;
+                            done = true;
+                        }
+                        HttpSansIoEvent::RequestHeaders(_)
+                        | HttpSansIoEvent::RequestBodyChunk { .. }
+                        | HttpSansIoEvent::RequestComplete(_)
+                        | HttpSansIoEvent::Upgrade { .. } => {}
                     }
                 }
-            };
-            for ev in events {
-                match ev {
-                    HttpSansIoEvent::ResponseHeaders(id) => {
-                        let Some(head) = machine.response().cloned() else {
-                            bail!("ResponseHeaders without a parsed response");
-                        };
-                        response_close =
-                            wants_close(&head.headers) || close_delimited(&request.method, &head);
-                        let streamed = HttpResponse {
-                            body: Body::Streamed(StreamBody),
-                            // A response that arrived in one read already has its
-                            // trailer section on the machine's model. The stored
-                            // head holds none until `ResponseComplete` stores
-                            // them, so a plugin sees the same at this event
-                            // however the origin's bytes were split.
-                            trailers: HeaderMap::new(),
-                            ..head
-                        };
-                        let mut staged = Some(streamed.clone());
-                        ctx.store().update(id, &mut |f: &mut Flow| {
-                            if let (Flow::Http(h), Some(r)) = (f, staged.take()) {
-                                h.response = Some(r);
-                            }
-                        });
-                        ctx.emit(Event::ResponseHeaders(id)).await;
-                        let to_send = match ctx.store().get(id) {
-                            Some(Flow::Http(f)) => f.response.unwrap_or(streamed),
-                            _ => streamed,
-                        };
-                        forward_chunks = matches!(to_send.body, Body::Streamed(_));
-                        machine.enqueue_response(&to_send);
-                        flush(&mut machine, Side::Client, &mut client).await?;
-                    }
-                    HttpSansIoEvent::ResponseBodyChunk { bytes, .. } => {
-                        let room = max_body.saturating_sub(captured.len());
-                        if bytes.len() > room {
-                            captured.extend_from_slice(&bytes[..room]);
-                            response_truncated = true;
-                        } else {
-                            captured.extend_from_slice(&bytes);
-                        }
-                        if forward_chunks {
-                            machine.enqueue_body_chunk(Side::Client, &bytes);
-                            flush(&mut machine, Side::Client, &mut client).await?;
-                        }
-                    }
-                    HttpSansIoEvent::ResponseComplete(id) => {
-                        // The trailer section the origin sent after a chunked
-                        // body, parsed and bounded by the machine, which holds it
-                        // on its response model by now. Empty for any other body.
-                        let trailers = machine
-                            .response()
-                            .map(|r| r.trailers.clone())
-                            .unwrap_or_default();
-                        if forward_chunks {
-                            // Only a chunk-framed client body has a section to put
-                            // them in, and the writer withholds the fields that
-                            // cannot work as trailers. A plugin that replaced the
-                            // body (`forward_chunks` false) gets none of them.
-                            let withheld =
-                                machine.enqueue_body_end_with_trailers(Side::Client, &trailers);
-                            flush(&mut machine, Side::Client, &mut client).await?;
-                            if withheld > 0 {
-                                // A count only: trailer names and values are the
-                                // origin's bytes and never go in a log.
-                                tracing::debug!(
-                                    withheld,
-                                    "trailer fields were not forwarded to the client"
-                                );
-                            }
-                        }
-                        let mut bytes = Some(std::mem::take(&mut captured));
-                        let mut trailers = Some(trailers);
-                        ctx.store().update(id, &mut |f: &mut Flow| {
-                            if let (Flow::Http(h), Some(bytes)) = (f, bytes.take()) {
-                                if let Some(resp) = h.response.as_mut() {
-                                    resp.body = if bytes.is_empty() {
-                                        Body::Empty
-                                    } else {
-                                        Body::Bytes(bytes)
-                                    };
-                                    // The capture keeps every field the origin
-                                    // sent, whether or not it was forwarded, and
-                                    // replaces whatever a plugin left here.
-                                    resp.trailers = trailers.take().unwrap_or_default();
-                                }
-                                h.metadata.truncated |= response_truncated;
-                                h.metadata.duration = h.metadata.created.elapsed().ok();
-                            }
-                        });
-                        ctx.emit(Event::Response(id)).await;
-                        done = true;
-                    }
-                    HttpSansIoEvent::RequestHeaders(_)
-                    | HttpSansIoEvent::RequestBodyChunk { .. }
-                    | HttpSansIoEvent::RequestComplete(_)
-                    | HttpSansIoEvent::Upgrade { .. } => {}
+                if n == 0 && !done {
+                    // The transport failure reaches the typed error bus once the
+                    // store is finalised below, in the same words as the error.
+                    let words = "upstream closed before completing the response";
+                    fault = Some(words);
+                    bail!(words);
                 }
             }
-            if n == 0 && !done {
-                // Map the transport failure to the typed error bus before bailing.
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(e) = forwarded {
+            // However the response ended (the origin closed or timed out, its
+            // bytes were refused, an I/O error on either side), the bytes captured
+            // so far, bounded by `max_body` like a completed body, become the
+            // stored body and the response is marked truncated, so the flow is
+            // terminal for `flow.clear` and eviction and `flow.get` reports a
+            // size. With no head stored yet this changes nothing. The store is
+            // final before the error is dispatched, so a push or refetch built on
+            // that event sees the finished flow.
+            ctx.store().abandon_response(id, captured);
+            if let Some(words) = fault {
                 ctx.emit(Event::Error {
                     flow: id,
-                    kind: aitm_core::FlowError::Upstream(
-                        "upstream closed before completing the response".to_string(),
-                    ),
+                    kind: aitm_core::FlowError::Upstream(words.to_string()),
                 })
                 .await;
-                bail!("upstream closed before completing the response");
             }
+            return Err(e);
         }
 
         if machine.is_upgraded() {
@@ -1032,6 +1090,10 @@ async fn serve(
                 alpn: vec![protocol],
                 first_bytes: client_rest.clone(),
                 from_upgrade: true,
+                // The re-dispatched module sees the same attribution this
+                // connection's flows were stamped with.
+                peer_identity: conn.source_app.clone(),
+                capture_interface: conn.capture_interface.clone(),
             };
             let client_io: ByteStream = Box::pin(Prefixed::with_prefix(client, client_rest));
             let upstream_io: ByteStream = Box::pin(Prefixed::with_prefix(upstream_io, server_rest));
@@ -2384,6 +2446,8 @@ mod tests {
                 tls: true,
                 established: SystemTime::UNIX_EPOCH,
             }),
+            source_app: None,
+            capture_interface: None,
         }
     }
 
@@ -3667,6 +3731,8 @@ mod tests {
                 established: SystemTime::now(),
             },
             server_conn: None,
+            source_app: None,
+            capture_interface: None,
         };
         let (mut client, proxy_side) = duplex(64 * 1024);
 
@@ -3759,11 +3825,83 @@ mod tests {
         );
         assert!(!flow.metadata.truncated);
         assert_eq!(flow.metadata.marks, Vec::<String>::new());
+        // A proxied connection has no capture attribution: both are `None`, never
+        // a placeholder.
+        assert_eq!(flow.metadata.source_app, None);
+        assert_eq!(flow.metadata.capture_interface, None);
         assert!(
             matches!(flow.intercept, InterceptState::Observed),
             "intercept: {:?}",
             flow.intercept
         );
+    }
+
+    // ---- capture attribution (SA-AC0) ------------------------------------
+
+    /// `Conn::flow_meta` carries exactly the attribution onto a fresh `FlowMeta`:
+    /// marks, comment, replay flag and timing are each flow's own.
+    #[test]
+    fn conn_flow_meta_carries_only_attribution() {
+        let mut conn = Conn::plain(unknown_peer(), None);
+        conn.source_app = Some("com.apple.Safari".into());
+        conn.capture_interface = Some("macos-ne".into());
+
+        let meta = conn.flow_meta();
+
+        assert_eq!(meta.source_app, Some("com.apple.Safari".into()));
+        assert_eq!(meta.capture_interface, Some("macos-ne".into()));
+        assert!(meta.marks.is_empty());
+        assert!(!meta.is_replay);
+        assert_eq!(meta.comment, None);
+    }
+
+    /// SA-AC0: the attribution a capture ingress puts on the hint (`peer_identity`,
+    /// `capture_interface`) reaches the flow the module stores for a cleartext
+    /// request served through `spawn`, as `source_app` / `capture_interface`.
+    #[tokio::test]
+    async fn drive_stamps_the_hint_attribution_on_the_stored_flow() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let store = Arc::new(MemFlowStore::new());
+        let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store.clone(), Arc::new(NoSink));
+        let ctx = ctx.with_hint(NextLayerHint {
+            dst: unknown_peer(),
+            is_tls: false,
+            client_hello_sni: None,
+            alpn: vec![],
+            first_bytes: b"GET ".to_vec(),
+            from_upgrade: false,
+            peer_identity: Some("com.apple.Safari".into()),
+            capture_interface: Some("macos-ne".into()),
+        });
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], true));
+        let module = HttpModule::new();
+
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let serving = module.spawn(Box::pin(proxy_side), ctx);
+        let script = async {
+            let body = client_get(&mut client, "/one", "127.0.0.1:8080").await;
+            // Hang up, so the module sees the client finish and returns.
+            drop(client);
+            body
+        };
+        let (served, body) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("spawn hung: the request went to an upstream that never answers");
+        served.expect("the module ends cleanly when the client hangs up");
+        assert_eq!(body, "first");
+
+        // `spawn` took the context, so read the flow back through the shared store.
+        let flow = store
+            .list()
+            .into_iter()
+            .find_map(|id| match store.get(id) {
+                Some(Flow::Http(f)) if f.request.path == "/one" => Some(f),
+                _ => None,
+            })
+            .expect("a stored flow for /one");
+        assert_eq!(flow.metadata.source_app, Some("com.apple.Safari".into()));
+        assert_eq!(flow.metadata.capture_interface, Some("macos-ne".into()));
     }
 
     /// A taint lasts for one replacement. Once the new upstream is in place the
@@ -5328,6 +5466,43 @@ mod tests {
                 !format!("{events:?}").contains("evil-91c2"),
                 "the origin's field names must not reach an event: {events:?}"
             );
+            // With the head (and its chunk) stored before the section was refused,
+            // the response is finalised as a truncated one and the flow is
+            // terminal. Refused in the same read as the head, no head was ever
+            // stored (the machine drops the events of a read it refuses), so the
+            // flow stays in flight: the documented limitation (spec Non-goals,
+            // follow-up F1), pinned here so a later fix flips it knowingly.
+            if delivery == "head, then section" {
+                let resp = flow
+                    .response
+                    .as_ref()
+                    .expect("the head was stored before the section was refused");
+                assert!(
+                    matches!(&resp.body, Body::Bytes(b) if b == b"hello"),
+                    "the chunk captured before the refusal is the stored body ({delivery}): {:?}",
+                    resp.body
+                );
+                assert!(
+                    flow.metadata.truncated,
+                    "a refused response is marked truncated ({delivery})"
+                );
+                assert_eq!(
+                    ctx.store().clear().cleared,
+                    1,
+                    "a refused response is terminal ({delivery})"
+                );
+            } else {
+                assert!(
+                    flow.response.is_none(),
+                    "no head is stored when the read that held it is refused ({delivery}): {:?}",
+                    flow.response
+                );
+                assert_eq!(
+                    ctx.store().clear().skipped_in_flight,
+                    1,
+                    "a flow with no response stays in flight ({delivery}); spec F1"
+                );
+            }
         }
     }
 
@@ -5462,5 +5637,1019 @@ mod tests {
                 .any(|e| matches!(e, Event::Response(f) if *f == flow.id)),
             "an incomplete response is never dispatched as complete: {events:?}"
         );
+    }
+    // ---- finalising a response that ends early ----------------------------
+
+    /// The head of a response that declares ten body bytes. An origin that stops
+    /// after fewer leaves the body incomplete: a `Content-Length` body is never
+    /// completed by a close, so an EOF after it is premature.
+    const PARTIAL_HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n";
+
+    /// The path the clients below request, and their flow is stored under.
+    const PARTIAL_PATH: &str = "/t";
+
+    /// Read one request head from `io`, an origin's end, and discard it. The
+    /// origins below answer whatever was asked, but must not answer before the
+    /// proxy has forwarded the request: one that replied and closed first would
+    /// fail the forward, not the response.
+    async fn read_request_head(io: &mut DuplexStream) {
+        let mut held: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 512];
+        while !held.windows(4).any(|w| w == b"\r\n\r\n") {
+            match io.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => held.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+
+    /// Write `bytes` to an origin's end and flush them, as one segment.
+    async fn origin_write(io: &mut DuplexStream, bytes: &[u8]) {
+        io.write_all(bytes).await.expect("origin write");
+        io.flush().await.expect("origin flush");
+    }
+
+    /// Send `GET /t` on the client end.
+    async fn send_partial_get(client: &mut DuplexStream) {
+        client
+            .write_all(get_request(PARTIAL_PATH, "127.0.0.1:8080").as_bytes())
+            .await
+            .expect("send");
+    }
+
+    /// The typed errors dispatched for `flow`, in order.
+    fn errors_for(events: &[Event], flow: FlowId) -> Vec<&aitm_core::FlowError> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Error { flow: f, kind } if *f == flow => Some(kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Whether `Event::Response` was dispatched for `flow`.
+    fn dispatched_as_complete(events: &[Event], flow: FlowId) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, Event::Response(f) if *f == flow))
+    }
+
+    /// Asserts that `flow`'s response was finalised as abandoned: its body is
+    /// `Bytes(body)`, it is marked truncated and it has a duration.
+    fn assert_abandoned(flow: &HttpFlow, body: &[u8]) {
+        let resp = flow
+            .response
+            .as_ref()
+            .expect("the response head was stored");
+        assert!(
+            matches!(&resp.body, Body::Bytes(b) if b == body),
+            "the bytes captured before the failure are the stored body: {:?}",
+            resp.body
+        );
+        assert!(
+            flow.metadata.truncated,
+            "an abandoned response is marked truncated"
+        );
+        assert!(
+            flow.metadata.duration.is_some(),
+            "an abandoned response has a duration"
+        );
+    }
+
+    /// Records every event, in order, and, when `Event::Error` is dispatched for
+    /// an HTTP flow, what the store held for it at that moment (whether the
+    /// response body was already `Bytes(expect_body)`, and whether the flow was
+    /// already marked truncated), as a plugin, or the MCP push built from the
+    /// store on that event, would see it.
+    struct ErrorProbe {
+        store: Arc<MemFlowStore>,
+        events: Mutex<Vec<Event>>,
+        at_error: Mutex<Vec<(bool, bool)>>,
+        /// The buffered body the probe expects to find at dispatch time.
+        expect_body: &'static [u8],
+    }
+
+    impl EventSink for ErrorProbe {
+        fn emit(&self, ev: Event) -> BoxFuture<'_, Verdict> {
+            if let Event::Error { flow, .. } = &ev {
+                if let Some(Flow::Http(f)) = self.store.get(*flow) {
+                    let buffered = f.response.as_ref().is_some_and(
+                        |r| matches!(&r.body, Body::Bytes(b) if b.as_slice() == self.expect_body),
+                    );
+                    self.at_error
+                        .lock()
+                        .expect("at_error lock")
+                        .push((buffered, f.metadata.truncated));
+                }
+            }
+            self.events.lock().expect("events lock").push(ev);
+            Box::pin(async { Verdict::Continue })
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_the_response_when_the_upstream_closes_mid_body() {
+        // AC3: the flow becomes terminal, holding what was captured. AC4: it is
+        // so by the time the typed error is dispatched.
+        let (up, mut origin_end) = duplex(64 * 1024);
+        let store = Arc::new(MemFlowStore::new());
+        let sink = Arc::new(ErrorProbe {
+            store: store.clone(),
+            events: Mutex::new(Vec::new()),
+            at_error: Mutex::new(Vec::new()),
+            expect_body: b"abc",
+        });
+        let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink.clone());
+        let _origin = tokio::spawn(async move {
+            read_request_head(&mut origin_end).await;
+            origin_write(&mut origin_end, PARTIAL_HEAD.as_bytes()).await;
+            origin_write(&mut origin_end, b"abc").await;
+            // Dropping the origin's end closes the connection seven bytes short.
+        });
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an origin that closes mid-body fails the connection");
+        assert!(
+            err.to_string()
+                .contains("upstream closed before completing the response"),
+            "error: {err}"
+        );
+        assert!(closed, "the proxy hangs up on the client");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            format!("{PARTIAL_HEAD}abc"),
+            "the client received what the origin sent, and no more"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        assert_abandoned(&flow, b"abc");
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            errors_for(&events, flow.id),
+            vec![&aitm_core::FlowError::Upstream(
+                "upstream closed before completing the response".to_string()
+            )],
+            "one typed error, in fixed words: {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+        assert_eq!(
+            *sink.at_error.lock().expect("at_error lock"),
+            vec![(true, true)],
+            "the store holds the buffered, truncated response when Event::Error is dispatched"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_finalises_the_response_when_the_upstream_read_times_out() {
+        // AC5. The clock is paused: the 30 s `READ_TIMEOUT` is reached the moment
+        // every task is idle, so the test takes a fraction of a second of wall
+        // time. `with_serve` is not used because its 5 s guard would fire first.
+        let (up, mut origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(Vec::new());
+        let _origin = tokio::spawn(async move {
+            read_request_head(&mut origin_end).await;
+            origin_write(&mut origin_end, PARTIAL_HEAD.as_bytes()).await;
+            origin_write(&mut origin_end, b"abc").await;
+            // Hold the connection open and send nothing more.
+            std::future::pending::<()>().await;
+        });
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let serving = serve(
+            &ctx,
+            Box::pin(proxy_side),
+            Some(Box::pin(up)),
+            None,
+            Conn::plain(unknown_peer(), None),
+            MAX_BODY,
+        );
+        let script = async {
+            send_partial_get(&mut client).await;
+            let head =
+                read_up_to(&mut client, PARTIAL_HEAD.len() + 3, Duration::from_secs(5)).await;
+            let (rest, closed) = read_to_close(&mut client, Duration::from_secs(40)).await;
+            (head, rest, closed)
+        };
+        let wall = std::time::Instant::now();
+        let (served, (head, rest, closed)) = tokio::time::timeout(Duration::from_secs(60), async {
+            tokio::join!(serving, script)
+        })
+        .await
+        .expect("serve hung past the read timeout");
+        let wall = wall.elapsed();
+
+        let err = served.expect_err("an origin that goes quiet mid-body fails the connection");
+        assert!(
+            err.to_string().contains("upstream read timed out"),
+            "error: {err}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&head),
+            format!("{PARTIAL_HEAD}abc"),
+            "the client received what the origin sent"
+        );
+        assert!(
+            rest.is_empty() && closed,
+            "nothing more arrives, then the proxy hangs up: {rest:?}, closed: {closed}"
+        );
+        // A real 30 s wait would blow this bound: it proves the timeout was
+        // reached on the paused clock, with slack for a loaded machine.
+        assert!(wall < Duration::from_secs(10), "took {wall:?} of wall time");
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        assert_abandoned(&flow, b"abc");
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert!(
+            errors_for(&events, flow.id).is_empty(),
+            "no typed error is dispatched on this path (spec D4): {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_the_response_when_the_client_goes_away_mid_body() {
+        // AC7. The origin stays alive throughout: what fails is the forward of
+        // `def` to a client that has hung up.
+        let (up, mut origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        let client_gone = Arc::new(tokio::sync::Notify::new());
+        let told = client_gone.clone();
+        let _origin = tokio::spawn(async move {
+            read_request_head(&mut origin_end).await;
+            origin_write(&mut origin_end, PARTIAL_HEAD.as_bytes()).await;
+            origin_write(&mut origin_end, b"abc").await;
+            told.notified().await;
+            origin_write(&mut origin_end, b"def").await;
+            // Hold the connection open: the origin never fails this exchange.
+            std::future::pending::<()>().await;
+        });
+
+        let (served, got) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                let got =
+                    read_up_to(&mut client, PARTIAL_HEAD.len() + 3, Duration::from_secs(2)).await;
+                drop(client);
+                client_gone.notify_one();
+                got
+            },
+        )
+        .await;
+
+        let err = served.expect_err("a client that hangs up mid-body fails the connection");
+        assert!(
+            !err.to_string().contains("upstream"),
+            "the failure is the client's, not the origin's: {err}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            format!("{PARTIAL_HEAD}abc"),
+            "the client read the head and the first chunk before hanging up"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        // `def` was captured before its forward failed.
+        assert_abandoned(&flow, b"abcdef");
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert!(
+            errors_for(&events, flow.id).is_empty(),
+            "no typed error is dispatched on this path (spec D4): {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    // ---- tester additions: the remaining exits and inputs of the funnel -------
+
+    /// An origin whose connection fails with an I/O **error** (not an EOF) once
+    /// its scripted reply has been read: `read` returns `ConnectionReset`, which
+    /// is the h1 loop's `Ok(r) => r?` exit (spec D4, "upstream I/O error").
+    /// Writes are accepted and discarded; the reply is released only after the
+    /// request has been written, like a real origin.
+    struct ResettingOrigin {
+        reply: Vec<u8>,
+        pos: usize,
+        request_seen: bool,
+        waiting: Option<std::task::Waker>,
+    }
+
+    impl ResettingOrigin {
+        fn replying(reply: Vec<u8>) -> Self {
+            Self {
+                reply,
+                pos: 0,
+                request_seen: false,
+                waiting: None,
+            }
+        }
+    }
+
+    impl AsyncRead for ResettingOrigin {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut TaskCx<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if !this.request_seen {
+                this.waiting = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            if this.pos < this.reply.len() {
+                let n = buf.remaining().min(this.reply.len() - this.pos);
+                buf.put_slice(&this.reply[this.pos..this.pos + n]);
+                this.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "origin connection reset",
+            )))
+        }
+    }
+
+    impl AsyncWrite for ResettingOrigin {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskCx<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.request_seen = true;
+            if let Some(waker) = this.waiting.take() {
+                waker.wake();
+            }
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_the_response_when_the_upstream_read_fails() {
+        // Spec D4, "upstream I/O error": the read itself fails rather than
+        // returning EOF. No typed error is owed on this path, but the store must
+        // be finalised like on every other exit.
+        let origin = ResettingOrigin::replying(format!("{PARTIAL_HEAD}abc").into_bytes());
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(origin)]);
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err =
+            served.expect_err("an origin whose connection resets mid-body fails the connection");
+        assert!(
+            err.to_string().contains("origin connection reset"),
+            "the connection's own I/O error is what serve returns: {err}"
+        );
+        assert!(
+            !err.to_string().contains("upstream closed"),
+            "an I/O error is not mistaken for a clean close: {err}"
+        );
+        assert!(closed, "the proxy hangs up on the client");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            format!("{PARTIAL_HEAD}abc"),
+            "the client received what the origin sent before the reset"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        assert_abandoned(&flow, b"abc");
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert!(
+            errors_for(&events, flow.id).is_empty(),
+            "no typed error is dispatched on this path (spec D4): {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_an_empty_response_when_the_upstream_closes_after_the_head() {
+        // Empty input on the abandon path: not one body byte arrived before the
+        // origin closed. The response is finalised as `Body::Empty` (never
+        // `Bytes(vec![])`), truncated and terminal, with the one typed error any
+        // early close owes.
+        let (up, mut origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(async move {
+            read_request_head(&mut origin_end).await;
+            origin_write(&mut origin_end, PARTIAL_HEAD.as_bytes()).await;
+            // Dropping the origin's end closes the connection with the whole body owed.
+        });
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an origin that closes after the head fails the connection");
+        assert!(
+            err.to_string()
+                .contains("upstream closed before completing the response"),
+            "error: {err}"
+        );
+        assert!(closed, "the proxy hangs up on the client");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            PARTIAL_HEAD,
+            "the client received the head and nothing else"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        let resp = flow
+            .response
+            .as_ref()
+            .expect("the response head was stored");
+        assert_eq!(resp.status, 200);
+        assert!(
+            matches!(resp.body, Body::Empty),
+            "nothing captured is `Empty`, not `Bytes([])`: {:?}",
+            resp.body
+        );
+        assert!(
+            flow.metadata.truncated,
+            "an abandoned response is truncated"
+        );
+        assert!(
+            flow.metadata.duration.is_some(),
+            "an abandoned response has a duration"
+        );
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned empty response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            errors_for(&events, flow.id),
+            vec![&aitm_core::FlowError::Upstream(
+                "upstream closed before completing the response".to_string()
+            )],
+            "one typed error, in fixed words: {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_caps_an_abandoned_body_at_max_body() {
+        // Oversized input: the capture buffer is bounded by `max_body` on the
+        // abandon path exactly as on the completed path (spec Constraints,
+        // Security), while the client still receives every byte the origin sent.
+        const CAP: usize = 4;
+        let (up, mut origin_end) = duplex(64 * 1024);
+        let (ctx, _dialed, sink) = ctx_recording(vec![Box::pin(up)]);
+        let _origin = tokio::spawn(async move {
+            read_request_head(&mut origin_end).await;
+            origin_write(&mut origin_end, PARTIAL_HEAD.as_bytes()).await;
+            origin_write(&mut origin_end, b"abcdef").await;
+            // Six of ten bytes, then the origin's end is dropped.
+        });
+
+        let (served, (got, closed)) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            CAP,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an origin that closes mid-body fails the connection");
+        assert!(
+            err.to_string()
+                .contains("upstream closed before completing the response"),
+            "error: {err}"
+        );
+        assert!(closed, "the proxy hangs up on the client");
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            format!("{PARTIAL_HEAD}abcdef"),
+            "the wire is unchanged: the client got every byte, cap or no cap"
+        );
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        // Only the first `CAP` bytes are retained; the marker covers both the
+        // cap and the early end.
+        assert_abandoned(&flow, b"abcd");
+        assert_eq!(
+            ctx.store().clear(),
+            aitm_core::ClearOutcome {
+                cleared: 1,
+                skipped_in_flight: 0
+            },
+            "an abandoned, capped response is terminal"
+        );
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            errors_for(&events, flow.id).len(),
+            1,
+            "one typed error: {events:?}"
+        );
+        assert!(
+            !dispatched_as_complete(&events, flow.id),
+            "an abandoned response is never dispatched as complete: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_finalises_the_store_before_the_malformed_error_is_dispatched() {
+        // AC4's store-then-event order on the other path that dispatches a typed
+        // error (spec D3): when the machine refuses the origin's bytes after the
+        // head and a chunk were stored, the sink handling `Event::Error` already
+        // sees the response buffered (`hello`) and truncated.
+        let mut section = String::from("0\r\n");
+        for n in 0..65 {
+            section.push_str(&format!("x-evil-91c2-{n}: v\r\n"));
+        }
+        section.push_str("\r\n");
+        let (up, origin_end) = duplex(64 * 1024);
+        let store = Arc::new(MemFlowStore::new());
+        let sink = Arc::new(ErrorProbe {
+            store: store.clone(),
+            events: Mutex::new(Vec::new()),
+            at_error: Mutex::new(Vec::new()),
+            expect_body: b"hello",
+        });
+        let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store, sink.clone());
+        let _origin = tokio::spawn(origin_replying(
+            origin_end,
+            Arc::new(Mutex::new(Vec::new())),
+            vec![vec![TRAILER_HEAD.to_string(), section]],
+        ));
+
+        let (served, _) = with_serve(
+            &ctx,
+            Conn::plain(unknown_peer(), None),
+            None,
+            MAX_BODY,
+            |mut client| async move {
+                send_partial_get(&mut client).await;
+                read_to_close(&mut client, Duration::from_secs(2)).await
+            },
+        )
+        .await;
+
+        let err = served.expect_err("an over-cap trailer section fails the connection");
+        assert!(err.to_string().contains("trailer"), "error: {err}");
+        let flow = stored_http(&ctx, PARTIAL_PATH);
+        assert_abandoned(&flow, b"hello");
+        let events = sink.events.lock().expect("events lock");
+        assert_eq!(
+            errors_for(&events, flow.id),
+            vec![&aitm_core::FlowError::Upstream(
+                "malformed response from upstream".to_string()
+            )],
+            "one typed error, in fixed words: {events:?}"
+        );
+        assert_eq!(
+            *sink.at_error.lock().expect("at_error lock"),
+            vec![(true, true)],
+            "the store holds the buffered, truncated response when Event::Error is dispatched"
+        );
+    }
+
+    // ---- Tester additions (whole-branch stage 5): capture attribution on the
+    // TLS, h2 and upgrade paths, which the SA-AC0 tests above do not reach.
+    mod attribution {
+        use super::*;
+
+        /// A CA in a fresh temp dir, so a MITM test never touches the user's CA.
+        fn test_ca() -> Arc<CertAuthority> {
+            let dir = std::env::temp_dir().join(format!("aitm-attr-ca-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("ca dir");
+            Arc::new(CertAuthority::load_or_generate(&dir, 0o600).expect("test CA"))
+        }
+
+        /// The hint a capture ingress attaches: Safari on the macOS NE backend.
+        fn attributed_hint(is_tls: bool, first_bytes: Vec<u8>) -> NextLayerHint {
+            NextLayerHint {
+                dst: unknown_peer(),
+                is_tls,
+                client_hello_sni: None,
+                alpn: vec![],
+                first_bytes,
+                from_upgrade: false,
+                peer_identity: Some("com.apple.Safari".into()),
+                capture_interface: Some("macos-ne".into()),
+            }
+        }
+
+        /// The stored HTTP flow for `path` in `store` (the context is consumed by
+        /// the driver under test, so the store is read directly).
+        fn stored_in(store: &MemFlowStore, path: &str) -> HttpFlow {
+            store
+                .list()
+                .into_iter()
+                .find_map(|id| match store.get(id) {
+                    Some(Flow::Http(f)) if f.request.path == path => Some(f),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no stored flow for {path}"))
+        }
+
+        fn assert_attributed(flow: &HttpFlow) {
+            assert_eq!(
+                flow.metadata.source_app.as_deref(),
+                Some("com.apple.Safari")
+            );
+            assert_eq!(flow.metadata.capture_interface.as_deref(), Some("macos-ne"));
+            assert!(flow.metadata.marks.is_empty());
+            assert!(!flow.metadata.is_replay);
+        }
+
+        /// Read one `Content-Length`-framed 200 from any stream (the TLS client end
+        /// is not a `DuplexStream`, so [`client_get`] does not apply).
+        async fn read_one_200<S: AsyncRead + Unpin>(io: &mut S) -> String {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let head_end = loop {
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break p + 4;
+                }
+                let n = io.read(&mut chunk).await.expect("read head");
+                assert!(
+                    n > 0,
+                    "EOF before the response head: {:?}",
+                    String::from_utf8_lossy(&buf)
+                );
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            assert!(head.starts_with("HTTP/1.1 200"), "status line: {head}");
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().to_string())
+                })
+                .expect("Content-Length")
+                .parse()
+                .expect("a numeric Content-Length");
+            while buf.len() < head_end + len {
+                let n = io.read(&mut chunk).await.expect("read body");
+                assert!(n > 0, "EOF before the body ended");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned()
+        }
+
+        /// SA-AC0 on the TLS path: `mitm` builds its `Conn` from the hint, so a
+        /// captured HTTPS request (h1 after the ALPN mirror) is stored attributed.
+        /// The cleartext test above never reaches the `Conn` literal in `mitm`.
+        #[tokio::test]
+        async fn mitm_stamps_the_hint_attribution_on_the_stored_flow() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+
+            // The origin: TLS over a duplex, one 200 then close.
+            let (up_ours, up_origin) = duplex(64 * 1024);
+            let origin = tokio::spawn(async move {
+                let tls = TlsAcceptor::from(server_config(&[b"http/1.1"]))
+                    .accept(up_origin)
+                    .await
+                    .expect("origin handshake");
+                origin_serve(tls, vec!["first"], true).await;
+            });
+            let (ctx, _dialed) =
+                ctx_with_sink(vec![Box::pin(up_ours)], store.clone(), Arc::new(NoSink));
+            let ctx = ctx.with_hint(attributed_hint(true, vec![TLS_HANDSHAKE]));
+
+            // The client: a real handshake against the forged leaf, one GET, hang up.
+            let (client_end, proxy_side) = duplex(64 * 1024);
+            let client_cfg = HttpModule::new()
+                .with_insecure(true)
+                .upstream_tls_alpn(&[b"http/1.1".to_vec()])
+                .expect("client config");
+            let script = async move {
+                let mut tls = TlsConnector::from(client_cfg)
+                    .connect(
+                        ServerName::try_from("origin.test").expect("name"),
+                        client_end,
+                    )
+                    .await
+                    .expect("client handshake against the forged leaf");
+                tls.write_all(get_request("/one", "origin.test:8443").as_bytes())
+                    .await
+                    .expect("send");
+                tls.flush().await.expect("flush");
+                let body = read_one_200(&mut tls).await;
+                let _ = tls.shutdown().await;
+                body
+            };
+            let proxy_side: ByteStream = Box::pin(proxy_side);
+            let serving = module.mitm(
+                Prefixed::new(proxy_side),
+                ctx,
+                unknown_peer(),
+                Some(Target {
+                    host: "origin.test".into(),
+                    port: 8443,
+                    addr: origin_addr(),
+                }),
+            );
+            let (_served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("mitm hung");
+            assert_eq!(
+                body, "first",
+                "the request went through the MITM to the origin"
+            );
+            origin.abort();
+
+            assert_attributed(&stored_in(&store, "/one"));
+        }
+
+        /// SA-AC0 on the h2 path — the one Safari and Chrome take for a captured
+        /// HTTPS site: `stream_task` stamps `conn.flow_meta()` on each stream's flow.
+        /// `serve_h2` is driven directly over duplexes with the attributed `Conn`
+        /// that `mitm` would have built after the ALPN mirror.
+        #[tokio::test]
+        async fn serve_h2_stamps_the_connection_attribution_on_the_stored_flow() {
+            let module = HttpModule::new().with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, _dialed) = ctx_with_sink(vec![], store.clone(), Arc::new(NoSink));
+            let mut conn = Conn::plain(
+                unknown_peer(),
+                Some(("origin.test:443".to_string(), origin_addr())),
+            );
+            conn.scheme = "https".to_string();
+            conn.source_app = Some("com.apple.Safari".into());
+            conn.capture_interface = Some("macos-ne".into());
+
+            // An h2 origin: 200 "first" for every stream, until the connection ends.
+            let (up_ours, up_origin) = duplex(64 * 1024);
+            let origin = tokio::spawn(async move {
+                let mut server = h2::server::handshake(up_origin)
+                    .await
+                    .expect("origin h2 handshake");
+                while let Some(Ok((request, mut respond))) = server.accept().await {
+                    let (_head, mut body) = request.into_parts();
+                    while let Some(Ok(chunk)) = body.data().await {
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                    }
+                    let response = http::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("response");
+                    let mut send = respond
+                        .send_response(response, false)
+                        .expect("send response");
+                    send.send_data(bytes::Bytes::from_static(b"first"), true)
+                        .expect("send body");
+                }
+            });
+
+            let (client_end, proxy_side) = duplex(64 * 1024);
+            let upstream_h2_tls = module
+                .upstream_tls_alpn(&[b"h2".to_vec()])
+                .expect("h2 client config");
+            let serving = crate::h2::serve_h2(
+                ctx,
+                Box::pin(proxy_side),
+                Box::pin(up_ours),
+                conn,
+                MAX_BODY,
+                16,
+                upstream_h2_tls,
+            );
+            let script = async move {
+                let (send_req, connection) = h2::client::handshake(client_end)
+                    .await
+                    .expect("client h2 handshake");
+                let connection = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let mut ready = send_req.ready().await.expect("h2 ready");
+                let request = http::Request::builder()
+                    .method("GET")
+                    .uri("https://origin.test/one")
+                    .body(())
+                    .expect("request");
+                let (response, _body) = ready.send_request(request, true).expect("send request");
+                let response = response.await.expect("response");
+                assert_eq!(response.status().as_u16(), 200);
+                let mut body = response.into_body();
+                let mut got = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("body chunk");
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    got.extend_from_slice(&chunk);
+                }
+                // Hang up: dropping the handle and the connection closes the transport.
+                drop(ready);
+                connection.abort();
+                got
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("serve_h2 hung");
+            served.expect("serve_h2 ends when the client connection closes");
+            assert_eq!(body, b"first");
+            origin.abort();
+
+            let flow = stored_in(&store, "/one");
+            assert!(
+                matches!(flow.request.version, aitm_core::HttpVersion::H2),
+                "the flow came through the h2 driver"
+            );
+            assert_attributed(&flow);
+        }
+
+        /// The module an upgrade is re-dispatched to: records the hint it was
+        /// spawned with and returns at once.
+        struct RecordingUpgradeModule {
+            hint: Mutex<Option<NextLayerHint>>,
+        }
+
+        impl ProtocolModule for RecordingUpgradeModule {
+            fn id(&self) -> &str {
+                "recording-upgrade"
+            }
+
+            fn matches(&self, hint: &NextLayerHint) -> bool {
+                hint.from_upgrade
+            }
+
+            fn spawn(&self, _io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, Result<()>> {
+                *self.hint.lock().expect("hint lock") = ctx.hint().cloned();
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        /// Spec D2: the upgrade hint `serve` hands the next module carries the
+        /// connection's attribution, so the re-dispatched module sees what the
+        /// handshake flow was stamped with — and the handshake flow is stamped too.
+        #[tokio::test]
+        async fn upgrade_handoff_hint_carries_the_connection_attribution() {
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let recorder = Arc::new(RecordingUpgradeModule {
+                hint: Mutex::new(None),
+            });
+            let modules: Arc<[Arc<dyn ProtocolModule>]> =
+                Arc::from(vec![recorder.clone() as Arc<dyn ProtocolModule>]);
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store.clone(), Arc::new(NoSink));
+            let ctx = ctx
+                .with_modules(modules)
+                .with_hint(attributed_hint(false, b"GET ".to_vec()));
+
+            // An origin that answers the upgrade with a 101 and then holds the line.
+            let origin = tokio::spawn(async move {
+                let mut io = origin_end;
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 256];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match io.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = io
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    )
+                    .await;
+                let _ = io.flush().await;
+                while matches!(io.read(&mut chunk).await, Ok(n) if n > 0) {}
+            });
+
+            let module = HttpModule::new();
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(
+                        b"GET /chat HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                    )
+                    .await
+                    .expect("send the upgrade request");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 256];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = client.read(&mut chunk).await.expect("read the 101");
+                    assert!(
+                        n > 0,
+                        "EOF before the 101: {:?}",
+                        String::from_utf8_lossy(&buf)
+                    );
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                String::from_utf8_lossy(&buf).into_owned()
+            };
+            let (served, head) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the upgrade hand-off hung");
+            served.expect("serve returns the hand-off's result");
+            assert!(
+                head.starts_with("HTTP/1.1 101"),
+                "the 101 reached the client: {head}"
+            );
+            origin.abort();
+
+            let hint = recorder
+                .hint
+                .lock()
+                .expect("hint lock")
+                .clone()
+                .expect("the upgrade module was spawned with a hint");
+            assert!(hint.from_upgrade);
+            assert!(
+                hint.alpn
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("websocket")),
+                "alpn: {:?}",
+                hint.alpn
+            );
+            assert_eq!(hint.peer_identity.as_deref(), Some("com.apple.Safari"));
+            assert_eq!(hint.capture_interface.as_deref(), Some("macos-ne"));
+            assert_attributed(&stored_in(&store, "/chat"));
+        }
     }
 }

@@ -1,4 +1,5 @@
 import Foundation
+import Observation
 
 /// Which core the app talks to, as a persisted, user-changeable choice (spec O1).
 /// `embedded` is the default: the app runs and manages its own bundled core.
@@ -48,12 +49,23 @@ public protocol ActiveKindPersistence: AnyObject {
 }
 
 /// `UserDefaults`-backed persistence for the active-core choice, under
+/// Whether the status bar's Expected-role warning applies. The embedded core always
+/// connects the app as operator, so the warning describes an external core: it is
+/// suppressed only while the embedded core is the ACTIVE connection and present. An
+/// external connection with a dormant embedded controller still warns.
+public func roleWarningApplies(activeKind: ActiveCoreKind, embeddedConnectionPresent: Bool) -> Bool {
+    !(activeKind == .embedded && embeddedConnectionPresent)
+}
+
 /// `bus.activeKind` (the key `BusSettings` binds to as well).
 public final class UserDefaultsActiveKindPersistence: ActiveKindPersistence {
     public static let key = "bus.activeKind"
     private let defaults: UserDefaults
 
-    public init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    /// The store is the caller's to name: the app passes `Store.defaults` (the operator's
+    /// defaults in a normal launch, the isolated harness suite under `APP_STORE`), so no
+    /// `.standard` default can leak the operator's `bus.activeKind` into a harness run.
+    public init(defaults: UserDefaults) { self.defaults = defaults }
 
     public func load() -> ActiveCoreKind? {
         defaults.string(forKey: Self.key).flatMap(ActiveCoreKind.init(rawValue:))
@@ -73,8 +85,10 @@ public final class UserDefaultsActiveKindPersistence: ActiveKindPersistence {
 /// Construction is side-effect-free: call `activate()` once at launch to apply the
 /// restored choice. The UI exposes exactly one active choice today; the registry
 /// seam (Task 4) keeps the door open for several at once.
-@MainActor
+@MainActor @Observable
 public final class ActiveConnectionModel {
+    /// Observed: the connection indicators branch on it (`ConnectionSummary`), so a kind
+    /// switch alone must invalidate them, not only the bus state change that follows.
     public private(set) var activeKind: ActiveCoreKind
 
     private let driver: ActiveConnectionDriver

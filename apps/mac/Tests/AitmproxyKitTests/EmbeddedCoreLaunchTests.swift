@@ -73,8 +73,9 @@ import Testing
         #expect(config.token != config.operatorToken)
         #expect(yaml.contains("operator_token: \"\(config.operatorToken)\""))
         #expect(yaml.contains("token: \"\(config.token)\""))        // agent token still present
-        // Startup stays deny-by-default: no `scope:` block is emitted, so the core
-        // comes up with empty scope and only a present operator may widen it.
+        // Startup stays deny-by-default: no `scope:` block is emitted — none for the default,
+        // empty scope (a persisted operator scope is the only thing that adds one) — and
+        // `allow_agent_widen` is never emitted, so only a present operator may widen scope.
         #expect(!yaml.contains("scope:"))
         #expect(!yaml.contains("allow_agent_widen"))
     }
@@ -115,12 +116,367 @@ import Testing
         #expect(!yaml.contains("upstream"))              // no wrapper object the core would reject
     }
 
+    // MARK: Capture gate (TG-AC1 / TG-AC2)
+
+    private func config(captureEnabled: Bool) -> EmbeddedCoreLaunch.Config {
+        EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            captureEnabled: captureEnabled
+        )
+    }
+
+    @Test func capture_gate_emitted_only_when_enabled() throws {
+        // The Network Extension feeder is the core's deny-by-default on-switch:
+        // the app writes the `macos_capture` section only when the operator has
+        // turned capture on, and writes nothing at all when it is off so the core
+        // parses its disabled default (TG-AC1).
+        #expect(try config(captureEnabled: true).yaml().contains("macos_capture:\n  enabled: true"))
+        #expect(!(try config(captureEnabled: false).yaml()).contains("macos_capture"))
+    }
+
+    @Test func capture_gate_defaults_off() throws {
+        // A Config built without `captureEnabled:` — every pre-existing call site —
+        // is off: the field is false and no `macos_capture` text reaches the file,
+        // so shipping the field cannot silently arm capture (TG-AC2 default-off).
+        let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        #expect(config.captureEnabled == false)
+        #expect(!(try config.yaml()).contains("macos_capture"))
+    }
+
+    @Test func capture_gate_is_byte_identical_to_the_core_parse_input() throws {
+        // The core's `config_file.rs` `macos_capture_enable_round_trips` test parses
+        // exactly "macos_capture:\n  enabled: true\n" into an enabled feeder config.
+        // The emitted block must be that text byte-for-byte — a top-level
+        // `macos_capture:` at column 0 (sibling of `listen`/`mcp`/`browser`, since
+        // `deny_unknown_fields` rejects any wrapper) with `enabled: true` indented
+        // two spaces and newline-terminated — so what the app writes is what the
+        // core is proven to accept (TG-AC2 core-compatible).
+        let coreParseInput = "macos_capture:\n  enabled: true\n"
+        let yaml = try config(captureEnabled: true).yaml()
+        #expect(yaml.contains("macos_capture:\n  enabled: true"))
+        #expect(yaml.contains(coreParseInput))
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.contains("macos_capture:"))          // exact line: column 0, no indent
+        #expect(lines.contains("  enabled: true"))         // exact line: two-space indent
+        let key = lines.firstIndex(of: "macos_capture:")
+        let valueLine = key.flatMap { lines.indices.contains($0 + 1) ? lines[$0 + 1] : nil }
+        #expect(valueLine == "  enabled: true")            // directly under the key, nothing between
+    }
+
+    @Test func capture_gate_composes_with_ssl_insecure_as_two_top_level_keys() throws {
+        // Both operator opt-ins at once. Each block is appended after its own newline, so
+        // neither fuses into the other's line, and each key appears once, at column 0.
+        let both = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true
+        )
+        let yaml = try both.yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "ssl_insecure: true" }.count == 1)
+        #expect(lines.filter { $0 == "macos_capture:" }.count == 1)
+        #expect(lines.filter { $0 == "  enabled: true" }.count == 1)
+        #expect(yaml.hasSuffix("macos_capture:\n  enabled: true\n"))
+        // Each flag controls only its own block.
+        let sslOnly = try config(sslInsecure: true).yaml()
+        #expect(sslOnly.contains("ssl_insecure: true"))
+        #expect(!sslOnly.contains("macos_capture"))
+        #expect(!(try config(captureEnabled: true).yaml()).contains("ssl_insecure"))
+    }
+
+    @Test func a_crafted_path_cannot_smuggle_the_capture_gate_into_a_capture_off_config() throws {
+        // Deny-by-default holds against hostile input. A path that merely contains the gate's
+        // text stays inside its double-quoted scalar; one that tries to start a new line is
+        // refused outright. Either way a config built with capture OFF has no gate line.
+        let sameLine = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/x/\"y\\macos_capture: enabled: true"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint")
+        )
+        let lines = try sameLine.yaml().split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(!lines.contains("macos_capture:"))
+        #expect(!lines.contains("  enabled: true"))
+
+        let newlineInBinary = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/x\nmacos_capture:\n  enabled: true"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint")
+        )
+        #expect(throws: (any Error).self) { try newlineInBinary.yaml() }
+
+        let newlineInEndpoint = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/e\nmacos_capture:\n  enabled: true")
+        )
+        #expect(throws: (any Error).self) { try newlineInEndpoint.yaml() }
+    }
+
+    @Test func rewriting_a_config_with_capture_off_leaves_no_gate_behind() throws {
+        // OFF is applied by rewriting the config and restarting the core. The write truncates, so
+        // a file that carried the gate cannot keep a stale tail of it: the OFF text is the shorter
+        // of the two, which is exactly where a missing truncate would leave the old gate behind.
+        // Honours $TMPDIR (as CaptureCapabilityTests does) so it also runs where the system
+        // temp directory is not writable.
+        let tmp = ProcessInfo.processInfo.environment["TMPDIR"].map { URL(filePath: $0) }
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = tmp.appending(path: "embedded-core-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let configURL = dir.appending(path: "config.yaml")
+
+        try EmbeddedCoreLaunch.writeConfig(config(captureEnabled: true).yaml(), to: configURL)
+        let on = try String(contentsOf: configURL, encoding: .utf8)
+        #expect(on.contains("macos_capture:\n  enabled: true"))
+
+        try EmbeddedCoreLaunch.writeConfig(config(captureEnabled: false).yaml(), to: configURL)
+        let off = try String(contentsOf: configURL, encoding: .utf8)
+        #expect(off.count < on.count)
+        #expect(!off.contains("macos_capture"))
+        #expect(!off.contains("enabled: true"))
+        let perms = try FileManager.default.attributesOfItem(atPath: configURL.path)[.posixPermissions] as? NSNumber
+        #expect(perms?.int16Value == 0o600)
+    }
+
+    @Test func capture_gate_text_is_what_the_core_round_trip_test_parses() throws {
+        // `capture_gate_is_byte_identical_to_the_core_parse_input` compares against a literal
+        // copied from the core's test. Pin the copy to its source: the Rust test must still spell
+        // this exact text, and both tests the spec cites (TG-AC2) must still exist. This file
+        // lives at apps/mac/Tests/AitmproxyKitTests/, so the repo root is five levels up.
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let source = root.appending(path: "crates/aitm/src/config_file.rs")
+        try #require(
+            FileManager.default.fileExists(atPath: source.path),
+            "cannot find the core's config_file.rs at \(source.path)")
+        let rust = try String(contentsOf: source, encoding: .utf8)
+
+        let block = "macos_capture:\n  enabled: true\n"
+        #expect(try config(captureEnabled: true).yaml().hasSuffix(block))
+        // Rust spells the same text as a string literal with `\n` escapes.
+        let rustLiteral = "\"" + block.replacingOccurrences(of: "\n", with: "\\n") + "\""
+        let spelledInRust = rust.contains(rustLiteral)
+        #expect(spelledInRust, "config_file.rs no longer contains the literal \(rustLiteral)")
+        let roundTripTest = rust.contains("fn macos_capture_enable_round_trips")
+        let defaultsOffTest = rust.contains("fn macos_capture_defaults_disabled")
+        #expect(roundTripTest, "the core's macos_capture_enable_round_trips test is gone")
+        #expect(defaultsOffTest, "the core's macos_capture_defaults_disabled test is gone")
+    }
+
     @Test func swift_stop_grace_exceeds_the_embedded_core_obscura_budget() {
         // The SIGTERM→SIGKILL grace must outlast the core's whole obscura teardown
         // budget (stop_timeout + the core's 1 s reap margin) so a clean SIGTERM is
         // always enough and SIGKILL never orphans obscura mid-teardown (S1 / AC7).
         let coreBudget = EmbeddedCoreLaunch.obscuraStopTimeoutSeconds + 1
         #expect(EmbeddedCoreLaunch.childStopGraceSeconds > coreBudget)
+    }
+
+    // MARK: Scope block (SP-AC4 … SP-AC7, SP-AC16, SP-AC17)
+
+    private func config(scopeHosts: [String]) -> EmbeddedCoreLaunch.Config {
+        EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            scopeHosts: scopeHosts
+        )
+    }
+
+    @Test func scope_block_is_byte_identical_to_the_core_parse_input() throws {
+        // The core's `tests/config_file.rs` `scope_entries_block_round_trips` test parses exactly
+        // this text into three scope entries. The emitted block must be that text byte-for-byte:
+        // a top-level `scope:` at column 0 (sibling of `listen`/`mcp`/`browser`, since
+        // `deny_unknown_fields` rejects any wrapper), `  entries:` directly under it, then one
+        // double-quoted `- "<host>"` line per host indented four, in array order,
+        // newline-terminated — so what the app writes is what the core is proven to accept (SP-AC4).
+        let yaml = try config(scopeHosts: ["api.example.test", "*.shop.test", "localhost:8099"]).yaml()
+        #expect(yaml.hasSuffix("scope:\n  entries:\n    - \"api.example.test\"\n    - \"*.shop.test\"\n    - \"localhost:8099\"\n"))
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "scope:" }.count == 1)
+        let key = try #require(lines.firstIndex(of: "scope:"))
+        #expect(Array(lines.dropFirst(key + 1).prefix(4)) == [
+            "  entries:",
+            "    - \"api.example.test\"",
+            "    - \"*.shop.test\"",
+            "    - \"localhost:8099\"",
+        ])
+    }
+
+    @Test func scope_block_defaults_to_nothing() throws {
+        // A Config built without `scopeHosts:` — every pre-existing call site — carries an empty
+        // scope and emits no `scope` text of any kind, so the core keeps its deny-by-default
+        // empty startup scope (SP-AC6).
+        let config = sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"))
+        #expect(config.scopeHosts == [])
+        let yaml = try config.yaml()
+        #expect(!yaml.contains("scope:"))
+        #expect(!yaml.contains("entries"))
+    }
+
+    @Test func scope_block_never_emits_allow_agent_widen() throws {
+        // Widening stays operator-only: restoring the operator's scope must never turn into
+        // letting agents widen it, whether or not a scope is restored (SP-AC5).
+        let defaultYAML = try sampleConfig(endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint")).yaml()
+        let scopedYAML = try config(scopeHosts: ["api.example.test", "*.shop.test", "localhost:8099"]).yaml()
+        #expect(!defaultYAML.contains("allow_agent_widen"))
+        #expect(!scopedYAML.contains("allow_agent_widen"))
+    }
+
+    @Test func scope_block_escapes_quotes_and_backslashes() throws {
+        // A quote or a backslash in a host is backslash-escaped the way paths are, so it cannot
+        // break out of its double-quoted scalar: one backslash before the quote, two for the
+        // backslash (SP-AC17).
+        let yaml = try config(scopeHosts: [#"a"b.test"#, #"c\d.test"#]).yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.contains(#"    - "a\"b.test""#))
+        #expect(lines.contains(#"    - "c\\d.test""#))
+    }
+
+    @Test func scope_block_rejects_a_host_with_a_newline() {
+        // A newline cannot live inside a one-line double-quoted scalar; rather than let a crafted
+        // host inject YAML into the token-bearing config, rendering throws and names the host
+        // (SP-AC16).
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\nlisten: 0.0.0.0:1")) {
+            try config(scopeHosts: ["ok.test", "evil.test\nlisten: 0.0.0.0:1"]).yaml()
+        }
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\rx")) {
+            try config(scopeHosts: ["evil.test\rx"]).yaml()
+        }
+    }
+
+    @Test func scope_block_follows_the_ssl_and_capture_tails() throws {
+        // All three tails at once: each top-level key appears exactly once, at column 0, and the
+        // scope block comes last — so every byte-exact `hasSuffix` on a scope-less config still
+        // holds (SP-AC4).
+        let all = EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true, scopeHosts: ["api.example.test"]
+        )
+        let lines = try all.yaml().split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "ssl_insecure: true" }.count == 1)
+        #expect(lines.filter { $0 == "macos_capture:" }.count == 1)
+        #expect(lines.filter { $0 == "scope:" }.count == 1)
+        let ssl = try #require(lines.firstIndex(of: "ssl_insecure: true"))
+        let capture = try #require(lines.firstIndex(of: "macos_capture:"))
+        let scope = try #require(lines.firstIndex(of: "scope:"))
+        #expect(ssl < capture)
+        #expect(capture < scope)
+        // Scope-less configs are unchanged.
+        #expect(try config(captureEnabled: true).yaml().hasSuffix("macos_capture:\n  enabled: true\n"))
+    }
+
+    @Test func scope_block_text_is_what_the_core_round_trip_test_parses() throws {
+        // `scope_block_is_byte_identical_to_the_core_parse_input` compares against a literal copied
+        // from the core's test. Pin the copy to its source: the Rust test must still spell this
+        // exact text and the round-trip test the spec cites (SP-AC7) must still exist. This file
+        // lives at apps/mac/Tests/AitmproxyKitTests/, so the repo root is five levels up.
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        let source = root.appending(path: "crates/aitm/tests/config_file.rs")
+        try #require(
+            FileManager.default.fileExists(atPath: source.path),
+            "cannot find the core's tests/config_file.rs at \(source.path)")
+        let rust = try String(contentsOf: source, encoding: .utf8)
+
+        let block = "scope:\n  entries:\n    - \"api.example.test\"\n    - \"*.shop.test\"\n    - \"localhost:8099\"\n"
+        #expect(try config(scopeHosts: ["api.example.test", "*.shop.test", "localhost:8099"]).yaml().hasSuffix(block))
+        // Rust spells the same text as one plain string literal with `\"` and `\n` escapes.
+        let rustLiteral = "\"" + block
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "\\n") + "\""
+        #expect(rust.contains(rustLiteral), "tests/config_file.rs no longer contains the literal \(rustLiteral)")
+        #expect(rust.contains("fn scope_entries_block_round_trips"),
+                "the core's scope_entries_block_round_trips test is gone")
+    }
+
+    // MARK: Tester — scope block edge cases (SP-AC4, SP-AC16, SP-AC17)
+
+    @Test func scope_block_emits_unicode_and_yaml_specials_verbatim_inside_quotes() throws {
+        // Hosts `EmbeddedScope.load` keeps (an IDN, mixed case, `#`, `'`) are spliced verbatim:
+        // inside double quotes `#` is a literal, not a comment, and `'` needs no escaping. The
+        // core's `tests/config_file.rs` `scope_entries_quoting_survives_the_parse` parses these
+        // same lines back to the same hosts.
+        let yaml = try config(scopeHosts: ["bücher.example", "API.Example.TEST", "a#b.test", "o'neil.test"]).yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        let key = try #require(lines.firstIndex(of: "scope:"))
+        #expect(Array(lines.dropFirst(key + 1).prefix(5)) == [
+            "  entries:",
+            "    - \"bücher.example\"",
+            "    - \"API.Example.TEST\"",
+            "    - \"a#b.test\"",
+            "    - \"o'neil.test\"",
+        ])
+    }
+
+    @Test func scope_block_keeps_a_huge_list_whole_and_in_order() throws {
+        // Oversized input: every host becomes exactly one `    - "…"` line, in array order, the
+        // key still appears once, nothing follows the list, and the block still ends in a newline.
+        let hosts = (0..<2_000).map { "h\($0).example.test" }
+        let yaml = try config(scopeHosts: hosts).yaml()
+        let lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        #expect(lines.filter { $0 == "scope:" }.count == 1)
+        let key = try #require(lines.firstIndex(of: "scope:"))
+        #expect(lines.dropFirst(key + 1).first == "  entries:")
+        #expect(Array(lines.dropFirst(key + 2).prefix(hosts.count)) == hosts.map { "    - \"\($0)\"" })
+        #expect(lines.count == key + 2 + hosts.count + 1)   // + the empty piece after the final newline
+        #expect(yaml.hasSuffix("    - \"h1999.example.test\"\n"))
+    }
+
+    @Test func scope_block_rejects_a_newline_anywhere_in_the_list() {
+        // The refusal is per host and total: a newline in the last of many hosts, or a bare
+        // newline, throws the host variant (never the path one) and no config text is handed out
+        // (SP-AC16).
+        let many = (0..<50).map { "h\($0).example.test" } + ["last.test\n"]
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("last.test\n")) {
+            try config(scopeHosts: many).yaml()
+        }
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("\n")) {
+            try config(scopeHosts: ["\n"]).yaml()
+        }
+    }
+
+    @Test func scope_block_rejects_a_crlf_host() {
+        // "\r\n" is one Swift `Character`: the guard must see the CR and LF scalars inside it, not
+        // compare grapheme clusters. From the app's surface this host is unreachable
+        // (`EmbeddedScope.load` drops it), so this pins `yaml()`'s own SP-AC16 contract.
+        #expect(throws: EmbeddedCoreLaunch.ConfigError.hostContainsNewline("evil.test\r\nlisten: 0.0.0.0:1")) {
+            try config(scopeHosts: ["evil.test\r\nlisten: 0.0.0.0:1"]).yaml()
+        }
+    }
+
+    @Test func scope_block_is_purely_additive_to_the_rest_of_the_config() throws {
+        // Everything before the block — tokens, ports, paths, the ssl and capture tails — is
+        // byte-identical with and without a persisted scope; the block only ever appends.
+        let scopeless = try EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true
+        ).yaml()
+        let scoped = try EmbeddedCoreLaunch.Config(
+            obscuraBinary: URL(fileURLWithPath: "/ok/obscura"),
+            proxyPort: 8080, browserProxyPort: 8083,
+            token: "00", operatorToken: "11",
+            endpointFile: URL(fileURLWithPath: "/tmp/bus.endpoint"),
+            sslInsecure: true, captureEnabled: true, scopeHosts: ["api.example.test"]
+        ).yaml()
+        #expect(scoped.hasPrefix(scopeless))
+        #expect(scoped.hasSuffix("scope:\n  entries:\n    - \"api.example.test\"\n"))
+        #expect(scoped.count > scopeless.count)
     }
 
     // MARK: Config path escaping (S3)

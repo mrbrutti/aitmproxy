@@ -91,7 +91,9 @@ struct ScopePanel: View {
     private var addRow: some View {
         VStack(alignment: .leading, spacing: Space.xs) {
             HStack(spacing: Space.sm) {
-                TextField("host, host:port or *.wildcard", text: $draft)
+                // Port-qualified for now: a bare host also claims the app's DNS lookup (see
+                // ConnectionSummary.scopeEntryHint); the hint goes when the provider fix lands.
+                TextField("host:443 or host:80 (for now), host:port or *.wildcard:port", text: $draft)
                     .textFieldStyle(.plain)
                     .font(Tok.Face.data(Tok.Typography.Size.md))
                     .padding(.horizontal, Space.sm)
@@ -205,6 +207,18 @@ struct ScopePanel: View {
         }
         .buttonStyle(.plain)
         .onHover { hovered = $0 ? entry.host : (hovered == entry.host ? nil : hovered) }
+        .contextMenu {
+            Button("Remove from Scope") { remove(entry.host) }
+            Button("Copy Host") {
+                Pasteboard.copy(entry.host)
+            }
+            // Show Flows narrows the Domains page to this host; a wildcard or a host
+            // with no captured flows has no group to show, so the item stays out.
+            if session.hosts.contains(where: { $0.0 == entry.host }) {
+                Divider()
+                Button("Show Flows") { session.show(.domains, group: .host(entry.host)) }
+            }
+        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(entry.host)
         .accessibilityValue(isPending ? "pending" : entry.limit?.readout ?? "no limit")

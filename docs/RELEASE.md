@@ -112,17 +112,24 @@ On Matt's Mac, in the repo checkout at the tagged commit:
 # a. Build the macOS arm64 tarball (aitm + aitm-tui + obscura).
 scripts/package.sh
 
-# b. Bundle the embedded core (aitm + obscura) into Aitmproxy.app.
-#    build.sh picks up the newest dist/aitm-*-<target>.tar.gz from step a.
-apps/mac/build.sh
+# b. Bundle the embedded core (aitm + obscura) and the capture system extension
+#    into /Applications/Aitmproxy.app. build.sh picks up the newest
+#    dist/aitm-*-<target>.tar.gz from step a. --ne is required for the extension
+#    (never inferred); --allow-unnotarized acknowledges that this intermediate
+#    cannot activate the extension until step c notarizes it. The script refuses
+#    to replace an installed app of another version without --replace. It also
+#    bundles the detection catalogue from the tarball (share/aitm/scripts,
+#    beside the core).
+apps/mac/build.sh --ne --allow-unnotarized --replace
 
 # c. Re-sign with the Developer ID + hardened runtime, build the DMG,
 #    notarize it with Apple, and staple the ticket.
-ASC_ISSUER_ID=<issuer-id> scripts/notarize-dmg.sh
+APP=/Applications/Aitmproxy.app ASC_ISSUER_ID=<issuer-id> scripts/notarize-dmg.sh
 ```
 
-`notarize-dmg.sh` refuses to notarize a core-less app, so step (a) and (b) must
-run first. Then upload the two macOS assets to the Release **[Terminal]**:
+`notarize-dmg.sh` refuses to notarize a core-less app, or one without the
+detection catalogue, so step (a) and (b) must run first. Then upload the two
+macOS assets to the Release **[Terminal]**:
 
 ```bash
 gh release upload v<ver> \

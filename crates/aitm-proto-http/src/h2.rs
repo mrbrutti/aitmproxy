@@ -24,9 +24,12 @@
 //! read, response future, send-capacity wait) is bounded by [`READ_TIMEOUT`],
 //! mirroring the h1 per-read timeout, so a slow or hung peer cannot pin a stream
 //! or connection open indefinitely. A failed stream emits [`Event::Error`] before
-//! it tears down, as the h1 path does. (The plugin-dispatch `ctx.emit` awaits are
-//! never timed out here — a flow parked at a breakpoint is legitimately suspended
-//! and the chain owns that timeout, `intercept_timeout`.)
+//! it tears down, as the h1 path does; a response that ends early (the upstream
+//! reset or vanished, a wire timeout, the client went away) is first stored as a
+//! truncated, finished response — [`aitm_core::FlowStore::abandon_response`] —
+//! so the error about it is dispatched over a terminal flow. (The plugin-dispatch
+//! `ctx.emit` awaits are never timed out here — a flow parked at a breakpoint is
+//! legitimately suspended and the chain owns that timeout, `intercept_timeout`.)
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -34,7 +37,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    Authority, Body, Event, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
+    Authority, Body, Event, Flow, FlowId, HeaderMap, HttpFlow, HttpRequest, HttpResponse,
     HttpVersion, InterceptState, StreamBody,
 };
 use aitm_plugin::{ByteStream, ModuleCtx};
@@ -357,7 +360,7 @@ async fn stream_task(
         response: None,
         client_conn: conn.client_conn.clone(),
         server_conn: conn.server_conn.clone(),
-        metadata: FlowMeta::default(),
+        metadata: conn.flow_meta(),
         intercept: InterceptState::Observed,
     }));
     ctx.emit(Event::RequestHeaders(id)).await;
@@ -543,30 +546,48 @@ async fn drive_stream(
     let client_resp = translate::h2_response_from(&to_send);
 
     if forward_chunks {
-        let mut client_send = respond
-            .send_response(client_resp, false)
-            .context("send h2 response head")?;
+        // `captured` and `truncated` live outside the fallible block so they
+        // survive its failure: every exit of the forward path (a `send_response`
+        // failure, a wire timeout, an upstream reset, a client-side send failure)
+        // lands in the `Err` arm below, which finalises the staged `Streamed`
+        // head as a truncated, finished response **before** `stream_task` emits
+        // `Event::Error` about it. `captured` is the same `max_body`-bounded
+        // buffer the success path stores, so an abandoned body never exceeds the
+        // cap.
         let mut captured: Vec<u8> = Vec::new();
         let mut truncated = false;
-        while let Some(chunk) = wire("response body read", resp_body.data()).await? {
-            let chunk = chunk.context("read upstream h2 response body")?;
-            let len = chunk.len();
-            let room = max_body.saturating_sub(captured.len());
-            if len > room {
-                captured.extend_from_slice(&chunk[..room]);
-                truncated = true;
-            } else {
-                captured.extend_from_slice(&chunk);
+        let forwarded = async {
+            let mut client_send = respond
+                .send_response(client_resp, false)
+                .context("send h2 response head")?;
+            while let Some(chunk) = wire("response body read", resp_body.data()).await? {
+                let chunk = chunk.context("read upstream h2 response body")?;
+                let len = chunk.len();
+                let room = max_body.saturating_sub(captured.len());
+                if len > room {
+                    captured.extend_from_slice(&chunk[..room]);
+                    truncated = true;
+                } else {
+                    captured.extend_from_slice(&chunk);
+                }
+                // Send to the client (awaiting client flow-control) before
+                // releasing upstream capacity, so backpressure spans both hops.
+                send_body(&mut client_send, chunk).await?;
+                let _ = resp_body.flow_control().release_capacity(len);
             }
-            // Send to the client (awaiting client flow-control) before releasing
-            // upstream capacity, so backpressure spans both hops.
-            send_body(&mut client_send, chunk).await?;
-            let _ = resp_body.flow_control().release_capacity(len);
+            client_send
+                .send_data(Bytes::new(), true)
+                .context("end h2 response")?;
+            Ok::<(), anyhow::Error>(())
         }
-        client_send
-            .send_data(Bytes::new(), true)
-            .context("end h2 response")?;
-        finish_response(ctx, id, captured, truncated).await;
+        .await;
+        match forwarded {
+            Ok(()) => finish_response(ctx, id, captured, truncated).await,
+            Err(e) => {
+                ctx.store().abandon_response(id, captured);
+                return Err(e);
+            }
+        }
     } else {
         // A plugin replaced the streamed body at ResponseHeaders, so the upstream
         // body is not forwarded. Release it now: dropping an undrained `RecvStream`

@@ -231,6 +231,55 @@ async fn spawn_closing_origin(alpn: Vec<Vec<u8>>) -> SocketAddr {
     addr
 }
 
+/// A TLS h2 origin that accepts one stream, reads its request, sends a 200 head
+/// and one DATA frame (`abc`) **without** END_STREAM, drives the connection long
+/// enough for those frames to be on the wire, then drops the connection with the
+/// stream still open — the proxy's response body read then fails mid-body.
+async fn spawn_partial_body_origin(alpn: Vec<Vec<u8>>) -> SocketAddr {
+    let acceptor = origin_tls(alpn);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind origin");
+    let addr = listener.local_addr().expect("origin addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((tcp, _)) = listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut conn) = h2::server::handshake(tls).await else {
+                    return;
+                };
+                if let Some(Ok((req, mut respond))) = conn.accept().await {
+                    let (_parts, mut rbody) = req.into_parts();
+                    while let Some(Ok(chunk)) = rbody.data().await {
+                        let _ = rbody.flow_control().release_capacity(chunk.len());
+                    }
+                    let head = http::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("fixture head");
+                    let Ok(mut send) = respond.send_response(head, false) else {
+                        return;
+                    };
+                    if send.send_data(Bytes::from_static(b"abc"), false).is_err() {
+                        return;
+                    }
+                    // Drive the connection so the HEADERS and DATA frames are
+                    // flushed; nothing else arrives, so this simply times out.
+                    let _ = tokio::time::timeout(Duration::from_millis(200), conn.accept()).await;
+                    drop(send);
+                }
+                // Drop `conn` (and the TLS stream) with the stream still open: the
+                // proxy sees the upstream vanish mid-body.
+            });
+        }
+    });
+    addr
+}
+
 /// A plugin that records the flow id of every `Event::Error` the chain dispatches,
 /// so a test can assert a failed stream reached the typed error bus.
 struct ErrorRecorder {
@@ -434,6 +483,33 @@ async fn wait_for_flow(store: &dyn FlowStore) -> HttpFlow {
             return flow;
         }
         assert!(Instant::now() < deadline, "no completed HttpFlow captured");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Wait until the store holds an `HttpFlow` whose response body is **buffered**
+/// (not `Body::Streamed`), i.e. a finished or abandoned response. Unlike
+/// [`wait_for_flow`], a staged head whose body is still streaming does not count.
+async fn wait_for_buffered_response(store: &dyn FlowStore) -> HttpFlow {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let found = store.list().into_iter().find_map(|id| match store.get(id) {
+            Some(Flow::Http(f))
+                if f.response
+                    .as_ref()
+                    .is_some_and(|r| !matches!(r.body, Body::Streamed(_))) =>
+            {
+                Some(f)
+            }
+            _ => None,
+        });
+        if let Some(flow) = found {
+            return flow;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no HttpFlow with a buffered (finished or abandoned) response captured"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -1280,6 +1356,75 @@ async fn upstream_closing_early_emits_flow_error() {
         assert!(
             Instant::now() < deadline,
             "no Event::Error was emitted for the failed flow"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// AC8 (flow-finish-and-timing): an upstream that sends a 200 head and one DATA
+/// frame, then drops the connection mid-body, leaves a flow whose response is
+/// finalised in the store as a truncated, **buffered** body — so it is terminal
+/// for `clear` — and the failure still reaches the error bus.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_dropping_mid_body_finalises_the_flow_as_truncated() {
+    let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
+    let root_pem = ca.root_cert_pem().to_string();
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let origin = spawn_partial_body_origin(vec![ALPN_H2.to_vec()]).await;
+    let (proxy, store) = run_proxy(
+        ca,
+        vec![Box::new(ErrorRecorder {
+            errors: errors.clone(),
+        })],
+        None,
+    )
+    .await;
+
+    let send_req = connect_h2(proxy, origin, &root_pem).await;
+    let result = h2_try_get(&send_req, origin, "/partial").await;
+    assert!(
+        result.is_err(),
+        "a stream whose upstream dropped mid-body must not complete: {result:?}"
+    );
+
+    // The staged head is finalised: the bytes forwarded before the drop are
+    // stored as a truncated body with a duration, not left `Streamed` for good.
+    let flow = wait_for_buffered_response(store.as_ref()).await;
+    let response = flow
+        .response
+        .as_ref()
+        .expect("the response head was stored");
+    assert_eq!(response.status, 200);
+    match &response.body {
+        Body::Bytes(bytes) => assert_eq!(
+            bytes, b"abc",
+            "the bytes forwarded before the drop are the stored body"
+        ),
+        other => panic!("an abandoned response body must be Bytes(abc), got {other:?}"),
+    }
+    assert!(
+        flow.metadata.truncated,
+        "a response that ended early is marked truncated"
+    );
+    assert!(
+        flow.metadata.duration.is_some(),
+        "an abandoned response gets a duration"
+    );
+
+    // Terminal for the store: `clear` removes it instead of skipping it in flight.
+    let outcome = store.clear();
+    assert_eq!(outcome.cleared, 1, "the abandoned flow is terminal");
+    assert_eq!(outcome.skipped_in_flight, 0);
+
+    // And the failure was still dispatched on the error bus for that flow.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if errors.lock().unwrap().contains(&flow.id) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Event::Error was emitted for the abandoned flow"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

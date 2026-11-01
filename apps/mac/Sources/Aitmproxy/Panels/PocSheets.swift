@@ -20,7 +20,7 @@ struct RunAgainPopover: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.md) {
-            Text("Run again").font(Tok.Face.ui(Tok.Typography.Size.md, .semibold)).foregroundStyle(Tok.Ink.primary.color)
+            Text("Run Again").font(Tok.Face.ui(Tok.Typography.Size.md, .semibold)).foregroundStyle(Tok.Ink.primary.color)
             field("Target") {
                 TextField("https://host", text: $form.target).textFieldStyle(.plain)
                     .font(Tok.Face.data(Tok.Typography.Size.md)).focused($targetFocused)

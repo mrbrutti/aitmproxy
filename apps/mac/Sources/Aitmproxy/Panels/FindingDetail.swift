@@ -3,8 +3,8 @@ import AppKit
 import SwiftUI
 
 /// The detail pane of the Findings page (S-051): the editable YAML with Save,
-/// the screenshot, the per-assertion table, and the Open capture · Run again ·
-/// Export actions.
+/// the screenshot, the per-assertion table, and the Open Capture · Run Again… ·
+/// Export… actions.
 struct FindingDetail: View {
     @Bindable var state: PocPanelState
     @State private var showRunAgain = false
@@ -40,13 +40,13 @@ struct FindingDetail: View {
                     .lineLimit(1).truncationMode(.tail)
             }
             Spacer(minLength: Space.sm)
-            FlatButton("Open capture") { state.openCapture() }
+            FlatButton("Open Capture") { state.openCapture() }
                 .disabled(finding.captureID == nil)
-            FlatButton("Run again") { showRunAgain = true }
+            FlatButton("Run Again…") { showRunAgain = true }
                 .popover(isPresented: $showRunAgain, arrowEdge: .bottom) {
                     RunAgainPopover(state: state, finding: finding, isPresented: $showRunAgain)
                 }
-            FlatButton("Export") { export() }
+            FlatButton("Export…") { state.exportViaPanel() }
         }
         .padding(.horizontal, Space.margin)
         .frame(height: Tok.Size.inspectorHeader)
@@ -133,7 +133,7 @@ struct FindingDetail: View {
 
     @ViewBuilder private func assertions(_ finding: Finding) -> some View {
         if finding.assertions.isEmpty {
-            Hint(text: finding.hasRun ? "No assertions evaluated" : "Not run yet — Run again to evaluate the success assertions")
+            Hint(text: finding.hasRun ? "No assertions evaluated" : "Not run yet — Run Again… evaluates the success assertions")
         } else {
             VStack(spacing: 0) {
                 // Built locally (not the shared ColumnHeads) so RESULT sits over the
@@ -170,14 +170,4 @@ struct FindingDetail: View {
         }
     }
 
-    private func export() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.prompt = "Export"
-        panel.message = "Choose a folder for the YAML, screenshot and HAR"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        state.exportBundle(to: url)
-    }
 }

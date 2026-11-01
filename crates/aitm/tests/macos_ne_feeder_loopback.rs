@@ -32,6 +32,7 @@
 //! on a lock, and the test must not run while a real `aitm` with
 //! `macos_capture.enabled` is live on the same machine (they would fight over it).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -45,6 +46,7 @@ use std::time::Duration;
 
 use aitm::ingress::CoreIngress;
 use aitm::macos_capture::adapter::{CAPTURE_INTERFACE, HANDOFF_PROTOCOL_VERSION};
+use aitm::macos_capture::capability::CaptureCapability;
 use aitm::macos_capture::feeder::CaptureSession;
 use aitm::macos_capture::listener::{
     write_data_handshake, write_datagram, CaptureListener, ControlChannel, ControlMessage,
@@ -53,9 +55,12 @@ use aitm::macos_capture::listener::{
 use aitm::macos_capture::peer_auth::PeerVerifier;
 use aitm::macos_capture::rendezvous::RENDEZVOUS_PATH;
 use aitm::macos_capture::scope_spec::provider_scope_spec;
+use aitm::macos_capture::status::{
+    CaptureStatus, CaptureStatusReader, FeederState, OffReason, ProviderState,
+};
 use aitm_core::{
     ActionPermit, ByteStream, Event, EventSink, GuardError, MemFlowStore, ModuleCtx, NextLayerHint,
-    ProtocolModule, ScopeEntry, ScopeRateGuard, UpstreamConnector, Verdict,
+    ProtocolModule, ScopeEntry, ScopeRateGuard, UpstreamConnector, Value, Verdict,
 };
 use aitm_proto_l4::config::L4Config;
 use aitm_proto_l4::flow::{InMemoryL4FlowStore, L4FlowStore};
@@ -176,10 +181,23 @@ fn uds_bind_available(socket_dir: &Path) -> bool {
 // replicates them over the public `aitm_core` traits. ----
 
 /// The L7 scope guard, shared by the session (which lists its scope to push to the
-/// provider) and by the ingress (which enforces it) — as in production. `in_scope`
-/// is an exact host match against the seeded list, so a flow's scope comes from the
-/// SNI it carries, as it does in the real guard.
-struct SeededScope(Vec<ScopeEntry>);
+/// provider) and by the ingress (which enforces it) — as in production. A real
+/// [`StdGuard`](aitm_core::StdGuard) seeded once with the test's scope answers both
+/// `list_scope` and `in_scope`, so the test asserts the real matching contract
+/// (`host:port` authority, a portless entry admits any port) rather than a copy of
+/// it; `check_active` stays unreachable because the feeder and the ingress must
+/// consume no rate or concurrency budget.
+struct SeededScope(aitm_core::StdGuard);
+
+impl SeededScope {
+    fn seeded(entries: Vec<ScopeEntry>) -> Self {
+        let guard = aitm_core::StdGuard::default();
+        for entry in entries {
+            guard.add_scope(entry);
+        }
+        Self(guard)
+    }
+}
 
 impl ScopeRateGuard for SeededScope {
     fn check_active(&self, _host: &str) -> Result<ActionPermit, GuardError> {
@@ -190,10 +208,10 @@ impl ScopeRateGuard for SeededScope {
         false
     }
     fn list_scope(&self) -> Vec<ScopeEntry> {
-        self.0.clone()
+        self.0.list_scope()
     }
     fn in_scope(&self, host: &str) -> bool {
-        self.0.iter().any(|e| e.host.eq_ignore_ascii_case(host))
+        self.0.in_scope(host)
     }
 }
 
@@ -272,12 +290,35 @@ fn l4_scope() -> Vec<L4ScopeEntry> {
     }]
 }
 
-/// What the recording ingress saw.
+/// What the recording ingress saw, and the read side of the session's
+/// `capture.status` handle (what the bus verb would report at each phase).
 struct Observed {
     spawns: Arc<AtomicUsize>,
     dials: Arc<AtomicUsize>,
     recorded: Arc<Mutex<Option<NextLayerHint>>>,
     l4_store: Arc<dyn L4FlowStore>,
+    status: CaptureStatusReader,
+}
+
+/// `value[key]`: the member of a `Value::Object`; panics on a missing key or a
+/// non-object so an assertion reads like the literal it checks.
+fn at<'a>(value: &'a Value, key: &str) -> &'a Value {
+    match value {
+        Value::Object(map) => map
+            .get(key)
+            .unwrap_or_else(|| panic!("no key {key:?} in {value:?}")),
+        other => panic!("{key:?} indexed into a non-object: {other:?}"),
+    }
+}
+
+/// A `Value::Object` of string members.
+fn str_object(pairs: &[(&str, &str)]) -> Value {
+    Value::Object(
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), Value::Str((*v).to_string())))
+            .collect::<BTreeMap<_, _>>(),
+    )
 }
 
 impl Observed {
@@ -327,7 +368,7 @@ fn build_session(
     l4_config.scope.extend(l4_scope());
     let l4_guard = Arc::new(L4Guard::new(&l4_config));
     let l4_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-    let l7_guard = Arc::new(SeededScope(l7_scope()));
+    let l7_guard = Arc::new(SeededScope::seeded(l7_scope()));
 
     let ingress = CoreIngress::with_l4(l4_guard.clone(), l4_store.clone()).with_stream(
         Arc::from(vec![module]),
@@ -338,12 +379,14 @@ fn build_session(
         }),
         l7_guard.clone(),
     );
+    let (status_writer, status) = CaptureStatus::channel(true);
     let session = CaptureSession::new(
         Arc::new(ingress),
         l7_guard,
         Some(l4_guard),
         verifier,
         socket_dir,
+        status_writer,
     );
     (
         session,
@@ -352,6 +395,7 @@ fn build_session(
             dials,
             recorded,
             l4_store,
+            status,
         },
     )
 }
@@ -660,6 +704,18 @@ fn loopback_provider_feeds_in_scope_flows_and_shutdown_cleans_up() {
             "the socket dir it names is mode 0700"
         );
 
+        // CS-AC6: bound and published, no provider yet — the verb would report
+        // `listening` / `awaiting_provider` with no feeder reason.
+        until("the feeder to record listening", || {
+            seen.status.snapshot().feeder == FeederState::Listening
+        })
+        .await;
+        let s = seen.status.snapshot();
+        assert_eq!(s.feeder, FeederState::Listening);
+        assert_eq!(s.provider, ProviderState::Detached);
+        assert_eq!(s.capability(), CaptureCapability::AwaitingProvider);
+        assert_eq!(at(at(&s.to_value(), "feeder"), "reason"), &Value::Null);
+
         // From here on, find the sockets the way the provider does: from the file.
         let mut provider = Provider::attach(PathBuf::from(rendezvous.trim_end())).await;
 
@@ -682,6 +738,25 @@ fn loopback_provider_feeds_in_scope_flows_and_shutdown_cleans_up() {
             "and it equals the emitter's output for that scope"
         );
 
+        // CS-AC7: the attachment is recorded with the pushed tokens; the
+        // `ScriptedVerifier` does not override `team_id`, so the team is absent, and
+        // with no handoff yet the capability is `approved_attached`.
+        until("the attachment to be recorded", || {
+            matches!(
+                seen.status.snapshot().provider,
+                ProviderState::Attached { .. }
+            )
+        })
+        .await;
+        let s = seen.status.snapshot();
+        assert!(
+            matches!(s.provider, ProviderState::Attached { team_id: None, .. }),
+            "{s:?}"
+        );
+        assert_eq!(s.scope_tokens, ["example.com", "198.51.100.7"]);
+        assert_eq!((s.tcp_handed_off, s.udp_handed_off), (0, 0));
+        assert_eq!(s.capability(), CaptureCapability::ApprovedAttached);
+
         // LF-AC6, TCP in scope: the stub module is spawned exactly once with the
         // authoritative remote as `hint.dst`, the SNI, and the bytes the provider sent.
         run_tcp_flow(
@@ -695,6 +770,10 @@ fn loopback_provider_feeds_in_scope_flows_and_shutdown_cleans_up() {
             1,
             "the in-scope TCP flow spawns the module once"
         );
+        // CS-AC10: the handoff was counted as TCP, so the core now says `capturing`.
+        let s = seen.status.snapshot();
+        assert!(s.tcp_handed_off >= 1, "{s:?}");
+        assert_eq!(s.capability(), CaptureCapability::Capturing);
         let hint = seen.hint().expect("the module recorded its hint");
         assert_eq!(hint.dst.to_string(), REMOTE);
         assert_eq!(hint.client_hello_sni.as_deref(), Some("example.com"));
@@ -746,6 +825,9 @@ fn loopback_provider_feeds_in_scope_flows_and_shutdown_cleans_up() {
             flow.packets.iter().all(|p| !p.injected),
             "capture observes, it never injects"
         );
+        // CS-AC10: the UDP handoff was counted under its own kind.
+        let s = seen.status.snapshot();
+        assert!(s.udp_handed_off >= 1, "{s:?}");
 
         // LF-AC6, UDP out of scope: refused, nothing new is stored.
         run_udp_flow(&mut provider, udp_open(4, "198.51.100.8:53"), &[b"probe"]).await;
@@ -802,6 +884,21 @@ fn loopback_provider_feeds_in_scope_flows_and_shutdown_cleans_up() {
         // the pump (the core closes the lingering data socket).
         running.shutdown().await;
         assert_cleaned_up(&canonical);
+        // CS-AC4, CS-AC11: shutdown is honest — `off`/`stopped`, the provider
+        // detached (its attachment task was cancelled mid-flight, so the RAII guard
+        // recorded it), counters zeroed, capability `feeder_off`.
+        let s = seen.status.snapshot();
+        assert_eq!(s.feeder, FeederState::Off(OffReason::Stopped));
+        assert_eq!(s.provider, ProviderState::Detached);
+        assert_eq!((s.tcp_handed_off, s.udp_handed_off), (0, 0));
+        assert_eq!(
+            s.capability(),
+            CaptureCapability::FeederOff("stopped".to_string())
+        );
+        assert_eq!(
+            at(&s.to_value(), "feeder"),
+            &str_object(&[("reason", "stopped"), ("state", "off")])
+        );
         wait_closed(&mut lingering, "the lingering pump to stop at shutdown").await;
         // The provider sees the control channel end: it detaches and fails open.
         assert!(

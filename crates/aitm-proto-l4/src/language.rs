@@ -100,8 +100,20 @@ pub const PACKET_SOURCE: &str = "packet";
 const DEFAULT_TIMEOUT_MS: u64 = 1000;
 
 /// The default interface a `l4:` step injects on / captures from when its body
-/// omits `interface` (the normative spec example does).
-const DEFAULT_INTERFACE: &str = "lo";
+/// omits `interface` (the normative spec example does): the loopback of the OS
+/// the core was compiled for, `lo0` on macOS/BSD, `lo` everywhere else.
+pub const DEFAULT_INTERFACE: &str = if cfg!(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+    target_os = "dragonfly"
+)) {
+    "lo0"
+} else {
+    "lo"
+};
 
 /// Every l4 scripting verb, in catalog order — the one vocabulary shared by the
 /// Rhai `l4.*` host fns, the `l4:` step `op`, and the `l4.*` command names. The
@@ -208,8 +220,8 @@ impl ProtocolLanguage for L4Language {
         for (verb, gate) in VERBS {
             let live = self.live.clone();
             let verb_name = (*verb).to_string();
-            let f: HostFn = Box::new(move |_ctx: &HostCallCtx, args: &[Value]| {
-                host_fn(&live, &verb_name, args)
+            let f: HostFn = Box::new(move |ctx: &HostCallCtx, args: &[Value]| {
+                host_fn(&live, &verb_name, ctx, args)
             });
             let guard = L4SeamGuard {
                 gates: self.live.guard.agent_gates(),
@@ -308,8 +320,15 @@ fn agent_gate_check(
 
 /// Dispatch a `l4.<verb>(...)` Rhai call (arguments already marshalled to
 /// [`Value`]) to the shared verb logic. The agent gate already ran in
-/// [`L4SeamGuard::permit`]; the `L4Guard` scope check runs inside the verb.
-fn host_fn(live: &L4Live, verb: &str, args: &[Value]) -> Result<Value, HostError> {
+/// [`L4SeamGuard::permit`]; the `L4Guard` scope check runs inside the verb. `ctx`
+/// carries the live caller trust, which `flow.get` reads to decide whether this
+/// caller sees packet bytes (spec §2.2).
+fn host_fn(
+    live: &L4Live,
+    verb: &str,
+    ctx: &HostCallCtx,
+    args: &[Value],
+) -> Result<Value, HostError> {
     match verb {
         "interfaces" => Ok(do_interfaces()),
         "craft" => {
@@ -328,7 +347,11 @@ fn host_fn(live: &L4Live, verb: &str, args: &[Value]) -> Result<Value, HostError
         "flow.list" => Ok(do_flow_list(live)),
         "flow.get" => {
             let id = str_arg(args.first(), "id")?;
-            do_flow_get(live, &id)
+            // The optional `offset` / `limit` positional arguments parse exactly
+            // like the command's params (L4PAR-AC2, one window on both faces).
+            let window = crate::commands::flow::PacketWindow::from_values(args.get(1), args.get(2))
+                .map_err(bad)?;
+            do_flow_get(live, &id, window, ctx.caller().is_trusted_control())
         }
         "inject" => {
             let spec = parse_spec_arg(args.first())?;
@@ -478,14 +501,27 @@ fn do_flow_list(live: &L4Live) -> Value {
     )
 }
 
-/// `l4.flow.get` — a summary of one stored L4 flow.
-fn do_flow_get(live: &L4Live, id: &str) -> Result<Value, HostError> {
+/// `l4.flow.get` — the `window` of one stored L4 flow; each packet's `bytes` only
+/// under the §2.2 rule (as amended) for **that packet** (injected or captured) and
+/// the caller's trust, decided by the same
+/// [`BytesView`](crate::commands::flow::BytesView) the command path uses, built
+/// once per reply.
+fn do_flow_get(
+    live: &L4Live,
+    id: &str,
+    window: crate::commands::flow::PacketWindow,
+    caller_is_trusted_control: bool,
+) -> Result<Value, HostError> {
     let id = crate::commands::flow_id_from_str(id).map_err(bad)?;
     let flow = live
         .store
         .get(id)
         .ok_or_else(|| HostError::BadArgs(format!("no L4 flow with id {id:?}")))?;
-    Ok(crate::commands::flow::flow_to_value(&flow))
+    Ok(crate::commands::flow::flow_to_value(
+        &flow,
+        window,
+        crate::commands::flow::BytesView::new(caller_is_trusted_control, &live.guard.agent_gates()),
+    ))
 }
 
 /// `l4.inject` — guarded wire write of a crafted packet, `count` copies, through
@@ -1277,9 +1313,26 @@ fn catalog_host_fns() -> Vec<HostFnSig> {
         },
         HostFnSig {
             name: "flow.get".to_string(),
-            params: vec![p("id", "string", "The L4 flow id to summarize.")],
+            params: vec![
+                p("id", "string", "The L4 flow id to summarize."),
+                p(
+                    "offset",
+                    "int",
+                    "First packet index to return (optional, default 0).",
+                ),
+                p(
+                    "limit",
+                    "int",
+                    "How many packets to return (optional, default 256, at most 4096; 0 \
+                     returns none).",
+                ),
+            ],
             returns: "object".to_string(),
-            description: "Summarize one stored L4 flow and its packets (read-only).".to_string(),
+            description: "Summarize one stored L4 flow and a window of its packets (read-only); \
+                          each packet's bytes only for trusted callers or an agent holding \
+                          the gate that could have produced that packet (Inject for an \
+                          injected one, Capture for a captured one)."
+                .to_string(),
         },
         HostFnSig {
             name: "inject".to_string(),
@@ -1410,5 +1463,303 @@ mod tests {
                 "the step op `{op}` must be a real host-fn verb"
             );
         }
+    }
+
+    /// L4PAR-AC8: an `l4:` step with no `interface` resolves to the loopback
+    /// name of the OS the core was compiled for — `lo0` on macOS/BSD, `lo` on
+    /// Linux — so the normative spec example (no `interface`) works unedited
+    /// on both.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn step_default_interface_is_lo0_on_macos() {
+        let body: serde_yaml::Value = serde_yaml::from_str("op: craft").expect("the step parses");
+        assert_eq!(step_interface(&body), "lo0");
+    }
+
+    /// L4PAR-AC8, the Linux half: the default is `lo`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn step_default_interface_is_lo_on_linux() {
+        let body: serde_yaml::Value = serde_yaml::from_str("op: craft").expect("the step parses");
+        assert_eq!(step_interface(&body), "lo");
+    }
+
+    /// An explicit `interface` always wins over the per-OS default.
+    #[test]
+    fn step_default_interface_is_overridden_by_explicit_field() {
+        let body: serde_yaml::Value =
+            serde_yaml::from_str("op: craft\ninterface: en0").expect("the step parses");
+        assert_eq!(step_interface(&body), "en0");
+    }
+
+    // ---- L4PAR-AC35: the Rhai `l4.flow.get` applies the bytes rule -----------
+
+    /// A tag-less call source for building a [`HostCallCtx`] in a test.
+    struct NoSource;
+    impl aitm_plugin::language::HostCallContextSource for NoSource {
+        fn tag(&self) -> Option<Value> {
+            None
+        }
+        fn call_source(&self) -> &str {
+            "test"
+        }
+    }
+
+    /// Every packet object of a `l4.flow.get` reply made through the Rhai
+    /// dispatch as `caller`, in window order.
+    fn rhai_flow_get_packets(
+        live: &L4Live,
+        caller: aitm_core::CallerTrust,
+        id: &str,
+    ) -> Vec<BTreeMap<String, Value>> {
+        let src = NoSource;
+        let ctx = HostCallCtx::new(caller, &src);
+        let got =
+            host_fn(live, "flow.get", &ctx, &[Value::Str(id.to_string())]).expect("flow.get ok");
+        let Value::Object(flow) = got else {
+            panic!("flow.get returns an object, got {got:?}");
+        };
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array: {flow:?}");
+        };
+        packets
+            .iter()
+            .map(|p| match p {
+                Value::Object(o) => o.clone(),
+                other => panic!("a packet object, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The first packet object of [`rhai_flow_get_packets`].
+    fn rhai_flow_get_packet(
+        live: &L4Live,
+        caller: aitm_core::CallerTrust,
+        id: &str,
+    ) -> BTreeMap<String, Value> {
+        rhai_flow_get_packets(live, caller, id)
+            .into_iter()
+            .next()
+            .expect("one packet object")
+    }
+
+    /// A flow of `kind` holding one packet per `(bytes, injected)` element, in
+    /// order, inserted into `store`; its id string. An injected packet is
+    /// outbound (one the core put on the wire), a captured one inbound.
+    fn insert_flow(store: &dyn L4FlowStore, kind: L4FlowKind, packets: &[(&[u8], bool)]) -> String {
+        use crate::flow::{L4Bind, L4Meta, L4Packet};
+        let id = store.insert(L4Flow {
+            id: L4FlowId::new(),
+            kind,
+            bind: L4Bind {
+                interface: "lo0".into(),
+                filter: None,
+                queue: None,
+            },
+            packets: packets
+                .iter()
+                .map(|(bytes, injected)| L4Packet {
+                    dir: if *injected {
+                        L4Direction::Outbound
+                    } else {
+                        L4Direction::Inbound
+                    },
+                    timestamp: std::time::SystemTime::now(),
+                    decoded: PacketSpec::summarize(bytes),
+                    bytes: bytes.to_vec(),
+                    injected: *injected,
+                })
+                .collect(),
+            metadata: L4Meta::default(),
+        });
+        crate::commands::flow_id_to_string(id)
+    }
+
+    /// Each packet's `bytes` value (or `None`) from a Rhai `l4.flow.get` of `id`
+    /// as `caller`, in window order.
+    fn rhai_flow_get_bytes(
+        live: &L4Live,
+        caller: aitm_core::CallerTrust,
+        id: &str,
+    ) -> Vec<Option<Value>> {
+        rhai_flow_get_packets(live, caller, id)
+            .iter()
+            .map(|o| o.get("bytes").cloned())
+            .collect()
+    }
+
+    /// L4PAR-AC35 (spec §2.2 as amended) — the Rhai face follows the command
+    /// path's **per-packet** rule. A `send_recv` flow holds an injected stimulus
+    /// and a captured reply: with only the Inject gate open an agent reads the
+    /// stimulus's bytes and not the reply's; with only the Capture gate open the
+    /// reverse; with every gate closed neither; an operator reads both. A
+    /// `capture` flow's packet follows the Capture gate alone.
+    #[test]
+    fn rhai_flow_get_bytes_gate_is_per_packet() {
+        use aitm_core::CallerTrust;
+
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let cap_bytes = vec![0xde, 0xad];
+        let stimulus = vec![0xbe, 0xef, 0x01];
+        let reply = vec![0xca, 0xfe];
+        let cap_id = insert_flow(
+            store.as_ref(),
+            L4FlowKind::Capture,
+            &[(cap_bytes.as_slice(), false)],
+        );
+        let sr_id = insert_flow(
+            store.as_ref(),
+            L4FlowKind::SendRecv,
+            &[(stimulus.as_slice(), true), (reply.as_slice(), false)],
+        );
+        let live = L4Live {
+            guard: Arc::new(L4Guard::new(&L4Config::default())),
+            backend: Arc::new(PcapBackend::new()),
+            store,
+        };
+        let gates = live.guard.agent_gates();
+        assert!(!gates.allowed(AgentGate::Capture));
+        assert!(!gates.allowed(AgentGate::Inject));
+
+        // Every gate closed: an agent gets lengths, never bytes.
+        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &cap_id);
+        assert_eq!(packet.get("length"), Some(&Value::Int(2)));
+        assert!(!packet.contains_key("bytes"), "capture, closed: {packet:?}");
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Agent, &sr_id),
+            vec![None, None],
+            "send_recv, closed"
+        );
+
+        // Only Inject open: the injected stimulus's bytes; not the captured
+        // reply's, not the capture's.
+        gates.set(AgentGate::Inject, true);
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Agent, &sr_id),
+            vec![Some(Value::Bytes(stimulus.clone())), None],
+            "the Inject gate reveals the injected packet only"
+        );
+        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &cap_id);
+        assert!(
+            !packet.contains_key("bytes"),
+            "the Inject gate must not reveal a capture's bytes, got {packet:?}"
+        );
+
+        // Only Capture open: the captured reply and the capture; not the stimulus.
+        gates.set(AgentGate::Inject, false);
+        gates.set(AgentGate::Capture, true);
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Agent, &sr_id),
+            vec![None, Some(Value::Bytes(reply.clone()))],
+            "the Capture gate reveals the captured packet only"
+        );
+        let packet = rhai_flow_get_packet(&live, CallerTrust::Agent, &cap_id);
+        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(cap_bytes.clone())));
+
+        // Operator, every gate closed: everything.
+        gates.set(AgentGate::Capture, false);
+        let packet = rhai_flow_get_packet(&live, CallerTrust::Operator, &cap_id);
+        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(cap_bytes)));
+        assert_eq!(
+            rhai_flow_get_bytes(&live, CallerTrust::Operator, &sr_id),
+            vec![Some(Value::Bytes(stimulus)), Some(Value::Bytes(reply))]
+        );
+    }
+
+    /// The `l4.flow.get` reply's `(offset, packets.len())` for a Rhai call with
+    /// `args` after the id, as the operator.
+    fn rhai_flow_get_window(
+        live: &L4Live,
+        id: &str,
+        args: &[Value],
+    ) -> Result<(i64, usize), HostError> {
+        let src = NoSource;
+        let ctx = HostCallCtx::new(aitm_core::CallerTrust::Operator, &src);
+        let mut all = vec![Value::Str(id.to_string())];
+        all.extend_from_slice(args);
+        let got = host_fn(live, "flow.get", &ctx, &all)?;
+        let Value::Object(flow) = got else {
+            panic!("flow.get returns an object, got {got:?}");
+        };
+        let Some(Value::Int(offset)) = flow.get("offset") else {
+            panic!("offset is an Int: {flow:?}");
+        };
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array: {flow:?}");
+        };
+        Ok((*offset, packets.len()))
+    }
+
+    /// L4PAR-AC2 on the Rhai face: `l4.flow.get(id, offset, limit)` takes the
+    /// optional window as its 2nd / 3rd arguments through the same parsing as
+    /// the command's params — absent ⇒ default, `limit 0` ⇒ none, a negative or
+    /// non-integer ⇒ a `BadArgs` naming the argument.
+    #[test]
+    fn rhai_flow_get_accepts_offset_and_limit() {
+        use crate::flow::{L4Bind, L4Meta, L4Packet};
+
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let id = store.insert(L4Flow {
+            id: L4FlowId::new(),
+            kind: L4FlowKind::Capture,
+            bind: L4Bind {
+                interface: "lo0".into(),
+                filter: None,
+                queue: None,
+            },
+            packets: (0u8..5)
+                .map(|i| L4Packet {
+                    dir: L4Direction::Inbound,
+                    timestamp: std::time::SystemTime::now(),
+                    decoded: PacketSpec::summarize(&[i]),
+                    bytes: vec![i],
+                    injected: false,
+                })
+                .collect(),
+            metadata: L4Meta::default(),
+        });
+        let id = crate::commands::flow_id_to_string(id);
+        let live = L4Live {
+            guard: Arc::new(L4Guard::new(&L4Config::default())),
+            backend: Arc::new(PcapBackend::new()),
+            store,
+        };
+
+        assert_eq!(
+            rhai_flow_get_window(&live, &id, &[]),
+            Ok((0, 5)),
+            "no window: all five"
+        );
+        assert_eq!(
+            rhai_flow_get_window(&live, &id, &[Value::Int(3)]),
+            Ok((3, 2)),
+            "offset 3 of 5"
+        );
+        assert_eq!(
+            rhai_flow_get_window(&live, &id, &[Value::Int(1), Value::Int(2)]),
+            Ok((1, 2)),
+            "offset 1, limit 2"
+        );
+        assert_eq!(
+            rhai_flow_get_window(&live, &id, &[Value::Null, Value::Int(0)]),
+            Ok((0, 0)),
+            "null offset is absent; limit 0 returns none"
+        );
+        assert_eq!(
+            rhai_flow_get_window(&live, &id, &[Value::Int(9)]),
+            Ok((9, 0)),
+            "past the end is empty, not an error"
+        );
+        let err = rhai_flow_get_window(&live, &id, &[Value::Int(-1)]).unwrap_err();
+        assert!(
+            matches!(&err, HostError::BadArgs(m) if m.contains("`offset` must be a non-negative integer")),
+            "got {err:?}"
+        );
+        let err = rhai_flow_get_window(&live, &id, &[Value::Int(0), Value::Str("many".into())])
+            .unwrap_err();
+        assert!(
+            matches!(&err, HostError::BadArgs(m) if m.contains("`limit` must be an integer")),
+            "got {err:?}"
+        );
     }
 }

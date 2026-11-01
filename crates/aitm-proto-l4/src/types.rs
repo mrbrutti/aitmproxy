@@ -52,6 +52,23 @@ pub enum L4Proto {
     Raw,
 }
 
+impl L4Proto {
+    /// The name `l4.flow.get` puts on the wire for a packet's transport: the
+    /// same names [`PacketSpec::summarize`](crate::craft::PacketSpec::summarize)
+    /// uses, so a flow row and its packet detail agree.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            L4Proto::Tcp => "TCP",
+            L4Proto::Udp => "UDP",
+            L4Proto::Icmp => "ICMP",
+            L4Proto::IcmpV6 => "ICMPv6",
+            L4Proto::Other(_) => "other",
+            L4Proto::Raw => "raw",
+        }
+    }
+}
+
 /// A deny-by-default scope entry. Nothing captures, injects, or intercepts until
 /// an entry exists and matches; Capture / Inject / Intercept are distinct
 /// capabilities on the entry.
@@ -119,11 +136,23 @@ pub enum L4Capability {
     Intercept,
 }
 
-/// An inclusive port range. `lo == 0 && hi == 65535` means "any port".
+/// An inclusive port range. [`PortRange::ANY`] (`0..=65535`) means "any port".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortRange {
     pub lo: u16,
     pub hi: u16,
+}
+
+impl PortRange {
+    /// The full range, meaning "any port" (`*`, `any` or an omitted `ports` in
+    /// `l4.scope.add`; `all ports` in its confirm prompt).
+    pub const ANY: PortRange = PortRange { lo: 0, hi: 65535 };
+
+    /// Whether this is the full range, [`PortRange::ANY`].
+    #[must_use]
+    pub fn is_any(self) -> bool {
+        self == Self::ANY
+    }
 }
 
 /// A CIDR block: a base address plus a prefix length in bits.
@@ -139,4 +168,31 @@ pub struct IpCidr {
 pub struct RateCap {
     pub pps: u32,
     pub burst: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{L4Proto, PortRange};
+
+    /// `PortRange::ANY` is the full range and the only range `is_any` accepts.
+    #[test]
+    fn port_range_any() {
+        assert_eq!(PortRange::ANY, PortRange { lo: 0, hi: 65535 });
+        assert!(PortRange::ANY.is_any());
+        assert!(!PortRange { lo: 0, hi: 65534 }.is_any());
+        assert!(!PortRange { lo: 1, hi: 65535 }.is_any());
+        assert!(!PortRange { lo: 80, hi: 80 }.is_any());
+    }
+
+    /// A15 (L4PAR-AC1): the names `l4.flow.get` puts on the wire for the four
+    /// transports `PacketSpec::endpoints` decodes, the same as `summarize`'s.
+    #[test]
+    fn wire_names() {
+        assert_eq!(
+            [L4Proto::Tcp, L4Proto::Udp, L4Proto::Icmp, L4Proto::IcmpV6].map(L4Proto::wire_name),
+            ["TCP", "UDP", "ICMP", "ICMPv6"]
+        );
+        assert_eq!(L4Proto::Other(47).wire_name(), "other");
+        assert_eq!(L4Proto::Raw.wire_name(), "raw");
+    }
 }

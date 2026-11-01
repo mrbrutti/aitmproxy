@@ -97,9 +97,12 @@ export interface FlowNotification {
   event: FlowEventKind;
   id: string;
   /**
-   * Sparse, and a trigger only. The server sends `{id, kind:"http", method, authority, path,
-   * status}` or `{id, kind:"ws", handshake, messages}` (`"ws"` is not the model's `websocket`);
-   * the store refetches the row instead of applying it. Only the fixture bus sends a full model.
+   * The full `flow.get` object for the flow, same keys and spelling (`kind:"http"` with method,
+   * scheme, authority, path, status, request_bytes, response_bytes, started_at, duration_ms;
+   * `kind:"websocket"` with handshake, messages, started_at, duration_ms). On a real bus the store
+   * still treats the push as a trigger and refetches the row by id; that is a deliberate choice
+   * (one fetch path for push and poll), not a workaround for a sparse summary. Only the fixture bus
+   * has its summary applied directly.
    */
   summary?: unknown;
 }

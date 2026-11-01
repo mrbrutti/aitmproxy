@@ -41,6 +41,43 @@ enum SnapshotScene: String, CaseIterable {
     case inspectWebSocket = "inspect-websocket"
     case inspectL4 = "inspect-l4"
     case inspectL4OutOfScope = "inspect-l4-oos"
+    case appsNoAttribution = "apps-noattribution"
+    // The Status page (spec 2026-10-31 status page, ST-AC3), one scene per lane state worth seeing.
+    case statusOK = "status-ok"
+    case statusFresh = "status-fresh"
+    case statusCoreFailed = "status-core-failed"
+    case statusBusToken = "status-bus-token"
+    case statusCoreStarting = "status-core-starting"
+    case statusCoreStopped = "status-core-stopped"
+    case statusBusConnecting = "status-bus-connecting"
+    case statusBusAgent = "status-bus-agent"
+    case statusScopeEmpty = "status-scope-empty"
+    case statusWaiting = "status-waiting"
+    case statusDegraded = "status-degraded"
+    case statusExternal = "status-external"
+
+    /// The fixture rows the `appsNoAttribution` and `statusFresh` scenes replace, restored by `reset`.
+    private static var savedRows: [FlowRow]?
+    /// The fixture bus state, role and warning a Status scene overrides, restored by `reset`.
+    private static var savedBus: (bus: BusState, role: String?, warning: Bool)?
+
+    /// Seeds the Status page: page, embedded core, bus, role and the capture state. Every Status
+    /// scene goes through here so the restore in `reset` has one shape to undo.
+    private static func status(_ session: Session, core: CoreConnection?, bus: BusState, role: String?,
+                               roleWarning: Bool = false, capability: CaptureCapability,
+                               scope: [String] = Fixtures.scope) {
+        Self.savedBus = Self.savedBus ?? (session.bus, session.resolvedRole, session.roleWarning)
+        session.page = .status
+        session.coreHealth.connection = core
+        session.bus = bus
+        session.resolvedRole = role
+        session.roleWarning = roleWarning
+        session.coreHealth.captureSupported = true
+        session.coreHealth.captureCapability = capability
+        session.scopeHosts = scope
+    }
+
+    private static let readyCore = core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080")
 
     /// Task 8: a seeded embedded `CoreConnection` so the health dot and the
     /// core-log panel render without a live core (snapshots use fixtures).
@@ -73,6 +110,7 @@ enum SnapshotScene: String, CaseIterable {
             session.paletteVisible = true
         case .paletteFlows:
             session.paletteOpenedByKeyboard = true
+            session.paletteSeedQuery = "shop"
             session.paletteVisible = true
         case .multiSelect:
             session.selection = Set(session.rows.prefix(3).map(\.id))
@@ -84,6 +122,13 @@ enum SnapshotScene: String, CaseIterable {
                 m.body = Data("{\n  \"email\": \"ops@shop-staging.test\",\n  \"password\": \"' OR 1=1 --\",\n  \"remember\": true\n}".utf8)
                 session.updateDraft(id, m)
             }
+        case .appsNoAttribution:
+            // Live reality (NS-AC8): captured flows carry no source app, so the Apps page
+            // cannot group them. The table must stay, with the capture-state banner above it.
+            Self.savedRows = Self.savedRows ?? session.rows
+            session.rows = session.rows.map { var row = $0; row.client = nil; return row }
+            session.page = .apps
+            CaptureSnapshotState.noscope.apply(to: session)
         case .scopeSheet:
             session.scopeSheetVisible = true
         case .importDrop:
@@ -195,6 +240,60 @@ enum SnapshotScene: String, CaseIterable {
         case .inspectL4OutOfScope:
             // The out-of-L4-scope session: dimmed, mutating actions disabled (AC9).
             session.select(session.rows.first { $0.kind == .l4 && !$0.inScope }?.id)
+        case .statusOK:
+            // Everything green: three ok lanes, the Getting-started list collapsed to one line.
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .capturing)
+        case .statusFresh:
+            // First launch: core and bus up, no extension, empty scope, no flows; Recent is empty.
+            Self.savedRows = Self.savedRows ?? session.rows
+            session.rows = []
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .extensionNotInstalled, scope: [])
+        case .statusCoreFailed:
+            // The core died: the Core lane is the error, the bus is offline, nothing on the page is blank.
+            Self.status(session,
+                        core: Self.core(.degraded(reason: "the core exited unexpectedly (status 1)\naitm: address already in use (os error 48)"),
+                                        label: "Embedded core"),
+                        bus: .disconnected, role: nil, capability: .inactive)
+        case .statusCoreStarting:
+            Self.status(session, core: Self.core(.starting, label: "Embedded core · starting"), bus: .connecting("127.0.0.1:60745"), role: nil,
+                   capability: .inactive)
+        case .statusCoreStopped:
+            Self.status(session, core: Self.core(.stopped, label: "Embedded core · stopped"), bus: .disconnected, role: nil,
+                   capability: .inactive)
+        case .statusBusConnecting:
+            Self.status(session, core: Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080"),
+                   bus: .connecting("127.0.0.1:60745"), role: nil, capability: .capturing)
+        case .statusBusAgent:
+            Self.status(session, core: Self.core(.ready, label: "Embedded core · proxy 127.0.0.1:8080", proxyAddress: "127.0.0.1:8080"),
+                   bus: .connected("127.0.0.1:60745"), role: "agent", roleWarning: true, capability: .capturing)
+        case .statusBusToken:
+            // The bus rejected the token: the Bus lane names the token remedy.
+            Self.status(session, core: Self.readyCore,
+                        bus: .failed("the bus rejected the token (401 unauthorized)"), role: nil,
+                        capability: .inactive)
+        case .statusScopeEmpty:
+            // The trap (PR #181): capture on, scope empty — a warning, never a green "Capturing".
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .capturing, scope: [])
+        case .statusWaiting:
+            // Activation submitted, the two System Settings approvals outstanding.
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .pendingApproval)
+        case .statusDegraded:
+            // An unnotarized build: macOS refused the extension's signature; the remedy says install the signed app.
+            Self.status(session, core: Self.readyCore, bus: .connected("127.0.0.1:60745"), role: "operator",
+                        capability: .degraded("macOS refused the extension: invalid code signature (OSSystemExtensionErrorDomain 8)"))
+        case .statusExternal:
+            // An external core the operator runs: the Core lane is "external", Capture offers Switch to Embedded.
+            // Seeded through a throw-away model (no-op driver, in-memory persistence) so nothing is started
+            // or written; `reset` drops it again.
+            let model = ActiveConnectionModel(driver: SnapshotCoreDriver(), persistence: SnapshotActiveKindPersistence())
+            model.select(.external)
+            session.connection = model
+            Self.status(session, core: nil, bus: .connected("10.0.0.12:9090"), role: "operator",
+                        capability: .inactive)
         }
     }
 
@@ -205,7 +304,7 @@ enum SnapshotScene: String, CaseIterable {
         session.sidebarQuery = ""
         session.paletteVisible = false
         if session.layout == .detached {
-            NSApp.windows.first { $0.title == "Inspector" }?.close()
+            Snapshot.inspectorWindow()?.close()
             session.layout = .horizontal
         }
         session.activityLogVisible = false
@@ -223,6 +322,80 @@ enum SnapshotScene: String, CaseIterable {
         session.coreLogVisible = false
         session.coreHealth.connection = nil
         session.coreHealth.log.removeAll()
+        if let rows = savedRows {
+            session.rows = rows
+            savedRows = nil
+        }
+        if let saved = savedBus {
+            session.bus = saved.bus
+            session.resolvedRole = saved.role
+            session.roleWarning = saved.warning
+            savedBus = nil
+        }
+        // Fixture runs have no live active-core model; the external Status scene seeds one.
+        session.connection = nil
+        // Back to no extension and the fixture scope, whatever a scene seeded.
+        CaptureSnapshotState.reset(session)
         session.select(session.rows.first { $0.seq == 50 }?.id)
+    }
+}
+
+/// A driver for the `statusExternal` scene: switching the active kind starts and stops nothing.
+private final class SnapshotCoreDriver: ActiveConnectionDriver {
+    var isEmbeddedRunning: Bool { false }
+    func activateEmbedded() {}
+    func activateExternal() {}
+}
+
+/// In-memory persistence for the `statusExternal` scene: the operator's real choice is never written.
+/// `nonisolated` because the protocol is: no isolated-conformance inference to lean on.
+private nonisolated final class SnapshotActiveKindPersistence: ActiveKindPersistence {
+    private var kind: ActiveCoreKind?
+    func load() -> ActiveCoreKind? { kind }
+    func save(_ kind: ActiveCoreKind) { self.kind = kind }
+}
+
+/// The states Settings ▸ Capture shows the operator, walked by snapshot mode (TG-AC11):
+/// off, awaiting approval, capturing, failed. Each seeds what the `ExtensionController`
+/// and the persisted capture choice would give the tab. A snapshot run embeds no
+/// extension, so the seed also marks capture supported, and it seeds the toggle position
+/// through `captureChoice` instead of writing the operator's real preference.
+/// The raw value names the file: `settings-capture-<state>-<mode>.png`.
+enum CaptureSnapshotState: String, CaseIterable {
+    case off, awaiting, active, failed, noscope
+
+    func apply(to session: Session) {
+        session.coreHealth.captureSupported = true
+        // Every state starts from the fixture scope; only `noscope` empties it, so a state
+        // never inherits the previous one's scope (the light pass must not leak into dark).
+        session.scopeHosts = Fixtures.scope
+        switch self {
+        case .off:
+            session.coreHealth.captureCapability = .inactive
+            session.coreHealth.captureChoice = false
+        case .awaiting:
+            session.coreHealth.captureCapability = .pendingApproval
+            session.coreHealth.captureChoice = true
+        case .active:
+            session.coreHealth.captureCapability = .capturing
+            session.coreHealth.captureChoice = true
+        case .failed:
+            session.coreHealth.captureCapability = .degraded(
+                "Could not start the capture tunnel after 4 attempts: the proxy configuration was not allowed")
+            session.coreHealth.captureChoice = true
+        case .noscope:
+            // The trap: capture on, scope empty, so nothing is captured. The tab must say so.
+            session.coreHealth.captureCapability = .capturing
+            session.coreHealth.captureChoice = true
+            session.scopeHosts = []
+        }
+    }
+
+    /// Back to what a snapshot run starts with: no extension, nothing seeded.
+    static func reset(_ session: Session) {
+        session.coreHealth.captureSupported = false
+        session.coreHealth.captureCapability = .extensionNotInstalled
+        session.coreHealth.captureChoice = nil
+        session.scopeHosts = Fixtures.scope
     }
 }

@@ -25,11 +25,12 @@ members = [
     "crates/aitm-bus-client",
     "crates/aitm-tui",
     "crates/aitm-peer-token",
+    "crates/aitm-sysproxy",
     "crates/aitm",
 ]
 
 [workspace.package]
-version = "0.5.2"
+version = "0.5.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.97"
@@ -74,3 +75,4 @@ aitm-bus-client = { path = "crates/aitm-bus-client" }
 aitm-tui = { path = "crates/aitm-tui" }
 aitm-plugin-scanner = { path = "crates/aitm-plugin-scanner" }
 aitm-peer-token = { path = "crates/aitm-peer-token" }
+aitm-sysproxy = { path = "crates/aitm-sysproxy" }

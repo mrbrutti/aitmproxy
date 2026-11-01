@@ -221,3 +221,43 @@ fn durable_line_has_the_same_keys_as_to_value() {
     assert!(none.as_object().unwrap().contains_key("connection_id"));
     assert_eq!(none["connection_id"], serde_json::Value::Null);
 }
+
+// D17.2: an operator-token connection is audited as "operator", and the
+// crate's own reader accepts the record back.
+#[test]
+fn operator_frontend_round_trips() {
+    let rec = AuditRecord {
+        frontend: "operator",
+        ..record("changed=true")
+    };
+    let json = serde_json::to_string(&rec).unwrap();
+    assert!(json.contains("\"frontend\":\"operator\""), "{json}");
+    let back: AuditRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, rec);
+}
+
+// D17.2 (tester): the reader's allow-list grew by exactly "operator"; any
+// other frontend word is still a deserialization error, never a leak.
+#[test]
+fn reader_rejects_an_unknown_frontend() {
+    let rec = record("changed=true");
+    let json = serde_json::to_string(&rec).unwrap();
+    for bad in ["gui", "Operator", "OPERATOR", "operator ", ""] {
+        let tampered = json.replace("\"frontend\":\"cli\"", &format!("\"frontend\":\"{bad}\""));
+        assert_ne!(tampered, json, "replacement did not apply for {bad:?}");
+        let err = serde_json::from_str::<AuditRecord>(&tampered).unwrap_err();
+        // `intern` reports an unknown variant with the vocabulary, so even
+        // the empty string pins something: the exact three words.
+        assert!(
+            err.to_string().starts_with(&format!(
+                "unknown variant `{bad}`, expected one of `cli`, `mcp`, `operator`"
+            )),
+            "{bad:?}: {err}"
+        );
+    }
+    for good in ["cli", "mcp", "operator"] {
+        let ok = json.replace("\"frontend\":\"cli\"", &format!("\"frontend\":\"{good}\""));
+        let back: AuditRecord = serde_json::from_str(&ok).unwrap();
+        assert_eq!(back.frontend, good);
+    }
+}

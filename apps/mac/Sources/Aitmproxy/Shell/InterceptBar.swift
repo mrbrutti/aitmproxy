@@ -7,9 +7,12 @@ import SwiftUI
 struct InterceptBar: View {
     @Environment(Session.self) private var session
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var pulse = false
 
     private var target: FlowRow? { session.interceptTarget }
+
+    /// A failed embedded core cannot resume, kill or edit anything: the paused
+    /// bar keeps Disarm and Rules… live and dims the rest (B4).
+    private var coreFailed: Bool { session.coreHealth.health == .failed }
 
     var body: some View {
         if session.paused.isEmpty {
@@ -39,16 +42,15 @@ struct InterceptBar: View {
 
     private var pausedBar: some View {
         HStack(spacing: Tok.Metric.padInner) {
-            Circle()
-                .fill(Tok.Intercept.onBase.color)
+            PulseDot(color: Tok.Intercept.onBase, reduceMotion: reduceMotion)
                 .frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                .opacity(pulse && !reduceMotion ? 0.45 : 1)
-                .onAppear {
-                    guard !reduceMotion else { return }
-                    withAnimation(.easeInOut(duration: Tok.Motion.interceptPulse / 2).repeatForever()) { pulse = true }
-                }
+                .accessibilityHidden(true)
             Text("\(session.paused.count) paused").fontWeight(.semibold)
-            if let target {
+            if coreFailed {
+                Text("· core failed — restart the core to resume")
+                    .opacity(0.9)
+                    .lineLimit(1)
+            } else if let target {
                 Text(targetText(target))
                     .font(Tok.Face.data(Tok.Typography.Size.md))
                     .opacity(0.9)
@@ -78,21 +80,27 @@ struct InterceptBar: View {
     /// The paused-bar actions. `compact` keeps only Resume and folds the rest into
     /// an overflow menu; `ViewThatFits` picks it when the full row would not fit.
     @ViewBuilder private func actions(compact: Bool) -> some View {
-        let resumeTitle = target.map { session.pendingEditCount($0.id) > 0 } == true ? "Apply & Resume" : "Resume"
+        // The verb table titles Resume vs Apply & Resume and says whether Edit applies (one predicate
+        // with the Flow menu and the row menu, B3).
+        let resume = session.verbItem(.resume, for: target?.id)
+        let edit = session.verbItem(.edit, for: target?.id)
+        let kill = session.verbItem(.kill, for: target?.id)
         HStack(spacing: Tok.Metric.gapTight) {
-            PrimaryButton(resumeTitle, hint: "⌘⏎") { if let target { session.applyAndResume(target.id) } }
+            PrimaryButton(resume.title, hint: resume.hint) { if let target { session.applyAndResume(target.id) } }
                 .accessibilityIdentifier("resume-button")
+                .disabled(coreFailed)
             if compact {
                 Menu {
-                    if let target, row(target).state == .paused {
-                        Button("Edit Paused Request") { session.editPaused(target.id) }
+                    if let target, edit.enabled {
+                        Button(edit.title) { session.perform(.edit, on: target.id) }.disabled(coreFailed)
                     }
-                    Button("Resume All") { session.resumeAll() }
-                    Menu("Kill") {
+                    Button("Resume All") { session.resumeAll() }.disabled(coreFailed)
+                    Menu(kill.title) {
                         ForEach(KillMode.allCases, id: \.self) { mode in
                             Button(mode.title) { session.killMode = mode; if let target { session.kill(target.id) } }
                         }
                     }
+                    .disabled(coreFailed)
                     Button("Breakpoint Rules…") { session.rulesVisible = true }
                     Button("Disarm Intercept") { session.arm(false) }
                 } label: {
@@ -103,11 +111,13 @@ struct InterceptBar: View {
                 .menuIndicator(.hidden)
                 .fixedSize()
             } else {
-                if let target, row(target).state == .paused {
-                    GhostButton("Edit", hint: "e") { session.editPaused(target.id) }
+                if let target, edit.enabled {
+                    GhostButton("Edit", hint: edit.hint) { session.perform(.edit, on: target.id) }
                         .accessibilityIdentifier("edit-button")
+                        .disabled(coreFailed)
                 }
-                GhostButton("Resume all") { session.resumeAll() }
+                GhostButton("Resume All") { session.resumeAll() }
+                    .disabled(coreFailed)
                 Menu {
                     ForEach(KillMode.allCases, id: \.self) { mode in
                         Button {
@@ -118,13 +128,14 @@ struct InterceptBar: View {
                         }
                     }
                 } label: {
-                    GhostButton("Kill", hint: "⌘\\", menu: true) { if let target { session.kill(target.id) } }
+                    GhostButton(kill.title, hint: kill.hint, menu: true) { if let target { session.kill(target.id) } }
                 } primaryAction: {
                     if let target { session.kill(target.id) }
                 }
                 .menuStyle(.button)
                 .buttonStyle(.plain)
                 .menuIndicator(.hidden)
+                .disabled(coreFailed)
                 .help("Kill \(session.killMode.title.lowercased()) (⌘\\); click the chevron for other modes")
                 GhostButton("Rules…") { session.rulesVisible = true }
                 GhostButton("Disarm", hint: "i") { session.arm(false) }
@@ -132,16 +143,13 @@ struct InterceptBar: View {
         }
     }
 
-    private func row(_ r: FlowRow) -> FlowRow { r }
-
+    /// "edited"/"pending" comes from `pendingEditCount` alone, the same predicate
+    /// the Resume title and the editor footer use, so the three never disagree (B3).
     private func targetText(_ row: FlowRow) -> String {
         var s = "\(row.method.label) \(row.url)"
         let pending = session.pendingEditCount(row.id)
         if pending > 0 {
             s += " · \(pending) edit\(pending == 1 ? "" : "s") pending"
-        } else if row.edited, let detail = session.details[row.id], let original = detail.originalRequest {
-            let n = max(abs(detail.request.headers.count - original.headers.count), 1)
-            s += " · edited (\(n) header\(n == 1 ? "" : "s"))"
         }
         return s
     }
@@ -206,6 +214,81 @@ struct GhostButton: View {
             .background(Color.black.opacity(0.12), in: RoundedRectangle(cornerRadius: Tok.Radius.control))
         }
         .buttonStyle(PressStyle())
+    }
+}
+
+/// The paused bar's 8 pt dot. Its pulse (opacity 1 → 0.45 and back over `motion.interceptPulse`,
+/// curve `motion.pulse`) is a Core Animation animation on the dot's own layer, so the render server
+/// breathes it and the main thread does nothing per frame: the SwiftUI `repeatForever` it replaces
+/// cost 17–23 % of a core for as long as any flow was paused. Reduce Motion removes the animation
+/// and holds opacity 1; when the setting turns off again the animation is added back. Both run from
+/// `updateNSView`, so a live toggle in System Settings is right in either direction (S-069).
+struct PulseDot: NSViewRepresentable {
+    var color: DynamicColor
+    var reduceMotion: Bool
+
+    func makeNSView(context: Context) -> PulseLayerView {
+        let view = PulseLayerView()
+        view.wantsLayer = true
+        view.color = color
+        return view
+    }
+
+    func updateNSView(_ view: PulseLayerView, context: Context) {
+        view.color = color
+        view.setPulsing(!reduceMotion)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: PulseLayerView, context: Context) -> CGSize? {
+        CGSize(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
+    }
+
+    /// The dot's own layer-backed view (not `FlowCellView.DotView`, the table's status dot).
+    final class PulseLayerView: NSView {
+        private static let pulseKey = "pulse"
+        /// The token, not a resolved `NSColor`: two dynamic colours never compare equal, the token does,
+        /// so only a real change redraws the layer.
+        var color: DynamicColor = Tok.Intercept.onBase { didSet { if color != oldValue { needsDisplay = true } } }
+        private var pulsing = false
+
+        /// The radius lives on the backing layer itself, so a layer AppKit recreates keeps it.
+        override func makeBackingLayer() -> CALayer {
+            let layer = CALayer()
+            layer.cornerRadius = Tok.Size.statusDot / 2
+            return layer
+        }
+
+        override var wantsUpdateLayer: Bool { true }
+        override func updateLayer() { layer?.backgroundColor = color.nsColor.cgColor }
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            needsDisplay = true
+        }
+
+        func setPulsing(_ on: Bool) {
+            pulsing = on
+            guard let layer else { return }
+            if on {
+                guard layer.animation(forKey: Self.pulseKey) == nil else { return }
+                let pulse = CABasicAnimation(keyPath: "opacity")
+                pulse.fromValue = 1.0
+                pulse.toValue = 0.45
+                pulse.duration = Tok.Motion.interceptPulse / 2
+                pulse.autoreverses = true
+                pulse.repeatCount = .infinity
+                pulse.timingFunction = Tok.Motion.pulseTiming
+                layer.add(pulse, forKey: Self.pulseKey)
+            } else {
+                layer.removeAnimation(forKey: Self.pulseKey)
+                layer.opacity = 1
+            }
+        }
+
+        /// A layer that left and re-entered a window may have dropped its animations; put it back.
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if pulsing, window != nil { setPulsing(true) }
+        }
     }
 }
 

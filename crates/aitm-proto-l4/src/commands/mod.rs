@@ -36,11 +36,15 @@ pub mod sendrecv;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
+use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
 
 use crate::flow::L4FlowId;
-use crate::types::{IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, PortRange};
+use crate::module::{AvailabilitySource, L4Availability};
+use crate::types::{
+    IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
+};
 
 pub use crate::gates::{AgentGate, L4AgentGates};
 pub(crate) use agent::{agent_commands, L4AgentGate};
@@ -114,6 +118,26 @@ fn interface_fields() -> Vec<aitm_core::ParamDef> {
 }
 
 // ---- shared helpers for the command layer -------------------------------------
+
+/// One result/param field of a command schema. The shared constructor every
+/// `l4.*` schema builds its field lists with.
+pub(crate) fn field(name: &str, ty: TypeDesc, required: bool, description: &str) -> ParamDef {
+    ParamDef {
+        name: name.into(),
+        ty,
+        required,
+        description: description.into(),
+    }
+}
+
+/// Milliseconds since the Unix epoch, UTC — the clock HTTP `flow.get`'s
+/// `started_at`, `l4.flow.get`'s `timestamp` / `started_at` and
+/// `l4.intercept.list`'s `parked_at` all report. A pre-epoch time is `0`; a time
+/// past `i64::MAX` ms saturates.
+pub(crate) fn epoch_ms(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+}
 
 /// A transport-neutral [`Value`] as a `serde_json::Value`, so a structured craft
 /// spec / scope entry can be deserialized into its serde-derived Rust type.
@@ -195,7 +219,7 @@ pub(crate) fn parse_cidr(s: &str) -> anyhow::Result<IpCidr> {
 }
 
 /// `addr/prefix` for display / round-trip.
-fn cidr_to_string(cidr: &IpCidr) -> String {
+pub(crate) fn cidr_to_string(cidr: &IpCidr) -> String {
     format!("{}/{}", cidr.addr, cidr.prefix)
 }
 
@@ -241,7 +265,7 @@ fn capability_to_string(cap: L4Capability) -> &'static str {
 pub(crate) fn parse_ports(s: &str) -> anyhow::Result<PortRange> {
     let s = s.trim();
     if s.is_empty() || s == "*" || s.eq_ignore_ascii_case("any") {
-        return Ok(PortRange { lo: 0, hi: 65535 });
+        return Ok(PortRange::ANY);
     }
     if let Some((lo, hi)) = s.split_once('-') {
         let lo = lo
@@ -265,7 +289,7 @@ pub(crate) fn parse_ports(s: &str) -> anyhow::Result<PortRange> {
 }
 
 /// `lo-hi` for display / round-trip.
-fn ports_to_string(ports: &PortRange) -> String {
+pub(crate) fn ports_to_string(ports: &PortRange) -> String {
     format!("{}-{}", ports.lo, ports.hi)
 }
 
@@ -298,18 +322,24 @@ pub(crate) fn scope_entry_to_value(entry: &L4ScopeEntry) -> Value {
         Value::Str(capability_to_string(entry.capability).to_string()),
     );
     obj.insert("inject_rate".to_string(), Value::Object(rate));
+    obj.insert(
+        "source".to_string(),
+        Value::Str(scope_source_to_string(entry.source).to_string()),
+    );
     Value::Object(obj)
+}
+
+/// `config` / `runtime` — the provenance label UIs show (plan A5, L4PAR-AC5).
+fn scope_source_to_string(source: L4ScopeSource) -> &'static str {
+    match source {
+        L4ScopeSource::Config => "config",
+        L4ScopeSource::Runtime => "runtime",
+    }
 }
 
 /// The fields a scope entry reports — shared by the `scope.add` result and
 /// `scope.list` elements.
-fn scope_entry_fields() -> Vec<aitm_core::ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| aitm_core::ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
+fn scope_entry_fields() -> Vec<ParamDef> {
     vec![
         field("id", TypeDesc::Str, true, "The scope entry's stable id."),
         field(
@@ -341,6 +371,12 @@ fn scope_entry_fields() -> Vec<aitm_core::ParamDef> {
             true,
             "The per-entry injection ceiling.",
         ),
+        field(
+            "source",
+            TypeDesc::Str,
+            true,
+            "`config` (operator config block) or `runtime` (added over the bus).",
+        ),
     ]
 }
 
@@ -352,15 +388,21 @@ pub(crate) fn active_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
 ) -> Vec<Arc<dyn Command>> {
+    // `l4.flow.get` reads the shared agent gates at invoke time: packet bytes reach
+    // an agent only while its Capture gate is open (spec §2.2).
+    let gates = guard.agent_gates();
     vec![
         Arc::new(L4Interfaces),
-        // `ScopeAdd` is thin: the widen gate (reading the shared gates) and the forced
-        // `source = Runtime` live in `L4Guard::add_runtime_scope`.
+        // `ScopeAdd` is thin. The widen gate lives in the guard
+        // (`L4Guard::add_runtime_scope`, reading the shared gates) and applies to
+        // every untrusted caller and to script/PoC callers; a confirmed operator or
+        // CLI call takes `L4Guard::add_operator_scope` and skips it. Both paths force
+        // `source = Runtime` through the guard's `push_runtime`.
         Arc::new(ScopeAdd::new(guard.clone())),
         Arc::new(ScopeRemove::new(guard.clone())),
         Arc::new(ScopeList::new(guard)),
         Arc::new(FlowList::new(store.clone())),
-        Arc::new(FlowGet::new(store)),
+        Arc::new(FlowGet::new(store, gates)),
         Arc::new(Craft),
     ]
 }
@@ -370,9 +412,11 @@ pub(crate) fn active_commands(
 /// applies this to the wire + intercept command lists before the privilege gate, so
 /// an untrusted (agent) caller, i.e. any caller `Frontend::is_trusted_control` does
 /// not trust, is refused a gated verb unless its `l4.allow_agent_*` flag is on; the
-/// trusted-control roles (operator and CLI) bypass it. Scope-add's widen gate lives
-/// inside the command (it refuses every runtime caller when off); everything here
-/// is gated for an untrusted caller only.
+/// trusted-control roles (operator and CLI) bypass it. `l4.scope.add` is not in this
+/// list: its widen gate lives in the guard (`add_runtime_scope`), where it applies to
+/// untrusted and script/PoC callers alike, while a confirmed operator or CLI call
+/// skips it (`add_operator_scope`); both paths force `source = Runtime` via
+/// `push_runtime`. Everything here is gated for an untrusted caller only.
 pub(crate) fn agent_gate(
     cmds: Vec<Arc<dyn Command>>,
     gates: &Arc<L4AgentGates>,
@@ -387,7 +431,8 @@ pub(crate) fn agent_gate(
 
 /// The per-capability [`AgentGate`] that governs a command, if it is one of the
 /// Mcp-only gated verbs. Read-only / `Write` commands return `None` (never gated by a
-/// flag), as does `l4.scope.add` (its widen gate lives in the command itself).
+/// flag), as does `l4.scope.add` (its widen gate lives in the guard, see
+/// [`agent_gate`]).
 fn gate_for(name: &str) -> Option<AgentGate> {
     match name {
         "l4.inject" | "l4.send_recv" => Some(AgentGate::Inject),
@@ -400,20 +445,25 @@ fn gate_for(name: &str) -> Option<AgentGate> {
     }
 }
 
-/// Build the ordered list of Task 10 wire commands (`l4.capture.*`, `l4.inject`,
+/// Build the Task 10 wire commands (`l4.capture.start` / `.stop`, `l4.inject`,
 /// `l4.send_recv`) over the shared guard + store, a fresh libpcap wire backend, and
 /// one shared [`CaptureRegistry`](crate::capture::CaptureRegistry) the capture
-/// commands manage together. Kept additive to [`active_commands`] so the two
-/// registration lists merge cleanly; [`crate::module::L4Module::load`] registers
-/// both. The backend construction is pure (no privilege, fail-closed at call time).
+/// commands manage together — plus, **separately**, the `l4.capture.status` verb
+/// over the same registry. `capture` is the capture/inject class's
+/// [`AvailabilitySource`]; the status verb reads it at invoke time. The split is
+/// the registration contract: [`crate::module::L4Module::load`] gates the first
+/// list on privilege and registers the status verb beside it, ungated, so it
+/// always answers (spec §1, L4PAR-AC9). The backend construction is pure (no
+/// privilege, fail-closed at call time).
 pub(crate) fn wire_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
-) -> Vec<Arc<dyn Command>> {
+    capture: AvailabilitySource,
+) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
     let backend: Arc<dyn crate::backend::CaptureInjectBackend> =
         Arc::new(crate::backend::pcap::PcapBackend::new());
     let registry = Arc::new(crate::capture::CaptureRegistry::new());
-    vec![
+    let gated: Vec<Arc<dyn Command>> = vec![
         Arc::new(CaptureStart::new(
             guard.clone(),
             backend.clone(),
@@ -421,9 +471,63 @@ pub(crate) fn wire_commands(
             registry.clone(),
         )),
         Arc::new(CaptureStop::new(registry.clone())),
-        Arc::new(CaptureStatus::new(registry)),
         Arc::new(Inject::new(guard.clone(), store.clone(), backend.clone())),
         Arc::new(SendRecv::new(guard, store, backend)),
+    ];
+    (gated, Arc::new(CaptureStatus::new(registry, capture)))
+}
+
+/// The availability object the two status verbs answer (spec §1, L4PAR-AC3/AC4):
+/// `{available: Bool, code: Str, reason: Str|Null, <payload_key>: Array}`. The
+/// payload (capture flow ids / intercept sessions) is forced to `[]` when the class
+/// is unavailable, so a UI never renders stale rows under a refusing control.
+pub(crate) fn availability_object(
+    av: &L4Availability,
+    payload_key: &str,
+    payload: Vec<Value>,
+) -> Value {
+    let mut obj = BTreeMap::new();
+    obj.insert("available".to_string(), Value::Bool(av.is_available()));
+    obj.insert("code".to_string(), Value::Str(av.code_str().to_string()));
+    obj.insert(
+        "reason".to_string(),
+        av.reason()
+            .map_or(Value::Null, |reason| Value::Str(reason.to_string())),
+    );
+    let payload = if av.is_available() { payload } else { vec![] };
+    obj.insert(payload_key.to_string(), Value::Array(payload));
+    Value::Object(obj)
+}
+
+/// The result fields of an [`availability_object`], for the two status verbs'
+/// schemas: one shape, one parser on every frontend.
+pub(crate) fn availability_fields(
+    payload_key: &str,
+    payload_ty: TypeDesc,
+    payload_description: &str,
+) -> Vec<ParamDef> {
+    vec![
+        field(
+            "available",
+            TypeDesc::Bool,
+            true,
+            "Whether this capability class works on this core now.",
+        ),
+        field(
+            "code",
+            TypeDesc::Str,
+            true,
+            "`available`, `needs_privilege` (the platform supports it, the process lacks \
+             it), `unsupported_platform`, or `not_configured`.",
+        ),
+        field(
+            "reason",
+            TypeDesc::Str,
+            false,
+            "The exact text the gated verbs return in `L4 unavailable: <reason>`; null \
+             when available.",
+        ),
+        field(payload_key, payload_ty, true, payload_description),
     ]
 }
 

@@ -8,6 +8,8 @@ commands:
       List the ids of every captured flow, oldest first.
   flow get --id <flow-id>
       Summarize one captured flow: kind, request line, status, state.
+  flow table
+      Per-flow summaries for a flows table: method, URL, status, duration, state, and marks, oldest first. Read-only.
   flow subscribe [--filter <json-object>] [--since <flow-id>]
       Subscribe to live flow notifications on this connection. Returns a sub_id; matching flows then arrive as notifications/aitm/flow lines with no further request. Read-only.
   flow unsubscribe --sub_id <int>
@@ -18,6 +20,12 @@ commands:
       Replace a flow's highlight mark set (e.g. colour names); an empty array clears it.
   flow comment --id <flow-id> --text <string>
       Set a flow's free-text comment; an empty string clears it.
+  scan discover --target <string> [--max_depth <int>] [--max_pages <int>]
+      Discover reachable in-scope URLs under `target` (same-origin, scope-bound, budget-capped) and enumerate the injection points visible in captured requests. No injection or fuzzing is performed. `max_depth`/`max_pages` may lower the configured caps, never raise them. A navigation that lands off-origin or out of scope (a redirect) aborts the crawl with `stopped_reason = "left_scope"`. While the crawl runs the proxy's browser-egress posture is held confined, so the embedded browser cannot fetch an out-of-scope public host (sub-resource or redirect target); the hold is released when the command returns. Only one discovery runs at a time (crawls share one browser page); a second call while one is running is refused immediately — wait for it to finish.
+  scan passive [--target <string>]
+      Run the passive checks (reflected request parameters, missing security headers, cookie flags) over the flows already captured for `target`, or over every captured flow when `target` is absent. Issues no traffic. Findings carry the parameter, header or cookie NAME, never its value.
+  scan report [--target <string>]
+      Fold the recorded findings into `report_md` (one markdown section per finding) and `index` (one {poc_path, target_path, class, passed, control_passed, finding_capture, screenshot_path} entry per finding). `target` selects the findings recorded against that origin, or against a path under it. Empty when no findings directory is configured. Credentials are masked.
   flow replay --id <flow-id>
       Reissue a captured HTTP request through the proxy client; returns the new flow's id.
   flow intercept [--enabled <true|false>] [--rules <json-array>]
@@ -27,7 +35,7 @@ commands:
   flow kill --id <flow-id> [--mode <string>]
       Abort an intercepted flow. mode=reset (default) drops it so the client sees a reset/closed connection; mode=429 or mode=503 answers the client with that status and an empty body, with no upstream request.
   proxy status
-      The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, `paused` (parked-flow count), `capturing`, and `flows` (visible count).
+      The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, `paused` (parked-flow count), `capturing`, `flows` (visible count), `version` (the aitm binary's version), and `system_proxy` (the OS proxy setting as this core sees it: `state` one of points_at_us/other/off/unknown/unsupported, `host`/`port` when `other`, `managed_by_us`, `setting`, `supported`, `detail`; refreshed at most every 5 s).
   proxy pause
       Pause capture: new flows are hidden from list/status/count. Traffic still flows and each hidden flow stays in memory, reachable by id, until it ages out via normal eviction (use flow.clear to drop completed ones). While paused, continued traffic can evict older visible flows under the store's capacity bound, so resume or clear to reclaim history. Returns the capture state.
   proxy resume
@@ -36,6 +44,14 @@ commands:
       Remove completed flows from the store (in-flight and intercepted flows are kept); returns {cleared, skipped_in_flight}.
   config get
       A redacted view of the proxy configuration (no MCP token or key material).
+  proxy system status
+      Read the OS system proxy: where it points relative to this core, whether this core manages it, and the per-service rows on macOS.
+  proxy system set [--bypass <json-array>]
+      Point the OS system proxy (HTTP and HTTPS) at this core, recording the previous setting so it is restored on unset or exit. Operator-only.
+  proxy system unset
+      Restore the OS system proxy this core set, service by service, from the recorded previous setting; services another tool changed since are left alone. Operator-only.
+  capture status
+      What the core knows about the macOS Network/System Extension capture path: whether `macos_capture.enabled` is set, whether the capture feeder is listening, whether a code-signature-verified extension provider is attached, the scope it holds, and the flows it has handed off during the current attachment. Read-only and parameterless. Times are Unix epoch milliseconds. When `feeder.state` is `off`, `feeder.reason` is exactly one of `macos_capture.enabled is false`, `not a macOS build`, `not started`, `stopped`. This is not the record toggle: `proxy.status.capturing` reports whether the proxy records flows.
   flow mutate --id <flow-id> --edits <json-object>
       Edit a captured HTTP flow in place. Edits apply to the request (method, path, headers, body); when the flow is parked at the response phase they apply to the response and `status` is valid.
   request send [--method <string>] [--scheme <string>] --authority <string> [--path <string>] [--headers <json-object>] [--body <value>]
@@ -72,6 +88,42 @@ commands:
       List the configured Map rules.
   map remove --id <string>
       Remove a Map rule by id. Refused from an agent frontend unless maps.allow_agent_authoring is set.
+  check cmdi [--args <json-object>]
+      Confirm OS command injection in { url, param }
+  check cors [--args <json-object>]
+      Probe { url } CORS with a canary Origin
+  check crlf [--args <json-object>]
+      Confirm CRLF header injection in { url, param }
+  check methods [--args <json-object>]
+      Send OPTIONS to { url } and report Allow
+  check ldapi [--args <json-object>]
+      Confirm LDAP injection in { url, param }
+  check nosqli [--args <json-object>]
+      Confirm NoSQL operator injection in { url, param, value? }
+  check open_redirect [--args <json-object>]
+      Set { url, param } to a canary and check the redirect
+  check path_traversal [--args <json-object>]
+      Confirm path traversal / LFI in { url, param }
+  check headers [--args <json-object>]
+      Fetch { url } and report missing security headers
+  check paths [--args <json-object>]
+      Probe { base } for well-known sensitive paths
+  check sqli [--args <json-object>]
+      Confirm SQL injection in { url, param, value? } (error + boolean)
+  check ssrf [--args <json-object>]
+      Confirm SSRF in { url, param } via metadata/internal targets
+  check ssti [--args <json-object>]
+      Confirm template injection in { url, param }
+  check xss [--args <json-object>]
+      Confirm reflected XSS in { url, param } (unencoded reflection)
+  check xxe [--args <json-object>]
+      Confirm in-band XXE at { url } (XML endpoint)
+  l4 recon [--args <json-object>]
+      List L4 interfaces and current scope (read-only)
+  l4 tcp_probe [--args <json-object>]
+      Single TCP SYN to { dst, port, interface } -> open/closed/filtered
+  l4 udp_probe [--args <json-object>]
+      Single UDP datagram to { dst, port, interface }
   browser navigate --url <string>
       Load a URL in the embedded browser (SSRF- and scope-guarded).
   browser click [--selector <string>] [--x <number>] [--y <number>]
@@ -84,6 +136,8 @@ commands:
       Evaluate a JavaScript expression in the page and return its value.
   browser get_dom
       The page's current outer HTML.
+  browser confine --on <true|false>
+      Confine the embedded browser's egress to the current scope (on), or restore free public browsing (off). Private/loopback handling is unaffected either way.
   poc build --flow_id <flow-id> [--name <string>] [--param <string>]
       Build a parameterized reproducible PoC (YAML) from a captured flow.
   poc run --poc_path <string> [--target <string>] [--vars <json-object>]
@@ -102,12 +156,12 @@ commands:
       Install the aitmproxy root CA into the OS trust store (macOS keychain via `security`, Linux ca-certificates anchors, Windows Root store via certutil); every TLS client that uses that store will then trust certificates this proxy mints. Idempotent; identifies the certificate by fingerprint; never reads the CA key. Refused from an agent frontend (MCP) unless ca.allow_agent_install is set in the aitmproxy config; dry_run is always allowed and lists the commands that would run. The embedded obscura browser does not use the OS store (it trusts the CA through --ca-cert) and is unaffected.
   ca uninstall [--scope <string>] [--dry_run <true|false>]
       Remove the aitmproxy root CA from the OS trust store (macOS keychain via `security`, Linux ca-certificates anchors, Windows Root store via certutil); TLS clients that use that store stop trusting certificates this proxy mints. Idempotent; identifies the certificate by fingerprint; never reads the CA key. Refused from an agent frontend (MCP) unless ca.allow_agent_install is set in the aitmproxy config; dry_run is always allowed and lists the commands that would run. The embedded obscura browser does not use the OS store (it trusts the CA through --ca-cert) and is unaffected.
-  agent status
-      Report the current agent policy and recent agent activity. Read-only and readable by any role.
+  agent status [--exclude_self <true|false>]
+      Report the current agent policy and recent agent activity. Read-only and readable by any role, but the activity count covers only the entries the caller may see: a caller that is not trusted control does not count entries made by trusted control (operator, CLI).
   agent set --policy <string>
       Set the agent policy (all | auto | ask | readonly | paused). The deliberate operator act that governs the agent — operator/CLI only; the agent cannot change its own policy.
   agent activity [--since <int>] [--limit <int>]
-      Recent command-invocation audit entries (who ran what, with what redacted arguments, and the outcome), oldest first. Read-only and readable by any role.
+      Recent command-invocation audit entries (who ran what, with what redacted arguments, and the outcome), oldest first. A live view, not a complete record: a high-volume source can flush other sources' entries. `origin` is authoritative; `client_label` is an unauthenticated display string. A call with no `limit` can return at most 6144 entries at the default sizes, so pass `limit`. Read-only and readable by any role, but a caller that is not trusted control does not see entries made by trusted control (operator, CLI).
   agent approve --request_id <string> --allow <true|false>
       Approve or deny a Sensitive agent command the server parked under the `ask` policy. Operator/CLI only; the agent cannot approve its own requests.
   script validate [--path <string>] [--source <string>]
@@ -132,4 +186,48 @@ commands:
       Record a finding (after a passing poc.run): writes a human-readable YAML record and a runs.jsonl line, returns its id.
   findings remove --id <string>
       Delete a recorded finding's YAML (the runs.jsonl history is kept). Operator/CLI only.
+  l4 interfaces
+      List the capture-capable network interfaces (read-only).
+  l4 scope add --cidr <string> --interface <string> --direction <string> --capability <string> [--ports <string>] [--inject_rate_pps <int>] [--inject_rate_burst <int>]
+      Add an entry to the deny-by-default L4 scope (CIDR, ports, interface, direction, capability, injection rate). The single escape hatch that brings a target into play.
+  l4 scope remove --id <string>
+      Remove an L4 scope entry by id (reverts that target to deny-by-default).
+  l4 scope list
+      List the current L4 scope entries (read-only).
+  l4 flow list
+      List the ids of every captured / crafted / send-recv / intercepted L4 flow, oldest first (read-only).
+  l4 flow get --id <string> [--offset <int>] [--limit <int>]
+      Summarize one L4 flow: kind, bind, creation time, endpoints, and a window of its packets with bytes, time and addresses (read-only). `packet_count` is always the total; list polling should pass `limit: 0` and let only an inspector fetch a window. A reply carries at most 4 MiB of raw packet bytes; when that stops the window early, `truncated` is true and `next_offset` is where to resume.
+  l4 craft --spec <value>
+      Build a layered PacketSpec into on-wire bytes and a structural summary. Pure: no privilege, no wire. `Some` header fields ship verbatim (a forced-bad checksum/length is preserved); omitted fields auto-complete.
+  l4 capture start --interface <string> [--direction <string>]
+      Start a scoped, filtered background capture on an interface; returns the Capture flow id. Guarded (Capture): deny-by-default, a scope-derived BPF filter, and a per-packet guard re-check.
+  l4 capture stop --id <string>
+      Stop and remove a running capture by its flow id; returns whether one was running.
+  l4 inject --spec <value> --dst <string> --interface <string> [--port <int>] [--count <int>]
+      Inject a crafted PacketSpec to a target as a bounded, rate-capped batch. Guarded (Inject): scope + dangerous-destination denylist + rate/size/count, then the core scope/rate guard. Routes every write through the single send_on_wire choke point.
+  l4 send_recv --spec <value> --dst <string> --interface <string> [--port <int>] [--timeout_ms <int>] [--expect <string>]
+      Scapy sr/sr1: inject a crafted stimulus and return the correlated reply (Response / Other / NoResponse) linked to the stimulus in an L4 flow. Guarded (Inject+Capture); never hangs (bounded by `timeout_ms`).
+  l4 capture status
+      Report whether capture is available on this core (`available`, `code`, `reason`) and the flow ids of running captures. Always answers, never `L4 unavailable`.
+  l4 intercept start --interface <string> [--direction <string>] [--queue_num <int>]
+      Bind the in-path NFQUEUE and open a guarded interception session (Linux). Requires an `Intercept` scope entry on the interface + direction; returns the session's flow id. `L4Unavailable` when in-path is disabled or unsupported.
+  l4 intercept stop --flow <string>
+      End an interception session by flow id; fail-open forwards anything still parked. `false` if no such session.
+  l4 intercept list [--flow <string>]
+      List the packets currently parked awaiting a verdict, across sessions or for one `flow` (read-only), in arrival order, oldest first.
+  l4 intercept mutate --id <string> [--spec <value>] [--bytes <text>]
+      Edit a parked packet via a PacketSpec (`spec`) or raw `bytes`, keeping the original as a backup for `l4.intercept.revert`. The edit is reinjected only when the packet is forwarded.
+  l4 intercept revert --id <string>
+      Discard a staged mutation on a parked packet, restoring its original bytes. `false` if nothing was staged.
+  l4 intercept forward --id <string>
+      Forward a parked packet through the guarded verdict path — mangled if it was mutated, otherwise the kernel's original. `false` if the id is not parked.
+  l4 intercept drop --id <string>
+      Drop a parked packet (verdict Drop). `false` if the id is not parked.
+  l4 intercept status
+      Report whether in-path interception is available on this core (`available`, `code`, `reason`) and the live interception sessions with their parked-packet counts. Always answers, never `L4 unavailable`.
+  l4 agent status
+      Report the four per-capability agent gate states (inject, capture, intercept, widen) that govern the agent (MCP) L4 path. Read-only.
+  l4 agent set --capability <string> --allowed <true|false>
+      Open or close one per-capability agent gate (capability: inject | capture | intercept | widen). The deliberate operator act that governs the agent L4 path — operator/CLI only; the agent can neither call it nor read-then-flip its own gates.
 

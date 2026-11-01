@@ -186,6 +186,19 @@ public enum EmbeddedCoreLaunch {
         /// upstream certificate (operator opt-in from Settings ▸ Proxy; a footgun
         /// for reaching self-signed servers, never for untrusted networks).
         public var sslInsecure: Bool
+        /// When true, emit a top-level `macos_capture.enabled: true` so the core
+        /// runs the Network Extension feeder. This is the core's deny-by-default
+        /// on-switch, config-file-only by design: the operator flips it from the
+        /// app and the manager re-reads it on every spawn, so a core restart is
+        /// what applies the change (TG-AC1/TG-AC2). Off by default; nothing is
+        /// emitted when false so the core parses its disabled default.
+        public var captureEnabled: Bool
+        /// The embedded core's restored operator scope (`scope.json`), emitted as
+        /// `scope.entries` in array order. Empty — the default for every pre-existing
+        /// call site — emits nothing, so the core keeps its deny-by-default empty
+        /// startup scope. `allow_agent_widen` is never emitted: restoring the
+        /// operator's scope must not let agents widen it.
+        public var scopeHosts: [String]
 
         public init(
             obscuraBinary: URL,
@@ -194,7 +207,9 @@ public enum EmbeddedCoreLaunch {
             token: String,
             operatorToken: String,
             endpointFile: URL,
-            sslInsecure: Bool = false
+            sslInsecure: Bool = false,
+            captureEnabled: Bool = false,
+            scopeHosts: [String] = []
         ) {
             self.obscuraBinary = obscuraBinary
             self.proxyPort = proxyPort
@@ -203,6 +218,8 @@ public enum EmbeddedCoreLaunch {
             self.operatorToken = operatorToken
             self.endpointFile = endpointFile
             self.sslInsecure = sslInsecure
+            self.captureEnabled = captureEnabled
+            self.scopeHosts = scopeHosts
         }
 
         /// The `config.yaml` body. The bus binds `port: 0` (ephemeral, so it
@@ -218,8 +235,9 @@ public enum EmbeddedCoreLaunch {
         ///
         /// `mcp.operator_token` is emitted alongside the agent token so the app can
         /// connect as a present human (`Frontend::Operator`) and widen scope from
-        /// its Scope panel; no `scope:` block is emitted, so startup scope stays
-        /// deny-by-default/empty and agents remain gated.
+        /// its Scope panel; a `scope:` block is emitted only when `scopeHosts` is
+        /// non-empty (the operator's persisted embedded scope); `allow_agent_widen`
+        /// is never emitted, so agents remain gated.
         public func yaml() throws -> String {
             let obscuraPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(obscuraBinary.path)
             let endpointPath = try EmbeddedCoreLaunch.yamlDoubleQuoted(endpointFile.path)
@@ -241,7 +259,31 @@ public enum EmbeddedCoreLaunch {
             // `ssl_insecure` is a top-level config key (sibling of `listen`); the core's
             // `deny_unknown_fields` rejects any wrapper object, so it must stay unindented.
             // Emitted only when the operator opts out of upstream TLS verification.
-            return sslInsecure ? base + "\nssl_insecure: true\n" : base
+            var body = sslInsecure ? base + "\nssl_insecure: true\n" : base
+            // `macos_capture` is likewise a top-level section (sibling of `listen`/`mcp`/
+            // `browser`) with `enabled` indented two spaces. Emitted only when the
+            // operator has turned capture on; when off, nothing is written so the core
+            // keeps its disabled default. The text is byte-for-byte the input of the
+            // core's `config_file.rs` `macos_capture_enable_round_trips` test.
+            if captureEnabled {
+                body += "\nmacos_capture:\n  enabled: true\n"
+            }
+            // `scope` is the last tail so every byte-exact `hasSuffix` on a scope-less config
+            // still holds. A top-level `scope:` with `entries:` under it is exactly the shape
+            // the core's `ScopeFile` accepts (`deny_unknown_fields`), and the text is
+            // byte-for-byte the input of the core's `tests/config_file.rs`
+            // `scope_entries_block_round_trips` test. Hosts are trusted beyond the newline
+            // check: validation has one home, `EmbeddedScope.load`, and the core normalises
+            // again when it seeds the guard. Nothing is written when the scope is empty.
+            if !scopeHosts.isEmpty {
+                body += "\nscope:\n  entries:\n"
+                for host in scopeHosts {
+                    let escaped = try EmbeddedCoreLaunch.yamlDoubleQuoted(
+                        host, onNewline: ConfigError.hostContainsNewline)
+                    body += "    - \"\(escaped)\"\n"
+                }
+            }
+            return body
         }
     }
 
@@ -249,18 +291,27 @@ public enum EmbeddedCoreLaunch {
     public enum ConfigError: Error, Equatable {
         /// A path carried a newline, which would break out of its YAML scalar.
         case pathContainsNewline(String)
+        /// A scope host carried a newline, which would break out of its YAML scalar
+        /// and let a crafted host inject YAML into the token-bearing config.
+        case hostContainsNewline(String)
     }
 
-    /// Escapes a filesystem path for embedding inside a double-quoted YAML scalar:
-    /// backslashes and double-quotes are backslash-escaped. A path containing a
-    /// newline (`\n` or `\r`) is rejected — a newline cannot be represented inside
-    /// a double-quoted scalar on one line, and allowing it would let a crafted path
-    /// inject arbitrary YAML (S3). Returns the inner text to splice between quotes.
-    static func yamlDoubleQuoted(_ path: String) throws -> String {
-        guard !path.contains("\n"), !path.contains("\r") else {
-            throw ConfigError.pathContainsNewline(path)
+    /// Escapes a value (a filesystem path, or a scope host) for embedding inside a
+    /// double-quoted YAML scalar: backslashes and double-quotes are backslash-escaped.
+    /// A value containing a newline scalar (`\n` or `\r`, alone or as CRLF) is rejected
+    /// with `onNewline(value)` — a newline cannot be represented inside a double-quoted
+    /// scalar on one line, and allowing it would let a crafted value inject arbitrary
+    /// YAML (S3). Returns the inner text to splice between quotes.
+    static func yamlDoubleQuoted(
+        _ value: String,
+        onNewline: (String) -> ConfigError = ConfigError.pathContainsNewline
+    ) throws -> String {
+        // Scalars, not Characters: `"\r\n"` is one Swift grapheme, so a Character-level
+        // `contains("\n")` let a CRLF value through.
+        guard !value.unicodeScalars.contains(where: { $0 == "\n" || $0 == "\r" }) else {
+            throw onNewline(value)
         }
-        return path
+        return value
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
     }

@@ -933,14 +933,18 @@ fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     let mut want: Vec<&str> = CORE_TOOLS.to_vec();
     want.sort_unstable();
     assert_eq!(names, want);
-    assert_eq!(app.tools.len(), 61);
+    assert_eq!(app.tools.len(), 65);
     for lit in [
         "flow.detail",
         "flow.mark",
         "flow.comment",
         "proxy.status",
+        "capture.status",
         "proxy.pause",
         "proxy.resume",
+        "proxy.system.status",
+        "proxy.system.set",
+        "proxy.system.unset",
         "flow.clear",
         "config.get",
         "scope.remove",
@@ -989,7 +993,7 @@ fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     assert_eq!(app.selected.as_deref(), Some("f50"));
 
     // With M4 merged the whole fixture is core: the core app equals the full one.
-    assert_eq!(fixture_app(200, 50).tools.len(), 61);
+    assert_eq!(fixture_app(200, 50).tools.len(), 65);
     let text = text_of(&app, 200, 50);
     assert!(text.contains("11 / 15 rows"), "{text}");
     assert!(text.contains("Agent ● all tools · 14/min"), "{text}");

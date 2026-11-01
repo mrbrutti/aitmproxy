@@ -2,8 +2,8 @@ import AitmproxyKit
 import AppKit
 import SwiftUI
 
-/// Working: Pinned, Saved · All: Apps, Domains · aitmproxy: Scope, Scan,
-/// Findings, Browser, Scripts, Agent (foundation §2.6). Flat `surface`, 28px rows,
+/// Traffic: Flows, Apps, Domains, Pinned, Connections, Overview · Testing: Scope, Scan,
+/// Findings, Browser · Automation: Scripts, Agent (spec §3). Flat `surface`, 28px rows,
 /// counts only on queues. Apps and Domains expand to one sub-item per
 /// client / host; a sub-item narrows the list (S-013); ⇧P pins one (S-014).
 struct SidebarView: View {
@@ -24,23 +24,9 @@ struct SidebarView: View {
             Rule()
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    group("Working")
-                    item(.pinned, count: session.pins.hosts.count + session.pins.apps.count)
-                    ForEach(session.pins.hosts.filter(matches), id: \.self) { host in
-                        subItem(.host(host), title: host, monogram: "◎", count: session.hosts.first { $0.0 == host }?.1, page: .pinned)
-                    }
-                    ForEach(session.pins.apps.filter(matches), id: \.self) { app in
-                        subItem(.client(app), title: app, monogram: String(app.prefix(1)),
-                                count: session.clients.first { $0.0.name == app }?.1, page: .pinned)
-                    }
-                    if session.page == .pinned, session.pins.isEmpty {
-                        hint("Nothing pinned — press ⇧P on a row.")
-                    }
-                    item(.saved, count: session.savedSessions)
-
-                    group("All")
-                    item(.overview)
-                    item(.connections)
+                    // Groups by the operator's jobs (spec §3): the main work window first.
+                    group("Traffic")
+                    item(.flows, count: session.rows.count)
                     item(.apps, count: session.clients.count)
                     if session.page == .apps || querying {
                         let visible = session.clients.filter { matches($0.0.name) }
@@ -58,13 +44,28 @@ struct SidebarView: View {
                             subItem(.host(host), title: host, monogram: "◎", count: count, page: .domains)
                         }
                     }
+                    item(.pinned, count: session.pins.hosts.count + session.pins.apps.count)
+                    ForEach(session.pins.hosts.filter(matches), id: \.self) { host in
+                        subItem(.host(host), title: host, monogram: "◎", count: session.hosts.first { $0.0 == host }?.1, page: .pinned)
+                    }
+                    ForEach(session.pins.apps.filter(matches), id: \.self) { app in
+                        subItem(.client(app), title: app, monogram: String(app.prefix(1)),
+                                count: session.clients.first { $0.0.name == app }?.1, page: .pinned)
+                    }
+                    if session.page == .pinned, session.pins.isEmpty {
+                        hint("Nothing pinned — press ⇧P on a row.")
+                    }
+                    item(.connections)
+                    item(.overview)
 
-                    group("aitmproxy")
+                    group("Testing")
                     item(.scope, count: session.scopeHosts.count, queue: true)
                     // Offered only when the core lists scan.discover; the count is the injection points found.
                     if session.scanEnabled { item(.scan, count: session.scan.points.count, queue: true) }
                     item(.findings, count: session.findingsCount, queue: true)
                     item(.browser, text: session.browserTabs == 1 ? "1 tab" : "\(session.browserTabs) tabs")
+
+                    group("Automation")
                     item(.scripts, text: "\(session.activeScripts) active")
                     item(.agent, text: "\(session.agentActionsLastMinute)/min", agent: true)
                 }
@@ -77,16 +78,18 @@ struct SidebarView: View {
         .dimsWhenInactive()
     }
 
-    /// `›•‹ aitmproxy  0.1` — the product mark in the accent, the wordmark in the UI face.
+    /// `›•‹ aitmproxy` — the product mark and wordmark, nothing else. Connection state has one
+    /// home, the toolbar's connection cluster (spec §4, revision 2); this row says nothing about it.
     private var brand: some View {
         HStack(spacing: Space.sm) {
             ProductMark().frame(width: 16, height: 16)
             Text("aitmproxy").font(Tok.Face.ui(Tok.Typography.Size.md, .medium)).foregroundStyle(Tok.Ink.primary.color)
-            Spacer()
-            Text(session.version).font(Tok.Face.data(Tok.Typography.Size.xs)).foregroundStyle(Tok.Ink.tertiary.color)
+            Spacer(minLength: 0)
         }
         .padding(.horizontal, Space.lg)
         .frame(height: Tok.Size.toolbar)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("aitmproxy")
     }
 
     /// Editorial section labels: small, tracked capitals in the tertiary tier.

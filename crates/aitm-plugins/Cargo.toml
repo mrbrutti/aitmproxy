@@ -9,6 +9,9 @@ description = "First-party feature plugins: capture, replay, intercept, mutate, 
 [dependencies]
 aitm-core.workspace = true
 aitm-rules.workspace = true
+# `SystemProxy::summary()` for the `proxy.status.system_proxy` sub-object (plan C14;
+# no cycle: aitm-sysproxy depends only on aitm-core and aitm-ca).
+aitm-sysproxy.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 time = { version = "0.3", features = ["formatting"] }

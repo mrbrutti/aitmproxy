@@ -6,6 +6,7 @@ import SwiftUI
 ///   APP_STORE=/tmp/x APP_SNAPSHOT=/tmp/shots ~/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy
 /// writes <page>-light.png and <page>-dark.png for every sidebar page, and
 /// settings-<tab>-light.png and settings-<tab>-dark.png for every Settings tab, then quits.
+/// Settings ▸ Capture also writes settings-capture-<off|awaiting|active|failed|noscope>-<mode>.png.
 /// Each PNG gets a <page>-<mode>-layout.json with the grid probes (tools/check-layout.swift).
 /// APP_SNAPSHOT_PAGES=apps,scope limits the pages. Add "settings" to include Settings.
 /// Add APP_ACCENT=<id> to see the pages in another accent. Snapshots always show the fixture session.
@@ -54,6 +55,9 @@ enum Snapshot {
             }
             for mode in ["light", "dark"] {
                 NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
+                // Scenes mutate the session (imports, sends, selections); start each appearance
+                // pass from the same fixture state so a light/dark pair differs only in appearance.
+                if Store.usesFixtures { session.loadFixtures() }
                 for page in SidebarPage.allCases where only?.contains(page.rawValue) ?? true {
                     session.page = page
                     try? await Task.sleep(for: .seconds(0.8))
@@ -64,7 +68,7 @@ enum Snapshot {
                     scene.apply(to: session)
                     try? await Task.sleep(for: .seconds(0.8))
                     capture(to: "\(dir)/\(scene.rawValue)-\(mode).png")
-                    if scene == .detached, let inspector = NSApp.windows.first(where: { $0.title == "Inspector" }) {
+                    if scene == .detached, let inspector = Snapshot.inspectorWindow() {
                         inspector.setContentSize(NSSize(width: 1100, height: 620))
                         try? await Task.sleep(for: .seconds(0.4))
                         capture(to: "\(dir)/\(scene.rawValue)-window-\(mode).png", window: inspector)
@@ -90,11 +94,32 @@ enum Snapshot {
                         capture(to: "\(dir)/settings-\(tab.rawValue)-\(mode).png", window: settings)
                     }
                 }
+                // The Capture tab above shows a build without the extension (the note). Here it is
+                // in each state the operator can meet: off, awaiting approval, capturing, failed.
+                session.settingsTab = .capture
+                for mode in ["light", "dark"] {
+                    NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
+                    for state in CaptureSnapshotState.allCases {
+                        state.apply(to: session)
+                        try? await Task.sleep(for: .seconds(0.8))
+                        let settings = NSApp.windows.first { $0.isVisible && $0 !== main && !$0.isSheet }
+                        capture(to: "\(dir)/settings-capture-\(state.rawValue)-\(mode).png", window: settings)
+                    }
+                }
+                CaptureSnapshotState.reset(session)
             }
             print("SNAPSHOT done \(dir)")
             // An open sheet refuses terminate, and the run would wait forever.
             for window in NSApp.windows { if let sheet = window.attachedSheet { window.endSheet(sheet) } }
             NSApp.terminate(nil)
+        }
+    }
+
+    /// The detached inspector window, found by its scene id: its title names the focused
+    /// flow (rule 19), so a title match would miss it.
+    static func inspectorWindow() -> NSWindow? {
+        NSApp.windows.first { window in
+            (window.identifier?.rawValue.hasPrefix("inspector") ?? false) || window.title == "Inspector"
         }
     }
 

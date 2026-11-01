@@ -12,9 +12,9 @@ The primary screen on fixtures and on a live `aitm`: usable for a day of watchin
 As the operator, I launch the app and see the sidebar, window toolbar, chip bar, flow list, intercept bar and status bar laid out as the mockup.
 Screens: apps
 Acceptance:
-- [snap] Sidebar 240 px with Working / All / aitmproxy groups in tracked small caps; brand mark `›•‹ aitmproxy` top-left; filter field at the bottom.
-- [snap] Toolbar holds sidebar toggle, pause capture, compose, clear; the listening pill in the centre; Agent toggle, palette and layout glyphs on the right; no glass capsules behind any group.
-- [snap] Chip bar 36 px with `All | HTTP HTTPS WebSocket | h1 h2 | JSON … Other` and the `Filters ▾` affordance; status bar 28 px on `raised`.
+- [snap] Sidebar 240 px with Traffic / Testing / Automation groups in tracked small caps; brand mark `›•‹ aitmproxy` top-left (a label, no status); filter field at the bottom.
+- [snap] Toolbar holds sidebar toggle, compose, clear; the connection cluster (pill, Proxy switch, Capture switch) in the centre; Agent toggle, palette and layout glyphs on the right; no glass capsules behind any group.
+- [snap] Chip bar 36 px with `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON … Other` and the `Filters ▾` affordance; status bar 28 px on `raised` with the list's facts only.
 - [self] Fixtures load 14 rows; the window opens at 1440×900 with a 1100×640 minimum.
 Status: done
 
@@ -249,20 +249,20 @@ UX:
 Status: done
 (Fixtures update locally; live `flow.mark`/`flow.comment` wait on S-core-F6 and surface a status-bar error until then.)
 
-### S-018 Pause capture and clear the session
-As the operator, I click pause in the toolbar to stop recording and clear to drop every flow; both are real proxy state.
+### S-018 Pause the proxy and clear the session
+As the operator, I flip the Proxy switch in the toolbar to stop recording and click clear to drop every flow; both are real proxy state, read back from the core.
 Screens: apps
 Depends: S-005
 Core: F7
 Acceptance:
-- [snap] Paused: the listening pill's dot is grey and reads `paused`; the toolbar glyph flips to record.
+- [snap] Paused: the toolbar's Proxy switch is off and the pill reads `paused`.
 - [self] Pause sends `proxy.pause`, resume `proxy.resume`, clear `flow.clear`; the list empties and the empty state returns.
 - [manual] Clear asks for confirmation when any flow is paused.
 UX:
-- Flow: toolbar pause (or View ▸ Pause Capture ⇧⌘R) -> pill dot grey, reads "paused", glyph flips to record -> click again to resume; toolbar trash (File ▸ Clear Session ⌘⌫) -> list empties -> empty state returns
+- Flow: toolbar Proxy switch (or View ▸ Pause Proxy ⇧⌘R) -> switch grey, pill reads "paused" -> click again to resume; toolbar trash (File ▸ Clear Session ⌘⌫) -> list empties -> empty state returns
 - Surface: inline toolbar toggles; Clear asks "Clear 2 paused flows too?" (confirmation dialog, destroys data) only when flows are paused, buttons "Clear" / "Cancel"
-- States: paused + new client traffic -> rows still flow? No: paused capture records nothing; the pill says so. Live bus without F7 -> status-bar error "Pause needs proxy.pause (F7)"; fixtures toggle locally
-- Words: "Pause Capture" / "Resume Capture", "Clear Session", tooltip "Pause capture (⇧⌘R)"
+- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"; fixtures toggle locally
+- Words: "Proxy" (the switch), "Pause Proxy" / "Resume Proxy", "Clear Session", tooltip "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
 - Access: both in the menu bar; the pill is a status, not a control, to VoiceOver
 Status: done
 (Fixtures toggle locally; live `proxy.pause/resume`/`flow.clear` wait on S-core-F7 and surface a status-bar error until then.)
@@ -461,13 +461,14 @@ Status: done
 ## M3 Filter & find
 
 ### S-030 Filter by content type with the chip bar
-As the operator, I click a chip (or press ⌘1…9) and the list narrows to that protocol or content type.
+As the operator, I click a chip (or press ⌘1…9) and the list narrows to that protocol, transport or content type.
 Screens: apps
 Depends: S-002
 Acceptance:
 - [snap] One chip active on `raised` at 500 weight; separators between groups.
-- [self] JSON narrows the list; WebSocket keeps only WS flows; All restores.
-- [unit] `ContentCategory.classify` maps content types; h1/h2 look at the HTTP version.
+- [self] JSON narrows the list; WebSocket keeps only WS flows; TCP / UDP / L4 keep the raw-L4 rows by transport; All restores.
+- [unit] `ContentCategory.classify` maps content types; h1/h2 look at the HTTP version; tcp/udp/l4 look at `FlowRow.l4` (ST-AC11).
+- [hover] Every chip says what it keeps.
 Status: done
 
 ### S-031 Stack filters in the filter bar
@@ -634,23 +635,25 @@ UX:
 - States: invalid regex / empty URL -> inline error under the field, Save disabled; no rules -> "Every request pauses" note; live before F3 -> rules kept locally and the bar says "rules need F3"
 - Words: sheet title "Breakpoint Rules"; buttons "Add Rule", "Remove", "Test your rule", "Save ⌘⏎", "Cancel"
 - Access: table rows selectable by keyboard; form fields in reading order
+Live: 2026-10-31, the first time the rules reached a real core (PR #202): `flow.intercept` accepts the app's rule set, a request rule `park` parks `/park` and lets `/` through, a response rule parks the response head (live self-test). The rule `flag` stays in the app and is not applied on park yet — follow-up.
 Status: done
 
 ### S-041 Intercept and edit a response
 As the operator, I pause at the response phase and change status, headers or body before the client sees it.
-Screens: edit-paused
+Screens: apps (the inspector on the flow list; no snapshot scene — fixture scenes are not evidence and are being removed, Matt 2026-10-31)
 Depends: S-037, S-040
 Core: F3
 Acceptance:
-- [snap] The summary pill reads `Paused · response`; the Response pane becomes editable like the request.
-- [self] Apply & Resume sends the response edits then `flow.resume`; the Edited pencil appears.
+- [live] The summary pill reads `Paused · response`; the Response pane becomes editable like the request (real core, real parked response).
+- [live] Apply & Resume sends the response edits then `flow.resume`; the client receives them; the Edited pencil appears (live self-test + screenshots).
 UX:
 - Flow: a rule with ☑ Response pauses at the response -> summary pill `Paused · response` -> Response pane editable (status, headers, body) -> Apply & Resume
 - Surface: inline in the inspector
 - States: before F3 nothing pauses at the response; the pill never shows
 - Words: pill "Paused · response"; footer as the request editor's
 - Access: same as S-037
-Status: todo
+Live: 2026-10-31, dev bundle with the release core, a curl parked at the response head under a response rule, edited in the Raw editor by real keystrokes, Apply & Resume (⌘⏎): curl received `HTTP/1.1 203` + `x-aitm-edited: 1` (`docs/evidence/S-041/`). Body edits reach the client too (live self-test). Rules… had never reached a live core before this (FIXLOG 2026-10-31).
+Status: done
 
 ### S-042 Compose a request
 As the operator, I press ⌘N (or `n`) and fill method, URL, headers, query and body in a sheet, pick a template, and Send; the result appears as a new flow.
@@ -741,7 +744,7 @@ Screens: scope, scope-sheet
 Depends: S-005
 Acceptance:
 - [snap] The Scope page lists entries with their limit readout (`10 req/s · back-off 2×`) and the count of flows in scope; the sheet has a text field with validation and `Add ⌘⏎`.
-- [unit] Entry validation accepts the three forms and rejects schemes and paths; `hostMatches` handles wildcard and port.
+- [unit] Entry validation accepts the three forms and rejects schemes and paths; `Scope.matches` (Kit, the one in-scope rule the poll uses too) handles wildcard and port.
 - [self] `scope.add` is sent; the Scope count in the sidebar and `N hosts in scope` in the status bar update; affected rows lose their dimming.
 UX:
 - Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once
@@ -1151,6 +1154,37 @@ UX:
 - Access: none
 Notes: two Strong cards done as pure moves — `Session` split into state + `Session+Verbs/Editing/Filters/Palette` (809 → 406 lines), `FlowColumn`/`Density` out of `FlowTableView.swift` (542 → 430). No file past 600. Carried: one verb table for row actions (next Strong, before S-041/S-045), viewers behind one `ViewerKind` (with S-045). `docs/ARCHITECTURE.md` and `docs/FIXLOG.md` started.
 Status: done
+
+### S-079 The flow list follows the capture on every page
+As the operator, I watch the Flows page (or any list page) and every change the poll brings — a new row, a parked row resumed, a status landing — is drawn within the poll interval, without switching pages.
+Screens: apps
+Depends: S-002, S-005
+Acceptance:
+- [live] Dev bundle with a real core, Flows page, intercept armed from the Flow menu: a curl parks and its row appears within a poll; Flow ▸ Resume turns the row to its status within a poll; a second curl's row appears; no page switch (before/after screenshots in `docs/evidence/S-079/`).
+- [live] The same on the Apps page (unchanged).
+Live: 2026-10-31, found on the installed v0.5.6 during the S-041 check (FIXLOG 2026-10-31 "The Flows page stopped redrawing"); S-073 to S-078 are reserved for the Proxyman capture-flow stories drafted in `docs/research/proxyman-capture-flow-gaps.md`.
+Status: done
+
+### S-072 See what is running and what to do first
+As the operator, on a fresh launch I land on a Status page that shows the core, the bus and the capture extension — each with a state word, one fact and its control — and a live Getting-started list, so I never have to guess which sidebar item to look at or why no flows appear.
+Screens: status, status-ok, status-fresh, status-external, status-core-starting, status-core-stopped, status-core-failed, status-bus-connecting, status-bus-agent, status-bus-token, status-scope-empty, status-waiting, status-degraded
+Depends: S-063, S-070, core F1
+Spec: `docs/superpowers/specs/2026-10-31-macos-status-page-and-first-run-design.md`
+Acceptance:
+- [unit] `ConnectionSummary.make` yields the spec's word table for every core × bus × capture state; no lane word says "Capturing" while the scope is empty (ST-AC1/2).
+- [snapshot] The Status page renders every lane state in light + dark with no clipping; grid-lint + check-layout PASS (ST-AC3).
+- [self-test] A fixture session's lanes read "not running / connected / no extension"; Open Scope, Open Browser and Core Log from Status call the same entries as their menu items; Proxy ▸ Status (⌘0) is in the menu bar and the command map (ST-AC4/6).
+- [structural] The toolbar cluster, Status page, Core Log header and Settings rows take their words only from `ConnectionSummary` (ST-AC5); the sidebar and the status bar carry no connection state (ST-AC10).
+- [self-test] The toolbar's Proxy switch is live only while the bus is connected as operator and flips through `setCapturing`; its position and the pill's "paused" / "intercept armed" are the core's facts from `proxy.status`. The Capture switch's position is the lane's fact (in-flight choice overriding); it stands down, with the reason in its help, when the extension is not in the build, the core is external or a switch is in flight (ST-AC9).
+- [manual] On the notarized app: fresh launch lands on Status; the cards read the real state; Turn Off/On Capture from the card changes Settings ▸ Capture within one poll; adding a host ticks the step; the first flow ticks the last step (ST-AC7).
+UX:
+- Flow: launch (fresh install) → Status → read the three lanes → click the one remedy (Turn On Capture / Open Scope… / Restart Core) → the step ticks → first flow appears in Recent → click it → Domains with the flow selected. Returning: launch → last page; ⌘0 or the toolbar pill → Status. Any page: the Proxy and Capture switches beside the pill flip without leaving it.
+- Surface: sidebar page (a place the operator comes back to); controls inline on the lane cards; destructive Uninstall behind ⋯ with a confirmation dialog. The two everyday controls (Proxy on/paused, Capture on/off) are inline toolbar switches — they change one value already on screen — in the one connection cluster; the brand row and status bar show nothing about connection (Matt's review 2).
+- States: each lane ok / working / off / warning / error with word + detail + remedy; Getting started rows done (✓, stays) or pending (○ + one action), collapsing to one line when all done; Recent "No flows yet — point a client at <address>".
+- Words: Status, Core, Bus, All Apps, Proxy (the switch) / Pause Proxy / Resume Proxy, All Apps (the switch) / Capture All Apps / Stop Capturing All Apps, Restart Core, Reconnect, Open Scope…, Core Log…, Open Browser, Copy Address, Uninstall Extension…, Getting started (GLOSSARY).
+- Access: every card action has a menu-bar twin with a shortcut; dots carry "Core: running" labels; the switches carry label + on/off value + help with the reason, never colour alone (VoiceOver read-out is ST-AC12, open).
+Notes: the capture lane maps PR #181's `CaptureAdvice` 1:1; until the provider stops claiming DNS, the scope step says to add `host:443`. A core `capture.status` verb (proposed) will sharpen the capture detail through `CoreCaptureStatus` without a UI change.
+Status: in progress
 
 ---
 
