@@ -238,13 +238,21 @@ G92. Panel history in doc comments (`ui/scan/mod.rs` hints doc, `ui/scan/jobs.rs
 
 G93. The live cell's T7-20 grep and T7-19 point set follow the amended ACs: each screen sample is tagged with the surface it was taken on (`scan` for the four tabs and their overlays, `inspector` while a flow detail is open, `other`), the T7-20 grep covers `scan` samples only and the failure detail names the sample index and tag; after G20 lands (orphan points kept) the T7-19 comparison covers every point of the live `scan.sitemap` result, not only those attached to a listed node (drop the attached-only filter, keep the count line). Verified by `python3 -m py_compile` and the discovery dry run; the real run stays Terminal-only.
 
+## Task 15 quality panel (the Python cell)
+
+G94. **Important (evidence integrity).** `Checks.note` lands in `summary.txt` and the pass tally as `ok` (`tests/e2e/tui/test_tui_scan_live.py` `Checks.note`, `lines()`, the head line): three-state results (`ok`/`FAIL`/`note`), `note ` printed in `lines()` and the summary, the head line reads `PASS: <n> ok, <m> noted, 0 failed` (exit code unchanged, notes are not failures).
+
+G95. **Important (vacuous pass).** A missing `l4-stream-safe` profile turns all of T7-18 into a passing note (`step_t7_18`): `c.check("T7-18: the Profiles list carries l4-stream-safe", False, names)` and return; the only sanctioned skip inside T7-18 stays the `l4.scope.add` refusal. The T7-18 `y` check compares the TUI outcome with the harness's own `scan.start`: `(row_shown and harness_job) or (refusals and harness_job is None)`, and on a refusal the wording's code matches the harness answer's code.
+
+G96. Cell robustness and hygiene: `tab()` waits on a tab-specific marker (Issues footer `S severity · C confidence`, Jobs footer `x cancel · ⏎ issues of this job`, Site map `Nodes` pane title, Profiles `name  lanes`) instead of the strip text present on every tab; the T7-16 early-break predicate and the phase-change assertion use one filtered `phases` list; `host_label` uses `node.get("port") or default`; one `wait_field(read, key, want, timeout)` helper replaces the four `dict.update(..) or` waits; the three fixed sleeps (after `P`, after `J`, the node walk) become polls on the expected text; the `Esc` after re-entering Scan from the inspector runs only when the Detail pane is focused (or the row is re-selected with `cursor_to`); delete `found["state"]`, `Ctx.status_pairs`, the `reopen_scan` alias and the unreachable outer `except Fatal`.
+
 ## Dispatch (2026-11-01, after Task 14 lands)
 
 Round G runs as two fix Coders in sequence in the one worktree, each committing by explicit path as `fix(tui-scan): G<ids> <title>` with reproducing tests first for every behaviour item, followed by one combined panel over both ranges.
 
 **Round G-A (behaviour, bounds, security, spec rulings)**, first, while the Task 14 panel runs: G10, G11, G12, G13, G14, G15, G16, G17, G18, G19, G20, G21, G22, G31, G33, G35, G36, G37, G42, G45, G46, G47, G48, G49, G50, G51, G52, G53, G54, G57, G61, G66, G67, G71, G72, G73, G74, G75, G82, G83. Priority order inside the round: G82, G45 (+G53), G51, G52, G20, G22, G61 (+G14), then the rest by number.
 
-**Round G-B (structure, hygiene, tests)**, after G-A is committed: G1, G2, G3, G5, G6, G7, G8, G9, G23, G24, G25, G26, G27, G28, G29, G30, G32, G34, G38, G39, G40, G41, G43, G44, G55, G56, G58, G59, G60, G62, G63, G64, G65, G68, G69, G70, G76, G77, G78, G79, G80, G81, G84, G85, G86, G87, G88, G89, G90, G91, G92, G93 (the Python cell, last). G88 first in G-B (test evidence) (appended below as G84+ before G-B is dispatched).
+**Round G-B (structure, hygiene, tests)**, after G-A is committed: G1, G2, G3, G5, G6, G7, G8, G9, G23, G24, G25, G26, G27, G28, G29, G30, G32, G34, G38, G39, G40, G41, G43, G44, G55, G56, G58, G59, G60, G62, G63, G64, G65, G68, G69, G70, G76, G77, G78, G79, G80, G81, G84, G85, G86, G87, G88, G89, G90, G91, G92, G93, G94, G95, G96 (the Python cell, done last as one group; G94 and G95 are Important). G88 first in G-B (test evidence) (appended below as G84+ before G-B is dispatched).
 
 Each Coder may touch only the files its items name plus the test files that reproduce them; neither touches `CORE_TOOLS`, `fixtures/bus-fixture.json`, nor `docs/**`.
 

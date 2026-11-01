@@ -602,6 +602,13 @@ Kept by the main session during stage 6. One row per finding.
 | 15 | coder note | Minor | AC 17's `P` trigger said `finding_id`; D11 keys on `poc_ref` | spec AC 17 amended |
 | 15 | coder note | Minor | `q` is Back inside Scan; the cell presses `Esc` first | spec AC 20 amended |
 | 15 | coder note | Minor | sandbox run dies at target boot (socket-bind denial); engine skip untested here | expected; the Terminal run is the orchestrator's (Task 17) |
+| 15 | quality | Important | `Checks.note` recorded as `ok` in the summary and the pass tally | fix round G-B (G94): three-state results |
+| 15 | quality | Important | a missing `l4-stream-safe` profile makes T7-18 a passing note; the `y` check does not compare with the harness's `scan.start` | fix round G-B (G95) |
+| 15 | quality | Minor | `tab()` waits on a marker present on every tab | fix round G-B (G96) |
+| 15 | quality | Minor | T7-16 early-break counts an unparsed state cell as a phase change | fix round G-B (G96) |
+| 15 | quality | Minor | `host_label` renders `host:None` without a `port` | fix round G-B (G96) |
+| 15 | quality | Minor | four `dict.update(..) or` waits; three fixed sleeps; unconditional `Esc` after the inspector; dead data and an unreachable handler | fix round G-B (G96) |
+| 15 | quality | note | three copies of the VT100 `Screen`/`Terminal` model across the TUI cells | follow-up outside this track: lift into `aitm_e2e/pty.py` (T10 owns the harness) |
 
 ## Shipped
 
