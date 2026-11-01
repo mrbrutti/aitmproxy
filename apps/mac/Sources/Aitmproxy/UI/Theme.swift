@@ -66,9 +66,9 @@ final class ThemeStore {
     }
 
     private init() {
-        // APP_ACCENT picks the accent for a run; otherwise the operator's choice, except in a
-        // snapshot, self-test or fixture run (`Store.isOverridden`), which shows the default
-        // so a harness never inherits the operator's accent.
+        // APP_ACCENT picks the accent for a run; otherwise the operator's choice, except when
+        // `APP_STORE` redirects the store (`Store.isOverridden`: a dev bundle or harness run),
+        // which shows the default so such a run never inherits the operator's accent.
         themeID = ProcessInfo.processInfo.environment["APP_ACCENT"]
             ?? (Store.isOverridden ? Self.defaultID : UserDefaults.standard.string(forKey: "appearance.accent") ?? Self.defaultID)
         NotificationCenter.default.addObserver(forName: NSColor.systemColorsDidChangeNotification,

@@ -329,7 +329,7 @@ final class Session {
         if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
         // The Scope page shows the embedded core's persisted scope before the bus
         // connects; `refreshScope()` replaces it with the core's `scope.list` on connect (D5).
-        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence().load() ?? .embedded,
+        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded,
                                        bundledCorePresent: EmbeddedCore.discoverBundled() != nil,
                                        usesFixtures: Store.usesFixtures) {
             scopeHosts = EmbeddedScope.load(from: scopeURL).hosts
