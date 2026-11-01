@@ -32,6 +32,11 @@ final class BusService: FlowActions {
     /// Settings core — so waiting for the embedded core to come up does not latch
     /// onto some other core the operator happens to be running.
     @ObservationIgnored private var preferEmbedded = false
+    /// The current run's number. `stop()` retires a run by bumping it; a run owns the
+    /// connection — and may write `client`, `session.bus`, the role, `serverInfo`, `tools`,
+    /// `session.listenAddress`, `session.commandRunner`, the poll's session data — iff its
+    /// `generation` still equals this. A superseded run owns nothing but its own socket.
+    @ObservationIgnored private var runGeneration = 0
 
     init(session: Session) { self.session = session }
 
@@ -65,21 +70,30 @@ final class BusService: FlowActions {
     /// Connects (and keeps reconnecting with back-off) until `stop()`.
     func start() {
         stop()
-        runTask = Task { await run() }
+        runTask = Task { await run(generation: runGeneration) }
     }
 
     func stop() {
         runTask?.cancel()
         runTask = nil
+        // Retire the run as well as wake it: cancellation makes its sleeps throw, the bump (the
+        // single bump site) takes its ownership, so whatever it still does, it writes nothing shared.
+        runGeneration += 1
         if let client { Task { await client.disconnect() } }
         client = nil
         session.bus = .disconnected
         session.applyResolvedRole(nil)
     }
 
-    private func run() async {
+    /// One connection after another until `stop()`. `generation` is this run's number: every
+    /// shared write after a suspension point happens only while it still equals `runGeneration`,
+    /// so a run that a later `start()` or `stop()` retired closes its own socket and does nothing else.
+    private func run(generation: Int) async {
+        func owns() -> Bool { generation == runGeneration }
         var backoff: Duration = .seconds(1)
-        while !Task.isCancelled {
+        // Cancellation is the wake-up (it is what makes the sleeps throw); ownership is the write
+        // permission. Both stay, so a cancelled task can never spin on sleeps that return at once.
+        while !Task.isCancelled && owns() {
             let resolved = preferEmbedded ? endpointOverride : (endpointOverride ?? Self.resolveEndpoint())
             guard let endpoint = resolved else {
                 session.bus = preferEmbedded ? .connecting("embedded core") : .failed("no bus configured")
@@ -100,24 +114,36 @@ final class BusService: FlowActions {
             }
             do {
                 let info = try await client.connect()
+                // A superseded run owns nothing but its own socket.
+                guard owns() else { await client.disconnect(); return }
                 serverInfo = info
                 session.bus = .connected(address)
                 session.applyResolvedRole(info.role)
                 session.listenAddress = Self.listenAddress() ?? session.listenAddress
-                tools = (try? await client.listTools()) ?? []
+                let listed = (try? await client.listTools()) ?? []
+                // Same: the tools and the palette's runner are the owner's to publish.
+                guard owns() else { await client.disconnect(); return }
+                tools = listed
                 session.tools = tools
                 session.commandRunner = { [weak self] name, args in
                     guard let self, let client = self.client else { throw BusError.disconnected }
                     return try await client.call(name, args)
                 }
                 await refreshScope()
+                // Same, before the poll takes over the session's rows.
+                guard owns() else { await client.disconnect(); return }
                 backoff = .seconds(1)
-                try await pollLoop(client)
+                try await pollLoop(client, generation: generation)
             } catch {
-                session.bus = .failed(Self.describe(error))
-                session.applyResolvedRole(nil)
+                // Only the owner reports a loss; a run retired mid-flight has nothing to say.
+                if owns() {
+                    session.bus = .failed(Self.describe(error))
+                    session.applyResolvedRole(nil)
+                }
             }
             await client.disconnect()
+            // A superseded run owns nothing but its own socket: closing it was its last act.
+            guard owns() else { return }
             self.client = nil
             if Task.isCancelled { break }
             try? await Task.sleep(for: backoff)
@@ -127,7 +153,8 @@ final class BusService: FlowActions {
 
     /// Polls `flow.list`, fetches summaries for new and in-flight flows, and
     /// rebuilds the rows oldest-first. Finished flows are not re-fetched.
-    private func pollLoop(_ client: BusClient) async throws {
+    private func pollLoop(_ client: BusClient, generation: Int) async throws {
+        func owns() -> Bool { generation == runGeneration }
         throughput.reset()
         refetch.reset()
         // However this connection ends — stop(), or a core that went away — no
@@ -136,7 +163,7 @@ final class BusService: FlowActions {
             session.upBytesPerSecond = 0
             session.downBytesPerSecond = 0
         }
-        while !Task.isCancelled {
+        while !Task.isCancelled && owns() {
             // Scope first: `inScope` below and the capture advice (Settings ▸ Capture, the Apps
             // banner) read `scopeHosts`, and a host added from the CLI or another client must
             // not leave them claiming an empty scope.
@@ -146,10 +173,15 @@ final class BusService: FlowActions {
             // one poll, and a relaunch against an already-paused core starts out saying so.
             await refreshProxyStatus()
             let ids = try await client.call("flow.list").arrayValue?.compactMap { $0.stringValue }.map(FlowID.init) ?? []
+            // A superseded run owns nothing but its own socket; even the refetch bookkeeping is the owner's.
+            guard owns() else { return }
             for id in ids {
                 let cached = summaries[id]
                 guard refetch.shouldFetch(id, cached: cached) else { continue }
-                if let json = try? await client.call("flow.get", ["id": .string(id.raw)]), let summary = FlowSummary(json: json) {
+                let json = try? await client.call("flow.get", ["id": .string(id.raw)])
+                // A superseded run owns nothing but its own socket; the cache is the owner's.
+                guard owns() else { return }
+                if let json, let summary = FlowSummary(json: json) {
                     // ↑ is what clients sent (request bodies), ↓ what came back (response
                     // bodies): each flow's growth since its last summary joins the totals.
                     throughput.record(previous: cached, current: summary)
@@ -157,6 +189,8 @@ final class BusService: FlowActions {
                     refetch.didFetch(id, summary: summary)
                 }
             }
+            // Likewise the rows and rates this iteration publishes: no await from here to the sleep.
+            guard owns() else { return }
             let known = Set(ids)
             summaries = summaries.filter { known.contains($0.key) }
             refetch.retain(known)
