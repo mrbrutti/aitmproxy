@@ -175,14 +175,12 @@ struct MainView: View {
             } else if session.page == .connections {
                 ConnectionDashboard().frame(height: 260)
                 Rule()
-            } else if session.scopeHosts.isEmpty, case .connected = session.bus {
-                ScopeBanner()
-                Rule()
             }
-            if session.page == .apps, session.clients.isEmpty, !session.rows.isEmpty {
-                // Captured flows exist but carry no source app, so this page cannot group them.
-                // Keep the table (captured flows are never hidden) and say why in one line.
-                AppsAttributionBanner()
+            // The one banner line on every list page (spec 2026-10-31-mac-traffic-route-advice-design
+            // D5/D8): the closed routes' state words and one remedy button while flows exist; nothing
+            // when nothing is closed. The table stays: captured flows are never hidden behind it.
+            if session.trafficRoutes.banner != nil {
+                RouteBanner()
                 Rule()
             }
             if session.splitView {
@@ -248,7 +246,7 @@ struct MainView: View {
                              onCompose: { session.openCompose() })
         .overlay {
             if session.visibleRows.isEmpty {
-                EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress)
+                EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress, routes: session.trafficRoutes.advice)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -305,23 +303,44 @@ struct BuildPoCTarget: Identifiable {
     let id: FlowID
 }
 
-/// "No flows yet — point a client at 127.0.0.1:8080 or open the browser." (foundation §2.8)
+/// "No flows yet — point a client at 127.0.0.1:8080 or open the browser." (foundation §2.8). Unfiltered,
+/// with closed routes to name (`routes`, the Kit's `TrafficRoutes.advice`), one row per entry with its
+/// buttons takes the generic line's place (spec 2026-10-31-mac-traffic-route-advice-design D4); the
+/// routes come in as a parameter so the view stays a function of its inputs.
 struct EmptyFlows: View {
     var filtered: Bool
     var listen: String
+    var routes: [TrafficRoute]
+    @Environment(Session.self) private var session
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         VStack(spacing: Space.sm) {
             Text(filtered ? "No flows match" : "No flows yet")
                 .font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
-            Text(filtered ? "Clear the chip or the filter to see the capture."
-                 : "Point a client at \(listen) or open the browser.")
-                .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+                .allowsHitTesting(false)
+            if filtered {
+                Text("Clear the chip or the filter to see the capture.")
+                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+                    .allowsHitTesting(false)
+            } else if routes.isEmpty {
+                Text("Point a client at \(listen) or open the browser.")
+                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+                    .allowsHitTesting(false)
+            } else {
+                VStack(alignment: .leading, spacing: Space.md) {
+                    ForEach(routes, id: \.kind) { route in
+                        RouteAdviceRow(route: route) { action in
+                            RouteActions.run(action, session: session, openSettings: openSettings)
+                        }
+                    }
+                }
+                .padding(.top, Space.sm)
+            }
         }
         .multilineTextAlignment(.center)
         .padding(.top, Tok.Size.columnHeader)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .allowsHitTesting(false)
     }
 }
 

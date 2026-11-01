@@ -308,6 +308,7 @@ private struct StepRow: View {
             }
         }
         .frame(height: Tok.Size.Row.default)
+        .help(step.detail ?? step.title)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(step.done ? "Done" : "To do"): \(step.title)")
     }
