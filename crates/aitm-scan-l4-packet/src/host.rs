@@ -491,6 +491,14 @@ impl PointRunner {
         self.report(job_id);
     }
 
+    /// Stop the job because `what` no longer builds, and hand back the reason
+    /// the caller records. See [`craft_stop`].
+    fn stop_on_craft(&self, what: &str, message: &str) -> StopReason {
+        let reason = craft_stop(what, message);
+        self.stop(reason.clone());
+        reason
+    }
+
     /// Hand the job's counters to the engine through the integration shim.
     fn report(&self, job_id: &str) {
         if let Some(counters) = self.shared.state.counters(job_id) {
@@ -696,9 +704,14 @@ impl PointRunner {
                 run.stopped = Some(reason);
                 return run;
             }
-            // The seed was built at discovery time, so this is unreachable
-            // short of a guard ceiling change mid-job; the point sends nothing.
-            Err(HostError::Craft(_)) => return run,
+            // Seed 0 was built once in `PointRunner::new` and the built
+            // spec is cached, so this is unreachable: `build()` is pure and
+            // never consults the guard. If it is ever reached the job stops
+            // rather than reporting a point that sent nothing (finding N5).
+            Err(HostError::Craft(message)) => {
+                run.stopped = Some(self.stop_on_craft(SEED0, &message));
+                return run;
+            }
         }
 
         let timing = self.shared.timing;
@@ -880,7 +893,10 @@ impl PointRunner {
                         run.stopped = Some(reason);
                         break;
                     }
-                    Err(HostError::Craft(_)) => break,
+                    Err(HostError::Craft(message)) => {
+                        run.stopped = Some(self.stop_on_craft(SEED0, &message));
+                        break;
+                    }
                 }
             }
         }
@@ -899,7 +915,9 @@ impl PointRunner {
         let first = match self.liveness_probe().await {
             Ok(passed) => passed,
             Err(HostError::Stopped(reason)) => return (false, false, Some(reason)),
-            Err(HostError::Craft(_)) => return (true, true, None),
+            Err(HostError::Craft(message)) => {
+                return (true, true, Some(self.stop_on_craft(SEED0, &message)))
+            }
         };
         if first && !always {
             return (true, true, None);
@@ -908,7 +926,9 @@ impl PointRunner {
         match self.liveness_probe().await {
             Ok(second) => (first, second, None),
             Err(HostError::Stopped(reason)) => (first, false, Some(reason)),
-            Err(HostError::Craft(_)) => (first, true, None),
+            Err(HostError::Craft(message)) => {
+                (first, true, Some(self.stop_on_craft(SEED0, &message)))
+            }
         }
     }
 
@@ -961,7 +981,10 @@ impl PointRunner {
                         triage.stop = Some(reason);
                         return triage;
                     }
-                    Err(HostError::Craft(_)) => return triage,
+                    Err(HostError::Craft(message)) => {
+                        triage.stop = Some(self.stop_on_craft(SEED0, &message));
+                        return triage;
+                    }
                 }
             } else {
                 // The previous replay did not reproduce the candidate, so its
@@ -994,7 +1017,12 @@ impl PointRunner {
                     triage.stop = Some(reason);
                     return triage;
                 }
-                Err(HostError::Craft(_)) => return triage,
+                // Not seed 0: the case's own spec, which `deliver` already
+                // built once before this replay (finding N5).
+                Err(HostError::Craft(message)) => {
+                    triage.stop = Some(self.stop_on_craft("the replayed case", &message));
+                    return triage;
+                }
             };
             // Only a replay that actually went out is an attempt: a `deliver`
             // the charge or the wire refused never reached the target, so it is
@@ -1046,6 +1074,24 @@ impl PointRunner {
         }
         Ok(false)
     }
+}
+
+/// What [`craft_stop`] calls the lane's one cached seed.
+const SEED0: &str = "seed 0";
+
+/// The stop a craft failure raises: `what` no longer builds, so the stimulus
+/// never reached the wire and the run cannot be read as a clean one (review
+/// finding Q1). One mapping for every site, so none of them can answer a
+/// craft failure differently from the others (review finding N5).
+///
+/// Nothing reachable produces one. Seed 0 is built once in
+/// [`PointRunner::new`] and the built spec is cached; a case is built by its
+/// first `deliver` before any replay reuses it; and `PacketSpec::build` is
+/// pure — it never consults the `L4Guard`, so no mid-job ceiling change can
+/// make it start failing. The arms exist because the error type admits the
+/// case, and this says what the lane does with it.
+fn craft_stop(what: &str, message: &str) -> StopReason {
+    StopReason::Unavailable(format!("{what} no longer builds: {message}"))
 }
 
 /// The `L4Error::Unavailable` message for a `send_recv` task that did not
@@ -1180,15 +1226,9 @@ impl ProbeHost for PacketHost {
             let spec = PacketSpec {
                 layers: vec![Layer::Raw(bytes)],
             };
-            // The seed id is read off the plan's corpus, not rebuilt into a
-            // packet (review finding M8).
-            let seed_id = self
-                .runner
-                .plan
-                .seeds
-                .first()
-                .map(|seed| seed.id.clone())
-                .unwrap_or_default();
+            // The seed id is the one the runner already owns, not a packet
+            // rebuilt from the plan (review findings M8/N4).
+            let seed_id = self.runner.seed0.id.clone();
             let sent = self
                 .runner
                 .replay(spec, &seed_id, vec![payload.value.clone()], 0)
@@ -1309,7 +1349,8 @@ mod tests {
     use aitm_scan_model::{JobCtx, L4Counters, Payload, PayloadMode, ProbeHost};
 
     use super::{
-        join_error_message, HostError, PacketHost, PointRunner, RunnerRegistry, Shared, Timing,
+        craft_stop, join_error_message, HostError, PacketHost, PointRunner, RunnerRegistry, Shared,
+        Timing,
     };
     use crate::codec::hex_encode;
     use crate::oracle::CaseClass;
@@ -2730,5 +2771,29 @@ mod tests {
             2 * spacing
         );
         assert_eq!(mock.inject_count(), 1 + 7 + 2 + 1 + 3 * 3);
+    }
+
+    /// Review finding N5: every craft failure the runner can meet maps to one
+    /// stop shape, so the sites that must handle one cannot diverge into four
+    /// different answers.
+    ///
+    /// No reachable path produces one: seed 0 is built once in
+    /// [`PointRunner::new`] and the built spec is cached, a case is built in
+    /// its first `deliver` before any replay reuses it, and
+    /// `PacketSpec::build` is pure — it never consults the guard, so no
+    /// mid-job ceiling change can make it start failing. The mapping is
+    /// therefore pinned here on its own.
+    #[test]
+    fn a_craft_failure_maps_to_one_unavailable_stop() {
+        assert_eq!(
+            craft_stop("seed 0", "the packet is 65536 bytes, max 65535"),
+            StopReason::Unavailable(
+                "seed 0 no longer builds: the packet is 65536 bytes, max 65535".to_string()
+            )
+        );
+        assert_eq!(
+            craft_stop("the replayed case", "no such layer").to_string(),
+            "l4 unavailable: the replayed case no longer builds: no such layer"
+        );
     }
 }
