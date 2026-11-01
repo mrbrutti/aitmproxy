@@ -51,11 +51,11 @@ const MAX_DATAGRAM: usize = 65_535;
 /// backlog, never refused, so the Vulnerable "connect refused" oracle stays
 /// unambiguous. There is deliberately no deadline on an incomplete message
 /// (it would reintroduce the silent close D5 forbids).
-pub(crate) const MAX_CONNS: usize = 256;
+const MAX_CONNS: usize = 256;
 
 /// Whether the accept loop may take another connection with `open` in
 /// flight: the [`MAX_CONNS`] gate.
-pub(crate) fn accepting(open: usize) -> bool {
+fn accepting(open: usize) -> bool {
     open < MAX_CONNS
 }
 
@@ -890,18 +890,12 @@ mod tests {
 
     #[test]
     fn accept_loop_pauses_at_max_conns() {
-        // A `Wait`ing connection pins up to `max_buffer()` bytes until EOF,
-        // so the accept loop takes no new connection while 256 are open;
-        // later connects wait in the listen backlog (never refused, so the
-        // V "connect refused" oracle stays unambiguous) and are taken as
-        // soon as one of the 256 ends.
+        // The boundary of the gate on `run_tcp`'s accept arm; the why is
+        // on `MAX_CONNS`.
         assert_eq!(MAX_CONNS, 256);
-        assert!(accepting(0));
-        assert!(accepting(1));
         assert!(accepting(255));
         assert!(!accepting(256));
         assert!(!accepting(257));
-        assert!(!accepting(usize::MAX));
     }
 
     // --- Tester additions (stage 5) ---

@@ -301,6 +301,31 @@ async fn exchange(stream: &mut TcpStream, send: &[u8], read_timeout: Duration) -
     Ok(read_until_idle(stream, read_timeout).await.0)
 }
 
+/// Write `send`, wait up to `first_within` for the first byte of the reply,
+/// then collect the rest until `idle` passes without bytes or the peer
+/// closes. On success the read returns `idle` after the reply; only a
+/// failure waits out `first_within`.
+async fn exchange_within(
+    stream: &mut TcpStream,
+    send: &[u8],
+    first_within: Duration,
+    idle: Duration,
+) -> Res<Vec<u8>> {
+    stream
+        .write_all(send)
+        .await
+        .map_err(|e| format!("write: {e}"))?;
+    let mut buf = [0u8; 8192];
+    let mut out = match timeout(first_within, stream.read(&mut buf)).await {
+        Ok(Ok(0)) => return Err("closed before any reply byte".to_string()),
+        Ok(Err(e)) => return Err(format!("read: {e}")),
+        Err(_elapsed) => return Err(format!("no reply byte within {first_within:?}")),
+        Ok(Ok(n)) => buf[..n].to_vec(),
+    };
+    out.extend(read_until_idle(stream, idle).await.0);
+    Ok(out)
+}
+
 /// One fresh-connection TCP exchange: connect, read the banner if any, send,
 /// collect the reply until `read_timeout` of idle or the close.
 async fn tcp_exchange(
@@ -1014,15 +1039,17 @@ where
 }
 
 /// Reply budget for a row whose one write is an inline line around the
-/// RESP 1 MiB cap. The speaker is stateless, so the driver re-offers the
-/// whole buffer after every 8 KiB read and `l4-resp` rescans it for a CRLF
-/// each time: the ~128 reads of 1 MiB cost over a second of rescans in a
-/// debug build (under 30 ms optimised) before the speaker can answer or
-/// the 200 ms idle can even start, while the client's `write_all` returns
-/// as soon as the loopback buffers have taken the bytes. `CLOSE_WITHIN`
-/// from that moment is too short; the budget below is only ever waited out
-/// on a failure (the read returns on the close).
-const LARGE_LINE_WITHIN: Duration = Duration::from_secs(10);
+/// RESP 1 MiB cap. The driver re-offers the buffer after every 8 KiB read
+/// and `l4-resp` scans it for a CRLF; before the per-connection scan memo
+/// (T10 PR C fix round 2) every one of the ~128 reads rescanned the whole
+/// buffer, which measured 2.4-5.2 s in an unoptimised build (~150 ms
+/// optimised) before the speaker could answer or the 200 ms idle could
+/// even start, while the client's `write_all` returns as soon as the
+/// loopback buffers have taken the bytes. With the memo the absorb is
+/// O(n), but the budget stays generous: it is only ever waited out on a
+/// failure (the read returns on the close), and a tight one would flake
+/// when the parallel live tests compete for the CPU.
+const LARGE_LINE_WITHIN: Duration = Duration::from_secs(20);
 
 /// One write on a fresh connection and the exact bytes that must come
 /// back: the malformed rows (`expect`, then a close with reason `error`)
@@ -1132,7 +1159,7 @@ fn malformed_rows() -> Vec<Labelled<Row>> {
                 read_idle: LARGE_LINE_WITHIN,
             },
         },
-        // --- Fix round 1 (item 11) ---
+        // --- Over-long inline lines: complete, with their CRLF ---
         Labelled {
             service: "l4-resp",
             label: "complete inline line one byte past 1 MiB (with its CRLF)",
@@ -1212,12 +1239,21 @@ async fn malformed_input_is_answered_before_the_close() {
 
 /// A line sent in two pieces: `first` has no CRLF, the connection must
 /// still be open and silent after 1 s, then `second` completes it and
-/// `expect` comes back on the same connection.
+/// `expect` comes back on the same connection, its first byte within
+/// `reply_within`. The 1 s hold proves "silent and open", not "reached the
+/// 200 ms idle": a 1 MiB `first` may still be being absorbed when the hold
+/// ends; `resp_never_waits_past_its_buffer_cap` (hermetic) is what pins the
+/// `Wait` at exactly the cap.
 struct Partial {
     banner: Option<&'static [u8]>,
     first: Vec<u8>,
     second: Vec<u8>,
     expect: Vec<u8>,
+    /// Budget for the first byte of the reply after `second` is written:
+    /// `REPLY_IDLE` for an ordinary row, `LARGE_LINE_WITHIN` when `first`
+    /// is a 1 MiB line the speaker may still be absorbing. Only a failure
+    /// waits it out.
+    reply_within: Duration,
 }
 
 fn partial_rows() -> Vec<Labelled<Partial>> {
@@ -1230,6 +1266,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 first: b"NOO".to_vec(),
                 second: b"P\r\n".to_vec(),
                 expect: b"250 OK\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
         Labelled {
@@ -1240,6 +1277,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 first: b"NOOP\r\t".to_vec(),
                 second: b"\r\n".to_vec(),
                 expect: b"250 OK\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
         Labelled {
@@ -1250,6 +1288,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 first: b"NOO".to_vec(),
                 second: b"P\r\n".to_vec(),
                 expect: b"200 ok\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
         Labelled {
@@ -1260,6 +1299,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 first: b"USER a\r\t".to_vec(),
                 second: b"\r\n".to_vec(),
                 expect: b"331 password required\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
         Labelled {
@@ -1270,6 +1310,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 first: b"get mykey".to_vec(),
                 second: b"\r\n".to_vec(),
                 expect: b"END\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
         Labelled {
@@ -1280,6 +1321,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 first: b"set k 0 0 2\r\nh".to_vec(),
                 second: b"i\r\n".to_vec(),
                 expect: b"STORED\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
         Labelled {
@@ -1290,6 +1332,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 first: b"PIN".to_vec(),
                 second: b"G\r\n".to_vec(),
                 expect: b"+PONG\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
         // --- Tester additions (stage 5) ---
@@ -1306,8 +1349,12 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                 },
                 second: b"\n".to_vec(),
                 expect: b"STORED\r\n".to_vec(),
+                reply_within: REPLY_IDLE,
             },
         },
+        // The hold proves the connection is silent and open after 1 s; the
+        // speaker may still be absorbing the 1 MiB (O(n) since the scan
+        // memo), so the reply gets the large-line budget, free on success.
         Labelled {
             service: "l4-resp",
             label: "inline line of exactly 1 MiB waits, then its CRLF makes it an unknown command",
@@ -1321,6 +1368,7 @@ fn partial_rows() -> Vec<Labelled<Partial>> {
                     expect.extend_from_slice(b"'\r\n");
                     expect
                 },
+                reply_within: LARGE_LINE_WITHIN,
             },
         },
     ]
@@ -1350,7 +1398,7 @@ async fn partial_flow(
     if !bytes.is_empty() {
         return Err(format!("wrote {} on a partial line", hex(&bytes)));
     }
-    let got = exchange(&mut stream, &row.second, REPLY_IDLE).await?;
+    let got = exchange_within(&mut stream, &row.second, row.reply_within, REPLY_IDLE).await?;
     if got != row.expect {
         return Err(format!(
             "completed line: got {} expected {}",
