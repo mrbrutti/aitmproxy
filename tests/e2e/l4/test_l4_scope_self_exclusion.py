@@ -16,10 +16,13 @@ request log, and the scope-compiled BPF filter -- never a fixture:
     grow during the burst" is confinement, not a dead capture).
 
 Capability gate (headless vs live rig), each a precise SKIP (77): an l4-enabled runner core,
-an operator token, a CONFIG loopback capture scope NARROWED to a port range (so an out-of-
-scope loopback port exists), and raw-capture privilege (libpcap/BPF; macOS NE). Converted
-from the dead _lib/mcp draft harness onto aitm_e2e: env-model (AITM_BUS_ADDR +
-AITM_BUS_OPERATOR_TOKEN [+ AITM_PROXY_ADDR / AITM_TARGET_URL]); never boots its own l4 core.
+an operator token, a CONFIG loopback capture scope (`l4.scope.list` `source: "config"`)
+NARROWED to a port range (so an out-of-scope loopback port exists), and raw-capture
+privilege. `l4.capture.start` is pcap/BPF only (/dev/bpf* read+write on macOS, CAP_NET_RAW
+on Linux); `l4.capture.status` always answers `{available, code, reason, captures}` and an
+`available: false` is a SKIP carrying the core's `reason`. Converted from the dead _lib/mcp
+draft harness onto aitm_e2e: env-model (AITM_BUS_ADDR + AITM_BUS_OPERATOR_TOKEN
+[+ AITM_PROXY_ADDR / AITM_TARGET_URL]); never boots its own l4 core.
 Soft-assertion battery; exit 0/1/77. serial: a privileged global sniff -- run it alone.
 """
 from __future__ import annotations
@@ -44,7 +47,7 @@ from aitm_e2e.bus import BusClient, BusError, ToolError  # noqa: E402
 from aitm_e2e.proxyutil import via_proxy  # noqa: E402
 
 UNAVAILABLE_HINTS = (
-    "unavailable", "pcap", "privilege", "permission", "approve the extension",
+    "unavailable", "pcap", "privilege", "permission", "/dev/bpf", "cap_net_raw",
     "not permitted", "no such device", "operation not permitted",
 )
 OOS_ROUNDS = 30
@@ -109,6 +112,42 @@ def is_loopback_v4_cidr(cidr: str) -> bool:
     return cidr.split("/", 1)[0].strip().startswith("127.")
 
 
+def is_config_scope(entry: dict) -> bool:
+    """`l4.scope.list` reports provenance as `source`: `config` or `runtime`. A pre-parity
+    core has no `source`; it is accepted (it could not record a runtime loopback entry)."""
+    return entry.get("source", "config") == "config"
+
+
+def capture_status(reply):
+    """Parse an `l4.capture.status` reply into (available, reason, capture_ids).
+
+    New shape (L4 parity spec, availability seam): an object
+    `{available, code, reason, captures}` where `captures` is the list of running
+    capture flow ids and `reason` is the exact text the gated verbs put after
+    `L4 unavailable: ` (null when available). Old shape (pre-parity cores): a bare
+    list of ids, which meant available. Pure: no bus, no exit."""
+    if isinstance(reply, dict):
+        ids = reply.get("captures") or []
+        return bool(reply.get("available", False)), reply.get("reason"), list(ids)
+    if isinstance(reply, list):
+        return True, None, list(reply)
+    raise TypeError(f"unexpected l4.capture.status reply: {reply!r}")
+
+
+def capture_ids(reply):
+    """The running capture flow ids from either `l4.capture.status` shape."""
+    return capture_status(reply)[2]
+
+
+def read_capture_status(op):
+    """(available, reason, ids) from the live core. A pre-parity core gated the verb
+    behind privilege; its `L4 unavailable: <reason>` error is read as unavailable."""
+    status, reply = op.try_call("l4.capture.status")
+    if status == "error":
+        return False, str(reply), []
+    return capture_status(reply)
+
+
 def parse_ports(spec: str):
     lo, _, hi = spec.partition("-")
     return int(lo), int(hi)
@@ -142,7 +181,8 @@ def main() -> int:
     op_token = os.environ.get("AITM_BUS_OPERATOR_TOKEN")
     if not (bus_addr and op_token):
         skip("no runner-provided L4 core: set AITM_BUS_ADDR + AITM_BUS_OPERATOR_TOKEN from an "
-             "l4-enabled rig (l4.capture.* is operator-gated and raw capture needs NE/root)")
+             "l4-enabled rig (l4.capture.* is operator-gated and raw capture needs /dev/bpf* "
+             "read+write on macOS or CAP_NET_RAW on Linux)")
     bh, _, bp = bus_addr.rpartition(":")
     core = SimpleNamespace(bus_addr=(bh or "127.0.0.1", int(bp)),
                            cfg=SimpleNamespace(agent_token=os.environ.get("AITM_BUS_TOKEN", ""), operator_token=op_token))
@@ -155,18 +195,19 @@ def main() -> int:
     upstream = None
     try:
         op = BusClient.operator(core)
-        need = ("l4.scope.list", "l4.capture.start", "l4.capture.stop", "l4.flow.get", "l4.flow.list")
+        need = ("l4.scope.list", "l4.capture.status", "l4.capture.start", "l4.capture.stop", "l4.flow.get", "l4.flow.list")
         missing = [t for t in need if t not in set(op.tool_names())]
         if missing:
             skip(f"the L4 module is not enabled on this core (missing {missing}); l4.* is opt-in + "
-                 "feature-compiled -- run this in the L4/NE rig")
+                 "feature-compiled -- run this in the L4 rig")
 
         section("the in-scope target comes from the CONFIG-declared loopback capture scope")
         scope = op.call("l4.scope.list")
-        loop_caps = [e for e in scope if e.get("capability") == "capture" and is_loopback_v4_cidr(e.get("cidr", ""))]
+        loop_caps = [e for e in scope
+                     if e.get("capability") == "capture" and is_config_scope(e) and is_loopback_v4_cidr(e.get("cidr", ""))]
         if not loop_caps:
-            skip("no CONFIG-declared loopback capture scope. Declare an l4.scope capture entry covering "
-                 "127.0.0.1 (only Config provenance lifts the loopback denylist).")
+            skip("no CONFIG-declared loopback capture scope (source == \"config\"). Declare an l4.scope "
+                 "capture entry covering 127.0.0.1 (only Config provenance lifts the loopback denylist).")
         iface = loop_caps[0]["interface"]
         direction = loop_caps[0].get("direction", "inbound")
         in_ranges = [parse_ports(e.get("ports", "0-65535")) for e in loop_caps if e["interface"] == iface]
@@ -200,13 +241,21 @@ def main() -> int:
         oos_udp_port = next(p for p in range(40000, 40100) if not in_any(p, in_ranges) and p not in reserved)
         tag = f"l4conf-{uuid.uuid4().hex[:8]}"
 
+        section("the core reports capture availability honestly (l4.capture.status always answers)")
+        available, reason, pre_ids = read_capture_status(op)
+        print(f"note: l4.capture.status available={available!r} reason={reason!r} captures={pre_ids}", flush=True)
+        if not available:
+            skip(f"L4 capture is not available on this core: {reason}. Raw capture is pcap/BPF only: "
+                 "it needs read+write on /dev/bpf* (macOS; install ChmodBPF or run with privilege) or "
+                 "CAP_NET_RAW (Linux).")
+
         section("start the real, scope-filtered capture (privileged; SKIPs if unreachable)")
         ok_s, started = confirm_call(op, "l4.capture.start", {"interface": iface, "direction": direction})
         if not ok_s:
             msg = str(started)
             if any(h in msg.lower() for h in UNAVAILABLE_HINTS):
-                skip(f"L4 capture is not available here: {msg[:200]}. Raw capture needs libpcap/BPF "
-                     "privilege; on macOS approve + enable the Network/System Extension first.")
+                skip(f"L4 capture is not available here: {msg[:200]}. Raw capture is pcap/BPF only "
+                     "(/dev/bpf* read+write on macOS, CAP_NET_RAW on Linux).")
             fail(f"l4.capture.start was refused unexpectedly (not an availability skip): {msg[:300]}")
         flow_id = started.get("flow_id") if isinstance(started, dict) else None
         if not flow_id:

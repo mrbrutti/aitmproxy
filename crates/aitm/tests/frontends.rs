@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 59] = [
+const EXPECTED_TOOLS: [&str; 62] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -46,6 +46,12 @@ const EXPECTED_TOOLS: [&str; 59] = [
     "capture.status",
     "proxy.pause",
     "proxy.resume",
+    // proxy.system.* (spec 2026-10-31-system-proxy-automation-design): the OS system
+    // proxy read (Read) and the two operator-only mutators (Sensitive), registered on
+    // every platform after ControlPlugin.
+    "proxy.system.status",
+    "proxy.system.set",
+    "proxy.system.unset",
     "config.get",
     "request.send",
     "browser.navigate",

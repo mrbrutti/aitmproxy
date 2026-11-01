@@ -31,11 +31,12 @@ members = [
     "crates/aitm-scan-ws",
     "crates/aitm-scan-l4-packet",
     "crates/aitm-scan-l4-stream",
+    "crates/aitm-sysproxy",
     "crates/aitm",
 ]
 
 [workspace.package]
-version = "0.5.6"
+version = "0.5.8"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.97"
@@ -103,3 +104,4 @@ aitm-scan-checks-http = { path = "crates/aitm-scan-checks-http" }
 aitm-scan-ws = { path = "crates/aitm-scan-ws" }
 aitm-scan-l4-packet = { path = "crates/aitm-scan-l4-packet" }
 aitm-scan-l4-stream = { path = "crates/aitm-scan-l4-stream" }
+aitm-sysproxy = { path = "crates/aitm-sysproxy" }

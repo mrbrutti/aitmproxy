@@ -83,6 +83,127 @@ impl L4Privilege {
     }
 }
 
+/// Why a capability class is **not** usable on this core, as the status verbs report
+/// it in `code` (spec §1, L4PAR-AC3/AC4). A closed vocabulary so a UI can attach
+/// behaviour (D0's "Allow packet capture") without matching on `reason` text. The
+/// `available` case is [`L4Availability::Available`], so an "available with a
+/// reason" or "unavailable with no reason" state cannot be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableCode {
+    /// The platform supports the class; this process lacks the privilege.
+    NeedsPrivilege,
+    /// No backend for the class on this platform (e.g. in-path on macOS).
+    UnsupportedPlatform,
+    /// Supported and privileged, but not configured (`l4.intercept` absent).
+    NotConfigured,
+}
+
+impl UnavailableCode {
+    /// The wire string, in vocabulary order.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsPrivilege => "needs_privilege",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::NotConfigured => "not_configured",
+        }
+    }
+}
+
+/// One capability class's availability: either usable now, or unusable for a
+/// closed-vocabulary [`UnavailableCode`] with the exact `reason` text the gated
+/// verbs return in `L4 unavailable: <reason>`. Derived from the cached
+/// [`L4Privilege`] through an [`AvailabilitySource`], so the status verbs and the
+/// gated verbs can never disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L4Availability {
+    /// The class works on this core now.
+    Available,
+    /// The class does not work on this core now; `reason` is the gated verbs' text.
+    Unavailable {
+        /// The closed-vocabulary classification.
+        code: UnavailableCode,
+        /// The gated verbs' exact refusal text.
+        reason: String,
+    },
+}
+
+impl L4Availability {
+    /// The wire `code`: `"available"`, or the [`UnavailableCode`]'s string.
+    #[must_use]
+    pub fn code_str(&self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Unavailable { code, .. } => code.as_str(),
+        }
+    }
+
+    /// The gated verbs' exact refusal text; `None` when available.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Available => None,
+            Self::Unavailable { reason, .. } => Some(reason.as_str()),
+        }
+    }
+
+    /// Whether the class is usable now.
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+}
+
+/// Where a status verb reads one capability class's availability **at invoke time**
+/// (spec §1, L4PAR-AC38). Today [`L4Module::load`] builds one per class over a clone
+/// of the cached [`L4Privilege`]; the privilege spec (D0) swaps in a live
+/// `PrivilegeState` without touching the commands.
+pub type AvailabilitySource = Arc<dyn Fn() -> L4Availability + Send + Sync>;
+
+impl L4Privilege {
+    /// The capture/inject class's availability. A `Some` reason is `NeedsPrivilege`
+    /// where the platform has a backend (macOS `/dev/bpf*`, Linux `CAP_NET_RAW`) and
+    /// `UnsupportedPlatform` elsewhere.
+    #[must_use]
+    pub fn capture_availability(&self) -> L4Availability {
+        match &self.capture_inject {
+            None => L4Availability::Available,
+            Some(reason) => L4Availability::Unavailable {
+                code: if cfg!(any(target_os = "macos", target_os = "linux")) {
+                    UnavailableCode::NeedsPrivilege
+                } else {
+                    UnavailableCode::UnsupportedPlatform
+                },
+                reason: reason.clone(),
+            },
+        }
+    }
+
+    /// The in-path class's availability. A `Some` reason is `NeedsPrivilege` on Linux
+    /// (the only NFQUEUE platform) and `UnsupportedPlatform` elsewhere, macOS
+    /// included. Privilege outranks configuration: only a privileged class with no
+    /// `l4.intercept` config (`configured == false`) reads `NotConfigured`, carrying
+    /// the same text `l4.intercept.start` refuses with.
+    #[must_use]
+    pub fn intercept_availability(&self, configured: bool) -> L4Availability {
+        match &self.intercept {
+            Some(reason) => L4Availability::Unavailable {
+                code: if cfg!(target_os = "linux") {
+                    UnavailableCode::NeedsPrivilege
+                } else {
+                    UnavailableCode::UnsupportedPlatform
+                },
+                reason: reason.clone(),
+            },
+            None if !configured => L4Availability::Unavailable {
+                code: UnavailableCode::NotConfigured,
+                reason: crate::commands::intercept::INTERCEPT_NOT_CONFIGURED.to_string(),
+            },
+            None => L4Availability::Available,
+        }
+    }
+}
+
 /// Linux: read the effective capability set from `/proc/self/status` and check the
 /// `CAP_NET_RAW` / `CAP_NET_ADMIN` bits. Unreadable / unparsable ⇒ fail-closed.
 #[cfg(target_os = "linux")]
@@ -201,7 +322,10 @@ impl Command for L4Gated {
 }
 
 /// Wrap each command in `cmds` as [`L4Gated`] when `reason` is `Some` (the capability
-/// is unavailable); otherwise leave them live.
+/// is unavailable); otherwise leave them live. The two status verbs never reach
+/// this function: `wire_commands` / `intercept_commands` return them separately
+/// and [`L4Module::load`] registers them beside the gated list, so they always
+/// answer with the availability object (spec §1, L4PAR-AC9).
 fn gate(cmds: Vec<Arc<dyn Command>>, reason: Option<&str>) -> Vec<Arc<dyn Command>> {
     match reason {
         None => cmds,
@@ -296,6 +420,17 @@ impl L4Module {
         }
     }
 
+    /// Hand the module the core's **own** listener ports (proxy, embedded-browser
+    /// proxy, loopback bus, web UI, MCP streamable HTTP). They are set on the
+    /// module's guard, so no capture — bus, CLI or Rhai, all of which record
+    /// through this guard — ever records a loopback frame to or from one of them
+    /// (L4PAR-AC34, spec §2.1). Replaces any set already there.
+    #[must_use]
+    pub fn with_self_ports(self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.guard.set_self_ports(ports);
+        self
+    }
+
     /// The shared deny-by-default guard (an `Arc` clone).
     #[must_use]
     pub fn guard(&self) -> Arc<L4Guard> {
@@ -331,33 +466,49 @@ impl Plugin for L4Module {
         // privilege gate (`gate`, outer) so an unprivileged core returns a typed
         // `L4Unavailable` before the flag is even consulted. The operator who opted in
         // still sees an honest, drivable surface (amended M5 Task 13).
+        // Both availability sources close over a clone of the one cached probe the
+        // gate below reads, and the status verbs query them at invoke time (spec §1,
+        // L4PAR-AC38): `l4.capture.status` / `l4.intercept.status` and the gated
+        // verbs' `L4Unavailable` reason cannot disagree, and D0 swaps in a live
+        // `PrivilegeState` here without touching the commands. Each status verb
+        // comes back separately from its gated list and registers ungated beside
+        // it, so it always answers (L4PAR-AC9).
+        let capture_source: AvailabilitySource = {
+            let privilege = self.privilege.clone();
+            Arc::new(move || privilege.capture_availability())
+        };
+        let intercept_source: AvailabilitySource = {
+            let privilege = self.privilege.clone();
+            let configured = self.intercept_cfg.is_some();
+            Arc::new(move || privilege.intercept_availability(configured))
+        };
+        let (wire, capture_status) =
+            crate::commands::wire_commands(self.guard(), self.store(), capture_source);
         for cmd in gate(
-            crate::commands::agent_gate(
-                crate::commands::wire_commands(self.guard(), self.store()),
-                &gates,
-            ),
+            crate::commands::agent_gate(wire, &gates),
             self.privilege.capture_inject.as_deref(),
         ) {
             reg.add_command(cmd);
         }
+        reg.add_command(capture_status);
         // The in-path interception commands (M5 Task 12) register additively over
         // the shared session registry, so a `start` outlives the call and the later
         // verdict commands reach it. Agent-gated (`intercept` capability) then
         // privilege-gated on in-path (`CAP_NET_ADMIN`) the same way.
+        let (intercept, intercept_status) = crate::commands::intercept::intercept_commands(
+            self.guard(),
+            self.store(),
+            self.sessions.clone(),
+            self.intercept_cfg.clone(),
+            intercept_source,
+        );
         for cmd in gate(
-            crate::commands::agent_gate(
-                crate::commands::intercept::intercept_commands(
-                    self.guard(),
-                    self.store(),
-                    self.sessions.clone(),
-                    self.intercept_cfg.clone(),
-                ),
-                &gates,
-            ),
+            crate::commands::agent_gate(intercept, &gates),
             self.privilege.intercept.as_deref(),
         ) {
             reg.add_command(cmd);
         }
+        reg.add_command(intercept_status);
         // The operator-only live toggle: `l4.agent.status` (read the four gates) and
         // `l4.agent.set` (flip one). Never privilege- or agent-gated here — the set
         // command self-gates to operator/CLI, and status is read-only.
@@ -844,6 +995,130 @@ mod tests {
             ),
             other => panic!("want L4Error::Unavailable, got {other:?}"),
         }
+    }
+
+    /// Invoke a registered `l4.*` verb with no params against a stub host.
+    fn invoke_no_params(reg: &Registry, name: &str) -> anyhow::Result<Value> {
+        let store = MemFlowStore::new();
+        let client = StubClient;
+        let guard = StdGuard::default();
+        let h = host(&store, &client, &guard);
+        reg.command(name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+            .invoke(Params::default(), &h)
+    }
+
+    /// The expected availability object: `{available, code, reason, <payload_key>: []}`.
+    fn availability_value(
+        available: bool,
+        code: &str,
+        reason: Option<&str>,
+        payload_key: &str,
+    ) -> Value {
+        let mut m = BTreeMap::new();
+        m.insert("available".to_string(), Value::Bool(available));
+        m.insert("code".to_string(), Value::Str(code.into()));
+        m.insert(
+            "reason".to_string(),
+            reason.map_or(Value::Null, |r| Value::Str(r.into())),
+        );
+        m.insert(payload_key.to_string(), Value::Array(vec![]));
+        Value::Object(m)
+    }
+
+    /// L4PAR-AC3 / AC4 (plan A4): on a privileged module with in-path configured,
+    /// both status verbs answer the availability object with `available: true`,
+    /// `code: "available"`, `reason: null` and an empty payload.
+    #[test]
+    fn status_verbs_answer_when_privileged() {
+        let cfg = L4Config {
+            enabled: true,
+            intercept: Some(InterceptConfig::default()),
+            ..L4Config::default()
+        };
+        let module = L4Module::with_privilege(&cfg, L4Privilege::available());
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(module));
+
+        assert_eq!(
+            invoke_no_params(&reg, "l4.capture.status").expect("capture.status answers"),
+            availability_value(true, "available", None, "captures")
+        );
+        assert_eq!(
+            invoke_no_params(&reg, "l4.intercept.status").expect("intercept.status answers"),
+            availability_value(true, "available", None, "sessions")
+        );
+    }
+
+    /// L4PAR-AC34 (plan A10): `with_self_ports` sets the core's own listener
+    /// ports on the module's guard, the one every `l4.capture.*` verb records
+    /// through.
+    #[test]
+    fn with_self_ports_sets_the_guard() {
+        let cfg = L4Config {
+            enabled: true,
+            ..L4Config::default()
+        };
+        let module = L4Module::with_privilege(&cfg, L4Privilege::available())
+            .with_self_ports([28182, 27431]);
+        assert_eq!(module.guard().self_ports(), vec![27431, 28182]);
+    }
+
+    /// L4PAR-AC4 (plan A4): privilege present but no `intercept` config ⇒
+    /// `l4.intercept.status` reads `not_configured` with the exact text
+    /// `l4.intercept.start` refuses with.
+    #[test]
+    fn intercept_status_not_configured() {
+        let cfg = L4Config {
+            enabled: true,
+            intercept: None,
+            ..L4Config::default()
+        };
+        let module = L4Module::with_privilege(&cfg, L4Privilege::available());
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(module));
+
+        assert_eq!(
+            invoke_no_params(&reg, "l4.intercept.status").expect("intercept.status answers"),
+            availability_value(
+                false,
+                "not_configured",
+                Some("in-path interception is disabled (no `intercept` config)"),
+                "sessions"
+            )
+        );
+    }
+
+    /// L4PAR-AC4 (plan A4): the real macOS probe classifies in-path as
+    /// `unsupported_platform` with a non-empty reason, and privilege outranks
+    /// configuration (`configured = false` does not turn it into
+    /// `not_configured`). The literal reason text is the e2e cell's to pin.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_intercept_is_unsupported_platform() {
+        let av = L4Privilege::probe().intercept_availability(false);
+        assert_eq!(av.code_str(), "unsupported_platform");
+        assert!(
+            av.reason().is_some_and(|r| !r.is_empty()),
+            "a non-empty reason, got {av:?}"
+        );
+        assert!(!av.is_available());
+    }
+
+    /// L4PAR-AC4 (plan A14): on Linux, the only NFQUEUE platform, a probe that found
+    /// `CAP_NET_ADMIN` missing classifies in-path as `needs_privilege` even when the
+    /// `l4.intercept` block is configured (privilege outranks configuration).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_intercept_without_cap_net_admin_needs_privilege() {
+        let av = L4Privilege {
+            capture_inject: None,
+            intercept: Some("missing CAP_NET_ADMIN".into()),
+        }
+        .intercept_availability(true);
+        assert_eq!(av.code_str(), "needs_privilege");
+        assert_eq!(av.reason(), Some("missing CAP_NET_ADMIN"));
+        assert!(!av.is_available());
     }
 
     /// The real startup probe is defensive: it never panics, whatever the platform

@@ -255,6 +255,12 @@ pub const CORE_TOOLS: &[&str] = &[
     // capture feeder's read-only state (Sensitivity::Read), registered on every
     // platform.
     "capture.status",
+    // proxy.system.* (spec 2026-10-31-system-proxy-automation-design): the OS
+    // system proxy read (Sensitivity::Read) and the two operator-only mutators
+    // (Sensitivity::Sensitive), registered on every platform.
+    "proxy.system.status",
+    "proxy.system.set",
+    "proxy.system.unset",
     "browser.navigate",
     "browser.click",
     "browser.type",
