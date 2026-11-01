@@ -21,7 +21,7 @@ struct RouteBanner: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 } icon: {
-                    Image(systemName: "network").font(.system(size: Tok.Size.iconInline))
+                    Image(systemName: Tok.Glyph.network).font(.system(size: Tok.Size.iconInline))
                 }
                 .labelStyle(RouteLabelStyle())
                 Spacer(minLength: Space.sm)
@@ -92,8 +92,8 @@ struct RouteAdviceRow: View {
 
     static func glyph(_ kind: TrafficRoute.Kind) -> String {
         switch kind {
-        case .systemProxy: "network"
-        case .allApps: "app.badge"
+        case .systemProxy: Tok.Glyph.network
+        case .allApps: Tok.Glyph.apps
         case .scope: Tok.Glyph.scope
         case .caTrust: Tok.Glyph.lock
         }

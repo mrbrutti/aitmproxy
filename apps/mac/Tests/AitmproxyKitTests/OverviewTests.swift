@@ -53,6 +53,23 @@ private enum OverviewInputs {
     ].map { ($0.id, $0) })
 }
 
+/// The AI-AC7 rows (spec 2026-10-31-mac-app-icons-and-names, D4): two identifiers that share
+/// the name "Google Chrome (Service)", one owner, and a proxied flow with no client at all.
+/// Built here with literal values; `ClientTreeTests` and `OverviewBreakdownsTests` carry their own copy.
+private enum AppRows {
+    static func row(_ id: String, _ seq: Int, _ host: String, _ client: ClientInfo?) -> FlowRow {
+        FlowRow(id: FlowID(id), seq: seq, method: .get, scheme: "https", authority: host, path: "/", client: client)
+    }
+
+    static let chrome = ClientInfo(name: "Google Chrome", bundleID: "com.google.Chrome")
+    static let a = row("A", 1, "a.example", chrome)
+    static let b = row("B", 2, "a.example", ClientInfo(name: "Google Chrome (Service)", bundleID: "com.google.Chrome.helper"))
+    static let c = row("C", 3, "a.example", chrome)
+    static let d = row("D", 4, "b.example",
+                       ClientInfo(name: "Google Chrome (Service)", bundleID: "com.google.Chrome.helper.renderer"))
+    static let e = row("E", 5, "c.example", nil)
+}
+
 @Suite struct OverviewTests {
     @Test func countsTheSession() {
         let stats = OverviewStats(rows: OverviewInputs.rows)
@@ -131,6 +148,15 @@ private enum OverviewInputs {
     @Test func rangeLabels() {
         #expect(StatusClass.informational.rangeLabel == "1xx")
         #expect(StatusClass.serverError.rangeLabel == "5xx")
+    }
+
+    /// AI-AC11: the Clients tile counts group keys (the signing identifier), not names — the
+    /// two "(Service)" clients are two apps, and the row with no client is none.
+    @Test func countsClientsByIdentifier() {
+        let stats = OverviewStats(rows: [AppRows.a, AppRows.b, AppRows.c, AppRows.d, AppRows.e])
+        #expect(stats.clients == 3)
+        #expect(stats.flows == 5)
+        #expect(stats.hosts == 3)
     }
 }
 
