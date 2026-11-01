@@ -12,7 +12,7 @@
 //! loop and never the proof: the acceptance evidence for T5 is the real-bus
 //! e2e cells and the live loopback test.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -113,6 +113,11 @@ struct Script {
     reply_delay: Duration,
     /// Whether every inject fails with [`L4Error::WireWrite`].
     wire_write_fails: bool,
+    /// At most one ICMP reply per target per this window, as a kernel that
+    /// rate-limits the ICMP errors it generates does.
+    icmp_window: Option<Duration>,
+    /// When each target last had an ICMP reply out of this mock.
+    last_icmp: HashMap<IpAddr, Instant>,
 }
 
 /// An in-memory [`CaptureInjectBackend`]: it answers injected stimuli from a
@@ -237,6 +242,20 @@ impl MockBackend {
         lock(&self.script).reply_delay = d;
     }
 
+    /// Answer at most one [`MockReply::Icmp`] per `window` per target and stay
+    /// silent in between, the way a target host's kernel rate-limits the ICMP
+    /// errors it generates (Linux: `net.ipv4.icmp_ratelimit = 1000` ms per
+    /// destination, the observation behind spec amendment 46).
+    ///
+    /// The self-echo is unaffected: the capture still reads the injected frame
+    /// first, exactly as loopback delivers it, whether or not an ICMP error
+    /// follows.
+    pub fn icmp_ratelimit(&self, window: Duration) {
+        let mut script = lock(&self.script);
+        script.icmp_window = Some(window);
+        script.last_icmp.clear();
+    }
+
     /// A capture that never sees its own injects: only the scripted reply is
     /// queued. The default models the real loopback, which delivers the
     /// stimulus first (see the type doc); use this for a test that needs the
@@ -284,6 +303,27 @@ impl MockBackend {
         false
     }
 
+    /// Whether this mock may answer `target` with an ICMP error now: always,
+    /// unless [`MockBackend::icmp_ratelimit`] set a window and one went out
+    /// inside it. Spending the token is part of the answer, so the caller
+    /// cannot ask twice for one reply.
+    fn icmp_allowed(&self, target: IpAddr) -> bool {
+        let mut script = lock(&self.script);
+        let Some(window) = script.icmp_window else {
+            return true;
+        };
+        let now = Instant::now();
+        if script
+            .last_icmp
+            .get(&target)
+            .is_some_and(|last| now.duration_since(*last) < window)
+        {
+            return false;
+        }
+        script.last_icmp.insert(target, now);
+        true
+    }
+
     /// The reply frame for `stimulus`, or `None` when this mock answers
     /// nothing or the stimulus does not decode to a UDP/TCP packet.
     fn reply_frame(&self, stimulus: &[u8]) -> Option<Vec<u8>> {
@@ -312,17 +352,22 @@ impl MockBackend {
                 };
                 vec![ip, transport, Layer::Raw(ends.payload.to_vec())]
             }
-            MockReply::Icmp { icmp_type, code } => vec![
-                ip,
-                Layer::Icmp(IcmpSpec {
-                    icmp_type: Some(icmp_type),
-                    code: Some(code),
-                    rest_of_header: Some(0),
-                    checksum: None,
-                }),
-                // An ICMP error quotes the head of the offending datagram.
-                Layer::Raw(quoted_datagram(stimulus)),
-            ],
+            MockReply::Icmp { icmp_type, code } => {
+                if !self.icmp_allowed(ends.dst) {
+                    return None;
+                }
+                vec![
+                    ip,
+                    Layer::Icmp(IcmpSpec {
+                        icmp_type: Some(icmp_type),
+                        code: Some(code),
+                        rest_of_header: Some(0),
+                        checksum: None,
+                    }),
+                    // An ICMP error quotes the head of the offending datagram.
+                    Layer::Raw(quoted_datagram(stimulus)),
+                ]
+            }
             MockReply::Rst => vec![
                 ip,
                 Layer::Tcp(TcpSpec {
@@ -783,6 +828,9 @@ pub mod harness {
             replay_spacing: Duration::from_millis(10),
             recovery_poll: Duration::from_millis(10),
             recovery_polls: 10,
+            // Unpaced by default, so a test that does not care about amendment
+            // 46 still costs milliseconds; a test that does sets its own pace.
+            icmp_pace: Some(Duration::ZERO),
             ..Timing::default()
         }
     }

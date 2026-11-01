@@ -156,10 +156,11 @@ impl Check for CrashCheck {
                 confidence: Confidence::Firm,
                 evidence: Evidence::default(),
                 detail: format!(
-                    "{} cases sent on {} field {}; no crash",
+                    "{} cases sent on {} field {}; no crash{}",
                     run.sent_count(),
                     run.target,
-                    run.field
+                    run.field,
+                    no_reply_note(&run)
                 ),
                 poc_hint: None,
             }
@@ -440,11 +441,27 @@ pub fn reaction_detail(run: &PointRun) -> String {
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "l4 reactions on {} field {}: {counts}; latency outliers {}",
+        "l4 reactions on {} field {}: {counts}; latency outliers {}{}",
         run.target,
         run.field,
-        run.outlier_count()
+        run.outlier_count(),
+        no_reply_note(run)
     )
+}
+
+/// The `; no_reply (icmp_ratelimit) x <n>` tail a run carries when some of its
+/// cases drew no reply on an ICMP-paced point (spec amendment 46), empty when
+/// none did. It is the operator's explanation for silence that is the target
+/// host's ICMP rate limiter and not a crash.
+fn no_reply_note(run: &PointRun) -> String {
+    let count = run.no_reply_count();
+    if count == 0 {
+        return String::new();
+    }
+    run.cases
+        .iter()
+        .find_map(|case| case.note)
+        .map_or_else(String::new, |note| format!("; {} x {count}", note.label()))
 }
 
 /// The operator-facing line for a dry run: how many cases were rendered and
@@ -827,6 +844,92 @@ mod tests {
         assert_eq!(mock.inject_count(), 11);
     }
 
+    /// Spec D8.4 and amendment 46: the kernel reactions of a closed port prove
+    /// classification, never a crash. Against a host whose kernel rate-limits
+    /// the ICMP errors it generates — so an unpaced run reads mostly silence —
+    /// the crash check still answers `Clean`, says how many cases were
+    /// `no_reply (icmp_ratelimit)`, and the reaction check reports the
+    /// port-unreachable as the Info-severity reaction it is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_closed_port_never_yields_l4_crash() {
+        let mock = MockBackend::new(MockReply::Icmp {
+            icmp_type: 3,
+            code: 3,
+        });
+        mock.icmp_ratelimit(Duration::from_millis(300));
+        let mut profile = l4_profile(vec![udp_target(9)], 20);
+        profile.l4.icmp_pace_ms = 0;
+        profile.l4.consecutive_timeouts = 50;
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+
+        let crash = run_check(&CrashCheck::new(Arc::clone(&registry)), &runner).await;
+        let reaction = run_check(&ReactionCheck::new(registry), &runner).await;
+
+        assert_eq!(crash.outcome, Outcome::Clean);
+        assert_eq!(crash.confidence, Confidence::Firm);
+        assert!(crash.evidence.l4.is_none());
+        assert!(
+            crash
+                .detail
+                .starts_with("20 cases sent on 127.0.0.1:9/udp field raw; no crash"),
+            "a closed port is never a crash: {}",
+            crash.detail
+        );
+        assert!(
+            crash.detail.contains("; no_reply (icmp_ratelimit) x "),
+            "the silence the rate limiter caused is named: {}",
+            crash.detail
+        );
+
+        assert_eq!(reaction_meta().severity, aitm_poc::Severity::Info);
+        assert_eq!(reaction.outcome, Outcome::Vulnerable);
+        assert_eq!(reaction.confidence, Confidence::Firm);
+        let l4 = reaction
+            .evidence
+            .l4
+            .as_ref()
+            .expect("the reaction evidence");
+        assert_eq!(
+            l4.oracle,
+            L4Oracle::Icmp {
+                icmp_type: 3,
+                code: 3
+            }
+        );
+        let matched = reaction
+            .evidence
+            .matched
+            .as_deref()
+            .expect("the matched line");
+        let (label, count) = matched.split_once(" x ").expect("`<label> x <count>`");
+        assert_eq!(label, "icmp(3,3)");
+        let count: u32 = count.parse().expect("a case count");
+        assert!(
+            (1..=20).contains(&count),
+            "the rate limiter lets some cases through: {matched}"
+        );
+        assert!(
+            reaction
+                .detail
+                .starts_with("l4 reactions on 127.0.0.1:9/udp field raw: icmp(3,3) x "),
+            "{}",
+            reaction.detail
+        );
+        assert!(
+            reaction.detail.contains("; no_reply (icmp_ratelimit) x "),
+            "{}",
+            reaction.detail
+        );
+
+        let counters = shared.state.counters(job.job_id()).expect("counters");
+        assert_eq!(counters.cases, 20);
+        assert_eq!(counters.crashes, 0);
+        assert_eq!(counters.liveness_failures, 0);
+        assert_eq!(counters.retired_elements, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reaction_check_reports_reset() {
         let mock = MockBackend::new(MockReply::Rst);
@@ -1000,6 +1103,7 @@ mod tests {
                 latency_outlier: outlier,
             },
             candidate: Candidate::No,
+            note: None,
         };
         let icmp = CaseClass::Icmp {
             icmp_type: 3,

@@ -102,6 +102,42 @@ pub struct CaseRecord {
     /// recorded here rather than inferred later from the run's stop (review
     /// finding Q2).
     pub candidate: Candidate,
+    /// Why this case carries no reply, when the lane knows the reason: the
+    /// `no_reply (icmp_ratelimit)` note of spec amendment 46. `None` for every
+    /// other case.
+    pub note: Option<CaseNote>,
+}
+
+/// Why a case reads the way it does, when the lane knows a reason the class
+/// alone does not carry.
+///
+/// Today there is one: a silent case on a point whose baseline is an ICMP
+/// error. The target host's kernel rate-limits the errors it generates, so the
+/// silence is the rate limiter, not the service; the case is recorded with the
+/// note, is no crash candidate, and spends no liveness probe (spec D8.4,
+/// amendment 46). The note carries no wire bytes, so `Debug` prints it whole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseNote {
+    /// Nothing came back, and the lane knows why.
+    NoReply {
+        /// The reason, as the operator reads it: [`ICMP_RATELIMIT`].
+        reason: &'static str,
+    },
+}
+
+/// The reason of a [`CaseNote::NoReply`] on an ICMP-paced point: the target
+/// host's kernel rate-limits the ICMP errors it answers with.
+pub const ICMP_RATELIMIT: &str = "icmp_ratelimit";
+
+impl CaseNote {
+    /// The note as the operator reads it in a verdict detail:
+    /// `no_reply (icmp_ratelimit)`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match *self {
+            CaseNote::NoReply { reason } => format!("no_reply ({reason})"),
+        }
+    }
 }
 
 /// Whether a case reached the wire, and what came back when it did.
@@ -137,6 +173,7 @@ impl CaseRecord {
             sent_hex,
             outcome: CaseOutcome::Unsent,
             candidate: Candidate::No,
+            note: None,
         }
     }
 
@@ -230,6 +267,7 @@ impl fmt::Debug for CaseRecord {
             )
             .field("outcome", &self.outcome)
             .field("candidate", &self.candidate)
+            .field("note", &self.note)
             .finish()
     }
 }
@@ -335,6 +373,15 @@ impl PointRun {
     #[must_use]
     pub fn sent_count(&self) -> u32 {
         u32::try_from(self.cases.iter().filter(|case| case.sent()).count()).unwrap_or(u32::MAX)
+    }
+
+    /// How many of the run's cases carry the `no_reply (icmp_ratelimit)` note
+    /// of amendment 46: silent cases on a point whose baseline is an ICMP
+    /// error, which the target host's kernel rate-limited.
+    #[must_use]
+    pub fn no_reply_count(&self) -> u32 {
+        u32::try_from(self.cases.iter().filter(|case| case.note.is_some()).count())
+            .unwrap_or(u32::MAX)
     }
 
     /// How many of the run's cases came back outside the latency window.
@@ -756,6 +803,7 @@ mod tests {
                 latency_outlier: false,
             },
             candidate: Candidate::No,
+            note: None,
         }
     }
 

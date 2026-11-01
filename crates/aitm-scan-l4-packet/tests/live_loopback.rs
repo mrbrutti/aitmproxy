@@ -34,20 +34,23 @@
 //!   the default the run would still pass, but every permit past the first
 //!   hundred would wait on the rate limiter instead of measuring the service.
 //!   `max_packet_bytes` and `max_packets_per_call` stay at their defaults.
-//! * **ICMP generation is rate-limited.** On macOS `net.inet.icmp.icmplim`
-//!   (default 250 per second) sits far above the 20 cases the reaction tests
-//!   send at the default 500 ms reply window, so the kernel answers every one.
-//!   Linux limits ICMP errors per destination (`net.ipv4.icmp_ratelimit`,
-//!   1000 ms between errors to one peer after a small burst, with
-//!   `icmp_ratemask` covering destination-unreachable; the kernel exempts
-//!   loopback destinations from that per-peer limit but still applies the
-//!   global `icmp_msgs_per_sec`/`icmp_msgs_burst` budget, which the lane's
-//!   liveness probes draw from as well). The closed-UDP test therefore asserts
-//!   that **at least one** case was classified `icmp(3,3)`, tolerates `silence`
-//!   on the others, and prints the class histogram plus the counters so the
-//!   operator sees exactly what the lane made of the silent cases; a false
-//!   `l4-crash` on a closed port fails the test with those numbers in the
-//!   message. The liveness rule itself is not redesigned here.
+//! * **ICMP generation is rate-limited, so the lane paces the point.** On
+//!   macOS `net.inet.icmp.icmplim` (default 250 per second) sits far above the
+//!   20 cases the reaction tests send. Linux limits ICMP errors per
+//!   destination (`net.ipv4.icmp_ratelimit`, 1000 ms between errors to one
+//!   peer after a small burst, with `icmp_ratemask` covering
+//!   destination-unreachable, plus the global
+//!   `icmp_msgs_per_sec`/`icmp_msgs_burst` budget the lane's liveness probes
+//!   draw from as well), and the first real rig run read most cases as
+//!   `silence` because of it. Spec amendment 46 answers that: a point whose
+//!   baseline is an ICMP error is **paced** — consecutive cases, liveness
+//!   probes and replays on it are spaced at least `l4.icmp_pace_ms` apart
+//!   (default 1100 ms, floor 1000 ms). The closed-UDP test therefore asserts
+//!   that **every** one of its 20 cases was classified `icmp(3,3)`, and that
+//!   the paced run took at least `19 x 1100 ms`; it prints the elapsed time
+//!   and the class histogram. A silent case on such a point is recorded as
+//!   `no_reply (icmp_ratelimit)` and is never a crash candidate, so a closed
+//!   port can never yield `l4-crash` (spec D8.4).
 //! * **The capture sees the stimulus itself.** On Linux `lo` libpcap delivers
 //!   the RX copy of every frame the lane injects, and macOS `lo0` BPF reports
 //!   sent frames too, so the first frame a reply capture reads is the lane's
@@ -66,7 +69,7 @@ use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aitm_proto_l4::backend::pcap::PcapBackend;
 use aitm_proto_l4::backend::CaptureInjectBackend;
@@ -386,8 +389,15 @@ async fn live_closed_udp_port_yields_icmp_3_3() {
         .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
         .expect("the lane hosts the point it minted");
 
+    // The lane paces an ICMP-baseline point by `l4.icmp_pace_ms`, raised to
+    // the `ICMP_PACE_FLOOR_MS` floor; the profile default is 1100 ms, so the
+    // 20 cases cost at least nineteen gaps of it (spec amendment 46).
+    assert_eq!(profile.l4.icmp_pace_ms, 1100, "the profile default pace");
+    let pace = Duration::from_millis(u64::from(profile.l4.icmp_pace_ms));
+    let started = Instant::now();
     let reaction = run_check(&lane, REACTION_CHECK_ID, &point, host.as_ref()).await;
     let crash = run_check(&lane, CRASH_CHECK_ID, &point, host.as_ref()).await;
+    let elapsed = started.elapsed();
     let counters = lane.counters(job.job_id());
     let stats = lane.stats(job.job_id());
     let run = point_run(&lane, &job, &point);
@@ -407,16 +417,32 @@ async fn live_closed_udp_port_yields_icmp_3_3() {
     println!("stats: {stats:?}");
     println!("classes: {histogram:?}");
     println!(
-        "closed udp port: {icmp_3_3} of {} cases drew icmp(3,3), {silent} were silent (Linux rate-limits ICMP errors; the liveness probes draw from the same budget); baseline {:?}, crash {:?}, stopped {:?}",
+        "closed udp port: {icmp_3_3} of {} cases drew icmp(3,3), {silent} were silent, {} were noted no_reply (icmp_ratelimit); paced at {pace:?}, elapsed {elapsed:?}; baseline {:?}, crash {:?}, stopped {:?}",
         run.cases.len(),
+        run.no_reply_count(),
         run.baseline,
         run.crash.as_ref().map(|c| (c.case_index, c.recovered)),
         run.stopped
     );
 
+    assert_eq!(
+        icmp_3_3, 20,
+        "under the pace of amendment 46 every case draws the kernel's port-unreachable; classes {histogram:?}, elapsed {elapsed:?}"
+    );
+    assert_eq!(
+        counters,
+        Some(L4Counters {
+            cases: 20,
+            crashes: 0,
+            liveness_failures: 0,
+            retired_elements: 0,
+        }),
+        "a closed port costs no liveness probe and no crash; stats {stats:?}"
+    );
     assert!(
-        icmp_3_3 >= 1,
-        "at least one case must be classified icmp(3,3) by the kernel's port-unreachable; classes {histogram:?}"
+        elapsed >= 19 * pace,
+        "twenty paced cases cost at least {:?}; the run took {elapsed:?} (classes {histogram:?})",
+        19 * pace
     );
     assert_eq!(reaction.outcome, Outcome::Vulnerable);
     let l4 = reaction
