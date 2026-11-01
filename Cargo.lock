@@ -67,6 +67,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ratatui",
  "rcgen",
  "rustls",
  "security-framework",

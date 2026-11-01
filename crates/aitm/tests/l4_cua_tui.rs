@@ -4,13 +4,13 @@
 //! This is the §4.3 CUA path for the ratatui surface, held to Matt's standing
 //! acceptance bar — real scenarios, real keys, a real core, a real bus; never a
 //! green unit assert or a screenshot alone. It extends the ui-tui foundation's
-//! bus-task + snapshot harness (`tui_live_bus.rs` spawns a real core over the
-//! loopback-TCP bus; `l4_surface.rs` renders the surface) into a driver that
-//! presses **crossterm `KeyEvent`s through the TUI's own key map**
-//! ([`aitm_tui::keys::map`]) — the literal human-input path `aitm_tui::run` runs
-//! — and feeds the live `BusEvent` stream back through the reducer, exactly as
-//! the real UI loop does. Nothing here calls an `Action` variant directly: every
-//! step is a keystroke a real operator types.
+//! bus-task harness (`tui_live_bus.rs` spawns a real core over the loopback-TCP
+//! bus) into a driver that presses **crossterm `KeyEvent`s through the TUI's
+//! own key map** ([`aitm_tui::keys::map`]) — the literal human-input path
+//! `aitm_tui::run` runs — feeds the live `BusEvent` stream back through the
+//! reducer, exactly as the real UI loop does, and reads the screen by drawing
+//! the TUI's own `ui::render` into an off-screen buffer. Nothing here calls an
+//! `Action` variant directly: every step is a keystroke a real operator types.
 //!
 //! **What is driven, over the real bus, with real keys:**
 //! - the union flow list renders real L4 capture rows (fed through the
@@ -37,8 +37,7 @@
 //! **confirm overlay** (dest + summary + scope + permit budget) and the real
 //! packet round-trip against the `aitm-testtarget` L4 service are the
 //! **privileged/Linux-gated** half: driven for real only under `AITM_L4_TESTS=1`
-//! on an elevated host; asserted-degraded otherwise. The overlay machinery
-//! itself is pinned by the component test `l4_surface::inject_shows_confirm`.
+//! on an elevated host; asserted-degraded otherwise.
 //!
 //! **Sandbox.** The Claude sandbox cannot bind TCP; when the bus bind is refused
 //! the test prints a note and returns, as `tui_live_bus.rs` does. Run it for real
@@ -66,11 +65,12 @@ use aitm_tui::action::{BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::model::FlowKind;
-use aitm_tui::snapshot::{render, to_text};
 use aitm_tui::theme::Theme;
 use aitm_tui::TransportChoice;
 use anyhow::Context as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::Rect;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{timeout, Instant};
@@ -219,12 +219,33 @@ fn is_permission_denied(e: &anyhow::Error) -> bool {
 
 // ---- the real-key driver ----------------------------------------------------
 
+/// The screen as text, styles dropped: `app` drawn through the TUI's own
+/// renderer into an off-screen `cols`×`rows` buffer, one symbol per cell, each
+/// line trimmed of trailing spaces, `\n`-joined and ending in `\n` — the same
+/// text `crates/aitm-tui/tests/common/mod.rs` reads.
+fn text_of(app: &App, cols: u16, rows: u16) -> String {
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(app, &Theme::new(true), area, &mut buf);
+    if cols == 0 {
+        return "\n".repeat(usize::from(rows));
+    }
+    // The cells are row-major, so each `cols`-long chunk is one row.
+    let mut out = String::new();
+    for row in buf.content().chunks(usize::from(cols)) {
+        let line: String = row.iter().map(Cell::symbol).collect();
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 /// The TUI driven headless: the real reducer, fed real keystrokes through the
-/// real key map and the live `BusEvent` stream, rendered through the real
-/// snapshotter. It is `aitm_tui::run`'s loop with the terminal I/O removed.
+/// real key map and the live `BusEvent` stream, rendered through the TUI's own
+/// `ui::render` into an off-screen buffer. It is `aitm_tui::run`'s loop with
+/// the terminal I/O removed.
 struct Cua {
     app: App,
-    theme: Theme,
     req_tx: mpsc::Sender<BusRequest>,
     ev_rx: mpsc::Receiver<BusEvent>,
 }
@@ -291,12 +312,7 @@ impl Cua {
 
     /// The operator-visible screen, rendered exactly as the terminal would draw it.
     fn screen(&self) -> String {
-        to_text(&render(
-            &self.app,
-            &self.theme,
-            self.app.width,
-            self.app.height,
-        ))
+        text_of(&self.app, self.app.width, self.app.height)
     }
 
     /// Press Down in the flow list until the selected flow is the L4 flow on
@@ -423,12 +439,7 @@ async fn tui_l4_cua_against_a_live_core() {
 
     let mut app = App::new(TermCaps::full(), label);
     let _ = app.update(aitm_tui::action::Action::Resize(200, 60));
-    let mut cua = Cua {
-        app,
-        theme: Theme::new(true),
-        req_tx,
-        ev_rx,
-    };
+    let mut cua = Cua { app, req_tx, ev_rx };
 
     // ---- STEP 0: connect; feature-detect l4.* ; the first live poll lands ----
     step(0, "connect to the live core; feature-detect the L4 surface");
@@ -583,7 +594,7 @@ async fn tui_l4_cua_against_a_live_core() {
                                  // Against a real core the enforcement is the guard, not the UI's dimming: an
                                  // out-of-scope packet is refused at the ingress and is **never captured**, so a
                                  // dimmed out-of-scope L4 flow cannot even exist in the store — a stronger
-                                 // property than the fixture-driven dimming. Drive one more refusal live.
+                                 // property than the UI's dimming. Drive one more refusal live.
     let refused_again = ingress.accept(captured(IFACE, "203.0.113.9", 80, udp_frame(80, b"evil")));
     assert_eq!(
         refused_again,
@@ -605,7 +616,7 @@ async fn tui_l4_cua_against_a_live_core() {
     );
     eprintln!(
         "[scope] out-of-scope capture refused at the ingress (no flow created); the UI's \
-         inject-disabled-with-scope-reason is pinned by l4_surface::out_of_scope_inject_disabled"
+         inject-disabled-with-scope-reason is a courtesy on top of this guard"
     );
 
     // ---- STEP 6: the Agent view's per-feature L4 toggle flips the gate (AC11) ----

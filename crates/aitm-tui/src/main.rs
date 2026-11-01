@@ -1,11 +1,7 @@
-//! `aitm-tui` — run the terminal operator UI against a proxy's bus, the
-//! recorded fixture, or render a snapshot of the main screen to a file.
+//! `aitm-tui` — run the terminal operator UI against a proxy's bus.
 //!
 //! ```text
 //! aitm-tui --bus 127.0.0.1:9090 --token-file ~/.aitm/bus.token [--poc-dir dir]
-//! aitm-tui --fixture [path.json]
-//! aitm-tui --snapshot out.svg [--cols 200 --rows 50] [--fixture path]
-//! aitm-tui --snapshot-core out.svg      (the 56 core tools only)
 //! ```
 //! `--poc-dir` is where a built PoC (`P`) is written — `poc.build` answers
 //! with the YAML text; it should be the proxy's `poc.dir` so `poc.run` can
@@ -20,10 +16,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use aitm_tui::caps::TermCaps;
-use aitm_tui::theme::Theme;
-use aitm_tui::{fixture_app, fixture_app_core, snapshot, RunOptions, TransportChoice};
+use aitm_tui::{RunOptions, TransportChoice};
 
-const USAGE: &str = "usage: aitm-tui (--bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] [--expect-role agent|operator] | --fixture [path]) [--poc-dir dir] [--ansi|--truecolor] [--poll ms]\n       aitm-tui --snapshot out.svg [--cols N --rows N]\n       aitm-tui --snapshot-core out.svg [--cols N --rows N]   (fixture limited to the 56 core tools)\n       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it\n       --expect-role: the role you expect the token to resolve to; the status line warns if it does not (it is never sent to the server)";
+const USAGE: &str = "usage: aitm-tui --bus host:port (--token-file p | --token t (insecure: visible in ps)) [--allow-remote-bus] [--expect-role agent|operator] [--poc-dir dir] [--ansi|--truecolor] [--poll ms]\n       --poc-dir: where P (poc.build) writes the PoC YAML; use the proxy's poc.dir so poc.run can read it\n       --expect-role: the role you expect the token to resolve to; the status line warns if it does not (it is never sent to the server)";
 
 /// Why a non-loopback bus is refused without the flag.
 const REMOTE_BUS_REFUSED: &str = "refusing a bus that is not on loopback: the token would travel in cleartext (the TLS bus is core follow-up F15). Pass --allow-remote-bus to do it anyway.";
@@ -32,12 +27,6 @@ struct Args {
     bus: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
-    fixture: Option<Option<PathBuf>>,
-    snapshot: Option<PathBuf>,
-    /// `--snapshot-core`: the fixture with only the 56 core tools.
-    snapshot_core: bool,
-    cols: u16,
-    rows: u16,
     caps: Option<TermCaps>,
     poll_ms: u64,
     allow_remote_bus: bool,
@@ -62,11 +51,6 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         bus: None,
         token: None,
         token_file: None,
-        fixture: None,
-        snapshot: None,
-        snapshot_core: false,
-        cols: 200,
-        rows: 50,
         caps: None,
         poll_ms: 500,
         allow_remote_bus: false,
@@ -85,18 +69,6 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--bus" => a.bus = Some(value(&mut i, "--bus")?),
             "--token" => a.token = Some(value(&mut i, "--token")?),
             "--token-file" => a.token_file = Some(PathBuf::from(value(&mut i, "--token-file")?)),
-            "--fixture" => {
-                let next = argv.get(i + 1).filter(|n| !n.starts_with("--")).cloned();
-                if next.is_some() {
-                    i += 1;
-                }
-                a.fixture = Some(next.map(PathBuf::from));
-            }
-            "--snapshot" => a.snapshot = Some(PathBuf::from(value(&mut i, "--snapshot")?)),
-            "--snapshot-core" => {
-                a.snapshot = Some(PathBuf::from(value(&mut i, "--snapshot-core")?));
-                a.snapshot_core = true;
-            }
             "--allow-remote-bus" => a.allow_remote_bus = true,
             "--poc-dir" => a.poc_dir = Some(PathBuf::from(value(&mut i, "--poc-dir")?)),
             "--expect-role" => {
@@ -107,16 +79,6 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                     ));
                 }
                 a.expect_role = Some(v);
-            }
-            "--cols" => {
-                a.cols = value(&mut i, "--cols")?
-                    .parse()
-                    .map_err(|e| format!("--cols: {e}"))?
-            }
-            "--rows" => {
-                a.rows = value(&mut i, "--rows")?
-                    .parse()
-                    .map_err(|e| format!("--rows: {e}"))?
             }
             "--poll" => {
                 a.poll_ms = value(&mut i, "--poll")?
@@ -144,27 +106,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    if let Some(out) = args.snapshot {
-        let app = if args.snapshot_core {
-            fixture_app_core(args.cols, args.rows)
-        } else {
-            fixture_app(args.cols, args.rows)
-        };
-        let theme = Theme::new(true);
-        let buf = snapshot::render(&app, &theme, args.cols, args.rows);
-        let body = match out.extension().and_then(|e| e.to_str()) {
-            Some("svg") => snapshot::to_svg(&buf),
-            Some("ans") | Some("ansi") => snapshot::to_ansi(&buf),
-            _ => snapshot::to_text(&buf),
-        };
-        std::fs::write(&out, body)?;
-        println!("wrote {}", out.display());
-        return Ok(());
-    }
-
-    let transport = match (args.fixture, args.bus) {
-        (Some(path), _) => TransportChoice::Fixture(path),
-        (None, Some(bus)) => {
+    let transport = match args.bus {
+        Some(bus) => {
             let addr: SocketAddr = bus.parse()?;
             check_bus_address(addr, args.allow_remote_bus).map_err(anyhow::Error::msg)?;
             let token = match (args.token, args.token_file) {
@@ -177,7 +120,7 @@ async fn main() -> anyhow::Result<()> {
             };
             TransportChoice::Tcp { addr, token }
         }
-        (None, None) => match std::env::var("AITM_BUS") {
+        None => match std::env::var("AITM_BUS") {
             Ok(bus) if !bus.is_empty() => {
                 let token = std::env::var("AITM_BUS_TOKEN").unwrap_or_default();
                 if token.is_empty() {
@@ -222,7 +165,10 @@ mod tests {
             "{USAGE}"
         );
         assert!(USAGE.contains("--allow-remote-bus"), "{USAGE}");
-        assert!(USAGE.contains("--snapshot-core"), "{USAGE}");
+        assert!(
+            !USAGE.contains("--fixture") && !USAGE.contains("--snapshot"),
+            "{USAGE}"
+        );
         let a = parse(&argv("--bus 127.0.0.1:9090 --token abc")).unwrap();
         assert_eq!(a.token.as_deref(), Some("abc"));
         assert!(!a.allow_remote_bus);
@@ -264,14 +210,20 @@ mod tests {
             a.poc_dir.as_deref(),
             Some(std::path::Path::new("/tmp/pocs"))
         );
-        assert_eq!(parse(&argv("--fixture")).unwrap().poc_dir, None);
         assert_eq!(
-            parse(&argv("--fixture --poc-dir")).err().as_deref(),
+            parse(&argv("--bus 127.0.0.1:9090 --token t"))
+                .unwrap()
+                .poc_dir,
+            None
+        );
+        assert_eq!(
+            parse(&argv("--bus 127.0.0.1:9090 --token t --poc-dir"))
+                .err()
+                .as_deref(),
             Some("--poc-dir needs a value")
         );
         assert!(USAGE.contains("[--poc-dir dir]"), "{USAGE}");
         assert!(USAGE.contains("poc.build"), "{USAGE}");
-        assert!(USAGE.contains("56 core tools"), "{USAGE}");
     }
 
     /// Decision B: `--expect-role` is a client-side expectation, accepting
@@ -305,14 +257,25 @@ mod tests {
         assert!(USAGE.contains("--expect-role"), "{USAGE}");
     }
 
+    /// The recorded fixture and the snapshot renderer were removed on
+    /// 2026-10-31 (spec 2026-10-31-remove-fake-data-ui-modes): their flags
+    /// are unknown arguments, refused with the usage, like any other typo.
     #[test]
-    fn snapshot_core_is_a_snapshot_with_the_core_fixture() {
-        let a = parse(&argv("--snapshot-core out.svg --cols 100 --rows 30")).unwrap();
-        assert_eq!(a.snapshot.as_deref(), Some(std::path::Path::new("out.svg")));
-        assert!(a.snapshot_core);
-        assert_eq!((a.cols, a.rows), (100, 30));
-        let a = parse(&argv("--snapshot out.svg")).unwrap();
-        assert!(!a.snapshot_core);
-        assert!(parse(&argv("--snapshot-core")).is_err());
+    fn fixture_and_snapshot_flags_are_unknown_arguments() {
+        for (argv_text, flag) in [
+            ("--fixture", "--fixture"),
+            ("--snapshot out.svg", "--snapshot"),
+            ("--snapshot-core out.svg", "--snapshot-core"),
+            ("--cols 100", "--cols"),
+        ] {
+            let err = parse(&argv(argv_text))
+                .err()
+                .unwrap_or_else(|| panic!("{argv_text} parsed; it must be refused"));
+            assert!(
+                err.starts_with(&format!("unknown argument `{flag}`")),
+                "{argv_text}: {err}"
+            );
+            assert!(err.contains("usage: aitm-tui"), "{argv_text}: {err}");
+        }
     }
 }

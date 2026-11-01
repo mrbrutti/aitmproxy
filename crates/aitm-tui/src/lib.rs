@@ -3,13 +3,11 @@
 //! A ratatui client of the command bus: the same flow list, inspector,
 //! intercept bar, compose, scope, PoC and agent surfaces as the macOS and web
 //! apps, drawn with the shared tokens and degraded the way §2.9 spells out.
-//! It talks to the proxy through [`aitm_bus_client`] over loopback TCP, over an
-//! in-process handler when `aitm tui` embeds the proxy, or against the
-//! recorded fixture for UI development.
+//! It talks to the proxy through [`aitm_bus_client`] over loopback TCP, or
+//! over an in-process handler when `aitm tui` embeds the proxy.
 //!
 //! Structure: [`app`] holds the state and reducer, [`bus`] the one task that
-//! talks to the proxy, [`ui`] and [`viewers`] draw, [`snapshot`] renders
-//! off-screen, [`fixture`] serves the recorded bus, [`open`] hands a file to
+//! talks to the proxy, [`ui`] and [`viewers`] draw, [`open`] hands a file to
 //! the desktop for `o`.
 
 pub mod action;
@@ -19,13 +17,11 @@ pub mod bus;
 pub mod caps;
 pub mod clipboard;
 pub mod filter;
-pub mod fixture;
 pub mod keys;
 pub mod l4;
 pub mod languages;
 pub mod model;
 pub mod open;
-pub mod snapshot;
 pub mod syntax;
 pub mod theme;
 pub mod tokens;
@@ -40,22 +36,17 @@ use std::time::Duration;
 use aitm_bus_client::{BusClient, InProcessHandler, InProcessTransport, TcpTransport};
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt as _;
-use serde_json::Value;
 use tokio::sync::mpsc;
 
-use crate::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
+use crate::action::{Action, Level};
 use crate::app::App;
 use crate::caps::TermCaps;
-use crate::fixture::{Fixture, FixtureTransport};
-use crate::model::{AgentState, Finding, FlowDetail, ProxyStatus};
 use crate::theme::Theme;
 
 /// Where the UI gets its bus.
 pub enum TransportChoice {
     /// A running proxy's loopback TCP transport.
     Tcp { addr: SocketAddr, token: String },
-    /// The recorded fixture (built-in when `None`).
-    Fixture(Option<PathBuf>),
     /// `aitm tui`: the proxy in this process; the handler is `McpServer::handle`.
     InProcess(InProcessHandler),
 }
@@ -112,18 +103,6 @@ pub fn connector(choice: TransportChoice) -> anyhow::Result<(bus::Connector, Str
                 })
             });
             (c, addr.to_string())
-        }
-        TransportChoice::Fixture(path) => {
-            let fixture = match path {
-                Some(p) => Fixture::parse(&std::fs::read_to_string(&p)?)?,
-                None => Fixture::builtin(),
-            };
-            let shared = fixture.shared();
-            let c: bus::Connector = Arc::new(move || {
-                let shared = shared.clone();
-                Box::pin(async move { Ok(BusClient::new(Box::new(FixtureTransport::new(shared)))) })
-            });
-            (c, "fixture".to_string())
         }
         TransportChoice::InProcess(handler) => {
             let c: bus::Connector = Arc::new(move || {
@@ -228,8 +207,8 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
 /// `session.load` / `flow.export` / `flow.import` (F10), `tls.passthrough.*`
 /// (F11), `map.add` / `map.list` / `map.remove` (Map) — and the M4 additions:
 /// `agent.status` / `agent.set` / `agent.activity` / `agent.approve` (F1) and
-/// `flow.subscribe` / `flow.unsubscribe` (F4). What [`fixture_app_core`] limits
-/// the fixture to; with M4 merged the whole fixture is now core.
+/// `flow.subscribe` / `flow.unsubscribe` (F4). `crates/aitm/tests/tui_live_bus.rs`
+/// pins this list against the running server's `tools/list`.
 pub const CORE_TOOLS: &[&str] = &[
     "flow.list",
     "flow.get",
@@ -347,151 +326,76 @@ pub const CORE_TOOLS: &[&str] = &[
     "check.l4-packet-reaction",
 ];
 
-/// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,
-/// with the paused login request selected — the state every snapshot and UI
-/// test starts from. The fixture's whole tool list is offered, F-gated
-/// commands included.
-pub fn fixture_app(cols: u16, rows: u16) -> App {
-    fixture_app_from(Fixture::builtin(), cols, rows)
-}
+/// An [`App`] for in-crate tests: `cols`×`rows`, connected to a bus that
+/// offers every [`CORE_TOOLS`] name. Flows, details and findings are not
+/// part of it; each test feeds the `BusEvent`s it needs as inline literals.
+#[cfg(test)]
+pub(crate) fn connected_app(cols: u16, rows: u16) -> App {
+    use crate::action::{BusEvent, ToolInfo};
 
-/// [`fixture_app`] against the bus as it exists today: only [`CORE_TOOLS`]
-/// are offered. Since the 2026-10-28 core merge that is everything but the
-/// F1 agent tools, so the agent toggle and panel show their degraded state
-/// and the rest is lit. This is what `aitm-tui --snapshot-core` renders.
-pub fn fixture_app_core(cols: u16, rows: u16) -> App {
-    load_fixture_app(Fixture::builtin(), cols, rows, true)
-}
-
-/// [`fixture_app`] from an already parsed fixture (`--fixture path`): its
-/// whole tool list is offered. A fixture is a developer's file, so a tool
-/// entry the client cannot read is a panic naming it, not a silent omission.
-pub fn fixture_app_from(fx: Fixture, cols: u16, rows: u16) -> App {
-    load_fixture_app(fx, cols, rows, false)
-}
-
-fn load_fixture_app(mut fx: Fixture, cols: u16, rows: u16, core_only: bool) -> App {
-    let mut app = App::new(TermCaps::full(), "fixture");
+    let mut app = App::new(TermCaps::full(), "test");
     let _ = app.update(Action::Resize(cols, rows));
-    let tools: Vec<ToolInfo> = fx
-        .tools
+    let tools = CORE_TOOLS
         .iter()
-        .map(|t| {
-            ToolInfo::from_json(t).unwrap_or_else(|e| panic!("bus-fixture.json tool entry: {e}"))
+        .map(|name| ToolInfo {
+            name: (*name).to_string(),
+            description: format!("{name} (test)"),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
         })
-        .filter(|t| !core_only || CORE_TOOLS.contains(&t.name.as_str()))
         .collect();
     let _ = app.on_bus(BusEvent::Connected {
-        server: format!("{} {}", fx.server_name, fx.server_version),
+        server: "aitmproxy test".into(),
         tools,
         role: None,
     });
-    // The handshake reads `proxy.status` (F7) when the bus has it.
-    if app.has_tool("proxy.status") {
-        if let Ok(v) = fx.call("proxy.status", &serde_json::Map::new()) {
-            let _ = app.on_bus(BusEvent::ProxyStatus(ProxyStatus::from_json(&v)));
-        }
-    }
-    let ids: Vec<String> = fx
-        .call("flow.list", &serde_json::Map::new())
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|v| v.as_str().map(str::to_string))
-        .collect();
-    let arg = |id: &str| -> serde_json::Map<String, Value> {
-        let mut m = serde_json::Map::new();
-        m.insert("id".into(), Value::String(id.to_string()));
-        m
-    };
-    let summaries: Vec<Value> = ids
-        .iter()
-        .filter_map(|id| fx.call("flow.get", &arg(id)).ok())
-        .collect();
-    let _ = app.on_bus(BusEvent::Flows(summaries));
-    if app.has_tool("flow.detail") {
-        for id in &ids {
-            if let Ok(v) = fx.call("flow.detail", &arg(id)) {
-                if let Some(d) = FlowDetail::from_json(&v) {
-                    let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
-                }
-            }
-        }
-    }
-    let _ = app.on_bus(BusEvent::Scope(fx.scope.clone()));
-    let _ = app.on_bus(BusEvent::Intercept(fx.intercept_armed));
-    // The L4 operator surface (ui-ext Part 3), when the bus offers it.
-    if app.has_tool("l4.flow.list") {
-        let ids: Vec<String> = fx
-            .call("l4.flow.list", &serde_json::Map::new())
-            .ok()
-            .and_then(|v| v.as_array().cloned())
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect();
-        let flows: Vec<Value> = ids
-            .iter()
-            .filter_map(|id| fx.call("l4.flow.get", &arg(id)).ok())
-            .collect();
-        let _ = app.on_bus(BusEvent::L4Flows(flows));
-    }
-    if app.has_tool("l4.scope.list") {
-        if let Ok(Value::Array(entries)) = fx.call("l4.scope.list", &serde_json::Map::new()) {
-            let _ = app.on_bus(BusEvent::L4Scope(entries));
-        }
-    }
-    if app.has_tool("l4.agent.status") {
-        if let Ok(v) = fx.call("l4.agent.status", &serde_json::Map::new()) {
-            let _ = app.on_bus(BusEvent::L4Agent(v));
-        }
-    }
-    if app.has_tool("agent.status") {
-        let mut agent = AgentState::default();
-        agent.apply_status(&fx.agent);
-        let _ = app.on_bus(BusEvent::Agent(agent));
-    }
-    // The PoC library (`poc.list`, files not run), then the recorded run
-    // results replayed as `poc.run` answers — oldest first, so the newest
-    // ends up on top — then the YAML each asks for through `poc.get`.
-    let mut pending = Vec::new();
-    if app.has_tool("poc.list") {
-        if let Ok(Value::Array(items)) = fx.call("poc.list", &serde_json::Map::new()) {
-            let library = items.iter().filter_map(Finding::from_json).collect();
-            pending.extend(app.on_bus(BusEvent::Findings(library)));
-        }
-    }
-    if app.has_tool("poc.run") {
-        for run in fx.findings.iter().rev() {
-            pending.extend(app.on_bus(BusEvent::CallOk {
-                name: "poc.run".into(),
-                value: run.clone(),
-            }));
-        }
-    }
-    for req in pending {
-        if let BusRequest::PocGet(path) = req {
-            let mut m = serde_json::Map::new();
-            m.insert("poc_path".into(), Value::String(path));
-            if let Ok(v) = fx.call("poc.get", &m) {
-                let _ = app.on_bus(BusEvent::CallOk {
-                    name: "poc.get".into(),
-                    value: v,
-                });
-            }
-        }
-    }
-    if app.has_tool("findings.list") {
-        if let Ok(v) = fx.call("findings.list", &serde_json::Map::new()) {
-            if let Some(items) = v.get("findings").and_then(Value::as_array) {
-                let list = items.iter().filter_map(Finding::from_script_json).collect();
-                let _ = app.on_bus(BusEvent::ScriptFindings(list));
-            }
-        }
-    }
-    // The replay above is a recording, not live events: no toasts from it.
-    app.toasts.clear();
-    app.selected = Some("f50".into());
     app
+}
+
+/// A `flow.get` summary in the core's wire shape, for in-crate tests: the
+/// one builder the `app`, `ui` and `ui::flows` test modules share.
+#[cfg(test)]
+pub(crate) fn summary(
+    id: &str,
+    method: &str,
+    authority: &str,
+    path: &str,
+    status: Option<u16>,
+    intercept: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": id, "kind": "http", "method": method, "scheme": "https",
+        "authority": authority, "path": path, "status": status,
+        "is_replay": false, "intercept": intercept,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tester (D7): the in-crate test bus offers every `CORE_TOOLS` name
+    /// exactly once and nothing more; its address `test` is not loopback
+    /// (so a screenshot goes through `poc.artifact`, never the local disk);
+    /// it is the size asked for; and it carries no flows, details, scope or
+    /// findings — every test writes those itself.
+    #[test]
+    fn connected_app_offers_every_core_tool_and_nothing_else() {
+        let app = connected_app(120, 30);
+        assert_eq!(app.tools.len(), CORE_TOOLS.len());
+        for name in CORE_TOOLS {
+            assert!(app.has_tool(name), "{name} is on the test bus");
+            assert_eq!(
+                app.tools.iter().filter(|t| t.name == *name).count(),
+                1,
+                "{name} listed once"
+            );
+        }
+        assert!(!app.is_loopback_bus());
+        assert_eq!((app.width, app.height), (120, 30));
+        assert!(app.flows.is_empty());
+        assert!(app.details.is_empty());
+        assert!(app.scope.is_empty());
+        assert!(app.findings.is_empty());
+        assert_eq!(app.selected, None);
+    }
 }

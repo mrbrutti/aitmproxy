@@ -62,7 +62,8 @@ impl TermCaps {
         }
     }
 
-    /// Every capability on: used for snapshots, which render the design palette.
+    /// Every capability on: what the off-screen test renders use, so they
+    /// draw the design palette.
     pub const fn full() -> Self {
         Self {
             truecolor: true,
