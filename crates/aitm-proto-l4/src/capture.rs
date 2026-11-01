@@ -298,12 +298,46 @@ pub fn start_capture(
 /// Compile the `Capture` scope entries for `interface` into a libpcap BPF filter —
 /// the first boundary that keeps out-of-scope traffic from ever being delivered.
 ///
-/// Returns `None` when the capture should not be narrowed at the BPF level: no
-/// `Capture` entry carries an address/port constraint, or at least one authorizes
-/// unconstrained traffic (narrowing then would wrongly drop packets that entry
-/// permits). The per-packet guard check remains authoritative in every case.
+/// The scope part is `None` when the capture should not be narrowed at the BPF
+/// level: no `Capture` entry carries an address/port constraint, or at least one
+/// authorizes unconstrained traffic (narrowing then would wrongly drop packets
+/// that entry permits). The per-packet guard check remains authoritative in every
+/// case.
+///
+/// On a loopback interface (`lo`, `lo0`, …) the core's own listener ports
+/// ([`L4Guard::self_ports`]) are ANDed out — `(<scope>) and not port 27431`, or
+/// `not (port 27431 or port 28182)` for several — whatever the scope says, so the
+/// kernel never delivers the bus's own frames (L4PAR-AC34, spec §2.1). The
+/// per-packet [`L4Guard::is_self_traffic`] drop in the capture loop is the
+/// authoritative second boundary.
 #[must_use]
 pub fn scope_filter(guard: &L4Guard, interface: &str) -> Option<String> {
+    let scope = scope_clause(guard, interface);
+    if !is_loopback_interface(interface) {
+        return scope;
+    }
+    let self_ports = guard.self_ports();
+    let exclusion = match self_ports.as_slice() {
+        [] => return scope,
+        [port] => format!("not port {port}"),
+        ports => format!(
+            "not ({})",
+            ports
+                .iter()
+                .map(|p| format!("port {p}"))
+                .collect::<Vec<_>>()
+                .join(" or ")
+        ),
+    };
+    Some(match scope {
+        Some(clause) => format!("({clause}) and {exclusion}"),
+        None => exclusion,
+    })
+}
+
+/// The scope half of [`scope_filter`]: the `Capture` entries for `interface`
+/// compiled to a BPF clause, or `None` when the capture should not be narrowed.
+fn scope_clause(guard: &L4Guard, interface: &str) -> Option<String> {
     let entries: Vec<L4ScopeEntry> = guard
         .list_scope()
         .into_iter()
@@ -332,6 +366,14 @@ pub fn scope_filter(guard: &L4Guard, interface: &str) -> Option<String> {
     }
 }
 
+/// Whether `interface` is a loopback interface: `lo` (Linux) or `lo<digits>`
+/// (`lo0` on macOS and the BSDs).
+fn is_loopback_interface(interface: &str) -> bool {
+    interface
+        .strip_prefix("lo")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Decode one delivered frame and, if the **same** guard authorizes it for
 /// `Capture`, append it to the flow. Out-of-scope, undecodable, or non-IP frames
 /// are silently dropped — never recorded.
@@ -343,6 +385,13 @@ fn record_frame(
     store: &dyn L4FlowStore,
     flow_id: L4FlowId,
 ) {
+    // The core's own traffic (a loopback frame to or from one of its listener
+    // ports — the bus's plaintext token line among it) is dropped before the
+    // scope check and before anything is recorded, whatever the scope says
+    // (L4PAR-AC34, spec §2.1).
+    if guard.is_self_traffic(&PacketSpec::endpoints(frame)) {
+        return;
+    }
     // A frame that carries no IP target cannot be in a CIDR-scoped capture.
     let Some(target) = packet_target(frame, interface, direction) else {
         return;
@@ -638,6 +687,161 @@ mod tests {
             scope_filter(&g, MOCK_IFACE),
             Some("(host 127.0.0.1) or (host 127.0.0.2)".to_string())
         );
+    }
+
+    /// A `Capture` entry on `lo0`, the macOS loopback (the plan's A10 tests speak
+    /// of the rig's interface).
+    fn lo0_entry(ports: (u16, u16)) -> L4ScopeEntry {
+        let mut e = entry(("127.0.0.1", 32), ports, L4Capability::Capture);
+        e.interface = "lo0".to_string();
+        e
+    }
+
+    /// A crafted IPv4/TCP frame 127.0.0.1:`src_port` → 127.0.0.1:`dst_port`
+    /// carrying a bus-shaped first line — the frame an agent would read the
+    /// operator token out of.
+    fn lo_tcp_frame(src_port: u16, dst_port: u16) -> Vec<u8> {
+        use crate::craft::TcpSpec;
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::LOCALHOST),
+                    dst: Some(Ipv4Addr::LOCALHOST),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(src_port),
+                    dst_port: Some(dst_port),
+                    ..TcpSpec::default()
+                }),
+                Layer::Raw(b"{\"token\": \"not-for-agents\"}\n".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds")
+    }
+
+    /// An empty `Capture` flow on `lo0` for `record_frame` to append into.
+    fn lo0_capture_flow(store: &dyn L4FlowStore) -> L4FlowId {
+        store.insert(L4Flow {
+            id: L4FlowId::new(),
+            kind: L4FlowKind::Capture,
+            bind: L4Bind {
+                interface: "lo0".to_string(),
+                filter: None,
+                queue: None,
+            },
+            packets: VecDeque::new(),
+            metadata: L4Meta::default(),
+        })
+    }
+
+    /// L4PAR-AC34 (plan A10): with self ports `{27431}` (the bus), a loopback
+    /// frame to the bus and its reply from the bus are never recorded — even
+    /// under a capture scope covering `127.0.0.1/32` on every port — while a
+    /// frame to an in-scope, non-self port is.
+    #[test]
+    fn self_traffic_is_never_recorded() {
+        let g = guard_with(vec![lo0_entry((0, u16::MAX))]);
+        g.set_self_ports([27431]);
+        let store = InMemoryL4FlowStore::new();
+        let flow_id = lo0_capture_flow(&store);
+
+        record_frame(
+            &lo_tcp_frame(51000, 27431),
+            "lo0",
+            L4Direction::Outbound,
+            &g,
+            &store,
+            flow_id,
+        );
+        record_frame(
+            &lo_tcp_frame(27431, 51000),
+            "lo0",
+            L4Direction::Outbound,
+            &g,
+            &store,
+            flow_id,
+        );
+        assert_eq!(
+            store.get(flow_id).expect("flow").packets.len(),
+            0,
+            "a frame to or from the bus port is never recorded"
+        );
+
+        record_frame(
+            &lo_tcp_frame(51000, 9099),
+            "lo0",
+            L4Direction::Outbound,
+            &g,
+            &store,
+            flow_id,
+        );
+        let flow = store.get(flow_id).expect("flow");
+        assert_eq!(flow.packets.len(), 1, "an in-scope non-self frame is kept");
+        assert_eq!(
+            PacketSpec::endpoints(&flow.packets[0].bytes).dst_port,
+            Some(9099)
+        );
+    }
+
+    /// L4PAR-AC34 (plan A10): on a loopback interface the scope-derived BPF
+    /// filter ANDs `not port …` for every self port (ascending); on any other
+    /// interface it is unchanged.
+    #[test]
+    fn scope_filter_excludes_self_ports() {
+        let g = guard_with(vec![lo0_entry((0, u16::MAX))]);
+        g.set_self_ports([27431]);
+        assert_eq!(
+            scope_filter(&g, "lo0"),
+            Some("(host 127.0.0.1) and not port 27431".to_string())
+        );
+
+        let g = guard_with(vec![lo0_entry((9000, 9999))]);
+        g.set_self_ports([28182, 27431]);
+        assert_eq!(
+            scope_filter(&g, "lo0"),
+            Some(
+                "(host 127.0.0.1 and portrange 9000-9999) and not (port 27431 or port 28182)"
+                    .to_string()
+            )
+        );
+
+        // An unconstrained loopback scope still excludes the core's own ports.
+        let mut any = lo0_entry((0, u16::MAX));
+        any.cidr = IpCidr {
+            addr: "0.0.0.0".parse().unwrap(),
+            prefix: 0,
+        };
+        let g = guard_with(vec![any]);
+        g.set_self_ports([27431]);
+        assert_eq!(scope_filter(&g, "lo0"), Some("not port 27431".to_string()));
+
+        // Linux `lo` is a loopback interface too.
+        let mut lo = lo0_entry((0, u16::MAX));
+        lo.interface = "lo".to_string();
+        let g = guard_with(vec![lo]);
+        g.set_self_ports([27431]);
+        assert_eq!(
+            scope_filter(&g, "lo"),
+            Some("(host 127.0.0.1) and not port 27431".to_string())
+        );
+
+        // A non-loopback interface: the filter is exactly what it was.
+        let g = guard_with(vec![entry(
+            ("127.0.0.1", 32),
+            (0, u16::MAX),
+            L4Capability::Capture,
+        )]);
+        g.set_self_ports([27431]);
+        assert_eq!(
+            scope_filter(&g, MOCK_IFACE),
+            Some("host 127.0.0.1".to_string())
+        );
+
+        // No self ports: a loopback filter is unchanged too.
+        let g = guard_with(vec![lo0_entry((0, u16::MAX))]);
+        assert_eq!(scope_filter(&g, "lo0"), Some("host 127.0.0.1".to_string()));
     }
 
     /// AC8 / deny-by-default: an empty scope refuses to start a capture — no permit,

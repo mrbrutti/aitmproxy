@@ -68,6 +68,13 @@ pub struct Features {
     /// scripting engine, so a script's `l4.scope.add` and the bus see one state (no
     /// divergent L4 engagement state).
     pub l4_shared: Option<L4Shared>,
+    /// The core's own listener ports **beyond** the proxy and browser-proxy ports
+    /// `cfg` already names: the loopback bus, the web UI and the MCP streamable-HTTP
+    /// port, each when the binary binds one. Assembly hands all of them to the L4
+    /// module, so no capture ever records a loopback frame to or from the core
+    /// itself — the bus's plaintext token line among it (L4PAR-AC34, spec §2.1).
+    /// The binary refines the set with the bound ports after binding.
+    pub l4_self_ports: Vec<u16>,
     /// The macOS NE live-capture feeder config. Opt-in and deny-by-default:
     /// `enabled` is false by default, so the default feature set never binds the
     /// capture listener. The feeder runs only when `enabled` and the build is macOS.
@@ -92,6 +99,7 @@ impl Default for Features {
             l4: L4Config::default(),
             l4_privilege: None,
             l4_shared: None,
+            l4_self_ports: Vec::new(),
             macos_capture: MacosCaptureConfig::default(),
         }
     }
@@ -435,6 +443,15 @@ pub fn assemble_with_scripts(
             ),
             None => L4Module::with_privilege(&features.l4, privilege),
         };
+        // Self-exclusion (L4PAR-AC34, spec §2.1): the core's own listener ports —
+        // the proxy and browser-proxy ports from `cfg`, plus the bus / web UI / MCP
+        // HTTP ports the binary knows — are handed to the module so no capture ever
+        // records the core's own loopback traffic, whatever the scope says.
+        let module = module.with_self_ports(
+            [cfg.listen.port(), cfg.browser.proxy_addr.port()]
+                .into_iter()
+                .chain(features.l4_self_ports.iter().copied()),
+        );
         l4_half = Some((module.guard(), module.store()));
         builder = builder.register_plugin(Box::new(module));
     }
@@ -884,6 +901,39 @@ mod tests {
         cfg.ca.dir = temp_ca_dir("l4-guard-off");
         let disabled = assemble_with(&cfg, &Features::default()).expect("assemble, l4 disabled");
         assert!(disabled.l4_guard.is_none());
+    }
+
+    /// L4PAR-AC34 (plan A10): assembly hands the L4 module the core's own
+    /// listener ports — the proxy and browser-proxy ports from `cfg` plus
+    /// `Features::l4_self_ports` (bus, web UI, MCP HTTP) — so no capture ever
+    /// records them.
+    #[test]
+    fn l4_self_ports_cover_the_cores_listeners() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("l4-self-ports");
+        cfg.listen = "127.0.0.1:28180".parse().unwrap();
+        cfg.browser.proxy_addr = "127.0.0.1:28181".parse().unwrap();
+        let shared = L4Shared {
+            guard: Arc::new(L4Guard::new(&L4Config {
+                enabled: true,
+                ..L4Config::default()
+            })),
+            store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
+        };
+        let features = Features {
+            l4: L4Config {
+                enabled: true,
+                ..L4Config::default()
+            },
+            l4_privilege: Some(L4Privilege::available()),
+            l4_shared: Some(shared.clone()),
+            l4_self_ports: vec![28182, 27431],
+            ..Features::default()
+        };
+        let assembled = assemble_with(&cfg, &features).expect("assemble with l4 enabled");
+        let guard = assembled.l4_guard.expect("l4 enabled exposes the guard");
+        assert_eq!(guard.self_ports(), vec![27431, 28180, 28181, 28182]);
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
     }
 
     /// `Assembled::governance` hands out the assembly's own `agent_state` and

@@ -428,6 +428,17 @@ impl L4Module {
         }
     }
 
+    /// Hand the module the core's **own** listener ports (proxy, embedded-browser
+    /// proxy, loopback bus, web UI, MCP streamable HTTP). They are set on the
+    /// module's guard, so no capture — bus, CLI or Rhai, all of which record
+    /// through this guard — ever records a loopback frame to or from one of them
+    /// (L4PAR-AC34, spec §2.1). Replaces any set already there.
+    #[must_use]
+    pub fn with_self_ports(self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.guard.set_self_ports(ports);
+        self
+    }
+
     /// The shared deny-by-default guard (an `Arc` clone).
     #[must_use]
     pub fn guard(&self) -> Arc<L4Guard> {
@@ -1044,6 +1055,20 @@ mod tests {
             invoke_no_params(&reg, "l4.intercept.status").expect("intercept.status answers"),
             availability_value(true, "available", None, "sessions")
         );
+    }
+
+    /// L4PAR-AC34 (plan A10): `with_self_ports` sets the core's own listener
+    /// ports on the module's guard, the one every `l4.capture.*` verb records
+    /// through.
+    #[test]
+    fn with_self_ports_sets_the_guard() {
+        let cfg = L4Config {
+            enabled: true,
+            ..L4Config::default()
+        };
+        let module = L4Module::with_privilege(&cfg, L4Privilege::available())
+            .with_self_ports([28182, 27431]);
+        assert_eq!(module.guard().self_ports(), vec![27431, 28182]);
     }
 
     /// L4PAR-AC4 (plan A4): privilege present but no `intercept` config ⇒

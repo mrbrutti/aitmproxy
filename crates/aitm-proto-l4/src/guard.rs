@@ -19,7 +19,7 @@
 //! one. A permit is an RAII token carrying a bounded send budget (size + count)
 //! and an in-flight slot released on drop. There is no unchecked path.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::L4Config;
+use crate::craft::PacketEndpoints;
 use crate::types::{
     IpCidr, L4Action, L4Capability, L4Proto, L4ScopeEntry, L4ScopeId, L4ScopeSource,
 };
@@ -286,6 +287,12 @@ pub struct L4Guard {
     /// enforcement point at once (a live, non-cosmetic switch).
     agent_gates: Arc<crate::gates::L4AgentGates>,
     in_flight: Arc<AtomicU32>,
+    /// The core's **own** listener ports (proxy, embedded-browser proxy, loopback
+    /// bus, web UI, MCP streamable HTTP), set by the binary once they are bound.
+    /// A loopback frame to or from one of them is the core's own traffic — the
+    /// bus's plaintext `{"token": …}` line among it — and is never recorded by a
+    /// capture, whatever the scope says (L4PAR-AC34, spec §2.1). Empty until set.
+    self_ports: RwLock<BTreeSet<u16>>,
 }
 
 impl L4Guard {
@@ -305,7 +312,55 @@ impl L4Guard {
             dangerous_dst_override: cfg.dangerous_dst_override,
             agent_gates: crate::gates::L4AgentGates::from_config(cfg),
             in_flight: Arc::new(AtomicU32::new(0)),
+            self_ports: RwLock::new(BTreeSet::new()),
         }
+    }
+
+    /// Replace the set of the core's own listener ports (see `self_ports` on the
+    /// struct). Port `0` is never a bound listener and is ignored, so a caller may
+    /// pass a not-yet-bound ephemeral port through unchanged.
+    pub fn set_self_ports(&self, ports: impl IntoIterator<Item = u16>) {
+        let set: BTreeSet<u16> = ports.into_iter().filter(|p| *p != 0).collect();
+        *self
+            .self_ports
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = set;
+    }
+
+    /// The core's own listener ports, ascending.
+    #[must_use]
+    pub fn self_ports(&self) -> Vec<u16> {
+        self.self_ports
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Whether a decoded frame is the core's own traffic: its source **or**
+    /// destination is a loopback address **and** its source **or** destination port
+    /// is one of [`self_ports`](L4Guard::self_ports). Such a frame must never be
+    /// recorded (L4PAR-AC34). A frame with no loopback address, or no port in the
+    /// set, is not self traffic.
+    #[must_use]
+    pub fn is_self_traffic(&self, ep: &PacketEndpoints) -> bool {
+        let loopback = ep
+            .src
+            .iter()
+            .chain(ep.dst.iter())
+            .any(|ip| ip.to_canonical().is_loopback());
+        if !loopback {
+            return false;
+        }
+        let set = self
+            .self_ports
+            .read()
+            .unwrap_or_else(PoisonError::into_inner);
+        ep.src_port
+            .iter()
+            .chain(ep.dst_port.iter())
+            .any(|p| set.contains(p))
     }
 
     /// The shared per-capability agent gates (an `Arc` clone). The module hands this
@@ -681,6 +736,47 @@ mod tests {
             assert!(matches!(addr, IpAddr::V6(_)), "block reported in v6 space");
             assert_eq!(prefix, 96 + 16, "169.254.0.0/16 mapped to a /112");
         }
+    }
+
+    /// L4PAR-AC34 (plan A10): the self-port set is replaced on each `set`,
+    /// read back ascending, ignores port 0 (never a bound listener), and
+    /// `is_self_traffic` is true only for a loopback frame whose src **or** dst
+    /// port is in the set.
+    #[test]
+    fn self_ports_and_self_traffic() {
+        use crate::craft::PacketEndpoints;
+        let g = L4Guard::new(&cfg());
+        assert!(
+            g.self_ports().is_empty(),
+            "no self ports until the binary sets them"
+        );
+
+        g.set_self_ports([28182, 27431, 27431, 0]);
+        assert_eq!(g.self_ports(), vec![27431, 28182]);
+
+        let ep = |src: &str, src_port: u16, dst: &str, dst_port: u16| PacketEndpoints {
+            proto: Some(L4Proto::Tcp),
+            src: Some(src.parse().unwrap()),
+            dst: Some(dst.parse().unwrap()),
+            src_port: Some(src_port),
+            dst_port: Some(dst_port),
+        };
+        assert!(g.is_self_traffic(&ep("127.0.0.1", 51000, "127.0.0.1", 27431)));
+        assert!(g.is_self_traffic(&ep("127.0.0.1", 27431, "127.0.0.1", 51000)));
+        assert!(g.is_self_traffic(&ep("::1", 51000, "::1", 28182)));
+        assert!(
+            !g.is_self_traffic(&ep("127.0.0.1", 51000, "127.0.0.1", 9099)),
+            "a loopback frame to a non-self port is not the core's own traffic"
+        );
+        assert!(
+            !g.is_self_traffic(&ep("10.0.0.5", 51000, "10.0.0.9", 27431)),
+            "a non-loopback frame is never self traffic, whatever its ports"
+        );
+        assert!(!g.is_self_traffic(&PacketEndpoints::default()));
+
+        g.set_self_ports([9]);
+        assert_eq!(g.self_ports(), vec![9], "set replaces, it does not union");
+        assert!(!g.is_self_traffic(&ep("127.0.0.1", 51000, "127.0.0.1", 27431)));
     }
 
     fn cfg() -> L4Config {
