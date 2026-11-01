@@ -758,6 +758,30 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1-11 | Tester | Important | `Cargo.lock` pinned the six new crates at 0.5.5 after the v0.5.6 merge | fixed in 8574223f |
+| 1 | Tester | Minor | `ScanErrorCode` carried eleven codes (`Cancelled`, `Clamped`) vs spec D3's nine | fixed in 2a3cf99b (plan text 15b14494) |
+| 11 | Tester | Minor | No hermetic test for the `main.rs` ws-language slot (binary-only wiring) | accepted by orchestrator 2026-10-31: covered by `skeleton_returns_none`, `wire::tests::skeleton_lane_slots_are_empty_today`, the real-boot proof, and T4's live cells |
+| 4 | Tester | Info | An empty profile document parses to `ScanProfile::default()` | accepted by orchestrator 2026-10-31: pinned by test; T1b refuses nameless/targetless profiles (`invalid_profile`) |
+| 3 | Security | Minor | `scope_filter` and `covering_scope_entry` compared `interface` literally and missed `"*"` entries | fixed in 801c63f3 (`interface_covers` helper used by all three callers) |
+| 2 | Security | Minor | `LateHandles` did not forward `send_opts`, so `record: Never`/`marks` were dropped through it | fixed in 801c63f3 |
+| 5 | Security | Minor | Derived `Debug` on `Payload`/`RawProbe`/`ProbeResponse`/`Frame` would print live session header values | fixed in 801c63f3 (redacting `Debug`); follow-up accepted 2026-10-31: `RawProbe.url` still prints verbatim and `L4Reply` keeps derived `Debug`; T2 redacts the query before any log line, T5 gives `L4Reply` a redacting `Debug` |
+| - | Security | n/a | `cargo audit` not runnable in the sandbox | orchestrator: run in the Terminal before integration; no external crate entered `Cargo.lock` in T1a |
+| 4 | Quality | Minor | `L4Seed` untagged enum errors could not name a mistyped key | fixed in 2019feef (`try_from = "L4SeedRaw"`) |
+| 3 | Quality | Minor | Interface-match rule duplicated between guard and capture | fixed in 801c63f3 (same helper as the Security finding) |
+| 1 | Quality | Minor | `ScanErrorCode` tokens hand-maintained in three places; `FromStr::Err = anyhow` | accepted by orchestrator 2026-10-31: the agreement test pins the three tables; a single token table and a unit error type go to T1b, the next writer of `vocab.rs` |
+| 6 | Quality | Minor | `Issue`/`IssueSummary` and `JobStatus`/`JobSummary` duplicate fields by hand | fixed in 2019feef (structural subset tests); flattening deferred to T1b |
+| 5 | Quality | Minor | `FrameKind` not comparable | fixed in 801c63f3 (`Copy, PartialEq, Eq, Hash`) |
+| 11 | Quality | Minor | `main.rs` language wiring is a copy-paste block per language | accepted by orchestrator 2026-10-31: style; refactor when a third language lands (T5/T6) |
+| 7, 11 | Quality | Minor | Null `Lane`/`Check`/`JobCtx`/`ProbeHost` stubs duplicated across crates | accepted by orchestrator 2026-10-31: a `testing` module in `aitm-scan-model` is T1b's first task as the next consumer |
+| 1, 6, 9 | Quality | Minor | Stale doc comments (`#[allow(unused_imports)]`, `Clamped.field`, fixture README generator, `SessionProfile` rename) | fixed in 2019feef |
+| 4 | Quality | Minor | `builtin_profiles()` restates two defaults | accepted by orchestrator 2026-10-31: explicit values keep the spec's "dry_run off" / "cases 500" visible |
+| 1, 10, 11 | Spec | Minor | `Cargo.lock` edited but declared by no task | fixed in 6ada1233 (ownership matrix: derived file) |
+| 2 | Spec | Minor | Spec D9.1/D12 attributed the `PipelineClient::send_opts` impl to T1b | fixed in 6ada1233 (spec D9.1 and D12 rows) |
+| 11 | Spec | Minor | D12 T1a row lacked the `aitm-plugin-scanner` setter exception | fixed in 6ada1233 |
+| 8 | Spec | Minor | Plan Task 8 omitted `StartResult.dry_run`; no fixture note | fixed in 6ada1233 (plan) and 2019feef (README note) |
+| 1 | Spec | Minor | `LaneKind` L4 doc comments misdescribed the two lanes | fixed in 2019feef |
+| 1 | Spec | Minor | `blake3` dependency comment named the wrong purpose | fixed in 2019feef |
+| 9 | Spec | Minor | Two `scan.checks.json` entries reused XSS metadata | fixed in 2019feef |
 
 ## Shipped
 
