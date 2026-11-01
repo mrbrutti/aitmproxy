@@ -1,17 +1,25 @@
 import AitmproxyKit
 import SwiftUI
 
-/// The paused request as editable raw bytes (S-038): an `NSTextView` with
+/// The paused message as editable raw bytes (S-038): an `NSTextView` with
 /// the syntax colours; edited lines take the amber edge; the footer counts
-/// the pending edits and offers Revert.
+/// the pending edits and offers Revert. `phase` picks the message: the request,
+/// or the response of a flow parked at the response head (S-041).
 struct RawRequestEditor: View {
     @Environment(Session.self) private var session
     var row: FlowRow
     var detail: FlowDetail
+    var phase: InterceptPhase = .request
     @State private var text = ""
     @State private var parseError: RawHTTP.ParseError?
 
-    private var draft: HTTPMessage { session.editDrafts[row.id] ?? detail.request }
+    /// The message as the proxy holds it now, and the copy Revert goes back to (one
+    /// mapping, `FlowDetail.message(for:)`; the panes show this editor only once that
+    /// message exists, so the fallback is never shown).
+    private var target: HTTPMessage { detail.message(for: phase) ?? detail.request }
+    private var original: HTTPMessage { detail.original(for: phase) ?? target }
+    private var draft: HTTPMessage { session.currentDraft(row.id) ?? target }
+    private var noun: String { phase.rawValue }
 
     var body: some View {
         // The editor is clipped to its frame and the footer is a bottom safe-area
@@ -21,7 +29,7 @@ struct RawRequestEditor: View {
                      onTextChange: { new in
             text = new
             do {
-                let message = try RawHTTP.parse(new)
+                let message = try RawHTTP.parse(new, expecting: phase)
                 parseError = nil
                 session.updateDraft(row.id, message)
             } catch {
@@ -35,7 +43,7 @@ struct RawRequestEditor: View {
         .onChange(of: row.id) { text = RawHTTP.render(draft); parseError = nil }
         // The Headers table (or a revert) changed the draft: re-render unless the text already says the same.
         .onChange(of: session.editDrafts[row.id]) {
-            if (try? RawHTTP.parse(text)) != draft { text = RawHTTP.render(draft); parseError = nil }
+            if (try? RawHTTP.parse(text, expecting: phase)) != draft { text = RawHTTP.render(draft); parseError = nil }
         }
     }
 
@@ -44,7 +52,7 @@ struct RawRequestEditor: View {
             Rule(color: Tok.Line.rule)
             HStack(spacing: Space.md) {
                 if let parseError {
-                    Text("Could not parse the request: \(parseError.description)")
+                    Text("Could not parse the \(noun): \(parseError.description)")
                         .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Intercept.deep.color)
                 } else if !session.removedHeaders(row.id).isEmpty {
                     // A deleted header can't be applied yet (flow.mutate has no removal
@@ -55,9 +63,18 @@ struct RawRequestEditor: View {
                         .lineLimit(1).truncationMode(.middle)
                         .accessibilityIdentifier("removal-warning")
                         .accessibilityValue(removed.joined(separator: ","))
+                } else if !session.unencodableHeaders(row.id).isEmpty {
+                    // flow.mutate carries one value per header name: a changed multi-value
+                    // header is not sent at all rather than collapsed to one line.
+                    let names = session.unencodableHeaders(row.id)
+                    Text("Multi-value header edits need a core follow-up — \(names.joined(separator: ", ")) will keep the original values")
+                        .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Intercept.deep.color)
+                        .lineLimit(1).truncationMode(.middle)
+                        .accessibilityIdentifier("multivalue-warning")
+                        .accessibilityValue(names.joined(separator: ","))
                 } else {
                     let n = session.pendingEditCount(row.id)
-                    Text(n == 0 ? "No edits yet — Resume forwards the request unchanged."
+                    Text(n == 0 ? "No edits yet — Resume forwards the \(noun) unchanged."
                          : "\(n) edit\(n == 1 ? "" : "s") pending — Apply & Resume sends your changes, then continues.")
                         .font(Tok.Face.ui(Tok.Typography.Size.sm)).foregroundStyle(Tok.Ink.tertiary.color)
                         // Deterministic read-back of the pending-edit count (CUA / a11y).
@@ -65,10 +82,10 @@ struct RawRequestEditor: View {
                         .accessibilityValue("\(n)")
                 }
                 Spacer()
-                if session.editDrafts[row.id] != nil {
+                if session.currentDraft(row.id) != nil {
                     FlatButton("Revert to Original") {
                         session.revertDraft(row.id)
-                        text = RawHTTP.render(detail.originalRequest ?? detail.request)
+                        text = RawHTTP.render(original)
                         parseError = nil
                     }
                 }
@@ -80,15 +97,19 @@ struct RawRequestEditor: View {
     }
 }
 
-/// Headers of a paused request as an editable table (S-037): name and value
-/// fields per row, ✕ removes, `Add Header` appends.
+/// Headers of a paused message as an editable table (S-037): name and value
+/// fields per row, ✕ removes, `Add Header` appends. `phase` picks the request
+/// or, for a flow parked at the response head, the response (S-041).
 struct EditableHeaderTable: View {
     @Environment(Session.self) private var session
     var row: FlowRow
     var detail: FlowDetail
+    var phase: InterceptPhase = .request
 
-    private var draft: HTTPMessage { session.editDrafts[row.id] ?? detail.request }
-    private var originalNames: Set<String> { Set((detail.originalRequest ?? detail.request).headers.map(\.name)) }
+    private var target: HTTPMessage { detail.message(for: phase) ?? detail.request }
+    private var original: HTTPMessage { detail.original(for: phase) ?? target }
+    private var draft: HTTPMessage { session.currentDraft(row.id) ?? target }
+    private var originalNames: Set<String> { Set(original.headers.map(\.name)) }
 
     var body: some View {
         ScrollView {
@@ -137,7 +158,7 @@ struct EditableHeaderTable: View {
     }
 
     private func isChanged(_ header: HTTPMessage.Header) -> Bool {
-        (detail.originalRequest ?? detail.request).header(header.name) != header.value
+        original.header(header.name) != header.value
     }
 
     private func binding(_ index: Int, _ key: WritableKeyPath<HTTPMessage.Header, String>) -> Binding<String> {

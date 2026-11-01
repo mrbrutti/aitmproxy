@@ -2,6 +2,46 @@
 
 Bugs found after the fact, with the rule each one taught. Newest first.
 
+## 2026-10-31 — Breakpoint rules never reached a live core
+
+Symptom: with any rule in Rules… (S-040), arming intercept on a real `aitm` failed
+with `bus error -32602: param rules: [0]: unknown param match`, so the whole
+`flow.intercept` call was refused and the rules only ever "worked" on fixtures.
+Found while proving S-041 live (a response-phase rule is the only way to park a
+response).
+Cause: `BreakpointRule.arguments` sent the app's own fields (`match`, `flag`) and
+the phase token `both`; the core accepts only `id name enabled phase url method
+host ws_dir`, phases `request|response|any`, and rejects one unknown key for the
+whole call. It also sent a regex pattern as a bare `url` string, which the core
+reads as a wildcard, and the core anchors a wildcard (`^…$` on the path) where the
+app's preview matches a plain pattern as a substring.
+Fix: the wire form carries only the core's fields, `any` for both phases, and
+`url` as the core's `{regex}` object: a regex rule travels as written, a wildcard
+as the regex the app's own preview uses (`*` any run, `?` one character, no
+`*`/`?` a substring, case-insensitive), because the core's wildcard form has no
+`?`, no substring match and is case-sensitive, so the preview and the core would
+disagree. `BusService.setIntercept` sends the objects unchanged. The live self-test arms a response rule and a
+request rule on a real core: the matching request parks, the other passes, and
+the edited response is what curl receives.
+Rule: a wire form is proven against the real core, never against the fixture
+double — one unknown key refuses the whole call and the fixture never says so.
+
+Superseded 2026-10-31 by #208: the core's wildcard now has the preview's semantics
+(`*` any run, `?` literal, substring when star-less, leading `/` path-only,
+case-insensitive, full URL or path), so a wildcard travels as `{wildcard}` as
+typed and `wildcardRegex` is gone; the field discipline above stands.
+
+## 2026-10-31 — The inspector kept the parked copy after Apply & Resume
+
+Symptom: after editing a parked response's status to 203 and pressing Apply &
+Resume, the row read 203 with the Edited pencil while the Response pane still
+showed `HTTP/1.1 200 OK` — the head cached when the flow was selected while parked.
+Cause: `flow.detail` is fetched on selection; `flow.mutate` + `flow.resume` change
+the flow on the core but nothing fetched the detail again.
+Fix: `applyAndResume` loads the detail again after the resume when edits were sent.
+Rule: after a command that changes a flow on the core, refresh what the inspector
+shows from the core; the row's summary is polled, the detail is not.
+
 ## 2026-10-28 — Removing a header from a paused request was a silent no-op
 
 Symptom: deleting a request header (the Headers table ✕, or deleting the line in
