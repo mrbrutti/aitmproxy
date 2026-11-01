@@ -352,7 +352,11 @@ Result: the status object above plus `"changed": true|false` and `"commands":
 and the state file exists → `changed: false`, no writes, `commands: []`. When it
 `points_at_us` with **no** state file (set by hand or by another instance), the
 verb snapshots and writes anyway so that a file exists and restore is possible
-(`changed: true`). Errors (`anyhow::Err`, so the frontends show the message):
+(`changed: true`). A set over an **existing** state file whose live state no longer
+`points_at_us` keeps that file's `previous` row for every service still equal
+to its `wrote` (our own endpoint is never recorded as "previous"); a service
+another tool took over since takes its live row (Linux: the same rule per key
+set). Added 2026-10-31 from fix F1, recorded by the panel. Errors (`anyhow::Err`, so the frontends show the message):
 the executor could not start a tool or timed out; a second change already in
 flight ("a system-proxy change is already in flight"); the call came from a
 process that is not serving (`listening == false`, see §D10); or a partial
@@ -386,7 +390,7 @@ source. When `mechanism == none` the sub-object is present with
 `state: "unsupported"` and no shell-out ever runs.
 
 `summarize` for the two mutating verbs: `"system proxy → 127.0.0.1:8080 (2
-services, 1 240 ms)"` / `"system proxy restored → 127.0.0.1:9090 (2 services,
+services, 1240 ms)"` / `"system proxy restored → 127.0.0.1:9090 (2 services,
 980 ms)"`.
 
 ### D7. Config block and the state file
