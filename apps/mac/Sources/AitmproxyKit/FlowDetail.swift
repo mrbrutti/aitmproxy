@@ -53,6 +53,23 @@ public struct ConnectionInfo: Hashable, Sendable {
     }
 }
 
+/// The tunnel facts of a `CONNECT` row as `flow.detail` reports them (#228, `meta.tunnel`
+/// `{mode, reason, bytes_up, bytes_down}` in `crates/aitm-plugins/src/detail.rs`): the
+/// outcome, the reason when there is one, and the bytes a passthrough tunnel relayed.
+public struct TunnelInfo: Hashable, Sendable {
+    public var mode: TunnelMode
+    public var reason: TunnelReason?
+    public var bytesUp: Int64?
+    public var bytesDown: Int64?
+
+    public init(mode: TunnelMode, reason: TunnelReason? = nil, bytesUp: Int64? = nil, bytesDown: Int64? = nil) {
+        self.mode = mode
+        self.reason = reason
+        self.bytesUp = bytesUp
+        self.bytesDown = bytesDown
+    }
+}
+
 /// Everything the inspector needs for one flow.
 public struct FlowDetail: Hashable, Sendable {
     public var id: FlowID
@@ -68,10 +85,16 @@ public struct FlowDetail: Hashable, Sendable {
     /// Set when a body is paged or truncated (F5 `flow.detail {body: range}`).
     public var requestBodyExtent: BodyExtent?
     public var responseBodyExtent: BodyExtent?
+    /// The tunnel facts of a `CONNECT` row (`meta.tunnel`, #228); nil for a flow that is
+    /// not a tunnel and from a core older than #228.
+    public var tunnel: TunnelInfo?
+    /// The core observed this flow without decrypting it (`meta.passive`; absent → false).
+    public var passive: Bool
 
     public init(id: FlowID, request: HTTPMessage, response: HTTPMessage? = nil,
                 connection: ConnectionInfo, originalRequest: HTTPMessage? = nil, timing: FlowTiming? = nil,
                 requestBodyExtent: BodyExtent? = nil, responseBodyExtent: BodyExtent? = nil,
+                tunnel: TunnelInfo? = nil, passive: Bool = false,
                 coreID: CoreID = .fixture) {
         self.id = id
         self.coreID = coreID
@@ -82,5 +105,7 @@ public struct FlowDetail: Hashable, Sendable {
         self.timing = timing
         self.requestBodyExtent = requestBodyExtent
         self.responseBodyExtent = responseBodyExtent
+        self.tunnel = tunnel
+        self.passive = passive
     }
 }
