@@ -1440,6 +1440,8 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 
 **Task 19 after T4 merges (coordinator heads-up, 2026-11-01):** T4's WS lane PR #227 lands before this PR: on the final main merge re-pin `skeleton_lane_slots_are_empty_today` (lane count flips to 1), re-run `api_catalog` (the `ws` namespace sits beside `probe.*` in `rhai.api.json`) and `production_languages()`; in `wire.rs`/`main.rs` pass `cfg.ssl_insecure` into `aitm_scan_ws::lane::build_with` / `language::build_with` (the WS lane verifies TLS by default); the `HostCallContextSource` run-kind signal (Task 4) is what T4's hook refusal relies on. Details: shared note `t4-ws-lane-handover.md`.
 
+**Integration state (2026-11-01, after main 448e75e0 + T4):** contract counts vs main: `EXPECTED_TOOLS` 62 → 90, `CORE_TOOLS` 65 → 93, `bus-fixture.json` 65 → 93 (20 T1b verbs + the eight `check.ws-*` manual verbs the engine registers for T4's lane); `collect_lanes_with(l4, TlsPolicy)` + `ws_tls_policy(cfg)` pass `ssl_insecure` to the WS lane and language (T4 exposes no TLS-mode accessor, so the test pins the handed policy; follow-up for T4: `WsLane::tls_policy()`); T4's literals gained the three model fields; `lane_slots_collect_the_landed_lanes` pins 1 lane. Stale "while T4 is unimplemented" comments in `main.rs`/`aitm-scan-ws/lib.rs`/`collect_native_checks` doc noted for the whole-branch fix round.
+
 Within a wave no two tasks share a file. `crates/aitm-plugin-rhai/src/lib.rs` is edited in
 wave 1 (Task 4) and wave 2 (Task 13); `crates/aitm-plugin-scanner/src/plugin.rs` in wave 4
 (Task 14) and wave 5 (Task 15); `crates/aitm-plugin-scanner/Cargo.toml` in wave 1 (Task 3) and
