@@ -122,7 +122,8 @@ def run_blind(op, target) -> tuple[list, int, dict]:
     sitemap = scan_call(op, "operator", "scan.sitemap", {"job": job})
     points_per_key: dict = {}
     for node in (sitemap.get("nodes") or []):
-        for name in (node.get("params") or []):
+        for param in (node.get("params") or []):
+            name = param.get("name") if isinstance(param, dict) else str(param)
             key = (node.get("path_template"), name)
             points_per_key[key] = points_per_key.get(key, 0) + 1
     return issues(op, "operator", job=job), seq0, points_per_key
