@@ -35,7 +35,7 @@ struct OverviewBreakdownRow: View {
                            labelWidth: Self.clientWidth, value: String(entry.count),
                            fraction: fraction(entry.count, of: breakdowns.clientMax),
                            action: { session.show(.apps, group: .client(entry.key)) })
-                        .help(entry.key)
+                        .help(AppIdentifier.tooltipText(entry.key))
                         .accessibilityLabel("\(entry.name), \(entry.count)")
                 }
             }

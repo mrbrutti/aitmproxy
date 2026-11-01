@@ -35,13 +35,19 @@ final class AppIdentityResolver {
     @ObservationIgnored private var icons = BoundedCache<String, NSImage>(capacity: 128)
     /// Identifiers with a lookup scheduled and not yet stored: one in-flight lookup per identifier.
     @ObservationIgnored private var inFlight: Set<String> = []
+    /// Identifiers resolved at least once. The poll loop's `enriched` never re-schedules one of
+    /// these after `verdicts` evicted it (stage-6 security S-M1: past 512 distinct identifiers the
+    /// poll would otherwise re-resolve the evicted ones every tick, forever); only a visible
+    /// `identity(for:)` read does, so re-resolution is bounded by what is on screen.
+    @ObservationIgnored private var seen = BoundedCache<String, Bool>(capacity: 4096)
     /// `onResolve` callbacks waiting for a verdict, by identifier.
     @ObservationIgnored private var pending: [String: [@MainActor (AppIdentity) -> Void]] = [:]
     /// `Tok.Size.icon`, read once here: the token is main-actor isolated (the app target's default
     /// isolation) and the lookup runs off the main actor, so it travels as a `nonisolated let`.
     nonisolated private let iconSide: CGFloat
 
-    init() {
+    /// One resolver serves every surface (D1): only `shared` may be built.
+    private init() {
         iconSide = Tok.Size.icon
     }
 
@@ -71,7 +77,7 @@ final class AppIdentityResolver {
     func enriched(_ client: ClientInfo) -> ClientInfo {
         guard let identifier = client.bundleID else { return client }
         if let verdict = verdicts[identifier] { return client.withResolvedName(verdict.name) }
-        schedule(identifier)
+        if seen[identifier] == nil { schedule(identifier) }
         return client
     }
 
@@ -86,6 +92,7 @@ final class AppIdentityResolver {
         let lookup = AppIdentifier.ownerMap[identifier] ?? identifier
         let ownerMapUsed = lookup != identifier
         // 3. The first candidate LaunchServices knows is the hit; the candidate is the matched id.
+        //    An oversize identifier has no candidates (Kit cap) and falls through to step 8 untouched.
         var hit: URL?
         var matched = lookup
         for candidate in AppIdentifier.candidates(for: lookup) {
@@ -114,14 +121,15 @@ final class AppIdentityResolver {
         //    is never used (it follows the Finder's extension setting).
         var name = Self.bundleName(of: owner) ?? AppIdentifier.fallbackName(for: identifier)
         if isService { name = AppIdentifier.serviceLabel(name) }
-        // 7. The owner's icon as a `Tok.Size.icon` square copy, never a template.
+        // 7. A `Tok.Size.icon` square copy of the owner's icon for this identifier, never a template;
+        //    `store` swaps it for the owner's shared image so every helper of one app shows one picture.
         let icon = Self.icon(forOwner: owner, side: iconSide)
         return AppIdentity(identifier: identifier, name: name, icon: icon, bundleURL: owner, isService: isService)
     }
 
     /// D2 step 4: `…/Google Chrome.app/Contents/Frameworks/…/Helpers/Google Chrome Helper.app`
     /// → `…/Google Chrome.app`; a hit with no `.app` component is its own owner.
-    nonisolated static func owner(of hit: URL) -> URL {
+    nonisolated private static func owner(of hit: URL) -> URL {
         let components = hit.pathComponents
         guard let index = components.firstIndex(where: { $0.hasSuffix(".app") }), index < components.count - 1
         else { return hit }
@@ -177,6 +185,7 @@ final class AppIdentityResolver {
             }
         }
         verdicts[verdict.identifier] = stored
+        seen[verdict.identifier] = true
         version += 1
         let callbacks = pending.removeValue(forKey: verdict.identifier) ?? []
         for body in callbacks { body(stored) }

@@ -220,7 +220,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     }
     ```
 
-    - `clients(in:)`: today's `Session.clients` body (count per `ClientInfo` value) with the
+    - `clients(in:)`: grouped by `groupKey`, the entry's `ClientInfo` being the first row's with that key
+      (I-2 ruling 2026-11-01; replaces today's `Session.clients` body, which counted per `ClientInfo` value), with the
       order **count desc, then `name` asc, then `groupKey` asc** — the third key is added here
       (plan call) so two "(Service)" rows of one owner order deterministically; rows with
       `client == nil` are skipped.
@@ -259,6 +260,9 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
     `contains(.client("com.apple.Safari"))` all `true`; `contains(.client("Safari")) == false`;
     `unpin(.clientHost(client: "x", host: "example.com"))` → `hosts == []`; pinning
     `.client("com.apple.Safari")` again → `apps.count == 1`.
+  - `clientsWithOneIdentifierAndTwoNamesAreOneApp` (I-2 pin): rows `("Chrome", com.google.Chrome, example.com)`,
+    `("Google Chrome", com.google.Chrome, example.com)`, `("Google Chrome", com.google.Chrome, www.apple.com)` →
+    one entry, `groupKey == "com.google.Chrome"`, `name == "Chrome"`, count 3; `hosts(forClient:)` = `[example.com: 2, www.apple.com: 1]`.
   - `boundedCacheEvictsOldestInserted` (AI-AC12): `var c = BoundedCache<String, Int>(capacity: 3)`;
     `c["a"] = 1; c["b"] = 2; c["c"] = 3; c["d"] = 4` → `c.count == 3`, `c["a"] == nil`, `c["d"] == 4`;
     then `c["b"] = 20; c["e"] = 5` → `c["c"] == nil`, `c["b"] == 20`, `c["e"] == 5`;
@@ -398,6 +402,8 @@ have no Kit test by construction (AppKit/SwiftUI); their proof is Task 8 plus th
 ---
 
 ### Task 5: Session tree state and the sidebar Apps tree
+
+> Checklist additions (stage-6 on PR #268): (1) the context-menu noun at `SidebarView.swift:158` must say "Host" for `.clientHost` too (today every non-`.host` group reads "App"); (2) delete `AppMark` (NSRunningApplication path) — `ClientMark` replaces it; (3) `Session.clients` becomes `ClientTree.clients(in: rows)` unless the one-line interim widening already landed it (Review log Q-M1); (4) every identifier tooltip is `AppIdentifier.tooltipText(id)` (security S-M3).
 
 - **Satisfies:** D4 (Session), D5, D7, D10 (sidebar rows); AI-AC13 (tripwires); proven live by
   AI-AC14, AI-AC15, AI-AC19, AI-AC20 (Task 8).
@@ -716,12 +722,29 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | 4 | Coder (noticed) | Minor | `apps/web/src/components/Icon.tsx` has no Lucide entry for `glyph.network.web = "network"`; nothing generates from `glyph.web`, so no gate breaks | follow-up (web), listed in Shipped |
 | 4 | Coder (noticed) | Minor | `Shell/SidebarView.swift` still holds `AppMark` (uses `NSRunningApplication`) | Task 5 replaces it with `ClientMark` as planned (waits for system-proxy PR 4) |
 | 7 | Coder (noticed) | Minor | two stale "gallery" words remain in KIT.md's token tables (`Tok.Ground.surface` "the gallery ground", section role "gallery section labels"), outside Task 7's three parts | follow-up docs sweep, listed in Shipped |
-| Kit half | Tester | Important | I-1 — `Shell/SidebarView.swift:35` and `:52` still build `.client(client.name)` while `FlowQuery` matches `.client(key)` against `groupKey`: in a build of this range an Apps row lists nothing and `isPinned(.client(name))` disagrees with key-stored pins | orchestrator GRANTED 2026-11-01 a two-token interim claim on `Shell/SidebarView.swift` (the `.client(client.name)` group at line 35 → `.client(client.groupKey)`; the pinned-app count lookup `$0.0.name == app` at the line-52 call site → `$0.0.groupKey == app`; nothing else in the file; observe-lane Task 13 re-merges over it); done by the orchestrating session in the I-1/I-2 fix commit; Task 5 still owns the rest of the file |
-| Kit half | Tester | Important | I-2 — `ClientTree.clients(in:)` grouped by the `ClientInfo` value while every other consumer groups by `groupKey` (two names under one identifier ⇒ two Apps rows, Overview 1) | ruled 2026-11-01 (architect): group by `groupKey`, first row's `ClientInfo`; spec D4 amended; fixed by the Task 2 coder + one pin test (SHA in the next commit) |
+| Kit half | Tester | Important | I-1 — `Shell/SidebarView.swift:35` and `:52` still build `.client(client.name)` while `FlowQuery` matches `.client(key)` against `groupKey`: in a build of this range an Apps row lists nothing and `isPinned(.client(name))` disagrees with key-stored pins | orchestrator GRANTED 2026-11-01 a two-token interim claim on `Shell/SidebarView.swift` (the `.client(client.name)` group at line 35 → `.client(client.groupKey)`; the pinned-app count lookup `$0.0.name == app` at the line-52 call site → `$0.0.groupKey == app`; nothing else in the file; observe-lane Task 13 re-merges over it); fixed in b45c3045 (orchestrating session); Task 5 still owns the rest of the file |
+| Kit half | Tester | Important | I-2 — `ClientTree.clients(in:)` grouped by the `ClientInfo` value while every other consumer groups by `groupKey` (two names under one identifier ⇒ two Apps rows, Overview 1) | ruled 2026-11-01 (architect): group by `groupKey`, first row's `ClientInfo`; spec D4 amended; fixed in b45c3045 (Task 2 coder) + pin test `clientsWithOneIdentifierAndTwoNamesAreOneApp` |
 | Kit half | Tester | Minor | M-1 — `sanitized` caps after trimming so a trailing space can survive the cap | accepted: spec-conformant; noted |
 | Kit half | Tester | Minor | M-2 — PR B's `ClientInfo.knownSourceApps` still names `com.apple.WebKit.Networking` "Safari" for one poll / imported rows (anti-goal 1); `Flow.swift` is do-not-touch | accepted for this PR; follow-up in Shipped (core/PR B table) |
 | Kit half | Tester | Minor | M-3 — glyph string literals remain in `ShellView.swift:367,406`, `SidebarPage.swift:38`, `SettingsView.swift:61`, `BrowserPanel.swift:108` (outside the Q10 fold) | accepted; follow-up in Shipped (token sweep) |
 | Kit half | Tester | Minor | M-4 — `ClientMark` / `AppIdentityResolver` unreferenced until Tasks 5/6 | by construction (plan waves); no action |
+| PR #268 | spec | Important | SP-I1 — plan Task 2 (`clients(in:)`: "count per `ClientInfo` value") and spec D1 ("today's `Session.clients` body … moved into the Kit") still described the pre-I-2 grouping | fixed in docs (this commit): both say grouped by `groupKey`, first row's `ClientInfo`; pin test named in Task 2's test list |
+| PR #268 | spec | Minor | SP-M1 — stale comment in `ClientTreeTests.swift:98` stated the pre-ruling "overwrite keeps age" rule above assertions that pin the refresh | fixed (this commit) |
+| PR #268 | spec | Minor | SP-M2 — I-1/I-2 Review-log rows carried no fix SHA | fixed in docs (this commit): `b45c3045` |
+| PR #268 | spec | Minor | SP-M3 — D2 step 6 had no rule for the all-nil name case the code handles (Task 4 deviation (d)) | fixed in docs (this commit): "if none sanitises, `AppIdentifier.fallbackName(for: id)`" |
+| PR #268 | spec | Minor | SP-M4 — AI-AC5 says "four true paths" but D1 listed three; the test's fourth (`.xpc/`) literal was the coder's | fixed in docs (this commit): fourth path added to D1 |
+| PR #268 | spec | Minor | SP-M5 — `Session.clients` (`Session.swift:360-364`) still groups by `ClientInfo` value until Task 5, so the Apps header can exceed the Overview tile in the I-2 scenario while the Kit half is on main alone | accepted (plan defers it to Task 5; recorded so the half-landed ruling is known) |
+| PR #268 | quality | Important | Q-I1 — `OverviewBreakdowns.clients` re-implemented `ClientTree.clients` (group by key, first-row name, count→name→key sort); the two copies drifted once already in this range (Tester I-2) | fixed (this commit): `clients = ClientTree.clients(in: http).map { ClientCount(key:name:count:) }`; `OverviewStats.clients` stays a one-liner |
+| PR #268 | quality | Minor | Q-M1 — `ClientTree.swift` doc comment says `Session.clients` calls it while `Session.swift:360-364` still carries the old `ClientInfo`-value loop (a third copy, the one running) | orchestrator asked 2026-11-01 to widen the Session.swift interim claim by one line (`var clients { ClientTree.clients(in: rows) }`); disposition recorded when answered |
+| PR #268 | quality | Minor | Q-M2 — stale "overwrite keeps age" test comment | = spec SP-M1, fixed (this commit) |
+| PR #268 | quality | Minor | Q-M3 — `AppIdentityResolver` had an internal `init()` beside `shared` (a second resolver with cold caches was constructible), `owner(of:)` internal among private siblings, step-7 comment described `store`'s job | fixed (this commit): `private init()`, `private static owner(of:)`, step-7 comment reworded |
+| PR #268 | quality | Minor | Q-M4 — tester suite: a runtime `#expect(shared is BoundedCache…)` that cannot fail stood in for a compile-time check; `boundedCacheOverwriteRefreshesTheOldest` re-proves a Coder property | fixed (this commit): `let _: any Sendable = …` with a comment; the overlapping test kept, overlap accepted in writing (it pins the refresh from the other key and the count) |
+| PR #268 | quality | Minor | Q-M5 — KIT.md documents Task 5/6 UI (app row anatomy, `FlowCellView.clientIcon`, pinned-app mark) that does not exist at this head; `SidebarView.swift:158` labels every non-`.host` group "App" so a `.clientHost` row would read "Pin App" | accepted in writing: a known forward state of the kit page (plan wave order), closed by the Task 5/6 PR; Task 5 checklist line added for the context-menu noun |
+| PR #268 | security | Important | S-I1 — identifier length unbounded off the wire (64 KiB `source_app` round-trips an import; a handoff identifier is signer-chosen, frame cap 1 MiB) and `candidates` materialised every dotted prefix eagerly, one `NSWorkspace` IPC per candidate: a 64 KiB all-dot id → ~2 GiB of strings + 65k IPCs in one detached task | fixed (this commit): `AppIdentifier.candidates` returns `[]` over `maxIdentifierBytes` 256 / `maxIdentifierComponents` 8 so the resolver goes straight to step 8; spec D1 + AI-AC1 literals; tester `candidatesRefuseOversizeIdentifiers` |
+| PR #268 | security | Minor | S-M1 — past 512 distinct identifiers the poll loop's `enriched` re-scheduled every evicted identifier each tick (eviction storm; `inFlight` unbounded) | fixed (this commit): `seen` (`BoundedCache`, 4096) marks identifiers resolved once; `enriched` never re-schedules them, only a visible `identity(for:)` read does |
+| PR #268 | security | Minor | S-M2 — the prefix walk lets an ad-hoc-signed local binary (`codesign -i com.apple.Safari.sync`) wear Safari's icon and "Safari (Service)"; the tooltip's raw id is the only tell | accepted as a design gap (the NE does not verify the signer); spec Open question 4; follow-up in Shipped: team-id beside `source_app` from the extension's audit token, resolver inherits only on a team match |
+| PR #268 | security | Minor | S-M3 — the Overview bar tooltip showed the raw `bundleID` (no Cc/Cf filter, no cap): a U+202E override makes the tail read as another vendor | fixed (this commit): `AppIdentifier.tooltipText(_:)` (Cc/Cf stripped, 256-char cap, no trimming) used by the bar `.help`; D10 rule; Task 5 uses it for the sidebar rows; tester `tooltipTextStripsFormatAndControlScalarsAndCaps` |
+| PR #268 | security | — | `unsafe` sign-off: none in range; no `@unchecked`/`nonisolated(unsafe)`; the `Handoff` wrapper was not needed | n/a |
 
 ## Shipped
 
@@ -733,4 +756,5 @@ Pre-filled 2026-11-01 — follow-ups accepted during implementation, each a smal
 2. KIT.md: drop the two stale "gallery" words in the token tables (Task 7 noticed).
 3. `Flow.swift` `knownSourceApps`: drop the `com.apple.WebKit.Networking → "Safari"` row so PR B's one-poll name matches `knownUnbundled` (Tester M-2; `Flow.swift` is do-not-touch here).
 4. Glyph-literal sweep: `ShellView.swift:367,406`, `SidebarPage.swift:38`, `SettingsView.swift:61`, `BrowserPanel.swift:108` → `Tok.Glyph.*` via gen-tokens (Tester M-3).
-5. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.
+5. Signer verification (security S-M2, spec Open question 4): the extension derives the team identifier from the flow's audit token and sends it beside `source_app`; the resolver inherits an owner's icon/name only on a team match — extension + core + Kit, its own spec.
+6. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.

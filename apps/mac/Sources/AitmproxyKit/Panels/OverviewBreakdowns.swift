@@ -64,21 +64,9 @@ public struct OverviewBreakdowns: Hashable, Sendable {
             .sorted { $0.value == $1.value ? $0.key.label < $1.key.label : $0.value > $1.value }
             .map { MethodCount($0.key, $0.value) }
 
-        var byClient: [String: ClientCount] = [:]
-        for row in http {
-            guard let client = row.client else { continue }
-            let key = client.groupKey
-            if let seen = byClient[key] {
-                byClient[key] = ClientCount(key: key, name: seen.name, count: seen.count + 1)
-            } else {
-                byClient[key] = ClientCount(key: key, name: client.name, count: 1)
-            }
-        }
-        clients = byClient.values.sorted { a, b in
-            if a.count != b.count { return a.count > b.count }
-            if a.name != b.name { return a.name < b.name }
-            return a.key < b.key
-        }
+        // One grouping rule for the Apps tree and these bars (stage-6 Q-I1): group by `groupKey`,
+        // first row's name, count desc → name asc → key asc, all owned by `ClientTree.clients`.
+        clients = ClientTree.clients(in: http).map { ClientCount(key: $0.groupKey, name: $0.name, count: $1) }
 
         l4Sessions = rows.filter { $0.l4 != nil }
 

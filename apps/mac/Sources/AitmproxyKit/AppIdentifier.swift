@@ -8,8 +8,15 @@ public enum AppIdentifier {
     /// `com.google.Chrome.helper.renderer` → `[…renderer, com.google.Chrome.helper, com.google.Chrome]`;
     /// fewer than three components → just the identifier. Three is the floor so the walk never
     /// reaches a bare vendor prefix (`com.google`) that could match an unrelated registration.
+    ///
+    /// An identifier over `maxIdentifierBytes` (UTF-8) or `maxIdentifierComponents` dotted parts is
+    /// never asked of LaunchServices: `[]`, so the resolver goes straight to the fallback name and the
+    /// process mark (stage-6 security S-I1: the identifier is signer-chosen and arrives unbounded from
+    /// an import or a handoff; one string per prefix and one IPC per candidate must stay bounded).
     public static func candidates(for identifier: String) -> [String] {
+        guard identifier.utf8.count <= maxIdentifierBytes else { return [] }
         let parts = identifier.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count <= maxIdentifierComponents else { return [] }
         guard parts.count >= 3 else { return [identifier] }
         var out = [identifier]
         var length = parts.count - 1
@@ -18,6 +25,25 @@ public enum AppIdentifier {
             length -= 1
         }
         return out
+    }
+
+    /// Longest identifier (UTF-8 bytes) LaunchServices is asked about. Apple's own bundle identifiers
+    /// are under 100 bytes; code-signing identifiers are normally the bundle id.
+    public static let maxIdentifierBytes = 256
+    /// Most dotted components LaunchServices is asked about (the walk is one IPC per component).
+    public static let maxIdentifierComponents = 8
+
+    /// The identifier as a tooltip (D10): control and format scalars (Cc, Cf — bidi overrides
+    /// included) removed, capped at `maxIdentifierBytes` characters, nothing else changed — no
+    /// trimming, no `.app` rule (stage-6 security S-M3: the raw `bundleID` is wire text).
+    public static func tooltipText(_ identifier: String) -> String {
+        let scalars = identifier.unicodeScalars.filter { scalar in
+            switch scalar.properties.generalCategory {
+            case .control, .format: false
+            default: true
+            }
+        }
+        return String(String.UnicodeScalarView(scalars).prefix(maxIdentifierBytes))
     }
 
     /// `node-5555…` → `node`: an identifier with no `.` whose tail is `-` + 16 or more lowercase

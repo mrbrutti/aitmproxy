@@ -95,7 +95,7 @@ import Testing
         #expect(c.count == 3)
         #expect(c["a"] == nil)
         #expect(c["d"] == 4)
-        // Overwriting keeps the key's age: "c" is now the oldest, not "b".
+        // Overwriting refreshes "b" to newest, so "c" is now the oldest (ruling 2026-11-01).
         c["b"] = 20
         c["e"] = 5
         #expect(c["c"] == nil)
