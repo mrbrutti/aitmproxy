@@ -41,11 +41,13 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
         the keys (a wording already on the strip is stale, H54); a head that never draws
         is reported with the banner, the Jobs cursor's job and the harness's own node
         counts (H39).
-  T7-20 hygiene: the seeded Cookie and Authorization values (and their first 12 hex
-        chars) never appear in any screen sample taken on the Scan surface (every sample
-        is kept, tagged with its surface, and grepped), and q ends the process with exit 0.
-        The values are seeded on `GET /` (the session-bearing flow the engine's session
-        reuse reads); the reflected `GET /search?q=<marker>` goes without them (H55).
+  T7-20 hygiene: the seeded Cookie value (and its first 12 hex chars) never appears in
+        any screen sample taken on the Scan surface (every sample is kept, tagged with
+        its surface, and grepped), and q ends the process with exit 0. The cookie is
+        seeded on `GET /` (the session-bearing flow the engine's session reuse reads);
+        the reflected `GET /search?q=<marker>` goes without it. No Authorization header
+        is seeded: session reuse replays it on every probe and aitm-testtarget answers a
+        fabricated bearer as unauthenticated, so nothing reflects (H55 as amended by T1b).
 
 Capability gates -> exit 77 (SKIP), nothing claimed:
   * no aitm-tui binary (AITM_TUI_BIN, a build output, or PATH);
@@ -1030,7 +1032,6 @@ class Ctx:
         self.names = names
         self.marker = ""
         self.cookie_secret = ""
-        self.auth_secret = ""
         self.jobs = {}
         self.l4_entry_id = None
 
@@ -1234,23 +1235,23 @@ def phases_of(samples):
 
 
 def step_seed(ctx):
-    """Two real GETs through the proxy. First `GET /` carrying the session material
-    (`Cookie: sid=..`, `Authorization: Bearer ..`): the flow the engine's session reuse
-    reads and picks its canary from, and the source of the T7-20 secrets. Then
-    `GET /search?q=<marker>` WITHOUT session headers: the /search node the crawl finds
-    and the one reflected-xss point the audit must attack. The third live run seeded
-    the material on /search itself; the engine made that flow the session canary
-    (`session reused · canary GET /search?q=..` in the Jobs detail), a canary is not
-    attacked, and the job raised nothing (H55)."""
+    """Two real GETs through the proxy. First `GET /` carrying the session cookie
+    (`Cookie: sid=..`, and nothing else): the flow the engine's session reuse reads,
+    and the source of the T7-20 secret. Then `GET /search?q=<marker>` WITHOUT the
+    cookie: the /search node the crawl finds and the one reflected-xss point the audit
+    attacks. The third live run seeded a `Cookie` and an `Authorization: Bearer
+    <fabricated>` on /search itself and raised nothing: T1b (the engine owner) ruled
+    that the canary is never excluded from the audit; session reuse replays the seeded
+    Authorization on every probe and aitm-testtarget answers an invalid bearer as
+    unauthenticated, with no reflection. So no Authorization header is seeded at all
+    (H55 as amended)."""
     c = ctx.c
-    session_headers = {"Cookie": f"sid={ctx.cookie_secret}",
-                       "Authorization": f"Bearer {ctx.auth_secret}",
-                       "Connection": "close"}
+    session_headers = {"Cookie": f"sid={ctx.cookie_secret}", "Connection": "close"}
     try:
         session = via_proxy(ctx.proxy_port, "GET", f"{ctx.target}/", headers=session_headers)
     except OSError as e:
         c.fatal("seed: the session-bearing GET / through the proxy failed", str(e))
-    c.check("seed: GET / with the session headers (Cookie, Authorization) answered 200 (H55)",
+    c.check("seed: GET / with the session cookie only (no Authorization header) answered 200 (H55)",
             session.status == 200, f"status {session.status}")
     url = f"{ctx.target}/search?q={ctx.marker}"
     try:
@@ -1961,8 +1962,8 @@ def step_t7_20(ctx):
     """T7-20: no seeded secret on any Scan-surface screen sample; `q` exits 0."""
     c, term = ctx.c, ctx.term
     leaks = ctx.ev.leaks("scan")
-    c.check("T7-20: no Scan-surface screen sample carried the seeded Cookie or Authorization "
-            f"value (whole or its first {SECRET_PREFIX} hex chars)",
+    c.check("T7-20: no Scan-surface screen sample carried the seeded Cookie value "
+            f"(whole or its first {SECRET_PREFIX} hex chars)",
             not leaks, f"{len(leaks)} of {ctx.ev.tagged('scan')} scan samples (index, tag, step): "
                        f"{leaks[:8]}; {len(ctx.ev.samples)} samples in all")
     for _ in range(4):
@@ -1999,10 +2000,9 @@ def main():
     # handler can redact whatever an exception carries.
     marker = "ts" + secrets.token_hex(4)
     cookie_secret = secrets.token_hex(16)
-    auth_secret = secrets.token_hex(16)
-    ev = Evidence([cookie_secret, auth_secret])
+    ev = Evidence([cookie_secret])
     try:
-        return run(tui, ev, marker, cookie_secret, auth_secret)
+        return run(tui, ev, marker, cookie_secret)
     except SystemExit:
         raise
     except Exception as e:  # noqa: BLE001
@@ -2018,7 +2018,7 @@ def quietly(step):
         pass
 
 
-def run(tui, ev, marker, cookie_secret, auth_secret):
+def run(tui, ev, marker, cookie_secret):
     booted = tgt = bus = push_client = pushes = term = ctx = None
     work = token_file = None
     try:
@@ -2096,7 +2096,7 @@ def run(tui, ev, marker, cookie_secret, auth_secret):
 
         c = Checks(ev.redact, screen=failing_screen, write=ev.write)
         ctx = Ctx(c, term, bus, pushes, ev, proxy_port, target, origin, target_port, names)
-        ctx.marker, ctx.cookie_secret, ctx.auth_secret = marker, cookie_secret, auth_secret
+        ctx.marker, ctx.cookie_secret = marker, cookie_secret
 
         if subscribed:
             c.note("push: the second bus client holds no flow.subscribe subscription "
