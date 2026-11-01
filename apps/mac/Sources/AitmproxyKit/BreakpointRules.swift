@@ -43,12 +43,20 @@ public struct BreakpointRule: Identifiable, Hashable, Sendable, Codable {
 
     /// Whether a flow matches this rule's URL and method. The URL pattern is
     /// evaluated against the full URL and against the path with its query;
-    /// either may match, as `crates/aitm-rules` does for the core.
+    /// either may match, as `crates/aitm-rules` does for the core. A wildcard
+    /// that starts with `/` is evaluated against the path only, and an empty
+    /// pattern matches nothing (the core rejects it; omit `url` for any URL).
     public func matches(_ row: FlowRow) -> Bool {
         if !method.isEmpty, method.uppercased() != row.method.label { return false }
+        if url.isEmpty { return false }
         // A pattern anchored at the path's start (`/api/*`, `^/v1/`) can never
         // match a subject that starts with a scheme, so the path is a subject too.
-        let subjects = [row.url, row.path + (row.query.map { "?" + $0 } ?? "")]
+        let pathSubject = row.path + (row.query.map { "?" + $0 } ?? "")
+        // A wildcard starting with `/` means the path (a URL never starts with
+        // `/`); against the full URL it would also match at the `//` of
+        // `scheme://` when the host starts with that segment (`/admin` vs
+        // `https://admin.example.com/transfer`).
+        let subjects = (matching == .wildcard && url.hasPrefix("/")) ? [pathSubject] : [row.url, pathSubject]
         switch matching {
         case .wildcard:
             return subjects.contains { Self.wildcardMatches(pattern: url, text: $0) }

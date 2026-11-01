@@ -44,5 +44,12 @@
     { "ac": "AC7 edge", "kind": "wildcard", "pattern": "*/a+b",                    "scheme": "https", "authority": "h.test", "path": "/aab", "expect": false },
     { "ac": "AC5 edge", "kind": "wildcard", "pattern": "*/admin",                  "scheme": "https", "authority": "h.test", "path": "/Admin", "expect": true },
     { "ac": "AC5 edge", "kind": "regex",    "pattern": "^/ADMIN$",                 "scheme": "https", "authority": "h.test", "path": "/admin", "expect": true },
-    { "ac": "AC5 edge", "kind": "regex",    "pattern": "(?-i)^/ADMIN$",            "scheme": "https", "authority": "h.test", "path": "/admin", "expect": false }
+    { "ac": "AC5 edge", "kind": "regex",    "pattern": "(?-i)^/ADMIN$",            "scheme": "https", "authority": "h.test", "path": "/admin", "expect": false },
+    { "ac": "AC17", "kind": "wildcard", "pattern": "/admin",   "scheme": "https", "authority": "admin.example.com", "path": "/transfer", "expect": false },
+    { "ac": "AC17", "kind": "wildcard", "pattern": "/admin",   "scheme": "https", "authority": "h.test",            "path": "/admin",    "expect": true },
+    { "ac": "AC17", "kind": "wildcard", "pattern": "/admin",   "scheme": "https", "authority": "h.test",            "path": "/v1/admin", "expect": true },
+    { "ac": "AC17", "kind": "wildcard", "pattern": "/api/*",   "scheme": "https", "authority": "api.example.com",   "path": "/other",    "expect": false },
+    { "ac": "AC17", "kind": "wildcard", "pattern": "*/login*", "scheme": "https", "authority": "login.example.com", "path": "/x",        "expect": true },
+    { "ac": "AC17", "kind": "regex",    "pattern": "/admin",   "scheme": "https", "authority": "admin.example.com", "path": "/transfer", "expect": true },
+    { "ac": "AC17", "kind": "regex",    "pattern": "^/admin",  "scheme": "https", "authority": "admin.example.com", "path": "/transfer", "expect": false }
   ] }

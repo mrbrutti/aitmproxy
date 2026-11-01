@@ -24,7 +24,7 @@ use aitm_core::{
     InterceptState, ParamDef, ParamSchema, Params, Plugin, Registry, ResumeHandle, TypeDesc, Value,
     Verdict,
 };
-use aitm_rules::{bus, compile, CompiledRule, Phase, Rule};
+use aitm_rules::{bus, check_rule_count, compile, CompiledRule, Phase, Rule};
 
 /// State the plugin (which parks flows on events) shares with its commands
 /// (which release them).
@@ -254,10 +254,11 @@ fn rule_param_fields() -> Vec<ParamDef> {
             "url",
             TypeDesc::Any,
             "URL match against the full request URL (scheme://host[:port]/path?query) and \
-             against the path alone; either may match. A wildcard string (* = any run, \
-             every other character literal, case-insensitive; with no * it matches as a \
-             substring), or {wildcard} / {regex} (a regex is searched, case-insensitive by \
-             default; (?-i) restores case).",
+             against the path; either may match. Omit to match any URL. A wildcard string: \
+             * = any run, other characters literal, case-insensitive; with a * it must match \
+             the whole URL or the whole path (*h.org*, not *h.org); with no * it is a \
+             substring; a leading / means the path only. Or {wildcard} / {regex}: a regex is \
+             searched, case-insensitive by default; (?-i) restores case.",
         ),
         field(
             "method",
@@ -277,12 +278,13 @@ fn rule_param_fields() -> Vec<ParamDef> {
     ]
 }
 
-/// Compile every rule object in a `rules` array, mapping a bad regex (or a
-/// malformed rule) to an `Err` that aborts the `flow.intercept` call.
+/// Compile every rule object in a `rules` array, mapping too many rules, a bad
+/// regex or a malformed rule to an `Err` that aborts the `flow.intercept` call.
 fn compile_rules(value: &Value) -> anyhow::Result<Vec<CompiledRule>> {
     let Value::Array(items) = value else {
         anyhow::bail!("param `rules` must be an array of rule objects");
     };
+    check_rule_count(items.len())?;
     items
         .iter()
         .enumerate()

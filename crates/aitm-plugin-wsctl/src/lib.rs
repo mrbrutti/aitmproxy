@@ -46,7 +46,7 @@ use aitm_core::{
     ParamSchema, Params, Plugin, Registry, ResumeHandle, TypeDesc, Value, Verdict, WsDir, WsOpcode,
 };
 use aitm_proto_ws::{InjectFrame, InjectRegistry};
-use aitm_rules::{bus, compile, CompiledRule, Phase, Rule};
+use aitm_rules::{bus, check_rule_count, compile, CompiledRule, Phase, Rule};
 
 /// State the plugin (which parks frames on events) shares with its commands
 /// (which arm it and release parked frames).
@@ -204,6 +204,7 @@ impl Command for WsIntercept {
                 Value::Array(a) => a,
                 other => anyhow::bail!("param `rules` must be an array, got {other:?}"),
             };
+            check_rule_count(arr.len())?;
             let mut compiled = Vec::with_capacity(arr.len());
             for (pos, item) in arr.iter().enumerate() {
                 let obj = match item {
@@ -637,6 +638,53 @@ mod tests {
         assert!(bus::parse_phase("bogus").is_err());
         assert!(parse_dir("sideways").is_err());
         assert!(parse_opcode("nope").is_err());
+    }
+
+    /// AC18: `ws.intercept` turns away more than 256 rules before compiling any,
+    /// and the previously armed set survives the rejected call; 256 is accepted.
+    #[test]
+    fn more_than_256_rules_are_rejected_and_leave_the_active_set() {
+        use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
+        use futures::future::BoxFuture;
+
+        struct StubClient;
+        impl ProxyClient for StubClient {
+            fn send(&self, _req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+                Box::pin(async { anyhow::bail!("stub client") })
+            }
+        }
+        let store = MemFlowStore::new();
+        let client = StubClient;
+        let guard = StdGuard::default();
+        let host = CommandHost::new(&store, &client, &guard, None);
+        let cmd = WsIntercept {
+            shared: Arc::default(),
+        };
+        let rules = |n: usize| {
+            Value::Array(
+                (0..n)
+                    .map(|_| Value::Object(obj(&[("ws_dir", Value::Str("c2s".into()))])))
+                    .collect(),
+            )
+        };
+        let params = |rules: Value| Params::new(obj(&[("rules", rules)]));
+
+        cmd.invoke(params(rules(1)), &host).expect("one rule arms");
+        let err = cmd
+            .invoke(params(rules(257)), &host)
+            .expect_err("257 rules are rejected");
+        assert_eq!(
+            err.to_string(),
+            "257 rules supplied; the limit is 256 per call"
+        );
+        assert_eq!(
+            lock(&cmd.shared.rules).len(),
+            1,
+            "the armed set survives the rejected call"
+        );
+        cmd.invoke(params(rules(256)), &host)
+            .expect("256 rules is the cap, inclusive");
+        assert_eq!(lock(&cmd.shared.rules).len(), 256);
     }
 
     #[test]

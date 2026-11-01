@@ -255,8 +255,9 @@ fn assert_states_full_url_subject(what: &str, description: &JsonValue) {
 
 /// AC15 (schema descriptions): every rule schema that shares the matcher states
 /// the full-URL-and-path subject. `flow.intercept` also spells out the wildcard
-/// and regex rules (case, substring, `(?-i)`), since it is the schema agents
-/// and surfaces read for a breakpoint rule.
+/// and regex rules (case, substring, whole-subject anchoring with a `*`,
+/// `(?-i)`), since it is the schema agents and surfaces read for a breakpoint
+/// rule.
 #[test]
 fn rule_schemas_state_the_full_url_subject() {
     let proxy = build_proxy(&config("schema")).expect("build proxy");
@@ -266,7 +267,7 @@ fn rule_schemas_state_the_full_url_subject() {
     let url = &intercept["properties"]["rules"]["items"]["properties"]["url"]["description"];
     assert_states_full_url_subject("flow.intercept rules[].url", url);
     let url = url.as_str().unwrap_or_default();
-    for phrase in ["case-insensitive", "substring", "(?-i)"] {
+    for phrase in ["case-insensitive", "substring", "whole URL", "(?-i)"] {
         assert!(
             url.contains(phrase),
             "flow.intercept rules[].url must state `{phrase}`; got: {url}"
@@ -293,9 +294,15 @@ fn rule_schemas_state_the_full_url_subject() {
 
 /// AC15 (operator docs): the intercept skill and the site state the same
 /// subject and rules as the schema, so an operator reading either learns that a
-/// host-bearing pattern works, a star-less one is a substring, and matching is
+/// host-bearing pattern works, a star-less one is a substring, a starred one
+/// must cover the whole URL or the whole path, and matching is
 /// case-insensitive. Read from the workspace checkout; the files are prose, so
 /// this pins the phrases the spec names rather than exact sentences.
+///
+/// Docs editors: `site/docs.html` and
+/// `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md` are pinned
+/// from here. If this test fails after a rewording, keep each listed phrase in
+/// the `url`-rule sentence (or change the list here together with the spec).
 #[test]
 fn operator_docs_state_the_full_url_subject() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -305,16 +312,16 @@ fn operator_docs_state_the_full_url_subject() {
             "aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md",
             &[
                 "full URL",
-                "path alone",
                 "case-insensitive",
                 "substring",
+                "whole URL",
                 "(?-i)",
             ][..],
         ),
         (
             "site/docs.html",
             "site/docs.html",
-            &["full URL", "path alone", "case-insensitive", "substring"][..],
+            &["full URL", "case-insensitive", "substring", "whole URL"][..],
         ),
     ] {
         let path = root.join(rel);

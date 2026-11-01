@@ -11,7 +11,9 @@ use aitm_core::{
     Body, ConnInfo, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpVersion,
     InterceptState, WsDir, WsFlow,
 };
-use aitm_rules::{compile, HostMatch, MatchCondition, Phase, Rule, RuleError, UrlMatch};
+use aitm_rules::{
+    check_rule_count, compile, HostMatch, MatchCondition, Phase, Rule, RuleError, UrlMatch,
+};
 
 fn conn() -> ConnInfo {
     ConnInfo {
@@ -126,8 +128,8 @@ fn oversized_regex_rejected() {
     let err = compile(rule(UrlMatch::Regex("a{1000}{1000}{100}".into())))
         .expect_err("a pattern over the size cap must be rejected, not balloon");
     assert!(matches!(err, RuleError::BadRegex { .. }));
-    // Tester: the pattern is valid syntax, so the rejection must come from the
-    // cap, not the parser; a `BadRegex` alone would also pass for a syntax error.
+    // The pattern is valid syntax, so the rejection must come from the cap, not
+    // the parser; a `BadRegex` alone would also pass for a syntax error.
     assert!(
         err.to_string().contains("size limit"),
         "rejection must name the size cap: {err}"
@@ -136,14 +138,15 @@ fn oversized_regex_rejected() {
 
 #[test]
 fn oversized_wildcards_rejected_under_size_cap() {
-    // Tester (spec Constraints: agent-supplied patterns are rejected, never
-    // panic, never balloon). A wildcard is compiled through the same capped
-    // builder, so a pathological one is rejected like a regex. A run of stars
-    // compiles to a `.*` program per star; a huge star-less literal compiles to
-    // one case-folded instruction per character. Both blow the 1 MiB cap.
-    let stars = "*".repeat(50_000);
+    // Spec Constraints: agent-supplied patterns are rejected, never panic, never
+    // balloon. A wildcard is compiled through the same capped builder, so a
+    // pathological one that fits under the byte cap is still rejected like a
+    // regex: a run of stars compiles to a `.*` program per star, and 4096 of
+    // them blow the 1 MiB cap. Anything longer never reaches the builder
+    // (`PatternTooLong`, pinned in `patterns_over_4096_bytes_are_rejected`).
+    let stars = "*".repeat(4096);
     let err = compile(rule(UrlMatch::Wildcard(stars)))
-        .expect_err("a 50k-star wildcard must be rejected under the size cap");
+        .expect_err("a 4096-star wildcard must be rejected under the size cap");
     assert!(matches!(err, RuleError::BadRegex { .. }));
     assert!(
         err.to_string().contains("size limit"),
@@ -151,52 +154,109 @@ fn oversized_wildcards_rejected_under_size_cap() {
         err.to_string().chars().take(120).collect::<String>()
     );
 
-    let literal = "a".repeat(256 * 1024);
-    let err = compile(rule(UrlMatch::Wildcard(literal)))
-        .expect_err("a 256 KiB star-less wildcard must be rejected under the size cap");
-    assert!(matches!(err, RuleError::BadRegex { .. }));
-    assert!(
-        err.to_string().contains("size limit"),
-        "rejection must name the size cap: {}",
-        err.to_string().chars().take(120).collect::<String>()
-    );
-
-    // A long-but-realistic pattern (a 4 KiB path) still compiles and matches.
-    let long_path = format!("/{}", "x".repeat(4096));
-    let compiled = compile(rule(UrlMatch::Wildcard(format!("*{long_path}"))))
-        .expect("4 KiB wildcard compiles");
+    // A long-but-realistic pattern (a 4 KiB literal path) still compiles and
+    // matches: `*` plus a 4095-byte path is exactly 4096 bytes.
+    let long_path = format!("/{}", "x".repeat(4094));
+    let pattern = format!("*{long_path}");
+    assert_eq!(pattern.len(), 4096);
+    let compiled = compile(rule(UrlMatch::Wildcard(pattern))).expect("4096-byte wildcard compiles");
     assert!(compiled.matches(&http_flow(&long_path), Phase::Request, None));
     assert!(!compiled.matches(&http_flow("/x"), Phase::Request, None));
 }
 
 #[test]
-fn empty_url_patterns_match_every_http_flow() {
-    // Tester: the degenerate end of the substring rule. `bus.rs` accepts
-    // `url: ""` (a bare string is a wildcard) and `{regex: ""}`, and an empty
-    // pattern is a substring of every subject, so both arm a match-everything
-    // rule on an HTTP flow, the same as omitting `url`. The macOS form refuses
-    // an empty pattern ("Enter a URL pattern") before it reaches the bus; the
-    // core does not. Pinned so a change here is deliberate.
-    let wildcard =
-        compile(rule(UrlMatch::Wildcard(String::new()))).expect("empty wildcard compiles");
-    assert!(wildcard.matches(&http_flow("/get"), Phase::Request, None));
-    assert!(wildcard.matches(
-        &http_flow_scheme("https", "GET", "h.test:443", ""),
-        Phase::Request,
-        None
-    ));
-    // Still an HTTP-only clause: a WebSocket flow has no URL to be a substring of.
-    assert!(!wildcard.matches(&ws_flow(), Phase::Request, None));
+fn patterns_over_4096_bytes_are_rejected() {
+    // AC18. The byte cap runs before the regex builder, so an over-long pattern
+    // that is also invalid regex syntax reports its length, not the syntax
+    // error, and a 256 KiB literal is turned away without being walked.
+    let at_cap = "a".repeat(4096);
+    compile(rule(UrlMatch::Wildcard(at_cap.clone()))).expect("a 4096-byte wildcard compiles");
+    compile(rule(UrlMatch::Regex(at_cap.clone()))).expect("a 4096-byte regex compiles");
+    compile(rule_with(MatchCondition {
+        host: Some(HostMatch::Wildcard(at_cap)),
+        ..cond()
+    }))
+    .expect("a 4096-byte host wildcard compiles");
 
-    let regex = compile(rule(UrlMatch::Regex(String::new()))).expect("empty regex compiles");
-    assert!(regex.matches(&http_flow("/get"), Phase::Request, None));
-    assert!(!regex.matches(&ws_flow(), Phase::Request, None));
+    let over = format!("[{}", "a".repeat(4096)); // 4097 bytes, and unterminated
+    for (what, r) in [
+        ("url wildcard", rule(UrlMatch::Wildcard(over.clone()))),
+        ("url regex", rule(UrlMatch::Regex(over.clone()))),
+        (
+            "host wildcard",
+            rule_with(MatchCondition {
+                host: Some(HostMatch::Wildcard(over.clone())),
+                ..cond()
+            }),
+        ),
+    ] {
+        let err = compile(r).expect_err(what);
+        assert_eq!(
+            err,
+            RuleError::PatternTooLong {
+                len: 4097,
+                max: 4096
+            },
+            "{what}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "pattern is 4097 bytes; the limit is 4096",
+            "{what}"
+        );
+    }
+
+    for huge in ["*".repeat(50_000), "a".repeat(256 * 1024)] {
+        let len = huge.len();
+        let err = compile(rule(UrlMatch::Wildcard(huge))).expect_err("over the byte cap");
+        assert_eq!(err, RuleError::PatternTooLong { len, max: 4096 });
+    }
+}
+
+#[test]
+fn more_than_256_rules_per_call_are_rejected() {
+    // AC18: the count check `flow.intercept` and `ws.intercept` both run before
+    // compiling anything, so a rejected call leaves the active rules alone.
+    check_rule_count(0).expect("no rules is fine");
+    check_rule_count(256).expect("256 rules is the cap, inclusive");
+    let err = check_rule_count(257).expect_err("257 rules is over the cap");
+    assert_eq!(
+        err,
+        RuleError::TooManyRules {
+            count: 257,
+            max: 256
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "257 rules supplied; the limit is 256 per call"
+    );
+}
+
+#[test]
+fn empty_url_patterns_are_rejected() {
+    // AC19: `bus.rs` accepts `url: ""` (a bare string is a wildcard) and
+    // `{regex: ""}`, and an empty pattern is a substring of every subject, so
+    // it would arm a match-everything rule by accident. The core refuses it, as
+    // the macOS form already does ("Enter a URL pattern"); omit `url` to match
+    // any URL.
+    for clause in [
+        UrlMatch::Wildcard(String::new()),
+        UrlMatch::Regex(String::new()),
+    ] {
+        let err = compile(rule(clause)).expect_err("an empty url pattern is rejected");
+        assert_eq!(err, RuleError::EmptyPattern);
+        assert_eq!(
+            err.to_string(),
+            "empty url pattern; omit `url` to match any URL"
+        );
+    }
 }
 
 #[test]
 fn anchored_empty_regex_matches_only_an_empty_path() {
-    // Tester: `^$` can never match the full URL (it always has a scheme), so it
-    // fires only through the second subject, and only when the path is empty.
+    // `^$` can never match the full URL (it always has a scheme), so it fires
+    // only through the second subject, and only when the path is empty.
     let compiled = compile(rule(UrlMatch::Regex("^$".into()))).expect("valid regex");
     assert!(compiled.matches(
         &http_flow_scheme("https", "GET", "h.test:443", ""),
@@ -212,7 +272,7 @@ fn anchored_empty_regex_matches_only_an_empty_path() {
 
 #[test]
 fn url_wildcard_case_folds_beyond_ascii() {
-    // Tester: case-insensitivity is the regex crate's Unicode fold, not an ASCII
+    // Case-insensitivity is the regex crate's Unicode fold, not an ASCII
     // lowercase, so a non-ASCII letter in a path folds too (the subject is what
     // the client sent; a raw UTF-8 path is legal on the wire).
     let compiled = compile(rule(UrlMatch::Wildcard("*/caf\u{c9}*".into()))).expect("valid");

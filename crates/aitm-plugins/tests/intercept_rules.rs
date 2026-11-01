@@ -324,3 +324,66 @@ fn host_bearing_rule_parks_matching_host() {
         "the other host's flow stays observed"
     );
 }
+
+/// AC18: more than 256 rules in one call is rejected before any is compiled,
+/// naming the cap, and the previously armed rule stays active; 256 is accepted.
+#[test]
+fn too_many_rules_is_error() {
+    let reg = registry();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    arm(
+        &reg,
+        &host,
+        params(&[
+            ("enabled", Value::Bool(true)),
+            (
+                "rules",
+                Value::Array(vec![rule_obj(&[
+                    ("url", Value::Str("*/admin".into())),
+                    ("phase", Value::Str("request".into())),
+                ])]),
+            ),
+        ]),
+    );
+
+    let rules = |n: usize| {
+        Value::Array(
+            (0..n)
+                .map(|_| rule_obj(&[("url", Value::Str("*/x*".into()))]))
+                .collect(),
+        )
+    };
+    let intercept = reg
+        .command("flow.intercept")
+        .expect("flow.intercept registered");
+
+    let err = intercept
+        .invoke(params(&[("rules", rules(257))]), &host)
+        .expect_err("257 rules are rejected");
+    assert_eq!(
+        err.to_string(),
+        "257 rules supplied; the limit is 256 per call"
+    );
+
+    // The earlier `*/admin` rule is still active.
+    let id = store.insert(http_flow("/admin"));
+    assert!(
+        dispatch_request(&reg, &store, id).is_some(),
+        "the valid rule survived the rejected call"
+    );
+
+    let out = intercept
+        .invoke(params(&[("rules", rules(256))]), &host)
+        .expect("256 rules is the cap, inclusive");
+    match out {
+        Value::Object(o) => match o.get("rules") {
+            Some(Value::Array(active)) => assert_eq!(active.len(), 256),
+            other => panic!("flow.intercept should echo the rules array, got {other:?}"),
+        },
+        other => panic!("flow.intercept should return an object, got {other:?}"),
+    }
+}
