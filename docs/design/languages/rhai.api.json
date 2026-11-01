@@ -688,13 +688,13 @@
       "name": "probe.timing_fit",
       "kind": "function",
       "signature": "probe.timing_fit(#{ requested_s: [..], observed_ms: [..] }) -> #{ correlated, slope, r }",
-      "description": "Fit observed response times against the delays the payloads asked for (ZAP's rule: correlation error 0.15, slope error 0.30, longer delays must take longer). Only inside a check closure."
+      "description": "Fit observed response times against the delays the payloads asked for (ZAP's rule: correlation error 0.15, slope error 0.30, longer delays must take longer). A pure helper: it reads only its arguments, so it is callable anywhere, not just inside a check closure."
     },
     {
       "name": "probe.levenshtein_ratio",
       "kind": "function",
       "signature": "probe.levenshtein_ratio(a, b) -> float",
-      "description": "How alike two strings are: 1.0 identical, 0.0 nothing in common. For boolean-blind comparisons against the baseline body; inputs are truncated to 32 KiB each. Only inside a check closure."
+      "description": "How alike two strings are: 1.0 identical, 0.0 nothing in common. For boolean-blind comparisons against the baseline body; inputs are truncated to 32 KiB each. A pure helper: it reads only its arguments, so it is callable anywhere, not just inside a check closure."
     }
   ],
   "reg": [
@@ -713,7 +713,7 @@
     {
       "name": "reg.add_check",
       "kind": "method",
-      "signature": "reg.add_check(#{ id, name, class, lanes, kinds, intensity, cost, technique, severity, confidence_max, description, remediation?, scope? }, |point| { ... }) -> verdict map | string | [verdict map, ...]",
+      "signature": "reg.add_check(#{ id, name, class, lanes, kinds, intensity, cost, technique, severity, confidence_max, description, needs_baseline?, wants_traits?, targets_session?, scope?, cwe?, remediation? }, |point| { ... }) -> verdict map | string | [verdict map, ...]",
       "description": "Register a scanner check, callable from load(reg): the metadata map tells the scheduler when to run it (remediation, scope, cwe, needs_baseline, wants_traits and targets_session are optional), and the closure returns a verdict map (outcome, confidence, evidence, detail, poc_hint, location), a plain string read as inconclusive, or an array of verdict maps: the first is the root verdict and the rest are its siblings, each becoming its own issue. A verdict's optional location: #{ path, name } overrides the issue location, so an origin-scoped check reports one issue per exposed path. Inside the closure the probe.* functions are available."
     }
   ],
