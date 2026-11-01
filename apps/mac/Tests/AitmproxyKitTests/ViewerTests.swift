@@ -2,6 +2,45 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
+/// Inputs for the diff and code-export suites: a login parked with one header added while it
+/// waited, the last response the login endpoint sent (pretty JSON the printer must leave
+/// alone), and a product listing with a query.
+private enum ViewerInputs {
+    static let loginRow = Make.row(seq: 50, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login",
+                                  state: .paused, edited: true)
+    static let loginDetail = Make.detail(
+        id: "00000050-0000-4000-8000-000000000050",
+        request: Make.message(
+            "POST /api/auth/login HTTP/2",
+            [("host", "auth.shop-staging.test"), ("content-type", "application/json"), ("accept", "*/*"),
+             ("user-agent", "curl/8.7.1"), ("x-forwarded-for", "127.0.0.1")],
+            body: "{\n  \"email\": \"ops@shop-staging.test\",\n  \"password\": \"correct-horse-battery\",\n  \"remember\": true\n}"))
+    static let loginResponse = Make.response(200, [
+        ("content-type", "application/json; charset=utf-8"),
+        ("set-cookie", "session=9f1c…; HttpOnly; Secure; SameSite=Lax"),
+        ("cache-control", "no-store"),
+        ("content-length", "318"),
+    ], body: """
+    {
+      "token": "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJvcHMiLCJyb2xlIjoiYWRtaW4ifQ.…",
+      "expires_in": 3600,
+      "user": {
+        "id": 1042,
+        "email": "ops@shop-staging.test",
+        "role": "admin",
+        "mfa_enrolled": false
+      },
+      "set_cookie": "session=…; HttpOnly; Secure; SameSite=Lax"
+    }
+    """)
+    static let productsRow = Make.row(seq: 41, host: "api.shop-staging.test", path: "/api/products",
+                                     query: "category=electronics&limit=20", status: 200)
+    static let productsDetail = Make.detail(
+        id: "flow-41",
+        request: Make.message("GET /api/products?category=electronics&limit=20 HTTP/2",
+                              [("host", "api.shop-staging.test"), ("accept", "application/json")]))
+}
+
 // MARK: - JSON tree
 
 @Suite struct JSONTreeViewerTests {
@@ -154,8 +193,8 @@ import Testing
         #expect(JSONTree.copyText(for: root, indent: 4).hasPrefix("{\n    \"user\": {\n        \"id\": 1042,"))
     }
 
-    @Test func prettyRoundTripsTheFixtureBody() throws {
-        let body = try #require(Fixtures.previousLoginResponse.body)
+    @Test func prettyLeavesAPrettyBodyUnchanged() throws {
+        let body = try #require(ViewerInputs.loginResponse.body)
         let original = try #require(String(data: body, encoding: .utf8))
         #expect(JSONTree.pretty(body) == original)
         #expect(JSONTree.pretty(Data("not json".utf8)) == nil)
@@ -310,8 +349,8 @@ import Testing
         #expect(!TextDiff(old: "small", new: "small").truncated)
     }
 
-    @Test func flowDiffOverTwoFixtureDetails() throws {
-        let a = Fixtures.pausedLogin
+    @Test func flowDiffOverTwoDetails() throws {
+        let a = ViewerInputs.loginDetail
         var b = a
         b.id = FlowID("other")
         b.request.headers = b.request.headers.map { header in
@@ -333,7 +372,7 @@ import Testing
     }
 
     @Test func flowDiffNormalisesJSONBodies() {
-        let a = Fixtures.pausedLogin
+        let a = ViewerInputs.loginDetail
         var b = a
         b.request.body = Data(#"{"email":"ops@shop-staging.test","password":"correct-horse-battery","remember":true}"#.utf8)
         #expect(!FlowDiff.compare(a, b).sections[1].diff.hasChanges)
@@ -344,7 +383,7 @@ import Testing
     }
 
     @Test func flowDiffHeadAndBodyText() {
-        #expect(FlowDiff.headText(Fixtures.previousLoginResponse).hasPrefix("HTTP/2 200 OK\ncontent-type: application/json; charset=utf-8\n"))
+        #expect(FlowDiff.headText(ViewerInputs.loginResponse).hasPrefix("HTTP/2 200 OK\ncontent-type: application/json; charset=utf-8\n"))
         let binary = HTTPMessage(startLine: "HTTP/2 200 OK", headers: [.init("content-type", "application/octet-stream")],
                                  body: Data([0x00, 0xFF]))
         #expect(FlowDiff.bodyText(binary) == "00000000  00 ff" + String(repeating: " ", count: 43) + "  ..")
@@ -355,8 +394,8 @@ import Testing
 // MARK: - Code export
 
 @Suite struct CodeExportViewerTests {
-    let row = Fixtures.rows[9]
-    let detail = Fixtures.pausedLogin
+    let row = ViewerInputs.loginRow
+    let detail = ViewerInputs.loginDetail
 
     static let expectedCurl = """
     curl -X POST 'https://auth.shop-staging.test/api/auth/login' \\
@@ -373,7 +412,6 @@ import Testing
     """
 
     @Test func curlForThePausedLogin() {
-        #expect(row.seq == 50)
         #expect(CodeExport.curl(detail, row: row) == Self.expectedCurl)
     }
 
@@ -389,7 +427,7 @@ import Testing
                                          headers: [.init("accept-encoding", "gzip, br")], body: nil)
         #expect(CodeExport.curl(encoded) == "curl 'https://h/' \\\n  -H 'accept-encoding: gzip, br' \\\n  --compressed")
         #expect(!CodeExport.curl(encoded).contains("-k"))
-        let request = CodeExport.Request(Fixtures.detail(for: Fixtures.rows[0]), row: Fixtures.rows[0])
+        let request = CodeExport.Request(ViewerInputs.productsDetail, row: ViewerInputs.productsRow)
         #expect(request.url == "https://api.shop-staging.test/api/products?category=electronics&limit=20")
         #expect(request.method == "GET")
 

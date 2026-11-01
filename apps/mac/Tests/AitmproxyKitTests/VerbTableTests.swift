@@ -4,10 +4,13 @@ import Testing
 
 /// One verb table for row actions: titles, keys and enabled rules for every surface.
 @Suite struct VerbTableTests {
-    static let paused = Fixtures.rows.first { $0.state == .paused }!
-    static let pending = Fixtures.rows.first { $0.state == .pending }!
-    static let finished = Fixtures.rows.first { $0.state == .complete && $0.inScope && $0.comment == nil }!
-    static let outOfScope = Fixtures.rows.first { !$0.inScope }!
+    /// The four rows the table's rules turn on: parked, in flight, finished in scope, and out of scope.
+    static let paused = Make.row(seq: 1, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login",
+                                 state: .paused)
+    static let pending = Make.row(seq: 2, host: "cdn.shop-staging.test", path: "/assets/hero.webp", state: .pending)
+    static let finished = Make.row(seq: 3, host: "api.shop-staging.test", path: "/api/products", status: 200)
+    static let outOfScope = Make.row(seq: 4, method: .post, host: "telemetry.vendor-analytics.example", path: "/v2/batch",
+                                     status: 204, inScope: false)
 
     private func item(_ verb: FlowVerb, _ context: VerbContext?) -> VerbItem {
         VerbTable.item(verb, for: context)

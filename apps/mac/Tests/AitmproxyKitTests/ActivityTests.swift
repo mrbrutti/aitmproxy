@@ -72,15 +72,28 @@ import Testing
     }
 }
 
+/// Three scripts as `script.list` could report them — one active, one switched off, one that
+/// failed to compile — for `ScriptInfoTests.statusTextFollowsEnabledAndError`.
+private enum ScriptInfoInputs {
+    static let active = ScriptInfo(id: "strip-hsts", name: "Strip HSTS", ruleSummary: "*.shop-staging.test · response",
+                                   phases: ["response"], enabled: true)
+    static let disabled = ScriptInfo(id: "tag-agent-replays", name: "Tag agent replays",
+                                     ruleSummary: "api.shop-staging.test/api/* · GET POST", phases: ["request", "response"],
+                                     enabled: false)
+    static let broken = ScriptInfo(id: "ws-logger", name: "WebSocket frame logger",
+                                   ruleSummary: "wss://api.shop-staging.test/ws/*", phases: ["websocket"], enabled: true,
+                                   error: "line 12: unknown function 'frame.len' — did you mean 'frame.length'?")
+}
+
 @Suite struct ScriptInfoTests {
     @Test func statusTextFollowsEnabledAndError() {
-        #expect(Fixtures.scripts[0].statusText == "Saved and active")
-        #expect(Fixtures.scripts[1].statusText == "Disabled")
-        #expect(Fixtures.scripts[2].statusText.hasPrefix("Error: line 12"))
+        #expect(ScriptInfoInputs.active.statusText == "Saved and active")
+        #expect(ScriptInfoInputs.disabled.statusText == "Disabled")
+        #expect(ScriptInfoInputs.broken.statusText.hasPrefix("Error: line 12"))
         // Enabled with an error is not active: the Scripts page and the sidebar must agree.
-        #expect(Fixtures.scripts[0].isActive)
-        #expect(!Fixtures.scripts[1].isActive)
-        #expect(!Fixtures.scripts[2].isActive)
+        #expect(ScriptInfoInputs.active.isActive)
+        #expect(!ScriptInfoInputs.disabled.isActive)
+        #expect(!ScriptInfoInputs.broken.isActive)
     }
 
     @Test func decodesAScriptListItem() throws {

@@ -3,6 +3,77 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
+/// Inputs for `ScanTests`: the authorised hosts, the bus's tool list with and without the
+/// scanner, three captured flows, and a `scan.discover` answer that links to them.
+private enum ScanInputs {
+    static let scope = ["api.shop-staging.test", "auth.shop-staging.test"]
+
+    /// `scan.discover` as `tools/list` describes it: `target` required, two optional budgets.
+    static let discoverTool = ToolDescriptor(
+        name: "scan.discover",
+        description: "Discover reachable in-scope URLs under target and enumerate the injection points visible in captured requests. No injection or fuzzing is performed.",
+        inputSchema: [
+            "type": "object",
+            "properties": [
+                "target": ["type": "string", "description": "The in-scope seed URL, e.g. https://app.example/."],
+                "max_depth": ["type": "integer", "description": "Link depth to follow (clamped to the configured cap)."],
+                "max_pages": ["type": "integer", "description": "Pages to visit (clamped to the configured cap)."],
+            ],
+            "required": ["target"],
+            "additionalProperties": false,
+        ])
+    static let flowList = ToolDescriptor(
+        name: "flow.list", description: "List captured flow ids, oldest first.",
+        inputSchema: ["type": "object", "properties": [:], "additionalProperties": false])
+
+    /// A bus with the scanner plugin, and one without.
+    static let tools = [flowList, discoverTool]
+    static let toolsWithoutScan = [flowList]
+
+    static let productsID = "00000041-0000-4000-8000-000000000041"
+    static let ordersID = "00000045-0000-4000-8000-000000000045"
+    static let loginID = "00000050-0000-4000-8000-000000000050"
+
+    /// The three flows the answer below links to: a product listing with a query, an orders
+    /// page, and the login.
+    static let rows: [FlowRow] = [
+        Make.row(id: productsID, seq: 1, host: "api.shop-staging.test", path: "/api/products",
+                 query: "category=electronics&limit=20", status: 200),
+        Make.row(id: ordersID, seq: 2, host: "api.shop-staging.test", path: "/api/orders", query: "page=3", status: 502),
+        Make.row(id: loginID, seq: 3, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login", state: .paused),
+    ]
+
+    /// A `scan.discover` result over those rows: every endpoint and every injection point
+    /// names one of them (`endpoint_flows` is keyed by the same URL string `endpoints` lists),
+    /// and the secret-named points arrive redacted, as the scanner returns them.
+    static let discover: JSONValue = {
+        func point(_ flow: String, _ location: String, _ name: String, _ example: String) -> JSONValue {
+            ["flow": .string(flow), "location": .string(location), "name": .string(name), "example": .string(example)]
+        }
+        let products = "http://api.shop-staging.test/api/products?category=electronics&limit=20"
+        let orders = "http://api.shop-staging.test/api/orders?page=3"
+        let login = "http://auth.shop-staging.test/api/auth/login"
+        return [
+            "endpoints": [.string(products), .string(orders), .string(login)],
+            "endpoint_flows": [
+                products: .string(productsID),
+                orders: .string(ordersID),
+                login: .string(loginID),
+            ],
+            "injection_points": [
+                point(productsID, "query", "category", "electronics"),
+                point(productsID, "query", "limit", "20"),
+                point(ordersID, "query", "page", "3"),
+                point(loginID, "body_param", "email", "ops@shop-staging.test"),
+                point(loginID, "body_param", "password", "<redacted>"),
+                point(loginID, "cookie", "session", "<redacted>"),
+            ],
+            "pages_crawled": 3,
+            "stopped_reason": nil,
+        ]
+    }()
+}
+
 /// The Scan panel's model (scanner-integration Stage 1, AC5/AC6): the
 /// `scan.discover` result decoded as the bus delivers it, the launch form built
 /// from the tool schema, and the scope-bound, deny-by-default launch. The
@@ -38,8 +109,6 @@ import Testing
     static func decoded() throws -> ScanResult {
         try ScanResult(json: JSONValue.parse(resultJSON))
     }
-
-    static var discoverTool: ToolDescriptor? { Fixtures.tools.first { $0.name == "scan.discover" } }
 
     // MARK: Decoding
 
@@ -89,16 +158,18 @@ import Testing
         #expect(throws: (any Error).self) { try ScanResult(json: json) }
     }
 
-    /// The fixture runner (and a misbehaving core) can hand back a bare string.
+    /// A misbehaving core can hand back a bare string.
     @Test func aNonObjectResultIsRefused() {
-        #expect(throws: (any Error).self) { try ScanResult(json: .string("ok (fixture)")) }
+        #expect(throws: (any Error).self) { try ScanResult(json: .string("ok")) }
     }
 
-    @Test func theFixtureResultDecodesAndReferencesFixtureFlows() throws {
-        let result = try ScanResult(json: Fixtures.scanDiscover)
-        #expect(!result.endpoints.isEmpty)
-        #expect(!result.injectionPoints.isEmpty)
-        let known = Set(Fixtures.rows.map(\.id))
+    /// A result built as a `JSONValue` (not parsed from text) decodes the same way, and every
+    /// injection point names one of the captured rows.
+    @Test func aJSONValueResultDecodesAndItsPointsNameCapturedFlows() throws {
+        let result = try ScanResult(json: ScanInputs.discover)
+        #expect(result.endpoints.count == 3)
+        #expect(result.injectionPoints.count == 6)
+        let known = Set(ScanInputs.rows.map(\.id))
         #expect(result.injectionPoints.allSatisfy { known.contains($0.flowID) })
         #expect(result.injectionPoints.contains { $0.example == "<redacted>" })
     }
@@ -190,19 +261,19 @@ import Testing
     }
 
     /// A `scan.discover` answer whose `endpoint_flows` link every endpoint decodes with
-    /// one link per endpoint, and each link names the sample flow whose URL the endpoint is.
-    @Test func theFixtureLinksEveryEndpointToItsFixtureFlow() throws {
-        let result = try ScanResult(json: Fixtures.scanDiscover)
-        let rows = Dictionary(uniqueKeysWithValues: Fixtures.rows.map { ($0.id, $0) })
+    /// one link per endpoint, and each link names the captured flow whose URL the endpoint is.
+    @Test func everyLinkedEndpointResolvesToTheRowWhoseURLItIs() throws {
+        let result = try ScanResult(json: ScanInputs.discover)
+        let rows = Dictionary(uniqueKeysWithValues: ScanInputs.rows.map { ($0.id, $0) })
 
         #expect(result.endpointFlows.count == result.endpoints.count)
         for endpoint in result.endpoints {
             let flow = try #require(result.flowID(forEndpoint: endpoint), "\(endpoint) has a flow")
-            let row = try #require(rows[flow], "\(endpoint) links to a fixture flow")
+            let row = try #require(rows[flow], "\(endpoint) links to a captured flow")
             let tail = row.query.map { "\(row.path)?\($0)" } ?? row.path
             #expect(endpoint.hasSuffix("://\(row.authority)\(tail)"), "\(endpoint) is the URL of flow \(row.seq)")
         }
-        #expect(result.flowID(forEndpoint: "http://api.shop-staging.test/api/orders?page=3") == Fixtures.id(45))
+        #expect(result.flowID(forEndpoint: "http://api.shop-staging.test/api/orders?page=3") == FlowID(ScanInputs.ordersID))
     }
 
     // MARK: ScanState
@@ -255,22 +326,22 @@ import Testing
 
     @Test func anInScopeTargetLaunchesOneScopeBoundDiscover() {
         var state = ScanState()
-        let form = ScanForm(tool: Self.discoverTool, scopeHosts: Fixtures.scope)
-        let args = state.beginLaunch(form: form, scopeHosts: Fixtures.scope, tools: Fixtures.tools)
+        let form = ScanForm(tool: ScanInputs.discoverTool, scopeHosts: ScanInputs.scope)
+        let args = state.beginLaunch(form: form, scopeHosts: ScanInputs.scope, tools: ScanInputs.tools)
         #expect(args == ["target": .string("http://api.shop-staging.test/")])
         #expect(state.running)
         #expect(state.error == nil)
 
         // The running flag disables re-launch while the crawl is in flight.
-        #expect(state.beginLaunch(form: form, scopeHosts: Fixtures.scope, tools: Fixtures.tools) == nil)
+        #expect(state.beginLaunch(form: form, scopeHosts: ScanInputs.scope, tools: ScanInputs.tools) == nil)
         #expect(state.running)
     }
 
     @Test func anOutOfScopeTargetNeverLaunches() {
         var state = ScanState()
-        var form = ScanForm(tool: Self.discoverTool, scopeHosts: Fixtures.scope)
+        var form = ScanForm(tool: ScanInputs.discoverTool, scopeHosts: ScanInputs.scope)
         form.target = "https://telemetry.vendor-analytics.example/v2"
-        let args = state.beginLaunch(form: form, scopeHosts: Fixtures.scope, tools: Fixtures.tools)
+        let args = state.beginLaunch(form: form, scopeHosts: ScanInputs.scope, tools: ScanInputs.tools)
         #expect(args == nil, "nothing reaches the wire for an out-of-scope host")
         #expect(!state.running)
         #expect(state.error == "Out of scope — add telemetry.vendor-analytics.example to scope to scan it")
@@ -278,27 +349,27 @@ import Testing
 
     @Test func anEmptyScopeRefusesEveryTarget() {
         var state = ScanState()
-        var form = ScanForm(tool: Self.discoverTool, scopeHosts: [])
+        var form = ScanForm(tool: ScanInputs.discoverTool, scopeHosts: [])
         #expect(form.target.isEmpty, "nothing in scope to seed the target with")
         form.target = "http://api.shop-staging.test/"
-        #expect(state.beginLaunch(form: form, scopeHosts: [], tools: Fixtures.tools) == nil)
+        #expect(state.beginLaunch(form: form, scopeHosts: [], tools: ScanInputs.tools) == nil)
         #expect(!state.running)
         #expect(state.error?.hasPrefix("Out of scope") == true)
     }
 
     @Test func aBlankTargetNeverLaunches() {
         var state = ScanState()
-        var form = ScanForm(tool: Self.discoverTool, scopeHosts: [])
+        var form = ScanForm(tool: ScanInputs.discoverTool, scopeHosts: [])
         form.target = "   "
-        #expect(state.beginLaunch(form: form, scopeHosts: Fixtures.scope, tools: Fixtures.tools) == nil)
+        #expect(state.beginLaunch(form: form, scopeHosts: ScanInputs.scope, tools: ScanInputs.tools) == nil)
         #expect(state.error == "Choose an in-scope host to scan")
     }
 
     @Test func aBusWithoutTheScannerNeverLaunches() {
         var state = ScanState()
-        let form = ScanForm(tool: nil, scopeHosts: Fixtures.scope)
-        let withoutScan = Fixtures.tools.filter { $0.name != "scan.discover" }
-        #expect(state.beginLaunch(form: form, scopeHosts: Fixtures.scope, tools: withoutScan) == nil)
+        let form = ScanForm(tool: nil, scopeHosts: ScanInputs.scope)
+        let withoutScan = ScanInputs.toolsWithoutScan
+        #expect(state.beginLaunch(form: form, scopeHosts: ScanInputs.scope, tools: withoutScan) == nil)
         #expect(!state.running)
         #expect(state.error == "scan.discover is not on this bus (needs the scanner plugin)")
     }
@@ -327,8 +398,8 @@ import Testing
     // MARK: ScanForm
 
     @Test func theFormIsBuiltFromTheToolSchema() throws {
-        let tool = try #require(Self.discoverTool)
-        var form = ScanForm(tool: tool, scopeHosts: Fixtures.scope)
+        let tool = ScanInputs.discoverTool
+        var form = ScanForm(tool: tool, scopeHosts: ScanInputs.scope)
         #expect(form.fields == ["max_depth", "max_pages", "target"], "the schema's parameters, sorted by name")
         #expect(form.hasMaxDepth && form.hasMaxPages)
         #expect(form.target == "http://api.shop-staging.test/", "seeded with the first concrete in-scope host")
@@ -373,12 +444,12 @@ import Testing
         let narrow = ToolDescriptor(
             name: "scan.discover", description: "",
             inputSchema: ["type": "object", "properties": ["target": ["type": "string"]]])
-        form.sync(tool: narrow, scopeHosts: Fixtures.scope)
+        form.sync(tool: narrow, scopeHosts: ScanInputs.scope)
         #expect(form.fields == ["target"])
         #expect(form.target == "http://api.shop-staging.test/", "a blank target is seeded once scope arrives")
 
         form.target = "http://auth.shop-staging.test/login"
-        form.sync(tool: Self.discoverTool, scopeHosts: ["cdn.shop-staging.test"])
+        form.sync(tool: ScanInputs.discoverTool, scopeHosts: ["cdn.shop-staging.test"])
         #expect(form.fields == ["max_depth", "max_pages", "target"])
         #expect(form.target == "http://auth.shop-staging.test/login")
     }
@@ -395,14 +466,14 @@ import Testing
         #expect(form.authority == "api.shop-staging.test:8443")
     }
 
-    // MARK: Fixtures and the sidebar section
+    // MARK: The sidebar section
 
     /// The Scan sidebar section is offered exactly when the bus lists `scan.discover`
-    /// (`Session.scanEnabled`): present with the sample tool list, absent without it.
+    /// (`Session.scanEnabled`): present when the list has it, absent without it.
     @Test func theScanSectionIsOfferedOnlyWhenTheToolIs() {
-        #expect(Fixtures.tools.contains { $0.name == "scan.discover" })
-        #expect(ScanForm.isOffered(in: Fixtures.tools))
+        #expect(ScanInputs.tools.contains { $0.name == "scan.discover" })
+        #expect(ScanForm.isOffered(in: ScanInputs.tools))
         #expect(!ScanForm.isOffered(in: []))
-        #expect(!ScanForm.isOffered(in: Fixtures.tools.filter { $0.name != "scan.discover" }))
+        #expect(!ScanForm.isOffered(in: ScanInputs.toolsWithoutScan))
     }
 }

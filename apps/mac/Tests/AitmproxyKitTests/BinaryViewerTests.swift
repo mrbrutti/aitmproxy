@@ -2,12 +2,65 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
-/// S-024 raw protobuf and MessagePack decoding, S-023 image fixtures.
+/// The binary bodies `BinaryViewerTests` decodes: one protobuf message, one MessagePack map
+/// touching every family, and a 4×4 image as PNG and as JPEG.
+private enum BinaryViewerInputs {
+    /// A message with a varint, a string, a nested message, a float and a zigzag-encoded sint:
+    /// `1: 150 · 2: "testing" · 3: {1: 1, 2: "ok"} · 4: 1.0f · 5: -1 (sint32)`.
+    static let protobuf = Data([
+        0x08, 0x96, 0x01,
+        0x12, 0x07, 0x74, 0x65, 0x73, 0x74, 0x69, 0x6E, 0x67,
+        0x1A, 0x06, 0x08, 0x01, 0x12, 0x02, 0x6F, 0x6B,
+        0x25, 0x00, 0x00, 0x80, 0x3F,
+        0x28, 0x01,
+    ])
+
+    /// A 12-entry map touching every MessagePack family: nil, bool, negative
+    /// fixint, uint8, int16, float32, float64, str, bin, array, map, fixext1.
+    static let msgpack = Data([
+        0x8C,
+        0xA3, 0x6E, 0x69, 0x6C, 0xC0,                                     // "nil": nil
+        0xA4, 0x62, 0x6F, 0x6F, 0x6C, 0xC3,                               // "bool": true
+        0xA3, 0x69, 0x6E, 0x74, 0xFF,                                     // "int": -1
+        0xA5, 0x75, 0x69, 0x6E, 0x74, 0x38, 0xCC, 0xC8,                   // "uint8": 200
+        0xA5, 0x69, 0x6E, 0x74, 0x31, 0x36, 0xD1, 0xFE, 0xD4,             // "int16": -300
+        0xA5, 0x66, 0x6C, 0x6F, 0x61, 0x74, 0xCA, 0x3F, 0xC0, 0x00, 0x00, // "float": 1.5
+        0xA6, 0x64, 0x6F, 0x75, 0x62, 0x6C, 0x65,                         // "double": 2.5
+        0xCB, 0x40, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xA3, 0x73, 0x74, 0x72, 0xA2, 0x68, 0x69,                         // "str": "hi"
+        0xA3, 0x62, 0x69, 0x6E, 0xC4, 0x03, 0x01, 0x02, 0x03,             // "bin": 01 02 03
+        0xA5, 0x61, 0x72, 0x72, 0x61, 0x79, 0x92, 0x01, 0x02,             // "array": [1, 2]
+        0xA3, 0x6D, 0x61, 0x70, 0x81, 0xA1, 0x61, 0x01,                   // "map": {"a": 1}
+        0xA3, 0x65, 0x78, 0x74, 0xD4, 0x01, 0x2A,                         // "ext": fixext1 type 1, 0x2a
+    ])
+
+    /// A valid 4×4 RGBA PNG with an sRGB chunk (97 bytes).
+    static let png = Data(base64Encoded:
+        "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAAXNSR0IArs4c6QAAABtJREFUeNpjUE1+/f8/EEPpBgYkDohuYCCo"
+        + "AgDXYSv1p0H72AAAAABJRU5ErkJggg==")!
+
+    /// The same 4×4 image as a baseline JPEG (850 bytes, JFIF + Exif).
+    static let jpeg = Data(base64Encoded:
+        "/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQA"
+        + "AAABAAAABKADAAQAAAABAAAABAAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZjwCyBOmA"
+        + "CZjs+EJ+/8AAEQgABAAEAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQE"
+        + "AAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldY"
+        + "WVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk"
+        + "5ebn6Onq8fLz9PX29/j5+v/EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIBAgQEAwQHBQQEAAECdwABAgMR"
+        + "BAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdo"
+        + "aWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uLj5OXm5+jp6vLz"
+        + "9PX29/j5+v/bAEMAAgICAgICAwICAwQDAwMEBQQEBAQFBwUFBQUFBwgHBwcHBwcICAgICAgICAoKCgoKCgsLCwsLDQ0NDQ0NDQ0N"
+        + "Df/bAEMBAgICAwMDBgMDBg0JBwkNDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDQ0NDf/dAAQA"
+        + "Af/aAAwDAQACEQMRAD8A+k/hXey6P4dube3G5TqV2v33i4t3+zLxC0a/chU9ML91Nsaoi+lf8JJe/wB3/wAj3P8A8erynwD/AMgS"
+        + "4/7Cmp/+lctdrX9eYr+PP1f5n00/iZ//2Q==")!
+}
+
+/// S-024 raw protobuf and MessagePack decoding, S-023 image dimensions.
 @Suite struct BinaryViewerTests {
     // MARK: - Protobuf
 
     @Test func decodesVarintStringAndNestedMessage() throws {
-        let fields = try ProtobufRaw.decode(Fixtures.protobufSample)
+        let fields = try ProtobufRaw.decode(BinaryViewerInputs.protobuf)
         #expect(fields.map(\.number) == [1, 2, 3, 4, 5])
         #expect(fields.map(\.wireType) == [.varint, .lengthDelimited, .lengthDelimited, .fixed32, .varint])
         #expect(fields[0].valueText == "150 (zigzag 75)")
@@ -77,14 +130,14 @@ import Testing
         #expect(offset([0x0B, 0x10, 0x07]) == 3, "group never closed")
         #expect(offset(Array(repeating: 0xFF, count: 11)) == 0, "varint longer than 10 bytes")
         #expect(ProtobufRawError(offset: 3, message: "x").description == "x at byte 3")
-        #expect(offset(Array(Fixtures.protobufSample)) == nil)
-        #expect(BodyKind.detect(contentType: nil, data: Fixtures.protobufSample) == .protobuf)
+        #expect(offset(Array(BinaryViewerInputs.protobuf)) == nil)
+        #expect(BodyKind.detect(contentType: nil, data: BinaryViewerInputs.protobuf) == .protobuf)
     }
 
     // MARK: - MessagePack
 
     @Test func decodesEveryFamilyIntoTheTree() throws {
-        let root = try MessagePack.decode(Fixtures.msgpackSample)
+        let root = try MessagePack.decode(BinaryViewerInputs.msgpack)
         #expect(root.kind == .object(count: 12))
         #expect(root.children.map(\.key) == ["nil", "bool", "int", "uint8", "int16", "float", "double", "str", "bin",
                                               "array", "map", "ext"])
@@ -106,7 +159,7 @@ import Testing
         #expect(byKey["ext"]?.children.map(\.key) == ["ext", "data"])
         #expect(byKey["ext"]?.children.map(\.scalarText) == ["1", "Kg=="])
         #expect(JSONTree.copyText(for: try #require(byKey["map"])) == "{\n  \"a\": 1\n}")
-        #expect(BodyKind.detect(contentType: nil, data: Fixtures.msgpackSample) == .messagepack)
+        #expect(BodyKind.detect(contentType: nil, data: BinaryViewerInputs.msgpack) == .messagepack)
     }
 
     @Test func wideIntegersAndLongContainers() throws {
@@ -145,10 +198,10 @@ import Testing
         #expect(MessagePackError(offset: 3, message: "x").description == "x at byte 3")
     }
 
-    // MARK: - Sample bodies
+    // MARK: - Images
 
-    @Test func sampleImagesDecodeWithDimensions() {
-        #expect(BodyKind.imageInfo(Fixtures.tinyPNG) == .image(format: .png, width: 4, height: 4))
-        #expect(BodyKind.imageInfo(Fixtures.tinyJPEG) == .image(format: .jpeg, width: 4, height: 4))
+    @Test func tinyImagesDecodeWithDimensions() {
+        #expect(BodyKind.imageInfo(BinaryViewerInputs.png) == .image(format: .png, width: 4, height: 4))
+        #expect(BodyKind.imageInfo(BinaryViewerInputs.jpeg) == .image(format: .jpeg, width: 4, height: 4))
     }
 }
