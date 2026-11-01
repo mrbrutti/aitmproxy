@@ -276,6 +276,17 @@ fn html_escape(s: &str) -> String {
     out
 }
 
+/// Answer a `/ws` request: the handshake (D4), then the frame loop on the
+/// upgraded connection. Stub from Task A5 with the final signature; Task A17
+/// fills the body. Until then every `/ws` request is `501 not yet`.
+pub(crate) fn serve_upgrade(
+    _info: &crate::app::RequestInfo,
+    _on_upgrade: hyper::upgrade::OnUpgrade,
+    _state: std::sync::Arc<crate::app::AppState>,
+) -> crate::app::Resp {
+    crate::app::html(hyper::StatusCode::NOT_IMPLEMENTED, "not yet".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -72,7 +72,8 @@ impl TestTarget {
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         let addr = listener.local_addr().expect("local addr");
         let base_url = format!("http://{addr}");
-        let state = Arc::new(app::AppState::new(mode));
+        let log = log::ControlLog::new(mode);
+        let state = Arc::new(app::AppState::new(mode, log));
 
         let serve_state = state.clone();
         tokio::spawn(async move {
