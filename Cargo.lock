@@ -472,6 +472,7 @@ dependencies = [
  "bytes",
  "form_urlencoded",
  "futures",
+ "httparse",
  "rcgen",
  "rhai",
  "rustls",
