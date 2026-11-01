@@ -13,7 +13,9 @@
 # generates exactly it, so the file and the code cannot drift apart.
 grammar: tlv
 transport: tcp
-reply: "Opaque framing: any byte that comes back is a reply, and a TCP service that stays open without answering is alive too."
+reply: >-
+  Opaque framing: any byte that comes back is a reply, and a TCP service
+  that stays open without answering is alive too.
 message:
   # Fixed bytes before the length: magic, version, a message type. Not
   # mutated — rewriting them only makes the peer hang up.

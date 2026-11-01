@@ -183,8 +183,7 @@ impl Grammar for Tlv {
 
     /// The first read is the whole reply: the recovered relation describes
     /// what `tlv` sends, not what comes back.
-    fn reply_complete(&self, buf: &[u8]) -> bool {
-        let _ = buf;
+    fn reply_complete(&self, _buf: &[u8]) -> bool {
         true
     }
 
@@ -208,8 +207,7 @@ impl Grammar for Tlv {
 
     /// `tlv` has no command vocabulary, so it cannot recognise a credential
     /// and claims none.
-    fn is_credential_message(&self, bytes: &[u8]) -> bool {
-        let _ = bytes;
+    fn is_credential_message(&self, _bytes: &[u8]) -> bool {
         false
     }
 }

@@ -88,8 +88,7 @@ pub trait Grammar: Send + Sync {
     /// The prelude for one specific case. Defaults to [`Grammar::prelude`];
     /// a grammar overrides it when a case subsumes its own prelude (MQTT: a
     /// CONNECT case goes on a connection of its own).
-    fn prelude_for(&self, case: &[u8]) -> Vec<Vec<u8>> {
-        let _ = case;
+    fn prelude_for(&self, _case: &[u8]) -> Vec<Vec<u8>> {
         self.prelude()
     }
 
@@ -105,8 +104,7 @@ pub trait Grammar: Send + Sync {
 
     /// The same message with its credentials removed, when the grammar can
     /// strip them (MQTT CONNECT), or `None` when the seed must be dropped.
-    fn strip_credentials(&self, bytes: &[u8]) -> Option<Vec<u8>> {
-        let _ = bytes;
+    fn strip_credentials(&self, _bytes: &[u8]) -> Option<Vec<u8>> {
         None
     }
 

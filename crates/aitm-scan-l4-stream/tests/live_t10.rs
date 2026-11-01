@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use aitm_scan_l4_stream::client::{StreamClient, TokioStreamClient};
+use aitm_scan_l4_stream::codec::decode_hex;
 use aitm_scan_l4_stream::lane_with_client;
 use aitm_scan_l4_stream::state::JobState;
 use aitm_scan_model::{
@@ -991,9 +992,7 @@ fn tlv_seeds_infer_the_length_relation() {
             let L4Seed::Hex { hex } = seed else {
                 panic!("the TLV corpus is hex seeds");
             };
-            let bytes = (0..hex.len() / 2)
-                .map(|b| u8::from_str_radix(&hex[b * 2..b * 2 + 2], 16).expect("the seeds are hex"))
-                .collect();
+            let bytes = decode_hex(hex).expect("the profile's seeds are hex");
             Seed {
                 id: format!("hex:{i}"),
                 bytes,

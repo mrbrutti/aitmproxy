@@ -120,8 +120,7 @@ impl Grammar for Raw {
     }
 
     /// `raw` invents nothing: it has no idea what a well-formed message is.
-    fn generate(&self, rng: &mut ChaCha8Rng) -> Vec<u8> {
-        let _ = rng;
+    fn generate(&self, _rng: &mut ChaCha8Rng) -> Vec<u8> {
         Vec::new()
     }
 
@@ -134,8 +133,7 @@ impl Grammar for Raw {
     }
 
     /// The first read is the whole reply: `raw` has no framing.
-    fn reply_complete(&self, buf: &[u8]) -> bool {
-        let _ = buf;
+    fn reply_complete(&self, _buf: &[u8]) -> bool {
         true
     }
 
@@ -152,8 +150,7 @@ impl Grammar for Raw {
     }
 
     /// `raw` cannot tell a credential from any other byte, so it claims none.
-    fn is_credential_message(&self, bytes: &[u8]) -> bool {
-        let _ = bytes;
+    fn is_credential_message(&self, _bytes: &[u8]) -> bool {
         false
     }
 }

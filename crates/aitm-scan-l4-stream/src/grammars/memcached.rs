@@ -194,8 +194,7 @@ impl Grammar for Memcached {
     /// The text protocol has no credential command — SASL authentication is
     /// the binary protocol's, which this grammar does not speak — so no seed
     /// is dropped for carrying one.
-    fn is_credential_message(&self, bytes: &[u8]) -> bool {
-        let _ = bytes;
+    fn is_credential_message(&self, _bytes: &[u8]) -> bool {
         false
     }
 }

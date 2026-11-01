@@ -275,19 +275,26 @@ fn arith_at(input: &mut [u8], rng: &mut ChaCha8Rng, width: usize) -> Option<Stri
 
 /// Overwrite the `width`-byte field at a random offset with an AFL
 /// interesting value, two's complement, in a random endianness.
-fn interesting_at(
+///
+/// The table is borrowed as the `&[i8]`, `&[i16]` or `&[i32]` the const
+/// declares, and the chosen entry is widened to `i64` where it is used, so a
+/// call copies nothing.
+fn interesting_at<T>(
     input: &mut [u8],
     rng: &mut ChaCha8Rng,
     width: usize,
-    table: &[i64],
-) -> Option<String> {
+    table: &[T],
+) -> Option<String>
+where
+    T: Copy + Into<i64>,
+{
     let len = input.len();
     if len < width || table.is_empty() {
         return None;
     }
     let off = below(rng, len - width + 1);
     let end = pick_end(rng);
-    let value = *table.get(below(rng, table.len()))?;
+    let value: i64 = (*table.get(below(rng, table.len()))?).into();
     let field = input.get_mut(off..off + width)?;
     write_uint(field, end, value as u64);
     if width == 1 {
@@ -295,18 +302,6 @@ fn interesting_at(
     } else {
         Some(format!("@{off},{},{value}", end.tag()))
     }
-}
-
-fn interesting_8() -> Vec<i64> {
-    INTERESTING_8.iter().map(|&v| i64::from(v)).collect()
-}
-
-fn interesting_16() -> Vec<i64> {
-    INTERESTING_16.iter().map(|&v| i64::from(v)).collect()
-}
-
-fn interesting_32() -> Vec<i64> {
-    INTERESTING_32.iter().map(|&v| i64::from(v)).collect()
 }
 
 /// Apply one mutator to `input` in place.
@@ -382,9 +377,9 @@ pub fn apply(
         ByteMutator::WordAdd => arith_at(input, rng, 2),
         ByteMutator::DwordAdd => arith_at(input, rng, 4),
         ByteMutator::QwordAdd => arith_at(input, rng, 8),
-        ByteMutator::ByteInteresting => interesting_at(input, rng, 1, &interesting_8()),
-        ByteMutator::WordInteresting => interesting_at(input, rng, 2, &interesting_16()),
-        ByteMutator::DwordInteresting => interesting_at(input, rng, 4, &interesting_32()),
+        ByteMutator::ByteInteresting => interesting_at(input, rng, 1, &INTERESTING_8),
+        ByteMutator::WordInteresting => interesting_at(input, rng, 2, &INTERESTING_16),
+        ByteMutator::DwordInteresting => interesting_at(input, rng, 4, &INTERESTING_32),
         ByteMutator::BytesDelete => {
             if len < 2 {
                 return None;
@@ -642,6 +637,86 @@ mod tests {
             assert_eq!(note, None, "{} with no donor", m.name());
             assert_eq!(buf, b"hello world".to_vec());
         }
+    }
+
+    /// `interesting_at` reads the `INTERESTING_*` consts where they are: the
+    /// three tables are passed in as the `&[i8]`, `&[i16]` and `&[i32]` they
+    /// are declared as, widened at use, so no per-call `Vec<i64>` is built.
+    ///
+    /// The three pinned notes are the mutators' output before the tables
+    /// stopped being copied, so the draw order — offset, endianness, index —
+    /// is the same one the schedule's determinism depends on (spec C5).
+    #[test]
+    fn interesting_at_reads_the_const_tables() {
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut buf = b"hello world".to_vec();
+        assert_eq!(
+            interesting_at(&mut buf, &mut rng, 1, &INTERESTING_8),
+            Some("@1,-1".to_string())
+        );
+        assert_eq!(
+            buf,
+            vec![104, 255, 108, 108, 111, 32, 119, 111, 114, 108, 100]
+        );
+
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut buf = b"hello world".to_vec();
+        assert_eq!(
+            interesting_at(&mut buf, &mut rng, 2, &INTERESTING_16),
+            Some("@1,be,1".to_string())
+        );
+        assert_eq!(buf, vec![104, 0, 1, 108, 111, 32, 119, 111, 114, 108, 100]);
+
+        let mut rng = ChaCha8Rng::seed_from_u64(7);
+        let mut buf = b"hello world".to_vec();
+        assert_eq!(
+            interesting_at(&mut buf, &mut rng, 4, &INTERESTING_32),
+            Some("@1,be,16".to_string())
+        );
+        assert_eq!(buf, vec![104, 0, 0, 0, 16, 32, 119, 111, 114, 108, 100]);
+
+        // Every draw writes one of the table's values, widened, in one of the
+        // two byte orders — and touches nothing outside its own field.
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        for _ in 0..200 {
+            let mut buf = vec![0x41u8; 8];
+            let note = interesting_at(&mut buf, &mut rng, 2, &INTERESTING_16)
+                .expect("an eight-byte buffer has room for a two-byte field");
+            let mut parts = note.trim_start_matches('@').split(',');
+            let off: usize = parts
+                .next()
+                .and_then(|text| text.parse().ok())
+                .expect("the note opens with the offset");
+            let end = match parts.next() {
+                Some("be") => End::Be,
+                Some("le") => End::Le,
+                other => panic!("the note names a byte order, not {other:?}"),
+            };
+            let value: i64 = parts
+                .next()
+                .and_then(|text| text.parse().ok())
+                .expect("the note ends with the value written");
+            assert!(
+                INTERESTING_16.iter().any(|&v| i64::from(v) == value),
+                "{value} is not one of the 16-bit interesting values"
+            );
+            let field = buf.get(off..off + 2).expect("the field is in the buffer");
+            assert_eq!(read_uint(field, end), value as u16 as u64);
+            assert!(
+                buf.iter()
+                    .enumerate()
+                    .all(|(i, &b)| (off..off + 2).contains(&i) || b == 0x41),
+                "a byte outside the field changed: {buf:?}"
+            );
+        }
+
+        // Nothing to write into, and nothing to choose from.
+        let mut short = vec![0u8];
+        assert_eq!(
+            interesting_at(&mut short, &mut rng, 4, &INTERESTING_32),
+            None
+        );
+        assert_eq!(interesting_at(&mut short, &mut rng, 1, &[] as &[i8]), None);
     }
 
     #[test]

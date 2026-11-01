@@ -226,8 +226,7 @@ impl Grammar for Modbus {
     }
 
     /// Modbus/TCP carries no credentials.
-    fn is_credential_message(&self, bytes: &[u8]) -> bool {
-        let _ = bytes;
+    fn is_credential_message(&self, _bytes: &[u8]) -> bool {
         false
     }
 }

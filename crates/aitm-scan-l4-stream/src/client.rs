@@ -151,7 +151,10 @@ pub trait StreamClient: Send + Sync {
     // pacing, payload, completeness, banner and the two timeouts are each an
     // independent decision of the caller's, and bundling them would hide the
     // authorisation arguments inside a struct.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "spec S5.5 fixes this signature; see the note above"
+    )]
     fn exchange<'a>(
         &'a self,
         ep: &'a Endpoint,
@@ -171,7 +174,10 @@ pub trait StreamClient: Send + Sync {
 pub struct TokioStreamClient;
 
 impl StreamClient for TokioStreamClient {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the `StreamClient::exchange` signature, which an implementation must match"
+    )]
     fn exchange<'a>(
         &'a self,
         ep: &'a Endpoint,
@@ -256,7 +262,10 @@ fn ended_for(e: &io::Error) -> Option<Ended> {
 
 /// One TCP connection: optional banner, then one write + one bounded read per
 /// message.
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the `StreamClient::exchange` signature, forwarded argument for argument"
+)]
 async fn tcp_exchange(
     ep: &Endpoint,
     permit: &mut L4Permit,
@@ -535,7 +544,10 @@ pub mod testing {
     }
 
     impl StreamClient for CountingClient {
-        #[allow(clippy::too_many_arguments)]
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "the `StreamClient::exchange` signature, which this double must match"
+        )]
         fn exchange<'a>(
             &'a self,
             ep: &'a Endpoint,

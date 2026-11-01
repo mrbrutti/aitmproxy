@@ -74,23 +74,19 @@ impl Grammar for Pending {
         transport_for(self.kind)
     }
 
-    fn parse(&self, bytes: &[u8]) -> Option<Tree> {
-        let _ = bytes;
+    fn parse(&self, _bytes: &[u8]) -> Option<Tree> {
         None
     }
 
-    fn generate(&self, rng: &mut ChaCha8Rng) -> Vec<u8> {
-        let _ = rng;
+    fn generate(&self, _rng: &mut ChaCha8Rng) -> Vec<u8> {
         Vec::new()
     }
 
-    fn classify_reply(&self, reply: &[u8]) -> ReplyClass {
-        let _ = reply;
+    fn classify_reply(&self, _reply: &[u8]) -> ReplyClass {
         ReplyClass::Unknown
     }
 
-    fn reply_complete(&self, buf: &[u8]) -> bool {
-        let _ = buf;
+    fn reply_complete(&self, _buf: &[u8]) -> bool {
         true
     }
 
@@ -106,8 +102,7 @@ impl Grammar for Pending {
         Vec::new()
     }
 
-    fn is_credential_message(&self, bytes: &[u8]) -> bool {
-        let _ = bytes;
+    fn is_credential_message(&self, _bytes: &[u8]) -> bool {
         false
     }
 }

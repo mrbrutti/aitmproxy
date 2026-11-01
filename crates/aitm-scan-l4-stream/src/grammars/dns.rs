@@ -162,8 +162,7 @@ impl Grammar for Dns {
 
     /// Always: a DNS reply over UDP is one datagram, so the first read holds
     /// all of it.
-    fn reply_complete(&self, buf: &[u8]) -> bool {
-        let _ = buf;
+    fn reply_complete(&self, _buf: &[u8]) -> bool {
         true
     }
 
@@ -183,8 +182,7 @@ impl Grammar for Dns {
     }
 
     /// DNS carries no credential this lane can recognise.
-    fn is_credential_message(&self, bytes: &[u8]) -> bool {
-        let _ = bytes;
+    fn is_credential_message(&self, _bytes: &[u8]) -> bool {
         false
     }
 }
