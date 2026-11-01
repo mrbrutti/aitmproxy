@@ -465,10 +465,9 @@ final class ScanPanelState {
     func launch(map: Bool) async {
         // One launch at a time: a confirm sheet or an in-flight call owns the bus until it settles.
         guard surface.confirm == nil, !surface.launchInFlight else { return }
-        if let refusal = launchRefusal {
-            surface.setStatusLine(refusal)
-            return
-        }
+        // The footer and the button's help already show the refusal; echoing it into the
+        // status line would outlive the refusal once the operator fixes the cause.
+        guard launchRefusal == nil else { return }
         let call = surface.launchArguments(map: map)
         surface.launchInFlight = true
         await send(tool: call.tool, args: call.args)
@@ -567,7 +566,8 @@ final class ScanPanelState {
         profile.name = trimmed
         surface.loadedProfile = nil
         surface.editedProfile = profile
-        surface.selectedProfile = trimmed
+        // Through `select(profile:)`: picking the duplicate starts afresh like any pick.
+        surface.select(profile: trimmed)
         duplicateName = nil
     }
 
