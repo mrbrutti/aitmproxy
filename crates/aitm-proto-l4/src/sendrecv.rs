@@ -353,6 +353,14 @@ struct Correlation {
     /// fields (identification, checksum, a zero source address) but never the
     /// transport, so this is the part of our own frame that comes back verbatim.
     stimulus_transport: Vec<u8>,
+    /// Whether the one same-host, portless self-echo has been consumed. The
+    /// kernel delivers our injected frame to the capture exactly once per
+    /// `send_recv`, so [`Correlation::is_own_stimulus`] claims at most one
+    /// transport-equal same-host frame as ours and any further one is a reply.
+    /// A `Cell`: `classify` takes `&self` and the correlation is owned by the
+    /// one worker thread that awaits the reply (it moves into the thread, so it
+    /// needs `Send`, never `Sync`).
+    portless_echo_seen: std::cell::Cell<bool>,
 }
 
 /// The verdict on one captured frame.
@@ -387,7 +395,17 @@ impl Correlation {
             stimulus,
             stimulus_ends,
             stimulus_transport,
+            portless_echo_seen: std::cell::Cell::new(false),
         }
+    }
+
+    /// Whether the stimulus is portless (ICMP, an unknown protocol) between the
+    /// same two addresses — the one shape whose self-echo cannot be told from a
+    /// verbatim reply by direction, so it is counted instead.
+    fn is_portless_same_host(&self) -> bool {
+        let ends = &self.stimulus_ends;
+        matches!((ends.src, ends.dst), (Some(src), Some(dst)) if src == dst)
+            && !matches!((ends.src_port, ends.dst_port), (Some(_), Some(_)))
     }
 
     fn classify(&self, frame: &[u8]) -> Classified {
@@ -396,6 +414,12 @@ impl Correlation {
         // byte-equal check is the cheap first cut; the direction check below is
         // the rule, since the capture may re-frame the copy.
         if frame == self.stimulus.as_slice() {
+            // A verbatim copy (macOS BPF) is the one self-echo a same-host
+            // portless stimulus gets: mark it consumed, so a verbatim reply
+            // behind it is not taken for a second copy of our frame.
+            if self.is_portless_same_host() {
+                self.portless_echo_seen.set(true);
+            }
             return Classified::Ignore;
         }
         let Some(info) = decode_reply(frame) else {
@@ -463,6 +487,23 @@ impl Correlation {
     /// transport is untouched. A loopback ICMP echo reply differs in its
     /// transport (type 0, another checksum) and still correlates. A frame too
     /// short to carry a transport slice never compares equal.
+    ///
+    /// The transport comparison is consumed **at most once** per correlation
+    /// (`portless_echo_seen`, also set by the byte-equal fast path in
+    /// [`Correlation::classify`]): the kernel delivers our injected frame to the
+    /// capture exactly once per `send_recv`, so the first transport-equal
+    /// same-host frame is the self-echo and any further one is a reply. That
+    /// removes the residual the security delta named — a same-host raw service
+    /// for a protocol with no type field (IPPROTO 253, say) that echoes the
+    /// stimulus verbatim used to be indistinguishable from the self-echo and
+    /// was `Ignore`d in every mode. What remains: a reply that reached the
+    /// capture **before** our own echo is read from it would be taken for the
+    /// echo and the echo for the reply. On loopback that order cannot occur (the
+    /// echo is delivered synchronously with the send, ahead of anything the
+    /// target answers), which is why the rule is "at most one" and not "the
+    /// first one is the echo". The accepted shape on the other side: two
+    /// self-echo-shaped frames with no real reply behind them report the second
+    /// as the `Response` (pinned by a test).
     fn is_own_stimulus(&self, info: &ReplyInfo<'_>) -> bool {
         let ends = &self.stimulus_ends;
         let (Some(src), Some(dst)) = (ends.src, ends.dst) else {
@@ -476,7 +517,18 @@ impl Correlation {
             (Some(src_port), Some(dst_port)) => {
                 info.ends.src_port == Some(src_port) && info.ends.dst_port == Some(dst_port)
             }
-            _ => src != dst || info.transport == self.stimulus_transport.as_slice(),
+            _ => {
+                if src != dst {
+                    return true;
+                }
+                if info.transport == self.stimulus_transport.as_slice()
+                    && !self.portless_echo_seen.get()
+                {
+                    self.portless_echo_seen.set(true);
+                    return true;
+                }
+                false
+            }
         }
     }
 }
@@ -1606,6 +1658,207 @@ mod tests {
             assert_eq!(flow.packets[0].bytes, stimulus);
             assert_eq!(backend.injected(), vec![stimulus.clone()]);
             assert_eq!(g.in_flight(), 0);
+        }
+    }
+
+    /// An IPv4 frame of protocol 253 (an experimental protocol with no type
+    /// field: nothing in its transport distinguishes a request from a reply) from
+    /// `src` to `dst`, carrying `payload` verbatim, with the IPv4 identification
+    /// and TTL the caller names (`None` ⇒ the crafted defaults, id 0 / TTL 64).
+    fn raw_proto_frame(
+        src: &str,
+        dst: &str,
+        identification: Option<u16>,
+        ttl: Option<u8>,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some(dst.parse::<Ipv4Addr>().unwrap()),
+                    protocol: Some(253),
+                    identification,
+                    ttl,
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Raw(payload.to_vec()),
+            ],
+        }
+        .build()
+        .expect("raw protocol frame builds")
+    }
+
+    /// Run a portless `send_recv` over `frames` under `expect` and assert its
+    /// outcome is `Response` whose bytes are `want`, recorded behind the stimulus
+    /// as the flow's only other packet.
+    fn assert_portless_response(
+        stimulus: &[u8],
+        frames: Vec<Vec<u8>>,
+        want: &[u8],
+        expect: ReplyMatch,
+    ) {
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(frames);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend.clone(),
+            store.clone(),
+            raw_portless_spec(stimulus, expect, Duration::from_secs(5)),
+        )
+        .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Response(p) => {
+                assert_eq!(p.bytes, want, "{expect:?}: the reply, not our own frame");
+                assert!(!p.injected, "{expect:?}: observed, not injected");
+            }
+            other => panic!("{expect:?}: expected the reply as Response, got {other:?}"),
+        }
+        let flow = store.get(flow_id).expect("flow present");
+        assert_eq!(
+            flow.packets.len(),
+            2,
+            "{expect:?}: the stimulus and the reply"
+        );
+        assert_eq!(flow.packets[0].bytes, stimulus);
+        assert!(flow.packets[0].injected);
+        assert_eq!(flow.packets[1].bytes, want);
+        assert_eq!(backend.injected(), vec![stimulus.to_vec()]);
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// Security delta (Minor): a same-host, portless reply whose transport bytes
+    /// echo the stimulus verbatim (protocol 253 to a loopback raw echo service:
+    /// no type field to flip) was indistinguishable from the self-echo and was
+    /// `Ignore`d in every mode. The self-echo arrives exactly once per
+    /// `send_recv`, so at most one transport-equal same-host frame is consumed as
+    /// ours: the kernel-shaped self-echo (new id, new checksum) is ignored, and
+    /// the verbatim reply behind it (its own id and TTL, the same bytes past the
+    /// IP header) is the `Response` in all three modes.
+    #[test]
+    fn verbatim_portless_echo_reply_after_the_self_echo_is_a_response() {
+        let stimulus = raw_proto_frame("127.0.0.1", "127.0.0.1", None, None, b"raw-echo");
+        let self_echo = kernel_shaped(&stimulus);
+        let reply = raw_proto_frame(
+            "127.0.0.1",
+            "127.0.0.1",
+            Some(0x1234),
+            Some(63),
+            b"raw-echo",
+        );
+        assert_eq!(
+            reply[20..],
+            stimulus[20..],
+            "the reply's transport is verbatim"
+        );
+        assert_ne!(reply, self_echo, "but its IP header is the service's own");
+        assert_ne!(reply, stimulus);
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Raw,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&self_echo), Classified::Ignore),
+                "{expect:?}: the kernel-shaped self-echo is our own stimulus"
+            );
+            assert!(
+                matches!(c.classify(&reply), Classified::Response),
+                "{expect:?}: the verbatim echo reply behind it is the reply"
+            );
+            assert_portless_response(
+                &stimulus,
+                vec![self_echo.clone(), reply.clone()],
+                &reply,
+                expect,
+            );
+        }
+    }
+
+    /// The macOS shape of the same case: BPF returns our frame byte-identical, so
+    /// the whole-frame fast path in `classify` consumes the self-echo. That fast
+    /// path must also mark the one self-echo as seen, so the verbatim reply behind
+    /// it is the `Response` and not taken for a second copy of our frame.
+    #[test]
+    fn verbatim_portless_echo_reply_after_a_byte_identical_self_echo_is_a_response() {
+        let stimulus = raw_proto_frame("127.0.0.1", "127.0.0.1", None, None, b"raw-echo");
+        let reply = raw_proto_frame(
+            "127.0.0.1",
+            "127.0.0.1",
+            Some(0x1234),
+            Some(63),
+            b"raw-echo",
+        );
+        assert_eq!(
+            reply[20..],
+            stimulus[20..],
+            "the reply's transport is verbatim"
+        );
+        assert_ne!(reply, stimulus, "but its IP header is the service's own");
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Raw,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&stimulus), Classified::Ignore),
+                "{expect:?}: the byte-identical self-echo is our own stimulus"
+            );
+            assert!(
+                matches!(c.classify(&reply), Classified::Response),
+                "{expect:?}: the verbatim echo reply behind it is the reply"
+            );
+            assert_portless_response(
+                &stimulus,
+                vec![stimulus.clone(), reply.clone()],
+                &reply,
+                expect,
+            );
+        }
+    }
+
+    /// The accepted shape of the "at most one" rule: the correlator cannot tell a
+    /// second self-echo-shaped frame from a verbatim reply, so when two
+    /// kernel-shaped copies of our frame arrive with no real reply behind them,
+    /// the second is reported as the `Response`. On a real interface the kernel
+    /// delivers our frame to the capture exactly once per inject, so this shape
+    /// needs a second party that echoes verbatim — which is a reply.
+    #[test]
+    fn a_second_self_echo_shaped_frame_is_reported_as_the_response() {
+        let stimulus = raw_proto_frame("127.0.0.1", "127.0.0.1", None, None, b"raw-echo");
+        let self_echo = kernel_shaped(&stimulus);
+
+        for expect in loopback_modes() {
+            let c = Correlation::new(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                L4Proto::Raw,
+                expect,
+                stimulus.clone(),
+            );
+            assert!(
+                matches!(c.classify(&self_echo), Classified::Ignore),
+                "{expect:?}: the first self-echo-shaped frame is consumed as ours"
+            );
+            assert!(
+                matches!(c.classify(&self_echo), Classified::Response),
+                "{expect:?}: the second is a reply — the accepted shape of the rule"
+            );
+            assert_portless_response(
+                &stimulus,
+                vec![self_echo.clone(), self_echo.clone()],
+                &self_echo,
+                expect,
+            );
         }
     }
 
