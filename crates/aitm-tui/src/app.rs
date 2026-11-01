@@ -38,7 +38,7 @@ pub const MAX_DETAILS: usize = 2_000;
 
 /// The tools that change the CA's trust-store state (§D17): they get the
 /// scope default, raise the pill's in-flight word, and are re-read after.
-pub const CA_TRUST_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
+pub(crate) const CA_TRUST_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
 
 /// Tools that ask the operator for a local `y/N` before they are sent
 /// (§4.2 step 4: the bus has no `confirm` on the wire until F1, and the
@@ -3918,7 +3918,9 @@ impl App {
                     "ca.install" | "ca.uninstall" => {
                         self.ca_installing = false;
                         self.ask_ca_status(&mut out);
-                        if message.starts_with("ca.install cancelled") {
+                        if message.starts_with("ca.install cancelled")
+                            || message.starts_with("ca.uninstall cancelled")
+                        {
                             self.toast(Level::Info, "CA trust cancelled");
                             return out;
                         }
@@ -5083,6 +5085,20 @@ mod tests {
         let t = app.current_toast().expect("toast");
         assert_eq!(t.level, Level::Error);
         assert_eq!(t.text, "ca.install refused: agent frontend");
+
+        // Record correction 15: the uninstall dialog can be dismissed too.
+        let _ = app.run_command("ca.uninstall");
+        let _ = app.update(Action::Input('y'));
+        assert!(app.ca_installing);
+        let reqs = app.on_bus(BusEvent::CallFailed {
+            name: "ca.uninstall".into(),
+            message: "ca.uninstall cancelled: the macOS authentication dialog was dismissed; the CA is still trusted".into(),
+        });
+        assert!(!app.ca_installing);
+        assert_eq!(reqs, vec![ca_status_call()]);
+        let t = app.current_toast().expect("toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "CA trust cancelled");
     }
 
     /// S3: details follow the flows (vanished rows drop theirs) and never
