@@ -19,16 +19,6 @@ use aitm_tui::caps::TermCaps;
 use common::*;
 use serde_json::{json, Value};
 
-macro_rules! fixture {
-    ($name:literal) => {
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aitm-scan-model/fixtures/",
-            $name
-        ))
-    };
-}
-
 const TOOLS: &[&str] = &[
     "scan.start",
     "scan.list",
@@ -38,10 +28,6 @@ const TOOLS: &[&str] = &[
 ];
 
 const JOB: &str = "scan-1a2b3c4d";
-
-fn value(text: &str) -> Value {
-    serde_json::from_str(text).expect("fixture is JSON")
-}
 
 /// A connected v2 app at 200x50 with the five verbs this file needs.
 fn app() -> App {
@@ -56,7 +42,7 @@ fn progress_line() -> BusEvent {
     BusEvent::Notification(json!({
         "jsonrpc": "2.0",
         "method": "notifications/aitm/job",
-        "params": value(fixture!("job.progress.json")),
+        "params": fixture("job.progress.json"),
     }))
 }
 
@@ -137,7 +123,7 @@ fn four_progress_lines_yield_one_inflight_status() {
 #[test]
 fn status_polls_every_four_ticks_only_while_live() {
     let mut app = app();
-    let status = value(fixture!("scan.status.json"));
+    let status = fixture("scan.status.json");
     let reqs = app.on_bus(status_reply(status.clone()));
     assert!(reqs.is_empty(), "a status reply pushes nothing: {reqs:?}");
     assert_eq!(app.scan.jobs.order, vec![JOB.to_string()]);
@@ -175,7 +161,7 @@ fn scan_list_folds_order_and_asks_status_for_unknown_jobs() {
     let reqs = app.on_bus(BusEvent::CallTaggedOk {
         tag: "scan.list".into(),
         name: "scan.list".into(),
-        value: value(fixture!("scan.list.json")),
+        value: fixture("scan.list.json"),
     });
     assert_eq!(
         app.scan.jobs.order,
@@ -223,7 +209,7 @@ fn disconnect_clears_inflight() {
 #[test]
 fn a_malformed_status_keeps_the_row() {
     let mut app = app();
-    let _ = app.on_bus(status_reply(value(fixture!("scan.status.json"))));
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
     let reqs = app.on_bus(status_reply(json!({ "job": 5 })));
     assert!(reqs.is_empty(), "a bad reply pushes nothing: {reqs:?}");
     assert_eq!(app.scan.jobs.full[JOB].probes.sent, 418);

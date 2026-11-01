@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use aitm_scan_model::{
     JobEvent, JobNotification, JobStatus, ListResult, JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
 };
+use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
 
 use crate::action::ToolSchema as _;
@@ -3929,7 +3930,7 @@ impl App {
         if params.get("kind").and_then(Value::as_str) != Some(JOB_KIND_SCAN) {
             return;
         }
-        let Ok(line) = serde_json::from_value::<JobNotification>(params.clone()) else {
+        let Ok(line) = JobNotification::deserialize(params) else {
             return;
         };
         self.on_job_line(&line, out);

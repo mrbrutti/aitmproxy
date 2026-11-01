@@ -6,6 +6,8 @@
 //! Fixture-driven: this proves parsing only. Acceptance is the pty cell against
 //! a real core (spec Acceptance criteria, "Live").
 
+mod common;
+
 use aitm_scan_model::{
     ChecksResult, Issue, IssuesResult, JobEvent, JobNotification, JobState, ListResult, Phase,
     ProfileDeleteResult, ProfileListResult, ProfileSaveResult, ScanErrorCode, ScanProfile,
@@ -14,24 +16,11 @@ use aitm_scan_model::{
 use aitm_tui::scan::{
     elapsed_text, parse_result, state_phase_text, tag_keyed, tag_parts, ScanError,
 };
+use common::fixture;
 use serde_json::{json, Value};
 
-macro_rules! fixture {
-    ($name:literal) => {
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aitm-scan-model/fixtures/",
-            $name
-        ))
-    };
-}
-
-fn value(text: &str) -> Value {
-    serde_json::from_str(text).expect("fixture is JSON")
-}
-
-fn parse<T: serde::de::DeserializeOwned>(verb: &str, text: &str) -> T {
-    match parse_result::<T>(verb, &value(text)) {
+fn parse<T: serde::de::DeserializeOwned>(verb: &str, value: &Value) -> T {
+    match parse_result::<T>(verb, value) {
         Ok(v) => v,
         Err(e) => panic!("{verb}: {}", e.detail),
     }
@@ -39,65 +28,65 @@ fn parse<T: serde::de::DeserializeOwned>(verb: &str, text: &str) -> T {
 
 #[test]
 fn every_fixture_parses_into_its_contract_type() {
-    let start: StartResult = parse("scan.start", fixture!("scan.start.json"));
+    let start: StartResult = parse("scan.start", &fixture("scan.start.json"));
     assert_eq!(start.clamped[0].field, "budget.probes");
-    let map: StartResult = parse("scan.map", fixture!("scan.map.json"));
+    let map: StartResult = parse("scan.map", &fixture("scan.map.json"));
     assert_eq!(map.job, "scan-1a2b3c4d");
 
-    let status: aitm_scan_model::JobStatus = parse("scan.status", fixture!("scan.status.json"));
+    let status: aitm_scan_model::JobStatus = parse("scan.status", &fixture("scan.status.json"));
     assert_eq!(status.probes.sent, 418);
     assert_eq!(status.probes.budget, 2000);
     assert_eq!(status.points.audited, 80);
     assert_eq!(status.points.found, 120);
     assert_eq!(status.state, JobState::Running);
     assert_eq!(status.phase, Phase::Auditing);
-    let cancel: aitm_scan_model::JobStatus = parse("scan.cancel", fixture!("scan.cancel.json"));
+    let cancel: aitm_scan_model::JobStatus = parse("scan.cancel", &fixture("scan.cancel.json"));
     assert_eq!(cancel.state, JobState::Cancelling);
 
-    let list: ListResult = parse("scan.list", fixture!("scan.list.json"));
+    let list: ListResult = parse("scan.list", &fixture("scan.list.json"));
     assert_eq!(list.jobs.len(), 2);
 
-    let issues: IssuesResult = parse("scan.issues", fixture!("scan.issues.json"));
+    let issues: IssuesResult = parse("scan.issues", &fixture("scan.issues.json"));
     assert_eq!(issues.by_severity.high, 1);
-    let issue: Issue = parse("scan.issue", fixture!("scan.issue.json"));
+    let issue: Issue = parse("scan.issue", &fixture("scan.issue.json"));
     assert_eq!(issue.id, "issue-9f8e7d6c");
-    let updated: Issue = parse("scan.issue.update", fixture!("scan.issue.update.json"));
+    let updated: Issue = parse("scan.issue.update", &fixture("scan.issue.update.json"));
     assert_eq!(updated.status, aitm_scan_model::IssueStatus::FalsePositive);
 
-    let sitemap: SitemapResult = parse("scan.sitemap", fixture!("scan.sitemap.json"));
+    let sitemap: SitemapResult = parse("scan.sitemap", &fixture("scan.sitemap.json"));
     assert_eq!(sitemap.next_cursor, Some("node-2".into()));
 
-    let checks: ChecksResult = parse("scan.checks", fixture!("scan.checks.json"));
+    let checks: ChecksResult = parse("scan.checks", &fixture("scan.checks.json"));
     assert_eq!(checks.checks.len(), 3);
 
     let profiles: ProfileListResult =
-        parse("scan.profile.list", fixture!("scan.profile.list.json"));
+        parse("scan.profile.list", &fixture("scan.profile.list.json"));
     assert_eq!(profiles.profiles.len(), 7);
-    let profile: ScanProfile = parse("scan.profile.get", fixture!("scan.profile.get.json"));
+    let profile: ScanProfile = parse("scan.profile.get", &fixture("scan.profile.get.json"));
     assert_eq!(profile.name, "standard");
-    let saved: ProfileSaveResult = parse("scan.profile.save", fixture!("scan.profile.save.json"));
+    let saved: ProfileSaveResult = parse("scan.profile.save", &fixture("scan.profile.save.json"));
     assert_eq!(saved.saved, "my-api");
     let deleted: ProfileDeleteResult =
-        parse("scan.profile.delete", fixture!("scan.profile.delete.json"));
+        parse("scan.profile.delete", &fixture("scan.profile.delete.json"));
     assert!(deleted.deleted);
 
     let session: SessionProfile = parse(
         "scan.session.preview",
-        fixture!("scan.session.preview.json"),
+        &fixture("scan.session.preview.json"),
     );
     assert_eq!(session.cookies, vec!["sid".to_string()]);
 
-    let pushes: [(&str, JobEvent); 7] = [
-        (fixture!("job.started.json"), JobEvent::Started),
-        (fixture!("job.phase.json"), JobEvent::Phase),
-        (fixture!("job.progress.json"), JobEvent::Progress),
-        (fixture!("job.issue.json"), JobEvent::Issue),
-        (fixture!("job.finished.json"), JobEvent::Finished),
-        (fixture!("job.cancelled.json"), JobEvent::Cancelled),
-        (fixture!("job.failed.json"), JobEvent::Failed),
+    let pushes: [(Value, JobEvent); 7] = [
+        (fixture("job.started.json"), JobEvent::Started),
+        (fixture("job.phase.json"), JobEvent::Phase),
+        (fixture("job.progress.json"), JobEvent::Progress),
+        (fixture("job.issue.json"), JobEvent::Issue),
+        (fixture("job.finished.json"), JobEvent::Finished),
+        (fixture("job.cancelled.json"), JobEvent::Cancelled),
+        (fixture("job.failed.json"), JobEvent::Failed),
     ];
     for (text, event) in pushes {
-        let line: JobNotification = parse("notifications/aitm/job", text);
+        let line: JobNotification = parse("notifications/aitm/job", &text);
         assert_eq!(line.kind, "scan");
         assert_eq!(line.event, event);
     }
@@ -105,7 +94,7 @@ fn every_fixture_parses_into_its_contract_type() {
 
 #[test]
 fn unknown_keys_are_tolerated() {
-    let mut v = value(fixture!("scan.status.json"));
+    let mut v = fixture("scan.status.json");
     v["future"] = json!(1);
     let status = parse_result::<aitm_scan_model::JobStatus>("scan.status", &v)
         .expect("a reply with an extra key still parses");

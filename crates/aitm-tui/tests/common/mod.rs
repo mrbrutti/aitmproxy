@@ -177,3 +177,15 @@ pub fn toast(app: &App) -> &str {
     app.current_toast()
         .map_or("<no toast>", |t| t.text.as_str())
 }
+
+/// One file of the scanner contract pack (`crates/aitm-scan-model/fixtures/`),
+/// parsed, so a test writes `fixture("scan.status.json")` (fix round B,
+/// B10). Read at run time, so a test binary does not embed every fixture it
+/// names; a missing or malformed file is a test bug and panics with its name.
+pub fn fixture(name: &str) -> Value {
+    let path =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../aitm-scan-model/fixtures/").to_string() + name;
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("fixture {name}: cannot read {path}: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("fixture {name} is not JSON: {e}"))
+}
