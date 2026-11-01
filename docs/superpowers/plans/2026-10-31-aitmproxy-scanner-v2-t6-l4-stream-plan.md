@@ -35,6 +35,7 @@ T6 fills the `aitm-scan-l4-stream` skeleton that T1a handed over: a grammar form
 | A | Stage-6 panel round 1, fix task A (host/lib/checks/state/tree/corpus/spec, resp+dns YAML, campaign+gates tests): guard `PacketTooLarge` is skipped and counted (SPEC-C1); `count_from` names the count field and validation requires `count: { of: <repeat> }`; seed skip notes reach the discovery line (`seeds_skipped=`) and the detail (`seed_notes=[...]`); S9 `warn!` on guard refusal, discovery refusal and target-down; `StreamHost` lost its dead tree and accessors; one `RECOVERY_POLL`; shared `proto_of`/`proto_name`/error strings/`record_case`/`L4_DISABLED`; `ceilings` split in four; tree.rs element ceiling on declared counts and checked length arithmetic (SEC-M1/M2). |
 | B | Stage-6 panel round 1, fix task B (grammars, denylist, mutators, client, YAML, live harness): SMTP/FTP `sp` is a `present`/`absent` choice with only `absent` immutable and `delim_inject` steps out of a `choice`; `Grammar::specs()` so C1 covers all 11 documents; the denylist uses `mqtt::{read_varint, read_string}`; const interesting tables; underscored unused parameters; allow reasons; `tlv.yaml` prose; `codec::decode_hex` in the harness. |
 | R2 | Stage-6 panel round 2 (Minors from the re-review): the count is registered under the count field's name only; capped-repeat test asserts equality; profile seeds decoded once per job with notes shared across nodes; `authorise_preview` is the single discovery refusal point (the disabled lane warns too); `mqtt::connect_flags` shared with the denylist; `capture_tracing` returns the serial lock; WARN test split in three on an ephemeral port; duplicate DNS test removed, RESP count test moved to `resp.rs`; `grammars::testkit` shared by SMTP/FTP; `FieldPath::parent`; `#[doc(hidden)]` on the two test-reachable fns. |
+| F6 | A named `tlv` target still infers its length relation from the corpus and a named `raw` takes the seeds (found by the first bus-level run on T1b's engine: `grammar="tlv" reason=named ... points=0`); `grammar.rs` `infer_or_raw`/`raw_over` (`grammar.rs`, `lib.rs` test). |
 | R3 | Round-2 re-review leftovers: `TracingCapture` drops the sink guard before the serial lock; test rename; stale port comment; spec errata (empty-target clause, `Arc<Vec<String>>`). |
 
 The Review log holds the findings each round closes.
@@ -398,6 +399,14 @@ Kept by the T6 session during stage 6. One row per finding. Range reviewed: `395
 | fix A/B | Quality | Info | `GuardedClient` double justified; `interesting_at` generic correct; `is_parser_fault_candidate(oracle, true)` acceptable; `report_l4_hook` honest; two name-resolution rules deliberate | No change |
 
 **Live proof after the fix rounds** (`run-both-4.log`, lane HEAD 5e202bb6 + round 2, target built from main `c30e34b6`): vulnerable 8/8 `l4-crash` with 4 downtime windows each (tlv by inferred relation), patched 8/8 clean, `denylisted=0` everywhere, max client->server bytes per 1 s window 5813 <= 8192, both modes exit 0; the whole crate passes in the Terminal with no SKIP (lib 206, campaign 8, gates 13, live self-checks 3).
+
+**Bus-level run on T1b's engine (proof branch, PR #232 head 6c1f6d99 + T6):**
+
+| Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| 23 | T6 session (cells) | Important | A target naming `grammar: "tlv"` selected the inference-less registry stub: `discover` logged `reason=named ... points=0`, jobs finished `done` with zero issues | Fixed in 2aa0e2c4 (F6) |
+| 23 | T6 session (cells) | External | `test_t6_grammars_live.py::advertises()` required the grammar name as a token in an `l4_field` check id; T6 ships three generic checks (S6.3) | Fixed by T10 in PR #233 (`lane_landed`) |
+| 23 | T6 session (cells) | Info | T1b's contract additions (`Verdict.location`/`more`, `CheckMeta.scope`, `L4Options.fields`) break the lane's build until #232 merges | Adapted on the proof branch; applied to #229 at integration once #232 is on main |
 
 **Re-review of round 2 (range `5e202bb6..1e31bbf4`; Security PASS, Quality PASS, Spec PASS):**
 
