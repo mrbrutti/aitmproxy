@@ -14,5 +14,11 @@ export interface NeedsConfirm {
 export const isNeedsConfirm = (v: unknown): v is NeedsConfirm =>
   isRecord(v) && v.status === 'needs_confirmation' && typeof v.prompt === 'string' && typeof v.confirm_token === 'string';
 
+/** Claims to be the confirm envelope but lacks its prompt or token: never treated as the verb having run. */
+export const isMalformedConfirm = (v: unknown): boolean => isRecord(v) && v.status === 'needs_confirmation' && !isNeedsConfirm(v);
+
 /** The error shown when the confirming call is answered with another `needs_confirmation`. */
 export const STALE_CONFIRM_MESSAGE = 'confirmation was not accepted (stale or reused token)';
+
+/** The error shown when a reply claims to be the confirm envelope but is missing its prompt or token. */
+export const MALFORMED_CONFIRM_MESSAGE = 'malformed confirmation envelope';

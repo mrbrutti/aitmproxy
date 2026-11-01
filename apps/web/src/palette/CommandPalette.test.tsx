@@ -6,6 +6,7 @@ import { AppProvider } from '~/state/context';
 import type { AppStore, FlowEntry } from '~/state/app';
 import type { ToolDef } from '~/bus/types';
 import type { FlowSummary } from '~/model/flow';
+import { MALFORMED_CONFIRM_MESSAGE, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
 import { CommandPalette } from './CommandPalette';
 
 const tool = (name: string, description: string, props: Record<string, unknown> = {}, required: string[] = [], mutates = true, confirm: string | null = null): ToolDef => ({
@@ -710,6 +711,57 @@ describe('CommandPalette grouping', () => {
     expect(app.notice).toHaveBeenCalledWith('ca.status could not be re-read; the CA word may be stale', 'error');
     expect(getByRole('status').textContent).toContain('ok');
     expect(app.setCAInstalling).toHaveBeenLastCalledWith(false);
+  });
+
+  it('a stale second envelope for a confirming call the operator typed away from is an error notice, never silent: no result stage, the flag released once', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    const { getByRole, getByText, queryByRole } = await atServerPrompt(app, order);
+    const replies = heldBus(app, order);
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    expect(getByText('Running…')).toBeTruthy();
+    fireEvent.input(getByRole('combobox'), { target: { value: '>flow' } });
+    await tick();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    replies[0]!({ ...ENVELOPE, confirm_token: 'tok-9c1d' });
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([
+      ['ca.install', { scope: 'user' }],
+      ['ca.install', { scope: 'user', _confirm: 'tok-7f3a' }],
+    ]);
+    expect(app.notice).toHaveBeenCalledTimes(1);
+    expect(app.notice).toHaveBeenCalledWith(STALE_CONFIRM_MESSAGE, 'error');
+    expect(queryByRole('status')).toBeNull();
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('listbox', { name: 'Results' })).toBeTruthy();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'call:ca.install', 'refreshCA', 'installing:false']);
+  });
+
+  it('a needs_confirmation envelope without its token is malformed: an error result saying so, no prompt, the flag released after one re-read', async () => {
+    const app = stubApp(CA_UNTRUSTED);
+    const order: string[] = [];
+    traceCA(app, order);
+    app.call.mockImplementation(async (name: string) => {
+      order.push(`call:${name}`);
+      return { status: 'needs_confirmation', prompt: 'ca.install changes the trust store of this machine. Confirm?' };
+    });
+    const { getByRole, getByText, queryByRole } = await mount(app);
+    fireEvent.click(getByText('Trust the aitmproxy CA').closest('[role="option"]')!);
+    await tick();
+    fireEvent.click(getByText('Run').closest('button')!);
+    await tick();
+    fireEvent.click(getByText('Confirm').closest('button')!);
+    await tick();
+    await tick();
+    expect(app.call.mock.calls).toEqual([['ca.install', { scope: 'user' }]]);
+    expect(queryByRole('alert')).toBeNull();
+    expect(getByRole('status').textContent).toContain('error');
+    expect(getByRole('status').textContent).toContain(MALFORMED_CONFIRM_MESSAGE);
+    expect(getByRole('status').textContent).toContain('malformed confirmation envelope');
+    expect(app.notice).not.toHaveBeenCalled();
+    expect(order).toEqual(['installing:true', 'call:ca.install', 'refreshCA', 'installing:false']);
   });
 
   it('Esc closes from the list and returns to the list from a form', async () => {

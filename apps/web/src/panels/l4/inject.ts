@@ -4,8 +4,7 @@
 // exactly what the core returns (a `needs_confirmation` prompt, a guard refusal verbatim, or the
 // sent result). The dimming/disabling the surface shows is a courtesy; the guard is the enforcement.
 
-import { isNeedsConfirm, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
-import { isRecord } from '~/lib/isRecord';
+import { isMalformedConfirm, isNeedsConfirm, MALFORMED_CONFIRM_MESSAGE, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
 import type { PacketSpec } from './model';
 
 export interface InjectArgs {
@@ -33,10 +32,7 @@ export type GuardedOutcome =
   | { kind: 'done'; result: unknown }
   | { kind: 'refused'; message: string };
 
-/** Claims to be the confirm envelope but lacks its prompt or token: never treated as the verb having run. */
-const isMalformedConfirm = (v: unknown): boolean => isRecord(v) && v.status === 'needs_confirmation' && !isNeedsConfirm(v);
-
-const MALFORMED_CONFIRM: GuardedOutcome = { kind: 'refused', message: 'malformed confirmation envelope' };
+const MALFORMED_CONFIRM: GuardedOutcome = { kind: 'refused', message: MALFORMED_CONFIRM_MESSAGE };
 
 /** First phase for any confirm-gated verb: run it, and classify the result. */
 export async function beginGuarded(call: Call, tool: string, params: Record<string, unknown>): Promise<GuardedOutcome> {

@@ -14,7 +14,7 @@ import { FlowLine } from '~/lib/schema-form/FlowLine';
 import { SchemaForm } from '~/lib/schema-form/SchemaForm';
 import { createFormState, type FormState, type RawValues } from '~/lib/schema-form/infer';
 import { isCACancelled, isCATrustTool } from '~/state/caTrust';
-import { isNeedsConfirm, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
+import { isMalformedConfirm, isNeedsConfirm, MALFORMED_CONFIRM_MESSAGE, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
 import { segments } from '~/lib/fuzzy';
 import { openedByPointer } from '~/lib/pointer';
 import { buildGroups, commandKey, compactJson, flatten, flowIdsIn, parseQuery, pushRecent, readPinned, readRecent, setupKey, togglePinned, type PaletteItem } from './groups';
@@ -93,6 +93,7 @@ export const CommandPalette: Component = () => {
   const callFor = async (tool: ToolDef, args: Record<string, unknown>, phase: Phase): Promise<Outcome> => {
     try {
       const value = await app.call(tool.name, phase.kind === 'begin' ? args : { ...args, _confirm: phase.token });
+      if (isMalformedConfirm(value)) return { kind: 'failed', message: MALFORMED_CONFIRM_MESSAGE };
       if (!isNeedsConfirm(value)) return { kind: 'done', value };
       if (phase.kind === 'confirm') return { kind: 'stale' };
       return { kind: 'ask', prompt: value.prompt, token: value.confirm_token };
@@ -104,8 +105,8 @@ export const CommandPalette: Component = () => {
   /**
    * Where a call's outcome takes the palette. Only a palette still waiting for this very run is
    * written to: one that was closed, left, or moved on to a newer run meanwhile treats the reply
-   * as the end of the run (a failure becomes a notice, a result is dropped). A CA run (§D17.12)
-   * is released on every ending while it owns the flag, never while the prompt is up.
+   * as the end of the run (a failure or a stale token becomes a notice, a result is dropped).
+   * A CA run (§D17.12) is released on every ending while it owns the flag, never while the prompt is up.
    */
   const settle = async (tool: ToolDef, args: Record<string, unknown>, outcome: Outcome, t0: number, seq: number) => {
     const ca = isCATrustTool(tool.name);
@@ -115,6 +116,7 @@ export const CommandPalette: Component = () => {
       if (awaited) setStage(s);
     };
     const result = (ok: boolean, value: unknown): Stage => ({ kind: 'result', tool, ok, value, ms: performance.now() - t0, args });
+    const fail = (message: string) => (awaited ? setStage(result(false, message)) : app.notice(message, 'error'));
     switch (outcome.kind) {
       case 'ask':
         if (awaited) setStage({ kind: 'confirm', tool, args, prompt: outcome.prompt, token: outcome.token });
@@ -125,15 +127,14 @@ export const CommandPalette: Component = () => {
         if (tool.mutates !== false) void app.refreshSide();
         break;
       case 'stale':
-        show(result(false, STALE_CONFIRM_MESSAGE));
+        fail(STALE_CONFIRM_MESSAGE);
         break;
       case 'failed':
         if (ca && isCACancelled(outcome.message)) {
           // The operator dismissed the OS dialog: calm (D17.4), nothing to inspect.
           app.notice(outcome.message, 'info');
           show({ kind: 'list' });
-        } else if (awaited) setStage(result(false, outcome.message));
-        else app.notice(outcome.message, 'error');
+        } else fail(outcome.message);
         break;
     }
     if (ca && caOwner === seq) await releaseCA();
