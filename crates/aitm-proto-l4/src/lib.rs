@@ -17,6 +17,7 @@ pub mod craft;
 pub mod flow;
 pub mod gates;
 pub mod guard;
+pub mod helper;
 pub mod icmp;
 pub mod intercept;
 pub mod language;
