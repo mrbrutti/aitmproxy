@@ -16,6 +16,18 @@ E3. **The notice is cleared by any parsed `scan.*` reply** (`crates/aitm-tui/src
 
 E10. **A landing suppressed while a read is pending is never retried** (`crates/aitm-tui/src/app.rs` `scan.issue` reply arm): on a successful `scan.issue` reply, if the Issues tab is shown with the List pane focused and the cursor's id differs from the reply's id and is not in `read`, run `issue_cursor_landed` once (never on a failed reply, so no retry loop). Test (`tests/scan_v2_issues.rs`): land on row 1 (read pending), Down to row 2, fold row 1's reply: exactly one `scan.issue` for row 2 leaves.
 
+E11. **`read` can hold an id the page no longer lists** (`crates/aitm-tui/src/app.rs` `scan.issue` reply arm): insert only when `issues.list` carries the id (so the D1 invariant `read.len() <= list.len()` holds between folds). Test: land on X, refetch to a page without X, fold X's reply, `read` is empty.
+
+E12. **`flow_cursor` is reset by whichever read answers** (`crates/aitm-tui/src/app.rs`): reset it where the Issues list cursor moves (beside the Jobs `detail_scroll = 0`), not in the reply arm.
+
+E13. `count_of` lost exhaustiveness (`crates/aitm-tui/src/scan/issues.rs`): keep the five-arm match in `count_of` and define `severity_counts` as `SEVERITY_ORDER.map(|s| count_of(b, s))`.
+
+E14. `scan_reply_keyed` takes `name` only to `debug_assert` it (`crates/aitm-tui/src/app.rs`): drop the parameter and the assert (the tag is the verb's source).
+
+E15. `list` and `rows` are parallel vectors (`crates/aitm-tui/src/scan/issues.rs`): keep both (Task 8 reads summary fields such as `poc_ref`/`finding_id` off `list` for rows whose full issue is not yet read), but state on the `list` doc what still reads it and add a `debug_assert_eq!(list.len(), rows.len())` at the end of `fold_result`.
+
+E16. Test-file hygiene (`tests/scan_v2_issues.rs`): module doc says "twenty ticks after the last fetch"; `fn app_with(tools: &[&str]) -> App` with `app()` calling it; `fn page_of(n, id_of) -> Value` shared by the two synthetic-page tests; `pending_read: Option<IssueId>`; `STATUS_MAX` pinned against `status_token(IssueStatus::FalsePositive).len()`; the `read` doc's `scan.issue.update` mention reads "Task 8 adds".
+
 ## Structure
 
 E4. The model imports a UI module (`crates/aitm-tui/src/scan/jobs.rs` `use crate::ui::text::truncate`): move `ui/text.rs` to `src/text.rs` (`pub mod text;` in `lib.rs`), keep `pub use crate::text as text;` in `ui/mod.rs` so existing `crate::ui::text` paths compile; the model imports `crate::text::truncate`.

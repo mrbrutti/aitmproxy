@@ -407,6 +407,17 @@ Kept by the main session during stage 6. One row per finding.
 | fix D | coder note | note | the legacy Jobs key line is a fifth tertiary line not routed through `hint` | Task 14 replaces it with the `bars.rs` hints |
 | fix D | security | re-review | D1, D2, D3, D9 closed; bounds: at most one `scan.issues` and one `scan.issue` in flight, `read` at most 513 full issues | closed |
 | fix D | security | Minor | a width-0 string (U+200B and kin) passes the cell-based `truncate` whole, so a hostile page defeats D2's per-frame bound in bytes | fix round E (E1): `truncate` also caps at `4 * w` chars; `read` capped at 64 entries (drop the oldest) |
+| fix D | spec | re-review | D1 to D14 closed with the report's literals; the D1 Up-after-Down rewording proves the claim | closed |
+| fix D | spec | Minor | spec D6 and D10 still named `fetched`/`issues.detail` | re-aligned in this commit |
+| fix D | spec | Minor | the filtered-out-job test proves the `forget_job` pin, not the filtered-out clause (indistinguishable under the prune) | accepted; name kept as a regression pin |
+| fix D | spec | note | plan Task 7 "Change" paragraph still describes `fetched`/`detail`/`pub CONFIDENCE_GLYPHS` | accepted as history; the Review log and Task 8 text carry the current shapes |
+| fix D | quality | re-review | D1 to D14 closed | closed |
+| fix D | quality | Minor | `read` can hold an id the page no longer lists until the next fold | fix round E (E11) |
+| fix D | quality | Minor | `flow_cursor` reset by whichever read answers | fix round E (E12) |
+| fix D | quality | Minor | `count_of` lost exhaustiveness | fix round E (E13) |
+| fix D | quality | Minor | `scan_reply_keyed` threads `name` only to assert it | fix round E (E14) |
+| fix D | quality | Minor | `list`/`rows` parallel vectors; `list` retains the raw strings | fix round E (E15): keep both, document, assert lengths |
+| fix D | quality | Minor | test-file hygiene (stale cadence doc, inlined `app()`, synthetic pages twice) and small hygiene | fix round E (E16) |
 
 ## Shipped
 
