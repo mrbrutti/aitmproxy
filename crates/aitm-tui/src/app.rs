@@ -2039,10 +2039,26 @@ impl App {
         }]
     }
 
-    /// Forward / Drop a parked in-path L4 packet (ui-ext §3.4, L4OPS-AC12),
-    /// through the same confirm-over-the-wire path; feature-detected from
-    /// `l4.intercept.*`, documented-limited when absent.
+    /// Forward / Drop a parked in-path L4 packet (ui-ext §3.4, L4OPS-AC12;
+    /// L4 parity spec §4), through the same confirm-over-the-wire path. While
+    /// `l4.intercept.status` says unavailable nothing reaches the bus: the
+    /// toast carries the core's reason (AC11). The verdict names the **parked
+    /// packet's id** from `l4.intercept.list`, the first listed for this flow
+    /// (oldest first), never the flow id (AC10).
     fn l4_intercept_verb(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Vec<BusRequest> {
+        if !self.l4.intercept.available {
+            let reason = self
+                .l4
+                .intercept
+                .reason
+                .clone()
+                .unwrap_or_else(|| "unavailable".to_string());
+            self.toast(
+                Level::Warn,
+                format!("in-path intercept unavailable: {reason}"),
+            );
+            return Vec::new();
+        }
         if !self.has_tool(tool) {
             self.toast(
                 Level::Warn,
@@ -2050,23 +2066,63 @@ impl App {
             );
             return Vec::new();
         }
-        if flow.parked().is_none() {
-            self.toast(
-                Level::Info,
-                "No parked L4 packet — Forward/Drop need an in-path intercept session",
-            );
+        let Some(parked_id) = self.l4.parked_for(&flow.id).map(|p| p.id.clone()) else {
+            self.toast(Level::Info, "no parked packet on this flow");
             return Vec::new();
-        }
+        };
         if !self.l4.in_scope(flow) {
             self.toast(Level::Warn, "Out of L4 scope — intercept actions disabled");
             return Vec::new();
         }
-        let args = json!({ "id": flow.id });
+        let args = json!({ "id": parked_id });
         self.l4.pending = Some((tool.to_string(), args.clone()));
         vec![BusRequest::Call {
             name: tool.to_string(),
             args,
         }]
+    }
+
+    /// Ask for the selected L4 flow's packet window (spec §2: the inspector,
+    /// not the list poll, fetches packets) on a core whose `l4.flow.get`
+    /// declares `offset` / `limit`. An older core sends the whole log on the
+    /// poll already, so nothing is asked.
+    fn request_l4_window(&self, id: &str, out: &mut Vec<BusRequest>) {
+        if self.has_tool("l4.flow.get") && crate::l4::supports_window(&self.tools) {
+            out.push(BusRequest::Call {
+                name: "l4.flow.get".into(),
+                args: crate::l4::inspect_args(id),
+            });
+        }
+    }
+
+    /// Upsert one parsed `l4.flow.get` object: the union list row and the full
+    /// flow in `self.l4.flows`. When the object carries no packets but the
+    /// stored flow does (a `limit: 0` poll reply over an inspected window), the
+    /// stored packets are kept; a grown `packet_count` on the selected flow
+    /// asks for the window again.
+    fn upsert_l4_flow(&mut self, mut f: crate::l4::L4Flow, out: &mut Vec<BusRequest>) {
+        if f.packets.is_empty() {
+            if let Some(prev) = self.l4.flows.get(&f.id) {
+                if !prev.packets.is_empty() {
+                    if self.selected.as_deref() == Some(f.id.as_str())
+                        && f.packet_count != prev.packet_count
+                    {
+                        self.request_l4_window(&f.id, out);
+                    }
+                    f.packets = prev.packets.clone();
+                }
+            }
+        }
+        if let Some(&i) = self.index.get(&f.id) {
+            let seq = self.flows[i].seq;
+            self.flows[i] = FlowRow::from_l4(&f, seq);
+        } else {
+            let row = FlowRow::from_l4(&f, self.next_seq);
+            self.next_seq += 1;
+            self.index.insert(row.id.clone(), self.flows.len());
+            self.flows.push(row);
+        }
+        self.l4.flows.insert(f.id.clone(), f);
     }
 
     fn gate(&mut self, r: &FlowRow) -> bool {
@@ -2962,9 +3018,10 @@ impl App {
     /// Ask the bus for `id`'s detail when it can answer (`flow.detail`, F5)
     /// and the app neither has it nor has given up on it.
     fn request_detail(&mut self, id: &str, out: &mut Vec<BusRequest>) {
-        // L4 flows carry no `flow.detail`; their packets arrive on the `l4.*`
-        // poll and live in `self.l4.flows`.
+        // L4 flows carry no `flow.detail`; the list poll brings their fields and
+        // the inspector asks for the packet window (spec §2).
         if self.row(id).is_some_and(|r| r.kind == FlowKind::L4) {
+            self.request_l4_window(id, out);
             return;
         }
         if self.has_tool("flow.detail")
@@ -3628,16 +3685,7 @@ impl App {
                     .collect();
                 for f in parsed {
                     seen.insert(f.id.clone());
-                    if let Some(&i) = self.index.get(&f.id) {
-                        let seq = self.flows[i].seq;
-                        self.flows[i] = FlowRow::from_l4(&f, seq);
-                    } else {
-                        let row = FlowRow::from_l4(&f, self.next_seq);
-                        self.next_seq += 1;
-                        self.index.insert(row.id.clone(), self.flows.len());
-                        self.flows.push(row);
-                    }
-                    self.l4.flows.insert(f.id.clone(), f);
+                    self.upsert_l4_flow(f, &mut out);
                 }
                 let before = self.flows.len();
                 self.flows
@@ -3904,6 +3952,16 @@ impl App {
                             self.details.remove(&id);
                             self.request_detail(&id, &mut out);
                         }
+                    }
+                    // The inspector's packet window (spec §2): fold it, no toast.
+                    "l4.flow.get" => {
+                        if let Some(f) = crate::l4::L4Flow::from_json(&value) {
+                            self.upsert_l4_flow(f, &mut out);
+                            let packets = self.selected_l4().map_or(0, |f| f.packets.len());
+                            self.l4.packet_cursor =
+                                self.l4.packet_cursor.min(packets.saturating_sub(1));
+                        }
+                        return out;
                     }
                     // L4 craft build() → the hex preview (L4OPS-AC8).
                     "l4.craft" => {

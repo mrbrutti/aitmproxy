@@ -12,8 +12,9 @@ use aitm_tui::app::{App, Mode, SidebarItem};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::l4::{
-    ascii_column, flow_get_args, fold_status, hex_dump, inspect_args, slow_l4_reads, status_ids,
-    supports_operator_scope_add, supports_window, L4Availability, L4Flow, L4Parked, L4State,
+    ascii_column, clock_ms, flow_get_args, fold_status, hex_dump, inspect_args, packet_fields,
+    slow_l4_reads, status_ids, supports_operator_scope_add, supports_window, L4Availability,
+    L4Flow, L4Pane, L4Parked, L4State,
 };
 use aitm_tui::theme::Theme;
 use aitm_tui::ui::complete::l4_command_candidates;
@@ -1032,4 +1033,383 @@ fn capture_commands_help_lists_the_panel_key_and_commands() {
     );
     assert!(text.contains(":l4 stop [<id>]"), "{text}");
     assert!(text.contains("L4 panel"), "{text}");
+}
+
+// --------------------------------------------------------------- parked_id
+
+/// A base64 of `bytes` as the core sends it (standard, padded).
+fn b64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// An `l4.flow.get` object for intercept session `id` whose one parked packet
+/// carries the §2 fields and `bytes` (a UDP datagram 127.0.0.1:40000 →
+/// 127.0.0.1:9053 with payload `payload`).
+fn section_2_flow(id: &str, payload: &[u8]) -> Value {
+    json!({
+        "id": id,
+        "kind": "intercept",
+        "interface": "lo",
+        "queue": 0,
+        "packet_count": 1,
+        "injected_count": 0,
+        "started_at": 1_700_000_000_000i64,
+        "proto": "UDP", "src": "127.0.0.1", "dst": "127.0.0.1",
+        "src_port": 40000, "dst_port": 9053,
+        "offset": 0, "truncated": false, "next_offset": null,
+        "packets": [{
+            "dir": "inbound", "length": payload.len(), "injected": false,
+            "layers": ["IPv4", "UDP", "Raw"],
+            "timestamp": 1_700_000_000_000i64,
+            "proto": "UDP", "src": "127.0.0.1", "dst": "127.0.0.1",
+            "src_port": 40000, "dst_port": 9053,
+            "bytes": b64(payload)
+        }]
+    })
+}
+
+/// An intercept-capable session: the rig's verbs, intercept available, an L4
+/// scope entry covering `lo` for intercept, flow `F` landed by the poll and
+/// parked packet `P1` listed for it, with `F` selected.
+fn intercept_ready(parked: Vec<Value>) -> App {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable("X"),
+        intercept: L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "sessions": ["F"]}),
+        ),
+        captures: vec![],
+    });
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "interface": "lo", "capability": "intercept", "cidr": "127.0.0.1/32",
+        "ports": "9000-9999", "direction": "inbound"
+    })]));
+    let _ = app.on_bus(BusEvent::L4Flows(vec![intercept_flow("F")]));
+    let _ = app.on_bus(BusEvent::L4Parked(parked));
+    app.selected = Some("F".into());
+    assert!(app.selected_l4().is_some(), "flow F must be selected");
+    app
+}
+
+fn parked_p1() -> Value {
+    json!({
+        "id": "P1", "flow": "F", "state": "parked", "dir": "inbound",
+        "length": 60, "layers": ["IPv4", "TCP"], "parked_at": 1_700_000_000_000i64
+    })
+}
+
+fn render_inspector(app: &App) -> String {
+    let theme = Theme::new(true);
+    let area = Rect::new(0, 0, 120, 30);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::l4::inspector(app, &theme, area, &mut buf);
+    buffer_text(&buf).join("\n")
+}
+
+/// AC10: Forward and Drop send the parked packet's id from `l4.intercept.list`,
+/// never the flow id.
+#[test]
+fn parked_id_forward_and_drop_send_the_parked_id_never_the_flow_id() {
+    let mut app = intercept_ready(vec![parked_p1()]);
+    let out = app.update(Action::Resume);
+    assert_eq!(
+        out,
+        vec![BusRequest::Call {
+            name: "l4.intercept.forward".into(),
+            args: json!({"id": "P1"}),
+        }]
+    );
+    let out2 = app.update(Action::Kill);
+    assert_eq!(
+        out2,
+        vec![BusRequest::Call {
+            name: "l4.intercept.drop".into(),
+            args: json!({"id": "P1"}),
+        }]
+    );
+    for req in out.iter().chain(out2.iter()) {
+        let BusRequest::Call { args, .. } = req else {
+            panic!("{req:?}");
+        };
+        assert_ne!(*args, json!({"id": "F"}));
+        assert!(!args.to_string().contains("\"F\""), "{args}");
+    }
+}
+
+/// The oldest listed parked packet for the flow is the one acted on; another
+/// flow's parked packet is never picked.
+#[test]
+fn parked_id_acts_on_the_first_listed_for_the_flow() {
+    let mut app = intercept_ready(vec![
+        json!({"id": "P9", "flow": "OTHER", "state": "parked", "length": 1, "layers": []}),
+        json!({"id": "P2", "flow": "F", "state": "parked", "length": 1, "layers": []}),
+        json!({"id": "P3", "flow": "F", "state": "parked", "length": 1, "layers": []}),
+    ]);
+    assert_eq!(
+        app.update(Action::Resume),
+        vec![BusRequest::Call {
+            name: "l4.intercept.forward".into(),
+            args: json!({"id": "P2"}),
+        }]
+    );
+}
+
+/// No parked entry for the flow: nothing on the bus, an honest toast.
+#[test]
+fn parked_id_without_a_parked_entry_sends_nothing() {
+    let mut app = intercept_ready(vec![]);
+    assert_eq!(app.update(Action::Resume), Vec::<BusRequest>::new());
+    assert!(
+        toast_text(&app).contains("no parked packet"),
+        "{}",
+        toast_text(&app)
+    );
+    assert_eq!(app.update(Action::Kill), Vec::<BusRequest>::new());
+}
+
+/// AC11: intercept unavailable (reason `Y`) → Forward / Drop / Mutate put no
+/// `l4.intercept.*` call on the bus, the toast carries the core's reason, and
+/// the intercept pane is one documented-limited line with `Y` and no hints.
+#[test]
+fn parked_id_unavailable_intercept_refuses_locally_with_the_reason() {
+    let mut app = intercept_ready(vec![parked_p1()]);
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable("X"),
+        intercept: L4Availability::from_reply(&json!({
+            "available": false, "code": "unsupported_platform", "reason": "Y", "sessions": []
+        })),
+        captures: vec![],
+    });
+    assert_eq!(app.update(Action::Resume), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+    assert_eq!(app.update(Action::Kill), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+    // Mutate (`e`) opens the craft pane; it never calls `l4.intercept.*`.
+    let out = app.update(Action::Edit);
+    assert!(
+        !out.iter().any(
+            |r| matches!(r, BusRequest::Call { name, .. } if name.starts_with("l4.intercept."))
+        ),
+        "{out:?}"
+    );
+    assert_eq!(out, Vec::<BusRequest>::new());
+
+    app.l4.pane = L4Pane::Intercept;
+    let text = render_inspector(&app);
+    assert!(text.contains("intercept unavailable"), "{text}");
+    assert!(text.contains('Y'), "{text}");
+    assert!(!text.contains("Forward"), "{text}");
+    assert!(!text.contains("Drop"), "{text}");
+    assert!(!text.contains("Mutate"), "{text}");
+    assert!(!text.contains("Phase 2"), "{text}");
+}
+
+/// With intercept available and `P1` parked, the pane shows the parked id and
+/// the Forward / Mutate / Drop hints.
+#[test]
+fn parked_id_available_pane_shows_the_parked_packet_and_hints() {
+    let mut app = intercept_ready(vec![parked_p1()]);
+    app.l4.pane = L4Pane::Intercept;
+    let text = render_inspector(&app);
+    assert!(text.contains("P1"), "{text}");
+    assert!(text.contains("Forward"), "{text}");
+    assert!(text.contains("Drop"), "{text}");
+    assert!(text.contains("60B") || text.contains("60 B"), "{text}");
+}
+
+/// Selecting an L4 row asks for its packet window with `inspect_args` on a core
+/// that declares the window; the reply lands in `app.l4.flows` silently, and
+/// the next `limit: 0` poll does not wipe the packets it brought.
+#[test]
+fn parked_id_selecting_an_l4_row_fetches_the_packet_window() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let _ = app.on_bus(BusEvent::L4Flows(vec![intercept_flow("F")]));
+    app.selected = None;
+    let out = app.update(Action::Down);
+    assert_eq!(app.selected.as_deref(), Some("F"));
+    assert_eq!(
+        out,
+        vec![BusRequest::Call {
+            name: "l4.flow.get".into(),
+            args: inspect_args("F"),
+        }]
+    );
+
+    let out = app.on_bus(BusEvent::CallOk {
+        name: "l4.flow.get".into(),
+        value: section_2_flow("F", b"hello-l4"),
+    });
+    assert_eq!(out, Vec::<BusRequest>::new());
+    assert!(
+        app.current_toast().is_none(),
+        "the window reply never toasts"
+    );
+    let f = app.selected_l4().expect("F");
+    assert_eq!(f.packets.len(), 1);
+    assert_eq!(f.packets[0].bytes.as_deref(), Some(&b"hello-l4"[..]));
+
+    // The poll's `limit: 0` reply carries flow fields only.
+    let mut polled = section_2_flow("F", b"hello-l4");
+    polled["packets"] = json!([]);
+    let out = app.on_bus(BusEvent::L4Flows(vec![polled.clone()]));
+    assert_eq!(out, Vec::<BusRequest>::new());
+    assert_eq!(app.selected_l4().map(|f| f.packets.len()), Some(1));
+
+    // More packets arrived: the selected flow's window is asked for again.
+    polled["packet_count"] = json!(2);
+    let out = app.on_bus(BusEvent::L4Flows(vec![polled]));
+    assert_eq!(
+        out,
+        vec![BusRequest::Call {
+            name: "l4.flow.get".into(),
+            args: inspect_args("F"),
+        }]
+    );
+
+    // An older core without the window: the row's poll reply is all there is.
+    let mut old = self::app();
+    let tools: Vec<ToolInfo> = l4_tools(false)
+        .into_iter()
+        .map(|mut t| {
+            if t.name == "l4.flow.get" {
+                t.input_schema =
+                    json!({"type": "object", "properties": {"id": {"type": "string"}}});
+            }
+            t
+        })
+        .collect();
+    let _ = connected(&mut old, tools);
+    let _ = old.on_bus(BusEvent::L4Flows(vec![intercept_flow("F")]));
+    old.selected = None;
+    assert_eq!(old.update(Action::Down), Vec::<BusRequest>::new());
+}
+
+/// Pure: epoch ms → a UTC clock, and the §2 field list of a packet.
+#[test]
+fn parked_id_clock_and_packet_fields() {
+    assert_eq!(clock_ms(1_700_000_000_000), "22:13:20.000");
+    assert_eq!(clock_ms(0), "00:00:00.000");
+    assert_eq!(clock_ms(1_700_000_000_123), "22:13:20.123");
+
+    let flow = L4Flow::from_json(&section_2_flow("F", b"hello-l4")).expect("flow");
+    let fields = packet_fields(&flow.packets[0]);
+    assert_eq!(
+        fields,
+        vec![
+            ("time", "22:13:20.000".to_string()),
+            ("proto", "UDP".to_string()),
+            ("endpoints", "127.0.0.1:40000 → 127.0.0.1:9053".to_string()),
+            ("length", "8 B".to_string()),
+            ("injected", "no".to_string()),
+        ]
+    );
+
+    let bare = L4Flow::from_json(&intercept_flow("F")).expect("flow");
+    let fields = packet_fields(&bare.packets[0]);
+    assert_eq!(fields[0], ("time", "—".to_string()));
+    assert_eq!(fields[1], ("proto", "TCP".to_string()));
+    assert_eq!(fields[2], ("endpoints", "—".to_string()));
+}
+
+/// AC40 (render): the packet pane shows the §2 fields and a `hex_dump` row of
+/// the packet's bytes.
+#[test]
+fn parked_id_packet_pane_shows_section_2_fields_and_hex() {
+    let mut app = intercept_ready(vec![parked_p1()]);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "l4.flow.get".into(),
+        value: section_2_flow("F", b"hello-l4"),
+    });
+    app.l4.pane = L4Pane::Packets;
+    let text = render_inspector(&app);
+    assert!(text.contains("22:13:20.000"), "{text}");
+    assert!(text.contains("UDP"), "{text}");
+    assert!(text.contains("127.0.0.1:40000 → 127.0.0.1:9053"), "{text}");
+    assert!(text.contains("8 B"), "{text}");
+    assert!(text.contains("injected"), "{text}");
+    assert!(text.contains("00000000  68 65 6c 6c 6f 2d 6c 34"), "{text}");
+    assert!(text.contains("hello-l4"), "{text}");
+    assert!(!text.contains("no bytes from this core"), "{text}");
+}
+
+/// A packet without `bytes` (withheld under §2.2, or an older core) says so.
+#[test]
+fn parked_id_packet_pane_is_honest_without_bytes() {
+    let mut app = intercept_ready(vec![parked_p1()]);
+    let mut v = section_2_flow("F", b"hello-l4");
+    v["packets"][0]
+        .as_object_mut()
+        .expect("packet")
+        .remove("bytes");
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "l4.flow.get".into(),
+        value: v,
+    });
+    app.l4.pane = L4Pane::Packets;
+    let text = render_inspector(&app);
+    assert!(text.contains("no bytes from this core"), "{text}");
+    assert!(!text.contains("00000000  "), "{text}");
+}
+
+/// AC40: a packet of every byte 0..=255, with control characters in the
+/// core's strings too, renders with no character below `' '`.
+#[test]
+fn parked_id_packet_pane_render_is_inert() {
+    let mut app = intercept_ready(vec![parked_p1()]);
+    let all: Vec<u8> = (0..=255u8).collect();
+    let mut v = section_2_flow("F", &all);
+    v["packets"][0]["proto"] = json!("U\u{1b}[31mDP");
+    v["packets"][0]["src"] = json!("127.0.0.1\u{7}");
+    v["packets"][0]["layers"] = json!(["IPv4", "UDP\u{1b}[0m", "Raw"]);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "l4.flow.get".into(),
+        value: v,
+    });
+    let theme = Theme::new(true);
+    // Tall enough to draw every one of the 16 hex rows.
+    let area = Rect::new(0, 0, 120, 60);
+    let mut buf = Buffer::empty(area);
+    app.l4.pane = L4Pane::Packets;
+    aitm_tui::ui::l4::inspector(&app, &theme, area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert!(text.contains("00000020  20 21 22 23"), "{text}");
+    assert!(
+        text.chars().all(|c| c >= ' ' || c == '\n'),
+        "control character reached the terminal: {text:?}"
+    );
+    // The same for the intercept pane, whose parked entry comes from the core.
+    let _ = app.on_bus(BusEvent::L4Parked(vec![json!({
+        "id": "P1\u{1b}[2J", "flow": "F", "state": "parked", "length": 60,
+        "layers": ["IPv4", "TCP\u{8}"]
+    })]));
+    app.l4.pane = L4Pane::Intercept;
+    let text = render_inspector(&app);
+    assert!(
+        text.chars().all(|c| c >= ' ' || c == '\n'),
+        "control character reached the terminal: {text:?}"
+    );
 }

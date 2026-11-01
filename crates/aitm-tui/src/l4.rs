@@ -478,6 +478,64 @@ pub fn hex_dump(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Epoch milliseconds (UTC, spec §2) as a `HH:MM:SS.mmm` clock, the same 12
+/// cells HTTP rows get from `model::clock_of`. Pure arithmetic; no calendar.
+pub fn clock_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let sod = secs.rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60,
+        millis
+    )
+}
+
+/// One `addr:port` endpoint; an IPv6 address is bracketed; a missing port is
+/// omitted.
+fn endpoint(addr: &str, port: Option<u16>) -> String {
+    let host = if addr.contains(':') {
+        format!("[{addr}]")
+    } else {
+        addr.to_string()
+    };
+    match port {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    }
+}
+
+/// The §2 fields of a packet as `(label, value)` rows for the detail pane:
+/// `time`, `proto`, `endpoints` (`src:port → dst:port`), `length`, `injected`.
+/// A field the core did not send reads `—`. The values are the core's text and
+/// are rendered through the inert path by the caller.
+pub fn packet_fields(p: &L4Packet) -> Vec<(&'static str, String)> {
+    let time = p.timestamp.map_or_else(|| "—".to_string(), clock_ms);
+    let proto = p
+        .proto
+        .clone()
+        .or_else(|| proto_of(&p.layers).map(str::to_string))
+        .unwrap_or_else(|| "—".to_string());
+    let endpoints = match (&p.src, &p.dst) {
+        (Some(s), Some(d)) => format!("{} → {}", endpoint(s, p.src_port), endpoint(d, p.dst_port)),
+        (Some(s), None) => format!("{} → ?", endpoint(s, p.src_port)),
+        (None, Some(d)) => format!("? → {}", endpoint(d, p.dst_port)),
+        (None, None) => "—".to_string(),
+    };
+    vec![
+        ("time", time),
+        ("proto", proto),
+        ("endpoints", endpoints),
+        ("length", format!("{} B", p.length)),
+        (
+            "injected",
+            if p.injected { "yes" } else { "no" }.to_string(),
+        ),
+    ]
+}
+
 /// A packet's layer tree as an honest, **labelled** indented text tree
 /// (ui-ext §3.2: a terminal cannot draw a graphical tree, so render it as text —
 /// never drop it). Outermost layer first, each nested one a step deeper.
