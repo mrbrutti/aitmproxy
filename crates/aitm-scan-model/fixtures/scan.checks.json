@@ -1,0 +1,84 @@
+{
+  "checks": [
+    {
+      "id": "http.reflected-xss",
+      "name": "reflected-xss check",
+      "class": "reflected-xss",
+      "lanes": [
+        "http"
+      ],
+      "kinds": [
+        "query",
+        "body_param"
+      ],
+      "intensity": "medium",
+      "cost": "light",
+      "technique": "reflected",
+      "severity": "high",
+      "confidence_max": "certain",
+      "needs_baseline": false,
+      "wants_traits": null,
+      "targets_session": false,
+      "cwe": 79,
+      "description": "Detects reflected-xss.",
+      "remediation": "Validate and encode untrusted input.",
+      "origin": {
+        "kind": "native"
+      }
+    },
+    {
+      "id": "http.sqli-error",
+      "name": "sqli check",
+      "class": "sqli",
+      "lanes": [
+        "http"
+      ],
+      "kinds": [
+        "query",
+        "body_param"
+      ],
+      "intensity": "medium",
+      "cost": "light",
+      "technique": "reflected",
+      "severity": "high",
+      "confidence_max": "certain",
+      "needs_baseline": false,
+      "wants_traits": null,
+      "targets_session": false,
+      "cwe": 79,
+      "description": "Detects sqli.",
+      "remediation": "Validate and encode untrusted input.",
+      "origin": {
+        "kind": "bundled",
+        "path": "scripts/bundled/active/sqli.rhai"
+      }
+    },
+    {
+      "id": "http.custom-marker",
+      "name": "custom check",
+      "class": "custom",
+      "lanes": [
+        "http"
+      ],
+      "kinds": [
+        "query",
+        "body_param"
+      ],
+      "intensity": "medium",
+      "cost": "light",
+      "technique": "reflected",
+      "severity": "high",
+      "confidence_max": "certain",
+      "needs_baseline": false,
+      "wants_traits": null,
+      "targets_session": false,
+      "cwe": 79,
+      "description": "Detects custom.",
+      "remediation": "Validate and encode untrusted input.",
+      "origin": {
+        "kind": "custom",
+        "path": "~/.aitmproxy/scripts/marker.rhai"
+      }
+    }
+  ]
+}
