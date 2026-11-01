@@ -63,7 +63,7 @@ use crate::limits::{
 };
 use crate::redact::{safe_url, scrub_error};
 use crate::session::{browser_cookie_statements, browser_partial};
-use crate::url_norm::{guard_authority, parse_absolute, request_url, same_origin};
+use crate::url_norm::{guard_authority, parse_absolute, request_url, resolve, same_origin};
 
 /// The crawl engine that drives the embedded browser.
 ///
@@ -508,7 +508,7 @@ impl<'a> Run<'a> {
             if self.report.attempts >= self.limits.max_pages {
                 return Ok(Some(StopReason::MaxPages));
             }
-            self.report.attempts += 1;
+            self.report.attempts = self.report.attempts.saturating_add(1);
             self.report.depth_reached = self.report.depth_reached.max(depth);
 
             match self.visit(&page, depth).await? {
@@ -581,7 +581,7 @@ impl<'a> Run<'a> {
             return Ok(Step::Stop(StopReason::LeftScope));
         };
 
-        self.report.pages += 1;
+        self.report.pages = self.report.pages.saturating_add(1);
         self.frontier.mark_visited(&landed);
         let dom = match bounded(self.job, self.browser.get_dom()).await {
             Ok(dom) => dom,
@@ -625,7 +625,7 @@ impl<'a> Run<'a> {
         let base = extracted
             .base
             .as_deref()
-            .and_then(|href| crate::url_norm::resolve(page, href))
+            .and_then(|href| resolve(page, href))
             .unwrap_or_else(|| page.clone());
         let resources: &[String] = if self.limits.follow_resources {
             &extracted.resources
@@ -633,7 +633,7 @@ impl<'a> Run<'a> {
             &[]
         };
         for href in extracted.links.iter().chain(resources) {
-            let Some(target) = crate::url_norm::resolve(&base, href) else {
+            let Some(target) = resolve(&base, href) else {
                 continue;
             };
             if !self.in_scope(&target) {
