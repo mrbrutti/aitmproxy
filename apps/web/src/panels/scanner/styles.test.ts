@@ -204,12 +204,17 @@ function sourceFiles(dir: string): string[] {
 }
 
 describe('the app bundle never imports node: modules (plan PA1)', () => {
-  it('no non-test file under src/ imports from node:', () => {
+  it('no non-test file under src/ imports from node:, and none imports the test kit', () => {
     const files = sourceFiles(SRC_ROOT);
     // The walk is real: the scanner views are in it, the tests are not.
     expect(files.some((f) => f.endsWith('/panels/scanner/JobsView.tsx'))).toBe(true);
     expect(files.some((f) => /\.test\.tsx?$/.test(f))).toBe(false);
-    const offenders = files.filter((f) => /from\s+['"]node:|require\(\s*['"]node:/.test(readFileSync(f, 'utf8')));
+    const sources = files.map((f) => [f, readFileSync(f, 'utf8')] as const);
+    // Static, CommonJS and dynamic forms alike.
+    const offenders = sources.filter(([, src]) => /from\s+['"]node:|require\(\s*['"]node:|import\(\s*['"]node:/.test(src)).map(([f]) => f);
     expect(offenders).toEqual([]);
+    // The test kit reads fixtures with node:fs, so it must stay out of the bundle too.
+    const kitImporters = sources.filter(([, src]) => /from\s+['"][^'"]*\/testkit['"]/.test(src)).map(([f]) => f);
+    expect(kitImporters).toEqual([]);
   });
 });

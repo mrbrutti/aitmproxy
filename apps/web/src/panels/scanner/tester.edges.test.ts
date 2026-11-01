@@ -403,3 +403,126 @@ describe('tester: store against a hostile profile.delete reply', () => {
     expect(s.lastError()).toBeNull();
   });
 });
+
+/* ------------------------------------------------------------------ fix round (A8): ensure* vs. Retry */
+
+describe('tester: ensure* racing a load* Retry (A8)', () => {
+  const built: ScanStore[] = [];
+  const tick = (ms = 0) => vi.advanceTimersByTimeAsync(ms);
+  type Deferred = { resolve: (v: unknown) => void; reject: (e: Error) => void };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    for (const s of built.splice(0)) s.dispose();
+    vi.useRealTimers();
+  });
+
+  /** A store whose every `scan.profile.list` call is parked until the test settles it, in call order. */
+  function parkedProfiles() {
+    const stub = stubApp();
+    const parked: Deferred[] = [];
+    stub.reply('scan.profile.list', () => new Promise((resolve, reject) => parked.push({ resolve, reject })));
+    const s = scanStore(stub.app);
+    built.push(s);
+    return { stub, s, parked };
+  }
+
+  const listOf = (names: string[]) => ({
+    profiles: names.map((name) => ({ name, builtin: false, summary: { lanes: ['http'], intensity: 'medium', speed: 'normal' } })),
+  });
+
+  it('a Retry while the bootstrap read is parked is a second read, ensure joins it (no third), and the Retry’s answer is what is held', async () => {
+    const { stub, s, parked } = parkedProfiles();
+    await tick();
+    expect(stub.count('scan.profile.list')).toBe(1); // the store's own bootstrap
+    expect(s.profilesLoaded()).toBe(false);
+
+    const joinedBoot = s.ensureProfiles();
+    const retry = s.loadProfiles(); // Retry always reads
+    const joinedRetry = s.ensureProfiles(); // joins the read in flight
+    expect(stub.count('scan.profile.list')).toBe(2);
+
+    parked[0]!.resolve(listOf(['first']));
+    await joinedBoot;
+    expect(s.profilesLoaded()).toBe(true);
+    expect(s.profiles().map((p) => p.name)).toEqual(['first']);
+    // Loaded now: a fresh ensure costs nothing even while the Retry is still out.
+    await s.ensureProfiles();
+    expect(stub.count('scan.profile.list')).toBe(2);
+
+    parked[1]!.resolve(listOf(['second']));
+    await Promise.all([retry, joinedRetry]);
+    expect(s.profiles().map((p) => p.name)).toEqual(['second']);
+    expect(s.profilesError()).toBeNull();
+    expect(stub.count('scan.profile.list')).toBe(2);
+  });
+
+  it('a failed read counts as loaded: ensure is a no-op afterwards (Retry is load), and a Retry already in flight clears the error when it answers', async () => {
+    const { stub, s, parked } = parkedProfiles();
+    await tick();
+    const retry = s.loadProfiles();
+    expect(stub.count('scan.profile.list')).toBe(2);
+
+    parked[0]!.reject(new Error('bus closed'));
+    await tick();
+    expect(s.profilesLoaded()).toBe(true);
+    expect(s.profilesError()).toBe('bus closed');
+    expect(s.profiles()).toEqual([]);
+    // ensure never retries a failure on its own: the view's Retry button calls `load`.
+    await s.ensureProfiles();
+    expect(stub.count('scan.profile.list')).toBe(2);
+
+    parked[1]!.resolve(listOf(['back']));
+    await retry;
+    expect(s.profilesError()).toBeNull();
+    expect(s.profiles().map((p) => p.name)).toEqual(['back']);
+    expect(stub.count('scan.profile.list')).toBe(2);
+  });
+});
+
+/* ------------------------------------------------------------------ fix round (A5 × A8): statusError on prototype-named jobs */
+
+describe('tester: statusError keyed by a job named like an Object.prototype member (A5, A8)', () => {
+  let close: (() => void) | null = null;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    close?.();
+    close = null;
+    vi.useRealTimers();
+  });
+
+  it('a failed read for job "constructor" lands on that key alone, and the next good read clears it', async () => {
+    const stub = stubApp();
+    let m!: LiveModel;
+    const disposeRoot = createRoot((d) => {
+      m = createLiveModel(stub.app, () => true);
+      return d;
+    });
+    close = () => {
+      m.dispose();
+      disposeRoot();
+    };
+
+    stub.fail('scan.status', 'scan: not_found: constructor');
+    await m.refreshStatus('constructor');
+    expect(m.statusError('constructor')).toBe('scan: not_found: constructor');
+    expect(m.statusError('hasOwnProperty')).toBeNull();
+    expect(m.statusError('toString')).toBeNull();
+    expect(m.statusError('valueOf')).toBeNull();
+    expect(m.statusError(JOB)).toBeNull();
+    expect(m.status('constructor')).toBeNull();
+
+    stub.reply('scan.status', { ...raw('scan.status.json'), job: 'constructor' });
+    await m.refreshStatus('constructor');
+    expect(m.statusError('constructor')).toBeNull();
+    expect(m.status('constructor')!.probes.sent).toBe(418);
+    expect(m.status('hasOwnProperty')).toBeNull();
+  });
+});

@@ -18,6 +18,8 @@ import { ConfirmInject } from '~/panels/l4/ConfirmInject';
 
 import { IssuesView } from './IssuesView';
 import { JobsView } from './JobsView';
+import { JobStrip } from './JobStrip';
+import { parseScanProfile, type ScanProfile } from './model';
 import { ProfilesView } from './ProfilesView';
 import { SitemapView } from './SitemapView';
 import { scanStore, type ScanStore } from './store';
@@ -240,5 +242,117 @@ describe('tester: ConfirmInject wiring the scanner relies on', () => {
     expect(cancel.disabled).toBe(true);
     fireEvent.click(confirm);
     expect(onConfirm).not.toHaveBeenCalled();
+  });
+});
+
+/* ------------------------------------------------------------------ fix round: A3 and A8 in the views */
+
+const standard = (): ScanProfile => parseScanProfile(fixture('scan.profile.get.json'))!;
+const SCOPE = { scope: [{ host: '127.0.0.1' }] };
+const jobsRow = (id: string) => document.querySelector<HTMLElement>(`[role=option][data-job="${id}"]`);
+
+describe('tester: Cancel placement (A3) and error ownership (A8) in the Jobs view', () => {
+  it('rows_have_no_cancel: no row carries a button; exactly two Cancel controls exist, the strip’s and the detail’s', async () => {
+    mount(() => (
+      <>
+        <JobStrip />
+        <JobsView />
+      </>
+    ));
+    await waitFor(() => expect(jobsRow(JOB)).not.toBeNull());
+    const rows = Array.from(document.querySelectorAll<HTMLElement>('[role=option][data-job]'));
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.querySelectorAll('button')).toHaveLength(0);
+      // The two-line row: state words and the severity bar are there, Cancel is not.
+      expect(row.querySelector('[data-field=state]')).not.toBeNull();
+      expect(row.querySelector('[role=img]')).not.toBeNull();
+    }
+    const cancels = screen.getAllByRole('button', { name: `Cancel scan ${JOB}` });
+    expect(cancels).toHaveLength(2);
+    const strip = screen.getByRole('region', { name: 'Selected job' });
+    const detail = screen.getByRole('region', { name: 'Job detail' });
+    expect(cancels.filter((b) => strip.contains(b))).toHaveLength(1);
+    expect(cancels.filter((b) => detail.contains(b))).toHaveLength(1);
+  });
+
+  it('a launch refusal never shows in the Jobs view; a refused cancel does, and a later error of another source replaces it', async () => {
+    const h = mount(
+      () => (
+        <>
+          <JobStrip />
+          <JobsView />
+        </>
+      ),
+      SCOPE,
+    );
+    await waitFor(() => expect(jobsRow(JOB)).not.toBeNull());
+
+    h.fail('scan.start', 'scan: out_of_scope: host 10.0.0.9');
+    await h.s.launch(standard(), 'start');
+    expect(h.s.lastError()).toEqual({ source: 'launch', code: 'out_of_scope', text: 'Out of scope: host 10.0.0.9' });
+    expect(document.querySelector('[data-error]')).toBeNull();
+    expect(screen.queryByText('Out of scope: host 10.0.0.9')).toBeNull();
+
+    h.fail('scan.cancel', 'scan: not_found: scan-1a2b3c4d');
+    await h.s.cancel(JOB);
+    const line = await screen.findByText('Not found: scan-1a2b3c4d');
+    expect(line.getAttribute('data-error')).toBe('cancel');
+    expect(line.getAttribute('role')).toBe('alert');
+    expect(screen.getByRole('region', { name: 'Job detail' }).contains(line)).toBe(true);
+
+    // One error slot (A8): the next launch refusal belongs to the editor, so the cancel line goes.
+    await h.s.launch(standard(), 'start');
+    await waitFor(() => expect(document.querySelector('[data-error="cancel"]')).toBeNull());
+    expect(h.s.lastError()!.source).toBe('launch');
+  });
+});
+
+describe('tester: error ownership (A8) and a code-less error (W-3) in the editor', () => {
+  async function mountEditor() {
+    const h = mount(() => <ProfilesView />, SCOPE);
+    await screen.findByLabelText('Profile name');
+    return h;
+  }
+
+  it('a refused cancel reaches the toast, never the editor', async () => {
+    const h = await mountEditor();
+    h.fail('scan.cancel', 'scan: not_found: scan-1a2b3c4d');
+    const result = await h.s.cancel(JOB);
+    expect(result.ok).toBe(false);
+    expect(h.notice).toHaveBeenCalledWith('Not found: scan-1a2b3c4d', 'error');
+    expect(h.s.lastError()).toEqual({ source: 'cancel', code: 'not_found', text: 'Not found: scan-1a2b3c4d' });
+    expect(screen.queryByRole('status', { name: 'Launch result' })).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('form', { name: 'Profile editor' }).textContent).not.toContain('Not found');
+  });
+
+  it('a launch rejection with no scan: code renders its text verbatim, with no Add-to-Scope affordance', async () => {
+    const h = await mountEditor();
+    h.fail('scan.start', 'bus closed');
+    await h.s.launch(standard(), 'start');
+    expect(h.s.lastError()).toEqual({ source: 'launch', code: null, text: 'bus closed' });
+    const result = await screen.findByRole('status', { name: 'Launch result' });
+    expect(result.textContent).toBe('bus closed');
+    expect(result.querySelectorAll('button')).toHaveLength(0);
+    expect(h.notice).toHaveBeenCalledWith('bus closed', 'error');
+  });
+
+  it('a failed scan.profile.get shows the profile error block with Retry; Retry reads again and binds the editor', async () => {
+    const h = mount(() => <ProfilesView />, SCOPE, (stub) => stub.fail('scan.profile.get', 'scan: not_found: standard'));
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toContain('Not found: standard');
+    expect(screen.queryByLabelText('Profile name')).toBeNull();
+    expect(h.s.lastError()).toEqual({ source: 'profile', code: 'not_found', text: 'Not found: standard' });
+    // Not the launch-result block: that one renders launch/save/delete/preview only.
+    expect(screen.queryByRole('status', { name: 'Launch result' })).toBeNull();
+
+    const before = h.count('scan.profile.get');
+    h.reply('scan.profile.get', fixture('scan.profile.get.json'));
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(h.count('scan.profile.get')).toBe(before + 1));
+    const name = (await screen.findByLabelText('Profile name')) as HTMLInputElement;
+    expect(name.value).toBe('standard');
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 });
