@@ -390,10 +390,18 @@ Kept by the main session during stage 6. One row per finding.
 | 7 | quality | Minor | tests `contains` where a row literal exists; one `assert!(a == b)` | fix round D (D13) |
 | 7 | quality | Minor | four overstated doc comments; small hygiene | fix round D (D14) |
 | fix C | security | re-review | C1, C2, C3, C20, C21, C22 closed | closed |
-| fix C | security | Minor | C20 residual: Jobs rows are still built at render over the raw strings, so per-frame CPU is linear in the retained text | fix round E: bound `profile_name` and `targets` in `fold_status` (or store a prebuilt `JobRow`), and make `ui::text::truncate` early-exit |
-| fix C | security | Minor | C2 doc says `ceil(n/16)` firings; with the cursor's job riding out of turn the bound is `ceil((n-1)/15)` | fix round E: doc wording |
+| fix C | security | Minor | C20 residual: Jobs rows are still built at render over the raw strings, so per-frame CPU is linear in the retained text | fix round E (E1): bound `profile_name` and `targets` in `fold_status` (or store a prebuilt `JobRow`), and make `ui::text::truncate` early-exit |
+| fix C | security | Minor | C2 doc says `ceil(n/16)` firings; with the cursor's job riding out of turn the bound is `ceil((n-1)/15)` | fix round E (E2): doc wording |
 | fix C | spec | re-review | C1 to C31 closed with the report's literals; D3/D6/D13 re-aligned in this commit (C1/C2 cadence rules, `from_message(tag, ..)`, notice clearing) | closed |
 | fix C | spec | Minor | seven supporting public items beyond the report's names | accepted (as for Tasks 6 and 7) |
+| fix C | quality | re-review | C1 to C31 closed (deviations weighed and accepted) | closed |
+| fix C | quality | Minor | the model imports `ui::text::truncate` | fix round E (E4): `ui/text.rs` becomes `crate::text`, re-exported from `ui` |
+| fix C | quality | Minor | three public readings of one Detail pane | fix round E (E5) |
+| fix C | quality | Minor | notice cleared by any parsed `scan.*` reply, contradicting the docs; a status poll erases `already done` within a second | ruling (a): key-clear only; fix round E (E3) |
+| fix C | quality | Minor | `summaries` field doc contradicts the invariant | fix round E (E6) |
+| fix C | quality | Minor | `live()` dedupe condition hard to read | fix round E (E7) |
+| fix C | quality | Minor | `d`/`dir` pair, gap spelled twice, one fully qualified `Style` | fix round E (E8) |
+| fix C | quality | Minor | `forty_running_jobs` mid-file; one six-property test | fix round E (E9) |
 
 ## Shipped
 
