@@ -1485,4 +1485,200 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+    // ---- tester (privilege unit p1b): oversized, hostile and failing inputs ---
+
+    /// Tester: one chunk bigger than the bound keeps only its last 4 KiB; a
+    /// later small chunk evicts the oldest bytes; bytes that are not UTF-8 (a
+    /// launcher in another locale, or a binary-spewing helper) render lossily
+    /// and never panic.
+    #[test]
+    fn stderr_tail_oversized_chunk_and_non_utf8() {
+        let mut tail = StderrTail::new();
+        assert!(tail.is_empty());
+        assert_eq!(tail.text(), "");
+
+        tail.push(&[b'a'; 10_000]);
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert!(tail.bytes().iter().all(|b| *b == b'a'));
+
+        tail.push(&[b'b'; 10]);
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        let bytes = tail.bytes();
+        assert!(bytes[..STDERR_TAIL_BYTES - 10].iter().all(|b| *b == b'a'));
+        assert!(bytes[STDERR_TAIL_BYTES - 10..].iter().all(|b| *b == b'b'));
+
+        tail.push(&[0xff, 0xfe, b'!']);
+        let text = tail.text();
+        assert!(text.ends_with("\u{FFFD}\u{FFFD}!"), "{text:?}");
+        assert_eq!(text.chars().count(), STDERR_TAIL_BYTES);
+
+        // Exactly the bound in one push replaces everything.
+        tail.push(&[b'c'; STDERR_TAIL_BYTES]);
+        assert_eq!(tail.len(), STDERR_TAIL_BYTES);
+        assert!(tail.bytes().iter().all(|b| *b == b'c'));
+    }
+
+    /// Tester: the §5.5 table's precedence. Exit 126 is a Cancel whatever the
+    /// text says; among the exit-127 texts the no-agent row wins, then EOF,
+    /// then "Not authorized"; exit 0 before the helper connected is still a
+    /// failure, not an approval; the key text is found inside 4 KiB of noise.
+    #[test]
+    fn classify_exit_precedence_and_exit_zero() {
+        assert_eq!(
+            classify_exit(ChildExit::Exited(126), "Not authorized").0,
+            RequestState::Dismissed
+        );
+        let all_three = format!(
+            "{}\n{}\n{}\n",
+            stderr_text::NO_AGENT,
+            stderr_text::EOF,
+            stderr_text::NOT_AUTHORIZED
+        );
+        assert_eq!(
+            classify_exit(ChildExit::Exited(127), &all_three),
+            (RequestState::Failed, msg::NO_PROMPT_SHOWN.to_string())
+        );
+        let eof_and_auth = format!("{}\n{}\n", stderr_text::EOF, stderr_text::NOT_AUTHORIZED);
+        assert_eq!(
+            classify_exit(ChildExit::Exited(127), &eof_and_auth),
+            (RequestState::Dismissed, msg::CANCELLED.to_string())
+        );
+        assert_eq!(
+            classify_exit(ChildExit::Exited(127), "").0,
+            RequestState::Failed
+        );
+        assert_eq!(
+            classify_exit(ChildExit::Exited(0), ""),
+            (
+                RequestState::Failed,
+                "The packet-capture helper did not start (pkexec exit 0)".to_string()
+            )
+        );
+        let noisy = format!(
+            "{}{}{}",
+            "x".repeat(2000),
+            stderr_text::NOT_AUTHORIZED,
+            "y".repeat(2000)
+        );
+        assert_eq!(
+            classify_exit(ChildExit::Exited(127), &noisy).1,
+            msg::AUTH_FAILED
+        );
+    }
+
+    /// Tester: when the launcher itself cannot be started (no `pkexec` binary,
+    /// EPERM, ENOMEM), the request is `cannot_prompt` naming the OS error, the
+    /// SIGINT hold taken for the spawn is released, and nothing is left running.
+    #[test]
+    fn spawn_failure_is_cannot_prompt_and_releases_the_hold() {
+        struct Failing {
+            holds: Arc<AtomicUsize>,
+            holds_at_spawn: Mutex<Vec<usize>>,
+        }
+        impl Spawner for Failing {
+            fn spawn(&self, _argv: &[OsString]) -> std::io::Result<Box<dyn Child>> {
+                self.holds_at_spawn
+                    .lock()
+                    .unwrap()
+                    .push(self.holds.load(Ordering::SeqCst));
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no pkexec here",
+                ))
+            }
+        }
+
+        let holds = Arc::new(AtomicUsize::new(0));
+        let spawner = Failing {
+            holds: Arc::clone(&holds),
+            holds_at_spawn: Mutex::new(Vec::new()),
+        };
+        let req = request_linux(
+            &cfg(ProcessLifetime::Serving, None),
+            &packaged(),
+            &spawner,
+            &CountingGuard(Arc::clone(&holds)),
+            Path::new(SOCKET),
+            true,
+        );
+        assert_eq!(req.outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            req.message,
+            "The packet-capture helper could not be started (no pkexec here)"
+        );
+        assert!(req.spawned.is_none());
+        assert_eq!(
+            *spawner.holds_at_spawn.lock().unwrap(),
+            vec![1],
+            "the hold was taken for the spawn"
+        );
+        assert_eq!(
+            holds.load(Ordering::SeqCst),
+            0,
+            "and released when the spawn failed"
+        );
+    }
+
+    /// Tester: a `try_wait` error (the launcher was reaped by someone else, or
+    /// `waitpid` failed) is a `failed` end naming the error, never a hang; a
+    /// connected session still wins over a broken child.
+    #[test]
+    fn watch_step_reports_a_try_wait_error_as_failed() {
+        struct Broken;
+        impl Child for Broken {
+            fn id(&self) -> u32 {
+                1
+            }
+            fn try_wait(&mut self) -> std::io::Result<Option<ChildExit>> {
+                Err(std::io::Error::other("waitpid: ECHILD"))
+            }
+            fn kill(&mut self) {}
+            fn stderr_tail(&mut self) -> String {
+                String::new()
+            }
+        }
+        let mut child = Broken;
+        assert_eq!(
+            watch_step(&mut child, false, 0, 1),
+            WatchOutcome::Ended {
+                state: RequestState::Failed,
+                message: "The packet-capture helper did not start (waitpid: ECHILD)".to_string(),
+            }
+        );
+        assert_eq!(watch_step(&mut child, true, 0, 1), WatchOutcome::Connected);
+    }
+
+    /// Tester: a `/proc/self/status` the kernel did not write. An oversized,
+    /// signed, empty or mis-labelled `CapEff` line yields no mask (and so no
+    /// capability); whitespace around a good mask is tolerated; a capability
+    /// number past the mask's width is never set.
+    #[test]
+    fn parse_cap_eff_rejects_oversized_signed_and_mislabelled_lines() {
+        assert_eq!(parse_cap_eff("CapEff:\tffffffffffffffffff\n"), None);
+        assert_eq!(parse_cap_eff("CapEff:\t-1\n"), None);
+        assert_eq!(parse_cap_eff(""), None);
+        assert_eq!(parse_cap_eff("XCapEff:\t0000000000002000\n"), None);
+        assert_eq!(parse_cap_eff("CapEff:\t\n"), None);
+        assert_eq!(
+            parse_cap_eff("CapEff: 0000000000002000 \n"),
+            Some(0x2000),
+            "whitespace around the mask is tolerated"
+        );
+        assert_eq!(parse_cap_eff("CapEff:\tffffffffffffffff\n"), Some(u64::MAX));
+        assert!(!has_cap(u64::MAX, 64));
+        assert!(has_cap(u64::MAX, 63));
+    }
+
+    /// Tester: the real spawner refuses an empty argv before touching the OS,
+    /// and reports a missing program as the OS does; neither leaves a child.
+    #[test]
+    fn std_spawner_refuses_empty_argv_and_missing_program() {
+        let err = StdSpawner.spawn(&[]).err().expect("empty argv");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        let err = StdSpawner
+            .spawn(&os(&["/nonexistent/aitm-tester-no-such-launcher", "serve"]))
+            .err()
+            .expect("missing program");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
 }

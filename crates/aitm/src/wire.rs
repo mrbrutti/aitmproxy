@@ -1260,6 +1260,191 @@ mod tests {
         assert!(!should_request_at_start(RequestMode::Manual, &available));
     }
 
+    /// A scripted macOS prober for a live `PrivilegeState`: row 5 of the spec
+    /// §2.2 table (the handoff app embeds the helper plist; capture needs
+    /// approval) or row 2 (a `/dev/bpf*` opens read+write; available).
+    struct MacRow {
+        bpf_rw_opens: bool,
+    }
+
+    impl aitm_proto_l4::privilege::state::Prober for MacRow {
+        fn gather(
+            &self,
+            request: Option<&aitm_proto_l4::privilege::report::RequestProgress>,
+        ) -> aitm_proto_l4::privilege::derive::ProbeInputs {
+            use aitm_proto_l4::privilege::derive::{MacInputs, ProbeInputs};
+            use aitm_proto_l4::privilege::report::Platform;
+            ProbeInputs {
+                enabled: true,
+                platform: Platform::Macos,
+                mac: Some(MacInputs {
+                    bpf_rw_opens: self.bpf_rw_opens,
+                    receipt: None,
+                    handoff_app_embeds_helper: true,
+                }),
+                linux: None,
+                request: request.cloned(),
+                now_ms: 0,
+            }
+        }
+    }
+
+    /// Every `tracing` event emitted on the calling thread while `f` runs, as
+    /// `(level, message)`. A thread-local default subscriber, so other tests'
+    /// output is never counted.
+    fn capture_events(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        use std::sync::Mutex;
+        use tracing::field::{Field, Visit};
+
+        struct Message(String);
+        impl Visit for Message {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        struct Capture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), message.0));
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(Capture(Arc::clone(&events)), f);
+        let out = events.lock().unwrap().clone();
+        out
+    }
+
+    /// L4PRIV-AC24, unit half (tester, plan P1b.6/P1b.15): assembling a core
+    /// with L4 enabled over a live state whose capture needs approval logs
+    /// exactly ONE line `L4 enabled; packet capture needs approval: <how.label>`,
+    /// at `warn`, naming no command (AC3 words); with capture available it logs
+    /// the one `info` line instead and no "needs approval" line; with L4 off it
+    /// logs no L4 start-up line at all.
+    #[test]
+    fn startup_logs_exactly_one_needs_approval_line() {
+        use aitm_proto_l4::privilege::state::L4PrivilegeConfig;
+
+        const MARKER: &str = "L4 enabled; packet capture needs approval: ";
+        const COMMANDS: [&str; 8] = [
+            "sudo",
+            "setcap",
+            "chmod",
+            "chgrp",
+            "chown",
+            "dseditgroup",
+            "launchctl",
+            "pkexec",
+        ];
+        let live = |bpf_rw_opens: bool| {
+            Arc::new(PrivilegeState::with_prober(
+                &PrivilegeConfig {
+                    enabled: true,
+                    l4: L4PrivilegeConfig::default(),
+                    lifetime: ProcessLifetime::Serving,
+                },
+                Box::new(MacRow { bpf_rw_opens }),
+                Arc::new(|| 1_762_000_000_000),
+            ))
+        };
+        let l4_on = || L4Config {
+            enabled: true,
+            ..L4Config::default()
+        };
+
+        // Needs approval: exactly one warn line with the row's label.
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("priv-startup-line");
+        let features = Features {
+            l4: l4_on(),
+            l4_privilege_state: Some(live(false)),
+            ..Features::default()
+        };
+        let events = capture_events(|| {
+            build_proxy_with(&cfg, &features).expect("build, needs approval");
+        });
+        let lines: Vec<&(tracing::Level, String)> =
+            events.iter().filter(|(_, m)| m.contains(MARKER)).collect();
+        assert_eq!(lines.len(), 1, "exactly one start-up line, got {events:?}");
+        let (level, line) = lines[0];
+        assert_eq!(*level, tracing::Level::WARN);
+        assert_eq!(
+            line,
+            "L4 enabled; packet capture needs approval: Allow packet capture in the Aitmproxy app"
+        );
+        let words: Vec<String> = line
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .map(str::to_ascii_lowercase)
+            .collect();
+        for command in COMMANDS {
+            assert!(
+                !words.iter().any(|w| w == command),
+                "the start-up line names a command `{command}`: {line}"
+            );
+        }
+        assert!(
+            !events.iter().any(|(_, m)| m.contains("privilege present")),
+            "no 'present' line while capture needs approval: {events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+
+        // Available: the one info line, and no approval line.
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("priv-startup-available");
+        let features = Features {
+            l4: l4_on(),
+            l4_privilege_state: Some(live(true)),
+            ..Features::default()
+        };
+        let events = capture_events(|| {
+            build_proxy_with(&cfg, &features).expect("build, available");
+        });
+        assert!(
+            !events.iter().any(|(_, m)| m.contains(MARKER)),
+            "{events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(l, m)| *l == tracing::Level::INFO
+                    && m == "L4 enabled; capture/inject privilege present")
+                .count(),
+            1,
+            "{events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+
+        // L4 off: the privilege verbs register, but no L4 start-up line.
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("priv-startup-off");
+        let events = capture_events(|| {
+            build_proxy_with(&cfg, &Features::default()).expect("build, l4 off");
+        });
+        assert!(
+            !events.iter().any(|(_, m)| m.starts_with("L4 enabled")),
+            "{events:?}"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
     /// `Assembled::governance` hands out the assembly's own `agent_state` and
     /// `audit_ring` `Arc`s, not copies, and `Clone` keeps that identity: a
     /// policy set through the `Governance` is the policy the core reads.

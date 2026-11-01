@@ -42,15 +42,33 @@ fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
 }
 
-/// The production (non-test) prefix of a source file: everything before the trailing
-/// `#[cfg(test)] mod tests` block. Every module in this crate keeps its unit tests in
-/// one such trailing block, so this cleanly excludes test-only code (e.g. mock
-/// backends that legitimately call `.inject(..)`) from the structural scan.
+/// The production (non-test) prefix of a source file: everything before the first
+/// `#[cfg(test)]` that introduces a **module** (`mod tests`, `pub(crate) mod fakes`).
+/// Every module in this crate keeps its unit tests in such a trailing block, so this
+/// cleanly excludes test-only code (e.g. mock backends that legitimately call
+/// `.inject(..)`) from the structural scan.
+///
+/// A `#[cfg(test)]` on a single test-only *method* earlier in the file does not end
+/// the prefix (tester, privilege unit p1b): `privilege/state.rs` carries two such
+/// seams hundreds of lines before its `mod tests`, and cutting there would hide the
+/// watcher thread, the session attach and the direct helper start from the scan.
+/// Including a test-only method in the scan is the conservative direction: a wire
+/// write inside one would still trip the gate.
 fn production_prefix(source: &str) -> &str {
-    match source.find("#[cfg(test)]") {
-        Some(idx) => &source[..idx],
-        None => source,
+    const ATTR: &str = "#[cfg(test)]";
+    let mut from = 0;
+    while let Some(rel) = source[from..].find(ATTR) {
+        let idx = from + rel;
+        let after = source[idx + ATTR.len()..].trim_start();
+        if after.starts_with("mod ")
+            || after.starts_with("pub mod ")
+            || after.starts_with("pub(crate) mod ")
+        {
+            return &source[..idx];
+        }
+        from = idx + ATTR.len();
     }
+    source
 }
 
 /// Every `*.rs` file under `src/`, recursively.
@@ -163,5 +181,57 @@ fn mangling_verdict_requires_permit_by_type() {
     assert!(
         !prod.contains("pub _permit"),
         "the held L4Permit must stay a private field so InterceptHandle is unforgeable (AC21)"
+    );
+}
+
+/// Tester (privilege unit p1b): the tripwire's notion of "production code" must
+/// reach the end of every production item. `privilege/state.rs` puts
+/// `#[cfg(test)]` on two test-only methods (`with_requester`, `changes`) long
+/// before its `mod tests`; cutting the scan at the first attribute would leave the
+/// watcher thread, the session attach and the direct helper start (plan P1b.14)
+/// outside `exactly_one_production_wire_write`. This pins that the scan reaches
+/// them, still stops at the test module, and that the one choke point is in view.
+#[test]
+fn production_prefix_reaches_the_trailing_test_module() {
+    let state = std::fs::read_to_string(src_dir().join("privilege").join("state.rs"))
+        .expect("read privilege/state.rs");
+    let prod = production_prefix(&state);
+    for item in [
+        "fn run_watcher(",
+        "fn attach_session(",
+        "fn spawn_direct(",
+        "impl Acceptor for HelperListener",
+        "pub fn current_platform()",
+    ] {
+        assert!(
+            prod.contains(item),
+            "the production scan of privilege/state.rs must reach `{item}`"
+        );
+    }
+    assert!(
+        !prod.contains("\nmod tests {"),
+        "the scan stops at the trailing test module"
+    );
+    assert!(
+        !prod.contains("#[test]"),
+        "no test function is inside the production prefix"
+    );
+
+    let wire = std::fs::read_to_string(src_dir().join("wire.rs")).expect("read wire.rs");
+    let prod = production_prefix(&wire);
+    assert!(prod.contains("pub fn send_on_wire("));
+    assert!(!prod.contains("#[test]"));
+
+    // The rule on synthetic sources: an early test-only method does not end the
+    // prefix; the first test-only module does; a file without one is whole.
+    let synthetic = "fn a() {}\n    #[cfg(test)]\n    fn seam() {}\nfn b() {}\n\
+                     #[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+    let prefix = production_prefix(synthetic);
+    assert!(prefix.contains("fn b()"), "{prefix:?}");
+    assert!(!prefix.contains("fn t()"), "{prefix:?}");
+    assert_eq!(production_prefix("fn a() {}\n"), "fn a() {}\n");
+    assert_eq!(
+        production_prefix("fn a() {}\n#[cfg(test)]\npub(crate) mod fakes {}\n"),
+        "fn a() {}\n"
     );
 }

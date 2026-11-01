@@ -661,4 +661,124 @@ mod tests {
             super::super::routed::HELPER_NOT_WIRED
         );
     }
+    // ---- tester (privilege unit p1b): the helper goes away or misbehaves ------
+
+    /// Tester: the helper dies mid-capture (connection drop). The frame that
+    /// arrived before the drop is still delivered; then `next_frame` ends with
+    /// the session's close reason, the end is sticky, the backend is no longer
+    /// live, every inject is `Unavailable`, and dropping the ended source sends
+    /// nothing on the closed session. The guard's scope is empty here: an
+    /// empty `ScopeSet` is what construction puts on the wire.
+    #[test]
+    fn session_drop_mid_capture_ends_the_source_and_the_backend() {
+        let (session, mut peer) = open_session();
+        let guard = guard();
+        assert!(
+            guard.scope_set().scope.is_empty(),
+            "the default guard has an empty scope: construction sends an empty set"
+        );
+        let backend = backend_over(Arc::clone(&session), guard, &mut peer);
+        let mut source = backend
+            .open_capture("lo", None, Duration::from_secs(5))
+            .expect("open");
+        assert!(matches!(
+            read_msg(&mut peer).expect("open"),
+            Msg::CaptureOpen { id: 1, .. }
+        ));
+        peer.write_all(&encode(&Msg::Frame {
+            capture_id: 1,
+            ts_us: 1,
+            bytes: vec![9, 9],
+        }))
+        .expect("frame");
+        drop(peer);
+
+        assert_eq!(
+            source.next_frame().expect("the frame before the drop"),
+            Some(vec![9, 9])
+        );
+        let err = source.next_frame().expect_err("ended");
+        assert_eq!(
+            unavailable_text(&err),
+            "helper capture ended: helper session closed: peer closed the session"
+        );
+        assert_eq!(source.next_frame().expect_err("sticky"), err);
+        wait_closed(&session);
+        assert!(!backend.is_live());
+        let err = backend.inject("lo", &[1]).expect_err("closed");
+        assert_eq!(unavailable_text(&err), "the helper session is closed");
+        drop(source);
+    }
+
+    /// Tester: an oversized frame from the helper (a length above `MAX_FRAME`)
+    /// closes the session before a byte of it is read; the open capture ends
+    /// with that reason, the backend is no longer live, and the core has shut
+    /// its end of the socket.
+    #[test]
+    fn oversized_helper_frame_ends_capture_and_session() {
+        use crate::helper::proto::{ProtoError, MAX_FRAME};
+
+        let (session, mut peer) = open_session();
+        let backend = backend_over(Arc::clone(&session), guard(), &mut peer);
+        let mut source = backend
+            .open_capture("lo", None, Duration::from_secs(5))
+            .expect("open");
+        let _ = read_msg(&mut peer).expect("open");
+        let len = u32::try_from(MAX_FRAME + 1).expect("fits");
+        peer.write_all(&len.to_be_bytes()).expect("header");
+
+        let err = source.next_frame().expect_err("ended");
+        let text = unavailable_text(&err);
+        assert!(
+            text.starts_with(
+                "helper capture ended: helper session closed: frame length 262145 exceeds"
+            ),
+            "{text}"
+        );
+        wait_closed(&session);
+        assert!(!backend.is_live());
+        assert_eq!(
+            read_msg(&mut peer),
+            Err(ProtoError::Eof),
+            "the core shut its end"
+        );
+    }
+
+    /// Tester: a helper that never answers an `Inject` costs exactly
+    /// [`INJECT_TIMEOUT`] and is `Unavailable` with the timeout text; the
+    /// session stays live (a slow helper is not a dead one) and the next
+    /// inject is answered normally.
+    #[test]
+    fn inject_timeout_is_unavailable_and_keeps_the_session_live() {
+        let (session, mut peer) = open_session();
+        let backend = backend_over(Arc::clone(&session), guard(), &mut peer);
+        let t = std::thread::spawn(move || {
+            let first = read_msg(&mut peer).expect("inject 1");
+            assert!(matches!(first, Msg::Inject { request_id: 1, .. }));
+            // Never answer request 1; answer whatever comes next.
+            let second = read_msg(&mut peer).expect("inject 2");
+            let Msg::Inject { request_id, .. } = second else {
+                panic!("want an Inject, got {second:?}");
+            };
+            peer.write_all(&encode(&Msg::InjectResult {
+                request_id,
+                error: None,
+            }))
+            .expect("result");
+            peer
+        });
+        let started = Instant::now();
+        let err = backend.inject("lo", &[1]).expect_err("no answer");
+        assert_eq!(unavailable_text(&err), "the helper did not answer in time");
+        assert!(
+            started.elapsed() >= INJECT_TIMEOUT,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(backend.is_live(), "a timeout does not end the session");
+        backend
+            .inject("lo", &[2])
+            .expect("the next inject is answered");
+        drop(t.join().expect("peer"));
+    }
 }

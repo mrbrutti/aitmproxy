@@ -1627,4 +1627,153 @@ mod tests {
         assert_eq!(state.request().outcome, Outcome::CannotPrompt);
         let _: Box<dyn Any + Send> = Box::new(());
     }
+    // ---- tester (privilege unit p1b): a helper that misbehaves at Hello, a
+    // foreign peer at the socket -----------------------------------------------
+
+    /// A peer that answers `Hello` with `reply` bytes verbatim, then holds the
+    /// socket until the core shuts its end.
+    fn garbage_peer(mut peer: UnixStream, reply: Vec<u8>) -> std::thread::JoinHandle<()> {
+        peer.set_read_timeout(Some(WAIT)).expect("peer timeout");
+        std::thread::spawn(move || {
+            let _hello = read_msg(&mut peer).expect("hello");
+            peer.write_all(&reply).expect("reply");
+            let _ = read_msg(&mut peer);
+        })
+    }
+
+    /// Tester: a helper that connects with the right credentials but answers
+    /// garbage (an HTTP line, an unknown frame type) or another protocol
+    /// version to `Hello` never becomes a backend: the request is `failed`
+    /// naming the handshake and the defect, the launcher is killed, the SIGINT
+    /// hold is released, the routed backend stays unwired and the prober sees
+    /// no live session.
+    #[test]
+    fn watcher_fails_the_request_when_the_helper_answers_garbage_to_hello() {
+        let version_2 = encode(&Msg::HelloAck {
+            proto: 2,
+            helper_version: "9.9.9".to_string(),
+            caps: vec![],
+        });
+        let cases: [(Vec<u8>, &str); 3] = [
+            (
+                b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
+                "the packet-capture helper did not complete its handshake (frame length \
+                 1213486160 exceeds",
+            ),
+            (
+                vec![0, 0, 0, 5, 0xff, 1, 2, 3, 4],
+                "the packet-capture helper did not complete its handshake (unknown message \
+                 type 0xff)",
+            ),
+            (
+                version_2,
+                "the packet-capture helper did not complete its handshake (helper speaks \
+                 protocol 2, this core speaks 1)",
+            ),
+        ];
+        for (reply, want_prefix) in cases {
+            let (state, now) = state_over(vec![row6()]);
+            now.store(11_000, Ordering::SeqCst);
+            state.set_guard(Arc::new(L4Guard::new(&L4Config::default())));
+            let holds = Arc::new(AtomicUsize::new(0));
+            let hold = CountingGuard(Arc::clone(&holds)).hold();
+
+            let (core, peer) = UnixStream::pair().expect("socketpair");
+            let peer_thread = garbage_peer(peer, reply);
+            let session = HelperSession::from_stream(core).expect("session");
+            let child = FakeChild {
+                exit: Some(ChildExit::Exited(0)),
+                ..FakeChild::alive(4242)
+            };
+            let killed = Arc::clone(&child.killed);
+
+            run_watcher(
+                Arc::clone(&state.shared),
+                Box::new(child),
+                Box::new(OnePeer(Mutex::new(Some(session)))),
+                hold,
+                11_000,
+                true,
+            );
+
+            let request = state.report().request.expect("progress recorded");
+            assert_eq!(request.state, RequestState::Failed, "{want_prefix}");
+            assert!(
+                request.message.starts_with(want_prefix),
+                "got {:?}, want prefix {want_prefix:?}",
+                request.message
+            );
+            assert_eq!(request.at, 11_000);
+            assert_eq!(killed.load(Ordering::SeqCst), 1, "the launcher is killed");
+            assert_eq!(holds.load(Ordering::SeqCst), 0, "the hold is released");
+            assert!(state.helper_backend().is_none());
+            assert!(!state.shared.live_is_up());
+            for word in ["sudo", "pkexec", "chmod", "setcap", "chown"] {
+                assert!(!request.message.contains(word), "{}", request.message);
+            }
+            peer_thread.join().expect("peer");
+        }
+    }
+
+    /// Tester: a connection from a process other than the spawned launcher
+    /// (the peer uid or pid check fails) is dropped and the watcher keeps
+    /// waiting; the request's end is still decided by the launcher's exit.
+    /// Here the launcher is dismissed after the foreign peers came and went.
+    #[test]
+    fn watcher_drops_a_foreign_peer_and_keeps_watching() {
+        struct ForeignThenNobody(Arc<AtomicUsize>);
+        impl Acceptor for ForeignThenNobody {
+            fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+                match self.0.fetch_add(1, Ordering::SeqCst) {
+                    0 => Err(SessionError::PeerPid(999)),
+                    1 => Err(SessionError::PeerUid(0)),
+                    _ => Err(SessionError::Timeout),
+                }
+            }
+        }
+
+        let (state, now) = state_over(vec![row6()]);
+        now.store(2_000, Ordering::SeqCst);
+        let holds = Arc::new(AtomicUsize::new(0));
+        let hold = CountingGuard(Arc::clone(&holds)).hold();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let child = FakeChild {
+            ticks_left: 3,
+            exit: Some(ChildExit::Exited(126)),
+            stderr: "Error executing command as another user: Request dismissed\n".to_string(),
+            ..FakeChild::alive(4242)
+        };
+        let killed = Arc::clone(&child.killed);
+
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(child),
+            Box::new(ForeignThenNobody(Arc::clone(&accepts))),
+            hold,
+            2_000,
+            true,
+        );
+
+        assert!(
+            accepts.load(Ordering::SeqCst) >= 4,
+            "the foreign peers did not end the watch: {} accept slices",
+            accepts.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            state.report().request,
+            Some(RequestProgress {
+                state: RequestState::Dismissed,
+                at: 2_000,
+                message: "Approval was cancelled".to_string(),
+            })
+        );
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            0,
+            "the child ended on its own"
+        );
+        assert_eq!(holds.load(Ordering::SeqCst), 0);
+        assert!(state.helper_backend().is_none());
+        assert!(!state.shared.live_is_up());
+    }
 }

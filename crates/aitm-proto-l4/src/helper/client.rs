@@ -1292,4 +1292,144 @@ mod tests {
         let err = HelperListener::bind(Path::new("/nonexistent")).expect_err("stub");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
+    // ---- tester (privilege unit p1b): hostile and broken peers ----------------
+
+    /// Play a peer that answers `Hello` with `reply` bytes verbatim; the
+    /// handshake's error and whether the session closed.
+    fn handshake_against(reply: Vec<u8>) -> (SessionError, bool) {
+        let (mut session, mut peer) = pair();
+        let t = std::thread::spawn(move || {
+            let _hello = read_msg(&mut peer).expect("hello");
+            peer.write_all(&reply).expect("reply");
+            peer
+        });
+        let err = session
+            .handshake("0.9.9-test", Duration::from_secs(5))
+            .expect_err("a garbage reply is refused");
+        let closed = session.is_closed();
+        drop(t.join().expect("peer"));
+        (err, closed)
+    }
+
+    /// Tester: a helper that answers garbage to `Hello` never yields a session.
+    /// Four shapes of garbage: not a frame at all (an HTTP status line, whose
+    /// first four bytes read as a 1.2 GB length), a frame of an unknown type, a
+    /// `HelloAck` frame whose body is not JSON, and a zero-length frame. Each is
+    /// a `Proto` error naming the defect, closes the session, and (for the
+    /// oversized one) is refused by the number alone before a byte of body is
+    /// read or allocated. No text tells the operator to run anything.
+    #[test]
+    fn handshake_refuses_garbage_replies() {
+        let ack_type = encode(&Msg::HelloAck {
+            proto: PROTO,
+            helper_version: String::new(),
+            caps: vec![],
+        })[4];
+
+        let (err, closed) = handshake_against(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
+        assert_eq!(err, SessionError::Proto(ProtoError::TooLong(0x4854_5450)));
+        assert!(closed);
+
+        let (err, closed) = handshake_against(vec![0, 0, 0, 5, 0xff, 1, 2, 3, 4]);
+        assert_eq!(err, SessionError::Proto(ProtoError::UnknownType(0xff)));
+        assert!(closed);
+
+        let body = b"{not json";
+        let mut frame = u32::try_from(body.len() + 1)
+            .expect("fits")
+            .to_be_bytes()
+            .to_vec();
+        frame.push(ack_type);
+        frame.extend_from_slice(body);
+        let (err, closed) = handshake_against(frame);
+        assert!(
+            matches!(err, SessionError::Proto(ProtoError::BadJson(_))),
+            "{err:?}"
+        );
+        assert!(closed);
+
+        let (err, closed) = handshake_against(vec![0, 0, 0, 0]);
+        assert_eq!(err, SessionError::Proto(ProtoError::BadBinary));
+        assert!(closed);
+
+        for err in [
+            SessionError::Proto(ProtoError::TooLong(0x4854_5450)),
+            SessionError::Proto(ProtoError::UnknownType(0xff)),
+            SessionError::Proto(ProtoError::BadBinary),
+        ] {
+            let text = err.to_string();
+            for word in ["sudo", "pkexec", "chmod", "setcap", "chown"] {
+                assert!(!text.contains(word), "{text}");
+            }
+        }
+    }
+
+    /// Tester: a frame cut short (the header claims 100 bytes, three arrive,
+    /// then the peer vanishes) is a transport error mid-message, not a clean
+    /// close: the session closes with `Proto(Io(..))`, a subscribed capture
+    /// ends with a `Closed` event, and a later send is refused.
+    #[test]
+    fn truncated_frame_then_drop_closes_session() {
+        let (session, mut peer) = open_session();
+        let rx = session.subscribe_capture(1);
+        peer.write_all(&100u32.to_be_bytes()).expect("header");
+        peer.write_all(&[0x06, 1, 2, 3]).expect("partial body");
+        drop(peer);
+        wait_closed(&session);
+        let reason = session.close_reason();
+        assert!(
+            matches!(reason, Some(SessionError::Proto(ProtoError::Io(_)))),
+            "a stream that ends inside a message is an I/O error, got {reason:?}"
+        );
+        let event = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("closed event");
+        assert!(matches!(event, CaptureEvent::Closed { .. }), "{event:?}");
+        assert_eq!(
+            session.send(&Msg::CaptureClose { id: 1 }),
+            Err(SessionError::Closed)
+        );
+    }
+
+    /// Tester: an inject waiting for its result does not sit out its timeout
+    /// when the helper drops mid-wait; it fails at once with `Closed`.
+    #[test]
+    fn inject_waiter_fails_fast_when_the_peer_drops_mid_wait() {
+        let (session, mut peer) = open_session();
+        let t = std::thread::spawn(move || {
+            let msg = read_msg(&mut peer).expect("inject");
+            assert!(matches!(msg, Msg::Inject { request_id: 7, .. }));
+            drop(peer);
+        });
+        let started = Instant::now();
+        let err = session
+            .inject(7, "lo", &[1], Duration::from_secs(30))
+            .expect_err("peer gone");
+        assert_eq!(err, SessionError::Closed);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the waiter must not wait out the 30 s timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(session.is_closed());
+        t.join().expect("peer");
+    }
+
+    /// Tester: an empty `ScopeSet` (no entries, no self ports, zero limits) is
+    /// a legal message both ways; the helper's deny-by-default needs exactly
+    /// this to be expressible.
+    #[test]
+    fn empty_scope_set_round_trips() {
+        let (session, mut peer) = open_session();
+        let empty = ScopeSet {
+            scope: vec![],
+            global_inject_pps: 0,
+            max_packet_bytes: 0,
+            max_packets_per_call: 0,
+            self_ports: vec![],
+        };
+        session.send_scope(&empty).expect("send");
+        assert_eq!(read_msg(&mut peer).expect("scope"), Msg::ScopeSet(empty));
+        assert!(!session.is_closed());
+    }
 }
