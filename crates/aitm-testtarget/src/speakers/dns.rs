@@ -17,12 +17,16 @@ use super::{mode_bug, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;
 
 /// The service as the driver registers it.
-pub static DEF: ServiceDef = ServiceDef {
+pub const DEF: ServiceDef = ServiceDef {
     name: "l4-dns-fault",
     grammar: "dns",
     proto: Proto::Udp,
-    new_conn: || Box::new(Dns),
+    new_conn,
 };
+
+fn new_conn() -> Box<dyn Speaker> {
+    Box::new(Dns)
+}
 
 /// Largest datagram the speaker looks at (classic DNS-over-UDP payload).
 pub const MAX_DATAGRAM: usize = 512;

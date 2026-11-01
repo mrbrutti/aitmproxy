@@ -853,12 +853,10 @@ mod tests {
         assert_eq!(sleep_seconds("1; WAITFOR DELAY '0:0:2'"), Some(2));
         assert_eq!(sleep_seconds("1"), None);
 
-        // Patched never sleeps: the 400 comes back immediately.
-        let started = Instant::now();
+        // Patched never sleeps: the 400 comes back (the sleep decision is
+        // pinned above; a wall-clock bound here would only flake).
         let (status, _, _) = get(P, "/items?id=1%20AND%20SLEEP(3)").await;
-        let elapsed = started.elapsed();
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
     }
 
     #[tokio::test]

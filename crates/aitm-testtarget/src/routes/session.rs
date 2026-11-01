@@ -119,21 +119,19 @@ impl SessionStore {
     /// session was valid for this request. An armed session whose count
     /// reaches zero here is removed, so the *next* call sees it invalid.
     pub(crate) fn touch(&self, id: &str) -> bool {
-        let expired = {
-            let mut sessions = self.lock();
-            let Some(session) = sessions.live.get_mut(id) else {
-                return false;
-            };
-            match session.armed.as_mut() {
-                Some(left) => {
-                    *left = left.saturating_sub(1);
-                    *left == 0
-                }
-                None => false,
+        let mut sessions = self.lock();
+        let Some(session) = sessions.live.get_mut(id) else {
+            return false;
+        };
+        let expired = match session.armed.as_mut() {
+            Some(left) => {
+                *left = left.saturating_sub(1);
+                *left == 0
             }
+            None => false,
         };
         if expired {
-            self.remove(id);
+            sessions.live.remove(id);
         }
         true
     }
@@ -142,18 +140,19 @@ impl SessionStore {
     /// drops it right away). Returns whether the session existed.
     pub(crate) fn arm(&self, id: &str, n: u32) -> bool {
         let mut sessions = self.lock();
-        if !sessions.live.contains_key(id) {
+        let Some(session) = sessions.live.get_mut(id) else {
             return false;
-        }
+        };
         if n == 0 {
             sessions.live.remove(id);
-        } else if let Some(session) = sessions.live.get_mut(id) {
+        } else {
             session.armed = Some(n);
         }
         true
     }
 
     /// Drop `id` (a no-op for an unknown id).
+    #[cfg(test)]
     pub(crate) fn remove(&self, id: &str) {
         self.lock().live.remove(id);
     }

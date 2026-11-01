@@ -438,12 +438,7 @@ impl<T: Serialize> Ring<T> {
 
 /// Lower-case hex SHA-256 (64 chars).
 pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for b in digest {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// The first 16 hex chars of [`sha256_hex`] (the `cookie_sha256` /
@@ -704,6 +699,15 @@ impl ControlLog {
 
     // -- L4 --
 
+    /// Run `f` on `service`'s rings, creating them on first use.
+    fn with_l4(&self, service: &str, f: impl FnOnce(&mut L4Log)) {
+        let mut l4 = lock(&self.l4);
+        match l4.get_mut(service) {
+            Some(log) => f(log),
+            None => f(l4.entry(service.to_string()).or_default()),
+        }
+    }
+
     pub(crate) fn l4_accept(&self, service: &str, conn_id: &str, peer: SocketAddr) {
         let entry = L4Accept {
             seq: self.next_seq(),
@@ -711,11 +715,7 @@ impl ControlLog {
             conn_id: conn_id.to_string(),
             peer: peer.to_string(),
         };
-        lock(&self.l4)
-            .entry(service.to_string())
-            .or_default()
-            .accepts
-            .push(entry);
+        self.with_l4(service, |log| log.accepts.push(entry));
     }
 
     /// Log one message; `bytes` is hashed and measured, never stored.
@@ -738,11 +738,7 @@ impl ControlLog {
             verb: verb.map(str::to_string),
             classified,
         };
-        lock(&self.l4)
-            .entry(service.to_string())
-            .or_default()
-            .messages
-            .push(entry);
+        self.with_l4(service, |log| log.messages.push(entry));
     }
 
     pub(crate) fn l4_close(
@@ -761,11 +757,7 @@ impl ControlLog {
             bytes_in,
             bytes_out,
         };
-        lock(&self.l4)
-            .entry(service.to_string())
-            .or_default()
-            .closes
-            .push(entry);
+        self.with_l4(service, |log| log.closes.push(entry));
     }
 
     /// Log a V-mode crash window; `trigger` is hashed, never stored.
@@ -786,11 +778,7 @@ impl ControlLog {
             up_at_ms,
             trigger_sha256: sha256_hex(trigger),
         };
-        lock(&self.l4)
-            .entry(service.to_string())
-            .or_default()
-            .downtime
-            .push(entry);
+        self.with_l4(service, |log| log.downtime.push(entry));
     }
 
     // -- services --
@@ -923,12 +911,13 @@ mod tests {
             r.cookie_names,
             vec!["session".to_string(), "theme".to_string()]
         );
-        assert_eq!(r.cookie_sha256.as_deref().map(str::len), Some(16));
+        // The literal prefixes (`printf 'session=abc; theme=dark' | shasum -a 256`).
+        assert_eq!(r.cookie_sha256.as_deref(), Some("5c5fc99ebd5b1b93"));
+        assert_eq!(r.auth_sha256.as_deref(), Some("b937a6fd6074f365"));
         assert_eq!(
             r.cookie_sha256.as_deref(),
             Some(sha256_prefix16(b"session=abc; theme=dark").as_str())
         );
-        assert_eq!(r.auth_sha256.as_deref().map(str::len), Some(16));
         assert_eq!(
             r.auth_sha256.as_deref(),
             Some(sha256_prefix16(b"Bearer x").as_str())

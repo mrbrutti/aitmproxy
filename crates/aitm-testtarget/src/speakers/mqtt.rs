@@ -20,7 +20,7 @@ pub const MAX_REMAINING: usize = 65_536;
 const MAX_HEADER: usize = 5;
 
 /// The `l4-mqtt` service.
-pub static DEF: ServiceDef = ServiceDef {
+pub const DEF: ServiceDef = ServiceDef {
     name: "l4-mqtt",
     grammar: "mqtt",
     proto: Proto::Tcp,
@@ -266,19 +266,11 @@ impl Speaker for Mqtt {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::speakers::{Parsed, Proto, Speaker, Step};
+    use crate::speakers::{msg, Parsed, Proto, Speaker, Step};
     use crate::SeedMode;
 
     fn parse(mode: SeedMode, bytes: &[u8]) -> Parsed {
         Mqtt.parse(mode, bytes)
-    }
-
-    fn msg(consumed: usize, verb: &str, step: Step) -> Parsed {
-        Parsed::Message {
-            consumed,
-            verb: Some(verb.to_string()),
-            step,
-        }
     }
 
     #[test]

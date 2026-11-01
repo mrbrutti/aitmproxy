@@ -19,12 +19,16 @@ pub const MAX_LINE: usize = 1024;
 const DENYLIST: [&str; 7] = ["DELE", "STOR", "APPE", "RMD", "RNFR", "RNTO", "MKD"];
 
 /// `/services` entry for the FTP speaker.
-pub static DEF: ServiceDef = ServiceDef {
+pub const DEF: ServiceDef = ServiceDef {
     name: "l4-ftp",
     grammar: "ftp",
     proto: Proto::Tcp,
-    new_conn: || Box::new(Ftp),
+    new_conn,
 };
+
+fn new_conn() -> Box<dyn Speaker> {
+    Box::new(Ftp)
+}
 
 /// One FTP control connection. Stateless: `PASS` logs in without a `USER`.
 #[derive(Debug)]
@@ -97,15 +101,8 @@ fn split_verb(line: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::speakers::msg;
     use crate::SeedMode;
-
-    fn msg(step: Step, consumed: usize, verb: &str) -> Parsed {
-        Parsed::Message {
-            consumed,
-            verb: Some(verb.to_string()),
-            step,
-        }
-    }
 
     #[test]
     fn ftp_banner() {
@@ -126,39 +123,39 @@ mod tests {
         assert_eq!(
             s.parse(v, b"USER a\r\n"),
             msg(
-                Step::Reply(b"331 password required\r\n".to_vec()),
                 8,
-                "USER"
+                "USER",
+                Step::Reply(b"331 password required\r\n".to_vec())
             )
         );
         assert_eq!(
             s.parse(v, b"pass b\r\n"),
-            msg(Step::Reply(b"230 logged in\r\n".to_vec()), 8, "PASS")
+            msg(8, "PASS", Step::Reply(b"230 logged in\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"NOOP\r\n"),
-            msg(Step::Reply(b"200 ok\r\n".to_vec()), 6, "NOOP")
+            msg(6, "NOOP", Step::Reply(b"200 ok\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"PWD\r\n"),
-            msg(Step::Reply(b"257 \"/\"\r\n".to_vec()), 5, "PWD")
+            msg(5, "PWD", Step::Reply(b"257 \"/\"\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"TYPE I\r\n"),
-            msg(Step::Reply(b"200 ok\r\n".to_vec()), 8, "TYPE")
+            msg(8, "TYPE", Step::Reply(b"200 ok\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"DELE x\r\n"),
-            msg(Step::Denylisted(b"550 denied\r\n".to_vec()), 8, "DELE")
+            msg(8, "DELE", Step::Denylisted(b"550 denied\r\n".to_vec()))
         );
         for verb in ["STOR", "APPE", "RMD", "RNFR", "RNTO", "MKD", "mkd"] {
             let line = format!("{verb} x\r\n");
             assert_eq!(
                 s.parse(v, line.as_bytes()),
                 msg(
-                    Step::Denylisted(b"550 denied\r\n".to_vec()),
                     line.len(),
-                    &verb.to_ascii_uppercase()
+                    &verb.to_ascii_uppercase(),
+                    Step::Denylisted(b"550 denied\r\n".to_vec())
                 ),
                 "{verb}"
             );
@@ -166,20 +163,20 @@ mod tests {
         assert_eq!(
             s.parse(v, b"SYST\r\n"),
             msg(
-                Step::ProtocolError(b"500 unknown command\r\n".to_vec()),
                 6,
-                "SYST"
+                "SYST",
+                Step::ProtocolError(b"500 unknown command\r\n".to_vec())
             )
         );
         // Only the first line is consumed; the rest stays for the next call.
         assert_eq!(
             s.parse(v, b"QUIT\r\nNOOP\r\n"),
-            msg(Step::Close(Some(b"221 bye\r\n".to_vec())), 6, "QUIT")
+            msg(6, "QUIT", Step::Close(Some(b"221 bye\r\n".to_vec())))
         );
         // Patched mode answers the benign exchange identically.
         assert_eq!(
             s.parse(SeedMode::Patched, b"NOOP\r\n"),
-            msg(Step::Reply(b"200 ok\r\n".to_vec()), 6, "NOOP")
+            msg(6, "NOOP", Step::Reply(b"200 ok\r\n".to_vec()))
         );
     }
 

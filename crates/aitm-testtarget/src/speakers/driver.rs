@@ -166,6 +166,9 @@ pub(crate) enum Action {
     Keep,
     /// Close the connection with this reason.
     CloseConn(CloseReason),
+    /// The Patched-mode fault close: `error` after a parse or an idle,
+    /// `oversize` past the buffer cap (the driver knows which).
+    Fault,
     /// Open the crash window: log `downtime`, close with reason `trigger`,
     /// take the listener down.
     Crash,
@@ -173,17 +176,28 @@ pub(crate) enum Action {
 
 /// The driver's reading of a [`Step`] (spec D5 semantics, plan P2):
 /// `Reply`/`ProtocolError`/`Denylisted` write when non-empty and keep;
-/// `Fault` writes when non-empty and closes `error`; `Close` writes when
-/// given and closes `quit`; `Trigger` crashes.
+/// `Fault` writes when non-empty and takes the fault close; `Close` writes
+/// when given and closes `quit`; `Trigger` crashes.
 pub(crate) fn apply(step: Step) -> Vec<Action> {
     let write = |bytes: Vec<u8>| (!bytes.is_empty()).then_some(Action::Write(bytes));
     let (write, then) = match step {
         Step::Reply(b) | Step::ProtocolError(b) | Step::Denylisted(b) => (write(b), Action::Keep),
-        Step::Fault(b) => (write(b), Action::CloseConn(CloseReason::Error)),
+        Step::Fault(b) => (write(b), Action::Fault),
         Step::Close(b) => (b.and_then(write), Action::CloseConn(CloseReason::Quit)),
         Step::Trigger => (None, Action::Crash),
     };
     write.into_iter().chain(std::iter::once(then)).collect()
+}
+
+/// How many of the `pending` buffered bytes are the `in` message for
+/// `step`: on `Trigger`/`Fault` the connection ends and the whole buffer is
+/// the trigger (so a cell can match the logged hash against what it sent);
+/// otherwise exactly the `consumed` message.
+pub(crate) fn input_span(step: &Step, consumed: usize, pending: usize) -> usize {
+    match step {
+        Step::Trigger | Step::Fault(_) => pending,
+        _ => consumed,
+    }
 }
 
 /// The `classified` token of an `in` message for a step (spec D2:
@@ -299,9 +313,9 @@ impl TcpConn {
                     // consuming nothing would re-parse the same bytes
                     // forever; both are speaker bugs this guard contains.
                     let consumed = consumed.clamp(1, self.buf.len());
-                    let input: Vec<u8> = self.buf.drain(..consumed).collect();
+                    let take = input_span(&step, consumed, self.buf.len());
                     if let Some(end) = self
-                        .step(&input, verb.as_deref(), step, CloseReason::Error)
+                        .step(take, verb.as_deref(), step, CloseReason::Error)
                         .await
                     {
                         return Some(end);
@@ -316,41 +330,43 @@ impl TcpConn {
     /// past `max_buffer()`); a `Fault` then closes with `fault_reason`.
     async fn idle(&mut self, fault_reason: CloseReason) -> Option<ConnEnd> {
         let step = self.speaker.on_idle(self.mode, &self.buf);
-        let input = std::mem::take(&mut self.buf);
-        self.step(&input, None, step, fault_reason).await
+        self.step(self.buf.len(), None, step, fault_reason).await
     }
 
-    /// Log the `in` message and carry out the step's actions.
+    /// Log the first `take` buffered bytes as the `in` message, carry out
+    /// the step's actions, then drain them (logged in place, no copy).
     async fn step(
         &mut self,
-        input: &[u8],
+        take: usize,
         verb: Option<&str>,
         step: Step,
         fault_reason: CloseReason,
     ) -> Option<ConnEnd> {
+        let take = take.min(self.buf.len());
         self.log.l4_message(
             self.service,
             &self.conn_id,
             Dir::In,
-            input,
+            &self.buf[..take],
             verb,
             classified(&step),
         );
+        let mut end = None;
         for action in apply(step) {
-            match action {
-                Action::Write(bytes) => {
-                    if self.write(&bytes).await.is_err() {
-                        return Some(self.close(CloseReason::Error));
-                    }
-                }
-                Action::Keep => {}
-                // `Fault` closes `error` after idle, `oversize` past the cap.
-                Action::CloseConn(CloseReason::Error) => return Some(self.close(fault_reason)),
-                Action::CloseConn(reason) => return Some(self.close(reason)),
-                Action::Crash => return Some(self.crash(input)),
-            }
+            end = match action {
+                Action::Write(bytes) => match self.write(&bytes).await {
+                    Ok(()) => continue,
+                    Err(_) => Some(self.close(CloseReason::Error)),
+                },
+                Action::Keep => continue,
+                Action::Fault => Some(self.close(fault_reason)),
+                Action::CloseConn(reason) => Some(self.close(reason)),
+                Action::Crash => Some(self.crash(take)),
+            };
+            break;
         }
-        None
+        self.buf.drain(..take);
+        end
     }
 
     /// Write and log one outbound message (`out`, `ok`).
@@ -380,8 +396,9 @@ impl TcpConn {
         ConnEnd::Closed
     }
 
-    /// Open the crash window for `input` and close with reason `trigger`.
-    fn crash(&self, input: &[u8]) -> ConnEnd {
+    /// Open the crash window for the first `take` buffered bytes (the
+    /// trigger) and close with reason `trigger`.
+    fn crash(&self, take: usize) -> ConnEnd {
         let down_at_ms = ControlLog::now_ms();
         self.window.trigger_at(Instant::now());
         self.log.l4_downtime(
@@ -389,7 +406,7 @@ impl TcpConn {
             &self.conn_id,
             down_at_ms,
             up_at_ms(down_at_ms),
-            input,
+            &self.buf[..take.min(self.buf.len())],
         );
         self.close(CloseReason::Trigger);
         ConnEnd::Crashed
@@ -560,7 +577,7 @@ async fn run_udp(
                     }
                 }
                 // No connection to keep or close over UDP.
-                Action::Keep | Action::CloseConn(_) => {}
+                Action::Keep | Action::CloseConn(_) | Action::Fault => {}
                 Action::Crash => {
                     let down_at_ms = ControlLog::now_ms();
                     window.trigger_at(Instant::now());
@@ -663,17 +680,12 @@ mod tests {
             apply(Step::Denylisted(x.clone())),
             vec![Action::Write(x.clone()), Action::Keep]
         );
-        // Fault: write when non-empty, then close with reason `error`.
-        assert_eq!(
-            apply(Step::Fault(vec![])),
-            vec![Action::CloseConn(CloseReason::Error)]
-        );
+        // Fault: write when non-empty, then the fault close (`error` after a
+        // parse or idle, `oversize` past the buffer cap; the driver decides).
+        assert_eq!(apply(Step::Fault(vec![])), vec![Action::Fault]);
         assert_eq!(
             apply(Step::Fault(x.clone())),
-            vec![
-                Action::Write(x.clone()),
-                Action::CloseConn(CloseReason::Error)
-            ]
+            vec![Action::Write(x.clone()), Action::Fault]
         );
         // Trigger: crash.
         assert_eq!(apply(Step::Trigger), vec![Action::Crash]);
@@ -713,6 +725,21 @@ mod tests {
         assert_eq!(svc.addr("l4-resp"), Some(a));
         assert_eq!(svc.addr("l4-dns-fault"), Some(b));
         assert_eq!(svc.addr("l4-mqtt"), None);
+    }
+
+    #[test]
+    fn trigger_and_fault_hash_the_whole_pending_buffer() {
+        // A cell matches `trigger_sha256` / the `in` message hash against
+        // what it sent, so on Trigger/Fault the driver hashes everything
+        // pending, not just the bytes the speaker consumed; every other
+        // step hashes exactly its message.
+        assert_eq!(input_span(&Step::Trigger, 2, 10), 10);
+        assert_eq!(input_span(&Step::Fault(vec![1]), 2, 10), 10);
+        assert_eq!(input_span(&Step::Fault(vec![]), 7, 7), 7);
+        assert_eq!(input_span(&Step::Reply(vec![1]), 2, 10), 2);
+        assert_eq!(input_span(&Step::ProtocolError(vec![]), 2, 10), 2);
+        assert_eq!(input_span(&Step::Denylisted(vec![1]), 2, 10), 2);
+        assert_eq!(input_span(&Step::Close(None), 2, 10), 2);
     }
 
     #[test]

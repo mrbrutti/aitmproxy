@@ -92,6 +92,11 @@ pub enum Parsed {
 
 /// A pure protocol responder. One instance per connection (TCP) or per
 /// service (UDP); the driver owns the socket and the log.
+///
+/// Logging contract: the `in` message of a [`Parsed::Message`] hashes the
+/// `consumed` bytes, except that on [`Step::Trigger`] / [`Step::Fault`] the
+/// driver hashes the **whole pending buffer** (and `trigger_sha256` with it),
+/// so a cell can match the hash against the bytes it sent.
 pub trait Speaker: Send {
     /// Service name as listed in `/services` (`l4-resp`, ...).
     fn name(&self) -> &'static str;
@@ -213,6 +218,17 @@ pub fn mode_bug(mode: SeedMode, p_reply: Vec<u8>) -> Step {
     match mode {
         SeedMode::Vulnerable => Step::Trigger,
         SeedMode::Patched => Step::Fault(p_reply),
+    }
+}
+
+/// The expected [`Parsed::Message`] of a speaker test: `consumed` bytes,
+/// verb `verb`, then `step`.
+#[cfg(test)]
+pub(super) fn msg(consumed: usize, verb: &str, step: Step) -> Parsed {
+    Parsed::Message {
+        consumed,
+        verb: Some(verb.to_string()),
+        step,
     }
 }
 

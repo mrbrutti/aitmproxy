@@ -530,9 +530,10 @@ async fn vulnerable_flow(case: Case, addr: SocketAddr, control: String) -> Res<(
     if !is_hex64(sha) {
         return Err(format!("trigger_sha256 is not 64 hex: {sha:?}"));
     }
-    // A datagram is one message, so its hash is exact; a TCP trigger may be
-    // logged as whatever prefix the first read delivered.
-    if case.proto == Proto::Udp && sha != sha256_hex(&case.trigger_send) {
+    // The driver hashes the whole pending buffer on a trigger (a datagram
+    // is one message anyway), and every trigger here is one write, so the
+    // hash is exactly what was sent.
+    if sha != sha256_hex(&case.trigger_send) {
         return Err(format!(
             "trigger_sha256 {sha} != sha256(trigger) {}",
             sha256_hex(&case.trigger_send)
@@ -654,6 +655,15 @@ async fn patched_flow(case: Case, addr: SocketAddr, control: String) -> Res<()> 
         return Err(format!(
             "P trigger classified {} expected {:?}",
             trigger_msg["classified"], case.p_classified
+        ));
+    }
+    // On a Fault the driver hashes the whole pending buffer: exactly the
+    // one write the trigger was.
+    if trigger_msg["sha256"] != sha256_hex(&case.trigger_send) {
+        return Err(format!(
+            "P trigger message sha256 {} != sha256(trigger) {}",
+            trigger_msg["sha256"],
+            sha256_hex(&case.trigger_send)
         ));
     }
     Ok(())

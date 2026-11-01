@@ -18,12 +18,16 @@ pub const MAX_LINE: usize = 1024;
 const LOCAL_DOMAIN: &str = "target.test";
 
 /// `/services` entry for the SMTP speaker.
-pub static DEF: ServiceDef = ServiceDef {
+pub const DEF: ServiceDef = ServiceDef {
     name: "l4-smtp",
     grammar: "smtp",
     proto: Proto::Tcp,
-    new_conn: || Box::new(Smtp),
+    new_conn,
 };
+
+fn new_conn() -> Box<dyn Speaker> {
+    Box::new(Smtp)
+}
 
 /// One SMTP connection. Stateless: every verb is answered on its own.
 #[derive(Debug)]
@@ -136,15 +140,8 @@ fn is_local_recipient(path: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::speakers::msg;
     use crate::SeedMode;
-
-    fn msg(step: Step, consumed: usize, verb: &str) -> Parsed {
-        Parsed::Message {
-            consumed,
-            verb: Some(verb.to_string()),
-            step,
-        }
-    }
 
     #[test]
     fn smtp_banner() {
@@ -164,69 +161,69 @@ mod tests {
         let v = SeedMode::Vulnerable;
         assert_eq!(
             s.parse(v, b"EHLO x\r\n"),
-            msg(Step::Reply(b"250 target.test\r\n".to_vec()), 8, "EHLO")
+            msg(8, "EHLO", Step::Reply(b"250 target.test\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"helo x\r\n"),
-            msg(Step::Reply(b"250 target.test\r\n".to_vec()), 8, "HELO")
+            msg(8, "HELO", Step::Reply(b"250 target.test\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"MAIL FROM:<a@target.test>\r\n"),
-            msg(Step::Reply(b"250 OK\r\n".to_vec()), 27, "MAIL")
+            msg(27, "MAIL", Step::Reply(b"250 OK\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"RCPT TO:<b@target.test>\r\n"),
-            msg(Step::Reply(b"250 OK\r\n".to_vec()), 25, "RCPT")
+            msg(25, "RCPT", Step::Reply(b"250 OK\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"RCPT TO:<b@TARGET.Test>\r\n"),
-            msg(Step::Reply(b"250 OK\r\n".to_vec()), 25, "RCPT")
+            msg(25, "RCPT", Step::Reply(b"250 OK\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"RCPT TO:<b@other.example>\r\n"),
             msg(
-                Step::Denylisted(b"550 relay denied\r\n".to_vec()),
                 27,
-                "RCPT"
+                "RCPT",
+                Step::Denylisted(b"550 relay denied\r\n".to_vec())
             )
         );
         assert_eq!(
             s.parse(v, b"RCPT TO:<b@target.test.evil>\r\n"),
             msg(
-                Step::Denylisted(b"550 relay denied\r\n".to_vec()),
                 30,
-                "RCPT"
+                "RCPT",
+                Step::Denylisted(b"550 relay denied\r\n".to_vec())
             )
         );
         assert_eq!(
             s.parse(v, b"NOOP\r\n"),
-            msg(Step::Reply(b"250 OK\r\n".to_vec()), 6, "NOOP")
+            msg(6, "NOOP", Step::Reply(b"250 OK\r\n".to_vec()))
         );
         assert_eq!(
             s.parse(v, b"DATA\r\n"),
             msg(
-                Step::ProtocolError(b"451 not accepted\r\n".to_vec()),
                 6,
-                "DATA"
+                "DATA",
+                Step::ProtocolError(b"451 not accepted\r\n".to_vec())
             )
         );
         assert_eq!(
             s.parse(v, b"VRFY root\r\n"),
             msg(
-                Step::ProtocolError(b"500 unknown command\r\n".to_vec()),
                 11,
-                "VRFY"
+                "VRFY",
+                Step::ProtocolError(b"500 unknown command\r\n".to_vec())
             )
         );
         // Only the first line is consumed; the rest stays for the next call.
         assert_eq!(
             s.parse(v, b"QUIT\r\nNOOP\r\n"),
-            msg(Step::Close(Some(b"221 bye\r\n".to_vec())), 6, "QUIT")
+            msg(6, "QUIT", Step::Close(Some(b"221 bye\r\n".to_vec())))
         );
         // Patched mode answers the benign exchange identically.
         assert_eq!(
             s.parse(SeedMode::Patched, b"NOOP\r\n"),
-            msg(Step::Reply(b"250 OK\r\n".to_vec()), 6, "NOOP")
+            msg(6, "NOOP", Step::Reply(b"250 OK\r\n".to_vec()))
         );
     }
 

@@ -153,19 +153,11 @@ fn read_holding(tid: u16, uid: u8, data: &[u8]) -> Step {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::speakers::{Parsed, Proto, Speaker, Step};
+    use crate::speakers::{msg, Parsed, Proto, Speaker, Step};
     use crate::SeedMode;
 
     fn parse(mode: SeedMode, buf: &[u8]) -> Parsed {
         Modbus.parse(mode, buf)
-    }
-
-    fn msg(consumed: usize, verb: &str, step: Step) -> Parsed {
-        Parsed::Message {
-            consumed,
-            verb: Some(verb.to_string()),
-            step,
-        }
     }
 
     #[test]

@@ -17,6 +17,7 @@ use hyper::StatusCode;
 use serde_json::Value;
 
 use crate::app::{html, percent_decode, reflect, AppState, RequestInfo, Resp};
+use crate::seed::SeedMode;
 
 /// Most parts [`parse_multipart`] keeps; later parts are dropped unread.
 const MAX_PARTS: usize = 64;
@@ -63,7 +64,7 @@ fn single_segment(path: &str, prefix: &str) -> Option<String> {
 
 /// `GET /whoami`: `User-Agent` and `X-Forwarded-For` reflected into `<p>`s.
 /// A missing header reflects as the empty string.
-fn whoami(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
+fn whoami(info: &RequestInfo, mode: SeedMode) -> Resp {
     let agent = reflect(mode, info.header("user-agent").unwrap_or(""));
     let from = reflect(mode, info.header("x-forwarded-for").unwrap_or(""));
     html(
@@ -74,7 +75,7 @@ fn whoami(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
 
 /// `GET /prefs`: the `theme` cookie reflected into the body class; without the
 /// cookie the default is set (`theme=light; Path=/`) and rendered.
-fn prefs(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
+fn prefs(info: &RequestInfo, mode: SeedMode) -> Resp {
     match info.cookie("theme") {
         Some(theme) => html(
             StatusCode::OK,
@@ -94,7 +95,7 @@ fn prefs(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
 /// `POST /api/profile`: the JSON value at `profile.address.city` reflected into
 /// a `text/html` `<div>`. Malformed JSON or a missing city is a 400; a
 /// non-string city reflects its JSON serialisation.
-fn profile(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
+fn profile(info: &RequestInfo, mode: SeedMode) -> Resp {
     let Ok(doc) = serde_json::from_slice::<Value>(&info.body) else {
         return html(StatusCode::BAD_REQUEST, "invalid json".to_string());
     };
@@ -117,7 +118,7 @@ fn profile(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
 /// `POST /upload`: the `file` part's filename and byte count plus the `note`
 /// field reflected into one `<p>`. A request that is not multipart (or names no
 /// boundary) is a 400; a missing part reflects as empty / 0 bytes.
-fn upload(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
+fn upload(info: &RequestInfo, mode: SeedMode) -> Resp {
     let Some(boundary) = info.header("content-type").and_then(multipart_boundary) else {
         return html(
             StatusCode::BAD_REQUEST,
@@ -144,7 +145,7 @@ fn upload(info: &RequestInfo, mode: crate::seed::SeedMode) -> Resp {
 }
 
 /// `GET /docs/{slug}`: the slug reflected into an `<h1>`.
-fn doc(mode: crate::seed::SeedMode, slug: &str) -> Resp {
+fn doc(mode: SeedMode, slug: &str) -> Resp {
     html(
         StatusCode::OK,
         format!("<h1>Doc: {}</h1>", reflect(mode, slug)),
@@ -152,7 +153,7 @@ fn doc(mode: crate::seed::SeedMode, slug: &str) -> Resp {
 }
 
 /// `GET /files/{name}.txt`: the filename stem reflected into a `<p>`.
-fn file(mode: crate::seed::SeedMode, name: &str) -> Resp {
+fn file(mode: SeedMode, name: &str) -> Resp {
     html(
         StatusCode::OK,
         format!("<p>file {}.txt</p>", reflect(mode, name)),

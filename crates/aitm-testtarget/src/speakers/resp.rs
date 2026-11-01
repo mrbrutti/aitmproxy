@@ -250,19 +250,11 @@ fn bulk(data: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::speakers::{Parsed, Speaker, Step};
+    use crate::speakers::{msg, Parsed, Speaker, Step};
     use crate::SeedMode;
 
     fn parse(mode: SeedMode, buf: &[u8]) -> Parsed {
         Resp.parse(mode, buf)
-    }
-
-    fn msg(consumed: usize, verb: &str, step: Step) -> Parsed {
-        Parsed::Message {
-            consumed,
-            verb: Some(verb.to_string()),
-            step,
-        }
     }
 
     #[test]
