@@ -92,7 +92,11 @@ deny-by-default guard. It is not an L4-only shim.
 
 - **A provider that captures out-of-scope or non-consented traffic into the
   core.** If any flow reaches a protocol module or L4 plugin without the core's
-  guard passing it, deny-by-default is broken.
+  guard passing it, deny-by-default is broken. *Amendment (2026-11-01, approved by
+  Matt via the observe-only-lane spec, its OQ7):* "traffic" means flow **bytes**.
+  Connection **metadata** about out-of-scope flows may enter the core only through the
+  observe-only lane (`2026-10-31-macos-ne-observe-only-lane-design.md`), which the
+  operator enables explicitly, carries no bytes, and is filtered to the operator's own uid.
 - **A root sysex that hands plaintext flows to a squatting local process.** If the
   data path can be hijacked by an unauthenticated peer on a user-writable socket,
   the design has failed.
