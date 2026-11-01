@@ -756,6 +756,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | fix round | done | H76-H77 in `783b4af8`; `--selftest` 67 ok | run 7 after H75 |
 | 16 | tester | PASS | `8e63ab29`: nine tests added, eight strengthened, no production defect; crate gate green (549 tests) | H75 next; then the Task 17 merge (plan recorded in the round H report) |
 | 16 | tester | note | banner `refreshing <verb>...` and the empty text show together over an empty pane | accepted (spec-letter Minor) |
+| H (Rust) | fix round | done | H75 `dc1ad52b`; crate gate green (551 tests); pre-merge Rust tip | live run 7 |
 
 ## Shipped
 
