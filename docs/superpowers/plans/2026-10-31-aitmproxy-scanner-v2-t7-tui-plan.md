@@ -20,7 +20,7 @@ Inner-loop tests live in `crates/aitm-tui/tests/scan_v2_*.rs` (one file per task
 
 - **Satisfies:** T7-1 (parsing half; the Jobs-row literals are Task 6), T7-7 (the `wording()` table; routing is Task 13).
 - **Depends on:** none.
-- **Files:** `crates/aitm-tui/Cargo.toml` (modify: add `aitm-scan-model.workspace = true` under `[dependencies]`), `crates/aitm-tui/src/lib.rs` (modify: add `pub mod scan;` to the module list), `crates/aitm-tui/src/scan/mod.rs` (create), `crates/aitm-tui/src/scan/profiles.rs` (create), `crates/aitm-tui/src/scan/jobs.rs` (create), `crates/aitm-tui/src/scan/sitemap.rs` (create), `crates/aitm-tui/src/scan/issues.rs` (create), `crates/aitm-tui/src/scan/launch.rs` (create), `crates/aitm-tui/src/scan/legacy.rs` (create), `crates/aitm-tui/tests/scan_v2_parse.rs` (create).
+- **Files:** `crates/aitm-tui/Cargo.toml` (modify: add `aitm-scan-model.workspace = true` under `[dependencies]`), `crates/aitm-tui/src/lib.rs` (modify: add `pub mod scan;` to the module list), `crates/aitm-tui/src/scan/mod.rs` (create), `crates/aitm-tui/src/scan/profiles.rs` (create), `crates/aitm-tui/src/scan/jobs.rs` (create), `crates/aitm-tui/src/scan/sitemap.rs` (create), `crates/aitm-tui/src/scan/issues.rs` (create), `crates/aitm-tui/src/scan/launch.rs` (create), `crates/aitm-tui/src/scan/legacy.rs` (create), `crates/aitm-tui/tests/scan_v2_parse.rs` (create), `Cargo.lock` (derived: the one `aitm-scan-model` line under `aitm-tui`, the mechanical consequence of the `Cargo.toml` edit; added to the list on panel review 2026-11-01).
 - **Change:** plain data only, no reducer logic, exactly the names and fields of spec D3 (derives: `Debug, Clone, PartialEq, Default` where the contained `aitm_scan_model` types allow; `Eq` where they do).
   - `scan/mod.rs`: `pub enum ScanTab { Profiles, Jobs, SiteMap, Issues }` with `pub const ALL: [ScanTab; 4]`, `pub fn label(self) -> &'static str` ("Profiles", "Jobs", "Site map", "Issues") and `pub fn index(self) -> usize`; `pub struct ScanState` with the D3 fields (`tab`, `profiles`, `jobs`, `sitemap`, `issues`, `launch`, `legacy`, `inflight: BTreeSet<String>`, `last_error: Option<ScanError>`, `opened_at_tick: Option<u64>`); `pub struct ScanError { pub verb: String, pub code: Option<ScanErrorCode>, pub detail: String }` with `pub fn from_message(verb: &str, message: &str) -> Self` (uses `ScanErrorCode::parse_message`; an unparseable message gives `code: None, detail: message`) and `pub fn wording(&self) -> String` (coded: the D9 text, then `": "`, then `detail`; uncoded: `"<verb>: <detail>"`); `pub fn parse_result<T: serde::de::DeserializeOwned>(verb: &str, value: &serde_json::Value) -> Result<T, ScanError>` (on failure `code: None`, `detail: format!("reply did not match the contract ({e})")`; `wording()` adds the `<verb>: ` prefix, so the verb appears once; amended on panel review 2026-11-01); the tag helpers `pub fn tag_keyed(verb: &str, key: &str) -> String` (`"<verb>:<key>"`) and `pub fn tag_parts(tag: &str) -> (&str, Option<&str>)` (split at the first `:` after the verb; `scan.status:scan-1a2b3c4d` gives `("scan.status", Some("scan-1a2b3c4d"))`, a bare verb gives `(verb, None)`); `pub fn scan_host(raw: &str) -> String` (the body of today's private `app.rs` `scan_host`, moved verbatim; `app.rs` is not edited in this task, the duplicate is removed in Task 4); re-exports of every sub-module type.
   - `scan/profiles.rs`: `ProfilesState`, `ProfilePane { List, Fields, Origins, Checks }`, `ProfileEditor`, `OriginChoice { origin: String, source: OriginSource }`, `OriginSource { FromScope, FromFlows, Typed }`, `TriState { Default, Include, Exclude }`, and `pub const EDITOR_FIELDS: [EditorField; 23]` with `pub enum EditorField` in exactly the D3 order (`Name, Origins, L4Targets, LaneHttp, LaneWs, LaneL4Packet, LaneL4Stream, Intensity, Speed, Accuracy, Checks, CrawlStrategy, UseBrowser, MaxDepth, MaxPages, SubmitForms, SessionMode, OnLost, BudgetProbes, BudgetTimeS, BudgetMaxIssues, HttpVersion, RecordProbes`) and `pub fn label(self) -> &'static str`.
@@ -202,6 +202,7 @@ Inner-loop tests live in `crates/aitm-tui/tests/scan_v2_*.rs` (one file per task
 | File | Tasks |
 |---|---|
 | `crates/aitm-tui/Cargo.toml` | 1 |
+| `Cargo.lock` (derived, one line) | 1 |
 | `crates/aitm-tui/src/lib.rs` (module list only; `CORE_TOOLS` untouched) | 1 |
 | `crates/aitm-tui/src/scan/mod.rs` | 1, 4, 5, 13 |
 | `crates/aitm-tui/src/scan/profiles.rs` | 1, 9, 10, 11 |
@@ -275,6 +276,20 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1-3 | security | Important | `flow.subscribe` is live but every push line still triggers a full flow sweep (`app.rs` `Notification => Refresh`) | planned intermediate state; closed by Task 5 (`flows_dirty`, one `Refresh` per tick, job lines routed to `scan.status`); the branch does not merge between Tasks 2 and 5 |
+| 1-3 | security | Minor | `scan_host` mis-parses a bare IPv6 literal (`::1` loses its last group) | fix round A (after Task 5) |
+| 1-3 | security | Minor | confirm overlay survives a `Disconnected` with a token bound to the dead connection | fix round A: clear `wire_confirm`, restore the mode, toast `<call> confirmation dropped: bus disconnected` |
+| 1-3 | quality | Important | uncoded contract-mismatch wording repeats the verb; its test computed the expectation from the value under test | spec D10 and plan Task 1 amended in 37aff2a7 (detail carries no verb); code and test fixed in fix round A |
+| 1-3 | quality | Minor | `pub type L4Confirm` alias has no user and its doc comment is false | plan Task 3 amended in 37aff2a7 (alias dropped); removal in fix round A |
+| 1-3 | quality | Minor | two `scan_v2_confirm.rs` assertions pass with the behaviour broken (`" P"` substring; `mode == wire_confirm_from` mirror) | fix round A: distinctive prompt literal; set `wire_confirm_from = Mode::Scan` and assert the literal |
+| 1-3 | quality | Minor | `_confirm` spelled in three places (`bus.rs`, `launch.rs`, `fixture.rs`) | fix round A: one `pub const CONFIRM_KEY` in `action.rs` |
+| 1-3 | quality | Minor | transport-vs-refusal split written three times in `bus.rs` | fix round A: one `fn refusal(e: BusError) -> Result<String, Outcome>` |
+| 1-3 | quality | Minor | `parse_result` clones every reply before deserialising | fix round A: deserialize from `&Value` |
+| 1-3 | quality | Minor | `IssueFilters` doc comment cites a constraint the plan no longer has | Task 7 retypes the field and rewrites the comment (plan amendment 8883634a) |
+| 1-3 | quality | Minor | `scan_host` carries an unreachable `unwrap_or` fallback | fix round A (after Task 4 removed the `app.rs` twin) |
+| 1-3 | spec | Important | Task 1 edited `Cargo.lock`, not in its declared file list | plan Task 1 file list and Ownership matrix amended (this commit); no code change; the Coder should have reported it |
+| 1-3 | spec | Minor | `IssueFilters.severity_min` typed `crate::model::Severity`, not the wire type | plan amendment 8883634a: Task 7 adds `aitm-poc` and retypes it |
+| 1-3 | spec | note | overlay call-name line uses `theme.l4()` for `scan.*` calls too | fix round A: `accent()` for `scan.*` (hue only on data, D13) |
 
 ## Shipped
 
