@@ -192,6 +192,12 @@ fn walk(action: &Action, cursor: usize, len: usize, page: usize) -> usize {
     .min(last)
 }
 
+/// The toast the Scan views raise when `⏎` names a flow the store no
+/// longer holds (D11): the one "not in the flow list" wording.
+fn not_in_flow_list(id: &str) -> String {
+    format!("flow {id} is not in the flow list (cleared, or not captured here)")
+}
+
 /// One step of a Scan Detail pane's scroll over `len` lines: [`walk`] on
 /// the `u16` the pane keeps, saturating at the type's end (fix round F,
 /// F11). The Jobs and Issues Detail panes share it.
@@ -1459,16 +1465,12 @@ impl App {
                     }
                 }
                 Mode::Findings => {
-                    if let Some(f) = self.findings.get(self.finding_cursor) {
-                        if let Some(id) = f.finding_capture.clone() {
-                            if self.row(&id).is_some() {
-                                self.selected = Some(id);
-                                self.mode = Mode::Inspector;
-                                self.ensure_detail(&mut out);
-                            } else {
-                                self.toast(Level::Warn, "finding capture is not in the flow store");
-                            }
-                        }
+                    let capture = self
+                        .findings
+                        .get(self.finding_cursor)
+                        .and_then(|f| f.finding_capture.clone());
+                    if let Some(id) = capture {
+                        self.open_flow(id, "finding capture is not in the flow store", &mut out);
                     }
                 }
                 // Scan: ⏎ acts per tab (D11). On Jobs it opens the Issues
@@ -1489,7 +1491,8 @@ impl App {
                 Mode::Scan if self.scan.tab == ScanTab::Issues => {
                     if self.scan.issues.pane == IssuePane::Detail {
                         if let Some((id, _)) = self.scan.issues.flow_under_cursor() {
-                            self.open_scan_flow(id.to_string(), &mut out);
+                            let id = id.to_string();
+                            self.open_flow(id.clone(), &not_in_flow_list(&id), &mut out);
                         }
                     } else {
                         self.scan.issues.pane = IssuePane::Detail;
@@ -1505,7 +1508,7 @@ impl App {
                 // tabs act in their own tasks.
                 Mode::Scan => {
                     if let Some(id) = self.scan.sitemap_selected_flow(self.scan_offer()) {
-                        self.open_scan_flow(id, &mut out);
+                        self.open_flow(id.clone(), &not_in_flow_list(&id), &mut out);
                     }
                 }
                 Mode::Prompt(_) | Mode::Compose => out.extend(self.submit()),
@@ -4192,21 +4195,19 @@ impl App {
         }
     }
 
-    /// `⏎` on a flow the Scan view names (a Site map node or point, an
-    /// Issues probe or baseline flow): open it in the inspector when the
-    /// store holds it, else refuse with the one "not in the flow list"
-    /// toast (D11).
-    fn open_scan_flow(&mut self, id: String, out: &mut Vec<BusRequest>) {
+    /// `⏎` on a flow another view names (a Findings capture, a Site map
+    /// node or point, an Issues probe or baseline flow): open it in the
+    /// inspector from the top when the store holds it, else refuse with
+    /// `missing_toast` (the Scan views' [`not_in_flow_list`], the Findings
+    /// view's own text; D11, fix round F, F14).
+    fn open_flow(&mut self, id: String, missing_toast: &str, out: &mut Vec<BusRequest>) {
         if self.row(&id).is_some() {
             self.selected = Some(id);
             self.mode = Mode::Inspector;
             self.inspector.reset_view();
             self.ensure_detail(out);
         } else {
-            self.toast(
-                Level::Warn,
-                format!("flow {id} is not in the flow list (cleared, or not captured here)"),
-            );
+            self.toast(Level::Warn, missing_toast);
         }
     }
 
