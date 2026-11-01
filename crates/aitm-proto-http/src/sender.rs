@@ -24,8 +24,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aitm_core::{
-    ssrf_check, Authority, Body, HttpRequest, HttpResponse, RequestSender, ScopeRateGuard,
-    SsrfPolicy, VersionPolicy,
+    ssrf_check, ActionPermit, Authority, Body, HttpRequest, HttpResponse, RequestSender,
+    ScopeRateGuard, SsrfPolicy, VersionPolicy,
 };
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
@@ -203,6 +203,26 @@ impl SsrfGate {
                 .map_err(|e| anyhow!("SSRF: refusing {what} to {host}: {e}"))?;
         }
         Ok(())
+    }
+
+    /// [`check`](Self::check), then the scope guard's own live permit for
+    /// `host`: for a caller that has no guarded client upstream — the raw
+    /// HTTP/2 observe probe — this is the scope check and the pacing, taken
+    /// at the moment of the dial, so a `scope.remove` after the baseline
+    /// still stops the connection and the probe counts against the host's
+    /// active rate like any other egress. The permit must be held for the
+    /// life of the connection.
+    pub(crate) fn check_live(
+        &self,
+        what: &str,
+        authority: &str,
+        host: &str,
+        ips: &[IpAddr],
+    ) -> Result<ActionPermit> {
+        self.check(what, authority, host, ips)?;
+        self.scope
+            .check_active(host)
+            .map_err(|e| anyhow!("scope: refusing {what} to {host}: {e}"))
     }
 }
 

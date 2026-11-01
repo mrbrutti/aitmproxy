@@ -629,24 +629,14 @@ async fn a_family_answered_5xx_is_abandoned_on_its_first_probe() {
     let verdict = sqli_check().run(&q(), &host).await;
 
     assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
-    assert!(
-        verdict.detail.ends_with(
-            "payload families were answered 5xx on the first probe and abandoned: the payload \
-             breaks the query rather than delaying it, which is the error-based check's \
-             territory, so no delay was measured"
-        ),
-        "{}",
-        verdict.detail
+    assert_eq!(
+        verdict.detail,
+        "2 of 2 payload families were abandoned after a 5xx answer (on probe 1 of 4): the \
+         payload breaks the query rather than delaying it, which is the error-based check's \
+         territory, so no delay was measured for them"
     );
-    // One probe per family and not one more.
-    let families = verdict
-        .detail
-        .split(" of ")
-        .nth(1)
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse::<usize>().ok())
-        .expect("the detail names the family count");
-    assert_eq!(host.sent().len(), families, "{:?}", host.sent());
+    // One probe per family and not one more: the sqli check ships two families.
+    assert_eq!(host.sent().len(), 2, "{:?}", host.sent());
 }
 
 /// One erroring family among measured ones still makes the point Inconclusive:

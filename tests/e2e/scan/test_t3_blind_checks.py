@@ -62,15 +62,16 @@ ACTIVE_DIR = Path(repo_root()) / "scripts" / "bundled" / "active"
 # case-insensitively, so `SLEEP`, `pg_sleep` and `sleep` are one token here.
 DELAY_TOKENS = ("sleep", "waitfor")
 TIMED_PATHS = ("/items", "/orders", "/ping")
+# The seeded points, as (path, parameter).
+TIMED_POINTS = (("/items", "id"), ("/orders", "id"), ("/ping", "host"))
 # Spec D2 caps a timing check at 8 delay probes per point; two timing checks run
-# here (`sqli-time`, `cmdi-time`) and both apply to every query point, so the
-# target may see up to 16 delay-bearing requests per path, 8 from each (live run
-# 2026-11-01: /items saw exactly 16, 8 per check).
+# here (`sqli-time`, `cmdi-time`) and both apply to every query point, so one
+# point may see up to 16 delay-bearing requests, 8 from each (live run
+# 2026-11-01: /items?id saw exactly 16, 8 per check). A point is a (path,
+# parameter) pair read from the target's own log: `path` plus the name before
+# the first `=` of `query` (form fields are logged without a query, so a POST
+# point counts under its path alone).
 MAX_DELAY_PROBES_PER_POINT = 16
-# The log is counted per path, and a path can carry more than one insertion
-# point (`/search` has the `q` query parameter and the search form's body
-# field), so the bound for the non-seeded paths is two points' worth.
-MAX_DELAY_PROBES_PER_PATH = 2 * MAX_DELAY_PROBES_PER_POINT
 MIN_TIMING_R = 0.85
 JOB_TIMEOUT = 600.0
 
@@ -91,14 +92,17 @@ def timing_of(op, issue_summary: dict) -> dict:
     return ((full.get("evidence") or {}).get("timing") or {})
 
 
-def delay_probes_per_path(target, seq0: int) -> dict:
-    """{path -> number of requests whose query carried a delay payload}, read from
-    the target's own log: the independent count of what the timing checks sent."""
+def delay_probes_per_point(target, seq0: int) -> dict:
+    """{(path, parameter) -> number of requests whose query carried a delay
+    payload}, read from the target's own log: the independent count of what the
+    timing checks sent to each insertion point."""
     counts: dict = {}
     for e in target.logs.scanner_requests(seq0):
-        query = (e.get("query") or "").lower()
-        if any(tok in query for tok in DELAY_TOKENS):
-            counts[e.get("path")] = counts.get(e.get("path"), 0) + 1
+        query = e.get("query") or ""
+        if any(tok in query.lower() for tok in DELAY_TOKENS):
+            param = query.split("=", 1)[0] if "=" in query else ""
+            key = (e.get("path"), param)
+            counts[key] = counts.get(key, 0) + 1
     return counts
 
 
@@ -165,18 +169,20 @@ def main() -> None:
                   f"(check_id={cmdi[0].get('check_id')!r}, timing={t_cmdi or None})")
 
             section("the timing checks are bounded (the target's own request count)")
-            counts_v = delay_probes_per_path(v, seq_v)
-            for path in TIMED_PATHS:
-                n = counts_v.get(path, 0)
+            counts_v = delay_probes_per_point(v, seq_v)
+            shown = {f"{path}?{param}": n for (path, param), n in sorted(counts_v.items())}
+            for point in TIMED_POINTS:
+                n = counts_v.get(point, 0)
                 check(n <= MAX_DELAY_PROBES_PER_POINT,
-                      f"V: {n} delay-payload request(s) on {path} (<= {MAX_DELAY_PROBES_PER_POINT})")
-            extra = {k: n for k, n in counts_v.items()
-                     if k not in TIMED_PATHS and n > MAX_DELAY_PROBES_PER_PATH}
+                      f"V: {n} delay-payload request(s) on {point[0]}?{point[1]} "
+                      f"(<= {MAX_DELAY_PROBES_PER_POINT}, 8 per timing check)")
+            extra = {f"{k[0]}?{k[1]}": n for k, n in counts_v.items()
+                     if k not in TIMED_POINTS and n > MAX_DELAY_PROBES_PER_POINT}
             check(not extra,
-                  f"V: no other path got more than {MAX_DELAY_PROBES_PER_PATH} delay payloads "
-                  f"(observed {extra or 'none'}; all paths {counts_v or 'none'})")
-            check(sum(counts_v.get(p, 0) for p in ("/orders", "/ping")) > 0,
-                  f"V: the delay payloads really reached the target (per-path {counts_v or 'none'})")
+                  f"V: no other point got more than {MAX_DELAY_PROBES_PER_POINT} delay payloads "
+                  f"(observed {extra or 'none'}; all points {shown or 'none'})")
+            check(sum(counts_v.get(p, 0) for p in TIMED_POINTS[1:]) > 0,
+                  f"V: the delay payloads really reached the target (per point {shown or 'none'})")
 
             section("the patched twin yields none of the three")
             iss_p, seq_p = run_blind(op, p)

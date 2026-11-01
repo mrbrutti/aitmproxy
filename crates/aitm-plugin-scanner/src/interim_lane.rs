@@ -32,19 +32,24 @@ use std::time::{Duration, SystemTime};
 use aitm_core::{
     Body, CommandHost, Flow, FlowId, HeaderMap, HttpFlow, HttpRequest, RecordPolicy, SendOptions,
 };
+#[cfg(test)]
+use aitm_scan_model::PocHint;
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Discovery, Evidence, FlowRef,
     InsertionKind, InsertionPoint, Intensity, JobCtx, Lane, LaneKind, NodeId, Outcome, ParamRef,
-    Payload, PayloadMode, PocHint, PointTrait, ProbeHost, ProbeResponse, ProfileTarget, RawProbe,
+    Payload, PayloadMode, PointTrait, ProbeHost, ProbeResponse, ProfileTarget, RawProbe,
     ScanProfile, SiteNode, Technique, UseBrowser, Verdict, MAX_MATCH_BODY,
 };
 use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 
+#[cfg(test)]
 use crate::checks::CheckDefinition;
+#[cfg(test)]
 use crate::client::ProbeRefused;
 use crate::config::ScannerConfig;
 use crate::discover::{is_secret_name, InjectionPoint, Location};
+#[cfg(test)]
 use crate::scheduler::payload_cap;
 use crate::util::{default_port, normalize_origin, origin_key, scrub, split_authority, wire_token};
 
@@ -598,11 +603,13 @@ impl ProbeHost for InterimProbeHost {
 /// No longer in [`Lane::checks`]: the T3 natives own `xss-reflected` and
 /// `open-redirect` (T3 PR 2a). Kept as the test vehicle for this lane's probe
 /// host (recording policy, held flows, budget) and retired with the lane.
-pub struct LegacyActiveCheck {
+#[cfg(test)]
+pub(crate) struct LegacyActiveCheck {
     def: CheckDefinition,
     meta: CheckMeta,
 }
 
+#[cfg(test)]
 impl Check for LegacyActiveCheck {
     fn meta(&self) -> &CheckMeta {
         &self.meta
@@ -906,6 +913,7 @@ fn bounded_body(body: &Body) -> Vec<u8> {
 /// Read from the typed [`ProbeRefused`] the job client raises, never from
 /// words in the message: an upstream error that happens to say "canceled" is
 /// one failed send, not the end of the run.
+#[cfg(test)]
 fn ends_the_run(err: &anyhow::Error) -> bool {
     matches!(
         err.downcast_ref::<ProbeRefused>(),

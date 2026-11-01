@@ -689,9 +689,13 @@ impl RawH2Client {
             // Then the gate, on every address this name answered, immediately
             // before the dial — so the address the driver connects to is one
             // the operator's policy and scope actually allow.
-            if let Some(gate) = &self.ssrf {
-                gate.check("raw h2 probe", &authority, &host, &ips)?;
-            }
+            // The live scope permit is held until the conversation ends, so
+            // the connection is paced and counted as one active egress and a
+            // scope change during the probe is seen on the next one.
+            let _permit = match &self.ssrf {
+                Some(gate) => Some(gate.check_live("raw h2 probe", &authority, &host, &ips)?),
+                None => None,
+            };
             let addr = ips
                 .into_iter()
                 .next()
@@ -2489,6 +2493,10 @@ mod driver_tests {
         guard.add_scope(ScopeEntry {
             host: "127.0.0.1".into(),
         });
+        // The live scope permit is taken for the name the probe dials.
+        guard.add_scope(ScopeEntry {
+            host: "origin.test".into(),
+        });
         let client = client.with_ssrf(SsrfPolicy::default(), guard);
 
         let obs = client
@@ -2502,6 +2510,34 @@ mod driver_tests {
         );
         assert_eq!(dialer.calls(), 1, "the gate let the dial through");
         settled(&log, |l| l.headers_streams == vec![1]).await;
+    }
+
+    /// The gate takes the scope guard's live permit for the name it dials
+    /// (panel review of PR 2a): a scope that lifts the private-address block
+    /// for the IP literal but does not hold the host itself refuses the probe
+    /// before the dial, and says it was the scope, not SSRF.
+    #[tokio::test]
+    async fn the_gate_refuses_a_host_the_live_scope_does_not_hold() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        let (client, dialer, _log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        let client = client.with_ssrf(SsrfPolicy::default(), guard);
+
+        let err = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("a host outside the live scope is refused");
+
+        assert!(
+            err.to_string()
+                .starts_with("scope: refusing raw h2 probe to origin.test"),
+            "{err}"
+        );
+        assert_eq!(dialer.calls(), 0, "a refused probe never dials");
     }
 
     /// SEC-1: without `with_ssrf` the driver behaves exactly as before — the
@@ -2692,6 +2728,9 @@ mod driver_tests {
         let scope = Arc::new(StdGuard::default());
         scope.add_scope(ScopeEntry {
             host: "127.0.0.1".into(),
+        });
+        scope.add_scope(ScopeEntry {
+            host: "origin.test".into(),
         });
         let client = client.with_ssrf(SsrfPolicy::default(), scope);
         client
