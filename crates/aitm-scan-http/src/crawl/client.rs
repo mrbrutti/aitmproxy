@@ -40,12 +40,12 @@ use aitm_core::{
 };
 use aitm_scan_model::JobCtx;
 
-use crate::crawl::extract::{extract, FormSpec};
+use crate::crawl::extract::{extract, FieldKind, FormSpec};
 use crate::crawl::frontier::{fingerprint, remaining, CrawlReport, Crawler, Frontier, Limits};
 use crate::crawl::values::{form_action, form_pairs_for};
 use crate::limits::{MARK_CRAWL, MAX_DOM_BYTES, MAX_HELD_CRAWL_BODY, USER_AGENT};
 use crate::url_norm::{guard_authority, origin_key, resolve, same_origin};
-use crate::{params, redact, session};
+use crate::{multipart, params, redact, session};
 
 /// What the crawler says it accepts; a target that content-negotiates answers
 /// the HTML the crawler can actually read (call **A13**).
@@ -289,7 +289,8 @@ impl<'a> Run<'a> {
                 continue;
             }
             let pairs = form_pairs_for(form, &self.marker, &self.origin_text);
-            let Some(submission) = submission_for(form, action, &pairs, depth.saturating_add(1))
+            let Some(submission) =
+                submission_for(form, action, &pairs, &self.marker, depth.saturating_add(1))
             else {
                 continue;
             };
@@ -381,24 +382,41 @@ fn held(mut flow: HttpFlow) -> HttpFlow {
 /// The request one form submission sends.
 ///
 /// A `GET` form replaces the action's query with the serialised pairs, exactly
-/// as a browser does; every other form (which `form_action` has already
-/// narrowed to `POST`) sends them as an
-/// `application/x-www-form-urlencoded` body.
+/// as a browser does. A `POST` form (which is all `form_action` leaves) sends
+/// them as a body in the encoding the form asked for: `multipart/form-data`
+/// when its `enctype` says so, `application/x-www-form-urlencoded` otherwise.
+/// Honouring the `enctype` is what lets an upload endpoint answer the crawl at
+/// all — one that validates its parts answers `400` to a urlencoded body and
+/// the crawl learns nothing about it (AC T2-1, T2-2).
 fn submission_for(
     form: &FormSpec,
     mut action: Url,
     pairs: &[(String, String)],
+    marker: &str,
     depth: u32,
 ) -> Option<Submission> {
-    let encoded = params::serialize_form(pairs);
     if form.method.trim().eq_ignore_ascii_case("POST") {
-        let request = post_request(&action, &encoded)?;
+        let request = if wants_multipart(form) {
+            let (boundary, body) = multipart_body(form, pairs, marker);
+            post_request(
+                &action,
+                &format!("multipart/form-data; boundary={boundary}"),
+                &body,
+            )?
+        } else {
+            post_request(
+                &action,
+                "application/x-www-form-urlencoded",
+                params::serialize_form(pairs).as_bytes(),
+            )?
+        };
         return Some(Submission {
             request,
             url: action,
             depth,
         });
     }
+    let encoded = params::serialize_form(pairs);
     action.set_query((!encoded.is_empty()).then_some(encoded.as_str()));
     let request = get_request(&action)?;
     Some(Submission {
@@ -406,6 +424,72 @@ fn submission_for(
         url: action,
         depth,
     })
+}
+
+/// Whether the form asked to be sent as `multipart/form-data`.
+///
+/// A prefix match, case-insensitively: the extractor already trims and
+/// lower-cases the attribute, and a page may legally write the media type with
+/// parameters after it.
+fn wants_multipart(form: &FormSpec) -> bool {
+    form.enctype.as_deref().is_some_and(|enctype| {
+        enctype
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("multipart/form-data")
+    })
+}
+
+/// The `multipart/form-data` body one submission sends, with its boundary.
+///
+/// One `form-data; name="…"` part per generated pair, in order, then one part
+/// per file control: a browser sends a part for every `<input type="file">`,
+/// and an endpoint that checks its upload rejects a body that has none, so the
+/// crawler sends a small inert text file named after the job marker.
+///
+/// The boundary is derived from the job marker (`----aitm<marker>`), which is
+/// unguessable from the page, so no value the page put in a hidden field can
+/// forge a delimiter; a CRLF inside a part's value is ordinary content, not a
+/// delimiter, so values are written as they are. Only the quoted `name=` and
+/// `filename=` parameters are escaped, by the one escaper the parser's rules
+/// are written against.
+fn multipart_body(form: &FormSpec, pairs: &[(String, String)], marker: &str) -> (String, Vec<u8>) {
+    let boundary = format!("----aitm{marker}");
+    let mut body: Vec<u8> = Vec::new();
+
+    for (name, value) in pairs {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{}\"\r\n\r\n",
+                multipart::escape_filename(name)
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+
+    for field in form
+        .fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::File))
+    {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{}\"; filename=\"aitm-{marker}.txt\"\r\n\
+                 Content-Type: text/plain\r\n\r\n",
+                multipart::escape_filename(&field.name)
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(format!("aitm-{marker}").as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    (boundary, body)
 }
 
 /// A crawl `GET` for `url`: no body, the crawler's own `Accept` and
@@ -426,12 +510,13 @@ fn get_request(url: &Url) -> Option<HttpRequest> {
     })
 }
 
-/// A crawl form `POST` of `encoded` to `url`.
-fn post_request(url: &Url, encoded: &str) -> Option<HttpRequest> {
+/// A crawl form `POST` of `body` to `url`, framed by `content_type` and its
+/// own length.
+fn post_request(url: &Url, content_type: &str, body: &[u8]) -> Option<HttpRequest> {
     let (authority, path) = parts(url)?;
     let mut headers = base_headers(&authority);
-    headers.set("content-type", "application/x-www-form-urlencoded");
-    headers.set("content-length", &encoded.len().to_string());
+    headers.set("content-type", content_type);
+    headers.set("content-length", &body.len().to_string());
     Some(HttpRequest {
         method: "POST".to_string(),
         scheme: url.scheme().to_string(),
@@ -439,7 +524,7 @@ fn post_request(url: &Url, encoded: &str) -> Option<HttpRequest> {
         path,
         version: HttpVersion::Http11,
         headers,
-        body: Body::Bytes(encoded.as_bytes().to_vec()),
+        body: Body::Bytes(body.to_vec()),
         timestamp: SystemTime::now(),
     })
 }
@@ -782,5 +867,107 @@ mod tests {
         assert_eq!(report.pages, 0);
         assert_eq!(report.attempts, 1);
         assert_eq!(report.stopped_reason, Some("navigation_failed"));
+    }
+
+    // --- N2: a `multipart/form-data` form is posted as multipart ------------
+
+    /// The Task 4 form, `POST`ed as `multipart/form-data` with a file control
+    /// added, beside a plain `POST` form that keeps the urlencoded pin.
+    fn enctype_pages() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "/",
+                concat!(
+                    r#"<form action="/upload" method="post" enctype="multipart/form-data">"#,
+                    r#"<input name="q">"#,
+                    r#"<select name="s"><option value="a">A</option><option value="b">B</option></select>"#,
+                    r#"<input type="hidden" name="h" value="1">"#,
+                    r#"<input type="radio" name="r" value="x" checked>"#,
+                    r#"<input type="radio" name="r" value="y">"#,
+                    r#"<input type="file" name="doc">"#,
+                    r#"<input type="submit"></form>"#,
+                    r#"<form action="/save" method="post"><input name="q">"#,
+                    r#"<input type="submit"></form>"#,
+                ),
+            ),
+            ("/upload", "<p>uploaded</p>"),
+            ("/save", "<p>saved</p>"),
+        ]
+    }
+
+    /// The body bytes of a request the crawler sent.
+    fn body_bytes(req: &HttpRequest) -> Vec<u8> {
+        match &req.body {
+            Body::Bytes(bytes) => bytes.clone(),
+            Body::Empty => Vec::new(),
+            Body::Streamed(_) => panic!("the crawler never streams a body"),
+        }
+    }
+
+    /// The one request the crawl sent to `path`.
+    fn sent_to(client: &crate::testutil::ScriptedClient, path: &str) -> HttpRequest {
+        let sent = client.sent.lock().unwrap();
+        let mut found = sent.iter().filter(|(req, _)| req.path == path);
+        let (req, _) = found
+            .next()
+            .unwrap_or_else(|| panic!("nothing sent to {path}"));
+        req.clone()
+    }
+
+    #[tokio::test]
+    async fn multipart_form_is_posted_as_multipart() {
+        let client = Arc::new(site(&enctype_pages()));
+        let job = FakeJob::new(profile(|_| {}), Arc::clone(&client));
+
+        crawl(&job).await;
+
+        let upload = sent_to(&client, "/upload");
+        assert_eq!(upload.method, "POST");
+        let boundary = "----aitmaitm7f3a";
+        assert_eq!(
+            upload.headers.get("content-type"),
+            Some(format!("multipart/form-data; boundary={boundary}").as_str())
+        );
+        let body = body_bytes(&upload);
+        assert_eq!(
+            upload.headers.get("content-length"),
+            Some(body.len().to_string().as_str())
+        );
+
+        let parts = crate::multipart::parse(&body, boundary)
+            .expect("the lane's own parser reads the body the lane built");
+        // `name|filename|content-type|value` per part, `-` for an absent one.
+        let shape: Vec<String> = parts
+            .iter()
+            .map(|part| {
+                let dash =
+                    |field: &Option<String>| field.clone().unwrap_or_else(|| "-".to_string());
+                format!(
+                    "{}|{}|{}|{}",
+                    dash(&part.name),
+                    dash(&part.filename),
+                    dash(&part.content_type),
+                    String::from_utf8_lossy(&body[part.value_span.clone()])
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                "q|-|-|aitm-aitm7f3a".to_string(),
+                "s|-|-|a".to_string(),
+                "h|-|-|1".to_string(),
+                "r|-|-|x".to_string(),
+                "doc|aitm-aitm7f3a.txt|text/plain|aitm-aitm7f3a".to_string(),
+            ]
+        );
+
+        // A form that does not ask for multipart still posts urlencoded.
+        let save = sent_to(&client, "/save");
+        assert_eq!(
+            save.headers.get("content-type"),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(body_bytes(&save), b"q=aitm-aitm7f3a".to_vec());
     }
 }
