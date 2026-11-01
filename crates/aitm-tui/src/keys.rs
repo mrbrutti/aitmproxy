@@ -92,7 +92,12 @@ fn browser(key: KeyEvent) -> Option<Action> {
 /// `r` launches the legacy scope-bound crawl, `x` cancels the Jobs cursor's
 /// job, `F` jumps to the findings pane, `:` palette, `?` help, Esc/`q` closes
 /// the focused pane or leaves the view. Each tab's own keys are added to this
-/// one function by its task.
+/// one function by its task. Profiles (plan task 10): `e` edit, Space
+/// toggle, `w` save, `D` delete, `N` new, `o` typed origin, `a`/`d` add or
+/// remove the picker row, `t` L4 target, `h`/`l`/← collapse or expand a
+/// tree node; → stays ⏎ (it opens the Site map's row and the legacy point's
+/// flow, which `tests/scan_surface.rs` pins), and ⏎ expands a collapsed
+/// node too.
 fn scan(key: KeyEvent) -> Option<Action> {
     if let Some(a) = nav(key) {
         return Some(a);
@@ -101,6 +106,18 @@ fn scan(key: KeyEvent) -> Option<Action> {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
         KeyCode::Char('x') => Action::ScanCancel,
+        // Profiles (D11, plan task 10).
+        KeyCode::Char('e') => Action::ScanEdit,
+        KeyCode::Char(' ') => Action::ScanToggle,
+        KeyCode::Char('w') => Action::ScanSave,
+        KeyCode::Char('D') => Action::ScanDelete,
+        KeyCode::Char('N') => Action::ScanNewProfile,
+        KeyCode::Char('o') => Action::ScanOriginPrompt,
+        KeyCode::Char('a') => Action::ScanOriginAdd,
+        KeyCode::Char('d') => Action::ScanOriginRemove,
+        KeyCode::Char('t') => Action::ScanL4TargetPrompt,
+        KeyCode::Left | KeyCode::Char('h') => Action::Left,
+        KeyCode::Char('l') => Action::Right,
         // Issues filters (D11): one key per filter, `R` resets them all.
         KeyCode::Char('S') => Action::ScanFilter(crate::scan::IssueFilterKey::Severity),
         KeyCode::Char('C') => Action::ScanFilter(crate::scan::IssueFilterKey::Confidence),

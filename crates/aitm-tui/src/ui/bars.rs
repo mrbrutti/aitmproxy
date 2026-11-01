@@ -505,6 +505,11 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             "eval:",
             "JavaScript expression · ⏎ run (browser.eval) · Esc",
         ),
+        // The Profiles editor's prompts (scanner v2 spec D4, D11).
+        PromptKind::ScanOrigin => ("origin:", "scheme://host[:port] · ⏎ add"),
+        PromptKind::ScanField => ("value:", "⏎ set · Esc"),
+        PromptKind::ScanProfileName => ("profile name:", "⏎ save as (scan.profile.save)"),
+        PromptKind::ScanL4Target => ("l4 target:", "ip:port[/tcp|udp][ grammar] · ⏎ add"),
     };
     let text = match (kind, &app.confirm) {
         (PromptKind::Confirm, Some(c)) => {

@@ -4,12 +4,56 @@
 //! `:scan <origin>` command and the legacy seed share.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv6Addr;
+use std::net::{IpAddr, Ipv6Addr};
 
-use aitm_scan_model::{CheckMeta, ProfileListEntry, ScanProfile, SessionProfile};
+use aitm_scan_model::{
+    Accuracy, Canary, CheckMeta, CheckSelection, ChecksResult, CrawlStrategy, HttpVersionPolicy,
+    Intensity, L4TargetSpec, L4Transport, LaneKind, OnLost, ProfileListEntry, ProfileListResult,
+    RecordProbes, ScanProfile, SessionMode, SessionProfile, Speed, UseBrowser,
+};
 
-use super::ScanError;
+use super::{lane_token, step, Dir, ScanError};
 use crate::model::FlowRow;
+use crate::text::truncate;
+
+/// The most `scan.profile.list` rows kept at fold (spec D6, hostile-core
+/// bounds; the builder's number: a profile directory of a few dozen files
+/// is large).
+pub const PROFILES_MAX: usize = 256;
+
+/// The most `scan.checks` entries kept at fold (hostile-core bounds; the
+/// builder's number: the bundled catalogue is a few dozen checks).
+pub const CHECKS_MAX: usize = 1024;
+
+/// The longest a selector (a check id, a class, a profile name) may be, in
+/// bytes, to be kept at fold. A selector is sent back verbatim
+/// (`scan.profile.get {name}`, `checks.include`), so an over-long one is
+/// dropped rather than cut: a cut selector would name nothing.
+pub const SELECTOR_MAX: usize = 128;
+
+/// The widest any display-only string of a folded reply grows, in cells
+/// (a check's name, description and remediation, a session's names and
+/// canary path, a save reply's path).
+const VALUE_MAX: usize = 200;
+
+/// The most cookie and header names a session preview keeps.
+const SESSION_NAMES_MAX: usize = 32;
+
+/// The most `previews` entries kept; the map is emptied when a new origin
+/// would exceed it (a cheap bound: the editor shows one origin's preview).
+const PREVIEWS_MAX: usize = 64;
+
+/// The detail of the uncoded error a `scan.profile.get` reply gets when its
+/// `name` is not the key of the tag it answers (spec D6, hostile-core
+/// bounds): nothing is folded from such a reply.
+pub const OTHER_PROFILE: &str = "reply named a different profile";
+
+/// The detail of the uncoded error a `scan.session.preview` reply gets when
+/// its `origin` is not the key of the tag it answers.
+pub const OTHER_ORIGIN: &str = "reply named a different origin";
+
+/// What a bad `t` line is refused with (plan task 10).
+pub const L4_TARGET_ERROR: &str = "L4 target must be ip:port[/tcp|udp][ grammar]";
 
 /// Which pane of the Profiles tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -333,6 +377,642 @@ fn parse_port(digits: &str) -> Result<u16, String> {
     }
 }
 
+/// What `e` (`ScanEdit`) does on a field (spec D11): cycle an enum, toggle
+/// a bool or a lane, open the `ScanField` prompt for a number or the name,
+/// open the `ScanL4Target` prompt, or focus the Origins or Checks pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Free text (`name`).
+    Text,
+    /// A `u32` / `u64`.
+    Number,
+    /// A bool or a lane: Space and `e` both flip it.
+    Toggle,
+    /// An enum: `e` steps it forward.
+    Cycle,
+    /// `origins`: `e` focuses the Origins pane.
+    Origins,
+    /// `l4_targets`: `e` opens the L4 target prompt.
+    L4Targets,
+    /// `checks`: `e` focuses the Checks pane.
+    Checks,
+}
+
+impl EditorField {
+    /// How the field is edited.
+    pub fn kind(self) -> FieldKind {
+        match self {
+            EditorField::Name => FieldKind::Text,
+            EditorField::Origins => FieldKind::Origins,
+            EditorField::L4Targets => FieldKind::L4Targets,
+            EditorField::LaneHttp
+            | EditorField::LaneWs
+            | EditorField::LaneL4Packet
+            | EditorField::LaneL4Stream
+            | EditorField::SubmitForms => FieldKind::Toggle,
+            EditorField::Intensity
+            | EditorField::Speed
+            | EditorField::Accuracy
+            | EditorField::CrawlStrategy
+            | EditorField::UseBrowser
+            | EditorField::SessionMode
+            | EditorField::OnLost
+            | EditorField::HttpVersion
+            | EditorField::RecordProbes => FieldKind::Cycle,
+            EditorField::Checks => FieldKind::Checks,
+            EditorField::MaxDepth
+            | EditorField::MaxPages
+            | EditorField::BudgetProbes
+            | EditorField::BudgetTimeS
+            | EditorField::BudgetMaxIssues => FieldKind::Number,
+        }
+    }
+
+    /// The lane a lane field stands for.
+    fn lane(self) -> Option<LaneKind> {
+        match self {
+            EditorField::LaneHttp => Some(LaneKind::Http),
+            EditorField::LaneWs => Some(LaneKind::Ws),
+            EditorField::LaneL4Packet => Some(LaneKind::L4Packet),
+            EditorField::LaneL4Stream => Some(LaneKind::L4Stream),
+            _ => None,
+        }
+    }
+}
+
+/// The enum rings `e` cycles, each in the contract's declaration order.
+const INTENSITIES: [Intensity; 4] = [
+    Intensity::Passive,
+    Intensity::Light,
+    Intensity::Medium,
+    Intensity::Intrusive,
+];
+const SPEEDS: [Speed; 3] = [Speed::Fast, Speed::Normal, Speed::Thorough];
+const ACCURACIES: [Accuracy; 3] = [
+    Accuracy::FewerFalseNegatives,
+    Accuracy::Normal,
+    Accuracy::FewerFalsePositives,
+];
+const STRATEGIES: [CrawlStrategy; 3] = [
+    CrawlStrategy::Fast,
+    CrawlStrategy::Normal,
+    CrawlStrategy::Thorough,
+];
+const BROWSERS: [UseBrowser; 3] = [UseBrowser::Auto, UseBrowser::Always, UseBrowser::Never];
+const SESSION_MODES: [SessionMode; 2] = [SessionMode::Observed, SessionMode::None];
+const ON_LOSTS: [OnLost; 2] = [OnLost::Stop, OnLost::Continue];
+const HTTP_VERSIONS: [HttpVersionPolicy; 4] = [
+    HttpVersionPolicy::Auto,
+    HttpVersionPolicy::H1,
+    HttpVersionPolicy::H2,
+    HttpVersionPolicy::H2c,
+];
+const RECORDINGS: [RecordProbes; 2] = [RecordProbes::IssuesOnly, RecordProbes::All];
+
+/// The wire token of a contract enum (`medium`, `fewer_false_negatives`):
+/// what the editor shows and the YAML carries. Empty for a value serde
+/// cannot write (none of the rings has one).
+fn token<T: serde::Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+impl ProfileEditor {
+    /// An editor over `draft`, loaded from the profile `loaded_from` (`None`
+    /// for a new one), `builtin` when that profile ships with aitmproxy (a
+    /// save asks for another name). The picker rows start empty: the
+    /// reducer fills them with [`ProfileEditor::refresh_origins`].
+    pub fn new(draft: ScanProfile, loaded_from: Option<String>, builtin: bool) -> Self {
+        Self {
+            loaded_from,
+            builtin,
+            draft,
+            dirty: false,
+            field: 0,
+            tree_cursor: 0,
+            collapsed: BTreeSet::new(),
+            origin_cursor: 0,
+            origin_choices: Vec::new(),
+        }
+    }
+
+    /// The field under the Fields cursor.
+    pub fn field(&self) -> EditorField {
+        EDITOR_FIELDS[self.field.min(EDITOR_FIELDS.len() - 1)]
+    }
+
+    /// The current value of the field under the cursor as text: what the
+    /// `ScanField` prompt is prefilled with and what a plain view prints.
+    pub fn field_text(&self) -> String {
+        let d = &self.draft;
+        let on_off = |b: bool| if b { "on" } else { "off" }.to_string();
+        match self.field() {
+            EditorField::Name => d.name.clone(),
+            EditorField::Origins => {
+                if d.target.origins.is_empty() {
+                    "none".to_string()
+                } else {
+                    d.target.origins.join(", ")
+                }
+            }
+            EditorField::L4Targets => {
+                if d.target.l4.is_empty() {
+                    "none".to_string()
+                } else {
+                    d.target
+                        .l4
+                        .iter()
+                        .map(l4_target_text)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            }
+            f @ (EditorField::LaneHttp
+            | EditorField::LaneWs
+            | EditorField::LaneL4Packet
+            | EditorField::LaneL4Stream) => on_off(f.lane().is_some_and(|l| d.lanes.contains(&l))),
+            EditorField::Intensity => token(&d.intensity),
+            EditorField::Speed => token(&d.speed),
+            EditorField::Accuracy => token(&d.accuracy),
+            EditorField::Checks => format!(
+                "include {} · exclude {}",
+                d.checks.include.len(),
+                d.checks.exclude.len()
+            ),
+            EditorField::CrawlStrategy => token(&d.crawl.strategy),
+            EditorField::UseBrowser => token(&d.crawl.use_browser),
+            EditorField::MaxDepth => d.crawl.max_depth.to_string(),
+            EditorField::MaxPages => d.crawl.max_pages.to_string(),
+            EditorField::SubmitForms => on_off(d.crawl.submit_forms),
+            EditorField::SessionMode => token(&d.session.mode),
+            EditorField::OnLost => token(&d.session.on_lost),
+            EditorField::BudgetProbes => d.budget.probes.to_string(),
+            EditorField::BudgetTimeS => d.budget.time_s.to_string(),
+            EditorField::BudgetMaxIssues => d.budget.max_issues.to_string(),
+            EditorField::HttpVersion => token(&d.http.version),
+            EditorField::RecordProbes => token(&d.http.record_probes),
+        }
+    }
+
+    /// Step an enum field forward (declaration order, wrapping), flip a
+    /// bool or a lane. Any other field is left alone. Returns whether the
+    /// draft changed; a change marks it dirty.
+    pub fn cycle(&mut self, field: EditorField) -> bool {
+        let d = &mut self.draft;
+        let changed = match field {
+            EditorField::Intensity => {
+                d.intensity = step(&INTENSITIES, d.intensity, Dir::Next);
+                true
+            }
+            EditorField::Speed => {
+                d.speed = step(&SPEEDS, d.speed, Dir::Next);
+                true
+            }
+            EditorField::Accuracy => {
+                d.accuracy = step(&ACCURACIES, d.accuracy, Dir::Next);
+                true
+            }
+            EditorField::CrawlStrategy => {
+                d.crawl.strategy = step(&STRATEGIES, d.crawl.strategy, Dir::Next);
+                true
+            }
+            EditorField::UseBrowser => {
+                d.crawl.use_browser = step(&BROWSERS, d.crawl.use_browser, Dir::Next);
+                true
+            }
+            EditorField::SessionMode => {
+                d.session.mode = step(&SESSION_MODES, d.session.mode, Dir::Next);
+                true
+            }
+            EditorField::OnLost => {
+                d.session.on_lost = step(&ON_LOSTS, d.session.on_lost, Dir::Next);
+                true
+            }
+            EditorField::HttpVersion => {
+                d.http.version = step(&HTTP_VERSIONS, d.http.version, Dir::Next);
+                true
+            }
+            EditorField::RecordProbes => {
+                d.http.record_probes = step(&RECORDINGS, d.http.record_probes, Dir::Next);
+                true
+            }
+            EditorField::SubmitForms => {
+                d.crawl.submit_forms = !d.crawl.submit_forms;
+                true
+            }
+            f => match f.lane() {
+                Some(lane) => {
+                    if let Some(i) = d.lanes.iter().position(|l| *l == lane) {
+                        d.lanes.remove(i);
+                    } else {
+                        d.lanes.push(lane);
+                        // `LaneKind` orders by declaration, so the list
+                        // reads as the Fields pane does.
+                        d.lanes.sort();
+                        d.lanes.dedup();
+                    }
+                    true
+                }
+                None => false,
+            },
+        };
+        self.dirty |= changed;
+        changed
+    }
+
+    /// Write `text` into a text or number field: the name as typed
+    /// (trimmed), a number parsed as the field's width; a number field
+    /// given anything else is refused with `<label> must be a number`, and
+    /// a field that is not text at all with `<label> is not a text field`.
+    /// A write marks the draft dirty.
+    pub fn set_text(&mut self, field: EditorField, text: &str) -> Result<(), String> {
+        let text = text.trim();
+        let number = || format!("{} must be a number", field.label());
+        let d = &mut self.draft;
+        match field {
+            EditorField::Name => d.name = text.to_string(),
+            EditorField::MaxDepth => d.crawl.max_depth = text.parse().map_err(|_| number())?,
+            EditorField::MaxPages => d.crawl.max_pages = text.parse().map_err(|_| number())?,
+            EditorField::BudgetProbes => d.budget.probes = text.parse().map_err(|_| number())?,
+            EditorField::BudgetTimeS => d.budget.time_s = text.parse().map_err(|_| number())?,
+            EditorField::BudgetMaxIssues => {
+                d.budget.max_issues = text.parse().map_err(|_| number())?
+            }
+            other => return Err(format!("{} is not a text field", other.label())),
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Add `origin` to the draft unless it is there already. Returns
+    /// whether it was added (a change marks the draft dirty).
+    pub fn add_origin(&mut self, origin: &str) -> bool {
+        if self.draft.target.origins.iter().any(|o| o == origin) {
+            return false;
+        }
+        self.draft.target.origins.push(origin.to_string());
+        self.dirty = true;
+        true
+    }
+
+    /// Remove `origin` from the draft. Returns whether it was there.
+    pub fn remove_origin(&mut self, origin: &str) -> bool {
+        let before = self.draft.target.origins.len();
+        self.draft.target.origins.retain(|o| o != origin);
+        let removed = self.draft.target.origins.len() != before;
+        self.dirty |= removed;
+        removed
+    }
+
+    /// Add an L4 target unless an equal one is there. Returns whether it
+    /// was added.
+    pub fn add_l4_target(&mut self, target: L4TargetSpec) -> bool {
+        if self.draft.target.l4.contains(&target) {
+            return false;
+        }
+        self.draft.target.l4.push(target);
+        self.dirty = true;
+        true
+    }
+
+    /// Space on the check tree: cycle the node's own selector through
+    /// [`toggle_selector`] and mark the draft dirty.
+    pub fn toggle_node(&mut self, selector: &str) {
+        toggle_selector(&mut self.draft.checks, selector);
+        self.dirty = true;
+    }
+
+    /// Rebuild the picker rows from the D8 rule over `scope` and `flows`,
+    /// keeping the origins the operator typed (`o`) that the rule does not
+    /// list, and settle the picker cursor onto the rows.
+    pub fn refresh_origins(&mut self, scope: &[String], flows: &[FlowRow]) {
+        let mut rows = origin_choices(scope, flows);
+        for typed in self
+            .origin_choices
+            .iter()
+            .filter(|c| c.source == OriginSource::Typed)
+        {
+            if !rows.iter().any(|r| r.origin == typed.origin) {
+                rows.push(typed.clone());
+            }
+        }
+        self.origin_choices = rows;
+        self.origin_cursor = self
+            .origin_cursor
+            .min(self.origin_choices.len().saturating_sub(1));
+    }
+
+    /// Record an origin the operator typed as a picker row (so `a` and `d`
+    /// reach it), once.
+    pub fn note_typed_origin(&mut self, origin: &str) {
+        if !self.origin_choices.iter().any(|c| c.origin == origin) {
+            self.origin_choices.push(OriginChoice {
+                origin: origin.to_string(),
+                source: OriginSource::Typed,
+            });
+        }
+    }
+
+    /// The picker row under the Origins cursor.
+    pub fn highlighted_origin(&self) -> Option<&str> {
+        self.origin_choices
+            .get(self.origin_cursor)
+            .map(|c| c.origin.as_str())
+    }
+}
+
+/// `ip:port/proto[ grammar]`, the way [`parse_l4_target`] reads it.
+pub fn l4_target_text(t: &L4TargetSpec) -> String {
+    let proto = match t.proto {
+        L4Transport::Tcp => "tcp",
+        L4Transport::Udp => "udp",
+    };
+    match &t.grammar {
+        Some(g) => format!("{}:{}/{proto} {g}", t.ip, t.port),
+        None => format!("{}:{}/{proto}", t.ip, t.port),
+    }
+}
+
+/// Read an L4 target from `ip:port[/tcp|udp][ grammar]` (plan task 10):
+/// an IPv4 or bracketed IPv6 address, a port from 1 to 65535, `tcp` when
+/// no transport is named, and at most one word of grammar after a space.
+/// Anything else is [`L4_TARGET_ERROR`].
+pub fn parse_l4_target(s: &str) -> Result<L4TargetSpec, String> {
+    let err = || L4_TARGET_ERROR.to_string();
+    let mut words = s.split_whitespace();
+    let head = words.next().ok_or_else(err)?;
+    let grammar = words.next().map(str::to_string);
+    if words.next().is_some() {
+        return Err(err());
+    }
+    let (addr, proto) = match head.split_once('/') {
+        Some((addr, "tcp")) => (addr, L4Transport::Tcp),
+        Some((addr, "udp")) => (addr, L4Transport::Udp),
+        Some(_) => return Err(err()),
+        None => (head, L4Transport::Tcp),
+    };
+    let (host, port) = authority_parts(addr).map_err(|_| err())?;
+    let port = port.ok_or_else(err)?;
+    let ip: IpAddr = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| err())?;
+    Ok(L4TargetSpec {
+        ip: ip.to_string(),
+        port,
+        proto,
+        grammar,
+    })
+}
+
+/// One row of the flattened check tree (spec D3, D11): a lane at depth 0,
+/// a class at depth 1, a check at depth 2, each with the one selector its
+/// toggle writes (`lane:<lane>`, `<class>`, `<id>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeNode {
+    pub depth: u8,
+    /// What the row prints: the lane token, the class, the check id.
+    pub label: String,
+    /// The selector this node's toggle writes.
+    pub selector: String,
+    /// The check id, on a check node only.
+    pub id: Option<String>,
+}
+
+/// The lane to class to check tree over `checks` (spec D11), flattened in
+/// display order: lanes in declaration order, classes by name under each
+/// lane a check lists, check ids by name under their class; a node whose
+/// selector is in `collapsed` hides what is under it. A check in two lanes
+/// appears under both (the engine resolves a selector lane-free).
+pub fn check_tree(checks: &[CheckMeta], collapsed: &BTreeSet<String>) -> Vec<TreeNode> {
+    let mut lanes: BTreeMap<LaneKind, BTreeMap<&str, BTreeSet<&str>>> = BTreeMap::new();
+    for check in checks {
+        for lane in &check.lanes {
+            lanes
+                .entry(*lane)
+                .or_default()
+                .entry(check.class.as_str())
+                .or_default()
+                .insert(check.id.as_str());
+        }
+    }
+    let mut out = Vec::new();
+    for (lane, classes) in lanes {
+        let lane_selector = format!("lane:{}", lane_token(lane));
+        let lane_open = !collapsed.contains(&lane_selector);
+        out.push(TreeNode {
+            depth: 0,
+            label: lane_token(lane).to_string(),
+            selector: lane_selector,
+            id: None,
+        });
+        if !lane_open {
+            continue;
+        }
+        for (class, ids) in classes {
+            let class_open = !collapsed.contains(class);
+            out.push(TreeNode {
+                depth: 1,
+                label: class.to_string(),
+                selector: class.to_string(),
+                id: None,
+            });
+            if !class_open {
+                continue;
+            }
+            for id in ids {
+                out.push(TreeNode {
+                    depth: 2,
+                    label: id.to_string(),
+                    selector: id.to_string(),
+                    id: Some(id.to_string()),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// A node's own selector state (spec D3): `Exclude` when `selector` is in
+/// `exclude` (applied after `include`, so it is what the engine does with a
+/// selector listed in both), `Include` when in `include`, `Default`
+/// otherwise. Only the node's own selector is read: an id under a listed
+/// class reads `Default`.
+pub fn tri_state(selection: &CheckSelection, selector: &str) -> TriState {
+    if selection.exclude.iter().any(|s| s == selector) {
+        TriState::Exclude
+    } else if selection.include.iter().any(|s| s == selector) {
+        TriState::Include
+    } else {
+        TriState::Default
+    }
+}
+
+/// Cycle `selector` through Default, Include, Exclude, Default (spec D3),
+/// writing exactly that selector and touching no other entry.
+pub fn toggle_selector(selection: &mut CheckSelection, selector: &str) {
+    match tri_state(selection, selector) {
+        TriState::Default => selection.include.push(selector.to_string()),
+        TriState::Include => {
+            selection.include.retain(|s| s != selector);
+            selection.exclude.push(selector.to_string());
+        }
+        TriState::Exclude => {
+            selection.exclude.retain(|s| s != selector);
+            selection.include.retain(|s| s != selector);
+        }
+    }
+}
+
+/// The editor's session line (spec D11): `session: none` for an
+/// unauthenticated profile; for an observed one, the preview of the first
+/// origin as `session: observed · <cookie and header names> (names) ·
+/// canary <METHOD> <path>`, or what is still missing (an origin, or the
+/// preview the reducer asked for). Names only ever reach this line: the
+/// type carries none of the values (D7) and [`ProfilesState::fold_preview`]
+/// cuts a name at any `=`.
+pub fn session_line(editor: &ProfileEditor, previews: &BTreeMap<String, SessionProfile>) -> String {
+    if editor.draft.session.mode == SessionMode::None {
+        return "session: none".to_string();
+    }
+    let Some(origin) = editor.draft.target.origins.first() else {
+        return "session: observed · add an origin (o) to preview it".to_string();
+    };
+    let Some(preview) = previews.get(origin) else {
+        return "session: observed · preview pending".to_string();
+    };
+    let names: Vec<&str> = preview
+        .cookies
+        .iter()
+        .chain(preview.headers.iter())
+        .map(String::as_str)
+        .collect();
+    let names = if names.is_empty() {
+        "no session names".to_string()
+    } else {
+        names.join(", ")
+    };
+    let canary = match &preview.canary {
+        Canary::None => "canary none".to_string(),
+        Canary::Flow { method, path, .. } => format!("canary {} {path}", token(method)),
+    };
+    format!("session: observed · {names} (names) · {canary}")
+}
+
+/// Whether a wire string may be used as a selector or a name the TUI sends
+/// back verbatim: non-empty and at most [`SELECTOR_MAX`] bytes.
+fn usable_selector(s: &str) -> bool {
+    !s.is_empty() && s.len() <= SELECTOR_MAX
+}
+
+/// [`truncate`] to [`VALUE_MAX`], skipping the walk when the string is
+/// within the cap in bytes.
+fn cut(s: &mut String) {
+    if s.len() > VALUE_MAX {
+        *s = truncate(s, VALUE_MAX);
+    }
+}
+
+/// A session name as the line may show it: cut at the first `=`, `;` or
+/// whitespace (a name has none; a core that sends `name=value` leaks
+/// nothing past the name), then bounded.
+fn session_name(name: &str) -> String {
+    let end = name
+        .find(|c: char| c == '=' || c == ';' || c.is_whitespace())
+        .unwrap_or(name.len());
+    let mut s = name[..end].to_string();
+    cut(&mut s);
+    s
+}
+
+impl ProfilesState {
+    /// Fold a `scan.profile.list` reply (spec D10). Hostile-core bounds
+    /// (D6): a row whose name is empty or longer than [`SELECTOR_MAX`] is
+    /// dropped (the name is the key `scan.profile.get` takes back), the
+    /// list is cut to [`PROFILES_MAX`], and the cursor is clamped.
+    pub fn fold_list(&mut self, mut list: ProfileListResult) {
+        list.profiles.retain(|p| usable_selector(&p.name));
+        list.profiles.truncate(PROFILES_MAX);
+        self.list = list.profiles;
+        self.cursor = self.cursor.min(self.list.len().saturating_sub(1));
+    }
+
+    /// Fold a `scan.checks` reply (spec D10). Hostile-core bounds: a check
+    /// whose id or class is unusable as a selector is dropped, the
+    /// catalogue is cut to [`CHECKS_MAX`], the display strings to
+    /// [`VALUE_MAX`] cells, the lane list to its four distinct values, and
+    /// the tree cursor is clamped onto the rebuilt tree.
+    pub fn fold_checks(&mut self, mut result: ChecksResult) {
+        result
+            .checks
+            .retain(|c| usable_selector(&c.id) && usable_selector(&c.class));
+        result.checks.truncate(CHECKS_MAX);
+        for check in &mut result.checks {
+            cut(&mut check.name);
+            cut(&mut check.description);
+            if let Some(r) = check.remediation.as_mut() {
+                cut(r);
+            }
+            check.lanes.sort();
+            check.lanes.dedup();
+            check.kinds.truncate(32);
+            if let Some(t) = check.wants_traits.as_mut() {
+                t.truncate(32);
+            }
+        }
+        self.checks = result.checks;
+        if let Some(editor) = self.editor.as_mut() {
+            let rows = check_tree(&self.checks, &editor.collapsed).len();
+            editor.tree_cursor = editor.tree_cursor.min(rows.saturating_sub(1));
+        }
+    }
+
+    /// Fold a `scan.session.preview` reply for `origin` (the tag's key).
+    /// Names only are kept, each cut at any `=` and bounded, at most
+    /// [`SESSION_NAMES_MAX`] of each kind; the map is emptied before it
+    /// would grow past [`PREVIEWS_MAX`] origins.
+    pub fn fold_preview(&mut self, origin: &str, mut preview: SessionProfile) {
+        preview.cookies.truncate(SESSION_NAMES_MAX);
+        preview.headers.truncate(SESSION_NAMES_MAX);
+        for name in preview.cookies.iter_mut().chain(preview.headers.iter_mut()) {
+            *name = session_name(name);
+        }
+        cut(&mut preview.origin);
+        if let Canary::Flow { path, .. } = &mut preview.canary {
+            cut(path);
+        }
+        if self.previews.len() >= PREVIEWS_MAX && !self.previews.contains_key(origin) {
+            self.previews.clear();
+        }
+        self.previews.insert(origin.to_string(), preview);
+    }
+
+    /// The row under the list cursor.
+    pub fn cursor_entry(&self) -> Option<&ProfileListEntry> {
+        self.list.get(self.cursor)
+    }
+
+    /// The flattened check tree for the open editor's collapse state (an
+    /// empty tree without one).
+    pub fn tree(&self) -> Vec<TreeNode> {
+        match &self.editor {
+            Some(e) => check_tree(&self.checks, &e.collapsed),
+            None => Vec::new(),
+        }
+    }
+
+    /// The tree node under the Checks cursor.
+    pub fn cursor_node(&self) -> Option<TreeNode> {
+        let editor = self.editor.as_ref()?;
+        check_tree(&self.checks, &editor.collapsed)
+            .into_iter()
+            .nth(editor.tree_cursor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +1060,75 @@ mod tests {
             Ok("https://H:443".to_string()),
             "a typed port is kept as typed"
         );
+    }
+
+    #[test]
+    fn toggle_selector_cycles_one_selector_only() {
+        let mut sel = CheckSelection {
+            include: vec!["a".into()],
+            exclude: vec!["b".into()],
+        };
+        toggle_selector(&mut sel, "c");
+        assert_eq!(sel.include, vec!["a".to_string(), "c".to_string()]);
+        toggle_selector(&mut sel, "c");
+        assert_eq!(sel.include, vec!["a".to_string()]);
+        assert_eq!(sel.exclude, vec!["b".to_string(), "c".to_string()]);
+        toggle_selector(&mut sel, "c");
+        assert_eq!(sel.include, vec!["a".to_string()]);
+        assert_eq!(sel.exclude, vec!["b".to_string()]);
+        // Listed in both: exclude wins, and the next toggle clears both.
+        let mut both = CheckSelection {
+            include: vec!["x".into()],
+            exclude: vec!["x".into()],
+        };
+        assert_eq!(tri_state(&both, "x"), TriState::Exclude);
+        toggle_selector(&mut both, "x");
+        assert_eq!(both, CheckSelection::default());
+    }
+
+    #[test]
+    fn session_names_are_cut_at_the_first_separator() {
+        assert_eq!(session_name("sid"), "sid");
+        assert_eq!(session_name("sid=abc"), "sid");
+        assert_eq!(session_name("sid; Path=/"), "sid");
+        assert_eq!(session_name("x y"), "x");
+        assert_eq!(session_name("=v"), "");
+    }
+
+    #[test]
+    fn every_field_has_a_kind_and_a_text() {
+        // The name is the one field whose text may be empty (an unnamed
+        // draft prefills an empty prompt), so the draft gets one here.
+        let editor = ProfileEditor::new(
+            ScanProfile {
+                name: "named".into(),
+                ..ScanProfile::default()
+            },
+            None,
+            false,
+        );
+        for (i, f) in EDITOR_FIELDS.iter().enumerate() {
+            let mut e = editor.clone();
+            e.field = i;
+            assert_eq!(e.field(), *f);
+            assert!(!e.field_text().is_empty(), "{f:?} prints something");
+        }
+        let mut e = editor.clone();
+        assert!(!e.cycle(EditorField::Name), "a text field does not cycle");
+        assert!(!e.dirty);
+        assert!(e.cycle(EditorField::LaneL4Stream));
+        assert_eq!(e.draft.lanes, vec![LaneKind::Http, LaneKind::L4Stream]);
+        assert!(e.dirty);
+        assert_eq!(
+            e.set_text(EditorField::Speed, "fast"),
+            Err("speed is not a text field".to_string())
+        );
+        assert_eq!(
+            e.set_text(EditorField::BudgetTimeS, "-1"),
+            Err("budget_time_s must be a number".to_string())
+        );
+        assert_eq!(e.set_text(EditorField::BudgetTimeS, " 90 "), Ok(()));
+        assert_eq!(e.draft.budget.time_s, 90);
     }
 
     #[test]

@@ -712,6 +712,23 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
                 let _ = app.update(Action::OpenBrowser);
                 let _ = app.update(Action::BrowserEvalPrompt);
             }
+            // The Profiles editor's prompts (scanner v2, plan task 10): all
+            // four need an open editor, `w` needs the save verb on the bus.
+            PromptKind::ScanOrigin
+            | PromptKind::ScanField
+            | PromptKind::ScanProfileName
+            | PromptKind::ScanL4Target => {
+                app.tools.extend(tools(&["scan.profile.save"]));
+                let _ = app.update(Action::OpenScan);
+                let _ = app.update(Action::ScanTab(aitm_tui::scan::ScanTab::Profiles));
+                let _ = app.update(Action::ScanNewProfile);
+                let _ = app.update(match kind {
+                    PromptKind::ScanOrigin => Action::ScanOriginPrompt,
+                    PromptKind::ScanField => Action::ScanEdit,
+                    PromptKind::ScanProfileName => Action::ScanSave,
+                    _ => Action::ScanL4TargetPrompt,
+                });
+            }
         }
         assert_eq!(app.mode, Mode::Prompt(kind), "{kind:?} opens");
     };
@@ -728,6 +745,10 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
         (PromptKind::Confirm, Mode::Ca),
         (PromptKind::BrowserUrl, Mode::Browser),
         (PromptKind::BrowserEval, Mode::Browser),
+        (PromptKind::ScanOrigin, Mode::Scan),
+        (PromptKind::ScanField, Mode::Scan),
+        (PromptKind::ScanProfileName, Mode::Scan),
+        (PromptKind::ScanL4Target, Mode::Scan),
     ];
     for (kind, home) in cases {
         let mut app = fixture_app(200, 50);

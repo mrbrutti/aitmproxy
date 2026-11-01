@@ -13,8 +13,10 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use aitm_scan_model::{
-    Issue, IssueStatus, IssuesResult, JobEvent, JobId, JobNotification, JobStatus, ListResult,
-    Phase, SitemapResult, JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
+    is_builtin_name, ChecksResult, Issue, IssueStatus, IssuesResult, JobEvent, JobId,
+    JobNotification, JobStatus, ListResult, Phase, ProfileDeleteResult, ProfileListResult,
+    ProfileSaveResult, ScanProfile, SessionMode, SessionProfile, SitemapResult, JOB_KIND_SCAN,
+    JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
@@ -29,11 +31,13 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, parse_result, state_text, status_token, step, tag_keyed, tag_parts, typed_origin,
-    Dir, IssueFilterKey, IssuePane, JobPane, MapSource, ScanError, ScanOffer, ScanState, ScanTab,
-    ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
+    is_job_id, parse_l4_target, parse_result, state_text, status_token, step, tag_keyed, tag_parts,
+    typed_origin, Dir, FieldKind, IssueFilterKey, IssuePane, JobPane, MapSource, ProfileEditor,
+    ProfilePane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
+    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
     SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
+use crate::text::truncate;
 use crate::theme::Theme;
 use crate::viewers::json;
 
@@ -122,6 +126,18 @@ pub enum PromptKind {
     BrowserUrl,
     /// Browser view `e`: a JavaScript expression for `browser.eval`.
     BrowserEval,
+    /// Profiles `o`: an origin to add to the draft, typed (scanner v2 spec
+    /// D4, D8).
+    ScanOrigin,
+    /// Profiles `e` on a number or text field: the new value, prefilled
+    /// with the current one (spec D4).
+    ScanField,
+    /// Profiles `w` on a builtin or an unnamed draft: the name to save it
+    /// under (spec D4).
+    ScanProfileName,
+    /// Profiles `t`: an L4 target as `ip:port[/tcp|udp][ grammar]` (spec
+    /// D4).
+    ScanL4Target,
 }
 
 /// The last `browser.screenshot`: its header facts and the bytes `o` hands
@@ -172,6 +188,30 @@ pub struct BrowserState {
 /// edges, the strip-and-banner row, a heading row, a rule, a detail line and
 /// one spare footer row (spec D11, plan task 4).
 const SCAN_CHROME_ROWS: u16 = 10;
+
+/// The widest a profile name grows in a `saved` / `deleted` toast, in cells
+/// (D6 hostile-core bounds; plan task 10).
+const SAVED_NAME_MAX: usize = 80;
+
+/// The widest a saved profile's path grows in its toast, in cells.
+const SAVED_PATH_MAX: usize = 200;
+
+/// What the Profiles keys say when no editor is open (plan task 10).
+const NO_EDITOR: &str = "open a profile first (Enter on a row, or N for a new one)";
+
+/// The tag a confirmed `scan.*` call leaves under (spec D4), so the
+/// one-line `y/N` prompt and the tagged path meet: `scan.profile.delete`
+/// is keyed by the `name` it deletes. `None` for a call that is not a
+/// scanner verb, which keeps the plain `Call` path.
+fn scan_confirm_tag(name: &str, args: &Value) -> Option<String> {
+    match name {
+        "scan.profile.delete" => Some(tag_keyed(
+            name,
+            args.get("name").and_then(Value::as_str).unwrap_or_default(),
+        )),
+        _ => None,
+    }
+}
 
 /// One step of a Scan cursor or scroll over `len` entries (D11): `Up`/`Down`
 /// by one, `PageUp`/`PageDown` by `page`, `Home`/`End` to the ends, any
@@ -1453,6 +1493,11 @@ impl App {
                             usize::try_from((self.compose.field as i64 + i64::from(d)).clamp(0, 3))
                                 .unwrap_or(0)
                     }
+                    // Scan (plan task 10): in the Checks pane ← collapses
+                    // and → (`l`) expands the node under the cursor;
+                    // elsewhere in the view the keys do nothing (the chips
+                    // are the flow list's).
+                    Mode::Scan => self.scan_tree_fold(dir == Dir::Prev),
                     _ => self.chip = step(&Chip::ALL, self.chip, dir),
                 }
             }
@@ -1473,7 +1518,13 @@ impl App {
                         self.open_flow(id, "finding capture is not in the flow store", &mut out);
                     }
                 }
-                // Scan: ⏎ acts per tab (D11). On Jobs it opens the Issues
+                // Scan: ⏎ acts per tab (D11). On Profiles it opens the
+                // row's editor, edits the field, adds the origin or acts on
+                // the tree node, by pane (plan task 10).
+                Mode::Scan if self.scan.tab == ScanTab::Profiles => {
+                    self.profiles_enter(&mut out);
+                }
+                // On Jobs it opens the Issues
                 // tab filtered to the cursor's job and asks for its issues
                 // once (D6, "entering Issues, any filter change"); the
                 // legacy Jobs row has no job, so nothing happens there (D12).
@@ -1814,6 +1865,11 @@ impl App {
                 if self.scan.tab == ScanTab::SiteMap {
                     self.request_sitemap(None, &mut out);
                 }
+                // And for Profiles (D6, "entering Profiles the first
+                // time"): the list and the check catalogue, while empty.
+                if self.scan.tab == ScanTab::Profiles {
+                    self.enter_profiles(&mut out);
+                }
             }
             Action::ScanLaunch => {
                 if self.scan.legacy.running {
@@ -1831,6 +1887,15 @@ impl App {
             Action::ScanIssueStatus(status) => self.scan_issue_status(status, &mut out),
             Action::ScanOpenPoc => self.scan_open_poc(),
             Action::ScanNextPage => self.scan_next_page(&mut out),
+            Action::ScanEdit => self.scan_edit(&mut out),
+            Action::ScanToggle => self.scan_toggle(),
+            Action::ScanSave => self.scan_save(&mut out),
+            Action::ScanDelete => self.scan_delete(),
+            Action::ScanNewProfile => self.scan_new_profile(),
+            Action::ScanOriginPrompt => self.scan_origin_prompt(),
+            Action::ScanOriginAdd => self.scan_origin_add(&mut out),
+            Action::ScanOriginRemove => self.scan_origin_remove(),
+            Action::ScanL4TargetPrompt => self.scan_l4_target_prompt(),
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -2428,6 +2493,13 @@ impl App {
         };
         self.mode = c.return_to;
         if yes {
+            // A `scan.*` verb leaves through the tagged path (spec D4):
+            // `scan.profile.delete` under `scan.profile.delete:<name>`.
+            if let Some(tag) = scan_confirm_tag(&c.name, &c.args) {
+                let mut out = Vec::new();
+                self.scan_call(tag, &c.name, c.args, &mut out);
+                return out;
+            }
             vec![BusRequest::Call {
                 name: c.name,
                 args: c.args,
@@ -2706,6 +2778,40 @@ impl App {
                     self.browser_call("browser.eval", json!({ key: text }), &mut out);
                 }
             }
+            Mode::Prompt(PromptKind::ScanOrigin) => {
+                self.close_prompt();
+                self.submit_scan_origin(&text, &mut out);
+            }
+            // A blank line is a "no" (nothing changes, the prompt closes,
+            // like every other prompt); a refused value keeps the prompt
+            // open with the line cleared (the filter prompt's convention),
+            // so the operator tries again or leaves with Esc.
+            Mode::Prompt(PromptKind::ScanField) if text.is_empty() => self.close_prompt(),
+            Mode::Prompt(PromptKind::ScanField) => match self.submit_scan_field(&text) {
+                Ok(()) => self.close_prompt(),
+                Err(e) => {
+                    self.toast(Level::Error, e);
+                    self.prompt.clear();
+                }
+            },
+            Mode::Prompt(PromptKind::ScanL4Target) if text.is_empty() => self.close_prompt(),
+            Mode::Prompt(PromptKind::ScanL4Target) => match self.submit_scan_l4_target(&text) {
+                Ok(()) => self.close_prompt(),
+                Err(e) => {
+                    self.toast(Level::Error, e);
+                    self.prompt.clear();
+                }
+            },
+            Mode::Prompt(PromptKind::ScanProfileName) if text.is_empty() => self.close_prompt(),
+            Mode::Prompt(PromptKind::ScanProfileName) => {
+                match self.submit_scan_profile_name(&text, &mut out) {
+                    Ok(()) => self.close_prompt(),
+                    Err(e) => {
+                        self.toast(Level::Error, e);
+                        self.prompt.clear();
+                    }
+                }
+            }
             Mode::Compose => {
                 if self.compose.field < 3 {
                     self.compose.field += 1;
@@ -2818,6 +2924,18 @@ impl App {
                             let n = issues.detail_len();
                             scroll(&mut issues.detail_scroll, action, n, page);
                             issues.follow_flow = false;
+                        }
+                    }
+                } else if self.scan.tab == ScanTab::Profiles
+                    && self.scan.profiles.pane == ProfilePane::Checks
+                {
+                    // The Checks pane walks the flattened tree's rows
+                    // (lanes, classes and checks), not the catalogue's
+                    // entries (plan task 10).
+                    let rows = self.scan.profiles.tree().len();
+                    if let Some(editor) = self.scan.profiles.editor.as_mut() {
+                        if rows > 0 {
+                            editor.tree_cursor = walk(action, editor.tree_cursor, rows, page);
                         }
                     }
                 } else if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
@@ -3461,6 +3579,9 @@ impl App {
     /// Fold a bus event in; may ask for more work (details for new rows).
     pub fn on_bus(&mut self, event: BusEvent) -> Vec<BusRequest> {
         let mut out = Vec::new();
+        // The origin picker reads the scope and the captured flows (D8):
+        // an open editor's rows follow them.
+        let origins_moved = matches!(event, BusEvent::Flows(_) | BusEvent::Scope(_));
         match event {
             BusEvent::Connected {
                 server,
@@ -4044,6 +4165,9 @@ impl App {
                 self.on_scan_failed(&tag, message, &mut out)
             }
         }
+        if origins_moved {
+            self.refresh_origin_choices();
+        }
         out
     }
 
@@ -4179,6 +4303,12 @@ impl App {
         }
         if entering && tab == ScanTab::SiteMap {
             self.request_sitemap(None, out);
+        }
+        // Profiles reads its list and catalogue while they are empty (D6,
+        // "entering Profiles the first time"): pressing `1` on the tab
+        // itself retries a read that failed or was lost.
+        if tab == ScanTab::Profiles {
+            self.enter_profiles(out);
         }
     }
 
@@ -4337,6 +4467,450 @@ impl App {
                 .is_some_and(|s| !s.is_terminal()),
             None => !self.scan.jobs.live().is_empty(),
         }
+    }
+
+    // ------------------------------------------------------ scan: Profiles
+
+    /// Entering Profiles (D6): `scan.profile.list {}` while the list is
+    /// empty and `scan.checks {}` while the catalogue is, each quiet when
+    /// the bus lacks the verb (the tab's degraded text says so) and
+    /// deduped by its tag while in flight.
+    fn enter_profiles(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.profiles.list.is_empty() {
+            self.request_profile_list(out);
+        }
+        if self.scan.profiles.checks.is_empty() {
+            self.scan_poll("scan.checks".to_string(), "scan.checks", json!({}), out);
+        }
+    }
+
+    /// `scan.profile.list {}` under its single-slot tag: the entry read and
+    /// the refresh after a save or a delete (D6).
+    fn request_profile_list(&mut self, out: &mut Vec<BusRequest>) {
+        self.scan_poll(
+            "scan.profile.list".to_string(),
+            "scan.profile.list",
+            json!({}),
+            out,
+        );
+    }
+
+    /// Profiles ⏎ by pane (D11): on the List it reads the row's profile
+    /// (`scan.profile.get {name}` under `scan.profile.get:<name>`); on
+    /// Fields it edits the field; on Origins it adds the highlighted row;
+    /// on Checks it expands a collapsed node, else cycles the node's state.
+    fn profiles_enter(&mut self, out: &mut Vec<BusRequest>) {
+        match self.scan.profiles.pane {
+            ProfilePane::List => {
+                let Some(name) = self.scan.profiles.cursor_entry().map(|p| p.name.clone()) else {
+                    return;
+                };
+                self.scan_call(
+                    tag_keyed("scan.profile.get", &name),
+                    "scan.profile.get",
+                    json!({ "name": name }),
+                    out,
+                );
+            }
+            ProfilePane::Fields => self.scan_edit(out),
+            ProfilePane::Origins => self.scan_origin_add(out),
+            ProfilePane::Checks => {
+                let Some(node) = self.scan.profiles.cursor_node() else {
+                    return;
+                };
+                let Some(editor) = self.scan.profiles.editor.as_mut() else {
+                    return;
+                };
+                if editor.collapsed.remove(&node.selector) {
+                    return;
+                }
+                editor.toggle_node(&node.selector);
+                self.recompute_launch_gate();
+            }
+        }
+    }
+
+    /// A `scan.profile.get` reply, or `N`: show `editor` with the Fields
+    /// pane focused, its picker rows from the scope and the flows (D8), and
+    /// read the session preview an observed profile with an origin needs
+    /// (D6).
+    fn open_editor(&mut self, editor: ProfileEditor, out: &mut Vec<BusRequest>) {
+        self.scan.profiles.editor = Some(editor);
+        self.scan.profiles.pane = ProfilePane::Fields;
+        self.refresh_origin_choices();
+        self.request_session_preview(out);
+        self.recompute_launch_gate();
+    }
+
+    /// Rebuild the open editor's picker rows from the scope and the flows
+    /// (D8); nothing without an editor.
+    fn refresh_origin_choices(&mut self) {
+        if let Some(editor) = self.scan.profiles.editor.as_mut() {
+            editor.refresh_origins(&self.scope, &self.flows);
+        }
+    }
+
+    /// `scan.session.preview {target: first origin}` under
+    /// `scan.session.preview:<origin>` when the draft's session is observed,
+    /// it has an origin and no preview for it is held (D6). Quiet when the
+    /// bus lacks the verb: the session line is a display.
+    fn request_session_preview(&mut self, out: &mut Vec<BusRequest>) {
+        let Some(editor) = self.scan.profiles.editor.as_ref() else {
+            return;
+        };
+        if editor.draft.session.mode != SessionMode::Observed {
+            return;
+        }
+        let Some(origin) = editor.draft.target.origins.first().cloned() else {
+            return;
+        };
+        if self.scan.profiles.previews.contains_key(&origin) {
+            return;
+        }
+        self.scan_poll(
+            tag_keyed("scan.session.preview", &origin),
+            "scan.session.preview",
+            json!({ "target": origin }),
+            out,
+        );
+    }
+
+    /// The UI-3 launch gate (spec D7): recomputed on every draft change.
+    /// Plan task 12 fills it; until then the gate is open.
+    fn recompute_launch_gate(&mut self) {}
+
+    /// Profiles `N` (D11): a fresh editor over the defaults.
+    fn scan_new_profile(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        let mut out = Vec::new();
+        self.open_editor(
+            ProfileEditor::new(ScanProfile::default(), None, false),
+            &mut out,
+        );
+        debug_assert!(out.is_empty(), "a default profile has no origin to preview");
+    }
+
+    /// Profiles `e` (D11): edit the field under the Fields cursor by its
+    /// kind; inert off the tab or without an editor (a toast says what to
+    /// open).
+    fn scan_edit(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        };
+        let field = editor.field();
+        match field.kind() {
+            FieldKind::Cycle | FieldKind::Toggle => {
+                if editor.cycle(field) {
+                    self.recompute_launch_gate();
+                    // A session switched to observed may now need its
+                    // preview.
+                    self.request_session_preview(out);
+                }
+            }
+            FieldKind::Text | FieldKind::Number => {
+                let text = editor.field_text();
+                self.open_prompt(PromptKind::ScanField);
+                self.prompt = text;
+            }
+            FieldKind::Origins => self.scan.profiles.pane = ProfilePane::Origins,
+            FieldKind::Checks => self.scan.profiles.pane = ProfilePane::Checks,
+            FieldKind::L4Targets => self.open_prompt(PromptKind::ScanL4Target),
+        }
+    }
+
+    /// Profiles Space (D11): flip a lane or bool field on the Fields pane,
+    /// or cycle the tri-state of the tree node under the Checks cursor.
+    fn scan_toggle(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        match self.scan.profiles.pane {
+            ProfilePane::Fields => {
+                let Some(editor) = self.scan.profiles.editor.as_mut() else {
+                    self.toast(Level::Info, NO_EDITOR);
+                    return;
+                };
+                let field = editor.field();
+                if field.kind() == FieldKind::Toggle && editor.cycle(field) {
+                    self.recompute_launch_gate();
+                }
+            }
+            ProfilePane::Checks => {
+                let Some(node) = self.scan.profiles.cursor_node() else {
+                    return;
+                };
+                if let Some(editor) = self.scan.profiles.editor.as_mut() {
+                    editor.toggle_node(&node.selector);
+                    self.recompute_launch_gate();
+                }
+            }
+            ProfilePane::List | ProfilePane::Origins => {}
+        }
+    }
+
+    /// Profiles ← / → (`h` / `l`) in the Checks pane: collapse or expand
+    /// the lane or class node under the cursor (a check node has nothing
+    /// under it). Nothing elsewhere in the view.
+    fn scan_tree_fold(&mut self, collapse: bool) {
+        if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Checks {
+            return;
+        }
+        let Some(node) = self.scan.profiles.cursor_node() else {
+            return;
+        };
+        if node.id.is_some() {
+            return;
+        }
+        if let Some(editor) = self.scan.profiles.editor.as_mut() {
+            if collapse {
+                editor.collapsed.insert(node.selector);
+            } else {
+                editor.collapsed.remove(&node.selector);
+            }
+            let rows = self.scan.profiles.tree().len();
+            if let Some(editor) = self.scan.profiles.editor.as_mut() {
+                editor.tree_cursor = editor.tree_cursor.min(rows.saturating_sub(1));
+            }
+        }
+    }
+
+    /// Profiles `o` (D11): the typed-origin prompt; needs an editor.
+    fn scan_origin_prompt(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        if self.scan.profiles.editor.is_none() {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        }
+        self.open_prompt(PromptKind::ScanOrigin);
+    }
+
+    /// The `o` prompt's line (D8): the typed origin keeps its scheme, a bare
+    /// host gets the rule's; a host the scope does not cover is refused
+    /// with the one toast and nothing changes; otherwise the origin joins
+    /// the draft and the picker, and an observed session reads its preview.
+    fn submit_scan_origin(&mut self, text: &str, out: &mut Vec<BusRequest>) {
+        if text.is_empty() {
+            return;
+        }
+        let origin = match typed_origin(text, &self.flows) {
+            Ok(origin) => origin,
+            Err(reason) => {
+                self.toast(Level::Warn, reason);
+                return;
+            }
+        };
+        let host = crate::scan::scan_host(&origin);
+        if host.is_empty() || !scope_covers(&self.scope, &host) {
+            self.toast(
+                Level::Warn,
+                format!("Out of scope: add `{host}` to scope to scan it"),
+            );
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        };
+        editor.note_typed_origin(&origin);
+        if editor.add_origin(&origin) {
+            self.recompute_launch_gate();
+            self.request_session_preview(out);
+        }
+    }
+
+    /// Profiles `a` in the Origins pane (D11): the highlighted picker row
+    /// joins the draft.
+    fn scan_origin_add(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Origins {
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return;
+        };
+        let Some(origin) = editor.highlighted_origin().map(str::to_string) else {
+            return;
+        };
+        if editor.add_origin(&origin) {
+            self.recompute_launch_gate();
+            self.request_session_preview(out);
+        }
+    }
+
+    /// Profiles `d` in the Origins pane (D11): the highlighted row's origin
+    /// leaves the draft.
+    fn scan_origin_remove(&mut self) {
+        if self.scan.tab != ScanTab::Profiles || self.scan.profiles.pane != ProfilePane::Origins {
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return;
+        };
+        let Some(origin) = editor.highlighted_origin().map(str::to_string) else {
+            return;
+        };
+        if editor.remove_origin(&origin) {
+            self.recompute_launch_gate();
+        }
+    }
+
+    /// Profiles `t` (D11): the L4 target prompt; needs an editor.
+    fn scan_l4_target_prompt(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        if self.scan.profiles.editor.is_none() {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        }
+        self.open_prompt(PromptKind::ScanL4Target);
+    }
+
+    /// The `t` prompt's line: parsed by [`parse_l4_target`], added once.
+    fn submit_scan_l4_target(&mut self, text: &str) -> Result<(), String> {
+        let target = parse_l4_target(text)?;
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return Err(NO_EDITOR.to_string());
+        };
+        if editor.add_l4_target(target) {
+            self.recompute_launch_gate();
+        }
+        Ok(())
+    }
+
+    /// The `ScanField` prompt's line: written into the field under the
+    /// Fields cursor (the one `e` opened the prompt on).
+    fn submit_scan_field(&mut self, text: &str) -> Result<(), String> {
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return Err(NO_EDITOR.to_string());
+        };
+        let field = editor.field();
+        editor.set_text(field, text)?;
+        self.recompute_launch_gate();
+        Ok(())
+    }
+
+    /// Profiles `w` (D11): `scan.profile.save {profile}` with the draft
+    /// serialised with serde (D3: the whole typed copy); a builtin, a
+    /// builtin's name or an unnamed draft asks `ScanProfileName` first.
+    fn scan_save(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_ref() else {
+            self.toast(Level::Info, NO_EDITOR);
+            return;
+        };
+        if !self.has_tool("scan.profile.save") {
+            let err = ScanError::missing_verb("scan.profile.save");
+            self.toast(Level::Warn, err.wording());
+            self.scan.set_error(err);
+            return;
+        }
+        let name = editor.draft.name.trim();
+        if editor.builtin || name.is_empty() || is_builtin_name(name) {
+            self.open_prompt(PromptKind::ScanProfileName);
+            return;
+        }
+        self.send_profile_save(out);
+    }
+
+    /// The `ScanProfileName` prompt's line: a non-empty name that is not a
+    /// builtin's replaces `draft.name`, then the draft is saved.
+    fn submit_scan_profile_name(
+        &mut self,
+        text: &str,
+        out: &mut Vec<BusRequest>,
+    ) -> Result<(), String> {
+        if is_builtin_name(text) {
+            return Err(format!("{text} is a builtin profile; pick another name"));
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+            return Err(NO_EDITOR.to_string());
+        };
+        editor.draft.name = text.to_string();
+        editor.dirty = true;
+        self.send_profile_save(out);
+        Ok(())
+    }
+
+    /// `scan.profile.save {profile: <draft>}` under its single-slot tag.
+    fn send_profile_save(&mut self, out: &mut Vec<BusRequest>) {
+        let Some(editor) = self.scan.profiles.editor.as_ref() else {
+            return;
+        };
+        let profile = match serde_json::to_value(&editor.draft) {
+            Ok(v) => v,
+            Err(e) => {
+                self.toast(
+                    Level::Error,
+                    format!("profile could not be serialised: {e}"),
+                );
+                return;
+            }
+        };
+        self.scan_call(
+            "scan.profile.save".to_string(),
+            "scan.profile.save",
+            json!({ "profile": profile }),
+            out,
+        );
+    }
+
+    /// Profiles `D` (D11): the non-builtin under the cursor (the List
+    /// row, or the open editor's profile off the List pane) goes through
+    /// the one-line `y/N` prompt, "delete profile <name>? y/N"; `y` sends
+    /// `scan.profile.delete {name}` under `scan.profile.delete:<name>`
+    /// ([`App::answer_confirm`]). A builtin is refused without a prompt.
+    fn scan_delete(&mut self) {
+        if self.scan.tab != ScanTab::Profiles {
+            return;
+        }
+        let target = if self.scan.profiles.pane == ProfilePane::List {
+            self.scan
+                .profiles
+                .cursor_entry()
+                .map(|p| (p.name.clone(), p.builtin))
+        } else {
+            self.scan.profiles.editor.as_ref().and_then(|e| {
+                e.loaded_from
+                    .as_ref()
+                    .map(|name| (name.clone(), e.builtin || is_builtin_name(name)))
+            })
+        };
+        let Some((name, builtin)) = target else {
+            return;
+        };
+        if builtin {
+            self.toast(
+                Level::Info,
+                format!(
+                    "{} is a builtin profile and cannot be deleted",
+                    truncate(&name, SAVED_NAME_MAX)
+                ),
+            );
+            return;
+        }
+        if !self.has_tool("scan.profile.delete") {
+            let err = ScanError::missing_verb("scan.profile.delete");
+            self.toast(Level::Warn, err.wording());
+            self.scan.set_error(err);
+            return;
+        }
+        self.confirm = Some(ConfirmCall {
+            name: "scan.profile.delete".to_string(),
+            description: format!("delete profile {name}? y/N"),
+            args: json!({ "name": name }),
+            return_to: Mode::Scan,
+        });
+        self.open_prompt(PromptKind::Confirm);
     }
 
     /// Jobs `x` (spec D11): `scan.cancel {job}` for the cursor's job under
@@ -4543,6 +5117,88 @@ impl App {
                 match self.scan_reply::<SitemapResult>(tag, &value) {
                     Some(result) => self.scan.sitemap.fold_result(result),
                     None => self.scan.sitemap.appending = false,
+                }
+            }
+            "scan.profile.list" => {
+                if let Some(list) = self.scan_reply::<ProfileListResult>(tag, &value) {
+                    self.scan.profiles.fold_list(list);
+                }
+            }
+            "scan.checks" => {
+                if let Some(result) = self.scan_reply::<ChecksResult>(tag, &value) {
+                    self.scan.profiles.fold_checks(result);
+                }
+            }
+            "scan.profile.get" => {
+                // The same hostile-core bound as `scan.status`: the profile
+                // is folded only under the name the tag asked for, so a
+                // reply cannot swap another profile into the editor.
+                if let Some(profile) = self.scan_reply_keyed::<ScanProfile>(
+                    tag,
+                    &value,
+                    |p: &ScanProfile| p.name.as_str(),
+                    OTHER_PROFILE,
+                ) {
+                    let name = profile.name.clone();
+                    let builtin = self
+                        .scan
+                        .profiles
+                        .list
+                        .iter()
+                        .find(|p| p.name == name)
+                        .map_or_else(|| is_builtin_name(&name), |p| p.builtin);
+                    self.open_editor(ProfileEditor::new(profile, Some(name), builtin), out);
+                }
+            }
+            "scan.profile.save" => {
+                if let Some(saved) = self.scan_reply::<ProfileSaveResult>(tag, &value) {
+                    let name = truncate(&saved.saved, SAVED_NAME_MAX);
+                    let path = truncate(&saved.path, SAVED_PATH_MAX);
+                    self.toast(Level::Info, format!("saved {name} at {path}"));
+                    if let Some(editor) = self.scan.profiles.editor.as_mut() {
+                        editor.dirty = false;
+                        editor.builtin = false;
+                        editor.loaded_from = Some(saved.saved);
+                    }
+                    self.request_profile_list(out);
+                }
+            }
+            "scan.profile.delete" => {
+                // The result names no profile; the tag's key does.
+                let name = tag_parts(tag).1.unwrap_or_default().to_string();
+                if let Some(result) = self.scan_reply::<ProfileDeleteResult>(tag, &value) {
+                    let shown = truncate(&name, SAVED_NAME_MAX);
+                    if result.deleted {
+                        self.toast(Level::Info, format!("deleted {shown}"));
+                    } else {
+                        self.toast(Level::Warn, format!("{shown} was not a saved profile"));
+                    }
+                    // The editor over the deleted profile is stale: close it.
+                    if self
+                        .scan
+                        .profiles
+                        .editor
+                        .as_ref()
+                        .is_some_and(|e| e.loaded_from.as_deref() == Some(name.as_str()))
+                    {
+                        self.scan.profiles.editor = None;
+                        self.scan.profiles.pane = ProfilePane::List;
+                        self.recompute_launch_gate();
+                    }
+                    self.request_profile_list(out);
+                }
+            }
+            "scan.session.preview" => {
+                // Folded only under the origin the tag asked for (names
+                // only are in the type, D7).
+                if let Some(preview) = self.scan_reply_keyed::<SessionProfile>(
+                    tag,
+                    &value,
+                    |p: &SessionProfile| p.origin.as_str(),
+                    OTHER_ORIGIN,
+                ) {
+                    let origin = tag_parts(tag).1.unwrap_or_default().to_string();
+                    self.scan.profiles.fold_preview(&origin, preview);
                 }
             }
             "scan.issue" | "scan.issue.update" => {

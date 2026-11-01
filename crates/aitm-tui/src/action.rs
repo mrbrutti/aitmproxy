@@ -104,6 +104,38 @@ pub enum Action {
     /// `next_cursor` the last reply carried, appending it (spec D11); inert
     /// without one.
     ScanNextPage,
+    /// Profiles `e` (or ⏎ on a field): edit the field under the Fields
+    /// cursor by its kind (spec D11): an enum cycles forward, a bool or lane
+    /// flips, a number or the name opens `PromptKind::ScanField` prefilled,
+    /// `origins` and `checks` focus their pane, `l4_targets` opens the L4
+    /// target prompt.
+    ScanEdit,
+    /// Profiles Space: flip a lane or bool field, or cycle the tri-state of
+    /// the check-tree node under the Checks cursor (spec D11).
+    ScanToggle,
+    /// Profiles `w`: `scan.profile.save {profile}` with the typed draft; a
+    /// builtin (or an unnamed draft) asks `PromptKind::ScanProfileName`
+    /// first (spec D11).
+    ScanSave,
+    /// Profiles `D`: delete the non-builtin profile under the cursor after
+    /// the one-line `y/N` confirm (spec D11), `scan.profile.delete {name}`
+    /// tagged `scan.profile.delete:<name>`.
+    ScanDelete,
+    /// Profiles `N`: open the editor over `ScanProfile::default()` (spec
+    /// D11).
+    ScanNewProfile,
+    /// Profiles `o`: the typed-origin prompt (`PromptKind::ScanOrigin`,
+    /// spec D8, D11); the origin joins the draft when the scope covers it.
+    ScanOriginPrompt,
+    /// Profiles `a` in the Origins pane: add the highlighted picker row to
+    /// the draft (spec D11).
+    ScanOriginAdd,
+    /// Profiles `d` in the Origins pane: remove the highlighted row's
+    /// origin from the draft (spec D11).
+    ScanOriginRemove,
+    /// Profiles `t`: the L4 target prompt (`PromptKind::ScanL4Target`,
+    /// `ip:port[/tcp|udp][ grammar]`, spec D11).
+    ScanL4TargetPrompt,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,
