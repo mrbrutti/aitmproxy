@@ -66,7 +66,7 @@ One `Mode::Scan` with `ScanTab { Profiles, Jobs, SiteMap, Issues }`. The sidebar
 | Bus offers | Sidebar row | Profiles | Jobs | Site map | Issues | Launch verbs |
 |---|---|---|---|---|---|---|
 | `scan.start` (v2) | yes; count = open issues total from the newest non-terminal job, else `-` | full | full | `scan.sitemap` | full | start `scan.start`; map `scan.map`, else `scan.discover`, else key inert with reason |
-| only `scan.discover` (legacy) | yes; count = legacy points | degraded banner: "profiles need scan.profile.list (scanner v2)" | legacy launcher: `r`/`s` run `scan.discover`, one row for the one-shot (running / done / error) | legacy result: endpoints as nodes, points as points | degraded banner | `scan.discover { target }` |
+| only `scan.discover` (legacy) | yes; count = legacy points | degraded banner: "profiles need scan.profile.list (scanner v2)" | legacy launcher: `r`/`s` run `scan.discover`, one row for the one-shot (running / done / error) | legacy result: endpoints as nodes, points as points | degraded banner: "issues need scan.issues (scanner v2)" (literal fixed on panel review 2026-11-01) | `scan.discover { target }` |
 | neither | no row | `:scan` opens the view with "the scanner is not on this bus (scan.start / scan.discover)" in every tab | | | | none |
 
 Within v2, each control is gated by its own verb (`has_tool`): Issues needs `scan.issues` + `scan.issue`; status controls `scan.issue.update`; Site map `scan.sitemap`; Profiles list `scan.profile.list`; editor save/delete `scan.profile.save`/`scan.profile.delete`; the check tree `scan.checks`; session names `scan.session.preview`; cancel `scan.cancel`; the L4 gate `l4.scope.list`. A missing verb renders that control inert with the inline text `<verb> is not on this bus`.
@@ -162,7 +162,7 @@ A result that fails to parse is a `ScanError` with `code: None`, detail `"reply 
 
 ### D11. The four tabs
 
-Common chrome: a tab strip `1 Profiles  2 Jobs  3 Site map  4 Issues` under the box title, the active tab bold; a one-line state banner under it (`idle`, `refreshing...`, the `ScanError` wording, or the degraded text); the status bar hints (in `bars.rs`) list the tab's keys. Keys shared by every tab:
+Common chrome: a tab strip `1 Profiles  2 Jobs  3 Site map  4 Issues` under the box title, the active tab bold; a one-line state banner to its right on the same row (`idle`, `refreshing...`, the `ScanError` wording, or the degraded text; amended on panel review 2026-11-01, the mockups already drew it there); the status bar hints (in `bars.rs`) list the tab's keys. Keys shared by every tab:
 
 | Key | Action |
 |---|---|
