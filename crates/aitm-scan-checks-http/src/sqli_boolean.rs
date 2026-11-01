@@ -475,7 +475,9 @@ impl Check for SqliBoolean {
 mod tests {
     use aitm_scan_model::{Accuracy, Speed};
 
-    use super::{condition_pairs, confirmations, is_hit, pairs_allowed, MAX_BOOLEAN_PROBES};
+    use super::{
+        condition_pairs, confirmations, is_hit, length_differs, pairs_allowed, MAX_BOOLEAN_PROBES,
+    };
 
     /// The order is the plan's: four base pairs, then the same four with a
     /// leading `)`. Both arms of every pair are the same length, which is what
@@ -553,6 +555,20 @@ mod tests {
             !is_hit(600, 120, 120),
             "both arms moved together: the page reacts to any suffix"
         );
+        // The third clause on its own. Above, the first clause already refuses
+        // (120 is nothing like the 600-byte baseline), so the case says nothing
+        // about the third. Here the true arm *does* reproduce the baseline
+        // (40 bytes is exactly the noise floor) and the false arm *does*
+        // diverge from it (60 bytes), and the pair is still not a hit, because
+        // the two arms are only 20 bytes apart: the page drifted, it did not
+        // answer the condition.
+        assert!(!length_differs(640, 600, 600), "clause 1 holds");
+        assert!(length_differs(660, 600, 600), "clause 2 holds");
+        assert!(
+            !is_hit(600, 640, 660),
+            "the false arm must diverge from the true arm too"
+        );
+        assert!(is_hit(600, 640, 681), "41 bytes apart is a divergence");
 
         // The threshold is `matching::length_differs`, so a difference inside
         // the noise floor is not a difference.

@@ -956,3 +956,78 @@ async fn the_real_runner_refuses_session_material_before_dialling() {
         "a raw h2 probe never sends a `cookie` header"
     );
 }
+
+/// Every one of the five, not just the rapid-reset one: a point whose URL is
+/// missing, non-http(s) or unparseable opens no connection at all. The raw
+/// driver's whole safety argument (module doc, condition 1) is that it dials
+/// the point's own authority, so a check that guessed a target when the point
+/// named none would be dialling somewhere nobody authorised.
+#[tokio::test]
+async fn no_h2_check_dials_without_a_usable_http_url() {
+    let mut no_url = origin_point();
+    no_url.url = None;
+    let mut points = vec![no_url];
+    for url in [
+        "ftp://origin.test/x",
+        "file:///etc/passwd",
+        "wss://origin.test/ws",
+        "https:///x",
+        "origin.test/x",
+        "",
+    ] {
+        points.push(point(InsertionKind::Query, "q", url));
+    }
+
+    for id in ALL_IDS {
+        for p in &points {
+            let runner = FakeRunner::answering(resets(8));
+            let check = check_named(&runner, id);
+            let host = ScriptedHost::new();
+
+            let v = check.run(p, &host).await;
+
+            assert_eq!(v.outcome, Outcome::Inconclusive, "{id} {:?}", p.url);
+            assert_eq!(v.detail, "the point has no usable http(s) url");
+            assert_eq!(runner.calls(), 0, "{id} dialled for {:?}", p.url);
+            assert_eq!(
+                host.baseline_calls(),
+                0,
+                "{id} probed the lane for {:?}",
+                p.url
+            );
+        }
+    }
+}
+
+/// The stop contract for all five: a cancelled job, a job with no budget and a
+/// job past its deadline each send nothing — no baseline, no raw connection —
+/// and the authority is left unclaimed, so the check can still run when a later
+/// job reaches the same origin.
+#[tokio::test]
+async fn no_h2_check_probes_a_stopped_job_or_burns_the_authority() {
+    for id in ALL_IDS {
+        for stopped in [
+            ScriptedHost::new().with_cancelled(true),
+            ScriptedHost::new().with_budget(0),
+            ScriptedHost::new().with_deadline(Instant::now() - Duration::from_secs(1)),
+        ] {
+            let runner = FakeRunner::answering(resets(8));
+            let check = check_named(&runner, id);
+
+            let v = run(&check, &stopped).await;
+
+            assert_eq!(v.outcome, Outcome::Inconclusive, "{id}");
+            assert_eq!(
+                v.detail,
+                "stopped: the job was cancelled, out of budget or past its deadline"
+            );
+            assert_eq!(stopped.baseline_calls(), 0, "{id}");
+            assert_eq!(runner.calls(), 0, "{id}");
+
+            // The authority was never claimed, so a healthy run still probes.
+            let healthy = run(&check, &ScriptedHost::new()).await;
+            assert_ne!(healthy.outcome, Outcome::Inconclusive, "{id}");
+            assert_eq!(runner.calls(), 1, "{id}");
+        }
+    }
+}

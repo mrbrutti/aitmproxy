@@ -63,6 +63,7 @@ pub struct ScriptedHost {
     budget: AtomicU32,
     deadline: Instant,
     cancelled: bool,
+    cancel_after: Option<usize>,
     profile: ScanProfile,
 }
 
@@ -90,6 +91,7 @@ impl ScriptedHost {
             budget: AtomicU32::new(16),
             deadline: Instant::now() + Duration::from_secs(60),
             cancelled: false,
+            cancel_after: None,
             profile: ScanProfile::default(),
         }
     }
@@ -167,6 +169,20 @@ impl ScriptedHost {
     #[must_use]
     pub fn with_cancelled(mut self, cancelled: bool) -> Self {
         self.cancelled = cancelled;
+        self
+    }
+
+    /// Report the job as cancelled from the moment `n` stimuli have been sent.
+    ///
+    /// A real `scan.cancel` lands *during* a check, not before it: the token is
+    /// set while the check is between probes. A fixed `cancelled` flag can only
+    /// test the "cancelled before it started" case, so this makes the host's
+    /// answer depend on how far the check has got, which is what
+    /// [`aitm_scan_model::Check::run`]'s "stop after the current probe"
+    /// contract is actually about.
+    #[must_use]
+    pub fn with_cancel_after(mut self, n: usize) -> Self {
+        self.cancel_after = Some(n);
         self
     }
 
@@ -307,6 +323,9 @@ impl ProbeHost for ScriptedHost {
 
     fn cancelled(&self) -> bool {
         self.cancelled
+            || self
+                .cancel_after
+                .is_some_and(|n| self.sent_probes().len() >= n)
     }
 
     fn held_flows(&self) -> Vec<aitm_core::Flow> {

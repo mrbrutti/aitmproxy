@@ -139,7 +139,11 @@ fn median_ms(baseline_ms: &[u32]) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{correlated, fit};
+    use aitm_scan_model::Timing;
+
+    use super::{
+        correlated, fit, CORRELATION_ERROR_RANGE, IDEAL_SLOPE_MS_PER_S, SLOPE_ERROR_RANGE,
+    };
 
     #[test]
     fn fit_reports_a_correlated_alternating_delay() {
@@ -261,5 +265,78 @@ mod tests {
         assert!(!correlated(&edge(1000.0, 0.84)));
         assert!(correlated(&edge(1290.0, 1.0)));
         assert!(!correlated(&edge(1310.0, 1.0)));
+    }
+
+    /// The correlation half of the rule on a *jittered* series — the shape a
+    /// real target produces, where two requests for the same delay do not come
+    /// back in the same number of milliseconds. Both series below have the same
+    /// slope (about 1010 ms/s, well inside the 30 % band), so only `r` can
+    /// decide, and the decision lands exactly on ZAP's 0.15 error range: a
+    /// spread of 880 ms between the two one-second answers is still correlated,
+    /// 890 ms is not. A check that widened this range would start reporting
+    /// noisy targets as injectable.
+    #[test]
+    fn the_correlation_edge_holds_on_a_jittered_series() {
+        let baseline = [38, 41, 39, 40];
+        let series = |spread: u32| {
+            fit(
+                &[1.0, 3.0, 1.0, 3.0],
+                &[1040 + spread, 3060, 1040 - spread, 3060],
+                &baseline,
+            )
+        };
+
+        let inside = series(880);
+        assert!((0.851..0.852).contains(&inside.r), "r was {}", inside.r);
+        assert!(
+            (1000.0..1020.0).contains(&inside.slope),
+            "slope was {}",
+            inside.slope
+        );
+        assert!(correlated(&inside), "r {} is inside 0.15", inside.r);
+
+        let outside = series(890);
+        assert!((0.848..0.849).contains(&outside.r), "r was {}", outside.r);
+        assert!(
+            (1000.0..1020.0).contains(&outside.slope),
+            "slope was {}",
+            outside.slope
+        );
+        assert!(!correlated(&outside), "r {} is outside 0.15", outside.r);
+
+        // A target that answers both one-second requests far apart and both
+        // three-second requests far apart has no signal at all, whatever the
+        // means do: the spread swamps the difference the payload made.
+        let noise = fit(&[1.0, 3.0, 1.0, 3.0], &[3000, 3100, 100, 3020], &baseline);
+        assert!(!correlated(&noise), "slope {} r {}", noise.slope, noise.r);
+    }
+
+    /// The boundary of `correlated` itself is **inclusive**: `r` exactly
+    /// `1.0 - CORRELATION_ERROR_RANGE` passes. The rule is "within the error
+    /// range", not "inside it", and the two scanners (native and the Rhai
+    /// `probe.timing_fit` that calls this) must round the same way.
+    #[test]
+    fn the_acceptance_boundary_is_inclusive() {
+        let edge = |slope: f32, r: f32| Timing {
+            requested_s: Vec::new(),
+            observed_ms: Vec::new(),
+            baseline_ms: Vec::new(),
+            slope,
+            r,
+        };
+        assert!(correlated(&edge(1000.0, 1.0 - CORRELATION_ERROR_RANGE)));
+        assert!(correlated(&edge(
+            IDEAL_SLOPE_MS_PER_S * (1.0 + SLOPE_ERROR_RANGE),
+            1.0
+        )));
+        assert!(correlated(&edge(
+            IDEAL_SLOPE_MS_PER_S * (1.0 - SLOPE_ERROR_RANGE),
+            1.0
+        )));
+        // An r above 1.0 is impossible from `fit`, but the rule must not take a
+        // wild value for a perfect one.
+        assert!(!correlated(&edge(1000.0, 1.2)));
+        assert!(!correlated(&edge(f32::NAN, 1.0)));
+        assert!(!correlated(&edge(1000.0, f32::NAN)));
     }
 }
