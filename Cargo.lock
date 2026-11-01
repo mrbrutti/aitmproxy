@@ -500,6 +500,7 @@ name = "aitm-tui"
 version = "0.5.8"
 dependencies = [
  "aitm-bus-client",
+ "aitm-scan-model",
  "anyhow",
  "crossterm",
  "futures",

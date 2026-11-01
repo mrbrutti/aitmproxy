@@ -25,6 +25,7 @@ pub mod l4;
 pub mod languages;
 pub mod model;
 pub mod open;
+pub mod scan;
 pub mod snapshot;
 pub mod syntax;
 pub mod theme;
