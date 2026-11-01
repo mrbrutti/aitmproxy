@@ -26,6 +26,7 @@ pub mod redact;
 pub mod registry;
 pub mod store;
 pub mod stream;
+pub mod tunnel;
 pub mod value;
 
 pub use agent::{AgentPolicy, AgentState};
@@ -68,6 +69,7 @@ pub use proxy::{Proxy, ProxyBuilder};
 pub use registry::Registry;
 pub use store::{ClearOutcome, FlowKind, FlowQuery, FlowStore, MemFlowStore};
 pub use stream::{AsyncReadWrite, ByteStream};
+pub use tunnel::{classify_client_failure, relay, TunnelRequest, TunnelRow};
 pub use value::{Params, Value};
 
 /// The crate version, wired to the Cargo package version.
