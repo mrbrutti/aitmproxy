@@ -21,6 +21,7 @@ pub mod icmp;
 pub mod intercept;
 pub mod language;
 pub mod module;
+pub mod privilege;
 pub mod sendrecv;
 pub mod types;
 pub mod wire;
