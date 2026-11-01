@@ -576,8 +576,8 @@ mod tests {
 
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use aitm_proto_l4::config::L4Config;
@@ -842,6 +842,121 @@ mod tests {
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].reply.len(), 65_536);
         assert_eq!(MAX_REPLY, 65_536);
+        assert_eq!(steps[0].ended, Ended::Replied);
+    }
+
+    /// The peer drops the connection in the middle of a multi-message
+    /// exchange: the step that saw the close ends it, the messages behind it
+    /// are never written into a dead socket, and the exchange is an `Ok`
+    /// result (a close is a reaction, not a client failure).
+    #[tokio::test]
+    async fn peer_closes_between_messages() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+        let addr = listener.local_addr().expect("local addr");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&seen);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    counted.fetch_add(n, Ordering::SeqCst);
+                    let _ = sock.write_all(b"+OK\r\n").await;
+                }
+                // Hang up before the second message.
+                drop(sock);
+            }
+        });
+
+        let ep = tcp_endpoint(addr);
+        let guard = loopback_guard();
+        let mut permit = permit_for(&guard, &ep);
+        let pacer = pacer();
+        let complete = |b: &[u8]| b.ends_with(b"\r\n");
+        let client = TokioStreamClient;
+
+        let steps = client
+            .exchange(
+                &ep,
+                &mut permit,
+                &pacer,
+                &[
+                    b"one\r\n".to_vec(),
+                    b"two\r\n".to_vec(),
+                    b"three\r\n".to_vec(),
+                ],
+                &complete,
+                false,
+                Duration::from_millis(500),
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .expect("a peer hang-up is not a client error");
+
+        assert!(
+            steps.len() <= 2,
+            "the exchange carried on past the close: {} steps",
+            steps.len()
+        );
+        assert_eq!(steps[0].sent_len, 5);
+        assert_eq!(steps[0].reply, b"+OK\r\n".to_vec());
+        let last = steps.last().expect("at least one step");
+        assert!(
+            matches!(last.ended, Ended::Eof | Ended::Reset),
+            "the last step ended {:?}, not on the close",
+            last.ended
+        );
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            5,
+            "only the first message reached the peer"
+        );
+    }
+
+    /// A reply of exactly `MAX_REPLY` bytes, with the peer still holding the
+    /// connection open: the read stops at the bound and reports a reply, not
+    /// silence and not a truncation of one byte less.
+    #[tokio::test]
+    async fn reply_exactly_at_the_bound() {
+        let Some(listener) = loopback_listener().await else {
+            return;
+        };
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 64];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(&[0x42u8; MAX_REPLY]).await;
+                // Stay open: the bound, not the EOF, must end the read.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        });
+
+        let ep = tcp_endpoint(addr);
+        let guard = loopback_guard();
+        let mut permit = permit_for(&guard, &ep);
+        let pacer = pacer();
+        let complete = |_: &[u8]| false;
+        let client = TokioStreamClient;
+
+        let steps = client
+            .exchange(
+                &ep,
+                &mut permit,
+                &pacer,
+                &[b"hello".to_vec()],
+                &complete,
+                false,
+                REPLY_TIMEOUT,
+                CONNECT_TIMEOUT,
+            )
+            .await
+            .expect("exchange");
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].reply.len(), MAX_REPLY);
+        assert!(steps[0].reply.iter().all(|b| *b == 0x42));
         assert_eq!(steps[0].ended, Ended::Replied);
     }
 

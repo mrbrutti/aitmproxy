@@ -1133,6 +1133,97 @@ message:
         assert!(err.to_string().contains("u16"), "display: {err}");
     }
 
+    /// Hostile or malformed operator YAML is refused, never accepted and
+    /// never a panic (S2 validation; Task 1 flagged that the depth limit is
+    /// checked *after* deserialisation, so this pins what happens to a
+    /// document deeper than the deserialiser itself will go).
+    #[test]
+    fn hostile_yaml_is_refused_not_accepted() {
+        fn nested(depth: usize) -> String {
+            let mut yaml = String::from("grammar: t\ntransport: tcp\nmessage:\n");
+            let mut indent = String::from("  ");
+            for i in 0..depth {
+                yaml.push_str(&format!(
+                    "{indent}- name: g{i}\n{indent}  type: group\n{indent}  fields:\n"
+                ));
+                indent.push_str("    ");
+            }
+            yaml.push_str(&format!("{indent}- {{ name: leaf, type: u8 }}\n"));
+            yaml
+        }
+
+        // One level past MAX_DEPTH: our own check, naming the depth reached.
+        let nine: MessageSpec =
+            serde_yaml::from_str(&nested(9)).expect("nine levels still deserialise");
+        assert_eq!(nine.validate(), Err(SpecError::TooDeep(9)));
+        let err = MessageSpec::from_yaml(&nested(9)).expect_err("nine levels are refused");
+        assert!(
+            err.to_string()
+                .contains("fields nest 9 levels deep; at most 8 are allowed"),
+            "display: {err}"
+        );
+
+        // Far past it, the deserialiser's own recursion limit stops first.
+        // The point is that it is an error and not a stack overflow: the
+        // process is still running to make the next assertion.
+        for depth in [64usize, 512, 4096] {
+            let err = MessageSpec::from_yaml(&nested(depth))
+                .err()
+                .unwrap_or_else(|| panic!("depth {depth} must not be accepted"));
+            assert!(
+                err.to_string().contains("recursion limit exceeded"),
+                "depth {depth} gave {err}"
+            );
+        }
+    }
+
+    /// The field-count ceiling counts the whole tree, not one level.
+    #[test]
+    fn field_count_ceiling_counts_the_whole_tree() {
+        let mut flat = String::from("grammar: t\ntransport: tcp\nmessage:\n");
+        for i in 0..MAX_FIELDS {
+            flat.push_str(&format!("  - {{ name: f{i}, type: u8 }}\n"));
+        }
+        assert!(
+            MessageSpec::from_yaml(&flat).is_ok(),
+            "exactly {MAX_FIELDS} fields are allowed"
+        );
+
+        let mut over = flat.clone();
+        over.push_str(&format!("  - {{ name: f{MAX_FIELDS}, type: u8 }}\n"));
+        let err = MessageSpec::from_yaml(&over).expect_err("one field too many is refused");
+        assert!(
+            err.to_string()
+                .contains("declares 257 fields; at most 256 are allowed"),
+            "display: {err}"
+        );
+
+        // Nested fields count too: 2 groups x 128 children + the 2 groups.
+        let mut nested = String::from("grammar: t\ntransport: tcp\nmessage:\n");
+        for g in 0..2 {
+            nested.push_str(&format!("  - name: g{g}\n    type: group\n    fields:\n"));
+            for i in 0..128 {
+                nested.push_str(&format!("      - {{ name: f{i}, type: u8 }}\n"));
+            }
+        }
+        let spec: MessageSpec = serde_yaml::from_str(&nested).expect("the document parses");
+        assert_eq!(spec.validate(), Err(SpecError::TooManyFields(258)));
+    }
+
+    /// An empty or non-grammar document is an error with the module prefix,
+    /// not a default-valued `MessageSpec`.
+    #[test]
+    fn empty_and_junk_documents_are_errors() {
+        for text in ["", "~", "[]", "grammar: t\n", "{\"grammar\": 7}"] {
+            let err = MessageSpec::from_yaml(text)
+                .expect_err("an incomplete document is not a MessageSpec");
+            assert!(
+                err.to_string().starts_with("l4_stream: grammar"),
+                "text {text:?} gave {err}"
+            );
+        }
+    }
+
     #[test]
     fn grammar_kind_names() {
         assert_eq!(GrammarKind::parse("modbus"), Some(GrammarKind::Modbus));

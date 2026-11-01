@@ -851,6 +851,14 @@ mod tests {
             }
         }
 
+        /// The same context under an operator-chosen profile.
+        fn with_profile(profile: ScanProfile) -> Self {
+            Self {
+                profile,
+                ..Self::new()
+            }
+        }
+
         fn broke(mut self) -> Self {
             self.affordable = false;
             self
@@ -1003,6 +1011,35 @@ mod tests {
             state,
             guard,
             client,
+        )
+    }
+
+    /// A host for any grammar: the point's tree comes from the grammar's own
+    /// generator, so every grammar can be driven through the probe sequence.
+    fn host_for(
+        kind: GrammarKind,
+        ep: Endpoint,
+        job: &Arc<TestJob>,
+        client: &Arc<CountingClient>,
+    ) -> StreamHost {
+        use rand::SeedableRng;
+        let grammar = grammar::by_kind(kind);
+        let seed = grammar.generate(&mut rand_chacha::ChaCha8Rng::seed_from_u64(7));
+        let tree = grammar
+            .parse(&seed)
+            .unwrap_or_else(|| panic!("{kind:?} parses its own generated message"));
+        let mut point = discovered(ep);
+        point.grammar = kind;
+        point.seed_bytes = seed;
+        let state = JobState::new("scan-18", "aitm18", job.profile.l4.max_bytes_per_s);
+        StreamHost::new(
+            point,
+            grammar,
+            tree,
+            Arc::clone(job) as Arc<dyn JobCtx>,
+            state,
+            Some(loopback_guard()),
+            Arc::clone(client) as Arc<dyn StreamClient>,
         )
     }
 
@@ -1167,6 +1204,120 @@ mod tests {
             1
         );
         assert_eq!(host.state().cases_sent.load(Ordering::SeqCst), 0);
+    }
+
+    /// C4's host half across the whole profile surface: no built-in profile,
+    /// and no profile with every `l4` knob at its maximum and the lane
+    /// explicitly included, makes a denylisted message sendable. The client
+    /// double would record any write, so zero writes is the assertion.
+    #[tokio::test]
+    async fn no_profile_lifts_the_denylist() {
+        // One denylisted message per grammar that has a denylist, each one
+        // checked against the pure function first so a typo here cannot make
+        // the test pass vacuously.
+        let cases: Vec<(GrammarKind, Vec<u8>, &str)> = vec![
+            (
+                GrammarKind::Resp,
+                b"*1\r\n$8\r\nFLUSHALL\r\n".to_vec(),
+                "FLUSHALL",
+            ),
+            (
+                GrammarKind::Resp,
+                b"SHUTDOWN NOSAVE\r\n".to_vec(),
+                "SHUTDOWN",
+            ),
+            (
+                GrammarKind::Memcached,
+                b"flush_all\r\n".to_vec(),
+                "flush_all",
+            ),
+            (
+                GrammarKind::Smtp,
+                b"RCPT TO:<a@other.example>\r\n".to_vec(),
+                "RCPT",
+            ),
+            (GrammarKind::Smtp, b"DATA\r\n".to_vec(), "DATA"),
+            (GrammarKind::Ftp, b"DELE /etc/passwd\r\n".to_vec(), "DELE"),
+            (
+                GrammarKind::Modbus,
+                vec![
+                    0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x01, 0x05, 0x00, 0x00, 0xff, 0x00,
+                ],
+                "fc 5",
+            ),
+            (
+                GrammarKind::Mqtt,
+                vec![0x31, 0x08, 0x00, 0x03, b'a', b'/', b'b', b'v', 0x00, 0x00],
+                "publish retain",
+            ),
+            (
+                GrammarKind::Dns,
+                vec![
+                    0x12, 0x34, 0x00, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0x03, b'w', b'w', b'w',
+                    0x00, 0x00, 0xfc, 0x00, 0x01,
+                ],
+                "qtype axfr",
+            ),
+        ];
+        for (kind, bytes, verb) in &cases {
+            assert_eq!(
+                crate::denylist::refuses(*kind, bytes),
+                Some(*verb),
+                "{kind:?}: the fixture is not actually denylisted"
+            );
+        }
+
+        // Every built-in profile, plus one with every l4 field maxed out and
+        // the lane named in `checks.include`.
+        let maxed = ScanProfile {
+            name: "maxed".to_string(),
+            l4: aitm_scan_model::L4Options {
+                cases: u32::MAX,
+                reproduce_count: u32::MAX,
+                liveness_every: u32::MAX,
+                consecutive_timeouts: u32::MAX,
+                max_bytes_per_s: u32::MAX,
+                seeds: Vec::new(),
+                dry_run: false,
+            },
+            checks: aitm_scan_model::CheckSelection {
+                include: vec!["lane:l4_stream".to_string()],
+                ..Default::default()
+            },
+            ..ScanProfile::default()
+        };
+
+        let mut profiles = aitm_scan_model::builtin_profiles();
+        assert_eq!(profiles.len(), 7, "the seven built-in profiles");
+        profiles.push(maxed);
+
+        for profile in profiles {
+            let name = profile.name.clone();
+            let job = Arc::new(TestJob::with_profile(profile));
+            let client = Arc::new(CountingClient::live());
+
+            for (kind, bytes, verb) in &cases {
+                let host = host_for(*kind, endpoint(6379), &job, &client);
+                let Err(error) = host.probe(&payload(bytes)).await else {
+                    panic!("{name}/{kind:?}: {verb} must never be sent");
+                };
+                let refused = host_error(&error);
+                assert!(
+                    matches!(refused, HostError::Denylisted(v) if v == verb),
+                    "{name}/{kind:?}: expected Denylisted({verb}), got {refused}"
+                );
+            }
+            assert_eq!(
+                client.count(),
+                0,
+                "profile {name} let a denylisted message reach the client"
+            );
+            assert_eq!(
+                job.charges(),
+                0,
+                "profile {name} charged for a skipped case"
+            );
+        }
     }
 
     #[tokio::test]

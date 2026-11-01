@@ -395,6 +395,70 @@ mod tests {
         }
     }
 
+    /// Truncation of *every* frame shape, not only the Ethernet one, plus the
+    /// zero-length and single-byte cases. A short capture may still yield a
+    /// short payload, but it may never claim a payload longer than the bytes
+    /// that are actually there, and it may never panic.
+    #[test]
+    fn every_frame_shape_survives_truncation() {
+        let udp: Vec<u8> = vec![
+            0x45, 0x00, 0x00, 0x1f, 0x00, 0x01, 0x00, 0x00, 0x40, 0x11, 0x00, 0x00, 0x7f, 0x00,
+            0x00, 0x01, 0x0a, 0x00, 0x00, 0x09, 0x9c, 0x40, 0x00, 0x35, 0x00, 0x0b, 0x00, 0x00,
+            0xde, 0xad, 0xbe,
+        ];
+        let mut bsd: Vec<u8> = vec![
+            0x02, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00, 0x00, 0x16, 0x06, 0x40,
+        ];
+        bsd.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
+        bsd.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09,
+        ]);
+        bsd.extend_from_slice(&[
+            0x04, 0xd2, 0x1e, 0x61, 0, 0, 0, 3, 0, 0, 0, 4, 0x50, 0x10, 0x20, 0x00, 0, 0, 0, 0,
+            0xfa, 0xce,
+        ]);
+
+        let shapes: [(&str, Vec<u8>, Vec<String>); 3] = [
+            ("ethernet+ipv4+tcp", ethernet_ipv4_tcp_frame(), ethernet()),
+            (
+                "bare ipv4+udp",
+                udp,
+                vec!["IPv4".to_string(), "UDP".to_string()],
+            ),
+            (
+                "bsd loopback+ipv6+tcp",
+                bsd,
+                vec!["IPv6".to_string(), "TCP".to_string()],
+            ),
+        ];
+
+        for (name, frame, layers) in shapes {
+            for len in 0..frame.len() {
+                let prefix = &frame[..len];
+                if let Some(got) = transport_payload(prefix, &layers) {
+                    assert!(
+                        got.payload.len() <= prefix.len(),
+                        "{name}: a {len}-byte prefix yielded {} payload bytes",
+                        got.payload.len()
+                    );
+                }
+                // The layer hint must not change whether it panics.
+                let _ = transport_payload(prefix, &[]);
+                let _ = transport_payload(prefix, &ethernet());
+            }
+            // The whole frame is still extractable after all that.
+            assert!(
+                transport_payload(&frame, &layers).is_some(),
+                "{name}: the intact frame is extractable"
+            );
+        }
+
+        assert!(transport_payload(&[], &ethernet()).is_none());
+        assert!(transport_payload(&[0x45], &[]).is_none());
+    }
+
     #[test]
     fn random_bytes_never_panic() {
         let mut rng = ChaCha8Rng::seed_from_u64(0x5EED_5EED);

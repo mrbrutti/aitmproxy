@@ -457,7 +457,9 @@ mod tests {
     };
     use crate::client::Ended;
     use crate::infer::LenDescriptor;
-    use crate::spec::{GrammarKind, Transport};
+    use crate::spec::{GrammarKind, MessageSpec, Transport};
+    use rand::{Rng, RngCore, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
 
     /// An inference that always refuses, so selection never reaches a real
     /// TLV grammar in these tests.
@@ -623,6 +625,99 @@ mod tests {
         assert!(!exchange.matches(&other, Ended::Replied));
         assert!(!exchange.matches(b"not dns", Ended::Replied));
         assert!(!exchange.matches(b"", Ended::Silence));
+    }
+
+    /// C1's round-trip half for **every** grammar, not only the three whose
+    /// own module asserts it: each embedded spec validates, serialises with
+    /// `serde_yaml` and re-parses to an equal value, and names itself.
+    #[test]
+    fn every_grammar_spec_validates_and_round_trips() {
+        for grammar in registry() {
+            let spec = grammar.spec();
+            spec.validate()
+                .unwrap_or_else(|e| panic!("{}: embedded spec is invalid: {e}", grammar.name()));
+
+            let yaml = spec
+                .to_yaml()
+                .unwrap_or_else(|e| panic!("{}: spec does not serialise: {e}", grammar.name()));
+            let again = MessageSpec::from_yaml(&yaml).unwrap_or_else(|e| {
+                panic!("{}: serialised spec does not parse: {e}", grammar.name())
+            });
+            assert_eq!(
+                &again,
+                spec,
+                "{}: the YAML round trip is not the identity",
+                grammar.name()
+            );
+
+            assert_eq!(
+                spec.grammar,
+                grammar.name(),
+                "the document names the grammar it belongs to"
+            );
+            assert_eq!(spec.transport, grammar.transport());
+            assert_eq!(spec.default_ports, grammar.default_ports().to_vec());
+            assert!(
+                !yaml.is_empty() && yaml.contains("grammar:"),
+                "{}: serialised to {yaml:?}",
+                grammar.name()
+            );
+        }
+    }
+
+    /// Every grammar survives the inputs a fuzzing lane will inevitably hand
+    /// it: nothing, one byte, a 64 KiB run and 10 000 random strings. A
+    /// grammar may refuse any of them, but it may not panic, and anything it
+    /// does parse must render back unchanged.
+    #[test]
+    fn grammars_survive_empty_oversized_and_random_bytes() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0xC0FF_EE00);
+        let fixed: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x00],
+            vec![0xff],
+            b"\r\n".to_vec(),
+            vec![b'A'; 65_536],
+            vec![0x80; 16],
+        ];
+
+        for grammar in registry() {
+            for bytes in &fixed {
+                if let Some(tree) = grammar.parse(bytes) {
+                    assert_eq!(
+                        crate::tree::render(&tree),
+                        *bytes,
+                        "{}: parse/render is not the identity on {} bytes",
+                        grammar.name(),
+                        bytes.len()
+                    );
+                }
+                // The reply side takes the same abuse.
+                let _ = grammar.classify_reply(bytes);
+                let _ = grammar.reply_complete(bytes);
+                let _ = grammar.is_credential_message(bytes);
+                let _ = grammar.strip_credentials(bytes);
+                let _ = grammar.prelude_for(bytes);
+            }
+
+            let mut buf = [0u8; 96];
+            for _ in 0..10_000 {
+                let len = rng.random_range(0..=96usize);
+                let bytes = &mut buf[..len];
+                rng.fill_bytes(bytes);
+                if let Some(tree) = grammar.parse(bytes) {
+                    assert_eq!(
+                        crate::tree::render(&tree),
+                        bytes.to_vec(),
+                        "{}: parse/render is not the identity on {bytes:?}",
+                        grammar.name()
+                    );
+                }
+                let _ = grammar.classify_reply(bytes);
+                let _ = grammar.reply_complete(bytes);
+                let _ = grammar.is_credential_message(bytes);
+            }
+        }
     }
 
     #[test]

@@ -1197,6 +1197,150 @@ message:
         );
     }
 
+    /// A varint is at most four bytes (MQTT's rule), and the fifth
+    /// continuation byte is a parse refusal, not a silent truncation and not
+    /// a panic.
+    #[test]
+    fn varint_is_bounded_at_four_bytes() {
+        let spec = MessageSpec::from_yaml(concat!(
+            "grammar: synthetic\n",
+            "transport: tcp\n",
+            "message:\n",
+            "  - { name: n, type: varint }\n",
+            "  - { name: rest, type: bytes }\n",
+        ))
+        .expect("the synthetic varint grammar parses");
+
+        // One byte, two bytes, and the four-byte maximum all parse.
+        for (wire, want) in [
+            (vec![0x00u8], 0i64),
+            (vec![0x7f], 127),
+            (vec![0x80, 0x01], 128),
+            (vec![0xff, 0xff, 0xff, 0x7f], 268_435_455),
+        ] {
+            let tree = parse(&spec, &wire).expect("a well-formed varint parses");
+            assert_eq!(bytes_at(&tree, "n"), wire);
+            assert_eq!(decode_number(FieldKind::Varint, &wire), Some(want));
+            assert_eq!(render(&tree), wire);
+        }
+
+        // A fifth continuation byte: refused outright.
+        assert!(parse(&spec, &[0x80, 0x80, 0x80, 0x80, 0x01]).is_none());
+        // A varint that never terminates before the buffer ends: refused.
+        assert!(parse(&spec, &[0x80, 0x80]).is_none());
+        // Nothing at all: refused, not a zero-length varint.
+        assert!(parse(&spec, &[]).is_none());
+
+        // Five bytes never decode, and a value past the four-byte range
+        // never encodes, so a relation holding one is left broken rather
+        // than written wrong.
+        assert_eq!(
+            decode_number(FieldKind::Varint, &[0x80, 0x80, 0x80, 0x80, 0x01]),
+            None
+        );
+        assert_eq!(
+            encode_number(FieldKind::Varint, 268_435_455),
+            Some(vec![0xff, 0xff, 0xff, 0x7f])
+        );
+        assert_eq!(encode_number(FieldKind::Varint, 268_435_456), None);
+        assert_eq!(encode_number(FieldKind::Varint, -1), None);
+    }
+
+    /// `decimal` carries a sign, and a value that does not fit an `i64` is a
+    /// refusal rather than a wrapped number.
+    #[test]
+    fn decimal_signs_and_overflow() {
+        let spec = MessageSpec::from_yaml(concat!(
+            "grammar: synthetic\n",
+            "transport: tcp\n",
+            "message:\n",
+            "  - { name: n, type: decimal }\n",
+            "  - { name: crlf, type: delim, value: \"\\r\\n\" }\n",
+        ))
+        .expect("the synthetic decimal grammar parses");
+
+        for (wire, want) in [
+            (&b"0\r\n"[..], 0i64),
+            (b"-1\r\n", -1),
+            (b"+7\r\n", 7),
+            (b"9223372036854775807\r\n", i64::MAX),
+        ] {
+            let tree = parse(&spec, wire).expect("a signed decimal parses");
+            let digits = &wire[..wire.len() - 2];
+            assert_eq!(bytes_at(&tree, "n"), digits.to_vec());
+            assert_eq!(decode_number(FieldKind::Decimal, digits), Some(want));
+            assert_eq!(render(&tree), wire.to_vec(), "render is byte-identical");
+        }
+
+        // A sign with no digits is not a decimal.
+        assert!(parse(&spec, b"-\r\n").is_none());
+        assert!(parse(&spec, b"\r\n").is_none());
+
+        // Twenty digits overflow an i64: the bytes still parse and render
+        // unchanged, but no number is read out of them.
+        let wire = b"99999999999999999999\r\n";
+        let tree = parse(&spec, wire).expect("the digits are still a decimal field");
+        assert_eq!(render(&tree), wire.to_vec());
+        assert_eq!(
+            decode_number(FieldKind::Decimal, b"99999999999999999999"),
+            None
+        );
+        assert_eq!(
+            decode_number(FieldKind::Decimal, b"-99999999999999999999"),
+            None
+        );
+        assert_eq!(
+            encode_number(FieldKind::Decimal, -42),
+            Some(b"-42".to_vec())
+        );
+    }
+
+    /// A `len` relation whose recomputed value does not fit the field is
+    /// marked broken and left alone: a fuzzing lane never writes a wrong
+    /// number over an operator's bytes.
+    #[test]
+    fn a_relation_that_does_not_fit_is_marked_broken() {
+        let spec = MessageSpec::from_yaml(concat!(
+            "grammar: synthetic\n",
+            "transport: tcp\n",
+            "message:\n",
+            "  - { name: len, type: u8, len: { of: [body] } }\n",
+            "  - { name: body, type: bytes }\n",
+        ))
+        .expect("the synthetic u8-length grammar parses");
+
+        let mut wire = vec![4u8];
+        wire.extend_from_slice(b"abcd");
+        let mut tree = parse(&spec, &wire).expect("the frame parses");
+        resatisfy(&mut tree, None);
+        assert_eq!(bytes_at(&tree, "len"), vec![4]);
+        assert!(
+            !tree
+                .get(&FieldPath::new("len"))
+                .expect("len")
+                .relation_broken
+        );
+
+        // Grow the body past what a u8 length can express, the way a
+        // `BytesInsert` mutator does.
+        tree.get_mut(&FieldPath::new("body")).expect("body").bytes = vec![b'a'; 300];
+        resatisfy(&mut tree, None);
+        assert_eq!(
+            bytes_at(&tree, "len"),
+            vec![4],
+            "the unencodable length is left as it was"
+        );
+        assert!(
+            tree.get(&FieldPath::new("len"))
+                .expect("len")
+                .relation_broken,
+            "and the node says so"
+        );
+        let mut want = vec![4u8];
+        want.extend_from_slice(&vec![b'a'; 300]);
+        assert_eq!(render(&tree), want, "the message is still rendered whole");
+    }
+
     #[test]
     fn checksum_relations_are_recomputed_from_their_targets() {
         let crc_spec = MessageSpec::from_yaml(concat!(
