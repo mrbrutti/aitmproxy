@@ -173,6 +173,8 @@ dependencies = [
  "caps",
  "nix 0.31.3",
  "oslog",
+ "pcap",
+ "socket2",
 ]
 
 [[package]]

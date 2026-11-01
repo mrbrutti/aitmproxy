@@ -15,6 +15,15 @@ path = "src/main.rs"
 # (spec §5.2, §5.3): the only product crate the helper links. No Rhai, no
 # `aitm-mcp`, no HTTP (plan unit p2 preamble; the P2.1 `cargo tree` tripwire).
 aitm-proto-l4.workspace = true
+# The real `Wire` for `serve` (plan P2.7): libpcap capture + L2 inject, the same
+# crate and version `aitm-proto-l4` uses (research note 08; libpcap ships with
+# macOS, Linux needs libpcap-dev).
+pcap = "2.5"
+# Local-destination inject on Linux (spec S1 from spike S7, plan A6): a raw IP
+# socket with IP_HDRINCL through socket2's safe API (`set_header_included_v4`),
+# because `pcap_inject` of an L2 frame on `lo` is dropped as a martian. Already
+# in `Cargo.lock` (tokio/hyper); no new transitive code.
+socket2 = "0.6"
 
 [lints]
 workspace = true
