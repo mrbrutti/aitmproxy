@@ -589,6 +589,26 @@ mod tests {
                 .count(),
             8
         );
+        // Tester (stage 5): the pre-fix tokens are gone for good; a row that
+        // slipped back to one of them must fail here by name, not only via
+        // the set comparison above.
+        for legacy in ["xss", "cswsh", "ws-input-reflection"] {
+            assert!(
+                manifest().iter().all(|v| v.class != legacy),
+                "class {legacy:?} is not a vulnerability family"
+            );
+        }
+        assert_eq!(
+            manifest().iter().filter(|v| v.class == "ws-cswsh").count(),
+            1
+        );
+        assert_eq!(
+            manifest()
+                .iter()
+                .filter(|v| v.class == "ws-injection")
+                .count(),
+            1
+        );
 
         // Ids are unique: the grader reports `missing` by id.
         let ids: BTreeSet<&str> = manifest().iter().map(|v| v.id.as_str()).collect();

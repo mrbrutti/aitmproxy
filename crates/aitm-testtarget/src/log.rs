@@ -970,6 +970,34 @@ mod tests {
         );
         let dumped = serde_json::to_string(&r.headers).expect("serialize headers");
         assert!(!dumped.contains("secret"), "credential leaked: {dumped}");
+
+        // Tester (stage 5): a repeated or non-UTF-8 credential header is
+        // still one `"<redacted>"`, never joined or dumped as `<binary>`.
+        let mut h = HeaderMap::new();
+        h.append(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_static("first-secret"),
+        );
+        h.append(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header value"),
+        );
+        h.append(
+            HeaderName::from_static("x-amz-security-token"),
+            HeaderValue::from_bytes(&[0xff]).expect("opaque header value"),
+        );
+        let r = redact_headers(&h);
+        assert_eq!(
+            r.headers.get("x-api-key").map(String::as_str),
+            Some("<redacted>")
+        );
+        assert_eq!(
+            r.headers.get("x-amz-security-token").map(String::as_str),
+            Some("<redacted>")
+        );
+        let dumped = serde_json::to_string(&r.headers).expect("serialize headers");
+        assert!(!dumped.contains("secret"), "credential leaked: {dumped}");
+        assert!(!dumped.contains("<binary>"), "{dumped}");
     }
 
     #[test]

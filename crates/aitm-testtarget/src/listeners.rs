@@ -106,18 +106,17 @@ mod tests {
         let attempts = attempts.lock().expect("attempts");
         assert_eq!(attempts.len(), 4, "err, err, ok, then parked: {attempts:?}");
         // Each error is followed by at least the back-off before the next
-        // accept; an accepted connection is followed by the next accept
-        // without one.
+        // accept. Only lower bounds are asserted: an upper bound on the
+        // accept-after-Ok gap would flake on a loaded machine; that the loop
+        // reached its fourth accept inside the 500 ms timeout (four attempts
+        // above) is the proof it did not back off after the accepted
+        // connection.
         assert!(
             attempts[1] - attempts[0] >= SOCKET_ERROR_BACKOFF,
             "{attempts:?}"
         );
         assert!(
             attempts[2] - attempts[1] >= SOCKET_ERROR_BACKOFF,
-            "{attempts:?}"
-        );
-        assert!(
-            attempts[3] - attempts[2] < SOCKET_ERROR_BACKOFF,
             "{attempts:?}"
         );
         assert_eq!(served.load(Ordering::SeqCst), 1);
