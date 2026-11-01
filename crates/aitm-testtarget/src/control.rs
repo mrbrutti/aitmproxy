@@ -3,9 +3,17 @@
 //! from `/`, never in the HTTP scope, never logs its own requests and never
 //! adds the P-mode headers. Seven routes: `GET /services`, `GET /log/http`,
 //! `GET /log/ws`, `GET /log/l4[?service=NAME]`, `GET /log/conns`,
-//! `POST /reset`, `GET /mode`; anything else is a JSON 404. A request that
-//! carries an `Origin` header (a browser page, never the harness) is a JSON
-//! 403 `cross-origin` whatever the route, so a page cannot `POST /reset`.
+//! `POST /reset`, `GET /mode`; anything else is a JSON 404.
+//!
+//! Two refusals run before routing, both JSON 403 whatever the route. A
+//! request whose `Host` (port stripped) is not `127.0.0.1`, `localhost` or
+//! `[::1]`, or that has no `Host` at all, is `bad host`: a DNS-rebinding page
+//! whose name now resolves to 127.0.0.1 reaches this port with its own name
+//! in `Host` and no `Origin` on a navigation or simple GET, and must not be
+//! able to read the logs. The harness dials the loopback address the builder
+//! returned and hyper h1 always supplies `Host`, so it is never affected. A
+//! request that carries an `Origin` header (a browser page, never the
+//! harness) is `cross-origin`, so a page cannot `POST /reset`.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -62,6 +70,17 @@ pub(crate) async fn route<B: Body>(
     req: Request<B>,
     log: Arc<ControlLog>,
 ) -> Result<Resp, Infallible> {
+    let host_ok = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(is_loopback_host);
+    if !host_ok {
+        return Ok(json_response(
+            StatusCode::FORBIDDEN,
+            &json!({ "error": "bad host" }),
+        ));
+    }
     if req.headers().contains_key("origin") {
         return Ok(json_response(
             StatusCode::FORBIDDEN,
@@ -88,6 +107,19 @@ pub(crate) async fn route<B: Body>(
         }
     };
     Ok(json_response(StatusCode::OK, &body))
+}
+
+/// Whether a `Host` header value, with any `:port` stripped, is one of the
+/// control origin's own loopback names: `127.0.0.1`, `localhost` or `[::1]`.
+/// Case-sensitive on purpose (the harness never varies it) and no suffix or
+/// subdomain is accepted.
+fn is_loopback_host(host: &str) -> bool {
+    let name = match (host.starts_with('['), host.find(']')) {
+        // IPv6 literal: the port, if any, follows the closing bracket.
+        (true, Some(end)) => &host[..=end],
+        _ => host.split_once(':').map_or(host, |(name, _)| name),
+    };
+    matches!(name, "127.0.0.1" | "localhost" | "[::1]")
 }
 
 /// The value of `key` in a raw query string (`a=1&b=2`), or `None`. Service
@@ -127,20 +159,23 @@ mod tests {
         SocketAddr::from(([127, 0, 0, 1], port))
     }
 
-    fn get(path: &str) -> Request<Full<Bytes>> {
+    /// A request as the harness sends it: hyper h1 always supplies a `Host`,
+    /// and the harness dials the loopback address the builder returned.
+    fn request(method: &str, path: &str, host: &str) -> Request<Full<Bytes>> {
         Request::builder()
-            .method("GET")
+            .method(method)
             .uri(path)
+            .header("host", host)
             .body(Full::new(Bytes::new()))
             .expect("valid request")
     }
 
+    fn get(path: &str) -> Request<Full<Bytes>> {
+        request("GET", path, "127.0.0.1:4")
+    }
+
     fn post(path: &str) -> Request<Full<Bytes>> {
-        Request::builder()
-            .method("POST")
-            .uri(path)
-            .body(Full::new(Bytes::new()))
-            .expect("valid request")
+        request("POST", path, "127.0.0.1:4")
     }
 
     /// Drive `route` and return `(status, content-type, parsed JSON body)`.
@@ -332,12 +367,9 @@ mod tests {
             ("GET", "/nope"),
         ] {
             for origin in ["http://127.0.0.1:1", "null", "http://evil.example"] {
-                let req = Request::builder()
-                    .method(method)
-                    .uri(path)
-                    .header("origin", origin)
-                    .body(Full::new(Bytes::new()))
-                    .expect("valid request");
+                let mut req = request(method, path, "127.0.0.1:4");
+                req.headers_mut()
+                    .insert("origin", origin.parse().expect("header value"));
                 let (status, ct, body) = call(req, &log).await;
                 assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path} {origin}");
                 assert_eq!(ct, "application/json");
@@ -347,6 +379,100 @@ mod tests {
         // Nothing was reset by the refused POST.
         let (_, _, http) = call(get("/log/http"), &log).await;
         assert_eq!(http["entries"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_request_for_a_non_loopback_host_is_bad_host_403() {
+        // DNS rebinding: a page at `evil.example` whose name is re-pointed at
+        // 127.0.0.1 reaches the port with `Host: evil.example:<port>` and no
+        // `Origin` on a plain navigation or `fetch` GET. The control origin
+        // answers only to its own loopback names, so such a request cannot
+        // read the logs; the check runs before the `Origin` one and before
+        // routing, so no route (not even `/reset`) is reachable through it.
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let conn = log.open_conn(Listener::Plain, None, addr(40003));
+        log.log_request(RequestEntry {
+            seq: 0,
+            ts_ms: 0,
+            conn_id: conn.conn_id.clone(),
+            listener: conn.listener,
+            version: HttpVersion::H1,
+            conn_req_index: conn.next_request_index(),
+            method: "GET".to_string(),
+            path: "/".to_string(),
+            query: String::new(),
+            headers: Default::default(),
+            cookie_names: Vec::new(),
+            cookie_sha256: None,
+            auth_sha256: None,
+            body_len: 0,
+            body_sha256: sha256_hex(b""),
+            status: 200,
+        });
+        for (method, path) in [("POST", "/reset"), ("GET", "/log/http"), ("GET", "/nope")] {
+            for host in [
+                "evil.example:1",
+                "evil.example",
+                "127.0.0.1.evil.example",
+                "localhost.evil.example:5",
+                "10.0.0.1:5",
+                "",
+            ] {
+                let (status, ct, body) = call(request(method, path, host), &log).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{method} {path} Host={host:?}"
+                );
+                assert_eq!(ct, "application/json", "{method} {path} Host={host:?}");
+                assert_eq!(
+                    body,
+                    json!({ "error": "bad host" }),
+                    "{method} {path} Host={host:?}"
+                );
+            }
+        }
+        // No `Host` at all (hyper h1 never does this; a hand-built request) is
+        // refused the same way.
+        let no_host = Request::builder()
+            .method("GET")
+            .uri("/mode")
+            .body(Full::new(Bytes::new()))
+            .expect("valid request");
+        let (status, _, body) = call(no_host, &log).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({ "error": "bad host" }));
+        // Nothing was reset by the refused POSTs.
+        let (_, _, http) = call(get("/log/http"), &log).await;
+        assert_eq!(http["entries"].as_array().map(Vec::len), Some(1));
+
+        // The loopback names, with or without a port, route normally.
+        for host in [
+            "127.0.0.1:5",
+            "127.0.0.1",
+            "localhost",
+            "localhost:65535",
+            "[::1]",
+            "[::1]:7",
+        ] {
+            let (status, ct, body) = call(request("GET", "/mode", host), &log).await;
+            assert_eq!(status, StatusCode::OK, "Host={host}");
+            assert_eq!(ct, "application/json");
+            assert_eq!(body, json!({ "mode": "vulnerable" }), "Host={host}");
+            let (status, _, body) = call(request("GET", "/nope", host), &log).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "Host={host}");
+            assert_eq!(body, json!({ "error": "not found" }));
+        }
+        // A bad host with an `Origin` too is `bad host`, not `cross-origin`:
+        // the host check comes first.
+        let mut req = request("POST", "/reset", "evil.example:1");
+        req.headers_mut().insert(
+            "origin",
+            "http://evil.example".parse().expect("header value"),
+        );
+        let (status, _, body) = call(req, &log).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, json!({ "error": "bad host" }));
     }
 
     // --- Tester additions (stage 5): the remaining D2 routes and non-routes ---

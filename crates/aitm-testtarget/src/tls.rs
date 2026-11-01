@@ -209,16 +209,18 @@ mod tests {
     fn one_identity_serves_both_alpn_lists() {
         // Every `self_signed` call mints a different certificate, so the two
         // TLS listeners must be built from one borrowed identity (spec D1:
-        // one self-signed certificate per process). The socket proof that
-        // both listeners present the same DER is `tls_listener_negotiates_h2_and_h1`.
+        // one self-signed certificate per process). This test only shows
+        // that both configs can be built from the same `&Identity` with
+        // different ALPN lists; `rustls::ServerConfig` does not expose the
+        // certificate it will present, so the only proof that the two
+        // listeners actually serve one leaf DER is the socket test
+        // `tls_listener_negotiates_h2_and_h1` in `tests/scan_http.rs`.
         let a = self_signed().expect("identity a");
         let b = self_signed().expect("identity b");
         assert_ne!(a.cert_der(), b.cert_der(), "fresh identities differ");
         let h2_h1 = server_config(ALPN_H2_H1, &a).expect("h2+h1 config from a");
         let h1 = server_config(ALPN_H1, &a).expect("h1 config from the same a");
         assert_ne!(h2_h1.alpn_protocols, h1.alpn_protocols);
-        // The identity is still usable afterwards (borrowed, not consumed).
-        assert_eq!(a.cert_der().len(), a.cert_der().len());
     }
 
     #[test]

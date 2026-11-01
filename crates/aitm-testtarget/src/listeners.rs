@@ -120,6 +120,5 @@ mod tests {
             "{attempts:?}"
         );
         assert_eq!(served.load(Ordering::SeqCst), 1);
-        assert_eq!(SOCKET_ERROR_BACKOFF, Duration::from_millis(10));
     }
 }
