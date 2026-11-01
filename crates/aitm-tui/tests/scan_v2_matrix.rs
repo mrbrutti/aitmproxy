@@ -255,12 +255,23 @@ fn v2_site_map_enter_opens_the_v2_nodes_first_flow() {
 
     let _ = app.update(Action::OpenScan);
     let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
-    app.scan.sitemap.nodes = result.nodes;
-    app.scan.sitemap.nodes.push(second);
-    app.scan.sitemap.points = result.points;
+    // The two-node page arrives through the fold (fix round G, G13), so
+    // the lines and the point order are built as they are live.
+    let mut page = sitemap;
+    page["nodes"] = serde_json::json!([
+        serde_json::to_value(&result.nodes[0]).expect("the node serialises"),
+        serde_json::to_value(&second).expect("the node serialises"),
+    ]);
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.sitemap".into(),
+        name: "scan.sitemap".into(),
+        value: page,
+    });
     app.scan.sitemap.pane = MapPane::Nodes;
     app.scan.legacy.endpoints = vec!["http://127.0.0.1:8080/legacy".into()];
     assert_eq!(app.scan.sitemap.nodes.len(), 2);
+    assert_eq!(app.scan.sitemap.lines.len(), 2, "the fold built the lines");
+    assert_eq!(app.scan.sitemap.points.len(), 2);
 
     let _ = app.update(Action::Down);
     assert_eq!(
