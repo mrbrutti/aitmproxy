@@ -91,15 +91,19 @@ struct ProviderRuleSet: Equatable {
 
     /// Wildcards the header forbids with port 0; no real flow has them as destination.
     private static let wildcardAddresses: Set<String> = ["0.0.0.0", "::"]
+    /// The IPv4 limited broadcast; `IPv4Address` has no property for it.
+    private static let limitedBroadcast = "255.255.255.255"
 
     /// The rule set wanted for `scope`: the TCP catch-all plus one UDP rule per
-    /// claimable IP token, in canonical order. `nil` (no core attached) is TCP-only.
+    /// claimable IP token, in canonical order, capped at `maxUDPTargets`. `nil` (no core
+    /// attached) is TCP-only. Skipped silently (spec Design H as amended): wildcards,
+    /// loopback, multicast, the limited broadcast, and any text `Network.NWEndpoint.Host`
+    /// does not read as an IP (cannot happen for `IPText.canonical` output; a guard).
     static func wanted(for scope: ScopeMatcher?) -> ProviderRuleSet {
         var targets: [UDPTarget] = []
         for entry in scope?.udpClaimableIPEntries ?? [] {
             guard case .ip(let address) = entry.target else { continue }
-            if wildcardAddresses.contains(address) { continue }
-            guard hostAndPrefix(for: address) != nil else { continue }
+            guard let parsed = hostAndPrefix(for: address), !isSkipped(parsed.host, text: address) else { continue }
             targets.append(UDPTarget(address, entry.port))
         }
         var canonical: [UDPTarget] = []
@@ -141,6 +145,23 @@ struct ProviderRuleSet: Equatable {
         let targets = udpTargets.map(\.summaryText).joined(separator: ", ")
         let suffix = dropped > 0 ? " (+\(dropped) dropped)" : ""
         return "\(1 + udpTargets.count) rules (TCP catch-all + UDP \(targets))\(suffix)"
+    }
+
+    /// Addresses that yield no rule: the wildcards (the header forbids them with port 0
+    /// and no real flow has that destination), loopback (the kernel never diverts it,
+    /// NE header "except loopback"), multicast, and the IPv4 limited broadcast -- one
+    /// rule the kernel rejects would block the whole set. Under-inclusive by design.
+    private static func isSkipped(_ host: Network.NWEndpoint.Host, text address: String) -> Bool {
+        if wildcardAddresses.contains(address) || address == limitedBroadcast { return true }
+        switch host {
+        case .ipv4(let v4):
+            // `isLoopback` matches only 127.0.0.1 on the macOS 27 SDK (pinned by the
+            // 127.200.1.2 vector); the whole 127/8 block is loopback, so test the octet.
+            return v4.isLoopback || v4.rawValue.first == 127 || v4.isMulticast
+        case .ipv6(let v6): return v6.isLoopback || v6.isMulticast
+        case .name: return true
+        @unknown default: return true
+        }
     }
 
     /// The parsed host and the host-route prefix for a canonical IP text; nil when
@@ -286,8 +307,9 @@ extension HandoffSelfCheck {
     /// dropped count in the summary; an IPv4-mapped IPv6 token is unmapped by `IPText.canonical` and
     /// yields the SAME /32 IPv4 rule as the plain token; a spec made only of
     /// never-claimed ports, wildcards (any port -- spec H is unconditional) and malformed
-    /// tokens is TCP-only; loopback is not a wildcard; the summary's count prefix follows
-    /// the rule count.
+    /// tokens is TCP-only; loopback, multicast and the limited broadcast are skipped like
+    /// the wildcards (spec H as amended, fix F5); the summary's count prefix follows the
+    /// rule count.
     static func providerRulesEdges(_ r: Recorder) {
         typealias Target = ProviderRuleSet.UDPTarget
 
@@ -410,12 +432,24 @@ extension HandoffSelfCheck {
               ScopeMatcher(spec: "0.0.0.0:8080 [::]:443").udpClaimableIPEntries.count == 2)
         r.check("providerRulesEdges: a separators-only spec is TCP-only",
               ProviderRuleSet.wanted(for: ScopeMatcher(spec: " ,;\n\t")) == .tcpOnly)
-        // Loopback is not a wildcard: spec H names only 0.0.0.0 and ::, so a loopback
-        // token yields a rule (the kernel never diverts loopback anyway).
-        r.check("providerRulesEdges: loopback tokens are not skipped",
-              ProviderRuleSet.wanted(for: ScopeMatcher(spec: "127.0.0.1:9000 [::1]:9000")).udpTargets
-                  == [Target("127.0.0.1", 9000), Target("::1", 9000)],
-              "\(ProviderRuleSet.wanted(for: ScopeMatcher(spec: "127.0.0.1:9000 [::1]:9000")).udpTargets)")
+        // Loopback, multicast and the IPv4 limited broadcast are skipped (spec H as
+        // amended): the kernel never diverts loopback, and one rule it rejects would
+        // block the whole set. The matcher does hold these entries; the skip is in wanted.
+        let skippedTokens = ["127.0.0.1:9000", "[::1]:9000", "224.0.0.251", "224.0.0.251:9000",
+                             "[ff02::fb]:5353", "[ff02::fb]:9000", "255.255.255.255:1900",
+                             "127.0.0.1", "[::1]", "255.255.255.255", "127.200.1.2:443", "[ff05::1:3]:547"]
+        for token in skippedTokens {
+            let w = ProviderRuleSet.wanted(for: ScopeMatcher(spec: token))
+            r.check("providerRulesEdges: \(token) -> tcpOnly", w == .tcpOnly, "\(w.udpTargets)")
+        }
+        r.check("providerRulesEdges: the matcher holds every skipped token but the :5353 one as claimable",
+              ScopeMatcher(spec: skippedTokens.joined(separator: " ")).udpClaimableIPEntries.count == skippedTokens.count - 1,
+              "\(ScopeMatcher(spec: skippedTokens.joined(separator: " ")).udpClaimableIPEntries.count)")
+        let mixed = ProviderRuleSet.wanted(for: ScopeMatcher(spec: "127.0.0.1:9000 198.51.100.7:443 [::1] 224.0.0.251 255.255.255.255"))
+        r.check("providerRulesEdges: a real target survives beside skipped loopback/multicast/broadcast tokens",
+              mixed.udpTargets == [Target("198.51.100.7", 443)] && mixed.dropped == 0, "\(mixed.udpTargets)")
+        r.check("providerRulesEdges: skipped tokens are not counted as dropped",
+              ProviderRuleSet.wanted(for: ScopeMatcher(spec: "127.0.0.1:9000 [::1]:9000")).dropped == 0)
     }
 }
 #endif
