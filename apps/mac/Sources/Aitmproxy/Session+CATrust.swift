@@ -1,6 +1,7 @@
 import AitmBusClient
 import AitmproxyKit
 import Foundation
+import os.log
 
 /// The one call path for CA trust in the mac app (spec 2026-10-31-system-proxy-automation-design
 /// §D17.10): the only home of the `"ca.install"` and `"ca.uninstall"` literals, the D17.1 scope
@@ -9,13 +10,15 @@ import Foundation
 /// from the forced `ca.status` re-read, never from the reply (D17.5). The CA panel, the first-run
 /// sheet, the Status card and the Proxy menu all come here; `tools/check-ca-trust-path.sh` pins it.
 extension Session {
+    private static let caLog = Logger(subsystem: "com.mrbrutti.aitmproxy", category: "ca-trust")
+
     /// The CA fact of the Core lane and its Getting-started step; nil until `ca.status` has been
-    /// read, the certificate exists and some store has said yes or no. The read-back outranks the
-    /// needs-admin latch: a trusted store is trusted whatever the last change said.
+    /// read, the certificate exists and some store has said yes or no. The Kit ranks the read-back
+    /// over the needs-admin latch (`CATrustFacts`, pinned by its tests).
     var caTrust: CATrustFacts? {
         guard let caStatus, caStatus.exists, var facts = CATrustFacts(status: caStatus) else { return nil }
         facts.installing = caTrustInstalling
-        facts.needsAdmin = caTrustNeedsAdmin && !facts.trusted
+        facts.needsAdmin = caTrustNeedsAdmin
         return facts
     }
 
@@ -48,23 +51,45 @@ extension Session {
     func untrustCA() async { await changeCATrust("ca.uninstall") }
 
     /// `ca.status` read directly on the bus (no activity-log entry, like `proxy.status`),
-    /// assigned only when it changed; a trusted store clears the needs-admin latch and the last
-    /// trust error. Returns whether the read-back landed: false for a core without the verb, no
-    /// bus, or an unparseable reply, which leaves the status as is.
+    /// assigned only when it changed. A trusted store clears the needs-admin latch, and a failed
+    /// install's error (its end state holds); a failed uninstall's stays until an uninstall's does.
+    /// Returns whether the read-back landed: false for a core without the verb, no bus, or an
+    /// unparseable reply, which leaves the status as is.
     @discardableResult
     func refreshCAStatus() async -> Bool {
-        guard let commandRunner, let json = try? await commandRunner("ca.status", [:]),
-              let status = CAStatus(json: json) else { return false }
+        guard let commandRunner else { return false }
+        let json: JSONValue
+        do {
+            json = try await commandRunner("ca.status", [:])
+        } catch {
+            Self.caLog.debug("ca.status not read: \(BusService.describe(error), privacy: .public)")
+            return false
+        }
+        guard let status = CAStatus(json: json) else {
+            Self.caLog.debug("ca.status reply did not decode")
+            return false
+        }
         if status != caStatus { caStatus = status }
         if status.trustedScope != nil {
             caTrustNeedsAdmin = false
-            caTrustLastError = nil
+            if caTrustLastError?.command == "ca.install" { caTrustLastError = nil }
         }
         return true
     }
 
+    /// No bus, no fact: the read-back, the latch and the last failure all belong to a connection.
+    func forgetCATrust() {
+        caStatus = nil
+        caTrustNeedsAdmin = false
+        caTrustLastError = nil
+    }
+
     private func changeCATrust(_ command: String) async {
-        guard caTrustControlLive else { return }
+        guard !caTrustInstalling else { return }
+        guard caTrustControlLive else {
+            fail(command, CATrustFacts.notOperatorLine)
+            return
+        }
         caTrustInstalling = true
         defer { caTrustInstalling = false }
         if caStatus == nil { await refreshCAStatus() }
@@ -87,15 +112,21 @@ extension Session {
                 caTrustLastError = nil
             } else {
                 caTrustNeedsAdmin = CATrustFacts.signalsNeedsAdmin(message)
-                caTrustLastError = "\(command): \(message)"
-                lastError = caTrustLastError
+                fail(command, message)
             }
         }
-        let readBack = await refreshCAStatus()
-        if !readBack, caTrustLastError == nil {
-            caTrustLastError = "the CA may have changed but ca.status could not be read"
-            lastError = caTrustLastError
+        // The fact is the store's (D17.5). A failure clears only when the store now says the verb's
+        // end state holds: trusted after an install, not trusted after an uninstall.
+        guard await refreshCAStatus(), let caStatus, caStatus.trustReported else {
+            if caTrustLastError == nil { fail(command, CATrustFacts.readBackFailedLine) }
+            return
         }
+        if (caStatus.trustedScope != nil) == (command == "ca.install") { caTrustLastError = nil }
+    }
+
+    private func fail(_ command: String, _ message: String) {
+        caTrustLastError = CATrustFailure(command: command, message: message)
+        lastError = caTrustLastError?.line
     }
 
     // MARK: First-run sheet (spec D17.8)

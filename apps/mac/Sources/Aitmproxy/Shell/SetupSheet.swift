@@ -54,7 +54,7 @@ struct SetupSheet: View {
         return SetupRow(number: 1, title: ConnectionAction.trustCA.title, done: caDone) {
             Group {
                 if let facts {
-                    LaneDot(state: facts.state, word: facts.text, label: "Certificate Authority: \(facts.text)")
+                    LaneDot(state: facts.state, word: facts.text, title: CATrustFacts.laneTitle)
                 } else {
                     Text((session.caTrustStep ?? CATrustFacts.unknownStep()).title)
                 }

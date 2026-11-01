@@ -139,9 +139,7 @@ final class BusService: FlowActions {
             session.downBytesPerSecond = 0
             // No connection means no fact: the CA row and step must not keep a stale store's word,
             // nor the last change's latch and error.
-            session.caStatus = nil
-            session.caTrustNeedsAdmin = false
-            session.caTrustLastError = nil
+            session.forgetCATrust()
         }
         var tick = 0
         while !Task.isCancelled {

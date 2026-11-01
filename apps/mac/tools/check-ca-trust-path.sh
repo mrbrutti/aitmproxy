@@ -12,8 +12,8 @@
 # source and fails closed.
 #
 # Usage: tools/check-ca-trust-path.sh [mac-dir]   (default: the apps/mac that holds this script)
-#        tools/check-ca-trust-path.sh --self-check   plants one violation per rule in a copy and
-#                                                    expects each rule's tag on its file
+#        tools/check-ca-trust-path.sh --self-check   plants one violation per rule (two for rule 2)
+#                                                    in a copy and expects each rule's tag on its file
 # Exit 0 and "PASS" on a clean tree. Exit 1 on any violation, printing each offending
 # "file:line" (relative to apps/mac) with its text.
 #
@@ -38,7 +38,10 @@
 #      expect). An UNDOTTED `trustCA(` / `untrustCA(` (a call from inside an `extension
 #      Session`, or a second definition) may appear in those four files and in
 #      Session+CATrust.swift only, where the undotted matches are exactly the two `func`
-#      definitions (pinned by count).
+#      definitions (pinned by count). A BARE member reference — `session.trustCA`,
+#      `self.untrustCA`, `Session.trustCA` with no `(` after it, the method handed on as a
+#      value — may appear in those five files only. The receiver is required because
+#      `.trustCA` is also the `ConnectionAction` case every surface names.
 #   3. The scope: AitmproxyKit/CATrustFacts.swift renders `.string("user")` (expect);
 #      Session+CATrust.swift calls `scopeArgs(platform:` (expect) and never spells "system"
 #      (deny); no file under the scan roots spells `.string("system")`.
@@ -68,10 +71,14 @@ if [ "${1:-}" = "--self-check" ]; then
     echo "SELF-CHECK FAIL: the clean copy does not pass; fix the tree first"
     exit 1
   fi
-  # One plant per rule: a quoted verb (rule 1), an undotted call from inside an extension
-  # Session outside the allow-list (rule 2), a bare token on an agent-reachable surface (rule 4).
+  # One plant per rule, two for rule 2: a quoted verb (rule 1), an undotted call from inside an
+  # extension Session outside the allow-list and a bare member reference outside it (rule 2),
+  # the "system" scope literal in the call path (rule 3), a bare token on an agent-reachable
+  # surface (rule 4).
   printf '\nlet _ = "ca.install"\n' >> "$work/Sources/Aitmproxy/Session+Verbs.swift"
   printf '\nextension Session {\n    func plantedTrust() async { await trustCA() }\n}\n' >> "$work/Sources/Aitmproxy/Session+Connection.swift"
+  printf '\nextension Session {\n    var plantedTrustRef: () async -> Void { self.trustCA }\n}\n' >> "$work/Sources/Aitmproxy/Panels/ConfigPanel.swift"
+  printf '\nlet _ = JSONValue.string("system")\n' >> "$work/Sources/Aitmproxy/Session+CATrust.swift"
   printf '\n// planted: trustCA\n' >> "$work/Sources/Aitmproxy/Panels/AgentPanel.swift"
   out=$(bash "$self" "$work" 2>&1); rc=$?
   printf '%s\n' "$out"
@@ -81,10 +88,14 @@ if [ "${1:-}" = "--self-check" ]; then
     || { echo "SELF-CHECK FAIL: rule 1 did not name the planted \"ca.install\" in Session+Verbs.swift"; ok=0; }
   grep -qE '^VIOLATION \[2 [^]]*\] Sources/Aitmproxy/Session\+Connection\.swift:' <<<"$out" \
     || { echo "SELF-CHECK FAIL: rule 2 did not name the planted undotted trustCA() in Session+Connection.swift"; ok=0; }
+  grep -qE '^VIOLATION \[2 [^]]*\] Sources/Aitmproxy/Panels/ConfigPanel\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 2 did not name the planted bare self.trustCA reference in Panels/ConfigPanel.swift"; ok=0; }
+  grep -qE '^VIOLATION \[3 [^]]*\] Sources/Aitmproxy/Session\+CATrust\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 3 did not name the planted .string(\"system\") in Session+CATrust.swift"; ok=0; }
   grep -qE '^VIOLATION \[4 [^]]*\] Sources/Aitmproxy/Panels/AgentPanel\.swift:' <<<"$out" \
     || { echo "SELF-CHECK FAIL: rule 4 did not name the planted trustCA token in Panels/AgentPanel.swift"; ok=0; }
   if [ "$ok" -eq 1 ]; then
-    echo "SELF-CHECK PASS: rules 1, 2 and 4 each caught their planted violation"
+    echo "SELF-CHECK PASS: rules 1–4 each caught their planted violation"
     exit 0
   fi
   exit 1
@@ -216,6 +227,10 @@ scan "2 trustCA()/untrustCA() call" "$undotted_re" "$ca_panel" "$setup_sheet" "$
 expect "2 trustCA()/untrustCA() call" "$ca_trust" 'func trustCA\(\)' 'func trustCA()'
 expect "2 trustCA()/untrustCA() call" "$ca_trust" 'func untrustCA\(\)' 'func untrustCA()'
 expect_count "2 trustCA()/untrustCA() call" "$ca_trust" "$undotted_re" 2 'an undotted trustCA(/untrustCA( (the two func definitions)'
+# Bare: the method as a value, `session.trustCA` / `self.untrustCA` / `Session.trustCA` with no
+# `(` after it. The receiver is required: `.trustCA` alone is also the ConnectionAction case.
+bare_re='([Ss]ession|self)\.(un)?trustCA([^A-Za-z0-9_(]|$)'
+scan "2 trustCA()/untrustCA() call" "$bare_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift" "$ca_trust"
 
 # ---- 3. the scope is the user store, never "system" ----------------------------------
 expect "3 user scope" "$ca_facts" '\.string\("user"\)' 'the .string("user") scope'

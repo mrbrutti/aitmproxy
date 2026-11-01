@@ -34,10 +34,10 @@ struct LaneDot: View {
         self.quietWhenOK = quietWhenOK
     }
 
-    init(state: LaneState, word: String, label: String) {
+    init(state: LaneState, word: String, title: String) {
         self.state = state
         self.word = word
-        self.label = label
+        label = "\(title): \(word)"
     }
 
     var body: some View {

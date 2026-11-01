@@ -37,6 +37,12 @@ public struct CATrustFacts: Hashable, Sendable {
     static let needsAdminMacLine = "macOS did not show its authentication dialog. Open the Certificate Authority panel, export the certificate and trust it in Keychain Access."
     /// The Agent log's answer to an agent's `ca.install` / `ca.uninstall` request: the operator trusts the CA from the app's own surfaces.
     public static let operatorOnlyNote = "not approved from the Agent log — the operator uses \(ConnectionAction.trustCA.title)"
+    /// The spoken title of the CA fact's dot, "<title>: <word>", on the Status page and the first-run sheet.
+    public static let laneTitle = "Certificate Authority"
+    /// A trust change ran but the forced `ca.status` re-read did not land (D17.5: the reply is not the fact).
+    public static let readBackFailedLine = "the CA may have changed but ca.status could not be read"
+    /// The one call path refused: the bus is connected, but not as the operator.
+    public static let notOperatorLine = "the bus is not the operator's"
 
     /// The fact text (D17.6).
     public var text: String {
@@ -98,4 +104,18 @@ public struct CATrustFacts: Hashable, Sendable {
     public static func signalsNeedsAdmin(_ errorText: String) -> Bool {
         errorText.contains("without a GUI session") || errorText.contains("needs root")
     }
+}
+
+/// The last trust change's failure, kept with the verb it came from so a read-back clears it only
+/// when that verb's end state is what the store now says; the CA panel shows `line`.
+public struct CATrustFailure: Hashable, Sendable {
+    public var command: String
+    public var message: String
+
+    public init(command: String, message: String) {
+        self.command = command
+        self.message = message
+    }
+
+    public var line: String { "\(command): \(message)" }
 }

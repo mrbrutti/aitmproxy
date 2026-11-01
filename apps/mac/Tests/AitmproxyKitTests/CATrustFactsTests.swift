@@ -315,9 +315,24 @@ import Testing
         #expect(CATrustFacts.signalsNeedsAdmin("tool ca.install failed (code -32000): needs root: run aitm ca install from a shell where sudo can prompt, or start the proxy as root (tee: exit 1)"))
     }
 
-    /// E: the sheet's words have one Kit home.
-    @Test func setupWordsAreTheSheetsWords() {
-        #expect(SetupWords.sheetTitle == "Set up aitmproxy on this Mac")
-        #expect(SetupWords.scopeCaption == "Nothing is decrypted until a host is in Scope")
+    /// The words every CA surface shares: the spoken lane title (one speaker per row), the line
+    /// for a post-change read-back that did not land, the line for a refused call when the bus is
+    /// not the operator's.
+    @Test func surfaceWordsHaveOneHome() {
+        #expect(CATrustFacts.laneTitle == "Certificate Authority")
+        #expect(CATrustFacts.readBackFailedLine == "the CA may have changed but ca.status could not be read")
+        #expect(CATrustFacts.notOperatorLine == "the bus is not the operator's")
+    }
+
+    /// A trust failure keeps the verb it came from, so a later read-back clears it only when that
+    /// verb's end state is what the store now says; the CA panel shows "<verb>: <message>".
+    @Test func failureCarriesItsCommand() {
+        let failure = CATrustFailure(command: "ca.uninstall", message: "security: exit 1")
+        #expect(failure.command == "ca.uninstall")
+        #expect(failure.message == "security: exit 1")
+        #expect(failure.line == "ca.uninstall: security: exit 1")
+        let refused = CATrustFailure(command: "ca.install", message: CATrustFacts.notOperatorLine)
+        #expect(refused.line == "ca.install: the bus is not the operator's")
+        #expect(failure != refused)
     }
 }

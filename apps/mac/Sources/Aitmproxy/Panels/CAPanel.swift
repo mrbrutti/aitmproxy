@@ -66,7 +66,7 @@ struct CAPanel: View {
             if let facts = session.caTrust, !facts.trusted, let remedy = facts.remedy {
                 RemedyText(remedy, color: Tok.State.warning.fg)
             }
-            if let error = session.caTrustLastError { errorLabel(error) }
+            if let failure = session.caTrustLastError { errorLabel(failure.line) }
             if let actionError { errorLabel(actionError) }
             Hint(text: CATrustFacts.quicCaveat)
         }
@@ -167,11 +167,12 @@ struct CAPanel: View {
             FlatButton("Export PEM…") { export(format: "pem") }.disabled(busy || !status.exists)
             FlatButton("Export DER…") { export(format: "der") }.disabled(busy || !status.exists)
             Spacer()
+            // Live only while the bus is the operator's and no change is in flight, like the sheet's button.
             if status.installed {
-                FlatButton("Uninstall…") { change(install: false, status: status) }.disabled(busy || session.caTrustInstalling)
+                FlatButton("Uninstall…") { change(install: false, status: status) }.disabled(busy || !session.caTrustControlLive)
             } else {
                 PrimaryButton("Install…") { change(install: true, status: status) }
-                    .disabled(busy || session.caTrustInstalling || !status.exists)
+                    .disabled(busy || !session.caTrustControlLive || !status.exists)
             }
         }
     }

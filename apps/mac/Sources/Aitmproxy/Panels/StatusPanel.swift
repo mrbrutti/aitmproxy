@@ -311,7 +311,7 @@ private struct CATrustRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            LaneDot(state: facts.state, word: facts.text, label: "Certificate Authority: \(facts.text)")
+            LaneDot(state: facts.state, word: facts.text, title: CATrustFacts.laneTitle)
                 .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
                 .foregroundStyle(Tok.Ink.primary.color)
             if let remedy = facts.remedy {
@@ -327,7 +327,6 @@ private struct CATrustRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Certificate Authority: \(facts.text)")
     }
 }
 
