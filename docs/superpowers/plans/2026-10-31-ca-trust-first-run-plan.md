@@ -109,10 +109,34 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 16. **`confirm_prompt` and a doomed system request.** `confirm_prompt` has no frontend, so a hand-rolled bus client sending `scope: "system"` is prompted and then refused by correction 7's guard; accepted as a residual (no frontend sends `"system"`, SP-AC34), a `Command` trait change is the follow-up.
 17. **PR A files.** Besides the table above, PR A touches `crates/aitm-ca/src/audit.rs`, `crates/aitm-ca/tests/audit.rs`, `crates/aitm-ca/src/platform/mod.rs` (shared tail rendering) and `crates/aitm-ca/src/testing.rs` (test literals, `unspawnable`).
 
+18. **SP-AC33 `overall` assertions deferred.** `make(caTrust:).overall` composition and the index-2 pin need `ConnectionSummary.make(caTrust:)`, which belongs to mac-attribution's rebase (correction 13); until then `overall` excludes the CA state and the Status view inserts the step after Bus (app target, proven live).
+19. **PR D files.** `Shell/ShellView.swift` (the sheet attachment) replaces `Shell/ShellToolbar.swift` in the table; PR 4's toolbar condition ORs into `Session.setupSheetDue`. `AitmproxyKit/Panels/CAStatus.swift` (two fields), `AitmproxyKit/SetupWords.swift` (new), `AitmproxyKit/Panels/Activity.swift` (`_confirm` elision), `UI/ConnectionLook.swift` (dot/remedy parts), `Session+Palette.swift` and `Panels/AgentPanel.swift` (confirm-gated CA verbs kept off the generic paths) join the table. `SetupRow` numbers are 1 and 2 today; PR 4 renumbers to 2 and 3.
+20. **`CATrustFacts` surface.** `platform` (chooses the Linux vs macOS needs-admin remedy), `isCancelled`, `signalsNeedsAdmin`, `notGeneratedStep()` are part of the type; the tripwire's extra checks (tree-wide `.string("system")`, `FixtureBus.swift`, fixture files denied the runners) are accepted.
+21. **D17.6 `exists == false` row** renders as the step "CA not generated yet — the core creates it on first start" (no action) on the Status page and the sheet; the CA panel keeps its "No certificate" badge.
+
 ## Review log
 
 | Date | PR | Reviewer | Finding | Severity | Disposition |
 |---|---|---|---|---|---|
+| 2026-11-01 | D mac | security + quality | needs-admin latch overrides the read-back; step done while state warning | Important | fix task M1 (A) |
+| 2026-11-01 | D mac | security | `changeCATrust` trusts its callers; Status row buttons not gated | Minor | fix task M1 (B) |
+| 2026-11-01 | D mac | security + spec | tripwire: dotted-only rule 2, absent rule-4 file skipped, harness files not denied, self-check proves one rule | Minor / Important (spec) | fix task M1 (J) |
+| 2026-11-01 | D mac | security | palette/approve can issue `ca.install` by name (pre-existing; no handshake, never completes) | Minor | fix task M1 (M) |
+| 2026-11-01 | D mac | security | consumed `_confirm` token lands in the activity log | Minor | fix task M1 (N) |
+| 2026-11-01 | D mac | quality | `refreshCAStatus` swallows a failed post-change read-back | Minor | fix task M1 (C) |
+| 2026-11-01 | D mac | quality | prefix matching inconsistent; audit-context prefix breaks it | Minor | fix task M1 (D) |
+| 2026-11-01 | D mac | quality | sheet's Scope sentence has no Kit home | Minor | fix task M1 (E) |
+| 2026-11-01 | D mac | quality | three hand-rolled dot/remedy renderings | Minor | fix task M1 (F) |
+| 2026-11-01 | D mac | quality | sheet row repeats the same sentence three times | Minor | fix task M1 (G) |
+| 2026-11-01 | D mac | quality | sticky `caTrustLastError` hides export errors; CA panel says "No certificate" when the bus is down | Minor | fix task M1 (H) |
+| 2026-11-01 | D mac | quality | `onChange(of: setupSheetDue)` without `initial:` | Minor | fix task M1 (I) |
+| 2026-11-01 | D mac | quality | tripwire helpers copied from the capture script | Minor | accepted (two scripts, two invariants; a shared lib is a follow-up) |
+| 2026-11-01 | D mac | quality | test name vs fixture; `caDone` recomputed; `step.action`; `allStepsDone` unused | Minor | fix task M1 (L); `allStepsDone` stays for attribution's `make(caTrust:)` |
+| 2026-11-01 | D mac | spec | SP-AC33 `overall` assertions and index-2 pin absent | Important (disposition) | correction 18 |
+| 2026-11-01 | D mac | spec | `ShellView.swift` undeclared, `ShellToolbar.swift` untouched | Important (disposition) | correction 19 |
+| 2026-11-01 | D mac | spec | D17.6 `exists == false` row not rendered | Important | fix task M1 (K), correction 21 |
+| 2026-11-01 | D mac | spec | `CATrustFacts` surface beyond the record; extra tripwire checks | Minor | correction 20 |
+| 2026-11-01 | D mac | spec | `isCancelled` install-only | Minor | fix task M1 (D), correction 15 |
 | 2026-11-01 | A core | security (re) | delete arm in `install` matches `Trust::Unknown` too | Minor | fix task C2: key on `Trust::No` |
 | 2026-11-01 | A core | security (re) + quality (re) | re-trust delete has no SHA-1 fallback; third copy of the delete line | Minor | fix task C2: `Op::delete_copy` |
 | 2026-11-01 | A core | security (re) + spec (re) | `confirm_prompt` still prompts a doomed non-CLI system request | Minor | correction 16: accepted residual |
