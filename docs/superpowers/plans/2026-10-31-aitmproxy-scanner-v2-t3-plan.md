@@ -182,6 +182,25 @@ same commit as the T1b merge and the pin re-point; Tasks 12-16 then become
 verification against the real engine rather than authoring from scratch. The
 `probe.*` shape the drafts assume is S5 unless T1b's bridge says otherwise.
 
+
+**Amendment A5 (coordinator, 2026-11-01): two plan-level acceptance criteria for the
+raw-h2 checks, implemented after the T1b merge (Task 11, since the hooks
+`ProbeHost::charge(units) -> bool` and `ProbeHost::baseline_peer_addr() ->
+Option<SocketAddr>` arrive with T1b):**
+- **T3-6** Every raw-h2 check calls `host.charge(plan.streams.max(1))` before dialling
+  and returns `Inconclusive` ("budget refused the raw probe") when it is `false`; the
+  live cell shows `scan.status.probes.sent` growing by the stream count (0/8/3/2/2) per
+  authority. Unit: a host whose `charge` returns false -> `runner.calls() == 0`; a
+  counting host records exactly the stream count.
+- **T3-7** The raw probe dials `host.baseline_peer_addr()`: the driver gains
+  `RawH2Target.addr: Option<SocketAddr>` (pre-validated address; when `Some` the
+  resolver is not consulted and the SSRF gate still checks that address); the check
+  returns `Inconclusive` ("baseline peer address unknown") when the hook returns `None`
+  and refuses when the address differs from the one the baseline reported. Unit: a host
+  returning `Some(addr)` -> the dialer is called with exactly `addr`; `None` -> no dial.
+Until the merge, F3 implements the `budget_left() >= streams` pre-check (SEC-C2) and
+the normalised profile-origin match (C6/SEC-C3) as the interim.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
