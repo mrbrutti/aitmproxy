@@ -160,7 +160,6 @@ pub fn send_recv(
     // interface to receive — deny-by-default refuses here, before the capture opens or
     // a byte reaches the wire. Both permits are held for the operation's lifetime
     // (moved into the worker thread).
-    let stimulus_proto = spec.packet.transport_proto();
     let inject_permit = guard.check(L4Action::Inject, &real_target)?;
 
     // A send-and-receive observes the reply arriving on the interface; the bind
@@ -175,10 +174,15 @@ pub fn send_recv(
     };
     let capture_permit = guard.check(L4Action::Capture, &capture_target)?;
 
+    // The reply is correlated by the transport *decoded from the built frame*
+    // (the same decode the C3 check used), not by the spec's layer list: a stimulus
+    // handed over as one pre-built `Raw` frame has no transport layer in its spec
+    // yet is an IPv4/UDP (or TCP) packet on the wire, and its reversed five-tuple
+    // must still classify `Response` (scanner v2 T5 review, finding T2).
     let correlation = Correlation {
         dst: spec.dst,
         dst_port: spec.dst_port,
-        proto: stimulus_proto,
+        proto: real_target.proto,
         expect: spec.expect,
         stimulus: bytes.clone(),
     };
@@ -441,7 +445,7 @@ mod tests {
 
     use crate::backend::CaptureSource;
     use crate::config::L4Config;
-    use crate::craft::{Ipv4Spec, Layer, UdpSpec};
+    use crate::craft::{Ipv4Spec, Layer, TcpSpec, UdpSpec};
     use crate::flow::InMemoryL4FlowStore;
     use crate::guard::L4GuardError;
     use crate::types::{IpCidr, L4Capability, L4ScopeEntry, L4ScopeId, PortRange, RateCap};
@@ -730,6 +734,122 @@ mod tests {
             matches!(outcome, SendRecvOutcome::Other(_)),
             "wrong-port reply from the host is Other, got {outcome:?}"
         );
+    }
+
+    /// A TCP RST reply frame from `src:src_port` to the stimulus source port, the
+    /// kernel's answer for a closed TCP port.
+    fn tcp_rst_reply(src: &str, src_port: u16) -> Vec<u8> {
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(src.parse::<Ipv4Addr>().unwrap()),
+                    dst: Some("127.0.0.1".parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(src_port),
+                    dst_port: Some(40000),
+                    // RST (0x04) | ACK (0x10).
+                    flags: Some(0x14),
+                    ..TcpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("rst reply builds")
+    }
+
+    /// Scanner v2 T5 review, finding T2 (Minor): a stimulus handed over as one
+    /// pre-built frame (`layers: [Raw(bytes)]`, the lane's liveness `probe` replay
+    /// and any `l4.send_recv` caller with a ready frame) correlates by the protocol
+    /// *decoded from those bytes*, not by the spec's layer list (which says `Raw`).
+    /// The reversed five-tuple UDP echo is therefore `Response`, and a TCP RST
+    /// from the target to the same stimulus is still `Other`.
+    #[test]
+    fn raw_wrapped_frame_correlates_by_its_decoded_protocol() {
+        // The frame the lane would replay: IPv4/UDP 127.0.0.1:40000 -> 127.0.0.1:9.
+        let frame = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some("127.0.0.1".parse::<Ipv4Addr>().unwrap()),
+                    dst: Some("127.0.0.1".parse::<Ipv4Addr>().unwrap()),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(40000),
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"probe".to_vec()),
+            ],
+        }
+        .build()
+        .expect("stimulus builds");
+        assert_eq!(
+            PacketSpec::summarize(&frame).layers,
+            vec!["IPv4", "UDP"],
+            "the pre-built frame is IPv4/UDP on the wire"
+        );
+        let raw_wrapped = || PacketSpec {
+            layers: vec![Layer::Raw(frame.clone())],
+        };
+        assert_eq!(
+            raw_wrapped().transport_proto(),
+            L4Proto::Raw,
+            "the spec's own layer list cannot name the transport"
+        );
+        let raw_spec = |expect| SendRecvSpec {
+            packet: raw_wrapped(),
+            dst: "127.0.0.1".parse().unwrap(),
+            dst_port: Some(9),
+            interface: IFACE.to_string(),
+            timeout: Duration::from_secs(1),
+            expect,
+        };
+
+        // The reversed five-tuple echo (UDP 127.0.0.1:9 -> :40000) is the Response.
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![udp_reply("127.0.0.1", 9, b"echo")]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend.clone(),
+            store.clone(),
+            raw_spec(ReplyMatch::FiveTuple),
+        )
+        .expect("authorized send_recv runs");
+        let reply = match outcome {
+            SendRecvOutcome::Response(p) => p,
+            other => panic!("expected the UDP echo as Response, got {other:?}"),
+        };
+        assert_eq!(reply.decoded.layers, vec!["IPv4", "UDP"]);
+        assert!(reply.bytes.windows(4).any(|w| w == b"echo"));
+        assert_eq!(
+            backend.injected(),
+            vec![frame.clone()],
+            "the pre-built frame went to the wire byte-for-byte"
+        );
+        let flow = store.get(flow_id).expect("send_recv flow present");
+        assert_eq!(
+            flow.packets.len(),
+            2,
+            "stimulus + correlated reply recorded"
+        );
+        assert_eq!(g.in_flight(), 0);
+
+        // A TCP RST from the target to the same stimulus is a reaction, not the reply.
+        let g = send_recv_guard();
+        let backend = MockBackend::with_replies(vec![tcp_rst_reply("127.0.0.1", 9)]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let (_flow_id, outcome) = send_recv(&g, backend, store, raw_spec(ReplyMatch::FiveTuple))
+            .expect("authorized send_recv runs");
+        match outcome {
+            SendRecvOutcome::Other(p) => {
+                assert_eq!(p.decoded.layers, vec!["IPv4", "TCP"]);
+            }
+            other => panic!("expected the TCP RST as Other, got {other:?}"),
+        }
+        assert_eq!(g.in_flight(), 0);
     }
 
     /// Panel finding (Minor): a correlated reply is capture-scope re-checked before
