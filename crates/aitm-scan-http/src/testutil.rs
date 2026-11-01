@@ -542,9 +542,13 @@ impl FakeBrowser {
     /// What the crawler's tagged submit expression does on this page, as the
     /// real expression would: no tagged element answers `{ok:false}` and
     /// submits nothing; an element whose `action` now resolves off the page's
-    /// origin answers `{ok:false, action}` and submits nothing; otherwise the
-    /// form is submitted (logged `submit <index>`, landing where the page's
-    /// `forms` entry says) and the answer is `{ok:true, action}` (R-I1).
+    /// origin, or to anything but an `http(s)` URL (`javascript:`, `data:`,
+    /// `about:`, the expression's `"null"`-origin rule, F4-3), answers
+    /// `{ok:false, action}` and submits nothing; otherwise the form is
+    /// submitted (logged `submit <index>`, landing where the page's `forms`
+    /// entry says) and the answer is `{ok:true, action}` (R-I1). The scheme
+    /// rule is [`crate::url_norm::resolve`]'s: a non-http(s) target resolves
+    /// to `None`.
     ///
     /// A [`LiveFormScript::answers_ok_regardless`] form skips the origin check
     /// and submits whatever the action is, standing in for a browser whose

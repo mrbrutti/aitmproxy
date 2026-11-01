@@ -395,9 +395,13 @@ impl Submitted {
 /// and resolved against the document's base URL the way the browser will; one
 /// that resolves off `location.origin` answers `{ok:false, action}` **before**
 /// anything is submitted, so the check and the submit are one eval round and
-/// a script cannot retarget the form between them. The lane judges the
-/// returned `action` by [`form_action`] once more, the rule that admitted the
-/// extracted form.
+/// a script cannot retarget the form between them. The comparison alone is
+/// not enough: a sandboxed document's `location.origin` is the opaque
+/// `"null"`, and so is the origin of a `javascript:`, `data:` or `about:`
+/// target, so the two would compare equal; a target whose origin is `"null"`
+/// or whose protocol is not `http:`/`https:` is refused outright (F4-3). The
+/// lane judges the returned `action` by [`form_action`] once more, the rule
+/// that admitted the extracted form.
 ///
 /// `requestSubmit()` fires the page's `submit` handlers and its validation, so
 /// a single-page app that intercepts the submit behaves as it does for a human;
@@ -417,7 +421,9 @@ pub(crate) fn submit_form_js(index: usize) -> String {
             "var target;",
             "try{{target=new URL(action===null?\"\":action,base);}}",
             "catch(e){{return {{ok:false,action:action}};}}",
-            "if(target.origin!==location.origin){{return {{ok:false,action:action}};}}",
+            "if(target.origin===\"null\"",
+            "||(target.protocol!==\"http:\"&&target.protocol!==\"https:\")",
+            "||target.origin!==location.origin){{return {{ok:false,action:action}};}}",
             "if(HTMLFormElement.prototype.requestSubmit){{",
             "HTMLFormElement.prototype.requestSubmit.call(f);}}",
             "else{{HTMLFormElement.prototype.submit.call(f);}}",
@@ -1620,6 +1626,42 @@ mod tests {
         assert_nothing_left_for_search_or_evil(&store);
     }
 
+    /// The form matched when it was tagged, but a script pointed its `action`
+    /// at a `javascript:` URL before the submit eval: the target has no
+    /// http(s) origin to compare, so it is refused like an off-origin one and
+    /// nothing is submitted (F4-3).
+    #[tokio::test]
+    async fn live_form_retargeted_to_javascript_at_submit_is_skipped() {
+        let store = Arc::new(MemFlowStore::new());
+        let home = home().with_live_form(
+            0,
+            matching_live_form().with_action_at_submit("javascript:void(0)"),
+        );
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        assert!(
+            !browser
+                .log_lines()
+                .iter()
+                .any(|line| line.starts_with("submit ")),
+            "{:?}",
+            browser.log_lines()
+        );
+        assert_eq!(report.forms_submitted, 0);
+        assert_eq!(report.forms_skipped, 1);
+        assert_eq!(report.clicks, 1);
+        assert_eq!(report.stopped_reason, None);
+        assert_nothing_left_for_search_or_evil(&store);
+    }
+
     /// The submit expression's in-eval check is bypassed (a browser that
     /// answers `{ok:true}` for an off-origin action): the engine judges the
     /// returned `action` by [`form_action`] itself and refuses it. The
@@ -2175,8 +2217,11 @@ mod tests {
         // Submitting addresses the element the tag eval marked, never a live
         // `document.forms` index (R-I1), re-reads its `action` through the
         // prototype getter, refuses an action that resolves off the page's
-        // origin, and submits through the prototype methods so a control named
-        // `submit` or `requestSubmit` cannot clobber them.
+        // origin — including the opaque `"null"` origin a sandboxed document
+        // shares with a `javascript:`/`data:`/`about:` target, and any
+        // non-http(s) scheme (F4-3) — and submits through the prototype
+        // methods so a control named `submit` or `requestSubmit` cannot
+        // clobber them.
         let submit = submit_form_js(1);
         assert!(submit.starts_with(SUBMIT_FORM_MARKER), "{submit}");
         for needed in [
@@ -2184,7 +2229,9 @@ mod tests {
             "return {ok:false}",
             "Element.prototype.getAttribute.call(f,\"action\")",
             "Node.prototype,\"baseURI\"",
-            "location.origin",
+            "target.origin===\"null\"",
+            "target.protocol!==\"http:\"&&target.protocol!==\"https:\"",
+            "target.origin!==location.origin",
             "HTMLFormElement.prototype.requestSubmit.call(f)",
             "HTMLFormElement.prototype.submit.call(f)",
             "return {ok:true,action:action}",
