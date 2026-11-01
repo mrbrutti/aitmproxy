@@ -28,6 +28,12 @@ E15. `list` and `rows` are parallel vectors (`crates/aitm-tui/src/scan/issues.rs
 
 E16. Test-file hygiene (`tests/scan_v2_issues.rs`): module doc says "twenty ticks after the last fetch"; `fn app_with(tools: &[&str]) -> App` with `app()` calling it; `fn page_of(n, id_of) -> Value` shared by the two synthetic-page tests; `pending_read: Option<IssueId>`; `STATUS_MAX` pinned against `status_token(IssueStatus::FalsePositive).len()`; the `read` doc's `scan.issue.update` mention reads "Task 8 adds".
 
+E17. Issues degraded text omits `scan.issue.update` (`crates/aitm-tui/src/ui/scan/mod.rs` `degraded()`): the Issues verb slice is `["scan.issues", "scan.issue", "scan.issue.update"]`.
+
+E18. Issues List-pane `Enter` is inert (`crates/aitm-tui/src/app.rs`): `Enter` with the List pane focused sets `issues.pane = IssuePane::Detail` (D11 "⏎ open or act"); test in `tests/scan_v2_issues.rs`.
+
+E19. The Issues detail lines are rebuilt from `read[id]` every frame (`crates/aitm-tui/src/scan/issues.rs`, `crates/aitm-tui/src/ui/scan/issues.rs`): E1's bounded `truncate` makes each line O(cells); additionally bound the `Issue` strings once when `fold_issue` inserts into `read` (`evidence.payload`, `evidence.matched`, `description`, `remediation`, `note` cut to `DETAIL_VALUE_MAX` chars), so the per-frame work is over bounded text only.
+
 ## Structure
 
 E4. The model imports a UI module (`crates/aitm-tui/src/scan/jobs.rs` `use crate::ui::text::truncate`): move `ui/text.rs` to `src/text.rs` (`pub mod text;` in `lib.rs`), keep `pub use crate::text as text;` in `ui/mod.rs` so existing `crate::ui::text` paths compile; the model imports `crate::text::truncate`.
