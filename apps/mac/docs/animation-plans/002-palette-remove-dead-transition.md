@@ -1,7 +1,7 @@
 # 002 — Remove the palette's dead entrance transition
 
 - **Status**: DONE — #203
-- **Commit**: 0f000174
+- **Commit**: written at 0f000174; implemented as bc0ed774 (PR #203)
 - **Severity**: LOW
 - **Category**: Purpose & frequency · dead code
 - **Estimated scope**: 1 Swift file (`Shell/ShellView.swift`), ~10 lines removed

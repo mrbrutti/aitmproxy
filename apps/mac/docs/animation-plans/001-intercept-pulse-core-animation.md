@@ -1,7 +1,7 @@
 # 001 — Move the armed-intercept pulse to Core Animation
 
 - **Status**: DONE — #204
-- **Commit**: 0f000174
+- **Commit**: written at 0f000174; implemented as aa3a1f9f (PR #204)
 - **Severity**: HIGH (performance), with the MEDIUM Reduce Motion and token findings of the same site
 - **Category**: Performance · Accessibility · Cohesion & tokens
 - **Estimated scope**: 1 Swift file (`Shell/InterceptBar.swift`), 1 token JSON + regenerated `UI/Tokens.swift`, 2 design docs

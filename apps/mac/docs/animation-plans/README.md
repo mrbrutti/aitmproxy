@@ -25,6 +25,9 @@ Nothing in either plan touches the files other sessions hold on 2026-10-31
 
 - `Session.paletteOpenedByKeyboard` has no reader after 002; retire it when `Session.swift`,
   `App.swift`, `Shell/ShellToolbar.swift` and `SnapshotScenes.swift` are free.
+- `Tok.Motion.popover` has no consumer after 002 and its token description ("scale from 0.97 at
+  the trigger's origin") describes the motion 002 declared dead; retire or re-describe it the next
+  time `docs/design/tokens.json` is touched.
 - Product, not motion: `FlowTableView` reloads the whole table on any non-append change. (The
   intercept-bar-over-the-bus gap seen on `1854fae7` was already fixed by #196.)
 - Fixture and snapshot modes are being deleted from every frontend (Matt, 2026-10-31); the
