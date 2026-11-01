@@ -378,6 +378,12 @@ pub const MAX_CAPTURED_SEEDS: usize = 8;
 /// How many bytes [`default_payload`] carries.
 pub const DEFAULT_SEED_LEN: usize = 16;
 
+/// The largest seed payload a case can carry: the IPv4 `total_length` ceiling
+/// (65535) less the 20-byte IPv4 and 8-byte UDP headers the lane puts in front
+/// of it. A longer seed cannot be crafted at all, so the profile that names it
+/// is refused at discovery rather than at send time.
+pub const MAX_SEED_BYTES: usize = 65_535 - 28;
+
 /// The lane's built-in seed payload: the job's marker, padded with spaces or
 /// truncated to [`DEFAULT_SEED_LEN`] bytes, so every case is attributable to
 /// the job that sent it and every plan carries at least one seed.
@@ -447,12 +453,29 @@ pub fn seed_payloads(
         });
     };
 
+    // A seed the builder could never craft is the operator's mistake, so it is
+    // refused here, by name, instead of overflowing a wire length at send time.
+    let push_checked = |bytes: Vec<u8>,
+                        origin: SeedOrigin,
+                        out: &mut Vec<SeedPayload>|
+     -> Result<(), DiscoverError> {
+        if bytes.len() > MAX_SEED_BYTES {
+            return Err(DiscoverError::InvalidProfile(format!(
+                "seed {key}#{} is {} bytes; the largest payload is {MAX_SEED_BYTES}",
+                out.len(),
+                bytes.len()
+            )));
+        }
+        push(bytes, origin, out);
+        Ok(())
+    };
+
     // (a) The operator's own seeds, in profile order.
     for seed in &options.seeds {
         match seed {
-            L4Seed::Hex { hex } => push(hex_decode(hex)?, SeedOrigin::Profile, &mut out),
+            L4Seed::Hex { hex } => push_checked(hex_decode(hex)?, SeedOrigin::Profile, &mut out)?,
             L4Seed::Base64 { base64 } => {
-                push(base64_decode(base64)?, SeedOrigin::Profile, &mut out);
+                push_checked(base64_decode(base64)?, SeedOrigin::Profile, &mut out)?;
             }
             L4Seed::Flow { flow } => {
                 let found = l4_flow_id(*flow)
@@ -474,7 +497,7 @@ pub fn seed_payloads(
                     )));
                 }
                 for payload in payloads {
-                    push(payload, SeedOrigin::Captured, &mut out);
+                    push_checked(payload, SeedOrigin::Captured, &mut out)?;
                 }
             }
         }
@@ -684,7 +707,7 @@ mod tests {
 
     use super::{
         choose_src_port, default_payload, discover_all, loopback_interface, points_for,
-        probe_privilege, resolve_target, seed_payloads, DiscoverError,
+        probe_privilege, resolve_target, seed_payloads, DiscoverError, MAX_SEED_BYTES,
     };
     use crate::fields::{default_fields, IpVersion};
     use crate::plan::{link_framing, SeedOrigin, TargetPlan};
@@ -918,6 +941,43 @@ mod tests {
         };
         let err = seed_payloads(&target, &bad, None, "aitm7f3a").expect_err("\"zz\" is not hex");
         assert!(matches!(err, DiscoverError::InvalidProfile(_)), "{err:?}");
+    }
+
+    /// A profile seed longer than [`MAX_SEED_BYTES`] cannot be crafted into a
+    /// packet (the IPv4 `total_length` would overflow), so it is refused at
+    /// discovery as the operator's mistake, naming the seed and the ceiling.
+    #[test]
+    fn oversize_seed_is_invalid_profile() {
+        let guard = loopback_guard("*", 100);
+        let target = resolve_target(&guard, &udp_target(9)).expect("resolves");
+
+        let at_ceiling = L4Options {
+            seeds: vec![L4Seed::Hex {
+                hex: "41".repeat(MAX_SEED_BYTES),
+            }],
+            ..L4Options::default()
+        };
+        let seeds =
+            seed_payloads(&target, &at_ceiling, None, "aitm7f3a").expect("the ceiling itself fits");
+        assert_eq!(seeds[0].bytes.len(), MAX_SEED_BYTES);
+
+        let over = L4Options {
+            seeds: vec![L4Seed::Hex {
+                hex: "41".repeat(MAX_SEED_BYTES + 1),
+            }],
+            ..L4Options::default()
+        };
+        let err = seed_payloads(&target, &over, None, "aitm7f3a").expect_err("one byte too many");
+        let DiscoverError::InvalidProfile(message) = &err else {
+            panic!("expected invalid_profile, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            &format!(
+                "seed 127.0.0.1:9/udp#0 is {} bytes; the largest payload is {MAX_SEED_BYTES}",
+                MAX_SEED_BYTES + 1
+            )
+        );
     }
 
     #[test]
