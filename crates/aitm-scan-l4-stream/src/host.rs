@@ -74,8 +74,8 @@ pub enum HostError {
     /// The destructive-command denylist refused the case or one of its prelude
     /// messages; the verb is named, the bytes are not.
     Denylisted(&'static str),
-    /// The rendered case is over [`MAX_MESSAGE`]; it is skipped, never
-    /// truncated.
+    /// The rendered case is over [`MAX_MESSAGE`], or over the guard's own
+    /// `max_packet_bytes`; it is skipped, never truncated.
     TooLarge,
     /// The payload carried no bytes, and was not the reserved liveness value.
     NotBytes,
@@ -379,6 +379,16 @@ impl StreamHost {
                 // once (spec S5.4).
                 Err(ClientError::Guard(L4GuardError::CountExceeded { .. })) if !reminted => {
                     reminted = true;
+                }
+                // The guard's own packet ceiling is the lane's 64 KiB bound
+                // read off a different number: the message is too big to send,
+                // which is a case to skip and count, not a refusal that ends
+                // the campaign (spec S5.7, SPEC-C1).
+                Err(ClientError::Guard(L4GuardError::PacketTooLarge { .. })) => {
+                    self.state
+                        .cases_skipped_too_large
+                        .fetch_add(1, Ordering::SeqCst);
+                    return Err(HostError::TooLarge);
                 }
                 Err(ClientError::Guard(e)) => return Err(HostError::Guard(guard_message(&e))),
                 Err(ClientError::DryRun) => return Err(HostError::DryRun),
@@ -926,8 +936,14 @@ mod tests {
     /// `127.0.0.0/8`, which is what an operator writes to let the lane reach a
     /// local speaker (loopback is otherwise a dangerous destination).
     fn loopback_guard() -> Arc<L4Guard> {
+        guard_capped_at(L4Config::default().max_packet_bytes)
+    }
+
+    /// [`loopback_guard`] whose permits refuse any write over `max_packet_bytes`.
+    fn guard_capped_at(max_packet_bytes: usize) -> Arc<L4Guard> {
         Arc::new(L4Guard::new(&L4Config {
             enabled: true,
+            max_packet_bytes,
             scope: vec![L4ScopeEntry {
                 id: L4ScopeId::new(),
                 cidr: IpCidr {
@@ -1093,6 +1109,66 @@ mod tests {
                 })
                 .collect();
             Box::pin(async move { Ok(steps) })
+        }
+    }
+
+    /// A `StreamClient` that asks the permit for every write, as the real one
+    /// does, and opens no socket.
+    ///
+    /// [`TokioStreamClient`] calls `permit.authorize_packet(len)` before each
+    /// write and surfaces the refusal as [`ClientError::Guard`]; this double
+    /// is that one choke point and nothing else, so a guard refusal raised by
+    /// a *write* — rather than by `guard.check` — can be driven in a sandbox
+    /// that refuses to bind.
+    ///
+    /// [`TokioStreamClient`]: crate::client::TokioStreamClient
+    struct GuardedClient {
+        reply: Vec<u8>,
+        writes: AtomicU32,
+    }
+
+    impl GuardedClient {
+        fn new(reply: &[u8]) -> Self {
+            Self {
+                reply: reply.to_vec(),
+                writes: AtomicU32::new(0),
+            }
+        }
+
+        fn writes(&self) -> u32 {
+            self.writes.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StreamClient for GuardedClient {
+        #[allow(clippy::too_many_arguments, reason = "the StreamClient signature")]
+        fn exchange<'a>(
+            &'a self,
+            _ep: &'a Endpoint,
+            permit: &'a mut L4Permit,
+            _pacer: &'a Mutex<BytePacer>,
+            messages: &'a [Vec<u8>],
+            _complete: &'a (dyn Fn(&[u8]) -> bool + Sync),
+            _expects_banner: bool,
+            _reply_timeout: Duration,
+            _connect_timeout: Duration,
+        ) -> BoxFuture<'a, Result<Vec<ExchangeStep>, ClientError>> {
+            Box::pin(async move {
+                let mut steps = Vec::with_capacity(messages.len());
+                for message in messages {
+                    permit
+                        .authorize_packet(message.len())
+                        .map_err(ClientError::Guard)?;
+                    self.writes.fetch_add(1, Ordering::SeqCst);
+                    steps.push(ExchangeStep {
+                        sent_len: message.len(),
+                        reply: self.reply.clone(),
+                        ended: Ended::Replied,
+                        elapsed_ms: 3,
+                    });
+                }
+                Ok(steps)
+            })
         }
     }
 
@@ -1338,6 +1414,41 @@ mod tests {
             host.state().cases_skipped_too_large.load(Ordering::SeqCst),
             1
         );
+    }
+
+    /// SPEC-C1: the guard's own packet ceiling is the same skip as the lane's
+    /// 64 KiB bound — counted and stepped over, never a campaign-ending guard
+    /// refusal.
+    #[tokio::test]
+    async fn guard_packet_too_large_is_skipped_not_a_guard_stop() {
+        let job = Arc::new(TestJob::new());
+        let client = Arc::new(GuardedClient::new(b"+PONG\r\n"));
+        let host = host_with(
+            endpoint(6379),
+            Some(guard_capped_at(64)),
+            &job,
+            Arc::clone(&client) as Arc<dyn StreamClient>,
+        );
+
+        let error = host
+            .probe(&payload(&[b'A'; 200]))
+            .await
+            .expect_err("a 200-byte case is over the guard's 64-byte packet ceiling");
+
+        assert!(
+            matches!(host_error(&error), HostError::TooLarge),
+            "a packet-size refusal is a skip, not a stop: {error}"
+        );
+        assert_eq!(host.state.cases_skipped_too_large.load(Ordering::SeqCst), 1);
+        assert_eq!(client.writes(), 0, "the refused case wrote nothing");
+
+        // And the same host goes on sending: the campaign is not over.
+        let response = host
+            .probe(&payload(b"PING\r\n"))
+            .await
+            .expect("a case under the ceiling still goes out");
+        assert_eq!(response.body, b"+PONG\r\n".to_vec());
+        assert_eq!(client.writes(), 1);
     }
 
     #[tokio::test]
