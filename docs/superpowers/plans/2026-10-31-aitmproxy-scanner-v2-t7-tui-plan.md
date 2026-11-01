@@ -553,6 +553,12 @@ Kept by the main session during stage 6. One row per finding.
 | 12 | security | Minor | a second wire-confirm replacing a `scan.*` confirm strands `launch.pending`; `yes` ignores a refused `scan_call` | fix round G (G67 extended): drop toast, pending cleared |
 | 12 | security | Minor | `StartResult.lanes.run` joined into the toast unbounded | fix round G (G72) |
 | 12 | security | Minor | list-row launch of an L4-lane profile bypasses the UI-3 client gate | fix round G (G73); D7 amended: gate reads the cursor row's lanes without an editor |
+| 13 | coder note | Minor | `started_here` also cleared on `not_found` (else `fold_list` re-inserts the dropped id) | ratified; D13 amended |
+| 13 | coder note | Minor | refused wording read from the Profiles tab's error via `refused_launch()`, no new launch state; `blocked` takes precedence | ratified; D13 amended |
+| 13 | coder note | Minor | only the Profiles footer draws the refusal; Jobs shows it in the banner | fix round G (G65 addendum): `blocked_footer` takes `blocked.or(refused)` on both tabs |
+| 13 | coder note | Minor | `ui/scan/mod.rs` untouched: the banner already showed the tab error | accepted; plan file list unchanged |
+| 13 | coder note | Minor | stale `not_found` banner on Jobs after the self-heal (no same-tag success can come) | fix round G (G74): the requested `scan.list` success clears it; D13 amended |
+| 13 | coder note | Minor | `tab_error` falls back to `last_error` on every tab (Task 5) | accepted, pre-existing |
 
 ## Shipped
 

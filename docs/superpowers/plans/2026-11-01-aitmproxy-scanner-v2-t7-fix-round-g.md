@@ -158,7 +158,7 @@ G63. `launch_args` and the toast's profile name decide the same precedence twice
 
 G64. `fold_start_result`'s six Jobs writes belong on `JobsState` (`app.rs`): `JobsState::land_started(&mut self, status: JobStatus)` holding `started_here.insert`, `fold_status`, move-to-front, `cursor = 0`, `pane = List`, `detail_scroll = 0`, with a unit test for the already-listed case; `fold_start_result` keeps the D6 bounds and the toasts. Rides with G39.
 
-G65. Jobs and Profiles draw the blocked reason with two layouts and two copies of the footer arithmetic (`ui/scan/jobs.rs`, `ui/scan/profiles.rs`): after G55, one `pub fn blocked_footer(theme, area, blocked: Option<&str>, footer: &str, buf) -> Rect` in `ui/scan/mod.rs` drawing the wrapped reason over the hint and returning the body rect; both `detail` functions call it (the Jobs copy stops cutting the actionable tail at 90 columns). Test: the D7 fragments whole at 90x40 on the Jobs tab too.
+G65. Jobs and Profiles draw the blocked reason with two layouts and two copies of the footer arithmetic (`ui/scan/jobs.rs`, `ui/scan/profiles.rs`): after G55, one `pub fn blocked_footer(theme, area, blocked: Option<&str>, footer: &str, buf) -> Rect` in `ui/scan/mod.rs` drawing the wrapped reason over the hint and returning the body rect; both `detail` functions call it (the Jobs copy stops cutting the actionable tail at 90 columns). The reason passed is `launch.blocked.or(scan.refused_launch().map(wording))` on both tabs (Task 13 ruling), so Jobs draws a refused launch like Profiles. Test: the D7 fragments whole at 90x40 on the Jobs tab too.
 
 G66. `l4_gate` decides IPv6 by `contains(':')` (`scan/launch.rs`): `match first.ip.parse::<IpAddr>() { Ok(IpAddr::V6(_)) => 128, _ => 32 }` with a comment that an unparseable ip still yields a suggestion because G53 refuses it at fold.
 
@@ -179,6 +179,10 @@ G71. `scan.map` is held by the UI-3 L4 gate (`crates/aitm-tui/src/app.rs` `scan_
 G72. `StartResult.lanes.run` is joined into the start toast unbounded (`crates/aitm-tui/src/app.rs` `fold_start_result`): collect `run` into a `BTreeSet<LaneKind>` (at most the four kinds, declaration order) before joining, and `truncate` the whole start toast to `SAVED_PATH_MAX` cells. Test: a `scan.start` reply with 100_000 `http` run lanes toasts `scan-1a2b3c4d started: standard (http)`.
 
 G73. A list-row launch of a stored profile with an L4 lane bypasses the UI-3 client gate (`crates/aitm-tui/src/app.rs` `recompute_launch_gate`, `scan_launch_v2`): with no editor open, `blocked` is computed from the Profiles cursor row's `lanes` (known from `scan.profile.list`): the first D7 text when `l4.scope.list` is absent, else `L4 launch disabled: open the profile (⏎) to check its L4 target and scope` (D7 as amended; the row carries no targets to check); recomputed when the Profiles cursor moves and when the editor closes. `s` stays inert while `blocked` is `Some`; `m` is not held (G71). Test (`tests/scan_v2_launch.rs`): no editor, cursor on a fixture row with an L4 lane, no `l4.scope.list`: the Profiles footer shows `GATE_NO_LAYER` and `s` sends nothing; with the layer present the footer names the editor; cursor on `standard`: `blocked == None` and `s` sends `{profile_name: "standard"}`.
+
+## Task 13 coder report
+
+G74. The `not_found` self-heal leaves its error in the Jobs banner forever (`crates/aitm-tui/src/app.rs` `on_scan_failed`, `scan.list` arm): remember the dropped job's error tag (`scan.status:<job>` or `scan.cancel:<job>`) in `ScanState.heal_pending: Option<String>` when the self-heal requests `scan.list`; on that `scan.list` success call `clear_error(&tag)` and clear the field (D13 as amended). Test (`tests/scan_v2_errors.rs`): after `not_found` on `scan.status:scan-1a2b3c4d`, folding `scan.list.json` leaves `last_error == None` and the Jobs banner without the wording.
 
 ## Not in this round
 
