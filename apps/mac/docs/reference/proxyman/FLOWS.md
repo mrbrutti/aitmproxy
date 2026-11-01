@@ -20,10 +20,10 @@ taken from one of four sources, marked per line:
 - **[Matt]** what Matt observed on his Mac on 2026-10-31 (Proxyman 26.3.0,
   macOS 27.0) and relayed through the orchestrator session.
 
-Proxyman was **not** launched by this session (its "Auto Override System Proxy
+Proxyman was never launched by this session (its "Auto Override System Proxy
 Settings at Launch" default routed every new Claude session through
-127.0.0.1:9090 tonight). A screen index with our own shots waits in
-[SCREENS.md](SCREENS.md) for a run Matt starts himself with that checkbox off.
+127.0.0.1:9090 on 2026-10-31). Matt ran it himself on 2026-11-01, with that
+checkbox still on, and the screen index of that run is [SCREENS.md](SCREENS.md).
 
 ## 0. The model in one paragraph
 

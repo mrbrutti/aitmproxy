@@ -1,0 +1,507 @@
+80:     Running unittests src/lib.rs 
+299:test result: ok. 215 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.60s
+301:     Running unittests src/main.rs 
+341:test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+343:     Running tests/agent_surface.rs 
+349:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+351:     Running tests/audit_durable_connection_id.rs 
+356:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+358:     Running tests/bundled_startup.rs 
+364:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+366:     Running tests/ca_frontends.rs 
+374:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+376:     Running tests/config_file.rs 
+396:test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+398:     Running tests/config_rhai.rs 
+412:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+414:     Running tests/discover_e2e.rs 
+421:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+423:     Running tests/e2e_reflected_xss.rs 
+428:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+430:     Running tests/findings_surface.rs 
+437:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+439:     Running tests/frontends.rs 
+453:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+455:     Running tests/intercept_url_rules_mcp.rs 
+462:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+464:     Running tests/l4_acceptance_mcp.rs 
+471:test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.03s
+473:     Running tests/l4_cua_tui.rs 
+478:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 37.13s
+480:     Running tests/l4_operator_surfaces.rs 
+500:test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+502:     Running tests/l4_pocstep_wiring.rs 
+511:test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.04s
+513:     Running tests/l4_wiring.rs 
+522:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+524:     Running tests/m4_browser_capture.rs 
+530:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+532:     Running tests/m4_grader_gate.rs 
+538:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+540:     Running tests/m4_live_acceptance.rs 
+545:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+547:     Running tests/m4_scripted_e2e.rs 
+554:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+556:     Running tests/m4_sensitivity.rs 
+561:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+563:     Running tests/m6_wiring.rs 
+572:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+574:     Running tests/macos_capture_adapter.rs 
+581:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+583:     Running tests/macos_capture_availability.rs 
+588:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+590:     Running tests/macos_capture_capability.rs 
+595:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+597:     Running tests/macos_capture_gate.rs 
+602:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+604:     Running tests/macos_capture_listener.rs 
+612:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+614:     Running tests/macos_capture_no_key.rs 
+619:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+621:     Running tests/macos_ne_feeder_loopback.rs 
+628:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+630:     Running tests/obscura_mitm.rs 
+638:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+640:     Running tests/operator_token_dispatch.rs 
+646:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s
+648:     Running tests/rhai_e2e.rs 
+659:test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+661:     Running tests/rule_token_consistency.rs 
+666:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+668:     Running tests/shutdown.rs 
+674:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+676:     Running tests/soak.rs 
+681:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+683:     Running tests/sysproxy_config.rs 
+690:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+692:     Running tests/sysproxy_contract.rs 
+697:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+699:     Running tests/sysproxy_watchdog_dispatch.rs 
+705:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+707:     Running tests/tui_embed.rs 
+714:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+716:     Running tests/tui_live_bus.rs 
+721:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+723:     Running tests/tui_mode_governance.rs 
+741:test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+743:     Running tests/tui_mode_governance_live.rs 
+748:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+750:     Running tests/web.rs 
+764:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+766:     Running tests/web_bus_ask_split.rs 
+777:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+779:     Running tests/web_bus_audit_identity.rs 
+785:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+787:     Running tests/web_bus_audit_label.rs 
+792:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+794:     Running tests/web_bus_concurrency.rs 
+809:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+811:     Running tests/web_bus_governance.rs 
+822:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+824:     Running tests/web_bus_push.rs 
+838:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+840:     Running tests/web_bus_roles.rs 
+849:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+851:     Running tests/web_bus_write_deadline.rs 
+861:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.53s
+863:     Running tests/wiring.rs 
+869:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+871:     Running tests/wiring_m2.rs 
+879:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s
+881:     Running unittests src/lib.rs 
+911:test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+913:     Running tests/browser.rs 
+919:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+921:     Running tests/dvwa_fixes.rs 
+927:test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+929:     Running tests/firefox.rs 
+935:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+937:     Running tests/obscura_lifecycle.rs 
+948:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+950:     Running tests/obscura_spawn.rs 
+961:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+963:     Running tests/ssrf.rs 
+981:test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+983:     Running unittests src/lib.rs 
+993:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+995:     Running tests/bus_client.rs 
+1009:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+1011:     Running tests/tester_in_process.rs 
+1022:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+1024:     Running unittests src/lib.rs 
+1029:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1031:     Running tests/audit.rs 
+1042:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1044:     Running tests/cert.rs 
+1053:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1055:     Running tests/commands.rs 
+1087:test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1089:     Running tests/exec.rs 
+1099:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1101:     Running tests/executors.rs 
+1112:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+1114:     Running tests/linux.rs 
+1125:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1127:     Running tests/macos.rs 
+1146:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1148:     Running tests/real_os.rs 
+1153:test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1155:     Running tests/windows.rs 
+1161:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1163:     Running unittests src/lib.rs 
+1169:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1171:     Running tests/cli.rs 
+1184:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1186:     Running unittests src/lib.rs 
+1339:test result: ok. 149 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.80s
+1341:     Running tests/chain.rs 
+1353:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+1355:     Running tests/classifier_wildcard_free.rs 
+1364:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+1366:     Running tests/event_types.rs 
+1372:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1374:     Running tests/flow_model.rs 
+1392:test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1394:     Running tests/guard.rs 
+1408:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+1410:     Running tests/m2_types.rs 
+1418:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1420:     Running tests/m4_identity.rs 
+1427:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1429:     Running tests/registry.rs 
+1436:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1438:     Running tests/scope_seam.rs 
+1450:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1452:     Running tests/sensitivity.rs 
+1459:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1461:     Running tests/smoke.rs 
+1466:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1468:     Running tests/ssrf.rs 
+1478:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1480:     Running tests/store.rs 
+1496:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1498:     Running tests/store_control.rs 
+1517:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1519:     Running tests/trust_gate_scan.rs 
+1532:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+1534:     Running tests/upgrade_handoff.rs 
+1541:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1543:     Running unittests src/lib.rs 
+1547:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1549:     Running tests/findings.rs 
+1562:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1564:     Running tests/recorder.rs 
+1570:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1572:     Running tests/recorder_e2e.rs 
+1577:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1579:     Running tests/report.rs 
+1585:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1587:     Running unittests src/lib.rs 
+1655:test result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.70s
+1657:     Running tests/audit_integrity.rs 
+1674:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+1676:     Running tests/http.rs 
+1687:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+1689:     Running tests/mcp.rs 
+1843:test result: ok. 150 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+1845:     Running tests/widget_lint.rs 
+1857:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1859:     Running unittests src/lib.rs 
+1866:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1868:     Running unittests src/lib.rs 
+1872:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1874:     Running tests/language.rs 
+1886:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1888:     Running tests/seam.rs 
+1893:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1895:     Running unittests src/lib.rs 
+1899:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1901:     Running tests/map_local.rs 
+1911:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1913:     Running tests/map_remote.rs 
+1923:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+1925:     Running unittests src/lib.rs 
+1960:test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+1962:     Running tests/commands.rs 
+1968:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1970:     Running tests/tunnel.rs 
+1976:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+1978:     Running unittests src/lib.rs 
+1982:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+1984:     Running tests/api_catalog.rs 
+2003:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2005:     Running tests/budget.rs 
+2014:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+2016:     Running tests/bundled_scripts.rs 
+2023:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+2025:     Running tests/command.rs 
+2036:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2038:     Running tests/commands.rs 
+2083:test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+2085:     Running tests/dsl.rs 
+2098:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2100:     Running tests/engine.rs 
+2117:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+2119:     Running tests/flow_api.rs 
+2134:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2136:     Running tests/flow_state.rs 
+2153:test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2155:     Running tests/host_core.rs 
+2169:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2171:     Running tests/host_net.rs 
+2192:test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+2194:     Running tests/host_registry.rs 
+2208:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2210:     Running tests/loader.rs 
+2234:test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+2236:     Running tests/marshal.rs 
+2245:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2247:     Running tests/plugin.rs 
+2275:test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+2277:     Running tests/poc_step.rs 
+2295:test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+2297:     Running tests/prelude.rs 
+2303:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2305:     Running tests/types.rs 
+2313:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2315:     Running tests/wire.rs 
+2323:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+2325:     Running unittests src/lib.rs 
+2526:test result: ok. 197 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+2528:     Running unittests src/lib.rs 
+2541:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2543:     Running tests/agent_file_io.rs 
+2553:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2555:     Running tests/confinement.rs 
+2564:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2566:     Running tests/har_roundtrip.rs 
+2575:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2577:     Running tests/session_roundtrip.rs 
+2592:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2594:     Running unittests src/lib.rs 
+2605:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2607:     Running tests/frame_intercept.rs 
+2614:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.06s
+2616:     Running tests/ws_send.rs 
+2622:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2624:     Running unittests src/lib.rs 
+2631:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2633:     Running tests/agent_gates.rs 
+2641:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2643:     Running tests/capture.rs 
+2665:test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2667:     Running tests/control.rs 
+2678:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2680:     Running tests/detail.rs 
+2698:test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2700:     Running tests/intercept.rs 
+2708:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2710:     Running tests/intercept_rules.rs 
+2722:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.65s
+2724:     Running tests/kill_modes.rs 
+2730:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+2732:     Running tests/meta.rs 
+2741:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2743:     Running tests/mutate.rs 
+2750:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2752:     Running tests/replay.rs 
+2759:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2761:     Running tests/response_edit.rs 
+2767:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+2769:     Running tests/scope_rate.rs 
+2780:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2782:     Running tests/subscription.rs 
+2787:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2789:     Running unittests src/lib.rs 
+2810:test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2812:     Running tests/builder.rs 
+2839:test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2841:     Running tests/dvwa_fixes.rs 
+2855:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2857:     Running tests/library.rs 
+2873:test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2875:     Running tests/matcher.rs 
+2883:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2885:     Running tests/protocol_step.rs 
+2893:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2895:     Running tests/run.rs 
+2907:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2909:     Running tests/script_command.rs 
+2916:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2918:     Running tests/script_runner.rs 
+2929:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+2931:     Running tests/script_step.rs 
+2938:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2940:     Running tests/serde.rs 
+2949:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2951:     Running tests/target.rs 
+2956:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2958:     Running tests/template.rs 
+2964:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2966:     Running unittests src/lib.rs 
+3250:test result: ok. 280 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+3252:     Running tests/ca.rs 
+3261:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3263:     Running tests/h1_conformance.rs 
+3273:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+3275:     Running tests/h2_limits.rs 
+3280:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s
+3282:     Running tests/h2_mitm.rs 
+3307:test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.33s
+3309:     Running tests/http1_hardening.rs 
+3320:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+3322:     Running tests/https_capture.rs 
+3331:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+3333:     Running tests/response_park.rs 
+3339:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+3341:     Running tests/sansio.rs 
+3383:test result: ok. 38 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3385:     Running tests/sender.rs 
+3395:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+3397:     Running tests/stale_upstream.rs 
+3407:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+3409:     Running unittests src/lib.rs 
+3603:test result: ok. 184 passed; 0 failed; 6 ignored; 0 measured; 0 filtered out; finished in 0.47s
+3605:     Running tests/active_roundtrip.rs 
+3611:test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3613:     Running tests/hard_gates.rs 
+3621:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3623:     Running tests/inpath.rs 
+3630:test result: ok. 1 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3632:     Running tests/language.rs 
+3651:test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+3653:     Running tests/operator_surfaces.rs 
+3667:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3669:     Running tests/surface.rs 
+3675:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+3677:     Running unittests src/lib.rs 
+3687:test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3689:     Running unittests src/lib.rs 
+3697:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3699:     Running tests/ws_capture.rs 
+3711:test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3713:     Running unittests src/lib.rs 
+3719:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3721:     Running tests/matches.rs 
+3749:test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+3751:     Running tests/url_match_cases.rs 
+3756:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+3758:     Running unittests src/lib.rs 
+3835:test result: ok. 73 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+3837:     Running tests/catalogue.rs 
+3855:test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+3857:     Running tests/check_hardening.rs 
+3892:test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+3894:     Running tests/native_h2_observe.rs 
+3949:test result: ok. 51 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3951:     Running tests/native_reflection.rs 
+3980:test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+3982:     Running tests/native_sqli_boolean.rs 
+4011:test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+4013:     Running tests/native_timing.rs 
+4036:test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4038:     Running unittests src/lib.rs 
+4043:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4045:     Running unittests src/lib.rs 
+4256:test result: ok. 207 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s
+4258:     Running tests/live_loopback.rs 
+4269:test result: ok. 4 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4271:     Running unittests src/lib.rs 
+4276:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4278:     Running unittests src/lib.rs 
+4306:test results::tests::issues_result_tolerates_missing_cursor ... ok
+4307:test results::tests::issues_result_carries_severity_tally ... ok
+4308:test results::tests::job_event_tokens ... ok
+4309:test results::tests::dry_run_is_absent_unless_set ... ok
+4310:test results::tests::list_sitemap_and_profile_results_round_trip ... ok
+4311:test results::tests::notification_without_issue_omits_the_key ... ok
+4312:test results::tests::notification_round_trips ... ok
+4313:test results::tests::profile_summary_from_standard ... ok
+4314:test results::tests::results_tolerate_unknown_keys ... ok
+4317:test results::tests::start_result_round_trips_with_skipped_lane ... ok
+4334:test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4336:     Running tests/builtin_profiles.rs 
+4349:test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+4351:     Running tests/fixtures.rs 
+4360:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+4362:     Running unittests src/lib.rs 
+4558:test result: ok. 192 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.57s
+4560:     Running tests/live_lane.rs 
+4566:test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4568:     Running tests/live_language.rs 
+4575:test result: ok. 0 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4577:     Running tests/tcp_transport.rs 
+4583:test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4585:     Running unittests src/lib.rs 
+4707:test result: ok. 118 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
+4709:     Running tests/tripwire.rs 
+4716:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+4718:     Running unittests src/lib.rs 
+4932:test result: ok. 210 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+4934:     Running unittests src/main.rs 
+4943:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4945:     Running tests/grader.rs 
+4953:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4955:     Running tests/l4.rs 
+4962:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+4964:     Running tests/scan_http.rs 
+4975:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+4977:     Running tests/serve_bin.rs 
+4985:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+4987:     Running tests/speakers_live.rs 
+5001:test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.91s
+5003:     Running tests/target.rs 
+5011:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+5013:     Running unittests src/lib.rs 
+5145:test result: ok. 128 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+5147:     Running unittests src/main.rs 
+5156:test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5158:     Running tests/bus_task.rs 
+5165:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+5167:     Running tests/cli_usage.rs 
+5174:test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s
+5176:     Running tests/complete.rs 
+5184:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5186:     Running tests/core_sync.rs 
+5197:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+5199:     Running tests/perf.rs 
+5205:test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+5207:     Running tests/robustness.rs 
+5242:test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.64s
+5244:     Running tests/syntax.rs 
+5255:test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5257:     Running tests/tester_edge_cases.rs 
+5272:test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.16s
+5282:test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.73s
+5288:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5294:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5300:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+5306:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5312:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5318:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5324:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5330:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5337:test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.01s
+5343:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5349:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5356:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s
+5362:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5368:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5374:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5380:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5386:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5392:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+5399:test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+5405:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5411:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5417:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5423:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5429:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5435:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5441:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5447:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5453:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5459:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5465:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5471:test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+5473:GATE EXIT=0

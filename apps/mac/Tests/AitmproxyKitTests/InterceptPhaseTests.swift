@@ -11,8 +11,9 @@ import Testing
         body: Data("{\"ok\": true}".utf8))
 
     @Test func parkedPhaseComesFromTheDetail() {
-        let paused = Fixtures.rows.first { $0.state == .paused && $0.id != Fixtures.pausedLogin.id }!
-        let requestOnly = Fixtures.detail(for: paused)
+        let paused = Make.row(seq: 1, host: "api.shop-staging.test", path: "/api/me", state: .paused)
+        let requestOnly = Make.detail(id: "flow-1",
+                                      request: Make.message("GET /api/me HTTP/2", [("host", "api.shop-staging.test")]))
         #expect(InterceptPhase.parked(paused, detail: nil) == .request)
         #expect(InterceptPhase.parked(paused, detail: requestOnly) == .request)
         var withResponse = requestOnly
@@ -23,8 +24,11 @@ import Testing
         headKnown.status = 200
         #expect(InterceptPhase.parked(headKnown, detail: nil) == .response)
         #expect(InterceptPhase.parked(headKnown, detail: requestOnly) == .response)
-        let complete = Fixtures.rows.first { $0.state == .complete }!
-        #expect(InterceptPhase.parked(complete, detail: Fixtures.detail(for: complete)) == nil)
+        let complete = Make.row(seq: 2, host: "api.shop-staging.test", path: "/api/health", status: 200)
+        let finished = Make.detail(id: "flow-2",
+                                   request: Make.message("GET /api/health HTTP/2", [("host", "api.shop-staging.test")]),
+                                   response: response)
+        #expect(InterceptPhase.parked(complete, detail: finished) == nil)
         #expect(InterceptPhase.response.title == "Paused · response")
         #expect(InterceptPhase.request.title == "Paused · request")
     }
@@ -34,7 +38,7 @@ import Testing
         #expect(HTTPMessage(startLine: "HTTP/1.1 418 I'm a teapot", headers: []).statusCode == 418)
         #expect(HTTPMessage(startLine: "HTTP/2 418", headers: []).statusCode == 418)
         #expect(HTTPMessage(startLine: "GET /x HTTP/2", headers: []).statusCode == nil)
-        #expect(Fixtures.pausedLogin.request.isResponse == false)
+        #expect(Make.message("POST /api/auth/login HTTP/2").isResponse == false)
         #expect(response.isResponse)
     }
 

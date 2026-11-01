@@ -8,7 +8,7 @@ let package = Package(
         // The command-bus client (§4.10): NWConnection over loopback TCP,
         // newline-delimited JSON-RPC 2.0 / MCP. No UI, no main actor.
         .target(name: "AitmBusClient"),
-        // Domain models, formatting, filters, fixtures. No SwiftUI, so tests run without the app.
+        // Domain models, formatting, filters. No SwiftUI, so tests run without the app.
         .target(name: "AitmproxyKit", dependencies: ["AitmBusClient"]),
         .executableTarget(
             name: "Aitmproxy",

@@ -1,0 +1,98 @@
+LIVE self-test · app /tmp/Aitmproxy-dev-nf.app/Contents/MacOS/Aitmproxy-nf · defaults suite com.mrbrutti.aitmproxy.harness-nofx-live2 · role operator
+sandbox_extension_issue_file_to_process failed for /tmp/Aitmproxy-dev-nf.app: 1 (Operation not permitted)
+LIVE self-test · config /tmp/claude/nofx-mac-live/config.yaml · upstream 127.0.0.1:8099
+PASS bus connects (127.0.0.1:19190)
+tools/list: agent.activity agent.approve agent.set agent.status browser.click browser.confine browser.eval browser.get_dom browser.navigate browser.screenshot browser.type ca.export ca.install ca.status ca.uninstall capture.status check.cmdi check.cors check.crlf check.headers check.ldapi check.methods check.nosqli check.open_redirect check.path_traversal check.paths check.sqli check.ssrf check.ssti check.xss check.xxe config.get findings.get findings.list findings.record findings.remove flow.clear flow.comment flow.detail flow.export flow.get flow.import flow.intercept flow.kill flow.list flow.mark flow.mutate flow.replay flow.resume flow.subscribe flow.table flow.unsubscribe l4.recon l4.tcp_probe l4.udp_probe map.add map.list map.remove poc.artifact poc.build poc.get poc.list poc.run proxy.pause proxy.resume proxy.status proxy.system.set proxy.system.status proxy.system.unset request.send scan.discover scan.passive scan.report scope.add scope.list scope.remove script.disable script.enable script.findings script.list script.reload script.save script.validate session.load session.save tls.passthrough.add tls.passthrough.list tls.passthrough.remove ws.frame ws.intercept ws.send
+PASS tools/list has flow.intercept, flow.list, flow.get, request.send, scope.add
+PASS connecting issues no scope.add
+PASS scope.add lands in scope.list
+PASS an external core never writes scope.json
+PASS the self-test's own scope.add is recorded as an operator command
+PASS flow.intercept {enabled: true} arms
+PASS flow.intercept {enabled: false} disarms
+PASS request.send creates a flow that flow.list / flow.get show
+PASS the sent flow completes with a status (200)
+PASS tools/list has flow.detail (F5)
+PASS flow.detail returns the request line
+PASS flow.detail returns the response with a body to review
+PASS flow.replay adds a flow and selects it
+PASS a parked request exposes its line + headers for editing (flow.detail)
+PASS flow.resume releases a parked flow and the client gets its response
+PASS flow.kill is accepted and releases the parked flow
+PASS flow.intercept takes a response-phase rule
+PASS a response rule parks at the response head: the row is parked at the response (Paused · response) and the detail carries it
+PASS the response draft has three pending edits
+PASS the client received the edited status and header (flow.mutate on the parked response, then flow.resume)
+PASS the client received the edited body
+PASS the Edited pencil appears on the resumed row
+PASS the inspector's detail is refreshed to the edited response after Apply & Resume
+PASS flow.intercept accepts the app's request rule
+PASS the matching request parks and the other completes (rule url → core wildcard)
+PASS flow.intercept accepts the wildcard with host rule
+PASS the wildcard with host rule parks the matching request on the core (full URL)
+PASS the app's preview agrees with the core: matchCount == 1 for the wildcard with host rule over the live rows
+PASS flow.intercept accepts the regex with host rule
+PASS the regex with host rule parks the matching request on the core (full URL)
+PASS the app's preview agrees with the core: matchCount == 1 for the regex with host rule over the live rows
+PASS flow.intercept accepts the another host rule
+PASS a rule for another host leaves the request flowing (nothing parks, curl exit 0)
+PASS the preview counts no live row for the other host
+PASS a warm visibleRows cache still registers the dependency on rows (the Flows page redraws, FIXLOG 2026-10-31)
+PASS a warm visibleRows cache still registers the dependency on details
+PASS flow.mark reaches the bus and is recorded (ok)
+PASS flow.comment reaches the bus and is recorded (ok)
+PASS proxy.pause reaches the bus and is recorded (ok)
+PASS flow.clear reaches the bus and is recorded (ok)
+PASS flow.clear empties the list and offers Undo Clear (11 flows)
+PASS Undo Clear puts the 11 flows back and they survive four polls (11 present)
+PASS every action is in the activity log (40 operator entries)
+PASS a real menu key equivalent (⌘K) drives the UI from the keyboard, not the bus
+PASS File menu has Compose Request…
+PASS File menu has Import…
+PASS File menu has Export Selection…
+SKIP menu Save Session: S-066
+PASS File menu has Clear Session
+PASS Flow menu has Arm/Disarm Intercept
+PASS Flow menu has Resume / Apply & Resume
+PASS Flow menu has Resume All
+PASS Flow menu has Kill…
+PASS Flow menu has Edit Paused Request
+PASS Flow menu has Revert to Original
+PASS Flow menu has Replay
+PASS Flow menu has Edit & Replay
+PASS Flow menu has Kill/Delete
+PASS Flow menu has Mark
+PASS Flow menu has Comment…
+PASS Flow menu has Pin Host
+PASS Flow menu has Build PoC from Flow…
+PASS Flow menu has Add Host to Scope…
+PASS Flow menu has Copy as cURL / httpie / Python / fetch
+PASS Flow menu has Diff Selected
+PASS Flow menu has Quick Look Body
+SKIP menu Focus Inspector: the inspector has no single focus target yet
+PASS View menu has Filter Bar
+PASS View menu has Sidebar Filter
+PASS View menu has Command Palette
+PASS View menu has Find in Body
+PASS View menu has Chips
+PASS View menu has Inspector Below / Right / Detached / Split View
+PASS View menu has Toggle Sidebar
+PASS View menu has Pause/Resume Proxy
+PASS View menu has Auto-select
+PASS View menu has Density
+PASS Agent menu has Allow All Tools / Read-only / Paused
+PASS Agent menu has Activity Log…
+PASS Agent menu has Approve Pending Request
+PASS Proxy menu has Status
+PASS Proxy menu has Scope…
+PASS Proxy menu has Breakpoint Rules…
+PASS Proxy menu has Certificate Authority…
+PASS Proxy menu has Configuration…
+PASS Proxy menu has Browser
+PASS Proxy menu has Core Log…
+PASS Proxy menu has Reconnect Bus
+PASS Proxy menu has Restart Core
+PASS Proxy menu has Capture / Stop Capturing All Apps
+PASS typing r in the sidebar filter types, never replays
+LIVE SELFTEST PASS 90 checks
+exit=0

@@ -67,7 +67,8 @@ extension Session {
 
     private func refuse(_ message: String) {
         lastError = message
-        guard !Store.usesFixtures else { return }
+        // The live self-test must not hang on a modal alert; `lastError` already carries the message.
+        guard !SelfTest.requested else { return }
         let alert = NSAlert()
         alert.messageText = "Import failed"
         alert.informativeText = message

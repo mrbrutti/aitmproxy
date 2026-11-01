@@ -13,7 +13,7 @@ extension Session {
     func editAndReplay(_ id: FlowID) {
         guard let row = rows.first(where: { $0.id == id }) else { return }
         guard row.inScope else { lastError = "Out of scope — add \(row.authority) to scope to act"; return }
-        let detail = details[id] ?? Fixtures.detail(for: row)
+        guard let detail = details[id] else { lastError = "Flow detail not loaded yet — select the flow and try again"; return }
         openCompose(ComposeDraft.from(detail: detail, row: row))
     }
 
