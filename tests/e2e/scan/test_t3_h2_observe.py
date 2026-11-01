@@ -60,7 +60,14 @@ EXPECTED_ISSUES = (("h2-settings-observe", "h2-settings"),
 SILENT_CHECKS = ("h2-pseudo-header-validation", "h2-header-crlf-tolerance",
                  "h2-cl-te-downgrade-indicator")
 RAPID_RESET_PHRASE = "no reset-rate mitigation"
-EXPECTED_REQUESTS = [0, 2, 2, 3, 8]
+# Per-connection request counters of the five raw-probe connections, sorted, as
+# hyper really counts them (T3 PR 2a live run, 2026-11-01): the SETTINGS-only
+# probe and the three malformed-header probes have every stream rejected before
+# it counts as a request (0), and the rapid-reset probe's eight cancelled
+# request heads are counted (8). The job client's own pooled h2 connection (the
+# crawl and the checks' baselines) is not a raw-probe connection and is told
+# apart by the `GET /` the crawl fetched on it.
+EXPECTED_REQUESTS = [0, 0, 0, 0, 8]
 JOB_TIMEOUT = 600.0
 
 
@@ -86,16 +93,22 @@ def h2_profile(name: str, origin: str) -> dict:
 
 def run_on(op, target, label: str) -> tuple[list, list]:
     """Scan `target`'s TLS origin; return (issues, the h2 connections it opened)."""
-    target.logs.reset()
+    seq0 = target.logs.reset()
     t0 = int(time.time() * 1000)
     job = start_job(op, "operator",
                     profile=h2_profile(f"e2e-t3-h2-observe-{label}", target.tls_base))["job"]
     status = wait_terminal(op, "operator", job, timeout=JOB_TIMEOUT)
     ok(f"{label}: job ended state={status.get('state')!r} "
        f"issues={(status.get('issues') or {}).get('total')!r}")
+    # The connections the job client pooled are the ones that carried the crawl's
+    # `GET /`; every other h2 connection opened during the job is a raw probe.
+    pooled = {e.get("conn_id") for e in target.logs.scanner_requests(seq0)
+              if e.get("path") == "/" and e.get("listener") == "tls"}
     conns = [c for c in target.logs.conns()
              if c.get("listener") == "tls" and c.get("alpn") == "h2"
-             and int(c.get("opened_ms", 0)) >= t0]
+             and int(c.get("opened_ms", 0)) >= t0 and c.get("conn_id") not in pooled]
+    check(len(pooled) >= 1,
+          f"{label}: the job client pooled at least one h2 connection for the crawl (observed {sorted(pooled)})")
     return issues(op, "operator", job=job), conns
 
 
