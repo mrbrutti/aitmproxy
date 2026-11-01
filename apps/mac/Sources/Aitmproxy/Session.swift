@@ -192,6 +192,14 @@ final class Session {
     /// connection is additive because every stored flow already carries its originating id.
     let activeCoreID = CoreID()
     var scopeHosts: [String] = []
+    /// The macOS system proxy as the core reports it. nil = unknown (never rendered as off); written by
+    /// the system-proxy session's PR4 from `proxy.status.system_proxy` and the `proxy.system.set`/`unset`
+    /// replies — nothing in this app writes it until then (traffic-route spec D6, plan call 4).
+    var systemProxy: SystemProxyState?
+    /// `proxy.status.decrypt` as last polled (traffic-route spec D6): how many hosts Scope decrypts and the
+    /// core's own empty-Scope sentence. nil until the first live read or on an older core; `make` ignores
+    /// it while the bus lane is not `.ok`, so no reset on disconnect is needed.
+    var decrypt: DecryptStatus?
     var findingsCount = 0
     var browserTabs = 0
     var activeScripts = 0

@@ -103,6 +103,7 @@ struct ShellView: View {
 /// Everything right of the sidebar.
 struct MainView: View {
     @Environment(Session.self) private var session
+    @Environment(\.openSettings) private var openSettings
 
     var body: some View {
         @Bindable var session = session
@@ -162,7 +163,10 @@ struct MainView: View {
     }
 
     private var flows: some View {
-        VStack(spacing: 0) {
+        // The routes once per body (`Session.trafficRoutes` is computed on every read): the banner, its guard
+        // and the empty state all read this value.
+        let routes = session.trafficRoutes
+        return VStack(spacing: 0) {
             // A failed embedded core captures nothing; surface it everywhere, not just
             // in the status-bar dot, with the reason and the two recovery actions.
             if session.coreHealth.health == .failed {
@@ -175,22 +179,20 @@ struct MainView: View {
             } else if session.page == .connections {
                 ConnectionDashboard().frame(height: 260)
                 Rule()
-            } else if session.scopeHosts.isEmpty, case .connected = session.bus {
-                ScopeBanner()
-                Rule()
             }
-            if session.page == .apps, session.clients.isEmpty, !session.rows.isEmpty {
-                // Captured flows exist but carry no source app, so this page cannot group them.
-                // Keep the table (captured flows are never hidden) and say why in one line.
-                AppsAttributionBanner()
+            // The one banner line on every list page (spec 2026-10-31-mac-traffic-route-advice-design
+            // D5/D8): the closed routes' state words and one remedy button while flows exist; nothing
+            // when nothing is closed. The table stays: captured flows are never hidden behind it.
+            if routes.banner != nil {
+                RouteBanner(routes: routes)
                 Rule()
             }
             if session.splitView {
                 // Two lists, own chips and selection, one capture; the focused pane carries a 2 px accent edge.
                 HStack(spacing: 0) {
-                    listPane(0)
+                    listPane(0, routes: routes)
                     VRule()
-                    listPane(1)
+                    listPane(1, routes: routes)
                 }
             } else if session.page == .connections {
                 // Viz-first Connection page: the waterfall replaces the flow table; the
@@ -202,14 +204,14 @@ struct MainView: View {
                 // With flows present the table stays and AppsAttributionBanner speaks above it.
                 AppsEmptyState()
             } else {
-                flowTable
+                flowTable(routes: routes)
             }
         }
         .environment(session)
         .themed()
     }
 
-    private func listPane(_ pane: Int) -> some View {
+    private func listPane(_ pane: Int, routes: TrafficRoutes) -> some View {
         @Bindable var session = session
         return VStack(spacing: 0) {
             if pane == 0 {
@@ -218,7 +220,7 @@ struct MainView: View {
                 ChipBar(selected: $session.secondQuery.chip)
             }
             if pane == 0 {
-                flowTable
+                flowTable(routes: routes)
             } else {
                 FlowTableView(rows: session.secondVisibleRows, selection: $session.secondSelection, sort: $session.secondQuery.sort,
                               density: session.density, layoutURL: nil, quickLookTick: session.quickLookTick,
@@ -236,7 +238,7 @@ struct MainView: View {
         .frame(maxWidth: .infinity)
     }
 
-    private var flowTable: some View {
+    private func flowTable(routes: TrafficRoutes) -> some View {
         @Bindable var session = session
         return FlowTableView(rows: session.visibleRows, selection: $session.selection, sort: $session.sort,
                              density: session.density, layoutURL: session.columnsURL, quickLookTick: session.quickLookTick,
@@ -248,7 +250,10 @@ struct MainView: View {
                              onCompose: { session.openCompose() })
         .overlay {
             if session.visibleRows.isEmpty {
-                EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress)
+                EmptyFlows(filtered: !session.rows.isEmpty, listen: session.listenAddress, routes: routes.advice,
+                           controlLive: session.caTrustControlLive) { action in
+                    RouteActions.run(action, session: session, openSettings: openSettings)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -305,23 +310,43 @@ struct BuildPoCTarget: Identifiable {
     let id: FlowID
 }
 
-/// "No flows yet — point a client at 127.0.0.1:8080 or open the browser." (foundation §2.8)
+/// "No flows yet — point a client at 127.0.0.1:8080 or open the browser." (foundation §2.8). Unfiltered,
+/// with closed routes to name (`routes`, the Kit's `TrafficRoutes.advice`), one row per entry with its
+/// buttons takes the generic line's place (spec 2026-10-31-mac-traffic-route-advice-design D4). A pure
+/// function of its inputs: the routes, whether the bus is the operator's (`controlLive`, which the Trust
+/// button needs), and `run`, the caller's `RouteActions.run` — the one place a route action becomes an effect.
 struct EmptyFlows: View {
     var filtered: Bool
     var listen: String
+    var routes: [TrafficRoute]
+    var controlLive: Bool
+    var run: (ConnectionAction) -> Void
 
     var body: some View {
         VStack(spacing: Space.sm) {
             Text(filtered ? "No flows match" : "No flows yet")
                 .font(Tok.Face.ui(Tok.Typography.Size.xl, .medium)).foregroundStyle(Tok.Ink.primary.color)
-            Text(filtered ? "Clear the chip or the filter to see the capture."
-                 : "Point a client at \(listen) or open the browser.")
-                .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+                .allowsHitTesting(false)
+            if filtered {
+                Text("Clear the chip or the filter to see the capture.")
+                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+                    .allowsHitTesting(false)
+            } else if routes.isEmpty {
+                Text("Point a client at \(listen) or open the browser.")
+                    .font(Tok.Face.ui(Tok.Typography.Size.md)).foregroundStyle(Tok.Ink.tertiary.color)
+                    .allowsHitTesting(false)
+            } else {
+                VStack(alignment: .leading, spacing: Space.md) {
+                    ForEach(routes, id: \.kind) { route in
+                        RouteAdviceRow(route: route, controlLive: controlLive, run: run)
+                    }
+                }
+                .padding(.top, Space.sm)
+            }
         }
         .multilineTextAlignment(.center)
         .padding(.top, Tok.Size.columnHeader)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .allowsHitTesting(false)
     }
 }
 
