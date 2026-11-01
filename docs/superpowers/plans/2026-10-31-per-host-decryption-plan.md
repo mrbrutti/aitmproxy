@@ -1,7 +1,9 @@
 # Per-host decryption and visible tunnels — implementation plan
 
 **Status:** approved — self-approved 2026-10-31 by the per-host-decryption session
-(autonomous mode).
+(autonomous mode). Implemented 2026-11-01; stage 5 PASS ×2, stage 6 panel re-checked
+to PASS; PR mrbrutti/aitmproxy#228 open against `main` (head carries `origin/main`
+42cdaf2e). Stage 7 (merge, Shipped section) is the orchestrator's.
 **Spec:** `docs/superpowers/specs/2026-10-31-per-host-decryption-design.md`
 **Branch / worktree:** `claude/youthful-kapitsa-c196d6` off `main` 144cdcc8,
 `/Users/matt/Security/aitmproxy/.claude/worktrees/youthful-kapitsa-c196d6`
