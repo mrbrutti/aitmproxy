@@ -782,8 +782,7 @@ Task 8 (plugin) → Task 9 (wiring) → {Task 10 main.rs ∥ Task 11 pins} → T
 ## PR 2 — TUI (`:sysproxy`, key `s`, pill word)
 
 **WAIT:** after the fake-data-removal TUI PR and l4-parity's TUI unit have merged;
-rebase onto main first. **Never touch `crates/aitm-tui/src/fixture.rs`.** If a task
-needs it, stop and report.
+rebase onto main first. **`crates/aitm-tui/src/fixture.rs` and `fixtures/bus-fixture.json` were removed from main by #244 (2026-11-01); no fixture pin remains. Tests build on `App::new()`.**
 
 ### Task 16: model — `SystemProxyWord`
 
@@ -824,7 +823,7 @@ needs it, stop and report.
   else toast `Level::Warn, "System proxy needs the core's proxy.system.* verbs"`; `on` →
   `sysproxy_setting = true` + `BusRequest::Call { name: "proxy.system.set".into(), args: json!({}) }`;
   `off` → `sysproxy_setting = true` + `Call "proxy.system.unset" {}`; `status` → `Call "proxy.system.status" {}`
-  (its reply toasts `detail`); other `rest` → `Level::Error` usage toast
+  (its reply toasts `detail` and, when it parses, refreshes the word — amended 2026-11-01); other `rest` → `Level::Error` usage toast
   `"usage: :sysproxy on|off|status"`. `Action::ToggleSysProxy` → `on` when
   `system_proxy.state != "points_at_us"`, else `off`. Reply handling (the `match name`
   that handles `"proxy.pause" | "proxy.resume"`): `"proxy.system.set" | "proxy.system.unset"`
@@ -852,8 +851,9 @@ needs it, stop and report.
 - **Satisfies:** SP-AC26 (render half).
 - **Depends on:** Task 17.
 - **Files:** `crates/aitm-tui/src/ui/bars.rs` (modify `toolbar`), `crates/aitm-tui/src/ui/overlays.rs`
-  (help line), `crates/aitm-tui/src/ui/complete.rs` (`BUILTIN_COMMANDS` entry
-  `("sysproxy on|off|status", "set / restore the OS system proxy (key s)")`).
+  (help line), `crates/aitm-tui/src/app.rs` — NOT `ui/complete.rs`, corrected 2026-11-01 — (`BUILTIN_COMMANDS` entry
+  `("sysproxy on|off|status", "Set / restore the OS system proxy (s)")` — casing/wording amended 2026-11-01 on the quality panel's ask).
+  A reconnect (`BusEvent::Connected`/`Disconnected`) drops the in-flight flag (added 2026-11-01, F-tui 6).
 - **Change:** in `toolbar`, after `format!(" · {listen}")` and before `{state}`
   (`· intercept armed` / `· capture paused`), append `app.system_proxy.as_ref().and_then(|w| w.pill(app.sysproxy_setting)).map(|p| format!(" {p}")).unwrap_or_default()`.
   Help overlay: `k("s", "set / restore the system proxy (:sysproxy on|off|status)")` after the `b / l / t` line.
@@ -1628,6 +1628,20 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 17 | security, quality, tester (PR 2) | Minor | no client-side guard against a second `s`/`:sysproxy` while a change is in flight; the core's refusal clears the flag for the first call | fixed in F-tui (guard + Warn toast "system proxy change already in flight") |
+| 18 | security (PR 2) | Minor | `toolbar` sums four `u16` widths with plain `+`; an unbounded host could overflow in debug builds | fixed in F-tui (saturating / usize arithmetic) |
+| 17 | quality (PR 2) | Minor | `"points_at_us"` literal compared in `app.rs` as well as `model.rs` | fixed in F-tui (`SystemProxyWord::points_at_us()`) |
+| 17 | quality, spec (PR 2) | Minor | set/unset reply re-reads `detail` from raw JSON; `sysproxy_detail` falls back to `"<verb>: ok"` (not a spec string); `:sysproxy status` reply does not update the word | fixed in F-tui: the status reply updates the word when it parses; fallback kept and recorded (TUI-only string, only reachable on a malformed reply, pinned by the tester) |
+| 18 | quality (PR 2) | Minor | `toolbar_hints_yield_to_the_pill_word` depends on ambient text widths; `palette_lists_the_sysproxy_command` asserts the const; palette description casing | fixed in F-tui (long-host + wide-width assertions, named constants; the tester's driven palette test covers the render); casing → "Set / restore the OS system proxy (s)" |
+| 18 | spec (PR 2) | Minor | Task 18 edited `src/app.rs` (the plan named `ui/complete.rs`, which never held `BUILTIN_COMMANDS`); toolbar hints yield when the pill word would clip (beyond "append the word"); help box 36→37 rows | recorded: plan error on the file; the yield is required for the §D12 word to render whole at the plan's 160-col test width; accepted by the orchestrator in Matt's name |
+| 17 | spec (PR 2) | Minor | set/unset reply keeps the previous word when the reply is not a status object (plan said replace unconditionally) | accepted (recorded): robustness reading; unreachable with a conforming core |
+| tester (PR 2) | tester | Minor | `keys::flows()` ignores `ctrl` for plain letters so Ctrl-S also toggles (pre-existing convention); the help `:` list shows only the first 14 commands so `sysproxy` appears on the key line, not the list | recorded; no change |
+| F-tui (PR 2) | quality+security+spec (PR 2, re-run on b44f498a) | Important | the F-tui in-flight guard had no reset on bus `Connected`/`Disconnected`: a dropped reply left `sysproxy_setting` up and locked `s` / `:sysproxy on|off` out for the rest of the run | fixed (F-tui 6): `App::forget_inflight()` (run on `Connected`/`Disconnected`) clears the flag with the browser and CA in-flight state; test `a_reconnect_drops_the_in_flight_flag_so_the_guard_lets_the_retry_through` |
+| F-tui (PR 2) | security (PR 2, re-run) | Minor | the raw `:proxy.system.set|unset` and the palette's tool list bypassed the guard and did not raise the flag (a refusal could settle the wrong flight) | fixed (F-tui 7): `App::sysproxy_begin_change()` is the one guard, used by the `sysproxy` arm and `call_tool`; test `the_raw_verb_path_shares_the_in_flight_guard` |
+| F-tui (PR 2) | quality (PR 2, re-run) | Minor | `toolbar_at`/`toolbar_text` duplicated across two test files; `PILL_GUTTER` doc said "each side" while two uses take it as the total gap; TUI and core spelled the in-flight refusal differently | fixed: `toolbar_at` lives in `tests/common/mod.rs`; doc reworded (arithmetic unchanged); the TUI toast is the core's exact sentence "a system-proxy change is already in flight" |
+| F-tui (PR 2) | spec (PR 2, re-run) | Minor | plan Task 18 still spelled the old palette literal; Task 17 did not mention the status reply refreshing the word; the core-flag half of the guard can refuse on a `setting` up to 5 s stale | plan Tasks 17/18 amended (dated); the 5 s staleness recorded, no code change (self-heals on the next poll) |
+| 19 (PR 2) | live proof (SP-AC27 TUI half) | — | run 1 (11:27 PST) flipped and restored the proxy but the pty had a 0×0 window (crossterm sizes by TIOCGWINSZ) so no text was drawn; run 2 (11:30:14–11:30:33 PST) with the window set: pill `off` → `setting…` → `→ us` → `setting…` → `off`, `scutil` HTTP/HTTPS 28080 while set, before == after, state file gone, token leak 0, a real CONNECT (api.apple-cloudkit.com, out of scope) rode through the proxy during the window | done 2026-11-01 on Matt's "Yes, both"; dumps in PR #258 |
+| 16 | coder (stop-on-gap) | Minor | Task 16 declared only `model.rs`, but `ProxyStatus` is built with exhaustive struct literals in `src/app.rs` (test helper), `tests/core_sync.rs`, `tests/common/mod.rs`; adding `system_proxy` there is required to compile | file list extended to those three one-line edits, orchestrator 2026-11-01 |
 | 20–22 | quality, spec (F-web re-run) | Minor | `refreshSystemProxy` ran while our own set/unset was in flight; three redundant `.listenButton` declarations; failure toast wording | fixed in the follow-up commit (gate on `systemProxySetting`; CSS trimmed; "Copy env line failed") |
 | 20 | quality (F-web re-run) | Minor | `mergeSystemProxy` keeps `guidance`/`remedy` across a state change; one Toolbar test waits a real ~2 s poll | accepted (recorded) by the orchestrator in Matt's name under the standing mandate: the kept fields are only read in the states that produce them; the store proves the rule on fake timers |
 | 22 | spec (F-web re-run) | Minor | `title: guidance` on the Copy env line item and the success notice "Copied env line" are not in the spec | accepted in Matt's name: the tooltip was the security reviewer's ask (show the text before copying); the success notice is the app's convention for every copy action |
