@@ -85,7 +85,7 @@ upstream_pid=$!
 sleep 0.5
 
 # 5. Launch the app the NORMAL way (no --selftest, no APP_LIVE): APP_STORE keeps it
-#    off the real database; usesFixtures stays false so the live embedded path runs.
+#    off the real database; the app runs its live embedded path (there is no fixture mode).
 rm -rf ~/Library/Saved\ Application\ State/com.mrbrutti.aitmproxy.savedState
 store=/tmp/Aitmproxy-live-embedded-state
 rm -rf "$store"; mkdir -p "$store"

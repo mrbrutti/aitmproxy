@@ -12,7 +12,9 @@ import { Icon } from '~/components/Icon';
 import { Kbd } from '~/components/Kbd';
 import { FlowLine } from '~/lib/schema-form/FlowLine';
 import { SchemaForm } from '~/lib/schema-form/SchemaForm';
-import { createFormState, type FormState } from '~/lib/schema-form/infer';
+import { createFormState, type FormState, type RawValues } from '~/lib/schema-form/infer';
+import { isCACancelled, isCATrustTool } from '~/state/caTrust';
+import { isMalformedConfirm, isNeedsConfirm, MALFORMED_CONFIRM_MESSAGE, STALE_CONFIRM_MESSAGE } from '~/bus/confirm';
 import { segments } from '~/lib/fuzzy';
 import { openedByPointer } from '~/lib/pointer';
 import { buildGroups, commandKey, compactJson, flatten, flowIdsIn, parseQuery, pushRecent, readPinned, readRecent, setupKey, togglePinned, type PaletteItem } from './groups';
@@ -22,8 +24,15 @@ import css from './palette.module.css';
 type Stage =
   | { kind: 'list' }
   | { kind: 'form'; tool: ToolDef; form: FormState; confirming: boolean }
+  | { kind: 'confirm'; tool: ToolDef; args: Record<string, unknown>; prompt: string; token: string }
   | { kind: 'running'; tool: ToolDef }
   | { kind: 'result'; tool: ToolDef; ok: boolean; value: unknown; ms: number; args: Record<string, unknown> };
+
+/** Which call of the bus confirm handshake (bus spec D4) a run is: the first, or the re-send carrying `_confirm`. */
+type Phase = { kind: 'begin' } | { kind: 'confirm'; token: string };
+
+/** How one call ended; `ask` only ever comes from the `begin` phase, a second envelope is `stale`. */
+type Outcome = { kind: 'done'; value: unknown } | { kind: 'ask'; prompt: string; token: string } | { kind: 'stale' } | { kind: 'failed'; message: string };
 
 export const CommandPalette: Component = () => {
   const app = useApp();
@@ -37,9 +46,17 @@ export const CommandPalette: Component = () => {
   let list: HTMLDivElement | undefined;
   const previous = document.activeElement as HTMLElement | null;
 
+  let disposed = false;
+  /** Bumped by every `run`; a reply whose run is no longer the latest ends that run without touching the stage. */
+  let runSeq = 0;
+  /** The `run` that holds the CA in-flight flag (§D17.12); only its ending releases it, so a superseded CA run cannot release what a newer one holds. */
+  let caOwner = 0;
   const close = () => app.openPalette(false);
   onCleanup(() => {
+    disposed = true;
     if (previous && document.contains(previous)) previous.focus({ preventScroll: true });
+    const s = stage();
+    if (s.kind === 'confirm' && isCATrustTool(s.tool.name)) void releaseCA();
   });
   onMount(() => queueMicrotask(() => input?.focus()));
 
@@ -67,24 +84,90 @@ export const CommandPalette: Component = () => {
   // ---- running commands ----
   const toolByName = (name: string) => app.proxy.tools.find((t) => t.name === name) ?? null;
 
-  const run = async (tool: ToolDef, args: Record<string, unknown>) => {
-    setStage({ kind: 'running', tool });
-    const t0 = performance.now();
+  /** When a `ca.install` / `ca.uninstall` run ends, however it ends (§D17.12): the read-back the word comes from (D17.5), then the in-flight flag. */
+  const releaseCA = async () => {
+    if (!(await app.refreshCA())) app.notice('ca.status could not be re-read; the CA word may be stale', 'error');
+    app.setCAInstalling(false);
+  };
+
+  const callFor = async (tool: ToolDef, args: Record<string, unknown>, phase: Phase): Promise<Outcome> => {
     try {
-      const value = await app.call(tool.name, args);
-      setStage({ kind: 'result', tool, ok: true, value, ms: performance.now() - t0, args });
-      if (tool.mutates !== false) void app.refreshSide();
+      const value = await app.call(tool.name, phase.kind === 'begin' ? args : { ...args, _confirm: phase.token });
+      if (isMalformedConfirm(value)) return { kind: 'failed', message: MALFORMED_CONFIRM_MESSAGE };
+      if (!isNeedsConfirm(value)) return { kind: 'done', value };
+      if (phase.kind === 'confirm') return { kind: 'stale' };
+      return { kind: 'ask', prompt: value.prompt, token: value.confirm_token };
     } catch (e) {
-      setStage({ kind: 'result', tool, ok: false, value: (e as Error).message, ms: performance.now() - t0, args });
+      return { kind: 'failed', message: (e as Error).message };
     }
+  };
+
+  /**
+   * Where a call's outcome takes the palette. Only a palette still waiting for this very run is
+   * written to: one that was closed, left, or moved on to a newer run meanwhile treats the reply
+   * as the end of the run (a failure or a stale token becomes a notice, a result is dropped).
+   * A CA run (§D17.12) is released on every ending while it owns the flag, never while the prompt is up.
+   */
+  const settle = async (tool: ToolDef, args: Record<string, unknown>, outcome: Outcome, t0: number, seq: number) => {
+    const ca = isCATrustTool(tool.name);
+    // A snapshot is exact here: every setStage in this function precedes its first await.
+    const awaited = !disposed && seq === runSeq && stage().kind === 'running';
+    const show = (s: Stage) => {
+      if (awaited) setStage(s);
+    };
+    const result = (ok: boolean, value: unknown): Stage => ({ kind: 'result', tool, ok, value, ms: performance.now() - t0, args });
+    const fail = (message: string) => (awaited ? setStage(result(false, message)) : app.notice(message, 'error'));
+    switch (outcome.kind) {
+      case 'ask':
+        if (awaited) setStage({ kind: 'confirm', tool, args, prompt: outcome.prompt, token: outcome.token });
+        else if (ca && caOwner === seq) await releaseCA();
+        return;
+      case 'done':
+        show(result(true, outcome.value));
+        if (tool.mutates !== false) void app.refreshSide();
+        break;
+      case 'stale':
+        fail(STALE_CONFIRM_MESSAGE);
+        break;
+      case 'failed':
+        if (ca && isCACancelled(outcome.message)) {
+          // The operator dismissed the OS dialog: calm (D17.4), nothing to inspect.
+          app.notice(outcome.message, 'info');
+          show({ kind: 'list' });
+        } else fail(outcome.message);
+        break;
+    }
+    if (ca && caOwner === seq) await releaseCA();
     setRecent(pushRecent(commandKey(tool.name)));
   };
 
-  const selectTool = (tool: ToolDef) => {
-    const form = createFormState(tool);
+  /** One call of a command: the first by default, the confirming re-send when `phase` carries the token. */
+  const run = async (tool: ToolDef, args: Record<string, unknown>, phase: Phase = { kind: 'begin' }) => {
+    const seq = ++runSeq;
+    setStage({ kind: 'running', tool });
+    const t0 = performance.now();
+    if (isCATrustTool(tool.name)) {
+      caOwner = seq;
+      if (phase.kind === 'begin') app.setCAInstalling(true);
+    }
+    await settle(tool, args, await callFor(tool, args, phase), t0, seq);
+  };
+
+  /** The operator declined the bus's prompt: nothing ran, nothing more is sent. */
+  const cancelConfirm = async (tool: ToolDef) => {
+    backToList();
+    if (isCATrustTool(tool.name)) await releaseCA();
+  };
+
+  /** Initial form values from a setup action's arguments: strings and booleans as they are, the rest as JSON text. */
+  const toRawValues = (args: Record<string, unknown>): RawValues =>
+    Object.fromEntries(Object.entries(args).map(([k, v]) => [k, typeof v === 'string' || typeof v === 'boolean' ? v : JSON.stringify(v)]));
+
+  const selectTool = (tool: ToolDef, initial: Record<string, unknown> = {}) => {
+    const form = createFormState(tool, toRawValues(initial));
     if (form.fields.length === 0) {
       if (typeof tool.confirm === 'string') setStage({ kind: 'form', tool, form, confirming: true });
-      else void run(tool, {});
+      else void run(tool, initial);
       return;
     }
     setStage({ kind: 'form', tool, form, confirming: false });
@@ -116,7 +199,7 @@ export const CommandPalette: Component = () => {
         setRecent(pushRecent(setupKey(item.action.id)));
         if (item.action.tool) {
           const t = toolByName(item.action.tool);
-          if (t) selectTool(t);
+          if (t) selectTool(t, item.action.args ?? {});
           else app.notice(`${item.action.tool} is not available on this bus`, 'error');
         } else void item.action.run?.();
         break;
@@ -135,6 +218,7 @@ export const CommandPalette: Component = () => {
       e.preventDefault();
       if (s.kind === 'list') close();
       else if (s.kind === 'form' && s.confirming && s.form.fields.length) setStage({ ...s, confirming: false });
+      else if (s.kind === 'confirm') void cancelConfirm(s.tool);
       else backToList();
       return;
     }
@@ -142,6 +226,7 @@ export const CommandPalette: Component = () => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         if (s.kind === 'form') submitForm();
+        else if (s.kind === 'confirm') void run(s.tool, s.args, { kind: 'confirm', token: s.token });
         else if (s.kind === 'result') void run(s.tool, s.args);
       }
       return;
@@ -217,7 +302,9 @@ export const CommandPalette: Component = () => {
             spellcheck={false}
             onInput={(e) => {
               setQuery(e.currentTarget.value);
-              if (stage().kind !== 'list') setStage({ kind: 'list' });
+              const s = stage();
+              if (s.kind === 'confirm') void cancelConfirm(s.tool);
+              else if (s.kind !== 'list') setStage({ kind: 'list' });
             }}
           />
           <Show when={mode() !== 'all'}>
@@ -351,6 +438,34 @@ export const CommandPalette: Component = () => {
                     <span class={css.spacer} />
                     <Button variant="primary" kbd="⌘⏎" onClick={submitForm} disabled={!st().form.result().valid && st().form.touched().size > 0} ref={(n) => st().form.fields.length === 0 && queueMicrotask(() => n.focus())}>
                       {st().confirming ? 'Confirm' : 'Run'}
+                    </Button>
+                  </div>
+                </div>
+              );
+            }}
+          </Match>
+
+          <Match when={stage().kind === 'confirm' && stage()}>
+            {(s) => {
+              const st = () => s() as Extract<Stage, { kind: 'confirm' }>;
+              return (
+                <div class={css.stage}>
+                  <div class={css.stageHead}>
+                    <span class={css.name}>{st().tool.name}</span>
+                    <span class={css.desc}>{st().tool.description}</span>
+                  </div>
+                  <div class={css.confirm} role="alert">
+                    {st().prompt}
+                  </div>
+                  <div class={css.stageFoot}>
+                    <button type="button" class={css.ghostBtn} onClick={() => void cancelConfirm(st().tool)}>
+                      <Icon name="chevron-right" size={12} style={{ transform: 'rotate(180deg)' }} />
+                      Cancel
+                      <Kbd>esc</Kbd>
+                    </button>
+                    <span class={css.spacer} />
+                    <Button variant="primary" kbd="⌘⏎" onClick={() => void run(st().tool, st().args, { kind: 'confirm', token: st().token })} ref={(n) => queueMicrotask(() => n.focus())}>
+                      Confirm
                     </Button>
                   </div>
                 </div>

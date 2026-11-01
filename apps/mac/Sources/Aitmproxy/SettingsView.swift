@@ -36,7 +36,7 @@ struct SettingsView: View {
     }
 }
 
-/// The Settings tabs. Snapshot mode walks through every case.
+/// The Settings tabs.
 enum SettingsTab: String, CaseIterable, Identifiable {
     case general, bus, proxy
     /// L4 capture: the operator's on/off, its state, and the extension's uninstall.
@@ -110,7 +110,7 @@ struct BusSettings: View {
                 set: { kind in
                     activeKindRaw = kind.rawValue
                     // Drive the live start/stop + make-active transition. The model
-                    // persists the choice too; it is nil only in fixture/snapshot runs.
+                    // persists the choice too; it is nil only until the shell has built the live stack.
                     session.connection?.select(kind)
                 }
             )) {
@@ -167,7 +167,7 @@ struct ProxySettings: View {
 
     /// Apply & Restart is live only for the embedded core and only once an edit
     /// diverges from what the running core was started with. With no applied
-    /// snapshot yet (no core up, or a fixture) it stays live so a first Apply can
+    /// snapshot yet (no core up) it stays live so a first Apply can
     /// start the core.
     private var canApply: Bool {
         guard usesEmbedded else { return false }
@@ -214,7 +214,7 @@ struct ProxySettings: View {
 /// extension is doing, and its uninstall (Task 17, NE-AC15). Capture is off until the
 /// operator turns it on here, with Proxy ▸ Capture All Apps or the toolbar's All Apps switch. Reads the capability the
 /// `ExtensionController` pushes into `CoreHealthState`. With no extension in this build
-/// (a development build, fixture and snapshot runs) the controls give way to a note: a
+/// (a development build) the controls give way to a note: a
 /// toggle that does nothing is never shown.
 ///
 /// Turning capture on or off, and uninstalling, are the operator's controls and nothing
