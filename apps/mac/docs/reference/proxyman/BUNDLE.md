@@ -182,6 +182,11 @@ strings -a Contents/Frameworks/ProxymanCore.framework/ProxymanCore | grep networ
 
 `networksetup -setwebproxy "`, `networksetup -setsecurewebproxy "`,
 `networksetup -setwebproxystate "`, `networksetup -setsecurewebproxystate "`.
+Seen live [SCREENS.md shot 31]: Settings ▸ Advanced ▸ `Proxy Helper Tool: ⚠ Not
+Installed`, `Your current HTTP/HTTPS Proxy is overridden by networksetup CLI.`,
+and `Restore the Previous HTTP/HTTPS Proxy When Proxyman Closes` **disabled**
+until the helper exists. Also seen: reopening the main window re-applies the
+override (SCREENS §6).
 UI copy: ``Your HTTP/HTTPS Proxy is currently overridden by `networksetup` CLI. It works, but slow!``,
 `Proxy Helper tool is better performance than using networksetup CLI`, and
 the status-bar badge text `Overridden by %@` (`networksetup` CLI or Proxy
@@ -315,6 +320,12 @@ bare executables such as `dataaccessd`. The matching loop, its flavor
 constant and the race with short-lived connections were not traced; our own
 design must handle them. No privilege is needed for the user's own
 processes; system daemons resolve by name only.
+
+Confirmed live on 2026-11-01 [Matt's Proxyman, SCREENS.md shots 30 and 34]:
+with the Network Extension toggle off and Pro-locked, the Apps sidebar named
+twelve clients with icons (`Mail`, `trustd`, `cloudd`, `nsurlsessiond`,
+`dataaccessd`, `Claude Helper`, `codex`, `Google Chrome`, …) from the system
+proxy alone.
 
 What this means for aitmproxy: the `Client —` column in every proxied flow
 of our app (see DELTA.md) is not waiting on the extension. The core (or the
