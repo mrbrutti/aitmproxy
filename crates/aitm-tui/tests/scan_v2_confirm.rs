@@ -7,6 +7,8 @@
 //! Fixture-driven: this proves the overlay and the cancel path only. Acceptance
 //! is the pty cell against a real core (spec Acceptance criteria, "Live").
 
+mod common;
+
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::fixture_app_core;
@@ -257,4 +259,87 @@ fn the_prompt_wraps_by_cell_width_not_chars() {
         9,
         "nine words fill 44 of 48 cells"
     );
+}
+
+/// The v2 bus the launch cell connects to (fix round H, H18).
+const SCAN_TOOLS: &[&str] = &[
+    "scan.start",
+    "scan.map",
+    "scan.list",
+    "scan.status",
+    "scan.profile.list",
+    "scan.profile.get",
+    "scan.checks",
+    "l4.scope.list",
+];
+
+/// Fix round H, H18: the overlay sits over the view the launch came from.
+/// A `needs_confirmation` on `scan.start` from Profiles keeps the Scan view
+/// (its box title and the tab strip) under the box; the Flows view, which
+/// `main_region` would draw, is not on screen.
+#[test]
+fn a_scan_confirm_draws_over_the_scan_view() {
+    let mut app = common::opened_v2(SCAN_TOOLS);
+    app.scope = vec!["auth.shop-staging.test".to_string()];
+    app.scan.profiles.cursor = 3; // `standard`
+    let reqs = app.update(Action::ScanStart);
+    assert_eq!(reqs.len(), 1, "one launch leaves: {reqs:?}");
+    let reqs = app.on_bus(common::reply(
+        "scan.start",
+        "scan.start",
+        json!({ "status": "needs_confirmation", "prompt": "Prompt-7Q verbatim", "confirm_token": "tok-1" }),
+    ));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.mode, Mode::WireConfirm);
+    assert_eq!(app.wire_confirm_from, Mode::Scan);
+
+    let text = screen(&app, 200, 50);
+    assert!(
+        text.contains("Confirm over the wire: scan launch"),
+        "the overlay is up: {text}"
+    );
+    assert!(
+        text.contains(" 1 Profiles "),
+        "the Scan tab strip stays under the overlay: {text}"
+    );
+    assert!(
+        text.contains(" Scan "),
+        "the Scan box title stays under the overlay: {text}"
+    );
+    assert!(
+        !text.contains("No flows yet"),
+        "the Flows view is not drawn under a Scan launch: {text}"
+    );
+}
+
+/// Fix round H, H18: an L4 confirm raised from the flow list or its
+/// inspector still draws the flow list under the box; the Scan view is not
+/// pulled in.
+#[test]
+fn an_l4_confirm_from_flows_still_shows_the_flow_list() {
+    for from in [Mode::Flows, Mode::Inspector] {
+        let mut app = fixture_app_core(200, 50);
+        app.wire_confirm = Some(WireConfirm {
+            call: "l4.inject".into(),
+            args: json!({ "spec": { "layers": [] } }),
+            prompt: "P".into(),
+            token: "tok-1".into(),
+        });
+        app.mode = Mode::WireConfirm;
+        app.wire_confirm_from = from;
+
+        let text = screen(&app, 200, 50);
+        assert!(
+            text.contains("Confirm over the wire: guarded L4 action"),
+            "{from:?}: the overlay is up: {text}"
+        );
+        assert!(
+            text.contains("shop-staging.test"),
+            "{from:?}: the flow list stays under the overlay: {text}"
+        );
+        assert!(
+            !text.contains(" 1 Profiles "),
+            "{from:?}: the Scan view is not drawn under an L4 confirm: {text}"
+        );
+    }
 }

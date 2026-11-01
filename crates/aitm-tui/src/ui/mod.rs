@@ -104,7 +104,14 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     bars::toolbar(app, theme, toolbar, buf);
     bars::chips(app, theme, chips, buf);
 
-    match app.mode {
+    // The wire-confirm overlay sits over the view the launch came from (fix
+    // round H, H18): its body is `wire_confirm_from`'s, the Scan view for a
+    // `scan.*` launch, the flow list and inspector for a guarded L4 verb.
+    let body_mode = match app.mode {
+        Mode::WireConfirm => app.wire_confirm_from,
+        mode => mode,
+    };
+    match body_mode {
         Mode::Compose => overlays::compose(app, theme, body, buf),
         Mode::Scope => overlays::scope(app, theme, body, buf),
         Mode::Findings => overlays::findings(app, theme, body, buf),
