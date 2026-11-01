@@ -14,7 +14,7 @@ use aitm_tui::keys;
 use aitm_tui::l4::{
     ascii_column, clock_ms, flow_get_args, fold_status, hex_dump, inspect_args, packet_fields,
     slow_l4_reads, status_ids, supports_operator_scope_add, supports_window, L4Availability,
-    L4Confirm, L4Flow, L4Pane, L4Parked, L4State,
+    L4Confirm, L4Flow, L4Pane, L4Parked, L4State, SCOPE_ADD_L4_USAGE,
 };
 use aitm_tui::model::{AgentPolicy, AgentState, FlowRow};
 use aitm_tui::theme::Theme;
@@ -459,10 +459,18 @@ fn models_bus_events_fold_into_l4_state() {
 /// statuses come first so one pass's status read governs its list read.
 #[test]
 fn polling_slow_reads_status_always_and_parked_only_when_available() {
+    // Tester: the unavailable pass is exactly these four, in this order —
+    // both status verbs every time, never `l4.intercept.list`.
     let unavailable = slow_l4_reads(|_| true, false);
-    assert!(unavailable.contains(&"l4.capture.status"));
-    assert!(unavailable.contains(&"l4.intercept.status"));
-    assert!(!unavailable.contains(&"l4.intercept.list"));
+    assert_eq!(
+        unavailable,
+        vec![
+            "l4.scope.list",
+            "l4.agent.status",
+            "l4.capture.status",
+            "l4.intercept.status",
+        ]
+    );
 
     let available = slow_l4_reads(|_| true, true);
     assert!(available.contains(&"l4.intercept.list"));
@@ -708,24 +716,25 @@ fn capture_commands_refuse_locally_while_capture_is_unavailable() {
     // Pending: nothing has answered yet.
     assert_eq!(app.l4.capture, L4Availability::pending());
     assert_eq!(app.run_command("l4 capture lo0"), Vec::<BusRequest>::new());
-    assert!(
-        toast_text(&app).contains("Reading L4 availability…"),
-        "toast: {:?}",
-        toast_text(&app)
+    // Tester: the plan's literal is `capture unavailable: <reason>`, exactly.
+    assert_eq!(
+        toast_text(&app),
+        "capture unavailable: Reading L4 availability…"
     );
 
     set_capture(&mut app, unavailable("X"), &[]);
+    app.toasts.clear();
     assert_eq!(app.run_command("l4 capture lo0"), Vec::<BusRequest>::new());
-    let t = toast_text(&app);
-    assert!(t.contains('X'), "toast carries the core's reason: {t:?}");
-    assert!(
-        t.starts_with("capture unavailable: "),
-        "toast is the plan's literal: {t:?}"
-    );
+    assert_eq!(toast_text(&app), "capture unavailable: X");
+    app.toasts.clear();
     assert_eq!(
         app.run_command("l4 capture lo0 outbound"),
         Vec::<BusRequest>::new()
     );
+    assert_eq!(toast_text(&app), "capture unavailable: X");
+    // Nothing is left pending and no overlay opened: the refusal is complete.
+    assert!(app.l4.pending.is_none());
+    assert_eq!(app.mode, Mode::Flows);
 }
 
 /// With capture available, `:l4 capture <iface> [dir]` is exactly one
@@ -1183,12 +1192,11 @@ fn parked_id_acts_on_the_first_listed_for_the_flow() {
 fn parked_id_without_a_parked_entry_sends_nothing() {
     let mut app = intercept_ready(vec![]);
     assert_eq!(app.update(Action::Resume), Vec::<BusRequest>::new());
-    assert!(
-        toast_text(&app).contains("no parked packet"),
-        "{}",
-        toast_text(&app)
-    );
+    assert_eq!(toast_text(&app), "no parked packet on this flow");
+    app.toasts.clear();
     assert_eq!(app.update(Action::Kill), Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "no parked packet on this flow");
+    assert!(app.l4.pending.is_none(), "{:?}", app.l4.pending);
 }
 
 /// AC11: intercept unavailable (reason `Y`) → Forward / Drop / Mutate put no
@@ -1204,10 +1212,15 @@ fn parked_id_unavailable_intercept_refuses_locally_with_the_reason() {
         })),
         captures: vec![],
     });
+    // Tester: the plan's literal is `in-path intercept unavailable: <reason>`,
+    // exactly, and nothing is left pending for a confirm.
     assert_eq!(app.update(Action::Resume), Vec::<BusRequest>::new());
-    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+    assert_eq!(toast_text(&app), "in-path intercept unavailable: Y");
+    app.toasts.clear();
     assert_eq!(app.update(Action::Kill), Vec::<BusRequest>::new());
-    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+    assert_eq!(toast_text(&app), "in-path intercept unavailable: Y");
+    assert!(app.l4.pending.is_none(), "{:?}", app.l4.pending);
+    assert_ne!(app.mode, Mode::L4Confirm);
     // Mutate (`e`) opens the craft pane; it never calls `l4.intercept.*`.
     let out = app.update(Action::Edit);
     assert!(
@@ -1545,9 +1558,11 @@ fn mutate_unavailable_intercept_refuses_both_with_the_reason() {
         captures: vec![],
     });
     assert_eq!(app.update(Action::L4MutateParked), Vec::<BusRequest>::new());
-    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+    assert_eq!(toast_text(&app), "in-path intercept unavailable: Y");
+    app.toasts.clear();
     assert_eq!(app.update(Action::L4RevertParked), Vec::<BusRequest>::new());
-    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+    assert_eq!(toast_text(&app), "in-path intercept unavailable: Y");
+    assert!(app.l4.pending.is_none(), "{:?}", app.l4.pending);
 }
 
 /// The B4 refusal: no parked packet for the flow → nothing on the bus, an
@@ -1556,17 +1571,10 @@ fn mutate_unavailable_intercept_refuses_both_with_the_reason() {
 fn mutate_without_a_parked_packet_refuses_both() {
     let mut app = craft_ready(vec![]);
     assert_eq!(app.update(Action::L4MutateParked), Vec::<BusRequest>::new());
-    assert!(
-        toast_text(&app).contains("no parked packet"),
-        "{}",
-        toast_text(&app)
-    );
+    assert_eq!(toast_text(&app), "no parked packet on this flow");
+    app.toasts.clear();
     assert_eq!(app.update(Action::L4RevertParked), Vec::<BusRequest>::new());
-    assert!(
-        toast_text(&app).contains("no parked packet"),
-        "{}",
-        toast_text(&app)
-    );
+    assert_eq!(toast_text(&app), "no parked packet on this flow");
 }
 
 /// A spec the editor cannot parse never reaches the bus: the error lands in
@@ -1830,18 +1838,21 @@ fn scope_add_l4_confirm_handshake_reissues_with_the_token() {
 fn scope_add_l4_refuses_bad_arity_and_words_locally() {
     let mut on = app();
     let _ = connected(&mut on, l4_tools(true));
-    assert_eq!(on.run_command("scope add l4 127.0.0.1/32"), vec![]);
-    assert!(toast_text(&on).contains("usage"), "{:?}", toast_text(&on));
-    assert_eq!(
-        on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 sideways capture"),
-        vec![]
-    );
-    assert!(toast_text(&on).contains("usage"), "{:?}", toast_text(&on));
-    assert_eq!(
-        on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound sniff"),
-        vec![]
-    );
-    assert!(toast_text(&on).contains("usage"), "{:?}", toast_text(&on));
+    // Tester: the toast is the one usage line, exactly; nothing is left
+    // pending (a later `needs_confirmation` reply must have nothing to bind).
+    for bad in [
+        "scope add l4 127.0.0.1/32",
+        "scope add l4",
+        "scope add l4 127.0.0.1/32 9100-9199 lo0 sideways capture",
+        "scope add l4 127.0.0.1/32 9100-9199 lo0 inbound sniff",
+        "scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture extra",
+    ] {
+        on.toasts.clear();
+        assert_eq!(on.run_command(bad), vec![], "{bad}");
+        assert_eq!(toast_text(&on), SCOPE_ADD_L4_USAGE, "{bad}");
+        assert!(on.l4.pending.is_none(), "{bad}: {:?}", on.l4.pending);
+        assert_eq!(on.mode, Mode::Flows, "{bad}");
+    }
 }
 
 /// Against a core without unit (a') (`confirmable` false) the full command is
@@ -2598,4 +2609,707 @@ fn no_stale_f1_in_tui_src() {
         }
     }
     assert!(hits.is_empty(), "stale F1 text:\n{}", hits.join("\n"));
+}
+
+// ================================================================== tester
+//
+// Stage-5 additions (tester). Every input below is built in the test in the
+// core's wire shape; nothing is read from a fixture, a snapshot or a seeded
+// store. The theme of this block is the unit's core promise — **nothing on
+// the wire when unavailable, and never the flow id on a verdict** — plus the
+// edge cases a bus client must survive: malformed, empty, oversized and
+// control-character-laden replies.
+
+/// Every L4 `Call` an action sequence emitted, as `(name, args)`.
+fn l4_calls(reqs: &[BusRequest]) -> Vec<(String, Value)> {
+    reqs.iter()
+        .filter_map(|r| match r {
+            BusRequest::Call { name, args } if name.starts_with("l4.") => {
+                Some((name.clone(), args.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A screen (or pane) has no control character at all: the only `\n` is the
+/// row join the helper adds itself.
+fn assert_inert(text: &str, what: &str) {
+    assert!(
+        text.chars().all(|c| c >= ' ' || c == '\n'),
+        "{what}: a control character reached the rendered buffer: {text:?}"
+    );
+}
+
+/// The parked-id rule (spec §4, plan decision 3, AC10/AC12) across **every**
+/// verdict verb at once: with a uuid-shaped flow id and a uuid-shaped parked
+/// id, Forward, Drop, Mutate and Revert each send exactly one `l4.intercept.*`
+/// call whose `id` is the parked id; no emitted argument anywhere contains the
+/// flow id; Mutate's only other key is `spec`. The confirm re-issue of Forward
+/// keeps the parked id and adds only `_confirm`.
+#[test]
+fn tester_parked_id_rule_every_verdict_verb_carries_only_the_parked_id() {
+    const FLOW: &str = "6f1c2b7e-9d3a-4e5f-8a0b-1c2d3e4f5a6b";
+    const PARKED: &str = "0a9b8c7d-6e5f-4a3b-2c1d-0e9f8a7b6c5d";
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable("X"),
+        intercept: L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "sessions": [FLOW]}),
+        ),
+        captures: vec![],
+    });
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "interface": "lo", "capability": "intercept", "cidr": "127.0.0.1/32",
+        "ports": "9000-9999", "direction": "inbound"
+    })]));
+    let _ = app.on_bus(BusEvent::L4Flows(vec![intercept_flow(FLOW)]));
+    let _ = app.on_bus(BusEvent::L4Parked(vec![json!({
+        "id": PARKED, "flow": FLOW, "state": "parked", "dir": "inbound",
+        "length": 60, "layers": ["IPv4", "TCP"], "parked_at": 1_700_000_000_000i64
+    })]));
+    app.selected = Some(FLOW.into());
+    app.l4.craft.lines = vec![EDITOR_SPEC.to_string()];
+
+    let mut seen = Vec::new();
+    for (action, verb) in [
+        (Action::Resume, "l4.intercept.forward"),
+        (Action::Kill, "l4.intercept.drop"),
+        (Action::L4MutateParked, "l4.intercept.mutate"),
+        (Action::L4RevertParked, "l4.intercept.revert"),
+    ] {
+        let out = app.update(action.clone());
+        let calls = l4_calls(&out);
+        assert_eq!(calls.len(), 1, "{action:?} → exactly one L4 call: {out:?}");
+        let (name, args) = &calls[0];
+        assert_eq!(name, verb, "{action:?}");
+        assert_eq!(args["id"], json!(PARKED), "{verb} carries the parked id");
+        let keys: Vec<&str> = args
+            .as_object()
+            .expect("object args")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        if verb == "l4.intercept.mutate" {
+            assert_eq!(keys, vec!["id", "spec"], "{verb}");
+            assert_eq!(args["spec"], editor_spec());
+        } else {
+            assert_eq!(keys, vec!["id"], "{verb}");
+        }
+        assert!(
+            !args.to_string().contains(FLOW),
+            "{verb} must never carry the flow id: {args}"
+        );
+        seen.push(name.clone());
+    }
+    assert_eq!(
+        seen,
+        vec![
+            "l4.intercept.forward",
+            "l4.intercept.drop",
+            "l4.intercept.mutate",
+            "l4.intercept.revert"
+        ]
+    );
+
+    // The confirm handshake on Forward re-issues `{id: <parked>, _confirm}` —
+    // still never the flow id — and `n` on a fresh one sends nothing.
+    let _ = app.update(Action::Resume);
+    let reqs = app.on_bus(BusEvent::CallOk {
+        name: "l4.intercept.forward".into(),
+        value: json!({"status": "needs_confirmation", "prompt": "Forward 1 parked TCP packet?", "confirm_token": "cfm-77"}),
+    });
+    assert!(
+        l4_calls(&reqs).is_empty(),
+        "the handshake reply sends nothing"
+    );
+    assert_eq!(app.mode, Mode::L4Confirm);
+    let reqs = app.update(Action::L4Confirm(true));
+    assert_eq!(
+        reqs,
+        vec![BusRequest::Call {
+            name: "l4.intercept.forward".into(),
+            args: json!({"id": PARKED, "_confirm": "cfm-77"}),
+        }]
+    );
+    assert!(!reqs[0].clone().to_debug().contains(FLOW));
+    assert_eq!(app.mode, Mode::Inspector, "back to the inspector");
+
+    let _ = app.update(Action::Kill);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "l4.intercept.drop".into(),
+        value: json!({"status": "needs_confirmation", "prompt": "Drop?", "confirm_token": "cfm-78"}),
+    });
+    assert_eq!(app.mode, Mode::L4Confirm);
+    assert_eq!(
+        keys::map(press('n'), Mode::L4Confirm),
+        Some(Action::L4Confirm(false))
+    );
+    assert_eq!(app.update(Action::L4Confirm(false)), vec![]);
+    assert_eq!(toast_text(&app), "l4.intercept.drop cancelled");
+    assert!(app.l4.confirm.is_none());
+}
+
+/// `Debug` text of a request, for "does not contain" checks.
+trait DebugText {
+    fn to_debug(self) -> String;
+}
+impl DebugText for BusRequest {
+    fn to_debug(self) -> String {
+        format!("{self:?}")
+    }
+}
+
+/// A `needs_confirmation` reply **without** a `confirm_token` is not a
+/// handshake the TUI can complete: it opens no overlay and re-issues nothing
+/// (a bare re-issue would just earn another `needs_confirmation`). Covered
+/// for the scope add and for the inject.
+#[test]
+fn tester_malformed_handshake_without_a_token_opens_nothing_and_sends_nothing() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let _ = on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture");
+    let reqs = on.on_bus(BusEvent::CallOk {
+        name: "l4.scope.add".into(),
+        value: json!({"status": "needs_confirmation", "prompt": "P"}),
+    });
+    assert!(
+        !reqs
+            .iter()
+            .any(|r| matches!(r, BusRequest::Call { name, .. } if name == "l4.scope.add")),
+        "no bare re-issue: {reqs:?}"
+    );
+    assert_ne!(on.mode, Mode::L4Confirm, "no overlay without a token");
+    assert!(on.l4.confirm.is_none());
+    assert!(
+        on.l4.pending.is_none(),
+        "the pending call is consumed, not replayed"
+    );
+    // `y` now (no overlay) must not resurrect anything.
+    assert_eq!(on.update(Action::L4Confirm(true)), vec![]);
+
+    let mut inj = inject_ready(available());
+    let _ = inj.update(Action::L4Inject);
+    let reqs = inj.on_bus(BusEvent::CallOk {
+        name: "l4.inject".into(),
+        value: json!({"status": "needs_confirmation", "prompt": "Inject?"}),
+    });
+    assert!(l4_calls(&reqs).is_empty(), "{reqs:?}");
+    assert_ne!(inj.mode, Mode::L4Confirm);
+    assert!(inj.l4.confirm.is_none());
+    assert_eq!(inj.update(Action::L4Confirm(true)), vec![]);
+}
+
+/// HTTP `:scope add <host>` is unchanged by the L4 form even for hosts that
+/// begin with the letters `l4` — only the exact word `l4` (alone or followed
+/// by a space) is the L4 form — and the same holds through the palette's
+/// Submit path with the `l4` completion present.
+#[test]
+fn tester_scope_add_host_beginning_with_l4_is_still_http_scope() {
+    for confirmable in [true, false] {
+        let mut app = app();
+        let _ = connected(&mut app, l4_tools(confirmable));
+        for host in ["l4.example.com", "l4test", "l4-api.test:9100", "L4.example"] {
+            assert_eq!(
+                app.run_command(&format!("scope add {host}")),
+                vec![BusRequest::ScopeAdd(host.into())],
+                "confirmable={confirmable} host={host}"
+            );
+            assert!(app.l4.pending.is_none());
+        }
+        // Through the palette: typed line + ⏎.
+        let _ = app.update(Action::PaletteOpen);
+        app.prompt = "scope add l4.example.com".into();
+        assert_eq!(
+            app.update(Action::Submit),
+            vec![BusRequest::ScopeAdd("l4.example.com".into())],
+            "confirmable={confirmable}"
+        );
+        // The bare word `l4` is the L4 form, never a host called "l4".
+        app.toasts.clear();
+        let reqs = app.run_command("scope add l4");
+        assert_eq!(reqs, vec![], "confirmable={confirmable}");
+        assert!(
+            !reqs.contains(&BusRequest::ScopeAdd("l4".into())),
+            "`l4` is never added as an HTTP host"
+        );
+        if confirmable {
+            assert_eq!(toast_text(&app), SCOPE_ADD_L4_USAGE);
+        } else {
+            assert_eq!(
+                toast_text(&app),
+                "this core cannot confirm an operator L4 scope add"
+            );
+        }
+    }
+}
+
+/// Spec §2.3 / AC40 discipline for **strings**, not just packet bytes: every
+/// core-supplied L4 string that reaches the screen — the two status reasons,
+/// a parked id, a parked state, layer names, packet `proto`/`src`, capture
+/// ids, interface names (scope entries and flows, as list rows and as palette
+/// completions), scope-entry fields, the confirm prompt and the refusal
+/// toasts — is rendered with no control character anywhere on the screen,
+/// with ESC sequences and newlines included in the input. Where the renderer
+/// goes through `inert()` the control byte shows as `.` (the AC40 rule), which
+/// pins that the helper is actually on that path.
+#[test]
+fn tester_core_strings_with_control_characters_render_inert_on_every_surface() {
+    const CAP_REASON: &str = "no\u{1b}[31m bpf\naccess\r\u{7}";
+    const INT_REASON: &str = "Linux\u{1b}[0m only\n";
+    const PARKED: &str = "P1\u{1b}[2J";
+    let theme = Theme::new(true);
+
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(true));
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable(CAP_REASON),
+        intercept: L4Availability::from_reply(&json!({
+            "available": false, "code": "unsupported_platform", "reason": INT_REASON, "sessions": []
+        })),
+        captures: vec!["C\u{1b}[5m1".into()],
+    });
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "id": "S1", "interface": "lo\u{1b}[31m0", "capability": "cap\u{8}ture",
+        "cidr": "127.0.0.1/32\n", "ports": "9000-9999", "direction": "in\u{1b}bound",
+        "source": "con\u{7}fig"
+    })]));
+    let mut flow = section_2_flow("F", b"hello-l4");
+    flow["interface"] = json!("lo\u{1b}[31m0");
+    flow["packets"][0]["proto"] = json!("U\u{1b}[31mDP");
+    flow["packets"][0]["src"] = json!("127.0.0.1\u{7}");
+    flow["packets"][0]["layers"] = json!(["IPv4", "UDP\u{1b}[0m", "Raw\n"]);
+    let _ = app.on_bus(BusEvent::L4Flows(vec![flow]));
+    let _ = app.on_bus(BusEvent::Flows(vec![http_summary("H1")]));
+    app.selected = Some("F".into());
+
+    // (1) The L4 panel: reasons and capture ids through `inert` → `.`.
+    let area = Rect::new(0, 0, 120, 16);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::l4::panel(&app, &theme, area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert_inert(&text, "L4 panel");
+    assert!(
+        text.contains("capture unavailable — no.[31m bpf.access.."),
+        "the reason went through inert(): {text}"
+    );
+    assert!(
+        text.contains("intercept unavailable — Linux.[0m only."),
+        "{text}"
+    );
+    assert!(
+        text.contains("C.[5m1"),
+        "capture id through inert(): {text}"
+    );
+
+    // (2) The inspector's three panes while intercept is unavailable.
+    for pane in [L4Pane::Packets, L4Pane::Craft, L4Pane::Intercept] {
+        app.l4.pane = pane;
+        let text = render_inspector(&app);
+        assert_inert(&text, &format!("inspector {pane:?} (unavailable)"));
+        if pane == L4Pane::Intercept {
+            assert!(
+                text.contains("in-path intercept unavailable — Linux.[0m only."),
+                "{text}"
+            );
+        }
+        if pane == L4Pane::Packets {
+            assert!(
+                text.contains("proto U.[31mDP"),
+                "packet proto through inert(): {text}"
+            );
+            assert!(
+                text.contains("127.0.0.1.:40000"),
+                "packet src through inert(): {text}"
+            );
+        }
+    }
+
+    // (3) Intercept available with a control-laden parked entry: bar, header.
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable(CAP_REASON),
+        intercept: L4Availability::from_reply(
+            &json!({"available": true, "code": "available", "reason": null, "sessions": ["F"]}),
+        ),
+        captures: vec![],
+    });
+    let _ = app.on_bus(BusEvent::L4Parked(vec![json!({
+        "id": PARKED, "flow": "F", "state": "par\u{1b}[1mked", "length": 60,
+        "layers": ["IPv4", "TCP\u{8}"], "parked_at": 1_700_000_000_000i64
+    })]));
+    app.l4.pane = L4Pane::Intercept;
+    let text = render_inspector(&app);
+    assert_inert(&text, "intercept pane (available)");
+    assert!(
+        text.contains("id P1.[2J"),
+        "parked id through inert(): {text}"
+    );
+    assert!(
+        text.contains("state par.[1mked"),
+        "parked state through inert(): {text}"
+    );
+    app.l4.pane = L4Pane::Craft;
+    let text = render_inspector(&app);
+    assert_inert(&text, "craft pane");
+    assert!(
+        text.contains("m apply to parked P1.[2J"),
+        "craft header parked id through inert(): {text}"
+    );
+
+    // (4) The scope overlay: interface / cidr / capability / source fields.
+    let area = Rect::new(0, 0, 120, 24);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::overlays::scope(&app, &theme, area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert_inert(&text, "scope overlay");
+    assert!(text.contains("L4 scope"), "{text}");
+
+    // (5) The confirm overlay with a control-laden core prompt.
+    let text = render_confirm(
+        "l4.scope.add",
+        json!({"cidr": "127.0.0.1/32"}),
+        "Add L4 scope\u{1b}[31m 127.0.0.1/32\nall ports on lo0\u{7}",
+    );
+    assert_inert(&text, "confirm overlay");
+    assert!(text.contains("127.0.0.1/32"), "{text}");
+
+    // (6) The whole screen: the L4 list row (interface as the target), the
+    // refusal toasts carrying the reasons, and the palette completions that
+    // carry the interface name.
+    let area = Rect::new(0, 0, 160, 44);
+    let _ = app.update(Action::Resize(160, 44));
+    app.mode = Mode::Flows;
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    assert_inert(&buffer_text(&buf).join("\n"), "flow list with an L4 row");
+
+    assert_eq!(app.run_command("l4 capture lo0"), vec![]);
+    assert_eq!(
+        toast_text(&app),
+        format!("capture unavailable: {CAP_REASON}")
+    );
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    assert_inert(
+        &buffer_text(&buf).join("\n"),
+        "status bar with the capture toast",
+    );
+
+    app.mode = Mode::Inspector;
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable(CAP_REASON),
+        intercept: L4Availability::from_reply(&json!({
+            "available": false, "code": "unsupported_platform", "reason": INT_REASON, "sessions": []
+        })),
+        captures: vec![],
+    });
+    assert_eq!(app.update(Action::Resume), vec![]);
+    assert_eq!(
+        toast_text(&app),
+        format!("in-path intercept unavailable: {INT_REASON}")
+    );
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    assert_inert(
+        &buffer_text(&buf).join("\n"),
+        "inspector with the intercept toast",
+    );
+
+    app.mode = Mode::Flows;
+    let _ = app.update(Action::PaletteOpen);
+    app.prompt = "l4 capture ".into();
+    assert_eq!(app.l4_interfaces(), vec!["lo\u{1b}[31m0".to_string()]);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    assert_inert(
+        &buffer_text(&buf).join("\n"),
+        "palette with interface completions",
+    );
+}
+
+/// Tripwire for the dependency the screen-wide property above leans on: a
+/// ratatui `Buffer` drops every grapheme containing a control character
+/// (`set_stringn`), so even a string that bypasses `inert()` never puts a raw
+/// control byte in a cell. If a ratatui upgrade changes this, this test goes
+/// red before any operator terminal does.
+#[test]
+fn tester_render_buffer_drops_raw_control_graphemes_tripwire() {
+    let area = Rect::new(0, 0, 16, 1);
+    let mut buf = Buffer::empty(area);
+    buf.set_string(
+        0,
+        0,
+        "a\u{1b}[31mb\nc\r\u{7}d",
+        ratatui::style::Style::default(),
+    );
+    let text = buffer_text(&buf).join("");
+    assert_eq!(text, "a[31mbcd");
+    assert_inert(&text, "Buffer::set_string");
+    // And the `inert()` rule on top of it makes the drop visible as `.`.
+    assert_eq!(ascii_column("a\u{1b}[31mb\nc".as_bytes()), "a.[31mb.c");
+}
+
+/// Malformed wire shapes never panic and never fabricate state: parked
+/// entries without `id` or `flow` (or that are not objects) are dropped, a
+/// non-bool `available` is unrecognised (unavailable with a reason, never
+/// available), a non-bool `confirmable` is `false`, `bytes` that is not
+/// base64 is "no bytes" (shown honestly, never as an empty packet), and an
+/// error whose marker ends the text parses with an empty reason.
+#[test]
+fn tester_malformed_wire_shapes_never_panic_and_never_fabricate() {
+    // Parked list: only entries with string `id` and `flow` survive.
+    let parked = L4Parked::list_from_json(&json!([
+        {"id": "P1"},
+        {"flow": "F"},
+        {"id": 7, "flow": "F"},
+        {"id": "P2", "flow": "F", "length": -5, "layers": "IPv4", "parked_at": "soon"},
+        "P3",
+        null,
+        42,
+        {"id": "P4", "flow": "F", "state": null}
+    ]));
+    assert_eq!(
+        parked.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        vec!["P2", "P4"]
+    );
+    assert_eq!(parked[0].length, 0, "a negative length is 0, not a wrap");
+    assert!(parked[0].layers.is_empty(), "a non-array layers is empty");
+    assert_eq!(parked[0].parked_at, None);
+    assert_eq!(parked[1].state, "parked", "a null state keeps the default");
+    assert!(L4Parked::list_from_json(&json!(null)).is_empty());
+    assert!(L4Parked::list_from_json(&json!("P1")).is_empty());
+    assert!(L4Parked::list_from_json(&json!([])).is_empty());
+
+    // Status: `available` must be a bool to count.
+    for odd in [
+        json!({"available": "true", "code": "available"}),
+        json!({"available": 1}),
+        json!({"code": "available", "reason": null}),
+        json!(null),
+        json!(0),
+        json!({}),
+    ] {
+        let a = L4Availability::from_reply(&odd);
+        assert!(!a.available, "{odd} must not read as available");
+        assert_eq!(
+            a.reason.as_deref(),
+            Some("unrecognised l4 status reply"),
+            "{odd}"
+        );
+        assert_eq!(a.code, None, "{odd}");
+    }
+    // String entries and object entries' `id` are ids (intercept `sessions`
+    // are objects); numbers, nulls and id-less objects are dropped.
+    assert_eq!(
+        status_ids(
+            &json!({"captures": ["C1", 7, null, {"id": "C2"}, {"flow": "F"}, {"id": 3}]}),
+            "captures"
+        ),
+        vec!["C1".to_string(), "C2".to_string()],
+        "string ids and object ids are capture ids; nothing else is"
+    );
+    assert_eq!(
+        status_ids(&json!({"captures": "C1"}), "captures"),
+        Vec::<String>::new()
+    );
+    // An empty reason after the marker is still an honest unavailable.
+    assert_eq!(
+        L4Availability::from_error("l4.capture.status: L4 unavailable: "),
+        Some(L4Availability {
+            available: false,
+            code: None,
+            reason: Some(String::new()),
+        })
+    );
+    assert_eq!(L4Availability::from_error(""), None);
+    assert_eq!(L4Availability::from_error("L4 unavailable"), None);
+
+    // `confirmable` must be a bool to gate the scope-add form on.
+    for odd in [json!("yes"), json!(1), json!(null), json!({})] {
+        let t = ToolInfo::from_json(&json!({"name": "l4.scope.add", "confirmable": odd}))
+            .expect("decodes");
+        assert!(!t.confirmable, "confirmable={odd} must read as false");
+        assert!(!supports_operator_scope_add(&[t]));
+    }
+
+    // `bytes` that is not base64: no bytes, said honestly in the pane.
+    let mut app = intercept_ready(vec![parked_p1()]);
+    let mut v = section_2_flow("F", b"hello-l4");
+    v["packets"][0]["bytes"] = json!("!!not base64!!");
+    v["packets"][0]["src_port"] = json!(70000);
+    v["packets"][0]["dst_port"] = json!(-1);
+    let out = app.on_bus(BusEvent::CallOk {
+        name: "l4.flow.get".into(),
+        value: v,
+    });
+    assert_eq!(out, Vec::<BusRequest>::new());
+    let p = &app.selected_l4().expect("F").packets[0];
+    assert_eq!(p.bytes, None, "invalid base64 is no bytes, not garbage");
+    assert_eq!(p.src_port, None, "a port over u16 is absent, not wrapped");
+    assert_eq!(p.dst_port, None);
+    app.l4.pane = L4Pane::Packets;
+    let text = render_inspector(&app);
+    assert!(text.contains("no bytes from this core"), "{text}");
+    assert!(!text.contains("00000000  "), "{text}");
+
+    // A flow object that is not an object, or has no id, is dropped silently.
+    let before = app.l4.flows.len();
+    let out = app.on_bus(BusEvent::L4Flows(vec![
+        json!(null),
+        json!("F"),
+        json!({"kind": "capture"}),
+    ]));
+    assert_eq!(out, Vec::<BusRequest>::new());
+    assert!(app.current_toast().is_none(), "{:?}", toast_text(&app));
+    assert!(app.l4.flows.len() <= before);
+}
+
+/// Oversized inputs render without panic and stay inert: a 65 535-byte packet
+/// (the largest IP datagram) in a small pane and on the whole screen, ten
+/// thousand parked entries, a 10 000-character reason and five hundred
+/// running captures.
+#[test]
+fn tester_oversized_inputs_render_without_panic() {
+    let theme = Theme::new(true);
+    let huge: Vec<u8> = (0..65_535u32).map(|i| (i % 251) as u8).collect();
+    let mut app = intercept_ready(vec![parked_p1()]);
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "l4.flow.get".into(),
+        value: section_2_flow("F", &huge),
+    });
+    assert_eq!(
+        app.selected_l4()
+            .map(|f| f.packets[0].bytes.as_ref().map(Vec::len)),
+        Some(Some(65_535))
+    );
+    assert_eq!(hex_dump(&huge).len(), 4096);
+    app.l4.pane = L4Pane::Packets;
+    let text = render_inspector(&app);
+    assert_inert(&text, "packets pane, 65535-byte packet");
+    assert!(text.contains("hex: 65535 bytes"), "{text}");
+    assert!(text.contains("65535 B"), "{text}");
+    for (cols, rows) in [(80u16, 24u16), (160, 44), (10, 3), (1, 1)] {
+        let _ = app.update(Action::Resize(cols, rows));
+        app.mode = Mode::Inspector;
+        let area = Rect::new(0, 0, cols, rows);
+        let mut buf = Buffer::empty(area);
+        aitm_tui::ui::render(&app, &theme, area, &mut buf);
+        assert_inert(&buffer_text(&buf).join("\n"), "whole screen");
+    }
+
+    // Ten thousand parked entries: the first listed for the flow still wins,
+    // and the verdict carries exactly that id.
+    let mut many: Vec<Value> = (0..10_000)
+        .map(|i| json!({"id": format!("Q{i}"), "flow": "OTHER", "state": "parked", "length": 1}))
+        .collect();
+    many.push(json!({"id": "FIRST", "flow": "F", "state": "parked", "length": 1}));
+    many.push(json!({"id": "SECOND", "flow": "F", "state": "parked", "length": 1}));
+    let _ = app.on_bus(BusEvent::L4Parked(many));
+    assert_eq!(app.l4.parked.len(), 10_002);
+    assert_eq!(
+        app.update(Action::Resume),
+        vec![BusRequest::Call {
+            name: "l4.intercept.forward".into(),
+            args: json!({"id": "FIRST"}),
+        }]
+    );
+
+    // A 10 000-character reason and 500 captures in the L4 panel.
+    let long_reason: String = "x\u{1b}".repeat(5_000);
+    let ids: Vec<&str> = vec!["C"; 500];
+    set_capture(&mut app, unavailable(&long_reason), &ids);
+    assert_eq!(app.run_command("l4 capture lo0"), vec![]);
+    assert_eq!(
+        toast_text(&app),
+        format!("capture unavailable: {long_reason}")
+    );
+    let area = Rect::new(0, 0, 100, 14);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::l4::panel(&app, &theme, area, &mut buf);
+    assert_inert(&buffer_text(&buf).join("\n"), "L4 panel, 10k reason");
+    // `:l4 stop` with 500 running captures is 500 stops, one per id, in order.
+    let out = app.run_command("l4 stop");
+    assert_eq!(out.len(), 500);
+    assert!(out.iter().all(|r| matches!(
+        r,
+        BusRequest::Call { name, args } if name == "l4.capture.stop" && *args == json!({"id": "C"})
+    )));
+}
+
+/// Nothing on the wire when unavailable, under **every** `code` the status
+/// contract can carry and under the older core's error fallback: the inject
+/// key, `:l4 capture` and the four verdicts each emit no L4 call, toast the
+/// plan's literal with the core's reason, and leave nothing pending.
+#[test]
+fn tester_nothing_on_the_wire_under_every_unavailable_code() {
+    let statuses: Vec<(String, L4Availability)> = [
+        "needs_privilege",
+        "unsupported_platform",
+        "not_configured",
+    ]
+    .iter()
+    .map(|code| {
+        let reason = format!("reason for {code}");
+        (
+            reason.clone(),
+            L4Availability::from_reply(
+                &json!({"available": false, "code": code, "reason": reason, "captures": []}),
+            ),
+        )
+    })
+    .chain(std::iter::once((
+        "older core".to_string(),
+        L4Availability::from_error("l4.capture.status: L4 unavailable: older core")
+            .expect("marker"),
+    )))
+    .chain(std::iter::once((
+        "Reading L4 availability…".to_string(),
+        L4Availability::pending(),
+    )))
+    .collect();
+
+    for (reason, status) in &statuses {
+        // Capture / inject side.
+        let mut app = inject_ready(status.clone());
+        assert_eq!(app.update(Action::L4Inject), vec![], "{reason}");
+        assert_eq!(toast_text(&app), format!("inject unavailable: {reason}"));
+        assert!(app.l4.pending.is_none(), "{reason}");
+        app.toasts.clear();
+        assert_eq!(app.run_command("l4 capture lo"), vec![], "{reason}");
+        assert_eq!(toast_text(&app), format!("capture unavailable: {reason}"));
+
+        // Intercept side: the same status object as the intercept verb's.
+        let mut app = craft_ready(vec![parked_p1()]);
+        let _ = app.on_bus(BusEvent::L4Availability {
+            capture: unavailable("X"),
+            intercept: status.clone(),
+            captures: vec![],
+        });
+        for action in [
+            Action::Resume,
+            Action::Kill,
+            Action::L4MutateParked,
+            Action::L4RevertParked,
+        ] {
+            app.toasts.clear();
+            let out = app.update(action.clone());
+            assert!(l4_calls(&out).is_empty(), "{reason}: {action:?} → {out:?}");
+            assert_eq!(
+                toast_text(&app),
+                format!("in-path intercept unavailable: {reason}"),
+                "{action:?}"
+            );
+            assert!(app.l4.pending.is_none(), "{reason}: {action:?}");
+            assert_ne!(app.mode, Mode::L4Confirm);
+        }
+        // And the reducer itself never asks for the parked list: that read is
+        // the bus task's, gated on the status (the bus-level test is in
+        // `src/bus.rs`).
+        let out = app.update(Action::Edit);
+        assert!(
+            !l4_calls(&out).iter().any(|(n, _)| n == "l4.intercept.list"),
+            "{out:?}"
+        );
+    }
 }

@@ -624,6 +624,471 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------- tester: Session
+    //
+    // Stage-5 additions (L4 parity unit (b), tester). The bus *task* is driven
+    // through a recording in-memory transport, so what reaches the wire is
+    // asserted at the level that matters: `l4_slow_pass` never asks for
+    // `l4.intercept.list` while intercept is unavailable and re-reads both
+    // status verbs every pass; `l4_poll` sends `limit: 0` only when the core
+    // declares the window; `handle` keeps `_confirm` for every confirmable
+    // L4 verb. No socket, no fixture: every reply is built here.
+
+    use aitm_bus_client::{BusClient, BusTransport};
+    use futures::future::BoxFuture;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+    type Calls = StdArc<StdMutex<Vec<(String, Value)>>>;
+    type Answer = StdArc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
+
+    /// A recording bus: every `tools/call` lands in `calls`; `answer` decides
+    /// the reply (`Ok` → `structuredContent`, `Err(text)` → an `isError` tool
+    /// error, the shape `aitm-mcp` sends). Other methods answer `{}`.
+    struct RecordingBus {
+        calls: Calls,
+        answer: Answer,
+    }
+
+    impl BusTransport for RecordingBus {
+        fn send(&self, line: String) -> BoxFuture<'_, anyhow::Result<Option<String>>> {
+            let req: Value = serde_json::from_str(&line).expect("the client sends JSON");
+            let Some(id) = req.get("id").filter(|i| !i.is_null()).cloned() else {
+                return Box::pin(async { Ok(None) });
+            };
+            let result = match req["method"].as_str() {
+                Some("tools/call") => {
+                    let name = req["params"]["name"].as_str().unwrap_or("").to_string();
+                    let args = req["params"]["arguments"].clone();
+                    self.calls
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((name.clone(), args.clone()));
+                    match (self.answer)(&name, &args) {
+                        Ok(v) => json!({
+                            "content": [{"type": "text", "text": v.to_string()}],
+                            "structuredContent": v
+                        }),
+                        Err(text) => json!({
+                            "isError": true,
+                            "content": [{"type": "text", "text": text}]
+                        }),
+                    }
+                }
+                _ => json!({}),
+            };
+            let reply = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+            Box::pin(async move { Ok(Some(reply)) })
+        }
+    }
+
+    fn session(answer: Answer) -> (Session, Calls, mpsc::Receiver<BusEvent>) {
+        let calls: Calls = StdArc::new(StdMutex::new(Vec::new()));
+        let client = StdArc::new(BusClient::new(Box::new(RecordingBus {
+            calls: calls.clone(),
+            answer,
+        })));
+        let (tx, rx) = mpsc::channel(1024);
+        (Session::new(client, tx), calls, rx)
+    }
+
+    fn tool(name: &str, props: &[&str]) -> ToolInfo {
+        let mut properties = serde_json::Map::new();
+        for p in props {
+            properties.insert((*p).to_string(), json!({"type": "string"}));
+        }
+        ToolInfo {
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: json!({"type": "object", "properties": properties}),
+            confirmable: false,
+        }
+    }
+
+    fn names(calls: &Calls) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    fn args_of(calls: &Calls, name: &str) -> Vec<Value> {
+        calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+
+    fn clear(calls: &Calls) {
+        calls.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<BusEvent>) -> Vec<BusEvent> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            out.push(e);
+        }
+        out
+    }
+
+    const AC3: &str =
+        r#"{"available": false, "code": "needs_privilege", "reason": "R_CAP", "captures": []}"#;
+    const AC4: &str = r#"{"available": false, "code": "unsupported_platform", "reason": "R_INT", "sessions": []}"#;
+
+    fn v(s: &str) -> Value {
+        serde_json::from_str(s).expect("literal JSON")
+    }
+
+    /// Spec §1 + §4 at the bus task: both status verbs are read on **every**
+    /// slow pass (never cached), `l4.intercept.list` is never requested while
+    /// the last `l4.intercept.status` said unavailable, it is requested once
+    /// the core says available (and the parked list reaches the app), and it
+    /// stops again the pass after the core withdraws availability — even
+    /// though that pass's read list was planned while it was still available.
+    #[tokio::test]
+    async fn l4_slow_pass_reads_statuses_every_pass_and_gates_the_parked_list_on_availability() {
+        let intercept_on = StdArc::new(StdMutex::new(false));
+        let flag = intercept_on.clone();
+        let answer: Answer = StdArc::new(move |name: &str, _args: &Value| match name {
+            "l4.scope.list" => Ok(json!([])),
+            "l4.agent.status" => {
+                Ok(json!({"capture": false, "inject": false, "intercept": false, "widen": false}))
+            }
+            "l4.capture.status" => Ok(v(AC3)),
+            "l4.intercept.status" => Ok(if *flag.lock().unwrap_or_else(|e| e.into_inner()) {
+                json!({"available": true, "code": "available", "reason": null, "sessions": ["F"]})
+            } else {
+                v(AC4)
+            }),
+            "l4.intercept.list" => Ok(json!([{
+                "id": "P1", "flow": "F", "state": "parked", "dir": "inbound",
+                "length": 60, "layers": ["IPv4", "TCP"], "parked_at": 1_700_000_000_000i64
+            }])),
+            other => Err(format!("{other}: unexpected call")),
+        });
+        let (mut s, calls, mut rx) = session(answer);
+        s.tools = [
+            "l4.scope.list",
+            "l4.agent.status",
+            "l4.capture.status",
+            "l4.intercept.status",
+            "l4.intercept.list",
+        ]
+        .iter()
+        .map(|n| tool(n, &[]))
+        .collect();
+
+        // Pass 1 and 2: exactly the four reads each time, in order.
+        for pass in 1..=2 {
+            clear(&calls);
+            assert!(s.l4_slow_pass().await.is_ok());
+            assert_eq!(
+                names(&calls),
+                vec![
+                    "l4.scope.list",
+                    "l4.agent.status",
+                    "l4.capture.status",
+                    "l4.intercept.status"
+                ],
+                "pass {pass}"
+            );
+            let events = drain(&mut rx);
+            let availability = events
+                .iter()
+                .find_map(|e| match e {
+                    BusEvent::L4Availability {
+                        capture,
+                        intercept,
+                        captures,
+                    } => Some((capture.clone(), intercept.clone(), captures.clone())),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("pass {pass}: no L4Availability event in {events:?}"));
+            assert_eq!(availability.0.code.as_deref(), Some("needs_privilege"));
+            assert_eq!(availability.0.reason.as_deref(), Some("R_CAP"));
+            assert!(!availability.0.available);
+            assert_eq!(availability.1.code.as_deref(), Some("unsupported_platform"));
+            assert_eq!(availability.1.reason.as_deref(), Some("R_INT"));
+            assert!(availability.2.is_empty());
+            assert!(
+                !events.iter().any(|e| matches!(e, BusEvent::L4Parked(_))),
+                "pass {pass}: no parked list while unavailable: {events:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, BusEvent::Toast(..) | BusEvent::CallFailed { .. })),
+                "pass {pass}: an availability read never toasts: {events:?}"
+            );
+        }
+
+        // The core becomes able to intercept (D0 at runtime). Within two
+        // passes the parked list is read and reaches the app.
+        *intercept_on.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        clear(&calls);
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            assert!(s.l4_slow_pass().await.is_ok());
+            events.extend(drain(&mut rx));
+        }
+        assert!(
+            names(&calls).iter().any(|n| n == "l4.intercept.list"),
+            "the parked list is read once intercept is available: {:?}",
+            names(&calls)
+        );
+        assert_eq!(
+            names(&calls)
+                .iter()
+                .filter(|n| *n == "l4.intercept.status")
+                .count(),
+            2,
+            "the status is still re-read every pass"
+        );
+        let parked = events
+            .iter()
+            .find_map(|e| match e {
+                BusEvent::L4Parked(p) => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no L4Parked event in {events:?}"));
+        assert_eq!(parked[0]["id"], json!("P1"));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            BusEvent::L4Availability { intercept, .. } if intercept.available
+        )));
+
+        // The core withdraws it: the very next pass skips the list, although
+        // the previous status had planned it, and so does every later pass.
+        *intercept_on.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        for pass in 1..=2 {
+            clear(&calls);
+            assert!(s.l4_slow_pass().await.is_ok());
+            assert!(
+                !names(&calls).iter().any(|n| n == "l4.intercept.list"),
+                "after withdrawal, pass {pass}: {:?}",
+                names(&calls)
+            );
+            let events = drain(&mut rx);
+            assert!(!events.iter().any(|e| matches!(e, BusEvent::L4Parked(_))));
+        }
+    }
+
+    /// Spec §1 compatibility at the bus task: an older core's `L4 unavailable:`
+    /// tool error on a status verb folds into availability (reason = the text
+    /// after the marker) with no toast and no `CallFailed`; any other tool
+    /// error is an honest unavailable with its text; a core without the verbs
+    /// is never asked and gets no availability event at all.
+    #[tokio::test]
+    async fn l4_slow_pass_folds_tool_errors_into_availability_without_a_toast() {
+        let answer: Answer = StdArc::new(|name: &str, _: &Value| match name {
+            "l4.capture.status" => Err("l4.capture.status: L4 unavailable: X".to_string()),
+            "l4.intercept.status" => Err("internal error (-32603)".to_string()),
+            other => Err(format!("{other}: unexpected call")),
+        });
+        let (mut s, calls, mut rx) = session(answer);
+        s.tools = vec![
+            tool("l4.capture.status", &[]),
+            tool("l4.intercept.status", &[]),
+        ];
+        assert!(s.l4_slow_pass().await.is_ok());
+        assert_eq!(
+            names(&calls),
+            vec!["l4.capture.status", "l4.intercept.status"]
+        );
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let BusEvent::L4Availability {
+            capture,
+            intercept,
+            captures,
+        } = &events[0]
+        else {
+            panic!("{events:?}");
+        };
+        assert_eq!(
+            *capture,
+            L4Availability {
+                available: false,
+                code: None,
+                reason: Some("X".into()),
+            }
+        );
+        assert_eq!(
+            *intercept,
+            L4Availability {
+                available: false,
+                code: None,
+                reason: Some("internal error (-32603)".into()),
+            }
+        );
+        assert!(captures.is_empty());
+
+        // No `l4.*` on the bus: nothing read, nothing emitted.
+        let (mut bare, calls, mut rx) = session(StdArc::new(|n: &str, _: &Value| {
+            Err(format!("{n}: must not be called"))
+        }));
+        bare.tools = vec![tool("flow.list", &[])];
+        assert!(bare.l4_slow_pass().await.is_ok());
+        assert!(names(&calls).is_empty());
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// Spec §2 at the bus task: the list poll's `l4.flow.get` carries
+    /// `limit: 0` exactly when the core's `inputSchema` declares `limit`, and
+    /// just `{id}` against an older core — the same reply either way.
+    #[tokio::test]
+    async fn l4_poll_sends_limit_zero_only_when_the_core_declares_the_window() {
+        let answer: Answer = StdArc::new(|name: &str, args: &Value| match name {
+            "l4.flow.list" => Ok(json!(["F", "G"])),
+            "l4.flow.get" => Ok(json!({
+                "id": args["id"], "kind": "capture", "interface": "lo0",
+                "packet_count": 3, "injected_count": 0, "packets": []
+            })),
+            other => Err(format!("{other}: unexpected call")),
+        });
+        let expected = |window: bool, id: &str| {
+            if window {
+                json!({"id": id, "limit": 0})
+            } else {
+                json!({"id": id})
+            }
+        };
+        for declares_window in [true, false] {
+            let (mut s, calls, mut rx) = session(answer.clone());
+            let get_props: &[&str] = if declares_window {
+                &["id", "offset", "limit"]
+            } else {
+                &["id"]
+            };
+            s.tools = vec![tool("l4.flow.list", &[]), tool("l4.flow.get", get_props)];
+            assert!(s.l4_poll().await.is_ok());
+            assert_eq!(
+                names(&calls),
+                vec!["l4.flow.list", "l4.flow.get", "l4.flow.get"],
+                "window={declares_window}"
+            );
+            assert_eq!(
+                args_of(&calls, "l4.flow.get"),
+                vec![
+                    expected(declares_window, "F"),
+                    expected(declares_window, "G")
+                ],
+                "window={declares_window}"
+            );
+            let events = drain(&mut rx);
+            let flows = events
+                .iter()
+                .find_map(|e| match e {
+                    BusEvent::L4Flows(f) => Some(f.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no L4Flows in {events:?}"));
+            assert_eq!(flows.len(), 2);
+            assert_eq!(flows[0]["id"], json!("F"));
+        }
+    }
+
+    /// The `_confirm` re-issue reaches the wire intact for **every**
+    /// confirmable L4 verb — `l4.inject`, `l4.scope.add`,
+    /// `l4.intercept.forward`, `l4.intercept.drop` — through the real
+    /// `handle` → `prune` → `call` path, against each verb's declared schema
+    /// (the rig's key sets): the declared keys and `_confirm` survive, an
+    /// undeclared key is dropped, and the reply comes back as `CallOk`. The
+    /// B9 live run found the token pruned here; this pins the fix per verb.
+    #[tokio::test]
+    async fn handle_keeps_the_confirm_token_for_every_confirmable_l4_verb() {
+        let answer: Answer = StdArc::new(|name: &str, args: &Value| {
+            if args.get("_confirm").and_then(Value::as_str) == Some("cfm_1") {
+                Ok(json!(format!("{name}: confirmed")))
+            } else {
+                Ok(json!({"status": "needs_confirmation", "prompt": "P", "confirm_token": "cfm_1"}))
+            }
+        });
+        let (mut s, calls, mut rx) = session(answer);
+        s.tools = vec![
+            tool("l4.inject", &["spec", "dst", "interface", "count"]),
+            tool(
+                "l4.scope.add",
+                &["cidr", "ports", "interface", "direction", "capability"],
+            ),
+            tool("l4.intercept.forward", &["id"]),
+            tool("l4.intercept.drop", &["id"]),
+        ];
+        let spec = json!({"layers": [{"ipv4": {"src": "127.0.0.1", "dst": "127.0.0.1"}}, {"udp": {"src_port": 40000, "dst_port": 9053}}]});
+        let cases: Vec<(&str, Value)> = vec![
+            (
+                "l4.inject",
+                json!({"spec": spec, "interface": "lo0", "dst": "127.0.0.1"}),
+            ),
+            (
+                "l4.scope.add",
+                json!({"cidr": "127.0.0.1/32", "ports": "9100-9199", "interface": "lo0",
+                       "direction": "inbound", "capability": "capture"}),
+            ),
+            ("l4.intercept.forward", json!({"id": "P1"})),
+            ("l4.intercept.drop", json!({"id": "P1"})),
+        ];
+        for (call, original) in cases {
+            // What the app sends on `y`: the originals plus the token (and a
+            // stray undeclared key, to prove pruning still happens).
+            let confirm = crate::l4::L4Confirm {
+                call: call.to_string(),
+                args: original.clone(),
+                prompt: "P".into(),
+                token: "cfm_1".into(),
+            };
+            let mut sent = confirm.confirmed_args();
+            sent["bogus"] = json!(1);
+            clear(&calls);
+            assert!(s
+                .handle(BusRequest::Call {
+                    name: call.to_string(),
+                    args: sent,
+                })
+                .await
+                .is_ok());
+            let on_wire = args_of(&calls, call);
+            assert_eq!(on_wire.len(), 1, "{call}: {on_wire:?}");
+            let mut expected = original.clone();
+            expected["_confirm"] = json!("cfm_1");
+            assert_eq!(
+                on_wire[0], expected,
+                "{call}: the token survives pruning, `bogus` does not"
+            );
+            let events = drain(&mut rx);
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    BusEvent::CallOk { name, value } if name == call && *value == json!(format!("{call}: confirmed"))
+                )),
+                "{call}: the confirmed reply reaches the app: {events:?}"
+            );
+            // And a first issue without the token is sent bare (no token
+            // invented client-side) and earns the handshake.
+            clear(&calls);
+            assert!(s
+                .handle(BusRequest::Call {
+                    name: call.to_string(),
+                    args: original.clone(),
+                })
+                .await
+                .is_ok());
+            assert_eq!(args_of(&calls, call), vec![original.clone()], "{call}");
+            let events = drain(&mut rx);
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    BusEvent::CallOk { name, value } if name == call && value["status"] == json!("needs_confirmation")
+                )),
+                "{call}: {events:?}"
+            );
+        }
+    }
+
     /// The refusal reads for either intended role and never names a file as
     /// the only token source (AC1/AC2 surface, Decision B wording). Pinned so
     /// the reword is not silently reverted.
