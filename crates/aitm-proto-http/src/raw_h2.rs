@@ -516,6 +516,7 @@ pub struct RawH2Client {
     tls: TlsVerify,
     dialer: Arc<dyn Dialer>,
     resolver: Arc<dyn HostResolver>,
+    ssrf: Option<crate::sender::SsrfGate>,
 }
 
 impl RawH2Client {
@@ -526,7 +527,29 @@ impl RawH2Client {
             tls: verify,
             dialer: Arc::new(RawTcpDialer),
             resolver: Arc::new(RawSystemResolver),
+            ssrf: None,
         }
+    }
+
+    /// Enforce the SSRF policy against `scope` on every probe: refuse a
+    /// private, loopback or metadata address unless an in-scope IP literal
+    /// lifts it, exactly as [`crate::sender::HttpSender::with_ssrf`] does for
+    /// the reissue path. The check runs on every address the target resolved
+    /// to, immediately before the dial, so a short-TTL record flipped after
+    /// the check already passed `host.baseline()` cannot steer an
+    /// accept-any probe at an internal address.
+    ///
+    /// Opt-in: a client built without this behaves exactly as before. Every
+    /// live caller (the checks crate's raw h2 runner) is expected to configure
+    /// it.
+    #[must_use]
+    pub fn with_ssrf(
+        mut self,
+        policy: aitm_core::SsrfPolicy,
+        scope: Arc<dyn aitm_core::ScopeRateGuard>,
+    ) -> Self {
+        self.ssrf = Some(crate::sender::SsrfGate { policy, scope });
+        self
     }
 
     /// Replace the dial seam (tests, or a caller with its own transport).
@@ -563,15 +586,7 @@ impl RawH2Client {
             other => anyhow::bail!("raw h2 probe cannot speak scheme {other:?}"),
         };
         let (host, port) = split_target(&plan.target.authority, tls)?;
-
-        let addr = self
-            .resolver
-            .resolve(host.clone(), port)
-            .await?
-            .into_iter()
-            .next()
-            .map(|ip| SocketAddr::new(ip, port))
-            .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
+        let authority = aitm_core::Authority::new(&host, port).to_string();
 
         let mut obs = RawH2Observation {
             settings: Vec::new(),
@@ -582,10 +597,24 @@ impl RawH2Client {
         };
 
         let started = Instant::now();
-        let outcome = tokio::time::timeout(
-            RAW_TOTAL_TIMEOUT,
-            self.connect_and_converse(plan, addr, &host, tls, streams, &mut obs),
-        )
+        let outcome = tokio::time::timeout(RAW_TOTAL_TIMEOUT, async {
+            // The resolve is *inside* the cap: a name server that never answers
+            // must not hold the probe open past the whole-probe deadline.
+            let ips = self.resolver.resolve(host.clone(), port).await?;
+            // Then the gate, on every address this name answered, immediately
+            // before the dial — so the address the driver connects to is one
+            // the operator's policy and scope actually allow.
+            if let Some(gate) = &self.ssrf {
+                gate.check("raw h2 probe", &authority, &host, &ips)?;
+            }
+            let addr = ips
+                .into_iter()
+                .next()
+                .map(|ip| SocketAddr::new(ip, port))
+                .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
+            self.connect_and_converse(plan, addr, &host, tls, streams, &mut obs)
+                .await
+        })
         .await;
         obs.elapsed_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
 
@@ -1873,5 +1902,140 @@ mod driver_tests {
 
         settled(&log, |l| l.headers_streams.len() == 1).await;
         assert_eq!(log.lock().expect("server log").headers_blocks, expected);
+    }
+
+    /// Every name answers one fixed address, so a test can choose exactly what
+    /// the SSRF gate sees.
+    struct FixedResolver(IpAddr);
+
+    impl HostResolver for FixedResolver {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            let ip = self.0;
+            Box::pin(async move { Ok(vec![ip]) })
+        }
+    }
+
+    /// A resolver that never answers.
+    struct HangingResolver;
+
+    impl HostResolver for HangingResolver {
+        fn resolve(&self, _host: String, _port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    const METADATA: IpAddr = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+    const PRIVATE: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+
+    /// SEC-1: a name that resolves to the cloud metadata address is refused
+    /// before the driver dials, once the gate is configured.
+    #[tokio::test]
+    async fn the_ssrf_gate_refuses_a_metadata_address_before_the_dial() {
+        use aitm_core::{SsrfPolicy, StdGuard};
+
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let client = client
+            .with_resolver(Arc::new(FixedResolver(METADATA)))
+            .with_ssrf(SsrfPolicy::default(), Arc::new(StdGuard::default()));
+
+        let err = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("the metadata address is refused");
+
+        assert!(err.to_string().contains("SSRF"), "unexpected error: {err}");
+        assert!(
+            !err.to_string().contains("169.254.169.254"),
+            "the refusal must not name the resolved address: {err}"
+        );
+        assert_eq!(dialer.calls(), 0, "a refused probe never dials");
+    }
+
+    /// SEC-1: the same for an RFC 1918 address behind a public name.
+    #[tokio::test]
+    async fn the_ssrf_gate_refuses_a_private_address_before_the_dial() {
+        use aitm_core::{SsrfPolicy, StdGuard};
+
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let client = client
+            .with_resolver(Arc::new(FixedResolver(PRIVATE)))
+            .with_ssrf(SsrfPolicy::default(), Arc::new(StdGuard::default()));
+
+        let err = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("a private address is refused");
+
+        assert!(err.to_string().contains("SSRF"), "unexpected error: {err}");
+        assert_eq!(dialer.calls(), 0, "a refused probe never dials");
+    }
+
+    /// SEC-1: an operator who scoped the IP literal lifts the block, exactly as
+    /// on the sender's reissue path — the probe then runs to completion.
+    #[tokio::test]
+    async fn an_in_scope_ip_literal_lifts_the_raw_probe_ssrf_block() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        let (client, dialer, log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        let client = client.with_ssrf(SsrfPolicy::default(), guard);
+
+        let obs = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("a scoped loopback literal passes the gate");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Headers { status: Some(200) }]
+        );
+        assert_eq!(dialer.calls(), 1, "the gate let the dial through");
+        settled(&log, |l| l.headers_streams == vec![1]).await;
+    }
+
+    /// SEC-1: without `with_ssrf` the driver behaves exactly as before — the
+    /// gate is opt-in, and the live wiring is the checks crate's job.
+    #[tokio::test]
+    async fn without_the_gate_a_private_address_is_still_dialled() {
+        let (client, dialer, log) = peer(Script::new(vec![(3, 128)], Answer::Status(0x88)));
+        let client = client.with_resolver(Arc::new(FixedResolver(PRIVATE)));
+
+        let obs = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the probe completes");
+
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Headers { status: Some(200) }]
+        );
+        assert_eq!(dialer.calls(), 1);
+        settled(&log, |l| l.headers_streams == vec![1]).await;
+    }
+
+    /// SEC-1/SEC-9: the resolve is inside the whole-probe cap, so a resolver
+    /// that never answers cannot hold the probe open past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_resolver_that_never_answers_is_bounded_by_the_total_timeout() {
+        let (client, dialer, _log) = peer(Script::new(vec![], Answer::Nothing));
+        let client = client.with_resolver(Arc::new(HangingResolver));
+
+        let started = tokio::time::Instant::now();
+        let obs = client
+            .probe(&plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect("the probe completes");
+        let waited = started.elapsed();
+
+        assert!(obs.connection_closed);
+        assert_eq!(obs.streams, vec![StreamOutcome::Timeout]);
+        assert!(
+            waited <= RAW_TOTAL_TIMEOUT,
+            "the probe took {waited:?}, cap is {RAW_TOTAL_TIMEOUT:?}"
+        );
+        assert_eq!(dialer.calls(), 0, "a probe that never resolved never dials");
     }
 }

@@ -148,11 +148,39 @@ pub fn is_h2_not_negotiated(err: &anyhow::Error) -> bool {
     })
 }
 
-/// The SSRF gate for the reissue path: the same policy + live scope the browser
-/// connector uses.
-struct SsrfGate {
-    policy: SsrfPolicy,
-    scope: Arc<dyn ScopeRateGuard>,
+/// The SSRF gate for every outbound path in this crate: the same policy + live
+/// scope the browser connector uses. Shared with [`crate::raw_h2`], so the
+/// reissue path and the raw h2 probe driver run one implementation of the
+/// check rather than two.
+pub(crate) struct SsrfGate {
+    pub(crate) policy: SsrfPolicy,
+    pub(crate) scope: Arc<dyn ScopeRateGuard>,
+}
+
+impl SsrfGate {
+    /// Refuse the target when **any** address it resolved to is private,
+    /// loopback or metadata and no in-scope IP literal lifts the block, so the
+    /// resolve-then-connect (DNS-rebinding) window is closed. `what` names the
+    /// caller's operation; the message carries the requested host and the
+    /// guard's own refusal, never the resolved address.
+    pub(crate) fn check(
+        &self,
+        what: &str,
+        authority: &str,
+        host: &str,
+        ips: &[IpAddr],
+    ) -> Result<()> {
+        let scope = self.scope.list_scope();
+        for ip in ips {
+            // `confine_to_scope = false`: scope-confined egress is a
+            // browser-only posture (scanner S2). Active reissue is already
+            // scope-gated upstream by `check_active`; it must not be gated
+            // again here (per the egress-confinement spec's anti-goal).
+            ssrf_check(&self.policy, &scope, false, authority, *ip)
+                .map_err(|e| anyhow!("SSRF: refusing {what} to {host}: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// Reissues requests over real HTTP/1.1 or HTTP/2 (+ TLS for `https`).
@@ -328,15 +356,7 @@ impl HttpSender {
         // this sender is covered.
         let ips = self.resolver.resolve(host.clone(), port).await?;
         if let Some(gate) = &self.ssrf {
-            let scope = gate.scope.list_scope();
-            for ip in &ips {
-                // `confine_to_scope = false`: scope-confined egress is a
-                // browser-only posture (scanner S2). Active reissue is already
-                // scope-gated upstream by `check_active`; it must not be gated
-                // again here (per the egress-confinement spec's anti-goal).
-                ssrf_check(&gate.policy, &scope, false, &authority, *ip)
-                    .map_err(|e| anyhow!("SSRF: refusing reissue to {host}: {e}"))?;
-            }
+            gate.check("reissue", &authority, &host, &ips)?;
         }
         let addr = ips
             .into_iter()
