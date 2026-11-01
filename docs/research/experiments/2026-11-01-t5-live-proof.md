@@ -137,13 +137,13 @@ Not run at this head. The three cells (`tests/e2e/scan/test_t5_*.py`) drive the 
 
 ### (vi) macOS
 
-Blocked on the product's privilege units. `aitm-l4-helper` phase 1 (unit p2: `bpf-permissions --dry-run`, `bpf-revert --dry-run`, `probe`, `version`) exists in its own PR; the notarized bundle that lets the app register it and trigger a real apply (units p3/p4) does not yet. On this Mac the three T5 cells SKIP 77 with exactly:
+Blocked on the product's privilege units. `aitm-l4-helper` phase 1 (unit p2: `bpf-permissions --dry-run`, `bpf-revert --dry-run`, `probe`, `version`) exists in its own PR; the notarized bundle that lets the app register it and trigger a real apply (units p3/p4) does not yet. Once the engine is on `main`, the three T5 cells SKIP 77 on this Mac with exactly:
 
 ```
 packet-capture permission not granted (aitm-l4-helper phase 1 pending)
 ```
 
-The cells gate on `l4.privilege` (`capabilities.inject.state == "available" && via == "process"`) and fall back to `l4.capture.status` on a core without the verb. Nothing was installed and no `/dev/bpf*` mode changed on Matt's Mac. State recorded read-only by `scripts/t5-live-proof-macos.sh record` at `19372ae4` (`/tmp/claude/t5-proof-mac/record-20261101T195150Z.txt`):
+The cells gate on `l4.privilege` (both `capabilities.capture` and `capabilities.inject` must be `state == "available"` with `via == "process"`) and fall back to `l4.capture.status` on a core without the verb. **What this branch's cells print today:** a core built from this branch registers no `scan.start` (the engine is PR #232), so all three cells SKIP 77 earlier, at `require_verbs` (`missing verb scan.start, ...`), before the privilege gate is reached; the privilege literal above is what `packet_lane_gate` prints once the engine is on `main`, pinned by the tester's direct probe of all eleven gate branches (`/tmp/claude/t5-tester/pygate.log`, stage 5 report), not by a cell run on this Mac. Nothing was installed and no `/dev/bpf*` mode changed on Matt's Mac. State recorded read-only by `scripts/t5-live-proof-macos.sh record` at `19372ae4` (`/tmp/claude/t5-proof-mac/record-20261101T195150Z.txt`):
 
 ```
 $ ls -l /dev/bpf0 /dev/bpf1
@@ -166,5 +166,5 @@ exit 77: aitm-l4-helper not present: Mac leg pending the notarized bundle (units
 - `send_recv` invariant (D8.4/D12): the capture ignores the stimulus's own direction (same src addr/port, dst addr/port, protocol) before any match; a mock backend echoes the stimulus first so unit tests keep the regression covered.
 - Linux loopback injects at layer 3 (`SOCK_RAW` + `IP_HDRINCL`, `IPV6_HDRINCL` for v6), decided by libpcap's `IFF_LOOPBACK` flag; layer-2 `sendpacket` only for real NICs and macOS `lo0`. Spec D8.4 should state the Linux-loopback limitation: `ipv4.total_length` and `ipv4.checksum` mutations are repaired by the kernel on that path and cannot be fuzzed there; the injector requires Ethernet framing (ethertype ↔ version) and compares its destination with the guard's parse.
 - ICMP-paced points (amendment 46): `L4Options.icmp_pace_ms` default 1100, ceiling `l4_icmp_pace_ms_min: 1000`, `no_reply (icmp_ratelimit)` note, a closed port never yields `l4-crash`.
-- Linux ICMP facts for D8.4: `icmp_ratelimit` 1000 ms per destination, `icmp_ratemask` 6168, burst about 6; verified on the rig, not assumed.
+- Linux ICMP facts for D8.4: `icmp_ratelimit` 1000 ms per destination, `icmp_ratemask` 6168, `icmp_msgs_per_sec` 1000, `icmp_msgs_burst` 50 as read on the rig; loopback is exempt from the per-peer limit (kernel source and run 3), so the pace is for remote targets.
 - Privilege spec: on macOS the lane needs read+write on `/dev/bpf*` in the core process (`via: process`); the Linux rig uses file capabilities (`cap_net_raw,cap_net_admin+ep`) on the binary, never a root cargo. Nothing in the lane needs the NE system extension.
