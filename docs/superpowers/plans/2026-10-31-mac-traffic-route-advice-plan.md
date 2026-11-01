@@ -2,12 +2,12 @@
 
 **Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode)
 **Spec:** `docs/superpowers/specs/2026-10-31-mac-traffic-route-advice-design.md`
-(approved 2026-10-31; acceptance criteria TR-AC1 … TR-AC19; TR-AC15–17 are the CA-trust fact, TR-AC18–19 the one-banner-line rule, both 2026-10-31 amendments)
+(approved 2026-10-31; acceptance criteria TR-AC1 … TR-AC20; TR-AC15–17 are the CA-trust fact, TR-AC18–19 the one-banner-line rule, TR-AC20 the per-host-decryption tunnel clause (conditional on the core story) — all 2026-10-31 amendments)
 **Branch / worktree:** this worktree, `claude/apps-attribution-8ab619`
 (`/Users/matt/Security/aitmproxy/.claude/worktrees/apps-attribution-8ab619`), rebased on
 `main 3fe92f6`. It ships as one PR to `main`.
 
-## Gate: nothing below starts until both hold
+## Gate: nothing below starts until the first two hold; the CA parts also wait for the third
 
 1. **The fixture-removal mac PR is on `main` and this branch has rebased once onto its merge
    SHA** (the orchestrator sends it; record here: `__________`). That PR deletes the mac app's
@@ -25,7 +25,7 @@
    where wording moves; the new `Bus/SystemProxyReader.swift`; the `Session.trafficRoutes` accessor
    (`Session+Connection.swift`). Spec §D7 additionally names `Session.swift` (two stored properties: `systemProxy`, `caStatus`),
    `Bus/BusService.swift` (two system-proxy call sites + `refreshCAStatus()` + one reset),
-   `AitmproxyKit/CATrustFacts.swift` (new) and `Tests/AitmproxyKitTests/CATrustFactsTests.swift` (new), `Shell/RouteBanner.swift` (new), `App.swift`
+   `Shell/RouteBanner.swift` (new), `App.swift`
    (one menu item), `AitmproxyKit/CommandMap.swift` (one entry), `apps/mac/docs/BRIEF.md` (one
    token — `CommandMapTests.mapMatchesTheBrief` compares the map against the brief, so the entry
    cannot land without it), `apps/mac/docs/GLOSSARY.md` and `apps/mac/docs/STORIES.md`. **The
@@ -33,6 +33,15 @@
    `Session.swift` are also modified by the sibling icons plan on this same branch
    (`2026-10-31-mac-app-icons-and-names-plan.md` Tasks 5/6): Task 2 here and those tasks are
    **never run concurrently**; whichever lands second rebases onto the first.
+3. **CA parts only — the CA-trust session's `CATrustFacts` PR is on `main`** (number TBD; record
+   here: `__________`) and this branch has rebased onto it. That PR implements, to spec D2/D2a,
+   `AitmproxyKit/CATrustFacts.swift` (`CATrustFacts`, `init?(status:)`), its tests
+   (`CATrustFactsTests.swift`, TR-AC15) and the two additive `CAStatus` fields `trustedScope` /
+   `trustReported`. This plan creates none of them. Gated on it: **Task 1b** (the `make(caTrust:)`
+   slot, the `.caTrust` derivation and its tests), **Task 2b** (`Session.caStatus`,
+   `refreshCAStatus()`, the `caTrust:` pass-through) and the CA clauses of Tasks 3/5/6 (which
+   render whatever `routes.caTrust` holds — nil, hence nothing, until 1b/2b land). Not gated: Tasks
+   1, 2, 3, 4, 5 and the system-proxy / All Apps / Scope halves of Task 6.
 
 Before Wave A the orchestrator runs the baseline gate once on the rebased tree (Swift gate below
 plus the three tripwires) so every later failure is attributable to this plan.
@@ -99,13 +108,19 @@ Tester and panel.
 
 | Wave | Tasks | Parallel? |
 |---|---|---|
-| A | Task 1 | — |
+| A | Task 1 (system proxy, All Apps, Scope; `.caTrust` kinds declared, always nil) | — |
 | B | Task 2 (after 1) | — ; not concurrent with the icons plan's Tasks 5/6 (shared `BusService.swift`, `Session.swift`) |
 | C | Task 3 ∥ Task 4 (both after 2) | yes, file-disjoint |
 | D | Task 5 (after 3) | — (may run beside Task 4 if Task 3 landed first) |
-| E | Task 6, then whole-branch Tester and the three reviewers | sequential |
+| A′ | Task 1b (after 1 **and gate 3**) | may run beside C/D (Kit + tests only; `ConnectionSummary.swift` is Task 1's file, so 1b runs after 1 has landed, never beside it) |
+| B′ | Task 2b (after 1b and 2) | — ; same shared-file rule as Task 2 |
+| E | Task 6 (CA clauses only after 2b), then whole-branch Tester and the three reviewers | sequential |
 
-Evidence classes: **K** Tasks 1, 4 (CommandMap); **T** Task 5 (run), Task 6 (whole branch);
+If gate 3 is late, Waves A–D and Task 6's system-proxy/All Apps/Scope halves ship first as one PR
+(every `caTrust` surface renders nothing while the slot is nil); 1b/2b and the CA halves of Task 6
+follow as a second PR on the same branch. **Plan call 14.**
+
+Evidence classes: **K** Tasks 1, 1b, 4 (CommandMap); **T** Task 5 (run), Task 6 (whole branch);
 **L** Task 6. Tasks 2 and 3 have no Kit test by construction (CFNetwork, SwiftUI); their proof is
 the TR-AC8 structural greps, Task 6, and the diff review.
 
@@ -113,18 +128,19 @@ the TR-AC8 structural greps, Task 6, and the diff review.
 
 ## Tasks
 
-### Task 1: Kit model — `SystemProxyState`, `TrafficRoutes`, `make(systemProxy:)`, the predicate table
+### Task 1: Kit model — `SystemProxyState`, `TrafficRoutes`, `make(systemProxy:tunnelledFlowCount:)`, the predicate table (no CA derivation)
 
-- **Satisfies:** TR-AC1, TR-AC2, TR-AC3, TR-AC4, TR-AC5, TR-AC6 (all but the `CommandMap` clause), TR-AC15, TR-AC16, TR-AC18
-- **Depends on:** none
+- **Satisfies:** TR-AC1, TR-AC2, TR-AC3, TR-AC4, TR-AC5, TR-AC6 (all but the `CommandMap` clause), TR-AC18 (non-CA cases)
+- **Depends on:** none (not gated on the CA-trust PR)
 - **Files:**
   - `apps/mac/Sources/AitmproxyKit/SystemProxyState.swift` (create)
   - `apps/mac/Sources/AitmproxyKit/ConnectionSummary.swift` (modify)
   - `apps/mac/Tests/AitmproxyKitTests/SystemProxyStateTests.swift` (create)
   - `apps/mac/Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` (modify)
-  - `apps/mac/Sources/AitmproxyKit/CATrustFacts.swift` (create)
-  - `apps/mac/Tests/AitmproxyKitTests/CATrustFactsTests.swift` (create)
-- **Change:** exactly spec D2/D2a/D3/D4/D5 (CA amendment included), Foundation only (no CFNetwork, SystemConfiguration,
+- **Change:** exactly spec D2/D2a/D3/D4/D5 **without** the `caTrust` input or derivation: declare
+  `TrafficRoute.Kind.caTrust`, `TrafficRoutes.caTrust: TrafficRoute?` (always nil from this task's
+  `make`) and `GettingStartedStep.Kind.caTrust` (never emitted yet) so Task 3's views compile against
+  the full vocabulary; `make` has no `caTrust:` parameter until Task 1b. Foundation only (no CFNetwork, SystemConfiguration,
   SwiftUI, AppKit import anywhere in the Kit).
 
   `SystemProxyState.swift`:
@@ -178,7 +194,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   }
 
   public struct TrafficRoute: Hashable, Sendable {
-      public enum Kind: String, Hashable, Sendable, CaseIterable { case systemProxy, allApps, caTrust }
+      public enum Kind: String, Hashable, Sendable, CaseIterable { case systemProxy, allApps, scope, caTrust }
       public let kind: Kind
       public let open: Bool
       public let line: String
@@ -192,11 +208,12 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   public struct TrafficRoutes: Hashable, Sendable {
       public let systemProxy: TrafficRoute?
       public let allApps: TrafficRoute?
+      public let scope: TrafficRoute                                   // always present; closed iff scopeHostCount == 0
       public let caTrust: TrafficRoute?                                // nil = ca.status unread/unknown
       public let advice: [TrafficRoute]
       public let banner: String?
       public var anyOpen: Bool { [systemProxy, allApps].compactMap { $0 }.contains(where: \.open) }   // routes only
-      public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, caTrust: TrafficRoute?, advice: [TrafficRoute], banner: String?)
+      public init(systemProxy: TrafficRoute?, allApps: TrafficRoute?, scope: TrafficRoute, caTrust: TrafficRoute?, advice: [TrafficRoute], banner: String?)
   }
 
   public struct GettingStartedStep {
@@ -210,9 +227,125 @@ the TR-AC8 structural greps, Task 6, and the diff review.
       public static func make(core:activeKind:bus:role:roleWarning:capability:captureSupported:
                               scopeHostCount:flowCount:listenAddress:coreCapture: = nil,
                               systemProxy: SystemProxyState? = nil,
-                              caTrust: CATrustFacts? = nil) -> ConnectionSummary
+                              tunnelledFlowCount: Int = 0) -> ConnectionSummary   // Task 1b inserts `caTrust: CATrustFacts? = nil` before it
   }
   ```
+
+  Inside `make`: compute `routes` (private `routes(systemProxy:advice:activeKind:bus:scopeHostCount:flowCount:listenAddress:)`)
+  **before** `steps`, and pass `routes` into `steps`. Route derivation and words are spec D3,
+  verbatim — the system-proxy lines use `L` = `listenAddress` and `H:P` = the `.other` endpoint;
+  the All Apps open line is `"All Apps on"`; `advice` = the closed entries of `[systemProxy, allApps,
+  scope, caTrust]`, in that order, **only when the bus lane's `state == .ok`**, else `[]`; `banner` =
+  spec D5's predicate and composed form.
+  Steps are spec D4: `systemProxy` step omitted while `routes.systemProxy == nil`, otherwise
+  `title = line`, `detail = detail`, `done = open`, `action = .openNetworkSettings` when closed;
+  `extensionOn` titles become the All Apps route line for `.off`/`.awaitingApproval`/`.degraded`
+  (actions unchanged: `.turnCaptureOn`/`.approveInSystemSettings`/`.openCaptureSettings`) and
+  `"All Apps is on"` for `.onEmptyScope`/`.on` (detail `"in-scope hosts of every app"`);
+  `scopeSet` keeps its title and action: undone `"Add a host to Scope (for now as example.com:443)"`,
+  `.openScope`, detail `"Nothing is decrypted until a host is in Scope — add one"`; done
+  `"Scope: N hosts decrypted"` (`Format.count`), action nil, detail = the scope entry's detail.
+
+  **Existing tests this changes** (update them in the same commit; they are the spec's new words):
+  in `gettingStartedStepsFollowTheFacts`, `fresh.steps[2].title` becomes
+  `"All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`
+  and `waiting.steps[2].title` becomes
+  `"All Apps waiting for approval — approve the extension in System Settings"`. The five-element
+  `done` arrays stay (no `systemProxy:` → five steps).
+
+- **Test:** the private `make(...)` helper in `ConnectionSummaryTests` gains `systemProxy: SystemProxyState? = nil`
+  and `tunnelled: Int = 0` (→ `tunnelledFlowCount:`); Task 1b adds `caTrust: CATrustFacts? = nil`;
+  add a helper `both(_ host: String, _ port: Int) -> SystemProxyState` (HTTP and HTTPS at that
+  endpoint). `L = "127.0.0.1:8080"`.
+
+  `SystemProxyStateTests.swift`:
+  - `parsesTheProxiesDictionary` (TR-AC1): `SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 9090, "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": 9090])`
+    → `http == Endpoint(host: "127.0.0.1", port: 9090)`, `https == http`, `http?.address == "127.0.0.1:9090"`;
+    `["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 8080, "HTTPSEnable": 0]` → `https == nil`, `http?.port == 8080`;
+    `["HTTPEnable": 0, "HTTPProxy": "127.0.0.1", "HTTPPort": 8080]` → `http == nil`;
+    `["HTTPProxy": "127.0.0.1", "HTTPPort": 8080]` (Enable absent) → `http == nil`;
+    `SystemProxyState(settings: [:]) == .off`.
+  - `routeToTheCore` (TR-AC2), every literal: `.off.route(to: L) == .off`;
+    `both("127.0.0.1", 8080)` → `.thisCore(http: true, https: true)`; `both("localhost", 8080)` → the same;
+    `SystemProxyState(http: Endpoint(host: "127.0.0.1", port: 8080), https: nil)` → `.thisCore(http: true, https: false)`;
+    `both("127.0.0.1", 9090)` → `.other(host: "127.0.0.1", port: 9090)`;
+    `http 10.0.0.1:3128, https 127.0.0.1:8080` → `.thisCore(http: false, https: true)`;
+    `http nil, https 10.0.0.1:3128` → `.other(host: "10.0.0.1", port: 3128)`;
+    `both("127.0.0.1", 8080).route(to: "0.0.0.0:8080") == .thisCore(http: true, https: true)`;
+    `both("127.0.0.1", 8081).route(to: L) == .other(host: "127.0.0.1", port: 8081)`.
+
+  `ConnectionSummaryTests.swift` additions:
+  - `routesAdviceAndBanner` (TR-AC3): `make(bus: .connected("127.0.0.1:60745"), role: "operator", capability: .capturing, hosts: 0, flows: 0, systemProxy: .off).routes`:
+    `advice.map(\.line) == ["system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it", "Nothing is decrypted until a host is in Scope — add one"]`,
+    `advice.map(\.kind) == [.systemProxy, .scope]`, `routes.allApps?.line == "All Apps on"`, `routes.allApps?.open == true`,
+    `advice.map(\.detail) == ["every proxy-aware app, regardless of Scope", "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"]`,
+    `advice[0].actions == [.openNetworkSettings, .copyListenAddress]`, `advice[1].actions == [.openScope]`,
+    `routes.scope.state == "Nothing is decrypted until a host is in Scope"`, `routes.scope.remedy == "add one"`,
+    `banner == nil`, `anyOpen == true`. Same with `flows: 6` → `advice == []`, `banner == nil`;
+    with `flows: 6, tunnelled: 6` → `banner == "Nothing is decrypted until a host is in Scope — add one"`;
+    with `.inactive, flows: 6` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`.
+    Same with `systemProxy: both("127.0.0.1", 9090), flows: 0` →
+    `advice[0].line == "system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it"`
+    and `advice.allSatisfy { !$0.line.contains("off") }`.
+  - `predicateTable` (TR-AC4), one `make` per row, bus `.connected("x")`/`role: "operator"` unless stated:
+    `.inactive, systemProxy: .off` → `routes.allApps?.line == "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`, `actions == [.openCaptureSettings]`, `open == false`;
+    `.pendingApproval` → `"All Apps waiting for approval — approve the extension in System Settings"`, `[.approveInSystemSettings]`;
+    `.degraded("x")` → `"All Apps degraded — x"`, `[.openCaptureSettings]`;
+    `.capturing, hosts: 1` → `routes.allApps?.line == "All Apps on"`, `open == true`, `actions == []`, `routes.scope.line == "Scope: 1 host decrypted"`, `routes.scope.open == true`; `hosts: 3` → `"Scope: 3 hosts decrypted"`;
+    `systemProxy: SystemProxyState(http: Endpoint(host: "127.0.0.1", port: 8080), https: nil)` → `routes.systemProxy?.line == "system proxy on · 127.0.0.1:8080 · HTTP only"`, `open == true`, `actions == []`;
+    `https`-only at the core → `"system proxy on · 127.0.0.1:8080 · HTTPS only"`;
+    `both("127.0.0.1", 8080)` → `"system proxy on · 127.0.0.1:8080"`;
+    `systemProxy: nil, .capturing, hosts: 0` → `routes.systemProxy == nil`, `advice.map(\.line) == ["Nothing is decrypted until a host is in Scope — add one"]`;
+    `supported: false, systemProxy: .off, hosts: 2, flows: 3` → `routes.allApps == nil`, `banner == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
+    `supported: false, systemProxy: .off, hosts: 0, flows: 3` → `banner == "system proxy off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
+    `supported: false, systemProxy: .off, hosts: 0, flows: 0` → `advice.map(\.kind) == [.systemProxy, .scope]`;
+    `systemProxy: .off, .capturing, hosts: 2, flows: 3` → `banner == nil`, `anyOpen == true`;
+    `both("127.0.0.1", 9090), .capturing, hosts: 2, flows: 3` → `banner == nil`;
+    `both("127.0.0.1", 8080), .capturing, hosts: 0, flows: 3` → `banner == nil`, `advice.map(\.kind) == [.allApps]`;
+    `bus: .disconnected, systemProxy: .off, .capturing, hosts: 0` → `advice == []`, `banner == nil`;
+    `bus: .connected("x"), role: "agent", roleWarning: true, systemProxy: .off` → `advice == []` (lane not `.ok`);
+    `kind: .external, bus: .connected("x"), role: "operator", .capturing, hosts: 2, systemProxy: .off` → `routes.allApps == nil`, `advice.map(\.kind) == [.systemProxy]`;
+    `systemProxy: .off, .inactive, hosts: 2, flows: 3` → `banner == "system proxy off · All Apps off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
+    `systemProxy: .off, .inactive, hosts: 0, flows: 3` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
+    `both("127.0.0.1", 8080), .capturing, hosts: 0, flows: 3, tunnelled: 3` → `banner == "Nothing is decrypted until a host is in Scope — add one"`;
+    `both("127.0.0.1", 8080), .capturing, hosts: 0, flows: 3, tunnelled: 2` → `banner == nil`.
+  - `stepsCarryTheRouteWords` (TR-AC5): `systemProxy: nil` → `steps.map(\.kind)` contains no `.systemProxy`;
+    `systemProxy: .off` → `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .firstFlow]`,
+    `steps[2].done == false`, `steps[2].title == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`,
+    `steps[2].detail == "every proxy-aware app, regardless of Scope"`, `steps[2].action == .openNetworkSettings`;
+    `both("127.0.0.1", 9090)` → `steps[2].title == "system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it"`, `done == false`;
+    `both("127.0.0.1", 8080)` with `core(.ready), .capturing, hosts: 2, flows: 1` → `steps[2].title == "system proxy on · 127.0.0.1:8080"`, `done == true`, `action == nil`, `allStepsDone == true`;
+    `.capturing, hosts: 0` → `extensionOn.title == "All Apps is on"`, `done == true`, `detail == "in-scope hosts of every app"`, `scopeSet.title == "Add a host to Scope (for now as example.com:443)"`, `scopeSet.done == false`, `scopeSet.action == .openScope`, `scopeSet.detail == "Nothing is decrypted until a host is in Scope — add one"`;
+    `.inactive` → `extensionOn.title == "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`, `action == .turnCaptureOn`;
+    `.pendingApproval` → the waiting line, `action == .approveInSystemSettings`;
+    `.degraded("x")` → `extensionOn.title == "All Apps degraded — x"`, `action == .openCaptureSettings`;
+    `.capturing, hosts: 2` → `scopeSet.title == "Scope: 2 hosts decrypted"`, `scopeSet.done == true`, `scopeSet.action == nil`, `scopeSet.detail == "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"`; `hosts: 1` → `"Scope: 1 host decrypted"`;
+    `coreRunning`, `busConnected`, `firstFlow` → `detail == nil`.
+  - `openNetworkSettingsAction` (TR-AC6 Kit part): `ConnectionAction.openNetworkSettings.title == "Open Network Settings…"`,
+    `isDestructive == false`, `settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.Network-Settings.extension"`,
+    `ConnectionAction.approveInSystemSettings.settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"`,
+    `ConnectionAction.allCases.filter { $0.settingsURL != nil } == [.approveInSystemSettings, .openNetworkSettings]`,
+    `ConnectionAction.allCases == [.startCore, .restartCore, .showCoreLog, .switchToEmbedded, .reconnectBus, .openBusSettings, .turnCaptureOn, .turnCaptureOff, .openScope, .approveInSystemSettings, .uninstallExtension, .openCaptureSettings, .openBrowser, .copyListenAddress, .openNetworkSettings]`
+    (the reserved `setSystemProxy`/`unsetSystemProxy` are absent by construction of this literal list).
+
+  - `composedBanner` (TR-AC18): `routes.systemProxy?.state == "system proxy off"`, `routes.systemProxy?.remedy == "set 127.0.0.1:8080 as the system proxy, or point a client at it"` (`.off` input);
+    `hosts: 0` → `routes.scope.state == "Nothing is decrypted until a host is in Scope"`, `routes.scope.remedy == "add one"`;
+    `.capturing, hosts: 0, flows: 3, tunnelled: 3, systemProxy: .off` → `banner == "Nothing is decrypted until a host is in Scope — add one"`;
+    `.inactive, hosts: 0, flows: 3, systemProxy: .off` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
+    `.inactive, hosts: 2, flows: 3, systemProxy: .off` → `banner == "system proxy off · All Apps off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
+- **Done when:** the new tests and the two updated expectations pass, every other existing
+  `AitmproxyKitTests` suite still passes, and the Swift gate is green (Terminal, orchestrator).
+  Sandbox evidence: `swiftc -parse` clean on the four files; the report lists the literal values above.
+
+### Task 1b: Kit model — the CA fact (`make(caTrust:)`, `.caTrust` entry and step) — GATED on gate 3
+
+- **Satisfies:** TR-AC16, TR-AC18 (CA cases); TR-AC15 is proved by the CA-trust session's PR
+- **Depends on:** Task 1 landed; **gate 3** (the CA-trust PR on `main`, this branch rebased onto it)
+- **Files:**
+  - `apps/mac/Sources/AitmproxyKit/ConnectionSummary.swift` (modify — the `caTrust:` parameter and derivation)
+  - `apps/mac/Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` (modify)
+  - `apps/mac/Sources/AitmproxyKit/CATrustFacts.swift`, `AitmproxyKit/Panels/CAStatus.swift`, `Tests/AitmproxyKitTests/CATrustFactsTests.swift`: **read only** — the CA-trust PR's; a Coder who finds them missing or differing from spec D2 stops and reports (gate 3 not met)
+- **Change:** `make` gains `caTrust: CATrustFacts? = nil` (before `tunnelledFlowCount`); the derivation below; the `.caTrust` step per spec D4. The contract this task consumes (defined in spec D2, implemented by the CA-trust PR):
 
   `CATrustFacts.swift` (spec D2, shared with the system-proxy-automation session; Foundation only):
 
@@ -235,8 +368,8 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   `"no"`). `CATrustFacts(status:)` = nil when `!trustReported`; else `trusted = status.trusted`,
   `scope = status.trustedScope`, `fingerprint = status.fingerprint.isEmpty ? nil : status.fingerprint`.
   Nothing else in `CAStatus.swift` changes (`statusText`, `confirmPrompt`, `guides` untouched) and
-  `CAPanel.swift` is not touched. **Claim:** `AitmproxyKit/Panels/CAStatus.swift` for these two
-  fields only (orchestrator, Q1).
+  `CAPanel.swift` is not touched. Those two fields and the type are the CA-trust PR's; this task only reads them.
+
 
   CA fact in `make` (spec D3/D4/D5): `routes.caTrust` nil when `caTrust == nil`; else `kind: .caTrust`,
   `open = trusted`, `line` = `"CA trusted (user keychain)"` / `"CA trusted (system keychain)"` /
@@ -247,97 +380,47 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   closed entries in that order (bus `.ok`). Banner: `bothClosed ∨ caClosed` per spec D5; `shown` =
   the closed routes (when `bothClosed`) then the CA entry (when `caClosed`); text =
   `shown.map(\.state).joined(" · ")` + `" — " + <first non-nil remedy in shown>` (none for CA) —
-  the composed form; a single shown entry yields exactly its `line`. Step `caTrust`
+  the composed form; a single shown entry yields exactly its `line`. Per-host decryption (spec D3/D5
+  amendment): `routes.scope` always present — `kind: .scope`, `open = scopeHostCount > 0`, line
+  `"Nothing is decrypted until a host is in Scope — add one"` / `"Scope: " + Format.count(n, "host") + " decrypted"`,
+  detail `"Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"`,
+  actions `[.openScope]` when closed; All Apps is open for `.onEmptyScope` and `.on` with line
+  `"All Apps on"` (closed lines only for `.off`/`.awaitingApproval`/`.degraded`). `shown` = closed routes
+  when `routesClosed`, + `scope` when `scopeHostCount == 0 ∧ (routesClosed ∨ allTunnels)` where
+  `allTunnels = flowCount > 0 ∧ tunnelledFlowCount == flowCount`, + CA when closed; priority system
+  proxy > All Apps > Scope > CA. Step `caTrust`
   after `scopeSet`, omitted when `routes.caTrust == nil`; `title` = `"Trust the aitmproxy CA"` when
   not done, the route line when done; `detail` = the route detail; `action = nil`.
 
-  Inside `make`: compute `routes` (private `routes(systemProxy:advice:activeKind:bus:scopeHostCount:flowCount:listenAddress:)`)
-  **before** `steps`, and pass `routes` into `steps`. Route derivation and words are spec D3,
-  verbatim — the system-proxy lines use `L` = `listenAddress` and `H:P` = the `.other` endpoint;
-  the All Apps `.on` line is `"All Apps on · " + Format.count(n, "host") + " in scope"`;
-  `advice` = the closed non-nil routes, system proxy first, **only when the bus lane's `state == .ok`**,
-  else `[]`; `banner` = spec D5's predicate, the closed routes' lines joined with `" · "`.
-  Steps are spec D4: `systemProxy` step omitted while `routes.systemProxy == nil`, otherwise
-  `title = line`, `detail = detail`, `done = open`, `action = .openNetworkSettings` when closed;
-  `extensionOn` titles become the All Apps route line for `.off`/`.awaitingApproval`/`.degraded`
-  (actions unchanged: `.turnCaptureOn`/`.approveInSystemSettings`/`.openCaptureSettings`) and
-  `"All Apps is on"` for `.onEmptyScope`/`.on` (detail `"in-scope hosts of every app"`);
-  `scopeSet` for `.onEmptyScope` is `"All Apps on, nothing in scope — add a host"` with detail
-  `"in-scope hosts of every app"`, otherwise unchanged with `detail nil`.
 
-  **Existing tests this changes** (update them in the same commit; they are the spec's new words):
-  in `gettingStartedStepsFollowTheFacts`, `fresh.steps[2].title` becomes
-  `"All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`
-  and `waiting.steps[2].title` becomes
-  `"All Apps waiting for approval — approve the extension in System Settings"`. The five-element
-  `done` arrays stay (no `systemProxy:` → five steps).
+- **Test:** the private `make(...)` helper gains `caTrust: CATrustFacts? = nil`.
 
-- **Test:** the private `make(...)` helper in `ConnectionSummaryTests` gains `systemProxy: SystemProxyState? = nil`;
-  add a helper `both(_ host: String, _ port: Int) -> SystemProxyState` (HTTP and HTTPS at that
-  endpoint). `L = "127.0.0.1:8080"`.
+  `ConnectionSummaryTests` additions for the CA fact (TR-AC16), `notTrusted = CATrustFacts(trusted: false, scope: nil, fingerprint: "AB:CD")`,
+  `trustedUser = CATrustFacts(trusted: true, scope: "user", fingerprint: "AB:CD")`:
+  - `caTrustJoinsAdviceAndSteps`: TR-AC3 inputs + `caTrust: notTrusted` → `routes.caTrust?.line == "HTTPS is not captured until the CA is trusted"`,
+    `routes.caTrust?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`,
+    `routes.caTrust?.actions == []`, `advice.map(\.kind) == [.systemProxy, .scope, .caTrust]`, `anyOpen == true`,
+    `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrust, .firstFlow]`,
+    `steps[5].title == "Trust the aitmproxy CA"`, `steps[5].done == false`, `steps[5].action == nil`, `steps[5].detail == <the detail string>`;
+  - `caTrustBanner`: same + `flows: 6` → `banner == "HTTPS is not captured until the CA is trusted"`; same + `flows: 6, tunnelled: 6` → `banner == "Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one"`;
+    same + `.inactive, flows: 6` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
+    `both("127.0.0.1", 8080), .capturing, hosts: 2, flows: 3, caTrust: notTrusted` → `banner == "HTTPS is not captured until the CA is trusted"`, `anyOpen == true`;
+    `both("127.0.0.1", 8080), .capturing, hosts: 2, flows: 3, caTrust: trustedUser` → `banner == nil`;
+    `systemProxy: .off, .capturing, hosts: 0, flows: 3, tunnelled: 3, caTrust: trustedUser` → `banner == "Nothing is decrypted until a host is in Scope — add one"` (no CA clause);
+  - `caTrusted`: `caTrust: trustedUser` → `routes.caTrust?.line == "CA trusted (user keychain)"`, `open == true`, `detail == "HTTPS on both routes"`, `steps` contain `.caTrust` with `title == "CA trusted (user keychain)"`, `done == true`;
+    `scope: "system"` → `"CA trusted (system keychain)"`; `scope: nil, trusted: true` → `"CA trusted"`;
+    `allStepsDone == true` with `core(.ready)`, `both("127.0.0.1", 8080)`, `.capturing, hosts: 2, flows: 1, caTrust: trustedUser`;
+  - `caUnknownSaysNothing`: `caTrust: nil` → `routes.caTrust == nil`, no `.caTrust` step, `advice`/`banner` carry no `"CA"` and no `"HTTPS"`;
+  - `caSiblingStates`: `CATrustFacts(trusted: false, scope: nil, fingerprint: nil, installing: true)` → `line == "trusting CA…"`, `open == false`;
+    `remedy: "CA trust needs an administrator"` → `line == "CA trust needs an administrator"`, `open == false`.
+  - `composedBannerWithCA` (TR-AC18, CA cases; `notTrusted`/`trustedUser` as above):
+    `routes.caTrust?.remedy == nil` and `state == line` (`notTrusted`); `.capturing, hosts: 2` → `routes.allApps?.remedy == nil`, `routes.scope.remedy == nil`;
+    `.inactive, hosts: 0, flows: 3, systemProxy: .off, caTrust: notTrusted` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"` (fresh install);
+    `.capturing, hosts: 0, flows: 3, systemProxy: .off, caTrust: notTrusted` → `banner == "HTTPS is not captured until the CA is trusted"`;
+    `.capturing, hosts: 0, flows: 3, tunnelled: 3, systemProxy: .off, caTrust: notTrusted` → `banner == "Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one"`;
+    single-fact cases: `banner == routes.<fact>?.line` for `supported: false, .off, flows: 3` and for `both("127.0.0.1", 8080), .capturing, hosts: 2, flows: 3, caTrust: notTrusted`.
 
-  `SystemProxyStateTests.swift`:
-  - `parsesTheProxiesDictionary` (TR-AC1): `SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 9090, "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": 9090])`
-    → `http == Endpoint(host: "127.0.0.1", port: 9090)`, `https == http`, `http?.address == "127.0.0.1:9090"`;
-    `["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 8080, "HTTPSEnable": 0]` → `https == nil`, `http?.port == 8080`;
-    `["HTTPEnable": 0, "HTTPProxy": "127.0.0.1", "HTTPPort": 8080]` → `http == nil`;
-    `["HTTPProxy": "127.0.0.1", "HTTPPort": 8080]` (Enable absent) → `http == nil`;
-    `SystemProxyState(settings: [:]) == .off`.
-  - `routeToTheCore` (TR-AC2), every literal: `.off.route(to: L) == .off`;
-    `both("127.0.0.1", 8080)` → `.thisCore(http: true, https: true)`; `both("localhost", 8080)` → the same;
-    `SystemProxyState(http: Endpoint(host: "127.0.0.1", port: 8080), https: nil)` → `.thisCore(http: true, https: false)`;
-    `both("127.0.0.1", 9090)` → `.other(host: "127.0.0.1", port: 9090)`;
-    `http 10.0.0.1:3128, https 127.0.0.1:8080` → `.thisCore(http: false, https: true)`;
-    `http nil, https 10.0.0.1:3128` → `.other(host: "10.0.0.1", port: 3128)`;
-    `both("127.0.0.1", 8080).route(to: "0.0.0.0:8080") == .thisCore(http: true, https: true)`;
-    `both("127.0.0.1", 8081).route(to: L) == .other(host: "127.0.0.1", port: 8081)`.
-
-  `ConnectionSummaryTests.swift` additions:
-  - `routesAdviceAndBanner` (TR-AC3): `make(bus: .connected("127.0.0.1:60745"), role: "operator", capability: .capturing, hosts: 0, flows: 0, systemProxy: .off).routes`:
-    `advice.map(\.line) == ["system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it", "All Apps on, nothing in scope — add a host"]`,
-    `advice.map(\.detail) == ["every proxy-aware app, regardless of Scope", "in-scope hosts of every app"]`,
-    `advice[0].actions == [.openNetworkSettings, .copyListenAddress]`, `advice[1].actions == [.openScope]`,
-    `banner == nil`, `anyOpen == false`. Same with `flows: 6` → `advice == []`,
-    `banner == "system proxy off · All Apps on, nothing in scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`.
-    Same with `systemProxy: both("127.0.0.1", 9090), flows: 0` →
-    `advice[0].line == "system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it"`
-    and `advice.allSatisfy { !$0.line.contains("off") }`.
-  - `predicateTable` (TR-AC4), one `make` per row, bus `.connected("x")`/`role: "operator"` unless stated:
-    `.inactive, systemProxy: .off` → `routes.allApps?.line == "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`, `actions == [.openCaptureSettings]`, `open == false`;
-    `.pendingApproval` → `"All Apps waiting for approval — approve the extension in System Settings"`, `[.approveInSystemSettings]`;
-    `.degraded("x")` → `"All Apps degraded — x"`, `[.openCaptureSettings]`;
-    `.capturing, hosts: 1` → `"All Apps on · 1 host in scope"`, `open == true`, `actions == []`;
-    `systemProxy: SystemProxyState(http: Endpoint(host: "127.0.0.1", port: 8080), https: nil)` → `routes.systemProxy?.line == "system proxy on · 127.0.0.1:8080 · HTTP only"`, `open == true`, `actions == []`;
-    `https`-only at the core → `"system proxy on · 127.0.0.1:8080 · HTTPS only"`;
-    `both("127.0.0.1", 8080)` → `"system proxy on · 127.0.0.1:8080"`;
-    `systemProxy: nil, .capturing, hosts: 0` → `routes.systemProxy == nil`, `advice.map(\.line) == ["All Apps on, nothing in scope — add a host"]`;
-    `supported: false, systemProxy: .off, flows: 3` → `routes.allApps == nil`, `banner == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    `supported: false, systemProxy: .off, flows: 0` → `advice.map(\.kind) == [.systemProxy]`;
-    `systemProxy: .off, .capturing, hosts: 2, flows: 3` → `banner == nil`, `anyOpen == true`;
-    `both("127.0.0.1", 9090), .capturing, hosts: 2, flows: 3` → `banner == nil`;
-    `both("127.0.0.1", 8080), .capturing, hosts: 0, flows: 3` → `banner == nil`, `advice.map(\.kind) == [.allApps]`;
-    `bus: .disconnected, systemProxy: .off, .capturing, hosts: 0` → `advice == []`, `banner == nil`;
-    `bus: .connected("x"), role: "agent", roleWarning: true, systemProxy: .off` → `advice == []` (lane not `.ok`);
-    `kind: .external, bus: .connected("x"), role: "operator", .capturing, hosts: 2, systemProxy: .off` → `routes.allApps == nil`, `advice.map(\.kind) == [.systemProxy]`;
-    `systemProxy: .off, .inactive, flows: 3` → `banner == "system proxy off · All Apps off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`.
-  - `stepsCarryTheRouteWords` (TR-AC5): `systemProxy: nil` → `steps.map(\.kind)` contains no `.systemProxy`;
-    `systemProxy: .off` → `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .firstFlow]`,
-    `steps[2].done == false`, `steps[2].title == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`,
-    `steps[2].detail == "every proxy-aware app, regardless of Scope"`, `steps[2].action == .openNetworkSettings`;
-    `both("127.0.0.1", 9090)` → `steps[2].title == "system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it"`, `done == false`;
-    `both("127.0.0.1", 8080)` with `core(.ready), .capturing, hosts: 2, flows: 1` → `steps[2].title == "system proxy on · 127.0.0.1:8080"`, `done == true`, `action == nil`, `allStepsDone == true`;
-    `.capturing, hosts: 0` → `extensionOn.title == "All Apps is on"`, `done == true`, `detail == "in-scope hosts of every app"`, `scopeSet.title == "All Apps on, nothing in scope — add a host"`, `scopeSet.action == .openScope`, `scopeSet.detail == "in-scope hosts of every app"`;
-    `.inactive` → `extensionOn.title == "All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`, `action == .turnCaptureOn`;
-    `.pendingApproval` → the waiting line, `action == .approveInSystemSettings`;
-    `.degraded("x")` → `extensionOn.title == "All Apps degraded — x"`, `action == .openCaptureSettings`;
-    `.capturing, hosts: 2` → `scopeSet.title == "Scope has 2 hosts"`, `scopeSet.detail == nil`;
-    `coreRunning`, `busConnected`, `firstFlow` → `detail == nil`.
-  - `openNetworkSettingsAction` (TR-AC6 Kit part): `ConnectionAction.openNetworkSettings.title == "Open Network Settings…"`,
-    `isDestructive == false`, `settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.Network-Settings.extension"`,
-    `ConnectionAction.approveInSystemSettings.settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"`,
-    `ConnectionAction.allCases.filter { $0.settingsURL != nil } == [.approveInSystemSettings, .openNetworkSettings]`,
-    `ConnectionAction.allCases == [.startCore, .restartCore, .showCoreLog, .switchToEmbedded, .reconnectBus, .openBusSettings, .turnCaptureOn, .turnCaptureOff, .openScope, .approveInSystemSettings, .uninstallExtension, .openCaptureSettings, .openBrowser, .copyListenAddress, .openNetworkSettings]`
-    (the reserved `setSystemProxy`/`unsetSystemProxy` are absent by construction of this literal list).
+  The CA-trust PR owns `CATrustFactsTests.swift` (TR-AC15); for reference, the contract it pins:
 
   `CATrustFactsTests.swift` (TR-AC15), inputs built with `CAStatus(json:)` over literal `JSONValue`
   objects (`"exists": true`, `"fingerprint_sha256": "AB:CD"`, `"stores": {...}`):
@@ -347,35 +430,9 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   - system `"yes"`, user `"no"` → `trusted == true`, `scope == "system"`;
   - `CAStatus.trusted` unchanged in meaning: `trusted == (CATrustFacts(status:)?.trusted ?? false)` on every input above.
 
-  `ConnectionSummaryTests` additions for the CA fact (TR-AC16), `notTrusted = CATrustFacts(trusted: false, scope: nil, fingerprint: "AB:CD")`,
-  `trustedUser = CATrustFacts(trusted: true, scope: "user", fingerprint: "AB:CD")`:
-  - `caTrustJoinsAdviceAndSteps`: TR-AC3 inputs + `caTrust: notTrusted` → `routes.caTrust?.line == "HTTPS is not captured until the CA is trusted"`,
-    `routes.caTrust?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`,
-    `routes.caTrust?.actions == []`, `advice.map(\.kind) == [.systemProxy, .allApps, .caTrust]`, `anyOpen == false`,
-    `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrust, .firstFlow]`,
-    `steps[5].title == "Trust the aitmproxy CA"`, `steps[5].done == false`, `steps[5].action == nil`, `steps[5].detail == <the detail string>`;
-  - `caTrustBanner`: same + `flows: 6` → `banner == "system proxy off · All Apps on, nothing in scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    `both("127.0.0.1", 8080), .capturing, hosts: 2, flows: 3, caTrust: notTrusted` → `banner == "HTTPS is not captured until the CA is trusted"`, `anyOpen == true`;
-    `both("127.0.0.1", 8080), .capturing, hosts: 2, flows: 3, caTrust: trustedUser` → `banner == nil`;
-    `systemProxy: .off, .capturing, hosts: 0, flows: 3, caTrust: trustedUser` → the TR-AC3 two-line banner with no CA clause;
-  - `caTrusted`: `caTrust: trustedUser` → `routes.caTrust?.line == "CA trusted (user keychain)"`, `open == true`, `detail == "HTTPS on both routes"`, `steps` contain `.caTrust` with `title == "CA trusted (user keychain)"`, `done == true`;
-    `scope: "system"` → `"CA trusted (system keychain)"`; `scope: nil, trusted: true` → `"CA trusted"`;
-    `allStepsDone == true` with `core(.ready)`, `both("127.0.0.1", 8080)`, `.capturing, hosts: 2, flows: 1, caTrust: trustedUser`;
-  - `caUnknownSaysNothing`: `caTrust: nil` → `routes.caTrust == nil`, no `.caTrust` step, `advice`/`banner` carry no `"CA"` and no `"HTTPS"`;
-  - `caSiblingStates`: `CATrustFacts(trusted: false, scope: nil, fingerprint: nil, installing: true)` → `line == "trusting CA…"`, `open == false`;
-    `remedy: "CA trust needs an administrator"` → `line == "CA trust needs an administrator"`, `open == false`.
-  - `composedBanner` (TR-AC18): `routes.systemProxy?.state == "system proxy off"`, `routes.systemProxy?.remedy == "set 127.0.0.1:8080 as the system proxy, or point a client at it"` (`.off` input);
-    `routes.caTrust?.remedy == nil` and `state == line` (`notTrusted`); `.capturing, hosts: 2` → `routes.allApps?.remedy == nil`;
-    `.inactive, hosts: 0, flows: 3, systemProxy: .off, caTrust: notTrusted` → `banner == "system proxy off · All Apps off · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    `.capturing, hosts: 0, flows: 3, systemProxy: .off, caTrust: notTrusted` → `banner == "system proxy off · All Apps on, nothing in scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    `.capturing, hosts: 0, flows: 3, systemProxy: .off` → `banner == "system proxy off · All Apps on, nothing in scope — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    `.inactive, flows: 3, systemProxy: .off` → `banner == "system proxy off · All Apps off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`;
-    single-fact cases: `banner == routes.<fact>?.line` for `supported: false, .off, flows: 3` and for `both("127.0.0.1", 8080), .capturing, hosts: 2, flows: 3, caTrust: notTrusted`.
-- **Done when:** the new tests and the two updated expectations pass, every other existing
-  `AitmproxyKitTests` suite still passes, and the Swift gate is green (Terminal, orchestrator).
-  Sandbox evidence: `swiftc -parse` clean on the four files; the report lists the literal values above.
+- **Done when:** the new tests pass, Task 1's tests still pass unchanged, and the Swift gate is green.
 
-### Task 2: App reader, poll-tick wiring, `Session.systemProxy`, `Session.trafficRoutes`, `perform(.openNetworkSettings)`
+### Task 2: App reader, poll-tick wiring, `Session.systemProxy`, `Session.trafficRoutes`, `perform(.openNetworkSettings)` (no CA wiring)
 
 - **Satisfies:** TR-AC8 (CFNetwork single file; Kit import rule), the model half of TR-AC10–13
   (the fact reaches the views within one poll)
@@ -383,7 +440,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
 - **Files:**
   - `apps/mac/Sources/Aitmproxy/Bus/SystemProxyReader.swift` (create)
   - `apps/mac/Sources/Aitmproxy/Bus/BusService.swift` (modify: two call sites + one reset)
-  - `apps/mac/Sources/Aitmproxy/Session.swift` (modify: two stored properties)
+  - `apps/mac/Sources/Aitmproxy/Session.swift` (modify: one stored property)
   - `apps/mac/Sources/Aitmproxy/Session+Connection.swift` (modify)
 - **Change:**
 
@@ -398,8 +455,8 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   }
   ```
 
-  `Session.swift`: `var systemProxy: SystemProxyState?` and `var caStatus: CAStatus?` (both observed,
-  nil at init; doc comment "nil until the first live read; reset to nil when the live connection ends").
+  `Session.swift`: `var systemProxy: SystemProxyState?` (observed, nil at init; doc comment "nil until
+  the first live read; reset to nil when the live connection ends"). Task 2b adds `caStatus`.
 
   `BusService.swift`: `private func refreshSystemProxy()` — `let state = SystemProxyReader.read();
   if state != session.systemProxy { session.systemProxy = state }`. Called (1) once right after
@@ -408,16 +465,11 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   beside the throughput reset (plan call 5: a session with no live bus says nothing about the
   system proxy). No new timer; no read outside these three lines.
 
-  `BusService.swift`, CA: `private func refreshCAStatus()` — `guard let client, let json = try? await client.call("ca.status"),
-  let parsed = CAStatus(json: json) else { return }; if parsed != session.caStatus { session.caStatus = parsed }`.
-  Called (1) once after the connect-path `refreshSystemProxy()`, (2) in `pollLoop` every 10th
-  iteration (a `tick` counter local to `pollLoop`, `tick % 10 == 0`, reset per connection; plan
-  call 9 — `ca.status` spawns `/usr/bin/security` per store on macOS). The `pollLoop` `defer` also
-  sets `session.caStatus = nil`. The same existing verb the CA page calls; no new verb, no change to
-  `CAPanel.swift`.
-
   `Session+Connection.swift`: `connectionSummary` passes `systemProxy: systemProxy` and
-  `caTrust: caStatus.flatMap(CATrustFacts.init)`;
+  `tunnelledFlowCount: rows.count { $0.tls == .tunnelled }` (Task 2b adds `caTrust: caStatus.flatMap(CATrustFacts.init)`)
+  (a count over `FlowRow.tls`, `AitmproxyKit/Flow.swift` `TLSState.tunnelled`; today `FlowSummary`
+  never yields it, so the count is 0 until the per-host-decryption core story lands — stated in
+  spec D5);
   new accessor, the only one of its name in the app target:
 
   ```swift
@@ -436,18 +488,45 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   `grep -rlE '^import (CFNetwork|SystemConfiguration|SwiftUI|AppKit)' apps/mac/Sources/AitmproxyKit` → empty;
   `grep -rn 'var trafficRoutes' apps/mac/Sources/Aitmproxy` → one line, in `Session+Connection.swift`,
   containing `connectionSummary.routes`; `grep -c 'refreshSystemProxy()' apps/mac/Sources/Aitmproxy/Bus/BusService.swift`
-  → `3` (definition + two calls); `grep -c 'refreshCAStatus()' apps/mac/Sources/Aitmproxy/Bus/BusService.swift`
-  → `3`; `grep -rln '"ca.status"' apps/mac/Sources` → exactly `Bus/BusService.swift` and
-  `Panels/CAPanel.swift`; `grep -rn 'ca.install' apps/mac/Sources/Aitmproxy/Bus apps/mac/Sources/Aitmproxy/Session*.swift`
-  → empty; `git diff -- apps/mac/Package.swift` → empty. Live proof is Task 6.
+  → `3` (definition + two calls); `git diff -- apps/mac/Package.swift` → empty. Live proof is Task 6.
 - **Done when:** the greps print the values above, the app target compiles (`swift build` in the
   Swift gate run), and the Swift gate is green.
+
+### Task 2b: CA wiring — `Session.caStatus`, `refreshCAStatus()`, the `caTrust:` pass-through — GATED on gate 3
+
+- **Satisfies:** the model half of TR-AC17 (the CA fact reaches the views within one CA tick); TR-AC8's `ca.status` caller grep
+- **Depends on:** Task 1b and Task 2 landed; not concurrent with the icons plan's Tasks 5/6 (shared `BusService.swift`, `Session.swift`)
+- **Files:**
+  - `apps/mac/Sources/Aitmproxy/Bus/BusService.swift` (modify — `refreshCAStatus()` + tick counter + defer reset)
+  - `apps/mac/Sources/Aitmproxy/Session.swift` (modify — `var caStatus: CAStatus?`)
+  - `apps/mac/Sources/Aitmproxy/Session+Connection.swift` (modify — `caTrust: caStatus.flatMap(CATrustFacts.init)`)
+- **Change:**
+
+  `Session.swift`: `var caStatus: CAStatus?` (observed, nil at init; "nil until the first live read; reset
+  to nil when the live connection ends").
+
+  `BusService.swift`, CA: `private func refreshCAStatus()` — `guard let client, let json = try? await client.call("ca.status"),
+  let parsed = CAStatus(json: json) else { return }; if parsed != session.caStatus { session.caStatus = parsed }`.
+  Called (1) once after the connect-path `refreshSystemProxy()`, (2) in `pollLoop` every 10th
+  iteration (a `tick` counter local to `pollLoop`, `tick % 10 == 0`, reset per connection; plan
+  call 9 — `ca.status` spawns `/usr/bin/security` per store on macOS). The `pollLoop` `defer` also
+  sets `session.caStatus = nil`. The same existing verb the CA page calls; no new verb, no change to
+  `CAPanel.swift`.
+
+  `Session+Connection.swift`: `connectionSummary` additionally passes `caTrust: caStatus.flatMap(CATrustFacts.init)`.
+
+- **Test:** none in Kit by construction. Sandbox checks: `grep -c 'refreshCAStatus()' apps/mac/Sources/Aitmproxy/Bus/BusService.swift`
+  → `3`; `grep -rln '"ca.status"' apps/mac/Sources` → exactly `Bus/BusService.swift` and
+  `Panels/CAPanel.swift`; `grep -rn 'ca.install' apps/mac/Sources/Aitmproxy/Bus apps/mac/Sources/Aitmproxy/Session*.swift`
+  → empty.
+- **Done when:** the greps print the values above, the app target compiles, the Swift gate is green.
 
 ### Task 3: The two surfaces — Status step help, Flows empty-state route rows, `RouteBanner`
 
 - **Satisfies:** the view half of TR-AC10, TR-AC11, TR-AC12, TR-AC13, TR-AC14, TR-AC17, TR-AC19 (Flows/Status
   buttons, help, the CA row without a button, the one-banner-line rule), TR-AC8 (ShellView/StatusPanel diff footprint)
-- **Depends on:** Task 2
+- **Depends on:** Task 2 (not 1b/2b: the views render `routes.caTrust`/`advice` whatever they hold; the
+  CA row and step appear by themselves once 2b lands)
 - **Files:**
   - `apps/mac/Sources/Aitmproxy/Shell/RouteBanner.swift` (create)
   - `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (modify — two hunks only)
@@ -502,7 +581,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   `flowTable` overlay call as `routes: session.trafficRoutes.advice`; plan call 6 — a parameter,
   not the environment, so the struct stays a pure function of its inputs). Unfiltered and
   `routes` non-empty: under "No flows yet", one row per route — glyph (`"network"` for
-  `.systemProxy`, `"app.badge"` for `.allApps`, `Tok.Glyph.lock` for `.caTrust`), `Text(route.line)`,
+  `.systemProxy`, `"app.badge"` for `.allApps`, `Tok.Glyph.scope` for `.scope`, `Tok.Glyph.lock` for `.caTrust`), `Text(route.line)`,
   its actions as `SmallButton`s (every action in `route.actions`, so the system-proxy row offers
   Open Network Settings… and Copy Address, the All Apps row its one, the CA row none — `.trustCA`
   is reserved for the sibling; the row is informational until it lands), and `Text(route.detail)` beneath at
@@ -540,8 +619,9 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   - `apps/mac/Sources/AitmproxyKit/CommandMap.swift` (modify — one entry)
   - `apps/mac/docs/BRIEF.md` (modify — one token on the Proxy menu line)
   - `apps/mac/Tests/AitmproxyKitTests/CommandMapTests.swift` (modify — one expectation)
-  - `apps/mac/docs/GLOSSARY.md` (modify — two rows)
-  - `apps/mac/docs/STORIES.md` (modify — S-073)
+  - `apps/mac/docs/GLOSSARY.md` (modify — three rows)
+  - (`apps/mac/docs/STORIES.md` is **not** touched here: the improve-loop session owns S-073/S-074/S-080
+    and writes them with the shared strings of spec D2a)
 - **Change:**
   - `App.swift`: a NEW group right after the first `Divider()` (before `Button("Browser")`): `Button("Network Settings…") { session.perform(connection: .openNetworkSettings) }` followed by a `Divider()`. Agreed with the system-proxy session 2026-10-31: its `Toggle("Set as System Proxy")` (⌥⌘P) goes on the line directly ABOVE this item later, so nothing moves.
     no keyboard shortcut (plan call 7 — its neighbours Certificate Authority… and Configuration…
@@ -554,9 +634,8 @@ the TR-AC8 structural greps, Task 6, and the diff review.
     `mapMatchesTheBrief` then proves the map row for free.
   - `GLOSSARY.md`: rows `| System proxy | The macOS HTTP/HTTPS proxy setting every proxy-aware app follows, regardless of Scope; off, on · <address> (this core), or on · <address>, not this core | network proxy, global proxy, PAC |`
     and `| Route | One of the two ways traffic reaches the proxy without pointing a client by hand: the system proxy (every proxy-aware app, regardless of Scope) or All Apps (in-scope hosts of every app); open or closed | path, lane (that is the Status card) |`.
-  - `STORIES.md`: `### S-073 See why nothing is flowing` after S-072 — operator story, Depends
-    S-072, Spec = this plan's spec, Acceptance = [unit] TR-AC3–5 words, [structural] TR-AC7–8,
-    [manual] TR-AC10–14 on the real app; Status: in progress. No `[snapshot]`/`[self-test]` lines.
+  - `GLOSSARY.md`, third row: `| Scope (decryption) | Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel row. Nothing is decrypted until a host is in Scope | allowlist, MITM list, "read-only" (retired) |`.
+  - `STORIES.md`: nothing — S-073/S-074/S-080 are the improve-loop session's, using spec D2a's strings verbatim.
 - **Test:** `CommandMapTests` — `briefParses` and `mapMatchesTheBrief` pass with the new row
   (`missing == []`, `extra == []`). Sandbox check: `grep -c 'Network Settings…' apps/mac/docs/BRIEF.md apps/mac/Sources/AitmproxyKit/CommandMap.swift apps/mac/Sources/Aitmproxy/App.swift`
   → `1` each.
@@ -577,7 +656,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   call; call above `if session.splitView {`). NS-AC3 struct/body pins and the NS-AC8 empty-state
   pins are untouched. Header comment notes spec D8.
   - Rule 1: a second grep with an opening-quote prefix pattern,
-    `prefixes='"(system proxy off|system proxy on|All Apps on|All Apps off|All Apps waiting|All Apps degraded|HTTPS is not captured|Trust the aitmproxy CA|CA trusted|trusting CA|CA trust needs)'`,
+    `prefixes='"(system proxy off|system proxy on|All Apps on|All Apps off|All Apps waiting|All Apps degraded|Nothing is decrypted|Scope:|HTTPS is not captured|Trust the aitmproxy CA|CA trusted|trusting CA|CA trust needs)'`,
     same scan root and exclusions as `words`, same FAIL message family
     ("a view spells a route word; read it from ConnectionSummary.routes instead").
   - Rule 2: unchanged.
@@ -592,7 +671,7 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   2. Mutation, then revert: append `Text("system proxy off — x")` inside `EmptyFlows` → exit 1,
      output names `Shell/ShellView.swift`. Same for `Text("system proxy on · x")`,
      `Text("HTTPS is not captured until the CA is trusted")`, `Text("Trust the aitmproxy CA")` and
-     `Text("All Apps on, nothing in scope — add a host")` in `Shell/RouteBanner.swift`.
+     `Text("Nothing is decrypted until a host is in Scope — add one")` in `Shell/RouteBanner.swift`.
   3. Mutation: add `let _ = session.connectionSummary` to `RouteBanner.swift` → exit 1 (rule 2 and 3);
      the same line in `ShellView.swift` → exit 1 (rule 2).
   4. Mutation: a second `var trafficRoutes: TrafficRoutes { connectionSummary.routes }` in
@@ -606,7 +685,9 @@ the TR-AC8 structural greps, Task 6, and the diff review.
 
 - **Satisfies:** TR-AC9 (gates on the whole branch), TR-AC10, TR-AC11, TR-AC12, TR-AC13, TR-AC14,
   TR-AC17 (the NOT-trusted state only), TR-AC19
-- **Depends on:** Tasks 1–5 merged into the branch, Swift gate green, tripwires PASS
+- **Depends on:** Tasks 1–5 merged into the branch, Swift gate green, tripwires PASS; the CA clauses
+  (A2/A6 CA row, B2 CA row/step, B4 CA-only banner, B7, B8's CA half) additionally need 1b and 2b —
+  without them the CA surfaces render nothing and those clauses are recorded as deferred, not failed
 - **Files:** none in the repo. Evidence under `/tmp/claude/route-advice/` (PNG screenshots,
   `scutil --proxy` dumps, bus replies). The Shipped section records the build each half ran on.
 - **Change:** none. **HARD GATE (Matt, via the orchestrator): do NOT run `ca.install` on Matt's
@@ -681,8 +762,8 @@ the TR-AC8 structural greps, Task 6, and the diff review.
     → `A5-https-only.png`, `A5-other.png`.
   - A6 Banner, no extension (TR-AC13 / D5 "no extension" row): with A5's state,
     `curl -x 127.0.0.1:8080 http://example.com/` twice. Flows shows the table and ONE banner line
-    reading exactly `system proxy on · 127.0.0.1:8081, not this core · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`
-    (composed, spec D5), with Open Network Settings…; no other banner above or below it. → `A6-banner.png`. Set the primary
+    reading exactly `system proxy on · 127.0.0.1:8081, not this core · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`
+    (composed, spec D5: no extension → `allApps` nil, scope empty), with Open Network Settings… and Open Scope…; no other banner above or below it. → `A6-banner.png`. Set the primary
     service back to `127.0.0.1 8080` on both protocols → the banner is exactly
     `HTTPS is not captured until the CA is trusted` (TR-AC17, open route + untrusted CA). → `A6-ca-only.png`.
   - A7 Actions (TR-AC14): click Open Network Settings… on Flows (System Settings ▸ Network opens),
@@ -698,24 +779,27 @@ the TR-AC8 structural greps, Task 6, and the diff review.
   - B1 Launch; toolbar All Apps switch on; setup step 3; `scope.list` → `[]` (`…/bus-B1.json`).
   - B2 As found (TR-AC10, full): Flows "No flows yet" with both rows —
     `system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it`
-    (Open Network Settings…, Copy Address) and `All Apps on, nothing in scope — add a host`
+    (Open Network Settings…, Copy Address) and `Nothing is decrypted until a host is in Scope — add one`
     (Open Scope…), each with its detail line, then the CA row `HTTPS is not captured until the CA is trusted`
     (no button; `ca.status` → `…/bus-B2-ca.json`, every store `trusted: "no"` — TR-AC17). Status:
-    the same two route lines as `○` steps with the same buttons, `✓ All Apps is on` above the scope
-    step, and `○ Trust the aitmproxy CA` (no button) above the first-flow step; hover → the CA
+    `○` the system-proxy line (Open Network Settings…), `✓ All Apps is on`, `○ Add a host to Scope
+    (for now as example.com:443)` (Open Scope…; hover → the scope line), and `○ Trust the aitmproxy CA` (no button) above the first-flow step; hover → the CA
     detail. Nothing reads "trusted". → `B2-flows.png`, `B2-status.png`.
   - B3 Scope over the bus (TR-AC11): `scope.add example.com:443` (`…/bus-B3-add.json`), no app
-    interaction. Within one second both pages drop the All Apps line; the system-proxy line stays;
-    Status `scopeSet` reads `✓ Scope has 1 host`. `scope.remove example.com:443` → the line is back
+    interaction. Within one second both pages drop the scope line; the system-proxy line stays;
+    Status `scopeSet` reads `✓ Scope: 1 host decrypted`. `scope.remove example.com:443` → the line is back
     on both pages. → `B3-after-add-flows.png`, `B3-after-add-status.png`, `B3-after-remove-flows.png`.
   - B4 Banner (TR-AC13): scope `[]`; `curl -x 127.0.0.1:8080 http://example.com/` twice. Flows
-    shows the table and ONE banner line reading
-    `system proxy on · 127.0.0.1:9090, not this core · All Apps on, nothing in scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`
-    with Open Network Settings… and Open Scope…; no "No scope set" `ScopeBanner` and no "Flows
+    shows the table (plain-HTTP rows are readable and All Apps is on, so the Scope fact is not banner
+    material — spec D5) and ONE banner line reading `HTTPS is not captured until the CA is trusted`.
+    Then the operator turns the toolbar's All Apps switch OFF (real click; both routes closed): the
+    banner becomes exactly
+    `system proxy on · 127.0.0.1:9090, not this core · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`
+    with Open Network Settings… and All Apps Settings…; switch it back ON afterwards; no "No scope set" `ScopeBanner` and no "Flows
     carry no source app" line anywhere. Pinned, Domains and Apps show the same single line
     (Apps: rows present, Client column "—", exactly one banner). → `B4-flows-banner.png`,
     `B4-domains.png`, `B4-apps.png`.
-    `scope.add example.com:443` → the banner is exactly `HTTPS is not captured until the CA is trusted`
+    `scope.add example.com:443` (All Apps on again) → the banner is exactly `HTTPS is not captured until the CA is trusted`
     (a route is open, the CA is not trusted — TR-AC17) (`B4-ca-only-scope.png`).
     Header position (TR-AC19): on Apps with the single banner, record the column header's top edge
     (`…/B4-header-with-banner.txt`, from the screenshot's pixel row or the table header's AX frame);
@@ -732,6 +816,17 @@ the TR-AC8 structural greps, Task 6, and the diff review.
     `every proxy-aware app, regardless of Scope` / `in-scope hosts of every app`. → `B5-*.png`.
   - B6 Restore check: `diff proxy-before.txt proxy-after.txt` empty; `scope.list` → `[]`;
     `…/B6-restored-flows.png` shows the B2 lines.
+  - B8 Per-host decryption (TR-AC20, CONDITIONAL — run only if the installed build's core decrypts
+    per host and the SSL column shows a tunnel state; otherwise write `deferred: core story not in
+    this build` to `…/B8-deferred.txt`): with `-setwebproxy`/`-setsecurewebproxy` at 127.0.0.1:8080
+    (A4 recipe, originals recorded) and `scope.list` `[]`, Safari → `https://example.com/`: a row
+    appears with the SSL column in its tunnel state and no body; when every row is a tunnel (Edit ▸
+    Clear first, then the one request) the banner reads `Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — add one`
+    (CA untrusted on this Mac). `scope.add example.com:443` → the line leaves both pages,
+    `✓ Scope: 1 host decrypted`; the next request's row would decrypt only with a trusted CA, so on
+    Matt's Mac record the tunnel→scope transition and mark the decrypted-row half deferred with the CA
+    half (hard gate). `scope.remove`; restore the proxy. → `B8-tunnel-row.png`, `B8-banner.png`,
+    `B8-after-add.png`.
   - B7 CA fact, read-only (TR-AC17): `call("ca.status")` → `…/bus-B7-ca.json` quoted in the report
     (stores `user`/`system`: `installed`, `trusted: "no"`); the Flows and Status screenshots from B2
     and B4 are the evidence for the line, the step and the CA-only banner. **No `ca.install`, no
@@ -752,37 +847,36 @@ the TR-AC8 structural greps, Task 6, and the diff review.
 
 ## File-disjointness table
 
-| File | T1 | T2 | T3 | T4 | T5 | T6 |
-|---|---|---|---|---|---|---|
-| `AitmproxyKit/SystemProxyState.swift` (new) | C | | | | | |
-| `AitmproxyKit/ConnectionSummary.swift` | M | | | | | |
-| `Tests/AitmproxyKitTests/SystemProxyStateTests.swift` (new) | C | | | | | |
-| `Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` | M | | | | | |
-| `AitmproxyKit/CATrustFacts.swift` (new) | C | | | | | |
-| `AitmproxyKit/Panels/CAStatus.swift` (two additive fields) | M | | | | | |
-| `Tests/AitmproxyKitTests/CATrustFactsTests.swift` (new) | C | | | | | |
-| `Aitmproxy/Bus/SystemProxyReader.swift` (new) | | C | | | | |
-| `Aitmproxy/Bus/BusService.swift` | | M | | | | |
-| `Aitmproxy/Session.swift` | | M | | | | |
-| `Aitmproxy/Session+Connection.swift` | | M | | | | |
-| `Aitmproxy/Shell/RouteBanner.swift` (new) | | | C | | | |
-| `Aitmproxy/Shell/ShellView.swift` (two hunks + the `EmptyFlows` call; two old banner call sites removed) | | | M | | | |
-| `Aitmproxy/Panels/StatusPanel.swift` (two tokens) | | | M | | | |
-| `Aitmproxy/App.swift` | | | | M | | |
-| `AitmproxyKit/CommandMap.swift` | | | | M | | |
-| `Tests/AitmproxyKitTests/CommandMapTests.swift` | | | | M | | |
-| `apps/mac/docs/BRIEF.md` | | | | M | | |
-| `apps/mac/docs/GLOSSARY.md` | | | | M | | |
-| `apps/mac/docs/STORIES.md` | | | | M | | |
-| `apps/mac/tools/check-connection-words.sh` | | | | | M | |
-| `apps/mac/tools/check-capture-toggle.sh` (NS-AC8 banner pins) | | | | | M | |
-| (no repo files; `/tmp/claude/route-advice/`) | | | | | | — |
+| File | T1 | T1b | T2 | T2b | T3 | T4 | T5 | T6 |
+|---|---|---|---|---|---|---|---|---|
+| `AitmproxyKit/SystemProxyState.swift` (new) | C | | | | | | | |
+| `AitmproxyKit/ConnectionSummary.swift` | M | M (after T1 landed) | | | | | | |
+| `Tests/AitmproxyKitTests/SystemProxyStateTests.swift` (new) | C | | | | | | | |
+| `Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` | M | M (after T1 landed) | | | | | | |
+| `AitmproxyKit/CATrustFacts.swift`, `AitmproxyKit/Panels/CAStatus.swift` (two fields), `Tests/AitmproxyKitTests/CATrustFactsTests.swift` | — the CA-trust session's PR (gate 3); read-only here | | | | | | | |
+| `Aitmproxy/Bus/SystemProxyReader.swift` (new) | | | C | | | | | |
+| `Aitmproxy/Bus/BusService.swift` | | | M | M (after T2) | | | | |
+| `Aitmproxy/Session.swift` | | | M | M (after T2) | | | | |
+| `Aitmproxy/Session+Connection.swift` | | | M | M (after T2) | | | | |
+| `Aitmproxy/Shell/RouteBanner.swift` (new) | | | | | C | | | |
+| `Aitmproxy/Shell/ShellView.swift` (two hunks + the `EmptyFlows` call; two old banner call sites removed) | | | | | M | | | |
+| `Aitmproxy/Panels/StatusPanel.swift` (two tokens) | | | | | M | | | |
+| `Aitmproxy/App.swift` | | | | | | M | | |
+| `AitmproxyKit/CommandMap.swift` | | | | | | M | | |
+| `Tests/AitmproxyKitTests/CommandMapTests.swift` | | | | | | M | | |
+| `apps/mac/docs/BRIEF.md` | | | | | | M | | |
+| `apps/mac/docs/GLOSSARY.md` | | | | | | M | | |
+| `apps/mac/tools/check-connection-words.sh` | | | | | | | M | |
+| `apps/mac/tools/check-capture-toggle.sh` (NS-AC8 banner pins) | | | | | | | M | |
+| (no repo files; `/tmp/claude/route-advice/`) | | | | | | | | — |
 
-C = create, M = modify. No file appears in two columns; Tasks 3 and 4 may run as parallel
-Coders. Shared with the sibling icons plan on this branch: `Bus/BusService.swift`, `Session.swift`
-(its Tasks 5/6) — sequence, never concurrent. Not touched by anyone: `CaptureAdvice.swift`,
-`CaptureCapability.swift`, `Package.swift`, `UI/Tokens.swift`, `Bus/ExtensionController.swift`,
-`Panels/ScopePanel.swift`, `apps/mac/Extension/**`, `crates/**`.
+C = create, M = modify. A file in two columns is edited by the later task only after the earlier one
+has landed (T1→T1b, T2→T2b); no two tasks edit a file concurrently. Tasks 3 and 4 may run as
+parallel Coders; T1b may run beside Wave C/D. Shared with the sibling icons plan on this branch:
+`Bus/BusService.swift`, `Session.swift` (its Tasks 5/6) — sequence, never concurrent. Not touched by
+anyone here: `CaptureAdvice.swift`, `CaptureCapability.swift`, `Package.swift`, `UI/Tokens.swift`,
+`Bus/ExtensionController.swift`, `Panels/ScopePanel.swift`, `Panels/CAPanel.swift`,
+`apps/mac/docs/STORIES.md` (improve-loop session), `apps/mac/Extension/**`, `crates/**`.
 
 ## Acceptance-criteria coverage
 
@@ -799,11 +893,12 @@ Coders. Shared with the sibling icons plan on this branch: `Bus/BusService.swift
 | 12 | L | 6 (A3–A5, A8) |
 | 13 | L | 6 (A6 no-extension row; B4 composed banner, no old banners) |
 | 14 | L | 6 (A7, B5) |
-| 15 | K | 1 (`CATrustFactsTests`) |
-| 16 | K | 1 (`caTrust*` tests in `ConnectionSummaryTests`) |
-| 17 | L | 6 (A2/A6 CA row and CA-only banner on the dev bundle; B2/B4/B7 on the installed app) — NOT-trusted state only; hard gate |
-| 18 | K | 1 (`composedBanner`) |
+| 15 | K (contract) | the CA-trust session's PR (`CATrustFactsTests`); gate 3 |
+| 16 | K | 1b (`caTrust*` tests in `ConnectionSummaryTests`) |
+| 17 | L | 6 (A2/A6 CA row and CA-only banner on the dev bundle; B2/B4/B7 on the installed app) — NOT-trusted state only; hard gate; needs 1b/2b (gate 3) |
+| 18 | K | 1 (`composedBanner`), 1b (`composedBannerWithCA`) |
 | 19 | L | 6 (B4 header measurement, one banner on all four list pages), T (Task 5 NS-AC8 pins) |
+| 20 | L, conditional | 6 (B8; deferred until the per-host-decryption core story is in the installed build) |
 
 ## Plan-level calls (for Matt or the orchestrator to overturn; none blocks)
 
@@ -840,6 +935,18 @@ Coders. Shared with the sibling icons plan on this branch: `Bus/BusService.swift
 11. The CA step and the CA row ship with **no button**: no `ConnectionAction` reaches the CA page
     today and `.trustCA`/`.openCAPanel` are the sibling's. The CA page stays reachable from the
     sidebar and Proxy ▸ Certificate Authority….
+14. **Split for the CA-trust PR.** Task 1 lands the system-proxy / All Apps / Scope model with the
+    `.caTrust` kinds declared but never produced, so Tasks 2–5 and the non-CA halves of Task 6 do
+    not wait for gate 3; Task 1b/2b add the CA slot, derivation and read once the CA-trust PR is on
+    `main`. Yes, split: the first PR is complete and honest on its own (a nil `caTrust` renders
+    nothing, never "trusted"), and the second is small. If gate 3 is already met when Wave A starts,
+    1 and 1b may be one Coder sitting (same files, same tests), 2 and 2b likewise.
+13. Per-host decryption (spec amendment): `routes.scope` is its own entry; All Apps is open whenever
+    the extension is on (the Scope entry owns the empty-scope clause, so the composed banner never
+    repeats it); `tunnelledFlowCount` is counted in `Session+Connection` from `FlowRow.tls ==
+    .tunnelled` and is 0 until the core story lands, which makes `allTunnels` false and TR-AC20
+    deferred — a Coder adds no wire parsing for it (that is the core story's PR, which will extend
+    `FlowSummary`). `STORIES.md` leaves Task 4: the improve-loop session owns S-073/S-074/S-080.
 12. `check-capture-toggle.sh` is edited in Task 5 (NS-AC8 banner pins → `RouteBanner()`), so Task 3
     is expected to leave exactly those pins red until Task 5 lands; the waves stay as drawn (C then
     D), and the whole-branch run must be green. The `AppsAttributionBanner` struct is kept, not
@@ -858,6 +965,13 @@ Coders. Shared with the sibling icons plan on this branch: `Bus/BusService.swift
 - **Q3 (sibling, CA init).** `CATrustFacts(status:)` is specified failable here (plan call 10).
   Confirm with the system-proxy-automation session before Task 1 runs, or it adopts whatever that
   session has already landed, provided unknown never renders as trusted or not trusted.
+- **Q6 (orchestrator, gate 3).** The CA-trust session's PR number and merge SHA for gate 3, and
+  confirmation that it implements `CATrustFacts` exactly as spec D2 (failable `init?(status:)`,
+  `trustedScope`/`trustReported` on `CAStatus`); if its shape differs, this spec's D2 is amended
+  first and Task 1b follows the merged shape.
+- **Q5 (orchestrator, sequencing).** TR-AC20/B8 needs the per-host-decryption core story in the
+  installed build; if it ships after this plan, B8 is recorded as deferred and re-run with that
+  story's own live proof. Confirm which PR owns the `FlowSummary` → `.tunnelled` wire mapping.
 - **Q4 (Matt, not blocking).** The CA-trusted proof (step B8) exists only if Matt allows the aitm
   CA to be trusted on his Mac, in his own words; until then TR-AC17 is proved in its not-trusted
   form only and Shipped says so.
