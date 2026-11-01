@@ -161,7 +161,9 @@ crates/aitm-scan-http/
      `MAX_EXAMPLE_CHARS: usize = 64`, `MAX_SAFE_URL_CHARS: usize = 256`,
      `MAX_HELD_FLOWS: usize = 16`, `MAX_AWAIT: Duration = Duration::from_secs(30)`,
      `CANARY_EVERY: u32 = 25`, `MAX_SESSION_MONITORS: usize = 16`,
-     `MAX_HELD_CRAWL_BODY: usize = 64 * 1024`, `MARK_CRAWL: &str = "crawl"`.
+     `MAX_HELD_CRAWL_BODY: usize = 64 * 1024`, `MARK_CRAWL: &str = "crawl"`; added later:
+     `USER_AGENT: &str = "aitm-scan"` (Task 20 hoist), `JOB_MARK_PREFIX`/`job_mark()` and
+     `MAX_STORED_FLOWS: usize = 2048` (panel fix round).
   5. `hash.rs`: `pub(crate) fn fnv1a64(bytes: &[u8]) -> u64` (FNV-1a, 64-bit, offset basis
      `0xcbf2_9ce4_8422_2325`, prime `0x0000_0100_0000_01b3`).
 - **Test:** `hash::tests::fnv1a64_known_vectors`: `fnv1a64(b"") == 0xcbf2_9ce4_8422_2325`,
@@ -518,7 +520,10 @@ crates/aitm-scan-http/
   session cookie name (cookie kind) or a session header name (header kind, case-insensitive) in
   `opts.session`, or `is_secret_name(name)`. `example` = `redact::example(kind, name, value)`;
   for `param_name_*` the example is the key itself; for `entire_body` the first 64 chars scrubbed.
-  `url` = `scheme://authority/path?query` as captured; `method` = the request's; `flow` =
+  `url` = `scheme://authority/path?query` as captured, passed through `redact::safe_url`
+  (secret-keyed query values `<redacted>`, other values scrubbed, userinfo/fragment dropped,
+  bounded to `MAX_SAFE_URL_CHARS`; amended 2026-11-01 under the anti-goal "no result carries a
+  value", fix 21243e44); `method` = the request's; `flow` =
   `Some(FlowRef(flow.id))`; `site_node = None`; `frequency = 1`; `id =
   format!("{}:{}:{}", flow.id, kind_token(kind), ordinal)` (call A9). After collecting, drop
   kinds not in `opts.kinds` (count `kind_filtered`), drop points matching `ignore` (count
@@ -717,7 +722,8 @@ crates/aitm-scan-http/
   Values: Text/Textarea/Other → `aitm-<marker>`; Email → `aitm-<marker>@example.invalid`;
   Number/Tel → `1`; Url → `origin`; Password → `Aitm-<marker>!1`; Date → `2026-01-01`;
   Checkbox/Radio → the field's `value`; Select → first option (None when no options); Hidden →
-  the existing value (None when absent); File → None (skipped).
+  the existing value (None when absent); File → None as a pair (the client engine adds an inert
+  file part instead when the form is multipart, call A18 as amended).
 - **Test:** `value_pins` with marker `7f3a`, origin `http://t:8080`: Text `q` → `Some("aitm-7f3a")`;
   Email → `Some("aitm-7f3a@example.invalid")`; Password → `Some("Aitm-7f3a!1")`; Number → `Some("1")`;
   Url → `Some("http://t:8080")`; Select `["a","b"]` → `Some("a")`; Hidden value `"1"` → `Some("1")`;
@@ -1110,7 +1116,7 @@ crates/aitm-scan-http/
 
 | Task | Files |
 |---|---|
-| 1 | `crates/aitm-scan-http/Cargo.toml`, `src/lib.rs`, `src/limits.rs`, `src/hash.rs`, every placeholder listed in Task 1 |
+| 1 | `crates/aitm-scan-http/Cargo.toml`, `src/lib.rs`, `src/limits.rs`, `src/hash.rs`, every placeholder listed in Task 1, `Cargo.lock` (derived) |
 | 2 | `src/redact.rs` |
 | 3 | `src/url_norm.rs` |
 | 4 | `src/crawl/extract.rs` |
@@ -1222,9 +1228,13 @@ is touched by Task 20 alone (the one literal), so every commit on the branch kee
 - **A17** The log-site redaction rule is enforced by a `cargo test`-time lint in `redact.rs`
   (`include_str!` over the five network-facing files) in addition to the review item, so a later
   edit that logs a raw URL fails the gate.
-- **A18** Form field grouping: for checkbox/radio groups the checked field wins, else the first;
-  file inputs are skipped, so a multipart form is submitted as `application/x-www-form-urlencoded`
-  by the client engine (the browser engine submits whatever the page does).
+- **A18** Form field grouping: for checkbox/radio groups the checked field wins, else the first.
+  Amended 2026-11-01 (orchestrator, fix N2 in 171c8689): a form whose `enctype` is
+  `multipart/form-data` is submitted by the client engine as multipart (boundary derived from the
+  job marker), one part per generated pair plus one inert `text/plain` part named
+  `aitm-<marker>.txt` with body `aitm-<marker>` per `<input type="file">`; the upload of that inert
+  file is an accepted stimulus (same origin, bounded by `max_pages`). Other forms stay urlencoded.
+  The browser engine submits whatever the page does.
 - **A19** The stored-flow seeding (decision 6 (i)) also feeds up to 256 captured `GET` URLs into
   the crawl frontier as seeds, so proxied traffic widens the crawl and not only the site map.
 
@@ -1258,6 +1268,20 @@ Kept by the main session during stage 6. One row per finding.
 | 20 | Coder (stage 4) | Minor | R3: a crawl that failed mid-way lost the captures it had already produced | fixed in 1f753ce1 (store re-queried on `Err`; `Crawlers` injection seam for the test) |
 | 21 prep | Tester (stage 5) | Important | N1: `session.mode: none` still replayed a captured flow's own `Cookie`/`Authorization`, so AC T2-4's `none` half could not hold for a seed captured while logged in | fixed in bfe7b789 (strip at host construction and on `probe_raw`); plan amended (d1f5d359, 292e0d9d) |
 | 21 prep | Tester (stage 5) | Minor | N2: client crawler posted `multipart/form-data` forms as urlencoded (A18) | fixed in 171c8689 (multipart body with an inert file part) |
+| whole branch | Security + Quality (stage 6) | Critical | C1: `extract.rs::refresh_target` slices a byte index inside a multibyte char (`content="0;éé"`), panicking the discovery future | fix round A (pending SHA) |
+| whole branch | Security (stage 6) | Important | S-I1: JSON/XML secret detection reads the leaf name, not the path (`session.id`, `auth.value` leak an example and are mutated) | fix round B (pending SHA) |
+| whole branch | Security (stage 6) | Important | S-I2: browser form submission trusts the extractor's form index against a re-navigated live page; a JS-mounted third-party form could be posted off-origin before `left_scope` | fix round A: live form attributes verified before fill/submit; raw-text elements in the extractor |
+| whole branch | Security (stage 6) | Important | S-I3: browser crawl report holds every produced flow with full bodies (client engine truncates) | fix round A: shared held-copy truncation |
+| whole branch | Security (stage 6) | Minor | S-M1 path-segment `%` passthrough of SP/CR/LF; `probe_raw` method unvalidated | fix round B |
+| whole branch | Security (stage 6) | Minor | S-M2 path-borne tokens exposed as point name/example | fix round B: placeholder names for id-like segments, redacted examples for uuid/oid/hex/base64 |
+| whole branch | Security (stage 6) | Minor | S-M3 derived `Debug` on `JsonLeaf`, `SplitPath`, `Frontier` could print values/URLs | fix rounds A+B |
+| whole branch | Security (stage 6) | Minor | S-M4 `safe_query` matches keys before percent-decoding | fix round B |
+| whole branch | Security + Quality (stage 6) | Minor | S-M5 `SessionMonitors` eviction forgets a live job's lost state (>16 jobs) | fix round B: bounded lost-job set, rebuilt monitors start lost |
+| whole branch | Security (stage 6) | Minor | S-M6 `StoreDiff::snapshot` is O(store) per browser action | fix round A: one snapshot per page, running set |
+| whole branch | Security (stage 6) | Minor | S-M7 `stored_flows` uncapped clone with bodies | fix round A: `MAX_STORED_FLOWS` newest-first, bodies cleared |
+| whole branch | Quality (stage 6) | Minor | Q: job mark formatted in four places; stop reasons as literals; duplicate crawl request builders (+ seed sends ignoring `http.version`, Spec Minor); `attempts` counted in two places; `in_scope(&str)`; permit comment lie; checkbox rule twice; test-only `len/is_empty`; profile clone per host; hand-rolled `scrub_error`; visibility nits | fix rounds A+B |
+| whole branch | Quality (stage 6) | Minor | Three byte-search helpers and two `splice`s with different bad-span semantics; `visit`/`landed_page` repetition; constants pinned twice in tests | accepted by the orchestrator (autonomous mandate) 2026-11-01: `mutate.rs` guards every span before splicing (`checked_span`) so no runtime defect; a cross-parser helper refactor is out of proportion for this PR; `limits_match_the_plan` is the plan's own pin |
+| whole branch | Spec (stage 6) | Minor | `expect` missing from `EXCLUDED_HEADERS`; seed fetches ignore `http.version`; A18/Task 14 vs N2; Task 10 `url` wording; `Cargo.lock` under Task 1; `USER_AGENT` not in the constant list | code items in fix rounds A/B; plan items fixed in this commit |
 
 ## Shipped
 
