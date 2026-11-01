@@ -14,6 +14,19 @@ use aitm_poc::Severity;
 use aitm_testtarget::grader::{grade, GradeReport};
 use aitm_testtarget::manifest;
 
+/// The six M4 rows `one_reproduced_per_planted` reproduces; every other
+/// manifest row (the T10 seeds) must come back as `missing`. Mirrors
+/// `LEGACY_IDS` in `tests/target.rs` (separate test crates cannot share a
+/// const).
+const LEGACY_IDS: [&str; 6] = [
+    "reflected-xss-search-q",
+    "stored-xss-comments",
+    "ssrf-fetch-preview",
+    "idor-account",
+    "auth-bypass-admin-role",
+    "open-redirect-next",
+];
+
 fn at(secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
@@ -53,8 +66,8 @@ fn finding(
     }
 }
 
-/// One reproduced finding per planted vuln, each target a full origin URL whose
-/// path matches the planted path (IDOR uses a concrete id against the
+/// One reproduced finding per legacy planted vuln, each target a full origin
+/// URL whose path matches the planted path (IDOR uses a concrete id against the
 /// `/account/{id}` template).
 fn one_reproduced_per_planted() -> Vec<FindingRecord> {
     vec![
@@ -109,10 +122,19 @@ fn grade_counts_reproduced() {
     let report: GradeReport = grade(&findings);
 
     assert_eq!(report.planted, manifest().len());
-    assert_eq!(report.found, manifest().len());
-    assert_eq!(report.reproduced, manifest().len());
+    assert_eq!(report.found, 6);
+    assert_eq!(report.reproduced, 6);
     assert_eq!(report.false_positives, 0);
-    assert!(report.missing.is_empty(), "missing: {:?}", report.missing);
+    // Every row the six findings do not reproduce is reported missing, in
+    // manifest order: the grader's "missing" semantics for the T10 seeds are
+    // pinned here, not hidden.
+    let expected_missing: Vec<String> = manifest()
+        .iter()
+        .filter(|v| !LEGACY_IDS.contains(&v.id.as_str()))
+        .map(|v| v.id.clone())
+        .collect();
+    assert_eq!(expected_missing.len(), manifest().len() - 6);
+    assert_eq!(report.missing, expected_missing);
     assert!(
         report.spurious.is_empty(),
         "spurious: {:?}",
