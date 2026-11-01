@@ -170,6 +170,10 @@ G69. Test assertions in `tests/scan_v2_launch.rs`: delete the vacuous `contains(
 
 G70. Addendum to G41: `CLAMPED_MAX`/`CLAMPED_FIELD_MAX` move with `SAVED_NAME_MAX`/`SAVED_PATH_MAX` to the model with one doc line each.
 
+## Task 12 spec panel
+
+G71. `scan.map` is held by the UI-3 L4 gate (`crates/aitm-tui/src/app.rs` `scan_launch_v2`): the `blocked.is_some()` return applies to `scan.start` only; `scan.map` keeps the in-flight and origin-scope checks (D7 as amended: the engine forces `lanes: [http]` for a map). Test (`tests/scan_v2_launch.rs`): the L4-blocked draft with an in-scope origin gives no request on `s` and one `scan.map` on `m`.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
