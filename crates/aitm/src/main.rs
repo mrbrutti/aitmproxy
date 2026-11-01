@@ -25,6 +25,10 @@ use aitm::macos_capture::feeder;
 use aitm::macos_capture::peer_auth::CodeSignatureVerifier;
 use aitm::render::render_cli_value;
 use aitm::scripts::LateHandles;
+use aitm::startup::card::{ModeWord, ReadyInputs};
+use aitm::startup::errors::{exit_with, report_for, StartupError};
+use aitm::startup::log::{current_log_path, init_tracing, log_file_path, tui_log};
+use aitm::startup::{self, TermOpts};
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
 use aitm::wire::{
@@ -38,8 +42,10 @@ use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
 use aitm_sysproxy::{Recovery, SystemProxy};
+use aitm_term::error::ErrorReport;
+use aitm_term::reporter::Reporter;
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// The config file path when `--config` is not given.
 const CONFIG_ENV: &str = "AITM_CONFIG";
@@ -164,22 +170,28 @@ struct Bound {
 /// error) that error is returned and the system proxy is untouched: a core
 /// that cannot serve must never point the OS at itself, so nothing is left
 /// for the watchdog or the exit path to undo. Serving modes only (plan C5);
-/// a one-shot process never reaches this.
+/// a one-shot process never reaches this. The recovery outcome comes back
+/// beside the bound value (`Recovery::Nothing` when the mode does not manage
+/// the system proxy) so `run` reports it only when it did something
+/// (terminal-reporting plan C18).
 async fn bind_then_recover_system_proxy<T, F>(
     mode: &Mode,
     sysproxy: &SystemProxy,
     auto: bool,
     bind: F,
-) -> anyhow::Result<T>
+) -> anyhow::Result<(T, Recovery)>
 where
     F: Future<Output = anyhow::Result<T>>,
 {
     let bound = bind.await?;
-    if manages_system_proxy(mode) {
+    let recovery = if manages_system_proxy(mode) {
         let recovery = sysproxy.recover_at_startup(auto);
         log_recovery("startup", &recovery);
-    }
-    Ok(bound)
+        recovery
+    } else {
+        Recovery::Nothing
+    };
+    Ok((bound, recovery))
 }
 
 /// A recovery that failed is worth a `warn!` here; every other outcome the
@@ -223,12 +235,19 @@ struct Invocation {
     bus_endpoint_file: Option<PathBuf>,
     web_args: Option<WebArgs>,
     mode: Mode,
+    /// The global terminal flags (`-v`, `-vv`, `-q`, `--color`), split off
+    /// before anything else (terminal-reporting spec D9).
+    term: TermOpts,
 }
 
 /// Classify `argv`. `None` when `aitm web --help` printed its usage and
 /// there is nothing to run. A mode usage error prints its line and exits 2
 /// (nothing has been built yet, so nothing needs tearing down).
 fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
+    let (term, argv) = match startup::split_term_args(argv) {
+        Ok(split) => split,
+        Err(text) => exit_with(&ErrorReport::usage(text), None),
+    };
     let (config_arg, argv) = split_config_arg(argv)?;
     let (script_args, argv) = split_script_args(argv)?;
     let (bus_endpoint_file, argv) = split_bus_endpoint_file_arg(argv)?;
@@ -238,7 +257,7 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     let web_args: Option<WebArgs> = match argv.first().map(String::as_str) {
         Some("web") => match web::parse_args(&argv[1..])? {
             WebCommand::Help => {
-                print!("{}", web::USAGE);
+                startup::write_stdout(web::USAGE)?;
                 return Ok(None);
             }
             WebCommand::Run(args) => Some(args),
@@ -247,10 +266,7 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     };
     let mode = match parse_mode(argv) {
         Ok(mode) => mode,
-        Err(usage) => {
-            eprintln!("{usage}");
-            std::process::exit(2);
-        }
+        Err(usage) => exit_with(&report_for(&anyhow::anyhow!(usage), None), None),
     };
     Ok(Some(Invocation {
         config_arg,
@@ -258,6 +274,7 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
         bus_endpoint_file,
         web_args,
         mode,
+        term,
     }))
 }
 
@@ -265,10 +282,34 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
 /// workers get a stack sized for script evaluation: a hook runs on the worker
 /// that dispatches it (`block_in_place`), and Rhai recurses once per nesting
 /// level of a value — see `aitm_plugin_rhai::engine::WORKER_STACK_SIZE`.
-fn main() -> anyhow::Result<()> {
-    let Some(invocation) = parse_invocation(std::env::args().skip(1).collect())? else {
-        return Ok(());
+fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // `--version` / `--help` are answered before anything boots: no mode
+    // parse, no runtime, no config read, no tracing sink (spec D8). A closed
+    // stdout changes nothing: the text was all there was to say.
+    if let Some(pre) = startup::pre_boot(&argv) {
+        let _ = match pre {
+            startup::PreBoot::Version => {
+                startup::write_stdout(&format!("{}\n", startup::version_line()))
+            }
+            startup::PreBoot::Help => startup::write_stdout(startup::SYNOPSIS),
+        };
+        std::process::exit(0);
+    }
+    let invocation = match parse_invocation(argv) {
+        Ok(Some(invocation)) => invocation,
+        Ok(None) => return,
+        Err(e) => exit_with(&report_for(&e, None), None),
     };
+    // The one reporter for this process (spec D4): it draws the checklist in
+    // the serving modes only (plan C4) and shortens paths to `~` on a TTY (C7).
+    let caps = invocation.term.detect_caps();
+    let reporter = Reporter::stderr(caps, invocation.term.verbosity)
+        .checklist(matches!(
+            invocation.mode,
+            Mode::Server | Mode::Web | Mode::Tui
+        ))
+        .with_home(std::env::var_os("HOME").map(PathBuf::from));
     // The two modes that exit before anything is built — no config load, no
     // tracing sink, no service, no runtime — are dispatched here, in one
     // place, so `run` only ever sees a mode that serves something.
@@ -297,48 +338,77 @@ fn main() -> anyhow::Result<()> {
                 .clone()
                 .or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from))
                 .unwrap_or_else(config_file::default_config_path);
-            let written = operator_token::generate_and_store(&config_path, *force)?;
-            println!("{}", operator_token::confirmation_message(&written));
-            return Ok(());
+            let written = match operator_token::generate_and_store(&config_path, *force) {
+                Ok(written) => written,
+                Err(e) => exit_with(&report_for(&e, None), Some(&reporter)),
+            };
+            let confirmation = format!("{}\n", operator_token::confirmation_message(&written));
+            if let Err(e) = startup::write_stdout(&confirmation) {
+                exit_with(&report_for(&anyhow::Error::new(e), None), Some(&reporter));
+            }
+            return;
         }
         Mode::Server | Mode::Cli(_) | Mode::Tui | Mode::Web => {}
     }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(aitm_plugin_rhai::engine::WORKER_STACK_SIZE)
-        .build()?;
-    runtime.block_on(run(invocation))
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => exit_with(&report_for(&anyhow::Error::new(e), None), Some(&reporter)),
+    };
+    // On failure the panel is rendered through the same reporter the phases
+    // used (`exit_with` ends the live region itself; a `finish()` first would
+    // turn the TTY panel into its piped form), with the log file as footer.
+    match runtime.block_on(run(invocation, reporter.clone())) {
+        Ok(()) => reporter.finish(),
+        Err(e) => exit_with(
+            &report_for(&e, current_log_path().as_deref()),
+            Some(&reporter),
+        ),
+    }
 }
 
-async fn run(invocation: Invocation) -> anyhow::Result<()> {
+async fn run(invocation: Invocation, reporter: Reporter) -> anyhow::Result<()> {
     let Invocation {
         config_arg,
         script_args,
         bus_endpoint_file,
         web_args,
         mode,
+        term,
     } = invocation;
+    // The header opens the checklist in the serving modes only (plan C4); a
+    // one-shot verb prints nothing unless a phase runs long (spec D12).
+    if manages_system_proxy(&mode) {
+        reporter.header("aitmproxy", env!("CARGO_PKG_VERSION"));
+    }
     let web_settings = match &web_args {
         Some(args) => Some(args.resolve(|k| std::env::var(k).ok())?),
         None => None,
     };
-    // The TUI owns the terminal, so its subscriber must not write there.
-    // (`OperatorToken` and `SysproxyWatchdog` never reach here: `main`
-    // dispatched both before the runtime was built. Their arms stay so the
-    // match is exhaustive over `Mode` rather than hiding behind `_`.)
-    let tui_log = match mode {
-        Mode::Tui => tui::init_tracing(),
-        Mode::Server
-        | Mode::Cli(_)
-        | Mode::Web
-        | Mode::OperatorToken { .. }
-        | Mode::SysproxyWatchdog { .. } => {
-            init_tracing();
-            TuiLog::Off
-        }
+    // The log file and the three-layer tracing composition (spec D7, D11):
+    // the file always; in tui mode nothing else, because ratatui owns the
+    // terminal after the handover (plan C14). (`OperatorToken` and
+    // `SysproxyWatchdog` never reach here: `main` dispatched both before the
+    // runtime was built.)
+    let tui = mode == Mode::Tui;
+    let log_path = log_file_path(tui, &|k| std::env::var(k).ok());
+    let sink = init_tracing(&term, &reporter, &log_path, tui);
+    let tui_log = if tui {
+        tui_log(&sink, &log_path)
+    } else {
+        TuiLog::Off
     };
 
     let config_path = config_arg.or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from));
+    // The file `load_settings` reads, or the default it falls back to when
+    // nothing names one: the phase line and the remedies name it.
+    let effective_path = config_path
+        .clone()
+        .unwrap_or_else(config_file::default_config_path);
+    let phase = reporter.phase("reading config");
     let Settings {
         core: mut cfg,
         rhai: mut rhai_cfg,
@@ -347,7 +417,22 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         // The `system_proxy:` section: `wire.rs` builds the `SystemProxy`
         // engine from it, and `auto` drives the startup recovery below.
         system_proxy,
-    } = config_file::load_settings(config_path.as_deref())?;
+    } = phase.finish_with(
+        config_file::load_settings(config_path.as_deref()).map_err(|e| StartupError::ConfigFile {
+            path: effective_path.clone(),
+            source: e,
+        }),
+        |_| {
+            if effective_path.exists() {
+                format!("config {}", reporter.display_path(&effective_path))
+            } else {
+                format!(
+                    "config defaults · {} not found",
+                    reporter.display_path(&effective_path)
+                )
+            }
+        },
+    )?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
     // `--bus-endpoint-file` wins over the config's `endpoint_file`; it only means
@@ -420,7 +505,11 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     if let Some(lang) = &ws_language {
         languages.push(lang.as_ref());
     }
-    let tier = aitm_plugin_rhai::wire::build_with_languages(rhai_cfg, script_services, &languages)?;
+    let phase = reporter.phase("loading detections");
+    let tier = phase.finish_with(
+        aitm_plugin_rhai::wire::build_with_languages(rhai_cfg, script_services, &languages),
+        |tier| format!("{} detections ready", tier.host.set().names().len()),
+    )?;
     // The language only had to live long enough to install its host fns on the engine
     // (which holds its own `Arc` clones of the shared state); drop the borrow so the
     // shared handle can move into `Features` below.
@@ -450,13 +539,13 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         warn!(target: "aitm::scripts", "{err}");
     }
     if strict && !tier.errors.is_empty() {
-        anyhow::bail!(
-            "{} script(s) failed to load and `rhai.strict` is set",
-            tier.errors.len()
-        );
+        return Err(StartupError::StrictScripts {
+            failed: tier.errors.len(),
+        }
+        .into());
     }
     for name in tier.host.set().names() {
-        info!(target: "aitm::scripts", script = %name, "script loaded into the host");
+        debug!(target: "aitm::scripts", script = %name, "script loaded into the host");
     }
     // Scripts see bodies up to the proxy's configured cap; the engine's string
     // and blob limits default to the same figure, and must keep up with it.
@@ -491,6 +580,10 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         system_proxy: system_proxy.clone(),
         ..Features::default()
     };
+    // Whether assembly mints the CA or loads it is read off the key file's
+    // existence before the call (`wire.rs` is frozen; spec D10).
+    let had_key = cfg.ca.dir.join("ca.key").exists();
+    let phase = reporter.phase("preparing CA");
     let assembled = assemble_with_scripts(
         &cfg,
         &features,
@@ -507,7 +600,14 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
             // command host at invocation time (`FindingsPlugin::store_for`).
             commands: vec![Box::new(tier.commands), Box::new(FindingsPlugin::new())],
         },
-    )?;
+    );
+    let assembled = phase.finish_with(assembled, |assembled| {
+        format!(
+            "CA {} · {}",
+            if had_key { "loaded" } else { "created" },
+            reporter.display_path(assembled.ca.cert_path())
+        )
+    })?;
     let governance = assembled.governance();
     let Assembled {
         proxy,
@@ -556,10 +656,10 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                 stdout.flush()?;
                 return Ok(());
             }
-            Err(err) => {
-                eprintln!("{err}");
-                std::process::exit(1);
-            }
+            Err(err) => exit_with(
+                &report_for(&err, current_log_path().as_deref()),
+                Some(&reporter),
+            ),
         }
     }
 
@@ -580,17 +680,9 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     // The bound addresses are read inside this block too: after the startup set,
     // no `?` remains before the `select!`, so the §D9 (a) restore below is reached
     // on every path.
-    let config_display = config_path
-        .unwrap_or_else(config_file::default_config_path)
-        .display()
-        .to_string();
-    let Bound {
-        proxy_listener,
-        browser_listener,
-        web_listener,
-        proxy_addr,
-        browser_addr,
-    } = bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
+    let config_display = effective_path.display().to_string();
+    let phase = reporter.phase("binding ports");
+    let bound = bind_then_recover_system_proxy(&mode, &sysproxy, system_proxy.auto, async {
         let proxy_listener = bind_service_port(
             cfg.listen,
             "the proxy",
@@ -642,7 +734,31 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
             browser_addr,
         })
     })
-    .await?;
+    .await;
+    let (
+        Bound {
+            proxy_listener,
+            browser_listener,
+            web_listener,
+            proxy_addr,
+            browser_addr,
+        },
+        recovery,
+    ) = phase.finish_with(bound, |(bound, _)| {
+        let mut summary = format!(
+            "proxy listening {} · browser proxy {}",
+            bound.proxy_addr, bound.browser_addr
+        );
+        if let Some((_, addr)) = &bound.web_listener {
+            summary.push_str(&format!(" · web UI listening {addr}"));
+        }
+        summary
+    })?;
+    // Shown only when the recovery did something (plan C18); a failed one is
+    // already a `warn!` that reaches the view through the tracing layer.
+    if let Some(summary) = startup::card::recovery_summary(&recovery) {
+        reporter.phase("restoring system proxy").done(&summary);
+    }
 
     // Self-exclusion of the core's own listeners (L4PAR-AC34, spec §2.1): the
     // bound proxy, browser-proxy and (for `aitm web`) web UI ports top up the set
@@ -678,18 +794,38 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     let mut browser_cfg = cfg.browser.clone();
     browser_cfg.obscura.allow_private =
         engine_may_reach_private(&cfg.browser.ssrf, &cfg.scope.entries);
+    let phase = reporter.phase("starting obscura");
     let launched = match aitm_browser::launch_owned(&browser_cfg, ca.cert_path()).await {
-        Ok(l) => Some(l),
+        Ok(l) => {
+            phase.done(&startup::card::browser_summary(
+                &cfg.browser.engine,
+                l.version(),
+            ));
+            Some(l)
+        }
         Err(e) => {
+            // The WARN reaches the view through the tracing layer; the phase
+            // itself ends done, not failed (spec D10).
             warn!(
                 engine = ?cfg.browser.engine,
                 error = %e,
                 "embedded browser unavailable; browser.* commands will error"
             );
+            phase.done("browser unavailable");
             None
         }
     };
     let browser: Option<Arc<dyn BrowserDriver>> = launched.as_ref().map(|l| l.driver.clone());
+    // The trust read shells out to the OS store, so it exists only in the
+    // serving modes (spec amendment A); a one-shot verb returned above.
+    let ca_trust = if manages_system_proxy(&mode) {
+        let phase = reporter.phase("checking CA trust");
+        let word = startup::card::read_ca_trust(&cfg.ca.dir);
+        phase.done(startup::card::ca_phase_summary(word));
+        word
+    } else {
+        None
+    };
     // Shared service handles for the frontends and the replay client.
     let services = tui::services(&proxy, &cfg, browser.clone(), tui_log);
 
@@ -760,7 +896,33 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
             info!(target: "aitm", "{advice}");
         }
     }
+    // The ready card (spec D10): M1 for bare `aitm`, M6 for `aitm web`, none
+    // for `aitm tui`, whose status bar is the card (D11). On stderr, so stdout
+    // stays free for stdio MCP; the URL rows carry the bridge tokens on purpose.
+    let print_ready_card = |mode: ModeWord, web_url: Option<&str>, operator_url: Option<&str>| {
+        reporter.card(&startup::card::ready_card(&ReadyInputs {
+            mode,
+            proxy: proxy_addr,
+            browser: browser_addr,
+            // The Web card's `Bus` row is always `ready` (M6); the transport
+            // word is the Server card's.
+            bus: startup::card::bus_word(&cfg.mcp.transport),
+            web_url,
+            operator_url,
+            ca: ca_trust,
+            scope_hosts: cfg.scope.entries.len(),
+            system_proxy: &sysproxy.summary(),
+            intercept_armed: false,
+            capture_paused: false,
+            log: sink.path.as_deref(),
+            home: reporter.display_home(),
+        }));
+        reporter.finish();
+    };
     let result = if mode == Mode::Tui {
+        // The handover (spec D11): the checklist is erased up to the header
+        // before ratatui takes the alternate screen.
+        reporter.finish_and_clear();
         // `aitm tui`: the loopback agent server is built by `tui::build_servers`
         // on the core's shared policy state and audit ring (the `governance`
         // passed here, from `assembled.governance()` above) through
@@ -861,23 +1023,13 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                 // all) and its address read there, so here we just serve on it.
                 let url = web::ui_url(bound, &settings.token);
                 // Log only the bound address; the token must never reach a
-                // tracing sink. The one-time summary println is the operator's
-                // link — its URLs carry the token on purpose (stdout, not logs).
+                // tracing sink. The ready card is the operator's link — its
+                // URLs carry the token on purpose (stderr, not logs).
                 web::log_listening(bound);
                 let operator_url = operator_token
                     .as_ref()
                     .map(|op| web::operator_ui_url(bound, op));
-                println!(
-                    "{}",
-                    web::startup_summary(
-                        &url,
-                        operator_url.as_deref(),
-                        proxy_addr,
-                        browser_addr,
-                        "ready",
-                        launch_advice,
-                    )
-                );
+                print_ready_card(ModeWord::Web, Some(&url), operator_url.as_deref());
                 Some((listener, state))
             }
             _ => None,
@@ -888,6 +1040,10 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                 None => std::future::pending().await,
             }
         };
+
+        if mode == Mode::Server {
+            print_ready_card(ModeWord::Server, None, None);
+        }
 
         // The main listener relays client traffic; the browser listener is
         // SSRF-filtered (the embedded browser dials `cfg.browser.proxy_addr`).
@@ -1040,45 +1196,6 @@ fn apply_bus_endpoint_file(
     }
 }
 
-/// The curated default tracing directive used when `RUST_LOG` is unset (AC3).
-///
-/// Operator-relevant lifecycle on the `aitm*` targets ("proxy listening", the
-/// obscura start/stop/attach lines) stays at `info`, while the noisy transport
-/// and browser dependencies are pinned to `warn` so a normal browsing session
-/// does not bury the useful lines under per-connection dependency chatter.
-/// Benign per-connection disconnects are already emitted at `debug` (Task 1),
-/// so the `info` baseline hides them without a per-target pin. `RUST_LOG`, when
-/// set, overrides this wholesale (see [`build_env_filter`]).
-const DEFAULT_LOG_DIRECTIVE: &str = "info,\
-    chromiumoxide=warn,\
-    tungstenite=warn,\
-    tokio_tungstenite=warn,\
-    hyper=warn,\
-    hyper_util=warn,\
-    rustls=warn,\
-    tower=warn,\
-    reqwest=warn";
-
-/// Build the server path's `EnvFilter`: `rust_log` (the `RUST_LOG` value) when it
-/// is set and non-empty overrides the default wholesale; otherwise the curated
-/// [`DEFAULT_LOG_DIRECTIVE`] is used. Both parse lossily, so a malformed
-/// directive drops the bad part rather than failing startup.
-fn build_env_filter(rust_log: Option<String>) -> tracing_subscriber::EnvFilter {
-    use tracing_subscriber::EnvFilter;
-    match rust_log.filter(|v| !v.trim().is_empty()) {
-        Some(directive) => EnvFilter::new(directive),
-        None => EnvFilter::new(DEFAULT_LOG_DIRECTIVE),
-    }
-}
-
-/// Install a tracing subscriber: `RUST_LOG`-driven, defaulting to the curated
-/// quiet filter ([`DEFAULT_LOG_DIRECTIVE`]).
-fn init_tracing() {
-    use tracing_subscriber::fmt;
-    let filter = build_env_filter(std::env::var("RUST_LOG").ok());
-    let _ = fmt().with_env_filter(filter).try_init();
-}
-
 /// Bind one service port up front, turning "address already in use" into a
 /// single clear, actionable error — the port, who most likely holds it, and how
 /// to change it — so a conflict surfaces here, before obscura is spawned and
@@ -1100,16 +1217,14 @@ async fn bind_service_port(
 }
 
 /// The one "already in use" error [`bind_service_port`] returns: the port, who
-/// most likely holds it, and how to change it.
+/// most likely holds it, and how to change it. Typed, so the error panel can
+/// be exact; its `Display` is 0.5.10's four lines verbatim (spec D6).
 fn addr_in_use_error(addr: std::net::SocketAddr, role: &str, remedy: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "cannot start: {role} port {addr} is already in use.\n\
-         It is most likely held by another running `aitm`, the aitmproxy macOS app's \
-         embedded core, or another program.\n\
-         {remedy}\n\
-         Find the holder with:  lsof -nP -iTCP:{port} -sTCP:LISTEN",
-        port = addr.port(),
-    )
+    anyhow::Error::new(StartupError::PortInUse {
+        role: role.to_string(),
+        addr,
+        remedy: remedy.to_string(),
+    })
 }
 
 #[cfg(test)]
@@ -1130,10 +1245,12 @@ mod tests {
 
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
-        build_env_filter, configured_agent_port, manages_system_proxy, parse_invocation,
-        parse_mode, split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation,
-        Mode, OPERATOR_TOKEN_USAGE,
+        configured_agent_port, manages_system_proxy, parse_invocation, parse_mode,
+        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation, Mode,
+        StartupError, TermOpts, OPERATOR_TOKEN_USAGE,
     };
+    use aitm_sysproxy::Recovery;
+    use aitm_term::caps::{ColorChoice, Verbosity};
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
@@ -1242,68 +1359,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// Install a subscriber with `filter` over a buffer, run `f`, and return
-    /// everything it emitted — so a test can assert which targets/levels survive.
-    fn capture_with_filter(filter: tracing_subscriber::EnvFilter, f: impl FnOnce()) -> String {
-        let buf = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_env_filter(filter)
-            .with_writer(BufWriter(buf.clone()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let bytes = buf.lock().unwrap().clone();
-        String::from_utf8(bytes).unwrap()
-    }
-
-    #[test]
-    fn default_filter_quiets_connection_noise() {
-        // AC3: the curated default (no RUST_LOG) keeps operator lifecycle while
-        // silencing per-connection dependency chatter and benign disconnects.
-        let out = capture_with_filter(build_env_filter(None), || {
-            tracing::info!(target: "aitm_core::proxy", "proxy listening");
-            tracing::info!(target: "chromiumoxide", "cdp event spam");
-            tracing::debug!(target: "aitm_core::proxy", "connection closed before completion");
-        });
-        assert!(
-            out.contains("proxy listening"),
-            "operator lifecycle must survive the default filter: {out:?}"
-        );
-        assert!(
-            !out.contains("cdp event spam"),
-            "noisy dependency target must be pinned below info: {out:?}"
-        );
-        assert!(
-            !out.contains("connection closed before completion"),
-            "benign per-connection debug must stay hidden at the info baseline: {out:?}"
-        );
-    }
-
-    #[test]
-    fn rust_log_overrides_the_curated_default() {
-        // AC3: RUST_LOG overrides the curated default wholesale — a directive that
-        // raises a pinned dependency to trace makes its trace events appear.
-        let out = capture_with_filter(build_env_filter(Some("chromiumoxide=trace".into())), || {
-            tracing::trace!(target: "chromiumoxide", "cdp trace restored");
-        });
-        assert!(
-            out.contains("cdp trace restored"),
-            "RUST_LOG must override the curated default wholesale: {out:?}"
-        );
-    }
-
-    #[test]
-    fn empty_rust_log_falls_back_to_the_curated_default() {
-        // An empty RUST_LOG is treated as unset, not as "disable everything".
-        let out = capture_with_filter(build_env_filter(Some("   ".into())), || {
-            tracing::info!(target: "aitm_core::proxy", "proxy listening");
-        });
-        assert!(
-            out.contains("proxy listening"),
-            "an empty RUST_LOG must fall back to the curated default: {out:?}"
-        );
     }
 
     #[test]
@@ -1654,6 +1709,10 @@ mod tests {
                 .starts_with("cannot start: the proxy port 127.0.0.1:18080 is already in use."),
             "{err}"
         );
+        assert!(
+            err.downcast_ref::<StartupError>().is_some(),
+            "the port conflict is typed so its panel can be exact (spec D6): {err:?}"
+        );
         assert_eq!(
             mutating_lines(&exec),
             Vec::<String>::new(),
@@ -1677,20 +1736,24 @@ mod tests {
     #[tokio::test]
     async fn startup_recovery_sets_the_system_proxy_once_the_ports_are_bound() {
         let (exec, sp, dir) = scripted_sysproxy("bound");
-        let bound =
+        let (bound, recovery) =
             bind_then_recover_system_proxy(&Mode::Cli(args(&["flow", "list"])), &sp, true, async {
                 Ok(("proxy", "browser"))
             })
             .await
             .unwrap();
         assert_eq!(bound, ("proxy", "browser"));
+        assert!(
+            matches!(recovery, Recovery::Nothing),
+            "a one-shot mode never recovers: {recovery:?}"
+        );
         assert_eq!(
             exec.runs(),
             Vec::<String>::new(),
             "a one-shot mode never recovers"
         );
 
-        let bound = bind_then_recover_system_proxy(&Mode::Server, &sp, true, async {
+        let (bound, recovery) = bind_then_recover_system_proxy(&Mode::Server, &sp, true, async {
             Ok(("proxy", "browser"))
         })
         .await
@@ -1699,6 +1762,10 @@ mod tests {
             bound,
             ("proxy", "browser"),
             "the bound listeners come back untouched"
+        );
+        assert!(
+            matches!(recovery, Recovery::Set(_)),
+            "`auto` set the system proxy: {recovery:?}"
         );
         assert_eq!(
             mutating_lines(&exec),
@@ -1827,9 +1894,11 @@ mod tests {
                 bus_endpoint_file,
                 web_args,
                 mode,
+                term,
             } = parse_invocation(argv.clone())
                 .expect("parses")
                 .expect("something to run");
+            assert_eq!(term, TermOpts::default(), "{argv:?}");
             assert_eq!(
                 mode,
                 Mode::SysproxyWatchdog {
@@ -1848,5 +1917,22 @@ mod tests {
             assert!(bus_endpoint_file.is_none(), "{argv:?}");
             assert!(web_args.is_none(), "{argv:?}");
         }
+    }
+
+    /// Spec D9: the global terminal flags are split off first and ride in the
+    /// invocation; the mode is classified from what is left.
+    #[test]
+    fn invocation_carries_the_term_opts() {
+        let invocation = parse_invocation(args(&["-q", "--color=never", "scope", "list"]))
+            .expect("parses")
+            .expect("something to run");
+        assert_eq!(
+            invocation.term,
+            TermOpts {
+                verbosity: Verbosity::Quiet,
+                color: ColorChoice::Never,
+            }
+        );
+        assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list"])));
     }
 }

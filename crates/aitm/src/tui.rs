@@ -22,19 +22,14 @@
 //! a minute at idle) would flood it.
 //!
 //! Logging: a `tracing` subscriber writing to stdout or stderr would paint
-//! over the UI, so [`init_tracing`] writes to a file when `RUST_LOG` is set
-//! and installs nothing when it is not. The file is `$AITM_TUI_LOG` when that
-//! is set (created or appended to), else `aitm-tui-<pid>.log` under the
-//! system temp directory, made fresh for this run; either way it is opened
-//! owner-read/write only (`0600`) on Unix because the temp directory is
-//! shared. The outcome — path, or why there is no log — is the UI's startup
-//! toast ([`TuiLog::startup_note`]).
+//! over the UI, so in tui mode the shared composition in
+//! [`crate::startup::log`] installs the file layer only: the log is
+//! `<aitm dir>/logs/aitm.log`, overridable with `AITM_LOG_FILE` and, for one
+//! more release, [`LOG_PATH_ENV`]. The outcome — path, or why there is no
+//! log — is the UI's startup toast ([`TuiLog::startup_note`]).
 
-use std::ffi::OsStr;
-use std::fs::{File, OpenOptions};
-use std::io;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aitm_bus_client::InProcessHandler;
@@ -56,13 +51,6 @@ pub const LOG_PATH_ENV: &str = "AITM_TUI_LOG";
 
 /// How often the TUI polls `flow.list` (F4 push is not on the bus yet).
 const POLL: Duration = Duration::from_millis(500);
-
-/// The default log file name under [`std::env::temp_dir`] when `RUST_LOG` is
-/// set and [`LOG_PATH_ENV`] is not: one per process, so no run writes through
-/// a file another run — or another user, in the shared temp dir — left there.
-pub fn default_log_file_name() -> String {
-    format!("aitm-tui-{}.log", std::process::id())
-}
 
 /// Where tui-mode tracing went, for the startup toast.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,7 +88,8 @@ pub struct Services {
     /// The proxy's live browser-egress posture (`Proxy::egress()`), shared with
     /// every frontend so `browser.confine` flips the connector's real posture.
     pub egress: Arc<EgressConfinement>,
-    /// Where tui-mode tracing went (see [`init_tracing`]), for the startup toast.
+    /// Where tui-mode tracing went (see [`crate::startup::log::tui_log`]),
+    /// for the startup toast.
     pub log: TuiLog,
 }
 
@@ -210,71 +199,6 @@ pub fn with_shared_governance(
     server
         .with_agent_state(Arc::clone(agent_state))
         .with_audit_ring(Arc::clone(audit_ring))
-}
-
-/// Where the tui-mode log goes: `explicit` (the value of [`LOG_PATH_ENV`])
-/// when set and non-empty, else [`default_log_file_name`] under the system
-/// temp dir.
-pub fn log_path_from(explicit: Option<&OsStr>) -> PathBuf {
-    match explicit {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => std::env::temp_dir().join(default_log_file_name()),
-    }
-}
-
-/// Open the log file, readable and writable by the owner only on Unix (the
-/// default temp directory is world-readable). An explicit path (`append`)
-/// is created or appended to. The default path is made fresh: whatever sits
-/// there is removed and the file created with `create_new`, so a file or
-/// link planted at the predictable name is never written through; if
-/// something lands in the window between the two steps, the open fails and
-/// the caller leaves logging off.
-pub fn open_log_file(path: &Path, append: bool) -> io::Result<File> {
-    let mut opts = OpenOptions::new();
-    if append {
-        opts.create(true).append(true);
-    } else {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-        opts.write(true).create_new(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
-    }
-    opts.open(path)
-}
-
-/// Install the `tui`-mode tracing subscriber: file-backed when `RUST_LOG` is
-/// set, nothing otherwise. Never writes to the terminal. A log file that
-/// cannot be opened disables logging rather than failing the run; the
-/// returned [`TuiLog`] says which happened.
-pub fn init_tracing() -> TuiLog {
-    use tracing_subscriber::{fmt, EnvFilter};
-    let Ok(filter) = EnvFilter::try_from_default_env() else {
-        return TuiLog::Off;
-    };
-    let explicit = std::env::var_os(LOG_PATH_ENV).filter(|p| !p.is_empty());
-    let path = log_path_from(explicit.as_deref());
-    let file = match open_log_file(&path, explicit.is_some()) {
-        Ok(f) => f,
-        Err(e) => {
-            return TuiLog::Unavailable {
-                path,
-                why: e.to_string(),
-            }
-        }
-    };
-    let _ = fmt()
-        .with_env_filter(filter)
-        .with_ansi(false)
-        .with_writer(Mutex::new(file))
-        .try_init();
-    TuiLog::File(path)
 }
 
 /// The two servers `aitm tui` runs over one proxy: the agent-facing one on the
@@ -423,6 +347,7 @@ mod tests {
     use super::*;
     use aitm_core::{AgentPolicy, AuditResult};
     use aitm_proto_l4::guard::L4Guard;
+    use std::io;
 
     /// L4PAR-AC34 / spec §2.1 (security Critical, second half), live: an agent
     /// `McpServer` on loopback TCP port 0 with [`crate::wire::self_port_hook`]
@@ -516,91 +441,6 @@ mod tests {
             .next()
             .expect("the test module follows `run`");
         assert!(run_body.contains("attach_bound_hook(agent, on_agent_bound)"));
-    }
-
-    /// SEC-3: the default log is per process (`aitm-tui-<pid>.log`), so two
-    /// `aitm tui` runs never share a file in the world-writable temp dir;
-    /// `AITM_TUI_LOG` names an explicit path.
-    #[test]
-    fn the_log_path_defaults_to_a_per_process_file_and_honours_the_override() {
-        let default = std::env::temp_dir().join(format!("aitm-tui-{}.log", std::process::id()));
-        assert_eq!(log_path_from(None), default);
-        assert_eq!(log_path_from(Some(OsStr::new(""))), default);
-        assert_eq!(
-            log_path_from(Some(OsStr::new("/var/log/aitm/tui.log"))),
-            PathBuf::from("/var/log/aitm/tui.log")
-        );
-    }
-
-    /// SEC-3: the default file is opened fresh — whatever sits at the path
-    /// is removed and the file created anew (`create_new`), owner-only — so
-    /// a file planted there before the run is never written through.
-    #[test]
-    fn the_default_log_file_is_created_fresh_owner_only_and_fails_closed() {
-        use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!("aitm-tui-log-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("aitm-tui-fresh.log");
-        std::fs::write(&path, "planted before the run\n").expect("plant a file");
-
-        let mut fresh = open_log_file(&path, false).expect("create the log file");
-        writeln!(fresh, "one").expect("write");
-        drop(fresh);
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read back"),
-            "one\n",
-            "the planted content is gone, not appended to"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path)
-                .expect("metadata")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
-        }
-        // Something that cannot be removed as a file (a directory) fails
-        // closed: no file is opened, the caller disables logging.
-        let planted_dir = dir.join("aitm-tui-dir.log");
-        std::fs::create_dir_all(&planted_dir).expect("plant a directory");
-        assert!(open_log_file(&planted_dir, false).is_err());
-        assert!(planted_dir.is_dir(), "left alone");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// SEC-3: an explicit `AITM_TUI_LOG` keeps the create-or-append
-    /// semantics, owner-only on Unix.
-    #[test]
-    fn an_explicit_log_file_is_appended_to() {
-        use std::io::Write as _;
-        let dir = std::env::temp_dir().join(format!("aitm-tui-log-append-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join("tui.log");
-        let _ = std::fs::remove_file(&path);
-
-        let mut first = open_log_file(&path, true).expect("create the log file");
-        writeln!(first, "one").expect("write");
-        drop(first);
-        let mut second = open_log_file(&path, true).expect("reopen the log file");
-        writeln!(second, "two").expect("write");
-        drop(second);
-
-        assert_eq!(
-            std::fs::read_to_string(&path).expect("read back"),
-            "one\ntwo\n",
-            "reopening appends"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(&path)
-                .expect("metadata")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// SEC-3: what the startup toast says for each logging outcome — a
