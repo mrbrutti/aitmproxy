@@ -201,6 +201,10 @@ struct ProxySettings: View {
                  : "The active core is external; its port and TLS come from the config.yaml it was launched with. Switch to the embedded core in Bus to manage them here.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
+            // Spec D17.7: the QUIC caveat, the one sentence, as a footnote of the Proxy tab.
+            Text(CATrustFacts.quicCaveat)
+                .font(.callout)
+                .foregroundStyle(.secondary)
         }
     }
 
