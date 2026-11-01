@@ -1939,6 +1939,11 @@ the current contract. The orchestrator (release driver) approved each row before
 | A7 | 2026-11-01 | p1a panel (SP-M1, spec reviewer) | **P1a.2:** the two handshake bodies (`Hello`, `HelloAck`) tolerate unknown JSON keys so a newer peer is reported as `version_mismatch` (spec §5.2), not as malformed JSON; every other control body and `ScopeSet` carry `deny_unknown_fields`. A `PROTO` bump therefore keeps the handshake shape or changes the type byte. |
 | A8 | 2026-11-01 | p1a panel (SP-M2, spec reviewer; accepted) | **P1a.3 / §5.3:** the helper's frame parser refuses an IP packet with no transport it can name (unknown IP protocol, fragment) as `NoTransport`, while the core's in-process inject path admits such a packet as `L4Proto::Raw` after the CIDR check. Deny-side only; walk W (AC8) uses UDP and TCP. The serve loop passes the parser's text through as `InjectResult.error`. |
 | A9 | 2026-11-01 | p2 session (P2.6 coder) | **P2.6:** the plan's `nix` feature list names `prctl`; nix 0.31 has no such feature (prctl lives under `process`). Features used: `user`, `process`, `socket`, `fs`, `uio`. The helper additionally checks the peer's pid equals `getppid()` (pkexec execs in place, spike S7), so the AC18 harness must spawn the helper directly, never through a shell wrapper. The drop runs only when the real or effective uid is 0 (AC17's setcap copy and AC18's unprivileged run skip it); `no_new_privs` is set in every case. |
+| A10 | 2026-11-01 | p2 panel (spec reviewer SP-I1) | **P2.7 / P2.8:** A1's "Linux unit test that a loopback inject reaches a UDP socket with `route_localnet=0`" lives in `serve_loop::tests::linux_loopback_inject_reaches_a_udp_socket_with_default_sysctls`, `#[cfg(target_os = "linux")]` and `#[ignore]` because it needs `CAP_NET_RAW` on `lo`; P2.8 runs it on the [linux-ci] rig with `cargo test -p aitm-l4-helper -- --ignored` and quotes the output. It cannot compile on Matt's Mac (A5). |
+| A11 | 2026-11-01 | p2 panel (tester F3, security, quality) | **P2.2 / spec §3.1 step 4:** `plan_apply` emits `AddMember` only when at least one node is valid (will be chowned). A run that fixed no node changes no directory-service state. Tightens the spec's wording ("no receipt yet, console user is an admin"), recorded as spec amendment S3. |
+| A12 | 2026-11-01 | p2 panel (quality QP2-M1, security SEC-M2, SEC-M3, SEC-M4, SEC-M5; tester F2, F4, F5) | **P2.7:** `Wire::inject(&self, iface, link, bytes)` takes the link type the loop already resolved (one pcap handle per inject, none for the raw-IP path); the loop refuses an `Inject` whose interface no `Inject`-capability entry of the current `ScopeSet` covers BEFORE `wire.link` opens anything; `serve_loop` takes `caps: Vec<String>` and `main` fills it from `/proc/self/status` (`probe::cap_names`) so `HelloAck.caps` is the effective set; a new `ScopeSet` stops open captures whose interface no longer passes `capture_filter` (`CaptureClosed { reason: "scope changed" }`) and starts fresh rate buckets; capture threads start through `thread::Builder` (a spawn error is a `CaptureClosed`, not a panic); `read_timeout_ms` is clamped to `MIN_READ_TIMEOUT_MS = 100` before `wire.open`. **P2.3 / P2.6:** directory mode checks compare `mode & 0o7777` to the spec literals 0755 / 0700. **P2.4:** member names in the log line are `escape_default`ed; executor failure texts read "owner of /dev/bpfN not changed: …" / "mode of … not changed: …" (plan Rule 2 word list). **P2.1:** one `EXIT_FAILED = 1` for probe/bpf/serve failures (an exit constant used only under one `cfg` is dead code on the other OS and fails CI's clippy). |
+| A13 | 2026-11-01 | p2 panel (spec reviewer SP-M10) | **Claims:** the plan's and spec's Amendment logs and the plan's Review log are orchestrator-owned bookkeeping; a unit's PR may carry rows for them on the orchestrator's instruction without the files appearing in its Claims row. p2's PR carries A1–A13, S1–S3 and the p1a/p2 Review-log rows. |
+| A14 | 2026-11-01 | p2 panel, accepted Minors | Accepted without code change (reasons in the Review log): SEC-M1 (`set_permissions` follows symlinks; planting one needs root), SEC-M6 (bounding drop bounded by `caps::all()`, `CAP_LAST_CAP` 40 on the rig kernel; P2.8 reads `CapBnd`), QP2-M2 (`PcapWire` duplicates `PcapBackend` until `CaptureInjectBackend` returns `Box<dyn CaptureSource + Send>`; follow-up), QP2-M3 (one `Step` enum serving both plans; plan-prescribed), SP-M2 (`Arc<dyn Wire>` instead of `&dyn Wire`), SP-M3 (`invoking_user` takes `Option<&OsStr>`), SP-M4 (`--dry-run` prints fact lines before the plan when a fact could not be read), F6 (a failed `dseditgroup -o edit -d` keeps the receipt; P3.13 adds a "member already removed by hand" case). |
 
 ## Review log
 
@@ -1946,6 +1951,47 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| p1a P1a.2 | tester | Minor (F1) | `encode` of an over-long interface name could be misread as a 65 535-byte name plus frame | fixed in aa2b58fc (marker only, always `BadBinary`) |
+| p1a P1a.2 | tester | Info (F2) | `ScopeSet` and control bodies accepted unknown JSON keys | fixed in aa2b58fc (`deny_unknown_fields`; handshake bodies re-exempted in e223712e, see SP-M1) |
+| p1a P1a.4 | spec | Important (SP-I1) | unit gate not evidenced on the reviewed head (shared-target race with `cargo clean -p`) | closed by evidence: quiesced Terminal gates on 09f6b860 and e223712e all 0 |
+| p1a P1a.2 | security | Minor (SEC-M1) | `BadJson`/`Json` echo peer-chosen key text unbounded | fixed in e223712e (`bounded_json_error`, 120 bytes + marker) |
+| p1a P1a.2 | spec | Minor (SP-M1) | strict `Hello`/`HelloAck` hid `version_mismatch` | fixed in e223712e (handshake bodies tolerate unknown keys; A7, S2) |
+| p1a P1a.3 | spec | Minor (SP-M2) | `NoTransport` refusal vs the core's `Raw` bucket | accepted (orchestrator, 2026-11-01): deny-side, documented; A8, S2 |
+| p1a all | spec | Minor (SP-M3) | `Display`/`Error` impls beyond the plan | accepted: zero behaviour; needed by P1a.4's `String` contract |
+| p1a P1a.1 | quality | Minor (Q1) | tautological assert | fixed in e223712e |
+| p1a all | quality | Minor (Q2) | tests pinned serde/std prose with line+column | fixed in e223712e (prefixes) |
+| p1a P1a.2/4 | quality | Minor (Q3) | duplicate tests after the F1/F2 fix | fixed in e223712e |
+| p1a P1a.4 | quality | Minor (Q4) | `String` error at `HelperGuard` | accepted: plan-prescribed signature |
+| p1a P1a.2 | quality | Minor (Q5) | private mirror JSON structs | accepted: plan's `Msg` table fixes the inline shapes |
+| p1a P1a.2/3 | quality | Minor (Q6) | unreachable defensive decode arms | fixed in e223712e (`split_first_chunk`, `split_at_checked`) |
+| p1a P1a.2 | quality | Minor (Q7) | private `Cursor` shadowed std's | fixed in e223712e (`Payload`) |
+| p1a P1a.4 | quality | Minor (Q8) | capture-entry predicate duplicated with `capture.rs` | accepted as follow-up: `capture.rs` outside the p1a Claims row |
+| p1a P1a.4 | security | Minor (SEC-M2, round 2) | `capture_filter` echoes the interface name unbounded | accepted (orchestrator, 2026-11-01): the serve loop validates names (≤ 15 bytes, `[A-Za-z0-9._-]`) before the call; bounded echo with the next p1a-file change |
+| p1a P1a.1 | quality | Minor (QR2-1..3, round 2) | `floor_char_boundary`, home of `bounded_json_error`, duplicated SEC-M1 assertions | accepted: style; follow-up with the next p1a-file change |
+| p1a all | tester | Minor (P1–P3, round 2) | boundary tests proposed (120/121-byte bound, verbatim short message, `split_header` ±1) | accepted as follow-up tests; properties verified by the tester's probe |
+| p2 P2.1 | quality | Important (QP2-I1) | `EXIT_BPF_FAILED` dead on Linux → CI clippy red | fixed in 2f74c3ac (one `EXIT_FAILED`; cfg audit) |
+| p2 P2.7 | spec | Important (SP-I1) | A1's Linux loopback-inject unit test absent | fixed in 2f74c3ac (`#[cfg(linux)] #[ignore]` test; A10) |
+| p2 P2.3/P2.4 | tester, quality, security, spec | Minor (F1) | raw `chown`/`chmod` text in the unified-log line | fixed in 2f74c3ac ("owner of … not changed") |
+| p2 P2.3/P2.6 | tester, spec, security | Minor (F2) | mode checks masked setuid/setgid/sticky | fixed in 2f74c3ac (`& 0o7777`; S3) |
+| p2 P2.2 | tester, quality, security | Minor (F3) | `AddMember` planned with no valid node | fixed in 2f74c3ac (A11, S3) |
+| p2 P2.4 | tester, quality, security | Minor (F4) | member names joined unescaped | fixed in 2f74c3ac (`escape_default`) |
+| p2 P2.7 | tester, quality, security, spec | Minor (F5) | `read_timeout_ms: 0` blocks `CaptureClose` | fixed in 2f74c3ac (`MIN_READ_TIMEOUT_MS = 100`) |
+| p2 P2.3 | tester, security, spec | Minor (F6) | revert stops on a failed `dseditgroup -d` and keeps the receipt | accepted: fail-closed; P3.13 adds the "member already removed by hand" case |
+| p2 P2.3 | security | Minor (SEC-M1) | `set_permissions` follows symlinks (lstat→chmod window) | accepted: planting the symlink needs root (devfs, root:admin dir); A14 |
+| p2 P2.7 | security, quality | Minor (SEC-M2, QP2-M1) | pcap handle opened before the inject guard; three handles per inject | fixed in 2f74c3ac (scope pre-check; `Wire::inject` takes the link) |
+| p2 P2.7 | security, spec | Minor (SEC-M3, SP-M1) | `HelloAck.caps` literal | fixed in 2f74c3ac (effective set via `probe::cap_names`) |
+| p2 P2.7 | security | Minor (SEC-M4) | `ScopeSet` did not revisit open captures | fixed in 2f74c3ac ("scope changed" close; S3) |
+| p2 P2.7 | security | Minor (SEC-M5) | `thread::spawn` panic on EAGAIN | fixed in 2f74c3ac (`thread::Builder`) |
+| p2 P2.6 | security | Minor (SEC-M6) | bounding drop bounded by `caps::all()` | accepted: defence in depth; P2.8 reads `CapBnd`; A14 |
+| p2 P2.7 | quality | Minor (QP2-M2) | `PcapWire` duplicates `PcapBackend` | accepted as cross-crate follow-up (`+ Send` on `CaptureInjectBackend`); A14 |
+| p2 P2.2/3 | quality | Minor (QP2-M3) | unreachable `Step` arms | accepted: plan-prescribed single `Step`; A14 |
+| p2 P2.7 | quality | Minor (QP2-M8) | redundant per-function `allow(dead_code)` | fixed in 2f74c3ac |
+| p2 tests | quality | Minor (QP2-M9) | computed expectations, hygiene, cross-crate Display pins, negative waits | partly fixed in 2f74c3ac (computed expectations, hygiene); Display pins and negative waits accepted |
+| p2 P2.7 | spec | Minor (SP-M2) | `Arc<dyn Wire>` instead of `&dyn Wire` | accepted; A14 |
+| p2 P2.6 | spec | Minor (SP-M3) | `invoking_user(.., Option<&OsStr>)` | accepted (non-UTF-8 env refused, never panics); A14 |
+| p2 P2.4 | spec | Minor (SP-M4) | dry-run prints fact lines before the plan | accepted (honest unprivileged dry run); A14 |
+| p2 P2.2 | spec | Minor (SP-M9) | spec §3.1 step order vs plan | recorded as S3 |
+| p2 docs | spec | Minor (SP-M10) | amendment-log docs outside the Claims row | recorded as A13 |
 
 ## Shipped
 
