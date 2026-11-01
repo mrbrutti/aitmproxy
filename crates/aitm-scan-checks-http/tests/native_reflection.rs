@@ -311,6 +311,7 @@ async fn xss_reflected_meta_is_the_session_call_s3_entry() {
             InsertionKind::XmlValue,
             InsertionKind::MultipartValue,
             InsertionKind::Header,
+            InsertionKind::Cookie,
             InsertionKind::PathSegment,
             InsertionKind::ParamNameQuery,
         ]
@@ -488,7 +489,7 @@ async fn open_redirect_sends_three_forms_and_catches_the_scheme_relative_one() {
 }
 
 #[tokio::test]
-async fn open_redirect_sends_at_most_three_probes() {
+async fn open_redirect_sends_at_most_six_probes() {
     let host = ScriptedHost::new()
         .with_marker(MARKER)
         .with_fallback(html(200, "no redirect"));
@@ -505,6 +506,9 @@ async fn open_redirect_sends_at_most_three_probes() {
             "https://aitm-redirect.invalid/".to_string(),
             "//aitm-redirect.invalid/".to_string(),
             "/\\aitm-redirect.invalid/".to_string(),
+            "/\t/aitm-redirect.invalid/".to_string(),
+            "/\r/aitm-redirect.invalid/".to_string(),
+            "/\n\\aitm-redirect.invalid/".to_string(),
         ]
     );
 }
@@ -616,7 +620,11 @@ async fn neither_check_sends_a_request_to_the_canary_host() {
 
     let mut targets = xss_host.sent_targets();
     targets.extend(redirect_host.sent_targets());
-    assert_eq!(targets.len(), 6, "three probes from each check");
+    assert_eq!(
+        targets.len(),
+        9,
+        "three probes from xss, six canary forms from open-redirect"
+    );
     for target in &targets {
         assert_eq!(target, TARGET_URL);
         assert!(
@@ -688,9 +696,9 @@ async fn neither_check_sends_when_the_budget_is_gone() {
 async fn neither_check_reports_clean_when_every_probe_fails() {
     let point = point(InsertionKind::Query, "next", TARGET_URL);
 
-    for check in [
-        aitm_scan_checks_http::xss::check(),
-        aitm_scan_checks_http::redirect::check(),
+    for (check, probes) in [
+        (aitm_scan_checks_http::xss::check(), 3),
+        (aitm_scan_checks_http::redirect::check(), 6),
     ] {
         let host = ScriptedHost::new()
             .with_marker(MARKER)
@@ -703,7 +711,7 @@ async fn neither_check_reports_clean_when_every_probe_fails() {
             "{} must not call a target it could not reach clean",
             check.meta().id
         );
-        assert_eq!(host.sent().len(), 3, "{}", check.meta().id);
+        assert_eq!(host.sent().len(), probes, "{}", check.meta().id);
         assert_eq!(verdict.poc_hint, None);
     }
 }
@@ -770,4 +778,39 @@ async fn details_name_the_point_and_quote_no_response_text() {
         "the detail quoted the response: {}",
         verdict.detail
     );
+}
+
+/// A cookie value printed into the page is a reflection like any other (the
+/// seeded `/prefs` theme cookie, AC T2-3; found by T2's live run): the check
+/// declares the `Cookie` kind, fires on an unencoded echo and stays clean on
+/// the Patched route's escaped echo.
+#[tokio::test]
+async fn xss_reflected_covers_a_cookie_point_and_stays_clean_when_the_cookie_is_escaped() {
+    let meta = aitm_scan_checks_http::xss::check();
+    assert!(meta.meta().kinds.contains(&InsertionKind::Cookie));
+
+    let vulnerable = ScriptedHost::new().with_marker(MARKER).with_fallback(html(
+        200,
+        &format!("<body class=\"{FIRST_XSS_PROBE}\">theme</body>"),
+    ));
+    let point = point(InsertionKind::Cookie, "theme", TARGET_URL);
+    let verdict = aitm_scan_checks_http::xss::check()
+        .run(&point, &vulnerable)
+        .await;
+    assert_eq!(verdict.outcome, Outcome::Vulnerable, "{}", verdict.detail);
+    assert!(
+        verdict.detail.contains("Cookie point \"theme\""),
+        "{}",
+        verdict.detail
+    );
+
+    let patched = ScriptedHost::new().with_marker(MARKER).with_fallback(html(
+        200,
+        "<body class=\"&lt;aitmabcd&gt;x&lt;/aitmabcd&gt;\">theme</body>",
+    ));
+    let verdict = aitm_scan_checks_http::xss::check()
+        .run(&point, &patched)
+        .await;
+    assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+    assert_eq!(verdict.poc_hint, None);
 }

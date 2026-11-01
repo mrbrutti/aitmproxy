@@ -639,7 +639,11 @@ async fn half_a_boolean_pair_is_never_a_finding() {
 async fn xss_reflected_fires_on_every_kind_it_declares() {
     let check = aitm_scan_checks_http::xss::check();
     let kinds = check.meta().kinds.clone();
-    assert_eq!(kinds.len(), 8, "the declared kinds");
+    assert_eq!(
+        kinds.len(),
+        9,
+        "the declared kinds (Cookie since T2's live run)"
+    );
 
     for kind in kinds {
         let host = ScriptedHost::new().with_marker(MARKER).on(
@@ -1021,16 +1025,16 @@ async fn the_budget_gate_spends_exactly_the_plan_when_the_budget_allows_it() {
         v.detail
     );
 
-    // open-redirect: the same three-probe shape.
+    // open-redirect: the same shape over its six canary forms.
     let exact = ScriptedHost::new()
         .with_marker(MARKER)
         .with_fallback(html(200, "nothing"))
-        .with_budget(3);
+        .with_budget(6);
     let v = aitm_scan_checks_http::redirect::check()
         .run(&q(), &exact)
         .await;
     assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
-    assert_eq!(exact.sent().len(), 3);
+    assert_eq!(exact.sent().len(), 6);
 
     // sqli-time: a baseline plus two families of four.
     let exact = ScriptedHost::new()
