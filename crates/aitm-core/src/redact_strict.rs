@@ -257,7 +257,12 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   start of a line any name that `is_secret_key_strict` does the same, except
 ///   that a `host:port` (`auth.example.com:8443`) is a host, not a header. Prose
 ///   without a `:` is untouched, and so is a header with an empty value and no
-///   folded line.
+///   folded line. A line break written as a backslash and `n`, `r` or `t`, any number
+///   of backslashes, stands for a real one when it is glued to the name
+///   (`GET / HTTP/1.1\nCookie: a=b; z=C`, as in a raw request kept in a string): the
+///   name starts after the letter and is at the start of a line, and the mask runs to
+///   the next real CR or LF or the end of the text, escaped breaks and the headers
+///   after them included, so no tail of a value is left (`\nCookie: [redacted]`).
 /// - **P3.** `basic` followed by blanks and a base64-alphabet token of at least 8
 ///   characters masks the token only when it decodes (leniently, padding not
 ///   required) to bytes that contain `:`, the `user:pass` shape. `negotiate` or
@@ -1255,6 +1260,21 @@ fn folded_end(bytes: &[u8], mut line_end: usize) -> usize {
     }
 }
 
+/// Whether the name run `start..end` opens with the letter of an escaped line break
+/// glued to the name after it. A text taken from a string that holds a raw request has
+/// the two characters `\` and `n` (`r`, `t`) where the request has a line break, and
+/// no byte between that letter and the name: `\nCookie` is one run of name bytes, though
+/// the name is `Cookie`. True when a backslash stands in front of the run, the run
+/// starts with `n`, `r` or `t`, and something follows that letter. The number of
+/// backslashes is not counted: a request escaped twice writes its break `\\n`, and a
+/// name read a little too eagerly is a mask too many, never one too few.
+fn glued_line_escape(bytes: &[u8], start: usize, end: usize) -> bool {
+    start > 0
+        && bytes[start - 1] == b'\\'
+        && matches!(bytes[start], b'n' | b'r' | b't')
+        && end - start > 1
+}
+
 /// P2. See [`scrub_strict`]. One left-to-right scan: each name run is read once,
 /// and a masked line, folded lines included, is skipped whole, so the work is
 /// linear.
@@ -1282,15 +1302,19 @@ fn mask_header_lines(text: &str) -> String {
         if bytes.get(colon) != Some(&b':') {
             continue;
         }
-        // A name run is ASCII, so `start..end` is on char boundaries.
-        let name = &text[start..end];
-        let at_line_start = start == 0 || matches!(bytes[start - 1], b'\r' | b'\n');
+        // An escaped line break glued to the name (`\nCookie`) ends a line: the name
+        // starts after its letter, and stands at the start of a line.
+        let escaped = glued_line_escape(bytes, start, end);
+        let name_start = if escaped { start + 1 } else { start };
+        // A name run is ASCII, so `name_start..end` is on char boundaries.
+        let name = &text[name_start..end];
+        let at_line_start = escaped || start == 0 || matches!(bytes[start - 1], b'\r' | b'\n');
         let masks = CREDENTIAL_HEADERS
             .iter()
             .any(|header| name.eq_ignore_ascii_case(header))
             || (at_line_start
                 && is_secret_key_strict(name)
-                && !is_host_port(bytes, start, end, is_ascii_ws));
+                && !is_host_port(bytes, name_start, end, is_ascii_ws));
         if !masks {
             continue;
         }
@@ -1905,7 +1929,7 @@ fn mask_extra_pairs(text: &str) -> String {
 mod tests {
     use std::cell::Cell;
 
-    use super::{converge, scrub_round, scrub_strict, MAX_ROUNDS, SHAPES};
+    use super::{converge, glued_line_escape, scrub_round, scrub_strict, MAX_ROUNDS, SHAPES};
 
     /// `converge` over `round`, and how many times it called it.
     fn run(text: &str, round: impl Fn(&str) -> String) -> (String, usize) {
@@ -1946,6 +1970,36 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn a_line_escape_glued_to_a_name_run_is_a_backslash_and_n_r_or_t() {
+        // `(text, start, end)`: the name run `start..end` of `text`, and whether it
+        // opens with the letter of an escaped line break glued to the name after it.
+        for (text, start, end, want) in [
+            (r"\nCookie", 1, 8, true),
+            (r"\tCookie", 1, 8, true),
+            (r"\rCookie", 1, 8, true),
+            (r"\\nCookie", 2, 9, true),
+            (r"\\\nCookie", 3, 10, true),
+            (r"x\ntoken", 2, 8, true),
+            // No backslash in front, or a space, or another letter after it.
+            (r"nCookie", 0, 7, false),
+            (r" nCookie", 1, 8, false),
+            (r"onCookie", 0, 8, false),
+            (r"\xCookie", 1, 8, false),
+            (r"\NCookie", 1, 8, false),
+            (r"\Cookie", 1, 7, false),
+            // The escape letter alone has no name after it.
+            (r"a\n:", 2, 3, false),
+            (r"\n", 1, 2, false),
+        ] {
+            assert_eq!(
+                glued_line_escape(text.as_bytes(), start, end),
+                want,
+                "{text:?} {start}..{end}"
+            );
+        }
     }
 
     #[test]

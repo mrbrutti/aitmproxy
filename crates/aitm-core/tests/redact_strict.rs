@@ -624,6 +624,160 @@ fn a_text_that_does_not_settle_is_replaced_whole() {
 }
 
 #[test]
+fn a_header_after_an_escaped_line_break_is_masked_to_the_end_of_its_line() {
+    // Text from a free string that holds a raw request escaped once or twice has the
+    // two characters `\` and `n` where a request has a line break. The `n` is a
+    // letter to the name rules, so `nCookie` was one name and P2 did not read it: only
+    // `scrub_text` masked the first pair of the cookie and the rest stayed.
+    // Every literal below is the text itself: a backslash, then the letter.
+    let mut t = Table::default();
+
+    // The reviewer's reproducers, one frame each.
+    t.row(
+        r"\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"\nCookie: [redacted]",
+    );
+    t.row(
+        r"\r\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"\r\nCookie: [redacted]",
+    );
+    t.row(
+        r"\\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"\\nCookie: [redacted]",
+    );
+    t.row(
+        r"GET / HTTP/1.1\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"GET / HTTP/1.1\nCookie: [redacted]",
+    );
+    t.row(
+        r"Host: h\nCookie: a=b; z=CNRYx9k3f7q2z8w1",
+        r"Host: h\nCookie: [redacted]",
+    );
+    t.row(
+        r"\nSet-Cookie: a=b; Path=/; z=CNRYx9k3f7q2z8w1",
+        r"\nSet-Cookie: [redacted]",
+    );
+
+    // The other escapes, every depth of backslashes, the other credential headers,
+    // case and blanks.
+    t.row(r"\tCookie: a=b; z=C", r"\tCookie: [redacted]");
+    t.row(r"\rCookie: a=b; z=C", r"\rCookie: [redacted]");
+    t.row(r"x\\\nCookie: a=b; z=C", r"x\\\nCookie: [redacted]");
+    t.row(r"x\\\\nCookie: a=b; z=C", r"x\\\\nCookie: [redacted]");
+    t.row(r"\n\nCookie: a=b; z=C", r"\n\nCookie: [redacted]");
+    t.row(r"\nCookie2: a=b; z=C", r"\nCookie2: [redacted]");
+    t.row(r"\ncookie: a=b; z=C", r"\ncookie: [redacted]");
+    t.row(r"\nCOOKIE :  a=b; z=C", r"\nCOOKIE : [redacted]");
+    t.row(
+        r"\nAuthorization: Bearer abc.def; z=C",
+        r"\nAuthorization: [redacted]",
+    );
+    t.row(
+        r"\nProxy-Authorization: Basic abc; z=C",
+        r"\nProxy-Authorization: [redacted]",
+    );
+
+    // The strict-name rule reads the start of a line: after an escaped break, `pass`
+    // is a header name too. An empty value is still left alone.
+    t.row(r"x\npass: hunter2 there", r"x\npass: [redacted]");
+    t.row(r"x\r\npw: a b", r"x\r\npw: [redacted]");
+    t.unchanged(r"x\nCookie:");
+
+    // Where the mask ends. The value runs to the next REAL CR or LF or to the end of
+    // the text, escaped breaks inside it included: a cookie value may hold a
+    // backslash and a letter, so ending at one could leave a tail of the value.
+    // Everything after an escaped break is therefore masked with it, a following
+    // header (`Host: x`) too.
+    t.row(r"\nCookie: a=b; z=C\r\nHost: x", r"\nCookie: [redacted]");
+    t.row(
+        r"\nCookie: a=b; z=C\nHost: x\nCookie: q=r",
+        r"\nCookie: [redacted]",
+    );
+    t.row(r"\nCookie: a=b; sid=ab\ncd", r"\nCookie: [redacted]");
+    // A real line break ends it, as for any header, and what follows is read again.
+    t.row(
+        "\\nCookie: a=b; z=C\r\nHost: x",
+        "\\nCookie: [redacted]\r\nHost: x",
+    );
+    t.row(
+        "\\nCookie: a=b; z=C\nHost: x\\nCookie: q=r; s=t",
+        "\\nCookie: [redacted]\nHost: x\\nCookie: [redacted]",
+    );
+    // A folded line after it, real, is part of the value.
+    t.row(
+        "\\nCookie: a=b;\r\n z=C\r\nHost: x",
+        "\\nCookie: [redacted]\r\nHost: x",
+    );
+
+    // Real line breaks, a space and `; ` before the name were read before and still
+    // are, and so is the name at the start of the text.
+    t.row("\nCookie: a=b; z=C", "\nCookie: [redacted]");
+    t.row("\r\nCookie: a=b; z=C", "\r\nCookie: [redacted]");
+    t.row("x Cookie: a=b; z=C", "x Cookie: [redacted]");
+    t.row("x; Cookie: a=b; z=C", "x; Cookie: [redacted]");
+    t.row("Cookie: a=b; z=C", "Cookie: [redacted]");
+
+    // Only the pair of characters is a break. A word that ends in `n`, `r` or `t`
+    // glued to the name is not (`onCookie`: `scrub_text` alone reads that key), a
+    // backslash before a name that does not start with those letters is not, an
+    // upper-case `\N` is not, and prose that is no header is untouched.
+    t.row("onCookie: a=b; z=C", "onCookie: [redacted]");
+    t.row("tCookie: a=b; z=C", "tCookie: [redacted]");
+    t.row(r"\Cookie: a=b; z=C", r"\Cookie: [redacted]");
+    // `\N` and `\x` are no line break, so P2 does not read these names and the
+    // output is what `scrub_text` alone gives, the tail of the cookie included. A
+    // break that P2 read would mask the whole value (see above).
+    t.row(r"\NCookie: a=b; z=C", r"\NCookie: [redacted]; z=C");
+    t.row(r"\xCookie: a=b; z=C", r"\xCookie: [redacted]; z=C");
+    t.row("https://x/cookie: y", "https://x/cookie: [redacted]");
+    t.unchanged(r"\nbypass: x");
+    t.unchanged(r"\nauthor: Bob");
+    t.unchanged(r"\ncompass: north");
+    // A name that merely starts with `n`, `r` or `t` is no escape without the
+    // backslash: `tpass` and `npw` are not `pass` and `pw` at the start of a line.
+    t.unchanged("tpass: hunter2 there");
+    t.unchanged("npw: a b");
+    t.unchanged("x\nrotp: 123456");
+    t.unchanged(r"C:\temp\notes: draft");
+    t.unchanged("a\\nb: c");
+
+    // Hostile, 2 MiB each. Every name run is read once, an escaped break glued to it
+    // included, and a masked line is skipped whole.
+    let times = |unit: &str| unit.repeat((2 << 20) / unit.len());
+    // One header with no real line break after it: its value is the whole rest.
+    let unit = r"\nCookie: ";
+    t.hostile_settles(
+        r"`\nCookie: ` x N",
+        times(unit),
+        r"\nCookie: [redacted]".to_string(),
+    );
+    // Names that are no header, or have no value: nothing to mask.
+    for (label, unit) in [
+        (r"`\nn` x N", r"\nn"),
+        (r"`\nCookie` x N", r"\nCookie"),
+        (r"`\npass:` and a real LF x N", "\\npass:\n"),
+    ] {
+        t.hostile_settles(label, times(unit), times(unit));
+    }
+    // A real line break after each value: every line is a header of its own.
+    for (label, unit, line) in [
+        (
+            r"`\nCookie: a=b` and a real LF x N",
+            "\\nCookie: a=b\n",
+            "\\nCookie: [redacted]\n",
+        ),
+        (
+            r"`\nSet-Cookie: a=b` and a real CRLF x N",
+            "\\nSet-Cookie: a=b\r\n",
+            "\\nSet-Cookie: [redacted]\r\n",
+        ),
+    ] {
+        t.hostile_settles(label, times(unit), line.repeat((2 << 20) / unit.len()));
+    }
+    t.finish();
+}
+
+#[test]
 fn a_private_key_block_is_masked_whole_whatever_precedes_it() {
     // The block is masked before `scrub_text` and P2 run, so a key name in front of
     // it (whose own mask would eat the BEGIN line) cannot leave the key body behind.
