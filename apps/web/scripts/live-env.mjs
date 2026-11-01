@@ -56,6 +56,72 @@ function l4Block(l4) {
   return lines;
 }
 
+/**
+ * Render a `scanner:` config block (umbrella D11 key names). Only the keys actually given are
+ * emitted, so an absent key keeps the core's own fail-closed default: the agent gates
+ * (`allow_agent_active`, `allow_agent_l4_fuzz`) stay off, the ceilings stay at the built-in ones.
+ */
+function scannerBlock(s) {
+  const lines = ['scanner:'];
+  for (const flag of ['allow_agent_active', 'allow_agent_l4_fuzz']) {
+    if (s[flag] != null) lines.push(`  ${flag}: ${!!s[flag]}`);
+  }
+  if (s.max_jobs != null) lines.push(`  max_jobs: ${s.max_jobs}`);
+  if (s.default_profile != null) lines.push(`  default_profile: ${s.default_profile}`);
+  const ceilings = s.ceilings ?? null;
+  if (ceilings) {
+    const inner = [];
+    if (ceilings.probes != null) inner.push(`    probes: ${ceilings.probes}`);
+    if (ceilings.time_s != null) inner.push(`    time_s: ${ceilings.time_s}`);
+    if (inner.length) lines.push('  ceilings:', ...inner);
+  }
+  return lines;
+}
+
+/**
+ * Render the `aitm` config YAML a live run uses. Extracted from `startAitm` so a proof script can
+ * assert the file it is about to hand the core without spawning anything; `startAitm` passes its
+ * own ports, dirs and secrets straight through. Optional sections are omitted entirely when their
+ * option is absent, which keeps the file byte-identical to the pre-extraction one for the existing
+ * callers (`cua-live.mjs`, `cua-l4.mjs`, `selftest-live.mjs`).
+ */
+export function renderConfig({
+  proxyPort,
+  browserProxyPort,
+  pocDir,
+  pocOut,
+  operatorSecret,
+  token,
+  scope = [],
+  l4 = null,
+  findingsDir = null,
+  scanner = null,
+}) {
+  return [
+    `listen: 127.0.0.1:${proxyPort}`,
+    `browser:`,
+    `  proxy_addr: 127.0.0.1:${browserProxyPort}`,
+    `scope:`,
+    `  allow_agent_widen: true`,
+    ...(scope.length ? [`  entries:`, ...scope.map((s) => `    - "${s}"`)] : []),
+    `poc:`,
+    `  dir: ${pocDir}`,
+    `  out_dir: ${pocOut}`,
+    // `findings.dir` (FindingsConfig::dir): where the persistent findings store writes its
+    // per-finding YAML + runs.jsonl, so a scan's findings survive the run and can be asserted.
+    ...(findingsDir ? [`findings:`, `  dir: ${findingsDir}`] : []),
+    ...(scanner ? scannerBlock(scanner) : []),
+    `mcp:`,
+    `  operator_token: ${operatorSecret}`,
+    `  transport:`,
+    `    loopback_tcp:`,
+    `      port: 0`,
+    `      token: ${token}-mcp`,
+    ...(l4 ? l4Block(l4) : []),
+    '',
+  ].join('\n');
+}
+
 /** A local target: JSON + cookies, a body/header echo, and a reflecting search page for PoCs. */
 export function startTarget() {
   const hits = [];
@@ -102,6 +168,58 @@ export function startTarget() {
   });
 }
 
+/**
+ * Spawns the real `aitm-testtarget-serve` binary (the hermetic seeded-vulnerable target the
+ * deterministic suites serve in-process, kept alive as a process) on an ephemeral loopback port.
+ * `mode` is `vulnerable` (the seeded findings) or `patched` (the same shapes, nothing to find).
+ * Resolves once the binary prints its bound base URL on stdout; `stop()` kills it.
+ */
+export async function startTestTarget({
+  bin = process.env.AITM_TESTTARGET_BIN ?? join(REPO, 'target/debug/aitm-testtarget-serve'),
+  mode = 'vulnerable',
+  log = () => {},
+} = {}) {
+  if (!existsSync(bin)) throw new Error(`test target binary not found at ${bin} — run: cargo build -p aitm-testtarget --bin aitm-testtarget-serve`);
+  const child = spawn(bin, ['--mode', mode, '--port', '0'], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env } });
+  let out = '';
+  let stderr = '';
+  child.stderr.on('data', (d) => {
+    stderr += d;
+    log(String(d).trimEnd());
+  });
+  // crates/aitm-testtarget/src/main.rs prints exactly one `listening <url>` line on stdout.
+  const base = await new Promise((res, rej) => {
+    const timer = setTimeout(() => rej(new Error(`test target did not start in 10 s\n${stderr}`)), 10000);
+    const done = (fn, v) => {
+      clearTimeout(timer);
+      fn(v);
+    };
+    child.stdout.on('data', (d) => {
+      out += d;
+      const m = out.match(/listening\s+(\S+)/);
+      if (m) done(res, m[1]);
+    });
+    child.on('exit', (code) => done(rej, new Error(`test target exited ${code}\n${stderr}`)));
+    child.on('error', (err) => done(rej, err));
+  });
+  const url = new URL(base);
+  return {
+    child,
+    mode,
+    base: base.replace(/\/$/, ''),
+    host: url.host,
+    port: Number(url.port),
+    stderr: () => stderr,
+    stop: () =>
+      new Promise((r) => {
+        if (child.exitCode != null || child.signalCode != null) return r();
+        child.once('exit', () => r());
+        child.kill('SIGINT');
+        setTimeout(() => child.kill('SIGKILL'), 3000);
+      }),
+  };
+}
+
 /** Sends one HTTP request THROUGH the proxy (absolute-URI form). Resolves {status, headers, body}. */
 export function viaProxy(proxyPort, method, url, { headers = {}, body = null, timeoutMs = 15000 } = {}) {
   return new Promise((res, rej) => {
@@ -125,7 +243,14 @@ export function viaProxy(proxyPort, method, url, { headers = {}, body = null, ti
  * Spawns `aitm web` with its own config (all ports free, scope widening on, PoC dirs set).
  * Resolves once the bridge is up. `env.stop()` kills it.
  */
-export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.AITM_BIN ?? join(REPO, 'target/debug/aitm'), log = () => {} } = {}) {
+export async function startAitm({
+  scope = [],
+  l4 = null,
+  findingsDir = null,
+  scanner = null,
+  aitmBin = process.env.AITM_BIN ?? join(REPO, 'target/debug/aitm'),
+  log = () => {},
+} = {}) {
   if (!existsSync(aitmBin)) throw new Error(`aitm binary not found at ${aitmBin} — run: cargo build -p aitm (after npm run build in apps/web)`);
   const [proxyPort, browserProxyPort, webPort] = await Promise.all([freePort(), freePort(), freePort()]);
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
@@ -138,28 +263,7 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
   const pocDir = join(dir, 'poc');
   const pocOut = join(dir, 'poc-out');
   const cfg = join(dir, 'config.yaml');
-  writeFileSync(
-    cfg,
-    [
-      `listen: 127.0.0.1:${proxyPort}`,
-      `browser:`,
-      `  proxy_addr: 127.0.0.1:${browserProxyPort}`,
-      `scope:`,
-      `  allow_agent_widen: true`,
-      ...(scope.length ? [`  entries:`, ...scope.map((s) => `    - "${s}"`)] : []),
-      `poc:`,
-      `  dir: ${pocDir}`,
-      `  out_dir: ${pocOut}`,
-      `mcp:`,
-      `  operator_token: ${operatorSecret}`,
-      `  transport:`,
-      `    loopback_tcp:`,
-      `      port: 0`,
-      `      token: ${token}-mcp`,
-      ...(l4 ? l4Block(l4) : []),
-      '',
-    ].join('\n'),
-  );
+  writeFileSync(cfg, renderConfig({ proxyPort, browserProxyPort, pocDir, pocOut, operatorSecret, token, scope, l4, findingsDir, scanner }));
   for (const d of [pocDir, pocOut]) if (!existsSync(d)) spawn('mkdir', ['-p', d]);
   const child = spawn(aitmBin, ['--config', cfg, 'web', '--listen', `127.0.0.1:${webPort}`, '--token', token], {
     stdio: ['ignore', 'pipe', 'pipe'],
