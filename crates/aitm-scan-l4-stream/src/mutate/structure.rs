@@ -694,7 +694,7 @@ fn split_index(path: &FieldPath) -> Option<(FieldPath, usize)> {
     }
     let open = text.rfind('[')?;
     let index = text.get(open + 1..text.len() - 1)?.parse().ok()?;
-    Some((FieldPath::new(text.get(..open)?), index))
+    Some((path.parent()?, index))
 }
 
 /// The node list the node at `target` belongs to.
@@ -736,7 +736,7 @@ fn preceding_text_field(tree: &Tree, path: &FieldPath) -> Option<FieldPath> {
                 .then(|| previous.path.clone())
             }
             None => {
-                let parent = parent_path(&at_path)?;
+                let parent = at_path.parent()?;
                 if tree.get(&parent)?.kind != FieldKind::Choice {
                     return None;
                 }
@@ -744,18 +744,6 @@ fn preceding_text_field(tree: &Tree, path: &FieldPath) -> Option<FieldPath> {
             }
         }
     }
-}
-
-/// The path of the container the node at `path` sits in, or `None` for a
-/// top-level field: `a.b.c` is in `a.b`, and `a.b[2]` is in `a.b`.
-fn parent_path(path: &FieldPath) -> Option<FieldPath> {
-    let text = path.as_str();
-    if text.ends_with(']') {
-        let open = text.rfind('[')?;
-        return Some(FieldPath::new(text.get(..open)?));
-    }
-    let dot = text.rfind('.')?;
-    Some(FieldPath::new(text.get(..dot)?))
 }
 
 /// Renumber a container's descendants after its children changed, so every

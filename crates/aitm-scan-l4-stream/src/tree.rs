@@ -73,6 +73,21 @@ impl FieldPath {
         FieldPath(format!("{parent}[{i}]", parent = self.0))
     }
 
+    /// The path of the container this path sits in, or `None` for a
+    /// top-level field: `a.b[2]` is in `a.b`, `a.b` is in `a`, and `a` has
+    /// no parent. The inverse of [`child`](Self::child) and
+    /// [`index`](Self::index).
+    #[must_use]
+    pub fn parent(&self) -> Option<FieldPath> {
+        let text = &self.0;
+        if text.ends_with(']') {
+            let open = text.rfind('[')?;
+            return Some(FieldPath(text.get(..open)?.to_string()));
+        }
+        let dot = text.rfind('.')?;
+        Some(FieldPath(text.get(..dot)?.to_string()))
+    }
+
     /// The name of the field this path ends at, without any index:
     /// `questions[0].name[2]` is named `name`. This is an
     /// `InsertionPoint`'s name.
@@ -591,13 +606,9 @@ impl<'a> Parser<'a> {
         };
 
         match relation {
-            Relation::Count { of } => match usize::try_from(value) {
+            Relation::Count { .. } => match usize::try_from(value) {
                 Ok(count) => {
-                    // A declared count is reachable under two names: the
-                    // count field's own (`count_from: qdcount`, the spelling
-                    // spec S2 and S3 use) and the repeat it counts.
                     self.counts.push((node.path.last().to_string(), count));
-                    self.counts.push((of.clone(), count));
                 }
                 Err(_) => node.relation_broken = true,
             },
@@ -1154,6 +1165,63 @@ message:
         );
     }
 
+    /// SPEC-I1 / SEC-M1: the parser bounds a repeat only through the **count
+    /// field**'s own name, the one `resolve_count_from` validates. A repeat
+    /// whose `count_from` names *itself* — the self-naming spelling the
+    /// validator refuses — is not bounded by any count, even when a sibling
+    /// count field declares `count: { of: <that repeat> }`.
+    ///
+    /// Built by hand to get past `validate`, this proves the parser agrees
+    /// with the validator: the self-named `items` repeat ignores the
+    /// declared count of five and behaves as the unbounded repeat it is (a
+    /// zero-width element, so it yields nothing rather than five nodes).
+    #[test]
+    fn a_repeat_naming_itself_is_not_bounded_by_the_declared_count() {
+        let spec = MessageSpec {
+            grammar: "synthetic".to_string(),
+            transport: crate::spec::Transport::Tcp,
+            message: vec![
+                FieldSpec {
+                    name: "n".to_string(),
+                    kind: FieldKind::Decimal,
+                    relation: Some(Relation::Count {
+                        of: "items".to_string(),
+                    }),
+                    ..FieldSpec::default()
+                },
+                FieldSpec {
+                    name: "crlf".to_string(),
+                    kind: FieldKind::Delim,
+                    value: Some(Literal::Text("\r\n".to_string())),
+                    ..FieldSpec::default()
+                },
+                FieldSpec {
+                    name: "items".to_string(),
+                    kind: FieldKind::Repeat,
+                    // The banned self-naming spelling.
+                    count_from: Some("items".to_string()),
+                    fields: vec![FieldSpec {
+                        name: "data".to_string(),
+                        kind: FieldKind::Bytes { size: None },
+                        ..FieldSpec::default()
+                    }],
+                    ..FieldSpec::default()
+                },
+            ],
+            ..MessageSpec::default()
+        };
+
+        let tree = parse(&spec, b"5\r\n").expect("the hand-built frame parses");
+        let items = tree
+            .get(&FieldPath::new("items"))
+            .expect("an `items` repeat");
+        assert_eq!(
+            items.children.len(),
+            0,
+            "the declared count of five must not bound a self-named repeat",
+        );
+    }
+
     #[test]
     fn declared_length_past_buffer_is_marked_not_trusted() {
         let spec = modbus();
@@ -1186,6 +1254,16 @@ message:
         assert_eq!(FieldPath::new("header").child("length").last(), "length");
         assert_eq!(FieldPath::new("count").last(), "count");
         assert_eq!(FieldPath::new("args").index(1).last(), "args");
+    }
+
+    #[test]
+    fn field_path_parent() {
+        assert_eq!(
+            FieldPath::new("a.b[2]").parent(),
+            Some(FieldPath::new("a.b"))
+        );
+        assert_eq!(FieldPath::new("a.b").parent(), Some(FieldPath::new("a")));
+        assert_eq!(FieldPath::new("a").parent(), None);
     }
 
     #[test]
@@ -1340,9 +1418,6 @@ message:
         );
     }
 
-    /// A `len` relation whose recomputed value does not fit the field is
-    /// marked broken and left alone: a fuzzing lane never writes a wrong
-    /// number over an operator's bytes.
     /// SEC-M1: a declared element count is bounded by
     /// [`MAX_REPEAT_ELEMENTS`] like any other, so a frame that declares a
     /// million elements allocates at most the cap.
@@ -1366,22 +1441,15 @@ message:
         ))
         .expect("the synthetic counted-repeat grammar parses");
 
-        let parsed = parse(&spec, b"1000000\r\n");
-
-        match parsed {
-            None => {}
-            Some(tree) => {
-                let items = tree
-                    .get(&FieldPath::new("items"))
-                    .expect("an `items` repeat");
-                assert!(
-                    items.children.len() <= MAX_REPEAT_ELEMENTS,
-                    "a declared million elements yielded {} nodes, over the \
-                     {MAX_REPEAT_ELEMENTS} cap",
-                    items.children.len(),
-                );
-            }
-        }
+        let tree = parse(&spec, b"1000000\r\n").expect("the counted-repeat frame parses");
+        let items = tree
+            .get(&FieldPath::new("items"))
+            .expect("an `items` repeat");
+        assert_eq!(
+            items.children.len(),
+            MAX_REPEAT_ELEMENTS,
+            "a declared million elements must stop at the {MAX_REPEAT_ELEMENTS} cap",
+        );
     }
 
     /// SEC-M2: an extreme declared length is arithmetic the parser must not
@@ -1412,6 +1480,9 @@ message:
         }
     }
 
+    /// A `len` relation whose recomputed value does not fit the field is
+    /// marked broken and left alone: a fuzzing lane never writes a wrong
+    /// number over an operator's bytes.
     #[test]
     fn a_relation_that_does_not_fit_is_marked_broken() {
         let spec = MessageSpec::from_yaml(concat!(
