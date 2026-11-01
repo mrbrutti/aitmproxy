@@ -1,6 +1,6 @@
 # macOS traffic-route advice design
 
-**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode)
+**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 plus the orchestrator's gate-2/gate-5 rulings of 2026-11-01 (see Amendments)
 **Research inputs:**
 - Live diagnosis, 2026-10-31, installed 0.5.4 app (observation only): `/Users/matt/Library/Application Support/Claude-3p/side-session-notes/local_9f6f2891-d1f9-458f-a0c7-0c5668557fb3/live-sidebar-not-loading-diagnosis.md`
 - `docs/research/22-macos-system-proxy-toggle.md` — read-back via `CFNetworkCopySystemProxySettings()`, the sibling "Set as system proxy" work and its candidate words; §5a's live observation (Proxyman's `127.0.0.1:9090` set for HTTP+HTTPS on both enabled services)
@@ -20,7 +20,7 @@
   `TLSState.tunnelled` ("CONNECT tunnel passed through; not decrypted"); `FlowSummary` (line ~156)
   does not yet produce it from the wire. Shared strings confirmed by the improve-loop session for
   stories S-073/S-074/S-080 (notes `proxyman-capture-flow-gaps.md` §3).
-- Per-host decryption merged as PR #228 (`main 8175eea3` = v0.5.9): `proxy.status` now carries
+- Per-host decryption merged as PR #228 (`448e75e0`, released as v0.5.9 = `8175eea3`): `proxy.status` now carries
   `decrypt = {scope_hosts: Int, decrypting: Bool, advice: String?}` (`crates/aitm-plugins/src/control.rs`
   ~140–155) where `advice` is the core constant `NOTHING_DECRYPTED_ADVICE` =
   `"Nothing is decrypted until a host is in Scope."` (`crates/aitm-core/src/config.rs:176`) while
@@ -30,6 +30,16 @@
   `upstream_unreachable`, `upstream_tls_failed`, `protocol_error`), `bytes_up`, `bytes_down`
   (`crates/aitm-plugins/src/capture.rs` `tunnel_fields` ~265–283; labels in
   `crates/aitm-core/src/flow.rs` `TunnelMode`/`TunnelReason`).
+- Orchestrator rulings, 2026-11-01 (recorded as the plan's gate-2 answers and gate 5): the app has **no
+  reader of its own** for the system proxy — the fact arrives from the system-proxy session: PR 4a ships
+  `AitmproxyKit/SystemProxyState.swift` (the type this spec defines, plus its Kit tests) ahead of this
+  spec's PR; PR4 (after us) decodes `proxy.status.system_proxy` and the `proxy.system.set`/`unset`
+  replies into it and writes `Session.systemProxy`. `ConnectionAction.openNetworkSettings` is **denied**
+  (Matt: system-proxy setup happens automatically in the app with the OS's own prompt, never by sending
+  him to System Settings). The CA fact is the CA-trust session's published `Session.caTrust`
+  (mac PR D, branch `claude/ca-trust-mac`, `apps/mac/Sources/Aitmproxy/Session+CATrust.swift`); CA
+  polling is PR D's. `BusService.swift` is granted for exactly one line (the `proxy.status.decrypt`
+  decode). The base of this design is `main 8e19c2e3`.
 
 ## Intent
 
@@ -58,46 +68,57 @@ client-side flag.
 
 ## Goals
 
-- With the system proxy not pointing at the core and the scope empty on a build with All Apps
-  on, the Flows page's empty state shows two lines — for a system proxy that is off, verbatim
-  `system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it`; for one
-  pointing elsewhere, the same line naming what it found (`system proxy on · 127.0.0.1:9090, not
-  this core — …`) — and the core's own sentence `Nothing is decrypted until a host is in Scope.`,
-  each with its action (Open Network Settings… / Copy Address; Add Host…).
+- With the scope empty on a build with All Apps on, the Flows page's empty state shows the core's
+  own sentence `Nothing is decrypted until a host is in Scope.` with its buttons (Add Host…, Open
+  Scope…). Once PR4 feeds the system-proxy slot, a system proxy that is off adds the line, verbatim,
+  `system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it`, and one
+  pointing elsewhere the same line naming what it found (`system proxy on · 127.0.0.1:9090, not
+  this core — …`), each with PR4's Set as System Proxy action. Until PR4 lands the system proxy is
+  unknown and neither page says anything about it — never "off".
 - With the CA not trusted (Matt's Mac today), both pages carry one more line, verbatim: `HTTPS is
   not captured until the CA is trusted` — the Flows empty state as a row, the Status checklist as
   the undone step "Trust the aitmproxy CA"; when `ca.status` has not been read, nothing is said
   about the CA, and nothing ever reads "trusted" unless a store reports `trusted: "yes"`.
-- The Status page's Getting-started list shows the same lines as undone steps with the same
-  actions; after `scope.add` over the bus the scope line disappears from both pages within one
-  poll; after the system proxy is set to the core's address the system-proxy line disappears
-  the same way — without any view being told.
+- The Status page's Getting-started list shows the same lines as undone steps (each step keeps its
+  existing action: the All Apps step `.turnCaptureOn`, the Scope step `.openScope`); after `scope.add` over the bus the scope line disappears from both pages within one
+  poll; after the system proxy is set to the core's address (PR4's toggle or `networksetup`) the
+  system-proxy line disappears the same way — without any view being told.
 - When flows exist and neither route is open, one line above the Flows table says so; when
   flows exist and at least one route is open, nothing is shown.
 - Every word comes from `AitmproxyKit.ConnectionSummary`; `check-connection-words.sh` fails if
   a view spells `system proxy off` or `Nothing is decrypted until a host is in Scope` itself.
-- The system-proxy fact is a public, stable Kit value (`SystemProxyState`) that the sibling
-  set-system-proxy work (`proxy.system.status/set/unset`, Settings ▸ Proxy toggle) consumes
-  unchanged, so the app has one read-back type and one set of words for the system proxy.
+- The system-proxy fact is a public, stable Kit value (`SystemProxyState`, defined here as the
+  shared contract and shipped by the system-proxy session's PR 4a) that PR4 fills from
+  `proxy.status.system_proxy` (PR #246's `init?(compact:listenAddress:)`) and extends (`SystemProxyFacts`,
+  `.setSystemProxy`/`.unsetSystemProxy`, the Proxy ▸ toggle), so the app has one read-back type and
+  one set of words for the system proxy.
 
 ## Non-goals
 
 - A "Set as system proxy" / "Restore system proxy" action, its helper, its snapshot-and-restore
-  file, its bus verbs and its `ConnectionAction`s (`.setSystemProxy`, `.unsetSystemProxy` are
-  **reserved** for that session, §D2a). Here the system-proxy line only *opens* System Settings
-  ▸ Network; this spec adds read-only facts.
-- Installing or trusting the CA from this app's surfaces: `ConnectionAction.trustCA` (title "Trust
-  the aitmproxy CA") and `.openCAPanel` are **reserved** for the system-proxy-automation session,
-  which owns the install-action side (confirm prompt, admin prompt). The CA page
-  (`Panels/CAPanel.swift`) is not changed here. Never `.installCA`.
+  file, its Proxy ▸ toggle (⌥⌘P) and its `ConnectionAction`s (`.setSystemProxy`, `.unsetSystemProxy`
+  are **reserved** for the system-proxy session's PR4, §D2a; its bus verbs are already on `main`,
+  PR #214). This spec adds the read-only route fact only; the system-proxy line carries **no
+  action** until PR4 fills it. Never an "Open Network Settings…" action: the orchestrator denied
+  `.openNetworkSettings` 2026-11-01 (Matt: system-proxy setup happens in the app with the OS's own
+  prompt, never by sending him to System Settings).
+- Installing, trusting or polling the CA from code in this spec: `ConnectionAction.trustCA` (title
+  "Trust the aitmproxy CA"), `.openCAPanel`, `CATrustFacts`, `Session.caTrust`/`caStatus`,
+  `refreshCAStatus()` and `Session+CATrust.swift` are the CA-trust session's mac PR D, which lands
+  before this spec's PR and owns the install side (confirm prompt, admin prompt). This spec
+  **consumes** PR D's `Session.caTrust` and its `CATrustFacts` helpers as the CA entry's line,
+  actions and step; it declares none of them, never calls `ca.status` or `ca.install`, and does not
+  change `Panels/CAPanel.swift`. Never `.installCA`.
 - Any copy change outside the two surfaces (Flows empty state + Flows banner; Getting-started
   steps). The toolbar pill, the lane cards, Settings, the Apps page's `AppsAttributionBanner` /
-  `AppsEmptyState` and `ScopeBanner`'s text are unchanged (one exception: `ScopeBanner` *yields*
-  to the route banner on the Flows page, §D8).
-- Anything under `apps/mac/Extension/`, any core (Rust) change, any new bus verb.
+  `AppsEmptyState` and `ScopeBanner`'s text are unchanged (one exception: `ScopeBanner`'s call
+  site in `MainView.flows` is removed, §D8; the struct and its text stay).
+- Anything under `apps/mac/Extension/`, any core (Rust) change, any new bus verb, any in-app read
+  of the macOS proxy settings (`CFNetworkCopySystemProxySettings()`, `SCDynamicStore`): the
+  core's `proxy.system.status` is the one reader, and PR4 is the one poller.
 - PAC/WPAD, SOCKS, per-service or per-app proxy settings, a browser's own manual proxy
-  (Firefox), the bypass list, CA trust. The model answers one question: do the effective global
-  HTTP/HTTPS system-proxy settings point at this core's listen address.
+  (Firefox), the bypass list. The system-proxy model answers one question: do the effective
+  global HTTP/HTTPS system-proxy settings point at this core's listen address.
 - The `firstFlow` step's words and action (unchanged).
 
 ## Anti-goals
@@ -112,6 +133,8 @@ client-side flag.
 - Lying: saying "off" when the system proxy is on and pointing at another port; saying anything
   about the system proxy before it has been read or with the bus down.
 - A view reaching the capture switch or the `ExtensionController` (the capture tripwires).
+- A second reader of the system proxy (an in-app CFNetwork or SCDynamicStore copy beside the
+  core's `proxy.system.status`): two readers is two derivations.
 - Proving this with fixture or sample data.
 - Saying the CA is trusted on an unread or `unknown` status, or deriving trust from anything but
   the keychain read-back `ca.status` returns.
@@ -127,35 +150,57 @@ client-side flag.
   pure model that construct their own literal values — one `ConnectionSummary.make` call per
   row of the predicate table (§D10) with the expected strings; (2) the three source tripwires
   `tools/check-capture-operator-only.sh`, `tools/check-capture-toggle.sh`,
-  `tools/check-connection-words.sh`; (3) the real installed app with the extension on and the
-  real system-proxy state flipped via `networksetup`/`scutil` in the Terminal plus a real
-  request — screenshots of the Flows and Status pages showing the same words, and bus reads
-  (`scope.list`, `scope.add`, operator token never printed).
+  `tools/check-connection-words.sh`; (3) the real installed app with the extension on and real
+  requests — and, on the first build that also contains PR4, the real system-proxy state flipped
+  (PR4's toggle, or `networksetup`/`scutil` in the Terminal) — screenshots of the Flows and Status
+  pages showing the same words, and bus reads (`scope.list`, `scope.add`, operator token never
+  printed).
 - **Hard gate — no `ca.install` on Matt's Mac.** Trusting the aitm CA on his machine is Matt's
   decision and he has not given it. No proof, script, Coder, Tester or orchestrating session calls
   `ca.install` (or clicks Install… on the CA page) on his Mac. The live proof proves only the
   NOT-trusted state and its line as his Mac is today, plus `ca.status` over the bus showing
   `trusted: "no"`. The install → line-disappears path is proved only after Matt says in his own
-  words that the CA may be trusted, and then only through the app's own step (the Status checklist
-  action with its admin prompt, once the sibling's `.trustCA` lands), never a direct verb call.
-- **CA parts land after the CA-trust session's PR.** `AitmproxyKit/CATrustFacts.swift`, its tests
-  and the two additive `CAStatus` fields (`trustedScope`, `trustReported`) are implemented by the
-  CA-trust session in its PR, to this spec's definitions. This spec stays the contract; its own
-  CA work (the `make(caTrust:)` slot, the `.caTrust` entry and step, the `ca.status` read, the
-  Flows/Status rendering of the CA line) starts only once that PR is on `main`. The system-proxy,
+  words that the CA may be trusted, and then only through the app's own step (the Status checklist's
+  Trust the aitmproxy CA action — PR D's `.trustCA` — with its admin prompt), never a direct verb call.
+- **CA parts land after PR D, and consume what PR D publishes.** The CA-trust session's mac PR D
+  (branch `claude/ca-trust-mac`) lands before this spec's PR and publishes the CA fact this spec
+  reads — `Session.caTrust: CATrustFacts?` and nothing else: computed by PR D via
+  `CATrustFacts(status:)` from the raw `Session.caStatus: CAStatus?` (nil until the first answer,
+  reset by `Session.forgetCATrust()` when the bus disconnects); nil when every store is unknown or
+  the certificate does not exist; `installing` and `needsAdmin` already applied from
+  `Session.caTrustInstalling` / `Session.caTrustNeedsAdmin`. Cadence is PR D's:
+  `BusService.pollLoop` calls `session.refreshCAStatus()` on the first tick and every 10th 500 ms
+  tick (`BusService.caStatusEveryTicks = 10`), forced after `trustCA()`/`untrustCA()`. PR D's Kit
+  `CATrustFacts` has fields `{trusted, scope, fingerprint, platform, installing, needsAdmin}` and
+  helpers `{text, state, remedy, actions, step, quicCaveat, notTrustedLine, laneTitle, …}` (read from
+  `claude/ca-trust-mac` `4ae616d3`); this spec consumes **`text`** (the one-line fact string),
+  `actions` and `step` instead of recomputing the CA words — PR D's `state` is a `LaneState`
+  (`ok`/`working`/`warning`), not a string, and its `remedy` is a longer sentence (`notTrustedLine`,
+  `needsAdminMacLine`), neither of which is a line here (one vocabulary — the strings in §D2a are PR D's). This spec's own CA work (the `make(caTrust:)`
+  slot, the `.caTrust` entry, the `.caTrusted` step, the Flows/Status rendering, and the hand-over
+  that replaces PR D's interim `StatusPanel` insertion — `stepsWithCATrust` and `CATrustRow` — with
+  this spec's step and row, keeping the words) starts only once PR D is on `main`. The system-proxy,
   All Apps and Scope parts are not gated on it and land first (plan Tasks 1/2 vs 1b/2b).
+- **`SystemProxyState` is PR #246's file.** The type is defined here (§D2) as the shared contract and
+  shipped — type plus 31 Kit tests and `init?(compact:listenAddress:)`, no polling, no other file —
+  by the system-proxy session as PR #246 (branch `claude/system-proxy-kit-type`) ahead of this
+  spec's PR (plan gate 5). This spec declares nothing of it and compiles against it; PR4 proper
+  keeps ownership and adds `SystemProxyFacts` and the `proxy.status.system_proxy` polling that
+  writes `Session.systemProxy`. TR-AC1/2 are the contract PR #246's tests pin.
 - **`FlowSummary` decoder is a separate claim.** Mapping the wire's `tunnel` field onto
-  `FlowRow.tls` edits `AitmproxyKit/FlowSummary.swift` and adds its Kit tests; the coordinator has
-  asked the orchestrator for that claim. It is plan Task 1c, gated on the answer; everything else
-  here is independent of it, and TR-AC20 becomes unconditional once Task 1c is in.
-- **Start SHA and claims.** Code starts from `main` at or after `8175eea3` (v0.5.9, PR #228 merged; supersedes `5eac2a50`) and
-  after the fixture-removal PR; this worktree is rebased onto `5eac2a50` and the design is
-  against the working tree. The orchestrator's claim approval is granted for the files in §D7.
-  In `Shell/ShellView.swift` only `EmptyFlows` (the struct at ~319–336) and the insertion of the
-  one new banner in `MainView.flows` (~174–200) may change; lines 49–62 (the palette overlay) and
-  the palette transition belong to another session and are not touched.
+  `FlowRow.tls` edits `AitmproxyKit/FlowSummary.swift` and adds its Kit tests; the orchestrator
+  granted that claim 2026-11-01 (plan gate 4 and "Coordinator contract for Task 1c"). It is plan
+  Task 1c; everything else here is independent of it, and TR-AC20 becomes unconditional once Task
+  1c is in.
+- **Start SHA and claims.** This design is against `main 8e19c2e3` (this worktree's base; v0.5.9 /
+  PR #228 and the system-proxy verbs PR #214 are in; it supersedes the `5eac2a50` and `8175eea3`
+  references of earlier revisions). Code starts after the fixture-removal mac PR (gate 1), PR 4a
+  (gate 5) and, for the CA parts, PR D (gate 3). The orchestrator's file claims are the plan's
+  gate 2, answered 2026-11-01. In `Shell/ShellView.swift` only `EmptyFlows` (the struct at ~316–336)
+  and the insertion of the one new banner in `MainView.flows` (~171–200) may change; lines 49–62
+  (the palette overlay) and the palette transition belong to another session and are not touched.
 - **One model.** `ConnectionSummary` is extended; no parallel type. The route words live in
-  `AitmproxyKit/ConnectionSummary.swift`; the system-proxy value in the new
+  `AitmproxyKit/ConnectionSummary.swift`; the system-proxy value in PR 4a's
   `AitmproxyKit/SystemProxyState.swift`. Both surfaces read `Session.trafficRoutes`, a one-line
   accessor of `connectionSummary.routes` (§D7).
 - **Words, exactly** (§D2a, §D4). "All Apps" is the feature's name in every user-facing string
@@ -165,32 +210,38 @@ client-side flag.
   hosts of every app" is carried by the model (`TrafficRoute.detail`) and shown on both surfaces.
 - **Shared vocabulary** (§D2a): `SystemProxyState`, `SystemProxyState.Endpoint`,
   `SystemProxyRoute` and the system-proxy words are public, stable and additive-only from the
-  moment they land; the sibling set-system-proxy spec consumes them and adds the reserved
-  actions beside them. `CATrustFacts`, `TrafficRoute.Kind.caTrust` and the CA words are shared the
-  same way with the system-proxy-automation session (it writes the install side and consumes this
-  `ConnectionSummary` model). This spec may use only `openNetworkSettings` (new),
-  `copyListenAddress`, `openScope`, `turnCaptureOn` and the existing `openCaptureSettings` /
-  `approveInSystemSettings`; `.trustCA` and `.openCAPanel` are reserved, so the CA step and row
-  ship with no action until they land.
-- **The read is the effective global setting.** `CFNetworkCopySystemProxySettings()` returns
+  moment they land (PR #246 ships them with `init?(compact:listenAddress:)`); PR4 adds `SystemProxyFacts`
+  and the reserved actions beside them. `CATrustFacts`, `TrafficRoute.Kind.caTrust` and the CA words are
+  shared the same way with the CA-trust session (PR D writes the install side and the facts; this
+  `ConnectionSummary` model consumes them). This spec may use `addScopeHost` (new),
+  `copyListenAddress`, `openScope`, `turnCaptureOn`, the existing `openCaptureSettings` /
+  `approveInSystemSettings`, and PR D's `.trustCA` / `.openCAPanel` (consumed, never declared). It
+  adds no `openNetworkSettings` (denied) and leaves the system-proxy entry's `actions` empty for
+  PR4's `.setSystemProxy`.
+- **The read is the core's, and it is the effective global setting.** `proxy.status.system_proxy`
+  (PR4; the core refreshes it ≤ 5 s and immediately after `proxy.system.set`/`unset`) classifies
   the system-wide effective proxies, which follow the PRIMARY network service (per-service values
-  can disagree, e.g. under a VPN). The model reads that and nothing per-service; the words say
-  "system proxy", never a service name.
+  can disagree, e.g. under a VPN — research 22 §2.4, an inference from issue reports and the
+  SystemConfiguration headers, not from configd source). The app reads nothing per-service and
+  nothing from CFNetwork; the words say "system proxy", never a service name.
 - **Tripwires.** `tools/check-connection-words.sh` must keep failing on a view that spells a
   connection word, including the new route words (its word list gains them, §D9).
   `tools/check-capture-operator-only.sh` rule 5 parses `Shell/ShellView.swift` for exactly one
   `ExtensionController(` construction and one `.start()` on it: that block is not touched.
   `tools/check-capture-toggle.sh` NS-AC4 (ShellView reads no `capture.enabled`, calls no
   `CaptureSwitch`, touches no `extensionController`) must hold for the new banner file too.
-- **The system-proxy fact is a value.** `ConnectionSummary.make` takes `SystemProxyState?`;
-  the only code that calls `CFNetworkCopySystemProxySettings()` is `Bus/SystemProxyReader.swift`
-  in the app target, called only from `BusService`'s live connection (§D6).
-- **Cadence.** No read faster than `BusService.pollInterval` (500 ms); the system-proxy read rides
-  the existing poll tick. `ca.status` is read on the same loop but every 10th tick (§D6): on macOS
-  it spawns `/usr/bin/security` per store (`crates/aitm-ca/src/exec.rs`), so a 500 ms cadence would
-  mean ~8 subprocesses a second. Never a new verb.
-- **No new dependencies.** CFNetwork is a system framework; the Kit stays free of SwiftUI,
-  AppKit and CFNetwork (it parses a plain dictionary).
+- **The system-proxy fact is a value.** `ConnectionSummary.make` takes `SystemProxyState?`; no
+  file under `apps/mac/Sources` calls `CFNetworkCopySystemProxySettings()` (TR-AC8).
+  `Session.systemProxy` is nil until PR4's first answer and is written by PR4 only (§D6).
+- **Cadence.** Nothing new is polled. The system-proxy fact rides PR4's decode of the existing
+  `proxy.status` poll (`BusService.pollInterval`, 500 ms); the CA fact rides PR D's
+  `refreshCAStatus()` (first tick, then every 10th tick — on macOS `ca.status` spawns
+  `/usr/bin/security` per store, `crates/aitm-ca/src/exec.rs`; two stores at 2 ticks/s would be
+  ~4 spawns a second — inference, unmeasured); `proxy.status.decrypt` is decoded from the same
+  `proxy.status` reply the app already polls (§D6). Never a new verb, never a new read.
+- **No new dependencies.** The Kit stays free of SwiftUI, AppKit, CFNetwork and
+  SystemConfiguration (it parses a plain dictionary and `JSONValue`); the app target imports
+  nothing new.
 - **Design rules.** Tokens from `Tok`/`Space`; `SmallButton`/`FlatButton`; hairline rules; no
   hard-coded colours; layout judged on the real-app screenshots.
 - **Honest, not nagging** (§D5): banner only while BOTH routes are closed and flows exist.
@@ -211,29 +262,46 @@ Flows empty state needs 0–2 lines with actions and the banner needs a predicat
 
 ### D2. Types (Kit, pure)
 
-`AitmproxyKit/SystemProxyState.swift` (new):
+`AitmproxyKit/SystemProxyState.swift` — **defined here as the shared contract, implemented by the
+system-proxy session (file owned by PR4; shipped as the tiny PR 4a = PR #246, branch
+`claude/system-proxy-kit-type`, with 31 Kit tests, ahead of this spec's PR — plan gate 5)**. PR #246
+also carries `init?(compact:listenAddress:)`, PR4's decoder of `proxy.status.system_proxy`
+(`points_at_us` → both endpoints at the listen address, `other` → both at `host:port`, `off` → `.off`,
+`unsupported` / `needs_privilege` / `unknown` / malformed → nil). This spec declares nothing of it; its
+`make(systemProxy:)` calls `state.route(to: listenAddress)` for the word, so `points_at_us` reads
+`system proxy on · L`:
 
 ```swift
-/// The effective global macOS HTTP/HTTPS system proxy as `CFNetworkCopySystemProxySettings()`
-/// reports it (follows the primary network service) — the one read-back every system-proxy
-/// surface in the app uses: this spec's route advice, the set-system-proxy toggle and
-/// `proxy.system.status`. `nil` endpoint = that protocol's *Enable key is 0 or absent. Built from
-/// the raw dictionary so the parser is testable without CFNetwork.
+/// The effective global macOS HTTP/HTTPS system proxy (follows the primary network service) — the
+/// one read-back every system-proxy surface in the app uses: this spec's route advice and PR4's
+/// toggle. Filled by PR4 from `proxy.status.system_proxy` via `init?(compact:listenAddress:)` (PR #246:
+/// points_at_us → both endpoints at the listen address, other → both at host:port, off → .off,
+/// unsupported / needs_privilege / unknown / malformed → nil) and from the `proxy.system.set`/`unset`
+/// replies. `nil` endpoint = that protocol's *Enable key is 0 or absent. `init(settings:)` is the pure
+/// dictionary form (number or numeric-string ports).
 public struct SystemProxyState: Hashable, Sendable {
     public struct Endpoint: Hashable, Sendable {
-        public var host: String
-        public var port: Int
-        /// "host:port"
-        public var address: String
+        public let host: String                      // PR #246: `let`, not `var`
+        public let port: Int
+        /// "host:port" (computed, plan call 3)
+        public var address: String { "\(host):\(port)" }
+        public init(host: String, port: Int)
     }
-    public var http: Endpoint?
-    public var https: Endpoint?
+    public let http: Endpoint?
+    public let https: Endpoint?
     public init(http: Endpoint?, https: Endpoint?)
     /// Keys "HTTPEnable", "HTTPProxy", "HTTPPort", "HTTPSEnable", "HTTPSProxy", "HTTPSPort"
     /// (the values of the kCFNetworkProxies* constants). Enable is any non-zero number; a Port is
-    /// accepted as a number or a numeric string (CFNetwork hands back NSNumber; the string form
-    /// costs nothing and was asked for by the system-proxy session, which shares this type).
+    /// accepted as a number or a numeric string (research 22 §2.2 documents only the dictionary's
+    /// shape — that CFNetwork hands back NSNumber is unverified; the string form costs nothing and
+    /// was asked for by the system-proxy session, which owns this type).
     public init(settings: [String: Any])
+    /// PR #246 / PR4: the bus object `proxy.status.system_proxy` (a `JSONValue`, the Kit's bus-object
+    /// convention). points_at_us → both endpoints at `listenAddress`; other → both at host:port;
+    /// off → .off; unsupported / needs_privilege / unknown / malformed → nil. An `other` whose endpoint
+    /// equals `listenAddress` → nil (unknown): the core reports its partial case "HTTP → us, HTTPS off"
+    /// as `other` at our own host:port, and two endpoints cannot express "partly at us".
+    public init?(compact: JSONValue, listenAddress: String)
     public static let off = SystemProxyState(http: nil, https: nil)
     /// Does the system proxy deliver traffic to a core listening at `listenAddress` ("host:port")?
     public func route(to listenAddress: String) -> SystemProxyRoute
@@ -250,44 +318,47 @@ public enum SystemProxyRoute: Hashable, Sendable {
 }
 ```
 
-Matching rule for `route(to:)`: ports equal, and hosts equal after lower-casing, or both
-loopback (`127.0.0.1`, `localhost`, `::1`), or the listen host is a wildcard (`0.0.0.0`, `::`)
-and the proxy host is loopback. `thisCore` is reported when at least one protocol matches (an
+Matching rule for `route(to:)`: ports equal, and hosts equal after lower-casing and stripping IPv6
+brackets (`[::1]` ≡ `::1`), or both loopback (`127.0.0.1`, `localhost`, `::1`), or the listen host is
+a wildcard (`0.0.0.0`, `::`) and the proxy host is loopback. `thisCore` is reported when at least one protocol matches (an
 HTTP-only system proxy does deliver `http://` traffic; the words say "HTTP only"). `.other` is a
-real, current case: Matt's Mac carries Proxyman's `127.0.0.1:9090` for HTTP and HTTPS.
+real, current case: Matt's Mac carries Proxyman's `127.0.0.1:9090` for HTTP and HTTPS. PR #246's
+`init?(compact:listenAddress:)` maps the core's one verdict `points_at_us` to both endpoints at the
+listen address, so `route(to:)` yields `.thisCore(true, true)` and the word is `system proxy on · L`;
+the `HTTP only` / `HTTPS only` lines remain for the dictionary form.
 
 `AitmproxyKit/ConnectionSummary.swift` additions:
 
 ```swift
 public enum ConnectionAction {
-    …, case openNetworkSettings           // NEW here: title "Open Network Settings…"
     …, case addScopeHost                  // NEW here: title "Add Host…" — the Scope entry's remedy button (opens Scope with its add sheet)
-    // RESERVED for the set-system-proxy session, not added by this spec:
+    // PR4 (system-proxy session), not added by this spec — fills the system-proxy entry's actions:
     //   case setSystemProxy, unsetSystemProxy
-    // RESERVED for the system-proxy-automation session (CA install side), not added by this spec:
+    // PR D (CA-trust session), consumed by this spec, never declared here:
     //   case trustCA /* title "Trust the aitmproxy CA" */, openCAPanel
-}
-extension ConnectionAction {
-    /// The System Settings pane the action opens; nil for every other action.
-    public var settingsURL: URL?   // openNetworkSettings → "x-apple.systempreferences:com.apple.Network-Settings.extension"
-                                   // approveInSystemSettings → the existing LoginItems URL (moved here: one table)
+    // Denied 2026-11-01 (orchestrator): openNetworkSettings — nothing sends the operator to System Settings ▸ Network
 }
 
-// AitmproxyKit/CATrustFacts.swift (new) — shared contract; IMPLEMENTED by the CA-trust session's PR (number TBD),
-// with exactly these names and strings, together with the two additive CAStatus fields (§D7)
-/// What the keychain says about the aitm CA, as `ca.status` reports it. `installing` and `remedy` are
-/// the sibling's verb-sourced fields (in-flight install, needs-admin); this spec passes the defaults.
+// AitmproxyKit — PR D's `CATrustFacts` (CA-trust session, branch `claude/ca-trust-mac`); this spec declares
+// nothing of it and consumes it through `Session.caTrust` (§D6)
 public struct CATrustFacts: Hashable, Sendable {
     public var trusted: Bool
     /// The store that reports trusted == "yes": "user" | "system"; nil when not trusted.
     public var scope: String?
     public var fingerprint: String?
-    public var installing: Bool = false
-    public var remedy: String? = nil
-    public init(trusted: Bool, scope: String?, fingerprint: String?, installing: Bool = false, remedy: String? = nil)
-    /// Pure, from the Kit's `CAStatus`. Failable: nil when no store reports "yes" or "no" (the core's
-    /// "unknown", or no stores), which renders as unknown — never as trusted, never as not trusted.
+    public var platform: String            // `ca.status.platform`; no default — tests pass "macos"
+    public var installing = false          // applied by PR D from Session.caTrustInstalling
+    public var needsAdmin = false          // applied by PR D from Session.caTrustNeedsAdmin
+    /// PR D: nil unless some store answered yes or no (`CAStatus.trustReported`); `Session.caTrust`
+    /// adds `caStatus.exists` — renders as unknown, never as trusted, never as not trusted.
     public init?(status: CAStatus)
+    // PR D's helpers (4ae616d3), consumed here:
+    //   text: String        — the one-line fact: "trusting CA…" | "CA trusted (System keychain)" | "CA trusted (user keychain)"
+    //                         | "CA trust needs an administrator" | "HTTPS is not captured until the CA is trusted"   → our `line`
+    //   actions             — [] installing; [.openCAPanel] trusted or needsAdmin; [.trustCA, .openCAPanel] otherwise → our `actions`
+    //   step                — GettingStartedStep(.caTrusted, title: trustCA.title when plain not-trusted else text,
+    //                         done: state == .ok, action: done ? nil : actions.first)                               → our step's title/action
+    // not used here: state (a LaneState ok/working/warning), remedy (notTrustedLine / needsAdminMacLine), quicCaveat, laneTitle, …
 }
 
 // AitmproxyKit/DecryptStatus.swift (new)
@@ -313,7 +384,8 @@ public struct TrafficRoute: Hashable, Sendable {
     /// What this route carries (the lane principle), the same on every state of the route:
     /// systemProxy → "every proxy-aware app, regardless of Scope"; allApps → "in-scope hosts of every app".
     public let detail: String
-    /// What opens the route, primary first; empty when open.
+    /// What opens the route, primary first; empty when open — and empty for the system-proxy entry
+    /// until PR4 fills `.setSystemProxy`.
     public let actions: [ConnectionAction]
     /// The state words: `line` up to its first " — " ("system proxy off", "All Apps off"), or the whole
     /// line when it has none (the quoted Scope sentence, verbatim with its period; the CA line). The
@@ -323,12 +395,14 @@ public struct TrafficRoute: Hashable, Sendable {
 }
 
 public struct TrafficRoutes: Hashable, Sendable {
-    /// nil until the system proxy has been read (first poll; a session with no live bus).
+    /// nil while the system proxy is unknown: before PR4 lands, before PR4's first `proxy.status`
+    /// answer, a session with no live bus, or a state the core cannot classify.
     public let systemProxy: TrafficRoute?
     /// nil when this build has no extension (`CaptureAdvice.unsupported`) or an external core is active.
     public let allApps: TrafficRoute?
     /// The Scope fact (not a route; under per-host decryption it gates decryption on both). Always
-    /// present: closed iff `scopeHostCount == 0`.
+    /// present: closed iff `!open` per §D3 (`!decrypt.decrypting` when `decrypt` is present and the
+    /// bus lane is `.ok`, else `scopeHostCount == 0`).
     public let scope: TrafficRoute
     /// The CA fact (not a route; it gates HTTPS on both). nil while `ca.status` is unread or unknown.
     public let caTrust: TrafficRoute?
@@ -337,14 +411,14 @@ public struct TrafficRoutes: Hashable, Sendable {
     public let advice: [TrafficRoute]
     /// The one-line banner text above the Flows table, or nil (§D5): the shown entries' `state`s joined " · ".
     public let banner: String?
-    /// The banner's one button: the highest-priority shown entry's `actions.first` (nil when that entry
-    /// has none). Priority: system proxy, All Apps, Scope, CA.
+    /// The banner's one button: the first shown entry that has an action, its `actions.first` (nil when
+    /// none has one). Priority: system proxy (PR4's Set as System Proxy, once filled), All Apps, Scope, CA.
     public let bannerAction: ConnectionAction?
     public var anyOpen: Bool
 }
 
 public struct GettingStartedStep {
-    public enum Kind { case coreRunning, busConnected, systemProxy /* NEW */, extensionOn, scopeSet, caTrusted /* from the CA-trust PR D */, firstFlow }
+    public enum Kind { case coreRunning, busConnected, caTrusted /* PR D's source order */, systemProxy /* NEW */, extensionOn, scopeSet, firstFlow } // source order is PR D's; the Getting-started STEPS order is make's (systemProxy, extensionOn, scopeSet, caTrusted)
     …
     /// The route's `detail` for the route/CA steps (shown as the row's help); nil for the others.
     public let detail: String?   // NEW, defaulted nil
@@ -357,8 +431,8 @@ public struct ConnectionSummary {
         core connection: CoreConnection?, activeKind: ActiveCoreKind, bus: BusState, role: String?,
         roleWarning: Bool, capability: CaptureCapability, captureSupported: Bool, scopeHostCount: Int,
         flowCount: Int, listenAddress: String, coreCapture: CoreCaptureStatus? = nil,
-        systemProxy: SystemProxyState? = nil,         // NEW, defaulted so existing call sites compile
-        caTrust: CATrustFacts? = nil,                 // NEW; nil = `ca.status` unread/unknown
+        systemProxy: SystemProxyState? = nil,         // NEW, defaulted so existing call sites compile; `Session.systemProxy`, written by PR4
+        caTrust: CATrustFacts? = nil,                 // NEW; PR D's `Session.caTrust`; nil = unread/unknown
         tunnelledFlowCount: Int = 0,                  // NEW; rows whose `tls == .tunnelled` (§D5)
         decrypt: DecryptStatus? = nil                 // NEW; `proxy.status.decrypt`, nil from an older core
     ) -> ConnectionSummary
@@ -406,27 +480,36 @@ this spec renders them. Wire source: `crates/aitm-plugins/src/capture.rs` `tunne
 `crates/aitm-plugins/src/detail.rs` ~355–380 (`meta.passive`, `meta.tunnel {mode, reason, bytes_up,
 bytes_down}`), labels in `crates/aitm-core/src/flow.rs`.
 
-The Kit `CAStatus` decoder gains nothing the sibling does not also need: `CATrustFacts(status:)`
-reads `stores.*.trusted` labels ("yes" → trusted with that store's scope; any "no" and no "yes" →
-not trusted; only "unknown"/none → nil) and `fingerprint_sha256`. `CAStatus.trusted: Bool` stays.
+`CATrustFacts(status:)`, anything on `CAStatus`, and the CA read are PR D's; nothing in this spec reads
+`CAStatus`. The CA entry's `line` and `actions` and the `caTrusted` step come from PR D's `text`,
+`actions` and `step` helpers (§D3/§D4); the strings in §D2a are PR D's and are the test oracle
+(TR-AC16). The field-by-field mapping is confirmed against PR D's file when plan gate 3 is recorded;
+if a helper returns a different string, §D2a is amended first and the literal follows PR D.
 
 ### D2a. Shared vocabulary (stable; consumed by the sibling set-system-proxy work)
 
-The sibling session adds operator-only `proxy.system.status/set/unset` verbs and a Settings ▸
-Proxy toggle. It consumes exactly these names and words and adds its own actions beside them; it
-does not redefine any of the following.
+The system-proxy session's operator-only `proxy.system.status/set/unset` verbs are on `main`
+(PR #214, `3d710ab7`). Its PR 4a ships `SystemProxyState.swift` (the type below, with its Kit
+tests, PR #246) ahead of this spec's PR, including `init?(compact:listenAddress:)` over
+`proxy.status.system_proxy = { state: off|points_at_us|other|unsupported|needs_privilege|unknown,
+host, port, managed_by_us, setting, supported, detail }`; its PR4 (after us) adds `SystemProxyFacts`,
+the `proxy.status` polling that writes `Session.systemProxy`, the Proxy ▸ toggle (⌥⌘P) and the
+actions `.setSystemProxy`/`.unsetSystemProxy`. It
+uses exactly these names and words and does not redefine any of the following.
 
 | Name | Meaning |
 |---|---|
-| `SystemProxyState` | effective global read-back of the macOS HTTP/HTTPS proxy; `http`/`https: Endpoint?`; `init(settings:)`; `.off` |
-| `SystemProxyState.Endpoint` | `host`, `port`, `address` ("host:port") |
+| `SystemProxyState` | effective global read-back of the macOS HTTP/HTTPS proxy; `http`/`https: Endpoint?`; `init(settings:)` (Port as number or numeric string); `init?(compact:listenAddress:)` (the bus object; PR #246); `.off`; PR #246's file |
+| `SystemProxyState.Endpoint` | `host`, `port`, `address` ("host:port", computed), `init(host:port:)` |
 | `SystemProxyRoute` | `.off`, `.thisCore(http:https:)`, `.other(host:port:)` — `state.route(to: listenAddress)` |
-| `ConnectionAction.openNetworkSettings` | title "Open Network Settings…"; `settingsURL` = `x-apple.systempreferences:com.apple.Network-Settings.extension` |
+| `Session.systemProxy: SystemProxyState?` | declared by this spec's Task 2 (nil, never written by this spec's code — plan call 4); **written by PR4 only**, from the `system_proxy` sub-object of every `proxy.status` poll and from the direct replies of `proxy.system.set`/`unset`; nil = unknown, never rendered as "off" |
 | `ConnectionAction.addScopeHost` | title "Add Host…"; opens the Scope page with its add sheet — the Scope entry's remedy button (shared with S-073/S-074/S-080) |
-| `ConnectionAction.setSystemProxy`, `.unsetSystemProxy` | **reserved names** for the sibling's actions (candidate titles "Set as System Proxy" / "Restore System Proxy", research 22 §4); not implemented here |
+| `ConnectionAction.setSystemProxy`, `.unsetSystemProxy` | **reserved names** for PR4's actions (candidate titles "Set as System Proxy" / "Restore System Proxy", research 22 §4); PR4 fills the system-proxy entry's `actions` and the `systemProxy` step's action with `.setSystemProxy`; empty here |
+| `SystemProxyFacts` | PR4's richer value (`managed_by_us`, `setting`, `supported`, `detail`) beside `SystemProxyState`; not read here |
 | `TrafficRoute.Kind.systemProxy` / `.allApps` / `.scope` / `.caTrust` | the two routes, and the two facts that gate what they carry (Scope → decryption, CA → HTTPS) |
-| `CATrustFacts` | `trusted`, `scope` ("user" \| "system"), `fingerprint`, `installing` (sibling), `remedy` (sibling); `init?(status: CAStatus)`; nil slot = unknown |
-| `ConnectionAction.trustCA`, `.openCAPanel` | **reserved names** for the system-proxy-automation session (title "Trust the aitmproxy CA"); not implemented here |
+| `CATrustFacts` | PR D's: fields `{trusted, scope ("user" \| "system"), fingerprint, platform, installing, needsAdmin}`, `init?(status: CAStatus)`, helpers `{text, state, remedy, actions, step, quicCaveat, notTrustedLine, laneTitle, …}`; nil slot = unknown |
+| `Session.caTrust: CATrustFacts?` | PR D's published CA state (`Session+CATrust.swift`); the only CA value this spec reads |
+| `ConnectionAction.trustCA`, `.openCAPanel` | PR D's (title "Trust the aitmproxy CA"); consumed here as the CA entry's actions (PR D's `actions`) and the `caTrusted` step's action |
 
 **Lane principle** (in `TrafficRoute.detail`, the GLOSSARY, and both surfaces):
 *system proxy → every proxy-aware app, regardless of Scope; All Apps → in-scope hosts of every app.*
@@ -447,18 +530,18 @@ never reads "off". The sibling's "changed by another app" (research 22 §4) is *
 not defined here. The bare state words a toggle or status row needs are the prefixes above:
 `system proxy off`, `system proxy on · L`, `system proxy on · H:P, not this core`.
 
-CA words (one string per fact, both surfaces; S = `scope` rendered "user keychain" / "system keychain"):
+CA words (one string per fact, both surfaces, all PR D's `text`; S = `scope` rendered "user keychain" / "System keychain" — capital S, PR D verbatim):
 
 | Fact | Line | Detail |
 |---|---|---|
 | trusted | `CA trusted (S)` — e.g. `CA trusted (user keychain)`, accurate because the core's macOS default install scope is User, the login keychain | `HTTPS on both routes` |
 | not trusted | `HTTPS is not captured until the CA is trusted` (the Status step's title is `Trust the aitmproxy CA`; the Flows row and the banner use the line) | `HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then` |
-| installing (sibling sets `installing`) | `trusting CA…` | as not trusted |
-| needs admin (sibling sets `remedy`) | `CA trust needs an administrator` (= `remedy`) | as not trusted |
+| installing (PR D sets `installing`) | `trusting CA…` | as not trusted |
+| needs admin (PR D sets `needsAdmin`) | `CA trust needs an administrator` (PR D's `text`; its `remedy` is the longer `needsAdminMacLine`, shown on the CA page, not here) | as not trusted |
 | unread / unknown (nil slot) | nothing — no step, no row, no banner clause | — |
 
-The last two rows are the sibling's strings, listed here so there is one table; this spec never sets
-`installing` or `remedy`.
+Every row is PR D's string (its `text`/`step` helpers), listed here so there is one table;
+this spec never sets `installing` or `needsAdmin`.
 
 **Scope words — shared with the improve-loop session's stories S-073/S-074/S-080** (confirmed verbatim):
 
@@ -484,12 +567,15 @@ everywhere.
 Let `L` = `listenAddress`, `a` = `CaptureAdvice.make(capability:supported:scopeHostCount:)`
 (already computed for the capture lane), `n` = `scopeHostCount`.
 
-System proxy route (`nil` when `systemProxy == nil`); `detail` = `every proxy-aware app, regardless of Scope`:
+System proxy route (`nil` when `systemProxy == nil` — unknown: before PR4, before its first answer,
+or a state the core cannot classify); `detail` = `every proxy-aware app, regardless of Scope`.
+**Orchestrator ruling 2026-11-01:** the closed entries carry **no action in this PR**; PR4 fills
+`[.setSystemProxy]` (its Set as System Proxy, the OS's own prompt). `.openNetworkSettings` is denied.
 
 | `systemProxy.route(to: L)` | open | `line` | `actions` |
 |---|---|---|---|
-| `.off` | no | `system proxy off — set L as the system proxy, or point a client at it` | `[.openNetworkSettings, .copyListenAddress]` |
-| `.other(H, P)` | no | `system proxy on · H:P, not this core — set L as the system proxy, or point a client at it` | `[.openNetworkSettings, .copyListenAddress]` |
+| `.off` | no | `system proxy off — set L as the system proxy, or point a client at it` | `[]` (PR4: `[.setSystemProxy]`) |
+| `.other(H, P)` | no | `system proxy on · H:P, not this core — set L as the system proxy, or point a client at it` | `[]` (PR4: `[.setSystemProxy]`) |
 | `.thisCore(true, true)` | yes | `system proxy on · L` | `[]` |
 | `.thisCore(true, false)` | yes | `system proxy on · L · HTTP only` | `[]` |
 | `.thisCore(false, true)` | yes | `system proxy on · L · HTTPS only` | `[]` |
@@ -508,8 +594,9 @@ banner never says it twice. (`CaptureAdvice.onEmptyScope` still drives the captu
 
 Scope fact (always present; `kind = .scope`; `detail` = `Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel`):
 
-Let `d` = `decrypt` (nil from an older core); closed ⇔ `d != nil ? !d.decrypting : scopeHostCount == 0`;
-`N` = `d?.scopeHosts ?? scopeHostCount`.
+Let `d` = `decrypt` when the bus lane's state is `.ok`, else nil (nil also from an older core; the
+one-line `BusService` grant has no disconnect reset, so a stale `decrypt` is ignored by rule, not by a
+reset); closed ⇔ `d != nil ? !d.decrypting : scopeHostCount == 0`; `N` = `d?.scopeHosts ?? scopeHostCount`.
 
 | state | open | `line` (= `state`: no " — " clause) | `actions` |
 |---|---|---|---|
@@ -521,15 +608,21 @@ The text is the core's own sentence so every surface in the product (TUI, web, t
 string (core spec D9) and a core wording change reaches this app without an edit; the remedy is the
 **button** `Add Host…`, never appended text. The open form stays ours: the core's `advice` is null then.
 
-CA fact (`nil` when `caTrust == nil`); `kind = .caTrust`, `detail` = `HTTPS on both routes` when
-trusted, else `HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then`:
+CA fact (`nil` when `caTrust == nil`, i.e. PR D's `Session.caTrust` is nil); `kind = .caTrust`,
+`open = trusted`; `line` = PR D's `text`, `actions` = PR D's `actions`, `detail` = `HTTPS on both
+routes` when trusted, else `HTTPS is not captured until the CA is trusted — browsers using QUIC load
+directly until then`. What those helpers yield (PR D's own code, `CATrustFacts.swift` on
+`claude/ca-trust-mac` `4ae616d3`; `installing` wins over `trusted`, which wins over `needsAdmin`):
 
-| `caTrust` | open | `line` | `actions` |
+| `caTrust` | open | `line` (= `text`) | `actions` |
 |---|---|---|---|
-| `trusted == true` | yes | `CA trusted (user keychain)` / `(system keychain)` per `scope`; `CA trusted` when `scope` is nil | `[]` |
 | `installing == true` | no | `trusting CA…` | `[]` |
-| `remedy != nil` | no | the `remedy` text (sibling's `CA trust needs an administrator`) | `[.trustCA, .openCAPanel]` |
-| otherwise | no | `HTTPS is not captured until the CA is trusted` | `[.trustCA, .openCAPanel]` (PR D's cases; title "Trust the aitmproxy CA" — the banner's button when the CA is the highest-priority shown fact) |
+| `trusted == true` | yes | `CA trusted (System keychain)` when `scope == "system"`, else `CA trusted (user keychain)` (PR D has no scope-nil form: trusted ⇔ a store said yes) | `[.openCAPanel]` — an open entry's actions are not offered (§D2: empty when open) |
+| `needsAdmin == true` | no | `CA trust needs an administrator` | `[.openCAPanel]` (PR D offers the panel only; the step's action is `.openCAPanel`) |
+| otherwise | no | `HTTPS is not captured until the CA is trusted` | `[.trustCA, .openCAPanel]` (title "Trust the aitmproxy CA" — the banner's button when the CA is the first shown fact with an action) |
+
+The open entry stores `actions = []` like every other open entry (PR D's `[.openCAPanel]` for a trusted
+fact is the CA page's affordance, not a route remedy); the closed entries store PR D's `actions` as is.
 
 `advice` = `[systemProxy, allApps, scope, caTrust].compactMap { $0 }.filter { !$0.open }`, in that
 order, when the bus lane's state is `.ok`, else `[]` (the scope is known only through the bus).
@@ -538,12 +631,12 @@ order, when the bus lane's state is `.ok`, else `[]` (the scope is known only th
 ### D4. Words and where they appear
 
 **Getting-started steps**, in order: `coreRunning`, `busConnected`, `systemProxy`,
-`extensionOn`, `scopeSet`, `caTrust`, `firstFlow`.
+`extensionOn`, `scopeSet`, `caTrusted`, `firstFlow`.
 
-- `systemProxy` (new): **omitted from `steps` while `routes.systemProxy == nil`** (the fact has
-  not been read: anti-goal "lying"). `title` = `routes.systemProxy.line` verbatim; `detail` =
-  the route's `detail`; `done` = `open`; `action` = `.openNetworkSettings` when closed, nil when
-  open.
+- `systemProxy` (new): **omitted from `steps` while `routes.systemProxy == nil`** (the fact is
+  unknown — before PR4, before its first answer: anti-goal "lying"). `title` =
+  `routes.systemProxy.line` verbatim; `detail` = the route's `detail`; `done` = `open`; `action` =
+  nil in this PR (PR4 sets `.setSystemProxy` when closed).
 - `extensionOn`: `unsupported` → "All Apps capture is not in this build" (unchanged, action nil);
   `.off` / `.awaitingApproval` / `.degraded` → `title` = the All Apps route `line`, `detail` = the
   route's `detail`, `done` false, action `.turnCaptureOn` / `.approveInSystemSettings` /
@@ -557,15 +650,28 @@ order, when the bus lane's state is `.ok`, else `[]` (the scope is known only th
   decrypted` with N = `decrypt.scopeHosts` when present (`Format.count`; was "Scope has n hosts"),
   action nil, `detail` = the Scope entry's `detail`.
 - `coreRunning`, `busConnected`, `firstFlow`: unchanged, `detail` nil.
-- `caTrust` (new): **omitted while `routes.caTrust == nil`** (unread or unknown: we can neither say
-  it is trusted nor that it is not, and a step that cannot name its fix is noise — the CA page shows
-  the raw detail). `done` = `open`; `title` = `Trust the aitmproxy CA` when not done, `CA trusted
-  (user keychain)` (the route line) when done; `detail` = the route's `detail`; `action` = nil in
-  this spec (no `ConnectionAction` reaches the CA page today; the sibling's `.trustCA` becomes the
-  primary action and `.openCAPanel` the secondary when they land — the step is listed without a
-  button until then, and the CA page stays reachable from the sidebar and Proxy ▸ Certificate
-  Authority…). The Status step title and the Flows line differ on purpose for this one fact (a
-  checklist names the task, a flow list names the consequence); both strings come from the model.
+- `caTrusted` (PR D's `GettingStartedStep.Kind`): **omitted while `routes.caTrust == nil`** (unread
+  or unknown: we can neither say it is trusted nor that it is not, and a step that cannot name its
+  fix is noise — the CA page shows the raw detail). `done` = `open`; `title` and `action` are PR D's
+  `step` (`CATrustFacts.step`, 4ae616d3): `title` = `Trust the aitmproxy CA` for the plain not-trusted
+  fact, else `text` (`CA trust needs an administrator` when `needsAdmin`, `trusting CA…` while
+  `installing`, `CA trusted (user keychain)` / `(System keychain)` when done); `action` =
+  `actions.first` when not done — `.trustCA` for the plain not-trusted fact (PR D's confirm and admin
+  prompts), **`.openCAPanel` when `needsAdmin`**, nil while `installing` — and nil when done.
+  `.openCAPanel` stays the Flows row's second button, and the CA page is reachable from the sidebar
+  and Proxy ▸ Certificate Authority…; `detail` = the route's `detail`. **Hand-over from PR D:** PR D
+  ships an interim `StatusPanel` insertion (`stepsWithCATrust`, `CATrustRow`) so its step is visible
+  before this spec lands — it inserts `session.caTrustStep` **after `busConnected`**; this spec's step
+  replaces it — the insertion and the row call are removed, the words stay, and the step **moves to
+  after `scopeSet`** (§D7, plan Task 2b). **PR D's two nil-facts rows are dropped here (Architect's
+  call, open question 21):** `CATrustFacts.unknownStep()` ("CA trust unknown — open the Certificate
+  Authority panel") and `notGeneratedStep()` ("CA not generated yet — the core creates it on first
+  start"), which PR D shows when `ca.status` was read but `caTrust` is nil, do not enter this list,
+  because `make` reads `Session.caTrust` and nothing else (the orchestrator's ruling) and this spec
+  omits the step whenever `routes.caTrust == nil`; the first-run sheet (`Shell/SetupSheet.swift`,
+  PR D's) keeps `session.caTrustStep` with both rows, and the CA page shows the raw status.
+  The Status step title and the Flows line differ on purpose for this one fact (a checklist names
+  the task, a flow list names the consequence); both strings come from the model.
 
 Route lines start lower-case (except the proper name "All Apps") and the Status rows show them
 verbatim, done or not (**Architect's call**: one string per fact beats a sentence-cased twin; the
@@ -573,29 +679,39 @@ sibling toggle reuses the same strings). `StepRow` gains `.help(step.detail ?? s
 one line in `StatusPanel.swift`.
 
 **Flows empty state** (`EmptyFlows`, unfiltered): the "No flows yet" headline stays. Under it,
-when `routes.advice` is non-empty, one row per entry — the `line` with its primary action as a
-`SmallButton` (plus Copy Address for the system-proxy line; the CA row has no button until the
-reserved actions land), and the entry's `detail` as a smaller tertiary line beneath — *instead of* the generic "Point a client at L or open the
-browser." line; when `advice` is empty the generic line stays as today. The filtered state ("No
-flows match") is unchanged.
+when `routes.advice` is non-empty, one row per entry — the `line` with every action in the entry's
+`actions` as `SmallButton`s (Add Host… and Open Scope… for the Scope row; Trust the aitmproxy CA and
+the CA page for the CA row; All Apps Settings… for the All Apps row; none for the system-proxy row
+until PR4 fills `.setSystemProxy`), and the entry's `detail` as a smaller tertiary line beneath —
+*instead of* the generic "Point a client at L or open the browser." line; when `advice` is empty the
+generic line stays as today. The filtered state ("No flows match") is unchanged.
 
 **Flows banner**: §D5.
 
 ### D5. The banner predicate (exact) and the one-line rule
 
 ```
-routesClosed   ⇔  routes.systemProxy != nil  ∧  !routes.systemProxy.open
-               ∧  (routes.allApps == nil  ∨  !routes.allApps.open)
-scopeClosed    ⇔  scopeHostCount == 0
+knownOpenRoute ⇔  (routes.systemProxy?.open ?? false)  ∨  (routes.allApps?.open ?? false)
+closedRoutes   =  knownOpenRoute ? [] : [systemProxy, allApps].compactMap{$0}.filter{!$0.open}   // an unknown system proxy (nil) is never named
+scopeClosed    ⇔  !routes.scope.open
 allTunnels     ⇔  flowCount > 0  ∧  tunnelledFlowCount == flowCount
 caClosed       ⇔  routes.caTrust != nil  ∧  !routes.caTrust.open
-shown          =  (routesClosed ? [systemProxy, allApps].compactMap{$0}.filter{!$0.open} : [])
-               +  (scopeClosed ∧ (routesClosed ∨ allTunnels) ? [scope] : [])
+shown          =  closedRoutes
+               +  (scopeClosed ∧ (!closedRoutes.isEmpty ∨ allTunnels) ? [scope] : [])
                +  (caClosed ? [caTrust] : [])                       // priority order
 banner != nil  ⇔  flowCount > 0  ∧  bus.state == .ok  ∧  !shown.isEmpty
 banner         =  shown.map(\.state).joined(" · ")            // text: states only, no remedy clause
-bannerAction   =  shown.first?.actions.first                     // the one button: the highest-priority remedy
+bannerAction   =  shown.first { !$0.actions.isEmpty }?.actions.first   // the one button: the first shown fact that has a remedy
 ```
+
+**Why `knownOpenRoute`, not a "both routes read and closed" rule (Architect's call, 2026-11-01).** With no
+reader of our own the system proxy is unknown on every build until PR4 lands, and unknown again until
+PR4's first answer; a banner that waited for a *known-closed* system proxy would never name a closed All
+Apps. The rule names only what is known closed and says nothing about the unknown (anti-goal "lying"):
+an unknown system proxy beside an open All Apps is a known open route — no banner; beside a closed All
+Apps the banner reads `All Apps off …` and never mentions the system proxy. **`bannerAction` skips an
+entry with no action (Architect's call):** a closed system-proxy fact carries none until PR4, and must
+not swallow the button.
 
 `tunnelledFlowCount` = the rows whose `FlowRow.tls == .tunnelled` (`AitmproxyKit/Flow.swift`:
 "CONNECT tunnel passed through; not decrypted"), counted by `Session+Connection` and passed into
@@ -616,134 +732,147 @@ among readable ones needs no banner. When every row is a tunnel the operator can
 the one line says why; with a route open and some rows readable, the Scope fact is not banner
 material (anti-goal: nagging). It always appears in the empty state when closed.
 
-**Composed form (Architect's call, after the improve-loop measurement; shape aligned with core
-spec D9).** Up to four facts compete for one 40 pt line, and full lines with remedies would be
-~260 characters. The banner names every shown fact by its *state words* joined with ` · ` and
-carries **no remedy text at all**; the remedy is the banner's one **button**, the highest-priority
-shown fact's primary action: system proxy → `Open Network Settings…`, All Apps off → `All Apps
-Settings…`, Scope → `Add Host…`, CA → `Trust the aitmproxy CA`. So the system-proxy and CA
-remedies become buttons too, and the Scope text is the core's sentence untouched. Literals
-(button in the last column):
+**Composed form (Architect's call, after the improve-loop observation; shape aligned with core
+spec D9).** Up to four facts compete for one `Tok.Size.Row.dense` (28 pt) line, and full lines with
+remedies would be ~260 characters. The banner names every shown fact by its *state words* joined
+with ` · ` and carries **no remedy text at all**; the remedy is the banner's one **button**, the
+first shown fact's primary action: system proxy → PR4's `Set as System Proxy` (none in this PR),
+All Apps off → `All Apps Settings…`, Scope → `Add Host…`, CA → `Trust the aitmproxy CA`. So the
+CA remedy becomes a button too, and the Scope text is the core's sentence untouched. Literals
+(button in the last column; "system proxy unknown" is every build until PR4 lands):
 
 | Shown facts | `banner` | `bannerAction` |
 |---|---|---|
-| fresh install: system proxy off + All Apps off + scope empty + CA not trusted | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted` | `.openNetworkSettings` |
-| system proxy off + All Apps off + scope empty | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.` | `.openNetworkSettings` |
-| system proxy off + All Apps off + scope set | `system proxy off · All Apps off` | `.openNetworkSettings` |
+| fresh install until PR4: system proxy unknown + All Apps off + scope empty + CA not trusted | `All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted` | `.openCaptureSettings` |
+| fresh install with PR4: system proxy off + All Apps off + scope empty + CA not trusted | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted` | `.openCaptureSettings` in this PR (PR4: `.setSystemProxy`) |
+| system proxy off + All Apps off + scope empty | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.` | `.openCaptureSettings` (PR4: `.setSystemProxy`) |
+| system proxy off + All Apps off + scope set | `system proxy off · All Apps off` | `.openCaptureSettings` (PR4: `.setSystemProxy`) |
+| system proxy unknown + All Apps off + scope set | `All Apps off` | `.openCaptureSettings` |
 | a route open + scope empty + every row a tunnel | `Nothing is decrypted until a host is in Scope.` | `.addScopeHost` |
 | a route open + scope empty + every row a tunnel + CA not trusted | `Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted` | `.addScopeHost` |
 | a route open + scope empty + some rows readable (plain HTTP) | nil, or `HTTPS is not captured until the CA is trusted` when the CA is not trusted | — / `.trustCA` |
 | a route open + CA not trusted | `HTTPS is not captured until the CA is trusted` | `.trustCA` |
-| no extension in the build + system proxy off + scope empty | `system proxy off · Nothing is decrypted until a host is in Scope.` | `.openNetworkSettings` |
-| no extension in the build + system proxy off + scope set | `system proxy off` | `.openNetworkSettings` |
+| no extension in the build + system proxy off + scope empty | `system proxy off · Nothing is decrypted until a host is in Scope.` | `.addScopeHost` (PR4: `.setSystemProxy`) |
+| no extension in the build + system proxy off + scope set | `system proxy off` | nil in this PR (PR4: `.setSystemProxy`) |
+| no extension in the build + system proxy unknown + scope empty + every row a tunnel | `Nothing is decrypted until a host is in Scope.` | `.addScopeHost` |
 
 A closed CA fact alone does not close the routes, but it adds its state whenever flows exist and
 HTTPS is not trusted: the flows the operator sees are the plain-HTTP ones and every HTTPS attempt
 is failing right now.
 
 The view (`RouteBanner`) shows `banner` in one line — `lineLimit(1)`, `truncationMode(.tail)`,
-`Tok.Size.Row.dense` (40 pt), tertiary ink, the former `ScopeBanner` shape — with the full
-`banner` and the shown entries' `detail`s joined with ` · ` as its `.help`, and **one** `SmallButton`
-for `bannerAction` (`Open Network Settings…` / `All Apps Settings…` / `Add Host…` / `Trust the
-aitmproxy CA`); nothing else sits on the line.
+`Tok.Size.Row.dense` (28 pt; `Tokens.swift:296`), tertiary ink, the former `ScopeBanner` shape — with
+the full `banner` and the shown entries' `detail`s joined with ` · ` as its `.help`, and **one**
+`SmallButton` for `bannerAction` (`All Apps Settings…` / `Add Host…` / `Trust the aitmproxy CA`;
+PR4 adds `Set as System Proxy`); nothing when `bannerAction` is nil; nothing else sits on the line.
 
 **One banner line, everywhere flows are listed (§D8).** On every page that renders the flow
 table — Flows, Pinned, Domains, Apps — the route banner is the only banner: shown iff
 `routes.banner != nil`, above the table; when nothing is shown, no banner at all. `ScopeBanner`
 and `AppsAttributionBanner` are no longer rendered on any page (§D8). The column header therefore
-sits at most one 40 pt line below the chip bar, never two.
+sits at most one 28 pt line (`Tok.Size.Row.dense`) below the chip bar, never two (56 pt).
 
-### D6. The live reader and its cadence (Architect's call: poll tick)
+### D6. Where the live facts come from (no reader of our own — orchestrator rulings 2026-11-01)
 
-`Bus/SystemProxyReader.swift` (app target, new): one static function that bridges
-`CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any]` — the effective
-global settings — into `SystemProxyState(settings:)`, `nil` when the call returns nothing.
-`BusService` calls it right after `refreshProxyStatus()` in `pollLoop` and once after `connect()`
-succeeds, writing `session.systemProxy` only when the value changed (no re-render churn).
-`Session.systemProxy: SystemProxyState?` is a plain observed property, `nil` until the first live
-read; `Session+Connection.connectionSummary` passes it to `make`.
+Three `Session` facts feed `make`; this spec writes exactly one of them.
 
-Why the poll tick and not `SCDynamicStore` notifications: (1) the read is a sub-millisecond
-dynamic-store dictionary copy, so twice a second costs nothing measurable; (2) it lands with the
-same ≤500 ms latency as `scope.list` and `proxy.status`, so the two route facts never disagree
-in age; (3) a notification source needs a run-loop/dispatch hookup, a second framework import
-and its own teardown — a moving part with no pure test; (4) it honours "no polling faster than
-the existing poll loop" by construction. If the read ever shows in a profile,
-`SCDynamicStoreSetNotificationKeys` on `State:/Network/Global/Proxies` is the drop-in; nothing in
-the model changes. The sibling's `proxy.system.status` verb, when it lands, can replace the
-in-app read with the core's — same type, same words.
+- **`Session.systemProxy: SystemProxyState?`** — declared by this spec's Task 2 as a plain observed
+  property on `Session.swift`, nil at init and **never written by this spec's code** (plan call 4).
+  PR4 (system-proxy session, after this PR) writes it from the `system_proxy` sub-object of every
+  `proxy.status` poll (existing cadence — `refreshProxyStatus()` every 500 ms tick; the core refreshes it ≤ 5 s and immediately
+  after set/unset) and from the direct replies of `proxy.system.set`/`unset`, via PR #246's
+  `SystemProxyState.init?(compact:listenAddress:)` (points_at_us → both endpoints at the listen
+  address, other → both at host:port, off → `.off`, unsupported / needs_privilege / unknown /
+  malformed → nil). Until PR4 lands the value is nil on
+  every build: the `systemProxy` step is omitted, no system-proxy words appear anywhere, and nothing
+  reads "off". There is no `Bus/SystemProxyReader.swift`, no `CFNetworkCopySystemProxySettings()`
+  call and no `refreshSystemProxy()` in this PR — the earlier in-app reader was withdrawn by the
+  orchestrator (two readers is two derivations; the core's `proxy.system.status` is the one reader).
+- **`Session.decrypt: DecryptStatus?`** — the one `BusService.swift` line this PR is granted, inside
+  the existing `refreshProxyStatus()`: `session.decrypt = status["decrypt"].flatMap(DecryptStatus.init)`
+  (no new verb, no new read: `proxy.status` is already polled every tick; no `defer` reset — §D3
+  ignores `decrypt` whenever the bus lane is not `.ok`, so a stale value after a disconnect changes
+  nothing). An older core without `decrypt` leaves it nil and the Kit falls back to `scopeHostCount`.
+- **`Session.caTrust: CATrustFacts?`** — PR D's published CA state (`Session+CATrust.swift`, branch
+  `claude/ca-trust-mac`), read as is: computed by PR D from the raw `Session.caStatus` via
+  `CATrustFacts(status:)` (nil = unknown or no certificate; `installing`/`needsAdmin` applied by PR D;
+  reset by `Session.forgetCATrust()` on disconnect) on PR D's cadence (`BusService.pollLoop` →
+  `session.refreshCAStatus()` on the first tick and every 10th 500 ms tick,
+  `BusService.caStatusEveryTicks = 10`, forced after `trustCA()`/`untrustCA()`). A trust change made
+  in Keychain Access or by `aitm ca install` from a terminal reaches both pages within ~5 s without a
+  visit to the CA page. This spec adds no CA read and no `Session.caStatus`.
 
-**`ca.status` read.** `BusService` already owns the poll; it gains `refreshCAStatus()`: once after
-`connect()` succeeds and then every 10th `pollLoop` tick (~5 s), calling the existing read-only,
-unaudited `ca.status` verb and writing `session.caStatus: CAStatus?` only when changed (reset to nil
-in the `pollLoop` `defer`). Why not every tick: on macOS the verb spawns `/usr/bin/security` per
-store. Why not only the CA page's `onAppear` read: the Status and Flows surfaces must follow a trust
-change made in Keychain Access or by `aitm ca install` from a terminal without a visit to the CA
-page. `Session+Connection.connectionSummary` passes `caTrust: caStatus.flatMap(CATrustFacts.init)`.
-The CA page keeps its own read (untouched); the two agree within one CA tick.
+`Session+Connection.connectionSummary` passes `systemProxy: systemProxy`, `decrypt: decrypt`,
+`tunnelledFlowCount: rows.count { $0.tls == .tunnelled }` and `caTrust: caTrust` to `make`. The CA
+page keeps its own read (untouched); the two agree within one CA tick.
 
-### D7. Views and files (the claim list)
+### D7. Views and files (the claim list — the plan's gate 2 records the orchestrator's answers of 2026-11-01)
 
-- `AitmproxyKit/SystemProxyState.swift` (new), `AitmproxyKit/ConnectionSummary.swift`,
-  `Tests/AitmproxyKitTests/SystemProxyStateTests.swift` (new),
-  `Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` (the predicate-table test).
-  **Implemented by the CA-trust session's PR (number TBD), to this spec's definitions, not here:**
-  `AitmproxyKit/CATrustFacts.swift` (new), `Tests/AitmproxyKitTests/CATrustFactsTests.swift` (new)
-  and the two additive fields `trustedScope` / `trustReported` in `AitmproxyKit/Panels/CAStatus.swift`.
-  `Panels/CAPanel.swift` is **not** changed by anyone here.
-- `Session.swift`: `var systemProxy: SystemProxyState?`, `var caStatus: CAStatus?`,
+- `AitmproxyKit/ConnectionSummary.swift`, `Tests/AitmproxyKitTests/ConnectionSummaryTests.swift` (the
+  predicate-table test). **PR 4a's, read-only here:** `AitmproxyKit/SystemProxyState.swift` and
+  `Tests/AitmproxyKitTests/SystemProxyStateTests.swift` (TR-AC1/2). **PR D's, read-only here:**
+  `AitmproxyKit/CATrustFacts.swift` (or wherever PR D puts the type), `AitmproxyKit/Panels/CAStatus.swift`,
+  `Session+CATrust.swift`, `Panels/CAPanel.swift` — not changed by anyone here.
+- `Session.swift`: `var systemProxy: SystemProxyState?` (nil; written by PR4 only, §D6) and
   `var decrypt: DecryptStatus?` (from `proxy.status.decrypt`, nil until read / on an older core).
-- `Session+Connection.swift`: `connectionSummary` passes `systemProxy:`, `decrypt:`,
-  `tunnelledFlowCount:` and `caTrust: caStatus.flatMap(CATrustFacts.init)`; new one-line accessor
-  `var trafficRoutes: TrafficRoutes { connectionSummary.routes }` — the only thing the Flows
-  surfaces read, so `connectionSummary`'s reader allow-list does not grow and no lane word can
-  leak into `ShellView.swift`; `perform(connection: .addScopeHost)` does `show(.scope)` then
-  `scopeSheetVisible = true` (the Proxy ▸ Scope… menu's add-sheet path); `perform(connection:
-  .openNetworkSettings)` opens `action.settingsURL` with `NSWorkspace` (and `.approveInSystemSettings` switches to the same
-  `settingsURL` table).
-- `Bus/SystemProxyReader.swift` (new), `Bus/BusService.swift` (the two system-proxy call sites,
-  `refreshCAStatus()` with its tick counter, §D6, and — in the existing `refreshProxyStatus()` —
-  `session.decrypt = status["decrypt"].flatMap(DecryptStatus.init)`, reset to nil in the `pollLoop`
-  `defer`; no new verb, no new read: `proxy.status` is already polled every tick).
+  `Session.caTrust`/`caStatus` are PR D's.
+- `Session+Connection.swift` (on PR D's merged SHA — PR D edits the same `perform` switch; sequential,
+  never simultaneous): `connectionSummary` passes `systemProxy:`, `decrypt:`, `tunnelledFlowCount:`
+  and `caTrust: caTrust`; new one-line accessor `var trafficRoutes: TrafficRoutes { connectionSummary.routes }`
+  — the only thing the Flows surfaces read, so `connectionSummary`'s reader allow-list does not grow
+  and no lane word can leak into `ShellView.swift`; `perform(connection: .addScopeHost)` does
+  `show(.scope)` then `scopeSheetVisible = true` (the Proxy ▸ Scope… menu's add-sheet path) and
+  returns `true`. No `.openNetworkSettings` case (denied).
+- `Bus/BusService.swift`: **exactly one added line**, in the existing `refreshProxyStatus()`:
+  `session.decrypt = status["decrypt"].flatMap(DecryptStatus.init)` (§D6). No `refreshSystemProxy()`,
+  no `refreshCAStatus()`, no reader file, no reset line, no new verb.
 - `AitmproxyKit/DecryptStatus.swift` (new) + `Tests/AitmproxyKitTests/DecryptStatusTests.swift` (new).
 - `AitmproxyKit/FlowSummary.swift`, `AitmproxyKit/Flow.swift` (`TunnelMode`, `TunnelReason`, the five
   `FlowRow` fields, `isTunnel`, `==`), `AitmproxyKit/FlowDetail.swift` (`TunnelInfo`, `tunnel`,
   `passive`), `AitmproxyKit/FlowDetail+Wire.swift` + `Tests/AitmproxyKitTests/FlowSummaryTests.swift`
-  (new), `FlowRowEqualityTests.swift`, `FlowDetailWireTests.swift` — **plan Task 1c, pending the
-  orchestrator's claim answer**; file-disjoint from Task 1; nothing else in this spec touches them.
-- `Shell/RouteBanner.swift` (new): renders `session.trafficRoutes.banner` with the closed
-  routes' primary actions through `session.perform(connection:)`; `.openCaptureSettings`, which
-  `perform` leaves to the view, sets `settingsTab = .capture` and calls `openSettings()` exactly as
-  `AppsAttributionBanner` does. Mentions no `connectionSummary`, `ConnectionSummary`, `LaneDot`,
-  `LaneState`, `CaptureSwitch`, `capture.enabled`, `extensionController`.
-- `Shell/ShellView.swift`, two hunks only: (1) `EmptyFlows` (struct ~319–336) reads
+  (new), `FlowRowEqualityTests.swift`, `FlowDetailWireTests.swift` — **plan Task 1c, claim granted
+  2026-11-01**; file-disjoint from Task 1; nothing else in this spec touches them.
+- `Shell/RouteBanner.swift` (new): renders `session.trafficRoutes.banner` and its one `bannerAction`
+  button through `session.perform(connection:)`; `.openCaptureSettings`, which `perform` leaves to
+  the view, sets `settingsTab = .capture` and calls `openSettings()` exactly as `AppsAttributionBanner`
+  does. Mentions no `connectionSummary`, `ConnectionSummary`, `LaneDot`, `LaneState`, `CaptureSwitch`,
+  `capture.enabled`, `extensionController`.
+- `Shell/ShellView.swift`, two hunks only: (1) `EmptyFlows` (struct ~316–336) reads
   `session.trafficRoutes.advice` (via `@Environment(Session.self)`, or a `routes:` parameter
-  passed from the existing `flowTable` overlay call at ~261 — builder's choice) and gains the
+  passed from the existing `flowTable` overlay call, `ShellView.swift:258` — builder's choice) and gains the
   route rows; `allowsHitTesting` stays off except for its buttons. (2) In `MainView.flows`
-  (~174–200) the `ScopeBanner()` branch and the `AppsAttributionBanner()` block are removed and one
+  (~171–200) the `ScopeBanner()` branch and the `AppsAttributionBanner()` block are removed and one
   insertion takes their place: `if session.trafficRoutes.banner != nil { RouteBanner(); Rule() }`
   on every list page (§D8 lists the two removed call sites verbatim). The `AppsAttributionBanner`
   struct stays. Nothing else in the file changes; the `ExtensionController` block (rule 5) and
   lines 49–62 are untouched.
-- `Panels/StatusPanel.swift`: the one `.help` line on `StepRow` (§D4).
-- `App.swift` + `AitmproxyKit/CommandMap.swift`: Proxy ▸ "Network Settings…" menu item (every
-  action has a menu item; shortcut left to the builder, must not clash) and its command-map
-  entry (the map is the menu's table of record).
-- `tools/check-connection-words.sh`: §D9. `tools/check-capture-toggle.sh`: the NS-AC8 banner pins
-  move to `RouteBanner()` (§D8).
-- `apps/mac/docs/GLOSSARY.md`: "System proxy" and "Route" rows carrying the lane principle;
-  `docs/STORIES.md`: S-073 "See why nothing is flowing" (depends S-072).
+- `Panels/StatusPanel.swift` — **stated once, here; TR-AC8 and the plan refer to it:** (a) the one
+  `.help(step.detail ?? step.title)` line on `StepRow` (§D4); (b) `.addScopeHost` joins the
+  handled-by-`perform` case list in `run(_:)` (its switch over `ConnectionAction` is exhaustive; PR D
+  adds its own `.trustCA`/`.openCAPanel` cases); (c) the PR D hand-over: the interim
+  `stepsWithCATrust` insertion and the `CATrustRow` call are removed — this spec's `caTrusted` step
+  and the Flows CA row carry the same words (§D4).
+- `tools/check-connection-words.sh`: §D9. `tools/check-capture-toggle.sh` (granted on the
+  fixture-removal mac SHA; that PR modifies the script): the NS-AC8 banner pins move to
+  `RouteBanner()` (§D8).
+- **Not touched** (withdrawn with `.openNetworkSettings`, 2026-11-01): `App.swift`,
+  `AitmproxyKit/CommandMap.swift`, `apps/mac/docs/BRIEF.md`, `apps/mac/docs/GLOSSARY.md` — the Proxy
+  menu gets only PR4's toggle (⌥⌘P), nothing of ours. **Not touched** either: `apps/mac/docs/STORIES.md`
+  (the improve-loop session owns S-073/S-074/S-080 and writes them with §D2a's strings),
+  `Bus/SystemProxyReader.swift` (never created), `Panels/CAPanel.swift`, `Session+CATrust.swift`.
 
 ### D8. One banner line: `ScopeBanner` and `AppsAttributionBanner` retire from the list pages
 
-Measured by the improve-loop session on `main 9dba3d9f` (fresh install, empty scope, no source
+Observed by the improve-loop session on `main 9dba3d9f` (fresh install, empty scope, no source
 app): `ScopeBanner` ("No scope set — every host is read-only until you add one") and
 `AppsAttributionBanner` ("Flows carry no source app yet, so this page cannot group them.") stacked
-above the Apps list, 40 pt each, pushing the column header 80 pt down so a click aimed at row 1
-hit the header and sorted by URL.
+above the Apps list — each a `Tok.Size.Row.dense` row (28 pt: `Tokens.swift:296`; `ScopePanel.swift:268`,
+`ShellView.swift:368`), so two rows push the column header 56 pt down — and a click aimed at row 1
+hit the header and sorted by URL. (The session's note did not record a pixel measurement; the
+live step, TR-AC19, measures the header offset against that token.)
 
-Rule: on every page that lists flows, at most ONE 40 pt banner line is ever shown, and it is the
-route banner of this spec. It absorbs the scope line (the Scope fact: `Nothing is decrypted until a
+Rule: on every page that lists flows, at most ONE `Tok.Size.Row.dense` (28 pt) banner line is ever
+shown, and it is the route banner of this spec. It absorbs the scope line (the Scope fact: `Nothing is decrypted until a
 host is in Scope.`; "every host is read-only" is retired) and replaces `AppsAttributionBanner` (its "no source app" case is the
 All Apps / scope / CA state in the shared vocabulary, with the one remedy button). Neither old banner is
 rendered when the route banner is, and when nothing is closed no banner is shown at all.
@@ -760,8 +889,8 @@ delete with a later cleanup) and the `AppsAttributionBanner` struct in `ShellVie
 `check-capture-toggle.sh`'s NS-AC3 body pins hold; its call site goes). The read-only-scope fact
 stays visible in the status bar's scope item and on the Scope page.
 
-Call sites removed in `Shell/ShellView.swift`, both inside `MainView.flows` (~187–197 on `main
-5eac2a50`): (1) `} else if !Store.usesFixtures, session.scopeHosts.isEmpty, case .connected =
+Call sites removed in `Shell/ShellView.swift`, both inside `MainView.flows` (~185–193 on `main
+8e19c2e3`): (1) `} else if !Store.usesFixtures, session.scopeHosts.isEmpty, case .connected =
 session.bus { ScopeBanner(); Rule() }` (as the fixture-removal PR leaves it), (2)
 `if session.page == .apps, session.clients.isEmpty, !session.rows.isEmpty { AppsAttributionBanner();
 Rule() }`. In their place, one insertion: `if session.trafficRoutes.banner != nil { RouteBanner();
@@ -794,19 +923,22 @@ when `decrypt` is present, else `scopeHostCount` (the scope line is the quoted c
 `decrypt.advice` is present, the fallback otherwise — same `state`, so every banner literal below holds
 for both);
 T = every row a tunnel; bus `.ok` throughout (with the bus not `.ok`: no advice, no banner, steps
-as today). L = listen address; H:P = a foreign endpoint. The Kit test makes one
+as today). SP "unknown (nil)" is every build until PR4 lands. L = listen address; H:P = a foreign endpoint. The Kit test makes one
 `ConnectionSummary.make` call per row with literal inputs and pins the literal lines. "E" = the
 Flows empty-state entries (0 flows), "B" = the banner (flows > 0).
 
 | SP | AA | SC | Status `systemProxy` / `extensionOn` / `scopeSet` | E | B (T false) | B (T true) |
 |---|---|---|---|---|---|---|
 | unknown (nil) | on | 0 | absent / ✓ All Apps is on / ○ Add a host to Scope … | scope line | no | scope line |
+| unknown — the core's partial case (`other` at our own address: HTTP → us, HTTPS off; PR #246 maps it to nil) | any | any | absent / per AA / per SC | per AA / SC | no system-proxy contribution (step omitted, banner as if unknown) | same |
 | off | on | n | ○ system proxy off — … / ✓ / ✓ Scope: n hosts decrypted | system proxy line | no | no (T impossible with a host decrypting — if seen, no) |
 | off | on | 0 | ○ system proxy off — … / ✓ All Apps is on / ○ Add a host to Scope … | system proxy line, scope line | no | `Nothing is decrypted until a host is in Scope.` |
-| off | off / awaiting / degraded | 0 | ○ … / ○ All Apps off — … (or waiting / degraded) / ○ Add a host … | system proxy, All Apps, scope lines | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. — set …` (waiting/degraded state words likewise) | same |
-| off | off | n | ○ / ○ / ✓ | system proxy, All Apps lines | `system proxy off · All Apps off — set …` | same |
-| off | unsupported or external core | 0 | ○ / "not in this build" or lane / ○ | system proxy, scope lines | `system proxy off · Nothing is decrypted until a host is in Scope. — set …` | same |
-| off | unsupported or external core | n | ○ / … / ✓ | system proxy line | `system proxy off — set …` | same |
+| unknown (nil) | off / awaiting / degraded | 0 | absent / ○ All Apps off — … (or waiting / degraded) / ○ Add a host … | All Apps, scope lines | `All Apps off · Nothing is decrypted until a host is in Scope.` (waiting/degraded state words likewise), button All Apps Settings… | same |
+| unknown (nil) | off | n | absent / ○ / ✓ | All Apps line | `All Apps off` | same |
+| off | off / awaiting / degraded | 0 | ○ … / ○ All Apps off — … (or waiting / degraded) / ○ Add a host … | system proxy, All Apps, scope lines | `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope.` (waiting/degraded state words likewise) | same |
+| off | off | n | ○ / ○ / ✓ | system proxy, All Apps lines | `system proxy off · All Apps off` | same |
+| off | unsupported or external core | 0 | ○ / "not in this build" or lane / ○ | system proxy, scope lines | `system proxy off · Nothing is decrypted until a host is in Scope.` | same |
+| off | unsupported or external core | n | ○ / … / ✓ | system proxy line | `system proxy off` | same |
 | other(H,P) | any | any | ○ system proxy on · H:P, not this core — … / per AA / per SC | as the "off" rows with the other line | as the "off" rows with the other state | same |
 | thisCore(·,·) | on | 0 | ✓ system proxy on · L [· HTTP(S) only] / ✓ / ○ Add a host … | scope line | no | scope line |
 | thisCore(·,·) | on | n | ✓ / ✓ / ✓ | generic line | no | no |
@@ -815,29 +947,40 @@ Flows empty-state entries (0 flows), "B" = the banner (flows > 0).
 
 The CA fact is orthogonal to every row above and adds one column each:
 
-| CA | Status `caTrust` step | E (appended last) | B |
+| CA | Status `caTrusted` step | E (appended last) | B |
 |---|---|---|---|
 | nil (unread / unknown) | absent | nothing | the row's value |
 | trusted (scope user) | ✓ CA trusted (user keychain) | nothing | the row's value |
-| not trusted | ○ Trust the aitmproxy CA (no button yet) | `HTTPS is not captured until the CA is trusted` | the row's states + ` · HTTPS is not captured until the CA is trusted` (before the remedy); where the row says **no** and flows > 0, the CA line alone |
-| installing (sibling) | ○ trusting CA… | `trusting CA…` | as not trusted |
+| not trusted | ○ Trust the aitmproxy CA (button Trust the aitmproxy CA) | `HTTPS is not captured until the CA is trusted` (buttons Trust the aitmproxy CA, the CA page) | the row's states + ` · HTTPS is not captured until the CA is trusted`; where the row says **no** and flows > 0, the CA line alone with the button Trust the aitmproxy CA |
+| installing (PR D) | ○ trusting CA… | `trusting CA…` | as not trusted |
 
 ## Acceptance criteria
 
-Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
+Ordinals are the ids. Kit tests (literal strings), `L = "127.0.0.1:8080"`; TR-AC1/2 are the
+`SystemProxyState` contract PR 4a proves, TR-AC15 the `CATrustFacts` contract PR D proves.
 
-1. **TR-AC1 [kit-unit]** `SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1",
-   "HTTPPort": 9090, "HTTPSEnable": 1, "HTTPSProxy": "127.0.0.1", "HTTPSPort": 9090])` →
-   `http == Endpoint(host: "127.0.0.1", port: 9090)`, `https` the same, `http?.address == "127.0.0.1:9090"`;
-   `["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 8080, "HTTPSEnable": 0]` → `https == nil`;
-   an absent or `0` Enable yields nil; `SystemProxyState(settings: [:]) == .off`.
-2. **TR-AC2 [kit-unit]** `route(to: L)`: off → `.off`; both at `127.0.0.1:8080` →
+1. **TR-AC1 [kit-unit — contract; implemented and proved by PR #246's `SystemProxyStateTests`]**
+   `SystemProxyState(settings: ["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 9090, "HTTPSEnable": 1,
+   "HTTPSProxy": "127.0.0.1", "HTTPSPort": 9090])` → `http == Endpoint(host: "127.0.0.1", port: 9090)`, `https`
+   the same, `http?.address == "127.0.0.1:9090"`; `["HTTPEnable": 1, "HTTPProxy": "127.0.0.1", "HTTPPort": 8080,
+   "HTTPSEnable": 0]` → `https == nil`; **a numeric-string port** `["HTTPEnable": 1, "HTTPProxy": "127.0.0.1",
+   "HTTPPort": "9090"]` → `http?.port == 9090`, and `"HTTPPort": "abc"` → `http == nil`; an absent or `0` Enable
+   yields nil; `SystemProxyState(settings: [:]) == .off`.
+2. **TR-AC2 [kit-unit — contract; PR #246]** `route(to: L)`: off → `.off`; both at `127.0.0.1:8080` →
    `.thisCore(http: true, https: true)`; both at `localhost:8080` → the same; HTTP at
    `127.0.0.1:8080`, HTTPS nil → `.thisCore(http: true, https: false)`; both at `127.0.0.1:9090`
    → `.other(host: "127.0.0.1", port: 9090)`; HTTP at `10.0.0.1:3128`, HTTPS at `127.0.0.1:8080`
    → `.thisCore(http: false, https: true)`; HTTP nil, HTTPS at `10.0.0.1:3128` →
    `.other(host: "10.0.0.1", port: 3128)`; listen `0.0.0.0:8080` with proxy `127.0.0.1:8080` →
-   `.thisCore(true, true)`.
+   `.thisCore(true, true)`. `init?(compact:listenAddress:)` (PR #246): `{state: "points_at_us", host: "127.0.0.1", port: 8080}` →
+   `route(to: L) == .thisCore(http: true, https: true)`; `{state: "other", host: "127.0.0.1", port: 9090}` → `.other(host: "127.0.0.1", port: 9090)`;
+   `{state: "off"}` → `.off`; `{state: "unknown"}`, `{state: "unsupported"}`, `{state: "needs_privilege"}`, `{}` → nil;
+   **PR #246's listen-address vectors:** `listenAddress: "::1:8080"` (a bare IPv6 literal, no brackets) → nil;
+   `listenAddress: ":::8080"` → nil (the core prints `[::]:8080`, which parses; a malformed listen address is
+   unknown, never a match).
+   **the partial case:** `{state: "other", host: "127.0.0.1", port: 8080}` with `listenAddress: L` → nil (unknown — the
+   core reports "HTTP → us, HTTPS off" as `other` at our own address; the route step is omitted and the banner
+   gains nothing until PR4's facts carry the verb's `state`/`detail`).
 3. **TR-AC3 [kit-unit]** `make(core: nil, activeKind: .embedded, bus: .connected("127.0.0.1:60745"),
    role: "operator", roleWarning: false, capability: .capturing, captureSupported: true,
    scopeHostCount: 0, flowCount: 0, listenAddress: L, systemProxy: .off).routes.advice.map(\.line) ==
@@ -845,24 +988,27 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    "Nothing is decrypted until a host is in Scope."]`; `advice.map(\.kind) == [.systemProxy, .scope]`
    (All Apps is on, so open: `routes.allApps?.line == "All Apps on"`); `advice.map(\.detail) ==
    ["every proxy-aware app, regardless of Scope", "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"]`;
-   `advice[0].actions == [.openNetworkSettings, .copyListenAddress]`; `advice[1].actions == [.openScope]`;
-   `routes.scope.state == "Nothing is decrypted until a host is in Scope."` (= its line), `advice[1].actions == [.addScopeHost, .openScope]`;
+   `advice[0].actions == []` (PR4 fills `.setSystemProxy`); `advice[1].actions == [.addScopeHost, .openScope]`;
+   `routes.scope.state == "Nothing is decrypted until a host is in Scope."` (= its line);
    `banner == nil`, `bannerAction == nil`; `anyOpen == true` (All Apps). The same with `flowCount: 6` → `advice == []` and
    `banner == nil` (a route is open and the rows are readable); with `flowCount: 6, tunnelledFlowCount: 6`
    → `banner == "Nothing is decrypted until a host is in Scope."`; with `capability: .inactive, flowCount: 6` →
-   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`.
-   The same with `systemProxy` both at `127.0.0.1:9090` and `flowCount: 0` →
+   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`, `bannerAction == .openCaptureSettings`
+   (the system-proxy entry has no action in this PR). The same with `systemProxy` both at `127.0.0.1:9090` and `flowCount: 0` →
    `advice[0].line == "system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it"`
    and no advice line contains `"off"`. **Quoted core sentence:** the same inputs plus
    `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: "Nothing is decrypted until a host is in Scope.")` →
    `routes.scope.line == "Nothing is decrypted until a host is in Scope."` (verbatim, period included),
    `routes.scope.state == "Nothing is decrypted until a host is in Scope."` (period kept), `routes.scope.open == false`, `actions == [.addScopeHost, .openScope]`; with `flowCount: 6, tunnelledFlowCount: 6`
-   → `banner == "Nothing is decrypted until a host is in Scope."`; with `capability: .inactive, flowCount: 6` →
-   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`, `bannerAction == .openNetworkSettings`
-   (identical to the fallback composition); the all-tunnels case above has `bannerAction == .addScopeHost`. `decrypt: DecryptStatus(scopeHosts: 2, decrypting: true, advice: nil)` with
-   `scopeHostCount: 0` (stale list) → `routes.scope.open == true`, `line == "Scope: 2 hosts decrypted"`
-   (N comes from `decrypt`). `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: nil)` →
-   the fallback `line == "Nothing is decrypted until a host is in Scope."`.
+   → `banner == "Nothing is decrypted until a host is in Scope."`, `bannerAction == .addScopeHost`; with `capability: .inactive, flowCount: 6` →
+   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`
+   (identical to the fallback composition). **Stale list:** `decrypt: DecryptStatus(scopeHosts: 2, decrypting: true, advice: nil)` with
+   `scopeHostCount: 0` → `routes.scope.open == true`, `line == "Scope: 2 hosts decrypted"`
+   (N comes from `decrypt`), no `.scope` entry in `advice`, and with `flowCount: 6, tunnelledFlowCount: 6` →
+   `banner == nil` (the Scope fact follows `decrypt`, not the stale list). `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: nil)` →
+   the fallback `line == "Nothing is decrypted until a host is in Scope."`. **Bus not `.ok`:** the quoted inputs with
+   `bus: .disconnected` → `routes.scope.line == "Nothing is decrypted until a host is in Scope."` from `scopeHostCount`
+   (a `decrypt` value is ignored while the bus lane is not `.ok`), `advice == []`.
 4. **TR-AC4 [kit-unit, predicate table]** One `make` call per row of §D10 pinning `routes` and
    the steps, including: `.inactive` → All Apps line `"All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`
    with `[.openCaptureSettings]`; `.pendingApproval` → `"All Apps waiting for approval — approve the extension in System Settings"`,
@@ -872,9 +1018,15 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    HTTP-only at the core →
    `"system proxy on · 127.0.0.1:8080 · HTTP only"`, open; both at the core → `"system proxy on · 127.0.0.1:8080"`;
    `systemProxy: nil, .capturing, scopeHostCount: 0` → `routes.systemProxy == nil` and `advice` holds
-   the scope line only; `captureSupported: false` → `routes.allApps == nil`, and with `systemProxy: .off,
-   scopeHostCount: 2, flowCount: 3` the banner is the system-proxy line alone, with `scopeHostCount: 0`
-   it is `"system proxy off · Nothing is decrypted until a host is in Scope."` with `bannerAction == .openNetworkSettings`; `systemProxy: .off, capability: .capturing,
+   the scope line only; **system proxy unknown, All Apps off:** `systemProxy: nil, .inactive, scopeHostCount: 0, flowCount: 3`
+   → `banner == "All Apps off · Nothing is decrypted until a host is in Scope."`, `bannerAction == .openCaptureSettings`,
+   no `"system proxy"` anywhere in `banner` or `advice`; `systemProxy: nil, .inactive, scopeHostCount: 2, flowCount: 3`
+   → `banner == "All Apps off"`; `captureSupported: false` → `routes.allApps == nil`, and with `systemProxy: .off,
+   scopeHostCount: 2, flowCount: 3` the banner is the system-proxy state alone (`"system proxy off"`, `bannerAction == nil`
+   in this PR), with `scopeHostCount: 0`
+   it is `"system proxy off · Nothing is decrypted until a host is in Scope."` with `bannerAction == .addScopeHost`;
+   `captureSupported: false, systemProxy: nil, scopeHostCount: 0, flowCount: 3` → `banner == nil`, and with
+   `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope."`; `systemProxy: .off, capability: .capturing,
    scopeHostCount: 2, flowCount: 3` → `banner == nil` (one route open) and `anyOpen == true`;
    `systemProxy` at `127.0.0.1:9090`, `.capturing`, `scopeHostCount: 2`, `flowCount: 3` →
    `banner == nil`; bus `.disconnected` → `advice == []`, `banner == nil`; `activeKind: .external`
@@ -883,7 +1035,7 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    `.systemProxy`; with `systemProxy: .off` it is `[.coreRunning, .busConnected, .systemProxy,
    .extensionOn, .scopeSet, .firstFlow]` and the `.systemProxy` step has `done == false`,
    `title == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it"`,
-   `detail == "every proxy-aware app, regardless of Scope"`, `action == .openNetworkSettings`;
+   `detail == "every proxy-aware app, regardless of Scope"`, `action == nil` (PR4: `.setSystemProxy`);
    with both protocols at `127.0.0.1:9090` the title is the `not this core` line, undone; with
    both at the core it is done with `title == "system proxy on · 127.0.0.1:8080"`, action nil,
    and `allStepsDone` is then true when the other steps are. `.capturing, scopeHostCount: 0` →
@@ -895,39 +1047,12 @@ Kit unit tests (literal strings), `L = "127.0.0.1:8080"`:
    `scopeSet.title == "Scope: 2 hosts decrypted"`, `done == true`, `action == nil`,
    `detail == "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"`;
    `scopeHostCount: 1` → `"Scope: 1 host decrypted"`; `coreRunning`/`busConnected`/`firstFlow` have `detail == nil`.
-6a. **TR-AC15 [kit-unit, CA facts — contract; implemented and proved by the CA-trust session's PR]** `CATrustFacts(status:)` over literal `CAStatus(json:)` inputs:
-   `stores.user.trusted == "yes"` → `trusted == true`, `scope == "user"`, `fingerprint == <the sha256>`;
-   `user "no"`, `system "no"` → `trusted == false`, `scope == nil`; `user "unknown"` only → `nil`;
-   no `stores` with `exists == true` → `nil`; `system "yes"`, `user "no"` → `trusted == true`,
-   `scope == "system"`; `installing == false` and `remedy == nil` on every result.
-6b. **TR-AC16 [kit-unit, CA in routes and steps]** With the TR-AC3 inputs plus
-   `caTrust: CATrustFacts(trusted: false, scope: nil, fingerprint: "AB:CD")`:
-   `routes.caTrust?.line == "HTTPS is not captured until the CA is trusted"`,
-   `routes.caTrust?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`,
-   `routes.caTrust?.actions == [.trustCA, .openCAPanel]`, `advice.map(\.kind) == [.systemProxy, .scope, .caTrust]`
-   (All Apps on → open), `anyOpen == true`; `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrusted, .firstFlow]`,
-   the `.caTrust` step `title == "Trust the aitmproxy CA"`, `done == false`, `action == nil`,
-   `detail` = the detail string above. With `flowCount: 6` → `banner == "HTTPS is not captured until the CA is trusted"`
-   (All Apps open, rows readable); with `flowCount: 6, tunnelledFlowCount: 6` →
-   `banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`; with `capability: .inactive, flowCount: 6` →
-   `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`.
-   With `systemProxy` both at the core, `.capturing`, `scopeHostCount: 2`, `flowCount: 3`, same
-   `caTrust` → `banner == "HTTPS is not captured until the CA is trusted"`, `bannerAction == .trustCA`, `anyOpen == true`.
-   With `caTrust: CATrustFacts(trusted: true, scope: "user", fingerprint: "AB:CD")` →
-   `routes.caTrust?.line == "CA trusted (user keychain)"`, `open == true`, `detail == "HTTPS on both routes"`,
-   the step `title == "CA trusted (user keychain)"`, `done == true`, and with the two routes open
-   `banner == nil`; `scope: "system"` → `"CA trusted (system keychain)"`; `scope: nil` → `"CA trusted"`.
-   `caTrust: nil` → `routes.caTrust == nil`, no `.caTrust` step, no CA text in `advice` or `banner`.
-   `installing: true` → `line == "trusting CA…"`, `open == false`; `remedy: "CA trust needs an administrator"`
-   → `line == "CA trust needs an administrator"`.
-6. **TR-AC6 [kit-unit]** `ConnectionAction.addScopeHost.title == "Add Host…"`, `isDestructive == false`, `settingsURL == nil`;
-   `ConnectionAction.openNetworkSettings.title == "Open Network Settings…"`,
-   `.isDestructive == false`, `settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.Network-Settings.extension"`;
-   `approveInSystemSettings.settingsURL?.absoluteString == "x-apple.systempreferences:com.apple.LoginItems-Settings.extension"`;
-   every other action's `settingsURL` is nil; `ConnectionAction` has no case named
-   `setSystemProxy`, `unsetSystemProxy`, `trustCA` or `openCAPanel` (reserved; a test that the enum's `allCases`-style
-   witness list has exactly the pre-existing cases plus `openNetworkSettings`). `CommandMap` lists
-   "Network Settings…" under Proxy.
+6. **TR-AC6 [kit-unit]** `ConnectionAction.addScopeHost.title == "Add Host…"`, `isDestructive == false`;
+   `ConnectionAction.trustCA.title == "Trust the aitmproxy CA"` (PR D's). `ConnectionAction.allCases`
+   equals the 14 pre-existing cases (`startCore` … `copyListenAddress`, in source order) plus
+   `addScopeHost` and PR D's `trustCA`, `openCAPanel` in the merged order — the Coder pins the literal
+   list; it contains no `openNetworkSettings` (denied), no `setSystemProxy` and no `unsetSystemProxy`
+   (PR4's).
 
 Source tripwires:
 
@@ -943,107 +1068,162 @@ Source tripwires:
    rule 5 still finds exactly one `ExtensionController(` and one `.start()` in `ShellView.swift`;
    `RouteBanner.swift` and `ShellView.swift` contain no `CaptureSwitch`, `capture.enabled`,
    `extensionController`.
-8. **TR-AC8 [structural]** `grep -rln CFNetworkCopySystemProxySettings apps/mac/Sources` prints
-   exactly `apps/mac/Sources/Aitmproxy/Bus/SystemProxyReader.swift`; no file under
-   `Sources/AitmproxyKit` imports CFNetwork, SystemConfiguration, SwiftUI or AppKit;
-   `Package.swift` is unchanged; `grep -rln '"ca.status"' apps/mac/Sources` prints exactly
-   `Bus/BusService.swift` and `Panels/CAPanel.swift` (no new caller, no new verb);
-   `grep -rn 'ca.install' apps/mac/Sources/Aitmproxy/Bus apps/mac/Sources/Aitmproxy/Shell apps/mac/Sources/Aitmproxy/Panels/StatusPanel.swift` is empty;
+8. **TR-AC8 [structural]** `grep -rln CFNetworkCopySystemProxySettings apps/mac/Sources` is **empty**
+   (no reader of our own); no file under `Sources/AitmproxyKit` imports CFNetwork, SystemConfiguration,
+   SwiftUI or AppKit; `Package.swift` is unchanged; the set of files naming `"ca.status"` under
+   `apps/mac/Sources` is identical to PR D's merged SHA (this spec adds no caller and no verb);
+   `grep -rn 'ca.install' apps/mac/Sources/Aitmproxy/Shell apps/mac/Sources/Aitmproxy/Session+Connection.swift apps/mac/Sources/Aitmproxy/Panels/StatusPanel.swift` is empty;
+   `git diff <base> -- apps/mac/Sources/Aitmproxy/Bus/BusService.swift` is exactly one added line
+   (the `decrypt` decode in `refreshProxyStatus()`, plus at most a comment) and contains no `await`;
    `git diff <base> -- apps/mac/Sources/Aitmproxy/Shell/ShellView.swift`
    shows hunks only inside `MainView.flows` and the `EmptyFlows` struct (lines 49–62 and the
    `ExtensionController` block identical); `git diff <base> -- apps/mac/Sources/Aitmproxy/Panels/StatusPanel.swift`
-   is the one `.help` line.
-9. **TR-AC9 [gates]** `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build` green
-   including the new tests; the release build (`./build.sh --ne --allow-unnotarized` as the input
+   is the §D7 footprint: the `.help` line, `.addScopeHost` in `run(_:)`'s handled list, and the removal
+   of PR D's interim `stepsWithCATrust`/`CATrustRow` insertion — nothing else.
+9. **TR-AC9 [gates]** `swift test --package-path apps/mac --scratch-path ~/Library/Developer/Aitmproxy/test-build-routes`
+   green including the new tests; the release build (`./build.sh --ne --allow-unnotarized` as the input
    to `scripts/notarize-dmg.sh`, `docs/RELEASE.md` step 3) has no warnings; the Rust gate is
    unaffected (no Rust change).
 
 Real installed app (the notarized build containing this change, installed in `/Applications`,
 embedded core running, All Apps on with the extension attached — a `./build.sh --debug` dev build
-may be used for an early pass of the system-proxy lines, but it cannot activate the extension and
-does not count). Every `networksetup` write runs in the Terminal panel (admin prompt is Matt's),
+may be used for an early pass, but it cannot activate the extension and does not count).
+**System-proxy clauses run only on the first build that also contains PR4**; on a build without
+PR4 the system proxy is unknown, the `systemProxy` step is absent, no system-proxy words appear,
+and those clauses are recorded as "deferred to PR4", not failed. Every `networksetup` write runs
+in the Terminal panel (any admin prompt is Matt's; research 22 §5b saw none in its one run),
 records the original values of every enabled service first (`networksetup -listallnetworkservices`,
 `-getwebproxy`, `-getsecurewebproxy`) and restores them at the end; the primary service is the
 one `route -n get default` names. The operator token is read from the 0600 per-launch config into
 a shell variable and never printed. Evidence = `screencapture` PNGs under
 `/tmp/claude/route-advice/`, the `scutil --proxy` output before each step, and the bus replies.
 
-10. **TR-AC10 [live, as found]** With the system proxy as Matt has it today (`scutil --proxy`:
-    `HTTPEnable : 1`, `HTTPProxy : 127.0.0.1`, `HTTPPort : 9090`, HTTPS the same) and
-    `scope.list` over the operator bus `[]`: the Flows page shows "No flows yet" with
+10. **TR-AC10 [live, as found]** With `scope.list` over the operator bus `[]`: **(a) this PR's build
+    (system proxy unknown):** the Flows page shows "No flows yet" with
+    `Nothing is decrypted until a host is in Scope.`, its detail line and its buttons (Add Host…,
+    Open Scope…); the Status page's Getting-started list has **no** system-proxy step, shows
+    `✓ All Apps is on` and `○ Add a host to Scope (for now as example.com:443)` (Open Scope…) whose
+    help is the scope line; nowhere does either page mention the system proxy. Clicking Add Host…
+    opens the Scope page with its add sheet; Open Scope… shows the Scope page; hovering the All Apps
+    step shows `in-scope hosts of every app` as its help. **(b) the first build with PR4,** with the
+    system proxy as Matt has it today (`scutil --proxy`: `HTTPEnable : 1`, `HTTPProxy : 127.0.0.1`,
+    `HTTPPort : 9090`, HTTPS the same): the Flows empty state gains, above the scope row,
     `system proxy on · 127.0.0.1:9090, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it`
-    and `Nothing is decrypted until a host is in Scope.`, each with its detail line and its
-    buttons (Open Network Settings…, Copy Address; Open Scope…); the Status page's Getting-started
-    list shows `○` the system-proxy line (Open Network Settings…), `✓ All Apps is on`, and
-    `○ Add a host to Scope (for now as example.com:443)` (Open Scope…) whose help is the scope line. Nowhere does either
-    page say the system proxy is off. One screenshot of each page.
+    with its detail line and PR4's Set as System Proxy button; Status shows `○` the system-proxy line
+    with that button and its help `every proxy-aware app, regardless of Scope`. Nowhere does either
+    page say the system proxy is off. One screenshot of each page per build.
 11. **TR-AC11 [live]** `scope.add example.com:443` over the operator bus, no app interaction:
-    within one second both pages drop the scope line; the system-proxy line stays; the
+    within one second both pages drop the scope line; the system-proxy line (if any) stays; the
     `scopeSet` step reads `✓ Scope: 1 host decrypted`. `scope.remove` brings the line back on both
     pages. Screenshots before/after.
-12. **TR-AC12 [live, flipped]** On every enabled service, `networksetup -setwebproxystate <svc> off`
-    and `-setsecurewebproxystate <svc> off`: within one second both pages read
+12. **TR-AC12 [live, flipped — PR4 build only]** On every enabled service, `networksetup -setwebproxystate <svc> off`
+    and `-setsecurewebproxystate <svc> off`: within one poll of the core's refresh both pages read
     `system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it`
     (`scutil --proxy` confirms `HTTPEnable : 0`). Then `-setwebproxy <svc> 127.0.0.1 8080` and
-    `-setsecurewebproxy <svc> 127.0.0.1 8080` on the primary service: within one second the
+    `-setsecurewebproxy <svc> 127.0.0.1 8080` on the primary service (or PR4's toggle): the
     system-proxy line disappears from the Flows empty state and the Status step reads
     `✓ system proxy on · 127.0.0.1:8080`; a real `http://example.com/` in Safari then produces a
     flow with no `-x`. Then `-setwebproxy <svc> 127.0.0.1 8081` on the primary service: both
     pages read `system proxy on · 127.0.0.1:8081, not this core — set 127.0.0.1:8080 as the system proxy, or point a client at it`
     (HTTP) — or `· HTTPS only` if HTTPS still points at 8080, per §D3. Finally the recorded
     Proxyman values are restored and re-read with `-getwebproxy`/`-getsecurewebproxy`; both pages
-    show the TR-AC10 line again.
-13. **TR-AC13 [live, banner]** With the system proxy not pointing at the core (as found) and
-    `scope.list` `[]`, `curl -x 127.0.0.1:8080 http://example.com/` ×2: the Flows page shows the
-    table with the rows and ONE banner line composed per §D5 (the state words of every closed
-    fact, no remedy text) with one button, Open Network Settings…, and no "No
-    scope set" `ScopeBanner` anywhere; Pinned, Domains and Apps show the same single line and no
-    other banner. After `scope.add example.com:443` the All Apps state leaves the line; after
-    `scope.remove` and the system proxy set to 127.0.0.1:8080 the system-proxy state leaves it;
-    with every fact open the banner is gone and nothing replaces it; restored afterwards.
-14. **TR-AC14 [live, actions]** Clicking Open Network Settings… on either page opens System
-    Settings ▸ Network; Proxy ▸ Network Settings… in the menu bar does the same; Copy Address
-    puts `127.0.0.1:8080` on the pasteboard (`pbpaste`); Open Scope… shows the Scope page.
-    Hovering a route step on Status shows its detail (`every proxy-aware app, regardless of Scope`
-    / `in-scope hosts of every app`) as the help.
-15. **TR-AC17 [live, CA not trusted — HARD GATE: no `ca.install`]** On Matt's Mac as it is today:
+    show the TR-AC10(b) line again. On this PR's build: recorded as deferred to PR4.
+13. **TR-AC13 [live, banner]** With `scope.list` `[]`, `curl -x 127.0.0.1:8080 http://example.com/` ×2
+    (plain-HTTP rows, readable): **(a) this PR's build:** with All Apps on the Flows page shows the
+    table and no banner (a route is open and the rows are readable) — or, with the CA untrusted, the
+    CA-only line of TR-AC17; the operator then switches All Apps OFF in the toolbar (real click; the
+    one known route closed): ONE banner line composed per §D5 — `All Apps off · Nothing is decrypted
+    until a host is in Scope.` (plus ` · HTTPS is not captured until the CA is trusted` while the CA is
+    untrusted) — with one button, All Apps Settings…, no system-proxy words, and no "No scope set"
+    `ScopeBanner` anywhere; Pinned, Domains and Apps show the same single line and no other banner.
+    After `scope.add example.com:443` the Scope state leaves the line; after switching All Apps back
+    ON the banner is gone (or the CA-only line remains) and nothing replaces it. **(b) the PR4 build,**
+    system proxy as found (`.other`) and All Apps off: the line starts `system proxy on · 127.0.0.1:9090, not this core · All Apps off · …`
+    with PR4's Set as System Proxy as the button; after the system proxy is set to 127.0.0.1:8080
+    the system-proxy state leaves it; with every fact open the banner is gone. Restored afterwards.
+14. **TR-AC14 — deleted 2026-11-01** (orchestrator: `.openNetworkSettings` denied; no menu item, no
+    Network Settings… action). Its surviving clauses — Add Host…, Open Scope… and the step help — are
+    in TR-AC10(a).
+15. **TR-AC15 [kit-unit, CA facts — contract; implemented and proved by PR D]** `CATrustFacts(status:)`
+    over literal `CAStatus(json:)` inputs: `stores.user.trusted == "yes"` → `trusted == true`,
+    `scope == "user"`, `fingerprint == <the sha256>`; `user "no"`, `system "no"` → `trusted == false`,
+    `scope == nil`; `user "unknown"` only → `nil`; no `stores` with `exists == true` → `nil`;
+    `system "yes"`, `user "no"` → `trusted == true`, `scope == "system"`; `installing == false` and
+    `needsAdmin == false` on every result.
+16. **TR-AC16 [kit-unit, CA in routes and steps]** With the TR-AC3 inputs plus
+    `caTrust: <PR D's CATrustFacts: trusted false, scope nil, fingerprint "AB:CD", platform "macos", installing false, needsAdmin false>`
+    (`notTrusted`): `routes.caTrust?.line == "HTTPS is not captured until the CA is trusted"` (= PR D's `text`),
+    `routes.caTrust?.detail == "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"`,
+    `routes.caTrust?.actions == [.trustCA, .openCAPanel]` (PR D's `actions`, 4ae616d3),
+    `advice.map(\.kind) == [.systemProxy, .scope, .caTrust]` (All Apps on → open),
+    `anyOpen == true`; `steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .caTrusted, .firstFlow]`,
+    the `.caTrusted` step `title == "Trust the aitmproxy CA"`, `done == false`, `action == .trustCA`,
+    `detail` = the detail string above. With `flowCount: 6` → `banner == "HTTPS is not captured until the CA is trusted"`,
+    `bannerAction == .trustCA` (All Apps open, rows readable); with `flowCount: 6, tunnelledFlowCount: 6` →
+    `banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`, `bannerAction == .addScopeHost`;
+    with `capability: .inactive, flowCount: 6` →
+    `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`, `bannerAction == .openCaptureSettings`;
+    with `systemProxy: nil, capability: .inactive, flowCount: 6` →
+    `banner == "All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"` (the fresh install until PR4).
+    With `systemProxy` both at the core, `.capturing`, `scopeHostCount: 2`, `flowCount: 3`, same
+    `caTrust` → `banner == "HTTPS is not captured until the CA is trusted"`, `bannerAction == .trustCA`, `anyOpen == true`.
+    With `trusted: true, scope: "user"` →
+    `routes.caTrust?.line == "CA trusted (user keychain)"`, `open == true`, `detail == "HTTPS on both routes"`,
+    `actions == []`, the step `title == "CA trusted (user keychain)"`, `done == true`, `action == nil`, and with the two routes open
+    `banner == nil`; `scope: "system"` → `"CA trusted (System keychain)"` (capital S, PR D verbatim).
+    `caTrust: nil` → `routes.caTrust == nil`, no `.caTrusted` step, no CA text in `advice` or `banner`.
+    `installing: true` → `line == "trusting CA…"`, `open == false`, `actions == []`, the step `title == "trusting CA…"`,
+    `action == nil`; `needsAdmin: true` → `line == "CA trust needs an administrator"`, `open == false`,
+    `actions == [.openCAPanel]`, the step `title == "CA trust needs an administrator"`, `action == .openCAPanel`;
+    with `flowCount: 3`, both routes open and `needsAdmin: true` → `banner == "CA trust needs an administrator"`,
+    `bannerAction == .openCAPanel`.
+17. **TR-AC17 [live, CA not trusted — HARD GATE: no `ca.install`]** On Matt's Mac as it is today:
     `ca.status` over the operator bus (`…/bus-ca-status.json`) shows every store with
     `trusted: "no"` (or `installed: "absent"`). Within one CA tick of connecting, the Flows empty
-    state shows, after the two route rows, the row `HTTPS is not captured until the CA is trusted`
+    state shows, after the route rows, the row `HTTPS is not captured until the CA is trusted`
     with its detail `HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then`
-    and no button; the Status checklist shows `○ Trust the aitmproxy CA` with the same help and no
-    button; with the TR-AC13 curl rows present the banner ends in ` · HTTPS is not captured until the CA is trusted`;
-    with a route open (TR-AC12's 8080 step) and the curl rows present the banner is exactly
-    `HTTPS is not captured until the CA is trusted`. Nothing on either page reads "trusted".
-    **No one runs `ca.install` or clicks Install… on his Mac for this proof.** The trusted state
-    (`CA trusted (user keychain)`, the line gone) is proved only after Matt says in his own words
-    that the CA may be trusted, through the app's own step once `.trustCA` exists — recorded then
-    in the plan's Shipped section, not here.
-16. **TR-AC18 [kit-unit, composed banner]** `TrafficRoute.state`: the system-proxy off route has
+    and its buttons Trust the aitmproxy CA and the CA page — **present, not clicked**; the Status
+    checklist shows `○ Trust the aitmproxy CA` with the same help and its Trust the aitmproxy CA
+    button — present, not clicked; PR D's interim `CATrustRow` is gone and the words are unchanged;
+    with the TR-AC13 curl rows present and All Apps on the banner is exactly
+    `HTTPS is not captured until the CA is trusted` with the button Trust the aitmproxy CA; with All
+    Apps off it ends in ` · HTTPS is not captured until the CA is trusted`. Nothing on either page
+    reads "trusted". **No one runs `ca.install`, clicks Install… on the CA page, or clicks Trust the
+    aitmproxy CA on his Mac for this proof.** The trusted state (`CA trusted (user keychain)`, the
+    line gone) is proved only after Matt says in his own words that the CA may be trusted, through
+    the app's own step (that button, PR D's `.trustCA`, with its prompts) — recorded then in the
+    plan's Shipped section, not here.
+18. **TR-AC18 [kit-unit, composed banner]** `TrafficRoute.state`: the system-proxy off route has
     `state == "system proxy off"` (its `line` keeps the ` — set …` clause for the row and the step);
     the CA line has `state` == its line; All Apps `.on(hosts: 2)` has `line == "All Apps on"`;
-    `routes.scope` with `scopeHostCount: 0` has `state == line == "Nothing is decrypted until a host is in Scope."`. `bannerAction` is
-    the highest-priority shown entry's first action: `.openNetworkSettings` whenever the system-proxy
-    fact is shown, `.openCaptureSettings` when only All Apps + Scope are shown, `.addScopeHost` for
-    the all-tunnels Scope-only case, `.trustCA` for the CA-only case, nil when `banner == nil`.
+    `routes.scope` with `scopeHostCount: 0` has `state == line == "Nothing is decrypted until a host is in Scope."`.
+    `bannerAction` is the first shown entry that has an action: `.openCaptureSettings` whenever All Apps
+    off is shown (the system-proxy entry has no action in this PR; PR4's `.setSystemProxy` then takes
+    precedence), `.addScopeHost` for the Scope fact when nothing before it has an action, `.trustCA`
+    for the CA-only case, nil when `banner == nil` or no shown entry has an action.
     `make(… bus ok, capability: .inactive, captureSupported: true, scopeHostCount: 0, flowCount: 3,
-    listenAddress: L, systemProxy: .off, caTrust: CATrustFacts(trusted: false, scope: nil, fingerprint: nil))`
-    → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`
-    (the fresh-install case); the same with `.capturing` → `banner == "HTTPS is not captured until the CA is trusted"`
-    (All Apps open, rows readable), and with `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`;
+    listenAddress: L, systemProxy: .off, caTrust: notTrusted)`
+    → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`,
+    `bannerAction == .openCaptureSettings` (the fresh-install case with PR4); the same with `systemProxy: nil` →
+    `banner == "All Apps off · Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`,
+    `bannerAction == .openCaptureSettings` (the fresh-install case until PR4); the same with `.capturing` →
+    `banner == "HTTPS is not captured until the CA is trusted"`, `bannerAction == .trustCA`
+    (All Apps open, rows readable), and with `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope. · HTTPS is not captured until the CA is trusted"`,
+    `bannerAction == .addScopeHost`;
     `.capturing`, `caTrust: nil`, `tunnelledFlowCount: 3` → `banner == "Nothing is decrypted until a host is in Scope."`;
     `.inactive`, `caTrust: nil` → `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`;
     `.inactive`, `scopeHostCount: 2`, `caTrust: nil` → `banner == "system proxy off · All Apps off"`;
+    `captureSupported: false, systemProxy: .off, scopeHostCount: 2, flowCount: 3` → `banner == "system proxy off"`, `bannerAction == nil`;
     every single-fact banner equals that fact's `state` (`"system proxy off"` for the no-extension,
     scope-set case — never the line with its remedy clause).
-17. **TR-AC19 [live, one banner line]** On the installed app with rows present (TR-AC13 state), on
+19. **TR-AC19 [live, one banner line]** On the installed app with rows present (TR-AC13 state), on
     each of Flows, Pinned, Domains and Apps: exactly one banner line above the table, none of
     the old texts "No scope set" / "Flows carry no source app" anywhere; the column header's top
-    edge (from the window screenshot, or the table header's AX frame) sits exactly 40 pt below
-    its position after Edit ▸ Clear empties the list (no rows → `banner == nil` → no banner),
-    never 80; Undo Clear restores rows and the single banner. A click on the first row's y
-    selects row 1 and does not sort.
-18. **TR-AC20 [live, per-host decryption, v0.5.9+]** Unconditional once plan Task 1c (the `tunnel`
+    edge (from the window screenshot, or the table header's AX frame) sits exactly one
+    `Tok.Size.Row.dense` = **28 pt** below its position after Edit ▸ Clear empties the list (no rows →
+    `banner == nil` → no banner), never 56 (two stacked rows); Undo Clear restores rows and the
+    single banner. A click on the first row's y selects row 1 and does not sort.
+20. **TR-AC20 [live, per-host decryption, v0.5.9+]** Unconditional once plan Task 1c (the `tunnel`
     decoder) is in; until then recorded as deferred, not failed. With the installed app on the
     v0.5.9+ core, `scope.list` `[]`, and curl pointed at the proxy:
     `curl -x 127.0.0.1:8080 https://example.com/` → one row whose SSL column shows the tunnel state
@@ -1061,12 +1241,12 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
     present. `scope.remove` → the next `curl https://` row is a passthrough tunnel again and the
     line is back. Safari's HTTPS still needs the keychain to trust the CA and stays under the hard
     gate; curl with `--cacert` is the decrypted-row proof.
-19. **TR-AC21 [kit-unit, `DecryptStatus`]** `DecryptStatus(json:)` over literal `JSONValue` objects:
+21. **TR-AC21 [kit-unit, `DecryptStatus`]** `DecryptStatus(json:)` over literal `JSONValue` objects:
     `{"scope_hosts": 0, "decrypting": false, "advice": "Nothing is decrypted until a host is in Scope."}`
     → `scopeHosts == 0`, `decrypting == false`, `advice == "Nothing is decrypted until a host is in Scope."`;
     `{"scope_hosts": 2, "decrypting": true, "advice": null}` → `scopeHosts == 2`, `decrypting == true`,
     `advice == nil`; `{}` → nil; a `proxy.status` object without `decrypt` → `status["decrypt"].flatMap(DecryptStatus.init) == nil`.
-20. **TR-AC22 [kit-unit, the #228 row/detail decoder — plan Task 1c]** With literal `flow.get`
+22. **TR-AC22 [kit-unit, the #228 row/detail decoder — plan Task 1c]** With literal `flow.get`
     objects (`scheme: "https"`): `tunnel: "passthrough"` → `FlowSummary.tunnel == .passthrough`,
     `row.tls == .tunnelled`, `row.isTunnel == true`; `"failed"` → `.failed` / `.pinnedOrFailed`;
     `"decrypted"` → `.decrypted` / `.decrypted`; `tunnel: null` or absent → `tunnel == nil`,
@@ -1086,23 +1266,17 @@ a shell variable and never printed. Evidence = `screencapture` PNGs under
 ## Left to the builder
 
 - `EmptyFlows` reading `session.trafficRoutes` via the environment or taking a `routes:`
-  parameter; the glyphs for the two lines (`network` and `app.badge` suggested); the detail
+  parameter; the glyphs for the lines (`network` and `app.badge` suggested); the detail
   line's size (`Tok.Typography.Size.sm`, tertiary ink suggested).
-- The menu shortcut for Proxy ▸ Network Settings… (must not clash; `CommandMap` lists it).
-- Widening the loopback set beyond `127.0.0.1`, `localhost`, `::1` (for example `127.0.0.0/8`),
-  as long as TR-AC2 holds.
-- Whether `SystemProxyReader` returns `nil` or `.off` when `CFNetworkCopySystemProxySettings()`
-  itself returns nil (either is honest; nil keeps the step hidden).
 - `Hashable`/`Sendable` conformances and the `TrafficRoutes` memberwise init shape, provided the
   public fields above exist with these names.
-- The `ca.status` tick divisor (10 = ~5 s) may be lowered to 4 if the `security` cost measures
-  negligible; never 1.
-- Where `CATrustFacts.swift` sits in the Kit (top level suggested; `Panels/` holds `CAStatus`).
 - Deleting the now-unreferenced `ScopeBanner` struct, `AppsAttributionBanner` struct and
   `CaptureAdvice.banner` is a later cleanup with its own tripwire edits; not here.
 - How `tunnelledFlowCount` is counted in `Session+Connection` (a filter over `rows` is fine at
   today's sizes; cache it beside `rowsVersion` if it shows in a profile).
 - Whether `FlowSummary.tunnel` is stored as `String?` or a small enum; only the `tls` mapping is pinned.
+- Which of PR D's helpers (`state`, `text`, `notTrustedLine`, …) is the CA entry's `line` in code,
+  provided the §D2a strings come out (gate 3 confirms the mapping).
 
 ## Open questions
 
@@ -1114,19 +1288,21 @@ None block. Calls Matt may want to flip (each a one-line change):
    Apps carries traffic, so "Everything is connected" needs the system proxy to point here.
    Alternative: mark it done when any route is open.
 3. `ScopeBanner` and `AppsAttributionBanner` are no longer rendered on any list page; the route
-   banner is the one 40 pt line (§D8). Alternative: keep `ScopeBanner` where the route banner is absent (see 12).
-4. A build with no extension shows the system-proxy banner whenever rows come only from a
-   hand-pointed client (§D5). Alternative: suppress when `allApps == nil`.
-5. Poll-tick reading over `SCDynamicStore` notifications (§D6).
+   banner is the one 28 pt line (`Tok.Size.Row.dense`, §D8). Alternative: keep `ScopeBanner` where the route banner is absent (see 12).
+4. A build with no extension shows the system-proxy banner (once PR4 feeds the slot) whenever rows
+   come only from a hand-pointed client (§D5). Alternative: suppress when `allApps == nil`.
+5. (Superseded 2026-11-01 by the orchestrator's ruling: no in-app reader; PR4 polls
+   `proxy.status.system_proxy`. The earlier poll-tick-vs-`SCDynamicStore` choice no longer exists.)
 6. "Capture extension is on" → "All Apps is on" (§D4).
 7. Open-state words `system proxy on · L` (research 22's candidate, lane-word style) rather than
    `system proxy is L`; `.other` words `system proxy on · H:P, not this core — …`.
 8. The not-trusted `detail` repeats the line's first clause (both are the coordinators' binding
    strings); trimming the detail to `browsers using QUIC load directly until then` is one string.
-9. `CATrustFacts(status:)` is failable (nil on the core's `unknown`) so unknown never renders as
-   not trusted; the sibling may prefer a non-failable init plus a `known` flag.
-10. The CA step and row ship without a button until `.trustCA`/`.openCAPanel` land; an interim
-    navigation action to the CA page would be one more case.
+9. (Resolved by PR D: `CATrustFacts(status:)` is failable — nil when every store is unknown or
+   the certificate does not exist — so unknown never renders as trusted or not trusted.)
+10. The `caTrusted` step's action is PR D's `.trustCA` (its confirm and admin prompts) and the Flows
+    CA row carries `.trustCA` + `.openCAPanel`, both from PR D's `actions`; this spec replaces PR D's
+    interim `StatusPanel` insertion with its own step. Alternative: the row navigates to the CA page only.
 11. Composed banner (§D5): state words of every shown fact as text, the highest-priority fact's
     remedy as the one button (system proxy > All Apps > Scope > CA). Alternative: show only the
     highest-priority fact's state and a count ("· 2 more").
@@ -1135,9 +1311,8 @@ None block. Calls Matt may want to flip (each a one-line change):
 13. The Scope fact enters the banner only when both routes are closed or EVERY row is a tunnel
     (§D5); a mixed list relies on the tunnel row's own inline remedy. Alternative: any tunnel row.
 14. All Apps is reported open whenever the extension is on, even with an empty scope — true under
-    per-host decryption (connections arrive as tunnel rows); until the core story lands the
-    extension still rejects everything on an empty scope, and the empty state's scope line is what
-    tells the operator. Alternative: keep All Apps closed on an empty scope until the story ships.
+    per-host decryption (PR #228, on `main`: connections arrive as tunnel rows), and the empty state's
+    scope line is what tells the operator. Alternative: report All Apps closed on an empty scope.
 15. Done form `Scope: N hosts decrypted` (coordinators' proposal, accepted) rather than "Scope has n
     hosts"; `Format.count` gives `1 host` / `n hosts`.
 16. `DecryptStatus` value over a bare `decryptAdvice: String?` (§D2). The banner carries no remedy
@@ -1146,34 +1321,60 @@ None block. Calls Matt may want to flip (each a one-line change):
     Alternative: strip the period in the composed form only.
 17. The five #228 row fields ride on `FlowRow` (agreed Kit names; the improve-loop inspector and a
     possible column consume them) even though this spec renders none of them. Alternative: summary-only.
+18. (2026-11-01) The banner predicate names only *known-closed* routes (`knownOpenRoute`, §D5): with
+    the system proxy unknown (every build until PR4) a closed All Apps is still named and the
+    system proxy is not mentioned. Alternative: no banner until both routes are read.
+19. (2026-11-01) `bannerAction` is the first shown fact that has an action, so a closed system-proxy
+    fact with no action yet (until PR4's `.setSystemProxy`) does not swallow the button. Alternative:
+    strictly the first shown fact's action, nil if it has none.
+20. (2026-11-01) `Session.systemProxy` is declared by this spec's Task 2 (nil, never written here) so
+    `connectionSummary` compiles before PR4 lands; PR4 writes it. Alternative: PR4 declares it and
+    this spec's `make` call gains the argument on PR4's rebase.
+21. (2026-11-01) PR D's two nil-facts Status rows (`unknownStep()`, `notGeneratedStep()`) are dropped
+    from the Getting-started list when this spec's step replaces PR D's interim insertion: `make`
+    reads `Session.caTrust` alone and omits the step while it is nil; the first-run sheet and the CA
+    page keep them. Alternative: pass PR D's `Session.caTrustStep` into `make` and keep both rows.
 
 ## Summary
 
-One Kit value, `ConnectionSummary.routes`, derived inside `make` from a new public
-`SystemProxyState?` input plus the facts the lanes already use, names the two automatic routes
-into the proxy — the macOS system proxy (every proxy-aware app, regardless of Scope) and All
-Apps (in-scope hosts of every app) — as open or closed with one line, one detail and one action
-each, plus two facts that gate what the routes carry: Scope (per-host decryption, Matt's
-2026-10-31 decision: `Nothing is decrypted until a host is in Scope.`, shown in the banner
-when both routes are closed or every row is a tunnel) and CA trust. The Status page's Getting-started list (a new `systemProxy` step; the
-`extensionOn`/`scopeSet` steps' words) and the Flows page's empty state and one-line banner read
-`Session.trafficRoutes` and nothing else, so they cannot disagree; the banner shows only while
-both routes are closed and flows exist, as one composed 40 pt line that is the only banner on
-every list page (`ScopeBanner` and `AppsAttributionBanner` retire from them). `SystemProxyState`, `SystemProxyRoute` (`.off`,
-`.thisCore`, `.other` — Proxyman's `127.0.0.1:9090` is the live `.other` case today) and the
-system-proxy words are shared vocabulary for the sibling set-system-proxy work, which owns the
-reserved `.setSystemProxy`/`.unsetSystemProxy`. The effective global proxy is read with
-`CFNetworkCopySystemProxySettings()` once per existing poll tick in the app target. A third fact, `CATrustFacts` from the
-keychain read-back `ca.status` (read every 10th poll tick), adds the step "Trust the aitmproxy CA"
-and the line `HTTPS is not captured until the CA is trusted` to both surfaces and to the banner
-whenever flows exist and HTTPS is untrusted — Matt's Mac today; its install side is the sibling's
-(`.trustCA`, `.openCAPanel` reserved) and no proof ever runs `ca.install` on his Mac. Proof is Kit
+One Kit value, `ConnectionSummary.routes`, derived inside `make` from a `SystemProxyState?` input
+(the type defined here as the shared contract and shipped by the system-proxy session's PR 4a; the
+value written by its PR4 from `proxy.status.system_proxy`, nil = unknown until then) plus the facts
+the lanes already use, names the two automatic routes into the proxy — the macOS system proxy
+(every proxy-aware app, regardless of Scope) and All Apps (in-scope hosts of every app) — as open
+or closed with one line, one detail and one action each, plus two facts that gate what the routes
+carry: Scope (per-host decryption, Matt's 2026-10-31 decision: `Nothing is decrypted until a host is
+in Scope.`, shown in the banner when a known route is closed or every row is a tunnel) and CA trust
+(PR D's published `Session.caTrust`, consumed through its `CATrustFacts` helpers). The Status page's
+Getting-started list (a `systemProxy` step once PR4 feeds the slot; the `extensionOn`/`scopeSet`
+steps' words; the `caTrusted` step with PR D's `.trustCA`) and the Flows page's empty state and
+one-line banner read `Session.trafficRoutes` and nothing else, so they cannot disagree; the banner
+shows only while a known route is closed (or every row is a tunnel, or HTTPS is untrusted) and flows
+exist, as one composed `Tok.Size.Row.dense` (28 pt) line that is the only banner on every list page
+(`ScopeBanner` and `AppsAttributionBanner` retire from them), with one button — the first shown
+fact's remedy (`All Apps Settings…` / `Add Host…` / `Trust the aitmproxy CA`; PR4 adds `Set as
+System Proxy`). The app has no reader of its own: no CFNetwork call, no `ca.status` call, one
+`BusService` line (`proxy.status.decrypt`), no menu item (`.openNetworkSettings` was denied — setup
+happens in the app with the OS prompt). No proof ever runs `ca.install` on Matt's Mac. Proof is Kit
 unit tests (one `make` per predicate-table row), the three source tripwires and the real installed
-app with the real system proxy flipped — no fixture or sample-data UI tests.
+app — the system-proxy clauses on the first build that also contains PR4 — never fixture or
+sample-data UI tests.
 
 ## Amendments after approval
 
-- 2026-10-31 (coordinating session, agreed with the system-proxy session): `SystemProxyState(settings:)` accepts a Port given as a number or a numeric string; the "Network Settings…" menu item sits in a new Proxy-menu group right after the first divider (before Browser), with that session's "Set as System Proxy" toggle (⌥⌘P) to be added on the line above it. ⌥⌘P is unused by the app today (`grep keyboardShortcut("p"` finds nothing).
+Entries are a dated log. Where an earlier entry conflicts with a later one, the later entry and the
+body text above govern. Superseded by the 2026-11-01 entries, wherever an earlier entry says them:
+the CA "reserved / no button" wording and `.trustCA`/`.openCAPanel` as reserved names; the in-app
+system-proxy reader (`SystemProxyReader`, the poll-tick CFNetwork read); the Proxy ▸ Network
+Settings… item and `Open Network Settings…` as a button or `bannerAction`; the 40 pt banner figure
+(it is `Tok.Size.Row.dense` = 28 pt); the predicate names `bothClosed ∨ caClosed` and `routesClosed`
+(now `knownOpenRoute` / `closedRoutes`, §D5); the `— set …` remedy suffix and the fresh-install
+literals that carry it; the composed `state` stripping a trailing period (the period is kept) and the
+`… — add one` fallback (the fallback is the core's sentence verbatim); the start SHA `8175eea3` (base
+`main 8e19c2e3`); `CATrustFacts.remedy: String?` and a `trustedScope`/`trustReported` contract of our
+own (PR D's `needsAdmin`, `text`, `actions`, `step` are consumed instead).
+
+- 2026-10-31 (coordinating session, agreed with the system-proxy session): `SystemProxyState(settings:)` accepts a Port given as a number or a numeric string. (The "Network Settings…" menu item agreed in the same exchange was withdrawn 2026-11-01 when the orchestrator denied `.openNetworkSettings`; the Proxy menu gets only PR4's toggle, ⌥⌘P — unused by the app today, `grep keyboardShortcut("p"` finds nothing.)
 - 2026-10-31 (coordinating session, agreed with the NE and system-proxy-automation sessions): third fact **CA trust** added — `CATrustFacts` (`trusted`, `scope`, `fingerprint`, sibling-owned `installing`/`remedy`), `make(caTrust:)`, `TrafficRoute.Kind.caTrust`, step `caTrust` "Trust the aitmproxy CA" / `CA trusted (user keychain)`, line `HTTPS is not captured until the CA is trusted`, detail `… — browsers using QUIC load directly until then`, banner rule `bothClosed ∨ caClosed`, `ca.status` read every 10th tick; `.trustCA`/`.openCAPanel` reserved; **hard gate: no `ca.install` on Matt's Mac in any proof** (TR-AC15–17).
 - 2026-10-31 (coordinating session, after the improve-loop measurement on `main 9dba3d9f`): D8 widened — one 40 pt banner line on every list page (Flows, Pinned, Domains, Apps), the route banner only; `ScopeBanner()` and `AppsAttributionBanner()` call sites removed from `MainView.flows` (structs kept), `check-capture-toggle.sh` NS-AC8 pins move to `RouteBanner()`; composed banner form (`TrafficRoute.state`/`remedy`; states joined ` · ` + the one remedy, priority system proxy > All Apps > CA) with the fresh-install literal `system proxy off · All Apps off · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`; Apps-page predicate stated; TR-AC18 (kit) and TR-AC19 (live header position) added; TR-AC3/13/16 literals updated.
 - 2026-10-31 (coordinating session, Matt's per-host-decryption decision; strings confirmed by the improve-loop session for S-073/S-074/S-080): the Scope fact becomes its own `TrafficRoute` (`Kind.scope`, always present) with line `Nothing is decrypted until a host is in Scope.` / `Scope: N hosts decrypted` and detail `Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel`; All Apps is closed only when off/awaiting/degraded (open line `All Apps on`), so no clause repeats; `make(tunnelledFlowCount:)` from `FlowRow.tls == .tunnelled`; banner rule `routesClosed ∨ (scopeClosed ∧ (routesClosed ∨ allTunnels)) ∨ caClosed` with the fresh-install literal `system proxy off · All Apps off · Nothing is decrypted until a host is in Scope · HTTPS is not captured until the CA is trusted — set 127.0.0.1:8080 as the system proxy, or point a client at it`; `scopeSet` keeps title/action, done form `Scope: N hosts decrypted`, detail = the scope line; "every host is read-only" retired; D2a lists the improve-loop session's adjacent tunnel-row strings; TR-AC3/4/5/16/18 literals updated, TR-AC20 (conditional on the core story) added; `check-connection-words.sh` prefixes gain `"Nothing is decrypted` and `"Scope:`.
@@ -1182,3 +1383,5 @@ app with the real system proxy flipped — no fixture or sample-data UI tests.
 - 2026-10-31 (coordinating session, orchestrator registry update): the CA-trust session's mac PR D lands BEFORE this spec's PR and carries, as a narrow additive exception on `ConnectionSummary.swift`, `ConnectionAction.trustCA` and `.openCAPanel` with their titles and `GettingStartedStep.Kind.caTrusted` with its title — nothing else; `CATrustFacts` and the two `CAStatus` fields live in that PR too. This spec's step kind is therefore `.caTrusted` (not `.caTrust`; the route kind `TrafficRoute.Kind.caTrust` is unchanged), Task 1 must not redeclare those cases, and this branch rebases onto PR D's merged SHA before Task 1b/2b. Coding still starts on the fixture-removal SHA.
 - 2026-11-01 (coordinating session, after PR #228 / v0.5.9): the Scope entry quotes `proxy.status.decrypt.advice` verbatim (`Nothing is decrypted until a host is in Scope.`) when present and falls back to our `… — add one` on an older core; `make(decrypt: DecryptStatus?)` (new Kit value decoded from `proxy.status`, which `BusService` already polls — no new read); N for `Scope: N hosts decrypted` = `decrypt.scope_hosts`; composed `state` strips one trailing `.`, remedy `add one`; Kit row decoder maps `tunnel` `passthrough`→`.tunnelled`, `failed`→`.pinnedOrFailed`, `decrypted`→`.decrypted` (plan Task 1c, own claim pending; `tunnel_reason`/bytes stay on the wire); TR-AC20 rewritten around curl passthrough/`--cacert` decrypted rows and unconditional once Task 1c is in; TR-AC21/22 added; start SHA `8175eea3`.
 - 2026-11-01 (coordinating session, aligned with core spec D9 and the improve-loop session): banner text = shown states joined ` · ` with **no remedy text**; the remedy is one button `bannerAction` (`Open Network Settings…` / `All Apps Settings…` / `Add Host…` / `Trust the aitmproxy CA`); the Scope line is `proxy.status.decrypt.advice` verbatim (`Nothing is decrypted until a host is in Scope.`), fallback the same words, `— add one` retired; new `ConnectionAction.addScopeHost` ("Add Host…"); the Status step keeps `Open Scope…`. Task 1c widened to the full #228 contract: `TunnelMode`, `TunnelReason` (8), `tunnel`/`tunnelReason`/`tunnelBytesUp`/`tunnelBytesDown`/`passive` on `FlowSummary` and `FlowRow` (+ `isTunnel`, `==`), `FlowDetail.tunnel: TunnelInfo?` + `passive` from `meta`; TR-AC3/6/16/18/22 and D5/D10 literals updated.
+- 2026-11-01 (stage-6 fix pass on docs PR #242, spec + quality panel; self-approved, autonomous mode): post-PR-D CA state everywhere (the CA entry carries PR D's `[.trustCA, .openCAPanel]`, the `caTrusted` step's action is `.trustCA`, the CA-only banner button is `.trustCA`; every "reserved / no button" sentence removed; step kind `.caTrusted`, route kind `.caTrust`); TR-AC3 has one Scope action list and the stale-list banner case; D10 banner cells carry no remedy text; `scopeClosed ⇔ !routes.scope.open`; the numeric-string Port vector is in TR-AC1; `Tok.Size.Row.dense` is 28 pt (not 40) — D5/D8/TR-AC19 say 28 / 56 and D8 no longer claims a pixel measurement; AC ordinals = ids; `Endpoint.address` computed; STORIES.md not touched; the StatusPanel footprint stated once (D7); labels on the inferences (primary-service rule, NSNumber, spawn rate); base `main 8e19c2e3`.
+- 2026-11-01 (orchestrator rulings, recorded as the plan's gate 2 and gate 5): **no in-app system-proxy reader** — `Bus/SystemProxyReader.swift`, `refreshSystemProxy()` and the `CFNetworkCopySystemProxySettings()` call are dropped; `SystemProxyState.swift` (the type as defined here, with its Kit tests) ships as the system-proxy session's PR 4a = PR #246 ahead of this PR (gate 5), with `init?(compact:listenAddress:)` over `proxy.status.system_proxy`; PR4 (after us) adds `SystemProxyFacts`, the polling, the toggle and `.setSystemProxy`/`.unsetSystemProxy`, writing `Session.systemProxy`; until PR4 the system proxy is unknown (step omitted, no words, never "off"). **`.openNetworkSettings` denied** (Matt: setup happens in the app with the OS prompt): no action, no `settingsURL`, no menu item, no CommandMap/BRIEF/GLOSSARY rows, plan Task 4 removed, TR-AC14 deleted; the system-proxy entry's `actions` are empty until PR4. **CA fact = PR D's published `Session.caTrust`** (`Session+CATrust.swift`; `CATrustFacts` fields `{trusted, scope, fingerprint, platform, installing, needsAdmin}`, helpers `{text, actions, step, …}` consumed (`text` is the line; `state` is a `LaneState`); PR D's cadence `caStatusEveryTicks = 10`); no `refreshCAStatus()`, no `Session.caStatus` here; plan Task 2b removes PR D's interim `stepsWithCATrust`/`CATrustRow` once the CA step exists. **`BusService.swift` = one line** (`proxy.status.decrypt`); `check-capture-toggle.sh` GO on the fixture-removal mac SHA; `Session+Connection.swift` GO on PR D's SHA for `.addScopeHost` and `tunnelledFlowCount`. D5 predicate restated as `knownOpenRoute` with `bannerAction` = the first shown fact that has an action (Architect's calls 18/19); D6/D7 rewritten; the live proof's system-proxy clauses run on the first build that also contains PR4.

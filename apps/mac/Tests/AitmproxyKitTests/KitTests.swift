@@ -324,7 +324,7 @@ import Testing
     }
 }
 
-/// Sizes reach every sum in the Kit from the bus, imports and fixtures: none may trap.
+/// Sizes reach every sum in the Kit from the bus and imports: none may trap.
 @Suite struct SizeSumSaturationTests {
     private func row(_ seq: Int, request: Int64?, response: Int64?) -> FlowRow {
         FlowRow(
@@ -396,24 +396,27 @@ import Testing
         func keeps(_ chip: ContentCategory, _ rows: [FlowRow]) -> [FlowRow] {
             rows.filter { chip.matches(row: $0, contentType: nil, httpVersion: nil) }
         }
-        let l4 = Fixtures.l4Rows
+        // Three captured sessions — one TCP, two UDP — and two HTTP rows.
+        func session(_ n: Int, _ interface: String, _ layers: [String]) -> FlowRow {
+            L4Flow(id: FlowID("l4-\(n)"), sessionState: .capture, interface: interface, packetCount: 1, injectedCount: 0,
+                   packets: [L4Packet(index: 0, dir: .outbound, length: 42, injected: false, layers: layers)])
+                .row(seq: n, inScope: true)
+        }
+        let l4 = [session(1, "lo0", ["IPv4", "UDP"]), session(2, "en0", ["IPv4", "TCP"]), session(3, "lo0", ["IPv4", "UDP"])]
+        let http = [
+            Make.row(seq: 4, host: "api.shop-staging.test", path: "/api/products", status: 200),
+            Make.row(seq: 5, scheme: "http", host: "shop-staging.test", path: "/", status: 200),
+        ]
         #expect(keeps(.tcp, l4).map { $0.l4?.proto } == [.tcp])
         let udp = keeps(.udp, l4)
         #expect(udp.count == 2)
         #expect(udp.allSatisfy { $0.l4?.proto == .udp })
         #expect(keeps(.l4, l4).count == l4.count)
-        #expect(keeps(.l4, Fixtures.rows).isEmpty)
-        #expect(keeps(.tcp, Fixtures.rows).isEmpty)
+        #expect(keeps(.l4, http).isEmpty)
+        #expect(keeps(.tcp, http).isEmpty)
         #expect(ContentCategory.groups[2] == [.tcp, .udp, .l4])
         #expect(ContentCategory.shortcutChips.count == 9)
         #expect(ContentCategory.shortcutChips[4...6] == [.tcp, .udp, .l4])
         #expect(ContentCategory.allCases.allSatisfy { !$0.help.isEmpty })
-    }
-
-    @Test func fixturesMatchTheMockup() {
-        #expect(Fixtures.rows.count == 14)
-        #expect(Fixtures.rows.map(\.seq) == Array(41...54))
-        #expect(Fixtures.rows.filter { $0.state == .paused }.count == 2)
-        #expect(Fixtures.detail(for: Fixtures.rows[9]).request.header("x-forwarded-for") == "127.0.0.1")
     }
 }

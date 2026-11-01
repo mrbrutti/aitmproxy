@@ -18,8 +18,8 @@ use crate::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
 use crate::caps::TermCaps;
 use crate::filter::{self, Expr};
 use crate::model::{
-    counts_by, human_bytes, scope_covers, value_text, AgentPolicy, AgentState, Finding, FlowDetail,
-    FlowKind, FlowRow, Message, Severity,
+    counts_by, human_bytes, scope_covers, value_text, AgentPolicy, AgentState, CaTrustWord,
+    Finding, FlowDetail, FlowKind, FlowRow, Message, Severity, SystemProxyWord,
 };
 use crate::open::{self, OpenTarget};
 use crate::theme::Theme;
@@ -35,11 +35,16 @@ pub const SPLIT_COLS: u16 = 160;
 /// ones are dropped (they are fetched again on demand).
 pub const MAX_DETAILS: usize = 2_000;
 
+/// The tools that change the CA's trust-store state (§D17): they get the
+/// scope default, raise the pill's in-flight word, and are re-read after.
+pub(crate) const CA_TRUST_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
+
 /// Tools that ask the operator for a local `y/N` before they are sent
 /// (§4.2 step 4: the bus has no `confirm` on the wire until F1, and the
 /// TUI's server identity is `Frontend::Mcp`). A `dry_run` the tool's schema
-/// declares, given as the JSON boolean `true`, bypasses.
-pub const CONFIRM_TOOLS: &[&str] = &["ca.install", "ca.uninstall"];
+/// declares, given as the JSON boolean `true`, bypasses. Today these are
+/// exactly the CA-trust tools.
+pub const CONFIRM_TOOLS: &[&str] = CA_TRUST_TOOLS;
 
 /// The most PoC YAML the Findings panel reads from disk for one finding
 /// (`poc_path` on a loopback bus without `poc.get`).
@@ -922,6 +927,12 @@ pub struct App {
     pub auto_select: bool,
     pub intercept_armed: bool,
     pub capture_paused: bool,
+    /// `proxy.status.system_proxy` from the last poll (spec §D14); `None`
+    /// until the first reply, or when the core does not report it.
+    pub system_proxy: Option<SystemProxyWord>,
+    /// This TUI's own `proxy.system.set`/`unset` is in flight: the pill reads
+    /// `· sys-proxy setting…` until the reply or the error.
+    pub sysproxy_setting: bool,
     pub scope: Vec<String>,
     pub findings: Vec<Finding>,
     pub finding_cursor: usize,
@@ -968,8 +979,11 @@ pub struct App {
     pub confirm: Option<ConfirmCall>,
     /// What `o` asked to open; the run loop takes it with [`App::take_open_target`].
     pub pending_open: Option<OpenTarget>,
-    /// The last `ca.status` result, for the CA panel.
+    /// The last `ca.status` result, for the CA panel and the pill word.
     pub ca_status: Option<Value>,
+    /// A `ca.install`/`ca.uninstall` is on the wire: the pill reads
+    /// `· CA trusting…` until the reply (D17.6).
+    pub ca_installing: bool,
     /// The browser view (§2.7).
     pub browser: BrowserState,
     /// Hosts whose `scope.remove` is in flight, oldest first: the reply is a
@@ -1014,6 +1028,8 @@ impl App {
             auto_select: false,
             intercept_armed: false,
             capture_paused: false,
+            system_proxy: None,
+            sysproxy_setting: false,
             scope: Vec::new(),
             findings: Vec::new(),
             finding_cursor: 0,
@@ -1044,6 +1060,7 @@ impl App {
             confirm: None,
             pending_open: None,
             ca_status: None,
+            ca_installing: false,
             browser: BrowserState::default(),
             pending_scope_removals: VecDeque::new(),
             poc_get_inflight: VecDeque::new(),
@@ -1063,6 +1080,16 @@ impl App {
 
     pub fn narrow(&self) -> bool {
         self.width < NARROW_COLS
+    }
+
+    /// The toolbar pill's CA-trust word (§D17.6), from the last `ca.status`
+    /// and the in-flight flag; `None` while the trust state is unread.
+    pub fn ca_trust_word(&self) -> Option<String> {
+        self.ca_trust()?.pill(self.ca_installing)
+    }
+
+    fn ca_trust(&self) -> Option<CaTrustWord> {
+        CaTrustWord::from_json(self.ca_status.as_ref()?)
     }
 
     /// The server-resolved role for the live connection (`"operator"`/
@@ -1607,6 +1634,16 @@ impl App {
                 let armed = !self.intercept_armed;
                 self.intercept_armed = armed;
                 out.push(BusRequest::Intercept(armed));
+            }
+            // D14: `off` only when the word says the system proxy is already
+            // ours; `on` otherwise, including before the first status poll.
+            Action::ToggleSysProxy => {
+                let ours = self
+                    .system_proxy
+                    .as_ref()
+                    .is_some_and(SystemProxyWord::points_at_us);
+                let line = if ours { "sysproxy off" } else { "sysproxy on" };
+                out.extend(self.run_command(line));
             }
             Action::Resume => {
                 if let Some(f) = self.selected_l4().cloned() {
@@ -2462,9 +2499,37 @@ impl App {
         }
     }
 
+    /// One system-proxy change at a time, however it is reached (`s`,
+    /// `:sysproxy on|off`, the raw `:proxy.system.set|unset`, the palette's
+    /// tool list): refused with a Warn toast while ours is in flight or the
+    /// core's `setting` flag (another client's call) is up — the core would
+    /// refuse the second call anyway, and that refusal would wrongly settle
+    /// the first one's pill. Otherwise raises the flag and returns `true`.
+    fn sysproxy_begin_change(&mut self) -> bool {
+        let in_flight =
+            self.sysproxy_setting || self.system_proxy.as_ref().is_some_and(|w| w.setting);
+        if in_flight {
+            self.toast(Level::Warn, "a system-proxy change is already in flight");
+            return false;
+        }
+        self.sysproxy_setting = true;
+        true
+    }
+
     /// Hold `name(args)` for a `y/N` when it is in [`CONFIRM_TOOLS`] (and not
     /// a dry run); otherwise send it.
-    fn call_tool(&mut self, name: &str, args: Value) -> Vec<BusRequest> {
+    fn call_tool(&mut self, name: &str, mut args: Value) -> Vec<BusRequest> {
+        // D17.1: the trust-store scope is explicit wherever the OS has a
+        // user store, unless the operator typed one.
+        if CA_TRUST_TOOLS.contains(&name) {
+            if let (Some(scope), Some(obj)) = (
+                self.ca_trust().and_then(|w| w.default_scope()),
+                args.as_object_mut(),
+            ) {
+                obj.entry("scope")
+                    .or_insert_with(|| Value::String(scope.to_string()));
+            }
+        }
         // A dry run bypasses the prompt only when the tool's schema declares
         // `dry_run` and the value is the JSON boolean `true` (SEC-4): a
         // string typed at the prompt against a schema without the parameter
@@ -2493,6 +2558,11 @@ impl App {
                 return_to,
             });
             self.open_prompt(PromptKind::Confirm);
+            return Vec::new();
+        }
+        if matches!(name, "proxy.system.set" | "proxy.system.unset")
+            && !self.sysproxy_begin_change()
+        {
             return Vec::new();
         }
         if let Some(label) = browser_busy_label(name) {
@@ -2557,10 +2627,27 @@ impl App {
     }
 
     /// The bus went away (or came back): no call sent before now will be
-    /// answered, so the view stops waiting for them.
-    fn browser_forget_inflight(&mut self) {
+    /// answered, so nothing stays "in flight" — the browser view's counters,
+    /// the CA pill's `· CA trusting…` (D17.6) and the sys-proxy pill's
+    /// `· sys-proxy setting…` (D14) alike.
+    fn forget_inflight(&mut self) {
         self.browser.inflight = 0;
         self.browser.busy = None;
+        self.ca_installing = false;
+        // A `proxy.system.set|unset` reply that will never come must not
+        // keep the guard refusing `s` / `:sysproxy on|off` (F-tui 6).
+        self.sysproxy_setting = false;
+    }
+
+    /// Ask `ca.status` when the bus offers it (D17.5: the pill word is the
+    /// read-back, never a reply's claim).
+    fn ask_ca_status(&self, out: &mut Vec<BusRequest>) {
+        if self.has_tool("ca.status") {
+            out.push(BusRequest::Call {
+                name: "ca.status".into(),
+                args: json!({}),
+            });
+        }
     }
 
     /// Launch a scope-bound `scan.discover`. The target is bound to the
@@ -2627,6 +2714,9 @@ impl App {
         };
         self.mode = c.return_to;
         if yes {
+            if CA_TRUST_TOOLS.contains(&c.name.as_str()) {
+                self.ca_installing = true;
+            }
             vec![BusRequest::Call {
                 name: c.name,
                 args: c.args,
@@ -3630,12 +3720,7 @@ impl App {
             ),
             "ca" => {
                 self.mode = Mode::Ca;
-                if self.has_tool("ca.status") {
-                    out.push(BusRequest::Call {
-                        name: "ca.status".into(),
-                        args: json!({}),
-                    });
-                }
+                self.ask_ca_status(&mut out);
             }
             "browser" => out.extend(self.update(Action::OpenBrowser)),
             // `:l4` opens the L4 panel; `:l4 capture <iface> [dir]` and
@@ -3695,6 +3780,34 @@ impl App {
                         format!("{} needs core follow-up F7 ({tool})", title_case(cmd)),
                     );
                 }
+            }
+            // D14: the OS system proxy. One gate for the three verbs: a core
+            // with `proxy.system.set` has them all. `on` sends `{}` so the
+            // config's bypass list applies; `status` only reads.
+            "sysproxy" => {
+                let tool = match rest {
+                    "on" => "proxy.system.set",
+                    "off" => "proxy.system.unset",
+                    "status" => "proxy.system.status",
+                    _ => {
+                        self.toast(Level::Error, "usage: :sysproxy on|off|status");
+                        return out;
+                    }
+                };
+                if !self.has_tool("proxy.system.set") {
+                    self.toast(
+                        Level::Warn,
+                        "System proxy needs the core's proxy.system.* verbs",
+                    );
+                    return out;
+                }
+                if tool != "proxy.system.status" && !self.sysproxy_begin_change() {
+                    return out;
+                }
+                out.push(BusRequest::Call {
+                    name: tool.into(),
+                    args: json!({}),
+                });
             }
             "findings" | "poc" => {
                 if let Some(spec) = rest.strip_prefix("run ") {
@@ -3767,9 +3880,11 @@ impl App {
                     );
                 }
                 // A (re)connect is a new session: nothing sent before it
-                // will be answered.
-                self.browser_forget_inflight();
+                // will be answered — including a `proxy.system.set|unset`
+                // whose reply would have settled the pill.
+                self.forget_inflight();
                 out.push(BusRequest::Refresh);
+                self.ask_ca_status(&mut out);
             }
             BusEvent::ProxyStatus(s) => {
                 if s.address.is_some() {
@@ -3779,6 +3894,7 @@ impl App {
                 self.intercept_armed = s.intercept_armed;
                 self.capture_paused = !s.capturing;
                 self.store_paused = Some(s.paused);
+                self.system_proxy = s.system_proxy;
             }
             BusEvent::ScriptFindings(list) => {
                 self.findings.retain(|f| f.script.is_none());
@@ -3789,7 +3905,7 @@ impl App {
             }
             BusEvent::Disconnected(why) => {
                 self.bus = BusStatus::Disconnected(why.clone());
-                self.browser_forget_inflight();
+                self.forget_inflight();
                 self.toast(Level::Error, format!("bus: {why}"));
             }
             BusEvent::Flows(summaries) => {
@@ -4039,17 +4155,13 @@ impl App {
                         format!("CA exported: {}", value.as_str().unwrap_or("ok")),
                     ),
                     "ca.install" | "ca.uninstall" => {
+                        self.ca_installing = false;
                         let text = match &value {
                             Value::Null => "ok".to_string(),
                             other => value_text(other),
                         };
                         self.toast(Level::Info, format!("{name}: {text}"));
-                        if self.has_tool("ca.status") {
-                            out.push(BusRequest::Call {
-                                name: "ca.status".into(),
-                                args: json!({}),
-                            });
-                        }
+                        self.ask_ca_status(&mut out);
                     }
                     "flow.mutate" => self.toast(Level::Info, "Edit applied"),
                     "flow.resume" => self.toast(Level::Info, "Resumed"),
@@ -4102,6 +4214,23 @@ impl App {
                             "capture paused"
                         };
                         self.toast(Level::Info, msg);
+                    }
+                    // D14: the reply is the full status object; its word
+                    // replaces the last poll's and its `detail` is the toast.
+                    "proxy.system.set" | "proxy.system.unset" => {
+                        self.sysproxy_setting = false;
+                        if let Some(word) = SystemProxyWord::from_json(&value) {
+                            self.system_proxy = Some(word);
+                        }
+                        self.toast(Level::Info, sysproxy_detail(&name, &value));
+                    }
+                    // A status reply is a read: it refreshes the word when it
+                    // parses but never settles our in-flight flag.
+                    "proxy.system.status" => {
+                        if let Some(word) = SystemProxyWord::from_json(&value) {
+                            self.system_proxy = Some(word);
+                        }
+                        self.toast(Level::Info, sysproxy_detail(&name, &value));
                     }
                     "flow.clear" => {
                         let n = |k: &str| value.get(k).and_then(Value::as_u64).unwrap_or(0);
@@ -4328,6 +4457,18 @@ impl App {
                     "poc.build" => {
                         self.poc_build_pending.pop_front();
                     }
+                    // D17.4/D17.5: the word comes from the read-back, so every
+                    // reply re-asks; a dismissed OS dialog is information.
+                    "ca.install" | "ca.uninstall" => {
+                        self.ca_installing = false;
+                        self.ask_ca_status(&mut out);
+                        if message.starts_with("ca.install cancelled")
+                            || message.starts_with("ca.uninstall cancelled")
+                        {
+                            self.toast(Level::Info, "CA trust cancelled");
+                            return out;
+                        }
+                    }
                     // A guard refusal (out-of-scope / rate / denylist / oversize /
                     // count) is surfaced verbatim; drop the pending confirm.
                     "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
@@ -4338,6 +4479,11 @@ impl App {
                     "scan.discover" => {
                         self.scan.running = false;
                         self.scan.error = Some(message.clone());
+                    }
+                    // D14: a refusal (agent-token bus) or a failed write
+                    // settles the in-flight pill; the text below is verbatim.
+                    "proxy.system.set" | "proxy.system.unset" => {
+                        self.sysproxy_setting = false;
                     }
                     _ => {}
                 }
@@ -4464,6 +4610,15 @@ fn read_poc_yaml(path: &str) -> Result<String, String> {
     Ok(text)
 }
 
+/// The toast for a `proxy.system.*` reply: the core's `detail` line, or the
+/// verb's name when the reply carries none (spec §D14).
+fn sysproxy_detail(name: &str, value: &Value) -> String {
+    match value.get("detail").and_then(Value::as_str) {
+        Some(d) if !d.is_empty() => d.to_string(),
+        _ => format!("{name}: ok"),
+    }
+}
+
 /// `pause` → `Pause`, for a toast that starts a sentence.
 fn title_case(word: &str) -> String {
     let mut c = word.chars();
@@ -4538,6 +4693,10 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("poc run <path> [target]", "Run a PoC YAML"),
     ("agent all|readonly|paused", "Set the agent policy"),
     ("agent", "Open the agent panel and activity log"),
+    (
+        "sysproxy on|off|status",
+        "Set / restore the OS system proxy (s)",
+    ),
     ("ca", "CA panel: status, export, install, uninstall"),
     ("config", "Config panel: the redacted config.get view"),
     (
@@ -5247,6 +5406,270 @@ mod tests {
         assert_eq!(app.mode, Mode::Flows);
     }
 
+    fn ca_status_macos(trusted: &str) -> Value {
+        json!({"exists": true, "platform": "macos", "fingerprint_sha256": "AB:CD",
+            "stores": {"user": {"installed": "present", "trusted": trusted, "location": "login"},
+                       "system": {"installed": "absent", "trusted": "no", "location": "System"}}})
+    }
+
+    fn ca_status_debian() -> Value {
+        json!({"exists": true, "platform": "linux-debian",
+            "stores": {"system": {"installed": "absent", "trusted": "no", "location": "/usr/local/share/ca-certificates"}}})
+    }
+
+    fn ca_status_call() -> BusRequest {
+        BusRequest::Call {
+            name: "ca.status".into(),
+            args: json!({}),
+        }
+    }
+
+    /// SP-AC35 / D17.1: `ca.install` and `ca.uninstall` carry `scope: "user"`
+    /// when the reported platform has a user store (macOS, Windows) and none
+    /// was typed; a typed scope wins; the in-flight flag is up from `y` until
+    /// the reply and `n` never sets it.
+    #[test]
+    fn ca_install_scope_default_follows_the_reported_platform() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        app.ca_status = Some(ca_status_macos("no"));
+        assert!(app.run_command("ca.install").is_empty());
+        assert!(!app.ca_installing, "held for y/N: not in flight yet");
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({"scope": "user"})
+            }]
+        );
+        assert!(app.ca_installing);
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "ca.install".into(),
+            value: json!({"changed": true}),
+        });
+        assert!(!app.ca_installing, "the reply settles the flag");
+        assert_eq!(reqs, vec![ca_status_call(), BusRequest::Refresh]);
+
+        // `n` never sets the flag.
+        assert!(app.run_command("ca.uninstall").is_empty());
+        assert!(app.update(Action::Input('n')).is_empty());
+        assert!(!app.ca_installing);
+
+        // Uninstall carries the scope too.
+        assert!(app.run_command("ca.uninstall").is_empty());
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.uninstall".into(),
+                args: json!({"scope": "user"})
+            }]
+        );
+
+        // A typed scope wins.
+        assert!(app.run_command("ca.install scope=system").is_empty());
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({"scope": "system"})
+            }]
+        );
+
+        // Windows has a user store too.
+        app.ca_status = Some(json!({"exists": true, "platform": "windows",
+            "stores": {"user": {"trusted": "no"}}}));
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(
+            app.update(Action::Input('y')),
+            vec![BusRequest::Call {
+                name: "ca.install".into(),
+                args: json!({"scope": "user"})
+            }]
+        );
+    }
+
+    /// SP-AC35 / D17.1: no scope is invented when the platform has only a
+    /// system store (Linux), when `ca.status` has not answered yet, or when an
+    /// older core reported the pre-D17 shape.
+    #[test]
+    fn ca_install_passes_no_scope_on_linux_or_without_status() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        let bare_install = vec![BusRequest::Call {
+            name: "ca.install".into(),
+            args: json!({}),
+        }];
+
+        // Linux: the only scope is system, so none is passed.
+        app.ca_status = Some(ca_status_debian());
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(app.update(Action::Input('y')), bare_install);
+
+        // No status yet: nothing is invented.
+        app.ca_status = None;
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(app.update(Action::Input('y')), bare_install);
+
+        // An older core's shape: nothing is invented either.
+        app.ca_status = Some(json!({"path": "/tmp/ca.pem", "installed": false}));
+        assert!(app.run_command("ca.install").is_empty());
+        assert_eq!(app.update(Action::Input('y')), bare_install);
+    }
+
+    /// Both CA-trust tools are the ones the operator confirms locally.
+    #[test]
+    fn ca_trust_tools_are_the_confirm_tools() {
+        assert_eq!(CA_TRUST_TOOLS, &["ca.install", "ca.uninstall"]);
+        assert_eq!(CONFIRM_TOOLS, CA_TRUST_TOOLS);
+    }
+
+    /// D17.6: a bus drop while `ca.install` is on the wire settles the
+    /// in-flight flag, so the reconnect's read-back is what the pill shows,
+    /// never a stale `· CA trusting…`.
+    #[test]
+    fn bus_drop_mid_dialog_clears_the_in_flight_flag() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        app.ca_status = Some(ca_status_macos("no"));
+        let _ = app.run_command("ca.install");
+        let _ = app.update(Action::Input('y'));
+        assert!(app.ca_installing);
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA trusting…"));
+
+        let _ = app.on_bus(BusEvent::Disconnected("connection reset".into()));
+        assert!(!app.ca_installing, "no reply will come: not in flight");
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA untrusted"));
+
+        app.ca_installing = true;
+        let reqs = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "ca.status", "ca.install"]),
+            role: Some("operator".into()),
+        });
+        assert!(!app.ca_installing, "a new session: nothing is in flight");
+        assert!(reqs.contains(&ca_status_call()), "{reqs:?}");
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "ca.status".into(),
+            value: ca_status_macos("no"),
+        });
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA untrusted"));
+    }
+
+    /// SP-AC35 / D17.11: a connect whose tool list offers `ca.status` asks it
+    /// exactly once; a bus without it is not asked.
+    #[test]
+    fn connect_asks_ca_status_once_when_the_bus_offers_it() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        let reqs = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "flow.get", "ca.status", "ca.install"]),
+            role: Some("operator".into()),
+        });
+        assert_eq!(
+            reqs.iter().filter(|r| **r == ca_status_call()).count(),
+            1,
+            "{reqs:?}"
+        );
+        assert!(reqs.contains(&BusRequest::Refresh));
+        assert!(!app.ca_installing);
+
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.ca_installing = true;
+        let _ = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "ca.status"]),
+            role: Some("operator".into()),
+        });
+        assert!(!app.ca_installing, "a connect clears a stale flag");
+
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        let reqs = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&["flow.list", "flow.get"]),
+            role: Some("operator".into()),
+        });
+        assert_eq!(reqs, vec![BusRequest::Refresh]);
+    }
+
+    /// SP-AC35 / D17.6: the pill word follows the last `ca.status` and the
+    /// in-flight flag.
+    #[test]
+    fn ca_trust_word_follows_status_and_the_in_flight_flag() {
+        let mut app = app_with_flows();
+        assert_eq!(app.ca_trust_word(), None);
+        app.ca_status = Some(ca_status_macos("yes"));
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA trusted"));
+        app.ca_status = Some(ca_status_macos("no"));
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA untrusted"));
+        app.ca_installing = true;
+        assert_eq!(app.ca_trust_word().as_deref(), Some("· CA trusting…"));
+        app.ca_installing = false;
+        app.ca_status = Some(ca_status_macos("unknown"));
+        assert_eq!(
+            app.ca_trust_word().as_deref(),
+            Some("· CA untrusted"),
+            "user unknown, System says no: a store says no and none yes"
+        );
+        app.ca_status = Some(json!({"exists": true, "platform": "macos",
+            "stores": {"user": {"trusted": "unknown"}, "system": {"trusted": "unknown"}}}));
+        assert_eq!(app.ca_trust_word(), None);
+        app.ca_status = Some(json!({"path": "/tmp/ca.pem", "installed": true}));
+        assert_eq!(app.ca_trust_word(), None, "an older core's shape: no word");
+    }
+
+    /// D17.4 / D17.5: a dismissed macOS dialog is an information toast, not
+    /// an error; every `ca.install` failure settles the flag and re-reads
+    /// `ca.status`.
+    #[test]
+    fn ca_install_cancelled_is_an_info_toast_and_rereads_status() {
+        let mut app = app_with_flows();
+        app.tools
+            .extend(tools(&["ca.install", "ca.uninstall", "ca.status"]));
+        app.ca_status = Some(ca_status_macos("no"));
+        let _ = app.run_command("ca.install");
+        let _ = app.update(Action::Input('y'));
+        assert!(app.ca_installing);
+        let reqs = app.on_bus(BusEvent::CallFailed {
+            name: "ca.install".into(),
+            message: "ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted".into(),
+        });
+        assert!(!app.ca_installing);
+        assert_eq!(reqs, vec![ca_status_call()]);
+        let t = app.current_toast().expect("toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "CA trust cancelled");
+
+        // Any other failure stays an error, and still re-reads the status.
+        let _ = app.run_command("ca.install");
+        let _ = app.update(Action::Input('y'));
+        let reqs = app.on_bus(BusEvent::CallFailed {
+            name: "ca.install".into(),
+            message: "ca.install refused: agent frontend".into(),
+        });
+        assert!(!app.ca_installing);
+        assert_eq!(reqs, vec![ca_status_call()]);
+        let t = app.current_toast().expect("toast");
+        assert_eq!(t.level, Level::Error);
+        assert_eq!(t.text, "ca.install refused: agent frontend");
+
+        // Record correction 15: the uninstall dialog can be dismissed too.
+        let _ = app.run_command("ca.uninstall");
+        let _ = app.update(Action::Input('y'));
+        assert!(app.ca_installing);
+        let reqs = app.on_bus(BusEvent::CallFailed {
+            name: "ca.uninstall".into(),
+            message: "ca.uninstall cancelled: the macOS authentication dialog was dismissed; the CA is still trusted".into(),
+        });
+        assert!(!app.ca_installing);
+        assert_eq!(reqs, vec![ca_status_call()]);
+        let t = app.current_toast().expect("toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "CA trust cancelled");
+    }
+
     /// S3: details follow the flows (vanished rows drop theirs) and never
     /// exceed `MAX_DETAILS`; the selected flow's detail survives the cap.
     #[test]
@@ -5903,6 +6326,7 @@ mod tests {
             capturing,
             paused,
             flows: 3,
+            system_proxy: None,
         }
     }
 
@@ -6442,5 +6866,478 @@ mod tests {
         assert!(app.current_toast().is_some());
         let _ = app.update(Action::Tick);
         assert!(app.current_toast().is_none());
+    }
+
+    // ------------------------------------------------- system proxy (D14)
+
+    fn sysproxy_call(name: &str) -> BusRequest {
+        BusRequest::Call {
+            name: name.into(),
+            args: json!({}),
+        }
+    }
+
+    fn sysproxy_word(state: &str) -> SystemProxyWord {
+        SystemProxyWord {
+            state: state.into(),
+            supported: true,
+            ..SystemProxyWord::default()
+        }
+    }
+
+    /// SP-AC26 / D14: with the verbs on the bus, `:sysproxy on|off|status`
+    /// is one bare call each; `on` and `off` raise the in-flight flag (the pill
+    /// reads `setting…`), `status` does not; anything else is a usage error.
+    #[test]
+    fn sysproxy_on_calls_set_when_the_tool_exists() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        assert_eq!(
+            app.run_command(":sysproxy on"),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting, "on → in flight until the reply");
+
+        app.sysproxy_setting = false;
+        assert_eq!(
+            app.run_command(":sysproxy off"),
+            vec![sysproxy_call("proxy.system.unset")]
+        );
+        assert!(app.sysproxy_setting, "off → in flight until the reply");
+
+        app.sysproxy_setting = false;
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+        assert!(!app.sysproxy_setting, "status reads; nothing is in flight");
+
+        assert!(app.run_command(":sysproxy sideways").is_empty());
+        assert!(app.run_command(":sysproxy").is_empty());
+        let t = app.current_toast().expect("a usage toast");
+        assert_eq!(t.level, Level::Error);
+        assert_eq!(t.text, "usage: :sysproxy on|off|status");
+    }
+
+    /// SP-AC26 / D14: a bus without `proxy.system.set` (an older core, or a
+    /// tools/list that hid it) gets the one warning toast and no call.
+    #[test]
+    fn sysproxy_without_the_tool_toasts() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        assert!(app.run_command(":sysproxy on").is_empty());
+        assert!(!app.sysproxy_setting);
+        let t = app.current_toast().expect("a toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "System proxy needs the core's proxy.system.* verbs");
+        // `off` and `status` are gated by the same tool.
+        assert!(app.run_command(":sysproxy off").is_empty());
+        assert!(app.run_command(":sysproxy status").is_empty());
+        assert_eq!(app.toasts.len(), 3);
+        assert!(app
+            .toasts
+            .iter()
+            .all(|t| t.text == "System proxy needs the core's proxy.system.* verbs"));
+    }
+
+    /// D14: `s` in the flow list is `ToggleSysProxy`; the toggle sends `unset`
+    /// only when the word says the system proxy already points at us, else `set`
+    /// (including before the first `proxy.status` carried a word at all).
+    #[test]
+    fn s_key_toggles_by_state() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        assert_eq!(
+            crate::keys::map(
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+                Mode::Flows
+            ),
+            Some(Action::ToggleSysProxy)
+        );
+
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools
+            .extend(tools(&["proxy.system.set", "proxy.system.unset"]));
+
+        app.system_proxy = Some(sysproxy_word("points_at_us"));
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.unset")]
+        );
+        assert!(app.sysproxy_setting);
+
+        app.sysproxy_setting = false;
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+
+        app.sysproxy_setting = false;
+        app.system_proxy = Some(SystemProxyWord {
+            host: Some("127.0.0.1".into()),
+            port: Some(9090),
+            ..sysproxy_word("other")
+        });
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+
+        app.sysproxy_setting = false;
+        app.system_proxy = None;
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+
+        // The key is gated like the command: no tool, no call, the warning.
+        let mut bare = App::new(TermCaps::full(), "127.0.0.1:9090");
+        bare.system_proxy = Some(sysproxy_word("off"));
+        assert!(bare.update(Action::ToggleSysProxy).is_empty());
+        assert_eq!(
+            bare.current_toast().map(|t| t.text.as_str()),
+            Some("System proxy needs the core's proxy.system.* verbs")
+        );
+    }
+
+    /// D14: the `proxy.system.set` / `unset` reply clears the in-flight flag,
+    /// replaces the word with the reply's state and toasts its `detail`; a bus
+    /// error clears the flag and is shown verbatim; `proxy.system.status`
+    /// toasts `detail`; every `proxy.status` poll refreshes the word.
+    #[test]
+    fn set_reply_clears_in_flight_and_updates_the_word() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+
+        let _ = app.run_command(":sysproxy on");
+        assert!(app.sysproxy_setting);
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.set".into(),
+            value: json!({
+                "state": "points_at_us", "host": null, "port": null,
+                "managed_by_us": true, "setting": false, "supported": true,
+                "mechanism": "networksetup", "services": ["Wi-Fi"],
+                "detail": "HTTP and HTTPS → 127.0.0.1:8080 (this core)",
+                "changed": true, "commands": ["networksetup -setwebproxy Wi-Fi 127.0.0.1 8080"]
+            }),
+        });
+        assert!(
+            !app.sysproxy_setting,
+            "the reply settles the in-flight flag"
+        );
+        let word = app.system_proxy.as_ref().expect("the reply's word");
+        assert_eq!(word.state, "points_at_us");
+        assert!(word.managed_by_us);
+        assert_eq!(
+            word.pill(app.sysproxy_setting).as_deref(),
+            Some("· sys-proxy → us")
+        );
+        let t = app.current_toast().expect("the detail toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "HTTP and HTTPS → 127.0.0.1:8080 (this core)");
+        assert_eq!(reqs, vec![BusRequest::Refresh]);
+
+        // unset: the reply's `off` state replaces the word.
+        let _ = app.run_command(":sysproxy off");
+        assert!(app.sysproxy_setting);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.unset".into(),
+            value: json!({
+                "state": "off", "host": null, "port": null, "managed_by_us": false,
+                "setting": false, "supported": true, "detail": "HTTP and HTTPS off",
+                "changed": true, "commands": [], "restored": ["Wi-Fi"], "left_alone": []
+            }),
+        });
+        assert!(!app.sysproxy_setting);
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("off")
+        );
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("HTTP and HTTPS off")
+        );
+
+        // A refusal from an agent-token bus: flag cleared, text verbatim, word kept.
+        let _ = app.run_command(":sysproxy on");
+        assert!(app.sysproxy_setting);
+        let _ = app.on_bus(BusEvent::CallFailed {
+            name: "proxy.system.set".into(),
+            message: "proxy.system.set is operator-only".into(),
+        });
+        assert!(
+            !app.sysproxy_setting,
+            "an error settles the in-flight flag too"
+        );
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("off")
+        );
+        let t = app.current_toast().expect("the error toast");
+        assert_eq!(t.level, Level::Error);
+        assert_eq!(t.text, "proxy.system.set is operator-only");
+
+        // `status` toasts the detail and leaves the flag alone.
+        let _ = app.run_command(":sysproxy status");
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: json!({"state": "other", "host": "127.0.0.1", "port": 9090,
+                "supported": true, "detail": "HTTP and HTTPS → 127.0.0.1:9090 (not this core)"}),
+        });
+        assert!(!app.sysproxy_setting);
+        let t = app.current_toast().expect("the status toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "HTTP and HTTPS → 127.0.0.1:9090 (not this core)");
+
+        // Every proxy.status poll carries the word, next to the capture flags.
+        let _ = app.on_bus(BusEvent::ProxyStatus(ProxyStatus::from_json(&json!({
+            "listening": true, "address": "127.0.0.1:8080", "capturing": true,
+            "system_proxy": {"state": "other", "host": "127.0.0.1", "port": 9090,
+                "managed_by_us": false, "setting": false, "supported": true,
+                "detail": "HTTP and HTTPS → 127.0.0.1:9090 (not this core)"}
+        }))));
+        assert_eq!(
+            app.system_proxy
+                .as_ref()
+                .and_then(|w| w.pill(false))
+                .as_deref(),
+            Some("· sys-proxy → 127.0.0.1:9090")
+        );
+        let _ = app.on_bus(BusEvent::ProxyStatus(status(true, true, 0)));
+        assert_eq!(
+            app.system_proxy, None,
+            "a poll without the key clears the word"
+        );
+    }
+
+    /// F-tui 1 (review log, plan 2026-10-31-system-proxy-automation): a
+    /// second `s` / `:sysproxy on|off` while a change is in flight — ours or
+    /// the core's `setting` flag — is refused with a Warn toast and no call;
+    /// `:sysproxy status` still goes through mid-flight.
+    #[test]
+    fn a_second_toggle_mid_flight_is_refused_with_a_warn_toast() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting);
+
+        // The second toggle: no call, the Warn toast, the flag untouched.
+        assert!(app.update(Action::ToggleSysProxy).is_empty());
+        let t = app.current_toast().expect("the in-flight toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "a system-proxy change is already in flight");
+        assert!(
+            app.sysproxy_setting,
+            "the refusal does not settle our flight"
+        );
+
+        // The same for both typed forms.
+        assert!(app.run_command(":sysproxy on").is_empty());
+        assert!(app.run_command(":sysproxy off").is_empty());
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("a system-proxy change is already in flight")
+        );
+
+        // `status` only reads; it is allowed mid-flight.
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+        assert!(app.sysproxy_setting);
+
+        // The core's own `setting` flag (another client's call) guards too,
+        // and the refusal does not raise our flag.
+        app.sysproxy_setting = false;
+        app.system_proxy = Some(SystemProxyWord {
+            setting: true,
+            ..sysproxy_word("off")
+        });
+        assert!(app.run_command(":sysproxy on").is_empty());
+        let t = app.current_toast().expect("the core-flag toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "a system-proxy change is already in flight");
+        assert!(!app.sysproxy_setting);
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+    }
+
+    /// F-tui 6 (panel Important): a bus drop mid-flight loses the reply that
+    /// would have settled the pill. A (re)connect is a new session, so it
+    /// drops our in-flight flag too — otherwise the guard would refuse every
+    /// later `s` / `:sysproxy on|off` for the rest of the run.
+    #[test]
+    fn a_reconnect_drops_the_in_flight_flag_so_the_guard_lets_the_retry_through() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        let names = [
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ];
+        app.tools.extend(tools(&names));
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.run_command(":sysproxy on"),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting);
+
+        // The bus drops before the reply: the pill stops claiming `setting…`.
+        let _ = app.on_bus(BusEvent::Disconnected("core restarted".into()));
+        assert!(
+            !app.sysproxy_setting,
+            "a disconnect settles nothing but ends the flight"
+        );
+
+        // Reconnect with the verbs: the retry is a real call, not the Warn toast.
+        let _ = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&names),
+            role: Some("operator".into()),
+        });
+        assert!(!app.sysproxy_setting);
+        assert_eq!(
+            app.update(Action::ToggleSysProxy),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(
+            app.sysproxy_setting,
+            "the retry is in flight until its reply"
+        );
+
+        // And a reconnect alone (no disconnect seen) drops it as well.
+        let _ = app.on_bus(BusEvent::Connected {
+            server: "aitmproxy test".into(),
+            tools: tools(&names),
+            role: Some("operator".into()),
+        });
+        assert!(!app.sysproxy_setting);
+        assert_ne!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("a system-proxy change is already in flight")
+        );
+    }
+
+    /// F-tui 7 (panel Minor): the raw `:proxy.system.set|unset` (and the
+    /// palette's tool list, which calls the same path) goes through the same
+    /// guard as `s` / `:sysproxy`: refused mid-flight, and a cold call raises
+    /// the flag so its reply settles the pill it started.
+    #[test]
+    fn the_raw_verb_path_shares_the_in_flight_guard() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+        assert_eq!(
+            app.run_command(":proxy.system.set"),
+            vec![sysproxy_call("proxy.system.set")]
+        );
+        assert!(app.sysproxy_setting, "the raw call is a flight too");
+
+        assert!(app.run_command(":proxy.system.unset").is_empty());
+        assert!(app.run_command(":sysproxy off").is_empty());
+        let t = app.current_toast().expect("the in-flight toast");
+        assert_eq!(t.level, Level::Warn);
+        assert_eq!(t.text, "a system-proxy change is already in flight");
+        assert!(
+            app.sysproxy_setting,
+            "the refusal does not settle the first flight"
+        );
+
+        // `status` by name is a read; it passes.
+        assert_eq!(
+            app.run_command(":proxy.system.status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+    }
+
+    /// F-tui 4: a `proxy.system.status` reply that parses updates the word
+    /// (the toast stays `detail`) and never touches our in-flight flag.
+    #[test]
+    fn status_reply_updates_the_word_without_touching_the_flag() {
+        let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+        app.tools.extend(tools(&[
+            "proxy.system.set",
+            "proxy.system.unset",
+            "proxy.system.status",
+        ]));
+        app.system_proxy = Some(sysproxy_word("off"));
+        let reply = json!({"state": "other", "host": "127.0.0.1", "port": 9090,
+            "managed_by_us": false, "setting": false, "supported": true,
+            "detail": "HTTP and HTTPS → 127.0.0.1:9090 (not this core)"});
+
+        // Not in flight: the word follows the reply, the flag stays down.
+        assert_eq!(
+            app.run_command(":sysproxy status"),
+            vec![sysproxy_call("proxy.system.status")]
+        );
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: reply.clone(),
+        });
+        assert!(!app.sysproxy_setting);
+        let word = app.system_proxy.as_ref().expect("the reply's word");
+        assert_eq!(word.state, "other");
+        assert_eq!(word.host.as_deref(), Some("127.0.0.1"));
+        assert_eq!(word.port, Some(9090));
+        assert_eq!(
+            word.pill(app.sysproxy_setting).as_deref(),
+            Some("· sys-proxy → 127.0.0.1:9090")
+        );
+        let t = app.current_toast().expect("the status toast");
+        assert_eq!(t.level, Level::Info);
+        assert_eq!(t.text, "HTTP and HTTPS → 127.0.0.1:9090 (not this core)");
+
+        // Mid-flight: the word still follows, the flag stays up.
+        app.system_proxy = Some(sysproxy_word("off"));
+        let _ = app.run_command(":sysproxy on");
+        assert!(app.sysproxy_setting);
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: reply,
+        });
+        assert!(
+            app.sysproxy_setting,
+            "a status reply is not our set's reply"
+        );
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("other")
+        );
+
+        // A reply that does not parse keeps the word (and the fallback toast).
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "proxy.system.status".into(),
+            value: json!(null),
+        });
+        assert_eq!(
+            app.system_proxy.as_ref().map(|w| w.state.as_str()),
+            Some("other")
+        );
+        assert_eq!(
+            app.current_toast().map(|t| t.text.as_str()),
+            Some("proxy.system.status: ok")
+        );
     }
 }

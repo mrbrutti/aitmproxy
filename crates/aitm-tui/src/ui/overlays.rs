@@ -106,8 +106,6 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
 }
 
 pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let area = centered(screen, 96, 40);
-    let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     let k = |a: &str, b: &str| key_line(theme, a, b);
     let mut lines =
         vec![
@@ -147,6 +145,10 @@ pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
             "b / l / t",
             "toggle sidebar · layout below/right · auto-select",
         ),
+        k(
+            "s",
+            "set / restore the system proxy (:sysproxy on|off|status)",
+        ),
         k("y / o", "copy URL (OSC 52) · open externally"),
         k(
             "/",
@@ -176,6 +178,23 @@ pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         " Any key closes this help.",
         theme.text_tertiary(),
     ));
+    // The box is as tall as its content (plus the frame) and never taller than
+    // the screen; on a short terminal the tail is replaced by a footer that says
+    // how many lines are hidden, so the closing hint is never clipped.
+    let wanted = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(2);
+    let area = centered(screen, 96, wanted.min(screen.height));
+    let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
+    let visible = usize::from(inner.height);
+    if lines.len() > visible && visible > 0 {
+        let hidden = lines.len() - visible + 1;
+        lines.truncate(visible - 1);
+        lines.push(Line::styled(
+            format!(" … {hidden} more lines need a taller window · Any key closes this help."),
+            theme.text_tertiary(),
+        ));
+    }
     lines_into(buf, inner, &lines, 0);
 }
 

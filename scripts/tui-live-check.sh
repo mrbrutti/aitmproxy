@@ -122,10 +122,12 @@ tmux kill-session -t "$S" 2>/dev/null || true
 case "$MODE" in
   embed)
     say "starting: aitm tui (embedded) in tmux $S"
-    tmux new-session -d -s "$S" -x 200 -y 50 "RUST_LOG=info $AITM --config $WORK/aitm.yaml tui"
+    # AITM_AUDIT_LOG is inline: an export here would not reach a command string run by an existing tmux server.
+    tmux new-session -d -s "$S" -x 200 -y 50 "RUST_LOG=info AITM_AUDIT_LOG=off $AITM --config $WORK/aitm.yaml tui"
     ;;
   bus)
     say "starting: aitm server + aitm-tui over the bus"
+    export AITM_AUDIT_LOG=off
     "$AITM" --config "$WORK/aitm.yaml" > "$WORK/server.log" 2>&1 &
     SERVER_PID=$!
     sleep 1.5

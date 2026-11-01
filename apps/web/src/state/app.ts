@@ -8,9 +8,11 @@
 
 import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
-import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, PocRun, StateNotification, ToolDef } from '~/bus/types';
+import type { BusClient, AgentNotification, CAStatusWire, FlowEventKind, FlowNotification, PocRun, StateNotification, SystemProxyStatus, ToolDef } from '~/bus/types';
 import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
 import { isUiPollNoise, ownOriginOf } from '~/bus/noise';
+import { parseCATrust, type CATrustStatus } from './caTrust';
+import { mergeSystemProxy, parseSystemProxy } from './systemProxy';
 import {
   contentFamily,
   type ContentFamily,
@@ -121,6 +123,13 @@ interface ProxyState {
   polling: boolean;
   /** The core's version, from `proxy.status`; empty until it answers (never a made-up number). */
   version: string;
+  /**
+   * `proxy.status.system_proxy` (spec D6), parsed on every status read; null until the core answers
+   * or when it is older than the field. The toolbar pill word and menu derive from it (D15).
+   */
+  systemProxy: SystemProxyStatus | null;
+  /** This client's own `proxy.system.set` / `unset` is in flight (another client's is `systemProxy.setting`). */
+  systemProxySetting: boolean;
 }
 
 const STORAGE = {
@@ -236,8 +245,15 @@ export function createAppStore(bus: BusClient) {
       tools: [],
       polling: false,
       version: '',
+      systemProxy: null,
+      systemProxySetting: false,
     });
     let activitySeq = 0;
+
+    // CA trust (§D17.12): the last `ca.status` reading, and whether a `ca.install` / `ca.uninstall`
+    // run is in flight. The word always comes from the read-back, never from the install's reply.
+    const [caStatus, setCaStatus] = createSignal<CATrustStatus | null>(null);
+    const [caInstalling, setCAInstalling] = createSignal(false);
 
     const [toast, setToast] = createSignal<{ text: string; kind: 'error' | 'info' } | null>(null);
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -688,12 +704,15 @@ export function createAppStore(bus: BusClient) {
       if (!proxy.tools.some((t) => t.name === 'proxy.status')) return;
       lastStatusAt = Date.now();
       try {
-        const s = await bus.call<{ capturing?: boolean; intercept_armed?: boolean; address?: string | null; paused?: number; version?: unknown }>('proxy.status');
+        const s = await bus.call<{ capturing?: boolean; intercept_armed?: boolean; address?: string | null; paused?: number; version?: unknown; system_proxy?: unknown }>('proxy.status');
         setProxy({
           listening: s.capturing ?? proxy.listening,
           armed: typeof s.intercept_armed === 'boolean' ? s.intercept_armed : proxy.armed,
           address: s.address ?? proxy.address,
           version: typeof s.version === 'string' ? s.version : proxy.version,
+          // Always null, never undefined, when absent: a Solid store drops a key set to undefined.
+          // The compact object has no guidance/remedy: the last full read's survive it (spec D15).
+          systemProxy: mergeSystemProxy(proxy.systemProxy, parseSystemProxy(s.system_proxy)),
         });
       } catch {
         /* next tick */
@@ -869,6 +888,7 @@ export function createAppStore(bus: BusClient) {
               intercept_armed?: boolean;
               protocol?: string;
               version?: unknown;
+              system_proxy?: unknown;
             }>('proxy.status')
             .then((s) =>
               setProxy({
@@ -882,6 +902,7 @@ export function createAppStore(bus: BusClient) {
                 armed: typeof s.intercept_armed === 'boolean' ? s.intercept_armed : proxy.armed,
                 // The binary's version; a core older than the field sends none, and nothing is better than a guess.
                 version: typeof s.version === 'string' ? s.version : proxy.version,
+                systemProxy: mergeSystemProxy(proxy.systemProxy, parseSystemProxy(s.system_proxy)),
               }),
             )
             .catch(() => {}),
@@ -890,12 +911,29 @@ export function createAppStore(bus: BusClient) {
       await Promise.all(jobs);
     }
 
+    /**
+     * Re-read `ca.status` into `ca` (D17.5); true when the read-back landed. A missing tool leaves
+     * the reading untouched and a failed read keeps the last one, both false, so the caller that
+     * just changed the trust store can say the word may be stale. Each read costs the core one
+     * trust evaluation per store, so it runs only at bootstrap and after a `ca.install` /
+     * `ca.uninstall` run, not on every side refresh.
+     */
+    async function refreshCA(): Promise<boolean> {
+      if (!proxy.tools.some((t) => t.name === 'ca.status')) return false;
+      try {
+        setCaStatus(parseCATrust(await bus.call<CAStatusWire>('ca.status')));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
     /** The tool catalogue, then everything read through it. Shared by bootstrap and the loop's heal. */
     async function loadCatalogue() {
       const tools = await bus.tools();
       setProxy('tools', tools);
       toolsLoaded = true;
-      await refreshSide();
+      await Promise.all([refreshSide(), refreshCA()]);
     }
 
     async function bootstrap() {
@@ -1194,6 +1232,32 @@ export function createAppStore(bus: BusClient) {
       }
     };
 
+    /** One system-proxy change: flag it in flight for the pill, store the reply's status, clear the flag even on error. */
+    async function systemProxyChange(tool: 'proxy.system.set' | 'proxy.system.unset', args?: Record<string, unknown>): Promise<void> {
+      setProxy('systemProxySetting', true);
+      try {
+        const result = await bus.call<unknown>(tool, args);
+        setProxy('systemProxy', parseSystemProxy(result));
+      } finally {
+        setProxy('systemProxySetting', false);
+      }
+    }
+
+    /**
+     * The full status read the pill menu asks for when it opens (spec D15, amended 2026-11-01): the
+     * compact `proxy.status` sub-object has no `guidance`/`remedy`, so "Copy env line" and the
+     * privilege remedy come only from here. Gated on the tool being offered. A reply that is not a
+     * status object keeps what the poll already stored rather than wiping the pill. Skipped while this
+     * client's own set/unset is in flight: the change's reply stores the status, and a concurrent full
+     * read could race it with a stale object.
+     */
+    async function refreshSystemProxy(): Promise<void> {
+      if (proxy.systemProxySetting) return;
+      if (!proxy.tools.some((t) => t.name === 'proxy.system.status')) return;
+      const full = parseSystemProxy(await bus.call<unknown>('proxy.system.status'));
+      if (full) setProxy('systemProxy', full);
+    }
+
     const actions = {
       select,
       setSelection,
@@ -1366,6 +1430,13 @@ export function createAppStore(bus: BusClient) {
           await bus.call(proxy.listening ? 'proxy.pause' : 'proxy.resume');
           setProxy('listening', !proxy.listening);
         }),
+      // The system-proxy pill menu (spec D15): `proxy.system.set {}` / `proxy.system.unset` return the
+      // full D6 status object, which replaces the compact one from `proxy.status`. The in-flight flag
+      // is this client's own; a refusal reaches the status bar through `guarded`'s notice. No per-call
+      // timeout here: `ws.ts` has none and a set can take a couple of seconds of `networksetup`.
+      setSystemProxy: () => guarded('system proxy', () => systemProxyChange('proxy.system.set', {})),
+      unsetSystemProxy: () => guarded('system proxy', () => systemProxyChange('proxy.system.unset')),
+      refreshSystemProxy: () => guarded('system proxy', refreshSystemProxy),
       clear: () =>
         guarded('clear', async () => {
           await bus.call('flow.clear');
@@ -1442,6 +1513,9 @@ export function createAppStore(bus: BusClient) {
       scanDiscover: (args: Record<string, unknown>) => guarded('scan', () => bus.call<unknown>('scan.discover', args)),
       ensurePocSource,
       refreshSide,
+      refreshCA,
+      /** Set by the palette for the duration of a `ca.install` / `ca.uninstall` run and its re-read. */
+      setCAInstalling: (on: boolean) => setCAInstalling(on),
       /** The lifted L4 store calls this on each refresh so selection/list routing knows L4 ids. */
       setL4Ids: (ids: readonly FlowId[]) => setL4IdsSig(new Set<FlowId>(ids)),
       call: <T,>(tool: string, args?: Record<string, unknown>) => bus.call<T>(tool, args),
@@ -1469,6 +1543,13 @@ export function createAppStore(bus: BusClient) {
       oldestPaused,
       details,
       toast,
+      /** The last `ca.status` reading; null before the first read, without the tool, or when no store reports. */
+      get ca(): CATrustStatus | null {
+        return caStatus();
+      },
+      get caInstalling(): boolean {
+        return caInstalling();
+      },
       ...actions,
     };
   });

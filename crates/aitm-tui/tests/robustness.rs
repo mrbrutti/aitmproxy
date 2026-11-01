@@ -2011,10 +2011,20 @@ fn a_bus_drop_after_the_list_landed_keeps_the_rows_and_recovers_on_reconnect() {
     let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
     assert!(app.details.contains_key("a"));
 
-    // Reconnect: a new session asks for a fresh list; the toolbar follows
-    // the proxy.status the handshake reads.
+    // Reconnect: a new session asks for a fresh list and, since the bus
+    // offers `ca.status`, reads the CA trust back once (D17.11); the toolbar
+    // follows the proxy.status the handshake reads.
     let reqs = connect(&mut app, CORE_TOOLS, Some("127.0.0.1:8080"));
-    assert_eq!(reqs, vec![BusRequest::Refresh]);
+    assert_eq!(
+        reqs,
+        vec![
+            BusRequest::Refresh,
+            BusRequest::Call {
+                name: "ca.status".into(),
+                args: json!({}),
+            },
+        ]
+    );
     let text = text_of(&app, 200, 50);
     assert!(
         text.lines()

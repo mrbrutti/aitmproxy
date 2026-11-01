@@ -40,6 +40,10 @@ pub enum Action {
     ChipIndex(usize),
     ToggleLayout,
     ToggleAutoSelect,
+    /// Flow list `s` (spec §D14): set the OS system proxy to this core, or
+    /// restore it when `proxy.status.system_proxy` already points at us.
+    /// Routed through `:sysproxy on|off`, so the same tool gate applies.
+    ToggleSysProxy,
     Help,
     // Flow verbs (mitmproxy idiom, §2.1)
     ToggleIntercept,
