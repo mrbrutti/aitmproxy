@@ -67,6 +67,10 @@ TIMED_PATHS = ("/items", "/orders", "/ping")
 # target may see up to 16 delay-bearing requests per path, 8 from each (live run
 # 2026-11-01: /items saw exactly 16, 8 per check).
 MAX_DELAY_PROBES_PER_POINT = 16
+# The log is counted per path, and a path can carry more than one insertion
+# point (`/search` has the `q` query parameter and the search form's body
+# field), so the bound for the non-seeded paths is two points' worth.
+MAX_DELAY_PROBES_PER_PATH = 2 * MAX_DELAY_PROBES_PER_POINT
 MIN_TIMING_R = 0.85
 JOB_TIMEOUT = 600.0
 
@@ -167,9 +171,9 @@ def main() -> None:
                 check(n <= MAX_DELAY_PROBES_PER_POINT,
                       f"V: {n} delay-payload request(s) on {path} (<= {MAX_DELAY_PROBES_PER_POINT})")
             extra = {k: n for k, n in counts_v.items()
-                     if k not in TIMED_PATHS and n > MAX_DELAY_PROBES_PER_POINT}
+                     if k not in TIMED_PATHS and n > MAX_DELAY_PROBES_PER_PATH}
             check(not extra,
-                  f"V: no other point got more than {MAX_DELAY_PROBES_PER_POINT} delay payloads "
+                  f"V: no other path got more than {MAX_DELAY_PROBES_PER_PATH} delay payloads "
                   f"(observed {extra or 'none'}; all paths {counts_v or 'none'})")
             check(sum(counts_v.get(p, 0) for p in ("/orders", "/ping")) > 0,
                   f"V: the delay payloads really reached the target (per-path {counts_v or 'none'})")
