@@ -174,12 +174,14 @@ impl L4StreamLane {
         proto: L4Transport,
     ) -> anyhow::Result<String> {
         let Some(guard) = self.guard.as_deref() else {
-            return Err(anyhow!(L4_DISABLED));
+            return Err(anyhow!(refused_preview(ip, port, L4_DISABLED.to_string())));
         };
         if ip.is_loopback() && guard.self_ports().contains(&port) {
-            return Err(anyhow!(
-                "scan: out_of_scope: {ip}:{port} is one of the core's own listener ports"
-            ));
+            return Err(anyhow!(refused_preview(
+                ip,
+                port,
+                format!("scan: out_of_scope: {ip}:{port} is one of the core's own listener ports")
+            )));
         }
         let permit = guard
             .check(
@@ -192,7 +194,13 @@ impl L4StreamLane {
                     proto: proto_of(proto),
                 },
             )
-            .map_err(|error| anyhow!("scan: out_of_scope: {error}"))?;
+            .map_err(|error| {
+                anyhow!(refused_preview(
+                    ip,
+                    port,
+                    format!("scan: out_of_scope: {error}")
+                ))
+            })?;
         drop(permit);
         Ok(Self::scope_entry_for(guard, ip, port))
     }
@@ -382,6 +390,21 @@ pub fn lane_with_client(
     client: Arc<dyn StreamClient>,
 ) -> Arc<L4StreamLane> {
     Arc::new(L4StreamLane::new(guard, store, client))
+}
+
+/// Record a refused discovery preview and return its message (spec S9).
+///
+/// The host warns about every refusal it meets; discovery's own step-1
+/// preview is the other half of that rule, and it is the one an operator
+/// hits first when the endpoint was never in scope. The endpoint and the D3
+/// reason, and nothing else: discovery has read no seed yet (C11).
+fn refused_preview(ip: IpAddr, port: u16, reason: String) -> String {
+    tracing::warn!(
+        endpoint = %format_args!("{ip}:{port}"),
+        reason = %reason,
+        "l4 stream guard refusal"
+    );
+    reason
 }
 
 /// The scope entry as S5.4 renders it: `"<addr>/<prefix>:<lo>-<hi> <interface> <direction>"`.

@@ -1105,11 +1105,46 @@ async fn a_skipped_profile_seed_is_counted_and_named() {
 #[tokio::test]
 async fn a_guard_refusal_and_a_dead_target_are_warned() {
     let _serial = TRACING.lock().await;
-    let (_guard, lines) = common::capture_tracing();
     let seeds = hex_seeds(&[b"abc"]);
+
+    // (0) Discovery's own S5.2 step-1 preview, refused: the endpoint is not
+    // in the operator's L4 scope at all.
+    let (_guard0, lines) = common::capture_tracing();
+    let client = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", 9011, Some("raw"), 10, &seeds);
+    let (_lane, _job, found) = discover_with(
+        Some(guard_over(vec![entry(
+            Ipv4Addr::new(10, 0, 0, 0),
+            8,
+            ANY_INTERFACE,
+            L4Capability::Inject,
+        )])),
+        Arc::clone(&client),
+        profile,
+        "22prev",
+    )
+    .await;
+    let error = found.expect_err("an unscoped endpoint is never discovered");
+    assert!(
+        error.to_string().starts_with("scan: out_of_scope: "),
+        "{error}"
+    );
+    let recorded = lines.lock().expect("the capture sink").clone();
+    let warned: Vec<&String> = recorded
+        .iter()
+        .filter(|line| line.starts_with("WARN ") && line.contains("endpoint=127.0.0.1:9011"))
+        .collect();
+    assert_eq!(
+        warned.len(),
+        1,
+        "one WARN for the refused preview: {recorded:?}"
+    );
+    assert!(warned[0].contains("out_of_scope"), "{}", warned[0]);
+    assert_eq!(client.count(), 0, "a refusal opens no exchange");
 
     // (1) The A1 self-port re-check, which refuses after discovery and opens
     // no socket.
+    let (_guard, lines) = common::capture_tracing();
     let guard = common::wildcard_guard(&[9009]);
     let client = Arc::new(CountingClient::live());
     let profile = profile_for("127.0.0.1", 9009, Some("raw"), 10, &seeds);
