@@ -691,6 +691,7 @@ Shared facts for every coder:
 | 10 | `Cargo.toml` (root, after Task 1), `crates/aitm-scan-{http,checks-http,ws,l4-packet,l4-stream}/**` |
 | 11 | `crates/aitm/{Cargo.toml, src/wire.rs, src/main.rs}`, `crates/aitm-plugin-scanner/{Cargo.toml, src/plugin.rs}` |
 | 12 | none (merge + proof); may regenerate `Cargo.lock` after the merge |
+| fix round (panel) | `crates/aitm-proto-l4/src/{guard.rs, capture.rs, commands/mod.rs}`, `crates/aitm/src/scripts.rs`, `crates/aitm-scan-model/src/{point.rs, profile.rs, issue.rs, job.rs, lib.rs, session.rs, vocab.rs}`, `crates/aitm-scan-model/tests/builtin_profiles.rs`, `crates/aitm-scan-model/fixtures/{README.md, scan.checks.json}`, `Cargo.toml` (comment) |
 
 `Cargo.lock` is a derived file: Tasks 1, 10 and 11 regenerate it as a mechanical consequence of their manifest edits (new members and dependency edges only; no external crate enters it in T1a), and Task 12 regenerates it after merging `origin/main`.
 
@@ -782,6 +783,12 @@ Kept by the main session during stage 6. One row per finding.
 | 1 | Spec | Minor | `LaneKind` L4 doc comments misdescribed the two lanes | fixed in 2019feef |
 | 1 | Spec | Minor | `blake3` dependency comment named the wrong purpose | fixed in 2019feef |
 | 9 | Spec | Minor | Two `scan.checks.json` entries reused XSS metadata | fixed in 2019feef |
+| fix round | Security (re-review `15b14494..1af619fe`) | - | S1-S3 confirmed closed, no regression; asked that `L4Reply` get the redacting `Debug` now | fixed in a953b9e3; `RawProbe.url` query redaction stays with T2 (pin test required there) |
+| fix round | Quality (re-review) | Minor | Redundant `#[serde(default)]` on `L4SeedRaw`; eager key-name list | fixed in a953b9e3 |
+| fix round | Quality (re-review) | Minor | `get_ex_test()` helper not reused in one test | fixed in a953b9e3 |
+| fix round | Quality (re-review) | Minor | `interface_covers` called by path in `commands/mod.rs` | fixed in a953b9e3 |
+| fix round | Spec (re-review) | Minor | D9.1 paragraph placed the D9.1 types in `ctx.rs` | fixed in the docs commit that carries this row |
+| fix round | Spec (re-review) | Minor | D12 T1a cell missed `wire.rs`/`main.rs`/`types.rs`/`config.rs`; plan matrix lacked the fix-round files | fixed in the docs commit that carries this row |
 
 ## Shipped
 
