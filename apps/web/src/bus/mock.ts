@@ -441,6 +441,484 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     });
   }
 
+  // ---- Scanner v2 (D3, spec D-T8.11): the `scan.*` verbs and a simulated job --------------------
+  //
+  // DEVELOPMENT ONLY. Every reply below is a hand-written shape modelled on
+  // `crates/aitm-scan-model/fixtures/*.json`, and the "job" is a chain of `later()` timers: no
+  // request is sent, nothing is crawled, nothing is probed, and the two issues it reports are
+  // literals with fresh ids. This exists so the Scan panel can be built and demonstrated with
+  // `?bus=mock` while the engine lands. As the fixture pack's README says of the pack itself, a
+  // green run against a shape proves the shape and nothing else: **a `?bus=mock` run is never
+  // acceptance evidence** for the scanner (umbrella spec Verification). That proof is a live run
+  // against a real core with a real target.
+
+  /** `scanner.ceilings.probes` (D11 default). A bigger budget comes back `clamped`, never refused. */
+  const SCAN_PROBE_CEILING = 20000;
+  const SCAN_PROFILE_DIR = '/Users/operator/.aitmproxy/findings/scan/profiles';
+  /** The engine reports a lane whose crate is absent as skipped, not as a refusal (D1/D5). */
+  const SCAN_UNAVAILABLE_LANES = ['ws'];
+  const SCAN_CANARY = { kind: 'flow', method: 'GET', path: '/account', expected_status: 200 };
+
+  type ScanState = 'queued' | 'running' | 'cancelling' | 'done' | 'cancelled' | 'failed';
+  type ScanPhase = 'queued' | 'crawling' | 'passive' | 'auditing' | 'reporting' | 'done';
+
+  interface ScanIssueFx {
+    id: string;
+    job: string;
+    check_id: string;
+    class: string;
+    name: string;
+    severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+    confidence: 'certain' | 'firm' | 'tentative';
+    status: 'open' | 'confirmed' | 'false_positive';
+    lane: string;
+    target: { scheme: string; host: string; port: number };
+    location: { method: string; path: string; path_template: string; kind: string; name: string; field_path: string | null; ws_path: string | null; l4: null };
+    evidence: { payload: string; matched: string; probe_flows: string[]; baseline_flow: string | null; timing: null; diff: null; l4: null };
+    first_seen: number;
+    last_seen: number;
+    occurrences: number;
+    poc_ref: string | null;
+    finding_id: string | null;
+    description: string;
+    remediation: string | null;
+    note: string | null;
+  }
+
+  interface ScanJobFx {
+    job: string;
+    state: ScanState;
+    phase: ScanPhase;
+    profile_name: string;
+    targets: string[];
+    origin: string | null;
+    started_at: number;
+    finished_at: number | null;
+    stopped_reason: string | null;
+    probes: { sent: number; budget: number; errors: number; timeouts: number; rate_waits: number; by_lane: Record<string, number> };
+    crawl: { pages: number; queued: number; depth: number; forms_submitted: number };
+    points: { found: number; queued: number; audited: number; skipped: { ignored: number; frequent: number; limit: number } };
+    checks: { scheduled: number; done: number; running: string[] };
+    lanes: { requested: string[]; run: string[]; skipped: { lane: string; reason: string }[] };
+    clamped: { field: string; requested: number; applied: number }[];
+    /** Strictly increasing per job, as the engine's push sequence is. */
+    seq: number;
+  }
+
+  /** The `standard` built-in, field for field as `scan.profile.get` answers it. */
+  const SCAN_STANDARD_PROFILE: Record<string, unknown> = {
+    name: 'standard',
+    target: { origins: [], l4: [] },
+    lanes: ['http', 'ws'],
+    intensity: 'medium',
+    speed: 'normal',
+    accuracy: 'normal',
+    checks: { include: [], exclude: [] },
+    crawl: { strategy: 'normal', max_depth: 3, max_pages: 200, submit_forms: true, click_handlers: true, robots: true, sitemap: true, use_browser: 'auto' },
+    audit: {
+      kinds: ['query', 'body_param', 'json_value', 'xml_value', 'xml_attr', 'multipart_value', 'multipart_filename', 'header', 'cookie', 'path_segment', 'path_filename', 'param_name_query', 'param_name_body', 'entire_body', 'ws_json_value', 'ws_text', 'ws_form_param', 'ws_binary', 'ws_handshake_header', 'l4_field'],
+      ignore: [{ kind: null, name_regex: null, trait: 'session' }],
+      max_points_per_request: 64,
+      frequent_point_threshold: 8,
+    },
+    session: { mode: 'observed', from_flow: null, on_lost: 'stop' },
+    budget: { probes: 2000, time_s: 600, max_issues: 1024, check_timeout_s: 60, per_host_errors: { consecutive: 10, ratio: 0.5 } },
+    http: { version: 'auto', record_probes: 'issues_only' },
+    ws: { reply_window_ms: 1500, max_frame_bytes: 1048576 },
+    l4: { cases: 500, reproduce_count: 3, liveness_every: 25, consecutive_timeouts: 20, max_bytes_per_s: 65536, seeds: [], dry_run: false },
+  };
+
+  /** The seven built-ins of `scan.profile.list`; the tree each one returns is `standard` retuned. */
+  const SCAN_BUILTIN_PROFILES: { name: string; lanes: string[]; intensity: string; speed: string }[] = [
+    { name: 'passive-only', lanes: ['http'], intensity: 'passive', speed: 'normal' },
+    { name: 'map-only', lanes: ['http'], intensity: 'passive', speed: 'normal' },
+    { name: 'light-http', lanes: ['http'], intensity: 'light', speed: 'fast' },
+    { name: 'standard', lanes: ['http', 'ws'], intensity: 'medium', speed: 'normal' },
+    { name: 'thorough', lanes: ['http', 'ws'], intensity: 'medium', speed: 'thorough' },
+    { name: 'l4-stream-safe', lanes: ['l4_stream'], intensity: 'medium', speed: 'normal' },
+    { name: 'l4-full', lanes: ['l4_packet', 'l4_stream'], intensity: 'medium', speed: 'normal' },
+  ];
+
+  const savedScanProfiles = new Map<string, Record<string, unknown>>();
+  /** Newest first, as `scan.list` returns them. */
+  const scanJobs: ScanJobFx[] = [];
+  const scanIssues: ScanIssueFx[] = [];
+
+  const scanClone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+  const scanDict = (v: unknown): Record<string, unknown> => (typeof v === 'object' && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : {});
+  const scanStrings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
+  const scanNum = (v: unknown, dflt: number): number => (typeof v === 'number' && Number.isFinite(v) ? v : dflt);
+  /** The core's error form: `scan: <code>: <detail>`, which every UI matches on the code token. */
+  const scanError = (code: string, detail: string) => new BusError(`scan: ${code}: ${detail}`);
+  const scanHex8 = () => Math.floor(rng() * 0xffffffff).toString(16).padStart(8, '0');
+
+  function scanProfileTree(name: string): Record<string, unknown> {
+    const saved = savedScanProfiles.get(name);
+    if (saved) return scanClone(saved);
+    const builtin = SCAN_BUILTIN_PROFILES.find((p) => p.name === name);
+    if (!builtin) throw scanError('not_found', `no profile named ${name}`);
+    // The tree agrees with the list summary: name, lanes, intensity and speed come from the entry.
+    return { ...scanClone(SCAN_STANDARD_PROFILE), name: builtin.name, lanes: [...builtin.lanes], intensity: builtin.intensity, speed: builtin.speed };
+  }
+
+  function scanProfileEntry(name: string, tree: Record<string, unknown>, builtin: boolean) {
+    return {
+      name,
+      builtin,
+      summary: {
+        lanes: scanStrings(tree.lanes),
+        intensity: typeof tree.intensity === 'string' ? tree.intensity : 'medium',
+        speed: typeof tree.speed === 'string' ? tree.speed : 'normal',
+      },
+    };
+  }
+
+  /** The whole-profile launch the Scan surface sends: `{ profile }`, nothing else. */
+  function scanProfileArg(args: Record<string, unknown>): Record<string, unknown> {
+    const p = args.profile;
+    if (typeof p !== 'object' || p === null || Array.isArray(p)) throw scanError('invalid_profile', 'the fixture bus takes a whole `profile`');
+    return p as Record<string, unknown>;
+  }
+
+  function scanTargetsOf(p: Record<string, unknown>): { origins: string[]; l4: string[] } {
+    const t = scanDict(p.target);
+    const l4 = (Array.isArray(t.l4) ? t.l4 : []).map((x) => {
+      const o = scanDict(x);
+      return `${typeof o.ip === 'string' ? o.ip : '?'}:${scanNum(o.port, 0)}`;
+    });
+    return { origins: scanStrings(t.origins), l4 };
+  }
+
+  function scanCheckScope(origins: string[]) {
+    for (const o of origins) {
+      let host = '';
+      let hostPort = '';
+      try {
+        const u = new URL(o);
+        host = u.hostname;
+        hostPort = u.host;
+      } catch {
+        throw scanError('out_of_scope', `${o} is not in scope`);
+      }
+      if (![...scope].some((h) => h === host || h === hostPort || (h.startsWith('*.') && host.endsWith(h.slice(1)))))
+        throw scanError('out_of_scope', `${o} is not in scope`);
+    }
+  }
+
+  const scanJobOf = (id: string): ScanJobFx => {
+    const j = scanJobs.find((x) => x.job === id);
+    if (!j) throw scanError('not_found', `no job ${id}`);
+    return j;
+  };
+  const scanRunning = (j: ScanJobFx) => j.state === 'queued' || j.state === 'running';
+  const scanElapsed = (j: ScanJobFx) => (j.finished_at ?? Date.now()) - j.started_at;
+  const scanIssuesOf = (job: string) => scanIssues.filter((i) => i.job === job);
+
+  function scanIssueCounters(job: string) {
+    const rows = scanIssuesOf(job);
+    const by_severity = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+    const by_confidence = { certain: 0, firm: 0, tentative: 0 };
+    for (const r of rows) {
+      by_severity[r.severity]++;
+      by_confidence[r.confidence]++;
+    }
+    return { total: rows.length, by_severity, by_confidence };
+  }
+
+  /** The summary fields a `scan.list` row and every push line carry. */
+  function scanSummaryWire(j: ScanJobFx) {
+    return {
+      job: j.job,
+      state: j.state,
+      phase: j.phase,
+      elapsed_ms: scanElapsed(j),
+      probes: { ...j.probes, by_lane: { ...j.probes.by_lane } },
+      points: { ...j.points, skipped: { ...j.points.skipped } },
+      issues: scanIssueCounters(j.job),
+    };
+  }
+
+  /** The full `JobStatus` of `scan.status`, `scan.cancel` and the `scan.start` result. */
+  function scanStatusWire(j: ScanJobFx) {
+    const l4Lane = j.lanes.run.some((l) => l.startsWith('l4'));
+    return {
+      ...scanSummaryWire(j),
+      profile_name: j.profile_name,
+      targets: [...j.targets],
+      started_by: { frontend: 'operator', client_label: 'web-ui' },
+      started_at: j.started_at,
+      finished_at: j.finished_at,
+      stopped_reason: j.stopped_reason,
+      crawl: { ...j.crawl },
+      checks: { ...j.checks, running: [...j.checks.running] },
+      l4: l4Lane ? { cases: j.probes.sent, crashes: 0, liveness_failures: 0, retired_elements: 0 } : null,
+      session: j.origin ? { reused: true, lost: false, canary: { ...SCAN_CANARY }, browser_partial: false } : null,
+      lanes: { requested: [...j.lanes.requested], run: [...j.lanes.run], skipped: j.lanes.skipped.map((s) => ({ ...s })) },
+      clamped: j.clamped.map((c) => ({ ...c })),
+      error: null,
+    };
+  }
+
+  const scanIssueSummaryWire = (i: ScanIssueFx) => {
+    const { evidence: _e, description: _d, remediation: _r, note: _n, ...summary } = scanClone(i);
+    return summary;
+  };
+
+  /** One `notifications/aitm/job` line. `seq` is strictly increasing per job. */
+  function scanPush(j: ScanJobFx, event: string, issue?: ScanIssueFx) {
+    j.seq++;
+    notify('notifications/aitm/job', {
+      job: j.job,
+      kind: 'scan',
+      event,
+      seq: j.seq,
+      ts_ms: Date.now(),
+      status: scanSummaryWire(j),
+      ...(issue ? { issue: scanIssueSummaryWire(issue) } : {}),
+    });
+  }
+
+  /** Two flows of the fixture set to stand in for probe flows, so the inspector links resolve. */
+  function scanProbeFlows(): string[] {
+    const ids = [...flows.keys()].slice(-2);
+    return ids.length === 2 ? ids : ['550e8400-e29b-41d4-a716-446655440000', '7c9e6679-7425-40de-944b-e07fc1f90ae7'];
+  }
+
+  function scanFindIssue(j: ScanJobFx, which: 0 | 1) {
+    if (!scanRunning(j)) return;
+    const u = ((): URL | null => {
+      try {
+        return j.origin ? new URL(j.origin) : null;
+      } catch {
+        return null;
+      }
+    })();
+    const target = {
+      scheme: u?.protocol === 'http:' ? 'http' : 'https',
+      host: u?.hostname ?? '127.0.0.1',
+      port: Number(u?.port || (u?.protocol === 'http:' ? 80 : 443)) || 8080,
+    };
+    const [xss, redirect] = scanProbeFlows();
+    const fx: ScanIssueFx[] = [
+      {
+        id: `issue-${scanHex8()}`,
+        job: j.job,
+        check_id: 'http.reflected-xss',
+        class: 'reflected-xss',
+        name: 'Reflected cross-site scripting',
+        severity: 'high',
+        confidence: 'certain',
+        status: 'open',
+        lane: 'http',
+        target,
+        location: { method: 'GET', path: '/search', path_template: '/search', kind: 'query', name: 'q', field_path: null, ws_path: null, l4: null },
+        evidence: {
+          payload: '<script>aitm-canary()</script>',
+          matched: 'reflected marker aitm-canary in an HTML text node',
+          probe_flows: [xss ?? '', redirect ?? ''].filter((x) => x !== ''),
+          baseline_flow: xss ?? null,
+          timing: null,
+          diff: null,
+          l4: null,
+        },
+        first_seen: Date.now(),
+        last_seen: Date.now(),
+        occurrences: 1,
+        poc_ref: pocs[0]?.id ?? null,
+        finding_id: null,
+        description: 'A request parameter is reflected into the response unescaped.',
+        remediation: 'Contextually encode output and set a strict CSP.',
+        note: null,
+      },
+      {
+        id: `issue-${scanHex8()}`,
+        job: j.job,
+        check_id: 'http.open-redirect',
+        class: 'open-redirect',
+        name: 'Open redirect',
+        severity: 'medium',
+        confidence: 'firm',
+        status: 'open',
+        lane: 'http',
+        target,
+        location: { method: 'GET', path: '/go', path_template: '/go', kind: 'query', name: 'next', field_path: null, ws_path: null, l4: null },
+        evidence: {
+          payload: 'https://aitm.invalid/',
+          matched: 'Location header points at the injected host',
+          probe_flows: [redirect ?? ''].filter((x) => x !== ''),
+          baseline_flow: null,
+          timing: null,
+          diff: null,
+          l4: null,
+        },
+        first_seen: Date.now(),
+        last_seen: Date.now(),
+        occurrences: 1,
+        poc_ref: null,
+        finding_id: null,
+        description: 'The redirect target comes from a request parameter without an allow-list.',
+        remediation: 'Redirect only to paths of this origin, or to an allow-listed host.',
+        note: null,
+      },
+    ];
+    const issue = fx[which];
+    if (!issue) return;
+    scanIssues.push(issue);
+    scanPush(j, 'issue', issue);
+  }
+
+  /** `progress` every 250 ms while auditing: at most four lines a second, as D3 requires. */
+  function scanProgressTick(j: ScanJobFx) {
+    later(250, () => {
+      if (!scanRunning(j) || j.phase !== 'auditing') return;
+      j.probes.sent = Math.min(j.probes.budget, j.probes.sent + 7);
+      for (const lane of j.lanes.run) j.probes.by_lane[lane] = j.probes.sent;
+      j.points.audited = Math.min(j.points.found, j.points.audited + 4);
+      j.points.queued = Math.max(0, j.points.found - j.points.audited);
+      j.checks.done = Math.min(j.checks.scheduled, j.checks.done + 6);
+      scanPush(j, 'progress');
+      scanProgressTick(j);
+    });
+  }
+
+  /** The whole simulated run: phases on a timer, two issues, then `done`. A cancel ends it early. */
+  function scanRun(j: ScanJobFx) {
+    later(500, () => {
+      if (!scanRunning(j)) return;
+      j.state = 'running';
+      j.phase = 'crawling';
+      j.crawl = { pages: 12, queued: 25, depth: 2, forms_submitted: 1 };
+      scanPush(j, 'started');
+    });
+    later(2000, () => {
+      if (!scanRunning(j)) return;
+      j.phase = 'passive';
+      j.crawl = { pages: 37, queued: 0, depth: 3, forms_submitted: 4 };
+      j.points = { found: 120, queued: 120, audited: 0, skipped: { ignored: 5, frequent: 3, limit: 0 } };
+      scanPush(j, 'phase');
+    });
+    later(3000, () => {
+      if (!scanRunning(j)) return;
+      j.phase = 'auditing';
+      j.checks = { scheduled: 240, done: 0, running: ['http.reflected-xss', 'http.sqli-error'] };
+      scanPush(j, 'phase');
+      scanProgressTick(j);
+    });
+    later(4000, () => scanFindIssue(j, 0));
+    later(6000, () => scanFindIssue(j, 1));
+    later(8000, () => {
+      if (!scanRunning(j)) return;
+      j.phase = 'reporting';
+      j.checks = { ...j.checks, done: j.checks.scheduled, running: [] };
+      scanPush(j, 'phase');
+    });
+    later(9000, () => {
+      if (!scanRunning(j)) return;
+      j.state = 'done';
+      j.phase = 'done';
+      j.finished_at = Date.now();
+      scanPush(j, 'finished');
+    });
+  }
+
+  function scanStart(tool: 'scan.start' | 'scan.map', args: Record<string, unknown>): unknown {
+    const p = scanProfileArg(args);
+    const isMap = tool === 'scan.map';
+    const requestedLanes = isMap ? ['http'] : scanStrings(p.lanes);
+    const lanes = requestedLanes.length ? requestedLanes : ['http'];
+    const intensity = isMap ? 'passive' : typeof p.intensity === 'string' ? p.intensity : 'medium';
+    const { origins, l4 } = scanTargetsOf(p);
+    scanCheckScope(origins);
+    const targets = [...origins, ...(isMap ? [] : l4)];
+    if (!targets.length) throw scanError('invalid_profile', 'the profile has no origin and no L4 target');
+
+    // Confirm over the wire for the dangerous shapes, exactly as `l4.inject` does (D-T8.6).
+    const l4Lane = lanes.some((l) => l.startsWith('l4'));
+    if ((l4Lane || intensity === 'intrusive') && typeof args._confirm !== 'string')
+      return {
+        status: 'needs_confirmation',
+        prompt: `This scan sends malformed traffic to ${targets.join(', ')} and may disrupt the target. Continue?`,
+        confirm_token: `scan-${scanHex8()}`,
+      };
+
+    const wanted = scanNum(scanDict(p.budget).probes, 2000);
+    const budget = isMap ? 0 : Math.min(wanted, SCAN_PROBE_CEILING);
+    const clamped = !isMap && wanted > SCAN_PROBE_CEILING ? [{ field: 'budget.probes', requested: wanted, applied: SCAN_PROBE_CEILING }] : [];
+    const skipped = lanes.filter((l) => SCAN_UNAVAILABLE_LANES.includes(l)).map((lane) => ({ lane, reason: 'lane not available on this build' }));
+    const run = lanes.filter((l) => !SCAN_UNAVAILABLE_LANES.includes(l));
+    if (!run.length) throw scanError('lane_unavailable', `no requested lane is available: ${lanes.join(', ')}`);
+
+    const job: ScanJobFx = {
+      job: `scan-${scanHex8()}`,
+      state: 'queued',
+      phase: 'queued',
+      profile_name: typeof p.name === 'string' && p.name ? p.name : 'standard',
+      targets,
+      origin: origins[0] ?? null,
+      started_at: Date.now(),
+      finished_at: null,
+      stopped_reason: null,
+      probes: { sent: 0, budget, errors: 0, timeouts: 0, rate_waits: 0, by_lane: {} },
+      crawl: { pages: 0, queued: 0, depth: 0, forms_submitted: 0 },
+      points: { found: 0, queued: 0, audited: 0, skipped: { ignored: 0, frequent: 0, limit: 0 } },
+      checks: { scheduled: 0, done: 0, running: [] },
+      lanes: { requested: lanes, run, skipped },
+      clamped,
+      seq: 0,
+    };
+    scanJobs.unshift(job);
+    scanRun(job);
+    recordActivity(tool, { profile: job.profile_name, targets }, 'web');
+    return {
+      job: job.job,
+      status: scanStatusWire(job),
+      clamped: job.clamped.map((c) => ({ ...c })),
+      lanes: { requested: [...lanes], run: [...run], skipped: skipped.map((s) => ({ ...s })) },
+      // Present only for a profile with an L4 lane (D3); absent is not `false`.
+      ...(l4Lane ? { dry_run: scanDict(p.l4).dry_run === true } : {}),
+    };
+  }
+
+  /** Two site-map nodes and three insertion points, modelled on `scan.sitemap.json`. */
+  function scanSitemapWire(j: ScanJobFx | null) {
+    let scheme = 'http';
+    let host = '127.0.0.1';
+    let port = 8080;
+    try {
+      if (j?.origin) {
+        const u = new URL(j.origin);
+        scheme = u.protocol === 'http:' ? 'http' : 'https';
+        host = u.hostname;
+        port = Number(u.port || (u.protocol === 'http:' ? 80 : 443));
+      }
+    } catch {
+      /* keep the defaults */
+    }
+    const [a, b] = scanProbeFlows();
+    const flowA = a ?? '550e8400-e29b-41d4-a716-446655440000';
+    const flowB = b ?? '7c9e6679-7425-40de-944b-e07fc1f90ae7';
+    return {
+      nodes: [
+        { id: 'node-1', method: 'GET', scheme, host, port, path_template: '/account/{id}', flows: [flowA], params: [{ kind: 'query', name: 'tab' }], auth: true, points: 2, audited: true },
+        { id: 'node-2', method: 'GET', scheme, host, port, path_template: '/search', flows: [flowB], params: [{ kind: 'query', name: 'q' }], auth: false, points: 1, audited: j !== null },
+      ],
+      points: [
+        { id: 'point-json-1', lane: 'http', kind: 'json_value', name: 'city', path: 'profile.address.city', example: 'Lisbon', flow: flowA, site_node: 'node-1', traits: ['json'], frequency: 3, method: 'POST', url: `${scheme}://${host}:${port}/account` },
+        // The engine redacts a session-ish example before it reaches the wire (D7).
+        { id: 'point-cookie-1', lane: 'http', kind: 'cookie', name: 'theme', path: null, example: '<redacted>', flow: flowB, site_node: 'node-1', traits: ['id'], frequency: 9, method: 'GET', url: `${scheme}://${host}:${port}/account` },
+        { id: 'point-query-1', lane: 'http', kind: 'query', name: 'q', path: null, example: 'lamp', flow: flowB, site_node: 'node-2', traits: [], frequency: 12, method: 'GET', url: `${scheme}://${host}:${port}/search` },
+      ],
+      next_cursor: null,
+    };
+  }
+
+  /** The three checks of `scan.checks.json`: one native, one bundled, one operator-authored. */
+  const SCAN_CHECKS = [
+    { id: 'http.reflected-xss', name: 'reflected-xss check', class: 'reflected-xss', lanes: ['http'], kinds: ['query', 'body_param'], intensity: 'medium', cost: 'light', technique: 'reflected', severity: 'high', confidence_max: 'certain', needs_baseline: false, wants_traits: null, targets_session: false, cwe: 79, description: 'Detects reflected-xss.', remediation: 'Validate and encode untrusted input.', origin: { kind: 'native' } },
+    { id: 'http.sqli-error', name: 'Error-based SQL injection', class: 'sqli-error', lanes: ['http'], kinds: ['query', 'body_param', 'cookie', 'json_value'], intensity: 'medium', cost: 'light', technique: 'error', severity: 'high', confidence_max: 'firm', needs_baseline: true, wants_traits: null, targets_session: false, cwe: 89, description: 'Sends SQL metacharacters into the point and matches the response against database error signatures.', remediation: 'Use parameterised queries for every database call.', origin: { kind: 'bundled', path: 'scripts/bundled/active/sqli.rhai' } },
+    { id: 'http.custom-marker', name: 'Debug marker header exposure', class: 'information-disclosure', lanes: ['http'], kinds: ['header'], intensity: 'passive', cost: 'light', technique: 'passive', severity: 'low', confidence_max: 'certain', needs_baseline: false, wants_traits: null, targets_session: false, cwe: 200, description: 'An operator-authored passive check: flags responses carrying the in-house X-Debug-Marker header.', remediation: 'Strip the debug header at the edge for production builds.', origin: { kind: 'custom', path: '~/.aitmproxy/scripts/marker.rhai' } },
+  ];
+
   function need(args: Record<string, unknown>, key: string): string {
     const v = args[key];
     if (typeof v !== 'string' || !v) throw new BusError(`missing required parameter '${key}'`, -32602);
@@ -824,6 +1302,110 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
         }
         return { status: 'needs_confirmation', prompt: `${tool === 'l4.intercept.drop' ? 'Drop' : 'Forward'} the parked packet.`, confirm_token: `l4-${Date.now()}` };
 
+      // ---- Scanner v2 (D3): see the `scan*` fixtures above. Development only, never evidence. ----
+      case 'scan.start':
+      case 'scan.map':
+        return scanStart(tool, args);
+      case 'scan.status':
+        return scanStatusWire(scanJobOf(need(args, 'job')));
+      case 'scan.list': {
+        const active = args.active_only === true;
+        const limit = scanNum(args.limit, scanJobs.length);
+        return { jobs: scanJobs.filter((j) => !active || scanRunning(j) || j.state === 'cancelling').slice(0, Math.max(0, limit)).map(scanSummaryWire) };
+      }
+      case 'scan.cancel': {
+        // Two-step and idempotent, as the engine is: `cancelling` now, `cancelled` once it lands.
+        const j = scanJobOf(need(args, 'job'));
+        if (!scanRunning(j)) return scanStatusWire(j);
+        j.state = 'cancelling';
+        j.stopped_reason = 'cancelled';
+        later(300, () => {
+          if (j.state !== 'cancelling') return;
+          j.state = 'cancelled';
+          j.phase = 'done';
+          j.finished_at = Date.now();
+          j.checks = { ...j.checks, running: [] };
+          scanPush(j, 'cancelled');
+        });
+        recordActivity(tool, args, 'web');
+        return scanStatusWire(j);
+      }
+      case 'scan.issues': {
+        const job = typeof args.job === 'string' ? args.job : null;
+        if (job !== null) scanJobOf(job);
+        const all = job === null ? scanIssues : scanIssuesOf(job);
+        const rows = all.filter(
+          (i) =>
+            (typeof args.status !== 'string' || i.status === args.status) &&
+            (typeof args.lane !== 'string' || i.lane === args.lane) &&
+            (typeof args.class !== 'string' || i.class === args.class),
+        );
+        const limit = Math.min(scanNum(args.limit, 1024), 1024);
+        const by_severity = { critical: 0, high: 0, medium: 0, low: 0, info: 0 };
+        for (const r of rows) by_severity[r.severity]++;
+        // One page: the fixture bus never invents more issues than it found.
+        return { issues: rows.slice(0, Math.max(0, limit)).map(scanIssueSummaryWire), next_cursor: null, by_severity };
+      }
+      case 'scan.issue': {
+        const id = need(args, 'id');
+        const issue = scanIssues.find((i) => i.id === id);
+        if (!issue) throw scanError('not_found', `no issue ${id}`);
+        return scanClone(issue);
+      }
+      case 'scan.issue.update': {
+        const id = need(args, 'id');
+        const issue = scanIssues.find((i) => i.id === id);
+        if (!issue) throw scanError('not_found', `no issue ${id}`);
+        const status = need(args, 'status');
+        if (status !== 'open' && status !== 'confirmed' && status !== 'false_positive') throw scanError('invalid_profile', `unknown issue status ${status}`);
+        issue.status = status;
+        if (args.note !== undefined) issue.note = typeof args.note === 'string' && args.note ? args.note : null;
+        recordActivity(tool, { id, status }, 'web');
+        return scanClone(issue);
+      }
+      case 'scan.sitemap':
+        return scanSitemapWire(typeof args.job === 'string' ? scanJobOf(args.job) : null);
+      case 'scan.checks':
+        return {
+          checks: scanClone(SCAN_CHECKS).filter(
+            (c) =>
+              (typeof args.lane !== 'string' || c.lanes.includes(args.lane)) &&
+              (typeof args.class !== 'string' || c.class === args.class) &&
+              (typeof args.origin !== 'string' || c.origin.kind === args.origin),
+          ),
+        };
+      case 'scan.profile.list':
+        return {
+          profiles: [
+            ...SCAN_BUILTIN_PROFILES.map((p) => scanProfileEntry(p.name, { lanes: p.lanes, intensity: p.intensity, speed: p.speed }, true)),
+            ...[...savedScanProfiles.entries()].map(([name, tree]) => scanProfileEntry(name, tree, false)),
+          ],
+        };
+      case 'scan.profile.get':
+        return scanProfileTree(need(args, 'name'));
+      case 'scan.profile.save': {
+        const p = scanProfileArg(args);
+        const name = typeof p.name === 'string' ? p.name : '';
+        if (!name) throw scanError('invalid_profile', 'the profile needs a name');
+        if (SCAN_BUILTIN_PROFILES.some((b) => b.name === name)) throw scanError('invalid_profile', `${name} is a built-in profile`);
+        savedScanProfiles.set(name, scanClone(p));
+        recordActivity(tool, { name }, 'web');
+        return { saved: name, path: `${SCAN_PROFILE_DIR}/${name}.yaml` };
+      }
+      case 'scan.profile.delete': {
+        const name = need(args, 'name');
+        if (SCAN_BUILTIN_PROFILES.some((b) => b.name === name)) throw scanError('invalid_profile', `${name} is a built-in profile`);
+        const deleted = savedScanProfiles.delete(name);
+        recordActivity(tool, { name }, 'web');
+        return { deleted };
+      }
+      case 'scan.session.preview': {
+        // Names only: no verb, push or file of the scanner ever carries a session value (D7).
+        const target = need(args, 'target');
+        const source = [...flows.values()].find((f) => f.inScope && f.kind === 'http')?.id ?? null;
+        return { origin: target, cookies: ['sid'], headers: ['authorization'], source_flow: source, observed_at: Date.now(), canary: { ...SCAN_CANARY } };
+      }
+
       // ---- Rhai scripts (F8): see the `script*` fixtures above ----
       case 'script.list':
         return scriptFx.map((s) => ({ ...s, hooks: [...s.hooks] }));
@@ -938,6 +1520,21 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
     ['script.disable', "Turn a loaded script's hooks off live without unloading it. Idempotent. Answers { name, enabled }.", { name: { type: 'string', description: "the script's NAME (or file stem) as loaded" } }, ['name']],
     ['script.save', 'Write a script to <scripts_dir>/<name>.rhai after checking it compiles. Its hooks go live immediately; restart_required is true only when it registers commands or options.', { name: { type: 'string', description: "the script's file stem: letters, digits, `_` and `-` only" }, source: { type: 'string', description: 'the script text' }, enable: { type: 'boolean', description: "sets the saved script's live enabled flag (default true)" } }, ['name', 'source']],
     ['script.findings', 'Findings scripts emitted with finding(...) this run (in-memory, not persisted), oldest first, plus how many the bounded sink dropped.', { limit: { type: 'integer', description: 'return only the newest N findings' } }],
+    ['scan.start', 'Start a scan job from a whole ScanProfile; returns immediately with the job id. An L4 lane or intensity: intrusive needs the operator confirm handshake.', { profile: { type: 'object', description: 'the whole ScanProfile to run' } }, ['profile']],
+    ['scan.map', 'Map a target: crawl and passive only (lanes http, intensity passive), no probes. The job-model successor of scan.discover.', { profile: { type: 'object', description: 'the whole ScanProfile; the lanes and intensity are forced' } }, ['profile']],
+    ['scan.status', 'Full counters of one scan job.', { job: { type: 'string', description: 'job id from scan.start' } }, ['job']],
+    ['scan.list', 'Scan jobs, newest first.', { active_only: { type: 'boolean' }, limit: { type: 'integer' } }],
+    ['scan.cancel', 'Cancel a scan job; idempotent, answers cancelling then the job turns cancelled.', { job: { type: 'string' } }, ['job']],
+    ['scan.issues', 'Issues of a job (or of every job), with the counts by severity.', { job: { type: 'string' }, status: { type: 'string', enum: ['open', 'confirmed', 'false_positive'] }, lane: { type: 'string' }, class: { type: 'string' }, limit: { type: 'integer' }, cursor: { type: 'string' } }],
+    ['scan.issue', 'One issue with its evidence, probe flows, PoC ref and finding link.', { id: { type: 'string' } }, ['id']],
+    ['scan.issue.update', 'Set the triage status and note of an issue.', { id: { type: 'string' }, status: { type: 'string', enum: ['open', 'confirmed', 'false_positive'] }, note: { type: 'string' } }, ['id', 'status']],
+    ['scan.sitemap', 'Site map nodes and insertion points discovered by a job.', { job: { type: 'string' }, target: { type: 'string' }, limit: { type: 'integer' }, cursor: { type: 'string' } }],
+    ['scan.checks', 'The check catalogue as loaded: native, bundled and custom.', { lane: { type: 'string' }, class: { type: 'string' }, origin: { type: 'string', enum: ['native', 'bundled', 'custom'] } }],
+    ['scan.profile.list', 'Scan profiles: the built-ins and the operator-saved ones.', {}],
+    ['scan.profile.get', 'One scan profile, whole.', { name: { type: 'string' } }, ['name']],
+    ['scan.profile.save', 'Save an operator scan profile (its name may not be a built-in one).', { profile: { type: 'object', description: 'the whole ScanProfile; name required' } }, ['profile']],
+    ['scan.profile.delete', 'Delete an operator scan profile.', { name: { type: 'string' } }, ['name']],
+    ['scan.session.preview', 'Session material the engine would reuse for a target: cookie and header NAMES only, never a value.', { target: { type: 'string' } }, ['target']],
   ].map(([name, description, properties, required]) => ({
     name: name as string,
     description: description as string,
@@ -946,7 +1543,7 @@ export function createMockBus(opts: MockBusOptions = {}): BusClient & MockContro
       properties: properties as NonNullable<ToolDef['inputSchema']['properties']>,
       ...(required ? { required: required as string[] } : {}),
     },
-    mutates: !/\.(list|get|detail|status|tabs|get_dom|screenshot|activity|artifact|export|validate|findings)$/.test(name as string),
+    mutates: !/\.(list|get|detail|status|tabs|get_dom|screenshot|activity|artifact|export|validate|findings|issue|issues|sitemap|checks|preview)$/.test(name as string),
     confirm: /^ca\.(un)?install$/.test(name as string) ? 'This changes the system trust store.' : null,
   }));
 
