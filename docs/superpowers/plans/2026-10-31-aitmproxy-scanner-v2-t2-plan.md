@@ -44,6 +44,12 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 - **TDD per task.** Write the named tests first, run `cargo test -p aitm-scan-http --offline`
   and quote the red run (a compile error on a symbol that does not exist yet counts as red),
   implement, quote the green run. Commit after each task.
+- **Shared worktree discipline (added 2026-11-01 after two incidents).** Coders run in parallel in
+  one worktree with one git index: commit with a pathspec, `git commit -m <msg> -- <your file>`
+  (never `git add <file> && git commit`, which commits whatever a sibling has staged); format only
+  your own file with `rustfmt --edition 2021 <your file>` (never `cargo fmt` / `cargo fmt -p` in
+  write mode); never `git add -A`/`-u`/`commit -a`. Commit `2cb26e26` (Task 15) carries an
+  intermediate `crawl/browser.rs` for this reason; Task 18's own commit holds the final file.
 - **Sandbox vs Terminal.** `cargo test -p aitm-scan-http --offline`, `cargo clippy -p aitm-scan-http
   --all-targets --offline -- -D warnings` and `cargo fmt --check` work in the sandbox (offline
   registry cache: `url 2.5.x`, `regex 1.13.x`, `serde_json`, `tokio` are cached; `blake3` is **not**,
@@ -736,8 +742,11 @@ crates/aitm-scan-http/
   → `paths == ["/admin/", "/public", "/tmp/"]`, `sitemaps == ["http://t/sm.xml"]`.
   `sitemap_pins`: `<urlset><url><loc>http://t/a</loc></url><url><loc> http://t/b </loc></url></urlset>`
   → `["http://t/a", "http://t/b"]`; a `sitemapindex` with two `<loc>` → both.
-  `fetch_seeds_requests`: ScriptedClient serving the robots text above at `/robots.txt` and a
-  urlset at `/sitemap.xml` and `/sm.xml`; `robots: true, sitemap: true` → `sent_paths() ==
+  `fetch_seeds_requests`: ScriptedClient serving the robots text above at `/robots.txt` **with its
+  `Sitemap:` line pointing at `http://t:8080/sm.xml`** (corrected 2026-11-01: the `robots_pins` text
+  names port 80, which is not same-origin with the test origin; following a cross-origin sitemap
+  would be a scope escape, so the served fixture changes, not the rule) and a urlset at
+  `/sitemap.xml` and `/sm.xml`; `robots: true, sitemap: true` → `sent_paths() ==
   ["/robots.txt", "/sitemap.xml", "/sm.xml"]`, every `SendOptions.marks == ["scan:scan-1a2b3c4d", "crawl"]`,
   result contains `http://t:8080/admin/`, `http://t:8080/public`, `http://t:8080/a`; with
   `robots: false, sitemap: false` → `sent.len() == 0`; a session cookie `sid=S3` appears on every
