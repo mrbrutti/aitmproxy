@@ -309,4 +309,86 @@ mod tests {
         assert_eq!(ct, "application/json");
         assert_eq!(body, json!({ "mode": "patched" }));
     }
+
+    // --- Tester additions (stage 5): the remaining D2 routes and non-routes ---
+
+    #[tokio::test]
+    async fn ws_and_conns_routes_and_method_mismatches() {
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        let conn = log.open_conn(Listener::Plain, None, addr(40001));
+        log.log_ws(crate::log::WsLogEntry::Close(crate::log::WsCloseEntry {
+            seq: 0,
+            ts_ms: 0,
+            conn_id: conn.conn_id.clone(),
+            code: Some(1009),
+        }));
+
+        let (status, ct, ws) = call(get("/log/ws"), &log).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct, "application/json");
+        assert_eq!(ws["dropped"], json!(0));
+        assert_eq!(ws["entries"][0]["kind"], json!("close"));
+        assert_eq!(ws["entries"][0]["code"], json!(1009));
+        assert_eq!(ws["entries"][0]["conn_id"], json!(conn.conn_id.clone()));
+
+        let (status, ct, conns) = call(get("/log/conns"), &log).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct, "application/json");
+        assert_eq!(conns["entries"].as_array().map(Vec::len), Some(1));
+        assert_eq!(conns["entries"][0]["conn_id"], json!(conn.conn_id.clone()));
+        assert_eq!(conns["entries"][0]["peer"], json!("127.0.0.1:40001"));
+        assert_eq!(conns["entries"][0]["listener"], json!("plain"));
+        assert_eq!(conns["entries"][0]["alpn"], Value::Null);
+        assert_eq!(conns["entries"][0]["closed_ms"], Value::Null);
+        assert_eq!(conns["entries"][0]["requests"], json!(0));
+        assert!(conns.get("dropped").is_none(), "{conns}");
+
+        // Wrong method, trailing slash, sub-path or case: 404, and nothing reset.
+        for req in [
+            get("/reset"),
+            post("/mode"),
+            post("/services"),
+            get("/services/"),
+            get("/log"),
+            get("/log/http/1"),
+            get("/LOG/HTTP"),
+            post("/log/http"),
+            get("/"),
+        ] {
+            let (status, ct, body) = call(req, &log).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(ct, "application/json");
+            assert_eq!(body, json!({ "error": "not found" }));
+        }
+        let (_, _, ws) = call(get("/log/ws"), &log).await;
+        assert_eq!(
+            ws["entries"].as_array().map(Vec::len),
+            Some(1),
+            "GET /reset must not reset"
+        );
+
+        // Query strings are ignored except `service` on /log/l4.
+        let (status, _, body) = call(get("/services?x=1"), &log).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["mode"], json!("vulnerable"));
+        log.l4_message(
+            "l4-resp",
+            "c-00000009",
+            Dir::In,
+            b"PING\r\n",
+            Some("PING"),
+            Classified::Ok,
+        );
+        let (_, _, body) = call(get("/log/l4?x=1&service=l4-resp&y"), &log).await;
+        let keys: Vec<&String> = body["services"]
+            .as_object()
+            .expect("services object")
+            .keys()
+            .collect();
+        assert_eq!(keys, vec!["l4-resp"]);
+        let (_, _, body) = call(get("/log/l4?service="), &log).await;
+        assert_eq!(body, json!({ "services": {}, "dropped": 0 }));
+        let (_, _, body) = call(get("/log/l4?service=nope"), &log).await;
+        assert_eq!(body, json!({ "services": {}, "dropped": 0 }));
+    }
 }

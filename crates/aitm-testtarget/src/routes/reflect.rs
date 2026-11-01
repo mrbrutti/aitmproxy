@@ -588,4 +588,136 @@ Content-Disposition: form-data; name=\"note\"\r\n\
         assert!(json_path(&v, "profile.address.zip").is_none());
         assert!(json_path(&v, "profile.address.city.more").is_none());
     }
+
+    // --- Tester additions (stage 5): empty, missing and malformed inputs ---
+
+    #[tokio::test]
+    async fn whoami_without_headers_reflects_empty() {
+        let info = RequestInfo::test_request("GET", "/whoami", &[], b"");
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            let resp = call(mode, &info).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_string(resp).await, "<p>agent: </p><p>from: </p>");
+        }
+        // Only the two D3 headers are reflected.
+        let other = RequestInfo::test_request(
+            "GET",
+            "/whoami",
+            &[("referer", "<r>"), ("x-real-ip", "<i>")],
+            b"",
+        );
+        let resp = call(SeedMode::Vulnerable, &other).await;
+        assert_eq!(body_string(resp).await, "<p>agent: </p><p>from: </p>");
+    }
+
+    #[tokio::test]
+    async fn prefs_theme_among_other_cookies() {
+        let info = RequestInfo::test_request(
+            "GET",
+            "/prefs",
+            &[("cookie", "session=abc; theme=dark; lang=en")],
+            b"",
+        );
+        let resp = call(SeedMode::Vulnerable, &info).await;
+        assert!(resp.headers().get("set-cookie").is_none());
+        assert_eq!(body_string(resp).await, "<body class=\"dark\">");
+        // Without a theme (other cookies present) the default is set.
+        let info = RequestInfo::test_request("GET", "/prefs", &[("cookie", "session=abc")], b"");
+        let resp = call(SeedMode::Patched, &info).await;
+        assert_eq!(
+            resp.headers()
+                .get("set-cookie")
+                .and_then(|v| v.to_str().ok()),
+            Some("theme=light; Path=/")
+        );
+        assert_eq!(body_string(resp).await, "<body class=\"light\">");
+    }
+
+    #[tokio::test]
+    async fn profile_missing_city_empty_body_and_non_string() {
+        let json_ct: &[(&str, &str)] = &[("content-type", "application/json")];
+        for (body, expected) in [
+            (&br#"{"profile":{}}"#[..], "missing profile.address.city"),
+            (
+                br#"{"profile":{"address":{}}}"#,
+                "missing profile.address.city",
+            ),
+            (br#"{"user":"x"}"#, "missing profile.address.city"),
+            (b"", "invalid json"),
+            (b"[]", "missing profile.address.city"),
+        ] {
+            let info = RequestInfo::test_request("POST", "/api/profile", json_ct, body);
+            let resp = call(SeedMode::Vulnerable, &info).await;
+            let shown = String::from_utf8_lossy(body);
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{shown}");
+            assert_eq!(body_string(resp).await, expected, "{shown}");
+        }
+        // A non-string city reflects its JSON rendering, escaped in P.
+        let info = RequestInfo::test_request(
+            "POST",
+            "/api/profile",
+            json_ct,
+            br#"{"profile":{"address":{"city":{"n":1}}}}"#,
+        );
+        let resp = call(SeedMode::Vulnerable, &info).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            body_string(resp).await,
+            r#"<div class="city">{"n":1}</div>"#
+        );
+        let resp = call(SeedMode::Patched, &info).await;
+        assert_eq!(
+            body_string(resp).await,
+            r#"<div class="city">{&quot;n&quot;:1}</div>"#
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_missing_boundary_and_missing_parts() {
+        // multipart without a boundary parameter is a 400.
+        let info = RequestInfo::test_request(
+            "POST",
+            "/upload",
+            &[("content-type", "multipart/form-data")],
+            b"--X\r\n",
+        );
+        let resp = call(SeedMode::Vulnerable, &info).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_string(resp).await, "expected multipart/form-data");
+        // No content-type at all.
+        let info = RequestInfo::test_request("POST", "/upload", &[], b"");
+        let resp = call(SeedMode::Vulnerable, &info).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let ct: &[(&str, &str)] = &[("content-type", "multipart/form-data; boundary=X")];
+        // Only a note: no filename, 0 bytes.
+        let only_note =
+            b"--X\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\nhi\r\n--X--\r\n";
+        let info = RequestInfo::test_request("POST", "/upload", ct, only_note);
+        let resp = call(SeedMode::Vulnerable, &info).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "<p>uploaded  (0 bytes): hi</p>");
+        // A file part without a filename, and no note.
+        let no_name =
+            b"--X\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nabc\r\n--X--\r\n";
+        let info = RequestInfo::test_request("POST", "/upload", ct, no_name);
+        let resp = call(SeedMode::Vulnerable, &info).await;
+        assert_eq!(body_string(resp).await, "<p>uploaded  (3 bytes): </p>");
+        // A body with no parts at all.
+        let info = RequestInfo::test_request("POST", "/upload", ct, b"garbage");
+        let resp = call(SeedMode::Patched, &info).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "<p>uploaded  (0 bytes): </p>");
+        // A long note is reflected whole (the router caps the body, not this seed).
+        let big = "n".repeat(10_000);
+        let body = format!(
+            "--X\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n{big}\r\n--X--\r\n"
+        );
+        let info = RequestInfo::test_request("POST", "/upload", ct, body.as_bytes());
+        let resp = call(SeedMode::Vulnerable, &info).await;
+        assert_eq!(
+            body_string(resp).await,
+            format!("<p>uploaded  (0 bytes): {big}</p>")
+        );
+    }
 }

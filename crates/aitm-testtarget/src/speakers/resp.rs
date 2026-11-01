@@ -439,4 +439,87 @@ mod tests {
             Step::Close(None)
         );
     }
+
+    // --- Tester additions (stage 5): malformed lengths never panic or crash ---
+
+    #[test]
+    fn resp_malformed_lengths_close_without_a_crash() {
+        // A garbled or negative array count desynchronises the stream: Fault
+        // with no bytes, in both modes (never the crash window).
+        for buf in [&b"*abc\r\n"[..], b"*-1\r\n", b"*\r\n"] {
+            for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+                assert_eq!(
+                    parse(mode, buf),
+                    Parsed::Message {
+                        consumed: buf.len(),
+                        verb: None,
+                        step: Step::Fault(Vec::new()),
+                    },
+                    "{:?}",
+                    String::from_utf8_lossy(buf)
+                );
+            }
+        }
+        // An array element that is not a bulk string: Fault, no bytes.
+        assert_eq!(
+            parse(SeedMode::Vulnerable, b"*1\r\n+PING\r\n"),
+            Parsed::Message {
+                consumed: 11,
+                verb: None,
+                step: Step::Fault(Vec::new()),
+            }
+        );
+        // A garbled bulk length is the protocol-error reply in both modes.
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            assert_eq!(
+                parse(mode, b"*1\r\n$abc\r\n"),
+                Parsed::Message {
+                    consumed: 10,
+                    verb: None,
+                    step: Step::Fault(b"-ERR Protocol error: invalid bulk length\r\n".to_vec()),
+                }
+            );
+        }
+        // A bulk length that overflows i64 counts as huge: the bug.
+        let huge = b"*1\r\n$99999999999999999999\r\n";
+        assert_eq!(
+            parse(SeedMode::Vulnerable, huge),
+            Parsed::Message {
+                consumed: huge.len(),
+                verb: None,
+                step: Step::Trigger,
+            }
+        );
+        // `*0` and an empty inline line are ignored no-ops.
+        assert_eq!(
+            parse(SeedMode::Vulnerable, b"*0\r\n"),
+            Parsed::Message {
+                consumed: 4,
+                verb: None,
+                step: Step::Reply(Vec::new()),
+            }
+        );
+        assert_eq!(
+            parse(SeedMode::Vulnerable, b"\r\n"),
+            Parsed::Message {
+                consumed: 2,
+                verb: None,
+                step: Step::Reply(Vec::new()),
+            }
+        );
+        // ECHO without an argument is an empty bulk; an unknown name is echoed
+        // with its control bytes dropped.
+        assert_eq!(
+            parse(SeedMode::Vulnerable, b"ECHO\r\n"),
+            msg(6, "ECHO", Step::Reply(b"$0\r\n\r\n".to_vec()))
+        );
+        assert_eq!(
+            parse(SeedMode::Vulnerable, b"*1\r\n$3\r\na\x01b\r\n"),
+            msg(
+                13,
+                "AB",
+                Step::ProtocolError(b"-ERR unknown command 'ab'\r\n".to_vec())
+            )
+        );
+    }
 }

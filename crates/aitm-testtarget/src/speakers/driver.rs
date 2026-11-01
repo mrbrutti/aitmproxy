@@ -720,4 +720,13 @@ mod tests {
         assert_eq!(svc.addr("l4-dns-fault"), Some(b));
         assert_eq!(svc.addr("l4-mqtt"), None);
     }
+
+    // --- Tester additions (stage 5) ---
+
+    #[test]
+    fn up_at_is_down_plus_the_window() {
+        assert_eq!(up_at_ms(0), 5000);
+        assert_eq!(up_at_ms(1_700_000_000_000), 1_700_000_005_000);
+        assert_eq!(up_at_ms(u64::MAX), u64::MAX);
+    }
 }

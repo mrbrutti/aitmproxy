@@ -415,4 +415,85 @@ mod tests {
         );
         assert!(!store.is_valid(&id));
     }
+
+    // --- Tester additions (stage 5): bad `n`, n=0, no tab, login edge cases ---
+
+    #[tokio::test]
+    async fn logout_after_rejects_bad_n_and_n_zero_drops_at_once() {
+        let state = fresh(SeedMode::Vulnerable);
+        let id = login(&state).await;
+        let cookie = format!("session={id}");
+        for target in ["/logout-after?n=abc", "/logout-after", "/logout-after?n=-1"] {
+            let info = RequestInfo::test_request("GET", target, &[("cookie", &cookie)], b"");
+            let resp = route(&info, &state).await.expect("routed");
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{target}");
+            assert_eq!(
+                body_text(resp).await,
+                "<p>n must be a number</p>",
+                "{target}"
+            );
+        }
+        // A bad arm request changes nothing: still logged in.
+        assert!(state.sessions.is_valid(&id));
+        // n=0: the session is gone before the next request.
+        let info =
+            RequestInfo::test_request("GET", "/logout-after?n=0", &[("cookie", &cookie)], b"");
+        let resp = route(&info, &state).await.expect("routed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_text(resp).await, r#"{"armed":0}"#);
+        assert!(!state.sessions.is_valid(&id));
+        let resp = get_account(&state, Some(&id), "overview").await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        // An unknown session on /logout-after is the login redirect, not a 400.
+        let info = RequestInfo::test_request(
+            "GET",
+            "/logout-after?n=abc",
+            &[("cookie", "session=nope")],
+            b"",
+        );
+        let resp = route(&info, &state).await.expect("routed");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(header(&resp, "location"), Some("/login"));
+    }
+
+    #[tokio::test]
+    async fn account_without_tab_and_login_edge_cases() {
+        let state = fresh(SeedMode::Vulnerable);
+        let id = login(&state).await;
+        let cookie = format!("session={id}");
+        let info = RequestInfo::test_request("GET", "/account", &[("cookie", &cookie)], b"");
+        let resp = route(&info, &state).await.expect("routed");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_text(resp).await, "<h2>Account: </h2>");
+
+        // Missing credentials, wrong user, wrong case, empty body: 401, no cookie.
+        for body in [
+            &b""[..],
+            b"user=alice",
+            b"pass=wonderland",
+            b"user=bob&pass=wonderland",
+            b"user=ALICE&pass=wonderland",
+            b"user=alice&pass=Wonderland",
+        ] {
+            let info = RequestInfo::test_request("POST", "/login", &[], body);
+            let resp = route(&info, &state).await.expect("routed");
+            let shown = String::from_utf8_lossy(body);
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{shown}");
+            assert!(header(&resp, "set-cookie").is_none(), "{shown}");
+        }
+        // Not this module's routes.
+        for (method, target) in [
+            ("POST", "/account"),
+            ("GET", "/account/1"),
+            ("GET", "/logout"),
+            ("POST", "/logout-after"),
+            ("GET", "/login/"),
+        ] {
+            let info = RequestInfo::test_request(method, target, &[], b"");
+            assert!(route(&info, &state).await.is_none(), "{method} {target}");
+        }
+        assert_eq!(host_port("127.0.0.1:8080"), 8080);
+        assert_eq!(host_port("localhost"), 0);
+        assert_eq!(host_port("h:notaport"), 0);
+    }
 }

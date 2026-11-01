@@ -201,4 +201,51 @@ mod tests {
             "error must name the missing flag, got {err:?}"
         );
     }
+
+    // --- Tester additions (stage 5): bad values, order, defaults ---
+
+    #[test]
+    fn parse_args_rejects_bad_values_and_accepts_any_order() {
+        let err = parse_from(argv(&["--mode", "bogus"])).expect_err("bad mode");
+        assert!(err.contains("unknown --mode"), "{err}");
+        let err = parse_from(argv(&["--mode"])).expect_err("mode without value");
+        assert_eq!(err, "--mode needs a value");
+        let err = parse_from(argv(&["--port", "abc"])).expect_err("bad port");
+        assert_eq!(err, "invalid --port \"abc\"");
+        let err = parse_from(argv(&["--tls-port", "70000"])).expect_err("port out of range");
+        assert_eq!(err, "invalid --tls-port \"70000\"");
+        let err = parse_from(argv(&["--tls-h1-port", "-1"])).expect_err("negative port");
+        assert_eq!(err, "invalid --tls-h1-port \"-1\"");
+        let err = parse_from(argv(&["--control-port"])).expect_err("flag without value");
+        assert_eq!(err, "--control-port needs a value");
+        let err = parse_from(argv(&["--bogus"])).expect_err("unknown flag");
+        assert_eq!(err, "unexpected argument \"--bogus\"");
+        let err = parse_from(argv(&["8080"])).expect_err("bare positional");
+        assert_eq!(err, "unexpected argument \"8080\"");
+        // The l4/control rule holds whatever the flag order.
+        let ok = parse_from(argv(&["--l4", "--control-port", "0"])).expect("l4 before control");
+        assert!(ok.l4);
+        assert_eq!(ok.control, Some(0));
+        let err = parse_from(argv(&["--l4", "--port", "0"])).expect_err("l4 without control");
+        assert_eq!(err, "--l4 needs --control-port");
+        // No arguments: the legacy defaults.
+        assert_eq!(
+            parse_from(argv(&[])).expect("defaults"),
+            Args {
+                mode: SeedMode::Vulnerable,
+                port: 0,
+                tls: None,
+                tls_h1: None,
+                control: None,
+                l4: false,
+            }
+        );
+        // The last repeated flag wins.
+        assert_eq!(
+            parse_from(argv(&["--port", "1", "--port", "2"]))
+                .expect("repeat")
+                .port,
+            2
+        );
+    }
 }

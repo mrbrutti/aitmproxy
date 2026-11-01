@@ -1048,4 +1048,425 @@ mod tests {
         assert_eq!(ldap_escape(")(uid=*"), r"\29\28uid=\2a");
         assert_eq!(ldap_escape("alice"), "alice");
     }
+
+    // --- Tester additions (stage 5): untested D3 branches pinned to literals ---
+
+    #[tokio::test]
+    async fn sqli_error_double_quote_and_non_numeric() {
+        // Spec D3: an id containing `'` or `"` breaks the query in V.
+        let (status, _, body) = get(V, "/products?id=1%22").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "<pre>SQL syntax error near '1\"'</pre>");
+
+        // A non-numeric id without a quote is a plain, escaped product page in V.
+        let (status, _, body) = get(V, "/products?id=abc").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<h1>Product abc</h1>");
+        let (status, _, body) = get(V, "/products?id=%3Cb%3E").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<h1>Product &lt;b&gt;</h1>");
+
+        // P validates the id as an integer before anything else.
+        for target in [
+            "/products?id=abc",
+            "/products?id=1%22",
+            "/products?id=",
+            "/products",
+        ] {
+            let (status, _, body) = get(P, target).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{target}");
+            assert_eq!(body, "invalid id", "{target}");
+        }
+        // V with no id: an empty product, no error page.
+        let (status, _, body) = get(V, "/products").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<h1>Product </h1>");
+    }
+
+    #[tokio::test]
+    async fn sqli_boolean_comments_case_and_pure_verdicts() {
+        for (id, expected) in [
+            ("1%20and%201=1--", "<p>items: 1</p>"),
+            ("1%20OR%20'a'='a'%23", "<p>items: 5</p>"),
+            // OR-false keeps the base row; 9 is not one of the five items.
+            ("9%20OR%201=2", "<p>items: 0</p>"),
+            ("3", "<p>items: 1</p>"),
+            ("6", "<p>items: 0</p>"),
+            ("abc", "<p>items: 0</p>"),
+            ("1%20XOR%201=1", "<p>items: 0</p>"),
+            ("", "<p>items: 0</p>"),
+        ] {
+            let (status, _, body) = get(V, &format!("/items?id={id}")).await;
+            assert_eq!(status, StatusCode::OK, "id={id}");
+            assert_eq!(body, expected, "id={id}");
+        }
+        assert_eq!(eval_boolean("3"), Some(BoolVerdict::Base(3)));
+        assert_eq!(eval_boolean("1 OR 1=1"), Some(BoolVerdict::All));
+        assert_eq!(eval_boolean("1 AND 1=2"), Some(BoolVerdict::None));
+        assert_eq!(eval_boolean("1 and 'x' = 'x'"), Some(BoolVerdict::Base(1)));
+        assert_eq!(eval_boolean("x"), None);
+        assert_eq!(eval_boolean("1 AND nonsense"), None);
+
+        // P: integers only, whatever the payload.
+        for id in ["1--", "1%20OR%201=1", "abc", ""] {
+            let (status, _, body) = get(P, &format!("/items?id={id}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "id={id}");
+            assert_eq!(body, "invalid id", "id={id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sqli_time_sleeps_in_v_then_answers_boolean() {
+        // Spec D3 `sqli-time-items`: V sleeps min(n, 5) s, then gives the
+        // boolean seed's answer. One real second pins the timing oracle at
+        // the route, not only in the pure parser.
+        let started = Instant::now();
+        let (status, _, body) = get(V, "/items?id=1%20AND%20SLEEP(1)").await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<p>items: 0</p>");
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+
+        assert_eq!(sleep_seconds("1 and sleep(2)"), Some(2));
+        assert_eq!(sleep_seconds("1 AND SLEEP(999999999)"), Some(5));
+        assert_eq!(sleep_seconds("1 AND SLEEP(x)"), None);
+        assert_eq!(sleep_seconds("1; WAITFOR DELAY '0:0:7'"), Some(5));
+        assert_eq!(sleep_seconds("waitfor delay '00:00:03'"), Some(3));
+        assert_eq!(sleep_seconds("1 AND pg_sleep(0)"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn cmdi_separators_unknown_command_and_patched_allowlist() {
+        // Every D3 separator introduces the command.
+        for target in [
+            "/ping?host=localhost;id",
+            "/ping?host=localhost|id",
+            "/ping?host=localhost%26%26id",
+            "/ping?host=localhost%60id%60",
+            "/ping?host=localhost$(id)",
+        ] {
+            let (status, _, body) = get(V, target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_eq!(
+                body, "<pre>PING localhost: 56 data bytes\nuid=0(root) gid=0(root)</pre>",
+                "{target}"
+            );
+        }
+        // An unknown command is `sh: <cmd>: command not found`, escaped.
+        let (_, _, body) = get(V, "/ping?host=localhost;whoami").await;
+        assert_eq!(
+            body,
+            "<pre>PING localhost: 56 data bytes\nsh: whoami: command not found</pre>"
+        );
+        let (_, _, body) = get(V, "/ping?host=localhost;%3Cx%3E").await;
+        assert_eq!(
+            body,
+            "<pre>PING localhost: 56 data bytes\nsh: &lt;x&gt;: command not found</pre>"
+        );
+        // The host itself is escaped even in V: only the command "runs".
+        let (_, _, body) = get(V, "/ping?host=%3Cb%3E").await;
+        assert_eq!(body, "<pre>PING &lt;b&gt;: 56 data bytes</pre>");
+
+        // Pure: `sleep` is honoured through every separator, capped at 5.
+        assert_eq!(cmdi(V, "localhost&&sleep 2").1, Some(2));
+        assert_eq!(cmdi(V, "localhost$(sleep 9)").1, Some(5));
+        assert_eq!(cmdi(V, "localhost;SLEEP 1").1, Some(1));
+        assert_eq!(cmdi(V, "localhost;sleep x").1, None);
+
+        // P: `^[A-Za-z0-9.-]{1,253}$`, else 400 `invalid host`.
+        let (status, _, body) = get(P, "/ping?host=").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "invalid host");
+        for target in [
+            "/ping?host=localhost|id",
+            "/ping?host=localhost%26%26id",
+            "/ping?host=localhost$(id)",
+            "/ping?host=a_b",
+            "/ping?host=a%20b",
+            "/ping",
+        ] {
+            let (status, _, body) = get(P, target).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{target}");
+            assert_eq!(body, "invalid host", "{target}");
+        }
+        let long = "a".repeat(254);
+        let (status, _, _) = get(P, &format!("/ping?host={long}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let max = "a".repeat(253);
+        let (status, _, body) = get(P, &format!("/ping?host={max}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, format!("<pre>PING {max}: 56 data bytes</pre>"));
+        let (status, _, body) = get(P, "/ping?host=a.b-c9").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<pre>PING a.b-c9: 56 data bytes</pre>");
+    }
+
+    #[tokio::test]
+    async fn cmdi_sleep_is_awaited_in_v_only() {
+        let started = Instant::now();
+        let (status, _, body) = get(V, "/ping?host=localhost;sleep%201").await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<pre>PING localhost: 56 data bytes</pre>");
+        assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+
+        let started = Instant::now();
+        let (status, _, _) = get(P, "/ping?host=localhost;sleep%201").await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(elapsed < Duration::from_millis(100), "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn ssti_edge_cases() {
+        let (_, _, body) = get(P, "/greet?name=${6*7}").await;
+        assert_eq!(body, "<h1>Hello ${6*7}</h1>");
+        let (_, _, body) = get(P, "/greet?name=%3Cb%3E").await;
+        assert_eq!(body, "<h1>Hello &lt;b&gt;</h1>");
+        for (name, expected) in [
+            ("{{a*b}}", "<h1>Hello {{a*b}}</h1>"),
+            ("hi%20{{2*3}}!", "<h1>Hello hi 6!</h1>"),
+            ("{{7*7", "<h1>Hello {{7*7</h1>"),
+            ("{{7%2B7}}", "<h1>Hello {{7+7}}</h1>"),
+            (
+                "{{99999999999*99999999999}}",
+                "<h1>Hello {{99999999999*99999999999}}</h1>",
+            ),
+            ("%3Cb%3E", "<h1>Hello <b></h1>"),
+            ("${2*3}{{4*5}}", "<h1>Hello 620</h1>"),
+            ("", "<h1>Hello </h1>"),
+        ] {
+            let (status, _, body) = get(V, &format!("/greet?name={name}")).await;
+            assert_eq!(status, StatusCode::OK, "{name}");
+            assert_eq!(body, expected, "{name}");
+        }
+        assert_eq!(ssti(V, "{{ 7 * 7 }}"), "49");
+        assert_eq!(ssti(V, "{{-2*3}}"), "-6");
+        assert_eq!(ssti(P, "{{-2*3}}"), "{{-2*3}}");
+    }
+
+    #[tokio::test]
+    async fn traversal_allowlist_and_patched_rejections() {
+        // P refuses any `..` or `/`, encoded or not.
+        for target in [
+            "/static?file=../readme.txt",
+            "/static?file=a/readme.txt",
+            "/static?file=..%2freadme.txt",
+            "/static?file=....//readme.txt",
+            "/static?file=..",
+        ] {
+            let (status, _, body) = get(P, target).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{target}");
+            assert_eq!(body, "invalid file", "{target}");
+        }
+        // The allowlist is served with its content type in both modes.
+        for mode in [V, P] {
+            let (status, headers, body) = get(mode, "/static?file=style.css").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                hdr(&headers, "content-type").as_deref(),
+                Some("text/css; charset=utf-8")
+            );
+            assert_eq!(body, "body { font-family: system-ui, sans-serif; }\n");
+            let (status, headers, body) = get(mode, "/static?file=app.js").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                hdr(&headers, "content-type").as_deref(),
+                Some("application/javascript; charset=utf-8")
+            );
+            assert_eq!(body, "console.log(\"aitm-testtarget\");\n");
+            let (status, headers, body) = get(mode, "/static?file=readme.txt").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                hdr(&headers, "content-type").as_deref(),
+                Some("text/plain; charset=utf-8")
+            );
+            assert_eq!(body, "aitm-testtarget static assets\n");
+        }
+        // V: only a `../` path ending `etc/passwd` reaches the virtual file.
+        let (status, _, _) = get(V, "/static?file=../../etc/shadow").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get(V, "/static?file=etc/passwd").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, body) = get(V, "/static?file=..%2F..%2Fetc%2Fpasswd").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "root:x:0:0:root:/root:/bin/bash\n");
+        let (status, _, _) = get(V, "/static").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn xxe_malformed_bodies_and_doctype_case() {
+        let headers: &[(&str, &str)] = &[("content-type", "text/xml")];
+        for mode in [V, P] {
+            let (status, _, body) = call(mode, "POST", "/xml", headers, b"<order></order>").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{mode:?}");
+            assert_eq!(body, "invalid xml", "{mode:?}");
+            let (status, _, body) = call(mode, "POST", "/xml", headers, &[0xff, 0xfe, 0x3c]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{mode:?}");
+            assert_eq!(body, "invalid xml", "{mode:?}");
+            let (status, _, body) = call(mode, "POST", "/xml", headers, b"").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{mode:?}");
+            assert_eq!(body, "invalid xml", "{mode:?}");
+        }
+        // P refuses a DOCTYPE in any case, even without an entity.
+        let (status, _, body) = call(
+            P,
+            "POST",
+            "/xml",
+            headers,
+            b"<!doctype o><order><name>x</name></order>",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "DTD not allowed");
+        // Reflection of the name: raw in V, escaped in P.
+        let markup = b"<order><name><b>pen</b></name></order>";
+        let (_, _, body) = call(V, "POST", "/xml", headers, markup).await;
+        assert_eq!(body, "<p>Order for <b>pen</b></p>");
+        let (_, _, body) = call(P, "POST", "/xml", headers, markup).await;
+        assert_eq!(body, "<p>Order for &lt;b&gt;pen&lt;/b&gt;</p>");
+        // An internal (non-SYSTEM) entity is never expanded; an undeclared
+        // reference stays as typed.
+        let internal = br#"<!DOCTYPE o [<!ENTITY e "x">]><order><name>&e;</name></order>"#;
+        let (status, _, body) = call(V, "POST", "/xml", headers, internal).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<p>Order for &e;</p>");
+        let (_, _, body) = call(
+            V,
+            "POST",
+            "/xml",
+            headers,
+            b"<order><name>&nope;</name></order>",
+        )
+        .await;
+        assert_eq!(body, "<p>Order for &nope;</p>");
+    }
+
+    #[tokio::test]
+    async fn crlf_multiple_headers_cap_and_filters() {
+        let (status, headers, _) = get(V, "/lang?set=en%0d%0aA:%201%0d%0aB:%202").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hdr(&headers, "a").as_deref(), Some("1"));
+        assert_eq!(hdr(&headers, "b").as_deref(), Some("2"));
+        assert_eq!(hdr(&headers, "set-cookie").as_deref(), Some("lang=en"));
+
+        // A line without a colon is skipped.
+        let (_, headers, _) = get(V, "/lang?set=en%0d%0ano-colon%0d%0aA:%201").await;
+        assert_eq!(hdr(&headers, "a").as_deref(), Some("1"));
+        assert_eq!(headers.len(), 3, "{headers:?}");
+
+        // The cap is 16 injected headers.
+        let mut set = String::from("en");
+        for i in 1..=20 {
+            set.push_str(&format!("%0d%0aH{i}:%20v{i}"));
+        }
+        let (_, headers, _) = get(V, &format!("/lang?set={set}")).await;
+        assert_eq!(hdr(&headers, "h1").as_deref(), Some("v1"));
+        assert_eq!(hdr(&headers, "h16").as_deref(), Some("v16"));
+        assert_eq!(hdr(&headers, "h17"), None);
+        assert_eq!(hdr(&headers, "h20"), None);
+        // content-type + set-cookie + 16 injected.
+        assert_eq!(headers.len(), 18, "{headers:?}");
+
+        // P: one Set-Cookie carrying the whole (CR/LF-stripped) value.
+        let (_, headers, _) = get(P, "/lang?set=en%0d%0aA:%201%0d%0aB:%202").await;
+        assert_eq!(hdr(&headers, "a"), None);
+        assert_eq!(hdr(&headers, "b"), None);
+        assert_eq!(
+            hdr(&headers, "set-cookie").as_deref(),
+            Some("lang=enA: 1B: 2")
+        );
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(is_header_token("X-Injected"));
+        assert!(!is_header_token("Bad Name"));
+        assert!(!is_header_token(""));
+    }
+
+    #[tokio::test]
+    async fn nosqli_malformed_json_and_missing_password() {
+        let headers: &[(&str, &str)] = &[("content-type", "application/json")];
+        for mode in [V, P] {
+            for raw in [&b"not json"[..], b"", b"{\"username\":"] {
+                let (status, _, body) = call(mode, "POST", "/api/login", headers, raw).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{mode:?}");
+                assert_eq!(body, r#"{"error":"invalid json"}"#, "{mode:?}");
+            }
+        }
+        // No password: V falls through to 401, P refuses the non-string.
+        let none = br#"{"username":"alice"}"#;
+        let (status, _, body) = call(V, "POST", "/api/login", headers, none).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, r#"{"ok":false}"#);
+        let (status, _, body) = call(P, "POST", "/api/login", headers, none).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, r#"{"error":"password must be a string"}"#);
+        // Only an object is the operator shape in V; arrays, numbers and null
+        // are not, and P refuses every non-string.
+        for raw in [
+            &br#"{"username":"alice","password":["x"]}"#[..],
+            br#"{"username":"alice","password":7}"#,
+            br#"{"username":"alice","password":null}"#,
+        ] {
+            let shown = String::from_utf8_lossy(raw);
+            let (status, _, body) = call(V, "POST", "/api/login", headers, raw).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{shown}");
+            assert_eq!(body, r#"{"ok":false}"#, "{shown}");
+            let (status, _, body) = call(P, "POST", "/api/login", headers, raw).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{shown}");
+            assert_eq!(body, r#"{"error":"password must be a string"}"#, "{shown}");
+        }
+        // A top-level non-object parses but has no password.
+        let (status, _, body) = call(V, "POST", "/api/login", headers, b"[1,2]").await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body, r#"{"ok":false}"#);
+        // Any operator object is the marker body, the exact D3 literal.
+        let operator = br#"{"username":"x","password":{"$gt":""}}"#;
+        let (status, _, body) = call(V, "POST", "/api/login", headers, operator).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"ok":true,"marker":"NOSQLI-LOGIN-MARKER-4b1d"}"#);
+    }
+
+    #[tokio::test]
+    async fn ldapi_patched_literal_lookup_and_unbalanced_filters() {
+        // P: RFC 4515 escaping turns the metacharacters into literals.
+        for target in [
+            "/ldap?user=)(uid=*",
+            "/ldap?user=*",
+            "/ldap?user=alice)",
+            "/ldap?user=(alice",
+            "/ldap?user=ali*",
+        ] {
+            let (status, _, body) = get(P, target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_eq!(body, "<p>no entries</p>", "{target}");
+        }
+        let (_, _, body) = get(P, "/ldap?user=bob").await;
+        assert_eq!(body, "<p>uid=bob</p>");
+
+        // V: unbalanced parentheses are the 500; known users resolve; unknown
+        // and empty are `no entries`; the wildcard body is the D3 literal.
+        for target in ["/ldap?user=alice)", "/ldap?user=(alice", "/ldap?user=)("] {
+            let (status, _, body) = get(V, target).await;
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{target}");
+            assert_eq!(body, "<pre>Bad search filter</pre>", "{target}");
+        }
+        let (_, _, body) = get(V, "/ldap?user=carol").await;
+        assert_eq!(body, "<p>uid=carol</p>");
+        for target in ["/ldap?user=dave", "/ldap?user=", "/ldap"] {
+            let (status, _, body) = get(V, target).await;
+            assert_eq!(status, StatusCode::OK, "{target}");
+            assert_eq!(body, "<p>no entries</p>", "{target}");
+        }
+        let (_, _, body) = get(V, "/ldap?user=ali*").await;
+        assert_eq!(
+            body,
+            "<p>alice, bob, carol</p><p>LDAP-ALL-USERS-MARKER-77c2</p>"
+        );
+        assert_eq!(ldap_escape("\\"), r"\5c");
+        assert_eq!(ldap_escape("\0"), r"\00");
+        assert_eq!(ldap_escape("a(b)c*d\\e"), r"a\28b\29c\2ad\5ce");
+    }
 }

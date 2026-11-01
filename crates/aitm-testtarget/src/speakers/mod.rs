@@ -316,4 +316,23 @@ mod tests {
         assert_eq!(Proto::Tcp.as_str(), "tcp");
         assert_eq!(Proto::Udp.as_str(), "udp");
     }
+
+    // --- Tester additions (stage 5) ---
+
+    #[test]
+    fn crash_window_retrigger_restarts_and_constants_are_pinned() {
+        let w = CrashWindow::new();
+        let t0 = Instant::now();
+        w.trigger_at(t0);
+        // A second trigger while down restarts the 5 s window from its own time.
+        assert_eq!(
+            w.trigger_at(t0 + Duration::from_secs(2)),
+            t0 + Duration::from_secs(7)
+        );
+        assert!(w.is_down_at(t0 + Duration::from_millis(6999)));
+        assert!(!w.is_down_at(t0 + Duration::from_secs(7)));
+        assert_eq!(CRASH_WINDOW, Duration::from_secs(5));
+        assert_eq!(IDLE_TIMEOUT, Duration::from_millis(200));
+        assert!(!CrashWindow::default().is_down_at(Instant::now()));
+    }
 }

@@ -1067,4 +1067,199 @@ mod tests {
         assert_eq!(row["closed_ms"], serde_json::Value::Null);
         assert_eq!(row["requests"], serde_json::json!(0));
     }
+
+    // --- Tester additions (stage 5): redaction edges, failed TLS, shapes, overflow ---
+
+    #[test]
+    fn redact_edge_cases() {
+        let mut h = HeaderMap::new();
+        h.append(
+            HeaderName::from_static("x-bin"),
+            HeaderValue::from_bytes(&[0xff, 0xfe]).expect("opaque header value"),
+        );
+        h.append(
+            HeaderName::from_static("accept-language"),
+            HeaderValue::from_static("en"),
+        );
+        h.append(
+            HeaderName::from_static("x-a"),
+            HeaderValue::from_static("1"),
+        );
+        h.append(
+            HeaderName::from_static("x-a"),
+            HeaderValue::from_static("2"),
+        );
+        h.append(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_static("b=2; a=1"),
+        );
+        h.append(
+            HeaderName::from_static("cookie"),
+            HeaderValue::from_static("a=3; =x; c"),
+        );
+        h.append(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("ua/1"),
+        );
+        let r = redact_headers(&h);
+        assert_eq!(r.headers.get("x-bin").map(String::as_str), Some("<binary>"));
+        assert!(
+            !r.headers.contains_key("accept-language"),
+            "{:?}",
+            r.headers
+        );
+        assert_eq!(r.headers.get("x-a").map(String::as_str), Some("1, 2"));
+        assert_eq!(
+            r.headers.get("user-agent").map(String::as_str),
+            Some("ua/1")
+        );
+        assert_eq!(
+            r.cookie_names,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            r.cookie_sha256.as_deref(),
+            Some(sha256_prefix16(b"b=2; a=1; a=3; =x; c").as_str())
+        );
+        assert_eq!(r.auth_sha256, None);
+
+        // No cookie / authorization at all: empty names and null hashes.
+        let r = redact_headers(&HeaderMap::new());
+        assert_eq!(r, Redacted::default());
+        assert!(r.cookie_names.is_empty());
+        assert_eq!(r.cookie_sha256, None);
+        assert_eq!(r.auth_sha256, None);
+    }
+
+    #[test]
+    fn failed_tls_handshake_logs_none_without_a_conn_row() {
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        log.log_tls_handshake_failed(Listener::TlsH1);
+        let http = log.http_json();
+        let e = &http["entries"][0];
+        assert_eq!(e["kind"], serde_json::json!("tls_handshake"));
+        assert_eq!(e["alpn"], serde_json::json!("none"));
+        assert_eq!(e["listener"], serde_json::json!("tls_h1"));
+        assert_eq!(e["conn_id"], serde_json::json!("c-00000001"));
+        assert_eq!(e["seq"], serde_json::json!(1));
+        assert_eq!(log.conns_json(), serde_json::json!({ "entries": [] }));
+        // An accepted connection with no ALPN also reads `none`, but has a row.
+        let conn = log.open_conn(Listener::Tls, None, peer());
+        log.log_tls_handshake(&conn);
+        assert_eq!(conn.conn_id, "c-00000002");
+        assert_eq!(
+            log.http_json()["entries"][1]["alpn"],
+            serde_json::json!("none")
+        );
+        assert_eq!(
+            log.conns_json()["entries"][0]["alpn"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn services_json_shape_follows_d2() {
+        let log = ControlLog::new(SeedMode::Patched);
+        log.register_service(ServiceInfo {
+            name: "http".into(),
+            proto: "tcp",
+            addr: peer(),
+            role: "http",
+            alpn: Some(vec!["http/1.1"]),
+            grammar: None,
+        });
+        log.register_service(ServiceInfo {
+            name: "control".into(),
+            proto: "tcp",
+            addr: peer(),
+            role: "control",
+            alpn: None,
+            grammar: None,
+        });
+        log.register_service(ServiceInfo {
+            name: "l4-resp".into(),
+            proto: "tcp",
+            addr: peer(),
+            role: "l4",
+            alpn: None,
+            grammar: Some("resp"),
+        });
+        log.register_service(ServiceInfo {
+            name: "l4-udp-echo".into(),
+            proto: "udp",
+            addr: peer(),
+            role: "l4",
+            alpn: None,
+            grammar: None,
+        });
+        let v = log.services_json();
+        assert_eq!(v["mode"], serde_json::json!("patched"));
+        let rows = v["services"].as_array().expect("services");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(
+            rows[0],
+            serde_json::json!({"name":"http","proto":"tcp","addr":"127.0.0.1:40000","role":"http","alpn":["http/1.1"]})
+        );
+        assert_eq!(
+            rows[1],
+            serde_json::json!({"name":"control","proto":"tcp","addr":"127.0.0.1:40000","role":"control"})
+        );
+        assert_eq!(
+            rows[2],
+            serde_json::json!({"name":"l4-resp","proto":"tcp","addr":"127.0.0.1:40000","role":"l4","grammar":"resp"})
+        );
+        assert_eq!(
+            rows[3],
+            serde_json::json!({"name":"l4-udp-echo","proto":"udp","addr":"127.0.0.1:40000","role":"l4","grammar":null})
+        );
+        // Registering an l4 service pre-creates its empty /log/l4 slot; the
+        // HTTP and control rows get none.
+        let l4 = log.l4_json(None);
+        assert_eq!(
+            l4["services"]["l4-resp"],
+            serde_json::json!({"accepts":[],"messages":[],"closes":[],"downtime":[]})
+        );
+        assert!(l4["services"].get("http").is_none());
+        assert_eq!(l4["services"].as_object().map(|m| m.len()), Some(2));
+        assert_eq!(
+            log.l4_json(Some("nope")),
+            serde_json::json!({ "services": {}, "dropped": 0 })
+        );
+    }
+
+    #[test]
+    fn l4_ring_overflow_counts_dropped_and_reset_clears_it() {
+        let log = ControlLog::new(SeedMode::Vulnerable);
+        for _ in 0..RING_CAP + 3 {
+            log.l4_message(
+                "l4-tlv-crash",
+                "c-00000001",
+                Dir::In,
+                b"\0\0",
+                Some("frame"),
+                Classified::Ok,
+            );
+        }
+        let l4 = log.l4_json(Some("l4-tlv-crash"));
+        assert_eq!(l4["dropped"], serde_json::json!(3));
+        assert_eq!(
+            l4["services"]["l4-tlv-crash"]["messages"]
+                .as_array()
+                .map(Vec::len),
+            Some(RING_CAP)
+        );
+        // The oldest three were dropped: the first remaining carries seq 4.
+        assert_eq!(
+            l4["services"]["l4-tlv-crash"]["messages"][0]["seq"],
+            serde_json::json!(4)
+        );
+        let last = log.reset();
+        assert_eq!(last, u64::try_from(RING_CAP + 3).expect("fits"));
+        let l4 = log.l4_json(Some("l4-tlv-crash"));
+        assert_eq!(l4["dropped"], serde_json::json!(0));
+        assert_eq!(
+            l4["services"]["l4-tlv-crash"]["messages"],
+            serde_json::json!([])
+        );
+    }
 }

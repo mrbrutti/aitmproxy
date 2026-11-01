@@ -766,4 +766,31 @@ mod tests {
         assert_eq!(row("sqli-boolean-items-id").path, "/items");
         assert_eq!(row("sqli-time-items").path, "/items");
     }
+
+    // --- Tester additions (stage 5): the L4 table agrees with the speakers ---
+
+    #[test]
+    fn l4_manifest_matches_the_speaker_table() {
+        // The grader's L4 rows and the served speakers describe the same nine
+        // services: name, grammar and transport agree row for row.
+        let defs = crate::speakers::driver::all();
+        assert_eq!(defs.len(), 9);
+        for def in &defs {
+            let row = l4_manifest()
+                .iter()
+                .find(|a| a.id == def.name)
+                .unwrap_or_else(|| panic!("no l4_manifest row for speaker {}", def.name));
+            assert_eq!(row.grammar.as_deref(), Some(def.grammar), "{}", def.name);
+            assert_eq!(row.proto, def.proto.as_str(), "{}", def.name);
+        }
+    }
+
+    #[test]
+    fn manifest_yaml_lists_every_planted_id() {
+        let yaml = manifest_yaml();
+        for v in manifest() {
+            assert!(yaml.contains(&v.id), "yaml lacks {}", v.id);
+            assert!(yaml.contains(&v.class), "yaml lacks class {}", v.class);
+        }
+    }
 }

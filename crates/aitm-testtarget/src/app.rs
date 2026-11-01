@@ -1139,4 +1139,141 @@ mod tests {
         assert_eq!(info.conn.listener, Listener::Plain);
         assert_eq!(info.body.as_ref(), b"comment=hi+there&n=1");
     }
+
+    // --- Tester additions (stage 5): router coverage of the index, /ws, 404s ---
+
+    #[tokio::test]
+    async fn every_index_link_form_and_click_target_is_served() {
+        // Every href on `/`, every form action and the click-only data-href is
+        // answered by the router: never a 404 (the auth-gated ones 302, the
+        // POST forms with an empty body 400/302).
+        let (state, conn) = fresh(SeedMode::Vulnerable);
+        for href in INDEX_LINKS {
+            let resp = get_on(&state, &conn, href).await;
+            assert_ne!(resp.status(), StatusCode::NOT_FOUND, "GET {href}");
+        }
+        let resp = get_on(&state, &conn, "/files/readme.txt").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        for (method, action) in [
+            ("GET", "/search"),
+            ("POST", "/comments"),
+            ("POST", "/login"),
+            ("POST", "/upload"),
+            ("POST", "/api/profile"),
+            ("POST", "/api/login"),
+            ("POST", "/xml"),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(action)
+                .body(Full::new(Bytes::new()))
+                .expect("valid request");
+            let resp = route(req, state.clone(), conn.clone())
+                .await
+                .expect("route is infallible");
+            assert_ne!(resp.status(), StatusCode::NOT_FOUND, "{method} {action}");
+        }
+        // And every seed_index row's concrete path is one of those.
+        for row in seed_index() {
+            let path_only = row.path.split('?').next().unwrap_or(row.path);
+            let linked = INDEX_LINKS
+                .iter()
+                .any(|h| h.split('?').next().unwrap_or(h) == path_only)
+                || [
+                    "/search",
+                    "/comments",
+                    "/login",
+                    "/upload",
+                    "/files/readme.txt",
+                    "/ws",
+                ]
+                .contains(&path_only)
+                || ["/xml", "/api/login", "/api/profile"].contains(&path_only);
+            assert!(
+                linked,
+                "seed {} at {} is not linked from /",
+                row.id, row.path
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_dispatches_through_the_router() {
+        let (state, conn) = fresh(SeedMode::Vulnerable);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/ws")
+            .header("host", "127.0.0.1:1")
+            .header("upgrade", "websocket")
+            .header("connection", "Upgrade")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("sec-websocket-version", "13")
+            .body(Full::new(Bytes::new()))
+            .expect("valid request");
+        let resp = route(req, state.clone(), conn.clone())
+            .await
+            .expect("route is infallible");
+        assert_eq!(resp.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(
+            resp.headers()
+                .get("sec-websocket-accept")
+                .and_then(|v| v.to_str().ok()),
+            Some("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+        );
+        // Without the handshake headers /ws is a 400, not a 404.
+        let resp = get_on(&state, &conn, "/ws").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Both are logged as requests with their status.
+        let json = state.log.http_json();
+        let statuses: Vec<u64> = json["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|e| e["path"] == "/ws")
+            .filter_map(|e| e["status"].as_u64())
+            .collect();
+        assert_eq!(statuses, vec![101, 400]);
+        let ws = state.log.ws_json();
+        let accepted: Vec<bool> = ws["entries"]
+            .as_array()
+            .expect("ws entries")
+            .iter()
+            .filter(|e| e["kind"] == "handshake")
+            .filter_map(|e| e["accepted"].as_bool())
+            .collect();
+        assert_eq!(accepted, vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn unknown_paths_are_404_and_logged() {
+        // Includes the control routes: the target origin never serves them.
+        let (state, conn) = fresh(SeedMode::Vulnerable);
+        let paths = [
+            "/nope",
+            "/grader",
+            "/seed",
+            "/search/x",
+            "/items/1",
+            "/api",
+            "/log/http",
+            "/services",
+            "/mode",
+            "/reset",
+        ];
+        for path in paths {
+            let resp = get_on(&state, &conn, path).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(
+                resp.headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok()),
+                Some("text/html; charset=utf-8"),
+                "{path}"
+            );
+        }
+        let json = state.log.http_json();
+        let entries = json["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), paths.len());
+        assert!(entries.iter().all(|e| e["status"] == 404), "{json}");
+    }
 }

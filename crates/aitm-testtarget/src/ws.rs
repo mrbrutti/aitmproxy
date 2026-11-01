@@ -1209,4 +1209,112 @@ mod tests {
         assert_ne!(closed, Some(1));
         assert!(closed.is_some_and(|c| c >= conn.opened_ms));
     }
+
+    // --- Tester additions (stage 5): close without code, pong, fragments, EOF ---
+
+    #[tokio::test]
+    async fn frame_loop_close_without_code_pong_bad_utf8_and_fragments() {
+        // A close with no payload echoes an empty close and reports no code;
+        // an unsolicited pong is ignored; invalid UTF-8 text is `bad message`.
+        let v = state(Vulnerable);
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:6".parse().expect("peer"));
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+        let _hello = read_frame(&mut client).await;
+        client
+            .write_all(&masked(Opcode::Pong, b"late"))
+            .await
+            .expect("write pong");
+        client
+            .write_all(&masked(Opcode::Text, &[0xff, 0xfe]))
+            .await
+            .expect("write bad utf-8");
+        let (op, reply) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Text);
+        assert_eq!(reply, br#"{"type":"error","error":"bad message"}"#);
+        client
+            .write_all(&masked(Opcode::Close, b""))
+            .await
+            .expect("write close");
+        let (op, close) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Close);
+        assert!(close.is_empty());
+        assert_eq!(task.await.expect("loop task"), None);
+        let ws = v.log.ws_json();
+        let last = ws["entries"]
+            .as_array()
+            .expect("entries")
+            .last()
+            .cloned()
+            .expect("close entry");
+        assert_eq!(last["kind"], serde_json::json!("close"));
+        assert_eq!(last["code"], serde_json::Value::Null);
+        // The pong was logged as an `in` frame.
+        assert!(ws["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .any(|e| e["kind"] == "frame" && e["dir"] == "in" && e["opcode"] == "pong"));
+
+        // A text frame announcing a continuation (FIN clear) is refused with 1003.
+        let v = state(Vulnerable);
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:7".parse().expect("peer"));
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+        let _hello = read_frame(&mut client).await;
+        let mut first_fragment = masked(Opcode::Text, b"part");
+        first_fragment[0] &= 0x7f;
+        client
+            .write_all(&first_fragment)
+            .await
+            .expect("write fragment");
+        let (op, payload) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Close);
+        assert_eq!(payload, 1003u16.to_be_bytes().to_vec());
+        assert_eq!(task.await.expect("loop task"), Some(1003));
+
+        // The client vanishing mid-frame ends the loop without a code and
+        // still writes the close entry and stamps the connection.
+        let v = state(Vulnerable);
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:8".parse().expect("peer"));
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+        let _hello = read_frame(&mut client).await;
+        client.write_all(&[0x81]).await.expect("write partial");
+        drop(client);
+        assert_eq!(task.await.expect("loop task"), None);
+        let ws = v.log.ws_json();
+        let last = ws["entries"]
+            .as_array()
+            .expect("entries")
+            .last()
+            .cloned()
+            .expect("close entry");
+        assert_eq!(last["kind"], serde_json::json!("close"));
+        assert_eq!(last["code"], serde_json::Value::Null);
+        assert!(conn.closed_ms.lock().expect("closed_ms").is_some());
+
+        // A reserved opcode on the wire closes with 1002.
+        let v = state(Vulnerable);
+        let conn = v
+            .log
+            .open_conn(Listener::Plain, None, "127.0.0.1:9".parse().expect("peer"));
+        let (server, mut client) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(run_frames(server, v.clone(), conn.clone(), false));
+        let _hello = read_frame(&mut client).await;
+        client
+            .write_all(&[0x83, 0x80, 1, 2, 3, 4])
+            .await
+            .expect("write reserved opcode");
+        let (op, payload) = read_frame(&mut client).await;
+        assert_eq!(op, Opcode::Close);
+        assert_eq!(payload, 1002u16.to_be_bytes().to_vec());
+        assert_eq!(task.await.expect("loop task"), Some(1002));
+    }
 }
