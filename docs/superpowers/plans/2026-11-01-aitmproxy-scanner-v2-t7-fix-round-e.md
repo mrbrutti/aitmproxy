@@ -14,6 +14,8 @@ E2. C2's doc bound (`crates/aitm-tui/src/scan/jobs.rs` `poll_offset`/`advance_po
 
 E3. **The notice is cleared by any parsed `scan.*` reply** (`crates/aitm-tui/src/app.rs` `scan_reply`, `crates/aitm-tui/src/scan/mod.rs` field doc): ruling (a): drop the reply-clear; the notice lives until the next key (D3 says "the next key"; a background status poll must not erase `already done` before the operator reads it). Test (`tests/scan_v2_jobs.rs`): with job A done and job B running, `x` on A then a `scan.status:B` reply leaves the banner reading `already done`; `Down` clears it.
 
+E10. **A landing suppressed while a read is pending is never retried** (`crates/aitm-tui/src/app.rs` `scan.issue` reply arm): on a successful `scan.issue` reply, if the Issues tab is shown with the List pane focused and the cursor's id differs from the reply's id and is not in `read`, run `issue_cursor_landed` once (never on a failed reply, so no retry loop). Test (`tests/scan_v2_issues.rs`): land on row 1 (read pending), Down to row 2, fold row 1's reply: exactly one `scan.issue` for row 2 leaves.
+
 ## Structure
 
 E4. The model imports a UI module (`crates/aitm-tui/src/scan/jobs.rs` `use crate::ui::text::truncate`): move `ui/text.rs` to `src/text.rs` (`pub mod text;` in `lib.rs`), keep `pub use crate::text as text;` in `ui/mod.rs` so existing `crate::ui::text` paths compile; the model imports `crate::text::truncate`.

@@ -371,24 +371,24 @@ Kept by the main session during stage 6. One row per finding.
 | 6 | quality | Minor | `Columns::measure`/`total()` coupling; opaque test literals | fixed in 81e07c32 (fix round C) (C29) |
 | 6 | quality | Minor | cancel test reads its expectation from the fixture | fixed in 81e07c32 (fix round C) (C30) |
 | 6 | quality | Minor | clamped cursor twice, per-row `String` clone, `pub lane_name` | fixed in 81e07c32 (fix round C) (C31) |
-| 7 | security | Important | `fetched` and `scan.issue:*` in-flight tags grow without bound, keyed on unvalidated core-supplied issue ids | fix round D (D1): `is_issue_id`, prune `fetched` on fold, one `scan.issue` in flight (spec D6 amended) |
-| 7 | security | Minor | `limit: 512` not enforced client-side; every frame rebuilds every row from unbounded strings | fix round D (D2): truncate the page to `ISSUES_PAGE_LIMIT`, bound row strings at fold time |
+| 7 | security | Important | `fetched` and `scan.issue:*` in-flight tags grow without bound, keyed on unvalidated core-supplied issue ids | fixed in c3dc228d (fix round D) (D1): `is_issue_id`, prune `fetched` on fold, one `scan.issue` in flight (spec D6 amended) |
+| 7 | security | Minor | `limit: 512` not enforced client-side; every frame rebuilds every row from unbounded strings | fixed in 9a10c8c4 (fix round D) (D2): truncate the page to `ISSUES_PAGE_LIMIT`, bound row strings at fold time |
 | 7 | security | note | U+202E-class format characters pass ratatui's control-char filter TUI-wide (pre-existing, flow list too) | follow-up outside this track: a filter in `ui/text.rs` |
-| 7 | spec | Important | `scan.issue` dispatched through the quiet `scan_poll`; a bus lacking it is never named | ruling (b): keep `scan_poll`; fix round D (D4) makes the Issues degraded text name either missing verb (spec D11 amended) |
+| 7 | spec | Important | `scan.issue` dispatched through the quiet `scan_poll`; a bus lacking it is never named | ruling (b): keep `scan_poll`; fixed in 8e63bf22 (fix round D) (D4) makes the Issues degraded text name either missing verb (spec D11 amended) |
 | 7 | spec | Minor | filter banner drawn in the list pane, not the strip slot | accepted; spec D11 amended: the filter line is the list pane's first row, the strip carries state |
-| 7 | spec | Minor | `scan.issue` fold-under-key is a builder extension without a test | spec D6 amended (issue sentence); fix round D (D5) adds the test |
+| 7 | spec | Minor | `scan.issue` fold-under-key is a builder extension without a test | spec D6 amended (issue sentence); fixed in c3dc228d (fix round D) (D5) adds the test |
 | 7 | spec | Minor | thirteen helpers public beyond the plan's names | accepted (as for Task 6) |
-| 7 | spec | Minor | three builder rules unpinned (`S` off-tab, `OpenScan` on Issues, Detail-focused landing) | fix round D (D6) |
+| 7 | spec | Minor | three builder rules unpinned (`S` off-tab, `OpenScan` on Issues, Detail-focused landing) | fixed in c3dc228d (fix round D) (D6) |
 | 7 | spec | note | ownership matrix and spec D3 `IssuesState` stale after the hand-offs | matrix row and D3 updated in this commit |
-| 7 | quality | Important | `fetched` records that the TUI asked, not what it got: wrong detail under the cursor, stale reads after a filtered job ends, failed reads block retries | fix round D (D1, merged): `read: BTreeMap<IssueId, Issue>` filled on reply, pruned per fold; `detail()` is the cursor lookup (spec D3/D6 amended) |
-| 7 | quality | Minor | `fetched_at_tick` is write-only | fix round D (D7): the Issues timer counts from it |
-| 7 | quality | Minor | `cycle` hand-rolls four rings | fix round D (D8) |
-| 7 | quality | Minor | keyed-reply arm written twice (`OTHER_JOB`/`OTHER_ISSUE`) | fix round D (D9): `scan_reply_keyed` |
-| 7 | quality | Minor | one tertiary line drawn four ways | fix round D (D10): `hint()` |
-| 7 | quality | Minor | `token()` serde round trip per cell; duplicates `lane_name` | fix round D (D11) |
-| 7 | quality | Minor | severity order and `BySeverity` walk spelled three times | fix round D (D12) |
-| 7 | quality | Minor | tests `contains` where a row literal exists; one `assert!(a == b)` | fix round D (D13) |
-| 7 | quality | Minor | four overstated doc comments; small hygiene | fix round D (D14) |
+| 7 | quality | Important | `fetched` records that the TUI asked, not what it got: wrong detail under the cursor, stale reads after a filtered job ends, failed reads block retries | fixed in c3dc228d (fix round D) (D1, merged): `read: BTreeMap<IssueId, Issue>` filled on reply, pruned per fold; `detail()` is the cursor lookup (spec D3/D6 amended) |
+| 7 | quality | Minor | `fetched_at_tick` is write-only | fixed in 65abf477 (fix round D) (D7): the Issues timer counts from it |
+| 7 | quality | Minor | `cycle` hand-rolls four rings | fixed in 9a10c8c4 (fix round D) (D8) |
+| 7 | quality | Minor | keyed-reply arm written twice (`OTHER_JOB`/`OTHER_ISSUE`) | fixed in 65abf477 (fix round D) (D9): `scan_reply_keyed` |
+| 7 | quality | Minor | one tertiary line drawn four ways | fixed in 8e63bf22 (fix round D) (D10): `hint()` |
+| 7 | quality | Minor | `token()` serde round trip per cell; duplicates `lane_name` | fixed in 9a10c8c4 (fix round D) (D11) |
+| 7 | quality | Minor | severity order and `BySeverity` walk spelled three times | fixed in 9a10c8c4 (fix round D) (D12) |
+| 7 | quality | Minor | tests `contains` where a row literal exists; one `assert!(a == b)` | fixed in 65abf477 (fix round D) (D13) |
+| 7 | quality | Minor | four overstated doc comments; small hygiene | fixed in 9a10c8c4 (fix round D) (D14) |
 | fix C | security | re-review | C1, C2, C3, C20, C21, C22 closed | closed |
 | fix C | security | Minor | C20 residual: Jobs rows are still built at render over the raw strings, so per-frame CPU is linear in the retained text | fix round E (E1): bound `profile_name` and `targets` in `fold_status` (or store a prebuilt `JobRow`), and make `ui::text::truncate` early-exit |
 | fix C | security | Minor | C2 doc says `ceil(n/16)` firings; with the cursor's job riding out of turn the bound is `ceil((n-1)/15)` | fix round E (E2): doc wording |
@@ -402,6 +402,9 @@ Kept by the main session during stage 6. One row per finding.
 | fix C | quality | Minor | `live()` dedupe condition hard to read | fix round E (E7) |
 | fix C | quality | Minor | `d`/`dir` pair, gap spelled twice, one fully qualified `Style` | fix round E (E8) |
 | fix C | quality | Minor | `forty_running_jobs` mid-file; one six-property test | fix round E (E9) |
+| fix D | coder note | Minor | a landing suppressed while a read is pending is not retried when the reply lands (row under the cursor stays unread) | ruling: re-land once on a successful reply when the cursor's id differs from the reply's; fix round E (E10) |
+| fix D | coder note | note | with `scan.issues` present and `scan.issue` absent the list draws while the banner names the missing verb | accepted: the list is content, the banner is the state |
+| fix D | coder note | note | the legacy Jobs key line is a fifth tertiary line not routed through `hint` | Task 14 replaces it with the `bars.rs` hints |
 
 ## Shipped
 
