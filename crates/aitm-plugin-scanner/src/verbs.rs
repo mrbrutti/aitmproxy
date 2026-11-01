@@ -250,9 +250,16 @@ fn start_params() -> Vec<ParamDef> {
     vec![
         ParamDef {
             name: "profile".into(),
-            ty: TypeDesc::Object(Vec::new()),
+            // Free-form: the MCP param validator refuses any key a closed
+            // `Object` does not declare, which would reject every
+            // `ScanProfile` field. `ScanProfile`'s `deny_unknown_fields` is
+            // the real validator, and it answers a typo with
+            // `scan: invalid_profile:`.
+            ty: TypeDesc::Map(Box::new(TypeDesc::Any)),
             required: false,
-            description: "A complete `ScanProfile`, inline.".into(),
+            description: "A complete `ScanProfile`, inline; an unknown key is refused rather \
+                          than ignored."
+                .into(),
         },
         ParamDef {
             name: "profile_name".into(),
@@ -1050,7 +1057,9 @@ impl Command for ScanProfileSave {
                 .into(),
             params: vec![ParamDef {
                 name: "profile".into(),
-                ty: TypeDesc::Object(Vec::new()),
+                // Free-form for the same reason as `scan.start`'s `profile`:
+                // the schema must not police a `ScanProfile`'s keys.
+                ty: TypeDesc::Map(Box::new(TypeDesc::Any)),
                 required: true,
                 description: "The complete `ScanProfile` to save.".into(),
             }],
@@ -1893,6 +1902,160 @@ mod tests {
             .call("scan.start", &[])
             .expect_err("no selector is refused");
         assert_eq!(code(&none), ScanErrorCode::InvalidProfile);
+    }
+
+    /// The rule the MCP param validator applies to a param value
+    /// (`aitm_mcp::json::object_from_json`): a closed [`TypeDesc::Object`]
+    /// refuses every key it does not declare, while a `Map`/`Any` admits any
+    /// key and leaves the checking to the command. Mirrored here because
+    /// `aitm-mcp` is not a dependency of this crate. The live-run refusal this
+    /// reproduces was ``param `profile`: unknown param `name` for `object` ``.
+    fn keys_the_mcp_validator_refuses(ty: &TypeDesc, json: &serde_json::Value) -> Vec<String> {
+        let Some(fields) = json.as_object() else {
+            panic!("the value under test is a JSON object");
+        };
+        match ty {
+            TypeDesc::Map(_) | TypeDesc::Any => Vec::new(),
+            TypeDesc::Object(defs) => fields
+                .keys()
+                .filter(|key| !defs.iter().any(|def| &def.name == *key))
+                .cloned()
+                .collect(),
+            _ => fields.keys().cloned().collect(),
+        }
+    }
+
+    /// The declared type of one of `cmd`'s params.
+    fn param_ty(cmd: &dyn Command, name: &str) -> TypeDesc {
+        cmd.schema()
+            .params
+            .into_iter()
+            .find(|def| def.name == name)
+            .unwrap_or_else(|| panic!("`{}` declares a `{name}` param", cmd.name()))
+            .ty
+    }
+
+    /// A profile that exercises the whole `ScanProfile` tree, including the
+    /// three keys the live run was refused on (`name`, `target`, `accuracy`).
+    fn full_profile(name: &str) -> serde_json::Value {
+        let profile = ScanProfile {
+            name: name.to_string(),
+            target: aitm_scan_model::ProfileTarget {
+                origins: vec!["http://scan.test".to_string()],
+                l4: Vec::new(),
+            },
+            accuracy: aitm_scan_model::Accuracy::FewerFalsePositives,
+            ..ScanProfile::default()
+        };
+        let json = serde_json::to_value(&profile).expect("a `ScanProfile` serialises");
+        let keys: Vec<&str> = json
+            .as_object()
+            .expect("a profile is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "name",
+                "target",
+                "lanes",
+                "intensity",
+                "speed",
+                "accuracy",
+                "checks",
+                "crawl",
+                "audit",
+                "session",
+                "budget",
+                "http",
+                "ws",
+                "l4",
+            ],
+            "the profile under test must carry every `ScanProfile` field"
+        );
+        json
+    }
+
+    /// Spec D3: `scan.start`'s `profile` is "a complete `ScanProfile`, inline"
+    /// and `overrides` "a partial profile", so the MCP param validator must not
+    /// police their keys — `ScanProfile`'s `deny_unknown_fields` is the real
+    /// validator, and a typo is still `invalid_profile`. A real `tests/e2e`
+    /// run was refused at the schema with ``param `profile`: unknown param
+    /// `name` for `object` `` because both start-shaped verbs declared the
+    /// param as a closed, empty object.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_start_accepts_a_full_profile_object() {
+        let h = Harness::new();
+        let json = full_profile("inline-full");
+        let none: Vec<String> = Vec::new();
+
+        for verb in ["scan.start", "scan.map"] {
+            let cmd = h.cmd(verb);
+            for param in ["profile", "overrides"] {
+                assert_eq!(
+                    keys_the_mcp_validator_refuses(&param_ty(&*cmd, param), &json),
+                    none,
+                    "`{verb}` refuses `ScanProfile` keys in `{param}` at the schema"
+                );
+            }
+        }
+
+        // The whole profile really drives a job: the engine, not the schema,
+        // is what accepts it.
+        let result = h.ok(
+            "scan.start",
+            &[("profile", util::json_to_value(json.clone()))],
+        );
+        assert_eq!(
+            as_str(obj(obj(&result, "status"), "profile_name")),
+            "inline-full"
+        );
+        h.wait_terminal(as_str(obj(&result, "job"))).await;
+
+        // …and a typo is refused by that engine, with the typed code.
+        let mut typo = json;
+        let fields = typo.as_object_mut().expect("the profile is an object");
+        let accuracy = fields.remove("accuracy").expect("`accuracy` is a field");
+        fields.insert("accuracyy".to_string(), accuracy);
+        let err = h
+            .call("scan.start", &[("profile", util::json_to_value(typo))])
+            .expect_err("a mistyped profile key is refused");
+        assert_eq!(code(&err), ScanErrorCode::InvalidProfile);
+    }
+
+    /// Spec D3/D11: `scan.profile.save`'s `profile` is a whole `ScanProfile`
+    /// too, and was closed the same way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn scan_profile_save_accepts_a_full_profile_object() {
+        let h = Harness::with_findings_dir();
+        let json = full_profile("mine-full");
+        let cmd = h.cmd("scan.profile.save");
+        assert_eq!(
+            keys_the_mcp_validator_refuses(&param_ty(&*cmd, "profile"), &json),
+            Vec::<String>::new(),
+            "`scan.profile.save` refuses `ScanProfile` keys at the schema"
+        );
+
+        let saved = h.ok(
+            "scan.profile.save",
+            &[("profile", util::json_to_value(json.clone()))],
+        );
+        assert_eq!(as_str(obj(&saved, "saved")), "mine-full");
+        let got = h.ok("scan.profile.get", &[("name", s("mine-full"))]);
+        assert_eq!(as_str(obj(&got, "accuracy")), "fewer_false_positives");
+
+        let mut typo = json;
+        typo.as_object_mut()
+            .expect("the profile is an object")
+            .insert("budgett".to_string(), serde_json::Value::Null);
+        let err = h
+            .call(
+                "scan.profile.save",
+                &[("profile", util::json_to_value(typo))],
+            )
+            .expect_err("a mistyped profile key is refused");
+        assert_eq!(code(&err), ScanErrorCode::InvalidProfile);
     }
 
     /// Spec D3: an out-of-scope origin is `out_of_scope`, and `scan.cancel` is
