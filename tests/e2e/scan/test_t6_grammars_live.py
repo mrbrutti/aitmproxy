@@ -87,6 +87,12 @@ GRAMMARS: tuple[tuple[str, str], ...] = (
     ("smtp", "l4-smtp"),
     ("ftp", "l4-ftp"),
 )
+# `tlv` is the one grammar with no generator of its own: a named `tlv` with an empty
+# corpus has nothing to infer from (T6 child spec S5.2 (c)), so the row passes the
+# same three well-formed frames `test_t6_tlv_crash.py` uses (u16 BE length + payload,
+# three distinct lengths so the S4 length inference succeeds). Every other grammar
+# generates its own seeds.
+TLV_SEEDS = [{"hex": "000161"}, {"hex": "00026162"}, {"hex": "0003616263"}]
 FAULT_CLASSES = {"l4-crash", "l4-parser-fault"}
 VERBS = ("scan.start", "scan.status", "scan.issues", "scan.checks")
 MAX_BYTES_PER_S = 16384
@@ -140,7 +146,8 @@ def start_stream_job(op: BusClient, target: ScanTarget, service: str, grammar: s
             profile_name="l4-stream-safe",
             overrides={
                 "target": {"l4": [l4_endpoint(target, service, grammar)]},
-                "l4": {"cases": CASES, "max_bytes_per_s": MAX_BYTES_PER_S},
+                "l4": {"cases": CASES, "max_bytes_per_s": MAX_BYTES_PER_S,
+                       **({"seeds": TLV_SEEDS} if grammar == "tlv" else {})},
             },
             confirm=True,
         )
