@@ -569,15 +569,11 @@ mod tests {
         .expect("craft builds")
     }
 
-    /// One Capture flow created at `CREATED_MS` holding one inbound packet of
-    /// `bytes` seen at `PACKET_MS`, inserted into a fresh store. Returns the store
-    /// and the flow id string `l4.flow.get` takes.
-    fn one_packet_flow(bytes: Vec<u8>) -> (Arc<dyn L4FlowStore>, String) {
-        one_packet_flow_of(L4FlowKind::Capture, bytes)
-    }
-
-    /// [`one_packet_flow`] for a flow of `kind`.
-    fn one_packet_flow_of(kind: L4FlowKind, bytes: Vec<u8>) -> (Arc<dyn L4FlowStore>, String) {
+    /// The one place these tests build an `L4Flow`: a flow of `kind` on `lo0`
+    /// created at `CREATED_MS` holding `packets` in order, inserted into a fresh
+    /// store. Returns the store and the flow id string `l4.flow.get` takes. Every
+    /// other flow builder here is a one-line wrapper over this.
+    fn flow_of_packets(kind: L4FlowKind, packets: Vec<L4Packet>) -> (Arc<dyn L4FlowStore>, String) {
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let id = store.insert(L4Flow {
             id: L4FlowId::new(),
@@ -587,13 +583,7 @@ mod tests {
                 filter: None,
                 queue: None,
             },
-            packets: VecDeque::from(vec![L4Packet {
-                dir: L4Direction::Inbound,
-                timestamp: at_ms(PACKET_MS),
-                decoded: PacketSpec::summarize(&bytes),
-                bytes,
-                injected: false,
-            }]),
+            packets: VecDeque::from(packets),
             metadata: L4Meta {
                 marks: Vec::new(),
                 comment: None,
@@ -601,6 +591,50 @@ mod tests {
             },
         });
         (store, super::super::flow_id_to_string(id))
+    }
+
+    /// The `i`th packet of a flow: `bytes` seen at `PACKET_MS + i`, inbound and
+    /// captured, or outbound and `injected` (one the core put on the wire).
+    fn packet_at(i: usize, bytes: Vec<u8>, injected: bool) -> L4Packet {
+        L4Packet {
+            dir: if injected {
+                L4Direction::Outbound
+            } else {
+                L4Direction::Inbound
+            },
+            timestamp: at_ms(PACKET_MS + i as u64),
+            decoded: PacketSpec::summarize(&bytes),
+            bytes,
+            injected,
+        }
+    }
+
+    /// A flow of `kind` holding one captured inbound packet per element of
+    /// `packets`, in order.
+    fn flow_of(kind: L4FlowKind, packets: Vec<Vec<u8>>) -> (Arc<dyn L4FlowStore>, String) {
+        flow_of_packets(
+            kind,
+            packets
+                .into_iter()
+                .enumerate()
+                .map(|(i, b)| packet_at(i, b, false))
+                .collect(),
+        )
+    }
+
+    /// One Capture flow holding one captured inbound packet of `bytes`.
+    fn one_packet_flow(bytes: Vec<u8>) -> (Arc<dyn L4FlowStore>, String) {
+        flow_of(L4FlowKind::Capture, vec![bytes])
+    }
+
+    /// [`one_packet_flow`] for a flow of `kind`.
+    fn one_packet_flow_of(kind: L4FlowKind, bytes: Vec<u8>) -> (Arc<dyn L4FlowStore>, String) {
+        flow_of(kind, vec![bytes])
+    }
+
+    /// A Capture flow of `n` undecodable captured packets of `size` bytes each.
+    fn sized_packet_flow(n: usize, size: usize) -> (Arc<dyn L4FlowStore>, String) {
+        flow_of(L4FlowKind::Capture, vec![vec![0xab_u8; size]; n])
     }
 
     /// The deny-by-default agent gates (every `l4.allow_agent_*` false).
@@ -733,37 +767,14 @@ mod tests {
 
     // ---- L4PAR-AC2: bounded packet window ----------------------------------
 
-    /// A Capture flow of `n` crafted UDP packets, every other one injected, in a
-    /// fresh store. Returns the store and the flow id string.
+    /// A Capture flow of `n` crafted UDP packets, every other one injected.
     fn n_packet_flow(n: usize) -> (Arc<dyn L4FlowStore>, String) {
-        let bytes = crafted_udp();
-        let decoded = PacketSpec::summarize(&bytes);
-        let packets: VecDeque<L4Packet> = (0..n)
-            .map(|i| L4Packet {
-                dir: L4Direction::Inbound,
-                timestamp: at_ms(PACKET_MS + i as u64),
-                decoded: decoded.clone(),
-                bytes: bytes.clone(),
-                injected: i % 2 == 1,
-            })
-            .collect();
-        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let id = store.insert(L4Flow {
-            id: L4FlowId::new(),
-            kind: L4FlowKind::Capture,
-            bind: L4Bind {
-                interface: "lo0".into(),
-                filter: None,
-                queue: None,
-            },
-            packets,
-            metadata: L4Meta {
-                marks: Vec::new(),
-                comment: None,
-                created: at_ms(CREATED_MS),
-            },
-        });
-        (store, super::super::flow_id_to_string(id))
+        flow_of_packets(
+            L4FlowKind::Capture,
+            (0..n)
+                .map(|i| packet_at(i, crafted_udp(), i % 2 == 1))
+                .collect(),
+        )
     }
 
     /// Invoke `l4.flow.get` with `id` plus the given extra params, the way an
@@ -1196,39 +1207,6 @@ mod tests {
 
     // ---- L4PAR-AC36: reply byte budget ---------------------------------------
 
-    /// A Capture flow of `n` undecodable packets of `size` bytes each, none
-    /// injected, in a fresh store. Returns the store and the flow id string.
-    fn sized_packet_flow(n: usize, size: usize) -> (Arc<dyn L4FlowStore>, String) {
-        let bytes = vec![0xab_u8; size];
-        let decoded = PacketSpec::summarize(&bytes);
-        let packets: VecDeque<L4Packet> = (0..n)
-            .map(|i| L4Packet {
-                dir: L4Direction::Inbound,
-                timestamp: at_ms(PACKET_MS + i as u64),
-                decoded: decoded.clone(),
-                bytes: bytes.clone(),
-                injected: false,
-            })
-            .collect();
-        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let id = store.insert(L4Flow {
-            id: L4FlowId::new(),
-            kind: L4FlowKind::Capture,
-            bind: L4Bind {
-                interface: "lo0".into(),
-                filter: None,
-                queue: None,
-            },
-            packets,
-            metadata: L4Meta {
-                marks: Vec::new(),
-                comment: None,
-                created: at_ms(CREATED_MS),
-            },
-        });
-        (store, super::super::flow_id_to_string(id))
-    }
-
     /// Invoke `l4.flow.get` as `frontend` with the given gates and extra window
     /// params, returning the flow object and the number of packets it carries.
     fn get_window_as(
@@ -1399,38 +1377,6 @@ mod tests {
 
     // ---- Tester (stage 5): AC1 / AC2 / AC35 / AC36 edge cases ----------------
 
-    /// A Capture flow holding one inbound packet per element of `packets`, in
-    /// order, in a fresh store.
-    fn flow_of(packets: Vec<Vec<u8>>) -> (Arc<dyn L4FlowStore>, String) {
-        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let id = store.insert(L4Flow {
-            id: L4FlowId::new(),
-            kind: L4FlowKind::Capture,
-            bind: L4Bind {
-                interface: "lo0".into(),
-                filter: None,
-                queue: None,
-            },
-            packets: packets
-                .into_iter()
-                .enumerate()
-                .map(|(i, bytes)| L4Packet {
-                    dir: L4Direction::Inbound,
-                    timestamp: at_ms(PACKET_MS + i as u64),
-                    decoded: PacketSpec::summarize(&bytes),
-                    bytes,
-                    injected: false,
-                })
-                .collect(),
-            metadata: L4Meta {
-                marks: Vec::new(),
-                comment: None,
-                created: at_ms(CREATED_MS),
-            },
-        });
-        (store, super::super::flow_id_to_string(id))
-    }
-
     /// Invoke `l4.flow.get` as the operator with exactly `params`.
     fn invoke_raw(
         store: Arc<dyn L4FlowStore>,
@@ -1529,7 +1475,7 @@ mod tests {
     /// decodable packet still names the target.
     #[test]
     fn flow_endpoints_skip_an_undecodable_first_packet() {
-        let (store, id) = flow_of(vec![vec![0xde, 0xad], crafted_udp()]);
+        let (store, id) = flow_of(L4FlowKind::Capture, vec![vec![0xde, 0xad], crafted_udp()]);
         for extra in [
             vec![],
             vec![("limit", 0)],
@@ -1566,7 +1512,7 @@ mod tests {
     /// that just started) answers with every flow field and an empty window.
     #[test]
     fn flow_get_empty_flow() {
-        let (store, id) = flow_of(vec![]);
+        let (store, id) = flow_of(L4FlowKind::Capture, vec![]);
         let (flow, n) = flow_and_count(get_window(store, &id, &[]).expect("flow.get ok"));
         assert_eq!(n, 0);
         assert_eq!(flow.get("packet_count"), Some(&Value::Int(0)));
