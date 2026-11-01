@@ -487,6 +487,25 @@ mod tests {
         );
     }
 
+    /// The guard's typed refusal survives `anyhow` boxing: `JobClient` (T1b)
+    /// downcasts every `send_opts` error to tell `RateLimited { retry_after }`
+    /// (pace and retry) from `OutOfScope` (give up on the host) apart.
+    #[tokio::test]
+    async fn send_opts_guard_error_is_downcastable() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client = PipelineClient::new(store, guard, Arc::new(RecordingSender::new()));
+
+        let err = client
+            .send_opts(req("other.test"), SendOptions::default())
+            .await
+            .expect_err("other.test is not in scope");
+        assert_eq!(
+            err.downcast_ref::<crate::error::GuardError>(),
+            Some(&crate::error::GuardError::OutOfScope("other.test".into()))
+        );
+    }
+
     /// Tester: marks are carried verbatim, including an empty list and a long or
     /// odd mark, and a `Never` send leaves nothing behind that could carry them
     /// into the store.
