@@ -1642,6 +1642,20 @@ Kept by the main session during stage 6. One row per finding.
 | F-tui (PR 2) | spec (PR 2, re-run) | Minor | plan Task 18 still spelled the old palette literal; Task 17 did not mention the status reply refreshing the word; the core-flag half of the guard can refuse on a `setting` up to 5 s stale | plan Tasks 17/18 amended (dated); the 5 s staleness recorded, no code change (self-heals on the next poll) |
 | 19 (PR 2) | live proof (SP-AC27 TUI half) | — | run 1 (11:27 PST) flipped and restored the proxy but the pty had a 0×0 window (crossterm sizes by TIOCGWINSZ) so no text was drawn; run 2 (11:30:14–11:30:33 PST) with the window set: pill `off` → `setting…` → `→ us` → `setting…` → `off`, `scutil` HTTP/HTTPS 28080 while set, before == after, state file gone, token leak 0, a real CONNECT (api.apple-cloudkit.com, out of scope) rode through the proxy during the window | done 2026-11-01 on Matt's "Yes, both"; dumps in PR #258 |
 | 16 | coder (stop-on-gap) | Minor | Task 16 declared only `model.rs`, but `ProxyStatus` is built with exhaustive struct literals in `src/app.rs` (test helper), `tests/core_sync.rs`, `tests/common/mod.rs`; adding `system_proxy` there is required to compile | file list extended to those three one-line edits, orchestrator 2026-11-01 |
+| 20–22 | quality, spec (F-web re-run) | Minor | `refreshSystemProxy` ran while our own set/unset was in flight; three redundant `.listenButton` declarations; failure toast wording | fixed in the follow-up commit (gate on `systemProxySetting`; CSS trimmed; "Copy env line failed") |
+| 20 | quality (F-web re-run) | Minor | `mergeSystemProxy` keeps `guidance`/`remedy` across a state change; one Toolbar test waits a real ~2 s poll | accepted (recorded) by the orchestrator in Matt's name under the standing mandate: the kept fields are only read in the states that produce them; the store proves the rule on fake timers |
+| 22 | spec (F-web re-run) | Minor | `title: guidance` on the Copy env line item and the success notice "Copied env line" are not in the spec | accepted in Matt's name: the tooltip was the security reviewer's ask (show the text before copying); the success notice is the app's convention for every copy action |
+| 20–21 | spec (F-web re-run) | Minor | plan Tasks 20/21 signature blocks lack `mergeSystemProxy(prev, next)`, `refreshSystemProxy()` and the `guidance/remedy: string \| null` type | recorded here: `export function mergeSystemProxy(prev: SystemProxyStatus \| null, next: SystemProxyStatus \| null): SystemProxyStatus \| null` (systemProxy.ts); store action `refreshSystemProxy(): Promise<void>` gated on `proxy.system.status` (app.ts) |
+| 20–22 | quality, spec (PR 3) | Important | "Copy env line" and the `remedy` title unreachable: the polled compact object has no `guidance`/`remedy` and the web never called `proxy.system.status` | spec §D15 amended 2026-11-01 (menu-open full-status read, fields kept across polls); fixed in F-web (19f0b28f) |
+| 22 | spec (PR 3) | Important | `apps/web/src/shell/Toolbar.test.tsx` not in Task 22's file list | authorised by the orchestrator in the dispatch (component unit test, not evidence); recorded 2026-11-01 |
+| 22 | security (PR 3) | Minor | "Copy env line" used a bare `navigator.clipboard.writeText` (throws on a non-secure context, silent on rejection) | fixed in F-web 19f0b28f (`copyText` helper + notice on failure; the item carries `title: guidance` so the operator sees the text) |
+| 20 | security (PR 3) | Minor | server-supplied `host` interpolated unbounded into the pill | fixed in F-web (CSS clamp) |
+| 20 | spec (PR 3) | Minor | `· sys-proxy → ?:?` is outside the §D12 table | fixed in F-web (returns null when `other` lacks an endpoint) |
+| 20 | quality (PR 3) | Minor | `menuState` tests "unsupported" twice; `guidance`/`remedy` typed optional but always set | fixed in F-web |
+| 22 | quality (PR 3) | Minor | CSS comment inaccurate; hover wash invisible in light mode; clipboard stub not restored; `sysWord()` evaluated twice | fixed in F-web |
+| 20–22 | quality (PR 3) | Minor | status fixtures copied into three test files; two hand-rolled bus wrappers; both `proxy.status` readers carry their own wire type | accepted as follow-ups (shared `systemProxy.testkit.ts`; one `applyProxyStatus`), orchestrator 2026-11-01 |
+| 20 | spec (PR 3) | Minor | `SystemProxyMenuState` exported; disabled states beyond the three titled ones (`needs_privilege` with the remedy, `unknown`, no status) | accepted (recorded): the §D12 actions column gives "—" for those rows |
+| 22 | spec (PR 3) | Minor | pill word position before `· intercept armed` untested | fixed in F-web (assertion added) |
 | 24 (PR 4a) | quality (re-run) | Minor | `Endpoint.address` rendered a bare IPv6 host its own parser rejects; `settingsPort` truncated a fractional port where the wire path rejects | fixed in the follow-up commit (bracketed on render; `Int(exactly:)`) |
 | 24 (PR 4a) | quality (re-run) | Minor | a second definition of "loopback spelling" beside `EmbeddedCoreLaunch.isLoopbackHost` | accepted (recorded) with a cross-reference comment; the two callers have different stakes (dial guard vs display match) |
 | 24 (PR 4a) | quality | Important | `init?(compact:)` took `[String: Any]` and truncated ports; the Kit decodes bus objects as `JSONValue` with exact ints | fixed in c8ed92f4 |
@@ -1689,6 +1703,24 @@ Kept by the main session during stage 6. One row per finding.
 | tester | tester | Minor | watchdog wrote no log line for a file naming no service; IPv6 literal unbracketed in guidance | first fixed in F3 (Q5); second accepted (spec says "the IP literal"; `ours_from` maps loopback/unspecified to 127.0.0.1) |
 
 ## Shipped
+
+### PR 1 (core) — merged 2026-10-31 as squash 3d710ab (#214), ships in v0.5.8
+
+- Merged: Tasks 1–13, fixes F1–F4; crate `aitm-sysproxy`; verbs `proxy.system.status/set/unset`;
+  `proxy.status.system_proxy`; config `system_proxy`; hidden `aitm sysproxy-watchdog`; three
+  contract pins; docs. Gate green in the Terminal (fmt/clippy/238 suites). Panel: security,
+  quality, spec PASS after fixes; eight Minors accepted by the orchestrator (Review log).
+- Live proofs: SP-AC22 Linux in Lima `cis-lab` (set → `'manual'`/`127.0.0.1:18080`, unset → original
+  keys, `kill -9` → watchdog restore 126 ms). SP-AC20 core half + SP-AC21 macOS on Matt's Mac,
+  2026-10-31 22:44 on his explicit yes: auto-set at startup → SIGTERM restore; verb set (473 ms) →
+  unset (694 ms, both services) → set → `kill -9` → watchdog restore (761 ms); final per-service
+  state identical to before; no token in any output. Dumps in #214 (body + comment).
+- Cut from PR 1: nothing. Known limitation: the one-shot `aitm proxy system status` CLI run printed
+  no object to stdout in the proof (the bus verb is complete) — check the CLI renderer (follow-up).
+- Follow-ups: `SMAppService` root helper (standard users); KDE Plasma live proof; `testing` module
+  for the scripted-macOS fixtures; `set`/`unset` outcome structs; rustdoc private-link allow;
+  `Invocation::config_path()`; Matt's countersign on §D5 operator-critical hosts and the three
+  provisional answers. PR 2 (TUI), PR 3 (web), PR 4 (mac), PR 5 (CA trust) pending their gates.
 
 What merged, what was cut, follow-ups. Filled at stage 7.
 
