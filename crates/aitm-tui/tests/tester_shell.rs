@@ -934,7 +934,7 @@ fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     let mut want: Vec<&str> = CORE_TOOLS.to_vec();
     want.sort_unstable();
     assert_eq!(names, want);
-    assert_eq!(app.tools.len(), 95);
+    assert_eq!(app.tools.len(), 103);
     for lit in [
         "flow.detail",
         "flow.mark",
