@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { SystemProxyStatus } from '~/bus/types';
-import { menuState, parseSystemProxy, pillWord } from './systemProxy';
+import { menuState, mergeSystemProxy, parseSystemProxy, pillWord } from './systemProxy';
 
 const base: SystemProxyStatus = {
   state: 'off',
@@ -13,6 +13,8 @@ const base: SystemProxyStatus = {
   setting: false,
   supported: true,
   detail: 'HTTP and HTTPS off',
+  guidance: null,
+  remedy: null,
 };
 const off = base;
 const pointsAtUs: SystemProxyStatus = {
@@ -224,20 +226,22 @@ describe('parseSystemProxy — degenerate fields (tester)', () => {
 });
 
 describe('pillWord — the `other` row without an endpoint (tester)', () => {
-  it('falls back to ? for a missing host or port rather than inventing one', () => {
-    expect(pillWord({ ...other, host: null, port: null }, false)).toBe('· sys-proxy → ?:?');
-    expect(pillWord({ ...other, port: null }, false)).toBe('· sys-proxy → 127.0.0.1:?');
-    expect(pillWord({ ...other, host: null }, false)).toBe('· sys-proxy → ?:9090');
+  it('shows nothing for an `other` without a complete h:p endpoint — the D12 row is `→ h:p`, never a `?`', () => {
+    expect(pillWord({ ...other, host: null, port: null }, false)).toBeNull();
+    expect(pillWord({ ...other, port: null }, false)).toBeNull();
+    expect(pillWord({ ...other, host: null }, false)).toBeNull();
   });
 
   it('is either null or a D12 word for every state — never an empty string', () => {
     const states = ['off', 'points_at_us', 'other', 'unsupported', 'needs_privilege', 'unknown'] as const;
+    // `other` carries its endpoint here; without one it is a null too (the test above).
+    const at = (state: (typeof states)[number]) => (state === 'other' ? other : { ...base, state });
     for (const state of states) {
-      const w = pillWord({ ...base, state }, false);
+      const w = pillWord(at(state), false);
       expect(w === null || w.startsWith('· sys-proxy ')).toBe(true);
     }
-    // Only the three "nothing" cases are null; the table has four words plus setting….
-    expect(states.filter((state) => pillWord({ ...base, state }, false) === null)).toEqual(['unsupported', 'unknown']);
+    // Only the two "nothing" states are null; the table has four words plus setting….
+    expect(states.filter((state) => pillWord(at(state), false) === null)).toEqual(['unsupported', 'unknown']);
   });
 
   it('setting… wins over every state, including the ones that otherwise show nothing', () => {
@@ -278,5 +282,50 @@ describe('menuState — needs_privilege title and the precedence of the three ti
   it('showCopyEnv needs a non-empty guidance string, whatever the state', () => {
     expect(menuState({ ...off, guidance: 'export HTTP_PROXY=http://127.0.0.1:8080' }, false, 'agent').showCopyEnv).toBe(true);
     expect(menuState(off, false, 'operator').showCopyEnv).toBe(false); // the compact status has no guidance key at all
+  });
+});
+
+// ---- F-web (spec D15 amendment, 2026-11-01): the poll keeps the last guidance/remedy ----
+
+describe('mergeSystemProxy (the compact poll over the last full status)', () => {
+  const full: SystemProxyStatus = { ...unsupported, guidance: 'export HTTPS_PROXY=http://127.0.0.1:8080 HTTP_PROXY=http://127.0.0.1:8080' };
+  const withRemedy: SystemProxyStatus = { ...needsPrivilege, remedy: 'The system proxy needs an administrator.' };
+
+  it('keeps the previous guidance and remedy when the compact object carries none', () => {
+    const compact = parseSystemProxy({ state: 'unsupported', host: null, port: null, managed_by_us: false, setting: false, supported: false, detail: 'd2' });
+    expect(mergeSystemProxy(full, compact)).toEqual({ ...full, detail: 'd2' });
+    const compactNp = parseSystemProxy({ state: 'needs_privilege', host: null, port: null, managed_by_us: false, setting: false, supported: true, detail: 'HTTP and HTTPS off' });
+    expect(mergeSystemProxy(withRemedy, compactNp)?.remedy).toBe('The system proxy needs an administrator.');
+  });
+
+  it('takes every other field from the new object: the poll wins on state, endpoint, setting, detail', () => {
+    const compact = parseSystemProxy({ state: 'other', host: '10.0.0.1', port: 3128, managed_by_us: false, setting: true, supported: true, detail: 'elsewhere' });
+    expect(mergeSystemProxy(full, compact)).toEqual({ ...compact, guidance: full.guidance, remedy: null });
+  });
+
+  it('a new object that carries its own guidance/remedy replaces the old ones', () => {
+    const fresh: SystemProxyStatus = { ...full, guidance: 'export HTTPS_PROXY=http://127.0.0.1:9999' };
+    expect(mergeSystemProxy(full, fresh)?.guidance).toBe('export HTTPS_PROXY=http://127.0.0.1:9999');
+    expect(mergeSystemProxy(withRemedy, { ...withRemedy, remedy: 'r2' })?.remedy).toBe('r2');
+  });
+
+  it('with no previous status the new one is returned as parsed (null fields stay null)', () => {
+    const compact = parseSystemProxy({ state: 'off', detail: 'd' });
+    expect(mergeSystemProxy(null, compact)).toEqual(compact);
+    expect(mergeSystemProxy(null, compact)?.guidance).toBeNull();
+  });
+
+  it('a null new status is null: a malformed poll is not papered over with the old object', () => {
+    expect(mergeSystemProxy(full, null)).toBeNull();
+    expect(mergeSystemProxy(null, null)).toBeNull();
+  });
+
+  it('is pure: neither input is mutated', () => {
+    const prev = { ...full };
+    const next = parseSystemProxy({ state: 'unsupported', supported: false, detail: 'x' })!;
+    const nextCopy = { ...next };
+    mergeSystemProxy(prev, next);
+    expect(prev).toEqual(full);
+    expect(next).toEqual(nextCopy);
   });
 });

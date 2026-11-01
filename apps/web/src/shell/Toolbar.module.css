@@ -36,15 +36,22 @@
 .listen .mono {
   font-family: var(--font-data);
 }
-/* The pill as a <button> (system-proxy menu): same look, a hover wash, no outline or icon. */
+/* The pill as a <button> (system-proxy menu): the same look as the static pill, no icon beyond the
+   dot; hover lifts it to the active ground (the hover token equals the raised one in light mode).
+   The pill is clamped: the `other` endpoint comes from the OS and could be long, so it ellipsises
+   rather than pushing the Agent toggle out of the toolbar. */
 .listenButton {
   text-align: left;
   flex: 0 1 auto;
+  max-width: min(560px, 50vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   transition: background-color var(--motion-hover) ease;
 }
 @media (hover: hover) and (pointer: fine) {
   .listenButton:hover {
-    background: var(--color-ground-hover);
+    background: var(--color-ground-active);
   }
 }
 

@@ -1,6 +1,6 @@
 // The system-proxy pill word and menu state, as pure functions of `proxy.status.system_proxy`
-// (spec D6 fields, D12 word table, D15 web; plan C9). `app.ts` parses on poll and the toolbar
-// renders; nothing here touches the bus.
+// (spec D6 fields, D12 word table, D15 web; plan C9), and the merge the poll applies over the last
+// full status. `app.ts` parses on poll and the toolbar renders; nothing here touches the bus.
 
 import type { BusRole, SystemProxyState, SystemProxyStatus } from '~/bus/types';
 
@@ -47,7 +47,8 @@ export function pillWord(s: SystemProxyStatus | null, inFlight: boolean): string
     case 'points_at_us':
       return '· sys-proxy → us';
     case 'other':
-      return `· sys-proxy → ${s.host ?? '?'}:${s.port ?? '?'}`;
+      // The D12 row is `→ h:p`; an `other` without a complete endpoint has no row, so no word.
+      return s.host !== null && s.port !== null ? `· sys-proxy → ${s.host}:${s.port}` : null;
     case 'off':
       return '· sys-proxy off';
     case 'needs_privilege':
@@ -56,6 +57,21 @@ export function pillWord(s: SystemProxyStatus | null, inFlight: boolean): string
     case 'unknown':
       return null;
   }
+}
+
+/**
+ * The 2 s poll's compact object over the last status (spec D15, amended 2026-11-01): every field is
+ * the new object's, except that `guidance` and `remedy` are kept from `prev` when `next` carries
+ * none — the compact sub-object never does, and the full `proxy.system.status` read that set them
+ * must survive until the next menu open or a set/unset reply replaces it. A `null` next stays null.
+ */
+export function mergeSystemProxy(prev: SystemProxyStatus | null, next: SystemProxyStatus | null): SystemProxyStatus | null {
+  if (next === null) return null;
+  return {
+    ...next,
+    guidance: next.guidance ?? prev?.guidance ?? null,
+    remedy: next.remedy ?? prev?.remedy ?? null,
+  };
 }
 
 export interface SystemProxyMenuState {
@@ -81,7 +97,7 @@ export function menuState(s: SystemProxyStatus | null, inFlight: boolean, role: 
   if (inFlight || s?.setting) {
     disabled = true;
     title = 'setting system proxy…';
-  } else if (s?.state === 'unsupported' || (s !== null && !s.supported)) {
+  } else if (s !== null && !s.supported) {
     disabled = true;
     title = 'system proxy not available here';
   } else if (role !== 'operator') {

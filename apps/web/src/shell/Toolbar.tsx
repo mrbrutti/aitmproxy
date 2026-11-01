@@ -2,7 +2,10 @@
 // ⌘K · layout. Icons flat, 16px, secondary; nothing outlined except the Agent toggle and the
 // segmented control. The listening pill is a menu button (system-proxy spec D15): it appends the
 // D12 pill word after the address and opens the "Set as system proxy" menu; no icon beyond its dot.
-import { createSignal, Show, type Component } from 'solid-js';
+// Opening the menu asks the store for the full `proxy.system.status` (D15, amended 2026-11-01): the
+// polled compact object has no `guidance`/`remedy`, so the menu renders from it first and the "Copy
+// env line" item / the privilege remedy land when the full read arrives.
+import { createMemo, createSignal, Show, type Component } from 'solid-js';
 import { useApp } from '~/state/context';
 import type { AgentPolicy } from '~/state/app';
 import { Button } from '~/components/Button';
@@ -12,6 +15,7 @@ import { Popover } from '~/components/Popover';
 import { StatusDot } from '~/components/StatusDot';
 import { rectAnchor, type AnchorRect } from '~/components/floating';
 import { pluralize } from '~/lib/format';
+import { copyText } from '~/inspector/ui';
 import { menuState, pillWord } from '~/state/systemProxy';
 import css from './Toolbar.module.css';
 
@@ -78,7 +82,16 @@ export const Toolbar: Component = () => {
   const [sysMenu, setSysMenu] = createSignal<{ anchor: AnchorRect; kb: boolean } | null>(null);
 
   const dotHue = () => (app.proxy.armed ? 'armed' : app.proxy.listening ? 'success' : 'grey');
-  const sysWord = () => pillWord(app.proxy.systemProxy, app.proxy.systemProxySetting);
+  const sysWord = createMemo(() => pillWord(app.proxy.systemProxy, app.proxy.systemProxySetting));
+
+  /** Open the pill menu and ask for the full status (gated in the store on the tool being offered). */
+  const openSysMenu = (e: MouseEvent & { currentTarget: HTMLElement }) => {
+    setSysMenu({ anchor: rectAnchor(e.currentTarget.getBoundingClientRect()), kb: e.detail === 0 });
+    void app.refreshSystemProxy();
+  };
+
+  /** Copy the env line; a failure reaches the notice toast (D15), never the console. */
+  const copyEnvLine = (guidance: string) => void copyText(guidance).then((ok) => app.notice(ok ? 'Copied env line' : 'copy env line failed', ok ? 'info' : 'error'));
 
   /** The D15 menu: the checkbox from `menuState`, the `detail` line, and "Copy env line" when `guidance` is present. */
   const sysItems = () => {
@@ -94,7 +107,7 @@ export const Toolbar: Component = () => {
         onSelect: () => void (m.checked ? app.unsetSystemProxy() : app.setSystemProxy()),
       },
       ...(status && status.detail ? [{ label: status.detail, disabled: true }] : []),
-      ...(m.showCopyEnv && guidance ? [{ label: 'Copy env line', onSelect: () => void navigator.clipboard.writeText(guidance) }] : []),
+      ...(m.showCopyEnv && guidance ? [{ label: 'Copy env line', title: guidance, onSelect: () => copyEnvLine(guidance) }] : []),
     ];
   };
 
@@ -126,7 +139,7 @@ export const Toolbar: Component = () => {
         title="System proxy"
         aria-haspopup="menu"
         aria-expanded={sysMenu() != null}
-        onClick={(e) => setSysMenu({ anchor: rectAnchor(e.currentTarget.getBoundingClientRect()), kb: e.detail === 0 })}
+        onClick={openSysMenu}
       >
         <StatusDot hue={dotHue()} />
         <span role="status" aria-live="polite">
@@ -136,7 +149,7 @@ export const Toolbar: Component = () => {
             <b class={css.mono}>{app.proxy.address}</b>
           </Show>
           <Show when={app.proxy.protocol}> · {app.proxy.protocol}</Show>
-          <Show when={sysWord()}> {sysWord()}</Show>
+          <Show when={sysWord()}>{(w) => <> {w()}</>}</Show>
           <Show when={app.proxy.armed}> · intercept armed</Show>
         </span>
       </button>

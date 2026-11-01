@@ -11,7 +11,7 @@ import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js
 import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, PocRun, StateNotification, SystemProxyStatus, ToolDef } from '~/bus/types';
 import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
 import { isUiPollNoise, ownOriginOf } from '~/bus/noise';
-import { parseSystemProxy } from './systemProxy';
+import { mergeSystemProxy, parseSystemProxy } from './systemProxy';
 import {
   contentFamily,
   type ContentFamily,
@@ -705,7 +705,8 @@ export function createAppStore(bus: BusClient) {
           address: s.address ?? proxy.address,
           version: typeof s.version === 'string' ? s.version : proxy.version,
           // Always null, never undefined, when absent: a Solid store drops a key set to undefined.
-          systemProxy: parseSystemProxy(s.system_proxy),
+          // The compact object has no guidance/remedy: the last full read's survive it (spec D15).
+          systemProxy: mergeSystemProxy(proxy.systemProxy, parseSystemProxy(s.system_proxy)),
         });
       } catch {
         /* next tick */
@@ -895,7 +896,7 @@ export function createAppStore(bus: BusClient) {
                 armed: typeof s.intercept_armed === 'boolean' ? s.intercept_armed : proxy.armed,
                 // The binary's version; a core older than the field sends none, and nothing is better than a guess.
                 version: typeof s.version === 'string' ? s.version : proxy.version,
-                systemProxy: parseSystemProxy(s.system_proxy),
+                systemProxy: mergeSystemProxy(proxy.systemProxy, parseSystemProxy(s.system_proxy)),
               }),
             )
             .catch(() => {}),
@@ -1219,6 +1220,18 @@ export function createAppStore(bus: BusClient) {
       }
     }
 
+    /**
+     * The full status read the pill menu asks for when it opens (spec D15, amended 2026-11-01): the
+     * compact `proxy.status` sub-object has no `guidance`/`remedy`, so "Copy env line" and the
+     * privilege remedy come only from here. Gated on the tool being offered. A reply that is not a
+     * status object keeps what the poll already stored rather than wiping the pill.
+     */
+    async function refreshSystemProxy(): Promise<void> {
+      if (!proxy.tools.some((t) => t.name === 'proxy.system.status')) return;
+      const full = parseSystemProxy(await bus.call<unknown>('proxy.system.status'));
+      if (full) setProxy('systemProxy', full);
+    }
+
     const actions = {
       select,
       setSelection,
@@ -1397,6 +1410,7 @@ export function createAppStore(bus: BusClient) {
       // timeout here: `ws.ts` has none and a set can take a couple of seconds of `networksetup`.
       setSystemProxy: () => guarded('system proxy', () => systemProxyChange('proxy.system.set', {})),
       unsetSystemProxy: () => guarded('system proxy', () => systemProxyChange('proxy.system.unset')),
+      refreshSystemProxy: () => guarded('system proxy', refreshSystemProxy),
       clear: () =>
         guarded('clear', async () => {
           await bus.call('flow.clear');

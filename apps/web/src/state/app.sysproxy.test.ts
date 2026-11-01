@@ -22,6 +22,8 @@ interface SysCtl {
   status: unknown;
   /** The reply to `proxy.system.set` / `proxy.system.unset` (the full D6 status object plus `changed`/`commands`). */
   reply: unknown;
+  /** The reply to `proxy.system.status` (the full D6 object, `guidance`/`remedy` included). */
+  full: unknown;
   /** Held until released: the verb's reply is delayed, so the in-flight flag can be observed. */
   hold: Promise<void> | null;
   /** When set, the verb rejects with this `BusError` message (the core's refusal). */
@@ -36,25 +38,31 @@ type SysBus = TestBus & { sys: SysCtl };
  * The bridge-shaped bus with `system_proxy` on `proxy.status` and the two mutating verbs answered.
  * `{ absent: true }` is a core older than the field: `proxy.status` carries no `system_proxy` at all.
  */
-function sysproxyBus(opts: { status?: unknown; absent?: boolean } = {}): SysBus {
+function sysproxyBus(opts: { status?: unknown; absent?: boolean; statusTool?: boolean } = {}): SysBus {
   const bus = bridgeBus() as SysBus;
   const status = opts.absent ? undefined : (opts.status ?? POINTS_AT_US);
-  const sys: SysCtl = { status, reply: { ...POINTS_AT_US, changed: true, commands: [] }, hold: null, fail: null, calls: [] };
+  const sys: SysCtl = { status, reply: { ...POINTS_AT_US, changed: true, commands: [] }, full: { ...POINTS_AT_US, guidance: null, remedy: null }, hold: null, fail: null, calls: [] };
   const inner = bus.call.bind(bus);
   bus.call = async <T,>(tool: string, args: Record<string, unknown> = {}): Promise<T> => {
     if (tool === 'proxy.status') {
       const s = (await inner<Record<string, unknown>>(tool, args)) ?? {};
       return (sys.status === undefined ? s : { ...s, system_proxy: sys.status }) as T;
     }
-    if (tool === 'proxy.system.set' || tool === 'proxy.system.unset') {
+    if (tool === 'proxy.system.set' || tool === 'proxy.system.unset' || tool === 'proxy.system.status') {
       sys.calls.push({ tool, args });
       await new Promise((r) => setTimeout(r, 5)); // the loopback round trip, like the testkit's
       if (sys.hold) await sys.hold;
       if (sys.fail) throw new BusError(sys.fail);
-      return sys.reply as T;
+      return (tool === 'proxy.system.status' ? sys.full : sys.reply) as T;
     }
     return inner<T>(tool, args);
   };
+  // The three verbs are in the catalogue (a core with the feature); `statusTool: false` is a core without the read.
+  const innerTools = bus.tools.bind(bus);
+  bus.tools = async () => [
+    ...(await innerTools()),
+    ...['proxy.system.set', 'proxy.system.unset', ...(opts.statusTool === false ? [] : ['proxy.system.status'])].map((name) => ({ name, description: `${name} (test bus)`, inputSchema: { type: 'object' as const, properties: {} } })),
+  ];
   bus.sys = sys;
   return bus;
 }
@@ -302,5 +310,109 @@ describe('app store — system proxy edge cases (tester)', () => {
     await tick(6100);
     expect(app.toast()).toBeNull();
     expect(app.proxy.systemProxySetting).toBe(false);
+  });
+});
+
+// ---- F-web (spec D15 amendment, 2026-11-01): the menu-open full read and what the poll keeps ----
+
+const UNSUPPORTED = { state: 'unsupported', host: null, port: null, managed_by_us: false, setting: false, supported: false, detail: 'no system proxy mechanism on this host' };
+const ENV_LINE = 'export HTTPS_PROXY=http://127.0.0.1:8080 HTTP_PROXY=http://127.0.0.1:8080';
+const NEEDS_ADMIN = { state: 'needs_privilege', host: null, port: null, managed_by_us: false, setting: false, supported: true, detail: 'HTTP and HTTPS off' };
+const REMEDY = 'The system proxy needs an administrator; run the core as one.';
+
+describe('app store — refreshSystemProxy (the full read on menu open)', () => {
+  it('calls proxy.system.status and stores the full object, guidance included', async () => {
+    const { bus, app } = start(sysproxyBus({ status: UNSUPPORTED }));
+    await tick(200);
+    expect(app.proxy.systemProxy?.state).toBe('unsupported');
+    expect(app.proxy.systemProxy?.guidance).toBeNull(); // the compact poll has none
+    bus.sys.full = { ...UNSUPPORTED, guidance: ENV_LINE, remedy: null, mechanism: 'none', services: [] };
+
+    const done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(bus.sys.calls).toEqual([{ tool: 'proxy.system.status', args: {} }]);
+    expect(app.proxy.systemProxy?.guidance).toBe(ENV_LINE);
+    expect(app.proxy.systemProxy?.state).toBe('unsupported');
+    expect(app.proxy.systemProxySetting).toBe(false); // a read is not a change
+    expect(app.toast()).toBeNull();
+  });
+
+  it('the 2 s poll after it keeps guidance and remedy, and still follows the compact fields', async () => {
+    const { bus, app } = start(sysproxyBus({ status: NEEDS_ADMIN }));
+    await tick(200);
+    bus.sys.full = { ...NEEDS_ADMIN, guidance: null, remedy: REMEDY };
+    const done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+    expect(app.proxy.systemProxy?.remedy).toBe(REMEDY);
+    const statuses = bus.count('proxy.status');
+
+    bus.sys.status = { ...NEEDS_ADMIN, detail: 'HTTP off, HTTPS off' };
+    await tick(2500);
+
+    expect(bus.count('proxy.status')).toBeGreaterThan(statuses);
+    expect(app.proxy.systemProxy?.remedy).toBe(REMEDY);
+    expect(app.proxy.systemProxy?.detail).toBe('HTTP off, HTTPS off');
+    expect(app.proxy.systemProxy?.guidance).toBeNull();
+  });
+
+  it('a set/unset reply replaces the kept guidance/remedy (the full object is authoritative)', async () => {
+    const { bus, app } = start(sysproxyBus({ status: NEEDS_ADMIN }));
+    await tick(200);
+    bus.sys.full = { ...NEEDS_ADMIN, remedy: REMEDY };
+    let done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+    expect(app.proxy.systemProxy?.remedy).toBe(REMEDY);
+    bus.sys.reply = { ...POINTS_AT_US, guidance: null, remedy: null, changed: true, commands: [] };
+
+    done = app.setSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(app.proxy.systemProxy?.state).toBe('points_at_us');
+    expect(app.proxy.systemProxy?.remedy).toBeNull();
+  });
+
+  it('does nothing on a core that does not offer proxy.system.status', async () => {
+    const { bus, app } = start(sysproxyBus({ status: UNSUPPORTED, statusTool: false }));
+    await tick(200);
+
+    const done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(bus.sys.calls).toEqual([]);
+    expect(app.proxy.systemProxy?.state).toBe('unsupported');
+    expect(app.proxy.systemProxy?.guidance).toBeNull();
+    expect(app.toast()).toBeNull();
+  });
+
+  it('a refused read keeps the compact status and reaches the toast as an error', async () => {
+    const { bus, app } = start(sysproxyBus({ status: UNSUPPORTED }));
+    await tick(200);
+    bus.sys.fail = 'proxy.system.status: bus closed (1006)';
+
+    const done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(app.proxy.systemProxy?.state).toBe('unsupported');
+    expect(app.toast()).toEqual({ text: 'system proxy: proxy.system.status: bus closed (1006)', kind: 'error' });
+  });
+
+  it('a reply that is not a status object keeps the compact status rather than wiping it', async () => {
+    const { bus, app } = start(sysproxyBus({ status: UNSUPPORTED }));
+    await tick(200);
+    bus.sys.full = 'ok';
+
+    const done = app.refreshSystemProxy();
+    await tick(50);
+    await done;
+
+    expect(app.proxy.systemProxy?.state).toBe('unsupported');
+    expect(app.toast()).toBeNull();
   });
 });

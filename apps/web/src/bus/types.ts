@@ -158,8 +158,10 @@ export interface SystemProxyStatus {
   /** `mechanism != none`. */
   supported: boolean;
   detail: string;
-  guidance?: string | null;
-  remedy?: string | null;
+  /** The env-var line when `unsupported`; the parser sets null when the object carries none (the compact one never does). */
+  guidance: string | null;
+  /** The privilege sentence when `needs_privilege`; null otherwise or when absent. */
+  remedy: string | null;
 }
 
 export class BusError extends Error {
