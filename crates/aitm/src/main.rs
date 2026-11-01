@@ -418,7 +418,13 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     // `ws.*` host fn is guarded: a script cannot reach a host outside scope or past
     // the rate limit. `None` while track T4 is unimplemented, and a `None` slot adds
     // no language — the engine then has no `ws.*` namespace (deny-by-default).
-    let ws_language = aitm_scan_ws::language(handles.clone());
+    // It dials under the SAME certificate policy as the WS *lane*
+    // (`wire::collect_lanes_with`): `aitm::wire::ws_tls_policy(&cfg)` maps the
+    // operator's `ssl_insecure` onto `TlsPolicy`, so a self-signed `wss://` lab
+    // target behaves the same whether a script or a scan reached it. The default
+    // (`ssl_insecure: false`) verifies the chain against the webpki roots.
+    let ws_language =
+        aitm_scan_ws::language::build_with(handles.clone(), aitm::wire::ws_tls_policy(&cfg));
     let mut languages: Vec<&dyn aitm_plugin::language::ProtocolLanguage> = Vec::new();
     if let Some(lang) = &l4_language {
         languages.push(lang);

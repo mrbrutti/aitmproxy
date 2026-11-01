@@ -40,6 +40,7 @@ use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::{L4Module, L4Privilege};
 use aitm_proto_ws::{InjectRegistry, WsModule};
 use aitm_scan_model::CheckRegistry;
+use aitm_scan_ws::types::TlsPolicy;
 use aitm_sysproxy::plugin::SysProxyPlugin;
 use aitm_sysproxy::{SystemProxy, SystemProxyConfig};
 use tracing::{info, warn};
@@ -147,19 +148,61 @@ impl Default for Features {
 /// is `None` and both handles are passed as `None`; a landed L4 lane still returns
 /// `Some` then, so the refusal is `refused_l4` rather than `lane_unavailable`
 /// (spec D3's refusal order).
+///
+/// The WebSocket lane dials with [`TlsPolicy::Verify`] here; the binary selects
+/// the operator's posture with [`collect_lanes_with`] and [`ws_tls_policy`].
 #[must_use]
 pub fn collect_lanes(l4: Option<&L4Shared>) -> Vec<Arc<dyn aitm_scan_model::Lane>> {
+    collect_lanes_with(l4, TlsPolicy::Verify)
+}
+
+/// [`collect_lanes`], with the certificate policy the WebSocket lane dials with.
+///
+/// `aitm-scan-ws` verifies upstream certificates against the webpki roots by
+/// default, so a self-signed `wss://` lab target answers `Inconclusive` (the
+/// TLS handshake never completes) unless the operator's `ssl_insecure` is
+/// passed down. This is the sibling that passes it: `collect_lanes` keeps its
+/// one-argument signature (and its default-secure posture) for every caller
+/// that has no `Config` to read, and assembly calls this one with
+/// `ws_tls_policy(cfg)`. The other three slots take no TLS policy — the HTTP
+/// lane dials through `aitm-proto-http`'s sender, which already reads
+/// `cfg.ssl_insecure`, and the two L4 slots are below TLS.
+#[must_use]
+pub fn collect_lanes_with(
+    l4: Option<&L4Shared>,
+    ws_tls: TlsPolicy,
+) -> Vec<Arc<dyn aitm_scan_model::Lane>> {
     let guard = l4.map(|shared| shared.guard.clone());
     let store = l4.map(|shared| shared.store.clone());
     [
         aitm_scan_http::lane(),
-        aitm_scan_ws::lane(),
+        aitm_scan_ws::lane::build_with(ws_tls),
         aitm_scan_l4_packet::lane(guard.clone(), store.clone()),
         aitm_scan_l4_stream::lane(guard, store),
     ]
     .into_iter()
     .flatten()
     .collect()
+}
+
+/// The certificate policy scanner v2's WebSocket lane and `ws.*` script
+/// language dial with, for `cfg`.
+///
+/// `ssl_insecure: false` (the default) is [`TlsPolicy::Verify`]: the chain is
+/// checked against the webpki roots, exactly the posture `HttpModule`'s
+/// `with_insecure(cfg.ssl_insecure)` has. `ssl_insecure: true` is
+/// [`TlsPolicy::AcceptAny`]: chain validation is skipped (the handshake
+/// signature is still verified) so a lab of self-signed targets is reachable.
+/// One switch, both faces — the lane ([`collect_lanes_with`]) and the `ws.*`
+/// language (`main.rs`) — so a `wss://` target does not behave differently
+/// depending on which one reached it.
+#[must_use]
+pub fn ws_tls_policy(cfg: &Config) -> TlsPolicy {
+    if cfg.ssl_insecure {
+        TlsPolicy::AcceptAny
+    } else {
+        TlsPolicy::Verify
+    }
 }
 
 /// The native (compiled-in) scanner v2 checks this build ships (spec D1).
@@ -479,7 +522,10 @@ pub fn assemble_with_scripts(
     // into the first once the proxy exists, and the second is how the assembled
     // engine is read back.
     let scanner = ScannerPlugin::new(scanner_cfg)
-        .with_lanes(collect_lanes(features.l4_shared.as_ref()))
+        .with_lanes(collect_lanes_with(
+            features.l4_shared.as_ref(),
+            ws_tls_policy(cfg),
+        ))
         .with_native_checks(collect_native_checks())
         .with_script_checks(scripts.script_checks.clone().unwrap_or_default());
     let scan_late = scanner.late();
@@ -1125,6 +1171,37 @@ mod tests {
             store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
         };
         assert_eq!(collect_lanes(Some(&shared)).len(), 1);
+    }
+
+    /// Task 19 (T4 hand-off): the operator's `ssl_insecure` reaches the WS
+    /// lane's dialer. The lane verifies upstream certificates by default, so a
+    /// self-signed `wss://` lab target is Inconclusive unless the binary
+    /// selects `TlsPolicy::AcceptAny`. `dyn Lane` exposes nothing about its
+    /// transport (`TcpTransport::tls_policy` is `pub(crate)` in
+    /// `aitm-scan-ws`), so the assertion is on the policy this module hands the
+    /// builder, plus the fact that the insecure build is still the one `ws`
+    /// lane.
+    #[test]
+    fn the_ws_lane_receives_ssl_insecure() {
+        use aitm_scan_model::LaneKind;
+
+        let mut cfg = Config::default();
+        assert_eq!(
+            ws_tls_policy(&cfg),
+            TlsPolicy::Verify,
+            "the default posture"
+        );
+
+        cfg.ssl_insecure = true;
+        assert_eq!(
+            ws_tls_policy(&cfg),
+            TlsPolicy::AcceptAny,
+            "ssl_insecure: true relaxes the WS lane's chain validation"
+        );
+
+        let lanes = collect_lanes_with(None, ws_tls_policy(&cfg));
+        assert_eq!(lanes.len(), 1);
+        assert_eq!(lanes[0].lane(), LaneKind::Ws);
     }
 
     /// A check that sends nothing, standing in for one a Rhai `reg.add_check`
