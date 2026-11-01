@@ -202,6 +202,9 @@ Kept by the main session during stage 6. One row per finding. The Task 3 row rec
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 1 | orchestrator (Linux rig run 1, 2026-11-01) | Critical, pre-existing | `send_recv` on loopback reads its own injected stimulus from the capture and `FiveTuple` classifies it `Other`, ending the await before the real reply (tcpdump: 21 frames, all ours, no ICMP); the lane recorded `ProtocolError` for every case; the echo test passed on verdicts alone | fixed in 19108a50 (restored byte-for-byte as a354209f: direction-based `is_own_stimulus` plus byte equality, every `ReplyMatch` mode; a portless stimulus compares addresses only when src != dst so a loopback ICMP echo reply is not swallowed), 284e61e8 (the mock self-echoes by default: 32 lane tests go red without the fix), 3a4c57fd (`choose_src_port` skips the target port), dae2d21b (live tests assert class histograms; the SKIP line names the product's helper) |
+| 1 | orchestrator | note | the plan commit 1d356ccf swept the coder's staged pre-fix `sendrecv.rs` revert because the orchestrator committed the whole index after staging only the plan | restored in a354209f; every orchestrator commit now names its paths explicitly and coders leave nothing staged between commits |
+| 5 | coder (Task 5 report) | note | the plan's Linux SKIP literal forbids any `sudo`/`setcap` text under `tests/e2e/`, so the brief's wording was not used; ChmodBPF mentions remain in `tests/e2e/l4/*` (other tracks' cells) | accepted: `tests/e2e/l4/*` is not T5's; recorded as a follow-up for the L4 parity owner |
 
 ## Shipped
 
