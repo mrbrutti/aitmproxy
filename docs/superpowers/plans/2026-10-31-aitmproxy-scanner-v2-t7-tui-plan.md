@@ -750,6 +750,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | fix round | done | H66 `cb2a836d`, H68 `3086cfda`, H67 `ffdc6bd5`, H69 `baadb193`, H73 tests `b2165007`; crate gate green (540 tests); Rust final pending Task 16 | Task 16 after run 6 |
 | H (Rust) | coder note | Minor | H66 clearing in `ScanState` wrappers (`app.rs` call sites switched); a job never listed has not left; list-reported terminal clears too | ratified; D13 letter |
 | H (Rust) | coder note | note | H73 not a TUI defect: the cell's post-`g` read raced Home | H74 (cell); the order tests stay as pins |
+| H (cell) | fix round | done | H70-H72 in `461ad9e3`; `--selftest` 63 ok; markers verified against the Rust literals and read back from source | H74 next, then run 6 |
 
 ## Shipped
 

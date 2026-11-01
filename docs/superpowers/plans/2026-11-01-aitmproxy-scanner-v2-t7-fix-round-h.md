@@ -165,6 +165,8 @@ H73 (Rust). Enter on the Site map node whose row read `POST /login` opened the `
 
 H74 (cell). After `g` in T7-19 the cell read the stale `>` row before Home was processed: poll until the cursor row differs from the walk's last row (or equals the group-first node) before reading `under`; the same discipline wherever a key moves the cursor and the next read depends on it.
 
+**Cell H70-H72 result (2026-11-01):** done in `461ad9e3` (+359/-63); `--selftest` 63 ok with four mutation checks. H71 found no stale marker; the self-test now paints footers from Python mirrors of the five Rust key tables and reads the tables back from the Rust source (a renamed key fails the self-test without a core). Ratified: the landing wait lives in `launch()` with the outcome in `ctx.landed`; the Rust read-back row stays (the cell lives in-repo); self-test vocabulary values corrected to the live literals. H74 follows in the same coder's resumed run.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
