@@ -64,7 +64,8 @@ use crate::crawl::frontier::{
 };
 use crate::crawl::values::{chosen_fields, form_action, value_for};
 use crate::limits::{
-    job_mark, MARK_CRAWL, MAX_CLICKABLES_LISTED, MAX_DOM_BYTES, SETTLE_MAX_MS, SETTLE_POLL_MS,
+    job_mark, MARK_CRAWL, MAX_CLICKABLES_LISTED, MAX_DOM_BYTES, MAX_STORED_FLOWS, SETTLE_MAX_MS,
+    SETTLE_POLL_MS,
 };
 use crate::redact::{safe_url, scrub_error};
 use crate::session::{browser_cookie_statements, browser_partial};
@@ -124,7 +125,7 @@ impl StoreDiff {
 
     /// Mark every HTTP flow added since the snapshot whose request addresses
     /// `origin`, and return those flows as the store now holds them, each as a
-    /// [`held_copy`] with its response body bounded (S-I3).
+    /// [`held_copy`] without its response body (S-I3, R-M3).
     ///
     /// Every id this call sees joins the running set, so the next call on the
     /// same page reports only what arrived after it. Marks are a union: a
@@ -1061,12 +1062,24 @@ impl<'a> Run<'a> {
     }
 
     /// Mark what the last action on this page captured and keep those flows
-    /// for the lane.
+    /// for the lane, at most [`MAX_STORED_FLOWS`] of them, oldest dropped
+    /// (R-M3): every capture is marked in the store regardless, and the lane
+    /// reads only the request of each held copy.
     fn collect(&mut self) {
         let produced = self
             .page_diff
             .mark_new(self.store.as_ref(), self.origin, &self.marks);
         self.report.flows.extend(produced);
+        let excess = self.report.flows.len().saturating_sub(MAX_STORED_FLOWS);
+        if excess > 0 {
+            self.report.flows.drain(..excess);
+            tracing::debug!(
+                target: "scan",
+                job = self.job.job_id(),
+                dropped = excess,
+                "crawl: the report holds its newest flows only; oldest dropped"
+            );
+        }
     }
 
     /// The finished report, with the stop reason the run arrived at.
@@ -1110,7 +1123,7 @@ mod tests {
     use url::Url;
 
     use crate::crawl::frontier::{limits_for, Crawler};
-    use crate::limits::{MAX_CLICKABLES_LISTED, MAX_HELD_CRAWL_BODY};
+    use crate::limits::{MAX_CLICKABLES_LISTED, MAX_STORED_FLOWS};
     use crate::testutil::{
         captured_flow, request, response, FakeBrowser, FakeJob, LiveFormScript, PageScript,
         ScriptedClient, CLICKABLES_MARKER, SUBMIT_FORM_MARKER, TAG_FORM_MARKER,
@@ -1620,13 +1633,13 @@ mod tests {
         assert_eq!(report.forms_skipped, 0);
     }
 
-    // --- S-I3: the report holds bounded copies, the store the real flow -------
+    // --- S-I3 / R-M3: the report holds request-only copies, the store the real flow
 
-    /// A page whose capture carries a 200 KiB response: the report's copy is
-    /// cut to `MAX_HELD_CRAWL_BODY` (the lane reads only the request), while
-    /// the flow in the store keeps every byte.
+    /// A page whose capture carries a 200 KiB response: the report's copy
+    /// drops the response body outright (nobody reads it: the lane enumerates
+    /// `flow.request` only), while the flow in the store keeps every byte.
     #[tokio::test]
-    async fn held_flows_truncate_response_bodies() {
+    async fn held_flows_drop_response_bodies() {
         let big = vec![b'x'; 200 * 1024];
         let store = Arc::new(MemFlowStore::new());
         let browser = Arc::new(
@@ -1648,11 +1661,15 @@ mod tests {
 
         assert_eq!(report.flows.len(), 1);
         let held = &report.flows[0];
-        let Some(aitm_core::Body::Bytes(held_body)) = held.response.as_ref().map(|r| &r.body)
-        else {
-            panic!("the held flow keeps a bytes body");
-        };
-        assert_eq!(held_body.len(), MAX_HELD_CRAWL_BODY);
+        let response = held
+            .response
+            .as_ref()
+            .expect("the held copy keeps its status");
+        assert_eq!(response.status, 200);
+        assert!(
+            matches!(response.body, aitm_core::Body::Empty),
+            "the held copy carries no response body"
+        );
         assert_eq!(held.metadata.marks, marks());
 
         let Some(Flow::Http(stored)) = store.get(held.id) else {
@@ -1664,6 +1681,46 @@ mod tests {
         };
         assert_eq!(stored_body.len(), big.len());
         assert_eq!(stored.metadata.marks, marks());
+    }
+
+    /// A page whose load captures more flows than `MAX_STORED_FLOWS`: the
+    /// report keeps the newest `MAX_STORED_FLOWS` and drops the oldest (R-M3),
+    /// while every capture is still marked in the store.
+    #[tokio::test]
+    async fn browser_report_flows_are_capped_at_max_stored_flows() {
+        let extra = 3;
+        let captures: Vec<_> = (0..MAX_STORED_FLOWS + extra)
+            .map(|i| request("GET", &format!("http://t:8080/c/{i}"), &[], None))
+            .collect();
+        let store = Arc::new(MemFlowStore::new());
+        let browser = Arc::new(
+            FakeBrowser::new(vec![(
+                ROOT,
+                PageScript::new("<html><body>many</body></html>").with_captures(captures),
+            )])
+            .recording_into(store.clone() as Arc<dyn FlowStore>),
+        );
+        let job = job_with(browser, store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        assert_eq!(report.flows.len(), MAX_STORED_FLOWS);
+        assert_eq!(report.flows[0].request.path, format!("/c/{extra}"));
+        assert_eq!(
+            report.flows[MAX_STORED_FLOWS - 1].request.path,
+            format!("/c/{}", MAX_STORED_FLOWS + extra - 1)
+        );
+        assert_eq!(store.count(), MAX_STORED_FLOWS + extra);
+        for id in store.list() {
+            let Some(Flow::Http(flow)) = store.get(id) else {
+                panic!("the double stores HTTP flows");
+            };
+            assert_eq!(flow.metadata.marks, marks(), "flow {id:?}");
+        }
     }
 
     #[tokio::test]

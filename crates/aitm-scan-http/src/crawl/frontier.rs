@@ -19,7 +19,7 @@ use url::Url;
 use crate::hash::fnv1a64;
 use crate::limits::{
     CLICKS_PER_PAGE_NORMAL, CLICKS_PER_PAGE_THOROUGH, FORMS_PER_PAGE_NORMAL,
-    FORMS_PER_PAGE_THOROUGH, MAX_AWAIT, MAX_FRONTIER, MAX_HELD_CRAWL_BODY,
+    FORMS_PER_PAGE_THOROUGH, MAX_AWAIT, MAX_FRONTIER,
 };
 use crate::url_norm::page_key;
 
@@ -371,19 +371,18 @@ impl fmt::Debug for CrawlReport {
     }
 }
 
-/// The flow as a [`CrawlReport`] keeps it: the response body cut to
-/// [`MAX_HELD_CRAWL_BODY`], so a crawl of a few hundred large pages cannot
-/// grow the job's memory for the life of discovery (S-I3).
+/// The flow as a [`CrawlReport`] keeps it: the response body dropped, so a
+/// crawl of a few hundred large pages cannot grow the job's memory for the
+/// life of discovery (S-I3, R-M3).
 ///
 /// Both engines hold their produced flows through this one function. The
 /// stored flow (recorded by the client, or captured through the proxy) is
 /// untouched; this copy only feeds the site-map builder, which reads the
-/// request alone.
+/// request alone, so nothing is lost by holding no body at all. The response
+/// status and headers stay.
 pub(crate) fn held_copy(mut flow: HttpFlow) -> HttpFlow {
     if let Some(response) = flow.response.as_mut() {
-        if let Body::Bytes(bytes) = &mut response.body {
-            bytes.truncate(MAX_HELD_CRAWL_BODY);
-        }
+        response.body = Body::Empty;
     }
     flow
 }

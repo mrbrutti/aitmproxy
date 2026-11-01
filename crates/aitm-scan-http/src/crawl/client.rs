@@ -540,7 +540,6 @@ mod tests {
     use aitm_scan_model::{CrawlStrategy, ScanProfile, SessionMaterial, UseBrowser};
 
     use crate::crawl::frontier::limits_for;
-    use crate::limits::MAX_HELD_CRAWL_BODY;
     use crate::testutil::{site, FakeJob, JOB_ID};
     use crate::url_norm::parse_absolute;
 
@@ -763,8 +762,8 @@ mod tests {
     // --- tester additions (stage 5, whole branch) ----------------------------
 
     /// A body not declared HTML, or one over `MAX_DOM_BYTES`, is counted as a
-    /// page but never mined for links, and the report's held copies stay under
-    /// `MAX_HELD_CRAWL_BODY`.
+    /// page but never mined for links, and the report's held copies carry no
+    /// response body at all (R-M3).
     #[tokio::test]
     async fn non_html_and_oversized_bodies_are_not_mined() {
         let huge = format!(
@@ -814,26 +813,26 @@ mod tests {
         );
         assert_eq!(report.pages, 3);
         assert_eq!(report.flows.len(), 3);
+        // S-I3 / R-M3: every held copy keeps its status and drops its response
+        // body (the lane reads only the request); the stored flow keeps every
+        // byte.
         for flow in &report.flows {
-            if let Some(Body::Bytes(bytes)) = flow.response.as_ref().map(|r| &r.body) {
-                assert!(
-                    bytes.len() <= MAX_HELD_CRAWL_BODY,
-                    "a held body of {} bytes",
-                    bytes.len()
-                );
-            }
+            let response = flow
+                .response
+                .as_ref()
+                .expect("the held copy keeps its status");
+            assert!(
+                matches!(response.body, Body::Empty),
+                "{} carries a held response body",
+                flow.request.path
+            );
         }
-        // S-I3 (tester): the oversized page is cut to exactly the bound, not
-        // merely under it, and the stored flow keeps every byte.
         let held = report
             .flows
             .iter()
             .find(|flow| flow.request.path == "/huge")
             .expect("the huge page was held");
-        let Some(Body::Bytes(held_body)) = held.response.as_ref().map(|r| &r.body) else {
-            panic!("the held flow keeps a bytes body");
-        };
-        assert_eq!(held_body.len(), MAX_HELD_CRAWL_BODY);
+        assert_eq!(held.response.as_ref().map(|r| r.status), Some(200));
         let Some(Flow::Http(stored)) = store.get(held.id) else {
             panic!("the store holds the huge page");
         };
