@@ -487,7 +487,7 @@ Shared facts for every coder:
 - **Depends on:** Tasks 4, 5, 6.
 - **Files:** `crates/aitm-scan-model/src/results.rs` (replace placeholder).
 - **Change:** result types (`#[serde(default)]` where a field is optional; tolerant of unknown keys):
-  `StartResult { job: JobId, status: JobStatus, clamped: Vec<Clamped>, lanes: LaneReport }` (`scan.start`, `scan.map`);
+  `StartResult { job: JobId, status: JobStatus, clamped: Vec<Clamped>, lanes: LaneReport, dry_run: Option<bool> }` (`scan.start`, `scan.map`; `dry_run` is `skip_serializing_if = None` and set only for profiles with an L4 lane, spec D3/D8.4);
   `ListResult { jobs: Vec<JobSummary> }`; `IssuesResult { issues: Vec<IssueSummary>, next_cursor: Option<String>, by_severity: BySeverity }`;
   `SitemapResult { nodes: Vec<SiteNode>, points: Vec<InsertionPoint>, next_cursor: Option<String> }`;
   `ChecksResult { checks: Vec<CheckMeta> }`;
@@ -690,7 +690,9 @@ Shared facts for every coder:
 | 9 | `crates/aitm-scan-model/fixtures/**`, `crates/aitm-scan-model/tests/fixtures.rs` |
 | 10 | `Cargo.toml` (root, after Task 1), `crates/aitm-scan-{http,checks-http,ws,l4-packet,l4-stream}/**` |
 | 11 | `crates/aitm/{Cargo.toml, src/wire.rs, src/main.rs}`, `crates/aitm-plugin-scanner/{Cargo.toml, src/plugin.rs}` |
-| 12 | none (merge + proof) |
+| 12 | none (merge + proof); may regenerate `Cargo.lock` after the merge |
+
+`Cargo.lock` is a derived file: Tasks 1, 10 and 11 regenerate it as a mechanical consequence of their manifest edits (new members and dependency edges only; no external crate enters it in T1a), and Task 12 regenerates it after merging `origin/main`.
 
 Within a wave no two tasks share a file. The root `Cargo.toml` is edited by Task 1 (wave 1)
 and Task 10 (wave 4), sequentially.
