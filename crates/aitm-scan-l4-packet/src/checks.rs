@@ -97,8 +97,6 @@ pub fn reaction_meta() -> CheckMeta {
 ///
 /// Both share the lane's one registry, so either may be the check that drives
 /// a point's cases.
-// Task 11's `PacketLane::new` is the first caller; until it lands this is only
-// reached from this module's tests.
 #[must_use]
 pub fn checks(registry: Arc<RunnerRegistry>) -> Vec<Arc<dyn Check>> {
     vec![

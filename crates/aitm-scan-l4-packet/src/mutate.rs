@@ -1422,7 +1422,7 @@ mod tests {
         use aitm_scan_model::vocab::L4Transport;
 
         use crate::fields::{default_fields, IpVersion};
-        use crate::plan::{seed_spec, LinkFraming};
+        use crate::plan::{seed_spec, LinkFraming, ResolvedTarget};
 
         let full_mtu = vec![0x41u8; 1472];
         let payloads: [&[u8]; 3] = [b"", b"probe", full_mtu.as_slice()];
@@ -1437,17 +1437,17 @@ mod tests {
                 for framing in [LinkFraming::Null, LinkFraming::Ethernet] {
                     for payload in payloads {
                         let shape = format!("{ip:?}/{transport:?}/{framing:?}/{}B", payload.len());
-                        let seed = seed_spec(
+                        let target = ResolvedTarget {
+                            ip: local,
+                            port: 9,
+                            proto: transport,
+                            interface: "lo0".to_string(),
                             framing,
-                            local,
-                            local,
-                            9,
-                            transport,
-                            40000,
-                            payload,
-                            "seed".to_string(),
-                        )
-                        .unwrap_or_else(|err| panic!("{shape}: the seed builds: {err}"));
+                            local_ip: local,
+                            scope_entry: String::new(),
+                        };
+                        let seed = seed_spec(&target, 40000, payload, "seed".to_string())
+                            .unwrap_or_else(|err| panic!("{shape}: the seed builds: {err}"));
                         let link_len = framing.header_len();
 
                         for field in default_fields(ip, transport) {
@@ -1527,19 +1527,19 @@ mod tests {
         use aitm_scan_model::vocab::L4Transport;
 
         use crate::fields::{Ipv6Field, TcpField};
-        use crate::plan::{seed_spec, LinkFraming};
+        use crate::plan::{seed_spec, LinkFraming, ResolvedTarget};
 
-        let v4 = seed_spec(
-            LinkFraming::Null,
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            9,
-            L4Transport::Udp,
-            40000,
-            b"probe",
-            "v4".to_string(),
-        )
-        .expect("the v4 seed builds");
+        let v4_target = ResolvedTarget {
+            ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 9,
+            proto: L4Transport::Udp,
+            interface: "lo0".to_string(),
+            framing: LinkFraming::Null,
+            local_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            scope_entry: String::new(),
+        };
+        let v4 =
+            seed_spec(&v4_target, 40000, b"probe", "v4".to_string()).expect("the v4 seed builds");
         let at = |field| declared_value(&v4.spec, field, 4);
         assert_eq!(at(FieldPath::Ipv4(Ipv4Field::Ttl)), Some(64));
         assert_eq!(at(FieldPath::Ipv4(Ipv4Field::Ihl)), Some(5));
@@ -1555,17 +1555,17 @@ mod tests {
             None
         );
 
-        let v6 = seed_spec(
-            LinkFraming::Ethernet,
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            IpAddr::V6(Ipv6Addr::LOCALHOST),
-            443,
-            L4Transport::Tcp,
-            40001,
-            b"probe",
-            "v6".to_string(),
-        )
-        .expect("the v6 seed builds");
+        let v6_target = ResolvedTarget {
+            ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            port: 443,
+            proto: L4Transport::Tcp,
+            interface: "en0".to_string(),
+            framing: LinkFraming::Ethernet,
+            local_ip: IpAddr::V6(Ipv6Addr::LOCALHOST),
+            scope_entry: String::new(),
+        };
+        let v6 =
+            seed_spec(&v6_target, 40001, b"probe", "v6".to_string()).expect("the v6 seed builds");
         let at = |field| declared_value(&v6.spec, field, 14);
         assert_eq!(at(FieldPath::Ipv6(Ipv6Field::HopLimit)), Some(64));
         assert_eq!(at(FieldPath::Ipv6(Ipv6Field::PayloadLength)), Some(25));

@@ -1894,21 +1894,14 @@ mod tests {
 
         // A well-formed frame to 127.0.0.1:10, a port the "*" loopback scope
         // covers but this point never targets (its target is :9).
-        let target = &plans[0].target;
-        let elsewhere = crate::plan::seed_spec(
-            target.framing,
-            target.local_ip,
-            target.ip,
-            10,
-            aitm_scan_model::L4Transport::Udp,
-            target.port + 1,
-            b"x",
-            "elsewhere".to_string(),
-        )
-        .expect("the frame builds")
-        .spec
-        .build()
-        .expect("the frame crafts");
+        let mut wrong = plans[0].target.clone();
+        wrong.port = 10;
+        let elsewhere =
+            crate::plan::seed_spec(&wrong, wrong.port + 1, b"x", "elsewhere".to_string())
+                .expect("the frame builds")
+                .spec
+                .build()
+                .expect("the frame crafts");
 
         let refused = host
             .probe(&Payload {

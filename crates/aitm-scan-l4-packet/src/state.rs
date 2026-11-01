@@ -637,8 +637,6 @@ impl LaneState {
 /// Task 13 flips this body to `job.report_l4(counters)` once `origin/main`
 /// carries it. Until then the lane's counters still reach the operator through
 /// `PacketLane::counters(job_id)`, which stays either way.
-// Task 9 (`host.rs`) is the caller: its runner reports after every point run
-// and whenever it marks the job stopped.
 pub(crate) fn report_counters(job: &dyn JobCtx, counters: L4Counters) {
     let _ = (job, counters);
 }
