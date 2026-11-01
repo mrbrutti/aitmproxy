@@ -214,6 +214,53 @@ fn patterns_over_4096_bytes_are_rejected() {
 }
 
 #[test]
+fn pattern_cap_counts_bytes_not_chars() {
+    // AC18 edge: `MAX_PATTERN_BYTES` is a byte cap, not a character cap, so a
+    // multibyte pattern reaches it long before 4096 characters. U+1F600 is four
+    // bytes in UTF-8: 1024 of them are exactly 4096 bytes and compile on every
+    // pattern surface; 1025 (4100 bytes, far fewer than 4096 characters) are
+    // turned away with the byte length in the error.
+    let at_cap = "\u{1F600}".repeat(1024);
+    assert_eq!(at_cap.len(), 4096);
+    assert_eq!(at_cap.chars().count(), 1024);
+    let compiled = compile(rule(UrlMatch::Wildcard(at_cap.clone())))
+        .expect("a 4096-byte multibyte wildcard compiles");
+    // Star-less, so a substring of the path: a path carrying the same run matches.
+    assert!(compiled.matches(&http_flow(&format!("/{at_cap}")), Phase::Request, None));
+    assert!(!compiled.matches(&http_flow("/"), Phase::Request, None));
+    compile(rule(UrlMatch::Regex(at_cap.clone()))).expect("a 4096-byte multibyte regex compiles");
+    compile(rule_with(MatchCondition {
+        host: Some(HostMatch::Wildcard(at_cap)),
+        ..cond()
+    }))
+    .expect("a 4096-byte multibyte host wildcard compiles");
+
+    let over = "\u{1F600}".repeat(1025);
+    assert_eq!(over.len(), 4100);
+    for (what, r) in [
+        ("url wildcard", rule(UrlMatch::Wildcard(over.clone()))),
+        ("url regex", rule(UrlMatch::Regex(over.clone()))),
+        (
+            "host wildcard",
+            rule_with(MatchCondition {
+                host: Some(HostMatch::Wildcard(over.clone())),
+                ..cond()
+            }),
+        ),
+    ] {
+        let err = compile(r).expect_err(what);
+        assert_eq!(
+            err,
+            RuleError::PatternTooLong {
+                len: 4100,
+                max: 4096
+            },
+            "{what}: 1025 characters is under 4096, so a character cap would have accepted this"
+        );
+    }
+}
+
+#[test]
 fn more_than_256_rules_per_call_are_rejected() {
     // AC18: the count check `flow.intercept` and `ws.intercept` both run before
     // compiling anything, so a rejected call leaves the active rules alone.

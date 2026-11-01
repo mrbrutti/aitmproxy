@@ -387,3 +387,66 @@ fn too_many_rules_is_error() {
         other => panic!("flow.intercept should return an object, got {other:?}"),
     }
 }
+
+/// AC19 at the plugin level: an empty `url` pattern in any of its three bus
+/// spellings (`""`, `{wildcard: ""}`, `{regex: ""}`) makes `flow.intercept`
+/// return `Err` naming the empty pattern, and the previously armed rule stays
+/// active instead of being replaced by a match-everything rule.
+#[test]
+fn empty_url_pattern_is_error() {
+    let reg = registry();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    arm(
+        &reg,
+        &host,
+        params(&[
+            ("enabled", Value::Bool(true)),
+            (
+                "rules",
+                Value::Array(vec![rule_obj(&[
+                    ("url", Value::Str("*/admin".into())),
+                    ("phase", Value::Str("request".into())),
+                ])]),
+            ),
+        ]),
+    );
+    let intercept = reg
+        .command("flow.intercept")
+        .expect("flow.intercept registered");
+
+    for (what, url) in [
+        ("bare string", Value::Str(String::new())),
+        (
+            "{wildcard}",
+            rule_obj(&[("wildcard", Value::Str(String::new()))]),
+        ),
+        ("{regex}", rule_obj(&[("regex", Value::Str(String::new()))])),
+    ] {
+        let err = intercept
+            .invoke(
+                params(&[("rules", Value::Array(vec![rule_obj(&[("url", url)])]))]),
+                &host,
+            )
+            .expect_err(what);
+        assert!(
+            err.to_string().contains("empty url pattern"),
+            "{what}: the error should name the empty pattern: {err}"
+        );
+    }
+
+    // The earlier `*/admin` rule is still active, and nothing else parks.
+    let admin = store.insert(http_flow("/admin"));
+    assert!(
+        dispatch_request(&reg, &store, admin).is_some(),
+        "the valid rule survived the rejected calls"
+    );
+    let public = store.insert(http_flow("/public"));
+    assert!(
+        dispatch_request(&reg, &store, public).is_none(),
+        "no match-everything rule was armed by the rejected calls"
+    );
+}
