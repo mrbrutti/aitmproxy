@@ -60,7 +60,7 @@ use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use crate::limits::{CANARY_EVERY, MAX_AWAIT, MAX_HELD_FLOWS, MAX_SESSION_MONITORS};
+use crate::limits::{job_mark, CANARY_EVERY, MAX_AWAIT, MAX_HELD_FLOWS, MAX_SESSION_MONITORS};
 use crate::session::{CanaryOutcome, SessionMonitor};
 use crate::{mutate, redact, session, url_norm};
 
@@ -143,7 +143,7 @@ impl HttpProbeHost {
                 RecordProbes::IssuesOnly => RecordPolicy::Never,
                 RecordProbes::All => RecordPolicy::Always,
             },
-            marks: vec![format!("scan:{}", self.job.job_id())],
+            marks: vec![job_mark(self.job.job_id())],
             version: self.job.profile().http.version.into(),
         }
     }
