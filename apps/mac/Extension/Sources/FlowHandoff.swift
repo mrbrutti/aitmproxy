@@ -1455,10 +1455,12 @@ final class FlowHandoff: @unchecked Sendable {
 // the real code over real socketpairs with a fake core and fake NE flows, and
 // asserts LITERAL expected wire bytes. It needs no root, no entitlement, no NE.
 //
-// Co-located deliberately: the Extension has no separate test target (it is built by
-// `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no DEBUG define, so this whole
-// block is excluded from the release binary). Splitting it into its own `#if DEBUG`
-// file is a tracked readability cleanup (plan Review log, Task 11 Minor).
+// Where the checks live: the wire, link and claim groups are in this `enum
+// HandoffSelfCheck`; the rule groups are `#if DEBUG extension HandoffSelfCheck` blocks
+// beside the code they test (`ProviderRules.swift`, `RuleReconciler.swift`). `run()`
+// lists every group. Co-located because the Extension has no separate test target (it
+// is built by `apps/mac/build.sh` via `swiftc Sources/*.swift`, with no DEBUG define, so
+// none of this is in the release binary).
 #if DEBUG
 enum HandoffSelfCheck {
     private final class Box<T>: @unchecked Sendable {
