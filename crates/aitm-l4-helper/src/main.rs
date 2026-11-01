@@ -9,6 +9,8 @@
 
 #[allow(dead_code)] // wired into main by task P2.4
 mod bpf;
+#[allow(dead_code)] // wired into main by task P2.4
+mod bpf_exec;
 mod cli;
 mod probe;
 
