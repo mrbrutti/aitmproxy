@@ -15,14 +15,13 @@
 //! every point (D12: nothing changes in behaviour). The degraded states are
 //! the strip banner's (D13: one state on screen).
 
-use aitm_scan_model::InsertionPoint;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::scan::{point_header, point_line, MapPane, MapSource, NodeLine, ScanOffer};
+use crate::scan::{point_header, MapPane, MapSource, NodeLine, ScanOffer};
 use crate::theme::Theme;
 use crate::ui::bars::put;
 use crate::ui::scan::{hint, note, pane_rule, panes};
@@ -81,7 +80,7 @@ fn v2(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let header = point_header();
     points(
         theme,
-        &map.points[range],
+        &map.point_lines[range],
         cursor,
         map.pane == MapPane::Points,
         Head::Columns(&header),
@@ -110,7 +109,7 @@ fn legacy(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     );
     points(
         theme,
-        &map.points,
+        &map.point_lines,
         Some(legacy.cursor),
         map.pane == MapPane::Points,
         Head::Title(LEGACY_POINTS_TITLE),
@@ -224,14 +223,14 @@ fn nodes(
     }
 }
 
-/// The Points pane: the head, then one [`point_line`] per point (built for
-/// the rows on screen only), scrolled so `cursor` is on screen and
-/// highlighted while the pane is focused; `cursor` is `None` when no point
-/// is under it.
+/// The Points pane: the head, then one line per point (`points`, the
+/// `point_lines` twin the fold built; fix round G, G15), scrolled so
+/// `cursor` is on screen and highlighted while the pane is focused;
+/// `cursor` is `None` when no point is under it.
 #[allow(clippy::too_many_arguments)]
 fn points(
     theme: &Theme,
-    points: &[InsertionPoint],
+    points: &[String],
     cursor: Option<usize>,
     focused: bool,
     top_row: Head<'_>,
@@ -268,7 +267,7 @@ fn points(
         if is_cursor && focused {
             buf.set_style(row, selection_bg(theme));
         }
-        put(buf, row, marked(theme, &point_line(point), is_cursor, w));
+        put(buf, row, marked(theme, point, is_cursor, w));
     }
 }
 

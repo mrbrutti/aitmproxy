@@ -24,7 +24,8 @@ use aitm_tui::caps::TermCaps;
 use aitm_tui::model::FlowRow;
 use aitm_tui::scan::{
     origin_choices, typed_origin, IssueFilterKey, MapPane, OriginChoice, OriginSource, ScanTab,
-    AUDITED_MARK, ORIGIN_HOST_ERROR, SITEMAP_PAGE_LIMIT, SITEMAP_POLL_TICKS,
+    AUDITED_MARK, ORIGIN_HOST_ERROR, POINT_TRAITS_MAX, SITEMAP_PAGE_LIMIT, SITEMAP_POLL_TICKS,
+    SITEMAP_TOTAL_LIMIT,
 };
 use common::*;
 use serde_json::{json, Value};
@@ -344,6 +345,90 @@ fn j_toggles_the_job_query_and_refetches() {
         vec![&json!({})],
         "the query drops the job: {reqs:?}"
     );
+}
+
+/// Fix round G, G31: `J` with no job under the Jobs cursor leaves the
+/// query unchanged and refetches nothing; with one it toggles and
+/// refetches as before.
+#[test]
+fn j_without_a_jobs_cursor_job_refetches_nothing() {
+    let mut app = app();
+    open_site_map(&mut app);
+    assert_eq!(app.scan.jobs.cursor_job(), None);
+    let reqs = app.update(Action::ScanFilter(IssueFilterKey::Job));
+    assert!(sitemap_requests(&reqs).is_empty(), "{reqs:?}");
+    assert_eq!(app.scan.sitemap.query.job, None);
+}
+
+/// Fix round G, G15, G16, G17 (D6 hostile-core bounds): a point's traits
+/// are deduped and capped at `POINT_TRAITS_MAX` at fold and its line is
+/// built there; a `next_cursor` over `CURSOR_MAX` bytes is dropped (`n`
+/// sends nothing) and recorded as an uncoded error; appended pages stop
+/// at `SITEMAP_TOTAL_LIMIT` nodes, after which the cursor is dropped and
+/// the summary says so.
+#[test]
+fn traits_cursor_and_total_are_bounded_at_fold() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    let mut page = fixture("scan.sitemap.json");
+    page["points"][0]["traits"] = json!(vec!["url"; 1_000_000]);
+    page["next_cursor"] = json!("c".repeat(1 << 20));
+    let _ = app.on_bus(sitemap_reply(page));
+    let traits = &app.scan.sitemap.points[0].traits;
+    assert!(traits.len() <= POINT_TRAITS_MAX, "{}", traits.len());
+    assert_eq!(traits, &vec![aitm_scan_model::PointTrait::Url]);
+    assert_eq!(app.scan.sitemap.point_lines.len(), 2);
+    assert!(app.scan.sitemap.point_lines[0].contains("url"));
+    assert_eq!(
+        app.scan.sitemap.next_cursor, None,
+        "an oversized cursor is dropped"
+    );
+    let err = app.scan.sitemap.error.as_ref().expect("recorded");
+    assert_eq!(err.tag, "scan.sitemap");
+    assert_eq!(err.detail, "next_cursor exceeds 1024 bytes");
+    assert!(
+        app.update(Action::ScanNextPage).is_empty(),
+        "n sends nothing"
+    );
+    let text = screen(&app);
+    assert!(line_with(&text, "profile.address.city").is_some(), "{text}");
+
+    // Sixteen full pages reach the limit; the seventeenth is never asked
+    // for (`n` is inert once the cursor is dropped).
+    let mut app = app_with(TOOLS);
+    let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
+    let template = fixture("scan.sitemap.json")["nodes"][0].clone();
+    for page_no in 0..16 {
+        let nodes: Vec<Value> = (0..SITEMAP_PAGE_LIMIT)
+            .map(|k| {
+                let mut n = template.clone();
+                n["id"] = json!(format!("node-{page_no}-{k}"));
+                n
+            })
+            .collect();
+        let reqs = app.on_bus(sitemap_reply(json!({
+            "nodes": nodes,
+            "points": [],
+            "next_cursor": format!("page-{}", page_no + 1),
+        })));
+        assert!(reqs.is_empty(), "{reqs:?}");
+        let reqs = app.update(Action::ScanNextPage);
+        assert_eq!(
+            sitemap_requests(&reqs).len(),
+            usize::from(page_no < 15),
+            "page {page_no}: {reqs:?}"
+        );
+    }
+    assert_eq!(app.scan.sitemap.nodes.len(), SITEMAP_TOTAL_LIMIT);
+    assert_eq!(app.scan.sitemap.lines.len(), SITEMAP_TOTAL_LIMIT);
+    assert_eq!(app.scan.sitemap.next_cursor, None);
+    assert!(
+        app.scan.sitemap.summary().contains("limit reached"),
+        "{}",
+        app.scan.sitemap.summary()
+    );
+    assert!(app.update(Action::ScanNextPage).is_empty());
+    let _ = text_of(&app, 200, 50);
 }
 
 /// D6 cadence: while the Site map is shown and a job is crawling, the map

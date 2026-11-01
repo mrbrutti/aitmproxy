@@ -9,6 +9,7 @@
 //! (`lines`, the display twin of `nodes`), so a frame measures and draws
 //! bounded text only.
 
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use aitm_scan_model::{
@@ -30,6 +31,24 @@ pub const SITEMAP_POLL_TICKS: u64 = 40;
 /// (D6 hostile-core bounds; the Issues page limit, applied to both lists):
 /// the rest of a longer page is dropped at fold time.
 pub const SITEMAP_PAGE_LIMIT: usize = 512;
+
+/// The most nodes, and the most points, the Site map holds across appended
+/// pages (fix round G, G17; D6 hostile-core bounds; the builder's number,
+/// sixteen full pages): once a fold reaches it the lists are cut there,
+/// `next_cursor` is dropped and the summary says `limit reached`.
+pub const SITEMAP_TOTAL_LIMIT: usize = 8192;
+
+/// The most traits a point keeps at fold, after dedup (fix round G, G15;
+/// the vocabulary has fewer, so a longer list is a hostile core's).
+pub const POINT_TRAITS_MAX: usize = 8;
+
+/// The longest `next_cursor` the TUI echoes back to the core, in bytes
+/// (fix round G, G16): a longer one is dropped and recorded as an error.
+pub const CURSOR_MAX: usize = 1024;
+
+/// The detail of the uncoded error a `scan.sitemap` reply gets when its
+/// `next_cursor` is over [`CURSOR_MAX`].
+pub const CURSOR_TOO_LONG: &str = "next_cursor exceeds 1024 bytes";
 
 /// The mark an audited node's line ends with (D11 `✓`; builder's glyph, flat
 /// monochrome as D13 asks).
@@ -84,6 +103,20 @@ impl SitemapQuery {
     /// job without a job filter, that one job with it.
     pub fn matches(&self, job: &str) -> bool {
         self.job.as_deref().is_none_or(|j| j == job)
+    }
+
+    /// `J` (D11): the job filter becomes the Jobs cursor's job (`cursor`)
+    /// when none is set, else none. Returns whether the query changed, so
+    /// the reducer refetches only then (fix round G, G31): `J` with no
+    /// cursor job and no filter leaves it as it was.
+    pub fn toggle_job(&mut self, cursor: Option<JobId>) -> bool {
+        let next = match self.job {
+            Some(_) => None,
+            None => cursor,
+        };
+        let changed = next != self.job;
+        self.job = next;
+        changed
     }
 }
 
@@ -143,8 +176,18 @@ pub struct SitemapState {
     /// legacy bus: the injection points read as points, index for index
     /// with `legacy.points`. Strings bounded when set.
     pub points: Vec<InsertionPoint>,
-    /// `Some` while another page can be fetched with `n`.
+    /// The points' display twin, index for index with `points`
+    /// ([`point_line`] of each, built once at fold; fix round G, G15).
+    pub point_lines: Vec<String>,
+    /// Each node's range of `points`, index for index with `nodes`, built
+    /// at fold so [`SitemapState::node_points`] is a lookup (G17).
+    pub node_ranges: Vec<Range<usize>>,
+    /// `Some` while another page can be fetched with `n`; dropped once
+    /// the lists reach [`SITEMAP_TOTAL_LIMIT`] (`limit_reached`).
     pub next_cursor: Option<String>,
+    /// The lists reached [`SITEMAP_TOTAL_LIMIT`] (G17): the summary says
+    /// so and no further page is asked for.
+    pub limit_reached: bool,
     pub node_cursor: usize,
     /// An index into `points`, kept inside the selected node's range by
     /// [`SitemapState::settle_point_cursor`], or `points.len()` when that
@@ -172,7 +215,13 @@ impl SitemapState {
     /// settled: the Nodes cursor stays on the id it was on when that node
     /// is still listed (an appended page may move its row), else it is
     /// clamped.
-    pub fn fold_result(&mut self, mut result: SitemapResult) {
+    ///
+    /// Two more hostile-core bounds (fix round G): a `next_cursor` over
+    /// [`CURSOR_MAX`] bytes is dropped and returned as an uncoded error
+    /// (G16; the reducer records it); once either list reaches
+    /// [`SITEMAP_TOTAL_LIMIT`] it is cut there, the cursor is dropped and
+    /// `limit_reached` is set (G17).
+    pub fn fold_result(&mut self, mut result: SitemapResult) -> Option<ScanError> {
         let append = std::mem::take(&mut self.appending);
         result.nodes.truncate(SITEMAP_PAGE_LIMIT);
         result.points.truncate(SITEMAP_PAGE_LIMIT);
@@ -186,8 +235,23 @@ impl SitemapState {
             self.nodes = result.nodes;
             self.points = result.points;
         }
-        self.next_cursor = result.next_cursor;
+        let mut error = None;
+        self.next_cursor = match result.next_cursor {
+            Some(c) if c.len() > CURSOR_MAX => {
+                error = Some(ScanError::uncoded("scan.sitemap", CURSOR_TOO_LONG));
+                None
+            }
+            other => other,
+        };
+        self.limit_reached =
+            self.nodes.len() >= SITEMAP_TOTAL_LIMIT || self.points.len() >= SITEMAP_TOTAL_LIMIT;
+        if self.limit_reached {
+            self.nodes.truncate(SITEMAP_TOTAL_LIMIT);
+            self.points.truncate(SITEMAP_TOTAL_LIMIT);
+            self.next_cursor = None;
+        }
         self.relist(selected);
+        error
     }
 
     /// Sort `nodes` into group order, rebuild `lines` and the point order,
@@ -223,19 +287,28 @@ impl SitemapState {
         group_nodes(&mut self.nodes);
         self.points = legacy_points(legacy);
         self.points.iter_mut().for_each(bound_point);
+        self.point_lines = self.points.iter().map(point_line).collect();
+        self.node_ranges = Vec::new();
         self.lines = node_lines(&self.nodes);
     }
 
     /// Sort `points` into node order (stable, so a node's points keep the
     /// core's order), the orphans last (key `nodes.len()`; fix round G,
-    /// G20), so [`SitemapState::node_points`] finds each node's points
-    /// contiguous and an orphan is never in any node's range.
+    /// G20), so each node's points are contiguous and an orphan is never
+    /// in any node's range; then build each node's range and each point's
+    /// line (G15, G17). Linear in the lists: the node ids are indexed once.
     fn order_points(&mut self) {
         let last = self.nodes.len();
+        let index: HashMap<&str, usize> = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(k, n)| (n.id.as_str(), k))
+            .collect();
         let position = |p: &InsertionPoint| -> usize {
             p.site_node
                 .as_deref()
-                .and_then(|id| self.nodes.iter().position(|n| n.id == id))
+                .and_then(|id| index.get(id).copied())
                 .unwrap_or(last)
         };
         let mut keyed: Vec<(usize, InsertionPoint)> = std::mem::take(&mut self.points)
@@ -243,7 +316,18 @@ impl SitemapState {
             .map(|p| (position(&p), p))
             .collect();
         keyed.sort_by_key(|(k, _)| *k);
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(last);
+        let mut at = 0;
+        for node in 0..last {
+            let start = at;
+            while keyed.get(at).is_some_and(|(k, _)| *k == node) {
+                at += 1;
+            }
+            ranges.push(start..at);
+        }
+        self.node_ranges = ranges;
         self.points = keyed.into_iter().map(|(_, p)| p).collect();
+        self.point_lines = self.points.iter().map(point_line).collect();
     }
 
     /// The node under the Nodes cursor, if the list has one.
@@ -252,22 +336,14 @@ impl SitemapState {
     }
 
     /// The range of `points` belonging to the node at `idx`: contiguous,
-    /// because [`SitemapState::fold_result`] sorts them into node order.
-    /// Empty (at the position the node's points would take) when it has
-    /// none or `idx` names no node.
+    /// because [`SitemapState::fold_result`] sorts them into node order,
+    /// and read off `node_ranges`, built at fold. Empty (at the end of the
+    /// list) when the node has none or `idx` names no node.
     pub fn node_points(&self, idx: usize) -> Range<usize> {
-        let Some(node) = self.nodes.get(idx) else {
-            return self.points.len()..self.points.len();
-        };
-        let is_mine = |p: &InsertionPoint| p.site_node.as_deref() == Some(node.id.as_str());
-        let Some(start) = self.points.iter().position(is_mine) else {
-            return self.points.len()..self.points.len();
-        };
-        let len = self.points[start..]
-            .iter()
-            .take_while(|p| is_mine(p))
-            .count();
-        start..start + len
+        self.node_ranges
+            .get(idx)
+            .cloned()
+            .unwrap_or(self.points.len()..self.points.len())
     }
 
     /// Keep `point_cursor` on a point of the selected node: inside that
@@ -291,7 +367,8 @@ impl SitemapState {
 
     /// The summary line the view draws first (D11: `12 nodes · 2 points of
     /// node-1 · n next page`): the node count, the selected node's point
-    /// count and id, and the paging hint only while a next page exists.
+    /// count and id, the paging hint only while a next page exists, and
+    /// `limit reached` once the lists hit [`SITEMAP_TOTAL_LIMIT`] (G17).
     pub fn summary(&self) -> String {
         let mut text = format!("{} nodes", self.nodes.len());
         if let Some(node) = self.selected_node() {
@@ -300,6 +377,9 @@ impl SitemapState {
         }
         if self.next_cursor.is_some() {
             text.push_str(" · n next page");
+        }
+        if self.limit_reached {
+            text.push_str(" · limit reached");
         }
         text
     }
@@ -319,8 +399,14 @@ fn bound_node(node: &mut SiteNode) {
     node.flows.truncate(SITEMAP_PAGE_LIMIT);
 }
 
-/// Cut every string the screen reads off a point to [`VALUE_MAX`] cells.
+/// Cut every string the screen reads off a point to [`VALUE_MAX`] cells,
+/// and its traits to their distinct values, at most [`POINT_TRAITS_MAX`]
+/// (fix round G, G15).
 fn bound_point(point: &mut InsertionPoint) {
+    let mut seen: HashSet<PointTrait> = HashSet::new();
+    point.traits.retain(|t| seen.insert(*t));
+    point.traits.truncate(POINT_TRAITS_MAX);
+    point.traits.shrink_to_fit();
     cut(&mut point.id);
     cut(&mut point.name);
     for s in [

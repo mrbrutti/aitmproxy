@@ -4359,13 +4359,14 @@ impl App {
                 self.scan.issues.filters.cycle(key, cursor_job.as_deref());
                 self.request_issues(out);
             }
-            ScanTab::SiteMap if matches!(key, IssueFilterKey::Job) => {
-                let query = &mut self.scan.sitemap.query;
-                query.job = match query.job {
-                    Some(_) => None,
-                    None => cursor_job,
-                };
-                self.request_sitemap(None, out);
+            ScanTab::SiteMap => {
+                // Only `J` has a Site map meaning, and it refetches only
+                // when the query changed (fix round G, G31).
+                let changed = matches!(key, IssueFilterKey::Job)
+                    && self.scan.sitemap.query.toggle_job(cursor_job);
+                if changed {
+                    self.request_sitemap(None, out);
+                }
             }
             _ => {}
         }
@@ -5376,7 +5377,13 @@ impl App {
                 // a reply that misses the contract leaves the map and
                 // drops the append flag, so the next page starts clean.
                 match self.scan_reply::<SitemapResult>(tag, &value) {
-                    Some(result) => self.scan.sitemap.fold_result(result),
+                    Some(result) => {
+                        // An over-long `next_cursor` is dropped by the
+                        // fold and recorded here (fix round G, G16).
+                        if let Some(err) = self.scan.sitemap.fold_result(result) {
+                            self.scan.set_error(err);
+                        }
+                    }
                     None => self.scan.sitemap.appending = false,
                 }
             }
