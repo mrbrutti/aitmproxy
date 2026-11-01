@@ -443,7 +443,7 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
-| 2 | orchestrator (from the Task 2 coder's report) | Important | `PINNED` omits the bare `dst_port` and `interface` that spec D8.4 names non-fuzzable; they were refused as `unknown field path` instead of as pins (same `invalid_profile` code, wrong sentence) | fix task dispatched 2026-11-01 (wave 2); disposition filled when its commit lands |
+| 2 | orchestrator (from the Task 2 coder's report) | Important | `PINNED` omits the bare `dst_port` and `interface` that spec D8.4 names non-fuzzable; they were refused as `unknown field path` instead of as pins (same `invalid_profile` code, wrong sentence) | fixed in 31076103 (`PINNED` is 10 entries; `pinned_paths_refused_by_name` covers both) |
 
 ## Shipped
 
