@@ -725,6 +725,24 @@ mod tests {
         );
     }
 
+    /// Empty input: a relay whose both ends are already closed moves nothing and
+    /// ends cleanly — `(0, 0, Ok)`, so the row it closes reports zero bytes, not
+    /// an error (Tester addition, whole-branch stage 5).
+    #[tokio::test]
+    async fn relay_with_nothing_to_move_closes_cleanly_with_zero_counts() {
+        let (client_near, client_far) = tokio::io::duplex(64);
+        let (up_near, up_far) = tokio::io::duplex(64);
+        drop(client_far);
+        drop(up_far);
+        let mut client: ByteStream = Box::pin(client_near);
+        let mut upstream: ByteStream = Box::pin(up_near);
+
+        let (up, down, result) = relay(&mut client, &mut upstream).await;
+
+        assert_eq!((up, down), (0, 0));
+        result.expect("two closed ends are a clean close, not an error");
+    }
+
     /// An `io::Error` of `kind`, wrapped in an `anyhow` context the way the HTTP
     /// module wraps a client handshake error.
     fn io_err(kind: io::ErrorKind) -> anyhow::Error {

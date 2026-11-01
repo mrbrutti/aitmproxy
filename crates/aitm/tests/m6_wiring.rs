@@ -232,3 +232,61 @@ fn agent_gates_default_off() {
         "the refusal is explained: {err}"
     );
 }
+
+// ---- Tester additions (whole-branch stage 5) ---------------------------------
+
+/// AC14 / spec D2, the binary wiring: `assemble` hands the passthrough module a
+/// late-bound guard and binds it to the proxy's own guard right after `build`.
+/// Proven at the module-selection seam, with no sockets: on an empty Scope the
+/// passthrough module claims a TLS connection; after `scope.add` on the proxy's
+/// live guard the same connection goes to the HTTP module (decrypted); after
+/// `scope.remove` it is tunnelled again. A forgotten `bind` would leave the
+/// passthrough module claiming everything for ever.
+#[test]
+fn assemble_binds_the_passthrough_module_to_the_live_scope_guard() {
+    let cfg = config("live-scope");
+    assert!(
+        cfg.scope.entries.is_empty(),
+        "the proxy starts with an empty Scope"
+    );
+    let proxy = assemble(&cfg).expect("assemble").proxy;
+    let modules = proxy.modules();
+    let hint = NextLayerHint {
+        dst: "127.0.0.1:54321".parse().unwrap(),
+        is_tls: true,
+        client_hello_sni: Some("live.example".into()),
+        alpn: vec![],
+        first_bytes: vec![0x16, 0x03, 0x01],
+        from_upgrade: false,
+        peer_identity: None,
+        capture_interface: None,
+    };
+    let chosen = || {
+        modules
+            .iter()
+            .find(|m| m.matches(&hint))
+            .map(|m| m.id().to_string())
+    };
+
+    assert_eq!(
+        chosen().as_deref(),
+        Some("passthrough"),
+        "empty Scope: nothing is decrypted"
+    );
+
+    proxy.guard().add_scope(ScopeEntry {
+        host: "live.example".into(),
+    });
+    assert_eq!(
+        chosen().as_deref(),
+        Some("http"),
+        "after scope.add the next connection is the HTTP module's to decrypt"
+    );
+
+    assert!(proxy.guard().remove_scope("live.example"));
+    assert_eq!(
+        chosen().as_deref(),
+        Some("passthrough"),
+        "after scope.remove it is tunnelled again"
+    );
+}

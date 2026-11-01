@@ -1074,4 +1074,71 @@ mod tests {
         origin.read_to_end(&mut rest).await.expect("origin read");
         assert_eq!(rest, b"");
     }
+
+    // ---- Tester additions (whole-branch stage 5) ---------------------------------
+
+    /// AC8 (IPv6): `CONNECT [::1]:4443` is claimed, dialled as the IPv6 literal it
+    /// is — no lookup, `[::1]:4443` handed to the connector — and recorded under
+    /// the bracketed authority `Authority` prints, so the row keys the way a `::1`
+    /// scope entry and every other surface do.
+    #[tokio::test]
+    async fn ipv6_connect_is_dialled_as_a_literal_and_recorded_bracketed() {
+        const V6: &str = "[::1]:4443";
+        let v6_origin: SocketAddr = V6.parse().expect("v6 addr");
+        // `127.0.0.1` is in Scope; `::1` is another host and is not.
+        let guard = guard_with(&["127.0.0.1"]);
+        let module =
+            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
+        let hint = connect_hint(V6);
+        assert!(
+            module.matches(&hint),
+            "an out-of-scope IPv6 CONNECT is claimed"
+        );
+        let (mut client, origin, mut h) = start(module, Some(guard), hint, true);
+        let mut origin = origin.expect("origin");
+
+        let mut head = format!("CONNECT {V6} HTTP/1.1\r\nHost: {V6}\r\n\r\n").into_bytes();
+        head.extend_from_slice(UP);
+        client.write_all(&head).await.expect("client writes");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+        let mut up = vec![0u8; UP.len()];
+        origin
+            .read_exact(&mut up)
+            .await
+            .expect("bytes reach the origin");
+        assert_eq!(up, UP);
+        origin.write_all(DOWN).await.expect("origin writes");
+        let mut down = vec![0u8; DOWN.len()];
+        client
+            .read_exact(&mut down)
+            .await
+            .expect("bytes reach the client");
+        assert_eq!(down, DOWN);
+        drop(client);
+        drop(origin);
+        h.finish().await.expect("a clean close is not an error");
+
+        let row = h.row();
+        assert_eq!(row.request.authority, V6, "normalised through Authority");
+        assert_eq!(row.request.headers.get("host"), Some(V6));
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo {
+                mode: TunnelMode::Passthrough,
+                reason: Some(TunnelReason::OutOfScope),
+                bytes_up: Some(UP.len() as u64),
+                bytes_down: Some(DOWN.len() as u64),
+            })
+        );
+        let server = row.server_conn.as_ref().expect("the dialled origin");
+        assert_eq!(server.peer, v6_origin);
+        assert_eq!(server.sni.as_deref(), Some("::1"));
+        assert_eq!(
+            h.connector.asked(),
+            Some((V6.to_string(), v6_origin)),
+            "an IPv6 literal is dialled as is, under its bracketed authority"
+        );
+    }
 }

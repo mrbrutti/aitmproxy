@@ -192,3 +192,54 @@ fn tunnel_authority_is_none_without_connect_or_sni() {
     handoff.client_hello_sni = Some("ws.example".to_string());
     assert_eq!(handoff.tunnel_authority(), None, "upgrade hand-off");
 }
+
+// ---- Tester additions (whole-branch stage 5) ---------------------------------
+
+/// AC8 through the seam the HTTP module decides on (`ModuleCtx::in_scope`, spec
+/// D2), with the same scope-entry rules the passthrough module was proven
+/// against: `host:port` admits only that port, `*.suffix` the suffix and its
+/// subdomains and nothing that merely ends in the text, an IPv6 entry matches the
+/// bracketed authority `Authority` prints (with or without a port), matching is
+/// case-insensitive, and a string that is not an authority is never in scope.
+#[test]
+fn module_ctx_in_scope_follows_every_scope_entry_rule() {
+    let ported = ctx().with_scope(guard_with(&["api.example.com:8443"]));
+    assert!(ported.in_scope("api.example.com:8443"));
+    assert!(!ported.in_scope("api.example.com:443"), "only that port");
+    assert!(!ported.in_scope("example.com:8443"), "only that host");
+
+    let wild = ctx().with_scope(guard_with(&["*.example.com"]));
+    assert!(wild.in_scope("api.example.com:443"));
+    assert!(wild.in_scope("deep.api.example.com:8443"));
+    assert!(wild.in_scope("example.com:443"), "the suffix itself");
+    assert!(!wild.in_scope("example.com.evil:443"));
+    assert!(!wild.in_scope("notexample.com:443"));
+
+    let v6 = ctx().with_scope(guard_with(&["::1"]));
+    assert!(v6.in_scope("[::1]:443"));
+    assert!(v6.in_scope("[::1]:8443"), "a bare host admits every port");
+    assert!(!v6.in_scope("[::2]:443"));
+    assert!(!v6.in_scope("127.0.0.1:443"));
+    let v6_ported = ctx().with_scope(guard_with(&["[::1]:443"]));
+    assert!(v6_ported.in_scope("[::1]:443"));
+    assert!(!v6_ported.in_scope("[::1]:8443"));
+
+    let cased = ctx().with_scope(guard_with(&["Example.COM"]));
+    assert!(cased.in_scope("example.com:443"));
+    assert!(cased.in_scope("EXAMPLE.com:8443"));
+
+    let any = ctx().with_scope(guard_with(&["example.com", "*.example.com", "::1"]));
+    for junk in [
+        "",
+        " ",
+        "not an authority",
+        "example.com:notaport",
+        "[::1",
+        "/secret:443",
+    ] {
+        assert!(
+            !any.in_scope(junk),
+            "{junk:?} is not an authority, so it is never in scope"
+        );
+    }
+}

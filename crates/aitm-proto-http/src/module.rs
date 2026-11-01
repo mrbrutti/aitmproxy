@@ -7234,8 +7234,14 @@ mod tests {
         /// offering `http/1.1`, and its DER so a test can check which certificate
         /// a client was shown.
         fn origin_identity() -> (Arc<ServerConfig>, CertificateDer<'static>) {
+            origin_identity_named("origin.test")
+        }
+
+        /// [`origin_identity`] for an origin named `name` (the raw-TLS route
+        /// resolves the SNI, and `localhost` is the one name that resolves offline).
+        fn origin_identity_named(name: &str) -> (Arc<ServerConfig>, CertificateDer<'static>) {
             let key = rcgen::KeyPair::generate().expect("key");
-            let cert = rcgen::CertificateParams::new(vec!["origin.test".to_string()])
+            let cert = rcgen::CertificateParams::new(vec![name.to_string()])
                 .expect("params")
                 .self_signed(&key)
                 .expect("cert");
@@ -8299,6 +8305,787 @@ mod tests {
                 1,
                 "one upstream connection carried both requests"
             );
+        }
+
+        // ---- Tester additions (whole-branch stage 5): edge cases a proxy must survive ----
+        //
+        // Malformed, cut-short and oversized CONNECT heads; a tunnel that drops
+        // mid-relay from either end; bytes after the acknowledgement that look like
+        // TLS but are not; IPv6 authorities on both routes; and the raw-TLS
+        // (capture ingress) path of `drive`, which nothing above exercises through
+        // `spawn`: the relay with the buffered ClientHello, the SNI read from the
+        // record when the acceptor's peek missed it, and a hello without SNI.
+
+        /// The client peer the acceptor hands `drive` for a proxied connection:
+        /// on the explicit-proxy path the hint's `dst` is the client's own address.
+        fn client_peer() -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], 54321))
+        }
+
+        /// A proxied `CONNECT <authority>` as the acceptor peeks it: the request
+        /// line is in `first_bytes`, so `tunnel_authority()` names the host before
+        /// the module has read the head — what a `failed` row for a head that
+        /// cannot be read is keyed on.
+        fn connect_hint(authority: &str) -> NextLayerHint {
+            NextLayerHint {
+                dst: client_peer(),
+                is_tls: false,
+                client_hello_sni: None,
+                alpn: Vec::new(),
+                first_bytes: format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n")
+                    .into_bytes(),
+                from_upgrade: false,
+                peer_identity: None,
+                capture_interface: None,
+            }
+        }
+
+        /// The original destination a capture ingress (the NE) hands the module.
+        fn captured_dst() -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], 8443))
+        }
+
+        /// A raw-TLS connection from a capture ingress: no CONNECT, `dst` is the
+        /// original destination, the SNI as the acceptor peeked it (`None` when the
+        /// ClientHello did not fit the peek), and the capture attribution.
+        fn capture_tls_hint(sni: Option<&str>) -> NextLayerHint {
+            NextLayerHint {
+                dst: captured_dst(),
+                is_tls: true,
+                client_hello_sni: sni.map(str::to_string),
+                alpn: Vec::new(),
+                first_bytes: vec![TLS_HANDSHAKE, 0x03, 0x01],
+                from_upgrade: false,
+                peer_identity: Some("com.apple.Safari".into()),
+                capture_interface: Some("macos-ne".into()),
+            }
+        }
+
+        /// `localhost`: the one name that resolves without a network, so the
+        /// raw-TLS path (which resolves the SNI) can be driven offline.
+        const LOCALHOST_ORIGIN: &str = "localhost:8443";
+
+        fn localhost_name() -> ServerName<'static> {
+            ServerName::try_from("localhost").expect("name")
+        }
+
+        /// The io error kind at the root of a module error, if it is one.
+        fn io_kind(err: &anyhow::Error) -> Option<io::ErrorKind> {
+            err.chain()
+                .find_map(|cause| cause.downcast_ref::<io::Error>())
+                .map(io::Error::kind)
+        }
+
+        /// A `failed` row's invariants (spec D5): no status, closed on insert, and
+        /// the given outcome.
+        fn assert_failed(row: &HttpFlow, reason: TunnelReason) {
+            assert_eq!(row.request.method, "CONNECT");
+            assert_eq!(outcome(row), (TunnelMode::Failed, Some(reason)));
+            assert_eq!(status(row), None, "a failed tunnel reports no status");
+            assert!(row.metadata.duration.is_some(), "a failed row is closed");
+            assert!(!row.metadata.passive);
+        }
+
+        /// Oversized input: a CONNECT head past the 16 KiB cap that never reaches
+        /// its blank line is cut off and recorded as `failed/protocol_error`, keyed
+        /// on the authority the acceptor peeked; nothing is acknowledged or dialled.
+        #[tokio::test]
+        async fn oversized_connect_head_is_a_failed_protocol_error_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+            let ctx = ctx.with_hint(connect_hint(ORIGIN));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let mut head =
+                    format!("CONNECT {ORIGIN} HTTP/1.1\r\nHost: {ORIGIN}\r\nX-Pad: ").into_bytes();
+                head.resize(MAX_CONNECT_HEAD + 1024, b'a');
+                client
+                    .write_all(&head)
+                    .await
+                    .expect("send the oversized head");
+                read_head(&mut client).await
+            };
+            let (served, reply) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the oversized head hung");
+            let err = served.expect_err("an oversized head fails the connection");
+            assert_eq!(io_kind(&err), Some(io::ErrorKind::InvalidData), "{err:#}");
+            assert_eq!(reply, "", "no acknowledgement for a head that never ended");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1, "one failed row for the CONNECT");
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert!(row.request.headers.is_empty(), "nothing was parsed");
+            assert_failed(row, TunnelReason::ProtocolError);
+            assert!(row.server_conn.is_none(), "nothing was dialled");
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+            assert_eq!(store.count(), 1);
+        }
+
+        /// A client that hangs up mid-head (a speculative pre-connect that gave up)
+        /// is `failed/client_closed`, keyed on the peeked authority: no ack, no dial.
+        #[tokio::test]
+        async fn connect_head_cut_short_by_the_client_is_a_failed_client_closed_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+            let ctx = ctx.with_hint(connect_hint(ORIGIN));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(b"CONNECT 127.0.0.1:8443 HTTP/1.1\r\nHost: 127.0")
+                    .await
+                    .expect("send a partial head");
+                drop(client);
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the cut-short head hung");
+            let err = served.expect_err("an unfinished head is an error");
+            assert_eq!(io_kind(&err), Some(io::ErrorKind::UnexpectedEof), "{err:#}");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert!(row.request.headers.is_empty());
+            assert_failed(row, TunnelReason::ClientClosed);
+            assert!(!row.client_conn.tls, "no TLS byte was ever seen");
+            assert!(row.server_conn.is_none());
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+        }
+
+        /// Spec D5 "every CONNECT is a row": a head the module can read but not
+        /// parse (a non-UTF-8 header line) whose request line the acceptor's peek
+        /// did name is still a row — `failed/protocol_error`, keyed on that
+        /// authority — exactly as the passthrough module records it
+        /// (`malformed_connect_head_is_a_failed_protocol_error_row`). The client
+        /// gets no acknowledgement and nothing is dialled.
+        ///
+        /// Tester finding T1 (stage 5, whole branch): `HttpModule::tunnel` returns
+        /// `parse_connect(&head)?` with no row even when `ctx.hint()` names the
+        /// authority, so today this CONNECT is silent (the store stays empty). Enable
+        /// once the HTTP module records the row the way the passthrough module does.
+        #[tokio::test]
+        #[ignore = "Tester finding T1: a non-UTF-8 CONNECT head the peek named leaves no row in the HTTP module (spec D5)"]
+        async fn non_utf8_connect_head_is_a_failed_protocol_error_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+            let ctx = ctx.with_hint(connect_hint(ORIGIN));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(b"CONNECT 127.0.0.1:8443 HTTP/1.1\r\nX-Bad: \xff\xfe\r\n\r\n")
+                    .await
+                    .expect("send the malformed head");
+                read_head(&mut client).await
+            };
+            let (served, reply) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the malformed head hung");
+            let err = served.expect_err("a non-UTF-8 head fails the connection");
+            assert!(format!("{err:#}").contains("non-UTF-8"), "{err:#}");
+            assert_eq!(
+                reply, "",
+                "no acknowledgement for a head that did not parse"
+            );
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(
+                rows.len(),
+                1,
+                "a CONNECT the peek named leaves a row even when its head does not parse"
+            );
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert_failed(row, TunnelReason::ProtocolError);
+            assert!(row.server_conn.is_none());
+        }
+
+        /// After the acknowledgement the client sends bytes that start like a TLS
+        /// record but carry no ClientHello (invalid TLS). The handshake fails on
+        /// the client side with a TLS protocol error, not an alert, so the row is
+        /// `failed/client_tls_error`; the origin was never dialled.
+        #[tokio::test]
+        async fn garbage_that_looks_like_tls_after_the_ack_is_a_failed_client_tls_error_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                // A complete TLS handshake record whose one message has an
+                // unknown handshake type (0xff) and an empty body.
+                client
+                    .write_all(&[
+                        TLS_HANDSHAKE,
+                        0x03,
+                        0x01,
+                        0x00,
+                        0x04,
+                        0xff,
+                        0x00,
+                        0x00,
+                        0x00,
+                    ])
+                    .await
+                    .expect("send the bogus record");
+                // The proxy may answer with an alert, then closes.
+                let mut rest = Vec::new();
+                let _ = client.read_to_end(&mut rest).await;
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the bogus handshake hung");
+            let err = served.expect_err("a bogus ClientHello fails the connection");
+            assert_eq!(err.to_string(), "read ClientHello");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert_failed(row, TunnelReason::ClientTlsError);
+            assert!(row.client_conn.tls);
+            assert!(
+                row.server_conn.is_none(),
+                "the ClientHello is read before the origin is dialled"
+            );
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+        }
+
+        /// AC8 (IPv6), D5: `CONNECT [::1]:8443` to a host outside Scope is relayed
+        /// under the bracketed authority `Authority` prints, dialled as the IPv6
+        /// literal it is (no lookup), with exact byte counts once both ends close.
+        /// Raw bytes, not TLS: the relay is byte-agnostic.
+        #[tokio::test]
+        async fn out_of_scope_ipv6_connect_is_relayed_under_its_bracketed_authority() {
+            const V6: &str = "[::1]:8443";
+            let v6_peer = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 8443));
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            // `127.0.0.1` is in Scope; `::1` is a different host and is not.
+            let (ctx, dialed) =
+                scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, V6).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                client.write_all(b"ping").await.expect("client writes");
+                let mut buf = [0u8; 4];
+                origin
+                    .read_exact(&mut buf)
+                    .await
+                    .expect("the client's bytes reach the origin");
+                assert_eq!(&buf, b"ping");
+                origin.write_all(b"pong!").await.expect("origin writes");
+                let mut buf = [0u8; 5];
+                client
+                    .read_exact(&mut buf)
+                    .await
+                    .expect("the origin's bytes reach the client");
+                assert_eq!(&buf, b"pong!");
+                let open = tunnel_rows(&store);
+                assert_eq!(open.len(), 1);
+                assert_eq!(open[0].metadata.duration, None, "open while relaying");
+                // The client hangs up; the relay passes that on to the origin,
+                // which then closes too.
+                drop(client);
+                let mut rest = Vec::new();
+                origin.read_to_end(&mut rest).await.expect("origin read");
+                assert!(rest.is_empty(), "nothing after the client's hang-up");
+                drop(origin);
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the IPv6 relay hung");
+            served.expect("a tunnel both ends closed is a clean close");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.method, "CONNECT");
+            assert_eq!(row.request.authority, V6, "normalised through Authority");
+            assert_eq!(row.request.headers.get("host"), Some(V6));
+            assert_eq!(
+                row.metadata.tunnel,
+                Some(TunnelInfo {
+                    mode: TunnelMode::Passthrough,
+                    reason: Some(TunnelReason::OutOfScope),
+                    bytes_up: Some(4),
+                    bytes_down: Some(5),
+                })
+            );
+            assert_eq!(status(row), Some(200));
+            assert!(row.metadata.duration.is_some());
+            let server = row.server_conn.as_ref().expect("the dialled origin");
+            assert_eq!(server.peer, v6_peer);
+            assert_eq!(server.sni.as_deref(), Some("::1"));
+            let dialed = dialed.lock().expect("dialed lock").clone();
+            assert_eq!(
+                dialed.iter().map(|(_, addr)| *addr).collect::<Vec<_>>(),
+                vec![v6_peer],
+                "an IPv6 literal is dialled as is, with no lookup"
+            );
+            // Tester finding T2: the authority string handed to the connector here is
+            // `Target::authority()`'s `::1:8443`, not the `[::1]:8443` the row carries
+            // and the passthrough module hands its connector; the guarded connector
+            // cannot parse the bracket-less form. Pinned loosely until the Coder
+            // decides: both spellings name the same host and port.
+            assert_eq!(dialed.len(), 1);
+            assert!(request_paths(&store).is_empty());
+        }
+
+        /// AC8 (IPv6) on the decrypting route: with `::1` in Scope, `CONNECT
+        /// [::1]:8080` is admitted (`in_scope` matches the bracketed authority), the
+        /// cleartext request inside it is served and captured, and the tunnel row
+        /// and its inner row share the authority a frontend groups on (spec D9).
+        #[tokio::test]
+        async fn in_scope_ipv6_connect_is_decrypted_and_shares_its_authority_with_the_inner_row() {
+            const V6: &str = "[::1]:8080";
+            let v6_peer = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 8080));
+            let module = HttpModule::new();
+            let store = Arc::new(MemFlowStore::new());
+            let (upstream, origin) = plain_origin(vec!["v6"]);
+            let (ctx, dialed) = scoped_ctx(vec![upstream], store.clone(), scoped(&["::1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, V6).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                // Cleartext inside the tunnel (`curl -p` to a plain origin).
+                client
+                    .write_all(get_request("/v6", V6).as_bytes())
+                    .await
+                    .expect("send GET");
+                let body = read_one_200(&mut client).await;
+                drop(client);
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the IPv6 cleartext tunnel hung");
+            served.expect("the module ends cleanly when the client hangs up");
+            assert_eq!(body, "v6");
+            origin.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, V6);
+            assert_eq!(outcome(row), (TunnelMode::Decrypted, None));
+            assert_eq!(status(row), Some(200));
+            assert!(row.metadata.duration.is_some());
+            assert!(!row.client_conn.tls, "cleartext inside the tunnel");
+            assert!(
+                row.server_conn.is_none(),
+                "the row opens before `serve` dials the origin lazily (spec D5: \"when one was dialled\")"
+            );
+            assert_eq!(
+                dialed
+                    .lock()
+                    .expect("dialed lock")
+                    .iter()
+                    .map(|(_, addr)| *addr)
+                    .collect::<Vec<_>>(),
+                vec![v6_peer],
+                "the tunnel target is dialled as the IPv6 literal"
+            );
+
+            let inner = request_row(&store, "/v6");
+            assert!(!inner.metadata.passive);
+            assert_eq!(inner.metadata.tunnel, None);
+            assert_eq!(status(&inner), Some(200));
+            assert_eq!(
+                inner.request.authority, row.request.authority,
+                "spec D9: a decrypted tunnel row and its inner rows share their authority"
+            );
+        }
+
+        /// Connection drop mid-relay from the origin side: the relay passes the EOF
+        /// to the client; the client's next bytes have nowhere to go and end the
+        /// relay in an error. The row still closes with exact counts (what was read
+        /// from the client, what was written to it), keeps its 200 (the tunnel was
+        /// established) and gets a duration.
+        #[tokio::test]
+        async fn relay_row_keeps_exact_counts_when_the_origin_drops_mid_stream() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, _dialed) = scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                client.write_all(b"abc").await.expect("client writes");
+                let mut buf = [0u8; 3];
+                origin.read_exact(&mut buf).await.expect("origin reads");
+                assert_eq!(&buf, b"abc");
+                origin.write_all(b"defgh").await.expect("origin writes");
+                let mut buf = [0u8; 5];
+                client.read_exact(&mut buf).await.expect("client reads");
+                assert_eq!(&buf, b"defgh");
+                // The origin resets mid-stream.
+                drop(origin);
+                // The client sees the EOF the relay passes on...
+                let mut rest = Vec::new();
+                client.read_to_end(&mut rest).await.expect("client read");
+                assert!(rest.is_empty());
+                // ...and keeps talking: these bytes are read by the proxy and
+                // cannot be written to the origin.
+                client
+                    .write_all(b"more")
+                    .await
+                    .expect("the client can still write to the proxy");
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the origin drop hung the relay");
+            let err = served.expect_err("the relay ends in the write error");
+            assert_eq!(io_kind(&err), Some(io::ErrorKind::BrokenPipe), "{err:#}");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(
+                row.metadata.tunnel,
+                Some(TunnelInfo {
+                    mode: TunnelMode::Passthrough,
+                    reason: Some(TunnelReason::OutOfScope),
+                    bytes_up: Some(7),
+                    bytes_down: Some(5),
+                }),
+                "counts survive the error: 3 + 4 read from the client, 5 written to it"
+            );
+            assert_eq!(
+                status(row),
+                Some(200),
+                "an established tunnel that broke later is not a failed tunnel"
+            );
+            assert!(row.metadata.duration.is_some(), "closed");
+        }
+
+        // ---- The raw-TLS route (a capture ingress: no CONNECT) -----------------
+
+        /// D1/D2/AC16 on the raw-TLS route: a captured connection whose SNI the
+        /// acceptor peeked is out of Scope, so the HTTP module relays it — the
+        /// buffered ClientHello first — and the client completes TLS against the
+        /// origin's own certificate. The row is `passthrough/out_of_scope` under
+        /// `sni:dst-port`, with no CONNECT headers and the capture attribution; no
+        /// acknowledgement is written (a `200` line would have broken the TLS
+        /// stream, so the successful handshake proves it).
+        #[tokio::test]
+        async fn raw_tls_out_of_scope_on_the_capture_path_is_relayed_not_decrypted() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (identity, origin_der) = origin_identity_named("localhost");
+            let (upstream, origin) = tls_origin(identity, vec!["secret"]);
+            let (ctx, dialed) = scoped_ctx(vec![upstream], store.clone(), scoped(&[]));
+            let ctx = ctx.with_hint(capture_tls_hint(Some("localhost")));
+
+            let (client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                // No CONNECT: the client's first bytes are its ClientHello.
+                let mut tls = TlsConnector::from(accepting_any())
+                    .connect(localhost_name(), client)
+                    .await
+                    .expect("the handshake with the origin goes through the relay");
+                assert_eq!(
+                    presented(&tls),
+                    origin_der,
+                    "the client must see the origin's own certificate, not a proxy leaf"
+                );
+                let body = get(&mut tls, "/secret").await;
+                let _ = tls.shutdown().await;
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the raw-TLS relay hung");
+            served.expect("the relay ends cleanly when the client hangs up");
+            assert_eq!(body, "secret", "the origin's answer was relayed");
+            origin.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.method, "CONNECT");
+            assert_eq!(row.request.authority, LOCALHOST_ORIGIN, "sni:dst-port");
+            assert!(row.request.headers.is_empty(), "no CONNECT head to record");
+            let tunnel = row.metadata.tunnel.clone().expect("tunnel outcome");
+            assert_eq!(tunnel.mode, TunnelMode::Passthrough);
+            assert_eq!(tunnel.reason, Some(TunnelReason::OutOfScope));
+            assert!(tunnel.bytes_up.is_some_and(|n| n > 0), "{tunnel:?}");
+            assert!(tunnel.bytes_down.is_some_and(|n| n > 0), "{tunnel:?}");
+            assert_eq!(status(row), Some(200));
+            assert!(row.metadata.duration.is_some());
+            assert!(row.client_conn.tls);
+            assert_eq!(row.metadata.source_app.as_deref(), Some("com.apple.Safari"));
+            assert_eq!(row.metadata.capture_interface.as_deref(), Some("macos-ne"));
+            let dialed = dialed.lock().expect("dialed lock").clone();
+            assert_eq!(dialed.len(), 1);
+            assert_eq!(dialed[0].0, LOCALHOST_ORIGIN);
+            assert!(dialed[0].1.ip().is_loopback() && dialed[0].1.port() == 8443);
+            assert!(
+                request_paths(&store).is_empty(),
+                "nothing inside the relay is a row"
+            );
+        }
+
+        /// The mirror: the same captured connection with its host in Scope is
+        /// decrypted — the client trusting only the proxy CA completes the
+        /// handshake — and the row is `decrypted`, with the inner request its own,
+        /// acted-on row.
+        #[tokio::test]
+        async fn raw_tls_in_scope_on_the_capture_path_is_decrypted() {
+            let ca = test_ca();
+            let module = HttpModule::with_ca(ca.clone()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (identity, _origin_der) = origin_identity_named("localhost");
+            let (upstream, origin) = tls_origin(identity, vec!["secret"]);
+            let (ctx, _dialed) = scoped_ctx(vec![upstream], store.clone(), scoped(&["localhost"]));
+            let ctx = ctx.with_hint(capture_tls_hint(Some("localhost")));
+
+            let (client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let mut tls = TlsConnector::from(trusting(ca_root(&ca)))
+                    .connect(localhost_name(), client)
+                    .await
+                    .expect("a client that trusts the proxy CA completes the handshake");
+                let body = get(&mut tls, "/secret").await;
+                let _ = tls.shutdown().await;
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the decrypted raw-TLS connection hung");
+            served.expect("the module ends cleanly when the client hangs up");
+            assert_eq!(body, "secret");
+            origin.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, LOCALHOST_ORIGIN);
+            assert!(row.request.headers.is_empty());
+            assert_eq!(row.metadata.tunnel, Some(TunnelInfo::decrypted()));
+            assert_eq!(status(row), Some(200));
+            assert!(row.metadata.duration.is_some());
+            assert!(row.client_conn.tls);
+            assert_eq!(row.client_conn.sni.as_deref(), Some("localhost"));
+            assert!(
+                row.server_conn.is_some(),
+                "the origin it dialled is on the row"
+            );
+            assert_eq!(row.metadata.source_app.as_deref(), Some("com.apple.Safari"));
+            let inner = request_row(&store, "/secret");
+            assert!(!inner.metadata.passive);
+            assert_eq!(inner.metadata.tunnel, None);
+            assert_eq!(status(&inner), Some(200));
+        }
+
+        /// Anti-goal "a ClientHello larger than the acceptor's peek": the hint has
+        /// no SNI, so the module buffers the first TLS record itself, reads the SNI
+        /// from it and decides on that — out of Scope here, so the connection is
+        /// relayed and the client sees the origin's certificate. The buffered record
+        /// is not consumed: the handshake completes through the relay.
+        #[tokio::test]
+        async fn raw_tls_whose_sni_the_peek_missed_is_decided_on_the_record_it_buffers() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (identity, origin_der) = origin_identity_named("localhost");
+            let (upstream, origin) = tls_origin(identity, vec!["secret"]);
+            let (ctx, _dialed) = scoped_ctx(vec![upstream], store.clone(), scoped(&[]));
+            let ctx = ctx.with_hint(capture_tls_hint(None));
+
+            let (client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let mut tls = TlsConnector::from(accepting_any())
+                    .connect(localhost_name(), client)
+                    .await
+                    .expect("the handshake goes through the relay");
+                assert_eq!(presented(&tls), origin_der, "relayed, not decrypted");
+                let body = get(&mut tls, "/secret").await;
+                let _ = tls.shutdown().await;
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the peek-missed relay hung");
+            served.expect("the relay ends cleanly");
+            assert_eq!(body, "secret");
+            origin.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].request.authority, LOCALHOST_ORIGIN,
+                "the SNI came from the buffered record, the port from the capture dst"
+            );
+            assert_eq!(
+                outcome(&rows[0]),
+                (TunnelMode::Passthrough, Some(TunnelReason::OutOfScope))
+            );
+            assert!(request_paths(&store).is_empty());
+        }
+
+        /// A captured TLS connection whose ClientHello carries no SNI (a client
+        /// speaking to an IP) cannot be decrypted by name: `failed/protocol_error`,
+        /// keyed on the capture destination, nothing dialled, and the module ends
+        /// with the no-upstream error.
+        #[tokio::test]
+        async fn raw_tls_without_sni_on_the_capture_path_is_a_failed_protocol_error_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+            let ctx = ctx.with_hint(capture_tls_hint(None));
+
+            let (client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                // An IP server name sends no `server_name` extension.
+                TlsConnector::from(accepting_any())
+                    .connect(ip_name(), client)
+                    .await
+                    .expect_err("the proxy closes without serving")
+            };
+            let (served, _client_err) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the SNI-less hello hung");
+            let err = served.expect_err("TLS without SNI cannot pick an upstream");
+            assert_eq!(
+                err.to_string(),
+                "TLS without CONNECT or SNI: no upstream to pick"
+            );
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1, "a row, not silence");
+            let row = &rows[0];
+            assert_eq!(
+                row.request.authority, "127.0.0.1:8443",
+                "keyed on the capture dst"
+            );
+            assert!(row.request.headers.is_empty());
+            assert_failed(row, TunnelReason::ProtocolError);
+            assert!(row.client_conn.tls);
+            assert!(row.server_conn.is_none());
+            assert_eq!(row.metadata.capture_interface.as_deref(), Some("macos-ne"));
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+        }
+
+        /// Malformed input: a TLS record header announcing a 16 KiB ClientHello
+        /// followed by a few bytes and a hang-up. The module reads what there is,
+        /// finds no SNI, and records `failed/protocol_error` keyed on the capture
+        /// destination rather than waiting or panicking.
+        #[tokio::test]
+        async fn truncated_client_hello_on_the_capture_path_is_a_failed_protocol_error_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&[]));
+            let ctx = ctx.with_hint(capture_tls_hint(None));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(&[
+                        TLS_HANDSHAKE,
+                        0x03,
+                        0x01,
+                        0x40,
+                        0x00,
+                        0x01,
+                        0x00,
+                        0x3f,
+                        0xfc,
+                    ])
+                    .await
+                    .expect("send the truncated hello");
+                drop(client);
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the truncated hello hung");
+            served.expect_err("no SNI could be read");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, "127.0.0.1:8443");
+            assert_failed(row, TunnelReason::ProtocolError);
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+        }
+
+        /// Oversized input: a record header announcing a 64 KiB payload, with far
+        /// more bytes than one TLS record may hold behind it and the connection held
+        /// open. The module buffers at most `MAX_CLIENT_HELLO`, finds no ClientHello
+        /// in it, records `failed/protocol_error` and closes — it neither waits for
+        /// the rest nor buffers it.
+        #[tokio::test]
+        async fn oversized_tls_record_on_the_capture_path_is_capped_and_a_failed_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&[]));
+            let ctx = ctx.with_hint(capture_tls_hint(None));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let mut record = vec![TLS_HANDSHAKE, 0x03, 0x01, 0xff, 0xff];
+                record.resize(MAX_CLIENT_HELLO + 4096, 0);
+                client
+                    .write_all(&record)
+                    .await
+                    .expect("send the oversized record");
+                // Held open: the proxy must give up on its own.
+                let mut rest = Vec::new();
+                client.read_to_end(&mut rest).await.expect("client read");
+                assert!(rest.is_empty(), "nothing is written back");
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the oversized record hung the module");
+            served.expect_err("no ClientHello within the cap");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            assert_failed(&rows[0], TunnelReason::ProtocolError);
+            assert_eq!(rows[0].request.authority, "127.0.0.1:8443");
+            assert!(dialed.lock().expect("dialed lock").is_empty());
         }
     }
 }
