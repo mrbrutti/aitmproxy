@@ -25,7 +25,7 @@ use anyhow::{anyhow, Context as _, Result};
 use bytes::Bytes;
 use h2::client::SendRequest;
 
-use crate::sender::ProbeStream;
+use crate::sender::{ProbeStream, MAX_RESPONSE_BYTES};
 
 /// Mirrors `crate::h2`'s outbound settings (the constants there are private to
 /// that module, so the sender carries its own copies of the same values).
@@ -37,8 +37,6 @@ const HEADER_TABLE_SIZE: u32 = 4 * 1024;
 /// cannot pin the stream open. The whole exchange is additionally bounded by
 /// the sender's response timeout.
 const H2_WIRE_TIMEOUT: Duration = Duration::from_secs(30);
-/// The response-body cap, matching the h1 path in [`crate::sender`].
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 /// One pooled connection.
 struct Pooled {
@@ -867,10 +865,11 @@ mod tests {
         .expect("the first h2c exchange succeeds");
         assert_eq!(first_resp.status, 200);
 
-        // The origin has sent GOAWAY and hung up; let the client's connection
-        // task observe it before the next send looks in the pool.
+        // The origin has sent GOAWAY and hung up. Nothing waits for the
+        // client's connection task to notice: either `take` refuses the dead
+        // handle, or the send's one redial replaces it (review finding Q1).
+        // Both roads lead to the two dials asserted below.
         let _ = first.await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let second_resp = tokio::time::timeout(
             Duration::from_secs(10),

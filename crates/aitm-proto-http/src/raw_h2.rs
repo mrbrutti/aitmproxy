@@ -44,26 +44,27 @@
 //! literal response field would need the dynamic table this module does not
 //! keep.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
-use futures::future::BoxFuture;
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_rustls::TlsConnector;
 
-use crate::sender::{Dialer, HostResolver, ProbeStream};
+use crate::sender::{
+    split_authority, Dialer, HostResolver, ProbeStream, SystemResolver, TcpDialer, ALPN_H2,
+};
 
 /// The client connection preface (RFC 9113 §3.4), sent before any frame.
 pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
-/// Length of a frame header in bytes (RFC 9113 §4.1).
-pub const FRAME_HEADER_LEN: usize = 9;
+/// Length of a frame header in bytes (RFC 9113 §4.1). Internal: the public
+/// surface of this module is the nine-byte array [`frame_header`] returns.
+pub(crate) const FRAME_HEADER_LEN: usize = 9;
 
 /// Largest frame payload this codec will accept from a peer.
 ///
@@ -130,7 +131,7 @@ pub mod flags {
 /// the field holds; every caller in this crate writes a payload well under
 /// [`MAX_FRAME_BYTES`].
 #[must_use]
-pub fn frame_header(len: u32, kind: FrameType, flags: u8, stream: u32) -> [u8; FRAME_HEADER_LEN] {
+pub fn frame_header(len: u32, kind: FrameType, flags: u8, stream: u32) -> [u8; 9] {
     let l = len.to_be_bytes();
     let s = (stream & 0x7fff_ffff).to_be_bytes();
     [l[1], l[2], l[3], kind as u8, flags, s[0], s[1], s[2], s[3]]
@@ -409,9 +410,6 @@ const RAW_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 /// How much the driver reads at a time.
 const RAW_READ_CHUNK: usize = 8 * 1024;
 
-/// The only ALPN protocol a raw probe offers.
-const ALPN_H2: &[u8] = b"h2";
-
 /// `RST_STREAM` error code `CANCEL` (RFC 9113 §7), what a rapid-reset pair
 /// sends.
 const RST_CANCEL: u32 = 0x8;
@@ -571,8 +569,10 @@ impl RawH2Client {
     pub fn new(verify: TlsVerify) -> Self {
         Self {
             tls: verify,
-            dialer: Arc::new(RawTcpDialer),
-            resolver: Arc::new(RawSystemResolver),
+            // The sender's dialer, with the raw driver's own, shorter connect
+            // timeout: one implementation, two postures (review finding Q4).
+            dialer: Arc::new(TcpDialer::new(RAW_CONNECT_TIMEOUT)),
+            resolver: Arc::new(SystemResolver),
             ssrf: None,
         }
     }
@@ -623,7 +623,8 @@ impl RawH2Client {
     /// errors only on a transport failure; a peer that resets, goes away or
     /// says nothing is an observation, not an error.
     pub async fn probe(&self, plan: &RawH2Plan) -> Result<RawH2Observation> {
-        let streams = validate(plan)?;
+        let encoded = validate(plan)?;
+        let streams = encoded.len();
 
         let scheme = plan.target.scheme.to_ascii_lowercase();
         let tls = match scheme.as_str() {
@@ -631,7 +632,7 @@ impl RawH2Client {
             "http" => false,
             other => anyhow::bail!("raw h2 probe cannot speak scheme {other:?}"),
         };
-        let (host, port) = split_target(&plan.target.authority, tls)?;
+        let (host, port) = split_authority(&plan.target.authority, &scheme)?;
         let authority = aitm_core::Authority::new(&host, port).to_string();
 
         let mut obs = RawH2Observation {
@@ -658,7 +659,7 @@ impl RawH2Client {
                 .next()
                 .map(|ip| SocketAddr::new(ip, port))
                 .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
-            self.connect_and_converse(plan, addr, &host, tls, streams, &mut obs)
+            self.connect_and_converse(plan, addr, &host, tls, &encoded, &mut obs)
                 .await
         })
         .await;
@@ -682,7 +683,7 @@ impl RawH2Client {
         addr: SocketAddr,
         host: &str,
         tls: bool,
-        streams: usize,
+        encoded: &[Vec<u8>],
         obs: &mut RawH2Observation,
     ) -> Result<()> {
         let dialed = self
@@ -706,7 +707,7 @@ impl RawH2Client {
             dialed
         };
 
-        let result = converse(&mut *stream, plan, streams, obs).await;
+        let result = converse(&mut *stream, plan, encoded, obs).await;
         let _ = tokio::time::timeout(RAW_CLOSE_TIMEOUT, stream.shutdown()).await;
         result
     }
@@ -733,10 +734,13 @@ impl RawH2Client {
     }
 }
 
-/// Check a plan against the caps and the forbidden-header list, and return how
-/// many streams it will open. Runs before the dial, so a refused plan costs the
-/// target nothing.
-fn validate(plan: &RawH2Plan) -> Result<usize> {
+/// Check a plan against the caps and the forbidden-header list, encode its
+/// header blocks and check their size, and return the encoded blocks — one per
+/// stream, in the order they will be written.
+///
+/// Everything a plan can be refused for is decided here, before the dial, so a
+/// refused plan costs the target not even a connection (review finding Q7).
+fn validate(plan: &RawH2Plan) -> Result<Vec<Vec<u8>>> {
     if plan.streams > MAX_RAW_STREAMS {
         anyhow::bail!(
             "a raw h2 probe opens at most 8 streams on its one connection; the plan declares {}",
@@ -756,9 +760,10 @@ fn validate(plan: &RawH2Plan) -> Result<usize> {
         );
     }
 
-    let mut blocks = plan.mode.blocks(&plan.headers);
-    blocks.push(&plan.headers);
-    for header in blocks.into_iter().flatten() {
+    let blocks = plan.mode.blocks(&plan.headers);
+    let mut checked = blocks.clone();
+    checked.push(&plan.headers);
+    for header in checked.into_iter().flatten() {
         let name = String::from_utf8_lossy(&header.name).to_ascii_lowercase();
         for forbidden in FORBIDDEN_HEADERS {
             if name == forbidden {
@@ -767,20 +772,22 @@ fn validate(plan: &RawH2Plan) -> Result<usize> {
             }
         }
     }
-    Ok(wanted)
-}
 
-/// Split `host[:port]`, defaulting the port from the scheme.
-fn split_target(authority: &str, tls: bool) -> Result<(String, u16)> {
-    let default = if tls { 443 } else { 80 };
-    let parsed = aitm_core::Authority::parse_with_default(authority, default)
-        .map_err(|e| anyhow!("bad authority {authority:?}: {e}"))?;
-    let port = if parsed.port == 0 {
-        default
-    } else {
-        parsed.port
-    };
-    Ok((parsed.host, port))
+    // The driver never writes a frame larger than the RFC 9113 §6.5.2 minimum
+    // `SETTINGS_MAX_FRAME_SIZE` every peer must accept.
+    let mut encoded = Vec::with_capacity(wanted);
+    for block in blocks {
+        let bytes = encode_block(block);
+        if bytes.len() > MAX_FRAME_BYTES {
+            anyhow::bail!(
+                "raw h2 HEADERS block of {} bytes exceeds the {MAX_FRAME_BYTES}-byte frame cap",
+                bytes.len()
+            );
+        }
+        encoded.push(bytes);
+    }
+    debug_assert_eq!(encoded.len(), wanted);
+    Ok(encoded)
 }
 
 /// What a read attempt produced.
@@ -867,7 +874,7 @@ fn record(obs: &mut RawH2Observation, id: u32, outcome: StreamOutcome, opened: u
 async fn converse(
     stream: &mut dyn ProbeStream,
     plan: &RawH2Plan,
-    streams: usize,
+    encoded: &[Vec<u8>],
     obs: &mut RawH2Observation,
 ) -> Result<()> {
     let mut opening = PREFACE.to_vec();
@@ -903,23 +910,10 @@ async fn converse(
         }
     }
 
-    if streams == 0 {
+    if encoded.is_empty() {
         return Ok(());
     }
 
-    // Encode every block up front: an oversized one is refused before any
-    // HEADERS frame is written.
-    let mut encoded = Vec::with_capacity(streams);
-    for block in plan.mode.blocks(&plan.headers) {
-        let bytes = encode_block(block);
-        if bytes.len() > MAX_FRAME_BYTES {
-            anyhow::bail!(
-                "raw h2 HEADERS block of {} bytes exceeds the {MAX_FRAME_BYTES}-byte frame cap",
-                bytes.len()
-            );
-        }
-        encoded.push(bytes);
-    }
     let rapid_reset = matches!(plan.mode, RawH2Mode::RapidReset { .. });
 
     if let RawH2Mode::Blocks(_) = plan.mode {
@@ -942,7 +936,7 @@ async fn converse(
         let id = u32::try_from(index * 2 + 1).unwrap_or(u32::MAX);
         write_headers(stream, id, block, rapid_reset).await?;
     }
-    read_outcomes(stream, &mut reader, obs, streams).await?;
+    read_outcomes(stream, &mut reader, obs, encoded.len()).await?;
     Ok(())
 }
 
@@ -1029,39 +1023,20 @@ async fn read_outcomes(
     Ok(true)
 }
 
-/// A real TCP connection, bounded by [`RAW_CONNECT_TIMEOUT`]. (The sender's
-/// equivalent is private to its module.)
-struct RawTcpDialer;
-
-impl Dialer for RawTcpDialer {
-    fn dial(&self, addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>> {
-        Box::pin(async move {
-            let tcp = tokio::time::timeout(RAW_CONNECT_TIMEOUT, TcpStream::connect(addr))
-                .await
-                .map_err(|_| anyhow!("connect to {addr} timed out"))??;
-            Ok(Box::new(tcp) as Box<dyn ProbeStream>)
-        })
-    }
-}
-
-/// The operating system's resolver. (The sender's equivalent is private to its
-/// module.)
-struct RawSystemResolver;
-
-impl HostResolver for RawSystemResolver {
-    fn resolve(&self, host: String, port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
-        Box::pin(async move {
-            let addrs = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .with_context(|| format!("resolve {host}:{port}"))?;
-            Ok(addrs.map(|a| a.ip()).collect())
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Q4: the raw driver shares the sender's dialer, but not its 30 s connect
+    /// timeout — a probe gives a target ten seconds to answer and no more.
+    #[test]
+    fn the_raw_driver_keeps_its_own_connect_timeout() {
+        assert_eq!(RAW_CONNECT_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(
+            TcpDialer::new(RAW_CONNECT_TIMEOUT).connect_timeout(),
+            Duration::from_secs(10)
+        );
+    }
 
     #[test]
     fn the_preface_is_the_rfc_string() {
@@ -1723,6 +1698,8 @@ mod driver_tests {
 
     #[tokio::test]
     async fn a_goaway_ends_the_probe() {
+        // The peer answers the first HEADERS with `GOAWAY(1, ENHANCE_YOUR_CALM)`
+        // and says nothing else.
         let (client, dialer, _log) = peer(Script::new(vec![(3, 100)], Answer::GoAway(1, 11)));
 
         let obs = client
@@ -1730,8 +1707,17 @@ mod driver_tests {
             .await
             .expect("the probe completes");
 
-        assert_eq!(obs.goaway, Some((1, 11)));
-        assert!(obs.streams.len() <= 8, "streams: {:?}", obs.streams);
+        assert_eq!(
+            obs.goaway,
+            Some((1, 11)),
+            "the last stream id and the error code are the observation"
+        );
+        assert_eq!(obs.streams.len(), 8, "one slot per stream the plan opened");
+        assert_eq!(
+            obs.streams,
+            vec![StreamOutcome::Timeout; 8],
+            "the probe stops at the GOAWAY: no stream ever got an outcome"
+        );
         assert!(obs.connection_closed);
         assert_eq!(dialer.calls(), 1);
     }
@@ -1819,9 +1805,9 @@ mod driver_tests {
             err.to_string().contains("exceeds the 16384-byte frame cap"),
             "unexpected error: {err}"
         );
-        // The guard is inside the conversation, so the dial happened, but no
-        // HEADERS frame did.
-        assert_eq!(dialer.calls(), 1);
+        // The guard is part of validation, so the probe costs the target
+        // nothing at all: no dial, let alone a HEADERS frame.
+        assert_eq!(dialer.calls(), 0);
     }
 
     #[tokio::test]
@@ -1931,9 +1917,10 @@ mod driver_tests {
     }
 
     #[tokio::test]
-    async fn an_https_probe_offers_only_h2_so_an_http1_only_peer_is_refused() {
-        // The listener speaks `http/1.1` only; the probe offers `h2` alone, so
-        // the handshake fails rather than the driver writing h2 frames at an
+    async fn an_https_probe_is_refused_by_an_alpn_refusing_peer() {
+        // The listener's ALPN list is `http/1.1` and the probe offers `h2`
+        // alone, so the peer rejects the ClientHello outright: the failure is
+        // in the handshake, and the driver never writes an h2 frame at an
         // HTTP/1.1 server.
         let (client, dialer, _log) = tls_peer(
             Script::new(vec![(3, 128)], Answer::Nothing),
@@ -1947,8 +1934,30 @@ mod driver_tests {
             .expect_err("a peer that will not speak h2 is refused");
 
         assert!(
-            err.to_string().contains("TLS to origin.test")
-                || err.to_string().contains("did not negotiate ALPN h2"),
+            err.to_string().contains("raw h2 TLS to origin.test"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(dialer.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_https_probe_is_refused_when_the_handshake_selects_no_alpn() {
+        // A listener with no ALPN list at all completes the handshake and
+        // selects nothing — the other half of the guard, after the handshake.
+        let (client, dialer, _log) = tls_peer(
+            Script::new(vec![(3, 128)], Answer::Nothing),
+            TlsVerify::AcceptAny,
+            &[],
+        );
+
+        let err = client
+            .probe(&https_plan(RawH2Mode::SingleRequest, 1))
+            .await
+            .expect_err("a peer that negotiated no protocol is refused");
+
+        assert!(
+            err.to_string()
+                .contains("raw h2 probe: origin.test did not negotiate ALPN h2"),
             "unexpected error: {err}"
         );
         assert_eq!(dialer.calls(), 1);
@@ -1990,14 +1999,17 @@ mod driver_tests {
         vec![base("/a"), base("/b"), base("/c")]
     }
 
+    /// Whether `haystack` holds `needle` anywhere.
+    fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+        !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
     #[tokio::test]
     async fn blocks_open_one_stream_per_block_in_order_on_one_connection() {
         let (client, dialer, log) = peer(Script::new(vec![(3, 100)], Answer::Status(0x88)));
-        let variants = three_variants();
-        let expected: Vec<Vec<u8>> = variants.iter().map(|b| encode_block(b)).collect();
 
         let obs = client
-            .probe(&plan(RawH2Mode::Blocks(variants), 3))
+            .probe(&plan(RawH2Mode::Blocks(three_variants()), 3))
             .await
             .expect("the probe completes");
 
@@ -2009,10 +2021,17 @@ mod driver_tests {
         settled(&log, |l| l.headers_streams.len() == 3).await;
         let log = log.lock().expect("server log");
         assert_eq!(log.headers_streams, vec![1, 3, 5]);
-        assert_eq!(
-            log.headers_blocks, expected,
-            "each stream carries its own block"
-        );
+        // Each stream carries *its own* variant, in the plan's order: the
+        // paths are what tell the three apart on the wire.
+        let blocks = &log.headers_blocks;
+        assert_eq!(blocks.len(), 3);
+        assert!(holds(&blocks[0], b"/a"), "stream 1 carried {:?}", blocks[0]);
+        assert!(holds(&blocks[1], b"/b"), "stream 3 carried {:?}", blocks[1]);
+        assert!(holds(&blocks[2], b"/c"), "stream 5 carried {:?}", blocks[2]);
+        assert!(!holds(&blocks[0], b"/b") && !holds(&blocks[0], b"/c"));
+        assert!(blocks[0] != blocks[1] && blocks[1] != blocks[2] && blocks[0] != blocks[2]);
+        // And the whole field, name and value, really is on the wire.
+        assert!(holds(&blocks[0], b":path"), "{:?}", blocks[0]);
         assert!(log.rst_streams.is_empty(), "no reset pairs in Blocks mode");
     }
 
@@ -2125,14 +2144,21 @@ mod driver_tests {
     async fn blocks_ignore_the_plan_headers_field() {
         let (client, _dialer, log) = peer(Script::new(vec![], Answer::Status(0x88)));
         let variants = vec![three_variants().remove(2)];
-        let expected = vec![encode_block(&variants[0])];
         let mut p = plan(RawH2Mode::Blocks(variants), 1);
         p.headers.push(RawHeader::new("x-ignored", "yes"));
 
         client.probe(&p).await.expect("the probe completes");
 
         settled(&log, |l| l.headers_streams.len() == 1).await;
-        assert_eq!(log.lock().expect("server log").headers_blocks, expected);
+        let log = log.lock().expect("server log");
+        assert_eq!(log.headers_blocks.len(), 1);
+        let block = &log.headers_blocks[0];
+        assert!(holds(block, b"/c"), "the block is the variant: {block:?}");
+        assert!(
+            !holds(block, b"x-ignored"),
+            "the plan's own headers field must not reach the wire: {block:?}"
+        );
+        assert!(!holds(block, b"yes"), "{block:?}");
     }
 
     /// Every name answers one fixed address, so a test can choose exactly what

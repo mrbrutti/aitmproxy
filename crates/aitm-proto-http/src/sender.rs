@@ -48,14 +48,16 @@ const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// the caller (and, through a script's `http.send`, a hook) open indefinitely.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const READ_CHUNK: usize = 16 * 1024;
-const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+/// The response-body cap, shared with the h2 path in [`crate::h2_sender`].
+pub(crate) const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 /// How long an authority's negotiated protocol is reused before the sender
 /// offers both again.
 const ALPN_CACHE_TTL: Duration = Duration::from_secs(600);
 /// How many authorities the ALPN cache remembers.
 const ALPN_CACHE_CAPACITY: u64 = 1024;
 
-const ALPN_H2: &[u8] = b"h2";
+/// The ALPN protocol identifier for HTTP/2, shared with [`crate::raw_h2`].
+pub(crate) const ALPN_H2: &[u8] = b"h2";
 const ALPN_HTTP11: &[u8] = b"http/1.1";
 
 /// Name → addresses. A seam so the SSRF gate is testable without real DNS; the
@@ -64,8 +66,9 @@ pub trait HostResolver: Send + Sync {
     fn resolve(&self, host: String, port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>>;
 }
 
-/// The operating system's resolver, driven on tokio's blocking pool.
-struct SystemResolver;
+/// The operating system's resolver, driven on tokio's blocking pool. Shared
+/// with [`crate::raw_h2`], which resolves the same way.
+pub(crate) struct SystemResolver;
 
 impl HostResolver for SystemResolver {
     fn resolve(&self, host: String, port: u16) -> BoxFuture<'static, Result<Vec<IpAddr>>> {
@@ -91,13 +94,33 @@ pub trait Dialer: Send + Sync {
     fn dial(&self, addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>>;
 }
 
-/// A real TCP connection, bounded by [`CONNECT_TIMEOUT`].
-struct TcpDialer;
+/// A real TCP connection, bounded by the timeout it was built with.
+///
+/// Shared with [`crate::raw_h2`]: the reissue path allows [`CONNECT_TIMEOUT`]
+/// and the raw probe driver its own, shorter one, so the timeout is a
+/// constructor argument rather than two copies of this type (review finding
+/// Q4).
+pub(crate) struct TcpDialer {
+    connect_timeout: Duration,
+}
+
+impl TcpDialer {
+    pub(crate) fn new(connect_timeout: Duration) -> Self {
+        Self { connect_timeout }
+    }
+
+    /// The timeout this dialer was built with.
+    #[cfg(test)]
+    pub(crate) fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+}
 
 impl Dialer for TcpDialer {
     fn dial(&self, addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>> {
+        let connect_timeout = self.connect_timeout;
         Box::pin(async move {
-            let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+            let tcp = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
                 .await
                 .map_err(|_| anyhow!("connect to {addr} timed out"))??;
             Ok(Box::new(tcp) as Box<dyn ProbeStream>)
@@ -213,7 +236,7 @@ impl HttpSender {
             insecure: false,
             response_timeout: RESPONSE_TIMEOUT,
             resolver: Arc::new(SystemResolver),
-            dialer: Arc::new(TcpDialer),
+            dialer: Arc::new(TcpDialer::new(CONNECT_TIMEOUT)),
             ssrf: None,
             alpn: alpn_cache(ALPN_CACHE_TTL),
             h2_pool: H2Pool::new(),
@@ -693,7 +716,6 @@ async fn drive<S: AsyncRead + AsyncWrite + Unpin>(
     })
 }
 
-/// Split `host[:port]` with the scheme's default port; handles bracketed IPv6.
 /// An empty ALPN cache holding at most [`ALPN_CACHE_CAPACITY`] entries, each
 /// for `ttl`.
 fn alpn_cache(ttl: Duration) -> Cache<String, Negotiated> {
@@ -710,7 +732,9 @@ fn conn_key(scheme: &str, authority: &str) -> String {
     format!("{scheme}://{authority}")
 }
 
-fn split_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
+/// Split `host[:port]` with the scheme's default port; handles bracketed IPv6.
+/// Shared with [`crate::raw_h2`], which splits its target the same way.
+pub(crate) fn split_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
     let default = if scheme == "https" { 443 } else { 80 };
     let auth = aitm_core::Authority::parse_with_default(authority, default)
         .map_err(|e| anyhow!("bad authority {authority:?}: {e}"))?;
@@ -718,9 +742,10 @@ fn split_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
     Ok((auth.host, port))
 }
 
-/// `drive` over an in-memory stream: the reissue path returns the trailers of a
-/// chunked response (the machine captures them; the sender needs no change of
-/// its own) and fails closed on a trailer section over the machine's caps.
+/// The sender over in-memory streams: HTTP/1.1 framing through `drive`
+/// (chunked trailers, interim responses, the body cap), ALPN negotiation and
+/// its cache, the forced-version policies, and the SSRF gate — every one of
+/// them over a `tokio::io::duplex` pair, so nothing here binds a port.
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -731,6 +756,18 @@ mod tests {
     use super::*;
     use aitm_core::HeaderMap;
     use tokio::io::{duplex, DuplexStream};
+
+    /// Yield until `done` holds. A test waits on the state it cares about
+    /// rather than on a sleep long enough to "probably" cover it.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        for _ in 0..200_000 {
+            if done() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("{what}");
+    }
 
     /// A request for `path` on `127.0.0.1:8080`.
     fn request(method: &str, path: &str, headers: &[(&str, &str)], body: Body) -> HttpRequest {
@@ -1631,7 +1668,12 @@ mod tests {
             first_log.alpn,
             vec!["h2".to_string(), "http/1.1".to_string()]
         );
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // No wait for the client's connection task to notice: whether the dead
+        // connection is still in the pool when the next send looks is the
+        // scheduler's business, and both ways end here — the pooled handle is
+        // either refused by `take` or evicted by the one redial the send is
+        // allowed (review finding Q1), and the redial is what the dial count
+        // below pins.
 
         let err = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
             .await
@@ -1751,14 +1793,14 @@ mod tests {
             .expect("the h1 origin answers");
         assert_eq!(first.status, 200);
 
-        // A real wait, past the 1 ms TTL: the entry the first send wrote is
-        // gone, so the second send cannot be steered by it.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(
-            sender.negotiated_for("https", "origin.test:443"),
-            None,
-            "the cache entry must age out with the configured TTL"
-        );
+        // Wait on the condition, not on a clock: the 1 ms entry the first send
+        // wrote has to be gone before the second send, or it would be steered
+        // by it.
+        until(
+            "the cache entry must age out with the configured TTL",
+            || sender.negotiated_for("https", "origin.test:443").is_none(),
+        )
+        .await;
 
         let second = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
             .await
