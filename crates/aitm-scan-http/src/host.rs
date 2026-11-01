@@ -192,7 +192,7 @@ impl HttpProbeHost {
             Ok(Err(err)) => {
                 return Err(anyhow!(
                     "scan: {what} failed: {}",
-                    redact::scrub(&format!("{err:#}"))
+                    redact::scrub_error(&err)
                 ))
             }
             Err(_) => return Err(anyhow!("scan: {what} ran past its time bound")),
