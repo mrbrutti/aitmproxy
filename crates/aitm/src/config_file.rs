@@ -18,9 +18,9 @@ use anyhow::{bail, Context as _};
 use serde::Deserialize;
 
 use aitm_core::{
-    BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig, FirefoxConfig,
-    Frontend, LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig, PocConfig,
-    ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, Value,
+    AuditLogSetting, BackoffConfig, BrowserConfig, BrowserEngine, CaConfig, Config, FindingsConfig,
+    FirefoxConfig, Frontend, LimitConfig, MapsConfig, McpConfig, McpTransport, ObscuraConfig,
+    PocConfig, ScopeConfig, ScopeEntry, SessionIoConfig, SsrfPolicy, TlsConfig, Value,
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 use aitm_proto_l4::config::L4Config;
@@ -243,7 +243,7 @@ impl ConfigFile {
             ca.apply(&mut c.ca)?;
         }
         if let Some(m) = self.mcp {
-            m.apply(&mut c.mcp);
+            m.apply(&mut c.mcp)?;
         }
         if let Some(b) = self.browser {
             b.apply(&mut c.browser);
@@ -562,10 +562,13 @@ struct McpFile {
     operator_token: Option<String>,
     /// The role a stdio connection speaks as (default `agent`).
     stdio_role: Option<RoleFile>,
+    /// The durable audit log: `true` (the default file), `false` or `off`, or an
+    /// absolute path. Absent keeps the default.
+    audit_log: Option<AuditLogFile>,
 }
 
 impl McpFile {
-    fn apply(self, c: &mut McpConfig) {
+    fn apply(self, c: &mut McpConfig) -> anyhow::Result<()> {
         if let Some(t) = self.transport {
             c.transport = t.into();
         }
@@ -573,6 +576,60 @@ impl McpFile {
             c.operator_token = self.operator_token;
         }
         set(&mut c.stdio_role, self.stdio_role.map(Into::into));
+        if let Some(a) = self.audit_log {
+            c.audit_log = a.into_setting()?;
+        }
+        Ok(())
+    }
+}
+
+/// `audit_log: true | false | off | /absolute/path`. Untagged, so each YAML
+/// scalar lands in the first variant that takes it; `Other` catches what is
+/// neither a boolean nor a string (a number, a list) so that it is refused with
+/// the same message as a relative path instead of serde's generic "data did not
+/// match any variant".
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AuditLogFile {
+    Flag(bool),
+    Text(String),
+    Other(serde_yaml::Value),
+}
+
+impl AuditLogFile {
+    /// `true` is the default file, `false` and `off` (any case) turn it off, an
+    /// absolute path names the file; anything else is a config error.
+    fn into_setting(self) -> anyhow::Result<AuditLogSetting> {
+        match self {
+            Self::Flag(true) => Ok(AuditLogSetting::Default),
+            Self::Flag(false) => Ok(AuditLogSetting::Off),
+            Self::Text(s) if s.eq_ignore_ascii_case("off") => Ok(AuditLogSetting::Off),
+            Self::Text(s) if Path::new(&s).is_absolute() => {
+                Ok(AuditLogSetting::Path(PathBuf::from(s)))
+            }
+            // The value is not printed, only its kind: a file with a token under
+            // the wrong key must not have the token echoed into a log.
+            Self::Text(_) => bail!(
+                "mcp.audit_log must be true, false, off, or an absolute path; got a string that is neither off nor an absolute path"
+            ),
+            Self::Other(v) => bail!(
+                "mcp.audit_log must be true, false, off, or an absolute path; got {}",
+                yaml_kind(&v)
+            ),
+        }
+    }
+}
+
+/// What kind of YAML value `value` is, for an error that must not print it.
+fn yaml_kind(value: &serde_yaml::Value) -> &'static str {
+    match value {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a boolean",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a list",
+        serde_yaml::Value::Mapping(_) => "a mapping",
+        serde_yaml::Value::Tagged(_) => "a tagged value",
     }
 }
 

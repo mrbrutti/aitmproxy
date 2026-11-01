@@ -1,6 +1,12 @@
 # macOS NE observe-only lane design
 
-**Status:** draft
+**Status:** approved (2026-11-01 by Matt — "Approve spec" in the observe-only-lane session:
+calls C1–C13 accepted as recommended; OQ9 = (a) TCP-only catch-all rule as a separate fix).
+Dispositions in §Resolved decisions. **Part 1 is already on main** as PR #195
+(`2026-10-31-ne-source-app-on-the-wire-design.md`: `FlowMeta.source_app` /
+`capture_interface` on `flow.get`/`flow.table`/`flow.detail`/push), in a different shape from
+§Part 1's `ConnInfo.process`; the plan verifies that shape against OL-AC1/OL-AC2 and closes
+only residual gaps — it does not re-implement Part 1.
 **Research inputs:** `docs/research/23-macos-observe-only-lane.md` (primary; "research
 12" below), `docs/research/10-macos-network-extension.md` (§3.1, §3.5, §3.7, §3.9),
 `docs/research/experiments/2026-10-29-macos-ne-spike.md`,
@@ -606,9 +612,30 @@ source tripwire; **[review]** a Stage-6 finding.
   `log show --predicate 'process == "AitmproxyNE"'` prints one `New flow` line per flow
   with app, hostname, endpoints and interface (survey §Setup / item 6).
 
+## Resolved decisions (2026-11-01, Matt)
+
+Matt approved the spec as recommended ("Approve spec", 2026-11-01). Every open question
+below is **resolved to the Architect's recommendation** and kept for provenance:
+
+- **OQ1 → (a) now, wire shaped for (b)** (Candidate 2); (b) and (c) are not built.
+- **OQ2 → no bytes or duration in v1.**
+- **OQ3 → agents may not read observed rows by default**: `observe.*` is `Read` but refused
+  for `Frontend::Mcp` unless `macos_capture.observe.agent_readable` is set in the config file.
+- **OQ4 → same-uid only, self excluded**; root daemons and other users' apps are not observed.
+- **OQ5 → deferred** with (b).
+- **OQ6 → experiments 6/7/8 done** (survey write-up); item 9 and the (b) items 10–17 deferred.
+- **OQ7 → parent-spec wording amendment approved** and applied to
+  `2026-10-29-aitmproxy-macos-network-extension-design.md` §Anti-goals in the same commit.
+- **OQ8 → hostnames connect-by-name only, else IP:port, no reverse DNS.**
+- **OQ9 → (a) TCP-only catch-all rule, as its own small fix** landing before this plan's
+  `[Mac]` acceptance (proposed as session "Fix: TCP-only NE catch-all rule"); an Apple
+  Feedback citing DevForums 770707 is drafted there for Matt to file.
+- **Part 1 → superseded by PR #195** (see Status); the plan verifies, not rebuilds.
+
 ## Open questions
 
-Only Matt can answer these; each carries the Architect's recommendation.
+**None remain — all resolved 2026-11-01 (see §Resolved decisions).** Kept for provenance;
+each carries the Architect's recommendation, which is now the decision.
 
 1. **(a) now, wire shaped for (b) — confirm the fork.** Recommend Candidate 2 as designed.
    (b) in v1 means a third consent, an unknown fail-open posture on provider death,
