@@ -463,7 +463,24 @@ version = "0.5.8"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
+ "aitm-plugin-rhai",
+ "aitm-proto-http",
+ "aitm-proto-ws",
  "aitm-scan-model",
+ "aitm-testtarget",
+ "anyhow",
+ "bytes",
+ "form_urlencoded",
+ "futures",
+ "rcgen",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
