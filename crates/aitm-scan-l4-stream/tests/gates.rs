@@ -1,0 +1,784 @@
+//! Inner loop only: in-process speakers; not acceptance evidence for T6-1..T6-5.
+//!
+//! The lane's safety gates, driven the way the engine drives them: **C8** (a dry
+//! run opens no socket), **C9** (every refusal opens no socket), **C10** (a
+//! wildcard interface entry authorises, a literal one does not), **C15** (the
+//! four ceilings: cases per job, bytes per second, concurrent connections, and
+//! the message size), **C16** (ids are stable and repeat elements are capped)
+//! and **C18** (the core's own listener ports are never addressed). Spec S7 is
+//! the dry run.
+//!
+//! Every test that needs a real port binds an ephemeral one through
+//! [`common::bind_or_skip`], which prints `SKIP: sandbox refuses local binding`
+//! and makes the test return; where a port *can* be bound the test asserts and
+//! fails loudly. Most tests here need no port at all: a refusal, a dry run and a
+//! ceiling are all decided before a socket would be opened, which is the point.
+
+mod common;
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use aitm_proto_l4::config::L4Config;
+use aitm_proto_l4::guard::{L4Guard, ANY_INTERFACE};
+use aitm_proto_l4::types::{
+    IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange, RateCap,
+};
+use aitm_scan_l4_stream::client::testing::CountingClient;
+use aitm_scan_l4_stream::client::StreamClient;
+use aitm_scan_l4_stream::codec::encode_hex;
+use aitm_scan_l4_stream::host::HostError;
+use aitm_scan_l4_stream::state::{
+    MAX_BYTES_PER_S, MAX_CASES_PER_JOB, MAX_CONNECTIONS, MAX_MESSAGE, MAX_REPEAT_INDEX,
+};
+use aitm_scan_l4_stream::{lane_with_client, L4StreamLane};
+use aitm_scan_model::{
+    builtin_profiles, Check, Discovery, JobCtx, L4Seed, L4TargetSpec, L4Transport, Lane, Outcome,
+    Payload, PayloadMode, ProfileTarget, ScanProfile,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+
+use common::TestJob;
+
+// ---------------------------------------------------------------------------
+// Scaffolding
+// ---------------------------------------------------------------------------
+
+/// The built-in `l4-stream-safe` profile, which is what an operator runs.
+fn safe_profile() -> ScanProfile {
+    builtin_profiles()
+        .into_iter()
+        .find(|profile| profile.name == "l4-stream-safe")
+        .expect("`l4-stream-safe` is a built-in profile")
+}
+
+/// `l4-stream-safe` over one endpoint, with the case budget, grammar and seeds
+/// a test needs.
+fn profile_for(
+    ip: &str,
+    port: u16,
+    grammar: Option<&str>,
+    cases: u32,
+    seeds: &[String],
+) -> ScanProfile {
+    let mut profile = safe_profile();
+    profile.l4.cases = cases;
+    profile.l4.seeds = seeds
+        .iter()
+        .map(|hex| L4Seed::Hex { hex: hex.clone() })
+        .collect();
+    profile.target = ProfileTarget {
+        origins: Vec::new(),
+        l4: vec![L4TargetSpec {
+            ip: ip.to_string(),
+            port,
+            proto: L4Transport::Tcp,
+            grammar: grammar.map(str::to_string),
+        }],
+    };
+    profile
+}
+
+/// Seeds as the profile carries them: lowercase hex of the given byte strings.
+fn hex_seeds(seeds: &[&[u8]]) -> Vec<String> {
+    seeds.iter().map(|bytes| encode_hex(bytes)).collect()
+}
+
+/// One scope entry, written the way an operator's config does.
+fn entry(addr: Ipv4Addr, prefix: u8, interface: &str, capability: L4Capability) -> L4ScopeEntry {
+    L4ScopeEntry {
+        id: L4ScopeId::new(),
+        cidr: IpCidr {
+            addr: IpAddr::V4(addr),
+            prefix,
+        },
+        ports: PortRange { lo: 0, hi: 65535 },
+        interface: interface.to_string(),
+        direction: L4Direction::Outbound,
+        capability,
+        inject_rate: RateCap {
+            pps: 10_000,
+            burst: 10_000,
+        },
+        source: L4ScopeSource::Config,
+    }
+}
+
+/// A guard over `scope`, L4 enabled.
+fn guard_over(scope: Vec<L4ScopeEntry>) -> Arc<L4Guard> {
+    Arc::new(L4Guard::new(&L4Config {
+        enabled: true,
+        scope,
+        ..Default::default()
+    }))
+}
+
+/// A payload carrying `bytes` at the point.
+fn payload(bytes: &[u8]) -> Payload {
+    Payload {
+        value: String::new(),
+        mode: PayloadMode::Replace,
+        bytes: Some(bytes.to_vec()),
+    }
+}
+
+/// The lane's check with this catalogue id.
+fn check_by_id(checks: &[Arc<dyn Check>], id: &str) -> Arc<dyn Check> {
+    checks
+        .iter()
+        .find(|check| check.meta().id == id)
+        .unwrap_or_else(|| panic!("the lane ships a `{id}` check"))
+        .clone()
+}
+
+/// The `<planned>` of the S6.5 detail's `cases=<sent>/<planned>` clause.
+fn planned_in(detail: &str) -> u32 {
+    let clause = detail
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("cases="))
+        .unwrap_or_else(|| panic!("the detail has no `cases=` clause: {detail}"));
+    let (_sent, planned) = clause
+        .split_once('/')
+        .unwrap_or_else(|| panic!("`cases={clause}` is not `<sent>/<planned>`: {detail}"));
+    planned
+        .parse()
+        .unwrap_or_else(|e| panic!("`{planned}` is not a case count ({e}): {detail}"))
+}
+
+/// Discover under `profile`, through `client`, against `guard`.
+async fn discover_with(
+    guard: Option<Arc<L4Guard>>,
+    client: Arc<CountingClient>,
+    profile: ScanProfile,
+    job_id: &str,
+) -> (
+    Arc<L4StreamLane>,
+    Arc<dyn JobCtx>,
+    anyhow::Result<Discovery>,
+) {
+    let target = profile.target.clone();
+    let lane = lane_with_client(guard, None, Arc::clone(&client) as Arc<dyn StreamClient>);
+    let job: Arc<dyn JobCtx> = Arc::new(
+        TestJob::new(profile)
+            .with_job_id(job_id)
+            .with_marker(&format!("aitm{job_id}")),
+    );
+    let found = lane.discover(&target, job.as_ref()).await;
+    (lane, job, found)
+}
+
+// ---------------------------------------------------------------------------
+// A speaker that holds each connection open
+// ---------------------------------------------------------------------------
+
+/// An in-process TCP speaker that accepts, reads one message, holds the
+/// connection `hold` long, then echoes and closes.
+///
+/// Task 21's speakers all mimic a T10 trigger; this one mimics nothing — it
+/// exists so a test can watch how many connections the lane holds at once
+/// (C15's four-connection ceiling) and whether a refusal let one through at all
+/// (C9, C10, C18). The live counter is decremented *before* the reply is
+/// written, so the high-water mark can never over-count a connection the lane
+/// has already been released from.
+struct Holder {
+    /// Where the lane reaches it.
+    addr: SocketAddr,
+    /// Connections accepted since it started.
+    accepts: Arc<AtomicU32>,
+    /// The most connections it ever held at once.
+    max_concurrent: Arc<AtomicU32>,
+}
+
+impl Holder {
+    fn accepts(&self) -> u32 {
+        self.accepts.load(Ordering::SeqCst)
+    }
+
+    fn max_concurrent(&self) -> u32 {
+        self.max_concurrent.load(Ordering::SeqCst)
+    }
+}
+
+/// The port a socket-free test names: nothing of this harness listens on it,
+/// and no test that uses it ever reaches the wire — a refusal, a dry run, a
+/// passed deadline or a client double stops every one of them first.
+const UNBOUND: u16 = 9000;
+
+/// A speaker and its port, or the socket-free fallback.
+///
+/// A sandbox that refuses to bind leaves the speaker `None` and names
+/// [`UNBOUND`], so the half of a test that opens no socket — which is most of
+/// what C8, C9, C15, C16 and C18 are about — still runs and still asserts. The
+/// connection counters are then the only thing not checked, and
+/// [`accepts_is`] skips exactly those.
+async fn holder_or_unbound(hold: Duration) -> (Option<Holder>, u16) {
+    match holder(hold).await {
+        Some(speaker) => {
+            let port = speaker.addr.port();
+            (Some(speaker), port)
+        }
+        None => (None, UNBOUND),
+    }
+}
+
+/// Assert the speaker accepted `want` connections, when a speaker was bound.
+fn accepts_is(speaker: Option<&Holder>, want: u32, what: &str) {
+    if let Some(speaker) = speaker {
+        assert_eq!(speaker.accepts(), want, "{what}");
+    }
+}
+
+/// A [`Holder`] on an ephemeral loopback port, or `None` when the sandbox
+/// refuses to bind.
+async fn holder(hold: Duration) -> Option<Holder> {
+    let listener: TcpListener = common::bind_or_skip().await?;
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(e) => panic!("a bound loopback listener has a local address: {e}"),
+    };
+    let accepts = Arc::new(AtomicU32::new(0));
+    let live = Arc::new(AtomicU32::new(0));
+    let max_concurrent = Arc::new(AtomicU32::new(0));
+    let speaker = Holder {
+        addr,
+        accepts: Arc::clone(&accepts),
+        max_concurrent: Arc::clone(&max_concurrent),
+    };
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _peer)) = listener.accept().await else {
+                return;
+            };
+            accepts.fetch_add(1, Ordering::SeqCst);
+            let held = live.fetch_add(1, Ordering::SeqCst) + 1;
+            max_concurrent.fetch_max(held, Ordering::SeqCst);
+            let live = Arc::clone(&live);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                tokio::time::sleep(hold).await;
+                // Release the count first: the lane's connection permit is only
+                // freed once it has the reply, so a connection counted here is
+                // always one the lane is still holding.
+                live.fetch_sub(1, Ordering::SeqCst);
+                let _ = stream.write_all(buf.get(..read).unwrap_or(b"")).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    Some(speaker)
+}
+
+// ---------------------------------------------------------------------------
+// C8 / S7: a dry run opens no socket
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dry_run_opens_no_socket() {
+    // A dry run opens nothing, so the speaker is here only to be ignored.
+    let speaker = common::tlv_crash(Duration::from_secs(1)).await;
+    let port = speaker.as_ref().map_or(UNBOUND, |s| s.addr.port());
+
+    // The guard authorises the endpoint for discovery's S5.2 step-1 preview,
+    // and is then emptied: from here on *any* `guard.check` refuses, so a
+    // single byte on the wire would surface as a `Guard` stop reason.
+    let guard = common::wildcard_guard(&[port]);
+    let mut profile = profile_for("127.0.0.1", port, Some("raw"), 100, &hex_seeds(&[b"abc"]));
+    profile.l4.dry_run = true;
+
+    let client = Arc::new(CountingClient::dry_run());
+    let (lane, job, found) = discover_with(
+        Some(Arc::clone(&guard)),
+        Arc::clone(&client),
+        profile,
+        "22dry",
+    )
+    .await;
+    let discovery = found.expect("discovery over a scoped loopback endpoint succeeds");
+    assert_eq!(
+        discovery.points.len(),
+        1,
+        "one `raw` seed is one point: {:?}",
+        discovery
+            .points
+            .iter()
+            .map(|point| point.path.clone())
+            .collect::<Vec<_>>()
+    );
+
+    for existing in guard.list_scope() {
+        assert!(guard.remove_scope(existing.id), "the entry was there");
+    }
+    assert!(
+        guard.list_scope().is_empty(),
+        "the dry run runs against an empty scope"
+    );
+
+    let point = &discovery.points[0];
+    let host = lane
+        .probe_host_for(point, Arc::clone(&job))
+        .expect("the lane hosts probes for a point it discovered");
+    let verdict = check_by_id(&lane.checks(), "l4-crash")
+        .run(point, host.as_ref())
+        .await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert!(
+        verdict.detail.starts_with("dry run: 100 cases"),
+        "{}",
+        verdict.detail
+    );
+    let rendered = verdict
+        .detail
+        .lines()
+        .filter(|line| line.starts_with('#'))
+        .count();
+    assert_eq!(rendered, 50, "{}", verdict.detail);
+
+    // Nothing was sent, so the empty scope never bit: no guard refusal reached
+    // the verdict, no exchange was opened, and the speaker saw no connection.
+    assert!(
+        !verdict.detail.contains("guard refused"),
+        "a dry run never asks the guard: {}",
+        verdict.detail
+    );
+    assert_eq!(client.count(), 0, "a dry run opens no exchange");
+    if let Some(speaker) = speaker.as_ref() {
+        assert_eq!(speaker.accepts(), 0, "a dry run opens no socket");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C9: every refusal opens no socket
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn refusals_open_no_socket() {
+    let (speaker, port) = holder_or_unbound(Duration::ZERO).await;
+    let seeds = hex_seeds(&[b"abc"]);
+
+    // The shipped constructor with no guard: L4 is disabled.
+    let disabled = aitm_scan_l4_stream::lane(None, None).expect("the lane is Some even so");
+    let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &seeds);
+    let target = profile.target.clone();
+    let job = TestJob::new(profile).with_job_id("22off");
+    let error = disabled
+        .discover(&target, &job)
+        .await
+        .expect_err("a disabled L4 subsystem sends nothing");
+    assert_eq!(
+        error.to_string(),
+        "scan: refused_l4: L4 is disabled (l4.enabled: false); the stream lane sends nothing"
+    );
+
+    // The same refusal through a *live* client, which would really connect to
+    // the speaker if the lane let it.
+    let cases: Vec<(&str, Option<Arc<L4Guard>>, &str)> = vec![
+        ("disabled", None, "scan: refused_l4: "),
+        (
+            "other CIDR",
+            Some(guard_over(vec![entry(
+                Ipv4Addr::new(10, 0, 0, 0),
+                8,
+                ANY_INTERFACE,
+                L4Capability::Inject,
+            )])),
+            "scan: out_of_scope: ",
+        ),
+        (
+            "capture only",
+            Some(guard_over(vec![entry(
+                Ipv4Addr::new(127, 0, 0, 0),
+                8,
+                ANY_INTERFACE,
+                L4Capability::Capture,
+            )])),
+            "scan: out_of_scope: ",
+        ),
+    ];
+
+    for (name, guard, prefix) in cases {
+        let client = Arc::new(CountingClient::live());
+        let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &seeds);
+        let (_lane, _job, found) =
+            discover_with(guard, Arc::clone(&client), profile, "22refuse").await;
+        let error = found
+            .err()
+            .unwrap_or_else(|| panic!("the `{name}` guard must refuse"));
+        let text = error.to_string();
+        assert!(text.starts_with(prefix), "{name}: {text}");
+        if name == "capture only" {
+            assert!(text.contains("capability"), "{name}: {text}");
+        }
+        assert_eq!(client.count(), 0, "{name}: a refusal opens no exchange");
+    }
+
+    accepts_is(speaker.as_ref(), 0, "a refusal opens no socket");
+}
+
+// ---------------------------------------------------------------------------
+// C10: a wildcard interface entry authorises, a literal one does not
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wildcard_authorises_literal_refuses() {
+    let (speaker, port) = holder_or_unbound(Duration::ZERO).await;
+    let seeds = hex_seeds(&[b"abc"]);
+
+    // `"*"`: the preview passes and one real probe reaches the speaker. This
+    // half needs a bound port — it is the one place in this file that puts a
+    // byte on the wire — so without one it is left to the Terminal run.
+    if let Some(speaker) = speaker.as_ref() {
+        let client = Arc::new(CountingClient::live());
+        let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &seeds);
+        let (lane, job, found) = discover_with(
+            Some(common::wildcard_guard(&[port])),
+            Arc::clone(&client),
+            profile,
+            "22wild",
+        )
+        .await;
+        let discovery = found.expect("the wildcard entry authorises the preview");
+        let point = &discovery.points[0];
+        let host = lane
+            .probe_host_for(point, Arc::clone(&job))
+            .expect("the lane hosts the point");
+        host.probe(&payload(b"abc"))
+            .await
+            .expect("an authorised probe reaches the speaker");
+        assert_eq!(client.count(), 1, "one probe is one exchange");
+        assert_eq!(speaker.accepts(), 1, "one probe is one connection");
+    }
+
+    // `"lo0"`: a socket client cannot promise an egress interface, so a literal
+    // entry authorises nothing and no second connection is made.
+    let literal = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &seeds);
+    let (_lane, _job, found) = discover_with(
+        Some(guard_over(vec![entry(
+            Ipv4Addr::new(127, 0, 0, 0),
+            8,
+            "lo0",
+            L4Capability::Inject,
+        )])),
+        Arc::clone(&literal),
+        profile,
+        "22lo0",
+    )
+    .await;
+    let error = found.expect_err("a literal interface entry does not cover the wildcard");
+    assert!(
+        error.to_string().starts_with("scan: out_of_scope: "),
+        "{error}"
+    );
+    assert_eq!(literal.count(), 0, "a refusal opens no exchange");
+    accepts_is(
+        speaker.as_ref(),
+        1,
+        "the refused lane added no connection of its own",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C15: the four ceilings
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ceilings() {
+    let seeds = hex_seeds(&[b"aaa", b"bbb", b"ccc"]);
+
+    // (1) Cases per job: a profile asking for a million over three points
+    // plans at most the lane's own ceiling in total. The job's deadline has
+    // already passed, so every campaign stops at its first case: the planned
+    // count is what is under test, not a million real sends.
+    let client = Arc::new(CountingClient::dry_run());
+    let mut profile = profile_for("127.0.0.1", 9000, Some("raw"), 999_999, &seeds);
+    profile.l4.max_bytes_per_s = 1_000_000_000;
+    let target = profile.target.clone();
+    let lane = lane_with_client(
+        Some(common::wildcard_guard(&[9000])),
+        None,
+        Arc::clone(&client) as Arc<dyn StreamClient>,
+    );
+    let job: Arc<dyn JobCtx> = Arc::new(
+        TestJob::new(profile)
+            .with_job_id("22cap")
+            .with_marker("aitm22cap")
+            .with_deadline(Instant::now() - Duration::from_secs(1)),
+    );
+    let discovery = lane
+        .discover(&target, job.as_ref())
+        .await
+        .expect("three `raw` seeds over a scoped endpoint");
+    assert_eq!(discovery.points.len(), 3, "three seeds are three points");
+
+    let crash = check_by_id(&lane.checks(), "l4-crash");
+    let mut total_planned = 0u32;
+    for point in &discovery.points {
+        let host = lane
+            .probe_host_for(point, Arc::clone(&job))
+            .expect("the lane hosts the point");
+        let verdict = crash.run(point, host.as_ref()).await;
+        total_planned += planned_in(&verdict.detail);
+    }
+    assert!(
+        total_planned <= MAX_CASES_PER_JOB,
+        "three points planned {total_planned} cases, over the {MAX_CASES_PER_JOB} lane cap"
+    );
+    assert_eq!(total_planned, 4998, "5000 / 3 points, three times");
+    assert_eq!(client.count(), 0, "a passed deadline opens no exchange");
+
+    // (2) Bytes per second: a gigabyte-per-second profile is paced at 1 MiB/s.
+    let state = lane.state().get("22cap").expect("discovery left state");
+    let rate = state
+        .pacer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .rate();
+    assert_eq!(rate, MAX_BYTES_PER_S);
+    assert_eq!(rate, 1_048_576);
+
+    // (3) Concurrent connections: eight probes from eight hosts of one job
+    // never hold more than four connections at once.
+    let Some(speaker) = holder(Duration::from_millis(500)).await else {
+        return;
+    };
+    let port = speaker.addr.port();
+    let eight = hex_seeds(&[b"s0", b"s1", b"s2", b"s3", b"s4", b"s5", b"s6", b"s7"]);
+    let client = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &eight);
+    let (lane, job, found) = discover_with(
+        Some(common::wildcard_guard(&[port])),
+        Arc::clone(&client),
+        profile,
+        "22conc",
+    )
+    .await;
+    let discovery = found.expect("eight seeds over a scoped loopback endpoint");
+    assert_eq!(discovery.points.len(), 8, "eight seeds are eight points");
+
+    let hosts: Vec<Box<dyn aitm_scan_model::ProbeHost>> = discovery
+        .points
+        .iter()
+        .map(|point| {
+            lane.probe_host_for(point, Arc::clone(&job))
+                .expect("the lane hosts every point it discovered")
+        })
+        .collect();
+    let probes = hosts.iter().map(|host| {
+        let case = payload(b"concurrent");
+        async move { host.probe(&case).await.map(|_| ()) }
+    });
+    for result in futures::future::join_all(probes).await {
+        result.expect("every authorised probe reaches the speaker");
+    }
+    assert_eq!(speaker.accepts(), 8, "eight probes are eight connections");
+    assert_eq!(
+        speaker.max_concurrent(),
+        u32::try_from(MAX_CONNECTIONS).expect("four fits"),
+        "the job's connection ceiling is {MAX_CONNECTIONS}"
+    );
+
+    // (4) Message size: a seed over the message ceiling contributes nothing.
+    let oversize = "00".repeat(70_000);
+    assert!(
+        oversize.len() / 2 > MAX_MESSAGE,
+        "the seed is over the {MAX_MESSAGE}-byte ceiling"
+    );
+    let client = Arc::new(CountingClient::dry_run());
+    let profile = profile_for("127.0.0.1", 9000, Some("raw"), 10, &[oversize]);
+    let (_lane, _job, found) = discover_with(
+        Some(common::wildcard_guard(&[9000])),
+        Arc::clone(&client),
+        profile,
+        "22big",
+    )
+    .await;
+    let discovery = found.expect("an over-long seed is skipped, not a discovery failure");
+    assert_eq!(discovery.nodes.len(), 1, "the endpoint is still a node");
+    assert!(
+        discovery.points.is_empty(),
+        "an over-long seed yields no point: {:?}",
+        discovery
+            .points
+            .iter()
+            .map(|point| point.path.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(client.count(), 0, "discovery opens no exchange");
+}
+
+// ---------------------------------------------------------------------------
+// C16: ids are stable, repeat elements are capped
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ids_stable_and_capped() {
+    let seeds = hex_seeds(&[b"aaa", b"bbb"]);
+
+    // Two independent runs of the same discovery, under different jobs and
+    // markers: the ids an operator sees must not move.
+    let mut ids: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for job_id in ["22ida", "22idb"] {
+        let profile = profile_for("127.0.0.1", 9000, Some("raw"), 10, &seeds);
+        let (_lane, _job, found) = discover_with(
+            Some(common::wildcard_guard(&[9000])),
+            Arc::new(CountingClient::dry_run()),
+            profile,
+            job_id,
+        )
+        .await;
+        let discovery = found.expect("two `raw` seeds over a scoped endpoint");
+        ids.push((
+            discovery
+                .points
+                .iter()
+                .map(|point| point.id.clone())
+                .collect(),
+            discovery.nodes.iter().map(|node| node.id.clone()).collect(),
+        ));
+    }
+    let (first_points, first_nodes) = &ids[0];
+    let (second_points, second_nodes) = &ids[1];
+    assert_eq!(first_points.len(), 2, "{first_points:?}");
+    assert_eq!(first_points, second_points, "point ids are stable");
+    assert_eq!(first_nodes, second_nodes, "node ids are stable");
+    assert_eq!(
+        first_nodes,
+        &vec!["l4s-tcp-127.0.0.1-9000".to_string()],
+        "the node id is the endpoint"
+    );
+
+    // A RESP array of ten elements yields points for the first four only: the
+    // later ones are reached by the structure-aware mutators, not by a point
+    // each (spec S5.2 step 4).
+    let mut resp: Vec<u8> = b"*10\r\n".to_vec();
+    for _ in 0..10 {
+        resp.extend_from_slice(b"$1\r\na\r\n");
+    }
+    let profile = profile_for("127.0.0.1", 9000, Some("resp"), 10, &hex_seeds(&[&resp]));
+    let (_lane, _job, found) = discover_with(
+        Some(common::wildcard_guard(&[9000])),
+        Arc::new(CountingClient::dry_run()),
+        profile,
+        "22resp",
+    )
+    .await;
+    let discovery = found.expect("a RESP seed over a scoped endpoint");
+    let paths: Vec<String> = discovery
+        .points
+        .iter()
+        .map(|point| point.path.clone().unwrap_or_default())
+        .collect();
+    assert!(
+        paths.iter().any(|path| path.starts_with("args[3]")),
+        "the last kept element has points: {paths:?}"
+    );
+    for index in 0..10usize {
+        let has = paths
+            .iter()
+            .any(|path| path.starts_with(&format!("args[{index}]")));
+        assert_eq!(
+            has,
+            index <= MAX_REPEAT_INDEX,
+            "args[{index}] in {paths:?} (cap {MAX_REPEAT_INDEX})"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C18: the core's own listener ports
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn self_port_exclusion() {
+    let (speaker, port) = holder_or_unbound(Duration::ZERO).await;
+    let seeds = hex_seeds(&[b"abc"]);
+    let text = format!("{port} is one of the core's own listener ports");
+
+    // Declared before discovery: the endpoint is never discovered at all.
+    let guard = common::wildcard_guard(&[port]);
+    guard.set_self_ports([port]);
+    let client = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &seeds);
+    let (_lane, _job, found) = discover_with(
+        Some(Arc::clone(&guard)),
+        Arc::clone(&client),
+        profile,
+        "22selfa",
+    )
+    .await;
+    let error = found.expect_err("the lane never addresses the core's own listener");
+    assert_eq!(
+        error.to_string(),
+        format!("scan: out_of_scope: 127.0.0.1:{text}")
+    );
+    assert_eq!(client.count(), 0, "a refused endpoint opens no exchange");
+    accepts_is(speaker.as_ref(), 0, "a refused endpoint opens no socket");
+
+    // Declared *after* discovery, as a new core listener binds mid-job: the
+    // next probe is refused by the host's own re-check (A1).
+    let guard = common::wildcard_guard(&[port]);
+    let client = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", port, Some("raw"), 10, &seeds);
+    let (lane, job, found) = discover_with(
+        Some(Arc::clone(&guard)),
+        Arc::clone(&client),
+        profile,
+        "22selfb",
+    )
+    .await;
+    let discovery = found.expect("discovery before the listener bound");
+    let point = &discovery.points[0];
+    let host = lane
+        .probe_host_for(point, Arc::clone(&job))
+        .expect("the lane hosts the point");
+
+    guard.add_self_ports([port]);
+    let error = host
+        .probe(&payload(b"abc"))
+        .await
+        .expect_err("a probe at the core's own listener is refused");
+    assert!(
+        matches!(error.downcast_ref::<HostError>(), Some(HostError::Guard(_))),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&text), "{error}");
+    assert_eq!(client.count(), 0, "the refused probe opened no exchange");
+    accepts_is(speaker.as_ref(), 0, "the refused probe opened no socket");
+
+    // The same port number on a routable address the operator scoped is not the
+    // core's own listener: the probe reaches the client, which opens nothing.
+    let routable = guard_over(vec![entry(
+        Ipv4Addr::new(10, 0, 0, 0),
+        8,
+        ANY_INTERFACE,
+        L4Capability::Inject,
+    )]);
+    routable.set_self_ports([port]);
+    let client = Arc::new(CountingClient::dry_run());
+    let profile = profile_for("10.0.0.9", port, Some("raw"), 10, &seeds);
+    let (lane, job, found) =
+        discover_with(Some(routable), Arc::clone(&client), profile, "22selfc").await;
+    let discovery = found.expect("a scoped routable destination on the same port number");
+    let point = &discovery.points[0];
+    let host = lane
+        .probe_host_for(point, Arc::clone(&job))
+        .expect("the lane hosts the point");
+    let error = host
+        .probe(&payload(b"abc"))
+        .await
+        .expect_err("the client double opens nothing");
+    assert_eq!(
+        error.downcast_ref::<HostError>(),
+        Some(&HostError::DryRun),
+        "{error}"
+    );
+    assert_eq!(client.count(), 1, "the probe reached the client");
+    accepts_is(speaker.as_ref(), 0, "and never the loopback speaker");
+}
