@@ -443,6 +443,15 @@ Kept by the main session during stage 6. One row per finding.
 | fix F | coder note | Minor | Jobs `labelled()` passes `width - 1`, Issues `width`; one spare cell differs | fix round G (deferred to the whole-branch pass) |
 | fix E+F | spec | re-review | E1 to E19 and F1 to F15 closed with the reports' literals; four file-placement Minors accepted (E4/E11/E16 edits inside the model and view were the natural site) | closed |
 | fix E+F | spec | Minor | D3 did not name `read_order` or the oldest-first eviction | spec D3 amended in this commit |
+| fix E+F | quality | re-review | E1 to E19 and F1 to F15 closed as prescribed; deviations weighed and accepted | closed |
+| fix E+F | quality | Minor | `bound_issue` field list exhaustive by hand | fix round G (G1): generic every-string-leaf guard test |
+| fix E+F | quality | Minor | detail row arithmetic lives in the view and the model | fix round G (G2): `DetailLayout` into the model |
+| fix E+F | quality | Minor | `read`/`read_order` kept in step by hand; eviction can drop the row under the cursor | fix round G (G3): `ReadCache` with cursor-aware eviction |
+| fix E+F | quality | Minor | `labelled()`'s `Option<usize>` is two layouts | fix round G (G5) |
+| fix E+F | quality | Minor | mutation-chain overflow lost its count | fix round G (G6) |
+| fix E+F | quality | Minor | `IssuesState` detail-view trio reset at one site, clamped at another | fix round G (G7): `DetailView` |
+| fix E+F | quality | Minor | `scan_v2_issues.rs` module doc lies; two bundled tests | fix round G (G8): split into `scan_v2_issue_detail.rs` |
+| fix E+F | quality | Minor | small hygiene (`scroll` shadowing, inline paths, `ui::text` shim, module doc, spare cell) | fix round G (G9) |
 
 ## Shipped
 
