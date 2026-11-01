@@ -104,22 +104,35 @@ pub fn is_parser_fault_candidate(o: L4Oracle, liveness_after: bool) -> bool {
     matches!(o, L4Oracle::Reset) && liveness_after
 }
 
+/// The smallest median the latency rules will multiply (F1). A fast loopback
+/// target answers in 0–1 ms, so a raw median of `Some(0)` would make every
+/// later reply an outlier; both rules take `max(median, LATENCY_FLOOR_MS)`
+/// as their base instead.
+pub const LATENCY_FLOOR_MS: u32 = 10;
+
 /// Whether a clean reply's latency is an outlier candidate (spec S6.2):
-/// more than five times the median of the window. Without a median (fewer
-/// than the required samples) no case is an outlier.
+/// more than five times the median of the window, the median floored at
+/// [`LATENCY_FLOOR_MS`]. Without a median (fewer than the required samples)
+/// no case is an outlier.
 #[must_use]
 pub fn latency_outlier(elapsed_ms: u32, median: Option<u32>) -> bool {
     match median {
-        Some(m) => u64::from(elapsed_ms) > 5 * u64::from(m),
+        Some(m) => u64::from(elapsed_ms) > 5 * latency_base(m),
         None => false,
     }
 }
 
 /// Whether the confirming repeat of an outlier candidate confirms it
-/// (spec S6.2): more than three times the median.
+/// (spec S6.2): more than three times the median, the median floored at
+/// [`LATENCY_FLOOR_MS`].
 #[must_use]
 pub fn latency_confirms(elapsed_ms: u32, median: u32) -> bool {
-    u64::from(elapsed_ms) > 3 * u64::from(median)
+    u64::from(elapsed_ms) > 3 * latency_base(median)
+}
+
+/// The base both latency rules multiply: the median clamped up to the floor.
+fn latency_base(median_ms: u32) -> u64 {
+    u64::from(median_ms.max(LATENCY_FLOOR_MS))
 }
 
 #[cfg(test)]
@@ -128,7 +141,7 @@ mod tests {
 
     use super::{
         is_parser_fault_candidate, latency_confirms, latency_outlier, read, triggers_liveness,
-        Reading,
+        Reading, LATENCY_FLOOR_MS,
     };
     use crate::client::Ended;
     use crate::grammar::ReplyClass;
@@ -260,6 +273,23 @@ mod tests {
         assert!(!latency_outlier(1000, None));
         assert!(latency_confirms(31, 10));
         assert!(!latency_confirms(30, 10));
+    }
+
+    /// F1: a sub-millisecond target has a median of 0 or 1 ms, so without a
+    /// floor every later reply would be an outlier. The floor clamps the base
+    /// to [`LATENCY_FLOOR_MS`] for both rules.
+    #[test]
+    fn latency_floor_protects_fast_targets() {
+        assert_eq!(LATENCY_FLOOR_MS, 10);
+        assert!(!latency_outlier(1, Some(0)));
+        assert!(!latency_outlier(49, Some(0)));
+        assert!(latency_outlier(51, Some(0)));
+        assert!(latency_outlier(51, Some(5)));
+        assert!(latency_outlier(60, Some(10)));
+        assert!(!latency_outlier(50, Some(10)));
+        assert!(!latency_confirms(30, 0));
+        assert!(latency_confirms(31, 0));
+        assert!(latency_confirms(31, 10));
     }
 
     #[test]
