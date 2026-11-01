@@ -242,6 +242,55 @@ mod tests {
         );
     }
 
+    /// Panel S4, the IPv6 and port corners (Tester addition): a control byte
+    /// inside a bracketed literal, between the bracket and the port, inside the
+    /// port, or inside an unbracketed literal is rejected, each with the error
+    /// the shape calls for; and the error text names the raw input Debug-escaped,
+    /// so even the message carries no raw control byte.
+    #[test]
+    fn rejects_control_bytes_in_every_part_of_an_ipv6_authority() {
+        for c in ['\x1b', '\x07', '\0', '\x7f', '\r', '\n'] {
+            let inside = format!("[2001:db8::{c}1]:8443");
+            assert_eq!(
+                Authority::parse_with_default(&inside, 443),
+                Err(AuthorityError::InvalidHost(inside.clone())),
+                "{c:?} inside the literal"
+            );
+            let between = format!("[::1]{c}:8443");
+            assert_eq!(
+                Authority::parse_with_default(&between, 443),
+                Err(AuthorityError::InvalidPort(between.clone())),
+                "{c:?} between the bracket and the port"
+            );
+            let in_port = format!("[::1]:84{c}43");
+            assert_eq!(
+                Authority::parse_with_default(&in_port, 443),
+                Err(AuthorityError::InvalidPort(in_port.clone())),
+                "{c:?} inside the port"
+            );
+            let bare = format!("2001:db8::{c}1");
+            assert_eq!(
+                Authority::parse_with_default(&bare, 443),
+                Err(AuthorityError::InvalidHost(bare.clone())),
+                "{c:?} inside an unbracketed literal"
+            );
+            for s in [&inside, &between, &in_port, &bare] {
+                let text = Authority::parse_with_default(s, 443)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    !text.contains(c),
+                    "raw {c:?} in the error text for {s:?}: {text:?}"
+                );
+            }
+        }
+        // The valid literal beside them is unchanged.
+        assert_eq!(
+            Authority::parse_with_default("[2001:db8::1]:8443", 443).unwrap(),
+            Authority::new("2001:db8::1", 8443)
+        );
+    }
+
     #[test]
     fn scope_entry_matching() {
         let a = Authority::new("127.0.0.1", 3000);

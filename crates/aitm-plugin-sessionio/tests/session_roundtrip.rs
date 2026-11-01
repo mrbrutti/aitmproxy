@@ -777,3 +777,70 @@ fn a_tunnel_with_an_unknown_code_loads_as_no_tunnel() {
         assert_eq!(r.response.as_ref().expect("response").status, 200);
     }
 }
+
+/// Panel Q3 (Tester addition): every tunnel outcome this build knows — each
+/// `TunnelMode` with each `TunnelReason` and with none — survives `flow.export`
+/// → `flow.import` of a native session exactly, because the reader reverses the
+/// labels through `TunnelMode::ALL` / `TunnelReason::ALL`, the same lists the
+/// writer's labels come from. The document carries each wire label verbatim.
+#[test]
+fn every_tunnel_mode_and_reason_round_trips_through_a_native_session() {
+    let store = MemFlowStore::new();
+    let mut expected: Vec<(String, TunnelInfo)> = Vec::new();
+    for mode in TunnelMode::ALL {
+        for reason in TunnelReason::ALL.into_iter().map(Some).chain([None]) {
+            let path = format!("/{}/{}", mode.label(), reason.map_or("none", |r| r.label()));
+            let relayed = mode == TunnelMode::Passthrough;
+            let info = TunnelInfo {
+                mode,
+                reason,
+                bytes_up: relayed.then_some(7),
+                bytes_down: relayed.then_some(11),
+            };
+            let mut flow = plain_flow(&path);
+            flow.metadata_mut().tunnel = Some(info.clone());
+            store.insert(flow);
+            expected.push((path, info));
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        3 * 9,
+        "three modes × (eight reasons + none)"
+    );
+    let exported = export_native(&store);
+
+    let doc: serde_json::Value = serde_json::from_slice(&exported).expect("the export is JSON");
+    let flows = doc["flows"].as_array().expect("a flows array");
+    assert_eq!(flows.len(), expected.len());
+    for rec in flows {
+        let path = rec["request"]["path"].as_str().expect("a path");
+        let (_, info) = expected
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap_or_else(|| panic!("unexpected path {path}"));
+        assert_eq!(
+            rec["metadata"]["tunnel"]["mode"],
+            serde_json::json!(info.mode.label()),
+            "{path}"
+        );
+        assert_eq!(
+            rec["metadata"]["tunnel"]["reason"],
+            info.reason
+                .map_or(serde_json::Value::Null, |r| serde_json::json!(r.label())),
+            "{path}"
+        );
+    }
+
+    let fresh = MemFlowStore::new();
+    let ids = import_native(&fresh, exported);
+    assert_eq!(ids.len(), expected.len());
+    let restored = restored_by_path(&fresh, &ids);
+    for (path, info) in &expected {
+        assert_eq!(
+            restored[path.as_str()].metadata().tunnel.as_ref(),
+            Some(info),
+            "{path}"
+        );
+    }
+}

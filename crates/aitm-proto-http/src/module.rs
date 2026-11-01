@@ -9458,5 +9458,214 @@ mod tests {
             assert_eq!(row.metadata.capture_interface.as_deref(), Some("macos-ne"));
             assert!(dialed.lock().expect("dialed lock").is_empty());
         }
+
+        // ---- Tester additions (panel fix range 18073ee4..57563aa3) ---------------
+
+        /// Panel S1, a slow client on the HTTP module's own relay: the row appears
+        /// at the outcome (spec D5), so between the acknowledgement and the first
+        /// byte there is no row and nothing at the origin; a TLS record that
+        /// arrives late is then relayed with exact counts.
+        #[tokio::test]
+        async fn out_of_scope_connect_whose_first_byte_arrives_late_is_relayed() {
+            const RECORD: &[u8] = &[TLS_HANDSHAKE, 0x03, 0x01, 0x00, 0x03, b'a', b'b', b'c'];
+            const REPLY: &[u8] = &[TLS_HANDSHAKE, 0x03, 0x03, 0x00, 0x02, b'o', b'k'];
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, _dialed) = scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert_eq!(
+                    store.count(),
+                    0,
+                    "no row before the first byte: the outcome is not known yet"
+                );
+                let mut probe = [0u8; 1];
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), origin.read(&mut probe))
+                        .await
+                        .is_err(),
+                    "nothing reached the origin before the first byte"
+                );
+                client.write_all(RECORD).await.expect("the late record");
+                let mut got = vec![0u8; RECORD.len()];
+                origin
+                    .read_exact(&mut got)
+                    .await
+                    .expect("the record reaches the origin");
+                assert_eq!(got, RECORD);
+                origin.write_all(REPLY).await.expect("origin replies");
+                let mut reply = vec![0u8; REPLY.len()];
+                client
+                    .read_exact(&mut reply)
+                    .await
+                    .expect("the reply reaches the client");
+                assert_eq!(reply, REPLY);
+                drop(client);
+                let mut rest = Vec::new();
+                origin.read_to_end(&mut rest).await.expect("origin read");
+                assert!(rest.is_empty());
+                drop(origin);
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the relay hung");
+            served.expect("a tunnel both ends closed is a clean close");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(
+                row.metadata.tunnel,
+                Some(TunnelInfo {
+                    mode: TunnelMode::Passthrough,
+                    reason: Some(TunnelReason::OutOfScope),
+                    bytes_up: Some(RECORD.len() as u64),
+                    bytes_down: Some(REPLY.len() as u64),
+                })
+            );
+            assert_eq!(status(row), Some(200));
+            assert!(row.client_conn.tls);
+            assert!(row.metadata.duration.is_some());
+        }
+
+        /// The HTTP module has no pin list: `tls.passthrough` pins belong to the
+        /// passthrough module (spec D2), so a pinned host reaches this module only
+        /// when that module is absent, and then Scope alone decides. Out of Scope
+        /// a non-TLS first byte is refused (above); in Scope it is D6's cleartext
+        /// branch — served inside the tunnel as a `decrypted` row with
+        /// `client.tls == false`, the inner request its own non-passive row —
+        /// never a `passthrough/pinned` row and never a raw relay to the origin.
+        #[tokio::test]
+        async fn in_scope_connect_whose_first_byte_is_cleartext_is_served_as_a_decrypted_tls_false_row(
+        ) {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, mut origin) = duplex(64 * 1024);
+            let (ctx, dialed) =
+                scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                client
+                    .write_all(get_request("/plain", ORIGIN).as_bytes())
+                    .await
+                    .expect("send cleartext inside the tunnel");
+                let head = read_head(&mut origin).await;
+                assert!(
+                    head.starts_with("GET /plain HTTP/1.1\r\n"),
+                    "the origin is served the request as HTTP: {head:?}"
+                );
+                origin
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .expect("origin answers");
+                let body = read_one_200(&mut client).await;
+                drop(client);
+                drop(origin);
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the cleartext tunnel hung");
+            served.expect("the module ends cleanly when the client hangs up");
+            assert_eq!(body, "ok");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, ORIGIN);
+            assert_eq!(outcome(row), (TunnelMode::Decrypted, None));
+            assert_eq!(status(row), Some(200));
+            assert!(!row.client_conn.tls, "the client never spoke TLS");
+            assert!(
+                row.metadata.duration.is_some(),
+                "closed when the connection ended"
+            );
+            assert!(!row.metadata.passive);
+            let inner = request_row(&store, "/plain");
+            assert_eq!(inner.request.method, "GET");
+            assert_eq!(inner.request.authority, ORIGIN);
+            assert_eq!(status(&inner), Some(200));
+            assert!(
+                !inner.metadata.passive,
+                "a request inside an in-scope tunnel is acted on"
+            );
+            assert_eq!(inner.metadata.tunnel, None);
+            assert_eq!(request_paths(&store), vec!["/plain".to_string()]);
+            assert_eq!(
+                *dialed.lock().expect("dialed lock"),
+                vec![(ORIGIN.to_string(), origin_peer())]
+            );
+        }
+
+        /// Panel S4 end to end: a CONNECT whose authority carries an ASCII control
+        /// byte (a terminal escape) is refused before anything is acknowledged or
+        /// dialled — `Authority` rejects it — and the error the acceptor logs
+        /// carries the raw text Debug-escaped: no raw escape byte reaches a log
+        /// line. The row is `failed/protocol_error` under the raw label the module
+        /// records for an unparseable token (lowercased, the byte kept — pinned
+        /// here so a change to that label is a knowing one).
+        #[tokio::test]
+        async fn connect_authority_with_a_control_byte_is_refused_with_an_escaped_error() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(
+                        b"CONNECT \x1b[2Jevil.example:443 HTTP/1.1\r\nHost: evil.example:443\r\n\r\n",
+                    )
+                    .await
+                    .expect("send the CONNECT");
+                read_head(&mut client).await
+            };
+            let (served, reply) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the CONNECT hung");
+            let err = served.expect_err("a control byte in the authority fails the connection");
+            assert_eq!(
+                err.to_string(),
+                "malformed CONNECT authority: authority \"\\u{1b}[2Jevil.example:443\" has an invalid host"
+            );
+            let chain = format!("{err:#}");
+            assert!(
+                !chain.contains('\x1b'),
+                "a raw escape byte in the error text: {chain:?}"
+            );
+            assert_eq!(reply, "", "the proxy replies nothing and closes");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_failed(row, TunnelReason::ProtocolError);
+            // The raw label as `Authority::new(raw, 443)` prints it today: the
+            // token kept a colon, so `Display` brackets it like an IPv6 literal
+            // (`[host:port]:443`), control byte and all. Pinned so a change to
+            // that label is a knowing one (Tester finding: the label misleads;
+            // `log_failed` is the only place it is escaped).
+            assert_eq!(
+                row.request.authority, "[\x1b[2jevil.example:443]:443",
+                "the raw label, lowercased and bracketed"
+            );
+            assert_eq!(row.request.headers.get("host"), Some("evil.example:443"));
+            assert!(!row.client_conn.tls);
+            assert!(row.server_conn.is_none(), "nothing was dialled");
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+        }
     }
 }

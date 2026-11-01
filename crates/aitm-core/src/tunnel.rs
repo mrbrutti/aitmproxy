@@ -1036,10 +1036,25 @@ mod tests {
     fn log_failed_debug_escapes_the_authority() {
         let fields = Arc::new(AuthorityFields::default());
         tracing::subscriber::with_default(fields.clone(), || {
-            log_failed(
-                &Authority::new("\x1b[2Jevil.example", 443),
-                Some(TunnelReason::ProtocolError),
-            );
+            // tracing-core caches each callsite's interest when a thread first
+            // hits it; a sibling test hitting `log_failed` with no subscriber at
+            // the same instant can store "never" over the interest this
+            // dispatcher's registration computed (a lost update in
+            // `DefaultCallsite::register`), and the event is then skipped.
+            // Rebuild under our dispatcher and retry across that microsecond
+            // window so the test is not flaky in a parallel run (Tester,
+            // fix-range re-check: seen once as `left: []`).
+            for _ in 0..1_000 {
+                tracing::callsite::rebuild_interest_cache();
+                log_failed(
+                    &Authority::new("\x1b[2Jevil.example", 443),
+                    Some(TunnelReason::ProtocolError),
+                );
+                if !fields.0.lock().unwrap().is_empty() {
+                    break;
+                }
+                std::thread::yield_now();
+            }
         });
         let recorded = fields.0.lock().unwrap().clone();
         // Quoted and `\u{1b}`-escaped as `str`'s Debug prints it (the host is
@@ -1048,6 +1063,166 @@ mod tests {
         assert!(
             !recorded[0].contains('\x1b'),
             "no raw escape byte in the log field: {recorded:?}"
+        );
+    }
+
+    // ---- Tester additions (panel fix range 18073ee4..57563aa3) -------------------
+
+    /// Drive a relay through `rounds` near-bound silences, each broken only by
+    /// five bytes in one direction (`down`: origin → client, else client →
+    /// origin), then let both directions go quiet past the bound. Returns the
+    /// relay's outcome and the two far ends, so the caller can check both halves
+    /// were shut. Paused tokio time: the caller's test is `start_paused`.
+    async fn one_way_relay(
+        down: bool,
+        rounds: u32,
+    ) -> (
+        (RelayCounts, io::Result<()>),
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (client_near, mut client_far) = tokio::io::duplex(1024);
+        let (up_near, mut up_far) = tokio::io::duplex(1024);
+        let relay_task = tokio::spawn(async move {
+            let mut client: ByteStream = Box::pin(client_near);
+            let mut upstream: ByteStream = Box::pin(up_near);
+            relay(&mut client, &mut upstream).await
+        });
+        let almost = RELAY_IDLE_TIMEOUT - Duration::from_secs(1);
+        for round in 0..rounds {
+            tokio::time::advance(almost).await;
+            assert!(
+                !relay_task.is_finished(),
+                "round {round}: alive just short of the bound"
+            );
+            let (writer, reader) = if down {
+                (&mut up_far, &mut client_far)
+            } else {
+                (&mut client_far, &mut up_far)
+            };
+            writer.write_all(b"five!").await.unwrap();
+            let mut buf = [0u8; 5];
+            reader
+                .read_exact(&mut buf)
+                .await
+                .expect("the relay still forwards after a near-bound silence");
+            assert_eq!(&buf, b"five!");
+        }
+        tokio::time::advance(almost).await;
+        assert!(
+            !relay_task.is_finished(),
+            "alive after {} × (bound − 1 s) with traffic in one direction only",
+            rounds + 1
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), relay_task)
+            .await
+            .expect("the relay ends once both directions are idle past the bound")
+            .unwrap();
+        (outcome, client_far, up_far)
+    }
+
+    /// Panel S2, one direction only: a relay whose traffic flows only origin →
+    /// client (the client silent throughout) has its idle clock re-armed by
+    /// every one of those bytes — three near-bound silences, four times the
+    /// bound of wall time, never cut — and once that direction is quiet too the
+    /// bound fires with both halves shut and the counts showing the one-way flow.
+    #[tokio::test(start_paused = true)]
+    async fn relay_idle_clock_is_rearmed_by_downstream_traffic_alone() {
+        let ((counts, result), mut client_far, mut up_far) = one_way_relay(true, 3).await;
+        assert_eq!(counts, RelayCounts { up: 0, down: 15 });
+        result.expect("an idle shutdown is a clean close, not an error");
+        assert_eq!(
+            up_far.read(&mut [0u8; 1]).await.unwrap(),
+            0,
+            "the origin's half was shut"
+        );
+        assert_eq!(
+            client_far.read(&mut [0u8; 1]).await.unwrap(),
+            0,
+            "the client's half was shut"
+        );
+    }
+
+    /// Panel S2, the other direction: client → origin bytes alone re-arm the
+    /// clock the same way, and the counts show only `up`.
+    #[tokio::test(start_paused = true)]
+    async fn relay_idle_clock_is_rearmed_by_upstream_traffic_alone() {
+        let ((counts, result), mut client_far, mut up_far) = one_way_relay(false, 3).await;
+        assert_eq!(counts, RelayCounts { up: 15, down: 0 });
+        result.expect("an idle shutdown is a clean close, not an error");
+        assert_eq!(
+            up_far.read(&mut [0u8; 1]).await.unwrap(),
+            0,
+            "the origin's half was shut"
+        );
+        assert_eq!(
+            client_far.read(&mut [0u8; 1]).await.unwrap(),
+            0,
+            "the client's half was shut"
+        );
+    }
+
+    /// Panel S3, the shape of the rule: the header *name* is matched however it
+    /// is cased, and every secret-named header is redacted — `Authorization`,
+    /// `X-Api-Key`, `Cookie` — not only `Proxy-Authorization`; names, order and
+    /// every innocent value are kept, and no credential text is anywhere on the
+    /// row. Empty input (a raw-TLS row has no CONNECT headers) stays empty.
+    #[tokio::test]
+    async fn open_redacts_mixed_case_and_every_other_secret_named_header() {
+        const SECRETS: [&str; 5] = [
+            "dXNlcjpodW50ZXIy",
+            "eyJhbGciOi.payload.sig",
+            "YIIBxyzNegotiateBlob",
+            "sk_live_51Hxyz",
+            "sid=abc",
+        ];
+        let (ctx, store, _sink) = harness();
+        let mut req = request(SystemTime::now());
+        req.headers = HeaderMap::new();
+        req.headers
+            .set("PROXY-AUTHORIZATION", "Basic dXNlcjpodW50ZXIy");
+        req.headers
+            .set("pRoXy-aUtHoRiZaTiOn", "Bearer eyJhbGciOi.payload.sig");
+        req.headers
+            .set("Authorization", "Negotiate YIIBxyzNegotiateBlob");
+        req.headers.set("X-Api-Key", "sk_live_51Hxyz");
+        req.headers.set("Cookie", "sid=abc; theme=dark");
+        req.headers.set("Host", "example.com:443");
+        req.headers.set("Proxy-Connection", "keep-alive");
+        req.headers.set("User-Agent", "curl/8.7.1");
+        let row =
+            TunnelRow::open(&ctx, req, TunnelInfo::passthrough(TunnelReason::OutOfScope)).await;
+
+        let h = http(&store, row.id());
+        let stored: Vec<(&str, &str)> = h.request.headers.iter().collect();
+        assert_eq!(
+            stored,
+            vec![
+                ("PROXY-AUTHORIZATION", "<redacted>"),
+                ("pRoXy-aUtHoRiZaTiOn", "<redacted>"),
+                ("Authorization", "<redacted>"),
+                ("X-Api-Key", "<redacted>"),
+                ("Cookie", "<redacted>"),
+                ("Host", "example.com:443"),
+                ("Proxy-Connection", "keep-alive"),
+                ("User-Agent", "curl/8.7.1"),
+            ]
+        );
+        let dump = format!("{h:?}");
+        for secret in SECRETS {
+            assert!(
+                !dump.contains(secret),
+                "{secret} leaked onto the row: {dump}"
+            );
+        }
+
+        let mut req = request(SystemTime::now());
+        req.headers = HeaderMap::new();
+        let raw = TunnelRow::open(&ctx, req, TunnelInfo::decrypted()).await;
+        assert!(
+            http(&store, raw.id()).request.headers.is_empty(),
+            "an empty head stays empty"
         );
     }
 

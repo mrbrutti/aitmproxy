@@ -739,6 +739,19 @@ mod tests {
         dial_succeeds: bool,
     ) -> (DuplexStream, Option<DuplexStream>, Harness) {
         let (client, module_client) = duplex(64 * 1024);
+        let (origin, h) = start_on(module, hint, dial_succeeds, Box::pin(module_client));
+        (client, origin, h)
+    }
+
+    /// [`start`] with the module's client end supplied by the test — a wrapper
+    /// around a duplex end that misbehaves on cue (a reset) — returning the
+    /// origin's test end (when `dial_succeeds`) and the harness.
+    fn start_on(
+        module: PassthroughModule,
+        hint: NextLayerHint,
+        dial_succeeds: bool,
+        module_client: ByteStream,
+    ) -> (Option<DuplexStream>, Harness) {
         let (origin, module_origin) = duplex(64 * 1024);
         let store = Arc::new(MemFlowStore::new());
         let sink = Arc::new(RecordingSink::default());
@@ -748,12 +761,8 @@ mod tests {
         });
         let ctx = ModuleCtx::new(store.clone(), sink.clone(), connector.clone()).with_hint(hint);
         let module = Arc::new(module);
-        let task = tokio::spawn(async move {
-            let io: ByteStream = Box::pin(module_client);
-            module.spawn(io, ctx).await
-        });
+        let task = tokio::spawn(async move { module.spawn(module_client, ctx).await });
         (
-            client,
             dial_succeeds.then_some(origin),
             Harness {
                 store,
@@ -1467,5 +1476,405 @@ mod tests {
             Some((V6.to_string(), v6_origin)),
             "an IPv6 literal is dialled as is, under its bracketed authority"
         );
+    }
+
+    // ---- Tester additions (panel fix range 18073ee4..57563aa3) -------------------
+
+    /// The io error kind at the root of a module error, if it is one.
+    fn io_kind(err: &anyhow::Error) -> Option<io::ErrorKind> {
+        err.chain()
+            .find_map(|cause| cause.downcast_ref::<io::Error>())
+            .map(io::Error::kind)
+    }
+
+    /// The module's end of a client connection that resets — `read` fails with
+    /// `ConnectionReset` — once `after` bytes have been delivered. Writes go
+    /// through, so the acknowledgement still reaches the test's client end.
+    struct ResetAfter {
+        inner: DuplexStream,
+        after: usize,
+        delivered: usize,
+    }
+
+    impl AsyncRead for ResetAfter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut TaskCx<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            if this.delivered >= this.after {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "client connection reset",
+                )));
+            }
+            let before = buf.filled().len();
+            let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+            if let Poll::Ready(Ok(())) = &polled {
+                this.delivered += buf.filled().len() - before;
+            }
+            polled
+        }
+    }
+
+    impl AsyncWrite for ResetAfter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut TaskCx<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskCx<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Spec D1 / panel S1, the rule is on the first byte only: `0x16` followed by
+    /// bytes that are no TLS record at all is relayed as is — the module judges
+    /// nothing past the first byte (the origin's TLS stack does) — every byte
+    /// reaches the origin in order, and `bytes_up` counts them all.
+    #[tokio::test]
+    async fn tls_first_byte_followed_by_garbage_is_relayed_not_judged() {
+        const PAYLOAD: &[u8] =
+            b"\x16 not a TLS record at all \xff\x00\r\n\r\nGET / HTTP/1.1\r\n\r\n";
+        let guard = guard_with(&["scoped.example"]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+        client.write_all(PAYLOAD).await.expect("client writes");
+        let mut got = vec![0u8; PAYLOAD.len()];
+        origin
+            .read_exact(&mut got)
+            .await
+            .expect("every byte reaches the origin");
+        assert_eq!(got, PAYLOAD);
+        origin.write_all(DOWN).await.expect("origin writes");
+        let mut down = vec![0u8; DOWN.len()];
+        client
+            .read_exact(&mut down)
+            .await
+            .expect("origin bytes reach the client");
+        assert_eq!(down, DOWN);
+        drop(client);
+        drop(origin);
+        tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the relay hung")
+            .expect("a clean close is not an error");
+
+        let row = h.row();
+        assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo {
+                mode: TunnelMode::Passthrough,
+                reason: Some(TunnelReason::OutOfScope),
+                bytes_up: Some(PAYLOAD.len() as u64),
+                bytes_down: Some(DOWN.len() as u64),
+            })
+        );
+        assert!(
+            row.client_conn.tls,
+            "a 0x16 first byte is TLS as far as the row knows"
+        );
+        assert!(row.metadata.duration.is_some());
+    }
+
+    /// Oversized first write: a client that sends far more than the module reads
+    /// ahead to decide (one record, 16 KiB + 5) — 128 KiB + 1, more than the
+    /// duplex buffers hold at once — loses nothing: the read-ahead goes first,
+    /// the remainder follows from the stream in order, back-pressure and all,
+    /// and `bytes_up` is the exact total.
+    #[tokio::test]
+    async fn first_write_larger_than_one_record_is_relayed_whole_and_in_order() {
+        const LEN: usize = 128 * 1024 + 1;
+        let mut payload = Vec::with_capacity(LEN);
+        payload.push(0x16);
+        payload.extend((1..LEN).map(|i| (i % 251) as u8));
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        let ((), got) = tokio::time::timeout(STALL_GUARD, async {
+            tokio::join!(
+                async {
+                    client.write_all(&payload).await.expect("client writes");
+                },
+                async {
+                    let mut got = vec![0u8; LEN];
+                    origin.read_exact(&mut got).await.expect("origin reads");
+                    got
+                }
+            )
+        })
+        .await
+        .expect("the relay hung");
+        assert_eq!(got.len(), LEN);
+        assert!(got == payload, "every byte reaches the origin, in order");
+        drop(client);
+        drop(origin);
+        tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the relay hung")
+            .expect("a clean close is not an error");
+
+        let row = h.row();
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo {
+                mode: TunnelMode::Passthrough,
+                reason: Some(TunnelReason::OutOfScope),
+                bytes_up: Some(LEN as u64),
+                bytes_down: Some(0),
+            })
+        );
+        assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
+    }
+
+    /// A slow client: the row appears at the outcome (spec D5), so between the
+    /// acknowledgement and the client's first byte there is no row at all, the
+    /// origin has received nothing and the module is still waiting; a TLS record
+    /// that arrives late is then relayed as if it had come at once.
+    #[tokio::test]
+    async fn first_byte_that_arrives_late_is_waited_for_then_relayed() {
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            h.store.list().is_empty(),
+            "no row before the first byte: the outcome is not known yet"
+        );
+        assert!(!h.task.is_finished(), "the module waits for the first byte");
+        let mut probe = [0u8; 1];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                origin.read(&mut probe)
+            )
+            .await
+            .is_err(),
+            "nothing reached the origin before the first byte"
+        );
+
+        client.write_all(UP).await.expect("the late record");
+        let mut up = vec![0u8; UP.len()];
+        origin
+            .read_exact(&mut up)
+            .await
+            .expect("the late record reaches the origin");
+        assert_eq!(up, UP);
+        origin.write_all(DOWN).await.expect("origin writes");
+        let mut down = vec![0u8; DOWN.len()];
+        client
+            .read_exact(&mut down)
+            .await
+            .expect("origin bytes reach the client");
+        assert_eq!(down, DOWN);
+        drop(client);
+        drop(origin);
+        tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the relay hung")
+            .expect("a clean close is not an error");
+
+        let row = h.row();
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo {
+                mode: TunnelMode::Passthrough,
+                reason: Some(TunnelReason::OutOfScope),
+                bytes_up: Some(UP.len() as u64),
+                bytes_down: Some(DOWN.len() as u64),
+            })
+        );
+        assert!(row.client_conn.tls);
+        assert_eq!(row.response.as_ref().map(|r| r.status), Some(200));
+    }
+
+    /// Connection drop mid-stream, at the first-byte read: the client resets
+    /// right after the acknowledgement. The read fails with the reset: a
+    /// `failed/client_closed` row carrying the dialled origin, nothing relayed,
+    /// and the module ends with the reset — not a hang, not an open passthrough
+    /// row.
+    #[tokio::test]
+    async fn client_reset_before_its_first_byte_is_a_failed_client_closed_row() {
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, module_client) = duplex(64 * 1024);
+        let resetting = ResetAfter {
+            inner: module_client,
+            after: CONNECT_HEAD.len(),
+            delivered: 0,
+        };
+        let (origin, mut h) = start_on(
+            module,
+            connect_hint("127.0.0.1:4443"),
+            true,
+            Box::pin(resetting),
+        );
+        let mut origin = origin.expect("origin");
+
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        assert_eq!(ack, ACK);
+
+        let err = tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the reset tunnel hung")
+            .expect_err("the reset ends the connection");
+        assert_eq!(
+            io_kind(&err),
+            Some(io::ErrorKind::ConnectionReset),
+            "{err:#}"
+        );
+        let mut got = Vec::new();
+        origin.read_to_end(&mut got).await.expect("origin read");
+        assert_eq!(got, b"", "nothing was relayed");
+
+        let row = h.row();
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert!(row.response.is_none(), "no 200 on a failed tunnel");
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ClientClosed))
+        );
+        assert!(row.metadata.duration.is_some(), "closed on insert");
+        // Panel re-check Q13/S9 (OPEN micro-fix): this producer still reports
+        // `client.tls = true` for a CONNECT that failed before any inner byte,
+        // where the HTTP module reports `false`. Pinned to today's value so the
+        // fix flips it knowingly; the spec's answer is `false` (no handshake
+        // record was seen).
+        assert!(
+            row.client_conn.tls,
+            "Q13/S9 landed: flip this assertion to `!row.client_conn.tls`"
+        );
+        assert_eq!(
+            row.server_conn.as_ref().map(|s| s.peer),
+            Some(origin_addr()),
+            "the origin had been dialled"
+        );
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+    }
+
+    /// Panel S3 through the producer: a `Proxy-Authorization` (any case) and an
+    /// `X-Api-Key` in the CONNECT head reach the row as the literal `<redacted>`
+    /// — names and order kept — on a relayed tunnel and on a failed one alike,
+    /// and the credential text is nowhere on either row.
+    #[tokio::test]
+    async fn credentials_in_the_connect_head_are_redacted_on_the_row() {
+        const HEAD: &str = "CONNECT 127.0.0.1:4443 HTTP/1.1\r\nHost: 127.0.0.1:4443\r\nPROXY-authorization: Basic dXNlcjpodW50ZXIy\r\nX-Api-Key: sk_live_51Hxyz\r\nProxy-Connection: keep-alive\r\n\r\n";
+        const SECRETS: [&str; 2] = ["dXNlcjpodW50ZXIy", "sk_live_51Hxyz"];
+
+        // Relayed: the passthrough row.
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+        let mut head = HEAD.as_bytes().to_vec();
+        head.extend_from_slice(UP);
+        client.write_all(&head).await.expect("client writes");
+        let mut ack = vec![0u8; ACK.len()];
+        client.read_exact(&mut ack).await.expect("the ack arrives");
+        let mut up = vec![0u8; UP.len()];
+        origin
+            .read_exact(&mut up)
+            .await
+            .expect("bytes reach the origin");
+        drop(client);
+        drop(origin);
+        h.finish().await.expect("a clean close is not an error");
+        let row = h.row();
+        assert_eq!(
+            row.request.headers.iter().collect::<Vec<_>>(),
+            vec![
+                ("Host", "127.0.0.1:4443"),
+                ("PROXY-authorization", "<redacted>"),
+                ("X-Api-Key", "<redacted>"),
+                ("Proxy-Connection", "keep-alive"),
+            ]
+        );
+        assert_eq!(
+            row.request.headers.get("proxy-authorization"),
+            Some("<redacted>")
+        );
+        let dump = format!("{row:?}");
+        for secret in SECRETS {
+            assert!(
+                !dump.contains(secret),
+                "{secret} leaked onto the passthrough row: {dump}"
+            );
+        }
+
+        // Failed (the dial is refused): the failed row.
+        let guard = guard_with(&[]);
+        let module = PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard);
+        let (mut client, origin, mut h) = start(module, connect_hint("127.0.0.1:4443"), false);
+        assert!(origin.is_none());
+        client
+            .write_all(HEAD.as_bytes())
+            .await
+            .expect("client writes the head");
+        tokio::time::timeout(STALL_GUARD, h.finish())
+            .await
+            .expect("the refused dial hung")
+            .expect_err("a refused dial is an error");
+        let row = h.row();
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::UpstreamUnreachable))
+        );
+        assert_eq!(
+            row.request.headers.get("Proxy-Authorization"),
+            Some("<redacted>")
+        );
+        assert_eq!(row.request.headers.get("x-api-key"), Some("<redacted>"));
+        assert_eq!(row.request.headers.get("host"), Some("127.0.0.1:4443"));
+        let dump = format!("{row:?}");
+        for secret in SECRETS {
+            assert!(
+                !dump.contains(secret),
+                "{secret} leaked onto the failed row: {dump}"
+            );
+        }
     }
 }
