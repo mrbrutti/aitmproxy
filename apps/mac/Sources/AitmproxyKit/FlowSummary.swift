@@ -1,8 +1,8 @@
 import AitmBusClient
 import Foundation
 
-/// What `flow.get` returns today (foundation §4.3): a summary with body sizes and
-/// timing but no headers, bodies or client. Everything else on a row waits for F5.
+/// What `flow.get` returns today (foundation §4.3): a summary with body sizes,
+/// timing and the source app, but no headers or bodies. Everything else on a row waits for F5.
 public struct FlowSummary: Hashable, Sendable {
     public var id: FlowID
     public var kind: FlowKind
@@ -27,6 +27,14 @@ public struct FlowSummary: Hashable, Sendable {
     /// even as `null`): an older core omits them, and then a nil size is unknown for
     /// good rather than still streaming.
     public var reportsBodySizes: Bool
+    /// The signing identifier of the app that opened the connection, as the capture
+    /// backend observed it (`source_app`, e.g. `com.apple.Safari`). Nil for a proxied flow
+    /// (`null`), an older core that sends no key, and a provider that sent nothing (`""`):
+    /// none of those is an app, so none makes an Apps group.
+    public var sourceApp: String?
+    /// The capture backend that delivered the connection (`capture_interface`, `macos-ne`).
+    /// Nil for a proxied flow. Decoded as the wire's mirror; the row does not carry it.
+    public var captureInterface: String?
     /// When the core created the flow (`started_at`, milliseconds since the Unix
     /// epoch): the request head for HTTP, the upgrade for WebSocket. Nil from an
     /// older core, or when the core's clock was before the epoch.
@@ -52,7 +60,8 @@ public struct FlowSummary: Hashable, Sendable {
         id: FlowID, kind: FlowKind, intercept: InterceptLabel, isReplay: Bool, method: String? = nil,
         scheme: String? = nil, authority: String? = nil, path: String? = nil, status: Int? = nil,
         handshake: FlowID? = nil, messages: Int? = nil, requestBytes: Int64? = nil, responseBytes: Int64? = nil,
-        startedAt: Date? = nil, duration: Duration? = nil, reportsBodySizes: Bool = false
+        startedAt: Date? = nil, duration: Duration? = nil, reportsBodySizes: Bool = false,
+        sourceApp: String? = nil, captureInterface: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -70,6 +79,8 @@ public struct FlowSummary: Hashable, Sendable {
         self.startedAt = startedAt
         self.duration = duration
         self.reportsBodySizes = reportsBodySizes || requestBytes != nil || responseBytes != nil
+        self.sourceApp = sourceApp
+        self.captureInterface = captureInterface
     }
 
     /// Decodes the `structuredContent` of a `flow.get` result. Unknown
@@ -94,6 +105,10 @@ public struct FlowSummary: Hashable, Sendable {
         self.requestBytes = Self.size(json["request_bytes"])
         self.responseBytes = Self.size(json["response_bytes"])
         self.reportsBodySizes = json["request_bytes"] != nil || json["response_bytes"] != nil
+        // Who opened the connection and which backend saw it. Absent, null and "" all
+        // read as nil: a proxied flow is no app, and the UI never shows a fake group.
+        self.sourceApp = Self.identifier(json["source_app"])
+        self.captureInterface = Self.identifier(json["capture_interface"])
         // Timing is a count of milliseconds: a negative or fractional value from the
         // wire is not one and reads as unknown (nil), never as a date before 1970.
         self.startedAt = Self.wholeMillis(json["started_at"]).map { Date(timeIntervalSince1970: Double($0) / 1000) }
@@ -103,6 +118,12 @@ public struct FlowSummary: Hashable, Sendable {
     private static func size(_ value: JSONValue?) -> Int64? {
         guard let size = value?.intValue, size >= 0, Int64(size) <= Self.maxBodyBytes else { return nil }
         return Int64(size)
+    }
+
+    /// A non-empty string from the wire; nil when the key is absent, null, or `""`.
+    private static func identifier(_ value: JSONValue?) -> String? {
+        guard let text = value?.stringValue, !text.isEmpty else { return nil }
+        return text
     }
 
     /// A non-negative whole number of milliseconds, else nil: absent, `null`, negative
@@ -129,6 +150,7 @@ public struct FlowSummary: Hashable, Sendable {
             scheme: scheme, authority: authority ?? "", path: p, query: q,
             status: kind == .websocket && status == nil ? 101 : status,
             state: state, isReplay: isReplay, origin: isReplay ? .human : .client,
+            client: sourceApp.map { ClientInfo(sourceApp: $0) },
             startedAt: startedAt, duration: duration,
             requestBytes: requestBytes, responseBytes: responseBytes,
             tls: scheme == "https" || scheme == "wss" ? .decrypted : .none,
