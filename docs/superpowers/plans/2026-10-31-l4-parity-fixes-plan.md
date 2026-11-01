@@ -643,6 +643,10 @@ Kept by the main session during stage 6. One row per finding.
 | (a) docs (re-panel) | spec | Important | §2.2 amendment not carried into Goals, AC35, Decision 2, A11, E2 | fixed 262b15ab (per-packet rule everywhere) |
 | (a) docs (re-panel) | spec | Minor ×4 | AC34 names only the capture loop; Constraints bullet lacks tui/ingress; A10/A13/A9 task text drifted; Review log SHAs missing; `is_loopback_interface` pub | fixed 262b15ab; `is_loopback_interface` `pub(crate)` in 2e3514d2 |
 | (a) merge | spec | Minor | `Cargo.lock` touched (d2261658) outside §7(a) | accepted by the orchestrator 2026-11-01: mechanical re-resolution after merging main 3d710ab (`aitm-sysproxy` 0.5.6→0.5.7, the workspace version); cargo makes the same edit on any build |
+| (a) merge (pass 3) | security, quality | Minor / Important | Two fallible `local_addr()?` calls left after the system-proxy auto-set (restore-on-exit invariant); addresses read twice | fixed 5015b1f2 (pre-bound addresses), 340a5bfb (one iterator, duplicate configured-port add dropped) |
+| (a) fix 3 (pass 3) | quality | Minor ×4 | tui bind test failed in the sandbox instead of skipping; `ip_endpoints` duplicated the address extraction; two adjacent bools in `bytes_visible`; test helpers duplicated again | fixed 340a5bfb (`PermissionDenied` skip, `endpoints_of`, `BytesView`, shared helpers) |
+| (a) docs (pass 3) | spec | Minor ×3 | Review log SHAs; AC34 tui test name; `Cargo.lock` row | fixed d55b0fc9 and this row |
+| (a) pass 3 | spec, security | PASS | third-pass verdicts: spec PASS, security PASS; quality FAIL only on the fallible-call item fixed in 5015b1f2 before its report landed | closed; fix task 4 touched Minors only, verified by the Terminal gate on the final head (no fourth panel pass) |
 
 ## Shipped
 
