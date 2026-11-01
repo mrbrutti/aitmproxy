@@ -44,6 +44,11 @@ extension SelfTest {
             // Tester — positive control for "connecting issues no scope.add": the self-test's own
             // scope.add IS in the activity log as an operator command, so a scope.add issued on
             // connect would have been visible to that check too (the negative was not vacuous).
+            // Tester — the entry lands when the scope.add REPLY does, which is after the settle
+            // above returns on a core that already lists the upstream (one reused from an earlier
+            // run): that settle is satisfied at once while the call is still in flight. Wait
+            // (≤ 5 s) for the entry itself, so the check asserts the recording, not the timing.
+            await settle { session.activity.entries.contains { $0.origin == .operator && $0.command == "scope.add" } }
             check("the self-test's own scope.add is recorded as an operator command",
                   session.activity.visible.contains { $0.origin == .operator && $0.command == "scope.add" })
 
@@ -53,6 +58,15 @@ extension SelfTest {
             // connected while every action failed "the bus connection closed" and the Scope list
             // froze. The block leaves the session connected with scope [upstream], so every check
             // after it runs on the reconnected connection.
+            // Tester — the reconnect starts from a QUIESCENT session: the first Scope action above
+            // has completed (its scope.add entry reads ok and the list shows the upstream). A
+            // reconnect cuts an in-flight call by design (lastError "add to scope: the bus
+            // connection closed"), which would fail check 2 below for the wrong reason. This waits
+            // (≤ 5 s) for that completion; it never re-issues the action.
+            await settle {
+                session.activity.entries.contains { $0.origin == .operator && $0.command == "scope.add" && $0.result == .ok }
+                    && session.scopeHosts.contains(upstream)
+            }
             let recorder = BusStateRecorder(session: session)
             recorder.arm()
             session.reconnectBus()
@@ -71,10 +85,13 @@ extension SelfTest {
                   session.scopeHosts.contains(host) && session.lastError == nil, "scope \(session.scopeHosts) err \(session.lastError ?? "-")")
             check("the earlier scope entry survives the reconnect (the core's list wins)", session.scopeHosts.contains(upstream), "scope \(session.scopeHosts)")
             // The palette seam (`commandRunner`) issues no refreshScope: only the poll can drop the host.
-            _ = try? await session.runCommand("scope.remove", ["host": .string(host)])
+            // Tester — the palette call must land too (`removed`): had check 3 failed, the host was
+            // never listed and its absence alone would pass vacuously; a nil `commandRunner` or a
+            // cleared client throws here, and that is the bug.
+            let removed = (try? await session.runCommand("scope.remove", ["host": .string(host)])) != nil
             await settle(timeout: .seconds(3)) { !session.scopeHosts.contains(host) }
             check("scopeHosts keeps following the core after Reconnect Bus (a palette scope.remove is dropped by the poll)",
-                  !session.scopeHosts.contains(host), "scope \(session.scopeHosts)")
+                  removed && !session.scopeHosts.contains(host), "removed \(removed) scope \(session.scopeHosts)")
             // The mid-connect() probe: a second start() 1 ms after the first lands inside the first
             // run's connect() when timing allows; the second run must end up the owner either way.
             if let service = session.actions as? BusService {
