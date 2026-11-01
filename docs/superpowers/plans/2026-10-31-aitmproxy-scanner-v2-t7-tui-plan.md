@@ -426,6 +426,10 @@ Kept by the main session during stage 6. One row per finding.
 | 8 | spec | Minor | an unrequested `target` line in the detail | accepted by the T7 session; spec D11 amended in this commit |
 | 8 | spec | Minor | `waiting for scan.issue...` placeholder is false after a failed read or a missing verb | fix round F (F2): neutral wording `no detail read for this row` |
 | 8 | spec | Minor | eleven helpers public beyond the plan's two names | accepted (as for Tasks 6 and 7) |
+| 8 | security | Minor | `P` with a degenerate `poc_ref` (`""`, `/`, `.yaml`) jumps to an unrelated finding | fix round F (F3): empty ref = no PoC; match on file stem/name |
+| 8 | security | Minor | per-frame `format!` over unbounded `Issue` strings and the whole flow list; raw `poc_ref` in a toast | fix round F (F4): bound every rendered string and the flow list at insert, draw only the visible window |
+| 8 | security | Minor | head line's verdict forgeable by a name with three spaces (string re-split) | fix round F (F5): structured head, hue from the typed severity |
+| 8 | security | Minor | `flow_cursor` unclamped when an update shrinks the flow list | fix round F (F6) |
 
 ## Shipped
 
