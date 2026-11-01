@@ -65,14 +65,15 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
         rulesQueue.async {
             self.reconciler.begin { error in
                 if error != nil {
-                    // Already reported by `logRuleEvent(.applyFailed)`. Mirror `stopProxy`
-                    // (we are on `rulesQueue`): stop the reconciler first so the detach
-                    // that `handoff.stop()` fires reconciles nothing, then stop the link.
-                    // On the ECANCELED arm (`stopProxy` ran first; `reconciler.stop()` is
-                    // answering us from inside itself, nothing was reported) this stops
-                    // both a second time, harmlessly: `RuleReconciler.stop()` is
-                    // re-entrant and `FlowHandoff.stop()` / `CoreLink.stop()` are
-                    // idempotent.
+                    // A failed apply was already reported by `logRuleEvent(.applyFailed)`;
+                    // on the ECANCELED arm (`stopProxy` ran first and `reconciler.stop()`
+                    // is answering us from inside itself) nothing was reported. Either way
+                    // mirror `stopProxy` (we are on `rulesQueue`): stop the reconciler
+                    // first so the detach that `handoff.stop()` fires reconciles nothing,
+                    // then stop the link. On the ECANCELED arm that stops the reconciler a
+                    // second time, and the handoff first here and then again from
+                    // `stopProxy`, harmlessly: `RuleReconciler.stop()` is re-entrant and
+                    // `FlowHandoff.stop()` / `CoreLink.stop()` are idempotent.
                     self.reconciler.stop()
                     self.handoff.stop()
                 }

@@ -59,16 +59,16 @@ final class RuleReconciler {
     /// Startup (spec Design C). Clears `stopped`, leaves `pending` as the hook last set
     /// it (a Scope that reached the queue before `begin` is applied right after the
     /// startup apply), and applies `.tcpOnly` WITHOUT `reasserting` (the session is not
-    /// Connected yet). `completion` receives THAT apply's result, never a reconcile
-    /// apply's. A second `begin` without a `stop()` in between (Tahoe FB21464147,
-    /// `startProxy` called twice): with a set installed the session is live, so the
-    /// completion is answered with nil at once and the installed set stays; with the
-    /// startup apply still in flight it waits for that same result; with a reconcile
-    /// apply in flight and nothing installed (a failed startup without `stop()`) it is
-    /// parked: if that reconcile lands a set, the parked completion is answered `nil`
-    /// then (the session is live); if it fails, a fresh `.tcpOnly` startup apply follows
-    /// and answers with its own result (vectors F, H, I of
-    /// `ruleReconcilerStartupAndStop`).
+    /// Connected yet). On a first `begin`, `completion` receives that apply's result; a
+    /// reconcile apply's error never answers it. A second `begin` without a `stop()` in
+    /// between (Tahoe FB21464147, `startProxy` called twice): with a set installed the
+    /// session is live, so the completion is answered with nil at once and the
+    /// installed set stays; with the startup apply still in flight it waits for that
+    /// same result; with a reconcile apply in flight and nothing installed (a failed
+    /// startup without `stop()`) it is parked: if that reconcile lands a set, the parked
+    /// completion is answered `nil` then (the session is live); if it fails, a fresh
+    /// `.tcpOnly` startup apply follows and answers with its own result (vectors F, H, I
+    /// of `ruleReconcilerStartupAndStop`).
     func begin(completion: @escaping (Error?) -> Void) {
         stopped = false
         if installed != nil {
