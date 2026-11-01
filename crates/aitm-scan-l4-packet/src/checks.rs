@@ -1117,4 +1117,38 @@ mod tests {
         );
         assert_eq!(mock.inject_count(), 17);
     }
+
+    /// Tester (fix round): a triage the case cap cut short (finding F2) is an
+    /// interrupted triage like any other (finding F1), and the verdict names
+    /// the cap — literally — as the reason nothing was reproduced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cap_interrupted_triage_names_the_cap_in_its_detail() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        // Two cases is the whole job: the crashing case is the last one the
+        // cap allows, so not one replay fits.
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 2), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+
+        let verdict = run_check(&CrashCheck::new(registry), &runner).await;
+
+        assert_eq!(verdict.outcome, Outcome::Inconclusive);
+        assert_eq!(verdict.confidence, Confidence::Tentative);
+        assert_eq!(
+            verdict.detail,
+            "crash candidate on 127.0.0.1:9/udp field raw mutation grow:8: \
+             case cap reached: 2 cases sent before reproduction"
+        );
+        let trigger = mock.injected().get(2).cloned().expect("the third inject");
+        assert_eq!(verdict.evidence.payload, Some(hex_encode(&trigger)));
+        assert!(verdict.evidence.l4.is_none(), "{:?}", verdict.evidence.l4);
+        assert_eq!(verdict.poc_hint, None);
+        assert_eq!(mock.inject_count(), 5, "no replay went out");
+        let counters = shared.state.counters(job.job_id()).expect("counters");
+        assert_eq!(counters.cases, 2);
+        assert_eq!(counters.crashes, 0);
+        assert_eq!(counters.retired_elements, 0);
+    }
 }

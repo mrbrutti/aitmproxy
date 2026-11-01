@@ -1600,4 +1600,47 @@ mod tests {
         .expect("grow applies");
         assert_eq!(payload_of(&big).len(), 1472);
     }
+
+    /// Tester (fix round, F3): the clamped `Grow` with a ceiling at or below
+    /// the payload's own length allocates nothing and still honours the
+    /// ceiling — the payload is cut to it, down to empty.
+    #[test]
+    fn grow_clamped_below_the_payload_truncates_to_the_ceiling() {
+        let seed = udp_seed(b"probe");
+
+        let three = Mutation::Grow {
+            len: usize::MAX,
+            fill: GrowFill::Repeat,
+        }
+        .apply(&seed, 3)
+        .expect("grow applies");
+        assert_eq!(payload_of(&three), b"pro".to_vec());
+
+        let exact = Mutation::Grow {
+            len: usize::MAX,
+            fill: GrowFill::Zeros,
+        }
+        .apply(&seed, 5)
+        .expect("grow applies");
+        assert_eq!(payload_of(&exact), b"probe".to_vec());
+
+        let none = Mutation::Grow {
+            len: usize::MAX,
+            fill: GrowFill::Zeros,
+        }
+        .apply(&seed, 0)
+        .expect("grow applies");
+        assert_eq!(payload_of(&none), Vec::<u8>::new());
+
+        // And the clamped zero fill really is zeros past the seed bytes.
+        let zeros = Mutation::Grow {
+            len: usize::MAX,
+            fill: GrowFill::Zeros,
+        }
+        .apply(&seed, 16)
+        .expect("grow applies");
+        let mut expected = b"probe".to_vec();
+        expected.extend(std::iter::repeat_n(0u8, 11));
+        assert_eq!(payload_of(&zeros), expected);
+    }
 }

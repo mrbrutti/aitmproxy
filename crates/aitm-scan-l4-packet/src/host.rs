@@ -1992,4 +1992,250 @@ mod tests {
             mock.inject_count()
         );
     }
+
+    /// Tester (fix round): the operator cancels the job while the runner is
+    /// polling for recovery. `Cancelled` is the one stop F1's fixes never
+    /// exercised; it rides the same `await_recovery` path as `Budget`, so it
+    /// must end the run as a `Cancelled` stop with no crash and no retirement.
+    /// The cancel is keyed off the mock's inject count — once the second
+    /// failed probe (inject 5) is out, the first recovery poll is the next
+    /// send — so the test does not race a sleep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_during_recovery_wait_is_a_stop_not_a_crash() {
+        let mock = MockBackend::new(MockReply::Echo);
+        // Dead for longer than any recovery bound here, so only the cancel
+        // can end the wait.
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 1000, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let canceller = {
+            let (mock, job) = (Arc::clone(&mock), Arc::clone(&job));
+            tokio::spawn(async move {
+                // 1 baseline + 2 cases + 2 failed probes; the fifth inject's
+                // capture waits out a 50 ms reply window before the runner
+                // can send again.
+                for _ in 0..20_000 {
+                    if mock.inject_count() >= 5 {
+                        job.cancel();
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        };
+
+        let run = runner.run_point().await;
+        canceller.await.expect("the canceller task finishes");
+
+        assert_eq!(
+            mock.inject_count(),
+            5,
+            "the first recovery poll never went out"
+        );
+        assert_eq!(job.charged(), 5);
+        assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
+        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(run.stopped, Some(StopReason::Cancelled));
+        assert_eq!(
+            shared.state.stopped(job.job_id()),
+            Some(StopReason::Cancelled)
+        );
+        assert!(
+            run.crash.is_none(),
+            "a cancel during the recovery wait is not a crash: {:?}",
+            run.crash
+        );
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 2,
+                crashes: 0,
+                liveness_failures: 2,
+                retired_elements: 0,
+            })
+        );
+        assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+    }
+
+    /// Tester (fix round): the budget runs out at the replay itself — the
+    /// target came back (one recovery poll passed) and the triage's first
+    /// `deliver` is the charge that fails. This is the `Stopped` arm on the
+    /// replay send, not on `await_recovery`; it must be a `Budget` stop with
+    /// no crash, and the replay never reaches the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn budget_exhausted_at_the_replay_is_a_stop_not_a_crash() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // 1 baseline + 2 cases + 2 failed probes + 1 passing recovery poll = 6;
+        // the replay is the charge that fails.
+        let job = job.with_budget(6);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        assert_eq!(mock.inject_count(), 6, "the replay never went out");
+        assert_eq!(job.charged(), 6);
+        assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
+        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(run.stopped, Some(StopReason::Budget));
+        assert_eq!(shared.state.stopped(job.job_id()), Some(StopReason::Budget));
+        assert!(
+            run.crash.is_none(),
+            "a budget stop at the replay is not a reproduced crash: {:?}",
+            run.crash
+        );
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 2,
+                crashes: 0,
+                // The two failed probes; the recovery poll passed.
+                liveness_failures: 2,
+                retired_elements: 0,
+            })
+        );
+        assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+    }
+
+    /// Tester (fix round): the budget runs out right after the first replay
+    /// went out and left the target silent — the replay's own liveness pair
+    /// is what the budget refuses. One replay of three is not a reproduction
+    /// (spec call 14), so the run is a `Budget` stop with no crash; the replay
+    /// is still a counted case (call C10).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn budget_exhausted_after_a_replay_is_a_stop_not_a_crash() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // 1 baseline + 2 cases + 2 failed probes + 1 recovery poll + 1 replay
+        // = 7; the replay's first probe is the charge that fails.
+        let job = job.with_budget(7);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        assert_eq!(mock.inject_count(), 7);
+        assert_eq!(job.charged(), 7);
+        // The replay is not a record of the run; the loop's two cases are.
+        assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
+        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(run.stopped, Some(StopReason::Budget));
+        assert!(
+            run.crash.is_none(),
+            "one unconfirmed replay is not a reproduced crash: {:?}",
+            run.crash
+        );
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                // Two loop cases and the one replay (call C10).
+                cases: 3,
+                crashes: 0,
+                liveness_failures: 2,
+                retired_elements: 0,
+            })
+        );
+        assert_eq!(shared.state.cases_remaining(job.job_id()), Some(47));
+        assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+    }
+
+    /// Tester (fix round): the case cap is job-wide. With two points sharing a
+    /// cap of four, the first point's triage spends the shared ceiling on two
+    /// replays (both reproduce) and the third replay is refused by the cap, so
+    /// two reproductions of three is no crash — and the second point, which
+    /// had two cases allocated, sends nothing at all: it reads the `CaseCap`
+    /// stop before its baseline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cap_reached_inside_one_points_triage_stops_the_next_point() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 4), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(
+            Arc::clone(&mock),
+            profile,
+            &fields(&["raw", "ipv4.ttl"]),
+            1000,
+        );
+        assert_eq!(disc.points.len(), 2);
+        assert_eq!(shared.state.allocate_cases(job.job_id()), Some(2));
+        let first = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let second = runner_for(&shared, &job, &plans, &disc.points, "ipv4.ttl");
+
+        let run = first.run_point().await;
+
+        assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
+        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(run.stopped, Some(StopReason::CaseCap(4)));
+        assert!(
+            run.crash.is_none(),
+            "two reproductions of three, then the cap: not a confirmed crash: {:?}",
+            run.crash
+        );
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                // Two loop cases and two replays: exactly the cap.
+                cases: 4,
+                crashes: 0,
+                // The candidate's pair and each replay's pair.
+                liveness_failures: 6,
+                retired_elements: 0,
+            })
+        );
+        assert_eq!(shared.state.cases_remaining(job.job_id()), Some(0));
+        // 1 baseline + 2 cases + 2 probes + (1 poll + replay + 2 probes) x 2.
+        assert_eq!(mock.inject_count(), 13);
+        assert_eq!(job.charged(), 13);
+
+        let starved = second.run_point().await;
+
+        assert_eq!(starved.stopped, Some(StopReason::CaseCap(4)));
+        assert_eq!(starved.baseline, None, "not even a baseline went out");
+        assert!(starved.cases.is_empty(), "{:?}", starved.cases);
+        assert!(starved.crash.is_none());
+        assert_eq!(mock.inject_count(), 13, "the second point sent nothing");
+        assert_eq!(job.charged(), 13);
+        assert_eq!(
+            shared.state.stopped(job.job_id()),
+            Some(StopReason::CaseCap(4))
+        );
+    }
+
+    /// Tester (fix round): the cap reached by the fuzz loop's own last case,
+    /// with no triage, is a clean end — the loop's allocation already equals
+    /// the ceiling, so the cap check in `deliver` never fires and the job is
+    /// not marked stopped (spec D8.4 "cases per job <= 5000" is a bound, not
+    /// a stop; plan C10).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cap_reached_on_the_last_loop_case_is_a_clean_end() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 4);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        assert_eq!(run.cases.len(), 4, "{:?}", run.cases);
+        assert!(run.cases.iter().all(|case| case.sent), "{:?}", run.cases);
+        assert_eq!(run.stopped, None);
+        assert_eq!(shared.state.stopped(job.job_id()), None);
+        assert!(run.crash.is_none());
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 4,
+                crashes: 0,
+                liveness_failures: 0,
+                retired_elements: 0,
+            })
+        );
+        assert_eq!(shared.state.cases_remaining(job.job_id()), Some(0));
+        // 1 baseline + 4 cases; `liveness_every` is 25, so no scheduled probe.
+        assert_eq!(mock.inject_count(), 5);
+        assert_eq!(job.charged(), 5);
+    }
 }
