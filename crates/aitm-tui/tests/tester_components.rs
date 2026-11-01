@@ -1419,7 +1419,7 @@ fn findings_panel_lists_runs_and_opens_the_capture() {
     );
     let _ = app.update(Action::OpenFindings);
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("Findings — PoCs and runs"), "{text}");
+    assert!(text.contains("Findings · PoCs and runs"), "{text}");
     let first = line_with(&text, "Reflected XSS in /api/search q").unwrap();
     assert!(first.contains("✓") && first.contains("high"), "{first}");
     let second = line_with(&text, "IDOR on /api/cart/items/{id}").unwrap();

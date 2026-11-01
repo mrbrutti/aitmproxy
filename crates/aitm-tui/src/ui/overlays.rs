@@ -2,6 +2,8 @@
 //! the TUI"): the command palette, compose, the scope panel, the PoC findings
 //! panel, the agent panel with its activity log, quick-look and help.
 
+use std::sync::OnceLock;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Modifier;
@@ -14,6 +16,7 @@ use crate::text::{cells, fit, truncate};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph};
 use crate::ui::centered;
+use crate::ui::scan::{key_text, HELP};
 use crate::viewers;
 
 /// A bordered, titled panel filling `area`; returns the drawable inside.
@@ -105,9 +108,8 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     }
 }
 
-/// The flow list's help lines, as `(key, what)` pairs: the table the overlay
-/// draws under its `Flow list` heading, so [`help_line_count`] can count
-/// them without a theme.
+/// The flow list's help lines, as `(key, what)` pairs: the table
+/// [`help_rows`] lists under its `Flow list` heading.
 const FLOW_KEYS: &[(&str, &str)] = &[
     ("↑↓ j k", "move · PgUp/PgDn · g/G first/last"),
     (
@@ -152,40 +154,71 @@ const HELP_CLOSE: &str = " ↑↓ PgUp PgDn Home End scroll · any other key clo
 /// The help overlay's box width.
 const HELP_WIDTH: u16 = 110;
 
-/// Every line of the help overlay, in order: the flow list's keys and
-/// palette commands, the Scan section, a blank and the closing line.
+/// One row of the help overlay, theme-free (fix round H, H23): the one
+/// table [`help_lines`] styles and the scroll clamps count, so the count
+/// can never drift from what is drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HelpRow {
+    /// A section heading (`Flow list`, `Scan`).
+    Heading(&'static str),
+    /// A key (or key group) and what it does.
+    Key(&'static str, String),
+    /// A palette command and its detail.
+    Command(&'static str, &'static str),
+    Blank,
+    /// The closing line ([`HELP_CLOSE`]).
+    Close,
+}
+
+/// Every row of the help overlay, in order, built once: the flow list's
+/// keys and palette commands, the Scan section (its key groups joined by
+/// [`key_text`] from the tabs' own tables, [`HELP`]), a blank and the
+/// closing line.
+fn help_rows() -> &'static [HelpRow] {
+    static ROWS: OnceLock<Vec<HelpRow>> = OnceLock::new();
+    ROWS.get_or_init(|| {
+        let mut rows = vec![HelpRow::Heading("Flow list")];
+        rows.extend(
+            FLOW_KEYS
+                .iter()
+                .map(|(key, what)| HelpRow::Key(key, (*what).to_string())),
+        );
+        rows.extend(
+            BUILTIN_COMMANDS
+                .iter()
+                .take(HELP_COMMANDS)
+                .map(|(cmd, detail)| HelpRow::Command(cmd, detail)),
+        );
+        rows.push(HelpRow::Heading("Scan"));
+        rows.extend(
+            HELP.iter()
+                .map(|(key, groups)| HelpRow::Key(key, key_text(groups))),
+        );
+        rows.push(HelpRow::Blank);
+        rows.push(HelpRow::Close);
+        rows
+    })
+}
+
+/// [`help_rows`] styled for `theme`, one line per row.
 fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines = vec![heading(theme, "Flow list")];
-    for (key, what) in FLOW_KEYS {
-        lines.push(key_line(theme, key, what));
-    }
-    for (cmd, detail) in BUILTIN_COMMANDS.iter().take(HELP_COMMANDS) {
-        lines.push(Line::from(vec![
-            Span::styled(format!("   :{cmd:<26}"), theme.accent()),
-            Span::styled((*detail).to_string(), theme.text_tertiary()),
-        ]));
-    }
-    lines.push(heading(theme, "Scan"));
-    for (key, groups) in crate::ui::scan::HELP {
-        lines.push(key_line(theme, key, &crate::ui::scan::key_text(groups)));
-    }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(HELP_CLOSE, theme.text_tertiary()));
-    lines
+    help_rows()
+        .iter()
+        .map(|row| match row {
+            HelpRow::Heading(title) => heading(theme, title),
+            HelpRow::Key(key, what) => key_line(theme, key, what),
+            HelpRow::Command(cmd, detail) => Line::from(vec![
+                Span::styled(format!("   :{cmd:<26}"), theme.accent()),
+                Span::styled((*detail).to_string(), theme.text_tertiary()),
+            ]),
+            HelpRow::Blank => Line::raw(""),
+            HelpRow::Close => Line::styled(HELP_CLOSE, theme.text_tertiary()),
+        })
+        .collect()
 }
 
-/// The number of lines [`help_lines`] builds, from the same tables, so the
-/// reducer can clamp the scroll without a theme.
-fn help_line_count() -> usize {
-    1 + FLOW_KEYS.len()
-        + BUILTIN_COMMANDS.len().min(HELP_COMMANDS)
-        + 1
-        + crate::ui::scan::HELP.len()
-        + 2
-}
-
-/// The help box on a `cols`x`rows` screen: wide enough for its lines, as
-/// tall as they need up to the screen (fix round G, G89).
+/// The help box on `screen`: [`HELP_WIDTH`] wide, as tall as `lines` rows
+/// need up to the screen (fix round G, G89).
 fn help_box(screen: Rect, lines: usize) -> Rect {
     centered(
         screen,
@@ -198,7 +231,7 @@ fn help_box(screen: Rect, lines: usize) -> Rect {
 /// lines that do not fit inside its box (fix round G, G85). Zero when the
 /// screen is tall enough for all of them.
 pub fn help_scroll_max(cols: u16, rows: u16) -> usize {
-    let lines = help_line_count();
+    let lines = help_rows().len();
     let inner = help_box(Rect::new(0, 0, cols, rows), lines)
         .height
         .saturating_sub(2);
@@ -209,7 +242,7 @@ pub fn help_scroll_max(cols: u16, rows: u16) -> usize {
 /// page for PgUp/PgDn.
 pub fn help_page(cols: u16, rows: u16) -> usize {
     usize::from(
-        help_box(Rect::new(0, 0, cols, rows), help_line_count())
+        help_box(Rect::new(0, 0, cols, rows), help_rows().len())
             .height
             .saturating_sub(2),
     )
@@ -475,7 +508,7 @@ fn rate_limit_readout(app: &App) -> String {
 }
 
 pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Findings — PoCs and runs", area, buf);
+    let inner = boxed(theme, "Findings · PoCs and runs", area, buf);
     if app.findings.is_empty() {
         buf.set_string(
             inner.x + 1,
@@ -884,13 +917,22 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 mod tests {
     use super::*;
 
-    /// Fix round G, G85/G89: the line count the reducer clamps with is the
-    /// count the overlay draws, and the box is as tall as the lines need.
+    /// Fix round G, G85/G89 (fix round H, H23): the rows the reducer
+    /// clamps with are the lines the overlay draws, one each, and the box
+    /// is as tall as the lines need.
     #[test]
-    fn help_line_count_matches_the_lines_drawn() {
+    fn help_rows_are_the_lines_drawn() {
         let theme = Theme::new(true);
         let lines = help_lines(&theme);
-        assert_eq!(help_line_count(), lines.len());
+        assert_eq!(help_rows().len(), lines.len());
+        assert_eq!(help_rows().first(), Some(&HelpRow::Heading("Flow list")));
+        assert_eq!(help_rows().last(), Some(&HelpRow::Close));
+        assert!(
+            help_rows()
+                .iter()
+                .any(|r| matches!(r, HelpRow::Key("Jobs", w) if w == &key_text(&[crate::ui::scan::JOBS_KEYS]))),
+            "the Scan section joins the Jobs table"
+        );
         let tall = help_box(Rect::new(0, 0, 200, 50), lines.len());
         assert_eq!(usize::from(tall.height), lines.len() + 2);
         assert_eq!(help_scroll_max(200, 50), 0);
