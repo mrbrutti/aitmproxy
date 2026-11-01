@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 /// Which lane a point, check, probe or issue belongs to.
 ///
 /// The enum is `LaneKind` because `Lane` is the trait a lane crate implements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LaneKind {
     /// HTTP/1.1 and HTTP/2 requests and responses.
