@@ -13,6 +13,7 @@
 //! reaction check is `info`: an ICMP error or a TCP reset is the target
 //! answering, so it is a protocol reaction and never a crash.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -453,15 +454,32 @@ pub fn reaction_detail(run: &PointRun) -> String {
 /// cases drew no reply on an ICMP-paced point (spec amendment 46), empty when
 /// none did. It is the operator's explanation for silence that is the target
 /// host's ICMP rate limiter and not a crash.
+///
+/// The cases' notes are tallied per label (tester F3), one `<label> x <n>` per
+/// label joined by `, `, so the tail stays right when
+/// [`crate::state::CaseNote`] grows a second variant.
 fn no_reply_note(run: &PointRun) -> String {
-    let count = run.no_reply_count();
-    if count == 0 {
+    let tally = note_tally(run);
+    if tally.is_empty() {
         return String::new();
     }
-    run.cases
+    let entries = tally
         .iter()
-        .find_map(|case| case.note)
-        .map_or_else(String::new, |note| format!("; {} x {count}", note.label()))
+        .map(|(label, count)| format!("{label} x {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("; {entries}")
+}
+
+/// How many of a run's cases carry each note, keyed by the note's operator
+/// label (so the map is ordered and renders deterministically). Cases without
+/// a note are not counted.
+fn note_tally(run: &PointRun) -> BTreeMap<String, usize> {
+    let mut tally = BTreeMap::new();
+    for note in run.cases.iter().filter_map(|case| case.note) {
+        *tally.entry(note.label()).or_insert(0) += 1;
+    }
+    tally
 }
 
 /// The operator-facing line for a dry run: how many cases were rendered and
@@ -499,12 +517,16 @@ mod tests {
         Outcome, Technique, Verdict,
     };
 
-    use super::{checks, crash_meta, reaction_meta, CrashCheck, ReactionCheck};
+    use super::{
+        checks, crash_meta, no_reply_note, note_tally, reaction_meta, CrashCheck, ReactionCheck,
+    };
     use crate::codec::hex_encode;
     use crate::fields::FieldPath;
     use crate::host::{PacketHost, PointRunner, RunnerRegistry};
     use crate::oracle::CaseClass;
-    use crate::state::{Candidate, StopReason};
+    use crate::state::{
+        Candidate, CaseNote, CaseOutcome, CaseRecord, PointRun, StopReason, ICMP_RATELIMIT,
+    };
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
         fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply, TestJob,
@@ -1430,5 +1452,65 @@ mod tests {
         assert_eq!(verdict.evidence.payload, Some(hex_encode(&trigger)));
         assert!(verdict.evidence.l4.is_none(), "{:?}", verdict.evidence.l4);
         assert_eq!(mock.inject_count(), 6, "the check sent nothing");
+    }
+
+    /// Tester F3: the `no_reply` tail of a detail tallies the notes **per
+    /// label**, so it stays right when `CaseNote` grows a second variant; the
+    /// count of the first-seen label can never be attached to a different one.
+    /// With today's single variant the rendering is byte-identical to before:
+    /// `; no_reply (icmp_ratelimit) x <n>`, counting only the noted cases.
+    #[test]
+    fn no_reply_note_tallies_each_label() {
+        fn case(index: u32, note: Option<CaseNote>) -> CaseRecord {
+            CaseRecord {
+                index,
+                seed_id: "127.0.0.1:9/udp#0".to_string(),
+                chain: vec!["grow:8".to_string()],
+                sent_hex: "deadbeef".to_string(),
+                outcome: CaseOutcome::Sent {
+                    class: CaseClass::Silence,
+                    elapsed_ms: 1,
+                    latency_outlier: false,
+                },
+                candidate: Candidate::No,
+                note,
+            }
+        }
+        let noted = Some(CaseNote::NoReply {
+            reason: ICMP_RATELIMIT,
+        });
+        let run = PointRun {
+            point_id: "p0".to_string(),
+            target: "127.0.0.1:9/udp".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 1,
+            dry_run: false,
+            recovery_wait: Duration::from_secs(10),
+            baseline: Some(CaseClass::Icmp {
+                icmp_type: 3,
+                code: 3,
+            }),
+            cases: vec![case(0, noted), case(1, None), case(2, noted)],
+            crash: None,
+            stopped: None,
+        };
+
+        let tally = note_tally(&run);
+        assert_eq!(tally.len(), 1, "{tally:?}");
+        assert_eq!(tally.get("no_reply (icmp_ratelimit)"), Some(&2));
+        assert_eq!(no_reply_note(&run), "; no_reply (icmp_ratelimit) x 2");
+
+        let silent = PointRun {
+            cases: vec![case(0, None), case(1, None)],
+            ..run.clone()
+        };
+        assert!(note_tally(&silent).is_empty());
+        assert_eq!(no_reply_note(&silent), "", "no note, no tail");
+
+        let empty = PointRun {
+            cases: Vec::new(),
+            ..run
+        };
+        assert_eq!(no_reply_note(&empty), "");
     }
 }

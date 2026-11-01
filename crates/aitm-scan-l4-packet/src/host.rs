@@ -95,6 +95,10 @@ pub struct Timing {
     /// A test's own ICMP pace, replacing both the profile's `icmp_pace_ms` and
     /// [`ICMP_PACE_FLOOR_MS`]. `None` — the production value — means the
     /// profile's, never below the floor (see [`Timing::icmp_pace_for`]).
+    ///
+    /// Test-only: honoured in `cfg(test)` builds; a release build always
+    /// applies the floor (spec D11), so no lane caller can under-pace a closed
+    /// port through [`crate::PacketLane::with_timing`].
     pub icmp_pace: Option<Duration>,
 }
 
@@ -122,13 +126,25 @@ impl Timing {
 
     /// How far apart consecutive stimuli to an ICMP-baseline point are spaced
     /// (spec amendment 46): the profile's `l4.icmp_pace_ms`, raised to
-    /// [`ICMP_PACE_FLOOR_MS`] when it is below it, or the test override when
-    /// one is set.
+    /// [`ICMP_PACE_FLOOR_MS`] when it is below it. The [`Timing::icmp_pace`]
+    /// override replaces that in `cfg(test)` builds only; a release build
+    /// always paces at the floored value (spec D11).
     #[must_use]
     pub fn icmp_pace_for(&self, options: &L4Options) -> Duration {
-        self.icmp_pace.unwrap_or_else(|| {
-            Duration::from_millis(u64::from(options.icmp_pace_ms.max(ICMP_PACE_FLOOR_MS)))
-        })
+        let floored =
+            Duration::from_millis(u64::from(options.icmp_pace_ms.max(ICMP_PACE_FLOOR_MS)));
+        pace_with(self.icmp_pace, floored, cfg!(test))
+    }
+}
+
+/// The pace an ICMP-baseline point obeys: the test override, but only in a
+/// test build; otherwise `floored`, the profile value already raised to
+/// [`ICMP_PACE_FLOOR_MS`]. Pure, so the release arm is testable from a
+/// `cfg(test)` build.
+fn pace_with(test_override: Option<Duration>, floored: Duration, test_build: bool) -> Duration {
+    match test_override {
+        Some(pace) if test_build => pace,
+        _ => floored,
     }
 }
 
@@ -3156,8 +3172,9 @@ mod tests {
     }
 
     /// Amendment 46: the pace a point obeys is the profile's, never below the
-    /// lane's defensive floor, and a test override replaces both (so a unit
-    /// test costs milliseconds instead of twenty seconds).
+    /// lane's defensive floor, and in a test build the override replaces both
+    /// (so a unit test costs milliseconds instead of twenty seconds; see
+    /// `pace_override_is_bounded_to_test_builds` for the release arm).
     #[test]
     fn profile_pace_below_the_floor_is_raised() {
         assert_eq!(super::ICMP_PACE_FLOOR_MS, 1000);
@@ -3197,6 +3214,56 @@ mod tests {
             timing.icmp_pace_for(&options),
             Duration::from_millis(30),
             "the test override replaces the profile value and the floor"
+        );
+    }
+
+    /// Tester F2 (spec D11: "the packet lane applies the same floor itself so
+    /// no lane caller can under-pace a closed port"). `Timing::icmp_pace` is a
+    /// `pub` field reachable through `PacketLane::with_timing`, so the
+    /// override is honoured in `cfg(test)` builds only; a release build always
+    /// paces at the floored profile value, whatever the override says. The
+    /// release arm cannot run under `cfg(test)`, so the rule is pinned on the
+    /// pure helper `icmp_pace_for` goes through, over all four combinations.
+    #[test]
+    fn pace_override_is_bounded_to_test_builds() {
+        let floored = Duration::from_millis(1000);
+        let zero = Some(Duration::ZERO);
+
+        assert_eq!(
+            super::pace_with(zero, floored, true),
+            Duration::ZERO,
+            "a test build honours the override"
+        );
+        assert_eq!(
+            super::pace_with(None, floored, true),
+            floored,
+            "a test build without an override paces at the floored value"
+        );
+        assert_eq!(
+            super::pace_with(zero, floored, false),
+            floored,
+            "a release build ignores the override: the floor always applies"
+        );
+        assert_eq!(
+            super::pace_with(None, floored, false),
+            floored,
+            "a release build without an override paces at the floored value"
+        );
+
+        // `icmp_pace_for` is the `cfg!(test)` arm of the helper, so here the
+        // override is honoured and the floor still raises a profile value.
+        let options = L4Options {
+            icmp_pace_ms: 0,
+            ..L4Options::default()
+        };
+        let timing = Timing {
+            icmp_pace: zero,
+            ..Timing::default()
+        };
+        assert_eq!(timing.icmp_pace_for(&options), Duration::ZERO);
+        assert_eq!(
+            Timing::default().icmp_pace_for(&options),
+            Duration::from_millis(1000)
         );
     }
 
