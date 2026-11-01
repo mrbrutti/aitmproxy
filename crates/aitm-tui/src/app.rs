@@ -3443,8 +3443,10 @@ impl App {
                 self.bus = BusStatus::Disconnected(why.clone());
                 self.browser_forget_inflight();
                 // Nothing tagged before the drop will be answered (D4), and
-                // a launch in flight is lost with the connection.
+                // a launch in flight is lost with the connection, as is the
+                // one `scan.issue` read (D6).
                 self.scan.inflight.clear();
+                self.scan.issues.pending_read = None;
                 self.scan.launch.pending = None;
                 // A confirm token is bound to the connection that issued it
                 // (D7): a pending confirm is dropped, not answered, whatever
@@ -4084,17 +4086,20 @@ impl App {
     }
 
     /// The Issues cursor came to rest on a row (a key, or a list arriving
-    /// under it while the tab is shown): read the issue once (spec D6),
-    /// `scan.issue {id}` under `scan.issue:<id>`, remembered in `fetched`
-    /// until a status update or a terminal line for its job forgets it.
+    /// under it while the tab is shown): read the issue (spec D6),
+    /// `scan.issue {id}` under `scan.issue:<id>`, when `read` has no entry
+    /// for the id and no read is pending; at most one read is in flight
+    /// (fix round D, D1). The reply, not the send, fills `read`; an entry
+    /// leaves on a terminal line for its job or a fold that drops the id.
+    /// The row's id is already in the wire form (the fold dropped the rest).
     fn issue_cursor_landed(&mut self, out: &mut Vec<BusRequest>) {
-        if self.scan.issues.pane != IssuePane::List {
+        if self.scan.issues.pane != IssuePane::List || self.scan.issues.pending_read.is_some() {
             return;
         }
         let Some(id) = self.scan.issues.cursor_issue().map(|i| i.id.clone()) else {
             return;
         };
-        if self.scan.issues.fetched.contains(&id) {
+        if self.scan.issues.read.contains_key(&id) {
             return;
         }
         if self.scan_poll(
@@ -4103,7 +4108,7 @@ impl App {
             json!({ "id": id }),
             out,
         ) {
-            self.scan.issues.fetched.insert(id);
+            self.scan.issues.pending_read = Some(id);
         }
     }
 
@@ -4297,12 +4302,14 @@ impl App {
                 }
             }
             "scan.issue" => {
+                // The reply, ok or not, settles the one read in flight (D6).
+                self.scan.issues.pending_read = None;
                 if let Some(issue) = self.scan_reply::<Issue>(tag, &value) {
                     // The same hostile-core bound as `scan.status`: the
-                    // detail is folded only under the id the tag asked for.
+                    // issue is read only under the id the tag asked for.
                     if Some(issue.id.as_str()) == tag_parts(tag).1 {
-                        self.scan.issues.detail = Some(issue);
                         self.scan.issues.flow_cursor = 0;
+                        self.scan.issues.read.insert(issue.id.clone(), issue);
                     } else {
                         self.scan.set_error(ScanError::uncoded(tag, OTHER_ISSUE));
                     }
@@ -4337,10 +4344,15 @@ impl App {
     }
 
     /// A tagged `scan.*` call failed: settle the tag and record the error on
-    /// its tab. Task 13 adds the D9 wording display and the `not_found`
+    /// its tab. A failed `scan.issue` clears the pending read and reads
+    /// nothing, so the next landing on the row asks again (fix round D,
+    /// D3). Task 13 adds the D9 wording display and the `not_found`
     /// self-heal.
     fn on_scan_failed(&mut self, tag: &str, message: String, _out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
+        if tag_parts(tag).0 == "scan.issue" {
+            self.scan.issues.pending_read = None;
+        }
         self.scan.set_error(ScanError::from_message(tag, &message));
     }
 

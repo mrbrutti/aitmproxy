@@ -1,16 +1,17 @@
 //! The Issues tab's state (spec D3, D11): the grouped list, its filters and
 //! the open issue, plus the pure helpers the reducer and the view share.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
-    BySeverity, Confidence, Issue, IssueStatus, IssueSummary, IssuesResult, JobId, LaneKind,
+    BySeverity, Confidence, Issue, IssueId, IssueStatus, IssueSummary, IssuesResult, JobId,
+    LaneKind,
 };
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use super::{ScanError, ISSUES_PAGE_LIMIT};
+use super::{is_issue_id, ScanError, ISSUES_PAGE_LIMIT};
 
 /// How many `Tick`s between two `scan.issues` refreshes while the Issues tab
 /// is shown and a job is live (spec D6: five seconds).
@@ -262,7 +263,8 @@ pub fn issue_row(i: &IssueSummary) -> IssueRow {
 /// The Issues tab.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct IssuesState {
-    /// `scan.issues`' rows, in wire order; the view groups them by severity.
+    /// `scan.issues`' rows, in wire order, at most [`ISSUES_PAGE_LIMIT`] of
+    /// them and every id in the wire form; the view groups them by severity.
     pub list: Vec<IssueSummary>,
     /// The severity tally the headers show.
     pub by_severity: BySeverity,
@@ -272,29 +274,38 @@ pub struct IssuesState {
     /// The list cursor.
     pub cursor: usize,
     pub pane: IssuePane,
-    /// The open issue (`scan.issue` / `scan.issue.update` reply).
-    pub detail: Option<Issue>,
+    /// The full issues received from `scan.issue` (and, from the Issues
+    /// detail task on, `scan.issue.update`), by id: inserted on a reply
+    /// only, never on send, and pruned by every fold to the page's ids, so
+    /// `read.len() <= list.len()` (spec D3, D6; fix round D, D1). An entry
+    /// also leaves on a terminal line for its job ([`IssuesState::forget_job`]).
+    pub read: BTreeMap<IssueId, Issue>,
     /// Cursor over the detail's probe flows.
     pub flow_cursor: usize,
     /// The tick of the last `scan.issues` request this tab sent; `None`
     /// until the tab was first opened (spec D6: "when the Issues tab was
     /// ever opened" reads `is_some()`).
     pub fetched_at_tick: Option<u64>,
-    /// The issue ids `scan.issue` was asked for (spec D6: once per id); an id
-    /// leaves on a status update or on a terminal line for its job.
-    pub fetched: BTreeSet<String>,
+    /// The one `scan.issue` read in flight, by id (spec D6: at most one at a
+    /// time); the reply, ok or failed, clears it, as does a disconnect.
+    pub pending_read: Option<String>,
     /// This tab's last error.
     pub error: Option<ScanError>,
 }
 
 impl IssuesState {
     /// Fold a `scan.issues` reply (spec D10): the page replaces `list`, the
-    /// tally and the cursor; the list cursor is clamped to the new page.
-    pub fn fold_result(&mut self, result: IssuesResult) {
+    /// tally and `next_cursor`; the list cursor is clamped to the new page.
+    /// Hostile-core bounds (D6): a row whose id is not in the wire form is
+    /// dropped, and `read` keeps only the ids the page lists.
+    pub fn fold_result(&mut self, mut result: IssuesResult) {
+        result.issues.retain(|i| is_issue_id(&i.id));
         self.list = result.issues;
         self.by_severity = result.by_severity;
         self.next_cursor = result.next_cursor;
         self.cursor = self.cursor.min(self.list.len().saturating_sub(1));
+        let listed: BTreeSet<&str> = self.list.iter().map(|i| i.id.as_str()).collect();
+        self.read.retain(|id, _| listed.contains(id.as_str()));
     }
 
     /// The row under the list cursor, if the list has one.
@@ -302,23 +313,18 @@ impl IssuesState {
         self.list.get(self.cursor)
     }
 
-    /// Forget every fetched id that belongs to `job` (spec D6: a terminal
-    /// line for the job lets the next landing read the issue again), read
-    /// from the list rows and the open detail.
+    /// The full issue of the row under the cursor, when `scan.issue` has
+    /// answered for it: what the detail pane shows, so it is always the row
+    /// under the cursor and never the issue read last (fix round D, D1).
+    pub fn detail(&self) -> Option<&Issue> {
+        self.read.get(&self.cursor_issue()?.id)
+    }
+
+    /// Drop every read issue that belongs to `job` (spec D6: a terminal
+    /// line for the job lets the next landing read the issue again), by the
+    /// job the issue itself names, so a filtered-out job's issues leave too.
     pub fn forget_job(&mut self, job: &str) {
-        let of_job: BTreeSet<&str> = self
-            .list
-            .iter()
-            .filter(|i| i.job == job)
-            .map(|i| i.id.as_str())
-            .chain(
-                self.detail
-                    .iter()
-                    .filter(|i| i.job == job)
-                    .map(|i| i.id.as_str()),
-            )
-            .collect();
-        self.fetched.retain(|id| !of_job.contains(id.as_str()));
+        self.read.retain(|_, i| i.job != job);
     }
 }
 

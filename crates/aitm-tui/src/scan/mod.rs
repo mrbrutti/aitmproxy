@@ -484,7 +484,22 @@ pub fn parse_result<T: serde::de::DeserializeOwned>(
 /// line or a `scan.list` row is used as a tag key, an argument and an
 /// `inflight` entry only when this holds; the rest are ignored.
 pub fn is_job_id(s: &str) -> bool {
-    s.strip_prefix("scan-").is_some_and(|hex| {
+    is_wire_id(s, "scan-")
+}
+
+/// Whether `s` is an issue id in its wire form: `issue-` followed by exactly
+/// eight lowercase hex digits (spec D6, hostile-core bounds; fix round D,
+/// D1). An id from a `scan.issues` row or an `issue` push line is used as a
+/// tag key, an argument or a `read` entry only when this holds; a row that
+/// fails it is dropped by the fold.
+pub fn is_issue_id(s: &str) -> bool {
+    is_wire_id(s, "issue-")
+}
+
+/// `prefix` then exactly eight lowercase hex digits: the one shape every
+/// scanner id has on the wire.
+fn is_wire_id(s: &str, prefix: &str) -> bool {
+    s.strip_prefix(prefix).is_some_and(|hex| {
         hex.len() == 8
             && hex
                 .bytes()

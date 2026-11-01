@@ -4,8 +4,9 @@
 //! Entering Issues, any filter change and every twentieth tick while a job is
 //! live fetch `scan.issues {filters, limit: 512}`; the reply renders grouped
 //! under the five severity headers with their `by_severity` counts; the
-//! cursor landing on a row fetches `scan.issue {id}` once per id until a
-//! terminal line for its job forgets it.
+//! cursor landing on a row reads `scan.issue {id}` when `read` lacks the id
+//! and no read is pending; a reply fills `read`, a fold prunes it to the
+//! page, a terminal line for its job drops its entries (fix round D, D1).
 //!
 //! Fixture-driven: this proves the reducer and the rendering only. Acceptance
 //! is the pty cell against a real core (spec Acceptance criteria, "Live").
@@ -16,7 +17,7 @@ use aitm_poc::Severity;
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
-use aitm_tui::scan::{IssueFilterKey, IssueFilters, ScanTab};
+use aitm_tui::scan::{is_issue_id, IssueFilterKey, IssueFilters, IssuePane, ScanTab};
 use common::*;
 use serde_json::{json, Value};
 
@@ -30,6 +31,7 @@ const TOOLS: &[&str] = &[
 ];
 
 const JOB: &str = "scan-1a2b3c4d";
+const JOB_B: &str = "scan-0b0b0b0b";
 const XSS: &str = "issue-9f8e7d6c";
 const REDIRECT: &str = "issue-4c3b2a19";
 
@@ -78,6 +80,18 @@ fn issues_reply(body: Value) -> BusEvent {
         tag: "scan.issues".into(),
         name: "scan.issues".into(),
         value: body,
+    }
+}
+
+/// The `scan.issue.json` reply under its keyed tag, its `id` rewritten to
+/// `id` so the fold-under-key check passes for any row.
+fn issue_reply(id: &str) -> BusEvent {
+    let mut issue = fixture("scan.issue.json");
+    issue["id"] = json!(id);
+    BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{id}"),
+        name: "scan.issue".into(),
+        value: issue,
     }
 }
 
@@ -244,62 +258,134 @@ fn j_toggles_the_job_filter_to_the_jobs_cursor() {
     assert_eq!(reqs, vec![issues_request(json!({ "limit": 512 }))]);
 }
 
-/// T7-9, D6: the cursor landing on a row sends `scan.issue {id}` once; a
-/// later landing on the same id sends nothing.
+/// T7-9, D6 (fix round D, D1): the cursor landing on a row reads it once,
+/// a reply fills `read`, and `detail()` is the lookup for the row under the
+/// cursor: after Down (second row read) then Up, the detail is the first
+/// row's issue, never the one read last.
 #[test]
-fn cursor_on_a_row_fetches_the_issue_once() {
+fn cursor_on_a_row_reads_it_once_and_detail_follows_the_cursor() {
     let mut app = app();
     let _ = app.update(Action::ScanTab(ScanTab::Issues));
     // The list arriving puts the cursor on its first row: the first landing.
     let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
     assert_eq!(reqs, vec![issue_request(XSS)]);
     assert_eq!(app.scan.issues.cursor, 0);
+    assert_eq!(app.scan.issues.pending_read.as_deref(), Some(XSS));
+    assert!(app.scan.issues.read.is_empty(), "a send is not a read");
+    let _ = app.on_bus(issue_reply(XSS));
+    assert_eq!(app.scan.issues.pending_read, None);
+    assert_eq!(app.scan.issues.read.len(), 1);
+    assert!(!app.scan.inflight.contains(&format!("scan.issue:{XSS}")));
 
     let down = app.update(Action::Down);
     assert_eq!(app.scan.issues.cursor, 1);
     assert_eq!(down, vec![issue_request(REDIRECT)]);
+    let _ = app.on_bus(issue_reply(REDIRECT));
+    assert_eq!(app.scan.issues.read.len(), 2);
+    assert_eq!(
+        app.scan.issues.detail().map(|i| i.id.as_str()),
+        Some(REDIRECT)
+    );
 
     let up = app.update(Action::Up);
     assert_eq!(app.scan.issues.cursor, 0);
-    assert!(up.is_empty(), "the first row was asked for already: {up:?}");
-    assert!(app.scan.issues.fetched.contains(XSS));
-    assert!(app.scan.issues.fetched.contains(REDIRECT));
-
-    // The detail reply under its keyed tag fills `detail`.
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: fixture("scan.issue.json"),
-    });
+    assert!(up.is_empty(), "the first row was read already: {up:?}");
     assert_eq!(
-        app.scan.issues.detail.as_ref().map(|i| i.id.as_str()),
-        Some(XSS)
+        app.scan.issues.detail().map(|i| i.id.as_str()),
+        Some(XSS),
+        "the detail is the row under the cursor"
     );
-    assert!(!app.scan.inflight.contains(&format!("scan.issue:{XSS}")));
 }
 
-/// D6: a terminal line for a job forgets the ids it fetched, so the next
-/// landing asks again; the other job's ids stay.
+/// D1 (3): at most one `scan.issue` is in flight. Two landings before any
+/// reply send one request; the reply clears `pending_read`.
 #[test]
-fn a_terminal_line_forgets_the_jobs_fetched_issues() {
+fn two_landings_before_any_reply_send_one_read() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    assert_eq!(reqs, vec![issue_request(XSS)]);
+    let down = app.update(Action::Down);
+    assert_eq!(app.scan.issues.cursor, 1);
+    assert!(down.is_empty(), "a read is pending: {down:?}");
+    assert_eq!(app.scan.issues.pending_read.as_deref(), Some(XSS));
+    let _ = app.on_bus(issue_reply(XSS));
+    assert_eq!(app.scan.issues.pending_read, None);
+    assert!(app.scan.inflight.is_empty());
+}
+
+/// D3: a failed `scan.issue` clears the pending read and inserts nothing,
+/// so a later landing on the same row reads it again.
+#[test]
+fn a_failed_read_leaves_the_issue_readable() {
     let mut app = app();
     let _ = app.update(Action::ScanTab(ScanTab::Issues));
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
-    let _ = app.update(Action::Down);
-    assert_eq!(app.scan.issues.fetched.len(), 2);
-    // Settle both detail reads, so the tag dedupe is not what holds a
-    // re-read back below.
-    for id in [XSS, REDIRECT] {
-        let mut issue = fixture("scan.issue.json");
-        issue["id"] = json!(id);
-        let _ = app.on_bus(BusEvent::CallTaggedOk {
-            tag: format!("scan.issue:{id}"),
-            name: "scan.issue".into(),
-            value: issue,
-        });
-    }
+    let _ = app.on_bus(BusEvent::CallTaggedFailed {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        message: "scan: not_found: issue-9f8e7d6c".into(),
+    });
+    assert_eq!(app.scan.issues.pending_read, None);
+    assert!(app.scan.issues.read.is_empty(), "a failure reads nothing");
     assert!(app.scan.inflight.is_empty());
-    assert_eq!(app.scan.issues.fetched.len(), 2, "a reply keeps the id");
+
+    let down = app.update(Action::Down);
+    assert_eq!(down, vec![issue_request(REDIRECT)]);
+    let _ = app.on_bus(issue_reply(REDIRECT));
+    let up = app.update(Action::Up);
+    assert_eq!(
+        up,
+        vec![issue_request(XSS)],
+        "the failed row is asked for again"
+    );
+}
+
+/// D5: a `scan.issue` reply naming another issue than the tag's key is not
+/// folded: `detail()` stays `None` and the tab's error names the mismatch.
+#[test]
+fn a_read_naming_another_issue_is_not_folded() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let mut other = fixture("scan.issue.json");
+    other["id"] = json!(REDIRECT);
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        value: other,
+    });
+    assert_eq!(app.scan.issues.detail(), None);
+    assert!(app.scan.issues.read.is_empty());
+    assert_eq!(app.scan.issues.pending_read, None);
+    assert_eq!(
+        app.scan.issues.error.as_ref().map(|e| e.detail.as_str()),
+        Some("reply named a different issue")
+    );
+}
+
+/// D1 (2): a terminal line for a job drops its `read` entries, even while
+/// the `J` filter points at another job, so the next landing reads afresh.
+#[test]
+fn a_terminal_line_drops_the_jobs_read_issues_even_when_filtered_out() {
+    let mut app = app();
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    let mut other = fixture("scan.status.json");
+    other["job"] = json!(JOB_B);
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.status:{JOB_B}"),
+        name: "scan.status".into(),
+        value: other,
+    });
+    assert_eq!(app.scan.jobs.cursor_job().map(String::as_str), Some(JOB_B));
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let _ = app.on_bus(issue_reply(XSS));
+    assert_eq!(app.scan.issues.read.len(), 1);
+
+    let reqs = app.update(Action::ScanFilter(IssueFilterKey::Job));
+    assert_eq!(app.scan.issues.filters.job.as_deref(), Some(JOB_B));
+    assert_eq!(issues_requests(&reqs).len(), 1);
 
     let reqs = app.on_bus(BusEvent::Notification(json!({
         "jsonrpc": "2.0",
@@ -307,15 +393,122 @@ fn a_terminal_line_forgets_the_jobs_fetched_issues() {
         "params": fixture("job.finished.json"),
     })));
     assert!(
-        app.scan.issues.fetched.is_empty(),
-        "both issues belong to {JOB}: {:?}",
-        app.scan.issues.fetched
+        app.scan.issues.read.is_empty(),
+        "the read issue belongs to {JOB}: {:?}",
+        app.scan.issues.read.keys().collect::<Vec<_>>()
     );
-    // The line also refreshes the list (D6 third row); its reply lands the
-    // cursor again and asks for the row once more.
-    assert!(issues_requests(&reqs).len() == 1, "{reqs:?}");
-    let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
-    assert_eq!(reqs, vec![issue_request(REDIRECT)]);
+    assert_eq!(
+        issues_requests(&reqs).len(),
+        0,
+        "the filtered refetch is already in flight: {reqs:?}"
+    );
+}
+
+/// D1 (1): a page whose rows carry a 1 MiB id is dropped row by row: no
+/// `scan.issue` leaves, nothing is read or in flight.
+#[test]
+fn a_page_of_oversized_ids_is_dropped_without_a_read() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let _ = app.on_bus(issue_reply(XSS));
+    let huge = format!("issue-{}", "a".repeat(1 << 20));
+    let mut page = fixture("scan.issues.json");
+    for row in page["issues"].as_array_mut().unwrap_or(&mut Vec::new()) {
+        row["id"] = json!(huge);
+    }
+    let reqs = app.on_bus(issues_reply(page));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert!(app.scan.issues.list.is_empty());
+    assert!(
+        app.scan.issues.read.is_empty(),
+        "the fold pruned the old read"
+    );
+    assert!(app.scan.inflight.is_empty());
+    assert_eq!(app.scan.issues.pending_read, None);
+}
+
+/// D1 (2): `read` is pruned to the page on every fold, so a hundred pages
+/// of a hundred distinct ids leave `read.len() <= list.len()`.
+#[test]
+fn read_never_outgrows_the_page() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let template = fixture("scan.issues.json")["issues"][0].clone();
+    for page_no in 0..100u32 {
+        let rows: Vec<Value> = (0..100u32)
+            .map(|k| {
+                let mut row = template.clone();
+                row["id"] = json!(format!("issue-{:08x}", page_no * 100 + k));
+                row
+            })
+            .collect();
+        let first = rows[0]["id"].as_str().unwrap_or_default().to_string();
+        let reqs = app.on_bus(issues_reply(json!({
+            "issues": rows,
+            "next_cursor": null,
+            "by_severity": { "critical": 0, "high": 100, "medium": 0, "low": 0, "info": 0 },
+        })));
+        assert_eq!(reqs, vec![issue_request(&first)]);
+        let _ = app.on_bus(issue_reply(&first));
+    }
+    assert_eq!(app.scan.issues.list.len(), 100);
+    assert!(
+        app.scan.issues.read.len() <= app.scan.issues.list.len(),
+        "{} read over {} rows",
+        app.scan.issues.read.len(),
+        app.scan.issues.list.len()
+    );
+    assert!(app.scan.inflight.is_empty());
+}
+
+/// D1 (1): the issue-id wire form, `issue-` and exactly eight lowercase hex
+/// digits.
+#[test]
+fn is_issue_id_accepts_only_eight_lowercase_hex() {
+    assert!(is_issue_id("issue-9f8e7d6c"));
+    assert!(!is_issue_id("issue-9F8E7D6C"));
+    assert!(!is_issue_id("issue-9f8e7d6"));
+    assert!(!is_issue_id(""));
+}
+
+/// D6 pin: `S` on the Jobs tab sends nothing and moves no filter.
+#[test]
+fn s_on_the_jobs_tab_sends_nothing() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let reqs = app.update(Action::ScanFilter(IssueFilterKey::Severity));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.scan.issues.filters, IssueFilters::default());
+}
+
+/// D6 pin: coming back to the view on the Issues tab is entering it, so
+/// `OpenScan` after `Back` sends `scan.issues` again.
+#[test]
+fn open_scan_after_back_from_issues_refetches() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let _ = app.update(Action::Back);
+    assert_ne!(app.mode, Mode::Scan);
+    let reqs = app.update(Action::OpenScan);
+    assert_eq!(app.scan.tab, ScanTab::Issues);
+    assert_eq!(issues_requests(&reqs), vec![&json!({ "limit": 512 })]);
+}
+
+/// D6 pin: with the Detail pane focused, `Down` moves no list cursor and
+/// sends no `scan.issue`.
+#[test]
+fn detail_focused_down_sends_no_read() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let _ = app.on_bus(issue_reply(XSS));
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(app.scan.issues.pane, IssuePane::Detail);
+    let reqs = app.update(Action::Down);
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.scan.issues.cursor, 0);
 }
 
 /// T7-9, D6: with a running job, the Issues tab refetches every 20 ticks;
