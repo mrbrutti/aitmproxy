@@ -292,7 +292,8 @@ impl Kind {
                 cwe: Some(400),
                 description: "Opens and immediately cancels eight streams on one connection, \
                               once, and reports whether the server showed any reset-rate \
-                              mitigation (a GOAWAY or a refused stream). It is a bounded \
+                              mitigation (a GOAWAY, a refused stream or a closed \
+                              connection). It is a bounded \
                               probe, not a flood.",
                 remediation: "Apply a reset-rate limit per connection and close abusive \
                               connections with GOAWAY (CVE-2023-44487).",
@@ -654,12 +655,41 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
             &format!("the peer refused a stream during {RESET_PAIRS} reset pairs"),
         );
     }
+    // A reset or an answer is an observed outcome for the pair; a timeout is
+    // not. Only the observed ones count towards the complete series.
+    let observed = obs
+        .streams
+        .iter()
+        .filter(|outcome| !matches!(outcome, StreamOutcome::Timeout))
+        .count();
+    // The peer dropped the connection on the resets without saying why: the
+    // bluntest reset-rate mitigation there is, and the check's whole question
+    // answered (tester finding T2-2). Before the series check, because a drop
+    // is usually what cuts the series short.
+    if obs.connection_closed {
+        return no_finding(
+            Outcome::Clean,
+            &format!(
+                "the peer closed the connection without a GOAWAY after {observed} of \
+                 {RESET_PAIRS} reset pairs"
+            ),
+        );
+    }
+    // Fewer than eight observed pairs is not the "complete repeated
+    // observation" the `firm` verdict below stands on (spec review SP-3).
+    if observed < usize::from(RESET_PAIRS) {
+        return inconclusive(&format!(
+            "only {observed} of {RESET_PAIRS} reset pairs reached an outcome before the probe \
+             stopped"
+        ));
+    }
     Verdict {
         outcome: Outcome::Vulnerable,
-        // A complete repeated observation — all eight pairs sent, nothing at
-        // all from the peer — so the meta's `firm` ceiling is reachable
-        // (review SP-3). It is still not `certain`: a mitigation could exist
-        // above this threshold.
+        // A complete repeated observation — all eight pairs sent, every one
+        // answered or reset, nothing at all from the peer and the connection
+        // still open — so the meta's `firm` ceiling is reachable (review
+        // SP-3). It is still not `certain`: a mitigation could exist above
+        // this threshold.
         confidence: Confidence::Firm,
         evidence: Evidence {
             matched: Some(format!(

@@ -1591,27 +1591,40 @@ async fn an_empty_observation_is_inconclusive_for_the_malformed_checks() {
 }
 
 /// `h2-rapid-reset-mitigation`'s `firm` verdict is, per SP-3, "a complete
-/// repeated observation: 8 reset pairs, no GOAWAY, no refused stream". An
-/// observation that carries **fewer than eight stream outcomes** is not that
-/// observation, and a peer that **closed the connection** on the resets
-/// without a GOAWAY has mitigated by the bluntest means there is. Neither may
-/// be reported as "no reset-rate mitigation observed" at `firm`.
+/// repeated observation: 8 reset pairs, no GOAWAY, no refused stream". The
+/// rule (tester finding of the F3 pass, fixed in F5):
 ///
-/// Tester finding (F3 pass): `rapid_reset_verdict` reads only `goaway` and
-/// `Refused`; it ignores `streams.len()` and `connection_closed`. Un-ignore
-/// with the fix.
+/// - **fewer than eight outcomes**, or an outcome that is not a reset or an
+///   answer (a `Timeout`), is not that observation and is `Inconclusive`;
+/// - a peer that **closed the connection** on the resets without a GOAWAY has
+///   mitigated by the bluntest means there is, and is `Clean`;
+/// - only eight non-refused resets/answers on a connection that stayed open
+///   are "no reset-rate mitigation observed", at `firm`.
 #[tokio::test]
-#[ignore = "tester finding: rapid_reset_verdict ignores a short series and a closed connection"]
 async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
     // Two pairs answered, then nothing: not eight, so not a complete observation.
     let runner = FakeRunner::answering(resets(2));
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
     let v = run(&check, &h2host()).await;
-    assert_ne!(
-        (v.outcome, v.confidence),
-        (Outcome::Vulnerable, Confidence::Firm),
-        "two observed pairs were reported as eight: {}",
-        v.detail
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(v.confidence, Confidence::Tentative);
+    assert_eq!(
+        v.detail,
+        "only 2 of 8 reset pairs reached an outcome before the probe stopped"
+    );
+    assert_eq!(v.evidence.matched, None);
+
+    // Eight outcomes, but one of them is a timeout: nothing was observed for
+    // that pair, so the series is not complete either.
+    let mut streams = vec![reset(); 8];
+    streams[3] = StreamOutcome::Timeout;
+    let runner = FakeRunner::answering(obs(streams));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Inconclusive, "{}", v.detail);
+    assert_eq!(
+        v.detail,
+        "only 7 of 8 reset pairs reached an outcome before the probe stopped"
     );
 
     // Eight pairs, no GOAWAY, but the peer dropped the connection.
@@ -1620,10 +1633,22 @@ async fn rapid_reset_is_not_firm_on_a_short_series_or_a_dropped_connection() {
     let runner = FakeRunner::answering(o);
     let check = check_named(&runner, "h2-rapid-reset-mitigation");
     let v = run(&check, &h2host()).await;
-    assert_ne!(
-        v.outcome,
-        Outcome::Vulnerable,
-        "a dropped connection is a mitigation, yet: {}",
-        v.detail
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert_eq!(
+        v.detail,
+        "the peer closed the connection without a GOAWAY after 8 of 8 reset pairs"
+    );
+
+    // A drop part-way through is still the peer's doing: Clean, and the
+    // detail says how far the series got.
+    let mut o = resets(3);
+    o.connection_closed = true;
+    let runner = FakeRunner::answering(o);
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let v = run(&check, &h2host()).await;
+    assert_eq!(v.outcome, Outcome::Clean, "{}", v.detail);
+    assert_eq!(
+        v.detail,
+        "the peer closed the connection without a GOAWAY after 3 of 8 reset pairs"
     );
 }
