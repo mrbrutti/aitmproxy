@@ -648,6 +648,10 @@ tungstenite 0.28's client handshake (`VerifyData::verify_response`, `handshake/c
 
 `ws-subprotocol-observe`: a 101 that carries no `sec-websocket-protocol` (or an empty one) is **Clean** (RFC 6455 lets a server decline every offered subprotocol; the client is expected to fail such a connection), so the Patched target, which ignores the header, yields no issue. `Vulnerable(Info, Firm)` only when the 101 echoes the `aitm-<marker>` token (accepts any subprotocol) or selects a protocol the client never offered. Decision 6's "completed the upgrade with none" arm is withdrawn; the test is `server_completing_without_protocol_is_clean`. The check runs on both the `origin` and `sec-websocket-protocol` points (two dials per handshake); a per-handshake dedupe is an engine concern left as a follow-up.
 
+### Task 15 amendment (T4 session, 2026-11-01, call 34): Close frames carry their code
+
+The dialer recorded a received Close frame's payload as the reason text only, so no check could read the close code (`ProbeResponse` carries no `CollectEnd`, call 18) and `ws-oversize-frame`'s `Clean` arm (Close 1009/1002) was unreachable. `dialer.rs` now records a Close payload in the RFC 6455 layout (2-byte big-endian code + reason, the layout `aitm-proto-ws` captures) and reads a sent `FrameKind::Close` payload the same way (shorter than two bytes = code 1000, empty reason); test `close_frame_payload_carries_code_and_reason`. `ProbeResponse.elapsed_ms` is measured from the dial and includes the prerequisite drain (call 29), so the drop arm's early-`elapsed_ms` reading degrades to `Inconclusive` on a target whose prerequisite replies are slow; conservative, never a false `Vulnerable`.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
