@@ -49,7 +49,7 @@ use crate::scheduler::payload_cap;
 use crate::util::{default_port, normalize_origin, origin_key, scrub, split_authority, wire_token};
 
 /// The mark every crawl capture carries beside `scan:<job>` (spec D5).
-const CRAWL_MARK: &str = "crawl";
+pub(crate) const CRAWL_MARK: &str = "crawl";
 
 /// How many probe flows one [`InterimProbeHost`] keeps in memory (spec D5).
 pub const MAX_HELD_FLOWS: usize = 16;
@@ -149,11 +149,36 @@ impl InterimHttpLane {
         }
     }
 
+    /// Crawl one origin with the job's HTTP client, for a job that has no
+    /// browser to crawl with (spec D1 "every T1 AC must be provable on the
+    /// interim lane", D5 "client-crawler GETs go through `send_opts` like
+    /// probes, recorded under the same policy with the crawl mark").
+    ///
+    /// This is the fallback, not the default: a bound browser under
+    /// `use_browser: auto` crawls instead, because it runs the script a client
+    /// cannot. It runs when no browser is bound **or** `use_browser: never`,
+    /// and `crawl.max_pages > 0` — that one setting turns every crawl off.
+    ///
+    /// Returns why the crawl stopped when the reason is worth saying, so the
+    /// caller can log it beside the job; an exhausted graph says nothing.
+    async fn client_crawl(&self, origin: &str, job: &dyn JobCtx) -> Option<&'static str> {
+        let profile = job.profile();
+        let browser_crawls =
+            job.browser().is_some() && profile.crawl.use_browser != UseBrowser::Never;
+        if profile.crawl.max_pages == 0 || browser_crawls {
+            return None;
+        }
+        crate::interim_crawl::crawl_with_client(origin, job)
+            .await
+            .stopped
+    }
+
     /// Build the site map and the insertion points from every captured, in-scope
     /// flow in the store — the crawl's captures included, since they are now
     /// ordinary captures.
     fn map_flows(&self, origins: &[String], job: &dyn JobCtx) -> Discovery {
         let store = job.store();
+        let job_mark = format!("scan:{}", job.job_id());
         let mut nodes: Vec<SiteNode> = Vec::new();
         let mut index: HashMap<NodeId, usize> = HashMap::new();
         let mut points: Vec<InsertionPoint> = Vec::new();
@@ -163,8 +188,12 @@ impl InterimHttpLane {
                 continue;
             };
             // A replay is the scanner's own traffic (or an operator's); the
-            // attack surface is what the target was actually asked for.
-            if flow.metadata.is_replay {
+            // attack surface is what the target was actually asked for. This
+            // job's own crawl captures are the exception: the client crawl
+            // reissues each page through the proxy, which stamps a reissue a
+            // replay, and those pages are exactly the surface (spec D5,
+            // "crawl flows are different").
+            if flow.metadata.is_replay && !is_crawl_capture(&flow, &job_mark) {
                 continue;
             }
             let origin = origin_key(&flow.request.scheme, &flow.request.authority);
@@ -259,6 +288,16 @@ impl Lane for InterimHttpLane {
                         reason = %reason,
                         "interim lane: the browser crawl was refused; \
                          discovery continues over captured flows"
+                    );
+                }
+                // The client crawl, for a job with no browser to crawl with.
+                // It is a no-op whenever the browser crawl above could run.
+                if let Some(stopped) = self.client_crawl(origin, job).await {
+                    tracing::debug!(
+                        job = job.job_id(),
+                        origin,
+                        stopped,
+                        "interim lane: the client crawl stopped early"
                     );
                 }
             }
@@ -705,6 +744,15 @@ impl Check for LegacyPassiveCheck {
 
 /// The v2 kind a v1 [`Location`] becomes. `Redirect` is not a kind in v2: it is
 /// a query parameter carrying the `url` trait (spec D2).
+/// Whether a flow is one of **this** job's crawl captures: both the job's
+/// mark and [`CRAWL_MARK`], which only the two crawl paths put on a flow. A
+/// probe stored under `record_probes: all` carries the job's mark alone and
+/// stays what it is — the scanner's own traffic.
+fn is_crawl_capture(flow: &HttpFlow, job_mark: &str) -> bool {
+    let marks = &flow.metadata.marks;
+    marks.iter().any(|mark| mark == job_mark) && marks.iter().any(|mark| mark == CRAWL_MARK)
+}
+
 fn kind_for(location: &Location) -> InsertionKind {
     match location {
         Location::Query | Location::Redirect => InsertionKind::Query,
@@ -1231,6 +1279,128 @@ mod tests {
         }
     }
 
+    // -------------------------------------------------------- site stub client
+
+    /// The landing page of the stub site: two anchors with query parameters,
+    /// one GET form, and one link off the origin the crawl must never follow.
+    const SITE_INDEX: &str = concat!(
+        "<html><body>",
+        "<a href=\"/search?q=x\">search</a>",
+        "<a href=\"/redirect?to=http://away.test/\">redirect</a>",
+        "<a href=\"http://elsewhere.test/evil\">off origin</a>",
+        "<form action=\"/find\" method=\"get\"><input name=\"term\"></form>",
+        "</body></html>",
+    );
+
+    /// A `ProxyClient` serving that tiny site, recording every request with the
+    /// [`SendOptions`] it was handed and — like the real `PipelineClient` —
+    /// inserting the flow into the store when the caller asked to record it.
+    struct SiteClient {
+        store: Arc<dyn FlowStore>,
+        seen: Mutex<Vec<(HttpRequest, SendOptions)>>,
+        /// Refuse every request after the root with a spent-budget refusal,
+        /// the way the `JobClient` ends a crawl mid-page.
+        refuse_after_root: bool,
+    }
+
+    impl SiteClient {
+        fn new(store: &Arc<dyn FlowStore>) -> Arc<Self> {
+            Arc::new(Self {
+                store: Arc::clone(store),
+                seen: Mutex::new(Vec::new()),
+                refuse_after_root: false,
+            })
+        }
+
+        fn refusing(store: &Arc<dyn FlowStore>) -> Arc<Self> {
+            Arc::new(Self {
+                store: Arc::clone(store),
+                seen: Mutex::new(Vec::new()),
+                refuse_after_root: true,
+            })
+        }
+
+        fn seen(&self) -> std::sync::MutexGuard<'_, Vec<(HttpRequest, SendOptions)>> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        fn calls(&self) -> usize {
+            self.seen().len()
+        }
+
+        fn requests(&self) -> Vec<HttpRequest> {
+            self.seen().iter().map(|(req, _)| req.clone()).collect()
+        }
+
+        fn options(&self) -> Vec<SendOptions> {
+            self.seen().iter().map(|(_, opts)| opts.clone()).collect()
+        }
+
+        /// `METHOD path` for every request the crawl made, in order.
+        fn trail(&self) -> Vec<String> {
+            self.requests()
+                .iter()
+                .map(|req| format!("{} {}", req.method, req.path))
+                .collect()
+        }
+    }
+
+    impl ProxyClient for SiteClient {
+        fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            self.send_opts(req, SendOptions::default())
+        }
+
+        fn send_opts(
+            &self,
+            req: HttpRequest,
+            opts: SendOptions,
+        ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async move {
+                let path = req.path.split('?').next().unwrap_or("/").to_string();
+                let marks = opts.marks.clone();
+                let record = opts.record;
+                self.seen().push((req.clone(), opts));
+                if self.refuse_after_root && path != "/" {
+                    return Err(anyhow::Error::new(ProbeRefused::Budget));
+                }
+                let response = match path.as_str() {
+                    "/" => response(
+                        200,
+                        &[("content-type", "text/html; charset=utf-8")],
+                        SITE_INDEX,
+                    ),
+                    "/search" | "/find" => response(
+                        200,
+                        &[("content-type", "text/html; charset=utf-8")],
+                        "<html><body>ok</body></html>",
+                    ),
+                    "/redirect" => response(302, &[("location", "/")], ""),
+                    _ => response(404, &[("content-type", "text/plain")], "not found"),
+                };
+                let flow = HttpFlow {
+                    id: FlowId::new(),
+                    request: req,
+                    response: Some(response),
+                    client_conn: conn(),
+                    server_conn: None,
+                    metadata: FlowMeta {
+                        // The pipeline client stamps a reissued send as a
+                        // replay; a crawl capture is one, and the lane must
+                        // still read it as attack surface.
+                        is_replay: true,
+                        marks,
+                        ..FlowMeta::default()
+                    },
+                    intercept: InterceptState::Observed,
+                };
+                if record == RecordPolicy::Always {
+                    self.store.insert(Flow::Http(flow.clone()));
+                }
+                Ok(flow)
+            })
+        }
+    }
+
     // ----------------------------------------------------------- stub browser
 
     /// A browser whose every page links to fifty more on the origin, so an
@@ -1407,6 +1577,16 @@ mod tests {
         InterimHttpLane::new(ScannerConfig::default())
     }
 
+    /// A job whose crawl is off (`max_pages: 0`, spec D2), for the tests that
+    /// are about the probes or the mapping of what the store already holds:
+    /// discovery sends nothing, so the stub client's call count is the
+    /// probes' alone.
+    fn no_crawl_job(store: Arc<dyn FlowStore>, client: Arc<dyn ProxyClient>) -> TestJob {
+        let mut job = TestJob::new(store, client);
+        job.profile.crawl.max_pages = 0;
+        job
+    }
+
     async fn discover_origins(job: &TestJob, origins: &[&str]) -> Discovery {
         lane()
             .discover(&target(origins), job)
@@ -1454,7 +1634,7 @@ mod tests {
             "/search?q=1&next=http://elsewhere.test/",
         )));
         store.insert(Flow::Http(captured("http", "/account/42")));
-        let job = TestJob::new(
+        let job = no_crawl_job(
             Arc::clone(&store),
             StubClient::new(Answer::Fixed(200, "", "")),
         );
@@ -1529,20 +1709,21 @@ mod tests {
         assert!(job.charged() >= 1, "the crawl is charged to the job budget");
     }
 
-    /// Without a browser the lane still maps what the proxy already captured,
-    /// and charges nothing.
+    /// `max_pages: 0` is the one setting that turns *every* crawl off (spec
+    /// D2): the lane maps what the proxy already captured, sends nothing and
+    /// charges nothing.
     #[tokio::test]
-    async fn discover_without_browser_uses_captured_flows_only() {
+    async fn discover_with_the_crawl_off_uses_captured_flows_only() {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
-        let job = TestJob::new(
-            Arc::clone(&store),
-            StubClient::new(Answer::Fixed(200, "", "")),
-        );
+        let client = SiteClient::new(&store);
+        let job = no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _);
 
         let discovery = discover_with(&job).await;
 
         assert_eq!(point_named(&discovery, "q").kind, InsertionKind::Query);
+        assert_eq!(client.calls(), 0, "max_pages: 0 fetches nothing");
+        assert_eq!(store.list().len(), 1, "and records nothing");
         assert_eq!(job.charged(), 0, "no crawl, no charge");
     }
 
@@ -1554,7 +1735,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::EchoHtml("q"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1588,7 +1769,7 @@ mod tests {
             "/go?next=http://elsewhere.test/",
         )));
         let client = StubClient::new(Answer::RedirectTo("next"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "next").clone();
@@ -1616,7 +1797,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Error("upstream refused the connection"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1648,7 +1829,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "nothing to see"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1668,7 +1849,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1705,7 +1886,7 @@ mod tests {
         ));
         store.insert(Flow::Http(flow));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_origins(&job, &["https://target.test"]).await;
         let point = point_named(&discovery, "page").clone();
@@ -1725,7 +1906,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1750,7 +1931,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        let mut job = no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _);
         job.session = Some(Arc::new(SessionMaterial {
             cookies: vec![("sid".to_string(), "abc".to_string())],
             headers: Vec::new(),
@@ -1782,7 +1963,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1816,7 +1997,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1835,7 +2016,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        let mut job = no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _);
         job.budget = 2;
         let job = Arc::new(job);
 
@@ -1857,7 +2038,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1886,7 +2067,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(204, "text/plain", ""));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -1902,26 +2083,41 @@ mod tests {
         assert_eq!(client.calls(), 1, "the baseline is sent once");
     }
 
-    /// `use_browser: never` keeps the lane off the browser even when one is
-    /// available (spec D2's `crawl.use_browser`).
+    /// `use_browser: never` keeps the lane off the **browser** even when one
+    /// is available (spec D2's `crawl.use_browser`) — the client crawl still
+    /// runs, because D5 asks for the crawl captures either way and only
+    /// `max_pages: 0` turns the crawl itself off.
     #[tokio::test]
-    async fn use_browser_never_skips_the_crawl() {
+    async fn use_browser_never_skips_the_browser_not_the_client_crawl() {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
-        store.insert(Flow::Http(captured("http", "/search?q=hello")));
-        let mut job = TestJob::new(
-            Arc::clone(&store),
-            StubClient::new(Answer::Fixed(200, "", "")),
-        );
+        let client = SiteClient::new(&store);
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
         job.browser = Some(Arc::new(StubBrowser {
             store: Arc::clone(&store),
             path: "/crawled",
         }));
         job.profile.crawl.use_browser = UseBrowser::Never;
 
-        let _ = discover_with(&job).await;
+        let discovery = discover_with(&job).await;
 
-        assert_eq!(store.list().len(), 1, "nothing was crawled");
-        assert_eq!(job.charged(), 0);
+        let paths: Vec<String> = store
+            .list()
+            .into_iter()
+            .filter_map(|id| match store.get(id) {
+                Some(Flow::Http(flow)) => Some(flow.request.path),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !paths.iter().any(|p| p.starts_with("/crawled")),
+            "the browser was not driven: {paths:?}"
+        );
+        assert!(
+            client.trail().contains(&"GET /".to_string()),
+            "the client crawl ran instead: {:?}",
+            client.trail()
+        );
+        assert_eq!(point_named(&discovery, "q").kind, InsertionKind::Query);
     }
 
     // ---- wave-2/3 fix task ---------------------------------------------------
@@ -1939,7 +2135,7 @@ mod tests {
             Err(anyhow::anyhow!("operation was canceled: connection closed")),
             Ok(200),
         ]);
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
         let host = lane()
@@ -1960,7 +2156,7 @@ mod tests {
         let client = ScriptedClient::new(vec![Err(anyhow::Error::new(
             crate::client::ProbeRefused::Deadline,
         ))]);
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
         let host = lane()
             .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
             .expect("the lane hosts probes for its own point");
@@ -2076,7 +2272,7 @@ mod tests {
         let mut odd_case = captured("http", "/mine?m=1");
         odd_case.request.authority = "TARGET.TEST:80".to_string();
         store.insert(Flow::Http(odd_case));
-        let job = TestJob::new(
+        let job = no_crawl_job(
             Arc::clone(&store),
             StubClient::new(Answer::Fixed(200, "", "")),
         );
@@ -2104,7 +2300,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -2202,7 +2398,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello&other=1")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let point = point_named(&discovery, "q").clone();
@@ -2239,7 +2435,7 @@ mod tests {
         let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
         store.insert(Flow::Http(captured("http", "/search?q=hello")));
         let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
-        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let job = Arc::new(no_crawl_job(Arc::clone(&store), Arc::clone(&client) as _));
 
         let discovery = discover_with(&job).await;
         let mut point = point_named(&discovery, "q").clone();
@@ -2353,5 +2549,230 @@ mod tests {
                 meta.id
             );
         }
+    }
+    // ---- stage-6 fix task: the client crawl ---------------------------------
+
+    /// Spec D1 "every T1 AC must be provable on the interim lane" and D5
+    /// "client-crawler GETs go through `send_opts` like probes": with no
+    /// browser bound the lane crawls the origin through the job's client, so a
+    /// job started against a target nobody has browsed still finds its
+    /// parameters.
+    #[tokio::test]
+    async fn the_client_crawl_finds_points_when_no_browser_is_bound() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+
+        let discovery = discover_with(&job).await;
+
+        assert_eq!(
+            client.trail(),
+            vec![
+                "GET /",
+                "GET /search?q=x",
+                "GET /redirect?to=http://away.test/",
+                "GET /find?term=a",
+            ],
+            "the root, both anchors and the GET form, breadth-first"
+        );
+
+        let q = point_named(&discovery, "q");
+        assert_eq!(q.kind, InsertionKind::Query);
+        assert_eq!(q.url.as_deref(), Some("http://target.test/search?q=x"));
+        let to = point_named(&discovery, "to");
+        assert!(to.traits.contains(&PointTrait::Url), "{:?}", to.traits);
+        assert_eq!(
+            point_named(&discovery, "term").url.as_deref(),
+            Some("http://target.test/find?term=a"),
+            "the GET form became a query the v1 enumerator can see"
+        );
+    }
+
+    /// Spec D5 "Record policy": a crawl capture is recorded, marked
+    /// `scan:<job>` and `crawl`, and is read back as attack surface even
+    /// though the client stamped it a replay.
+    #[tokio::test]
+    async fn client_crawl_captures_are_recorded_and_marked() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+
+        let discovery = discover_with(&job).await;
+
+        for opts in client.options() {
+            assert_eq!(
+                opts.record,
+                RecordPolicy::Always,
+                "a crawl page is recorded"
+            );
+            assert_eq!(
+                opts.marks,
+                vec!["scan:scan-1a2b3c4d".to_string(), "crawl".to_string()]
+            );
+        }
+        let flows: Vec<Flow> = store
+            .list()
+            .into_iter()
+            .filter_map(|id| store.get(id))
+            .collect();
+        assert_eq!(flows.len(), 4, "every page reached the store");
+        for flow in &flows {
+            assert_eq!(
+                flow.metadata().marks,
+                vec!["scan:scan-1a2b3c4d".to_string(), "crawl".to_string()]
+            );
+        }
+        assert!(
+            !discovery.points.is_empty(),
+            "and the crawl captures are attack surface, replay stamp or not"
+        );
+    }
+
+    /// The crawl never leaves the origin: the off-origin anchor on the landing
+    /// page is not fetched, and nothing but the target's authority is dialled.
+    #[tokio::test]
+    async fn the_client_crawl_never_leaves_the_origin() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+
+        let _ = discover_with(&job).await;
+
+        let authorities: Vec<String> = client
+            .requests()
+            .iter()
+            .map(|req| req.authority.clone())
+            .collect();
+        assert!(
+            authorities.iter().all(|a| a == "target.test"),
+            "{authorities:?}"
+        );
+    }
+
+    /// `crawl.max_pages` bounds the client crawl the way it bounds the browser
+    /// crawl.
+    #[tokio::test]
+    async fn the_client_crawl_is_bounded_by_max_pages() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.profile.crawl.max_pages = 2;
+
+        let _ = discover_with(&job).await;
+
+        assert_eq!(client.trail(), vec!["GET /", "GET /search?q=x"]);
+    }
+
+    /// `crawl.max_depth: 0` keeps the crawl on the seed: the links the landing
+    /// page carries are one hop too deep.
+    #[tokio::test]
+    async fn the_client_crawl_is_bounded_by_max_depth() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.profile.crawl.max_depth = 0;
+
+        let _ = discover_with(&job).await;
+
+        assert_eq!(client.trail(), vec!["GET /"]);
+    }
+
+    /// Spec D5 "one budget per job": the crawl cannot ask for more pages than
+    /// the budget has left — a navigation is a probe.
+    #[tokio::test]
+    async fn the_client_crawl_is_bounded_by_the_jobs_budget() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.budget = 1;
+
+        let _ = discover_with(&job).await;
+
+        assert_eq!(client.trail(), vec!["GET /"]);
+    }
+
+    /// And a send the budget refuses mid-crawl ends it on the spot, leaving
+    /// discovery to run over what was captured before.
+    #[tokio::test]
+    async fn a_refused_send_ends_the_client_crawl() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::refusing(&store);
+        let job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+
+        let discovery = discover_with(&job).await;
+
+        assert_eq!(
+            client.trail(),
+            vec!["GET /", "GET /search?q=x"],
+            "the first refusal ends the crawl"
+        );
+        assert_eq!(store.list().len(), 1, "only the root was captured");
+        assert!(discovery.points.is_empty() || !discovery.nodes.is_empty());
+    }
+
+    /// Spec D7: the crawl is the scan's own traffic, so it carries the job's
+    /// session material exactly as a probe does.
+    #[tokio::test]
+    async fn the_client_crawl_carries_the_session() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.session = Some(Arc::new(SessionMaterial {
+            cookies: vec![("sid".to_string(), "abc".to_string())],
+            headers: Vec::new(),
+        }));
+
+        let _ = discover_with(&job).await;
+
+        let cookies: Vec<String> = client
+            .requests()
+            .iter()
+            .filter_map(|req| req.headers.get("cookie").map(str::to_string))
+            .collect();
+        assert_eq!(cookies.len(), client.calls(), "every page is authenticated");
+        assert!(cookies.iter().all(|c| c.contains("sid=abc")), "{cookies:?}");
+    }
+
+    /// A browser crawl and a client crawl are alternatives, not both: with a
+    /// browser bound under `use_browser: auto` the client sends nothing.
+    #[tokio::test]
+    async fn the_browser_crawl_leaves_no_work_for_the_client_crawl() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = SiteClient::new(&store);
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.browser = Some(Arc::new(StubBrowser {
+            store: Arc::clone(&store),
+            path: "/crawled?b=2",
+        }));
+
+        let _ = discover_with(&job).await;
+
+        assert_eq!(client.calls(), 0, "{:?}", client.trail());
+        assert_eq!(store.list().len(), 1, "the browser's capture, and only it");
+    }
+    /// Spec D3's `passive-only`: the built-in profile that asks for no crawl
+    /// (`max_pages: 0`, `use_browser: never`) sends nothing at all, browser or
+    /// no browser, and still maps what the proxy captured.
+    #[tokio::test]
+    async fn the_passive_only_profile_crawls_nothing() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured("http", "/search?q=hello")));
+        let client = SiteClient::new(&store);
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.browser = Some(Arc::new(StubBrowser {
+            store: Arc::clone(&store),
+            path: "/crawled",
+        }));
+        job.profile = aitm_scan_model::builtin_profiles()
+            .into_iter()
+            .find(|profile| profile.name == "passive-only")
+            .expect("the built-in passive-only profile");
+
+        let discovery = discover_with(&job).await;
+
+        assert_eq!(client.calls(), 0, "{:?}", client.trail());
+        assert_eq!(store.list().len(), 1, "the browser was not driven either");
+        assert_eq!(job.charged(), 0);
+        assert_eq!(point_named(&discovery, "q").kind, InsertionKind::Query);
     }
 }

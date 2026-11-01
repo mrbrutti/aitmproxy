@@ -944,13 +944,104 @@ mod tests {
         }
     }
 
-    /// A `ProxyClient` the command must never reach: discovery is read-only and
-    /// crawls through the browser, never the proxy client.
+    /// A `ProxyClient` the command must never reach: `scan.passive` reads what
+    /// the proxy already captured and sends nothing at all.
     struct NoSendClient;
 
     impl ProxyClient for NoSendClient {
         fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
-            panic!("scan.discover must not send through the proxy client: {req:?}");
+            panic!("scan.passive must not send through the proxy client: {req:?}");
+        }
+    }
+
+    /// The client a `scan.discover` harness sends through, holding the one
+    /// invariant that verb has left: a `map` job is "crawl + passive +
+    /// insertion points, **no probes**" (spec D3), and since the interim lane
+    /// crawls through the proxy client when no browser is bound (spec D5,
+    /// "client-crawler GETs go through `send_opts` like probes, recorded under
+    /// the same policy with the crawl mark"), every send it sees must be a
+    /// crawl capture of the target's own origin — recorded, `crawl`-marked,
+    /// and a `GET` or a form `POST`. A probe, or a request off the origin,
+    /// panics the job instead of being answered.
+    ///
+    /// It answers a plain `text/plain` 200 (a page with no links, so the crawl
+    /// ends on the seed) and does **not** insert into the store: the harness
+    /// seeds the store by hand with the captures a test wants mapped, the way
+    /// the proxy would have.
+    #[derive(Default)]
+    struct CrawlOnlyClient {
+        seen: Mutex<Vec<HttpRequest>>,
+    }
+
+    impl CrawlOnlyClient {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
+        fn requests(&self) -> Vec<HttpRequest> {
+            self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    impl ProxyClient for CrawlOnlyClient {
+        fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            self.send_opts(req, aitm_core::SendOptions::default())
+        }
+
+        fn send_opts(
+            &self,
+            req: HttpRequest,
+            opts: aitm_core::SendOptions,
+        ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            assert_eq!(
+                opts.record,
+                aitm_core::RecordPolicy::Always,
+                "a map job sends nothing but crawl captures, and a crawl capture is recorded: \
+                 {req:?}"
+            );
+            assert!(
+                opts.marks.iter().any(|mark| mark == "crawl"),
+                "a map job's only sends are its crawl, which carries the crawl mark: {:?}",
+                opts.marks
+            );
+            assert_eq!(
+                req.authority, "target.test",
+                "the crawl never leaves the origin: {req:?}"
+            );
+            assert!(
+                matches!(req.method.as_str(), "GET" | "POST"),
+                "the crawl navigates and submits forms, nothing else: {req:?}"
+            );
+            self.seen
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(req.clone());
+            Box::pin(async move {
+                Ok(HttpFlow {
+                    id: FlowId::new(),
+                    request: req,
+                    response: Some(HttpResponse {
+                        status: 200,
+                        version: HttpVersion::Http11,
+                        headers: {
+                            let mut headers = HeaderMap::new();
+                            headers.set("content-type", "text/plain");
+                            headers
+                        },
+                        trailers: HeaderMap::new(),
+                        body: Body::Bytes(b"ok".to_vec()),
+                        timestamp: SystemTime::now(),
+                    }),
+                    client_conn: conn(),
+                    server_conn: None,
+                    metadata: FlowMeta {
+                        is_replay: true,
+                        marks: opts.marks,
+                        ..FlowMeta::default()
+                    },
+                    intercept: InterceptState::Observed,
+                })
+            })
         }
     }
 
@@ -1474,7 +1565,11 @@ mod tests {
     fn scan_discover_without_egress_handle_still_crawls() {
         let store = Arc::new(MemFlowStore::new());
         store.insert(captured("/one", HeaderMap::new()));
-        let h = Harness::builder().store(Arc::clone(&store)).build();
+        let client = CrawlOnlyClient::new();
+        let h = Harness::builder()
+            .store(Arc::clone(&store))
+            .client(Arc::clone(&client) as Arc<dyn ProxyClient>)
+            .build();
         assert!(
             h.engine
                 .late
@@ -1490,6 +1585,18 @@ mod tests {
             .expect("no posture wired is not an error");
 
         assert_eq!(endpoints_of(&result), vec![endpoint("/one")]);
+        // Spec D3/D5: with no browser the crawl is the client's, and a map job
+        // makes no other request — the seed, and nothing else.
+        let trail: Vec<String> = client
+            .requests()
+            .iter()
+            .map(|req| format!("{} {}", req.method, req.path))
+            .collect();
+        assert_eq!(
+            trail,
+            vec!["GET /".to_string()],
+            "the seed was crawled once"
+        );
     }
 
     /// The target gate and the crawl use one parser, so a URL whose real host is
@@ -2766,8 +2873,10 @@ mod tests {
                 }
                 guard
             });
+            // A harness job may crawl through the client (spec D5), and
+            // nothing else: `CrawlOnlyClient` panics on any other send.
             let client: Arc<dyn ProxyClient> =
-                self.client.unwrap_or_else(|| Arc::new(NoSendClient));
+                self.client.unwrap_or_else(|| CrawlOnlyClient::new());
             let engine = Arc::new(Engine {
                 cfg: self.cfg.clone(),
                 late: ScanLate::new(),

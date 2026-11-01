@@ -21,6 +21,7 @@ pub mod config;
 pub mod crawl;
 pub mod discover;
 pub mod inject;
+pub mod interim_crawl;
 pub mod interim_lane;
 pub mod issues;
 pub mod jobs;
