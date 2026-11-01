@@ -88,14 +88,16 @@ final class RuleReconciler {
 
     /// `stopProxy`: forget everything. A late `reconcile` (the hook the detach fires)
     /// applies nothing; an in-flight completion becomes stale and is ignored; a later
-    /// `begin` starts over.
+    /// `begin` starts over. A `startProxy` completion still parked is answered once,
+    /// now, with `ECANCELED` (spec C as amended: never dropped), so the framework never
+    /// waits on a tunnel that is gone.
     func stop() {
         stopped = true
         installed = nil
         pending = .tcpOnly
         inFlight = false
         generation &+= 1
-        startupCompletions.removeAll()
+        answerStartup(with: NSError(domain: NSPOSIXErrorDomain, code: Int(ECANCELED)))
     }
 
     private func applyIfNeeded(reasserting: Bool) {
@@ -181,6 +183,13 @@ extension HandoffSelfCheck {
         /// True iff `applied` has exactly `i + 1` entries and the last is `(set, reasserting)`.
         func lastApply(_ i: Int, _ set: ProviderRuleSet, _ reasserting: Bool) -> Bool {
             applied.count == i + 1 && applied[i] == (set, reasserting)
+        }
+
+        /// True iff `results` is exactly one `NSPOSIXErrorDomain` / `ECANCELED` error: how
+        /// `stop()` answers a `startProxy` completion still parked (spec C as amended).
+        static func answeredOnceWithCancellation(_ results: [Error?]) -> Bool {
+            guard results.count == 1, let error = results[0] as NSError? else { return false }
+            return error.domain == NSPOSIXErrorDomain && error.code == Int(ECANCELED)
         }
 
         /// Deliver the `i`th parked completion with `error`. A completion that was never
@@ -302,9 +311,13 @@ extension HandoffSelfCheck {
         r.check("ruleReconciler: 11 begin after stop applies again", fake.applied.count == 6, "\(fake.applied.count)")
         r.check("ruleReconciler: 11 applied[5] == (.tcpOnly, false)", fake.lastApply(5, .tcpOnly, false), fake.trail())
 
-        // 12. An in-flight completion made stale by stop() is ignored even after a new
-        //    begin: it must neither install, nor report, nor answer the new startup.
+        // 12. stop() answers the startup completion still parked from step 11 exactly
+        //    once, with ECANCELED (never dropped). The in-flight completion it made stale
+        //    is ignored even after a new begin: it must neither install, nor report, nor
+        //    answer the new startup, nor answer the cancelled one a second time.
         reconciler.stop()
+        r.check("ruleReconciler: 12 stop answers the parked startup once with NSPOSIXErrorDomain/ECANCELED",
+              FakeApply.answeredOnceWithCancellation(secondStart), "\(secondStart.map { String(describing: $0) })")
         var thirdStart: [Error?] = []
         reconciler.begin { thirdStart.append($0) }
         r.check("ruleReconciler: 12 begin after a stop mid-flight applies anew", fake.applied.count == 7, "\(fake.applied.count)")
@@ -316,8 +329,8 @@ extension HandoffSelfCheck {
               "\(fake.events.count) vs \(eventsBeforeStale)")
         r.check("ruleReconciler: 12 stale completion does not answer the new startup", thirdStart.isEmpty,
               "\(thirdStart.count)")
-        r.check("ruleReconciler: 12 the abandoned startup completion is dropped, not answered", secondStart.isEmpty,
-              "\(secondStart.count)")
+        r.check("ruleReconciler: 12 the stale completion does not answer the cancelled startup again",
+              secondStart.count == 1, "\(secondStart.count)")
         fake.complete(6, nil, "ruleReconciler: 12 live")
         r.check("ruleReconciler: 12 the live completion installs .tcpOnly", reconciler.installed == .tcpOnly)
         r.check("ruleReconciler: 12 the live completion answers the new startup with nil",
@@ -355,8 +368,10 @@ extension HandoffSelfCheck {
     ///     installed applies nothing, answers its completion with nil at once and keeps
     ///     the installed set (fix F1; spec C as amended);
     ///  D. after `stop()`: a hook carrying a UDP set is dropped (plan step 10 covers nil
-    ///     only), a late completion of a pre-stop apply -- success or error -- neither
-    ///     installs nor reports nor answers a startup, and nothing further is applied;
+    ///     only), a startup completion still parked is answered once with ECANCELED by
+    ///     `stop()` itself (fix F2), a late completion of a pre-stop apply -- success or
+    ///     error -- neither installs nor reports nor answers anything, and nothing
+    ///     further is applied;
     ///  E. a `begin` after all that starts over cleanly;
     ///  F. a second `begin` while a RECONCILE apply is in flight with nothing installed
     ///     (startup failed, no `stop()`) is never answered by that reconcile's result: a
@@ -444,17 +459,21 @@ extension HandoffSelfCheck {
         r.check("\(g): D1 a hook carrying a UDP set after stop applies nothing", fake.applied.count == 5, fake.trail())
         r.check("\(g): D1 still nothing installed", reconciler.installed == nil)
 
-        // D2. stop() with a FAILING apply in flight: no .applyFailed, no startup answer.
+        // D2. stop() with the STARTUP apply in flight answers the parked startup once with
+        //     ECANCELED; the apply then FAILS late: no .applyFailed, no second answer.
         var startupD: [Error?] = []
         reconciler.begin { startupD.append($0) }
         r.check("\(g): D2 begin after stop applies (.tcpOnly, false)", fake.lastApply(5, tcpOnly, false), fake.trail())
+        r.check("\(g): D2 the startup is parked until its apply lands", startupD.isEmpty, "\(startupD.count)")
         reconciler.stop()
+        r.check("\(g): D2 stop answers the parked startup once with NSPOSIXErrorDomain/ECANCELED",
+              FakeApply.answeredOnceWithCancellation(startupD), "\(startupD.map { String(describing: $0) })")
         let eventsBeforeD2 = fake.events.count
         fake.complete(5, NSError(domain: "test", code: 3), "\(g): D2")
         r.check("\(g): D2 late error completion reports nothing", fake.events.count == eventsBeforeD2,
               "\(fake.events.count) vs \(eventsBeforeD2)")
-        r.check("\(g): D2 late error completion does not answer the abandoned startup",
-              startupD.isEmpty, "\(startupD.count)")
+        r.check("\(g): D2 late error completion does not answer the cancelled startup again",
+              startupD.count == 1, "\(startupD.map { String(describing: $0) })")
         r.check("\(g): D2 nothing installed", reconciler.installed == nil)
         r.check("\(g): D2 nothing further applied", fake.applied.count == 6, fake.trail())
 
