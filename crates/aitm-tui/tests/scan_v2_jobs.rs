@@ -11,7 +11,7 @@
 
 mod common;
 
-use aitm_scan_model::{BySeverity, JobStatus, JobSummary};
+use aitm_scan_model::{BySeverity, JobStatus, JobSummary, LaneKind};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
@@ -681,4 +681,39 @@ fn targets_are_capped_in_count_at_fold_with_the_rest_counted() {
     );
     assert!(row.targets.starts_with("http://h0.test http://h1.test"));
     let _ = text_of(&app, 200, 50);
+}
+
+/// Fix round H, H33 (D6 hostile-core bounds): `lanes.requested` and
+/// `lanes.run` are bounded in count at fold, not joined per frame. A status
+/// with 100_000 `http` run lanes (and the requested list in reverse with
+/// duplicates) folds to `run == [Http]` and `requested == [Http, Ws]`, and
+/// the Detail pane's lanes line reads `run http` at 200x50 with no second
+/// `http` token.
+#[test]
+fn lanes_are_deduped_and_sorted_at_fold() {
+    let mut app = app();
+    let mut body = fixture("scan.status.json");
+    body["lanes"]["run"] = json!(vec!["http"; 100_000]);
+    body["lanes"]["requested"] = json!(["ws", "http", "ws", "http"]);
+    let _ = app.on_bus(status_reply(body));
+    let full = app.scan.jobs.full.get(JOB).expect("folded");
+    assert_eq!(full.lanes.run, vec![LaneKind::Http]);
+    assert_eq!(full.lanes.requested, vec![LaneKind::Http, LaneKind::Ws]);
+    assert!(
+        full.lanes.run.capacity() <= 4,
+        "capacity {} not given back",
+        full.lanes.run.capacity()
+    );
+    let text = screen(&app);
+    let line =
+        line_with(&text, "lanes requested").unwrap_or_else(|| panic!("no lanes line: {text}"));
+    assert!(
+        line.contains("requested http ws · run http · skipped"),
+        "{line:?}"
+    );
+    assert_eq!(
+        line.matches("http").count(),
+        2,
+        "one requested http, one run http: {line:?}"
+    );
 }

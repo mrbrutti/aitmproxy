@@ -328,8 +328,12 @@ impl Deref for ReadStatus {
 /// `client_label`, each `clamped[].field`, each `lanes.skipped[].reason`,
 /// each `checks.running[]` and the canary path to [`DETAIL_VALUE_MAX`]
 /// cells; the three lists and `targets` cut to [`DETAIL_LIST_MAX`] with
-/// the rest counted in the returned [`StatusDropped`] (G102).
+/// the rest counted in the returned [`StatusDropped`] (G102);
+/// `lanes.requested` and `lanes.run` sorted and deduped (fix round H,
+/// H33: four kinds at most, so the Detail pane joins a bounded list).
 fn bound_status(status: &mut JobStatus) -> StatusDropped {
+    dedup_lanes(&mut status.lanes.requested);
+    dedup_lanes(&mut status.lanes.run);
     let cut = |s: &mut String| {
         if s.chars().any(char::is_control) {
             *s = clean(s);
@@ -366,6 +370,14 @@ fn bound_status(status: &mut JobStatus) -> StatusDropped {
         cut(field);
     }
     dropped
+}
+
+/// Sort and dedup a lane list and give its capacity back (fix round H,
+/// H33): at most one entry per [`LaneKind`], in declaration order.
+fn dedup_lanes(lanes: &mut Vec<LaneKind>) {
+    lanes.sort_unstable();
+    lanes.dedup();
+    lanes.shrink_to_fit();
 }
 
 /// Cut `v` to [`DETAIL_LIST_MAX`], give the capacity back and return how
