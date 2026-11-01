@@ -75,6 +75,16 @@ pub struct CheckMeta {
 }
 
 /// A check's result for one insertion point (spec D2).
+///
+/// **One verdict, or one per exposed path.** A check returns one root verdict
+/// and may attach sibling verdicts in [`Verdict::more`] (coordinator item (g),
+/// 2026-11-01). Each verdict's [`Verdict::location`], when present, overrides
+/// the issue location's `path` (and `name`), so an origin-scoped check such as
+/// an exposed-path probe produces one issue per entry — the dedupe key hashes
+/// class + location, which is what keeps `/.git/` and `/.env` apart. The
+/// engine flattens `more` **one level**: a `more` inside a `more` entry is
+/// ignored. Both fields are additive; a verdict written before them reads as
+/// "no override, no siblings".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Verdict {
@@ -89,6 +99,29 @@ pub struct Verdict {
     /// In-process instruction to the PoC builder; never serialised (call 23).
     #[serde(skip)]
     pub poc_hint: Option<PocHint>,
+    /// Where this verdict's issue lives when that differs from the point: the
+    /// engine takes `path` (and `name`) from here over the point's own.
+    #[serde(default)]
+    pub location: Option<VerdictLocation>,
+    /// Sibling verdicts from the same run, each becoming its own issue;
+    /// flattened one level by the engine.
+    #[serde(default)]
+    pub more: Vec<Verdict>,
+}
+
+/// The part of an issue location a verdict may override (coordinator item (g)).
+///
+/// An absent field keeps the point's value; a check that found `/.git/` sets
+/// `path` and leaves `name` to the point.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub struct VerdictLocation {
+    /// The request path the issue is at, overriding the point's.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The parameter or element name, overriding the point's.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 /// What a check tells the engine to assert when it reproduces the finding.
@@ -260,6 +293,8 @@ mod tests {
                 assertions: vec![aitm_poc::Assertion::Status(200)],
                 control: None,
             }),
+            location: None,
+            more: Vec::new(),
         };
 
         let json = serde_json::to_string(&verdict).expect("serializes");
@@ -504,5 +539,72 @@ mod tests {
         }"#;
         let err = serde_json::from_str::<CheckMeta>(json).expect_err("an unknown scope is refused");
         assert!(err.to_string().contains("everywhere"), "{err}");
+    }
+
+    /// Coordinator item (g) (2026-11-01): the multi-verdict contract is
+    /// additive. A verdict written before it carries neither `location` nor
+    /// `more` and reads as "no override, no siblings"; a `VerdictLocation`
+    /// round-trips its `path` so the engine can place one issue per exposed path.
+    #[test]
+    fn verdict_more_and_location_default_empty() {
+        let json = r#"{
+            "outcome": "vulnerable",
+            "confidence": "firm",
+            "evidence": {},
+            "detail": "exposed"
+        }"#;
+        let verdict: Verdict = serde_json::from_str(json).expect("deserializes");
+        assert_eq!(verdict.location, None);
+        assert!(verdict.more.is_empty());
+
+        let located = Verdict {
+            outcome: Outcome::Vulnerable,
+            confidence: Confidence::Firm,
+            evidence: Evidence::default(),
+            detail: "git metadata exposed".into(),
+            poc_hint: None,
+            location: Some(VerdictLocation {
+                path: Some("/.git/".into()),
+                name: None,
+            }),
+            more: vec![Verdict {
+                outcome: Outcome::Vulnerable,
+                confidence: Confidence::Firm,
+                evidence: Evidence::default(),
+                detail: "env file exposed".into(),
+                poc_hint: None,
+                location: Some(VerdictLocation {
+                    path: Some("/.env".into()),
+                    name: Some("env".into()),
+                }),
+                more: Vec::new(),
+            }],
+        };
+        let json = serde_json::to_string(&located).expect("serializes");
+        assert!(
+            json.contains(r#""location":{"path":"/.git/","name":null}"#),
+            "{json}"
+        );
+        let back: Verdict = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, located);
+        assert_eq!(
+            back.location.as_ref().and_then(|l| l.path.as_deref()),
+            Some("/.git/")
+        );
+        assert_eq!(back.more.len(), 1);
+        assert_eq!(
+            back.more[0]
+                .location
+                .as_ref()
+                .and_then(|l| l.path.as_deref()),
+            Some("/.env")
+        );
+        assert_eq!(
+            VerdictLocation::default(),
+            VerdictLocation {
+                path: None,
+                name: None
+            }
+        );
     }
 }

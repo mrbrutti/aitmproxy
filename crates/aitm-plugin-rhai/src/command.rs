@@ -249,6 +249,13 @@ impl<'a> ScriptRegHandle<'a> {
         if let Some((registry, _)) = &self.checks {
             let duplicates = registry.replace_source(&script, checks);
             if let Some(duplicate) = duplicates.first() {
+                // All or nothing holds for a duplicate id too: `replace_source`
+                // has already inserted this script's non-colliding checks, so
+                // take them back out before refusing the script (wave-2 quality
+                // panel). The script's previous entries went with the replace;
+                // a refused reload therefore leaves it with no checks at all,
+                // which is what a refused first load leaves too.
+                registry.remove_source(&script);
                 return Err(ScriptError::CheckMeta {
                     script: script.clone(),
                     check: Some(duplicate.id.clone()),

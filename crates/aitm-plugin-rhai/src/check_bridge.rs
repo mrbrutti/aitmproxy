@@ -8,12 +8,15 @@
 //! key** rather than a default — the catalogue cannot schedule what it cannot
 //! classify (spec D4).
 //!
-//! **What a closure may return.** A verdict map with the `Verdict` wire keys, or
-//! a plain string, which reads as `inconclusive` with that string as the detail.
-//! The string form is what keeps an old-style script honest: a check that only
-//! prints a sentence still produces a legal verdict instead of breaking the run.
-//! A closure that throws is an `error` verdict carrying the script error — a
-//! check never fails the job (spec D2).
+//! **What a closure may return.** A verdict map with the `Verdict` wire keys, a
+//! plain string, which reads as `inconclusive` with that string as the detail,
+//! or an **array of verdict maps**: the first is the root verdict and the rest
+//! are its `more` siblings, each map optionally carrying `location: #{ path,
+//! name }` so an origin-scoped check yields one issue per exposed path
+//! (coordinator item (g)). The string form is what keeps an old-style script
+//! honest: a check that only prints a sentence still produces a legal verdict
+//! instead of breaking the run. A closure that throws is an `error` verdict
+//! carrying the script error — a check never fails the job (spec D2).
 //!
 //! **Where its probes go.** `run` opens a [`RunKind::Check`] run under the
 //! profile's `check_timeout`, parks the host in the [`crate::host_probe`] check
@@ -27,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aitm_core::{CallerTrust, Value};
-use aitm_scan_model::check::{CheckMeta, ControlHint, Evidence, PocHint, Verdict};
+use aitm_scan_model::check::{CheckMeta, ControlHint, Evidence, PocHint, Verdict, VerdictLocation};
 use aitm_scan_model::point::InsertionPoint;
 use aitm_scan_model::traits::{Check, ProbeHost};
 use aitm_scan_model::vocab::{CheckOrigin, Confidence, Outcome};
@@ -44,7 +47,7 @@ use crate::marshal::dynamic_to_value;
 /// The keys a check's meta map may carry: exactly [`CheckMeta`]'s wire names
 /// minus `origin`, which the bridge supplies from where the script came from.
 /// A key outside this set is a typo the author must see, not a silent no-op.
-const META_KEYS: [&str; 16] = [
+const META_KEYS: [&str; 17] = [
     "id",
     "name",
     "class",
@@ -61,10 +64,22 @@ const META_KEYS: [&str; 16] = [
     "scope",
     "cwe",
     "description",
+    "remediation",
 ];
 
-/// The keys a verdict map may carry.
-const VERDICT_KEYS: [&str; 5] = ["outcome", "confidence", "evidence", "detail", "poc_hint"];
+/// The keys a verdict map may carry. `more` is not one: siblings are expressed
+/// by returning an array, never nested inside a map.
+const VERDICT_KEYS: [&str; 6] = [
+    "outcome",
+    "confidence",
+    "evidence",
+    "detail",
+    "poc_hint",
+    "location",
+];
+
+/// The keys a verdict's `location` map may carry: the [`VerdictLocation`] fields.
+const LOCATION_KEYS: [&str; 2] = ["path", "name"];
 
 /// A check a script declared with `reg.add_check(meta, |point| …)`.
 ///
@@ -357,7 +372,9 @@ fn value_to_json(value: &Value) -> serde_json::Value {
 ///
 /// A map is read key by key; a plain string is `inconclusive` with that string
 /// as the detail, so a script that only says what it saw still produces a legal
-/// verdict; anything else is an `error` naming what came back.
+/// verdict; an array of maps is the root verdict followed by its `more`
+/// siblings ([`verdict_from_array`]); anything else is an `error` naming what
+/// came back.
 pub fn verdict_from_dynamic(value: &Dynamic) -> Verdict {
     if let Some(text) = value.read_lock::<rhai::ImmutableString>() {
         return Verdict {
@@ -366,14 +383,53 @@ pub fn verdict_from_dynamic(value: &Dynamic) -> Verdict {
             evidence: Evidence::default(),
             detail: text.to_string(),
             poc_hint: None,
+            location: None,
+            more: Vec::new(),
         };
+    }
+    if let Some(items) = value.read_lock::<rhai::Array>() {
+        return verdict_from_array(&items);
     }
     let Some(map) = value.read_lock::<Map>() else {
         return error_verdict(format!(
-            "a check closure returns a verdict map or a string, got a {}",
+            "a check closure returns a verdict map, a string or an array of verdict maps, \
+             got a {}",
             value.type_name()
         ));
     };
+    verdict_from_map(&map)
+}
+
+/// An array return: element `[0]` is the root verdict, the rest go into its
+/// `more`, each read by the map rule. A non-map element refuses the whole
+/// array — the root is an `error` naming the index — because a half-read list
+/// of paths would report some exposures and silently drop others. The bridge
+/// nests one level only: a map cannot carry `more` (it is not a verdict key),
+/// so nothing deeper can be expressed.
+fn verdict_from_array(items: &[Dynamic]) -> Verdict {
+    let mut verdicts = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(map) = item.read_lock::<Map>() else {
+            return error_verdict(format!(
+                "a verdict array holds verdict maps only; element [{index}] is a {}",
+                item.type_name()
+            ));
+        };
+        verdicts.push(verdict_from_map(&map));
+    }
+    let mut rest = verdicts.into_iter();
+    let Some(mut root) = rest.next() else {
+        return error_verdict(
+            "a check closure returned an empty array; return a verdict map, a string, \
+             or an array with at least one verdict map",
+        );
+    };
+    root.more = rest.collect();
+    root
+}
+
+/// The map rule: one verdict map, key by key, unknown keys refused by name.
+fn verdict_from_map(map: &Map) -> Verdict {
     if let Some(unknown) = map.keys().find(|k| !VERDICT_KEYS.contains(&k.as_str())) {
         return error_verdict(format!(
             "a verdict has no field '{unknown}'; the fields are {}",
@@ -437,12 +493,34 @@ pub fn verdict_from_dynamic(value: &Dynamic) -> Verdict {
         }
     };
 
+    let location = match map.get("location").filter(|v| !v.is_unit()) {
+        None => None,
+        Some(value) => {
+            let Some(fields) = value.read_lock::<Map>() else {
+                return error_verdict("a verdict's `location` must be a map of path and name");
+            };
+            if let Some(unknown) = fields.keys().find(|k| !LOCATION_KEYS.contains(&k.as_str())) {
+                return error_verdict(format!(
+                    "a verdict's `location` has no field '{unknown}'; the fields are {}",
+                    LOCATION_KEYS.join(", ")
+                ));
+            }
+            Some(VerdictLocation {
+                path: fields.get("path").and_then(token),
+                name: fields.get("name").and_then(token),
+            })
+        }
+    };
+
     Verdict {
         outcome,
         confidence,
         evidence,
         detail: map.get("detail").and_then(token).unwrap_or_default(),
         poc_hint,
+        location,
+        // Siblings come only from the array form; a map is one verdict.
+        more: Vec::new(),
     }
 }
 
@@ -508,6 +586,8 @@ fn error_verdict(detail: impl Into<String>) -> Verdict {
         evidence: Evidence::default(),
         detail: detail.into(),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 
@@ -552,4 +632,42 @@ pub(crate) fn checks_from_collected(
 /// check that failed on some *other* key.
 fn declared_id(map: &Map) -> Option<String> {
     map.get("id").and_then(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// T3 live-run bug (coordinator, 2026-11-01): `META_KEYS` is the set a
+    /// script may declare, and it must be every `CheckMeta` wire key but
+    /// `origin` — the bridge once omitted `remediation` and refused every script
+    /// that documented a fix. Pinned against the struct's own serialisation so
+    /// a field added to `CheckMeta` fails here rather than in a script.
+    #[test]
+    fn meta_keys_cover_every_check_meta_field_but_origin() {
+        let json = serde_json::to_value(aitm_scan_model::testing::null_meta("pin"))
+            .expect("CheckMeta serialises");
+        let mut wire: Vec<String> = json
+            .as_object()
+            .expect("an object")
+            .keys()
+            .filter(|k| k.as_str() != "origin")
+            .cloned()
+            .collect();
+        wire.sort();
+        let mut keys: Vec<String> = META_KEYS.iter().map(|k| k.to_string()).collect();
+        keys.sort();
+        assert_eq!(keys, wire);
+        assert!(META_KEYS.contains(&"remediation"));
+
+        // `field_parses` is a typed arm per key, so it cannot consume the list
+        // directly; pin instead that every key the bridge accepts has an arm
+        // that parses the field's own serialised value.
+        for key in META_KEYS {
+            assert!(
+                field_parses(key, &json[key]),
+                "field_parses has no working arm for `{key}`"
+            );
+        }
+    }
 }

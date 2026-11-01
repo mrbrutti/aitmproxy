@@ -223,6 +223,8 @@ impl Check for NullCheck {
                 evidence: Evidence::default(),
                 detail: "nothing to report".to_string(),
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             }
         })
     }
@@ -280,6 +282,11 @@ pub fn query_point(url: &str, name: &str) -> InsertionPoint {
 /// returns, and each spends one of the sixteen probes the host starts with; the
 /// budget saturates at zero and the host keeps answering, because it is a
 /// recorder, not an enforcer. A baseline costs nothing and is recorded nowhere.
+///
+/// A `probe` may be answered from a payload-keyed table instead of the canned
+/// reply ([`RecordingHost::with_reply_for`]), so a multi-path check can be
+/// driven to distinct answers per path; `baseline` and `probe_raw` always give
+/// the canned reply.
 pub struct RecordingHost {
     /// An owning handle to this host, when it was built by
     /// [`RecordingHost::shared_new`]; otherwise dangling, so `shared()` is `None`.
@@ -295,6 +302,9 @@ pub struct RecordingHost {
     /// The address the canned baseline is pretended to have come from, when a
     /// test pinned one with [`RecordingHost::with_peer`]. `None` otherwise.
     peer: Option<SocketAddr>,
+    /// `(needle, status, body)` in registration order; the first needle that is
+    /// a substring of a probe's payload value answers that probe.
+    replies: Vec<(String, u16, Vec<u8>)>,
 }
 
 impl RecordingHost {
@@ -309,7 +319,19 @@ impl RecordingHost {
             budget: AtomicU32::new(RECORDING_BUDGET),
             profile: ScanProfile::default(),
             peer: None,
+            replies: Vec::new(),
         }
+    }
+
+    /// The same host, answering `status`/`body` to any `probe` whose payload
+    /// value contains `needle`. Entries are consulted in the order they were
+    /// added and the first match wins; a payload no needle matches gets the
+    /// canned reply. `baseline` and `probe_raw` never consult the table.
+    #[must_use]
+    pub fn with_reply_for(mut self, needle: &str, status: u16, body: &str) -> Self {
+        self.replies
+            .push((needle.to_string(), status, body.as_bytes().to_vec()));
+        self
     }
 
     /// The same host, pinned to the peer address its baseline came from, so a
@@ -344,10 +366,26 @@ impl RecordingHost {
 
     /// The canned response.
     fn response(&self) -> ProbeResponse {
+        self.response_with(self.status, self.body.clone())
+    }
+
+    /// The table's reply for `payload` when a needle matches, else the canned one.
+    fn response_for(&self, payload: &str) -> ProbeResponse {
+        match self
+            .replies
+            .iter()
+            .find(|(needle, _, _)| payload.contains(needle.as_str()))
+        {
+            Some((_, status, body)) => self.response_with(*status, body.clone()),
+            None => self.response(),
+        }
+    }
+
+    fn response_with(&self, status: u16, body: Vec<u8>) -> ProbeResponse {
         ProbeResponse {
-            status: Some(self.status),
+            status: Some(status),
             headers: Vec::new(),
-            body: self.body.clone(),
+            body,
             elapsed_ms: 1,
             flow: None,
             ws_frames: None,
@@ -379,7 +417,7 @@ impl ProbeHost for RecordingHost {
         Box::pin(async {
             self.sent().push(payload.value.clone());
             self.charge_one();
-            Ok(self.response())
+            Ok(self.response_for(&payload.value))
         })
     }
 
@@ -420,6 +458,13 @@ impl ProbeHost for RecordingHost {
 
     fn shared(&self) -> Option<Arc<dyn ProbeHost>> {
         self.me.upgrade().map(|host| host as Arc<dyn ProbeHost>)
+    }
+
+    /// An inert client, so a script check driven by the recorder runs on the
+    /// bridge's budgeted path and a closure's `http.send` is refused rather
+    /// than reaching any network (spec D9.3).
+    fn client(&self) -> Option<Arc<dyn ProxyClient>> {
+        Some(Arc::new(NullClient))
     }
 
     fn baseline_peer_addr(&self) -> Option<SocketAddr> {
@@ -601,5 +646,76 @@ mod tests {
         assert!(response.body.is_empty());
         assert_eq!(host.payloads(), vec![String::new()]);
         assert_eq!(host.budget_left(), 15);
+    }
+
+    /// Coordinator item (2026-11-01): a payload-keyed reply table, so a test
+    /// can drive a multi-path check — `/.git/` answers one body, `/.env`
+    /// another — and a payload nothing matches still gets the canned default.
+    /// Only `probe` consults the table.
+    #[test]
+    fn recording_host_answers_by_payload_needle() {
+        let host = RecordingHost::new(200, "default")
+            .with_reply_for(".git", 200, "ref: refs/heads/main")
+            .with_reply_for(".env", 403, "forbidden");
+
+        let git = block_on(host.probe(&payload("/.git/HEAD"))).expect("the stub answers");
+        assert_eq!(git.status, Some(200));
+        assert_eq!(git.body, b"ref: refs/heads/main".to_vec());
+
+        let env = block_on(host.probe(&payload("/.env"))).expect("the stub answers");
+        assert_eq!(env.status, Some(403));
+        assert_eq!(env.body, b"forbidden".to_vec());
+
+        let other = block_on(host.probe(&payload("/robots.txt"))).expect("the stub answers");
+        assert_eq!(other.status, Some(200));
+        assert_eq!(other.body, b"default".to_vec());
+
+        let baseline = block_on(host.baseline()).expect("the stub answers");
+        assert_eq!(
+            baseline.body,
+            b"default".to_vec(),
+            "baseline ignores the table"
+        );
+        let raw = block_on(host.probe_raw(RawProbe {
+            method: "GET".to_string(),
+            url: "http://127.0.0.1:8080/.git/".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        }))
+        .expect("the stub answers");
+        assert_eq!(raw.body, b"default".to_vec(), "probe_raw ignores the table");
+
+        assert_eq!(
+            host.payloads(),
+            vec![
+                "/.git/HEAD".to_string(),
+                "/.env".to_string(),
+                "/robots.txt".to_string()
+            ]
+        );
+    }
+
+    /// Wave-2/3 security review: a script check must only ever send through
+    /// the host's budgeted client. The recorder therefore lends one — inert, so
+    /// a closure's `http.send` is refused rather than reaching the network —
+    /// instead of the trait default `None`, which the bridge is to treat as a
+    /// wiring error.
+    #[test]
+    fn recording_host_lends_an_inert_client() {
+        let host = RecordingHost::new(200, "ok");
+        let dynamic: &dyn ProbeHost = &host;
+        let client = dynamic.client().expect("the recorder lends a client");
+        let err = block_on(client.send(HttpRequest {
+            method: "GET".to_string(),
+            scheme: "http".to_string(),
+            authority: "127.0.0.1:8080".to_string(),
+            path: "/".to_string(),
+            version: aitm_core::HttpVersion::Http11,
+            headers: aitm_core::HeaderMap::new(),
+            body: aitm_core::Body::Empty,
+            timestamp: std::time::SystemTime::now(),
+        }))
+        .expect_err("the lent client sends nothing");
+        assert!(err.to_string().contains("no client"), "{err}");
     }
 }
