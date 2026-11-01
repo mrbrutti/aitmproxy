@@ -197,6 +197,20 @@ struct Candidate {
     example: String,
 }
 
+/// What a caller of [`Collector::record`] knows about a candidate that its
+/// kind, name and value do not say.
+#[derive(Clone, Copy, Default)]
+struct RecordFlags {
+    /// The value was read out of a JSON body ([`PointTrait::Json`]).
+    json: bool,
+    /// The name is the lane's own label for a path segment
+    /// ([`path_segment_token`] produced it), not text read off the wire, so
+    /// the secret-name vocabulary does not apply to it (R-M1, F4-2).
+    placeholder: bool,
+    /// The example must not be shown: the segment is a token (S-M2).
+    withhold: bool,
+}
+
 /// Collects candidates in order, dropping repeats of a `(kind, name, path)`.
 struct Collector<'a> {
     candidates: Vec<Candidate>,
@@ -226,22 +240,43 @@ impl<'a> Collector<'a> {
         value: &str,
         json: bool,
     ) {
-        self.record(kind, name, path, value, json, false);
+        self.record(
+            kind,
+            name,
+            path,
+            value,
+            RecordFlags {
+                json,
+                ..RecordFlags::default()
+            },
+        );
     }
 
-    /// Record one path candidate at the 1-based `index`, with its example
-    /// withheld when the caller says so: the segment is a token
-    /// ([`path_segment_token`] named it anything but `{id}`), and a token in
-    /// the path must not leak through `example` (S-M2, R-M1).
+    /// Record one path candidate at the 1-based `index`. `placeholder` says
+    /// the name is the lane's own label for the segment ([`path_segment_token`]
+    /// produced it) rather than text read off the wire; `withhold` says its
+    /// example must not be shown (the token is anything but `{id}`), because a
+    /// token in the path must not leak through `example` (S-M2, R-M1).
     fn push_path(
         &mut self,
         kind: InsertionKind,
         name: &str,
         index: usize,
         value: &str,
+        placeholder: bool,
         withhold: bool,
     ) {
-        self.record(kind, name, Some(index.to_string()), value, false, withhold);
+        self.record(
+            kind,
+            name,
+            Some(index.to_string()),
+            value,
+            RecordFlags {
+                json: false,
+                placeholder,
+                withhold,
+            },
+        );
     }
 
     /// The one recording path behind [`Collector::push`] and
@@ -252,8 +287,7 @@ impl<'a> Collector<'a> {
         name: &str,
         path: Option<String>,
         value: &str,
-        json: bool,
-        withhold: bool,
+        flags: RecordFlags,
     ) {
         if name.is_empty() {
             return;
@@ -264,10 +298,12 @@ impl<'a> Collector<'a> {
         }
 
         let mut found = traits_for(value);
-        if json {
+        if flags.json {
             found.push(PointTrait::Json);
         }
-        if session_trait(kind, name, self.session) || path_is_secret(kind, path.as_deref()) {
+        if session_trait(kind, name, flags.placeholder, self.session)
+            || path_is_secret(kind, path.as_deref())
+        {
             found.push(PointTrait::Session);
         }
         let traits: Vec<PointTrait> = TRAIT_ORDER
@@ -278,7 +314,7 @@ impl<'a> Collector<'a> {
 
         // D8.1: a session point never shows its value, whatever it is named;
         // the caller withholds a path token's value the same way (S-M2).
-        let example = if withhold || traits.contains(&PointTrait::Session) {
+        let example = if flags.withhold || traits.contains(&PointTrait::Session) {
             redact::REDACTED.to_string()
         } else {
             redact::example(kind, name, value)
@@ -309,12 +345,21 @@ fn path_is_secret(kind: InsertionKind, path: Option<&str>) -> bool {
 
 /// Whether a point carries session state: its name is a session cookie or (case
 /// insensitively) a session header of this job, or it reads as a secret.
-fn session_trait(kind: InsertionKind, name: &str, session: Option<&SessionMaterial>) -> bool {
-    // A template placeholder (`{id}`, `{token}`) is the lane's own label for a
-    // path segment, not a name the application reads, so the secret-name
-    // vocabulary does not apply to it: `{token}` names a point that must be
-    // audited, with its example withheld (R-M1).
-    if !is_placeholder(name) && redact::is_secret_name(name) {
+///
+/// `placeholder` is the one exemption from the secret vocabulary, and it is
+/// the caller's to assert, never inferred from the name's shape: a template
+/// placeholder (`{id}`, `{token}`) is the lane's own label for a path segment,
+/// not a name the application reads, so `{token}` names a point that must be
+/// audited, with its example withheld (R-M1). A `{session}` read off the wire
+/// (a raw path segment, a query key, a body field) is a name like any other
+/// and keeps the trait (F4-2).
+fn session_trait(
+    kind: InsertionKind,
+    name: &str,
+    placeholder: bool,
+    session: Option<&SessionMaterial>,
+) -> bool {
+    if !placeholder && redact::is_secret_name(name) {
         return true;
     }
     let Some(material) = session else {
@@ -329,12 +374,6 @@ fn session_trait(kind: InsertionKind, name: &str, session: Option<&SessionMateri
             .any(|(known, _)| known.eq_ignore_ascii_case(name)),
         _ => false,
     }
-}
-
-/// Whether `name` is a template placeholder such as `{id}` or `{token}`, the
-/// shape [`path_segment_token`] answers and nothing else produces.
-fn is_placeholder(name: &str) -> bool {
-    name.len() > 2 && name.starts_with('{') && name.ends_with('}')
 }
 
 /// Every insertion point of one captured request (spec D8.1).
@@ -373,7 +412,7 @@ pub(crate) fn enumerate_v2(flow: &HttpFlow, opts: &EnumerateOptions<'_>) -> Enum
         let token = path_segment_token(segment);
         let name = token.unwrap_or(segment);
         let withhold = token.is_some_and(|placeholder| placeholder != "{id}");
-        collector.push_path(kind, name, index + 1, segment, withhold);
+        collector.push_path(kind, name, index + 1, segment, token.is_some(), withhold);
     }
 
     // 3. Body values, by format.
@@ -1066,6 +1105,72 @@ mod tests {
         let plain = last_segment("http://t:8080/account/settings");
         assert_eq!(plain.name, "settings");
         assert_eq!(plain.example.as_deref(), Some("settings"));
+    }
+
+    /// The placeholder exemption is the lane's, not the wire's (F4-2): only a
+    /// name `path_segment_token` produced (`{token}` for a 64-hex reset
+    /// segment) skips the secret vocabulary. A request that literally carries
+    /// `{session}` as a path segment or `{password}` as a query key names
+    /// points that read as secrets and carry `Session`, examples withheld.
+    #[test]
+    fn wire_supplied_braces_are_not_placeholders() {
+        let mut req = request("GET", "http://t:8080/", &[], None);
+        req.path = "/api/{session}/x?{password}=1".to_string();
+        let flow = captured_flow(req, 200, &[], b"");
+        let profile = ScanProfile::default();
+        let empty = CompiledIgnore::compile(&[]).unwrap();
+        let out = enumerate_v2(
+            &flow,
+            &EnumerateOptions {
+                intensity: profile.intensity,
+                kinds: &profile.audit.kinds,
+                ignore: &empty,
+                max_points: profile.audit.max_points_per_request,
+                session: None,
+            },
+        );
+
+        let segment = point(&out, PathSegment, "{session}");
+        assert_eq!(segment.path.as_deref(), Some("2"));
+        assert!(
+            segment.traits.contains(&PointTrait::Session),
+            "{:?}",
+            segment.traits
+        );
+        assert_eq!(segment.example.as_deref(), Some("<redacted>"));
+
+        let key = point(&out, Query, "{password}");
+        assert!(
+            key.traits.contains(&PointTrait::Session),
+            "{:?}",
+            key.traits
+        );
+        assert_eq!(key.example.as_deref(), Some("<redacted>"));
+
+        // The lane's own placeholder keeps the exemption.
+        let reset = request(
+            "GET",
+            &format!("http://t:8080/reset/{}", "a".repeat(64)),
+            &[],
+            None,
+        );
+        let out = enumerate_v2(
+            &captured_flow(reset, 200, &[], b""),
+            &EnumerateOptions {
+                intensity: profile.intensity,
+                kinds: &profile.audit.kinds,
+                ignore: &empty,
+                max_points: profile.audit.max_points_per_request,
+                session: None,
+            },
+        );
+        let token = point(&out, PathSegment, "{token}");
+        assert!(
+            !token.traits.contains(&PointTrait::Session),
+            "{:?}",
+            token.traits
+        );
+        assert_eq!(token.example.as_deref(), Some("<redacted>"));
     }
 
     /// S-I1 (tester): the path rule covers an XML *attribute* too — its path
