@@ -494,3 +494,50 @@ fn a_failed_legacy_crawl_is_drawn_on_the_jobs_tab() {
         "the Jobs tab draws the failure reason: {text}"
     );
 }
+
+/// Fix round H, H35 (D6 hostile-core bounds): a legacy `scan.discover`
+/// failure's text is bounded once, when it is stored in `legacy.error`
+/// (control characters stripped, cut to `ERROR_DETAIL_MAX` cells), not
+/// re-bounded by every frame. A 1 MiB message with tabs leaves the stored
+/// error at most `ERROR_DETAIL_MAX` cells, tab-free and ending in an
+/// ellipsis; the Jobs tab banner draws it on a legacy bus.
+#[test]
+fn legacy_discover_failure_text_is_bounded_when_stored() {
+    use aitm_tui::scan::ERROR_DETAIL_MAX;
+    use aitm_tui::text::width;
+
+    let mut app = legacy_app(200, 50);
+    let _ = app.update(Action::OpenScan);
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.update(Action::ScanLaunch);
+    assert!(app.scan.legacy.running);
+    let message = "refused:\t".repeat(1 << 17);
+    assert!(message.len() >= 1 << 20);
+    let _ = app.on_bus(BusEvent::CallFailed {
+        name: "scan.discover".into(),
+        message,
+    });
+    let stored = app
+        .scan
+        .legacy
+        .error
+        .as_deref()
+        .expect("the reason is kept");
+    assert!(
+        width(stored) <= ERROR_DETAIL_MAX,
+        "{} cells stored",
+        width(stored)
+    );
+    assert!(!stored.contains('\t'), "tabs stripped: {stored:?}");
+    assert!(stored.ends_with('…'), "{stored:?}");
+    assert!(stored.starts_with("refused:refused:"));
+    // The same CallFailed also toasts the raw message (every verb's path,
+    // outside H35); the toast is dropped here so the Jobs banner alone is
+    // read.
+    app.toasts.clear();
+    let text = screen(&app);
+    assert!(
+        text.contains("refused:refused:"),
+        "the Jobs banner reads the stored reason: {text}"
+    );
+}

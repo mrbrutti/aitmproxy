@@ -35,12 +35,12 @@ use crate::scan::{
     parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
     tag_parts, typed_origin, usable_selector, walk, Dir, EditorField, FieldKind, IssueFilterKey,
     IssuePane, JobPane, Launch, LaunchVerb, MapPane, PendingLaunch, ProfileEditor, ProfilePane,
-    ScanError, ScanOffer, ScanState, ScanTab, CLAMPED_FIELD_MAX, CLAMPED_MAX, ISSUES_POLL_TICKS,
-    LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN,
-    OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX, SAVED_PATH_MAX, SITEMAP_POLL_TICKS,
+    ScanError, ScanOffer, ScanState, ScanTab, CLAMPED_FIELD_MAX, CLAMPED_MAX, ERROR_DETAIL_MAX,
+    ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
+    OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX, SAVED_PATH_MAX, SITEMAP_POLL_TICKS,
     STATUS_POLL_TICKS,
 };
-use crate::text::truncate;
+use crate::text::{clean, truncate};
 use crate::theme::Theme;
 use crate::viewers::json;
 
@@ -4171,10 +4171,11 @@ impl App {
                         self.l4.pending = None;
                     }
                     // A refused or failed crawl clears the running flag and keeps
-                    // the reason in the Scan view until the next launch.
+                    // the reason in the Scan view until the next launch, bounded
+                    // once here (fix round H, H35; D6 hostile-core bounds).
                     "scan.discover" => {
                         self.scan.legacy.running = false;
-                        self.scan.legacy.error = Some(message.clone());
+                        self.scan.legacy.error = Some(truncate(&clean(&message), ERROR_DETAIL_MAX));
                     }
                     _ => {}
                 }
