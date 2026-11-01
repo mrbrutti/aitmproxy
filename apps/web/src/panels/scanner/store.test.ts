@@ -6,19 +6,12 @@
 // The fixtures under `crates/aitm-scan-model/fixtures/` are wire *shapes*, never evidence: a green
 // run here says the store holds the contract, not that any scan ever ran (fixtures/README.md).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import type { AppStore } from '~/state/app';
 import type { PocRun } from '~/bus/mock';
 import { findingsState } from '~/panels/findings/state';
-import { stubApp } from './testkit';
+import { fixture, stubApp } from './testkit';
 import { parseScanProfile, type ScanProfile } from './model';
 import { scanStore, type ScanStore } from './store';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const fixture = (name: string): unknown =>
-  JSON.parse(readFileSync(resolve(here, '../../../../../crates/aitm-scan-model/fixtures', name), 'utf8'));
 
 const JOB = 'scan-1a2b3c4d';
 const ISSUE = 'issue-9f8e7d6c';
@@ -134,7 +127,11 @@ describe('scanStore: profiles (D-T8.5)', () => {
 
     expect(await h.s.saveProfile(h.s.draft('my-api')!.profile)).toBe(false);
 
-    expect(h.s.lastError()).toBe('scan.profile.save answered with an unexpected shape');
+    expect(h.s.lastError()).toEqual({
+      source: 'save',
+      code: null,
+      text: 'scan.profile.save answered with an unexpected shape',
+    });
     expect(h.notice).toHaveBeenCalledWith('scan.profile.save answered with an unexpected shape', 'error');
     expect(h.s.draft('my-api')!.dirty).toBe(true);
   });
@@ -147,7 +144,10 @@ describe('scanStore: profiles (D-T8.5)', () => {
 
     expect(await h.s.saveProfile(standard())).toBe(false);
 
-    expect(h.s.lastError()).toBe('Invalid profile: standard is a built-in profile');
+    expect(h.s.lastError()!.text).toBe('Invalid profile: standard is a built-in profile');
+    expect(h.s.lastError()!.code).toBe('invalid_profile');
+    expect(h.s.lastError()!.source).toBe('save');
+    expect(h.s.lastErrorText()).toBe('Invalid profile: standard is a built-in profile');
     expect(h.s.draft('standard')).not.toBeNull();
   });
 
@@ -212,6 +212,62 @@ describe('scanStore: profiles (D-T8.5)', () => {
       { id: 'e1', cidr: '127.0.0.0/8', ports: '0-65535', interface: '*', direction: 'outbound', capability: 'inject', inject_rate: { pps: 100, burst: 100 } },
     ]);
   });
+
+  it('ensureProfiles joins the read in flight, is a no-op once loaded, and loadProfiles still re-reads (A3)', async () => {
+    const h = harness();
+    // The store's own bootstrap already asked once; two concurrent ensures ride that read.
+    const a = h.s.ensureProfiles();
+    const b = h.s.ensureProfiles();
+    expect(h.count('scan.profile.list')).toBe(1);
+    await Promise.all([a, b]);
+    expect(h.s.profilesLoaded()).toBe(true);
+
+    await h.s.ensureProfiles();
+    expect(h.count('scan.profile.list')).toBe(1);
+
+    await h.s.loadProfiles();
+    expect(h.count('scan.profile.list')).toBe(2);
+  });
+
+  it('ensureChecks, ensureL4Scope and ensureJobs memoise the same way (A3)', async () => {
+    const h = harness();
+    await Promise.all([h.s.ensureChecks(), h.s.ensureChecks()]);
+    expect(h.count('scan.checks')).toBe(1);
+    await h.s.ensureChecks();
+    expect(h.count('scan.checks')).toBe(1);
+    await h.s.loadChecks();
+    expect(h.count('scan.checks')).toBe(2);
+
+    await Promise.all([h.s.ensureL4Scope(), h.s.ensureL4Scope()]);
+    expect(h.count('l4.scope.list')).toBe(1);
+    await h.s.ensureL4Scope();
+    expect(h.count('l4.scope.list')).toBe(1);
+
+    // The bootstrap read the list once; ensureJobs rides it and never asks again once loaded.
+    await Promise.all([h.s.ensureJobs(), h.s.ensureJobs()]);
+    expect(h.count('scan.list')).toBe(1);
+    await h.s.ensureJobs();
+    expect(h.count('scan.list')).toBe(1);
+    await h.s.refreshJobs();
+    expect(h.count('scan.list')).toBe(2);
+  });
+
+  it('a profile named like an Object.prototype key loads instead of reading the prototype (A5)', async () => {
+    const h = harness();
+    await tick();
+    expect(h.s.draft('constructor')).toBeNull();
+    expect(h.s.issueDetail('constructor')).toBeNull();
+    expect(h.s.issueDetailError('constructor')).toBeNull();
+
+    h.reply('scan.profile.get', { ...standard(), name: 'constructor' });
+    await h.s.loadProfile('constructor');
+
+    expect(h.count('scan.profile.get')).toBe(1);
+    expect(h.argsOf('scan.profile.get')[0]).toEqual({ name: 'constructor' });
+    expect(h.s.draft('constructor')!.profile.name).toBe('constructor');
+    expect(h.s.draft('constructor')!.dirty).toBe(false);
+    expect(h.s.lastError()).toBeNull();
+  });
 });
 
 describe('scanStore: launch (D-T8.6)', () => {
@@ -268,16 +324,25 @@ describe('scanStore: launch (D-T8.6)', () => {
     const outcome = await h.s.launch(standard(), 'start');
 
     expect(outcome.kind).toBe('refused');
-    expect(h.s.lastError()!.startsWith('Agent session: the core refuses active scans')).toBe(true);
+    expect(h.s.lastError()!.text.startsWith('Agent session: the core refuses active scans')).toBe(true);
+    expect(h.s.lastError()!.code).toBe('refused_agent');
+    expect(h.s.lastError()!.source).toBe('launch');
     expect(h.s.agent()).toBe(true);
-    expect(h.notice).toHaveBeenCalledWith(h.s.lastError(), 'error');
+    expect(h.notice).toHaveBeenCalledWith(h.s.lastError()!.text, 'error');
+    // The convenience filter: a launch error is visible to the editor, not to the issues view.
+    expect(h.s.errorFor(['launch', 'save'])()).toBe(h.s.lastError());
+    expect(h.s.errorFor(['issue'])()).toBeNull();
   });
 
   it('a malformed start reply is reported instead of inventing a job', async () => {
     const h = harness({ replies: { 'scan.start': {} } });
     const outcome = await h.s.launch(standard(), 'start');
     expect(outcome.kind).toBe('malformed');
-    expect(h.s.lastError()).toBe('scan.start answered with an unexpected shape');
+    expect(h.s.lastError()).toEqual({
+      source: 'launch',
+      code: null,
+      text: 'scan.start answered with an unexpected shape',
+    });
     expect(h.notice).toHaveBeenCalledWith('scan.start answered with an unexpected shape', 'error');
     // Nothing was invented from the reply: no after-start notice, no switch to the Jobs view.
     expect(h.s.startNotice()).toBeNull();
@@ -300,9 +365,33 @@ describe('scanStore: launch (D-T8.6)', () => {
 
     await h.s.launch(standard(), 'map');
 
-    expect(h.s.lastError()).toBe('Not found: profile gone');
+    expect(h.s.lastError()).toEqual({ source: 'launch', code: 'not_found', text: 'Not found: profile gone' });
     expect(h.count('scan.list')).toBe(lists + 1);
     expect(h.count('scan.profile.list')).toBe(profiles + 1);
+  });
+
+  it('a stale confirm token shows "Confirmation required" and re-runs the handshake (A7, D-T8.6)', async () => {
+    const h = harness();
+    let prompts = 0;
+    h.reply('scan.start', (args) => {
+      if (typeof args._confirm === 'string') return Promise.reject(new Error('scan: confirm_required: stale'));
+      prompts += 1;
+      return { status: 'needs_confirmation', prompt: `P${prompts}`, confirm_token: `t${prompts}` };
+    });
+
+    await h.s.launch(standard(), 'start');
+    expect(h.s.pendingConfirm()!.prompt).toBe('P1');
+
+    const outcome = await h.s.confirmLaunch();
+
+    expect(outcome.kind).toBe('confirm');
+    expect(h.s.lastError()!.text).toBe('Confirmation required');
+    expect(h.s.lastError()!.code).toBe('confirm_required');
+    expect(h.notice).toHaveBeenCalledWith('Confirmation required', 'error');
+    expect(h.count('scan.start')).toBe(3);
+    expect(h.argsOf('scan.start')[1]!._confirm).toBe('t1');
+    expect(h.s.pendingConfirm()!.prompt).toBe('P2');
+    expect(h.s.pendingConfirm()!.token).toBe('t2');
   });
 });
 
@@ -327,18 +416,26 @@ describe('scanStore: jobs and issues (D-T8.2, D-T8.9)', () => {
     expect(h.s.issuesScope()).toBeNull();
   });
 
-  it('a cancel the core refused is reported, not swallowed', async () => {
+  it('a cancel the core refused is reported through the same text as every other verb (A1)', async () => {
     const h = harness();
+    h.fail('scan.cancel', 'scan: not_found: scan-1a2b3c4d');
+    const result = await h.s.cancel(JOB);
+    expect(result.ok).toBe(false);
+    expect(h.s.lastError()!.text.startsWith('Not found:')).toBe(true);
+    expect(h.s.lastError()).toEqual({ source: 'cancel', code: 'not_found', text: 'Not found: scan-1a2b3c4d' });
+    expect(h.notice).toHaveBeenCalledWith('Not found: scan-1a2b3c4d', 'error');
+
     h.reply('scan.cancel', { nope: 1 });
-    expect(await h.s.cancel(JOB)).toBeNull();
-    expect(h.s.lastError()).toBe(`Cancel failed for ${JOB}`);
-    expect(h.notice).toHaveBeenCalledWith(`Cancel failed for ${JOB}`, 'error');
+    await h.s.cancel(JOB);
+    expect(h.s.lastError()!.text).toBe('scan.cancel answered with an unexpected shape');
   });
 
   it('cancel that the core accepted reports the two-step state', async () => {
     const h = harness();
     h.reply('scan.cancel', fixture('scan.cancel.json'));
-    expect((await h.s.cancel(JOB))!.state).toBe('cancelling');
+    const result = await h.s.cancel(JOB);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.status.state).toBe('cancelling');
     expect(h.s.lastError()).toBeNull();
   });
 

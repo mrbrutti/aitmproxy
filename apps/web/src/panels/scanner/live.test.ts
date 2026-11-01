@@ -7,16 +7,9 @@
 // run here says the model holds the contract, not that any scan ever ran (fixtures/README.md).
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot } from 'solid-js';
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { stubApp } from './testkit';
+import { fixture, stubApp } from './testkit';
 import { createLiveModel, type LiveModel } from './live';
 import { JOB_NOTIFICATION_METHOD, parseIssue } from './model';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const fixture = (name: string): unknown =>
-  JSON.parse(readFileSync(resolve(here, '../../../../../crates/aitm-scan-model/fixtures', name), 'utf8'));
 
 type Raw = Record<string, unknown>;
 /** A fixture as a mutable bag, for the "same reply with one field changed" cases. */
@@ -278,17 +271,58 @@ describe('createLiveModel: pages', () => {
 describe('createLiveModel: failures', () => {
   it('cancel_returns_cancelling', async () => {
     const h = harness();
-    const status = await h.m.cancel(JOB);
-    expect(status!.state).toBe('cancelling');
+    const result = await h.m.cancel(JOB);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.status.state).toBe('cancelling');
     expect(h.m.status(JOB)!.state).toBe('cancelling');
     expect(h.argsOf('scan.cancel')[0]).toEqual({ job: JOB });
   });
 
-  it('cancel answers null instead of throwing when the verb refuses', async () => {
+  it('cancel answers the refusal text instead of throwing when the verb refuses (A1)', async () => {
     const h = harness();
     h.fail('scan.cancel', 'scan: not_found: scan-1a2b3c4d');
-    await expect(h.m.cancel(JOB)).resolves.toBeNull();
+    await expect(h.m.cancel(JOB)).resolves.toEqual({ ok: false, message: 'scan: not_found: scan-1a2b3c4d' });
     expect(h.m.status(JOB)).toBeNull();
+
+    h.reply('scan.cancel', { nope: 1 });
+    await expect(h.m.cancel(JOB)).resolves.toEqual({
+      ok: false,
+      message: 'scan.cancel answered with an unexpected shape',
+    });
+  });
+
+  it('statusError holds the raw core text of a failed status read and clears on the next good one (A4)', async () => {
+    const h = harness();
+    await h.m.refreshStatus(JOB);
+    expect(h.m.status(JOB)!.probes.sent).toBe(418);
+    expect(h.m.statusError(JOB)).toBeNull();
+
+    h.fail('scan.status', 'scan: not_found: scan-1a2b3c4d');
+    await h.m.refreshStatus(JOB);
+    expect(h.m.statusError(JOB)).toBe('scan: not_found: scan-1a2b3c4d');
+    expect(h.m.status(JOB)!.probes.sent).toBe(418);
+
+    h.reply('scan.status', { nope: 1 });
+    await h.m.refreshStatus(JOB);
+    expect(h.m.statusError(JOB)).toBe('scan.status answered with an unexpected shape');
+
+    h.reply('scan.status', fixture('scan.status.json'));
+    await h.m.refreshStatus(JOB);
+    expect(h.m.statusError(JOB)).toBeNull();
+    expect(h.m.statusError(OTHER)).toBeNull();
+  });
+
+  it('a job named like an Object.prototype key is not found on the prototype (A5)', async () => {
+    const h = harness();
+    expect(h.m.status('constructor')).toBeNull();
+    expect(h.m.statusError('constructor')).toBeNull();
+    expect(h.m.issues('constructor').rows).toEqual([]);
+    expect(h.m.sitemap('constructor').nodes).toEqual([]);
+    expect(h.m.issues('hasOwnProperty').loading).toBe(false);
+
+    h.reply('scan.status', { ...raw('scan.status.json'), job: 'constructor' });
+    await h.m.refreshStatus('constructor');
+    expect(h.m.status('constructor')!.job).toBe('constructor');
   });
 
   it('bad_shape_is_an_error: a status reply of the wrong shape changes nothing', async () => {

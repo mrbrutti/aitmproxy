@@ -6,9 +6,6 @@
 // pack's README demands: nothing here is evidence that a scan found, reported or reproduced
 // anything. T8's acceptance is the live run, never this suite.
 
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import type { L4ScopeEntryWire } from '~/panels/l4/model';
@@ -28,6 +25,8 @@ import {
   hostKey,
   isLive,
   isStale,
+  own,
+  emptyRecord,
   isTerminal,
   isValidProfileName,
   jobTone,
@@ -51,10 +50,7 @@ import {
   parseSitemapResult,
 } from './model';
 
-const here = dirname(fileURLToPath(import.meta.url));
-const FIXTURES = resolve(here, '../../../../../crates/aitm-scan-model/fixtures');
-
-const fixture = (name: string): unknown => JSON.parse(readFileSync(resolve(FIXTURES, name), 'utf8'));
+import { fixture } from './testkit';
 
 const status = () => parseJobStatus(fixture('scan.status.json'))!;
 const issueRows = () => parseIssuesResult(fixture('scan.issues.json'))!.issues;
@@ -373,5 +369,24 @@ describe('unknownSelectors', () => {
       'l4_stream:*',
       'x.y',
     ]);
+  });
+});
+
+describe('own / emptyRecord (A5: wire-keyed records never read Object.prototype)', () => {
+  it('own answers only an own property, never a prototype one', () => {
+    const r: Record<string, number> = { a: 1 };
+    expect(own(r, 'a')).toBe(1);
+    expect(own(r, 'b')).toBeUndefined();
+    expect(own(r, 'constructor')).toBeUndefined();
+    expect(own(r, 'hasOwnProperty')).toBeUndefined();
+    expect(own(r, '__proto__')).toBeUndefined();
+  });
+
+  it('emptyRecord has no prototype, so a wire key like "constructor" starts undefined', () => {
+    const r = emptyRecord<number>();
+    expect(Object.getPrototypeOf(r)).toBeNull();
+    expect(r['constructor']).toBeUndefined();
+    r['constructor'] = 2;
+    expect(own(r, 'constructor')).toBe(2);
   });
 });

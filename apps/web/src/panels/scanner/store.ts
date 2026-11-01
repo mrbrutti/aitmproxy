@@ -21,7 +21,7 @@ import type { AppStore } from '~/state/app';
 import { findingsState } from '~/panels/findings/state';
 import type { L4ScopeEntryWire } from '~/panels/l4/model';
 
-import { EMPTY_FILTER, scanErrorText, type IssueFilter } from './helpers';
+import { EMPTY_FILTER, emptyRecord, own, scanErrorText, type IssueFilter } from './helpers';
 import {
   beginLaunch,
   confirmLaunch as confirmLaunchCall,
@@ -29,11 +29,13 @@ import {
   type LaunchMode,
   type LaunchOutcome,
 } from './launch';
-import { createLiveModel, type LiveModel } from './live';
+import { createLiveModel, type CancelResult, type LiveModel } from './live';
 import {
   parseChecksResult,
   parseIssue,
+  parseProfileDeleteResult,
   parseProfileList,
+  parseProfileSaveResult,
   parseScanError,
   parseScanProfile,
   parseSessionProfile,
@@ -41,7 +43,7 @@ import {
   type Issue,
   type IssueStatus,
   type ProfileListEntry,
-  type JobStatus,
+  type ScanErrorCode,
   type ScanProfile,
   type SessionProfile,
   type StartResult,
@@ -57,6 +59,20 @@ export type Tab = 'profiles' | 'jobs' | 'sitemap' | 'issues';
 export interface ProfileDraft {
   profile: ScanProfile;
   dirty: boolean;
+}
+
+/** Which operation an error came from, so a view shows only the errors of the controls it owns. */
+export type ScanErrorSource = 'launch' | 'save' | 'delete' | 'preview' | 'cancel' | 'issue' | 'profile';
+
+/**
+ * The last failure the operator must see (D-T8.6): where it came from, the `scan:` code the core
+ * gave (`null` for a transport error or a shape complaint) and the text `scanErrorText` renders
+ * for it. Views branch on `code`/`source`, never on the text.
+ */
+export interface ScanError {
+  source: ScanErrorSource;
+  code: ScanErrorCode | null;
+  text: string;
 }
 
 /** The core's confirmation prompt, held with exactly what is needed to re-issue the launch. */
@@ -107,21 +123,31 @@ export interface ScanStore extends LiveModel {
   issueDetailError(id: string): string | null;
 
   busy: Accessor<boolean>;
-  lastError: Accessor<string | null>;
+  lastError: Accessor<ScanError | null>;
+  /** `lastError()?.text`, for a caller that only renders. */
+  lastErrorText: Accessor<string | null>;
+  /** `lastError()` when its `source` is one of `sources`, else `null`. */
+  errorFor(sources: readonly ScanErrorSource[]): Accessor<ScanError | null>;
   startNotice: Accessor<StartResult | null>;
   dismissStartNotice(): void;
   pendingConfirm: Accessor<PendingConfirm | null>;
 
+  /** `load*` always reads (Retry); `ensure*` joins a read in flight and is a no-op once loaded. */
   loadProfiles(): Promise<void>;
+  ensureProfiles(): Promise<void>;
   loadProfile(name: string): Promise<void>;
   saveProfile(profile: ScanProfile): Promise<boolean>;
   deleteProfile(name: string): Promise<boolean>;
   loadChecks(): Promise<void>;
+  ensureChecks(): Promise<void>;
   loadL4Scope(): Promise<void>;
+  ensureL4Scope(): Promise<void>;
+  ensureJobs(): Promise<void>;
   previewSession(origin: string): Promise<SessionProfile | null>;
   launch(profile: ScanProfile, mode: LaunchMode): Promise<LaunchOutcome>;
   confirmLaunch(): Promise<LaunchOutcome>;
   cancelConfirm(): void;
+  cancel(job: string): Promise<CancelResult>;
   loadIssue(id: string): Promise<void>;
   updateIssue(id: string, status: IssueStatus, note?: string): Promise<Issue | null>;
   openFlow(id: string): Promise<void>;
@@ -150,8 +176,8 @@ const DIRECTIONS = ['inbound', 'outbound'] as const;
 const CAPABILITIES = ['capture', 'inject', 'intercept'] as const;
 
 /**
- * `l4.scope.list` has no parser in `model.ts` (it is the L4 panel's contract), so it is read
- * defensively here exactly as `panels/l4/store.ts` reads it: anything that is not a usable entry is
+ * `l4.scope.list` is the L4 panel's contract and has no parser anywhere (`panels/l4` trusts the
+ * wire shape), so this is the one place it is parsed: anything that is not a usable entry is
  * dropped rather than trusted, because `l4Covered` dims a control from it.
  */
 function parseL4Entries(raw: unknown): L4ScopeEntryWire[] | null {
@@ -186,17 +212,22 @@ function parseL4Entries(raw: unknown): L4ScopeEntryWire[] | null {
   return out;
 }
 
-/** `scan.profile.save` / `scan.profile.delete` are the two replies `model.ts` has no parser for. */
-function savedName(raw: unknown): string | null {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const o = raw as Record<string, unknown>;
-  return typeof o.saved === 'string' && typeof o.path === 'string' ? o.saved : null;
-}
-
-function deletedFlag(raw: unknown): boolean | null {
-  if (typeof raw !== 'object' || raw === null) return null;
-  const o = raw as Record<string, unknown>;
-  return typeof o.deleted === 'boolean' ? o.deleted : null;
+/**
+ * One read, shared: a caller that only needs the data *present* calls `ensure`, which joins the
+ * read in flight and does nothing once `loaded()` is true; `load` always reads (Retry, a reconnect)
+ * and is what `ensure` joins. Three mounts in the same tick cost one verb (A3).
+ */
+function sharedLoad(loaded: () => boolean, read: () => Promise<void>): { load(): Promise<void>; ensure(): Promise<void> } {
+  let inflight: Promise<void> | null = null;
+  const load = (): Promise<void> => {
+    const p = read().finally(() => {
+      if (inflight === p) inflight = null;
+    });
+    inflight = p;
+    return p;
+  };
+  const ensure = (): Promise<void> => (loaded() ? Promise.resolve() : (inflight ?? load()));
+  return { load, ensure };
 }
 
 const stores = new WeakMap<AppStore, ScanStore>();
@@ -240,13 +271,14 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
   const [selectedIssue, setSelectedIssueSignal] = createSignal<string | null>(null);
   const [filter, setFilterSignal] = createSignal<IssueFilter>(EMPTY_FILTER);
   const [busyCount, setBusyCount] = createSignal(0);
-  const [lastError, setLastError] = createSignal<string | null>(null);
+  const [lastError, setLastError] = createSignal<ScanError | null>(null);
   const [startNotice, setStartNotice] = createSignal<StartResult | null>(null);
   const [pendingConfirm, setPendingConfirm] = createSignal<PendingConfirm | null>(null);
 
-  const [drafts, setDrafts] = createStore<Record<string, ProfileDraft>>({});
-  const [details, setDetails] = createStore<Record<string, Issue>>({});
-  const [detailErrors, setDetailErrors] = createStore<Record<string, string>>({});
+  // Keyed by wire strings (profile names, issue ids), so: no prototype, every read via `own` (A5).
+  const [drafts, setDrafts] = createStore<Record<string, ProfileDraft>>(emptyRecord());
+  const [details, setDetails] = createStore<Record<string, Issue>>(emptyRecord());
+  const [detailErrors, setDetailErrors] = createStore<Record<string, string>>(emptyRecord());
   /** The profile each draft is measured against: what `scan.profile.get` (or a save) last gave. */
   const loaded = new Map<string, ScanProfile>();
 
@@ -263,14 +295,24 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
   };
   const issuesScope = (): string | null => (allJobs() ? null : selectedJob());
 
-  /** A refusal is reported, never softened: the code picks the text, an unknown code stays raw. */
-  function report(message: string): string {
+  /**
+   * A refusal is reported, never softened: the code picks the text, an unknown code stays raw, and
+   * the parsed code travels with it so a view can act on `out_of_scope` without reading the text.
+   */
+  function report(source: ScanErrorSource, message: string): ScanError {
     const { code, detail } = parseScanError(message);
-    const text = scanErrorText(code, detail);
-    setLastError(text);
-    app.notice(text, 'error');
-    return text;
+    const error: ScanError = { source, code, text: scanErrorText(code, detail) };
+    setLastError(error);
+    app.notice(error.text, 'error');
+    return error;
   }
+
+  const errorFor =
+    (sources: readonly ScanErrorSource[]): Accessor<ScanError | null> =>
+    () => {
+      const e = lastError();
+      return e !== null && sources.includes(e.source) ? e : null;
+    };
 
   async function guarded<T>(fn: () => Promise<T>): Promise<T> {
     setBusyCount((n) => n + 1);
@@ -283,7 +325,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
   /* ---------------------------------------------------------------- profiles */
 
-  async function loadProfiles(): Promise<void> {
+  const { load: loadProfiles, ensure: ensureProfiles } = sharedLoad(profilesLoaded, async () => {
     if (!ready()) return;
     try {
       const parsed = parseProfileList(await app.call<unknown>('scan.profile.list'));
@@ -298,7 +340,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
       setProfilesLoaded(true);
       setProfilesError(errorText(e));
     }
-  }
+  });
 
   function putDraft(name: string, profile: ScanProfile, dirty: boolean): void {
     setDrafts(name, { profile, dirty });
@@ -306,17 +348,17 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
   /** A no-op while a draft exists: a read must never overwrite what the operator is editing. */
   async function loadProfile(name: string): Promise<void> {
-    if (!ready() || drafts[name]) return;
+    if (!ready() || own(drafts, name)) return;
     try {
       const parsed = parseScanProfile(await app.call<unknown>('scan.profile.get', { name }));
       if (!parsed) {
-        report(shapeError('scan.profile.get'));
+        report('profile', shapeError('scan.profile.get'));
         return;
       }
       loaded.set(name, parsed);
       putDraft(name, parsed, false);
     } catch (e) {
-      report(errorText(e));
+      report('profile', errorText(e));
     }
   }
 
@@ -333,18 +375,18 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
   async function saveProfile(profile: ScanProfile): Promise<boolean> {
     return guarded(async () => {
       try {
-        const saved = savedName(await app.call<unknown>('scan.profile.save', { profile }));
+        const saved = parseProfileSaveResult(await app.call<unknown>('scan.profile.save', { profile }));
         if (saved === null) {
-          report(shapeError('scan.profile.save'));
+          report('save', shapeError('scan.profile.save'));
           return false;
         }
         loaded.set(profile.name, profile);
-        if (drafts[profile.name]) setDrafts(profile.name, 'dirty', false);
+        if (own(drafts, profile.name)) setDrafts(profile.name, 'dirty', false);
         setLastError(null);
         await loadProfiles();
         return true;
       } catch (e) {
-        report(errorText(e));
+        report('save', errorText(e));
         return false;
       }
     });
@@ -353,9 +395,9 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
   async function deleteProfile(name: string): Promise<boolean> {
     return guarded(async () => {
       try {
-        const deleted = deletedFlag(await app.call<unknown>('scan.profile.delete', { name }));
+        const deleted = parseProfileDeleteResult(await app.call<unknown>('scan.profile.delete', { name }));
         if (deleted === null) {
-          report(shapeError('scan.profile.delete'));
+          report('delete', shapeError('scan.profile.delete'));
           return false;
         }
         loaded.delete(name);
@@ -364,15 +406,15 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
         setLastError(null);
         // The reload is the truth about what is left, whichever way the core answered.
         await loadProfiles();
-        return deleted;
+        return deleted.deleted;
       } catch (e) {
-        report(errorText(e));
+        report('delete', errorText(e));
         return false;
       }
     });
   }
 
-  async function loadChecks(): Promise<void> {
+  const { load: loadChecks, ensure: ensureChecks } = sharedLoad(checksLoaded, async () => {
     if (!ready()) return;
     try {
       const parsed = parseChecksResult(await app.call<unknown>('scan.checks'));
@@ -387,17 +429,22 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
       setChecksLoaded(true);
       setChecksError(errorText(e));
     }
-  }
+  });
 
   /** Unknown coverage stays `null`: it dims nothing (`preflight`), it only explains. */
-  async function loadL4Scope(): Promise<void> {
-    if (!ready() || !l4Offered()) return;
-    try {
-      setL4Entries(parseL4Entries(await app.call<unknown>('l4.scope.list')));
-    } catch {
-      setL4Entries(null);
-    }
-  }
+  const { load: loadL4Scope, ensure: ensureL4Scope } = sharedLoad(
+    () => l4Entries() !== null,
+    async () => {
+      if (!ready() || !l4Offered()) return;
+      try {
+        setL4Entries(parseL4Entries(await app.call<unknown>('l4.scope.list')));
+      } catch {
+        setL4Entries(null);
+      }
+    },
+  );
+
+  const { load: refreshJobs, ensure: ensureJobs } = sharedLoad(live.jobsLoaded, live.refreshJobs);
 
   /** Names only (D7/W-13): the reply carries no session value and this store holds none. */
   async function previewSession(origin: string): Promise<SessionProfile | null> {
@@ -405,12 +452,12 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
       try {
         const parsed = parseSessionProfile(await app.call<unknown>('scan.session.preview', { target: origin }));
         if (!parsed) {
-          report(shapeError('scan.session.preview'));
+          report('preview', shapeError('scan.session.preview'));
           return null;
         }
         return parsed;
       } catch (e) {
-        report(errorText(e));
+        report('preview', errorText(e));
         return null;
       }
     });
@@ -436,17 +483,16 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
         await afterStart(outcome.result);
         return outcome;
       case 'refused': {
-        report(outcome.message);
+        report('launch', outcome.message);
         // The world moved under us: re-read what the refusal says is gone.
         if (outcome.code === 'not_found') {
-          await live.refreshJobs();
+          await refreshJobs();
           await loadProfiles();
         }
         return outcome;
       }
       case 'malformed':
-        setLastError(outcome.message);
-        app.notice(outcome.message, 'error');
+        report('launch', outcome.message);
         return outcome;
     }
   }
@@ -459,8 +505,9 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
   /**
    * The second phase of the core's handshake. A stale or reused token comes back as
-   * `confirm_required`: the token is worthless, so the handshake starts over and the operator sees
-   * the core's fresh prompt — nothing is sent confirmed in between.
+   * `confirm_required`: the refusal is shown as D-T8.6's "Confirmation required", the worthless
+   * token is dropped, and the handshake starts over so the operator sees the core's fresh prompt —
+   * nothing is sent confirmed in between.
    */
   async function confirmLaunch(): Promise<LaunchOutcome> {
     const pending = untrack(pendingConfirm);
@@ -469,6 +516,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     return guarded(async () => {
       const outcome = await confirmLaunchCall(call, pending.mode, pending.profile, pending.token);
       if (outcome.kind === 'refused' && outcome.code === 'confirm_required') {
+        report('launch', outcome.message);
         return handle(await beginLaunch(call, pending.mode, pending.profile), pending.mode, pending.profile);
       }
       return handle(outcome, pending.mode, pending.profile);
@@ -479,15 +527,14 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     setPendingConfirm(null);
   }
 
-  /** A refusal answers `null` rather than throwing (`live.ts`); the operator is told it failed. */
-  async function cancel(job: string): Promise<JobStatus | null> {
-    const next = await live.cancel(job);
-    if (!next) {
-      const text = `Cancel failed for ${job}`;
-      setLastError(text);
-      app.notice(text, 'error');
-    }
-    return next;
+  /**
+   * A refusal answers `{ ok: false }` rather than throwing (`live.ts`), and is reported through the
+   * same path as every other verb, so `scan: not_found: x` reads "Not found: x" here too.
+   */
+  async function cancel(job: string): Promise<CancelResult> {
+    const result = await live.cancel(job);
+    if (!result.ok) report('cancel', result.message);
+    return result;
   }
 
   /* ---------------------------------------------------------------- issues */
@@ -514,7 +561,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
           await app.call<unknown>('scan.issue.update', { id, status, ...(note !== undefined ? { note } : {}) }),
         );
         if (!parsed) {
-          report(shapeError('scan.issue.update'));
+          report('issue', shapeError('scan.issue.update'));
           return null;
         }
         setDetails(id, parsed);
@@ -523,7 +570,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
         setLastError(null);
         return parsed;
       } catch (e) {
-        report(errorText(e));
+        report('issue', errorText(e));
         return null;
       }
     });
@@ -563,13 +610,14 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
   // The first time this core is both open and v2, read what the surface needs before it is opened:
   // the job list (the Sidebar's live count) and the profile list. A later reconnect re-reads the
-  // profiles; the job resync on reconnect is the live model's (`live.ts`).
+  // profiles; the job resync on reconnect is the live model's (`live.ts`). Both go through the
+  // shared loads, so a view mounting in the same tick joins these reads instead of repeating them.
   let firstReady = true;
   createEffect(() => {
     if (!ready()) return;
     untrack(() => {
       void loadProfiles();
-      if (firstReady) void live.refreshJobs();
+      if (firstReady) void ensureJobs();
       firstReady = false;
     });
   });
@@ -585,6 +633,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
 
   return {
     ...live,
+    refreshJobs,
     cancel,
     dispose,
 
@@ -606,7 +655,7 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     profilesError,
     selectedProfile,
     setSelectedProfile: (name: string | null) => setSelectedProfileSignal(name),
-    draft: (name: string) => drafts[name] ?? null,
+    draft: (name: string) => own(drafts, name) ?? null,
     setDraft,
     discardDraft,
 
@@ -621,21 +670,27 @@ function build(app: AppStore, disposeRoot: () => void): ScanStore {
     setSelectedIssue: (id: string | null) => setSelectedIssueSignal(id),
     filter,
     setFilter: (f: IssueFilter) => setFilterSignal(f),
-    issueDetail: (id: string) => details[id] ?? null,
-    issueDetailError: (id: string) => detailErrors[id] || null,
+    issueDetail: (id: string) => own(details, id) ?? null,
+    issueDetailError: (id: string) => own(detailErrors, id) || null,
 
     busy: () => busyCount() > 0,
     lastError,
+    lastErrorText: () => lastError()?.text ?? null,
+    errorFor,
     startNotice,
     dismissStartNotice: () => setStartNotice(null),
     pendingConfirm,
 
     loadProfiles,
+    ensureProfiles,
     loadProfile,
     saveProfile,
     deleteProfile,
     loadChecks,
+    ensureChecks,
     loadL4Scope,
+    ensureL4Scope,
+    ensureJobs,
     previewSession,
     launch,
     confirmLaunch,

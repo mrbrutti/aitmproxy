@@ -66,9 +66,12 @@ const DEFAULT_TOOLS: string[] = [...SCAN_VERBS, 'l4.scope.list', 'scope.list', '
 const here = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = resolve(here, '../../../../../crates/aitm-scan-model/fixtures');
 
-/** A fresh parse per call: a test that mutates a reply cannot leak into the next one. */
-function fixture(name: string): unknown {
-  return JSON.parse(readFileSync(resolve(FIXTURES, `${name}.json`), 'utf8'));
+/**
+ * One fixture of the pack, by file name (`'scan.status.json'`), parsed fresh per call so a test
+ * that mutates a reply cannot leak into the next one. The one `fixture` every scanner test imports.
+ */
+export function fixture(name: string): unknown {
+  return JSON.parse(readFileSync(resolve(FIXTURES, name), 'utf8'));
 }
 
 const tool = (name: string): ToolDef => ({ name, description: `${name} (stub)`, inputSchema: { type: 'object' } });
@@ -100,7 +103,7 @@ export function stubApp(opts: StubOptions = {}) {
 
   /** The fixture a verb answers with when no test said otherwise. */
   function defaultReply(name: string): unknown {
-    if ((SCAN_VERBS as readonly string[]).includes(name)) return fixture(name);
+    if ((SCAN_VERBS as readonly string[]).includes(name)) return fixture(`${name}.json`);
     if (name === 'scope.list') return proxy.scope.map((s) => ({ host: s.host }));
     if (name === 'l4.scope.list' || name === 'flow.list') return [];
     return null;

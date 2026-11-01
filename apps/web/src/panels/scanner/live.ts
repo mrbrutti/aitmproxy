@@ -20,7 +20,7 @@ import { batch, createEffect, createSignal, untrack, type Accessor } from 'solid
 import { createStore } from 'solid-js/store';
 import type { AppStore } from '~/state/app';
 import type { BusState } from '~/bus/types';
-import { isLive, isStale } from './helpers';
+import { emptyRecord, isLive, isStale, own } from './helpers';
 import {
   ISSUES_LIMIT,
   JOB_NOTIFICATION_METHOD,
@@ -89,12 +89,23 @@ export const EMPTY_SITEMAP: SitemapPage = {
   loadedAt: null,
 };
 
+/**
+ * What `cancel` answers: the core's `cancelling` status, or why it did not cancel — the core's
+ * refusal text verbatim (`scan: not_found: …`), or the shape complaint. Never a rejection.
+ */
+export type CancelResult = { ok: true; status: JobStatus } | { ok: false; message: string };
+
 export interface LiveModel {
   jobs: Accessor<JobSummary[]>;
   jobsLoaded: Accessor<boolean>;
   jobsError: Accessor<string | null>;
   /** The last status the core gave for `job`, or `null` before the first read answered. */
   status: (job: string) => JobStatus | null;
+  /**
+   * Why the last `scan.status` read of `job` gave nothing: the core's refusal text verbatim, or
+   * the shape complaint. `null` while the last read answered (the held status is then current).
+   */
+  statusError: (job: string) => string | null;
   /** `null` until the first `scan.list` answered, then how many jobs are non-terminal. */
   liveCount: Accessor<number | null>;
   /** `null` is the "All jobs" page, which is its own page. */
@@ -106,7 +117,7 @@ export interface LiveModel {
   loadMoreIssues(job: string | null): Promise<void>;
   refreshSitemap(job: string): Promise<void>;
   loadMoreSitemap(job: string): Promise<void>;
-  cancel(job: string): Promise<JobStatus | null>;
+  cancel(job: string): Promise<CancelResult>;
   /** The Issues view tells the model which page to heartbeat while its job is live. */
   setIssuesMounted(job: string | null, mounted: boolean): void;
   /** After `scan.issue.update`: the detail replaces its row wherever that row is loaded. */
@@ -130,9 +141,11 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
   const [jobsLoaded, setJobsLoaded] = createSignal(false);
   const [jobsError, setJobsError] = createSignal<string | null>(null);
   const [liveCount, setLiveCount] = createSignal<number | null>(null);
-  const [statuses, setStatuses] = createStore<Record<string, JobStatus>>({});
-  const [issuePages, setIssuePages] = createStore<Record<string, IssuesPage>>({});
-  const [sitemapPages, setSitemapPages] = createStore<Record<string, SitemapPage>>({});
+  // Keyed by wire strings (job ids), so: no prototype, and every read through `own` (A5).
+  const [statuses, setStatuses] = createStore<Record<string, JobStatus>>(emptyRecord());
+  const [statusErrors, setStatusErrors] = createStore<Record<string, string | null>>(emptyRecord());
+  const [issuePages, setIssuePages] = createStore<Record<string, IssuesPage>>(emptyRecord());
+  const [sitemapPages, setSitemapPages] = createStore<Record<string, SitemapPage>>(emptyRecord());
 
   const lastSeq = new Map<string, number>();
   const statusTriggers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -146,8 +159,8 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
   let disposed = false;
 
   const issuesKey = (job: string | null): string => job ?? ALL_JOBS;
-  const issuesPage = (job: string | null): IssuesPage => issuePages[issuesKey(job)] ?? EMPTY_ISSUES;
-  const sitemapPage = (job: string): SitemapPage => sitemapPages[job] ?? EMPTY_SITEMAP;
+  const issuesPage = (job: string | null): IssuesPage => own(issuePages, issuesKey(job)) ?? EMPTY_ISSUES;
+  const sitemapPage = (job: string): SitemapPage => own(sitemapPages, job) ?? EMPTY_SITEMAP;
 
   function patchIssues(key: string, patch: Partial<IssuesPage>): void {
     setIssuePages(key, (prev: IssuesPage | undefined) => ({ ...(prev ?? EMPTY_ISSUES), ...patch }));
@@ -192,19 +205,31 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
    * last word and is always taken.
    */
   function applyStatus(next: JobStatus): void {
-    const held = statuses[next.job];
+    const held = own(statuses, next.job);
     if (held && isStale(held, next)) return;
     setStatuses(next.job, next);
   }
 
+  /**
+   * A failed read never touches the held status (a drifted or empty reply says nothing about the
+   * job), but it is not dropped either: `statusError(job)` carries the core's text until a read
+   * answers again, so a row can say why its counters stopped moving.
+   */
   async function refreshStatus(job: string): Promise<void> {
     if (disposed || !ready()) return;
     try {
       const next = parseJobStatus(await app.call<unknown>('scan.status', { job }));
-      // A drifted or empty reply says nothing about the job: what we hold stays.
-      if (!disposed && next) applyStatus(next);
-    } catch {
-      /* the next trigger or poll tick reads again */
+      if (disposed) return;
+      if (!next) {
+        setStatusErrors(job, shapeError('scan.status'));
+        return;
+      }
+      batch(() => {
+        applyStatus(next);
+        setStatusErrors(job, null);
+      });
+    } catch (e) {
+      if (!disposed) setStatusErrors(job, errorText(e));
     }
   }
 
@@ -224,7 +249,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
         patchIssues(key, { loading: false, error: shapeError('scan.issues') });
         return;
       }
-      const held = issuePages[key];
+      const held = own(issuePages, key);
       patchIssues(key, {
         rows: cursor !== null && held ? [...held.rows, ...parsed.issues] : parsed.issues,
         bySeverity: parsed.by_severity,
@@ -261,7 +286,7 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
         patchSitemap(job, { loading: false, error: shapeError('scan.sitemap') });
         return;
       }
-      const held = sitemapPages[job];
+      const held = own(sitemapPages, job);
       patchSitemap(job, {
         nodes: cursor !== null && held ? [...held.nodes, ...parsed.nodes] : parsed.nodes,
         points: cursor !== null && held ? [...held.points, ...parsed.points] : parsed.points,
@@ -285,24 +310,25 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
 
   /**
    * Two-step by contract: the reply is `cancelling`, the job turns `cancelled` later and the poll
-   * reads that. Total: a refusal answers `null` rather than rejecting, so a row's Cancel button
-   * cannot leave an unhandled rejection behind (the caller reports the `null`).
+   * reads that. Total: a refusal answers `{ ok: false, message }` with the core's text rather than
+   * rejecting, so a row's Cancel button cannot leave an unhandled rejection behind and the caller
+   * can show *why* (`scan: not_found: …` is not "cancel failed").
    */
-  async function cancel(job: string): Promise<JobStatus | null> {
-    if (disposed || !ready()) return null;
+  async function cancel(job: string): Promise<CancelResult> {
+    if (disposed || !ready()) return { ok: false, message: 'the bus is not open on a v2 core' };
     try {
       const next = parseJobStatus(await app.call<unknown>('scan.cancel', { job }));
-      if (!next) return null;
+      if (!next) return { ok: false, message: shapeError('scan.cancel') };
       applyStatus(next);
-      return next;
-    } catch {
-      return null;
+      return { ok: true, status: next };
+    } catch (e) {
+      return { ok: false, message: errorText(e) };
     }
   }
 
   function replaceIssueRow(issue: Issue): void {
     for (const key of Object.keys(issuePages)) {
-      const page = issuePages[key];
+      const page = own(issuePages, key);
       if (!page || !page.rows.some((r) => r.id === issue.id)) continue;
       setIssuePages(key, 'rows', (rows: IssueSummary[]) => rows.map((r) => (r.id === issue.id ? issue : r)));
     }
@@ -440,7 +466,8 @@ export function createLiveModel(app: AppStore, offered: Accessor<boolean>): Live
     jobs,
     jobsLoaded,
     jobsError,
-    status: (job: string) => statuses[job] ?? null,
+    status: (job: string) => own(statuses, job) ?? null,
+    statusError: (job: string) => own(statusErrors, job) ?? null,
     liveCount,
     issues: issuesPage,
     sitemap: sitemapPage,

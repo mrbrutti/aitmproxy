@@ -199,6 +199,8 @@ export interface CrawlCounters {
   forms_submitted: number;
   /** Crawl errors, a failed browser crawl among them (the client crawl then stands in). Absent → 0. */
   errors: number;
+  /** Forms the crawler saw but did not submit (`submit_forms: false`, or a form it would not fill). Absent → 0. */
+  forms_skipped: number;
 }
 
 export interface SkippedPoints {
@@ -392,7 +394,10 @@ export interface Evidence {
 
 export interface IssueSummary {
   id: string;
+  /** The job that first found the issue. */
   job: string;
+  /** Every job that found or re-found it, the first finder included. Absent on the wire → `[]`. */
+  jobs: string[];
   check_id: string;
   class: string;
   name: string;
@@ -672,13 +677,22 @@ function optStr(v: unknown): string | null {
   return typeof v === 'string' ? v : null;
 }
 
-/** A finite number, or `fallback`. `NaN`/`Infinity` would render as garbage, so they are rejected. */
+/**
+ * A finite, non-negative number, or `fallback`. Every integer on this wire is a counter, a size, a
+ * timestamp or a budget: `NaN`/`Infinity` would render as garbage and a negative one would step a
+ * counter below zero, so both are rejected (the signed timing statistics use `signed`).
+ */
 function num(v: unknown, fallback = 0): number {
-  return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
 function optNum(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
+}
+
+/** A finite number of either sign: a regression slope or a correlation coefficient. */
+function signed(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
 function bool(v: unknown, fallback = false): boolean {
@@ -789,6 +803,7 @@ function crawlCounters(v: unknown): CrawlCounters {
     depth: num(o.depth),
     forms_submitted: num(o.forms_submitted),
     errors: num(o.errors),
+    forms_skipped: num(o.forms_skipped),
   };
 }
 
@@ -1006,8 +1021,8 @@ function timing(v: unknown): Timing | null {
     requested_s: numList(o.requested_s),
     observed_ms: numList(o.observed_ms),
     baseline_ms: numList(o.baseline_ms),
-    slope: num(o.slope),
-    r: num(o.r),
+    slope: signed(o.slope),
+    r: signed(o.r),
   };
 }
 
@@ -1095,6 +1110,7 @@ function issueCore(raw: unknown): IssueSummary | null {
   return {
     id,
     job,
+    jobs: strList(o.jobs),
     check_id: str(o.check_id),
     class: str(o.class),
     name: str(o.name),
@@ -1427,6 +1443,23 @@ export function parseScanProfile(raw: unknown): ScanProfile | null {
       dry_run: bool(l.dry_run),
     },
   };
+}
+
+/** `scan.profile.save`: the saved name and where the core wrote it. */
+export function parseProfileSaveResult(raw: unknown): ProfileSaveResult | null {
+  const o = dict(raw);
+  if (!o) return null;
+  const saved = reqStr(o.saved);
+  const path = reqStr(o.path);
+  if (saved === null || path === null) return null;
+  return { saved, path };
+}
+
+/** `scan.profile.delete`: whether anything was deleted. */
+export function parseProfileDeleteResult(raw: unknown): ProfileDeleteResult | null {
+  const o = dict(raw);
+  if (!o || typeof o.deleted !== 'boolean') return null;
+  return { deleted: o.deleted };
 }
 
 /** `scan.session.preview`. Names only: the wire carries no session value (D7). */

@@ -27,6 +27,25 @@ import type {
 } from './model';
 import { SEVERITY_ORDER } from './model';
 
+/* ------------------------------------------------------------------ wire-keyed records */
+
+/**
+ * A record keyed by a wire string (a job id, a profile name, an issue id) must never answer from
+ * `Object.prototype`: `drafts['constructor']` is a function, not a draft. Every keyed read of such a
+ * record goes through here, and the record itself starts as `emptyRecord()` so a reactive read of
+ * an absent key is tracked instead of landing on the prototype.
+ */
+export function own<T>(record: Record<string, T>, key: string): T | undefined {
+  // The read comes first so a Solid store tracks the key even while it is absent.
+  const value = record[key];
+  return Object.hasOwn(record, key) ? value : undefined;
+}
+
+/** A record with no prototype at all, for `createStore` roots keyed by wire strings. */
+export function emptyRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
 /* ------------------------------------------------------------------ job state */
 
 const TERMINAL: readonly JobState[] = ['done', 'cancelled', 'failed'];

@@ -6,9 +6,6 @@
 // says the scanner found, reported or reproduced anything; acceptance for T8 is the live run
 // (`scripts/scan-live.mjs`), never this suite.
 
-import { readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -23,7 +20,9 @@ import {
   parseJobStatus,
   parseJobSummary,
   parseListResult,
+  parseProfileDeleteResult,
   parseProfileList,
+  parseProfileSaveResult,
   parseScanError,
   parseScanProfile,
   parseSessionProfile,
@@ -31,11 +30,7 @@ import {
   parseSitemapResult,
   parseStartResult,
 } from './model';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const FIXTURES = resolve(here, '../../../../../crates/aitm-scan-model/fixtures');
-
-const fixture = (name: string): unknown => JSON.parse(readFileSync(resolve(FIXTURES, name), 'utf8'));
+import { fixture } from './testkit';
 
 describe('parseJobStatus', () => {
   it('reads scan.status.json field for field', () => {
@@ -66,6 +61,22 @@ describe('parseJobStatus', () => {
     const status = parseJobStatus({ ...raw, crawl: { ...crawl, errors: 2 } });
     expect(status!.crawl.errors).toBe(2);
     expect(status!.crawl.pages).toBe(37);
+  });
+
+  it('crawl.forms_skipped is 0 when absent and read when present (engine contract A8)', () => {
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const crawl = raw.crawl as Record<string, unknown>;
+    expect(parseJobStatus(raw)!.crawl.forms_skipped).toBe(0);
+    expect(parseJobStatus({ ...raw, crawl: { ...crawl, forms_skipped: 3 } })!.crawl.forms_skipped).toBe(3);
+  });
+
+  it('a negative counter on the wire reads as 0, never as a negative number', () => {
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    const probes = raw.probes as Record<string, unknown>;
+    const status = parseJobStatus({ ...raw, probes: { ...probes, sent: -5 }, finished_at: -1 });
+    expect(status!.probes.sent).toBe(0);
+    expect(status!.finished_at).toBeNull();
+    expect(status!.probes.budget).toBe(2000);
   });
 
   it('reads scan.cancel.json as a cancelling job', () => {
@@ -160,6 +171,15 @@ describe('parseIssue', () => {
     const issue = parseIssue(fixture('scan.issue.update.json'));
     expect(issue!.status).toBe('false_positive');
     expect(issue!.note).toBe('intended behaviour');
+  });
+
+  it('issue.jobs: every finder of the issue; absent on the wire reads as [] (engine contract A8)', () => {
+    const raw = fixture('scan.issue.json') as Record<string, unknown>;
+    expect(parseIssue(raw)!.jobs).toEqual([]);
+    expect(parseIssueSummary(raw)!.jobs).toEqual([]);
+    const refound = parseIssue({ ...raw, jobs: ['scan-1a2b3c4d', 'scan-55667788'] })!;
+    expect(refound.jobs).toEqual(['scan-1a2b3c4d', 'scan-55667788']);
+    expect(refound.job).toBe('scan-1a2b3c4d');
   });
 });
 
@@ -419,5 +439,22 @@ describe('parseScanError', () => {
     for (const code of SCAN_ERROR_CODES) {
       expect(parseScanError(`scan: ${code}: detail`)).toEqual({ code, detail: 'detail' });
     }
+  });
+});
+
+describe('parseProfileSaveResult / parseProfileDeleteResult', () => {
+  it('reads scan.profile.save.json and scan.profile.delete.json', () => {
+    const saved = parseProfileSaveResult(fixture('scan.profile.save.json'));
+    expect(saved!.saved).toBe('my-api');
+    expect(saved!.path).toBe('/Users/operator/.aitmproxy/findings/scan/profiles/my-api.yaml');
+    expect(parseProfileDeleteResult(fixture('scan.profile.delete.json'))!.deleted).toBe(true);
+  });
+
+  it('garbage is null', () => {
+    expect(parseProfileSaveResult(null)).toBeNull();
+    expect(parseProfileSaveResult({ nope: 1 })).toBeNull();
+    expect(parseProfileSaveResult({ saved: 'x' })).toBeNull();
+    expect(parseProfileDeleteResult('x')).toBeNull();
+    expect(parseProfileDeleteResult({ deleted: 'yes' })).toBeNull();
   });
 });
