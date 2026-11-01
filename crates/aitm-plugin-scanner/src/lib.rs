@@ -9,6 +9,10 @@
 //! [`manual_check`] and [`commands`] its bus surface, and [`interim_lane`] the
 //! HTTP lane the engine runs until the `aitm-scan-http` lane crate lands.
 
+// The workspace lint already forbids `unsafe`; the attribute makes the
+// promise local to the crate that handles attacker-authored bytes.
+#![forbid(unsafe_code)]
+
 pub mod catalogue;
 pub mod checks;
 pub mod client;

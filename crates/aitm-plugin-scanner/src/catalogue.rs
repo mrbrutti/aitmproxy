@@ -100,7 +100,7 @@ pub fn assemble(
     let mut ordered: Vec<(String, Arc<dyn Check>)> = Vec::new();
 
     for lane in lanes {
-        let source = format!("lane:{}", lane_token(lane.lane()));
+        let source = format!("lane:{}", crate::util::wire_token(&lane.lane()));
         for check in lane.checks() {
             ordered.push((source.clone(), check));
         }
@@ -288,15 +288,6 @@ fn source_label(origin: &CheckOrigin) -> String {
         CheckOrigin::Bundled { path } => format!("bundled:{path}"),
         CheckOrigin::Custom { path } => format!("custom:{path}"),
     }
-}
-
-/// A lane's wire token (`http`, `ws`, `l4_packet`, `l4_stream`), taken from the
-/// model's serde representation so selectors and the wire never diverge.
-fn lane_token(lane: LaneKind) -> String {
-    serde_json::to_value(lane)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{lane:?}").to_lowercase())
 }
 
 /// The lane a `lane:<token>` selector names, or `None` for an unknown token.

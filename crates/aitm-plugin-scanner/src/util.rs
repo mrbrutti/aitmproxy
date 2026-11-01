@@ -73,6 +73,116 @@ pub fn scrub(text: &str) -> String {
     aitm_core::redact::scrub_text(text)
 }
 
+/// The serde wire token of a value, unquoted (`InsertionKind::Query` →
+/// `query`, `LaneKind::L4Packet` → `l4_packet`).
+///
+/// The one helper behind every enum-to-token in the engine, so a point id, a
+/// catalogue selector and an issue report can never spell a variant three
+/// ways. A value that serialises to something other than a string (a number,
+/// a map) is its JSON text; a value that cannot be serialised at all is empty,
+/// so no caller can panic on a model change.
+pub fn wire_token<T: serde::Serialize>(v: &T) -> String {
+    match serde_json::to_value(v) {
+        Ok(serde_json::Value::String(token)) => token,
+        Ok(other) => other.to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+/// The default port of the four schemes the engine knows an origin by, or
+/// `None` for anything else.
+pub fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    }
+}
+
+/// Split `host[:port]`, keeping a bracketed IPv6 literal intact. A tail that is
+/// not all digits, or does not fit a `u16`, is not a port: the authority is
+/// returned whole with `None`.
+pub fn split_authority(authority: &str) -> (&str, Option<u16>) {
+    let tail = match authority.rfind(']') {
+        Some(bracket) => &authority[bracket + 1..],
+        None => authority,
+    };
+    match tail.rsplit_once(':') {
+        Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            let cut = authority.len() - port.len() - 1;
+            (&authority[..cut], port.parse().ok())
+        }
+        _ => (authority, None),
+    }
+}
+
+/// The origin normal form over an already-split `(scheme, authority)`:
+/// `scheme://host[:port]`, lowercased, with the scheme's default port elided
+/// (`http`/`ws` 80, `https`/`wss` 443) and any other port kept.
+///
+/// No validation beyond that: this is for a flow the proxy already captured,
+/// whose scheme and authority are what they are. An operator-written origin
+/// goes through [`normalize_origin`], which refuses what is not an origin and
+/// then lands in exactly this form, so the two compare byte for byte.
+pub fn origin_key(scheme: &str, authority: &str) -> String {
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = authority.to_ascii_lowercase();
+    let (host, port) = split_authority(&authority);
+    match port {
+        Some(port) if Some(port) != default_port(&scheme) => format!("{scheme}://{host}:{port}"),
+        _ => format!("{scheme}://{host}"),
+    }
+}
+
+/// An operator-written origin in the one normal form ([`origin_key`]'s), or a
+/// message naming what made the input not an origin.
+///
+/// Accepted: `http`, `https`, `ws` and `wss`, a host (an IPv6 literal keeps
+/// its brackets), an optional port, an optional trailing slash, surrounding
+/// whitespace. The scheme and host are lowercased and the scheme's default
+/// port dropped, because `http://h:80` and `http://h` are one origin and the
+/// scanner must not treat them as two. Refused, naming the part: userinfo, a
+/// path, a query, a fragment, any other scheme, no scheme, no host — an origin
+/// carries none of those, and silently dropping one would scan something other
+/// than what the operator wrote.
+pub fn normalize_origin(input: &str) -> Result<String, String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err("an origin is required, but it was empty".to_string());
+    }
+    let url = url::Url::parse(raw).map_err(|e| format!("`{raw}` is not an origin: {e}"))?;
+    let scheme = url.scheme();
+    if default_port(scheme).is_none() {
+        return Err(format!(
+            "`{raw}` is not an origin: scheme `{scheme}` is not `http`, `https`, `ws` or `wss`"
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!("`{raw}` is not an origin: it carries userinfo"));
+    }
+    let host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| format!("`{raw}` is not an origin: it has no host"))?;
+    if !matches!(url.path(), "" | "/") {
+        return Err(format!(
+            "`{raw}` is not an origin: it has the path `{}`",
+            url.path()
+        ));
+    }
+    if url.query().is_some() {
+        return Err(format!("`{raw}` is not an origin: it has a query string"));
+    }
+    if url.fragment().is_some() {
+        return Err(format!("`{raw}` is not an origin: it has a fragment"));
+    }
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    Ok(origin_key(scheme, &authority))
+}
+
 /// Map a `serde_json::Value` onto the bus [`aitm_core::Value`].
 ///
 /// An integer stays an `Int`, any other number is a `Float`, and a number with
@@ -259,5 +369,112 @@ mod tests {
                 PathBuf::from(format!("findings/scan/{sub}"))
             );
         }
+    }
+
+    // ---- the one origin normal form (wave-2/3 quality fix) ------------------
+
+    /// The one normal form every module compares origins in: scheme and host
+    /// lowercased, the scheme's default port elided for all four schemes, an
+    /// explicit non-default port kept, an IPv6 literal's brackets kept, the
+    /// trailing slash dropped.
+    #[test]
+    fn normalize_origin_shape_table() {
+        let table = [
+            ("HTTP://Example.test:8080/", "http://example.test:8080"),
+            ("https://example.test/", "https://example.test"),
+            ("  http://example.test/  ", "http://example.test"),
+            ("http://h:80", "http://h"),
+            ("https://h:443", "https://h"),
+            ("ws://h:80", "ws://h"),
+            ("wss://h:443", "wss://h"),
+            ("ws://h:8081", "ws://h:8081"),
+            ("WSS://H:8443/", "wss://h:8443"),
+            ("https://h:80", "https://h:80"),
+            ("http://[::1]:8080", "http://[::1]:8080"),
+            ("https://[2001:DB8::1]:443", "https://[2001:db8::1]"),
+            ("http://[::1]", "http://[::1]"),
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+        ];
+        for (input, want) in table {
+            assert_eq!(
+                normalize_origin(input).as_deref(),
+                Ok(want),
+                "normalize_origin({input:?})"
+            );
+        }
+    }
+
+    /// What is not an origin is refused with a message naming the part that
+    /// made it one: userinfo, a path, a query, a fragment, an unknown scheme,
+    /// no scheme, no host, nothing at all.
+    #[test]
+    fn normalize_origin_refuses_non_origins_naming_the_part() {
+        let refused = [
+            ("http://u:p@h/", "userinfo"),
+            ("http://h/path", "path"),
+            ("http://h/?q=1", "query"),
+            ("http://h/#frag", "fragment"),
+            ("ftp://h", "scheme"),
+            ("http://", "host"),
+            ("", "empty"),
+        ];
+        for (input, part) in refused {
+            let err = normalize_origin(input).expect_err(input);
+            assert!(
+                err.contains(part),
+                "refusal for {input:?} does not name {part:?}: {err}"
+            );
+        }
+        assert!(
+            normalize_origin("example.test").is_err(),
+            "a bare host is not an origin"
+        );
+    }
+
+    /// `origin_key` is the same table over an already-split `(scheme,
+    /// authority)`, with no validation beyond lowercasing and port elision.
+    #[test]
+    fn origin_key_elides_default_ports_for_all_four_schemes() {
+        assert_eq!(origin_key("HTTPS", "Ex.test:443"), "https://ex.test");
+        assert_eq!(origin_key("http", "ex.test:80"), "http://ex.test");
+        assert_eq!(origin_key("ws", "ex.test:80"), "ws://ex.test");
+        assert_eq!(origin_key("wss", "ex.test:443"), "wss://ex.test");
+        assert_eq!(origin_key("http", "ex.test:443"), "http://ex.test:443");
+        assert_eq!(origin_key("http", "ex.test:8080"), "http://ex.test:8080");
+        assert_eq!(origin_key("http", "[::1]:80"), "http://[::1]");
+        assert_eq!(origin_key("http", "[::1]:8080"), "http://[::1]:8080");
+        assert_eq!(origin_key("http", "TARGET.TEST"), "http://target.test");
+        assert_eq!(
+            normalize_origin("HTTP://Target.Test:80/").as_deref(),
+            Ok(origin_key("http", "target.test").as_str()),
+            "a profile origin and a flow's authority meet in one form"
+        );
+    }
+
+    /// `split_authority` keeps a bracketed IPv6 literal whole and only reads a
+    /// port that is all digits.
+    #[test]
+    fn split_authority_handles_ipv6_and_odd_ports() {
+        assert_eq!(split_authority("h:8080"), ("h", Some(8080)));
+        assert_eq!(split_authority("h"), ("h", None));
+        assert_eq!(split_authority("[::1]:8080"), ("[::1]", Some(8080)));
+        assert_eq!(split_authority("[::1]"), ("[::1]", None));
+        assert_eq!(split_authority("h:"), ("h:", None));
+        assert_eq!(split_authority("h:abc"), ("h:abc", None));
+        assert_eq!(split_authority("h:99999"), ("h", None));
+    }
+
+    /// `wire_token` is the serde wire form of a value, unquoted: the one helper
+    /// behind every `<enum> → token` in the engine.
+    #[test]
+    fn wire_token_is_the_unquoted_serde_form() {
+        use aitm_scan_model::{InsertionKind, LaneKind};
+        assert_eq!(wire_token(&InsertionKind::Query), "query");
+        assert_eq!(wire_token(&InsertionKind::BodyParam), "body_param");
+        assert_eq!(wire_token(&LaneKind::Http), "http");
+        assert_eq!(wire_token(&LaneKind::L4Packet), "l4_packet");
+        assert_eq!(wire_token(&aitm_poc::Severity::High), "high");
+        assert_eq!(wire_token(&7u8), "7", "a non-string value is its JSON text");
+        assert_eq!(wire_token(&"plain"), "plain", "a string is not quoted");
     }
 }

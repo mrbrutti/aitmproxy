@@ -7,6 +7,10 @@
 //! Design: `docs/superpowers/specs/2026-10-27-aitmproxy-m3-rhai-scripting-design.md`.
 //! Every module is declared here up front so later tasks never re-touch this file.
 
+// The workspace lint already forbids `unsafe`; the attribute makes the
+// promise local to the crate that runs operator- and agent-authored scripts.
+#![forbid(unsafe_code)]
+
 pub mod catalog_assembly;
 pub mod check_bridge;
 pub mod command;

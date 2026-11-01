@@ -93,14 +93,16 @@ impl Reproduced {
 /// Reproduce `input`'s issue through its PoC hint and, when the PoC passes,
 /// record the finding (spec D6).
 ///
-/// `out_dir` is where the PoC artifacts are written (the system temp directory
-/// when `None`); the finding record itself goes to the configured
-/// `findings.dir`, as `record_finding` decides.
+/// `out_dir` is where the PoC artifacts are written (the worker passes
+/// `<findings.dir>/scan/pocs`); the finding record itself goes to the
+/// configured `findings.dir`, as `record_finding` decides. With `None` the
+/// reproduction is skipped with a `note`: a PoC — a working exploit of the
+/// operator's target — is never written under the system temp directory.
 ///
 /// Only an issue at `confidence >= firm` is reproduced — spec D6's floor — and
 /// only a hint that actually asserts something: an empty assertion list would
 /// make an `all: []` that matches vacuously, which would report a false
-/// positive. Either case spends no probe and returns a `note`.
+/// positive. Each of these cases spends no probe and returns a `note`.
 ///
 /// Errors only when the PoC cannot be built at all. A run that fails or errors,
 /// and a findings store that refuses the record, are reported in the returned
@@ -122,9 +124,15 @@ pub async fn reproduce_and_record(
             input.issue.check_id
         )));
     }
+    let Some(out_dir) = out_dir else {
+        return Ok(Reproduced::skipped(format!(
+            "issue {} was not reproduced: no PoC output directory is configured, \
+             and a PoC is never written under the system temp directory",
+            input.issue.id
+        )));
+    };
 
-    let runner =
-        StdPocRunner::with_output_dir(out_dir.map_or_else(std::env::temp_dir, |d| d.to_path_buf()));
+    let runner = StdPocRunner::with_output_dir(out_dir.to_path_buf());
 
     let poc = build(
         &input,
@@ -259,13 +267,12 @@ fn control_flow(flow: &HttpFlow, payload: &str, control: &str) -> Option<HttpFlo
     let in_body = match &out.request.body {
         Body::Bytes(bytes) => {
             let text = String::from_utf8_lossy(bytes);
-            match text.contains(payload) {
-                true => {
-                    let replaced = text.replace(payload, control).into_bytes();
-                    out.request.body = Body::Bytes(replaced);
-                    true
-                }
-                false => false,
+            if text.contains(payload) {
+                let replaced = text.replace(payload, control).into_bytes();
+                out.request.body = Body::Bytes(replaced);
+                true
+            } else {
+                false
             }
         }
         _ => false,
@@ -908,6 +915,9 @@ mod tests {
     #[tokio::test]
     async fn empty_hint_reproduces_nothing() {
         let findings = ScratchDir::new();
+        // An output directory is given so the skip below is the empty hint's,
+        // not the missing-directory skip of `no_out_dir_skips_the_poc_with_a_note`.
+        let artifacts = ScratchDir::new();
         let probe = probe_flow(&[], "q", MARK);
         let issue = issue(Confidence::Certain, &probe);
         let meta = meta();
@@ -929,7 +939,7 @@ mod tests {
                 started_by: &started,
             },
             &harness.host(),
-            None,
+            Some(artifacts.path()),
         )
         .await
         .expect("an empty hint is not an error");
@@ -938,6 +948,57 @@ mod tests {
         assert_eq!(out.finding_id, None);
         assert_eq!(client.sends(), 0, "no probe was spent");
         assert!(out.poc_ref.is_empty(), "no PoC was written");
+        assert!(
+            out.note
+                .as_deref()
+                .is_some_and(|n| n.contains("no assertion")),
+            "the skip is the empty hint's: {out:?}"
+        );
+    }
+
+    /// Wave-2/3 security fix: with no PoC output directory the reproduction is
+    /// skipped with a note — a PoC artefact is never written under the system
+    /// temp directory — and no probe is spent.
+    #[tokio::test]
+    async fn no_out_dir_skips_the_poc_with_a_note() {
+        let findings = ScratchDir::new();
+        let probe = probe_flow(&[], "q", MARK);
+        let issue = issue(Confidence::Firm, &probe);
+        let meta = meta();
+        let started = started_by();
+        let hint = PocHint {
+            assertions: vec![Assertion::word(MARK)],
+            control: None,
+        };
+        let client = StubClient::new(200, true);
+
+        let harness = Harness::new(Arc::clone(&client), Some(findings.path()));
+        let out = reproduce_and_record(
+            ReproductionInput {
+                issue: &issue,
+                hint: &hint,
+                probe_flow: &probe,
+                payload: MARK,
+                meta: &meta,
+                started_by: &started,
+            },
+            &harness.host(),
+            None,
+        )
+        .await
+        .expect("no output directory is not an error");
+
+        assert!(!out.passed, "nothing ran: {out:?}");
+        assert_eq!(out.finding_id, None);
+        assert!(out.poc_ref.is_empty(), "no PoC was written: {out:?}");
+        assert!(
+            out.note
+                .as_deref()
+                .is_some_and(|n| n.contains("output directory")),
+            "the note says why: {out:?}"
+        );
+        assert_eq!(client.sends(), 0, "no probe was spent");
+        assert!(findings.yaml_files().is_empty(), "no finding file");
     }
 
     // ---- tester additions ---------------------------------------------------

@@ -431,6 +431,15 @@ impl ProxyClient for JobClient {
             if self.meter.ladder_state(&host) == LadderState::Tripped {
                 return Err(anyhow::Error::new(ProbeRefused::HostLadder(host)));
             }
+            // A job that is already over spends nothing either: the deadline
+            // and the cancellation are read before a unit is charged, so a
+            // `Deadline`/`Cancelled` refusal never costs a probe.
+            if self.budget.cancel.is_cancelled() {
+                return Err(anyhow::Error::new(ProbeRefused::Cancelled));
+            }
+            if Instant::now() >= self.budget.deadline {
+                return Err(anyhow::Error::new(ProbeRefused::Deadline));
+            }
             if !self.budget.charge(1) {
                 return Err(anyhow::Error::new(ProbeRefused::Budget));
             }
@@ -470,10 +479,15 @@ impl ProxyClient for JobClient {
                     Some(GuardError::RateLimited { retry_after }) => {
                         if attempt >= MAX_RATE_RETRIES {
                             // Paced as long as the job can afford to: hand the
-                            // guard's refusal back rather than keep the lane
-                            // spinning on one point.
+                            // guard's refusal back, typed like every other
+                            // guard refusal, rather than keep the lane spinning
+                            // on one point.
                             self.meter.errors.fetch_add(1, Ordering::SeqCst);
-                            return Err(err);
+                            return Err(anyhow::Error::new(ProbeRefused::Guard(
+                                GuardError::RateLimited {
+                                    retry_after: *retry_after,
+                                },
+                            )));
                         }
                         self.meter.rate_waits.fetch_add(1, Ordering::SeqCst);
                         let wait = (*retry_after).min(MAX_AWAIT);
@@ -499,7 +513,10 @@ impl ProxyClient for JobClient {
                     }
                     Some(GuardError::HostDisabled) => {
                         // The proxy's own per-host breaker already fired: the
-                        // job's ladder agrees and stops probing this host.
+                        // job's ladder agrees and stops probing this host. It
+                        // is still a probe that got no answer, so it counts in
+                        // `errors` like every other refusal.
+                        self.meter.errors.fetch_add(1, Ordering::SeqCst);
                         self.meter.record(&host, false, &self.per_host);
                         return Err(anyhow::Error::new(ProbeRefused::HostLadder(host)));
                     }
@@ -1149,8 +1166,16 @@ mod tests {
             .send(req_to("ex.test"))
             .await
             .expect_err("a host that never stops rate limiting is given up on");
-        // The wave-2/3 quality fix may wrap the guard's refusal in a typed
-        // `ProbeRefused`; either way the text must name the rate limit.
+        // Wave-2/3 quality fix: the exhausted pacer hands back the typed
+        // `ProbeRefused::Guard`, like every other guard refusal, and the text
+        // still names the rate limit.
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Guard(GuardError::RateLimited {
+                retry_after: Duration::from_millis(1),
+            })),
+            "not the typed guard refusal: {err}"
+        );
         assert!(
             err.to_string().contains("rate limited"),
             "the refusal names the rate limit: {err}"
@@ -1233,8 +1258,8 @@ mod tests {
 
     /// A guard refusal other than a rate limit is a typed `ProbeRefused::Guard`
     /// counted once; the proxy's own `HostDisabled` breaker is answered as a
-    /// `HostLadder` refusal and marks the host's ladder without being counted
-    /// as a transport error.
+    /// `HostLadder` refusal, marks the host's ladder and (wave-2/3 quality
+    /// fix) counts in `errors` like every other probe that got no answer.
     #[tokio::test]
     async fn guard_refusals_are_typed_and_host_disabled_is_a_ladder_refusal() {
         let stub = StubClient::new(vec![
@@ -1282,6 +1307,11 @@ mod tests {
             "{err}"
         );
         assert_eq!(stub.calls(), 2);
+        assert_eq!(
+            meter.errors.load(Ordering::SeqCst),
+            2,
+            "a `HostDisabled` refusal is a probe without an answer: counted"
+        );
 
         // Not tripped by the lenient rules, so the next probe still reaches the
         // sender: `HostDisabled` agrees with the ladder but does not force it.
@@ -1332,7 +1362,8 @@ mod tests {
     }
 
     /// A deadline that has already passed, or a token already cancelled,
-    /// refuses without polling the sender at all.
+    /// refuses without polling the sender at all — and (wave-2/3 fix) without
+    /// spending a budget unit: the probe was never going to be sent.
     #[tokio::test]
     async fn an_expired_deadline_or_cancelled_job_refuses_without_sending() {
         let stub = StubClient::new(vec![Outcome::Ok(200)]);
@@ -1344,7 +1375,7 @@ mod tests {
         let client = JobClient::new(
             stub.clone(),
             "scan-1a2b3c4d",
-            expired,
+            Arc::clone(&expired),
             Arc::new(ProbeMeter::default()),
             RecordProbes::IssuesOnly,
             HttpVersionPolicy::Auto,
@@ -1359,18 +1390,20 @@ mod tests {
             Some(&ProbeRefused::Deadline)
         );
         assert_eq!(stub.calls(), 0, "nothing is sent after the deadline");
+        assert_eq!(expired.spent(), 0, "a deadline refusal spends no budget");
 
         let cancel = CancellationToken::new();
         cancel.cancel();
         let stub = StubClient::new(vec![Outcome::Sleep(Duration::from_secs(5))]);
+        let cancelled_budget = Arc::new(JobBudget::new(
+            10,
+            Instant::now() + Duration::from_secs(60),
+            cancel,
+        ));
         let client = JobClient::new(
             stub.clone(),
             "scan-1a2b3c4d",
-            Arc::new(JobBudget::new(
-                10,
-                Instant::now() + Duration::from_secs(60),
-                cancel,
-            )),
+            Arc::clone(&cancelled_budget),
             Arc::new(ProbeMeter::default()),
             RecordProbes::IssuesOnly,
             HttpVersionPolicy::Auto,
@@ -1389,6 +1422,12 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "a pre-cancelled job must not wait on the sender: {:?}",
             started.elapsed()
+        );
+        assert_eq!(stub.calls(), 0, "nothing is sent after a cancel");
+        assert_eq!(
+            cancelled_budget.spent(),
+            0,
+            "a cancel refusal spends no budget"
         );
     }
 

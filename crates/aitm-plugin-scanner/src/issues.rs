@@ -20,7 +20,6 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::fmt;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -29,7 +28,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::Context;
-use serde::Serialize;
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
@@ -37,15 +35,17 @@ use aitm_scan_model::{
     IssueStatus, IssueTarget, IssuesResult, JobId, L4Transport, LaneKind, ScanErrorCode,
 };
 
-use crate::util::{issue_id, scan_dir, scrub};
+use crate::util::{issue_id, normalize_origin, origin_key, scan_dir, scrub, wire_token};
 
-/// The separator between the fields of a dedupe key's preimage: the ASCII unit
-/// separator, which no field of a URL, a header name or a grammar path carries,
-/// so no two different tuples can share a preimage.
+/// The separator between the fields of a dedupe key's preimage. Every field is
+/// length-prefixed (see [`field`]), so the boundaries are fixed by the lengths
+/// and the separator is only there to keep the preimage readable.
 const FIELD_SEP: &str = "\u{1f}";
 
 /// How an absent optional field is written into a key preimage, and how an
-/// absent method reads in a rendered location.
+/// absent method reads in a rendered location. A *present* optional field is
+/// written `+<len>:<bytes>` (see [`optional`]), so `None` and `Some("-")` can
+/// never share a preimage.
 const ABSENT: &str = "-";
 
 /// The largest page [`IssueStore::query`] returns, whatever the caller asks for
@@ -129,10 +129,16 @@ pub enum DedupeInput<'a> {
 }
 
 /// The spec D6 dedupe key: the blake3 hex digest of the variant tag and every
-/// field, joined by [`FIELD_SEP`], with an absent option written [`ABSENT`].
+/// field, each length-prefixed ([`field`]), an absent option written
+/// [`ABSENT`] and a present one tagged ([`optional`]), joined by [`FIELD_SEP`].
 ///
 /// The tag is part of the preimage so a passive key and an HTTP key over the
-/// same origin can never collide.
+/// same origin can never collide; the length prefixes mean no field's bytes —
+/// a separator in a path, an empty name — can shift the boundaries between
+/// fields, so two different tuples can never share a preimage.
+///
+/// The preimage layout is the store format of every issue file's key: a
+/// change here moves every pinned key (`dedupe_key_is_pinned_across_process_runs_and_variants_never_collide`).
 pub fn dedupe_key(input: &DedupeInput<'_>) -> String {
     let fields: Vec<String> = match input {
         DedupeInput::Http {
@@ -146,15 +152,15 @@ pub fn dedupe_key(input: &DedupeInput<'_>) -> String {
             name,
             field_path,
         } => vec![
-            "http".to_string(),
-            (*class).to_string(),
-            (*scheme).to_string(),
-            (*host).to_string(),
-            port.to_string(),
-            (*method).to_string(),
-            (*path_template).to_string(),
-            variant_token(kind),
-            (*name).to_string(),
+            field("http"),
+            field(class),
+            field(scheme),
+            field(host),
+            field(&port.to_string()),
+            field(method),
+            field(path_template),
+            field(&wire_token(kind)),
+            field(name),
             optional(*field_path),
         ],
         DedupeInput::Passive {
@@ -163,11 +169,11 @@ pub fn dedupe_key(input: &DedupeInput<'_>) -> String {
             host,
             port,
         } => vec![
-            "passive".to_string(),
-            (*class).to_string(),
-            (*scheme).to_string(),
-            (*host).to_string(),
-            port.to_string(),
+            field("passive"),
+            field(class),
+            field(scheme),
+            field(host),
+            field(&port.to_string()),
         ],
         DedupeInput::L4 {
             class,
@@ -178,11 +184,11 @@ pub fn dedupe_key(input: &DedupeInput<'_>) -> String {
             field_path,
             mutation_class,
         } => vec![
-            "l4".to_string(),
-            (*class).to_string(),
-            (*ip).to_string(),
-            port.to_string(),
-            variant_token(proto),
+            field("l4"),
+            field(class),
+            field(ip),
+            field(&port.to_string()),
+            field(&wire_token(proto)),
             optional(*grammar),
             optional(*field_path),
             optional(*mutation_class),
@@ -193,21 +199,48 @@ pub fn dedupe_key(input: &DedupeInput<'_>) -> String {
         .to_string()
 }
 
-/// An optional key field as it is written into a preimage.
-fn optional(value: Option<&str>) -> String {
-    value.unwrap_or(ABSENT).to_string()
+/// A key field as it is written into a preimage: `<len>:<bytes>`, so the
+/// field's own bytes can never be read as a boundary.
+fn field(value: &str) -> String {
+    format!("{}:{value}", value.len())
 }
 
-/// The wire token of a fieldless enum (`InsertionKind::Query` → `query`).
-///
-/// Every such enum in the model serialises to a string, so the `Debug` arm is
-/// unreachable; it is there so this helper cannot fail and no key computation
-/// can panic on a model change.
-fn variant_token<T: Serialize + fmt::Debug>(value: &T) -> String {
-    match serde_json::to_value(value) {
-        Ok(serde_json::Value::String(token)) => token,
-        _ => format!("{value:?}"),
+/// An optional key field as it is written into a preimage: [`ABSENT`] for
+/// `None`, `+<len>:<bytes>` for `Some`, so `None` and `Some("-")` differ.
+fn optional(value: Option<&str>) -> String {
+    match value {
+        None => ABSENT.to_string(),
+        Some(value) => format!("+{}", field(value)),
     }
+}
+
+/// Whether `id` has the spec D6 shape `issue-<8 lowercase hex>` — the only
+/// shape an issue id is trusted as a file name in.
+fn is_issue_id(id: &str) -> bool {
+    id.strip_prefix("issue-").is_some_and(|hex| {
+        hex.len() == 8
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// One interpolated field of the Markdown report, rendered *inline*: scrubbed,
+/// every `\r`/`\n` collapsed to a space so a field cannot start a line (a
+/// heading, a list item) of its own, and every backtick escaped so it cannot
+/// close the code span it is quoted in. Every attacker-reachable string in
+/// `issues_md` goes through here.
+fn md_inline(text: &str) -> String {
+    let scrubbed = scrub(text);
+    let mut out = String::with_capacity(scrubbed.len());
+    for ch in scrubbed.chars() {
+        match ch {
+            '\r' | '\n' => out.push(' '),
+            '`' => out.push_str("\\`"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// What a lane or check hands the store: an issue without the fields the store
@@ -403,6 +436,19 @@ impl IssueStore {
                 .map(str::to_string);
             let issue: Issue = serde_json::from_value(value)
                 .with_context(|| format!("parse {}", path.display()))?;
+            // The id names the file every later write goes to, so it is
+            // trusted only when it *is* this file's name: `issue-<8 hex>` and
+            // equal to the stem. Anything else (`../../x`, another issue's id)
+            // is refused here rather than written somewhere later.
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !is_issue_id(&issue.id) || issue.id != stem {
+                anyhow::bail!(
+                    "refusing {}: its id `{}` is not the file's name \
+                     (an issue id is `issue-<8 hex>` and names its own file)",
+                    path.display(),
+                    scrub(&issue.id)
+                );
+            }
             if let Some(key) = key {
                 inner.by_key.insert(key, issue.id.clone());
             }
@@ -639,26 +685,28 @@ impl IssueStore {
         let mut out = String::new();
         for issue in sorted(&inner, &filter) {
             // `write!` to a `String` cannot fail; the result is discarded
-            // deliberately rather than unwrapped.
+            // deliberately rather than unwrapped. Every string the target or
+            // a check authored goes through `md_inline`, so it can only ever
+            // be text inside its line.
             let _ = writeln!(
                 out,
                 "## {} {}\n",
-                variant_token(&issue.severity),
-                scrub(&issue.name)
+                wire_token(&issue.severity),
+                md_inline(&issue.name)
             );
-            let _ = writeln!(out, "- Target: {}", scrub(&origin_of(&issue.target)));
+            let _ = writeln!(out, "- Target: {}", md_inline(&origin_of(&issue.target)));
             let _ = writeln!(
                 out,
                 "- Location: {}",
-                scrub(&location_line(&issue.location))
+                md_inline(&location_line(&issue.location))
             );
-            let _ = writeln!(out, "- Confidence: {}", variant_token(&issue.confidence));
+            let _ = writeln!(out, "- Confidence: {}", wire_token(&issue.confidence));
             let _ = writeln!(out, "- Occurrences: {}", issue.occurrences);
             if let Some(payload) = &issue.evidence.payload {
-                let _ = writeln!(out, "- Payload: `{}`", scrub(payload));
+                let _ = writeln!(out, "- Payload: `{}`", md_inline(payload));
             }
             if let Some(matched) = &issue.evidence.matched {
-                let _ = writeln!(out, "- Matched: `{}`", scrub(matched));
+                let _ = writeln!(out, "- Matched: `{}`", md_inline(matched));
             }
             out.push('\n');
         }
@@ -841,30 +889,24 @@ fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
-/// An issue target as the operator writes an origin: `scheme://host`, with the
-/// port kept when it is not the scheme's default (the `normalize_origin` form).
+/// An issue target as the operator writes an origin: the one normal form of
+/// [`origin_key`] (`scheme://host`, the port kept when it is not the scheme's
+/// default).
 fn origin_of(target: &IssueTarget) -> String {
-    let default_port = match target.scheme.as_str() {
-        "https" | "wss" => Some(443),
-        "http" | "ws" => Some(80),
-        _ => None,
-    };
-    if default_port == Some(target.port) {
-        format!("{}://{}", target.scheme, target.host)
-    } else {
-        format!("{}://{}:{}", target.scheme, target.host, target.port)
-    }
+    origin_key(&target.scheme, &format!("{}:{}", target.host, target.port))
 }
 
-/// Whether `want` names this issue's origin: the normalized origin, the same
-/// origin with the port spelled out, or the bare host.
+/// Whether `want` names this issue's origin: any spelling of the origin that
+/// normalizes to it (case, a trailing slash, the default port spelled out), or
+/// the bare host.
 fn target_matches(target: &IssueTarget, want: &str) -> bool {
-    let want = want.trim_end_matches('/').to_ascii_lowercase();
-    let scheme = target.scheme.to_ascii_lowercase();
-    let host = target.host.to_ascii_lowercase();
-    want == origin_of(target).to_ascii_lowercase()
-        || want == format!("{scheme}://{host}:{}", target.port)
-        || want == host
+    match normalize_origin(want) {
+        Ok(wanted) => wanted == origin_of(target),
+        Err(_) => want
+            .trim()
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(&target.host),
+    }
 }
 
 /// One issue location on one line of the report.
@@ -873,7 +915,7 @@ fn location_line(location: &IssueLocation) -> String {
     let mut line = format!(
         "{method} {} [{}] {}",
         location.path,
-        variant_token(&location.kind),
+        wire_token(&location.kind),
         location.name
     );
     if let Some(l4) = &location.l4 {
@@ -881,7 +923,7 @@ fn location_line(location: &IssueLocation) -> String {
             " ({}:{} {})",
             l4.ip,
             l4.port,
-            variant_token(&l4.proto)
+            wire_token(&l4.proto)
         ));
     }
     line.trim_end().to_string()
@@ -1528,6 +1570,50 @@ mod tests {
         assert!(!store.render_issues_md(Some("https://t.example")).is_empty());
     }
 
+    /// Wave-2/3 security fix: attacker-controlled text is rendered *inline*. A
+    /// path carrying a decoded `%0A## Critical` cannot open a heading of its
+    /// own, a carriage return cannot split a line, and a backtick in `matched`
+    /// cannot close the code span it is quoted in.
+    #[test]
+    fn issues_md_keeps_attacker_text_inline() {
+        let store = IssueStore::new(None);
+        let mut issue = new_issue("a", "q");
+        issue.location.path = "/search\n## Critical injected heading\r\n- Target: evil".into();
+        issue.location.path_template = issue.location.path.clone();
+        issue.evidence = Evidence {
+            matched: Some("x`y".into()),
+            ..Evidence::default()
+        };
+        store.upsert(issue, 100).expect("upsert");
+
+        let md = store.render_issues_md(None);
+
+        assert!(
+            md.lines().all(|line| !line.starts_with("## Critical")),
+            "an injected heading survived: {md}"
+        );
+        // The injected text is kept, inline, so substring counts are 2 by
+        // design; what must hold is that it never *starts* a line.
+        assert_eq!(
+            md.lines().filter(|line| line.starts_with("## ")).count(),
+            1,
+            "exactly one heading line: {md}"
+        );
+        assert_eq!(
+            md.lines()
+                .filter(|line| line.starts_with("- Target:"))
+                .count(),
+            1,
+            "exactly one target line: {md}"
+        );
+        assert!(!md.contains('\r'), "a carriage return survived: {md:?}");
+        assert!(md.contains("x\\`y"), "the backtick was not escaped: {md}");
+        assert!(
+            md.contains("Critical injected heading"),
+            "the text itself is kept, inline: {md}"
+        );
+    }
+
     // ---- tester additions ---------------------------------------------------
 
     /// Spec D6: the key is a function of its inputs alone, so two processes
@@ -1535,7 +1621,12 @@ mod tests {
     /// below was computed once and is pinned; a change to the preimage layout
     /// is a store-format change and must fail here. The three variants over
     /// one origin never collide, and an absent optional field is distinct from
-    /// a present one.
+    /// a present one — including a present one that is literally `-`.
+    ///
+    /// Re-pinned once, by the wave-2/3 fix task (2026-11-01), when every field
+    /// became length-prefixed and present optionals tagged (`040b6604…` →
+    /// `56695f37…`); the store had not shipped, so no issue file carried the
+    /// old key.
     #[test]
     fn dedupe_key_is_pinned_across_process_runs_and_variants_never_collide() {
         let http = DedupeInput::Http {
@@ -1551,7 +1642,7 @@ mod tests {
         };
         assert_eq!(
             dedupe_key(&http),
-            "040b66044ef445e40f5f6fe1fb541d2ba8c2294626ce84b409f0927998d5f403",
+            "56695f37dedad95835a19d7c75ce78d7ffe7edf4d8173e062396d56f25ab32a7",
             "the pinned HTTP key moved: the preimage layout changed"
         );
 
@@ -1597,6 +1688,11 @@ mod tests {
             dedupe_key(&http),
             dedupe_key(&variant("reflected-xss", "GET", Some("user.name"))),
             "a present field path is distinct from an absent one"
+        );
+        assert_ne!(
+            dedupe_key(&http),
+            dedupe_key(&variant("reflected-xss", "GET", Some("-"))),
+            "a field path that is literally `-` is distinct from an absent one"
         );
         assert_ne!(
             dedupe_key(&http),
@@ -1840,6 +1936,57 @@ mod tests {
             reloaded.load().expect("non-json files are ignored"),
             1,
             "only `*.json` issue files count"
+        );
+    }
+
+    /// Wave-2/3 security fix: an id read from disk is trusted as a file name
+    /// only when it *is* the file's name — `issue-<8 hex>` and equal to the
+    /// stem. A file whose JSON `id` says `../../x`, or names another issue's
+    /// file, is refused naming the file; the honest file still loads.
+    #[test]
+    fn load_refuses_an_issue_whose_id_disagrees_with_its_file() {
+        let dir = TempDir::new();
+        let store = IssueStore::new(Some(dir.path()));
+        let id = store
+            .upsert(new_issue("a", "q"), 100)
+            .expect("upsert")
+            .issue()
+            .id
+            .clone();
+        let text = std::fs::read_to_string(dir.issue_file(&id)).expect("read the issue file");
+
+        std::fs::write(
+            dir.issue_file("issue-deadbeef"),
+            text.replace(&id, "../../x"),
+        )
+        .expect("seed a traversal id");
+        let err = IssueStore::new(Some(dir.path()))
+            .load()
+            .expect_err("a traversal id is refused");
+        assert!(
+            format!("{err:#}").contains("issue-deadbeef.json"),
+            "the error names the file: {err:#}"
+        );
+
+        std::fs::write(
+            dir.issue_file("issue-deadbeef"),
+            text.replace(&id, "issue-cafebabe"),
+        )
+        .expect("seed a well-shaped id that is not this file's");
+        let err = IssueStore::new(Some(dir.path()))
+            .load()
+            .expect_err("an id that is not the file's stem is refused");
+        assert!(
+            format!("{err:#}").contains("issue-deadbeef.json"),
+            "the error names the file: {err:#}"
+        );
+
+        std::fs::remove_file(dir.issue_file("issue-deadbeef")).expect("remove it");
+        assert_eq!(
+            IssueStore::new(Some(dir.path()))
+                .load()
+                .expect("the honest file loads"),
+            1
         );
     }
 }

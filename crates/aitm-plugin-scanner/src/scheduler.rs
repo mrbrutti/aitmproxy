@@ -175,6 +175,9 @@ pub fn plan(
         );
 
         let mut session_blocked = false;
+        // `skipped.frequent` counts points, like `skipped.ignored`, so a point
+        // losing three heavy checks to the frequent rule is one skipped point.
+        let mut frequent_dropped = false;
         for check in checks {
             let meta = check.meta();
 
@@ -196,7 +199,7 @@ pub fn plan(
                 }
             }
             if frequent && meta.cost != CheckCost::Light {
-                out.skipped.frequent += 1;
+                frequent_dropped = true;
                 continue;
             }
             if let Some(key) = scope_key(meta, point, node) {
@@ -217,6 +220,9 @@ pub fn plan(
             }
         }
 
+        if frequent_dropped {
+            out.skipped.frequent += 1;
+        }
         if session_blocked {
             out.skipped.ignored += 1;
         }
@@ -482,6 +488,28 @@ mod tests {
             .frequent
             .contains(&(InsertionKind::Query, "q".to_string())));
         assert_eq!(out.skipped.ignored, 0);
+    }
+
+    /// Wave-2/3 quality fix: `skipped.frequent` counts *points*, like
+    /// `skipped.ignored`, not the items dropped from them — one frequent point
+    /// losing three medium checks is one skipped point, not three.
+    #[test]
+    fn frequent_is_counted_once_per_point() {
+        let checks = vec![
+            check("M1", |m| m.cost = CheckCost::Medium),
+            check("M2", |m| m.cost = CheckCost::Medium),
+            check("M3", |m| m.cost = CheckCost::Medium),
+        ];
+        let mut frequent = point("p0", "q");
+        frequent.frequency = 9;
+
+        let out = plan(&[frequent], &[], &checks, &ScanProfile::default());
+
+        assert!(out.active.is_empty(), "{:?}", ids(&out.active));
+        assert_eq!(out.skipped.frequent, 1, "one point, however many items");
+        assert!(out
+            .frequent
+            .contains(&(InsertionKind::Query, "q".to_string())));
     }
 
     /// Spec D4 ("skip checks unlikely to be effective"): `wants_traits` must

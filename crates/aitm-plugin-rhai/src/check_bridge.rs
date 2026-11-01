@@ -148,8 +148,17 @@ impl Check for ScriptCheck {
                      (ProbeHost::shared returned none)",
                 );
             };
+            // The same holds for the client: a closure's `http.send` must go
+            // through the job's budgeted client (spec D9.3), so a host that
+            // lends none is the same wiring bug, and nothing runs on the
+            // unbudgeted namespace client in its place.
+            let Some(client) = host.client() else {
+                return error_verdict(
+                    "the engine must hand a budgeted client to a script check \
+                     (ProbeHost::client returned none)",
+                );
+            };
             let check_timeout = Duration::from_secs(host.profile().budget.check_timeout_s);
-            let client = host.client();
             // A closure that names anything outside itself — `probe`, a script
             // constant — is curried by rhai with those values, so the call must
             // lead with the curry and end with the point, exactly as a script
@@ -191,10 +200,7 @@ impl Check for ScriptCheck {
                 // Inside a job the closure's own `http.send` goes through the
                 // job's client, so scope, rate, marks and the record policy
                 // apply to a script's sends too (spec D9.3).
-                let result = match client {
-                    Some(client) => with_client(client, call),
-                    None => call(),
-                };
+                let result = with_client(client, call);
 
                 match result {
                     Ok(value) => verdict_from_dynamic(&value),

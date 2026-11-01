@@ -20,11 +20,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aitm_core::{
-    Body, Flow, FlowId, FlowStore, HttpFlow, HttpRequest, ProxyClient, RecordPolicy, SendOptions,
+    Body, Flow, FlowId, FlowKind, FlowQuery, FlowStore, HttpFlow, HttpRequest, ProxyClient,
+    RecordPolicy, SendOptions,
 };
 use aitm_scan_model::{Canary, CanaryMethod, FlowRef, SessionMaterial, SessionProfile};
 
 use crate::discover::is_secret_name;
+use crate::util::{normalize_origin, origin_key, split_authority};
 
 /// How many probes pass between two canary sends (spec D7).
 pub const CANARY_EVERY: u32 = 25;
@@ -71,16 +73,27 @@ pub fn pick_observed(
     origin: &str,
     from_flow: Option<FlowId>,
 ) -> Option<ObservedSession> {
-    let wanted = normalize_origin(origin);
+    let wanted = normalize_origin(origin).ok()?;
 
+    // The store narrows by host, kind and replay first, so only this host's
+    // captured HTTP flows are cloned out; the origin check (scheme and port)
+    // runs on those alone.
+    let authority = wanted
+        .split_once("://")
+        .map_or(wanted.as_str(), |(_, authority)| authority);
+    let (host, _) = split_authority(authority);
     let mut candidates: Vec<HttpFlow> = store
-        .list()
+        .query(&FlowQuery {
+            host: Some(host.to_string()),
+            kind: Some(FlowKind::Http),
+            is_replay: Some(false),
+            ..FlowQuery::default()
+        })
         .into_iter()
         .filter_map(|id| match store.get(id) {
             Some(Flow::Http(flow)) => Some(flow),
             _ => None,
         })
-        .filter(|flow| !flow.metadata.is_replay)
         .filter(|flow| origin_of(&flow.request) == wanted)
         .filter(|flow| has_material(&material_of(&flow.request)))
         .collect();
@@ -304,23 +317,10 @@ fn cookie_pairs(header: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A request's origin, normalised for comparison.
+/// A request's origin in the one normal form, so `HTTP://Ex.test:80/` in a
+/// profile and `Ex.test:80` in a captured request are one origin.
 fn origin_of(req: &HttpRequest) -> String {
-    normalize_origin(&format!("{}://{}", req.scheme, req.authority))
-}
-
-/// Lowercase an origin and drop a trailing slash and the scheme's default port,
-/// so `HTTP://Ex.test:80/` and `http://ex.test` are one origin.
-fn normalize_origin(origin: &str) -> String {
-    let lower = origin.trim_end_matches('/').to_ascii_lowercase();
-    for (scheme, port) in [("http://", ":80"), ("https://", ":443")] {
-        if lower.starts_with(scheme) {
-            if let Some(stripped) = lower.strip_suffix(port) {
-                return stripped.to_string();
-            }
-        }
-    }
-    lower
+    origin_key(&req.scheme, &req.authority)
 }
 
 /// A capture time as epoch milliseconds, the scanner's timestamp unit. A clock

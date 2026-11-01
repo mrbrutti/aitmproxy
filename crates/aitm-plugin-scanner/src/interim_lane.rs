@@ -42,10 +42,11 @@ use futures::future::BoxFuture;
 use tokio::sync::OnceCell;
 
 use crate::checks::CheckDefinition;
+use crate::client::ProbeRefused;
 use crate::config::ScannerConfig;
 use crate::discover::{is_secret_name, InjectionPoint, Location};
 use crate::scheduler::payload_cap;
-use crate::util::scrub;
+use crate::util::{default_port, normalize_origin, origin_key, scrub, split_authority, wire_token};
 
 /// The mark every crawl capture carries beside `scan:<job>` (spec D5).
 const CRAWL_MARK: &str = "crawl";
@@ -74,16 +75,29 @@ impl InterimHttpLane {
     /// navigation added to the store (spec D5, "Crawl flows are different").
     ///
     /// Degrades rather than failing: no browser, `use_browser: never`,
-    /// `max_pages: 0` or a crawl refusal all leave the store untouched and the
-    /// discovery pass continues over what the proxy already captured.
-    async fn crawl_origin(&self, origin: &str, job: &dyn JobCtx) {
+    /// `max_pages: 0`, a spent budget or a crawl refusal all leave the store
+    /// untouched and the discovery pass continues over what the proxy already
+    /// captured. A crawl the crawler *refused* (the seed out of scope, a
+    /// malformed origin) is returned as its reason, so the caller can say why
+    /// discovery ran on captures alone; every other case is `None`.
+    ///
+    /// Spec D5 "one budget per job": a navigation is a probe. The crawler's
+    /// `max_pages` is capped by what the budget has left *before* it starts,
+    /// so the crawl can never outrun the probes budget, and the pages it did
+    /// navigate are charged afterwards. Should that charge be refused (another
+    /// lane spent the budget meanwhile), whatever is left is drained: the
+    /// navigations happened and the budget must say so.
+    async fn crawl_origin(&self, origin: &str, job: &dyn JobCtx) -> Option<String> {
         let profile = job.profile();
         if profile.crawl.max_pages == 0 || profile.crawl.use_browser == UseBrowser::Never {
-            return;
+            return None;
         }
-        let Some(browser) = job.browser() else {
-            return;
-        };
+        // No browser: nothing to crawl and nothing to report.
+        let browser = job.browser()?;
+        let max_pages = profile.crawl.max_pages.min(job.budget_left());
+        if max_pages == 0 {
+            return None;
+        }
 
         let store = job.store();
         let client = job.client();
@@ -92,7 +106,7 @@ impl InterimHttpLane {
 
         let cfg = ScannerConfig {
             max_depth: profile.crawl.max_depth as usize,
-            max_pages: profile.crawl.max_pages as usize,
+            max_pages: max_pages as usize,
             time_budget: Duration::from_secs(profile.budget.time_s),
             ..self.cfg.clone()
         };
@@ -118,11 +132,15 @@ impl InterimHttpLane {
             });
         }
 
-        if let Ok(outcome) = outcome {
-            let pages = u32::try_from(outcome.pages_crawled).unwrap_or(u32::MAX);
-            if pages > 0 {
-                job.charge(pages);
+        match outcome {
+            Ok(outcome) => {
+                let pages = u32::try_from(outcome.pages_crawled).unwrap_or(u32::MAX);
+                if pages > 0 && !job.charge(pages) {
+                    job.charge(job.budget_left());
+                }
+                None
             }
+            Err(err) => Some(scrub(&format!("{err:#}"))),
         }
     }
 
@@ -226,9 +244,24 @@ impl Lane for InterimHttpLane {
                 if job.cancelled() {
                     break;
                 }
-                self.crawl_origin(origin, job).await;
+                // `Discovery` has no notes field (the model is frozen for this
+                // task), so a refused crawl is logged with the job's context:
+                // discovery still runs over what the proxy captured.
+                if let Some(reason) = self.crawl_origin(origin, job).await {
+                    tracing::warn!(
+                        job = job.job_id(),
+                        origin,
+                        reason = %reason,
+                        "interim lane: the browser crawl was refused; \
+                         discovery continues over captured flows"
+                    );
+                }
             }
-            let origins: Vec<String> = target.origins.iter().filter_map(|o| origin_of(o)).collect();
+            let origins: Vec<String> = target
+                .origins
+                .iter()
+                .filter_map(|o| normalize_origin(o).ok())
+                .collect();
             Ok(self.map_flows(&origins, job))
         })
     }
@@ -567,7 +600,7 @@ impl Check for LegacyActiveCheck {
                     detail: format!(
                         "{} confirmed at {} `{}`",
                         self.meta.name,
-                        kind_token(point.kind),
+                        wire_token(&point.kind),
                         point.name
                     ),
                     // AC T1-10: the engine reproduces the finding with exactly
@@ -584,7 +617,7 @@ impl Check for LegacyActiveCheck {
                 if let Some(err) = last_error {
                     return inconclusive(&format!(
                         "every probe at {} `{}` failed: {err}",
-                        kind_token(point.kind),
+                        wire_token(&point.kind),
                         point.name
                     ));
                 }
@@ -596,7 +629,7 @@ impl Check for LegacyActiveCheck {
                 detail: format!(
                     "no {} reaction at {} `{}`",
                     self.meta.class,
-                    kind_token(point.kind),
+                    wire_token(&point.kind),
                     point.name
                 ),
                 poc_hint: None,
@@ -677,18 +710,10 @@ fn kind_for(location: &Location) -> InsertionKind {
     }
 }
 
-/// An insertion kind's wire token, taken from its serde form so a point id can
-/// never disagree with what `scan.sitemap` prints.
-fn kind_token(kind: InsertionKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_string))
-        .unwrap_or_default()
-}
-
-/// A point's stable id within a job: `<flow>:<kind>:<name>`.
+/// A point's stable id within a job: `<flow>:<kind>:<name>`, the kind in its
+/// wire form so a point id can never disagree with what `scan.sitemap` prints.
 fn point_id(flow: FlowId, kind: InsertionKind, name: &str) -> String {
-    format!("{flow}:{}:{name}", kind_token(kind))
+    format!("{flow}:{}:{name}", wire_token(&kind))
 }
 
 /// What the observed value looks like (spec D2 `traits`).
@@ -713,44 +738,6 @@ fn traits_for(point: &InjectionPoint) -> Vec<PointTrait> {
         traits.push(PointTrait::Email);
     }
     traits
-}
-
-/// `scheme://host[:port]`, lowercased, with the scheme's default port elided,
-/// so a flow's authority and a profile's origin compare in one normal form.
-fn origin_key(scheme: &str, authority: &str) -> String {
-    let scheme = scheme.to_ascii_lowercase();
-    let authority = authority.to_ascii_lowercase();
-    let (host, port) = split_authority(&authority);
-    let default = if scheme == "https" { 443 } else { 80 };
-    match port {
-        Some(port) if port != default => format!("{scheme}://{host}:{port}"),
-        _ => format!("{scheme}://{host}"),
-    }
-}
-
-/// The same normal form for a profile origin (`http(s)://host[:port][/...]`).
-fn origin_of(origin: &str) -> Option<String> {
-    let (scheme, rest) = origin.split_once("://")?;
-    let authority = rest.split('/').next().unwrap_or(rest);
-    if authority.is_empty() {
-        return None;
-    }
-    Some(origin_key(scheme, authority))
-}
-
-/// Split `host[:port]`, keeping a bracketed IPv6 literal intact.
-fn split_authority(authority: &str) -> (&str, Option<u16>) {
-    let tail = match authority.rfind(']') {
-        Some(bracket) => &authority[bracket + 1..],
-        None => authority,
-    };
-    match tail.rsplit_once(':') {
-        Some((_, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
-            let cut = authority.len() - port.len() - 1;
-            (&authority[..cut], port.parse().ok())
-        }
-        _ => (authority, None),
-    }
 }
 
 /// A path with every purely numeric segment collapsed to `{id}` (spec D8.1).
@@ -788,7 +775,8 @@ fn new_node(id: &NodeId, flow: &HttpFlow, origin: &str) -> SiteNode {
         method: flow.request.method.clone(),
         scheme: scheme.to_string(),
         host: host.to_string(),
-        port: port.unwrap_or(if scheme == "https" { 443 } else { 80 }),
+        // `origin` is in the normal form, so no port means the scheme's default.
+        port: port.or_else(|| default_port(scheme)).unwrap_or(80),
         path_template: path_template(&flow.request.path),
         flows: Vec::new(),
         params: Vec::new(),
@@ -833,13 +821,23 @@ fn bounded_body(body: &Body) -> Vec<u8> {
     bytes[..bytes.len().min(MAX_MATCH_BODY)].to_vec()
 }
 
-/// Whether a probe error means the job is over (budget, deadline, cancel)
-/// rather than that one send failed.
+/// Whether a probe error means this point is over — the job's budget, deadline
+/// or cancellation, or the host's error ladder — rather than that one send
+/// failed and the next payload still deserves a try.
+///
+/// Read from the typed [`ProbeRefused`] the job client raises, never from
+/// words in the message: an upstream error that happens to say "canceled" is
+/// one failed send, not the end of the run.
 fn ends_the_run(err: &anyhow::Error) -> bool {
-    let text = err.to_string().to_ascii_lowercase();
-    ["budget", "deadline", "cancel"]
-        .iter()
-        .any(|needle| text.contains(needle))
+    matches!(
+        err.downcast_ref::<ProbeRefused>(),
+        Some(
+            ProbeRefused::Budget
+                | ProbeRefused::Deadline
+                | ProbeRefused::Cancelled
+                | ProbeRefused::HostLadder(_)
+        )
+    )
 }
 
 /// An inconclusive verdict carrying a scrubbed reason.
@@ -1166,7 +1164,109 @@ mod tests {
         }
     }
 
+    /// A `ProxyClient` that answers from a queue — an error, or a plain-text
+    /// 200 with the given status — and a plain 200 once the queue is empty.
+    struct ScriptedClient {
+        queue: Mutex<std::collections::VecDeque<anyhow::Result<u16>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScriptedClient {
+        fn new(script: Vec<anyhow::Result<u16>>) -> Arc<Self> {
+            Arc::new(Self {
+                queue: Mutex::new(script.into_iter().collect()),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl ProxyClient for ScriptedClient {
+        fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            self.send_opts(req, SendOptions::default())
+        }
+
+        fn send_opts(
+            &self,
+            req: HttpRequest,
+            _opts: SendOptions,
+        ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let next = self
+                    .queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pop_front();
+                let status = match next {
+                    Some(Err(err)) => return Err(err),
+                    Some(Ok(status)) => status,
+                    None => 200,
+                };
+                Ok(HttpFlow {
+                    id: FlowId::new(),
+                    request: req,
+                    response: Some(response(status, &[("content-type", "text/plain")], "ok")),
+                    client_conn: conn(),
+                    server_conn: None,
+                    metadata: FlowMeta {
+                        is_replay: true,
+                        ..FlowMeta::default()
+                    },
+                    intercept: InterceptState::Observed,
+                })
+            })
+        }
+    }
+
     // ----------------------------------------------------------- stub browser
+
+    /// A browser whose every page links to fifty more on the origin, so an
+    /// uncapped crawl would navigate fifty times. Each navigation lands one
+    /// captured flow in the store and is counted.
+    struct LinkyBrowser {
+        store: Arc<dyn FlowStore>,
+        navigations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl BrowserDriver for LinkyBrowser {
+        fn navigate(&self, url: &str) -> BoxFuture<'_, anyhow::Result<NavOutcome>> {
+            let url = url.to_string();
+            Box::pin(async move {
+                self.navigations.fetch_add(1, Ordering::SeqCst);
+                let path = url::Url::parse(&url)
+                    .map(|u| u.path().to_string())
+                    .unwrap_or_else(|_| "/".to_string());
+                self.store.insert(Flow::Http(captured("http", &path)));
+                Ok(NavOutcome {
+                    final_url: url,
+                    status: Some(200),
+                })
+            })
+        }
+        fn click(&self, _target: ClickTarget) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn type_text(&self, _selector: &str, _text: &str) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn screenshot(&self) -> BoxFuture<'_, anyhow::Result<Vec<u8>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn eval(&self, _expr: &str) -> BoxFuture<'_, anyhow::Result<Value>> {
+            Box::pin(async { Ok(Value::Null) })
+        }
+        fn get_dom(&self) -> BoxFuture<'_, anyhow::Result<String>> {
+            Box::pin(async {
+                Ok((1..=50)
+                    .map(|i| format!("<a href=\"/p{i}\">p{i}</a>"))
+                    .collect::<String>())
+            })
+        }
+    }
 
     /// A browser whose single navigation inserts one captured flow into the
     /// store, the way a real proxied navigation lands in it.
@@ -1813,6 +1913,137 @@ mod tests {
 
         assert_eq!(store.list().len(), 1, "nothing was crawled");
         assert_eq!(job.charged(), 0);
+    }
+
+    // ---- wave-2/3 fix task ---------------------------------------------------
+
+    /// Whether a probe error ends the run is read from the typed
+    /// `ProbeRefused`, never from words in the message: an upstream error that
+    /// happens to say "canceled" is one failed send and the next payload is
+    /// still tried, while a typed `Deadline` ends the point with no further
+    /// payload.
+    #[tokio::test]
+    async fn an_upstream_error_mentioning_cancel_does_not_end_the_point() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured("http", "/search?q=hello")));
+        let client = ScriptedClient::new(vec![
+            Err(anyhow::anyhow!("operation was canceled: connection closed")),
+            Ok(200),
+        ]);
+        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let discovery = discover_with(&job).await;
+        let point = point_named(&discovery, "q").clone();
+        let host = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts probes for its own point");
+
+        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+
+        assert!(
+            client.calls() >= 2,
+            "the second payload was not attempted after an upstream error: {} call(s), {:?} {}",
+            client.calls(),
+            verdict.outcome,
+            verdict.detail
+        );
+        assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
+
+        let client = ScriptedClient::new(vec![Err(anyhow::Error::new(
+            crate::client::ProbeRefused::Deadline,
+        ))]);
+        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+        let host = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts probes for its own point");
+
+        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+
+        assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+        assert!(verdict.detail.contains("deadline"), "{}", verdict.detail);
+        assert_eq!(
+            client.calls(),
+            1,
+            "a typed deadline refusal ends the point: no further payload"
+        );
+    }
+
+    /// Spec D5 "one budget per job": the crawl's navigations are probes, so
+    /// `crawl.max_pages` is capped by what the budget has left *before* the
+    /// crawl, not charged after the fact. Budget 3, `max_pages: 50`, a browser
+    /// that would yield fifty pages: at most three navigations, and the budget
+    /// is spent.
+    #[tokio::test]
+    async fn the_crawl_cannot_outrun_the_probe_budget() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let browser = Arc::new(LinkyBrowser {
+            store: Arc::clone(&store),
+            navigations: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut job = TestJob::new(
+            Arc::clone(&store),
+            StubClient::new(Answer::Fixed(200, "", "")),
+        );
+        job.browser = Some(Arc::clone(&browser) as Arc<dyn BrowserDriver>);
+        job.budget = 3;
+        job.profile.crawl.max_pages = 50;
+
+        let _ = discover_with(&job).await;
+
+        let navigations = browser.navigations.load(Ordering::SeqCst);
+        assert!(
+            (1..=3).contains(&navigations),
+            "{navigations} navigations against a budget of 3"
+        );
+        assert_eq!(
+            job.budget_left(),
+            0,
+            "the crawl spent exactly what the budget had left (charged {})",
+            job.charged()
+        );
+    }
+
+    /// A crawl the crawler refused — here the seed is out of the job's scope —
+    /// surfaces its reason instead of being swallowed, so the caller can say
+    /// why discovery ran on captures alone; a crawl that ran, or was skipped
+    /// by design, reports nothing.
+    #[tokio::test]
+    async fn a_refused_crawl_reports_its_reason() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let mut job = TestJob::new(
+            Arc::clone(&store),
+            StubClient::new(Answer::Fixed(200, "", "")),
+        );
+        job.browser = Some(Arc::new(StubBrowser {
+            store: Arc::clone(&store),
+            path: "/crawled",
+        }));
+        let lane = InterimHttpLane {
+            cfg: ScannerConfig::default(),
+        };
+
+        let reason = lane
+            .crawl_origin("http://nobody.test", &job)
+            .await
+            .expect("an out-of-scope seed is a refused crawl");
+        assert!(
+            reason.contains("nobody.test") || reason.contains("scope"),
+            "the reason names the refusal: {reason}"
+        );
+        assert_eq!(job.charged(), 0, "a refused crawl spends nothing");
+
+        assert_eq!(
+            lane.crawl_origin(ORIGIN, &job).await,
+            None,
+            "a crawl that ran reports no reason"
+        );
+        assert!(job.charged() >= 1);
+
+        job.profile.crawl.use_browser = UseBrowser::Never;
+        assert_eq!(
+            lane.crawl_origin("http://nobody.test", &job).await,
+            None,
+            "a crawl skipped by design is not a refusal"
+        );
     }
 
     // ---- tester additions ---------------------------------------------------

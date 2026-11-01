@@ -257,6 +257,114 @@ async fn remediation_is_an_accepted_optional_key() {
     assert_eq!(without.snapshot()[0].meta().remediation, None);
 }
 
+type ProbeFuture<'a> = Pin<
+    Box<dyn Future<Output = anyhow::Result<aitm_scan_model::point::ProbeResponse>> + Send + 'a>,
+>;
+
+/// A host that can lend itself out (`shared`) but no client: the model's
+/// default `client()` is `None`. Every probe it is asked for is counted, so a
+/// test can prove the check ran nothing.
+struct ClientlessHost {
+    me: std::sync::Weak<ClientlessHost>,
+    profile: aitm_scan_model::profile::ScanProfile,
+    probes: std::sync::atomic::AtomicUsize,
+}
+
+impl ClientlessHost {
+    fn shared_new() -> Arc<ClientlessHost> {
+        Arc::new_cyclic(|me| ClientlessHost {
+            me: me.clone(),
+            profile: aitm_scan_model::profile::ScanProfile::default(),
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    fn response() -> aitm_scan_model::point::ProbeResponse {
+        aitm_scan_model::point::ProbeResponse {
+            status: Some(200),
+            headers: Vec::new(),
+            body: b"ok".to_vec(),
+            elapsed_ms: 1,
+            flow: None,
+            ws_frames: None,
+            l4: None,
+        }
+    }
+}
+
+impl ProbeHost for ClientlessHost {
+    fn baseline(&self) -> ProbeFuture<'_> {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(Self::response()) })
+    }
+    fn probe<'a>(&'a self, _payload: &'a aitm_scan_model::point::Payload) -> ProbeFuture<'a> {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(Self::response()) })
+    }
+    fn probe_raw(&self, _req: aitm_scan_model::point::RawProbe) -> ProbeFuture<'_> {
+        self.probes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(Self::response()) })
+    }
+    fn marker(&self) -> String {
+        "aitm7f3a".to_string()
+    }
+    fn budget_left(&self) -> u32 {
+        4
+    }
+    fn deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+    fn profile(&self) -> &aitm_scan_model::profile::ScanProfile {
+        &self.profile
+    }
+    fn cancelled(&self) -> bool {
+        false
+    }
+    fn held_flows(&self) -> Vec<aitm_core::Flow> {
+        Vec::new()
+    }
+    fn shared(&self) -> Option<Arc<dyn ProbeHost>> {
+        self.me.upgrade().map(|host| host as Arc<dyn ProbeHost>)
+    }
+}
+
+/// Wave-2/3 security fix: a host that lends no client is a wiring bug, exactly
+/// like one that lends no shared handle — the check runs nothing (so nothing
+/// can go out on the unbudgeted namespace client) and the verdict is an error
+/// naming the missing client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_without_a_client_is_a_wiring_error() {
+    let loader = loader();
+    let checks = Arc::new(CheckRegistry::new());
+    run_load(
+        &loader,
+        &checks,
+        "<clientless>",
+        &check_script(&meta_src(""), r#"{ probe.send("X"); "ran" }"#),
+    )
+    .expect("the script loads");
+
+    let host = ClientlessHost::shared_new();
+    let point = query_point("http://127.0.0.1:8080/", "q");
+    let probe_host: &dyn ProbeHost = host.as_ref();
+    let verdict = checks.snapshot()[0].run(&point, probe_host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Error, "{}", verdict.detail);
+    assert!(
+        verdict.detail.contains("client"),
+        "the error names the missing client: {}",
+        verdict.detail
+    );
+    assert_eq!(
+        host.probes.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the closure did not run"
+    );
+}
+
 /// A meta map for check `id`, well formed in every other key.
 fn meta_with_id(id: &str) -> String {
     format!(

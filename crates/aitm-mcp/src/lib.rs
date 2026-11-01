@@ -6,6 +6,10 @@
 //! so the same core serves every transport ([`transport`]): newline-delimited JSON
 //! over stdio, or over a loopback-only TCP socket that requires a token.
 
+// The workspace lint already forbids `unsafe`; the attribute makes the
+// promise local to the crate that parses an agent's wire bytes.
+#![forbid(unsafe_code)]
+
 mod base64;
 pub mod http;
 pub mod json;

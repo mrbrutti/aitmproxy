@@ -207,12 +207,15 @@ impl Profiles {
             )));
         }
         validate(profile).map_err(invalid)?;
-        let dir = self.saved_dir.as_ref().ok_or_else(|| {
+        // The one place a saved profile's path is built is `saved_path`, so
+        // `save`, `get` and `delete` can never disagree about where it lives.
+        let path = self.saved_path(name).ok_or_else(|| {
             invalid("`findings.dir` is not set, so there is nowhere to save a profile")
         })?;
-        std::fs::create_dir_all(dir)
-            .map_err(|e| invalid(format!("cannot create {}: {e}", dir.display())))?;
-        let path = dir.join(format!("{name}.yaml"));
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| invalid(format!("cannot create {}: {e}", dir.display())))?;
+        }
         let yaml = serde_yaml::to_string(profile)
             .map_err(|e| invalid(format!("profile `{name}` cannot be written as YAML: {e}")))?;
         std::fs::write(&path, yaml)
@@ -337,43 +340,21 @@ fn merge_json(base: &mut serde_json::Value, patch: serde_json::Value) {
 /// and the scanner must not treat them as two. Userinfo, a path, a query and a
 /// fragment are refused: an origin carries none of them, and silently dropping
 /// one would scan something other than what the operator wrote.
+///
+/// The normal form itself is [`crate::util::normalize_origin`]'s, the one every
+/// module compares origins in. That form also knows `ws`/`wss` (an issue's
+/// target can be a WebSocket origin); a *profile* origin is
+/// `http(s)://host[:port]` (spec D3 `ScanProfile.target.origins`), so a
+/// WebSocket scheme is refused here rather than silently accepted.
 pub fn normalize_origin(s: &str) -> Result<String, String> {
-    let raw = s.trim();
-    if raw.is_empty() {
-        return Err("an origin is required, but it was empty".to_string());
-    }
-    let url = url::Url::parse(raw).map_err(|e| format!("`{raw}` is not an origin: {e}"))?;
-    match url.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(format!(
-                "`{raw}` is not an origin: scheme `{other}` is not `http` or `https`"
-            ))
-        }
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(format!("`{raw}` is not an origin: it carries userinfo"));
-    }
-    let host = url
-        .host_str()
-        .filter(|h| !h.is_empty())
-        .ok_or_else(|| format!("`{raw}` is not an origin: it has no host"))?;
-    if !matches!(url.path(), "" | "/") {
+    let origin = crate::util::normalize_origin(s)?;
+    if !(origin.starts_with("http://") || origin.starts_with("https://")) {
         return Err(format!(
-            "`{raw}` is not an origin: it has the path `{}`",
-            url.path()
+            "`{}` is not a profile origin: its scheme is not `http` or `https`",
+            s.trim()
         ));
     }
-    if url.query().is_some() {
-        return Err(format!("`{raw}` is not an origin: it has a query string"));
-    }
-    if url.fragment().is_some() {
-        return Err(format!("`{raw}` is not an origin: it has a fragment"));
-    }
-    Ok(match url.port() {
-        Some(port) => format!("{}://{host}:{port}", url.scheme()),
-        None => format!("{}://{host}", url.scheme()),
-    })
+    Ok(origin)
 }
 
 /// Whether a profile is runnable, with a message naming the field that is not
@@ -417,6 +398,9 @@ pub fn validate(p: &ScanProfile) -> Result<(), String> {
     }
     if p.budget.time_s < 1 {
         return Err("`budget.time_s` must be at least 1".to_string());
+    }
+    if p.budget.check_timeout_s < 1 {
+        return Err("`budget.check_timeout_s` must be at least 1".to_string());
     }
     Ok(())
 }
@@ -925,6 +909,27 @@ mod tests {
         ] {
             assert!(normalize_origin(bad).is_err(), "`{bad}` is not an origin");
         }
+    }
+
+    /// Wave-2/3 security fix: `budget.check_timeout_s: 0` is floored like
+    /// `probes` and `time_s` — a zero wall budget would time every check out
+    /// at once — and `save` refuses it as `invalid_profile` naming the field.
+    #[test]
+    fn check_timeout_zero_is_invalid_profile() {
+        let mut profile = named_profile("zero-timeout");
+        profile.budget.check_timeout_s = 0;
+
+        let err = validate(&profile).expect_err("a zero check timeout is invalid");
+        assert!(err.contains("budget.check_timeout_s"), "{err}");
+
+        let tmp = TempFindings::new();
+        let profiles = Profiles::new(&tmp.config());
+        let err = profiles.save(&profile).expect_err("save refuses it");
+        assert!(
+            err.to_string().starts_with("scan: invalid_profile:"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("budget.check_timeout_s"), "{err}");
     }
 
     /// A saved profile wins over a config profile, which wins over a built-in,
