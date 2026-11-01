@@ -98,11 +98,13 @@ pub(crate) fn path_segment_token(segment: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a path segment is an opaque token: a UUID, or a run of 16 or more
-/// hex characters (a 24-hex object id, a 64-hex reset token, a session
-/// handle). A plain numeric id is not opaque.
+/// Whether a path segment is an opaque hex token: a run of 16 or more hex
+/// characters (a 64-hex reset token, a session handle). Its only caller,
+/// [`path_segment_token`], has already ruled out the id-like shapes
+/// ([`is_id_like`]: digits, a UUID, a 24-hex object id), so this is the rule
+/// for what is left.
 fn is_opaque_token(segment: &str) -> bool {
-    is_uuid(segment) || (segment.len() >= 16 && is_hex(segment))
+    segment.len() >= 16 && is_hex(segment)
 }
 
 /// Whether `segment` reads as a file name rather than a route component.
