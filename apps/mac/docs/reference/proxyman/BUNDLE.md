@@ -335,13 +335,26 @@ ls "$HOME/Library/Application Support/com.proxyman.NSProxy"
   (that folder exists here and is empty, matching the Settings label
   `Proxyman CA (not installed)` Matt saw; the `defaults` key
   `IsOpenProxymanFirstTime = 0` shows the app has been launched).
-- Install to the **login keychain without root**, through the `security`
-  CLI:
-  `security add-trusted-cert -r trustRoot -k $(security default-keychain -d user | sed 's/"//g') "<path>/proxyman-ca.pem"`.
-  A second, `sudo`, variant targets `/Library/Keychains/System.keychain` and
-  is used by the "Automatically Trust Proxyman Certificate in your Keychain
-  Access (Require root privileges)" option and by the Android/iOS "system
-  certificate" flows.
+- Two install paths, both through the `security` CLI (the docs page
+  `/docs/debug-devices/macos` names the tabs):
+  - **Automatic** tab, button `Install & Trust Certificate`: runs
+    `security add-trusted-cert -r trustRoot …` inside an AppleScript
+    `do shell script "…" with administrator privileges` (both fragments are
+    in the binary, which is what the `com.apple.security.automation.apple-events`
+    entitlement is for). macOS shows its own **administrator password**
+    dialog; no sudo, no Terminal. Settings copy: `Automatically Trust
+    Proxyman Certificate in your Keychain Access (Require root privileges)`.
+    The `sudo security add-trusted-cert -d -r trustRoot -k
+    /Library/Keychains/System.keychain "…"` string is the same command in
+    its system-keychain form.
+  - **Manual** tab, button `Generate and Add…`: `SecItemAdd` into the
+    keychain without trust and without a password (macOS may ask which
+    keychain, `Make sure you Select System or Login Keychains.`), then the
+    operator opens Keychain Access and sets `Always Trust` (`1. Open
+    "Keychain Access" app -> Search "Proxyman CA" -> Double-click to Open`,
+    `2. Select "Always Trust" -> Close this Windows & Save`).
+  - A user-keychain variant also exists:
+    `security add-trusted-cert -r trustRoot -k $(security default-keychain -d user | sed 's/"//g') "<path>/proxyman-ca.pem"`.
   Removal: `security find-certificate -c "<name>" -a -Z | awk '/SHA-1/{system("security delete-certificate -Z "$NF)}'`.
 - Programmatic APIs imported for custom CAs: `SecItemAdd`, `SecPKCS12Import`,
   `SecCertificateCreateWithData`, `SecIdentityCopyCertificate`;
@@ -364,9 +377,11 @@ ls "$HOME/Library/Application Support/com.proxyman.NSProxy"
   the certificate is not properly trusted in Keychain Access for domain/app
   SSL Proxying`.
 
-What this means for aitmproxy: Proxyman never asks for sudo for the CA. The
-default path is the **user login keychain** via `security add-trusted-cert
--r trustRoot`, which triggers macOS's own password prompt and nothing else.
+What this means for aitmproxy: Proxyman never asks for sudo in a Terminal
+for the CA. The recommended path is `security add-trusted-cert -r trustRoot`
+run "with administrator privileges", which triggers macOS's own admin
+password dialog and nothing else; the manual path needs no password but
+leaves trust to Keychain Access.
 Our `aitm ca install` already has the recipe (research `07-ca-install`); the
 app must call it in-process on first run, show the three states (not
 installed / installed not trusted / trusted) and serve the PEM from the proxy
@@ -522,7 +537,8 @@ bytes to the app.
 
 **How they never ask for sudo:** macOS asks instead. SMJobBless shows the
 Authorization dialog with Proxyman's own sentence; `security add-trusted-cert`
-on the login keychain shows the keychain prompt; the system extension shows
+run with administrator privileges shows the admin password dialog (manual
+mode: no password, trust set in Keychain Access); the system extension shows
 the Login Items & Extensions approval and the network-configuration Allow.
 Everything else (networksetup fallback, CA generation, MCP, CLI) runs as the
 user.
