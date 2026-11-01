@@ -110,6 +110,36 @@ pub enum TriState {
     Exclude,
 }
 
+/// The mark a builtin profile carries in the list (spec D11 mockup:
+/// `passive-only ·`; the builder's glyph, flat monochrome).
+pub const BUILTIN_MARK: &str = "·";
+
+/// The tri-state glyphs of the check tree (spec "Left to the builder",
+/// `◆ ◇ ○` or similar; flat monochrome, D13): a filled diamond for a
+/// selector the profile includes, a hollow one for the engine's default,
+/// a barred circle for one it excludes. All three are one cell wide.
+pub const INCLUDE_GLYPH: &str = "◆";
+pub const DEFAULT_GLYPH: &str = "◇";
+pub const EXCLUDE_GLYPH: &str = "⊘";
+
+/// The collapse markers before a lane or class node of the check tree
+/// (builder's glyphs): `▾` while its children are shown, `▸` while they
+/// are hidden (`h` / `l`); a check node has none.
+pub const OPEN_MARK: &str = "▾";
+pub const COLLAPSED_MARK: &str = "▸";
+
+impl TriState {
+    /// The node's glyph: [`INCLUDE_GLYPH`], [`DEFAULT_GLYPH`] or
+    /// [`EXCLUDE_GLYPH`].
+    pub fn glyph(self) -> &'static str {
+        match self {
+            TriState::Default => DEFAULT_GLYPH,
+            TriState::Include => INCLUDE_GLYPH,
+            TriState::Exclude => EXCLUDE_GLYPH,
+        }
+    }
+}
+
 /// The editor over one profile draft.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProfileEditor {
@@ -472,7 +502,7 @@ const RECORDINGS: [RecordProbes; 2] = [RecordProbes::IssuesOnly, RecordProbes::A
 /// The wire token of a contract enum (`medium`, `fewer_false_negatives`):
 /// what the editor shows and the YAML carries. Empty for a value serde
 /// cannot write (none of the rings has one).
-fn token<T: serde::Serialize>(v: &T) -> String {
+pub(crate) fn token<T: serde::Serialize>(v: &T) -> String {
     serde_json::to_value(v)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))

@@ -24,8 +24,11 @@ use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::scan::{
     check_tree, parse_l4_target, session_line, tri_state, EditorField, OriginSource, ProfilePane,
-    ScanTab, TriState, CHECKS_MAX, EDITOR_FIELDS, L4_TARGET_ERROR, PROFILES_MAX,
+    ScanTab, TriState, BUILTIN_MARK, CHECKS_MAX, COLLAPSED_MARK, EDITOR_FIELDS, L4_TARGET_ERROR,
+    OPEN_MARK, PROFILES_MAX,
 };
+use aitm_tui::ui::scan::profiles::EDITING_MARK;
+use aitm_tui::ui::selection_bg;
 use common::*;
 use crossterm::event::KeyCode;
 use serde_json::{json, Value};
@@ -1148,4 +1151,416 @@ fn origins_pane_adds_and_removes_choices() {
         vec!["http://auth.shop-staging.test:8080".to_string()],
         "removing a choice the draft lacks changes nothing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Plan task 11: the Profiles view (spec D11 mockup, D8 picker, D13 states).
+// ---------------------------------------------------------------------------
+
+/// The screen split at the pane rule: `(list, detail)` texts, one line per
+/// row. The rule column is read from the footer line (`s start`), which the
+/// detail pane always carries; the box borders are outside both halves.
+fn halves(app: &App, cols: u16, rows: u16) -> (String, String) {
+    let text = text_of(app, cols, rows);
+    let footer =
+        line_with(&text, "s start · m map").unwrap_or_else(|| panic!("no footer:\n{text}"));
+    let rule = col_of(footer, " s start").unwrap_or_else(|| panic!("no footer col: {footer:?}"));
+    let mut list = String::new();
+    let mut detail = String::new();
+    for line in text.lines() {
+        let chars: Vec<char> = line.chars().collect();
+        let (l, d) = chars.split_at(rule.min(chars.len()));
+        list.push_str(&l.iter().collect::<String>());
+        list.push('\n');
+        detail.push_str(&d.iter().collect::<String>());
+        detail.push('\n');
+    }
+    (list, detail)
+}
+
+/// Focus a secondary pane the operator's way: the Fields cursor on the
+/// `origins` or `checks` field, then `e`.
+fn focus_pane(app: &mut App, field: EditorField, pane: ProfilePane) {
+    focus_field(app, field);
+    let _ = app.update(Action::ScanEdit);
+    assert_eq!(app.scan.profiles.pane, pane);
+}
+
+/// Plan task 11: every fixture row prints `name · lanes · intensity ·
+/// speed` with the builtin mark, the cursor row carries the `>` mark and
+/// the selection style while the List pane is focused.
+#[test]
+fn profile_list_renders_seven_rows_with_the_builtin_mark() {
+    let app = app();
+    let (list, _) = halves(&app, 200, 50);
+    for name in [
+        "passive-only",
+        "map-only",
+        "light-http",
+        "standard",
+        "thorough",
+        "l4-stream-safe",
+        "l4-full",
+    ] {
+        let line = line_with(&list, name).unwrap_or_else(|| panic!("no row {name}:\n{list}"));
+        assert!(
+            line.contains(BUILTIN_MARK),
+            "{name} is a builtin: {line:?} lacks {BUILTIN_MARK:?}"
+        );
+    }
+    let standard = line_with(&list, "standard").unwrap_or_default();
+    for want in ["http ws", "medium", "normal"] {
+        assert!(standard.contains(want), "{standard:?} lacks {want:?}");
+    }
+    let header = line_with(&list, "name").unwrap_or_default();
+    assert!(
+        header.contains("lanes") && header.contains("intensity") && header.contains("speed"),
+        "column header: {header:?}"
+    );
+    // The cursor row (index 0) is marked and highlighted; no other row is.
+    let first = line_with(&list, "passive-only").unwrap_or_default();
+    assert!(first.trim_start_matches('│').starts_with('>'), "{first:?}");
+    assert!(
+        !standard.trim_start_matches('│').starts_with('>'),
+        "{standard:?}"
+    );
+    let buf = draw(&app, 200, 50);
+    let y = line_index(&text_of(&app, 200, 50), "passive-only").unwrap_or_default();
+    let x = col_of(first, "passive-only").unwrap_or_default();
+    assert_eq!(
+        cell(&buf, x, y).bg,
+        selection_bg(&theme()).bg.unwrap_or_default()
+    );
+    let y3 = line_index(&text_of(&app, 200, 50), "standard").unwrap_or_default();
+    assert_ne!(
+        cell(&buf, x, y3).bg,
+        selection_bg(&theme()).bg.unwrap_or_default()
+    );
+}
+
+/// Plan task 11 (T7-11, render half): the Fields pane in `EDITOR_FIELDS`
+/// order as the D11 mockup, the lanes as `[x]`/`[ ]`, the budget line, the
+/// Task 10 session line verbatim; the Checks pane as the lane to class to
+/// check tree with the tri-state glyphs and the collapse markers.
+#[test]
+fn the_editor_renders_fields_tree_and_session() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::Scope(vec!["127.0.0.1".into()]));
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanOriginPrompt);
+    type_text(&mut app, ORIGIN);
+    let _ = app.update(Action::Submit);
+    let _ = app.on_bus(reply(
+        &format!("scan.session.preview:{ORIGIN}"),
+        "scan.session.preview",
+        fixture("scan.session.preview.json"),
+    ));
+    let (_, detail) = halves(&app, 200, 50);
+    for want in [
+        "profile standard (builtin)",
+        "dirty",
+        ORIGIN,
+        "[x] http",
+        "[x] ws",
+        "[ ] l4_packet",
+        "[ ] l4_stream",
+        "intensity medium",
+        "speed normal",
+        "accuracy normal",
+        "crawl",
+        "depth 3",
+        "pages 200",
+        SESSION_LINE,
+        "on_lost stop",
+        "probes 2000 · time 600 s · issues 1024",
+        "version auto",
+        "record issues_only",
+        "s start · m map · w save as · e edit · Space toggle",
+    ] {
+        assert!(detail.contains(want), "{want:?} missing from:\n{detail}");
+    }
+    // The fields come in EDITOR_FIELDS order: the header first, budget
+    // before http, the footer last.
+    let at = |needle: &str| line_index(&detail, needle).unwrap_or_else(|| panic!("{needle}"));
+    assert!(at("profile standard") < at("origins"));
+    assert!(at("origins") < at("[x] http"));
+    assert!(at("[x] http") < at("intensity medium"));
+    assert!(at("intensity medium") < at("checks"));
+    assert!(at("checks") < at("crawl"));
+    assert!(at("crawl") < at(SESSION_LINE));
+    assert!(at(SESSION_LINE) < at("probes 2000"));
+    assert!(at("probes 2000") < at("version auto"));
+    assert!(at("version auto") < at("s start"));
+    // The check summary line carries the lane and class glyphs.
+    let checks = line_with(&detail, "checks").unwrap_or_default();
+    assert!(
+        checks.contains(&format!("{} http", TriState::Default.glyph())),
+        "{checks:?}"
+    );
+    assert!(
+        checks.contains("reflected-xss") && checks.contains("sqli-error"),
+        "{checks:?}"
+    );
+
+    // The Checks pane: the tree under the fields while it is focused.
+    focus_pane(&mut app, EditorField::Checks, ProfilePane::Checks);
+    focus_node(&mut app, "http.sqli-error");
+    let _ = app.update(Action::ScanToggle);
+    let _ = app.update(Action::ScanToggle);
+    focus_node(&mut app, "sqli-error");
+    let _ = app.update(Action::ScanToggle);
+    let (_, detail) = halves(&app, 200, 50);
+    for want in [
+        "http",
+        "reflected-xss",
+        "sqli-error",
+        "information-disclosure",
+        "http.sqli-error",
+        "http.reflected-xss",
+        "http.custom-marker",
+    ] {
+        assert!(detail.contains(want), "{want:?} missing from:\n{detail}");
+    }
+    let tree_at = |needle: &str| {
+        detail
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(needle))
+            .map(|(k, _)| k)
+            .last()
+            .unwrap_or_else(|| panic!("{needle}"))
+    };
+    let lane = tree_at(&format!("{OPEN_MARK} {} http ", TriState::Default.glyph()));
+    let class = tree_at(&format!("{} sqli-error", TriState::Include.glyph()));
+    let leaf = tree_at(&format!("{} http.sqli-error", TriState::Exclude.glyph()));
+    assert!(
+        lane < class && class < leaf,
+        "lane {lane} class {class} leaf {leaf}"
+    );
+    let lane_line = detail.lines().nth(lane).unwrap_or_default();
+    assert!(lane_line.contains(OPEN_MARK), "{lane_line:?}");
+    assert!(
+        detail
+            .lines()
+            .nth(class)
+            .unwrap_or_default()
+            .contains(&format!(
+                "{OPEN_MARK} {} sqli-error",
+                TriState::Include.glyph()
+            )),
+        "a class node carries the open mark"
+    );
+    // Collapse the lane: the classes and checks vanish, the mark flips.
+    focus_node(&mut app, "lane:http");
+    let _ = app.update(Action::Left);
+    let (_, collapsed) = halves(&app, 200, 50);
+    let lane_line = line_with(
+        &collapsed,
+        &format!("{COLLAPSED_MARK} {} http", TriState::Default.glyph()),
+    );
+    assert!(lane_line.is_some(), "collapsed lane row:\n{collapsed}");
+    assert!(
+        !collapsed.contains("http.custom-marker"),
+        "the checks under a collapsed lane are hidden:\n{collapsed}"
+    );
+}
+
+/// Review log, Task 10: `Esc` returns the pane to the List but keeps the
+/// editor held; the held editor's row carries [`EDITING_MARK`] so the
+/// operator sees which profile `Tab` returns to, and a dirty draft adds
+/// `dirty` to the editor header.
+#[test]
+fn a_held_editor_is_marked_on_its_list_row() {
+    let mut app = app();
+    open_standard(&mut app);
+    let _ = app.update(Action::Back);
+    assert_eq!(app.scan.profiles.pane, ProfilePane::List);
+    assert!(app.scan.profiles.editor.is_some(), "Esc keeps the editor");
+    let (list, detail) = halves(&app, 200, 50);
+    let standard = line_with(&list, "standard").unwrap_or_default();
+    assert!(standard.contains(EDITING_MARK), "{standard:?}");
+    for other in ["passive-only", "map-only", "thorough"] {
+        let line = line_with(&list, other).unwrap_or_default();
+        assert!(!line.contains(EDITING_MARK), "{line:?}");
+    }
+    assert!(
+        !detail.contains("dirty"),
+        "a fresh editor is clean:\n{detail}"
+    );
+    // Dirty it: the header says so.
+    focus_field(&mut app, EditorField::Intensity);
+    let _ = app.update(Action::ScanEdit);
+    let (_, detail) = halves(&app, 200, 50);
+    let header = line_with(&detail, "profile standard").unwrap_or_default();
+    assert!(header.contains("dirty"), "{header:?}");
+    // Without an editor the detail says how to open one and no row is marked.
+    app.scan.profiles.editor = None;
+    let (list, detail) = halves(&app, 200, 50);
+    assert!(!list.contains(EDITING_MARK));
+    assert!(
+        detail.contains("⏎ opens the profile under the cursor"),
+        "{detail}"
+    );
+}
+
+/// Plan task 11 (T7-12, picker render): the Origins pane lists the D8
+/// choices with their source; a host with only https flows yields the
+/// https origin alone, a captured http flow adds its origin; the rows in
+/// the draft are ticked.
+#[test]
+fn the_origin_picker_offers_scheme_correct_origins() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::Scope(vec!["auth.shop-staging.test".into()]));
+    let _ = app.on_bus(BusEvent::Flows(vec![summary(
+        "f0",
+        "GET",
+        "auth.shop-staging.test",
+        "/login",
+        Some(200),
+        "none",
+    )]));
+    let _ = app.update(Action::ScanNewProfile);
+    focus_pane(&mut app, EditorField::Origins, ProfilePane::Origins);
+    let (_, detail) = halves(&app, 200, 50);
+    assert!(
+        detail.contains("https://auth.shop-staging.test"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("http://auth.shop-staging.test"),
+        "{detail}"
+    );
+    let row = line_with(&detail, "] https://auth.shop-staging.test").unwrap_or_default();
+    assert!(row.contains("scope"), "the source is named: {row:?}");
+    assert!(
+        row.contains("[ ] https://"),
+        "not in the draft yet: {row:?}"
+    );
+
+    let mut http = summary(
+        "f1",
+        "GET",
+        "auth.shop-staging.test:8080",
+        "/",
+        Some(200),
+        "none",
+    );
+    http["scheme"] = json!("http");
+    let _ = app.on_bus(BusEvent::Flows(vec![http]));
+    let (_, detail) = halves(&app, 200, 50);
+    assert!(
+        detail.contains("https://auth.shop-staging.test"),
+        "{detail}"
+    );
+    let row = line_with(&detail, "http://auth.shop-staging.test:8080")
+        .unwrap_or_else(|| panic!("{detail}"));
+    assert!(row.contains("flows"), "{row:?}");
+    let _ = app.update(Action::ScanOriginAdd);
+    let (_, detail) = halves(&app, 200, 50);
+    let row = line_with(&detail, "] https://auth.shop-staging.test").unwrap_or_default();
+    assert!(row.contains("[x] https://"), "added to the draft: {row:?}");
+}
+
+/// Plan task 11: wildcard scope entries cannot be origins (D8); they are
+/// listed greyed (tertiary text) with the hint to type one.
+#[test]
+fn wildcards_are_greyed_with_the_hint() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::Scope(vec!["*.shop-staging.test".into()]));
+    let _ = app.update(Action::ScanNewProfile);
+    focus_pane(&mut app, EditorField::Origins, ProfilePane::Origins);
+    let text = text_of(&app, 200, 50);
+    let line = line_with(&text, "*.shop-staging.test").unwrap_or_else(|| panic!("{text}"));
+    assert!(line.contains("type an origin (o)"), "{line:?}");
+    let y = line_index(&text, "*.shop-staging.test").unwrap_or_default();
+    let x = col_of(line, "*.shop-staging.test").unwrap_or_default();
+    let buf = draw(&app, 200, 50);
+    assert_eq!(
+        cell(&buf, x, y).fg,
+        theme().text_tertiary().fg.unwrap_or_default()
+    );
+}
+
+/// Plan task 11: while `launch.blocked` is `Some` (Task 12 computes it) the
+/// text sits over the footer in the warning hue, wrapped so the whole
+/// reason is readable at 200 and at 90 columns.
+#[test]
+fn a_blocked_launch_prints_its_reason_in_the_warning_hue() {
+    let mut app = app();
+    open_standard(&mut app);
+    let reason = "L4 launch disabled: no L4 scope entry with the inject capability. Add one with interface \"*\", direction outbound, 127.0.0.1/32 ports 7000, capability inject (l4.scope.add).";
+    app.scan.launch.blocked = Some(reason.to_string());
+    for (cols, rows) in [(200u16, 50u16), (90, 40)] {
+        let text = text_of(&app, cols, rows);
+        for want in [
+            "L4 launch disabled",
+            "interface \"*\"",
+            "direction outbound",
+            "127.0.0.1/32",
+            "7000",
+            "capability inject",
+            "(l4.scope.add)",
+        ] {
+            assert!(
+                text.contains(want),
+                "{cols}x{rows}: {want:?} missing from:\n{text}"
+            );
+        }
+        let y = line_index(&text, "L4 launch disabled").unwrap_or_default();
+        let x = col_of(text.lines().nth(y).unwrap_or_default(), "L4 launch").unwrap_or_default();
+        let buf = draw(&app, cols, rows);
+        assert_eq!(
+            cell(&buf, x, y).fg,
+            theme()
+                .fg(&aitm_tui::tokens::color::status::CLIENT_ERROR)
+                .fg
+                .unwrap_or_default(),
+            "{cols}x{rows}: the warning hue"
+        );
+        let footer = line_index(&text, "s start · m map").unwrap_or_default();
+        assert!(
+            y < footer,
+            "{cols}x{rows}: the reason sits above the footer"
+        );
+    }
+    app.scan.launch.blocked = None;
+    assert!(!text_of(&app, 200, 50).contains("L4 launch disabled"));
+}
+
+/// Plan task 11: nothing panics at 200x50, 90x40 or 40x4, whichever pane is
+/// focused, with and without an editor, with and without a blocked reason.
+#[test]
+fn profiles_view_draws_at_every_size() {
+    let mut app = app();
+    for (cols, rows) in [(200u16, 50u16), (90, 40), (40, 4), (12, 3)] {
+        let _ = text_of(&app, cols, rows);
+    }
+    let _ = app.on_bus(BusEvent::Scope(vec!["127.0.0.1".into(), "*.x".into()]));
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanOriginPrompt);
+    type_text(&mut app, ORIGIN);
+    let _ = app.update(Action::Submit);
+    app.scan.launch.blocked = Some("blocked ".repeat(40));
+    for pane in [
+        ProfilePane::List,
+        ProfilePane::Fields,
+        ProfilePane::Origins,
+        ProfilePane::Checks,
+    ] {
+        app.scan.profiles.pane = pane;
+        for (cols, rows) in [(200u16, 50u16), (90, 40)] {
+            let text = text_of(&app, cols, rows);
+            assert!(
+                text.contains("s start · m map") && text.contains("blocked blocked"),
+                "{pane:?} {cols}x{rows}: footer and reason stay on screen:\n{text}"
+            );
+            assert!(
+                text.contains("profile standard (builtin)"),
+                "{pane:?} {cols}x{rows}: the header stays on screen"
+            );
+        }
+        for (cols, rows) in [(40u16, 4u16), (12, 3), (1, 1)] {
+            let _ = text_of(&app, cols, rows);
+        }
+    }
 }
