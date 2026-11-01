@@ -65,6 +65,30 @@ H21. G2's prescribed unit test: in `scan/issues.rs` the L4 mirror test folds 100
 
 Ratified from the G-A+G-B spec re-review: `ui::scan::{Hint, hints, HELP, key_text, rows, wrap, blocked_footer, launch_reason}` stay `pub` because `tests/scan_v2_layout.rs` (G88) reads `HELP`/`key_text` from outside the crate; `scroll(at, ..)` lives in `scan/mod.rs` as `pub(crate)` so `DetailView::scroll` can use it; `LaunchVerb::parse`, `ReadCache::is_empty`/`keys`, `CURSOR_TOO_LONG` and `GATE_OPEN_PROFILE` are accepted helpers.
 
+### Rust tidy (from the G-A+G-B quality re-review, one Coder after H18-H21)
+
+H22. One `pub(crate) fn cut_to(s: &mut String, max: usize)` in `text.rs` (clean, then truncate when over `max`) replaces the copied closure in `bound_issue`/`bound_status` and the private `cut` fns in `profiles.rs` and `sitemap.rs`; per-site constants stay; the Profiles and Site map sites now strip control characters too (state it in the doc).
+
+H23. `help_line_count()` is a hand-kept twin of `help_lines()` (`ui/overlays.rs`): one theme-free row table (`enum HelpRow { Heading, Key, Command, Blank, Close }`) built once, `help_lines` styles it, the count is its `len()`; delete `help_line_count`; fix the `help_box` doc (takes a `Rect`).
+
+H24. Test scaffolding: `common::opened_minimal(tools) -> App` (the `scan.list`-only open) and `common::screen(app)`; `scan_v2_issue_detail.rs`, `scan_v2_issues.rs`, `scan_v2_sitemap.rs`, `scan_v2_jobs.rs` use them and `common::reply`/`tagged` instead of hand-built `CallTaggedOk` literals (the jobs variant presses `ScanTab(Jobs)` after).
+
+H25. `check_tree` survives only for tests (`scan/profiles.rs`): delete it; the four tests read `app.scan.profiles.rows()` or filter `tree_nodes(..)` locally.
+
+H26. `rows()` allocates a `Vec<&TreeNode>` per call (`scan/profiles.rs`): `fn rows(&self) -> impl Iterator<Item = &TreeNode>`, `visible_len()`, `cursor_node` as `rows().nth(tree_cursor)`; the view collects once per frame.
+
+H27. `PendingLaunch { call: LaunchVerb, launch: Launch }` (readers write `p.launch.args`), so `send_launch` moves the `Launch` in instead of copying two fields.
+
+H28. Key-table residue (`ui/scan/mod.rs`): `const OPEN_FLOW: Hint = ("⏎", "open flow")` used by `SITEMAP_KEYS`, `ISSUES_KEYS` and `LEGACY_SITEMAP_BAR` (no positional index); `const ISSUES_MORE: &[Hint] = &[FILTERS, RESET]` used by the macro call, `HELP` and the test.
+
+H29. `fn wants_l4(lanes: &[LaneKind]) -> bool` used by `l4_gate` and `row_gate` (`scan/launch.rs`).
+
+H30. `code_wording(NotFound)` returns `NOT_FOUND`; `wording()` appends `"; the list is being refreshed"` when `not_found_job().is_some()`, so the D9 sentence lives once (`scan/mod.rs`).
+
+H31. The new `#[allow(clippy::too_many_arguments)]` on Profiles `row_line` goes: pass the row as one `(&ProfileListEntry, &str)` pair or a small `RowCtx`.
+
+H32. Hygiene: the orphan "The row under the list cursor." doc line moves onto `cursor_entry`; use the imported `status`/`ui::scan`/`scan::launch`/`overlays` paths instead of fully qualified ones; `rows(..)` takes `buf` last like `hint`/`blocked_footer`; the G1 bound test asserts `4 * DETAIL_VALUE_MAX` (drop the `+ 1` and the misreading comment).
+
 ## Core track (outside T7, relayed to the coordinator 2026-11-01)
 
 `l4.scope.add` refuses `interface: "*"`: `crates/aitm-proto-l4/src/commands/scope.rs` `validate_interface` (`^[A-Za-z0-9._:-]{1,15}$`, landed in #218) has no `ANY_INTERFACE` branch, while `guard.rs` defines `"*"` as the entry-side wildcard and the TUI's D7 text tells the operator to add exactly that entry. Until the core accepts `"*"` the live T7-18 cleared-gate sub-steps (overlay, `y`, `n`) can only be noted as a core refusal; the cell must not paper over it with a literal interface (the guard's `interface_covers` would then demand the engine's target interface equal it).

@@ -697,6 +697,8 @@ Kept by the main session during stage 6. One row per finding.
 | G-A+G-B | spec | Minor | G2's single layout pin (L4 lines plus dropped flows) missing | fix round H Rust (H21) |
 | G-A+G-B | spec | Minor | `ui::scan` helpers `pub` not `pub(crate)` | ratified: the layout suite reads `HELP`/`key_text` |
 | G-A+G-B | spec | Minor | spec D3 state shapes predate G-B | D3 amended |
+| G-A+G-B | quality re-review | PASS | every G item verified in place; eleven structural Minors | fix round H Rust tidy (H22-H32) |
+| G-A+G-B | quality | Minor | `cut` closure copied in four folds; `help_line_count` twin; scaffolding copied into the new suite; test-only `check_tree`; allocating `rows()`; `Launch` copied into `PendingLaunch`; key-table residue; `wants_l4` twice; two `not_found` literals; new clippy allow; hygiene | fix round H Rust tidy (H22-H32) |
 
 ## Shipped
 
