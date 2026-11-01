@@ -1,6 +1,6 @@
 ---
 name: aitmproxy-intercept-mutate
-description: Intercept and mutate live traffic in aitmproxy during an AUTHORIZED security test. Use when the user wants to park in-flight HTTP requests or responses and edit them, tamper WebSocket frames, replay or craft requests, or drop/kill a connection. Covers arming interception (flow.intercept, ws.intercept), editing parked flows (flow.mutate, flow.resume, flow.kill, ws.frame, ws.send), active egress (flow.replay, request.send) and the scope gating that guards it.
+description: Intercept and mutate live traffic in aitmproxy during an AUTHORIZED security test. Use when the user wants to park in-flight HTTP requests or responses and edit them, tamper WebSocket frames, replay or craft requests, or drop/kill a connection. Covers arming interception (flow.intercept, ws.intercept), editing parked flows (flow.mutate, flow.resume, flow.kill, ws.frame, ws.send), active egress (flow.replay, request.send) and the scope gating that guards it; tells HTTP interception apart from the Linux-only l4.intercept.* packet verdicts.
 ---
 
 # aitmproxy intercept & mutate
@@ -73,6 +73,24 @@ target host is in the authorized scope first (`scope.list`); add it only if your
 engagement covers it (`scope.add`, operator-gated from an agent frontend). `flow.kill`
 with `429`/`503` gives the client an explicit status instead of a dropped
 connection.
+
+## HTTP interception is not `l4.intercept.*`
+
+Everything above (`flow.intercept`, `flow.resume`, `flow.kill`, `flow.mutate`,
+`ws.intercept`, `ws.frame`, `ws.send`) parks and edits **HTTP and WebSocket**
+traffic the proxy terminates, keyed by the HTTP flow id, and works on every
+platform. The `l4.intercept.*` family is a different mechanism: raw packets
+parked in a **Linux NFQUEUE** (Linux only; `CAP_NET_ADMIN`, an `l4.intercept`
+config block and the agent's Intercept gate, which the operator opens with
+`l4.agent.set`), where `l4.intercept.start` opens a session, `l4.intercept.list`
+shows the parked packets oldest first, and the verdicts `l4.intercept.forward` /
+`l4.intercept.drop` / `l4.intercept.mutate` / `l4.intercept.revert` take the
+parked packet's `id` from that list, never a flow id. On macOS
+`l4.intercept.status` answers `available: false, code: unsupported_platform`. Do
+not reach for a raw packet through `flow.intercept`, and do not try to park an
+HTTP request through `l4.intercept.*`. The L4 rules (status verbs, scope, gates,
+per-packet `bytes`) are in the **aitmproxy-overview** skill under "L4 (raw
+TCP/UDP)".
 
 Once you have a working manipulation, capture it reproducibly with
 **aitmproxy-findings-poc**.
