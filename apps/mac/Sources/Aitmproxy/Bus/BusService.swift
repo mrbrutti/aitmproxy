@@ -246,7 +246,7 @@ final class BusService: FlowActions {
         // `rules` is F3; the core rejects unknown arguments, so they travel only when there are any.
         var args: [String: JSONValue] = ["enabled": .bool(enabled)]
         if enabled, !rules.isEmpty {
-            args["rules"] = .array(rules.map { .object($0.arguments.mapValues { .string($0) }) })
+            args["rules"] = .array(rules.map { .object($0.arguments) })
         }
         let armed = try await call("flow.intercept", args).boolValue ?? enabled
         session.interceptArmed = armed

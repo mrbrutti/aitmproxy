@@ -1,3 +1,4 @@
+import AitmBusClient
 import Foundation
 
 /// A breakpoint rule (foundation §2.7 "Rules…", Proxyman's form; F3 carries
@@ -53,28 +54,51 @@ public struct BreakpointRule: Identifiable, Hashable, Sendable, Codable {
         }
     }
 
-    /// `*` any run, `?` one character; a pattern without `*` matches as a substring, as Proxyman does.
+    /// `*` any run, `?` one character; a pattern without `*` or `?` matches as a
+    /// substring, as Proxyman does. Case-insensitive. The same conversion gives the
+    /// wire form (`wildcardRegex`), so the preview and the core agree.
     public static func wildcardMatches(pattern: String, text: String) -> Bool {
-        let p = pattern.lowercased(), t = text.lowercased()
-        if !p.contains("*"), !p.contains("?") { return t.contains(p) }
-        var escaped = ""
-        for ch in p {
-            switch ch {
-            case "*": escaped += ".*"
-            case "?": escaped += "."
-            default: escaped += NSRegularExpression.escapedPattern(for: String(ch))
-            }
-        }
-        guard let re = try? NSRegularExpression(pattern: "^" + escaped + "$") else { return false }
-        return re.firstMatch(in: t, range: NSRange(t.startIndex..., in: t)) != nil
+        guard let re = try? NSRegularExpression(pattern: wildcardRegex(pattern), options: [.caseInsensitive]) else { return false }
+        return re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
     }
 
-    /// The wire form F3 will take.
-    public var arguments: [String: String] {
-        var a = ["url": url, "match": matching.rawValue, "phase": onRequest && onResponse ? "both" : onResponse ? "response" : "request"]
-        if !method.isEmpty { a["method"] = method.uppercased() }
-        if let flag { a["flag"] = flag.rawValue }
-        if !name.isEmpty { a["name"] = name }
+    /// The anchored regex a wildcard pattern means: `*` → `.*`, `?` → `.`, every
+    /// other character literal; no `*`/`?` → a substring (`.*pat.*`). Plain ASCII
+    /// escapes only, so ICU (the preview) and Rust's `regex` (the core) read it alike.
+    public static func wildcardRegex(_ pattern: String) -> String {
+        let substring = !pattern.contains("*") && !pattern.contains("?")
+        var body = substring ? ".*" : ""
+        for ch in pattern {
+            switch ch {
+            case "*": body += ".*"
+            case "?": body += "."
+            case "\\", ".", "+", "(", ")", "|", "[", "]", "{", "}", "^", "$": body += "\\\(ch)"
+            default: body.append(ch)
+            }
+        }
+        if substring { body += ".*" }
+        return "^" + body + "$"
+    }
+
+    /// The wire form of one `flow.intercept {rules}` entry: only the fields the core
+    /// knows (`crates/aitm-plugins/src/intercept.rs::rule_param_fields`), since one
+    /// unknown key rejects the whole call and leaves intercept armed on the old
+    /// rules — `match` and `flag` stay in the app. Phases are `request`, `response`
+    /// and `any` (both). `url` is always the core's `{regex}` object
+    /// (`crates/aitm-rules/src/bus.rs::parse_url_match`): a wildcard travels as the
+    /// regex `wildcardRegex` builds, case-insensitive like the preview, because the
+    /// core's own wildcard form has no `?`, no substring match and is case-sensitive.
+    public var arguments: [String: JSONValue] {
+        var a: [String: JSONValue] = [
+            "id": .string(id.uuidString),
+            "phase": .string(onRequest && onResponse ? "any" : onResponse ? "response" : "request"),
+        ]
+        switch matching {
+        case .wildcard: a["url"] = .object(["regex": .string("(?i)" + Self.wildcardRegex(url))])
+        case .regex: a["url"] = .object(["regex": .string(url)])
+        }
+        if !method.isEmpty { a["method"] = .string(method.uppercased()) }
+        if !name.isEmpty { a["name"] = .string(name) }
         return a
     }
 }
