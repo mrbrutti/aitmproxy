@@ -34,7 +34,6 @@ h2 check ids is missing from the catalogue (T3 is not merged yet), or the target
 started no TLS listener. The reason names the missing thing.
 """
 
-import dataclasses
 import json
 import sys
 import time
@@ -125,8 +124,12 @@ def assert_rejections(cfg, target, label: str) -> None:
     probe that sent nothing. Each check observes an origin once per ten minutes
     per check instance, and the job just did, so the manual run uses a core of
     its own (fresh instances) against the same target."""
-    # The job's core is still up, so the fresh one takes a port of its own.
-    with Aitm.server(dataclasses.replace(cfg, proxy_port=free_port())) as fresh:
+    # The job's core is still up, so the fresh one takes ports of its own: a new
+    # CoreConfig picks every port afresh (a `replace` of the proxy port alone kept
+    # the first core's browser proxy port and collided with it).
+    fresh_cfg = CoreConfig(proxy_port=free_port(), ssl_insecure=True,
+                           scope_entries=list(cfg.scope_entries))
+    with Aitm.server(fresh_cfg) as fresh:
         op = BusClient.operator(fresh)
         for check_id in SILENT_CHECKS:
             v = scan_call(op, "operator", f"check.{check_id}",
