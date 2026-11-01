@@ -807,9 +807,12 @@ Kept by the main session during stage 6. One row per finding.
   shows the six scan crates linked. No bus verb added; `tools/list` unchanged.
 - **Panel:** security / quality / spec PASS on the full range and PASS again on the fix range;
   tester PASS; every finding and disposition in the Review log above. No open findings.
-- **Cut:** nothing from the plan. Deferred by decision: `L4Seed` strictness beyond the key-naming
-  errors (accepted), the `main.rs` ws-language slot has no hermetic test (covered by the real boot
-  and T4's live cells), `serde_yaml` stays until a maintained successor is chosen.
+- **Cut:** nothing from the plan. Accepted in the Review log rather than fixed: five quality Minors
+  (the `ScanErrorCode` token table, the `main.rs` per-language block, the null-stub duplication,
+  the explicit profile defaults) and the `main.rs` ws-language slot's lack of a hermetic test
+  (covered by the real boot and T4's live cells). `serde_yaml` stays as a dev-dependency of the
+  model crate until a maintained successor is chosen (noted by the security reviewer; no finding
+  row).
 - **Follow-ups (handed to later tracks, recorded in the Review log):** a single token table and unit
   error type for `ScanErrorCode` (T1b, done on its branch), a `testing` module of null stubs in
   the model crate (T1b), refusing nameless/targetless profiles at `scan.start` (T1b, done),
