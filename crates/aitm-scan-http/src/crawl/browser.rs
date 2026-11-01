@@ -783,15 +783,19 @@ impl<'a> Run<'a> {
             // The submit eval addressed the tagged element and re-read its
             // live action (R-I1): a form that vanished or was retargeted since
             // the tag eval is refused there, and the action it did carry is
-            // judged here by the rule that admitted the extracted form. Either
-            // refusal is a skip: nothing to settle on, nothing to collect.
+            // judged here by the rule that admitted the extracted form, in the
+            // shape `FormSpec::from_attrs` gives every form it judges (R-M6).
+            // Either refusal is a skip: nothing to settle on, nothing to
+            // collect.
             let admitted = answer.as_ref().is_some_and(|answer| {
                 answer.ok
                     && form_action(
-                        &FormSpec {
-                            action: answer.action.clone(),
-                            ..form.clone()
-                        },
+                        &FormSpec::from_attrs(
+                            form.index,
+                            answer.action.as_deref(),
+                            Some(&form.method),
+                            form.enctype.as_deref(),
+                        ),
                         page,
                         self.origin,
                         extracted.base.as_deref(),
