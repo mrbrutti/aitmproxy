@@ -132,6 +132,22 @@ G53. Addendum to G45: `fold_profile` also refuses when any `target.l4[].ip` fail
 
 G54. Addendum to G36: the cached `TreeNode` carries its `TriState`, recomputed on toggle and on `fold_checks`, so `check_summary` and `tree_line` do no per-node scan of `include`/`exclude` per frame; `tri_state` stays for the toggle path. Test rides with G36's.
 
+## Task 11 quality panel
+
+G52 is raised to **priority** (the quality panel rated the per-frame editor clone Important: the copy is proportional to wire data). Also delete the `position(..).unwrap_or_default()` field lookup in `field_lines` (it printed the name for any field missing from `EDITOR_FIELDS`).
+
+G55. Two private `wrap` functions in `ui/scan/` (`crates/aitm-tui/src/ui/scan/profiles.rs` `wrap`/`clauses`; `crates/aitm-tui/src/ui/scan/confirm.rs` `wrap` measuring `chars().count()`): move the clause-aware, width-measured `wrap` and `clauses` with their tests to `ui/scan/mod.rs` beside `hint`/`labelled`; confirm calls it with `usize::MAX` rows and keeps its `vec![""]` empty-text contract at the call site. Test: confirm's existing tests plus one wide-glyph prompt wrapped by width, not chars.
+
+G56. The scroll-and-highlight row loop is written six times across `ui/scan/` (Profiles `list`/`origins`/`checks`, Jobs `list`, Sitemap `nodes`/`points`, Issues `list`): one `pub fn rows(buf, theme, area, total, cursor, focused, line: impl FnMut(usize) -> Line<'static>)` in `ui/scan/mod.rs` with a unit test for the scroll arithmetic (`top = cursor.saturating_sub(h - 1)`, enumerate/skip/take, selection on the cursor row while focused); rides with G29.
+
+G57. Addendum to G36: `check_summary` builds a second uncollapsed tree per frame with `&Default::default()` hiding the `BTreeSet<String>` type; the cached tree carries every node with a `hidden` flag (or a lanes-and-classes list) so the pane and the summary read one structure; any surviving direct call writes `&BTreeSet::new()`; the doc quotes the real glyphs (`◇`, not `○`).
+
+G58. The wildcard rule is decided in two places (`crates/aitm-tui/src/ui/scan/profiles.rs` `starts_with("*.")`; `crates/aitm-tui/src/scan/profiles.rs` `origin_choices`): `pub(crate) fn is_wildcard(entry: &str) -> bool` in `scan/profiles.rs`, used by both, so the view greys exactly what the picker skipped. Test: an entry `*` is greyed, not offered.
+
+G59. View hygiene (`crates/aitm-tui/src/ui/scan/profiles.rs`): bind `area.width` directly where `w + 1` is the only use; one `NO_PROFILES` const for the two `"no profiles yet"` literals with a one-line why on the editor-open branch; move `EDITING_MARK` beside `BUILTIN_MARK` in `scan::profiles`; drop the duplicate `BOLD` on `name_style` or in `highlight`; one `scan::GAP`/`GAP_TEXT` pair shared with Jobs (rides with G51's precomputed `ProfileRow`); the module doc keeps the ownership and D13 rules and points at the functions instead of narrating every pane.
+
+G60. Addendum to G44, Task 11's tests (`crates/aitm-tui/tests/scan_v2_profiles.rs`): one trimmed row literal per pane (the `standard` list row, the lanes line, the budget line, one tree row, one picker row) beside the fragment asserts; `line_with(..).unwrap_or_default()` becomes `unwrap_or_else(|| panic!(..))` naming the missing row.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).

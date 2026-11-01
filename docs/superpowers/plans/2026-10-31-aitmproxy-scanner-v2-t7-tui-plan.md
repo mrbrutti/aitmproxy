@@ -522,6 +522,13 @@ Kept by the main session during stage 6. One row per finding.
 | 11 | spec | Minor | `EDITING_MARK` and `TriState::glyph` undeclared | Task 11 file list amended |
 | 11 | spec | Minor | held-editor mark shown while held, not only while dirty | ratified; Task 10 disposition reworded |
 | 11 | spec | Minor | eleven builder decisions not in D11 (glyphs, columns, Fields block, extra field lines, `(unnamed)`, focus highlight, Origins/Checks rows and key heads, no-editor text, 4-row blocked wrap, hue) | all ratified in D11; the 4-row wrap with ellipsis accepted (first clause always whole) |
+| 11 | quality | Important | the Fields block deep-clones the whole editor every frame; `position(..).unwrap_or_default()` prints the name for an unknown field | fix round G (G52 raised to priority) |
+| 11 | quality | Minor | two private `wrap` functions in `ui/scan/` (profiles clause-aware by width, confirm greedy by chars) | fix round G (G55) |
+| 11 | quality | Minor | scroll-and-highlight row loop written six times across the views | fix round G (G56, with G29) |
+| 11 | quality | Minor | `check_summary` builds a second uncollapsed tree per frame; `&Default::default()` hides the type; doc quotes `○` | fix round G (G57, addendum to G36) |
+| 11 | quality | Minor | wildcard rule decided in two places | fix round G (G58) |
+| 11 | quality | Minor | view hygiene: dead `w`, two `no profiles yet` literals, `EDITING_MARK` apart from `BUILTIN_MARK`, double `BOLD`, second `GAP` pair, narrating module doc | fix round G (G59) |
+| 11 | quality | Minor | tests keep the fragment style; `unwrap_or_default()` hides a missing row | fix round G (G60, addendum to G44) |
 
 ## Shipped
 
