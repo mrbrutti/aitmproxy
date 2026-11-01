@@ -844,6 +844,234 @@ mod tests {
         assert_eq!(scope_filter(&g, "lo0"), Some("host 127.0.0.1".to_string()));
     }
 
+    // ---- Tester (stage 5): L4PAR-AC34 edge cases -----------------------------
+
+    /// A backend that records the BPF filter each capture was opened with, then
+    /// replays a fixed script of frames like [`ScriptBackend`].
+    struct FilterRecordingBackend {
+        frames: Mutex<Option<Vec<Vec<u8>>>>,
+        delivered: Arc<AtomicBool>,
+        filters: Mutex<Vec<Option<String>>>,
+    }
+
+    impl CaptureInjectBackend for FilterRecordingBackend {
+        fn open_capture(
+            &self,
+            _iface: &str,
+            filter: Option<&str>,
+            _read_timeout: Duration,
+        ) -> Result<Box<dyn CaptureSource>, L4Error> {
+            self.filters
+                .lock()
+                .unwrap()
+                .push(filter.map(str::to_string));
+            let frames = self.frames.lock().unwrap().take().unwrap_or_default();
+            Ok(Box::new(ScriptSource {
+                frames: frames.into_iter().collect(),
+                delivered: self.delivered.clone(),
+            }))
+        }
+
+        fn inject(&self, _iface: &str, _bytes: &[u8]) -> Result<(), L4Error> {
+            Ok(())
+        }
+    }
+
+    /// `ip` framed the way BSD/macOS `lo0` delivers it (`DLT_NULL`): a 4-byte
+    /// host-order address-family word (`AF_INET` = 2, `AF_INET6` = 30 on macOS)
+    /// before the IP header.
+    fn dlt_null(af: u32, ip: &[u8]) -> Vec<u8> {
+        let mut out = af.to_le_bytes().to_vec();
+        out.extend_from_slice(ip);
+        out
+    }
+
+    /// `ip` framed the way Linux `lo` delivers it: an Ethernet header with zero
+    /// MACs and the IPv4 EtherType.
+    fn linux_lo_ethernet(src_port: u16, dst_port: u16) -> Vec<u8> {
+        use crate::craft::{EtherSpec, TcpSpec};
+        PacketSpec {
+            layers: vec![
+                Layer::Ether(EtherSpec {
+                    dst: Some([0; 6]),
+                    src: Some([0; 6]),
+                    ..EtherSpec::default()
+                }),
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::LOCALHOST),
+                    dst: Some(Ipv4Addr::LOCALHOST),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(src_port),
+                    dst_port: Some(dst_port),
+                    ..TcpSpec::default()
+                }),
+                Layer::Raw(b"{\"token\": \"not-for-agents\"}\n".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds")
+    }
+
+    /// An IPv6 `::1` TCP frame `src_port` → `dst_port` with a bus-shaped line.
+    fn lo6_tcp_frame(src_port: u16, dst_port: u16) -> Vec<u8> {
+        use crate::craft::{Ipv6Spec, TcpSpec};
+        PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    src: Some(std::net::Ipv6Addr::LOCALHOST),
+                    dst: Some(std::net::Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(src_port),
+                    dst_port: Some(dst_port),
+                    ..TcpSpec::default()
+                }),
+                Layer::Raw(b"{\"token\": \"not-for-agents\"}\n".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds")
+    }
+
+    /// L4PAR-AC34 (tester), end to end through `start_capture` on `lo0`: the
+    /// real capture loop, with frames in the link-layer shapes a loopback
+    /// actually delivers (macOS `DLT_NULL`, Linux zero-MAC Ethernet, raw IP) and
+    /// over IPv4 and IPv6, under a capture scope covering `127.0.0.1/32` and
+    /// `::1/128` on every port. Every frame to or from the self ports is dropped;
+    /// the in-scope frame to 9099 is the only one recorded; and the BPF filter
+    /// the backend was opened with carries the exclusion.
+    #[test]
+    fn capture_loop_drops_self_traffic_in_every_loopback_framing() {
+        let mut v6 = lo0_entry((0, u16::MAX));
+        v6.cidr = IpCidr {
+            addr: "::1".parse().unwrap(),
+            prefix: 128,
+        };
+        let g = guard_with(vec![lo0_entry((0, u16::MAX)), v6]);
+        g.set_self_ports([27431, 28182]);
+
+        let kept = dlt_null(2, &lo_tcp_frame(51000, 9099));
+        let backend = Arc::new(FilterRecordingBackend {
+            frames: Mutex::new(Some(vec![
+                dlt_null(2, &lo_tcp_frame(51000, 27431)), // to the bus, macOS lo0 framing
+                dlt_null(2, &lo_tcp_frame(27431, 51000)), // the bus's reply
+                lo_tcp_frame(51001, 28182),               // to the web UI, raw IP
+                linux_lo_ethernet(51002, 27431),          // Linux lo framing
+                dlt_null(30, &lo6_tcp_frame(51003, 27431)), // IPv6 ::1 to the bus
+                lo6_tcp_frame(27431, 51003),              // IPv6 reply, raw IP
+                kept.clone(),                             // in scope, not self: kept
+            ])),
+            delivered: Arc::new(AtomicBool::new(false)),
+            filters: Mutex::new(Vec::new()),
+        });
+        let delivered = backend.delivered.clone();
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+
+        let handle = start_capture(
+            g.clone(),
+            backend.clone(),
+            store.clone(),
+            CaptureParams::new("lo0", L4Direction::Outbound),
+        )
+        .expect("authorized lo0 capture starts");
+        let flow_id = handle.flow_id();
+        wait_for(&delivered);
+        handle.stop();
+
+        let flow = store.get(flow_id).expect("capture flow present");
+        assert_eq!(
+            flow.packets.len(),
+            1,
+            "only the non-self in-scope frame is recorded, got {:?}",
+            flow.packets
+                .iter()
+                .map(|p| PacketSpec::endpoints(&p.bytes))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(flow.packets[0].bytes, kept);
+        let ep = PacketSpec::endpoints(&flow.packets[0].bytes);
+        assert_eq!(ep.src_port, Some(51000));
+        assert_eq!(ep.dst_port, Some(9099));
+
+        assert_eq!(
+            backend.filters.lock().unwrap().as_slice(),
+            &[Some(
+                "((host 127.0.0.1) or (host ::1)) and not (port 27431 or port 28182)".to_string()
+            )],
+            "the kernel filter excludes the self ports too"
+        );
+        assert_eq!(
+            flow.bind.filter.as_deref(),
+            Some("((host 127.0.0.1) or (host ::1)) and not (port 27431 or port 28182)"),
+            "the flow records the filter it ran with"
+        );
+    }
+
+    /// L4PAR-AC34 (tester): the exclusion is parenthesised so it ANDs onto a
+    /// multi-entry OR scope as a whole (BPF `and` binds tighter than `or`).
+    #[test]
+    fn scope_filter_exclusion_wraps_a_multi_entry_scope() {
+        let mut second = lo0_entry((9000, 9999));
+        second.cidr = IpCidr {
+            addr: "127.0.0.2".parse().unwrap(),
+            prefix: 32,
+        };
+        let g = guard_with(vec![lo0_entry((0, u16::MAX)), second]);
+        g.set_self_ports([27431]);
+        assert_eq!(
+            scope_filter(&g, "lo0"),
+            Some(
+                "((host 127.0.0.1) or (host 127.0.0.2 and portrange 9000-9999)) and not port 27431"
+                    .to_string()
+            )
+        );
+    }
+
+    /// L4PAR-AC34 (tester): which interface names get the BPF exclusion. The
+    /// per-packet drop does not depend on the name (it keys on loopback
+    /// addresses), so a miss here only loses the first boundary.
+    #[test]
+    fn loopback_interface_names() {
+        for yes in ["lo", "lo0", "lo1", "lo10"] {
+            assert!(is_loopback_interface(yes), "{yes} is loopback");
+        }
+        for no in [
+            "", "l", "lo0x", "low", "lo-1", "eth0", "en0", "utun3", "mock0",
+        ] {
+            assert!(!is_loopback_interface(no), "{no:?} is not loopback");
+        }
+    }
+
+    /// L4PAR-AC34 (tester): self-port frames are dropped even when they are
+    /// malformed past the transport header, and an empty or truncated frame never
+    /// panics the capture path and is never recorded.
+    #[test]
+    fn record_frame_survives_empty_and_truncated_frames() {
+        let g = guard_with(vec![lo0_entry((0, u16::MAX))]);
+        g.set_self_ports([27431]);
+        let store = InMemoryL4FlowStore::new();
+        let flow_id = lo0_capture_flow(&store);
+        let full = lo_tcp_frame(51000, 9099);
+        for frame in [
+            Vec::new(),
+            vec![0x45],
+            vec![2, 0, 0, 0],
+            full[..10].to_vec(),
+            full[..20].to_vec(), // IPv4 header only, no TCP header
+            dlt_null(2, &full[..22]),
+        ] {
+            record_frame(&frame, "lo0", L4Direction::Outbound, &g, &store, flow_id);
+        }
+        assert_eq!(
+            store.get(flow_id).expect("flow").packets.len(),
+            0,
+            "no empty or truncated frame is recorded"
+        );
+    }
+
     /// AC8 / deny-by-default: an empty scope refuses to start a capture — no permit,
     /// no handle.
     #[test]

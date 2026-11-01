@@ -39,6 +39,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import socket
 import sys
 import time
@@ -246,6 +247,35 @@ def udp_spec(src_port: int, dst_port: int, payload: bytes) -> dict:
     ]}
 
 
+_SELF_EXCLUSION = re.compile(
+    r"(?:^|\band\s+)not\s+(?:port\s+(\d+)|\(((?:port\s+\d+\s+or\s+)*port\s+\d+)\))\s*$")
+
+
+def bpf_excluded_ports(bpf) -> list[int]:
+    """The ports in the self-exclusion clause spec §2.1 ANDs onto a loopback capture's BPF
+    filter: a trailing `not port P` (one self port) or `not (port A or port B ...)` (several,
+    ascending). `[]` when the filter has no such clause. (A substring test for
+    `not port <bus>` misses the multi-port form, which is what a real core with proxy,
+    browser, bus and web listeners compiles.)"""
+    if not isinstance(bpf, str):
+        return []
+    m = _SELF_EXCLUSION.search(bpf.strip())
+    if not m:
+        return []
+    if m.group(1):
+        return [int(m.group(1))]
+    return [int(p) for p in re.findall(r"port\s+(\d+)", m.group(2))]
+
+
+def scope_covers_port(entry: dict, port: int) -> bool:
+    """Whether an `l4.scope.list` entry's `ports` (`lo-hi`) covers `port`."""
+    lo, _, hi = str(entry.get("ports", "0-65535")).partition("-")
+    try:
+        return int(lo) <= port <= int(hi or lo)
+    except ValueError:
+        return False
+
+
 def is_loopback_v4_cidr(cidr: str) -> bool:
     return cidr.split("/", 1)[0].strip().startswith("127.")
 
@@ -388,8 +418,10 @@ def main() -> int:
         head = op.call("l4.flow.get", {"id": flow_id, "limit": 0})
         bpf = head.get("filter")
         print(f"note: capture flow {flow_id} filter={bpf!r}", flush=True)
-        expect(isinstance(bpf, str) and f"not port {bus_port}" in bpf.replace("(", " ").replace(")", " "),
-               "the compiled BPF filter excludes the bus port (AC34 self-exclusion)", bpf)
+        excluded = bpf_excluded_ports(bpf)
+        expect(bus_port in excluded, "the compiled BPF filter excludes the bus port (AC34 self-exclusion)", bpf)
+        if proxy_port:
+            expect(proxy_port in excluded, "the compiled BPF filter excludes the proxy port (AC34 self-exclusion)", bpf)
 
         section("step 2: real HTTP (via the proxy), raw TCP and UDP-echo traffic while the capture runs")
         proxied, connected = drive_http(proxy_port, http_port, tag, n=3)
@@ -441,6 +473,11 @@ def main() -> int:
                (detail.get("truncated"), detail.get("next_offset")))
 
         section("step 5: AC34 -- the capture never recorded this script's own bus connection")
+        if not scope_covers_port(loop_caps[0], bus_port):
+            skipped_check("AC34 packet-level drop is discriminating here",
+                          f"the config capture scope ports {loop_caps[0].get('ports')!r} do not cover the bus "
+                          f"port {bus_port}, so scope alone keeps the bus out of this capture; the BPF "
+                          "exclusion check in step 1 and the unit tests are the proof of self-exclusion")
         all_pkts = read_all_packets(op, flow_id)
         own = self_traffic(all_pkts, (bus_port, proxy_port))
         print(f"note: scanned {len(all_pkts)} packets for ports {(bus_port, proxy_port)}", flush=True)

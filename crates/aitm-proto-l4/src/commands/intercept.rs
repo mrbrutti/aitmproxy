@@ -1747,6 +1747,217 @@ mod tests {
         assert!(parked_at_field.required);
     }
 
+    // ---- Tester (stage 5): L4PAR-AC37 edge cases -----------------------------
+
+    /// The `(id, parked_at, state)` of every entry `l4.intercept.list` returns for
+    /// `params`, in reply order.
+    fn list_entries(
+        list: &InterceptList,
+        host: &CommandHost,
+        params: Params,
+    ) -> Vec<(String, i64, String)> {
+        let Value::Array(items) = list.invoke(params, host).expect("list ok") else {
+            panic!("list returns an array");
+        };
+        items
+            .into_iter()
+            .map(|v| {
+                let Value::Object(o) = v else {
+                    panic!("a parked entry is an object");
+                };
+                let id = match o.get("id") {
+                    Some(Value::Str(s)) => s.clone(),
+                    other => panic!("id must be a string, got {other:?}"),
+                };
+                let at = match o.get("parked_at") {
+                    Some(Value::Int(ms)) => *ms,
+                    other => panic!("parked_at must be an Int, got {other:?}"),
+                };
+                let state = match o.get("state") {
+                    Some(Value::Str(s)) => s.clone(),
+                    other => panic!("state must be a string, got {other:?}"),
+                };
+                (id, at, state)
+            })
+            .collect()
+    }
+
+    /// A parked UDP packet to `10.0.0.5:9` carrying `payload`.
+    fn parked_packet(payload: &[u8]) -> L4Packet {
+        let bytes = ip_udp("10.0.0.5", payload);
+        L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: SystemTime::now(),
+            decoded: PacketSpec::summarize(&bytes),
+            bytes,
+            injected: false,
+        }
+    }
+
+    /// AC37 (tester): mutating the oldest parked packet does not move it. The
+    /// order is the arrival sequence, not "last touched", so the intercept bar's
+    /// default (the first listed) stays on the same packet after a Mutate, and the
+    /// `flow` filter keeps that order.
+    #[test]
+    fn intercept_list_order_survives_mutate_and_flow_filter() {
+        let guard = guard_with(vec![scope_entry(("10.0.0.5", 32), L4Capability::Intercept)]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let sessions = Arc::new(InterceptSessions::new());
+        let (backend, _verdicts) = MockBackend::with(vec![]);
+        let start = InterceptStart::with_backend(
+            guard,
+            store,
+            sessions.clone(),
+            Some(cfg(0)),
+            mock_factory(backend),
+        );
+        let list = InterceptList::new(sessions.clone());
+        let mutate = InterceptMutate::new(sessions.clone());
+        let parts = HostParts::new();
+        let host = parts.host();
+        start.invoke(start_params(0), &host).expect("start ok");
+
+        let deadline = SystemTime::now() + Duration::from_secs(30);
+        let ids = [3_u128, 1, 2].map(ParkedId::from_u128);
+        let flow = {
+            let map = sessions.lock();
+            let (fid, session) = map.iter().next().expect("one live session");
+            for (i, id) in ids.iter().enumerate() {
+                session
+                    .handle
+                    .park_for_test(*id, parked_packet(&[b'a' + i as u8]), deadline);
+            }
+            *fid
+        };
+        let want: Vec<String> = ids.iter().map(|id| parked_id_to_string(*id)).collect();
+        assert_eq!(
+            want,
+            vec![
+                "00000000-0000-0000-0000-000000000003",
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+            ]
+        );
+
+        // Mutate the oldest (uuid ...0003) with new raw bytes.
+        let mut m = BTreeMap::new();
+        m.insert("id".to_string(), Value::Str(want[0].clone()));
+        m.insert(
+            "bytes".to_string(),
+            Value::Bytes(ip_udp("10.0.0.5", b"mutated")),
+        );
+        mutate.invoke(Params::new(m), &host).expect("mutate ok");
+
+        let got = list_entries(&list, &host, Params::default());
+        let got_ids: Vec<&str> = got.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(got_ids, want, "a mutate must not reorder the list");
+        assert_eq!(got[0].2, "mutated");
+        assert_eq!(got[1].2, "parked");
+        assert_eq!(got[2].2, "parked");
+        assert!(
+            got[0].1 <= got[1].1 && got[1].1 <= got[2].1,
+            "parked_at is non-decreasing in arrival order: {got:?}"
+        );
+
+        // The same order through the `flow` filter the UIs use.
+        let filtered = list_entries(
+            &list,
+            &host,
+            one_param("flow", Value::Str(super::super::flow_id_to_string(flow))),
+        );
+        let filtered_ids: Vec<&str> = filtered.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(filtered_ids, want);
+
+        // A well-formed flow id with no session lists nothing.
+        let other = list_entries(
+            &list,
+            &host,
+            one_param(
+                "flow",
+                Value::Str(super::super::flow_id_to_string(crate::flow::L4FlowId::new())),
+            ),
+        );
+        assert!(other.is_empty(), "an unknown flow lists nothing: {other:?}");
+    }
+
+    /// AC37 (tester): a malformed `flow` filter is an error, not an unfiltered list.
+    #[test]
+    fn intercept_list_rejects_malformed_flow_filter() {
+        let sessions = Arc::new(InterceptSessions::new());
+        let list = InterceptList::new(sessions);
+        let parts = HostParts::new();
+        let host = parts.host();
+        assert!(list
+            .invoke(one_param("flow", Value::Str("not-a-uuid".into())), &host)
+            .is_err());
+        assert!(list
+            .invoke(one_param("flow", Value::Int(7)), &host)
+            .is_err());
+        // `null` counts as absent: the (empty) unfiltered list.
+        assert_eq!(
+            list.invoke(one_param("flow", Value::Null), &host)
+                .expect("null flow is no filter"),
+            Value::Array(vec![])
+        );
+    }
+
+    /// AC37 (tester) FINDING: across two live sessions the unfiltered
+    /// `l4.intercept.list` is not in arrival order. The sort key is
+    /// `(parked_seq, parked_at, id)` and `parked_seq` restarts at 0 in every
+    /// session, so session A's second packet (seq 1) is listed after session B's
+    /// first packet (seq 0) even though B's packet arrived later. Spec §4 says the
+    /// list is "in arrival order, oldest first". Un-ignore with the fix.
+    #[test]
+    #[ignore = "L4PAR-AC37 finding for the Coder: cross-session list order is by per-session seq, not arrival"]
+    fn intercept_list_is_arrival_ordered_across_sessions() {
+        let guard = guard_with(vec![scope_entry(("10.0.0.5", 32), L4Capability::Intercept)]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let sessions = Arc::new(InterceptSessions::new());
+        let (backend, _verdicts) = MockBackend::with(vec![]);
+        let start = InterceptStart::with_backend(
+            guard,
+            store,
+            sessions.clone(),
+            Some(cfg(0)),
+            mock_factory(backend),
+        );
+        let list = InterceptList::new(sessions.clone());
+        let parts = HostParts::new();
+        let host = parts.host();
+        start.invoke(start_params(0), &host).expect("start A");
+        start.invoke(start_params(1), &host).expect("start B");
+
+        let deadline = SystemTime::now() + Duration::from_secs(30);
+        let park = |session_index: usize, id: u128| {
+            let map = sessions.lock();
+            let mut flows: Vec<_> = map.keys().copied().collect();
+            flows.sort_by_key(|f| super::super::flow_id_to_string(*f));
+            let session = map.get(&flows[session_index]).expect("session");
+            session
+                .handle
+                .park_for_test(ParkedId::from_u128(id), parked_packet(b"x"), deadline);
+        };
+        // Arrival: A1 (A seq 0), A2 (A seq 1), then B1 (B seq 0), with a gap so
+        // `parked_at` differs by at least one millisecond each time.
+        park(0, 0xA1);
+        std::thread::sleep(Duration::from_millis(5));
+        park(0, 0xA2);
+        std::thread::sleep(Duration::from_millis(5));
+        park(1, 0xB1);
+
+        let got = list_entries(&list, &host, Params::default());
+        let got_ids: Vec<String> = got.into_iter().map(|(id, _, _)| id).collect();
+        assert_eq!(
+            got_ids,
+            vec![
+                parked_id_to_string(ParkedId::from_u128(0xA1)),
+                parked_id_to_string(ParkedId::from_u128(0xA2)),
+                parked_id_to_string(ParkedId::from_u128(0xB1)),
+            ],
+            "oldest first across sessions"
+        );
+    }
+
     // ---- Linux-gated functional tests (real NFQUEUE on a loopback nft queue) ---
 
     /// Whether the privileged, Linux-only in-path functional suite should run.

@@ -779,6 +779,89 @@ mod tests {
         assert!(!g.is_self_traffic(&ep("127.0.0.1", 51000, "127.0.0.1", 27431)));
     }
 
+    /// L4PAR-AC34 (tester): `is_self_traffic` edge cases. An IPv4-mapped IPv6
+    /// loopback (`::ffff:127.0.0.1`) is loopback; a frame with only one loopback
+    /// side still counts; UDP is covered like TCP; a frame with no ports (ICMP, or
+    /// an undecodable transport) is never self traffic; the empty set excludes
+    /// nothing.
+    #[test]
+    fn self_traffic_edge_cases() {
+        use crate::craft::PacketEndpoints;
+        let g = L4Guard::new(&cfg());
+        let ep = |proto: L4Proto, src: &str, sp: Option<u16>, dst: &str, dp: Option<u16>| {
+            PacketEndpoints {
+                proto: Some(proto),
+                src: Some(src.parse().unwrap()),
+                dst: Some(dst.parse().unwrap()),
+                src_port: sp,
+                dst_port: dp,
+            }
+        };
+        let bus = ep(
+            L4Proto::Tcp,
+            "127.0.0.1",
+            Some(51000),
+            "127.0.0.1",
+            Some(27431),
+        );
+        assert!(
+            !g.is_self_traffic(&bus),
+            "an empty self-port set excludes nothing"
+        );
+
+        g.set_self_ports([27431]);
+        assert!(g.is_self_traffic(&bus));
+        assert!(g.is_self_traffic(&ep(
+            L4Proto::Tcp,
+            "::ffff:127.0.0.1",
+            Some(51000),
+            "::ffff:127.0.0.1",
+            Some(27431)
+        )));
+        assert!(g.is_self_traffic(&ep(
+            L4Proto::Udp,
+            "127.0.0.1",
+            Some(27431),
+            "127.0.0.1",
+            Some(51000)
+        )));
+        assert!(
+            g.is_self_traffic(&ep(
+                L4Proto::Tcp,
+                "10.0.0.5",
+                Some(51000),
+                "127.0.0.1",
+                Some(27431)
+            )),
+            "one loopback side is enough"
+        );
+        assert!(g.is_self_traffic(&ep(
+            L4Proto::Tcp,
+            "127.0.0.2",
+            Some(51000),
+            "127.0.0.9",
+            Some(27431)
+        )));
+        assert!(
+            !g.is_self_traffic(&ep(L4Proto::Icmp, "127.0.0.1", None, "127.0.0.1", None)),
+            "no ports, no self traffic"
+        );
+        assert!(
+            !g.is_self_traffic(&ep(
+                L4Proto::Tcp,
+                "::ffff:10.0.0.5",
+                Some(51000),
+                "::ffff:10.0.0.9",
+                Some(27431)
+            )),
+            "a mapped non-loopback address is not loopback"
+        );
+
+        g.set_self_ports(std::iter::empty());
+        assert!(g.self_ports().is_empty(), "set to empty clears the set");
+        assert!(!g.is_self_traffic(&bus));
+    }
+
     fn cfg() -> L4Config {
         L4Config::default()
     }

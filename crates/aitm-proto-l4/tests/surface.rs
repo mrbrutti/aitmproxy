@@ -250,6 +250,33 @@ fn unprivileged_wire_verbs_unavailable_pure_verbs_work() {
         "sessions",
     );
 
+    // Tester (stage 5), L4PAR-AC3/AC4 unit half: the gated verbs refuse with
+    // exactly `L4 unavailable: ` + the `reason` the status verb reports, so a UI
+    // can show the status reason and know it is the text the button would return.
+    for (name, params, reason) in [
+        (
+            "l4.capture.start",
+            one("interface", Value::Str("lo0".into())),
+            "missing CAP_NET_RAW / /dev/bpf access",
+        ),
+        (
+            "l4.intercept.start",
+            one("interface", Value::Str("lo0".into())),
+            "missing CAP_NET_ADMIN",
+        ),
+    ] {
+        let err = reg
+            .command(name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+            .invoke(params, &host)
+            .expect_err(&format!("{name} must fail closed without privilege"));
+        assert_eq!(
+            err.to_string(),
+            format!("L4 unavailable: {reason}"),
+            "{name}"
+        );
+    }
+
     // Every pure / read / scope verb still works without privilege.
     reg.command("l4.interfaces")
         .unwrap()

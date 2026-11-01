@@ -1265,4 +1265,238 @@ mod tests {
         assert!(matches!(by_name("next_offset").ty, TypeDesc::Int));
         assert!(!by_name("next_offset").required);
     }
+
+    // ---- Tester (stage 5): AC1 / AC2 / AC35 / AC36 edge cases ----------------
+
+    /// A Capture flow holding one inbound packet per element of `packets`, in
+    /// order, in a fresh store.
+    fn flow_of(packets: Vec<Vec<u8>>) -> (Arc<dyn L4FlowStore>, String) {
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let id = store.insert(L4Flow {
+            id: L4FlowId::new(),
+            kind: L4FlowKind::Capture,
+            bind: L4Bind {
+                interface: "lo0".into(),
+                filter: None,
+                queue: None,
+            },
+            packets: packets
+                .into_iter()
+                .enumerate()
+                .map(|(i, bytes)| L4Packet {
+                    dir: L4Direction::Inbound,
+                    timestamp: at_ms(PACKET_MS + i as u64),
+                    decoded: PacketSpec::summarize(&bytes),
+                    bytes,
+                    injected: false,
+                })
+                .collect(),
+            metadata: L4Meta {
+                marks: Vec::new(),
+                comment: None,
+                created: at_ms(CREATED_MS),
+            },
+        });
+        (store, super::super::flow_id_to_string(id))
+    }
+
+    /// Invoke `l4.flow.get` as the operator with exactly `params`.
+    fn invoke_raw(
+        store: Arc<dyn L4FlowStore>,
+        params: Vec<(&str, Value)>,
+    ) -> anyhow::Result<Value> {
+        let mem = MemFlowStore::new();
+        let client = StubClient;
+        let core = StdGuard::default();
+        let host = CommandHost::new(&mem, &client, &core, None).with_frontend(Frontend::Operator);
+        let m: BTreeMap<String, Value> = params
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        FlowGet::new(store, closed_gates()).invoke(Params::new(m), &host)
+    }
+
+    /// L4PAR-AC35 (tester): the CLI is trusted control and gets `bytes` with the
+    /// gates closed, like the operator.
+    #[test]
+    fn flow_get_bytes_for_the_cli() {
+        let (store, id) = one_packet_flow(vec![0xde, 0xad]);
+        let packet = get_as(store, closed_gates(), Frontend::Cli, &id);
+        assert_eq!(packet.get("bytes"), Some(&Value::Bytes(vec![0xde, 0xad])));
+    }
+
+    /// L4PAR-AC35 + AC36 (tester): an agent whose Capture gate is open sees
+    /// bytes, so the byte budget applies to it exactly as to the operator.
+    #[test]
+    fn window_byte_budget_applies_to_an_agent_with_the_capture_gate_open() {
+        let (store, id) = sized_packet_flow(300, 60_000);
+        let gates = closed_gates();
+        gates.set(AgentGate::Capture, true);
+        let (flow, n) = get_window_as(store, gates, Frontend::Mcp, &id, &[]);
+        assert_eq!(n, 69);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Int(69)));
+    }
+
+    /// L4PAR-AC36 (tester): "within the budget" includes equal to it. Five 1 MiB
+    /// packets: the first four sum to exactly 4 MiB and are all returned, the
+    /// fifth is cut (`truncated`, `next_offset 4`). With `limit 4` the window, not
+    /// the budget, ends the walk: not truncated.
+    #[test]
+    fn window_byte_budget_exact_boundary() {
+        let mib = 1024 * 1024;
+        let (store, id) = sized_packet_flow(5, mib);
+        let (flow, n) = get_window_as(store.clone(), closed_gates(), Frontend::Operator, &id, &[]);
+        assert_eq!(n, 4, "4 × 1 MiB == the budget, which is within it");
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Int(4)));
+
+        let (flow, n) = get_window_as(
+            store,
+            closed_gates(),
+            Frontend::Operator,
+            &id,
+            &[("limit", 4)],
+        );
+        assert_eq!(n, 4);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Null));
+    }
+
+    /// L4PAR-AC36 (tester): `truncated` means the budget stopped the window, not
+    /// the limit. On the 300 × 60,000 flow, `limit 69` ends exactly where the
+    /// budget would (not truncated); `limit 70` is cut to 69 by the budget.
+    #[test]
+    fn window_byte_budget_versus_limit() {
+        let (store, id) = sized_packet_flow(300, 60_000);
+        let (flow, n) = get_window_as(
+            store.clone(),
+            closed_gates(),
+            Frontend::Operator,
+            &id,
+            &[("limit", 69)],
+        );
+        assert_eq!(n, 69);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Null));
+
+        let (flow, n) = get_window_as(
+            store,
+            closed_gates(),
+            Frontend::Operator,
+            &id,
+            &[("limit", 70)],
+        );
+        assert_eq!(n, 69);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(true)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Int(69)));
+    }
+
+    /// L4PAR-AC1 / AC2 (tester): the flow-level endpoints come from the first
+    /// *decodable* packet in the whole log, whatever the window: a leading
+    /// undecodable packet is skipped, and `limit 0` or a window past the
+    /// decodable packet still names the target.
+    #[test]
+    fn flow_endpoints_skip_an_undecodable_first_packet() {
+        let (store, id) = flow_of(vec![vec![0xde, 0xad], crafted_udp()]);
+        for extra in [
+            vec![],
+            vec![("limit", 0)],
+            vec![("offset", 0), ("limit", 1)],
+        ] {
+            let (flow, _) =
+                flow_and_count(get_window(store.clone(), &id, &extra).expect("flow.get ok"));
+            assert_eq!(
+                flow.get("proto"),
+                Some(&Value::Str("UDP".into())),
+                "{extra:?}"
+            );
+            assert_eq!(flow.get("src"), Some(&Value::Str("127.0.0.1".into())));
+            assert_eq!(flow.get("dst_port"), Some(&Value::Int(9053)));
+            assert_eq!(flow.get("src_port"), Some(&Value::Int(40000)));
+        }
+        // The window {0, 1} holds only the undecodable packet, null-addressed.
+        let got = get_window(store, &id, &[("offset", 0), ("limit", 1)]).expect("flow.get ok");
+        let Value::Object(flow) = got else {
+            panic!("object");
+        };
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets");
+        };
+        let Some(Value::Object(p0)) = packets.first() else {
+            panic!("one packet");
+        };
+        assert_eq!(packets.len(), 1);
+        assert_eq!(p0.get("proto"), Some(&Value::Null));
+        assert_eq!(p0.get("bytes"), Some(&Value::Bytes(vec![0xde, 0xad])));
+    }
+
+    /// L4PAR-AC1 / AC2 / AC36 (tester): a flow with no packets yet (a capture
+    /// that just started) answers with every flow field and an empty window.
+    #[test]
+    fn flow_get_empty_flow() {
+        let (store, id) = flow_of(vec![]);
+        let (flow, n) = flow_and_count(get_window(store, &id, &[]).expect("flow.get ok"));
+        assert_eq!(n, 0);
+        assert_eq!(flow.get("packet_count"), Some(&Value::Int(0)));
+        assert_eq!(flow.get("injected_count"), Some(&Value::Int(0)));
+        assert_eq!(flow.get("offset"), Some(&Value::Int(0)));
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+        assert_eq!(flow.get("next_offset"), Some(&Value::Null));
+        assert_eq!(flow.get("started_at"), Some(&Value::Int(1_700_000_000_000)));
+        for key in ["proto", "src", "dst", "src_port", "dst_port"] {
+            assert_eq!(flow.get(key), Some(&Value::Null), "flow.{key}");
+        }
+    }
+
+    /// L4PAR-AC2 (tester): malformed input is refused with an error, never
+    /// answered with a default window or another flow: an unknown id, a non-uuid
+    /// id, an empty id, a missing id, and window params of the wrong type.
+    #[test]
+    fn flow_get_refuses_malformed_input() {
+        let (store, id) = one_packet_flow(vec![0xde, 0xad]);
+        let unknown = super::super::flow_id_to_string(L4FlowId::new());
+        let err = invoke_raw(store.clone(), vec![("id", Value::Str(unknown.clone()))])
+            .expect_err("unknown id");
+        assert!(
+            err.to_string()
+                .contains(&format!("no L4 flow with id {unknown}")),
+            "got: {err}"
+        );
+        for bad in ["not-a-uuid", "", "00000000-0000-0000-0000"] {
+            assert!(
+                invoke_raw(store.clone(), vec![("id", Value::Str(bad.into()))]).is_err(),
+                "id {bad:?} must be refused"
+            );
+        }
+        assert!(invoke_raw(store.clone(), vec![]).is_err(), "missing id");
+        assert!(
+            invoke_raw(store.clone(), vec![("id", Value::Int(1))]).is_err(),
+            "non-string id"
+        );
+        for (k, v) in [
+            ("offset", Value::Str("10".into())),
+            ("limit", Value::Bool(true)),
+            ("limit", Value::Str("all".into())),
+        ] {
+            assert!(
+                invoke_raw(
+                    store.clone(),
+                    vec![("id", Value::Str(id.clone())), (k, v.clone())]
+                )
+                .is_err(),
+                "{k} = {v:?} must be refused"
+            );
+        }
+        // A huge offset is an empty window, not an overflow.
+        let (flow, n) = flow_and_count(
+            invoke_raw(
+                store,
+                vec![("id", Value::Str(id)), ("offset", Value::Int(i64::MAX))],
+            )
+            .expect("i64::MAX offset answers"),
+        );
+        assert_eq!(n, 0);
+        assert_eq!(flow.get("truncated"), Some(&Value::Bool(false)));
+    }
 }
