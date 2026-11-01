@@ -65,6 +65,9 @@ pub enum StopReason {
     GuardRefused(String),
     /// L4 is unavailable (no backend, no privilege), with its message.
     Unavailable(String),
+    /// The wire write itself failed: the stimulus was charged and never left
+    /// the host, so the run cannot be read as a clean one (review finding Q1).
+    WireWrite(String),
 }
 
 impl fmt::Display for StopReason {
@@ -79,6 +82,7 @@ impl fmt::Display for StopReason {
             Self::Cancelled => write!(f, "job cancelled"),
             Self::GuardRefused(m) => write!(f, "guard refused: {m}"),
             Self::Unavailable(m) => write!(f, "l4 unavailable: {m}"),
+            Self::WireWrite(m) => write!(f, "wire write failed: {m}"),
         }
     }
 }
@@ -1075,6 +1079,10 @@ mod tests {
         assert_eq!(
             StopReason::CaseCap(5000).to_string(),
             "case cap reached: 5000 cases sent"
+        );
+        assert_eq!(
+            StopReason::WireWrite("mock wire down".to_string()).to_string(),
+            "wire write failed: mock wire down"
         );
     }
 

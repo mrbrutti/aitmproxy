@@ -483,7 +483,7 @@ mod tests {
     use crate::fields::FieldPath;
     use crate::host::{PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
     use crate::plan::{point_id, TargetPlan};
-    use crate::state::LaneState;
+    use crate::state::{LaneState, StopReason};
     use crate::testing::{
         fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
         MockReply, TestJob,
@@ -777,6 +777,45 @@ mod tests {
                 .expect("counters")
                 .crashes,
             0
+        );
+    }
+
+    /// Review finding Q1: a wire write that fails is not a crafting mistake the
+    /// run can shrug off — the stimulus was charged and never reached the wire.
+    /// The job stops on it, and the point reports an error rather than a clean
+    /// run of "0 cases sent".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wire_write_failure_stops_the_job_and_is_not_clean() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 10);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // Discovery only opens a capture, so the wire breaks after it.
+        mock.fail_injects_with_wire_write();
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+
+        let run = runner.run_point().await;
+
+        assert_eq!(
+            run.stopped,
+            Some(StopReason::WireWrite("mock wire down".to_string()))
+        );
+        // The baseline is the one stimulus that was attempted: charged before
+        // the send, as every stimulus is, and not a case.
+        assert_eq!(job.charged(), 1);
+        assert!(run.cases.is_empty(), "{:?}", run.cases);
+        assert_eq!(
+            shared.state.counters(job.job_id()).expect("counters").cases,
+            0
+        );
+
+        let verdict = run_check(&CrashCheck::new(registry), &runner).await;
+        assert_eq!(verdict.outcome, Outcome::Error);
+        assert_eq!(verdict.confidence, Confidence::Tentative);
+        assert!(
+            verdict.detail.contains("wire write failed: mock wire down"),
+            "the verdict names the wire failure: {}",
+            verdict.detail
         );
     }
 

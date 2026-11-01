@@ -141,7 +141,8 @@ impl fmt::Debug for Shared {
 pub enum HostError {
     /// The lane stopped sending for this job; the reason is the ladder's.
     Stopped(StopReason),
-    /// The case could not be crafted or written to the wire.
+    /// The case could not be crafted. A wire write that fails is a
+    /// [`StopReason::WireWrite`] stop, not this (review finding Q1).
     Craft(String),
 }
 
@@ -300,9 +301,9 @@ impl PointRunner {
     /// # Errors
     /// [`HostError::Stopped`] when the job is cancelled, out of budget, past
     /// its deadline, refused by the guard or already stopped — including when
-    /// this very case tripped the stop ladder, which is recorded first.
-    /// [`HostError::Craft`] when the spec does not build or the wire write
-    /// fails.
+    /// this very case tripped the stop ladder, which is recorded first —
+    /// including a failed wire write ([`StopReason::WireWrite`]).
+    /// [`HostError::Craft`] when the spec does not build.
     pub async fn send_spec(
         &self,
         spec: PacketSpec,
@@ -590,7 +591,14 @@ impl PointRunner {
                     self.stop(reason.clone());
                     return Err(HostError::Stopped(reason));
                 }
-                Err(L4Error::WireWrite(message)) => return Err(HostError::Craft(message)),
+                // The stimulus was charged at (d) and never reached the wire:
+                // the send path is broken, so the job stops on it rather than
+                // running on and reporting a clean point (review finding Q1).
+                Err(L4Error::WireWrite(message)) => {
+                    let reason = StopReason::WireWrite(message);
+                    self.stop(reason.clone());
+                    return Err(HostError::Stopped(reason));
+                }
             }
         };
 
@@ -729,7 +737,27 @@ impl PointRunner {
                     run.stopped = Some(reason);
                     break;
                 }
-                Err(HostError::Craft(_)) => continue,
+                // A case the builder refused never went out: it is recorded as
+                // an unsendable case, exactly as one `mutation.apply` could not
+                // render, instead of vanishing from the run (review finding Q1).
+                Err(HostError::Craft(_)) => {
+                    let _ = self
+                        .shared
+                        .state
+                        .record_case(job_id, CaseClass::Silence, false);
+                    run.cases.push(CaseRecord {
+                        index,
+                        seed_id: seed.id,
+                        chain,
+                        sent_hex: String::new(),
+                        class: None,
+                        sent: false,
+                        elapsed_ms: 0,
+                        latency_outlier: false,
+                        liveness: None,
+                    });
+                    continue;
+                }
             };
             let mut record = delivered.sent.record;
             let stop = delivered.stop;
@@ -827,11 +855,15 @@ impl PointRunner {
     /// The two liveness probes a candidate costs: the second only when the
     /// first failed, unless `always` (after a replay, where both verdicts are
     /// part of the reproduction criterion).
+    /// A probe the builder refused never went out, so it says nothing about
+    /// the target: it is read as an unsendable, not as a failed probe, and
+    /// never starts a triage on evidence that does not exist (review finding
+    /// Q1). A failed wire write is a stop and propagates as one.
     async fn probe_pair(&self, always: bool) -> (bool, bool, Option<StopReason>) {
         let first = match self.liveness_probe().await {
             Ok(passed) => passed,
             Err(HostError::Stopped(reason)) => return (false, false, Some(reason)),
-            Err(HostError::Craft(_)) => false,
+            Err(HostError::Craft(_)) => return (true, true, None),
         };
         if first && !always {
             return (true, true, None);
@@ -840,7 +872,7 @@ impl PointRunner {
         match self.liveness_probe().await {
             Ok(second) => (first, second, None),
             Err(HostError::Stopped(reason)) => (first, false, Some(reason)),
-            Err(HostError::Craft(_)) => (first, false, None),
+            Err(HostError::Craft(_)) => (first, true, None),
         }
     }
 

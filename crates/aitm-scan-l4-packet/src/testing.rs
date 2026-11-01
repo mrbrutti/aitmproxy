@@ -114,6 +114,8 @@ struct Script {
     triggered: bool,
     /// How long a reply waits in the queue before a capture may read it.
     reply_delay: Duration,
+    /// Whether every inject fails with [`L4Error::WireWrite`].
+    wire_write_fails: bool,
 }
 
 /// An in-memory [`CaptureInjectBackend`]: it answers injected stimuli from a
@@ -206,6 +208,15 @@ impl MockBackend {
         });
         script.silent_left = 0;
         script.triggered = false;
+    }
+
+    /// Fail every inject the way a raw socket whose write is refused does:
+    /// [`L4Error::WireWrite`], with nothing on the wire and nothing recorded as
+    /// injected. The capture still opens, so this is the "the send path broke
+    /// under us" shape, not the "no privilege" one
+    /// ([`MockBackend::unavailable`]).
+    pub fn fail_injects_with_wire_write(&self) {
+        lock(&self.script).wire_write_fails = true;
     }
 
     /// Hold every reply in the queue for `d` before a capture may read it, so
@@ -323,6 +334,9 @@ impl CaptureInjectBackend for MockBackend {
     fn inject(&self, _iface: &str, bytes: &[u8]) -> Result<(), L4Error> {
         if !self.available {
             return Err(L4Error::Unavailable("no inject privilege (mock)".into()));
+        }
+        if lock(&self.script).wire_write_fails {
+            return Err(L4Error::WireWrite("mock wire down".into()));
         }
         let count = {
             let mut injected = lock(&self.injected);
