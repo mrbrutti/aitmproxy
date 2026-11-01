@@ -400,7 +400,7 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-**Status line:** shipped pending merge (2026-11-01). Tasks 1–4 built and panel-reviewed over three rounds
+**Status line:** shipped pending merge (2026-11-01) — PR https://github.com/mrbrutti/aitmproxy/pull/266 (panel comment posted). Tasks 1–4 built and panel-reviewed over three rounds
 (all PASS; every Minor fixed or accepted above; round-3 comment fixes `5ea7a3d8`); Task 5 (TR-AC8) run on Matt's Mac 2026-11-01 14:25–14:31
 PST under his go ("Yes, when ready", via the orchestrator, display lock held); **Tasks 6 (T2) and 7 (R1) were
 NOT built** — the ladder's first rung held: the in-place `setTunnelNetworkSettings` re-apply takes effect on
