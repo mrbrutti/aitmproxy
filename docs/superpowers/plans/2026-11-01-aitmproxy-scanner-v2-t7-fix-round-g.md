@@ -30,6 +30,12 @@ G11. **The Jobs Detail pane formats unbounded free-text fields every frame** (`c
 
 G12. **Retained capacity after `truncate`; timing vectors never cut** (`crates/aitm-tui/src/scan/issues.rs` `bound_issue`): `shrink_to_fit()` after the mutation-chain and flow truncations; cut `timing.requested_s/observed_ms/baseline_ms` to `TIMING_ROWS_MAX + 1` at fold and keep the original row count in `ReadIssue.dropped` (G6's struct) so `... n more` stays right. Test: an issue with 10^6 timing samples folds to 13 rows with `dropped.timing == 999_987`.
 
+## Task 9 coder notes
+
+G13. `tests/scan_v2_matrix.rs` sets `sitemap.nodes` directly (bypassing the fold, so `lines` stays empty): route the v2 Site map setup through a folded `scan.sitemap` reply.
+
+G14. Two pre-existing em dashes in legacy toast literals in `crates/aitm-tui/src/app.rs` ("Scan needs an in-scope host — ...", "Out of scope — add ..."): replace the dash with a colon; update the `scan_surface.rs` assertion if it pins the text.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).

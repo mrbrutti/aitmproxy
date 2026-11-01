@@ -457,6 +457,10 @@ Kept by the main session during stage 6. One row per finding.
 | fix E+F | security | Minor | Jobs Detail free-text fields (`error`, `client_label`, reasons, running ids) unbounded per frame | fix round G (G11) |
 | fix E+F | security | Minor | `Vec::truncate` keeps capacity; timing vectors never cut | fix round G (G12) |
 | fix E+F | security | note | `scan.list` length is not capped client-side; no reply-size cap below the bus client's 64 MiB line | accepted for v2 (the status fan-out is capped; rows per frame are bounded in text); candidate for the T1b/bus-client follow-up |
+| 9 | coder note | note | a third `scan_surface.rs` literal (the `r` launch target) follows D8; `SitemapState` gains `lines`/`appending`; D8 wording aligned to the plan's both-scheme rule; the summary line sits in the Nodes pane | spec D8/D3/D11/D12 amended in this commit |
+| 9 | coder note | note | legacy `endpoint_flows` ids that are not UUIDs cannot be carried in `SiteNode.flows` (fixture-only); `Enter` still opens them through `legacy.endpoint_flows` | accepted |
+| 9 | coder note | Minor | `tests/scan_v2_matrix.rs` sets `sitemap.nodes` directly, bypassing the fold | fix round G (G13): route through `fold_result` |
+| 9 | coder note | Minor | two pre-existing em dashes in legacy toast literals in `app.rs` | fix round G (G14): replace with a colon |
 
 ## Shipped
 
