@@ -18,6 +18,7 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode, BUILTIN_COMMANDS};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::ScanTab;
+use aitm_tui::ui::scan::HELP;
 use common::*;
 use serde_json::{json, Value};
 
@@ -356,18 +357,16 @@ fn palette_and_help_name_the_surface() {
     let _ = app.update(Action::Help);
     assert_eq!(app.mode, Mode::Help);
     let text = text_of(&app, 200, 50);
-    let scan_heading = row_of(&text, " Scan");
-    let tabs = row_of(&text, "1 2 3 4");
-    assert!(
-        tabs > scan_heading,
-        "the tab keys sit under the Scan heading:\n{text}"
+    // The heading is found by its own text at the box's left edge, not by a
+    // ` Scan` that the `F / S / @` line also carries (fix round G, G88).
+    let scan_heading = row_of(&text, "│ Scan");
+    assert_eq!(
+        row_of(&text, "1 2 3 4"),
+        scan_heading + 1,
+        "the tab keys sit right under the Scan heading:\n{text}"
     );
-    for (key, word) in [
-        ("Profiles", "s start"),
-        ("Jobs", "x cancel"),
-        ("Site map", "n next page"),
-        ("Issues", "f false positive"),
-    ] {
+    assert!(!HELP.is_empty(), "the Scan help section has entries");
+    for (key, what) in HELP {
         // The overlay's key column: `│ <key padded to 10>` inside the box.
         let column = format!("│ {key:<10}");
         let line = text
@@ -375,10 +374,25 @@ fn palette_and_help_name_the_surface() {
             .skip(scan_heading + 1)
             .find(|l| l.contains(&column))
             .unwrap_or_else(|| panic!("no help line for {key}:\n{text}"));
-        assert!(line.contains(word), "{key} help names {word:?}: {line:?}");
+        // The entry's whole text is on the line: a clipped line fails.
         assert!(
-            !line.contains('…') && line.trim_end().ends_with('│'),
-            "{key} help fits the box: {line:?}"
+            line.contains(what),
+            "{key} help carries its whole text {what:?}: {line:?}"
+        );
+    }
+    for (key, word) in [
+        ("Profiles", "s start"),
+        ("Jobs", "x cancel"),
+        ("Site map", "n next page"),
+        ("Issues", "f false positive"),
+    ] {
+        let entry = HELP
+            .iter()
+            .find(|(k, _)| *k == key)
+            .unwrap_or_else(|| panic!("no {key} entry in HELP: {HELP:?}"));
+        assert!(
+            entry.1.contains(word),
+            "{key} help names {word:?}: {entry:?}"
         );
     }
 }
