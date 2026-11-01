@@ -48,6 +48,12 @@ G18. `authority_parts` accepts `@`, `/`, `?`, `#` and whitespace in a host (`cra
 
 G19. On a bus offering both `scan.start` and `scan.discover` the legacy fold overwrites the v2 Site map lists (`crates/aitm-tui/src/app.rs` `scan.discover` arm, `crates/aitm-tui/src/scan/sitemap.rs`): call `show_legacy` only when `MapSource::from(scan_offer()) == Legacy`; under V2 the legacy result stays in `legacy.*` and the Site map shows v2 content. Test: a V2 app with a folded `scan.sitemap` page then a `scan.discover` reply keeps its nodes.
 
+## Task 9 spec panel
+
+G20 (priority). **Orphan points are dropped at fold** (`crates/aitm-tui/src/scan/sitemap.rs` `order_points`/`fold_result`): keep every point; a point whose `site_node` is `None` or names no current node sorts last (key `nodes.len()`) and is not drawn; re-run the ordering after every append so a point re-attaches when its node arrives on a later page. Update the unit test that pinned the drop. Test (`tests/scan_v2_sitemap.rs`): page 1 carries a point for `node-2` without the node; `n` appends page 2 with `node-2`; `node_points(1).len() == 1` and the point renders under that node.
+
+G21. `authority_parts` becomes `pub(crate)` (`crates/aitm-tui/src/scan/profiles.rs`); add the one-line test that a scope entry `api.test:8443` yields `https://api.test:8443`.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
