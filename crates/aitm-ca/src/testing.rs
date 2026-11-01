@@ -25,7 +25,7 @@ pub const FIXTURE_FP1: &str = "B1:30:2C:92:2B:7C:A0:78:5D:76:E0:A0:00:43:01:51:1
 
 /// The macOS trust read-back line `MacOsStore` runs for the `/ca` fixture
 /// directory the tests use (`verify-cert`, basic policy, local only).
-pub const VERIFY_USER: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
+pub const VERIFY_CMD: &str = "security verify-cert -c /ca/ca.crt -l -L -p basic";
 
 /// `verify-cert`'s stdout on exit 0 for a trusted CA.
 pub const VERIFY_OK: &str = "/ca/ca.crt: certificate verification successful.";
@@ -43,7 +43,7 @@ pub const MACOS_DETAIL: &str = "macOS: presence from `security find-certificate`
                                 `security verify-cert` (basic policy, local only; our install \
                                 sets the ssl and basic policies together)";
 
-/// What [`ScriptedExecutor::unspawnable`] fails [`VERIFY_USER`] with.
+/// What [`ScriptedExecutor::unspawnable`] fails [`VERIFY_CMD`] with.
 pub const VERIFY_SPAWN_FAILURE: &str = "could not start `security verify-cert -c /ca/ca.crt -l -L \
                                         -p basic`: No such file or directory (os error 2)";
 

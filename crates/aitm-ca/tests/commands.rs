@@ -19,7 +19,7 @@ use aitm_ca::store::{
 };
 use aitm_ca::testing::{
     MemoryAuditLog, ScriptedExecutor, CANCEL_STDERR, FIXTURE_FP1, FIXTURE_FP256, MACOS_DETAIL,
-    NOT_TRUSTED, VERIFY_OK, VERIFY_SPAWN_FAILURE, VERIFY_USER,
+    NOT_TRUSTED, VERIFY_CMD, VERIFY_OK, VERIFY_SPAWN_FAILURE,
 };
 use aitm_ca::CaPlugin;
 use aitm_core::{
@@ -1198,6 +1198,11 @@ fn registers_four_commands() {
     for gated in ["ca.install", "ca.uninstall"] {
         let d = h.reg.command(gated).unwrap().schema().description;
         assert!(d.contains("ca.allow_agent_install"), "{gated}: {d}");
+        assert!(
+            d.contains("dry_run is never gated by `ca.allow_agent_install`"),
+            "{gated}: {d}"
+        );
+        assert!(!d.contains("always allowed"), "{gated}: {d}");
     }
     let plugin = CaPlugin::with_backend(
         cfg("/ca", false),
@@ -1323,7 +1328,7 @@ fn ca_status_json_reports_user_trust_yes() {
         ScriptedExecutor::new()
             .file("/ca/ca.crt", FIXTURE)
             .respond(Q_USER, 0, &present_user_output(), "")
-            .respond(VERIFY_USER, 0, VERIFY_OK, ""),
+            .respond(VERIFY_CMD, 0, VERIFY_OK, ""),
         MemoryAuditLog::new(),
     );
     let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
@@ -1338,7 +1343,7 @@ fn ca_status_json_reports_user_trust_yes() {
         h.exec.runs(),
         vec![
             Q_USER.to_string(),
-            VERIFY_USER.to_string(),
+            VERIFY_CMD.to_string(),
             Q_SYS.to_string()
         ]
     );
@@ -1595,7 +1600,7 @@ fn ca_status_json_reports_user_trust_no_and_unknown() {
         ScriptedExecutor::new()
             .file("/ca/ca.crt", FIXTURE)
             .respond(Q_USER, 0, &present_user_output(), "")
-            .respond(VERIFY_USER, 1, NOT_TRUSTED, ""),
+            .respond(VERIFY_CMD, 1, NOT_TRUSTED, ""),
         MemoryAuditLog::new(),
     );
     let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
@@ -1610,7 +1615,7 @@ fn ca_status_json_reports_user_trust_no_and_unknown() {
         h.exec.runs(),
         vec![
             Q_USER.to_string(),
-            VERIFY_USER.to_string(),
+            VERIFY_CMD.to_string(),
             Q_SYS.to_string()
         ]
     );
@@ -1619,7 +1624,7 @@ fn ca_status_json_reports_user_trust_no_and_unknown() {
         detail,
         vec![
             MACOS_DETAIL.to_string(),
-            format!("`{VERIFY_USER}` exited 1: {NOT_TRUSTED}"),
+            format!("`{VERIFY_CMD}` exited 1: {NOT_TRUSTED}"),
             OBSCURA_DETAIL_LINE.to_string(),
         ],
         "{detail:?}"
@@ -1645,7 +1650,7 @@ fn ca_status_json_reports_user_trust_no_and_unknown() {
         h.exec.runs(),
         vec![
             Q_USER.to_string(),
-            VERIFY_USER.to_string(),
+            VERIFY_CMD.to_string(),
             Q_SYS.to_string()
         ]
     );
@@ -1689,7 +1694,7 @@ fn ca_status_json_system_scope_trust() {
         ScriptedExecutor::new()
             .file("/ca/ca.crt", FIXTURE)
             .respond(Q_SYS, 0, &present_system_output(), "")
-            .respond(VERIFY_USER, 0, VERIFY_OK, ""),
+            .respond(VERIFY_CMD, 0, VERIFY_OK, ""),
         MemoryAuditLog::new(),
     );
     let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
@@ -1703,7 +1708,7 @@ fn ca_status_json_system_scope_trust() {
         vec![
             Q_USER.to_string(),
             Q_SYS.to_string(),
-            VERIFY_USER.to_string()
+            VERIFY_CMD.to_string()
         ]
     );
     assert!(
@@ -1720,7 +1725,7 @@ fn ca_status_json_system_scope_trust() {
             .file("/ca/ca.crt", FIXTURE)
             .respond(Q_USER, 0, &present_user_output(), "")
             .respond(Q_SYS, 0, &present_system_output(), "")
-            .respond(VERIFY_USER, 0, VERIFY_OK, ""),
+            .respond(VERIFY_CMD, 0, VERIFY_OK, ""),
         MemoryAuditLog::new(),
     );
     let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
@@ -1730,9 +1735,9 @@ fn ca_status_json_system_scope_trust() {
         h.exec.runs(),
         vec![
             Q_USER.to_string(),
-            VERIFY_USER.to_string(),
+            VERIFY_CMD.to_string(),
             Q_SYS.to_string(),
-            VERIFY_USER.to_string()
+            VERIFY_CMD.to_string()
         ]
     );
     assert_eq!(
@@ -1748,7 +1753,7 @@ fn ca_status_json_system_scope_trust() {
             .file("/ca/ca.crt", FIXTURE)
             .respond(Q_USER, 0, &present_user_output(), "")
             .respond(Q_SYS, 0, &present_system_output(), "")
-            .respond(VERIFY_USER, 1, "", NOT_TRUSTED),
+            .respond(VERIFY_CMD, 1, "", NOT_TRUSTED),
         MemoryAuditLog::new(),
     );
     let v = h.call("ca.status", Frontend::Operator, &[]).unwrap();
@@ -1758,7 +1763,7 @@ fn ca_status_json_system_scope_trust() {
         strings(&v, "detail"),
         vec![
             MACOS_DETAIL.to_string(),
-            format!("`{VERIFY_USER}` exited 1: {NOT_TRUSTED}"),
+            format!("`{VERIFY_CMD}` exited 1: {NOT_TRUSTED}"),
             OBSCURA_DETAIL_LINE.to_string(),
         ]
     );
@@ -1845,8 +1850,8 @@ fn cancelled_install_audit_detail_is_the_full_message() {
 }
 
 // ---------------------------------------------------------------------------
-// Stage-6 fix task C1 (plan correction 7, spec D17.1/D17.14): only the CLI
-// may ask for the System keychain on a platform that has a user scope.
+// Plan correction 7, spec D17.1/D17.14: only the CLI may ask for the System
+// keychain on a platform that has a user scope.
 // ---------------------------------------------------------------------------
 
 const SYSTEM_NEEDS_TERMINAL_INSTALL: &str = "system scope needs a terminal: run `aitm ca install \
@@ -2001,8 +2006,8 @@ fn linux_operator_system_scope_is_unchanged() {
     assert_eq!(h.exec.runs()[0], tee);
 }
 
-// Stage-6 fix task C1 (finding 2): the calm message hides the tool text, so
-// the stderr tail goes to one DEBUG line at the classification site.
+// Spec D17.4: the calm message hides the tool text, so the stderr tail goes
+// to one DEBUG line at the classification site.
 #[test]
 fn cancelled_install_logs_the_stderr_tail_at_debug() {
     let h = Harness::new(
@@ -2042,8 +2047,6 @@ fn cancelled_install_logs_the_stderr_tail_at_debug() {
     assert!(!h.records()[0].detail.contains("canceled"));
     let warns = capture.at(Level::WARN, "aitm_ca");
     assert_eq!(warns.len(), 1, "{capture:?}");
-    assert!(!warns[0]
-        .fields
-        .get("error")
-        .is_some_and(|e| e.contains("canceled")));
+    let error = warns[0].fields.get("error").expect("WARN carries error");
+    assert!(!error.contains("canceled"), "{error}");
 }

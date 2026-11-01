@@ -729,8 +729,8 @@ impl Op {
              store via certutil); {effect}. Idempotent; identifies the certificate by \
              fingerprint; never reads the CA key. Refused from an agent frontend (MCP) unless \
              ca.allow_agent_install is set; the CLI and an operator-token connection (a \
-             present human) are not gated. dry_run is always allowed and lists the commands \
-             that would run. The embedded obscura browser does not use the OS store (it \
+             present human) are not gated. dry_run is never gated by `ca.allow_agent_install` \
+             and lists the commands that would run. The embedded obscura browser does not use the OS store (it \
              trusts the CA through --ca-cert) and is unaffected."
         )
     }
@@ -777,35 +777,70 @@ struct Change {
 
 impl Change {
     /// The scope to act on: the one asked for if the platform has it, else
-    /// the platform's least-privileged one.
-    fn resolve_scope(platform: &Platform, wanted: Option<Scope>) -> Result<Scope, TrustError> {
-        match wanted {
-            Some(scope) if platform.scopes().contains(&scope) => Ok(scope),
-            Some(scope) => Err(TrustError::new(
-                TrustErrorKind::UnsupportedScope,
-                match platform {
-                    Platform::Linux(_) => {
-                        "Linux has no per-user OS trust store; use --scope system".to_string()
-                    }
-                    other => format!(
-                        "scope {scope} is not available on {}; use one of {}",
-                        other.label(),
-                        other
-                            .scopes()
-                            .iter()
-                            .map(Scope::label)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                },
-            )),
+    /// the platform's least-privileged one. Where a user scope exists, the
+    /// System keychain is the terminal's alone (spec D17.1, D17.14): a bus
+    /// client never makes the core spawn `sudo`, so any other frontend asking
+    /// for it is refused here with one WARN. Linux has only the system scope
+    /// and is unchanged (D17.13).
+    fn resolve_scope(
+        &self,
+        platform: &Platform,
+        wanted: Option<Scope>,
+        frontend: Frontend,
+    ) -> Result<Scope, TrustError> {
+        let scope = match wanted {
+            Some(scope) if platform.scopes().contains(&scope) => scope,
+            Some(scope) => {
+                return Err(TrustError::new(
+                    TrustErrorKind::UnsupportedScope,
+                    match platform {
+                        Platform::Linux(_) => {
+                            "Linux has no per-user OS trust store; use --scope system".to_string()
+                        }
+                        other => format!(
+                            "scope {scope} is not available on {}; use one of {}",
+                            other.label(),
+                            other
+                                .scopes()
+                                .iter()
+                                .map(Scope::label)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    },
+                ))
+            }
             None => platform.default_scope().ok_or_else(|| {
                 TrustError::new(
                     TrustErrorKind::UnsupportedPlatform,
                     format!("no trust store on {}", platform.label()),
                 )
-            }),
+            })?,
+        };
+        if scope == Scope::System
+            && frontend != Frontend::Cli
+            && platform.scopes().contains(&Scope::User)
+        {
+            let refusal = TrustError::new(
+                TrustErrorKind::UnsupportedScope,
+                format!(
+                    "system scope needs a terminal: run `aitm ca {} --scope system` yourself; \
+                     the app and the bus clients use the login keychain",
+                    self.op.verb()
+                ),
+            );
+            warn!(
+                target: "aitm_ca",
+                command = self.op.name(),
+                frontend = frontend_label(frontend),
+                scope = scope.label(),
+                platform = platform.label(),
+                kind = refusal.kind.label(),
+                "refused: the System keychain is reachable from the CLI only"
+            );
+            return Err(refusal);
         }
+        Ok(scope)
     }
 }
 
@@ -836,7 +871,7 @@ impl Command for Change {
                     TypeDesc::Bool,
                     false,
                     "Run the read-only queries and list the mutating commands without running \
-                     them. Never gated.",
+                     them. Never gated by `ca.allow_agent_install`.",
                 ),
             ],
             TypeDesc::Object(vec![
@@ -936,35 +971,10 @@ impl Command for Change {
             ));
         }
 
-        let scope = Self::resolve_scope(&platform, args.scope).map_err(|e| audit.fail(e.into()))?;
+        let scope = self
+            .resolve_scope(&platform, args.scope, frontend)
+            .map_err(|e| audit.fail(e.into()))?;
         audit.scope = Some(scope.label().to_string());
-
-        // Where a user scope exists, the System keychain is the terminal's
-        // alone (spec D17.1, D17.14): a bus client never makes the core spawn
-        // `sudo`. Linux has only the system scope and is unchanged (D17.13).
-        if scope == Scope::System
-            && frontend != Frontend::Cli
-            && platform.scopes().contains(&Scope::User)
-        {
-            let refusal = TrustError::new(
-                TrustErrorKind::UnsupportedScope,
-                format!(
-                    "system scope needs a terminal: run `aitm ca {} --scope system` yourself; \
-                     the app and the bus clients use the login keychain",
-                    op.verb()
-                ),
-            );
-            warn!(
-                target: "aitm_ca",
-                command = op.name(),
-                frontend = audit.frontend,
-                scope = scope.label(),
-                platform = platform.label(),
-                kind = refusal.kind.label(),
-                "refused: the System keychain is reachable from the CLI only"
-            );
-            return Err(audit.fail(refusal.into()));
-        }
 
         let store = store_for(&platform);
         let apply = |exec: &dyn Executor| match op {
@@ -1030,7 +1040,9 @@ impl Command for Change {
     /// The question a human frontend asks first. `None` for a dry run, when
     /// there is no `ca.crt`, or when `invoke` would fail on the platform or
     /// scope anyway (it then fails with the clear error). Reads `ca.crt`
-    /// only; runs nothing.
+    /// only; runs nothing. The prompt has no frontend, so the scope is
+    /// resolved as the CLI's would be (plan correction 16: a non-CLI
+    /// `system` request is prompted, then refused by `invoke`).
     fn confirm_prompt(&self, args: &Params) -> Option<String> {
         let shared = &*self.shared;
         let args = ChangeArgs::parse(args).ok()?;
@@ -1039,7 +1051,9 @@ impl Command for Change {
         }
         let cert = CaCert::load(&shared.cfg.dir, shared.exec()).ok()??;
         let platform = shared.platform();
-        let scope = Self::resolve_scope(&platform, args.scope).ok()?;
+        let scope = self
+            .resolve_scope(&platform, args.scope, Frontend::Cli)
+            .ok()?;
         let location = location_for(&platform, scope, shared.exec())?;
         Some(self.op.prompt(&cert.fingerprint_sha256(), &location, scope))
     }

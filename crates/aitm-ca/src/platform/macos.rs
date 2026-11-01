@@ -179,6 +179,29 @@ impl<'a> Op<'a> {
         Ok((cmd, out))
     }
 
+    /// `delete-certificate -Z <sha256>`, then `-Z <sha1>` when that fails
+    /// (older macOS keys the keychain on SHA-1). `None` once a copy is gone;
+    /// otherwise the failure text of every attempt, so the attempt that
+    /// carried the real reason is never hidden by the other's "not found".
+    fn delete_copy(&mut self) -> Result<Option<String>, TrustError> {
+        let keychain = self.keychain.clone();
+        let sha256 = self.cert.sha256_hex();
+        let (cmd, out) = self.mutate("delete-certificate", false, &["-Z", &sha256, &keychain])?;
+        if out.success() {
+            return Ok(None);
+        }
+        let sha1 = self.cert.sha1_hex_lower();
+        let (cmd1, out1) = self.mutate("delete-certificate", false, &["-Z", &sha1, &keychain])?;
+        if out1.success() {
+            return Ok(None);
+        }
+        Ok(Some(format!(
+            "{}; {}",
+            failure_text(&cmd, &out),
+            failure_text(&cmd1, &out1)
+        )))
+    }
+
     fn finish(self, changed: bool, detail: Vec<String>) -> Change {
         Change {
             changed,
@@ -223,6 +246,29 @@ fn is_headless(out: &CmdOutput) -> bool {
 
 fn is_cancelled(out: &CmdOutput) -> bool {
     out.stderr.to_lowercase().contains(CANCEL_MARKER)
+}
+
+/// What `install` does with a certificate that is already in `keychain`,
+/// from the trust read-back: `None` when the copy is untrusted and is to be
+/// replaced; otherwise the `detail` of an unchanged result. Only a definite
+/// `No` deletes (plan correction 8).
+fn keep_present_copy(
+    keychain: &str,
+    verdict: Result<(Trust, Option<String>), TrustError>,
+) -> Option<Vec<String>> {
+    match verdict {
+        Ok((Trust::Yes, _)) => Some(vec![format!("already present and trusted in {keychain}")]),
+        Ok((Trust::No, _)) => None,
+        Ok((Trust::Unknown, line)) => {
+            let mut detail = vec![format!("already present in {keychain}")];
+            detail.extend(line);
+            Some(detail)
+        }
+        Err(e) => Some(vec![
+            format!("already present in {keychain}"),
+            e.to_string(),
+        ]),
+    }
 }
 
 /// `verify-cert` prints its verdict (`Cert Verify Result: …`) on stdout, so a
@@ -280,36 +326,18 @@ impl TrustStore for MacOsStore {
         if op.presence()? == Presence::Present {
             // Presence is not trust: a copy left by a dismissed dialog whose
             // rollback failed, or imported by hand, has no trust settings.
-            match op.verify_trust() {
-                Ok((Trust::Yes, _)) => {
-                    return Ok(op.finish(
-                        false,
-                        vec![format!("already present and trusted in {keychain}")],
-                    ));
-                }
-                Err(e) => {
-                    return Ok(op.finish(
-                        false,
-                        vec![format!("already present in {keychain}"), e.to_string()],
-                    ));
-                }
-                Ok(_) => {
-                    let sha256 = cert.sha256_hex();
-                    let (cmd, out) =
-                        op.mutate("delete-certificate", false, &["-Z", &sha256, &keychain])?;
-                    if !out.success() {
-                        return Err(TrustError::new(
-                            TrustErrorKind::ToolFailed,
-                            format!(
-                                "could not remove the untrusted copy from {keychain}: {}",
-                                failure_text(&cmd, &out)
-                            ),
-                        )
-                        .into());
-                    }
-                    detail.push(format!("replaced the untrusted copy in {keychain}"));
-                }
+            let verdict = op.verify_trust();
+            if let Some(unchanged) = keep_present_copy(&keychain, verdict) {
+                return Ok(op.finish(false, unchanged));
             }
+            if let Some(failure) = op.delete_copy()? {
+                return Err(TrustError::new(
+                    TrustErrorKind::ToolFailed,
+                    format!("could not remove the untrusted copy from {keychain}: {failure}"),
+                )
+                .into());
+            }
+            detail.push(format!("replaced the untrusted copy in {keychain}"));
         }
 
         let path = cert.path.display().to_string();
@@ -357,11 +385,7 @@ impl TrustStore for MacOsStore {
         // caller sees either way.
         if let Ok((_, requery)) = op.query() {
             if parse_presence(&requery, cert) == Presence::Present {
-                let sha256 = cert.sha256_hex();
-                let rolled_back = op
-                    .mutate("delete-certificate", false, &["-Z", &sha256, &keychain])
-                    .map(|(_, out)| out.success())
-                    .unwrap_or(false);
+                let rolled_back = matches!(op.delete_copy(), Ok(None));
                 message.push_str(if rolled_back {
                     "; removed the untrusted copy it left behind"
                 } else {
@@ -398,25 +422,9 @@ impl TrustStore for MacOsStore {
             ));
         }
 
-        let sha256 = cert.sha256_hex();
-        let sha1 = cert.sha1_hex_lower();
         for pass in 1..=MAX_DELETE_PASSES {
-            let (cmd, out) = op.mutate("delete-certificate", false, &["-Z", &sha256, &keychain])?;
-            if !out.success() {
-                // Older macOS keys the keychain on SHA-1.
-                let (cmd1, out1) =
-                    op.mutate("delete-certificate", false, &["-Z", &sha1, &keychain])?;
-                if !out1.success() {
-                    return Err(TrustError::new(
-                        TrustErrorKind::ToolFailed,
-                        format!(
-                            "{}; {}",
-                            failure_text(&cmd, &out),
-                            failure_text(&cmd1, &out1)
-                        ),
-                    )
-                    .into());
-                }
+            if let Some(failure) = op.delete_copy()? {
+                return Err(TrustError::new(TrustErrorKind::ToolFailed, failure).into());
             }
             if op.presence()? != Presence::Present {
                 detail.push(format!("removed from {keychain}"));
@@ -435,5 +443,23 @@ impl TrustStore for MacOsStore {
             ),
         )
         .into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_verdict_never_deletes() {
+        assert_eq!(
+            keep_present_copy("K", Ok((Trust::Unknown, Some("line".to_string())))),
+            Some(vec!["already present in K".to_string(), "line".to_string()])
+        );
+        assert_eq!(
+            keep_present_copy("K", Ok((Trust::Unknown, None))),
+            Some(vec!["already present in K".to_string()])
+        );
+        assert_eq!(keep_present_copy("K", Ok((Trust::No, None))), None);
     }
 }
