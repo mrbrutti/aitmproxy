@@ -33,8 +33,8 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -45,9 +45,9 @@ use crossterm::Command;
 
 use crate::caps::Caps;
 pub use crate::caps::Verbosity;
-use crate::card::Card;
+use crate::card::{Card, Row, INDENT};
 use crate::clock::{Clock, SystemClock};
-use crate::error::ErrorReport;
+use crate::error::{ErrorReport, FixCommand};
 use crate::event::{EventSender, UiEvent};
 use crate::glyphs::Glyphs;
 use crate::style::{paint, Role};
@@ -56,7 +56,7 @@ use crate::text;
 /// Spec T4: a phase younger than this is not drawn, and a `done`/`fail` of
 /// such a phase prints nothing in one-shot mode (C4). It is also the ticker's
 /// wake-up interval, so the spinner runs at ten frames a second.
-pub const FIRST_DRAW_DELAY: Duration = Duration::from_millis(100);
+pub(crate) const FIRST_DRAW_DELAY: Duration = Duration::from_millis(100);
 
 /// How long a blocking call waits for the render thread before giving up on
 /// it (plan C10). A sink that blocks this long is a stalled pipe, and the
@@ -65,8 +65,11 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 const THREAD_NAME: &str = "aitm-term";
 
-/// The indent under the header (spec T3).
-const INDENT: &str = "  ";
+/// The render queue's capacity (fix task S3). Warnings and events beyond it
+/// are dropped and counted rather than queued without bound: a flood of
+/// per-connection WARNs is attacker-triggerable. Every other message kind
+/// blocks its caller until there is room.
+const QUEUE_CAPACITY: usize = 256;
 
 /// What the API sends to the render thread.
 enum Msg {
@@ -96,6 +99,8 @@ enum Msg {
     },
     Warn(String),
     Event(UiEvent),
+    /// A success line outside any phase (`Reporter::note`).
+    Note(String),
     Card(Card),
     Error {
         report: ErrorReport,
@@ -142,6 +147,9 @@ struct Renderer {
     header_blank: usize,
     /// Spinner frame index.
     frame: usize,
+    /// Warnings and events dropped by `Reporter::send` while the queue was
+    /// full, not yet reported (S3); shared with the `Reporter`.
+    suppressed: Arc<AtomicUsize>,
 }
 
 impl Renderer {
@@ -152,6 +160,7 @@ impl Renderer {
         clock: Arc<dyn Clock>,
         sink: Box<dyn Write + Send>,
         width_probe: Box<dyn Fn() -> Option<u16> + Send>,
+        suppressed: Arc<AtomicUsize>,
     ) -> Renderer {
         Renderer {
             caps,
@@ -161,6 +170,7 @@ impl Renderer {
             clock,
             sink,
             width_probe,
+            suppressed,
             running: Vec::new(),
             pending: Vec::new(),
             live_lines_drawn: 0,
@@ -189,8 +199,17 @@ impl Renderer {
         self
     }
 
+    /// The caps for this frame: `caps` with the width probed now (spec T5),
+    /// the startup width when the probe has nothing.
+    fn frame_caps(&self) -> Caps {
+        Caps {
+            width: (self.width_probe)().unwrap_or(self.caps.width),
+            ..self.caps
+        }
+    }
+
     fn width(&self) -> usize {
-        usize::from((self.width_probe)().unwrap_or(self.caps.width))
+        usize::from(self.frame_caps().width)
     }
 
     /// The one place bytes leave the renderer. ASCII glyph sets also get
@@ -245,20 +264,14 @@ impl Renderer {
                 }
             }
             Msg::Warn(line) => {
-                let line = if self.rich() {
-                    format!(
-                        "{INDENT}{} {line}",
-                        paint(&self.caps, Role::Warning, self.glyphs.warn)
-                    )
-                } else {
-                    format!("warning: {line}")
-                };
+                let line = self.warn_line(&line);
                 self.emit(line);
             }
             Msg::Event(ev) => {
                 let line = self.event_line(&ev);
                 self.emit(line);
             }
+            Msg::Note(line) => self.note(&line),
             Msg::Card(card) => self.card(&card),
             Msg::Error { report, home } => self.error(&report, home.as_deref()),
             Msg::Checklist(on) => self.checklist = on,
@@ -299,6 +312,49 @@ impl Renderer {
         } else {
             format!("{summary}{}", duration.unwrap_or_default())
         }
+    }
+
+    /// `! <line>` (rich, the glyph painted Warning) or `warning: <line>`.
+    fn warn_line(&self, line: &str) -> String {
+        if self.rich() {
+            format!(
+                "{INDENT}{} {line}",
+                paint(&self.caps, Role::Warning, self.glyphs.warn)
+            )
+        } else {
+            format!("warning: {line}")
+        }
+    }
+
+    /// One line for the warnings dropped while the queue was full, printed
+    /// when the queue next drains (S3); the counter is reset. Warnings show
+    /// under `-q`, so their count does too.
+    fn report_suppressed(&mut self) {
+        let n = self.suppressed.swap(0, Ordering::AcqRel);
+        if n == 0 {
+            return;
+        }
+        let plural = if n == 1 { "" } else { "s" };
+        let line = self.warn_line(&format!("{n} warning{plural} suppressed"));
+        self.emit(line);
+    }
+
+    /// `✓ <line>` (rich, the glyph painted Success) or `<line>` (plain): a
+    /// success note outside any phase, a done line without a duration. Quiet
+    /// drops it like every other non-warning line.
+    fn note(&mut self, line: &str) {
+        if self.quiet() {
+            return;
+        }
+        let line = if self.rich() {
+            format!(
+                "{INDENT}{} {line}",
+                paint(&self.caps, Role::Success, self.glyphs.done)
+            )
+        } else {
+            line.to_string()
+        };
+        self.emit(line);
     }
 
     fn fail_line(&self, what: &str) -> String {
@@ -480,20 +536,35 @@ impl Renderer {
         }
     }
 
-    /// The ticker stops: every live phase collapses as a failed line, then a
-    /// blank line and the panel follow the live region.
+    /// The ticker stops: every live phase collapses as a failed line (`✕
+    /// <label>` rich, `error: <label>` plain), then the panel follows. In the
+    /// rich form one blank line separates it from whatever was drawn since
+    /// the header (spec: one blank line between blocks; the header carries
+    /// its own, and a one-shot panel is the first thing on screen, so neither
+    /// case gets another). The rich panel wraps at the width probed for this
+    /// frame, not the width measured at startup.
     fn error(&mut self, report: &ErrorReport, home: Option<&Path>) {
+        let running = std::mem::take(&mut self.running);
         if self.rich() {
-            let failed = paint(&self.caps, Role::Danger, self.glyphs.failed);
-            for live in std::mem::take(&mut self.running) {
-                self.pending
-                    .push(format!("{INDENT}{failed} {}", live.label));
+            for live in running {
+                let line = self.fail_line(&live.label);
+                self.pending.push(line);
             }
             self.redraw();
-            let text = report.render_rich(&self.caps, self.glyphs, home);
-            self.write_text(&format!("\n{text}"));
-            self.scrolled += 1 + text.lines().count();
+            let text = report.render_rich(&self.frame_caps(), self.glyphs, home);
+            let lines = text.lines().count();
+            if self.scrolled > 0 {
+                self.write_text(&format!("\n{text}"));
+                self.scrolled += 1 + lines;
+            } else {
+                self.write_text(&text);
+                self.scrolled += lines;
+            }
         } else {
+            for live in running {
+                let line = self.fail_line(&live.label);
+                self.write_text(&format!("{line}\n"));
+            }
             self.write_text(&report.render_plain(self.glyphs));
         }
     }
@@ -529,13 +600,22 @@ fn clamp_u16(n: usize) -> u16 {
 }
 
 /// The render thread's loop: one message at a time, a tick on every 100 ms
-/// silence while a phase is live, exit when every sender is gone.
+/// silence while a phase is live, exit when every sender is gone. Each time
+/// the queue drains (and once more at the close) the warnings dropped while
+/// it was full are reported (S3).
 fn run(mut renderer: Renderer, rx: Receiver<Msg>) -> Renderer {
     loop {
-        let next = if renderer.rich() && renderer.has_live() {
-            rx.recv_timeout(FIRST_DRAW_DELAY)
-        } else {
-            rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        let next = match rx.try_recv() {
+            Ok(msg) => Ok(msg),
+            Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+            Err(TryRecvError::Empty) => {
+                renderer.report_suppressed();
+                if renderer.rich() && renderer.has_live() {
+                    rx.recv_timeout(FIRST_DRAW_DELAY)
+                } else {
+                    rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+                }
+            }
         };
         match next {
             Ok(msg) => renderer.handle(msg),
@@ -543,6 +623,7 @@ fn run(mut renderer: Renderer, rx: Receiver<Msg>) -> Renderer {
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    renderer.report_suppressed();
     renderer
 }
 
@@ -551,7 +632,7 @@ enum State {
     /// No message yet: the renderer waits here for the thread to start.
     Idle(Renderer),
     Running {
-        tx: Sender<Msg>,
+        tx: SyncSender<Msg>,
         thread: JoinHandle<Option<Renderer>>,
     },
     /// After `finish`: synchronous plain-line rendering, or nothing when the
@@ -567,6 +648,9 @@ struct Inner {
     /// Set once by `with_home`; read through `display_home`.
     home: OnceLock<PathBuf>,
     next_id: AtomicU64,
+    /// Warnings and events dropped on a full queue, until the renderer
+    /// reports them (S3).
+    suppressed: Arc<AtomicUsize>,
     state: Mutex<State>,
 }
 
@@ -586,15 +670,6 @@ impl fmt::Debug for Reporter {
     }
 }
 
-/// `crossterm::terminal::size()` for the live region; only consulted when the
-/// caps animate, which implies a TTY (spec T5).
-fn measure_width() -> Option<u16> {
-    crossterm::terminal::size()
-        .ok()
-        .map(|(cols, _rows)| cols)
-        .filter(|cols| *cols > 0)
-}
-
 impl Reporter {
     /// A reporter over `sink` with the system clock.
     pub fn new(caps: Caps, sink: Box<dyn Write + Send>, verbosity: Verbosity) -> Reporter {
@@ -608,11 +683,14 @@ impl Reporter {
         verbosity: Verbosity,
         clock: Arc<dyn Clock>,
     ) -> Reporter {
+        // The live region re-measures on every frame (spec T5); animation
+        // implies a TTY, so the probe is only installed where it can answer.
         let width_probe: Box<dyn Fn() -> Option<u16> + Send> = if caps.animate {
-            Box::new(measure_width)
+            Box::new(crate::caps::measure_width)
         } else {
             Box::new(|| None)
         };
+        let suppressed = Arc::new(AtomicUsize::new(0));
         let renderer = Renderer::new(
             caps,
             verbosity,
@@ -620,6 +698,7 @@ impl Reporter {
             Arc::clone(&clock),
             sink,
             width_probe,
+            Arc::clone(&suppressed),
         );
         Reporter {
             inner: Arc::new(Inner {
@@ -629,6 +708,7 @@ impl Reporter {
                 clock,
                 home: OnceLock::new(),
                 next_id: AtomicU64::new(1),
+                suppressed,
                 state: Mutex::new(State::Idle(renderer)),
             }),
         }
@@ -658,8 +738,9 @@ impl Reporter {
         self
     }
 
-    /// The operator's home, for `~` shortening (C7). Set once; `None` leaves
-    /// it unset.
+    /// The operator's home, for `~` shortening (C7). Set-once: the first
+    /// `Some` wins; later calls, `None` included, are ignored, so a `None`
+    /// from an unset `HOME` never clears a home set earlier.
     pub fn with_home(self, home: Option<PathBuf>) -> Reporter {
         if let Some(home) = home {
             let _ = self.inner.home.set(home);
@@ -692,47 +773,59 @@ impl Reporter {
     /// `p` with the home shortened to `~` when [`Reporter::display_home`]
     /// allows it (spec T6).
     pub fn display_path(&self, p: &Path) -> String {
-        text::tilde(p, self.display_home())
+        clean(&text::tilde(p, self.display_home()))
     }
 
     /// The header line (`›•‹ aitmproxy 0.5.11`); serving modes only (C4).
     pub fn header(&self, wordmark: &str, version: &str) {
         self.send(Msg::Header {
-            wordmark: wordmark.to_string(),
-            version: version.to_string(),
+            wordmark: clean(wordmark),
+            version: clean(version),
         });
     }
 
     /// Starts a phase; it ends through [`Phase::done`], [`Phase::fail`],
     /// [`Phase::finish_with`] or, on drop, as `done(label)`.
     pub fn phase(&self, label: &str) -> Phase {
+        let label = clean(label);
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         self.send(Msg::PhaseStart {
             id,
-            label: label.to_string(),
+            label: label.clone(),
             at: self.inner.clock.now(),
         });
         Phase {
             reporter: self.clone(),
             id,
-            label: label.to_string(),
+            label,
             ended: false,
         }
     }
 
     /// A warning line above the live region (`! …`), `warning: …` when plain.
     pub fn warn(&self, line: &str) {
-        self.send(Msg::Warn(line.to_string()));
+        self.send(Msg::Warn(clean(line)));
+    }
+
+    /// A one-line success note outside any phase: `  ✓ <line>` rich, `<line>`
+    /// plain, nothing under `-q`. Usable at any time, after
+    /// [`Reporter::finish`] included; `main` prints `stdin closed · stdio
+    /// MCP transport ended` with it when the stdio MCP transport ends (spec
+    /// Open question 3). On a TTY the glyph form needs the live renderer, so
+    /// call it before `finish`; afterwards the plain-line mode (C10) prints
+    /// the bare line.
+    pub fn note(&self, line: &str) {
+        self.send(Msg::Note(clean(line)));
     }
 
     /// A WARN+ tracing event folded into the view (spec D7).
     pub fn event(&self, ev: UiEvent) {
-        self.send(Msg::Event(ev));
+        self.send(Msg::Event(sanitize_event(ev)));
     }
 
     /// The ready card; blocks until it is on the sink.
     pub fn card(&self, card: &Card) {
-        self.send(Msg::Card(card.clone()));
+        self.send(Msg::Card(sanitize_card(card)));
         self.send_and_wait(Msg::Flush);
     }
 
@@ -740,7 +833,7 @@ impl Reporter {
     /// panel is on the sink.
     pub fn error(&self, report: &ErrorReport) {
         self.send(Msg::Error {
-            report: report.clone(),
+            report: sanitize_report(report),
             home: self.display_home().map(Path::to_path_buf),
         });
         self.send_and_wait(Msg::Flush);
@@ -782,9 +875,22 @@ impl Reporter {
             start_thread(&mut state);
         }
         let unsent = match &mut *state {
-            State::Running { tx, .. } => match tx.send(msg) {
-                Ok(()) => return,
-                Err(mpsc::SendError(msg)) => msg,
+            State::Running { tx, .. } => match msg {
+                // Attacker-triggerable volume never blocks a caller and
+                // never queues without bound (S3): a full queue drops the
+                // warning and counts it for the renderer to report.
+                Msg::Warn(_) | Msg::Event(_) => match tx.try_send(msg) {
+                    Ok(()) => return,
+                    Err(TrySendError::Full(_)) => {
+                        self.inner.suppressed.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(TrySendError::Disconnected(msg)) => msg,
+                },
+                msg => match tx.send(msg) {
+                    Ok(()) => return,
+                    Err(mpsc::SendError(msg)) => msg,
+                },
             },
             State::Finished(Some(renderer)) => {
                 renderer.handle(msg);
@@ -841,6 +947,71 @@ impl Reporter {
     }
 }
 
+/// Every content string is neutralised with [`text::sanitize`] here, as it
+/// enters a message, never on the way out: the renderer's own SGR and cursor
+/// codes must pass `write_text` untouched. WARN/ERROR text and fields from
+/// any crate, `anyhow` chains, phase summaries and Rhai `log.warn` text can
+/// carry a client-supplied authority, and an `ESC ]`/`BEL`/C1 inside it must
+/// not reach the operator's terminal.
+fn clean(s: &str) -> String {
+    text::sanitize(s).into_owned()
+}
+
+fn sanitize_event(ev: UiEvent) -> UiEvent {
+    UiEvent {
+        level: ev.level,
+        target: clean(&ev.target),
+        message: clean(&ev.message),
+        fields: ev
+            .fields
+            .iter()
+            .map(|(name, value)| (clean(name), clean(value)))
+            .collect(),
+    }
+}
+
+/// Labels are `&'static str` from spec T3's fixed set and stay as they are.
+fn sanitize_card(card: &Card) -> Card {
+    Card {
+        headline: clean(&card.headline),
+        headline_role: card.headline_role,
+        rows: card
+            .rows
+            .iter()
+            .map(|row| Row {
+                label: row.label,
+                value: clean(&row.value),
+                value_role: row.value_role,
+                next: row.next.as_deref().map(clean),
+            })
+            .collect(),
+    }
+}
+
+fn sanitize_report(report: &ErrorReport) -> ErrorReport {
+    ErrorReport {
+        kind: report.kind.clone(),
+        what: clean(&report.what),
+        why: report.why.iter().map(String::as_str).map(clean).collect(),
+        fix: report.fix.as_deref().map(clean),
+        command: report
+            .command
+            .as_ref()
+            .map(|FixCommand(command)| FixCommand(clean(command))),
+        log: report.log.as_deref().map(sanitize_path),
+    }
+}
+
+/// The log path as the panel will display it, control characters
+/// neutralised; a clean path is kept as is (its bytes matter when it is not
+/// UTF-8, and `display()` would lose them).
+fn sanitize_path(path: &Path) -> PathBuf {
+    match text::sanitize(&path.display().to_string()) {
+        Cow::Borrowed(_) => path.to_path_buf(),
+        Cow::Owned(cleaned) => PathBuf::from(cleaned),
+    }
+}
+
 /// Moves the idle renderer onto the `aitm-term` thread. Should the OS refuse
 /// a thread, the renderer stays on the caller's side and renders plain lines
 /// synchronously, so no output is lost.
@@ -848,7 +1019,7 @@ fn start_thread(state: &mut State) {
     let State::Idle(renderer) = std::mem::replace(state, State::Finished(None)) else {
         return;
     };
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(QUEUE_CAPACITY);
     let slot = Arc::new(Mutex::new(Some(renderer)));
     let worker = Arc::clone(&slot);
     let spawned = std::thread::Builder::new()
@@ -892,7 +1063,7 @@ impl Phase {
         let at = self.reporter.inner.clock.now();
         self.end(Msg::PhaseDone {
             id: self.id,
-            summary: summary.to_string(),
+            summary: clean(summary),
             at,
         });
     }
@@ -902,7 +1073,7 @@ impl Phase {
         let at = self.reporter.inner.clock.now();
         self.end(Msg::PhaseFail {
             id: self.id,
-            what: what.to_string(),
+            what: clean(what),
             at,
         });
     }
@@ -1007,6 +1178,7 @@ mod tests {
             clock,
             Box::new(sink.clone()),
             Box::new(move || Some(columns)),
+            Arc::new(AtomicUsize::new(0)),
         )
     }
 
@@ -2179,6 +2351,7 @@ mod tests {
             FakeClock::new(),
             Box::new(sink.clone()),
             Box::new(|| None),
+            Arc::new(AtomicUsize::new(0)),
         );
         r.handle(Msg::Event(browser_event()));
         assert_eq!(
@@ -2477,6 +2650,515 @@ mod tests {
         assert_eq!(
             &text[drawn.len()..],
             format!("{BEGIN}\x1b[2A{CLR}  ! w\n{CLR}\n{UP1}{END}")
+        );
+    }
+    // ---- fix task (panel pass 1): S1 escape injection, Q4 error panel,
+    // F4 leading blank line ----
+
+    /// S1: a WARN whose field carries an OSC title change, a BEL and a line
+    /// break, through the real `UiLayer` → reporter → render thread path.
+    #[test]
+    fn a_warn_event_carrying_osc_bel_and_newline_renders_as_one_clean_line() {
+        use crate::tracing_layer::UiLayer;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(true, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        let subscriber = tracing_subscriber::registry()
+            .with(UiLayer::new(reporter.events(), tracing::Level::WARN));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(error = %"a\x1b]0;x\x07b\n c", "boom");
+        });
+        reporter.finish();
+
+        let bytes = sink.bytes();
+        let text = sink.text();
+        assert!(
+            !text.contains("\x1b]"),
+            "no OSC may reach the sink: {text:?}"
+        );
+        assert!(
+            !bytes.contains(&0x07),
+            "no BEL may reach the sink: {text:?}"
+        );
+        assert_eq!(
+            text::strip_sgr(&text).matches('\n').count(),
+            1,
+            "the event occupies exactly one line: {text:?}"
+        );
+        for seq in csi_sequences(&bytes) {
+            assert!(
+                is_allowed_csi(&seq),
+                "only the renderer's own sequences may appear: {seq:?} in {text:?}"
+            );
+        }
+        assert_eq!(
+            text,
+            format!(
+                "{BEGIN}{CLR}  \x1b[33m!\x1b[0m boom\x1b[2m · error=a\u{FFFD}]0;x\u{FFFD}b  c\x1b[0m\n{END}"
+            )
+        );
+    }
+
+    /// S1, the finding's literal: a cursor-up sequence inside a phase summary.
+    #[test]
+    fn plain_phase_summary_with_a_cursor_sequence_is_neutralised() {
+        let sink = SharedSink::new();
+        let reporter =
+            Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal).checklist(true);
+        reporter.phase("x").done("a\x1b[2Ab");
+        reporter.finish();
+        assert_eq!(sink.text(), "a\u{FFFD}[2Ab\n");
+        assert_eq!(sink.bytes().iter().filter(|b| **b == 0x1b).count(), 0);
+    }
+
+    /// S1: every content string a caller hands the reporter is neutralised
+    /// where it enters; plain mode, byte for byte.
+    #[test]
+    fn plain_reporter_neutralises_control_characters_at_every_entry_point() {
+        let sink = SharedSink::new();
+        let reporter =
+            Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal).checklist(true);
+        reporter.header("aitm\x1bproxy", "0.5\n11");
+        reporter.phase("bind\x07ing").fail("bind\x07ing");
+        drop(reporter.phase("drop\rped"));
+        reporter.warn("w\x1b]0;t\x07");
+        reporter.card(&Card {
+            headline: "h".to_string(),
+            headline_role: Role::Success,
+            rows: vec![Row {
+                label: "Bus",
+                value: "stdio\u{9b}2J (MCP)".to_string(),
+                value_role: Role::Plain,
+                next: Some("aitm\u{9b}1A x".to_string()),
+            }],
+        });
+        reporter.error(
+            &ErrorReport::failure("cannot start\nok: all good")
+                .with_why(vec!["a\tb".to_string()])
+                .with_fix("c\rd")
+                .with_command("lsof\x1b[2K -i")
+                .with_log(Some(PathBuf::from("/tmp/a\x1b]0;x\x07.log"))),
+        );
+        reporter.finish();
+
+        assert_eq!(
+            sink.text(),
+            "aitm\u{FFFD}proxy 0.5 11\n\
+             error: bind\u{FFFD}ing\n\
+             drop ped\n\
+             warning: w\u{FFFD}]0;t\u{FFFD}\n\
+             Bus: stdio\u{FFFD}2J (MCP) - aitm\u{FFFD}1A x\n\
+             error: cannot start ok: all good\n\
+             \x20 a b\n\
+             \x20 c d\n\
+             \x20 fix: lsof\u{FFFD}[2K -i\n\
+             \x20 log: /tmp/a\u{FFFD}]0;x\u{FFFD}.log\n"
+        );
+        assert_eq!(sink.bytes().iter().filter(|b| **b == 0x1b).count(), 0);
+        assert!(!sink.bytes().contains(&0x07));
+        assert_eq!(
+            reporter.display_path(Path::new("/tmp/a\x1bb")),
+            "/tmp/a\u{FFFD}b"
+        );
+    }
+
+    /// S1: a C1 control (U+009B, a one-byte CSI) in a card row value and
+    /// headline renders as U+FFFD in the rich form.
+    #[test]
+    fn rich_card_row_value_with_a_c1_control_renders_the_replacement_character() {
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        reporter.card(&Card {
+            headline: "h\u{9b}".to_string(),
+            headline_role: Role::Success,
+            rows: vec![Row {
+                label: "Bus",
+                value: "stdio\u{9b}2J (MCP)".to_string(),
+                value_role: Role::Plain,
+                next: None,
+            }],
+        });
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            "\n● h\u{FFFD}\n  Bus           stdio\u{FFFD}2J (MCP)\n"
+        );
+        assert!(!sink.text().contains('\u{9b}'));
+    }
+
+    /// Q4 (a): the panel wraps at the width probed for this frame, not the
+    /// width measured at startup.
+    #[test]
+    fn error_panel_wraps_at_the_probed_width_not_the_startup_width() {
+        let sink = SharedSink::new();
+        // Started at 80 columns; the terminal is 40 wide when the panel is drawn.
+        let mut r = renderer_with_width(
+            rich_caps(false, true),
+            Verbosity::Normal,
+            false,
+            FakeClock::new(),
+            &sink,
+            40,
+        );
+        let report = ErrorReport::failure("cannot start").with_why(vec![
+            "It is most likely held by another running `aitm`, the aitmproxy macOS app's embedded core, or another program.".to_string(),
+        ]);
+        r.handle(Msg::Error {
+            report: report.clone(),
+            home: None,
+        });
+        assert_eq!(
+            sink.text(),
+            "✕ cannot start\n\
+             \x20 It is most likely held by another\n\
+             \x20 running `aitm`, the aitmproxy macOS\n\
+             \x20 app's embedded core, or another\n\
+             \x20 program.\n"
+        );
+        assert_eq!(
+            sink.text(),
+            report.render_rich(
+                &Caps {
+                    width: 40,
+                    ..rich_caps(false, true)
+                },
+                &RICH,
+                None
+            )
+        );
+    }
+
+    /// Q4 (b): in plain mode a phase still live at error time is collapsed
+    /// as `error: <label>` before the panel, as the rich form does with `✕`.
+    #[test]
+    fn plain_error_collapses_live_phases_as_error_lines_before_the_panel() {
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            Caps::plain(),
+            Verbosity::Normal,
+            false,
+            clock.clone(),
+            &sink,
+        );
+        start(&mut r, &clock, 1, "loading detections");
+        start(&mut r, &clock, 2, "starting obscura");
+        clock.advance(Duration::from_millis(150));
+        r.handle(Msg::Error {
+            report: port_report(),
+            home: None,
+        });
+        assert_eq!(
+            sink.text(),
+            "error: loading detections\n\
+             error: starting obscura\n\
+             error: cannot start: the proxy port 127.0.0.1:8080 is already in use\n\
+             \x20 fix: lsof -nP -iTCP:8080 -sTCP:LISTEN\n"
+        );
+        // The phases are gone: a late end prints nothing more.
+        done(&mut r, &clock, 1, "49 detections ready");
+        assert_eq!(sink.text().matches('\n').count(), 4);
+        no_escape_bytes(&sink);
+    }
+
+    /// F4: the one-shot usage panel is the first thing on screen; it starts
+    /// with the glyph, not a blank line. After a header and a collapsed
+    /// phase, exactly one blank line separates them from the panel.
+    #[test]
+    fn a_panel_as_the_first_rich_output_has_no_leading_blank_line() {
+        let sink = SharedSink::new();
+        let caps = rich_caps(true, true);
+        let mut r = renderer(caps, Verbosity::Normal, false, FakeClock::new(), &sink);
+        r.handle(Msg::Error {
+            report: port_report(),
+            home: None,
+        });
+        let text = sink.text();
+        assert!(
+            text.starts_with("\x1b[31m✕\x1b[0m cannot start"),
+            "{text:?}"
+        );
+        assert!(!text.starts_with('\n'), "{text:?}");
+        assert_eq!(text, port_report().render_rich(&caps, &RICH, None));
+
+        // Through the public API too: a usage error before anything else.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        reporter.error(&ErrorReport::usage(
+            "usage: aitm tui (takes no further arguments)",
+        ));
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            "✕ usage: aitm tui (takes no further arguments)\n\n  ▸ aitm --help\n"
+        );
+
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(false, true),
+            Verbosity::Normal,
+            true,
+            clock.clone(),
+            &sink,
+        );
+        header(&mut r);
+        start(&mut r, &clock, 1, "reading config");
+        done(&mut r, &clock, 1, "config defaults");
+        r.handle(Msg::Error {
+            report: port_report(),
+            home: None,
+        });
+        let panel = port_report().render_rich(&rich_caps(false, true), &RICH, None);
+        assert_eq!(
+            sink.text(),
+            format!("›•‹ aitmproxy 0.5.11\n\n{BEGIN}{CLR}  ✓ config defaults\n{END}\n{panel}")
+        );
+    }
+    // ---- fix task (panel pass 1): N1 `Reporter::note`, S3 bounded queue,
+    // Q9 `with_home` ----
+
+    /// N1: the one-line success note `main` prints when the stdio MCP
+    /// transport ends (spec Open question 3), usable at any time, after
+    /// `finish()` included.
+    #[test]
+    fn note_prints_one_success_line_in_every_mode_including_after_finish() {
+        const LINE: &str = "stdin closed · stdio MCP transport ended";
+
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(utf8_pipe(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.finish();
+        reporter.note(LINE);
+        assert_eq!(sink.text(), "stdin closed · stdio MCP transport ended\n");
+        no_escape_bytes(&sink);
+
+        // Rich: a done line without a phase, in the same frame as every
+        // other finished line; the visible text is `  ✓ <line>`.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        reporter.note(LINE);
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            format!("{BEGIN}{CLR}  ✓ stdin closed · stdio MCP transport ended\n{END}")
+        );
+        assert_eq!(
+            text::strip_sgr(&sink.text()),
+            "  ✓ stdin closed · stdio MCP transport ended\n"
+        );
+
+        // The glyph is painted Success when colour is on.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(true, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        reporter.note(LINE);
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            format!(
+                "{BEGIN}{CLR}  \x1b[32m✓\x1b[0m stdin closed · stdio MCP transport ended\n{END}"
+            )
+        );
+
+        // ASCII twins on an ASCII terminal: no byte above 0x7f.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, false),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        reporter.note(LINE);
+        reporter.finish();
+        assert_eq!(
+            sink.text(),
+            format!("{BEGIN}{CLR}  + stdin closed - stdio MCP transport ended\n{END}")
+        );
+        assert!(sink.bytes().iter().all(|b| *b < 0x80));
+
+        // Quiet suppresses it, before and after finish.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Quiet);
+        reporter.note(LINE);
+        reporter.finish();
+        reporter.note(LINE);
+        assert_eq!(sink.text(), "");
+
+        // Sanitised like every other content string.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.note("a\x1b[2Ab\nc");
+        reporter.finish();
+        assert_eq!(sink.text(), "a\u{FFFD}[2Ab c\n");
+    }
+
+    /// S3: the line the renderer prints for warnings dropped while its
+    /// queue was full, in both forms, singular and plural, counter reset.
+    #[test]
+    fn suppressed_warnings_line_in_both_modes() {
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            Caps::plain(),
+            Verbosity::Normal,
+            false,
+            FakeClock::new(),
+            &sink,
+        );
+        r.report_suppressed();
+        assert_eq!(sink.text(), "", "nothing dropped, nothing said");
+        r.suppressed.store(1, Ordering::Relaxed);
+        r.report_suppressed();
+        r.report_suppressed();
+        assert_eq!(
+            sink.text(),
+            "warning: 1 warning suppressed\n",
+            "the counter is reset once reported"
+        );
+        r.suppressed.store(44, Ordering::Relaxed);
+        r.report_suppressed();
+        assert_eq!(
+            sink.text(),
+            "warning: 1 warning suppressed\nwarning: 44 warnings suppressed\n"
+        );
+
+        // Rich, and under -q: warnings still show, so does their count.
+        let sink = SharedSink::new();
+        let mut r = renderer(
+            rich_caps(true, true),
+            Verbosity::Quiet,
+            false,
+            FakeClock::new(),
+            &sink,
+        );
+        r.suppressed.store(3, Ordering::Relaxed);
+        r.report_suppressed();
+        assert_eq!(
+            sink.text(),
+            format!("{BEGIN}{CLR}  \x1b[33m!\x1b[0m 3 warnings suppressed\n{END}")
+        );
+    }
+
+    /// A sink whose writes block until the test opens the gate, so the
+    /// render thread can be held mid-line while the queue fills. It reports
+    /// each write attempt on `entered` first.
+    #[derive(Clone)]
+    struct GatedSink {
+        inner: SharedSink,
+        entered: mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl GatedSink {
+        fn new() -> (GatedSink, mpsc::Receiver<()>) {
+            let (entered, entered_rx) = mpsc::channel();
+            let sink = GatedSink {
+                inner: SharedSink::new(),
+                entered,
+                gate: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
+            };
+            (sink, entered_rx)
+        }
+
+        fn open(&self) {
+            let (lock, cv) = &*self.gate;
+            *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            cv.notify_all();
+        }
+    }
+
+    impl Write for GatedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            let (lock, cv) = &*self.gate;
+            let mut open = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            while !*open {
+                open = cv.wait(open).unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(open);
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// S3: with the render thread held on a stalled write, warnings beyond
+    /// the queue's capacity are dropped and counted, no caller blocks, and
+    /// the count is reported once as the queue drains.
+    #[test]
+    fn warnings_beyond_the_queue_capacity_are_dropped_counted_and_reported() {
+        let (sink, entered) = GatedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.warn("first");
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the render thread must reach the sink");
+        // The thread is inside the write of `first`; the queue is empty.
+        let started = Instant::now();
+        for i in 2..=QUEUE_CAPACITY + 11 {
+            reporter.warn(&format!("w{i}"));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a full queue must not block a warning"
+        );
+        assert_eq!(reporter.inner.suppressed.load(Ordering::Relaxed), 10);
+
+        sink.open();
+        reporter.finish();
+
+        let mut expected = String::from("warning: first\n");
+        for i in 2..=QUEUE_CAPACITY + 1 {
+            expected.push_str(&format!("warning: w{i}\n"));
+        }
+        expected.push_str("warning: 10 warnings suppressed\n");
+        assert_eq!(sink.inner.text(), expected);
+        assert_eq!(reporter.inner.suppressed.load(Ordering::Relaxed), 0);
+        assert!(matches!(&*reporter.lock(), State::Finished(Some(_))));
+    }
+
+    /// Q9: `with_home` is set-once — the first `Some` wins; later calls,
+    /// `None` included, change nothing.
+    #[test]
+    fn with_home_keeps_the_first_home_and_ignores_later_calls() {
+        let first = PathBuf::from("/Users/matt");
+        let reporter = Reporter::new(
+            rich_caps(false, true),
+            Box::new(SharedSink::new()),
+            Verbosity::Normal,
+        )
+        .with_home(None)
+        .with_home(Some(first.clone()))
+        .with_home(Some(PathBuf::from("/Users/other")))
+        .with_home(None);
+        assert_eq!(reporter.display_home(), Some(first.as_path()));
+        assert_eq!(
+            reporter.display_path(Path::new("/Users/matt/x.log")),
+            "~/x.log"
+        );
+        assert_eq!(
+            reporter.display_path(Path::new("/Users/other/x.log")),
+            "/Users/other/x.log"
         );
     }
 }

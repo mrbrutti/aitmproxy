@@ -12,6 +12,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::caps::Caps;
+use crate::card::INDENT;
 use crate::glyphs::Glyphs;
 use crate::style::{paint, Role};
 use crate::text;
@@ -21,9 +22,8 @@ pub const EXIT_FAILURE: i32 = 1;
 /// Process exit status for an [`ErrorKind::Usage`] error (spec D6, AC-W1-13).
 pub const EXIT_USAGE: i32 = 2;
 
-/// The indent every body line of a panel carries (spec T3/T5).
-const INDENT: &str = "  ";
-/// The rich footer label, padded so the path starts in the card value column.
+/// The rich footer label, padded so the path starts in the card value column
+/// (`INDENT` + `Log` padded to the card's label width).
 const LOG_LABEL: &str = "  Log           ";
 /// What a usage error points at until wave 2 generates per-verb help (D6 rule 4).
 const HELP_COMMAND: &str = "aitm --help";

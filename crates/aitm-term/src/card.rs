@@ -62,7 +62,9 @@ impl Card {
         for row in &self.rows {
             out.push_str(INDENT);
             out.push_str(row.label);
-            let pad = LABEL_WIDTH.saturating_sub(width(row.label));
+            // A label wider than the column (a call-site bug; T3 caps them
+            // at twelve) still gets one space so it is never glued to its value.
+            let pad = LABEL_WIDTH.saturating_sub(width(row.label)).max(1);
             out.push_str(&" ".repeat(pad));
             out.push_str(&paint(caps, row.value_role, &row.value));
             out.push('\n');
@@ -321,9 +323,10 @@ mod tests {
     }
 
     #[test]
-    fn a_label_wider_than_the_column_is_not_padded_and_does_not_panic() {
+    fn a_label_wider_than_the_column_keeps_one_space_and_does_not_panic() {
         // T3 fixes the label set at twelve characters or fewer, so a wider
-        // label is a call-site bug; the renderer only has to stay whole.
+        // label is a call-site bug; the renderer only has to stay whole and
+        // keep the label and value apart (fix task Q13).
         let card = Card {
             headline: "x".to_string(),
             headline_role: Role::Success,
@@ -336,7 +339,7 @@ mod tests {
         };
         assert_eq!(
             card.render_rich(&tty(false), &RICH),
-            "● x\n  System proxy watchdogv\n                ▸ aitm x\n"
+            "● x\n  System proxy watchdog v\n                ▸ aitm x\n"
         );
         assert_eq!(
             card.render_plain(&RICH),

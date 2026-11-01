@@ -8,15 +8,15 @@
 //! layout. Every function here is pure and allocation-only: no terminal, no
 //! environment.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::style::RESET;
+
 /// The Control Sequence Introducer every SGR (and cursor) sequence starts with.
 const CSI: &str = "\x1b[";
-
-/// SGR reset, appended when a truncation cuts inside a painted span.
-const RESET: &str = "\x1b[0m";
 
 /// Byte length of the control sequence at the start of `s`, which must begin
 /// with [`CSI`]: the introducer, the parameter and intermediate bytes, and the
@@ -144,6 +144,29 @@ pub fn wrap(s: &str, width: usize, indent: &str) -> Vec<String> {
     lines
 }
 
+/// Defence against terminal escape injection: every `char::is_control()`
+/// character in `s` (C0 including ESC and BEL, DEL, and C1 including U+009B,
+/// the one-byte CSI) becomes U+FFFD, except that `\n`, `\r` and `\t` each
+/// become one space, so a message is always one line. Content strings from
+/// other crates (WARN/ERROR text and fields, `anyhow` chains, Rhai `log.warn`
+/// text, client-supplied authorities inside errors) pass through here as they
+/// enter the reporter; the renderer's own SGR and cursor codes never do.
+/// Clean text is returned borrowed.
+pub fn sanitize(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(char::is_control) {
+        return Cow::Borrowed(s);
+    }
+    Cow::Owned(
+        s.chars()
+            .map(|c| match c {
+                '\n' | '\r' | '\t' => ' ',
+                c if c.is_control() => '\u{FFFD}',
+                c => c,
+            })
+            .collect(),
+    )
+}
+
 /// `path` with a leading `home` replaced by `~` (spec T6); the full path
 /// otherwise. The match is by whole components, so `/Users/matthew` is not
 /// under `/Users/matt`; `home` itself becomes `~`; an empty `home` shortens
@@ -162,6 +185,7 @@ pub fn tilde(path: &Path, home: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::borrow::Cow;
     use std::path::Path;
 
     #[test]
@@ -356,5 +380,38 @@ mod tests {
         assert_eq!(tilde(Path::new("/tmp/x"), Some(root)), "~/tmp/x");
         assert_eq!(tilde(Path::new("relative/x"), Some(root)), "relative/x");
         assert_eq!(tilde(Path::new(""), Some(Path::new("/Users/matt"))), "");
+    }
+    // ---- fix task (panel pass 1): S1 terminal escape injection ----
+
+    #[test]
+    fn sanitize_replaces_every_control_character_and_folds_line_breaks_to_spaces() {
+        // C0 (ESC, BEL, NUL), DEL and C1 (U+009B, a one-byte CSI) become
+        // U+FFFD; `\n`, `\r` and `\t` become one space each, so a message is
+        // always one line.
+        assert_eq!(sanitize("a\x1b]0;x\x07b"), "a\u{FFFD}]0;x\u{FFFD}b");
+        assert_eq!(sanitize("a\x1b[2Ab"), "a\u{FFFD}[2Ab");
+        assert_eq!(sanitize("a\u{9b}2Jb"), "a\u{FFFD}2Jb");
+        assert_eq!(sanitize("a\x7fb\0c"), "a\u{FFFD}b\u{FFFD}c");
+        assert_eq!(sanitize("one\ntwo\r\nthree\tfour"), "one two  three four");
+        assert_eq!(sanitize("one\ntwo").lines().count(), 1);
+        // Clean text is borrowed, not copied, and non-control Unicode stays.
+        assert!(matches!(
+            sanitize("✓ 49 detections · ready"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            sanitize("✓ 49 detections · ready"),
+            "✓ 49 detections · ready"
+        );
+        assert!(matches!(sanitize(""), Cow::Borrowed(_)));
+        assert!(matches!(sanitize("a\x1bb"), Cow::Owned(_)));
+        // No control character survives, and nothing is dropped: every
+        // input character maps to exactly one output character.
+        let every: String = (0u32..=0x9f).filter_map(char::from_u32).collect();
+        let out = sanitize(&every);
+        assert!(out.chars().all(|c| !c.is_control()), "{out:?}");
+        assert_eq!(out.chars().count(), every.chars().count());
+        // 65 controls (32 C0, DEL, 32 C1) minus the three line breaks.
+        assert_eq!(out.matches('\u{FFFD}').count(), 62);
     }
 }

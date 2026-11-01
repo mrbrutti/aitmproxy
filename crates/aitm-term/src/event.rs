@@ -43,8 +43,21 @@ impl fmt::Debug for EventSender {
 }
 
 /// A field name that must never reach a sink in clear: equal to, or ending
-/// with, one of these, case-insensitively.
-const SECRET_SUFFIXES: [&str; 3] = ["token", "secret", "password"];
+/// with, one of these, case-insensitively (plan C9's three, plus the HTTP
+/// credential names a proxy's WARN lines carry; fix task S4).
+const SECRET_SUFFIXES: [&str; 11] = [
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "cookie",
+    "passwd",
+    "credential",
+    "credentials",
+    "api_key",
+    "apikey",
+    "bearer",
+];
 
 /// Replace the value of every secret-named field with [`REDACTED`].
 pub fn redact_fields(fields: &mut [(String, String)]) {
@@ -150,6 +163,41 @@ mod tests {
         redact_fields(&mut got);
         let values: Vec<&str> = got.iter().map(|(_, v)| v.as_str()).collect();
         assert_eq!(values, ["<redacted>", "<redacted>", "<redacted>", "d", "e"]);
+
+        // Fix task S4: the HTTP credential names a proxy's WARN lines carry.
+        let mut got = fields(&[
+            ("authorization", "f"),
+            ("Proxy_Authorization", "g"),
+            ("cookie", "h"),
+            ("Set_Cookie", "i"),
+            ("passwd", "j"),
+            ("credential", "k"),
+            ("credentials", "l"),
+            ("api_key", "m"),
+            ("APIKEY", "n"),
+            ("bearer", "o"),
+            ("authorized", "p"),
+            ("cookie_jar", "q"),
+        ]);
+        redact_fields(&mut got);
+        let values: Vec<&str> = got.iter().map(|(_, v)| v.as_str()).collect();
+        assert_eq!(
+            values,
+            [
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "<redacted>",
+                "p",
+                "q"
+            ]
+        );
 
         let mut none: Vec<(String, String)> = Vec::new();
         redact_fields(&mut none);

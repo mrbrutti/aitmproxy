@@ -28,7 +28,7 @@ pub enum TermMode {
 impl TermMode {
     /// The mode named by an `AITM_TERM` value, matched case-insensitively;
     /// `None` for anything that is not one of the three words.
-    pub fn from_env_value(value: &str) -> Option<TermMode> {
+    pub(crate) fn from_env_value(value: &str) -> Option<TermMode> {
         if value.eq_ignore_ascii_case("rich") {
             Some(TermMode::Rich)
         } else if value.eq_ignore_ascii_case("ascii") {
@@ -80,11 +80,7 @@ impl Caps {
     /// applies that rule.
     pub fn detect_stderr(color: ColorChoice) -> Caps {
         let tty = std::io::stderr().is_terminal();
-        let width = if tty {
-            crossterm::terminal::size().ok().map(|(cols, _rows)| cols)
-        } else {
-            None
-        };
+        let width = if tty { measure_width() } else { None };
         Self::from_parts(tty, width, color, &|key| std::env::var(key).ok())
     }
 
@@ -176,6 +172,17 @@ impl Caps {
             ..self
         }
     }
+}
+
+/// The terminal's width in columns; `None` when it cannot be measured or
+/// reports zero (spec T5). The one probe for detection and for the live
+/// region's per-frame re-measure. crossterm opens `/dev/tty` and would answer
+/// for a pipe, so callers ask only when the stream is known to be a terminal.
+pub fn measure_width() -> Option<u16> {
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, _rows)| cols)
+        .filter(|cols| *cols > 0)
 }
 
 /// Spec T1 / plan C21: any of `LC_ALL`, `LC_CTYPE`, `LANG` ends in
@@ -478,5 +485,21 @@ mod tests {
         // A real measurement is still taken as is.
         let measured = Caps::from_parts(true, Some(120), ColorChoice::Auto, &env_of(TTY_ENV));
         assert_eq!(measured.width, 120);
+    }
+    // ---- fix task (panel pass 1): Q8 one width probe ----
+
+    #[test]
+    fn measure_width_never_reports_zero_columns() {
+        // The one property that holds on every machine (a sandbox without a
+        // terminal yields `None`; a Terminal run its real width): a zero
+        // measurement is filtered to `None`, so `from_parts` falls back to 80.
+        match measure_width() {
+            None => {}
+            Some(cols) => assert!(cols > 0),
+        }
+        assert_eq!(
+            Caps::from_parts(true, measure_width(), ColorChoice::Auto, &env_of(TTY_ENV)).width,
+            measure_width().unwrap_or(80)
+        );
     }
 }

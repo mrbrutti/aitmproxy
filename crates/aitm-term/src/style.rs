@@ -27,8 +27,9 @@ pub enum Role {
 }
 
 impl Role {
-    /// Every role, for tests and tables that iterate them.
-    pub const ALL: [Role; 7] = [
+    /// Every role, for the tests that iterate them.
+    #[cfg(test)]
+    pub(crate) const ALL: [Role; 7] = [
         Role::Accent,
         Role::Success,
         Role::Warning,
@@ -52,8 +53,9 @@ impl Role {
     }
 }
 
-/// SGR reset: every painted span ends with it.
-const RESET: &str = "\x1b[0m";
+/// SGR reset: every painted span ends with it; `text::truncate` appends it
+/// when a cut leaves a span open.
+pub(crate) const RESET: &str = "\x1b[0m";
 
 /// `text` wrapped in `role`'s SGR code and a reset; `text` unchanged when the
 /// caps allow no colour or the role is [`Role::Plain`].
