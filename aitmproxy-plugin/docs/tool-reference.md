@@ -62,11 +62,11 @@ know about the family:
 | Tool | Parameters | Description |
 | --- | --- | --- |
 | `flow.list` | — | List the ids of every captured flow, oldest first. |
-| `flow.get` | `--id <flow-id>` | Summarize one captured flow: kind, request line, status, state. |
-| `flow.table` | — | Per-flow summaries for a flows table: method, URL, status, duration, state, and marks, oldest first. Read-only. |
+| `flow.get` | `--id <flow-id>` | Summarize one captured flow: kind, request line, status, state. The summary carries the five per-host decryption keys with the same names and values as a `flow.table` row and the `flow.subscribe` push summary: `tunnel` (`decrypted` \| `passthrough` \| `failed`; null when the flow is not a CONNECT tunnel row), `tunnel_reason` (passthrough: `out_of_scope` \| `pinned`; failed: `client_rejected_certificate` \| `client_closed` \| `client_tls_error` \| `upstream_unreachable` \| `upstream_tls_failed` \| `protocol_error`; else null), `bytes_up` / `bytes_down` (int, set when a passthrough tunnel closes; else null) and `passive` (bool, always present: plain HTTP to a host outside Scope, observed but nothing acted on it). |
+| `flow.table` | — | Per-flow summaries for a flows table: method, URL, status, duration, state, and marks, oldest first. Read-only. Every CONNECT is a row, and each row carries `tunnel`: `decrypted` (TLS terminated with the proxy's leaf; the inner requests are their own rows), `passthrough` (relayed byte for byte, the client saw the origin's certificate) or `failed` (never established), null for a flow that is not a tunnel row; `tunnel_reason`: `out_of_scope` \| `pinned` for a passthrough, `client_rejected_certificate` \| `client_closed` \| `client_tls_error` \| `upstream_unreachable` \| `upstream_tls_failed` \| `protocol_error` for a failure, else null; `bytes_up` / `bytes_down`: bytes a passthrough tunnel relayed, set when it closes, else null; `passive` (bool, always present): true for plain HTTP to a host outside Scope — observed only, no breakpoint rule, script or map rule touched it; false for every tunnel row. A tunnel row's `status` is 200 once established and null when it failed; its `duration_ms` is null while the tunnel is open. |
 | `flow.subscribe` | `[--filter <json-object>] [--since <flow-id>]` | Subscribe to live flow notifications on this connection. Returns a sub_id; matching flows then arrive as notifications/aitm/flow lines with no further request. Read-only. |
 | `flow.unsubscribe` | `--sub_id <int>` | Cancel a flow subscription on this connection. Read-only. |
-| `flow.detail` | `--id <flow-id> [--body <string>] [--offset <int>] [--length <int>]` | Full detail for one flow: headers, bodies, connection info, timing and edit state. `body` selects none\|inline\|range (default inline). |
+| `flow.detail` | `--id <flow-id> [--body <string>] [--offset <int>] [--length <int>]` | Full detail for one flow: headers, bodies, connection info, timing and edit state. `body` selects none\|inline\|range (default inline). `meta` adds `passive` (bool) and `tunnel`: an object `{mode, reason, bytes_up, bytes_down}` for a CONNECT tunnel row (`mode` is `decrypted` \| `passthrough` \| `failed`; `reason` and the byte counts take the same values as `flow.table`'s `tunnel_reason` / `bytes_up` / `bytes_down`), or null when the flow is not a tunnel row. |
 | `flow.mark` | `--id <flow-id> --marks <json-array>` | Replace a flow's highlight mark set (e.g. colour names); an empty array clears it. |
 | `flow.comment` | `--id <flow-id> --text <string>` | Set a flow's free-text comment; an empty string clears it. |
 | `flow.replay` | `--id <flow-id>` | Reissue a captured HTTP request through the proxy client; returns the new flow's id. |
@@ -82,7 +82,7 @@ know about the family:
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `proxy.status` | — | The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, `paused` (parked-flow count), `capturing`, `flows` (visible count), `version` (the aitm binary's version), and `system_proxy` (the OS proxy setting as this core sees it: `state` one of points_at_us/other/off/unknown/unsupported, `host`/`port` when `other`, `managed_by_us`, `setting`, `supported`, `detail`; refreshed at most every 5 s). |
+| `proxy.status` | — | The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, `paused` (parked-flow count), `capturing`, `flows` (visible count), `version` (the aitm binary's version), and `system_proxy` (the OS proxy setting as this core sees it: `state` one of points_at_us/other/off/unknown/unsupported, `host`/`port` when `other`, `managed_by_us`, `setting`, `supported`, `detail`; refreshed at most every 5 s), and `decrypt` (`scope_hosts`: entries in Scope, the decryption list; `decrypting`: scope_hosts > 0; `advice`: the one sentence to show when nothing is decrypted, else null). With an empty Scope `advice` is exactly `Nothing is decrypted until a host is in Scope.`; frontends print it verbatim and never compose their own. |
 | `proxy.pause` | — | Pause capture: new flows are hidden from list/status/count. Traffic still flows and each hidden flow stays in memory, reachable by id, until it ages out via normal eviction (use flow.clear to drop completed ones). While paused, continued traffic can evict older visible flows under the store's capacity bound, so resume or clear to reclaim history. Returns the capture state. |
 | `proxy.resume` | — | Resume capture: new flows are shown again. Returns the capture state. |
 
@@ -90,7 +90,7 @@ know about the family:
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `scope.add` | `--host <string>` | Add a host, host:port, or *.wildcard to the active scope. Refused from an agent frontend (MCP) unless scope.allow_agent_widen is set. |
+| `scope.add` | `--host <string>` | Add a host, host:port, or *.wildcard to Scope. New connections to it are decrypted from now on; hosts outside Scope are tunnelled. Refused from an agent frontend (MCP) unless scope.allow_agent_widen is set. |
 | `scope.remove` | `--host <string>` | Remove a scope entry (exact match). Narrowing scope is allowed from any frontend; returns true if an entry was removed. |
 | `scope.list` | — | List the current scope entries. |
 
@@ -175,9 +175,9 @@ know about the family:
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `tls.passthrough.list` | — | List the hosts whose TLS is tunnelled (not decrypted). |
-| `tls.passthrough.add` | `--host <string>` | Add a host or *.wildcard to the TLS passthrough list (tunnel, do not decrypt). Refused from an agent frontend (MCP) unless tls.allow_agent_passthrough is set. |
-| `tls.passthrough.remove` | `--host <string>` | Remove an entry from the TLS passthrough list. Refused from an agent frontend (MCP) unless tls.allow_agent_passthrough is set. |
+| `tls.passthrough.list` | — | List the hosts whose TLS is tunnelled (not decrypted). Pins win over Scope: a pinned host is tunnelled even when it is in Scope (its CONNECT row has `tunnel` `passthrough`, `tunnel_reason` `pinned`). |
+| `tls.passthrough.add` | `--host <string>` | Add a host or *.wildcard to the TLS passthrough list (tunnel, do not decrypt). Refused from an agent frontend (MCP) unless tls.allow_agent_passthrough is set. A pin wins over Scope: the host stays tunnelled (`tunnel_reason` `pinned`) even while it is in Scope. |
+| `tls.passthrough.remove` | `--host <string>` | Remove an entry from the TLS passthrough list. Refused from an agent frontend (MCP) unless tls.allow_agent_passthrough is set. Removing a pin does not by itself decrypt the host: new connections to it are decrypted only if it is also in Scope. |
 
 ## `session.*`
 
