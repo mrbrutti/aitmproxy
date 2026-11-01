@@ -351,6 +351,13 @@ impl PrivilegeState {
         *lock(&self.shared.guard) = Some(guard);
     }
 
+    /// A guard is attached (see [`set_guard`](PrivilegeState::set_guard)), so
+    /// a connecting helper session can be built over it.
+    #[must_use]
+    pub fn has_guard(&self) -> bool {
+        self.shared.guard().is_some()
+    }
+
     /// Set (or clear) the helper session's backend. The routed backend takes it
     /// for `Available { via: Helper }` from the next call on.
     pub(crate) fn set_helper_backend(&self, backend: Option<Arc<dyn CaptureInjectBackend>>) {

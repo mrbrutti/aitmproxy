@@ -549,6 +549,13 @@ impl L4Module {
         intercept_cfg: Option<InterceptConfig>,
         privilege: Arc<PrivilegeSource>,
     ) -> Self {
+        // Over a live state, attach the guard a Linux helper session's backend is
+        // built over (plan P1b.14 hand-over): every live constructor (`new`,
+        // `with_state`, `with_shared_state`) passes here, so the binary's wiring
+        // cannot forget it. A fixed source has no state to attach to.
+        if let PrivilegeSource::Live(state) = &*privilege {
+            state.set_guard(Arc::clone(&guard));
+        }
         Self {
             guard,
             store,
@@ -706,6 +713,80 @@ mod tests {
         guard: &'a StdGuard,
     ) -> CommandHost<'a> {
         CommandHost::new(store, client, guard, None)
+    }
+
+    /// A prober scripted to one fixed macOS `needs_approval` row; these tests
+    /// never run the real platform probe.
+    struct OneRowProber;
+
+    impl crate::privilege::state::Prober for OneRowProber {
+        fn gather(
+            &self,
+            _request: Option<&crate::privilege::report::RequestProgress>,
+        ) -> crate::privilege::derive::ProbeInputs {
+            use crate::privilege::derive::{MacInputs, ProbeInputs};
+            use crate::privilege::report::Platform;
+            ProbeInputs {
+                enabled: true,
+                platform: Platform::Macos,
+                mac: Some(MacInputs {
+                    bpf_rw_opens: false,
+                    receipt: None,
+                    handoff_app_embeds_helper: false,
+                }),
+                linux: None,
+                request: None,
+                now_ms: 1_762_000_000_000,
+            }
+        }
+    }
+
+    /// A live `PrivilegeState` over the scripted prober, the way the binary
+    /// holds one (shared with the `l4.privilege` verb and the scripting engine).
+    fn live_state() -> Arc<PrivilegeState> {
+        Arc::new(PrivilegeState::with_prober(
+            &PrivilegeConfig {
+                enabled: true,
+                l4: crate::config::L4PrivilegeConfig::default(),
+                lifetime: ProcessLifetime::Serving,
+            },
+            Box::new(OneRowProber),
+            Arc::new(|| 1_762_000_000_000),
+        ))
+    }
+
+    /// Plan P1b.14 hand-over: a module built over a **live** state attaches its
+    /// guard to that state, so a Linux helper session that connects can build its
+    /// `HelperBackend` over the module's guard instead of failing the attach with
+    /// "no L4 guard attached to the privilege state". Both live constructors the
+    /// binary's `assemble_with` uses (`with_state`, `with_shared_state`) do it.
+    #[test]
+    fn live_constructors_attach_the_guard_to_the_privilege_state() {
+        let cfg = L4Config {
+            enabled: true,
+            ..L4Config::default()
+        };
+
+        let state = live_state();
+        assert!(!state.has_guard(), "a fresh state has no guard attached");
+        let _module = L4Module::with_state(&cfg, Arc::clone(&state));
+        assert!(
+            state.has_guard(),
+            "with_state must attach the module's guard"
+        );
+
+        let state = live_state();
+        let guard = Arc::new(L4Guard::new(&cfg));
+        let _module = L4Module::with_shared_state(
+            Arc::clone(&guard),
+            Arc::new(InMemoryL4FlowStore::new()),
+            None,
+            Arc::clone(&state),
+        );
+        assert!(
+            state.has_guard(),
+            "with_shared_state must attach the shared guard"
+        );
     }
 
     fn registered(cfg: &L4Config) -> (Registry, Arc<L4Guard>, Arc<dyn L4FlowStore>) {
