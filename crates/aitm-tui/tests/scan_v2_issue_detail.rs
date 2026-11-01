@@ -17,7 +17,6 @@ mod common;
 use aitm_scan_model::IssueStatus;
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
-use aitm_tui::caps::TermCaps;
 use aitm_tui::model::Finding;
 use aitm_tui::scan::{IssuePane, ScanTab, DETAIL_VALUE_MAX};
 use aitm_tui::snapshot::to_text;
@@ -43,22 +42,7 @@ const PROBE_1: &str = "550e8400-e29b-41d4-a716-446655440000";
 /// `scan.list` its open issued already settled empty, so nothing is in
 /// flight.
 fn app_with(tools: &[&str]) -> App {
-    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
-    let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, tools, None);
-    let _ = app.update(Action::OpenScan);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": [] }),
-    });
-    assert_eq!(app.mode, Mode::Scan);
-    assert_eq!(app.scan.tab, ScanTab::Profiles);
-    assert!(
-        app.scan.inflight.is_empty(),
-        "nothing in flight at the start"
-    );
-    app
+    opened_minimal(tools)
 }
 
 /// [`app_with`] offering every verb the Issues tab uses.
@@ -68,20 +52,16 @@ fn app() -> App {
 
 /// The `scan.issue {id}` request under its keyed tag.
 fn issue_request(id: &str) -> BusRequest {
-    BusRequest::CallTagged {
-        tag: format!("scan.issue:{id}"),
-        name: "scan.issue".into(),
-        args: json!({ "id": id }),
-    }
+    tagged(
+        &format!("scan.issue:{id}"),
+        "scan.issue",
+        json!({ "id": id }),
+    )
 }
 
 /// A `scan.issues` reply under its tag.
 fn issues_reply(body: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: "scan.issues".into(),
-        name: "scan.issues".into(),
-        value: body,
-    }
+    reply("scan.issues", "scan.issues", body)
 }
 
 /// The `scan.issue.json` reply under its keyed tag, its `id` rewritten to
@@ -89,15 +69,7 @@ fn issues_reply(body: Value) -> BusEvent {
 fn issue_reply(id: &str) -> BusEvent {
     let mut issue = fixture("scan.issue.json");
     issue["id"] = json!(id);
-    BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{id}"),
-        name: "scan.issue".into(),
-        value: issue,
-    }
-}
-
-fn screen(app: &App) -> String {
-    text_of(app, 200, 50)
+    reply(&format!("scan.issue:{id}"), "scan.issue", issue)
 }
 
 /// A line of the 200x50 detail pane (the text right of the pane rule),
@@ -165,11 +137,7 @@ fn read_issue_strings_are_bounded_at_fold_time() {
     issue["evidence"]["matched"] = json!("M".repeat(1 << 20));
     issue["remediation"] = json!("R".repeat(1 << 20));
     issue["note"] = json!("N".repeat(1 << 20));
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: issue,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
     let read = app
         .scan
         .issues
@@ -218,11 +186,11 @@ fn app_with_xss_read() -> App {
     let _ = app.update(Action::ScanTab(ScanTab::Issues));
     let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
     assert_eq!(reqs, vec![issue_request(XSS)]);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: fixture("scan.issue.json"),
-    });
+    let _ = app.on_bus(reply(
+        &format!("scan.issue:{XSS}"),
+        "scan.issue",
+        fixture("scan.issue.json"),
+    ));
     assert_eq!(app.scan.issues.detail().map(|i| i.id.as_str()), Some(XSS));
     app
 }
@@ -260,11 +228,11 @@ fn detail_shows_evidence_and_status_round_trips() {
     let reqs = app.update(Action::ScanIssueStatus(IssueStatus::FalsePositive));
     assert_eq!(
         reqs,
-        vec![BusRequest::CallTagged {
-            tag: format!("scan.issue.update:{XSS}"),
-            name: "scan.issue.update".into(),
-            args: json!({ "id": XSS, "status": "false_positive" }),
-        }]
+        vec![tagged(
+            &format!("scan.issue.update:{XSS}"),
+            "scan.issue.update",
+            json!({ "id": XSS, "status": "false_positive" })
+        )]
     );
     assert!(app
         .scan
@@ -275,11 +243,11 @@ fn detail_shows_evidence_and_status_round_trips() {
         .update(Action::ScanIssueStatus(IssueStatus::FalsePositive))
         .is_empty());
 
-    let reqs = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue.update:{XSS}"),
-        name: "scan.issue.update".into(),
-        value: fixture("scan.issue.update.json"),
-    });
+    let reqs = app.on_bus(reply(
+        &format!("scan.issue.update:{XSS}"),
+        "scan.issue.update",
+        fixture("scan.issue.update.json"),
+    ));
     assert!(reqs.is_empty(), "{reqs:?}");
     assert!(app.scan.inflight.is_empty());
     assert_eq!(
@@ -310,11 +278,11 @@ fn detail_shows_evidence_and_status_round_trips() {
     let reqs = app.update(Action::ScanIssueStatus(IssueStatus::Confirmed));
     assert_eq!(
         reqs,
-        vec![BusRequest::CallTagged {
-            tag: format!("scan.issue.update:{XSS}"),
-            name: "scan.issue.update".into(),
-            args: json!({ "id": XSS, "status": "confirmed" }),
-        }]
+        vec![tagged(
+            &format!("scan.issue.update:{XSS}"),
+            "scan.issue.update",
+            json!({ "id": XSS, "status": "confirmed" })
+        )]
     );
     let _ = app.on_bus(BusEvent::CallTaggedFailed {
         tag: format!("scan.issue.update:{XSS}"),
@@ -324,11 +292,11 @@ fn detail_shows_evidence_and_status_round_trips() {
     let reqs = app.update(Action::ScanIssueStatus(IssueStatus::Open));
     assert_eq!(
         reqs,
-        vec![BusRequest::CallTagged {
-            tag: format!("scan.issue.update:{XSS}"),
-            name: "scan.issue.update".into(),
-            args: json!({ "id": XSS, "status": "open" }),
-        }]
+        vec![tagged(
+            &format!("scan.issue.update:{XSS}"),
+            "scan.issue.update",
+            json!({ "id": XSS, "status": "open" })
+        )]
     );
 }
 
@@ -491,11 +459,7 @@ fn probe_flows_are_bounded_at_fold_time_with_a_more_line() {
         .map(|k| format!("550e8400-e29b-41d4-a716-4466{k:08x}"))
         .collect();
     issue["evidence"]["probe_flows"] = json!(flows);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: issue,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
     let read = app
         .scan
         .issues
@@ -533,11 +497,7 @@ fn head_line_verdict_hue_comes_from_the_typed_severity_not_the_name() {
     let mut issue = fixture("scan.issue.json");
     issue["name"] = json!("Debug marker   critical · certain · confirmed");
     issue["severity"] = json!("info");
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: issue,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
     let buf = draw(&app, 200, 50);
     let text = to_text(&buf);
     let head =
@@ -591,11 +551,11 @@ fn an_update_that_shrinks_the_flow_list_clamps_the_flow_cursor() {
     let mut update = fixture("scan.issue.update.json");
     update["evidence"]["probe_flows"] = json!([ONLY]);
     update["evidence"]["baseline_flow"] = Value::Null;
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue.update:{XSS}"),
-        name: "scan.issue.update".into(),
-        value: update,
-    });
+    let _ = app.on_bus(reply(
+        &format!("scan.issue.update:{XSS}"),
+        "scan.issue.update",
+        update,
+    ));
     assert_eq!(
         app.scan.issues.detail_view.flow_cursor, 0,
         "clamped to the one flow"
@@ -631,11 +591,7 @@ fn app_with_tall_xss_read() -> App {
         "reproduced": [2, 3],
         "scope_entry": "l4-1"
     });
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: issue,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
     assert!(
         app.scan
             .issues
@@ -706,11 +662,7 @@ fn app_with_poc_ref(poc_ref: Value) -> App {
     let _ = app.on_bus(issues_reply(page));
     let mut issue = fixture("scan.issue.json");
     issue["poc_ref"] = poc_ref;
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: issue,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
     let other = Finding::from_json(&json!({ "poc_path": "/pocs/open-redirect.yaml" }))
         .unwrap_or_else(|| panic!("a finding"));
     let matching = Finding::from_json(&json!({ "poc_path": "/pocs/poc-3b1c.yaml" }))
@@ -781,11 +733,7 @@ fn the_mutation_chain_overflow_names_its_count() {
         "mutation_chain": chain,
         "sent_hex": "00ff",
     });
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: issue,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
     let read = app.scan.issues.detail().expect("the issue is read");
     let l4 = read.evidence.l4.as_ref().expect("l4 evidence");
     assert_eq!(
@@ -856,8 +804,9 @@ fn inflate_free_text(value: &mut Value, text: &str) -> usize {
 
 /// Fix round G, G1: `bound_issue` names its fields by hand, so this walks
 /// the issue generically: every free-text string leaf of the fixture set
-/// to 1 MiB folds to at most `4 * DETAIL_VALUE_MAX` chars once read (a
-/// cell is at most four bytes, the ellipsis one char), whatever the field.
+/// to 1 MiB folds to at most `4 * DETAIL_VALUE_MAX` chars once read
+/// (`truncate`'s contract: at most `w` cells and `4 * w` chars, the
+/// ellipsis included), whatever the field.
 #[test]
 fn every_free_text_leaf_of_a_read_issue_is_bounded() {
     let mut app = app();
@@ -891,18 +840,14 @@ fn every_free_text_leaf_of_a_read_issue_is_bounded() {
     let huge = "x".repeat(1 << 20);
     let set = inflate_free_text(&mut issue, &huge);
     assert!(set >= 20, "the free-text leaves were inflated: {set}");
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: issue,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", issue));
     let read = app.scan.issues.detail().expect("the issue is read");
     let folded = serde_json::to_value(&read.issue).expect("an issue serialises");
     let mut leaves = Vec::new();
     string_leaves(&folded, String::new(), &mut leaves);
     for (path, chars) in leaves {
         assert!(
-            chars <= 4 * DETAIL_VALUE_MAX + 1,
+            chars <= 4 * DETAIL_VALUE_MAX,
             "{path} holds {chars} chars after the fold"
         );
     }

@@ -20,7 +20,6 @@ mod common;
 
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
-use aitm_tui::caps::TermCaps;
 use aitm_tui::model::FlowRow;
 use aitm_tui::scan::{
     origin_choices, typed_origin, IssueFilterKey, MapPane, OriginChoice, OriginError, OriginSource,
@@ -49,22 +48,7 @@ const COOKIE_FLOW: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
 /// `scan.list` its open issued already settled empty, so nothing is in
 /// flight.
 fn app_with(tools: &[&str]) -> App {
-    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
-    let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, tools, None);
-    let _ = app.update(Action::OpenScan);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": [] }),
-    });
-    assert_eq!(app.mode, Mode::Scan);
-    assert_eq!(app.scan.tab, ScanTab::Profiles);
-    assert!(
-        app.scan.inflight.is_empty(),
-        "nothing in flight at the start"
-    );
-    app
+    opened_minimal(tools)
 }
 
 fn app() -> App {
@@ -82,11 +66,7 @@ fn sitemap_request(args: Value) -> BusRequest {
 
 /// A `scan.sitemap` reply under its tag.
 fn sitemap_reply(body: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: "scan.sitemap".into(),
-        name: "scan.sitemap".into(),
-        value: body,
-    }
+    reply("scan.sitemap", "scan.sitemap", body)
 }
 
 /// The `scan.sitemap` requests among `reqs`, as their arguments.
@@ -113,11 +93,7 @@ fn status_reply(state: &str, phase: &str) -> BusEvent {
     let mut body = fixture("scan.status.json");
     body["state"] = json!(state);
     body["phase"] = json!(phase);
-    BusEvent::CallTaggedOk {
-        tag: format!("scan.status:{JOB}"),
-        name: "scan.status".into(),
-        value: body,
-    }
+    reply(&format!("scan.status:{JOB}"), "scan.status", body)
 }
 
 /// Enter the Site map tab and settle its entry read with `scan.sitemap.json`.
@@ -145,10 +121,6 @@ fn pane_row(text: &str, needle: &str) -> String {
         .expect("the needle's pane")
         .trim()
         .to_string()
-}
-
-fn screen(app: &App) -> String {
-    text_of(app, 200, 50)
 }
 
 /// A `flow.get` summary with its scheme set.
@@ -326,11 +298,7 @@ fn enter_opens_the_nodes_first_flow_via_row() {
 #[test]
 fn j_toggles_the_job_query_and_refetches() {
     let mut app = app();
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: fixture("scan.list.json"),
-    });
+    let _ = app.on_bus(reply("scan.list", "scan.list", fixture("scan.list.json")));
     assert_eq!(app.scan.jobs.cursor_job().map(String::as_str), Some(JOB));
     open_site_map(&mut app);
 
@@ -447,11 +415,7 @@ fn traits_cursor_and_total_are_bounded_at_fold() {
 #[test]
 fn a_crawling_job_refreshes_the_map_on_the_timer_and_on_its_terminal_line() {
     let mut app = app();
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: fixture("scan.list.json"),
-    });
+    let _ = app.on_bus(reply("scan.list", "scan.list", fixture("scan.list.json")));
     let _ = app.on_bus(status_reply("running", "crawling"));
     open_site_map(&mut app);
     let mut sitemap_reads = 0;

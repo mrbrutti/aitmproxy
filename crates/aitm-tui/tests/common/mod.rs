@@ -220,6 +220,33 @@ pub fn failed(tag: &str, name: &str, message: &str) -> BusEvent {
 }
 
 /// A connected v2 app at 200x50 opened on the Scan view (landing on
+/// Profiles, D2) offering `tool_names`, with the `scan.list` its open
+/// issued settled empty, so nothing is in flight: the minimal open the
+/// Jobs, Site map and Issues suites share (fix round H, H24; their tool
+/// lists lack the Profiles reads). [`opened_v2`] is the full open with
+/// the fixtures folded.
+pub fn opened_minimal(tool_names: &[&str]) -> App {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, tool_names, None);
+    let _ = app.update(Action::OpenScan);
+    let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": [] })));
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(app.scan.tab, ScanTab::Profiles);
+    assert!(
+        app.scan.inflight.is_empty(),
+        "nothing in flight at the start: {:?}",
+        app.scan.inflight
+    );
+    app
+}
+
+/// The screen as text at 200x50, the size every scanner v2 suite draws at.
+pub fn screen(app: &App) -> String {
+    text_of(app, 200, 50)
+}
+
+/// A connected v2 app at 200x50 opened on the Scan view (landing on
 /// Profiles, D2) with the open's three reads (`scan.list`,
 /// `scan.profile.list`, `scan.checks`; D6) asserted to leave and settled
 /// from the fixtures: an empty job list, the seven profiles and the check

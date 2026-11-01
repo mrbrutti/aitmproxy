@@ -20,7 +20,6 @@ use aitm_poc::Severity;
 use aitm_scan_model::IssueStatus;
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
-use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{is_issue_id, IssueFilterKey, IssueFilters, ScanTab, READ_MAX};
 use common::*;
 use serde_json::{json, Value};
@@ -43,22 +42,7 @@ const REDIRECT: &str = "issue-4c3b2a19";
 /// `scan.list` its open issued already settled empty, so nothing is in
 /// flight.
 fn app_with(tools: &[&str]) -> App {
-    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
-    let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, tools, None);
-    let _ = app.update(Action::OpenScan);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": [] }),
-    });
-    assert_eq!(app.mode, Mode::Scan);
-    assert_eq!(app.scan.tab, ScanTab::Profiles);
-    assert!(
-        app.scan.inflight.is_empty(),
-        "nothing in flight at the start"
-    );
-    app
+    opened_minimal(tools)
 }
 
 /// [`app_with`] offering every verb the Issues tab uses.
@@ -90,20 +74,16 @@ fn issues_request(args: Value) -> BusRequest {
 
 /// The `scan.issue {id}` request under its keyed tag.
 fn issue_request(id: &str) -> BusRequest {
-    BusRequest::CallTagged {
-        tag: format!("scan.issue:{id}"),
-        name: "scan.issue".into(),
-        args: json!({ "id": id }),
-    }
+    tagged(
+        &format!("scan.issue:{id}"),
+        "scan.issue",
+        json!({ "id": id }),
+    )
 }
 
 /// A `scan.issues` reply under its tag.
 fn issues_reply(body: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: "scan.issues".into(),
-        name: "scan.issues".into(),
-        value: body,
-    }
+    reply("scan.issues", "scan.issues", body)
 }
 
 /// The `scan.issue.json` reply under its keyed tag, its `id` rewritten to
@@ -111,20 +91,12 @@ fn issues_reply(body: Value) -> BusEvent {
 fn issue_reply(id: &str) -> BusEvent {
     let mut issue = fixture("scan.issue.json");
     issue["id"] = json!(id);
-    BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{id}"),
-        name: "scan.issue".into(),
-        value: issue,
-    }
+    reply(&format!("scan.issue:{id}"), "scan.issue", issue)
 }
 
 /// The `scan.status.json` reply for `JOB` under its keyed tag.
 fn status_reply(body: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: format!("scan.status:{JOB}"),
-        name: "scan.status".into(),
-        value: body,
-    }
+    reply(&format!("scan.status:{JOB}"), "scan.status", body)
 }
 
 fn issues_requests(reqs: &[BusRequest]) -> Vec<&Value> {
@@ -152,10 +124,6 @@ fn page_of(n: usize, id_of: impl Fn(usize) -> String) -> Value {
         "next_cursor": null,
         "by_severity": { "critical": 0, "high": n, "medium": 0, "low": 0, "info": 0 },
     })
-}
-
-fn screen(app: &App) -> String {
-    text_of(app, 200, 50)
 }
 
 /// The Issues filter line as drawn in the list pane: the row cut at the
@@ -485,11 +453,7 @@ fn a_read_naming_another_issue_is_not_folded() {
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
     let mut other = fixture("scan.issue.json");
     other["id"] = json!(REDIRECT);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.issue:{XSS}"),
-        name: "scan.issue".into(),
-        value: other,
-    });
+    let _ = app.on_bus(reply(&format!("scan.issue:{XSS}"), "scan.issue", other));
     assert_eq!(app.scan.issues.detail(), None);
     assert!(app.scan.issues.read.is_empty());
     assert_eq!(app.scan.issues.pending_read, None);
@@ -507,11 +471,7 @@ fn a_terminal_line_drops_the_jobs_read_issues_even_when_filtered_out() {
     let _ = app.on_bus(status_reply(fixture("scan.status.json")));
     let mut other = fixture("scan.status.json");
     other["job"] = json!(JOB_B);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.status:{JOB_B}"),
-        name: "scan.status".into(),
-        value: other,
-    });
+    let _ = app.on_bus(reply(&format!("scan.status:{JOB_B}"), "scan.status", other));
     assert_eq!(app.scan.jobs.cursor_job().map(String::as_str), Some(JOB_B));
     let _ = app.update(Action::ScanTab(ScanTab::Issues));
     let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));

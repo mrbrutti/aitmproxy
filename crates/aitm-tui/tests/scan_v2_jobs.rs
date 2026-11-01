@@ -13,8 +13,7 @@ mod common;
 
 use aitm_scan_model::{BySeverity, JobStatus, JobSummary, LaneKind};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
-use aitm_tui::app::{App, Mode};
-use aitm_tui::caps::TermCaps;
+use aitm_tui::app::App;
 use aitm_tui::scan::{
     probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ReadStatus, ScanTab,
     DETAIL_LIST_MAX, DETAIL_VALUE_MAX, JOBS_MAX, PROFILE_MAX, TARGETS_MAX,
@@ -37,21 +36,8 @@ const OTHER: &str = "scan-55667788";
 /// A connected v2 app at 200x50 on the Jobs tab, the `scan.list` its open
 /// issued already settled empty, so nothing is in flight.
 fn app_with(tools: &[&str]) -> App {
-    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
-    let _ = app.update(Action::Resize(200, 50));
-    let _ = connect(&mut app, tools, None);
-    let _ = app.update(Action::OpenScan);
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": [] }),
-    });
+    let mut app = opened_minimal(tools);
     let _ = app.update(Action::ScanTab(ScanTab::Jobs));
-    assert_eq!(app.mode, Mode::Scan);
-    assert!(
-        app.scan.inflight.is_empty(),
-        "nothing in flight at the start"
-    );
     app
 }
 
@@ -61,20 +47,12 @@ fn app() -> App {
 
 /// A `scan.status` reply for `JOB` under its keyed tag.
 fn status_reply(body: Value) -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: format!("scan.status:{JOB}"),
-        name: "scan.status".into(),
-        value: body,
-    }
+    reply(&format!("scan.status:{JOB}"), "scan.status", body)
 }
 
 /// The `scan.list.json` reply under its single-slot tag.
 fn list_reply() -> BusEvent {
-    BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: fixture("scan.list.json"),
-    }
+    reply("scan.list", "scan.list", fixture("scan.list.json"))
 }
 
 /// The `scan.status.json` fixture with its state and phase replaced.
@@ -85,21 +63,17 @@ fn status_in(state: &str, phase: &str) -> Value {
     body
 }
 
-fn screen(app: &App) -> String {
-    text_of(app, 200, 50)
-}
-
 /// The strip-and-banner row of the Scan view.
 fn banner_row(text: &str) -> &str {
     line_with(text, "1 Profiles").unwrap_or_default()
 }
 
 fn cancel_request() -> BusRequest {
-    BusRequest::CallTagged {
-        tag: format!("scan.cancel:{JOB}"),
-        name: "scan.cancel".into(),
-        args: json!({ "job": JOB }),
-    }
+    tagged(
+        &format!("scan.cancel:{JOB}"),
+        "scan.cancel",
+        json!({ "job": JOB }),
+    )
 }
 
 /// T7-1, T7-8: one `scan.status` renders the row with every literal the
@@ -187,11 +161,11 @@ fn cancel_is_sent_once_until_the_reply() {
     assert!(second.is_empty(), "the tag dedupe holds it: {second:?}");
     assert!(app.scan.inflight.contains(&format!("scan.cancel:{JOB}")));
 
-    let reqs = app.on_bus(BusEvent::CallTaggedOk {
-        tag: format!("scan.cancel:{JOB}"),
-        name: "scan.cancel".into(),
-        value: fixture("scan.cancel.json"),
-    });
+    let reqs = app.on_bus(reply(
+        &format!("scan.cancel:{JOB}"),
+        "scan.cancel",
+        fixture("scan.cancel.json"),
+    ));
     assert!(reqs.is_empty(), "a cancel reply pushes nothing: {reqs:?}");
     assert!(
         !app.scan.inflight.contains(&format!("scan.cancel:{JOB}")),
@@ -734,11 +708,7 @@ fn a_huge_list_folds_to_jobs_max_rows() {
             s
         })
         .collect();
-    let _ = app.on_bus(BusEvent::CallTaggedOk {
-        tag: "scan.list".into(),
-        name: "scan.list".into(),
-        value: json!({ "jobs": jobs }),
-    });
+    let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": jobs })));
     assert_eq!(JOBS_MAX, 256);
     assert_eq!(
         app.scan.jobs.order.len(),
