@@ -721,9 +721,16 @@ pub(crate) fn not_found() -> Resp {
 /// would turn into one (`/%2fhost`, `/%5chost`; the query parser decoded once
 /// already, so these are the double-encoded forms). The caller strips TAB, CR
 /// and LF first (`redirect()` drops CR/LF, browsers strip TAB), so a control
-/// character cannot hide the second character from this check. T3 finding and
-/// security review, 2026-11-01.
+/// character cannot hide the second character from this check; the predicate
+/// also refuses any control byte on its own, so a second caller cannot reopen
+/// the gap. T3 finding and security review, 2026-11-01.
 fn is_safe_relative(next: &str) -> bool {
+    // Self-contained: a control byte anywhere (TAB/CR/LF a browser would strip,
+    // or anything `HeaderValue` refuses) is never a same-origin path, whatever
+    // the caller stripped.
+    if next.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
     let mut chars = next.chars();
     if chars.next() != Some('/') {
         return false;
@@ -860,7 +867,6 @@ mod tests {
         (state, conn)
     }
 
-    /// `GET path` on `conn`; returns the full response.
     fn location(resp: &Resp) -> Option<String> {
         resp.headers()
             .get("location")
@@ -868,6 +874,7 @@ mod tests {
             .map(str::to_string)
     }
 
+    /// `GET path` on `conn`; returns the full response.
     async fn get_on(state: &Arc<AppState>, conn: &Arc<ConnInfo>, path: &str) -> Resp {
         let req = Request::builder()
             .method("GET")
