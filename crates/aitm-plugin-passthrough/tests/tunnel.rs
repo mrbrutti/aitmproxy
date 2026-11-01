@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use aitm_core::{
     ByteStream, Chain, Flow, FlowStore, MemFlowStore, ModuleCtx, NextLayerHint, ProtocolModule,
-    Registry, UpstreamConnector,
+    Registry, ScopeEntry, ScopeRateGuard, StdGuard, UpstreamConnector,
 };
 use aitm_plugin_passthrough::{PassthroughList, PassthroughModule};
 use aitm_proto_http::{CertAuthority, HttpModule};
@@ -131,9 +131,14 @@ impl UpstreamConnector for MapConnector {
 }
 
 /// Start the split proxy: `PassthroughModule` (first) + `HttpModule`, a real
-/// chain/store, and a `MapConnector`. Returns the proxy address and the store.
+/// chain/store, a `MapConnector`, and a real `StdGuard` whose Scope is
+/// `scope_hosts` — handed to the passthrough module and to every `ModuleCtx`, the
+/// way the acceptor wires them (spec D2). Only an in-scope, unpinned host is
+/// MITM'd; a pinned or out-of-scope one is tunnelled. Returns the proxy address
+/// and the store.
 async fn run_split_proxy(
     passthrough_hosts: Vec<String>,
+    scope_hosts: Vec<String>,
     by_host: HashMap<String, SocketAddr>,
     ca: Arc<CertAuthority>,
 ) -> (SocketAddr, Arc<dyn FlowStore>) {
@@ -141,10 +146,15 @@ async fn run_split_proxy(
     let registry = Arc::new(Registry::new());
     let chain = Arc::new(Chain::new(registry, store.clone()));
     let connector: Arc<dyn UpstreamConnector> = Arc::new(MapConnector { by_host });
+    let guard = StdGuard::default();
+    for host in scope_hosts {
+        guard.add_scope(ScopeEntry { host });
+    }
+    let guard: Arc<dyn ScopeRateGuard> = Arc::new(guard);
 
     let list = PassthroughList::new(passthrough_hosts);
     let modules: Arc<[Arc<dyn ProtocolModule>]> = Arc::from(vec![
-        Arc::new(PassthroughModule::new(list)) as Arc<dyn ProtocolModule>,
+        Arc::new(PassthroughModule::new(list).with_scope(guard.clone())) as Arc<dyn ProtocolModule>,
         Arc::new(HttpModule::with_ca(ca).with_insecure(true)) as Arc<dyn ProtocolModule>,
     ]);
 
@@ -160,6 +170,7 @@ async fn run_split_proxy(
             let store = store_for_loop.clone();
             let chain = chain.clone();
             let connector = connector.clone();
+            let guard = guard.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 256];
                 let n = tcp.peek(&mut buf).await.unwrap_or(0);
@@ -179,7 +190,8 @@ async fn run_split_proxy(
                 };
                 let ctx = ModuleCtx::new(store, chain, connector)
                     .with_modules(modules.clone())
-                    .with_hint(hint);
+                    .with_hint(hint)
+                    .with_scope(guard);
                 let io: ByteStream = Box::pin(tcp);
                 let _ = module.spawn(io, ctx).await;
             });
@@ -280,11 +292,18 @@ async fn passthrough_tunnels_mitm_still_decrypts() {
     let (pinned_addr, pinned_cert) = spawn_tls_fixture("localhost").await;
     let (mitm_addr, mitm_cert) = spawn_tls_fixture("127.0.0.1").await;
 
-    // "localhost" is on the passthrough list; "127.0.0.1" is not.
+    // "localhost" is on the passthrough list; "127.0.0.1" is not, and it is in
+    // Scope — the only host the proxy may decrypt (spec D1).
     let mut by_host = HashMap::new();
     by_host.insert("localhost".to_string(), pinned_addr);
     by_host.insert("127.0.0.1".to_string(), mitm_addr);
-    let (proxy, store) = run_split_proxy(vec!["localhost".to_string()], by_host, ca.clone()).await;
+    let (proxy, store) = run_split_proxy(
+        vec!["localhost".to_string()],
+        vec!["127.0.0.1".to_string()],
+        by_host,
+        ca.clone(),
+    )
+    .await;
 
     // Passthrough host: the client accepts any cert and must see the ORIGIN's own
     // cert — the proxy never terminated TLS.

@@ -263,9 +263,13 @@ async fn handle_conn(
     } else {
         Arc::new(PassiveConnector)
     };
+    // The proxy's own guard rides the ctx (spec D2): a module that re-checks
+    // Scope before terminating TLS answers from the live scope `scope.add` /
+    // `scope.remove` mutate, not the seam's deny-by-default.
     let ctx = ModuleCtx::new(inner.store.clone(), inner.chain.clone(), connector)
         .with_modules(inner.modules.clone())
-        .with_hint(hint);
+        .with_hint(hint)
+        .with_scope(inner.guard.clone());
     let io: ByteStream = Box::pin(stream);
     module.spawn(io, ctx).await
 }
@@ -278,8 +282,10 @@ async fn handle_conn(
 /// bounds-checked through `get`/`?`, so a truncated or malformed hello yields
 /// `None`, never a panic — this runs on attacker-controlled bytes. No TLS library
 /// is pulled into `aitm-core`; this is a read-only walk of the handshake layout
-/// (RFC 8446 §4.1.2, RFC 6066 §3), not a TLS implementation.
-fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
+/// (RFC 8446 §4.1.2, RFC 6066 §3), not a TLS implementation. Public so the HTTP
+/// module can read the SNI of a raw-TLS ClientHello it buffers itself when the
+/// hello did not fit the acceptor's peek (spec D2).
+pub fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
     // TLS record header: content_type(1)=0x16 handshake, version(2), length(2).
     if buf.first() != Some(&0x16) {
         return None;
@@ -449,13 +455,17 @@ impl ProxyBuilder {
 #[cfg(test)]
 mod tests {
     use super::{is_benign_disconnect, parse_client_hello_sni, Proxy};
-    use crate::config::Config;
+    use crate::config::{Config, ScopeEntry};
     use crate::error::GuardError;
     use crate::protocol::{ModuleCtx, NextLayerHint, ProtocolModule};
     use crate::stream::ByteStream;
     use futures::future::BoxFuture;
     use std::io;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
 
     /// A no-op protocol module that claims nothing — enough to assert the proxy
     /// exposes its registered module list, event sink, and a guarded connector.
@@ -488,6 +498,76 @@ mod tests {
         // The sink and a guarded connector construct without panicking.
         let _sink = proxy.event_sink();
         let _conn = proxy.upstream_connector(true);
+    }
+
+    /// Claims everything; when spawned, reports whether two authorities are in
+    /// scope according to its context — the question a module asks before it
+    /// terminates TLS (spec D2).
+    struct ScopeProbe {
+        answers: Mutex<Option<oneshot::Sender<(bool, bool)>>>,
+    }
+
+    impl ProtocolModule for ScopeProbe {
+        fn id(&self) -> &str {
+            "scope-probe"
+        }
+        fn matches(&self, _hint: &NextLayerHint) -> bool {
+            true
+        }
+        fn spawn(&self, _io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, anyhow::Result<()>> {
+            let probed = (
+                ctx.in_scope("example.com:443"),
+                ctx.in_scope("other.test:443"),
+            );
+            if let Some(tx) = self.answers.lock().ok().and_then(|mut s| s.take()) {
+                let _ = tx.send(probed);
+            }
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// AC14: the acceptor attaches the proxy's guard — the `StdGuard` seeded from
+    /// config and mutated by `scope.add` — to every `ModuleCtx` it spawns a module
+    /// with, so `ctx.in_scope` answers from the live Scope (`true` for the seeded
+    /// host, `false` for another), not the seam's deny-by-default `false`.
+    /// Binds a loopback listener: run it from a shell that may bind sockets.
+    #[tokio::test]
+    async fn acceptor_attaches_the_scope_guard_to_the_module_ctx() {
+        let mut cfg = Config::default();
+        cfg.scope.entries.push(ScopeEntry {
+            host: "example.com".to_string(),
+        });
+        let (tx, rx) = oneshot::channel();
+        let proxy = Proxy::builder()
+            .with_config(cfg)
+            .register_module(Arc::new(ScopeProbe {
+                answers: Mutex::new(Some(tx)),
+            }))
+            .build()
+            .expect("build proxy");
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move { proxy.run_on(listener).await });
+
+        let mut client = TcpStream::connect(addr).await.expect("connect the proxy");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .expect("send a request line for the peek");
+
+        let answers = tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("the probe module is spawned within 5s")
+            .expect("the probe reports its answers");
+        assert_eq!(
+            answers,
+            (true, false),
+            "the acceptor's ModuleCtx answers in_scope from the proxy's own guard"
+        );
+        server.abort();
     }
 
     #[tokio::test]

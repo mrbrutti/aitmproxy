@@ -2,10 +2,11 @@
 //!
 //! The binary wiring converges five additive features: every new first-party
 //! command is registered into the one `Registry` the frontends share; the
-//! `PassthroughModule` is ordered before `HttpModule` so a pinned SNI tunnels
-//! past MITM; the additive `Config.tls`/`Config.maps` sections parse with
-//! `deny_unknown_fields`; and the agent gates default to the deny-by-default
-//! posture (off) with no config overrides.
+//! `PassthroughModule` is ordered before `HttpModule` so a pinned SNI (and, with
+//! per-host decryption, any out-of-scope authority) tunnels past MITM; the
+//! additive `Config.tls`/`Config.maps` sections parse with `deny_unknown_fields`;
+//! and the agent gates default to the deny-by-default posture (off) with no
+//! config overrides.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -17,7 +18,8 @@ use std::time::SystemTime;
 use aitm::config_file::parse;
 use aitm::wire::{assemble, ordered_modules};
 use aitm_core::{
-    CommandHost, Config, Frontend, HttpFlow, HttpRequest, NextLayerHint, Params, ProxyClient, Value,
+    CommandHost, Config, Frontend, HttpFlow, HttpRequest, NextLayerHint, Params, ProxyClient,
+    ScopeEntry, ScopeRateGuard, StdGuard, Value,
 };
 use aitm_plugin_passthrough::PassthroughList;
 use aitm_proto_http::{CertAuthority, HttpModule};
@@ -90,14 +92,24 @@ fn assembles_with_all_m6_plugins() {
 
 /// `PassthroughModule` is registered before `HttpModule`, so the acceptor (which
 /// picks the first module whose `matches` returns true) selects passthrough for a
-/// pinned SNI even though `HttpModule` would also claim a TLS connection.
+/// pinned SNI even though `HttpModule` would also claim a TLS connection. With
+/// the scope guard `ordered_modules` now hands it, an in-scope unpinned host goes
+/// to `HttpModule` and an out-of-scope one is tunnelled (spec D1/D2, AC14).
 #[test]
 fn passthrough_module_ordered_before_http() {
     let dir = temp_ca_dir("order");
     let ca = Arc::new(CertAuthority::load_or_generate(&dir, 0o600).expect("ca"));
     let http = HttpModule::with_ca(ca);
     let list = PassthroughList::new(vec!["pinned.example".into()]);
-    let modules = ordered_modules(http, list, InjectRegistry::default());
+    // Scope: `pinned.example` (pins must still win) and `other.example`.
+    let guard = StdGuard::default();
+    for host in ["pinned.example", "other.example"] {
+        guard.add_scope(ScopeEntry {
+            host: host.to_string(),
+        });
+    }
+    let guard: Arc<dyn ScopeRateGuard> = Arc::new(guard);
+    let modules = ordered_modules(http, list, InjectRegistry::default(), guard);
 
     assert_eq!(
         modules[0].id(),
@@ -122,16 +134,28 @@ fn passthrough_module_ordered_before_http() {
         .expect("a module claims the pinned-SNI connection");
     assert_eq!(chosen.id(), "passthrough");
 
-    // A non-pinned TLS connection still goes to HTTP (MITM), not passthrough.
+    // An in-scope, non-pinned TLS connection goes to HTTP (MITM), not passthrough.
     let other = NextLayerHint {
         client_hello_sni: Some("other.example".into()),
-        ..pinned
+        ..pinned.clone()
     };
     let chosen = modules
         .iter()
         .find(|m| m.matches(&other))
         .expect("a module claims the ordinary connection");
     assert_eq!(chosen.id(), "http");
+
+    // An out-of-scope TLS connection is tunnelled: passthrough claims it before
+    // HTTP can decrypt it.
+    let unscoped = NextLayerHint {
+        client_hello_sni: Some("unscoped.example".into()),
+        ..pinned
+    };
+    let chosen = modules
+        .iter()
+        .find(|m| m.matches(&unscoped))
+        .expect("a module claims the out-of-scope connection");
+    assert_eq!(chosen.id(), "passthrough");
 }
 
 /// The additive `tls:` section parses, and an unknown key under it is an error
