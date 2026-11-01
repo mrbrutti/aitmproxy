@@ -150,7 +150,7 @@ impl Check for CrashCheck {
             if run.dry_run {
                 return dry_run_verdict(&run);
             }
-            if let Some(verdict) = candidate_verdict(&run) {
+            if let Some(verdict) = candidate_verdict(&run, host.profile().l4.reproduce_count) {
                 return verdict;
             }
             if let Some(verdict) = stopped_verdict(&run) {
@@ -339,10 +339,21 @@ fn dry_run_verdict(run: &PointRun) -> Verdict {
 /// The candidate carried is the most recent one, which is the case the
 /// interrupted triage was reproducing. `Evidence.l4` stays `None`: an
 /// `L4Evidence` asserts a reproduction count, and nothing was reproduced.
-/// `None` when the run was not stopped or holds no silent candidate; the
-/// caller has already returned for a run that does hold a crash.
-fn candidate_verdict(run: &PointRun) -> Option<Verdict> {
-    let reason = run.stopped.as_ref()?;
+/// A candidate also goes unconfirmed with no stop at all when the profile
+/// asks for no replay: `reproduce_count: 0` means the triage never ran, so
+/// spec call 14's reproduction never happened and the point is inconclusive
+/// rather than clean (review finding G1).
+///
+/// `None` when the run holds no silent candidate, or when it holds one the
+/// triage did get to judge — a replay ran and did not reproduce it, which is
+/// the lane's answer, not an open question. The caller has already returned
+/// for a run that does hold a crash.
+fn candidate_verdict(run: &PointRun, reproduce_count: u32) -> Option<Verdict> {
+    let why = match run.stopped.as_ref() {
+        Some(reason) => format!("{reason} before reproduction"),
+        None if reproduce_count == 0 => "not reproduced (reproduce_count is 0)".to_string(),
+        None => return None,
+    };
     let case = run
         .cases
         .iter()
@@ -356,7 +367,7 @@ fn candidate_verdict(run: &PointRun) -> Option<Verdict> {
             ..Evidence::default()
         },
         detail: format!(
-            "crash candidate on {} field {} mutation {}: {reason} before reproduction",
+            "crash candidate on {} field {} mutation {}: {why}",
             run.target,
             run.field,
             case.chain.join(";")
@@ -709,6 +720,56 @@ mod tests {
         );
         assert!(verdict.detail.contains("crash candidate"));
         assert!(verdict.detail.contains("budget"));
+        assert_eq!(
+            shared
+                .state
+                .counters(job.job_id())
+                .expect("counters")
+                .crashes,
+            0
+        );
+    }
+
+    /// Review finding G1: with `reproduce_count: 0` the triage never runs, so
+    /// the candidate stays unconfirmed and the run carries no crash **and no
+    /// stop** — the fuzz loop ran to its last case. The check must still
+    /// surface the candidate: `inconclusive`/`tentative`, saying why nothing
+    /// was reproduced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unconfirmed_candidate_without_stop_is_inconclusive() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let mut profile = with_hex_seed(l4_profile(vec![udp_target(9)], 10), "deadbeef0000");
+        profile.l4.reproduce_count = 0;
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+
+        let verdict = run_check(&CrashCheck::new(registry), &runner).await;
+
+        assert_eq!(verdict.outcome, Outcome::Inconclusive);
+        assert_eq!(verdict.confidence, Confidence::Tentative);
+        assert!(
+            verdict.evidence.l4.is_none(),
+            "nothing was reproduced, so there is no crash evidence: {:?}",
+            verdict.evidence.l4
+        );
+        // Eight cases were left unconfirmed; the verdict carries the most
+        // recent of them, bytes and mutation chain alike.
+        let run = runner.run_point().await;
+        let candidate = run
+            .cases
+            .iter()
+            .find(|case| case.chain == vec!["grow:8:repeat".to_string()])
+            .expect("the grow:8:repeat case");
+        assert_eq!(candidate.liveness, Some((false, false)));
+        assert_eq!(verdict.evidence.payload, Some(candidate.sent_hex.clone()));
+        assert_eq!(
+            verdict.detail,
+            "crash candidate on 127.0.0.1:9/udp field raw mutation grow:8:repeat: \
+             not reproduced (reproduce_count is 0)"
+        );
+        assert!(run.stopped.is_none(), "{:?}", run.stopped);
         assert_eq!(
             shared
                 .state

@@ -742,7 +742,14 @@ impl PointRunner {
                     run.stopped = Some(reason);
                     break;
                 }
-                if !first && !second {
+                // `reproduce_count: 0` asks for no replay at all, and spec
+                // call 14 confirms a crash only on a reproduction. So the
+                // triage never runs, the candidate is never confirmed — no
+                // crash, no retirement, no stop — and the loop goes on to the
+                // next case, keeping this one's `(false, false)` liveness for
+                // `checks::CrashCheck` to report as inconclusive (review
+                // finding G1).
+                if !first && !second && reproduce_count > 0 {
                     let triage = self
                         .triage(&spec, &seed.id, &chain, index, reproduce_count)
                         .await;
@@ -1446,6 +1453,66 @@ mod tests {
         assert_eq!(run.cases.len(), 10);
         // 1 baseline + 10 cases + 2 failed probes + 1 recovery poll + 3 x (replay + 2 probes).
         assert_eq!(mock.inject_count(), 1 + 10 + 2 + 1 + 3 * 3);
+    }
+
+    /// Review finding G1: with `reproduce_count: 0` no replay can ever run,
+    /// and the spec's call 14 confirms a crash only on a reproduction. The
+    /// candidate is left unconfirmed — no crash, no retirement, no stop — and
+    /// the fuzz loop goes on to the next case; `checks::CrashCheck` reports
+    /// the candidate as inconclusive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reproduce_count_zero_never_confirms() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let mut profile = with_hex_seed(l4_profile(vec![udp_target(9)], 10), "deadbeef0000");
+        profile.l4.reproduce_count = 0;
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        assert!(
+            run.crash.is_none(),
+            "nothing was reproduced, so nothing is a crash: {:?}",
+            run.crash
+        );
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 10,
+                crashes: 0,
+                liveness_failures: 16,
+                retired_elements: 0,
+            })
+        );
+        // Eight of the ten cases carry the pattern that kills the target,
+        // and every one of them was left unconfirmed: two failed probes each,
+        // and the run carried on to the next case every time.
+        assert_eq!(
+            run.cases
+                .iter()
+                .filter(|case| case.liveness == Some((false, false)))
+                .map(|case| case.chain.join(";"))
+                .collect::<Vec<_>>(),
+            [
+                "grow:8",
+                "grow:12",
+                "grow:16",
+                "grow:64",
+                "grow:256",
+                "grow:1024",
+                "grow:1472",
+                "grow:8:repeat"
+            ]
+        );
+        assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+        assert_eq!(run.cases.len(), 10, "the loop ran on: {:?}", run.cases);
+        let candidate = run
+            .cases
+            .iter()
+            .find(|case| case.chain == vec!["grow:8".to_string()])
+            .expect("the grow:8 case");
+        assert_eq!(candidate.liveness, Some((false, false)));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
