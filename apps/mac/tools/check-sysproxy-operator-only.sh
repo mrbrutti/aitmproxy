@@ -89,6 +89,8 @@ if [ "${1:-}" = "--self-check" ]; then
   # `session` nor `self`.
   printf '\nextension Session {\n    var plantedBareRef: () async -> Void { setSystemProxy }\n}\n' >> "$work/Sources/Aitmproxy/Panels/ScopePanel.swift"
   printf '\nfunc plantedOtherReceiver(_ s: Session) -> () async -> Void { s.restoreSystemProxy }\n' >> "$work/Sources/Aitmproxy/Panels/ScriptsPanel.swift"
+  # Second security re-check (2026-11-01): an optional-chained value and an underscore receiver.
+  printf '\nfunc plantedOptionalChain(_ _s: Session?) -> (() async -> Void)? { _s?.setSystemProxy }\n' >> "$work/Sources/Aitmproxy/Panels/SavedPanel.swift"
   out=$(bash "$self" "$work" 2>&1); rc=$?
   printf '%s\n' "$out"
   ok=1
@@ -107,6 +109,8 @@ if [ "${1:-}" = "--self-check" ]; then
     || { echo "SELF-CHECK FAIL: rule 2 did not name the planted bare undotted setSystemProxy reference in Panels/ScopePanel.swift"; ok=0; }
   grep -qE '^VIOLATION \[2 [^]]*\] Sources/Aitmproxy/Panels/ScriptsPanel\.swift:' <<<"$out" \
     || { echo "SELF-CHECK FAIL: rule 2 did not name the planted s.restoreSystemProxy reference in Panels/ScriptsPanel.swift"; ok=0; }
+  grep -qE '^VIOLATION \[2 [^]]*\] Sources/Aitmproxy/Panels/SavedPanel\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 2 did not name the planted _s?.setSystemProxy reference in Panels/SavedPanel.swift"; ok=0; }
   if [ "$ok" -eq 1 ]; then
     echo "SELF-CHECK PASS: rules 1–4 each caught their planted violation"
     exit 0
@@ -175,7 +179,7 @@ expect() {
     return
   fi
   # Code only: a `//` comment must not keep an allow-list entry alive.
-  if ! sed -E 's#//.*$##' "$2" | grep -qE -e "$3"; then
+  if ! sed -E 's#/\*.*\*/##g; s#//.*$##' "$2" | grep -qE -e "$3"; then
     flag "$1" "$2: no longer contains $4; the allow-list is stale or this tripwire has gone blind. Re-read the code and update this script"
   fi
 }
@@ -247,7 +251,7 @@ expect_count "$rule2" "$sysproxy" "$undotted_re" 2 'an undotted setSystemProxy(/
 # alone is also the ConnectionAction case.
 # Any lowercase receiver (a variable: `session`, `self`, `s`) or the type `Session`; type-named
 # receivers such as `ConnectionAction.setSystemProxy` (the action case) are not member references.
-bare_re='(^|[^A-Za-z0-9_.])(Session|[a-z][A-Za-z0-9_]*)\.(setSystemProxy|restoreSystemProxy)([^A-Za-z0-9_(]|$)'
+bare_re='(^|[^A-Za-z0-9_.])(Session|[a-z_][A-Za-z0-9_]*)[?!]?\.(setSystemProxy|restoreSystemProxy)([^A-Za-z0-9_(]|$)'
 scan "$rule2" "$bare_re" "$settings_view" "$status_panel" "$setup_sheet" "$route_banner" "$app_swift" "$sysproxy"
 # Bare undotted: the method handed on as a value from inside an `extension Session`
 # (`{ setSystemProxy }`). The leading-dot form is the ConnectionAction case and is excluded;
