@@ -111,11 +111,7 @@ impl Check for CmdiEcho {
                     Ok(response) => response,
                     // The dialer's error text names the transport failure and
                     // never a header value (plan tasks 9-16, "Shape").
-                    Err(error) => {
-                        let mut verdict = common::connect_error(&error);
-                        verdict.evidence.probe_flows = flows;
-                        return verdict;
-                    }
+                    Err(error) => return common::connect_error(&error, flows),
                 };
                 flows.extend(response.flow);
 
@@ -170,7 +166,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{check, ID};
-    use crate::testing::{echo_handler, point_and_host_for, ws_server, ServerConn, TestJob};
+    use crate::testing::{echo_handler, host_for, ws_server, ServerConn, TestJob};
     use crate::transport::WsTransport;
 
     /// The seeded vulnerable target: the `msg` field reaches a shell, so
@@ -302,7 +298,7 @@ mod tests {
     async fn vulnerable_server_runs_echo() {
         let (transport, log) = ws_server(None, shell_handler);
         let job = TestJob::new(100);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let marker = host.marker();
         let point = host.point().clone();
 
@@ -337,7 +333,7 @@ mod tests {
     async fn echoing_the_literal_is_clean() {
         let (transport, log) = ws_server(None, echo_handler);
         let job = TestJob::new(100);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -359,7 +355,7 @@ mod tests {
     async fn patched_escaping_echo_is_clean() {
         let (transport, log) = ws_server(None, patched_echo_handler);
         let job = TestJob::new(100);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -383,7 +379,7 @@ mod tests {
     async fn budget_zero_sends_nothing() {
         let (transport, log) = ws_server(None, shell_handler);
         let job = TestJob::new(0);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -401,7 +397,7 @@ mod tests {
         let (transport, log) = ws_server(None, shell_handler);
         let job = TestJob::new(100);
         job.cancel();
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -417,8 +413,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_error_is_inconclusive() {
         let job = TestJob::new(100);
-        let host =
-            point_and_host_for("msg", &job, Arc::new(DeadTransport) as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, Arc::new(DeadTransport));
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;

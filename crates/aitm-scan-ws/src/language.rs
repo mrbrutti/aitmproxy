@@ -22,8 +22,11 @@
 //! conversation is async and must survive across calls (`dial` … `send` …
 //! `recv` … `close`). So the language owns one background thread running a
 //! current-thread tokio runtime that holds the open [`WsConn`]s; each host fn
-//! sends it a [`DriverCmd`] over `std::sync::mpsc` and blocks on the reply with
-//! a timeout. The thread starts lazily on the first `ws.dial`.
+//! sends it a [`DriverCmd`] over a `tokio::sync::mpsc` command channel — whose
+//! async `recv` is what lets the driver wait for the next command while the
+//! ones already in flight keep running — and blocks, with a timeout, on the
+//! bounded `std::sync::mpsc` reply channel it sent along with the command. The
+//! thread starts lazily on the first `ws.dial`.
 //!
 //! ## Redaction
 //!
@@ -118,7 +121,7 @@ impl WsLanguage {
             link: Arc::new(DriverLink {
                 guard,
                 dialer,
-                sender: Mutex::new(None),
+                sender: Arc::new(Mutex::new(None)),
             }),
         }
     }
@@ -268,10 +271,12 @@ fn catalog_host_fns() -> Vec<HostFnSig> {
                         .to_string(),
             }],
             returns: "int".to_string(),
-            description:
-                "Open a scope-guarded WebSocket connection and return its handle; at most 4 are \
-                 open at once."
-                    .to_string(),
+            // Built from the constant, like `handle_bound_reason`: the number
+            // an operator reads in the catalogue cannot drift from the bound.
+            description: format!(
+                "Open a scope-guarded WebSocket connection and return its handle; at most \
+                 {MAX_HANDLES} are open at once."
+            ),
         },
         HostFnSig {
             name: "send".to_string(),
@@ -302,8 +307,9 @@ fn catalog_host_fns() -> Vec<HostFnSig> {
                 ParamSig {
                     name: "timeout_ms".to_string(),
                     ty: "int".to_string(),
-                    description: "How long to collect replies for, clamped to 30000 ms."
-                        .to_string(),
+                    description: format!(
+                        "How long to collect replies for, clamped to {RECV_TIMEOUT_CAP_MS} ms."
+                    ),
                 },
             ],
             returns: "object".to_string(),
@@ -528,11 +534,17 @@ fn build_request(url: &str, headers: Option<&Value>) -> Result<Request<()>, Host
         }
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| HostError::BadArgs(format!("{name} is not a valid header name")))?;
-        let header = HeaderValue::from_str(value).map_err(|_| {
-            HostError::BadArgs(format!(
-                "the value of header {name} cannot be sent on the wire"
-            ))
-        })?;
+        // Visible ASCII only: `from_str` also accepts obs-text (bytes
+        // 0x80-0xFF), which tungstenite's serialiser later refuses by quoting
+        // the whole value back in its error (security finding S9).
+        let header = HeaderValue::from_str(value)
+            .ok()
+            .filter(|header| header.to_str().is_ok())
+            .ok_or_else(|| {
+                HostError::BadArgs(format!(
+                    "the value of header {name} cannot be sent on the wire"
+                ))
+            })?;
         request.headers_mut().insert(name, header);
     }
     Ok(request)
@@ -557,9 +569,26 @@ fn unknown_handle(handle: i64) -> HostError {
     HostError::BadArgs(format!("no open websocket handle {handle}"))
 }
 
-/// The error for a driver that is not running, or did not answer in time.
+/// The error for a handle another command is holding right now.
+///
+/// A handle serialises its own commands, and a script that drives one handle
+/// from two engines (or a hook that overlaps its own calls) must be told that,
+/// not left waiting out the other command's window (quality finding N6).
+fn busy_handle(handle: i64) -> HostError {
+    HostError::BadArgs(format!("websocket handle {handle} is busy"))
+}
+
+/// The error for a driver that is not running, or whose channel has closed.
 fn driver_unavailable() -> HostError {
     HostError::BadArgs("ws driver unavailable".to_string())
+}
+
+/// The error for a driver that is there but did not answer within `wait`.
+fn driver_silent(wait: Duration) -> HostError {
+    HostError::BadArgs(format!(
+        "the ws driver did not answer within {} ms",
+        wait.as_millis()
+    ))
 }
 
 /// One command a host fn asks the driver thread to run.
@@ -603,6 +632,17 @@ enum DriverCmd {
     },
 }
 
+/// The one place the driver's command channel is kept.
+///
+/// Shared with the driver thread so a driver that cannot start clears it and
+/// the next `ws.dial` spawns again (quality finding N7).
+type SenderSlot = Arc<Mutex<Option<UnboundedSender<DriverCmd>>>>;
+
+/// Forget the driver this slot points at, so the next `ws.dial` starts one.
+fn clear_sender(slot: &SenderSlot) {
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
 /// The host fns' side of the driver: the live state plus the channel to it.
 ///
 /// The thread starts on the first [`DriverLink::start`] (i.e. the first
@@ -612,7 +652,7 @@ enum DriverCmd {
 struct DriverLink {
     guard: Arc<dyn ScopeRateGuard>,
     dialer: Arc<WsDialer>,
-    sender: Mutex<Option<UnboundedSender<DriverCmd>>>,
+    sender: SenderSlot,
 }
 
 impl DriverLink {
@@ -622,6 +662,12 @@ impl DriverLink {
     /// lets the driver's [`tokio::task::LocalSet`] loop wait for a command and
     /// still drive the in-flight ones (Q3), while the reply half of each command
     /// stays a bounded `std::sync::mpsc` the host fn blocks on.
+    ///
+    /// A thread that will not spawn leaves the slot empty and is logged at
+    /// `warn!` with the OS error (quality finding N7); so does a driver whose
+    /// runtime will not build, from the thread itself. Either way the next
+    /// `ws.dial` tries again rather than reporting a driver that was never
+    /// there.
     fn start(&self) -> Result<UnboundedSender<DriverCmd>, HostError> {
         let mut slot = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(sender) = slot.as_ref() {
@@ -630,10 +676,14 @@ impl DriverLink {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let guard = Arc::clone(&self.guard);
         let dialer = Arc::clone(&self.dialer);
+        let own_slot = Arc::clone(&self.sender);
         thread::Builder::new()
             .name("aitm-ws-script".to_string())
-            .spawn(move || run_driver(receiver, guard, dialer))
-            .map_err(|_| driver_unavailable())?;
+            .spawn(move || run_driver(receiver, guard, dialer, &own_slot))
+            .map_err(|err| {
+                tracing::warn!(error = %err, "the ws script driver thread could not be spawned");
+                driver_unavailable()
+            })?;
         *slot = Some(sender.clone());
         Ok(sender)
     }
@@ -648,9 +698,10 @@ impl DriverLink {
 
     /// Send one command and block for its reply, at most `wait`.
     ///
-    /// A driver that has gone away, or has not answered within `wait`, is
-    /// [`driver_unavailable`] rather than a hang: a host fn runs on a worker
-    /// thread a script is waiting on.
+    /// Neither outcome is a hang — a host fn runs on a worker thread a script
+    /// is waiting on — and the two are told apart (quality finding N6): a
+    /// channel nobody is listening on is [`driver_unavailable`], while a driver
+    /// that is running but silent for `wait` is [`driver_silent`].
     fn ask<T>(
         &self,
         sender: &UnboundedSender<DriverCmd>,
@@ -663,9 +714,8 @@ impl DriverLink {
             .map_err(|_| driver_unavailable())?;
         match answers.recv_timeout(wait) {
             Ok(answer) => answer,
-            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                Err(driver_unavailable())
-            }
+            Err(RecvTimeoutError::Timeout) => Err(driver_silent(wait)),
+            Err(RecvTimeoutError::Disconnected) => Err(driver_unavailable()),
         }
     }
 }
@@ -680,25 +730,31 @@ struct OpenHandle {
 ///
 /// Commands arrive on a `tokio::sync::mpsc` and each is handled in its own
 /// [`tokio::task::spawn_local`] task, so a slow command on one handle (a long
-/// `ws.recv`) never blocks a command on another (Q3). Commands on the *same*
-/// handle still serialise, because each handle lives behind its own
-/// [`AsyncMutex`]. The reaper is a separate task on the [`REAP_TICK`]. When the
+/// `ws.recv`) never blocks a command on another (Q3). A second command on the
+/// *same* handle does not queue behind the first: each handle lives behind its
+/// own [`AsyncMutex`] and a command that cannot take it answers
+/// [`busy_handle`] at once (N6). The reaper is a separate task on the
+/// [`REAP_TICK`]. When the
 /// last [`DriverLink`] drops, the command channel closes, the loop ends, and
 /// every open handle is closed before the runtime drops.
 fn run_driver(
     mut commands: UnboundedReceiver<DriverCmd>,
     guard: Arc<dyn ScopeRateGuard>,
     dialer: Arc<WsDialer>,
+    slot: &SenderSlot,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
         Ok(runtime) => runtime,
-        // Nothing can be answered without a runtime; dropping the receiver
-        // disconnects the channel and every host fn reports the driver gone.
+        // Nothing can be answered without a runtime. The slot this driver was
+        // started from is cleared so the next `ws.dial` spawns a fresh one
+        // instead of sending into a channel nobody reads (N7), and the failure
+        // is a `warn!`: an operator's script just lost its websocket verbs.
         Err(err) => {
-            tracing::debug!(error = %err, "the ws script driver could not start a runtime");
+            tracing::warn!(error = %err, "the ws script driver could not start a runtime");
+            clear_sender(slot);
             return;
         }
     };
@@ -860,7 +916,7 @@ async fn drive_send(
     frame: Frame,
 ) -> Result<(), HostError> {
     let open = handle_rc(state, handle)?;
-    let mut open = open.lock().await;
+    let mut open = open.try_lock().map_err(|_| busy_handle(handle))?;
     // The error text is tungstenite's own (a protocol or socket message); the
     // frame payload never reaches it.
     open.conn
@@ -878,7 +934,7 @@ async fn drive_recv(
     window: Duration,
 ) -> Result<Vec<Frame>, HostError> {
     let open = handle_rc(state, handle)?;
-    let mut open = open.lock().await;
+    let mut open = open.try_lock().map_err(|_| busy_handle(handle))?;
     // The collection's own deadline is the window plus the grace the host fn is
     // waiting out, so `collect` ends on the window, never on this.
     let deadline = Instant::now() + window + REPLY_GRACE;
@@ -892,13 +948,14 @@ async fn drive_recv(
 }
 
 /// Close `handle` and free its connection.
+///
+/// The handle leaves the table only once this command holds it: a close that
+/// collided with an in-flight send or recv is refused as busy, and the handle
+/// the other command is using stays open and findable.
 async fn drive_close(state: &Rc<RefCell<DriverState>>, handle: i64) -> Result<(), HostError> {
-    let open = state
-        .borrow_mut()
-        .handles
-        .remove(&handle)
-        .ok_or_else(|| unknown_handle(handle))?;
-    let mut open = open.lock().await;
+    let open = handle_rc(state, handle)?;
+    let mut open = open.try_lock().map_err(|_| busy_handle(handle))?;
+    state.borrow_mut().handles.remove(&handle);
     open.conn.close().await;
     Ok(())
 }
@@ -1145,6 +1202,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["dial", "send", "recv", "close"]
         );
+        let dial = &catalog.host_fns[0];
+        assert_eq!(
+            dial.description,
+            "Open a scope-guarded WebSocket connection and return its handle; at most 4 are open \
+             at once."
+        );
+        assert_eq!(
+            catalog.host_fns[2].params[1].description,
+            "How long to collect replies for, clamped to 30000 ms."
+        );
         assert!(catalog.poc_step.is_none());
         assert_eq!(catalog.sources, Vec::<String>::new());
     }
@@ -1291,6 +1358,24 @@ mod tests {
     }
 
     #[test]
+    fn ws_dial_refuses_a_non_ascii_header_value_without_quoting_it() {
+        // `HeaderValue::from_str` accepts obs-text, so a script's non-ASCII
+        // cookie used to reach tungstenite's serialiser, whose error quotes the
+        // whole value back at the script (security finding S9).
+        let text = refusal(
+            "ws.dial(#{ url: \"ws://127.0.0.1:8080/ws\", headers: #{ \"Cookie\": \"sid=s3cr3t-caf\u{e9}\" } })",
+        );
+        assert!(
+            text.contains("the value of header cookie cannot be sent on the wire"),
+            "unexpected refusal: {text}"
+        );
+        assert!(
+            !text.contains("s3cr3t") && !text.contains("caf"),
+            "the refusal quoted the header value: {text}"
+        );
+    }
+
+    #[test]
     fn recv_and_close_on_an_unknown_handle_are_bad_args() {
         for script in ["ws.recv(42, 10)", "ws.close(42)"] {
             let text = refusal(script);
@@ -1361,10 +1446,25 @@ mod tests {
         assert_eq!(h1, 1);
 
         // Thread A: a 1500 ms recv on handle 1. No frame arrives, so it waits out
-        // the whole window, holding handle 1 the entire time.
+        // the whole window, holding handle 1 the entire time. What it got is
+        // asserted after the join (N8): a recv that failed early would leave
+        // handle 1 free and make handle 2's speed prove nothing.
         let a = std::thread::spawn(move || {
             let _seed = seed_call_context(CallerTrust::Operator, None, None);
-            let _ = engine_a.eval::<Dynamic>("ws.recv(1, 1500)");
+            let started = Instant::now();
+            let frames = engine_a
+                .eval::<Map>("ws.recv(1, 1500)")
+                .map(|reply| {
+                    reply
+                        .get("frames")
+                        .cloned()
+                        .expect("a recv reply carries `frames`")
+                        .into_array()
+                        .expect("`frames` is an array")
+                        .len()
+                })
+                .map_err(|err| err.to_string());
+            (frames, started.elapsed())
         });
 
         // Give A's long recv time to reach the driver before B starts.
@@ -1388,7 +1488,116 @@ mod tests {
             elapsed < Duration::from_millis(1000),
             "handle 2 took {elapsed:?}; a recv on handle 1 must not block it"
         );
+
+        let (frames_a, elapsed_a) = a.join().expect("thread A joins");
+        assert_eq!(
+            frames_a,
+            Ok(0),
+            "handle 1's recv must evaluate and come back with no frames"
+        );
+        assert!(
+            elapsed_a >= Duration::from_millis(1400),
+            "handle 1's recv returned after {elapsed_a:?}; it must hold the handle for its \
+             whole 1500 ms window"
+        );
+    }
+
+    #[test]
+    fn a_command_on_a_handle_another_command_holds_says_the_handle_is_busy() {
+        // Two engines, one handle: A holds handle 1 for a long `ws.recv` while
+        // B tries to send on it. Contention on a handle is not "the driver is
+        // unavailable" — the driver is right there, answering — it is a busy
+        // handle, and the refusal says which one (quality finding N6).
+        let guard = scoped_guard();
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = Arc::new(WsDialer::new(Arc::clone(&transport) as Arc<dyn WsTransport>));
+        let language = WsLanguage::new(guard, dialer);
+        let engine_a = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&language],
+        )
+        .expect("the ws language installs");
+        let engine_b = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&language],
+        )
+        .expect("the ws language installs");
+
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+        let h1: i64 = engine_a
+            .eval(r#"ws.dial(#{ url: "ws://127.0.0.1:8080/ws" })"#)
+            .expect("the first dial evaluates");
+        assert_eq!(h1, 1);
+
+        let a = std::thread::spawn(move || {
+            let _seed = seed_call_context(CallerTrust::Operator, None, None);
+            let _ = engine_a.eval::<Dynamic>("ws.recv(1, 1500)");
+        });
+        // Long enough for A's recv to have taken the handle's lock.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let err = engine_b
+            .eval::<Dynamic>(r#"ws.send(1, "hi")"#)
+            .expect_err("a command on a handle another command holds is refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("websocket handle 1 is busy"),
+            "unexpected refusal: {text}"
+        );
+        assert!(
+            !text.contains("ws driver unavailable"),
+            "a busy handle is not an unavailable driver: {text}"
+        );
         a.join().expect("thread A joins");
+    }
+
+    #[test]
+    fn a_driver_that_went_away_is_started_again_by_the_next_dial() {
+        // A driver whose runtime will not build clears the slot it was started
+        // from (N7). That is the half this test drives directly — a runtime
+        // that refuses to build cannot be forced from here — and it proves the
+        // consequence that matters: the next `ws.dial` spawns a new driver
+        // rather than sending into a channel nobody reads.
+        use super::clear_sender;
+
+        let guard = scoped_guard();
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = Arc::new(WsDialer::new(Arc::clone(&transport) as Arc<dyn WsTransport>));
+        let language = WsLanguage::new(guard, dialer);
+        let engine = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&language],
+        )
+        .expect("the ws language installs");
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+
+        let first: i64 = engine
+            .eval(r#"ws.dial(#{ url: "ws://127.0.0.1:8080/ws" })"#)
+            .expect("the first dial evaluates");
+        assert_eq!(first, 1);
+        let kept_alive = language.link.started().expect("the driver is running");
+
+        clear_sender(&language.link.sender);
+        assert!(
+            language.link.started().is_none(),
+            "a cleared slot leaves no sender behind"
+        );
+
+        let after: i64 = engine
+            .eval(r#"ws.dial(#{ url: "ws://127.0.0.1:8080/ws" })"#)
+            .expect("the next dial starts a driver instead of reporting one gone");
+        assert_eq!(
+            after, 1,
+            "the dial went to a new driver, whose handles start at one again"
+        );
+        assert!(
+            language.link.started().is_some(),
+            "the new driver's sender is stored for the calls after it"
+        );
+        drop(kept_alive);
     }
 
     #[test]

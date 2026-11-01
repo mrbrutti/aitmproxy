@@ -58,7 +58,6 @@ use aitm_scan_model::{Confidence, InsertionKind, InsertionPoint, JobCtx, Lane, O
 use aitm_scan_ws::checks;
 use aitm_scan_ws::dialer::WsDialer;
 use aitm_scan_ws::lane::WsLane;
-use aitm_scan_ws::testing::live::{control_json, strip_scheme, Target};
 use aitm_scan_ws::testing::TestJob;
 use aitm_scan_ws::transport::TcpTransport;
 use aitm_scan_ws::types::{TlsPolicy, MAX_CONNECTIONS};
@@ -70,6 +69,10 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
+
+mod common;
+
+use common::live::{control_json, http, Target};
 
 /// The fixture login `POST /login` accepts on the seeded target.
 const LOGIN_FORM: &str = "user=alice&pass=wonderland";
@@ -86,45 +89,6 @@ const SWEEP_BUDGET: u32 = 4_000;
 /// purpose: the point of the concurrency observation is that the lane's own
 /// semaphore, not the test's pacing, is what bounds the target's connections.
 const SWEEP_CONCURRENCY: usize = 12;
-
-// --- a dependency-free HTTP/1.1 client for the control origin -----------------
-
-/// One request over a fresh connection, read to EOF; `(head, body)`.
-///
-/// Deliberately hand-written: the control origin speaks plain HTTP/1.1 and the
-/// crate takes no HTTP client dependency for its tests.
-async fn http(
-    origin: &str,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: &str,
-) -> (String, String) {
-    let authority = strip_scheme(origin);
-    let mut stream = TcpStream::connect(authority)
-        .await
-        .unwrap_or_else(|err| panic!("connect {authority}: {err}"));
-    let mut request =
-        format!("{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
-    for (name, value) in headers {
-        request.push_str(&format!("{name}: {value}\r\n"));
-    }
-    request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .unwrap_or_else(|err| panic!("send {method} {path}: {err}"));
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .await
-        .unwrap_or_else(|err| panic!("read {method} {path}: {err}"));
-    let text = String::from_utf8_lossy(&raw).into_owned();
-    text.split_once("\r\n\r\n").map_or_else(
-        || (text.clone(), String::new()),
-        |(h, b)| (h.to_string(), b.to_string()),
-    )
-}
 
 /// `POST /reset` on the control origin: every log ring is cleared.
 async fn control_reset(control: &str) {
@@ -478,7 +442,7 @@ async fn prove(mode: &str) -> Proof {
     }
 
     // The observers, for the whole sweep.
-    let ws_log = control_json(&target.control, "/log/ws");
+    let ws_log = control_json(&target.control, "/log/ws").await;
     for entry in entries_of(&ws_log, "handshake") {
         println!(
             "handshake[{mode}]: origin={} key={} cookies={} session_valid={} status={} subprotocol={}",
@@ -524,7 +488,7 @@ async fn prove(mode: &str) -> Proof {
         );
     }
 
-    let conns = control_json(&target.control, "/log/conns");
+    let conns = control_json(&target.control, "/log/conns").await;
     for entry in conns["entries"]
         .as_array()
         .map(Vec::as_slice)
@@ -560,7 +524,7 @@ async fn prove(mode: &str) -> Proof {
         "oversize[{mode}]: {:?}/{:?} — {}",
         oversize_verdict.outcome, oversize_verdict.confidence, oversize_verdict.detail
     );
-    let pad_log = control_json(&target.control, "/log/ws");
+    let pad_log = control_json(&target.control, "/log/ws").await;
     let frames = entries_of(&pad_log, "frame");
     for entry in &frames {
         println!(

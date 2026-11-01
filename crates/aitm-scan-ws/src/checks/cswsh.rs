@@ -89,7 +89,7 @@ impl Check for Cswsh {
 
             let baseline = match host.baseline().await {
                 Ok(response) => response,
-                Err(e) => return common::connect_error(&e),
+                Err(e) => return common::connect_error(&e, Vec::new()),
             };
 
             if let Some(reason) = common::stop_reason(host) {
@@ -98,7 +98,7 @@ impl Check for Cswsh {
 
             let probe = match host.probe(&foreign_origin_payload()).await {
                 Ok(response) => response,
-                Err(e) => return common::connect_error(&e),
+                Err(e) => return common::connect_error(&e, Vec::new()),
             };
 
             if probe.status != Some(101) {
@@ -111,7 +111,7 @@ impl Check for Cswsh {
                 );
             }
 
-            let probe_first = common::first_data_frame(probe.ws_frames.as_deref().unwrap_or(&[]));
+            let probe_first = common::first_data_frame(&probe);
             let Some(probe_first) = probe_first else {
                 return verdict(
                     Outcome::Inconclusive,
@@ -121,8 +121,7 @@ impl Check for Cswsh {
                 );
             };
 
-            let baseline_first =
-                common::first_data_frame(baseline.ws_frames.as_deref().unwrap_or(&[]));
+            let baseline_first = common::first_data_frame(&baseline);
             if baseline_first.is_some_and(|frame| frame.payload == probe_first.payload) {
                 verdict(
                     Outcome::Vulnerable,

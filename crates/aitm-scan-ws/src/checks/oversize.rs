@@ -109,7 +109,7 @@ impl Check for OversizeFrame {
                 Ok(response) => response,
                 // The dialer's error text names hosts, ports and timeouts, never
                 // a header value, so it is safe to put in front of an operator.
-                Err(err) => return common::connect_error(&err),
+                Err(err) => return common::connect_error(&err, Vec::new()),
             };
 
             let evidence = Evidence {
@@ -117,7 +117,7 @@ impl Check for OversizeFrame {
                 probe_flows: response.flow.into_iter().collect(),
                 ..Evidence::default()
             };
-            let frames: &[Frame] = response.ws_frames.as_deref().unwrap_or_default();
+            let frames = common::reply_frames(&response);
             let limit_close = frames
                 .iter()
                 .filter(|frame| frame.kind == FrameKind::Close)
@@ -192,7 +192,6 @@ fn verdict(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use aitm_scan_model::{
         CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
@@ -205,7 +204,6 @@ mod tests {
 
     use super::check;
     use crate::testing::{echo_handler, point_and_host_for, ws_server, ServerConn, TestJob};
-    use crate::transport::WsTransport;
 
     /// The fixture's chosen client frame, `{"msg":"hi","user":"bob"}`.
     const CHOSEN_LEN: usize = 25;
@@ -313,7 +311,7 @@ mod tests {
     async fn vulnerable_server_processes_oversize_frame() {
         let (transport, log) = ws_server(None, echo_handler);
         let job = TestJob::new(100);
-        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
+        let (point, host) = point_and_host_for("msg", &job, transport);
 
         let verdict = check().run(&point, &host).await;
 
@@ -343,7 +341,7 @@ mod tests {
     async fn patched_server_closes_1009() {
         let (transport, _log) = ws_server(None, closes_1009_above_40);
         let job = TestJob::new(100);
-        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
+        let (point, host) = point_and_host_for("msg", &job, transport);
 
         let verdict = check().run(&point, &host).await;
 
@@ -363,7 +361,7 @@ mod tests {
     async fn dropped_connection_is_flagged() {
         let (transport, _log) = ws_server(None, drops_above_40);
         let job = TestJob::new(100);
-        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
+        let (point, host) = point_and_host_for("msg", &job, transport);
 
         let verdict = check().run(&point, &host).await;
 
@@ -385,7 +383,7 @@ mod tests {
         let job = TestJob::with(100, |profile| {
             profile.ws.reply_window_ms = 300;
         });
-        let (point, host) = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>);
+        let (point, host) = point_and_host_for("msg", &job, transport);
 
         let verdict = check().run(&point, &host).await;
 

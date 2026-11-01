@@ -121,7 +121,7 @@ impl Check for SubprotocolObserve {
                 Ok(response) => response,
                 // The dialer's error text names the authority and the failure,
                 // never a header (plan task 9-16 common shape).
-                Err(err) => return common::connect_error(&err),
+                Err(err) => return common::connect_error(&err, Vec::new()),
             };
 
             let evidence = Evidence {
@@ -211,7 +211,6 @@ mod tests {
     use crate::testing::{
         echo_handler, point_and_host_for, ws_server, HandshakeDecision, ServerLog, TestJob,
     };
-    use crate::transport::WsTransport;
 
     /// The subprotocol the check asks for, over a [`TestJob`]'s fixed marker.
     const REQUESTED: &str = "aitm-mk7f3a9e";
@@ -224,7 +223,7 @@ mod tests {
         job: &Arc<TestJob>,
     ) -> (Verdict, Arc<ServerLog>) {
         let (transport, log) = ws_server(decide, echo_handler);
-        let (point, host) = point_and_host_for(name, job, transport as Arc<dyn WsTransport>);
+        let (point, host) = point_and_host_for(name, job, transport);
         let verdict = check().run(&point, &host).await;
         (verdict, log)
     }

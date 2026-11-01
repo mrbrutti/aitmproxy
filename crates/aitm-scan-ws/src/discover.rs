@@ -657,13 +657,6 @@ mod tests {
         }
     }
 
-    /// The canonical captured handshake, from the shared harness fixture:
-    /// `GET /ws` on `127.0.0.1:8080` carrying an `Origin`, a session `Cookie`
-    /// and a subprotocol.
-    fn handshake_flow() -> HttpFlow {
-        captured_conversation().0
-    }
-
     fn message(dir: WsDir, opcode: WsOpcode, data: Vec<u8>) -> WsMessage {
         WsMessage {
             dir,
@@ -698,14 +691,9 @@ mod tests {
         }
     }
 
-    /// The canonical conversation: two client text frames and one server reply.
-    fn fixture() -> (HttpFlow, WsFlow) {
-        captured_conversation()
-    }
-
     /// `discover_flow` over one client text frame, for the single-frame cases.
     fn discover_one(frame: WsMessage) -> Discovered {
-        let handshake = handshake_flow();
+        let handshake = captured_conversation().0;
         let ws = ws_flow(&handshake, vec![frame]);
         discover_flow(&ws, &handshake, &mut IdGen::new("job-1"))
     }
@@ -736,7 +724,7 @@ mod tests {
 
     #[test]
     fn fixture_yields_expected_points() {
-        let (handshake, ws) = fixture();
+        let (handshake, ws) = captured_conversation();
         let found = discover_flow(&ws, &handshake, &mut IdGen::new("job-1"));
 
         assert_eq!(
@@ -809,7 +797,7 @@ mod tests {
     fn point_url_and_node_path_drop_the_query() {
         // A captured upgrade whose query carries a credential: neither the
         // point's `url` nor the node's `path_template` may repeat it (S7).
-        let mut handshake = handshake_flow();
+        let mut handshake = captured_conversation().0;
         handshake.request.path = "/ws?token=s3cr3t-query&room=1".to_string();
         let ws = ws_flow(&handshake, vec![client_text(r#"{"msg":"hi"}"#)]);
         let found = discover_flow(&ws, &handshake, &mut IdGen::new("job-1"));
@@ -929,7 +917,7 @@ mod tests {
 
     #[test]
     fn repeats_count_frequency_and_keep_first_frame() {
-        let handshake = handshake_flow();
+        let handshake = captured_conversation().0;
         let ws = ws_flow(
             &handshake,
             vec![client_text(r#"{"msg":"a"}"#), client_text(r#"{"msg":"b"}"#)],
@@ -950,7 +938,7 @@ mod tests {
 
     #[test]
     fn origin_matching_normalises_ports_and_schemes() {
-        let handshake = handshake_flow();
+        let handshake = captured_conversation().0;
         assert!(origin_matches(
             &handshake,
             &["http://127.0.0.1:8080".to_string()]
@@ -960,7 +948,7 @@ mod tests {
             &["http://127.0.0.1:8081".to_string()]
         ));
 
-        let mut secure = handshake_flow();
+        let mut secure = captured_conversation().0;
         secure.request.scheme = "wss".into();
         secure.request.authority = "app.test".into();
         assert!(origin_matches(
@@ -973,7 +961,7 @@ mod tests {
 
     #[test]
     fn ids_are_stable_and_shaped() {
-        let (handshake, ws) = fixture();
+        let (handshake, ws) = captured_conversation();
         let first = discover_flow(&ws, &handshake, &mut IdGen::new("job-1"));
         let second = discover_flow(&ws, &handshake, &mut IdGen::new("job-1"));
 

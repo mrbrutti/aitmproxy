@@ -117,11 +117,7 @@ async fn probe_each_template(host: &dyn ProbeHost) -> Verdict {
             Ok(response) => response,
             // The dialer's error text names the host and the failure, never a
             // header: a connect failure is "could not tell", not "clean".
-            Err(error) => {
-                let mut verdict = common::connect_error(&error);
-                verdict.evidence.probe_flows = probe_flows;
-                return verdict;
-            }
+            Err(error) => return common::connect_error(&error, probe_flows),
         };
         probe_flows.extend(response.flow);
         if ssti_hit(&String::from_utf8_lossy(&response.body), payload, expected) {

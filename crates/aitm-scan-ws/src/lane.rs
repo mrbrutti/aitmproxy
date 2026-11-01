@@ -385,14 +385,14 @@ mod tests {
         );
         stranger.id = "ws-deadbeef".to_string();
 
-        // `Box<dyn ProbeHost>` is not `Debug`, so the `Ok` arm is spelled out
-        // rather than taken through `expect_err`.
-        let err = match lane.probe_host_for(&stranger, job) {
-            Ok(_) => panic!("an id this lane never issued must not host a probe"),
-            Err(err) => err,
-        };
+        let err = host_err(
+            &lane,
+            &stranger,
+            job,
+            "an id this lane never issued must not host a probe",
+        );
         assert!(
-            err.to_string().contains("unknown ws point"),
+            err.contains("unknown ws point"),
             "unexpected error text: {err}"
         );
     }
@@ -551,7 +551,18 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn no_verdict_or_point_of_any_check_carries_the_captured_cookie() {
-        use crate::testing::{echo_handler, ws_server};
+        // Swept twice. The second conversation's cookie carries a non-ASCII
+        // byte: `http` accepts it as obs-text, and tungstenite's serialiser
+        // used to quote the whole value back in its error, which reached every
+        // check's `detail` through `connect error: {e}` (security finding S9).
+        sweep_the_catalogue_for(crate::testing::FIXTURE_COOKIE).await;
+        sweep_the_catalogue_for("sid=s3cr3t-caf\u{e9}").await;
+    }
+
+    /// Run every check over every point discovered from a conversation whose
+    /// `Cookie` is `cookie`, and grep each point and verdict `Debug`.
+    async fn sweep_the_catalogue_for(cookie: &str) {
+        use crate::testing::{captured_conversation_with_cookie, echo_handler, ws_server};
 
         let (transport, _log) = ws_server(None, echo_handler);
         // A short reply window: this test greps text, it does not time anything.
@@ -559,7 +570,7 @@ mod tests {
             profile.ws.reply_window_ms = 40;
         });
         let store = job.store();
-        let (handshake, ws) = captured_conversation();
+        let (handshake, ws) = captured_conversation_with_cookie(cookie);
         store.insert(Flow::Http(handshake));
         store.insert(Flow::WebSocket(ws));
         let lane = WsLane::new(Arc::new(WsDialer::new(transport)));
@@ -574,7 +585,7 @@ mod tests {
         for found_point in &found.points {
             let shown = format!("{found_point:?}");
             assert!(
-                !shown.contains("s3cr3t-cookie"),
+                !shown.contains("s3cr3t"),
                 "a discovered point leaked the cookie: {shown}"
             );
             for check in lane.checks() {
@@ -584,7 +595,7 @@ mod tests {
                 let verdict = check.run(found_point, host.as_ref()).await;
                 let shown = format!("{verdict:?}");
                 assert!(
-                    !shown.contains("s3cr3t-cookie"),
+                    !shown.contains("s3cr3t"),
                     "{} @ {} leaked the cookie: {shown}",
                     check.meta().id,
                     found_point.name

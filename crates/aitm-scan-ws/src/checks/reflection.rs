@@ -95,9 +95,13 @@ fn meta() -> &'static CheckMeta {
 
 /// [`common::inconclusive`] carrying only what the check tried to send.
 fn inconclusive(detail: impl Into<String>, payload: Option<String>) -> Verdict {
-    let mut verdict = common::inconclusive(detail, Vec::new());
-    verdict.evidence.payload = payload;
-    verdict
+    Verdict {
+        evidence: Evidence {
+            payload,
+            ..Evidence::default()
+        },
+        ..common::inconclusive(detail, Vec::new())
+    }
 }
 
 impl Check for InputReflection {
@@ -131,9 +135,13 @@ impl Check for InputReflection {
                 Err(error) => {
                     // The dialer's error text names the transport failure, never
                     // a header of the request that failed to go out.
-                    let mut verdict = common::connect_error(&error);
-                    verdict.evidence.payload = Some(canary);
-                    return verdict;
+                    return Verdict {
+                        evidence: Evidence {
+                            payload: Some(canary),
+                            ..Evidence::default()
+                        },
+                        ..common::connect_error(&error, Vec::new())
+                    };
                 }
             };
 
@@ -186,7 +194,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{check, ID};
-    use crate::testing::{point_and_host_for, ws_server, ServerConn, TestJob};
+    use crate::testing::{host_for, ws_server, ServerConn, TestJob};
     use crate::transport::WsTransport;
 
     /// The marker `TestJob` hands out, and the canary the check builds from it.
@@ -316,7 +324,7 @@ mod tests {
     async fn unencoded_reflection_is_certain() {
         let (transport, log) = ws_server(None, vulnerable_target);
         let job = TestJob::new(100);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -346,7 +354,7 @@ mod tests {
     async fn encoded_reflection_is_clean() {
         let (transport, _log) = ws_server(None, patched_target);
         let job = TestJob::new(100);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -371,7 +379,7 @@ mod tests {
     async fn no_reflection_is_clean() {
         let (transport, log) = ws_server(None, silent_target);
         let job = TestJob::new(100);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -392,7 +400,7 @@ mod tests {
     async fn budget_zero_is_inconclusive() {
         let (transport, log) = ws_server(None, vulnerable_target);
         let job = TestJob::new(0);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -409,7 +417,7 @@ mod tests {
     async fn cancelled_is_inconclusive() {
         let (transport, log) = ws_server(None, vulnerable_target);
         let job = TestJob::new(100);
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
         job.cancel();
 
@@ -426,12 +434,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_error_is_inconclusive() {
         let job = TestJob::new(100);
-        let host = point_and_host_for(
-            "msg",
-            &job,
-            Arc::new(RefusingTransport) as Arc<dyn WsTransport>,
-        )
-        .1;
+        let host = host_for("msg", &job, Arc::new(RefusingTransport));
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;
@@ -453,7 +456,7 @@ mod tests {
         let job = TestJob::with(100, |profile| {
             profile.http.record_probes = RecordProbes::All;
         });
-        let host = point_and_host_for("msg", &job, transport as Arc<dyn WsTransport>).1;
+        let host = host_for("msg", &job, transport);
         let point = host.point().clone();
 
         let verdict = check().run(&point, &host as &dyn ProbeHost).await;

@@ -104,7 +104,7 @@ async fn run(host: &dyn ProbeHost) -> Verdict {
 
     let baseline = match host.baseline().await {
         Ok(response) => response,
-        Err(error) => return common::connect_error(&error),
+        Err(error) => return common::connect_error(&error, Vec::new()),
     };
     if sql_error_signature(&body_text(&baseline)).is_some() {
         return clean("baseline already carries a SQL error signature", &baseline);
@@ -121,7 +121,7 @@ async fn run(host: &dyn ProbeHost) -> Verdict {
         };
         let response = match host.probe(&probe).await {
             Ok(response) => response,
-            Err(error) => return common::connect_error(&error),
+            Err(error) => return common::connect_error(&error, Vec::new()),
         };
         if let Some(signature) = sql_error_signature(&body_text(&response)) {
             return Verdict {

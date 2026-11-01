@@ -1408,7 +1408,7 @@ mod tests {
         let (transport, _log) = ws_server(None, echo_handler);
         let job = TestJob::new(100);
         job.expire();
-        let host = host_for("msg", &job, Arc::clone(&transport));
+        let host = host_for("msg", &job, transport.clone());
 
         let err = host
             .probe(&text("X", PayloadMode::Replace))

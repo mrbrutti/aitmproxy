@@ -13,7 +13,11 @@
 //!
 //! Nothing here logs a header value or a frame payload: `tracing` lines carry
 //! an authority, a frame kind and a byte length, and [`DialError`] carries the
-//! transport's own text, never a header, a path or a query.
+//! transport's own text, never a header value, a path or a query. A
+//! third-party text is only ever passed through when it is known not to quote
+//! what it was given: tungstenite's serialiser names the offending header
+//! *and its value*, so that one is replaced here rather than forwarded
+//! (security finding S9).
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -34,12 +38,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout_at;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::handshake::client::generate_request;
 use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
-use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
+use tokio_tungstenite::tungstenite::{Error as TungsteniteError, Message, Utf8Bytes};
 use tokio_tungstenite::WebSocketStream;
 
 use crate::transport::WsTransport;
@@ -99,9 +104,17 @@ fn header_name(name: &str) -> anyhow::Result<HeaderName> {
 }
 
 /// `value` as an HTTP header value; the error names the header, never the value.
+///
+/// Visible ASCII only. `HeaderValue::from_str` also accepts obs-text (bytes
+/// 0x80-0xFF), which every serialiser downstream then refuses — tungstenite's
+/// by quoting the whole value back in its error text (security finding S9). A
+/// value this crate cannot put on the wire is refused here, where the refusal
+/// names the header alone.
 fn header_value(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
     HeaderValue::from_str(value)
-        .map_err(|_| anyhow!("the value of header {name} cannot be sent on the wire"))
+        .ok()
+        .filter(|value| value.to_str().is_ok())
+        .ok_or_else(|| anyhow!("the value of header {name} cannot be sent on the wire"))
 }
 
 /// The `host:port` the scope guard is asked about for `request`.
@@ -112,7 +125,7 @@ fn header_value(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
 /// with no host yields a bare `:port`, which the guard refuses like any other
 /// out-of-scope authority; no path, query or header value ever reaches it.
 #[must_use]
-pub fn request_authority(request: &Request<()>) -> String {
+pub(crate) fn request_authority(request: &Request<()>) -> String {
     let uri = request.uri();
     let scheme = uri.scheme_str().unwrap_or("ws");
     let host = uri.host().unwrap_or_default();
@@ -434,8 +447,7 @@ impl WsDialer {
         // unrequested one, or echoes a different one — all three are server
         // behaviours this scanner has to *observe* (`ws-subprotocol-observe`),
         // and the replay keeps the captured `Sec-WebSocket-Protocol` (D8.3).
-        let (head, key) =
-            generate_request(request).map_err(|err| DialError::Handshake(err.to_string()))?;
+        let (head, key) = generate_request(request).map_err(unserialisable_request)?;
         let (stream, buffered, head_end) =
             match timeout_at(until, exchange_head(stream, head)).await {
                 Ok(Ok(exchanged)) => exchanged,
@@ -568,6 +580,33 @@ impl WsDialer {
     }
 }
 
+/// The close frame an RFC 6455 close payload (code, then reason) describes.
+///
+/// The model payload is the same layout `close_payload` records; shorter than
+/// a code is a plain normal close.
+fn close_frame(payload: &[u8]) -> CloseFrame {
+    match payload.get(..2) {
+        Some(&[high, low]) => CloseFrame {
+            code: CloseCode::from(u16::from_be_bytes([high, low])),
+            reason: String::from_utf8_lossy(payload.get(2..).unwrap_or_default())
+                .into_owned()
+                .into(),
+        },
+        _ => CloseFrame {
+            code: CloseCode::Normal,
+            reason: String::new().into(),
+        },
+    }
+}
+
+/// `payload` as the message `build` makes of it, plus the one copy the record
+/// keeps; the message and the copy share nothing but the original bytes.
+fn shared_payload(payload: Vec<u8>, build: fn(Bytes) -> Message) -> (Message, Vec<u8>) {
+    let bytes = Bytes::from(payload);
+    let recorded = bytes.to_vec();
+    (build(bytes), recorded)
+}
+
 /// Write the upgrade request and read the response head off `stream`.
 ///
 /// Returns the stream, everything read so far (the head and whatever the server
@@ -633,6 +672,23 @@ fn header_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str>
         .iter()
         .find(|(header, _)| header == name)
         .map(|(_, value)| value.as_str())
+}
+
+/// The refusal for an upgrade request tungstenite would not serialise.
+///
+/// tungstenite's own text is **never** passed through (security finding S9):
+/// its `Utf8` variant reads `… failed to convert header to a str for header
+/// name 'cookie' with value: "sid=…"`, which would carry a captured cookie into
+/// every check's `detail` and into a script's `BadArgs`. A
+/// [`ProtocolError::InvalidHeader`] names a header and nothing else, so that
+/// one name is repeated; everything else is reported without detail.
+fn unserialisable_request(err: TungsteniteError) -> DialError {
+    match err {
+        TungsteniteError::Protocol(ProtocolError::InvalidHeader(name)) => DialError::Request(
+            format!("the upgrade request could not be serialised for header {name}"),
+        ),
+        _ => DialError::Request("the upgrade request could not be serialised".to_string()),
+    }
 }
 
 /// Pass `authority` through the guard, waiting out one rate limit if it fits.
@@ -780,8 +836,12 @@ impl WsConn {
 
     /// Frames this connection saw but did not record because the replay flow
     /// had reached the dial's collection ceilings (security finding S5).
+    ///
+    /// Read only by the tests that assert the ceilings held: the counter is
+    /// maintained on every dial, but nothing in a shipped path asks for it.
+    #[cfg(test)]
     #[must_use]
-    pub fn unrecorded(&self) -> usize {
+    pub(crate) fn unrecorded(&self) -> usize {
         self.unrecorded
     }
 
@@ -793,7 +853,7 @@ impl WsConn {
     /// The byte counter is reset with the record so recording continues from a
     /// clean budget. The replay-flow path ([`WsConn::into_flows`]) never calls
     /// this and so keeps the full conversation.
-    pub fn take_recorded(&mut self) -> Vec<Frame> {
+    pub(crate) fn take_recorded(&mut self) -> Vec<Frame> {
         self.recorded_bytes = 0;
         std::mem::take(&mut self.recorded)
             .into_iter()
@@ -830,44 +890,24 @@ impl WsConn {
             bail!("a {len}-byte frame exceeds this dial's {max}-byte frame limit");
         }
         let kind = frame.kind;
-        let message = match kind {
-            FrameKind::Close => {
-                // The model payload is the RFC 6455 layout (code, then reason),
-                // the same bytes `close_payload` records; shorter than a code is
-                // a plain normal close.
-                let close = match frame.payload.get(..2) {
-                    Some(&[high, low]) => CloseFrame {
-                        code: CloseCode::from(u16::from_be_bytes([high, low])),
-                        reason: String::from_utf8_lossy(frame.payload.get(2..).unwrap_or_default())
-                            .into_owned()
-                            .into(),
-                    },
-                    _ => CloseFrame {
-                        code: CloseCode::Normal,
-                        reason: String::new().into(),
-                    },
-                };
-                tracing::debug!(kind = ?kind, bytes = len, "ws send");
-                self.stream
-                    .send(Message::Close(Some(close)))
-                    .await
-                    .context("sending a websocket frame")?;
-                self.record(WsDir::ClientToServer, frame);
-                return Ok(());
-            }
-            FrameKind::Text => Message::Text(
-                Utf8Bytes::try_from(Bytes::from(frame.payload))
-                    .context("a text frame payload must be valid UTF-8")?,
+        // One match and one tail (quality finding N9): every kind yields the
+        // message that goes out *and* the bytes that are recorded, so no kind
+        // can take a send path of its own and no arm exists for a message this
+        // function never builds.
+        let (message, payload) = match kind {
+            FrameKind::Close => (
+                Message::Close(Some(close_frame(&frame.payload))),
+                frame.payload,
             ),
-            FrameKind::Binary => Message::Binary(Bytes::from(frame.payload)),
-            FrameKind::Ping => Message::Ping(Bytes::from(frame.payload)),
-            FrameKind::Pong => Message::Pong(Bytes::from(frame.payload)),
-        };
-        // One copy, for the record; `Bytes` shares the buffer with the message.
-        let payload: Vec<u8> = match &message {
-            Message::Text(text) => text.as_bytes().to_vec(),
-            Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.to_vec(),
-            Message::Close(_) | Message::Frame(_) => Vec::new(),
+            FrameKind::Text => {
+                let text = Utf8Bytes::try_from(Bytes::from(frame.payload))
+                    .context("a text frame payload must be valid UTF-8")?;
+                let payload = text.as_bytes().to_vec();
+                (Message::Text(text), payload)
+            }
+            FrameKind::Binary => shared_payload(frame.payload, Message::Binary),
+            FrameKind::Ping => shared_payload(frame.payload, Message::Ping),
+            FrameKind::Pong => shared_payload(frame.payload, Message::Pong),
         };
         tracing::debug!(kind = ?kind, bytes = len, "ws send");
         self.stream
@@ -1170,6 +1210,7 @@ mod tests {
     use futures::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::handshake::server::{
         create_response, ErrorResponse, Request,
     };
@@ -1179,7 +1220,10 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{build_request, CollectEnd, DialError, DialLimits, DialOutcome, WsConn, WsDialer};
-    use crate::testing::{captured_conversation, echo_handler, ws_server, HandshakeDecision};
+    use crate::testing::{
+        captured_conversation, captured_conversation_with_cookie, echo_handler, ws_server,
+        HandshakeDecision,
+    };
     use crate::types::HandshakeOverrides;
 
     /// A guard with the fixture authority in scope.
@@ -1345,6 +1389,83 @@ mod tests {
         assert_eq!(hdr(sent, "origin"), Some("https://attacker.invalid"));
         assert_eq!(hdr(sent, "cookie"), None);
         assert_eq!(hdr(sent, "sec-websocket-protocol"), Some("chat"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_ascii_header_value_is_refused_without_quoting_it() {
+        // `HeaderValue::from_str` accepts obs-text, so a captured cookie with a
+        // non-ASCII byte used to pass this layer and die in tungstenite's
+        // serialiser, whose error quotes the whole value (security finding S9).
+        // The refusal names the header and nothing of the value.
+        let (transport, log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(Arc::clone(&transport) as Arc<_>);
+        let (handshake, _) = captured_conversation_with_cookie("sid=s3cr3t-caf\u{e9}");
+        let guard = guard_in_scope();
+
+        let err = dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                soon(),
+                DialLimits::default(),
+            )
+            .await
+            .expect_err("a header value that cannot go on the wire is not dialled");
+
+        let text = err.to_string();
+        assert!(
+            matches!(err, DialError::Request(_)),
+            "expected a request error, got: {err:?}"
+        );
+        assert!(
+            text.to_lowercase()
+                .contains("the value of header cookie cannot be sent on the wire"),
+            "unexpected refusal: {text}"
+        );
+        assert!(
+            !text.contains("s3cr3t") && !text.contains("caf"),
+            "the refusal quoted the header value: {text}"
+        );
+        assert!(
+            transport.connects().is_empty() && log.handshakes().is_empty(),
+            "nothing may reach the wire for a request that cannot be built"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_tungstenite_will_not_serialise_is_refused_without_quoting_it() {
+        // The second layer of finding S9: a request built elsewhere (the `ws.*`
+        // language builds its own) can still carry an obs-text value, and
+        // tungstenite's `generate_request` error is
+        // `... for header name 'cookie' with value: "sid=s3cr3t-caf\xc3\xa9"`.
+        // That text is never passed through.
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(Arc::clone(&transport) as Arc<_>);
+        let guard = guard_in_scope();
+        let mut request = "ws://127.0.0.1:8080/ws"
+            .into_client_request()
+            .expect("a client request for the fixture authority");
+        request.headers_mut().insert(
+            "cookie",
+            HeaderValue::from_bytes("sid=s3cr3t-caf\u{e9}".as_bytes())
+                .expect("obs-text is a valid header value"),
+        );
+
+        let err = dialer
+            .dial_request(request, &*guard, soon(), DialLimits::default())
+            .await
+            .expect_err("a request that cannot be serialised is not dialled");
+
+        let text = err.to_string();
+        assert!(
+            matches!(err, DialError::Request(_)),
+            "expected a request error, got: {err:?}"
+        );
+        assert!(
+            !text.contains("s3cr3t") && !text.contains("caf"),
+            "the refusal quoted the header value: {text}"
+        );
     }
 
     #[test]

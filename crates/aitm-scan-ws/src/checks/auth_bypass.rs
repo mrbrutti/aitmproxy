@@ -121,14 +121,16 @@ impl Check for WsAuthBypassHandshake {
 
             let baseline = match host.baseline().await {
                 Ok(response) => response,
-                Err(error) => return common::connect_error(&error),
+                Err(error) => return common::connect_error(&error, Vec::new()),
             };
             if let Some(stop) = common::stop_reason(host) {
                 return common::inconclusive(stop, Vec::new());
             }
             let probe = match host.probe_raw(stripped_credentials()).await {
                 Ok(response) => response,
-                Err(error) => return common::connect_error(&error),
+                Err(error) => {
+                    return common::connect_error(&error, baseline.flow.into_iter().collect())
+                }
             };
 
             let evidence = Evidence {
@@ -141,8 +143,8 @@ impl Check for WsAuthBypassHandshake {
 
             match probe.status {
                 Some(101) => match (
-                    common::first_data_frame(probe.ws_frames.as_deref().unwrap_or(&[])),
-                    common::first_data_frame(baseline.ws_frames.as_deref().unwrap_or(&[])),
+                    common::first_data_frame(&probe),
+                    common::first_data_frame(&baseline),
                 ) {
                     (Some(reply), Some(authenticated)) if same_reply(reply, authenticated) => {
                         Verdict {
