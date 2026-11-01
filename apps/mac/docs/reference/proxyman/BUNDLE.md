@@ -2,8 +2,11 @@
 
 Reference for aitmproxy's macOS app. Every fact below was produced by the
 command quoted next to it, run against `/Applications/Proxyman.app`
-(Proxyman 26.3.0, build 260300) on 2026-10-31. Nothing was patched, launched
-or licensed; the app was not running during the inspection.
+(Proxyman 26.3.0, build 260300) on 2026-10-31, unless it carries a tag:
+**[docs]** (proxyman.com), **[Matt]** (observed on his Mac), or **Reading:**
+(an inference from symbols, stated as such). Nothing was patched, launched or
+licensed; the app was not running during the inspection, and this session
+never launched it.
 
 Companion documents: [FLOWS.md](FLOWS.md) (operator flows and prompts),
 [SCREENS.md](SCREENS.md) (screen index, when captured), [DELTA.md](DELTA.md)
@@ -161,11 +164,15 @@ nm -u -arch arm64 $H | grep -E 'proc_|sysctl'
 Selectors `setConnectionPID:`, `startTimer`, `stopTimer`, `timerOnTick`,
 `scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:`, and imports
 `proc_listpids`, `proc_pidpath`, `sysctl`, `runningApplicationWithProcessIdentifier:`.
-Together with `originalNetworkSetting` this is the whole mechanism: the helper
-remembers the caller's PID and the pre-override proxy dictionary, polls on a
-timer, and when the PID is gone it applies the original setting itself. That
-is the install sheet's "Graceful Revert the Proxy if the app is crashed
-unexpectedly" and "Persist and Restore to your previous Proxy setting".
+Reading (inference, the control flow itself was not traced): together with
+`originalNetworkSetting` these fit one mechanism, the helper remembering the
+caller's PID and the pre-override proxy dictionary, polling on a timer, and
+applying the original setting when the PID is gone. The docs confirm the
+behaviour, not the code: helper 1.2.0 "reverts the HTTP proxy configuration
+if Proxyman crashes", 1.3.0 "remembers your previous proxy settings and
+restores them when you quit" [docs]. That is the install sheet's "Graceful
+Revert the Proxy if the app is crashed unexpectedly" and "Persist and Restore
+to your previous Proxy setting".
 
 ### 3.5 Fallback without the helper
 
@@ -175,12 +182,13 @@ strings -a Contents/Frameworks/ProxymanCore.framework/ProxymanCore | grep networ
 
 `networksetup -setwebproxy "`, `networksetup -setsecurewebproxy "`,
 `networksetup -setwebproxystate "`, `networksetup -setsecurewebproxystate "`.
-UI copy: `Your HTTP/HTTPS Proxy is currently overridden by `networksetup` CLI.
-It works, but slow!`, `Proxy Helper tool is better performance than using
-networksetup CLI`, and the status-bar badge text `Overridden by %@`
-(`networksetup` CLI or Proxy Helper Tool). The docs add that for a non-admin
-or guest user `networksetup` fails outright, which is the second reason for
-the helper.
+UI copy: ``Your HTTP/HTTPS Proxy is currently overridden by `networksetup` CLI. It works, but slow!``,
+`Proxy Helper tool is better performance than using networksetup CLI`, and
+the status-bar badge text `Overridden by %@` (`networksetup` CLI or Proxy
+Helper Tool). For a non-admin or guest user `networksetup` fails outright,
+which is the second reason for the helper [docs]. No `SCNetworkSet*` symbol
+is imported by the helper or ProxymanCore (`nm -u` on both, zero hits): the
+helper writes `/NetworkServices/<id>/Proxies` directly.
 
 What this means for aitmproxy:
 
@@ -191,8 +199,9 @@ What this means for aitmproxy:
   dialog; later launches never prompt because the daemon is already root.
 - Crash safety lives in the daemon (PID watch + stored original), not in the
   app. Our `aitm-sysproxy` must do the same or a crashed app leaves the Mac
-  pointing at a dead port (which is what happened tonight with Proxyman
-  itself when it quit while another copy still "owned" the override).
+  pointing at a dead port (which is what happened on Matt's Mac tonight,
+  before this session, when his Proxyman quit while another copy still
+  "owned" the override [Matt]).
 - Expect two macOS surfaces: the Authorization dialog at install, and on
   macOS 13+ a Login Items toggle the app must detect and explain
   (`statusForLegacyPlist`). SMAppService.daemon would replace SMJobBless for a
@@ -294,14 +303,18 @@ ProxymanCore imports `proc_listpids`, `proc_pidinfo`, `proc_pidfdinfo`,
 `proc_name`, `proc_pidpath`, `sysctl`, `sysctlbyname`, and
 `NSRunningApplication`; symbols `macProcessNameForPID:`,
 `fullKernelProcessNameForPID:`, `clientName`, and the Swift initializer
-`ProxymanCore.Client.init(name:bundlePath:icon:)`. That is the libproc
-recipe: for a loopback connection whose peer port is known, walk
-`proc_listpids`, ask `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)` for each socket
-until one matches the client's local port, then `proc_pidpath` → bundle →
-`NSRunningApplication(processIdentifier:)` for `localizedName` and `icon`
-(`iconForFile:` as the fallback for bare executables such as `dataaccessd`).
-No privilege is needed for the user's own processes; system daemons resolve
-by name only.
+`ProxymanCore.Client.init(name:bundlePath:icon:)`.
+
+Reading (inference): those symbols fit the standard libproc recipe, and
+nothing else in the binary explains the icons: for a loopback connection
+whose peer port is known, walk `proc_listpids`, ask `proc_pidfdinfo` for each
+process's sockets until one matches the client's local port, then
+`proc_pidpath` → bundle → `NSRunningApplication(processIdentifier:)` for
+`localizedName` and `icon`, with `iconForFile:` (imported) as a fallback for
+bare executables such as `dataaccessd`. The matching loop, its flavor
+constant and the race with short-lived connections were not traced; our own
+design must handle them. No privilege is needed for the user's own
+processes; system daemons resolve by name only.
 
 What this means for aitmproxy: the `Client —` column in every proxied flow
 of our app (see DELTA.md) is not waiting on the extension. The core (or the
@@ -314,9 +327,9 @@ never touch the proxy.
 `codesign -d --entitlements :- <path>` prints `binary contains an invalid
 entitlements blob` for every Proxyman binary on this macOS (both inside the
 sandbox and from the Terminal). The XML blob is still present in the code
-signature; it was read with a 40-line Python parser of the `LC_CODE_SIGNATURE`
-superblob (slot magic `0xfade7171`), and `codesign -d --entitlements - --xml`
-from the Terminal agrees:
+signature; it was read by parsing the `LC_CODE_SIGNATURE` superblob (slot
+magic `0xfade7171`; a throwaway script, not committed), and
+`codesign -d --entitlements - --xml` from the Terminal agrees:
 
 ```
 codesign -d --entitlements - --xml <path> | plutil -p -
@@ -429,10 +442,13 @@ otool -L $M; strings -a $M | grep -E '^[a-z]+(_[a-z0-9]+)+$' | sort -u
   `StatefulHTTPServerTransport` / `StatelessHTTPServerTransport` /
   `HTTPClientTransport` in the same Swift MCP package). Clients register it
   as `claude mcp add proxyman --transport stdio -- "/Applications/Proxyman.app/Contents/MacOS/mcp-server"`.
-  It forwards to the running app over a loopback HTTP bridge authenticated by
-  a per-session token in `~/Library/Application Support/com.proxyman.NSProxy/mcp-handshake.json`
-  (0600); strings `Failed to write handshake file`, `Invalid handshake file.
-  Please restart Proxyman.`, `Proxyman is not running, MCP is stopped, or MCP
+  It forwards to the running app over a loopback HTTP bridge. The docs say
+  the bridge binds 127.0.0.1 only and uses a per-session cryptographic token
+  stored in `~/Library/Application Support/com.proxyman.NSProxy/mcp-handshake.json`
+  with 0600 permissions [docs]; the binaries only show the file's existence
+  (`[MCPHTTPServer] Handshake file written to:`, `Failed to write handshake
+  file`, `Invalid handshake file. Please restart Proxyman.`) and the file was
+  not present on this Mac to inspect. Other strings: `Proxyman is not running, MCP is stopped, or MCP
   has been disabled by your organization. Open Proxyman Settings > MCP to
   check its status.`
 - Settings ▸ MCP has `Enable MCP Server` and `Redact Sensitive Data Before
@@ -493,6 +509,10 @@ traffic" the way Proxyman's `troubleshoot_missing_traffic` does.
 
 ## 8. CLI
 
+```
+strings -a Contents/MacOS/mcp-server | grep -E 'export-log|enabledRules|Command in PATH|mcp <on'
+```
+
 `proxyman-cli` (Swift, `3X57WP8E8V.com.proxyman.NSProxy.CLI`). From the MCP
 help strings: `mcp <on|off>` (works with the app closed), `breakpoint
 <on|off|open>`, `rules <tool> <action>` with folders, `export --mode
@@ -523,6 +543,11 @@ plutil -convert json -o - Contents/Resources/en.lproj/Preferences.strings
   `proxyman.io`, `in.appcenter.ms`, `*.sentry.io`, `proxy.man`,
   `cert.proxyman.io`, `httpbin.proxyman.app` and `*` :443 "because Proxyman
   acts as Man-In-the-Middle Proxy".
+
+What this means for aitmproxy: the menu-bar extra is an Appearance option,
+off by default, not the app's home; the resource figures in the status bar
+are opt-in too. Telemetry and crash reporting are opt-in toggles with their
+hosts declared; our BRIEF drops them entirely, which is simpler.
 
 ## 10. Linked libraries
 

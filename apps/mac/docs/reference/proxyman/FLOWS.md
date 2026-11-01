@@ -8,8 +8,11 @@ taken from one of four sources, marked per line:
   `Localizable.strings`, `Certificates.strings`, …) and `strings -a` on the
   binaries;
 - **[video]** the 25 s demo `capture-http-https-demo-2026.mp4`
-  (3524×2028, 60 fps), 12 frames at 0.5 fps in `/tmp/claude/proxyman/frames/`
-  (a sibling session fetched it; the sandbox cannot reach assets.proxyman.com);
+  (3524×2028, 60 fps), read as 12 frames at 0.5 fps (a sibling session fetched
+  it; the sandbox cannot reach assets.proxyman.com); the three frames that
+  carry distinct screens are committed as `shots/demo-video/f001-main-window.png`,
+  `f008-custom-previewer.png`, `f011-json-path.png`, the other nine show the
+  same window with another tab selected;
 - **[docs]** proxyman.com pages `/docs/basic-features/proxy-setting-tool`,
   `/docs/basic-features/ssl-proxying`, `/docs/advanced-features/network-extension`,
   `/docs/advanced-features/mcp`, `/docs/debug-devices/macos`, `/network-extension`
@@ -41,11 +44,15 @@ quitting reverts the proxy; a crash is reverted by the helper.
    [strings]; the address is the LAN IP of the primary interface
    (ProxymanCore watches `kSCDynamicStorePropNetPrimaryInterface`, see
    BUNDLE §10; `defaults` keeps `lastKnownIPAddressCurrentNetwork`).
-2. **Auto override.** Settings ▸ General ▸ `Auto Override System Proxy
-   Settings at Launch` [strings, Matt] with the help text `Override your
-   System Proxy Settings in Wi-Fi -> Details… -> Proxies tab.` [strings].
-   It is on by default; without the helper the override goes through
-   `networksetup` and the sheet below warns about it.
+2. **Auto override.** Settings ▸ General [Matt, strings]: `Port Number:`
+   `9090` (`1-65535`, `This port is occupied! Please select available
+   port.`), `Auto Override System Proxy Settings at Launch` with the help
+   text `Override your System Proxy Settings in Wi-Fi -> Details… -> Proxies
+   tab.`, `Auto Start Recording Traffic at Launch` (`Record HTTP/HTTPS
+   Traffic and display on the main table view.`), `Use HTTP/2`, `Advanced
+   Proxy Setting…`, then the CA block (§4). Auto override is on by default;
+   without the helper the override goes through `networksetup` and the sheet
+   below warns about it.
 3. **The helper sheet** (first launch, and again when the helper is
    outdated: `New version of Proxy Helper Tool (%@)` [strings]):
    - Title `Install Proxy Helper Tool`, subtitle `Version 1.7.0` [Matt]
@@ -55,8 +62,8 @@ quitting reverts the proxy; a crash is reverted by the helper.
      · `Graceful Revert the Proxy if the app is crashed unexpectedly`
      · `Persist and Restore to your previous Proxy setting`
      · `Comply with new macOS 13 Ventura Requirements for Helper Tool`.
-   - Warning line: `Your HTTP/HTTPS Proxy is currently overridden by
-     `networksetup` CLI. It works, but slow!` [strings, Matt].
+   - Warning line: ``Your HTTP/HTTPS Proxy is currently overridden by `networksetup` CLI. It works, but slow!``
+     [strings, Matt].
    - Button `Install Helper Tool (Required Root Privileges)` [Matt]
      (`Install Helper Tool` + `(Required Root Privileges)` [strings]).
    - Secondary copy elsewhere: `Proxyman Helper Tool requires your permission
@@ -74,9 +81,11 @@ quitting reverts the proxy; a crash is reverted by the helper.
      ON [docs]. A stale entry is cleared with `sfltool resetbtm` + restart
      [docs].
    - Skippable: `Later` [strings]; later from Settings ▸ Advanced ▸ `Proxy
-     Helper Tool:` row with `Install Helper Tool` [strings] and status words
-     `Installed & Trusted` / `Not installed` [strings].
-   - Install from the command line, for scripted setups [docs]:
+     Helper Tool:` row with `Install Helper Tool` [strings]; the helper's own
+     status words are `Helper Tool Status: Installed / Need Allow in System
+     Setting / Need Update / Not Install` (BUNDLE §3.2).
+   - Install from the command line, for scripted setups, quoted as the docs
+     print it (the executable is spelled `Proxyman` on disk) [docs]:
      `sudo /Applications/Proxyman.app/Contents/MacOS/proxyman --install-privileged-components`.
 4. **The "no traffic" nudge** (a timer after launch when nothing arrived)
    [Matt, strings]: alert `No HTTP Traffic?` · body `It seems that Proxyman
@@ -128,7 +137,7 @@ the status-bar badge.
   (⌘+K)`, `Add new domains or apps into Source Panel (Left Panel)`, `Filter
   specific domains or app in the Source Panel (Left Panel)`. Bottom: `+` and
   `Filter (⌘⇧F)`. Matt also saw `Capture ▸ Overview` at the top.
-- **Flow list columns** [video, Matt]: `●` state dot · `#` · `URL` · `Client`
+- **Flow list columns** [video f001, Matt]: `●` state dot · `#` · `URL` · `Client`
   (icon + name) · `Method` (pill) · `Status` (pill) · `Time` (`10:59:38.064`)
   · `Duration` (`519 ms`) · `Request` (`160 bytes`) · `Response` (`2 bytes`)
   · `SSL` (open padlock when decrypted) · `Edited` (✓) · `Tools`
@@ -139,7 +148,7 @@ the status-bar badge.
   closed, `999` (grey) when it failed or never answered, amber `Active`
   while open [Matt; string `Active`, `Inactive`]; Request/Response `–`; no
   padlock; the dot grey. Every connection is a row, decrypted or not.
-- **Inspector** [video f001–f012]: strip `POST` pill · `200 OK` pill · URL.
+- **Inspector** [video f001, f008, f011]: strip `POST` pill · `200 OK` pill · URL.
   Request tabs `Header Query Body Raw Summary +`; Response tabs `Header Body
   Raw Treeview +`. `+` opens the `Custom Previewer Tab` sheet (`Custom Body
   Previewer Tabs — Display Request/Response Body with different formats.`)
@@ -297,8 +306,8 @@ Settings ▸ MCP: `Enable MCP Server`, `Redact Sensitive Data Before Sending to
 AI` (`Automatically redact sensitive information before sending to AI
 tools.`) [docs, strings]. Client setup is one command [docs]:
 `claude mcp add proxyman --transport stdio -- "/Applications/Proxyman.app/Contents/MacOS/mcp-server"`.
-The stdio binary forwards to the app over a loopback bridge with a 0600 token
-file; when the app is closed: `Proxyman is not running, MCP is stopped, or MCP
+The stdio binary forwards to the app over a loopback bridge with a
+per-session token file [docs] (BUNDLE §7); when the app is closed: `Proxyman is not running, MCP is stopped, or MCP
 has been disabled by your organization. Open Proxyman Settings > MCP to check
 its status.` [strings]. Verbs: BUNDLE §7. The agent can also do the
 privileged steps (`set_system_proxy`, `install_network_extension`,
@@ -322,7 +331,7 @@ from iOS Simulators` [strings].
 | Install helper | macOS Authorization dialog | "Proxyman is trying to override Proxy config in System Preferences." + admin password |
 | Helper on macOS 13+ | System Settings ▸ Login Items | Proxyman toggle; app says `Need Allow in System Setting`, button `Open Login Items` |
 | Override proxy (helper installed) | nobody | status badge `Proxy Overridden` |
-| Override proxy (no helper) | nobody; `networksetup` runs as the user | sheet warns `… overridden by `networksetup` CLI. It works, but slow!` |
+| Override proxy (no helper) | nobody; `networksetup` runs as the user | sheet warns "… overridden by networksetup CLI. It works, but slow!" |
 | CA Automatic | macOS admin password dialog | from `do shell script … with administrator privileges` |
 | CA Manual | keychain chooser, then Keychain Access | `Make sure you Select System or Login Keychains.`, `Always Trust` |
 | Network Extension install | System Settings ▸ Login Items & Extensions ▸ Network Extensions | `… click ⓘ next to Network Extensions, then turn on Proxyman.` |
