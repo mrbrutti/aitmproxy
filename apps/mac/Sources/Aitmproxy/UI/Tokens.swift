@@ -323,16 +323,29 @@ enum Tok {
         static func easeInOut(_ duration: Double) -> Animation {
             Animation.timingCurve(0.77, 0.0, 0.175, 1.0, duration: duration)
         }
+        static var easeInOutTiming: CAMediaTimingFunction {
+            CAMediaTimingFunction(controlPoints: 0.77, 0.0, 0.175, 1.0)
+        }
         static func easeOut(_ duration: Double) -> Animation {
             Animation.timingCurve(0.23, 1.0, 0.32, 1.0, duration: duration)
         }
+        static var easeOutTiming: CAMediaTimingFunction {
+            CAMediaTimingFunction(controlPoints: 0.23, 1.0, 0.32, 1.0)
+        }
         static let hover: Double = 0.100
-        /// The armed-intercept bar's dot pulses opacity 1→0.5; stops under reduced motion.
+        /// The armed-intercept bar's dot pulses opacity 1→0.45 over one breath (600 ms down, 600 ms up) as a Core Animation opacity animation; removed under Reduce Motion.
         static let interceptPulse: Double = 1.200
         /// Menus, popovers; scale from 0.97 at the trigger's origin.
         static let popover: Double = 0.160
         /// Button :active scale(0.97).
         static let press: Double = 0.120
+        /// Breathing curve for the one allowed pulse (the armed-intercept dot): a gentle sine-like ease-in-out, never for travel.
+        static func pulse(_ duration: Double) -> Animation {
+            Animation.timingCurve(0.42, 0.0, 0.58, 1.0, duration: duration)
+        }
+        static var pulseTiming: CAMediaTimingFunction {
+            CAMediaTimingFunction(controlPoints: 0.42, 0.0, 0.58, 1.0)
+        }
         /// New flows append with no animation: the list can gain 50 rows/s.
         static let rowArrive: Double = 0.000
         /// Compose/PoC sheets, the browser drawer.
