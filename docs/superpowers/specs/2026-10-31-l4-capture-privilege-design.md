@@ -210,6 +210,8 @@ helper with a missing policy file or no `pkexec` is the install row (row 8, `ope
 carries `action: bus_verb`, so a frontend renders `package` as a download link only when `action.type == "open_url"`
 and otherwise shows the label alone. Row 4's lazy direct start of a file-caps helper requires `root_owned_chain` on the
 helper's path and is serving-only: a one-shot command on that row refuses (no helper is wired) and spawns nothing.
+(Panel 2, 2026-11-01) Row 4's `probe` runs only for a candidate whose whole path chain is root-owned, and its result
+is cached per path identity (device, inode, size, mtime, ctime) for the process lifetime.
 
 Helper discovery order: `l4.privilege.helper_path` from config, then `<exe dir>/aitm-l4-helper`,
 `/usr/lib/aitmproxy/aitm-l4-helper`, `/run/wrappers/bin/aitm-l4-helper`. Discovery finds a helper to probe; only the
@@ -233,7 +235,9 @@ policy's exec path is ever run through `pkexec` (§5.1).
   path before using it: an existing `*.app` directory not under `/tmp`, `/private/tmp` or `/var/folders`;
   `CFBundleIdentifier` equal to `com.mrbrutti.aitmproxy`; and a valid code signature whose team is `995PCLM9KH`. Only
   then does it run `/usr/bin/open -a <path> aitmproxy://packet-capture/allow` (§3.4) and reply `handed_to_app`. A
-  missing or failing app is `cannot_prompt`.
+  missing or failing app is `cannot_prompt`. (Panel 2, 2026-11-01) The configured or derived path is canonicalized
+  first, and a path that cannot be canonicalized is "missing"; the `plutil` and `codesign` facts are cached per
+  bundle stamp (device, inode, `Info.plist` mtime, main executable mtime).
 - Linux: `pending` after spawning `/usr/bin/pkexec /usr/lib/aitmproxy/aitm-l4-helper serve --connect <socket>` (§5;
   panel, 2026-11-01: the launcher by absolute path, environment per §5.5) with
   pkexec's stderr on a pipe the core drains; the progress moves to `approved` when the helper connects and passes
@@ -556,6 +560,12 @@ sits between the connected-session row (`running`) and the file-caps row of the 
 session connects. `HelperBackend` implements the existing `CaptureInjectBackend` trait
 over this session, so the commands do not change.
 
+(Panel 2, 2026-11-01) Every peer-supplied text the core shows an operator (the helper's `InjectResult` error,
+`CaptureClosed.reason`, a handshake defect text, and each entry of the macOS receipt's `errors`) is bounded to 512
+bytes with control characters replaced (`TEXT_BOUND`), and a blank entry falls back to the spec literal for that
+place. The listener watcher ends a request as `failed` after 10 consecutive `accept` errors (`ACCEPT_ERRORS_MAX`),
+logging one `warn` at the first.
+
 #### 5.3 The helper enforces the guard itself
 
 For every `Inject` the helper parses the frame itself (it never trusts a target the core claims), then runs the same
@@ -639,6 +649,13 @@ withdrawn). **(Architect's call:** during that window Ctrl-C cancels the prompt 
 the child is gone, Ctrl-C shuts the core down as before. Matt's Question 6 in the plan stays flagged.) The TUI leaves
 raw mode before the prompt (below), which is exactly when Ctrl-C turns from a key into a signal.
 
+(Panel 2, 2026-11-01) Both serving shutdown futures consult the hold: the one `aitm` and `aitm web` await
+(`crates/aitm/src/lib.rs` `shutdown_signal`) and the `aitm tui` select arm (`crates/aitm/src/tui.rs`). When a held
+Ctrl-C reaches the core alone (no shared foreground process group, so the child saw no signal), the core kills the
+launcher child itself, so the prompt is cancelled and the stop is never deferred to the 300 s timeout
+(**Architect's call:** the core sends the child SIGINT, so the table above records `dismissed`). The watcher thread
+carries an unwind guard, so a panic can never leave the request `pending` or the hold raised.
+
 (S7) The textual prompt names an **admin** identity (`Authenticating as: <admin>`); for an operator who is not in
 `sudo`/`wheel` that is another user's account, which is correct polkit behaviour and why the web banner says "Enter
 an administrator password in the terminal running aitm".
@@ -717,7 +734,11 @@ index. Forks (i)–(v) and the open item are untouched.
   ways, re-runs the guard on every frame and builds its own capture filter (§5.3), and dies with the core. Only the
   policy's root-owned path is ever pkexec'd. Its limit: a compromised core can send a wider `ScopeSet`, so it is a
   boundary against everything except its parent core. The setcap fallback makes it an oracle for every user who can
-  execute it, which is why the doc restricts it to a group.
+  execute it, which is why the doc restricts it to a group. (Panel 2, 2026-11-01) Every text the helper or the
+  receipt hands the core for an operator (`InjectResult.error`, `CaptureClosed.reason`, handshake defect text, the
+  receipt's `errors` entries) is bounded to 512 bytes with control characters replaced (`TEXT_BOUND`), a blank entry
+  falling back to the spec literal; and a listener whose `accept` fails 10 times in a row (`ACCEPT_ERRORS_MAX`) ends
+  the request `failed` with one `warn` at the first error, so a broken or hostile socket cannot spin the watcher.
 - **T4, agent and remote triggers.** `l4.privilege.request` is operator-only at the policy gate and in the command,
   and is never parked; gated verbs never start a request. The macOS URL only brings the app forward (§3.4); the
   in-app click and the OS approval, or the polkit dialog on Linux, are the human gates. An agent with a shell could
@@ -770,6 +791,8 @@ Changed:
 
 - `crates/aitm-proto-l4/src/{module,capture,sendrecv,language,config}.rs`, `commands/{capture,intercept,mod}.rs`
 - `crates/aitm/src/{wire,main}.rs`; `crates/aitm-mcp/src/server.rs` (`is_operator_only` only)
+- `crates/aitm/src/lib.rs` and `crates/aitm/src/tui.rs` (panel 2, 2026-11-01: each shutdown arm consults the prompt
+  hold)
 - `apps/mac/Info.plist.in` (URL type), `ConnectionSummary.swift`, `EmbeddedCoreLaunch.swift`, `StatusPanel.swift`,
   `SettingsView.swift`, `App.swift` (URL handler), the L4 surface file that hosts the capture controls (named in the
   plan: `Panels/L4CaptureControls.swift`, new). Privilege decoding lives in the new `PacketCapture.swift` (plan
@@ -791,6 +814,8 @@ for Matt** carry user-visible change this spec did not list:
   `backend/mod.rs`, `crates/aitm-proto-l4/Cargo.toml` (`tracing`, Linux `nix`), `crates/aitm/tests/frontends.rs`,
   `crates/aitm-tui/src/lib.rs` (`CORE_TOOLS` only; `tester_shell.rs` dropped, panel 2026-11-01, deleted by #244),
   `Cargo.lock` (the derived line for the `Cargo.toml` change only, panel 2026-11-01),
+  `crates/aitm/src/{lib,tui}.rs` (panel 2, 2026-11-01: the shutdown arm consults the hold; `tui.rs` one line plus
+  threading the hold into `tui::run`),
   `tests/e2e/l4/{test_l4_parity_core,test_l4_parity_priv}.py`, `docs/research/mcp-tool-catalog.txt`,
   `aitmproxy-plugin/docs/tool-reference.md`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`
 - (p2) new `tests/e2e/l4/linux-privilege-rig.sh`; changed the root `Cargo.toml` (`members`, workspace dep),

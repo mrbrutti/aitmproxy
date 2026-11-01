@@ -907,7 +907,7 @@ capability's reason.
 - **Satisfies:** AC16, AC17, AC20, AC22, AC23 (core halves), spec §2.3, §2.4 (one-shot), §5.1, §5.5
 - **Depends on:** P1b.13; spike **S7** (exit codes). (S7) Answered; the mapping and the tests below are the
   corrected ones (spec §5.5 table). The original "126 dismissed, 127 failed" rule is wrong for the textual agent.
-- **Files:** `crates/aitm-proto-l4/src/privilege/linux.rs`, `crates/aitm-proto-l4/src/privilege/state.rs`, `crates/aitm/src/lib.rs` (panel, 2026-11-01: `shutdown_signal` consults the prompt hold; the fix task), `crates/aitm-proto-l4/src/privilege/derive.rs` (panel, 2026-11-01: the `last_session_error` row; the fix task)
+- **Files:** `crates/aitm-proto-l4/src/privilege/linux.rs`, `crates/aitm-proto-l4/src/privilege/state.rs`, `crates/aitm/src/lib.rs` (panel, 2026-11-01: `shutdown_signal` consults the prompt hold; the fix task), `crates/aitm-proto-l4/src/privilege/derive.rs` (panel, 2026-11-01: the `last_session_error` row; the fix task), `crates/aitm/src/tui.rs` (panel 2, 2026-11-01: the `aitm tui` shutdown arm consults the hold, one line, plus threading the hold into `tui::run`; granted to p1b from P6.3)
 - **Change:**
   - `pub trait Spawner: Send + Sync { fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>>; }` and
     `pub trait Child: Send { fn id(&self) -> u32; fn try_wait(&mut self) -> io::Result<Option<ChildExit>>; fn
@@ -929,6 +929,14 @@ capability's reason.
     `SIG_IGN` (inherited across `execve`, it makes the prompt un-cancellable). No `sigaction`, no `unsafe`, no new
     crate; the shape of the count is the builder's. **(Architect's call:** during that window Ctrl-C cancels the
     prompt and does not shut the core down; see Questions, Q6 stays flagged for Matt.)
+    (Panel 2, 2026-11-01) Both serving shutdown futures consult the hold: `shutdown_signal` in `lib.rs` (`aitm`,
+    `aitm web`) and the `aitm tui` select arm in `tui.rs`, which receives the hold through `tui::run`. On a held
+    Ctrl-C each arm calls `pub fn PrivilegeState::cancel_prompt(&self)`, which kills the live launcher child (SIGINT,
+    so `classify_exit` records `dismissed`), so a Ctrl-C delivered to the core alone (no shared foreground process
+    group) still ends the prompt and never waits out the 300 s timeout; with no child alive it is a no-op. The
+    watcher thread carries an unwind guard (a drop guard) that moves a still-`pending` request to `failed` and
+    releases the hold if the thread panics, so a panic never leaves the request `pending` or the hold raised
+    (**Architect's call** on `failed` as the terminal state).
   - `pub fn classify_exit(exit: ChildExit, stderr: &str) -> (Progress, String)` (pure), the spec §5.5 table:
     - `Exited(126)` → `Dismissed`, `"Approval was cancelled"` (graphical agent's Cancel);
     - `Exited(127)` with stderr containing `Got unexpected EOF while reading from controlling terminal` →
@@ -948,6 +956,11 @@ capability's reason.
     both proto numbers (ours and the peer's), and `unknown` for any other `SessionError` with `detail` carrying its
     text. The request's progress is `failed`; its message is the builder's wording (outside the P1b.3 tripwire) and
     must name neither a command nor the socket path. `failed` is never a `Helper.status` value (spec §5.2).
+    (Panel 2, 2026-11-01) The carrier type is `pub enum SessionFailure { VersionMismatch(u32), Protocol(String) }`
+    in `privilege/derive.rs` (the name `SessionError` is taken by `helper::client`); the watcher maps
+    `SessionError::VersionMismatch(theirs)` to `VersionMismatch(theirs)` and every other `SessionError` to
+    `Protocol(<its text, bounded by TEXT_BOUND>)`. `Protocol(_)` reads `helper.status: unknown` with the text in
+    `detail`; only `VersionMismatch(_)` reads `version_mismatch`.
   - `pub fn request_linux(cfg, inputs: &LinuxInputs, spawner: &dyn Spawner, signal: &dyn SignalGuard, socket: &Path,
     display_set: bool) -> LinuxRequest` (panel, 2026-11-01: the signature as landed; the checks run in this order):
     - `lifetime == OneShot` gives `CannotPrompt`, `"a one-shot command exits before the helper could serve it; set
@@ -976,6 +989,8 @@ capability's reason.
     pkexec, on first use. (Panel, 2026-11-01) It requires `root_owned_chain` on the helper's path and is serving-only:
     a one-shot on that row refuses (the helper is not wired) and spawns nothing. When any helper session ends, the
     cache is marked dirty so the next `report()` re-probes and capture returns to `needs_approval` (spec §2.1).
+    (Panel 2, 2026-11-01) `probe` runs only for a candidate with `root_owned_chain`, and its result is cached per
+    path identity (device, inode, size, mtime, ctime) for the process lifetime (`linux::ProbeCache`).
   - `pkexec` is never given any path but `LINUX_HELPER_PATH`.
 - **Test (first, failing):** `linux::tests` with a fake spawner and clock:
   - `one_shot_refuses_and_spawns_nothing`
@@ -999,11 +1014,21 @@ capability's reason.
     refuses (panics) on any `SIG_IGN`-style call. Nothing is spawned without a hold.
   - `held_ctrl_c_keeps_serving` (panel, 2026-11-01; in `crates/aitm/src/lib.rs`, pure): the shutdown decision for a
     Ctrl-C with the hold count at 1 is "keep serving" and its log line is exactly `Ctrl-C cancelled the
-    packet-capture prompt; the core keeps serving`; with the count at 0 it is "shut down".
-  - `version_mismatch_after_handshake_failure` (panel, 2026-11-01; `derive::tests`): no session, `last_session_error
-    = Some(VersionMismatch(2))` gives `helper.status == "version_mismatch"` and a `detail` containing both `1` and
-    `2`; a `Proto(..)` error gives `"unknown"` with the error text in `detail`; a connected session gives `"running"`
-    whatever the last error.
+    packet-capture prompt; the core keeps serving`; with the count at 0 it is "shut down". (Panel 2, 2026-11-01:
+    delivered by the Tester as `lib.rs::tests::held_ctrl_c_keeps_serving`; this is the Ctrl-C literal test.)
+  - `held_ctrl_c_alone_cancels_the_prompt` (panel 2, 2026-11-01; `state::tests`, fake spawner): with a child alive
+    and the hold at 1, `cancel_prompt()` kills the fake child, the progress reads `dismissed` with `"Approval was
+    cancelled"`, and the hold is 0; with no child it changes nothing. (Name the Architect's; the fix-task coder
+    reports the delivered name.)
+  - `watcher_panic_releases_hold_and_ends_pending` (panel 2, 2026-11-01; `state::tests`): a fake child whose
+    `try_wait` panics leaves the request `failed`, not `pending`, and the hold at 0.
+  - `linux_session_failure_is_version_mismatch_until_a_session_connects` (panel, 2026-11-01; `derive::tests`;
+    panel 2: the delivered name, was `version_mismatch_after_handshake_failure`): no session, `last_session_error =
+    Some(SessionFailure::VersionMismatch(2))` gives `helper.status == "version_mismatch"` and a `detail` containing
+    both `1` and `2`; a connected session gives `"running"` whatever the last error.
+  - `protocol_failure_is_unknown_with_detail` (panel 2, 2026-11-01; `derive::tests`): no session,
+    `last_session_error = Some(SessionFailure::Protocol(..))` gives `helper.status == "unknown"` with the error text
+    in `detail`.
   - `pkexec_env_is_cleared_but_for_display` (panel, 2026-11-01): the spawned child's environment is exactly the
     subset of `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` that is set in the core; `SHELL`, `LANG` and `LC_ALL` are
     absent. Proven live only by the [linux-ci] run (P2.8).
@@ -1050,7 +1075,8 @@ TUI is live-only, and `tui_live_bus.rs` compares `CORE_TOOLS` to the live `tools
 - **Change:** pins only. The counts above are the values at branch cut. If `main` moved, add 2 to whatever they read.
 - **Test (first, failing):** before the edit, `cargo test --offline -p aitm --test frontends` fails on the set
   difference (quote it). After the edit, it passes. In the Terminal: `cargo test -p aitm --test tui_live_bus` passes
-  (the TUI pin fails only there, since it binds a port).
+  (the TUI pin fails only there, since it binds a port). (Panel 2, 2026-11-01) The Terminal `cargo test -p aitm
+  --test l4_cua_tui` result (the AC27 branch fixed in e79aeab0) is quoted in the Review log at ready time.
 - **Done when:** the full gate passes in the Terminal.
 
 ### Task P1b.17: live core checks on the rig (e2e)
@@ -1096,7 +1122,8 @@ TUI is live-only, and `tui_live_bus.rs` compares `CORE_TOOLS` to the live `tools
   exits 1 (no `l4.privilege`).
 - **Live check [mac-any], rig on this branch (Terminal):** `test_privilege_core.py` exits 0 (77 on the AC5 block
   until p7), `test_l4_parity_core.py` exits 0, `test_l4_parity_priv.py` exits 77. **[linux-ci]:** the same three in
-  the Fedora container, output quoted.
+  the Fedora container, output quoted. (Panel 2, 2026-11-01) The Terminal `l4_cua_tui` run result is quoted in the
+  Review log at ready time alongside these.
 - (Panel, 2026-11-01) The `[linux-ci]` half (AC20, AC23 and the Linux cells of `test_privilege_core.py`) is
   re-scoped to P2.8 [linux-ci], the helper unit, which builds the container rig this needs (`cis-lab` has none yet:
   podman, `--systemd=always --privileged`), pending Matt's acceptance (Review log row "P1b.17 [linux-ci]"). Until
@@ -1889,7 +1916,7 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 
 - **Satisfies:** AC22
 - **Depends on:** P6.2
-- **Files:** `crates/aitm-tui/src/lib.rs` (terminal suspend and restore around the request), `crates/aitm/src/tui.rs` (passes `core_shares_tty: true` in `aitm tui` mode only)
+- **Files:** `crates/aitm-tui/src/lib.rs` (terminal suspend and restore around the request), `crates/aitm/src/tui.rs` (passes `core_shares_tty: true` in `aitm tui` mode only; panel 2, 2026-11-01: its shutdown arm's hold consult is p1b's, P1b.14, already landed)
 - **Change:**
   - `pub fn should_suspend(platform: &str, core_shares_tty: bool, outcome: &str) -> bool` is true iff `linux`,
     `core_shares_tty` and `pending`.
@@ -1899,7 +1926,9 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
     prompt hold (P1b.14; panel 2026-11-01: a hold count the tokio `ctrl_c` shutdown future consults while the pkexec
     child lives) is what keeps the TUI alive, and the TUI must not install `SIG_IGN` or its own exit-on-SIGINT during
     this window. After the prompt ends with `dismissed`, the TUI redraws with the banner
-    "Approval was cancelled".
+    "Approval was cancelled". (Panel 2, 2026-11-01) The `aitm tui` shutdown arm already consults the prompt hold
+    (p1b, P1b.14); P6.3 keeps only the raw-mode suspend and restore and the `core_shares_tty` flag, and adds no
+    signal or shutdown code.
 - **Test (first, failing):** `should_suspend("linux", true, "pending") == true`. The cases `("macos", true,
   "handed_to_app")`, `("linux", false, "pending")` and `("linux", true, "cannot_prompt")` are all `false`.
 - **Done when:** the tests pass and the Rust gate passes.
@@ -2065,7 +2094,7 @@ packets? Packet capture isn't allowed on this machine yet." on Linux.
 | AC19 | P2.6 | P2.8 [linux-ci] |
 | AC20 | P1b.2, P1b.14 | P1b.17 [linux-ci] (panel 2026-11-01: re-scoped to P2.8 pending Matt) |
 | AC21 | P6.6 | P6.10 [linux-desk] |
-| AC22 | P6.3, P1b.14 (`sigint_is_dismissed`, `sigint_handler_installed_not_ignored`; S7) | P6.10 [linux-ci] (test rule removed; harness matches `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====`; S7) |
+| AC22 | P6.3, P1b.14 (`sigint_is_dismissed`, `sigint_handler_installed_not_ignored`; S7; panel 2, 2026-11-01: `held_ctrl_c_keeps_serving` in `crates/aitm/src/lib.rs`, Tester) | P6.10 [linux-ci] (test rule removed; harness matches `==== AUTHENTICATING FOR com.mrbrutti.aitmproxy.l4-helper.run ====`; S7) |
 | AC23 | P1b.5 (`prompt_possible` with `tty_opens`; S7), P1b.14 (`no_prompt_is_cannot_prompt_and_spawns_nothing`, `no_agent_text_is_failed`) | P1b.17 [linux-ci] (core under `setsid`; S7; panel 2026-11-01: re-scoped to P2.8 pending Matt); doc branch after P5.4 |
 | AC24 | P1b.6, P1b.16 | P1b.17 |
 | AC25 | P3.10, P6.1, P6.4, P6.5 | P3.13, P6.10 [mac-any, linux-ci] |
