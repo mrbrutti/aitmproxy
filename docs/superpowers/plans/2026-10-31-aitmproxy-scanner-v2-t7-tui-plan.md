@@ -355,6 +355,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix B | quality | Minor | stale binding name `text` in `scan_v2_parse.rs` after B10 | fix round C |
 | fix B | spec | re-review | B1 to B10 closed with the report's literals; D6 ordering parenthetical, "lowercase", and the D3 `ScanError` shape re-aligned in this commit | closed |
 | fix B | spec | Minor | `pub const OTHER_JOB` and `ScanError::tagged` are unrequested public helpers | accepted (`tagged()` goes in fix round C's constructor change; `OTHER_JOB` stays, consistent with `NO_SCANNER`/`MISSING_VERB`) |
+| 6 | security | Minor | per-frame joins, measures and `elide_middle` over unbounded core strings (`targets`, `profile_name`); `detail_len()` allocates every line on each key | fix round C (C20): bound at row construction, count without allocating |
+| 6 | coder note | Minor | `already <state>` notice rides the error channel and reads `scan.cancel: already done` | fix round C (C19): non-error `notice` slot in the banner |
 
 ## Shipped
 
