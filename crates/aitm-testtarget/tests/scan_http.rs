@@ -642,6 +642,7 @@ async fn tls_listener_negotiates_h2_and_h1() {
         (tls_h1, &["h2", "http/1.1"], b"http/1.1"),
     ];
     let mut streams = Vec::new();
+    let mut leaf_certs: Vec<Vec<u8>> = Vec::new();
     for (i, (url, offered, expected)) in cases.iter().enumerate() {
         let (stream, negotiated) = tls_connect(url, offered).await;
         assert_eq!(
@@ -649,6 +650,14 @@ async fn tls_listener_negotiates_h2_and_h1() {
             Some(*expected),
             "offered {offered:?} to {url}"
         );
+        let leaf = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .map(|cert| cert.as_ref().to_vec())
+            .unwrap_or_else(|| panic!("{url} presented no certificate"));
+        leaf_certs.push(leaf);
         streams.push(stream);
         // The server logs its side of the handshake asynchronously; wait for
         // it before the next connect so the log order is the connect order.
@@ -673,6 +682,14 @@ async fn tls_listener_negotiates_h2_and_h1() {
         .filter_map(|e| e["conn_id"].as_str())
         .collect();
     assert_eq!(ids.len(), 3, "three distinct connections: {ids:?}");
+    // Spec D1: one self-signed certificate per process, so `tls` and
+    // `tls_h1` present the same leaf DER.
+    assert_eq!(leaf_certs.len(), 3);
+    assert_eq!(
+        leaf_certs[0], leaf_certs[2],
+        "tls and tls_h1 must present the same certificate"
+    );
+    assert_eq!(leaf_certs[0], leaf_certs[1]);
     drop(streams);
 }
 

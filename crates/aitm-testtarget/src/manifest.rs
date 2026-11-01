@@ -386,7 +386,7 @@ pub fn l4_manifest() -> &'static [L4Asset] {
                     "l4-mqtt",
                     "tcp",
                     "mqtt",
-                    "CONNECT 10 0C 00 04 4D 51 54 54 04 02 00 3C 00 00 -> CONNACK 20 02 00 00; PINGREQ C0 00 -> D0 00; PUBLISH QoS1 32 0A 00 03 61 2F 62 00 01 68 69 -> PUBACK 40 02 00 01; QoS0 accepted silently; SUBSCRIBE -> SUBACK QoS0; DISCONNECT E0 00 closes; liveness CONNECT + DISCONNECT",
+                    "CONNECT 10 0C 00 04 4D 51 54 54 04 02 00 3C 00 00 -> CONNACK 20 02 00 00; PINGREQ C0 00 -> D0 00; PUBLISH QoS1 32 09 00 03 61 2F 62 00 01 68 69 -> PUBACK 40 02 00 01; QoS0 accepted silently; SUBSCRIBE -> SUBACK QoS0; DISCONNECT E0 00 closes; liveness CONNECT + DISCONNECT",
                     "remaining-length varint with a 5th byte, or value > 65536",
                 ),
                 speaker(
@@ -643,6 +643,24 @@ mod tests {
                 v.id
             );
         }
+    }
+
+    #[test]
+    fn l4_manifest_mqtt_publish_literal_is_well_formed() {
+        // `32 09 00 03 61 2F 62 00 01 68 69`: fixed header, remaining length
+        // 9 (topic length 2 + `a/b` 3 + packet id 2 + `hi` 2). The spec's
+        // `32 0A` spelling is one byte short of its own payload and the
+        // speaker reads it as an incomplete packet.
+        let mqtt = l4_manifest()
+            .iter()
+            .find(|a| a.id == "l4-mqtt")
+            .expect("l4-mqtt asset");
+        assert!(
+            mqtt.behaviour.contains("32 09 00 03 61 2F 62 00 01 68 69"),
+            "{}",
+            mqtt.behaviour
+        );
+        assert!(!mqtt.behaviour.contains("32 0A"), "{}", mqtt.behaviour);
     }
 
     #[test]

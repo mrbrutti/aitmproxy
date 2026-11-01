@@ -9,9 +9,10 @@
 //! (`Decoded::Oversize`, close `1009`), and a reserved opcode or RSV bit is
 //! `Decoded::Malformed`. No `unwrap`/`expect` touches wire bytes.
 //!
-//! The handshake is checked in the D4 order: key and version (400), HTTP/1.1
-//! only (400 over h2), `Origin` (403 in P), the login cookie (401 in P), the
-//! subprotocol echo (V only). Every outcome writes a `handshake` entry; the
+//! The handshake is checked in the D4 order: HTTP/1.1 only (400 over h2, so
+//! a plain h2 `GET /ws` names the real reason), key and version (400),
+//! `Origin` (403 in P), the login cookie (401 in P), the subprotocol echo (V
+//! only). Every outcome writes a `handshake` entry; the
 //! accepted connection's frames are logged in both directions and the loop's
 //! end writes a `close` entry and stamps the connection closed (the 101 marks
 //! the connection upgraded, so the listener's own close after hyper hands
@@ -384,8 +385,8 @@ struct Accepted {
     subprotocol: Option<String>,
 }
 
-/// The D4 handshake decision, in order: key + version 13 (400), h1 only
-/// (400 over h2), `Origin` (403), login (401 in P), then the subprotocol echo.
+/// The D4 handshake decision, in order: h1 only (400 over h2), key + version
+/// 13 (400), `Origin` (403), login (401 in P), then the subprotocol echo.
 #[allow(clippy::too_many_arguments)]
 fn handshake_verdict(
     mode: SeedMode,
@@ -398,13 +399,15 @@ fn handshake_verdict(
     session_valid: bool,
     requested_protocol: Option<&str>,
 ) -> Result<Accepted, (StatusCode, &'static str)> {
+    // An h2 connection cannot carry an upgrade at all, whatever headers came
+    // with the request: say so before judging the key and version.
+    if alpn == Some("h2") {
+        return Err((StatusCode::BAD_REQUEST, "websocket requires HTTP/1.1"));
+    }
     let key = match (key, version) {
         (Some(k), Some("13")) if !k.is_empty() => k,
         _ => return Err((StatusCode::BAD_REQUEST, "bad websocket handshake")),
     };
-    if alpn == Some("h2") {
-        return Err((StatusCode::BAD_REQUEST, "websocket requires HTTP/1.1"));
-    }
     if !origin_allowed(mode, origin, scheme, host) {
         return Err((StatusCode::FORBIDDEN, "<p>forbidden origin</p>"));
     }
@@ -968,6 +971,18 @@ mod tests {
         );
         h2.scheme = "https";
         let resp = serve_upgrade(&h2, never_upgraded(), v.clone());
+        assert_eq!(resp.status().as_u16(), 400);
+        assert_eq!(body_text(resp).await, "websocket requires HTTP/1.1");
+        // ... and the h2 check comes first: a plain h2 `GET /ws` without the
+        // key/version headers names the real reason, not a bad handshake.
+        let mut plain_h2 = RequestInfo::test_request("GET", "/ws", &[("host", "127.0.0.1:1")], b"");
+        plain_h2.conn = ControlLog::new(Vulnerable).open_conn(
+            Listener::Tls,
+            Some("h2"),
+            "127.0.0.1:2".parse().expect("peer"),
+        );
+        plain_h2.scheme = "https";
+        let resp = serve_upgrade(&plain_h2, never_upgraded(), p.clone());
         assert_eq!(resp.status().as_u16(), 400);
         assert_eq!(body_text(resp).await, "websocket requires HTTP/1.1");
     }

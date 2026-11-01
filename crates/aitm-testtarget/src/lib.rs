@@ -137,14 +137,21 @@ impl TargetBuilder {
         let plain = bind_plain(self.port, state.clone()).await?;
         let base_url = format!("http://{plain}");
 
+        // One self-signed certificate per process (spec D1), shared by both
+        // TLS listeners; minted only when one of them is asked for.
+        let identity = if self.tls.is_some() || self.tls_h1.is_some() {
+            Some(tls::self_signed()?)
+        } else {
+            None
+        };
         let mut tls_url = None;
-        if let Some(port) = self.tls {
-            let addr = tls::bind(log::Listener::Tls, port, state.clone()).await?;
+        if let (Some(port), Some(identity)) = (self.tls, &identity) {
+            let addr = tls::bind(log::Listener::Tls, port, state.clone(), identity).await?;
             tls_url = Some(format!("https://{addr}"));
         }
         let mut tls_h1_url = None;
-        if let Some(port) = self.tls_h1 {
-            let addr = tls::bind(log::Listener::TlsH1, port, state.clone()).await?;
+        if let (Some(port), Some(identity)) = (self.tls_h1, &identity) {
+            let addr = tls::bind(log::Listener::TlsH1, port, state.clone(), identity).await?;
             tls_h1_url = Some(format!("https://{addr}"));
         }
         let mut control_url = None;
@@ -154,11 +161,7 @@ impl TargetBuilder {
         }
         let (l4, legacy_l4) = if self.l4 {
             let speakers = L4Services::start(mode, log.clone()).await?;
-            let legacy = L4Service::try_start(L4Config { enabled: true })
-                .await?
-                .ok_or_else(|| {
-                    std::io::Error::other("legacy l4 service did not start when enabled")
-                })?;
+            let legacy = L4Service::try_start().await?;
             for row in legacy_l4_rows(legacy.udp_addr(), legacy.tcp_addr()) {
                 log.register_service(row);
             }

@@ -339,9 +339,10 @@ mod tests {
 
     #[test]
     fn plan_literal_with_remaining_0a_is_one_byte_short() {
-        // Spec D5 / plan A11 write `32 0A 00 03 61 2F 62 00 01 68 69`, but
-        // only 9 bytes follow the length byte: as written it is a partial
-        // packet (and would be the bug after a 200 ms idle), not a PUBLISH.
+        // Pins the corrected PUBLISH literal (remaining length `09`, as the
+        // manifest and the live suite now spell it): with `0A` only 9 bytes
+        // follow the length byte, so the speaker sees a partial packet (and
+        // the bug after a 200 ms idle), never a PUBLISH.
         let as_written = [
             0x32, 0x0A, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x00, 0x01, 0x68, 0x69,
         ];
