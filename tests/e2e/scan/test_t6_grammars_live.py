@@ -25,11 +25,16 @@ Modbus/TCP, MQTT, SMTP, FTP) and its child-spec-D5 speaker:
 covered by AC T5-2b in `test_t5_crash_oracle.py`; it is not run here. That is
 why this cell iterates eight grammars, not nine.
 
-Partial skips. A grammar the lane has not landed yet (no `scan.checks` check
-with the `l4_field` insertion kind naming it, or `scan.start` refused with
-`invalid_profile` naming it) prints `[SKIP-PART] <grammar>` and the cell moves
-on -- but if EVERY grammar skips that way the cell FAILS, so a half-landed
-lane is visible while a missing lane is a normal whole-cell SKIP 77.
+Partial skips. The lane ships three GENERIC checks for every grammar
+(`l4-crash`, `l4-parser-fault`, `l4-latency-outlier`, kind `l4_field`; T6 child
+spec S6.3): a check id never names a grammar, the grammar lives in
+`Issue.location.l4.grammar` and the site node's `path_template`. So "landed" is
+one question for the whole lane (at least one `l4_field` check in `scan.checks`),
+and the per-grammar question is answered by `scan.start`: an unknown grammar is
+refused with `invalid_profile: unknown grammar '<x>'; known: ...`, printed as
+`[SKIP-PART] <grammar>` and the cell moves on -- but if EVERY grammar skips that
+way the cell FAILS, so a half-landed lane is visible while a missing lane is a
+normal whole-cell SKIP 77.
 
 Observer: the seeded speakers' control-origin L4 logs (classification,
 downtime, and the message timestamps the pacer bound is computed from).
@@ -46,7 +51,6 @@ Exit 0 pass / 1 fail / 77 skip. Never prints a token.
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -96,23 +100,12 @@ EXPECT = Expectations("grammar assertion")
 expect = EXPECT.expect
 
 
-def advertises(checks: list[dict], grammar: str) -> bool | None:
-    """Does `scan.checks` advertise `grammar`? True / False, or None when the
-    build exposes no `l4_field` check at all (so the question cannot be
-    answered from the catalogue and only `scan.start` can refuse).
-
-    The match is on the `id` / `class` TOKENS (split on `-` and `_`), never on free
-    text: a description that merely mentions "dns" is not an advertised dns grammar."""
-    l4_field = [c for c in checks if "l4_field" in (c.get("kinds") or [])]
-    if not l4_field:
-        return None
-    for c in l4_field:
-        tokens = set()
-        for key in ("id", "class"):
-            tokens.update(re.split(r"[-_]", str(c.get(key) or "").lower()))
-        if grammar in tokens:
-            return True
-    return False
+def lane_landed(checks: list[dict]) -> bool:
+    """Has the stream lane landed at all: at least one `scan.checks` entry with the
+    `l4_field` insertion kind, whatever its id (the three generic checks carry no
+    grammar name; T6 child spec S6.3). Per-grammar support is decided by
+    `scan.start`, never by the catalogue."""
+    return any("l4_field" in (c.get("kinds") or []) for c in checks)
 
 
 def worst_window(messages: list[dict]) -> tuple[int, int]:
@@ -161,8 +154,8 @@ def check_grammar(op: BusClient, vuln: ScanTarget, patched: ScanTarget,
     """Run both halves for one grammar. True when it ran, False when it was
     skipped as not landed."""
     section(f"grammar {grammar} -- speaker {service}")
-    if advertises(checks, grammar) is False:
-        print(f"  [SKIP-PART] {grammar}: no scan.checks `l4_field` check names it", flush=True)
+    if not lane_landed(checks):
+        print(f"  [SKIP-PART] {grammar}: scan.checks has no `l4_field` check (lane not landed)", flush=True)
         return False
 
     vuln.logs.reset()
