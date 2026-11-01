@@ -67,9 +67,11 @@ Exit 0 PASS / 1 FAIL / 77 SKIP.
 `python3 -I tests/e2e/tui/test_tui_scan_live.py --selftest` runs the screen readers
 (cursor row, severity group, editor header, surface tag, inspector, Findings head, the
 Site map node and marker, the wire-confirm overlay, the crawl `browser` line, the strip
-banner), the failure-screen writer and the L4 scope read against frames
-painted with the TUI's real geometry (the boxed Scan view, its pane rule, a sidebar
-offset), with no core and no pty, one line per assertion; exit 0 when all hold.
+banner, the prompt bar and the Fields `origins`/`l4` lines), the failure-screen writer,
+the L4 scope read, the prompt and `browser` key helpers against a scripted terminal
+(H49, H44) and the push-counting thread against a scripted bus client (H46), against
+frames painted with the TUI's real geometry (the boxed Scan view, its pane rule, a
+sidebar offset), with no core and no pty, one line per assertion; exit 0 when all hold.
 """
 from __future__ import annotations
 
@@ -208,6 +210,20 @@ EDITOR_FIELDS = ("name", "origins", "l4_targets", "lane_http", "lane_ws", "lane_
 # editor sets `never` first and asserts the line (H42).
 BROWSER_FIELD_RE = re.compile(r"· browser (auto|always|never) ·")
 BROWSER_RING = ("auto", "always", "never")
+# The Scan prompts' bar (`ui/bars.rs` `prompt`): while `Mode::Prompt` is up the status
+# row (the screen's last) reads ` <label> <typed>` with the label one of `origin:` (o),
+# `l4 target:` (t), `profile name:` (w) or `value:` (e on a text or number field).
+# `submit_retrying` (app.rs) closes the prompt on Ok and keeps it up with the line
+# cleared on a refusal; Enter is processed after the bar has echoed the typed value, so
+# a helper that returned on the echo let the next keys type into the open prompt and
+# an Esc discard the value (H43): every prompt helper waits for the bar to leave AND
+# the value to land on its Fields line (H49), and `e` is checked for a stray `value:`
+# prompt (H44).
+PROMPT_BAR_RE = re.compile(r"^ (origin|l4 target|profile name|value):(?=\s|$)")
+# A held editor's Fields line (`ui/scan/profiles.rs` `fields`): ` <label padded to
+# LABEL_W> <segments>` at the detail pane's first cell, right after the pane rule; the
+# `origins` and `l4` values are `text_of`'s (`none` when empty, else comma-joined).
+FIELD_LINE_RE = r"│ {label} {{2,}}(\S[^│]*?)\s*(?:│|$)"
 # The strip banner's quiet states (`ui/scan/mod.rs` `banner`): `idle`, a refresh in flight,
 # the `already <state>` notice a key left. Anything else on the strip row is the tab's
 # last error wording (D9) or its degraded text (D2), which T7-19 waits for as the other
@@ -529,43 +545,115 @@ class Checks:
         return [f"{state:<5}{n}" for n, state in self.results]
 
 
+JOB_PUSH = "notifications/aitm/job"
+PUSH_SAMPLES = 3
+
+
 class Pushes:
     """The second bus client: holds a flow.subscribe subscription and tallies
-    notifications/aitm/job lines by job and params.event (spec D3 push kind). Only
-    the counts are kept; the client's own stash is cleared after each drain."""
+    notifications/aitm/job lines by job and params.event (spec D3 push kind; the
+    engine fans `{job, kind, event, seq, status, issue?}` out to every connection
+    holding any flow.subscribe, no replay). Its own state is visible (H46): every
+    drained line counted by method, the first PUSH_SAMPLES raw job params kept, the
+    flow.subscribe reply, the lines the client could not parse and the messages the
+    fold rejected (each counted and read past, never fatal), and why the thread
+    stopped: `stop()`, or `<Type>: <text>` when an exception ended `_run` (the socket
+    closed by the core is a `BusError`). The client's own stash is cleared after each
+    drain. The first live run recorded `{}` with none of this, so an empty count could
+    not be told from a dead thread."""
 
-    def __init__(self, client):
+    def __init__(self, client, subscribe_reply=None):
         self.client = client
-        self.counts = {}
+        self.subscribe_reply = subscribe_reply
+        self.counts = {}  # job -> event -> n
+        self.by_method = {}  # method (or `<reply>`) -> lines
+        self.lines = 0
+        self.bad_lines = 0
+        self.bad_messages = 0
+        self.last_error = ""
+        self.samples = []  # the first PUSH_SAMPLES job params, raw (redacted on write)
+        self.stopped_by = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
     def _run(self):
-        while not self._stop.is_set():
-            try:
-                msgs = self.client.drain_notifications(0.5)
-            except (BusError, OSError, ValueError):
-                return
-            for m in msgs:
-                if (m.get("method") or "") != "notifications/aitm/job":
+        try:
+            while not self._stop.is_set():
+                try:
+                    msgs = self.client.drain_notifications(0.5)
+                except ValueError as e:
+                    # One line `_recv` could not parse: the socket is intact and the line
+                    # consumed (the harness's drain loses the batch before it); read on.
+                    self._error("bad_lines", e)
                     continue
-                params = m.get("params") or {}
-                job = str(params.get("job"))
-                event = str(params.get("event"))
-                with self._lock:
-                    per = self.counts.setdefault(job, {})
-                    per[event] = per.get(event, 0) + 1
-            self.client.notifications.clear()
+                for m in msgs:
+                    try:
+                        self._fold(m)
+                    except Exception as e:  # noqa: BLE001  one bad message, never the thread
+                        self._error("bad_messages", e)
+                self.client.notifications.clear()
+        except Exception as e:  # noqa: BLE001  the socket died or the client is gone
+            self._end(f"{type(e).__name__}: {e}")
+            return
+        self._end("stop()")
+
+    def _fold(self, m):
+        if not isinstance(m, dict):
+            raise TypeError(f"message is not an object: {type(m).__name__}")
+        method = m.get("method")
+        key = str(method) if method else ("<reply>" if "id" in m else "<no method>")
+        with self._lock:
+            self.lines += 1
+            self.by_method[key] = self.by_method.get(key, 0) + 1
+        if method != JOB_PUSH:
+            return
+        params = m.get("params")
+        if not isinstance(params, dict):
+            raise TypeError(f"{JOB_PUSH} params are not an object: {type(params).__name__}")
+        job, event = str(params.get("job")), str(params.get("event"))
+        with self._lock:
+            per = self.counts.setdefault(job, {})
+            per[event] = per.get(event, 0) + 1
+            if len(self.samples) < PUSH_SAMPLES:
+                self.samples.append(params)
+
+    def _error(self, counter, e):
+        with self._lock:
+            setattr(self, counter, getattr(self, counter) + 1)
+            self.last_error = f"{type(e).__name__}: {e}"[:300]
+
+    def _end(self, reason):
+        with self._lock:
+            if self.stopped_by is None:
+                self.stopped_by = reason
+
+    def alive(self):
+        """True while the drain thread runs (it stops only on `stop()` or a dead socket)."""
+        return self._thread.is_alive() and self.stopped_by is None
 
     def of(self, job):
         with self._lock:
             return dict(self.counts.get(job, {}))
 
     def snapshot(self):
+        """Everything `push-counts.json` records (H46)."""
         with self._lock:
-            return {j: dict(ev) for j, ev in self.counts.items()}
+            return {"by_job": {j: dict(ev) for j, ev in self.counts.items()},
+                    "by_method": dict(self.by_method), "lines": self.lines,
+                    "bad_lines": self.bad_lines, "bad_messages": self.bad_messages,
+                    "last_error": self.last_error, "stopped_by": self.stopped_by,
+                    "subscribe_reply": self.subscribe_reply,
+                    "first_job_params": list(self.samples)}
+
+    def describe(self):
+        """The state as one failure detail (redacted by the check that prints it)."""
+        s = self.snapshot()
+        return (f"push thread stopped_by: {s['stopped_by'] or 'running'}; {s['lines']} lines by method "
+                f"{s['by_method']}; bad lines {s['bad_lines']}, bad messages {s['bad_messages']}, last "
+                f"error {s['last_error']!r}; flow.subscribe reply {s['subscribe_reply']!r}; first "
+                f"{JOB_PUSH} params {s['first_job_params']}")
 
     def stop(self):
         self._stop.set()
@@ -813,6 +901,31 @@ def browser_value(text):
     return m.group(1) if m else None
 
 
+def prompt_open(text):
+    """The label of the Scan prompt the status row carries (`origin:`, `l4 target:`,
+    `profile name:`, `value:`), or None when no Scan prompt is up (H49, H44). The bar
+    is the screen's last row (`ui/bars.rs` `prompt` draws into the status area)."""
+    m = PROMPT_BAR_RE.match(text.rsplit("\n", 1)[-1])
+    return m.group(1) + ":" if m else None
+
+
+def field_line(text, label):
+    """The held editor's Fields line labelled `label` (`origins`, `l4`, ..): the value
+    text after the padded label, to the next pane rule or the row's end; None without
+    one. The first match top-down is the Fields block's (the Origins pane's own head
+    sits under it)."""
+    m = re.search(FIELD_LINE_RE.format(label=re.escape(label)), text, re.M)
+    return m.group(1) if m else None
+
+
+def prompt_settled(text, landed):
+    """True once no Scan prompt is up and `landed(text)` holds: the one predicate every
+    prompt helper waits on after Enter (H49). A bar still up is a refusal keeping the
+    prompt open or an Enter not yet processed; either way the value is not in the
+    draft and no key may follow."""
+    return prompt_open(text) is None and bool(landed(text))
+
+
 def banner_of(text):
     """The Scan strip row's state banner (`ui/scan/mod.rs` `banner`): the text after
     the last tab label, to the box's right border; None off the view (H39)."""
@@ -899,8 +1012,11 @@ def focus_profiles_list(ctx):
     (EDITOR_HEAD_RE; the no-editor hint is not one, H4, so a plain Profiles visit presses
     nothing). The `>` row is drawn whichever pane is focused, so a List that was already
     focused is told by the strip leaving on that `Esc`, and `:scan` brings the view back
-    on this tab."""
+    on this tab. While a Scan prompt is still up nothing is pressed and the answer is
+    False: after H43 that `Esc` would discard the typed value (H49)."""
     term = ctx.term
+    if prompt_open(term.text()) is not None:
+        return False
     if EDITOR_HEAD_RE.search(term.text()):
         term.press(ESC)
         time.sleep(UI_SETTLE)
@@ -948,29 +1064,58 @@ def ensure_editor(ctx, name, origin):
     return type_origin(ctx, origin)
 
 
-def type_origin(ctx, origin):
-    """`o` (PromptKind::ScanOrigin), the origin, Enter."""
-    ctx.term.press("o")
-    if not ctx.term.wait_for(r"origin:", 8):
-        return False
-    ctx.term.press(origin)
-    time.sleep(UI_SETTLE)
-    ctx.term.press(ENTER)
-    return poll(lambda: origin in ctx.term.text(), 10)
-
-
-def set_browser_never(ctx):
-    """The held editor's crawl `use_browser` set to `never` with `e` (H42). The Fields
-    pane is focused by construction, not read (focus is a style): one `Esc` to the List
-    pane (`focus_profiles_list`, draft kept), then one Tab (`step_pane`: List, Fields,
-    Origins, Checks); `g` puts the field cursor on the first field and `j` walks it to
-    `use_browser` (EDITOR_FIELDS, counted, since the cursor is a highlight); then `e`
-    round the ring until the crawl line reads `browser never`, each press checked to
-    have moved the value (an `e` on another field moves nothing and stops the loop).
-    Returns what the line reads afterwards, or None without a crawl line."""
+def submit_prompt(ctx, key, label, value, landed, timeout):
+    """Press `key`, wait for the `label` prompt bar, type `value`, Enter, and return
+    True only once the prompt CLOSED and `landed(text)` holds (`prompt_settled`, H49).
+    False when a Scan prompt was already up, the bar never came, or it is still up
+    after `timeout` (a refused value keeps it open, `submit_retrying`): then nothing
+    more is pressed here, since a key would type into the prompt and an Esc would
+    discard the value (H43); the caller's check fails with the screen."""
     term = ctx.term
+    if prompt_open(term.text()) is not None:
+        return False
+    term.press(key)
+    if not poll(lambda: prompt_open(term.text()) == label, 8, 0.1):
+        return False
+    term.press(value)
+    time.sleep(UI_SETTLE)
+    term.press(ENTER)
+    return poll(lambda: prompt_settled(term.text(), landed), timeout, 0.1)
+
+
+def type_origin(ctx, origin, timeout=10):
+    """`o` (PromptKind::ScanOrigin), the origin, Enter; True once the prompt closed and
+    the origin is on the Fields `origins` line (H49)."""
+    return submit_prompt(ctx, "o", "origin:", origin,
+                         lambda t: origin in (field_line(t, "origins") or ""), timeout)
+
+
+def type_l4_target(ctx, spec, timeout=10):
+    """`t` (PromptKind::ScanL4Target), `ip:port[/tcp|udp]`, Enter; True once the prompt
+    closed and the target's `ip:port` is on the Fields `l4` line (H49)."""
+    return submit_prompt(ctx, "t", "l4 target:", spec,
+                         lambda t: spec.split("/")[0] in (field_line(t, "l4") or ""), timeout)
+
+
+def set_browser_never(ctx, step, what="the editor"):
+    """The held editor's crawl `use_browser` set to `never` with `e` (H42), recorded as
+    the check `<step>: <what>'s crawl `browser` field reads `never` before the launch
+    (H42)`; the answer is whether it passed. The Fields pane is focused by construction,
+    not read (focus is a style): one `Esc` to the List pane (`focus_profiles_list`,
+    draft kept; nothing while a prompt is up, H49), then one Tab (`step_pane`: List,
+    Fields, Origins, Checks); `g` puts the field cursor on the first field and `j`
+    walks it to `use_browser` (EDITOR_FIELDS, counted, since the cursor is a
+    highlight); then `e` round the ring until the crawl line reads `browser never`,
+    each press checked to have moved the value. An `e` that opens a prompt instead
+    (`value:`: the cursor was on a text or number field, not `use_browser`) is
+    answered by one Esc and no more keys; the check fails naming the prompt and the
+    prompt screen is kept as `screen-<step>-stray-prompt.txt` (H44; the second live run
+    typed `s` into that prompt)."""
+    c, term = ctx.c, ctx.term
+    name = f"{step}: {what}'s crawl `browser` field reads `never` before the launch (H42)"
     if not focus_profiles_list(ctx):
-        return None
+        return c.check(name, False, f"the Profiles List pane never took focus (prompt up: "
+                                    f"{prompt_open(term.text())!r}); {ctx.screen(step.lower())}")
     term.press("\t")
     time.sleep(UI_SETTLE)
     term.press("g")
@@ -982,20 +1127,21 @@ def set_browser_never(ctx):
         if was is None or was == "never":
             break
         term.press("e")
-        if not poll(lambda: browser_value(term.text()) not in (None, was), 5, 0.1):
+        poll(lambda: browser_value(term.text()) not in (None, was) or prompt_open(term.text()) is not None,
+             5, 0.1)
+        label = prompt_open(term.text())
+        if label is not None:
+            stray = ctx.snap(f"{step.lower()}-stray-prompt")
+            bar = stray.rsplit("\n", 1)[-1].strip()
+            kept = ctx.ev.write(f"screen-{step}-stray-prompt.txt", stray)
+            term.press(ESC)
+            return c.check(name, False, f"`e` opened the `{label}` prompt (bar {bar!r}): the Fields "
+                                        f"cursor was not on `use_browser` (H44); Esc pressed, no more "
+                                        f"keys; the prompt screen is {kept}")
+        if browser_value(term.text()) in (None, was):
             break
-    return browser_value(term.text())
-
-
-def type_l4_target(ctx, spec):
-    """`t` (PromptKind::ScanL4Target), `ip:port[/tcp|udp]`, Enter."""
-    ctx.term.press("t")
-    if not ctx.term.wait_for(r"l4 target:", 8):
-        return False
-    ctx.term.press(spec)
-    time.sleep(UI_SETTLE)
-    ctx.term.press(ENTER)
-    return poll(lambda: spec.split("/")[0] in ctx.term.text(), 10)
+    value = browser_value(term.text())
+    return c.check(name, value == "never", f"the crawl line reads browser {value!r}; {ctx.screen(step.lower())}")
 
 
 def launch(ctx, key, timeout=JOB_APPEAR_S):
@@ -1067,8 +1213,7 @@ def step_t7_16(ctx):
                 ctx.screen("t7-16"))
     c.check("T7-16: `o` accepted the target origin into the editor", type_origin(ctx, ctx.origin),
             ctx.screen("t7-16"))
-    c.check("T7-16: the editor's crawl `browser` field reads `never` before the launch (H42)",
-            set_browser_never(ctx) == "never", ctx.screen("t7-16"))
+    set_browser_never(ctx, "T7-16")
 
     job = launch(ctx, "s")
     if not job:
@@ -1143,8 +1288,7 @@ def step_t7_16(ctx):
             c.check("T7-16: the held `standard` editor was available for the fresh job", False,
                     ctx.screen("t7-16"))
             return
-        c.check("T7-16: the fresh job's editor reads `browser never` (H42)",
-                set_browser_never(ctx) == "never", ctx.screen("t7-16"))
+        set_browser_never(ctx, "T7-16", "the fresh job's editor")
         fresh = launch(ctx, "s")
         if not fresh:
             c.check("T7-16: `s` started the fresh job for the cancel (scan.list gained an id)", False,
@@ -1165,9 +1309,15 @@ def step_t7_16(ctx):
     c.check(f"T7-16: scan.status agrees {cancel_job} is `cancelled`", final.get("state") == "cancelled",
             final.get("state"))
 
+    # The push counts, with the second client's own state in the failure detail: what it
+    # drained by method, why its thread stopped (if it did), what flow.subscribe answered
+    # and the first job lines it saw (H46); its socket must still be alive here.
     counts = ctx.pushes.of(cancel_job)
     c.check(f"T7-16: the second bus client saw a `progress` and a `cancelled` line for {cancel_job}",
-            counts.get("progress", 0) >= 1 and counts.get("cancelled", 0) >= 1, counts)
+            counts.get("progress", 0) >= 1 and counts.get("cancelled", 0) >= 1,
+            f"counts for {cancel_job} {counts}; {ctx.pushes.describe()}")
+    c.check("T7-16: the second bus client's subscription socket is still alive (its drain thread "
+            "runs; it stops only on `stop()` or a dead socket)", ctx.pushes.alive(), ctx.pushes.describe())
 
 
 def pick_issue(ctx, job, found):
@@ -1205,8 +1355,7 @@ def step_t7_17(ctx):
         c.check("T7-17: the `standard` editor with the target origin was available", False,
                 ctx.screen("t7-17"))
         return
-    c.check("T7-17: the editor's crawl `browser` field reads `never` before the launch (H42)",
-            set_browser_never(ctx) == "never", ctx.screen("t7-17"))
+    set_browser_never(ctx, "T7-17")
     job = launch(ctx, "s")
     if not job:
         c.check("T7-17: the second `s` started a job", False, ctx.screen("t7-17"))
@@ -1584,8 +1733,7 @@ def step_t7_19(ctx):
     if not type_origin(ctx, ctx.origin):
         c.check("T7-19: `o` never accepted the origin for the map job", False, ctx.screen("t7-19"))
         return
-    c.check("T7-19: the editor's crawl `browser` field reads `never` before the launch (H42)",
-            set_browser_never(ctx) == "never", ctx.screen("t7-19"))
+    set_browser_never(ctx, "T7-19")
     job = launch(ctx, "m")
     if not job:
         c.check("T7-19: `m` started no map job", False, ctx.screen("t7-19"))
@@ -1795,12 +1943,14 @@ def run(tui, ev, marker, cookie_secret, auth_secret):
         subscribed = ""
         if "flow.subscribe" in names:
             try:
-                push_client.call("flow.subscribe", {})
+                reply = push_client.call("flow.subscribe", {})
             except (ToolError, BusError) as e:
                 subscribed = str(e)
+                reply = f"{type(e).__name__}: {e}"
         else:
-            subscribed = "this bus has no flow.subscribe"
-        pushes = Pushes(push_client)
+            subscribed = reply = "this bus has no flow.subscribe"
+        # The reply goes into push-counts.json beside the counts (H46).
+        pushes = Pushes(push_client, reply)
 
         u = urllib.parse.urlsplit(target)
         target_port = u.port or (443 if u.scheme == "https" else 80)
@@ -1837,6 +1987,9 @@ def run(tui, ev, marker, cookie_secret, auth_secret):
 
         scenario(ctx)
 
+        # The drain thread is stopped first so the file carries its exit reason:
+        # `stop()` here, or the exception that ended it earlier (H46).
+        pushes.stop()
         ev.write_json("push-counts.json", pushes.snapshot())
         failed = c.failed()
         n_ok, n_noted, n_failed = c.tally()
@@ -1962,10 +2115,14 @@ def scan_box(f, tab, offset=0, banner="idle"):
     return ix, body_y, left, rule_x, rule_x + 1, iw - left - 1, body_h
 
 
-def profiles_frame(editor, offset=0, browser="auto"):
+ORIGIN = "http://127.0.0.1:8080"
+
+
+def profiles_frame(editor, offset=0, browser="auto", origins=ORIGIN, l4="none"):
     """Profiles (ui/scan/profiles.rs): the column header, three rows with `standard`
     under the cursor, and on the detail side either the no-editor hint over the D7
     gate text and the key footer, or the held editor's header and Fields block (its
+    `origins` and `l4` rows as `text_of` writes them, `none` when empty, H49; its
     `crawl` row carrying `browser` as `field_lines` writes it, H42)."""
     f = Frame()
     chrome(f)
@@ -1981,8 +2138,8 @@ def profiles_frame(editor, offset=0, browser="auto"):
     if editor:
         f.put(dx, y, " profile standard (builtin)")
         f.put(dx + dw - 6, y, "dirty")
-        f.put(dx, y + 1, f" {'origins':<9} http://127.0.0.1:8080")
-        f.put(dx, y + 2, f" {'l4':<9} -")
+        f.put(dx, y + 1, f" {'origins':<9} {origins}")
+        f.put(dx, y + 2, f" {'l4':<9} {l4}")
         f.put(dx, y + 3, f" {'lanes':<9} [x] http  [x] ws  [ ] l4_packet  [ ] l4_stream")
         f.put(dx, y + 4, f" {'intensity':<9} balanced   speed normal   accuracy balanced")
         f.put(dx, y + 5, f" {'checks':<9} all (12)")
@@ -2148,7 +2305,7 @@ def findings_frame():
     severity before the title, the detail head puts the title before the severity."""
     f = Frame()
     chrome(f)
-    ix, iy, iw, ih = box(f, 0, BODY_Y, COLS, BODY_H, "Findings \u2014 PoCs and runs")
+    ix, iy, iw, ih = box(f, 0, BODY_Y, COLS, BODY_H, FINDINGS_TITLE)
     list_w = iw * 45 // 100
     for yy in range(iy, iy + ih):
         f.put(ix + list_w - 1, yy, "│")
@@ -2159,6 +2316,116 @@ def findings_frame():
     f.put(dx, iy, f" {ISSUE_NAME}  high")
     f.put(dx, iy + 1, f" poc     {POC_PATH}")
     return f.text()
+
+
+# The Findings overlay's box title (`ui/overlays.rs` `findings`; the middle dot is the
+# TUI's separator everywhere, H40); the live `P` poll matches its tail (H41).
+FINDINGS_TITLE = "Findings · PoCs and runs"
+
+# The Scan prompts' right-hand hints (`ui/bars.rs` `prompt`), by label.
+PROMPT_HINTS = {"origin:": "scheme://host[:port] · ⏎ add", "value:": "⏎ set · Esc",
+                "profile name:": "a-z 0-9 . _ - lowercase · ⏎ save as",
+                "l4 target:": "ip:port[/tcp|udp][ grammar] · ⏎ add"}
+
+
+def prompt_over(body_text, label, typed):
+    """The prompt bar (`ui/bars.rs` `prompt`) over `body_text`: the status row reads
+    ` <label> <typed>` then the cursor cell, the hint right-aligned (`put_sides`). After
+    H43 the body under it is the view the prompt was opened from, so over the held
+    editor the Fields lines stay on screen while the bar is up (H49)."""
+    f = Frame.from_text(body_text)
+    f.blank(0, ROWS - 1, COLS, 1)
+    f.put(0, ROWS - 1, f" {label} {typed} ")
+    hint = PROMPT_HINTS[label] + " "
+    f.put(COLS - len(hint), ROWS - 1, hint)
+    return f.text()
+
+
+class ScriptedTerm:
+    """A `Terminal` stand-in for the key helpers (no pty): `text()` is the held
+    `standard` editor's frame with whatever prompt is up painted over it, `press`
+    records every key and moves the state the way `app.rs` does. `o` opens the
+    `origin:` prompt and `t` the `l4 target:` one; typed keys go into an open prompt;
+    Enter closes it and lands the value on its Fields line only after `lag` further
+    `text()` reads (the TUI processes Enter after the bar echoed the typed value, the
+    live H49 failure) unless `refuse` (`submit_retrying` keeps the bar up with the line
+    cleared); Esc closes it and drops the value (H43). `e` cycles the crawl `browser`
+    ring when `on_field`, else opens the `value:` prompt prefilled with the name (the
+    Fields cursor on `name`, the live H44 failure)."""
+
+    def __init__(self, on_field=True, refuse=False, lag=2):
+        self.keys = []
+        self.on_field, self.refuse, self.lag = on_field, refuse, lag
+        self.origins, self.l4, self.browser = "none", "none", "auto"
+        self.prompt = None  # (label, typed)
+        self._pending = None  # (label, typed, reads left) after Enter
+
+    def _frame(self):
+        return profiles_frame(editor=True, browser=self.browser, origins=self.origins, l4=self.l4)
+
+    def text(self):
+        if self._pending is not None:
+            label, typed, left = self._pending
+            if left > 0:
+                self._pending = (label, typed, left - 1)
+            else:
+                self._pending, self.prompt = None, None
+                if label == "origin:":
+                    self.origins = typed
+                elif label == "l4 target:":
+                    self.l4 = typed
+        if self.prompt is None:
+            return self._frame()
+        return prompt_over(self._frame(), *self.prompt)
+
+    def wait_for(self, pattern, timeout):
+        return poll(lambda: re.search(pattern, self.text()) is not None, timeout, 0.05)
+
+    def press(self, keys):
+        self.keys.append(keys)
+        if self.prompt is not None:
+            label, typed = self.prompt
+            if keys == ESC:
+                self.prompt = None
+            elif keys == ENTER:
+                if self.refuse:
+                    self.prompt = (label, "")
+                else:
+                    self._pending = (label, typed, self.lag)
+            else:
+                self.prompt = (label, typed + keys)
+            return
+        if keys == "o":
+            self.prompt = ("origin:", "")
+        elif keys == "t":
+            self.prompt = ("l4 target:", "")
+        elif keys == "e":
+            if self.on_field:
+                self.browser = BROWSER_RING[(BROWSER_RING.index(self.browser) + 1) % len(BROWSER_RING)]
+            else:
+                self.prompt = ("value:", "standard")
+
+
+class ScriptedPushClient:
+    """A bus client stand-in for `Pushes`: each `drain_notifications` call returns the
+    next scripted batch, or raises the scripted exception (a `ValueError` is one line
+    `_recv` could not parse, a `BusError` the socket closed by the core); the script
+    exhausted, it returns nothing, like a quiet socket."""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.notifications = []
+        self.drains = 0
+
+    def drain_notifications(self, _timeout):
+        self.drains += 1
+        if not self.script:
+            return []
+        item = self.script.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        self.notifications.extend(item)
+        return item
 
 
 def selftest():
@@ -2339,6 +2606,133 @@ def selftest():
             and banner_is_error(banner_of(erred)) and banner_of(erred).startswith("scan.sitemap: ")
             and banner_of(insp) is None,
             f"{banner_of(sitemap)!r} {banner_of(noticed)!r} {banner_of(erred)!r}")
+
+    # Cell items from the second live smoke run: H41, H44, H46, H49.
+    c.check("selftest: Findings: the box title is `Findings · PoCs and runs` (H40) and the live "
+            "`P` poll's `PoCs and runs` still matches it (H41)",
+            FINDINGS_TITLE in findings and "PoCs and runs" in findings and "\u2014" not in findings
+            and surface_of(findings) == "other", row_of(findings, "PoCs"))
+
+    origin_up = prompt_over(held, "origin:", ORIGIN)
+    value_up = prompt_over(held, "value:", "standard")
+    empty_up = prompt_over(held, "l4 target:", "")
+    c.check("selftest: prompt bar: the Scan prompt's label is read off the status row while it is "
+            "up (`origin:` with a value, `value:`, an empty `l4 target:`), None once it closed, "
+            "and the view under it stays `scan` (H43, H49, H44)",
+            prompt_open(origin_up) == "origin:" and prompt_open(value_up) == "value:"
+            and prompt_open(empty_up) == "l4 target:" and prompt_open(held) is None
+            and prompt_open(plain) is None and surface_of(origin_up) == "scan",
+            f"{prompt_open(origin_up)!r} {prompt_open(value_up)!r} {prompt_open(empty_up)!r} "
+            f"{prompt_open(held)!r}")
+    pending = prompt_over(profiles_frame(editor=True, origins="none"), "origin:", ORIGIN)
+    with_l4 = profiles_frame(editor=True, l4="127.0.0.1:8080/tcp")
+    on_origins = lambda t: ORIGIN in (field_line(t, "origins") or "")  # noqa: E731
+    c.check("selftest: Fields: the `origins` and `l4` lines are read by label (`none` when empty); "
+            "a frame with the origin on the prompt bar and the bar still up is NOT closed although "
+            "the origin is on screen (the H49 regression), nor is one with the origin on the "
+            "`origins` line under a bar still up; the held frame is",
+            field_line(held, "origins") == ORIGIN and field_line(held, "l4") == "none"
+            and field_line(with_l4, "l4") == "127.0.0.1:8080/tcp" and field_line(plain, "origins") is None
+            and ORIGIN in pending and not prompt_settled(pending, on_origins)
+            and on_origins(origin_up) and not prompt_settled(origin_up, on_origins)
+            and prompt_settled(held, on_origins),
+            f"origins {field_line(held, 'origins')!r} l4 {field_line(held, 'l4')!r} "
+            f"pending {field_line(pending, 'origins')!r} bar up {prompt_open(origin_up)!r}")
+
+    script_dir = tempfile.mkdtemp(prefix="aitm-tui-scan-selftest-")
+    try:
+        s_ev = Evidence([secret], directory=script_dir)
+        s_out = io.StringIO()
+
+        def scripted(**kw):
+            term = ScriptedTerm(**kw)
+            checks = Checks(s_ev.redact, screen=term.text, write=s_ev.write, out=s_out)
+            return term, checks, Ctx(checks, term, None, None, s_ev, 0, "", ORIGIN, 8080, set())
+
+        lagged, _, lag_ctx = scripted(lag=3)
+        typed_ok = type_origin(lag_ctx, ORIGIN, timeout=3)
+        c.check("selftest: type_origin returns only once the prompt bar left and the origin is on the "
+                "`origins` line: True on a TUI that processes Enter late, no key after Enter (H49)",
+                typed_ok is True and lagged.prompt is None and lagged.origins == ORIGIN
+                and lagged.keys[-1] == ENTER and lagged.keys[0] == "o",
+                f"{typed_ok} keys {lagged.keys!r} origins {lagged.origins!r}")
+        refused, _, ref_ctx = scripted(refuse=True)
+        typed_no = type_origin(ref_ctx, ORIGIN, timeout=0.6)
+        c.check("selftest: type_origin is False while the bar stays up (a refused value, "
+                "`submit_retrying`) and presses nothing more: no Esc into the open prompt (H49, H43)",
+                typed_no is False and refused.prompt == ("origin:", "") and refused.keys[-1] == ENTER,
+                f"{typed_no} keys {refused.keys!r} prompt {refused.prompt!r}")
+        l4term, _, l4_ctx = scripted(lag=1)
+        l4_ok = type_l4_target(l4_ctx, "127.0.0.1:8080/tcp", timeout=3)
+        c.check("selftest: type_l4_target waits the same way: the target on the `l4` line, the bar gone (H49)",
+                l4_ok is True and l4term.l4 == "127.0.0.1:8080/tcp" and l4term.prompt is None,
+                f"{l4_ok} l4 {l4term.l4!r} keys {l4term.keys!r}")
+        stuck, _, stuck_ctx = scripted(refuse=True)
+        stuck.press("o")
+        c.check("selftest: focus_profiles_list presses nothing while a Scan prompt is up (an Esc "
+                "would discard the typed value after H43) and returns False (H49)",
+                focus_profiles_list(stuck_ctx) is False and stuck.keys == ["o"],
+                f"keys {stuck.keys!r}")
+
+        stray, stray_checks, stray_ctx = scripted(on_field=False)
+        stray_ok = set_browser_never(stray_ctx, "T7-16")
+        after_e = stray.keys[stray.keys.index("e") + 1:] if "e" in stray.keys else None
+        stray_files = sorted(n for n in os.listdir(script_dir) if "stray-prompt" in n)
+        c.check("selftest: set_browser_never: an `e` that opens the `value:` prompt gets one Esc and "
+                "nothing more, the H42 check FAILS naming the prompt, and the prompt screen is kept "
+                "as `screen-T7-16-stray-prompt.txt` (H44)",
+                stray_ok is False and stray.keys.count("e") == 1 and after_e == [ESC]
+                and stray.prompt is None and len(stray_checks.failed()) == 1
+                and "`value:` prompt" in s_out.getvalue() and stray_files == ["screen-T7-16-stray-prompt.txt"],
+                f"{stray_ok} keys {stray.keys!r} files {stray_files} printed {s_out.getvalue()[-300:]!r}")
+        walked, walk_checks, walk_ctx = scripted(on_field=True)
+        walk_ok = set_browser_never(walk_ctx, "T7-17")
+        c.check("selftest: set_browser_never: on the `use_browser` field two `e` presses walk the ring "
+                "auto, always, never and the H42 check passes (H42, H44)",
+                walk_ok is True and walked.browser == "never" and walked.keys.count("e") == 2
+                and walk_checks.tally() == (1, 0, 0)
+                and walked.keys[:3] == [ESC, "\t", "g"] and walked.keys[3] == "j" * EDITOR_FIELDS.index("use_browser"),
+                f"{walk_ok} browser {walked.browser!r} keys {walked.keys!r}")
+    finally:
+        shutil.rmtree(script_dir, ignore_errors=True)
+
+    def job_line(job, event, **extra):
+        params = {"job": job, "kind": "scan", "event": event, "seq": 1, "status": {"state": "running"}}
+        params.update(extra)
+        return {"jsonrpc": "2.0", "method": "notifications/aitm/job", "params": params}
+
+    dead = ScriptedPushClient([
+        [job_line("scan-00000001", "progress"), {"jsonrpc": "2.0", "method": "notifications/aitm/flow"},
+         "not an object", {"jsonrpc": "2.0", "id": 7, "result": {}}],
+        ValueError("Expecting value: line 1 column 1 (char 0)"),
+        [job_line("scan-00000001", "cancelled", issue={"name": "x"}), job_line("scan-00000002", "progress"),
+         job_line("scan-00000002", "progress")],
+        BusError("bus connection closed by the core"),
+    ])
+    dead_pushes = Pushes(dead, {"subscribed": True})
+    dead_pushes._thread.join(5)
+    snap = dead_pushes.snapshot()
+    c.check("selftest: Pushes: a bad line and a bad message are counted and read past; the "
+            "dead socket ends the thread with `stopped_by: BusError: ..`; counts, by_method, the "
+            "subscribe reply and the first three job params are in the snapshot (H46)",
+            not dead_pushes.alive() and (snap["stopped_by"] or "").startswith("BusError: bus connection closed")
+            and dead_pushes.of("scan-00000001") == {"progress": 1, "cancelled": 1}
+            and dead_pushes.of("scan-00000002") == {"progress": 2}
+            and snap["by_method"] == {"notifications/aitm/job": 4, "notifications/aitm/flow": 1, "<reply>": 1}
+            and snap["lines"] == 6 and snap["bad_lines"] == 1 and snap["bad_messages"] == 1
+            and snap["subscribe_reply"] == {"subscribed": True}
+            and [p["job"] for p in snap["first_job_params"]] == ["scan-00000001", "scan-00000001", "scan-00000002"]
+            and dead.drains == 4 and "stopped_by: BusError" in dead_pushes.describe()
+            and "'<reply>': 1" in dead_pushes.describe(),
+            json.dumps(snap, default=str)[:600])
+    quiet_pushes = Pushes(ScriptedPushClient([]), "this bus has no flow.subscribe")
+    was_alive = poll(lambda: quiet_pushes.alive(), 1, 0.05)
+    quiet_pushes.stop()
+    c.check("selftest: Pushes: a quiet socket keeps the thread alive; `stop()` ends it with "
+            "`stopped_by: stop()` and nothing counted (H46)",
+            was_alive and not quiet_pushes.alive() and quiet_pushes.snapshot()["stopped_by"] == "stop()"
+            and quiet_pushes.snapshot()["by_method"] == {} and quiet_pushes.snapshot()["lines"] == 0,
+            json.dumps(quiet_pushes.snapshot(), default=str))
 
     n_ok, n_noted, n_failed = c.tally()
     print(f"{'PASS' if not n_failed else 'FAIL'}: selftest {n_ok} ok, {n_failed} failed", flush=True)
