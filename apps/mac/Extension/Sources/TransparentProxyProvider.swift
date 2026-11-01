@@ -68,6 +68,11 @@ final class TransparentProxyProvider: NETransparentProxyProvider, NEAppProxyUDPF
                     // Already reported by `logRuleEvent(.applyFailed)`. Mirror `stopProxy`
                     // (we are on `rulesQueue`): stop the reconciler first so the detach
                     // that `handoff.stop()` fires reconciles nothing, then stop the link.
+                    // On the ECANCELED arm (`stopProxy` ran first; `reconciler.stop()` is
+                    // answering us from inside itself, nothing was reported) this stops
+                    // both a second time, harmlessly: `RuleReconciler.stop()` is
+                    // re-entrant and `FlowHandoff.stop()` / `CoreLink.stop()` are
+                    // idempotent.
                     self.reconciler.stop()
                     self.handoff.stop()
                 }

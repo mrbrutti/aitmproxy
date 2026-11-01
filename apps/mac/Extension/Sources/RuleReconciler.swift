@@ -64,8 +64,11 @@ final class RuleReconciler {
     /// `startProxy` called twice): with a set installed the session is live, so the
     /// completion is answered with nil at once and the installed set stays; with the
     /// startup apply still in flight it waits for that same result; with a reconcile
-    /// apply in flight and nothing installed (a failed startup without `stop()`) it
-    /// waits for a fresh startup apply that follows that reconcile, whatever its result.
+    /// apply in flight and nothing installed (a failed startup without `stop()`) it is
+    /// parked: if that reconcile lands a set, the parked completion is answered `nil`
+    /// then (the session is live); if it fails, a fresh `.tcpOnly` startup apply follows
+    /// and answers with its own result (vectors F, H, I of
+    /// `ruleReconcilerStartupAndStop`).
     func begin(completion: @escaping (Error?) -> Void) {
         stopped = false
         if installed != nil {
@@ -97,6 +100,12 @@ final class RuleReconciler {
         pending = .tcpOnly
         inFlight = false
         generation &+= 1
+        // Answer LAST, with the parked list already cleared inside `answerStartup`: the
+        // provider's startup completion calls `stop()` back synchronously on this path
+        // (its error branch mirrors `stopProxy`), so `stop()` is re-entered here. The
+        // nested call is harmless -- every field above is already in its stopped state,
+        // its extra `generation` bump keeps the same flight stale, and it finds nothing
+        // parked -- so the completion runs exactly once (vector J).
         answerStartup(with: NSError(domain: NSPOSIXErrorDomain, code: Int(ECANCELED)))
     }
 
@@ -386,6 +395,10 @@ extension HandoffSelfCheck {
     ///  I. (Tester, round 2) a reconcile apply that lands SUCCESSFULLY while a second
     ///     `begin` is parked (failed startup, no `stop()`) answers it nil at that moment;
     ///     no fresh startup apply follows (spec C, round-2 amendment).
+    ///  J. (fix R2-3) a parked startup completion that calls `stop()` back from INSIDE
+    ///     the `stop()` answering it (the provider's error branch on the ECANCELED arm)
+    ///     runs exactly once; the nested `stop()` finds nothing parked and nothing
+    ///     further is applied, installed or reported; a later `begin` starts over.
     static func ruleReconcilerStartupAndStop(_ r: Recorder) {
         let fake = FakeApply(r)
         let reconciler = fake.makeReconciler()
@@ -667,6 +680,54 @@ extension HandoffSelfCheck {
         reconciler.reconcile(for: m1)
         r.check("\(g): I a Scope push with the same set applies nothing", fake.applied.count == 18, fake.trail())
         r.check("\(g): I every apply parked exactly one completion",
+              fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
+
+        // J. (fix R2-3) The provider's startup completion re-enters `stop()`: its error
+        //    branch mirrors `stopProxy` (`reconciler.stop()`, then `handoff.stop()`) and
+        //    runs on the ECANCELED arm too, i.e. synchronously INSIDE the `stop()` that
+        //    is answering it. `stop()` answers LAST, with the parked list already
+        //    cleared, so the nested call finds nothing to answer: the completion runs
+        //    exactly once with ECANCELED, nothing further is applied, installed or
+        //    reported, the stale flight stays inert, and a later `begin` starts over.
+        reconciler.stop()
+        var startupJ: [Error?] = []
+        var nestedStops = 0
+        reconciler.begin { error in
+            startupJ.append(error)
+            if error != nil {   // what TransparentProxyProvider.startProxy's error branch does
+                nestedStops += 1
+                reconciler.stop()
+            }
+        }
+        r.check("\(g): J begin applies (.tcpOnly, false)", fake.lastApply(18, tcpOnly, false), fake.trail())
+        r.check("\(g): J the startup is parked until its apply lands", startupJ.isEmpty && nestedStops == 0,
+              "\(startupJ.count) answers, \(nestedStops) nested stops")
+        let eventsBeforeJ = fake.events.count
+        reconciler.stop()
+        r.check("\(g): J the completion re-entered stop() exactly once", nestedStops == 1, "\(nestedStops)")
+        r.check("\(g): J the parked startup is answered exactly once with NSPOSIXErrorDomain/ECANCELED despite the nested stop()",
+              FakeApply.answeredOnceWithCancellation(startupJ), "\(startupJ.map { String(describing: $0) })")
+        r.check("\(g): J nothing further applied", fake.applied.count == 19, fake.trail())
+        r.check("\(g): J nothing installed", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("\(g): J nothing reported", fake.events.count == eventsBeforeJ, "\(fake.events.count) vs \(eventsBeforeJ)")
+        fake.complete(18, nil, "\(g): J stale")
+        r.check("\(g): J the stale startup completion answers nothing again",
+              startupJ.count == 1 && nestedStops == 1, "\(startupJ.count) answers, \(nestedStops) nested stops")
+        r.check("\(g): J the stale completion installs nothing", reconciler.installed == nil,
+              "\(String(describing: reconciler.installed?.summary))")
+        r.check("\(g): J the stale completion reports nothing", fake.events.count == eventsBeforeJ,
+              "\(fake.events.count) vs \(eventsBeforeJ)")
+        var startupJ2: [Error?] = []
+        reconciler.begin { startupJ2.append($0) }
+        r.check("\(g): J a begin after the nested stop starts over with (.tcpOnly, false)",
+              fake.lastApply(19, tcpOnly, false), fake.trail())
+        fake.complete(19, nil, "\(g): J")
+        r.check("\(g): J that begin is answered once with nil",
+              startupJ2.count == 1 && startupJ2[0] == nil, "\(startupJ2.map { String(describing: $0) })")
+        r.check("\(g): J installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("\(g): J the cancelled startup is not answered by the new flight", startupJ.count == 1, "\(startupJ.count)")
+        r.check("\(g): J every apply parked exactly one completion",
               fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
     }
 }
