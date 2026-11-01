@@ -102,11 +102,11 @@ public struct CATrustFacts: Hashable, Sendable {
 `CAStatus` (`AitmproxyKit/Panels/CAStatus.swift`) gains `trustedScope: String?` (the first
 store whose `trusted == "yes"`, user before system) and `trustReported: Bool` (any store says
 `yes` or `no`). `ConnectionAction` gains `.trustCA` / `.openCAPanel` and `GettingStartedStep.Kind`
-gains `.caTrusted` **if the orchestrator grants the additive exception on
-`ConnectionSummary.swift`**; otherwise the same names live on a `CATrustAction` enum in
-`CATrustFacts.swift` and the step is a `CATrustStep` struct, both to be folded in by
-mac-attribution. `ConnectionSummary.make` is not touched either way; the Status view inserts
-the CA step after `.busConnected` itself.
+gains `.caTrusted` (the orchestrator granted this additive exception on
+`ConnectionSummary.swift` on 2026-11-01: exactly the three cases and the two title lines,
+nothing else; mac-attribution rebases onto it). `ConnectionSummary.make` is not touched; the
+Status view inserts the CA step after `.busConnected` itself. PR D order: removal-mac PR →
+this PR → mac-attribution → system-proxy PR 4.
 
 **App.** `Session.caStatus: CAStatus?`, `Session.caTrustInstalling`, `Session.caTrust:
 CATrustFacts?` (facts with `installing`/`needsAdmin` applied). `Session+CATrust.swift` is the
