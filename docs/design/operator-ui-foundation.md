@@ -398,6 +398,7 @@ The shared feature set every surface implements. **Source**: m = mitmproxy, P = 
 | `poc.build` | `{flow_id, name, param}` → PoC YAML path | Build PoC from flow |
 | `poc.run` | `{poc_path, target, vars?}` → `{passed, finding_capture: FlowId, poc_path, screenshot_path, evaluated: [{assertion, matched}]}` | Findings panel; `finding_capture` opens in the inspector |
 | `ca.status/export/install/uninstall` | per schema; install/uninstall have `confirm_prompt` and the MCP gate `ca.allow_agent_install` | CA panel / setup |
+| `capture.status` | `{}` → `{enabled, feeder: {state: off\|listening\|bind_failed, reason?}, provider: {state: detached\|attached, attached_at?, team_id?}, scope_entries, scope_tokens: [String], flows_handed_off: {tcp, udp}, last_handoff_at?, capability, capability_reason?}`; times are epoch ms | Settings ▸ Capture status and the Core/Bus/NE status UI (read-only; the on-switch stays `macos_capture.enabled` in the config file; `proxy.status.capturing` is the record toggle, not this) |
 
 ### 4.4 Live flow list — polling today, subscription after F4
 
