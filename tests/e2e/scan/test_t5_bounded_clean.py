@@ -123,7 +123,11 @@ def main() -> int:
         profile = {
             "lanes": ["l4_packet"],
             "target": {"origins": [], "l4": [{"ip": ip, "port": port, "proto": proto}]},
-            "l4": {"cases": CASES, "liveness_every": LIVENESS_EVERY},
+            # One insertion point: with the default IPv4/UDP field table the lane
+            # fuzzes 14 points (one baseline each, ceil(100/14) cases per point,
+            # header points that cannot be sent counted as unsendable), so the
+            # frame count below holds only for a single `raw` point (T5, 2026-11-01).
+            "l4": {"cases": CASES, "liveness_every": LIVENESS_EVERY, "fields": ["raw"]},
         }
         started = start_job(op, "operator", profile=profile, confirm=True)
         note("scan.start", started)
