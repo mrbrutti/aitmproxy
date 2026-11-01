@@ -5,11 +5,11 @@ import Testing
 /// The bodies `BodyFormatTests` formats, one per format the picker lists, and a generator for
 /// multi-megabyte JSON. Every message is a `200 OK` with its content type and length.
 private enum BodyFormatInputs {
-    static func response(_ type: String, _ body: String, extra: [HTTPMessage.Header] = []) -> HTTPMessage {
+    static func response(_ type: String, _ body: String) -> HTTPMessage {
         let data = Data(body.utf8)
         return HTTPMessage(
             startLine: "HTTP/2 200 OK",
-            headers: [.init("content-type", type), .init("content-length", String(data.count)), .init("server", "envoy")] + extra,
+            headers: [.init("content-type", type), .init("content-length", String(data.count)), .init("server", "envoy")],
             body: data)
     }
 

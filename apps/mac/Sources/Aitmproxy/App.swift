@@ -53,12 +53,9 @@ struct AitmproxyApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Started from a terminal, the process is not a foreground app yet.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate()
-        SelfTest.armWatchdog()
-        // Fail closed before any window, BusService, activate() or ExtensionController
-        // exists (spec D3 items 8 and 5): a removed fake-data switch, or a `--selftest`
+        // Fail closed first (spec D3 items 8 and 5), before the process even becomes a
+        // foreground app and before any window, BusService, connection model or
+        // ExtensionController exists: a removed fake-data switch, or a `--selftest`
         // without its harness, must never run the live stack on the operator's real
         // defaults. `exit` flushes the one printed line.
         if let why = RemovedModes.refusal(environment: ProcessInfo.processInfo.environment) {
@@ -69,6 +66,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             print(why)
             exit(1)
         }
+        // Started from a terminal, the process is not a foreground app yet.
+        NSApp.setActivationPolicy(.regular)
+        NSApp.activate()
+        SelfTest.armWatchdog()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }

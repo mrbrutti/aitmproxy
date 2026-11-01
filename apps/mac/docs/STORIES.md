@@ -240,7 +240,7 @@ Depends: S-010
 Core: F6
 Acceptance:
 - [snap] The mark menu shows 11 system-colour swatches and Clear; the row's 6 px swatch and the Comment column update at once.
-- [self] `flow.mark {id, marks}` and `flow.comment {id, text}` are sent; on fixtures the row updates locally.
+- [self] `flow.mark {id, marks}` and `flow.comment {id, text}` are sent over the bus.
 - [unit] A comment longer than the column truncates with an ellipsis and shows in full in the Summary tab.
 UX:
 - Flow: `m` (or Flow ▸ Mark ▸, or row context menu ▸ Mark) -> popover of 11 swatches + Clear -> click -> swatch appears in the Mark column; `c` / ⌘L -> inline comment field in the status bar's left slot? No — a small popover anchored to the row with one field -> Return saves, Esc cancels -> Comment column shows it
@@ -263,7 +263,7 @@ Acceptance:
 UX:
 - Flow: toolbar Proxy switch (or View ▸ Pause Proxy ⇧⌘R) -> switch grey, pill reads "paused" -> click again to resume; toolbar trash (File ▸ Clear Session ⌘⌫) -> list empties -> empty state returns
 - Surface: inline toolbar toggles; Clear asks "Clear 2 paused flows too?" (confirmation dialog, destroys data) only when flows are paused, buttons "Clear" / "Cancel"
-- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"; fixtures toggle locally
+- States: paused + new client traffic -> rows still flow? No: a paused proxy records nothing; the pill says so, and a pause from any other client shows within one poll (`proxy.status`). Live bus without F7 -> status-bar error "pause proxy: …"
 - Words: "Proxy" (the switch), "Pause Proxy" / "Resume Proxy", "Clear Session", tooltip "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
 - Access: both in the menu bar; the pill is a status, not a control, to VoiceOver
 Status: done

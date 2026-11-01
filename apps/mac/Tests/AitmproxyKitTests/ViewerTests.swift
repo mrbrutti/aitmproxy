@@ -6,10 +6,10 @@ import Testing
 /// waited, the last response the login endpoint sent (pretty JSON the printer must leave
 /// alone), and a product listing with a query.
 private enum ViewerInputs {
-    static let loginRow = Make.row(seq: 50, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login",
+    static let loginRow = Make.row(id: "login", seq: 1, method: .post, host: "auth.shop-staging.test", path: "/api/auth/login",
                                   state: .paused, edited: true)
     static let loginDetail = Make.detail(
-        id: "00000050-0000-4000-8000-000000000050",
+        id: "login",
         request: Make.message(
             "POST /api/auth/login HTTP/2",
             [("host", "auth.shop-staging.test"), ("content-type", "application/json"), ("accept", "*/*"),
@@ -33,10 +33,10 @@ private enum ViewerInputs {
       "set_cookie": "session=…; HttpOnly; Secure; SameSite=Lax"
     }
     """)
-    static let productsRow = Make.row(seq: 41, host: "api.shop-staging.test", path: "/api/products",
+    static let productsRow = Make.row(id: "products", seq: 2, host: "api.shop-staging.test", path: "/api/products",
                                      query: "category=electronics&limit=20", status: 200)
     static let productsDetail = Make.detail(
-        id: "flow-41",
+        id: "products",
         request: Make.message("GET /api/products?category=electronics&limit=20 HTTP/2",
                               [("host", "api.shop-staging.test"), ("accept", "application/json")]))
 }

@@ -5,7 +5,7 @@
 /// operator's real defaults. Presence is the stale invocation, so any value counts, an
 /// empty one included.
 public enum RemovedModes {
-    public static let variables = ["APP_FIXTURES", "APP_SNAPSHOT", "APP_SNAPSHOT_PAGES", "APP_KIT_GALLERY", "APP_L4_EMBEDDED"]
+    static let variables = ["APP_FIXTURES", "APP_SNAPSHOT", "APP_SNAPSHOT_PAGES", "APP_KIT_GALLERY", "APP_L4_EMBEDDED"]
 
     /// The refusal line for the first removed variable present in `environment`; nil when none is.
     public static func refusal(environment: [String: String]) -> String? {

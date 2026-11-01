@@ -18,6 +18,10 @@ import Testing
             == "APP_SNAPSHOT was removed on 2026-10-31 with the fixture modes; see apps/mac/CLAUDE.md")
     }
 
+    @Test func theListIsExactlyTheFiveSwitchesTheSpecNames() {
+        #expect(RemovedModes.variables == ["APP_FIXTURES", "APP_SNAPSHOT", "APP_SNAPSHOT_PAGES", "APP_KIT_GALLERY", "APP_L4_EMBEDDED"])
+    }
+
     @Test func theKeptHarnessVariableAloneIsNotRefused() {
         #expect(RemovedModes.refusal(environment: ["APP_STORE": "/tmp/claude/x"]) == nil)
     }

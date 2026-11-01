@@ -183,11 +183,24 @@ final class PocPanelState {
 
     private func persist() { try? store.save(findings) }
 
+    /// Why a `poc.build` answer could not be turned into a finding. The app's own
+    /// judgement, not something the core reported, so not a `BusError`.
+    private enum PocBuildError: LocalizedError {
+        case unreadable(String)
+        case noYAMLOrPath
+        var errorDescription: String? {
+            switch self {
+            case .unreadable(let path): "could not read \(path)"
+            case .noYAMLOrPath: "poc.build returned neither YAML nor a path"
+            }
+        }
+    }
+
     /// `poc.build` returns YAML text or a path, depending on the build. Derive
     /// both from what the core returned and never synthesize YAML: a path that
     /// cannot be read, or an answer that is neither YAML nor a path, throws a
-    /// `BusError.tool` naming the reason; the caller's `catch` shows it in the
-    /// status bar and inserts no finding.
+    /// `PocBuildError`; the caller's `catch` shows it in the status bar
+    /// (`build PoC: …`) and inserts no finding.
     private func resolveBuilt(_ returned: String, name: String) throws -> (yaml: String, path: String) {
         let slug = Finding(title: name, severity: .medium, target: "", passed: false, ranAt: Date(), origin: .human, pocPath: "", yaml: "").slug
         if returned.contains("\n"), returned.contains("id:") {
@@ -195,11 +208,11 @@ final class PocPanelState {
         }
         if returned.hasSuffix(".yaml") || returned.hasSuffix(".yml") {
             guard let yaml = try? String(contentsOfFile: returned, encoding: .utf8) else {
-                throw BusError.tool(message: "poc.build: could not read \(returned)")
+                throw PocBuildError.unreadable(returned)
             }
             return (yaml, returned)
         }
-        throw BusError.tool(message: "poc.build returned neither YAML nor a path")
+        throw PocBuildError.noYAMLOrPath
     }
 
     private func loadScreenshot(for id: Finding.ID?) {

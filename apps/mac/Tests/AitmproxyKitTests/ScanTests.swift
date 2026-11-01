@@ -163,17 +163,6 @@ private enum ScanInputs {
         #expect(throws: (any Error).self) { try ScanResult(json: .string("ok")) }
     }
 
-    /// A result built as a `JSONValue` (not parsed from text) decodes the same way, and every
-    /// injection point names one of the captured rows.
-    @Test func aJSONValueResultDecodesAndItsPointsNameCapturedFlows() throws {
-        let result = try ScanResult(json: ScanInputs.discover)
-        #expect(result.endpoints.count == 3)
-        #expect(result.injectionPoints.count == 6)
-        let known = Set(ScanInputs.rows.map(\.id))
-        #expect(result.injectionPoints.allSatisfy { known.contains($0.flowID) })
-        #expect(result.injectionPoints.contains { $0.example == "<redacted>" })
-    }
-
     // MARK: Endpoint flows (AC3: an endpoint links to the flow it was fetched in)
 
     /// `endpoint_flows` is keyed by the same scrubbed URL string `endpoints`

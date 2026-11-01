@@ -3,7 +3,7 @@ import Testing
 @testable import AitmproxyKit
 
 /// Ten HTTP/WS rows and three raw-L4 sessions for `OverviewBreakdownsTests`: five methods,
-/// five clients with two ties on the count, eight completed durations, two error statuses
+/// five clients, three of them tied at two so the ranking falls back to name, eight completed durations, two error statuses
 /// and five non-empty responses.
 private enum OverviewBreakdownInputs {
     static let obscura = ClientInfo(name: "obscura")

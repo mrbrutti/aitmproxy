@@ -80,13 +80,17 @@ fi
 # its store from under it.
 store="/tmp/$name-dev-state$tag"
 rm -rf "$HOME/Library/Saved Application State/com.mrbrutti.aitmproxy.savedState" "$store"
-mkdir -p "$store"
-# /tmp is shared: the store must be a directory this user owns (a path someone else planted
-# there survives the rm -rf above, and mkdir -p would silently accept it).
-[[ -O $store && -d $store ]] || { echo "store $store is not a directory we own; refusing to launch"; exit 1; }
+# /tmp is shared: nothing legitimate can exist at $store after the rm -rf above, so a plain
+# mkdir (no -p) fails on anything that appeared in between, and the check refuses a symlink
+# (-O and -d follow links; -L does not) as well as a directory another user owns.
+mkdir "$store" || { echo "store $store already exists; refusing to launch"; exit 1; }
+[[ ! -L $store && -O $store && -d $store ]] || { echo "store $store is not a directory we own; refusing to launch"; exit 1; }
 # Live launch: the bundle talks to the core copied in above (or, under APP_LIVE=1 + AITM_CONFIG,
 # to an external one). There is no fixture, snapshot or gallery mode to launch instead.
 unsetopt bg_nice  # zsh nices background jobs by default; the app runs at normal priority, as from Finder
 APP_STORE="$store" "$dev/Contents/MacOS/$exe" &
 pid=$!
-echo "== launched pid $pid · store $store · stop: kill $pid"
+# Stopping: SIGTERM ends the app without its AppKit teardown, so the embedded core and its
+# obscura child survive (parent 1) — reap them by the bundle path (scoped; never a global pkill).
+echo "== launched pid $pid · store $store"
+echo "== stop: kill $pid; pkill -f $dev/Contents/Resources/core/"

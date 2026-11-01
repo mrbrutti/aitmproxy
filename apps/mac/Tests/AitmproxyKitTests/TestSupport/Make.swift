@@ -31,9 +31,17 @@ enum Make {
                     body: body.map { Data($0.utf8) })
     }
 
+    /// The reason phrases the tests use, spelled here so the builder leans on no Kit logic.
+    private static let reasons: [Int: String] = [
+        101: "Switching Protocols", 200: "OK", 204: "No Content", 304: "Not Modified",
+        422: "Unprocessable Content", 502: "Bad Gateway",
+    ]
+
     /// A response whose start line is `HTTP/2 <status> <reason>`, with `(name, value)` headers and a UTF-8 body.
+    /// A status outside `reasons` is a test-input mistake and traps.
     static func response(_ status: Int, _ headers: [(String, String)] = [], body: String? = nil) -> HTTPMessage {
-        message("HTTP/2 \(status) \(StatusText.reason(status))".trimmingCharacters(in: .whitespaces), headers, body: body)
+        guard let reason = reasons[status] else { preconditionFailure("Make.response: add a reason phrase for \(status)") }
+        return message("HTTP/2 \(status) \(reason)", headers, body: body)
     }
 
     /// A flow detail. `connection` defaults to a bare HTTP/2 connection with no addresses.

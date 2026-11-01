@@ -35,10 +35,10 @@ the operator-commands merge (PR #6, `tools/list` = 34).
    `APP_LIVE_STRICT=1`: "flow.kill denies the client a response (curl exit 52,
    row killed)".
 
-## Verification & CUA automation coverage boundary
+## Verification
 
 The operator workflow is verified two ways, both repeatable:
-- **Agent-driven (MCP bus)** — `tools/selftest-live.sh` (21 checks): intercept →
+- **Agent-driven (MCP bus)** — `tools/selftest-live.sh` (90 checks on 2026-11-01, 44 of them the menu audit): intercept →
   `flow.detail` review → edit a paused request → resume, plus mark/comment,
   pause/clear, kill (strict), activity log.
 - **Human UI (computer-use)** — `tools/cua-ne-drive.sh <pid> [host]`: real input
@@ -58,11 +58,12 @@ Stable `.accessibilityIdentifier`s are set on the key views — flow rows
 (`raw-request-editor`), the edit-status (`edit-status`), and the Resume/Edit
 buttons — for VoiceOver and for XCUITest. Note: **AppleScript / System Events does
 not surface SwiftUI's `AXIdentifier`** (verified — reads return NOTFOUND), and the
-NSTableView AX descent is timing-sensitive, so the scripted *read-back* uses the
-screenshot diff rather than by-identifier AX reads. A fully by-identifier
-deterministic UI test would be an **XCUITest** target (which does read these
-identifiers); the end-to-end "an edit reaches the client" assertion already lives
-in the agent `tools/selftest-live.sh` (edit → `flow.mutate` → `flow.resume`).
+NSTableView AX descent is timing-sensitive, so the removed click-through's scripted
+*read-back* used a screenshot diff rather than by-identifier AX reads (removed
+2026-10-31; today the proof is `winshot` shots read by a person). A fully
+by-identifier deterministic UI test would be an **XCUITest** target (which does read
+these identifiers); the end-to-end "an edit reaches the client" assertion already
+lives in the agent `tools/selftest-live.sh` (edit → `flow.mutate` → `flow.resume`).
 
 ## 1. Our core command surface (post-merge, 34 tools)
 
