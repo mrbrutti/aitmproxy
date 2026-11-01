@@ -151,7 +151,9 @@ pub(crate) struct EnumerateOptions<'a> {
     /// The per-request cap (`audit.max_points_per_request`).
     pub max_points: u32,
     /// The job's session material, if it has one: a cookie or header named in
-    /// it carries [`PointTrait::Session`].
+    /// it has its example withheld ([`is_material`]). It does *not* carry
+    /// [`PointTrait::Session`] on membership alone — only the name decides
+    /// that ([`session_trait`]).
     pub session: Option<&'a SessionMaterial>,
 }
 
@@ -301,9 +303,7 @@ impl<'a> Collector<'a> {
         if flags.json {
             found.push(PointTrait::Json);
         }
-        if session_trait(kind, name, flags.placeholder, self.session)
-            || path_is_secret(kind, path.as_deref())
-        {
+        if session_trait(name, flags.placeholder) || path_is_secret(kind, path.as_deref()) {
             found.push(PointTrait::Session);
         }
         let traits: Vec<PointTrait> = TRAIT_ORDER
@@ -313,8 +313,13 @@ impl<'a> Collector<'a> {
             .collect();
 
         // D8.1: a session point never shows its value, whatever it is named;
-        // the caller withholds a path token's value the same way (S-M2).
-        let example = if flags.withhold || traits.contains(&PointTrait::Session) {
+        // the caller withholds a path token's value the same way (S-M2); and a
+        // point that *is* this job's session material keeps its value withheld
+        // even though membership no longer marks it (see [`is_material`]).
+        let example = if flags.withhold
+            || traits.contains(&PointTrait::Session)
+            || is_material(kind, name, self.session)
+        {
             redact::REDACTED.to_string()
         } else {
             redact::example(kind, name, value)
@@ -343,8 +348,19 @@ fn path_is_secret(kind: InsertionKind, path: Option<&str>) -> bool {
     ) && path.is_some_and(redact::is_secret_name)
 }
 
-/// Whether a point carries session state: its name is a session cookie or (case
-/// insensitively) a session header of this job, or it reads as a secret.
+/// Whether a point carries session state: its *name* reads as a secret in the
+/// shared vocabulary (`session`, `sid`, `*token*`, `auth*`, `jwt`, `csrf`,
+/// `PHPSESSID`, ...).
+///
+/// Membership of this job's session material does **not** mark a point, and
+/// that is deliberate (stage-5 ruling on D7/D8.1): the engine's material pick
+/// takes every cookie of the newest Cookie-bearing capture, so in a job with
+/// no login the only cookie on the wire (`theme=dark`) counted as "session
+/// material" and, carrying the trait, was dropped by the default ignore rule
+/// — the `cookie` kind then vanished from the site map entirely. The
+/// vocabulary alone decides, so a plainly named cookie is audited and a
+/// secret-named one is not, whatever the material pick happened to grab. The
+/// value of a material point is still withheld ([`is_material`]).
 ///
 /// `placeholder` is the one exemption from the secret vocabulary, and it is
 /// the caller's to assert, never inferred from the name's shape: a template
@@ -353,15 +369,18 @@ fn path_is_secret(kind: InsertionKind, path: Option<&str>) -> bool {
 /// audited, with its example withheld (R-M1). A `{session}` read off the wire
 /// (a raw path segment, a query key, a body field) is a name like any other
 /// and keeps the trait (F4-2).
-fn session_trait(
-    kind: InsertionKind,
-    name: &str,
-    placeholder: bool,
-    session: Option<&SessionMaterial>,
-) -> bool {
-    if !placeholder && redact::is_secret_name(name) {
-        return true;
-    }
+fn session_trait(name: &str, placeholder: bool) -> bool {
+    !placeholder && redact::is_secret_name(name)
+}
+
+/// Whether `(kind, name)` is one of this job's session material's own cookies
+/// or headers.
+///
+/// It no longer marks the point [`PointTrait::Session`] (see
+/// [`session_trait`]), so the point is audited; it still withholds the
+/// example, because material is a credential this job carries whatever it is
+/// named, and D8.1 never publishes one.
+fn is_material(kind: InsertionKind, name: &str, session: Option<&SessionMaterial>) -> bool {
     let Some(material) = session else {
         return false;
     };
@@ -1618,8 +1637,10 @@ mod tests {
             &EnumerateOptions::from_profile(&profile, &default_ignore, Some(&session)),
         );
         assert!(!has_named(&out, Header, "X-Api-Key"));
-        assert!(!has_named(&out, Header, "X-Tenant"));
-        assert_eq!(out.ignored, 2);
+        // `X-Tenant` is material, but material alone no longer marks a point:
+        // it is audited like any other header.
+        assert!(has_named(&out, Header, "X-Tenant"));
+        assert_eq!(out.ignored, 1);
 
         let no_ignore = CompiledIgnore::compile(&[]).unwrap();
         let out = enumerate_v2(
@@ -1635,10 +1656,86 @@ mod tests {
         let key = point(&out, Header, "X-Api-Key");
         assert!(key.traits.contains(&PointTrait::Session));
         assert_eq!(key.example.as_deref(), Some("<redacted>"));
-        // `X-Tenant` reads as no secret: only the session material marks it.
+        // `X-Tenant` reads as no secret, so it is no `Session` point and is
+        // audited. Its example is still withheld: it is a value this job
+        // carries as session material, whatever it is named (D8.1).
         let tenant = point(&out, Header, "X-Tenant");
-        assert!(tenant.traits.contains(&PointTrait::Session));
+        assert!(
+            !tenant.traits.contains(&PointTrait::Session),
+            "{:?}",
+            tenant.traits
+        );
         assert_eq!(tenant.example.as_deref(), Some("<redacted>"));
+    }
+
+    /// Session *material* membership no longer marks a point (stage-5 ruling
+    /// on D7/D8.1): the engine's material pick takes every cookie of the
+    /// newest Cookie-bearing capture, so in a job with no login the only
+    /// cookie (`theme=dark`) counted as material and the whole `cookie` kind
+    /// vanished from the site map. The secret-name vocabulary decides alone:
+    /// `theme` is audited even while it is material, `session` is not even
+    /// though nothing but its name says so. Cookie examples stay `<redacted>`
+    /// either way.
+    #[test]
+    fn material_membership_alone_marks_no_point() {
+        fn cookie_point(
+            cookie: &str,
+            material: &[(&str, &str)],
+            ignore: &[IgnoreRule],
+        ) -> Option<InsertionPoint> {
+            let flow = captured_flow(
+                request("GET", "http://t:8080/x", &[("Cookie", cookie)], None),
+                200,
+                &[],
+                b"",
+            );
+            let session = SessionMaterial {
+                cookies: material
+                    .iter()
+                    .map(|(n, v)| (n.to_string(), v.to_string()))
+                    .collect(),
+                headers: Vec::new(),
+            };
+            let profile = ScanProfile::default();
+            let compiled = CompiledIgnore::compile(ignore).unwrap();
+            let out = enumerate_v2(
+                &flow,
+                &EnumerateOptions::from_profile(&profile, &compiled, Some(&session)),
+            );
+            out.points.into_iter().find(|p| p.kind == Cookie)
+        }
+
+        let none: [IgnoreRule; 0] = [];
+        let default_rules = ScanProfile::default().audit.ignore;
+
+        // A plainly named cookie is audited even though the engine counted it
+        // as this job's session material.
+        let theme = cookie_point("theme=dark", &[("theme", "dark")], &none)
+            .expect("the theme cookie is a point");
+        assert_eq!(theme.name, "theme");
+        assert!(
+            !theme.traits.contains(&PointTrait::Session),
+            "{:?}",
+            theme.traits
+        );
+        assert_eq!(theme.example.as_deref(), Some("<redacted>"));
+        assert!(
+            cookie_point("theme=dark", &[("theme", "dark")], &default_rules).is_some(),
+            "the default ignore rule drops a material cookie that is not named like a secret"
+        );
+
+        // A cookie whose name reads as a secret keeps the trait and is dropped
+        // by the default rule.
+        let sess = cookie_point("session=abc", &[("session", "abc")], &none)
+            .expect("the session cookie is a point");
+        assert_eq!(sess.name, "session");
+        assert!(
+            sess.traits.contains(&PointTrait::Session),
+            "{:?}",
+            sess.traits
+        );
+        assert_eq!(sess.example.as_deref(), Some("<redacted>"));
+        assert!(cookie_point("session=abc", &[("session", "abc")], &default_rules).is_none());
     }
 
     // --- tester additions (stage 5, whole branch) ----------------------------
