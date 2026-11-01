@@ -774,4 +774,129 @@ mod tests {
         assert!(!monitor.is_lost());
         assert!(!monitor.should_stop());
     }
+
+    // --- tester additions (stage 5, whole branch) ----------------------------
+
+    /// A loss is a status-class change away from 2xx and nothing else: a
+    /// transport error or a timeout reads as 0 and counts only when the canary
+    /// was observed answering 2xx; 200 -> 401 is a loss; 200 -> 204 is not; a
+    /// canary that was never 2xx cannot prove a loss.
+    #[tokio::test]
+    async fn loss_is_a_class_change_from_2xx_only() {
+        let timeout = Duration::from_secs(5);
+        let canary = |expected: u16| CanaryRequest {
+            request: request("GET", "http://t:8080/me", &[("cookie", "sid=S3")], None),
+            method: CanaryMethod::Get,
+            path: "/me".to_string(),
+            expected_status: expected,
+        };
+
+        let failing = ScriptedClient::new(|_req| Err(anyhow::anyhow!("connection refused")));
+        let monitor = SessionMonitor::new(Some(canary(200)), OnLost::Stop, 1);
+        assert_eq!(
+            monitor
+                .check(&failing, SendOptions::default(), timeout)
+                .await,
+            CanaryOutcome::Lost {
+                before: 200,
+                after: 0
+            }
+        );
+        assert!(monitor.should_stop());
+
+        let unauthorised = ScriptedClient::new(|_req| Ok(response(401, &[], b"")));
+        let monitor = SessionMonitor::new(Some(canary(200)), OnLost::Stop, 1);
+        assert_eq!(
+            monitor
+                .check(&unauthorised, SendOptions::default(), timeout)
+                .await,
+            CanaryOutcome::Lost {
+                before: 200,
+                after: 401
+            }
+        );
+
+        let no_content = ScriptedClient::new(|_req| Ok(response(204, &[], b"")));
+        let monitor = SessionMonitor::new(Some(canary(200)), OnLost::Stop, 1);
+        assert_eq!(
+            monitor
+                .check(&no_content, SendOptions::default(), timeout)
+                .await,
+            CanaryOutcome::Ok
+        );
+        assert!(!monitor.is_lost());
+
+        let monitor = SessionMonitor::new(Some(canary(302)), OnLost::Stop, 1);
+        assert_eq!(
+            monitor
+                .check(&failing, SendOptions::default(), timeout)
+                .await,
+            CanaryOutcome::Ok
+        );
+        assert!(!monitor.is_lost());
+        assert!(!monitor.should_stop());
+
+        // A canary that hangs is bounded by `timeout` and reads as a loss.
+        let slow = ScriptedClient::new(|_req| Ok(response(200, &[], b"")))
+            .with_delay(Duration::from_secs(5));
+        let monitor = SessionMonitor::new(Some(canary(200)), OnLost::Stop, 1);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            monitor
+                .check(&slow, SendOptions::default(), Duration::from_millis(100))
+                .await,
+            CanaryOutcome::Lost {
+                before: 200,
+                after: 0
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Every character that could break out of a `document.cookie` assignment
+    /// is percent-encoded, a non-token name is skipped, and applying the
+    /// session twice (the crawler and a probe host may both do it) changes
+    /// nothing.
+    #[test]
+    fn cookie_statement_escaping_and_idempotent_apply() {
+        let material = session_of(&[("v", "a\"b\\c\r\nd;e")], &[]);
+        assert_eq!(
+            browser_cookie_statements(&material),
+            vec!["document.cookie = \"v=a%22b%5Cc%0D%0Ad%3Be; path=/\"".to_string()]
+        );
+        assert!(browser_cookie_statements(&session_of(
+            &[("", "x"), ("a=b", "x"), ("a b", "x"), ("a;b", "x")],
+            &[]
+        ))
+        .is_empty());
+
+        let material = session_of(
+            &[("sid", "S3"), ("lang", "en")],
+            &[("Authorization", "Bearer T")],
+        );
+        let mut req = request("GET", "http://t:8080/a", &[("cookie", "theme=dark")], None);
+        apply_session(&mut req, &material);
+        let once: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        apply_session(&mut req, &material);
+        let twice: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        assert_eq!(once, twice);
+        assert_eq!(
+            req.headers.get("cookie"),
+            Some("theme=dark; sid=S3; lang=en")
+        );
+        assert_eq!(count_header(&req, "cookie"), 1);
+        assert_eq!(count_header(&req, "authorization"), 1);
+    }
 }

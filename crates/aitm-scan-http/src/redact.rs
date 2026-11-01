@@ -289,6 +289,7 @@ mod tests {
             ("crawl/client.rs", include_str!("crawl/client.rs")),
             ("session.rs", include_str!("session.rs")),
             ("lane.rs", include_str!("lane.rs")),
+            ("crawl/seeds.rs", include_str!("crawl/seeds.rs")),
         ] {
             for (line, text) in log_invocations(source) {
                 if !mentions_url(&text) {
@@ -316,5 +317,33 @@ mod tests {
         let invocations = log_invocations(scrubbed);
         assert_eq!(invocations.len(), 1);
         assert!(mentions_safe_url(&invocations[0].1));
+    }
+
+    // --- tester additions (stage 5, whole branch) ----------------------------
+
+    /// The scrubbers survive empty, relative, malformed and IPv6 input without
+    /// losing the credential-free parts or keeping a credential.
+    #[test]
+    fn safe_url_survives_empty_and_odd_input() {
+        assert_eq!(safe_url(""), "");
+        assert_eq!(safe_url("http://t/x?a"), "http://t/x?a");
+        assert_eq!(
+            safe_url("http://[::1]:8080/x?a=1"),
+            "http://[::1]:8080/x?a=1"
+        );
+        assert_eq!(
+            safe_url("/relative?token=abc"),
+            "/relative?token=[redacted]"
+        );
+        let garbage = safe_url("not a url sid=abc password=hunter2");
+        assert!(
+            !garbage.contains("abc") && !garbage.contains("hunter2"),
+            "{garbage}"
+        );
+        // An out-of-range port makes the URL unparseable; the userinfo still goes.
+        let unparseable = safe_url("http://user:hunter2@h:99999/x?q=1");
+        assert!(!unparseable.contains("hunter2"), "{unparseable}");
+        assert!(unparseable.contains("h:99999/x?q=1"), "{unparseable}");
+        assert_eq!(example(InsertionKind::Query, "q", ""), "");
     }
 }

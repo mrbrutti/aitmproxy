@@ -930,4 +930,175 @@ mod tests {
         );
         assert_eq!(host.budget_left(), 1000);
     }
+
+    // --- tester additions (stage 5, whole branch) ----------------------------
+
+    /// A loss seen through one host stops every other host of the job that
+    /// shares the monitor, including a host built after the loss, and nothing
+    /// more is sent (AC T2-5: "every probe/baseline/probe_raw of every host").
+    #[tokio::test]
+    async fn session_lost_stops_sibling_and_later_hosts() {
+        let fx = fixture(canary_lost_client());
+        let monitor = canary_monitor(2, OnLost::Stop);
+        let first = HttpProbeHost::new(&fx.point, fx.ctx(), Arc::clone(&monitor)).unwrap();
+        let sibling = HttpProbeHost::new(&fx.point, fx.ctx(), Arc::clone(&monitor)).unwrap();
+
+        first.probe(&replace("one")).await.unwrap();
+        let lost = first
+            .probe(&replace("two"))
+            .await
+            .expect_err("the second probe runs the canary and finds the loss");
+        assert!(format!("{lost:#}").starts_with(SESSION_LOST_PREFIX));
+        assert_eq!(fx.sent().len(), 2);
+
+        let raw = || RawProbe {
+            method: "GET".to_string(),
+            url: "http://t:8080/raw".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        for (what, result) in [
+            ("sibling baseline", sibling.baseline().await),
+            ("sibling probe", sibling.probe(&replace("x")).await),
+            ("sibling probe_raw", sibling.probe_raw(raw()).await),
+        ] {
+            let err = result.expect_err(what);
+            assert!(
+                format!("{err:#}").starts_with(SESSION_LOST_PREFIX),
+                "{what}: {err:#}"
+            );
+        }
+
+        let later = HttpProbeHost::new(&fx.point, fx.ctx(), Arc::clone(&monitor)).unwrap();
+        let err = later
+            .baseline()
+            .await
+            .expect_err("a host built after the loss is stopped too");
+        assert!(format!("{err:#}").starts_with(SESSION_LOST_PREFIX));
+        assert_eq!(fx.sent().len(), 2, "nothing is sent after the loss");
+    }
+
+    /// A sender's error is named by stage and scrubbed before it becomes the
+    /// lane's error: whatever the transport put in it, no credential survives
+    /// (AC T2-6), while the structural part of the message does.
+    #[tokio::test]
+    async fn sender_errors_are_scrubbed_and_name_the_stage() {
+        let client = ScriptedClient::new(|_: &HttpRequest| {
+            Err(anyhow::anyhow!(
+                "connect reset while sending sid=S3; password=hunter2 Authorization: Bearer tok"
+            ))
+        });
+        let fx = fixture(client);
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        let probe = host
+            .probe(&replace("x"))
+            .await
+            .expect_err("the sender failed");
+        let text = format!("{probe:#}");
+        assert!(text.starts_with("scan: probe failed: "), "{text}");
+        for secret in ["S3", "hunter2", "tok"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+        assert!(
+            text.contains("connect reset"),
+            "the structural part survives: {text}"
+        );
+
+        let baseline = host.baseline().await.expect_err("the sender failed");
+        assert!(format!("{baseline:#}").starts_with("scan: baseline failed: "));
+        let raw = host
+            .probe_raw(RawProbe {
+                method: "GET".to_string(),
+                url: "http://t:8080/raw".to_string(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("the sender failed");
+        assert!(format!("{raw:#}").starts_with("scan: probe_raw failed: "));
+
+        // Every attempt reached the client; none produced a flow to hold.
+        assert_eq!(fx.sent().len(), 3);
+        assert!(host.held_flows().is_empty());
+    }
+
+    /// A send that outlives `min(deadline - now, MAX_AWAIT)` is cut off with
+    /// an error, not awaited to completion: the host's deadline bounds it.
+    #[tokio::test]
+    async fn a_send_past_the_deadline_is_cut_off() {
+        let fx = fixture_full(
+            ScanProfile::default(),
+            ok_200().with_delay(Duration::from_secs(5)),
+            1,
+        );
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        let started = Instant::now();
+        let err = host
+            .probe(&replace("x"))
+            .await
+            .expect_err("the send outlives the deadline");
+
+        assert!(
+            format!("{err:#}").contains("ran past its time bound"),
+            "{err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the await was not bounded: {:?}",
+            started.elapsed()
+        );
+        assert!(host.held_flows().is_empty());
+    }
+
+    /// A raw probe's header that cannot go on the wire is refused by name with
+    /// its value never quoted; `Host` is the capture's whatever the raw probe
+    /// says; a raw body is framed with its length and the session still rides.
+    #[tokio::test]
+    async fn probe_raw_headers_and_body_are_framed_safely() {
+        let fx = fixture(ok_200());
+        let host = HttpProbeHost::new(&fx.point, fx.ctx(), unarmed()).unwrap();
+
+        let refused = host
+            .probe_raw(RawProbe {
+                method: "GET".to_string(),
+                url: "http://t:8080/raw".to_string(),
+                headers: vec![("X-Bad".to_string(), "a\r\nhunter2".to_string())],
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a header with a line break cannot go on the wire");
+        let text = format!("{refused:#}");
+        assert!(text.contains("X-Bad"), "{text}");
+        assert!(
+            !text.contains("hunter2"),
+            "the error quoted the value: {text}"
+        );
+        assert_eq!(fx.sent().len(), 0);
+
+        host.probe_raw(RawProbe {
+            method: "POST".to_string(),
+            url: "http://t:8080/raw?x=1".to_string(),
+            headers: vec![
+                ("Host".to_string(), "evil.test".to_string()),
+                ("X-Extra".to_string(), "yes".to_string()),
+            ],
+            body: b"abc".to_vec(),
+        })
+        .await
+        .unwrap();
+
+        let sent = fx.sent();
+        assert_eq!(sent.len(), 1);
+        let req = &sent[0].0;
+        assert_eq!(req.method, "POST");
+        assert_eq!(req.path, "/raw?x=1");
+        assert_eq!(req.authority, "t:8080");
+        assert_eq!(req.headers.get("host"), Some("t:8080"));
+        assert_eq!(req.headers.get("x-extra"), Some("yes"));
+        assert_eq!(req.headers.get("content-length"), Some("3"));
+        assert!(matches!(&req.body, aitm_core::Body::Bytes(bytes) if bytes == b"abc"));
+        assert!(req.headers.get("cookie").unwrap().contains("sid=S3"));
+    }
 }

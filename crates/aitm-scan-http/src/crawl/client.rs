@@ -679,4 +679,108 @@ mod tests {
         assert_eq!(sent.len(), 2);
         assert_eq!(report.stopped_reason, None);
     }
+
+    // --- tester additions (stage 5, whole branch) ----------------------------
+
+    /// A body not declared HTML, or one over `MAX_DOM_BYTES`, is counted as a
+    /// page but never mined for links, and the report's held copies stay under
+    /// `MAX_HELD_CRAWL_BODY`.
+    #[tokio::test]
+    async fn non_html_and_oversized_bodies_are_not_mined() {
+        let huge = format!(
+            "{}<a href=\"/from-huge\">x</a>",
+            "<p>pad</p>".repeat(MAX_DOM_BYTES / 10 + 1)
+        );
+        let client = Arc::new(crate::testutil::ScriptedClient::new(
+            move |req: &HttpRequest| {
+                Ok(match req.path.as_str() {
+                    "/" => crate::testutil::response(
+                        200,
+                        &[("content-type", "text/html")],
+                        br#"<a href="/json">j</a><a href="/huge">h</a>"#,
+                    ),
+                    "/json" => crate::testutil::response(
+                        200,
+                        &[("content-type", "application/json")],
+                        br#"{"html":"<a href=\"/from-json\">x</a>"}"#,
+                    ),
+                    "/huge" => crate::testutil::response(
+                        200,
+                        &[("content-type", "text/html")],
+                        huge.as_bytes(),
+                    ),
+                    _ => crate::testutil::response(
+                        200,
+                        &[("content-type", "text/html")],
+                        b"<p>leaf</p>",
+                    ),
+                })
+            },
+        ));
+        let job = FakeJob::new(profile(|_| {}), Arc::clone(&client));
+
+        let report = crawl(&job).await;
+
+        let sent: BTreeSet<String> = client.sent_paths().into_iter().collect();
+        assert_eq!(
+            sent,
+            ["/", "/json", "/huge"]
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<BTreeSet<String>>()
+        );
+        assert_eq!(report.pages, 3);
+        assert_eq!(report.flows.len(), 3);
+        for flow in &report.flows {
+            if let Some(Body::Bytes(bytes)) = flow.response.as_ref().map(|r| &r.body) {
+                assert!(
+                    bytes.len() <= MAX_HELD_CRAWL_BODY,
+                    "a held body of {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+    }
+
+    /// A fetch that errors is one page the crawl did not get: the walk goes on
+    /// and the report stays clean; only a crawl that loaded nothing at all
+    /// reports `navigation_failed`.
+    #[tokio::test]
+    async fn fetch_errors_are_counted_not_fatal() {
+        let client = Arc::new(crate::testutil::ScriptedClient::new(
+            |req: &HttpRequest| match req.path.as_str() {
+                "/" => Ok(crate::testutil::response(
+                    200,
+                    &[("content-type", "text/html")],
+                    br#"<a href="/a">a</a><a href="/b">b</a>"#,
+                )),
+                "/a" => Err(anyhow::anyhow!("connection reset")),
+                _ => Ok(crate::testutil::response(
+                    200,
+                    &[("content-type", "text/html")],
+                    b"<p>b</p>",
+                )),
+            },
+        ));
+        let job = FakeJob::new(profile(|_| {}), Arc::clone(&client));
+
+        let report = crawl(&job).await;
+
+        assert_eq!(client.sent_paths(), vec!["/", "/a", "/b"]);
+        assert_eq!(report.pages, 2);
+        assert_eq!(report.attempts, 3);
+        assert_eq!(report.flows.len(), 2);
+        assert_eq!(report.stopped_reason, None);
+
+        let dead = Arc::new(crate::testutil::ScriptedClient::new(|_: &HttpRequest| {
+            Err(anyhow::anyhow!("refused"))
+        }));
+        let job = FakeJob::new(profile(|_| {}), Arc::clone(&dead));
+
+        let report = crawl(&job).await;
+
+        assert_eq!(report.pages, 0);
+        assert_eq!(report.attempts, 1);
+        assert_eq!(report.stopped_reason, Some("navigation_failed"));
+    }
 }

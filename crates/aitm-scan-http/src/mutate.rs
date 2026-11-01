@@ -1047,4 +1047,187 @@ mod tests {
             assert!(err.contains("flow-1:point:0"), "{err}");
         }
     }
+
+    // --- tester additions (stage 5, whole branch) ----------------------------
+
+    /// `Content-Length` is recomputed for every body kind a mutation can touch
+    /// (AC T2-3 / D8.1 "recomputes Content-Length"): a stale value is replaced
+    /// in the header's captured spelling, exactly one entry remains, and a
+    /// bodiless request gains none.
+    #[test]
+    fn content_length_is_recomputed_for_every_body_kind() {
+        fn stale_length(mut req: HttpRequest) -> HttpRequest {
+            req.headers.remove("content-length");
+            req.headers.set("Content-Length", "999");
+            req
+        }
+        let form = stale_length(request(
+            "POST",
+            "http://t:8080/login",
+            &[],
+            Some(("application/x-www-form-urlencoded", b"a=1&b=2")),
+        ));
+        let json = stale_length(json_request(r#"{"n":3,"s":"a"}"#));
+        let xml = stale_length(xml_request("<a id=\"1\"><b>v</b></a>"));
+        let multipart = stale_length(multipart_request());
+        let raw = stale_length(request(
+            "POST",
+            "http://t:8080/raw",
+            &[],
+            Some(("application/octet-stream", b"hello")),
+        ));
+
+        let cases: Vec<(&str, &HttpRequest, InsertionPoint, Payload)> = vec![
+            (
+                "body_param",
+                &form,
+                point(InsertionKind::BodyParam, "b", None),
+                replace("longer value"),
+            ),
+            (
+                "param_name_body (form)",
+                &form,
+                point(InsertionKind::ParamNameBody, "b", None),
+                replace("renamed"),
+            ),
+            (
+                "json_value",
+                &json,
+                point(InsertionKind::JsonValue, "n", Some("n")),
+                replace("123456"),
+            ),
+            (
+                "param_name_body (json)",
+                &json,
+                point(InsertionKind::ParamNameBody, "s", None),
+                replace("string"),
+            ),
+            (
+                "xml_value",
+                &xml,
+                point(InsertionKind::XmlValue, "b", Some("a.b")),
+                replace("a much longer value"),
+            ),
+            (
+                "xml_attr",
+                &xml,
+                point(InsertionKind::XmlAttr, "id", Some("a@id")),
+                replace(""),
+            ),
+            (
+                "multipart_value",
+                &multipart,
+                point(InsertionKind::MultipartValue, "title", None),
+                replace(""),
+            ),
+            (
+                "multipart_filename",
+                &multipart,
+                point(InsertionKind::MultipartFilename, "doc", None),
+                replace("a-very-long-filename.txt"),
+            ),
+            (
+                "entire_body",
+                &raw,
+                point(InsertionKind::EntireBody, "body", None),
+                raw_payload(&[0, 1, 2, 3, 4, 5, 6, 7]),
+            ),
+        ];
+        for (what, req, point, payload) in cases {
+            let out =
+                build_request(req, &point, &payload).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let body = body_bytes(&out.body).unwrap_or_else(|| panic!("{what}: body is bytes"));
+            let want = body.len().to_string();
+            let lengths: Vec<(&str, &str)> = out
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                .collect();
+            assert_eq!(lengths, vec![("Content-Length", want.as_str())], "{what}");
+        }
+
+        let get = request("GET", "http://t:8080/search?q=1", &[], None);
+        let out =
+            build_request(&get, &point(InsertionKind::Query, "q", None), &replace("z")).unwrap();
+        assert!(
+            !out.headers.has("content-length"),
+            "a bodiless request gains no Content-Length"
+        );
+        assert!(matches!(out.body, Body::Empty));
+    }
+
+    /// A path point must carry a usable 1-based index: `0`, a non-number, an
+    /// empty string and a missing index are stale, never a panic or a silent
+    /// probe of another segment; the index, not the text, addresses the
+    /// segment (call A9).
+    #[test]
+    fn path_points_need_a_one_based_index() {
+        let req = request(
+            "GET",
+            "http://t:8080/files/reports/summary.pdf?x=1",
+            &[],
+            None,
+        );
+        for index in [Some("0"), Some("x"), Some(""), None] {
+            let err = build_request(
+                &req,
+                &point(InsertionKind::PathSegment, "reports", index),
+                &replace("z"),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("path_segment"), "{index:?}: {err}");
+            assert!(err.contains("flow-1:point:0"), "{index:?}: {err}");
+        }
+
+        let twins = request("GET", "http://t:8080/a/a/a", &[], None);
+        let out = build_request(
+            &twins,
+            &point(InsertionKind::PathSegment, "a", Some("2")),
+            &replace("b"),
+        )
+        .unwrap();
+        assert_eq!(out.path, "/a/b/a");
+    }
+
+    /// Prefix and suffix modes reach every kind through the one `apply_mode`:
+    /// a JSON number stays a number while the result still parses, and a
+    /// cookie or header keeps the original value inside the payload (with a
+    /// cookie's line break encoded).
+    #[test]
+    fn prefix_and_suffix_wrap_the_original_value() {
+        let json = json_request(r#"{"n":3}"#);
+        let numeric = point(InsertionKind::JsonValue, "n", Some("n"));
+        let out = build_request(&json, &numeric, &text_payload("0", PayloadMode::Suffix)).unwrap();
+        assert_eq!(body_text(&out), r#"{"n":30}"#);
+        let out = build_request(&json, &numeric, &text_payload("'", PayloadMode::Suffix)).unwrap();
+        assert_eq!(body_text(&out), r#"{"n":"3'"}"#);
+
+        let req = request(
+            "GET",
+            "http://t:8080/",
+            &[("X-Client", "abc"), ("Cookie", "sid=S3; theme=dark")],
+            None,
+        );
+        let theme = point(InsertionKind::Cookie, "theme", None);
+        let out = build_request(&req, &theme, &text_payload("<p>", PayloadMode::Prefix)).unwrap();
+        assert_eq!(out.headers.get("cookie"), Some("sid=S3; theme=<p>dark"));
+        let out = build_request(
+            &req,
+            &theme,
+            &text_payload("\r\nInjected: 1", PayloadMode::Suffix),
+        )
+        .unwrap();
+        assert_eq!(
+            out.headers.get("cookie"),
+            Some("sid=S3; theme=dark%0D%0AInjected: 1")
+        );
+        let out = build_request(
+            &req,
+            &point(InsertionKind::Header, "X-Client", None),
+            &text_payload("'", PayloadMode::Suffix),
+        )
+        .unwrap();
+        assert_eq!(out.headers.get("x-client"), Some("abc'"));
+    }
 }

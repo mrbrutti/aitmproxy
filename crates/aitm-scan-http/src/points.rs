@@ -1117,4 +1117,313 @@ mod tests {
         assert!(tenant.traits.contains(&PointTrait::Session));
         assert_eq!(tenant.example.as_deref(), Some("<redacted>"));
     }
+
+    // --- tester additions (stage 5, whole branch) ----------------------------
+
+    /// The per-request cap keeps candidate order (query values first) and
+    /// counts every survivor it drops; it runs after the ignore rules, so the
+    /// ignored count does not move; a cap of zero keeps nothing but still
+    /// reports every candidate in `seen`.
+    #[test]
+    fn cap_keeps_candidate_order_and_zero_keeps_nothing() {
+        let flow = pinned_flow();
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let session = material();
+        let opts = |max_points: u32| EnumerateOptions {
+            intensity: profile.intensity,
+            kinds: &profile.audit.kinds,
+            ignore: &ignore,
+            max_points,
+            session: Some(&session),
+        };
+        let total = enumerate_v2(&flow, &opts(u32::MAX)).points.len() as u32;
+        assert!(total > 2);
+
+        let two = enumerate_v2(&flow, &opts(2));
+        assert_eq!(
+            triples(&two),
+            vec![
+                (Query, "q".to_string(), None),
+                (Query, "next".to_string(), None),
+            ]
+        );
+        assert_eq!(two.overflow, total - 2);
+        assert_eq!(two.ignored, 2, "the cap runs after the ignore rules");
+        assert_eq!(two.points[0].id, format!("{}:query:0", flow.id));
+        assert_eq!(two.points[1].id, format!("{}:query:1", flow.id));
+
+        let none = enumerate_v2(&flow, &opts(0));
+        assert!(none.points.is_empty());
+        assert_eq!(none.overflow, total);
+        assert!(none.seen.iter().any(|p| p.kind == Query && p.name == "q"));
+        assert!(none
+            .seen
+            .iter()
+            .any(|p| p.kind == Cookie && p.name == "sid"));
+    }
+
+    /// A value under a secret-looking name never reaches an `example`, whatever
+    /// kind carries it (AC T2-6): a query `token`, a form `password`, an
+    /// `X-Auth-Token` header, any cookie. Plain values still show, so the
+    /// redaction is a rule and not a blanket.
+    #[test]
+    fn secret_named_values_never_reach_an_example() {
+        let flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/reset?token=abc123&q=plain",
+                &[
+                    ("X-Auth-Token", "t0k3n"),
+                    ("Cookie", "theme=dark"),
+                    ("X-Client", "shown"),
+                ],
+                Some((
+                    "application/x-www-form-urlencoded",
+                    b"password=hunter2&user=bob",
+                )),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let profile = ScanProfile::default();
+        let no_ignore = CompiledIgnore::compile(&[]).unwrap();
+        let out = enumerate_v2(
+            &flow,
+            &EnumerateOptions {
+                intensity: Intensity::Medium,
+                kinds: &profile.audit.kinds,
+                ignore: &no_ignore,
+                max_points: u32::MAX,
+                session: None,
+            },
+        );
+
+        for (kind, name) in [
+            (Query, "token"),
+            (InsertionKind::BodyParam, "password"),
+            (Header, "X-Auth-Token"),
+            (Cookie, "theme"),
+        ] {
+            assert_eq!(
+                point(&out, kind, name).example.as_deref(),
+                Some("<redacted>"),
+                "{kind:?} {name}"
+            );
+        }
+        for (kind, name) in [
+            (Query, "token"),
+            (InsertionKind::BodyParam, "password"),
+            (Header, "X-Auth-Token"),
+        ] {
+            assert!(
+                point(&out, kind, name)
+                    .traits
+                    .contains(&PointTrait::Session),
+                "{kind:?} {name} carries the session trait"
+            );
+        }
+        assert_eq!(point(&out, Query, "q").example.as_deref(), Some("plain"));
+        assert_eq!(
+            point(&out, InsertionKind::BodyParam, "user")
+                .example
+                .as_deref(),
+            Some("bob")
+        );
+        assert_eq!(
+            point(&out, Header, "X-Client").example.as_deref(),
+            Some("shown")
+        );
+
+        let examples: Vec<&str> = out
+            .points
+            .iter()
+            .filter_map(|p| p.example.as_deref())
+            .collect();
+        for secret in ["abc123", "hunter2", "t0k3n", "dark"] {
+            assert!(
+                !examples.iter().any(|example| example.contains(secret)),
+                "{secret} leaked into an example: {examples:?}"
+            );
+        }
+
+        // The whole-body example is scrubbed, not copied.
+        let plain = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/x",
+                &[],
+                Some(("text/plain", b"note sid=abc123 end")),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(
+            &plain,
+            &EnumerateOptions::from_profile(&profile, &no_ignore, None),
+        );
+        let body = point(&out, EntireBody, "body");
+        assert_eq!(body.example.as_deref(), Some("note sid=[redacted] end"));
+    }
+
+    /// Empty and malformed inputs enumerate nothing broken and never panic: a
+    /// bare `GET`, a query made of separators, and bodies whose declared format
+    /// does not parse (the query points still come out).
+    #[test]
+    fn empty_and_malformed_inputs_do_not_panic() {
+        let profile = ScanProfile::default();
+        let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let opts = EnumerateOptions::from_profile(&profile, &ignore, None);
+
+        let bare = captured_flow(request("GET", "http://t:8080/", &[], None), 200, &[], b"");
+        let out = enumerate_v2(&bare, &opts);
+        assert!(out.points.is_empty(), "{:?}", triples(&out));
+        assert!(out.seen.is_empty());
+        assert_eq!((out.overflow, out.ignored, out.kind_filtered), (0, 0, 0));
+
+        let separators = captured_flow(
+            request("GET", "http://t:8080/x?&&==&a&=b", &[], None),
+            200,
+            &[],
+            b"",
+        );
+        let out = enumerate_v2(&separators, &opts);
+        assert!(out.points.iter().all(|p| !p.name.is_empty()));
+        assert!(has(&out, Query, "a", None), "{:?}", triples(&out));
+
+        for (content_type, body) in [
+            ("application/json", &b"{\"a\":"[..]),
+            ("application/json", &[0xff_u8, 0xfe][..]),
+            ("text/xml", &b"<a><b>"[..]),
+            (
+                "multipart/form-data; boundary=XyZ",
+                &b"--nope\r\n\r\nx\r\n--nope--\r\n"[..],
+            ),
+            ("application/x-www-form-urlencoded", &b"&&=&"[..]),
+        ] {
+            let flow = captured_flow(
+                request(
+                    "POST",
+                    "http://t:8080/x?q=1",
+                    &[],
+                    Some((content_type, body)),
+                ),
+                200,
+                &[],
+                b"",
+            );
+            let out = enumerate_v2(&flow, &opts);
+            assert!(
+                !out.points.iter().any(|p| is_body_kind(p.kind)),
+                "{content_type}: {:?}",
+                triples(&out)
+            );
+            assert!(has(&out, Query, "q", None), "{content_type}");
+        }
+    }
+
+    /// An ignore rule matches only when every key it sets matches; a rule
+    /// scoped to one kind never reaches another kind's point of the same name;
+    /// two rules are an OR.
+    #[test]
+    fn ignore_rule_requires_every_key_to_match() {
+        let flow = pinned_flow();
+        let profile = ScanProfile::default();
+        let session = material();
+        let run = |rules: &[IgnoreRule]| {
+            let ignore = CompiledIgnore::compile(rules).unwrap();
+            enumerate_v2(
+                &flow,
+                &EnumerateOptions {
+                    intensity: profile.intensity,
+                    kinds: &profile.audit.kinds,
+                    ignore: &ignore,
+                    max_points: u32::MAX,
+                    session: Some(&session),
+                },
+            )
+        };
+
+        // Header + `^sid$`: the cookie `sid` is another kind, so it stays.
+        let out = run(&[IgnoreRule {
+            kind: Some(Header),
+            name_regex: Some("^sid$".to_string()),
+            point_trait: None,
+        }]);
+        assert!(has_named(&out, Cookie, "sid"));
+        assert_eq!(out.ignored, 0);
+
+        // Cookie + session trait: the session cookie goes, the Authorization
+        // header stays (and still shows no value).
+        let out = run(&[IgnoreRule {
+            kind: Some(Cookie),
+            name_regex: None,
+            point_trait: Some(PointTrait::Session),
+        }]);
+        assert!(!has_named(&out, Cookie, "sid"));
+        assert!(has_named(&out, Header, "Authorization"));
+        assert_eq!(
+            point(&out, Header, "Authorization").example.as_deref(),
+            Some("<redacted>")
+        );
+        assert_eq!(out.ignored, 1);
+
+        // Two rules: either may match.
+        let out = run(&[
+            IgnoreRule {
+                kind: Some(Cookie),
+                name_regex: None,
+                point_trait: None,
+            },
+            IgnoreRule {
+                kind: None,
+                name_regex: Some("(?i)^x-client$".to_string()),
+                point_trait: None,
+            },
+        ]);
+        assert!(!has_named(&out, Cookie, "sid"));
+        assert!(!has_named(&out, Cookie, "theme"));
+        assert!(!has_named(&out, Header, "X-Client"));
+        assert_eq!(out.ignored, 3);
+    }
+
+    /// Every `Cookie` header of a request is enumerated, in order, and every
+    /// cookie's example is withheld whatever it is called.
+    #[test]
+    fn every_cookie_header_is_enumerated_and_redacted() {
+        let flow = captured_flow(
+            request(
+                "GET",
+                "http://t:8080/x",
+                &[("Cookie", "a=1; b=2"), ("Cookie", "c=3")],
+                None,
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let profile = ScanProfile::default();
+        let no_ignore = CompiledIgnore::compile(&[]).unwrap();
+        let out = enumerate_v2(
+            &flow,
+            &EnumerateOptions::from_profile(&profile, &no_ignore, None),
+        );
+
+        let cookies: Vec<(&str, Option<&str>)> = out
+            .points
+            .iter()
+            .filter(|p| p.kind == Cookie)
+            .map(|p| (p.name.as_str(), p.example.as_deref()))
+            .collect();
+        assert_eq!(
+            cookies,
+            vec![
+                ("a", Some("<redacted>")),
+                ("b", Some("<redacted>")),
+                ("c", Some("<redacted>")),
+            ]
+        );
+    }
 }

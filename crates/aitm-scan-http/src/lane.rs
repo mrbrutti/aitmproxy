@@ -411,12 +411,14 @@ mod tests {
 
     use aitm_core::{Flow, FlowStore, MemFlowStore};
     use aitm_scan_model::{
-        Discovery, FlowRef, InsertionKind, InsertionPoint, JobCtx, Lane, LaneKind, ParamRef,
-        ProfileTarget, ScanProfile, SessionMaterial, SiteNode, UseBrowser,
+        Discovery, FlowRef, IgnoreRule, InsertionKind, InsertionPoint, JobCtx, Lane, LaneKind,
+        ParamRef, ProfileTarget, ScanProfile, SessionMaterial, SiteNode, UseBrowser,
     };
 
     use super::HttpLane;
-    use crate::testutil::{captured_flow, request, site, FakeBrowser, FakeJob, PageScript, MARKER};
+    use crate::testutil::{
+        captured_flow, request, site, FakeBrowser, FakeJob, PageScript, JOB_ID, MARKER,
+    };
 
     /// The origin every test discovers; `t:8080` is the host [`FakeJob`] scopes.
     const ORIGIN: &str = "http://t:8080";
@@ -867,5 +869,114 @@ mod tests {
 
         assert_eq!(lane.lane(), LaneKind::Http);
         assert!(lane.checks().is_empty());
+    }
+
+    // --- tester additions (stage 5, whole branch) ----------------------------
+
+    /// An ignore list that does not compile fails the pass before a single
+    /// request goes out, and the error names the offending pattern.
+    #[tokio::test]
+    async fn invalid_ignore_rule_fails_discovery_before_any_request() {
+        let client = Arc::new(site(&fixture_pages()));
+        let job = FakeJob::new(
+            profile(|p| {
+                p.crawl.use_browser = UseBrowser::Never;
+                p.audit.ignore = vec![IgnoreRule {
+                    kind: None,
+                    name_regex: Some("(".to_string()),
+                    point_trait: None,
+                }];
+            }),
+            Arc::clone(&client),
+        );
+
+        let result = HttpLane::new().discover(&target(&[ORIGIN]), &job).await;
+
+        let err = match result {
+            Ok(discovery) => panic!("an uncompilable ignore list must fail: {discovery:?}"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains('('), "{err}");
+        assert_eq!(client.sent.lock().unwrap().len(), 0);
+    }
+
+    /// An origin the scope guard does not admit is skipped whole: no crawl
+    /// request, no node from the store, no error.
+    #[tokio::test]
+    async fn origin_outside_the_scope_guard_is_skipped() {
+        let store = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured_flow(
+            request("GET", "http://evil.test:9/x?q=1", &[], None),
+            200,
+            &[],
+            b"",
+        )));
+        let client = Arc::new(site(&fixture_pages()));
+        let job = FakeJob::new(
+            profile(|p| p.crawl.use_browser = UseBrowser::Never),
+            Arc::clone(&client),
+        )
+        .with_store(Arc::clone(&store));
+
+        let discovery = discover(&job, &["http://evil.test:9"]).await;
+
+        assert!(discovery.nodes.is_empty());
+        assert!(discovery.points.is_empty());
+        assert_eq!(
+            client.sent.lock().unwrap().len(),
+            0,
+            "an unadmitted origin is never crawled"
+        );
+    }
+
+    /// A stored flow another job's crawl produced is that job's discovery, not
+    /// this one's; this job's own crawl flows and plain captures (even ones
+    /// marked by another job without the crawl mark) are enumerated.
+    #[tokio::test]
+    async fn another_jobs_crawl_flows_are_not_re_enumerated() {
+        let store = Arc::new(MemFlowStore::new());
+        let mut theirs = captured_flow(
+            request("GET", "http://t:8080/theirs?q=1", &[], None),
+            200,
+            &[],
+            b"",
+        );
+        theirs.metadata.marks = vec!["scan:scan-other001".to_string(), "crawl".to_string()];
+        store.insert(Flow::Http(theirs));
+        let mut ours = captured_flow(
+            request("GET", "http://t:8080/ours?q=1", &[], None),
+            200,
+            &[],
+            b"",
+        );
+        ours.metadata.marks = vec![format!("scan:{JOB_ID}"), "crawl".to_string()];
+        store.insert(Flow::Http(ours));
+        let mut marked_only = captured_flow(
+            request("GET", "http://t:8080/marked?q=1", &[], None),
+            200,
+            &[],
+            b"",
+        );
+        marked_only.metadata.marks = vec!["scan:scan-other001".to_string()];
+        store.insert(Flow::Http(marked_only));
+        let client = Arc::new(site(&[]));
+        let job = FakeJob::new(profile(|p| p.crawl.max_pages = 0), Arc::clone(&client))
+            .with_store(Arc::clone(&store));
+
+        let discovery = discover(&job, &[ORIGIN]).await;
+
+        let templates: BTreeSet<String> = discovery
+            .nodes
+            .iter()
+            .map(|node| node.path_template.clone())
+            .collect();
+        assert_eq!(
+            templates,
+            ["/marked", "/ours"]
+                .iter()
+                .map(|template| (*template).to_string())
+                .collect::<BTreeSet<String>>()
+        );
+        assert_eq!(client.sent.lock().unwrap().len(), 0);
     }
 }
