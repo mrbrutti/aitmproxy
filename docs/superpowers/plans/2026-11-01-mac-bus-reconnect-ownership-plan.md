@@ -540,8 +540,14 @@ from `$W/apps/mac`. The external core is the one the orchestrator already staged
 config `/tmp/claude/192-ext/config.yaml` (`listen: "127.0.0.1:18192"`, bus `loopback_tcp` port
 `18193`, agent + operator tokens), started with `/tmp/claude/192-ext/start-core.sh` (or
 `AITM_CONFIG=/tmp/claude/192-ext/config.yaml <aitm>`), with the upstream
-`python3 -m http.server 18099 --bind 127.0.0.1`. The same core may serve the red and the green
-run. Keep the logs under `/tmp/claude/`.
+`python3 -m http.server 18099 --bind 127.0.0.1`. **Each self-test run needs a FRESH external core** (orchestrator correction, 2026-11-01): the
+live self-test assumes the core's defaults. A core reused from an earlier run already has the
+upstream in scope (so `settle { scopeHosts.contains(upstream) }` returns before the `scope.add`
+reply lands) and keeps that run's last breakpoint rules, because `flow.intercept {enabled: false}`
+leaves the core's rule set alone and the app sends `rules` only when it has some; the first
+`arm(true)` then parks only the stale rule's matches ("a request through the armed proxy parks"
+fails). Restart the core between runs (`/tmp/claude/192-ext/restart-core.sh`). Keep the logs under
+`/tmp/claude/`.
 
 | # | When | Command | Expected last line (and exit) |
 |---|---|---|---|
