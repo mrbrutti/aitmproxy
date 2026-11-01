@@ -58,7 +58,7 @@ const MAX_SLEEP_SECS: u64 = 5;
 /// Most headers the CRLF seed will inject from one value.
 const MAX_INJECTED_HEADERS: usize = 16;
 
-/// Dispatch: only the nine paths below belong to this module; everything else
+/// Dispatch: only the ten paths below belong to this module; everything else
 /// returns `None` so the router can fall through to the other route modules.
 pub(crate) async fn route(info: &RequestInfo, state: &Arc<AppState>) -> Option<Resp> {
     let mode = state.mode;
@@ -69,14 +69,16 @@ pub(crate) async fn route(info: &RequestInfo, state: &Arc<AppState>) -> Option<R
         }
         ("GET", "/items") => {
             let id = info.query_param("id").unwrap_or_default();
-            // The timing seed shares the route with the boolean one: decide
-            // first (pure), then sleep, then answer. Patched never sleeps.
-            if mode == SeedMode::Vulnerable {
-                if let Some(secs) = sleep_seconds(&id) {
-                    tokio::time::sleep(Duration::from_secs(secs)).await;
-                }
-            }
             Some(sqli_items(mode, &id))
+        }
+        ("GET", "/orders") => {
+            let id = info.query_param("id").unwrap_or_default();
+            // Decide first (pure), then sleep, then answer. Patched never sleeps.
+            let (resp, sleep) = sqli_time(mode, &id);
+            if let Some(secs) = sleep {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+            }
+            Some(resp)
         }
         ("GET", "/ping") => {
             let host = info.query_param("host").unwrap_or_default();
@@ -176,6 +178,8 @@ impl BoolVerdict {
 
 /// Vulnerable: the id is "concatenated into the query", so an injected
 /// `AND`/`OR` comparison changes the row count. Patched: integers only.
+/// Never sleeps in either mode: the timing technique has its own route
+/// (`/orders`), so the two are two insertion points, not one issue.
 fn sqli_items(mode: SeedMode, id: &str) -> Resp {
     if mode == SeedMode::Patched && !is_integer(id) {
         return html(StatusCode::BAD_REQUEST, "invalid id".to_string());
@@ -231,7 +235,27 @@ fn unquote(s: &str) -> &str {
     s.trim().trim_matches(['\'', '"']).trim()
 }
 
-// --- Seed 3: time-based SQLi (`GET /items?id=`, same route) ------------------
+// --- Seed 3: time-based SQLi (`GET /orders?id=`) ------------------------------
+
+/// Vulnerable: the id is "concatenated into the query", so a `SLEEP(n)` /
+/// `pg_sleep(n)` / `WAITFOR DELAY` in it stalls the answer `min(n, 5)` s
+/// before the order page echoes the (HTML-escaped) id. Patched: integers
+/// only, else 400, and it never sleeps. Returns the response plus the seconds
+/// the caller must sleep first.
+fn sqli_time(mode: SeedMode, id: &str) -> (Resp, Option<u64>) {
+    if mode == SeedMode::Patched {
+        if !is_integer(id) {
+            return (html(StatusCode::BAD_REQUEST, "invalid id"), None);
+        }
+        return (order_body(id), None);
+    }
+    (order_body(id), sleep_seconds(id))
+}
+
+/// `<p>order <id></p>`, the id escaped (this is a timing seed, not an XSS one).
+fn order_body(id: &str) -> Resp {
+    html(StatusCode::OK, format!("<p>order {}</p>", html_escape(id)))
+}
 
 /// The sleep a time-based payload asks for, in seconds, capped at
 /// [`MAX_SLEEP_SECS`]. Recognises `SLEEP(n)` (which also covers PostgreSQL's
@@ -798,6 +822,8 @@ mod tests {
             ("GET", "/api/login"),
             ("GET", "/xml"),
             ("GET", "/productsx"),
+            ("POST", "/orders"),
+            ("GET", "/orders/1"),
         ] {
             let info = RequestInfo::test_request(method, target, &[], b"");
             assert!(
@@ -853,10 +879,30 @@ mod tests {
         assert_eq!(sleep_seconds("1; WAITFOR DELAY '0:0:2'"), Some(2));
         assert_eq!(sleep_seconds("1"), None);
 
-        // Patched never sleeps: the 400 comes back (the sleep decision is
-        // pinned above; a wall-clock bound here would only flake).
-        let (status, _, _) = get(P, "/items?id=1%20AND%20SLEEP(3)").await;
+        // The timing seed lives on its own route (`/orders`), so the boolean
+        // and the timing technique are two insertion points.
+        let (status, _, body) = get(V, "/orders?id=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<p>order 1</p>");
+        let (status, _, body) = get(P, "/orders?id=1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<p>order 1</p>");
+        // Patched never sleeps: integer only, the 400 comes back at once.
+        let started = Instant::now();
+        let (status, _, body) = get(P, "/orders?id=1%20AND%20SLEEP(3)").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body, "invalid id");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // `/items` keeps only the boolean seed and never sleeps, in V either.
+        let started = Instant::now();
+        let (status, _, body) = get(V, "/items?id=1%20AND%20SLEEP(1)").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<p>items: 0</p>");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "/items must not sleep: {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
@@ -1117,17 +1163,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqli_time_sleeps_in_v_then_answers_boolean() {
-        // Spec D3 `sqli-time-items`: V sleeps min(n, 5) s, then gives the
-        // boolean seed's answer. One real second pins the timing oracle at
-        // the route, not only in the pure parser.
+    async fn sqli_time_sleeps_on_orders_in_v() {
+        // Spec D3 `sqli-time-orders-id`: V sleeps min(n, 5) s, then echoes
+        // the (escaped) id. One real second pins the timing oracle at the
+        // route, not only in the pure parser.
         let started = Instant::now();
-        let (status, _, body) = get(V, "/items?id=1%20AND%20SLEEP(1)").await;
+        let (status, _, body) = get(V, "/orders?id=1%20AND%20SLEEP(1)").await;
         let elapsed = started.elapsed();
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, "<p>items: 0</p>");
+        assert_eq!(body, "<p>order 1 AND SLEEP(1)</p>");
         assert!(elapsed >= Duration::from_secs(1), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+        // The echoed id is HTML-escaped: the timing seed is not an XSS seed.
+        let (status, _, body) = get(V, "/orders?id=1%3Cb%3E").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "<p>order 1&lt;b&gt;</p>");
 
         assert_eq!(sleep_seconds("1 and sleep(2)"), Some(2));
         assert_eq!(sleep_seconds("1 AND SLEEP(999999999)"), Some(5));

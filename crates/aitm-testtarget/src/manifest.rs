@@ -116,14 +116,14 @@ pub fn manifest() -> &'static [PlantedVuln] {
                     "sqli-boolean-items-id",
                     "sqli",
                     "/items",
-                    "GET /items?id=1 AND 1=1 vs id=1 AND 1=2 differ (<p>items: 1</p> / <p>items: 0</p>); id=1 OR 1=1 -> all five; patched: integer only, else 400",
+                    "GET /items?id=1 AND 1=1 vs id=1 AND 1=2 differ (<p>items: 1</p> / <p>items: 0</p>); id=1 OR 1=1 -> all five; patched: integer only, else 400; never sleeps in either mode (the timing seed is /orders)",
                     "<p>items: 5</p>",
                 ),
                 planted(
-                    "sqli-time-items",
+                    "sqli-time-orders-id",
                     "sqli",
-                    "/items",
-                    "GET /items?id=1 AND SLEEP(3) (also pg_sleep(n), WAITFOR DELAY '0:0:n', case-insensitive) sleeps min(n,5) s before the boolean answer; patched never sleeps",
+                    "/orders",
+                    "GET /orders?id=1 AND SLEEP(3) (also pg_sleep(n), WAITFOR DELAY '0:0:n', case-insensitive) sleeps min(n,5) s before <p>order <id></p>; patched: integer only, else 400, never sleeps",
                     "elapsed >= n s",
                 ),
                 planted(
@@ -450,8 +450,8 @@ const fn seed_route(
 /// One row per planted seed on a real route (the three passive rows, which are
 /// properties of every response, have none). `/search` and `/comments` are
 /// linked by both an anchor and a form; their rows record the form, since the
-/// anchor is pinned separately by the index test. `/items` and `/ws` each
-/// carry two seeds and so appear twice, once per id.
+/// anchor is pinned separately by the index test. `/ws` carries two seeds
+/// and so appears twice, once per id.
 pub fn seed_index() -> &'static [SeedRoute] {
     static SEED_INDEX: [SeedRoute; 25] = [
         seed_route("reflected-xss-search-q", "GET", "/search", Discovery::Form),
@@ -467,7 +467,12 @@ pub fn seed_index() -> &'static [SeedRoute] {
             Discovery::Anchor,
         ),
         seed_route("sqli-boolean-items-id", "GET", "/items", Discovery::Anchor),
-        seed_route("sqli-time-items", "GET", "/items", Discovery::Anchor),
+        seed_route(
+            "sqli-time-orders-id",
+            "GET",
+            "/orders?id=1",
+            Discovery::Anchor,
+        ),
         seed_route("cmdi-ping-host", "GET", "/ping", Discovery::Anchor),
         seed_route("ssti-greet-name", "GET", "/greet", Discovery::Anchor),
         seed_route("traversal-static-file", "GET", "/static", Discovery::Anchor),
@@ -604,7 +609,26 @@ mod tests {
             by_id("sqli-error-products-id").success_signal,
             "SQL syntax error near"
         );
-        assert_eq!(by_id("sqli-time-items").vulnerable_path, "/items");
+        assert_eq!(by_id("sqli-time-orders-id").vulnerable_path, "/orders");
+        assert_eq!(by_id("sqli-time-orders-id").patched_path, "/orders");
+        assert!(
+            by_id("sqli-time-orders-id")
+                .trigger_hint
+                .contains("/orders?id=1 AND SLEEP(3)"),
+            "{}",
+            by_id("sqli-time-orders-id").trigger_hint
+        );
+        assert!(
+            by_id("sqli-boolean-items-id")
+                .trigger_hint
+                .contains("never sleeps"),
+            "{}",
+            by_id("sqli-boolean-items-id").trigger_hint
+        );
+        assert!(
+            manifest().iter().all(|v| v.id != "sqli-time-items"),
+            "the time seed left /items"
+        );
         assert_eq!(
             by_id("cmdi-ping-host").success_signal,
             "uid=0(root) gid=0(root)"
@@ -806,7 +830,13 @@ mod tests {
         assert_eq!(row("ws-cswsh").path, "/ws");
         assert_eq!(row("ws-input-reflection").discovery, Discovery::Ws);
         assert_eq!(row("sqli-boolean-items-id").path, "/items");
-        assert_eq!(row("sqli-time-items").path, "/items");
+        assert_eq!(row("sqli-time-orders-id").path, "/orders?id=1");
+        assert_eq!(row("sqli-time-orders-id").discovery, Discovery::Anchor);
+        assert_eq!(
+            seed_index().iter().filter(|r| r.path == "/items").count(),
+            1,
+            "/items appears once"
+        );
     }
 
     // --- Tester additions (stage 5): the L4 table agrees with the speakers ---

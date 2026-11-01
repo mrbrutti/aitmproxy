@@ -566,6 +566,7 @@ const INDEX_LINKS: &[&str] = &[
     "/profile/1",
     "/products?id=1",
     "/items?id=1",
+    "/orders?id=1",
     "/ping?host=localhost",
     "/greet?name=world",
     "/static?file=readme.txt",
