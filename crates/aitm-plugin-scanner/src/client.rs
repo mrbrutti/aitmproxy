@@ -1116,4 +1116,314 @@ mod tests {
             .expect("probe");
         assert_eq!(stub.seen()[1].version, VersionPolicy::H1);
     }
+
+    // ---- tester additions ---------------------------------------------------
+
+    /// Pacing is bounded (wave-1 security review: "never spin in the pacer"):
+    /// after `MAX_RATE_RETRIES` attempts the guard's own refusal is handed
+    /// back, the probe cost one budget unit, and it counts as one error.
+    #[tokio::test]
+    async fn rate_limit_retries_are_bounded() {
+        let outcomes: Vec<Outcome> = (0..MAX_RATE_RETRIES + 2)
+            .map(|_| {
+                Outcome::Guard(GuardError::RateLimited {
+                    retry_after: Duration::from_millis(1),
+                })
+            })
+            .collect();
+        let stub = StubClient::new(outcomes);
+        let budget = loose_budget(10);
+        let meter = Arc::new(ProbeMeter::default());
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            budget.clone(),
+            meter.clone(),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            lenient_hosts(),
+        );
+
+        let started = Instant::now();
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("a host that never stops rate limiting is given up on");
+        // The wave-2/3 quality fix may wrap the guard's refusal in a typed
+        // `ProbeRefused`; either way the text must name the rate limit.
+        assert!(
+            err.to_string().contains("rate limited"),
+            "the refusal names the rate limit: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            stub.calls() as u32,
+            MAX_RATE_RETRIES,
+            "exactly the attempt ceiling"
+        );
+        assert_eq!(
+            meter.rate_waits.load(Ordering::SeqCst) as u32,
+            MAX_RATE_RETRIES - 1
+        );
+        assert_eq!(meter.errors.load(Ordering::SeqCst), 1);
+        assert_eq!(meter.sent.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            budget.spent(),
+            1,
+            "one probe, one unit, however many retries"
+        );
+        assert_eq!(
+            meter.ladder_state("ex.test"),
+            LadderState::Ok,
+            "being rate limited is not a host failure"
+        );
+    }
+
+    /// The Task 8 amendment's `LADDER_MIN_SAMPLE = 10`: the ratio rule is
+    /// silent until a host has ten outcomes in its window (nine failures of
+    /// nine is not a ratio), and speaks at exactly the tenth.
+    #[tokio::test]
+    async fn ratio_rule_needs_ten_outcomes() {
+        let stub = StubClient::new((0..10).map(|_| Outcome::Ok(500)).collect());
+        let meter = Arc::new(ProbeMeter::default());
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            loose_budget(20),
+            meter.clone(),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            PerHostErrors {
+                consecutive: 100,
+                ratio: 0.5,
+            },
+        );
+
+        for i in 0..9 {
+            client
+                .send(req_to("ex.test"))
+                .await
+                .expect("a 5xx is an answer");
+            assert_eq!(
+                meter.ladder_state("ex.test"),
+                LadderState::Ok,
+                "{} failures of {} is below the sample floor",
+                i + 1,
+                i + 1
+            );
+        }
+        client
+            .send(req_to("ex.test"))
+            .await
+            .expect("the tenth answer");
+        assert_eq!(
+            meter.ladder_state("ex.test"),
+            LadderState::Tripped,
+            "ten of ten over 0.5 trips at the floor"
+        );
+        assert_eq!(stub.calls(), 10);
+
+        // The ratio is per host: another host starts clean.
+        assert_eq!(meter.ladder_state("other.test"), LadderState::Ok);
+    }
+
+    /// A guard refusal other than a rate limit is a typed `ProbeRefused::Guard`
+    /// counted once; the proxy's own `HostDisabled` breaker is answered as a
+    /// `HostLadder` refusal and marks the host's ladder without being counted
+    /// as a transport error.
+    #[tokio::test]
+    async fn guard_refusals_are_typed_and_host_disabled_is_a_ladder_refusal() {
+        let stub = StubClient::new(vec![
+            Outcome::Guard(GuardError::OutOfScope("ex.test".into())),
+            Outcome::Guard(GuardError::HostDisabled),
+            Outcome::Ok(200),
+        ]);
+        let meter = Arc::new(ProbeMeter::default());
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            loose_budget(10),
+            meter.clone(),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            lenient_hosts(),
+        );
+
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("out of scope is refused");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Guard(GuardError::OutOfScope(
+                "ex.test".into()
+            ))),
+            "{err}"
+        );
+        assert!(err.to_string().contains("out of scope"), "{err}");
+        assert_eq!(meter.errors.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            meter.ladder_state("ex.test"),
+            LadderState::Ok,
+            "one failure under lenient rules is not a trip"
+        );
+
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("a disabled host is refused");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::HostLadder("ex.test".into())),
+            "{err}"
+        );
+        assert_eq!(stub.calls(), 2);
+
+        // Not tripped by the lenient rules, so the next probe still reaches the
+        // sender: `HostDisabled` agrees with the ladder but does not force it.
+        // What *is* pinned: the job never overrides the proxy's breaker.
+        let third = client.send(req_to("ex.test")).await;
+        assert!(third.is_ok(), "{third:?}");
+        assert_eq!(stub.calls(), 3);
+        assert_eq!(
+            meter.sent.load(Ordering::SeqCst),
+            1,
+            "only the answered probe counts as sent"
+        );
+    }
+
+    /// Spec D5 "one budget per job": twenty lanes racing for a budget of five
+    /// get exactly five sends between them, and the sender sees exactly five.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sends_never_overdraw_the_budget() {
+        let stub = StubClient::new((0..20).map(|_| Outcome::Ok(200)).collect());
+        let budget = loose_budget(5);
+        let client = Arc::new(JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            budget.clone(),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            lenient_hosts(),
+        ));
+
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.send(req_to("ex.test")).await.is_ok() })
+            })
+            .collect();
+        let mut ok = 0;
+        for task in tasks {
+            if task.await.expect("the task ran") {
+                ok += 1;
+            }
+        }
+
+        assert_eq!(ok, 5, "exactly the budget's worth of probes succeeded");
+        assert_eq!(stub.calls(), 5, "the sender never saw an over-budget probe");
+        assert_eq!(budget.spent(), 5);
+        assert_eq!(budget.left(), 0);
+    }
+
+    /// A deadline that has already passed, or a token already cancelled,
+    /// refuses without polling the sender at all.
+    #[tokio::test]
+    async fn an_expired_deadline_or_cancelled_job_refuses_without_sending() {
+        let stub = StubClient::new(vec![Outcome::Ok(200)]);
+        let expired = Arc::new(JobBudget::new(
+            10,
+            Instant::now() - Duration::from_secs(1),
+            CancellationToken::new(),
+        ));
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            expired,
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            lenient_hosts(),
+        );
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the deadline has passed");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Deadline)
+        );
+        assert_eq!(stub.calls(), 0, "nothing is sent after the deadline");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let stub = StubClient::new(vec![Outcome::Sleep(Duration::from_secs(5))]);
+        let client = JobClient::new(
+            stub.clone(),
+            "scan-1a2b3c4d",
+            Arc::new(JobBudget::new(
+                10,
+                Instant::now() + Duration::from_secs(60),
+                cancel,
+            )),
+            Arc::new(ProbeMeter::default()),
+            RecordProbes::IssuesOnly,
+            HttpVersionPolicy::Auto,
+            lenient_hosts(),
+        );
+        let started = Instant::now();
+        let err = client
+            .send(req_to("ex.test"))
+            .await
+            .expect_err("the job is cancelled");
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Cancelled)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a pre-cancelled job must not wait on the sender: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// `bounded_await` names the tighter of the two bounds, and `JobBudget`
+    /// arithmetic saturates: a `u32::MAX` charge against a small budget is a
+    /// clean refusal, not an overflow.
+    #[tokio::test]
+    async fn bounded_await_and_budget_edges() {
+        let cancel = CancellationToken::new();
+        let soon = Instant::now() + Duration::from_millis(20);
+        let end = bounded_await(soon, &cancel, tokio::time::sleep(Duration::from_secs(5)))
+            .await
+            .expect_err("the deadline is the tighter bound");
+        assert_eq!(end, AwaitEnd::Deadline);
+
+        let value = bounded_await(Instant::now() + Duration::from_secs(60), &cancel, async {
+            7
+        })
+        .await
+        .expect("a ready future completes");
+        assert_eq!(value, 7);
+
+        let budget = JobBudget::new(3, Instant::now() + Duration::from_secs(60), cancel);
+        assert!(!budget.charge(u32::MAX), "an overdraw is refused");
+        assert_eq!(budget.spent(), 0, "a refused charge spends nothing");
+        assert!(budget.charge(0), "a zero charge is free");
+        assert!(budget.charge(3));
+        assert_eq!(budget.left(), 0);
+        assert!(!budget.charge(1));
+
+        let huge = JobBudget::new(
+            u64::MAX,
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+        );
+        assert_eq!(huge.left(), u32::MAX, "`left` saturates for the wire field");
+    }
 }

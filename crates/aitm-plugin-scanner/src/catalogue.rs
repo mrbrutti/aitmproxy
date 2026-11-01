@@ -634,4 +634,109 @@ mod tests {
             "excluding everything selects nothing"
         );
     }
+
+    // ---- tester additions ---------------------------------------------------
+
+    /// A script entry that claims `origin: native` is not native: it ranks after
+    /// every bundled and custom script, so it can neither outrank a real native
+    /// check nor a bundled one for the same id — and an origin token the
+    /// `scan.checks` vocabulary does not know filters to nothing.
+    #[test]
+    fn a_script_claiming_native_origin_ranks_last() {
+        let liar = CheckRegistry::new();
+        liar.add("liar", {
+            let mut meta = null_meta("shared");
+            meta.description = "claims to be native".to_string();
+            meta.origin = CheckOrigin::Native;
+            Arc::new(NullCheck::new(meta))
+        })
+        .expect("new id");
+        let honest = CheckRegistry::new();
+        honest
+            .add("custom", {
+                let mut meta = null_meta("shared");
+                meta.description = "the custom one".to_string();
+                meta.origin = CheckOrigin::Custom {
+                    path: "/home/op/c.rhai".to_string(),
+                };
+                Arc::new(NullCheck::new(meta))
+            })
+            .expect("new id");
+        // Assemble the liar against a real native check: the native wins.
+        let native = vec![check("shared", |m| {
+            m.description = "the real native".to_string()
+        })];
+        let catalogue = assemble(&[], &native, &liar);
+        assert_eq!(
+            catalogue.get("shared").expect("kept").meta().description,
+            "the real native"
+        );
+        assert_eq!(
+            catalogue.conflicts(),
+            [CheckConflict {
+                id: "shared".to_string(),
+                kept: "native".to_string(),
+                refused: "native".to_string(),
+            }],
+            "the refused source is labelled by its claimed origin"
+        );
+        assert!(
+            catalogue.conflicts()[0].to_string().contains("shared"),
+            "{}",
+            catalogue.conflicts()[0]
+        );
+
+        assert!(
+            origin_rank(&CheckOrigin::Native)
+                > origin_rank(&CheckOrigin::Custom {
+                    path: String::new()
+                }),
+            "a script claiming native ranks after custom"
+        );
+        assert!(
+            origin_rank(&CheckOrigin::Custom {
+                path: String::new()
+            }) > origin_rank(&CheckOrigin::Bundled {
+                path: String::new()
+            }),
+            "custom ranks after bundled"
+        );
+
+        let catalogue = assemble(&[], &[], &honest);
+        assert!(catalogue.filter(None, None, Some("script")).is_empty());
+        assert!(catalogue.filter(None, None, Some("")).is_empty());
+        assert_eq!(catalogue.filter(None, None, Some("custom")).len(), 1);
+        assert!(catalogue.conflicts().is_empty());
+    }
+
+    /// An empty catalogue is a legal one: every lookup is empty, every selector
+    /// that is not a lane token is unknown, and an all-lane selection is `Ok`.
+    #[test]
+    fn an_empty_catalogue_answers_every_question() {
+        let catalogue = assemble(&[], &[], &CheckRegistry::new());
+        assert!(catalogue.all().is_empty());
+        assert!(catalogue.metas().is_empty());
+        assert!(catalogue.get("anything").is_none());
+        assert!(catalogue.conflicts().is_empty());
+        assert!(catalogue.filter(None, None, None).is_empty());
+        catalogue
+            .validate_selection(&CheckSelection {
+                include: vec!["lane:http".to_string()],
+                exclude: vec!["lane:ws".to_string()],
+            })
+            .expect("lane tokens are valid without entries");
+        let err = catalogue
+            .validate_selection(&CheckSelection {
+                include: vec![String::new()],
+                exclude: Vec::new(),
+            })
+            .expect_err("an empty entry names nothing");
+        assert_eq!(err.to_string(), "scan: unknown_check: ");
+        assert!(catalogue
+            .selected(&CheckSelection {
+                include: vec!["lane:http".to_string()],
+                exclude: Vec::new(),
+            })
+            .is_empty());
+    }
 }

@@ -5378,4 +5378,146 @@ mod tests {
         );
         assert_eq!(probe(&server()), json!(false));
     }
+
+    // ------------------- Task 5 (tester): edges of the job push and the gate
+
+    /// B16: a notification's `params` must be an object. A publisher whose
+    /// payload is not one (a string, a number, null) still gets a well-formed
+    /// line: the envelope fields alone, and nothing of the stray payload.
+    #[test]
+    fn job_payload_that_is_not_an_object_yields_envelope_only_params() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let (srv, _store) = revoke_server_with_store(&state);
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+
+        for payload in [Value::Str("stray".into()), Value::Int(7), Value::Null] {
+            srv.push_job_event(&job_event("progress", 4, payload.clone()));
+            let line = job_one_line(&operator);
+            let params = line["params"]
+                .as_object()
+                .unwrap_or_else(|| panic!("params is an object for {payload:?}: {line}"));
+            let mut keys: Vec<&str> = params.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["event", "job", "kind", "seq"],
+                "only the envelope for {payload:?}: {line}"
+            );
+            assert_eq!(line["params"]["seq"], json!(4), "{line}");
+            assert_eq!(line["params"]["job"], json!("scan-1a2b3c4d"), "{line}");
+            assert!(
+                !line.to_string().contains("stray"),
+                "a non-object payload never leaks into the line: {line}"
+            );
+        }
+    }
+
+    /// `spawn_push_dispatcher` is idempotent on the job stream too: two calls on
+    /// one server deliver each published event once, not twice.
+    #[tokio::test]
+    async fn job_dispatcher_is_spawned_once() {
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let bus = Arc::new(JobBus::default());
+        let srv = Arc::new(
+            McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio)
+                .with_agent_state(state)
+                .with_services(
+                    Arc::new(MemFlowStore::new()),
+                    Arc::new(NoClient),
+                    Arc::new(StdGuard::default()),
+                    None,
+                )
+                .with_jobs(bus.clone()),
+        );
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+        srv.spawn_push_dispatcher();
+        srv.spawn_push_dispatcher();
+        assert_eq!(
+            bus.receiver_count(),
+            1,
+            "a second spawn takes no second subscription"
+        );
+
+        bus.publish(job_event("started", 1, job_object(vec![])));
+        bus.publish(job_event("finished", 2, job_object(vec![])));
+
+        let sink = operator.out.clone().expect("the connection has a sink");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut lines = Vec::new();
+        while lines.len() < 2 && Instant::now() < deadline {
+            lines.extend(sink.drain());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Give a (wrongly) doubled dispatcher time to show itself.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        lines.extend(sink.drain());
+        let events: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let v: JsonValue = serde_json::from_str(l).expect("JSON");
+                v["params"]["event"].as_str().unwrap_or("").to_string()
+            })
+            .collect();
+        assert_eq!(
+            events,
+            ["started", "finished"],
+            "each event exactly once, in order: {lines:?}"
+        );
+    }
+
+    /// Call B6 widens the `auto` gate by exactly one name. Every other Sensitive
+    /// command — whatever it is called, `scan.*` included — keeps the generic
+    /// refusal and is never invoked.
+    #[test]
+    fn only_scan_start_defers_to_its_command_under_auto() {
+        let others = [
+            "l4.inject",
+            "l4.scope.add",
+            "poc.run",
+            "scan.map",
+            "scan.cancel",
+            "scan.issue.update",
+            "scan.start.now",
+            "proxy.system.enable",
+        ];
+        let state = Arc::new(AgentState::new(AgentPolicy::Auto));
+        let mut registry = Registry::new();
+        registry.add_command(Arc::new(JobGateStub("scan.start")));
+        for name in others {
+            registry.add_command(Arc::new(JobGateStub(name)));
+        }
+        let srv = McpServer::new(Arc::new(registry), McpTransport::Stdio)
+            .with_agent_state(state)
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+
+        for name in others {
+            let result = job_agent_call(&srv, name);
+            assert_eq!(result["isError"], json!(true), "{name}: {result}");
+            let text = result["content"][0]["text"]
+                .as_str()
+                .expect("the result carries text");
+            assert!(
+                text.contains("permits no sensitive actions"),
+                "{name} keeps the generic `auto` refusal: {text}"
+            );
+            assert!(
+                !text.contains("test gate"),
+                "{name} was invoked under `auto`: {text}"
+            );
+        }
+
+        let result = job_agent_call(&srv, "scan.start");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("the result carries text");
+        assert!(
+            text.contains("scan: refused_agent: test gate"),
+            "scan.start alone answers in its own vocabulary: {text}"
+        );
+    }
 }

@@ -1176,4 +1176,147 @@ mod tests {
             .expect_err("a zero time budget is refused")
             .contains("budget.time_s"));
     }
+
+    // ---- tester additions (edges of the saved store and the resolver) -----
+
+    /// A hand-edited saved file that no longer parses is `invalid_profile`
+    /// naming the file — never a silent fallback to a config or built-in
+    /// profile of the same name — and `list()` skips it rather than going blank.
+    #[test]
+    fn a_malformed_saved_file_is_invalid_profile_not_a_silent_fallback() {
+        let tmp = TempFindings::new();
+        let mut cfg = tmp.config();
+        cfg.profiles
+            .insert("broken".to_string(), named_profile("broken"));
+        let profiles = Profiles::new(&cfg);
+
+        let dir = tmp.path().join("scan").join("profiles");
+        std::fs::create_dir_all(&dir).expect("the profiles dir is created");
+        std::fs::write(dir.join("broken.yaml"), "name: [unclosed\n  lanes: :::\n")
+            .expect("the broken file is written");
+        std::fs::write(dir.join("good.yaml"), "name: good\nlanes: [http]\n")
+            .expect("the good file is written");
+
+        let err = profiles
+            .get("broken")
+            .expect_err("a broken saved file must not fall back to the config profile");
+        assert!(
+            err.to_string().starts_with("scan: invalid_profile:"),
+            "wire form: {err}"
+        );
+        assert!(
+            err.to_string().contains("broken.yaml"),
+            "names the file: {err}"
+        );
+
+        let listed = profiles.list();
+        assert!(
+            listed.iter().any(|e| e.name == "good" && !e.builtin),
+            "the readable saved profile is listed: {listed:?}"
+        );
+        assert!(
+            listed.iter().any(|e| e.name == "standard" && e.builtin),
+            "the built-ins are still listed: {listed:?}"
+        );
+        // The broken file shadows nothing in the list: the config entry shows.
+        assert_eq!(
+            listed.iter().filter(|e| e.name == "broken").count(),
+            1,
+            "one entry for the name, from the config layer: {listed:?}"
+        );
+    }
+
+    /// Spec D2 origin normal form: a port that is the scheme's default is the
+    /// same origin as no port at all, and `overrides` must be an object.
+    #[test]
+    fn default_ports_and_non_object_overrides() {
+        assert_eq!(
+            normalize_origin("http://h:80/"),
+            Ok("http://h".to_string()),
+            "`:80` on http is the default port"
+        );
+        assert_eq!(
+            normalize_origin("HTTPS://H.Example:443"),
+            Ok("https://h.example".to_string()),
+            "`:443` on https is the default port"
+        );
+        assert_eq!(
+            normalize_origin("http://h:443"),
+            Ok("http://h:443".to_string()),
+            "a non-default port is kept"
+        );
+        assert!(
+            normalize_origin("http://h/?q=1").is_err(),
+            "a query is refused"
+        );
+        assert!(
+            normalize_origin("http://h/#frag").is_err(),
+            "a fragment is refused"
+        );
+
+        let cfg = ScannerConfig::default();
+        let profiles = Profiles::new(&cfg);
+        for bad in [serde_json::json!([1, 2]), serde_json::json!("probes=5")] {
+            let err = profiles
+                .resolve(
+                    &cfg,
+                    StartArgs {
+                        target: Some("http://127.0.0.1:8080".to_string()),
+                        overrides: Some(bad.clone()),
+                        ..StartArgs::default()
+                    },
+                )
+                .expect_err("a non-object override is refused");
+            assert!(
+                err.to_string().starts_with("scan: invalid_profile:"),
+                "{bad}: {err}"
+            );
+            assert!(err.to_string().contains("overrides"), "{bad}: {err}");
+        }
+
+        let unchanged = profiles
+            .resolve(
+                &cfg,
+                StartArgs {
+                    target: Some("http://127.0.0.1:8080".to_string()),
+                    overrides: Some(serde_json::Value::Null),
+                    ..StartArgs::default()
+                },
+            )
+            .expect("a null override is no override");
+        assert_eq!(unchanged.name, "standard");
+    }
+
+    /// `target` alone needs the configured default profile to exist; an
+    /// operator who misspelt `scanner.default_profile` sees `not_found`
+    /// naming it, not a scan of some other profile.
+    #[test]
+    fn target_with_an_unknown_default_profile_is_not_found() {
+        let cfg = ScannerConfig {
+            default_profile: "nope".to_string(),
+            ..ScannerConfig::default()
+        };
+        let err = Profiles::new(&cfg)
+            .resolve(
+                &cfg,
+                StartArgs {
+                    target: Some("http://127.0.0.1:8080".to_string()),
+                    ..StartArgs::default()
+                },
+            )
+            .expect_err("an unknown default profile is refused");
+        assert_eq!(err.to_string(), "scan: not_found: profile `nope`");
+
+        // And a `profile_name` that no layer holds is the same refusal.
+        let err = Profiles::new(&cfg)
+            .resolve(
+                &cfg,
+                StartArgs {
+                    profile_name: Some("missing".to_string()),
+                    ..StartArgs::default()
+                },
+            )
+            .expect_err("an unknown profile name is refused");
+        assert_eq!(err.to_string(), "scan: not_found: profile `missing`");
+    }
 }

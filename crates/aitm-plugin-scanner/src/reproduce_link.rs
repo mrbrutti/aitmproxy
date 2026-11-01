@@ -939,4 +939,226 @@ mod tests {
         assert_eq!(client.sends(), 0, "no probe was spent");
         assert!(out.poc_ref.is_empty(), "no PoC was written");
     }
+
+    // ---- tester additions ---------------------------------------------------
+
+    /// A control that does not behave as the hint expected is reported as
+    /// `Some(false)` on the record — it is information for the triager, not a
+    /// veto: the reproduction passed, so the finding is still written with
+    /// `control_passed: false` in it.
+    #[tokio::test]
+    async fn a_failing_control_is_recorded_as_false_not_a_veto() {
+        let findings = ScratchDir::new();
+        let artifacts = ScratchDir::new();
+        let probe = probe_flow(&[], "q", MARK);
+        let issue = issue(Confidence::Certain, &probe);
+        let meta = meta();
+        let started = started_by();
+        let hint = PocHint {
+            assertions: vec![Assertion::word(MARK)],
+            control: Some(ControlHint {
+                payload: "benign".to_string(),
+                // The stub answers 200 to everything: this expectation fails.
+                expect: vec![Assertion::Status(404)],
+            }),
+        };
+        let client = StubClient::new(200, true);
+
+        let harness = Harness::new(Arc::clone(&client), Some(findings.path()));
+        let out = reproduce_and_record(
+            ReproductionInput {
+                issue: &issue,
+                hint: &hint,
+                probe_flow: &probe,
+                payload: MARK,
+                meta: &meta,
+                started_by: &started,
+            },
+            &harness.host(),
+            Some(artifacts.path()),
+        )
+        .await
+        .expect("reproduction runs");
+
+        assert!(out.passed, "{out:?}");
+        assert_eq!(out.control_passed, Some(false), "{out:?}");
+        assert_eq!(
+            client.sends(),
+            2,
+            "the probe PoC and the control, once each"
+        );
+        assert!(
+            out.finding_id.is_some(),
+            "a failed control does not veto the record"
+        );
+        let records = findings.yaml_files();
+        assert_eq!(records.len(), 1);
+        let text = std::fs::read_to_string(&records[0]).expect("read the record");
+        assert!(
+            text.contains("control_passed: false"),
+            "the record carries the control's verdict: {text}"
+        );
+    }
+
+    /// The control is derived textually from the probe request. When the payload
+    /// text is in neither the path nor the body there is no control request to
+    /// build, so `control_passed` is `None` and no second probe is spent; and a
+    /// control never runs after a reproduction that did not pass.
+    #[tokio::test]
+    async fn control_is_skipped_without_the_payload_and_after_a_failed_run() {
+        let findings = ScratchDir::new();
+        let artifacts = ScratchDir::new();
+        let probe = probe_flow(&[], "q", MARK);
+        let issue = issue(Confidence::Firm, &probe);
+        let meta = meta();
+        let started = started_by();
+        let hint = PocHint {
+            assertions: vec![Assertion::word(MARK)],
+            control: Some(ControlHint {
+                payload: "benign".to_string(),
+                expect: vec![Assertion::Status(200)],
+            }),
+        };
+
+        // The payload the caller names is not the one in the request.
+        let client = StubClient::new(200, true);
+        let harness = Harness::new(Arc::clone(&client), Some(findings.path()));
+        let out = reproduce_and_record(
+            ReproductionInput {
+                issue: &issue,
+                hint: &hint,
+                probe_flow: &probe,
+                payload: "NOT-IN-THE-REQUEST",
+                meta: &meta,
+                started_by: &started,
+            },
+            &harness.host(),
+            Some(artifacts.path()),
+        )
+        .await
+        .expect("reproduction runs");
+        assert!(out.passed, "{out:?}");
+        assert_eq!(
+            out.control_passed, None,
+            "no control can be derived: {out:?}"
+        );
+        assert_eq!(
+            client.sends(),
+            1,
+            "no second probe for an underivable control"
+        );
+
+        // An empty payload cannot be replaced either.
+        let client = StubClient::new(200, true);
+        let harness = Harness::new(Arc::clone(&client), Some(findings.path()));
+        let out = reproduce_and_record(
+            ReproductionInput {
+                issue: &issue,
+                hint: &hint,
+                probe_flow: &probe,
+                payload: "",
+                meta: &meta,
+                started_by: &started,
+            },
+            &harness.host(),
+            Some(artifacts.path()),
+        )
+        .await
+        .expect("reproduction runs");
+        assert_eq!(out.control_passed, None, "{out:?}");
+        assert_eq!(client.sends(), 1);
+
+        // A reproduction that fails never spends a probe on the control.
+        let client = StubClient::new(200, false);
+        let harness = Harness::new(Arc::clone(&client), Some(findings.path()));
+        let out = reproduce_and_record(
+            ReproductionInput {
+                issue: &issue,
+                hint: &hint,
+                probe_flow: &probe,
+                payload: MARK,
+                meta: &meta,
+                started_by: &started,
+            },
+            &harness.host(),
+            Some(artifacts.path()),
+        )
+        .await
+        .expect("a failed reproduction is not an error");
+        assert!(!out.passed);
+        assert_eq!(out.control_passed, None, "{out:?}");
+        assert_eq!(client.sends(), 1, "the control did not run");
+        assert!(out.note.is_some_and(|n| n.contains("did not reproduce")));
+    }
+
+    /// Spec D1 "where a probe goes": the PoC is sent through `host.client()`,
+    /// so the job's guard is what decides scope. A client that refuses (here,
+    /// an out-of-scope guard error) makes the run a skipped one with a note:
+    /// never a finding, never an `Err` that would sink the job.
+    #[tokio::test]
+    async fn a_refusing_client_is_a_skipped_run_not_an_error() {
+        /// A client whose every send is refused by the guard.
+        struct RefusingClient(AtomicUsize);
+
+        impl ProxyClient for RefusingClient {
+            fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Err(anyhow::Error::new(aitm_core::GuardError::OutOfScope(
+                        req.authority,
+                    )))
+                })
+            }
+        }
+
+        let findings = ScratchDir::new();
+        let artifacts = ScratchDir::new();
+        let probe = probe_flow(&[], "q", MARK);
+        let issue = issue(Confidence::Certain, &probe);
+        let meta = meta();
+        let started = started_by();
+        let hint = PocHint {
+            assertions: vec![Assertion::word(MARK)],
+            control: Some(ControlHint {
+                payload: "benign".to_string(),
+                expect: vec![Assertion::Status(200)],
+            }),
+        };
+        let client = RefusingClient(AtomicUsize::new(0));
+        let guard = StdGuard::default();
+        guard.add_scope(ScopeEntry {
+            host: TARGET_HOST.to_string(),
+        });
+        let store = MemFlowStore::new();
+        let config = Arc::new(config_with_dir(Some(findings.path())));
+        let host = CommandHost::new(&store, &client, &guard, None).with_config(config);
+
+        let out = reproduce_and_record(
+            ReproductionInput {
+                issue: &issue,
+                hint: &hint,
+                probe_flow: &probe,
+                payload: MARK,
+                meta: &meta,
+                started_by: &started,
+            },
+            &host,
+            Some(artifacts.path()),
+        )
+        .await
+        .expect("a refused reproduction is not an error");
+
+        assert!(!out.passed, "{out:?}");
+        assert_eq!(out.finding_id, None, "{out:?}");
+        assert_eq!(
+            out.control_passed, None,
+            "no control after a failed run: {out:?}"
+        );
+        assert!(out.note.is_some(), "the reason is reported: {out:?}");
+        assert!(
+            client.0.load(Ordering::SeqCst) <= 1,
+            "at most the one PoC send was attempted"
+        );
+        assert!(findings.yaml_files().is_empty(), "no finding file");
+    }
 }

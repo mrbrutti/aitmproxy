@@ -729,4 +729,194 @@ mod tests {
             "replayed with its headers unchanged"
         );
     }
+
+    // ---- tester additions ---------------------------------------------------
+
+    /// Spec D7's status-class rule, every branch: a `2xx` canary that comes back
+    /// `3xx`, `401` or `403` is lost; any other change (a `5xx`, a `404`, a
+    /// different `2xx`) is not evidence; and a canary that was never `2xx`
+    /// cannot report a loss at all.
+    #[tokio::test]
+    async fn canary_judges_every_status_class() {
+        let ok = CanaryRunner::new(&answered(
+            captured(id(11), "HEAD", "/me", &[("Cookie", "sid=abc")], 0),
+            204,
+        ))
+        .expect("a HEAD canary");
+        for (status, want) in [
+            (200, CanaryOutcome::Alive),
+            (204, CanaryOutcome::Alive),
+            (301, CanaryOutcome::Lost { status: 301 }),
+            (302, CanaryOutcome::Lost { status: 302 }),
+            (307, CanaryOutcome::Lost { status: 307 }),
+            (401, CanaryOutcome::Lost { status: 401 }),
+            (403, CanaryOutcome::Lost { status: 403 }),
+            (404, CanaryOutcome::Alive),
+            (429, CanaryOutcome::Alive),
+            (500, CanaryOutcome::Alive),
+            (503, CanaryOutcome::Alive),
+        ] {
+            let client = StubClient::new(status);
+            assert_eq!(
+                ok.check(&client).await.expect("the canary sends"),
+                want,
+                "a 2xx canary answered {status}"
+            );
+            let (req, _) = client.only_send();
+            assert_eq!(req.method, "HEAD", "the method is replayed as captured");
+        }
+
+        // Captured as a redirect: the session was never proven, so nothing
+        // the canary sees can prove it lost.
+        let never_2xx = CanaryRunner::new(&answered(
+            captured(id(12), "GET", "/me", &[("Cookie", "sid=abc")], 0),
+            302,
+        ))
+        .expect("a GET canary");
+        for status in [302, 401, 403, 200] {
+            assert_eq!(
+                never_2xx
+                    .check(&StubClient::new(status))
+                    .await
+                    .expect("sends"),
+                CanaryOutcome::Alive,
+                "a non-2xx canary answered {status} is not a loss"
+            );
+        }
+
+        // A captured flow without a response is treated the same way.
+        let unanswered =
+            CanaryRunner::new(&captured(id(13), "GET", "/me", &[("Cookie", "sid=abc")], 0))
+                .expect("a GET canary");
+        assert_eq!(
+            unanswered
+                .check(&StubClient::new(401))
+                .await
+                .expect("sends"),
+            CanaryOutcome::Alive
+        );
+
+        assert!(
+            CanaryRunner::new(&captured(id(14), "DELETE", "/me", &[], 0)).is_none(),
+            "a DELETE can never be a canary"
+        );
+    }
+
+    /// `from_flow` that is not a candidate — unknown, a replay, or carrying no
+    /// material — falls back to the newest candidate rather than failing.
+    #[test]
+    fn from_flow_that_is_not_a_candidate_falls_back_to_newest() {
+        let store = MemFlowStore::new();
+        let mut replay = captured(id(20), "GET", "/replay", &[("Cookie", "sid=zzz")], 0);
+        replay.metadata.is_replay = true;
+        store.insert(Flow::Http(replay));
+        store.insert(Flow::Http(captured(id(21), "GET", "/public", &[], 1)));
+        store.insert(Flow::Http(captured(
+            id(22),
+            "GET",
+            "/account",
+            &[("Cookie", "sid=abc")],
+            5,
+        )));
+
+        for from in [Some(id(99)), Some(id(20)), Some(id(21)), None] {
+            let picked = pick_observed(&store, ORIGIN, from).expect("a session");
+            assert_eq!(
+                picked.profile.source_flow,
+                Some(FlowRef(id(22))),
+                "from_flow {from:?} falls back to the newest candidate"
+            );
+            assert_eq!(picked.profile.cookies, vec!["sid".to_string()]);
+        }
+    }
+
+    /// Origin matching is on the normal form: authority case and the scheme's
+    /// default port do not split one origin, while another port or scheme does;
+    /// and a store with nothing to lift yields `None`, never an empty session.
+    #[test]
+    fn origin_normal_form_and_nothing_observed() {
+        let store = MemFlowStore::new();
+        let mut upper = captured(id(30), "GET", "/a", &[("Cookie", "sid=abc")], 0);
+        upper.request.authority = "EX.TEST:80".to_string();
+        store.insert(Flow::Http(upper));
+        let mut other_port = captured(id(31), "GET", "/b", &[("Cookie", "sid=other")], 0);
+        other_port.request.authority = "ex.test:8080".to_string();
+        store.insert(Flow::Http(other_port));
+        let mut tls = captured(id(32), "GET", "/c", &[("Cookie", "sid=tls")], 0);
+        tls.request.scheme = "https".to_string();
+        store.insert(Flow::Http(tls));
+
+        let picked = pick_observed(&store, "HTTP://ex.test/", None).expect("a session");
+        assert_eq!(picked.profile.source_flow, Some(FlowRef(id(30))));
+        assert_eq!(
+            picked.material.cookies,
+            vec![("sid".to_string(), "abc".to_string())]
+        );
+        assert_eq!(
+            pick_observed(&store, "http://ex.test:8080", None)
+                .expect("the other port has its own session")
+                .profile
+                .source_flow,
+            Some(FlowRef(id(31)))
+        );
+        assert_eq!(
+            pick_observed(&store, "https://ex.test", None)
+                .expect("the tls origin has its own session")
+                .profile
+                .source_flow,
+            Some(FlowRef(id(32)))
+        );
+        assert!(
+            pick_observed(&store, "http://nobody.test", None).is_none(),
+            "an origin with no captured flow has no session"
+        );
+
+        let bare = MemFlowStore::new();
+        bare.insert(Flow::Http(captured(
+            id(33),
+            "GET",
+            "/",
+            &[("Accept", "*/*")],
+            0,
+        )));
+        assert!(
+            pick_observed(&bare, ORIGIN, None).is_none(),
+            "a flow without material is not a session"
+        );
+        assert!(pick_observed(&MemFlowStore::new(), ORIGIN, None).is_none());
+    }
+
+    /// `apply` with nothing to apply leaves the request byte-for-byte alone, and
+    /// a malformed `Cookie` header yields only its well-formed pairs.
+    #[test]
+    fn apply_with_empty_material_and_malformed_cookies() {
+        let empty = SessionMaterial {
+            cookies: Vec::new(),
+            headers: Vec::new(),
+        };
+        let mut req = request("GET", "/p", &[("Accept", "text/html")]);
+        let before = format!("{req:?}");
+        apply(&empty, &mut req);
+        assert_eq!(format!("{req:?}"), before, "no material, no change");
+        assert!(!req.headers.has("cookie"), "no Cookie header is invented");
+
+        assert_eq!(
+            cookie_pairs(";; =novalue; a; b=1 ; c=x=y;"),
+            vec![
+                ("b".to_string(), "1".to_string()),
+                ("c".to_string(), "x=y".to_string())
+            ],
+            "empty names and name-less parts are dropped; `=` inside a value is kept"
+        );
+        assert!(cookie_pairs("").is_empty());
+
+        // A probe whose own Cookie header is malformed still gets the session.
+        let material = SessionMaterial {
+            cookies: vec![("sid".to_string(), "abc".to_string())],
+            headers: Vec::new(),
+        };
+        let mut odd = request("GET", "/p", &[("Cookie", ";;junk;;")]);
+        apply(&material, &mut odd);
+        assert_eq!(odd.headers.get("Cookie"), Some("sid=abc"));
+    }
 }

@@ -576,6 +576,8 @@ impl Check for LegacyActiveCheck {
                         assertions: vec![self.def.success_assertion(payload)],
                         control: None,
                     }),
+                    location: None,
+                    more: Vec::new(),
                 };
             }
             if !answered {
@@ -598,6 +600,8 @@ impl Check for LegacyActiveCheck {
                     point.name
                 ),
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             }
         })
     }
@@ -634,6 +638,8 @@ impl Check for LegacyPassiveCheck {
                     evidence: Evidence::default(),
                     detail: format!("no {} finding on the captured response", self.class),
                     poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
                 };
             };
             Verdict {
@@ -650,6 +656,8 @@ impl Check for LegacyPassiveCheck {
                 // response text or a header value.
                 detail: found.evidence,
                 poc_hint: None,
+                location: None,
+                more: Vec::new(),
             }
         })
     }
@@ -842,6 +850,8 @@ fn inconclusive(reason: &str) -> Verdict {
         evidence: Evidence::default(),
         detail: Evidence::excerpt(&scrub(reason)),
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 
@@ -1204,6 +1214,8 @@ mod tests {
         session: Option<Arc<SessionMaterial>>,
         budget: u32,
         charged: AtomicU32,
+        /// Set by a test that wants the job to read as cancelled.
+        cancelled: std::sync::atomic::AtomicBool,
     }
 
     impl TestJob {
@@ -1221,6 +1233,7 @@ mod tests {
                 session: None,
                 budget: 1000,
                 charged: AtomicU32::new(0),
+                cancelled: std::sync::atomic::AtomicBool::new(false),
             }
         }
 
@@ -1265,7 +1278,7 @@ mod tests {
             Instant::now() + Duration::from_secs(60)
         }
         fn cancelled(&self) -> bool {
-            false
+            self.cancelled.load(Ordering::SeqCst)
         }
         fn marker(&self) -> String {
             "aitm7f3a".to_string()
@@ -1800,5 +1813,290 @@ mod tests {
 
         assert_eq!(store.list().len(), 1, "nothing was crawled");
         assert_eq!(job.charged(), 0);
+    }
+
+    // ---- tester additions ---------------------------------------------------
+
+    /// The attack surface is what the target was asked for: a replay (the
+    /// scanner's own traffic), a flow to another origin and a non-HTTP flow
+    /// contribute no point and no node, while the origin's own captures do —
+    /// whatever case or default port their authority was captured with.
+    #[tokio::test]
+    async fn replays_other_origins_and_non_http_flows_are_not_attack_surface() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let mut replay = captured("http", "/replayed?r=1");
+        replay.metadata.is_replay = true;
+        store.insert(Flow::Http(replay));
+        let mut elsewhere = captured("http", "/other?o=1");
+        elsewhere.request.authority = "elsewhere.test".to_string();
+        store.insert(Flow::Http(elsewhere));
+        let mut tls = captured("https", "/secure?s=1");
+        tls.request.scheme = "https".to_string();
+        store.insert(Flow::Http(tls));
+        let mut odd_case = captured("http", "/mine?m=1");
+        odd_case.request.authority = "TARGET.TEST:80".to_string();
+        store.insert(Flow::Http(odd_case));
+        let job = TestJob::new(
+            Arc::clone(&store),
+            StubClient::new(Answer::Fixed(200, "", "")),
+        );
+
+        let discovery = discover_with(&job).await;
+
+        let names: Vec<&str> = discovery.points.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["m"], "only the origin's own capture: {names:?}");
+        assert_eq!(discovery.nodes.len(), 1, "{:?}", discovery.nodes);
+        assert_eq!(discovery.nodes[0].host, "target.test");
+        assert_eq!(discovery.nodes[0].port, 80);
+        assert_eq!(discovery.nodes[0].path_template, "/mine");
+
+        // An origin nobody captured maps to nothing, and an unparsable origin
+        // is skipped rather than matched against everything.
+        let empty = discover_origins(&job, &["http://nobody.test", "not-an-origin"]).await;
+        assert!(empty.points.is_empty() && empty.nodes.is_empty());
+    }
+
+    /// `probe.raw` needs an absolute URL on the point's origin: a relative path,
+    /// a scheme-less string and a userinfo-bearing URL to the same host are all
+    /// refused before anything is sent.
+    #[tokio::test]
+    async fn probe_raw_refuses_relative_and_malformed_urls() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured("http", "/search?q=hello")));
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let discovery = discover_with(&job).await;
+        let point = point_named(&discovery, "q").clone();
+        let host = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts probes for its own point");
+
+        for bad in [
+            "/search?q=1",
+            "target.test/search",
+            "",
+            "http://target.test:8080/",
+            "https://target.test/",
+            "http://user:pw@elsewhere.test/",
+        ] {
+            let err = host
+                .probe_raw(RawProbe {
+                    method: "GET".to_string(),
+                    url: bad.to_string(),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+                .await
+                .expect_err("a non-origin raw probe is refused");
+            assert!(
+                err.to_string().contains("probe.raw"),
+                "`{bad}`: the refusal names the verb: {err}"
+            );
+        }
+        assert_eq!(client.calls(), 0, "nothing was sent");
+
+        // The same host with the default port spelled out is the same origin.
+        host.probe_raw(RawProbe {
+            method: "POST".to_string(),
+            url: "http://TARGET.TEST:80/search?q=x".to_string(),
+            headers: vec![("X-Probe".to_string(), "1".to_string())],
+            body: b"a=b".to_vec(),
+        })
+        .await
+        .expect("the default port is the same origin");
+        let seen = client.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0.method, "POST");
+        assert_eq!(seen[0].0.path, "/search?q=x");
+        assert_eq!(seen[0].0.headers.get("x-probe"), Some("1"));
+        assert!(matches!(&seen[0].0.body, Body::Bytes(b) if b == b"a=b"));
+    }
+
+    /// Spec D5 "Cancellation": a cancelled job crawls nothing and an active
+    /// check stops before its first probe with an inconclusive verdict; a spent
+    /// budget does the same.
+    #[tokio::test]
+    async fn a_cancelled_or_exhausted_job_sends_nothing() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured("http", "/search?q=hello")));
+        let client = StubClient::new(Answer::EchoHtml("q"));
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.browser = Some(Arc::new(StubBrowser {
+            store: Arc::clone(&store),
+            path: "/crawled",
+        }));
+        job.cancelled.store(true, Ordering::SeqCst);
+        let job = Arc::new(job);
+
+        let discovery = discover_with(&job).await;
+        assert_eq!(store.list().len(), 1, "a cancelled job crawls nothing");
+        assert_eq!(job.charged(), 0);
+
+        let point = point_named(&discovery, "q").clone();
+        let host = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts probes for its own point");
+        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        assert_eq!(verdict.outcome, Outcome::Inconclusive);
+        assert!(verdict.detail.contains("cancelled"), "{}", verdict.detail);
+        assert_eq!(client.calls(), 0, "a cancelled check sends nothing");
+
+        let client = StubClient::new(Answer::EchoHtml("q"));
+        let mut job = TestJob::new(Arc::clone(&store), Arc::clone(&client) as _);
+        job.budget = 0;
+        let job = Arc::new(job);
+        let host = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts probes for its own point");
+        let verdict = check_named("reflected-xss").run(&point, &*host).await;
+        assert_eq!(verdict.outcome, Outcome::Inconclusive);
+        assert!(verdict.detail.contains("budget"), "{}", verdict.detail);
+        assert_eq!(client.calls(), 0, "a spent budget sends nothing");
+    }
+
+    /// Spec D2 `PayloadMode`: `prefix` and `suffix` wrap the point's observed
+    /// value; `replace` drops it.
+    #[tokio::test]
+    async fn payload_modes_wrap_the_observed_value() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured("http", "/search?q=hello&other=1")));
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let discovery = discover_with(&job).await;
+        let point = point_named(&discovery, "q").clone();
+        let host = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts probes for its own point");
+
+        for (mode, want) in [
+            (PayloadMode::Replace, "X"),
+            (PayloadMode::Prefix, "Xhello"),
+            (PayloadMode::Suffix, "helloX"),
+        ] {
+            host.probe(&Payload {
+                value: "X".to_string(),
+                mode,
+                bytes: None,
+            })
+            .await
+            .expect("the stub answers");
+            let (req, _) = client.seen().last().cloned().expect("a send");
+            assert_eq!(query_value(&req.path, "q"), want, "{mode:?}: {}", req.path);
+            assert_eq!(
+                query_value(&req.path, "other"),
+                "1",
+                "{mode:?}: the other parameter is untouched"
+            );
+        }
+    }
+
+    /// A point whose captured flow left the store, or that never carried one,
+    /// cannot be hosted: a plain error naming the point, no send.
+    #[tokio::test]
+    async fn a_point_without_its_flow_cannot_be_hosted() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        store.insert(Flow::Http(captured("http", "/search?q=hello")));
+        let client = StubClient::new(Answer::Fixed(200, "text/plain", "ok"));
+        let job = Arc::new(TestJob::new(Arc::clone(&store), Arc::clone(&client) as _));
+
+        let discovery = discover_with(&job).await;
+        let mut point = point_named(&discovery, "q").clone();
+
+        let mut gone = point.clone();
+        gone.flow = Some(FlowRef(FlowId::new()));
+        let err = lane()
+            .probe_host_for(&gone, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .err()
+            .expect("a flow that is not in the store cannot be hosted");
+        assert!(err.to_string().contains("no longer in the store"), "{err}");
+
+        point.flow = None;
+        let err = lane()
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .err()
+            .expect("a point without a flow cannot be hosted");
+        assert!(err.to_string().contains("carries no flow"), "{err}");
+
+        let mut renamed = point_named(&discovery, "q").clone();
+        renamed.id = format!("{}:query:zzz", renamed.flow.expect("a flow").0);
+        let err = lane()
+            .probe_host_for(&renamed, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .err()
+            .expect("a point that is not in its request cannot be hosted");
+        assert!(err.to_string().contains("no longer present"), "{err}");
+
+        assert_eq!(client.calls(), 0);
+    }
+
+    /// The lane's five checks carry the metadata the plan pins (call B19), in
+    /// the plan's order, with `id == class` and a native origin; the passive
+    /// three cover every HTTP kind and no WebSocket or L4 one.
+    #[test]
+    fn the_five_interim_checks_carry_the_pinned_metadata() {
+        let checks = lane().checks();
+        let ids: Vec<&str> = checks.iter().map(|c| c.meta().id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "reflected-xss",
+                "open-redirect",
+                "reflection",
+                "security-header",
+                "cookie-flag"
+            ]
+        );
+        for check in &checks {
+            let meta = check.meta();
+            assert_eq!(meta.id, meta.class, "{}: id == class", meta.id);
+            assert_eq!(meta.origin, CheckOrigin::Native, "{}", meta.id);
+            assert_eq!(meta.lanes, vec![LaneKind::Http], "{}", meta.id);
+            assert!(!meta.description.is_empty(), "{}", meta.id);
+            assert_eq!(meta.scope, CheckScope::Point, "{}", meta.id);
+        }
+
+        let xss = checks[0].meta();
+        assert_eq!(
+            xss.kinds,
+            vec![InsertionKind::Query, InsertionKind::BodyParam]
+        );
+        assert_eq!(xss.intensity, Intensity::Light);
+        assert_eq!(xss.cost, CheckCost::Medium);
+        assert_eq!(xss.technique, Technique::Reflected);
+        assert_eq!(xss.severity, aitm_poc::Severity::Medium);
+        assert_eq!(xss.confidence_max, Confidence::Certain);
+        assert_eq!(xss.cwe, Some(79));
+        assert!(xss.remediation.is_some());
+
+        let redirect = checks[1].meta();
+        assert_eq!(redirect.kinds, vec![InsertionKind::Query]);
+        assert_eq!(redirect.cost, CheckCost::Light);
+        assert_eq!(redirect.severity, aitm_poc::Severity::Low);
+        assert_eq!(redirect.cwe, Some(601));
+        assert_eq!(redirect.wants_traits, Some(vec![PointTrait::Url]));
+
+        for (check, confidence) in
+            checks[2..]
+                .iter()
+                .zip([Confidence::Tentative, Confidence::Firm, Confidence::Firm])
+        {
+            let meta = check.meta();
+            assert_eq!(meta.technique, Technique::Passive, "{}", meta.id);
+            assert_eq!(meta.intensity, Intensity::Passive, "{}", meta.id);
+            assert_eq!(meta.cost, CheckCost::Light, "{}", meta.id);
+            assert_eq!(meta.severity, aitm_poc::Severity::Low, "{}", meta.id);
+            assert_eq!(meta.confidence_max, confidence, "{}", meta.id);
+            assert!(meta.kinds.contains(&InsertionKind::Query), "{}", meta.id);
+            assert!(meta.kinds.contains(&InsertionKind::Cookie), "{}", meta.id);
+            assert!(
+                !meta.kinds.iter().any(|k| matches!(
+                    k,
+                    InsertionKind::WsText | InsertionKind::WsBinary | InsertionKind::L4Field
+                )),
+                "{}: an HTTP passive check applies to HTTP kinds only",
+                meta.id
+            );
+        }
     }
 }

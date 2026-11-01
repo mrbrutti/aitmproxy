@@ -679,4 +679,130 @@ mod tests {
             "a rule whose kind does not match leaves the point alone"
         );
     }
+
+    // ---- tester additions ---------------------------------------------------
+
+    /// Coordinator decision 4, the edges: a point with no site node is its own
+    /// node, an origin is read from the URL when the node is missing, and a
+    /// point with neither is its own origin — so an unattributable point is
+    /// never folded into another's single run.
+    #[test]
+    fn scope_keys_without_nodes_fall_back_to_url_then_point() {
+        let checks = vec![
+            check("per-node", |m| m.scope = CheckScope::Node),
+            check("per-origin", |m| m.scope = CheckScope::Origin),
+        ];
+        // Two node-less points on one origin (by URL), one on another origin,
+        // one with no URL at all.
+        let mut p0 = point("p0", "a");
+        p0.url = Some("http://a.test:8080/x".to_string());
+        let mut p1 = point("p1", "b");
+        p1.url = Some("http://a.test:8080/y".to_string());
+        let mut p2 = point("p2", "c");
+        p2.url = Some("https://b.test/".to_string());
+        let mut p3 = point("p3", "d");
+        p3.url = None;
+        let points = vec![p0, p1, p2, p3];
+
+        let out = plan(&points, &[], &checks, &ScanProfile::default());
+
+        assert_eq!(
+            count_for(&out.active, "per-node"),
+            4,
+            "a node-less point is its own node"
+        );
+        assert_eq!(
+            count_for(&out.active, "per-origin"),
+            3,
+            "a.test:8080 once (from the URL), b.test once, the url-less point once"
+        );
+        let origin_points: Vec<usize> = out
+            .active
+            .iter()
+            .filter(|i| i.check.meta().id == "per-origin")
+            .map(|i| i.point)
+            .collect();
+        assert_eq!(
+            origin_points,
+            vec![0, 2, 3],
+            "the first admissible point of each origin claims the slot"
+        );
+    }
+
+    /// Spec D2 `audit.ignore`: a `name_regex` that does not compile matches
+    /// nothing, so a typo cannot take the whole audit out; a `point_trait`
+    /// key matches only a point carrying that trait.
+    #[test]
+    fn a_malformed_ignore_regex_matches_nothing_and_traits_match_exactly() {
+        let checks = vec![check("a", |_| {})];
+        let mut url_point = point("p0", "next");
+        url_point.traits = vec![PointTrait::Url];
+        let points = vec![url_point, point("p1", "q")];
+
+        let mut profile = ScanProfile::default();
+        profile.audit.ignore = vec![IgnoreRule {
+            kind: None,
+            name_regex: Some("(".to_string()),
+            point_trait: None,
+        }];
+        let out = plan(&points, &[], &checks, &profile);
+        assert_eq!(out.active.len(), 2, "a broken regex ignores nothing");
+        assert_eq!(out.skipped.ignored, 0);
+
+        profile.audit.ignore = vec![IgnoreRule {
+            kind: None,
+            name_regex: None,
+            point_trait: Some(PointTrait::Url),
+        }];
+        let out = plan(&points, &[], &checks, &profile);
+        assert_eq!(
+            pairs(&out.active),
+            vec![("a".to_string(), 1)],
+            "only the url-trait point is ignored"
+        );
+        assert_eq!(out.skipped.ignored, 1);
+
+        // No points, no nodes: an empty plan, not a panic on the empty maximum.
+        let empty = plan(&[], &[], &checks, &profile);
+        assert!(empty.active.is_empty() && empty.passive.is_empty());
+        assert_eq!(empty.skipped.ignored, 0);
+        assert_eq!(empty.skipped.frequent, 0);
+        assert!(empty.frequent.is_empty());
+    }
+
+    /// The frequent-point rule is a strict `>` on the threshold, and a frequent
+    /// point still gets every light check — including passive ones, which run
+    /// in their own phase.
+    #[test]
+    fn frequent_threshold_is_strict_and_light_passives_survive() {
+        let checks = vec![
+            check("light-active", |m| m.cost = CheckCost::Light),
+            check("heavy-active", |m| m.cost = CheckCost::Heavy),
+            check("light-passive", |m| {
+                m.cost = CheckCost::Light;
+                m.technique = Technique::Passive;
+            }),
+        ];
+        let threshold = ScanProfile::default().audit.frequent_point_threshold;
+
+        let mut at = point("p0", "q");
+        at.frequency = threshold;
+        let out = plan(&[at], &[], &checks, &ScanProfile::default());
+        assert_eq!(
+            out.skipped.frequent, 0,
+            "exactly the threshold is not frequent"
+        );
+        assert!(out.frequent.is_empty());
+        assert_eq!(count_for(&out.active, "heavy-active"), 1);
+
+        let mut over = point("p0", "q");
+        over.frequency = threshold + 1;
+        let out = plan(&[over], &[], &checks, &ScanProfile::default());
+        assert_eq!(out.skipped.frequent, 1, "one heavy item dropped");
+        assert_eq!(ids(&out.active), vec!["light-active".to_string()]);
+        assert_eq!(ids(&out.passive), vec!["light-passive".to_string()]);
+        assert!(out
+            .frequent
+            .contains(&(InsertionKind::Query, "q".to_string())));
+    }
 }

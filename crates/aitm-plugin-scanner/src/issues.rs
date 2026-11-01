@@ -1527,4 +1527,319 @@ mod tests {
         );
         assert!(!store.render_issues_md(Some("https://t.example")).is_empty());
     }
+
+    // ---- tester additions ---------------------------------------------------
+
+    /// Spec D6: the key is a function of its inputs alone, so two processes
+    /// (and two releases) file the same weakness under the same key. The hex
+    /// below was computed once and is pinned; a change to the preimage layout
+    /// is a store-format change and must fail here. The three variants over
+    /// one origin never collide, and an absent optional field is distinct from
+    /// a present one.
+    #[test]
+    fn dedupe_key_is_pinned_across_process_runs_and_variants_never_collide() {
+        let http = DedupeInput::Http {
+            class: "reflected-xss",
+            scheme: "https",
+            host: "t.example",
+            port: 443,
+            method: "GET",
+            path_template: "/search",
+            kind: InsertionKind::Query,
+            name: "q",
+            field_path: None,
+        };
+        assert_eq!(
+            dedupe_key(&http),
+            "040b66044ef445e40f5f6fe1fb541d2ba8c2294626ce84b409f0927998d5f403",
+            "the pinned HTTP key moved: the preimage layout changed"
+        );
+
+        let passive = DedupeInput::Passive {
+            class: "reflected-xss",
+            scheme: "https",
+            host: "t.example",
+            port: 443,
+        };
+        let l4 = DedupeInput::L4 {
+            class: "reflected-xss",
+            ip: "t.example",
+            port: 443,
+            proto: L4Transport::Tcp,
+            grammar: None,
+            field_path: None,
+            mutation_class: None,
+        };
+        let keys = [dedupe_key(&http), dedupe_key(&passive), dedupe_key(&l4)];
+        assert_ne!(keys[0], keys[1], "http and passive over one origin differ");
+        assert_ne!(keys[0], keys[2], "http and l4 over one target differ");
+        assert_ne!(keys[1], keys[2], "passive and l4 over one target differ");
+
+        let variant =
+            |class: &'static str, method: &'static str, field_path: Option<&'static str>| {
+                DedupeInput::Http {
+                    class,
+                    scheme: "https",
+                    host: "t.example",
+                    port: 443,
+                    method,
+                    path_template: "/search",
+                    kind: InsertionKind::Query,
+                    name: "q",
+                    field_path,
+                }
+            };
+        assert_eq!(
+            dedupe_key(&http),
+            dedupe_key(&variant("reflected-xss", "GET", None))
+        );
+        assert_ne!(
+            dedupe_key(&http),
+            dedupe_key(&variant("reflected-xss", "GET", Some("user.name"))),
+            "a present field path is distinct from an absent one"
+        );
+        assert_ne!(
+            dedupe_key(&http),
+            dedupe_key(&variant("reflected-xss", "POST", None))
+        );
+        assert_ne!(
+            dedupe_key(&http),
+            dedupe_key(&variant("stored-xss", "GET", None))
+        );
+    }
+
+    /// Spec D6 "lists the paths in `evidence.matched` (bounded)": a hundred
+    /// sightings grow the occurrence count, never the evidence past the
+    /// model's excerpt bound, and the store still holds one issue.
+    #[test]
+    fn passive_path_list_is_bounded() {
+        let store = IssueStore::new(None);
+        let mut last = None;
+        for i in 0..100 {
+            let path = format!("/section-{i:03}/page");
+            last = Some(
+                store
+                    .upsert(passive_issue(&path, 443), i)
+                    .expect("passive upsert"),
+            );
+        }
+        let issue = last.expect("an upsert happened").issue().clone();
+        assert_eq!(store.count(), 1, "one origin, one passive issue");
+        assert_eq!(issue.occurrences, 100);
+        let matched = issue.evidence.matched.expect("the path list");
+        assert!(
+            matched.len() <= aitm_scan_model::MAX_EXCERPT_BYTES,
+            "the path list is unbounded: {} bytes",
+            matched.len()
+        );
+        assert!(matched.starts_with("/section-000/page"), "{matched}");
+    }
+
+    /// `scan.issues` paging at the edges: a cursor at or past the end is an
+    /// empty page with no `next_cursor` (and the tally still covers the set),
+    /// `limit` is capped at [`MAX_ISSUE_PAGE`], and a zero limit still moves.
+    #[test]
+    fn cursor_at_the_end_and_limit_over_the_cap() {
+        let store = graded_store();
+
+        let at_end = store
+            .query(&IssueFilter::default(), 2, Some("3"))
+            .expect("a cursor at the end");
+        assert!(at_end.issues.is_empty());
+        assert_eq!(at_end.next_cursor, None);
+        assert_eq!(at_end.by_severity.critical, 1, "the tally is of the set");
+
+        let past_end = store
+            .query(&IssueFilter::default(), 2, Some("99"))
+            .expect("a cursor past the end");
+        assert!(past_end.issues.is_empty());
+        assert_eq!(past_end.next_cursor, None);
+
+        let zero = store
+            .query(&IssueFilter::default(), 0, None)
+            .expect("a zero limit");
+        assert_eq!(
+            zero.issues.len(),
+            1,
+            "a zero limit is one issue, not a stuck cursor"
+        );
+        assert_eq!(zero.next_cursor.as_deref(), Some("1"));
+
+        for bad in ["-1", "1.5", "", " 2", "0x10"] {
+            let err = store
+                .query(&IssueFilter::default(), 2, Some(bad))
+                .expect_err("a non-decimal cursor is refused");
+            assert_eq!(err.to_string(), "scan: not_found: cursor", "cursor `{bad}`");
+        }
+
+        // The cap: more issues than one page can hold.
+        let big = IssueStore::new(None);
+        for i in 0..(MAX_ISSUE_PAGE + 6) {
+            big.upsert(graded("low", Severity::Low, &format!("p{i}")), i as u64)
+                .expect("upsert");
+        }
+        assert_eq!(big.count(), MAX_ISSUE_PAGE + 6);
+        let page = big
+            .query(&IssueFilter::default(), 5_000, None)
+            .expect("an over-cap limit");
+        assert_eq!(
+            page.issues.len(),
+            MAX_ISSUE_PAGE,
+            "limit is capped at MAX_ISSUE_PAGE"
+        );
+        assert_eq!(page.next_cursor.as_deref(), Some("1024"));
+        assert_eq!(page.by_severity.low as usize, MAX_ISSUE_PAGE + 6);
+        let rest = big
+            .query(&IssueFilter::default(), 5_000, page.next_cursor.as_deref())
+            .expect("the last page");
+        assert_eq!(rest.issues.len(), 6);
+        assert_eq!(rest.next_cursor, None);
+    }
+
+    /// Wave-2 amendment: the `target` filter matches the normalized origin,
+    /// the explicit `scheme://host:port`, or the bare host — case-insensitively
+    /// and with a trailing slash tolerated — and nothing else.
+    #[test]
+    fn target_filter_accepts_origin_explicit_port_and_bare_host() {
+        let store = graded_store();
+        let count = |target: &str| {
+            store
+                .query(
+                    &IssueFilter {
+                        target: Some(target.to_string()),
+                        ..IssueFilter::default()
+                    },
+                    10,
+                    None,
+                )
+                .expect("query")
+                .issues
+                .len()
+        };
+        assert_eq!(count("https://t.example"), 3, "the normalized origin");
+        assert_eq!(
+            count("https://t.example:443"),
+            3,
+            "the explicit default port"
+        );
+        assert_eq!(count("t.example"), 3, "the bare host");
+        assert_eq!(count("HTTPS://T.EXAMPLE/"), 3, "case and a trailing slash");
+        assert_eq!(
+            count("https://t.example:8443"),
+            0,
+            "another port is another origin"
+        );
+        assert_eq!(
+            count("http://t.example"),
+            0,
+            "another scheme is another origin"
+        );
+        assert_eq!(count("example"), 0, "a host suffix is not a match");
+    }
+
+    /// `by_severity` tallies every level, and `severity_min` / `confidence_min`
+    /// are inclusive floors.
+    #[test]
+    fn tally_covers_every_level_and_minimums_are_inclusive() {
+        let store = graded_store();
+        store
+            .upsert(graded("medium", Severity::Medium, "d"), 40)
+            .expect("medium");
+        store
+            .upsert(graded("info", Severity::Info, "e"), 50)
+            .expect("info");
+
+        let all = store
+            .query(&IssueFilter::default(), 10, None)
+            .expect("query");
+        assert_eq!(
+            all.by_severity,
+            BySeverity {
+                critical: 1,
+                high: 1,
+                medium: 1,
+                low: 1,
+                info: 1
+            }
+        );
+        let classes: Vec<&str> = all.issues.iter().map(|i| i.class.as_str()).collect();
+        assert_eq!(classes, ["critical", "high", "medium", "low", "info"]);
+
+        let at_least_medium = store
+            .query(
+                &IssueFilter {
+                    severity_min: Some(Severity::Medium),
+                    ..IssueFilter::default()
+                },
+                10,
+                None,
+            )
+            .expect("query");
+        assert_eq!(at_least_medium.issues.len(), 3);
+        assert_eq!(
+            at_least_medium.by_severity,
+            BySeverity {
+                critical: 1,
+                high: 1,
+                medium: 1,
+                low: 0,
+                info: 0
+            },
+            "the tally is of the filtered set"
+        );
+
+        // Every graded issue is `Firm`: a `Firm` floor keeps all, `Certain` none.
+        let firm = IssueFilter {
+            confidence_min: Some(Confidence::Firm),
+            ..IssueFilter::default()
+        };
+        assert_eq!(store.query(&firm, 10, None).expect("query").issues.len(), 5);
+        let certain = IssueFilter {
+            confidence_min: Some(Confidence::Certain),
+            ..IssueFilter::default()
+        };
+        assert_eq!(
+            store.query(&certain, 10, None).expect("query").issues.len(),
+            0
+        );
+    }
+
+    /// A store directory that does not exist yet loads nothing and is not an
+    /// error; a file that is there but is not an issue is, naming the file —
+    /// an operator's triage state is never silently dropped.
+    #[test]
+    fn load_refuses_a_corrupt_issue_file_and_tolerates_a_missing_dir() {
+        let dir = TempDir::new();
+        let fresh = IssueStore::new(Some(dir.path()));
+        assert_eq!(
+            fresh.load().expect("a missing directory is not an error"),
+            0
+        );
+
+        fresh.upsert(new_issue("a", "q"), 100).expect("upsert");
+        std::fs::write(dir.issue_file("issue-bad00bad"), "{\"not\":\"an issue\"}")
+            .expect("seed a corrupt file");
+        std::fs::write(
+            dir.path().join("scan").join("issues").join("notes.txt"),
+            "not json at all",
+        )
+        .expect("seed a non-json file");
+
+        let reloaded = IssueStore::new(Some(dir.path()));
+        let err = reloaded
+            .load()
+            .expect_err("a corrupt issue file fails the load");
+        assert!(
+            format!("{err:#}").contains("issue-bad00bad.json"),
+            "the error names the file: {err:#}"
+        );
+
+        std::fs::remove_file(dir.issue_file("issue-bad00bad")).expect("remove it");
+        let reloaded = IssueStore::new(Some(dir.path()));
+        assert_eq!(
+            reloaded.load().expect("non-json files are ignored"),
+            1,
+            "only `*.json` issue files count"
+        );
+    }
 }
