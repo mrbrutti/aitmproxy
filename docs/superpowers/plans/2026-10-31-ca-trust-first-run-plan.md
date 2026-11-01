@@ -124,6 +124,9 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 
 | Date | PR | Reviewer | Finding | Severity | Disposition |
 |---|---|---|---|---|---|
+| 2026-11-01 | D mac | M3 note (c6c5283d) | `CATrustFailure.Verb` + `resolved(by:)` is the one clearing rule (the Kit spells no verb literal; the string→Verb map lives in `Session+CATrust.swift`); `changeCATrust` still clears on success and on a cancelled dialog before the forced re-read (not store-driven; accepted) | — | Swift gate: build clean, 545 Kit tests passed |
+| 2026-11-01 | C web | W5 note (e49fa835) | stale-not-awaited → error notice; `isMalformedConfirm` + `MALFORMED_CONFIRM_MESSAGE` in `bus/confirm.ts`, palette treats a malformed envelope as `failed`; `beginInject`/`confirmInject` keep their own "unexpected result" refusal | — | web gate on the final head: gen 0, vitest 567/567, tsc 0, build 0 |
+| 2026-11-01 | B TUI | gate | merged head bd0bda79: fmt 0, clippy 0, `cargo test -p aitm-tui --no-fail-fast` exit 0 (15 binaries) | — | ready to open on the orchestrator's SHA |
 | 2026-11-01 | D mac | security (M2 re) | a trust change in flight across a core restart re-writes its failure after `forgetCATrust()` | Minor | accepted: the text is honest ("the bus connection closed"); a connection generation check is a follow-up |
 | 2026-11-01 | D mac | quality (M2 re) | failure-clearing rule split across two callers, untested; `notOperatorLine`/`readBackFailedLine` emitted for causes they do not name | Minor | fix task M3: `CATrustFailure.resolved(by:)` + tests; connected guard; `storesUnknownLine` |
 | 2026-11-01 | D mac | spec (M2 re) | unrequested debug logging; `CATrustFailure`/`SetupWordsTests.swift` unrecorded | Minor | correction 24 |
