@@ -422,6 +422,10 @@ Kept by the main session during stage 6. One row per finding.
 | 8 | coder note | Minor | Issues degraded text names `scan.issues`/`scan.issue` but not `scan.issue.update` | fix round E (E17) |
 | 8 | coder note | Minor | Issues List-pane `Enter` is inert | fix round E (E18): `Enter` on the list focuses the Detail pane |
 | 8 | coder note | note | the developer fixture answers `scan.issue.update` with a missing-tool error | accepted: the fixture is development only; the pty cell runs against a real core |
+| 8 | spec | Minor | flow list drawn after `seen`, not between the evidence and `poc` as D11 orders | fix round F (F1): move the flow list to its D11 position |
+| 8 | spec | Minor | an unrequested `target` line in the detail | accepted by the T7 session; spec D11 amended in this commit |
+| 8 | spec | Minor | `waiting for scan.issue...` placeholder is false after a failed read or a missing verb | fix round F (F2): neutral wording `no detail read for this row` |
+| 8 | spec | Minor | eleven helpers public beyond the plan's two names | accepted (as for Tasks 6 and 7) |
 
 ## Shipped
 
