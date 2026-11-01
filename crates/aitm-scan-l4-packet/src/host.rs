@@ -2876,4 +2876,77 @@ mod tests {
         // out and never charged.
         assert_eq!(mock.inject_count(), 2);
     }
+
+    /// Tester (round 3), finding T1's send-time half for a seed in the
+    /// *middle* of the corpus: with three seeds of which seed 1 does not
+    /// build, case 1 is recorded unsendable under seed 1's id and the loop
+    /// runs on, so cases 0 and 2 go out, the run has no stop and no crash,
+    /// exactly one case is counted unsendable, exactly two are counted sent,
+    /// and the wire saw the baseline plus those two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_middle_seed_leaves_its_neighbours_sent() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let profile = l4_profile(vec![udp_target(9)], 3);
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // Discovery refuses this corpus, so the plan is bent by hand: seed 0
+        // is the default seed, seed 1 is one byte more than the frame can
+        // carry, seed 2 builds.
+        let mut plan = plans[0].clone();
+        assert_eq!(plan.seeds.len(), 1);
+        assert_eq!(plan.seeds[0].id, "127.0.0.1:9/udp#0");
+        plan.seeds.push(SeedPayload {
+            id: "127.0.0.1:9/udp#1".to_string(),
+            bytes: vec![0x41; max_payload_for(&plan.target) + 1],
+            origin: SeedOrigin::Profile,
+        });
+        plan.seeds.push(SeedPayload {
+            id: "127.0.0.1:9/udp#2".to_string(),
+            bytes: vec![0x42; 16],
+            origin: SeedOrigin::Profile,
+        });
+        let point = disc.points.first().expect("one point").clone();
+        let runner = Arc::new(
+            PointRunner::new(
+                Arc::clone(&shared),
+                Arc::clone(&job) as Arc<dyn JobCtx>,
+                point,
+                plan,
+                FieldPath::Raw,
+            )
+            .expect("seed 0 builds"),
+        );
+
+        let run = runner.run_point().await;
+
+        assert_eq!(run.stopped, None, "a refused seed is not a stop");
+        assert!(run.crash.is_none());
+        assert_eq!(
+            run.cases
+                .iter()
+                .map(|case| (case.index, case.seed_id.as_str(), case.sent()))
+                .collect::<Vec<_>>(),
+            vec![
+                (0, "127.0.0.1:9/udp#0", true),
+                (1, "127.0.0.1:9/udp#1", false),
+                (2, "127.0.0.1:9/udp#2", true),
+            ],
+            "the loop runs on past the refused seed"
+        );
+        let refused = &run.cases[1];
+        assert_eq!(refused.class(), None);
+        assert_eq!(refused.sent_hex, "");
+        assert_eq!(refused.chain, Vec::<String>::new());
+        assert_eq!(refused.candidate, Candidate::No);
+        assert!(run.cases[0].class().is_some());
+        assert!(run.cases[2].class().is_some());
+
+        let stats = shared.state.stats(job.job_id()).expect("the job's stats");
+        assert_eq!(stats.cases_unsendable, 1);
+        assert_eq!(stats.l4.cases, 2);
+        assert_eq!(stats.l4.crashes, 0);
+        // 1 baseline + cases 0 and 2; the refused seed never went out and
+        // never charged.
+        assert_eq!(mock.inject_count(), 3);
+        assert_eq!(job.charged(), 3);
+    }
 }

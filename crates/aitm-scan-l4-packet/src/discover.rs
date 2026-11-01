@@ -1981,4 +1981,181 @@ mod tests {
             );
         }
     }
+
+    /// Tester (round 3): the one framing/IP/transport combination
+    /// `max_payload_for_is_the_frame_the_builder_accepts` did not pin, an IPv6
+    /// TCP target, holds against the builder too: a seed of exactly the
+    /// quoted ceiling crafts a full 65535-byte frame and one more byte does
+    /// not craft. The ceiling is checked from the framing arithmetic (65535
+    /// less the link header, the 40-byte IPv6 header and the 20-byte TCP
+    /// header), never from `max_payload_for` itself, and against the literal
+    /// per-host values of all four combinations.
+    #[test]
+    fn max_payload_for_holds_for_a_v6_tcp_target() {
+        let v4_guard = loopback_guard("*", 100);
+        let v6_guard = guard_over(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128, "*", &BOTH);
+        let v6_spec = |proto: L4Transport, port: u16| aitm_scan_model::profile::L4TargetSpec {
+            ip: "::1".to_string(),
+            port,
+            proto,
+            grammar: None,
+        };
+        let target =
+            resolve_target(&v6_guard, &v6_spec(L4Transport::Tcp, 80)).expect("::1 tcp resolves");
+        let link = link_framing(&target.interface).header_len();
+
+        let ceiling = max_payload_for(&target);
+        assert_eq!(ceiling, 65_535 - link - 40 - 20);
+        assert_eq!(
+            ceiling,
+            if cfg!(target_os = "macos") {
+                65_471
+            } else {
+                65_461
+            }
+        );
+        assert!(
+            ceiling < MAX_SEED_BYTES,
+            "the framing-blind pre-check must admit a seed only the build refuses"
+        );
+
+        let plan = |len: usize| TargetPlan {
+            seeds: vec![SeedPayload {
+                id: "seed".to_string(),
+                bytes: vec![0x41; len],
+                origin: SeedOrigin::Profile,
+            }],
+            fields: vec![FieldPath::Raw],
+            src_port: 40_000,
+            target: target.clone(),
+        };
+        let frame = plan(ceiling)
+            .seed_spec(0)
+            .expect("the ceiling crafts")
+            .spec
+            .build()
+            .expect("the ceiling builds");
+        assert_eq!(frame.len(), MAX_FRAME_BYTES);
+        // IPv6 payload_length counts everything past the fixed header: the
+        // TCP header plus the seed.
+        assert_eq!(
+            u16::from_be_bytes([frame[link + 4], frame[link + 5]]),
+            u16::try_from(20 + ceiling).expect("fits the field")
+        );
+        assert_eq!(
+            plan(ceiling + 1).seed_spec(0).expect_err("one byte over"),
+            PlanError::Craft("crafted packet exceeds 65535 bytes".to_string())
+        );
+
+        // The four combinations, literally, so a header constant cannot
+        // drift without a test noticing.
+        let table = [
+            (
+                resolve_target(&v4_guard, &udp_target(9)).expect("v4 udp"),
+                65_535 - link - 20 - 8,
+                65_503,
+            ),
+            (
+                resolve_target(&v4_guard, &tcp_target(80)).expect("v4 tcp"),
+                65_535 - link - 20 - 20,
+                65_491,
+            ),
+            (
+                resolve_target(&v6_guard, &v6_spec(L4Transport::Udp, 53)).expect("v6 udp"),
+                65_535 - link - 40 - 8,
+                65_483,
+            ),
+            (target, 65_535 - link - 40 - 20, 65_471),
+        ];
+        for (target, from_framing, on_macos) in table {
+            let got = max_payload_for(&target);
+            assert_eq!(got, from_framing, "{}/{:?}", target.ip, target.proto);
+            if cfg!(target_os = "macos") {
+                assert_eq!(got, on_macos, "{}/{:?}", target.ip, target.proto);
+            }
+        }
+    }
+
+    /// Tester (round 3): with three profile seeds, the one that does not
+    /// build is named by its own index — `#2`, not `#0` or `#1` — and the
+    /// same corpus with the third seed exactly at this target's ceiling plans
+    /// all three, the third as a full 65535-byte frame.
+    #[test]
+    fn the_third_of_three_seeds_is_refused_by_name() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        let target = resolve_target(&guard, &udp_target(9)).expect("resolves");
+        let ceiling = max_payload_for(&target);
+        let seeds = |third: usize| {
+            vec![
+                L4Seed::Hex {
+                    hex: "00".to_string(),
+                },
+                L4Seed::Hex {
+                    hex: "01".to_string(),
+                },
+                L4Seed::Hex {
+                    hex: "41".repeat(third),
+                },
+            ]
+        };
+        let discover = |profile: &aitm_scan_model::ScanProfile| {
+            discover_all(
+                &guard,
+                backend.as_ref(),
+                None,
+                &profile.target,
+                profile,
+                &fields(&["raw"]),
+                "aitm7f3a",
+            )
+        };
+
+        // At the ceiling every seed builds and the corpus is kept whole.
+        let mut profile = l4_profile(vec![udp_target(9)], 10);
+        profile.l4.seeds = seeds(ceiling);
+        let (plans, discovery) = discover(&profile).expect("three seeds at the ceiling plan");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(
+            plans[0]
+                .seeds
+                .iter()
+                .map(|seed| (seed.id.as_str(), seed.bytes.len(), seed.origin))
+                .collect::<Vec<_>>(),
+            vec![
+                ("127.0.0.1:9/udp#0", 1, SeedOrigin::Profile),
+                ("127.0.0.1:9/udp#1", 1, SeedOrigin::Profile),
+                ("127.0.0.1:9/udp#2", ceiling, SeedOrigin::Profile),
+            ]
+        );
+        assert_eq!(
+            plans[0]
+                .seed_spec(2)
+                .expect("seed 2 builds")
+                .spec
+                .build()
+                .expect("a full frame")
+                .len(),
+            65_535
+        );
+        assert_eq!(discovery.points.len(), 1);
+
+        // One byte over: inside `MAX_SEED_BYTES`, so the framing-blind
+        // pre-check passes it and only the build refuses it, by name.
+        assert!(ceiling < MAX_SEED_BYTES);
+        profile.l4.seeds = seeds(ceiling + 1);
+        let err = discover(&profile).expect_err("seed 2 does not build");
+        assert_eq!(
+            err,
+            DiscoverError::InvalidProfile(
+                "seed 127.0.0.1:9/udp#2 cannot be crafted: crafted packet exceeds 65535 bytes"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            err.to_string(),
+            "invalid_profile: seed 127.0.0.1:9/udp#2 cannot be crafted: crafted packet exceeds 65535 bytes"
+        );
+        assert_eq!(backend.inject_count(), 0);
+    }
 }
