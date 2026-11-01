@@ -550,6 +550,9 @@ Kept by the main session during stage 6. One row per finding.
 | 12 | spec | Minor | `m` held by the UI-3 L4 gate though a map runs no L4 lane | fix round G (G71): `scan.map` skips the `blocked` check; D7 amended |
 | 12 | spec | Minor | `nothing to launch` toast, `profile` placeholder and the no-pending `Null` fallback unstated | D7 amended with the two literals; the fallback is replaced by G67's let-else |
 | 12 | spec | Minor | D2 legacy row names only `r`/`s` | D2 amended to `r`/`s`/`m` |
+| 12 | security | Minor | a second wire-confirm replacing a `scan.*` confirm strands `launch.pending`; `yes` ignores a refused `scan_call` | fix round G (G67 extended): drop toast, pending cleared |
+| 12 | security | Minor | `StartResult.lanes.run` joined into the toast unbounded | fix round G (G72) |
+| 12 | security | Minor | list-row launch of an L4-lane profile bypasses the UI-3 client gate | fix round G (G73); D7 amended: gate reads the cursor row's lanes without an editor |
 
 ## Shipped
 

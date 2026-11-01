@@ -162,7 +162,7 @@ G65. Jobs and Profiles draw the blocked reason with two layouts and two copies o
 
 G66. `l4_gate` decides IPv6 by `contains(':')` (`scan/launch.rs`): `match first.ip.parse::<IpAddr>() { Ok(IpAddr::V6(_)) => 128, _ => 32 }` with a comment that an unparseable ip still yields a suggestion because G53 refuses it at fold.
 
-G67. `wire_confirm_from = Mode::Scan` written at send time with no reader before the overlay arm overwrites it; the scan overlay-opening arm copies the `l4.*` one (`app.rs`): delete the dead write; `fn open_wire_confirm(&mut self, confirm: WireConfirm, from: Mode)` used by both arms; the scan arm's `map_or((name, Null))` fallback becomes `let Some(p) = pending else { set_error(uncoded(tag, "reply with no pending launch")); return }`.
+G67. `wire_confirm_from = Mode::Scan` written at send time with no reader before the overlay arm overwrites it; the scan overlay-opening arm copies the `l4.*` one (`app.rs`): delete the dead write; `fn open_wire_confirm(&mut self, confirm: WireConfirm, from: Mode)` used by both arms; when `open_wire_confirm` replaces a confirm already on screen it toasts `<call> confirmation dropped` and, for a `scan.*` call, clears `launch.pending` (mirroring the Disconnected arm); `answer_wire_confirm(true)` clears `pending` when `scan_call` returns `false` (Task 12 security panel). Test: a scan confirm on screen, then an `l4.inject` `needs_confirmation` reply: `pending == None` and the toast; the scan arm's `map_or((name, Null))` fallback becomes `let Some(p) = pending else { set_error(uncoded(tag, "reply with no pending launch")); return }`.
 
 G68. Stringly-typed launch verb and a stale `PendingLaunch` doc (`app.rs`, `scan/launch.rs`, `ui/scan/confirm.rs`): `pub enum LaunchVerb { Start, Map }` with `as_str()`/`Display`; `PendingLaunch.call: LaunchVerb`; `on_scan_failed` tests `pending.as_ref().is_some_and(|p| p.call.as_str() == tag)`; the doc drops `scan.discover`; `WireConfirm::is_scan()` (or `pub(crate) Family::of`) used by the reducer and the view instead of `starts_with("scan.")`.
 
@@ -173,6 +173,12 @@ G70. Addendum to G41: `CLAMPED_MAX`/`CLAMPED_FIELD_MAX` move with `SAVED_NAME_MA
 ## Task 12 spec panel
 
 G71. `scan.map` is held by the UI-3 L4 gate (`crates/aitm-tui/src/app.rs` `scan_launch_v2`): the `blocked.is_some()` return applies to `scan.start` only; `scan.map` keeps the in-flight and origin-scope checks (D7 as amended: the engine forces `lanes: [http]` for a map). Test (`tests/scan_v2_launch.rs`): the L4-blocked draft with an in-scope origin gives no request on `s` and one `scan.map` on `m`.
+
+## Task 12 security panel
+
+G72. `StartResult.lanes.run` is joined into the start toast unbounded (`crates/aitm-tui/src/app.rs` `fold_start_result`): collect `run` into a `BTreeSet<LaneKind>` (at most the four kinds, declaration order) before joining, and `truncate` the whole start toast to `SAVED_PATH_MAX` cells. Test: a `scan.start` reply with 100_000 `http` run lanes toasts `scan-1a2b3c4d started: standard (http)`.
+
+G73. A list-row launch of a stored profile with an L4 lane bypasses the UI-3 client gate (`crates/aitm-tui/src/app.rs` `recompute_launch_gate`, `scan_launch_v2`): with no editor open, `blocked` is computed from the Profiles cursor row's `lanes` (known from `scan.profile.list`): the first D7 text when `l4.scope.list` is absent, else `L4 launch disabled: open the profile (⏎) to check its L4 target and scope` (D7 as amended; the row carries no targets to check); recomputed when the Profiles cursor moves and when the editor closes. `s` stays inert while `blocked` is `Some`; `m` is not held (G71). Test (`tests/scan_v2_launch.rs`): no editor, cursor on a fixture row with an L4 lane, no `l4.scope.list`: the Profiles footer shows `GATE_NO_LAYER` and `s` sends nothing; with the layer present the footer names the editor; cursor on `standard`: `blocked == None` and `s` sends `{profile_name: "standard"}`.
 
 ## Not in this round
 
