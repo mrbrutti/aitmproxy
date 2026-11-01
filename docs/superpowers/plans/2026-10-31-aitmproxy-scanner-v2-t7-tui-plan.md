@@ -768,6 +768,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | fix round | done | H82 in `a84b8d63`; `--selftest` 76 ok; cell complete | latency run at 300 ms (pre-merge) |
 | 15 | live smoke | 300 ms | 55 ok, 0 noted, 1 failed: every UI observation live; `x` landed during the crawl so no `progress` push preceded `cancelled` | H83 (cell): wait for the audit phase and one `progress` before `x` |
 | H (cell) | fix round | done | H83 in `7264041b`; `--selftest` 80 ok; cell complete | 300 ms run with H83 (pre-merge) |
+| 15 | live smoke | 300 ms + H83 | 56 ok, 0 noted, 0 failed (`/tmp/claude/t7-live-smoke12`): `x` at sample 19 after four `progress` pushes; 20 bracketed samples; 137 job pushes, no bad line; no Cookie on any Scan screen | the definitive run on the merged tree after the final #232 SHA |
 
 ## Shipped
 
