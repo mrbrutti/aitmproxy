@@ -671,6 +671,12 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | spec | Minor | node-count marker is a bare substring (`3 nodes` in `13 nodes`) | fix round H (H12) |
 | H (cell) | spec | Minor | node under the cursor matched by prefix; `inspector_open` path `/` matches anywhere | fix round H (H13) |
 | H (cell) | spec | Minor | post-`y` `row_shown` lacks the Jobs-marker wait | fix round H (H14) |
+| H (cell) | security+quality re-review | PASS | H1-H11 verified (tuple match against the core's echo, `finally` order, redaction); `--selftest` run green | three Minors to H15-H17; one Rust item H18; one core-track blocker relayed |
+| H (cell) | security | Minor | the wire-confirm overlay is not over the Scan view, so the overlay sample leaves the T7-20 grep | fix round H (H15 cell, H18 Rust) |
+| H (cell) | security | Minor | H2's lost-reply path is `OSError` (socket timeout), not `BusError` | fix round H (H16) |
+| H (cell) | quality | Minor | H6's justification off by one at exactly `COLUMN_MIN` | fix round H (H17) |
+| H | security | Important (TUI) | `Mode::WireConfirm` has no body arm; the Scan launch confirm draws over the Flows view | fix round H Rust (H18) |
+| H | security | Important (core) | `l4.scope.add` refuses `interface: "*"` (`validate_interface`, #218); blocks the live UI-3 cleared-gate proof | relayed to the coordinator for the core track; the cell notes the refusal honestly |
 
 ## Shipped
 

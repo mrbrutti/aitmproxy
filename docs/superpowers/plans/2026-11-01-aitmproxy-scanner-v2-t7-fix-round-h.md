@@ -43,6 +43,20 @@ H13. T7-19 identifies the node under the cursor by prefix (`GET  /` claims `GET 
 
 H14. T7-18's post-`y` `row_shown` reads the id anywhere (the start toast carries it) and does not wait on the Jobs marker: `row_shown = bool(new_job) and term.wait_for(TAB_MARKERS["2"], ROW_APPEAR_S) and poll(row_tail ..)`, H5 parity.
 
+H15. The wire-confirm overlay does not sit over the Scan view (see H18), so the T7-18 overlay sample tags `other`/`inspector` and leaves the T7-20 grep: paint a WireConfirm frame in the self-test (centered `boxed` over whatever body `ui/mod.rs` draws) and assert `surface_of`'s answer; correct the Evidence docstring ("the four tabs" only, overlays per H18); once H18 lands the sample tags `scan` by itself.
+
+H16. H2's lost-reply path is a socket timeout (`OSError`), not a `BusError`: catch `(BusError, OSError)` on the add and run the same exact-tuple lookup; `l4_entries`/`l4_entry_by_id` treat `OSError` like `BusError`.
+
+H17. H6's justification is off by one (`fit` renders 7 chars plus `…` at exactly `COLUMN_MIN`): make the row-name comparison ellipsis-tolerant (`cell.endswith("…") and needle.startswith(cell[:-1])`) and state the 200-column arithmetic in the comment.
+
+## Rust (after round G-B, one small coder)
+
+H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
+
+## Core track (outside T7, relayed to the coordinator 2026-11-01)
+
+`l4.scope.add` refuses `interface: "*"`: `crates/aitm-proto-l4/src/commands/scope.rs` `validate_interface` (`^[A-Za-z0-9._:-]{1,15}$`, landed in #218) has no `ANY_INTERFACE` branch, while `guard.rs` defines `"*"` as the entry-side wildcard and the TUI's D7 text tells the operator to add exactly that entry. Until the core accepts `"*"` the live T7-18 cleared-gate sub-steps (overlay, `y`, `n`) can only be noted as a core refusal; the cell must not paper over it with a literal interface (the guard's `interface_covers` would then demand the engine's target interface equal it).
+
 ## Not in this round
 
 The harness's shared default operator token on a loopback bus and the parent env inherited by the TUI child are pre-existing harness conventions (T10).
