@@ -2,9 +2,14 @@
 /// order per the per-host-decryption decision), one home for the sheet and its test.
 public enum SetupWords {
     public static let sheetTitle = "Set up aitmproxy on this Mac"
-    /// Row 1's title while the system-proxy route is unknown (no `proxy.status` answer yet); once the
-    /// route is known the row carries the Getting-started step's title, the route's own line.
+    /// Row 1's title (Matt's words, §D13 "Step order and words"); the route's line is the fact under it.
     public static let systemProxyRowTitle = "Set aitmproxy as the system proxy"
+    /// Row 1's checklist, verbatim (§D13 "First-run sheet").
+    public static let systemProxyChecklist = [
+        "Route every proxy-aware app through aitmproxy",
+        "Remember and restore your previous proxy setting",
+        "Revert automatically if the app quits or crashes",
+    ]
     /// Under row 1's button (§D13, Architect's call): the button sets now AND turns on the launch
     /// preference, because the core restores on quit and a one-time set would be gone at the next launch.
     public static let systemProxyAutoCaption = "Also turns on “Set system proxy at launch” in Settings ▸ Proxy"

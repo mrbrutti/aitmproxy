@@ -23,7 +23,7 @@ extension Session {
             captureSupported: coreHealth.captureSupported,
             scopeHostCount: scopeHosts.count,
             flowCount: rows.count,
-            listenAddress: coreHealth.connection?.proxyAddress ?? listenAddress,
+            listenAddress: effectiveListenAddress,
             systemProxy: systemProxy,
             systemProxyFacts: systemProxyFacts,
             caTrust: caTrust,

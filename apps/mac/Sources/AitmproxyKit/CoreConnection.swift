@@ -81,7 +81,7 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
     public var appliedPort: Int?
     public var appliedVerifyUpstreamTLS: Bool?
     /// The Settings ▸ Proxy system-proxy values this embedded core was last started with
-    /// (`SystemProxyPreferences.autoKey` / `.bypassKey`, the bypass field as typed), for the
+    /// (the launch preference and the bypass field as typed, `SystemProxyPreferences`), for the
     /// same Apply & Restart dirty-check. nil for a non-embedded core and until ready.
     public var appliedSystemProxyAuto: Bool?
     public var appliedSystemProxyBypass: String?

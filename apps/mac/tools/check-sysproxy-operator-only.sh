@@ -84,6 +84,11 @@ if [ "${1:-}" = "--self-check" ]; then
   printf '\nextension Session {\n    var plantedSetRef: () async -> Void { self.setSystemProxy }\n}\n' >> "$work/Sources/Aitmproxy/Panels/ConfigPanel.swift"
   printf '\n// planted: session.setSystemProxy()\n' >> "$work/Sources/Aitmproxy/Panels/AgentPanel.swift"
   printf '\nlet _ = "systemProxy.auto"\n' >> "$work/Sources/Aitmproxy/Session+Verbs.swift"
+  # The two shapes the security panel found unguarded (2026-11-01): an undotted member reference
+  # with no `(` inside an extension Session in a shared file, and a receiver that is neither
+  # `session` nor `self`.
+  printf '\nextension Session {\n    var plantedBareRef: () async -> Void { setSystemProxy }\n}\n' >> "$work/Sources/Aitmproxy/Panels/ScopePanel.swift"
+  printf '\nfunc plantedOtherReceiver(_ s: Session) -> () async -> Void { s.restoreSystemProxy }\n' >> "$work/Sources/Aitmproxy/Panels/ScriptsPanel.swift"
   out=$(bash "$self" "$work" 2>&1); rc=$?
   printf '%s\n' "$out"
   ok=1
@@ -98,6 +103,10 @@ if [ "${1:-}" = "--self-check" ]; then
     || { echo "SELF-CHECK FAIL: rule 3 did not name the planted session.setSystemProxy() in Panels/AgentPanel.swift"; ok=0; }
   grep -qE '^VIOLATION \[4 [^]]*\] Sources/Aitmproxy/Session\+Verbs\.swift:' <<<"$out" \
     || { echo "SELF-CHECK FAIL: rule 4 did not name the planted \"systemProxy.auto\" in Session+Verbs.swift"; ok=0; }
+  grep -qE '^VIOLATION \[2 [^]]*\] Sources/Aitmproxy/Panels/ScopePanel\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 2 did not name the planted bare undotted setSystemProxy reference in Panels/ScopePanel.swift"; ok=0; }
+  grep -qE '^VIOLATION \[2 [^]]*\] Sources/Aitmproxy/Panels/ScriptsPanel\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 2 did not name the planted s.restoreSystemProxy reference in Panels/ScriptsPanel.swift"; ok=0; }
   if [ "$ok" -eq 1 ]; then
     echo "SELF-CHECK PASS: rules 1–4 each caught their planted violation"
     exit 0
@@ -116,6 +125,7 @@ for root in "${scan_roots[@]}"; do
 done
 
 sysproxy=Sources/Aitmproxy/Session+SystemProxy.swift
+connection_summary=Sources/AitmproxyKit/ConnectionSummary.swift
 settings_view=Sources/Aitmproxy/SettingsView.swift
 status_panel=Sources/Aitmproxy/Panels/StatusPanel.swift
 setup_sheet=Sources/Aitmproxy/Shell/SetupSheet.swift
@@ -128,7 +138,6 @@ prefs=Sources/AitmproxyKit/SystemProxyPreferences.swift
 embedded_core=Sources/Aitmproxy/Bus/EmbeddedCore.swift
 embedded_core_controller=Sources/Aitmproxy/Bus/EmbeddedCoreController.swift
 ca_trust=Sources/Aitmproxy/Session+CATrust.swift
-core_connection=Sources/AitmproxyKit/CoreConnection.swift
 
 violations=0
 checked=0
@@ -165,7 +174,8 @@ expect() {
     flag "$1" "$2: not found, but the allow-list names it"
     return
   fi
-  if ! grep -qE -e "$3" "$2"; then
+  # Code only: a `//` comment must not keep an allow-list entry alive.
+  if ! sed -E 's#//.*$##' "$2" | grep -qE -e "$3"; then
     flag "$1" "$2: no longer contains $4; the allow-list is stale or this tripwire has gone blind. Re-read the code and update this script"
   fi
 }
@@ -235,8 +245,17 @@ expect_count "$rule2" "$sysproxy" "$undotted_re" 2 'an undotted setSystemProxy(/
 # Bare: the method as a value, `session.setSystemProxy` / `self.restoreSystemProxy` /
 # `Session.setSystemProxy` with no `(` after it. The receiver is required: `.setSystemProxy`
 # alone is also the ConnectionAction case.
-bare_re='([Ss]ession|self)\.(setSystemProxy|restoreSystemProxy)([^A-Za-z0-9_(]|$)'
+# Any lowercase receiver (a variable: `session`, `self`, `s`) or the type `Session`; type-named
+# receivers such as `ConnectionAction.setSystemProxy` (the action case) are not member references.
+bare_re='(^|[^A-Za-z0-9_.])(Session|[a-z][A-Za-z0-9_]*)\.(setSystemProxy|restoreSystemProxy)([^A-Za-z0-9_(]|$)'
 scan "$rule2" "$bare_re" "$settings_view" "$status_panel" "$setup_sheet" "$route_banner" "$app_swift" "$sysproxy"
+# Bare undotted: the method handed on as a value from inside an `extension Session`
+# (`{ setSystemProxy }`). The leading-dot form is the ConnectionAction case and is excluded;
+# the Kit's `case setSystemProxy, unsetSystemProxy` declaration is the one allowed undotted match
+# outside the call path.
+bare_undotted_re='(^|[^A-Za-z0-9_.])(setSystemProxy|restoreSystemProxy)([^A-Za-z0-9_(]|$)'
+scan "$rule2" "$bare_undotted_re" "$settings_view" "$status_panel" "$setup_sheet" "$route_banner" "$app_swift" "$sysproxy" "$connection_summary"
+expect_count "$rule2" "$connection_summary" "$bare_undotted_re" 1 'the ConnectionAction case declaration'
 
 # ---- 3. the agent-reachable surfaces reference none of it ----------------------------
 # The self-tests drive Session without an operator, so they are held to the same rule as
@@ -253,10 +272,13 @@ deny "3 agent-reachable surface" \
   Sources/Aitmproxy/SelfTest.swift \
   Sources/Aitmproxy/SelfTest+Live.swift
 
+expect "3 agent-reachable surface" Sources/Aitmproxy/Panels/AgentPanel.swift 'Session\.isSystemProxyVerb\(' 'the Approve guard Session.isSystemProxyVerb('
+expect "3 agent-reachable surface" Sources/Aitmproxy/Session+Palette.swift 'isSystemProxyVerb\(' 'the palette filter isSystemProxyVerb('
+
 # ---- 4. the launch preference: operator-written, spawn-read ---------------------------
 rule4="4 systemProxy.auto preference"
 autokey_re='SystemProxyPreferences\.autoKey'
-scan "$rule4" "$autokey_re" "$settings_view" "$setup_sheet" "$embedded_core" "$embedded_core_controller" "$ca_trust" "$core_connection"
+scan "$rule4" "$autokey_re" "$settings_view" "$setup_sheet" "$embedded_core" "$embedded_core_controller" "$ca_trust"
 expect "$rule4" "$settings_view" '@AppStorage\([[:space:]]*SystemProxyPreferences\.autoKey' 'the "Set system proxy at launch" @AppStorage binding'
 expect "$rule4" "$setup_sheet" '\.set\(true,[[:space:]]*forKey:[[:space:]]*SystemProxyPreferences\.autoKey\)' 'the sheet'"'"'s set(true, forKey: autoKey) write'
 expect "$rule4" "$embedded_core" 'forKey:[[:space:]]*SystemProxyPreferences\.autoKey' 'the spawn'"'"'s autoKey read'
@@ -264,8 +286,6 @@ expect "$rule4" "$embedded_core_controller" 'forKey:[[:space:]]*SystemProxyPrefe
 expect "$rule4" "$ca_trust" 'bool\(forKey:[[:space:]]*SystemProxyPreferences\.autoKey\)' 'setupSheetDue'"'"'s autoKey read'
 # CoreConnection.swift documents `appliedSystemProxyAuto` by naming the key; it neither reads
 # nor writes it. Pinned to exactly one line, and that line a `///` comment.
-expect_count "$rule4" "$core_connection" "$autokey_re" 1 'SystemProxyPreferences.autoKey (the one doc-comment mention)'
-expect "$rule4" "$core_connection" '^[[:space:]]*///.*SystemProxyPreferences\.autoKey' 'SystemProxyPreferences.autoKey on a /// doc-comment line'
 # The raw key is spelled once, where it is defined.
 scan "$rule4" '"systemProxy\.auto"' "$prefs"
 expect "$rule4" "$prefs" 'static let autoKey = "systemProxy\.auto"' 'the autoKey definition'

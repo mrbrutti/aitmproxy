@@ -13,8 +13,10 @@ import Foundation
 /// Pure data, `Hashable` and `Sendable`, no SwiftUI. The polling and the two mutating calls live
 /// in `Session`; this type never shells out and never calls a verb.
 public struct SystemProxyFacts: Hashable, Sendable {
+    /// The Agent log's Approve refuses the two verbs with this (the CA sibling's shape).
+    public static let operatorOnlyNote = "not approved from the Agent log — the operator uses \(ConnectionAction.setSystemProxy.title)"
     /// §D6's `state` word.
-    public enum Word: String, Hashable, Sendable, CaseIterable {
+    public enum Word: String, Hashable, Sendable {
         case pointsAtUs = "points_at_us"
         case other
         case off
@@ -64,18 +66,6 @@ public struct SystemProxyFacts: Hashable, Sendable {
     /// result. Nil unless `compact` is an object with a string `state`; a state word this build
     /// does not know is `.unknown` (never off, never ours). Values of the wrong type read as
     /// absent; each property documents its absent value.
-    /// The compact `proxy.status` object carries no `guidance`/`remedy`; a full
-    /// `proxy.system.status` (or a set/unset reply) does. When this value is compact (both
-    /// nil) and `previous` reported the same word, keep the previous full fields so the
-    /// 500 ms poll does not erase the Settings pane's guidance line (D13 "Facts in").
-    public func keepingFullFields(from previous: SystemProxyFacts?) -> SystemProxyFacts {
-        guard guidance == nil, remedy == nil, let previous, previous.word == word else { return self }
-        var merged = self
-        merged.guidance = previous.guidance
-        merged.remedy = previous.remedy
-        return merged
-    }
-
     public init?(compact: JSONValue, listenAddress: String) {
         guard let members = compact.objectValue, let stateWord = members["state"]?.stringValue else { return nil }
         self.init(
@@ -87,6 +77,18 @@ public struct SystemProxyFacts: Hashable, Sendable {
             detail: members["detail"]?.stringValue ?? "",
             remedy: SystemProxyFacts.sentence(members["remedy"]),
             guidance: SystemProxyFacts.sentence(members["guidance"]))
+    }
+
+    /// The compact `proxy.status` object carries no `guidance`/`remedy`; a full
+    /// `proxy.system.status` (or a set/unset reply) does. When this value is compact (both
+    /// nil) and `previous` reported the same word, keep the previous full fields so the
+    /// 500 ms poll does not erase the Settings pane's guidance line (D13 "Facts in").
+    public func keepingFullFields(from previous: SystemProxyFacts?) -> SystemProxyFacts {
+        guard guidance == nil, remedy == nil, let previous, previous.word == word else { return self }
+        var merged = self
+        merged.guidance = previous.guidance
+        merged.remedy = previous.remedy
+        return merged
     }
 
     /// A string with something in it, trimmed; nil for null, a non-string, or blank.

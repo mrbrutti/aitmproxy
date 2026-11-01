@@ -135,20 +135,20 @@ extension Session {
     var setupSheetDue: Bool {
         guard embeddedCoreActive, coreHealth.connection?.status == .ready, caTrustControlLive else { return false }
         let caUndone = caTrust.map { !$0.trusted } ?? false
-        // D13: the row is not due while "Set system proxy at launch" is on — the core sets it at launch.
-        let systemProxyUndone = systemProxyFacts?.supported == true && !systemProxyPointsAtUs
+        // The system-proxy row is due when its route is KNOWN and closed (a word that names no endpoint
+        // has no row to act on), the core has a mechanism, nothing is in flight, and D13's "Set system
+        // proxy at launch" is off — with it on the core sets the proxy at launch itself.
+        let systemProxyUndone = systemProxyFacts?.supported == true && systemProxy != nil && !systemProxyPointsAtUs
             && !(systemProxyFacts?.setting ?? false) && !Store.defaults.bool(forKey: SystemProxyPreferences.autoKey)
         guard caUndone || systemProxyUndone else { return false }
         let defaults = Store.defaults
-        return !defaults.bool(forKey: Self.setupSheetShownKey) && !defaults.bool(forKey: Self.setupSheetSuppressedKey)
+        return !defaults.bool(forKey: SystemProxyPreferences.sheetShownKey)
+            && !defaults.bool(forKey: SystemProxyPreferences.promptSuppressedKey)
     }
-
-    static let setupSheetShownKey = SystemProxyPreferences.sheetShownKey
-    static let setupSheetSuppressedKey = SystemProxyPreferences.promptSuppressedKey
 
     func presentSetupSheetIfDue() {
         guard setupSheetDue else { return }
-        Store.defaults.set(true, forKey: Self.setupSheetShownKey)
+        Store.defaults.set(true, forKey: SystemProxyPreferences.sheetShownKey)
         setupSheetVisible = true
     }
 }

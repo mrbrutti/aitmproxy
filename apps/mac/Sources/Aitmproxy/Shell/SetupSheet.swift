@@ -12,8 +12,8 @@ import SwiftUI
 struct SetupSheet: View {
     @Environment(Session.self) private var session
     @Environment(\.dismiss) private var dismiss
-    /// "Don't ask again", mirrored from `Store.defaults` on appear and written on every change.
-    @State private var promptSuppressed = false
+    /// "Don't ask again" (§D13), the sheet's own key.
+    @AppStorage(SystemProxyPreferences.promptSuppressedKey, store: Store.defaults) private var promptSuppressed = false
 
     /// The Scope step of the Getting-started list: one title, one done state, shared with the Status page.
     private var scopeStep: GettingStartedStep? { session.connectionSummary.steps.first { $0.kind == .scopeSet } }
@@ -21,7 +21,6 @@ struct SetupSheet: View {
     private var caDone: Bool { session.caTrust?.step.done ?? false }
     /// The system-proxy route and its Getting-started step: nil while the system proxy is unknown.
     private var systemProxyRoute: TrafficRoute? { session.connectionSummary.routes.systemProxy }
-    private var systemProxyStep: GettingStartedStep? { session.connectionSummary.steps.first { $0.kind == .systemProxy } }
     private var systemProxyDone: Bool { systemProxyRoute?.open == true }
 
     var body: some View {
@@ -46,9 +45,6 @@ struct SetupSheet: View {
                     .toggleStyle(.checkbox)
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.secondary.color)
-                    .onChange(of: promptSuppressed) { _, on in
-                        Store.defaults.set(on, forKey: SystemProxyPreferences.promptSuppressedKey)
-                    }
                 Spacer()
                 FlatButton(systemProxyDone && caDone && scopeDone ? "Done" : "Not Now") { dismiss() }
                     .keyboardShortcut(.cancelAction)
@@ -57,27 +53,39 @@ struct SetupSheet: View {
         }
         .frame(width: 560)
         .background(Tok.Ground.surface.color)
-        .onAppear { promptSuppressed = Store.defaults.bool(forKey: SystemProxyPreferences.promptSuppressedKey) }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(SetupWords.sheetTitle)
     }
 
-    /// Step 1: the route's line as the title (the step's; `SetupWords.systemProxyRowTitle` while the
-    /// route is unknown, with nothing under it), the route's detail, the primary button while the route
-    /// offers it (hidden once open; the Kit drops it while a change is in flight, when an administrator is
-    /// needed and when the platform has no mechanism), the launch-preference caption, the lane sentence.
+    /// Step 1 (§D13, Matt's words as the title): the route's line as the fact (nothing while the route is
+    /// unknown), the §D13 checklist, the primary button while the route offers it (hidden once open; the
+    /// Kit drops it while a change is in flight, when an administrator is needed and when the platform
+    /// has no mechanism), the launch-preference caption, the lane sentence.
     private var systemProxyRow: some View {
         let route = systemProxyRoute
-        return SetupRow(number: 1, title: systemProxyStep?.title ?? SetupWords.systemProxyRowTitle, done: systemProxyDone) {
+        return SetupRow(number: 1, title: SetupWords.systemProxyRowTitle, done: systemProxyDone) {
             if let route, !route.open {
-                Text(route.detail)
+                Text(route.line)
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.secondary.color)
+                VStack(alignment: .leading, spacing: Space.xs) {
+                    ForEach(SetupWords.systemProxyChecklist, id: \.self) { item in
+                        Label(item, systemImage: "checkmark")
+                            .labelStyle(.titleAndIcon)
+                    }
+                }
+                .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                .foregroundStyle(Tok.Ink.secondary.color)
                 if route.actions.contains(.setSystemProxy) {
                     PrimaryButton(ConnectionAction.setSystemProxy.title) {
-                        // Set now and at every launch (§D13, Architect's call): the core restores on quit.
-                        Store.defaults.set(true, forKey: SystemProxyPreferences.autoKey)
-                        Task { await session.setSystemProxy() }
+                        Task {
+                            await session.setSystemProxy()
+                            // Also at every launch (§D13, Architect's call) — once the set has actually
+                            // landed, so a refused set does not leave the preference on.
+                            if session.systemProxyPointsAtUs {
+                                Store.defaults.set(true, forKey: SystemProxyPreferences.autoKey)
+                            }
+                        }
                     }
                     .disabled(!session.systemProxyControlLive)
                     Text(SetupWords.systemProxyAutoCaption)

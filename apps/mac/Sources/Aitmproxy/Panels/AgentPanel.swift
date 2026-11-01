@@ -91,6 +91,13 @@ final class ActivityState {
             session.lastError = "\(entry.command): \(CATrustFacts.operatorOnlyNote)"
             return
         }
+        // The system-proxy verbs have one call path too (spec D13); the core never parks them, so
+        // this is belt-and-braces against a notification that names them.
+        if Session.isSystemProxyVerb(entry.command) {
+            record(command: entry.command, args: entry.args, result: .error(SystemProxyFacts.operatorOnlyNote))
+            session.lastError = "\(entry.command): \(SystemProxyFacts.operatorOnlyNote)"
+            return
+        }
         Task {
             do {
                 _ = try await session.runCommand(entry.command, entry.args)

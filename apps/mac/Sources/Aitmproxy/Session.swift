@@ -192,11 +192,12 @@ final class Session {
     /// connection is additive because every stored flow already carries its originating id.
     let activeCoreID = CoreID()
     var scopeHosts: [String] = []
-    /// The macOS system proxy's endpoint half as the core reports it: `systemProxyFacts.state`, written
-    /// beside the facts by `BusService.refreshProxyStatus()` and the set/unset replies (Session+SystemProxy.swift).
+    /// The macOS system proxy's endpoint half as the core reports it: the facts' `state`, one source
+    /// (`BusService.refreshProxyStatus()` and the set/unset replies write the facts; Session+SystemProxy.swift).
     /// nil = unknown (never rendered as off): no facts, or a verb word that names no endpoint
-    /// (traffic-route spec D6, plan call 4).
-    var systemProxy: SystemProxyState?
+    /// (traffic-route spec D6, plan call 4). `ConnectionSummary.make` keeps a separate `systemProxy:`
+    /// parameter for a CFNetwork read this app does not make.
+    var systemProxy: SystemProxyState? { systemProxyFacts?.state }
     /// `proxy.status.decrypt` as last polled (traffic-route spec D6): how many hosts Scope decrypts and the
     /// core's own empty-Scope sentence. nil until the first live read or on an older core; `make` ignores
     /// it while the bus lane is not `.ok`, so no reset on disconnect is needed.

@@ -25,6 +25,19 @@ extension Session {
     /// is on. No facts (no verb, no bus) → false, never a guess from the CFNetwork read.
     var systemProxyPointsAtUs: Bool { systemProxyFacts?.word == .pointsAtUs }
 
+    /// Why the control is not live, in the order §D13's Settings footnote lists the causes; nil when
+    /// `systemProxyControlLive`. One ladder for the footnote word and the refusal sentence.
+    var systemProxyNotLiveCause: SystemProxyNotLive? {
+        if systemProxySetting || systemProxyFacts?.setting == true { return .changeInFlight }
+        if let facts = systemProxyFacts, !facts.supported { return .unsupported }
+        guard case .connected = bus, resolvedRole == "operator" else { return .notOperator }
+        return systemProxyFacts == nil ? .waitingForCore : nil
+    }
+
+    /// The address the services are compared against: the live core's, else the configured one. The
+    /// summary, the facts parser and the status re-read all use this one.
+    var effectiveListenAddress: String { coreHealth.connection?.proxyAddress ?? listenAddress }
+
     /// The two mutating verbs, for the surfaces that must not offer them generically (the palette's
     /// Commands list, the Agent log's Approve), like `isCATrustVerb`.
     static func isSystemProxyVerb(_ name: String) -> Bool {
@@ -51,7 +64,7 @@ extension Session {
             Self.systemProxyLog.debug("proxy.system.status not read: \(BusService.describe(error), privacy: .public)")
             return false
         }
-        guard let facts = SystemProxyFacts(compact: json, listenAddress: systemProxyListenAddress) else {
+        guard let facts = SystemProxyFacts(compact: json, listenAddress: effectiveListenAddress) else {
             Self.systemProxyLog.debug("proxy.system.status reply did not decode")
             return false
         }
@@ -59,35 +72,25 @@ extension Session {
         return true
     }
 
-    /// No bus, no fact: the verb's word, the endpoint half and our own in-flight flag all belong to a connection.
+    /// No bus, no fact: the verb's word (and with it the endpoint half) and our own in-flight flag all
+    /// belong to a connection.
     func forgetSystemProxy() {
         systemProxyFacts = nil
-        systemProxy = nil
         systemProxySetting = false
     }
 
-    /// The address the summary compares the services against: the live core's, else the configured one.
-    private var systemProxyListenAddress: String { coreHealth.connection?.proxyAddress ?? listenAddress }
-
-    /// Change-guarded like the poll's writes: an @Observable set notifies even when equal, and every
-    /// route surface reads both.
-    private func applySystemProxyFacts(_ facts: SystemProxyFacts) {
-        if facts != systemProxyFacts { systemProxyFacts = facts }
-        if facts.state != systemProxy { systemProxy = facts.state }
-    }
-
-    /// Why the control is not live, one line, in the order the Settings footnote lists the causes.
-    private var systemProxyNotLiveReason: String {
-        if systemProxySetting || systemProxyFacts?.setting == true { return "a system-proxy change is already in flight" }
-        if let facts = systemProxyFacts, !facts.supported { return "the system proxy cannot be set on this platform" }
-        guard case .connected = bus, resolvedRole == "operator" else { return CATrustFacts.notOperatorLine }
-        return "the core has not reported the system proxy yet"
+    /// The one write of the facts, change-guarded like the poll's writes (an @Observable set notifies
+    /// even when equal): the poll, the status re-read and the set/unset replies all come here. A
+    /// compact object keeps the last full read's `guidance`/`remedy` while the word is unchanged.
+    func applySystemProxyFacts(_ facts: SystemProxyFacts) {
+        let merged = facts.keepingFullFields(from: systemProxyFacts)
+        if merged != systemProxyFacts { systemProxyFacts = merged }
     }
 
     private func changeSystemProxy(_ command: String) async {
         guard !systemProxySetting, case .connected = bus else { return }
         guard systemProxyControlLive else {
-            lastError = "\(command): \(systemProxyNotLiveReason)"
+            lastError = "\(command): \((systemProxyNotLiveCause ?? .waitingForCore).sentence)"
             return
         }
         systemProxySetting = true
@@ -109,9 +112,9 @@ extension Session {
             return
         }
         // The reply IS the fresh status (D6: set/unset return the read they end with), so it is the fact.
-        if let facts = SystemProxyFacts(compact: reply, listenAddress: systemProxyListenAddress) {
+        if let facts = SystemProxyFacts(compact: reply, listenAddress: effectiveListenAddress) {
             applySystemProxyFacts(facts)
-            lastError = nil
+            clearOwnError()
             return
         }
         // A reply without a readable status: the forced re-read is the fact; failing that, say so.
@@ -119,6 +122,38 @@ extension Session {
             lastError = "\(command): the reply carried no system-proxy status and the re-read failed"
             return
         }
-        lastError = nil
+        clearOwnError()
+    }
+
+    /// Success clears only this path's own line: `lastError` is the app's one shared error, and another
+    /// surface's unread failure is not ours to blank (the CA path keeps its own `caTrustLastError`).
+    private func clearOwnError() {
+        if let line = lastError, line.hasPrefix("proxy.system.") { lastError = nil }
+    }
+}
+
+/// Why the system-proxy control stands down (§D13 "disabled with the reason"), ordered as the Settings
+/// footnote lists the causes. One home for the footnote word and the refusal sentence.
+enum SystemProxyNotLive {
+    case changeInFlight, unsupported, notOperator, waitingForCore
+
+    /// The Settings footnote.
+    var word: String {
+        switch self {
+        case .changeInFlight: "setting…"
+        case .unsupported: "not available here"
+        case .notOperator: "connect as operator"
+        case .waitingForCore: "waiting for the core"
+        }
+    }
+
+    /// The `lastError` sentence when a call is attempted anyway.
+    var sentence: String {
+        switch self {
+        case .changeInFlight: "a system-proxy change is already in flight"
+        case .unsupported: "the system proxy cannot be set on this platform"
+        case .notOperator: CATrustFacts.notOperatorLine
+        case .waitingForCore: "the core has not reported the system proxy yet"
+        }
     }
 }

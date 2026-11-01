@@ -203,14 +203,12 @@ struct StatusPanel: View {
         }
     }
 
-    /// Whether a card or step button may be pressed now. The system-proxy pair is a bus call the
-    /// operator makes: it stands down while the bus is not the operator's or a change is in flight
-    /// (`Session.setSystemProxy()` refuses it then), as the sheet's row and the Flows banner do.
+    /// Whether a card or step button may be pressed now: the Flows banner's one predicate
+    /// (`RouteActions.standsDown`), so the CA and system-proxy buttons stand down the same way on
+    /// both pages while the bus is not the operator's or a change is in flight.
     private func isLive(_ action: ConnectionAction) -> Bool {
-        switch action {
-        case .setSystemProxy, .unsetSystemProxy: session.systemProxyControlLive
-        default: true
-        }
+        !RouteActions.standsDown(action, caTrustControlLive: session.caTrustControlLive,
+                                 systemProxyControlLive: session.systemProxyControlLive)
     }
 }
 

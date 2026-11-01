@@ -290,7 +290,8 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     // MARK: Make
 
-    /// `systemProxy` is `Session.systemProxy`, the CFNetwork read (nil = unknown, never rendered as "off");
+    /// `systemProxy` is the endpoint half without the verb facts (reserved for a CFNetwork read; today always
+    /// `systemProxyFacts?.state`; nil = unknown, never rendered as "off");
     /// `systemProxyFacts` the verb's `proxy.status.system_proxy` as `Session` parses it (nil = no verb on this
     /// bus) — when present it is the system-proxy route's one source and `systemProxy` is not read (spec
     /// 2026-10-31-system-proxy-automation-design D1); `caTrust` PR D's `Session.caTrust` (nil = `ca.status`

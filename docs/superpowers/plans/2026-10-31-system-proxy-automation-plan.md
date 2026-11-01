@@ -1250,7 +1250,13 @@ under Matt's standing mandate; the deviations marked **(Matt)** are flagged in t
   System Proxy"); the `.systemProxy` step's action = the route's first action; the `.firstFlow`
   titles of §D13; `ConnectionSummary.systemProxyLaneSentence` / `.bypassFieldCopy`. Task 30 folded in.
 - **Task 25** unchanged (Config `systemProxyAuto`/`systemProxyBypass`, the `system_proxy:` tail
-  after `scope`). Task 28's Kit half: `CommandMap` row `E("Proxy", "Set as / Restore System
+  after `scope`). Files added by the build (recorded 2026-11-01 after the panel): Task 27 →
+  `AitmproxyKit/SystemProxyPreferences.swift` (+Tests: the four keys, `bypassHosts`, `bypassField`,
+  `defaultBypassField` — one parser for spawn, the applied snapshot and the live set),
+  `AitmproxyKit/CoreConnection.swift`, `Bus/EmbeddedCoreController.swift`; Task 28 →
+  `AitmproxyKit/SetupWords.swift` (+Tests: row title, checklist, caption), `Session+Palette.swift`
+  (the two verbs excluded from the Commands list), `Panels/AgentPanel.swift` (Approve refuses them);
+  Task 24 → `SystemProxyFacts.keepingFullFields(from:)`. Task 28's Kit half: `CommandMap` row `E("Proxy", "Set as / Restore System
   Proxy", "⌥⌘P", items: toggle([...]))` directly after the CA row, and the same words appended to
   `docs/BRIEF.md`'s Proxy row (`mapMatchesTheBrief` pins the two together). There is no
   "Network Settings…" item on main (superseded 2026-11-01 in the traffic-route plan).

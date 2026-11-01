@@ -286,11 +286,11 @@ final class BusService: FlowActions {
         // `system_proxy` (system-proxy spec D6, D13 "Facts in"): the verb's compact object, read against the
         // address the summary compares the services with; the endpoint half follows it (nil = unknown,
         // never off). Absent on an older core → nil, which the route model reads as "no verb on this bus".
-        let listenAddress = session.coreHealth.connection?.proxyAddress ?? session.listenAddress
-        let facts = status["system_proxy"].flatMap { SystemProxyFacts(compact: $0, listenAddress: listenAddress) }?
-            .keepingFullFields(from: session.systemProxyFacts)
-        if session.systemProxyFacts != facts { session.systemProxyFacts = facts }
-        if session.systemProxy != facts?.state { session.systemProxy = facts?.state }
+        if let facts = status["system_proxy"].flatMap({ SystemProxyFacts(compact: $0, listenAddress: session.effectiveListenAddress) }) {
+            session.applySystemProxyFacts(facts)
+        } else if session.systemProxyFacts != nil {
+            session.systemProxyFacts = nil
+        }
     }
 
     // MARK: FlowActions

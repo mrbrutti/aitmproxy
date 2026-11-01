@@ -39,9 +39,18 @@ public enum SystemProxyPreferences {
         var hosts: [String] = []
         for piece in field.components(separatedBy: separators) {
             let host = piece.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !host.isEmpty, seen.insert(host).inserted else { continue }
+            guard !host.isEmpty, isPlausibleBypassHost(host), seen.insert(host).inserted else { continue }
             hosts.append(host)
         }
         return hosts
+    }
+
+    /// A piece the field will pass on: no control or illegal scalars (they would make the
+    /// per-launch config unparseable and the core fail to start until the field is edited) and
+    /// no leading `-` (an argv flag to `networksetup`). Matching rules stay the core's.
+    static func isPlausibleBypassHost(_ host: String) -> Bool {
+        guard !host.hasPrefix("-") else { return false }
+        let banned = CharacterSet.controlCharacters.union(.illegalCharacters)
+        return host.unicodeScalars.allSatisfy { !banned.contains($0) }
     }
 }

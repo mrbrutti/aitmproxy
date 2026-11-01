@@ -292,11 +292,7 @@ public enum EmbeddedCoreLaunch {
             // again when it seeds the guard. Nothing is written when the scope is empty.
             if !scopeHosts.isEmpty {
                 body += "\nscope:\n  entries:\n"
-                for host in scopeHosts {
-                    let escaped = try EmbeddedCoreLaunch.yamlDoubleQuoted(
-                        host, onNewline: ConfigError.hostContainsNewline)
-                    body += "    - \"\(escaped)\"\n"
-                }
+                body += try EmbeddedCoreLaunch.yamlHostList(scopeHosts)
             }
             // `system_proxy` is the LAST tail (after `scope`), so every byte-exact `hasSuffix`
             // on a config without it still holds. A top-level `system_proxy:` with `auto:` and
@@ -310,11 +306,7 @@ public enum EmbeddedCoreLaunch {
                 body += "\nsystem_proxy:\n  auto: \(systemProxyAuto)\n"
                 if !systemProxyBypass.isEmpty {
                     body += "  bypass:\n"
-                    for host in systemProxyBypass {
-                        let escaped = try EmbeddedCoreLaunch.yamlDoubleQuoted(
-                            host, onNewline: ConfigError.hostContainsNewline)
-                        body += "    - \"\(escaped)\"\n"
-                    }
+                    body += try EmbeddedCoreLaunch.yamlHostList(systemProxyBypass)
                 }
             }
             return body
@@ -328,6 +320,17 @@ public enum EmbeddedCoreLaunch {
         /// A scope or system-proxy bypass host carried a newline, which would break out
         /// of its YAML scalar and let a crafted host inject YAML into the token-bearing config.
         case hostContainsNewline(String)
+    }
+
+    /// One `    - "<host>"` line per host, each through `yamlDoubleQuoted` with the host error:
+    /// the scope entries and the system-proxy bypass list share this shape.
+    static func yamlHostList(_ hosts: [String]) throws -> String {
+        var lines = ""
+        for host in hosts {
+            let escaped = try yamlDoubleQuoted(host, onNewline: ConfigError.hostContainsNewline)
+            lines += "    - \"\(escaped)\"\n"
+        }
+        return lines
     }
 
     /// Escapes a value (a filesystem path, or a scope host) for embedding inside a

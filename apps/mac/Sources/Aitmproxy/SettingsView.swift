@@ -172,33 +172,11 @@ struct ProxySettings: View {
     @AppStorage(SystemProxyPreferences.autoKey, store: Store.defaults) private var systemProxyAuto = false
     @AppStorage(SystemProxyPreferences.bypassKey, store: Store.defaults) private var systemProxyBypass = SystemProxyPreferences.defaultBypassField
 
-    /// Why the live toggle is disabled (§D13: "disabled with the reason"). Settings-only
-    /// footnotes, not lane or route words: nothing else spells them.
-    private static let settingReason = "setting…"
-    private static let unsupportedReason = "not available here"
-    private static let notOperatorReason = "connect as operator"
-    private static let waitingForCoreReason = "waiting for the core"
-
     private var usesEmbedded: Bool { (ActiveCoreKind(rawValue: activeKindRaw) ?? .embedded) == .embedded }
 
-    /// The bus is connected as the operator: the same test `Session.caTrustControlLive`
-    /// makes, read here only to word the reason the toggle is off.
-    private var busIsOperator: Bool {
-        if case .connected = session.bus, session.resolvedRole == "operator" { return true }
-        return false
-    }
-
-    /// The footnote under a disabled live toggle, in the order §D13 lists the causes.
-    /// Nil when the toggle is live.
-    private var liveToggleReason: String? {
-        guard !session.systemProxyControlLive else { return nil }
-        let facts = session.systemProxyFacts
-        if session.systemProxySetting || facts?.setting == true { return Self.settingReason }
-        if facts?.supported == false { return Self.unsupportedReason }
-        if !busIsOperator { return Self.notOperatorReason }
-        if facts == nil { return Self.waitingForCoreReason }
-        return nil
-    }
+    /// The footnote under a disabled live toggle (§D13 "disabled with the reason"): the Session's one
+    /// cause ladder, worded for Settings. Nil when the toggle is live.
+    private var liveToggleReason: String? { session.systemProxyNotLiveCause?.word }
 
     /// Apply & Restart is live only for the embedded core and only once an edit
     /// diverges from what the running core was started with. With no applied
@@ -238,6 +216,10 @@ struct ProxySettings: View {
                 set: { on in Task { await (on ? session.setSystemProxy() : session.restoreSystemProxy()) } }
             ))
             .disabled(!session.systemProxyControlLive)
+            // One full `proxy.system.status` read when the pane appears: it is the only call that fills
+            // `guidance`; the poll's compact object does not carry it. On the one toggle, not the
+            // Section — a Section's modifiers apply to each of its rows.
+            .task { await session.refreshSystemProxyStatus() }
             // The route line, the same words the Status page and the banner show.
             if let line = session.connectionSummary.routes.systemProxy?.line {
                 Text(line)
@@ -277,9 +259,6 @@ struct ProxySettings: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
-        // One full `proxy.system.status` read when the pane appears: it is the only call
-        // that fills `guidance`; the poll's compact object does not carry it.
-        .task { _ = await session.refreshSystemProxyStatus() }
         Section {
             Button("Apply and Restart Core") { session.restartCoreTick += 1 }
                 .disabled(!canApply)
