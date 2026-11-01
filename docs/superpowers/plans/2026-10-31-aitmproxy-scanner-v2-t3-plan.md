@@ -171,6 +171,17 @@ observed in 8 reset pairs" is the normal reading of a conforming server), and
 `h2-pseudo-header-validation`, `h2-header-crlf-tolerance`, `h2-cl-te-downgrade-indicator`
 clean; forwarded to the coordinator as an AC wording item.
 
+
+**Amendment A4 (T3 session, 2026-11-01).** Tasks 12-16's script conversions and the
+Task 11 test-only harness are drafted OUT OF TREE first, under
+`/tmp/claude/t3-rhai/` (a scratch cargo crate holding the fake `reg.add_check` /
+`probe.*` harness and the converted `*.rhai` files), because any converted script
+committed under `scripts/bundled/active/` turns `crates/aitm/tests/bundled_startup.rs`
+red until T1b's bridge is on `main`. Task 11 moves the drafts into the tree in the
+same commit as the T1b merge and the pin re-point; Tasks 12-16 then become
+verification against the real engine rather than authoring from scratch. The
+`probe.*` shape the drafts assume is S5 unless T1b's bridge says otherwise.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
