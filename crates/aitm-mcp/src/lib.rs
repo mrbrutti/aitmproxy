@@ -20,6 +20,6 @@ pub use http::{StreamableHttp, StreamableHttpCfg};
 pub use schema::{McpSchemaDerive, McpTool, StdSchemaDerive};
 pub use server::{
     ConnCtx, McpServer, NotificationSink, DEFAULT_BROADCAST_CAPACITY, DEFAULT_PUSH_CAPACITY,
-    DEFAULT_WRITE_TIMEOUT,
+    DEFAULT_WRITE_TIMEOUT, JOB_NOTIFICATION_METHOD,
 };
 pub use widgets::{widget_meta_for, widgets, Widget, WidgetMeta};
