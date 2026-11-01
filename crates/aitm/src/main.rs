@@ -1142,11 +1142,20 @@ fn build_env_filter(rust_log: Option<String>) -> tracing_subscriber::EnvFilter {
 }
 
 /// Install a tracing subscriber: `RUST_LOG`-driven, defaulting to the curated
-/// quiet filter ([`DEFAULT_LOG_DIRECTIVE`]).
+/// quiet filter ([`DEFAULT_LOG_DIRECTIVE`]), writing to **stderr**.
+///
+/// Stderr, not `fmt()`'s stdout default: stdout is the operator's deliberate
+/// `println!` channel (the `aitm web` summary with its tokened URL) and the MCP
+/// stdio transport's wire, while diagnostics — a refused script's load error
+/// naming the bad `CheckMeta` key, say — belong on stderr, where a harness or
+/// a supervisor captures them separately.
 fn init_tracing() {
     use tracing_subscriber::fmt;
     let filter = build_env_filter(std::env::var("RUST_LOG").ok());
-    let _ = fmt().with_env_filter(filter).try_init();
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 /// Bind one service port up front, turning "address already in use" into a
@@ -1374,6 +1383,94 @@ mod tests {
             out.contains("proxy listening"),
             "an empty RUST_LOG must fall back to the curated default: {out:?}"
         );
+    }
+
+    #[test]
+    fn warn_and_error_survive_the_default_and_an_info_rust_log() {
+        // Stage-6 fix (scanner-v2 live e2e, core C): a refused script is logged
+        // at warn-or-above by the script tier; neither the curated default nor
+        // the harness's `RUST_LOG=info` may swallow it.
+        for filter in [
+            build_env_filter(None),
+            build_env_filter(Some("info".into())),
+        ] {
+            let out = capture_with_filter(filter, || {
+                tracing::warn!(target: "aitm_plugin_rhai::script", "script `a` refused (warn)");
+                tracing::error!(target: "aitm_plugin_rhai::script", "script `b` refused (error)");
+            });
+            assert!(
+                out.contains("script `a` refused (warn)"),
+                "warn must pass: {out:?}"
+            );
+            assert!(
+                out.contains("script `b` refused (error)"),
+                "error must pass: {out:?}"
+            );
+        }
+    }
+
+    /// Set in the child the test below spawns; unset in a normal run, so this
+    /// test is a no-op there.
+    const LOG_CHILD_ENV: &str = "AITM_TEST_LOG_CHILD";
+    /// The line the child emits: the script tier's refusal of a check whose
+    /// meta lacks `kinds` (the shape `aitm_plugin_rhai::plugin::load_into` logs).
+    const REFUSED_LINE: &str =
+        "script `e2e-broken`: reg.add_check `e2e-broken`: `kinds`: missing field `kinds`";
+
+    #[test]
+    fn log_child_emits_a_refused_script_line() {
+        if std::env::var_os(LOG_CHILD_ENV).is_none() {
+            return;
+        }
+        super::init_tracing();
+        tracing::error!(target: "aitm_plugin_rhai::script", script = "e2e-broken", "{REFUSED_LINE}");
+    }
+
+    /// Run this test binary as a child on `log_child_emits_a_refused_script_line`
+    /// with `rust_log` as its `RUST_LOG` (or unset), returning `(stdout, stderr)`.
+    fn run_log_child(rust_log: Option<&str>) -> (String, String) {
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let mut cmd = std::process::Command::new(exe);
+        cmd.args([
+            "--exact",
+            "tests::log_child_emits_a_refused_script_line",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(LOG_CHILD_ENV, "1")
+        .env_remove("RUST_LOG");
+        if let Some(directive) = rust_log {
+            cmd.env("RUST_LOG", directive);
+        }
+        let out = cmd.output().expect("the child test binary runs");
+        assert!(out.status.success(), "the child must pass: {out:?}");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    #[test]
+    fn server_tracing_writes_to_stderr_not_stdout() {
+        // Stage-6 fix (scanner-v2 live e2e, core C): the e2e harness captures the
+        // core's stderr and asserts a refused script's line names `kinds`. The
+        // server subscriber must therefore write to stderr — stdout is the
+        // operator's deliberate `println!` channel (the `aitm web` summary) and
+        // the MCP stdio transport's wire. Both with the harness's `RUST_LOG=info`
+        // and with `RUST_LOG` unset (the curated default).
+        for rust_log in [Some("info"), None] {
+            let (stdout, stderr) = run_log_child(rust_log);
+            assert!(
+                stderr.contains(REFUSED_LINE),
+                "RUST_LOG={rust_log:?}: the refused-script line must reach stderr; \
+                 stderr: {stderr:?}"
+            );
+            assert!(
+                !stdout.contains(REFUSED_LINE),
+                "RUST_LOG={rust_log:?}: the refused-script line must not go to stdout; \
+                 stdout: {stdout:?}"
+            );
+        }
     }
 
     #[test]
