@@ -375,10 +375,16 @@ impl FromStr for FieldPath {
 
 /// The field paths that are non-fuzzable by construction (spec D8.4).
 ///
-/// The destination and the source address are pinned so the lane can never
-/// send outside the admitted target or spoof a source; `ether.*` is pinned by
-/// the prefix rule in [`is_pinned`] rather than by an entry here.
-pub const PINNED: [&str; 8] = [
+/// Spec D8.4: "`dst`, `dst_port`, `interface`, `ether.src/dst`,
+/// `ipv4.src`/`ipv6.src` are **non-fuzzable by construction** (scapy's rule; a
+/// plan naming them is `invalid_profile`)". The destination, the destination
+/// port, the interface and the source address are pinned so the lane can never
+/// send outside the admitted target, off the admitted interface, or spoof a
+/// source. The plan's own `dst_port` and `interface` keys are named bare here
+/// as well as under their `udp.`/`tcp.` prefixes, so a profile naming either
+/// spelling is refused as a pin rather than as an unknown path. `ether.*` is
+/// pinned by the prefix rule in [`is_pinned`] rather than by an entry here.
+pub const PINNED: [&str; 10] = [
     "ipv4.src",
     "ipv4.dst",
     "ipv6.src",
@@ -387,6 +393,8 @@ pub const PINNED: [&str; 8] = [
     "tcp.dst_port",
     "dst",
     "src",
+    "dst_port",
+    "interface",
 ];
 
 /// Whether a path names a pinned field: an exact [`PINNED`] entry, or any
@@ -530,6 +538,8 @@ mod tests {
             "tcp.dst_port",
             "dst",
             "src",
+            "dst_port",
+            "interface",
             "ether.src",
             "ether.dst",
         ] {
