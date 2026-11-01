@@ -202,8 +202,8 @@ const RAW_BODY_ELEMENTS: [(&str, &str); 8] = [
 ///   a tag name counts only when a delimiter — whitespace, `>` or `/` —
 ///   follows it (or, for an end tag, the body ends), so `<scripty>` opens no
 ///   script and `</scripty` closes none.
-/// - A `<script` inside an HTML comment (`<!-- ... -->`, including the
-///   abruptly closed `<!-->` and `<!--->`) or inside the raw-text body of
+/// - A `<script` inside an HTML comment (`<!-- ... -->` or `<!-- ... --!>`,
+///   including the abruptly closed `<!-->` and `<!--->`) or inside the raw-text body of
 ///   one of [`RAW_BODY_ELEMENTS`] is text, not a tag, and opens nothing; a
 ///   `<plaintext>` turns the rest of the document into text. A comment or
 ///   raw-text body that never closes swallows the rest of the document, as
@@ -213,26 +213,26 @@ const RAW_BODY_ELEMENTS: [(&str, &str); 8] = [
 ///   value or a bogus comment (`<![CDATA[`, `<!DOCTYPE`, `<?xml`) opens
 ///   nothing either.
 ///
-/// Not modelled, each a documented divergence: a `>` inside an attribute
-/// value ends its tag early, so the rest of that tag is read as content (it
-/// can hide a reflection, and a `<script` in a later attribute value of the
-/// same tag would open one); the `--!>` comment close is not recognised, so
-/// such a comment runs on to the next `-->` (hide only); and the
-/// double-escaped state a `<!--<script>` inside a script enters, where the
-/// tokenizer needs a second `</script>` before the element ends, is read here
-/// as ending at the first one (hide only).
+/// Not modelled, each a documented divergence that desynchronises the pass
+/// from the tokenizer, after which a later `<script` may be read in either
+/// direction (a hidden reflection, or, on a page built for it, an invented
+/// one): a `>` inside an attribute value ends its tag early, so the rest of
+/// that tag is read as content; the double-escaped state a `<!--<script>`
+/// inside a script enters, where the tokenizer needs a second `</script>`
+/// before the element ends, is read here as ending at the first one; and
+/// foreign content (`<svg>`, `<math>`) is read as HTML, although there
+/// `<![CDATA[ ... ]]>` is a CDATA section and `<script>`, `<style>` and
+/// `<title>` do not change the tokenizer state.
 fn script_content_ranges(lower: &str) -> Vec<Range<usize>> {
     let mut ranges = Vec::new();
     let mut i = 0;
     while let Some(lt) = lower[i..].find('<').map(|off| i + off) {
         let rest = &lower[lt..];
         if rest.starts_with("<!--") {
-            // The search starts at the comment's own dashes so that `<!-->`
-            // and `<!--->` close it, as they do for the tokenizer.
-            let Some(off) = lower[lt + 2..].find("-->") else {
+            let Some(next) = comment_end(lower, lt) else {
                 break;
             };
-            i = lt + 2 + off + "-->".len();
+            i = next;
             continue;
         }
         if opens_element(rest, "plaintext") {
@@ -242,26 +242,18 @@ fn script_content_ranges(lower: &str) -> Vec<Range<usize>> {
             .iter()
             .find(|(name, _)| opens_element(rest, name))
         {
-            let Some(tag_end) = rest.find('>') else {
+            let Some(body) = raw_text_body(lower, lt, end_tag) else {
                 break;
             };
-            let content = lt + tag_end + 1;
-            let Some(off) = find_end_tag(&lower[content..], end_tag) else {
-                break;
-            };
-            i = content + off + end_tag.len();
+            i = body.end + end_tag.len();
             continue;
         }
         if opens_element(rest, "script") {
-            let Some(tag_end) = rest.find('>') else {
+            let Some(body) = raw_text_body(lower, lt, "</script") else {
                 break;
             };
-            let content = lt + tag_end + 1;
-            let Some(off) = find_end_tag(&lower[content..], "</script") else {
-                break;
-            };
-            ranges.push(content..content + off);
-            i = content + off + "</script".len();
+            i = body.end + "</script".len();
+            ranges.push(body);
             continue;
         }
         if starts_tag_like(rest) {
@@ -274,6 +266,34 @@ fn script_content_ranges(lower: &str) -> Vec<Range<usize>> {
         i = lt + 1;
     }
     ranges
+}
+
+/// The body of the raw-text or script element whose open tag starts at `lt`
+/// in `lower`: from one past the first `>` of the open tag to the delimited
+/// `end_tag` that closes it. `None` when the open tag never ends or the
+/// element never closes; both swallow the rest of the document.
+fn raw_text_body(lower: &str, lt: usize, end_tag: &str) -> Option<Range<usize>> {
+    let content = lt + lower[lt..].find('>')? + 1;
+    let off = find_end_tag(&lower[content..], end_tag)?;
+    Some(content..content + off)
+}
+
+/// Where the comment that opens at `lt` (`<!--`) in `lower` ends: one past
+/// the `>` of its `-->` or `--!>` close. The comment's own dashes may serve
+/// as the close, so `<!-->` and `<!--->` are complete comments, but `<!--!>`
+/// is not: the `--` of a `--!>` close must come after the opener. One
+/// forward pass over the `>`s, so linear in the body.
+fn comment_end(lower: &str, lt: usize) -> Option<usize> {
+    let bytes = lower.as_bytes();
+    let mut p = lt + "<!--".len();
+    while let Some(off) = lower[p..].find('>') {
+        let g = p + off;
+        if &bytes[g - 2..g] == b"--" || (g >= lt + 7 && &bytes[g - 3..g] == b"--!") {
+            return Some(g + 1);
+        }
+        p = g + 1;
+    }
+    None
 }
 
 /// Whether `b` may follow a tag name: whitespace, `>` or `/`.
@@ -444,7 +464,10 @@ impl Check for XssReflected {
 mod tests {
     use std::ops::Range;
 
-    use super::{context_probes, script_content_ranges, within_any, Context, CANARY_PREFIX};
+    use super::{
+        context_probes, script_content_ranges, within_any, Context, CANARY_PREFIX,
+        RAW_BODY_ELEMENTS,
+    };
 
     /// The canary is the prefix plus the job marker, and every probe carries it
     /// whole — a probe that dropped the tag would match any page. Each probe is
@@ -533,6 +556,15 @@ mod tests {
     /// byte offset `at` of `body` is script content.
     fn inside_script_element(body: &str, at: usize) -> bool {
         within_any(&script_content_ranges(&body.to_ascii_lowercase()), at)
+    }
+
+    /// Each raw-text element's end tag is its own name, so a copy-paste row
+    /// cannot make one element swallow the document.
+    #[test]
+    fn every_raw_body_element_closes_with_its_own_end_tag() {
+        for (name, end_tag) in RAW_BODY_ELEMENTS {
+            assert_eq!(end_tag, format!("</{name}"));
+        }
     }
 
     /// The pass lists exactly the content spans, in order, whatever the case
@@ -628,6 +660,13 @@ mod tests {
             "<plaintext><script><p>';aitmabcd//</p><script>x()</script>",
             // `</scripty>` ends no script, so the element never closes.
             "<script>x</scripty><p>';aitmabcd//</p>",
+            // `--!>` closes a comment, so the `-->` is title text and the
+            // echo is title text too (F7c).
+            "<!--x--!><title>--><script>';aitmabcd//</script></title>",
+            // `<!--!>` is not a closed comment; it swallows the rest.
+            "<!--!><script>q='';aitmabcd//';</script>",
+            // An end tag is read through to its first `>`, attributes and all.
+            "</div <script> ><p>';aitmabcd//</p><script>x()</script>",
         ] {
             assert!(!Context::JsString.reflected_in(body, js), "{body}");
         }
@@ -643,6 +682,9 @@ mod tests {
             "<script>var q='';aitmabcd//'; // </scripty\n</script>",
             // The body may end right after the closing tag's name.
             "<script>var q='';aitmabcd//';</script",
+            // A comment closed by `--!>` hides nothing after it.
+            "<!-- x --!><script>var q='';aitmabcd//';</script>",
+            "<!--><script>var q='';aitmabcd//';</script>",
         ] {
             assert!(Context::JsString.reflected_in(body, js), "{body}");
         }
