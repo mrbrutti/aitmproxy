@@ -86,6 +86,14 @@ pub enum Action {
     /// with no extra prompt: the tag dedupe sends it once until the reply; on
     /// a terminal job the key is inert and the banner reads `already <state>`.
     ScanCancel,
+    /// Profiles and Jobs `s`: launch `scan.start` with the editor's typed
+    /// draft, else the Profiles list cursor's name (spec D7, D11). Inert
+    /// while the UI-3 gate holds a reason or a launch is in flight.
+    ScanStart,
+    /// Profiles and Jobs `m`: the same with `scan.map`, falling back to the
+    /// legacy `scan.discover` on the draft's first origin when the bus
+    /// lacks `scan.map` (spec D2, D7).
+    ScanMap,
     /// Issues tab `S` `C` `L` `T` `J`: cycle one `scan.issues` filter and
     /// refetch the list (spec D11).
     ScanFilter(crate::scan::IssueFilterKey),

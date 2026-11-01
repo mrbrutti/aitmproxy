@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use aitm_scan_model::{
     is_builtin_name, ChecksResult, Issue, IssueStatus, IssuesResult, JobEvent, JobId,
     JobNotification, JobStatus, ListResult, Phase, ProfileDeleteResult, ProfileListResult,
-    ProfileSaveResult, ScanProfile, SessionMode, SessionProfile, SitemapResult, JOB_KIND_SCAN,
-    JOB_NOTIFICATION_METHOD,
+    ProfileSaveResult, ScanProfile, SessionMode, SessionProfile, SitemapResult, StartResult,
+    JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
@@ -31,9 +31,10 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, parse_l4_target, parse_result, state_text, status_token, step, tag_keyed, tag_parts,
-    typed_origin, Dir, FieldKind, IssueFilterKey, IssuePane, JobPane, MapSource, ProfileEditor,
-    ProfilePane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
+    is_job_id, l4_gate, lane_token, launch_args, parse_l4_target, parse_result, scan_host,
+    state_text, status_token, step, tag_keyed, tag_parts, typed_origin, Dir, FieldKind,
+    IssueFilterKey, IssuePane, JobPane, MapSource, PendingLaunch, ProfileEditor, ProfilePane,
+    ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
     MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
     SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
@@ -195,6 +196,14 @@ const SAVED_NAME_MAX: usize = 80;
 
 /// The widest a saved profile's path grows in its toast, in cells.
 const SAVED_PATH_MAX: usize = 200;
+
+/// The most `clamped` entries a `StartResult` toast names, and the cells a
+/// clamped field name may take (a hostile core's list is cut, not echoed).
+const CLAMPED_MAX: usize = 8;
+const CLAMPED_FIELD_MAX: usize = 64;
+
+/// The local refusal while a launch waits for its reply (spec D7).
+const LAUNCH_IN_FLIGHT: &str = "a launch is already in flight";
 
 /// What the Profiles keys say when no editor is open (plan task 10).
 const NO_EDITOR: &str = "open a profile first (Enter on a row, or N for a new one)";
@@ -1882,6 +1891,8 @@ impl App {
             Action::ScanPaneNext => self.scan.step_pane(true),
             Action::ScanPanePrev => self.scan.step_pane(false),
             Action::ScanCancel => self.scan_cancel(&mut out),
+            Action::ScanStart => self.scan_launch_v2("scan.start", &mut out),
+            Action::ScanMap => self.scan_launch_v2("scan.map", &mut out),
             Action::ScanFilter(key) => self.scan_filter(key, &mut out),
             Action::ScanFilterReset => self.scan_filter_reset(&mut out),
             Action::ScanIssueStatus(status) => self.scan_issue_status(status, &mut out),
@@ -2077,19 +2088,29 @@ impl App {
     /// Answer the wire-confirm overlay (spec D3, D7): `yes` re-issues the
     /// identical call plus the reserved `_confirm` token; `no` cancels with a
     /// `<call> cancelled` toast. Returns to the mode the launch came from. The
-    /// `l4.*` verbs re-issue with `BusRequest::Call`; Task 12 adds the tagged
-    /// branch for the `scan.*` launches.
+    /// `l4.*` verbs re-issue with `BusRequest::Call`; a `scan.*` launch goes
+    /// back out tagged under its verb (the pending launch stays until the
+    /// result), and a cancel clears the pending launch so the key is live.
     fn answer_wire_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
         self.mode = self.wire_confirm_from;
         let Some(c) = self.wire_confirm.take() else {
             return Vec::new();
         };
+        let is_scan = c.call.starts_with("scan.");
         if yes {
+            if is_scan {
+                let mut out = Vec::new();
+                self.scan_call(c.call.clone(), &c.call, c.confirmed_args(), &mut out);
+                return out;
+            }
             vec![BusRequest::Call {
                 name: c.call.clone(),
                 args: c.confirmed_args(),
             }]
         } else {
+            if is_scan {
+                self.scan.launch.pending = None;
+            }
             self.toast(Level::Info, format!("{} cancelled", c.call));
             Vec::new()
         }
@@ -3488,12 +3509,14 @@ impl App {
             "scan" => {
                 out.extend(self.update(Action::OpenScan));
                 if !rest.is_empty() {
-                    if self.scan_offer() == ScanOffer::None {
-                        self.toast(Level::Warn, NO_SCANNER);
-                    } else if self.scan.legacy.running {
-                        self.toast(Level::Info, "a scan is already running");
-                    } else {
-                        self.scan_launch(Some(rest.to_string()), &mut out);
+                    match self.scan_offer() {
+                        ScanOffer::None => self.toast(Level::Warn, NO_SCANNER),
+                        // D8: `:scan <origin>` under v2 is `scan.start {target}`.
+                        ScanOffer::V2 => self.scan_start_typed(rest, &mut out),
+                        ScanOffer::Legacy if self.scan.legacy.running => {
+                            self.toast(Level::Info, "a scan is already running");
+                        }
+                        ScanOffer::Legacy => self.scan_launch(Some(rest.to_string()), &mut out),
                     }
                 }
             }
@@ -3594,6 +3617,8 @@ impl App {
                     role,
                 };
                 self.tools = tools;
+                // The UI-3 gate reads the tool list (D7).
+                self.recompute_launch_gate();
                 if self.role_mismatch() {
                     let resolved = self.resolved_role().unwrap_or("unknown");
                     let expected = self.expect_role.as_deref().unwrap_or("");
@@ -3761,6 +3786,8 @@ impl App {
                     .iter()
                     .filter_map(crate::l4::L4ScopeEntry::from_json)
                     .collect();
+                // The UI-3 gate reads the L4 scope (D7).
+                self.recompute_launch_gate();
             }
             BusEvent::L4Agent(v) => self.l4.gates = crate::l4::L4Gates::from_json(&v),
             BusEvent::Findings(library) => self.merge_library(library, &mut out),
@@ -4575,9 +4602,219 @@ impl App {
         );
     }
 
-    /// The UI-3 launch gate (spec D7): recomputed on every draft change.
-    /// Plan task 12 fills it; until then the gate is open.
-    fn recompute_launch_gate(&mut self) {}
+    /// The UI-3 launch gate (spec D7): recomputed on every draft change, on
+    /// `Connected` (the tool list) and on `L4Scope` (the entries). Without an
+    /// editor there is no draft to gate.
+    fn recompute_launch_gate(&mut self) {
+        let has_layer = self.has_tool("l4.scope.list");
+        self.scan.launch.blocked = self
+            .scan
+            .profiles
+            .editor
+            .as_ref()
+            .and_then(|e| l4_gate(&e.draft, has_layer, &self.l4.scope));
+    }
+
+    /// Profiles and Jobs `s` / `m` (spec D7, D11): `verb` is `scan.start` or
+    /// `scan.map`. On a legacy bus both run the one-shot `r` runs (D2). Under
+    /// v2 the key is inert while the UI-3 gate holds a reason (the footer
+    /// shows it) or a launch is in flight (toast); every draft origin's host
+    /// is re-checked against the scope first (an origin can arrive from
+    /// `scan.profile.get` or outlive a scope shrink: the D8 toast, nothing
+    /// sent); `scan.map` falls back to `scan.discover` on the draft's first
+    /// origin when the bus lacks it (D2). The args come from the editor's
+    /// typed draft, else the Profiles list cursor's name.
+    fn scan_launch_v2(&mut self, verb: &str, out: &mut Vec<BusRequest>) {
+        match self.scan_offer() {
+            ScanOffer::None => {
+                self.toast(Level::Warn, NO_SCANNER);
+                return;
+            }
+            ScanOffer::Legacy => {
+                if self.scan.legacy.running {
+                    self.toast(Level::Info, "a scan is already running");
+                } else {
+                    self.scan_launch(None, out);
+                }
+                return;
+            }
+            ScanOffer::V2 => {}
+        }
+        if !matches!(self.scan.tab, ScanTab::Profiles | ScanTab::Jobs) {
+            return;
+        }
+        if self.scan.launch.blocked.is_some() {
+            return;
+        }
+        if self.scan.launch.pending.is_some() {
+            self.toast(Level::Info, LAUNCH_IN_FLIGHT);
+            return;
+        }
+        let origins: Vec<String> = self
+            .scan
+            .profiles
+            .editor
+            .as_ref()
+            .map(|e| e.draft.target.origins.clone())
+            .unwrap_or_default();
+        for origin in &origins {
+            let host = scan_host(origin);
+            if host.is_empty() || !scope_covers(&self.scope, &host) {
+                self.toast(
+                    Level::Warn,
+                    format!("Out of scope: add `{host}` to scope to scan it"),
+                );
+                return;
+            }
+        }
+        if verb == "scan.map" && !self.has_tool("scan.map") && self.has_tool("scan.discover") {
+            if self.scan.legacy.running {
+                self.toast(Level::Info, "a scan is already running");
+            } else {
+                match origins.first().cloned() {
+                    Some(origin) => self.scan_launch(Some(origin), out),
+                    None => self.toast(Level::Info, "map needs an origin: add one (o) first"),
+                }
+            }
+            return;
+        }
+        let list_name = self
+            .scan
+            .profiles
+            .list
+            .get(self.scan.profiles.cursor)
+            .map(|p| p.name.clone());
+        let editor = self.scan.profiles.editor.as_ref();
+        let Some(args) = launch_args(editor, list_name.as_deref(), None) else {
+            self.toast(
+                Level::Info,
+                "nothing to launch: open a profile (⏎) or :scan <origin>",
+            );
+            return;
+        };
+        let profile_name = match editor {
+            Some(e) if !e.draft.name.is_empty() => Some(e.draft.name.clone()),
+            Some(_) => None,
+            None => list_name,
+        };
+        self.send_launch(verb, args, profile_name, out);
+    }
+
+    /// `:scan <origin>` under v2 (spec D8): the D8 origin rule and the scope
+    /// check, then `scan.start {target}`; refused locally only while a
+    /// launch is in flight.
+    fn scan_start_typed(&mut self, raw: &str, out: &mut Vec<BusRequest>) {
+        if self.scan.launch.pending.is_some() {
+            self.toast(Level::Info, LAUNCH_IN_FLIGHT);
+            return;
+        }
+        let host = scan_host(raw);
+        if host.is_empty() || !scope_covers(&self.scope, &host) {
+            self.toast(
+                Level::Warn,
+                format!("Out of scope: add `{host}` to scope to scan it"),
+            );
+            return;
+        }
+        let target = match typed_origin(raw, &self.flows) {
+            Ok(target) => target,
+            Err(reason) => {
+                self.toast(Level::Warn, reason);
+                return;
+            }
+        };
+        let Some(args) = launch_args(None, None, Some(&target)) else {
+            return;
+        };
+        self.send_launch("scan.start", args, None, out);
+    }
+
+    /// The one way a launch leaves (spec D7): tagged under its verb and
+    /// recorded in `launch.pending` until the result, the prompt's cancel or
+    /// the failure; the overlay, should the server ask, returns to Scan.
+    fn send_launch(
+        &mut self,
+        verb: &str,
+        args: Value,
+        profile_name: Option<String>,
+        out: &mut Vec<BusRequest>,
+    ) {
+        if self.scan_call(verb.to_string(), verb, args.clone(), out) {
+            self.scan.launch.pending = Some(PendingLaunch {
+                call: verb.to_string(),
+                args,
+                profile_name,
+            });
+            self.wire_confirm_from = Mode::Scan;
+        }
+    }
+
+    /// Fold a `StartResult` (spec D7, D10): the job is marked started here
+    /// (fix round B, B3: the next `scan.list` that omits it keeps it at the
+    /// front), its status goes into `full` and the id to the front of
+    /// `order`, the view switches to Jobs with the cursor on it, the start
+    /// line is toasted and a non-empty `clamped` list is a second Warn
+    /// toast. D6 hostile-core bounds: an id outside the wire form, or a
+    /// status naming another job, folds nothing and records the error.
+    fn fold_start_result(&mut self, tag: &str, result: StartResult, fallback: Option<String>) {
+        if !is_job_id(&result.job) {
+            self.scan.set_error(ScanError::uncoded(
+                tag,
+                "reply named a job id outside the wire form",
+            ));
+            return;
+        }
+        if result.status.job != result.job {
+            self.scan.set_error(ScanError::uncoded(tag, OTHER_JOB));
+            return;
+        }
+        let id = result.job.clone();
+        self.scan.jobs.started_here.insert(id.clone());
+        self.scan.jobs.fold_status(result.status);
+        if let Some(pos) = self.scan.jobs.order.iter().position(|j| *j == id) {
+            if pos != 0 {
+                let moved = self.scan.jobs.order.remove(pos);
+                self.scan.jobs.order.insert(0, moved);
+            }
+        }
+        self.scan.jobs.cursor = 0;
+        self.scan.jobs.pane = JobPane::List;
+        self.scan.jobs.detail_scroll = 0;
+        self.scan.tab = ScanTab::Jobs;
+        let profile = self
+            .scan
+            .jobs
+            .full
+            .get(&id)
+            .map(|s| s.profile_name.clone())
+            .filter(|n| !n.is_empty())
+            .or_else(|| fallback.map(|n| truncate(&n, SAVED_NAME_MAX)))
+            .unwrap_or_else(|| "profile".to_string());
+        let lanes = result
+            .lanes
+            .run
+            .iter()
+            .map(|l| lane_token(*l))
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.toast(Level::Info, format!("{id} started: {profile} ({lanes})"));
+        if !result.clamped.is_empty() {
+            let parts: Vec<String> = result
+                .clamped
+                .iter()
+                .take(CLAMPED_MAX)
+                .map(|c| {
+                    format!(
+                        "{} {} -> {}",
+                        truncate(&c.field, CLAMPED_FIELD_MAX),
+                        c.requested,
+                        c.applied
+                    )
+                })
+                .collect();
+            self.toast(Level::Warn, format!("clamped: {}", parts.join("; ")));
+        }
+    }
 
     /// Profiles `N` (D11): a fresh editor over the defaults.
     fn scan_new_profile(&mut self) {
@@ -5081,6 +5318,32 @@ impl App {
     fn on_scan_ok(&mut self, tag: &str, name: &str, value: Value, out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
         match name {
+            "scan.start" | "scan.map" => {
+                // A `needs_confirmation` reply opens the shared overlay with
+                // the pending launch kept for the re-issue (D7); any other
+                // reply settles the launch, folded as a `StartResult` when
+                // it matches the contract.
+                let (call, args) = self
+                    .scan
+                    .launch
+                    .pending
+                    .as_ref()
+                    .map_or((name.to_string(), Value::Null), |p| {
+                        (p.call.clone(), p.args.clone())
+                    });
+                if let Some(confirm) =
+                    crate::scan::launch::WireConfirm::from_reply(&call, &args, &value)
+                {
+                    self.wire_confirm = Some(confirm);
+                    self.wire_confirm_from = Mode::Scan;
+                    self.mode = Mode::WireConfirm;
+                    return;
+                }
+                let fallback = self.scan.launch.pending.take().and_then(|p| p.profile_name);
+                if let Some(result) = self.scan_reply::<StartResult>(tag, &value) {
+                    self.fold_start_result(tag, result, fallback);
+                }
+            }
             "scan.status" | "scan.cancel" => {
                 // D6 hostile-core bound: the reply is folded only under the
                 // job the tag asked about, so a core cannot mint a new live
@@ -5304,6 +5567,10 @@ impl App {
         }
         if tag == "scan.sitemap" {
             self.scan.sitemap.appending = false;
+        }
+        // A refused launch is answered: the key is live again (D7, D13).
+        if tag == "scan.start" || tag == "scan.map" {
+            self.scan.launch.pending = None;
         }
         self.scan.set_error(ScanError::from_message(tag, &message));
     }

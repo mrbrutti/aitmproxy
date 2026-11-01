@@ -305,13 +305,22 @@ fn state_style(theme: &Theme, state: Option<JobState>) -> Style {
 /// narrow to draw them (`table_full` is false), then the `label value`
 /// lines of `JobsState::detail_text` (the full status's lines, or the
 /// waiting placeholder), scrolled by `detail_scroll`. The footer takes the
-/// last row when there are two or more.
+/// last row when there are two or more; while the UI-3 gate holds a reason
+/// (`launch.blocked`, D7) and there are three or more, the reason takes the
+/// row above the footer in the warning hue (D13's refused state), since
+/// `s` is live on this tab too.
 fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
     }
     let jobs = &app.scan.jobs;
     let w = usize::from(area.width).saturating_sub(1);
+    let blocked = app
+        .scan
+        .launch
+        .blocked
+        .as_deref()
+        .filter(|_| area.height >= 3);
     let mut first = vec![Span::styled(
         format!(" {}", row.id),
         theme.text_primary().add_modifier(Modifier::BOLD),
@@ -333,13 +342,26 @@ fn detail(app: &App, theme: &Theme, row: &JobRow, table_full: bool, area: Rect, 
         lines.push(labelled(theme, label, &value, w, None));
     }
     let has_footer = area.height >= 2;
-    let body_h = usize::from(area.height) - usize::from(has_footer);
+    let foot_rows = usize::from(has_footer) + usize::from(blocked.is_some());
+    let body_h = usize::from(area.height) - foot_rows;
     let scroll = usize::from(jobs.detail_scroll).min(lines.len().saturating_sub(1));
     for (k, line) in lines.into_iter().skip(scroll).take(body_h).enumerate() {
         put(
             buf,
             Rect::new(area.x, area.y + cells(k), area.width, 1),
             line,
+        );
+    }
+    if let Some(reason) = blocked {
+        // `status.clientError` is the `state.warning` foreground on both
+        // schemes (the Profiles footer draws the same reason with it).
+        put(
+            buf,
+            Rect::new(area.x, area.bottom() - 2, area.width, 1),
+            Line::styled(
+                format!(" {}", truncate(reason, w)),
+                theme.fg(&status::CLIENT_ERROR),
+            ),
         );
     }
     if has_footer {

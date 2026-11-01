@@ -2,9 +2,76 @@
 //! UI-3 reason a launch is blocked, and the wire-confirm handshake shared by the
 //! `l4.*` guarded verbs and the `scan.*` launches.
 
-use serde_json::Value;
+use aitm_scan_model::{LaneKind, ScanProfile};
+use serde_json::{json, Value};
 
 use crate::action::CONFIRM_KEY;
+use crate::l4::L4ScopeEntry;
+use crate::scan::profiles::ProfileEditor;
+
+/// The UI-3 reason when the bus has no L4 layer (spec D7, first clause).
+pub const GATE_NO_LAYER: &str =
+    "L4 launch disabled: the L4 layer is not on this bus (l4.scope.list)";
+/// The UI-3 reason when the draft names no L4 target (spec D7, second clause).
+pub const GATE_NO_TARGET: &str = "L4 launch disabled: add an L4 target (ip, port, proto) first";
+/// The capability word an L4 scope entry needs for a launch (spec D7).
+const INJECT: &str = "inject";
+
+/// The arguments of a `scan.start` / `scan.map` call (spec D7): from an
+/// open editor the whole typed draft as `{profile}`, else the Profiles list
+/// cursor's `{profile_name}`, else a typed origin as `{target}`; `None` with
+/// nothing to launch. The draft is serialised with serde from `ScanProfile`,
+/// so the wire carries exactly the type the engine parses.
+pub fn launch_args(
+    editor: Option<&ProfileEditor>,
+    list_name: Option<&str>,
+    typed: Option<&str>,
+) -> Option<Value> {
+    if let Some(editor) = editor {
+        return serde_json::to_value(&editor.draft)
+            .ok()
+            .map(|profile| json!({ "profile": profile }));
+    }
+    if let Some(name) = list_name {
+        return Some(json!({ "profile_name": name }));
+    }
+    typed.map(|target| json!({ "target": target }))
+}
+
+/// The UI-3 launch gate (spec D7): `None` when `draft.lanes` has neither L4
+/// lane, else the first of the three D7 reasons that applies, in D7 order:
+/// the L4 layer missing from the bus, no L4 target in the draft, no L4
+/// scope entry with the inject capability. The third names the entry to
+/// add for the draft's first L4 target. The client checks presence only;
+/// coverage of the target is the server's `out_of_scope` (D9).
+pub fn l4_gate(
+    draft: &ScanProfile,
+    has_l4_scope_list: bool,
+    l4_scope: &[L4ScopeEntry],
+) -> Option<String> {
+    let wants_l4 = draft
+        .lanes
+        .iter()
+        .any(|l| matches!(l, LaneKind::L4Packet | LaneKind::L4Stream));
+    if !wants_l4 {
+        return None;
+    }
+    if !has_l4_scope_list {
+        return Some(GATE_NO_LAYER.to_string());
+    }
+    let Some(first) = draft.target.l4.first() else {
+        return Some(GATE_NO_TARGET.to_string());
+    };
+    if l4_scope.iter().any(|e| e.capability == INJECT) {
+        return None;
+    }
+    // A host route: /32 for IPv4, /128 for an IPv6 literal.
+    let prefix = if first.ip.contains(':') { 128 } else { 32 };
+    Some(format!(
+        "L4 launch disabled: no L4 scope entry with the inject capability. Add one with interface \"*\", direction outbound, {}/{prefix} ports {}, capability inject (l4.scope.add).",
+        first.ip, first.port
+    ))
+}
 
 /// A pending confirm-over-the-wire handshake (spec D3, D7), generalised from the
 /// L4 inject confirm. The first guarded call (without `_confirm`) returns a
@@ -91,5 +158,63 @@ mod tests {
         assert_eq!(c.confirmed_args()["dst"], "127.0.0.1");
         // A plain success is not a confirmation handshake.
         assert!(WireConfirm::from_reply("l4.inject", &args, &json!({"injected": 1})).is_none());
+    }
+
+    #[test]
+    fn launch_args_prefer_the_editor_then_the_list_then_the_typed_origin() {
+        let draft = ScanProfile {
+            name: "mine".into(),
+            ..ScanProfile::default()
+        };
+        let editor = ProfileEditor::new(draft.clone(), None, false);
+        let args = launch_args(Some(&editor), Some("standard"), Some("https://a.test")).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ScanProfile>(args["profile"].clone()).unwrap(),
+            draft
+        );
+        assert_eq!(
+            launch_args(None, Some("standard"), Some("https://a.test")),
+            Some(json!({ "profile_name": "standard" }))
+        );
+        assert_eq!(
+            launch_args(None, None, Some("https://a.test")),
+            Some(json!({ "target": "https://a.test" }))
+        );
+        assert_eq!(launch_args(None, None, None), None);
+    }
+
+    #[test]
+    fn the_gate_is_open_without_an_l4_lane_and_closed_in_d7_order() {
+        use aitm_scan_model::{L4TargetSpec, L4Transport};
+        let mut draft = ScanProfile::default();
+        assert_eq!(l4_gate(&draft, false, &[]), None, "http only: no gate");
+        draft.lanes = vec![LaneKind::L4Packet];
+        assert_eq!(l4_gate(&draft, false, &[]).as_deref(), Some(GATE_NO_LAYER));
+        assert_eq!(l4_gate(&draft, true, &[]).as_deref(), Some(GATE_NO_TARGET));
+        draft.target.l4.push(L4TargetSpec {
+            ip: "10.0.0.9".into(),
+            port: 53,
+            proto: L4Transport::Udp,
+            grammar: None,
+        });
+        let capture = L4ScopeEntry::from_json(&json!({
+            "interface": "*", "capability": "capture", "cidr": "0.0.0.0/0",
+            "ports": "0-65535", "direction": "both"
+        }))
+        .unwrap();
+        assert_eq!(
+            l4_gate(&draft, true, std::slice::from_ref(&capture)).as_deref(),
+            Some("L4 launch disabled: no L4 scope entry with the inject capability. Add one with interface \"*\", direction outbound, 10.0.0.9/32 ports 53, capability inject (l4.scope.add).")
+        );
+        let inject = L4ScopeEntry::from_json(&json!({
+            "interface": "*", "capability": "inject", "cidr": "10.0.0.9/32",
+            "ports": "53", "direction": "outbound"
+        }))
+        .unwrap();
+        assert_eq!(l4_gate(&draft, true, &[capture, inject]), None);
+        draft.target.l4[0].ip = "::1".into();
+        assert!(l4_gate(&draft, true, &[])
+            .unwrap()
+            .contains("::1/128 ports 53"));
     }
 }

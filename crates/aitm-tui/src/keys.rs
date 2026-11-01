@@ -106,6 +106,9 @@ fn scan(key: KeyEvent) -> Option<Action> {
         KeyCode::Esc | KeyCode::Char('q') => Action::Back,
         KeyCode::Char('r') => Action::ScanLaunch,
         KeyCode::Char('x') => Action::ScanCancel,
+        // Launch (D7, D11, plan task 12): `s` start, `m` map.
+        KeyCode::Char('s') => Action::ScanStart,
+        KeyCode::Char('m') => Action::ScanMap,
         // Profiles (D11, plan task 10).
         KeyCode::Char('e') => Action::ScanEdit,
         KeyCode::Char(' ') => Action::ScanToggle,
