@@ -121,7 +121,10 @@ clauses never match them (unchanged). L4 flows do not pass through
   above, replacing the 2026-10-28 reconciliation note.
 - `flow.intercept`'s `rules[].url` schema description (the MCP tool schema
   every agent and surface reads) states the subject and the rules in one
-  sentence each.
+  sentence each, including that a starred pattern must cover the whole URL or
+  the whole path. `ws.intercept`'s `rules[].url` and `map.add`'s `condition`
+  descriptions carry a one-line pointer to the same subject (added 2026-10-31,
+  panel 1), not a second copy of the rules.
 - `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md` and
   `site/docs.html` say the pattern is matched against the full URL and the
   path.
@@ -146,6 +149,30 @@ is authoritative and the shared case table uses only syntax both accept.
 `host`, `method`, `phase`, `ws_dir` and `enabled` keep their semantics.
 `bus.rs` parse and echo are untouched. Map Local/Remote and `ws.intercept`
 inherit the new `url` semantics through `CompiledRule::matches`.
+
+### Amendment (2026-10-31, after panel 1)
+
+The security reviewer showed that a path-intended pattern also matches at the
+`//` of `scheme://` when the host starts with that segment: `/admin` matched
+`https://admin.example.com/transfer`, and Map Local/Remote act on such a match.
+Three decisions, all **(Architect's call)**:
+
+- **Leading `/` means the path.** A `url` *wildcard* whose first character is
+  `/` is evaluated against the path subject only (a URL never starts with `/`).
+  Every other wildcard, and every regex, keeps the two-subject rule, so the
+  `//` boundary remains a legitimate match for `*/seg*` and for an unanchored
+  regex (`*/login*` matches `https://login.example.com/x`). The docs say so and
+  recommend a `host` clause, or a `^/` anchor, when only the path is meant.
+- **Bounded input.** A pattern longer than 4096 bytes is rejected before any
+  regex is built (`RuleError::PatternTooLong`); `flow.intercept` and
+  `ws.intercept` reject more than 256 rules in one call. A rejected call leaves
+  the active rules unchanged. (The compiled-size cap only applies after the
+  parser has walked the whole pattern; with case folding a 1 MiB literal took
+  263 ms to reject.)
+- **No empty pattern.** An empty `url` wildcard or regex is rejected at compile
+  (`RuleError::EmptyPattern`); omit `url` to match any URL. The macOS form
+  already refuses an empty pattern; the core now agrees instead of arming a
+  match-everything rule.
 
 ## Acceptance criteria
 
@@ -204,6 +231,21 @@ inherit the new `url` semantics through `CompiledRule::matches`.
     over the bus pauses `curl -x <proxy> http://httpbin.org/get`;
     `flow.get` shows `intercepted`; `flow.resume` lets curl finish with 200.
     The transcript is in the PR body.
+
+17. **AC17 leading `/`.** Wildcard `/admin` matches `https://h.test/admin` and
+    `https://h.test/v1/admin` and does not match
+    `https://admin.example.com/transfer`; wildcard `/api/*` does not match
+    `https://api.example.com/other`; wildcard `*/login*` matches
+    `https://login.example.com/x` (documented boundary); regex `/admin`
+    matches `https://admin.example.com/transfer` and regex `^/admin` does not.
+    All are rows of the shared case table, so the Kit preview agrees.
+18. **AC18 bounded input.** A 4096-byte pattern compiles; a 4097-byte one is
+    `RuleError::PatternTooLong` naming the length and the cap, with no regex
+    built; `flow.intercept` with 257 rules errors and leaves the previously
+    armed rules active.
+19. **AC19 empty pattern.** `compile` of `{wildcard:""}` or `{regex:""}` is
+    `RuleError::EmptyPattern`; in the Kit preview a rule with an empty pattern
+    matches no row.
 
 ## Left to the builder
 

@@ -158,7 +158,7 @@ report is in.
 
 - **Satisfies:** AC14, AC15 (SKILL.md, site)
 - **Depends on:** Task 1 (to pass; it can be written in parallel)
-- **Files:** `tests/e2e/proxy/test_intercept_url_rules.py` (create), `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md` (modify: the `url` sentence under "Arm interception"), `site/docs.html` (modify: the one sentence at the "To hold only some traffic" paragraph)
+- **Files:** `tests/e2e/proxy/test_intercept_url_rules.py` (create), `tests/e2e/proxy/README.md` (modify: one catalogue entry, added 2026-10-31 after panel 1), `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md` (modify: the `url` sentence under "Arm interception"), `site/docs.html` (modify: the one sentence at the "To hold only some traffic" paragraph)
 - **Change:**
   - The cell follows `tests/e2e/proxy/test_intercept_replay.py` exactly
     (`# e2e: tier=T1 surface=proxy needs=curl`, `ProxyConfig` with free
@@ -185,12 +185,37 @@ report is in.
 - **Test:** in the Terminal panel, `cargo build -p aitm && python3 tests/e2e/proxy/test_intercept_url_rules.py` exits 0 with five `[ok]` sections; before Task 1 the first round times out waiting for the park.
 - **Done when:** the cell passes in the Terminal and the gate passes (the cell is not part of `cargo test`).
 
+### Fix task A (after panel 1, 2026-10-31): findings F1–F7
+
+- **Satisfies:** AC15 (anchoring clause), AC17, AC18, AC19; quality M2/M3/M6.
+- **Depends on:** Tasks 1–4, Tester.
+- **Files:** `crates/aitm-rules/src/lib.rs`, `crates/aitm-rules/tests/matches.rs`, `crates/aitm-rules/tests/cases/url-match-cases.json`, `crates/aitm-plugins/src/intercept.rs` (the `url` description and `compile_rules`), `crates/aitm-plugins/tests/intercept_rules.rs`, `crates/aitm-plugin-wsctl/src/lib.rs` (the `ws.intercept` rules parser's count cap only), `crates/aitm/tests/intercept_url_rules_mcp.rs`, `apps/mac/Sources/AitmproxyKit/BreakpointRules.swift` (`matches` only), `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md`, `site/docs.html` (the same sentence as Task 4).
+- **Change:** the findings report `rule-url-panel-1-findings.md` in the shared notes folder is the input: F1 leading-`/` wildcard is path-only (AC17 rows in the case table), F2 pattern length cap 4096 and 256-rule cap (AC18), F3 empty pattern rejected (AC19), F4 `Case { Fold, Exact }` instead of a positional bool, F5 drop `// Tester:` prefixes, F6 drop the `path alone` phrase pin, F7 state "with a `*` the pattern must match the whole URL or the whole path" in the schema text, SKILL.md and the site sentence and pin the phrase `whole URL` in both docs tests.
+- **Test:** the new AC17 rows fail on the current matcher, then pass; `PatternTooLong`/`EmptyPattern` tests; `rule_schemas_state_the_full_url_subject` and `operator_docs_state_the_full_url_subject` pin `whole URL`.
+- **Done when:** the crate-scoped tests pass and the Terminal gate, Swift suite, e2e cell and live proof are re-run green.
+
 ## Review log
 
 Kept by the orchestrating session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| whole branch | tester | Minor | `oversized_regex_rejected` could not tell cap from syntax error | fixed in fab0d7c4 (asserts the `size limit` message) |
+| whole branch | tester | Minor | AC15 docs (SKILL.md, site) had no test | fixed in fab0d7c4 (`operator_docs_state_the_full_url_subject`) |
+| whole branch | tester | Minor | empty `url` pattern matches every flow; surfaces differ | FIX (Fix task A, F3: rejected at compile; AC19) |
+| whole branch | tester | Minor | `*httpbin.org` (star only in front) never matches a URL with a path; docs should say | FIX (Fix task A, F7: anchoring clause in every operator text) |
+| whole branch | security | Minor | path-intended patterns (`/admin`, `*/login*`) also match at the `//` of `scheme://`; Map rules act on it | FIX (Fix task A, F1: leading-`/` wildcard is path-only; `//` boundary documented and pinned; AC17) |
+| whole branch | security | Minor | pattern length unbounded before the compiled-size cap (263 ms per MiB with case folding); `rules[]` count unbounded | FIX (Fix task A, F2: 4096-byte pattern cap, 256-rule cap; AC18) |
+| whole branch | security | Minor | empty `url` pattern accepted and matches every flow | FIX (Fix task A, F3) |
+| whole branch | quality | Minor | size-cap tests assert on the regex crate's error wording | accepted (autonomous mode, 2026-10-31): the string is `regex`'s Display; a bump that rewords it fails with an obvious message; after F2 only `oversized_regex_rejected` depends on it |
+| whole branch | quality | Minor | `compile_pattern` takes a positional `bool` beside the `Anchor` enum | FIX (Fix task A, F4: `Case { Fold, Exact }`) |
+| whole branch | quality | Minor | `// Tester:` role prefixes in test comments | FIX (Fix task A, F5) |
+| whole branch | quality | Minor | Swift path subject re-joins `path?query` that `FlowRow.url` also joins | accepted (autonomous mode, 2026-10-31): the spec confines the Kit change to `matches`/`wildcardMatches`; a `FlowRow.target` helper belongs with the sibling Kit PR |
+| whole branch | quality | Minor | `curl_bg`/`park` copied from the sibling e2e cell | accepted (autonomous mode, 2026-10-31): the plan directed the copy; `_clients.py` is a shared file other sessions edit |
+| whole branch | quality | Minor | operator-docs pin fails on a harmless rewording of "path alone" | FIX (Fix task A, F6) |
+| whole branch | spec | Important | AC15: the starred-pattern anchoring rule is missing from the schema text, SKILL.md and the site | FIX (Fix task A, F7) |
+| whole branch | spec | Important | Task 4 touched the undeclared `tests/e2e/proxy/README.md` | fixed in the plan (Task 4 Files line amended 2026-10-31; the hunk stays) |
+| whole branch | spec | Minor | spec silent on the empty `url` pattern | FIX (spec amended: rejected at compile, AC19; Fix task A, F3) |
 
 ## Shipped
 
