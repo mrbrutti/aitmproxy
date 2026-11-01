@@ -134,6 +134,40 @@ fn a_disconnect_drops_the_pending_confirm() {
     );
 }
 
+/// Fix round C, C3: the token is dropped whatever mode is on screen (an L4
+/// confirm pending while the operator looked at the flow list is just as
+/// dead after a disconnect); the mode is restored only when the overlay
+/// itself was up, so a view the operator is in stays where it is.
+#[test]
+fn a_disconnect_drops_a_pending_confirm_outside_the_overlay() {
+    let mut app = fixture_app_core(200, 50);
+    app.wire_confirm = Some(WireConfirm {
+        call: "l4.inject".into(),
+        args: json!({ "spec": { "layers": [] } }),
+        prompt: "P".into(),
+        token: "tok-1".into(),
+    });
+    app.mode = Mode::Flows;
+    app.wire_confirm_from = Mode::Inspector;
+
+    let reqs = app.on_bus(BusEvent::Disconnected("connection reset".into()));
+    assert!(reqs.is_empty(), "a disconnect sends nothing: {reqs:?}");
+    assert_eq!(app.wire_confirm, None, "the pending confirm is dropped");
+    assert_eq!(app.mode, Mode::Flows, "the mode the operator is in stays");
+    assert_eq!(
+        app.toasts
+            .iter()
+            .filter(|t| t.text == "l4.inject confirmation dropped: bus disconnected")
+            .count(),
+        1,
+        "the operator is told once: {:?}",
+        app.toasts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// Fix round A, A11 (D13: hue only on data): the overlay's call-name line
 /// reads in the accent for a `scan.*` call and in the L4 hue for an `l4.*`
 /// call; the two hues differ.

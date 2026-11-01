@@ -3435,14 +3435,16 @@ impl App {
                 self.scan.inflight.clear();
                 self.scan.launch.pending = None;
                 // A confirm token is bound to the connection that issued it
-                // (D7): an overlay still up is dropped, not answered.
+                // (D7): a pending confirm is dropped, not answered, whatever
+                // mode is on screen; only the overlay itself closes back to
+                // the mode the launch came from.
+                if let Some(c) = self.wire_confirm.take() {
+                    self.toast(
+                        Level::Warn,
+                        format!("{} confirmation dropped: bus disconnected", c.call),
+                    );
+                }
                 if self.mode == Mode::WireConfirm {
-                    if let Some(c) = self.wire_confirm.take() {
-                        self.toast(
-                            Level::Warn,
-                            format!("{} confirmation dropped: bus disconnected", c.call),
-                        );
-                    }
                     self.mode = self.wire_confirm_from;
                 }
                 self.toast(Level::Error, format!("bus: {why}"));
