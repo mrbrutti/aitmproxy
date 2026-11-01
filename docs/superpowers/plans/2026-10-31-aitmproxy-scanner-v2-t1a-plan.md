@@ -123,9 +123,9 @@ Shared facts for every coder:
      `CrawlStrategy { Fast, Normal, Thorough }`; `UseBrowser { Auto, Always, Never }`;
      `SessionMode { Observed, None }`; `OnLost { Stop, Continue }`;
      `PayloadMode { Replace, Prefix, Suffix }`;
-     `ScanErrorCode` with exactly the eleven D3 codes (`NotFound, Busy, OutOfScope, RefusedAgent,
-     RefusedL4, LaneUnavailable, InvalidProfile, UnknownCheck, ConfirmRequired, Cancelled,
-     Clamped`; `h2_not_negotiated` is a sender error, not a verb error code, and is not here),
+     `ScanErrorCode` with exactly the nine D3 codes (`NotFound, Busy, OutOfScope, RefusedAgent,
+     RefusedL4, LaneUnavailable, InvalidProfile, UnknownCheck, ConfirmRequired`; clamping and
+     cancellation are not errors; `h2_not_negotiated` is a sender error, not a verb error code, and is not here),
      `pub fn as_str(&self) -> &'static str`, `impl FromStr`, and
      `pub fn parse_message(msg: &str) -> Option<(ScanErrorCode, &str)>` for the
      `scan: <code>: <message>` form.
