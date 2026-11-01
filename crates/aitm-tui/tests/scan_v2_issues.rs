@@ -14,9 +14,11 @@
 mod common;
 
 use aitm_poc::Severity;
+use aitm_scan_model::IssueStatus;
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
+use aitm_tui::model::Finding;
 use aitm_tui::scan::{is_issue_id, IssueFilterKey, IssueFilters, IssuePane, ScanTab};
 use common::*;
 use serde_json::{json, Value};
@@ -27,6 +29,7 @@ const TOOLS: &[&str] = &[
     "scan.status",
     "scan.issues",
     "scan.issue",
+    "scan.issue.update",
     "scan.cancel",
 ];
 
@@ -34,6 +37,8 @@ const JOB: &str = "scan-1a2b3c4d";
 const JOB_B: &str = "scan-0b0b0b0b";
 const XSS: &str = "issue-9f8e7d6c";
 const REDIRECT: &str = "issue-4c3b2a19";
+/// The first probe flow of `scan.issue.json`.
+const PROBE_1: &str = "550e8400-e29b-41d4-a716-446655440000";
 
 /// A connected v2 app at 200x50 on the Profiles tab, the `scan.list` its
 /// open issued already settled empty, so nothing is in flight.
@@ -117,12 +122,17 @@ fn screen(app: &App) -> String {
     text_of(app, 200, 50)
 }
 
-/// The Issues filter line as drawn, without the trailing pane padding and
-/// box edges, so a test pins the whole literal.
+/// The Issues filter line as drawn in the list pane: the row cut at the
+/// pane rule (the detail pane shares the row), without the trailing pane
+/// padding, so a test pins the whole literal.
 fn filter_line(text: &str) -> &str {
-    line_with(text, "filters:")
-        .unwrap_or_default()
-        .trim_end_matches(['│', ' '])
+    let line = line_with(text, "filters:").unwrap_or_default();
+    // The first `│` is the box edge, the second the pane rule.
+    let after_edge = line.char_indices().nth(1).map_or(0, |(b, _)| b);
+    let end = line[after_edge..]
+        .find('│')
+        .map_or(line.len(), |b| after_edge + b);
+    line[..end].trim_end_matches(' ')
 }
 
 /// T7-9, D6: `ScanTab(Issues)` sends exactly one `scan.issues {limit: 512}`
@@ -665,4 +675,234 @@ fn issues_timer_counts_from_the_last_fetch_not_the_tick_modulo() {
     }
     assert_eq!(fired_at, vec![39], "twenty ticks after the stamp, once");
     assert_eq!(app.scan.issues.fetched_at_tick, Some(39));
+}
+
+/// A connected app on the Issues tab with the page folded and the XSS row
+/// read (`scan.issue.json` under its keyed tag), so the detail pane shows
+/// the issue under the cursor.
+fn app_with_xss_read() -> App {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let reqs = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    assert_eq!(reqs, vec![issue_request(XSS)]);
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        value: fixture("scan.issue.json"),
+    });
+    assert_eq!(app.scan.issues.detail().map(|i| i.id.as_str()), Some(XSS));
+    app
+}
+
+/// T7-9, D11: the detail pane shows the evidence of the read issue
+/// (`payload`, the payload, the matched text); `f` sends exactly
+/// `scan.issue.update {id, status: "false_positive"}` under its keyed tag,
+/// and the `scan.issue.update.json` reply replaces both the row and the
+/// read issue.
+#[test]
+fn detail_shows_evidence_and_status_round_trips() {
+    let mut app = app_with_xss_read();
+    let text = screen(&app);
+    let payload = line_with(&text, "payload").unwrap_or_else(|| panic!("no payload line: {text}"));
+    assert!(
+        payload.contains("<script>aitm-canary()</script>"),
+        "the payload line carries the payload: {payload:?}"
+    );
+    assert!(
+        line_with(&text, "matched")
+            .is_some_and(|l| l.contains("reflected marker aitm-canary in an HTML text node")),
+        "the matched line: {text}"
+    );
+    assert!(
+        line_with(
+            &text,
+            "Reflected cross-site scripting   high · certain · open"
+        )
+        .is_some(),
+        "the detail's first line names the issue and its verdict: {text}"
+    );
+    assert!(
+        line_with(
+            &text,
+            "c confirm · f false positive · u reopen · ⏎ open flow · P PoC"
+        )
+        .is_some(),
+        "the detail footer: {text}"
+    );
+
+    let reqs = app.update(Action::ScanIssueStatus(IssueStatus::FalsePositive));
+    assert_eq!(
+        reqs,
+        vec![BusRequest::CallTagged {
+            tag: format!("scan.issue.update:{XSS}"),
+            name: "scan.issue.update".into(),
+            args: json!({ "id": XSS, "status": "false_positive" }),
+        }]
+    );
+    assert!(app
+        .scan
+        .inflight
+        .contains(&format!("scan.issue.update:{XSS}")));
+    // The same key again is not re-issued while the update is in flight.
+    assert!(app
+        .update(Action::ScanIssueStatus(IssueStatus::FalsePositive))
+        .is_empty());
+
+    let reqs = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue.update:{XSS}"),
+        name: "scan.issue.update".into(),
+        value: fixture("scan.issue.update.json"),
+    });
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert!(app.scan.inflight.is_empty());
+    assert_eq!(
+        app.scan.issues.detail().map(|i| i.status),
+        Some(IssueStatus::FalsePositive)
+    );
+    assert_eq!(app.scan.issues.list[0].status, IssueStatus::FalsePositive);
+    assert_eq!(app.scan.issues.rows[0].status, "false_positive");
+    let text = screen(&app);
+    let row = line_with(&text, "Reflected cross-site scripting  GET /search")
+        .unwrap_or_else(|| panic!("no XSS row: {text}"));
+    assert!(
+        row.contains("false_positive"),
+        "the row shows the new status: {row:?}"
+    );
+    assert!(
+        line_with(
+            &text,
+            "Reflected cross-site scripting   high · certain · false_positive"
+        )
+        .is_some(),
+        "the detail shows the new status: {text}"
+    );
+    assert!(
+        line_with(&text, "note").is_some_and(|l| l.contains("intended behaviour")),
+        "the update's note is shown: {text}"
+    );
+
+    // `c` and `u` travel under their own tokens.
+    let reqs = app.update(Action::ScanIssueStatus(IssueStatus::Confirmed));
+    assert_eq!(
+        reqs,
+        vec![BusRequest::CallTagged {
+            tag: format!("scan.issue.update:{XSS}"),
+            name: "scan.issue.update".into(),
+            args: json!({ "id": XSS, "status": "confirmed" }),
+        }]
+    );
+    let _ = app.on_bus(BusEvent::CallTaggedFailed {
+        tag: format!("scan.issue.update:{XSS}"),
+        name: "scan.issue.update".into(),
+        message: "scan: not_found: issue-9f8e7d6c".into(),
+    });
+    let reqs = app.update(Action::ScanIssueStatus(IssueStatus::Open));
+    assert_eq!(
+        reqs,
+        vec![BusRequest::CallTagged {
+            tag: format!("scan.issue.update:{XSS}"),
+            name: "scan.issue.update".into(),
+            args: json!({ "id": XSS, "status": "open" }),
+        }]
+    );
+}
+
+/// T7-9, D11: with the Detail pane focused, the flow cursor starts on the
+/// first probe flow; `⏎` on a flow the store does not hold toasts the
+/// existing "not in the flow list" text and stays in the Scan view.
+#[test]
+fn enter_on_a_probe_flow_not_in_the_store_toasts() {
+    let mut app = app_with_xss_read();
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(app.scan.issues.pane, IssuePane::Detail);
+    assert_eq!(app.scan.issues.flow_cursor, 0);
+    let reqs = app.update(Action::Enter);
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.mode, Mode::Scan);
+    let toast = toast(&app);
+    assert!(toast.contains(PROBE_1), "{toast:?}");
+    assert!(toast.contains("not in the flow list"), "{toast:?}");
+}
+
+/// T7-9, D11: `↑↓` with Detail focused walk the probe flows then the
+/// baseline; `⏎` on a flow the store holds opens it in the inspector.
+#[test]
+fn enter_on_a_known_probe_flow_opens_the_inspector() {
+    let mut app = app_with_xss_read();
+    let _ = app.on_bus(BusEvent::Flows(vec![summary(
+        PROBE_1,
+        "GET",
+        "127.0.0.1:8080",
+        "/search?q=x",
+        Some(200),
+        "none",
+    )]));
+    let _ = app.update(Action::ScanPaneNext);
+    // The three flows are walkable and the cursor is clamped to them.
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.issues.flow_cursor, 1);
+    let _ = app.update(Action::Down);
+    let _ = app.update(Action::Down);
+    assert_eq!(
+        app.scan.issues.flow_cursor, 2,
+        "two probes and the baseline"
+    );
+    let _ = app.update(Action::Up);
+    let _ = app.update(Action::Up);
+    assert_eq!(app.scan.issues.flow_cursor, 0);
+    let text = screen(&app);
+    assert!(
+        line_with(&text, PROBE_1).is_some_and(|l| l.contains("probe")),
+        "the probe flow is listed with its tag: {text}"
+    );
+    assert!(
+        line_with(&text, "16fd2706-8baf-433b-82eb-8c7fada847da")
+            .is_some_and(|l| l.contains("baseline")),
+        "the baseline flow is listed with its tag: {text}"
+    );
+    let _ = app.update(Action::Enter);
+    assert_eq!(app.mode, Mode::Inspector);
+    assert_eq!(app.selected.as_deref(), Some(PROBE_1));
+}
+
+/// T7-9, D11: `P` opens Findings with the cursor on the first finding whose
+/// `poc_path` contains the issue's `poc_ref`; without such a finding it
+/// toasts the ref; an issue without a `poc_ref` toasts that.
+#[test]
+fn open_poc_switches_to_findings_or_toasts() {
+    let mut app = app_with_xss_read();
+    let other = Finding::from_json(&json!({ "poc_path": "/pocs/open-redirect.yaml" }))
+        .unwrap_or_else(|| panic!("a finding"));
+    let matching = Finding::from_json(&json!({ "poc_path": "/pocs/poc-3b1c.yaml" }))
+        .unwrap_or_else(|| panic!("a finding"));
+    app.findings = vec![other, matching];
+    let reqs = app.update(Action::ScanOpenPoc);
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.mode, Mode::Findings);
+    assert_eq!(app.finding_cursor, 1);
+
+    let mut app = app_with_xss_read();
+    app.findings.clear();
+    let _ = app.update(Action::ScanOpenPoc);
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(toast(&app), "PoC poc-3b1c is not in the Findings list");
+
+    // A finding whose title equals the issue name matches too.
+    let mut app = app_with_xss_read();
+    app.findings = vec![Finding::from_json(&json!({
+        "poc_path": "/pocs/other.yaml",
+        "title": "Reflected cross-site scripting",
+    }))
+    .unwrap_or_else(|| panic!("a finding"))];
+    let _ = app.update(Action::ScanOpenPoc);
+    assert_eq!(app.mode, Mode::Findings);
+    assert_eq!(app.finding_cursor, 0);
+
+    // The second row has no `poc_ref`.
+    let mut app = app_with_xss_read();
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.issues.cursor, 1);
+    let _ = app.update(Action::ScanOpenPoc);
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(toast(&app), "this issue has no PoC");
 }

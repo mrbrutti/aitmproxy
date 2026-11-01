@@ -13,8 +13,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use aitm_scan_model::{
-    Issue, IssuesResult, JobEvent, JobId, JobNotification, JobStatus, ListResult, JOB_KIND_SCAN,
-    JOB_NOTIFICATION_METHOD,
+    Issue, IssueStatus, IssuesResult, JobEvent, JobId, JobNotification, JobStatus, ListResult,
+    JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
@@ -29,9 +29,10 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, parse_result, state_text, step, tag_keyed, tag_parts, Dir, IssueFilterKey,
-    IssuePane, JobPane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS,
-    LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, STATUS_POLL_TICKS,
+    flow_refs, flow_refs_len, is_job_id, parse_result, state_text, status_token, step, tag_keyed,
+    tag_parts, Dir, IssueFilterKey, IssuePane, JobPane, ScanError, ScanOffer, ScanState, ScanTab,
+    ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
+    STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -1470,6 +1471,24 @@ impl App {
                         self.request_issues(&mut out);
                     }
                 }
+                // On Issues with the Detail pane focused it opens the probe
+                // (or baseline) flow under the flow cursor (D11); on the
+                // List pane the key is inert.
+                Mode::Scan if self.scan.tab == ScanTab::Issues => {
+                    if self.scan.issues.pane == IssuePane::Detail {
+                        let flow = self
+                            .scan
+                            .issues
+                            .detail()
+                            .and_then(|i| {
+                                flow_refs(i).into_iter().nth(self.scan.issues.flow_cursor)
+                            })
+                            .map(|(id, _)| id);
+                        if let Some(id) = flow {
+                            self.open_scan_flow(id, &mut out);
+                        }
+                    }
+                }
                 // On Site map it opens the focused list's selected flow in
                 // the inspector, read from the same lists the cursor keys
                 // walk (A2), which on a legacy bus is exactly today's
@@ -1480,19 +1499,7 @@ impl App {
                 // tabs act in their own tasks.
                 Mode::Scan => {
                     if let Some(id) = self.scan.sitemap_selected_flow(self.scan_offer()) {
-                        if self.row(&id).is_some() {
-                            self.selected = Some(id);
-                            self.mode = Mode::Inspector;
-                            self.inspector.reset_view();
-                            self.ensure_detail(&mut out);
-                        } else {
-                            self.toast(
-                                Level::Warn,
-                                format!(
-                                    "flow {id} is not in the flow list (cleared, or not captured here)"
-                                ),
-                            );
-                        }
+                        self.open_scan_flow(id, &mut out);
                     }
                 }
                 Mode::Prompt(_) | Mode::Compose => out.extend(self.submit()),
@@ -1805,6 +1812,8 @@ impl App {
             Action::ScanCancel => self.scan_cancel(&mut out),
             Action::ScanFilter(key) => self.scan_filter(key, &mut out),
             Action::ScanFilterReset => self.scan_filter_reset(&mut out),
+            Action::ScanIssueStatus(status) => self.scan_issue_status(status, &mut out),
+            Action::ScanOpenPoc => self.scan_open_poc(),
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -2760,6 +2769,8 @@ impl App {
                 let offer = self.scan_offer();
                 let jobs_detail =
                     self.scan.tab == ScanTab::Jobs && self.scan.jobs.pane == JobPane::Detail;
+                let issues_detail =
+                    self.scan.tab == ScanTab::Issues && self.scan.issues.pane == IssuePane::Detail;
                 if jobs_detail {
                     // The Jobs Detail pane scrolls its lines instead of
                     // moving a cursor (D11); the last line is the floor.
@@ -2767,6 +2778,24 @@ impl App {
                     let c = usize::from(self.scan.jobs.detail_scroll);
                     let next = walk(action, c, n, page);
                     self.scan.jobs.detail_scroll = u16::try_from(next).unwrap_or(u16::MAX);
+                } else if issues_detail {
+                    // The Issues Detail pane: Up/Down walk the flow list
+                    // (D11, "a walkable list"), the paging keys scroll the
+                    // lines (plan task 8); the view keeps the flow under the
+                    // cursor on screen.
+                    let issues = &mut self.scan.issues;
+                    let flows = issues.detail().map_or(0, flow_refs_len);
+                    match action {
+                        Action::Up | Action::Down => {
+                            issues.flow_cursor = walk(action, issues.flow_cursor, flows, page);
+                        }
+                        _ => {
+                            let n = issues.detail_len();
+                            let c = usize::from(issues.detail_scroll);
+                            let next = walk(action, c, n, page);
+                            issues.detail_scroll = u16::try_from(next).unwrap_or(u16::MAX);
+                        }
+                    }
                 } else if let Some((cursor, n)) = self.scan.cursor_mut(offer) {
                     if n > 0 {
                         let c = *cursor;
@@ -2777,8 +2806,11 @@ impl App {
                         if moved && self.scan.tab == ScanTab::Jobs {
                             self.scan.jobs.detail_scroll = 0;
                         }
-                        // The Issues cursor landing on a row reads it (D6).
+                        // The Issues cursor landing on a row reads it (D6)
+                        // and shows its detail from the top.
                         if moved && self.scan.tab == ScanTab::Issues {
+                            self.scan.issues.flow_cursor = 0;
+                            self.scan.issues.detail_scroll = 0;
                             self.issue_cursor_landed(out);
                         }
                     }
@@ -4085,6 +4117,79 @@ impl App {
         self.request_issues(out);
     }
 
+    /// Issues `c` / `f` / `u` (spec D11): set the cursor's issue to `status`
+    /// over the wire, `scan.issue.update {id, status}` under
+    /// `scan.issue.update:<id>`, so one update per issue is in flight (the
+    /// tag dedupe); the reply replaces the issue and its row through
+    /// [`App::on_scan_ok`]. Inert off the Issues tab or on an empty list.
+    fn scan_issue_status(&mut self, status: IssueStatus, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::Issues {
+            return;
+        }
+        let Some(id) = self.scan.issues.cursor_issue().map(|i| i.id.clone()) else {
+            return;
+        };
+        self.scan_call(
+            tag_keyed("scan.issue.update", &id),
+            "scan.issue.update",
+            json!({ "id": id, "status": status_token(status) }),
+            out,
+        );
+    }
+
+    /// Issues `P` (spec D11): switch to Findings with the cursor on the
+    /// first finding whose `poc_path` contains the cursor issue's `poc_ref`
+    /// or whose title equals the issue's name; without one, toast
+    /// `PoC <ref> is not in the Findings list`, and without a `poc_ref`,
+    /// `this issue has no PoC`. The row's summary carries both fields, so
+    /// the key works before the `scan.issue` read lands.
+    fn scan_open_poc(&mut self) {
+        if self.scan.tab != ScanTab::Issues {
+            return;
+        }
+        let Some(row) = self.scan.issues.cursor_issue() else {
+            return;
+        };
+        let Some(poc_ref) = row.poc_ref.clone() else {
+            self.toast(Level::Info, "this issue has no PoC");
+            return;
+        };
+        let name = row.name.clone();
+        let found = self
+            .findings
+            .iter()
+            .position(|f| f.poc_path.contains(&poc_ref) || f.title == name);
+        match found {
+            Some(k) => {
+                self.finding_cursor = k;
+                self.mode = Mode::Findings;
+                self.sidebar = SidebarItem::Findings;
+            }
+            None => self.toast(
+                Level::Warn,
+                format!("PoC {poc_ref} is not in the Findings list"),
+            ),
+        }
+    }
+
+    /// `⏎` on a flow the Scan view names (a Site map node or point, an
+    /// Issues probe or baseline flow): open it in the inspector when the
+    /// store holds it, else refuse with the one "not in the flow list"
+    /// toast (D11).
+    fn open_scan_flow(&mut self, id: String, out: &mut Vec<BusRequest>) {
+        if self.row(&id).is_some() {
+            self.selected = Some(id);
+            self.mode = Mode::Inspector;
+            self.inspector.reset_view();
+            self.ensure_detail(out);
+        } else {
+            self.toast(
+                Level::Warn,
+                format!("flow {id} is not in the flow list (cleared, or not captured here)"),
+            );
+        }
+    }
+
     /// The Issues cursor came to rest on a row (a key, or a list arriving
     /// under it while the tab is shown): read the issue (spec D6),
     /// `scan.issue {id}` under `scan.issue:<id>`, when `read` has no entry
@@ -4311,11 +4416,15 @@ impl App {
                     }
                 }
             }
-            "scan.issue" => {
-                // The reply, ok or not, settles the one read in flight (D6).
-                self.scan.issues.pending_read = None;
+            "scan.issue" | "scan.issue.update" => {
+                // The read's reply, ok or not, settles the one read in
+                // flight (D6); an update is its own keyed call.
+                if name == "scan.issue" {
+                    self.scan.issues.pending_read = None;
+                }
                 // The same hostile-core bound as `scan.status`: the issue
-                // is read only under the id the tag asked for.
+                // is folded only under the id the tag asked for. Both
+                // verbs replace `read[id]` and the matching list row (D10).
                 if let Some(issue) = self.scan_reply_keyed::<Issue>(
                     tag,
                     name,
@@ -4323,8 +4432,10 @@ impl App {
                     |i: &Issue| i.id.as_str(),
                     OTHER_ISSUE,
                 ) {
-                    self.scan.issues.flow_cursor = 0;
-                    self.scan.issues.read.insert(issue.id.clone(), issue);
+                    if name == "scan.issue" {
+                        self.scan.issues.flow_cursor = 0;
+                    }
+                    self.scan.issues.fold_issue(issue);
                 }
             }
             _ => {}

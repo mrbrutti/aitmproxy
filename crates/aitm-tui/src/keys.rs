@@ -108,6 +108,11 @@ fn scan(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('T') => Action::ScanFilter(crate::scan::IssueFilterKey::Status),
         KeyCode::Char('J') => Action::ScanFilter(crate::scan::IssueFilterKey::Job),
         KeyCode::Char('R') => Action::ScanFilterReset,
+        // Issues status controls and the PoC jump (D11).
+        KeyCode::Char('c') => Action::ScanIssueStatus(aitm_scan_model::IssueStatus::Confirmed),
+        KeyCode::Char('f') => Action::ScanIssueStatus(aitm_scan_model::IssueStatus::FalsePositive),
+        KeyCode::Char('u') => Action::ScanIssueStatus(aitm_scan_model::IssueStatus::Open),
+        KeyCode::Char('P') => Action::ScanOpenPoc,
         KeyCode::Char('1') => Action::ScanTab(crate::scan::ScanTab::Profiles),
         KeyCode::Char('2') => Action::ScanTab(crate::scan::ScanTab::Jobs),
         KeyCode::Char('3') => Action::ScanTab(crate::scan::ScanTab::SiteMap),

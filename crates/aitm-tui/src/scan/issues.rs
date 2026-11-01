@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use aitm_poc::Severity;
 use aitm_scan_model::{
     BySeverity, Confidence, InsertionKind, Issue, IssueId, IssueStatus, IssueSummary, IssuesResult,
-    JobId, LaneKind,
+    JobId, L4Evidence, L4Location, L4Oracle, L4Transport, LaneKind, Timing,
 };
 use serde_json::{json, Map, Value};
 
@@ -32,6 +32,19 @@ pub const NAME_MAX: usize = 40;
 pub const LOCATION_MAX: usize = 32;
 /// The widest a row's `kind:name` cell grows before it is cut.
 pub const POINT_MAX: usize = 24;
+/// The widest any one detail value grows before it is cut (D6 hostile-core
+/// bounds: a detail line is built from the core's strings when the pane is
+/// drawn, so every value is cut here before the view measures it).
+pub const DETAIL_VALUE_MAX: usize = 400;
+/// The most rows of the timing table [`issue_detail_lines`] prints; a longer
+/// series ends in a `... n more` line.
+pub const TIMING_ROWS_MAX: usize = 12;
+/// The most mutators of an L4 mutation chain [`issue_detail_lines`] prints.
+const MUTATIONS_MAX: usize = 16;
+/// The tag of a probe flow in [`flow_refs`].
+pub const PROBE: &str = "probe";
+/// The tag of the baseline flow in [`flow_refs`].
+pub const BASELINE: &str = "baseline";
 
 /// The confidence glyph pair, indexed tentative, firm, certain (spec D11,
 /// "Left to the builder"): two flat monochrome dots, filled as the verdict
@@ -362,8 +375,12 @@ pub struct IssuesState {
     /// `read.len() <= list.len()` (spec D3, D6; fix round D, D1). An entry
     /// also leaves on a terminal line for its job ([`IssuesState::forget_job`]).
     pub read: BTreeMap<IssueId, Issue>,
-    /// Cursor over the detail's probe flows.
+    /// Cursor over the detail's probe flows ([`flow_refs`]), walked by
+    /// `Up`/`Down` while the Detail pane is focused (spec D11).
     pub flow_cursor: usize,
+    /// The first detail line on screen; the paging keys scroll it while
+    /// the Detail pane is focused (plan task 8), a new row resets it.
+    pub detail_scroll: u16,
     /// The tick of the last `scan.issues` request this tab sent; `None`
     /// until the tab was first opened (spec D6: "when the Issues tab was
     /// ever opened" reads `is_some()`, and the 20-tick timer counts from
@@ -407,12 +424,354 @@ impl IssuesState {
         self.read.get(&self.cursor_issue()?.id)
     }
 
+    /// Fold a full `Issue` from `scan.issue` or `scan.issue.update` (spec
+    /// D10): it replaces `read[id]`, and the matching `list` row and its
+    /// display row are rebuilt from `issue.summary()`, so the list shows
+    /// the status the reply carries. An issue the page does not list is
+    /// still kept in `read` (the next fold prunes it if it stays unlisted).
+    pub fn fold_issue(&mut self, issue: Issue) {
+        if let Some(k) = self.list.iter().position(|row| row.id == issue.id) {
+            let summary = issue.summary();
+            self.rows[k] = issue_row(&summary);
+            self.list[k] = summary;
+        }
+        self.read.insert(issue.id.clone(), issue);
+    }
+
+    /// How many lines the Detail pane has for the row under the cursor:
+    /// [`issue_detail_lines`]' count plus the flow list ([`flow_refs`] under its
+    /// label), counted without building them; 0 while the row is unread.
+    /// The reducer clamps `detail_scroll` to it.
+    pub fn detail_len(&self) -> usize {
+        self.detail()
+            .map_or(0, |i| issue_detail_line_count(i) + flow_list_len(i))
+    }
+
     /// Drop every read issue that belongs to `job` (spec D6: a terminal
     /// line for the job lets the next landing read the issue again), by the
     /// job the issue itself names, so a filtered-out job's issues leave too.
     pub fn forget_job(&mut self, job: &str) {
         self.read.retain(|_, i| i.job != job);
     }
+}
+
+/// The `label` column every detail line after the first is written with
+/// (`payload  <script>...`): the labels are padded to it so the values line
+/// up, as in the D11 mockup.
+pub const DETAIL_LABEL_W: usize = 11;
+
+/// One `label value` detail line, the label padded to [`DETAIL_LABEL_W`] and the
+/// value cut to [`DETAIL_VALUE_MAX`].
+fn line(label: &str, value: &str) -> String {
+    format!(
+        "{label:<DETAIL_LABEL_W$} {}",
+        truncate(value, DETAIL_VALUE_MAX)
+    )
+}
+
+/// The lines of the Issues Detail pane for `issue` (spec D11, plan task 8),
+/// in this order: the name with `severity · confidence · status`; class,
+/// check id and lane; the target; the location; the description; the
+/// evidence (`payload`, `matched`, the timing table, the diff lengths, the
+/// L4 fields) when present; the PoC and finding refs; remediation and note
+/// when present; occurrences with first and last seen. The flows are not
+/// here: [`flow_refs`] lists them, and the view draws them as the walkable
+/// list under these lines. Every value is cut to [`DETAIL_VALUE_MAX`]
+/// (D6 hostile-core bounds); the view cuts each line to the pane. Nothing
+/// but the named fields of the `Issue` is ever rendered, so no cookie or
+/// header value can reach the screen from here.
+pub fn issue_detail_lines(issue: &Issue) -> Vec<String> {
+    let mut out = Vec::with_capacity(issue_detail_line_count(issue));
+    out.push(format!(
+        "{}   {} · {} · {}",
+        truncate(&issue.name, DETAIL_VALUE_MAX),
+        severity_token(issue.severity),
+        confidence_token(issue.confidence),
+        status_token(issue.status)
+    ));
+    out.push(line(
+        "class",
+        &format!(
+            "{} · check {} · lane {}",
+            issue.class,
+            issue.check_id,
+            lane_token(issue.lane)
+        ),
+    ));
+    out.push(line(
+        "target",
+        &format!(
+            "{}://{}:{}",
+            issue.target.scheme, issue.target.host, issue.target.port
+        ),
+    ));
+    out.push(line("location", &location_text(issue)));
+    out.push(line("description", &issue.description));
+    let ev = &issue.evidence;
+    if let Some(p) = &ev.payload {
+        out.push(line("payload", p));
+    }
+    if let Some(m) = &ev.matched {
+        out.push(line("matched", m));
+    }
+    if let Some(t) = &ev.timing {
+        timing_lines(t, &mut out);
+    }
+    if let Some(d) = &ev.diff {
+        out.push(line(
+            "diff",
+            &format!(
+                "baseline {} · true {} · false {} (response lengths)",
+                d.baseline_len, d.true_len, d.false_len
+            ),
+        ));
+    }
+    if let Some(l4) = &ev.l4 {
+        l4_lines(l4, &mut out);
+    }
+    out.push(line(
+        "poc",
+        &issue
+            .poc_ref
+            .as_deref()
+            .map_or_else(|| "none".to_string(), |r| format!("{r} (P)")),
+    ));
+    out.push(line(
+        "finding",
+        issue.finding_id.as_deref().unwrap_or("none"),
+    ));
+    if let Some(r) = &issue.remediation {
+        out.push(line("remediation", r));
+    }
+    if let Some(n) = &issue.note {
+        out.push(line("note", n));
+    }
+    out.push(line(
+        "seen",
+        &format!(
+            "{} occurrence{} · first {} · last {}",
+            issue.occurrences,
+            if issue.occurrences == 1 { "" } else { "s" },
+            seen_text(issue.first_seen),
+            seen_text(issue.last_seen)
+        ),
+    ));
+    out
+}
+
+/// The lines every [`issue_detail_lines`] has: the name line, class, target,
+/// location, description, poc, finding, seen.
+const DETAIL_FIXED_LINES: usize = 8;
+
+/// How many lines [`issue_detail_lines`] builds for `issue`, counted without
+/// building them (the reducer clamps the scroll on every key). Pinned to
+/// `issue_detail_lines(issue).len()` by a unit test.
+pub fn issue_detail_line_count(issue: &Issue) -> usize {
+    let ev = &issue.evidence;
+    DETAIL_FIXED_LINES
+        + usize::from(ev.payload.is_some())
+        + usize::from(ev.matched.is_some())
+        + ev.timing.as_ref().map_or(0, timing_line_count)
+        + usize::from(ev.diff.is_some())
+        + ev.l4.as_ref().map_or(0, |_| L4_LINES)
+        + usize::from(issue.remediation.is_some())
+        + usize::from(issue.note.is_some())
+}
+
+/// `METHOD path_template · kind name`, then the request path when it is
+/// not the template, the JSON field path, the WebSocket path and the L4
+/// point (`ip:port/proto`, grammar, field, mutation) when present.
+fn location_text(issue: &Issue) -> String {
+    let loc = &issue.location;
+    let mut text = match &loc.method {
+        Some(m) => format!("{m} {}", loc.path_template),
+        None => loc.path_template.clone(),
+    };
+    text.push_str(&format!(" · {} {}", kind_token(loc.kind), loc.name));
+    if loc.path != loc.path_template {
+        text.push_str(&format!(" · path {}", loc.path));
+    }
+    if let Some(f) = &loc.field_path {
+        text.push_str(&format!(" · field {f}"));
+    }
+    if let Some(w) = &loc.ws_path {
+        text.push_str(&format!(" · ws {w}"));
+    }
+    if let Some(l4) = &loc.l4 {
+        text.push_str(&format!(" · l4 {}", l4_location_text(l4)));
+    }
+    text
+}
+
+/// `ip:port/proto`, then the grammar, field path and mutation when set.
+fn l4_location_text(l4: &L4Location) -> String {
+    let proto = match l4.proto {
+        L4Transport::Tcp => "tcp",
+        L4Transport::Udp => "udp",
+    };
+    let mut text = format!("{}:{}/{proto}", l4.ip, l4.port);
+    if let Some(g) = &l4.grammar {
+        text.push_str(&format!(" grammar {g}"));
+    }
+    if let Some(f) = &l4.field_path {
+        text.push_str(&format!(" field {f}"));
+    }
+    if let Some(m) = &l4.mutation {
+        text.push_str(&format!(" mutation {m}"));
+    }
+    text
+}
+
+/// The timing table (spec D11): a header line, one row per sample
+/// (`requested_s | observed_ms | baseline_ms`, a series shorter than the
+/// longest reads `-`), at most [`TIMING_ROWS_MAX`] of them with a
+/// `... n more` line past that, then `slope`/`r`.
+fn timing_lines(t: &Timing, out: &mut Vec<String>) {
+    out.push(line("timing", "requested_s | observed_ms | baseline_ms"));
+    let rows = timing_rows(t);
+    let shown = rows.min(TIMING_ROWS_MAX);
+    for k in 0..shown {
+        let cell = |v: Option<String>| v.unwrap_or_else(|| "-".to_string());
+        out.push(line(
+            "",
+            &format!(
+                "{:>11} | {:>11} | {:>11}",
+                cell(t.requested_s.get(k).map(|v| format!("{v:.1}"))),
+                cell(t.observed_ms.get(k).map(ToString::to_string)),
+                cell(t.baseline_ms.get(k).map(ToString::to_string)),
+            ),
+        ));
+    }
+    if rows > shown {
+        out.push(line("", &format!("... {} more", rows - shown)));
+    }
+    out.push(line(
+        "",
+        &format!("slope {:.1} ms/s · r {:.2}", t.slope, t.r),
+    ));
+}
+
+/// The sample count of a timing table: its longest series.
+fn timing_rows(t: &Timing) -> usize {
+    t.requested_s
+        .len()
+        .max(t.observed_ms.len())
+        .max(t.baseline_ms.len())
+}
+
+/// The lines [`timing_lines`] writes: header, the shown rows, the overflow
+/// line when there is one, the fit line.
+fn timing_line_count(t: &Timing) -> usize {
+    let rows = timing_rows(t);
+    let shown = rows.min(TIMING_ROWS_MAX);
+    2 + shown + usize::from(rows > shown)
+}
+
+/// The lines [`l4_lines`] writes: case, oracle, liveness, mutations, sent.
+const L4_LINES: usize = 5;
+
+/// The L4 evidence (spec D11, "L4 evidence fields when present"): the seed
+/// and reproduction counts, the oracle's reading, the liveness probes, the
+/// mutation chain and the bytes sent (hex, cut like every value).
+fn l4_lines(l4: &L4Evidence, out: &mut Vec<String>) {
+    out.push(line(
+        "l4 case",
+        &format!(
+            "seed {} · rng {} · prior messages {} · reproduced {}/{} · scope {}",
+            l4.seed_id,
+            l4.rng_seed,
+            l4.prior_messages,
+            l4.reproduced.0,
+            l4.reproduced.1,
+            l4.scope_entry
+        ),
+    ));
+    out.push(line("oracle", &oracle_text(l4.oracle)));
+    let yes_no = |b: bool| if b { "passed" } else { "failed" };
+    out.push(line(
+        "liveness",
+        &format!(
+            "before {} · after {}",
+            yes_no(l4.liveness_before),
+            yes_no(l4.liveness_after)
+        ),
+    ));
+    let mut chain = l4
+        .mutation_chain
+        .iter()
+        .take(MUTATIONS_MAX)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(" > ");
+    if l4.mutation_chain.len() > MUTATIONS_MAX {
+        chain.push_str(&format!(
+            " > ... {} more",
+            l4.mutation_chain.len() - MUTATIONS_MAX
+        ));
+    }
+    if chain.is_empty() {
+        chain.push_str("none");
+    }
+    out.push(line("mutations", &chain));
+    out.push(line("sent hex", &l4.sent_hex));
+}
+
+/// How an L4 oracle read the reaction, in words.
+fn oracle_text(o: L4Oracle) -> String {
+    match o {
+        L4Oracle::ProtocolError => "protocol error".to_string(),
+        L4Oracle::Reset => "connection reset".to_string(),
+        L4Oracle::Icmp { icmp_type, code } => format!("icmp type {icmp_type} code {code}"),
+        L4Oracle::Silence => "silence".to_string(),
+        L4Oracle::LivenessFailed => "liveness failed".to_string(),
+        L4Oracle::LatencyOutlier => "latency outlier".to_string(),
+    }
+}
+
+/// The flows the Detail pane lists (spec D11): every probe flow tagged
+/// [`PROBE`] in wire order, then the baseline flow tagged [`BASELINE`]. The
+/// ids are the `FlowRef` UUIDs, already validated by the parse.
+pub fn flow_refs(issue: &Issue) -> Vec<(String, &'static str)> {
+    let ev = &issue.evidence;
+    let mut out = Vec::with_capacity(ev.probe_flows.len() + 1);
+    out.extend(ev.probe_flows.iter().map(|f| (f.to_string(), PROBE)));
+    if let Some(b) = &ev.baseline_flow {
+        out.push((b.to_string(), BASELINE));
+    }
+    out
+}
+
+/// How many flows [`flow_refs`] lists, counted without building them.
+pub fn flow_refs_len(issue: &Issue) -> usize {
+    issue.evidence.probe_flows.len() + usize::from(issue.evidence.baseline_flow.is_some())
+}
+
+/// The lines the view's flow list takes: its `flows` label line and one
+/// line per flow ([`flow_refs_len`]), or the label alone reading none.
+pub fn flow_list_len(issue: &Issue) -> usize {
+    1 + flow_refs_len(issue)
+}
+
+/// A wire timestamp (Unix milliseconds) as `YYYY-MM-DD HH:MM:SS` UTC: the
+/// civil-date arithmetic written out, so the crate needs no time
+/// dependency for one read-only line.
+pub fn seen_text(ms: u64) -> String {
+    let secs = ms / 1000;
+    let days = secs / 86_400;
+    let rem = secs % 86_400;
+    let (h, m, s) = (rem / 3600, rem % 3600 / 60, rem % 60);
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02}")
 }
 
 #[cfg(test)]
@@ -533,5 +892,176 @@ mod tests {
             assert_eq!(status_token(st), serde_name(st));
         }
         assert_eq!(kind_token(InsertionKind::WsJsonValue), "ws_json_value");
+    }
+
+    /// The contract pack's issue, parsed.
+    fn fixture_issue() -> Issue {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aitm-scan-model/fixtures/scan.issue.json"
+        ))
+        .unwrap_or_default();
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("scan.issue.json: {e}"))
+    }
+
+    /// Task 8: the detail lines in their order, the labels padded, the
+    /// flows listed probes first then the baseline, and the counts equal
+    /// to what is built.
+    #[test]
+    fn detail_lines_read_the_fixture_issue() {
+        let issue = fixture_issue();
+        let lines = issue_detail_lines(&issue);
+        assert_eq!(
+            lines,
+            vec![
+                "Reflected cross-site scripting   high · certain · open".to_string(),
+                "class       reflected-xss · check http.reflected-xss · lane http".into(),
+                "target      http://127.0.0.1:8080".into(),
+                "location    GET /search · query q".into(),
+                "description A request parameter is reflected into the response unescaped.".into(),
+                "payload     <script>aitm-canary()</script>".into(),
+                "matched     reflected marker aitm-canary in an HTML text node".into(),
+                "poc         poc-3b1c (P)".into(),
+                "finding     finding-7a21".into(),
+                "remediation Contextually encode output and set a strict CSP.".into(),
+                "seen        1 occurrence · first 2025-10-31 08:40:00 · last 2025-10-31 08:40:00"
+                    .into(),
+            ]
+        );
+        assert_eq!(issue_detail_line_count(&issue), lines.len());
+        assert_eq!(
+            flow_refs(&issue),
+            vec![
+                ("550e8400-e29b-41d4-a716-446655440000".to_string(), "probe"),
+                ("7c9e6679-7425-40de-944b-e07fc1f90ae7".to_string(), "probe"),
+                (
+                    "16fd2706-8baf-433b-82eb-8c7fada847da".to_string(),
+                    "baseline"
+                ),
+            ]
+        );
+        assert_eq!(flow_refs_len(&issue), 3);
+        assert_eq!(flow_list_len(&issue), 4);
+        let mut state = IssuesState::default();
+        assert_eq!(state.detail_len(), 0, "an unread row has no detail");
+        state.list = vec![issue.summary()];
+        state.rows = vec![issue_row(&state.list[0])];
+        state.read.insert(issue.id.clone(), issue);
+        assert_eq!(state.detail_len(), 11 + 4);
+    }
+
+    /// Task 8: timing, diff and L4 evidence render as their table and
+    /// fields; a long series is cut to `TIMING_ROWS_MAX` with an overflow
+    /// line; the count still equals the lines built; a 1 MiB value is cut
+    /// to `DETAIL_VALUE_MAX` cells.
+    #[test]
+    fn detail_lines_render_timing_diff_and_l4_evidence() {
+        use aitm_scan_model::{Diff, Evidence};
+        let mut issue = fixture_issue();
+        issue.evidence = Evidence {
+            payload: None,
+            matched: None,
+            probe_flows: Vec::new(),
+            baseline_flow: None,
+            timing: Some(Timing {
+                requested_s: vec![1.0, 2.0, 3.0],
+                observed_ms: vec![1010, 2020],
+                baseline_ms: vec![12, 11, 13],
+                slope: 1004.5,
+                r: 0.998,
+            }),
+            diff: Some(Diff {
+                baseline_len: 1200,
+                true_len: 1200,
+                false_len: 980,
+            }),
+            l4: Some(L4Evidence {
+                sent_hex: "deadbeef".into(),
+                seed_id: "hello".into(),
+                rng_seed: 42,
+                mutation_chain: vec!["flip".into(), "truncate".into()],
+                prior_messages: 3,
+                oracle: L4Oracle::Icmp {
+                    icmp_type: 3,
+                    code: 3,
+                },
+                liveness_before: true,
+                liveness_after: false,
+                reproduced: (2, 3),
+                scope_entry: "l4-1".into(),
+            }),
+        };
+        issue.remediation = None;
+        issue.description = "D".repeat(1 << 20);
+        let lines = issue_detail_lines(&issue);
+        assert_eq!(issue_detail_line_count(&issue), lines.len());
+        assert_eq!(
+            &lines[5..10],
+            &[
+                "timing      requested_s | observed_ms | baseline_ms".to_string(),
+                "                    1.0 |        1010 |          12".into(),
+                "                    2.0 |        2020 |          11".into(),
+                "                    3.0 |           - |          13".into(),
+                "            slope 1004.5 ms/s · r 1.00".into(),
+            ]
+        );
+        assert_eq!(
+            lines[10],
+            "diff        baseline 1200 · true 1200 · false 980 (response lengths)"
+        );
+        assert_eq!(
+            &lines[11..16],
+            &[
+                "l4 case     seed hello · rng 42 · prior messages 3 · reproduced 2/3 · scope l4-1"
+                    .to_string(),
+                "oracle      icmp type 3 code 3".into(),
+                "liveness    before passed · after failed".into(),
+                "mutations   flip > truncate".into(),
+                "sent hex    deadbeef".into(),
+            ]
+        );
+        let description = &lines[4];
+        assert_eq!(
+            description.chars().count(),
+            DETAIL_LABEL_W + 1 + DETAIL_VALUE_MAX,
+            "{description:?}"
+        );
+        assert!(description.ends_with('…'));
+        assert!(flow_refs(&issue).is_empty());
+        assert_eq!(flow_list_len(&issue), 1);
+
+        let timing = issue
+            .evidence
+            .timing
+            .as_mut()
+            .unwrap_or_else(|| panic!("timing"));
+        timing.observed_ms = vec![0; 40];
+        let lines = issue_detail_lines(&issue);
+        assert_eq!(issue_detail_line_count(&issue), lines.len());
+        assert_eq!(lines[5 + 1 + TIMING_ROWS_MAX], "            ... 28 more");
+    }
+
+    #[test]
+    fn seen_text_is_utc_civil_time() {
+        assert_eq!(seen_text(0), "1970-01-01 00:00:00");
+        assert_eq!(seen_text(1_761_900_000_000), "2025-10-31 08:40:00");
+        assert_eq!(seen_text(951_782_400_000), "2000-02-29 00:00:00");
+    }
+
+    /// Task 8: a folded issue replaces its list row and display row.
+    #[test]
+    fn fold_issue_replaces_the_row() {
+        let mut issue = fixture_issue();
+        let mut state = IssuesState::default();
+        state.list = vec![issue.summary()];
+        state.rows = vec![issue_row(&state.list[0])];
+        issue.status = IssueStatus::Confirmed;
+        state.fold_issue(issue);
+        assert_eq!(state.list[0].status, IssueStatus::Confirmed);
+        assert_eq!(state.rows[0].status, "confirmed");
+        assert_eq!(
+            state.detail().map(|i| i.status),
+            Some(IssueStatus::Confirmed)
+        );
     }
 }

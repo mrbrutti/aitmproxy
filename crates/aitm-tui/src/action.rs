@@ -91,6 +91,15 @@ pub enum Action {
     ScanFilter(crate::scan::IssueFilterKey),
     /// Issues tab `R`: clear every filter and refetch (spec D11).
     ScanFilterReset,
+    /// Issues tab `c` / `f` / `u`: set the cursor's issue to confirmed,
+    /// false_positive or open over the wire, `scan.issue.update {id,
+    /// status}` tagged `scan.issue.update:<id>` (spec D11); the reply
+    /// replaces the issue and its row.
+    ScanIssueStatus(aitm_scan_model::IssueStatus),
+    /// Issues tab `P`: open Findings on the finding of the cursor's issue
+    /// (its `poc_ref` in the `poc_path`, or the issue's name as the title),
+    /// else toast (spec D11).
+    ScanOpenPoc,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,
