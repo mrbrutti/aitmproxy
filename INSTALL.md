@@ -77,13 +77,12 @@ agent, using the `config.yaml` token — unless you paste an operator token in
 
 Every core, the app's embedded one included, appends the calls it receives to
 `audit.jsonl`, `audit.agent.jsonl` and `audit.reads.jsonl` in the config directory
-beside `config.yaml` (macOS: `~/Library/Application Support/aitmproxy/`, Linux:
-`~/.config/aitmproxy/`). They are on by default, mode `0600`, and rotate by size
-(92 MiB at most). Tokens and credentials are redacted before anything is written,
-but the files do name hosts, URLs and paths. Turn them off with
-`mcp.audit_log: off` in `config.yaml` or `AITM_AUDIT_LOG=off` in the environment.
-The format, `jq` recipes, what is redacted and the limits are in the README's
-[Audit log](README.md#audit-log) section.
+(macOS: `~/Library/Application Support/aitmproxy/`, Linux: `~/.config/aitmproxy/`).
+They are on by default, mode `0600`, record no tokens, and rotate to at most
+92 MiB in all while rotation works. Turn them off with `mcp.audit_log: off` in
+`config.yaml` or `AITM_AUDIT_LOG=off`. The README's
+[Audit log](README.md#audit-log) section has the format, what redaction cannot
+catch and the rotation exception.
 
 ## Building from source (`cargo` / bare binary)
 

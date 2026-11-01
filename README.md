@@ -231,7 +231,12 @@ client label, command, arguments and outcome. The recent ones stay in memory (re
 them with `agent.activity`). By default they are also appended to files on disk,
 so the record outlives a restart and the in-memory ring. Nothing needs switching
 on. The files belong to the core: no command and nothing on the bus reads or
-serves them.
+serves them, with one exception that the operator's own opt-in creates. With
+`session_io.allow_agent_file_io: true` and no `session_io.root`, the paths given to
+`session.save`, `session.load`, `flow.export` and `flow.import` are not confined,
+so an agent could overwrite or truncate any file the proxy can write, the audit
+files included. That opt-in is the operator's authorization decision; set
+`session_io.root` whenever agents get file access.
 
 They sit in the per-user config directory, beside `config.yaml`, with mode `0600`
 in a directory created `0700`:
@@ -244,14 +249,18 @@ has its own file, queue and size cap:
 
 | File | Holds | Size cap |
 |---|---|---|
-| `audit.jsonl` | The operator's calls: the macOS app, the web operator link, `aitm-tui --bus` | 20 MiB: 4 MiB each, the active file plus 4 rotated |
+| `audit.jsonl` | The operator's calls (the macOS app, the web operator link, `aitm-tui --bus`) and any call with origin `cli` | 20 MiB: 4 MiB each, the active file plus 4 rotated |
 | `audit.agent.jsonl` | The agent's calls other than successful reads: writes, sensitive calls, refusals and failures | 48 MiB: 8 MiB each, the active file plus 5 rotated |
 | `audit.reads.jsonl` | Successful reads such as `flow.list` and `flow.detail`, from any origin | 24 MiB: 8 MiB each, the active file plus 2 rotated |
 
 A file that reaches its cap rotates to `.1`, `.2` and so on (`audit.agent.jsonl.1`
 is the newest rotated file; the highest number is the oldest, and the only one
-ever deleted). The three streams use at most 92 MiB with the defaults. Retention
-is by size, not time, so how far back the files reach depends on call volume.
+ever deleted). While rotation works, the three streams use at most 92 MiB with the
+defaults. If rotation is wedged (for example a non-regular file planted at the
+oldest rotated name), the active file is held to twice its size cap and further
+lines are counted as dropped; `agent.status.durable_audit.degraded` turns true and
+a `gap` marker records the dropped lines. Retention is by size, not time, so how
+far back the files reach depends on call volume.
 
 Configure it with `mcp.audit_log` in the same `config.yaml`:
 
@@ -290,13 +299,16 @@ Each line is one JSON object. An entry has seven keys:
 {"at":1730419200123,"origin":"mcp","client_label":"claude-code","connection_id":"conn_1f3a9c05d2b84e77-3","command":"request.send","args":"{\"authority\":\"example.test\",\"headers\":{\"Authorization\":\"<redacted>\",\"X-Debug\":\"<redacted>\"},\"method\":\"GET\"}","result":"ok"}
 ```
 
-`at` is epoch milliseconds. `origin` is `operator` for the operator's calls and
-`mcp` for an agent's. `args` is the JSON text of the arguments, redacted and cut at
-512 bytes. `result` is `"ok"` or `{"error":"<reason>"}`. `client_label` and
-`connection_id` are `null` when the call has none.
+`at` is epoch milliseconds. `origin` is `operator` for the operator's calls, `mcp`
+for an agent's and `cli` for a CLI call, which lands in `audit.jsonl` with the
+operator's. No `cli` line is written today, because one-shot CLI commands run in
+their own process and build no writer. `args` is the JSON text of the arguments,
+redacted and cut at 512 bytes. `result` is `"ok"` or `{"error":"<reason>"}`.
+`client_label` and `connection_id` are `null` when the call has none.
 
-The writer adds two kinds of marker line. Neither has a `command` key, so
-`has(.marker)` tells a marker from an entry:
+The writer adds two kinds of marker line. Neither has a `command` key, so an entry
+is the line where `select(.command)` is true, and `select(has("marker"))` picks
+out the markers:
 
 - `{"marker":"start","schema":1,"at":…,"version":"…","pid":…,"stream":"agent"}` is
   the first line of every file the writer creates, and one more at every boot that
@@ -328,8 +340,10 @@ too.
   history, not as a continuous record. Do not treat the files as evidence-grade.
 - **No `fsync` per line.** An OS crash or power loss can lose recent lines, and a
   process crash loses whatever was queued. The next start closes a torn last line
-  with a newline; `jq -R 'fromjson?'` skips such a line. Rotation and a clean
-  shutdown do sync.
+  with a newline but leaves it in the file, and `jq -s` stops at it. Put
+  `jq -R 'fromjson?'` first to skip such a line:
+  `cat audit*.jsonl | jq -R 'fromjson?' | jq -s 'map(select(.command))'`.
+  Rotation and a clean shutdown do sync.
 - **A flood drops the newest entries.** The call path never waits for the disk.
   When a stream's queue is full the newest entries are dropped, counted in
   `agent.status` and marked by a `gap` line. The streams are separate, so an agent
@@ -349,11 +363,10 @@ too.
 
 #### What is redacted before anything is written
 
-One redaction applies at the source, so the in-memory ring, the pushed
-`notifications/aitm/agent` line, `agent.activity` and the files all show the same
-text, and the writer checks every field again, more strictly, just before it
-writes. The aim is that no token, secret or credential value reaches a file. The
-rules below enforce it; the last item names what no rule can see.
+One redaction applies at the source, and the writer checks every field again, more
+strictly, just before it writes. The aim is that no token, secret or credential
+value reaches a file. The rules below enforce it; the last item names what no rule
+can see.
 
 - **Configured tokens and environment secrets, by exact value.** The configured
   transport, operator and agent tokens, the web agent token, the per-run operator
@@ -393,9 +406,10 @@ rules below enforce it; the last item names what no rule can see.
   `signing_key`, and reads camelCase names such as `userPass`, `adminPw` and
   `totpCode`. A value typed into a field whose `selector` or `name` names a secret
   (`browser.type` into `#password`) reads `<redacted>`.
-- **The same text everywhere.** `agent.activity` and the pushed audit line carry
-  this redaction now, not only the files, so custom header values no longer appear
-  in them.
+- **The same text everywhere.** The source applies the redaction before anything
+  is stored, so the in-memory ring, `agent.activity` and the pushed
+  `notifications/aitm/agent` audit line carry it too, not only the files. Custom
+  header values no longer appear in them.
 - **What no rule can catch.** A bare credential: one with no frame around it, no
   registered value and no known shape. A password typed into a free-text field
   under an innocuous key (`"note":"my password is hunter2"`), an application's own
