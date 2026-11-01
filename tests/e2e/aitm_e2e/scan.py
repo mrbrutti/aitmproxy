@@ -51,7 +51,9 @@ __all__ = [
     "SCAN_VERBS_D3",
     "REFLECTED_XSS_CLASSES",
     "WS_CSWSH_CLASS",
-    "WS_INJECTION_CLASS",
+    "WS_REFLECTION_CLASS",
+    "WS_OVERSIZE_CLASS",
+    "WS_OVERSIZE_CHECK_ID",
     "JOB_NOTIFICATION_METHOD",
     "TERMINAL_STATES",
     "TERMINAL_EVENTS",
@@ -131,11 +133,19 @@ ROLES = ("operator", "agent")
 # The token is settled: `reflected-xss` is the only member today.
 REFLECTED_XSS_CLASSES: tuple[str, ...] = ("reflected-xss",)
 
-# The WebSocket issue families (D3 manifest rows `ws-cswsh` / `ws-input-reflection`,
-# whose classes are these). Check ids are a separate vocabulary: `ws-oversize-frame`
-# is a check id, not a class.
-WS_CSWSH_CLASS = "ws-cswsh"
-WS_INJECTION_CLASS = "ws-injection"
+# Integration-shared edit, sanctioned by the coordinator (2026-11-01): T4's SHIPPED
+# class names are the WebSocket vocabulary, and `ws-cswsh` / `ws-injection` are retired.
+# The classes T4's checks declare (`crates/aitm-scan-ws/src/checks/*.rs`) are `cswsh`,
+# `ws-auth-bypass`, `ws-input-reflection`, `ws-oversize-frame` and `ws-subprotocol`;
+# injection over frames reports the family tokens `sqli` / `ssti` / `cmdi`.
+# Check ids are still a separate vocabulary and differ from the class for CSWSH
+# (id `cswsh`, class `cswsh`) and subprotocol (id `ws-subprotocol-observe`,
+# class `ws-subprotocol`); for oversize the id and the class are both
+# `ws-oversize-frame`, so both constants are spelled out below.
+WS_CSWSH_CLASS = "cswsh"
+WS_REFLECTION_CLASS = "ws-input-reflection"
+WS_OVERSIZE_CLASS = "ws-oversize-frame"
+WS_OVERSIZE_CHECK_ID = "ws-oversize-frame"
 
 _CONTRACT = Path(repo_root()) / "crates" / "aitm" / "tests" / "frontends.rs"
 _ERROR_CODE_RE = re.compile(r"scan: ([a-z0-9_]+):")

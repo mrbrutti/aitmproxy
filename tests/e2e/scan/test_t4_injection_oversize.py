@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # e2e: tier=T1 surface=scan needs=ws
+# Integration-shared edit, sanctioned by the coordinator (2026-11-01): the reflection
+# issue class is T4's shipped `ws-input-reflection` (crates/aitm-scan-ws/src/checks/
+# reflection.rs) and the oversize check is id+class `ws-oversize-frame`
+# (checks/oversize.rs); `ws-injection` is retired.
 """AC T4-3: seeded reflected injection in the `msg` field is found on V
-(`ws-injection`) and not on P; `ws-oversize-frame` sends exactly one frame
+(`ws-input-reflection`) and not on P; `ws-oversize-frame` sends exactly one frame
 of `2 x max observed`, capped.
 
 Real, never a fixture: a stdlib RFC 6455 client holds a real `/ws` conversation
@@ -9,13 +13,14 @@ THROUGH the aitm proxy sending `{"type":"echo","msg":<L bytes>}`, so the core
 captures a client->server text frame whose `msg` is a reflection point. A
 `scan.start` with `lanes: ["ws"]` then audits it.
 
-- On V (`/ws` reflects `msg` unencoded): an issue with `class == "ws-injection"`.
-- On P (`/ws` HTML-escapes it): no `ws-injection` issue.
+- On V (`/ws` reflects `msg` unencoded): an issue with `class == "ws-input-reflection"`.
+- On P (`/ws` HTML-escapes it): no `ws-input-reflection` issue.
 - Oversize: the independent observer is the target's own frame log — among the lane's
   client->server frames (seq > the post-conversation reset), EXACTLY ONE has
   `len == 2 * max_observed`, where `max_observed` is the largest `in` frame length
   the cell itself produced (read from the log before the reset). The `ws-oversize-frame`
-  check contributes at most one issue per job.
+  check (`check_id == "ws-oversize-frame"`, class `ws-oversize-frame`, severity `info`)
+  contributes at most one issue per job.
 
 SKIP 77 when: the scanner verbs are absent, or the `ws` lane has no `scan.checks`
 entry on this build (the ws lane is not on `main`).
@@ -41,7 +46,8 @@ from aitm_e2e.config import CoreConfig  # noqa: E402
 from aitm_e2e.core import Aitm  # noqa: E402
 from aitm_e2e.scan import (  # noqa: E402
     ScanTarget,
-    WS_INJECTION_CLASS,
+    WS_OVERSIZE_CHECK_ID,
+    WS_REFLECTION_CLASS,
     WsClientWithHeaders,
     boot_target,
     issues,
@@ -81,7 +87,7 @@ def _max_in_frame_len(target: ScanTarget) -> int:
 
 
 def main() -> int:
-    section("AC T4-3: ws-injection on V not P; one ws-oversize-frame at 2x max")
+    section("AC T4-3: ws-input-reflection on V not P; one ws-oversize-frame at 2x max")
     with boot_target("vulnerable") as v, boot_target("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
@@ -112,8 +118,8 @@ def main() -> int:
                   f"V: the ws job finished done (state={v_final.get('state')!r}, "
                   f"stopped_reason={v_final.get('stopped_reason')!r})")
             v_issues = issues(op, "operator", job=v_job)
-            v_refl = [i for i in v_issues if i.get("class") == WS_INJECTION_CLASS]
-            check(len(v_refl) >= 1, f"V: a {WS_INJECTION_CLASS} issue was raised ({len(v_refl)})")
+            v_refl = [i for i in v_issues if i.get("class") == WS_REFLECTION_CLASS]
+            check(len(v_refl) >= 1, f"V: a {WS_REFLECTION_CLASS} issue was raised ({len(v_refl)})")
 
             section("V: exactly one lane frame at 2 x max observed (capped)")
             lane_in = [f for f in v.logs.ws()
@@ -123,11 +129,12 @@ def main() -> int:
             check(len(oversize) == 1,
                   f"exactly one lane in-frame has len == 2*{v_max} == {2 * v_max} "
                   f"({len(oversize)} of {len(lane_in)} lane frames)")
-            v_oversize_issues = [i for i in v_issues if "ws-oversize-frame" in (i.get("check_id") or "")]
+            v_oversize_issues = [i for i in v_issues if i.get("check_id") == WS_OVERSIZE_CHECK_ID]
             check(len(v_oversize_issues) <= 1,
-                  f"ws-oversize-frame contributes at most one issue per job ({len(v_oversize_issues)})")
+                  f"{WS_OVERSIZE_CHECK_ID} contributes at most one issue per job "
+                  f"({len(v_oversize_issues)})")
 
-            section("P: HTML-escaped, so no ws-injection")
+            section("P: HTML-escaped, so no ws-input-reflection")
             p_cookie = login(f"http://{p.authority}")
             phost, pport = _authority_parts(p.authority)
             pc = WsClientWithHeaders("127.0.0.1", core.cfg.proxy_port, phost, pport, "/ws",
@@ -145,9 +152,10 @@ def main() -> int:
             check(p_final.get("state") == "done",
                   f"P: the ws job finished done (state={p_final.get('state')!r}, "
                   f"stopped_reason={p_final.get('stopped_reason')!r})")
-            p_refl = [i for i in issues(op, "operator", job=p_job) if i.get("class") == WS_INJECTION_CLASS]
+            p_refl = [i for i in issues(op, "operator", job=p_job)
+                      if i.get("class") == WS_REFLECTION_CLASS]
             check(len(p_refl) == 0,
-                  f"P: no {WS_INJECTION_CLASS} issue (reflection is escaped) ({len(p_refl)})")
+                  f"P: no {WS_REFLECTION_CLASS} issue (reflection is escaped) ({len(p_refl)})")
             ok("AC T4-3 proven on V and P and the target's own frame log")
     return 0
 

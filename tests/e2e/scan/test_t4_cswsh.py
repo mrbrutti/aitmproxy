@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # e2e: tier=T1 surface=scan needs=ws
-"""AC T4-2: seeded Cross-Site WebSocket Hijacking is found on V (`ws-cswsh`, `certain`)
+# Integration-shared edit, sanctioned by the coordinator (2026-11-01): the CSWSH issue
+# class is T4's shipped `cswsh` (crates/aitm-scan-ws/src/checks/cswsh.rs); `ws-cswsh` is retired.
+"""AC T4-2: seeded Cross-Site WebSocket Hijacking is found on V (`cswsh`, `certain`)
 and not on P; the dialer regenerated `Sec-WebSocket-Key` and kept the `Cookie`.
 
 Real, never a fixture: the cell logs in to each target (`POST /login`
@@ -10,12 +12,12 @@ and the session cookie, recording its own `Sec-WebSocket-Key` K. A `scan.start`
 with `lanes: ["ws"]` runs the CSWSH check, which re-dials with a FOREIGN `Origin`
 and the captured cookie.
 
-- On V (`/ws` accepts any `Origin`): an issue `class == "ws-cswsh"`, `confidence ==
+- On V (`/ws` accepts any `Origin`): an issue `class == "cswsh"`, `confidence ==
   "certain"`; and the target's own WS handshake log (the independent observer) has a
   lane handshake whose `origin` is not V's own origin, whose `sec_websocket_key`
   differs from K (the dialer regenerated it), that kept the session cookie
   (`"session" in cookie_names`), and that was `accepted == True`.
-- On P (`/ws` rejects a foreign `Origin`): no `ws-cswsh` issue, and every foreign-origin
+- On P (`/ws` rejects a foreign `Origin`): no `cswsh` issue, and every foreign-origin
   handshake entry is `accepted == False`, `status == 403`.
 
 SKIP 77 when: the scanner verbs are absent, or the `ws` lane has no `scan.checks`
@@ -87,7 +89,7 @@ def _ws_handshakes_since(target: ScanTarget, seq0: int) -> list[dict]:
 
 
 def main() -> int:
-    section("AC T4-2: CSWSH found on V (ws-cswsh, certain), not on P; key regenerated, cookie kept")
+    section("AC T4-2: CSWSH found on V (cswsh, certain), not on P; key regenerated, cookie kept")
     with boot_target("vulnerable") as v, boot_target("patched") as p:
         cfg = CoreConfig(
             proxy_port=free_port(),
@@ -128,7 +130,7 @@ def main() -> int:
                   "V: a lane handshake used a foreign Origin, a key != the captured one, "
                   f"kept the session cookie, and was accepted ({len(lane_hs)} of {len(v_hs)})")
 
-            section("P: the same dial is rejected (403) and no ws-cswsh issue is raised")
+            section("P: the same dial is rejected (403) and no cswsh issue is raised")
             p_cookie = login(f"http://{p.authority}")
             _authed_conversation(core.cfg.proxy_port, p.authority, p_cookie)
             p_origin = f"http://{p.authority}"
