@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 82] = [
+const EXPECTED_TOOLS: [&str; 90] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -118,6 +118,16 @@ const EXPECTED_TOOLS: [&str; 82] = [
     "check.reflection",
     "check.security-header",
     "check.cookie-flag",
+    // The T4 WS lane's eight checks (`aitm-scan-ws`), each with its `check.<id>`
+    // manual verb once the lane registers with the engine.
+    "check.cswsh",
+    "check.ws-auth-bypass-handshake",
+    "check.ws-cmdi-echo",
+    "check.ws-input-reflection",
+    "check.ws-oversize-frame",
+    "check.ws-sql-error",
+    "check.ws-ssti",
+    "check.ws-subprotocol-observe",
 ];
 
 /// The six `browser.*` tool schemas as M1 shipped them, keyed by tool name.

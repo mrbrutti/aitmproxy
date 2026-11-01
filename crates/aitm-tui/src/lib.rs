@@ -333,6 +333,16 @@ pub const CORE_TOOLS: &[&str] = &[
     "check.reflection",
     "check.security-header",
     "check.cookie-flag",
+    // The T4 WS lane's eight checks (`aitm-scan-ws`), each with its `check.<id>`
+    // manual verb.
+    "check.cswsh",
+    "check.ws-auth-bypass-handshake",
+    "check.ws-cmdi-echo",
+    "check.ws-input-reflection",
+    "check.ws-oversize-frame",
+    "check.ws-sql-error",
+    "check.ws-ssti",
+    "check.ws-subprotocol-observe",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,
