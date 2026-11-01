@@ -30,10 +30,17 @@ comes through one of the four files below.
   28, badge 18, dot 8, icon 16 / 12 / 18, sidebar 240).
 - `Tok.Radius.*`: badge 4, control 6, panel 8, floating 10, `pill` (Capsule)
   only for the listening pill, chips and count chips.
-- `Tok.Motion.*`: `press` 120 ms scale 0.97, `hover` 100 ms, `popover` 160,
-  `sheet` 220, `rowArrive` 0, `interceptPulse` 1200 (stops under Reduce
-  Motion); curves `Tok.Motion.easeOut(_:)` / `easeInOut(_:)`. Nothing enters
-  with an animation; keyboard-initiated changes never animate.
+- `Tok.Motion.*`: `press` 120 ms scale 0.97, `interceptPulse` 1200 (a Core
+  Animation opacity pulse on the paused bar's dot, curve `pulse`; removed under
+  Reduce Motion), `rowArrive` 0; `hover` 100, `popover` 160 and `sheet` 220 are
+  reserved: hover fills snap on and off, popovers, menus and sheets are system
+  controls, and nothing the operator hits all day may take them on. Curves
+  `Tok.Motion.easeOut(_:)` / `easeInOut(_:)` for SwiftUI, each also as
+  `…Timing` (`CAMediaTimingFunction`) for AppKit layers. `pulse` is used only as
+  `pulseTiming` on the dot's Core Animation layer, never as a SwiftUI
+  `repeatForever` (that is what cost a fifth of a core); the generated
+  `pulse(_:)` exists only because every curve is emitted in both forms. Nothing enters with an
+  animation; keyboard-initiated changes never animate.
 - `Tok.Glyph.*` is the only place an SF Symbol name belongs. Flat, monochrome,
   regular weight, `Tok.Ink.secondary`; 16 in bars, 12 inline; never in a
   capsule, disc or glass. A new icon is added to tokens.json first.
