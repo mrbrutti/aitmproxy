@@ -158,7 +158,7 @@ fn http_detail_inline_has_headers_bodies_conn_meta() {
     assert_eq!(cc.get("sni"), Some(&Value::Str("api.ex.test".into())));
     assert_eq!(cc.get("alpn"), Some(&Value::Str("h2".into())));
     assert_eq!(cc.get("tls"), Some(&Value::Bool(true)));
-    // Peer→process resolution is deferred (Q6/F2); reported as null, not omitted.
+    // A proxied flow has no source app: `process` is null, not omitted.
     assert_eq!(cc.get("process"), Some(&Value::Null));
 
     let sc = obj(&d, "server_conn");
@@ -177,6 +177,26 @@ fn http_detail_inline_has_headers_bodies_conn_meta() {
         created.contains('T') && created.ends_with('Z'),
         "created={created}"
     );
+}
+
+#[test]
+fn client_conn_process_is_the_source_app_the_backend_observed() {
+    // `flow.detail` must agree with `flow.get`: the TUI and web Client columns read
+    // `client_conn.process`, so an NE-captured flow names its app there too.
+    let store = MemFlowStore::new();
+    let mut flow = flow_with_bodies();
+    flow.metadata_mut().source_app = Some("com.apple.Safari".into());
+    flow.metadata_mut().capture_interface = Some("macos-ne".into());
+    let id = store.insert(flow);
+    let d = detail(&store, id, Some("none"));
+    let cc = obj(&d, "client_conn");
+    assert_eq!(
+        cc.get("process"),
+        Some(&Value::Str("com.apple.Safari".into()))
+    );
+    // The server side has no process at all.
+    let sc = obj(&d, "server_conn");
+    assert_eq!(sc.get("process"), None);
 }
 
 #[test]

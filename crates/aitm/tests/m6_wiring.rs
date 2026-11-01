@@ -113,6 +113,8 @@ fn passthrough_module_ordered_before_http() {
         alpn: Vec::new(),
         first_bytes: vec![0x16],
         from_upgrade: false,
+        peer_identity: None,
+        capture_interface: None,
     };
     let chosen = modules
         .iter()
