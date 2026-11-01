@@ -338,7 +338,7 @@ fn set_namespace<T: Clone + Send + Sync + 'static>(engine: &mut Engine, name: &s
     engine.register_global_module(module.into());
 }
 
-/// [`block_on_send`] for a `browser.*` verb (T9): the future gets the run's whole
+/// [`drive`] for a `browser.*` verb (T9): the future gets the run's whole
 /// `browser_timeout` rather than the hook remainder, and once it has
 /// completed — succeeded or failed — the run's deadline is renewed, so the
 /// script's follow-up work (reading the DOM it just fetched, the next

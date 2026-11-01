@@ -275,16 +275,20 @@ pub fn query_point(url: &str, name: &str) -> InsertionPoint {
 /// response, so a test can assert on the payloads rather than on the network.
 ///
 /// Every probe appends its payload's `value` to the list [`RecordingHost::payloads`]
-/// returns and spends one of the sixteen probes the host starts with; the budget
-/// saturates at zero and the host keeps answering, because it is a recorder, not
-/// an enforcer. A baseline costs nothing and is not recorded as a payload.
+/// returns, every raw probe appends its URL to the list [`RecordingHost::raw_urls`]
+/// returns, and each spends one of the sixteen probes the host starts with; the
+/// budget saturates at zero and the host keeps answering, because it is a
+/// recorder, not an enforcer. A baseline costs nothing and is recorded nowhere.
 pub struct RecordingHost {
     /// An owning handle to this host, when it was built by
     /// [`RecordingHost::shared_new`]; otherwise dangling, so `shared()` is `None`.
     me: Weak<RecordingHost>,
     status: u16,
     body: Vec<u8>,
+    /// Payload values from `probe`, in order.
     sent: Mutex<Vec<String>>,
+    /// URLs from `probe_raw`, in order.
+    raw: Mutex<Vec<String>>,
     budget: AtomicU32,
     profile: ScanProfile,
 }
@@ -297,6 +301,7 @@ impl RecordingHost {
             status,
             body: body.as_bytes().to_vec(),
             sent: Mutex::new(Vec::new()),
+            raw: Mutex::new(Vec::new()),
             budget: AtomicU32::new(RECORDING_BUDGET),
             profile: ScanProfile::default(),
         }
@@ -312,9 +317,15 @@ impl RecordingHost {
         })
     }
 
-    /// The payload values this host was sent, in order.
+    /// The payload values this host was sent through `probe`, in order. A raw
+    /// probe is not here; see [`RecordingHost::raw_urls`].
     pub fn payloads(&self) -> Vec<String> {
         self.sent().clone()
+    }
+
+    /// The URLs this host was sent through `probe_raw`, in order.
+    pub fn raw_urls(&self) -> Vec<String> {
+        self.raw.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The canned response.
@@ -360,7 +371,10 @@ impl ProbeHost for RecordingHost {
 
     fn probe_raw(&self, req: RawProbe) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
-            self.sent().push(req.url.clone());
+            self.raw
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(req.url.clone());
             self.charge_one();
             Ok(self.response())
         })
@@ -484,11 +498,13 @@ mod tests {
         assert_eq!(host.payloads().len(), 20);
     }
 
-    /// Tester: `probe_raw` is recorded (by URL) and charged like a probe, so a
-    /// handshake-style check's sends are visible to a test too.
+    /// Tester: `probe_raw` is recorded (by URL, in its own list) and charged
+    /// like a probe, so a handshake-style check's sends are visible to a test
+    /// too — without a URL ever posing as a payload value in `payloads()`.
     #[test]
     fn recording_host_probe_raw_records_the_url_and_charges() {
         let host = RecordingHost::new(200, "ok");
+        block_on(host.probe(&payload("x"))).expect("the stub answers");
         let response = block_on(host.probe_raw(RawProbe {
             method: "OPTIONS".to_string(),
             url: "http://127.0.0.1:8080/raw".to_string(),
@@ -499,10 +515,15 @@ mod tests {
 
         assert_eq!(response.status, Some(200));
         assert_eq!(
-            host.payloads(),
+            host.raw_urls(),
             vec!["http://127.0.0.1:8080/raw".to_string()]
         );
-        assert_eq!(host.budget_left(), 15);
+        assert_eq!(
+            host.payloads(),
+            vec!["x".to_string()],
+            "a raw probe's URL is not a payload value"
+        );
+        assert_eq!(host.budget_left(), 14, "one probe and one raw probe");
     }
 
     /// Tester: an empty payload is a payload — recorded as `""`, charged once.

@@ -213,7 +213,9 @@ const HELP_COLLISION: &str = "two protocol languages registered the same host fu
                               namespace must be owned by one language.";
 
 const HELP_CHECK_META: &str = "every key of `CheckMeta` is required except `wants_traits`, `cwe`, \
-                               `remediation`, `needs_baseline`; see docs/scanner.md";
+                               `remediation`, `needs_baseline`, `targets_session`, `scope`; \
+                               `origin` is supplied by the host, not the script; see \
+                               docs/scanner.md";
 
 impl std::fmt::Display for ScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

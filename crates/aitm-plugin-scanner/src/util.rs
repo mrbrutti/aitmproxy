@@ -22,6 +22,13 @@ pub fn now_ms() -> u64 {
 
 /// The first eight lowercase hex digits of a fresh v4 UUID — the random tail
 /// both id shapes below are built from.
+///
+/// Eight hex digits are 32 bits of randomness, **not** a collision-free id:
+/// the birthday bound puts a repeat at roughly one in 65 000 after as many
+/// mints. The store that keeps the id is the one place that can tell, so it
+/// checks a fresh id against what it already holds (in memory and on disk)
+/// and re-mints on a collision; nothing here or in a caller may assume
+/// uniqueness from this function alone.
 fn short_hex() -> String {
     let mut s = uuid::Uuid::new_v4().simple().to_string();
     s.truncate(8);
@@ -29,11 +36,20 @@ fn short_hex() -> String {
 }
 
 /// A fresh job id, `scan-<8 hex>` (spec D5).
+///
+/// Not collision-free (see [`short_hex`]): the job registry that admits a job
+/// under this id must check it against the jobs it holds and re-mint on a
+/// collision, as the issue store does for [`issue_id`].
 pub fn job_id() -> String {
     format!("scan-{}", short_hex())
 }
 
 /// A fresh issue id, `issue-<8 hex>` (spec D6).
+///
+/// Not collision-free (see [`short_hex`]): `IssueStore::upsert` checks a
+/// candidate against the issues it holds in memory and on disk and re-mints
+/// on a collision (up to its `MAX_ID_ATTEMPTS`) rather than overwrite another
+/// issue's file.
 pub fn issue_id() -> String {
     format!("issue-{}", short_hex())
 }

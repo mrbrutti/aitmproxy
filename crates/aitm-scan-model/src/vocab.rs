@@ -406,6 +406,10 @@ const SCAN_ERROR_CODES: [(ScanErrorCode, &str); 9] = [
     (ScanErrorCode::ConfirmRequired, "confirm_required"),
 ];
 
+// Spec D3 names exactly nine codes; a tenth variant must add a row here (the
+// array length is the type's) and this line is what the reviewer counts.
+const _: () = assert!(SCAN_ERROR_CODES.len() == 9);
+
 /// The error [`FromStr`] returns for a token that is not one of the nine codes.
 ///
 /// A typed error rather than an `anyhow` string so a caller can match on it and
@@ -424,14 +428,41 @@ impl fmt::Display for UnknownScanErrorCode {
 
 impl std::error::Error for UnknownScanErrorCode {}
 
+/// A `scan.*` verb's refusal: the code and the message behind the wire string
+/// `scan: <code>: <message>` (spec D3).
+///
+/// [`scan_error`] wraps one of these in the `anyhow::Error` a verb returns, so
+/// an in-process caller downcasts to it and reads `code` directly, while a
+/// frontend on the far side of the bus still parses the string through
+/// [`ScanErrorCode::parse_message`]. `Display` is exactly that wire string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanRefusal {
+    /// Which of the nine codes the verb refused with.
+    pub code: ScanErrorCode,
+    /// The human-readable detail after the code.
+    pub message: String,
+}
+
+impl fmt::Display for ScanRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "scan: {}: {}", self.code.as_str(), self.message)
+    }
+}
+
+impl std::error::Error for ScanRefusal {}
+
 /// Build the one error form a `scan.*` verb refuses with: `scan: <code>: <message>`
-/// (spec D3).
+/// (spec D3), as a typed [`ScanRefusal`] inside the `anyhow::Error`.
 ///
 /// Every refusal in the engine goes through here, so no verb can emit a bare
-/// `scan:` prefix without a code and every frontend can match on the code token
-/// through [`ScanErrorCode::parse_message`].
+/// `scan:` prefix without a code, an in-process caller can
+/// `downcast_ref::<ScanRefusal>()`, and every frontend can match on the code
+/// token through [`ScanErrorCode::parse_message`].
 pub fn scan_error(code: ScanErrorCode, message: impl fmt::Display) -> anyhow::Error {
-    anyhow::anyhow!("scan: {}: {}", code.as_str(), message)
+    anyhow::Error::new(ScanRefusal {
+        code,
+        message: message.to_string(),
+    })
 }
 
 impl ScanErrorCode {
@@ -654,6 +685,23 @@ mod tests {
             ScanErrorCode::parse_message(&err.to_string()),
             Some((ScanErrorCode::Busy, "job scan-1a2b3c4d is running"))
         );
+    }
+
+    /// Wave-1 quality review: a refusal is a typed [`ScanRefusal`] inside the
+    /// `anyhow::Error`, so an in-process caller downcasts to the code instead of
+    /// re-parsing the string — and the wire string is unchanged.
+    #[test]
+    fn scan_error_is_downcastable() {
+        let err = scan_error(ScanErrorCode::Busy, "x");
+
+        assert_eq!(
+            err.downcast_ref::<ScanRefusal>(),
+            Some(&ScanRefusal {
+                code: ScanErrorCode::Busy,
+                message: "x".to_string(),
+            })
+        );
+        assert_eq!(err.to_string(), "scan: busy: x");
     }
 
     /// T1a Quality follow-up: one table backs `as_str`, `FromStr` and

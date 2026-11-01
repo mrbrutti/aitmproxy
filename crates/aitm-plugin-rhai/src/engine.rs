@@ -169,6 +169,20 @@ pub struct RunGuard {
     previous: Option<Run>,
 }
 
+/// How far out a deadline is pushed when `now + timeout` does not fit in an
+/// `Instant`: one year, which is "never" for any run and still a real instant
+/// the progress callback can compare against.
+const FAR_FUTURE: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+
+/// `now + timeout`, or a far-future instant when the addition would overflow
+/// (a `check_timeout_s` at the top of `u64` must not panic the engine thread;
+/// it means "no wall limit", and a far-future deadline is exactly that).
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now.checked_add(FAR_FUTURE).unwrap_or(now))
+}
+
 /// Open a run of `kind` under `budget`: its deadline is `hook_timeout` from
 /// now, and its `browser_timeout` is what each `browser.*` host call gets.
 /// Every dispatcher (hook, `load`, command, PoC step) calls this before
@@ -176,7 +190,7 @@ pub struct RunGuard {
 pub fn begin_run(kind: RunKind, budget: Budget) -> RunGuard {
     let run = Run {
         kind,
-        deadline: Instant::now() + budget.hook_timeout,
+        deadline: deadline_after(budget.hook_timeout),
         hook_timeout: budget.hook_timeout,
         browser_timeout: budget.browser_timeout,
     };
@@ -233,7 +247,7 @@ pub fn browser_budget() -> Option<Duration> {
 pub fn extend_deadline() {
     RUN.with(|cell| {
         if let Some(mut run) = cell.get() {
-            run.deadline = run.deadline.max(Instant::now() + run.hook_timeout);
+            run.deadline = run.deadline.max(deadline_after(run.hook_timeout));
             cell.set(Some(run));
         }
     });

@@ -46,10 +46,20 @@ impl Default for Ceilings {
     }
 }
 
-/// Budgets and gates that bound a scan run.
+/// The scanner's configuration: the engine's gates, limits and ceilings, and
+/// where its profiles come from.
 ///
-/// Every field is a hard ceiling: the scan stops at the first one it reaches,
-/// so a run is always bounded in breadth, depth, request count and wall time.
+/// Four kinds of field live here. The **gates** (`allow_agent_active`,
+/// `allow_agent_l4_fuzz`, `l4_allow_agent_inject`) decide whether a caller may
+/// start a kind of work at all and are deny-by-default. The **engine limits**
+/// (`max_jobs`, `history`, `check_timeout_s`) bound the registry and each check.
+/// The **ceilings** ([`Ceilings`]) are the administrator's wall every profile
+/// is clamped to. The **profile sources** (`default_profile`, `profiles`,
+/// `findings_dir`) say which profile a bare `scan.start` runs and where the
+/// file-declared and saved profiles are read from. The Stage-1 crawl budgets
+/// (`max_depth`, `max_pages`, `request_budget`, `time_budget`,
+/// `per_class_payload_cap`) are kept for the legacy `scan.*` verbs; a v2 job
+/// is bounded by its profile and the ceilings, not by them.
 ///
 /// `Eq` is deliberately absent: [`ScanProfile`] holds `f32` fields, so the tree
 /// is only `PartialEq`.

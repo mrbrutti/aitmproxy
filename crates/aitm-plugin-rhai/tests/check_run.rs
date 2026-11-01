@@ -238,7 +238,9 @@ fn probe_budget_is_capped_at_30s() {
     );
 }
 
-/// D4: a `CheckMeta` load error names the offending key.
+/// D4: a `CheckMeta` load error names the offending key — and, pinned in full,
+/// the help line lists exactly the keys a script may omit (`origin` is the
+/// host's, never the script's).
 #[test]
 fn check_meta_error_names_the_key() {
     let err = ScriptError::CheckMeta {
@@ -247,10 +249,26 @@ fn check_meta_error_names_the_key() {
         key: "kinds".into(),
         message: "missing".into(),
     };
-    assert!(
-        err.to_string().contains("`kinds`"),
-        "the error must name the key, got: {err}"
+    assert_eq!(
+        err.to_string(),
+        "script `s`: reg.add_check `?`: `kinds`: missing\n  help: every key of `CheckMeta` is \
+         required except `wants_traits`, `cwe`, `remediation`, `needs_baseline`, \
+         `targets_session`, `scope`; `origin` is supplied by the host, not the script; see \
+         docs/scanner.md"
     );
+}
+
+/// Wave-1 security review: a check timeout at the top of the range must not
+/// panic the engine thread — `Instant + Duration::from_secs(u64::MAX)` would —
+/// so the run opens with a far-future deadline and a probe still gets the cap.
+#[test]
+fn a_huge_check_timeout_does_not_panic() {
+    let _run = begin_run(
+        RunKind::Check,
+        Budget::for_check(Budget::default(), Duration::from_secs(u64::MAX)),
+    );
+    assert!(probe_budget().is_some(), "a run is open");
+    assert_eq!(probe_budget(), Some(MAX_PROBE_TIMEOUT));
 }
 
 // ---------------------------------------------------------------------------

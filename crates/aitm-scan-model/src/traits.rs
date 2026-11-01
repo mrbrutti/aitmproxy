@@ -402,18 +402,19 @@ mod tests {
     }
 
     /// Coordinator decision 1: a lane may report L4 counters or a lost session;
-    /// a `JobCtx` that does not care inherits a no-op body.
+    /// a `JobCtx` that does not care inherits a no-op body. That both calls
+    /// compile against `dyn JobCtx` on a stub that implements neither is the
+    /// proof the defaults exist; the one assertion is that they changed nothing.
     #[test]
     fn job_ctx_report_defaults_are_no_ops() {
         let job = NullJob::new();
         let dynamic: &dyn JobCtx = &job;
 
-        let reported: () = dynamic.report_l4(L4Counters {
+        dynamic.report_l4(L4Counters {
             cases: 1,
             ..Default::default()
         });
-        assert_eq!(reported, ());
-        assert_eq!(dynamic.report_session_lost(), ());
+        dynamic.report_session_lost();
 
         // The no-op changed nothing the engine reads.
         assert_eq!(dynamic.budget_left(), 7);
