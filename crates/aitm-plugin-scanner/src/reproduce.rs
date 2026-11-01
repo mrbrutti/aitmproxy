@@ -2563,4 +2563,131 @@ mod tests {
             Some("auth:\n  [redacted] [redacted]")
         );
     }
+
+    // ---- Tester additions: a nested credential in a text cut short, and on the
+    // ---- surfaces of a PoC that the nested-pair tests above do not reach.
+
+    /// A connection that drops mid-stream hands over a prefix of the text. Cut at
+    /// every char boundary, the embedded scrub never panics and leaves no character
+    /// of a nested credential in the clear: every credential is a run of `Q`, and
+    /// `Q` is nowhere else in a text. Userinfo in the text, before the pair and
+    /// inside its value, is stripped first as it always was. The whole text comes
+    /// out as the rule says.
+    #[test]
+    fn scrub_embedded_masks_a_nested_credential_on_every_prefix_of_the_text() {
+        let docs: &[(&str, &str)] = &[
+            (
+                "see http://u:pw@host/x\nauth:\n  password: QQQQ",
+                "see http://host/x\nauth:\n  [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  password: http://u:pw@host/QQQQ",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            (
+                "credentials:\r\n\tsecret: QQQQ",
+                "credentials:\r\n\t[redacted] [redacted]",
+            ),
+            (
+                "auth:\n  token:\n    secret:\n      password: QQQQ",
+                "auth:\n  [redacted]\n    [redacted]\n      [redacted] [redacted]",
+            ),
+            (
+                "auth:\n  password: \u{e9}QQQQ\u{1f600}",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            ("userSession:\n  QQQQ", "userSession:\n  [redacted]"),
+            (
+                "auth:\n  sessionKey: QQQQ",
+                "auth:\n  [redacted] [redacted]",
+            ),
+            (
+                "Credentials:\n\tjwt:\n\tsidebar :  \"QQQQ\"",
+                "Credentials:\n\t[redacted]\n\t[redacted] :  \"[redacted]\"",
+            ),
+        ];
+        let mut cuts = 0;
+        let mut leaks: Vec<(usize, String)> = Vec::new();
+        for &(doc, whole) in docs {
+            assert!(scrub_embedded(doc) == whole, "the whole text: {doc:?}");
+            for prefix in prefixes(doc) {
+                cuts += 1;
+                let out = scrub_embedded(prefix);
+                if out.contains('Q') {
+                    leaks.push((prefix.len(), out));
+                }
+            }
+        }
+        assert!(cuts >= 250, "the documents are too short: {cuts} cuts");
+        assert!(leaks.is_empty(), "a credential survived a cut: {leaks:#?}");
+    }
+
+    /// A nested credential in a header the builder keeps (its name is not a
+    /// secret), on one line and across a tab and a no-break space (a header value
+    /// cannot hold a line break: `HeaderMap::set` drops it), under a standard
+    /// parent and a wide-only one; and a request body that a connection dropped
+    /// mid-stream cut at every byte, a multi-byte character split included. No
+    /// credential survives in any of them.
+    #[test]
+    fn build_poc_masks_a_nested_credential_in_a_header_and_in_a_body_cut_at_every_byte() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[
+                ("X-Note", "auth: password: HDRPW5"),
+                ("X-Trace", "auth:\t\u{a0}password: HDRPW6"),
+                ("X-Debug", "userSession:\t HDRSESS7"),
+            ],
+            None,
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+        let step = http_step(&poc);
+        assert_eq!(
+            header_of(step, "X-Note"),
+            Some("auth: [redacted] [redacted]")
+        );
+        assert_eq!(
+            header_of(step, "X-Trace"),
+            Some("auth:\t\u{a0}[redacted] [redacted]")
+        );
+        assert_eq!(
+            header_of(step, "X-Debug"),
+            Some("userSession:\t [redacted]")
+        );
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        for canary in ["HDRPW5", "HDRPW6", "HDRSESS7"] {
+            assert!(!serialized.contains(canary), "leaked `{canary}`");
+        }
+
+        // The body, cut at every byte. `\u{e9}` is two bytes, `\u{1f600}` four, so
+        // some cuts split a character and the lossy decode puts U+FFFD there.
+        let body = "auth:\n  password: \u{e9}QQQQ\u{1f600}".as_bytes();
+        let mut cuts = 0;
+        let mut leaks: Vec<(usize, String)> = Vec::new();
+        for cut in 0..=body.len() {
+            let mut flow = flow_with("POST", "/search?q=hello", &[], None);
+            flow.request.body = Body::Bytes(body[..cut].to_vec());
+            let q = point(&flow, Location::Query, "q", "hello");
+            let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+            let text = http_step(&poc).body.clone().unwrap_or_default();
+            cuts += 1;
+            if text.contains('Q') {
+                leaks.push((cut, text));
+            }
+        }
+        assert!(cuts >= 25, "the body is too short: {cuts} cuts");
+        assert!(leaks.is_empty(), "a credential survived a cut: {leaks:#?}");
+        let mut flow = flow_with("POST", "/search?q=hello", &[], None);
+        flow.request.body = Body::Bytes(body.to_vec());
+        let q = point(&flow, Location::Query, "q", "hello");
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+        assert_eq!(
+            http_step(&poc).body.as_deref(),
+            Some("auth:\n  [redacted] [redacted]")
+        );
+    }
 }
