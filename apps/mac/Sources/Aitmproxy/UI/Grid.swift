@@ -65,16 +65,6 @@ final class GridProbes {
         probes[key] = nil
         owners[key] = nil
     }
-
-    /// Writes the probes next to a snapshot, for tools/check-layout.swift.
-    func write(to path: String, window: CGSize) {
-        struct File: Codable { var window: [String: Double]; var probes: [Probe] }
-        let file = File(window: ["width": window.width, "height": window.height],
-                        probes: probes.values.sorted { ($0.area, $0.y, $0.x) < ($1.area, $1.y, $1.x) })
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try? encoder.encode(file).write(to: URL(fileURLWithPath: path))
-    }
 }
 
 private struct GridProbeModifier: ViewModifier {

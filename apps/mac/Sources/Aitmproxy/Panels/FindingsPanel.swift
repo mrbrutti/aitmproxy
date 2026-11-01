@@ -88,7 +88,8 @@ final class PocPanelState {
         }
     }
 
-    /// `poc.run {poc_path, target, vars?}` → a new finding that selects itself.
+    /// `poc.run {poc_path, target, vars?}` → a new finding that selects itself. An
+    /// answer without a `passed` verdict records nothing: a result is never synthesized.
     func run(_ finding: Finding, target: String, vars: [String: String]) async {
         running = true
         defer { running = false }
@@ -96,8 +97,11 @@ final class PocPanelState {
             var args: [String: JSONValue] = ["poc_path": .string(finding.pocPath), "target": .string(target)]
             if !vars.isEmpty { args["vars"] = .object(vars.mapValues { .string($0) }) }
             let result = try await session.runCommand("poc.run", args)
-            let json = result.objectValue?["passed"] != nil ? result : syntheticResult(for: finding)
-            var new = Finding.fromRunResult(json, pocPath: finding.pocPath, target: target,
+            guard result.objectValue?["passed"] != nil else {
+                session.lastError = "poc.run returned no verdict (no passed field)"
+                return
+            }
+            var new = Finding.fromRunResult(result, pocPath: finding.pocPath, target: target,
                                             yaml: finding.id == selected ? yamlDraft : finding.yaml, origin: .human)
             new.screenshot = screenshotData(new.screenshotPath) ?? finding.screenshot
             insert(new)
@@ -200,16 +204,6 @@ final class PocPanelState {
         }
         session.lastError = "poc.build returned neither YAML nor a path"
         return (yaml: "", path: "")
-    }
-
-    private func syntheticResult(for finding: Finding) -> JSONValue {
-        .object([
-            "passed": .bool(true),
-            "finding_capture": finding.captureID.map { .string($0.raw) } ?? .null,
-            "poc_path": .string(finding.pocPath),
-            "screenshot_path": .string(finding.screenshotPath ?? ""),
-            "evaluated": .array(finding.assertions.map { .object(["assertion": .string($0.text), "matched": .bool(true)]) }),
-        ])
     }
 
     private func loadScreenshot(for id: Finding.ID?) {

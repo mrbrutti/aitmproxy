@@ -3,10 +3,12 @@ import AitmproxyKit
 import AppKit
 import Synchronization
 
-/// Self-test for agents: drives the real session model on fixture data,
+/// The self-test entry point and its scaffolding (the watchdog, `settle`, `check`,
+/// `finish`, the S-069 menu audit). The only run is the live one (`SelfTest+Live.swift`):
+/// with `APP_LIVE=1` and a running `aitm` it drives the real session over the real bus,
 /// prints PASS or FAIL per check, and quits with exit code 0 or 1.
-///   APP_STORE=/tmp/x ~/Applications/Aitmproxy.app/Contents/MacOS/Aitmproxy --selftest
-/// (tools/selftest.sh does this.) Add a check for every story with logic.
+///   AITM_CONFIG=… APP_STORE=/tmp/x APP_LIVE=1 Aitmproxy --selftest   (tools/selftest-live.sh)
+/// Without `APP_LIVE=1` the run is refused: the fixture self-test was removed on 2026-10-31.
 @MainActor
 enum SelfTest {
     static var requested: Bool { CommandLine.arguments.contains("--selftest") }
@@ -53,419 +55,12 @@ enum SelfTest {
             finish(code: 1)
             return
         }
-        // APP_LIVE=1: the bus pass instead of the fixture checks (SelfTest+Live.swift).
-        if live { return runLive(session: session) }
-        Task {
-            try? await Task.sleep(for: .seconds(0.5))
-            // The fixture set is Fixtures.rows + Fixtures.l4Rows; derive every count from it so
-            // the self-test follows the fixtures instead of pinning a stale literal.
-            let fixtureCount = Fixtures.rows.count + Fixtures.l4Rows.count
-            let inScopeCount = (Fixtures.rows + Fixtures.l4Rows).filter(\.inScope).count
-            check("fixtures load \(fixtureCount) rows", session.rows.count == fixtureCount)
-            // ST-AC4/ST-AC6: the Status page and the one connection vocabulary. Fixtures run no
-            // embedded core and connect the bus as operator, so the lanes must say exactly that.
-            let summary = session.connectionSummary
-            check("the core lane says the fixture core is not running", summary.core.word == "not running" && summary.core.state == .off)
-            check("the bus lane reads the fixture bus as connected", summary.bus.word == "connected" && summary.bus.state == .ok)
-            check("the capture lane says this build has no extension", summary.capture.word == "no extension")
-            check("Status is reached from the toolbar pill and ⌘0, not a list row", !SidebarPage.status.isInSidebar && !SidebarPage.status.showsFlows)
-            // ST-AC9: the toolbar switches follow the facts. Fixtures connect the bus, so the Proxy
-            // switch is live; this build has no extension, so the Capture switch stands down and says why.
-            check("the toolbar's Proxy switch is live while the bus is connected as operator", ToolbarSwitches.proxyLive(summary, role: session.resolvedRole))
-            check("the Proxy switch stands down on an agent-token connection even with no role expectation",
-                  !ToolbarSwitches.proxyLive(summary, role: "agent") && !ToolbarSwitches.proxyLive(summary, role: nil))
-            ToolbarSwitches.flipProxy(session, on: false)
-            await settle { !session.capturing }
-            check("flipping the Proxy switch pauses the proxy", !session.capturing)
-            ToolbarSwitches.flipProxy(session, on: true)
-            await settle { session.capturing }
-            check("flipping it again resumes", session.capturing)
-            check("the Proxy switch help names pause (⇧⌘R)", ToolbarSwitches.proxyHelp(summary, role: "operator", capturing: true).contains("⇧⌘R"))
-            // ST-AC9's enabled clause: each of the three terms flips the Capture switch's liveness.
-            let liveHealth = CoreHealthState()
-            liveHealth.captureCapability = .capturing
-            check("the Capture switch is live with an installed extension on the embedded core", ToolbarSwitches.captureLive(liveHealth, embedded: true))
-            check("the Capture switch stands down with an external core", !ToolbarSwitches.captureLive(liveHealth, embedded: false))
-            liveHealth.captureBusy = true
-            check("the Capture switch stands down while a switch is in flight", !ToolbarSwitches.captureLive(liveHealth, embedded: true))
-            check("the toolbar's Capture switch stands down with no extension in this build",
-                  !ToolbarSwitches.captureLive(session.coreHealth, embedded: true))
-            check("the Capture switch says why it is off", ToolbarSwitches.captureHelp(
-                summary.capture, controlsAvailable: session.coreHealth.captureControlsAvailable, embedded: true,
-                busy: false, choice: false).contains("not in this build"))
-            check("the Capture switch rests off while the lane is off", !ToolbarSwitches.captureOn(summary.capture))
-            // The position follows the lane for every state the extension can be in, and the
-            // in-flight choice wins while a switch runs.
-            let fixtureBus = session.bus
-            let fixtureAddress = session.listenAddress
-            func laneFor(_ capability: CaptureCapability, hosts: Int = 1) -> ConnectionLane {
-                ConnectionSummary.make(core: nil, activeKind: .embedded, bus: fixtureBus, role: "operator", roleWarning: false,
-                                       capability: capability, captureSupported: true, scopeHostCount: hosts,
-                                       flowCount: 0, listenAddress: fixtureAddress).capture
-            }
-            check("the Capture switch is on while capturing, waiting for approval or degraded",
-                  ToolbarSwitches.captureOn(laneFor(.capturing)) && ToolbarSwitches.captureOn(laneFor(.pendingApproval))
-                      && ToolbarSwitches.captureOn(laneFor(.degraded("tunnel setup failed"))) && ToolbarSwitches.captureOn(laneFor(.capturing, hosts: 0)))
-            check("the Capture switch is off while the extension is installed but inactive or not installed",
-                  !ToolbarSwitches.captureOn(laneFor(.inactive)) && !ToolbarSwitches.captureOn(laneFor(.extensionNotInstalled)))
-            check("an in-flight choice overrides the lane", ToolbarSwitches.capturePosition(choice: true, lane: laneFor(.inactive))
-                      && !ToolbarSwitches.capturePosition(choice: false, lane: laneFor(.capturing))
-                      && ToolbarSwitches.capturePosition(choice: nil, lane: laneFor(.capturing)))
-            check("the Capture switch help carries the lane's word when live", ToolbarSwitches.captureHelp(
-                summary.capture, controlsAvailable: true, embedded: true, busy: false, choice: true).contains(summary.capture.word))
-            check("Open Scope from Status shows the Scope page", { session.perform(connection: .openScope); return session.page == .scope }())
-            check("Open Browser from Status shows the Browser page", { session.perform(connection: .openBrowser); return session.page == .browser }())
-            check("Core Log from Status opens the core log", { session.perform(connection: .showCoreLog); return session.coreLogVisible }())
-            session.coreLogVisible = false
-            check("Settings actions are left to the view", !session.perform(connection: .openCaptureSettings) && !session.perform(connection: .turnCaptureOn))
-            check("Copy Address from Status copies the listen address", { session.perform(connection: .copyListenAddress); return NSPasteboard.general.string(forType: .string) == session.listenAddress }())
-            check("Reconnect from Status bumps the bus reconnect", { let before = session.reconnectTick; session.perform(connection: .reconnectBus); return session.reconnectTick == before + 1 }())
-            // ST-AC4: the landing rule — Status on a fresh install, the last list page otherwise.
-            check("a fresh install lands on Status", Session.landingPage(saved: nil) == .status)
-            check("a remembered list page is restored", Session.landingPage(saved: "domains") == .domains)
-            check("a session that ended on Status or Saved comes back on Flows", Session.landingPage(saved: "status") == .flows && Session.landingPage(saved: "saved") == .flows)
-            check("an unknown saved page lands on Status", Session.landingPage(saved: "nope") == .status)
-            session.page = .apps
-            check("two flows are paused", session.paused.count == 2)
-            check("the paused login is selected", session.focusedRow?.seq == 50)
-            check("the inspector has the login detail", session.focusedDetail?.request.header("x-forwarded-for") == "127.0.0.1")
-
-            session.chip = .json
-            check("the JSON chip narrows the list", session.visibleRows.count < session.rows.count && !session.visibleRows.isEmpty)
-            session.chip = .websocket
-            check("the WebSocket chip keeps only WS flows", session.visibleRows.allSatisfy { $0.kind == .websocket } && session.visibleRows.count == 1)
-            // ST-AC11: the transport chips keep the raw-L4 fixture rows by protocol.
-            session.chip = .tcp
-            check("the TCP chip keeps only raw TCP sessions", session.visibleRows.allSatisfy { $0.l4?.proto == .tcp } && session.visibleRows.count == 1)
-            session.chip = .udp
-            check("the UDP chip keeps only raw UDP flows", session.visibleRows.allSatisfy { $0.l4?.proto == .udp } && session.visibleRows.count == 2)
-            session.chip = .l4
-            check("the L4 chip keeps every packet flow", session.visibleRows.count == Fixtures.l4Rows.count && session.visibleRows.allSatisfy { $0.kind == .l4 })
-            session.chip = .all
-
-            session.page = .scope
-            check("Scope filters to in-scope flows", session.visibleRows.allSatisfy(\.inScope) && session.visibleRows.count == inScopeCount)
-            session.page = .apps
-
-            session.select(session.rows[0].id)
-            check("selecting a row focuses the inspector", session.focusedRow?.seq == 41)
-            session.interceptArmed = false
-            check("disarming clears the armed state", !session.interceptArmed)
-
-            // S-045: a WebSocket flow shows its frame stream, not a request/response.
-            let wsRow = session.rows.first { $0.kind == .websocket }
-            session.select(wsRow?.id)
-            let ws = session.focusedWSDetail
-            check("selecting the WebSocket flow loads its frames", (ws?.frames.count ?? 0) == 7)
-            check("the first frame pretty-prints as JSON", ws?.frames.first?.bodyKind == .json)
-            check("a binary frame is detected", ws?.frames.contains { $0.opcode == "binary" && $0.bodyKind == .binary } == true)
-            check("an injected frame is marked", ws?.frames.contains { $0.injected } == true)
-            session.select(session.rows[0].id)
-
-            // S-009: sorting never moves the selection; status puts rows without a code last.
-            session.sort = FlowSort(key: .status, ascending: false)
-            check("sorting by status puts 502 first and rows without a code last",
-                  session.visibleRows.first?.status == 502 && session.visibleRows.last?.status == nil)
-            check("sorting keeps the selection", session.focusedRow?.seq == 41 && session.selection.count == 1)
-            session.sort = .captureOrder
-            check("capture order is the default sort", session.visibleRows.map(\.seq) == session.rows.map(\.seq))
-
-            // S-016: density moves row pitch and body size together, selection intact.
-            session.density = .comfortable
-            check("comfortable density is 40pt rows with 14pt text", session.density.rowHeight == 40 && session.density.bodySize == 14)
-            check("changing density keeps the selection", session.focusedRow?.seq == 41)
-            session.density = .dense
-
-            // S-008: the column layout round-trips through the state folder.
-            let layout = ColumnLayout(order: ["seq", "url", "method"], widths: ["url": 333], hidden: ["mark"])
-            try? layout.save(to: session.columnsURL)
-            let loaded = ColumnLayout.load(from: session.columnsURL)
-            check("column layout persists under Store.url/columns.json", loaded == layout)
-            check("a missing column width falls back to its default", loaded?.width(for: "time", default: 124) == 124)
-
-            // S-012: multi-select summary.
-            session.selection = Set(session.rows[0..<3].map(\.id))
-            check("three selected rows summarise size and timing", session.selectionSummary?.text == "3 selected · 20.7 KB · 177 ms")
-            session.select(session.rows[0].id)
-            check("one row returns the summary to the row count", session.selectionSummary == nil)
-
-            // S-013: grouping from the sidebar.
-            session.show(.apps, group: .client("curl"))
-            check("selecting curl under Apps narrows to curl's flows", session.visibleRows.count == 3 && session.visibleRows.allSatisfy { $0.client?.name == "curl" })
-            session.show(.domains, group: .host("cdn.shop-staging.test"))
-            check("selecting a host under Domains narrows to it", session.visibleRows.allSatisfy { $0.authority == "cdn.shop-staging.test" })
-            session.show(.apps)
-            check("the group header shows all flows again", session.visibleRows.count == fixtureCount)
-
-            // S-014: pins persist and never duplicate.
-            session.pin(.host("cdn.shop-staging.test"))
-            session.pin(.host("cdn.shop-staging.test"))
-            check("pinning a host twice stores it once", session.pins.hosts.filter { $0 == "cdn.shop-staging.test" }.count == 1)
-            check("pins persist under Store.url/pins.json", Pins.load(from: session.pinsURL).hosts.contains("cdn.shop-staging.test"))
-            session.unpin(.host("cdn.shop-staging.test"))
-            check("unpinning removes the host", !session.pins.hosts.contains("cdn.shop-staging.test"))
-
-            // SP-AC10: a Scope action on the fixture session must leave no scope.json behind —
-            // fixture mode never writes the operator's store.
-            session.addScope("persist-probe.test")
-            await settle { session.scopeHosts.contains("persist-probe.test") }
-            check("fixture mode never persists scope (no scope.json under Store.url)",
-                  !FileManager.default.fileExists(atPath: session.scopeURL.path) && EmbeddedScope.load(from: session.scopeURL).hosts.isEmpty)
-            session.removeScope("persist-probe.test")
-            await settle { !session.scopeHosts.contains("persist-probe.test") }
-            check("fixture mode never persists scope on remove either (no scope.json under Store.url)",
-                  !FileManager.default.fileExists(atPath: session.scopeURL.path))
-
-            // S-015: Auto-select follows the newest flow, except from a paused row.
-            session.autoSelect = true
-            session.select(session.rows[0].id)
-            session.rows.append(Fixtures.rows[0].withID("auto-1", seq: 60))
-            check("Auto-select focuses the newest flow", session.focusedRow?.seq == 60)
-            session.select(session.rows[9].id)  // the paused login
-            session.rows.append(Fixtures.rows[0].withID("auto-2", seq: 61))
-            check("Auto-select does not steal focus from a paused row", session.focusedRow?.seq == 50)
-            session.autoSelect = false
-
-            // S-017: marks and comments.
-            let first = session.rows[0].id
-            session.mark(first, .green)
-            session.comment(first, "baseline")
-            check("marking and commenting update the row at once", session.rows[0].mark == .green && session.rows[0].comment == "baseline")
-
-            // S-018: pause and clear.
-            session.setCapturing(false)
-            await settle { !session.capturing }
-            check("pausing the proxy flips the state", !session.capturing)
-            let beforeClear = session.rows
-            let focusBeforeClear = session.focused
-            let selectionBeforeClear = session.selection
-            session.clearSession(confirm: { _ in true })
-            await settle { session.rows.isEmpty && session.clearNotice != nil }
-            check("clearing empties the session", session.rows.isEmpty && session.focused == nil)
-            // D2: Clear keeps one undo step (Edit > Undo Clear) and says so in the status bar.
-            check("clear shows the notice with the count and registers Undo Clear",
-                  session.clearNotice?.count == beforeClear.count && session.flowUndoManager.canUndo
-                      && session.flowUndoManager.undoActionName == "Clear")
-            session.flowUndoManager.undo()
-            check("undo restores the rows, selection and focused flow",
-                  session.rows == beforeClear && session.focused == focusBeforeClear && session.selection == selectionBeforeClear,
-                  "rows \(session.rows.count) of \(beforeClear.count), focused \(String(describing: session.focused))")
-            check("undo dismisses the notice and the step", session.clearNotice == nil && !session.flowUndoManager.canUndo)
-            // Marking an out-of-scope row from the keyboard is refused like every other verb.
-            let outOfScope = session.rows.first { !$0.inScope }!
-            session.perform(.mark(.red), on: outOfScope.id)
-            check("a mark colour on an out-of-scope row is refused with the reason",
-                  session.rows.first { $0.id == outOfScope.id }?.mark == nil && session.lastError == VerbTable.outOfScopeReason(outOfScope.authority))
-            session.lastError = nil
-            // A refused flow.clear offers no Undo and no notice; the rows stay.
-            let fixtureActions = session.actions as? FixtureActions
-            fixtureActions?.clearFails = true
-            session.clearSession(confirm: { _ in true })
-            await settle { session.lastError != nil }
-            check("a refused clear keeps the rows and offers neither Undo nor the notice",
-                  !session.rows.isEmpty && session.clearNotice == nil && session.clearedFlows == nil && !session.flowUndoManager.canUndo
-                      && session.lastError == "clear: flow.clear refused (fixture)", session.lastError ?? "no error")
-            fixtureActions?.clearFails = false
-            session.lastError = nil
-            // The notice lapses on its own timer and takes the copy and the step with it.
-            Session.clearNoticeSeconds = 0.2
-            session.clearSession(confirm: { _ in true })
-            await settle { session.rows.isEmpty && session.clearNotice != nil }
-            check("the notice shows after the clear", session.clearNotice != nil && session.flowUndoManager.canUndo)
-            await settle { session.clearNotice == nil }
-            check("letting the notice lapse releases the copy and the step",
-                  session.clearedFlows == nil && session.clearNotice == nil && !session.flowUndoManager.canUndo,
-                  "copy \(session.clearedFlows == nil) notice \(session.clearNotice == nil) canUndo \(session.flowUndoManager.canUndo)")
-            Session.clearNoticeSeconds = 8
-
-            // M3: filters, saved filters, sidebar query, palette.
-            session.loadFixtures()
-            session.filterStack = FilterStack(rows: [FilterRow(.method, .equals, "POST")])
-            check("a Method = POST row narrows to the two POSTs", session.visibleRows.map(\.seq) == [44, 50])
-            session.filterStack = FilterStack(rows: [FilterRow(.method, .equals, "POST"), FilterRow(.status, .equals, "502")], combinator: .or)
-            check("two rows under Any widen the list", session.visibleRows.map(\.seq) == [44, 45, 50])
-            session.filterStack.combinator = .and
-            check("switching to All narrows it", session.visibleRows.isEmpty)
-            session.filterStack = FilterStack(rows: [FilterRow(.url, .regex, "(")])
-            check("an invalid regex marks the row and matches nothing", session.filterStack.rows[0].validationError != nil && session.visibleRows.isEmpty)
-            session.clearFilter()
-            session.setFilterAdvanced(true)
-            session.filterText = "~m POST & ~c 2"
-            check("the Advanced text filters", session.filterError == nil && session.visibleRows.map(\.seq) == [44])
-            session.filterText = "~m POST &"
-            check("a parse error reports an offset", session.filterError != nil && session.visibleRows.count == fixtureCount)
-            session.setFilterAdvanced(false)
-            session.clearFilter()
-            session.filterStack = FilterStack(rows: [FilterRow(.host, .contains, "cdn")])
-            session.saveFilter(named: "cdn only")
-            session.clearFilter()
-            check("saving a filter persists it", (try? SavedFilterStore(stateDirectory: Store.url).load())?.first?.name == "cdn only")
-            if let saved = session.savedFilters.first { session.applySavedFilter(saved) }
-            check("applying a saved filter sets the rows and the text", session.visibleRows.count == 2 && session.currentFilterExpressionText.contains("cdn"))
-            session.clearFilter()
-            session.filterBarVisible = false
-            session.sidebarQuery = "staging"
-            check("the sidebar query matches hosts case-insensitively", session.hosts.filter { $0.0.localizedCaseInsensitiveContains("staging") }.count == 3)
-            session.sidebarQuery = ""
-            let items = session.paletteItems(for: "repl")
-            check("the palette ranks flow.replay first for 'repl'", items.first?.title == "flow.replay")
-            // Recent entries duplicate a command under the Recent section; count the Commands section only.
-            check("every tool appears in the palette",
-                  Set(session.paletteItems(for: "").filter { $0.section == .commands }.map(\.id)).count == session.tools.count)
-            let flows = session.paletteItems(for: "auth/login")
-            check("a URL fragment finds its flow", flows.contains { if case .flow = $0.kind { return $0.title.contains("auth/login") }; return false })
-            // M4: compose, edit & replay, kill modes, bulk.
-            session.composeDraft = ComposeDraft(method: "POST", url: "https://api.shop-staging.test/api/cart", headersText: "accept: application/json", body: "{\"q\":1}", bodyKind: .json)
-            let before = session.rows.count
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in session.sendCompose { _ in c.resume() } }
-            check("Send creates a new flow, selected, origin human", session.rows.count == before + 1 && session.focusedRow?.origin == .human && session.focusedRow?.method == .post)
-            check("compose history persists newest first", ComposeHistory.load(from: session.composeURL).entries.first?.url == "https://api.shop-staging.test/api/cart")
-            session.composeDraft = ComposeDraft(url: "https://telemetry.vendor-analytics.example/v2/batch")
-            check("an out-of-scope URL cannot be sent", session.composeDraft.validationError(scope: session.scopeHosts)?.hasPrefix("Out of scope") == true)
-            if let id = session.rows.first(where: { $0.seq == 50 })?.id {
-                session.editAndReplay(id)
-                check("Edit & Replay prefills Compose from the flow", session.composeVisible && session.composeDraft.url.hasSuffix("/api/auth/login") && session.composeDraft.method == "POST")
-                session.composeVisible = false
-            }
-            session.killMode = .respond503
-            if let id = session.rows.first(where: { $0.seq == 51 })?.id {
-                session.kill(id)
-                await settle { session.rows.first { $0.seq == 51 }?.status == 503 }
-                check("Kill with Respond 503 shows the synthetic status", session.rows.first { $0.seq == 51 }?.status == 503)
-            }
-            session.killMode = .reset
-            session.selection = Set(session.rows.filter { [41, 50].contains($0.seq) }.map(\.id))
-            session.resumeSelected()
-            check("bulk resume reports what it skipped", session.lastError == "Resumed 1 · skipped 1 (not paused)")
-            await settle { session.rows.first { $0.seq == 50 }?.state == .complete }
-            check("bulk resume resumed the paused row", session.rows.first { $0.seq == 50 }?.state == .complete)
-
-            // S-037/S-038: a draft diffs against the proxy's request; Apply & Resume sends mutate then resume.
-            session.loadFixtures()
-            if let paused = session.rows.first(where: { $0.seq == 51 }) {
-                session.editPaused(paused.id)
-                check("`e` selects the paused row and opens Raw", session.focused == paused.id && session.requestTab == .raw)
-                var m = session.details[paused.id]!.request
-                m.headers.append(.init("x-debug", "1"))
-                m.body = Data("{}".utf8)
-                session.updateDraft(paused.id, m)
-                check("the draft counts two pending edits", session.pendingEditCount(paused.id) == 2)
-                let parsed = try? RawHTTP.parse(RawHTTP.render(m))
-                check("the raw editor text round-trips", parsed?.headers == m.headers && parsed?.bodyText == "{}")
-                session.applyAndResume(paused.id)
-                await settle { session.rows.first { $0.id == paused.id }?.state == .complete }
-                let after = session.rows.first { $0.id == paused.id }
-                check("Apply & Resume mutated and resumed the flow", after?.state == .complete && after?.edited == true
-                      && session.details[paused.id]?.request.header("x-debug") == "1" && session.editDrafts[paused.id] == nil,
-                      "state=\(String(describing: after?.state)) edited=\(String(describing: after?.edited)) x-debug=\(session.details[paused.id]?.request.header("x-debug") ?? "nil") draft=\(session.editDrafts[paused.id] == nil) error=\(session.lastError ?? "-")")
-            }
-
-            // S-062: two queries over one capture; the inspector follows the focused pane; Clear acts on the capture.
-            session.loadFixtures()
-            session.splitView = true
-            session.secondQuery.chip = .websocket
-            check("the second pane has its own chip", session.secondVisibleRows.count == 1 && session.visibleRows.count == fixtureCount)
-            session.focus(pane: 1, on: session.secondVisibleRows.first?.id)
-            check("selecting in pane 2 focuses it and the inspector", session.focusedPane == 1 && session.focusedRow?.kind == .websocket)
-            session.splitView = false
-            check("leaving split view returns focus to pane 1", session.focusedPane == 0)
-
-            // S-070: a burst of 500 rows in 10 batches of 50 appends — each batch's model update + a frame stays short.
-            session.loadFixtures()
-            var batches: [Duration] = []
-            for batch in 0..<10 {
-                let started = ContinuousClock.now
-                var appended = session.rows
-                for n in 0..<50 {
-                    appended.append(Fixtures.rows[n % Fixtures.rows.count].withID("burst-\(batch)-\(n)", seq: 100 + batch * 50 + n))
-                }
-                session.rows = appended
-                let model = ContinuousClock.now - started
-                await Task.yield()
-                try? await Task.sleep(for: .milliseconds(20))
-                batches.append(ContinuousClock.now - started - .milliseconds(20))
-                print("BURST batch \(batch): model \(Format.duration(model)) · with frame \(Format.duration(batches[batch]))")
-            }
-            let worst = batches.dropFirst().max() ?? .zero
-            check("500 appended rows keep every warm batch under 50 ms (worst \(Format.duration(worst)))", worst < .milliseconds(50), Format.duration(worst))
-            check("appends keep the selection", session.focusedRow?.seq == 50)
-            check("the list holds \(fixtureCount + 500) rows", session.rows.count == fixtureCount + 500)
-
-            // S-040: rules validate, test against the list, persist, and change the armed notice.
-            let rule = BreakpointRule(name: "login", url: "*/api/auth/*", method: "POST")
-            check("a rule tests against the current list", BreakpointRules(rules: [rule]).matchCount(of: rule, in: Fixtures.rows) == 1)
-            check("an empty URL and a bad regex are rejected",
-                  BreakpointRule(url: "").validationError != nil && BreakpointRule(url: "[", matching: .regex).validationError != nil)
-            session.setBreakpointRules(BreakpointRules(rules: [rule, BreakpointRule(url: "*", enabled: false)]))
-            check("the armed notice counts enabled rules", session.breakpointRules.armedNotice == "Intercept armed — 1 rule")
-            check("rules persist under Store.url/rules.json", BreakpointRules.load(from: session.rulesURL).rules.count == 2)
-
-            // M2 scenes: the fixture extras re-key and select correctly.
-            session.loadFixtureExtras()
-            let cookieRow = session.extraRow { $0.request.header("cookie") != nil }
-            check("the cookie extra row exists and is re-keyed", cookieRow?.id.raw.hasPrefix("extra-") == true)
-            if let cookieRow { session.select(cookieRow.id) }
-            check("selecting the cookie row focuses it", session.focusedRow?.id == cookieRow?.id,
-                  "focused \(session.focusedRow?.seq ?? -1) wanted \(cookieRow?.seq ?? -1)")
-            check("the cookie row's detail has three request cookies",
-                  session.focusedDetail.map { Cookie.cookies(in: $0.request).count } == 3)
-            check("an image extra row exists", session.extraRow { ($0.response?.contentType ?? "").hasPrefix("image/") } != nil)
-
-            if let tool = Fixtures.tools.first(where: { $0.name == "flow.replay" }) {
-                let form = PaletteForm(tool: tool, session: session)
-                check("a FlowId parameter becomes a flow picker preset to the focused flow", form.values["id"] == session.focused?.raw && !form.missing.isEmpty == (session.focused == nil))
-            }
-
-            // S-065: HAR out and back in, locally before F10; other formats refused by name.
-            do {
-                let before = session.rows.count
-                let maxSeq = session.rows.map(\.seq).max() ?? 0
-                let chosen = Array(session.rows.prefix(2))
-                let har = FlowTransfer.export(chosen.map { ($0, session.details[$0.id]) }, as: .har)
-                let file = FileManager.default.temporaryDirectory.appending(path: "selftest-\(UUID().uuidString).har")
-                try? har.write(to: file, atomically: true, encoding: .utf8)
-                check("importing an exported HAR appends its flows as imported",
-                      session.importFile(file) && session.rows.count == before + 2
-                          && session.rows.suffix(2).allSatisfy { $0.origin == .imported && $0.inScope }
-                          && session.rows.last?.seq == maxSeq + 2,
-                      "rows \(session.rows.count) wanted \(before + 2); last seq \(session.rows.last?.seq ?? -1)")
-                check("the imported flow is selected and has its detail",
-                      session.focusedRow?.origin == .imported && session.focusedDetail?.request.startLine.hasPrefix("PUT /api/cart") == true,
-                      "focused \(session.focusedRow?.url ?? "-") \(session.focusedDetail?.request.startLine ?? "-")")
-                let charles = FileManager.default.temporaryDirectory.appending(path: "selftest.chlz")
-                try? Data().write(to: charles)
-                check("a Charles file is refused by name", !session.importFile(charles) && session.lastError?.hasPrefix("Can't import selftest.chlz: Charles") == true,
-                      session.lastError ?? "-")
-                session.rows.removeLast(2)
-                session.select(session.rows.first { $0.seq == 50 }?.id)
-            }
-
-            // Task 8: the embedded core's health dot and on-demand log panel.
-            session.coreHealth.connection = CoreConnection(
-                id: .fixture, kind: .embedded, endpoint: BusEndpoint(port: 0, token: ""),
-                status: .starting, label: "Embedded core")
-            check("the health dot maps starting to restarting", session.coreHealth.health == .restarting)
-            session.coreHealth.connection?.status = .ready
-            check("the health dot maps ready to running", session.coreHealth.health == .running)
-            session.coreHealth.connection?.status = .degraded(reason: "gave up")
-            check("the health dot maps degraded to failed", session.coreHealth.health == .failed)
-            check("the core log is empty and hidden before any output", session.coreHealth.log.isEmpty && !session.coreLogVisible)
-            session.coreHealth.record("proxy listening on 127.0.0.1:8080")
-            check("the core log captures a line", session.coreHealth.log.lines.last?.text == "proxy listening on 127.0.0.1:8080")
-            session.coreLogVisible = true
-            check("Core Log opens the on-demand panel", session.coreLogVisible)
-            session.coreLogVisible = false
-            session.coreHealth.connection = nil
-            session.coreHealth.log.removeAll()
-
-            // S-069: the menu bar carries the brief's command map, and a bare-letter
-            // shortcut never takes a letter from a text field.
-            checkMenuCoverage()
-            await checkTypingIsNotAVerb(session)
-
-            print(failures == 0 ? "SELFTEST PASS \(count) checks" : "SELFTEST FAIL \(failures) of \(count) checks")
-            finish(code: failures == 0 ? 0 : 1)
+        guard live else {
+            print("SELFTEST refused: the fixture self-test was removed on 2026-10-31; run tools/selftest-live.sh (APP_LIVE=1)")
+            finish(code: 1)
+            return
         }
+        runLive(session: session)
     }
 
     // MARK: S-069
@@ -495,7 +90,7 @@ enum SelfTest {
         return out
     }
 
-    private static func checkMenuCoverage() {
+    static func checkMenuCoverage() {
         let items = allMenuItems()
         for entry in CommandMap.all {
             if case .deferred(let why) = entry.scope {
@@ -513,7 +108,7 @@ enum SelfTest {
     }
 
     /// Types `r` into the sidebar filter: the field gets the letter, nothing replays.
-    private static func checkTypingIsNotAVerb(_ session: Session) async {
+    static func checkTypingIsNotAVerb(_ session: Session) async {
         NSApp.activate()
         guard let window = NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) else {
             return check("a main window exists for the typing check", false)
@@ -536,8 +131,8 @@ enum SelfTest {
         window.makeFirstResponder(nil)
     }
 
-    /// Waits for an async action to land instead of sleeping a fixed time (the
-    /// fixture actions hop through Tasks; under load a fixed sleep races them).
+    /// Waits for an async action to land instead of sleeping a fixed time (bus
+    /// replies hop through Tasks; under load a fixed sleep races them).
     static func settle(timeout: Duration = .seconds(5), until done: () -> Bool) async {
         let deadline = ContinuousClock.now + timeout
         while !done(), ContinuousClock.now < deadline {

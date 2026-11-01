@@ -4,10 +4,8 @@ import SwiftUI
 
 // Aitmproxy — the native macOS operator app for the aitmproxy command bus.
 //   Aitmproxy                       the app (connects to the bus from Settings or config.yaml)
-//   APP_FIXTURES=1 Aitmproxy        show the fixture session instead of a live bus
 //   APP_STORE=<dir> Aitmproxy       keep local state (pins, saved filters) elsewhere (tests)
-//   APP_SNAPSHOT=<dir> Aitmproxy    save a PNG of every sidebar page and Settings tab in light and dark, then quit
-//   Aitmproxy --selftest            run the self-test and quit with 0 or 1 (tools/selftest.sh)
+//   APP_LIVE=1 Aitmproxy --selftest run the live self-test against a running aitm and quit with 0 or 1 (tools/selftest-live.sh)
 //   APP_ACCENT=<id> Aitmproxy       run with another accent from Theme.all (UI/Theme.swift)
 //   APP_GRID=1 Aitmproxy            draw the 8 pt grid and the layout probes over the window
 
@@ -95,14 +93,6 @@ enum Store {
         let dir = URL.applicationSupportDirectory.appending(path: "Aitmproxy", directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
-    }
-
-    /// Fixture mode: APP_FIXTURES=1, or any snapshot/self-test run — unless
-    /// APP_LIVE=1 asks a snapshot to capture the live bus instead.
-    static var usesFixtures: Bool {
-        let env = ProcessInfo.processInfo.environment
-        if env["APP_LIVE"] == "1" { return false }
-        return env["APP_FIXTURES"] == "1" || env["APP_SNAPSHOT"] != nil || SelfTest.requested
     }
 }
 
