@@ -76,6 +76,10 @@ G30. Test hygiene (`tests/scan_v2_sitemap.rs`, `scan/sitemap.rs` tests): assert 
 
 G31. `J` with no Jobs-cursor job refetches an unchanged query (`crates/aitm-tui/src/scan/sitemap.rs`, `app.rs`): `SitemapQuery::toggle_job(&mut self, cursor: Option<JobId>) -> bool`; refetch only when it changed. Typed and bare origins normalise port 443 differently (`scan/profiles.rs`): one `origin(scheme, host, port)` that drops the scheme's default port in both paths; test `typed_origin("https://h:443") == "https://h"`.
 
+## Task 10 coder note
+
+G32. `ScanState::cursor_mut`'s Checks-pane arm is dead (`crates/aitm-tui/src/scan/mod.rs`): `navigate` handles the tree itself; drop the arm (return `None` for the Checks pane) and say so in the doc.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
