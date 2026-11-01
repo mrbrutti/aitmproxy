@@ -544,10 +544,10 @@ impl SessionMonitors {
         monitor
     }
 
-    /// How many monitors are held. Read by the lane's tests to pin call A5
-    /// (one monitor per job, built on the first point).
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
+    /// How many monitors are held. Read only by this crate's tests to pin call
+    /// A5 (one monitor per job, built on the first point), so it is test-only.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
         self.inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -556,10 +556,9 @@ impl SessionMonitors {
     }
 
     /// Whether no monitor is held. The conventional partner of
-    /// [`SessionMonitors::len`] (`clippy::len_without_is_empty`); no caller
-    /// needs it yet.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
+    /// [`SessionMonitors::len`] (`clippy::len_without_is_empty`); test-only.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 }
