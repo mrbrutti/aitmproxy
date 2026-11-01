@@ -276,8 +276,8 @@ Usage:
   aitm operator-token generate [--force]
 
 Groups:
-  agent  browser  ca  capture  config  demo  egress  findings  flow  map
-  poc  proxy  request  scan  scope  script  session  tls  ws
+  agent  browser  ca  capture  config  findings  flow  map  poc  proxy
+  request  scan  scope  script  session  tls  ws
 
 Options:
   --config <path>           config file (env AITM_CONFIG)
@@ -676,7 +676,7 @@ No human-facing text bypasses the layer. Allowed direct writers: `crates/aitm-te
 Each is observable on the real binary unless marked (unit). W1 unless tagged.
 
 1. **AC-W1-1** `aitm --version`, `aitm -V` and `aitm version` print exactly `aitm <CARGO_PKG_VERSION>\n` on stdout, nothing on stderr, exit 0; in a fresh empty `HOME` no file or directory is created under it (`find "$HOME" -newer marker` is empty); `/usr/bin/time` wall < 100 ms.
-2. **AC-W1-2** `aitm --help`, `aitm -h` and `aitm help` print the synopsis (M3) on stdout, exit 0, nothing created, < 100 ms; the `Groups:` line lists exactly the registry's first segments (unit test assembles the registry in a temp dir and compares).
+2. **AC-W1-2** `aitm --help`, `aitm -h` and `aitm help` print the synopsis (M3) on stdout, exit 0, nothing created, < 100 ms; the `Groups:` block lists exactly the built-in registry's first segments — the registry the binary assembles with an empty script tier (no bundled catalogue, so no `check`/`l4` script commands; `l4.enabled` off), 17 groups (unit test assembles it in a temp dir and compares).
 3. **AC-W1-3** With a real holder on the proxy port, bare `aitm` and `aitm web` exit 1 and stderr contains the headline `cannot start: the proxy port 127.0.0.1:<port> is already in use`, the sentence `It is most likely held by another running \`aitm\``, the remedy sentence with the config path, a line whose trimmed content is exactly `lsof -nP -iTCP:<port> -sTCP:LISTEN` preceded by the fix glyph (TTY) or `fix: ` (plain), and the `Log` footer; `os error 48` is absent; stdout is empty.
 4. **AC-W1-4** TTY startup draws in place: a `script -q` capture of bare `aitm` in Terminal contains at least one cursor-up sequence (`ESC [ <n> A`) and a clear-line sequence, the braille spinner frames appear only while a phase runs, and the final screen (last 14 lines of the capture after stripping SGR) equals M1's ready block for that machine's values.
 5. **AC-W1-5** Piped startup (`aitm 2>out.txt </dev/null` with loopback MCP, and the e2e merged log) contains zero `0x1b` bytes, no `\r`, one line per completed phase, and the `Label: value` card lines of M1p.
