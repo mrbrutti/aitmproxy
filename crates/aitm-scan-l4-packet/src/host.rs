@@ -280,6 +280,16 @@ impl PointRunner {
         self.rng_seed
     }
 
+    /// The scope entry that authorised this point's target.
+    ///
+    /// Task 10's reaction check records it in `L4Evidence.scope_entry`; a
+    /// crash carries its own copy in [`crate::state::CrashRecord`], but a
+    /// reaction has no record of its own to read it from.
+    #[must_use]
+    pub fn scope_entry(&self) -> &str {
+        &self.plan.target.scope_entry
+    }
+
     /// Send one crafted packet as a case of this job.
     ///
     /// # Errors
