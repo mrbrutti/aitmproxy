@@ -10,7 +10,7 @@ The session's worktree branch is `claude/cranky-vaughan-0e27b2`; the commits are
 the experiment name. Base: `origin/main` at `341b68a` (PR #183).
 **Session:** separate session with its own worktree, started by the observe-only-lane
 research/spec session (PR #184).
-**Inputs:** `docs/research/12-macos-observe-only-lane.md` §3.2, §5 items 6, 7, 8;
+**Inputs:** `docs/research/23-macos-observe-only-lane.md` §3.2, §5 items 6, 7, 8;
 `docs/superpowers/specs/2026-10-31-macos-ne-observe-only-lane-design.md` Part 3, Part 4,
 Open question 6.
 

@@ -1,7 +1,7 @@
 # macOS NE observe-only lane design
 
 **Status:** draft
-**Research inputs:** `docs/research/12-macos-observe-only-lane.md` (primary; "research
+**Research inputs:** `docs/research/23-macos-observe-only-lane.md` (primary; "research
 12" below), `docs/research/10-macos-network-extension.md` (§3.1, §3.5, §3.7, §3.9),
 `docs/research/experiments/2026-10-29-macos-ne-spike.md`,
 `docs/research/experiments/2026-10-31-macos-ne-observe-survey.md` (the pre-plan survey of
@@ -29,7 +29,7 @@ provider attached, and every flow declined because the scope was empty
 page listing every app's connections (app, destination, protocol, counts) even with no
 scope. Today there is no way to see all apps' traffic without MITM-ing it, and the Apps
 page is empty live even for in-scope captures because the core drops the source-app
-identity at the ingress (research 12 §3.0 fact 1, §3.1). This spec designs the
+identity at the ingress (research 23 §3.0 fact 1, §3.1). This spec designs the
 **observe-only lane**: connection *metadata* for flows the provider does not claim, plus
 the identity plumbing for flows it does, so the Apps page becomes a real network monitor
 while MITM stays deny-by-default and the provider stays fail-open. Design only.
@@ -48,7 +48,7 @@ while MITM stays deny-by-default and the provider stays fail-open. Design only.
 - **Metadata, never bytes.** No payload, DNS answer, or body of an out-of-scope flow ever
   crosses the control channel or lands in the core.
 - **Operator-only, default off, agent-gated; a wire that can grow into option (b)**
-  without UI or store rework (research 12 Candidate 2).
+  without UI or store rework (research 23 Candidate 2).
 
 ## Non-goals
 
@@ -58,7 +58,7 @@ while MITM stays deny-by-default and the provider stays fail-open. Design only.
 - No reverse DNS, SNI peeking, or DNS proxying; a flow without `remoteHostname` shows as
   IP:port (Little Snitch's own fallback).
 - No proxy-only (loopback `127.0.0.1:<port>`) client attribution: those flows never reach
-  the extension (research 12 §3.5); F5's libproc lookup is a separate item.
+  the extension (research 23 §3.5); F5's libproc lookup is a separate item.
 - No disk persistence, export, or history across core restarts; no `flow.subscribe` push
   of observed rows (UIs poll); no TUI observe view (TUI gets Part 1 only).
 - No change to scope semantics, `ScopeMatcher`, the scope-spec emitter, the data socket,
@@ -81,7 +81,7 @@ while MITM stays deny-by-default and the provider stays fail-open. Design only.
 
 - **Fail-open stays.** The provider never claims a flow the core may refuse; an observe
   emit must never block or slow `handleNewFlow`; a wedged (alive, not reading) or absent
-  core leaves the network untouched (research 12 §3.2.4; the tree's 2 s
+  core leaves the network untouched (research 23 §3.2.4; the tree's 2 s
   `handshakeSendTimeoutSeconds` comment).
 - **Code-signature peer auth on the UDS stays in both directions** (NE-AC6, LF-AC3/7). No
   new socket, no new unauthenticated path; `FlowSeen` rides the verified control channel.
@@ -89,13 +89,13 @@ while MITM stays deny-by-default and the provider stays fail-open. Design only.
   config file and the Capture Settings tab (LF-AC12 / TG-AC9 precedent).
 - **Deny-by-default MITM scope is untouched**; `claim()` runs first and is unchanged.
 - **Apple approval is assessed, not performed.** Verified 2026-10-31 (Terminal panel,
-  research 12 §3.3.5): both A1 Developer ID profiles already allow
+  research 23 §3.3.5): both A1 Developer ID profiles already allow
   `content-filter-provider-systemextension`, `dns-proxy-systemextension`,
   `packet-tunnel-provider-systemextension` and the rest, so even (b) needs no portal
   change or new profile. Every signing is Matt's identity in the Terminal panel; no coder
   or agent touches the portal, profiles, or approval prompts.
 - **Protocol-version discipline.** A new `ControlMessage` variant is a decode error on
-  today's core and detaches the provider (research 12 §3.1, §3.2.6); the version must bump
+  today's core and detaches the provider (research 23 §3.1, §3.2.6); the version must bump
   so skew fails loudly at `Hello`, never mid-stream.
 - **An inherited UDP rule defect, not the lane's (survey §R4 / item 5).** UDP `return
   false` itself is safe on macOS 27 (DNS, NTP and QUIC packets flow after `false`; the
@@ -117,7 +117,7 @@ while MITM stays deny-by-default and the provider stays fail-open. Design only.
 
 Defaults the Architect chose are marked **(Architect's call)**.
 
-### Recommendation: option (a) now, wire shaped for (b) — research 12 Candidate 2
+### Recommendation: option (a) now, wire shaped for (b) — research 23 Candidate 2
 
 **Decision (Architect's call).** Build (a): a metadata-only `FlowSeen` from the existing
 `NETransparentProxyProvider` for flows it declines, on the existing control channel.
@@ -127,13 +127,13 @@ feed byte counts and close events into the same rows. Do not build (b) or (c) no
 **v1 gives:** per app (signing identifier; executable path as the fallback for system
 processes), remote IP:port, hostname when the app used a connect-by-name API, TCP or UDP,
 connection counts, first/last seen. **Not in v1:** bytes, duration, close/success, ICMP,
-inbound, loopback (research 12 §3.2.2: the transparent-proxy headers expose none of these
+inbound, loopback (research 23 §3.2.2: the transparent-proxy headers expose none of these
 for a declined flow).
 
 **Only (b) adds:** per-flow byte totals and periodic statistics (header-documented on
 `NEFilterReport`, but population for an allow-without-filtering verdict is **unverified**),
 a close event, ICMP, the app-versus-creating-process split, inbound flows, opt-in loopback
-(research 12 §3.3.1–3.3.2, §4.2). **Its costs:** a third consent prompt, a second
+(research 23 §3.3.1–3.3.2, §4.2). **Its costs:** a third consent prompt, a second
 synchronous verdict in every app's connection path, an **unknown** fail-open posture on
 provider death, field-reported regressions when a filter and a transparent proxy coexist,
 and de-duplication (a filter reports every flow, including the ones the proxy claims;
@@ -145,7 +145,7 @@ consent; its one new risk, the emit's backpressure, is removed by construction (
 and the Apps-page deliverable does not need bytes. (b) returns only if Matt answers Open
 question 2 "bytes are required".
 
-**Why (c) is rejected** (research 12 §3.4): the core becomes every app's egress, so a
+**Why (c) is rejected** (research 23 §3.4): the core becomes every app's egress, so a
 core stall or refusal breaks every app (the parent anti-goal "breaks the user's network
 when the core is gone"); `dispatch_tcp` refuses out-of-scope flows and its SSRF connector
 blocks LAN targets, so claiming all needs a new unguarded passthrough disposition (a
@@ -189,7 +189,7 @@ Both halves of `ControlMessage` (`listener.rs:125-132`; Swift `HandoffMessages`)
 `FlowSeen` **(Architect's call)**, metadata-only by construction — no byte-, payload-, or
 body-typed field exists on the struct:
 
-| Field | Type | Source (research 12 §3.2.1, §3.2.3) |
+| Field | Type | Source (research 23 §3.2.1, §3.2.3) |
 |---|---|---|
 | `kind` | `FlowKind` (`Tcp`\|`Udp`) | which delegate fired |
 | `remote` | `SocketAddr` | `remoteFlowEndpoint` / `initialRemoteFlowEndpoint`; always `ip:port` in 15 846 flows (survey §R2) — keep the fail-open `nil` guard |
@@ -234,7 +234,7 @@ then return `false` as today.
 - **`tryPush` is the only work on the NE thread.** O(1), a short mutex with no I/O under
   it, no JSON encoding, no syscalls beyond the audit-token extraction and (only when the
   signing id is empty) one `proc_pidpath_audittoken`. Never `CoreLink.send` (it takes
-  `writeLock` and blocks up to 2 s; research 12 §3.2.4).
+  `writeLock` and blocks up to 2 s; research 23 §3.2.4).
 - **Bounded, drop-oldest.** `ObserveQueue` capacity **2 048** **(Architect's call**, sized
   from the survey, §R1 / item 1: the worst burst measured on Matt's Mac was 1 243 flows in
   8 s, peak 336/s, a cold Chromium profile loading a heavy page; organic peaks 60–70/s for a
@@ -271,7 +271,7 @@ then return `false` as today.
   value (every connection seen, none queued) depends on it.
 - **Nothing produced or kept while detached.** `Observe` state and the queue are cleared
   in `CoreLink.detach`; the provider holds no history for an absent core (a root process
-  holding all apps' history is a privacy exposure, research 12 §3.2.4).
+  holding all apps' history is a privacy exposure, research 23 §3.2.4).
 - **uid filter (resolves OQ10 for observed rows).** At attach the provider already reads
   the core's peer audit token (`PeerAuth.peerAuditToken(of:)`); it keeps its
   `audit_token_to_euid` as `coreUID`. A flow whose euid differs, or whose token is
@@ -287,7 +287,7 @@ then return `false` as today.
 
 New module `crates/aitm/src/macos_capture/observe.rs` **(Architect's call**: the `aitm`
 wiring layer beside the feeder; not `aitm-core`, not a new crate; not the closed `Flow`
-enum, not `L4Flow`, not `MemFlowStore` — research 12 §3.1, §4.3).
+enum, not `L4Flow`, not `MemFlowStore` — research 23 §3.1, §4.3).
 
 - `pub struct ObservedFlow { kind, remote, remote_hostname, app: AppKey, source_pid,
   source_uid, seen_at_ms, bytes_in: Option<u64>, bytes_out: Option<u64>,
@@ -322,7 +322,7 @@ enum, not `L4Flow`, not `MemFlowStore` — research 12 §3.1, §4.3).
     !cfg.observe.agent_readable`, naming the knob **(Architect's call**: Read plus an
     Mcp-only config gate, not `Sensitive`, which would make `Ask` park a read and `All`
     refuse unless listed in `defers_to_command_gate`). `AgentPolicy::Paused` is refused by
-    `policy_decision` anyway. There is no per-row gating (research 12 §3.1), so the gate
+    `policy_decision` anyway. There is no per-row gating (research 23 §3.1), so the gate
     is per command and observed rows live only behind these two commands — never in
     `flow.list`/`flow.table`/`flow.subscribe`.
   - `docs/research/mcp-tool-catalog.txt` and the agent-surface tests gain both names.
@@ -404,7 +404,7 @@ untouched: observed rows reach no module, plugin, guard, or capture-path store.
 |---|---|---|
 | Hostile or buggy provider floods `FlowSeen` | core CPU/memory | mutual peer auth (only our signed sysex can speak); `MAX_FRAME_LEN`; ring/aggregate caps; 5 000/s cap; decode error → detach |
 | Same-uid squatter in the 0700 dir | fake rows, scope read | LF's core-verifies-provider check: an unverified peer gets no `Scope`/`Observe` and is not read (LF-AC3); the bus token guards reads |
-| Another transparent proxy on the Mac | attribution shows that proxy as source; coverage gaps | documented degradation (research 12 §3.2.7); rows are "as seen"; no NE mitigation |
+| Another transparent proxy on the Mac | attribution shows that proxy as source; coverage gaps | documented degradation (research 23 §3.2.7); rows are "as seen"; no NE mitigation |
 | pid reuse | wrong process in a popover | pid is display-only; the grouping key is signing id/path; `(pid, pidversion)` left to (b) |
 | Stale sysex after upgrade | silent observe-less run | exact version match at `Hello`; capability degraded until `enable()` replaces it |
 | Agent exfiltrates the app/destination timeline | privacy | `agent_readable` default off; `Paused` refuses; every `observe.*` call is audited like any command |
@@ -439,7 +439,7 @@ same-team, same-short-version, newer-`CFBundleVersion` sysex replaced the activa
 with **no** System Settings prompt on macOS 27.0, and notarizing the `.app` zip sufficed
 for activation.
 
-**Option (b), if ever chosen** (research 12 §3.3.5–3.3.6): add
+**Option (b), if ever chosen** (research 23 §3.3.5–3.3.6): add
 `content-filter-provider-systemextension` to the `networkextension` array in **both**
 `apps/mac/Aitmproxy.entitlements` and `apps/mac/Extension/Aitmproxy-Extension.entitlements`;
 add `com.apple.networkextension.filter-data` → `FilterDataProvider` to `NEProviderClasses`
@@ -612,10 +612,10 @@ Only Matt can answer these; each carries the Architect's recommendation.
 
 1. **(a) now, wire shaped for (b) — confirm the fork.** Recommend Candidate 2 as designed.
    (b) in v1 means a third consent, an unknown fail-open posture on provider death,
-   filter-plus-proxy field regressions, and a de-duplication design (research 12 §3.3.4,
+   filter-plus-proxy field regressions, and a de-duplication design (research 23 §3.3.4,
    §3.3.7, §4.2).
 2. **Are bytes and duration required in v1?** Recommend **no**. If yes, (b) is the only
-   route; (a) cannot provide them (research 12 §3.2.2).
+   route; (a) cannot provide them (research 23 §3.2.2).
 3. **May agents read observed rows?** Recommend **not by default**: `observe.*` is `Read`
    but refused for `Frontend::Mcp` unless `macos_capture.observe.agent_readable` is set in
    the config file (no app control in v1).
