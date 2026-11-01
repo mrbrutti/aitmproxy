@@ -156,13 +156,15 @@ fn apply_patterns(text: &str) -> String {
 /// next pair's key and leave its value in the clear while that pair's opening
 /// quote is present (`password='a b token='S3'` masks through `S3`); a padded
 /// value (`"token":"YWJj=","user":"bob"`) still closes, because a delimiter
-/// follows its quote. A next key with only a closing quote is a residual: in
-/// `password='x password'=S3CR3T` the first value closes at that quote and
-/// `S3CR3T` is left in the clear. A quote that is unmatched, unescaped, or shaped
-/// like an opener, and two kinds of quote interleaved (`Token:Jwt:'token="'id"`),
-/// are residuals of the same kind: the scan can pair them differently inside a
-/// masked value than outside one, and a value that a secret key governs can then
-/// be left in the clear in a rare malformed input. An unquoted value, or one whose
+/// follows its quote. A next key with only a closing quote is read as a nested
+/// pair, by the rule below: `password='x password'=S3CR3T` becomes
+/// `password='[redacted]'=[redacted]`, and a next key that is not secret keeps its
+/// value (`password='x user'=S3CR3T` becomes `password='[redacted]'=S3CR3T`). An
+/// unmatched quote, an unescaped quote inside a quoted value, a quote shaped like
+/// an opener, and two kinds of quote interleaved (`Token:Jwt:'token="'id"`), are
+/// residuals: the scan can pair them differently inside a masked value than
+/// outside one, and a value that a secret key governs can then be left in the
+/// clear in a rare malformed input. An unquoted value, or one whose
 /// opening quote never closes, runs to the first whitespace, `&`, `;`, `,`, quote,
 /// or `}`.
 /// Whitespace is Unicode whitespace (`char::is_whitespace`), as the regex `\s`
@@ -186,11 +188,15 @@ fn apply_patterns(text: &str) -> String {
 /// Conservative by design: it over-redacts (any pair whose key reads as secret)
 /// rather than risk letting a secret through. A key *governs* the value after its
 /// separator, and on well-formed input every value that a secret key governs, read
-/// by the value rule above, is masked. Residual limit: a bare credential with no
-/// recognisable `key=` or `Bearer`/`Authorization` framing cannot be detected, so
-/// a token that no secret key governs stays visible wherever it sits, after a
-/// quoted value that ends in a key and a separator (`"x-pwd:"`) included. Work is
-/// linear in the length of `text`.
+/// by the value rule above, is masked (a value that starts with `[` or `{` is an
+/// unquoted value to that rule, so it ends at the first quote, comma or blank, and
+/// the elements of an array after that point stay visible:
+/// `{"api_keys": ["abc123", "def456"]}` becomes
+/// `{"api_keys": [redacted]"abc123", "def456"]}`). Residual limit: a bare
+/// credential with no recognisable `key=` or `Bearer`/`Authorization` framing
+/// cannot be detected, so a token that no secret key governs stays visible
+/// wherever it sits, after a quoted value that ends in a key and a separator
+/// (`"x-pwd:"`) included. Work is linear in the length of `text`.
 ///
 /// For the over-matching reading, which also masks keys that merely contain a
 /// short secret word (`author`, `sidebar`), see [`scrub_text_wide`].
@@ -229,15 +235,16 @@ pub fn scrub_text(text: &str) -> String {
 /// goes to an agent, an audit record, or a finding, where `authority=` and
 /// `author=3` are ordinary. Its running time is linear in the length of `text`.
 ///
-/// A residual, on malformed quotes: a quote that is unmatched, unescaped, or that
-/// closes a value but reads as an opener (it follows `=` or `:`, a value character
-/// follows it, and no delimiter does), and two kinds of quote interleaved
-/// (`Token:Jwt:'token="'id"`), can make a scan pair the quotes inside a masked
-/// value differently from the way it pairs them outside one, and so leave a value
-/// that a secret key governs in the clear in a rare malformed input. A well-formed
-/// input is not affected: a quoted value that ends in a key and a separator
-/// (`"x-pwd:"`) is read whole, and what follows its closing quote is read by its
-/// own keys, so a token that no secret key governs stays visible after it.
+/// A residual, on malformed quotes: an unmatched quote, an unescaped quote inside
+/// a quoted value, a quote that closes a value but reads as an opener (it follows
+/// `=` or `:`, a value character follows it, and no delimiter does), and two kinds
+/// of quote interleaved (`Token:Jwt:'token="'id"`), can make a scan pair the
+/// quotes inside a masked value differently from the way it pairs them outside
+/// one, and so leave a value that a secret key governs in the clear in a rare
+/// malformed input. A well-formed input leaves no governed value in the clear: a
+/// quoted value that ends in a key and a separator (`"x-pwd:"`) is read whole, and
+/// what follows its closing quote is read by its own keys; a token that no secret
+/// key governs stays visible there.
 pub fn scrub_text_wide(text: &str) -> String {
     mask_secret_pairs(
         &mask_secret_pairs(&apply_patterns(text), Reading::FirstOfWide),
@@ -2242,6 +2249,7 @@ mod tests {
         assert!(bad.is_empty(), "wrong output: {bad:#?}");
     }
 
+    /// A corpus check; the general property is the ownership-aware one (spec Residual risks 4).
     #[test]
     fn scrub_text_wide_masks_everything_scrub_text_masks() {
         let inputs = corpus_inputs();
