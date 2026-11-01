@@ -1571,6 +1571,70 @@ mod tests {
         assert_eq!(child.stderr_tail().trim(), "0");
     }
 
+    /// Plan P1b.14 `pkexec_env_is_cleared_but_for_display` (panel, 2026-11-01;
+    /// spec §5.5 "How the launcher is spawned"): the child's environment is
+    /// exactly the subset of [`PASSED_ENV`] set in the core; `SHELL`, `LANG`
+    /// and `LC_ALL` never reach it. Through the real spawner on a real child:
+    /// `/bin/sh` exists on macOS and Linux. The shell adds a few variables of
+    /// its own under an empty environment (`PWD`, `SHLVL`, `_`, by shell), so
+    /// the baseline is measured the same way under `env -i`, and what the
+    /// spawner's child has beyond that baseline must be within `PASSED_ENV`.
+    #[test]
+    fn pkexec_env_is_cleared_but_for_display() {
+        std::env::set_var("SHELL", "/bin/zsh");
+        std::env::set_var("LANG", "en_US.UTF-8");
+        std::env::set_var("LC_ALL", "C");
+        std::env::set_var("DISPLAY", ":9");
+        assert_eq!(
+            std::env::var("LC_ALL").as_deref(),
+            Ok("C"),
+            "set in the core"
+        );
+
+        let keys_of = |env: &str| -> Vec<String> {
+            env.lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| line.split('=').next().unwrap_or(line).to_string())
+                .collect()
+        };
+        let run = |argv: &[&str]| -> String {
+            let mut child = StdSpawner.spawn(&os(argv)).expect("spawn");
+            assert_eq!(wait_fake_free(child.as_mut()), ChildExit::Exited(0));
+            child.stderr_tail()
+        };
+
+        // What the shell itself adds under an empty environment.
+        let baseline = run(&["/usr/bin/env", "-i", "/bin/sh", "-c", "env >&2"]);
+        let shell_own = keys_of(&baseline);
+        assert!(
+            !shell_own.iter().any(|k| k == "DISPLAY" || k == "SHELL"),
+            "the baseline carries no display and no SHELL: {baseline:?}"
+        );
+
+        // The spawner's child, as pkexec would see it.
+        let env = run(&["/bin/sh", "-c", "env >&2"]);
+        let inherited: Vec<String> = keys_of(&env)
+            .into_iter()
+            .filter(|k| !shell_own.contains(k))
+            .collect();
+        // Keys only in the messages: a leaking spawner must not have this
+        // test print the core's environment (proxy credentials live there).
+        assert!(
+            !inherited.is_empty() && inherited.iter().all(|k| PASSED_ENV.contains(&k.as_str())),
+            "only DISPLAY, WAYLAND_DISPLAY and XAUTHORITY may be inherited; got {inherited:?}"
+        );
+        assert!(
+            env.lines().any(|line| line == "DISPLAY=:9"),
+            "DISPLAY is passed through verbatim; keys: {inherited:?}"
+        );
+        for absent in ["SHELL=", "LANG=", "LC_ALL=", "PATH=", "HOME="] {
+            assert!(
+                !env.lines().any(|line| line.starts_with(absent)),
+                "{absent} reached the child"
+            );
+        }
+    }
+
     fn wait_fake_free(child: &mut dyn Child) -> ChildExit {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {

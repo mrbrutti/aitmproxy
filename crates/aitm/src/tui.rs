@@ -375,6 +375,13 @@ pub(crate) fn attach_bound_hook(
 /// bound; `main.rs` passes [`self_port_hook`](crate::wire::self_port_hook) over
 /// the live L4 guard, as it does on the server path (L4PAR-AC34). With no agent
 /// server (stdio) the hook is dropped unused.
+///
+/// `prompt_held` is the packet-capture prompt hold (L4 privilege spec §5.5):
+/// the shutdown arm consults it through
+/// [`shutdown_signal_unless_held`](crate::shutdown_signal_unless_held), as the
+/// server path does, so a Ctrl-C at a pkexec prompt cancels the prompt and
+/// not the TUI.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: &Config,
     proxy: &Proxy,
@@ -383,6 +390,7 @@ pub async fn run(
     main_listener: tokio::net::TcpListener,
     browser_listener: tokio::net::TcpListener,
     on_agent_bound: Option<BoundHook>,
+    prompt_held: impl Fn() -> bool,
 ) -> anyhow::Result<()> {
     let startup_note = services.log.startup_note();
     let (agent, handler) = build_servers(cfg, services, governance);
@@ -411,7 +419,7 @@ pub async fn run(
         result = proxy.run_browser_on(browser_listener) => result,
         result = agent_serve => result,
         result = tui => result,
-        () = crate::shutdown_signal() => {
+        () = crate::shutdown_signal_unless_held(prompt_held) => {
             info!("shutdown signal received");
             Ok(())
         }

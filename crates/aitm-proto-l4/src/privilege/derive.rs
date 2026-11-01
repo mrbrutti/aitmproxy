@@ -72,8 +72,9 @@ pub enum SessionFailure {
 }
 
 impl SessionFailure {
-    /// The `helper.detail` text for the `version_mismatch` row: both protocol
-    /// numbers when the helper named one, else ours and the defect.
+    /// The `helper.detail` text for the session-failure row: both protocol
+    /// numbers when the helper named one (`version_mismatch`), else ours and
+    /// the defect (`unknown`).
     #[must_use]
     pub fn detail(&self) -> String {
         match self {
@@ -251,11 +252,17 @@ fn derive_linux(enabled: bool, linux: &LinuxInputs) -> (Capability, Capability, 
     let (status, detail) = if linux.session_connected {
         (HelperStatus::Running, None)
     } else if let Some(failure) = &linux.last_session_error {
-        // Spec §5.2: the last session closed at `Hello` (another protocol
-        // version, or garbage). After the connected-session row, before the
-        // file-caps row: a helper that is back and attached reads `running`
-        // again, and a mismatching file-caps helper is still named as such.
-        (HelperStatus::VersionMismatch, Some(failure.detail()))
+        // Spec §5.2: the last session closed at `Hello`. After the
+        // connected-session row, before the file-caps row: a helper that is
+        // back and attached reads `running` again, and a mismatching file-caps
+        // helper is still named as such. Only a helper that named another
+        // protocol is a `version_mismatch`; garbage at `Hello` is `unknown`
+        // with the defect as the detail (panel 2, 2026-11-01).
+        let status = match failure {
+            SessionFailure::VersionMismatch(_) => HelperStatus::VersionMismatch,
+            SessionFailure::Protocol(_) => HelperStatus::Unknown,
+        };
+        (status, Some(failure.detail()))
     } else if file_caps || packaged {
         (HelperStatus::Installed, None)
     } else if let Some(helper) = untrusted_path {
@@ -1467,7 +1474,8 @@ mod tests {
         );
         assert_eq!(how.kind, HowKind::Pkexec);
 
-        // Garbage instead of a HelloAck: the defect is the detail.
+        // Garbage instead of a HelloAck is not a version mismatch: `unknown`,
+        // with the defect as the detail (spec §5.2 as amended, panel 2).
         let report = derive(&linux_inputs(
             true,
             LinuxInputs {
@@ -1477,7 +1485,7 @@ mod tests {
                 ..linux_packaged()
             },
         ));
-        assert_eq!(report.helper.status, HelperStatus::VersionMismatch);
+        assert_eq!(report.helper.status, HelperStatus::Unknown);
         assert_eq!(
             report.helper.detail.as_deref(),
             Some("helper did not speak protocol 1 (unknown message type 0xff)")
@@ -1513,6 +1521,65 @@ mod tests {
         // L4 off: the row is still read "as found".
         let report = derive(&linux_inputs(
             false,
+            LinuxInputs {
+                last_session_error: Some(SessionFailure::VersionMismatch(2)),
+                ..linux_packaged()
+            },
+        ));
+        assert_eq!(report.helper.status, HelperStatus::VersionMismatch);
+    }
+
+    /// Panel 2 (spec §5.2 as amended): a malformed handshake (garbage, an
+    /// unknown frame type, bad JSON) is **not** a version mismatch. With no
+    /// session connected it reads `helper.status: unknown` with the defect in
+    /// `detail`; only `SessionFailure::VersionMismatch` reads
+    /// `version_mismatch`. The capture rows are untouched either way.
+    #[test]
+    fn protocol_failure_is_unknown_with_detail() {
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                last_session_error: Some(SessionFailure::Protocol(
+                    "unknown message type 0xff".to_string(),
+                )),
+                ..linux_packaged()
+            },
+        ));
+        assert_linux_common(&report);
+        assert_eq!(report.helper.status, HelperStatus::Unknown);
+        assert_eq!(report.helper.status.as_str(), "unknown");
+        assert_eq!(report.helper.kind, HelperKind::LinuxPkexecHelper);
+        assert_eq!(
+            report.helper.detail.as_deref(),
+            Some("helper did not speak protocol 1 (unknown message type 0xff)")
+        );
+        let (reason, how) = needs(&report);
+        assert_eq!(
+            reason,
+            "Allow packet capture (asks for an administrator password)"
+        );
+        assert_eq!(how.kind, HowKind::Pkexec);
+
+        // The same defect on the file-caps row: kind and capture stand.
+        let report = derive(&linux_inputs(
+            true,
+            LinuxInputs {
+                helper: Some(candidate(LINUX_HELPER_PATH, true, true, true)),
+                last_session_error: Some(SessionFailure::Protocol("bad JSON".to_string())),
+                ..linux_packaged()
+            },
+        ));
+        assert_eq!(report.helper.kind, HelperKind::LinuxCapHelper);
+        assert_eq!(report.helper.status, HelperStatus::Unknown);
+        assert_eq!(
+            report.helper.detail.as_deref(),
+            Some("helper did not speak protocol 1 (bad JSON)")
+        );
+        assert_eq!(report.capture, Capability::Available { via: Via::Helper });
+
+        // A version mismatch stays `version_mismatch`.
+        let report = derive(&linux_inputs(
+            true,
             LinuxInputs {
                 last_session_error: Some(SessionFailure::VersionMismatch(2)),
                 ..linux_packaged()

@@ -2216,7 +2216,7 @@ mod tests {
     /// I3 (spec §5.2): a helper that answers `Hello` with another protocol
     /// version fails the request **and** the next report says
     /// `helper.status: version_mismatch` naming both protocol numbers; a
-    /// malformed handshake does the same with the defect; a session that then
+    /// malformed handshake reads `unknown` with the defect; a session that then
     /// attaches clears it (`running`), and after it ends the row is `installed`.
     #[test]
     fn watcher_reports_version_mismatch_until_a_session_attaches() {
@@ -2259,7 +2259,8 @@ mod tests {
         );
         assert!(!holds.is_held());
 
-        // Garbage: the defect is carried, status is the same.
+        // Garbage: the defect is carried and the status is `unknown` (spec
+        // §5.2 as amended: only a named protocol is a version mismatch).
         let (core, peer) = UnixStream::pair().expect("socketpair");
         let peer_thread = garbage_peer(peer, vec![0, 0, 0, 5, 0xff, 1, 2, 3, 4]);
         let session = HelperSession::from_stream(core).expect("session");
@@ -2276,7 +2277,8 @@ mod tests {
         );
         peer_thread.join().expect("peer");
         let report = state.report();
-        assert_eq!(report.helper.status, HelperStatus::VersionMismatch);
+        assert_eq!(report.helper.status, HelperStatus::Unknown);
+        assert_eq!(report.helper.status.as_str(), "unknown");
         assert_eq!(
             report.helper.detail.as_deref(),
             Some("helper did not speak protocol 1 (unknown message type 0xff)")

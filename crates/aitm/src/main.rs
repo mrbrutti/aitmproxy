@@ -53,6 +53,15 @@ use tracing::{info, warn};
 /// The config file path when `--config` is not given.
 const CONFIG_ENV: &str = "AITM_CONFIG";
 
+/// The privilege state and the SIGINT hold it raises around a launcher child
+/// (privilege spec §5.5), built together so every shutdown future that
+/// consults the hold reads the count the state writes.
+fn privilege_state_with_hold(cfg: &PrivilegeConfig) -> (Arc<PrivilegeState>, HoldCount) {
+    let hold = HoldCount::default();
+    let state = Arc::new(PrivilegeState::new(cfg).with_sigint_hold(hold.clone()));
+    (state, hold)
+}
+
 /// What the command line asked for, after the `--config` and `--script` splits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
@@ -381,17 +390,14 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         | Mode::SysproxyWatchdog { .. } => ProcessLifetime::Serving,
     };
     // The SIGINT hold (privilege spec §5.5): the state raises it while a
-    // launcher child (the pkexec prompt) is alive; the shutdown futures below
-    // read it, so a Ctrl-C at the prompt cancels the prompt and not the core.
-    let sigint_hold = HoldCount::default();
-    let privilege_state = Arc::new(
-        PrivilegeState::new(&PrivilegeConfig {
-            enabled: l4.enabled,
-            l4: l4.privilege.clone(),
-            lifetime: l4_lifetime,
-        })
-        .with_sigint_hold(sigint_hold.clone()),
-    );
+    // launcher child (the pkexec prompt) is alive; every shutdown future below
+    // (server, capture session, `aitm tui`) reads it, so a Ctrl-C at the
+    // prompt cancels the prompt and not the core.
+    let (privilege_state, sigint_hold) = privilege_state_with_hold(&PrivilegeConfig {
+        enabled: l4.enabled,
+        l4: l4.privilege.clone(),
+        lifetime: l4_lifetime,
+    });
     let prompt_held = move || sigint_hold.is_held();
     // A script's `browser.navigate` decides SSRF under the same policy as the
     // `browser.navigate` command.
@@ -857,6 +863,7 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
                 proxy_listener,
                 browser_listener,
                 on_agent_bound,
+                prompt_held.clone(),
             ) => result,
             never = capture_run => match never {},
         }
@@ -1224,7 +1231,7 @@ mod tests {
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
         build_env_filter, configured_agent_port, manages_system_proxy, parse_invocation,
         parse_mode, split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation,
-        Mode, OPERATOR_TOKEN_USAGE,
+        Mode, PrivilegeConfig, ProcessLifetime, OPERATOR_TOKEN_USAGE,
     };
 
     fn args(a: &[&str]) -> Vec<String> {
@@ -1940,5 +1947,58 @@ mod tests {
             assert!(bus_endpoint_file.is_none(), "{argv:?}");
             assert!(web_args.is_none(), "{argv:?}");
         }
+    }
+
+    // ---- fix task C 2026-11-01 (p1b panel 2, C2): the prompt hold reaches every arm ----
+
+    /// Spec §5.5 (panel 2): the hold the shutdown arms consult is the one the
+    /// privilege state raises around a launcher child. What this proves: the
+    /// `held()` closure `main` hands to `shutdown_signal_unless_held` (server,
+    /// capture session and `tui::run`) reads the **same** `HoldCount` the
+    /// state writes, so a token taken through the state flips it and dropping
+    /// the token clears it. `tui::run` itself needs a terminal and a bus, so
+    /// its arm is pinned by `tui_shutdown_arm_consults_the_prompt_hold`.
+    #[test]
+    fn the_prompt_hold_handed_to_the_shutdown_arms_is_the_states() {
+        use aitm_proto_l4::privilege::linux::SignalGuard;
+        let (state, hold) = super::privilege_state_with_hold(&PrivilegeConfig {
+            enabled: false,
+            l4: Default::default(),
+            lifetime: ProcessLifetime::Serving,
+        });
+        let held = move || hold.is_held();
+        assert!(!held(), "no child, no hold");
+        let token = state.sigint_hold().hold();
+        assert!(
+            held(),
+            "a hold raised through the state is seen by the arms' closure"
+        );
+        let second = state.sigint_hold().hold();
+        drop(token);
+        assert!(held(), "any token out keeps the hold");
+        drop(second);
+        assert!(!held(), "the last token released clears it");
+    }
+
+    /// Tripwire for `crates/aitm/src/tui.rs`: the `aitm tui` select arm awaits
+    /// the hold-consulting shutdown future, never the plain one (spec §5.5,
+    /// panel 2: both serving shutdown futures consult the hold).
+    #[test]
+    fn tui_shutdown_arm_consults_the_prompt_hold() {
+        let run_body = include_str!("tui.rs")
+            .split("pub async fn run(")
+            .nth(1)
+            .expect("tui.rs defines `run`")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module follows `run`");
+        assert!(
+            run_body.contains("crate::shutdown_signal_unless_held("),
+            "the tui select arm must consult the prompt hold"
+        );
+        assert!(
+            !run_body.contains("crate::shutdown_signal()"),
+            "the plain shutdown future ignores the hold"
+        );
     }
 }
