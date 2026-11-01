@@ -268,6 +268,15 @@ fn detail_lists_lanes_and_session() {
             "the detail lacks {literal:?}: {text}"
         );
     }
+    // The lanes line whole, as `detail_text` builds it (plan Task 16).
+    let lines = app.scan.jobs.detail_text();
+    assert_eq!(
+        lines
+            .iter()
+            .find(|(l, _)| *l == "lanes")
+            .map(|(_, v)| v.as_str()),
+        Some("requested http ws · run http · skipped ws (lane not available on this build)")
+    );
 }
 
 /// Fix round C, C20 and fix round E, E1 (D6 hostile-core bounds): the
@@ -720,4 +729,55 @@ fn a_huge_list_folds_to_jobs_max_rows() {
     assert_eq!(app.scan.jobs.order[JOBS_MAX], "scan-000000ff");
     assert_eq!(app.scan.jobs.summaries.len(), JOBS_MAX + 1);
     let _ = screen(&app);
+}
+
+/// D13 hue on data (plan Task 16): the Jobs row's state cell takes the
+/// status token of its state (`running` the accent, `done` success,
+/// `failed` server-error, `cancelled` tertiary) and the id cell beside it
+/// stays primary text, whether or not the row is under the cursor.
+#[test]
+fn the_state_cell_wears_its_states_hue() {
+    use aitm_tui::snapshot::to_text;
+    use aitm_tui::tokens::color::status;
+
+    let theme = theme();
+    let fg = |style: ratatui::style::Style| style.fg.expect("the theme sets a foreground");
+    let table = [
+        ("running", "auditing", "running/audit", fg(theme.accent())),
+        ("done", "done", "done", fg(theme.fg(&status::SUCCESS))),
+        (
+            "failed",
+            "done",
+            "failed",
+            fg(theme.fg(&status::SERVER_ERROR)),
+        ),
+        ("cancelled", "done", "cancelled", fg(theme.text_tertiary())),
+    ];
+    for (state, phase, text, want) in table {
+        for under_cursor in [true, false] {
+            let mut app = app();
+            let _ = app.on_bus(list_reply());
+            let _ = app.on_bus(status_reply(status_in(state, phase)));
+            if !under_cursor {
+                let _ = app.update(Action::Down);
+                assert_eq!(app.scan.jobs.cursor, 1);
+            }
+            let buf = draw(&app, 200, 50);
+            let shown = to_text(&buf);
+            let y = line_index(&shown, JOB).unwrap_or_else(|| panic!("no row: {shown}"));
+            let line = shown.lines().nth(y).expect("the row");
+            let x = col_of(line, text).unwrap_or_else(|| panic!("{text:?} in {line:?}"));
+            assert_eq!(
+                cell(&buf, x, y).fg,
+                want,
+                "{state} under_cursor={under_cursor}: the state cell's hue"
+            );
+            let id_x = col_of(line, JOB).expect("the id");
+            assert_eq!(
+                cell(&buf, id_x, y).fg,
+                fg(theme.text_primary()),
+                "{state}: the id is primary text"
+            );
+        }
+    }
 }

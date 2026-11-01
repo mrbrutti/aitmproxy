@@ -257,10 +257,10 @@ fn scan_command_with_an_origin_sends_target_or_refuses() {
         launch_requests(&reqs).is_empty(),
         "an out-of-scope host launches nothing: {reqs:?}"
     );
-    let t = toast(&app);
-    assert!(
-        t.contains("Out of scope") && t.contains("evil.test"),
-        "{t:?}"
+    assert_eq!(
+        toast(&app),
+        "Out of scope: add `evil.test` to scope to scan it",
+        ":scan evil.test toasts the D8 text naming the host"
     );
     assert_eq!(app.scan.launch.pending, None);
 }
@@ -572,10 +572,10 @@ fn start_refuses_a_draft_origin_outside_scope() {
     let reqs = app.update(Action::ScanStart);
     assert!(launch_requests(&reqs).is_empty(), "{reqs:?}");
     assert_eq!(app.scan.launch.pending, None);
-    let t = toast(&app);
-    assert!(
-        t.contains("Out of scope") && t.contains("evil.test"),
-        "{t:?}"
+    assert_eq!(
+        toast(&app),
+        "Out of scope: add `evil.test` to scope to scan it",
+        "s from the editor toasts the D8 text naming the host"
     );
 
     // `m` applies the same rule.
@@ -934,4 +934,78 @@ fn every_legacy_launch_path_shares_the_running_guard() {
     let reqs = app.update(Action::ScanMap);
     assert!(launch_requests(&reqs).is_empty(), "m fallback: {reqs:?}");
     assert_eq!(toast(&app), RUNNING, "m fallback");
+}
+
+/// D6 and the Task 12 ruling in D11 (pinned in plan Task 16): a
+/// `StartResult` is folded only when its `job` is in the wire form and
+/// `status.job` names the same job. A reply whose status names another
+/// job, and one whose id is forged, leave Jobs empty and the tab on
+/// Profiles, toast no start line, clear the pending launch (the reply
+/// answered it) and record an uncoded error under `scan.start`; a
+/// `needs_confirmation` reply without a `confirm_token` opens no overlay
+/// and is a contract error that frees the key the same way.
+#[test]
+fn a_start_result_is_folded_only_under_its_own_job() {
+    let mut mismatch = fixture("scan.start.json");
+    mismatch["status"]["job"] = json!("scan-ffff0001");
+    let mut forged = fixture("scan.start.json");
+    forged["job"] = json!("scan-../../x");
+    forged["status"]["job"] = json!("scan-../../x");
+    let no_token = json!({ "status": "needs_confirmation", "prompt": "Prompt-7Q verbatim" });
+    for (what, value, detail) in [
+        (
+            "status names another job",
+            mismatch,
+            "reply named a different job",
+        ),
+        (
+            "a forged id",
+            forged,
+            "reply named a job id outside the wire form",
+        ),
+        (
+            "a confirm without a token",
+            no_token,
+            "reply did not match the contract (",
+        ),
+    ] {
+        let mut app = opened();
+        app.scan.profiles.cursor = 3;
+        let reqs = app.update(Action::ScanStart);
+        assert_eq!(reqs.len(), 1, "{what}: {reqs:?}");
+        app.toasts.clear();
+
+        let reqs = app.on_bus(reply("scan.start", "scan.start", value));
+        assert!(reqs.is_empty(), "{what}: {reqs:?}");
+        assert_eq!(app.mode, Mode::Scan, "{what}: no overlay");
+        assert!(app.wire_confirm.is_none(), "{what}");
+        assert_eq!(app.scan.tab, ScanTab::Profiles, "{what}: not switched");
+        assert!(app.scan.jobs.order.is_empty(), "{what}: nothing folded");
+        assert!(app.scan.jobs.full.is_empty(), "{what}");
+        assert!(app.scan.jobs.started_here.is_empty(), "{what}");
+        assert_eq!(app.scan.launch.pending, None, "{what}: answered");
+        assert!(!app.scan.inflight.contains("scan.start"), "{what}");
+        let err = app
+            .scan
+            .profiles
+            .error
+            .as_ref()
+            .unwrap_or_else(|| panic!("{what}: scan.start is the Profiles tab's error"));
+        assert_eq!(err.tag, "scan.start", "{what}");
+        assert_eq!(err.code, None, "{what}");
+        assert!(
+            err.detail.starts_with(detail),
+            "{what}: {:?} starts with {detail:?}",
+            err.detail
+        );
+        assert!(
+            toast_texts(&app)
+                .iter()
+                .all(|(_, t)| !t.contains("started")),
+            "{what}: no start toast: {:?}",
+            toast_texts(&app)
+        );
+        let reqs = app.update(Action::ScanStart);
+        assert_eq!(reqs.len(), 1, "{what}: the key is live again: {reqs:?}");
+    }
 }

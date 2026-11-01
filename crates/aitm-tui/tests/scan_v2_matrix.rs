@@ -290,3 +290,147 @@ fn v2_site_map_enter_opens_the_v2_nodes_first_flow() {
     );
     assert_eq!(app.mode, Mode::Inspector, "and opens it in the inspector");
 }
+
+/// Every verb of the v2 surface (spec D2, D3).
+const V2_TOOLS: &[&str] = &[
+    "scan.start",
+    "scan.map",
+    "scan.list",
+    "scan.status",
+    "scan.cancel",
+    "scan.issues",
+    "scan.issue",
+    "scan.issue.update",
+    "scan.sitemap",
+    "scan.profile.list",
+    "scan.profile.get",
+    "scan.profile.save",
+    "scan.profile.delete",
+    "scan.checks",
+    "scan.session.preview",
+];
+
+/// D13's in-flight and empty states (plan Task 16): while a tab's read is
+/// in flight over an empty pane the banner reads `refreshing <verb>...`;
+/// an empty reply draws the tab's empty text with the banner back to
+/// `idle`; once a pane is populated a read in flight leaves the banner
+/// `idle` and the content on screen.
+#[test]
+fn every_tab_reads_refreshing_over_an_empty_pane_then_its_empty_text() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, V2_TOOLS, None);
+    let reqs = app.update(Action::OpenScan);
+    assert_eq!(
+        called(&reqs).len(),
+        3,
+        "list, profile list, checks: {reqs:?}"
+    );
+    for (tab, verb) in [
+        (ScanTab::Profiles, "scan.profile.list"),
+        (ScanTab::Jobs, "scan.list"),
+        (ScanTab::SiteMap, "scan.sitemap"),
+        (ScanTab::Issues, "scan.issues"),
+    ] {
+        let _ = app.update(Action::ScanTab(tab));
+        assert!(
+            app.scan.inflight.contains(verb),
+            "{tab:?}: {verb} is in flight: {:?}",
+            app.scan.inflight
+        );
+        let text = text_of(&app, 200, 50);
+        let strip = banner_row(&text);
+        assert!(
+            strip.ends_with(&format!("refreshing {verb}...")),
+            "{tab:?}: the banner names the read in flight: {strip:?}"
+        );
+    }
+
+    for (tab, verb, value, empty) in [
+        (
+            ScanTab::Issues,
+            "scan.issues",
+            serde_json::json!({ "issues": [] }),
+            "no issues yet",
+        ),
+        (
+            ScanTab::SiteMap,
+            "scan.sitemap",
+            serde_json::json!({ "nodes": [], "points": [] }),
+            "no site map yet",
+        ),
+        (
+            ScanTab::Jobs,
+            "scan.list",
+            serde_json::json!({ "jobs": [] }),
+            "no jobs yet: start one from Profiles (s)",
+        ),
+        (
+            ScanTab::Profiles,
+            "scan.profile.list",
+            serde_json::json!({ "profiles": [] }),
+            "no profiles yet",
+        ),
+    ] {
+        // Enter the tab first: entering Site map or Issues re-reads (D6),
+        // which the dedupe folds into the read already in flight; the
+        // reply then settles the one tag.
+        let _ = app.update(Action::ScanTab(tab));
+        let _ = app.on_bus(BusEvent::CallTaggedOk {
+            tag: verb.into(),
+            name: verb.into(),
+            value,
+        });
+        assert!(
+            !app.scan.inflight.contains(verb),
+            "{tab:?}: {verb} settled: {:?}",
+            app.scan.inflight
+        );
+        let text = text_of(&app, 200, 50);
+        let strip = banner_row(&text);
+        assert!(
+            strip.ends_with("idle"),
+            "{tab:?}: the reply settled the banner: {strip:?}"
+        );
+        assert_eq!(
+            text.matches(empty).count(),
+            1,
+            "{tab:?}: the empty text once (D13):\n{text}"
+        );
+    }
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.checks".into(),
+        name: "scan.checks".into(),
+        value: serde_json::json!({ "checks": [] }),
+    });
+    assert!(app.scan.inflight.is_empty(), "{:?}", app.scan.inflight);
+
+    // A populated Jobs pane keeps its rows while the timer's list is in
+    // flight, and the banner reads idle, not refreshing.
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: fixture("scan.list.json"),
+    });
+    assert_eq!(app.scan.jobs.order.len(), 2);
+    let mut listed = false;
+    for _ in 0..40 {
+        listed |= called(&app.update(Action::Tick))
+            .iter()
+            .any(|n| n == "scan.list");
+    }
+    assert!(listed, "the forty-tick list left");
+    assert!(app.scan.inflight.contains("scan.list"));
+    let text = text_of(&app, 200, 50);
+    assert!(
+        banner_row(&text).ends_with("idle"),
+        "a populated pane is not refreshing: {:?}",
+        banner_row(&text)
+    );
+    assert!(
+        text.contains("scan-1a2b3c4d") && text.contains("scan-55667788"),
+        "the rows stay on screen:\n{text}"
+    );
+    assert!(!text.contains("no jobs yet"), "{text}");
+}

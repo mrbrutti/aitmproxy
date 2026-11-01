@@ -762,3 +762,120 @@ fn disconnect_clears_pending_launch() {
     let _ = app.on_bus(BusEvent::Disconnected("x".into()));
     assert_eq!(app.scan.launch.pending, None);
 }
+
+/// D6 hostile-core bounds, the `scan.cancel` half of the keyed-reply rule
+/// (plan Task 16): a `scan.cancel:<job>` reply whose `job` is another id
+/// folds nothing (the polled row keeps its running state and no row
+/// appears for the other id), records the uncoded `reply named a
+/// different job` under the cancel tag in the Jobs slot, and settles the
+/// tag so `x` is live again; the genuine reply then folds and clears it.
+#[test]
+fn a_cancel_reply_naming_another_job_is_not_folded() {
+    let mut app = scan_app();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(status_reply(fixture("scan.status.json")));
+    let cancel_tag = format!("scan.cancel:{JOB}");
+    let reqs = app.update(Action::ScanCancel);
+    assert_eq!(reqs.len(), 1, "x sends the cancel: {reqs:?}");
+    assert!(app.scan.inflight.contains(&cancel_tag));
+
+    let mut forged = fixture("scan.cancel.json");
+    forged["job"] = json!("scan-ffff0001");
+    let reqs = app.on_bus(BusEvent::CallTaggedOk {
+        tag: cancel_tag.clone(),
+        name: "scan.cancel".into(),
+        value: forged,
+    });
+    assert!(reqs.is_empty(), "a refused reply pushes nothing: {reqs:?}");
+    assert_eq!(app.scan.jobs.order, vec![JOB.to_string()]);
+    assert!(!app.scan.jobs.full.contains_key("scan-ffff0001"));
+    assert!(!app.scan.jobs.summaries.contains_key("scan-ffff0001"));
+    assert_eq!(
+        app.scan.jobs.full[JOB].state,
+        aitm_scan_model::JobState::Running,
+        "the polled row keeps the state its own reply gave it"
+    );
+    let err = app
+        .scan
+        .jobs
+        .error
+        .as_ref()
+        .expect("the mismatch is the Jobs tab's error");
+    assert_eq!(err.tag, cancel_tag);
+    assert_eq!(err.verb, "scan.cancel");
+    assert_eq!(err.code, None);
+    assert_eq!(err.detail, "reply named a different job");
+    assert!(
+        !app.scan.inflight.contains(&cancel_tag),
+        "the tag is settled even when the reply is refused"
+    );
+
+    let reqs = app.update(Action::ScanCancel);
+    assert_eq!(reqs.len(), 1, "x is live again: {reqs:?}");
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: cancel_tag,
+        name: "scan.cancel".into(),
+        value: fixture("scan.cancel.json"),
+    });
+    assert_eq!(
+        app.scan.jobs.full[JOB].state,
+        aitm_scan_model::JobState::Cancelling,
+        "the genuine reply folds"
+    );
+    assert_eq!(
+        app.scan.jobs.error, None,
+        "and its success clears the error"
+    );
+}
+
+/// D5 (plan Task 16): a `notifications/aitm/job` line is acted on only
+/// when it is a scan job line that parses. A line of another kind, one
+/// without an `event`, one whose `status` is not a summary, params that
+/// are not an object and a line with no params at all request nothing,
+/// fold nothing, record no error and never mark the flow list dirty (a
+/// job line is not a flow line, whatever its shape); the well-formed line
+/// still polls.
+#[test]
+fn a_job_line_of_another_kind_or_malformed_is_ignored() {
+    let mut app = scan_app();
+    let mut other_kind = fixture("job.progress.json");
+    other_kind["kind"] = json!("replay");
+    let mut no_event = fixture("job.progress.json");
+    no_event.as_object_mut().expect("an object").remove("event");
+    let mut bad_status = fixture("job.progress.json");
+    bad_status["status"] = json!("not a summary");
+    for (what, params) in [
+        ("another kind", other_kind),
+        ("no event", no_event),
+        ("a status that is not a summary", bad_status),
+        ("params that are a string", json!("garbage")),
+        ("params that are an array", json!([1, 2, 3])),
+        ("null params", Value::Null),
+    ] {
+        let reqs = app.on_bus(job_line(params));
+        assert!(reqs.is_empty(), "{what}: requested {reqs:?}");
+        assert!(app.scan.inflight.is_empty(), "{what}: nothing in flight");
+        assert!(
+            !app.flows_dirty,
+            "{what}: a job line never marks the flow list dirty"
+        );
+        assert!(app.scan.jobs.order.is_empty(), "{what}: nothing folded");
+        assert_eq!(
+            app.scan.last_error, None,
+            "{what}: an ignored line is not an error"
+        );
+    }
+    let reqs = app.on_bus(BusEvent::Notification(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/aitm/job",
+    })));
+    assert!(reqs.is_empty(), "no params: {reqs:?}");
+    assert!(!app.flows_dirty, "no params: not a flow line either");
+    assert!(tick(&mut app).is_empty(), "nothing was left for the tick");
+
+    assert_eq!(
+        app.on_bus(progress_line()),
+        vec![status_request(JOB)],
+        "the well-formed line still polls"
+    );
+}

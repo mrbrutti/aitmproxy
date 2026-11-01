@@ -297,22 +297,32 @@ fn jobs_narrow_row_drops_profile_and_targets_into_the_detail() {
 #[test]
 fn hints_follow_the_tab() {
     let mut app = populated();
-    for (tab, key) in [
-        (ScanTab::Profiles, "s start"),
-        (ScanTab::Jobs, "x cancel"),
-        (ScanTab::SiteMap, "n next page"),
-        (ScanTab::Issues, "f false positive"),
+    // The whole bar per tab, D11's literals (plan Task 16), `Esc back`
+    // last so it is the first to go when the bar is narrow.
+    for (tab, bar) in [
+        (
+            ScanTab::Profiles,
+            " s start  m map  w save as  e edit  Space toggle  Esc back",
+        ),
+        (
+            ScanTab::Jobs,
+            " x cancel  ⏎ issues of this job  s start  m map  Esc back",
+        ),
+        (
+            ScanTab::SiteMap,
+            " ⏎ open flow  n next page  J job filter  Esc back",
+        ),
+        (
+            ScanTab::Issues,
+            " c confirm  f false positive  u reopen  ⏎ open flow  P PoC  S C L T J filters  R reset  Esc back",
+        ),
     ] {
         let _ = app.update(Action::ScanTab(tab));
         let text = screen_at(&mut app, 200, 50);
         let bottom = bottom_line(&text);
         assert!(
-            bottom.contains(key),
-            "{tab:?}: the bottom line names {key:?}: {bottom:?}"
-        );
-        assert!(
-            bottom.contains("Esc back"),
-            "{tab:?}: the bottom line names Esc back: {bottom:?}"
+            bottom.starts_with(bar),
+            "{tab:?}: the bar reads {bar:?}: {bottom:?}"
         );
     }
     // The legacy launch keys are not the v2 Jobs hints.
@@ -557,4 +567,58 @@ fn help_overlay_scrolls_to_the_scan_section_on_a_short_terminal() {
     assert_eq!(text_of(&app, 200, 50), tall);
     let _ = app.update(Action::PageDown);
     assert_eq!(text_of(&app, 200, 50), tall);
+}
+
+/// D11's help literals (plan Task 16): the help overlay's Scan lines and
+/// the overlay's `F / S / @` and closing lines are pinned to the spec's
+/// words, not derived from the tables they are built from
+/// (`palette_and_help_name_the_surface` proves the overlay draws the
+/// tables; this proves the tables say what D11 says; the bars are pinned
+/// in `hints_follow_the_tab`).
+#[test]
+fn the_help_spells_the_d11_literals() {
+    let mut app = populated();
+    let lines: Vec<(&str, String)> = HELP.iter().map(|(k, g)| (*k, key_text(g))).collect();
+    assert_eq!(
+        lines,
+        vec![
+            (
+                "1 2 3 4",
+                "Profiles · Jobs · Site map · Issues tabs · Tab/BackTab pane · Esc back".to_string()
+            ),
+            (
+                "Profiles",
+                "s start · m map · w save as · e edit · Space toggle · N new · D delete · o origin · t L4 target".to_string()
+            ),
+            (
+                "Jobs",
+                "x cancel · ⏎ issues of this job · s start · m map".to_string()
+            ),
+            (
+                "Site map",
+                "⏎ open flow · n next page · J job filter".to_string()
+            ),
+            (
+                "Issues",
+                "c confirm · f false positive · u reopen · ⏎ open flow · P PoC · S C L T J filters · R reset".to_string()
+            ),
+        ]
+    );
+
+    let _ = app.update(Action::Back);
+    let _ = app.update(Action::Help);
+    assert_eq!(app.mode, Mode::Help);
+    let text = screen_at(&mut app, 200, 50);
+    let fsa = text
+        .lines()
+        .find(|l| l.contains("F / S / @"))
+        .unwrap_or_else(|| panic!("no F / S / @ line:\n{text}"));
+    assert!(
+        fsa.contains("findings · scope · agent panels · :scan the Scan view (keys below)"),
+        "{fsa:?}"
+    );
+    assert!(
+        text.contains("↑↓ PgUp PgDn Home End scroll · any other key closes this help."),
+        "the closing line:\n{text}"
+    );
 }

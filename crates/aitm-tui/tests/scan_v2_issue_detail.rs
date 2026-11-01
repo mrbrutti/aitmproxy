@@ -853,3 +853,70 @@ fn every_free_text_leaf_of_a_read_issue_is_bounded() {
     }
     let _ = screen(&app);
 }
+
+/// D6 keyed-reply discipline, the `scan.issue.update` half (plan Task 16):
+/// an update reply whose `id` is another issue's folds nothing: the read
+/// issue under the cursor keeps its status, the list row and its display
+/// row are unchanged, nothing is read for the other id, the Issues error
+/// reads `reply named a different issue` under the update tag, and the
+/// tag is settled so `f` is live again; the genuine reply then folds and
+/// clears the error.
+#[test]
+fn an_update_naming_another_issue_is_not_folded() {
+    let mut app = app_with_xss_read();
+    let tag = format!("scan.issue.update:{XSS}");
+    let reqs = app.update(Action::ScanIssueStatus(IssueStatus::FalsePositive));
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+
+    let mut other = fixture("scan.issue.update.json");
+    other["id"] = json!(REDIRECT);
+    let reqs = app.on_bus(reply(&tag, "scan.issue.update", other));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(
+        app.scan.issues.detail().map(|i| i.status),
+        Some(IssueStatus::Open),
+        "the read issue keeps its status"
+    );
+    assert_eq!(app.scan.issues.list[0].status, IssueStatus::Open);
+    assert_eq!(
+        app.scan.issues.list[1].status,
+        IssueStatus::Open,
+        "the other row is not touched either"
+    );
+    assert_eq!(app.scan.issues.rows[0].status, "open");
+    assert!(
+        !app.scan.issues.read.contains(REDIRECT),
+        "nothing is read for the other id"
+    );
+    let err = app
+        .scan
+        .issues
+        .error
+        .as_ref()
+        .expect("the mismatch is the Issues tab's error");
+    assert_eq!(err.tag, tag);
+    assert_eq!(err.code, None);
+    assert_eq!(err.detail, "reply named a different issue");
+    assert!(app.scan.inflight.is_empty(), "the tag is settled");
+    let text = screen(&app);
+    let row = line_with(&text, "Reflected cross-site scripting  GET /search")
+        .unwrap_or_else(|| panic!("no XSS row: {text}"));
+    assert!(
+        row.contains("  open") && !row.contains("false_positive"),
+        "the row still reads open: {row:?}"
+    );
+
+    let reqs = app.update(Action::ScanIssueStatus(IssueStatus::FalsePositive));
+    assert_eq!(reqs.len(), 1, "f is live again: {reqs:?}");
+    let _ = app.on_bus(reply(
+        &tag,
+        "scan.issue.update",
+        fixture("scan.issue.update.json"),
+    ));
+    assert_eq!(
+        app.scan.issues.detail().map(|i| i.status),
+        Some(IssueStatus::FalsePositive),
+        "the genuine reply folds"
+    );
+    assert_eq!(app.scan.issues.error, None, "and clears the error");
+}

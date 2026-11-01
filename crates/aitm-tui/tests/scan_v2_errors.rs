@@ -150,12 +150,8 @@ fn each_code_renders_its_wording_in_the_tab_and_the_toast() {
         let expected = format!("{text}: d");
         let shown = screen(&app);
         assert!(
-            shown.contains(text),
-            "{code}: the D9 text is on screen:\n{shown}"
-        );
-        assert!(
-            shown.contains(": d"),
-            "{code}: the detail follows the wording:\n{shown}"
+            banner_text(&shown).ends_with(&expected),
+            "{code}: the Profiles banner ends with the D9 wording and its detail:\n{shown}"
         );
         assert_eq!(toast(&app), expected, "{code}: the toast is the wording");
         assert_eq!(
@@ -678,4 +674,101 @@ fn a_list_failure_shows_on_jobs_only() {
     let _ = app.on_bus(reply("scan.list", "scan.list", fixture("scan.list.json")));
     assert_eq!(app.scan.jobs.error, None, "the list's success clears it");
     assert!(!banner_line(&screen(&app)).contains("Scanner busy"));
+}
+
+/// D9's ruling (2026-11-01) through the reducer (plan Task 16): a failed
+/// `scan.*` verb outside the D3 set is the Jobs tab's error (the unit test
+/// pins `owning_tab`; this pins the path a `CallTaggedFailed` takes).
+/// `scan.frobnicate` failing with an unparseable message lands in
+/// `jobs.error`, reads verbatim as `scan.frobnicate: boom` in the Jobs
+/// banner and the Error toast, and sits on no other tab's banner. (A
+/// success under such a tag is folded by no verb arm, so it clears
+/// nothing: the TUI never sends a verb outside D3, so none can come.)
+#[test]
+fn a_verb_outside_d3_fails_onto_the_jobs_tab() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let out = app.on_bus(failed("scan.frobnicate", "scan.frobnicate", "boom"));
+    assert!(out.is_empty(), "{out:?}");
+    let err = app
+        .scan
+        .jobs
+        .error
+        .as_ref()
+        .expect("an unknown verb is the Jobs tab's error");
+    assert_eq!(err.tag, "scan.frobnicate");
+    assert_eq!(err.verb, "scan.frobnicate");
+    assert_eq!(err.code, None);
+    assert_eq!(err.detail, "boom");
+    assert_eq!(toast(&app), "scan.frobnicate: boom");
+    assert_eq!(
+        app.toasts.back().map(|t| t.level),
+        Some(Level::Error),
+        "an Error toast"
+    );
+    let shown = screen(&app);
+    assert!(
+        banner_text(&shown).ends_with("scan.frobnicate: boom"),
+        "the Jobs banner reads it verbatim:\n{shown}"
+    );
+    for tab in [ScanTab::Profiles, ScanTab::SiteMap, ScanTab::Issues] {
+        let _ = app.update(Action::ScanTab(tab));
+        let shown = screen(&app);
+        assert!(
+            !banner_line(&shown).contains("scan.frobnicate"),
+            "{tab:?} does not carry the Jobs tab's error:\n{shown}"
+        );
+    }
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    assert!(
+        banner_text(&screen(&app)).ends_with("scan.frobnicate: boom"),
+        "the Jobs error survives the tab walk"
+    );
+}
+
+/// D13 "hue only on data" (plan Task 16): the banner wears the server-error
+/// hue for an error and secondary text for `idle` and for a notice.
+#[test]
+fn the_banner_wears_the_error_hue_only_for_an_error() {
+    let theme = theme();
+    let error_fg = theme
+        .fg(&aitm_tui::tokens::color::status::SERVER_ERROR)
+        .fg
+        .expect("the theme sets a foreground");
+    let plain_fg = theme
+        .text_secondary()
+        .fg
+        .expect("the theme sets a foreground");
+    assert_ne!(error_fg, plain_fg);
+    let hue_of = |app: &App, word: &str| {
+        let text = screen(app);
+        let y = line_index(&text, "1 Profiles").expect("the tab strip");
+        let line = text.lines().nth(y).expect("the strip row");
+        let x = col_of(line, word).unwrap_or_else(|| panic!("{word:?} on the strip row: {line:?}"));
+        cell(&draw(app, 240, 50), x, y).fg
+    };
+
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let mut done = fixture("scan.status.json");
+    done["state"] = json!("done");
+    done["phase"] = json!("done");
+    let _ = app.on_bus(reply(&format!("scan.status:{JOB}"), "scan.status", done));
+    assert_eq!(hue_of(&app, "idle"), plain_fg, "idle is secondary text");
+
+    let _ = app.update(Action::ScanCancel);
+    assert_eq!(app.scan.notice.as_deref(), Some("already done"));
+    assert_eq!(
+        hue_of(&app, "already done"),
+        plain_fg,
+        "a notice is secondary text, not an error"
+    );
+
+    let _ = app.update(Action::Down);
+    let _ = app.on_bus(failed("scan.list", "scan.list", "scan: busy: full"));
+    assert_eq!(
+        hue_of(&app, "Scanner busy"),
+        error_fg,
+        "an error wears the server-error hue"
+    );
 }

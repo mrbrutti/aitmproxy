@@ -712,7 +712,10 @@ fn save_on_a_builtin_asks_for_a_name_then_saves() {
     type_text(&mut app, "thorough");
     assert!(app.update(Action::Submit).is_empty());
     assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanProfileName));
-    assert!(toast(&app).contains("thorough"), "{}", toast(&app));
+    assert_eq!(
+        toast(&app),
+        "thorough is a builtin profile; pick another name"
+    );
 
     type_text(&mut app, "team-x");
     let reqs = app.update(Action::Submit);
@@ -1004,7 +1007,10 @@ fn delete_goes_through_the_confirm_prompt() {
     app.scan.profiles.cursor = 3;
     assert!(app.update(Action::ScanDelete).is_empty());
     assert_eq!(app.mode, Mode::Scan, "a builtin opens no prompt");
-    assert!(toast(&app).contains("builtin"), "{}", toast(&app));
+    assert_eq!(
+        toast(&app),
+        "standard is a builtin profile and cannot be deleted"
+    );
 
     app.scan.profiles.cursor = 7;
     assert!(app.update(Action::ScanDelete).is_empty());
@@ -1180,6 +1186,13 @@ fn hostile_profile_replies_are_bounded() {
     assert!(!line.contains("s3cr3t"), "{line}");
     assert!(line.contains("sid"), "{line}");
     assert!(line.len() < 4000, "bounded: {}", line.len());
+    let kept = &app.scan.profiles.previews[ORIGIN];
+    assert_eq!(
+        kept.headers.len(),
+        32,
+        "at most 32 header names are kept (D11)"
+    );
+    assert_eq!(kept.cookies[0], "sid", "the name before the `=`");
 
     // A preview naming another origin is not folded.
     let _ = app.update(Action::ScanNewProfile);
