@@ -248,6 +248,22 @@ Tentative; `h2-header-crlf-tolerance` severity Medium, `confidence_max` Tentativ
 cost Medium, no-mitigation verdict Firm. `matching::scrub` is `pub(crate)` (F5). The
 `origin/main` merge af52322a changed no T3-owned file.
 
+
+**Amendment A9 (T3 session, 2026-11-01, plan text after F4/F5 and option A).** Task 9's
+`h2-rapid-reset-mitigation` rule is: GOAWAY -> Clean; any `Refused` stream -> Clean; the
+connection closed without GOAWAY -> Clean (detail names how many pairs were observed);
+fewer than 8 outcomes -> Inconclusive; otherwise Vulnerable/Firm/Info "no reset-rate
+mitigation observed in 8 reset pairs"; its description reads "a GOAWAY, a refused stream or
+a closed connection". Task 10: `checks()` returns the five gate-free ids in order
+(`cmdi-time`, `open-redirect`, `sqli-boolean`, `sqli-time`, `xss-reflected`) and
+`checks_with(SsrfPolicy, Arc<dyn ScopeRateGuard>)` the ten; tests
+`checks_returns_only_the_gate_free_five`, `checks_with_returns_every_native_id`,
+`the_gated_slot_is_a_superset_of_the_ungated_one` (coordinator option A). Task 2 item 3:
+no `TimingOracle` type; the oracle is `timing::{fit, correlated}` plus the two constants.
+Task 1 item 3: `HttpSender::with_alpn_cache_ttl(Duration)` is part of the builder surface
+(F1.3). Task 6: `RawH2Client::with_ssrf`, `#[cfg(test)] connect_timeout()`, and the
+pre-dial `validate_and_encode` are the shipped shape; `RawH2Mode::Blocks` per A3.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
@@ -1573,6 +1589,8 @@ Kept by the main session during stage 6. One row per finding.
 | whole branch | Quality reviewer (final, native half) | **Important** | `xss-reflected`'s JS-string probe (`';tag//`) carries no angle bracket but a verbatim echo returns Vulnerable/Certain/High with a detail claiming markup survived: a false positive on sites that encode `<`/`>` correctly; no test covers "only the third probe reflects" | Fix round F6 FQ-1 (decided by the T3 session): JS-context hit only inside a `<script>` element, per-context detail, two tests |
 | whole branch | Quality reviewer (final, native half) | Minor | `STOPPED.replacen` string surgery; public codec items and `matching`/`timing` modules with no out-of-crate consumer; `wire`/`send_body` copied from `h2.rs`; three hygiene nits | F6 FQ-2, FQ-3, FQ-5 fixed; FQ-4 accepted (T3 session for Matt, 2026-11-01): `h2.rs` is not a T3 file and the `send_body` divergence is real and commented |
 | whole branch | Quality reviewer (final, native half) | — | Every prior quality finding verified closed in the tree; F4/F5 code reads cleanly; no `unwrap`/`expect` on data paths, no `unsafe`, no `#[ignore]`, no synchronisation sleeps; 238 + 219 tests | Recorded |
+| whole branch | Spec reviewer (final, native half) | Minor | Plan text drift: Task 9 rapid-reset rule two-branch vs five; Task 10 still says `checks()` returns ten; Task 2 lists the deleted `TimingOracle`; `with_alpn_cache_ttl` absent from Task 1/A7 | Fixed by amendment A9 (plan text) |
+| whole branch | Spec reviewer (final, native half) | — | PASS for the native range against its plan tasks: T3 commits touch only T3 files (verified against both merge parents); integration-shared files and `scripts/bundled/**` untouched; every D8.2 behaviour present and tested; public API reconciled; A5 correctly deferred; open conditions for merge = Task 18 `wire.rs` swap + re-pin, A5 after T1b, Tasks 11-16 after T1b, ACs T3-1..T3-5 via Task 17 | Recorded |
 | 3 | Coder (Task 3 report) | Minor | ALPN cache and h2 pool are keyed by `host:port` without scheme; one sender driving `http://h:p` (h2c) and `https://h:p` would collide on one key | Fixed in eb5b1f40 (F1.2): `conn_key(scheme, authority)` for cache and pool; `negotiated_for(scheme, authority)`; two tests |
 | 1,2,4 | Coder (Tasks 2 and 4 reports) | Important (process) | Parallel coders share one git index; a `git add <path>` + bare `git commit` swept a sibling's staged files into commit 25a42279 | Fixed by the Task 4 coder (rebuilt as 013a338e, single file); every later brief requires `git commit -- <paths>`; orchestrator audits each commit's stat |
 
