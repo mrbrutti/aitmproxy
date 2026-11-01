@@ -31,7 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
     Body, Config, Flow, FlowStore, HeaderMap, HttpFlow, HttpRequest, HttpVersion, Proxy,
-    RequestSender,
+    RequestSender, ScopeConfig, ScopeEntry,
 };
 use aitm_proto_http::{CertAuthority, Http1Sender, HttpModule};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -322,13 +322,25 @@ async fn spawn_over_cap_origin(go: Arc<Notify>) -> Origin {
 /// Run a `Proxy` (the passive listener, which relays to any address without a
 /// scope gate) with the HTTP module (a fresh CA) and no plugins, on a loopback
 /// listener bound here before the proxy starts, so connections made at once
-/// queue until it accepts them. Returns the proxy address and the proxy's flow
-/// store (taken before the proxy moves into its task).
+/// queue until it accepts them. Scope is the decryption list (per-host
+/// decryption), so `127.0.0.1` is in Scope: the cleartext `CONNECT` tunnel here
+/// is served by the proxy — its `Expect` handling under test — rather than
+/// relayed byte for byte. Returns the proxy address and the proxy's flow store
+/// (taken before the proxy moves into its task).
 async fn run_proxy() -> (SocketAddr, Arc<dyn FlowStore>) {
     let ca = Arc::new(CertAuthority::load_or_generate(&temp_dir(), 0o600).expect("CA"));
     let module = HttpModule::with_ca(ca).with_insecure(true);
+    let config = Config {
+        scope: ScopeConfig {
+            entries: vec![ScopeEntry {
+                host: "127.0.0.1".to_string(),
+            }],
+            ..ScopeConfig::default()
+        },
+        ..Config::default()
+    };
     let proxy = Proxy::builder()
-        .with_config(Config::default())
+        .with_config(config)
         .register_module(Arc::new(module))
         .build()
         .expect("build proxy");

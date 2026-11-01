@@ -61,7 +61,8 @@ impl std::fmt::Display for AssembleError {
 impl std::error::Error for AssembleError {}
 
 /// The namespaces that ship to operators, in catalog order. Task 6 adds `l4`
-/// (the first consumer of the seam); Task 5 adds `http`/`browser`/`store`/`scope`.
+/// (the first consumer of the seam); scanner v2 T4 adds `ws` (its integration
+/// task re-pins this list and the golden); Task 5 adds `http`/`browser`/`store`/`scope`.
 /// The test namespace (`aitm-proto-test`) is deliberately absent — it must not
 /// pollute operator completion.
 ///
@@ -70,7 +71,10 @@ impl std::error::Error for AssembleError {}
 /// default deny-by-default guard so no live engagement state is required to
 /// describe the surface.
 pub fn production_languages() -> Vec<Box<dyn ProtocolLanguage>> {
-    vec![Box::new(aitm_proto_l4::L4Language::for_catalog())]
+    vec![
+        Box::new(aitm_proto_l4::L4Language::for_catalog()),
+        Box::new(aitm_scan_ws::language::WsLanguage::for_catalog()),
+    ]
 }
 
 /// Concatenate each language's [`NamespaceCatalog`] into `rhai.api.json`'s

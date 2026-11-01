@@ -20,73 +20,319 @@
 //! The [`l4`] module adds an **opt-in**, off-by-default loopback L4 service (UDP
 //! echo + minimal TCP) so the L4 operator surfaces have a real, in-scope target;
 //! its in-scope assets are declared in the grader-only [`l4_manifest`].
+//!
+//! [`TestTarget::builder`] adds the T10 scanner surfaces on the same shared state:
+//! TLS listeners (ALPN `h2`+`http/1.1` and `http/1.1`-only), the loopback
+//! control origin (spec D2) and the nine L4 speakers ([`L4Services`]).
 
 mod app;
+mod control;
 pub mod grader;
 pub mod l4;
+mod listeners;
+mod log;
 pub mod manifest;
+mod routes;
 mod seed;
+mod speakers;
+mod tls;
+mod ws;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
 pub use grader::{grade, GradeReport};
 pub use l4::{L4Config, L4Service};
-pub use manifest::{l4_manifest, manifest, manifest_yaml, L4Asset, PlantedVuln};
+pub use manifest::{
+    l4_manifest, manifest, manifest_yaml, seed_index, Discovery, L4Asset, PlantedVuln, SeedRoute,
+};
 pub use seed::SeedMode;
+pub use speakers::{L4Services, Proto, RunningService};
 
-/// A running test target: the bound loopback address plus the per-instance state
-/// its endpoints share (e.g. the stored-XSS comment store).
+/// A running test target: the bound loopback addresses plus the per-instance
+/// state its listeners share (comment store, sessions, control log).
+///
+/// Built by [`TestTarget::builder`]; [`TestTarget::start`] and
+/// [`TestTarget::start_on`] are the plain-HTTP shorthands the legacy suites use.
 pub struct TestTarget {
+    mode: SeedMode,
     base_url: String,
-    // Retained so the serving task lives as long as the target; dropping the
-    // target lets the accept loop wind down with it.
+    tls_url: Option<String>,
+    tls_h1_url: Option<String>,
+    control_url: Option<String>,
+    // Retained so the serving tasks live as long as the target; dropping the
+    // target lets the accept loops wind down with it.
     _state: Arc<app::AppState>,
+    // Dropping the target aborts every speaker task (and its connections).
+    l4: Option<L4Services>,
+    // The legacy UDP echo + minimal TCP pair ([`l4`]), started alongside the
+    // speakers under `l4(true)` so `/services` lists it (spec D2); dropping
+    // the target aborts its loops too.
+    _legacy_l4: Option<L4Service>,
+}
+
+/// Which listeners a [`TestTarget`] starts (spec D1 "Library" row). Every port
+/// is loopback-only; `0` means an ephemeral port. A listener whose setter was
+/// never called is not started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TargetBuilder {
+    mode: SeedMode,
+    port: u16,
+    tls: Option<u16>,
+    tls_h1: Option<u16>,
+    control: Option<u16>,
+    l4: bool,
+}
+
+impl TargetBuilder {
+    /// Plain HTTP/1 port (default `0`, always started).
+    pub fn port(mut self, p: u16) -> Self {
+        self.port = p;
+        self
+    }
+
+    /// Start the TLS listener (ALPN `h2`, `http/1.1`) on `p`.
+    pub fn tls(mut self, p: u16) -> Self {
+        self.tls = Some(p);
+        self
+    }
+
+    /// Start the TLS listener (ALPN `http/1.1` only) on `p`.
+    pub fn tls_h1(mut self, p: u16) -> Self {
+        self.tls_h1 = Some(p);
+        self
+    }
+
+    /// Start the control origin (spec D2) on `p`.
+    pub fn control(mut self, p: u16) -> Self {
+        self.control = Some(p);
+        self
+    }
+
+    /// Start every L4 speaker on an ephemeral port. Requires [`control`](Self::control).
+    pub fn l4(mut self, on: bool) -> Self {
+        self.l4 = on;
+        self
+    }
+
+    /// Bind and start the listeners in the order plain, tls, tls_h1, control,
+    /// l4 (the nine speakers, then the legacy `l4-udp-echo` / `l4-tcp-service`
+    /// pair), returning once every one is accepting. `l4(true)` without
+    /// `control(..)` is `InvalidInput` (`l4 needs control`) and binds nothing;
+    /// a bind error is returned as-is (a serve process must report a port
+    /// clash cleanly).
+    pub async fn start(self) -> std::io::Result<TestTarget> {
+        if self.l4 && self.control.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "l4 needs control",
+            ));
+        }
+        let mode = self.mode;
+        let log = log::ControlLog::new(mode);
+        let state = Arc::new(app::AppState::new(mode, log.clone()));
+
+        let plain = bind_plain(self.port, state.clone()).await?;
+        let base_url = format!("http://{plain}");
+
+        // One self-signed certificate per process (spec D1), shared by both
+        // TLS listeners; minted only when one of them is asked for.
+        let identity = if self.tls.is_some() || self.tls_h1.is_some() {
+            Some(tls::self_signed()?)
+        } else {
+            None
+        };
+        let mut tls_url = None;
+        if let (Some(port), Some(identity)) = (self.tls, &identity) {
+            let addr = tls::bind(log::Listener::Tls, port, state.clone(), identity).await?;
+            tls_url = Some(format!("https://{addr}"));
+        }
+        let mut tls_h1_url = None;
+        if let (Some(port), Some(identity)) = (self.tls_h1, &identity) {
+            let addr = tls::bind(log::Listener::TlsH1, port, state.clone(), identity).await?;
+            tls_h1_url = Some(format!("https://{addr}"));
+        }
+        let mut control_url = None;
+        if let Some(port) = self.control {
+            let addr = control::bind(port, log.clone()).await?;
+            control_url = Some(format!("http://{addr}"));
+        }
+        let (l4, legacy_l4) = if self.l4 {
+            let speakers = L4Services::start(mode, log.clone()).await?;
+            let legacy = L4Service::try_start().await?;
+            for row in legacy_l4_rows(legacy.udp_addr(), legacy.tcp_addr()) {
+                log.register_service(row);
+            }
+            (Some(speakers), Some(legacy))
+        } else {
+            (None, None)
+        };
+
+        Ok(TestTarget {
+            mode,
+            base_url,
+            tls_url,
+            tls_h1_url,
+            control_url,
+            _state: state,
+            l4,
+            _legacy_l4: legacy_l4,
+        })
+    }
+}
+
+/// The `/services` rows for the legacy L4 pair (spec D2: `--l4` also lists
+/// `l4-udp-echo` and `l4-tcp-service`, `role == "l4"`, `"grammar": null`).
+fn legacy_l4_rows(udp_addr: SocketAddr, tcp_addr: SocketAddr) -> [log::ServiceInfo; 2] {
+    [
+        log::ServiceInfo {
+            name: "l4-udp-echo".to_string(),
+            proto: "udp",
+            addr: udp_addr,
+            role: "l4",
+            alpn: None,
+            grammar: None,
+        },
+        log::ServiceInfo {
+            name: "l4-tcp-service".to_string(),
+            proto: "tcp",
+            addr: tcp_addr,
+            role: "l4",
+            alpn: None,
+            grammar: None,
+        },
+    ]
+}
+
+/// Bind the plain HTTP/1 listener on loopback `port`, register it as the
+/// `http` service (spec D2 `/services`) and spawn its accept loop.
+async fn bind_plain(port: u16, state: Arc<app::AppState>) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    let addr = listener.local_addr()?;
+    state.log.register_service(log::ServiceInfo {
+        name: "http".to_string(),
+        proto: "tcp",
+        addr,
+        role: "http",
+        alpn: Some(vec!["http/1.1"]),
+        grammar: None,
+    });
+
+    tokio::spawn(listeners::accept_loop(listener, move |stream, _peer| {
+        let conn_state = state.clone();
+        async move { app::serve_connection(stream, conn_state).await }
+    }));
+    Ok(addr)
 }
 
 impl TestTarget {
-    /// Bind a fresh loopback port, start serving `mode`, and return once the
-    /// listener is accepting. Each call is an independent origin with its own
-    /// state, so a vulnerable target and its patched control can run at once.
+    /// A builder for a target in `mode` with only the plain listener enabled.
+    pub fn builder(mode: SeedMode) -> TargetBuilder {
+        TargetBuilder {
+            mode,
+            port: 0,
+            tls: None,
+            tls_h1: None,
+            control: None,
+            l4: false,
+        }
+    }
+
+    /// Bind a fresh loopback port, start serving `mode` over plain HTTP, and
+    /// return once the listener is accepting. Each call is an independent origin
+    /// with its own state, so a vulnerable target and its patched control can
+    /// run at once.
     pub async fn start(mode: SeedMode) -> TestTarget {
-        TestTarget::start_on(mode, 0)
+        TestTarget::builder(mode)
+            .start()
             .await
             .expect("bind loopback test target")
     }
 
-    /// Bind loopback `port` (0 = an ephemeral port), start serving `mode`, and
-    /// return once the listener is accepting. Like [`start`](Self::start) but with
-    /// the port chosen by the caller, so the standalone serve binary can expose a
-    /// fixed, operator-chosen port. Returns the bind error rather than panicking,
-    /// since a serve process must report a port clash cleanly.
+    /// Bind loopback `port` (0 = an ephemeral port), start serving `mode` over
+    /// plain HTTP, and return once the listener is accepting. Like
+    /// [`start`](Self::start) but with the port chosen by the caller. Returns the
+    /// bind error rather than panicking.
     pub async fn start_on(mode: SeedMode, port: u16) -> std::io::Result<TestTarget> {
-        let listener = TcpListener::bind(("127.0.0.1", port)).await?;
-        let addr = listener.local_addr().expect("local addr");
-        let base_url = format!("http://{addr}");
-        let state = Arc::new(app::AppState::new(mode));
-
-        let serve_state = state.clone();
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    continue;
-                };
-                let conn_state = serve_state.clone();
-                tokio::spawn(async move {
-                    app::serve_connection(stream, conn_state).await;
-                });
-            }
-        });
-
-        Ok(TestTarget {
-            base_url,
-            _state: state,
-        })
+        TestTarget::builder(mode).port(port).start().await
     }
 
     /// The `http://127.0.0.1:PORT` origin this instance is serving on.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// The `https://127.0.0.1:PORT` TLS (ALPN `h2`, `http/1.1`) origin, if started.
+    pub fn tls_url(&self) -> Option<&str> {
+        self.tls_url.as_deref()
+    }
+
+    /// The `https://127.0.0.1:PORT` TLS (ALPN `http/1.1` only) origin, if started.
+    pub fn tls_h1_url(&self) -> Option<&str> {
+        self.tls_h1_url.as_deref()
+    }
+
+    /// The `http://127.0.0.1:PORT` control origin (spec D2), if started.
+    pub fn control_url(&self) -> Option<&str> {
+        self.control_url.as_deref()
+    }
+
+    /// The running L4 speakers in spec D5 table order; empty unless
+    /// the builder's `l4(true)` was set. The legacy `l4-udp-echo` /
+    /// `l4-tcp-service` pair is not in this list; it is reachable through the
+    /// control origin's `/services`.
+    pub fn l4_services(&self) -> &[RunningService] {
+        self.l4.as_ref().map(L4Services::services).unwrap_or(&[])
+    }
+
+    /// The seed mode this target serves.
+    pub fn mode(&self) -> SeedMode {
+        self.mode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn builder_l4_without_control_is_invalid_input() {
+        let err = match TestTarget::builder(SeedMode::Vulnerable)
+            .l4(true)
+            .start()
+            .await
+        {
+            Ok(_) => panic!("l4 without a control origin must be refused"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "l4 needs control");
+    }
+
+    /// The legacy pair's `/services` rows (spec D2: `l4-udp-echo` / `udp`,
+    /// `l4-tcp-service` / `tcp`, both `role == "l4"` with `grammar: null` and
+    /// no `alpn`). The socket-level proof that `l4(true)` registers them is
+    /// A21's `services_lists_everything`; this pins the row shape without a bind.
+    #[test]
+    fn legacy_l4_rows_match_d2() {
+        let udp: SocketAddr = "127.0.0.1:40001".parse().expect("literal addr");
+        let tcp: SocketAddr = "127.0.0.1:40002".parse().expect("literal addr");
+        let [udp_row, tcp_row] = legacy_l4_rows(udp, tcp);
+
+        assert_eq!(udp_row.name, "l4-udp-echo");
+        assert_eq!(udp_row.proto, "udp");
+        assert_eq!(udp_row.addr, udp);
+        assert_eq!(udp_row.role, "l4");
+        assert_eq!(udp_row.alpn, None);
+        assert_eq!(udp_row.grammar, None);
+
+        assert_eq!(tcp_row.name, "l4-tcp-service");
+        assert_eq!(tcp_row.proto, "tcp");
+        assert_eq!(tcp_row.addr, tcp);
+        assert_eq!(tcp_row.role, "l4");
+        assert_eq!(tcp_row.alpn, None);
+        assert_eq!(tcp_row.grammar, None);
     }
 }
