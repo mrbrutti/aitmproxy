@@ -41,6 +41,8 @@ use aitm_core::{
     CallerTrust, Event, EventSink, FlowCtx, FlowError, FlowId, LimitConfig, Plugin, Registry,
     Verdict,
 };
+use aitm_scan_model::registry::CheckRegistry;
+use aitm_scan_model::vocab::CheckOrigin;
 use arc_swap::ArcSwap;
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, Scope, AST};
 
@@ -80,6 +82,11 @@ pub struct LoadedScript {
     options: ArcSwap<Options>,
     budget: Budget,
     errors: Arc<ErrorSink>,
+    /// The catalogue this script's `reg.add_check` declarations land in, and
+    /// where the script came from. `None` for a host built without a scanner;
+    /// `run_load` then reports an `add_check` as a load error instead of
+    /// dropping it (spec D4, plan call B9).
+    checks: Option<(Arc<CheckRegistry>, CheckOrigin)>,
 }
 
 /// A loaded script's identity and its live AST — the hot-reload seam. The
@@ -285,6 +292,17 @@ impl LoadedScript {
             options: ArcSwap::from_pointee(options),
             budget: Budget::of(cfg),
             errors: Arc::default(),
+            checks: None,
+        }
+    }
+
+    /// Register this script's `reg.add_check` checks into `checks` under
+    /// `origin`. The loader hands every script the one registry it owns, so a
+    /// reload of this script replaces exactly its own entries.
+    pub fn with_checks(self, checks: Arc<CheckRegistry>, origin: CheckOrigin) -> Self {
+        Self {
+            checks: Some((checks, origin)),
+            ..self
         }
     }
 
@@ -347,6 +365,9 @@ impl LoadedScript {
             .with_options((**self.options.load()).clone())
             .with_budget(self.budget)
             .with_caller(self.handle.authoring_trust());
+        if let Some((checks, origin)) = &self.checks {
+            handle = handle.with_checks(Arc::clone(checks), origin.clone());
+        }
         if let Err(err) = handle.run_load(&self.engine, &ast) {
             tracing::error!(target: SCRIPT_TARGET, script = %self.meta.name, "{err}");
             // `script.list` shows it as `last_error`, like a failed hook; a

@@ -23,8 +23,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use aitm_core::{
     CallerTrust, Command, CommandHost, ParamDef, ParamSchema, Params, Registry, TypeDesc, Value,
 };
+use aitm_scan_model::registry::CheckRegistry;
+use aitm_scan_model::vocab::CheckOrigin;
 use rhai::{CallFnOptions, Dynamic, Engine, EvalAltResult, FnPtr, Position, Scope, AST};
 
+use crate::check_bridge::checks_from_collected;
 use crate::engine::{begin_run, blocking, enter_constants, Budget, RunKind};
 use crate::error::ScriptError;
 use crate::host_core::Options;
@@ -134,6 +137,11 @@ pub struct ScriptRegHandle<'a> {
     options: Options,
     budget: Budget,
     caller: CallerTrust,
+    /// The catalogue a `reg.add_check` lands in, and where the script came
+    /// from. `None` for a host that runs scripts without a scanner; such a host
+    /// has nothing to schedule a check with, so `add_check` is reported as a
+    /// load error rather than silently dropped.
+    checks: Option<(Arc<CheckRegistry>, CheckOrigin)>,
 }
 
 impl<'a> ScriptRegHandle<'a> {
@@ -150,7 +158,20 @@ impl<'a> ScriptRegHandle<'a> {
             options: Options::default(),
             budget: Budget::default(),
             caller: CallerTrust::Agent,
+            checks: None,
         }
+    }
+
+    /// Land every `reg.add_check(meta, closure)` this script declares in
+    /// `checks`, tagged with `origin` (spec D4, plan call B9).
+    ///
+    /// The registry is keyed by the script's name, so re-running `load` for one
+    /// script replaces exactly that script's checks and leaves every other
+    /// source alone — the reload path. An id another source already owns is
+    /// refused, not shadowed: a class is single-sourced by design.
+    pub fn with_checks(mut self, checks: Arc<CheckRegistry>, origin: CheckOrigin) -> Self {
+        self.checks = Some((checks, origin));
+        self
     }
 
     /// Start from the script's configured options (the config entry's
@@ -219,6 +240,27 @@ impl<'a> ScriptRegHandle<'a> {
         .map_err(|err| ScriptError::from_eval(&script, LOAD_HOOK, &err, &self.budget))?;
 
         let collected = collector.take();
+
+        // Checks first, and all or nothing: a meta the catalogue cannot
+        // classify is a load error naming the key (spec D4), and a script
+        // refused for one bad check installs none of its commands either —
+        // the same effect model a throwing `load` has.
+        let checks = self.convert_checks(collected.checks, engine, ast, &script)?;
+        if let Some((registry, _)) = &self.checks {
+            let duplicates = registry.replace_source(&script, checks);
+            if let Some(duplicate) = duplicates.first() {
+                return Err(ScriptError::CheckMeta {
+                    script: script.clone(),
+                    check: Some(duplicate.id.clone()),
+                    key: "id".to_string(),
+                    message: format!(
+                        "check `{}` is already registered by source `{}`",
+                        duplicate.id, duplicate.existing_source
+                    ),
+                });
+            }
+        }
+
         for (name, default, desc) in collected.options {
             self.reg.add_option(&name, default.clone(), &desc);
             if self.options.get(&name).is_none() {
@@ -238,6 +280,44 @@ impl<'a> ScriptRegHandle<'a> {
             }));
         }
         Ok(())
+    }
+
+    /// Turn what `reg.add_check` collected into catalogue checks, or report the
+    /// first one the catalogue cannot classify. A script that declares a check
+    /// while the host runs no scanner is a configuration mistake worth saying
+    /// out loud, not a silent no-op.
+    fn convert_checks(
+        &self,
+        collected: Vec<(rhai::Map, FnPtr)>,
+        engine: &Arc<Engine>,
+        ast: &Arc<AST>,
+        script: &str,
+    ) -> Result<Vec<Arc<dyn aitm_scan_model::traits::Check>>, ScriptError> {
+        let Some((_, origin)) = &self.checks else {
+            if collected.is_empty() {
+                return Ok(Vec::new());
+            }
+            return Err(ScriptError::CheckMeta {
+                script: script.to_string(),
+                check: collected
+                    .first()
+                    .and_then(|(map, _)| map.get("id"))
+                    .and_then(|id| id.clone().into_string().ok()),
+                key: "id".to_string(),
+                message: "this build has no check catalogue to register a check in; \
+                          reg.add_check needs the scanner"
+                    .to_string(),
+            });
+        };
+        checks_from_collected(
+            collected,
+            origin,
+            engine,
+            ast,
+            &self.options,
+            self.budget,
+            script,
+        )
     }
 
     /// The script's options after `load`: config values plus declared defaults.
@@ -262,6 +342,9 @@ struct Collected {
     commands: Vec<(String, String, FnPtr)>,
     /// `(name, default, description)` in registration order.
     options: Vec<(String, Value, String)>,
+    /// `(meta map, closure)` in registration order: the checks the script
+    /// declared with `reg.add_check`, validated after `load` returns.
+    checks: Vec<(rhai::Map, FnPtr)>,
 }
 
 impl RegCollector {
@@ -295,6 +378,23 @@ pub fn register_reg_api(engine: &mut Engine) {
                 reg.lock()
                     .commands
                     .push((name.to_string(), desc.to_string(), func));
+                Ok(())
+            },
+        )
+        .register_fn(
+            "add_check",
+            |reg: &mut RegCollector,
+             meta: rhai::Map,
+             func: FnPtr|
+             -> Result<(), Box<EvalAltResult>> {
+                if meta.is_empty() {
+                    return Err(reg_error(
+                        "reg.add_check(meta, |point| …) needs a metadata map: \
+                         id, name, class, lanes, kinds, intensity, cost, technique, \
+                         severity, confidence_max, description",
+                    ));
+                }
+                reg.lock().checks.push((meta, func));
                 Ok(())
             },
         )

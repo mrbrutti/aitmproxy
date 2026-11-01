@@ -35,6 +35,7 @@ pub use catalog_assembly::{
     assemble_namespaces, assemble_poc_steps, poc_face_drift, production_languages,
     vocabulary_consistent, AssembleError, PocFaceDrift,
 };
+pub use check_bridge::{meta_from_map, poc_hint_from_map, verdict_from_dynamic, ScriptCheck};
 pub use command::{register_reg_api, ScriptCommand, ScriptRegHandle};
 pub use commands::ScriptCommands;
 pub use config::{RhaiConfig, RhaiLimits, ScriptEntry, ScriptMeta};
@@ -48,6 +49,7 @@ pub use host_core::{
     Finding, FindingSink, MemoryFindingSink, Options, ScriptCapability, ScriptServices,
 };
 pub use host_net::with_client;
+pub use host_probe::{levenshtein_ratio, timing_fit, CheckCtx, ProbeCapability, TimingFit};
 pub use host_registry::{registered_host_fns, seed_call_context, CallContextGuard, HostRegistry};
 pub use loader::{RhaiLoader, SUPPORTED_API};
 pub use plugin::{ErrorSink, LoadedScript, ScriptHandle, ScriptHost, ScriptSet};
