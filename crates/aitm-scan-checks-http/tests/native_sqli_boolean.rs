@@ -790,3 +790,35 @@ async fn a_true_arm_that_changes_a_stable_page_is_not_a_hit() {
 
     assert_eq!(verdict.outcome, Outcome::Clean, "{}", verdict.detail);
 }
+
+/// A point that answers 5xx to both arms of a pair is breaking the query, not
+/// evaluating a condition: that is the error-based check's finding. The check
+/// stops at that pair with an Inconclusive that says so, instead of spending
+/// the remaining pairs on server errors the host's error ladder counts (live
+/// run 2026-11-01: the seeded error-based `/products` tripped the ladder for
+/// the whole job).
+#[tokio::test]
+async fn a_pair_answered_5xx_on_both_arms_ends_the_point_as_error_based_territory() {
+    let host = ScriptedHost::new()
+        .with_baseline(html(200, "<p>product 1</p>"))
+        .on(EXAMPLE, html(200, "<p>product 1</p>"))
+        .on("1=1", html(200, "<p>product 1</p>"))
+        .on("1=2", html(200, "<p>product 1</p>"))
+        .on("'1'='1", html(500, "<pre>SQL syntax error</pre>"))
+        .on("'1'='2", html(500, "<pre>SQL syntax error</pre>"))
+        .with_fallback(html(200, "<p>product 1</p>"));
+    let point = point(InsertionKind::Query, "id", TARGET_URL);
+
+    let verdict = sqli().run(&point, &host).await;
+
+    assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+    assert!(
+        verdict.detail.starts_with(
+            "the point answered 5xx to both arms of \"' AND '1'='1\" / \"' AND '1'='2\""
+        ),
+        "{}",
+        verdict.detail
+    );
+    // Control, the numeric pair, the quoted pair: nothing after the 5xx pair.
+    assert_eq!(host.sent().len(), 5, "{:?}", host.sent());
+}

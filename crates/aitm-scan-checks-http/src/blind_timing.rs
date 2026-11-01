@@ -350,12 +350,19 @@ impl Check for TimingCheck {
             // than by the job stopping. They cost their probes and taught
             // nothing, so they may not be counted as a quiet target.
             let mut abandoned = 0usize;
+            // Families whose first probe the server answered with a 5xx. The
+            // payload breaks the query rather than delaying it — the
+            // error-based check's finding — and every further delay probe
+            // would be one more server error for a host whose error ladder
+            // the job shares with every other check (live run 2026-11-01).
+            let mut errored = 0usize;
 
             for family in families {
                 let mut requested: Vec<f32> = Vec::with_capacity(delays.len());
                 let mut observed: Vec<u32> = Vec::with_capacity(delays.len());
                 let mut probe_flows: Vec<FlowRef> = Vec::new();
                 let mut refused_here = 0usize;
+                let mut attempted_here = 0usize;
 
                 for delay in delays {
                     if !may_send(host, 1) {
@@ -369,6 +376,7 @@ impl Check for TimingCheck {
                         bytes: None,
                     };
                     tally.attempted();
+                    attempted_here += 1;
                     let Ok(resp) = host.probe(&payload).await else {
                         // One refused probe is not a verdict, but it does cost
                         // this family its complete series.
@@ -376,6 +384,12 @@ impl Check for TimingCheck {
                         refused_here += 1;
                         continue;
                     };
+                    if resp.status.is_some_and(|status| status >= 500) {
+                        errored += 1;
+                        // The rest of this family leaves the plan on purpose.
+                        tally.skipped(delays.len().saturating_sub(attempted_here));
+                        break;
+                    }
                     requested.push(delay);
                     observed.push(resp.elapsed_ms);
                     probe_flows.extend(resp.flow);
@@ -399,6 +413,18 @@ impl Check for TimingCheck {
 
             if let Some(unfinished) = tally.unfinished() {
                 return unfinished;
+            }
+            if errored > 0 {
+                let was = if errored == 1 { "was" } else { "were" };
+                return no_finding(
+                    Outcome::Inconclusive,
+                    format!(
+                        "{errored} of {total} payload families {was} answered 5xx on the first \
+                         probe and abandoned: the payload breaks the query rather than delaying \
+                         it, which is the error-based check's territory, so no delay was measured",
+                        total = families.len()
+                    ),
+                );
             }
             // Every probe the plan asked for was sent, but a family that lost
             // one of them was never fitted. `Clean` would claim the response

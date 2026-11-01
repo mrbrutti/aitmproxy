@@ -326,6 +326,13 @@ enum PairOutcome {
     Miss,
     /// One of the two arms was refused; nothing was learned.
     Failed,
+    /// Both arms were answered with a 5xx: the payload breaks the query
+    /// rather than being evaluated as a condition. That is the error-based
+    /// check's finding, not a boolean differential, and every further pair
+    /// would be one more server error for a host whose error ladder the job
+    /// shares with every other check (live run 2026-11-01: the seeded
+    /// error-based `/products` tripped the per-host ladder for the whole job).
+    Errored,
 }
 
 impl SqliBoolean {
@@ -346,6 +353,9 @@ impl SqliBoolean {
         let Some(f) = send_condition(host, false_arm).await else {
             return PairOutcome::Failed;
         };
+        if is_server_error(&t) && is_server_error(&f) {
+            return PairOutcome::Errored;
+        }
         let run = PairRun {
             true_len: body_len(&t),
             false_len: body_len(&f),
@@ -360,6 +370,11 @@ impl SqliBoolean {
             PairOutcome::Miss
         }
     }
+}
+
+/// Whether the server answered with a 5xx.
+fn is_server_error(resp: &ProbeResponse) -> bool {
+    resp.status.is_some_and(|status| status >= 500)
 }
 
 /// Append `condition` to the point's value and return the response, or `None`
@@ -552,6 +567,17 @@ impl Check for SqliBoolean {
                         tally.refused();
                         continue;
                     }
+                    PairOutcome::Errored => {
+                        return no_finding(
+                            Outcome::Inconclusive,
+                            format!(
+                                "the point answered 5xx to both arms of \"{true_arm}\" / \
+                                 \"{false_arm}\": the payload breaks the query rather than \
+                                 being evaluated as a condition, which is the error-based \
+                                 check's territory, not a boolean differential"
+                            ),
+                        );
+                    }
                 };
 
                 // Step 4: repeat the candidate until `Accuracy` is satisfied.
@@ -577,7 +603,7 @@ impl Check for SqliBoolean {
                         // all. Treating it as a miss would let a refused
                         // request end the run `Clean` over a candidate SQL
                         // injection, so the run stops here and says so.
-                        PairOutcome::Failed => {
+                        PairOutcome::Failed | PairOutcome::Errored => {
                             return no_finding(
                                 Outcome::Inconclusive,
                                 format!(

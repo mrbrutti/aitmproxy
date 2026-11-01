@@ -108,6 +108,13 @@ impl ProbeTally {
         self.failed += 1;
     }
 
+    /// `n` planned stimuli the check decided not to send — a family abandoned
+    /// after a 5xx, say. They leave the plan, so a run that skipped them on
+    /// purpose is not read as a run the job cut short.
+    pub(crate) fn skipped(&mut self, n: usize) {
+        self.planned = self.planned.saturating_sub(n);
+    }
+
     /// The verdict for a run that did not reach its own plan, in this order:
     ///
     /// 1. **stopped early** — fewer stimuli were attempted than planned, so
