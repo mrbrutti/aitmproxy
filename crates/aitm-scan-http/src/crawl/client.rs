@@ -46,12 +46,12 @@ use crate::crawl::frontier::{
 };
 use crate::crawl::values::{form_action, form_pairs_for};
 use crate::limits::{job_mark, MARK_CRAWL, MAX_DOM_BYTES, USER_AGENT};
-use crate::url_norm::{guard_authority, origin_key, resolve, same_origin};
+use crate::url_norm::{guard_authority, origin_key, parts, resolve, same_origin};
 use crate::{multipart, params, redact, session};
 
-/// What the crawler says it accepts; a target that content-negotiates answers
+/// What a page fetch says it accepts; a target that content-negotiates answers
 /// the HTML the crawler can actually read (call **A13**).
-const ACCEPT: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
+pub(crate) const ACCEPT_HTML: &str = "text/html,application/xhtml+xml,*/*;q=0.8";
 
 /// The crawl engine that fetches pages with the job's HTTP client.
 pub(crate) struct ClientCrawler;
@@ -169,7 +169,7 @@ impl<'a> Run<'a> {
                 );
                 continue;
             }
-            let Some(request) = get_request(&url) else {
+            let Some(request) = crawl_get(&url, ACCEPT_HTML) else {
                 continue;
             };
             if let Some(flow) = self.send(request, &url, left).await {
@@ -407,7 +407,7 @@ fn submission_for(
     }
     let encoded = params::serialize_form(pairs);
     action.set_query((!encoded.is_empty()).then_some(encoded.as_str()));
-    let request = get_request(&action)?;
+    let request = crawl_get(&action, ACCEPT_HTML)?;
     Some(Submission {
         request,
         url: action,
@@ -481,12 +481,16 @@ fn multipart_body(form: &FormSpec, pairs: &[(String, String)], marker: &str) -> 
     (boundary, body)
 }
 
-/// A crawl `GET` for `url`: no body, the crawler's own `Accept` and
-/// `User-Agent`, `Host` from the URL's own authority. `None` when the URL has
-/// no host, which [`resolve`] already refuses.
-fn get_request(url: &Url) -> Option<HttpRequest> {
+/// A crawl `GET` for `url`: no body, `accept` as its `Accept`, the crawler's
+/// own `User-Agent`, `Host` from the URL's own authority. `None` when the URL
+/// has no host, which [`resolve`] already refuses.
+///
+/// The one builder for every `GET` the crawl makes — a page fetch, a `GET`
+/// form submission, a `robots.txt` or sitemap read (Q3) — so the two engines
+/// and the seed reader cannot drift apart on what a crawl request looks like.
+pub(crate) fn crawl_get(url: &Url, accept: &str) -> Option<HttpRequest> {
     let (authority, path) = parts(url)?;
-    let headers = base_headers(&authority);
+    let headers = base_headers(&authority, accept);
     Some(HttpRequest {
         method: "GET".to_string(),
         scheme: url.scheme().to_string(),
@@ -503,7 +507,7 @@ fn get_request(url: &Url) -> Option<HttpRequest> {
 /// own length.
 fn post_request(url: &Url, content_type: &str, body: &[u8]) -> Option<HttpRequest> {
     let (authority, path) = parts(url)?;
-    let mut headers = base_headers(&authority);
+    let mut headers = base_headers(&authority, ACCEPT_HTML);
     headers.set("content-type", content_type);
     headers.set("content-length", &body.len().to_string());
     Some(HttpRequest {
@@ -518,25 +522,11 @@ fn post_request(url: &Url, content_type: &str, body: &[u8]) -> Option<HttpReques
     })
 }
 
-/// A URL's `host[:port]` and its request target (`path` with the query).
-fn parts(url: &Url) -> Option<(String, String)> {
-    let host = url.host_str()?;
-    let authority = match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    };
-    Some((authority, path))
-}
-
 /// The headers every crawl request carries.
-fn base_headers(authority: &str) -> HeaderMap {
+fn base_headers(authority: &str, accept: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.set("host", authority);
-    headers.set("accept", ACCEPT);
+    headers.set("accept", accept);
     headers.set("user-agent", USER_AGENT);
     headers
 }
@@ -607,6 +597,23 @@ mod tests {
             .crawl(&origin(), vec![origin()], job, &limits)
             .await
             .expect("the client crawl answers a report")
+    }
+
+    /// Q3: one builder for every crawl `GET`, page fetch and seed read alike.
+    #[test]
+    fn crawl_get_pins() {
+        let req = crawl_get(&parse_absolute("http://t:8080/a?b=1").unwrap(), ACCEPT_HTML)
+            .expect("an absolute URL builds a request");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.scheme, "http");
+        assert_eq!(req.authority, "t:8080");
+        assert_eq!(req.path, "/a?b=1");
+        assert_eq!(req.version, HttpVersion::Http11);
+        assert_eq!(req.headers.get("host"), Some("t:8080"));
+        assert_eq!(req.headers.get("accept"), Some(ACCEPT_HTML));
+        assert_eq!(req.headers.get("user-agent"), Some("aitm-scan"));
+        assert!(matches!(req.body, Body::Empty));
+        assert_eq!(ACCEPT_HTML, "text/html,application/xhtml+xml,*/*;q=0.8");
     }
 
     #[tokio::test]

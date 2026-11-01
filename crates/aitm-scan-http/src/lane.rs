@@ -369,10 +369,12 @@ async fn crawl_origin(
         return Ok(Vec::new());
     };
 
+    // The same options the client engine sends its pages with: recorded,
+    // marked, and on the profile's HTTP version (Sp2).
     let send = SendOptions {
         record: RecordPolicy::Always,
         marks: vec![job_mark.to_string(), MARK_CRAWL.to_string()],
-        ..SendOptions::default()
+        version: job.profile().http.version.into(),
     };
     let client = job.client();
     let mut seeds = vec![origin_root(origin)];
@@ -1041,6 +1043,41 @@ mod tests {
                 .collect::<BTreeSet<String>>()
         );
         assert_eq!(client.sent.lock().unwrap().len(), 0);
+    }
+
+    // --- Sp2: every crawl send honours the profile's HTTP version ------------
+
+    /// `http.version: h1` reaches the seed fetches and the crawl GETs alike:
+    /// the lane builds the seed `SendOptions` from the profile, not from
+    /// `SendOptions::default()`.
+    #[tokio::test]
+    async fn seed_sends_honour_the_profile_http_version() {
+        let client = Arc::new(site(&fixture_pages()));
+        let job = FakeJob::new(
+            profile(|p| {
+                p.crawl.use_browser = UseBrowser::Never;
+                p.crawl.robots = true;
+                p.crawl.sitemap = true;
+                p.http.version = aitm_scan_model::HttpVersionPolicy::H1;
+            }),
+            Arc::clone(&client),
+        );
+
+        let _ = discover(&job, &[ORIGIN]).await;
+
+        let sent = client.sent.lock().unwrap();
+        assert!(sent.iter().any(|(req, _)| req.path == "/robots.txt"));
+        assert!(sent.iter().any(|(req, _)| req.path == "/sitemap.xml"));
+        assert!(sent.iter().any(|(req, _)| req.path == "/a"));
+        for (req, opts) in sent.iter() {
+            assert_eq!(
+                opts.version,
+                aitm_core::VersionPolicy::H1,
+                "{} went out with {:?}",
+                req.path,
+                opts.version
+            );
+        }
     }
 
     // --- S-M7: the stored pass is capped, newest first, request only ---------

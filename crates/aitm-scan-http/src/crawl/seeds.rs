@@ -25,17 +25,21 @@
 //! line is pinned as *not* fetched.
 
 use std::collections::HashSet;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
-use aitm_core::{Body, HeaderMap, HttpRequest, HttpVersion, ProxyClient, SendOptions};
+use aitm_core::{ProxyClient, SendOptions};
 use aitm_scan_model::{CrawlOptions, SessionMaterial};
 use url::Url;
 
+use crate::crawl::client::crawl_get;
 use crate::limits::{
     MAX_AWAIT, MAX_BODY_PARSE_BYTES, MAX_SEED_URLS, MAX_SITEMAPS_FOLLOWED, MAX_SITEMAP_URLS,
-    USER_AGENT,
 };
 use crate::{params, redact, session, url_norm};
+
+/// What a seed read says it accepts: the two files are text and XML, never a
+/// page.
+const ACCEPT_SEEDS: &str = "text/plain,application/xml,text/xml,*/*;q=0.8";
 
 /// What a `robots.txt` offered: paths worth crawling and sitemaps worth reading.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -265,7 +269,7 @@ async fn fetch(
         return None;
     }
 
-    let mut req = get_request(url)?;
+    let mut req = crawl_get(url, ACCEPT_SEEDS)?;
     if let Some(material) = material {
         session::apply_session(&mut req, material);
     }
@@ -298,44 +302,13 @@ async fn fetch(
     Some(String::from_utf8_lossy(&bytes[..end]).into_owned())
 }
 
-/// A bare `GET` for `url`: no caching headers, no body, `Host` from the URL's
-/// own authority. `None` when the URL has no host, which [`url_norm::resolve`]
-/// already refuses.
-fn get_request(url: &Url) -> Option<HttpRequest> {
-    let host = url.host_str()?;
-    let authority = match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    };
-    let path = match url.query() {
-        Some(query) => format!("{}?{query}", url.path()),
-        None => url.path().to_string(),
-    };
-
-    let mut headers = HeaderMap::new();
-    headers.set("host", &authority);
-    headers.set("accept", "text/plain,application/xml,text/xml,*/*;q=0.8");
-    headers.set("user-agent", USER_AGENT);
-
-    Some(HttpRequest {
-        method: "GET".to_string(),
-        scheme: url.scheme().to_string(),
-        authority,
-        path,
-        version: HttpVersion::Http11,
-        headers,
-        body: Body::Empty,
-        timestamp: SystemTime::now(),
-    })
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::limits::MARK_CRAWL;
+    use crate::limits::{MARK_CRAWL, USER_AGENT};
     use crate::testutil::{response, ScriptedClient, JOB_ID};
-    use aitm_core::{HttpRequest, RecordPolicy};
+    use aitm_core::{HttpRequest, RecordPolicy, VersionPolicy};
     use std::time::Duration;
 
     /// The `robots.txt` of the plan's `robots_pins`, verbatim.
@@ -406,7 +379,7 @@ mod tests {
         SendOptions {
             record: RecordPolicy::Always,
             marks: vec![format!("scan:{JOB_ID}"), MARK_CRAWL.to_string()],
-            ..SendOptions::default()
+            version: VersionPolicy::H1,
         }
     }
 
@@ -456,7 +429,12 @@ mod tests {
         for (req, opts) in client.sent.lock().unwrap().iter() {
             assert_eq!(req.method, "GET");
             assert_eq!(req.headers.get("cookie"), Some("sid=S3"));
+            assert_eq!(req.headers.get("user-agent"), Some(USER_AGENT));
+            assert_eq!(req.headers.get("accept"), Some(ACCEPT_SEEDS));
+            assert_eq!(req.headers.get("host"), Some("t:8080"));
             assert_eq!(opts.record, RecordPolicy::Always);
+            // Sp2: the caller's version policy goes out on every seed send.
+            assert_eq!(opts.version, VersionPolicy::H1);
         }
 
         let urls: Vec<String> = seeds.iter().map(|url| url.as_str().to_string()).collect();

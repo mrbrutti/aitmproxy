@@ -109,6 +109,25 @@ fn is_plain_authority(authority: &str) -> bool {
             .any(|c| matches!(c, '/' | '?' | '#' | '@') || c.is_whitespace())
 }
 
+/// A URL's `host[:port]` and its request target (`path` with the query), the
+/// two parts a request built from it carries as `authority` and `path`.
+///
+/// `None` when the URL has no host, which [`parse_absolute`] and [`resolve`]
+/// already refuse. The one place this split is written (Q3): every crawl
+/// request builder goes through it.
+pub(crate) fn parts(url: &Url) -> Option<(String, String)> {
+    let host = url.host_str()?;
+    let authority = match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    };
+    let path = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    Some((authority, path))
+}
+
 /// The visited-set key for a page: its normalised serialisation.
 pub(crate) fn page_key(url: &Url) -> String {
     url.as_str().to_string()
@@ -168,6 +187,23 @@ mod tests {
         assert_eq!(origin_key(&o1), "http://t:8080");
         let o2 = parse_absolute("https://t/").unwrap();
         assert_eq!(origin_key(&o2), "https://t");
+    }
+
+    /// Q3: the one place a URL becomes a request's `authority` and target.
+    #[test]
+    fn parts_pins() {
+        assert_eq!(
+            parts(&parse_absolute("http://t:8080/a?b=1").unwrap()),
+            Some(("t:8080".to_string(), "/a?b=1".to_string()))
+        );
+        assert_eq!(
+            parts(&parse_absolute("https://t/").unwrap()),
+            Some(("t".to_string(), "/".to_string()))
+        );
+        assert_eq!(
+            parts(&parse_absolute("https://T:443/x#/r?q").unwrap()),
+            Some(("t".to_string(), "/x".to_string()))
+        );
     }
 
     #[test]
