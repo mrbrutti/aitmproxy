@@ -7,7 +7,12 @@
 //! - [`checks_with`] takes the job's SSRF policy and the engine's scope guard
 //!   and returns **all ten**, with the five h2 checks built over a runner that
 //!   checks every address it resolves against both before it dials;
-//! - [`checks`] returns **only the five** that dial nothing of their own.
+//! - [`checks`] — the slot the binary calls today — returns **nothing** in
+//!   this PR. The binary collects the catalogue through
+//!   `checks_with(policy, guard)` in a follow-up PR once the engine lands;
+//!   until then the slot stays empty, so no native check is reachable from
+//!   the binary and `crates/aitm/src/wire.rs`'s skeleton test keeps
+//!   asserting zero (split-PR decision of the final F6 pass).
 //!
 //! An ungated raw h2 probe therefore cannot be built through a slot at all:
 //! there is no constructor that omits the gate.
@@ -20,23 +25,20 @@ use aitm_scan_model::Check;
 use crate::h2_observe::{h2_checks, RealRawH2Runner};
 use crate::{blind_timing, redirect, sqli_boolean, xss};
 
-/// The native checks that need no gate of their own: the five that place a
-/// payload through [`aitm_scan_model::ProbeHost`] and open no socket.
+/// The ungated slot, which `crates/aitm/src/wire.rs::collect_native_checks`
+/// calls today: **empty** in this PR.
 ///
-/// A caller with no SSRF policy and no scope guard to hand — a test, a tool
-/// listing the catalogue — gets these and nothing else. For the whole
-/// catalogue, see [`checks_with`].
+/// The binary collects the catalogue through [`checks_with`] — with the
+/// job's live `SsrfPolicy` and the engine's `ScopeRateGuard` — in a follow-up
+/// PR once the engine lands. Until then this slot stays empty, so no native
+/// check is reachable from the binary, and `wire.rs`'s
+/// `skeleton_lane_slots_are_empty_today` keeps asserting zero (split-PR
+/// decision of the final F6 pass, 2026-11-01). The five gate-free checks are
+/// not offered here either: a slot the binary can reach without the gate
+/// would be the one place the two halves of the catalogue could diverge.
 #[must_use]
 pub fn checks() -> Vec<Arc<dyn Check>> {
-    let mut all: Vec<Arc<dyn Check>> = vec![
-        blind_timing::cmdi_time(),
-        blind_timing::sqli_time(),
-        redirect::check(),
-        sqli_boolean::check(),
-        xss::check(),
-    ];
-    all.sort_by(|a, b| a.meta().id.cmp(&b.meta().id));
-    all
+    Vec::new()
 }
 
 /// This crate's native HTTP checks: the ten of spec D8.2, in id order.
@@ -59,7 +61,13 @@ pub fn checks() -> Vec<Arc<dyn Check>> {
 #[must_use]
 pub fn checks_with(ssrf: SsrfPolicy, guard: Arc<dyn ScopeRateGuard>) -> Vec<Arc<dyn Check>> {
     let runner = Arc::new(RealRawH2Runner::with_ssrf(ssrf, guard));
-    let mut all = checks();
+    let mut all: Vec<Arc<dyn Check>> = vec![
+        blind_timing::cmdi_time(),
+        blind_timing::sqli_time(),
+        redirect::check(),
+        sqli_boolean::check(),
+        xss::check(),
+    ];
     all.extend(h2_checks(runner));
     all.sort_by(|a, b| a.meta().id.cmp(&b.meta().id));
     all

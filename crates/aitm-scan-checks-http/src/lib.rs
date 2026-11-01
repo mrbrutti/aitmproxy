@@ -12,11 +12,13 @@
 //!
 //! There are two slots. [`checks_with`] takes the job's `SsrfPolicy` and the
 //! engine's `ScopeRateGuard` and returns the ten native checks of D8.2;
-//! [`checks`] returns only the five that dial nothing of their own, so an
-//! ungated raw HTTP/2 probe cannot be built through a slot at all
-//! (coordinator decision of 2026-11-01, option A). `crates/aitm/src/wire.rs`
-//! calls **`checks_with`**, with the live policy and guard; T3's integration
-//! task makes that one-line swap. The ten, in id order:
+//! [`checks`], the slot `crates/aitm/src/wire.rs` calls today, returns
+//! **nothing** in this PR, so an ungated raw HTTP/2 probe cannot be built
+//! through a slot at all and no native check is reachable from the binary
+//! yet (coordinator decision of 2026-11-01, option A; split-PR call of the
+//! final F6 pass). The binary collects the catalogue through
+//! **`checks_with`**, with the live policy and guard, in a follow-up PR once
+//! the engine lands. The ten, in id order:
 //!
 //! | Technique | Checks | Module |
 //! |---|---|---|

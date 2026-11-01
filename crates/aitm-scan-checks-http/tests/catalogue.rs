@@ -9,10 +9,13 @@
 //!
 //! There are two slots because five of the ten checks dial raw:
 //! [`aitm_scan_checks_http::checks_with`] takes the live SSRF policy and scope
-//! guard and returns all ten, and [`aitm_scan_checks_http::checks`] returns
-//! only the five that probe through the lane's own guarded client. An ungated
-//! raw-h2 probe therefore cannot be constructed through the slot at all
-//! (coordinator decision of 2026-11-01, option A).
+//! guard and returns all ten, and [`aitm_scan_checks_http::checks`] — the one
+//! the binary calls today — returns **nothing** in this PR: the binary
+//! collects the catalogue through `checks_with(policy, guard)` in a follow-up
+//! once the engine lands, and until then no native check is reachable from
+//! it (coordinator decision of 2026-11-01, option A, and the split-PR call
+//! of the final F6 pass). An ungated raw-h2 probe therefore cannot be
+//! constructed through a slot at all.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -32,8 +35,8 @@ fn guard() -> Arc<dyn ScopeRateGuard> {
     Arc::new(StdGuard::default())
 }
 
-/// The five checks `checks()` returns: every native check that probes through
-/// the lane's own guarded client and dials nothing itself.
+/// The five gate-free checks among the ten: every native check that probes
+/// through the lane's own guarded client and dials nothing itself.
 const GATE_FREE_IDS: [&str; 5] = [
     "cmdi-time",
     "open-redirect",
@@ -81,35 +84,35 @@ fn checks_with_returns_every_native_id() {
     assert_eq!(ids, NATIVE_IDS, "the sorted native ids");
 }
 
-/// The ungated slot returns only the checks that need no gate. The five h2
-/// checks dial a raw socket, so they exist only where a policy and a guard
-/// were supplied: a caller that forgot cannot get one by accident.
+/// The ungated slot is what `crates/aitm/src/wire.rs::collect_native_checks`
+/// calls today, and in this PR it is empty: the binary collects the catalogue
+/// through `checks_with(policy, guard)` in a follow-up once the engine lands,
+/// so until then no native check — gate-free or not — is reachable from the
+/// binary, and `wire.rs`'s skeleton test keeps asserting zero.
 #[test]
-fn checks_returns_only_the_gate_free_five() {
-    let ids: Vec<String> = checks()
-        .iter()
-        .map(|check| check.meta().id.clone())
-        .collect();
-
-    assert_eq!(ids, GATE_FREE_IDS);
-    for id in &ids {
-        assert!(!id.starts_with("h2-"), "{id} dials raw and needs a gate");
-    }
+fn checks_is_empty_until_the_binary_collects_checks_with() {
+    assert!(checks().is_empty(), "the ungated slot must stay empty");
 }
 
-/// Together they are the whole catalogue, with nothing in `checks()` that
-/// `checks_with()` does not also build.
+/// `checks_with` returns the ten and `checks` returns none: the five h2
+/// checks exist only where a policy and a guard were supplied, and the five
+/// gate-free ones ride along with them rather than through a slot the binary
+/// could reach without the gate.
 #[test]
-fn the_gated_slot_is_a_superset_of_the_ungated_one() {
-    let gate_free: BTreeSet<String> = checks().iter().map(|c| c.meta().id.clone()).collect();
+fn the_gated_slot_returns_the_ten_and_the_ungated_one_none() {
     let all: BTreeSet<String> = gated().iter().map(|c| c.meta().id.clone()).collect();
+    assert_eq!(all, NATIVE_IDS.iter().map(|s| (*s).to_string()).collect());
 
-    assert!(gate_free.is_subset(&all));
-    let only_gated: Vec<&String> = all.difference(&gate_free).collect();
-    assert_eq!(only_gated.len(), 5, "the five h2 checks");
-    for id in only_gated {
-        assert!(id.starts_with("h2-"), "{id}");
-    }
+    let h2: Vec<&String> = all.iter().filter(|id| id.starts_with("h2-")).collect();
+    assert_eq!(h2.len(), 5, "the five h2 checks: {h2:?}");
+    let gate_free: Vec<&str> = all
+        .iter()
+        .filter(|id| !id.starts_with("h2-"))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(gate_free, GATE_FREE_IDS);
+
+    assert_eq!(checks().len(), 0);
 }
 
 #[test]
@@ -377,18 +380,27 @@ fn the_public_modules_are_the_checks_and_timing() {
     );
 }
 
-/// The ten checks `checks_with` returns carry the same metadata whether they
-/// came through `checks()` or not: the gated slot does not re-shape the five
-/// gate-free checks, it only adds the h2 five.
+/// The five gate-free checks `checks_with` returns carry exactly the metadata
+/// their modules declare: the gated slot does not re-shape them, it only adds
+/// the h2 five. (`checks()` is empty in this PR, so the comparison is against
+/// the modules' own constructors, not the other slot.)
 #[test]
 fn the_gated_slot_leaves_the_gate_free_five_untouched() {
-    let gate_free = checks();
+    let declared: Vec<Arc<dyn Check>> = vec![
+        aitm_scan_checks_http::blind_timing::cmdi_time(),
+        aitm_scan_checks_http::blind_timing::sqli_time(),
+        aitm_scan_checks_http::redirect::check(),
+        aitm_scan_checks_http::sqli_boolean::check(),
+        aitm_scan_checks_http::xss::check(),
+    ];
     let all = gated();
-    for check in &gate_free {
+    assert_eq!(declared.len(), GATE_FREE_IDS.len());
+    for check in &declared {
         let twin = all
             .iter()
             .find(|c| c.meta().id == check.meta().id)
             .unwrap_or_else(|| panic!("{} missing from checks_with", check.meta().id));
         assert_eq!(twin.meta(), check.meta(), "{}", check.meta().id);
     }
+    assert!(checks().is_empty());
 }
