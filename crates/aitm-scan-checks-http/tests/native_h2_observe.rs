@@ -17,7 +17,7 @@ use aitm_proto_http::raw_h2::{
 use aitm_scan_checks_http::h2_observe::{h2_checks, RawH2Runner, RealRawH2Runner};
 use aitm_scan_model::{
     Check, CheckCost, CheckOrigin, Confidence, InsertionKind, InsertionPoint, Intensity, LaneKind,
-    Outcome, Technique, Verdict,
+    Outcome, ProbeHost, Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -742,18 +742,42 @@ async fn a_stopped_job_sends_nothing() {
     }
 }
 
+/// The raw connection cannot charge the host — `ProbeHost` has no `charge` —
+/// so the check refuses to open one the job could not have paid for: the
+/// budget left after the baseline must cover the streams the plan will open.
+/// A three-stream check on a job with one unit of budget sends nothing.
 #[tokio::test]
-async fn the_raw_probe_does_not_spend_the_hosts_budget() {
-    let runner = FakeRunner::answering(resets(8));
-    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+async fn a_budget_that_cannot_cover_the_streams_opens_no_raw_connection() {
+    let runner = FakeRunner::answering(resets(3));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
     let host = h2host().with_budget(1);
 
     let v = run(&check, &host).await;
 
-    // Budget one pays for the baseline; the raw probe does not spend the host's
-    // budget, so it still runs.
+    assert_eq!(v.outcome, Outcome::Inconclusive);
+    assert_eq!(v.detail, "budget too low for the raw probe");
+    assert_eq!(runner.calls(), 0);
+    // The authority was not claimed, so a job with budget can still probe it.
+    let allowed = run(&check, &h2host().with_budget(8)).await;
+    assert_eq!(allowed.outcome, Outcome::Clean);
+    assert_eq!(runner.calls(), 1);
+}
+
+/// What the raw probe does *not* do: spend the host's budget. Nine units are
+/// one for the baseline and eight the eight-stream probe must be able to
+/// cover; after the probe, eight are still there, because nothing charged for
+/// the streams it opened.
+#[tokio::test]
+async fn the_raw_probe_does_not_spend_the_hosts_budget() {
+    let runner = FakeRunner::answering(resets(8));
+    let check = check_named(&runner, "h2-rapid-reset-mitigation");
+    let host = h2host().with_budget(9);
+
+    let v = run(&check, &host).await;
+
     assert_eq!(v.outcome, Outcome::Vulnerable);
     assert_eq!(runner.calls(), 1);
+    assert_eq!(host.budget_left(), 8, "only the baseline was charged");
 }
 
 // ---------------------------------------------------------------------------

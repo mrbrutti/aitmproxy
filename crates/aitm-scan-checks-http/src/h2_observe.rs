@@ -39,6 +39,17 @@
 //! 4. the probe is **observe-only**: its result is a note about the server's h2
 //!    behaviour, not a trust decision, and nothing it reads is replayed.
 //!
+//! # What the raw probe costs the job
+//!
+//! The streams a raw probe opens are requests the job made, but they do not
+//! go through [`ProbeHost`] and nothing charges them: the trait has no
+//! `charge`, so a check cannot spend the job's budget on them and the job's
+//! pacing does not apply to them. Until the engine grows that hook (raised
+//! with the coordinator as a T1b follow-up, plan amendment A5 item T3-6,
+//! which replaces this with `host.charge(streams.max(1))`), each check does
+//! the one thing it can from this side: it refuses to open a connection the
+//! remaining budget could not have paid for, one unit per stream.
+//!
 //! # One connection per authority
 //!
 //! The scheduler runs a check once per insertion point, but these are
@@ -434,12 +445,20 @@ impl Check for H2Check {
             if host.cancelled() || Instant::now() >= host.deadline() {
                 return inconclusive(STOPPED);
             }
+            // The raw connection cannot charge the job — `ProbeHost` has no
+            // `charge` — so the check refuses to open one the budget could not
+            // have paid for, counting one unit per stream the plan will open
+            // (security review SEC-C2; see the module header).
+            let plan = self.plan(&target);
+            if host.budget_left() < u32::from(plan.streams).max(1) {
+                return inconclusive(BUDGET_TOO_LOW);
+            }
             // Claimed only now, so a refused baseline does not burn the
             // authority; atomic, so two concurrent points open one connection.
             if !self.guard.claim(&key, Instant::now()) {
                 return inconclusive(ALREADY_OBSERVED);
             }
-            match self.runner.run(self.plan(&target)).await {
+            match self.runner.run(plan).await {
                 Ok(obs) => self.verdict(&obs),
                 Err(error) => {
                     tracing::debug!(%error, check = %self.meta.id, "raw h2 probe did not complete");
@@ -453,6 +472,7 @@ impl Check for H2Check {
 const STOPPED: &str = "stopped: the job was cancelled, out of budget or past its deadline";
 const ALREADY_OBSERVED: &str = "already observed for this authority";
 const NOT_A_PROFILE_ORIGIN: &str = "raw probe target is not a profile origin";
+const BUDGET_TOO_LOW: &str = "budget too low for the raw probe";
 
 /// Whether the check may send another request right now (copy of the gate
 /// `xss.rs` keeps; folding both into one helper is a later round).
