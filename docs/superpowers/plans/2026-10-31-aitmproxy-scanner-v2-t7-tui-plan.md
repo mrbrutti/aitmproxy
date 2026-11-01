@@ -588,6 +588,12 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | spec | Minor | "Jobs stacks at every width" has no 200x50 literal | fix round G-B (G87) |
 | 14 | spec | Minor | legacy-bus Profiles/Site map/Issues keep V2 hints | fix round G-B (G86, the stricter ruling) |
 | 14 | spec | Minor | help lines and the narrow first-line budget not in D11 | D11 amended |
+| 14 | quality | Important | two help assertions in `palette_and_help_name_the_surface` cannot fail | fix round G-B (G88, first): heading by `│ Scan`, full-text fit check, mutation proof |
+| 14 | quality | Minor | help box height hand-counted with a wrong comment | fix round G-B (G89, with G85) |
+| 14 | quality | Minor | three homes for the same key text (hints, HELP, FOOTERs) | fix round G-B (G90, with G84): one key table per tab |
+| 14 | quality | Minor | `Hint` alias with one user; `hints()` allocates a `Vec` per frame; `pub` where `pub(crate)` fits | fix round G-B (G90) |
+| 14 | quality | Minor | `unwrap_or_default()` vacuous sub-assertion; fourth `reply` copy | fix round G-B (G91, addendum to G80/G81) |
+| 14 | quality | Minor | panel history narrated in two doc comments | fix round G-B (G92) |
 
 ## Shipped
 

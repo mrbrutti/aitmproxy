@@ -222,13 +222,25 @@ G86. On a legacy bus the Profiles and Issues hints advertise keys the degraded t
 
 G87. Layout literals weaker than the spec sentences (`crates/aitm-tui/tests/scan_v2_layout.rs`): in `narrow_frames_stack_the_detail_below_the_list` add at 90x40 `row_of(narrow, "Reflected cross-site scripting   high") > row_of(narrow, "INFO 0")` and `row_of(narrow, "profile standard") > row_of(narrow, "team-staging")` (first detail line below the last list row, T7-14's sentence); in `jobs_narrow_row_drops_profile_and_targets_into_the_detail` assert at 200x50 that a `│─` rule row exists and the detail's `JOB` line sits below it (Jobs stacks at every width).
 
+## Task 14 quality panel
+
+G88. **Important (test evidence).** Two assertions in `palette_and_help_name_the_surface` cannot fail (`crates/aitm-tui/tests/scan_v2_layout.rs`): the Scan heading is found by `" Scan"`, which first matches the `F / S / @` help line; the fits-the-box check (`!contains('…') && ends_with('│')`) holds for any clipped line. Fix: `row_of(&text, "│ Scan")` for the heading plus `row_of(&text, "1 2 3 4") == scan_heading + 1`; replace the box check with `line.contains(what)` against each `HELP` entry's full text (so a clipped line fails). Mutation proof in the report: deleting the heading push and lengthening the Profiles entry to 300 cells must each turn the test red.
+
+G89. Help box height is a hand-counted literal with a wrong comment (`crates/aitm-tui/src/ui/overlays.rs` `help`): build `lines` first, then `centered(screen, 110, u16::try_from(lines.len() + 2).unwrap_or(u16::MAX))`; drop the counting comment. Rides with G85 (the scroll makes the clamp safe on small screens).
+
+G90. Three hand-maintained homes for the same key text (`ui/scan/mod.rs` `hints`/`HELP`; `jobs.rs`, `profiles.rs`, `issues.rs` `FOOTER`/`DETAIL_FOOTER`): with G84, one `const <TAB>_KEYS: &[Hint]` per tab in `ui/scan/mod.rs`; `hints()` returns `&'static [Hint]` (bars does `.to_vec()` once), the footers and `HELP` lines are joined from the same tables, so a key is spelled once. `Hint` is used by `HELP` too or dropped; `pub(crate)` visibility for all three.
+
+G91. Addendum to G81 and G80: `tests/scan_v2_layout.rs` `unwrap_or_default()` on the `running/audit` row and the wide header become `unwrap_or_else(|| panic!(..))` with the screen; `reply` imported from `tests/common` (G80's file list gains this file).
+
+G92. Panel history in doc comments (`ui/scan/mod.rs` hints doc, `ui/scan/jobs.rs` legacy doc): keep the D11/D12 citations, drop the two "replaced/went with Task 14" clauses.
+
 ## Dispatch (2026-11-01, after Task 14 lands)
 
 Round G runs as two fix Coders in sequence in the one worktree, each committing by explicit path as `fix(tui-scan): G<ids> <title>` with reproducing tests first for every behaviour item, followed by one combined panel over both ranges.
 
 **Round G-A (behaviour, bounds, security, spec rulings)**, first, while the Task 14 panel runs: G10, G11, G12, G13, G14, G15, G16, G17, G18, G19, G20, G21, G22, G31, G33, G35, G36, G37, G42, G45, G46, G47, G48, G49, G50, G51, G52, G53, G54, G57, G61, G66, G67, G71, G72, G73, G74, G75, G82, G83. Priority order inside the round: G82, G45 (+G53), G51, G52, G20, G22, G61 (+G14), then the rest by number.
 
-**Round G-B (structure, hygiene, tests)**, after G-A is committed: G1, G2, G3, G5, G6, G7, G8, G9, G23, G24, G25, G26, G27, G28, G29, G30, G32, G34, G38, G39, G40, G41, G43, G44, G55, G56, G58, G59, G60, G62, G63, G64, G65, G68, G69, G70, G76, G77, G78, G79, G80, G81, G84, G85, G86, G87, plus whatever the Task 14 quality panel adds (appended below as G84+ before G-B is dispatched).
+**Round G-B (structure, hygiene, tests)**, after G-A is committed: G1, G2, G3, G5, G6, G7, G8, G9, G23, G24, G25, G26, G27, G28, G29, G30, G32, G34, G38, G39, G40, G41, G43, G44, G55, G56, G58, G59, G60, G62, G63, G64, G65, G68, G69, G70, G76, G77, G78, G79, G80, G81, G84, G85, G86, G87, G88, G89, G90, G91, G92. G88 first in G-B (test evidence) (appended below as G84+ before G-B is dispatched).
 
 Each Coder may touch only the files its items name plus the test files that reproduce them; neither touches `CORE_TOOLS`, `fixtures/bus-fixture.json`, nor `docs/**`.
 
