@@ -5,9 +5,10 @@ with `l4.enabled: true` and a config-declared loopback scope, driven over the re
 as operator and as agent (python `aitm_e2e.bus`), with the real TUI in a pty, the real
 web UI in a browser, and a dev bundle of the macOS app connected to that core as its
 external core. Every "proven" cell below names the command that was run and what was
-seen. A cell is **fixture-only** when the surface shows the capability only from
-`Fixtures+L4.swift` / `fixture.rs` / `mock.ts` data, and **missing** when nothing in the
-surface reaches the verb. Matt's rule for this audit: sample data is not proof.
+seen. A cell is **missing live (fixture-only at 1854fae)** when the surface showed the
+capability only from `Fixtures+L4.swift` / `fixture.rs` / `mock.ts` data, and **missing** when
+nothing in the surface reaches the verb. Matt's rule for this audit: sample data is not proof.
+Line numbers are at 1854fae and drift; treat them as pointers, not contracts.
 
 Rig: `/tmp/claude/l4-rig/config.yaml` (proxy 28180, browser 28181, bus 27431, web 28182;
 `l4.scope` = lo0 `127.0.0.1/32` ports 9000-9999, one entry each for capture, inject,
@@ -23,14 +24,15 @@ intercept), `python3 -m http.server 9099` as the TCP target, a UDP echo on 9053.
 2. **The macOS app never shows a live L4 flow.** `BusService` polls only `flow.list` and
    `flow.get`; the only callers of `l4.flow.list` / `l4.flow.get` are the fixture
    command runner in `Session.swift`. Against a privileged external core the L4 rows,
-   badges and inspector stay empty. Everything L4 the app has shipped is fixture-only.
+   badges and inspector stay empty. Everything L4 the app has shipped is missing live
+   (fixture-only at 1854fae).
 3. **Two of the three UIs send the wrong id to Forward / Drop.** The TUI
    (`app.rs` `l4_intercept_verb`) and the mac `L4Inspector.interceptVerb` send the L4
    *flow* id; the core's `l4.intercept.forward/drop/mutate/revert` take the *parked
    packet* id from `l4.intercept.list`. Only the web UI sends the parked id.
 4. **Scope-as-authorisation is config-only in practice.** Operator `l4.scope.add` is
-   refused (`runtime L4 scope widening is disabled; declare scope in the l4.scope config
-   block or set l4.allow_agent_widen`) unless the operator first flips the *agent*
+   refused (``runtime L4 scope widening is disabled; declare scope in the `l4.scope` config
+   block or set `l4.allow_agent_widen` ``) unless the operator first flips the *agent*
    Widen gate with `l4.agent.set`. No UI offers an L4 scope add, and the TUI scope panel
    shows HTTP scope only.
 5. **L4 flows are invisible to the generic flow surface.** They live in
@@ -44,19 +46,19 @@ intercept), `python3 -m http.server 9099` as the TCP target, a UDP echo on 9053.
 
 | Verb | Unprivileged core (this Mac, `/dev/bpf*` root-only) | Notes |
 |---|---|---|
-| `tools/list` | 109 tools, 25 `l4.*` (`agent.set/status`, `capture.start/stop/status`, `craft`, `flow.get/list`, `inject`, `intercept.drop/forward/list/mutate/revert/start/status/stop`, `interfaces`, `recon`, `scope.add/list/remove`, `send_recv`, `tcp_probe`, `udp_probe`) | L4OPS-AC2 holds |
+| `tools/list` | 109 tools at 1854fae (110 at b109ca80, after #200), 25 `l4.*` (`agent.set/status`, `capture.start/stop/status`, `craft`, `flow.get/list`, `inject`, `intercept.drop/forward/list/mutate/revert/start/status/stop`, `interfaces`, `recon`, `scope.add/list/remove`, `send_recv`, `tcp_probe`, `udp_probe`) | L4OPS-AC2 holds |
 | `l4.interfaces` | OK, lists `lo0`, `en0`, utun*, … | |
 | `l4.scope.list` | OK, the three config entries with ids, `ports: "9000-9999"`, `inject_rate` | |
 | `l4.agent.status` | `{"capture": false, "inject": false, "intercept": false, "widen": false}` | |
 | `l4.flow.list` | `[]` | |
 | `l4.craft {spec}` | OK: `{"bytes": base64, "length": 30, "summary": {"layers": ["IPv4","UDP"], "length": 30}}` | pure, no privilege, agent too |
 | `l4.capture.start {interface: lo0, direction: inbound}` | `L4 unavailable: no read+write access to any /dev/bpf* device (capture/inject needs it; install ChmodBPF or run with privilege)` | L4OPS-AC3 holds |
-| `l4.capture.status` | same `L4 unavailable` error | a read verb that errors instead of answering "none, unavailable because …" |
+| `l4.capture.status` | same `L4 unavailable` error | a read verb that errors instead of answering "none, unavailable because …" (D11a) |
 | `l4.capture.stop {id}` | same | |
 | `l4.capture.start {interface, filter}` (what the web UI sends) | `-32602 unknown param filter for l4.capture.start` | **web bug**, fails before privilege |
 | `l4.inject` / `l4.send_recv` | schema `spec*, dst*, interface*, port, count` / `… timeout_ms, expect`; without `dst`: `missing required param dst` | |
 | `l4.intercept.start/status/list` | `L4 unavailable: in-path interception is unsupported on macOS (Linux CAP_NET_ADMIN / NFQUEUE only)` | by design |
-| `l4.scope.add {cidr, ports, interface, direction, capability}` | **refused** for the operator: `runtime L4 scope widening is disabled; … set l4.allow_agent_widen` | spec §3.3 says operator-confirmed add |
+| `l4.scope.add {cidr, ports, interface, direction, capability}` | **refused** for the operator: ``runtime L4 scope widening is disabled; … set `l4.allow_agent_widen` `` | spec §3.3 says operator-confirmed add (D11b: not confirm-gated) |
 | `l4.agent.set {capability: widen, allowed: true}` then `l4.scope.add` | OK: gate flips, add returns an id, `l4.scope.list` shows it; `l4.scope.remove` works; gate flipped back | the only runtime path to add scope |
 | agent token, policy `auto` | `l4.flow.list`, `l4.scope.list`, `l4.agent.status`, `l4.craft` OK; `l4.agent.set` and `l4.capture.start` refused: `the agent policy is auto … permits no sensitive actions` | L4OPS-AC5 holds |
 | `poc.build {flow_id: <l4 uuid>}` | `poc.build: no flow with id …` | HTTP store only |
@@ -72,18 +74,18 @@ See "Live capture" below.
 Legend: **live** = proven with real captured packets on this rig (none in this audit);
 **blocked** = needs privileged capture the product does not yet obtain itself; **live-unpriv** =
 proven on the real bus but only the honest `L4Unavailable` path could be exercised;
-**fixture-only** = at audit time it existed only on sample data; Matt's ruling the same evening
-is that no fixture can stand in and the fixture modes of all three frontends are being deleted,
-so every **fixture-only** cell reads as **missing live**; **missing** = no path to the verb;
+**missing live (fixture-only at 1854fae)** = at audit time it existed only on sample data; Matt's
+ruling the same evening is that no fixture can stand in, and the fixture modes of all three
+frontends are being deleted; **missing** = no path to the verb;
 **n/a (platform)** = Linux-only verb, cannot be exercised on macOS; **wrong** = reaches
 the verb with arguments the core rejects.
 
 | Capability | MCP tools (agent) | CLI | TUI | Web UI | macOS app |
 |---|---|---|---|---|---|
-| List L4 flows | live-unpriv (`l4.flow.list` → `[]`); **blocked** (no privileged capture) | one-shot `aitm l4.flow.list` runs its own in-process core, never the running one: **missing** against a live core | polls `l4.flow.list`+`get` (`bus.rs`); **blocked** | polls every 1.5 s (`store.ts`); **blocked** | **fixture-only**: no live caller of `l4.flow.*` |
-| Kind badge / TCP-UDP sub-label / chips | n/a | n/a | L4 badge + sub-label in `ui/flows.rs`; **no L4 chip**, help lists no L4 keys, filter hint omits `~l4 ~tcp ~udp` (filter accepts `~tcp`, seen) | L4 row component; **no L4/TCP/UDP quick-filter chip** (seen: All HTTP HTTPS WebSocket h1 h2 JSON …) | badge/sub-label in `FlowCellView`; no chips at 1854fae (seen); `TCP UDP L4` chips landed in PR #196 (5eac2a5); seen live on a dev bundle rebuilt at 5eac2a5 against the rig core (chips present, 0 rows); they filter `row.l4?.proto`, which no live row ever carries while D1 stands |
-| Inspect packets (layers, hex, timeline) | `l4.flow.get` returns `layers`, `length`, `dir`, `injected` only: no bytes, time, addresses | missing | text layer tree; no hex (bus has no bytes) | LayerTree, no hex | fixture-only |
-| L4 scope view | `l4.scope.list` live | `aitm l4.scope.list` in-process only | **missing** (scope panel is HTTP only, seen) | read-only list on the L4 page (seen) | fixture-only |
+| List L4 flows | live-unpriv (`l4.flow.list` → `[]`); **blocked** (no privileged capture) | one-shot `aitm l4.flow.list` runs its own in-process core, never the running one: **missing** against a live core | polls `l4.flow.list`+`get` (`bus.rs`); **blocked** | polls every 1.5 s (`store.ts`); **blocked** | **missing live (fixture-only at 1854fae)**: no live caller of `l4.flow.*` |
+| Kind badge / TCP-UDP sub-label / chips | n/a | n/a | L4 badge + sub-label in `ui/flows.rs`; **no L4 chip**, help lists no L4 keys, filter hint omits `~l4 ~tcp ~udp` (filter accepts `~tcp`, seen) | L4 row component; **no L4/TCP/UDP quick-filter chip** (seen: All HTTP HTTPS WebSocket h1 h2 JSON …) | badge/sub-label in `FlowCellView`; no chips at 1854fae (seen)[^196] |
+| Inspect packets (layers, hex, timeline) | `l4.flow.get` returns `layers`, `length`, `dir`, `injected` only: no bytes, time, addresses | missing | text layer tree; no hex (bus has no bytes) | LayerTree, no hex | missing live (fixture-only at 1854fae) |
+| L4 scope view | `l4.scope.list` live | `aitm l4.scope.list` in-process only | **missing** (scope panel is HTTP only, seen) | read-only list on the L4 page (seen) | missing live (fixture-only at 1854fae) |
 | L4 scope add (confirm) | operator refused unless Widen gate on (seen) | n/a | missing (`:scope add` → HTTP `scope.add`) | missing (run record admits it) | missing |
 | Capture start / stop / status | start/stop/status gated; **blocked** | n/a | **missing** (no key, no palette shortcut beyond raw tool) | start only, **no stop**; filter param **wrong** (`unknown param filter`); unprivileged notice seen: `l4.capture.start: L4 unavailable: no read+write access to any /dev/bpf* device …` | missing |
 | Intercept / pause (park) | n/a (platform) | n/a | missing (`intercept.start` never called) | missing | missing |
@@ -95,7 +97,11 @@ the verb with arguments the core rejects.
 | Replay / send_recv | `l4.send_recv` gated; **blocked** | n/a | missing (`r` blocked for non-HTTP) | missing | missing |
 | Findings / PoC from an L4 flow | `poc.build` → `no flow with id`; `findings.record` stores an unresolved uuid | n/a | `P` sends HTTP `poc.build` with the L4 id → `no flow` | missing | missing |
 | Agent gate toggles | `l4.agent.status/set` live (seen) | `aitm l4.agent.status` in-process | **live**: `@` then `c` flipped Capture on, bus `l4.agent.status` → `capture: true`, `c` again → false (seen); banner still says "agent.status is not on this bus (core follow-up F1) — read-only", which is stale | **live**: Agent panel switch `Agent Capture` aria-checked false→true, bus → `capture: true`, click again → false (seen) | `AgentPanel` reads/sets live behind `l4Enabled` (code only: no CUA click in this audit) |
-| Honest degradation (`L4Unavailable`) | typed error (seen) | n/a | toast (per `l4-cua-tui-acceptance.md`) | transient notice (seen) | `L4Availability` set only by `APP_L4_EMBEDDED=1` in fixture mode |
+| Honest degradation (`L4Unavailable`) | typed error (seen) | n/a | toast (per `l4-cua-tui-acceptance.md`) | transient notice (seen) | `L4Availability` set only by `APP_L4_EMBEDDED=1` in fixture mode: missing live (fixture-only at 1854fae) |
+
+[^196]: `TCP UDP L4` chips landed in PR #196 (5eac2a5) and were seen live on a dev bundle rebuilt
+at 5eac2a5 against the rig core (chips present, 0 rows). They filter `row.l4?.proto`, which no live
+row carries while D1 stands.
 
 ## Live capture (privileged half): blocked
 
@@ -121,7 +127,7 @@ any OS, so L4 capture is unreachable for every frontend as shipped.
 From `docs/superpowers/specs/2026-10-28-aitmproxy-l4-operator-surfaces-design.md`:
 
 - §3.1 / L4OPS-AC7 "union flow list, every kind renders": true in TUI and web (code),
-  false in macOS (fixture-only). Filter atoms `~l4 ~tcp ~udp ~icmp` are not surfaced.
+  false in macOS (missing live; fixture-only at 1854fae). Filter atoms `~l4 ~tcp ~udp ~icmp` are not surfaced.
 - §3.3 / L4OPS-AC9 "scope panel gains an L4 scope view; adding an L4 scope entry is
   Sensitive (operator confirm)": no UI adds L4 scope; the core refuses the operator.
 - §3.4 / L4OPS-AC12 "intercept bar … where absent (macOS/unprivileged) renders
@@ -158,7 +164,8 @@ From `docs/superpowers/specs/2026-10-28-aitmproxy-l4-operator-surfaces-design.md
 | D10 | Minor | TUI, web, macOS | No `L4` / `TCP` / `UDP` chips; TUI help and filter hint omit the L4 atoms | screens |
 | D10b | Minor | web | Polling churn: every 1.5 s the web calls `l4.flow.list`, `l4.scope.list`, `l4.capture.status`, `l4.agent.status`, `l4.intercept.status`, `l4.intercept.list`; on an unprivileged core four of those error each tick and fill the activity log (238 entries within 20 s of opening the page) | web Agent panel activity log, seen |
 | D10c | Minor | TUI | Agent panel banner "agent.status is not on this bus (core follow-up F1) — the toggle is read-only here" while the toggles work live | screen |
-| D11 | Minor | core | `l4.capture.status` errors `L4Unavailable` instead of answering; `l4.scope.add` is not confirm-gated though the spec calls it Sensitive | live |
+| D11a | Minor | core | `l4.capture.status` (and `l4.intercept.status`) error `L4Unavailable` instead of answering | live |
+| D11b | Minor | core | `l4.scope.add` is not confirm-gated though the operator-surfaces spec calls it Sensitive | live; `tools/list` shows no `confirmable` |
 | D12 | Minor | web | The first printed URL connects as an agent, so L4 actions are refused with a policy message until the operator URL is used | live |
 | D13 | Minor | docs | MCP catalogue, plugin tool reference and agent skills omit `l4.*`; e2e docstrings blame the NE for pcap privilege | files |
 | D14 | Minor | scripting | PoC `l4:` default interface `lo` is wrong on macOS | `language.rs:104` |
@@ -166,7 +173,8 @@ From `docs/superpowers/specs/2026-10-28-aitmproxy-l4-operator-surfaces-design.md
 
 ## Verified by hand
 
-- `tools/list` over loopback TCP as operator: 109 tools, the 25 `l4.*` above.
+- `tools/list` over loopback TCP as operator: 109 tools at 1854fae (110 at b109ca80, after #200),
+  the 25 `l4.*` above.
 - Every error string in this note is the verbatim bus reply, truncated only in length.
 - TUI screens are the real `aitm-tui` 0.5.4 in a 160×44 pty against the rig bus.
 - Web screens are the real embedded `aitm web` UI (v0.5.4) as operator.

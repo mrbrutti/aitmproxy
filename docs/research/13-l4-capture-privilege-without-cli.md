@@ -80,7 +80,9 @@ which auto-installs the helper and "Require[s] permission" (maintainer, issue 17
 - **Can it open `/dev/bpf*`? Unverified.** The spike never tried. Evidence is contradictory on the
   sandbox: Quinn (forums 132641, May 2020) "NetworkExtension providers must be sandboxed regardless
   of how they are packaged", while ES sysexes are not sandboxed; shipping Developer ID NE sysexes
-  (Proxyman, mitmproxy, aitm) carry no sandbox key and Little Snitch sets `app-sandbox=false`.
+  carry no sandbox key (Proxyman, inspected here with `codesign -d --entitlements`; aitm, from the
+  tree; mitmproxy's redirector was not inspected and is unverified), and Little Snitch sets
+  `app-sandbox=false`.
   Quinn (forums 128528): a sandbox is a second barrier on top of node permissions. No source states
   what a network-entitled sysex may open; `AF_NDRV` was not researched at all.
 - If it works, the cost: the sysex process exists only while the transparent-proxy configuration is
@@ -236,7 +238,7 @@ the UIs need is a read verb that always answers. Fields grounded in the above:
 | Frontend | macOS action | Linux action |
 |---|---|---|
 | macOS app | `SMAppService.daemon(...).register()`; on `.requiresApproval` call `openSystemSettingsLoginItems()` | n/a |
-| TUI / web / CLI | ask the installed app: `open -b <bundle-id> --args <flag>` (Proxyman precedent, 3.2; flag name is mine); no app: inference, `osascript` admin dialog installing the legacy daemon | core runs `pkexec <helper>` (polkit dialog) |
+| TUI / web / CLI | ask the installed app: `open -b <bundle-id> --args <flag>` (Proxyman precedent, 3.2; flag name is mine). **Superseded** by the privilege spec §3.4: a URL via `open -a <validated path>`, because `--args` is dropped when the app is already running and `-b` can resolve to a dev bundle. No app: inference, `osascript` admin dialog installing the legacy daemon | core runs `pkexec <helper>` (polkit dialog) |
 | Agent over MCP | never: operator-only verb, like `ca.allow_agent_install` (10 §3.5) | never |
 
 ## 4. Comparison
@@ -272,7 +274,9 @@ the UIs need is a read verb that always answers. Fields grounded in the above:
 - **macOS default: B2, registered by the app via `SMAppService.daemon`** (daemon plist and a small
   root script/binary in the bundle; group `access_bpf` to coexist with Wireshark, or `admin` as
   libpcap does; pre-create 256 nodes; re-apply at boot). One approval, no Apple entitlement, every
-  frontend benefits, `probe()` unchanged. Ship it with a CLI-only path: `open -b ... --args <flag>`, and consider the `osascript` legacy-daemon fallback for hosts without the app.
+  frontend benefits, `probe()` unchanged. Ship it with a CLI-only path: `open -b ... --args <flag>`
+  (**superseded** by the privilege spec §3.4, a URL handoff through `open -a`), and consider the
+  `osascript` legacy-daemon fallback for hosts without the app.
   Keep A out of Phase 1 unless a spike (`experiment/`) shows a network-entitled sysex can open
   `/dev/bpf*`; name the **NE session ("Ship macOS NE in DMG + app enable/disable toggle")** as the
   owner of any sysex change, since a frames lane touches `listener.rs` and `FlowHandoff.swift`
