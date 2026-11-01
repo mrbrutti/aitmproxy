@@ -306,6 +306,49 @@ mod tests {
         assert_eq!(cut.chars().count(), 128);
     }
 
+    /// Tester: `excerpt` is the one place a hostile response body reaches a
+    /// fixed-size buffer, so the boundary cases must not panic and must not
+    /// exceed the cap: empty input, exactly the cap, one byte over, and a
+    /// three-byte character straddling the cap (the cut falls back below it).
+    #[test]
+    fn evidence_excerpt_handles_empty_and_straddling_boundaries() {
+        assert_eq!(Evidence::excerpt(""), "");
+
+        let exact = "a".repeat(MAX_EXCERPT_BYTES);
+        assert_eq!(
+            Evidence::excerpt(&exact),
+            exact,
+            "at the cap, nothing is cut"
+        );
+
+        let over = "a".repeat(MAX_EXCERPT_BYTES + 1);
+        assert_eq!(Evidence::excerpt(&over).len(), MAX_EXCERPT_BYTES);
+
+        // 3-byte chars: 256 is not a multiple of 3, so the cut must step back to
+        // 255 rather than split a character.
+        let straddle = Evidence::excerpt(&"€".repeat(200));
+        assert_eq!(straddle.len(), 255);
+        assert_eq!(straddle.chars().count(), 85);
+        assert!(straddle.chars().all(|c| c == '€'));
+
+        // A 4-byte char that starts one byte before the cap is dropped whole.
+        let emoji = format!("{}{}", "a".repeat(MAX_EXCERPT_BYTES - 1), "😀".repeat(4));
+        let cut = Evidence::excerpt(&emoji);
+        assert_eq!(cut.len(), MAX_EXCERPT_BYTES - 1);
+        assert!(!cut.contains('😀'));
+
+        // Every excerpt is valid UTF-8 within the cap, whatever the input.
+        for n in 250..=262 {
+            let text = "é".repeat(n);
+            let out = Evidence::excerpt(&text);
+            assert!(
+                out.len() <= MAX_EXCERPT_BYTES,
+                "{n} chars overflowed the cap"
+            );
+            assert!(text.starts_with(&out), "{n} chars: excerpt is a prefix");
+        }
+    }
+
     #[test]
     fn l4_oracle_icmp_wire_shape() {
         assert_eq!(

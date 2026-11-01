@@ -465,6 +465,119 @@ mod tests {
         );
     }
 
+    /// Tester: `ALL` is the whole D2 vocabulary, in order, with no duplicate and
+    /// no omission — a length check alone would still pass if a variant were
+    /// dropped and another listed twice, and `audit.kinds` defaults to this list.
+    #[test]
+    fn insertion_kind_all_is_the_d2_vocabulary() {
+        let tokens: Vec<String> = InsertionKind::ALL
+            .iter()
+            .map(|k| {
+                serde_json::to_string(k)
+                    .expect("serializes")
+                    .replace('"', "")
+            })
+            .collect();
+        assert_eq!(
+            tokens,
+            vec![
+                "query",
+                "body_param",
+                "json_value",
+                "xml_value",
+                "xml_attr",
+                "multipart_value",
+                "multipart_filename",
+                "header",
+                "cookie",
+                "path_segment",
+                "path_filename",
+                "param_name_query",
+                "param_name_body",
+                "entire_body",
+                "ws_json_value",
+                "ws_text",
+                "ws_form_param",
+                "ws_binary",
+                "ws_handshake_header",
+                "l4_field",
+            ]
+        );
+        let distinct: std::collections::HashSet<&InsertionKind> =
+            InsertionKind::ALL.iter().collect();
+        assert_eq!(distinct.len(), InsertionKind::ALL.len(), "no duplicate");
+    }
+
+    /// Tester: every error code's serde token, `as_str` and `FromStr` agree, so a
+    /// UI that matches on the token of a `scan: <code>: <message>` string and a
+    /// UI that matches on the JSON token match the same thing.
+    #[test]
+    fn every_error_code_token_agrees_across_serde_display_and_from_str() {
+        let codes = [
+            ScanErrorCode::NotFound,
+            ScanErrorCode::Busy,
+            ScanErrorCode::OutOfScope,
+            ScanErrorCode::RefusedAgent,
+            ScanErrorCode::RefusedL4,
+            ScanErrorCode::LaneUnavailable,
+            ScanErrorCode::InvalidProfile,
+            ScanErrorCode::UnknownCheck,
+            ScanErrorCode::ConfirmRequired,
+            ScanErrorCode::Cancelled,
+            ScanErrorCode::Clamped,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for code in codes {
+            let token = code.as_str();
+            assert!(seen.insert(token), "{token} listed twice");
+            assert_eq!(
+                serde_json::to_string(&code).expect("serializes"),
+                format!("\"{token}\""),
+                "serde token of {token}"
+            );
+            assert_eq!(code.to_string(), token);
+            assert_eq!(token.parse::<ScanErrorCode>().expect("parses"), code);
+            assert_eq!(
+                ScanErrorCode::parse_message(&format!("scan: {token}: why")),
+                Some((code, "why"))
+            );
+        }
+        assert_eq!(seen.len(), 11);
+    }
+
+    /// Tester: `parse_message` is fed raw `anyhow` text from anywhere, so every
+    /// malformed shape must fall back to `None` rather than mis-parse. The empty
+    /// string, a bare prefix, an unknown code, a missing message separator and a
+    /// code buried mid-string are all refused; a message containing `": "` keeps
+    /// its whole tail.
+    #[test]
+    fn parse_message_refuses_malformed_input() {
+        for junk in [
+            "",
+            " ",
+            "scan:",
+            "scan: ",
+            "scan: busy",
+            "scan: busy:",
+            "scan: nonsense: why",
+            "scan:busy: why",
+            "SCAN: busy: why",
+            "prefixed scan: busy: why",
+            ": : ",
+        ] {
+            assert_eq!(
+                ScanErrorCode::parse_message(junk),
+                None,
+                "{junk:?} must not parse"
+            );
+        }
+        assert_eq!(
+            ScanErrorCode::parse_message("scan: out_of_scope: host: port not in scope"),
+            Some((ScanErrorCode::OutOfScope, "host: port not in scope")),
+            "only the first separator splits"
+        );
+    }
+
     #[test]
     fn check_origin_is_kind_tagged() {
         assert_eq!(

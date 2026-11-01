@@ -393,4 +393,126 @@ mod tests {
             }
         );
     }
+
+    /// A sender whose connection dies mid-send, the way a dropped upstream TCP
+    /// connection surfaces to the client.
+    struct DroppingSender;
+
+    impl RequestSender for DroppingSender {
+        fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+            Box::pin(async { Err(anyhow::anyhow!("connection reset by peer")) })
+        }
+    }
+
+    /// Tester: an upstream that drops mid-send stores no half-flow and still
+    /// charges the host's error budget — the bulk `record: Never` path must not
+    /// become a way to hammer a dead host for free. With a budget of one, the
+    /// single failure disables the host, which is how the charge is observed.
+    #[tokio::test]
+    async fn send_opts_upstream_drop_stores_nothing_and_charges_the_error_budget() {
+        for record in [RecordPolicy::Always, RecordPolicy::Never] {
+            let store = Arc::new(MemFlowStore::new());
+            let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+                host_error_budget: 1,
+                ..Default::default()
+            }));
+            guard.add_scope(ScopeEntry {
+                host: "ex.test".into(),
+            });
+            let client =
+                PipelineClient::new(store.clone(), guard.clone(), Arc::new(DroppingSender));
+
+            let err = client
+                .send_opts(
+                    req("ex.test"),
+                    SendOptions {
+                        record,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("the upstream dropped");
+            assert!(
+                err.to_string().contains("connection reset"),
+                "the upstream error reaches the caller unchanged: {err}"
+            );
+            assert_eq!(store.count(), 0, "{record:?}: no half-flow is stored");
+            assert!(
+                guard.check_active("ex.test").is_err(),
+                "{record:?}: the failure charged the host's error budget"
+            );
+        }
+    }
+
+    /// Tester: a 5xx under `record: Never` is not stored, but it still charges
+    /// the error budget, so an unrecorded bulk run cannot outrun the breaker.
+    #[tokio::test]
+    async fn send_opts_never_still_charges_a_5xx() {
+        struct ServerErrorSender;
+        impl RequestSender for ServerErrorSender {
+            fn send(&self, _req: &HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpResponse>> {
+                Box::pin(async {
+                    let mut resp = ok_response();
+                    resp.status = 503;
+                    Ok(resp)
+                })
+            }
+        }
+
+        let store = Arc::new(MemFlowStore::new());
+        let guard = Arc::new(StdGuard::new(crate::config::LimitConfig {
+            host_error_budget: 1,
+            ..Default::default()
+        }));
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let client = PipelineClient::new(store.clone(), guard.clone(), Arc::new(ServerErrorSender));
+
+        let flow = client
+            .send_opts(
+                req("ex.test"),
+                SendOptions {
+                    record: RecordPolicy::Never,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a 5xx is still a response");
+        assert_eq!(flow.response.expect("has a response").status, 503);
+        assert_eq!(store.count(), 0, "record: Never stores nothing");
+        assert!(
+            guard.check_active("ex.test").is_err(),
+            "the 5xx charged the host's error budget"
+        );
+    }
+
+    /// Tester: marks are carried verbatim, including an empty list and a long or
+    /// odd mark, and a `Never` send leaves nothing behind that could carry them
+    /// into the store.
+    #[tokio::test]
+    async fn marks_are_carried_verbatim() {
+        let store = Arc::new(MemFlowStore::new());
+        let guard = scoped_guard();
+        let client = PipelineClient::new(store.clone(), guard, Arc::new(RecordingSender::new()));
+
+        let odd = vec![
+            String::new(),
+            "scan:job-\u{1F600}".to_string(),
+            "x".repeat(4096),
+        ];
+        let flow = client
+            .send_opts(
+                req("ex.test"),
+                SendOptions {
+                    record: RecordPolicy::Always,
+                    marks: odd.clone(),
+                    version: VersionPolicy::Auto,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(flow.metadata.marks, odd);
+        assert_eq!(stored_marks(&store, flow.id), odd);
+    }
 }

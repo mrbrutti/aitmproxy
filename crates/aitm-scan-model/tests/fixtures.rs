@@ -322,6 +322,106 @@ fn no_fixture_carries_a_secret_value() {
     }
 }
 
+/// Tester: the result types are deliberately tolerant (`#[serde(default)]`, no
+/// `deny_unknown_fields`), which means a fixture key the model does **not** have
+/// — a typo, a renamed field, a key left over from an older draft — parses
+/// silently and the UI tracks build against a shape the engine will never send.
+/// This closes that hole: every key in every fixture must survive a parse and a
+/// re-serialize of the model type that carries it.
+#[test]
+fn no_fixture_key_is_silently_dropped() {
+    /// Parse a fixture into its model type and serialize the model back.
+    type Reparse = fn(&str) -> serde_json::Value;
+
+    macro_rules! reparse {
+        ($t:ty) => {
+            (|s: &str| -> serde_json::Value {
+                let v: $t = serde_json::from_str(s).expect("fixture parses");
+                serde_json::to_value(&v).expect("model re-serializes")
+            }) as Reparse
+        };
+    }
+
+    let table: Vec<(&str, Reparse)> = vec![
+        ("scan.start.json", reparse!(StartResult)),
+        ("scan.map.json", reparse!(StartResult)),
+        ("scan.status.json", reparse!(aitm_scan_model::JobStatus)),
+        ("scan.list.json", reparse!(ListResult)),
+        ("scan.cancel.json", reparse!(aitm_scan_model::JobStatus)),
+        ("scan.issues.json", reparse!(aitm_scan_model::IssuesResult)),
+        ("scan.issue.json", reparse!(Issue)),
+        ("scan.issue.update.json", reparse!(Issue)),
+        ("scan.sitemap.json", reparse!(SitemapResult)),
+        ("scan.checks.json", reparse!(ChecksResult)),
+        ("scan.profile.list.json", reparse!(ProfileListResult)),
+        ("scan.profile.get.json", reparse!(ScanProfile)),
+        ("scan.profile.save.json", reparse!(ProfileSaveResult)),
+        ("scan.profile.delete.json", reparse!(ProfileDeleteResult)),
+        ("scan.session.preview.json", reparse!(SessionProfile)),
+        ("job.started.json", reparse!(JobNotification)),
+        ("job.phase.json", reparse!(JobNotification)),
+        ("job.progress.json", reparse!(JobNotification)),
+        ("job.issue.json", reparse!(JobNotification)),
+        ("job.finished.json", reparse!(JobNotification)),
+        ("job.cancelled.json", reparse!(JobNotification)),
+        ("job.failed.json", reparse!(JobNotification)),
+    ];
+    assert_eq!(
+        table.len(),
+        ALL_FIXTURES.len(),
+        "the table covers every fixture"
+    );
+
+    for (name, reparse) in table {
+        let text = read(name);
+        let original: serde_json::Value = serde_json::from_str(&text).expect("fixture is JSON");
+        let emitted = reparse(&text);
+        let mut lost = Vec::new();
+        collect_lost_keys(&original, &emitted, String::new(), &mut lost);
+        assert!(
+            lost.is_empty(),
+            "fixture {name} carries keys the model does not: {lost:?}"
+        );
+    }
+}
+
+/// Walk `original` against `emitted` and record every object key the model did
+/// not emit back. A `null` in the fixture whose key is absent from the output is
+/// allowed: that is a `skip_serializing_if` optional, not a lost key.
+fn collect_lost_keys(
+    original: &serde_json::Value,
+    emitted: &serde_json::Value,
+    path: String,
+    lost: &mut Vec<String>,
+) {
+    match (original, emitted) {
+        (serde_json::Value::Object(o), serde_json::Value::Object(e)) => {
+            for (key, value) in o {
+                let child = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                match e.get(key) {
+                    Some(got) => collect_lost_keys(value, got, child, lost),
+                    None if value.is_null() => {}
+                    None => lost.push(child),
+                }
+            }
+        }
+        (serde_json::Value::Array(o), serde_json::Value::Array(e)) => {
+            for (i, value) in o.iter().enumerate() {
+                if let Some(got) = e.get(i) {
+                    collect_lost_keys(value, got, format!("{path}[{i}]"), lost);
+                } else {
+                    lost.push(format!("{path}[{i}]"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[test]
 fn push_sequence_is_monotonic() {
     let seqs: Vec<u64> = PUSH_FIXTURES

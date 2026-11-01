@@ -1254,4 +1254,92 @@ mod tests {
             Err(L4GuardError::OutOfL4Scope(_))
         ));
     }
+
+    /// D9.5 (tester) — the wildcard widens the interface only: a broad wildcard
+    /// entry still cannot reach a denylisted destination (cloud metadata).
+    #[test]
+    fn wildcard_does_not_lift_the_denylist() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("0.0.0.0", 0),
+            ANY_INTERFACE,
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        assert_eq!(
+            g.check(
+                L4Action::Inject,
+                &target("en0", L4Direction::Outbound, "169.254.169.254", 80)
+            )
+            .unwrap_err(),
+            L4GuardError::DangerousDestinationBlocked("169.254.169.254".into())
+        );
+    }
+
+    /// D9.5 (tester) — the wildcard widens the interface only: a Capture-only
+    /// wildcard entry still refuses Inject and Intercept on every interface.
+    #[test]
+    fn wildcard_does_not_widen_capability() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("10.0.0.0", 8),
+            ANY_INTERFACE,
+            L4Direction::Outbound,
+            L4Capability::Capture,
+            (100, 100),
+        ))
+        .unwrap();
+        let t = target("en0", L4Direction::Outbound, "10.1.2.3", 6379);
+        assert_eq!(
+            g.check(L4Action::Inject, &t).unwrap_err(),
+            L4GuardError::CapabilityNotGranted(L4Capability::Inject)
+        );
+        assert_eq!(
+            g.check(L4Action::Intercept, &t).unwrap_err(),
+            L4GuardError::CapabilityNotGranted(L4Capability::Intercept)
+        );
+        assert!(g.check(L4Action::Capture, &t).is_ok());
+    }
+
+    /// D9.5 (tester) — the motivating case: a socket client that cannot name its
+    /// egress NIC passes an empty interface, and a wildcard entry still matches
+    /// it while a literal entry still refuses it.
+    #[test]
+    fn wildcard_matches_an_unnamed_interface() {
+        let wild = L4Guard::new(&cfg());
+        wild.add_scope(entry(
+            ("10.0.0.0", 8),
+            ANY_INTERFACE,
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        assert!(wild
+            .check(
+                L4Action::Inject,
+                &target("", L4Direction::Outbound, "10.1.2.3", 6379)
+            )
+            .is_ok());
+
+        let literal = L4Guard::new(&cfg());
+        literal
+            .add_scope(entry(
+                ("10.0.0.0", 8),
+                "lo0",
+                L4Direction::Outbound,
+                L4Capability::Inject,
+                (100, 100),
+            ))
+            .unwrap();
+        assert!(matches!(
+            literal.check(
+                L4Action::Inject,
+                &target("", L4Direction::Outbound, "10.1.2.3", 6379)
+            ),
+            Err(L4GuardError::OutOfL4Scope(_))
+        ));
+    }
 }

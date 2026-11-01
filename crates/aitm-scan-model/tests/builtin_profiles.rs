@@ -176,3 +176,96 @@ fn unknown_key_is_rejected() {
         "error should name the key: {err}"
     );
 }
+
+/// Tester: `deny_unknown_fields` must hold on the *nested* blocks too. A typo
+/// inside `budget:` or `audit:` is the likely operator mistake, and silently
+/// ignoring it would run a scan with defaults the operator never asked for.
+#[test]
+fn a_mistyped_key_inside_a_block_is_rejected() {
+    for (yaml, key) in [
+        ("name: t\nbudget:\n  probs: 5\n", "probs"),
+        (
+            "name: t\naudit:\n  max_point_per_request: 4\n",
+            "max_point_per_request",
+        ),
+        (
+            "name: t\ntarget:\n  origin: http://127.0.0.1:8080\n",
+            "origin",
+        ),
+        ("name: t\nl4:\n  case: 5\n", "case"),
+        ("name: t\nhttp:\n  versions: h2\n", "versions"),
+    ] {
+        let err = serde_yaml::from_str::<ScanProfile>(yaml)
+            .expect_err("a mistyped nested key is an error");
+        assert!(
+            err.to_string().contains(key),
+            "error should name {key}: {err}"
+        );
+    }
+}
+
+/// Tester: malformed operator input never panics and never yields a profile.
+/// A scalar, a list, an unknown enum token and a wrong-typed value are all parse
+/// errors the verb surfaces as `invalid_profile`.
+#[test]
+fn malformed_profile_input_is_an_error_not_a_default() {
+    for yaml in [
+        "just a string",
+        "- name: t\n",
+        "name: t\nbudget: 5\n",
+        "name: t\nlanes: http\n",
+        "name: t\nbudget:\n  probes: not-a-number\n",
+        "name: t\nlanes:\n  - nope\n",
+        "name: t\nintensity: very\n",
+    ] {
+        assert!(
+            serde_yaml::from_str::<ScanProfile>(yaml).is_err(),
+            "{yaml:?} must not parse into a profile"
+        );
+    }
+}
+
+/// Tester: an absurdly large budget still parses (clamping to the ceilings is the
+/// engine's job, spec D3's `clamped` list, not the model's), but a value that
+/// cannot fit the field's type is a parse error rather than a wrap-around.
+#[test]
+fn oversized_budget_values_parse_or_fail_but_never_wrap() {
+    let big: ScanProfile =
+        serde_yaml::from_str("name: t\nbudget:\n  probes: 4294967295\n").expect("u32::MAX fits");
+    assert_eq!(big.budget.probes, u32::MAX);
+
+    assert!(
+        serde_yaml::from_str::<ScanProfile>("name: t\nbudget:\n  probes: 4294967296\n").is_err(),
+        "one past u32::MAX is an error, not a wrap to 0"
+    );
+    assert!(
+        serde_yaml::from_str::<ScanProfile>("name: t\nbudget:\n  probes: -1\n").is_err(),
+        "a negative budget is an error, not a wrap to u32::MAX"
+    );
+}
+
+/// Tester, behaviour pin: an **empty** profile document is not a parse error -
+/// `ScanProfile` is `#[serde(default)]`, so an empty file yields the all-defaults
+/// profile with an empty name and no origins. The model is deliberately tolerant
+/// here; refusing a nameless, targetless profile belongs to the engine (track
+/// T1b validates it and fails `scan.start` with `invalid_profile`). This pins
+/// what the model does today so a later track cannot assume the parse refused it.
+#[test]
+fn an_empty_document_yields_the_default_profile_not_an_error() {
+    let profile: ScanProfile =
+        serde_yaml::from_str("").expect("an empty document parses into defaults today");
+    assert_eq!(profile.name, "");
+    assert!(
+        profile.target.origins.is_empty(),
+        "it has no target, so no scan can start from it"
+    );
+    assert_eq!(profile, ScanProfile::default());
+
+    // An explicit null is not the same thing: it is a type error.
+    for yaml in ["~", "null"] {
+        assert!(
+            serde_yaml::from_str::<ScanProfile>(yaml).is_err(),
+            "{yaml:?} is an explicit null, not an empty document"
+        );
+    }
+}

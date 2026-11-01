@@ -234,6 +234,50 @@ mod tests {
         assert!(plugin.lanes().is_empty());
     }
 
+    /// Tester: the setters are documented as *replacing* what is already set,
+    /// not appending to it — the binary calls each one exactly once, and a second
+    /// call that silently doubled the catalogue would schedule every check twice.
+    #[test]
+    fn the_setters_replace_rather_than_append() {
+        let plugin = ScannerPlugin::new(ScannerConfig::default())
+            .with_lanes(vec![Arc::new(TestLane) as Arc<dyn Lane>])
+            .with_lanes(vec![
+                Arc::new(TestLane) as Arc<dyn Lane>,
+                Arc::new(TestLane) as Arc<dyn Lane>,
+            ])
+            .with_native_checks(vec![Arc::new(TestCheck::new()) as Arc<dyn Check>])
+            .with_native_checks(vec![Arc::new(TestCheck::new()) as Arc<dyn Check>]);
+
+        assert_eq!(plugin.lanes().len(), 2, "the last with_lanes call wins");
+        assert_eq!(
+            plugin.native_checks().len(),
+            1,
+            "the last with_native_checks call wins"
+        );
+
+        // Replacing with an empty list empties the slot; it does not keep the old one.
+        let emptied = plugin.with_lanes(Vec::new()).with_native_checks(Vec::new());
+        assert!(emptied.lanes().is_empty());
+        assert!(emptied.native_checks().is_empty());
+    }
+
+    /// Spec D12 / AC T1a-1: T1a adds **no verb**. A plugin carrying lane and
+    /// check slots registers exactly the three shipped `scan.*` commands and
+    /// nothing else, so `tools/list` is unchanged by the contract drop.
+    #[test]
+    fn filled_slots_register_no_extra_verb() {
+        let mut reg = Registry::new();
+        reg.add_plugin(Box::new(
+            ScannerPlugin::new(ScannerConfig::default())
+                .with_lanes(vec![Arc::new(TestLane) as Arc<dyn Lane>])
+                .with_native_checks(vec![Arc::new(TestCheck::new()) as Arc<dyn Check>]),
+        ));
+
+        let mut names: Vec<&str> = reg.commands().map(|c| c.name()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["scan.discover", "scan.passive", "scan.report"]);
+    }
+
     /// What the binary builds today, every lane crate still a skeleton: a plugin
     /// holding no slots at all.
     #[test]
