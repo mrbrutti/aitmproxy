@@ -16,6 +16,46 @@ use aitm_core::{
 use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::flow::{L4Flow, L4FlowStore};
 
+/// How many packets `l4.flow.get` returns when the caller gives no `limit`.
+pub const FLOW_GET_DEFAULT_LIMIT: usize = 256;
+/// The most packets one `l4.flow.get` reply carries; a larger `limit` is clamped.
+pub const FLOW_GET_MAX_LIMIT: usize = 4096;
+
+/// The `[offset, offset + limit)` slice of a flow's packet log that one
+/// `l4.flow.get` reply carries (spec §2, L4PAR-AC2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PacketWindow {
+    /// Index of the first packet returned.
+    pub(crate) offset: usize,
+    /// How many packets to return at most; `0` returns none.
+    pub(crate) limit: usize,
+}
+
+impl PacketWindow {
+    /// The window an argument-less call (or the Rhai `l4.flow.get`) gets.
+    pub(crate) const DEFAULT: PacketWindow = PacketWindow {
+        offset: 0,
+        limit: FLOW_GET_DEFAULT_LIMIT,
+    };
+
+    /// Read `offset` / `limit` from a command's params: absent ⇒ the default,
+    /// negative ⇒ an error naming the param, `limit` clamped to
+    /// [`FLOW_GET_MAX_LIMIT`].
+    pub(crate) fn from_params(args: &Params) -> anyhow::Result<PacketWindow> {
+        let read = |name: &str, default: usize| -> anyhow::Result<usize> {
+            if args.get(name).is_none() {
+                return Ok(default);
+            }
+            let v = args.get_int(name)?;
+            usize::try_from(v)
+                .map_err(|_| anyhow::anyhow!("`{name}` must be a non-negative integer"))
+        };
+        let offset = read("offset", Self::DEFAULT.offset)?;
+        let limit = read("limit", Self::DEFAULT.limit)?.min(FLOW_GET_MAX_LIMIT);
+        Ok(PacketWindow { offset, limit })
+    }
+}
+
 /// `l4.flow.list` → the ids of every stored L4 flow, oldest first.
 pub struct FlowList {
     store: Arc<dyn L4FlowStore>,
@@ -81,15 +121,33 @@ impl Command for FlowGet {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "Summarize one L4 flow: kind, bind, creation time, endpoints, and its \
-                          packets with bytes, time and addresses (read-only)."
+            description: "Summarize one L4 flow: kind, bind, creation time, endpoints, and a \
+                          window of its packets with bytes, time and addresses (read-only). \
+                          `packet_count` is always the total; list polling should pass \
+                          `limit: 0` and let only an inspector fetch a window."
                 .into(),
-            params: vec![ParamDef {
-                name: "id".into(),
-                ty: TypeDesc::Str,
-                required: true,
-                description: "The L4 flow id to summarize.".into(),
-            }],
+            params: vec![
+                ParamDef {
+                    name: "id".into(),
+                    ty: TypeDesc::Str,
+                    required: true,
+                    description: "The L4 flow id to summarize.".into(),
+                },
+                ParamDef {
+                    name: "offset".into(),
+                    ty: TypeDesc::Int,
+                    required: false,
+                    description: "First packet index to return (default 0).".into(),
+                },
+                ParamDef {
+                    name: "limit".into(),
+                    ty: TypeDesc::Int,
+                    required: false,
+                    description: "How many packets to return (default 256, at most 4096; 0 \
+                                  returns none)."
+                        .into(),
+                },
+            ],
             result: TypeDesc::Object(flow_fields()),
         }
     }
@@ -97,11 +155,12 @@ impl Command for FlowGet {
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         let id_str = args.get_str("id")?;
         let id = super::flow_id_from_str(id_str)?;
+        let window = PacketWindow::from_params(&args)?;
         let flow = self
             .store
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("no L4 flow with id {id_str}"))?;
-        Ok(flow_to_value(&flow))
+        Ok(flow_to_value(&flow, window))
     }
 }
 
@@ -174,13 +233,19 @@ fn flow_fields() -> Vec<ParamDef> {
             "packet_count",
             TypeDesc::Int,
             true,
-            "Packets recorded so far.",
+            "Packets recorded so far (the whole log, not just this window).",
         ),
         field(
             "injected_count",
             TypeDesc::Int,
             true,
             "Of those, how many aitmproxy authored.",
+        ),
+        field(
+            "offset",
+            TypeDesc::Int,
+            true,
+            "Index in the log of the first packet in `packets` (the `offset` asked for).",
         ),
         field(
             "packets",
@@ -243,7 +308,8 @@ fn flow_fields() -> Vec<ParamDef> {
                 ),
             ]))),
             true,
-            "The packet log, in arrival order.",
+            "The `[offset, offset + limit)` window of the packet log, in arrival order; \
+             empty past the end.",
         ),
     ]
 }
@@ -280,8 +346,10 @@ fn insert_endpoints(o: &mut BTreeMap<String, Value>, e: &PacketEndpoints) {
     );
 }
 
-/// An [`L4Flow`] as a transport-neutral object.
-pub(crate) fn flow_to_value(flow: &L4Flow) -> Value {
+/// An [`L4Flow`] as a transport-neutral object carrying the `window` slice of
+/// its packet log. `packet_count`, `injected_count` and the flow-level endpoints
+/// are over the whole log, so a `limit: 0` read still names the flow's target.
+pub(crate) fn flow_to_value(flow: &L4Flow, window: PacketWindow) -> Value {
     use crate::flow::L4FlowKind;
     use crate::types::L4Direction;
 
@@ -296,16 +364,21 @@ pub(crate) fn flow_to_value(flow: &L4Flow) -> Value {
         L4Direction::Outbound => "outbound",
     };
 
-    // Flow-level endpoints: the first packet that decodes to a transport.
-    let mut flow_endpoints = PacketEndpoints::default();
+    // Flow-level endpoints: the first packet in the whole log that decodes to a
+    // transport, whatever window the caller asked for.
+    let flow_endpoints = flow
+        .packets
+        .iter()
+        .map(|p| PacketSpec::endpoints(&p.bytes))
+        .find(|e| e.proto.is_some())
+        .unwrap_or_default();
     let packets: Vec<Value> = flow
         .packets
         .iter()
+        .skip(window.offset)
+        .take(window.limit)
         .map(|p| {
             let endpoints = PacketSpec::endpoints(&p.bytes);
-            if flow_endpoints.proto.is_none() && endpoints.proto.is_some() {
-                flow_endpoints = endpoints.clone();
-            }
             let mut o = BTreeMap::new();
             o.insert("dir".to_string(), Value::Str(dir(p.dir).to_string()));
             o.insert("length".to_string(), Value::Int(p.bytes.len() as i64));
@@ -352,6 +425,7 @@ pub(crate) fn flow_to_value(flow: &L4Flow) -> Value {
         Value::Int(flow.packets.len() as i64),
     );
     obj.insert("injected_count".to_string(), Value::Int(injected as i64));
+    obj.insert("offset".to_string(), Value::Int(window.offset as i64));
     obj.insert("packets".to_string(), Value::Array(packets));
     Value::Object(obj)
 }
@@ -556,5 +630,214 @@ mod tests {
     fn epoch_ms_clamps_pre_epoch_to_zero() {
         assert_eq!(epoch_ms(UNIX_EPOCH - Duration::from_secs(5)), 0);
         assert_eq!(epoch_ms(at_ms(1_700_000_000_123)), 1_700_000_000_123);
+    }
+
+    // ---- L4PAR-AC2: bounded packet window ----------------------------------
+
+    /// A Capture flow of `n` crafted UDP packets, every other one injected, in a
+    /// fresh store. Returns the store and the flow id string.
+    fn n_packet_flow(n: usize) -> (Arc<dyn L4FlowStore>, String) {
+        let bytes = crafted_udp();
+        let decoded = PacketSpec::summarize(&bytes);
+        let packets: VecDeque<L4Packet> = (0..n)
+            .map(|i| L4Packet {
+                dir: L4Direction::Inbound,
+                timestamp: at_ms(PACKET_MS + i as u64),
+                decoded: decoded.clone(),
+                bytes: bytes.clone(),
+                injected: i % 2 == 1,
+            })
+            .collect();
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let id = store.insert(L4Flow {
+            id: L4FlowId::new(),
+            kind: L4FlowKind::Capture,
+            bind: L4Bind {
+                interface: "lo0".into(),
+                filter: None,
+                queue: None,
+            },
+            packets,
+            metadata: L4Meta {
+                marks: Vec::new(),
+                comment: None,
+                created: at_ms(CREATED_MS),
+            },
+        });
+        (store, super::super::flow_id_to_string(id))
+    }
+
+    /// Invoke `l4.flow.get` with `id` plus the given extra params, the way a bus
+    /// caller does, returning the raw command result.
+    fn get_window(
+        store: Arc<dyn L4FlowStore>,
+        id: &str,
+        extra: &[(&str, i64)],
+    ) -> anyhow::Result<Value> {
+        let mem = MemFlowStore::new();
+        let client = StubClient;
+        let core = StdGuard::default();
+        let host = CommandHost::new(&mem, &client, &core, None);
+        let mut m = BTreeMap::new();
+        m.insert("id".to_string(), Value::Str(id.to_string()));
+        for (k, v) in extra {
+            m.insert((*k).to_string(), Value::Int(*v));
+        }
+        FlowGet::new(store).invoke(Params::new(m), &host)
+    }
+
+    /// The flow object and the number of packets it carries.
+    fn flow_and_count(v: Value) -> (BTreeMap<String, Value>, usize) {
+        let Value::Object(flow) = v else {
+            panic!("l4.flow.get returns an object, got {v:?}");
+        };
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array: {flow:?}");
+        };
+        (flow.clone(), packets.len())
+    }
+
+    /// L4PAR-AC2 — no window params: the first 256 of 300 packets, totals intact,
+    /// `offset 0` reported.
+    #[test]
+    fn window_default_returns_256_of_300() {
+        let (store, id) = n_packet_flow(300);
+        let (flow, n) = flow_and_count(get_window(store, &id, &[]).expect("flow.get ok"));
+        assert_eq!(n, FLOW_GET_DEFAULT_LIMIT);
+        assert_eq!(n, 256);
+        assert_eq!(flow.get("packet_count"), Some(&Value::Int(300)));
+        assert_eq!(flow.get("injected_count"), Some(&Value::Int(150)));
+        assert_eq!(flow.get("offset"), Some(&Value::Int(0)));
+    }
+
+    /// L4PAR-AC2 — `{offset 290, limit 50}` on 300 packets: the 10 that exist,
+    /// `offset 290` echoed, and the slice starts at packet 290.
+    #[test]
+    fn window_offset_and_limit_slice_the_log() {
+        let (store, id) = n_packet_flow(300);
+        let got = get_window(store, &id, &[("offset", 290), ("limit", 50)]).expect("flow.get ok");
+        let (flow, n) = flow_and_count(got);
+        assert_eq!(n, 10);
+        assert_eq!(flow.get("offset"), Some(&Value::Int(290)));
+        assert_eq!(flow.get("packet_count"), Some(&Value::Int(300)));
+        assert_eq!(flow.get("injected_count"), Some(&Value::Int(150)));
+        let Some(Value::Array(packets)) = flow.get("packets") else {
+            panic!("packets is an array");
+        };
+        let Some(Value::Object(first)) = packets.first() else {
+            panic!("first packet is an object");
+        };
+        assert_eq!(
+            first.get("timestamp"),
+            Some(&Value::Int(PACKET_MS as i64 + 290)),
+            "the window starts at packet 290"
+        );
+    }
+
+    /// L4PAR-AC2 — `limit 0` (list polling): no packets, but the totals and the
+    /// flow-level endpoints are still there so a list row can show its target.
+    #[test]
+    fn window_limit_zero_returns_no_packets() {
+        let (store, id) = n_packet_flow(300);
+        let (flow, n) =
+            flow_and_count(get_window(store, &id, &[("limit", 0)]).expect("flow.get ok"));
+        assert_eq!(n, 0);
+        assert_eq!(flow.get("packets"), Some(&Value::Array(vec![])));
+        assert_eq!(flow.get("packet_count"), Some(&Value::Int(300)));
+        assert_eq!(flow.get("injected_count"), Some(&Value::Int(150)));
+        assert_eq!(flow.get("offset"), Some(&Value::Int(0)));
+        assert_eq!(flow.get("proto"), Some(&Value::Str("UDP".into())));
+        assert_eq!(flow.get("dst_port"), Some(&Value::Int(9053)));
+    }
+
+    /// L4PAR-AC2 — `limit 100000` on 5000 packets is clamped to exactly 4096.
+    #[test]
+    fn window_limit_is_clamped_to_max() {
+        let (store, id) = n_packet_flow(5000);
+        let (flow, n) =
+            flow_and_count(get_window(store, &id, &[("limit", 100_000)]).expect("flow.get ok"));
+        assert_eq!(n, FLOW_GET_MAX_LIMIT);
+        assert_eq!(n, 4096);
+        assert_eq!(flow.get("packet_count"), Some(&Value::Int(5000)));
+    }
+
+    /// L4PAR-AC2 — an offset past the end is an empty window, not an error.
+    #[test]
+    fn window_offset_past_end_is_empty() {
+        let (store, id) = n_packet_flow(300);
+        let (flow, n) =
+            flow_and_count(get_window(store, &id, &[("offset", 400)]).expect("flow.get ok"));
+        assert_eq!(n, 0);
+        assert_eq!(flow.get("offset"), Some(&Value::Int(400)));
+        assert_eq!(flow.get("packet_count"), Some(&Value::Int(300)));
+    }
+
+    /// L4PAR-AC2 — negative window params are refused with a named error.
+    #[test]
+    fn window_negative_params_are_errors() {
+        let (store, id) = n_packet_flow(3);
+        let err = get_window(store.clone(), &id, &[("limit", -1)]).expect_err("negative limit");
+        assert!(
+            err.to_string()
+                .contains("`limit` must be a non-negative integer"),
+            "got: {err}"
+        );
+        let err = get_window(store, &id, &[("offset", -1)]).expect_err("negative offset");
+        assert!(
+            err.to_string()
+                .contains("`offset` must be a non-negative integer"),
+            "got: {err}"
+        );
+    }
+
+    /// L4PAR-AC2 — `PacketWindow::from_params` is the one place the window is read.
+    #[test]
+    fn window_from_params_defaults_and_clamps() {
+        assert_eq!(
+            PacketWindow::from_params(&Params::default()).expect("absent is default"),
+            PacketWindow::DEFAULT
+        );
+        assert_eq!(
+            PacketWindow::DEFAULT,
+            PacketWindow {
+                offset: 0,
+                limit: 256
+            }
+        );
+        let mut m = BTreeMap::new();
+        m.insert("offset".to_string(), Value::Int(7));
+        m.insert("limit".to_string(), Value::Int(1_000_000));
+        assert_eq!(
+            PacketWindow::from_params(&Params::new(m)).expect("clamped"),
+            PacketWindow {
+                offset: 7,
+                limit: 4096
+            }
+        );
+    }
+
+    /// L4PAR-AC2 — the schema offers `id`, then optional `offset` and `limit`, so
+    /// a UI can detect the window from `tools/list`.
+    #[test]
+    fn window_schema_params_are_id_offset_limit() {
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let schema = FlowGet::new(store).schema();
+        let names: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["id", "offset", "limit"]);
+        let by = |n: &str| schema.params.iter().find(|p| p.name == n).expect(n);
+        assert!(by("id").required);
+        assert!(!by("offset").required);
+        assert!(!by("limit").required);
+        assert!(matches!(by("offset").ty, TypeDesc::Int));
+        assert!(matches!(by("limit").ty, TypeDesc::Int));
+        let TypeDesc::Object(fields) = &schema.result else {
+            panic!("result is an object");
+        };
+        assert!(
+            fields
+                .iter()
+                .any(|f| f.name == "offset" && matches!(f.ty, TypeDesc::Int)),
+            "the reply schema lists `offset`"
+        );
     }
 }

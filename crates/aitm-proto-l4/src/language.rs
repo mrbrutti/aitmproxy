@@ -485,7 +485,10 @@ fn do_flow_get(live: &L4Live, id: &str) -> Result<Value, HostError> {
         .store
         .get(id)
         .ok_or_else(|| HostError::BadArgs(format!("no L4 flow with id {id:?}")))?;
-    Ok(crate::commands::flow::flow_to_value(&flow))
+    Ok(crate::commands::flow::flow_to_value(
+        &flow,
+        crate::commands::flow::PacketWindow::DEFAULT,
+    ))
 }
 
 /// `l4.inject` — guarded wire write of a crafted packet, `count` copies, through
