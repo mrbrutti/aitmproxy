@@ -709,6 +709,181 @@ fn map_falls_back_to_discover() {
     assert_eq!(toast(&app), "scan.map is not on this bus");
 }
 
+/// Fix round G, G71 (D7 as amended): the UI-3 L4 gate holds `s` only; a
+/// map runs no L4 lane, so `m` on an L4-blocked draft with an in-scope
+/// origin sends one `scan.map`.
+#[test]
+fn the_l4_gate_holds_start_but_not_map() {
+    let mut app = opened();
+    open_standard(&mut app);
+    make_l4_stream_only(&mut app);
+    add_l4_target(&mut app);
+    app.scan
+        .profiles
+        .editor
+        .as_mut()
+        .expect("editor")
+        .draft
+        .target
+        .origins
+        .push(ORIGIN.to_string());
+    assert_eq!(app.scan.launch.blocked.as_deref(), Some(GATE_NO_INJECT));
+    let reqs = app.update(Action::ScanStart);
+    assert!(reqs.is_empty(), "s is held: {reqs:?}");
+    let reqs = app.update(Action::ScanMap);
+    assert_eq!(reqs.len(), 1, "m is not: {reqs:?}");
+    let BusRequest::CallTagged { tag, name, .. } = &reqs[0] else {
+        panic!("a tagged call: {reqs:?}");
+    };
+    assert_eq!((tag.as_str(), name.as_str()), ("scan.map", "scan.map"));
+}
+
+/// Fix round G, G72: the start toast joins the distinct run lanes (four at
+/// most, declaration order) and is cut to the save toast's width, so a
+/// reply with a hundred thousand `http` lanes toasts one `http`.
+#[test]
+fn the_start_toast_dedupes_the_run_lanes() {
+    let mut app = opened();
+    app.scan.profiles.cursor = 3;
+    let _ = app.update(Action::ScanStart);
+    app.toasts.clear();
+    let mut start = fixture("scan.start.json");
+    start["lanes"]["run"] = json!(vec!["http"; 100_000]);
+    let _ = app.on_bus(reply("scan.start", "scan.start", start));
+    let toasts = toast_texts(&app);
+    assert!(
+        toasts.contains(&(
+            Level::Info,
+            "scan-1a2b3c4d started: standard (http)".to_string()
+        )),
+        "{toasts:?}"
+    );
+    assert!(toasts.iter().all(|(_, t)| t.chars().count() <= 4 * 200));
+}
+
+/// Fix round G, G73 (D7 as amended): with no editor the UI-3 gate reads
+/// the Profiles cursor row's lanes: the layer text when `l4.scope.list` is
+/// absent, else the text naming the editor; `s` stays inert while it
+/// holds and the Profiles footer shows it; an HTTP row is not gated.
+#[test]
+fn a_list_row_with_an_l4_lane_is_gated_without_an_editor() {
+    const GATE_OPEN_PROFILE: &str =
+        "L4 launch disabled: open the profile (⏎) to check its L4 target and scope";
+    let without_layer: Vec<&str> = TOOLS
+        .iter()
+        .copied()
+        .filter(|t| *t != "l4.scope.list")
+        .collect();
+    let mut app = opened_with(&without_layer);
+    assert!(app.scan.profiles.editor.is_none());
+    let _ = app.update(Action::End);
+    let _ = app.update(Action::Up);
+    assert_eq!(
+        app.scan.profiles.list[app.scan.profiles.cursor].name,
+        "l4-stream-safe"
+    );
+    assert_eq!(app.scan.launch.blocked.as_deref(), Some(GATE_NO_LAYER));
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains(GATE_NO_LAYER), "{text}");
+    let reqs = app.update(Action::ScanStart);
+    assert!(launch_requests(&reqs).is_empty(), "{reqs:?}");
+
+    let mut app = opened();
+    let _ = app.update(Action::End);
+    assert_eq!(
+        app.scan.profiles.list[app.scan.profiles.cursor].name,
+        "l4-full"
+    );
+    assert_eq!(app.scan.launch.blocked.as_deref(), Some(GATE_OPEN_PROFILE));
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains(GATE_OPEN_PROFILE), "{text}");
+    assert!(launch_requests(&app.update(Action::ScanStart)).is_empty());
+
+    for _ in 0..3 {
+        let _ = app.update(Action::Up);
+    }
+    assert_eq!(
+        app.scan.profiles.list[app.scan.profiles.cursor].name,
+        "standard"
+    );
+    assert_eq!(app.scan.launch.blocked, None);
+    let reqs = app.update(Action::ScanStart);
+    assert_eq!(
+        reqs,
+        vec![tagged(
+            "scan.start",
+            "scan.start",
+            json!({ "profile_name": "standard" })
+        )]
+    );
+}
+
+/// Fix round G, G67: a second wire confirm replacing a `scan.*` one on
+/// screen toasts `<call> confirmation dropped` and clears the pending
+/// launch; `y` on a confirm whose re-issue the reducer refuses clears it
+/// too; a launch reply with no pending launch is recorded, not folded.
+#[test]
+fn a_replaced_scan_confirm_drops_its_pending_launch() {
+    let mut app = opened();
+    app.scan.profiles.cursor = 3;
+    let _ = app.update(Action::ScanStart);
+    let _ = app.on_bus(reply(
+        "scan.start",
+        "scan.start",
+        json!({ "status": "needs_confirmation", "prompt": "P1", "confirm_token": "tok-1" }),
+    ));
+    assert_eq!(app.mode, Mode::WireConfirm);
+    assert!(app.scan.launch.pending.is_some());
+
+    let _ = app.on_bus(BusEvent::CallOk {
+        name: "l4.inject".into(),
+        value: json!({ "status": "needs_confirmation", "prompt": "P2", "confirm_token": "tok-2" }),
+    });
+    assert_eq!(app.mode, Mode::WireConfirm);
+    assert_eq!(
+        app.wire_confirm.as_ref().map(|c| c.call.as_str()),
+        Some("l4.inject")
+    );
+    assert_eq!(
+        app.scan.launch.pending, None,
+        "the stranded launch is cleared"
+    );
+    let toasts = toast_texts(&app);
+    assert!(
+        toasts.contains(&(Level::Warn, "scan.start confirmation dropped".to_string())),
+        "{toasts:?}"
+    );
+    let _ = app.update(Action::WireConfirm(false));
+
+    // `y` whose re-issue is refused (the verb left the bus) clears pending.
+    let _ = app.update(Action::ScanStart);
+    let _ = app.on_bus(reply(
+        "scan.start",
+        "scan.start",
+        json!({ "status": "needs_confirmation", "prompt": "P3", "confirm_token": "tok-3" }),
+    ));
+    assert!(app.scan.launch.pending.is_some());
+    app.tools.retain(|t| t.name != "scan.start");
+    let reqs = app.update(Action::WireConfirm(true));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(app.scan.launch.pending, None);
+
+    // A launch reply with nothing pending is an uncoded error, not a fold.
+    let mut app = opened();
+    assert_eq!(app.scan.launch.pending, None);
+    let reqs = app.on_bus(reply(
+        "scan.start",
+        "scan.start",
+        fixture("scan.start.json"),
+    ));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert!(app.scan.jobs.order.is_empty(), "nothing folded");
+    assert_eq!(
+        app.scan.last_error.as_ref().map(|e| e.detail.as_str()),
+        Some("reply with no pending launch")
+    );
+}
+
 /// D7, D13: while the gate holds a reason, the Jobs tab's footer shows it
 /// too (`s` is live there), in the warning hue, above the key footer.
 #[test]

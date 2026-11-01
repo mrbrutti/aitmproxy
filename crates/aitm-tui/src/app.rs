@@ -5,7 +5,7 @@
 //! data (foundation §2.10: "one fixture file … so a screen renders the same
 //! data on every platform").
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{Read as _, Write as _};
@@ -32,9 +32,9 @@ use crate::model::{
 use crate::open::{self, OpenTarget};
 use crate::scan::{
     fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
-    parse_result, scan_host, state_text, status_token, step, tag_keyed, tag_parts, typed_origin,
-    usable_selector, Dir, EditorField, FieldKind, IssueFilterKey, IssuePane, JobPane, MapSource,
-    PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab,
+    parse_result, row_gate, scan_host, state_text, status_token, step, tag_keyed, tag_parts,
+    typed_origin, usable_selector, Dir, EditorField, FieldKind, IssueFilterKey, IssuePane, JobPane,
+    MapSource, PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab,
     ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
     OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
@@ -2100,7 +2100,12 @@ impl App {
         if yes {
             if is_scan {
                 let mut out = Vec::new();
-                self.scan_call(c.call.clone(), &c.call, c.confirmed_args(), &mut out);
+                // A re-issue the reducer refuses (the verb left the bus)
+                // settles the launch: nothing will answer it (fix round G,
+                // G67).
+                if !self.scan_call(c.call.clone(), &c.call, c.confirmed_args(), &mut out) {
+                    self.scan.launch.pending = None;
+                }
                 return out;
             }
             vec![BusRequest::Call {
@@ -2114,6 +2119,24 @@ impl App {
             self.toast(Level::Info, format!("{} cancelled", c.call));
             Vec::new()
         }
+    }
+
+    /// Open the wire-confirm overlay on `confirm`, returning to `from` when
+    /// it closes: the one spelling the `l4.*` guarded verbs and the `scan.*`
+    /// launches share (fix round G, G67). A confirm already on screen is
+    /// replaced, not answered: its call is toasted as dropped and, for a
+    /// `scan.*` launch, the pending launch it held is cleared (the token
+    /// is gone with the prompt, so nothing can re-issue it).
+    fn open_wire_confirm(&mut self, confirm: crate::scan::launch::WireConfirm, from: Mode) {
+        if let Some(old) = self.wire_confirm.take() {
+            if old.call.starts_with("scan.") {
+                self.scan.launch.pending = None;
+            }
+            self.toast(Level::Warn, format!("{} confirmation dropped", old.call));
+        }
+        self.wire_confirm = Some(confirm);
+        self.wire_confirm_from = from;
+        self.mode = Mode::WireConfirm;
     }
 
     /// Toggle one per-feature agent gate (L4OPS-AC11). Where `l4.agent.set` is
@@ -2977,6 +3000,11 @@ impl App {
                         // from the top.
                         if moved && self.scan.tab == ScanTab::Jobs {
                             self.scan.jobs.detail_scroll = 0;
+                        }
+                        // The row under the Profiles cursor is what `s`
+                        // launches without an editor: re-gate it (G73).
+                        if moved && self.scan.tab == ScanTab::Profiles {
+                            self.recompute_launch_gate();
                         }
                         // The Issues cursor landing on a row reads it (D6)
                         // and shows its detail from the top.
@@ -4065,8 +4093,7 @@ impl App {
                             .unwrap_or((name.clone(), Value::Null));
                         match crate::scan::launch::WireConfirm::from_reply(&call, &args, &value) {
                             Some(confirm) => {
-                                self.wire_confirm = Some(confirm);
-                                self.mode = Mode::WireConfirm;
+                                self.open_wire_confirm(confirm, Mode::Inspector);
                                 return out;
                             }
                             None => {
@@ -4615,16 +4642,20 @@ impl App {
     }
 
     /// The UI-3 launch gate (spec D7): recomputed on every draft change, on
-    /// `Connected` (the tool list) and on `L4Scope` (the entries). Without an
-    /// editor there is no draft to gate.
+    /// `Connected` (the tool list), on `L4Scope` (the entries), on a
+    /// Profiles cursor move, a list fold and an editor close. Without an
+    /// editor the Profiles cursor row's lanes are gated instead
+    /// ([`row_gate`]; D7 as amended, fix round G, G73).
     fn recompute_launch_gate(&mut self) {
         let has_layer = self.has_tool("l4.scope.list");
-        self.scan.launch.blocked = self
-            .scan
-            .profiles
-            .editor
-            .as_ref()
-            .and_then(|e| l4_gate(&e.draft, has_layer, &self.l4.scope));
+        self.scan.launch.blocked = match self.scan.profiles.editor.as_ref() {
+            Some(e) => l4_gate(&e.draft, has_layer, &self.l4.scope),
+            None => self
+                .scan
+                .profiles
+                .cursor_entry()
+                .and_then(|p| row_gate(&p.summary.lanes, has_layer)),
+        };
     }
 
     /// Profiles and Jobs `s` / `m` (spec D7, D11): `verb` is `scan.start` or
@@ -4655,7 +4686,9 @@ impl App {
         if !matches!(self.scan.tab, ScanTab::Profiles | ScanTab::Jobs) {
             return;
         }
-        if self.scan.launch.blocked.is_some() {
+        // The UI-3 gate holds `s` only: a map runs no L4 lane (D7 as
+        // amended; fix round G, G71).
+        if verb == "scan.start" && self.scan.launch.blocked.is_some() {
             return;
         }
         if self.scan.launch.pending.is_some() {
@@ -4751,7 +4784,6 @@ impl App {
                 args,
                 profile_name,
             });
-            self.wire_confirm_from = Mode::Scan;
         }
     }
 
@@ -4796,14 +4828,24 @@ impl App {
             .filter(|n| !n.is_empty())
             .or_else(|| fallback.map(|n| truncate(&n, SAVED_NAME_MAX)))
             .unwrap_or_else(|| "profile".to_string());
+        // The distinct run lanes (four at most, declaration order) and the
+        // whole toast bounded (fix round G, G72).
         let lanes = result
             .lanes
             .run
             .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .map(|l| lane_token(*l))
             .collect::<Vec<_>>()
             .join(" ");
-        self.toast(Level::Info, format!("{id} started: {profile} ({lanes})"));
+        self.toast(
+            Level::Info,
+            truncate(
+                &format!("{id} started: {profile} ({lanes})"),
+                SAVED_PATH_MAX,
+            ),
+        );
         if !result.clamped.is_empty() {
             let parts: Vec<String> = result
                 .clamped
@@ -5200,6 +5242,8 @@ impl App {
             self.scan.jobs.advance_poll(&live[..attempted]);
         }
         if t.is_multiple_of(LIST_POLL_TICKS) && self.mode == Mode::Scan {
+            // A new timer window: the healed jobs may be polled again (G83).
+            self.scan.jobs.healed.clear();
             self.request_scan_list(out);
         }
         let issues_due = self
@@ -5319,21 +5363,20 @@ impl App {
                 // A `needs_confirmation` reply opens the shared overlay with
                 // the pending launch kept for the re-issue (D7); any other
                 // reply settles the launch, folded as a `StartResult` when
-                // it matches the contract.
-                let (call, args) = self
-                    .scan
-                    .launch
-                    .pending
-                    .as_ref()
-                    .map_or((name.to_string(), Value::Null), |p| {
-                        (p.call.clone(), p.args.clone())
-                    });
-                if let Some(confirm) =
-                    crate::scan::launch::WireConfirm::from_reply(&call, &args, &value)
-                {
-                    self.wire_confirm = Some(confirm);
-                    self.wire_confirm_from = Mode::Scan;
-                    self.mode = Mode::WireConfirm;
+                // it matches the contract. A reply with no pending launch
+                // (a cancel or a drop already settled it) is recorded, not
+                // folded (D7 as amended; fix round G, G67).
+                let Some(pending) = self.scan.launch.pending.as_ref() else {
+                    self.scan
+                        .set_error(ScanError::uncoded(tag, "reply with no pending launch"));
+                    return;
+                };
+                if let Some(confirm) = crate::scan::launch::WireConfirm::from_reply(
+                    &pending.call,
+                    &pending.args,
+                    &value,
+                ) {
+                    self.open_wire_confirm(confirm, Mode::Scan);
                     return;
                 }
                 let fallback = self.scan.launch.pending.take().and_then(|p| p.profile_name);
@@ -5358,6 +5401,11 @@ impl App {
                 if let Some(list) = self.scan_reply::<ListResult>(tag, &value) {
                     let followups = self.scan.jobs.fold_list(list);
                     self.request_scan_statuses(&followups, out);
+                    // The list a `not_found` self-heal asked for clears the
+                    // error it left (D13 as amended; fix round G, G74).
+                    if let Some(healed) = self.scan.heal_pending.take() {
+                        self.scan.clear_error(&healed);
+                    }
                 }
             }
             "scan.issues" => {
@@ -5388,6 +5436,8 @@ impl App {
             "scan.profile.list" => {
                 if let Some(list) = self.scan_reply::<ProfileListResult>(tag, &value) {
                     self.scan.profiles.fold_list(list);
+                    // The cursor row may have changed (G73).
+                    self.recompute_launch_gate();
                 }
             }
             "scan.checks" => {
@@ -5611,6 +5661,11 @@ impl App {
         {
             if let Some(job) = key {
                 self.drop_scan_job(job);
+                // The requested list's success clears this error (D13 as
+                // amended, G74) and asks no status for the job until the
+                // timer's list (G83).
+                self.scan.jobs.healed.insert(job.to_string());
+                self.scan.heal_pending = Some(tag.to_string());
                 self.request_scan_list(out);
             }
         }

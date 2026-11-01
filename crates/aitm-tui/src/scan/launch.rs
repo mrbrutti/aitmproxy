@@ -2,6 +2,8 @@
 //! UI-3 reason a launch is blocked, and the wire-confirm handshake shared by the
 //! `l4.*` guarded verbs and the `scan.*` launches.
 
+use std::net::IpAddr;
+
 use aitm_scan_model::{LaneKind, ScanProfile};
 use serde_json::{json, Value};
 
@@ -14,6 +16,11 @@ pub const GATE_NO_LAYER: &str =
     "L4 launch disabled: the L4 layer is not on this bus (l4.scope.list)";
 /// The UI-3 reason when the draft names no L4 target (spec D7, second clause).
 pub const GATE_NO_TARGET: &str = "L4 launch disabled: add an L4 target (ip, port, proto) first";
+/// The UI-3 reason for a list row with an L4 lane and no editor open (D7 as
+/// amended on the Task 12 security panel; fix round G, G73): a row carries
+/// no targets to check, so the operator opens the profile first.
+pub const GATE_OPEN_PROFILE: &str =
+    "L4 launch disabled: open the profile (⏎) to check its L4 target and scope";
 /// The capability word an L4 scope entry needs for a launch (spec D7).
 const INJECT: &str = "inject";
 
@@ -65,12 +72,34 @@ pub fn l4_gate(
     if l4_scope.iter().any(|e| e.capability == INJECT) {
         return None;
     }
-    // A host route: /32 for IPv4, /128 for an IPv6 literal.
-    let prefix = if first.ip.contains(':') { 128 } else { 32 };
+    // A host route: /128 for an IPv6 address, /32 otherwise (fix round G,
+    // G66). An ip that parses as nothing still yields a suggestion: G53
+    // refuses such a profile at fold, so only a hand-built draft has one.
+    let prefix = match first.ip.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => 128,
+        _ => 32,
+    };
     Some(format!(
         "L4 launch disabled: no L4 scope entry with the inject capability. Add one with interface \"*\", direction outbound, {}/{prefix} ports {}, capability inject (l4.scope.add).",
         first.ip, first.port
     ))
+}
+
+/// The UI-3 launch gate for a Profiles list row with no editor open (D7 as
+/// amended; fix round G, G73): `None` unless `lanes` has an L4 lane, else
+/// [`GATE_NO_LAYER`] when the bus lacks `l4.scope.list`, else
+/// [`GATE_OPEN_PROFILE`] (the row carries no targets or scope to check).
+pub fn row_gate(lanes: &[LaneKind], has_l4_scope_list: bool) -> Option<String> {
+    let wants_l4 = lanes
+        .iter()
+        .any(|l| matches!(l, LaneKind::L4Packet | LaneKind::L4Stream));
+    if !wants_l4 {
+        None
+    } else if !has_l4_scope_list {
+        Some(GATE_NO_LAYER.to_string())
+    } else {
+        Some(GATE_OPEN_PROFILE.to_string())
+    }
 }
 
 /// A pending confirm-over-the-wire handshake (spec D3, D7), generalised from the
@@ -183,6 +212,20 @@ mod tests {
         assert_eq!(launch_args(None, None, None), None);
     }
 
+    /// Fix round G, G73: a list row's lanes gate `s` without an editor.
+    #[test]
+    fn the_row_gate_reads_the_lanes_alone() {
+        assert_eq!(row_gate(&[LaneKind::Http, LaneKind::Ws], false), None);
+        assert_eq!(
+            row_gate(&[LaneKind::L4Stream], false).as_deref(),
+            Some(GATE_NO_LAYER)
+        );
+        assert_eq!(
+            row_gate(&[LaneKind::Http, LaneKind::L4Packet], true).as_deref(),
+            Some(GATE_OPEN_PROFILE)
+        );
+    }
+
     #[test]
     fn the_gate_is_open_without_an_l4_lane_and_closed_in_d7_order() {
         use aitm_scan_model::{L4TargetSpec, L4Transport};
@@ -216,5 +259,16 @@ mod tests {
         assert!(l4_gate(&draft, true, &[])
             .unwrap()
             .contains("::1/128 ports 53"));
+        // Fix round G, G66: the prefix follows the parsed address family,
+        // not a colon; an ip that is no address (G53 refuses it at fold,
+        // so only a hand-built draft carries one) still gets a suggestion.
+        draft.target.l4[0].ip = "fe80::1".into();
+        assert!(l4_gate(&draft, true, &[])
+            .unwrap()
+            .contains("fe80::1/128 ports 53"));
+        draft.target.l4[0].ip = "not:an:ip".into();
+        assert!(l4_gate(&draft, true, &[])
+            .unwrap()
+            .contains("not:an:ip/32 ports 53"));
     }
 }
