@@ -41,7 +41,9 @@ use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
 
 use crate::flow::L4FlowId;
 use crate::module::L4Availability;
-use crate::types::{IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, PortRange};
+use crate::types::{
+    IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
+};
 
 pub use crate::gates::{AgentGate, L4AgentGates};
 pub(crate) use agent::{agent_commands, L4AgentGate};
@@ -299,7 +301,19 @@ pub(crate) fn scope_entry_to_value(entry: &L4ScopeEntry) -> Value {
         Value::Str(capability_to_string(entry.capability).to_string()),
     );
     obj.insert("inject_rate".to_string(), Value::Object(rate));
+    obj.insert(
+        "source".to_string(),
+        Value::Str(scope_source_to_string(entry.source).to_string()),
+    );
     Value::Object(obj)
+}
+
+/// `config` / `runtime` — the provenance label UIs show (plan A5, L4PAR-AC5).
+fn scope_source_to_string(source: L4ScopeSource) -> &'static str {
+    match source {
+        L4ScopeSource::Config => "config",
+        L4ScopeSource::Runtime => "runtime",
+    }
 }
 
 /// The fields a scope entry reports — shared by the `scope.add` result and
@@ -341,6 +355,12 @@ fn scope_entry_fields() -> Vec<aitm_core::ParamDef> {
             ]),
             true,
             "The per-entry injection ceiling.",
+        ),
+        field(
+            "source",
+            TypeDesc::Str,
+            true,
+            "`config` (operator config block) or `runtime` (added over the bus).",
         ),
     ]
 }
