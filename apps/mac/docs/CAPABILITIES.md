@@ -14,7 +14,7 @@ the operator-commands merge (PR #6, `tools/list` = 34).
 ## Status legend
 
 - **✅ live** — works today against a running `aitm` over the bus (verified by the live self-test).
-- **🟡 app-ready, core-blocked** — the mac UI is built; waits on a named core item. Works on fixtures.
+- **🟡 app-ready, core-blocked** — the mac UI is built; waits on a named core item.
 - **🧩 planned** — story exists, not built.
 - **⛔ not in v1** — deliberately deferred (`docs/BRIEF.md`).
 - **— none** — no support anywhere yet.
@@ -41,7 +41,7 @@ The operator workflow is verified two ways, both repeatable:
 - **Agent-driven (MCP bus)** — `tools/selftest-live.sh` (21 checks): intercept →
   `flow.detail` review → edit a paused request → resume, plus mark/comment,
   pause/clear, kill (strict), activity log.
-- **Human UI (computer-use)** — `tools/cua-clickthrough.sh` with `tools/cgclick.swift`,
+- **Human UI (computer-use)** — `tools/cua-ne-drive.sh` on the dev bundle (the fixture-session click-through `cua-clickthrough.sh` was removed 2026-10-31), with `tools/cgclick.swift`,
   two layers, both real input events:
   - **Pixel path (no Accessibility tree):** normalize the window to a known origin,
     then **CGEvent-click computed row pixels**; selection is verified by
