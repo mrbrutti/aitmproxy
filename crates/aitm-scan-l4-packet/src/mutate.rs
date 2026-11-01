@@ -250,7 +250,11 @@ impl Mutation {
             }
             Self::Grow { len, fill } => {
                 let payload = raw_mut(&mut spec)?;
-                grow(payload, *len, *fill);
+                // The ceiling is applied to the *requested* length, before a
+                // byte is allocated: growing first and clamping after turns a
+                // `len` of `usize::MAX` into an unbounded allocation for the
+                // same clamped result (tester finding F3).
+                grow(payload, (*len).min(max_raw_bytes), *fill);
                 payload.truncate(max_raw_bytes);
             }
             Self::Truncate { len } => {
@@ -705,7 +709,10 @@ fn apply_raw(
 }
 
 /// Grow `payload` to `len` bytes; a `len` at or below the current length is a
-/// no-op, and the caller applies the ceiling.
+/// no-op.
+///
+/// `len` is what the caller has already clamped to its ceiling, so this
+/// allocates at most that much (tester finding F3).
 fn grow(payload: &mut Vec<u8>, len: usize, fill: GrowFill) {
     if len <= payload.len() {
         return;
@@ -1536,10 +1543,8 @@ mod tests {
             }
         }
         // A `Grow` past the ceiling is clamped to it, and one at or below the
-        // payload's length is a no-op. (`len` is kept bounded here: `apply`
-        // grows to `len` *before* it clamps, so a `usize::MAX` length would
-        // allocate without bound — tester finding F3; the lane's own tables
-        // never emit a length above `max_raw_bytes`.)
+        // payload's length is a no-op. (`apply` clamps the requested length
+        // before it grows — see `grow_clamps_before_allocating`.)
         let seed = udp_seed(b"probe");
         let grown = Mutation::Grow {
             len: 100_000,
@@ -1561,5 +1566,38 @@ mod tests {
             .apply(&seed, 1472)
             .expect("truncate applies");
         assert_eq!(payload_of(&kept), b"probe".to_vec());
+    }
+
+    /// Tester finding F3: the ceiling is applied to the requested length
+    /// *before* a byte is allocated, so an absurd `Grow` costs the ceiling
+    /// and nothing more.
+    #[test]
+    fn grow_clamps_before_allocating() {
+        let seed = udp_seed(b"probe");
+
+        let zeros = Mutation::Grow {
+            len: usize::MAX,
+            fill: GrowFill::Zeros,
+        }
+        .apply(&seed, 64)
+        .expect("grow applies");
+        assert_eq!(payload_of(&zeros).len(), 64);
+
+        let repeat = Mutation::Grow {
+            len: usize::MAX,
+            fill: GrowFill::Repeat,
+        }
+        .apply(&seed, 64)
+        .expect("grow applies");
+        assert_eq!(payload_of(&repeat).len(), 64);
+        assert_eq!(&payload_of(&repeat)[..10], b"probeprobe");
+
+        let big = Mutation::Grow {
+            len: 1_000_000,
+            fill: GrowFill::Zeros,
+        }
+        .apply(&seed, 1472)
+        .expect("grow applies");
+        assert_eq!(payload_of(&big).len(), 1472);
     }
 }
