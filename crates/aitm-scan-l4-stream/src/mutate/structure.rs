@@ -919,6 +919,67 @@ message:
         assert_eq!(cases[4].index, 4);
     }
 
+    /// C6's last clause: `checksum_invalid` on a synthetic `crc32` relation
+    /// changes that node and nothing else, and the re-satisfaction pass does
+    /// not quietly repair it.
+    #[test]
+    fn checksum_invalid_changes_only_the_checksum() {
+        let spec = MessageSpec::from_yaml(concat!(
+            "grammar: synthetic\n",
+            "transport: tcp\n",
+            "message:\n",
+            "  - { name: body, type: bytes, size: 9 }\n",
+            "  - { name: crc, type: u32 be, checksum: { algo: crc32, over: [body] } }\n",
+        ))
+        .expect("the synthetic crc32 grammar parses");
+        let mut wire = b"123456789".to_vec();
+        wire.extend_from_slice(&[0xcb, 0xf4, 0x39, 0x26]);
+        let tree = tree::parse(&spec, &wire).expect("the synthetic frame parses");
+
+        let cases = structure_cases(&tree, &spec, &FieldPath::new("crc"), GrammarKind::Tlv);
+        let chains = chains(&cases);
+        assert!(
+            chains.contains(&"checksum_invalid(crc,xor1)".to_string()),
+            "{chains:?}"
+        );
+        assert!(
+            chains.contains(&"checksum_invalid(crc,zero)".to_string()),
+            "{chains:?}"
+        );
+
+        let xor1 = cases
+            .iter()
+            .find(|case| case.chain.concat() == "checksum_invalid(crc,xor1)")
+            .expect("the xor1 case");
+        assert_eq!(
+            xor1.bytes,
+            b"123456789\xcb\xf4\x39\x27".to_vec(),
+            "only the checksum's last byte moved"
+        );
+        assert_eq!(&xor1.bytes[..9], b"123456789", "the body is untouched");
+
+        let zero = cases
+            .iter()
+            .find(|case| case.chain.concat() == "checksum_invalid(crc,zero)")
+            .expect("the zero case");
+        assert_eq!(zero.bytes, b"123456789\x00\x00\x00\x00".to_vec());
+        assert_eq!(&zero.bytes[..9], b"123456789");
+
+        // A mutation of the body, by contrast, is followed by the checksum.
+        let body = structure_cases(&tree, &spec, &FieldPath::new("body"), GrammarKind::Tlv);
+        for case in &body {
+            if case.bytes.len() == 13 {
+                let want = crate::codec::crc32(&case.bytes[..9]).to_be_bytes();
+                assert_eq!(
+                    &case.bytes[9..],
+                    &want[..],
+                    "case {} left a stale checksum",
+                    case.chain.concat()
+                );
+            }
+        }
+    }
+
     #[test]
     fn type_subst_skips_denylisted() {
         let spec = modbus_spec();
