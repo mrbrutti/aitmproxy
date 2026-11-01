@@ -16,14 +16,33 @@ aitm-poc = { workspace = true }
 # binary collects from the lane crates and hands to `ScannerPlugin` (spec D1).
 aitm-scan-model = { workspace = true }
 anyhow = { workspace = true }
+# The issue dedupe key of spec D6: `blake3` over the key tuple, so the same
+# class on the same point is one issue however many checks found it.
+blake3 = { workspace = true }
 futures = { workspace = true }
+# `ScanProfile` and the job/issue records the engine writes under
+# `<findings.dir>/scan/` (spec D5/D11) are serde types.
+serde = { workspace = true }
 # JSON request bodies are parsed with the same serializer the rest of the tree
 # uses; `url` is the WHATWG parser the embedded browser resolves links with, so
 # the crawler's scope decisions and the browser's navigation agree byte for byte.
 serde_json = "1"
-# `time` arms the per-navigation timeout that enforces `time_budget`.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# Operator-authored profiles are YAML (spec D11): `scan.profile.save`/`get` read
+# and write `<findings.dir>/scan/profiles/<name>.yaml`.
+serde_yaml = { workspace = true }
+# `time` arms the per-navigation timeout that enforces `time_budget`; `sync`
+# carries the job registry's status locks and the job bus publisher (spec D5).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"] }
+# `CancellationToken`: `scan.cancel` sets it and the worker observes it between
+# probes and inside every bounded await (spec D5 "Cancellation").
+tokio-util = { workspace = true }
 url = "2"
+# Job and issue ids (`scan-<8 hex>`, `issue-<8 hex>`, spec D5/D6).
+uuid = { workspace = true }
 
 [dev-dependencies]
+# The model crate's shared trait stubs (null client/job/host/check/lane and the
+# recording probe host), so the engine's tests exercise `Check`, `Lane` and
+# `ProbeHost` without each module minting its own stub.
+aitm-scan-model = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

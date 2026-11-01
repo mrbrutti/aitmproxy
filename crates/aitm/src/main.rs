@@ -345,6 +345,10 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         // The `system_proxy:` section: `wire.rs` builds the `SystemProxy`
         // engine from it, and `auto` drives the startup recovery below.
         system_proxy,
+        // The `scanner:` section (spec D11). Parsed here so a misspelled key is
+        // refused at startup; Task 17 of the scanner v2 T1b plan is what hands
+        // it to `wire::assemble` instead of `ScannerConfig::default()`.
+        scanner: _,
     } = config_file::load_settings(config_path.as_deref())?;
     env::apply(&mut cfg, |k| std::env::var(k).ok());
     env::apply_rhai(&mut rhai_cfg, |k| std::env::var(k).ok());
