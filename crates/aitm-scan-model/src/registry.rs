@@ -93,17 +93,24 @@ impl CheckRegistry {
     /// Make `checks` the complete set `source` provides, dropping whatever it
     /// registered before. The reload path for one script file.
     ///
-    /// Entries from other sources are untouched, and an incoming check whose id
-    /// another source owns is **not** inserted — the same rule [`CheckRegistry::add`]
-    /// applies, with no error to return. A caller that must know which ids were
-    /// refused adds them one by one.
-    pub fn replace_source(&self, source: &str, checks: Vec<Arc<dyn Check>>) {
+    /// Entries from other sources are untouched. An incoming check whose id
+    /// another source owns is **not** inserted — the same rule
+    /// [`CheckRegistry::add`] applies — and is reported in the returned list,
+    /// one [`DuplicateCheck`] per refused check, so a reload that silently lost
+    /// a check cannot look like a clean one. Empty means every check went in.
+    #[must_use = "a refused check vanishes from the catalogue; report or log the conflicts"]
+    pub fn replace_source(&self, source: &str, checks: Vec<Arc<dyn Check>>) -> Vec<DuplicateCheck> {
         let mut entries = self.write();
         entries.retain(|e| e.source != source);
 
+        let mut refused = Vec::new();
         for check in checks {
             let id = &check.meta().id;
-            if entries.iter().any(|e| &e.check.meta().id == id) {
+            if let Some(existing) = entries.iter().find(|e| &e.check.meta().id == id) {
+                refused.push(DuplicateCheck {
+                    id: id.clone(),
+                    existing_source: existing.source.clone(),
+                });
                 continue;
             }
             entries.push(Registered {
@@ -111,6 +118,7 @@ impl CheckRegistry {
                 check,
             });
         }
+        refused
     }
 
     /// Drop every check `source` registered, returning how many went.
@@ -176,6 +184,7 @@ mod tests {
     use super::*;
     use crate::testing::{null_meta, NullCheck};
     use crate::traits::Check;
+    use crate::CheckMeta;
 
     /// A check with the given id, from nowhere in particular.
     fn check(id: &str) -> Arc<dyn Check> {
@@ -263,7 +272,8 @@ mod tests {
             .add("s2", check("a-check"))
             .expect("a-check is new");
 
-        registry.replace_source("s2", Vec::new());
+        let refused = registry.replace_source("s2", Vec::new());
+        assert_eq!(refused, Vec::new(), "nothing to refuse in an empty set");
 
         let ids: Vec<String> = registry
             .snapshot()
@@ -272,7 +282,8 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["b-check".to_string()]);
 
-        registry.replace_source("s2", vec![check("c-check"), check("d-check")]);
+        let refused = registry.replace_source("s2", vec![check("c-check"), check("d-check")]);
+        assert_eq!(refused, Vec::new(), "c-check and d-check are new ids");
         let ids: Vec<String> = registry
             .snapshot()
             .iter()
@@ -285,6 +296,35 @@ mod tests {
                 "c-check".to_string(),
                 "d-check".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn replace_source_reports_ids_another_source_owns() {
+        let registry = CheckRegistry::new();
+        registry
+            .add("s1", check("b-check"))
+            .expect("b-check is new");
+
+        let refused = registry.replace_source("s2", vec![check("b-check"), check("c-check")]);
+
+        assert_eq!(
+            refused,
+            vec![DuplicateCheck {
+                id: "b-check".to_string(),
+                existing_source: "s1".to_string(),
+            }]
+        );
+        let ids: Vec<String> = registry
+            .snapshot()
+            .iter()
+            .map(|c| c.meta().id.clone())
+            .collect();
+        assert_eq!(ids, vec!["b-check".to_string(), "c-check".to_string()]);
+        assert_eq!(
+            registry.len(),
+            2,
+            "s1 keeps b-check; only c-check joined from s2"
         );
     }
 
@@ -318,5 +358,195 @@ mod tests {
         assert_eq!(registry.len(), 0);
         assert!(registry.is_empty());
         assert!(registry.snapshot().is_empty());
+    }
+
+    /// Tester: `replace_source` documents that an incoming check whose id
+    /// another source owns is skipped, never stolen — the single-source rule
+    /// `add` enforces, reported back as a [`DuplicateCheck`]. Pinned so a
+    /// reload of one script can never hijack a native check's id.
+    #[test]
+    fn replace_source_does_not_steal_an_id_another_source_owns() {
+        let registry = CheckRegistry::new();
+        let mut native = null_meta("a-check");
+        native.description = "native".to_string();
+        registry
+            .add("native", Arc::new(NullCheck::new(native)))
+            .expect("a-check is new");
+
+        let refused =
+            registry.replace_source("script.rhai", vec![check("a-check"), check("z-check")]);
+        assert_eq!(
+            refused,
+            vec![DuplicateCheck {
+                id: "a-check".to_string(),
+                existing_source: "native".to_string(),
+            }]
+        );
+
+        let snapshot = registry.snapshot();
+        let ids: Vec<&str> = snapshot.iter().map(|c| c.meta().id.as_str()).collect();
+        assert_eq!(ids, vec!["a-check", "z-check"]);
+        assert_eq!(
+            snapshot[0].meta().description,
+            "native",
+            "a-check still belongs to the native source"
+        );
+        assert_eq!(
+            registry.remove_source("script.rhai"),
+            1,
+            "only z-check was the script's"
+        );
+    }
+
+    /// Tester: two checks sharing one id inside a single `replace_source` batch
+    /// keep the first; the registry never holds two entries for one id.
+    #[test]
+    fn replace_source_with_a_duplicate_id_in_one_batch_keeps_the_first() {
+        let registry = CheckRegistry::new();
+        let mut first = null_meta("dup");
+        first.description = "first".to_string();
+        let mut second = null_meta("dup");
+        second.description = "second".to_string();
+
+        let refused = registry.replace_source(
+            "s",
+            vec![
+                Arc::new(NullCheck::new(first)),
+                Arc::new(NullCheck::new(second)),
+            ],
+        );
+        assert_eq!(
+            refused,
+            vec![DuplicateCheck {
+                id: "dup".to_string(),
+                existing_source: "s".to_string(),
+            }],
+            "the second copy is refused by the first, which the same batch owns"
+        );
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.snapshot()[0].meta().description, "first");
+    }
+
+    /// Tester: operations on a source that never registered are no-ops on an
+    /// empty registry — no panic, no phantom entry.
+    #[test]
+    fn unknown_source_operations_are_no_ops() {
+        let registry = CheckRegistry::new();
+        assert_eq!(registry.replace_source("ghost", Vec::new()), Vec::new());
+        assert_eq!(registry.remove_source("ghost"), 0);
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+    }
+
+    /// Tester: `Debug` lists `(id, source)` pairs sorted, never the checks.
+    #[test]
+    fn debug_lists_ids_and_sources_sorted() {
+        let registry = CheckRegistry::new();
+        registry.add("s2", check("b-check")).expect("new");
+        registry.add("s1", check("a-check")).expect("new");
+
+        assert_eq!(
+            format!("{registry:?}"),
+            r#"CheckRegistry { checks: [("a-check", "s1"), ("b-check", "s2")] }"#
+        );
+    }
+
+    /// Tester: the registry is one `Arc` shared by the scripting tier and the
+    /// engine. Eight sources racing to register the same fifty ids end with
+    /// exactly one entry per id, every cross-source duplicate refused, and a
+    /// snapshot that is sorted and free of repeats.
+    #[test]
+    fn concurrent_adds_keep_one_entry_per_id() {
+        let registry = Arc::new(CheckRegistry::new());
+        let workers: Vec<_> = (0..8)
+            .map(|t| {
+                let registry = Arc::clone(&registry);
+                std::thread::spawn(move || {
+                    let source = format!("s{t}");
+                    (0..50)
+                        .filter(|i| registry.add(&source, check(&format!("c-{i:02}"))).is_err())
+                        .count()
+                })
+            })
+            .collect();
+        let refused: usize = workers
+            .into_iter()
+            .map(|w| w.join().expect("worker thread"))
+            .sum();
+
+        assert_eq!(registry.len(), 50);
+        assert_eq!(refused, 7 * 50, "every id was refused to the seven losers");
+        let ids: Vec<String> = registry
+            .snapshot()
+            .iter()
+            .map(|c| c.meta().id.clone())
+            .collect();
+        let mut expected = ids.clone();
+        expected.sort();
+        expected.dedup();
+        assert_eq!(ids, expected, "snapshot is sorted with no repeat");
+    }
+
+    /// Tester: the module promises a poisoned lock does not take the catalogue
+    /// down. A check whose `meta()` panics while the write lock is held poisons
+    /// it; the next reader and writer recover rather than panicking too.
+    #[test]
+    fn a_poisoned_lock_is_recovered_not_propagated() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Panics from `meta()` while `armed`.
+        struct Grenade {
+            meta: CheckMeta,
+            armed: Arc<AtomicBool>,
+        }
+        impl Check for Grenade {
+            fn meta(&self) -> &CheckMeta {
+                assert!(!self.armed.load(Ordering::SeqCst), "boom");
+                &self.meta
+            }
+            fn run<'a>(
+                &'a self,
+                _point: &'a crate::point::InsertionPoint,
+                _host: &'a dyn crate::traits::ProbeHost,
+            ) -> futures::future::BoxFuture<'a, crate::check::Verdict> {
+                unreachable!("never run")
+            }
+        }
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let registry = CheckRegistry::new();
+        registry
+            .add(
+                "s1",
+                Arc::new(Grenade {
+                    meta: null_meta("grenade"),
+                    armed: Arc::clone(&armed),
+                }),
+            )
+            .expect("disarmed, it registers");
+
+        // Arm it: the next `add` scans existing entries under the write lock,
+        // calls `meta()` on the grenade and panics with the lock held.
+        armed.store(true, Ordering::SeqCst);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = catch_unwind(AssertUnwindSafe(|| registry.add("s2", check("other"))));
+        std::panic::set_hook(hook);
+        assert!(outcome.is_err(), "the armed grenade panics under the lock");
+        armed.store(false, Ordering::SeqCst);
+
+        // Reader and writer both recover: the interrupted add left no entry.
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.snapshot()[0].meta().id,
+            "grenade",
+            "the catalogue is still readable"
+        );
+        registry
+            .add("s2", check("other"))
+            .expect("the write lock is usable again");
+        assert_eq!(registry.len(), 2);
     }
 }
