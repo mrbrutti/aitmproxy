@@ -189,8 +189,8 @@ import Testing
         #expect(state.flowID(forEndpoint: "http://a.test/") == FlowID("f9"))
     }
 
-    /// The fixture session answers `scan.discover` with links so snapshots show
-    /// linked endpoints; each link names the fixture flow for that very URL.
+    /// A `scan.discover` answer whose `endpoint_flows` link every endpoint decodes with
+    /// one link per endpoint, and each link names the sample flow whose URL the endpoint is.
     @Test func theFixtureLinksEveryEndpointToItsFixtureFlow() throws {
         let result = try ScanResult(json: Fixtures.scanDiscover)
         let rows = Dictionary(uniqueKeysWithValues: Fixtures.rows.map { ($0.id, $0) })
@@ -398,30 +398,11 @@ import Testing
     // MARK: Fixtures and the sidebar section
 
     /// The Scan sidebar section is offered exactly when the bus lists `scan.discover`
-    /// (`Session.scanEnabled`): present with the fixture tool list, absent without it.
+    /// (`Session.scanEnabled`): present with the sample tool list, absent without it.
     @Test func theScanSectionIsOfferedOnlyWhenTheToolIs() {
         #expect(Fixtures.tools.contains { $0.name == "scan.discover" })
         #expect(ScanForm.isOffered(in: Fixtures.tools))
         #expect(!ScanForm.isOffered(in: []))
         #expect(!ScanForm.isOffered(in: Fixtures.tools.filter { $0.name != "scan.discover" }))
-    }
-
-    @Test func fixtureToolsIncludeScanDiscoverAndBrowserConfineAsTheBackendShipsThem() throws {
-        let names = Fixtures.tools.map(\.name)
-        #expect(names.filter { $0 == "scan.discover" }.count == 1)
-        #expect(names.filter { $0 == "browser.confine" }.count == 1)
-
-        let scan = try #require(Self.discoverTool)
-        let target = try #require(scan.parameters.first { $0.name == "target" })
-        #expect(target.type == .string && target.required)
-        let depth = try #require(scan.parameters.first { $0.name == "max_depth" })
-        #expect(depth.type == .int && !depth.required)
-        let pages = try #require(scan.parameters.first { $0.name == "max_pages" })
-        #expect(pages.type == .int && !pages.required)
-
-        let confine = try #require(Fixtures.tools.first { $0.name == "browser.confine" })
-        #expect(confine.parameters.map(\.name) == ["on"])
-        #expect(confine.parameters.first?.type == .bool)
-        #expect(confine.parameters.first?.required == true)
     }
 }

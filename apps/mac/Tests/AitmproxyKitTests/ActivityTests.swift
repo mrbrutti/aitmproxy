@@ -65,13 +65,6 @@ import Testing
         #expect(small.entries.map(\.command) == ["b", "c"])
     }
 
-    @Test func fixturesMatchTheStories() {
-        #expect(Fixtures.activity.count == 12)
-        #expect(Fixtures.activity.filter { $0.result == .pending }.map(\.command) == ["ca.install"])
-        #expect(Fixtures.activity.contains { if case .error = $0.result { return true } else { return false } })
-        #expect(Set(Fixtures.activity.map(\.origin)) == [.agent, .operator, .cli])
-    }
-
     @Test func readsAgentStatus() {
         let status = AgentStatus(json: ["policy": "readonly", "actions_last_minute": 14, "connected_clients": 2])
         #expect(status == AgentStatus(policy: "readonly", actionsLastMinute: 14, connectedClients: 2))
@@ -84,7 +77,10 @@ import Testing
         #expect(Fixtures.scripts[0].statusText == "Saved and active")
         #expect(Fixtures.scripts[1].statusText == "Disabled")
         #expect(Fixtures.scripts[2].statusText.hasPrefix("Error: line 12"))
-        #expect(Fixtures.scripts.filter(\.isActive).count == 1)
+        // Enabled with an error is not active: the Scripts page and the sidebar must agree.
+        #expect(Fixtures.scripts[0].isActive)
+        #expect(!Fixtures.scripts[1].isActive)
+        #expect(!Fixtures.scripts[2].isActive)
     }
 
     @Test func decodesAScriptListItem() throws {

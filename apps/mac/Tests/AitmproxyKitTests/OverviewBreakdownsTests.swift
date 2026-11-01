@@ -2,19 +2,19 @@ import Foundation
 import Testing
 @testable import AitmproxyKit
 
-/// The Overview's lower half over the fixture session (14 HTTP/WS rows + 3 L4 rows).
+/// The Overview's lower half over the sample rows (HTTP/WS rows plus L4 rows).
 @Suite struct OverviewBreakdownsTests {
     static let rows = Fixtures.rows + Fixtures.l4Rows
     static let breakdowns = OverviewBreakdowns(rows: rows)
 
     @Test func httpOnlyDropsTheL4Sockets() {
         let http = OverviewBreakdowns.httpOnly(Self.rows)
-        #expect(Self.rows.count == 17)
-        #expect(http.count == 14)
+        // httpOnly drops exactly the L4 rows, whatever the sample set's size.
+        #expect(http.count == Self.rows.count - Fixtures.l4Rows.count)
         #expect(http.allSatisfy { $0.l4 == nil })
         // The tiles built over it read HTTP/WS only: 4 hosts, not 4 + the L4 targets.
         let stats = OverviewStats(rows: http)
-        #expect(stats.flows == 14)
+        #expect(stats.flows == http.count)
         #expect(stats.hosts == 4)
         #expect(OverviewStats(rows: Self.rows).hosts == 7)
     }

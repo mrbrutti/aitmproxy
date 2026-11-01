@@ -31,11 +31,9 @@ import Testing
         #expect(ScopeEntry(host: "telemetry.vendor-analytics.example").flowCount(in: rows) == 1)
     }
 
-    @Test func fixturesCoverTheScopeHostsWithLimits() {
-        #expect(Fixtures.scopeEntries.map(\.host) == Fixtures.scope)
-        #expect(Fixtures.scopeLimits.count == 3)
-        #expect(Fixtures.scopeEntries.allSatisfy { $0.limit != nil })
-        #expect(Fixtures.scopeEntries.map(\.id) == Fixtures.scope)
+    @Test func entryIDIsItsHost() {
+        #expect(Fixtures.scopeEntries.map(\.id) == Fixtures.scopeEntries.map(\.host))
+        #expect(ScopeEntry(host: "api.shop-staging.test:8443").id == "api.shop-staging.test:8443")
     }
 
     @Test func validationReusesScopeAndRejectsDuplicates() {

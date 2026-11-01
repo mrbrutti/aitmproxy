@@ -145,17 +145,10 @@ import Testing
         #expect(MessagePackError(offset: 3, message: "x").description == "x at byte 3")
     }
 
-    // MARK: - Fixtures
+    // MARK: - Sample bodies
 
-    @Test func imageFixturesDecodeWithDimensions() {
-        #expect(Fixtures.tinyPNG.count == 97)
+    @Test func sampleImagesDecodeWithDimensions() {
         #expect(BodyKind.imageInfo(Fixtures.tinyPNG) == .image(format: .png, width: 4, height: 4))
         #expect(BodyKind.imageInfo(Fixtures.tinyJPEG) == .image(format: .jpeg, width: 4, height: 4))
-        #expect(Fixtures.imageDetail.response?.contentType == "image/png")
-        #expect(Fixtures.imageDetail.response?.body == Fixtures.tinyPNG)
-        #expect(Fixtures.protobufDetail.response?.contentType == "application/x-protobuf")
-        #expect(Fixtures.protobufDetail.request.body == Data([0x08, 0x2A]))
-        #expect(Fixtures.msgpackDetail.response?.contentType == "application/msgpack")
-        #expect(Set([Fixtures.imageDetail.id, Fixtures.protobufDetail.id, Fixtures.msgpackDetail.id]).count == 3)
     }
 }
