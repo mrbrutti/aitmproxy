@@ -752,6 +752,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | coder note | note | H73 not a TUI defect: the cell's post-`g` read raced Home | H74 (cell); the order tests stay as pins |
 | H (cell) | fix round | done | H70-H72 in `461ad9e3`; `--selftest` 63 ok; markers verified against the Rust literals and read back from source | H74 next, then run 6 |
 | H (cell) | fix round | done | H74 in `0fa083a0`; `--selftest` 64 ok; cell complete | live run 6 |
+| 15 | live smoke | run 6 | 24 ok, 3 failed: T7-17 passed live through the probe-flow inspector and `f`; the refetch after `f` moved the cursor off the issue (TUI: H75); `intrusive` raised the engine's confirm overlay the cell did not answer (H77) | H75 (Rust), H76-H77 (cell) |
 
 ## Shipped
 

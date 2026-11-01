@@ -169,6 +169,14 @@ H74 (cell). After `g` in T7-19 the cell read the stale `>` row before Home was p
 
 **Cell H74 result (2026-11-01):** done in `0fa083a0`; `--selftest` 64 ok; `press_home` waits for the cursor row to equal the walk's first recorded row (taken from the cell's own first frame, so no re-implementation of the group order); the pre-walk `g` gets a bounded change-wait. Noticed: `cursor_to` reads after fixed sleeps (a candidate if a later run overshoots a row). The cell is complete at `0fa083a0`; live run 6.
 
+## From the sixth live smoke run (`/tmp/claude/t7-live-smoke7`, 24 ok, 3 failed; T7-17's UI-2 chain passed live through `f`)
+
+H75 (Rust, after the Task 16 tester lands). After `f` the Issues list refetched (a status change triggers `scan.issues`) and the cursor kept its index while the rows moved, so `u` and `P` acted on another issue (`fail-1-t7-17.txt`: cursor on `Cookie without Secure or HttpOnly`, the marked `Open redirect` row elsewhere reading `false_positive`). D11 ruling: the Issues list cursor follows the issue id across folds, re-found by id like the Jobs and Site map cursors (G22); when the id is gone the index clamps as today. Test (`tests/scan_v2_issues.rs`): land on row 3, fold a refetched page where that issue sits at row 1, assert `cursor_issue().id` unchanged and `detail` still that issue's.
+
+H76 (cell). After `f` (and after `u`) assert the cursor row's name cell is still the marked issue's before the next key (a TUI behaviour check, H75); the failure detail names the row the cursor landed on.
+
+H77 (cell). An `intrusive` launch raises the engine's `needs_confirmation` overlay (`Confirm over the wire: scan launch`, "may disrupt the target"): `launch()` detects the overlay title after `s`/`m`, asserts it as a check ("the engine asked to confirm the intrusive launch"), presses `y`, then waits for the landing as today; `n` is never pressed there. This exercises UI-1's confirm on an HTTP job as well as T7-18's.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
