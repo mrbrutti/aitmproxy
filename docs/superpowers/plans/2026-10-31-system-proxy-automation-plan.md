@@ -1042,6 +1042,9 @@ never evidence; Kit unit tests and the live run are. Do not edit `Fixtures.rows`
 - **Done when:** owner's `swift test` shows the three new tests passing and every
   existing `ConnectionSummaryTests` still passing.
 
+
+> PR 4a (2026-11-01) shipped `SystemProxyState` as a struct of two endpoints plus `SystemProxyRoute { off, thisCore(http:https:), other(host:port:) }` and `init?(compact:listenAddress:)`; `SystemProxyFacts` carries `route: SystemProxyRoute`, not an enum `state`. Expected literal: `.route == .other(host: "127.0.0.1", port: 9090)`. Files: `apps/mac/Sources/AitmproxyKit/SystemProxyState.swift`, `apps/mac/Tests/AitmproxyKitTests/SystemProxyStateTests.swift` (PR #246). Tests shipped (Swift Testing): `anEndpointRendersAsHostColonPort`, the `settings*` family, `offHasNoEndpointsAndRoutesToOff`, `bothProtocolsAtOurAddressRouteToThisCore`, `localhostSpellingsMatchOurLoopbackAddress`, `aWildcardListenAddressMatchesALoopbackProxy`, `aDifferentPortIsAnotherProxy`, `aDifferentHostOnOurPortIsAnotherProxy`, `hostnameCaseDoesNotMatter`, `httpAtUsWithHttpsOffIsThisCoreForHttpOnly`, `oneProtocolAtUsAndTheOtherElsewhereIsStillThisCore`, `otherTakesTheHttpEndpointElseTheHttpsOne`, `anUnparsableListenAddressNeverMatches`, the `compact*` family incl. `other` at our own endpoint → nil, `aMalformedCompactObjectIsNil`, `theFullStatusObjectOfTheSpecParsesLikeTheCompactOne`, `anAddressParsesOnlyWithAHostAndAPortAndBracketsAroundIPv6`, `bracketsAroundAnIPv6HostDoNotMatter`, `compactOtherAtOurOwnListenAddressIsNil`, `aParsedBusObjectIsAccepted` (31 tests after the panel fix c8ed92f4; `statesAndRoutesAreHashableByValue` deleted).
+
 ### Task 25: Kit — `EmbeddedCoreLaunch.Config` emits the `system_proxy:` block
 
 - **Satisfies:** SP-AC25.
@@ -1639,6 +1642,14 @@ Kept by the main session during stage 6. One row per finding.
 | 20–22 | quality (PR 3) | Minor | status fixtures copied into three test files; two hand-rolled bus wrappers; both `proxy.status` readers carry their own wire type | accepted as follow-ups (shared `systemProxy.testkit.ts`; one `applyProxyStatus`), orchestrator 2026-11-01 |
 | 20 | spec (PR 3) | Minor | `SystemProxyMenuState` exported; disabled states beyond the three titled ones (`needs_privilege` with the remedy, `unknown`, no status) | accepted (recorded): the §D12 actions column gives "—" for those rows |
 | 22 | spec (PR 3) | Minor | pill word position before `· intercept armed` untested | fixed in F-web (assertion added) |
+| 24 (PR 4a) | quality (re-run) | Minor | `Endpoint.address` rendered a bare IPv6 host its own parser rejects; `settingsPort` truncated a fractional port where the wire path rejects | fixed in the follow-up commit (bracketed on render; `Int(exactly:)`) |
+| 24 (PR 4a) | quality (re-run) | Minor | a second definition of "loopback spelling" beside `EmbeddedCoreLaunch.isLoopbackHost` | accepted (recorded) with a cross-reference comment; the two callers have different stakes (dial guard vs display match) |
+| 24 (PR 4a) | quality | Important | `init?(compact:)` took `[String: Any]` and truncated ports; the Kit decodes bus objects as `JSONValue` with exact ints | fixed in c8ed92f4 |
+| 24 (PR 4a) | spec | Important | `other` reported at our own listen address routed `.thisCore` (§D6 partial case) | fixed in c8ed92f4 (nil = unknown); spec §D13 paragraph states the rule |
+| 24 (PR 4a) | spec | Important | spec §D13 / plan Task 24 / sibling plan Task 1 described an enum and claimed to create the files | docs amended in c5d30c99; sibling plan Files lines to be updated by the attribution session (text sent) |
+| 24 (PR 4a) | quality, spec | Minor | bare IPv6 literal parsed as host:port; brackets whitelisted not stripped; parameterisation; Hashable test; private statics; one init form | fixed in c8ed92f4 |
+| 24 (PR 4a) | spec | Minor | fields are `let` where the sibling contract said `var`; numeric-string port accepted on the wire; port range 1…65535 | accepted (recorded) by the orchestrator under Matt's mandate 2026-11-01: immutability is the better design; the leniencies are honest tightenings/widenings of §D6 |
+| 24 (PR 4a) | quality | Minor | `settingsPort` truncates a Double port in the CFNetwork dictionary; `Endpoint(address: "[]:8080")` yields host `[]` (matches nothing) | accepted (recorded): CFNetwork returns integers; harmless |
 | 7 | quality (F4) | Minor | `decide` rustdoc misstates the call graph; the `else { return 0 }` after `decide(Some(..))` is unreachable | accepted (recorded), orchestrator 2026-10-31; fold into the scaffolding follow-up (reword doc or `unreachable!`) |
 | crate | quality (F4) | Minor | rustdoc intra-doc links to `pub(crate)` items (not gated) | accepted (recorded); `#![allow(rustdoc::private_intra_doc_links)]` or plain backticks in the follow-up |
 | 10 | quality (F4) | Minor | config-path resolution spelled in both `main` and `run` | accepted (recorded); `Invocation::config_path()` in the follow-up |

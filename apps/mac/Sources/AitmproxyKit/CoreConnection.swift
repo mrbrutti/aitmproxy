@@ -15,9 +15,9 @@ public struct CoreID: Hashable, Sendable, Codable, CustomStringConvertible {
     /// Reconstructs an identity from a persisted `rawValue`.
     public init(rawValue: String) { self.rawValue = rawValue }
 
-    /// The well-known id for fixture / offline sample data: a single stable
-    /// originating connection, so seeded flows (Task 5) share one `CoreID`
-    /// without a live core. The live embedded connection gets a fresh id.
+    /// The well-known id for rows built without a core (imports, tests): one
+    /// stable originating connection so they share a `CoreID`. The live
+    /// embedded connection gets a fresh id.
     public static let fixture = CoreID(rawValue: "fixture")
 
     public var description: String { rawValue }

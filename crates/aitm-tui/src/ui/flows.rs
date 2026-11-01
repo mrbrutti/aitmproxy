@@ -522,15 +522,71 @@ fn l4_row_line<'a>(app: &App, theme: &Theme, r: &'a FlowRow, cols: &[Col]) -> Li
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::BusEvent;
+    use crate::model::FlowDetail;
+    use crate::summary;
+    use serde_json::json;
+
+    /// A `flow.detail` carrying only the metadata the Tick column reads.
+    fn detail(id: &str, marks: &[&str], origin: &str) -> FlowDetail {
+        FlowDetail::from_json(&json!({
+            "id": id, "kind": "http", "meta": {"marks": marks, "origin": origin}
+        }))
+        .unwrap()
+    }
 
     /// M-misc: a marked flow carries a `▍` swatch in its first mark's colour
     /// in the Tick column; paused and agent ticks take precedence.
     #[test]
     fn marked_rows_show_a_colour_swatch_in_the_tick_column() {
         let theme = Theme::new(true);
-        let app = crate::fixture_app(200, 50);
-        let buf = crate::snapshot::render(&app, &theme, 200, 50);
-        let text = crate::snapshot::to_text(&buf);
+        let mut app = crate::connected_app(200, 50);
+        // Rows outside the scope render entirely tertiary (§2.7), so the
+        // scope covers the host before any colour is asserted.
+        let _ = app.on_bus(BusEvent::Scope(vec!["*.example.test".into()]));
+        let _ = app.on_bus(BusEvent::Flows(vec![
+            summary(
+                "f41",
+                "GET",
+                "api.example.test",
+                "/api/products?category=widgets",
+                Some(200),
+                "observed",
+            ),
+            summary(
+                "f42",
+                "PUT",
+                "api.example.test",
+                "/api/cart/items/42",
+                Some(200),
+                "observed",
+            ),
+            summary(
+                "f48",
+                "GET",
+                "api.example.test",
+                "/api/search?q=test",
+                Some(200),
+                "observed",
+            ),
+            summary(
+                "f50",
+                "POST",
+                "api.example.test",
+                "/api/auth/login",
+                None,
+                "intercepted",
+            ),
+        ]));
+        for d in [
+            detail("f42", &["sky"], "human"),
+            detail("f48", &["red"], "agent"),
+            detail("f50", &["red"], "human"),
+        ] {
+            let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
+        }
+        let buf = crate::ui::render_buffer(&app, 200, 50);
+        let text = crate::ui::render_text(&app, 200, 50);
         let find = |needle: &str| -> (u16, usize) {
             let (y, line) = text
                 .lines()
@@ -543,8 +599,8 @@ mod tests {
                 .unwrap();
             (y as u16, x)
         };
-        // f42 (PUT cart item) is marked `sky`, human, not paused: swatch in the
-        // shared `mark.cyan` token (sky is Proxyman's name for it).
+        // f42 is marked `sky`, human, not paused: swatch in the shared
+        // `mark.cyan` token (sky is Proxyman's name for it).
         let (y, url_x) = find("/api/cart/items/42");
         let tick = buf.cell((url_x as u16 - 10, y)).unwrap();
         assert_eq!(tick.symbol(), MARK_SWATCH);
@@ -554,6 +610,11 @@ mod tests {
         let tick = buf.cell((url_x as u16 - 10, y)).unwrap();
         assert_eq!(tick.symbol(), "▎");
         assert_eq!(tick.fg, theme.agent().fg.unwrap());
+        // f50 is marked `red` but paused: the intercept tick wins over both.
+        let (y, url_x) = find("/api/auth/login");
+        let tick = buf.cell((url_x as u16 - 10, y)).unwrap();
+        assert_eq!(tick.symbol(), "▎");
+        assert_eq!(tick.fg, theme.fg(&color::intercept::BASE).fg.unwrap());
         // Unmarked (f41): blank.
         let (y, url_x) = find("/api/products?category");
         assert_eq!(buf.cell((url_x as u16 - 10, y)).unwrap().symbol(), " ");

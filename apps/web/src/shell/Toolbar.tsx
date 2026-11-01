@@ -17,6 +17,7 @@ import { rectAnchor, type AnchorRect } from '~/components/floating';
 import { pluralize } from '~/lib/format';
 import { copyText } from '~/inspector/ui';
 import { menuState, pillWord } from '~/state/systemProxy';
+import { caPillWord } from '~/state/caTrust';
 import css from './Toolbar.module.css';
 
 /** The five core postures, in the Agent menu's order; `auto`/`ask` as the core defines them (autonomous: sensitive refused · human in the loop: sensitive asks). */
@@ -154,6 +155,7 @@ export const Toolbar: Component = () => {
           </Show>
           <Show when={app.proxy.protocol}> · {app.proxy.protocol}</Show>
           <Show when={sysWord()}>{(w) => <> {w()}</>}</Show>
+          <Show when={caPillWord(app.ca, app.caInstalling)}>{(word) => <> {word()}</>}</Show>
           <Show when={app.proxy.armed}> · intercept armed</Show>
         </span>
       </button>
