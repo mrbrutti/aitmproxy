@@ -226,6 +226,60 @@ extension SelfTest {
             session.arm(false)
             await settle { !session.interceptArmed }
 
+            // Host-bearing rules (core #208: a rule's url is matched against the FULL URL, and the
+            // app's preview mirrors the core): a wildcard and a regex that name this upstream park
+            // the matching request on the core while `matchCount` counts exactly that row; a rule
+            // for another host leaves the next request flowing and counts nothing.
+            let hostRules: [(BreakpointRule, String)] = [
+                (BreakpointRule(name: "wildcard with host", url: "*\(upstream)/host-wild*"), "/host-wild"),
+                (BreakpointRule(name: "regex with host", url: "^http://\(NSRegularExpression.escapedPattern(for: upstream))/host-regex$", matching: .regex), "/host-regex"),
+            ]
+            for (rule, path) in hostRules {
+                let interceptCalls = session.activity.entries.filter { $0.command == "flow.intercept" }.count
+                session.setBreakpointRules(BreakpointRules(rules: [rule]))
+                session.arm(true)
+                await settle { session.interceptArmed && session.activity.entries.filter { $0.command == "flow.intercept" }.count > interceptCalls }
+                check("flow.intercept accepts the \(rule.name) rule", session.interceptArmed && session.lastError == nil, session.lastError ?? "")
+                let pausedBefore = Set(session.paused.map(\.id))
+                guard session.interceptArmed, let hit = curlThroughProxy(upstream, listen: session.listenAddress, path: path) else { continue }
+                await settle(timeout: .seconds(8)) { session.paused.contains { !pausedBefore.contains($0.id) } }
+                let parked = session.paused.first { !pausedBefore.contains($0.id) }
+                check("the \(rule.name) rule parks the matching request on the core (full URL)", parked?.path == path,
+                      "paused \(session.paused.map(\.url))")
+                let count = session.breakpointRules.matchCount(of: rule, in: session.rows)
+                check("the app's preview agrees with the core: matchCount == 1 for the \(rule.name) rule over the live rows",
+                      count == 1, "count \(count) over \(session.rows.count) rows")
+                if let parked {
+                    session.resume(parked.id)
+                    await settle(timeout: .seconds(6)) { !hit.isRunning }
+                } else {
+                    hit.terminate()
+                }
+                session.arm(false)
+                await settle { !session.interceptArmed }
+            }
+            let otherHost = BreakpointRule(name: "another host", url: "*other.invalid/*")
+            do {
+                let interceptCalls = session.activity.entries.filter { $0.command == "flow.intercept" }.count
+                session.setBreakpointRules(BreakpointRules(rules: [otherHost]))
+                session.arm(true)
+                await settle { session.interceptArmed && session.activity.entries.filter { $0.command == "flow.intercept" }.count > interceptCalls }
+                let pausedBefore = Set(session.paused.map(\.id))
+                // `/` (the upstream's listing, 200): a 404 path would fail curl -f even when nothing parks.
+                if session.interceptArmed, let pass = curlThroughProxy(upstream, listen: session.listenAddress, path: "/") {
+                    await settle(timeout: .seconds(8)) { !pass.isRunning }
+                    let newlyParked = session.paused.filter { !pausedBefore.contains($0.id) }
+                    check("a rule for another host leaves the request flowing (nothing parks, curl exit 0)",
+                          !pass.isRunning && pass.terminationStatus == 0 && newlyParked.isEmpty,
+                          "running \(pass.isRunning) exit \(pass.terminationStatus) parked \(newlyParked.map(\.url))")
+                    check("the preview counts no live row for the other host",
+                          session.breakpointRules.matchCount(of: otherHost, in: session.rows) == 0)
+                }
+            }
+            session.setBreakpointRules(BreakpointRules())
+            session.arm(false)
+            await settle { !session.interceptArmed }
+
             // F6 / F7: the call is made, the outcome is recorded, nothing hangs.
             let pending: [(String, () -> Void)] = [
                 ("flow.mark", { session.mark(row.id, .red) }),
