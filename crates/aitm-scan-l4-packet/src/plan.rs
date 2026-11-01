@@ -273,6 +273,13 @@ impl TargetPlan {
         target_key(self.target.ip, self.target.port, self.target.proto)
     }
 
+    /// The seed case `n` cycles to, or `None` for an empty corpus. The one
+    /// place the corpus modulo is written, so every caller cycles the same
+    /// way (review finding P2).
+    pub(crate) fn seed_at(&self, n: usize) -> Option<&SeedPayload> {
+        self.seeds.get(n % self.seeds.len().max(1))
+    }
+
     /// The built seed for case `n`, cycling the corpus.
     ///
     /// # Errors
@@ -280,8 +287,7 @@ impl TargetPlan {
     /// when the seed does not build.
     pub fn seed_spec(&self, n: usize) -> Result<SeedSpec, PlanError> {
         let seed = self
-            .seeds
-            .get(n % self.seeds.len().max(1))
+            .seed_at(n)
             .ok_or_else(|| PlanError::Craft("the target plan carries no seed".to_string()))?;
         seed_spec(&self.target, self.src_port, &seed.bytes, seed.id.clone())
     }

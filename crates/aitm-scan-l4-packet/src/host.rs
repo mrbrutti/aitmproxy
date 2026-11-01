@@ -417,7 +417,13 @@ impl PointRunner {
         let mut rng = Rng::new(self.rng_seed);
         for index in 0..allocated {
             let Some((seed, mutation)) = self.case_at(index, &boundary, &mut rng) else {
-                break;
+                // Exactly as the send loop does: a case whose seed does not
+                // build is rendered unsendable and the rest of the
+                // allocation is still rendered, instead of the dry run
+                // ending early and under-reporting what the job would send
+                // (review finding P3).
+                run.cases.push(self.unbuildable_case(index));
+                continue;
             };
             let sent_hex = mutation
                 .apply(&seed.spec, timing.max_raw_bytes)
@@ -489,9 +495,16 @@ impl PointRunner {
     fn seed_id_at(&self, index: u32) -> String {
         let nth = usize::try_from(index).unwrap_or(usize::MAX);
         self.plan
-            .seeds
-            .get(nth % self.plan.seeds.len().max(1))
+            .seed_at(nth)
             .map_or_else(String::new, |seed| seed.id.clone())
+    }
+
+    /// The record for a case whose seed the builder refuses: it never went
+    /// out, so it carries the id of the seed it cycles to, no mutation chain
+    /// and no bytes. Shared by the send loop and the dry run so the two
+    /// render one refused case the one way (review finding P3).
+    fn unbuildable_case(&self, index: u32) -> CaseRecord {
+        CaseRecord::unsent(index, self.seed_id_at(index), Vec::new(), String::new())
     }
 
     /// Stop the job's sending with `reason` (first stop wins) and report the
@@ -754,12 +767,7 @@ impl PointRunner {
                 // refuses, instead of ending the run in silence (tester
                 // finding T1).
                 self.shared.state.record_unsendable(job_id);
-                run.cases.push(CaseRecord::unsent(
-                    index,
-                    self.seed_id_at(index),
-                    Vec::new(),
-                    String::new(),
-                ));
+                run.cases.push(self.unbuildable_case(index));
                 continue;
             };
             let chain = vec![mutation.label()];
@@ -820,16 +828,20 @@ impl PointRunner {
             }
 
             if class.is_candidate() && stop.is_none() {
-                let (first, second, probe_stop) = self.probe_pair(false).await;
+                // A pair a stop cut short is read as the stop it is, before
+                // any verdict is taken off it (review finding P1).
+                let (first, second) = match self.probe_pair(false).await {
+                    Ok(pair) => pair,
+                    Err(reason) => {
+                        record.candidate = Candidate::Interrupted {
+                            stop: reason.clone(),
+                        };
+                        run.cases.push(record);
+                        run.stopped = Some(reason);
+                        break;
+                    }
+                };
                 alive = first || second;
-                if let Some(reason) = probe_stop {
-                    record.candidate = Candidate::Interrupted {
-                        stop: reason.clone(),
-                    };
-                    run.cases.push(record);
-                    run.stopped = Some(reason);
-                    break;
-                }
                 // Both probes failed, so this case is a candidate.
                 if !first && !second {
                     if reproduce_count == 0 {
@@ -930,28 +942,30 @@ impl PointRunner {
     /// The two liveness probes a candidate costs: the second only when the
     /// first failed, unless `always` (after a replay, where both verdicts are
     /// part of the reproduction criterion).
-    /// A probe the builder refused never went out, so it says nothing about
-    /// the target: it is read as an unsendable, not as a failed probe, and
-    /// never starts a triage on evidence that does not exist (review finding
-    /// Q1). A failed wire write is a stop and propagates as one.
-    async fn probe_pair(&self, always: bool) -> (bool, bool, Option<StopReason>) {
+    ///
+    /// A probe the builder refused never went out, so it is a stop, not a
+    /// verdict (review findings Q1 and P1): a pair any stop cut
+    /// short carries no bools at all, so no caller can read one as a failed
+    /// probe and start — or count — a reproduction on evidence that does not
+    /// exist. A failed wire write is a stop and propagates as one.
+    ///
+    /// # Errors
+    /// The [`StopReason`] that cut the pair short, whether the job stopped
+    /// under it or the builder refused a probe.
+    async fn probe_pair(&self, always: bool) -> Result<(bool, bool), StopReason> {
         let first = match self.liveness_probe().await {
             Ok(passed) => passed,
-            Err(HostError::Stopped(reason)) => return (false, false, Some(reason)),
-            Err(HostError::Craft(message)) => {
-                return (true, true, Some(self.stop_on_craft(SEED0, &message)))
-            }
+            Err(HostError::Stopped(reason)) => return Err(reason),
+            Err(HostError::Craft(message)) => return Err(self.stop_on_craft(SEED0, &message)),
         };
         if first && !always {
-            return (true, true, None);
+            return Ok((true, true));
         }
         tokio::time::sleep(self.shared.timing.liveness_retry).await;
         match self.liveness_probe().await {
-            Ok(second) => (first, second, None),
-            Err(HostError::Stopped(reason)) => (first, false, Some(reason)),
-            Err(HostError::Craft(message)) => {
-                (first, true, Some(self.stop_on_craft(SEED0, &message)))
-            }
+            Ok(second) => Ok((first, second)),
+            Err(HostError::Stopped(reason)) => Err(reason),
+            Err(HostError::Craft(message)) => Err(self.stop_on_craft(SEED0, &message)),
         }
     }
 
@@ -1057,12 +1071,21 @@ impl PointRunner {
                 .record
                 .class()
                 .is_some_and(|class| class.is_candidate());
-            let (first, second, probe_stop) = self.probe_pair(true).await;
+            // A pair a stop cut short never finished, so it is read as the
+            // stop it is and no reproduction is counted off it (review
+            // finding P1).
+            let (first, second) = match self.probe_pair(true).await {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    triage.stop = Some(reason);
+                    return triage;
+                }
+            };
             alive = first || second;
             if candidate && !first && !second {
                 triage.reproduced += 1;
             }
-            if let Some(reason) = probe_stop.or(delivered.stop) {
+            if let Some(reason) = delivered.stop {
                 triage.stop = Some(reason);
                 return triage;
             }
@@ -2948,5 +2971,99 @@ mod tests {
         // never charged.
         assert_eq!(mock.inject_count(), 3);
         assert_eq!(job.charged(), 3);
+    }
+
+    /// Quality (panel 3) finding P1: a probe pair a stop cut short never went
+    /// out in full, so it is a stop, not a verdict. The budget runs out at the
+    /// pair's first probe after a replay that did silence the target, which is
+    /// exactly the shape that must not be read as a reproduction — the triage
+    /// stops on the stop and counts nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_probe_pair_cut_short_by_a_stop_is_not_a_reproduction() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // 1 recovery poll (the 6-byte seed is too short to trigger, so it is
+        // answered) + 1 replay = 2; the pair's first probe is the charge that
+        // fails.
+        let job = job.with_budget(2);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        // The triage is driven on its own here, so the baseline the liveness
+        // probes are read against is set by hand: without it every probe
+        // fails and the recovery poll, not the pair, spends the budget.
+        *crate::sync::lock(&runner.baseline) = Some(CaseClass::Clean);
+        // An eight-byte frame carrying the trigger: this replay silences the
+        // mock, so the replay itself is a candidate.
+        let silencer = crate::plan::seed_spec(
+            &runner.plan.target,
+            runner.plan.src_port,
+            &[0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x00, 0x00],
+            runner.plan.seeds[0].id.clone(),
+        )
+        .expect("the trigger frame builds");
+
+        let triage = runner
+            .triage(&silencer.spec, &silencer.id, &["grow:8".to_string()], 1, 1)
+            .await;
+
+        assert_eq!(triage.stop, Some(StopReason::Budget));
+        assert_eq!(triage.attempts, 1, "the replay itself went out");
+        assert_eq!(
+            triage.reproduced, 0,
+            "a pair the budget cut short proves nothing"
+        );
+        assert!(
+            triage.recovered,
+            "a triage a stop cut short learned nothing about recovery"
+        );
+        assert_eq!(mock.inject_count(), 2, "the pair's probe never went out");
+    }
+
+    /// Quality (panel 3) finding P3: a dry run over a seed the builder refuses
+    /// renders the rest of the allocation instead of breaking, exactly as the
+    /// send loop does — the refused case is rendered unsendable and the run
+    /// still shows every case the job allocated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dry_run_renders_past_a_seed_the_builder_refuses() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let mut profile = l4_profile(vec![udp_target(9)], 2);
+        profile.l4.dry_run = true;
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // Discovery refuses this corpus, so the plan is bent by hand: seed 0
+        // builds, seed 1 is one byte more than the frame can carry.
+        let mut plan = plans[0].clone();
+        plan.seeds.push(SeedPayload {
+            id: "127.0.0.1:9/udp#1".to_string(),
+            bytes: vec![0x41; max_payload_for(&plan.target) + 1],
+            origin: SeedOrigin::Profile,
+        });
+        let point = disc.points.first().expect("one point").clone();
+        let runner = Arc::new(
+            PointRunner::new(
+                Arc::clone(&shared),
+                Arc::clone(&job) as Arc<dyn JobCtx>,
+                point,
+                plan,
+                FieldPath::Raw,
+            )
+            .expect("seed 0 builds"),
+        );
+
+        let run = runner.run_point().await;
+
+        assert!(run.dry_run);
+        assert_eq!(run.cases.len(), 2, "both allocated cases are rendered");
+        assert!(!run.cases[0].sent_hex.is_empty(), "case 0 renders a frame");
+        assert_eq!(run.cases[0].seed_id, "127.0.0.1:9/udp#0");
+        let refused = &run.cases[1];
+        assert!(!refused.sent());
+        assert_eq!(refused.class(), None);
+        assert_eq!(refused.index, 1);
+        assert_eq!(refused.seed_id, "127.0.0.1:9/udp#1");
+        assert_eq!(refused.sent_hex, "");
+        assert_eq!(refused.chain, Vec::<String>::new());
+        assert_eq!(mock.inject_count(), 0, "a dry run sends nothing");
+        assert_eq!(job.charged(), 0);
     }
 }
