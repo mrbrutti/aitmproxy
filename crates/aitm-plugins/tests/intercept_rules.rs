@@ -24,12 +24,17 @@ use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 
 fn http_flow(path: &str) -> Flow {
+    http_flow_at("ex.test", path)
+}
+
+/// A `GET http://{authority}{path}` flow, for rules that name a host.
+fn http_flow_at(authority: &str, path: &str) -> Flow {
     Flow::Http(HttpFlow {
         id: FlowId::new(),
         request: HttpRequest {
             method: "GET".into(),
             scheme: "http".into(),
-            authority: "ex.test".into(),
+            authority: authority.into(),
             path: path.into(),
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
@@ -270,5 +275,215 @@ fn invalid_rule_regex_is_error() {
     assert!(
         dispatch_request(&reg, &store, id).is_some(),
         "the valid rule survived the failed call"
+    );
+}
+
+/// AC12 (rule `url` clause matches the full request URL): a `url` wildcard that
+/// names a host parks the flow for that host, and a flow to another host with
+/// the same path sails through. Before the full-URL subject the clause ran
+/// against the path only, so `*ex.test*` could never fire.
+#[test]
+fn host_bearing_rule_parks_matching_host() {
+    let reg = registry();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    arm(
+        &reg,
+        &host,
+        params(&[
+            ("enabled", Value::Bool(true)),
+            (
+                "rules",
+                Value::Array(vec![rule_obj(&[
+                    ("url", Value::Str("*ex.test*".into())),
+                    ("phase", Value::Str("request".into())),
+                ])]),
+            ),
+        ]),
+    );
+
+    let matching = store.insert(http_flow_at("ex.test", "/anything"));
+    let mut parked = dispatch_request(&reg, &store, matching)
+        .expect("a host-bearing url rule parks the flow for that host");
+    assert!(
+        is_intercepted(&store, matching),
+        "GET http://ex.test/anything is intercepted under *ex.test*"
+    );
+    assert!(parked.try_recv().is_err(), "still parked before resume");
+
+    let other = store.insert(http_flow_at("other.test", "/anything"));
+    assert!(
+        dispatch_request(&reg, &store, other).is_none(),
+        "GET http://other.test/anything is not parked under *ex.test*"
+    );
+    assert!(
+        !is_intercepted(&store, other),
+        "the other host's flow stays observed"
+    );
+}
+
+/// AC18: more than 256 rules in one call is rejected before any is compiled,
+/// naming the cap, and the previously armed rule stays active; 256 is accepted.
+#[test]
+fn too_many_rules_is_error() {
+    let reg = registry();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    arm(
+        &reg,
+        &host,
+        params(&[
+            ("enabled", Value::Bool(true)),
+            (
+                "rules",
+                Value::Array(vec![rule_obj(&[
+                    ("url", Value::Str("*/admin".into())),
+                    ("phase", Value::Str("request".into())),
+                ])]),
+            ),
+        ]),
+    );
+
+    let rules = |n: usize| {
+        Value::Array(
+            (0..n)
+                .map(|_| rule_obj(&[("url", Value::Str("*/x*".into()))]))
+                .collect(),
+        )
+    };
+    let intercept = reg
+        .command("flow.intercept")
+        .expect("flow.intercept registered");
+
+    let err = intercept
+        .invoke(params(&[("rules", rules(257))]), &host)
+        .expect_err("257 rules are rejected");
+    assert!(
+        err.to_string().contains("limit is 256"),
+        "the error names the cap: {err}"
+    );
+
+    // The earlier `*/admin` rule is still active.
+    let id = store.insert(http_flow("/admin"));
+    assert!(
+        dispatch_request(&reg, &store, id).is_some(),
+        "the valid rule survived the rejected call"
+    );
+
+    let out = intercept
+        .invoke(params(&[("rules", rules(256))]), &host)
+        .expect("256 rules is the cap, inclusive");
+    match out {
+        Value::Object(o) => match o.get("rules") {
+            Some(Value::Array(active)) => assert_eq!(active.len(), 256),
+            other => panic!("flow.intercept should echo the rules array, got {other:?}"),
+        },
+        other => panic!("flow.intercept should return an object, got {other:?}"),
+    }
+}
+
+/// The `rules` param description (what `tools/list` shows an agent or operator
+/// before they call) names every cause that rejects the whole call, not only
+/// the invalid regex: the 256-rule cap, the 4096-byte pattern cap and the empty
+/// pattern, and says the active rules survive the rejection. The MCP layer
+/// copies the string verbatim (`rule_schemas_state_the_full_url_subject` in
+/// `crates/aitm/tests/intercept_url_rules_mcp.rs` shows that for `rules[].url`),
+/// so the pin lives at the schema.
+#[test]
+fn rules_param_text_names_every_rejection_cause() {
+    let reg = registry();
+    let schema = reg
+        .command("flow.intercept")
+        .expect("flow.intercept registered")
+        .schema();
+    let rules = schema
+        .params
+        .iter()
+        .find(|p| p.name == "rules")
+        .unwrap_or_else(|| {
+            let names: Vec<&str> = schema.params.iter().map(|p| p.name.as_str()).collect();
+            panic!("flow.intercept has a `rules` param; got {names:?}")
+        });
+    for phrase in [
+        "256",
+        "4096",
+        "empty url pattern",
+        "invalid regex",
+        "unchanged",
+    ] {
+        assert!(
+            rules.description.contains(phrase),
+            "the flow.intercept `rules` description must name `{phrase}`; got: {}",
+            rules.description
+        );
+    }
+}
+
+/// AC19 at the plugin level: an empty `url` pattern in any of its three bus
+/// spellings (`""`, `{wildcard: ""}`, `{regex: ""}`) makes `flow.intercept`
+/// return `Err` naming the empty pattern, and the previously armed rule stays
+/// active instead of being replaced by a match-everything rule.
+#[test]
+fn empty_url_pattern_is_error() {
+    let reg = registry();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    arm(
+        &reg,
+        &host,
+        params(&[
+            ("enabled", Value::Bool(true)),
+            (
+                "rules",
+                Value::Array(vec![rule_obj(&[
+                    ("url", Value::Str("*/admin".into())),
+                    ("phase", Value::Str("request".into())),
+                ])]),
+            ),
+        ]),
+    );
+    let intercept = reg
+        .command("flow.intercept")
+        .expect("flow.intercept registered");
+
+    for (what, url) in [
+        ("bare string", Value::Str(String::new())),
+        (
+            "{wildcard}",
+            rule_obj(&[("wildcard", Value::Str(String::new()))]),
+        ),
+        ("{regex}", rule_obj(&[("regex", Value::Str(String::new()))])),
+    ] {
+        let err = intercept
+            .invoke(
+                params(&[("rules", Value::Array(vec![rule_obj(&[("url", url)])]))]),
+                &host,
+            )
+            .expect_err(what);
+        assert!(
+            err.to_string().contains("empty url pattern"),
+            "{what}: the error should name the empty pattern: {err}"
+        );
+    }
+
+    // The earlier `*/admin` rule is still active, and nothing else parks.
+    let admin = store.insert(http_flow("/admin"));
+    assert!(
+        dispatch_request(&reg, &store, admin).is_some(),
+        "the valid rule survived the rejected calls"
+    );
+    let public = store.insert(http_flow("/public"));
+    assert!(
+        dispatch_request(&reg, &store, public).is_none(),
+        "no match-everything rule was armed by the rejected calls"
     );
 }
