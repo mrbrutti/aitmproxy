@@ -48,6 +48,8 @@ C17. Stale binding `text` in `tests/scan_v2_parse.rs` after B10: `params`.
 
 C18. Fix-round provenance tags in production doc comments (`crates/aitm-tui/src/scan/mod.rs`, `scan/sitemap.rs`, `scan/jobs.rs`, `ui/scan/mod.rs`, `app.rs`: the nine comments reading "(fix round A, Ax)" or "(fix round B, Bx)"): drop the tag, keep the why. Test doc comments may keep theirs.
 
+C19. **`already <state>` is routed through the error channel** (`crates/aitm-tui/src/app.rs` `scan_cancel`, `crates/aitm-tui/src/scan/mod.rs`, `crates/aitm-tui/src/ui/scan/mod.rs`): the banner reads `scan.cancel: already done` in the error hue. Add `ScanState.notice: Option<String>` (a non-error notice, cleared by the next key or reply that changes the tab), drawn by `banner()` in `text_secondary` between the error and the refreshing states; `scan_cancel` on a terminal job sets `notice = Some(format!("already {state}"))` and records no `ScanError`. Test (`tests/scan_v2_jobs.rs` `cancel_on_a_terminal_job_is_inert`): the banner contains `already done` and not `scan.cancel:`.
+
 ## Not in this round
 
 The `summaries` read-through in the Jobs row renderer (Task 6); `IssueFilters::args` and `fetched_at_tick: Option<u64>` (Task 7); `started_here` insertion on `StartResult` (Task 12); `typed_origin` IPv6 bracketing (Task 9); the Site map `render` by `MapSource` (Task 9).
