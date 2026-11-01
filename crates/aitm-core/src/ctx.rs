@@ -10,6 +10,7 @@
 use futures::future::BoxFuture;
 use tokio::sync::oneshot;
 
+use crate::client::SendOptions;
 use crate::flow::{
     Flow, FlowId, HttpFlow, HttpRequest, HttpResponse, InterceptState, ResumeHandle,
 };
@@ -22,6 +23,19 @@ use crate::value::Value;
 pub trait ProxyClient: Send + Sync {
     /// Send `req` and return the resulting captured flow (marked `is_replay`).
     fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>>;
+
+    /// Send `req` under [`SendOptions`] (record policy, marks, version policy).
+    /// The default ignores `opts` and calls [`ProxyClient::send`], which records;
+    /// an impl that cannot honour the options falls back to it. `PipelineClient`
+    /// overrides this to apply every option.
+    fn send_opts(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        let _ = opts;
+        self.send(req)
+    }
 }
 
 /// Where to click in the browser.

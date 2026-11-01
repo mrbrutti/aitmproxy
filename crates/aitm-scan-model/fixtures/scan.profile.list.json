@@ -1,0 +1,84 @@
+{
+  "profiles": [
+    {
+      "name": "passive-only",
+      "builtin": true,
+      "summary": {
+        "lanes": [
+          "http"
+        ],
+        "intensity": "passive",
+        "speed": "normal"
+      }
+    },
+    {
+      "name": "map-only",
+      "builtin": true,
+      "summary": {
+        "lanes": [
+          "http"
+        ],
+        "intensity": "passive",
+        "speed": "normal"
+      }
+    },
+    {
+      "name": "light-http",
+      "builtin": true,
+      "summary": {
+        "lanes": [
+          "http"
+        ],
+        "intensity": "light",
+        "speed": "fast"
+      }
+    },
+    {
+      "name": "standard",
+      "builtin": true,
+      "summary": {
+        "lanes": [
+          "http",
+          "ws"
+        ],
+        "intensity": "medium",
+        "speed": "normal"
+      }
+    },
+    {
+      "name": "thorough",
+      "builtin": true,
+      "summary": {
+        "lanes": [
+          "http",
+          "ws"
+        ],
+        "intensity": "medium",
+        "speed": "thorough"
+      }
+    },
+    {
+      "name": "l4-stream-safe",
+      "builtin": true,
+      "summary": {
+        "lanes": [
+          "l4_stream"
+        ],
+        "intensity": "medium",
+        "speed": "normal"
+      }
+    },
+    {
+      "name": "l4-full",
+      "builtin": true,
+      "summary": {
+        "lanes": [
+          "l4_packet",
+          "l4_stream"
+        ],
+        "intensity": "medium",
+        "speed": "normal"
+      }
+    }
+  ]
+}

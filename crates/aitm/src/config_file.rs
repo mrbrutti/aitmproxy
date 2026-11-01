@@ -24,6 +24,7 @@ use aitm_core::{
 };
 use aitm_plugin_rhai::{RhaiConfig, ScriptEntry};
 use aitm_proto_l4::config::L4Config;
+use aitm_sysproxy::SystemProxyConfig;
 
 use crate::macos_capture::config::MacosCaptureConfig;
 
@@ -47,6 +48,20 @@ pub struct Settings {
     /// to keep `aitm-core` untouched; an absent `macos_capture` section is the
     /// disabled default (the feeder's deny-by-default on-switch).
     pub macos_capture: MacosCaptureConfig,
+    /// System proxy automation (spec §D7). Lives outside `Config` like the two
+    /// above. `state_file` is always `Some` here: an unset one is filled with the
+    /// CA audit log's sibling, `<dir of ca.audit_log>/system-proxy-state.json`
+    /// (plan call C6), so it follows the same directory rule and fallbacks.
+    pub system_proxy: SystemProxyConfig,
+}
+
+/// Plan call C6: fill an unset `system_proxy.state_file` with the default that
+/// sits beside the CA audit log. Runs after the file's `ca:` section is applied,
+/// so an operator-set `ca.audit_log` moves the default with it.
+fn fill_default_state_file(system_proxy: &mut SystemProxyConfig, core: &Config) {
+    if system_proxy.state_file.is_none() {
+        system_proxy.state_file = Some(SystemProxyConfig::default_state_file(&core.ca.audit_log));
+    }
 }
 
 /// Load the config file as the core [`Config`] only.
@@ -71,12 +86,18 @@ pub fn load_settings(path: Option<&Path>) -> anyhow::Result<Settings> {
             Ok(text) => {
                 parse_settings(&text).with_context(|| format!("in config file {}", path.display()))
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Settings {
-                core: Config::default(),
-                rhai: RhaiConfig::default(),
-                l4: L4Config::default(),
-                macos_capture: MacosCaptureConfig::default(),
-            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let core = Config::default();
+                let mut system_proxy = SystemProxyConfig::default();
+                fill_default_state_file(&mut system_proxy, &core);
+                Ok(Settings {
+                    core,
+                    rhai: RhaiConfig::default(),
+                    l4: L4Config::default(),
+                    macos_capture: MacosCaptureConfig::default(),
+                    system_proxy,
+                })
+            }
             Err(e) => Err(e).with_context(|| format!("reading config file {}", path.display())),
         };
     };
@@ -103,15 +124,18 @@ pub fn parse_settings(yaml: &str) -> anyhow::Result<Settings> {
     let file: ConfigFile = serde_yaml::from_str(yaml).context("parsing config YAML")?;
     let l4 = file.l4.clone().unwrap_or_default();
     let macos_capture = file.macos_capture.clone().unwrap_or_default();
+    let mut system_proxy = file.system_proxy.clone().unwrap_or_default();
     let mut core = Config::default();
     let mut rhai = RhaiConfig::default();
     file.apply(&mut core, &mut rhai)?;
     append_scripts_dir_entries(&mut rhai);
+    fill_default_state_file(&mut system_proxy, &core);
     Ok(Settings {
         core,
         rhai,
         l4,
         macos_capture,
+        system_proxy,
     })
 }
 
@@ -188,6 +212,12 @@ struct ConfigFile {
     /// `macos_capture.*` key is an error. Lives outside `Config` to keep
     /// `aitm-core` untouched, like `l4`.
     macos_capture: Option<MacosCaptureConfig>,
+    /// System proxy automation (spec §D7). Maps directly to
+    /// [`SystemProxyConfig`] (its own `#[serde(default, deny_unknown_fields)]`
+    /// applies), so an absent section is the off default and a misspelled
+    /// `system_proxy.*` key is an error. Lives outside `Config` to keep
+    /// `aitm-core` untouched, like `macos_capture`.
+    system_proxy: Option<SystemProxyConfig>,
     /// The scripts to load, in chain order (M3 spec §8).
     scripts: Option<Vec<ScriptFile>>,
     /// The scripting sandbox: limits, the per-hook budget, the error policy.
@@ -253,7 +283,8 @@ impl ConfigFile {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TlsFile {
-    /// Hosts (or `*.wildcard`) tunnelled past MITM.
+    /// Hosts (or `*.wildcard`) pinned out of MITM: tunnelled even when in Scope
+    /// (pins win over Scope; a host outside Scope is tunnelled regardless).
     passthrough: Option<Vec<String>>,
     /// Let an agent (MCP) frontend change the passthrough list. Off by default.
     allow_agent_passthrough: Option<bool>,
@@ -800,6 +831,71 @@ mod tests {
     #[test]
     fn macos_capture_unknown_key_errors() {
         assert!(parse_settings("macos_capture:\n  nope: true\n").is_err());
+    }
+
+    /// SP-AC19: the `system_proxy` section maps onto `SystemProxyConfig`, and an
+    /// unset `state_file` is filled with the CA audit log's sibling (plan call C6),
+    /// so `Settings.system_proxy.state_file` is always `Some`.
+    #[test]
+    fn system_proxy_section_parses_with_default_state_file() {
+        let s = parse_settings("system_proxy:\n  auto: true\n  bypass: [corp.test]\n").unwrap();
+        assert!(s.system_proxy.auto);
+        assert_eq!(s.system_proxy.bypass, vec!["corp.test".to_string()]);
+        assert_eq!(
+            s.system_proxy.state_file,
+            Some(
+                s.core
+                    .ca
+                    .audit_log
+                    .with_file_name("system-proxy-state.json")
+            )
+        );
+    }
+
+    /// SP-AC19: an unknown key under `system_proxy` is an error
+    /// (`deny_unknown_fields`), not a silently kept default.
+    #[test]
+    fn system_proxy_unknown_key_is_an_error() {
+        assert!(parse_settings("system_proxy:\n  nope: true\n").is_err());
+    }
+
+    /// SP-AC19: no `system_proxy` section means off, no extra bypass, and still a
+    /// default state-file path (C6 applies to the absent section too).
+    #[test]
+    fn system_proxy_absent_is_off() {
+        let s = parse_settings("listen: \"127.0.0.1:8080\"\n").unwrap();
+        assert!(!s.system_proxy.auto);
+        assert!(s.system_proxy.bypass.is_empty());
+        assert!(s.system_proxy.state_file.is_some());
+    }
+
+    /// The SP-AC25 twin: the exact block the mac app writes (block-sequence
+    /// bypass, quoted host) parses to the same settings as the flow form.
+    #[test]
+    fn system_proxy_block_the_mac_app_emits_parses() {
+        let s = parse_settings("system_proxy:\n  auto: true\n  bypass:\n    - \"corp.test\"\n")
+            .unwrap();
+        assert!(s.system_proxy.auto);
+        assert_eq!(s.system_proxy.bypass, vec!["corp.test".to_string()]);
+    }
+
+    /// C6 fills `state_file` only when the file leaves it unset: an explicit path
+    /// is kept, and the default follows an operator-set `ca.audit_log`, not the
+    /// built-in one.
+    #[test]
+    fn system_proxy_explicit_state_file_and_audit_log_are_honoured() {
+        let s = parse_settings("system_proxy:\n  state_file: /tmp/x/sp.json\n").unwrap();
+        assert_eq!(
+            s.system_proxy.state_file,
+            Some(std::path::PathBuf::from("/tmp/x/sp.json"))
+        );
+        let s =
+            parse_settings("ca:\n  audit_log: /tmp/y/ca-audit.log\nsystem_proxy:\n  auto: true\n")
+                .unwrap();
+        assert_eq!(
+            s.system_proxy.state_file,
+            Some(std::path::PathBuf::from("/tmp/y/system-proxy-state.json"))
+        );
     }
 
     /// The streamable-HTTP transport is selectable from config as a `snake_case`

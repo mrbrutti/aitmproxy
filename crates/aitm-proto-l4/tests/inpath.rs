@@ -124,6 +124,69 @@ fn intercept_start_fail_closed_via_registry() {
         matches!(l4, L4Error::Unavailable(_)),
         "in-path must fail closed with L4Unavailable, got {l4:?}"
     );
+
+    // L4PAR-AC4 / AC9 (plan A4): `l4.intercept.status` is not privilege-gated. It
+    // answers `Ok` with `available: false` and the same reason the start refused with.
+    let status = reg
+        .command("l4.intercept.status")
+        .expect("l4.intercept.status must be on the bus")
+        .invoke(Params::default(), &host)
+        .expect("intercept.status must answer Ok without CAP_NET_ADMIN");
+    let Value::Object(fields) = &status else {
+        panic!("intercept.status must be an object, got {status:?}");
+    };
+    assert_eq!(fields.get("available"), Some(&Value::Bool(false)));
+    assert_eq!(
+        fields.get("reason"),
+        Some(&Value::Str("missing CAP_NET_ADMIN".into()))
+    );
+    assert_eq!(fields.get("sessions"), Some(&Value::Array(vec![])));
+
+    // Tester (stage 5): the full object, `code` included (in-path is Linux-only, so
+    // the same probe text is `needs_privilege` on Linux and `unsupported_platform`
+    // elsewhere), and the start's refusal carries exactly the status `reason`.
+    let code = if cfg!(target_os = "linux") {
+        "needs_privilege"
+    } else {
+        "unsupported_platform"
+    };
+    assert_eq!(fields.get("code"), Some(&Value::Str(code.into())));
+    assert_eq!(
+        fields.len(),
+        4,
+        "exactly available/code/reason/sessions: {fields:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "L4 unavailable: missing CAP_NET_ADMIN",
+        "intercept.start refuses with `L4 unavailable: ` + the status reason"
+    );
+    // The other in-path verbs stay gated: `l4.intercept.list` still refuses.
+    let list_err = reg
+        .command("l4.intercept.list")
+        .expect("l4.intercept.list must be on the bus")
+        .invoke(Params::default(), &host)
+        .expect_err("l4.intercept.list stays privilege-gated");
+    assert!(
+        matches!(
+            list_err.downcast_ref::<L4Error>(),
+            Some(L4Error::Unavailable(_))
+        ),
+        "got {list_err:?}"
+    );
+    // Capture is privileged on this module, so its status is available.
+    let capture = reg
+        .command("l4.capture.status")
+        .expect("l4.capture.status must be on the bus")
+        .invoke(Params::default(), &host)
+        .expect("capture.status answers");
+    let Value::Object(cap) = &capture else {
+        panic!("capture.status must be an object, got {capture:?}");
+    };
+    assert_eq!(cap.get("available"), Some(&Value::Bool(true)));
+    assert_eq!(cap.get("code"), Some(&Value::Str("available".into())));
+    assert_eq!(cap.get("reason"), Some(&Value::Null));
+    assert_eq!(cap.get("captures"), Some(&Value::Array(vec![])));
 }
 
 // ---- Linux-gated functional suite (real NFQUEUE on a loopback nft queue) ---------

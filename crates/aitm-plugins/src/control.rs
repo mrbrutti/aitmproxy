@@ -1,8 +1,10 @@
 //! The control plugin (F7): proxy and session control over the bus.
 //!
 //! `proxy.status` reports the proxy's live state (whether it is listening and on
-//! what address, whether interception is armed, how many flows are paused, and
-//! whether capture is on) so a surface has a read-only way to learn it.
+//! what address, whether interception is armed, how many flows are paused,
+//! whether capture is on, and `decrypt`: how many hosts Scope — the decryption
+//! list — holds and the one advice sentence to print when it holds none) so a
+//! surface has a read-only way to learn it.
 //! `proxy.pause`/`proxy.resume` toggle whether new flows are *shown*: a paused
 //! flow still passes through the proxy and stays in memory (reachable by id), it
 //! is simply hidden from `list`/`status`/`count` and aged out by normal eviction.
@@ -15,8 +17,9 @@ use std::sync::Arc;
 
 use aitm_core::{
     BrowserEngine, Command, CommandHost, Config, McpTransport, ParamSchema, Params, Plugin,
-    Registry, TypeDesc, Value,
+    Registry, TypeDesc, Value, NOTHING_DECRYPTED_ADVICE,
 };
+use aitm_sysproxy::SystemProxy;
 
 /// Registers `proxy.status`, `proxy.pause`, `proxy.resume`, `flow.clear`, and
 /// `config.get`. Shares the intercept plugin's armed flag and a serving flag for
@@ -24,6 +27,9 @@ use aitm_core::{
 pub struct ControlPlugin {
     armed: Arc<AtomicBool>,
     listening: Arc<AtomicBool>,
+    /// The system-proxy engine whose compact summary `proxy.status` carries as
+    /// `system_proxy` (spec §D6); absent, the field is omitted.
+    system_proxy: Option<Arc<SystemProxy>>,
 }
 
 impl ControlPlugin {
@@ -31,7 +37,20 @@ impl ControlPlugin {
     /// `InterceptPlugin::armed_flag`); `listening` is flipped by the binary once it
     /// is actually serving, so `proxy.status` reports the real state.
     pub fn new(armed: Arc<AtomicBool>, listening: Arc<AtomicBool>) -> Self {
-        Self { armed, listening }
+        Self {
+            armed,
+            listening,
+            system_proxy: None,
+        }
+    }
+
+    /// Carry the system-proxy engine so `proxy.status` reports its §D6 compact
+    /// `system_proxy` sub-object (cached ≤ 5 s by the engine; refreshed at once
+    /// by `proxy.system.set`/`unset`). The same `Arc` the `proxy.system.*`
+    /// verbs act over, so both faces see one state (spec §D8).
+    pub fn with_system_proxy(mut self, sp: Arc<SystemProxy>) -> Self {
+        self.system_proxy = Some(sp);
+        self
     }
 }
 
@@ -44,6 +63,7 @@ impl Plugin for ControlPlugin {
         reg.add_command(Arc::new(ProxyStatus {
             armed: self.armed.clone(),
             listening: self.listening.clone(),
+            system_proxy: self.system_proxy.clone(),
         }));
         reg.add_command(Arc::new(ProxyPause));
         reg.add_command(Arc::new(ProxyResume));
@@ -56,6 +76,7 @@ impl Plugin for ControlPlugin {
 struct ProxyStatus {
     armed: Arc<AtomicBool>,
     listening: Arc<AtomicBool>,
+    system_proxy: Option<Arc<SystemProxy>>,
 }
 
 impl Command for ProxyStatus {
@@ -71,8 +92,14 @@ impl Command for ProxyStatus {
         ParamSchema {
             description:
                 "The proxy's live state: `listening` (bool) + `address`, `intercept_armed`, \
-                          `paused` (parked-flow count), `capturing`, `flows` (visible count), and \
-                          `version` (the aitm binary's version)."
+                          `paused` (parked-flow count), `capturing`, `flows` (visible count), \
+                          `version` (the aitm binary's version), and `system_proxy` (the OS \
+                          proxy setting as this core sees it: `state` one of points_at_us/other/\
+                          off/unknown/unsupported, `host`/`port` when `other`, `managed_by_us`, \
+                          `setting`, `supported`, `detail`; refreshed at most every 5 s), and \
+                          `decrypt` (`scope_hosts`: entries in Scope, the decryption list; \
+                          `decrypting`: scope_hosts > 0; `advice`: the one sentence to show \
+                          when nothing is decrypted, else null)."
                     .into(),
             params: vec![],
             result: TypeDesc::Object(Vec::new()),
@@ -105,6 +132,27 @@ impl Command for ProxyStatus {
             "version".into(),
             Value::Str(env!("CARGO_PKG_VERSION").into()),
         );
+        // The §D6 compact sub-object; the engine serves it from its ≤ 5 s cache,
+        // so polling `proxy.status` every 2 s costs one OS read per 5 s at most.
+        if let Some(sp) = &self.system_proxy {
+            obj.insert("system_proxy".into(), sp.summary().to_value());
+        }
+        // Scope is the decryption list (spec D8). The count is the live guard's,
+        // so a `scope.add` after launch shows at once; the advice is the one
+        // constant every surface prints verbatim, `null` once a host is in Scope.
+        let scope_hosts = host.guard().list_scope().len();
+        let mut decrypt = BTreeMap::new();
+        decrypt.insert("scope_hosts".into(), Value::Int(scope_hosts as i64));
+        decrypt.insert("decrypting".into(), Value::Bool(scope_hosts > 0));
+        decrypt.insert(
+            "advice".into(),
+            if scope_hosts == 0 {
+                Value::Str(NOTHING_DECRYPTED_ADVICE.into())
+            } else {
+                Value::Null
+            },
+        );
+        obj.insert("decrypt".into(), Value::Object(decrypt));
         Ok(Value::Object(obj))
     }
 }

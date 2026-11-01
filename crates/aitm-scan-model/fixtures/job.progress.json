@@ -1,0 +1,48 @@
+{
+  "job": "scan-1a2b3c4d",
+  "kind": "scan",
+  "event": "progress",
+  "seq": 3,
+  "ts_ms": 1761900000003,
+  "status": {
+    "job": "scan-1a2b3c4d",
+    "state": "running",
+    "phase": "auditing",
+    "elapsed_ms": 42000,
+    "probes": {
+      "sent": 418,
+      "budget": 2000,
+      "errors": 2,
+      "timeouts": 1,
+      "rate_waits": 0,
+      "by_lane": {
+        "http": 418
+      }
+    },
+    "points": {
+      "found": 120,
+      "queued": 40,
+      "audited": 80,
+      "skipped": {
+        "ignored": 5,
+        "frequent": 3,
+        "limit": 0
+      }
+    },
+    "issues": {
+      "total": 3,
+      "by_severity": {
+        "critical": 0,
+        "high": 1,
+        "medium": 1,
+        "low": 1,
+        "info": 0
+      },
+      "by_confidence": {
+        "certain": 1,
+        "firm": 1,
+        "tentative": 1
+      }
+    }
+  }
+}

@@ -635,23 +635,25 @@ UX:
 - States: invalid regex / empty URL -> inline error under the field, Save disabled; no rules -> "Every request pauses" note; live before F3 -> rules kept locally and the bar says "rules need F3"
 - Words: sheet title "Breakpoint Rules"; buttons "Add Rule", "Remove", "Test your rule", "Save ⌘⏎", "Cancel"
 - Access: table rows selectable by keyboard; form fields in reading order
+Live: 2026-10-31, the first time the rules reached a real core (PR #202): `flow.intercept` accepts the app's rule set, a request rule `park` parks `/park` and lets `/` through, a response rule parks the response head (live self-test). The rule `flag` stays in the app and is not applied on park yet — follow-up.
 Status: done
 
 ### S-041 Intercept and edit a response
 As the operator, I pause at the response phase and change status, headers or body before the client sees it.
-Screens: edit-paused
+Screens: apps (the inspector on the flow list; no snapshot scene — fixture scenes are not evidence and are being removed, Matt 2026-10-31)
 Depends: S-037, S-040
 Core: F3
 Acceptance:
-- [snap] The summary pill reads `Paused · response`; the Response pane becomes editable like the request.
-- [self] Apply & Resume sends the response edits then `flow.resume`; the Edited pencil appears.
+- [live] The summary pill reads `Paused · response`; the Response pane becomes editable like the request (real core, real parked response).
+- [live] Apply & Resume sends the response edits then `flow.resume`; the client receives them; the Edited pencil appears (live self-test + screenshots).
 UX:
 - Flow: a rule with ☑ Response pauses at the response -> summary pill `Paused · response` -> Response pane editable (status, headers, body) -> Apply & Resume
 - Surface: inline in the inspector
 - States: before F3 nothing pauses at the response; the pill never shows
 - Words: pill "Paused · response"; footer as the request editor's
 - Access: same as S-037
-Status: todo
+Live: 2026-10-31, dev bundle with the release core, a curl parked at the response head under a response rule, edited in the Raw editor by real keystrokes, Apply & Resume (⌘⏎): curl received `HTTP/1.1 203` + `x-aitm-edited: 1` (`docs/evidence/S-041/`). Body edits reach the client too (live self-test). Rules… had never reached a live core before this (FIXLOG 2026-10-31).
+Status: done
 
 ### S-042 Compose a request
 As the operator, I press ⌘N (or `n`) and fill method, URL, headers, query and body in a sheet, pick a template, and Send; the result appears as a new flow.
@@ -742,7 +744,7 @@ Screens: scope, scope-sheet
 Depends: S-005
 Acceptance:
 - [snap] The Scope page lists entries with their limit readout (`10 req/s · back-off 2×`) and the count of flows in scope; the sheet has a text field with validation and `Add ⌘⏎`.
-- [unit] Entry validation accepts the three forms and rejects schemes and paths; `hostMatches` handles wildcard and port.
+- [unit] Entry validation accepts the three forms and rejects schemes and paths; `Scope.matches` (Kit, the one in-scope rule the poll uses too) handles wildcard and port.
 - [self] `scope.add` is sent; the Scope count in the sidebar and `N hosts in scope` in the status bar update; affected rows lose their dimming.
 UX:
 - Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once
@@ -1151,6 +1153,16 @@ UX:
 - Words: none
 - Access: none
 Notes: two Strong cards done as pure moves — `Session` split into state + `Session+Verbs/Editing/Filters/Palette` (809 → 406 lines), `FlowColumn`/`Density` out of `FlowTableView.swift` (542 → 430). No file past 600. Carried: one verb table for row actions (next Strong, before S-041/S-045), viewers behind one `ViewerKind` (with S-045). `docs/ARCHITECTURE.md` and `docs/FIXLOG.md` started.
+Status: done
+
+### S-079 The flow list follows the capture on every page
+As the operator, I watch the Flows page (or any list page) and every change the poll brings — a new row, a parked row resumed, a status landing — is drawn within the poll interval, without switching pages.
+Screens: apps
+Depends: S-002, S-005
+Acceptance:
+- [live] Dev bundle with a real core, Flows page, intercept armed from the Flow menu: a curl parks and its row appears within a poll; Flow ▸ Resume turns the row to its status within a poll; a second curl's row appears; no page switch (before/after screenshots in `docs/evidence/S-079/`).
+- [live] The same on the Apps page (unchanged).
+Live: 2026-10-31, found on the installed v0.5.6 during the S-041 check (FIXLOG 2026-10-31 "The Flows page stopped redrawing"); S-073 to S-078 are reserved for the Proxyman capture-flow stories drafted in `docs/research/proxyman-capture-flow-gaps.md`.
 Status: done
 
 ### S-072 See what is running and what to do first

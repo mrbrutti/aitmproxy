@@ -1,0 +1,59 @@
+{
+  "nodes": [
+    {
+      "id": "node-1",
+      "method": "GET",
+      "scheme": "http",
+      "host": "127.0.0.1",
+      "port": 8080,
+      "path_template": "/account/{id}",
+      "flows": [
+        "550e8400-e29b-41d4-a716-446655440000"
+      ],
+      "params": [
+        {
+          "kind": "query",
+          "name": "tab"
+        }
+      ],
+      "auth": true,
+      "points": 2,
+      "audited": true
+    }
+  ],
+  "points": [
+    {
+      "id": "point-json-1",
+      "lane": "http",
+      "kind": "json_value",
+      "name": "city",
+      "path": "profile.address.city",
+      "example": "Lisbon",
+      "flow": "550e8400-e29b-41d4-a716-446655440000",
+      "site_node": "node-1",
+      "traits": [
+        "json"
+      ],
+      "frequency": 3,
+      "method": "POST",
+      "url": "http://127.0.0.1:8080/account"
+    },
+    {
+      "id": "point-cookie-1",
+      "lane": "http",
+      "kind": "cookie",
+      "name": "theme",
+      "path": null,
+      "example": "<redacted>",
+      "flow": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "site_node": "node-1",
+      "traits": [
+        "id"
+      ],
+      "frequency": 9,
+      "method": "GET",
+      "url": "http://127.0.0.1:8080/account"
+    }
+  ],
+  "next_cursor": "node-2"
+}

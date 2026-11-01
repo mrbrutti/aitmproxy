@@ -14,12 +14,15 @@ aitm-core.workspace = true
 anyhow.workspace = true
 # `BoxFuture` for the `ProtocolModule::spawn` return type.
 futures.workspace = true
-# Resolving the upstream authority and copying bytes both ways with no MITM.
-tokio = { workspace = true, features = ["io-util", "net"] }
+# Resolving the upstream authority and copying bytes both ways with no MITM;
+# `time` bounds the wait for the first byte inside an acknowledged tunnel.
+tokio = { workspace = true, features = ["io-util", "net", "time"] }
 
 [dev-dependencies]
 uuid.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net"] }
+# `test-util` drives the first-byte timeout tests on a paused clock
+# (`#[tokio::test(start_paused = true)]`), so 30 s pass in no wall time.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time", "io-util", "net", "test-util"] }
 # The real HTTP module (MITM side of the test) and its certificate authority.
 aitm-proto-http.workspace = true
 # A loopback TLS origin with its own cert, and the two client handshakes.

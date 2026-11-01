@@ -4,106 +4,6 @@ import AppKit
 import Foundation
 import Observation
 
-/// The sidebar's entries (foundation §2.6). Snapshot mode walks every case.
-enum SidebarPage: String, CaseIterable, Identifiable {
-    case status, flows, pinned, saved, apps, domains, overview, connections, scope, scan, findings, browser, scripts, agent, ca, config
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .status: "Status"
-        case .flows: "Flows"
-        case .pinned: "Pinned"
-        case .saved: "Saved"
-        case .apps: "Apps"
-        case .domains: "Domains"
-        case .overview: "Overview"
-        case .connections: "Connection Log"
-        case .scope: "Scope"
-        case .scan: "Scan"
-        case .findings: "Findings"
-        case .browser: "Browser"
-        case .scripts: "Scripts"
-        case .agent: "Agent"
-        case .ca: "Certificate Authority"
-        case .config: "Configuration"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .status: "waveform.path.ecg"
-        case .flows: "list.bullet"
-        case .pinned: Tok.Glyph.pin
-        case .saved: "tray.full"
-        case .apps: "app.badge"
-        case .domains: Tok.Glyph.browser
-        case .overview: "chart.bar"
-        case .connections: "point.3.connected.trianglepath.dotted"
-        case .scope: Tok.Glyph.scope
-        case .scan: Tok.Glyph.search
-        case .findings: Tok.Glyph.poc
-        case .browser: Tok.Glyph.browser
-        case .scripts: "chevron.left.forwardslash.chevron.right"
-        case .agent: Tok.Glyph.agent
-        case .ca: Tok.Glyph.lock
-        case .config: "doc.text"
-        }
-    }
-
-    /// Pages that show the flow list (the rest open their own panel).
-    var showsFlows: Bool {
-        switch self {
-        case .flows, .pinned, .saved, .apps, .domains, .scope, .connections: true
-        case .status, .overview, .scan, .findings, .browser, .scripts, .agent, .ca, .config: false
-        }
-    }
-
-    /// CA and Configuration open from the Proxy menu and the palette; Status from the toolbar
-    /// pill, ⌘0 and the palette; Saved waits for the core to save (S-066). None are list rows.
-    var isInSidebar: Bool {
-        switch self {
-        case .ca, .config, .status, .saved: false
-        default: true
-        }
-    }
-}
-
-/// Where the inspector sits (Proxyman's layouts): below, right, or in its own window.
-enum InspectorLayout: String, CaseIterable {
-    case horizontal, vertical, detached
-
-    var title: String {
-        switch self {
-        case .horizontal: "Inspector Below"
-        case .vertical: "Inspector Right"
-        case .detached: "Inspector Detached"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .horizontal: "rectangle.split.1x2"
-        case .vertical: Tok.Glyph.split
-        case .detached: "macwindow.on.rectangle"
-        }
-    }
-}
-
-/// The agent policy (foundation §4.8, F1).
-enum AgentPolicy: String, CaseIterable {
-    case all, readOnly, paused
-
-    var title: String {
-        switch self {
-        case .all: "Allow all tools"
-        case .readOnly: "Read-only"
-        case .paused: "Paused"
-        }
-    }
-}
-
 // `BusState` lives in AitmproxyKit (ConnectionSummary.swift) so the connection indicators share it.
 
 /// Everything the shell shows. One object, shared through the environment.
@@ -208,7 +108,8 @@ final class Session {
     var requestTab: RequestTab = .raw
     var responseTab: ResponseTab = .body
     var sort: FlowSort = .captureOrder
-    var density: Density = Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .dense {
+    var density: Density = Store.isOverridden ? .dense
+        : Density(rawValue: UserDefaults.standard.string(forKey: "density") ?? "") ?? .dense {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(density.rawValue, forKey: "density") } }
     }
     var interceptArmed = false
@@ -262,7 +163,7 @@ final class Session {
     /// A query the palette starts with the next time it opens (snapshot scenes); cleared on use.
     var paletteSeedQuery: String?
     var tools: [ToolDescriptor] = Store.usesFixtures ? Fixtures.tools : []
-    var recentPaletteIDs: [String] = UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
+    var recentPaletteIDs: [String] = Store.isOverridden ? [] : UserDefaults.standard.stringArray(forKey: "palette.recent") ?? []
     /// A generic bus call for the palette; nil until a bus is attached.
     @ObservationIgnored var commandRunner: ((String, [String: JSONValue]) async throws -> JSONValue)?
     /// Every command this app runs, for the activity log (S-057): name, args, result text or nil on success.
@@ -307,8 +208,9 @@ final class Session {
     var upBytesPerSecond: Int64 = 0
     var downBytesPerSecond: Int64 = 0
     var version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.1"
-    /// Settings reopens on the last tab. Test and snapshot runs leave it alone.
-    var settingsTab: SettingsTab = SettingsTab(rawValue: UserDefaults.standard.string(forKey: "settings.tab") ?? "") ?? .general {
+    /// Settings reopens on the last tab. Test and snapshot runs neither read nor write it.
+    var settingsTab: SettingsTab = Store.isOverridden ? .general
+        : SettingsTab(rawValue: UserDefaults.standard.string(forKey: "settings.tab") ?? "") ?? .general {
         didSet { if !Store.isOverridden { UserDefaults.standard.set(settingsTab.rawValue, forKey: "settings.tab") } }
     }
 
@@ -327,7 +229,7 @@ final class Session {
         if !Store.usesFixtures { pins = Pins.load(from: pinsURL) }
         // The Scope page shows the embedded core's persisted scope before the bus
         // connects; `refreshScope()` replaces it with the core's `scope.list` on connect (D5).
-        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence().load() ?? .embedded,
+        if EmbeddedScope.seedsAtLaunch(activeKind: UserDefaultsActiveKindPersistence(defaults: Store.defaults).load() ?? .embedded,
                                        bundledCorePresent: EmbeddedCore.discoverBundled() != nil,
                                        usesFixtures: Store.usesFixtures) {
             scopeHosts = EmbeddedScope.load(from: scopeURL).hosts
@@ -336,62 +238,9 @@ final class Session {
         if !Store.usesFixtures { breakpointRules = BreakpointRules.load(from: rulesURL) }
         loadSavedFilters()
         if Store.usesFixtures {
-            // Fixture commands: the ones the shell already models act; the rest echo.
-            commandRunner = { [weak self] name, args in
-                guard let self else { throw BusError.disconnected }
-                switch name {
-                case "flow.intercept": interceptArmed = args["enabled"]?.boolValue ?? true; return .bool(interceptArmed)
-                case "flow.resume": if let id = args["id"]?.stringValue { resume(FlowID(id)) }; return .null
-                case "flow.kill": if let id = args["id"]?.stringValue { kill(FlowID(id)) }; return .null
-                case "flow.replay": if let id = args["id"]?.stringValue { replay(FlowID(id)) }; return .string("replayed")
-                case "flow.list": return .array(rows.map { .string($0.id.raw) })
-                case "scope.list": return .array(scopeHosts.map { .string($0) })
-                case "scope.add": if let h = args["host"]?.stringValue { addScope(h) }; return .string(args["host"]?.stringValue ?? "")
-                case "l4.flow.list": return .array(l4Details.keys.map { .string($0.raw) })
-                case "l4.flow.get":
-                    guard let id = args["id"]?.stringValue, let flow = l4Details[FlowID(id)] else { throw BusError.tool(message: "no such L4 flow") }
-                    return Fixtures.l4FlowJSON(flow)
-                case "l4.craft":
-                    return .object([
-                        "length": .number(Double(Fixtures.l4CraftBytes.count)),
-                        "bytes": .string(Fixtures.l4CraftBytes.base64EncodedString()),
-                        "summary": .object(["layers": .array([.string("IPv4"), .string("UDP")]),
-                                            "length": .number(Double(Fixtures.l4CraftBytes.count))]),
-                    ])
-                case "l4.inject", "l4.send_recv":
-                    // The guard refuses an out-of-scope target before any confirm token.
-                    let dst = args["dst"]?.stringValue ?? ""
-                    guard dst == "127.0.0.1" else {
-                        throw BusError.tool(message: "\(name) refused: OutOfL4Scope — \(dst) is not in the L4 scope "
-                            + "(deny-by-default). Add it with l4.scope.add (operator-confirmed).")
-                    }
-                    if args["_confirm"] != nil { return .object(["status": .string("ok"), "sent": .number(1)]) }
-                    let count = args["count"]?.intValue ?? 1
-                    return .object([
-                        "status": .string("needs_confirmation"),
-                        "prompt": .string("Inject \(count)× IPv4/UDP (37 B) to \(dst):\(args["port"]?.intValue ?? 9) "
-                            + "on \(args["interface"]?.stringValue ?? "lo0") — in scope \(Fixtures.l4Scope) · permit budget "
-                            + "64 pps. Re-send with _confirm to put it on the wire."),
-                        "confirm_token": .string("l4-\(UUID().uuidString.prefix(8))"),
-                    ])
-                case "scan.discover":
-                    // The scanner gates the seed before its first navigation: an out-of-scope target is refused, never crawled.
-                    let target = args["target"]?.stringValue ?? ""
-                    guard let authority = ScanForm.authority(of: target), Scope.contains(authority, in: scopeHosts) else {
-                        throw BusError.tool(message: "scan.discover refused: OutOfScope — \(target) is not in scope (deny-by-default).")
-                    }
-                    return Fixtures.scanDiscover
-                case "l4.agent.status": return l4AgentGatesJSON()
-                case "l4.agent.set":
-                    if let cap = args["capability"]?.stringValue, let allowed = args["allowed"]?.boolValue {
-                        setL4Gate(cap, allowed)
-                    }
-                    return l4AgentGatesJSON()
-                case "l4.capture.start", "l4.capture.stop", "l4.scope.add", "l4.scope.list", "l4.interfaces", "l4.capture.status":
-                    return .string("ok (fixture)")
-                default: return .string("ok (fixture)")
-                }
-            }
+            // The fixture bus (Bus/FixtureBus.swift): what `BusService.call` is live.
+            let bus = FixtureBus(session: self)
+            commandRunner = { name, args in try await bus.call(name, args) }
         }
     }
 
@@ -410,16 +259,31 @@ final class Session {
                   chip: chip, filter: filterExpression, sort: sort)
     }
 
-    /// Rows after the query. Compiled once per query change, not per access.
+    /// Rows after the query. The filter is compiled once per query change and the
+    /// rows are re-filtered once per `rows`/`details` change, not per access.
+    ///
+    /// `rows` and `details` are read on every access, before the cache is consulted,
+    /// and the reads must stay: an `@Observable` view depends only on what it read
+    /// during its last body evaluation, so a cache hit that skipped them would leave
+    /// the flow table with no dependency on the capture the first time it re-rendered
+    /// for another reason (the intercept bar appearing, a selection) — and the Flows
+    /// page then stopped redrawing until a page switch (FIXLOG 2026-10-31). `details`
+    /// is an input too: the content-type chips and the filter read it, so a detail
+    /// arriving after its row can change the filtered set. The live self-test pins
+    /// both reads with `withObservationTracking`.
     var visibleRows: [FlowRow] {
         let q = query
-        if cachedQuery != q || cachedRows == nil || cachedRowsVersion != rowsVersion {
+        let current = rows
+        let currentDetails = details
+        if let cached = cachedRows, cachedQuery == q, cachedRowsVersion == rowsVersion { return cached }
+        if cachedQuery != q || cachedCompiled == nil {
             cachedQuery = q
             cachedCompiled = q.compiled()
-            cachedRows = cachedCompiled?.apply(rows, details: details)
-            cachedRowsVersion = rowsVersion
         }
-        return cachedRows ?? rows
+        let filtered = cachedCompiled?.apply(current, details: currentDetails) ?? current
+        cachedRows = filtered
+        cachedRowsVersion = rowsVersion
+        return filtered
     }
 
     // MARK: Panels (M5): each panel owns its state; the session holds one of each.
@@ -565,62 +429,4 @@ final class Session {
     var composeURL: URL { Store.url.appending(path: "compose.json") }
     /// The operator's unsent edits per paused flow; nil = as the proxy holds it.
     var editDrafts: [FlowID: HTTPMessage] = [:]
-
-    /// The current L4 agent gates as the `l4.agent.status` / `.set` JSON object.
-    func l4AgentGatesJSON() -> JSONValue {
-        let gates = l4AgentGates ?? L4AgentGates(capture: false, inject: false, intercept: false, widen: false)
-        return .object([
-            "capture": .bool(gates.capture), "inject": .bool(gates.inject),
-            "intercept": .bool(gates.intercept), "widen": .bool(gates.widen),
-        ])
-    }
-
-    /// Flip one fixture L4 agent gate (the operator act `l4.agent.set` performs).
-    func setL4Gate(_ capability: String, _ allowed: Bool) {
-        guard var gates = l4AgentGates, let cap = L4AgentGates.Capability(rawValue: capability) else { return }
-        switch cap {
-        case .capture: gates.capture = allowed
-        case .inject: gates.inject = allowed
-        case .intercept: gates.intercept = allowed
-        case .widen: gates.widen = allowed
-        }
-        l4AgentGates = gates
-    }
-
-    /// The mockup's state: armed intercept, two paused, the login selected.
-    func loadFixtures() {
-        details = Dictionary(uniqueKeysWithValues:
-            Fixtures.rows.filter { $0.kind != .websocket }.map { ($0.id, Fixtures.detail(for: $0)) })
-        wsDetails = Dictionary(uniqueKeysWithValues:
-            Fixtures.rows.filter { $0.kind == .websocket }.map { ($0.id, Fixtures.wsDetail(for: $0)) })
-        l4Details = Dictionary(uniqueKeysWithValues:
-            Fixtures.l4Rows.compactMap { row in Fixtures.l4Detail(for: row).map { (row.id, $0) } })
-        l4AgentGates = L4AgentGates(capture: true, inject: false, intercept: false, widen: false)
-        // AC18 CUA affordance: APP_L4_EMBEDDED=1 launches the fixture session as the
-        // self-contained app's embedded user-level core, which cannot do raw L4. This
-        // flips the already-built honest-degradation surface (banner + disabled wire
-        // verbs) so the macOS CUA harness can drive it with real clicks. Test-only:
-        // the real connection model sets `l4EmbeddedCore` from the core it drives.
-        if ProcessInfo.processInfo.environment["APP_L4_EMBEDDED"] == "1" { l4EmbeddedCore = true }
-        rows = Fixtures.rows + Fixtures.l4Rows
-        interceptArmed = true
-        scopeHosts = Fixtures.scope
-        pins = Pins(hosts: ["api.shop-staging.test", "auth.shop-staging.test"])
-        // No saved sessions exist until the core can save a capture (S-066); say so.
-        savedSessions = 0
-        findingsCount = 2
-        browserTabs = 1
-        // The same predicate the Scripts page uses (enabled and no error), so the sidebar count never disagrees with it.
-        activeScripts = Fixtures.scripts.filter(\.isActive).count
-        agentActionsLastMinute = 14
-        memoryBytes = 196_000_000
-        upBytesPerSecond = 6_000
-        downBytesPerSecond = 3_000
-        bus = .connected("127.0.0.1:9090")
-        resolvedRole = "operator"
-        select(Fixtures.rows[9].id)
-        poc.load()
-        findingsCount = poc.findings.count
-        scan.loadFixture()
-    }
 }

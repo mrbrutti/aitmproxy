@@ -66,10 +66,20 @@
               "name": "id",
               "type": "string",
               "description": "The L4 flow id to summarize."
+            },
+            {
+              "name": "offset",
+              "type": "int",
+              "description": "First packet index to return (optional, default 0)."
+            },
+            {
+              "name": "limit",
+              "type": "int",
+              "description": "How many packets to return (optional, default 256, at most 4096; 0 returns none)."
             }
           ],
           "returns": "object",
-          "description": "Summarize one stored L4 flow and its packets (read-only)."
+          "description": "Summarize one stored L4 flow and a window of its packets (read-only); each packet's bytes only for trusted callers or an agent holding the gate that could have produced that packet (Inject for an injected one, Capture for a captured one)."
         },
         {
           "name": "inject",
@@ -129,6 +139,69 @@
           ],
           "returns": "object",
           "description": "Scapy sr1: inject a stimulus and return the correlated reply (Inject+Capture)."
+        }
+      ]
+    },
+    "ws": {
+      "api_version": "1",
+      "fns": [
+        {
+          "name": "dial",
+          "params": [
+            {
+              "name": "options",
+              "type": "object",
+              "description": "`#{ url: \"ws://host/path\", headers: #{ name: value } }`; the URL must be `ws://` or `wss://` and its authority must be in scope."
+            }
+          ],
+          "returns": "int",
+          "description": "Open a scope-guarded WebSocket connection and return its handle; at most 4 are open at once."
+        },
+        {
+          "name": "send",
+          "params": [
+            {
+              "name": "handle",
+              "type": "int",
+              "description": "A handle returned by `ws.dial`."
+            },
+            {
+              "name": "frame",
+              "type": "string|blob",
+              "description": "A string is sent as a Text frame, a blob as a Binary frame."
+            }
+          ],
+          "returns": "null",
+          "description": "Send one frame on an open handle."
+        },
+        {
+          "name": "recv",
+          "params": [
+            {
+              "name": "handle",
+              "type": "int",
+              "description": "A handle returned by `ws.dial`."
+            },
+            {
+              "name": "timeout_ms",
+              "type": "int",
+              "description": "How long to collect replies for, clamped to 30000 ms."
+            }
+          ],
+          "returns": "object",
+          "description": "Collect the frames the server sent, as `#{ frames: [ #{ kind, text, bytes } ] }`; Pings are answered."
+        },
+        {
+          "name": "close",
+          "params": [
+            {
+              "name": "handle",
+              "type": "int",
+              "description": "A handle returned by `ws.dial`."
+            }
+          ],
+          "returns": "null",
+          "description": "Send a Close frame and free the handle."
         }
       ]
     }

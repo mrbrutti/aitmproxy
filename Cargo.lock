@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aitm"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-browser",
  "aitm-bus-client",
@@ -50,6 +50,13 @@ dependencies = [
  "aitm-proto-l4",
  "aitm-proto-ws",
  "aitm-rules",
+ "aitm-scan-checks-http",
+ "aitm-scan-http",
+ "aitm-scan-l4-packet",
+ "aitm-scan-l4-stream",
+ "aitm-scan-model",
+ "aitm-scan-ws",
+ "aitm-sysproxy",
  "aitm-testtarget",
  "aitm-tui",
  "anyhow",
@@ -76,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-browser"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -91,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-bus-client"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "serde",
@@ -101,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-ca"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -117,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-cli"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-mcp",
@@ -128,7 +135,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-core"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "anyhow",
  "dirs",
@@ -143,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-findings"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -159,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-mcp"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-plugins",
@@ -177,14 +184,14 @@ dependencies = [
 
 [[package]]
 name = "aitm-peer-token"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "aitm-plugin"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -196,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-maprules"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-rules",
@@ -206,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-passthrough"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -221,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-rhai"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-browser",
  "aitm-core",
@@ -229,6 +236,7 @@ dependencies = [
  "aitm-poc",
  "aitm-proto-l4",
  "aitm-proto-test",
+ "aitm-scan-ws",
  "anyhow",
  "arc-swap",
  "base64 0.22.1",
@@ -243,11 +251,12 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-scanner"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-findings",
  "aitm-poc",
+ "aitm-scan-model",
  "anyhow",
  "futures",
  "serde_json",
@@ -257,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-sessionio"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -269,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-wsctl"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -283,11 +292,12 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugins"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
  "aitm-rules",
+ "aitm-sysproxy",
  "anyhow",
  "futures",
  "rcgen",
@@ -301,7 +311,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-poc"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-browser",
  "aitm-core",
@@ -324,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-http"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -352,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-l4"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -374,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-test"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -383,7 +393,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-ws"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -397,32 +407,125 @@ dependencies = [
 
 [[package]]
 name = "aitm-rules"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "anyhow",
  "regex",
+ "serde_json",
+]
+
+[[package]]
+name = "aitm-scan-checks-http"
+version = "0.5.9"
+dependencies = [
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-http"
+version = "0.5.9"
+dependencies = [
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-l4-packet"
+version = "0.5.9"
+dependencies = [
+ "aitm-proto-l4",
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-l4-stream"
+version = "0.5.9"
+dependencies = [
+ "aitm-proto-l4",
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-model"
+version = "0.5.9"
+dependencies = [
+ "aitm-core",
+ "aitm-poc",
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "aitm-scan-ws"
+version = "0.5.9"
+dependencies = [
+ "aitm-core",
+ "aitm-plugin",
+ "aitm-plugin-rhai",
+ "aitm-poc",
+ "aitm-proto-http",
+ "aitm-proto-ws",
+ "aitm-scan-model",
+ "aitm-testtarget",
+ "anyhow",
+ "bytes",
+ "form_urlencoded",
+ "futures",
+ "httparse",
+ "rcgen",
+ "rhai",
+ "rustls",
+ "rustls-pki-types",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "tracing",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "aitm-sysproxy"
+version = "0.5.9"
+dependencies = [
+ "aitm-ca",
+ "aitm-core",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "time",
+ "tracing",
 ]
 
 [[package]]
 name = "aitm-testtarget"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-core",
  "aitm-findings",
  "aitm-poc",
+ "base64 0.22.1",
  "bytes",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rcgen",
+ "rustls",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "sha1",
+ "sha2",
  "tokio",
+ "tokio-rustls",
 ]
 
 [[package]]
 name = "aitm-tui"
-version = "0.5.4"
+version = "0.5.9"
 dependencies = [
  "aitm-bus-client",
  "anyhow",
@@ -1398,7 +1501,9 @@ checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
  "atomic-waker",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime};
 use aitm_core::{
     Body, CommandHost, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
     HttpRequest, HttpResponse, HttpVersion, InterceptState, MemFlowStore, Params, Plugin,
-    ProxyClient, Registry, StdGuard, TypeDesc, Value, WsFlow,
+    ProxyClient, Registry, StdGuard, TunnelInfo, TunnelMode, TunnelReason, TypeDesc, Value, WsFlow,
 };
 use aitm_plugins::CapturePlugin;
 use futures::future::BoxFuture;
@@ -908,4 +908,419 @@ fn source_app_text_passes_through_verbatim_on_flow_get_and_flow_table() {
         row.get("capture_interface"),
         Some(&Value::Str("macos-ne\n".into()))
     );
+}
+
+// ---- per-host decryption (spec D7 / AC11): tunnel and passive keys on every surface ----
+
+/// A `CONNECT host:port` row as the tunnel recorder stores it (spec D5): scheme
+/// `https`, empty path, the tunnel outcome in `metadata.tunnel`, `200` when the
+/// tunnel was established (`None` for a failed one), and closed (`duration` set).
+fn connect_row(authority: &str, tunnel: TunnelInfo, status: Option<u16>) -> Flow {
+    let mut flow = http_flow("CONNECT", "", status);
+    if let Flow::Http(f) = &mut flow {
+        f.request.scheme = "https".into();
+        f.request.authority = authority.into();
+        f.metadata.duration = Some(Duration::from_millis(1500));
+        f.metadata.tunnel = Some(tunnel);
+    }
+    flow
+}
+
+/// `flow.get {id}` as an object.
+fn summary_of(reg: &Registry, host: &CommandHost, id: FlowId) -> BTreeMap<String, Value> {
+    let got = reg
+        .command("flow.get")
+        .expect("flow.get registered")
+        .invoke(id_params(id), host)
+        .expect("flow.get ok");
+    let Value::Object(obj) = got else {
+        panic!("flow.get must return an object, got {got:?}");
+    };
+    obj
+}
+
+/// `flow.table` as a list of row objects, oldest first.
+fn table_rows(reg: &Registry, host: &CommandHost) -> Vec<BTreeMap<String, Value>> {
+    let table = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .invoke(Params::default(), host)
+        .expect("flow.table ok");
+    let Value::Object(obj) = table else {
+        panic!("flow.table must return an object, got {table:?}");
+    };
+    let Some(Value::Array(rows)) = obj.get("flows") else {
+        panic!("flow.table result must have a `flows` array: {obj:?}");
+    };
+    rows.iter()
+        .map(|row| match row {
+            Value::Object(r) => r.clone(),
+            other => panic!("every row must be an object, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The five keys of spec D7 on one object, in the order `tunnel`, `tunnel_reason`,
+/// `bytes_up`, `bytes_down`, `passive`. `None` means the key is absent, which is
+/// never acceptable: every key is always present, null when it does not apply.
+fn tunnel_keys(obj: &BTreeMap<String, Value>) -> [Option<&Value>; 5] {
+    [
+        obj.get("tunnel"),
+        obj.get("tunnel_reason"),
+        obj.get("bytes_up"),
+        obj.get("bytes_down"),
+        obj.get("passive"),
+    ]
+}
+
+fn s(v: &str) -> Value {
+    Value::Str(v.into())
+}
+
+/// Spec D7 / AC11: `flow.table` rows and `flow.get` carry `tunnel`,
+/// `tunnel_reason`, `bytes_up`, `bytes_down` and `passive` with the documented
+/// values for a passthrough row, a failed row, a decrypted row, an ordinary
+/// request and a WebSocket flow, and the two verbs agree on every one of them.
+#[test]
+fn flow_table_and_flow_get_report_tunnel_fields() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let store = MemFlowStore::new();
+
+    let passthrough = store.insert(connect_row(
+        "origin.test:443",
+        TunnelInfo {
+            mode: TunnelMode::Passthrough,
+            reason: Some(TunnelReason::OutOfScope),
+            bytes_up: Some(10),
+            bytes_down: Some(20),
+        },
+        Some(200),
+    ));
+    let failed = store.insert(connect_row(
+        "pinned.test:443",
+        TunnelInfo::failed(TunnelReason::ClientRejectedCertificate),
+        None,
+    ));
+    let decrypted = store.insert(connect_row(
+        "api.test:443",
+        TunnelInfo::decrypted(),
+        Some(200),
+    ));
+    let ordinary = store.insert(http_flow("GET", "/a", Some(200)));
+    let ws = store.insert(ws_flow(ordinary));
+
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let got = summary_of(&reg, &host, passthrough);
+    assert_eq!(got.get("method"), Some(&s("CONNECT")));
+    assert_eq!(got.get("scheme"), Some(&s("https")));
+    assert_eq!(got.get("status"), Some(&Value::Int(200)));
+    assert_eq!(got.get("duration_ms"), Some(&Value::Int(1500)));
+    assert_eq!(
+        tunnel_keys(&got),
+        [
+            Some(&s("passthrough")),
+            Some(&s("out_of_scope")),
+            Some(&Value::Int(10)),
+            Some(&Value::Int(20)),
+            Some(&Value::Bool(false)),
+        ],
+        "flow.get on a passthrough row: {got:?}"
+    );
+
+    let got = summary_of(&reg, &host, failed);
+    assert_eq!(got.get("method"), Some(&s("CONNECT")));
+    assert_eq!(
+        got.get("status"),
+        Some(&Value::Null),
+        "a failed tunnel has no exchange outcome"
+    );
+    assert_eq!(
+        tunnel_keys(&got),
+        [
+            Some(&s("failed")),
+            Some(&s("client_rejected_certificate")),
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Bool(false)),
+        ],
+        "flow.get on a failed row: {got:?}"
+    );
+
+    let got = summary_of(&reg, &host, decrypted);
+    assert_eq!(got.get("status"), Some(&Value::Int(200)));
+    assert_eq!(
+        tunnel_keys(&got),
+        [
+            Some(&s("decrypted")),
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Bool(false)),
+        ],
+        "flow.get on a decrypted row: {got:?}"
+    );
+
+    let got = summary_of(&reg, &host, ordinary);
+    assert_eq!(got.get("method"), Some(&s("GET")));
+    assert_eq!(
+        tunnel_keys(&got),
+        [
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Bool(false)),
+        ],
+        "flow.get on an ordinary request: {got:?}"
+    );
+
+    let got = summary_of(&reg, &host, ws);
+    assert_eq!(got.get("kind"), Some(&s("websocket")));
+    assert_eq!(
+        tunnel_keys(&got),
+        [
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Null),
+            Some(&Value::Bool(false)),
+        ],
+        "flow.get on a WebSocket flow: {got:?}"
+    );
+
+    // flow.table: the same five keys, the same values, row for row.
+    let rows = table_rows(&reg, &host);
+    assert_eq!(rows.len(), 5, "five flows captured, in insertion order");
+    let expected: [(FlowId, [Value; 5]); 5] = [
+        (
+            passthrough,
+            [
+                s("passthrough"),
+                s("out_of_scope"),
+                Value::Int(10),
+                Value::Int(20),
+                Value::Bool(false),
+            ],
+        ),
+        (
+            failed,
+            [
+                s("failed"),
+                s("client_rejected_certificate"),
+                Value::Null,
+                Value::Null,
+                Value::Bool(false),
+            ],
+        ),
+        (
+            decrypted,
+            [
+                s("decrypted"),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Bool(false),
+            ],
+        ),
+        (
+            ordinary,
+            [
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Bool(false),
+            ],
+        ),
+        (
+            ws,
+            [
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Bool(false),
+            ],
+        ),
+    ];
+    for (row, (id, want)) in rows.iter().zip(expected.iter()) {
+        assert_eq!(row.get("id"), Some(&s(&id.to_string())));
+        let want: [Option<&Value>; 5] = [
+            Some(&want[0]),
+            Some(&want[1]),
+            Some(&want[2]),
+            Some(&want[3]),
+            Some(&want[4]),
+        ];
+        assert_eq!(tunnel_keys(row), want, "flow.table row for {id}: {row:?}");
+        let summary = summary_of(&reg, &host, *id);
+        assert_eq!(
+            tunnel_keys(row),
+            tunnel_keys(&summary),
+            "flow.table and flow.get must agree on the tunnel keys for {id}"
+        );
+    }
+    // `status` on the passthrough and failed rows, through the table too.
+    assert_eq!(rows[0].get("status"), Some(&Value::Int(200)));
+    assert_eq!(rows[1].get("status"), Some(&Value::Null));
+    assert_eq!(rows[1].get("method"), Some(&s("CONNECT")));
+}
+
+/// Spec D4 / D7: `passive` is a required boolean on both verbs: `true` for a
+/// cleartext request to a host outside Scope (observed only), `false` for an
+/// ordinary request and for every tunnel row, and a WebSocket flow reports the
+/// value stamped on its own metadata (copied from its handshake by the WS module).
+#[test]
+fn flow_table_and_flow_get_report_passive() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+    let store = MemFlowStore::new();
+
+    let mut observed = http_flow("GET", "/p", Some(200));
+    observed.metadata_mut().passive = true;
+    let passive = store.insert(observed);
+    let acted_on = store.insert(http_flow("GET", "/q", Some(200)));
+    let tunnel = store.insert(connect_row(
+        "origin.test:443",
+        TunnelInfo::passthrough(TunnelReason::OutOfScope),
+        Some(200),
+    ));
+    let mut ws_meta = ws_flow(passive);
+    ws_meta.metadata_mut().passive = true;
+    let passive_ws = store.insert(ws_meta);
+
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let got = summary_of(&reg, &host, passive);
+    assert_eq!(got.get("passive"), Some(&Value::Bool(true)), "{got:?}");
+    assert_eq!(
+        got.get("tunnel"),
+        Some(&Value::Null),
+        "a passive request is not a tunnel row"
+    );
+    let got = summary_of(&reg, &host, acted_on);
+    assert_eq!(got.get("passive"), Some(&Value::Bool(false)), "{got:?}");
+    let got = summary_of(&reg, &host, tunnel);
+    assert_eq!(
+        got.get("passive"),
+        Some(&Value::Bool(false)),
+        "a tunnel row is dispatched passively by virtue of `tunnel`, not `passive`: {got:?}"
+    );
+    let got = summary_of(&reg, &host, passive_ws);
+    assert_eq!(got.get("kind"), Some(&s("websocket")));
+    assert_eq!(got.get("passive"), Some(&Value::Bool(true)), "{got:?}");
+
+    let rows = table_rows(&reg, &host);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].get("id"), Some(&s(&passive.to_string())));
+    assert_eq!(rows[0].get("passive"), Some(&Value::Bool(true)));
+    assert_eq!(rows[1].get("id"), Some(&s(&acted_on.to_string())));
+    assert_eq!(rows[1].get("passive"), Some(&Value::Bool(false)));
+    assert_eq!(rows[2].get("id"), Some(&s(&tunnel.to_string())));
+    assert_eq!(rows[2].get("passive"), Some(&Value::Bool(false)));
+    assert_eq!(rows[2].get("tunnel"), Some(&s("passthrough")));
+    assert_eq!(rows[3].get("id"), Some(&s(&passive_ws.to_string())));
+    assert_eq!(rows[3].get("kind"), Some(&s("websocket")));
+    assert_eq!(rows[3].get("passive"), Some(&Value::Bool(true)));
+}
+
+/// Spec D7: both result schemas declare the five keys with the right types, the
+/// four tunnel keys optional (null when they do not apply) and `passive` required,
+/// and their descriptions quote the value sets so a surface built from
+/// `tools/list` learns the vocabulary without hard-coding it.
+#[test]
+fn schemas_declare_tunnel_and_passive() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+
+    let get_schema = reg
+        .command("flow.get")
+        .expect("flow.get registered")
+        .schema();
+    let TypeDesc::Object(get_fields) = get_schema.result else {
+        panic!(
+            "flow.get result must be an object schema, got {:?}",
+            get_schema.result
+        );
+    };
+    let table_schema = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .schema();
+    let TypeDesc::Object(table_fields) = table_schema.result else {
+        panic!(
+            "flow.table result must be an object schema, got {:?}",
+            table_schema.result
+        );
+    };
+    let flows = table_fields
+        .iter()
+        .find(|f| f.name == "flows")
+        .expect("flow.table result has a `flows` field");
+    let TypeDesc::Array(elem) = &flows.ty else {
+        panic!("`flows` must be an array, got {:?}", flows.ty);
+    };
+    let TypeDesc::Object(row_fields) = elem.as_ref() else {
+        panic!("`flows` elements must be objects, got {:?}", elem);
+    };
+
+    // (name, type, required, words the description must quote)
+    let want: [(&str, TypeDesc, bool, &[&str]); 5] = [
+        (
+            "tunnel",
+            TypeDesc::Str,
+            false,
+            &["decrypted", "passthrough", "failed", "null"],
+        ),
+        (
+            "tunnel_reason",
+            TypeDesc::Str,
+            false,
+            &[
+                "out_of_scope",
+                "pinned",
+                "client_rejected_certificate",
+                "client_closed",
+                "client_tls_error",
+                "upstream_unreachable",
+                "upstream_tls_failed",
+                "protocol_error",
+                "null",
+            ],
+        ),
+        ("bytes_up", TypeDesc::Int, false, &["passthrough", "null"]),
+        ("bytes_down", TypeDesc::Int, false, &["passthrough", "null"]),
+        ("passive", TypeDesc::Bool, true, &["Scope"]),
+    ];
+    for (command, fields) in [("flow.get", &get_fields), ("flow.table", row_fields)] {
+        for (name, ty, required, words) in &want {
+            let field = fields
+                .iter()
+                .find(|f| f.name == *name)
+                .unwrap_or_else(|| panic!("{name} missing from the {command} schema"));
+            assert!(
+                std::mem::discriminant(&field.ty) == std::mem::discriminant(ty),
+                "{command}.{name} must be {ty:?}, got {:?}",
+                field.ty
+            );
+            assert_eq!(
+                field.required, *required,
+                "{command}.{name} required flag (the tunnel keys are null when they do not \
+                 apply; `passive` is always a boolean)"
+            );
+            for word in *words {
+                assert!(
+                    field.description.contains(word),
+                    "{command}.{name} description must quote `{word}`: {}",
+                    field.description
+                );
+            }
+        }
+    }
 }

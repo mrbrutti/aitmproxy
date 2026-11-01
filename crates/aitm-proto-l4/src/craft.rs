@@ -18,9 +18,11 @@
 //!
 //! [`summarize`]: PacketSpec::summarize
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
+
+use crate::types::L4Proto;
 
 /// Hard ceiling on a crafted packet, independent of the guard's configurable
 /// `max_packet_bytes` (which bounds *injection*, M5 Task 5). This is the pure
@@ -183,6 +185,27 @@ pub struct PacketSummary {
     pub length: usize,
 }
 
+/// The endpoints a byte buffer decodes to: transport name, addresses and ports.
+/// Every field is `None` when that layer is absent or undecodable, so the whole
+/// value is [`PacketEndpoints::default`] for a buffer that is not a packet.
+/// Field names match [`PacketSpec`]'s (`src_port` / `dst_port`), so a packet
+/// read back from a flow can seed the craft editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PacketEndpoints {
+    /// Transport the buffer decodes to: only [`L4Proto::Tcp`], [`L4Proto::Udp`],
+    /// [`L4Proto::Icmp`] or [`L4Proto::IcmpV6`]; its [`L4Proto::wire_name`] is
+    /// the name [`PacketSpec::summarize`] uses.
+    pub proto: Option<L4Proto>,
+    /// Network-layer source address.
+    pub src: Option<IpAddr>,
+    /// Network-layer destination address.
+    pub dst: Option<IpAddr>,
+    /// Source port, TCP and UDP only.
+    pub src_port: Option<u16>,
+    /// Destination port, TCP and UDP only.
+    pub dst_port: Option<u16>,
+}
+
 /// Errors from the pure craft path. No I/O, so these are structural only.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CraftError {
@@ -223,8 +246,7 @@ impl PacketSpec {
     /// proto the guard uses for port matching and a `send_recv` reply must share.
     /// `Raw` when the spec declares no transport layer.
     #[must_use]
-    pub fn transport_proto(&self) -> crate::types::L4Proto {
-        use crate::types::L4Proto;
+    pub fn transport_proto(&self) -> L4Proto {
         for layer in &self.layers {
             match layer {
                 Layer::Tcp(_) => return L4Proto::Tcp,
@@ -240,7 +262,7 @@ impl PacketSpec {
     /// input yields an empty layer list with the correct length.
     #[must_use]
     pub fn summarize(bytes: &[u8]) -> PacketSummary {
-        use etherparse::{NetSlice, TransportSlice};
+        use etherparse::NetSlice;
 
         let mut layers = Vec::new();
         if let Some(p) = parse_frame(bytes) {
@@ -252,12 +274,8 @@ impl PacketSpec {
                 Some(NetSlice::Ipv6(_)) => layers.push("IPv6".to_string()),
                 _ => {}
             }
-            match &p.transport {
-                Some(TransportSlice::Tcp(_)) => layers.push("TCP".to_string()),
-                Some(TransportSlice::Udp(_)) => layers.push("UDP".to_string()),
-                Some(TransportSlice::Icmpv4(_)) => layers.push("ICMP".to_string()),
-                Some(TransportSlice::Icmpv6(_)) => layers.push("ICMPv6".to_string()),
-                _ => {}
+            if let Some(proto) = transport_proto(&p.transport) {
+                layers.push(proto.wire_name().to_string());
             }
         }
 
@@ -265,6 +283,16 @@ impl PacketSpec {
             layers,
             length: bytes.len(),
         }
+    }
+
+    /// Decode the addresses and ports of `bytes` over the same frame parser as
+    /// [`summarize`](PacketSpec::summarize). Never fails and never panics: an
+    /// undecodable buffer returns [`PacketEndpoints::default`].
+    #[must_use]
+    pub fn endpoints(bytes: &[u8]) -> PacketEndpoints {
+        parse_frame(bytes)
+            .map(|p| endpoints_of(&p))
+            .unwrap_or_default()
     }
 
     /// The first network layer's addresses, used as the pseudo-header for
@@ -289,6 +317,68 @@ impl PacketSpec {
             }
         }
         None
+    }
+}
+
+/// The transport an etherparse slice decodes to, as the [`L4Proto`] whose
+/// [`wire_name`](L4Proto::wire_name) the §2 `proto` field and
+/// [`PacketSpec::summarize`]'s layer name share; `None` for no or an unknown
+/// transport. The one mapping every decoder in the crate uses.
+pub(crate) fn transport_proto(
+    transport: &Option<etherparse::TransportSlice<'_>>,
+) -> Option<L4Proto> {
+    use etherparse::TransportSlice;
+    match transport {
+        Some(TransportSlice::Tcp(_)) => Some(L4Proto::Tcp),
+        Some(TransportSlice::Udp(_)) => Some(L4Proto::Udp),
+        Some(TransportSlice::Icmpv4(_)) => Some(L4Proto::Icmp),
+        Some(TransportSlice::Icmpv6(_)) => Some(L4Proto::IcmpV6),
+        _ => None,
+    }
+}
+
+/// The endpoints an already-parsed slice carries: network-layer addresses (IPv4
+/// or IPv6; `None` for no or another network layer), transport and ports. The one
+/// decode behind [`PacketSpec::endpoints`] and the intercept path's L3-only parse.
+pub(crate) fn endpoints_of(p: &etherparse::SlicedPacket<'_>) -> PacketEndpoints {
+    use etherparse::NetSlice;
+    let (src, dst) = match &p.net {
+        Some(NetSlice::Ipv4(v4)) => {
+            let h = v4.header();
+            (
+                Some(IpAddr::V4(h.source_addr())),
+                Some(IpAddr::V4(h.destination_addr())),
+            )
+        }
+        Some(NetSlice::Ipv6(v6)) => {
+            let h = v6.header();
+            (
+                Some(IpAddr::V6(h.source_addr())),
+                Some(IpAddr::V6(h.destination_addr())),
+            )
+        }
+        _ => (None, None),
+    };
+    let (src_port, dst_port) = transport_ports(&p.transport);
+    PacketEndpoints {
+        proto: transport_proto(&p.transport),
+        src,
+        dst,
+        src_port,
+        dst_port,
+    }
+}
+
+/// The `(source, destination)` ports of a transport slice: TCP and UDP carry
+/// them, anything else is `(None, None)`.
+pub(crate) fn transport_ports(
+    transport: &Option<etherparse::TransportSlice<'_>>,
+) -> (Option<u16>, Option<u16>) {
+    use etherparse::TransportSlice;
+    match transport {
+        Some(TransportSlice::Tcp(t)) => (Some(t.source_port()), Some(t.destination_port())),
+        Some(TransportSlice::Udp(u)) => (Some(u.source_port()), Some(u.destination_port())),
+        _ => (None, None),
     }
 }
 
@@ -640,5 +730,122 @@ mod tests {
             .build()
             .expect_err("empty spec must error");
         assert!(matches!(err, CraftError::BadLayerOrder(_)));
+    }
+
+    /// A1: `endpoints` decodes the addresses and ports of a crafted IPv4/UDP
+    /// frame — the pure half of `l4.flow.get`'s per-packet `proto/src/dst/
+    /// src_port/dst_port` (L4PAR-AC1 groundwork).
+    #[test]
+    fn endpoints_of_crafted_ipv4_udp() {
+        let bytes = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(40000),
+                    dst_port: Some(9053),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"hello-l4".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+
+        assert_eq!(
+            PacketSpec::endpoints(&bytes),
+            PacketEndpoints {
+                proto: Some(L4Proto::Udp),
+                src: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                dst: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+                src_port: Some(40000),
+                dst_port: Some(9053),
+            }
+        );
+    }
+
+    /// A1: a buffer that decodes to no network layer yields the all-`None`
+    /// default, never a panic.
+    #[test]
+    fn endpoints_of_undecodable_is_default() {
+        assert_eq!(
+            PacketSpec::endpoints(&[0xde, 0xad]),
+            PacketEndpoints::default()
+        );
+    }
+
+    /// A1: TCP carries ports, ICMP carries none, and IPv6 addresses are decoded
+    /// — the proto names match `summarize`'s.
+    #[test]
+    fn endpoints_of_tcp_icmp_ipv6() {
+        let tcp = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                    dst: Some(Ipv4Addr::new(10, 0, 0, 2)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(1234),
+                    dst_port: Some(80),
+                    ..TcpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+        let e = PacketSpec::endpoints(&tcp);
+        assert_eq!(e.proto, Some(L4Proto::Tcp));
+        assert_eq!(e.src, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert_eq!(e.dst, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
+        assert_eq!(e.src_port, Some(1234));
+        assert_eq!(e.dst_port, Some(80));
+
+        let icmp = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                // An echo request: type 8 with its id/seq word, so the ICMP
+                // header is the 8 bytes every real ICMP message carries.
+                Layer::Icmp(IcmpSpec {
+                    icmp_type: Some(8),
+                    rest_of_header: Some(0x0001_0001),
+                    ..IcmpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+        let e = PacketSpec::endpoints(&icmp);
+        assert_eq!(e.proto, Some(L4Proto::Icmp));
+        assert_eq!(e.dst, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert_eq!(e.src_port, None);
+        assert_eq!(e.dst_port, None);
+
+        let v6 = PacketSpec {
+            layers: vec![
+                Layer::Ipv6(Ipv6Spec {
+                    src: Some(Ipv6Addr::LOCALHOST),
+                    dst: Some(Ipv6Addr::LOCALHOST),
+                    ..Ipv6Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    dst_port: Some(9),
+                    ..UdpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("craft builds");
+        let e = PacketSpec::endpoints(&v6);
+        assert_eq!(e.proto, Some(L4Proto::Udp));
+        assert_eq!(e.src, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(e.dst, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(e.dst_port, Some(9));
     }
 }

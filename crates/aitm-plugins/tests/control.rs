@@ -1,16 +1,17 @@
 //! F7: the control plugin — proxy.status/pause/resume, flow.clear, config.get.
 
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, CommandHost, Config, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, HeaderMap, HttpFlow,
-    HttpRequest, HttpResponse, HttpVersion, InterceptState, McpConfig, McpTransport, MemFlowStore,
-    Params, ProxyClient, ScopeConfig, ScopeEntry, StdGuard, Value,
+    Body, CommandHost, Config, ConnInfo, Flow, FlowId, FlowMeta, FlowStore, Frontend, HeaderMap,
+    HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState, McpConfig, McpTransport,
+    MemFlowStore, Params, ProxyClient, ScopeConfig, ScopeEntry, StdGuard, Value,
 };
-use aitm_plugins::ControlPlugin;
+use aitm_plugins::{ControlPlugin, ScopePlugin};
 use futures::future::BoxFuture;
 
 struct StubClient;
@@ -283,5 +284,87 @@ fn config_get_is_redacted_and_requires_config() {
     assert!(
         !dump.contains("SECRET-TOKEN"),
         "config.get leaked the MCP token: {dump}"
+    );
+}
+
+/// Call `name` with `params` as the human CLI (`Frontend::Cli`), the way
+/// `aitm scope add --host …` reaches the bus: a trusted-control caller the
+/// `scope.add` gate admits without `scope.allow_agent_widen`.
+fn call_as_cli(
+    reg: &aitm_core::Registry,
+    store: &dyn FlowStore,
+    guard: &StdGuard,
+    name: &str,
+    params: Params,
+) -> Value {
+    let client = StubClient;
+    let host = CommandHost::new(store, &client, guard, None).with_frontend(Frontend::Cli);
+    reg.command(name)
+        .unwrap_or_else(|| panic!("{name} registered"))
+        .invoke(params, &host)
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// The literal `decrypt` object of AC13.
+fn decrypt_object(scope_hosts: i64, decrypting: bool, advice: Value) -> Value {
+    let mut obj = BTreeMap::new();
+    obj.insert("scope_hosts".to_string(), Value::Int(scope_hosts));
+    obj.insert("decrypting".to_string(), Value::Bool(decrypting));
+    obj.insert("advice".to_string(), advice);
+    Value::Object(obj)
+}
+
+/// AC13 (status + advice), empty Scope: `proxy.status.decrypt` is the literal
+/// `{scope_hosts: 0, decrypting: false, advice: "Nothing is decrypted until a
+/// host is in Scope."}`. The sentence is the one constant every surface prints
+/// and never composes, so it is pinned here, word for word.
+#[test]
+fn proxy_status_reports_decrypt_advice_on_empty_scope() {
+    let reg = reg();
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+
+    let status = call(&reg, &store, &guard, None, "proxy.status");
+    assert_eq!(
+        field(&status, "decrypt"),
+        &decrypt_object(
+            0,
+            false,
+            Value::Str("Nothing is decrypted until a host is in Scope.".into()),
+        )
+    );
+    assert_eq!(
+        aitm_core::NOTHING_DECRYPTED_ADVICE,
+        "Nothing is decrypted until a host is in Scope."
+    );
+
+    // The schema documents the sub-object, so `tools/list` tells a client it exists.
+    let schema = reg.command("proxy.status").expect("registered").schema();
+    assert!(
+        schema.description.contains("`decrypt`"),
+        "schema should mention decrypt: {}",
+        schema.description
+    );
+}
+
+/// AC13 (status + advice), after `scope.add`: the same read is
+/// `{scope_hosts: 1, decrypting: true, advice: null}`. The count comes from the
+/// live guard (what the proxy actually decrypts), not from the launch config.
+#[test]
+fn proxy_status_reports_decrypt_advice_after_scope_add() {
+    let mut reg = reg();
+    reg.add_plugin(Box::new(ScopePlugin::default()));
+    let store = MemFlowStore::new();
+    let guard = StdGuard::default();
+
+    let mut args = BTreeMap::new();
+    args.insert("host".to_string(), Value::Str("api.example.test".into()));
+    let added = call_as_cli(&reg, &store, &guard, "scope.add", Params::new(args));
+    assert_eq!(added, Value::Str("api.example.test".into()));
+
+    let status = call(&reg, &store, &guard, None, "proxy.status");
+    assert_eq!(
+        field(&status, "decrypt"),
+        &decrypt_object(1, true, Value::Null)
     );
 }
