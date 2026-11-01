@@ -555,6 +555,7 @@ async fn send<IO>(
 where
     IO: AsyncRead + AsyncWrite + Unpin,
 {
+    state.delay().await; // `--latency-ms`, once per server frame
     let ok = write_wire(io, &encode_frame(opcode, payload)).await;
     if ok {
         log_frame(state, conn, Dir::Out, opcode, payload);
@@ -1029,6 +1030,45 @@ mod tests {
         let mut payload = vec![0u8; len];
         io.read_exact(&mut payload).await.expect("payload");
         (opcode, payload)
+    }
+
+    /// `--latency-ms` (T7 ruling): every server frame waits the configured time,
+    /// in V and P alike; the frame itself is unchanged.
+    #[tokio::test]
+    async fn latency_delays_every_server_frame() {
+        let latency = std::time::Duration::from_millis(150);
+        for mode in [Vulnerable, Patched] {
+            let st = Arc::new(AppState::with_latency(mode, ControlLog::new(mode), latency));
+            let conn =
+                st.log
+                    .open_conn(Listener::Plain, None, "127.0.0.1:9".parse().expect("peer"));
+            let (server, mut client) = tokio::io::duplex(1 << 20);
+            let task = tokio::spawn(run_frames(server, st.clone(), conn.clone(), false));
+            let t0 = std::time::Instant::now();
+            let (op, hello) = read_frame(&mut client).await;
+            assert!(
+                t0.elapsed() >= latency,
+                "{mode:?} hello frame came in {:?}",
+                t0.elapsed()
+            );
+            assert_eq!(op, Opcode::Text);
+            assert_eq!(hello, br#"{"type":"hello","user":"anonymous"}"#);
+            let t1 = std::time::Instant::now();
+            client
+                .write_all(&masked(Opcode::Text, br#"{"type":"echo","msg":"hi"}"#))
+                .await
+                .expect("write text");
+            let (op, echo) = read_frame(&mut client).await;
+            assert!(
+                t1.elapsed() >= latency,
+                "{mode:?} echo frame came in {:?}",
+                t1.elapsed()
+            );
+            assert_eq!(op, Opcode::Text);
+            assert_eq!(echo, br#"{"type":"echo","msg":"hi","html":"<b>hi</b>"}"#);
+            drop(client);
+            let _ = task.await;
+        }
     }
 
     #[tokio::test]

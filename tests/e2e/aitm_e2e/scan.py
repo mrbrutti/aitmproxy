@@ -716,12 +716,13 @@ class TargetLogs:
 
 class ScanTarget:
     """`aitm-testtarget-serve --mode <mode> --port 0 [--tls-port 0 --tls-h1-port 0]
-    [--control-port 0] [--l4]` (T10 spec D1). Parses the stdout block
+    [--control-port 0] [--l4] [--latency-ms N]` (T10 spec D1). Parses the stdout block
     `listening http://..`, `tls https://..`, `tls_h1 https://..`, `control http://..`,
     `ready`; L4 addresses come from `GET /services` on the control origin."""
 
     def __init__(self, mode: str = "vulnerable", *, tls: bool = True, control: bool = True,
-                 l4: bool = False, start_timeout: float = 15.0):
+                 l4: bool = False, start_timeout: float = 15.0,
+                 latency_ms: int | None = None):
         if l4 and not control:
             raise ValueError("ScanTarget: l4=True needs control=True (--l4 needs --control-port)")
         bin_ = testtarget_bin()
@@ -742,6 +743,10 @@ class ScanTarget:
             argv += ["--control-port", "0"]
         if l4:
             argv.append("--l4")
+        if latency_ms:
+            # `--latency-ms N`: every HTTP response and WS frame waits N ms (not the
+            # L4 speakers), so a UI can be observed while a scan is still running.
+            argv += ["--latency-ms", str(int(latency_ms))]
         self.argv = argv
         self.proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)

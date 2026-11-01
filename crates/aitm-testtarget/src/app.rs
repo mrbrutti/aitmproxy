@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
@@ -57,16 +58,40 @@ pub(crate) struct AppState {
     pub flaky: AtomicU64,
     /// The observer log behind the control origin.
     pub log: Arc<ControlLog>,
+    /// `--latency-ms N`: a sleep applied once to every HTTP response and every
+    /// WebSocket server frame (never to the L4 speakers), identical in V and P.
+    /// `Duration::ZERO` (the default) is a no-op. It exists so an intrusive
+    /// scan of this target takes long enough for a UI to be observed running
+    /// (T7 ruling, 2026-11-01: ~278 probes finish in ~2 s undelayed).
+    pub latency: Duration,
 }
 
 impl AppState {
+    /// A state with no `--latency-ms` delay (tests; the builder uses `with_latency`).
+    #[cfg(test)]
     pub(crate) fn new(mode: SeedMode, log: Arc<ControlLog>) -> AppState {
+        Self::with_latency(mode, log, Duration::ZERO)
+    }
+
+    pub(crate) fn with_latency(
+        mode: SeedMode,
+        log: Arc<ControlLog>,
+        latency: Duration,
+    ) -> AppState {
         AppState {
             mode,
             comments: Mutex::new(VecDeque::new()),
             sessions: routes::session::SessionStore::new(),
             flaky: AtomicU64::new(0),
             log,
+            latency,
+        }
+    }
+
+    /// The `--latency-ms` sleep, awaited once per response; nothing for zero.
+    pub(crate) async fn delay(&self) {
+        if !self.latency.is_zero() {
+            tokio::time::sleep(self.latency).await;
         }
     }
 }
@@ -286,6 +311,7 @@ where
         body_sha256: sha256_hex(&info.body),
         status: resp.status().as_u16(),
     });
+    state.delay().await;
     Ok(resp)
 }
 
@@ -827,8 +853,12 @@ mod tests {
 
     /// A fresh target in `mode` plus one plain-listener connection on it.
     fn fresh(mode: SeedMode) -> (Arc<AppState>, Arc<ConnInfo>) {
+        fresh_with_latency(mode, Duration::ZERO)
+    }
+
+    fn fresh_with_latency(mode: SeedMode, latency: Duration) -> (Arc<AppState>, Arc<ConnInfo>) {
         let log = ControlLog::new(mode);
-        let state = Arc::new(AppState::new(mode, log));
+        let state = Arc::new(AppState::with_latency(mode, log, latency));
         let peer = "127.0.0.1:40000".parse().expect("peer addr");
         let conn = state.log.open_conn(Listener::Plain, None, peer);
         (state, conn)
@@ -1163,6 +1193,33 @@ mod tests {
         let resp = get_on(&state, &conn, "/redirect?next=/%0d%0aX").await;
         assert_eq!(resp.status(), StatusCode::FOUND);
         assert_eq!(location(&resp).as_deref(), Some("/X"));
+    }
+
+    /// `--latency-ms` (T7 ruling): every HTTP response, routed or 404, in V and
+    /// P alike, waits the configured time; zero adds nothing.
+    #[tokio::test]
+    async fn latency_delays_every_response_and_zero_is_a_noop() {
+        let latency = Duration::from_millis(150);
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            let (state, conn) = fresh_with_latency(mode, latency);
+            for path in ["/", "/nope", "/search?q=x"] {
+                let t0 = std::time::Instant::now();
+                let resp = get_on(&state, &conn, path).await;
+                let took = t0.elapsed();
+                assert!(took >= latency, "{mode:?} {path}: {took:?} < {latency:?}");
+                assert!(
+                    resp.status() != StatusCode::INTERNAL_SERVER_ERROR,
+                    "{mode:?} {path}"
+                );
+            }
+            let (state, conn) = fresh(mode);
+            let t0 = std::time::Instant::now();
+            get_on(&state, &conn, "/").await;
+            assert!(
+                t0.elapsed() < latency,
+                "{mode:?}: zero latency must not wait {latency:?}"
+            );
+        }
     }
 
     #[tokio::test]
