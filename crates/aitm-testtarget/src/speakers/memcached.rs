@@ -370,6 +370,16 @@ mod tests {
                 parse(mode, b"set k\xff 0 0 2\r\nhi\r\n"),
                 msg(18, "set", Step::Reply(b"STORED\r\n".to_vec()))
             );
+            // A NUL in a key is an ordinary byte too: words split on ASCII
+            // whitespace only.
+            assert_eq!(
+                parse(mode, b"get k\x00\r\n"),
+                msg(8, "get", Step::Reply(b"END\r\n".to_vec()))
+            );
+            assert_eq!(
+                parse(mode, b"set k\x00 0 0 1\r\n\x00\r\n"),
+                msg(17, "set", Step::Reply(b"STORED\r\n".to_vec()))
+            );
             assert_eq!(
                 parse(mode, b"g\xffet k\r\n"),
                 msg(8, "g\u{FFFD}et", Step::ProtocolError(b"ERROR\r\n".to_vec()))

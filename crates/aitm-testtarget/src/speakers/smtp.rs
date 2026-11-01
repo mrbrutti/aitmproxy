@@ -273,6 +273,11 @@ mod tests {
                 s.parse(mode, b"MAIL FROM:<a\xff@target.test>\r\n"),
                 msg(28, "MAIL", Step::Reply(b"250 OK\r\n".to_vec()))
             );
+            // A NUL in an argument is an ordinary byte too.
+            assert_eq!(
+                s.parse(mode, b"EHLO x\x00y\r\n"),
+                msg(10, "EHLO", Step::Reply(b"250 target.test\r\n".to_vec()))
+            );
             assert_eq!(
                 s.parse(mode, b"EH\xffLO x\r\n"),
                 msg(

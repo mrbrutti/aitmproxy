@@ -43,6 +43,22 @@ const READ_CHUNK: usize = 8192;
 /// Largest UDP payload a datagram can carry.
 const MAX_DATAGRAM: usize = 65_535;
 
+/// Most TCP connections one service serves at a time (spec D5). A
+/// connection parked in [`Step::Wait`] pins up to its speaker's
+/// `max_buffer()` bytes until EOF, so this bounds the target at about
+/// 256 MiB per service in the worst case. The accept loop simply does not
+/// `accept` while this many are open: later connects wait in the listen
+/// backlog, never refused, so the Vulnerable "connect refused" oracle stays
+/// unambiguous. There is deliberately no deadline on an incomplete message
+/// (it would reintroduce the silent close D5 forbids).
+pub(crate) const MAX_CONNS: usize = 256;
+
+/// Whether the accept loop may take another connection with `open` in
+/// flight: the [`MAX_CONNS`] gate.
+pub(crate) fn accepting(open: usize) -> bool {
+    open < MAX_CONNS
+}
+
 /// Rebind retry cadence and budget against `AddrInUse` after a crash window
 /// (plan P3: every 50 ms, up to 2 s).
 const REBIND_RETRY: Duration = Duration::from_millis(50);
@@ -166,7 +182,9 @@ pub(crate) enum Action {
     Keep,
     /// Close the connection with this reason.
     CloseConn(CloseReason),
-    /// The Patched-mode fault close: `error` after a parse or an idle,
+    /// The fault close after [`Step::Fault`]'s reply, if any: the P answer
+    /// to a V trigger, and in either mode the answer to malformed
+    /// non-trigger input. Reason `error` after a parse or an idle,
     /// `oversize` past the buffer cap (the driver knows which).
     Fault,
     /// Open the crash window: log `downtime`, close with reason `trigger`,
@@ -366,10 +384,13 @@ impl TcpConn {
 
     /// Hand the whole pending buffer to `on_idle` (after [`IDLE_TIMEOUT`] or
     /// past `max_buffer()`). A `Wait` within the cap keeps everything as it
-    /// is, unlogged; the next read re-arms the idle timer, and the
-    /// connection still ends on peer EOF, on the crash window, or when the
-    /// target drops (the task is aborted). Any other step is logged and
-    /// applied; a `Fault` closes with the cause's reason.
+    /// is, unlogged, and the 200 ms timer re-arms at once: `on_idle` runs
+    /// again on the unchanged buffer every [`IDLE_TIMEOUT`] until bytes or
+    /// EOF arrive (there is no `waiting` flag; the re-poll is bounded by
+    /// `max_buffer()` and harmless on loopback). The connection still ends
+    /// on peer EOF, on the crash window, or when the target drops (the task
+    /// is aborted). Any other step is logged and applied; a `Fault` closes
+    /// with the cause's reason.
     async fn idle(&mut self, cause: IdleCause) -> Option<ConnEnd> {
         let step = self.speaker.on_idle(self.mode, &self.buf);
         match idle_outcome(&step, cause) {
@@ -481,7 +502,8 @@ async fn read_event(stream: &mut TcpStream, scratch: &mut [u8], pending: bool) -
 
 /// Accept loop with the crash window: serve `first` (bound on `addr`) until
 /// a connection crashes, then drop it, signal every open connection, wait
-/// out the window and rebind `addr`.
+/// out the window and rebind `addr`. Never more than [`MAX_CONNS`]
+/// connections are open at once (see [`accepting`]).
 async fn run_tcp(
     def: ServiceDef,
     addr: SocketAddr,
@@ -509,8 +531,11 @@ async fn run_tcp(
         let (down_tx, down_rx) = watch::channel(false);
         let mut conns: JoinSet<ConnEnd> = JoinSet::new();
         loop {
+            // At the cap the accept branch is disabled; the join branch is
+            // then live (the set is non-empty) and re-enables it as soon as
+            // one connection ends.
             tokio::select! {
-                accepted = listener.accept() => match accepted {
+                accepted = listener.accept(), if accepting(conns.len()) => match accepted {
                     Ok((stream, peer)) => {
                         let n = conn_ids.fetch_add(1, Ordering::SeqCst) + 1;
                         let conn_id = format!("c-{n:08x}");
@@ -859,6 +884,24 @@ mod tests {
         // the no-op ones.
         assert_eq!(classified(&Step::Wait), Classified::Ok);
         assert_eq!(input_span(&Step::Wait, 2, 10), 2);
+    }
+
+    // --- T10 PR C fix round 1: the per-service connection cap ---
+
+    #[test]
+    fn accept_loop_pauses_at_max_conns() {
+        // A `Wait`ing connection pins up to `max_buffer()` bytes until EOF,
+        // so the accept loop takes no new connection while 256 are open;
+        // later connects wait in the listen backlog (never refused, so the
+        // V "connect refused" oracle stays unambiguous) and are taken as
+        // soon as one of the 256 ends.
+        assert_eq!(MAX_CONNS, 256);
+        assert!(accepting(0));
+        assert!(accepting(1));
+        assert!(accepting(255));
+        assert!(!accepting(256));
+        assert!(!accepting(257));
+        assert!(!accepting(usize::MAX));
     }
 
     // --- Tester additions (stage 5) ---

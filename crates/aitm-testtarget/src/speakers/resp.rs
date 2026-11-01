@@ -7,10 +7,10 @@
 //! crashes the Vulnerable origin, and so does an array still short of its `N`
 //! elements after [`super::IDLE_TIMEOUT`]; the Patched control answers the
 //! row's `-ERR Protocol error` and closes. Malformed framing that is not
-//! the bug (a garbled `*N` or `$len`, an element not starting with `$`) is
-//! answered with a specific `-ERR Protocol error: ...` and then closed in
-//! both modes: no close is ever silent, and a stalled inline line waits for
-//! its CRLF (T10 PR C). Destructive commands get
+//! the bug (a garbled `*N` or `$len`, an element not starting with `$`, an
+//! inline line past [`MAX_BULK`]) is answered with a specific `-ERR Protocol
+//! error: ...` and then closed in both modes: no close is ever silent, and a
+//! stalled inline line waits for its CRLF (T10 PR C). Destructive commands get
 //! `-ERR denylisted command` and are logged `denylisted` (spec D5).
 
 use super::{mode_bug, Parsed, Proto, ServiceDef, Speaker, Step};
@@ -124,6 +124,15 @@ fn parse_inline(buf: &[u8]) -> Parsed {
     let Some((line, consumed)) = line(buf) else {
         return Parsed::Incomplete;
     };
+    if line.len() > MAX_BULK {
+        // A complete inline line past the bulk cap is never dispatched
+        // (redis: "too big inline request"): say so, then close, both modes.
+        return Parsed::Message {
+            consumed,
+            verb: None,
+            step: Step::Fault(TOO_BIG_INLINE.to_vec()),
+        };
+    }
     let mut words = line
         .split(|b| b.is_ascii_whitespace())
         .filter(|w| !w.is_empty());
@@ -242,15 +251,19 @@ fn command(name: &[u8], args: &[&[u8]]) -> (String, Step) {
 }
 
 /// `-ERR Protocol error: expected '$', got '<c>'` for an array element line
-/// that does not start with `$`; `<c>` is its first byte when printable,
-/// empty otherwise (redis's own wording).
+/// that does not start with `$` (redis's own wording); `<c>` is its first
+/// byte when that is printable ASCII (`is_ascii_graphic()` or the space),
+/// empty otherwise: a control, high-bit or lossily decoded byte is never
+/// echoed, and the element itself is never decoded or copied (spec D5).
 fn expected_dollar(elem: &[u8]) -> Vec<u8> {
-    let got: String = String::from_utf8_lossy(elem)
-        .chars()
-        .take(1)
-        .filter(|c| !c.is_control())
-        .collect();
-    format!("-ERR Protocol error: expected '$', got '{got}'\r\n").into_bytes()
+    let mut out = b"-ERR Protocol error: expected '$', got '".to_vec();
+    if let Some(&b) = elem.first() {
+        if b.is_ascii_graphic() || b == b' ' {
+            out.push(b);
+        }
+    }
+    out.extend_from_slice(b"'\r\n");
+    out
 }
 
 /// The command name as typed, safe to echo inside a simple-error line:
@@ -469,7 +482,7 @@ mod tests {
     // --- Tester additions (stage 5): malformed lengths never panic or crash ---
 
     #[test]
-    fn resp_malformed_lengths_close_without_a_crash() {
+    fn resp_malformed_lengths_reply_then_close() {
         // A garbled or negative array count desynchronises the stream: the
         // protocol-error reply, then close, in both modes (never the crash
         // window, never a silent close; T10 PR C).
@@ -580,11 +593,12 @@ mod tests {
                 11,
                 b"-ERR Protocol error: expected '$', got ''\r\n",
             ),
-            // A garbled bulk length.
+            // A high-bit byte where `$` should be is not echoed either:
+            // `<c>` is printable ASCII or nothing (spec D5).
             (
-                b"*1\r\n$abc\r\n",
-                10,
-                b"-ERR Protocol error: invalid bulk length\r\n",
+                b"*1\r\n\xffPING\r\n",
+                11,
+                b"-ERR Protocol error: expected '$', got ''\r\n",
             ),
         ];
         for (buf, consumed, reply) in cases {
@@ -601,22 +615,48 @@ mod tests {
                 );
             }
         }
-        // The D5 trigger is untouched: `$N` over 1 MiB crashes V, P replies.
-        assert_eq!(
-            parse(SeedMode::Vulnerable, b"*1\r\n$1048577\r\n"),
-            Parsed::Message {
-                consumed: 14,
-                verb: None,
-                step: Step::Trigger,
+    }
+
+    /// A complete inline line longer than `MAX_BULK` (1 MiB) is never
+    /// dispatched as a command: `too big inline request`, then close, in
+    /// both modes (spec D5 "an inline line past 1 MiB"); exactly 1 MiB is
+    /// still a command (T10 PR C fix round 1, item 11).
+    #[test]
+    fn resp_over_long_inline_line_is_too_big_in_both_modes() {
+        let too_big = Step::Fault(b"-ERR Protocol error: too big inline request\r\n".to_vec());
+        // `PING` padded with spaces to one byte over the cap, then its CRLF.
+        let mut padded_ping = b"PING".to_vec();
+        padded_ping.resize(MAX_BULK + 1, b' ');
+        padded_ping.extend_from_slice(b"\r\n");
+        // One byte over the cap, no spaces at all.
+        let mut over = vec![b'a'; MAX_BULK + 1];
+        over.extend_from_slice(b"\r\n");
+        for mode in [SeedMode::Vulnerable, SeedMode::Patched] {
+            for buf in [&padded_ping, &over] {
+                assert_eq!(
+                    parse(mode, buf),
+                    Parsed::Message {
+                        consumed: MAX_BULK + 3,
+                        verb: None,
+                        step: too_big.clone(),
+                    },
+                    "{mode:?} {} bytes",
+                    buf.len()
+                );
             }
-        );
+        }
+        // Exactly the cap plus CRLF is an ordinary (unknown) command.
+        let mut at_cap = vec![b'a'; MAX_BULK];
+        at_cap.extend_from_slice(b"\r\n");
         assert_eq!(
-            parse(SeedMode::Patched, b"*1\r\n$1048577\r\n"),
-            Parsed::Message {
-                consumed: 14,
-                verb: None,
-                step: Step::Fault(b"-ERR Protocol error: invalid bulk length\r\n".to_vec()),
-            }
+            parse(SeedMode::Patched, &at_cap),
+            msg(
+                MAX_BULK + 2,
+                &"A".repeat(128),
+                Step::ProtocolError(
+                    format!("-ERR unknown command '{}'\r\n", "a".repeat(128)).into_bytes()
+                )
+            )
         );
     }
 
@@ -637,6 +677,16 @@ mod tests {
                 parse(mode, b"*2\r\n$3\r\nGET\r\n$2\r\nk\xff\r\n"),
                 msg(21, "GET", Step::Reply(b"$-1\r\n".to_vec()))
             );
+            // A NUL in an argument is an ordinary byte: inline words split
+            // on ASCII whitespace only, so it is echoed back verbatim.
+            assert_eq!(
+                parse(mode, b"ECHO a\x00b\r\n"),
+                msg(10, "ECHO", Step::Reply(b"$3\r\na\x00b\r\n".to_vec()))
+            );
+            assert_eq!(
+                parse(mode, b"*2\r\n$3\r\nGET\r\n$3\r\nk\x00v\r\n"),
+                msg(22, "GET", Step::Reply(b"$-1\r\n".to_vec()))
+            );
             // The verb itself carries the high-bit byte: unknown, echoed
             // lossily, connection kept.
             assert_eq!(
@@ -656,25 +706,28 @@ mod tests {
 
     // --- Tester additions (stage 5, T10 PR C) ---
 
-    /// `expected '$', got '<c>'` quotes exactly one printable char: a
-    /// control byte (DEL, TAB, NUL) is dropped, a lone high-bit byte or a
-    /// truncated UTF-8 lead becomes U+FFFD, a complete multi-byte char is
-    /// quoted whole. The reply is always a single well-formed error line
-    /// (no raw byte, no embedded CR/LF), then the connection closes, in
-    /// both modes.
+    /// `expected '$', got '<c>'` quotes the element's first byte only when
+    /// it is printable ASCII (`is_ascii_graphic()` or the space): a
+    /// control byte (DEL, TAB, NUL), a lone high-bit byte, a truncated
+    /// UTF-8 lead and even a complete multi-byte char all give `got ''`
+    /// (spec D5: never a control, high-bit or lossily decoded byte). The
+    /// reply is always a single well-formed ASCII error line (no raw byte,
+    /// no embedded CR/LF), then the connection closes, in both modes.
     #[test]
     fn resp_expected_dollar_quotes_one_printable_char() {
         let reply = |got: &str| {
             Step::Fault(format!("-ERR Protocol error: expected '$', got '{got}'\r\n").into_bytes())
         };
-        let cases: [(&[u8], usize, Step); 8] = [
+        let cases: [(&[u8], usize, Step); 10] = [
             (b"*1\r\n\x7fPING\r\n", 11, reply("")),
             (b"*1\r\n\tPING\r\n", 11, reply("")),
             (b"*1\r\n\x00PING\r\n", 11, reply("")),
-            (b"*1\r\n\xffPING\r\n", 11, reply("\u{FFFD}")),
-            (b"*1\r\n\xc3PING\r\n", 11, reply("\u{FFFD}")),
-            (b"*1\r\n\xc3\xa9\r\n", 8, reply("\u{e9}")),
+            (b"*1\r\n\xffPING\r\n", 11, reply("")),
+            (b"*1\r\n\xc3PING\r\n", 11, reply("")),
+            (b"*1\r\n\xc3\xa9\r\n", 8, reply("")),
+            (b"*1\r\n PING\r\n", 11, reply(" ")),
             (b"*1\r\n:1\r\n", 8, reply(":")),
+            (b"*1\r\n4\r\n", 7, reply("4")),
             (b"*2\r\n$4\r\nPING\r\n-x\r\n", 18, reply("-")),
         ];
         for (buf, consumed, step) in cases {
@@ -704,17 +757,16 @@ mod tests {
                     "{:?}",
                     String::from_utf8_lossy(&bytes)
                 );
+                assert!(bytes.is_ascii(), "{:?}", String::from_utf8_lossy(&bytes));
             }
         }
-        // The literal bytes of the U+FFFD case: EF BF BD inside the quotes.
+        // The literal bytes of the high-bit case: nothing between the quotes.
         assert_eq!(
             parse(SeedMode::Patched, b"*1\r\n\xffPING\r\n"),
             Parsed::Message {
                 consumed: 11,
                 verb: None,
-                step: Step::Fault(
-                    b"-ERR Protocol error: expected '$', got '\xef\xbf\xbd'\r\n".to_vec()
-                ),
+                step: Step::Fault(b"-ERR Protocol error: expected '$', got ''\r\n".to_vec()),
             }
         );
     }

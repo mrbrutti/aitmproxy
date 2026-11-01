@@ -71,8 +71,10 @@ pub enum Step {
     /// A denylisted command arrived: write the bytes, keep the connection;
     /// logged `denylisted` so a cell can prove none came.
     Denylisted(Vec<u8>),
-    /// Patched-mode answer to a Vulnerable trigger: write the bytes if
-    /// non-empty, then close with reason `error`; the listener stays up.
+    /// Reply if non-empty, then close with reason `error`; the listener
+    /// stays up. The Patched-mode answer to a Vulnerable trigger, and in
+    /// either mode the answer to malformed non-trigger input (a garbled
+    /// RESP length, an element without `$`, an inline line past 1 MiB).
     Fault(Vec<u8>),
     /// Vulnerable-mode crash: the driver opens the [`CrashWindow`], logs
     /// `downtime`, drops the connection and the listener.

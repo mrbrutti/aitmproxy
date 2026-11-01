@@ -628,15 +628,8 @@ async fn patched_flow(case: Case, addr: SocketAddr, control: String) -> Res<()> 
     let messages = array(&log, "messages")?;
     let trigger_msg = match trigger_conn {
         Some(local) => {
-            let conn_id = array(&log, "accepts")?
-                .iter()
-                .find(|a| a["peer"] == local.to_string())
-                .and_then(|a| a["conn_id"].as_str())
-                .ok_or_else(|| format!("no accepts entry with peer {local}"))?
-                .to_string();
-            let close = array(&log, "closes")?
-                .iter()
-                .find(|c| c["conn_id"] == conn_id)
+            let conn_id = conn_id_of(&log, local)?;
+            let close = close_of(&log, &conn_id)?
                 .ok_or_else(|| format!("no closes entry for {conn_id}"))?;
             if close["reason"] != "error" {
                 return Err(format!("close reason for {conn_id}: {}", close["reason"]));
@@ -982,21 +975,33 @@ fn close_of<'a>(log: &'a Value, conn_id: &str) -> Res<Option<&'a Value>> {
         .find(|c| c["conn_id"] == conn_id))
 }
 
-/// Run `flow` for every row against one `mode` target, sequentially, and
-/// fail with every failing row named by its service and label.
-async fn run_rows<R, F, Fut>(mode: SeedMode, rows: Vec<R>, flow: F)
+/// A row of one of the tables below, with the service it targets and the
+/// label `run_rows` names it by in a failure.
+struct Labelled<R> {
+    service: &'static str,
+    label: &'static str,
+    row: R,
+}
+
+/// Run `flow(service, row, addr, control)` for every row against one `mode`
+/// target, sequentially, and fail with every failing row named by its
+/// service and label.
+async fn run_rows<R, F, Fut>(mode: SeedMode, rows: Vec<Labelled<R>>, flow: F)
 where
-    R: RowInfo,
-    F: Fn(R, SocketAddr, String) -> Fut,
+    F: Fn(&'static str, R, SocketAddr, String) -> Fut,
     Fut: Future<Output = Res<()>>,
 {
     let target = start(mode).await;
     let control = target.control_url().expect("control url").to_string();
     let mut failures = Vec::new();
-    for row in rows {
-        let (service, label) = (row.service(), row.label());
+    for Labelled {
+        service,
+        label,
+        row,
+    } in rows
+    {
         let addr = service_addr(&target, service, Proto::Tcp);
-        if let Err(e) = flow(row, addr, control.clone()).await {
+        if let Err(e) = flow(service, row, addr, control.clone()).await {
             failures.push(format!("{service} [{label}]: {e}"));
         }
     }
@@ -1006,103 +1011,151 @@ where
         failures.len(),
         failures.join("\n  ")
     );
-    drop(target);
 }
 
-trait RowInfo {
-    fn service(&self) -> &'static str;
-    fn label(&self) -> &'static str;
+/// Reply budget for a row whose one write is an inline line around the
+/// RESP 1 MiB cap. The speaker is stateless, so the driver re-offers the
+/// whole buffer after every 8 KiB read and `l4-resp` rescans it for a CRLF
+/// each time: the ~128 reads of 1 MiB cost over a second of rescans in a
+/// debug build (under 30 ms optimised) before the speaker can answer or
+/// the 200 ms idle can even start, while the client's `write_all` returns
+/// as soon as the loopback buffers have taken the bytes. `CLOSE_WITHIN`
+/// from that moment is too short; the budget below is only ever waited out
+/// on a failure (the read returns on the close).
+const LARGE_LINE_WITHIN: Duration = Duration::from_secs(10);
+
+/// One write on a fresh connection and the exact bytes that must come
+/// back: the malformed rows (`expect`, then a close with reason `error`)
+/// and the high-bit rows (`expect`, connection kept).
+struct Row {
+    banner: Option<&'static [u8]>,
+    send: Vec<u8>,
+    expect: Vec<u8>,
+    /// How long `read_until_idle` waits for more bytes or the close:
+    /// `CLOSE_WITHIN` for a reply-then-close row, `REPLY_IDLE` for a
+    /// reply-and-keep row, `LARGE_LINE_WITHIN` for a 1 MiB line.
+    read_idle: Duration,
 }
 
 /// Malformed, non-trigger input: the speaker writes `expect`, then closes
 /// with reason `error`; the listener never goes down.
-struct Malformed {
-    service: &'static str,
-    label: &'static str,
-    banner: Option<&'static [u8]>,
-    send: Vec<u8>,
-    expect: Vec<u8>,
-}
-
-impl RowInfo for Malformed {
-    fn service(&self) -> &'static str {
-        self.service
-    }
-    fn label(&self) -> &'static str {
-        self.label
-    }
-}
-
-fn malformed_rows() -> Vec<Malformed> {
+fn malformed_rows() -> Vec<Labelled<Row>> {
     vec![
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "array header without CRLF before `$`",
-            banner: None,
-            send: b"*1$4\r\nPING\r\n".to_vec(),
-            expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"*1$4\r\nPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "element without `$`",
-            banner: None,
-            send: b"*1\r\n4\r\nPING\r\n".to_vec(),
-            expect: b"-ERR Protocol error: expected '$', got '4'\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"*1\r\n4\r\nPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got '4'\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "garbled bulk length",
-            banner: None,
-            send: b"*1\r\n$abc\r\n".to_vec(),
-            expect: b"-ERR Protocol error: invalid bulk length\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"*1\r\n$abc\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid bulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "negative array count",
-            banner: None,
-            send: b"*-1\r\n".to_vec(),
-            expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"*-1\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
         // --- Tester additions (stage 5) ---
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "garbled array count",
-            banner: None,
-            send: b"*abc\r\n".to_vec(),
-            expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"*abc\r\n".to_vec(),
+                expect: b"-ERR Protocol error: invalid multibulk length\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "empty element line: nothing to quote",
-            banner: None,
-            send: b"*1\r\n\r\nPING\r\n".to_vec(),
-            expect: b"-ERR Protocol error: expected '$', got ''\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"*1\r\n\r\nPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got ''\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "simple-string element `+PING`",
-            banner: None,
-            send: b"*1\r\n+PING\r\n".to_vec(),
-            expect: b"-ERR Protocol error: expected '$', got '+'\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"*1\r\n+PING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got '+'\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
-        Malformed {
+        Labelled {
             service: "l4-resp",
-            label: "high-bit byte where `$` should be is quoted as U+FFFD",
-            banner: None,
-            send: b"*1\r\n\xffPING\r\n".to_vec(),
-            expect: b"-ERR Protocol error: expected '$', got '\xef\xbf\xbd'\r\n".to_vec(),
+            label: "high-bit byte where `$` should be is not echoed",
+            row: Row {
+                banner: None,
+                send: b"*1\r\n\xffPING\r\n".to_vec(),
+                expect: b"-ERR Protocol error: expected '$', got ''\r\n".to_vec(),
+                read_idle: CLOSE_WITHIN,
+            },
         },
-        Malformed {
+        Labelled {
             service: "l4-resp",
             label: "inline line one byte past 1 MiB with no CRLF (at the 200 ms idle)",
-            banner: None,
-            send: vec![b'a'; RESP_MAX_BULK + 1],
-            expect: b"-ERR Protocol error: too big inline request\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: vec![b'a'; RESP_MAX_BULK + 1],
+                expect: b"-ERR Protocol error: too big inline request\r\n".to_vec(),
+                read_idle: LARGE_LINE_WITHIN,
+            },
+        },
+        // --- Fix round 1 (item 11) ---
+        Labelled {
+            service: "l4-resp",
+            label: "complete inline line one byte past 1 MiB (with its CRLF)",
+            row: Row {
+                banner: None,
+                send: {
+                    let mut line = vec![b'a'; RESP_MAX_BULK + 1];
+                    line.extend_from_slice(b"\r\n");
+                    line
+                },
+                expect: b"-ERR Protocol error: too big inline request\r\n".to_vec(),
+                read_idle: LARGE_LINE_WITHIN,
+            },
         },
     ]
 }
 
-async fn malformed_flow(row: Malformed, addr: SocketAddr, control: String) -> Res<()> {
+async fn malformed_flow(
+    service: &'static str,
+    row: Row,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
     let mut stream = tcp_open(addr, row.banner).await?;
     let local = stream
         .local_addr()
@@ -1111,7 +1164,7 @@ async fn malformed_flow(row: Malformed, addr: SocketAddr, control: String) -> Re
         .write_all(&row.send)
         .await
         .map_err(|e| format!("write: {e}"))?;
-    let (bytes, closed) = read_until_idle(&mut stream, CLOSE_WITHIN).await;
+    let (bytes, closed) = read_until_idle(&mut stream, row.read_idle).await;
     if bytes != row.expect {
         return Err(format!(
             "reply: got {} expected {}",
@@ -1120,11 +1173,14 @@ async fn malformed_flow(row: Malformed, addr: SocketAddr, control: String) -> Re
         ));
     }
     if !closed {
-        return Err("speaker did not close within 1 s after the reply".to_string());
+        return Err(format!(
+            "speaker did not close within {:?} after the reply",
+            row.read_idle
+        ));
     }
     // Not a trigger: the listener is up and nothing was logged as downtime.
     tcp_open(addr, row.banner).await?;
-    let log = l4_log(&control, row.service).await?;
+    let log = l4_log(&control, service).await?;
     let downtime = array(&log, "downtime")?;
     if !downtime.is_empty() {
         return Err(format!("downtime is not empty: {downtime:?}"));
@@ -1158,112 +1214,124 @@ async fn malformed_input_is_answered_before_the_close() {
 /// still be open and silent after 1 s, then `second` completes it and
 /// `expect` comes back on the same connection.
 struct Partial {
-    service: &'static str,
-    label: &'static str,
     banner: Option<&'static [u8]>,
     first: Vec<u8>,
     second: Vec<u8>,
     expect: Vec<u8>,
 }
 
-impl RowInfo for Partial {
-    fn service(&self) -> &'static str {
-        self.service
-    }
-    fn label(&self) -> &'static str {
-        self.label
-    }
-}
-
-fn partial_rows() -> Vec<Partial> {
+fn partial_rows() -> Vec<Labelled<Partial>> {
     vec![
-        Partial {
+        Labelled {
             service: "l4-smtp",
             label: "NOO + P",
-            banner: Some(SMTP_BANNER),
-            first: b"NOO".to_vec(),
-            second: b"P\r\n".to_vec(),
-            expect: b"250 OK\r\n".to_vec(),
+            row: Partial {
+                banner: Some(SMTP_BANNER),
+                first: b"NOO".to_vec(),
+                second: b"P\r\n".to_vec(),
+                expect: b"250 OK\r\n".to_vec(),
+            },
         },
-        Partial {
+        Labelled {
             service: "l4-smtp",
             label: "damaged terminator \\r\\t then CRLF",
-            banner: Some(SMTP_BANNER),
-            first: b"NOOP\r\t".to_vec(),
-            second: b"\r\n".to_vec(),
-            expect: b"250 OK\r\n".to_vec(),
+            row: Partial {
+                banner: Some(SMTP_BANNER),
+                first: b"NOOP\r\t".to_vec(),
+                second: b"\r\n".to_vec(),
+                expect: b"250 OK\r\n".to_vec(),
+            },
         },
-        Partial {
+        Labelled {
             service: "l4-ftp",
             label: "NOO + P",
-            banner: Some(FTP_BANNER),
-            first: b"NOO".to_vec(),
-            second: b"P\r\n".to_vec(),
-            expect: b"200 ok\r\n".to_vec(),
+            row: Partial {
+                banner: Some(FTP_BANNER),
+                first: b"NOO".to_vec(),
+                second: b"P\r\n".to_vec(),
+                expect: b"200 ok\r\n".to_vec(),
+            },
         },
-        Partial {
+        Labelled {
             service: "l4-ftp",
             label: "damaged terminator \\r\\t then CRLF",
-            banner: Some(FTP_BANNER),
-            first: b"USER a\r\t".to_vec(),
-            second: b"\r\n".to_vec(),
-            expect: b"331 password required\r\n".to_vec(),
+            row: Partial {
+                banner: Some(FTP_BANNER),
+                first: b"USER a\r\t".to_vec(),
+                second: b"\r\n".to_vec(),
+                expect: b"331 password required\r\n".to_vec(),
+            },
         },
-        Partial {
+        Labelled {
             service: "l4-memcached",
             label: "get mykey without CRLF",
-            banner: None,
-            first: b"get mykey".to_vec(),
-            second: b"\r\n".to_vec(),
-            expect: b"END\r\n".to_vec(),
+            row: Partial {
+                banner: None,
+                first: b"get mykey".to_vec(),
+                second: b"\r\n".to_vec(),
+                expect: b"END\r\n".to_vec(),
+            },
         },
-        Partial {
+        Labelled {
             service: "l4-memcached",
             label: "set waiting for its data",
-            banner: None,
-            first: b"set k 0 0 2\r\nh".to_vec(),
-            second: b"i\r\n".to_vec(),
-            expect: b"STORED\r\n".to_vec(),
+            row: Partial {
+                banner: None,
+                first: b"set k 0 0 2\r\nh".to_vec(),
+                second: b"i\r\n".to_vec(),
+                expect: b"STORED\r\n".to_vec(),
+            },
         },
-        Partial {
+        Labelled {
             service: "l4-resp",
             label: "inline PIN + G",
-            banner: None,
-            first: b"PIN".to_vec(),
-            second: b"G\r\n".to_vec(),
-            expect: b"+PONG\r\n".to_vec(),
+            row: Partial {
+                banner: None,
+                first: b"PIN".to_vec(),
+                second: b"G\r\n".to_vec(),
+                expect: b"+PONG\r\n".to_vec(),
+            },
         },
         // --- Tester additions (stage 5) ---
-        Partial {
+        Labelled {
             service: "l4-memcached",
             label: "cap-sized set (1 MiB) stalled on its final LF",
-            banner: None,
-            first: {
-                let mut first = format!("set k 0 0 {MC_MAX_DATA}\r\n").into_bytes();
-                first.extend(std::iter::repeat_n(b'x', MC_MAX_DATA));
-                first.push(b'\r');
-                first
+            row: Partial {
+                banner: None,
+                first: {
+                    let mut first = format!("set k 0 0 {MC_MAX_DATA}\r\n").into_bytes();
+                    first.extend(std::iter::repeat_n(b'x', MC_MAX_DATA));
+                    first.push(b'\r');
+                    first
+                },
+                second: b"\n".to_vec(),
+                expect: b"STORED\r\n".to_vec(),
             },
-            second: b"\n".to_vec(),
-            expect: b"STORED\r\n".to_vec(),
         },
-        Partial {
+        Labelled {
             service: "l4-resp",
             label: "inline line of exactly 1 MiB waits, then its CRLF makes it an unknown command",
-            banner: None,
-            first: vec![b'a'; RESP_MAX_BULK],
-            second: b"\r\n".to_vec(),
-            expect: {
-                let mut expect = b"-ERR unknown command '".to_vec();
-                expect.extend(std::iter::repeat_n(b'a', 128));
-                expect.extend_from_slice(b"'\r\n");
-                expect
+            row: Partial {
+                banner: None,
+                first: vec![b'a'; RESP_MAX_BULK],
+                second: b"\r\n".to_vec(),
+                expect: {
+                    let mut expect = b"-ERR unknown command '".to_vec();
+                    expect.extend(std::iter::repeat_n(b'a', 128));
+                    expect.extend_from_slice(b"'\r\n");
+                    expect
+                },
             },
         },
     ]
 }
 
-async fn partial_flow(row: Partial, addr: SocketAddr, control: String) -> Res<()> {
+async fn partial_flow(
+    service: &'static str,
+    row: Partial,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
     let mut stream = tcp_open(addr, row.banner).await?;
     let local = stream
         .local_addr()
@@ -1291,7 +1359,7 @@ async fn partial_flow(row: Partial, addr: SocketAddr, control: String) -> Res<()
         ));
     }
     // The wait was not logged as a message, and the connection is open.
-    let log = l4_log(&control, row.service).await?;
+    let log = l4_log(&control, service).await?;
     let conn_id = conn_id_of(&log, local)?;
     if let Some(close) = close_of(&log, &conn_id)? {
         return Err(format!("closed before we hung up: {close}"));
@@ -1310,7 +1378,7 @@ async fn partial_flow(row: Partial, addr: SocketAddr, control: String) -> Res<()
     drop(stream);
     let deadline = Instant::now() + CLOSE_WITHIN;
     loop {
-        let log = l4_log(&control, row.service).await?;
+        let log = l4_log(&control, service).await?;
         if let Some(close) = close_of(&log, &conn_id)? {
             if close["reason"] != "eof" {
                 return Err(format!(
@@ -1338,63 +1406,63 @@ async fn partial_line_waits_then_completes_the_command() {
 }
 
 /// A high-bit byte in an argument: the normal reply, connection kept.
-struct HighBit {
-    service: &'static str,
-    label: &'static str,
-    banner: Option<&'static [u8]>,
-    send: Vec<u8>,
-    expect: Vec<u8>,
-}
-
-impl RowInfo for HighBit {
-    fn service(&self) -> &'static str {
-        self.service
-    }
-    fn label(&self) -> &'static str {
-        self.label
-    }
-}
-
-fn high_bit_rows() -> Vec<HighBit> {
+fn high_bit_rows() -> Vec<Labelled<Row>> {
     vec![
-        HighBit {
+        Labelled {
             service: "l4-smtp",
             label: "EHLO x\\xff",
-            banner: Some(SMTP_BANNER),
-            send: b"EHLO x\xff\r\n".to_vec(),
-            expect: b"250 target.test\r\n".to_vec(),
+            row: Row {
+                banner: Some(SMTP_BANNER),
+                send: b"EHLO x\xff\r\n".to_vec(),
+                expect: b"250 target.test\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
         },
-        HighBit {
+        Labelled {
             service: "l4-ftp",
             label: "USER a\\xff",
-            banner: Some(FTP_BANNER),
-            send: b"USER a\xff\r\n".to_vec(),
-            expect: b"331 password required\r\n".to_vec(),
+            row: Row {
+                banner: Some(FTP_BANNER),
+                send: b"USER a\xff\r\n".to_vec(),
+                expect: b"331 password required\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
         },
-        HighBit {
+        Labelled {
             service: "l4-memcached",
             label: "get k\\xff",
-            banner: None,
-            send: b"get k\xff\r\n".to_vec(),
-            expect: b"END\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"get k\xff\r\n".to_vec(),
+                expect: b"END\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
         },
-        HighBit {
+        Labelled {
             service: "l4-resp",
             label: "ECHO \\xff",
-            banner: None,
-            send: b"ECHO \xff\r\n".to_vec(),
-            expect: b"$1\r\n\xff\r\n".to_vec(),
+            row: Row {
+                banner: None,
+                send: b"ECHO \xff\r\n".to_vec(),
+                expect: b"$1\r\n\xff\r\n".to_vec(),
+                read_idle: REPLY_IDLE,
+            },
         },
     ]
 }
 
-async fn high_bit_flow(row: HighBit, addr: SocketAddr, _control: String) -> Res<()> {
+async fn high_bit_flow(
+    _service: &'static str,
+    row: Row,
+    addr: SocketAddr,
+    _control: String,
+) -> Res<()> {
     let mut stream = tcp_open(addr, row.banner).await?;
     stream
         .write_all(&row.send)
         .await
         .map_err(|e| format!("write: {e}"))?;
-    let (bytes, closed) = read_until_idle(&mut stream, REPLY_IDLE).await;
+    let (bytes, closed) = read_until_idle(&mut stream, row.read_idle).await;
     if bytes != row.expect {
         return Err(format!(
             "reply: got {} expected {}",
@@ -1430,56 +1498,58 @@ const WAIT_SETTLE: Duration = Duration::from_millis(400);
 
 /// A line delivered one byte at a time, each after more than the idle.
 struct Dribble {
-    service: &'static str,
-    label: &'static str,
     banner: Option<&'static [u8]>,
     line: Vec<u8>,
     expect: Vec<u8>,
 }
 
-impl RowInfo for Dribble {
-    fn service(&self) -> &'static str {
-        self.service
-    }
-    fn label(&self) -> &'static str {
-        self.label
-    }
-}
-
-fn dribble_rows() -> Vec<Dribble> {
+fn dribble_rows() -> Vec<Labelled<Dribble>> {
     vec![
-        Dribble {
+        Labelled {
             service: "l4-smtp",
             label: "NOOP byte by byte",
-            banner: Some(SMTP_BANNER),
-            line: b"NOOP\r\n".to_vec(),
-            expect: b"250 OK\r\n".to_vec(),
+            row: Dribble {
+                banner: Some(SMTP_BANNER),
+                line: b"NOOP\r\n".to_vec(),
+                expect: b"250 OK\r\n".to_vec(),
+            },
         },
-        Dribble {
+        Labelled {
             service: "l4-ftp",
             label: "NOOP byte by byte",
-            banner: Some(FTP_BANNER),
-            line: b"NOOP\r\n".to_vec(),
-            expect: b"200 ok\r\n".to_vec(),
+            row: Dribble {
+                banner: Some(FTP_BANNER),
+                line: b"NOOP\r\n".to_vec(),
+                expect: b"200 ok\r\n".to_vec(),
+            },
         },
-        Dribble {
+        Labelled {
             service: "l4-memcached",
             label: "version byte by byte",
-            banner: None,
-            line: b"version\r\n".to_vec(),
-            expect: b"VERSION 1.6.0-aitm\r\n".to_vec(),
+            row: Dribble {
+                banner: None,
+                line: b"version\r\n".to_vec(),
+                expect: b"VERSION 1.6.0-aitm\r\n".to_vec(),
+            },
         },
-        Dribble {
+        Labelled {
             service: "l4-resp",
             label: "inline PING byte by byte",
-            banner: None,
-            line: b"PING\r\n".to_vec(),
-            expect: b"+PONG\r\n".to_vec(),
+            row: Dribble {
+                banner: None,
+                line: b"PING\r\n".to_vec(),
+                expect: b"+PONG\r\n".to_vec(),
+            },
         },
     ]
 }
 
-async fn dribble_flow(row: Dribble, addr: SocketAddr, control: String) -> Res<()> {
+async fn dribble_flow(
+    service: &'static str,
+    row: Dribble,
+    addr: SocketAddr,
+    control: String,
+) -> Res<()> {
     let mut stream = tcp_open(addr, row.banner).await?;
     let local = stream
         .local_addr()
@@ -1516,7 +1586,7 @@ async fn dribble_flow(row: Dribble, addr: SocketAddr, control: String) -> Res<()
             hex(&row.expect)
         ));
     }
-    let log = l4_log(&control, row.service).await?;
+    let log = l4_log(&control, service).await?;
     let conn_id = conn_id_of(&log, local)?;
     if let Some(close) = close_of(&log, &conn_id)? {
         return Err(format!("closed before we hung up: {close}"));
@@ -1555,56 +1625,54 @@ async fn dribbled_line_re_arms_the_idle_timer() {
 /// A connection parked in `Wait` while another connection fires the V
 /// trigger.
 struct WaitingThenCrash {
-    service: &'static str,
-    label: &'static str,
     banner: Option<&'static [u8]>,
     partial: Vec<u8>,
     trigger: Vec<u8>,
 }
 
-impl RowInfo for WaitingThenCrash {
-    fn service(&self) -> &'static str {
-        self.service
-    }
-    fn label(&self) -> &'static str {
-        self.label
-    }
-}
-
-fn waiting_then_crash_rows() -> Vec<WaitingThenCrash> {
+fn waiting_then_crash_rows() -> Vec<Labelled<WaitingThenCrash>> {
     vec![
-        WaitingThenCrash {
+        Labelled {
             service: "l4-smtp",
             label: "NOO waiting, long line on another connection",
-            banner: Some(SMTP_BANNER),
-            partial: b"NOO".to_vec(),
-            trigger: long_line(),
+            row: WaitingThenCrash {
+                banner: Some(SMTP_BANNER),
+                partial: b"NOO".to_vec(),
+                trigger: long_line(),
+            },
         },
-        WaitingThenCrash {
+        Labelled {
             service: "l4-ftp",
             label: "USER a waiting, long line on another connection",
-            banner: Some(FTP_BANNER),
-            partial: b"USER a".to_vec(),
-            trigger: long_line(),
+            row: WaitingThenCrash {
+                banner: Some(FTP_BANNER),
+                partial: b"USER a".to_vec(),
+                trigger: long_line(),
+            },
         },
-        WaitingThenCrash {
+        Labelled {
             service: "l4-memcached",
             label: "set waiting for its data, long line on another connection",
-            banner: None,
-            partial: b"set k 0 0 2\r\nh".to_vec(),
-            trigger: long_line(),
+            row: WaitingThenCrash {
+                banner: None,
+                partial: b"set k 0 0 2\r\nh".to_vec(),
+                trigger: long_line(),
+            },
         },
-        WaitingThenCrash {
+        Labelled {
             service: "l4-resp",
             label: "inline PIN waiting, $2000000 on another connection",
-            banner: None,
-            partial: b"PIN".to_vec(),
-            trigger: b"*1\r\n$2000000\r\n".to_vec(),
+            row: WaitingThenCrash {
+                banner: None,
+                partial: b"PIN".to_vec(),
+                trigger: b"*1\r\n$2000000\r\n".to_vec(),
+            },
         },
     ]
 }
 
 async fn waiting_then_crash_flow(
+    service: &'static str,
     row: WaitingThenCrash,
     addr: SocketAddr,
     control: String,
@@ -1662,7 +1730,7 @@ async fn waiting_then_crash_flow(
         return Err("listener still accepting after the crash".to_string());
     }
 
-    let log = l4_log(&control, row.service).await?;
+    let log = l4_log(&control, service).await?;
     let waiting_id = conn_id_of(&log, waiting_local)?;
     let trigger_id = conn_id_of(&log, trigger_local)?;
     for (what, id) in [("waiting", &waiting_id), ("trigger", &trigger_id)] {
