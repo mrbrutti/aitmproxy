@@ -418,7 +418,7 @@ public struct TrafficRoutes: Hashable, Sendable {
 }
 
 public struct GettingStartedStep {
-    public enum Kind { case coreRunning, busConnected, systemProxy /* NEW */, extensionOn, scopeSet, caTrusted /* from the CA-trust PR D */, firstFlow }
+    public enum Kind { case coreRunning, busConnected, caTrusted /* PR D's source order */, systemProxy /* NEW */, extensionOn, scopeSet, firstFlow } // source order is PR D's; the Getting-started STEPS order is make's (systemProxy, extensionOn, scopeSet, caTrusted)
     …
     /// The route's `detail` for the route/CA steps (shown as the row's help); nil for the others.
     public let detail: String?   // NEW, defaulted nil

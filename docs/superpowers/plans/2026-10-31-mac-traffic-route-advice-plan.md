@@ -256,7 +256,7 @@ greps, Task 6, and the diff review.
   }
 
   public struct GettingStartedStep {
-      public enum Kind: String, …, CaseIterable { case coreRunning, busConnected, systemProxy, extensionOn, scopeSet, caTrusted, firstFlow }
+      public enum Kind: String, …, CaseIterable { case coreRunning, busConnected, caTrusted, systemProxy, extensionOn, scopeSet, firstFlow } // PR D's source order; steps order is make's
       public let detail: String?                                      // NEW
       public init(kind: Kind, title: String, done: Bool, action: ConnectionAction? = nil, detail: String? = nil)
   }
@@ -1146,6 +1146,7 @@ docs PR from this branch.
 | docs #242 | quality (2nd pass) | Minor | D6 "~2 s effective" (the poll is 500 ms, `refreshProxyStatus()` every tick) | fixed in b57840e3: dropped, cadence stated as the 500 ms tick |
 | docs #242 | quality (2nd pass) | Minor | icons spec AI-AC11 `Overview(rows:).clients` — the type is `OverviewStats` | fixed in b57840e3 |
 | docs #242 | quality (2nd pass) | Minor | `flowTable` overlay anchor "~258"/"~261" | fixed in b57840e3: `ShellView.swift:258` in spec D7 and plan Task 3 |
+| all | Spec (3rd pass) | Minor | `GettingStartedStep.Kind` listing showed `caTrusted` after `scopeSet`; PR D's enum is `coreRunning, busConnected, caTrusted, extensionOn, scopeSet, firstFlow` | fixed in (this pass): listings use PR D's source order; the steps order stays make's |
 
 ## Shipped
 
