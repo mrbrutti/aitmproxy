@@ -98,9 +98,10 @@
 //! **The result is a fixed point.** The walk is run again over its own result until a
 //! round leaves it alone (the first walk and at most three more, each with the budgets
 //! of a fresh call), because text can be masked into a different shape: a colon that a
-//! mask removes changes how a header array reads on the next walk. A value that does
-//! not settle in those rounds is returned as the last round left it, as the strict text
-//! pass itself does after its `MAX_ROUNDS` rounds; no input is known to reach that.
+//! mask removes changes how a header array reads on the next walk. A value that no
+//! round confirms fails closed: the whole value is replaced by `"<redacted>"`, because
+//! input built to keep changing must not leave its last round, whatever it holds, in
+//! the entry. No input is known to reach that.
 //!
 //! The function is `pub`, and not private to the server, because the durable
 //! writer reuses it: for an `args` text that parses as JSON it applies this same
@@ -172,9 +173,9 @@ const HEADER_NAME_KEYS: [&str; 3] = ["name", "key", "header"];
 /// the work; see the module doc).
 ///
 /// Idempotent: `redact_value(&redact_value(v)) == redact_value(v)`, because the walk is
-/// run again over its own result until a round leaves it alone (`settle`). The
-/// one exception is a value that does not settle within the rounds, which is returned
-/// as the last round left it; no input is known to do that.
+/// run again over its own result until a round leaves it alone (`settle`). A value that
+/// no round confirms is replaced as a whole by `"<redacted>"`, which is itself a fixed
+/// point, so the guarantee has no exception; no input is known to take that path.
 pub fn redact_value(value: &Value) -> Value {
     settle(walk(value, &mut Budget::new()), |round| {
         walk(round, &mut Budget::new())
@@ -182,8 +183,10 @@ pub fn redact_value(value: &Value) -> Value {
 }
 
 /// Run `again` over `value` until a round leaves it unchanged, and return that value:
-/// at most [`SETTLE_ROUNDS`] rounds, so a value that never settles is returned as the
-/// last round left it, unconfirmed. A value that is already settled costs one round.
+/// at most [`SETTLE_ROUNDS`] rounds. A value that is already settled costs one round.
+/// When no round confirms the value, it fails closed: the whole value is replaced by
+/// `"<redacted>"` (the literal a secret-named key produces), not left as the last round
+/// left it, so input that never settles cannot leave a credential in its last round.
 fn settle(first: Value, again: impl Fn(&Value) -> Value) -> Value {
     let mut current = first;
     for _ in 0..SETTLE_ROUNDS {
@@ -193,7 +196,7 @@ fn settle(first: Value, again: impl Fn(&Value) -> Value) -> Value {
         }
         current = next;
     }
-    current
+    redacted()
 }
 
 // ---- budget and bounds ---------------------------------------------------------
@@ -319,9 +322,11 @@ fn with_marker(head: &str) -> String {
 /// `pass` over `text`, with the result kept within `limit` bytes as well: a mask can
 /// lengthen text (`token=x ` becomes `token=[redacted] `), so a result that does not
 /// fit is cut like an input and passed again, a few times at most, which makes a second
-/// pass over the result leave it alone. If it still does not fit it is cut for good,
-/// and a pass over that may read differently: a text that does not settle is returned
-/// as the last round left it, as `scrub_strict` itself does after its `MAX_ROUNDS` rounds.
+/// pass over the result leave it alone. If it still does not fit it is cut for good, so
+/// the result is bounded but a pass over it may read differently; [`redact_value`]
+/// then finds that the value does not settle and replaces it as a whole. (The strict
+/// text pass bounds its own rounds by `MAX_ROUNDS` and says what it does when they run
+/// out.)
 fn bounded_pass(text: &str, limit: usize, pass: impl Fn(&str) -> String) -> String {
     let mut text = pass(text);
     for _ in 0..OUTPUT_ROUNDS {
@@ -2892,10 +2897,12 @@ mod tests {
     }
 
     /// `settle` runs a further round until one leaves the value alone: a value that
-    /// needs two changes is returned after the third round has confirmed it, and one
-    /// that never settles is returned after the third round, as that round left it.
+    /// needs two changes is returned after the third round has confirmed it. One that
+    /// no round confirms fails closed after the third: the whole value is replaced by
+    /// `"<redacted>"`, never left as the last round left it, because input built to
+    /// keep changing must not leave its last round, whatever it holds, in the entry.
     #[test]
-    fn settle_stops_at_a_fixed_point_or_after_three_rounds() {
+    fn settle_stops_at_a_fixed_point_or_fails_closed_after_three_rounds() {
         let rounds = std::cell::Cell::new(0);
         let grow_to_three = |value: &Value| {
             rounds.set(rounds.get() + 1);
@@ -2913,17 +2920,35 @@ mod tests {
             "two changes and the round that confirms them"
         );
 
+        // Every round changes the value and it holds a credential: the whole value,
+        // not a leaf of it, is replaced.
         let rounds = std::cell::Cell::new(0);
         let never = |value: &Value| {
             rounds.set(rounds.get() + 1);
-            json!(format!("{}x", value.as_str().unwrap_or_default()))
+            json!({"round": rounds.get(), "keep": value["keep"].clone()})
         };
-        assert_eq!(settle(json!(""), never), json!("xxx"));
+        let hostile = json!({"keep": [CANARY, {"nested": CANARY}], "round": 0});
+        assert_eq!(settle(hostile, never), json!("<redacted>"));
         assert_eq!(
             rounds.get(),
             3,
-            "no fixed point: three rounds, then it gives up"
+            "no fixed point: three rounds, then it fails closed"
         );
+
+        // A value that changes in all three rounds is never confirmed, even though the
+        // last round happens to be a fixed point: it fails closed as well.
+        let rounds = std::cell::Cell::new(0);
+        let late = |value: &Value| {
+            rounds.set(rounds.get() + 1);
+            let text = value.as_str().unwrap_or_default();
+            json!(if text.len() < 3 {
+                format!("{text}x")
+            } else {
+                text.to_owned()
+            })
+        };
+        assert_eq!(settle(json!(""), late), json!("<redacted>"));
+        assert_eq!(rounds.get(), 3, "three changes, none of them confirmed");
 
         let rounds = std::cell::Cell::new(0);
         let already = |value: &Value| {

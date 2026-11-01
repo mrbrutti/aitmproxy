@@ -114,6 +114,30 @@ impl Table {
         }
     }
 
+    /// A hostile shape that must come back as `expected` and be a fixed point: a second
+    /// call over the result changes nothing.
+    fn hostile_settles(&mut self, label: &str, input: String, expected: String) {
+        let ran = within(HOSTILE_SECS, move || {
+            let first = scrub_strict(&input);
+            let second = scrub_strict(&first);
+            (first, second)
+        });
+        match ran {
+            Ok((first, second)) if first == expected && second == first => {}
+            Ok((first, second)) => self.failures.push(format!(
+                "{label}: first {} bytes (want {} bytes), second call {}",
+                first.len(),
+                expected.len(),
+                if second == first {
+                    "settled"
+                } else {
+                    "changed it"
+                }
+            )),
+            Err(e) => self.failures.push(format!("{label}: {e}")),
+        }
+    }
+
     /// Hostile shapes of P4 and P5, 4 MiB each. A bare `eyJ` run has no dot, an
     /// unterminated PEM block is masked once to the end of the text, and a scheme
     /// with a colon but no `@` is no credential.
@@ -546,6 +570,56 @@ fn shapes_found_by_fuzzing_are_fixed_points() {
         failures.len(),
         FUZZ_FOUND_SHAPES.len(),
         failures.join("\n")
+    );
+}
+
+/// A text that needs as many rounds as an adversary likes: after the quotes are
+/// re-paired, each round masks one more `"D "c ` segment, and two rounds are spent on
+/// each, so `n` segments (`n` of 1 or more) need `5 + 2 * n` calls of one round until a
+/// call leaves the text as it was.
+fn layered(n: usize) -> String {
+    format!("-u\t\"otp:(\": \"h\u{3000}\"#&{}", "\"D \"c ".repeat(n))
+}
+
+#[test]
+fn a_shape_that_needed_seven_rounds_is_masked_not_replaced() {
+    // Found by fuzzing: the fixed point is reached after the sixth round and shown by
+    // the seventh. It is masked as the rounds leave it, not replaced whole.
+    assert_eq!(layered(1), "-u\t\"otp:(\": \"h\u{3000}\"#&\"D \"c ");
+    let mut t = Table::default();
+    t.row(&layered(1), "-u\t\"otp:[redacted]");
+    t.finish();
+}
+
+#[test]
+fn a_text_that_does_not_settle_is_replaced_whole() {
+    // When the rounds run out without a round leaving its input as it was, the last
+    // output has not been shown to be a fixed point and may still hold a credential a
+    // later round would mask. The whole text is replaced, and the replacement is a
+    // fixed point. If a later change makes these shapes settle, replace them with
+    // shapes that still do not.
+    let mut t = Table::default();
+    t.row(&layered(40), "[redacted]");
+    t.row(&format!("before {} after", layered(40)), "[redacted]");
+    t.row(&format!("{}password=hunter2", layered(40)), "[redacted]");
+    t.row("[redacted]", "[redacted]");
+    // 2 MiB: the work is a fixed number of linear rounds.
+    t.hostile_settles(
+        "`\"D \"c ` x N",
+        layered((2 << 20) / "\"D \"c ".len()),
+        "[redacted]".to_string(),
+    );
+    t.finish();
+    // The bounded form follows: the text is cut first, then replaced whole.
+    assert_eq!(
+        scrub_strict_bounded(&layered(40), 1 << 20),
+        "[redacted]",
+        "bounded, inside the cut"
+    );
+    assert_eq!(
+        scrub_strict_bounded(&layered(40), 100),
+        "[redacted]",
+        "bounded, cut inside the layers"
     );
 }
 
@@ -1040,6 +1114,13 @@ fn multipart_fields_with_a_secret_name_are_masked() {
     t.unchanged("<input name=\"password\" value=\"x\">");
     t.unchanged("name=\"password\"");
 
+    // Hostile, 2 MiB each: fields that are not secret and have no boundary line after
+    // them (a scan to the end of the text for each would be a pass per field), which
+    // come back unchanged.
+    for unit in ["name=\"a\"\n\nx\n", "name=\"a\"\n\n\n\n"] {
+        let text = unit.repeat((2 << 20) / unit.len() + 1);
+        t.hostile(&format!("{unit:?} x N"), text.clone(), text);
+    }
     // Hostile, 2 MiB each: field names with no blank line after them, and many
     // complete parts.
     t.hostile_completes(
@@ -1091,8 +1172,6 @@ fn the_pair_value_rule_matches_scrub_text() {
         "=abc&z=1",
         "=abc;z=1",
         "=abc,z=1",
-        "=abc\"z",
-        "=abc'z",
         "=abc}z",
         "=abc z=1",
         "=abc\u{a0}z=1",
@@ -1140,11 +1219,25 @@ fn the_pair_value_rule_matches_scrub_text() {
             ));
         }
     }
+    // The one place the two differ, on purpose: `scrub_text` ends an unquoted value at
+    // any quote, `scrub_strict` runs on across a quote that something follows (`O'Brien`).
+    for (tail, want) in [("=abc\"z", "=[redacted]"), ("=abc'z", "=[redacted]")] {
+        let strict = scrub_strict(&format!("x pass{tail}"));
+        if strict != format!("x pass{want}") {
+            failures.push(format!("tail {tail:?}: scrub_strict gives {strict:?}"));
+        }
+        let shared = scrub_text_after(&format!("x token{tail}"), "x token");
+        if shared.as_deref() == Some(want) {
+            failures.push(format!(
+                "tail {tail:?}: scrub_text now masks it whole, so the difference is gone"
+            ));
+        }
+    }
     assert!(
         failures.is_empty(),
         "{} of {} tails are masked to a different end:\n{}",
         failures.len(),
-        tails.len(),
+        tails.len() + 2,
         failures.join("\n")
     );
 }
@@ -1294,6 +1387,11 @@ fn bracketed_values_under_a_secret_key_are_masked_whole() {
         r#"{"passwords":["a"],"user":"u"}"#,
         r#"{"passwords":[redacted],"user":"u"}"#,
     );
+    // A parenthesis is not a bracket: an unmatched one in an element does not end the
+    // group.
+    t.row("cfg tokens: [a), CNRYx9q7]", "cfg tokens: [redacted]");
+    t.row("x tokens=[p)ss1, p)ss2]", "x tokens=[redacted]");
+    t.row(r#"{"tokens":["a", (b, "c"]}"#, r#"{"tokens":[redacted]}"#);
     // A group that is cut.
     t.row(r#"{"passwords":["CNRYx9"#, r#"{"passwords":[redacted]"#);
     // Names that are not secret keep their groups.
@@ -1425,6 +1523,98 @@ fn curl_user_flags_mask_the_password_part() {
     t.unchanged("run -u --verbose");
     t.unchanged("run --username a:b");
     t.unchanged("run x-u u:p");
+    t.finish();
+}
+
+#[test]
+fn an_unquoted_value_runs_across_a_quote_that_does_not_end_it() {
+    // `scrub_text` ends an unquoted value at any quote, so `password=O'Brien` would
+    // keep `'Brien`. Under a secret key a quote that is followed by a character that
+    // does not end a value is part of the value; one followed by whitespace, `&`, `;`,
+    // `,`, `}`, `]` or the end of the text still ends it. The shared vocabulary is
+    // read before `scrub_text` can cut the value, the rest by P6.
+    let mut t = Table::default();
+    t.row(
+        "password=O'Brien&remember=1",
+        "password=[redacted]&remember=1",
+    );
+    t.row(
+        "/login?user=bob&password=O'Brien",
+        "/login?user=bob&password=[redacted]",
+    );
+    t.row(
+        "user[password]=O'Brien&x=1",
+        "user[password]=[redacted]&x=1",
+    );
+    t.row("api_key=ab\"cdef123", "api_key=[redacted]");
+    t.row("https://x/?token=O'Brien", "https://x/?token=[redacted]");
+    t.row("pw=O'C", "pw=[redacted]");
+    t.row("token=a'b'C", "token=[redacted]");
+    t.row("password=O'Brien", "password=[redacted]");
+    // camelCase, a value followed by more pairs, a `:` separator, and a value in the
+    // middle of text.
+    t.row("userPass=O'C&x=1", "userPass=[redacted]&x=1");
+    t.row("x pass: it's here", "x pass: [redacted] here");
+    t.row("a=1&secret=x\"y&b=2", "a=1&secret=[redacted]&b=2");
+    // An opening quote that never closes: the rest of the value is read the same way.
+    t.row("password=\"O'Brien&x=1", "password=\"[redacted]&x=1");
+    t.row("x password: \"O'Bri", "x password: \"[redacted]");
+    // A key nested in the value of a host and port, which the value rule leaves alone.
+    t.row(
+        "x.auth:8443/cb?token=O'Brien",
+        "x.auth:8443/cb?token=[redacted]",
+    );
+    // What still ends a value: the quote of the enclosing string, and a quote with
+    // whitespace, `&`, `;`, `,`, `}`, `]` or the end after it.
+    t.row(r#"{"a":"x token=abc"}"#, r#"{"a":"x token=[redacted]"}"#);
+    t.row("token=abc\"", "token=[redacted]\"");
+    t.row("token=abc\" next", "token=[redacted]\" next");
+    t.row("token=abc'", "token=[redacted]'");
+    t.row("x=\"a\" token=b", "x=\"a\" token=[redacted]");
+    for follower in ["&z", ";z", ",z", "}z", "]z", " z", "\tz", "\nz", "\u{a0}z"] {
+        for quote in ['\'', '"'] {
+            t.row(
+                &format!("token=abc{quote}{follower}"),
+                &format!("token=[redacted]{quote}{follower}"),
+            );
+        }
+    }
+    // A quoted value keeps its own rule.
+    t.row("token=\"a b\"", "token=\"[redacted]\"");
+    t.row("token='a b' x", "token='[redacted]' x");
+    // Names that are not secret keep a value with a quote in it.
+    t.unchanged("name=O'Brien&city=L'Aquila");
+    t.unchanged("a=b\"c");
+
+    // Hostile, 2 MiB each: a value that is nothing but quotes the value runs across,
+    // values that start where the last one ended, and quoted values that close far on.
+    let unit = "a'";
+    t.hostile_settles(
+        "`token=` + `a'` x N",
+        format!("token={}", unit.repeat((2 << 20) / unit.len())),
+        "token=[redacted]'".to_string(),
+    );
+    let unit = "x\"";
+    t.hostile_settles(
+        "`password=` + `x\"` x N",
+        format!("password={}", unit.repeat((2 << 20) / unit.len())),
+        "password=[redacted]\"".to_string(),
+    );
+    t.hostile_settles(
+        "`pw=` + `a'` x N",
+        format!("pw={}", "a'".repeat((2 << 20) / 2)),
+        "pw=[redacted]'".to_string(),
+    );
+    t.hostile_settles(
+        "`token=` x N",
+        "token=".repeat((2 << 20) / 6),
+        "token=[redacted]".to_string(),
+    );
+    t.hostile_settles(
+        "`token=\"` x N, then `x\"`",
+        format!("{}x\"", "token=\"".repeat((2 << 20) / 7)),
+        "token=\"[redacted]\"".to_string(),
+    );
     t.finish();
 }
 
