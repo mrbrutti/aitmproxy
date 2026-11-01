@@ -8,6 +8,13 @@
 //! `SeedMode::Vulnerable` (the 5 s [`CrashWindow`]) and [`Step::Fault`] in
 //! `SeedMode::Patched` (the row's protocol-error reply, then close).
 //!
+//! The contract behind the steps (T10 PR C): in Patched mode every close
+//! is preceded by the row's protocol-error reply; anything that is not the
+//! trigger either answers with a protocol error and keeps the connection,
+//! or waits ([`Step::Wait`], a partial line still growing). The only silent
+//! closes are Vulnerable-mode triggers, MQTT's byte-less faults (it has no
+//! error reply), an orderly `quit`, and a peer EOF.
+//!
 //! Everything here is a plain value or a mutex over one `Option<Instant>`, so
 //! the state machine is unit-testable with a mocked clock.
 
@@ -64,8 +71,10 @@ pub enum Step {
     /// A denylisted command arrived: write the bytes, keep the connection;
     /// logged `denylisted` so a cell can prove none came.
     Denylisted(Vec<u8>),
-    /// Patched-mode answer to a Vulnerable trigger: write the bytes if
-    /// non-empty, then close with reason `error`; the listener stays up.
+    /// Reply if non-empty, then close with reason `error`; the listener
+    /// stays up. The Patched-mode answer to a Vulnerable trigger, and in
+    /// either mode the answer to malformed non-trigger input (a garbled
+    /// RESP length, an element without `$`, an inline line past 1 MiB).
     Fault(Vec<u8>),
     /// Vulnerable-mode crash: the driver opens the [`CrashWindow`], logs
     /// `downtime`, drops the connection and the listener.
@@ -73,6 +82,15 @@ pub enum Step {
     /// Orderly end (`QUIT`, `DISCONNECT`): write the bytes if any, then close
     /// with reason `quit`.
     Close(Option<Vec<u8>>),
+    /// Nothing to send, keep the connection, no log entry: the buffered
+    /// bytes are a message still arriving (a line without its CRLF yet, a
+    /// `set` waiting for its data), as a real server would wait for them.
+    /// Returned from [`Speaker::on_idle`]; the driver re-arms the idle
+    /// timer and still tears the connection down on peer EOF, on the
+    /// service's crash window, or when the target drops. A speaker never
+    /// waits past its [`Speaker::max_buffer`] (the driver closes
+    /// `oversize` if it does).
+    Wait,
 }
 
 /// Result of [`Speaker::parse`] on the buffered bytes.
@@ -109,7 +127,9 @@ pub trait Speaker: Send {
     fn parse(&mut self, mode: SeedMode, buf: &[u8]) -> Parsed;
     /// Called with the non-empty, still-incomplete buffer after
     /// [`IDLE_TIMEOUT`] of silence, or when the buffer exceeds
-    /// [`Speaker::max_buffer`].
+    /// [`Speaker::max_buffer`]. [`Step::Wait`] keeps waiting for the rest
+    /// of a line; a speaker whose incomplete frame is its D5 bug returns
+    /// the mode's trigger / fault instead.
     fn on_idle(&mut self, mode: SeedMode, buf: &[u8]) -> Step;
     /// Largest buffer the driver holds for this speaker before `on_idle`.
     fn max_buffer(&self) -> usize;
