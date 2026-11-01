@@ -227,26 +227,27 @@ struct PulseDot: NSViewRepresentable {
     var color: DynamicColor
     var reduceMotion: Bool
 
-    func makeNSView(context: Context) -> DotView {
-        let view = DotView()
+    func makeNSView(context: Context) -> PulseLayerView {
+        let view = PulseLayerView()
         view.wantsLayer = true
         view.layer?.cornerRadius = Tok.Size.statusDot / 2
         return view
     }
 
-    func updateNSView(_ view: DotView, context: Context) {
+    func updateNSView(_ view: PulseLayerView, context: Context) {
         view.fill = color.nsColor
         view.setPulsing(!reduceMotion)
     }
 
-    func sizeThatFits(_ proposal: ProposedViewSize, nsView: DotView, context: Context) -> CGSize? {
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: PulseLayerView, context: Context) -> CGSize? {
         CGSize(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
     }
 
-    final class DotView: NSView {
+    /// The dot's own layer-backed view (not `FlowCellView.DotView`, the table's status dot).
+    final class PulseLayerView: NSView {
         static let pulseKey = "pulse"
         var fill: NSColor = .clear { didSet { needsDisplay = true } }
-        private(set) var pulsing = false
+        private var pulsing = false
 
         override var wantsUpdateLayer: Bool { true }
         override func updateLayer() { layer?.backgroundColor = fill.cgColor }
