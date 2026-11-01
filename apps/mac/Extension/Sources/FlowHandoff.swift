@@ -1539,6 +1539,7 @@ enum HandoffSelfCheck {
         coreLinkAndClaim(r)
         scopeChangeHook(r)
         providerRules(r)
+        ruleReconciler(r)
         pumps(r)
         inboundCap(r)
         return r.failures
