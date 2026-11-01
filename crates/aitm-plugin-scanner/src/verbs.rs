@@ -426,8 +426,12 @@ impl Command for ScanMap {
             description: "Map one authorized, in-scope target: crawl it, run the passive \
                           checks and enumerate its insertion points. Takes the same \
                           parameters as `scan.start`, but the engine forces `lanes: [http]` \
-                          and `intensity: passive`, so no probe is ever sent. Returns the \
-                          accepted job immediately; read the result with `scan.sitemap` and \
+                          and `intensity: passive`, so no probe is ever sent. The map crawl \
+                          submits same-origin forms with inert values and the observed \
+                          session, skips logout-looking and destructive-looking forms \
+                          (counted in `crawl.forms_skipped`), and can be turned off with \
+                          `crawl.submit_forms: false`. Returns the accepted job \
+                          immediately; read the result with `scan.sitemap` and \
                           `scan.issues`."
                 .into(),
             params: start_params(),
@@ -841,30 +845,27 @@ impl Command for ScanSitemap {
     }
 
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        let job = match opt_str(&args, "job")? {
-            Some(job) => job,
-            None if opt_str(&args, "target")?.is_none() => {
+        let job =
+            match (opt_str(&args, "job")?, opt_str(&args, "target")?) {
+                (Some(job), _) => job,
                 // Neither given (both are optional in spec D3): the newest job.
-                self.engine
-                    .registry
-                    .newest()
-                    .ok_or_else(|| scan_error(ScanErrorCode::NotFound, "no scan job has run yet"))?
-            }
-            None => {
-                let target = opt_str(&args, "target")?.expect("checked above");
-                let origin = profiles::normalize_origin(&target)
-                    .map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
-                self.engine
-                    .registry
-                    .newest_for_target(&origin)
-                    .ok_or_else(|| {
-                        scan_error(
-                            ScanErrorCode::NotFound,
-                            format!("no scan job has run against {origin}"),
-                        )
-                    })?
-            }
-        };
+                (None, None) => self.engine.registry.newest().ok_or_else(|| {
+                    scan_error(ScanErrorCode::NotFound, "no scan job has run yet")
+                })?,
+                (None, Some(target)) => {
+                    let origin = profiles::normalize_origin(&target)
+                        .map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
+                    self.engine
+                        .registry
+                        .newest_for_target(&origin)
+                        .ok_or_else(|| {
+                            scan_error(
+                                ScanErrorCode::NotFound,
+                                format!("no scan job has run against {origin}"),
+                            )
+                        })?
+                }
+            };
         let discovery = self
             .engine
             .registry
@@ -1751,6 +1752,47 @@ mod tests {
         // `target` resolves to the newest job for that origin.
         let by_target = h.ok("scan.sitemap", &[("target", s("http://scan.test"))]);
         assert_eq!(as_array(obj(&by_target, "points")).len(), 2);
+
+        // Neither `job` nor `target` (spec amendment 27): the newest job of
+        // all. A second job against an origin with no captures has no node,
+        // which tells it from the first.
+        let bare = h.ok("scan.sitemap", &[]);
+        assert_eq!(
+            as_array(obj(&bare, "nodes")).len(),
+            2,
+            "one job: it is the newest"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let second = h.ok("scan.map", &[("target", s("http://other.test"))]);
+        let second = as_str(obj(&second, "job")).to_string();
+        h.wait_terminal(&second).await;
+        let bare = h.ok("scan.sitemap", &[]);
+        assert_eq!(
+            as_array(obj(&bare, "nodes")).len(),
+            0,
+            "the newest job's nodes"
+        );
+        assert_eq!(as_array(obj(&bare, "points")).len(), 0);
+        assert_eq!(
+            h.engine.registry.newest().as_deref(),
+            Some(second.as_str()),
+            "the registry names the same job"
+        );
+        let by_target = h.ok("scan.sitemap", &[("target", s("http://scan.test"))]);
+        assert_eq!(
+            as_array(obj(&by_target, "nodes")).len(),
+            2,
+            "`target` still picks the first job"
+        );
+    }
+
+    /// `scan.sitemap {}` before any job has run is `not_found`, in words.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sitemap_without_job_or_target_on_a_fresh_engine_is_not_found() {
+        let h = Harness::new();
+        let err = h.call("scan.sitemap", &[]).expect_err("no job has run");
+        assert_eq!(code(&err), ScanErrorCode::NotFound);
+        assert_eq!(err.to_string(), "scan: not_found: no scan job has run yet");
     }
 
     /// Spec D3/D4: `scan.checks` is the unified catalogue, filtered by lane,

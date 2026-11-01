@@ -141,12 +141,6 @@ pub fn pick_observed(
     })
 }
 
-/// Merge the session into a probe request (spec D7): the probe's own headers
-/// and cookies win, the session's are added by name.
-///
-/// A session header is set only when the request does not already carry that
-/// name, and the cookies are merged by name into one re-serialised `Cookie`
-/// header (`a=b; c=d`) in which the request's own value for a name is kept.
 /// `path` without its query string or fragment: `/account?tab=1#x` → `/account`;
 /// an empty path reads as `/`.
 fn bare_path(path: &str) -> String {
@@ -159,6 +153,12 @@ fn bare_path(path: &str) -> String {
     }
 }
 
+/// Merge the session into a probe request (spec D7): the probe's own headers
+/// and cookies win, the session's are added by name.
+///
+/// A session header is set only when the request does not already carry that
+/// name, and the cookies are merged by name into one re-serialised `Cookie`
+/// header (`a=b; c=d`) in which the request's own value for a name is kept.
 pub fn apply(material: &SessionMaterial, req: &mut HttpRequest) {
     for (name, value) in &material.headers {
         if !req.headers.has(name) {

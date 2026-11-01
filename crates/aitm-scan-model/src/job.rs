@@ -128,6 +128,12 @@ pub struct CrawlCounters {
     /// crawl says so instead of silently running on fewer points (additive,
     /// 2026-11-01; absent on the wire means 0).
     pub errors: u64,
+    /// Forms the crawl deliberately did not submit: logout-looking and
+    /// destructive-looking (action path or field name containing `delete`,
+    /// `remove`, `destroy`, `password`, `transfer`, `pay`, `purchase`,
+    /// `unsubscribe`, `confirm`). Additive, 2026-11-01; absent on the wire
+    /// means 0.
+    pub forms_skipped: u64,
 }
 
 /// Insertion-point counters (spec D5).
@@ -370,6 +376,36 @@ mod tests {
     /// Panel Q4 — the summary is structurally the status minus exactly the
     /// per-phase detail: every surviving key carries the same value, and no
     /// key is added.
+    /// Additive crawl counters (2026-11-01): `errors` and `forms_skipped`
+    /// default to 0 when absent on the wire, so an older frontend's record or
+    /// a lane that never reports them still parses; both serialize by name.
+    #[test]
+    fn crawl_counters_additive_fields_default_to_zero() {
+        let old: CrawlCounters =
+            serde_json::from_str(r#"{"pages":3,"queued":0,"depth":1,"forms_submitted":2}"#)
+                .expect("a record without the additive fields parses");
+        assert_eq!(
+            old,
+            CrawlCounters {
+                pages: 3,
+                depth: 1,
+                forms_submitted: 2,
+                ..CrawlCounters::default()
+            }
+        );
+        assert_eq!(old.errors, 0);
+        assert_eq!(old.forms_skipped, 0);
+
+        let json = serde_json::to_value(CrawlCounters {
+            forms_skipped: 4,
+            errors: 1,
+            ..CrawlCounters::default()
+        })
+        .expect("serializes");
+        assert_eq!(json["forms_skipped"], 4);
+        assert_eq!(json["errors"], 1);
+    }
+
     #[test]
     fn summary_is_the_status_minus_the_detail_fields() {
         let status = JobStatus {
@@ -392,7 +428,6 @@ mod tests {
                 ..IssueCounters::default()
             },
             crawl: CrawlCounters {
-                errors: 0,
                 pages: 9,
                 ..CrawlCounters::default()
             },

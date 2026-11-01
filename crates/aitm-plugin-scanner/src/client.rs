@@ -991,15 +991,15 @@ mod tests {
     async fn await_until_deadline_has_no_per_await_cap() {
         let cancel = CancellationToken::new();
         let cap = Duration::from_millis(20);
-        let deadline = Instant::now() + Duration::from_millis(400);
-        let slow = async {
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            7
-        };
-        let capped = bounded_await_with(deadline, &cancel, Some(cap), slow).await;
+        // A generous deadline: the first two assertions are about the cap,
+        // not about racing the clock under load.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        // A future that never completes: the cap, and only the cap, ends it.
+        let never = std::future::pending::<u8>();
+        let capped = bounded_await_with(deadline, &cancel, Some(cap), never).await;
         assert!(
             matches!(capped, Err(AwaitEnd::Timeout)),
-            "the cap ends a slow future as Timeout: {capped:?}"
+            "the cap ends a pending future as Timeout: {capped:?}"
         );
 
         let slow = async {
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(
             await_until_deadline(deadline, &cancel, slow).await.ok(),
             Some(7),
-            "without a cap the same future completes inside the deadline"
+            "without a cap a future longer than the cap completes inside the deadline"
         );
 
         let soon = Instant::now() + Duration::from_millis(30);

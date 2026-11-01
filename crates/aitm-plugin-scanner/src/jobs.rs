@@ -15,6 +15,7 @@
 //! The gate order is contract, not taste: a caller that is wrong in two ways
 //! must always learn the same reason first, or a UI cannot explain itself.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
@@ -255,16 +256,27 @@ impl JobRegistry {
 
     /// The newest job of all, for `scan.sitemap` with neither `job` nor `target`.
     pub fn newest(&self) -> Option<JobId> {
+        self.newest_where(|_| true)
+    }
+
+    /// The newest job that ran against `origin`, for `scan.sitemap { target }`.
+    pub fn newest_for_target(&self, origin: &str) -> Option<JobId> {
+        self.newest_where(|e| e.origins.iter().any(|o| o == origin))
+    }
+
+    /// The job with the greatest `started_at` among those `keep` admits; the
+    /// smaller id wins a same-millisecond tie, so the answer is deterministic.
+    fn newest_where(&self, keep: impl Fn(&JobEntry) -> bool) -> Option<JobId> {
         let inner = self.lock();
-        let mut rows: Vec<(u64, JobId)> = inner
+        inner
             .values()
+            .filter(|e| keep(e))
             .map(|e| {
                 let status = e.status.read().unwrap_or_else(|p| p.into_inner());
-                (status.started_at, status.job.clone())
+                (status.started_at, Reverse(status.job.clone()))
             })
-            .collect();
-        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        rows.into_iter().next().map(|(_, job)| job)
+            .max()
+            .map(|(_, Reverse(job))| job)
     }
 
     /// The three handles the worker needs to drive one job.
@@ -301,7 +313,7 @@ impl JobRegistry {
         if !status.state.is_terminal() {
             status.state = JobState::Cancelling;
         }
-        Some(status.clone())
+        Some(with_live_elapsed(status.clone()))
     }
 
     /// How many jobs are not yet terminal.
@@ -402,31 +414,16 @@ impl JobRegistry {
         prune(&mut inner, self.history);
         Ok(added)
     }
-
-    /// The newest job that ran against `origin`, for `scan.sitemap { target }`.
-    pub fn newest_for_target(&self, origin: &str) -> Option<JobId> {
-        let inner = self.lock();
-        let mut rows: Vec<(u64, JobId)> = inner
-            .values()
-            .filter(|e| e.origins.iter().any(|o| o == origin))
-            .map(|e| {
-                let status = e.status.read().unwrap_or_else(|p| p.into_inner());
-                (status.started_at, status.job.clone())
-            })
-            .collect();
-        rows.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-        rows.into_iter().next().map(|(_, job)| job)
-    }
 }
 
-/// `elapsed_ms` as a reader should see it: the worker writes the field only at
-/// the terminal transition, so a running job reports the wall time since
-/// `started_at` (spec D5 "monotonic from started_at"; T9 live run, 2026-11-01).
+/// `elapsed_ms` as a reader should see it: the wall time since `started_at`
+/// while the job runs (spec D5 "monotonic from started_at"; T9 live run,
+/// 2026-11-01), the fixed value once it is terminal. The worker writes the
+/// field on every counter sync and push line, but not during the crawling
+/// phase, so `status`, `list` and `cancel` compute it on the way out.
 fn with_live_elapsed(mut status: JobStatus) -> JobStatus {
     if status.finished_at.is_none() {
-        status.elapsed_ms = status
-            .elapsed_ms
-            .max(util::now_ms().saturating_sub(status.started_at));
+        status.elapsed_ms = util::now_ms().saturating_sub(status.started_at);
     }
     status
 }
@@ -2739,6 +2736,9 @@ mod tests {
             Some("scan-00000014".to_string())
         );
         assert_eq!(registry.newest_for_target("http://nowhere.test"), None);
+        // Of all three, the newest is the live `b.test` job.
+        assert_eq!(registry.newest(), Some("scan-0000001e".to_string()));
+        assert_eq!(crate::jobs::JobRegistry::new(1).newest(), None);
 
         // The handles are the entry's own, and cancelling through the registry
         // is what the worker observes.
@@ -2867,6 +2867,122 @@ mod tests {
         .expect("the 443 entry admits the default-port https origin");
         assert_eq!(started.lanes.run, vec![LaneKind::Http]);
         h.cancel_all();
+    }
+
+    /// Spec D5 "monotonic from `started_at`" (T9 live run, 2026-11-01): a job
+    /// that is still running reports the wall time since `started_at` from
+    /// every registry reader — `status`, `list` and the status `cancel`
+    /// returns — while a finished job keeps the value its terminal transition
+    /// fixed.
+    #[test]
+    fn a_running_job_reports_live_elapsed_ms() {
+        use aitm_scan_model::{JobState, JobStatus};
+        let registry = crate::jobs::JobRegistry::new(4);
+        let now = crate::util::now_ms();
+        let entry =
+            |job: &str, state: JobState, started_at: u64, elapsed_ms: u64| crate::jobs::JobEntry {
+                status: Arc::new(std::sync::RwLock::new(JobStatus {
+                    job: job.to_string(),
+                    state,
+                    started_at,
+                    finished_at: state.is_terminal().then_some(started_at + elapsed_ms),
+                    elapsed_ms,
+                    targets: vec!["http://a.test".to_string()],
+                    ..JobStatus::default()
+                })),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                confine: None,
+                started_by: Default::default(),
+                discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+                origins: vec!["http://a.test".to_string()],
+                is_agent: false,
+            };
+        assert!(registry.try_insert(entry(
+            "scan-11111111",
+            JobState::Running,
+            now.saturating_sub(5_000),
+            0
+        )));
+        assert!(registry.try_insert(entry(
+            "scan-22222222",
+            JobState::Done,
+            now.saturating_sub(60_000),
+            42
+        )));
+
+        let live = registry.status("scan-11111111").expect("the live job");
+        assert_eq!(live.finished_at, None);
+        assert!(
+            live.elapsed_ms >= 5_000,
+            "status is live: {}",
+            live.elapsed_ms
+        );
+
+        let listed = registry.list(false, 10);
+        let by_job = |job: &str| {
+            listed
+                .iter()
+                .find(|s| s.job == job)
+                .unwrap_or_else(|| panic!("{job} is listed"))
+                .elapsed_ms
+        };
+        assert!(
+            by_job("scan-11111111") >= 5_000,
+            "list agrees: {}",
+            by_job("scan-11111111")
+        );
+        assert_eq!(
+            by_job("scan-22222222"),
+            42,
+            "a finished job keeps its fixed elapsed"
+        );
+
+        let cancelled = registry.cancel("scan-11111111").expect("the live job");
+        assert_eq!(cancelled.state, JobState::Cancelling);
+        assert!(
+            cancelled.elapsed_ms >= 5_000,
+            "cancel's returned status is live too: {}",
+            cancelled.elapsed_ms
+        );
+        assert_eq!(
+            registry
+                .status("scan-22222222")
+                .expect("the done job")
+                .elapsed_ms,
+            42
+        );
+    }
+
+    /// Security review (delta ca852f71..e6bd03bc, 2026-11-01): a map crawl
+    /// under agent `auto` admission does not submit a form that looks like it
+    /// changes something that matters. The `/account/delete` form is skipped
+    /// and counted in `crawl.forms_skipped`; the `/comments` form beside it is
+    /// submitted as before. `max_depth: 1` parses the seed page only, so the
+    /// count is one page's worth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_destructive_looking_form_is_skipped_and_counted() {
+        const PAGE: &str = "<html><body>\
+             <form action=\"/account/delete\" method=\"post\"><input name=\"id\" value=\"7\"></form>\
+             <form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>\
+             </body></html>";
+
+        let h = Harness::bare().with_page(PAGE);
+        h.bind();
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.crawl.max_depth = 1;
+        let started =
+            crate::jobs::start(&h.engine, profile, operator(), true).expect("a map job starts");
+        let status = h
+            .wait_terminal(&started.job, std::time::Duration::from_secs(5))
+            .await;
+
+        assert_eq!(
+            h.client.trail(),
+            vec!["GET /", "POST /comments"],
+            "the delete form is never submitted; the comments form is"
+        );
+        assert_eq!(status.crawl.forms_skipped, 1, "{:?}", status.crawl);
+        assert_eq!(status.crawl.errors, 0);
     }
 
     /// Coordinator decision (2026-11-01, spec D8.1): a `scan.map` crawl submits

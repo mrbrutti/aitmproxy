@@ -270,11 +270,23 @@ pub trait JobCtx: Send + Sync {
     /// A crawl of one origin failed outright (the browser crawl timed out or
     /// was refused). The engine counts it in `crawl.errors` so the status says
     /// the job ran on fewer points than it could have; the lane then falls back
-    /// to whatever discovery it still has.
+    /// to whatever discovery it still has. The runtime scrubs `reason` before
+    /// it is logged; lanes need not.
     ///
     /// A no-op by default.
     fn report_crawl_error(&self, origin: &str, reason: &str) {
         let _ = (origin, reason);
+    }
+
+    /// The crawl deliberately did not submit `count` forms it found —
+    /// logout-looking or destructive-looking ones (see
+    /// `CrawlCounters::forms_skipped`). The engine adds them to
+    /// `crawl.forms_skipped` so a frontend can say the map is not the whole
+    /// form surface.
+    ///
+    /// A no-op by default.
+    fn report_forms_skipped(&self, count: u64) {
+        let _ = count;
     }
 }
 

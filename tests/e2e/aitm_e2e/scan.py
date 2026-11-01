@@ -361,6 +361,11 @@ atexit.register(ledger_flush)
 # ---------------------------------------------------------------------------
 
 
+def _sets_use_browser(d) -> bool:
+    """Whether a profile or overrides dict pins `crawl.use_browser` itself."""
+    return isinstance(d, dict) and isinstance(d.get("crawl"), dict) and "use_browser" in d["crawl"]
+
+
 def _job_args(profile, profile_name, target, overrides) -> dict:
     given = [k for k, v in (("profile", profile), ("profile_name", profile_name), ("target", target)) if v is not None]
     if len(given) != 1:
@@ -378,8 +383,6 @@ def _job_args(profile, profile_name, target, overrides) -> dict:
     # port shared with another session's core makes every navigation time out.
     # A cell that sets `crawl.use_browser` itself (profile or overrides) is
     # left alone (test_t2_crawl needs the real browser).
-    def _sets_use_browser(d) -> bool:
-        return isinstance(d, dict) and isinstance(d.get("crawl"), dict) and "use_browser" in d["crawl"]
     if not _sets_use_browser(profile) and not _sets_use_browser(overrides):
         overrides = dict(overrides or {})
         crawl = dict(overrides.get("crawl") or {})

@@ -123,7 +123,13 @@ a partial profile merged over it key by key, and a mistyped override key is an
 it crawls, runs the passive checks and enumerates insertion points, and sends no
 probe. Its crawl honours the profile's `crawl.submit_forms` (default on): form
 filling with inert generated values is part of the crawl, not a probe
-(coordinator decision, 2026-11-01). Read its result with `scan.sitemap` and
+(coordinator decision, 2026-11-01). Plainly: the map crawl **submits same-origin
+forms** with inert values and the observed session, **skips** logout-looking and
+destructive-looking forms — an action path or field name containing `delete`,
+`remove`, `destroy`, `password`, `transfer`, `pay`, `purchase`, `unsubscribe` or
+`confirm`, matched as whole words — and counts every form it skipped in
+`JobStatus.crawl.forms_skipped`; `crawl.submit_forms: false` turns form
+submission off altogether. Read its result with `scan.sitemap` and
 `scan.issues`.
 
 `scan.discover` is **deprecated**. It is now a `scan.map` job plus a bounded

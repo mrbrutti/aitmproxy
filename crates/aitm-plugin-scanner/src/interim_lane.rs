@@ -173,9 +173,11 @@ impl InterimHttpLane {
         if profile.crawl.max_pages == 0 || browser_crawled {
             return None;
         }
-        crate::interim_crawl::crawl_with_client(origin, job)
-            .await
-            .stopped
+        let crawled = crate::interim_crawl::crawl_with_client(origin, job).await;
+        if crawled.forms_skipped > 0 {
+            job.report_forms_skipped(u64::from(crawled.forms_skipped));
+        }
+        crawled.stopped
     }
 
     /// Build the site map and the insertion points from every captured, in-scope
@@ -1515,6 +1517,9 @@ mod tests {
         charged: AtomicU32,
         /// Set by a test that wants the job to read as cancelled.
         cancelled: std::sync::atomic::AtomicBool,
+        /// Every `(origin, reason)` the lane reported through
+        /// [`JobCtx::report_crawl_error`].
+        crawl_errors: Mutex<Vec<(String, String)>>,
     }
 
     impl TestJob {
@@ -1533,11 +1538,19 @@ mod tests {
                 budget: 1000,
                 charged: AtomicU32::new(0),
                 cancelled: std::sync::atomic::AtomicBool::new(false),
+                crawl_errors: Mutex::new(Vec::new()),
             }
         }
 
         fn charged(&self) -> u32 {
             self.charged.load(Ordering::SeqCst)
+        }
+
+        fn crawl_errors(&self) -> Vec<(String, String)> {
+            self.crawl_errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
     }
 
@@ -1581,6 +1594,12 @@ mod tests {
         }
         fn marker(&self) -> String {
             "aitm7f3a".to_string()
+        }
+        fn report_crawl_error(&self, origin: &str, reason: &str) {
+            self.crawl_errors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((origin.to_string(), reason.to_string()));
         }
     }
 
@@ -2268,6 +2287,69 @@ mod tests {
             lane.crawl_origin("http://nobody.test", &job).await,
             BrowserCrawl::NotApplicable,
             "a crawl skipped by design is not a failure"
+        );
+    }
+
+    /// T7/T2 live runs (2026-11-01): a browser crawl that fails outright is
+    /// reported through `JobCtx::report_crawl_error` — once, naming the
+    /// origin — and the client crawl runs in its place, so the job does not
+    /// proceed on captured flows alone.
+    #[tokio::test]
+    async fn a_failed_browser_crawl_is_reported_and_the_client_crawl_runs() {
+        let store: Arc<dyn FlowStore> = Arc::new(MemFlowStore::new());
+        let client = StubClient::new(Answer::Fixed(
+            200,
+            "text/html",
+            "<html><body><a href=\"/next?n=1\">next</a></body></html>",
+        ));
+        let mut job = TestJob::new(
+            Arc::clone(&store),
+            Arc::clone(&client) as Arc<dyn ProxyClient>,
+        );
+        // The out-of-scope seed makes the browser crawl fail (see
+        // `a_refused_crawl_reports_its_reason`).
+        job.browser = Some(Arc::new(StubBrowser {
+            store: Arc::clone(&store),
+            path: "/crawled",
+        }));
+
+        lane()
+            .discover(&target(&["http://nobody.test"]), &job)
+            .await
+            .expect("discovery still completes after a failed crawl");
+
+        let errors = job.crawl_errors();
+        assert_eq!(errors.len(), 1, "one failed crawl, one report: {errors:?}");
+        assert_eq!(errors[0].0, "http://nobody.test");
+        assert!(
+            errors[0].1.contains("nobody.test") || errors[0].1.contains("scope"),
+            "the reason says why: {}",
+            errors[0].1
+        );
+
+        // The client crawl ran instead: the seed GET, then the link it found.
+        let trail: Vec<String> = client
+            .seen()
+            .iter()
+            .map(|(req, _)| {
+                format!(
+                    "{} {}://{}{}",
+                    req.method, req.scheme, req.authority, req.path
+                )
+            })
+            .collect();
+        assert_eq!(
+            trail,
+            vec![
+                "GET http://nobody.test/".to_string(),
+                "GET http://nobody.test/next?n=1".to_string(),
+            ],
+            "the client crawl's GETs"
+        );
+        assert_eq!(
+            job.charged(),
+            0,
+            "a refused browser crawl spends nothing; the client crawl is metered by the client"
         );
     }
 
