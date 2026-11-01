@@ -627,6 +627,15 @@ Kept by the main session during stage 6. One row per finding.
 | 15 | spec | Minor | T7-19 opens `nodes[0]` of the reply, TUI renders in host-group order | fix round G-C (G101) |
 | 15 | spec | Minor | `tab()` markers present on every tab | fix round G-C (G96) |
 | 15 | spec | Minor | builder decisions unrecorded (Fatal policy, T7-18 ordering, child env, token file, skip format, `J` on Site map) | ratified in G101's text |
+| G-A | fix round | done | G10-G22, G31-G37, G42-G54, G57, G61, G66-G67, G71-G75, G82-G83 in 14 commits `0665f147..36ca1095`; crate gate green (496 tests) | D6/D8 amended with the builder's bounds; G102/G103 queued; combined panel after G-B and G-C |
+| G-A | coder note | Minor | `truncate` charges a control char one cell; `clean` strips `is_control` only (bidi/format filter stays out of track) | ratified |
+| G-A | coder note | Minor | G15 dedups before the cap (a million identical traits fold to one); G17 drops the cursor at 16 full pages | ratified; D6 amended |
+| G-A | coder note | Minor | G22 also groups legacy `scan.discover` nodes and re-finds the Nodes cursor by id on every fold; legacy `Enter` reads the grouped node | ratified (AC3 kept, `scan_surface` green) |
+| G-A | coder note | Minor | G31 drops the scheme's default port (`:443` on https); the Task 9 pin moved to `:8443` | ratified; D8 amended |
+| G-A | coder note | Minor | G45 one `PROFILE_LIST_MAX = 64` for `target.l4`, `audit.ignore`, `l4.seeds`; L4 `ip` within `SELECTOR_MAX` | ratified; D6 amended |
+| G-A | coder note | Minor | G46 a mismatching `saved` skips the toast but still refreshes the list; the builtin save-as test's reply now names the draft | ratified |
+| G-A | coder note | Minor | G49 `set_text(Name)` refuses an empty name; G67 let-else applies to any launch reply with no pending; G83 `healed` cleared when the 40-tick list request fires | ratified |
+| G-A | coder note | Minor | `ScanError::new` cleans the whole message once before truncating | accepted (error path) |
 
 ## Shipped
 
