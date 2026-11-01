@@ -161,7 +161,8 @@ crates/aitm-scan-http/
      `MAX_EXAMPLE_CHARS: usize = 64`, `MAX_SAFE_URL_CHARS: usize = 256`,
      `MAX_HELD_FLOWS: usize = 16`, `MAX_AWAIT: Duration = Duration::from_secs(30)`,
      `CANARY_EVERY: u32 = 25`, `MAX_SESSION_MONITORS: usize = 16`,
-     `MAX_HELD_CRAWL_BODY: usize = 64 * 1024`, `MARK_CRAWL: &str = "crawl"`; added later:
+     `MAX_HELD_CRAWL_BODY: usize = 64 * 1024` (removed in round 3, d04362d4: held crawl copies carry
+     no response body at all), `MARK_CRAWL: &str = "crawl"`; added later:
      `USER_AGENT: &str = "aitm-scan"` (Task 20 hoist), `JOB_MARK_PREFIX`/`job_mark()` and
      `MAX_STORED_FLOWS: usize = 2048` (panel fix round).
   5. `hash.rs`: `pub(crate) fn fnv1a64(bytes: &[u8]) -> u64` (FNV-1a, 64-bit, offset basis
@@ -871,7 +872,7 @@ crates/aitm-scan-http/
   pub(crate) async fn prime_session(browser: &dyn BrowserDriver, origin: &Url, material: &SessionMaterial, job: &dyn JobCtx) -> anyhow::Result<Vec<String>>   // charge(1), navigate(origin root), eval each browser_cookie_statement, eval "document.cookie", return browser_partial names (caller logs at warn: names only)
   pub(crate) const CLICKABLES_JS: &str   // one expression, marked `/*aitm-clickables*/`, returning up to MAX_CLICKABLES_LISTED objects {selector, text} for `a[href^="javascript:"], [onclick], button:not([type=submit]), [role=button], [data-href]`, each selector a unique tag:nth-child chain from <body>; no network, no mutation
   pub(crate) fn tag_form_js(index: usize) -> String       // sets data-aitm-form="<index>" on document.forms[index]
-  pub(crate) fn submit_form_js(index: usize) -> String    // document.forms[index].requestSubmit ? requestSubmit() : submit()
+  pub(crate) fn submit_form_js(index: usize) -> String    // round 3 (3856cf71): selects form[data-aitm-form="index"], re-reads its live action, refuses an off-origin action in the same eval, submits via HTMLFormElement.prototype.requestSubmit/submit.call(f), returns {ok, action}; the lane re-checks form_action on it and counts forms_skipped otherwise
   pub(crate) fn field_selector(form_index: usize, name: &str) -> String   // form[data-aitm-form="i"] [name="<escaped>"]
   ```
   Per page: cancel/time/`max_pages` checks as in Task 17; `attempts += 1`; `permit =
@@ -1306,6 +1307,9 @@ Kept by the main session during stage 6. One row per finding.
 | fix range | Quality (re-review) | Minor | `LiveForm::as_spec` duplicates the extractor's form normalisation; `MonitorTable` invariants inline; fifth `tchar` copy; `StoreDiff` built field-by-field; `StopReason` `NoBrowser`/`Display` story; dead `is_empty`s; misplaced test doc; two token predicates | fix round 3 (R-M5 uses `aitm_core::header::is_valid_name`; the rhai/poc `tchar` copies are a follow-up outside this track) |
 | fix range | Quality (re-review) | - | Files rewritten in the worktree mid-review | the concurrent Tester's instructed mutation checks (reverted byte-for-byte); the final panel runs on a quiesced tree |
 | fix range | Spec (re-review) | Minor | Plan text behind the fixes: Task 10 path naming, Task 4 raw-text set, `MAX_LOST_MONITOR_IDS` outside `limits.rs`, Task 16/18/20 and A14/A19 signature drift | plan amended in this commit; constant moved in round 3 |
+| fix range | Security (re-review) | Important | R-I1 (see above) | fixed in 3856cf71 (tagged element, prototype calls, in-eval origin check, lane re-check; doubles `gone_at_submit`/`with_action_at_submit`) |
+| round 3 | Coder (stage 4) | Minor | `{token}` placeholder tripped `is_secret_key` (bare `token`), which would have dropped every opaque-token point as a Session point; `MAX_HELD_CRAWL_BODY` became dead once held copies drop the body; `client.rs` test edited (one assertion) for R-M3 | accepted by the orchestrator 2026-11-01: `points::is_placeholder` shields template placeholders from the secret vocabulary (ab9c34d9); constant removed (d04362d4); test edit in scope of R-M3 |
+| round 3 | Coder (stage 4) | - | R-M1 ab9c34d9, R-M2 49ca4bc0, R-M3 d04362d4, R-M4 e5c88a97, R-M5 d61db8b6, R-M6 98067232, R-M7 70fb31ac, R-M8 6ebae63f, R-M9 e0e41c7f, R-M10 27afeff1 | fixed |
 
 ## Shipped
 
