@@ -281,14 +281,14 @@ impl StreamHost {
     fn mint_permit(&self) -> Result<L4Permit, HostError> {
         let ep = self.point.endpoint;
         let Some(guard) = self.guard.as_ref() else {
-            return Err(HostError::Guard(
+            return Err(self.guard_refusal(
                 "scan: refused_l4: L4 is disabled (l4.enabled: false); the stream lane sends \
                  nothing"
                     .to_string(),
             ));
         };
         if ep.ip.is_loopback() && guard.self_ports().contains(&ep.port) {
-            return Err(HostError::Guard(format!(
+            return Err(self.guard_refusal(format!(
                 "scan: out_of_scope: {}:{} is one of the core's own listener ports",
                 ep.ip, ep.port
             )));
@@ -307,7 +307,28 @@ impl StreamHost {
                     },
                 },
             )
-            .map_err(|e| HostError::Guard(guard_message(&e)))
+            .map_err(|e| self.guard_refusal(guard_message(&e)))
+    }
+
+    /// Record a guard refusal and return it (spec S9, SPEC-I3).
+    ///
+    /// Every refusal is the lane being told it may not send, which an
+    /// operator must see without turning on debug logging — so each one is
+    /// one WARN line carrying the point, the job, the endpoint and the D3
+    /// reason, and no byte of a case, a seed or a reply (C11).
+    fn guard_refusal(&self, reason: String) -> HostError {
+        tracing::warn!(
+            point = %self.point.point.id,
+            job = %self.state.job_id,
+            endpoint = %format_args!(
+                "{ip}:{port}",
+                ip = self.point.endpoint.ip,
+                port = self.point.endpoint.port,
+            ),
+            reason = %reason,
+            "l4 stream guard refusal"
+        );
+        HostError::Guard(reason)
     }
 
     /// Take one of the job's [`crate::state::MAX_CONNECTIONS`] connection
@@ -367,7 +388,7 @@ impl StreamHost {
                     rate_waits += 1;
                     self.state.rate_waits.fetch_add(1, Ordering::SeqCst);
                     if rate_waits > MAX_RATE_WAITS {
-                        return Err(HostError::Guard(guard_message(
+                        return Err(self.guard_refusal(guard_message(
                             &L4GuardError::InjectionRateExceeded { retry_after },
                         )));
                     }
@@ -390,7 +411,7 @@ impl StreamHost {
                         .fetch_add(1, Ordering::SeqCst);
                     return Err(HostError::TooLarge);
                 }
-                Err(ClientError::Guard(e)) => return Err(HostError::Guard(guard_message(&e))),
+                Err(ClientError::Guard(e)) => return Err(self.guard_refusal(guard_message(&e))),
                 Err(ClientError::DryRun) => return Err(HostError::DryRun),
                 Err(e) => return Err(HostError::Connect(e.to_string())),
             }

@@ -433,6 +433,18 @@ async fn run(
         stop = %campaign.stopped.token(),
         "l4 stream campaign finished"
     );
+    if campaign.stopped == StopReason::TargetDown {
+        // The one stop an operator must see without turning on debug
+        // logging: the target stopped answering and did not come back
+        // (spec S9, SPEC-I3). Ids and counts only, never a byte.
+        tracing::warn!(
+            point = %point.id,
+            job = %job.job_id,
+            cases_sent = campaign.cases_sent,
+            recovery_window_s = RECOVERY_WINDOW.as_secs(),
+            "l4 stream target did not recover"
+        );
+    }
     Ok(campaign)
 }
 

@@ -125,6 +125,13 @@ fn payload(bytes: &[u8]) -> Payload {
     }
 }
 
+/// Held for as long as a test reads the captured tracing lines.
+///
+/// `common::capture_tracing` shares one process-wide sink and clears it on
+/// every call, so two tests in this binary reading it at once would wipe each
+/// other's lines. They take this in turn instead.
+static TRACING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The lane's check with this catalogue id.
 fn check_by_id(checks: &[Arc<dyn Check>], id: &str) -> Arc<dyn Check> {
     checks
@@ -796,6 +803,7 @@ async fn self_port_exclusion() {
 /// the fourth.
 #[tokio::test]
 async fn discovery_line_reports_its_counts() {
+    let _serial = TRACING.lock().await;
     let (_guard, lines) = common::capture_tracing();
 
     let seeds = hex_seeds(&[
@@ -972,6 +980,7 @@ async fn a_skipped_profile_seed_is_counted_and_named() {
     use aitm_core::FlowId;
     use aitm_scan_model::FlowRef;
 
+    let _serial = TRACING.lock().await;
     let (_guard, lines) = common::capture_tracing();
 
     // Port 9008 is this test's alone: the capture sink is global and the
@@ -1052,4 +1061,112 @@ async fn a_skipped_profile_seed_is_counted_and_named() {
         verdict.detail
     );
     assert_eq!(client.count(), 0, "a passed deadline opens no exchange");
+}
+
+// ---------------------------------------------------------------------------
+// SPEC-I3 / S9: a refusal and a dead target are warned about
+// ---------------------------------------------------------------------------
+
+/// The two things an operator must see without turning on debug logging: the
+/// guard refusing to let the lane send, and a target that stopped answering.
+///
+/// Both lines are WARN, and both carry ids, counts and a reason only — no
+/// byte of a case or a reply (spec S9, C11).
+#[tokio::test]
+async fn a_guard_refusal_and_a_dead_target_are_warned() {
+    let _serial = TRACING.lock().await;
+    let (_guard, lines) = common::capture_tracing();
+    let seeds = hex_seeds(&[b"abc"]);
+
+    // (1) The A1 self-port re-check, which refuses after discovery and opens
+    // no socket.
+    let guard = common::wildcard_guard(&[9009]);
+    let client = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", 9009, Some("raw"), 10, &seeds);
+    let (lane, job, found) = discover_with(
+        Some(Arc::clone(&guard)),
+        Arc::clone(&client),
+        profile,
+        "22warn",
+    )
+    .await;
+    let discovery = found.expect("discovery before the listener bound");
+    let point = &discovery.points[0];
+    let host = lane
+        .probe_host_for(point, Arc::clone(&job))
+        .expect("the lane hosts the point");
+    guard.add_self_ports([9009]);
+    let error = host
+        .probe(&payload(b"abc"))
+        .await
+        .expect_err("the lane never probes the core's own listener");
+    assert!(
+        matches!(error.downcast_ref::<HostError>(), Some(HostError::Guard(_))),
+        "{error}"
+    );
+    assert_eq!(client.count(), 0, "a refusal opens no exchange");
+
+    let recorded = lines.lock().expect("the capture sink").clone();
+    assert!(
+        !recorded.is_empty(),
+        "the capture recorded nothing at all, so nothing below is proven"
+    );
+    let warned: Vec<&String> = recorded
+        .iter()
+        .filter(|line| line.starts_with("WARN ") && line.contains("listener ports"))
+        .collect();
+    assert_eq!(
+        warned.len(),
+        1,
+        "one WARN for the guard refusal: {recorded:?}"
+    );
+    assert!(
+        warned[0].contains(&point.id),
+        "the WARN names the point: {}",
+        warned[0]
+    );
+
+    // (2) A target that is not there at all: nothing listens on 9010, so the
+    // campaign's first connect fails and the campaign stops `target_down`.
+    let (_guard2, lines) = common::capture_tracing();
+    let client = Arc::new(CountingClient::live());
+    let profile = profile_for("127.0.0.1", 9010, Some("raw"), 10, &seeds);
+    let (lane, job, found) = discover_with(
+        Some(common::wildcard_guard(&[9010])),
+        Arc::clone(&client),
+        profile,
+        "22down",
+    )
+    .await;
+    let discovery = found.expect("discovery opens no socket, so it succeeds");
+    let point = &discovery.points[0];
+    let host = lane
+        .probe_host_for(point, Arc::clone(&job))
+        .expect("the lane hosts the point");
+    let verdict = check_by_id(&lane.checks(), "l4-crash")
+        .run(point, host.as_ref())
+        .await;
+    assert!(
+        verdict.detail.contains("stop=target_down"),
+        "a target that never answers stops the campaign: {}",
+        verdict.detail
+    );
+
+    let recorded = lines.lock().expect("the capture sink").clone();
+    let warned: Vec<&String> = recorded
+        .iter()
+        .filter(|line| {
+            line.starts_with("WARN ") && line.contains("target") && line.contains("recover")
+        })
+        .collect();
+    assert_eq!(
+        warned.len(),
+        1,
+        "one WARN for the target that never came back: {recorded:?}"
+    );
+    assert!(
+        warned[0].contains(&point.id),
+        "the WARN names the point: {}",
+        warned[0]
+    );
 }
