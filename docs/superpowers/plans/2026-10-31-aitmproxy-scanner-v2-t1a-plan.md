@@ -792,4 +792,31 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+- **Merged:** PR #213 `feat(scanner-v2): T1a contract drop`, squash `1f1cec4` on main (2026-11-01),
+  after merging main at `a8663ef8` (v0.5.6), `c8cf56a5` (v0.5.8) and `f2c9d70b`. All twelve tasks
+  landed: `crates/aitm-scan-model` (D2 types, traits, seven built-in profiles, 22-file fixture pack),
+  the five lane-crate skeletons plus the `aitm-scan-checks-http` checks slot, `wire.rs`/`main.rs`
+  slot collection and the `ScannerPlugin::with_lanes/with_native_checks` setters, `aitm-core`
+  `SendOptions`/`ProxyClient::send_opts`/`RequestSender::send_with` with the real `PipelineClient`
+  implementation and `LateHandles` forwarding, the L4 guard `interface: "*"` wildcard through
+  `interface_covers` in the guard, the capture filter and the confirm summary, and the workspace
+  dependency entries the lanes inherit.
+- **Proof:** Terminal gate `GATE_EXIT=0` on every head (final: 253 test binaries ok, 0 failed, with
+  the known load-sensitive Rhai budget test passing on the no-fail-fast re-run); real-boot proof
+  `python3 tests/e2e/run.py smoke mcp` 6/6 on the final head; `cargo tree -p aitm --depth 1`
+  shows the six scan crates linked. No bus verb added; `tools/list` unchanged.
+- **Panel:** security / quality / spec PASS on the full range and PASS again on the fix range;
+  tester PASS; every finding and disposition in the Review log above. No open findings.
+- **Cut:** nothing from the plan. Deferred by decision: `L4Seed` strictness beyond the key-naming
+  errors (accepted), the `main.rs` ws-language slot has no hermetic test (covered by the real boot
+  and T4's live cells), `serde_yaml` stays until a maintained successor is chosen.
+- **Follow-ups (handed to later tracks, recorded in the Review log):** a single token table and unit
+  error type for `ScanErrorCode` (T1b, done on its branch), a `testing` module of null stubs in
+  the model crate (T1b), refusing nameless/targetless profiles at `scan.start` (T1b, done),
+  redacting the query component of `RawProbe.url` before any log line (T2), refactoring the
+  per-language `poc_step` block in `main.rs` when a third language lands (T5/T6).
+- **Lessons:** `start_session` with `source_branch` cut sibling tracks from a stale point of the
+  branch, so every track was messaged the exact SHA to merge; the `Cargo.lock` is a derived file
+  that every task editing a manifest regenerates; a swarm of ten worktrees fills a volume with
+  40 to 57 GiB `target/` directories each, so idle worktrees' build caches are cleared as a
+  matter of course.
