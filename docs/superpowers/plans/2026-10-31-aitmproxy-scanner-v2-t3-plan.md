@@ -142,6 +142,15 @@ edits `lib.rs`; (2) every check constructor named in Tasks 5, 7, 8 and 9 is `pub
 (the text below is updated accordingly); (3) Task 10 still owns `catalogue.rs` and
 `lib.rs` doc comments only.
 
+
+**Amendment A2 (T3 session, 2026-11-01, from the Task 5 report).** The open-redirect
+`PocHint` regex is `(?im)^location:\s*.*aitm-redirect\.invalid` (multi-line flag added):
+`aitm_poc`'s `MatchPart::Header` is every header joined with `\n`, so the plan's
+`(?i)` form would match only when `Location` is the first header and the finding
+record would silently never be written. `.` does not cross `\n`, so the match stays
+on the `Location` line (test `the_location_matcher_is_multiline_and_line_bounded`).
+The hint also carries `control: Some(ControlHint { payload: "/", expect: [Not(<canary regex>)] })`.
+
 ### Waves
 
 Tasks inside a wave touch disjoint files and fan out to parallel coders.
@@ -1329,6 +1338,11 @@ Kept by the main session during stage 6. One row per finding.
 |---|---|---|---|---|
 | 1 | Coder (Task 1 report) | Important | A forced `H1`/`H2` send wrote the ALPN cache, so a later `Auto` send offered only the forced protocol for the TTL | Fixed by plan amendment: Task 3 item 5 narrows cache writes to `Auto` exchanges, test `a_forced_h1_send_does_not_pollute_the_alpn_cache` |
 | 2 | Coder (Task 2 report) | Minor | Plan wording implied the median-baseline correction affects the timing verdict; subtracting a constant moves only the intercept, which `Timing` does not carry | Accepted (T3 session 2026-11-01): behaviour as specified; `fit` doc states it; tests pin slope/r invariance and the median itself |
+| 5 | Coder (Task 5 report) | Important | Plan's open-redirect PoC regex lacked the multi-line flag; against `aitm_poc`'s joined header block the reproduction would fail and no `FindingRecord` would be written | Fixed in d329c3de (`(?im)`); recorded as amendment A2 |
+| 5 | Coder (Task 5 report) | Minor | XSS tag is `"aitm" + host.marker()`; T1b's marker fixtures already start with `aitm`, so the live canary may read `aitmaitm7f3a` | Accepted (T3 session 2026-11-01): cosmetic, still unique; revisit when T1b's marker format is final |
+| 5 | Coder (Task 5 report) | Minor | `may_send` (cancel/budget/deadline gate) duplicated in `xss.rs` and `redirect.rs`; Tasks 7-9 will want it too | Open: fold into a shared helper in the fix round after Tasks 7-9 land |
+| 1,3 | Tester (Tasks 1 and 3) | Important | A timed-out h2 exchange leaves the stalled connection pooled: the outer `send_impl` timeout drops the inner future before `pool.remove` runs, so later sends to that authority burn the full timeout (test `a_timed_out_exchange_drops_the_still_open_connection_from_the_pool`, `#[ignore]`d) | Fix task F1 dispatched 2026-11-01 |
+| 1,3 | Tester (Tasks 1 and 3) | Minor | ALPN cache TTL (10 min) is untestable without a seam | Fix task F1: `with_alpn_cache_ttl(Duration)` builder + test |
 | 3 | Coder (Task 3 report) | Minor | ALPN cache and h2 pool are keyed by `host:port` without scheme; one sender driving `http://h:p` (h2c) and `https://h:p` would collide on one key | Open for the panel: proposed fix is a `scheme://host:port` key in both maps (one line each) in the fix round |
 | 1,2,4 | Coder (Tasks 2 and 4 reports) | Important (process) | Parallel coders share one git index; a `git add <path>` + bare `git commit` swept a sibling's staged files into commit 25a42279 | Fixed by the Task 4 coder (rebuilt as 013a338e, single file); every later brief requires `git commit -- <paths>`; orchestrator audits each commit's stat |
 
