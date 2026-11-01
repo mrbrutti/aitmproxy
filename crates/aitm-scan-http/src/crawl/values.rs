@@ -65,31 +65,42 @@ pub(crate) fn value_for(field: &FieldSpec, marker: &str, origin: &str) -> Option
     }
 }
 
-/// Every name/value pair a crawl submission of `form` sends, in document
-/// order.
+/// The controls a crawl submission of `form` fills, in document order, with
+/// each checkbox or radio group reduced to the one member a browser submits.
 ///
-/// One pair per name for checkbox and radio groups — the checked member if the
-/// page checked one, else the first — at the position the group first appears.
-/// Controls [`value_for`] cannot fill are skipped, exactly as a browser omits
-/// an unset file input.
-pub(crate) fn form_pairs_for(form: &FormSpec, marker: &str, origin: &str) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
+/// One member per group name — the checked member if the page checked one,
+/// else the first — at the position the group first appears; every other
+/// control as it stands. This is the group rule, written once for both
+/// engines (Q7): the client engine turns the result into pairs through
+/// [`form_pairs_for`], the browser engine fills each chosen control in the
+/// live page.
+pub(crate) fn chosen_fields(form: &FormSpec) -> Vec<&FieldSpec> {
+    let mut chosen = Vec::new();
     let mut groups_done: HashSet<&str> = HashSet::new();
 
     for field in &form.fields {
-        let chosen = if is_group(&field.kind) {
+        if is_group(&field.kind) {
             if !groups_done.insert(field.name.as_str()) {
                 continue;
             }
-            group_member(form, &field.name).unwrap_or(field)
+            chosen.push(group_member(form, &field.name).unwrap_or(field));
         } else {
-            field
-        };
-        if let Some(value) = value_for(chosen, marker, origin) {
-            pairs.push((field.name.clone(), value));
+            chosen.push(field);
         }
     }
-    pairs
+    chosen
+}
+
+/// Every name/value pair a crawl submission of `form` sends, in document
+/// order: one per [`chosen_fields`] member [`value_for`] can fill. Controls it
+/// cannot fill are skipped, exactly as a browser omits an unset file input.
+pub(crate) fn form_pairs_for(form: &FormSpec, marker: &str, origin: &str) -> Vec<(String, String)> {
+    chosen_fields(form)
+        .into_iter()
+        .filter_map(|field| {
+            value_for(field, marker, origin).map(|value| (field.name.clone(), value))
+        })
+        .collect()
 }
 
 /// Whether a control is one of a named group of which a browser submits at
@@ -236,6 +247,52 @@ mod tests {
         assert_eq!(
             seen,
             vec![("q", "aitm-7f3a"), ("s", "a"), ("h", "1"), ("r", "x"),]
+        );
+    }
+
+    /// Q7: the one group rule both engines iterate. One member per checkbox
+    /// or radio name — the checked one, else the first — at the position the
+    /// group first appears; every other control in document order.
+    #[test]
+    fn chosen_fields_pins() {
+        let form = task4_form();
+        let chosen: Vec<(&str, Option<&str>, bool)> = chosen_fields(&form)
+            .into_iter()
+            .map(|f| (f.name.as_str(), f.value.as_deref(), f.checked))
+            .collect();
+        assert_eq!(
+            chosen,
+            vec![
+                ("q", None, false),
+                ("s", None, false),
+                ("h", Some("1"), false),
+                ("r", Some("x"), true),
+            ]
+        );
+
+        let unchecked = FormSpec {
+            index: 0,
+            action: None,
+            method: "POST".to_string(),
+            enctype: None,
+            fields: vec![
+                field("r", FieldKind::Radio, Some("x"), &[], false),
+                field("c", FieldKind::Checkbox, Some("1"), &[], false),
+                field("r", FieldKind::Radio, Some("y"), &[], true),
+                field("c", FieldKind::Checkbox, Some("2"), &[], false),
+                field("f", FieldKind::File, None, &[], false),
+            ],
+        };
+        let chosen: Vec<(&str, Option<&str>)> = chosen_fields(&unchecked)
+            .into_iter()
+            .map(|f| (f.name.as_str(), f.value.as_deref()))
+            .collect();
+        // `r` takes its checked member `y` at the group's first position; `c`
+        // has none checked and takes its first; the file control is kept for
+        // the caller to judge.
+        assert_eq!(
+            chosen,
+            vec![("r", Some("y")), ("c", Some("1")), ("f", None)]
         );
     }
 

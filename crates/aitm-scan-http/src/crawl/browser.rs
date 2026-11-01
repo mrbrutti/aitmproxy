@@ -53,11 +53,11 @@ use aitm_scan_model::{JobCtx, SessionMaterial};
 use futures::future::BoxFuture;
 use url::Url;
 
-use crate::crawl::extract::{extract, Extracted, FieldKind, FieldSpec, FormSpec};
+use crate::crawl::extract::{extract, Extracted, FieldKind, FormSpec};
 use crate::crawl::frontier::{
     fingerprint, held_copy, remaining, CrawlReport, Crawler, Frontier, Limits, StopReason,
 };
-use crate::crawl::values::{form_action, value_for};
+use crate::crawl::values::{chosen_fields, form_action, value_for};
 use crate::limits::{
     job_mark, MARK_CRAWL, MAX_CLICKABLES_LISTED, MAX_DOM_BYTES, SETTLE_MAX_MS, SETTLE_POLL_MS,
 };
@@ -727,12 +727,13 @@ impl<'a> Run<'a> {
     /// (`select`, `checkbox`, `radio`) is set through an expression. Hidden
     /// controls keep what the page put there — that is where the CSRF token
     /// lives — and a file input is left empty, exactly as a browser submits it.
+    /// Checkbox and radio groups come pre-reduced by [`chosen_fields`] to the
+    /// one member a browser submits (Q7).
     async fn fill_form(&self, form: &FormSpec) {
         let origin = self.origin.as_str();
         let marker = self.job.marker();
-        let mut groups: HashSet<&str> = HashSet::new();
 
-        for field in &form.fields {
+        for field in chosen_fields(form) {
             if field.name.is_empty() {
                 continue;
             }
@@ -741,11 +742,10 @@ impl<'a> Run<'a> {
                 // The page's own value is already in the DOM.
                 FieldKind::Hidden | FieldKind::File => continue,
                 FieldKind::Checkbox | FieldKind::Radio => {
-                    if !groups.insert(field.name.as_str()) {
-                        continue;
-                    }
-                    // A group the page already checked keeps the page's choice.
-                    if group_checked(form, &field.name) {
+                    // The chosen member is the one the page checked, in which
+                    // case the page's choice stands, or else the group's first
+                    // member, which is the one the selector's first match is.
+                    if field.checked {
                         continue;
                     }
                     let _ = bounded(self.job, self.browser.eval(&set_checked_js(&selector))).await;
@@ -987,13 +987,6 @@ impl<'a> Run<'a> {
         };
         self.report
     }
-}
-
-/// Whether the `name` group of `form` already has a member the page checked.
-fn group_checked(form: &FormSpec, name: &str) -> bool {
-    form.fields
-        .iter()
-        .any(|field: &FieldSpec| field.name == name && field.checked)
 }
 
 /// `text` cut to at most `max` bytes on a char boundary.
