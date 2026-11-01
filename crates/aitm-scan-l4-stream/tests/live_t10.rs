@@ -34,8 +34,8 @@ use aitm_scan_l4_stream::client::{StreamClient, TokioStreamClient};
 use aitm_scan_l4_stream::lane_with_client;
 use aitm_scan_l4_stream::state::JobState;
 use aitm_scan_model::{
-    builtin_profiles, Confidence, InsertionPoint, JobCtx, L4TargetSpec, L4Transport, Lane, Outcome,
-    ProfileTarget, ScanProfile, Verdict,
+    builtin_profiles, Confidence, InsertionPoint, JobCtx, L4Seed, L4TargetSpec, L4Transport, Lane,
+    Outcome, ProfileTarget, ScanProfile, Verdict,
 };
 use serde_json::{json, Value};
 
@@ -167,6 +167,11 @@ struct PointVerdict {
     path: String,
     check: String,
     verdict: Verdict,
+    /// Unix ms either side of `Check::run`, so a verdict can be correlated
+    /// with T10's `closes` entries. T10 stamps its rings from the same clock
+    /// (`log.rs` `now_ms`, `SystemTime` since the epoch).
+    started_ms: u64,
+    ended_ms: u64,
 }
 
 /// Drive the lane against one speaker, then read T10's log for it.
@@ -184,6 +189,17 @@ async fn run_service(origin: &str, mode: &str, name: &str, service: &Service) ->
     let guard = wildcard_guard(&[service.port]);
     let profile = profile_for(service);
     let target: ProfileTarget = profile.target.clone();
+    // Lengths only, never the seed bytes themselves (C11): enough to show the
+    // TLV corpus had three distinct lengths for inference to work on.
+    let seed_lengths: Vec<usize> = profile
+        .l4
+        .seeds
+        .iter()
+        .map(|seed| match seed {
+            L4Seed::Hex { hex } => hex.len() / 2,
+            _ => 0,
+        })
+        .collect();
     let job_id = format!("live-{name}");
     let lane = lane_with_client(
         Some(guard),
@@ -225,13 +241,17 @@ async fn run_service(origin: &str, mode: &str, name: &str, service: &Service) ->
                     continue;
                 }
             };
+            let started_ms = now_ms();
             let verdict = check.run(point, host.as_ref()).await;
+            let ended_ms = now_ms();
             let proving = verdict.outcome == Outcome::Vulnerable && PROVING_CLASSES.contains(&id);
             verdicts.push(PointVerdict {
                 point_id: point.id.clone(),
                 path: path.clone(),
                 check: id.to_string(),
                 verdict,
+                started_ms,
+                ended_ms,
             });
             // V mode: the fault is proven; stop driving this speaker rather
             // than keep hammering a service that is already down for its
@@ -341,8 +361,20 @@ async fn run_service(origin: &str, mode: &str, name: &str, service: &Service) ->
         ));
     }
 
+    // F3: why the lane chose the grammar it spoke. For TLV this is the proof
+    // that S4 inference ran over the seed corpus rather than a name being
+    // taken on trust.
+    let selection = selection_text(state.as_ref());
+    if service.grammar == "tlv" && !selection.starts_with("inferred ") {
+        failures.push(format!(
+            "{name}: TLV must reach its grammar by S4 inference over the seed corpus, but selection was `{selection}` (an ephemeral port colliding with a default-port convention would do this)",
+        ));
+    }
+
     let summary = format!(
-        "LIVE {mode} {name} grammar={grammar} points={points_run}/{points_found} cases={cases} vulnerable=[{vulnerable}] downtime={downtime} denylisted={denylisted} max_bps={max_bps} accepts={accepts}",
+        // `selection` is prose with spaces, so it is quoted and goes last,
+        // leaving every other field positionally parseable.
+        "LIVE {mode} {name} grammar={grammar} points={points_run}/{points_found} cases={cases} vulnerable=[{vulnerable}] downtime={downtime} denylisted={denylisted} max_bps={max_bps} accepts={accepts} selection=\"{selection}\"",
         grammar = service.grammar,
         cases = state
             .as_ref()
@@ -360,16 +392,21 @@ async fn run_service(origin: &str, mode: &str, name: &str, service: &Service) ->
         "grammar": service.grammar,
         "addr": service.addr,
         "proto": transport_name(service.proto),
-        "selection": state.as_ref().map(|state| {
+        "selection": selection,
+        "selection_by_node": state.as_ref().map(|state| {
             locked(&state.selection)
                 .iter()
                 .map(|(node, why)| (node.clone(), Value::String(why.clone())))
                 .collect::<serde_json::Map<String, Value>>()
         }),
+        "seed_lengths": seed_lengths,
         "points_found": points_found,
         "points_run": points_run,
         "stopped_at": stopped_at,
-        "verdicts": verdicts.iter().map(verdict_json).collect::<Vec<Value>>(),
+        "verdicts": verdicts
+            .iter()
+            .map(|entry| verdict_json(entry, &observed.close_events))
+            .collect::<Vec<Value>>(),
         "counters": state.as_ref().map(counters_json),
         "observer": observed.to_json(),
     });
@@ -390,13 +427,41 @@ fn profile_for(service: &Service) -> ScanProfile {
     profile.l4.cases = CASES;
     profile.l4.max_bytes_per_s = MAX_BYTES_PER_S;
     profile.l4.reproduce_count = REPRODUCE_COUNT;
+
+    // F3. The seven registry grammars generate their own example message, so
+    // naming the grammar is enough. TLV has no fixed shape to generate from:
+    // without captured flows or operator seeds the corpus is empty and
+    // discovery yields zero points, which is what the first real run saw.
+    //
+    // So TLV gets a seed corpus *and* no grammar name, because those are two
+    // halves of one thing: `select_grammar` short-circuits on a named grammar
+    // and returns the registry's TLV with reason `named`, skipping inference
+    // altogether. Leaving the name off sends selection down the S4 inference
+    // path over these seeds, which is what T6-1 asks to see — the 2-byte
+    // big-endian length relation recovered from the corpus, reported in the
+    // `selection=` field of the `LIVE` line.
+    let named_grammar = if service.grammar == "tlv" {
+        // T10's own benign TLV exchange shape at three distinct body lengths
+        // (3, 1, 5); inference refuses `too_few_seeds` under two, and needs
+        // the lengths to differ to recover the relation.
+        profile.l4.seeds = ["0003616263", "0001ff", "00050102030405"]
+            .into_iter()
+            .map(|hex| L4Seed::Hex {
+                hex: hex.to_string(),
+            })
+            .collect();
+        None
+    } else {
+        Some(service.grammar.clone())
+    };
+
     profile.target = ProfileTarget {
         origins: Vec::new(),
         l4: vec![L4TargetSpec {
             ip: service.ip.clone(),
             port: service.port,
             proto: service.proto,
-            grammar: Some(service.grammar.clone()),
+            grammar: named_grammar,
         }],
     };
     profile
@@ -408,7 +473,16 @@ fn profile_for(service: &Service) -> ScanProfile {
 
 /// One verdict as JSON: the `L4Evidence` without `sent_hex`, which is replaced
 /// by its byte length (C11: no message byte leaves this process).
-fn verdict_json(entry: &PointVerdict) -> Value {
+fn verdict_json(entry: &PointVerdict, closes: &[(u64, String)]) -> Value {
+    // Only for a finding, and only the reasons: which connections T10 tore
+    // down while this check was running, and why.
+    let closes_during = (entry.verdict.outcome == Outcome::Vulnerable).then(|| {
+        closes
+            .iter()
+            .filter(|(ts_ms, _)| (entry.started_ms..=entry.ended_ms).contains(ts_ms))
+            .map(|(ts_ms, reason)| json!({ "ts_ms": ts_ms, "reason": reason }))
+            .collect::<Vec<Value>>()
+    });
     let evidence = entry.verdict.evidence.l4.as_ref().map(|l4| {
         json!({
             "sent_bytes": l4.sent_hex.len() / 2,
@@ -431,6 +505,8 @@ fn verdict_json(entry: &PointVerdict) -> Value {
         "confidence": confidence_name(entry.verdict.confidence),
         "detail": entry.verdict.detail,
         "l4_evidence": evidence,
+        "ran_ms": [entry.started_ms, entry.ended_ms],
+        "closes_during": closes_during,
     })
 }
 
@@ -513,6 +589,35 @@ fn transport_name(proto: L4Transport) -> &'static str {
     }
 }
 
+/// Why the lane chose the grammar it spoke, as `corpus::selection_text` wrote
+/// it into the job state.
+///
+/// One endpoint means one node and one entry; the entries are joined if a
+/// future run ever covers more, and a job that never got that far reads
+/// `none`.
+fn selection_text(state: Option<&Arc<JobState>>) -> String {
+    let Some(state) = state else {
+        return "none".to_string();
+    };
+    let selection = locked(&state.selection);
+    if selection.is_empty() {
+        return "none".to_string();
+    }
+    let mut texts: Vec<String> = selection.values().cloned().collect();
+    texts.sort();
+    texts.dedup();
+    texts.join("; ")
+}
+
+/// Unix epoch milliseconds, the same clock T10 stamps its rings with.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
+}
+
 /// A `JobState` mutex, read without caring about a poisoned lock.
 fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -535,6 +640,9 @@ struct Observed {
     classified: BTreeMap<String, u64>,
     denylisted: u64,
     closes: usize,
+    /// Every close with its `ts_ms` and `reason`, for correlating a verdict's
+    /// cases to the connections T10 tore down while they ran.
+    close_events: Vec<(u64, String)>,
     downtime_ms: Vec<i64>,
     /// Client->server bytes per `ts_ms / 1000` bucket.
     windows: BTreeMap<u64, u64>,
@@ -596,6 +704,15 @@ fn summarise(service: &Value, dropped: u64) -> Observed {
         accepts: rows(service, "accepts").len(),
         denylisted: classified.get("denylisted").copied().unwrap_or(0),
         closes: rows(service, "closes").len(),
+        close_events: rows(service, "closes")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["ts_ms"].as_u64().unwrap_or(0),
+                    entry["reason"].as_str().unwrap_or("unknown").to_string(),
+                )
+            })
+            .collect(),
         downtime_ms,
         max_bps: windows.values().copied().max().unwrap_or(0),
         windows,
@@ -809,6 +926,12 @@ fn observer_summarises_a_log() {
 
     assert_eq!(observed.accepts, 2);
     assert_eq!(observed.closes, 1);
+    // The close keeps its epoch stamp and reason, so a verdict's wall-clock
+    // window can pick it up.
+    assert_eq!(
+        observed.close_events,
+        vec![(2_300_u64, "trigger".to_string())]
+    );
     assert_eq!(observed.classified["ok"], 3);
     assert_eq!(observed.classified["trigger"], 1);
     assert_eq!(observed.denylisted, 0);
@@ -836,4 +959,73 @@ fn observer_summarises_a_log() {
         0,
     );
     assert_eq!(denied.denylisted, 1);
+}
+
+/// F3: the three TLV seed constants really do drive S4 inference to the
+/// 2-byte big-endian length relation the proof quotes.
+///
+/// Without this the seeds are shipped on faith: a corpus that fails inference
+/// falls back to `raw` and the live run quietly proves the wrong thing. Drives
+/// the lane's own `select_for`/`selection_text`, not a copy of them.
+#[test]
+fn tlv_seeds_infer_the_length_relation() {
+    use aitm_scan_l4_stream::corpus::{select_for, selection_text, Seed};
+
+    let profile = profile_for(&Service {
+        proto: L4Transport::Tcp,
+        ip: "127.0.0.1".to_string(),
+        port: 49_152,
+        addr: "127.0.0.1:49152".to_string(),
+        grammar: "tlv".to_string(),
+    });
+
+    // The profile names no grammar for TLV, so selection must infer one.
+    assert_eq!(profile.target.l4[0].grammar, None);
+
+    let seeds: Vec<Seed> = profile
+        .l4
+        .seeds
+        .iter()
+        .enumerate()
+        .map(|(i, seed)| {
+            let L4Seed::Hex { hex } = seed else {
+                panic!("the TLV corpus is hex seeds");
+            };
+            let bytes = (0..hex.len() / 2)
+                .map(|b| u8::from_str_radix(&hex[b * 2..b * 2 + 2], 16).expect("the seeds are hex"))
+                .collect();
+            Seed {
+                id: format!("hex:{i}"),
+                bytes,
+            }
+        })
+        .collect();
+
+    // Three seeds of three distinct body lengths: 3, 1 and 5.
+    assert_eq!(
+        seeds
+            .iter()
+            .map(|seed| seed.bytes.len())
+            .collect::<Vec<_>>(),
+        vec![5, 3, 7]
+    );
+
+    let selected = select_for(None, L4Transport::Tcp, 49_152, &seeds)
+        .expect("selection over a seeded TLV corpus succeeds");
+    assert_eq!(selected.grammar.name(), "tlv");
+    assert_eq!(
+        selection_text(&selected.reason),
+        "inferred 2-byte be length at offset 0 counting body only"
+    );
+
+    // Every other speaker still names its grammar and ships no seeds.
+    let resp = profile_for(&Service {
+        proto: L4Transport::Tcp,
+        ip: "127.0.0.1".to_string(),
+        port: 49_153,
+        addr: "127.0.0.1:49153".to_string(),
+        grammar: "resp".to_string(),
+    });
+    assert_eq!(resp.target.l4[0].grammar.as_deref(), Some("resp"));
+    assert!(resp.l4.seeds.is_empty());
 }
