@@ -89,10 +89,19 @@ fn banner_style(app: &App, theme: &Theme) -> ratatui::style::Style {
     }
 }
 
-/// The one-line state of the active tab (D11, D13): no scanner at all, the
-/// last error of this tab, a refresh in flight over an empty pane, or `idle`.
-/// The degraded wording of a bus that is missing one verb belongs to the tab
-/// that needs it, not here.
+/// What a legacy bus can say about profiles (D2).
+const PROFILES_DEGRADED: &str = "profiles need scan.profile.list (scanner v2)";
+
+/// What a legacy bus can say about issues (D2, literal fixed on panel review
+/// 2026-11-01).
+const ISSUES_DEGRADED: &str = "issues need scan.issues (scanner v2)";
+
+/// The one-line state of the active tab (D11, D13), in this order: no
+/// scanner at all, the last error of this tab, the tab's degraded text (a
+/// legacy bus, or a v2 bus missing the tab's verb), a refresh in flight over
+/// an empty pane, or `idle`. The banner is the one place a degraded state is
+/// written (D13: exactly one state on screen); the pane bodies never repeat
+/// it.
 fn banner(app: &App) -> String {
     if app.scan_offer() == ScanOffer::None {
         return NO_SCANNER.to_string();
@@ -100,22 +109,49 @@ fn banner(app: &App) -> String {
     if let Some(e) = tab_error(app) {
         return e.wording();
     }
+    if let Some(text) = degraded(app) {
+        return text;
+    }
     if let Some(verb) = refreshing(app) {
         return format!("refreshing {verb}...");
     }
     "idle".to_string()
 }
 
-/// The active tab's last error, falling back to the view's for a tab that
-/// keeps none of its own.
-fn tab_error(app: &App) -> Option<&crate::scan::ScanError> {
-    let own = match app.scan.tab {
-        ScanTab::Profiles => app.scan.profiles.error.as_ref(),
-        ScanTab::Jobs => None,
-        ScanTab::SiteMap => app.scan.sitemap.error.as_ref(),
-        ScanTab::Issues => app.scan.issues.error.as_ref(),
+/// The active tab's degraded text, when the bus cannot serve it (D2): on a
+/// legacy bus Profiles and Issues name what they need; on a v2 bus a tab
+/// whose own verb is missing names it. Jobs is not gated by a verb in D2 (a
+/// v2 bus has `scan.start` by definition), and the Site map on a legacy bus
+/// is the legacy result (D12), not degraded.
+fn degraded(app: &App) -> Option<String> {
+    let verb = match (app.scan_offer(), app.scan.tab) {
+        (ScanOffer::Legacy, ScanTab::Profiles) => return Some(PROFILES_DEGRADED.to_string()),
+        (ScanOffer::Legacy, ScanTab::Issues) => return Some(ISSUES_DEGRADED.to_string()),
+        (ScanOffer::V2, ScanTab::Profiles) => "scan.profile.list",
+        (ScanOffer::V2, ScanTab::SiteMap) => "scan.sitemap",
+        (ScanOffer::V2, ScanTab::Issues) => "scan.issues",
+        _ => return None,
     };
-    own.or(app.scan.last_error.as_ref())
+    (!app.has_tool(verb)).then(|| missing_verb(verb))
+}
+
+/// The active tab's last error, falling back to the view's for a tab that
+/// keeps none of its own. On a legacy bus the Jobs tab's error is the
+/// `scan.discover` failure the legacy state kept (fix round A, A13).
+fn tab_error(app: &App) -> Option<crate::scan::ScanError> {
+    let own = match app.scan.tab {
+        ScanTab::Profiles => app.scan.profiles.error.clone(),
+        ScanTab::Jobs if app.scan_offer() == ScanOffer::Legacy => app
+            .scan
+            .legacy
+            .error
+            .as_deref()
+            .map(|e| crate::scan::ScanError::from_message("scan.discover", e)),
+        ScanTab::Jobs => None,
+        ScanTab::SiteMap => app.scan.sitemap.error.clone(),
+        ScanTab::Issues => app.scan.issues.error.clone(),
+    };
+    own.or_else(|| app.scan.last_error.clone())
 }
 
 /// The verb the active tab is waiting on while its pane is still empty.

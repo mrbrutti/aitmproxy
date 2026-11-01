@@ -65,6 +65,14 @@ fn tab_texts(app: &mut App) -> Vec<(ScanTab, String)> {
         .collect()
 }
 
+/// The strip-and-banner row of the Scan view, without its trailing box edge
+/// and padding, so `ends_with` reads the banner's last word.
+fn banner_row(text: &str) -> &str {
+    line_with(text, "1 Profiles")
+        .unwrap_or_default()
+        .trim_end_matches(['│', ' '])
+}
+
 /// The tool names of every call (tagged or not) in `reqs`.
 fn called(reqs: &[BusRequest]) -> Vec<String> {
     reqs.iter()
@@ -128,6 +136,67 @@ fn legacy_bus_opens_on_jobs_with_the_one_shot_row_and_no_scan_calls() {
         profiles.contains("profiles need scan.profile.list (scanner v2)"),
         "Profiles is degraded on a legacy bus: {profiles}"
     );
+    // A3: the degraded text is the banner (D11), not `idle`, and it is the
+    // one state on screen (D13): the pane body does not repeat it.
+    let strip = banner_row(&profiles);
+    assert!(
+        strip.ends_with("profiles need scan.profile.list (scanner v2)"),
+        "the Profiles strip row ends with the degraded literal: {strip:?}"
+    );
+    assert!(
+        !strip.contains("idle"),
+        "a degraded tab is not idle: {strip:?}"
+    );
+    assert_eq!(
+        profiles
+            .matches("profiles need scan.profile.list (scanner v2)")
+            .count(),
+        1,
+        "exactly one state on screen (D13): {profiles}"
+    );
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let issues = text_of(&app, 200, 50);
+    let strip = banner_row(&issues);
+    assert!(
+        strip.ends_with("issues need scan.issues (scanner v2)"),
+        "the Issues strip row ends with the degraded literal: {strip:?}"
+    );
+    assert_eq!(
+        issues
+            .matches("issues need scan.issues (scanner v2)")
+            .count(),
+        1,
+        "exactly one state on screen (D13): {issues}"
+    );
+}
+
+/// Fix round A, A3 (D2, D13): on a v2 bus missing one tab's verb, the banner
+/// reads `<verb> is not on this bus` and nothing else on the tab repeats it.
+#[test]
+fn v2_bus_missing_a_tabs_verb_says_so_once_in_the_banner() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = connect(&mut app, &["scan.start", "scan.list", "scan.status"], None);
+    let _ = app.update(Action::OpenScan);
+    for (tab, verb) in [
+        (ScanTab::Profiles, "scan.profile.list"),
+        (ScanTab::SiteMap, "scan.sitemap"),
+        (ScanTab::Issues, "scan.issues"),
+    ] {
+        let _ = app.update(Action::ScanTab(tab));
+        let text = text_of(&app, 200, 50);
+        let strip = banner_row(&text);
+        let want = format!("{verb} is not on this bus");
+        assert!(
+            strip.ends_with(&want),
+            "{tab:?}: the strip row ends with {want:?}: {strip:?}"
+        );
+        assert_eq!(
+            text.matches(&want).count(),
+            1,
+            "{tab:?}: exactly one state on screen (D13): {text}"
+        );
+    }
 }
 
 /// D2, bottom row: no scanner at all. The sidebar has no Scan row (never land

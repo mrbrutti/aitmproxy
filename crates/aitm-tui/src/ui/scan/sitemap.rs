@@ -12,16 +12,16 @@ use ratatui::text::{Line, Span};
 use crate::app::App;
 use crate::scan::{MapPane, ScanOffer};
 use crate::theme::Theme;
-use crate::ui::scan::{missing_verb, note, pane_rule, panes};
+use crate::ui::scan::{note, pane_rule, panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, truncate};
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     match app.scan_offer() {
+        // The banner carries the no-scanner and missing-verb states; the
+        // body adds nothing to them.
         ScanOffer::None => {}
-        ScanOffer::V2 if !app.has_tool("scan.sitemap") => {
-            note(theme, area, &missing_verb("scan.sitemap"), buf)
-        }
+        ScanOffer::V2 if !app.has_tool("scan.sitemap") => {}
         ScanOffer::V2 if app.scan.sitemap.nodes.is_empty() => {
             note(theme, area, "no site map yet", buf)
         }

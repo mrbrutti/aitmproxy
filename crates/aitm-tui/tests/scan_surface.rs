@@ -498,3 +498,23 @@ fn first_esc_on_the_legacy_site_map_leaves_the_view() {
         "one Esc leaves the legacy Site map (D12)"
     );
 }
+
+/// Fix round A, A13: a refused or failed legacy crawl is drawn, not only
+/// stored. The Jobs tab's banner reads the reason as `scan.discover: <msg>`.
+#[test]
+fn a_failed_legacy_crawl_is_drawn_on_the_jobs_tab() {
+    let mut app = legacy_app(200, 50);
+    let _ = app.update(Action::OpenScan);
+    assert_eq!(app.scan.tab, ScanTab::Jobs);
+    let _ = app.update(Action::ScanLaunch);
+    let _ = app.on_bus(BusEvent::CallFailed {
+        name: "scan.discover".into(),
+        message: "out of scope".into(),
+    });
+    assert_eq!(app.scan.legacy.error.as_deref(), Some("out of scope"));
+    let text = screen(&app);
+    assert!(
+        text.contains("scan.discover: out of scope"),
+        "the Jobs tab draws the failure reason: {text}"
+    );
+}

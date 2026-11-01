@@ -1,7 +1,8 @@
-//! The Profiles tab (spec D2, D11, D13). Plan task 4 draws its three states
-//! only: degraded on a legacy bus, degraded on a v2 bus without
-//! `scan.profile.list`, and empty. The list, the editor, the origin picker and
-//! the check tree arrive with the Profiles tasks.
+//! The Profiles tab (spec D2, D11, D13). Plan task 4 draws its empty state
+//! and a plain list only; the degraded states (a legacy bus, a v2 bus without
+//! `scan.profile.list`) are the banner's (D13: one state on screen), so the
+//! body draws nothing then. The editor, the origin picker and the check tree
+//! arrive with the Profiles tasks.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -11,20 +12,15 @@ use ratatui::text::{Line, Span};
 use crate::app::App;
 use crate::scan::ScanOffer;
 use crate::theme::Theme;
-use crate::ui::scan::{missing_verb, note};
+use crate::ui::scan::note;
 use crate::ui::text::{cells, truncate};
-
-/// What a bus without the v2 scanner can say about profiles (D2).
-pub const DEGRADED: &str = "profiles need scan.profile.list (scanner v2)";
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     match app.scan_offer() {
-        // The banner already names both verbs; one line is enough.
-        ScanOffer::None => {}
-        ScanOffer::Legacy => note(theme, area, DEGRADED, buf),
-        ScanOffer::V2 if !app.has_tool("scan.profile.list") => {
-            note(theme, area, &missing_verb("scan.profile.list"), buf)
-        }
+        // The banner carries the no-scanner, degraded and missing-verb
+        // states; the body adds nothing to them.
+        ScanOffer::None | ScanOffer::Legacy => {}
+        ScanOffer::V2 if !app.has_tool("scan.profile.list") => {}
         ScanOffer::V2 if app.scan.profiles.list.is_empty() => {
             note(theme, area, "no profiles yet", buf)
         }
