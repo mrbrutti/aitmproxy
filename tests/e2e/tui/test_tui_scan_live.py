@@ -82,10 +82,12 @@ A v2 core lacking scan.sitemap / scan.issues / scan.issue FAILS the step that re
 
 Attaches to a runner core (AITM_BUS_ADDR + AITM_BUS_OPERATOR_TOKEN + AITM_PROXY_ADDR +
 AITM_TARGET_URL) or self-boots the seeded `vulnerable` origin + Aitm.server(CoreConfig(..)):
-through `aitm_e2e.scan.ScanTarget(latency_ms=40)` when the harness offers it, so an
-intrusive scan takes ten seconds or more and the "while running" checks never race a
-fast job (H81; the summary head names the latency), else `Target("vulnerable")` at full
-speed with a `note`. Uses a real pty and real ports, so it runs from a real shell or rig, NEVER from the sandbox
+through `aitm_e2e.scan.ScanTarget(latency_ms=300)` when the harness offers it (H81; the
+engine probes about four at a time, so 40 ms gave about 100 probes/s and a job that
+finished inside one 0.5 s status sample; 300 ms gives about 13 probes/s and an intrusive
+job of about 20 s, so the "while running" checks never race a fast job, H82; the summary
+head names the latency), else `Target("vulnerable")` at full speed with a `note`. Uses a
+real pty and real ports, so it runs from a real shell or rig, NEVER from the sandbox
 (which denies socket binds). Evidence (screen captures, status brackets, push counts,
 summary) is written to $AITM_E2E_ARTIFACTS, else to a temp dir named on stdout; the
 seeded secrets are redacted from everything written or printed, and are never printed.
@@ -2514,11 +2516,17 @@ def quietly(step):
 # seconds, so the T7-16/T7-17 "while running" observations raced the job under load. No
 # cell-side timing trick is reliable; the lever is a slower target: T10's
 # `aitm-testtarget-serve --latency-ms N` (a per-response sleep on the HTTP and WS
-# listeners), reached through `aitm_e2e.scan.ScanTarget(mode, latency_ms=)`. 40 ms a
-# response makes an intrusive scan take ten seconds or more. The harness copy under test
-# may predate the flag (today's main has no `aitm_e2e.scan`), so the cell boots with the
-# lever when it exists and falls back to `Target("vulnerable")` at full speed with a note.
-TARGET_LATENCY_MS = 40
+# listeners), reached through `aitm_e2e.scan.ScanTarget(mode, latency_ms=)`. The tenth
+# live run showed 40 ms is not enough: the engine probes about four at a time, so 40 ms a
+# response gave about 100 probes/s and the intrusive job still finished inside one 0.5 s
+# status sample (`status-pairs.json`: 228 to 278 probes inside the window). 300 ms gives
+# about 13 probes/s, an intrusive job of about 20 s and a thorough one of about 14 s,
+# inside the 600 s budget (H82). Every literal that spells the latency (the argv, the `ok`
+# record, the summary head, the self-test) derives from this one constant. The harness
+# copy under test may predate the flag (today's main has no `aitm_e2e.scan`), so the cell
+# boots with the lever when it exists and falls back to `Target("vulnerable")` at full
+# speed with a note.
+TARGET_LATENCY_MS = 300
 TARGET_FAST_NOTE = ("target boots at full speed: this harness has no ScanTarget(latency_ms=), so the "
                     "T7-16 and T7-17 while-running checks may race a fast job (H81)")
 
@@ -3434,6 +3442,8 @@ def selftest():
     # observation raced the job. The lever is T10's `aitm-testtarget-serve --latency-ms N`
     # behind `aitm_e2e.scan.ScanTarget(mode, latency_ms=)`; the cell boots with it when
     # the harness offers it and falls back to `Target("vulnerable")` with a note when not.
+    # The latency is TARGET_LATENCY_MS (300 ms since H82: 40 ms still finished the job
+    # inside one status sample); every literal below spells the constant, never a number.
     class SlowStandIn:
         """`aitm_e2e.scan.ScanTarget` as T10 ships it: its own argv assembly (`--port 0`,
         the TLS pair and the control port on request, `--latency-ms N` when asked)."""
@@ -3491,11 +3501,11 @@ def selftest():
             f"picked {picked!r} {why!r}; old {old!r} {why_old!r}; none {none!r} {why_none!r}")
     slow, slow_ms = boot_seeded_target(SlowStandIn, fallback=FastStandIn)
     c.check("selftest: H81: with the lever the target boots `vulnerable` over plain HTTP, no TLS or "
-            "control listener, with `--latency-ms 40`, and the cell reads the same `base` and "
-            "`authority` it reads from Target",
-            slow_ms == TARGET_LATENCY_MS == 40 and isinstance(slow, SlowStandIn)
+            f"control listener, with `--latency-ms {TARGET_LATENCY_MS}`, and the cell reads the same "
+            "`base` and `authority` it reads from Target",
+            slow_ms == TARGET_LATENCY_MS and isinstance(slow, SlowStandIn)
             and slow.argv == ["aitm-testtarget-serve", "--mode", "vulnerable", "--port", "0",
-                              "--latency-ms", "40"]
+                              "--latency-ms", str(TARGET_LATENCY_MS)]
             and slow.base.rstrip("/") == "http://127.0.0.1:50795" and slow.authority == "127.0.0.1:50795"
             and FastStandIn.booted == [],
             f"latency {slow_ms!r}; argv {getattr(slow, 'argv', None)!r}")
@@ -3510,15 +3520,31 @@ def selftest():
     record_target_latency(rec, TARGET_LATENCY_MS, "")
     record_target_latency(rec, 0, "aitm_e2e.scan has no ScanTarget")
     record_target_latency(rec, None, "")
-    c.check("selftest: H81: the record is the `ok` line `target boots with 40 ms per response (H81)` "
-            "with the lever, a `note` that the timing checks may race a fast job without it, "
-            "nothing for a runner core; the summary head names the latency in each case",
-            rec.results == [("target boots with 40 ms per response (H81)", "ok"), (TARGET_FAST_NOTE, "note")]
+    c.check(f"selftest: H81: the record is the `ok` line `target boots with {TARGET_LATENCY_MS} ms per "
+            "response (H81)` with the lever, a `note` that the timing checks may race a fast job "
+            "without it, nothing for a runner core; the summary head names the latency in each case",
+            rec.results == [(f"target boots with {TARGET_LATENCY_MS} ms per response (H81)", "ok"),
+                            (TARGET_FAST_NOTE, "note")]
             and "may race a fast job" in TARGET_FAST_NOTE and "(H81)" in TARGET_FAST_NOTE
-            and latency_words(40) == "target latency 40 ms"
+            and latency_words(TARGET_LATENCY_MS) == f"target latency {TARGET_LATENCY_MS} ms"
             and latency_words(0) == "target latency none (full speed)"
             and latency_words(None) == "target latency unknown (runner core)",
-            f"results {rec.results!r}; words {latency_words(40)!r} {latency_words(0)!r} {latency_words(None)!r}")
+            f"results {rec.results!r}; words {latency_words(TARGET_LATENCY_MS)!r} {latency_words(0)!r} "
+            f"{latency_words(None)!r}")
+
+    # Cell item H82: the tenth live run's target, at 40 ms per response, still finished
+    # its intrusive job inside one 0.5 s status sample (`status-pairs.json`: 228 to 278
+    # probes inside the window; the engine probes about four at a time, about 100
+    # probes/s). The latency is 300 ms (about 13 probes/s, an intrusive job of about 20 s),
+    # and every literal that spells it (the argv, the `ok` record, the summary head) is
+    # derived from TARGET_LATENCY_MS, so the self-test cannot drift from the constant.
+    c.check("selftest: H82: TARGET_LATENCY_MS is 300 and the booted argv, the `ok` record and the "
+            "summary head all spell that one constant",
+            TARGET_LATENCY_MS == 300
+            and slow.argv[-2:] == ["--latency-ms", str(TARGET_LATENCY_MS)]
+            and rec.results[0] == (f"target boots with {TARGET_LATENCY_MS} ms per response (H81)", "ok")
+            and latency_words(TARGET_LATENCY_MS) == f"target latency {TARGET_LATENCY_MS} ms",
+            f"TARGET_LATENCY_MS {TARGET_LATENCY_MS!r}; argv {slow.argv!r}; record {rec.results[:1]!r}")
 
     # Cell item from the seventh live smoke run: H79. The engine's prompt names the origin
     # (`.. traffic to http://127.0.0.1:50795 and may disrupt the target. Continue?`), longer
