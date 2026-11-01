@@ -100,7 +100,7 @@ fn tab_strip(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 /// else (a notice included) is secondary text (D13: hue only on data).
 fn banner_style(theme: &Theme, error: Option<&ScanError>) -> ratatui::style::Style {
     if error.is_some() {
-        theme.fg(&crate::tokens::color::status::SERVER_ERROR)
+        theme.fg(&status::SERVER_ERROR)
     } else {
         theme.text_secondary()
     }
@@ -215,19 +215,45 @@ pub type Hint = (&'static str, &'static str);
 /// first to go when the bar is narrow.
 const ESC_BACK: Hint = ("Esc", "back");
 
+/// `⏎ open flow`, the Site map's and the Issues tab's flow open (fix round
+/// H, H28: one hint, named where the tables and the legacy bar read it).
+const OPEN_FLOW: Hint = ("⏎", "open flow");
+
+/// `parts` joined into one `N`-long array, `N` being their total length:
+/// how a bar is built from its tab's key table, its extra hints and
+/// [`ESC_BACK`] at compile time ([`key_table`]).
+const fn join<const N: usize>(parts: &[&[Hint]]) -> [Hint; N] {
+    let mut out = [("", ""); N];
+    let mut k = 0;
+    let mut i = 0;
+    while i < parts.len() {
+        let mut j = 0;
+        while j < parts[i].len() {
+            out[k] = parts[i][j];
+            k += 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    assert!(k == N, "N is the parts' total length");
+    out
+}
+
 /// One key table per tab (fix round G, G84, G90): `$keys` is what the
-/// tab's in-pane footer spells and `$bar` the same pairs with [`ESC_BACK`]
-/// after them, the status bar's list. The help overlay joins the same
-/// tables ([`HELP`]), so a key is named once.
+/// tab's in-pane footer spells and `$bar` the same hints, then the `$more`
+/// table when the tab has one, then [`ESC_BACK`], the status bar's list.
+/// The help overlay joins the same tables ([`HELP`]), so a key is named
+/// once.
 macro_rules! key_table {
-    ($keys:ident, $bar:ident $(, [$($extra:expr),*])?: $($k:literal => $w:literal),+ $(,)?) => {
-        pub(crate) const $keys: &[Hint] = &[$(($k, $w)),+];
-        pub(crate) const $bar: &[Hint] = &[$(($k, $w)),+, $($($extra,)*)? ESC_BACK];
+    ($keys:ident, $bar:ident $(, $more:ident)?: $($hint:expr),+ $(,)?) => {
+        pub(crate) const $keys: &[Hint] = &[$($hint),+];
+        pub(crate) const $bar: &[Hint] =
+            &join::<{ $keys.len() $(+ $more.len())? + 1 }>(&[$keys, $($more,)? &[ESC_BACK]]);
     };
 }
 
 key_table!(PROFILES_KEYS, PROFILES_BAR:
-    "s" => "start", "m" => "map", "w" => "save as", "e" => "edit", "Space" => "toggle");
+    ("s", "start"), ("m", "map"), ("w", "save as"), ("e", "edit"), ("Space", "toggle"));
 /// The Profiles keys the help lists beyond the footer's.
 pub(crate) const PROFILES_MORE: &[Hint] = &[
     ("N", "new"),
@@ -236,15 +262,18 @@ pub(crate) const PROFILES_MORE: &[Hint] = &[
     ("t", "L4 target"),
 ];
 key_table!(JOBS_KEYS, JOBS_BAR:
-    "x" => "cancel", "⏎" => "issues of this job", "s" => "start", "m" => "map");
+    ("x", "cancel"), ("⏎", "issues of this job"), ("s", "start"), ("m", "map"));
 key_table!(SITEMAP_KEYS, SITEMAP_BAR:
-    "⏎" => "open flow", "n" => "next page", "J" => "job filter");
+    OPEN_FLOW, ("n", "next page"), ("J", "job filter"));
 /// `R reset`, in the Issues list footer and in the bar.
 const RESET: Hint = ("R", "reset");
 /// The five filter keys as the bar and the help spell them, compactly.
 const FILTERS: Hint = ("S C L T J", "filters");
-key_table!(ISSUES_KEYS, ISSUES_BAR, [FILTERS, RESET]:
-    "c" => "confirm", "f" => "false positive", "u" => "reopen", "⏎" => "open flow", "P" => "PoC");
+/// The Issues hints the bar and the help list beyond the list footer's
+/// (fix round H, H28).
+const ISSUES_MORE: &[Hint] = &[FILTERS, RESET];
+key_table!(ISSUES_KEYS, ISSUES_BAR, ISSUES_MORE:
+    ("c", "confirm"), ("f", "false positive"), ("u", "reopen"), OPEN_FLOW, ("P", "PoC"));
 /// The Issues list footer: the filter keys (D11).
 pub(crate) const ISSUES_FILTER_KEYS: &[Hint] = &[
     ("S", "severity"),
@@ -276,7 +305,7 @@ const LEGACY_PROFILES_BAR: &[Hint] = &[("s", "scan"), ("m", "map"), ("3", "site 
 const LEGACY_ISSUES_BAR: &[Hint] = &[("3", "site map"), ESC_BACK];
 /// The Site map on a legacy bus (G86): the flow open without the v2
 /// paging and job filter.
-const LEGACY_SITEMAP_BAR: &[Hint] = &[SITEMAP_KEYS[0], ESC_BACK];
+const LEGACY_SITEMAP_BAR: &[Hint] = &[OPEN_FLOW, ESC_BACK];
 
 /// The status-bar hints of the Scan view (D11: the hints list the active
 /// tab's keys): the tab's keys most important first, `Esc back` last so it
@@ -317,7 +346,7 @@ pub const HELP: &[(&str, &[&[Hint]])] = &[
     ("Profiles", &[PROFILES_KEYS, PROFILES_MORE]),
     ("Jobs", &[JOBS_KEYS]),
     ("Site map", &[SITEMAP_KEYS]),
-    ("Issues", &[ISSUES_KEYS, &[FILTERS, RESET]]),
+    ("Issues", &[ISSUES_KEYS, ISSUES_MORE]),
 ];
 
 /// A tab body split into its list and detail panes, with the rule between
@@ -476,15 +505,16 @@ pub fn labelled(
 /// The rows of a list pane (fix round G, G56): `total` rows scrolled so
 /// `cursor` is on screen (the rows above it give way first), the cursor
 /// row highlighted while `focused`, each row built by `line(k)` only when
-/// it is drawn. The one scroll-and-highlight loop every tab's list shares.
+/// it is drawn. The one scroll-and-highlight loop every tab's list shares;
+/// `buf` last like [`hint`] and [`blocked_footer`].
 pub fn rows(
-    buf: &mut Buffer,
     theme: &Theme,
     area: Rect,
     total: usize,
     cursor: usize,
     focused: bool,
     mut line: impl FnMut(usize) -> Line<'static>,
+    buf: &mut Buffer,
 ) {
     if area.height == 0 || area.width == 0 || total == 0 {
         return;
@@ -671,10 +701,18 @@ mod tests {
         let area = Rect::new(0, 0, 10, 3);
         let mut buf = Buffer::empty(area);
         let mut built = Vec::new();
-        rows(&mut buf, &theme, area, 10, 7, true, |k| {
-            built.push(k);
-            Line::raw(format!("row {k}"))
-        });
+        rows(
+            &theme,
+            area,
+            10,
+            7,
+            true,
+            |k| {
+                built.push(k);
+                Line::raw(format!("row {k}"))
+            },
+            &mut buf,
+        );
         assert_eq!(built, vec![5, 6, 7], "top = 7 - (3 - 1)");
         assert_eq!(buf.cell((0, 2)).map(|c| c.symbol()), Some("r"));
         assert_eq!(
@@ -689,10 +727,18 @@ mod tests {
 
         let mut buf = Buffer::empty(area);
         let mut built = Vec::new();
-        rows(&mut buf, &theme, area, 10, 1, false, |k| {
-            built.push(k);
-            Line::raw("x")
-        });
+        rows(
+            &theme,
+            area,
+            10,
+            1,
+            false,
+            |k| {
+                built.push(k);
+                Line::raw("x")
+            },
+            &mut buf,
+        );
         assert_eq!(
             built,
             vec![0, 1, 2],
@@ -706,14 +752,28 @@ mod tests {
 
         let mut buf = Buffer::empty(area);
         let mut built = Vec::new();
-        rows(&mut buf, &theme, area, 2, 99, true, |k| {
-            built.push(k);
-            Line::raw("x")
-        });
+        rows(
+            &theme,
+            area,
+            2,
+            99,
+            true,
+            |k| {
+                built.push(k);
+                Line::raw("x")
+            },
+            &mut buf,
+        );
         assert_eq!(built, vec![0, 1], "the cursor is clamped to the last row");
-        rows(&mut buf, &theme, area, 0, 0, true, |_| {
-            unreachable!("no rows")
-        });
+        rows(
+            &theme,
+            area,
+            0,
+            0,
+            true,
+            |_| unreachable!("no rows"),
+            &mut buf,
+        );
     }
 
     /// The wrap keeps words whole, cuts a word wider than a row, stops at
@@ -799,7 +859,7 @@ mod tests {
             "x cancel · ⏎ issues of this job · s start · m map"
         );
         assert_eq!(
-            key_text(&[ISSUES_KEYS, &[FILTERS, RESET]]),
+            key_text(&[ISSUES_KEYS, ISSUES_MORE]),
             "c confirm · f false positive · u reopen · ⏎ open flow · P PoC · S C L T J filters · R reset"
         );
         assert_eq!(

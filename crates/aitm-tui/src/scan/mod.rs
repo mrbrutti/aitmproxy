@@ -473,13 +473,16 @@ impl ScanError {
     /// text, the verb named once).
     pub fn wording(&self) -> String {
         match self.code {
-            // The refresh clause only where the self-heal ran (D9 as
-            // amended on the Task 13 spec panel; fix round G, G75): a
-            // keyed `scan.status` / `scan.cancel` tag.
-            Some(ScanErrorCode::NotFound) if self.not_found_job().is_none() => {
-                format!("{NOT_FOUND}: {}", self.detail)
+            Some(code) => {
+                let mut text = code_wording(code).to_string();
+                // The refresh clause only where the self-heal ran (D9 as
+                // amended on the Task 13 spec panel; fix round G, G75): a
+                // keyed `scan.status` / `scan.cancel` tag.
+                if self.not_found_job().is_some() {
+                    text.push_str(REFRESHING);
+                }
+                format!("{text}: {}", self.detail)
             }
-            Some(code) => format!("{}: {}", code_wording(code), self.detail),
             None if self.detail == MISSING_VERB => format!("{} {}", self.verb, self.detail),
             None => format!("{}: {}", self.verb, self.detail),
         }
@@ -521,13 +524,15 @@ impl ScanError {
 /// The D9 `not_found` wording without its refresh clause: what a tag the
 /// self-heal does not answer reads (G75).
 const NOT_FOUND: &str = "No longer known to the core (it may have restarted)";
+/// The refresh clause [`ScanError::wording`] appends to [`NOT_FOUND`]
+/// where the self-heal ran (G75; fix round H, H30: the D9 sentence lives
+/// once).
+const REFRESHING: &str = "; the list is being refreshed";
 
-/// The D9 table.
+/// The D9 table; `not_found` without its refresh clause ([`REFRESHING`]).
 fn code_wording(code: ScanErrorCode) -> &'static str {
     match code {
-        ScanErrorCode::NotFound => {
-            "No longer known to the core (it may have restarted); the list is being refreshed"
-        }
+        ScanErrorCode::NotFound => NOT_FOUND,
         ScanErrorCode::Busy => {
             "Scanner busy: the job limit is reached or this origin already has a running job; wait or cancel one in Jobs (x)"
         }

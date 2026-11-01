@@ -23,7 +23,7 @@ use aitm_tui::app::{App, Mode, PromptKind};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::scan::{
-    check_tree, parse_l4_target, session_line, tri_state, EditorField, L4TargetError, OriginSource,
+    parse_l4_target, session_line, tree_nodes, tri_state, EditorField, L4TargetError, OriginSource,
     ProfilePane, ScanTab, TriState, BUILTIN_MARK, CHECKS_MAX, COLLAPSED_MARK, EDITING_MARK,
     EDITOR_FIELDS, L4_TARGET_ERROR, OPEN_MARK, ORIGIN_HOST_ERROR, ORIGIN_SCHEME_ERROR,
     PROFILES_MAX, SELECTOR_MAX, VALUE_MAX,
@@ -132,13 +132,21 @@ fn focus_field(app: &mut App, field: EditorField) {
 /// Put the Checks cursor on the tree node whose selector is `selector`.
 fn focus_node(app: &mut App, selector: &str) {
     app.scan.profiles.pane = ProfilePane::Checks;
-    let editor = app.scan.profiles.editor.as_mut().expect("an editor");
-    let tree = check_tree(&app.scan.profiles.checks, &editor.collapsed);
-    let idx = tree
-        .iter()
+    let idx = app
+        .scan
+        .profiles
+        .rows()
         .position(|n| n.selector == selector)
-        .unwrap_or_else(|| panic!("no node {selector:?} in {tree:?}"));
-    editor.tree_cursor = idx;
+        .unwrap_or_else(|| {
+            let tree: Vec<_> = app.scan.profiles.rows().collect();
+            panic!("no node {selector:?} in {tree:?}")
+        });
+    app.scan
+        .profiles
+        .editor
+        .as_mut()
+        .expect("an editor")
+        .tree_cursor = idx;
 }
 
 fn type_text(app: &mut App, text: &str) {
@@ -354,7 +362,7 @@ fn enter_on_a_row_opens_the_editor_and_previews_the_session() {
 fn check_tree_toggles_write_exactly_the_selectors() {
     let mut app = app();
     open_standard(&mut app);
-    let tree = check_tree(&app.scan.profiles.checks, &Default::default());
+    let tree: Vec<_> = app.scan.profiles.rows().collect();
     let selectors: Vec<&str> = tree.iter().map(|n| n.selector.as_str()).collect();
     assert_eq!(
         selectors,
@@ -448,10 +456,7 @@ fn check_tree_toggles_write_exactly_the_selectors() {
     let _ = app.update(Action::Left);
     let editor = app.scan.profiles.editor.as_ref().expect("editor");
     assert!(editor.collapsed.contains("lane:http"));
-    assert_eq!(
-        check_tree(&app.scan.profiles.checks, &editor.collapsed).len(),
-        1
-    );
+    assert_eq!(app.scan.profiles.visible_len(), 1);
     let _ = app.update(Action::Right);
     let editor = app.scan.profiles.editor.as_ref().expect("editor");
     assert!(editor.collapsed.is_empty());
@@ -1085,7 +1090,10 @@ fn hostile_profile_replies_are_bounded() {
     assert!(folded
         .iter()
         .all(|c| c.description.chars().count() <= 4 * VALUE_MAX));
-    let tree = check_tree(folded, &Default::default());
+    let tree: Vec<_> = tree_nodes(folded, &Default::default(), &Default::default())
+        .into_iter()
+        .filter(|n| !n.hidden)
+        .collect();
     assert_eq!(
         tree.len(),
         CHECKS_MAX + 2,

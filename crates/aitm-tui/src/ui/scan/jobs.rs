@@ -30,8 +30,8 @@ use crate::theme::Theme;
 use crate::tokens::color::status;
 use crate::ui::bars::put;
 use crate::ui::scan::{
-    blocked_footer, key_text, labelled, launch_reason, note, pane_rule, stacked, stacked_share,
-    Panes, GAP, GAP_TEXT, JOBS_KEYS,
+    blocked_footer, key_text, labelled, launch_reason, note, pane_rule, rows, stacked,
+    stacked_share, Panes, GAP, GAP_TEXT, JOBS_KEYS,
 };
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
@@ -136,7 +136,7 @@ impl Columns {
 fn list(
     app: &App,
     theme: &Theme,
-    rows: &[JobRow],
+    table: &[JobRow],
     cols: &Columns,
     cursor: usize,
     area: Rect,
@@ -151,16 +151,24 @@ fn list(
         header(theme, cols),
     );
     let body_h = usize::from(area.height.saturating_sub(1));
-    if body_h == 0 || rows.is_empty() {
+    if body_h == 0 || table.is_empty() {
         return;
     }
     let jobs = &app.scan.jobs;
     let focused = jobs.pane == JobPane::List;
     let body = Rect::new(area.x, area.y + 1, area.width, cells(body_h));
-    crate::ui::scan::rows(buf, theme, body, rows.len(), cursor, focused, |k| {
-        let row = &rows[k];
-        row_line(theme, cols, row, jobs.state_of(&row.id), k == cursor)
-    });
+    rows(
+        theme,
+        body,
+        table.len(),
+        cursor,
+        focused,
+        |k| {
+            let row = &table[k];
+            row_line(theme, cols, row, jobs.state_of(&row.id), k == cursor)
+        },
+        buf,
+    );
 }
 
 /// `job  profile  targets  state/phase  probes  points  issues  el.`, the

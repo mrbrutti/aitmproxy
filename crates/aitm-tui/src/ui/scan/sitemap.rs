@@ -207,7 +207,6 @@ fn nodes(theme: &Theme, lines: &[NodeLine], pane: Pane<'_>, area: Rect, buf: &mu
         .unwrap_or(0);
     let w = usize::from(body.width);
     rows(
-        buf,
         theme,
         body,
         entries.len(),
@@ -220,6 +219,7 @@ fn nodes(theme: &Theme, lines: &[NodeLine], pane: Pane<'_>, area: Rect, buf: &mu
             ),
             Entry::Row(i) => marked(theme, &lines[i].text, i == pane.cursor, w),
         },
+        buf,
     );
 }
 
@@ -236,13 +236,13 @@ fn points(theme: &Theme, points: &[String], pane: Pane<'_>, area: Rect, buf: &mu
     }
     let w = usize::from(body.width);
     rows(
-        buf,
         theme,
         body,
         points.len(),
         pane.cursor,
         pane.focused,
         |k| marked(theme, &points[k], k == pane.cursor, w),
+        buf,
     );
 }
 

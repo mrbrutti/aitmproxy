@@ -35,13 +35,14 @@ use crate::scan::{
     parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
     tag_parts, typed_origin, usable_selector, walk, Dir, EditorField, FieldKind, IssueFilterKey,
     IssuePane, JobPane, Launch, LaunchVerb, MapPane, PendingLaunch, ProfileEditor, ProfilePane,
-    ScanError, ScanOffer, ScanState, ScanTab, CLAMPED_FIELD_MAX, CLAMPED_MAX, ERROR_DETAIL_MAX,
-    ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
-    OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX, SAVED_PATH_MAX, SITEMAP_POLL_TICKS,
-    STATUS_POLL_TICKS,
+    ScanError, ScanOffer, ScanState, ScanTab, WireConfirm, CLAMPED_FIELD_MAX, CLAMPED_MAX,
+    ERROR_DETAIL_MAX, ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER,
+    OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SAVED_NAME_MAX,
+    SAVED_PATH_MAX, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
 use crate::text::{clean, truncate};
 use crate::theme::Theme;
+use crate::ui::overlays;
 use crate::viewers::json;
 
 /// Terminal widths below which the shell changes shape (§2.10(c)).
@@ -941,7 +942,7 @@ pub struct App {
     /// The pending confirm-over-the-wire handshake (spec D3, D7), shared by the
     /// `l4.*` guarded verbs and the `scan.*` launches; `Some` while the overlay
     /// is open.
-    pub wire_confirm: Option<crate::scan::launch::WireConfirm>,
+    pub wire_confirm: Option<WireConfirm>,
     /// The mode to return to when the wire-confirm overlay closes: `l4_inject`
     /// and `l4_intercept_verb` set `Mode::Inspector`, the scanner launch (Task
     /// 12) sets `Mode::Scan`.
@@ -2076,7 +2077,7 @@ impl App {
     /// replaced, not answered: its call is toasted as dropped and, for a
     /// `scan.*` launch, the pending launch it held is cleared (the token
     /// is gone with the prompt, so nothing can re-issue it).
-    fn open_wire_confirm(&mut self, confirm: crate::scan::launch::WireConfirm, from: Mode) {
+    fn open_wire_confirm(&mut self, confirm: WireConfirm, from: Mode) {
         if let Some(old) = self.wire_confirm.take() {
             if old.is_scan() {
                 self.scan.launch.pending = None;
@@ -2852,8 +2853,8 @@ impl App {
             Mode::Help => {
                 // The overlay scrolls over the lines its box cannot show
                 // (fix round G, G85); the view clamps the same way.
-                let max = crate::ui::overlays::help_scroll_max(self.width, self.height);
-                let page = crate::ui::overlays::help_page(self.width, self.height);
+                let max = overlays::help_scroll_max(self.width, self.height);
+                let page = overlays::help_page(self.width, self.height);
                 scroll(&mut self.help_scroll, action, max + 1, page);
             }
             Mode::Prompt(PromptKind::Palette) => {
@@ -2945,7 +2946,7 @@ impl App {
                     // The Checks pane walks the flattened tree's rows
                     // (lanes, classes and checks), not the catalogue's
                     // entries (plan task 10).
-                    let rows = self.scan.profiles.rows().len();
+                    let rows = self.scan.profiles.visible_len();
                     if let Some(editor) = self.scan.profiles.editor.as_mut() {
                         if rows > 0 {
                             editor.tree_cursor = walk(action, editor.tree_cursor, rows, page);
@@ -4046,7 +4047,7 @@ impl App {
                             .pending
                             .take()
                             .unwrap_or((name.clone(), Value::Null));
-                        match crate::scan::launch::WireConfirm::from_reply(&call, &args, &value) {
+                        match WireConfirm::from_reply(&call, &args, &value) {
                             Some(confirm) => {
                                 self.open_wire_confirm(confirm, Mode::Inspector);
                                 return out;
@@ -4727,11 +4728,7 @@ impl App {
     /// the failure; the overlay, should the server ask, returns to Scan.
     fn send_launch(&mut self, verb: LaunchVerb, launch: Launch, out: &mut Vec<BusRequest>) {
         if self.scan_call(verb.to_string(), verb.as_str(), launch.args.clone(), out) {
-            self.scan.launch.pending = Some(PendingLaunch {
-                call: verb,
-                args: launch.args,
-                profile_name: launch.profile_name,
-            });
+            self.scan.launch.pending = Some(PendingLaunch { call: verb, launch });
         }
     }
 
@@ -5304,15 +5301,18 @@ impl App {
                         .set_error(ScanError::uncoded(tag, "reply with no pending launch"));
                     return;
                 };
-                if let Some(confirm) = crate::scan::launch::WireConfirm::from_reply(
-                    pending.call.as_str(),
-                    &pending.args,
-                    &value,
-                ) {
+                if let Some(confirm) =
+                    WireConfirm::from_reply(pending.call.as_str(), &pending.launch.args, &value)
+                {
                     self.open_wire_confirm(confirm, Mode::Scan);
                     return;
                 }
-                let fallback = self.scan.launch.pending.take().and_then(|p| p.profile_name);
+                let fallback = self
+                    .scan
+                    .launch
+                    .pending
+                    .take()
+                    .and_then(|p| p.launch.profile_name);
                 if let Some(result) = self.scan_reply::<StartResult>(tag, &value) {
                     self.fold_start_result(tag, result, fallback);
                 }

@@ -986,14 +986,21 @@ impl ProfileEditor {
     }
 
     /// The visible rows of the cached tree: every node no collapsed
-    /// ancestor hides, in display order; what the Checks cursor walks.
-    pub fn rows(&self) -> Vec<&TreeNode> {
-        self.tree.iter().filter(|n| !n.hidden).collect()
+    /// ancestor hides, in display order; what the Checks cursor walks. An
+    /// iterator (fix round H, H26): the view collects it once per frame,
+    /// the reducer counts or indexes it without a `Vec`.
+    pub fn rows(&self) -> impl Iterator<Item = &TreeNode> {
+        self.tree.iter().filter(|n| !n.hidden)
+    }
+
+    /// How many rows [`ProfileEditor::rows`] yields.
+    pub fn visible_len(&self) -> usize {
+        self.rows().count()
     }
 
     /// The tree node under the Checks cursor.
     pub fn cursor_node(&self) -> Option<&TreeNode> {
-        self.rows().get(self.tree_cursor).copied()
+        self.rows().nth(self.tree_cursor)
     }
 
     /// Rebuild the picker rows from the D8 rule over `scope` and `flows`,
@@ -1145,8 +1152,8 @@ const LANE_PREFIX: &str = "lane:";
 /// lane a check lists, check ids by name under their class. Every node is
 /// listed; one under a selector in `collapsed` is `hidden`, and each
 /// carries its state in `selection`. A check in two lanes appears under
-/// both (the engine resolves a selector lane-free). [`check_tree`] is the
-/// visible rows of this.
+/// both (the engine resolves a selector lane-free). [`ProfileEditor::rows`]
+/// is the visible rows of this.
 pub fn tree_nodes(
     checks: &[CheckMeta],
     collapsed: &BTreeSet<String>,
@@ -1186,16 +1193,6 @@ pub fn tree_nodes(
         }
     }
     out
-}
-
-/// The visible rows of the check tree over `checks` for the collapse state
-/// `collapsed` ([`tree_nodes`] without the hidden nodes), states at their
-/// default. What the Checks pane lists.
-pub fn check_tree(checks: &[CheckMeta], collapsed: &BTreeSet<String>) -> Vec<TreeNode> {
-    tree_nodes(checks, collapsed, &CheckSelection::default())
-        .into_iter()
-        .filter(|n| !n.hidden)
-        .collect()
 }
 
 /// A node's own selector state (spec D3): `Exclude` when `selector` is in
@@ -1363,7 +1360,7 @@ impl ProfilesState {
     pub fn rebuild_tree(&mut self) {
         if let Some(editor) = self.editor.as_mut() {
             editor.tree = tree_nodes(&self.checks, &editor.collapsed, &editor.draft.checks);
-            let rows = editor.rows().len();
+            let rows = editor.visible_len();
             editor.tree_cursor = editor.tree_cursor.min(rows.saturating_sub(1));
         }
     }
@@ -1420,7 +1417,6 @@ impl ProfilesState {
         self.previews.insert(origin.to_string(), preview);
     }
 
-    /// The row under the list cursor.
     /// Whether `name` is a builtin profile (fix round G, G39: the one
     /// rule the get, save and delete paths share): the list row's flag
     /// when the list has the row, else the engine's builtin-name rule.
@@ -1489,17 +1485,21 @@ impl ProfilesState {
         self.set_collapsed(&selector, collapse);
     }
 
+    /// The row under the list cursor.
     pub fn cursor_entry(&self) -> Option<&ProfileListEntry> {
         self.list.get(self.cursor)
     }
 
     /// The visible rows of the open editor's cached tree (none without an
-    /// editor): what the Checks pane lists and its cursor walks.
-    pub fn rows(&self) -> Vec<&TreeNode> {
-        self.editor
-            .as_ref()
-            .map(ProfileEditor::rows)
-            .unwrap_or_default()
+    /// editor): what the Checks pane lists and its cursor walks (an
+    /// iterator; fix round H, H26).
+    pub fn rows(&self) -> impl Iterator<Item = &TreeNode> {
+        self.editor.iter().flat_map(ProfileEditor::rows)
+    }
+
+    /// How many rows [`ProfilesState::rows`] yields.
+    pub fn visible_len(&self) -> usize {
+        self.rows().count()
     }
 
     /// The tree node under the Checks cursor.
@@ -1712,7 +1712,7 @@ mod tests {
         assert_eq!(editor.tree[0].kind, NodeKind::Lane);
         assert_eq!(editor.tree[1].label(), "information-disclosure");
         assert_eq!(editor.tree[2].id(), Some("http.custom-marker"));
-        assert_eq!(profiles.rows().len(), 7);
+        assert_eq!(profiles.visible_len(), 7);
 
         profiles.toggle_node("sqli-error");
         let editor = profiles.editor.as_ref().unwrap_or_else(|| panic!("editor"));
@@ -1735,13 +1735,13 @@ mod tests {
             "hidden rows stay cached for the summary"
         );
         assert_eq!(editor.tree.iter().filter(|n| n.hidden).count(), 6);
-        assert_eq!(profiles.rows().len(), 1);
+        assert_eq!(profiles.visible_len(), 1);
         assert_eq!(
             profiles.cursor_node().map(|n| n.selector.as_str()),
             Some("lane:http")
         );
         profiles.set_collapsed("lane:http", false);
-        assert_eq!(profiles.rows().len(), 7);
+        assert_eq!(profiles.visible_len(), 7);
         if let Some(e) = profiles.editor.as_mut() {
             e.tree_cursor = 99;
         }

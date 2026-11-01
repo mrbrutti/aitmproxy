@@ -34,7 +34,7 @@ use crate::text::{cells, fit, truncate, width};
 use crate::theme::Theme;
 use crate::ui::bars::put;
 use crate::ui::scan::{
-    hint, key_text, labelled, note, pane_rule, panes, GAP, ISSUES_FILTER_KEYS, ISSUES_KEYS,
+    hint, key_text, labelled, note, pane_rule, panes, rows, GAP, ISSUES_FILTER_KEYS, ISSUES_KEYS,
 };
 use crate::ui::selection_bg;
 
@@ -156,22 +156,21 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         return;
     }
     // The rows were bounded and built when the page was folded (D6).
-    let rows = &issues.rows;
-    let cols = Columns::measure(rows, usize::from(area.width));
-    let mut entries: Vec<Entry> = Vec::with_capacity(rows.len() + 5);
+    let table = &issues.rows;
+    let cols = Columns::measure(table, usize::from(area.width));
+    let mut entries: Vec<Entry> = Vec::with_capacity(table.len() + 5);
     for (severity, members) in grouped(&issues.list) {
         entries.push(Entry::Header(severity));
         entries.extend(members.into_iter().map(Entry::Row));
     }
-    let cursor = issues.cursor.min(rows.len().saturating_sub(1));
+    let cursor = issues.cursor.min(table.len().saturating_sub(1));
     let cursor_line = entries
         .iter()
         .position(|e| matches!(e, Entry::Row(k) if *k == cursor))
         .unwrap_or(0);
     let focused = issues.pane == IssuePane::List;
     let body = Rect::new(area.x, area.y + 1, area.width, cells(body_h));
-    crate::ui::scan::rows(
-        buf,
+    rows(
         theme,
         body,
         entries.len(),
@@ -190,10 +189,11 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                 };
                 Line::styled(format!(" {header} {n}"), style)
             }
-            Entry::Row(idx) => rows.get(idx).map_or_else(Line::default, |row| {
+            Entry::Row(idx) => table.get(idx).map_or_else(Line::default, |row| {
                 row_line(theme, &cols, row, idx == cursor)
             }),
         },
+        buf,
     );
     if has_footer {
         hint(

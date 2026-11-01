@@ -199,7 +199,7 @@ fn start_from_the_editor_sends_the_typed_profile() {
     assert_eq!(sent.name, "standard");
     let pending = app.scan.launch.pending.as_ref().expect("a pending launch");
     assert_eq!(pending.call, LaunchVerb::Start);
-    assert_eq!(pending.profile_name.as_deref(), Some("standard"));
+    assert_eq!(pending.launch.profile_name.as_deref(), Some("standard"));
     assert!(app.scan.inflight.contains("scan.start"));
 
     let reqs = app.update(Action::ScanStart);
@@ -223,8 +223,8 @@ fn start_from_the_list_sends_the_name() {
         )]
     );
     let pending = app.scan.launch.pending.as_ref().expect("a pending launch");
-    assert_eq!(pending.args, json!({ "profile_name": "standard" }));
-    assert_eq!(pending.profile_name.as_deref(), Some("standard"));
+    assert_eq!(pending.launch.args, json!({ "profile_name": "standard" }));
+    assert_eq!(pending.launch.profile_name.as_deref(), Some("standard"));
 }
 
 /// D8, T7-4: `:scan <origin>` under v2 sends `scan.start { target }` with the

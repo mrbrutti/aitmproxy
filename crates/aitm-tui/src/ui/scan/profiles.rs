@@ -162,7 +162,6 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         .and_then(|e| e.loaded_from.as_deref());
     let body = Rect::new(area.x, area.y + 1, area.width, cells(body_h));
     rows(
-        buf,
         theme,
         body,
         profiles.list.len(),
@@ -174,28 +173,29 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             row_line(
                 theme,
                 &cols,
-                p,
-                lanes,
+                (p, lanes),
                 k == cursor,
                 held == Some(p.name.as_str()),
                 w,
             )
         },
+        buf,
     );
 }
 
 /// One list row: the cursor mark, the name, the held and builtin marks,
-/// the lanes (`lanes`, built at fold), the intensity and the speed.
-#[allow(clippy::too_many_arguments)]
+/// the lanes (built at fold), the intensity and the speed. `row` is the
+/// list entry and its lanes text, the pair `ProfilesState` keeps side by
+/// side (fix round H, H31).
 fn row_line(
     theme: &Theme,
     cols: &Columns,
-    p: &ProfileListEntry,
-    lanes: &str,
+    row: (&ProfileListEntry, &str),
     under_cursor: bool,
     held: bool,
     w: usize,
 ) -> Line<'static> {
+    let (p, lanes) = row;
     let mark = if under_cursor { ">" } else { " " };
     let editing = if held { EDITING_MARK } else { " " };
     let builtin = if p.builtin { BUILTIN_MARK } else { " " };
@@ -545,39 +545,47 @@ fn origins(app: &App, editor: &ProfileEditor, theme: &Theme, area: Rect, buf: &m
     let focused = app.scan.profiles.pane == ProfilePane::Origins && !choices.is_empty();
     let cursor = editor.origin_cursor.min(choices.len().saturating_sub(1));
     let total = choices.len() + wildcards.len();
-    rows(buf, theme, body, total, cursor, focused, |k| {
-        if let Some(choice) = choices.get(k) {
-            let is_cursor = k == cursor;
-            let mark = if is_cursor { ">" } else { " " };
-            let tick = if editor.draft.target.origins.contains(&choice.origin) {
-                "[x]"
+    rows(
+        theme,
+        body,
+        total,
+        cursor,
+        focused,
+        |k| {
+            if let Some(choice) = choices.get(k) {
+                let is_cursor = k == cursor;
+                let mark = if is_cursor { ">" } else { " " };
+                let tick = if editor.draft.target.origins.contains(&choice.origin) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                };
+                let source = match choice.source {
+                    OriginSource::FromScope => "scope",
+                    OriginSource::FromFlows => "flows",
+                    OriginSource::Typed => "typed",
+                };
+                clip(
+                    vec![
+                        Span::styled(mark.to_string(), theme.accent()),
+                        Span::styled(format!("{tick} {}", choice.origin), theme.text_primary()),
+                        Span::styled(format!("  {source}"), theme.text_secondary()),
+                    ],
+                    w,
+                )
             } else {
-                "[ ]"
-            };
-            let source = match choice.source {
-                OriginSource::FromScope => "scope",
-                OriginSource::FromFlows => "flows",
-                OriginSource::Typed => "typed",
-            };
-            clip(
-                vec![
-                    Span::styled(mark.to_string(), theme.accent()),
-                    Span::styled(format!("{tick} {}", choice.origin), theme.text_primary()),
-                    Span::styled(format!("  {source}"), theme.text_secondary()),
-                ],
-                w,
-            )
-        } else {
-            let entry = wildcards[k - choices.len()];
-            clip(
-                vec![Span::styled(
-                    format!("     {entry}  {WILDCARD_HINT}"),
-                    theme.text_tertiary(),
-                )],
-                w,
-            )
-        }
-    });
+                let entry = wildcards[k - choices.len()];
+                clip(
+                    vec![Span::styled(
+                        format!("     {entry}  {WILDCARD_HINT}"),
+                        theme.text_tertiary(),
+                    )],
+                    w,
+                )
+            }
+        },
+        buf,
+    );
 }
 
 /// The Checks pane (D11): the head, then the flattened tree, one row per
@@ -604,7 +612,8 @@ fn checks(
     if body.height == 0 {
         return;
     }
-    let tree = profiles.rows();
+    // The visible rows collected once per frame (fix round H, H26).
+    let tree: Vec<&TreeNode> = profiles.rows().collect();
     if tree.is_empty() {
         note(theme, body, NO_CHECKS, buf);
         return;
@@ -612,9 +621,15 @@ fn checks(
     let w = usize::from(body.width);
     let focused = profiles.pane == ProfilePane::Checks;
     let cursor = editor.tree_cursor.min(tree.len() - 1);
-    rows(buf, theme, body, tree.len(), cursor, focused, |k| {
-        tree_line(theme, editor, tree[k], k == cursor, w)
-    });
+    rows(
+        theme,
+        body,
+        tree.len(),
+        cursor,
+        focused,
+        |k| tree_line(theme, editor, tree[k], k == cursor, w),
+        buf,
+    );
 }
 
 /// One tree row.

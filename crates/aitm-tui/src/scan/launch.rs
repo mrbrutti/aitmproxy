@@ -117,11 +117,7 @@ pub fn l4_gate(
     has_l4_scope_list: bool,
     l4_scope: &[L4ScopeEntry],
 ) -> Option<String> {
-    let wants_l4 = draft
-        .lanes
-        .iter()
-        .any(|l| matches!(l, LaneKind::L4Packet | LaneKind::L4Stream));
-    if !wants_l4 {
+    if !wants_l4(&draft.lanes) {
         return None;
     }
     if !has_l4_scope_list {
@@ -151,16 +147,21 @@ pub fn l4_gate(
 /// [`GATE_NO_LAYER`] when the bus lacks `l4.scope.list`, else
 /// [`GATE_OPEN_PROFILE`] (the row carries no targets or scope to check).
 pub fn row_gate(lanes: &[LaneKind], has_l4_scope_list: bool) -> Option<String> {
-    let wants_l4 = lanes
-        .iter()
-        .any(|l| matches!(l, LaneKind::L4Packet | LaneKind::L4Stream));
-    if !wants_l4 {
+    if !wants_l4(lanes) {
         None
     } else if !has_l4_scope_list {
         Some(GATE_NO_LAYER.to_string())
     } else {
         Some(GATE_OPEN_PROFILE.to_string())
     }
+}
+
+/// Whether `lanes` has an L4 lane, the one test both gates open with (fix
+/// round H, H29).
+fn wants_l4(lanes: &[LaneKind]) -> bool {
+    lanes
+        .iter()
+        .any(|l| matches!(l, LaneKind::L4Packet | LaneKind::L4Stream))
 }
 
 /// A pending confirm-over-the-wire handshake (spec D3, D7), generalised from the
@@ -225,10 +226,10 @@ impl WireConfirm {
 pub struct PendingLaunch {
     /// The verb.
     pub call: LaunchVerb,
-    /// The arguments as sent (re-issued with `_confirm` after a prompt).
-    pub args: Value,
-    /// The profile the launch named, for the toast.
-    pub profile_name: Option<String>,
+    /// What was sent and named: the arguments (re-issued with `_confirm`
+    /// after a prompt) and the profile name for the toast (fix round H,
+    /// H27: the [`Launch`] moved in whole).
+    pub launch: Launch,
 }
 
 /// The launch state of the Scan view.
