@@ -1,0 +1,14 @@
+== --selftest without APP_LIVE (stdout only) ==
+SELFTEST refused: the fixture self-test was removed on 2026-10-31; run tools/selftest-live.sh (APP_LIVE=1)
+exit=1
+aitm processes before=1 after=1
+== --selftest without APP_STORE (stdout only) ==
+SELFTEST refused: set APP_STORE to a folder in /tmp
+exit=1
+== APP_FIXTURES=1 (removed switch, stdout only) ==
+APP_FIXTURES was removed on 2026-10-31 with the fixture modes; see apps/mac/CLAUDE.md
+exit=1
+== APP_SNAPSHOT=/tmp/x (removed switch, stdout only) ==
+APP_SNAPSHOT was removed on 2026-10-31 with the fixture modes; see apps/mac/CLAUDE.md
+exit=1
+aitm processes at the end=1

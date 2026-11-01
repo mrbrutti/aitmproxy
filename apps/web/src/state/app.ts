@@ -8,9 +8,10 @@
 
 import { batch, createEffect, createMemo, createRoot, createSignal, on, untrack, type Accessor } from 'solid-js';
 import { createStore, produce, reconcile, type SetStoreFunction } from 'solid-js/store';
-import type { BusClient, AgentNotification, FlowEventKind, FlowNotification, PocRun, StateNotification, ToolDef } from '~/bus/types';
+import type { BusClient, AgentNotification, CAStatusWire, FlowEventKind, FlowNotification, PocRun, StateNotification, ToolDef } from '~/bus/types';
 import { toAgentEntry, toDetail, toSummary } from '~/bus/normalize';
 import { isUiPollNoise, ownOriginOf } from '~/bus/noise';
+import { parseCATrust, type CATrustStatus } from './caTrust';
 import {
   contentFamily,
   type ContentFamily,
@@ -238,6 +239,11 @@ export function createAppStore(bus: BusClient) {
       version: '',
     });
     let activitySeq = 0;
+
+    // CA trust (§D17.12): the last `ca.status` reading, and whether a `ca.install` / `ca.uninstall`
+    // run is in flight. The word always comes from the read-back, never from the install's reply.
+    const [caStatus, setCaStatus] = createSignal<CATrustStatus | null>(null);
+    const [caInstalling, setCAInstalling] = createSignal(false);
 
     const [toast, setToast] = createSignal<{ text: string; kind: 'error' | 'info' } | null>(null);
     let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -890,12 +896,29 @@ export function createAppStore(bus: BusClient) {
       await Promise.all(jobs);
     }
 
+    /**
+     * Re-read `ca.status` into `ca` (D17.5); true when the read-back landed. A missing tool leaves
+     * the reading untouched and a failed read keeps the last one, both false, so the caller that
+     * just changed the trust store can say the word may be stale. Each read costs the core one
+     * trust evaluation per store, so it runs only at bootstrap and after a `ca.install` /
+     * `ca.uninstall` run, not on every side refresh.
+     */
+    async function refreshCA(): Promise<boolean> {
+      if (!proxy.tools.some((t) => t.name === 'ca.status')) return false;
+      try {
+        setCaStatus(parseCATrust(await bus.call<CAStatusWire>('ca.status')));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
     /** The tool catalogue, then everything read through it. Shared by bootstrap and the loop's heal. */
     async function loadCatalogue() {
       const tools = await bus.tools();
       setProxy('tools', tools);
       toolsLoaded = true;
-      await refreshSide();
+      await Promise.all([refreshSide(), refreshCA()]);
     }
 
     async function bootstrap() {
@@ -1442,6 +1465,9 @@ export function createAppStore(bus: BusClient) {
       scanDiscover: (args: Record<string, unknown>) => guarded('scan', () => bus.call<unknown>('scan.discover', args)),
       ensurePocSource,
       refreshSide,
+      refreshCA,
+      /** Set by the palette for the duration of a `ca.install` / `ca.uninstall` run and its re-read. */
+      setCAInstalling: (on: boolean) => setCAInstalling(on),
       /** The lifted L4 store calls this on each refresh so selection/list routing knows L4 ids. */
       setL4Ids: (ids: readonly FlowId[]) => setL4IdsSig(new Set<FlowId>(ids)),
       call: <T,>(tool: string, args?: Record<string, unknown>) => bus.call<T>(tool, args),
@@ -1469,6 +1495,13 @@ export function createAppStore(bus: BusClient) {
       oldestPaused,
       details,
       toast,
+      /** The last `ca.status` reading; null before the first read, without the tool, or when no store reports. */
+      get ca(): CATrustStatus | null {
+        return caStatus();
+      },
+      get caInstalling(): boolean {
+        return caInstalling();
+      },
       ...actions,
     };
   });

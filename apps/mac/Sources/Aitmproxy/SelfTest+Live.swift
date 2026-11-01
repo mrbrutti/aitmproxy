@@ -5,7 +5,7 @@ import Observation
 
 /// The live self-test: with `APP_LIVE=1` and a running `aitm` (its config at
 /// `AITM_CONFIG`), every `FlowActions` call goes over the real bus through
-/// `BusService`, the path the fixture self-test never touches.
+/// `BusService`.
 ///   AITM_CONFIG=… APP_STORE=/tmp/x APP_LIVE=1 Aitmproxy --selftest   (tools/selftest-live.sh)
 /// Commands the core lacks yet (F6 mark/comment, F7 pause/clear) must come
 /// back as recorded errors, never as a hang or a crash.
@@ -344,6 +344,10 @@ extension SelfTest {
             check("every action is in the activity log (\(recorded) operator entries)", recorded >= 11)
 
             checkHumanInputPath(session)
+            // S-069: the menu bar carries the brief's command map, and a bare-letter
+            // shortcut never takes a letter from a text field (SelfTest.swift).
+            checkMenuCoverage()
+            await checkTypingIsNotAVerb(session)
             finishLive()
         }
     }

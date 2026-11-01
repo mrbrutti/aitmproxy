@@ -172,11 +172,6 @@ struct CAPanel: View {
     // MARK: Actions
 
     private func load() {
-        if Store.usesFixtures {
-            status = Fixtures.caStatus
-            agentMayInstall = Fixtures.caStatus.allowAgentInstall
-            return
-        }
         agentMayInstall = configFlag()
         Task {
             if let json = try? await session.runCommand("ca.status", [:]), let parsed = CAStatus(json: json) {
