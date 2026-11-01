@@ -7,7 +7,7 @@
 //! Fixture-driven: this proves the overlay and the cancel path only. Acceptance
 //! is the pty cell against a real core (spec Acceptance criteria, "Live").
 
-use aitm_tui::action::{Action, BusRequest};
+use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::fixture_app_core;
 use aitm_tui::scan::launch::WireConfirm;
@@ -33,7 +33,7 @@ fn the_overlay_titles_and_footnotes_by_call_name() {
     app.wire_confirm = Some(WireConfirm {
         call: "scan.start".into(),
         args: json!({ "profile_name": "l4-stream-safe" }),
-        prompt: "P".into(),
+        prompt: "Prompt-7Q verbatim".into(),
         token: "tok-1".into(),
     });
     app.mode = Mode::WireConfirm;
@@ -44,7 +44,7 @@ fn the_overlay_titles_and_footnotes_by_call_name() {
         "scan launch title: {text}"
     );
     assert!(
-        text.lines().any(|l| l.contains(" P")),
+        text.contains("Prompt-7Q verbatim"),
         "the prompt is shown verbatim: {text}"
     );
     assert!(
@@ -81,15 +81,93 @@ fn n_cancels_with_the_call_name() {
         token: "tok-1".into(),
     });
     app.mode = Mode::WireConfirm;
+    app.wire_confirm_from = Mode::Scan;
 
     let reqs: Vec<BusRequest> = app.update(Action::WireConfirm(false));
     assert!(reqs.is_empty(), "cancel sends nothing: {reqs:?}");
     assert!(app.wire_confirm.is_none(), "the pending confirm is cleared");
     assert_eq!(
-        app.mode, app.wire_confirm_from,
-        "cancel returns to the launch mode"
+        app.mode,
+        Mode::Scan,
+        "cancel returns to the mode the launch came from"
     );
     assert_eq!(toast(&app), "scan.start cancelled");
+}
+
+/// Fix round A, A5: a confirm token is bound to the connection that issued
+/// it, so a `Disconnected` while the overlay is up drops the pending confirm,
+/// returns to the mode the launch came from and says why; nothing is sent.
+#[test]
+fn a_disconnect_drops_the_pending_confirm() {
+    let mut app = fixture_app_core(200, 50);
+    app.wire_confirm = Some(WireConfirm {
+        call: "scan.start".into(),
+        args: json!({ "profile_name": "l4-stream-safe" }),
+        prompt: "Prompt-7Q verbatim".into(),
+        token: "tok-1".into(),
+    });
+    app.mode = Mode::WireConfirm;
+    app.wire_confirm_from = Mode::Scan;
+
+    let reqs = app.on_bus(BusEvent::Disconnected("connection reset".into()));
+    assert!(reqs.is_empty(), "a disconnect sends nothing: {reqs:?}");
+    assert!(app.wire_confirm.is_none(), "the pending confirm is dropped");
+    assert_eq!(
+        app.mode,
+        Mode::Scan,
+        "the overlay closes to the launch mode"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.text == "scan.start confirmation dropped: bus disconnected"),
+        "the operator is told why: {:?}",
+        app.toasts
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+    );
+    let text = screen(&app, 200, 50);
+    assert!(
+        !text.contains("Confirm over the wire"),
+        "the overlay is gone: {text}"
+    );
+}
+
+/// Fix round A, A11 (D13: hue only on data): the overlay's call-name line
+/// reads in the accent for a `scan.*` call and in the L4 hue for an `l4.*`
+/// call; the two hues differ.
+#[test]
+fn the_call_name_line_takes_the_hue_of_its_family() {
+    let theme = Theme::new(true);
+    let accent = theme.accent().fg.expect("accent has a colour");
+    let l4 = theme.l4().fg.expect("l4 has a colour");
+    assert_ne!(accent, l4, "the two hues are distinct");
+
+    for (call, want) in [("scan.start", accent), ("l4.inject", l4)] {
+        let mut app = fixture_app_core(200, 50);
+        app.wire_confirm = Some(WireConfirm {
+            call: call.into(),
+            args: json!({}),
+            prompt: "Prompt-7Q verbatim".into(),
+            token: "tok-1".into(),
+        });
+        app.mode = Mode::WireConfirm;
+        let buf = render(&app, &theme, 200, 50);
+        let text = to_text(&buf);
+        let needle = format!(" {call}");
+        let (y, line) = text
+            .lines()
+            .enumerate()
+            .find(|(_, l)| l.contains(&needle))
+            .unwrap_or_else(|| panic!("the call-name line is drawn: {text}"));
+        let x = line
+            .find(call)
+            .map(|b| line[..b].chars().count())
+            .expect("column");
+        let cell = buf.cell((x as u16, y as u16)).expect("cell");
+        assert_eq!(cell.fg, want, "{call}: the call-name hue");
+    }
 }
 
 /// The box is centred and fits both the narrow and the wide layout without

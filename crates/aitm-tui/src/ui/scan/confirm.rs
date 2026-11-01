@@ -38,10 +38,17 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         screen.height.saturating_sub(8).clamp(7, 16),
     );
     let inner = boxed(theme, title, area, buf);
+    // D13, hue only on data: the call-name line reads in the hue of its
+    // family, the accent for a scan launch and the L4 hue for an L4 verb.
+    let call_hue = if c.call.starts_with("scan.") {
+        theme.accent()
+    } else {
+        theme.l4()
+    };
     let mut lines = vec![
         Line::styled(
             format!(" {}", c.call),
-            theme.l4().add_modifier(Modifier::BOLD),
+            call_hue.add_modifier(Modifier::BOLD),
         ),
         Line::raw(""),
     ];
