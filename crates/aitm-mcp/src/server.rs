@@ -2510,7 +2510,17 @@ fn defers_to_command_gate(name: &str) -> bool {
 /// `agent.approve` is also intercepted before the policy gate; this keeps `agent.set`
 /// (and any future operator-only Sensitive command) from being parked.
 fn is_operator_only(name: &str) -> bool {
-    matches!(name, "agent.set" | "agent.approve" | "l4.agent.set")
+    matches!(
+        name,
+        "agent.set"
+            | "agent.approve"
+            | "l4.agent.set"
+            // The system-proxy mutators (spec 2026-10-31-system-proxy-automation-design,
+            // SP-AC16): an agent can never point the OS at this core or restore it, so
+            // under `Ask` the call is refused outright, never parked for approval.
+            | "proxy.system.set"
+            | "proxy.system.unset"
+    )
 }
 
 /// The one decision behind both "may an agent-role caller subscribe now"
@@ -3476,6 +3486,164 @@ mod tests {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // ------------------- SP-AC16: proxy.system.set/unset are operator-only, never parked
+
+    /// A stand-in for one `proxy.system.*` verb (spec 2026-10-31-system-proxy-
+    /// automation-design, SP-AC16): the real verbs live in `aitm-sysproxy`, which
+    /// this crate must not depend on, so the gate is proved over fakes that carry
+    /// the real names and sensitivities and count their runs.
+    struct SysProxyVerb {
+        name: &'static str,
+        sensitivity: Sensitivity,
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl Command for SysProxyVerb {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn sensitivity(&self) -> Sensitivity {
+            self.sensitivity
+        }
+        fn schema(&self) -> ParamSchema {
+            ParamSchema {
+                description: format!("A stand-in for {}.", self.name),
+                params: vec![],
+                result: TypeDesc::Str,
+            }
+        }
+        fn invoke(&self, _args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            Ok(Value::Str("ran".into()))
+        }
+    }
+
+    /// A server under `policy` with the three `proxy.system.*` stand-ins (`set` and
+    /// `unset` Sensitive, `status` Read), the real `agent.*` verbs, a 1 s approval
+    /// timeout, and an operator subscribed through `flow.subscribe` so that an `Ask`
+    /// park would be possible (and visible on the operator's sink). Returns the
+    /// server, the operator connection, and the stand-ins' shared run counter.
+    fn sysproxy_server(policy: AgentPolicy) -> (McpServer, ConnCtx, Arc<AtomicUsize>) {
+        let state = Arc::new(AgentState::new(policy));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let mut registry = Registry::new();
+        for (name, sensitivity) in [
+            ("proxy.system.status", Sensitivity::Read),
+            ("proxy.system.set", Sensitivity::Sensitive),
+            ("proxy.system.unset", Sensitivity::Sensitive),
+        ] {
+            registry.add_command(Arc::new(SysProxyVerb {
+                name,
+                sensitivity,
+                runs: runs.clone(),
+            }));
+        }
+        registry.add_plugin(Box::new(AgentPlugin::new(state.clone())));
+        let srv = McpServer::new(Arc::new(registry), McpTransport::Stdio)
+            .with_agent_state(state)
+            .with_approval_timeout(Duration::from_secs(1))
+            .with_services(
+                Arc::new(MemFlowStore::new()),
+                Arc::new(NoClient),
+                Arc::new(StdGuard::default()),
+                None,
+            );
+        let operator = revoke_subscribe(&srv, ConnCtx::new(Frontend::Operator));
+        (srv, operator, runs)
+    }
+
+    /// The reply to an agent-role `tools/call name {}` on `srv`.
+    fn sysproxy_agent_call(srv: &McpServer, name: &str) -> JsonValue {
+        let reply = srv
+            .handle_on(
+                &ConnCtx::agent(),
+                &json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": {}}})
+                .to_string(),
+            )
+            .expect("the call replies");
+        serde_json::from_str(&reply).expect("the reply is JSON")
+    }
+
+    /// SP-AC16. Under each of `All`, `Auto` and `Ask`, an agent-role call to
+    /// `proxy.system.set` and to `proxy.system.unset` is refused outright and never
+    /// parked: the reply is a tool error naming the operator, the stand-in never
+    /// ran, the parked table is empty, and the connected operator received no
+    /// `approval_requested` line (under `Ask` a parkable command would have pushed
+    /// one and then timed out). `proxy.system.status` is a Read verb and runs under
+    /// `ReadOnly`. The two source predicates agree: both mutating names are
+    /// operator-only and neither defers to a command gate.
+    #[test]
+    fn proxy_system_verbs_are_operator_only_never_parked() {
+        for policy in [AgentPolicy::All, AgentPolicy::Auto, AgentPolicy::Ask] {
+            let (srv, operator, runs) = sysproxy_server(policy);
+            let sink = operator.out.as_ref().expect("the operator has a sink");
+            sink.drain();
+            for name in ["proxy.system.set", "proxy.system.unset"] {
+                let reply = sysproxy_agent_call(&srv, name);
+                let text = revoke_result_text(&reply["result"]);
+                assert_eq!(
+                    reply["result"]["isError"],
+                    json!(true),
+                    "{name} under {policy:?} is a tool error: {reply}"
+                );
+                assert!(
+                    text.starts_with(&format!("`{name}` refused:")) && text.contains("operator"),
+                    "{name} under {policy:?} is refused, naming the operator: {text:?}"
+                );
+                assert!(
+                    !text.contains("approval timeout")
+                        && !text.contains("approved")
+                        && !text.contains("awaiting"),
+                    "{name} under {policy:?} was refused, not parked and timed out: {text:?}"
+                );
+                assert_eq!(
+                    srv.parked.len(),
+                    0,
+                    "{name} under {policy:?} left no parked entry"
+                );
+                let pushed = sink.drain();
+                assert!(
+                    pushed
+                        .iter()
+                        .all(|line| !line.contains("approval_requested")),
+                    "{name} under {policy:?} pushed no approval request to the operator: \
+                     {pushed:?}"
+                );
+            }
+            assert_eq!(
+                runs.load(Ordering::SeqCst),
+                0,
+                "no mutating stand-in ran under {policy:?}"
+            );
+        }
+
+        let (srv, _operator, runs) = sysproxy_server(AgentPolicy::ReadOnly);
+        let reply = sysproxy_agent_call(&srv, "proxy.system.status");
+        assert_eq!(
+            reply["result"]["isError"],
+            json!(false),
+            "proxy.system.status is Read, so ReadOnly allows it: {reply}"
+        );
+        assert_eq!(
+            revoke_result_text(&reply["result"]),
+            "\"ran\"",
+            "the transcript carries the stand-in's JSON-rendered result"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the status stand-in ran once"
+        );
+
+        // The source predicates the gate is built from agree with the behaviour.
+        assert!(is_operator_only("proxy.system.set"));
+        assert!(is_operator_only("proxy.system.unset"));
+        assert!(!is_operator_only("proxy.system.status"));
+        assert!(!defers_to_command_gate("proxy.system.set"));
+        assert!(!defers_to_command_gate("proxy.system.unset"));
     }
 
     /// AC11: once the policy has left `ask`, an `agent.approve allow:true` does not
