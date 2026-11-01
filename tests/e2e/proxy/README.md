@@ -60,9 +60,10 @@ Python stdlib has no h2 server).
   booted with an EMPTY scope: an HTTPS request to an out-of-scope origin is
   tunnelled, not decrypted (`curl --cacert <aitm ca>` fails to verify because the
   client saw the ORIGIN's own cert; `curl -k` gets the origin's marker) and the bus
-  holds exactly one `CONNECT` row for it — `tunnel == "passthrough"`,
-  `tunnel_reason == "out_of_scope"`, status 200, `bytes_up`/`bytes_down` > 0,
-  `duration_ms` set once the client closed — and no decrypted `GET` row;
+  holds one `CONNECT` row per connection (one after the first curl, two after the
+  second), all `tunnel == "passthrough"`, `tunnel_reason == "out_of_scope"`,
+  status 200, `bytes_up`/`bytes_down` > 0, `duration_ms` set once the client
+  closed — never a decrypted `GET` row;
   `scope.add` flips the NEXT connection live (a `decrypted` CONNECT row plus a
   `GET` row with `passive == false`; the earlier passthrough row is untouched);
   `scope.remove` flips it back (a new `passthrough` row, no new `GET`); a client

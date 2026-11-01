@@ -18,18 +18,24 @@
 //! `metadata.tunnel` is `passthrough` with reason `pinned` or `out_of_scope`,
 //! carrying the `200 Connection Established` acknowledgement while the tunnel is
 //! open and, once either side closes, its `duration` and exact `bytes_up` /
-//! `bytes_down`. A resolve or dial failure is a `failed/upstream_unreachable` row
-//! (no status, closed on insert) and the client is dropped without an
-//! acknowledgement. The row's headers are the CONNECT head's; a captured
-//! connection's attribution (`source_app`, `capture_interface`) is carried over.
+//! `bytes_down`. Every earlier exit is a `failed` row (no status, closed on
+//! insert): a CONNECT head that cannot be read (`client_closed`) or is oversized
+//! or malformed (`protocol_error`), keyed on the authority the acceptor peeked; a
+//! resolve or dial failure (`upstream_unreachable`), after which the client is
+//! dropped without an acknowledgement; an acknowledgement the client is no longer
+//! there to read (`client_closed`). The row's headers are the CONNECT head's; a
+//! captured connection's attribution (`source_app`, `capture_interface`) is
+//! carried over.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    relay, Authority, ByteStream, ConnInfo, HeaderMap, ModuleCtx, NextLayerHint, ProtocolModule,
-    ScopeRateGuard, TunnelInfo, TunnelReason, TunnelRequest, TunnelRow,
+    classify_client_failure, relay, Authority, ByteStream, ConnInfo, HeaderMap, ModuleCtx,
+    NextLayerHint, ProtocolModule, ScopeRateGuard, TunnelInfo, TunnelReason, TunnelRequest,
+    TunnelRow,
 };
 use anyhow::{anyhow, Context, Result};
 use futures::future::BoxFuture;
@@ -80,8 +86,11 @@ impl PassthroughModule {
 
     /// Open the upstream and copy bytes both ways with no TLS termination,
     /// recording the connection as one tunnel row (spec D5/D6: parse → dial →
-    /// ack → row `passthrough` → relay → close with bytes and duration; a dial
-    /// failure is a `failed/upstream_unreachable` row).
+    /// ack → row `passthrough` → relay → close with bytes and duration). Every
+    /// earlier exit is a `failed` row: a head that cannot be read or parsed
+    /// (`client_closed` / `protocol_error`, keyed on the authority the acceptor
+    /// peeked), a dial failure (`upstream_unreachable`), an acknowledgement that
+    /// cannot be written (`client_closed`).
     async fn tunnel(&self, mut client: ByteStream, ctx: ModuleCtx) -> Result<()> {
         // The row's `created`, and what its `duration` is measured from.
         let opened_at = SystemTime::now();
@@ -89,22 +98,49 @@ impl PassthroughModule {
         let peer = hint
             .map(|h| h.dst)
             .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
-        let client_sni = hint.and_then(|h| h.client_hello_sni.clone());
-        let source_app = hint.and_then(|h| h.peer_identity.clone());
-        let capture_interface = hint.and_then(|h| h.capture_interface.clone());
         let is_connect = hint.is_some_and(|h| h.first_bytes.starts_with(b"CONNECT "));
         // The authority `matches` decided on (spec D1), when the peek held it.
         let hinted = hint.and_then(NextLayerHint::tunnel_authority);
+        let side = ClientSide {
+            client: ConnInfo {
+                peer,
+                sni: hint.and_then(|h| h.client_hello_sni.clone()),
+                alpn: None,
+                tls: true,
+                established: opened_at,
+            },
+            opened_at,
+            source_app: hint.and_then(|h| h.peer_identity.clone()),
+            capture_interface: hint.and_then(|h| h.capture_interface.clone()),
+        };
 
         // Two ways in: a `CONNECT host:port` tunnel (read the head here so the
         // client's TLS that follows stays in the stream; acknowledge it once the
         // origin is up), or a raw TLS connection whose ClientHello SNI the acceptor
         // matched (nothing to read first, no headers).
         let (authority, headers) = if is_connect {
-            let head = read_connect_head(&mut client).await?;
-            let (line_authority, headers) = parse_connect(&head)?;
+            let head = match read_connect_head(&mut client).await {
+                Ok(head) => head,
+                Err(err) => {
+                    // By type: EOF / reset → `client_closed`; the size cap
+                    // (`InvalidData`) → `protocol_error`.
+                    let err =
+                        anyhow::Error::from(err).context("passthrough: reading the CONNECT head");
+                    record_failed_head(&ctx, side, hinted, classify_client_failure(&err)).await;
+                    return Err(err);
+                }
+            };
+            let (line_authority, headers) = match parse_connect(&head) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    record_failed_head(&ctx, side, hinted, TunnelReason::ProtocolError).await;
+                    return Err(err);
+                }
+            };
             let authority = match hinted {
                 Some(authority) => authority,
+                // Only reached when the peek held no usable authority, so a failure
+                // here has nothing to key a row on (see `record_failed_head`).
                 None => Authority::parse_with_default(&line_authority, 443)
                     .map_err(|e| anyhow!("passthrough: CONNECT authority: {e}"))?,
             };
@@ -115,21 +151,7 @@ impl PassthroughModule {
             (authority, HeaderMap::new())
         };
 
-        let mut req = TunnelRequest {
-            authority,
-            headers,
-            client: ConnInfo {
-                peer,
-                sni: client_sni,
-                alpn: None,
-                tls: true,
-                established: opened_at,
-            },
-            server: None,
-            opened_at,
-            source_app,
-            capture_interface,
-        };
+        let mut req = side.request(authority, headers);
 
         let (dst, mut upstream) = match dial(&ctx, &req.authority).await {
             Ok(dialled) => dialled,
@@ -147,14 +169,9 @@ impl PassthroughModule {
             }
         };
 
-        // The upstream is open: acknowledge the CONNECT so the client starts TLS.
-        if is_connect {
-            client
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await?;
-            client.flush().await?;
-        }
-
+        // The dialled origin is on the row from here, so a failed acknowledgement
+        // still shows which origin was reached (spec D5: `server_conn` is the
+        // resolved origin when one was dialled).
         req.server = Some(ConnInfo {
             peer: dst,
             sni: Some(req.authority.host.clone()),
@@ -162,6 +179,20 @@ impl PassthroughModule {
             tls: true,
             established: SystemTime::now(),
         });
+
+        // The upstream is open: acknowledge the CONNECT so the client starts TLS.
+        // The ack comes before the row (spec D5: a passthrough row appears once the
+        // origin was dialled *and* the acknowledgement written), so an ack the
+        // client is no longer there to read is a `failed` row, not an open one.
+        if is_connect {
+            if let Err(err) = write_ack(&mut client).await {
+                let err = anyhow::Error::from(err)
+                    .context("passthrough: writing the CONNECT acknowledgement");
+                TunnelRow::open(&ctx, req, TunnelInfo::failed(classify_client_failure(&err))).await;
+                return Err(err);
+            }
+        }
+
         let reason = self.passthrough_reason(&req.authority);
         let row = TunnelRow::open(&ctx, req, TunnelInfo::passthrough(reason)).await;
 
@@ -199,6 +230,54 @@ impl ProtocolModule for PassthroughModule {
     }
 }
 
+/// What the module knows about the client before the CONNECT head is read:
+/// enough to key a `failed` row on, and the client half of the request a
+/// passthrough row is opened with.
+struct ClientSide {
+    client: ConnInfo,
+    opened_at: SystemTime,
+    source_app: Option<String>,
+    capture_interface: Option<String>,
+}
+
+impl ClientSide {
+    /// The [`TunnelRequest`] for `authority`, origin not yet dialled.
+    fn request(self, authority: Authority, headers: HeaderMap) -> TunnelRequest {
+        TunnelRequest {
+            authority,
+            headers,
+            client: self.client,
+            server: None,
+            opened_at: self.opened_at,
+            source_app: self.source_app,
+            capture_interface: self.capture_interface,
+        }
+    }
+}
+
+/// Spec D5: a CONNECT whose head could not be read or parsed is still a row — a
+/// `failed` one with `reason`, keyed on the authority the acceptor's peek held
+/// (the one `matches` accepted the connection on), no headers, closed on insert.
+/// When the peek held no authority there is nothing to key a row on, so none is
+/// recorded and only the error is returned (the prior behaviour). That is
+/// unreachable through the acceptor, which hands the module only connections
+/// `matches` accepted, and `matches` needs a tunnel authority.
+async fn record_failed_head(
+    ctx: &ModuleCtx,
+    side: ClientSide,
+    hinted: Option<Authority>,
+    reason: TunnelReason,
+) {
+    if let Some(authority) = hinted {
+        TunnelRow::open(
+            ctx,
+            side.request(authority, HeaderMap::new()),
+            TunnelInfo::failed(reason),
+        )
+        .await;
+    }
+}
+
 /// Resolve `authority` and open the upstream through the connection's connector.
 /// An IP literal is dialled as is (no lookup, so a loopback origin needs no
 /// resolver); a name goes through the system resolver. Any failure here is the
@@ -220,23 +299,40 @@ async fn dial(ctx: &ModuleCtx, authority: &Authority) -> Result<(SocketAddr, Byt
 }
 
 /// Read a CONNECT request head one byte at a time so the bytes that follow it (the
-/// client's TLS ClientHello) stay unread in the stream for the byte tunnel.
-async fn read_connect_head(client: &mut ByteStream) -> Result<Vec<u8>> {
+/// client's TLS ClientHello) stay unread in the stream for the byte tunnel. The
+/// errors are typed for [`classify_client_failure`]: a client that hangs up
+/// mid-head is `UnexpectedEof` (→ `client_closed`), a head past the cap is
+/// `InvalidData` (→ `protocol_error`).
+async fn read_connect_head(client: &mut ByteStream) -> io::Result<Vec<u8>> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     loop {
         let n = client.read(&mut byte).await?;
         if n == 0 {
-            return Err(anyhow!("connection closed before the CONNECT head ended"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed before the CONNECT head ended",
+            ));
         }
         head.push(byte[0]);
         if head.ends_with(b"\r\n\r\n") {
             return Ok(head);
         }
         if head.len() > MAX_CONNECT_HEAD {
-            return Err(anyhow!("CONNECT head exceeded {MAX_CONNECT_HEAD} bytes"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("CONNECT head exceeded {MAX_CONNECT_HEAD} bytes"),
+            ));
         }
     }
+}
+
+/// Write the `200 Connection Established` acknowledgement to the client.
+async fn write_ack(client: &mut ByteStream) -> io::Result<()> {
+    client
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await?;
+    client.flush().await
 }
 
 /// The authority (`host[:port]`) and the header lines of a `CONNECT host:port
@@ -793,5 +889,189 @@ mod tests {
                 bytes_down: Some(DOWN.len() as u64),
             })
         );
+    }
+
+    // ---- Spec D5 "every CONNECT is a row": the paths before the relay ----------
+
+    /// A client that goes away mid-head (a speculative pre-connect that gave up)
+    /// is a `failed/client_closed` row keyed on the authority the acceptor peeked:
+    /// no dial, no ack, closed on insert, and `spawn` returns the error.
+    #[tokio::test]
+    async fn connect_head_eof_is_a_failed_client_closed_row() {
+        let guard = guard_with(&[]);
+        let module =
+            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
+        let (mut client, _origin, mut h) =
+            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+
+        // The peek saw the CONNECT line; the client hangs up before the blank
+        // line that ends the head.
+        client
+            .write_all(b"CONNECT 127.0.0.1:4443 HTTP/1.1\r\nHost: 127.0")
+            .await
+            .expect("client writes a partial head");
+        drop(client);
+        let err = h
+            .finish()
+            .await
+            .expect_err("an unfinished head is an error");
+        assert!(
+            format!("{err:#}").contains("CONNECT head"),
+            "the read error is returned: {err:#}"
+        );
+
+        let row = h.row();
+        assert_eq!(row.request.method, "CONNECT");
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert!(row.request.headers.is_empty(), "nothing was parsed");
+        assert!(row.response.is_none(), "a failed tunnel has no status");
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ClientClosed))
+        );
+        assert!(
+            row.metadata.duration.is_some(),
+            "failed rows are closed on insert"
+        );
+        assert!(row.server_conn.is_none(), "the origin was never dialled");
+        assert_eq!(row.client_conn.peer, peer());
+        assert_eq!(h.connector.asked(), None, "no dial before the head is read");
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+    }
+
+    /// A CONNECT head past the 16 KiB cap is a `failed/protocol_error` row keyed
+    /// on the peeked authority; the client is cut off before any dial.
+    #[tokio::test]
+    async fn oversized_connect_head_is_a_failed_protocol_error_row() {
+        let guard = guard_with(&[]);
+        let module =
+            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
+        let (mut client, _origin, mut h) =
+            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+
+        // One byte over the cap and still no blank line.
+        let mut head = b"CONNECT 127.0.0.1:4443 HTTP/1.1\r\nX-Pad: ".to_vec();
+        head.resize(MAX_CONNECT_HEAD + 1, b'a');
+        client.write_all(&head).await.expect("client writes");
+        let err = h.finish().await.expect_err("an oversized head is an error");
+        assert!(
+            format!("{err:#}").contains("exceeded"),
+            "the cap error is returned: {err:#}"
+        );
+
+        let row = h.row();
+        assert_eq!(row.request.method, "CONNECT");
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert!(row.request.headers.is_empty(), "nothing was parsed");
+        assert!(row.response.is_none(), "a failed tunnel has no status");
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ProtocolError))
+        );
+        assert!(row.metadata.duration.is_some());
+        assert!(row.server_conn.is_none(), "the origin was never dialled");
+        assert_eq!(h.connector.asked(), None, "no dial before the head is read");
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+    }
+
+    /// A head the module cannot parse (here a non-UTF-8 header line) is a
+    /// `failed/protocol_error` row, not silence.
+    #[tokio::test]
+    async fn malformed_connect_head_is_a_failed_protocol_error_row() {
+        let guard = guard_with(&[]);
+        let module =
+            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
+        let (mut client, _origin, mut h) =
+            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+
+        client
+            .write_all(b"CONNECT 127.0.0.1:4443 HTTP/1.1\r\nX-Bad: \xff\xfe\r\n\r\n")
+            .await
+            .expect("client writes");
+        let err = h.finish().await.expect_err("a non-UTF-8 head is an error");
+        assert!(
+            format!("{err:#}").contains("non-UTF-8"),
+            "the parse error is returned: {err:#}"
+        );
+
+        let row = h.row();
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert!(row.response.is_none(), "a failed tunnel has no status");
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ProtocolError))
+        );
+        assert!(row.metadata.duration.is_some());
+        assert!(row.server_conn.is_none(), "the origin was never dialled");
+        assert_eq!(h.connector.asked(), None);
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+    }
+
+    /// The origin is up but the acknowledgement cannot be written (the client
+    /// hung up between its CONNECT and our 200): a `failed/client_closed` row
+    /// carrying the dialled origin, no status, nothing relayed.
+    #[tokio::test]
+    async fn ack_write_failure_is_a_failed_row() {
+        let guard = guard_with(&[]);
+        let module =
+            PassthroughModule::new(PassthroughList::new(Vec::new())).with_scope(guard.clone());
+        let (mut client, origin, mut h) =
+            start(module, Some(guard), connect_hint("127.0.0.1:4443"), true);
+        let mut origin = origin.expect("origin");
+
+        // The whole head goes in, then the client is gone: its bytes stay
+        // readable (the head is read whole) but the ack has no reader to reach.
+        client
+            .write_all(CONNECT_HEAD.as_bytes())
+            .await
+            .expect("client writes");
+        drop(client);
+        let err = h.finish().await.expect_err("a failed ack is an error");
+        assert!(
+            format!("{err:#}").contains("acknowledgement"),
+            "the ack write error is returned: {err:#}"
+        );
+        assert_eq!(
+            h.connector.asked(),
+            Some(("127.0.0.1:4443".to_string(), origin_addr())),
+            "the origin was dialled before the ack"
+        );
+
+        let row = h.row();
+        assert_eq!(row.request.method, "CONNECT");
+        assert_eq!(row.request.authority, "127.0.0.1:4443");
+        assert_eq!(row.request.headers.get("host"), Some("127.0.0.1:4443"));
+        assert!(
+            row.response.is_none(),
+            "no 200: the acknowledgement never reached the client"
+        );
+        assert_eq!(
+            row.metadata.tunnel,
+            Some(TunnelInfo::failed(TunnelReason::ClientClosed))
+        );
+        assert!(row.metadata.duration.is_some());
+        assert_eq!(
+            row.server_conn.as_ref().map(|s| s.peer),
+            Some(origin_addr()),
+            "the dialled origin is on the row"
+        );
+        assert_eq!(
+            h.sink.events(),
+            vec![Event::RequestHeaders(row.id), Event::Response(row.id)]
+        );
+
+        // Nothing was relayed: the origin sees EOF at once.
+        let mut rest = Vec::new();
+        origin.read_to_end(&mut rest).await.expect("origin read");
+        assert_eq!(rest, b"");
     }
 }

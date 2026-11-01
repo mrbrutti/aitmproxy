@@ -460,7 +460,7 @@ async fn opted_in_plugin_cannot_park_a_passive_flow() {
         tunnel: Some(TunnelInfo::passthrough(TunnelReason::OutOfScope)),
         ..FlowMeta::default()
     }));
-    let chain = Chain::new(Arc::new(reg), store);
+    let chain = Chain::new(Arc::new(reg), store.clone());
 
     let verdict = tokio::time::timeout(
         Duration::from_millis(100),
@@ -470,4 +470,13 @@ async fn opted_in_plugin_cannot_park_a_passive_flow() {
     .expect("a passive dispatch must return even if an observer tried to park it");
 
     assert_eq!(verdict, Verdict::Continue);
+
+    // The dropped park must not leak into the store: the row reads `observed`,
+    // never `intercepted` with a resume handle nobody awaits.
+    let stored = store.get(id).expect("the passive row is still stored");
+    let Flow::Http(row) = stored else {
+        panic!("the passive row is an HTTP flow, got {stored:?}");
+    };
+    assert_eq!(row.intercept.label(), "observed");
+    assert_eq!(store.intercepted_count(), 0);
 }

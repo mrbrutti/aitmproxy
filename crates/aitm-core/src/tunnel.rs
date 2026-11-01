@@ -289,6 +289,9 @@ impl AsyncWrite for Counted<'_> {
 ///   `BadCertificateStatusResponse`, `CertificateRequired`) →
 ///   [`TunnelReason::ClientRejectedCertificate`]: the client does not trust the
 ///   proxy's CA (Safari, `curl` without `--cacert`).
+/// - A received `close_notify` alert → [`TunnelReason::ClientClosed`]: a graceful
+///   close during the handshake, not a protocol fault (spec D5, amended
+///   2026-11-01).
 /// - Any other `rustls::Error` → [`TunnelReason::ClientTlsError`].
 /// - Anything else → [`TunnelReason::ProtocolError`].
 pub fn classify_client_failure(err: &anyhow::Error) -> TunnelReason {
@@ -325,11 +328,15 @@ fn is_client_gone(kind: io::ErrorKind) -> bool {
 }
 
 /// A TLS-layer error from the client side: a certificate-family alert means the
-/// client rejected our leaf; everything else is a TLS error.
+/// client rejected our leaf, a `close_notify` means it hung up gracefully;
+/// everything else is a TLS error.
 fn classify_tls(err: &rustls::Error) -> TunnelReason {
     match err {
         rustls::Error::AlertReceived(alert) if is_certificate_alert(alert) => {
             TunnelReason::ClientRejectedCertificate
+        }
+        rustls::Error::AlertReceived(rustls::AlertDescription::CloseNotify) => {
+            TunnelReason::ClientClosed
         }
         _ => TunnelReason::ClientTlsError,
     }
@@ -764,6 +771,13 @@ mod tests {
                 "{desc:?}"
             );
         }
+
+        // A `close_notify` during the handshake is a graceful close, not a fault
+        // (spec D5, amended 2026-11-01): the client went away.
+        assert_eq!(
+            classify_client_failure(&alert(A::CloseNotify)),
+            ClientClosed
+        );
 
         // Any other alert, or any other TLS error (wrapped or bare), is a TLS error.
         assert_eq!(

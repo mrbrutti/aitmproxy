@@ -89,14 +89,21 @@ impl Chain {
                     break;
                 }
             }
-            let parked = ctx.take_parked();
-            // A passive dispatch never parks. Only a plugin that opted in could
-            // have armed a receiver here, and no observer does; drop it rather
-            // than wait on it.
-            if passive && parked.is_some() {
+            (verdict, ctx.take_parked())
+        };
+
+        // A passive dispatch never parks. Only a plugin that opted in could have
+        // armed a receiver here, and no observer does; drop it rather than wait
+        // on it, and undo the `Intercepted` state it stamped on our working copy
+        // so the stored row never reads `intercepted` with a handle nobody awaits.
+        let parked = if passive {
+            if parked.is_some() {
                 tracing::debug!(%id, "an observer tried to park a passive flow; ignored");
+                set_intercept(&mut flow, InterceptState::Observed);
             }
-            (verdict, if passive { None } else { parked })
+            None
+        } else {
+            parked
         };
 
         // Persist the plugins' edits onto the *live* stored flow, rather than
