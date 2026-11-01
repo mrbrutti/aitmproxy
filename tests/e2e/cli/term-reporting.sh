@@ -474,7 +474,7 @@ section_preboot() {
 
 # ===========================================================================
 section_piped() {
-  begin_section "2. piped startup is plain lines (AC-W1-5, AC-W1-9, AC-W1-23)"
+  begin_section "2. piped startup is plain lines (AC-W1-5, AC-W1-7, AC-W1-8, AC-W1-9, AC-W1-23)"
   new_env piped || return
   local out="$ROOT/plain.out" err="$ROOT/plain.err"
   start_server "$out" "$err" "$AITM_BIN" --config "$CFG"
@@ -492,6 +492,12 @@ section_piped() {
   check "phase line: proxy listening 127.0.0.1:$PROXY_PORT · browser proxy" grep -q -E "^proxy listening 127\.0\.0\.1:$PROXY_PORT · browser proxy " "$err"
   check "card row: Bus: loopback 127.0.0.1:" grep -q -E '^Bus: loopback 127\.0\.0\.1:' "$err"
   check "card row: Scope advice · scope add" grep -q -E '^Scope: Nothing is decrypted until a host is in Scope\. · aitm scope add --host <host>$' "$err"
+  # A fresh HOME mints a CA no store can hold yet (login keychain absent →
+  # unknown, System keychain → no; any `no` reduces to untrusted, spec T7),
+  # so the untrusted path is deterministic here. The trusted path is the
+  # recipe's run on the operator's own HOME (AC-W1-7).
+  check "card row: CA: untrusted · aitm ca install (fresh HOME, AC-W1-7)" grep -q -E '^CA: untrusted · aitm ca install$' "$err"
+  check "card row: System proxy: <state> (AC-W1-8)" grep -q -E '^System proxy: ' "$err"
   check "card row: Log:" grep -q -E '^Log: ' "$err"
   check "no INFO line on stderr" [ "$(count_fx INFO "$err")" = 0 ]
   check "exit 0 after SIGTERM" [ "$SERVER_RC" = 0 ]
@@ -842,7 +848,7 @@ section_perf() {
 
 # ===========================================================================
 section_tty() {
-  begin_section "14. TTY recordings (AC-W1-4, 9, 10, 11, 25) and the forced-colour pipe"
+  begin_section "14. TTY recordings (AC-W1-4, 7, 8, 9, 10, 11, 25) and the forced-colour pipe"
   # The recordings' precondition, decided first so it is reported even when
   # the pipe run below cannot set up.
   local no_tty=""
@@ -882,6 +888,11 @@ section_tty() {
   check "tty: Bus row" grep -q -F "$(printf '  %-14s%s' Bus 'loopback 127.0.0.1:')" "$tail14"
   check "tty: Scope row" grep -q -F "$(printf '  %-14s%s' Scope 'Nothing is decrypted until a host is in Scope.')" "$tail14"
   check "tty: Scope fix line" grep -q -F "$(printf '  %-14s%s' '' '▸ aitm scope add --host <host>')" "$tail14"
+  # Fresh HOME ⇒ untrusted CA (see section 2): the pill word, the CA next
+  # step, and the System proxy row (two-space indent, label padded to 14).
+  check "tty: pill says '· CA untrusted' (fresh HOME, AC-W1-7)" grep -q -F '· CA untrusted' "$tail14"
+  check "tty: CA fix line '▸ aitm ca install' (AC-W1-7)" grep -q -F '▸ aitm ca install' "$tail14"
+  check "tty: System proxy row (AC-W1-8)" grep -q -E '^  System proxy  ' "$tail14"
   # shellcheck disable=SC2088  # the literal `~/` is what the card prints
   check "tty: Log row shortened to ~/" grep -q -F "$(printf '  %-14s%s' Log '~/')" "$tail14"
   echo "  --- SGR-stripped final screen (last 14 lines of tty.cast) ---"
