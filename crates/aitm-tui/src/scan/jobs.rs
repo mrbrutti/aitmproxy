@@ -79,14 +79,47 @@ impl JobsState {
     /// strings are bounded here, once ([`bound_status`]; D6: "row strings
     /// are bounded once at fold time"), so [`row`] and the Detail pane only
     /// copy bounded text.
-    pub fn fold_status(&mut self, mut status: JobStatus) {
-        let dropped = bound_status(&mut status);
-        let id = status.job.clone();
+    pub fn fold_status(&mut self, status: JobStatus) {
+        let read = ReadStatus::new(status);
+        let id = read.job.clone();
         if !self.order.contains(&id) {
             self.order.insert(0, id.clone());
         }
-        self.summaries.insert(id.clone(), status.summary());
-        self.full.insert(id, ReadStatus { status, dropped });
+        self.summaries.insert(id.clone(), read.summary());
+        self.full.insert(id, read);
+    }
+
+    /// A job this TUI started answered with its first status (spec D7;
+    /// fix round G, G64): the id is marked `started_here` (the next list
+    /// that omits it keeps it at the front, fix round B, B3), the status
+    /// folded, the id moved to the front of `order`, and the List pane
+    /// focused on it from the top. The reducer keeps the D6 bounds and the
+    /// toasts.
+    pub fn land_started(&mut self, status: JobStatus) {
+        let id = status.job.clone();
+        self.started_here.insert(id.clone());
+        self.fold_status(status);
+        if let Some(pos) = self.order.iter().position(|j| *j == id) {
+            if pos != 0 {
+                let moved = self.order.remove(pos);
+                self.order.insert(0, moved);
+            }
+        }
+        self.cursor = 0;
+        self.pane = JobPane::List;
+        self.detail_scroll = 0;
+    }
+
+    /// Forget a job the core no longer knows (D9 `not_found`; fix round G,
+    /// G77): out of `order`, `summaries`, `full` and `started_here` (else
+    /// the next list would put it back at the front), the cursor clamped
+    /// to what is left.
+    pub fn forget(&mut self, id: &str) {
+        self.order.retain(|j| j != id);
+        self.summaries.remove(id);
+        self.full.remove(id);
+        self.started_here.remove(id);
+        self.cursor = self.cursor.min(self.order.len().saturating_sub(1));
     }
 
     /// Fold a `scan.list` reply (spec D3, D10). `order` becomes the list's
@@ -213,7 +246,7 @@ impl JobsState {
     /// cannot happen (`full.keys() ⊆ summaries.keys()`, see `summaries`).
     pub fn row_of(&self, id: &str) -> JobRow {
         match self.summaries.get(id) {
-            Some(summary) => row(summary, self.full.get(id).map(|r| &r.status)),
+            Some(summary) => row(summary, self.full.get(id)),
             None => JobRow::unknown(id),
         }
     }
@@ -258,6 +291,8 @@ pub struct StatusDropped {
     pub running: usize,
     pub clamped: usize,
     pub skipped: usize,
+    /// Targets past [`DETAIL_LIST_MAX`] (fix round G, G102).
+    pub targets: usize,
 }
 
 /// A full status as `JobsState::full` holds it (fix round G, G11,
@@ -268,6 +303,14 @@ pub struct StatusDropped {
 pub struct ReadStatus {
     pub status: JobStatus,
     pub dropped: StatusDropped,
+}
+
+impl ReadStatus {
+    /// Bound `status` once ([`bound_status`]) and keep what was cut.
+    pub fn new(mut status: JobStatus) -> Self {
+        let dropped = bound_status(&mut status);
+        Self { status, dropped }
+    }
 }
 
 impl Deref for ReadStatus {
@@ -284,8 +327,8 @@ impl Deref for ReadStatus {
 /// four times [`TARGETS_MAX`], and `error`, `started_by.frontend`,
 /// `client_label`, each `clamped[].field`, each `lanes.skipped[].reason`,
 /// each `checks.running[]` and the canary path to [`DETAIL_VALUE_MAX`]
-/// cells; the three lists cut to [`DETAIL_LIST_MAX`] with the rest counted
-/// in the returned [`StatusDropped`].
+/// cells; the three lists and `targets` cut to [`DETAIL_LIST_MAX`] with
+/// the rest counted in the returned [`StatusDropped`] (G102).
 fn bound_status(status: &mut JobStatus) -> StatusDropped {
     let cut = |s: &mut String| {
         if s.chars().any(char::is_control) {
@@ -298,14 +341,15 @@ fn bound_status(status: &mut JobStatus) -> StatusDropped {
         }
     };
     status.profile_name = truncate(&clean(&status.profile_name), PROFILE_MAX);
-    for target in &mut status.targets {
-        *target = truncate(&clean(target), 4 * TARGETS_MAX);
-    }
     let dropped = StatusDropped {
         running: cap(&mut status.checks.running),
         clamped: cap(&mut status.clamped),
         skipped: cap(&mut status.lanes.skipped),
+        targets: cap(&mut status.targets),
     };
+    for target in &mut status.targets {
+        *target = truncate(&clean(target), 4 * TARGETS_MAX);
+    }
     cut(&mut status.started_by.frontend);
     let mut fields: Vec<&mut String> = Vec::new();
     fields.extend(status.error.as_mut());
@@ -411,11 +455,14 @@ impl JobRow {
 /// were bounded when the status was folded ([`JobsState::fold_status`], D6
 /// hostile-core bounds), so this only copies bounded text and a frame's
 /// measuring and eliding runs over at most a few hundred cells per row.
-pub fn row(summary: &JobSummary, full: Option<&JobStatus>) -> JobRow {
+pub fn row(summary: &JobSummary, full: Option<&ReadStatus>) -> JobRow {
     JobRow {
         id: summary.job.clone(),
         profile: full.map_or_else(|| UNKNOWN.to_string(), |f| f.profile_name.clone()),
-        targets: full.map_or_else(|| UNKNOWN.to_string(), |f| targets_text(&f.targets)),
+        targets: full.map_or_else(
+            || UNKNOWN.to_string(),
+            |f| targets_text(&f.targets, f.dropped.targets),
+        ),
         state_phase: state_phase_text(summary.state, summary.phase),
         probes: format!("{}/{}", summary.probes.sent, summary.probes.budget),
         probe_fill: probe_fill(summary.probes.sent, summary.probes.budget, PROBE_BAR_CELLS),
@@ -426,17 +473,19 @@ pub fn row(summary: &JobSummary, full: Option<&JobStatus>) -> JobRow {
 }
 
 /// The row's `targets` cell: the first [`TARGETS_JOINED`] targets (each
-/// already cut by the fold) joined by a space, `+n` for any more, the whole
-/// cut to four times [`TARGETS_MAX`].
-fn targets_text(targets: &[String]) -> String {
+/// already cut by the fold) joined by a space, `+n` for any more (the
+/// `dropped` the fold cut past [`DETAIL_LIST_MAX`] counted in; G102), the
+/// whole cut to four times [`TARGETS_MAX`].
+fn targets_text(targets: &[String], dropped: usize) -> String {
     let mut text = targets
         .iter()
         .take(TARGETS_JOINED)
         .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
-    if targets.len() > TARGETS_JOINED {
-        text.push_str(&format!(" +{}", targets.len() - TARGETS_JOINED));
+    let more = targets.len().saturating_sub(TARGETS_JOINED) + dropped;
+    if more > 0 {
+        text.push_str(&format!(" +{more}"));
     }
     truncate(&text, 4 * TARGETS_MAX)
 }
@@ -837,6 +886,60 @@ mod tests {
             detail_lines(&read_of(&full)).len()
         );
         assert_eq!(detail_line_count(&full), 11);
+    }
+
+    /// Fix round G, G64, G77: a started job lands at the front with the
+    /// List pane on it, even when the list already carried it further
+    /// down; forgetting the cursor's job clamps the cursor.
+    #[test]
+    fn land_started_fronts_the_job_and_forget_clamps_the_cursor() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../aitm-scan-model/fixtures/scan.status.json"
+        );
+        let text = std::fs::read_to_string(fixture).expect("the status fixture");
+        let status: JobStatus = serde_json::from_str(&text).expect("the fixture parses");
+        let mut jobs = JobsState::default();
+        let other = JobStatus {
+            job: "scan-0b0b0b0b".into(),
+            ..status.clone()
+        };
+        jobs.fold_status(other);
+        jobs.fold_status(status.clone());
+        jobs.fold_status(JobStatus {
+            job: "scan-0c0c0c0c".into(),
+            ..status.clone()
+        });
+        assert_eq!(
+            jobs.order,
+            vec!["scan-0c0c0c0c", "scan-1a2b3c4d", "scan-0b0b0b0b"],
+            "newest first"
+        );
+        jobs.cursor = 2;
+        jobs.pane = JobPane::Detail;
+        jobs.detail_scroll = 5;
+        jobs.land_started(status);
+        assert_eq!(
+            jobs.order,
+            vec!["scan-1a2b3c4d", "scan-0c0c0c0c", "scan-0b0b0b0b"],
+            "the already-listed job moves to the front"
+        );
+        assert!(jobs.started_here.contains("scan-1a2b3c4d"));
+        assert_eq!(
+            (jobs.cursor, jobs.pane, jobs.detail_scroll),
+            (0, JobPane::List, 0)
+        );
+        assert_eq!(jobs.full.len(), 3);
+
+        jobs.cursor = 2;
+        jobs.forget("scan-0b0b0b0b");
+        assert_eq!(jobs.order, vec!["scan-1a2b3c4d", "scan-0c0c0c0c"]);
+        assert_eq!(jobs.cursor, 1, "the cursor clamps to the last row");
+        assert!(!jobs.summaries.contains_key("scan-0b0b0b0b"));
+        assert!(!jobs.full.contains_key("scan-0b0b0b0b"));
+        jobs.forget("scan-1a2b3c4d");
+        assert!(!jobs.started_here.contains("scan-1a2b3c4d"));
+        assert_eq!(jobs.cursor, 0);
     }
 
     #[test]

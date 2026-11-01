@@ -10,6 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
 use crate::app::App;
+use crate::scan::launch::WireConfirm;
 use crate::theme::Theme;
 use crate::ui::centered;
 use crate::ui::overlays::{boxed, lines_into};
@@ -26,8 +27,8 @@ enum Family {
 }
 
 impl Family {
-    fn of(call: &str) -> Family {
-        if call.starts_with("scan.") {
+    fn of(confirm: &WireConfirm) -> Family {
+        if confirm.is_scan() {
             Family::Scan
         } else {
             Family::L4
@@ -67,7 +68,7 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
     let Some(c) = &app.wire_confirm else {
         return;
     };
-    let family = Family::of(&c.call);
+    let family = Family::of(c);
     let area = centered(
         screen,
         screen.width.saturating_sub(10).clamp(40, 90),

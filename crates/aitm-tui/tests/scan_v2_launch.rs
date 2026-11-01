@@ -19,7 +19,7 @@ use aitm_tui::action::{Action, BusEvent, BusRequest, Level};
 use aitm_tui::app::{App, Mode, CONFIRM_TOOLS};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
-use aitm_tui::scan::{EditorField, ProfilePane, ScanTab, EDITOR_FIELDS};
+use aitm_tui::scan::{EditorField, LaunchVerb, ProfilePane, ScanTab, EDITOR_FIELDS};
 use common::*;
 use crossterm::event::KeyCode;
 use serde_json::json;
@@ -198,7 +198,7 @@ fn start_from_the_editor_sends_the_typed_profile() {
     assert_eq!(&sent, draft, "the wire profile is the draft, round-tripped");
     assert_eq!(sent.name, "standard");
     let pending = app.scan.launch.pending.as_ref().expect("a pending launch");
-    assert_eq!(pending.call, "scan.start");
+    assert_eq!(pending.call, LaunchVerb::Start);
     assert_eq!(pending.profile_name.as_deref(), Some("standard"));
     assert!(app.scan.inflight.contains("scan.start"));
 
@@ -894,4 +894,52 @@ fn the_jobs_footer_shows_the_blocked_reason() {
         app.update(Action::ScanStart).is_empty(),
         "blocked in Jobs too"
     );
+}
+
+/// Fix round G, G62: the one "already running" guard sits in
+/// `scan_launch`, so every legacy launch path (`r`, `:scan <host>`, `s`
+/// on a legacy bus, and the `m` fallback to `scan.discover` on a v2 bus
+/// without `scan.map`) answers a running crawl with the one toast and
+/// sends nothing.
+#[test]
+fn every_legacy_launch_path_shares_the_running_guard() {
+    const RUNNING: &str = "a scan is already running";
+    let mut legacy = legacy_app(200, 50);
+    let _ = legacy.update(Action::OpenScan);
+    legacy.scan.legacy.running = true;
+    for (what, action) in [("r", Action::ScanLaunch), ("s", Action::ScanStart)] {
+        let reqs = legacy.update(action);
+        assert!(launch_requests(&reqs).is_empty(), "{what}: {reqs:?}");
+        assert_eq!(toast(&legacy), RUNNING, "{what}");
+        legacy.toasts.clear();
+    }
+    let reqs = legacy.run_command("scan auth.shop-staging.test");
+    assert!(launch_requests(&reqs).is_empty(), ":scan: {reqs:?}");
+    assert_eq!(toast(&legacy), RUNNING, ":scan <host>");
+
+    // A v2 bus without `scan.map` but with `scan.discover`: `m` falls to
+    // the legacy crawl, through the same guard.
+    let tools: Vec<&str> = TOOLS
+        .iter()
+        .copied()
+        .filter(|t| *t != "scan.map")
+        .chain(["scan.discover"])
+        .collect();
+    let mut app = opened_with(&tools);
+    open_standard(&mut app);
+    // The fallback needs an origin to crawl before it reaches the guard
+    // (with none, `map needs an origin` is the refusal).
+    app.scan
+        .profiles
+        .editor
+        .as_mut()
+        .expect("editor")
+        .draft
+        .target
+        .origins
+        .push(format!("https://{SCOPE_HOST}"));
+    app.scan.legacy.running = true;
+    let reqs = app.update(Action::ScanMap);
+    assert!(launch_requests(&reqs).is_empty(), "m fallback: {reqs:?}");
+    assert_eq!(toast(&app), RUNNING, "m fallback");
 }

@@ -90,9 +90,10 @@ pub fn owning_tab(verb: &str) -> ScanTab {
     match verb {
         "scan.checks" | "scan.session.preview" | "scan.start" | "scan.map" => ScanTab::Profiles,
         _ if verb.starts_with("scan.profile.") => ScanTab::Profiles,
-        "scan.list" | "scan.status" | "scan.cancel" => ScanTab::Jobs,
         "scan.sitemap" => ScanTab::SiteMap,
         "scan.issues" | "scan.issue" | "scan.issue.update" => ScanTab::Issues,
+        // The Jobs verbs (list, status, cancel) and any verb outside D3:
+        // Jobs reads `last_error`, so an unknown verb is never lost.
         _ => ScanTab::Jobs,
     }
 }
@@ -470,13 +471,27 @@ impl ScanError {
     /// the detail; an uncoded error reads `<verb>: <detail>`, except a
     /// missing verb, which reads `<verb> is not on this bus` (D2's inline
     /// text, the verb named once).
+    pub fn wording(&self) -> String {
+        match self.code {
+            // The refresh clause only where the self-heal ran (D9 as
+            // amended on the Task 13 spec panel; fix round G, G75): a
+            // keyed `scan.status` / `scan.cancel` tag.
+            Some(ScanErrorCode::NotFound) if self.not_found_job().is_none() => {
+                format!("{NOT_FOUND}: {}", self.detail)
+            }
+            Some(code) => format!("{}: {}", code_wording(code), self.detail),
+            None if self.detail == MISSING_VERB => format!("{} {}", self.verb, self.detail),
+            None => format!("{}: {}", self.verb, self.detail),
+        }
+    }
+
     /// Whether this is a launch (`scan.start` / `scan.map`) the core
     /// refused with a code the operator can act on from the Profiles tab
     /// (spec D13's refused state): `out_of_scope`, `refused_agent`,
     /// `refused_l4` or `confirm_required`. The launch key stays live for
     /// these; the footer shows the wording in the warning hue.
     pub fn is_refused_launch(&self) -> bool {
-        matches!(self.verb.as_str(), "scan.start" | "scan.map")
+        LaunchVerb::parse(&self.verb).is_some()
             && matches!(
                 self.code,
                 Some(
@@ -488,25 +503,18 @@ impl ScanError {
             )
     }
 
-    pub fn wording(&self) -> String {
-        match self.code {
-            // The refresh clause only where the self-heal ran (D9 as
-            // amended on the Task 13 spec panel; fix round G, G75): a
-            // keyed `scan.status` / `scan.cancel` tag.
-            Some(ScanErrorCode::NotFound) if !self.is_healed_tag() => {
-                format!("{NOT_FOUND}: {}", self.detail)
-            }
-            Some(code) => format!("{}: {}", code_wording(code), self.detail),
-            None if self.detail == MISSING_VERB => format!("{} {}", self.verb, self.detail),
-            None => format!("{}: {}", self.verb, self.detail),
+    /// The job a `not_found` self-heal answers for (spec call 8; D13 as
+    /// amended; fix round G, G78): the tag's key when the code is
+    /// `not_found` and the verb a keyed `scan.status:<job>` or
+    /// `scan.cancel:<job>`. The reducer drops that job and lists again;
+    /// the wording keeps its refresh clause only then (G75).
+    pub fn not_found_job(&self) -> Option<&str> {
+        if self.code != Some(ScanErrorCode::NotFound)
+            || !matches!(self.verb.as_str(), "scan.status" | "scan.cancel")
+        {
+            return None;
         }
-    }
-
-    /// Whether this error's tag is one the `not_found` self-heal answers:
-    /// a keyed `scan.status:<job>` or `scan.cancel:<job>`.
-    fn is_healed_tag(&self) -> bool {
-        matches!(self.verb.as_str(), "scan.status" | "scan.cancel")
-            && tag_parts(&self.tag).1.is_some()
+        tag_parts(&self.tag).1
     }
 }
 
@@ -710,7 +718,15 @@ mod tests {
         ] {
             assert_eq!(owning_tab(verb), ScanTab::Profiles, "{verb}");
         }
-        for verb in ["scan.list", "scan.status", "scan.cancel", "scan.discover"] {
+        // The Jobs verbs and any verb outside D3 share the fallback arm
+        // (fix round G, G79).
+        for verb in [
+            "scan.list",
+            "scan.status",
+            "scan.cancel",
+            "scan.discover",
+            "x",
+        ] {
             assert_eq!(owning_tab(verb), ScanTab::Jobs, "{verb}");
         }
         assert_eq!(owning_tab("scan.sitemap"), ScanTab::SiteMap);
@@ -753,6 +769,24 @@ mod tests {
             "No longer known to the core (it may have restarted): x",
             "a bare status tag ran no heal"
         );
+    }
+
+    /// Fix round G, G78: the self-heal predicate names the job only for a
+    /// keyed status or cancel `not_found`.
+    #[test]
+    fn not_found_job_names_only_a_keyed_status_or_cancel() {
+        let status = ScanError::from_message("scan.status:scan-1a2b3c4d", "scan: not_found: gone");
+        assert_eq!(status.not_found_job(), Some("scan-1a2b3c4d"));
+        let cancel = ScanError::from_message("scan.cancel:scan-1a2b3c4d", "scan: not_found: gone");
+        assert_eq!(cancel.not_found_job(), Some("scan-1a2b3c4d"));
+        let start = ScanError::from_message("scan.start", "scan: not_found: gone");
+        assert_eq!(start.not_found_job(), None, "a launch tag heals nothing");
+        let bare = ScanError::from_message("scan.status", "scan: not_found: gone");
+        assert_eq!(bare.not_found_job(), None, "an unkeyed tag names no job");
+        let busy = ScanError::from_message("scan.status:scan-1a2b3c4d", "scan: busy: x");
+        assert_eq!(busy.not_found_job(), None, "another code heals nothing");
+        assert!(ScanError::from_message("scan.map", "scan: out_of_scope: x").is_refused_launch());
+        assert!(!ScanError::from_message("scan.list", "scan: out_of_scope: x").is_refused_launch());
     }
 
     /// Fix round G, G28: the one since-last-request rule.

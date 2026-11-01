@@ -18,7 +18,7 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{
-    is_job_id, parse_result, JobsState, PendingLaunch, ScanTab, MAX_STATUS_FOLLOWUPS,
+    is_job_id, parse_result, JobsState, LaunchVerb, PendingLaunch, ScanTab, MAX_STATUS_FOLLOWUPS,
 };
 use common::*;
 use serde_json::{json, Value};
@@ -752,7 +752,7 @@ fn a_terminal_line_on_the_issues_tab_requests_issues() {
 fn disconnect_clears_pending_launch() {
     let mut app = app();
     app.scan.launch.pending = Some(PendingLaunch {
-        call: "scan.start".into(),
+        call: LaunchVerb::Start,
         args: json!({ "profile_name": "standard" }),
         profile_name: Some("standard".into()),
     });

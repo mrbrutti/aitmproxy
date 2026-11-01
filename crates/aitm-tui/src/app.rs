@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 use aitm_scan_model::{
     is_builtin_name, ChecksResult, Issue, IssueStatus, IssuesResult, JobEvent, JobId,
     JobNotification, JobStatus, ListResult, Phase, ProfileDeleteResult, ProfileListResult,
-    ProfileSaveResult, ScanErrorCode, ScanProfile, SessionMode, SessionProfile, SitemapResult,
-    StartResult, JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
+    ProfileSaveResult, ScanProfile, SessionMode, SessionProfile, SitemapResult, StartResult,
+    JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
@@ -34,10 +34,10 @@ use crate::scan::{
     due, fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
     parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
     tag_parts, typed_origin, usable_selector, walk, Dir, EditorField, FieldKind, IssueFilterKey,
-    IssuePane, JobPane, MapPane, PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer,
-    ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER,
-    OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SITEMAP_POLL_TICKS,
-    STATUS_POLL_TICKS,
+    IssuePane, JobPane, Launch, LaunchVerb, MapPane, PendingLaunch, ProfileEditor, ProfilePane,
+    ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
+    MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
+    OTHER_SAVED, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
 use crate::text::truncate;
 use crate::theme::Theme;
@@ -1849,19 +1849,13 @@ impl App {
                 let tab = self.scan.tab;
                 self.enter_tab_reads(tab, &mut out);
             }
-            Action::ScanLaunch => {
-                if self.scan.legacy.running {
-                    self.toast(Level::Info, "a scan is already running");
-                } else {
-                    self.scan_launch(None, &mut out);
-                }
-            }
+            Action::ScanLaunch => self.scan_launch(None, &mut out),
             Action::ScanTab(tab) => self.scan_tab(tab, &mut out),
             Action::ScanPaneNext => self.scan.step_pane(true),
             Action::ScanPanePrev => self.scan.step_pane(false),
             Action::ScanCancel => self.scan_cancel(&mut out),
-            Action::ScanStart => self.scan_launch_v2("scan.start", &mut out),
-            Action::ScanMap => self.scan_launch_v2("scan.map", &mut out),
+            Action::ScanStart => self.scan_launch_v2(LaunchVerb::Start, &mut out),
+            Action::ScanMap => self.scan_launch_v2(LaunchVerb::Map, &mut out),
             Action::ScanFilter(key) => self.scan_filter(key, &mut out),
             Action::ScanFilterReset => self.scan_filter_reset(&mut out),
             Action::ScanIssueStatus(status) => self.scan_issue_status(status, &mut out),
@@ -2065,7 +2059,7 @@ impl App {
         let Some(c) = self.wire_confirm.take() else {
             return Vec::new();
         };
-        let is_scan = c.call.starts_with("scan.");
+        let is_scan = c.is_scan();
         if yes {
             if is_scan {
                 let mut out = Vec::new();
@@ -2098,7 +2092,7 @@ impl App {
     /// is gone with the prompt, so nothing can re-issue it).
     fn open_wire_confirm(&mut self, confirm: crate::scan::launch::WireConfirm, from: Mode) {
         if let Some(old) = self.wire_confirm.take() {
-            if old.call.starts_with("scan.") {
+            if old.is_scan() {
                 self.scan.launch.pending = None;
             }
             self.toast(Level::Warn, format!("{} confirmation dropped", old.call));
@@ -2425,6 +2419,12 @@ impl App {
     /// user-typed target (`:scan <host>`); `None` picks the selected flow's host
     /// when it is in scope, else the first concrete in-scope host.
     fn scan_launch(&mut self, explicit: Option<String>, out: &mut Vec<BusRequest>) {
+        // One crawl at a time (fix round G, G62: the one guard for `r`,
+        // `:scan <host>`, `s`/`m` on a legacy bus and the map fallback).
+        if self.scan.legacy.running {
+            self.toast(Level::Info, "a scan is already running");
+            return;
+        }
         if !self.has_tool("scan.discover") {
             self.toast(
                 Level::Warn,
@@ -3528,9 +3528,6 @@ impl App {
                         ScanOffer::None => self.toast(Level::Warn, NO_SCANNER),
                         // D8: `:scan <origin>` under v2 is `scan.start {target}`.
                         ScanOffer::V2 => self.scan_start_typed(rest, &mut out),
-                        ScanOffer::Legacy if self.scan.legacy.running => {
-                            self.toast(Level::Info, "a scan is already running");
-                        }
                         ScanOffer::Legacy => self.scan_launch(Some(rest.to_string()), &mut out),
                     }
                 }
@@ -4654,18 +4651,14 @@ impl App {
     /// sent); `scan.map` falls back to `scan.discover` on the draft's first
     /// origin when the bus lacks it (D2). The args come from the editor's
     /// typed draft, else the Profiles list cursor's name.
-    fn scan_launch_v2(&mut self, verb: &str, out: &mut Vec<BusRequest>) {
+    fn scan_launch_v2(&mut self, verb: LaunchVerb, out: &mut Vec<BusRequest>) {
         match self.scan_offer() {
             ScanOffer::None => {
                 self.toast(Level::Warn, NO_SCANNER);
                 return;
             }
             ScanOffer::Legacy => {
-                if self.scan.legacy.running {
-                    self.toast(Level::Info, "a scan is already running");
-                } else {
-                    self.scan_launch(None, out);
-                }
+                self.scan_launch(None, out);
                 return;
             }
             ScanOffer::V2 => {}
@@ -4675,7 +4668,7 @@ impl App {
         }
         // The UI-3 gate holds `s` only: a map runs no L4 lane (D7 as
         // amended; fix round G, G71).
-        if verb == "scan.start" && self.scan.launch.blocked.is_some() {
+        if verb == LaunchVerb::Start && self.scan.launch.blocked.is_some() {
             return;
         }
         if self.scan.launch.pending.is_some() {
@@ -4697,15 +4690,11 @@ impl App {
             self.toast(Level::Warn, text);
             return;
         }
-        if verb == "scan.map" && !self.has_tool("scan.map") && self.has_tool("scan.discover") {
-            if self.scan.legacy.running {
-                self.toast(Level::Info, "a scan is already running");
-            } else {
-                let first = editor.and_then(|e| e.draft.target.origins.first().cloned());
-                match first {
-                    Some(origin) => self.scan_launch(Some(origin), out),
-                    None => self.toast(Level::Info, "map needs an origin: add one (o) first"),
-                }
+        if verb == LaunchVerb::Map && !self.has_tool("scan.map") && self.has_tool("scan.discover") {
+            let first = editor.and_then(|e| e.draft.target.origins.first().cloned());
+            match first {
+                Some(origin) => self.scan_launch(Some(origin), out),
+                None => self.toast(Level::Info, "map needs an origin: add one (o) first"),
             }
             return;
         }
@@ -4716,19 +4705,16 @@ impl App {
             .get(self.scan.profiles.cursor)
             .map(|p| p.name.clone());
         let editor = self.scan.profiles.editor.as_ref();
-        let Some(args) = launch_args(editor, list_name.as_deref(), None) else {
+        // The request and the toast's profile name follow one precedence
+        // (fix round G, G63).
+        let Some(launch) = launch_args(editor, list_name.as_deref(), None) else {
             self.toast(
                 Level::Info,
                 "nothing to launch: open a profile (⏎) or :scan <origin>",
             );
             return;
         };
-        let profile_name = match editor {
-            Some(e) if !e.draft.name.is_empty() => Some(e.draft.name.clone()),
-            Some(_) => None,
-            None => list_name,
-        };
-        self.send_launch(verb, args, profile_name, out);
+        self.send_launch(verb, launch, out);
     }
 
     /// `:scan <origin>` under v2 (spec D8): the D8 origin rule and the scope
@@ -4749,38 +4735,32 @@ impl App {
                 return;
             }
         };
-        let Some(args) = launch_args(None, None, Some(&target)) else {
+        let Some(launch) = launch_args(None, None, Some(&target)) else {
             return;
         };
-        self.send_launch("scan.start", args, None, out);
+        self.send_launch(LaunchVerb::Start, launch, out);
     }
 
     /// The one way a launch leaves (spec D7): tagged under its verb and
     /// recorded in `launch.pending` until the result, the prompt's cancel or
     /// the failure; the overlay, should the server ask, returns to Scan.
-    fn send_launch(
-        &mut self,
-        verb: &str,
-        args: Value,
-        profile_name: Option<String>,
-        out: &mut Vec<BusRequest>,
-    ) {
-        if self.scan_call(verb.to_string(), verb, args.clone(), out) {
+    fn send_launch(&mut self, verb: LaunchVerb, launch: Launch, out: &mut Vec<BusRequest>) {
+        if self.scan_call(verb.to_string(), verb.as_str(), launch.args.clone(), out) {
             self.scan.launch.pending = Some(PendingLaunch {
-                call: verb.to_string(),
-                args,
-                profile_name,
+                call: verb,
+                args: launch.args,
+                profile_name: launch.profile_name,
             });
         }
     }
 
-    /// Fold a `StartResult` (spec D7, D10): the job is marked started here
-    /// (fix round B, B3: the next `scan.list` that omits it keeps it at the
-    /// front), its status goes into `full` and the id to the front of
-    /// `order`, the view switches to Jobs with the cursor on it, the start
-    /// line is toasted and a non-empty `clamped` list is a second Warn
-    /// toast. D6 hostile-core bounds: an id outside the wire form, or a
-    /// status naming another job, folds nothing and records the error.
+    /// Fold a `StartResult` (spec D7, D10): the job lands in the Jobs state
+    /// (`JobsState::land_started`: marked started here, fix round B, B3;
+    /// its status in `full`, the id at the front, the List pane on it), the
+    /// view switches to Jobs, the start line is toasted and a non-empty
+    /// `clamped` list is a second Warn toast. D6 hostile-core bounds: an id
+    /// outside the wire form, or a status naming another job, folds nothing
+    /// and records the error.
     fn fold_start_result(&mut self, tag: &str, result: StartResult, fallback: Option<String>) {
         if !is_job_id(&result.job) {
             self.scan.set_error(ScanError::uncoded(
@@ -4794,17 +4774,7 @@ impl App {
             return;
         }
         let id = result.job.clone();
-        self.scan.jobs.started_here.insert(id.clone());
-        self.scan.jobs.fold_status(result.status);
-        if let Some(pos) = self.scan.jobs.order.iter().position(|j| *j == id) {
-            if pos != 0 {
-                let moved = self.scan.jobs.order.remove(pos);
-                self.scan.jobs.order.insert(0, moved);
-            }
-        }
-        self.scan.jobs.cursor = 0;
-        self.scan.jobs.pane = JobPane::List;
-        self.scan.jobs.detail_scroll = 0;
+        self.scan.jobs.land_started(result.status);
         self.scan.tab = ScanTab::Jobs;
         let profile = self
             .scan
@@ -5355,7 +5325,7 @@ impl App {
                     return;
                 };
                 if let Some(confirm) = crate::scan::launch::WireConfirm::from_reply(
-                    &pending.call,
+                    pending.call.as_str(),
                     &pending.args,
                     &value,
                 ) {
@@ -5609,57 +5579,43 @@ impl App {
         }
     }
 
-    /// A tagged `scan.*` call failed (spec D9): settle the tag, record the
-    /// error on its owning tab (the banner shows its wording until the next
-    /// success under the same tag, D13) and toast the same wording as an
-    /// Error. A failed `scan.issue` clears the pending read and reads
-    /// nothing, so the next landing on the row asks again (fix round D,
-    /// D3). `not_found` on a keyed `scan.status` / `scan.cancel` is the
-    /// self-heal of spec call 8: the job leaves `order`, `summaries`,
-    /// `full` and `started_here` (else the next list would put it back at
-    /// the front) and one `scan.list {}` is asked for. A refused launch
-    /// (`out_of_scope`, `refused_agent`, `refused_l4`, `confirm_required`
-    /// on `scan.start` / `scan.map`) clears `pending` so the key is live
-    /// again; the Profiles footer reads the wording off the tab's error
-    /// (`ScanState::refused_launch`), so nothing more is kept for it here.
+    /// A tagged `scan.*` call failed (spec D9, D13): the error is recorded
+    /// where its tab shows it and toasted. Two whys: a `not_found` on a
+    /// keyed `scan.status` / `scan.cancel` (`ScanError::not_found_job`,
+    /// spec call 8) drops the job from `started_here` too, else the
+    /// `scan.list` the self-heal asks for would put it back at the front;
+    /// a refused launch clears `pending` so the key is live again, and the
+    /// Profiles footer reads the wording off the tab's error
+    /// (`ScanState::refused_launch`), the UI-3 `blocked` text taking
+    /// precedence over it (D13), so nothing more is kept for it here.
     fn on_scan_failed(&mut self, tag: &str, message: String, out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
-        let (verb, key) = tag_parts(tag);
-        if verb == "scan.issue" {
+        let err = ScanError::from_message(tag, &message);
+        if err.verb == "scan.issue" {
             self.scan.issues.pending_read = None;
         }
-        // A refused launch is answered: the key is live again (D7, D13).
-        if tag == "scan.start" || tag == "scan.map" {
+        // The pending launch is answered: the key is live again (D7, D13).
+        if self
+            .scan
+            .launch
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.call.as_str() == tag)
+        {
             self.scan.launch.pending = None;
         }
-        let err = ScanError::from_message(tag, &message);
-        if err.code == Some(ScanErrorCode::NotFound)
-            && matches!(verb, "scan.status" | "scan.cancel")
-        {
-            if let Some(job) = key {
-                self.drop_scan_job(job);
-                // The requested list's success clears this error (D13 as
-                // amended, G74) and asks no status for the job until the
-                // timer's list (G83).
-                self.scan.jobs.healed.insert(job.to_string());
-                self.scan.heal_pending = Some(tag.to_string());
-                self.request_scan_list(out);
-            }
+        if let Some(job) = err.not_found_job() {
+            let job = job.to_string();
+            self.scan.jobs.forget(&job);
+            // The requested list's success clears this error (D13 as
+            // amended, G74) and asks no status for the job until the
+            // timer's list (G83).
+            self.scan.jobs.healed.insert(job);
+            self.scan.heal_pending = Some(tag.to_string());
+            self.request_scan_list(out);
         }
         self.toast(Level::Error, err.wording());
         self.scan.set_error(err);
-    }
-
-    /// Forget a job the core no longer knows (D9 `not_found`): out of
-    /// `order`, `summaries`, `full` and `started_here`, the cursor clamped
-    /// to what is left.
-    fn drop_scan_job(&mut self, job: &str) {
-        let jobs = &mut self.scan.jobs;
-        jobs.order.retain(|id| id != job);
-        jobs.summaries.remove(job);
-        jobs.full.remove(job);
-        jobs.started_here.remove(job);
-        jobs.cursor = jobs.cursor.min(jobs.order.len().saturating_sub(1));
     }
 
     /// A `browser.*` call answered: fill the view. A navigate re-reads the

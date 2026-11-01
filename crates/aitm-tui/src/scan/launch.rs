@@ -2,6 +2,7 @@
 //! UI-3 reason a launch is blocked, and the wire-confirm handshake shared by the
 //! `l4.*` guarded verbs and the `scan.*` launches.
 
+use std::fmt;
 use std::net::IpAddr;
 
 use aitm_scan_model::{LaneKind, ScanProfile};
@@ -24,25 +25,80 @@ pub const GATE_OPEN_PROFILE: &str =
 /// The capability word an L4 scope entry needs for a launch (spec D7).
 const INJECT: &str = "inject";
 
+/// The two launch verbs (spec D7; fix round G, G68): the one type the
+/// pending launch, the launch keys and the refused-launch rule name a
+/// verb by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchVerb {
+    Start,
+    Map,
+}
+
+impl LaunchVerb {
+    /// The wire verb.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaunchVerb::Start => "scan.start",
+            LaunchVerb::Map => "scan.map",
+        }
+    }
+
+    /// The launch verb `verb` names, if it is one.
+    pub fn parse(verb: &str) -> Option<Self> {
+        match verb {
+            "scan.start" => Some(LaunchVerb::Start),
+            "scan.map" => Some(LaunchVerb::Map),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for LaunchVerb {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a launch sends and names (fix round G, G63): the request's
+/// arguments and the profile name the start toast falls back on, decided
+/// by one precedence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    pub args: Value,
+    /// The profile the launch names: the draft's name (when it has one),
+    /// the list row's, or none for a typed origin.
+    pub profile_name: Option<String>,
+}
+
 /// The arguments of a `scan.start` / `scan.map` call (spec D7): from an
 /// open editor the whole typed draft as `{profile}`, else the Profiles list
 /// cursor's `{profile_name}`, else a typed origin as `{target}`; `None` with
 /// nothing to launch. The draft is serialised with serde from `ScanProfile`,
-/// so the wire carries exactly the type the engine parses.
+/// so the wire carries exactly the type the engine parses. The returned
+/// [`Launch`] carries the profile name the same precedence picks.
 pub fn launch_args(
     editor: Option<&ProfileEditor>,
     list_name: Option<&str>,
     typed: Option<&str>,
-) -> Option<Value> {
+) -> Option<Launch> {
     if let Some(editor) = editor {
-        return serde_json::to_value(&editor.draft)
-            .ok()
-            .map(|profile| json!({ "profile": profile }));
+        let profile = serde_json::to_value(&editor.draft).ok()?;
+        let name = editor.draft.name.clone();
+        return Some(Launch {
+            args: json!({ "profile": profile }),
+            profile_name: (!name.is_empty()).then_some(name),
+        });
     }
     if let Some(name) = list_name {
-        return Some(json!({ "profile_name": name }));
+        return Some(Launch {
+            args: json!({ "profile_name": name }),
+            profile_name: Some(name.to_string()),
+        });
     }
-    typed.map(|target| json!({ "target": target }))
+    typed.map(|target| Launch {
+        args: json!({ "target": target }),
+        profile_name: None,
+    })
 }
 
 /// The UI-3 launch gate (spec D7): `None` when `draft.lanes` has neither L4
@@ -141,6 +197,12 @@ impl WireConfirm {
         })
     }
 
+    /// Whether the call under confirmation is a `scan.*` launch (the
+    /// family the reducer and the overlay decide by; fix round G, G68).
+    pub fn is_scan(&self) -> bool {
+        self.call.starts_with("scan.")
+    }
+
     /// The args to re-send on confirm: the originals plus the `_confirm` token.
     pub fn confirmed_args(&self) -> Value {
         let mut args = self.args.clone();
@@ -151,12 +213,11 @@ impl WireConfirm {
     }
 }
 
-/// A `scan.start` / `scan.map` / `scan.discover` call sent and not yet
-/// answered.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A `scan.start` / `scan.map` call sent and not yet answered (spec D7).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingLaunch {
     /// The verb.
-    pub call: String,
+    pub call: LaunchVerb,
     /// The arguments as sent (re-issued with `_confirm` after a prompt).
     pub args: Value,
     /// The profile the launch named, for the toast.
@@ -196,20 +257,39 @@ mod tests {
             ..ScanProfile::default()
         };
         let editor = ProfileEditor::new(draft.clone(), None, false);
-        let args = launch_args(Some(&editor), Some("standard"), Some("https://a.test")).unwrap();
+        let launch = launch_args(Some(&editor), Some("standard"), Some("https://a.test")).unwrap();
         assert_eq!(
-            serde_json::from_value::<ScanProfile>(args["profile"].clone()).unwrap(),
+            serde_json::from_value::<ScanProfile>(launch.args["profile"].clone()).unwrap(),
             draft
+        );
+        assert_eq!(launch.profile_name.as_deref(), Some("mine"));
+        // An unnamed draft names no profile (fix round G, G63: one
+        // precedence for the request and the toast).
+        let unnamed = ProfileEditor::new(ScanProfile::default(), None, false);
+        assert_eq!(
+            launch_args(Some(&unnamed), Some("standard"), None)
+                .unwrap()
+                .profile_name,
+            None
         );
         assert_eq!(
             launch_args(None, Some("standard"), Some("https://a.test")),
-            Some(json!({ "profile_name": "standard" }))
+            Some(Launch {
+                args: json!({ "profile_name": "standard" }),
+                profile_name: Some("standard".to_string()),
+            })
         );
         assert_eq!(
             launch_args(None, None, Some("https://a.test")),
-            Some(json!({ "target": "https://a.test" }))
+            Some(Launch {
+                args: json!({ "target": "https://a.test" }),
+                profile_name: None,
+            })
         );
         assert_eq!(launch_args(None, None, None), None);
+        assert_eq!(LaunchVerb::parse("scan.map"), Some(LaunchVerb::Map));
+        assert_eq!(LaunchVerb::parse("scan.list"), None);
+        assert_eq!(LaunchVerb::Start.to_string(), "scan.start");
     }
 
     /// Fix round G, G73: a list row's lanes gate `s` without an editor.

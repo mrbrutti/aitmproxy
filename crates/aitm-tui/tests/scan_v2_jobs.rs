@@ -16,8 +16,8 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{
-    probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ScanTab, DETAIL_LIST_MAX,
-    DETAIL_VALUE_MAX, PROFILE_MAX, TARGETS_MAX,
+    probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ReadStatus, ScanTab,
+    DETAIL_LIST_MAX, DETAIL_VALUE_MAX, PROFILE_MAX, TARGETS_MAX,
 };
 use aitm_tui::ui::text::width;
 use common::*;
@@ -353,7 +353,7 @@ fn rows_are_bounded_at_construction() {
         targets: (1..=6).map(|n| format!("http://h{n}.test")).collect(),
         ..status
     };
-    let crowded = row(&many.summary(), Some(&many));
+    let crowded = row(&many.summary(), Some(&ReadStatus::new(many)));
     assert_eq!(
         crowded.targets,
         "http://h1.test http://h2.test http://h3.test http://h4.test +2"
@@ -515,7 +515,7 @@ fn row_reads_dots_until_the_status_is_known() {
     assert_eq!(bare.state_phase, "running/audit");
     assert_eq!(bare.elapsed, "42s");
     assert_eq!(bare.issues.high, 1);
-    let full = row(&summary, Some(&status));
+    let full = row(&summary, Some(&ReadStatus::new(status)));
     assert_eq!(full.profile, "standard");
     assert_eq!(full.targets, "http://127.0.0.1:8080");
 }
@@ -656,4 +656,29 @@ fn jobs_detail_wraps_the_blocked_reason_and_the_refused_launch_over_its_footer()
             .any(|y| lines[y].contains("Out of scope: add the HTTP host to Scope (S)")),
         "the refused wording sits in the footer rows:\n{text}"
     );
+}
+
+/// Fix round G, G102 (D6 hostile-core bounds): `targets` is bounded in
+/// count as well as per string: a status with 100 000 targets keeps
+/// `DETAIL_LIST_MAX` of them, counts the rest into `dropped.targets`, and
+/// the row's `+n` names every target the row does not show.
+#[test]
+fn targets_are_capped_in_count_at_fold_with_the_rest_counted() {
+    let mut app = app();
+    let mut status = fixture("scan.status.json");
+    status["targets"] = json!((0..100_000)
+        .map(|k| format!("http://h{k}.test"))
+        .collect::<Vec<_>>());
+    let _ = app.on_bus(status_reply(status));
+    let read = app.scan.jobs.full.get(JOB).expect("the status is folded");
+    assert_eq!(read.targets.len(), DETAIL_LIST_MAX);
+    assert_eq!(read.dropped.targets, 100_000 - DETAIL_LIST_MAX);
+    let row = app.scan.jobs.row_of(JOB);
+    assert!(
+        row.targets.ends_with(" +99996"),
+        "the row counts every target it does not show: {:?}",
+        row.targets
+    );
+    assert!(row.targets.starts_with("http://h0.test http://h1.test"));
+    let _ = text_of(&app, 200, 50);
 }
