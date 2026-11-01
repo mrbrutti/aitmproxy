@@ -240,9 +240,18 @@ struct Invocation {
     term: TermOpts,
 }
 
+/// The reporter a mode usage error renders through once the terminal flags
+/// are known (spec D9, panel Q3): stderr with the caps `--color` and the
+/// environment settle to, at the parsed verbosity. Only a `split_term_args`
+/// failure, before any `TermOpts` exist, falls back to auto-detected caps.
+fn usage_reporter(term: &TermOpts) -> Reporter {
+    Reporter::stderr(term.detect_caps(), term.verbosity)
+}
+
 /// Classify `argv`. `None` when `aitm web --help` printed its usage and
-/// there is nothing to run. A mode usage error prints its line and exits 2
-/// (nothing has been built yet, so nothing needs tearing down).
+/// there is nothing to run. A mode usage error renders its panel through
+/// [`usage_reporter`] (so `--color`/`-q` hold) and exits 2; nothing has been
+/// built yet, so nothing needs tearing down.
 fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     let (term, argv) = match startup::split_term_args(argv) {
         Ok(split) => split,
@@ -266,7 +275,10 @@ fn parse_invocation(argv: Vec<String>) -> anyhow::Result<Option<Invocation>> {
     };
     let mode = match parse_mode(argv) {
         Ok(mode) => mode,
-        Err(usage) => exit_with(&report_for(&anyhow::anyhow!(usage), None), None),
+        Err(usage) => exit_with(
+            &report_for(&anyhow::anyhow!(usage), None),
+            Some(&usage_reporter(&term)),
+        ),
     };
     Ok(Some(Invocation {
         config_arg,
@@ -1246,8 +1258,8 @@ mod tests {
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
         configured_agent_port, manages_system_proxy, parse_invocation, parse_mode,
-        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation, Mode,
-        StartupError, TermOpts, OPERATOR_TOKEN_USAGE,
+        split_bus_endpoint_file_arg, split_config_arg, split_script_args, usage_reporter,
+        Invocation, Mode, StartupError, TermOpts, OPERATOR_TOKEN_USAGE,
     };
     use aitm_sysproxy::Recovery;
     use aitm_term::caps::{ColorChoice, Verbosity};
@@ -1934,6 +1946,31 @@ mod tests {
             }
         );
         assert_eq!(invocation.mode, Mode::Cli(args(&["scope", "list"])));
+    }
+
+    /// Spec D9 (panel Q3/Sp3): a mode usage error (`aitm tui extra`,
+    /// `aitm operator-token`) renders through a reporter built from the
+    /// already-parsed `--color`/`-q`, not a fresh auto-detected one, so
+    /// `--color never` and `-q` hold on that path. `ColorChoice::Always` and
+    /// `Never` decide colour outright in `Caps::from_parts`, so the check is
+    /// hermetic; `-v` switches animation off (D2 rule 5). No message is sent,
+    /// so the real stderr stays untouched.
+    #[test]
+    fn mode_usage_panels_use_the_parsed_term_opts() {
+        let quiet_plain = usage_reporter(&TermOpts {
+            verbosity: Verbosity::Quiet,
+            color: ColorChoice::Never,
+        });
+        assert!(!quiet_plain.caps().color, "--color never holds");
+        assert_eq!(quiet_plain.verbosity(), Verbosity::Quiet, "-q holds");
+
+        let loud_forced = usage_reporter(&TermOpts {
+            verbosity: Verbosity::Verbose,
+            color: ColorChoice::Always,
+        });
+        assert!(loud_forced.caps().color, "--color always holds");
+        assert!(!loud_forced.caps().animate, "-v turns the live region off");
+        assert_eq!(loud_forced.verbosity(), Verbosity::Verbose);
     }
 
     // ---- tester, whole-branch pass (spec D6, D9; AC-W1-3, AC-W1-12) ----

@@ -5,8 +5,10 @@
 //! ([`default_log_dir`], amendment B: the `logs` sibling of the CA audit
 //! log), overridable with `AITM_LOG_FILE` and, in tui mode for one more
 //! release, `AITM_TUI_LOG`. The directory is created `0700`, the file is
-//! opened append-only, `0600`, `O_NOFOLLOW`, and rotated once to
-//! `aitm.log.1` when it is over [`ROTATE_BYTES`] at open ([`open_log_file`]).
+//! opened append-only, `0600`, `O_NOFOLLOW|O_NONBLOCK`, must be a regular
+//! file (a wider existing mode is tightened on the fd), and is rotated once
+//! to `aitm.log.1` when it is over [`ROTATE_BYTES`] at open
+//! ([`open_log_file`]).
 //!
 //! [`compose`] builds one `tracing_subscriber::registry()` with up to three
 //! layers, each behind its own filter: the file layer (always, when the file
@@ -34,40 +36,44 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::{fmt, EnvFilter};
 
 use crate::startup::args::TermOpts;
+use crate::startup::errors::StartupError;
 use crate::tui::{TuiLog, LOG_PATH_ENV};
+
+/// `<level>` followed by the curated noisy-crate caps, as one directive
+/// string (quality Q10: the cap list is spelled once). The noisy transport
+/// and browser dependencies are pinned to `warn` so a normal browsing session
+/// does not bury the useful lines under per-connection dependency chatter.
+macro_rules! with_noisy_caps {
+    ($level:literal) => {
+        concat!(
+            $level,
+            ",chromiumoxide=warn",
+            ",tungstenite=warn",
+            ",tokio_tungstenite=warn",
+            ",hyper=warn",
+            ",hyper_util=warn",
+            ",rustls=warn",
+            ",tower=warn",
+            ",reqwest=warn",
+        )
+    };
+}
 
 /// The curated default tracing directive used when `RUST_LOG` is unset (AC3).
 ///
 /// Operator-relevant lifecycle on the `aitm*` targets ("proxy listening", the
-/// obscura start/stop/attach lines) stays at `info`, while the noisy transport
-/// and browser dependencies are pinned to `warn` so a normal browsing session
-/// does not bury the useful lines under per-connection dependency chatter.
-/// Benign per-connection disconnects are already emitted at `debug` (Task 1),
-/// so the `info` baseline hides them without a per-target pin. `RUST_LOG`, when
-/// set, overrides this wholesale (see [`build_env_filter`]).
-pub const DEFAULT_LOG_DIRECTIVE: &str = "info,\
-    chromiumoxide=warn,\
-    tungstenite=warn,\
-    tokio_tungstenite=warn,\
-    hyper=warn,\
-    hyper_util=warn,\
-    rustls=warn,\
-    tower=warn,\
-    reqwest=warn";
+/// obscura start/stop/attach lines) stays at `info`, while the noisy
+/// dependencies are capped at `warn` (`with_noisy_caps!`). Benign
+/// per-connection disconnects are already emitted at `debug` (Task 1), so the
+/// `info` baseline hides them without a per-target pin. `RUST_LOG`, when set,
+/// overrides this wholesale (see [`build_env_filter`]).
+pub const DEFAULT_LOG_DIRECTIVE: &str = with_noisy_caps!("info");
 
 /// [`DEFAULT_LOG_DIRECTIVE`] with `debug` in front: the file (and `-vv`
 /// stderr) filter when `RUST_LOG` is unset and the operator asked for debug
 /// (plan C12). The noisy-crate caps stay, so `-vv` shows aitmproxy's own
 /// DEBUG records, not hyper's.
-pub const DEBUG_LOG_DIRECTIVE: &str = "debug,\
-    chromiumoxide=warn,\
-    tungstenite=warn,\
-    tokio_tungstenite=warn,\
-    hyper=warn,\
-    hyper_util=warn,\
-    rustls=warn,\
-    tower=warn,\
-    reqwest=warn";
+pub const DEBUG_LOG_DIRECTIVE: &str = with_noisy_caps!("debug");
 
 /// Environment variable naming an explicit log file, in every mode (spec D7).
 /// In tui mode `AITM_TUI_LOG` ([`LOG_PATH_ENV`]) is still honoured after it,
@@ -91,16 +97,25 @@ static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
 /// [`DEFAULT_LOG_DIRECTIVE`] is used. Both parse lossily, so a malformed
 /// directive drops the bad part rather than failing startup.
 pub fn build_env_filter(rust_log: Option<String>) -> EnvFilter {
-    match rust_log.filter(|v| !v.trim().is_empty()) {
+    match rust_log_set(rust_log.as_deref()) {
         Some(directive) => EnvFilter::new(directive),
         None => EnvFilter::new(DEFAULT_LOG_DIRECTIVE),
     }
 }
 
-/// A `RUST_LOG` value that counts as set: non-empty after trimming, the way
-/// [`build_env_filter`] has always read it.
+/// The one definition of "`RUST_LOG` is active" (quality Q2, tester F4):
+/// the value is set and non-empty after trimming, the way
+/// [`build_env_filter`] has always read it. Every consumer — the file
+/// directive, the raw stderr stream ([`raw_stream`]) and the caps'
+/// animation switch (`TermOpts::caps_from_parts`) — reads it through here,
+/// so `RUST_LOG=" "` is inactive everywhere at once.
+pub fn rust_log_active(value: Option<&str>) -> bool {
+    value.is_some_and(|v| !v.trim().is_empty())
+}
+
+/// The `RUST_LOG` value when [`rust_log_active`], else `None`.
 fn rust_log_set(rust_log: Option<&str>) -> Option<&str> {
-    rust_log.filter(|v| !v.trim().is_empty())
+    rust_log.filter(|v| rust_log_active(Some(v)))
 }
 
 /// The directive the file layer (and the raw stderr stream) filters with
@@ -119,7 +134,7 @@ pub fn file_directive(rust_log: Option<&str>, verbosity: Verbosity) -> String {
 /// non-empty `RUST_LOG`, or `-v`/`-vv`, and never in tui mode, where the
 /// TUI owns the terminal (D11, plan C14).
 pub fn raw_stream(opts: &TermOpts, rust_log: Option<&str>, tui: bool) -> bool {
-    !tui && (rust_log_set(rust_log).is_some() || opts.verbosity >= Verbosity::Verbose)
+    !tui && (rust_log_active(rust_log) || opts.verbosity >= Verbosity::Verbose)
 }
 
 /// The log directory: the `logs` sibling of the CA audit log, so it lands in
@@ -153,10 +168,15 @@ pub fn log_file_path(tui: bool, env: &dyn Fn(&str) -> Option<String>) -> PathBuf
 /// Open the log file for appending (spec D7): the parent directory is
 /// created `0700`, a file over [`ROTATE_BYTES`] is first renamed to
 /// `<name>.1` (replacing an older `.1`), and the file is opened
-/// `O_CREAT|O_APPEND|O_WRONLY|O_NOFOLLOW`, mode `0600` when created. The
-/// final component is never followed, so a symlink planted at the log path
-/// fails the open instead of being written through (plan C13; the pattern
-/// `aitm-proto-http` opens the CA key with).
+/// `O_CREAT|O_APPEND|O_WRONLY|O_NOFOLLOW|O_NONBLOCK`, mode `0600` when
+/// created. The final component is never followed, so a symlink planted at
+/// the log path fails the open instead of being written through (plan C13;
+/// the pattern `aitm-proto-http` opens the CA key with). After the open
+/// (security S2, spec amendment 2026-11-01) the fd must be a regular file —
+/// a device, FIFO or socket is refused with `log path is not a regular
+/// file`, and `O_NONBLOCK` makes a reader-less FIFO fail (`ENXIO`) instead
+/// of blocking startup — and an existing file wider than `0600` is
+/// tightened with `fchmod` on the open fd before anything is written.
 pub fn open_log_file(path: &Path) -> std::io::Result<File> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         let mut dir = DirBuilder::new();
@@ -175,7 +195,8 @@ pub fn open_log_file(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        opts.mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(not(unix))]
     {
@@ -186,7 +207,21 @@ pub fn open_log_file(path: &Path) -> std::io::Result<File> {
             )));
         }
     }
-    opts.open(path)
+    let file = opts.open(path)?;
+    // Checked on the opened fd, not the path, so nothing can be swapped in
+    // between the check and the first write.
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::other("log path is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if meta.permissions().mode() & 0o077 != 0 {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(file)
 }
 
 /// Rename `path` to `<name>.1` when it is a regular file larger than
@@ -264,9 +299,11 @@ where
 }
 
 /// Open the log file for the composition. On failure the operator gets one
-/// warning line through the reporter (`log file unavailable: <path> (<why>)
-/// · running without a log`; AC-W1-17) and the sink records the problem;
-/// nothing fails.
+/// warning line through the reporter — the `Display` of
+/// [`StartupError::LogFile`] (`log file unavailable: <path> (<why>)`), then
+/// `· running without a log` (AC-W1-17; quality Q1: that variant is the one
+/// place the wording lives) — and the sink records the open error's text as
+/// the problem; nothing fails.
 fn open_sink(reporter: &Reporter, path: &Path) -> (Option<Mutex<File>>, LogSink) {
     match open_log_file(path) {
         Ok(file) => (
@@ -277,16 +314,20 @@ fn open_sink(reporter: &Reporter, path: &Path) -> (Option<Mutex<File>>, LogSink)
             },
         ),
         Err(err) => {
+            let problem = err.to_string();
+            let unavailable = StartupError::LogFile {
+                path: path.to_path_buf(),
+                source: err,
+            };
             reporter.warn(&format!(
-                "log file unavailable: {} ({err}) {sep} running without a log",
-                path.display(),
+                "{unavailable} {sep} running without a log",
                 sep = reporter.glyphs().sep
             ));
             (
                 None,
                 LogSink {
                     path: None,
-                    problem: Some(err.to_string()),
+                    problem: Some(problem),
                 },
             )
         }
@@ -557,6 +598,98 @@ mod tests {
     }
 
     #[cfg(unix)]
+    /// Security S2(a): `mode(0o600)` applies only at creation, so a log file
+    /// that already exists wider (0644 here, say from an older build or a
+    /// hand-made file) is tightened to 0600 on the open fd before it is
+    /// written to; the contents are kept (append) and nothing is rotated.
+    #[test]
+    fn open_log_file_forces_0600_on_a_wider_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = TempDir::new("wide");
+        let path = d.path().join("aitm.log");
+        fs::write(&path, "old\n").expect("pre-create");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod 644");
+        assert_eq!(mode_of(&path), 0o644, "precondition");
+
+        let mut file = open_log_file(&path).expect("open the wide file");
+        assert_eq!(mode_of(&path), 0o600, "the open tightens the mode");
+        file.write_all(b"new\n").expect("append");
+        drop(file);
+        assert_eq!(fs::read_to_string(&path).expect("read"), "old\nnew\n");
+        assert!(!d.path().join("aitm.log.1").exists());
+
+        // A file that is already 0600 (or tighter) is left alone.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).expect("chmod 400");
+        drop(open_log_file(&path));
+        assert_eq!(mode_of(&path), 0o400, "a tighter mode is not widened");
+    }
+
+    /// Security S2(b): a FIFO at the log path with no reader must fail the
+    /// open promptly (`O_NONBLOCK` → `ENXIO`) instead of blocking startup
+    /// forever on the write-open. The open runs on its own thread so a
+    /// regression shows as a 1 s timeout, not a hung test binary. Skipped
+    /// where `mkfifo` is not runnable.
+    #[test]
+    fn open_log_file_refuses_a_reader_less_fifo_within_a_second() {
+        use std::os::unix::fs::FileTypeExt;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let d = TempDir::new("fifo");
+        let path = d.path().join("aitm.log");
+        let made = std::process::Command::new("mkfifo").arg(&path).status();
+        let Ok(status) = made else {
+            return; // no mkfifo on this host: nothing to prove
+        };
+        assert!(status.success(), "mkfifo {}: {status}", path.display());
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("fifo metadata")
+                .file_type()
+                .is_fifo(),
+            "precondition: a FIFO at the log path"
+        );
+
+        let (tx, rx) = mpsc::channel();
+        let target = path.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_log_file(&target).map(drop));
+        });
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Err(err)) => {
+                assert_eq!(err.raw_os_error(), Some(libc::ENXIO), "{err}");
+            }
+            Ok(Ok(())) => panic!("a reader-less FIFO was accepted as the log file"),
+            Err(_) => panic!("open_log_file blocked on a reader-less FIFO for over 1 s"),
+        }
+    }
+
+    /// Security S2(b): a device at the log path is refused after the open
+    /// (`AITM_LOG_FILE=/dev/fd/1` would otherwise put INFO on stdout), and
+    /// `open_sink` turns the refusal into the one `log file unavailable`
+    /// warning; the device itself is untouched.
+    #[test]
+    fn open_log_file_refuses_a_device_at_the_log_path() {
+        let path = Path::new("/dev/null");
+        let err = open_log_file(path).expect_err("a device is not a log file");
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(err.to_string(), "log path is not a regular file");
+
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        let (file, log_sink) = open_sink(&reporter, path);
+        reporter.finish();
+        assert!(file.is_none());
+        assert_eq!(log_sink.path, None);
+        assert_eq!(
+            log_sink.problem.as_deref(),
+            Some("log path is not a regular file")
+        );
+        assert_eq!(
+            sink.text(),
+            "warning: log file unavailable: /dev/null (log path is not a regular file) - running without a log\n"
+        );
+    }
+
     #[test]
     fn open_log_file_refuses_a_symlink() {
         let d = TempDir::new("symlink");
@@ -613,6 +746,32 @@ mod tests {
         assert!(!raw_stream(&opts(Verbosity::Debug), Some("info"), true));
         assert!(!raw_stream(&opts(Verbosity::Normal), Some(""), false));
         assert!(!raw_stream(&opts(Verbosity::Quiet), None, false));
+    }
+
+    /// Quality Q2 / tester F4: the one predicate every consumer reads.
+    /// Unset, empty and blank are inactive; anything with a non-space
+    /// character is active, however it is padded; `raw_stream` and the file
+    /// directive agree with it on the blank value.
+    #[test]
+    fn rust_log_active_is_trimmed_non_empty() {
+        assert!(!rust_log_active(None));
+        assert!(!rust_log_active(Some("")));
+        assert!(!rust_log_active(Some(" ")));
+        assert!(!rust_log_active(Some("\t\n")));
+        assert!(rust_log_active(Some("info")));
+        assert!(rust_log_active(Some(" warn ")));
+        assert!(rust_log_active(Some("x")));
+
+        assert!(!raw_stream(&opts(Verbosity::Normal), Some(" "), false));
+        assert_eq!(
+            file_directive(Some(" "), Verbosity::Normal),
+            DEFAULT_LOG_DIRECTIVE
+        );
+        assert_eq!(
+            file_directive(Some(" warn "), Verbosity::Normal),
+            " warn ",
+            "an active value is passed through untrimmed; EnvFilter trims"
+        );
     }
 
     #[test]

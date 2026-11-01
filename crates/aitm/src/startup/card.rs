@@ -27,12 +27,12 @@ use aitm_term::style::Role;
 use aitm_term::text;
 
 /// The next step under an empty `Scope` row (spec D10, M1).
-pub const SCOPE_ADD_COMMAND: &str = "aitm scope add --host <host>";
+pub(crate) const SCOPE_ADD_COMMAND: &str = "aitm scope add --host <host>";
 /// The next step under an `untrusted` `CA` row (spec D10, M1).
-pub const CA_INSTALL_COMMAND: &str = "aitm ca install";
+pub(crate) const CA_INSTALL_COMMAND: &str = "aitm ca install";
 /// The next step under an `off` or `points at <host>:<port>` `System proxy`
 /// row (spec T7).
-pub const PROXY_SYSTEM_SET_COMMAND: &str = "aitm proxy system set";
+pub(crate) const PROXY_SYSTEM_SET_COMMAND: &str = "aitm proxy system set";
 /// The `Browser` row's trailing note (spec M6; one plain string in wave 1,
 /// plan C24).
 const SSRF_NOTE: &str = "(SSRF-filtered)";

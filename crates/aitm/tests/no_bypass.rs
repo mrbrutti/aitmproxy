@@ -9,9 +9,14 @@
 //! sources with `std::fs::read_dir` (no `walkdir`).
 //!
 //! `crates/aitm-tui/src` joins the scan in a later wave (amendment D).
+//!
+//! The walk, the production-line rule and `Hit` are shared with the other
+//! pins through `tests/common/mod.rs` (quality Q5).
 
-use std::fmt;
 use std::path::{Path, PathBuf};
+
+mod common;
+use common::{list, production_lines, rust_files, workspace_root, Hit};
 
 /// The files allowed to write to stdout/stderr directly, with the reason spec
 /// D14 gives for each. W2 removes `confirm.rs` when the prompt goes through
@@ -36,34 +41,6 @@ const ROOTS: [&str; 2] = ["crates/aitm/src", "crates/aitm-cli/src"];
 
 /// The print macros no production line may call.
 const NEEDLES: [&str; 4] = ["println!(", "print!(", "eprintln!(", "eprint!("];
-
-/// One offending line, displayed as `path:line: text`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Hit {
-    path: PathBuf,
-    line: usize,
-    needle: &'static str,
-    text: String,
-}
-
-impl fmt::Display for Hit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.path.display(), self.line, self.text)
-    }
-}
-
-/// The production lines of a source file, numbered from 1: everything before
-/// the first line that is exactly `#[cfg(test)]` at column 0 (the trailing
-/// `mod tests` convention; an indented `#[cfg(test)]` on a single item, as in
-/// `macos_capture/feeder.rs`, does not end the scan), minus every line whose
-/// trimmed text starts with `//`.
-fn production_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| (index + 1, line))
-        .take_while(|(_, line)| *line != "#[cfg(test)]")
-        .filter(|(_, line)| !line.trim_start().starts_with("//"))
-}
 
 /// True when the byte before `at` continues an identifier, so a needle found
 /// at `at` is the tail of a longer name (`println!(` inside `eprintln!(`).
@@ -95,37 +72,6 @@ fn scan_prints(path: &Path, text: &str) -> Vec<Hit> {
         }));
     }
     hits
-}
-
-/// The workspace root, two levels above this crate's manifest.
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// Every `.rs` file under `dir`, recursively, in sorted order.
-fn rust_files(dir: &Path) -> Vec<PathBuf> {
-    let entries =
-        std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()));
-    let mut out = Vec::new();
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|err| panic!("read_dir entry under {}: {err}", dir.display()))
-            .path();
-        if path.is_dir() {
-            out.extend(rust_files(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out
-}
-
-fn list(hits: &[Hit]) -> String {
-    hits.iter()
-        .map(|hit| format!("  {hit}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[test]
@@ -162,6 +108,33 @@ fn scanner_ignores_indented_cfg_test_attributes_and_comments() {
             text: "fn h() { eprintln!(\"z\"); }".to_string(),
         }]
     );
+}
+
+/// Tester F1 / quality Q5: a column-0 `#[cfg(test)]` that gates a module
+/// *declaration* (`pub(crate) mod test_support;`, as in
+/// `crates/aitm/src/macos_capture/mod.rs`) does not end the scan; only one
+/// whose next significant line opens an inline `mod … {` does. A print after
+/// the declaration is caught; the inline module's body is still skipped.
+#[test]
+fn scanner_keeps_reading_past_a_cfg_test_declaration() {
+    let text = "#[cfg(test)]\npub(crate) mod test_support;\nfn f() { println!(\"after\"); }\n#[cfg(test)]\nmod tests { fn g() { println!(\"y\"); } }\n";
+    let hits = scan_prints(Path::new("inline.rs"), text);
+    assert_eq!(
+        hits,
+        vec![Hit {
+            path: PathBuf::from("inline.rs"),
+            line: 3,
+            needle: "println!(",
+            text: "fn f() { println!(\"after\"); }".to_string(),
+        }]
+    );
+    // `mod x;` (any visibility) is a declaration too.
+    let text = "#[cfg(test)]\nmod helpers;\nfn f() { eprint!(\"after\"); }\n";
+    assert_eq!(scan_prints(Path::new("inline.rs"), text).len(), 1);
+    // Blank, comment and attribute lines between the attribute and the
+    // module opener do not hide the opener.
+    let text = "fn ok() {}\n#[cfg(test)]\n\n// the tests\n#[allow(clippy::print_stdout)]\nmod tests {\n    fn t() { println!(\"x\"); }\n}\n";
+    assert_eq!(scan_prints(Path::new("inline.rs"), text), Vec::<Hit>::new());
 }
 
 #[test]

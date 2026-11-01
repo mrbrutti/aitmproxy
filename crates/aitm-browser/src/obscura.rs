@@ -527,8 +527,9 @@ impl ObscuraProcess {
     }
 
     /// The probed `--version` of the binary this child runs (trimmed);
-    /// informational, never a pin.
-    pub fn version(&self) -> &str {
+    /// informational, never a pin. Crate-private: only `ObscuraDriver::launch`
+    /// reads it, and `LaunchedBrowser::version` is the public surface.
+    pub(crate) fn version(&self) -> &str {
         &self.version
     }
 

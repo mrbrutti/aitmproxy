@@ -12,8 +12,18 @@
 //! may follow (so the hidden tail holds no code). Today the one declaration
 //! case is `crates/aitm/src/macos_capture/mod.rs`, whose tail is the
 //! `test_support` declaration alone.
+//!
+//! Since the fix for tester F1 the pins stop only at a column-0
+//! `#[cfg(test)]` whose next significant line opens an inline `mod … {`
+//! (`common::production_lines`), so a declaration tail is scanned rather than
+//! hidden; this guard stays as the explicit statement of the convention, and
+//! shares the walk and `opens_inline_module` with the pins through
+//! `tests/common/mod.rs` (quality Q5).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+mod common;
+use common::{opens_inline_module, rust_files, workspace_root};
 
 /// The roots the two pins walk, plus the one the tracing pin adds.
 const ROOTS: [&str; 3] = [
@@ -21,28 +31,6 @@ const ROOTS: [&str; 3] = [
     "crates/aitm-cli/src",
     "crates/aitm-term/src",
 ];
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn rust_files(dir: &Path) -> Vec<PathBuf> {
-    let entries =
-        std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()));
-    let mut out = Vec::new();
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|err| panic!("read_dir entry under {}: {err}", dir.display()))
-            .path();
-        if path.is_dir() {
-            out.extend(rust_files(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out
-}
 
 /// A line the pins' blind tail may hold without hiding anything: blank, a
 /// comment, an attribute, or a `mod …;` declaration.
@@ -56,12 +44,6 @@ fn harmless_tail_line(line: &str) -> bool {
             && (t.starts_with("mod ")
                 || t.starts_with("pub mod ")
                 || t.starts_with("pub(crate) mod ")))
-}
-
-fn opens_inline_module(line: &str) -> bool {
-    let t = line.trim_end();
-    (t.starts_with("mod ") || t.starts_with("pub mod ") || t.starts_with("pub(crate) mod "))
-        && t.ends_with('{')
 }
 
 /// The pure check over `(path, text)`: `None` when the file is fine, else

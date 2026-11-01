@@ -11,9 +11,14 @@
 //! file's `#[cfg(test)]` tail and asserts every hit lives in [`HOME`], whose
 //! `fmt::layer()` count equals its `.with_writer(` count. The scanner is a
 //! pure function over `(path, text)` so the self-check proves it bites.
+//!
+//! The walk, the production-line rule and `Hit` are shared with the other
+//! pins through `tests/common/mod.rs` (quality Q5).
 
-use std::fmt;
 use std::path::{Path, PathBuf};
+
+mod common;
+use common::{list, production_lines, rust_files, workspace_root, Hit};
 
 /// The one file allowed to build and install the tracing subscriber.
 const HOME: &str = "crates/aitm/src/startup/log.rs";
@@ -35,33 +40,6 @@ const INIT: &str = ".init()";
 const SET_GLOBAL: &str = "set_global_default(";
 /// The writer every `fmt` layer must name (never the stdout default).
 const WITH_WRITER: &str = ".with_writer(";
-
-/// One offending line, displayed as `path:line: text`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Hit {
-    path: PathBuf,
-    line: usize,
-    needle: &'static str,
-    text: String,
-}
-
-impl fmt::Display for Hit {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {}", self.path.display(), self.line, self.text)
-    }
-}
-
-/// The production lines of a source file, numbered from 1: everything before
-/// the first line that is exactly `#[cfg(test)]` at column 0 (the trailing
-/// `mod tests` convention; an indented `#[cfg(test)]` on a single item does
-/// not end the scan), minus every line whose trimmed text starts with `//`.
-fn production_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
-    text.lines()
-        .enumerate()
-        .map(|(index, line)| (index + 1, line))
-        .take_while(|(_, line)| *line != "#[cfg(test)]")
-        .filter(|(_, line)| !line.trim_start().starts_with("//"))
-}
 
 /// True for a `use` line that brings `tracing_subscriber`'s `fmt` into reach
 /// (`use tracing_subscriber::fmt;`, `use tracing_subscriber::fmt::…`,
@@ -121,37 +99,6 @@ fn count(text: &str, needle: &str) -> usize {
         .sum()
 }
 
-/// The workspace root, two levels above this crate's manifest.
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// Every `.rs` file under `dir`, recursively, in sorted order.
-fn rust_files(dir: &Path) -> Vec<PathBuf> {
-    let entries =
-        std::fs::read_dir(dir).unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()));
-    let mut out = Vec::new();
-    for entry in entries {
-        let path = entry
-            .unwrap_or_else(|err| panic!("read_dir entry under {}: {err}", dir.display()))
-            .path();
-        if path.is_dir() {
-            out.extend(rust_files(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out
-}
-
-fn list(hits: &[Hit]) -> String {
-    hits.iter()
-        .map(|hit| format!("  {hit}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[test]
 fn tracing_scanner_catches_a_bare_fmt_init() {
     let text = "use tracing_subscriber::fmt;\nfn i() { let _ = fmt().try_init(); }\n";
@@ -178,6 +125,26 @@ fn tracing_scanner_catches_a_bare_fmt_init() {
         hits[0].to_string(),
         "inline.rs:2: fn i() { let _ = fmt().try_init(); }"
     );
+}
+
+/// Tester F1 / quality Q5: the same tail rule as `no_bypass.rs` — a column-0
+/// `#[cfg(test)]` on a `pub(crate) mod x;` declaration does not end the
+/// scan, so a layer built after it is caught; `count` reads the same lines.
+#[test]
+fn tracing_scanner_keeps_reading_past_a_cfg_test_declaration() {
+    let text = "#[cfg(test)]\npub(crate) mod test_support;\nfn i() { let _ = fmt::layer(); }\n#[cfg(test)]\nmod tests { fn t() { let _ = fmt::layer().with_writer(std::io::stdout); } }\n";
+    let hits = scan_tracing(Path::new("inline.rs"), text);
+    assert_eq!(
+        hits,
+        vec![Hit {
+            path: PathBuf::from("inline.rs"),
+            line: 3,
+            needle: "fmt::layer()",
+            text: "fn i() { let _ = fmt::layer(); }".to_string(),
+        }]
+    );
+    assert_eq!(count(text, LAYER), 1);
+    assert_eq!(count(text, WITH_WRITER), 0);
 }
 
 #[test]

@@ -14,6 +14,8 @@
 
 use aitm_term::caps::{Caps, ColorChoice, Verbosity};
 
+use crate::startup::log::rust_log_active;
+
 /// The terminal flags every invocation accepts before its mode word
 /// (spec D9). `Default` is the bare invocation: normal verbosity, `--color
 /// auto`.
@@ -53,7 +55,7 @@ impl TermOpts {
 
     fn settle_animation(&self, caps: Caps, rust_log: Option<String>) -> Caps {
         let raw_stream =
-            self.verbosity >= Verbosity::Verbose || rust_log.is_some_and(|v| !v.is_empty());
+            self.verbosity >= Verbosity::Verbose || rust_log_active(rust_log.as_deref());
         if raw_stream {
             caps.without_animation()
         } else {
@@ -66,6 +68,11 @@ impl TermOpts {
 /// `--config -v` (a file literally named `-v`) is never read as a flag and a
 /// `-v` after the value still is (plan C26).
 const VALUED_FLAGS: &[&str] = &["--config", "--script", "--bus-endpoint-file"];
+
+/// The value-less terminal flags [`split_term_args`] strips, which
+/// [`pre_boot`] steps over before matching the alias (tester F3). `--color`
+/// is the one valued terminal flag and is handled beside `--config`.
+const TERM_SWITCHES: &[&str] = &["-v", "-vv", "--verbose", "-q", "--quiet"];
 
 /// Strip the terminal flags from the raw argv (spec D9; plan C26).
 ///
@@ -151,17 +158,24 @@ pub enum PreBoot {
 }
 
 /// The pre-boot fast path: the first token, after stepping over `--config <p>`
-/// and `--config=<p>`, is one of the version or help aliases. Anything else,
-/// including `web --help` (the mode's own help) and an empty argv, boots.
+/// / `--config=<p>` and the terminal flags [`split_term_args`] knows (`-v`,
+/// `-vv`, `--verbose`, `-q`, `--quiet`, `--color <v>`, `--color=<v>`; tester
+/// F3, so `aitm -v --version` never boots the host), is one of the version or
+/// help aliases. Anything else, including `web --help` (the mode's own help)
+/// and an empty argv, boots. A flag's value is never read as the alias:
+/// `--config --version` names a file and `--color --help` names a colour.
 pub fn pre_boot(argv: &[String]) -> Option<PreBoot> {
     let mut tokens = argv.iter();
     let first = loop {
         let token = tokens.next()?;
-        if token == "--config" {
+        if token == "--config" || token == "--color" {
             tokens.next()?;
             continue;
         }
-        if token.starts_with("--config=") {
+        if token.starts_with("--config=") || token.starts_with("--color=") {
+            continue;
+        }
+        if TERM_SWITCHES.contains(&token.as_str()) {
             continue;
         }
         break token;
@@ -397,6 +411,21 @@ mod tests {
                 .animate,
             "an empty RUST_LOG is not active"
         );
+        // Quality Q2 / tester F4: one definition of "RUST_LOG is active"
+        // (`startup::log::rust_log_active`, trimmed and non-empty), so a
+        // blank value does not switch the raw stream on for the caps while
+        // `raw_stream` leaves it off.
+        let blank_rust_log = env_of(&[
+            ("TERM", "xterm-256color"),
+            ("LANG", "en_US.UTF-8"),
+            ("RUST_LOG", " "),
+        ]);
+        assert!(
+            normal
+                .caps_from_parts(true, Some(120), &blank_rust_log)
+                .animate,
+            "a blank RUST_LOG is not active either"
+        );
 
         let never = opts(Verbosity::Normal, ColorChoice::Never);
         assert!(
@@ -555,10 +584,11 @@ mod tests {
         }
     }
 
-    /// Spec D8: only `--config <p>` / `--config=<p>` is stepped over, the
-    /// alias must be the whole first token, and nothing after it matters.
+    /// Spec D8: `--config <p>` / `--config=<p>` and the terminal flags are
+    /// stepped over (tester F3), the alias must be the whole first token,
+    /// and nothing after it matters.
     #[test]
-    fn pre_boot_steps_over_config_only_and_matches_whole_tokens() {
+    fn pre_boot_steps_over_config_and_term_flags_and_matches_whole_tokens() {
         assert_eq!(pre_boot(&argv(&["--config=x"])), None);
         assert_eq!(pre_boot(&argv(&["--config", "x"])), None);
         // `--config --version` names a file called `--version`: it boots.
@@ -567,9 +597,16 @@ mod tests {
             pre_boot(&argv(&["--config", "a", "--config=b", "-V"])),
             Some(PreBoot::Version)
         );
-        // Any other flag first boots (the terminal flags included).
-        assert_eq!(pre_boot(&argv(&["-v", "--version"])), None);
-        assert_eq!(pre_boot(&argv(&["--color=never", "--help"])), None);
+        // The terminal flags are stepped over too (tester F3: `aitm -v
+        // --version` must not boot the host); any other flag first boots.
+        assert_eq!(
+            pre_boot(&argv(&["-v", "--version"])),
+            Some(PreBoot::Version)
+        );
+        assert_eq!(
+            pre_boot(&argv(&["--color=never", "--help"])),
+            Some(PreBoot::Help)
+        );
         assert_eq!(pre_boot(&argv(&["--script", "a.rhai", "--help"])), None);
         for not_alias in [
             "--version=1",
@@ -591,6 +628,47 @@ mod tests {
             pre_boot(&argv(&["version", "--config"])),
             Some(PreBoot::Version)
         );
+    }
+
+    /// Tester F3 (spec D8/D9): every terminal flag `split_term_args` knows
+    /// (`-v`, `-vv`, `--verbose`, `-q`, `--quiet`, `--color <v>`,
+    /// `--color=<v>`) is stepped over before the alias is matched, so `aitm
+    /// -v --version` answers from the constant instead of booting the host;
+    /// a `--color` value is never read as the alias; and a terminal flag
+    /// before a command word still boots.
+    #[test]
+    fn pre_boot_steps_over_the_terminal_flags() {
+        assert_eq!(
+            pre_boot(&argv(&["-v", "--version"])),
+            Some(PreBoot::Version)
+        );
+        assert_eq!(
+            pre_boot(&argv(&["--color", "never", "-h"])),
+            Some(PreBoot::Help)
+        );
+        assert_eq!(pre_boot(&argv(&["-q", "scope", "list"])), None);
+        for flags in [
+            &["-vv"][..],
+            &["--verbose"],
+            &["--quiet"],
+            &["-q", "-v"],
+            &["--color=always"],
+            &["--color", "auto", "--config", "x", "-vv"],
+        ] {
+            let mut tokens: Vec<&str> = flags.to_vec();
+            tokens.push("version");
+            assert_eq!(
+                pre_boot(&argv(&tokens)),
+                Some(PreBoot::Version),
+                "{tokens:?}"
+            );
+        }
+        // `--color --help` names a colour called `--help`: not the alias.
+        assert_eq!(pre_boot(&argv(&["--color", "--help"])), None);
+        assert_eq!(pre_boot(&argv(&["--color"])), None);
+        assert_eq!(pre_boot(&argv(&["-v"])), None);
+        // `-V` is pre-boot's own alias, not a verbosity flag.
+        assert_eq!(pre_boot(&argv(&["-V", "-v"])), Some(PreBoot::Version));
     }
 
     /// AC-W1-2: `aitm --help` is spec M3's wave-1 block verbatim, with the

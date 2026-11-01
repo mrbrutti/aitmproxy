@@ -52,15 +52,23 @@ pub const LOG_PATH_ENV: &str = "AITM_TUI_LOG";
 /// How often the TUI polls `flow.list` (F4 push is not on the bus yet).
 const POLL: Duration = Duration::from_millis(500);
 
-/// Where tui-mode tracing went, for the startup toast.
+/// Where this run's log went, for the TUI's startup toast. Built by
+/// [`crate::startup::log::tui_log`] from the [`crate::startup::log::LogSink`]
+/// that `init_tracing` returned: since wave 1 the file layer is always
+/// attempted (`<aitm dir>/logs/aitm.log`, `AITM_LOG_FILE`, or `AITM_TUI_LOG`
+/// in tui mode; spec D7, D11), whatever `RUST_LOG` says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiLog {
-    /// `RUST_LOG` is unset: no subscriber, no file.
+    /// The non-tui placeholder: `main` passes it to [`services`] on the
+    /// server and web paths, where no toast is shown. It says nothing about
+    /// whether a log file opened (the file layer was still attempted via
+    /// `crate::startup::log`).
     Off,
     /// Logging to this file.
     File(PathBuf),
-    /// `RUST_LOG` is set but the file could not be opened: logging is
-    /// disabled for the run and the operator is told, not left guessing.
+    /// The log file could not be opened (`crate::startup::log::open_log_file`
+    /// refused it; `why` is the open error's text): the run continues with
+    /// no file and the operator is told, not left guessing.
     Unavailable { path: PathBuf, why: String },
 }
 
@@ -68,7 +76,7 @@ impl TuiLog {
     /// The status-bar note shown when the UI starts.
     pub fn startup_note(&self) -> String {
         match self {
-            TuiLog::Off => "embedded proxy · set RUST_LOG to write a log file".to_string(),
+            TuiLog::Off => "embedded proxy · log location not reported".to_string(),
             TuiLog::File(p) => format!("embedded proxy · log: {}", p.display()),
             TuiLog::Unavailable { path, why } => format!(
                 "embedded proxy · logging disabled: could not open {}: {why}",
@@ -444,12 +452,16 @@ mod tests {
     }
 
     /// SEC-3: what the startup toast says for each logging outcome — a
-    /// failed open is a warning, never a silent no-log run.
+    /// failed open is a warning, never a silent no-log run. `Off` is the
+    /// non-tui placeholder (spec reviewer Sp9): the file layer was still
+    /// attempted by `startup::log`, so the note no longer tells the operator
+    /// to set `RUST_LOG`, which has not decided whether a log is written
+    /// since wave 1.
     #[test]
     fn the_startup_note_names_the_log_file_or_why_there_is_none() {
         assert_eq!(
             TuiLog::Off.startup_note(),
-            "embedded proxy · set RUST_LOG to write a log file"
+            "embedded proxy · log location not reported"
         );
         assert_eq!(
             TuiLog::File(PathBuf::from("/tmp/aitm-tui-7.log")).startup_note(),

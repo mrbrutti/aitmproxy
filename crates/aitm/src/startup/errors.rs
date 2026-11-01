@@ -5,9 +5,9 @@
 //! meets most are typed here so [`report_for`] can turn each into the exact
 //! what/why/fix/command panel of mock-up M2, while the `Display` of every
 //! variant stays what 0.5.10 printed (the `main.rs` pin and
-//! `cli-startup.sh` read it through `anyhow`). A dispatcher or mode-parser
-//! usage error becomes a [`ErrorKind::Usage`] panel (exit 2) pointing at
-//! `aitm --help`; anything else is the `anyhow` chain, one cause per line
+//! `cli-startup.sh` read it through `anyhow`). A dispatcher, mode-parser or
+//! valued-global-flag usage error becomes a [`ErrorKind::Usage`] panel (exit
+//! 2) pointing at `aitm --help`; anything else is the `anyhow` chain, one cause per line
 //! (exit 1). Addressed by path (`startup::errors::…`), never re-exported from
 //! `mod.rs`.
 //!
@@ -37,6 +37,11 @@ pub const USAGE_PREFIXES: &[&str] = &[
 
 /// How every mode usage line and the dispatcher's own begins.
 const USAGE_LINE: &str = "usage:";
+/// The word a valued global flag's one-line error carries when its value is
+/// missing (`--config requires a path`, `--script requires a path`,
+/// `--bus-endpoint-file requires a path`; tester F2). With a headline that
+/// starts with `--`, it is a usage error.
+const REQUIRES: &str = " requires ";
 /// The first line of the dispatcher's full command list, which the panel
 /// drops in favour of the `aitm --help` pointer (plan C15).
 const REGISTRY_DUMP_HEADER: &str = "usage: aitm <command> [--flag value]...";
@@ -72,7 +77,8 @@ pub enum StartupError {
     /// `failed` scripts did not load while `rhai.strict` is set.
     StrictScripts { failed: usize },
     /// The log file could not be opened. Never fatal: startup continues
-    /// without it and the reporter prints it as a warning (AC-W1-17).
+    /// without it and `startup::log::open_sink` prints this variant's
+    /// `Display` as the warning (AC-W1-17), so the wording lives here once.
     LogFile { path: PathBuf, source: io::Error },
 }
 
@@ -83,8 +89,9 @@ fn lsof_command(port: u16) -> String {
 
 impl StartupError {
     /// The panel for the variants spec D6 maps (rules 1–3); `None` for
-    /// [`StartupError::LogFile`], which is never fatal and falls through to
-    /// the generic rule should it ever be returned as an error.
+    /// [`StartupError::LogFile`], which is built for its `Display` by
+    /// `startup::log::open_sink`, never returned as an error, and so falls
+    /// through to the generic rule should it ever reach `report_for`.
     fn report(&self) -> Option<ErrorReport> {
         match self {
             StartupError::PortInUse { role, addr, remedy } => Some(
@@ -169,8 +176,9 @@ impl StdError for StartupError {
 ///    `io::Error`, else the fix-the-file remedy;
 /// 3. a [`StartupError::StrictScripts`] → today's message plus its remedy;
 /// 4. a usage error (the top message starts with one of [`USAGE_PREFIXES`]
-///    or with `usage:`, or its headline is followed by the mode parser's own
-///    `usage:` line) → [`ErrorReport::usage`]: the first line as the
+///    or with `usage:`, or is a `--<flag> requires <value>` line, or its
+///    headline is followed by the mode parser's own `usage:` line) →
+///    [`ErrorReport::usage`]: the first line as the
 ///    headline, the following lines as causes up to, not including, the
 ///    dispatcher's command list, which the `aitm --help` pointer replaces
 ///    (plan C15);
@@ -197,6 +205,7 @@ fn usage_report(message: &str) -> Option<ErrorReport> {
     let mut rest = lines.peekable();
     let is_usage = USAGE_PREFIXES.iter().any(|p| what.starts_with(p))
         || what.starts_with(USAGE_LINE)
+        || flag_requires_a_value(what)
         || rest.peek().is_some_and(|line| line.starts_with(USAGE_LINE));
     if !is_usage {
         return None;
@@ -210,6 +219,12 @@ fn usage_report(message: &str) -> Option<ErrorReport> {
             .collect()
     };
     Some(ErrorReport::usage(what).with_why(why))
+}
+
+/// Part of rule 4: a valued flag given without its value (`--config requires
+/// a path`), raised by `main.rs` as a bare one-line error (tester F2).
+fn flag_requires_a_value(what: &str) -> bool {
+    what.starts_with("--") && what.contains(REQUIRES)
 }
 
 /// Rule 5 of [`report_for`]: the top message, then each cause.
@@ -425,6 +440,55 @@ mod tests {
         assert_eq!(failure.exit_code(), 1);
         assert_eq!(failure.what, "findings get: no such finding `nope`");
         assert_eq!(failure.command, None);
+    }
+
+    /// Tester F2 (spec D6 rule 4, AC-W1-13): a valued global flag given
+    /// without its value (`aitm --config`, `--script`, `--bus-endpoint-file`)
+    /// is a usage error — exit 2 with the `aitm --help` pointer — even though
+    /// `main.rs` raises it as a bare one-line `anyhow!` with no `usage:`
+    /// line. The rule is "starts with `--` and contains ` requires `", so a
+    /// failure that merely mentions a flag, or an unrelated `requires`, stays
+    /// exit 1.
+    #[test]
+    fn report_for_a_flag_that_requires_a_value_is_a_usage_error() {
+        for message in [
+            "--config requires a path",
+            "--script requires a path",
+            "--bus-endpoint-file requires a path",
+        ] {
+            let report = report_for(&anyhow::anyhow!("{message}"), None);
+            assert_eq!(report.kind, ErrorKind::Usage, "{message:?}");
+            assert_eq!(report.exit_code(), 2, "{message:?}");
+            assert_eq!(report.what, message, "{message:?}");
+            assert_eq!(report.why, Vec::<String>::new(), "{message:?}");
+            assert_eq!(report.fix, None, "{message:?}");
+            assert_eq!(
+                report.command,
+                Some(FixCommand("aitm --help".to_string())),
+                "{message:?}"
+            );
+        }
+        // The watchdog's two-line form is unchanged by the new rule.
+        let watchdog = report_for(
+            &anyhow::anyhow!(
+                "--state requires a path\nusage: aitm sysproxy-watchdog --pid <pid> --state <file> [--no-pipe]"
+            ),
+            None,
+        );
+        assert_eq!(watchdog.kind, ErrorKind::Usage);
+        assert_eq!(watchdog.what, "--state requires a path");
+
+        for not_usage in [
+            "reading config file --config requires a path",
+            "the proxy requires a path",
+            "--config: No such file or directory",
+            "--configrequires a path",
+        ] {
+            let report = report_for(&anyhow::anyhow!("{not_usage}"), None);
+            assert_eq!(report.kind, ErrorKind::Failure, "{not_usage:?}");
+            assert_eq!(report.exit_code(), 1, "{not_usage:?}");
+            assert_eq!(report.command, None, "{not_usage:?}");
+        }
     }
 
     #[test]
