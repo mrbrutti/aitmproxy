@@ -74,7 +74,13 @@ const TYPE_INJECT_RESULT: u8 = 0x09;
 ///
 /// The helper enforces the guard itself over this set rather than trusting a
 /// decision from the other side (spec §5.3). It is resent on every change.
+///
+/// An unknown top-level key is [`ProtoError::BadJson`]: this is a trust
+/// boundary, and a peer that speaks a different shape is a different
+/// protocol, which is what [`PROTO`] is for. The entries keep the core's
+/// [`L4ScopeEntry`] rules unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScopeSet {
     /// Deny-by-default scope entries, verbatim from the core's guard.
     pub scope: Vec<L4ScopeEntry>,
@@ -226,15 +232,19 @@ impl std::error::Error for ProtoError {}
 
 // The JSON bodies of the control messages. They are separate from `Msg` so the
 // type byte is the only discriminant on the wire: a payload can never claim to
-// be a different variant than its type byte says.
+// be a different variant than its type byte says. Each denies unknown keys: at
+// this trust boundary a key the type does not define is `BadJson`, and a peer
+// that needs a new key needs a new `PROTO`.
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HelloJson {
     proto: u32,
     core_version: String,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HelloAckJson {
     proto: u32,
     helper_version: String,
@@ -242,6 +252,7 @@ struct HelloAckJson {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CaptureOpenJson {
     id: u64,
     interface: String,
@@ -250,17 +261,20 @@ struct CaptureOpenJson {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CaptureCloseJson {
     id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CaptureClosedJson {
     capture_id: u64,
     reason: String,
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InjectResultJson {
     request_id: u64,
     error: Option<String>,
@@ -283,10 +297,20 @@ fn from_json<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T, ProtoE
 /// This does **not** enforce [`MAX_FRAME`]: the caller owns the packet-size
 /// limits (`max_packet_bytes`) and is expected to keep payloads inside them. An
 /// over-long message is refused by the peer with [`ProtoError::TooLong`], which
-/// closes the session — fail-closed either way. For the same reason a length
-/// that would not fit a `u32`, or an interface name that would not fit a `u16`,
-/// is written as a value the peer refuses rather than as a truncated one it
-/// would accept as something else.
+/// closes the session — fail-closed either way. For the same reason two values
+/// that do not fit their field are written as something the peer refuses
+/// rather than as a truncation it would accept as something else:
+///
+/// - A length that would not fit a `u32` is written as `u32::MAX`, which the
+///   peer refuses by the number alone ([`ProtoError::TooLong`]) before it reads
+///   a byte of the body, whatever the body holds.
+/// - An [`Msg::Inject`] interface name that would not fit a `u16` is written as
+///   the `u16::MAX` length marker followed by **nothing**: the name and the
+///   frame bytes are both dropped, so the claimed name is always longer than
+///   the payload and the peer answers [`ProtoError::BadBinary`] whatever the
+///   frame length. (Writing the frame bytes after the marker would let 65 535
+///   or more of them satisfy the claimed name, and the peer would decode an
+///   `Inject` for a different interface with a shorter frame.)
 #[must_use]
 pub fn encode(msg: &Msg) -> Vec<u8> {
     let (ty, payload) = match msg {
@@ -358,14 +382,18 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
                 Ok(len) => {
                     payload.extend_from_slice(&len.to_be_bytes());
                     payload.extend_from_slice(name);
+                    payload.extend_from_slice(bytes);
                 }
                 // No OS has an interface name this long (IFNAMSIZ is 16). Write
-                // a length the payload cannot satisfy rather than a truncated
-                // name the peer would accept as a different interface: the peer
-                // answers BadBinary and closes.
+                // the u16::MAX length marker and nothing after it — not the
+                // name, and not the frame bytes either — so the claimed name is
+                // always longer than the payload and the peer answers BadBinary
+                // and closes, whatever the frame length. Frame bytes after the
+                // marker would satisfy the claimed name once there are 65 535
+                // of them, and the peer would accept an Inject for a different
+                // interface with a shorter frame.
                 Err(_) => payload.extend_from_slice(&u16::MAX.to_be_bytes()),
             }
-            payload.extend_from_slice(bytes);
             (TYPE_INJECT, payload)
         }
         Msg::InjectResult { request_id, error } => (
@@ -377,9 +405,12 @@ pub fn encode(msg: &Msg) -> Vec<u8> {
         ),
     };
 
-    // The length counts the type byte. `saturating_add` and the `u32` fallback
-    // only matter for a payload the caller should never have built; both
-    // produce a frame the peer refuses.
+    // The length counts the type byte. `saturating_add` and the `u32::MAX`
+    // fallback only matter for a payload the caller should never have built.
+    // Unlike the interface-name marker above, nothing has to be dropped here:
+    // `read_msg` checks the length number alone, before reading a byte of the
+    // body, and `u32::MAX` exceeds `MAX_FRAME`, so the peer answers TooLong
+    // whatever follows the header and however long the body is.
     let len = u32::try_from(payload.len().saturating_add(1)).unwrap_or(u32::MAX);
     let mut out = Vec::with_capacity(5 + payload.len());
     out.extend_from_slice(&len.to_be_bytes());
@@ -1116,14 +1147,19 @@ mod tests {
         let mut reader = Cursor::new(wire);
         assert_eq!(read_msg(&mut reader), Ok(msg));
 
-        // One byte over: the encoder writes a 0xFFFF length and no name at
-        // all; a peer whose frame bytes cannot satisfy it answers BadBinary.
+        // One byte over: the encoder writes a 0xFFFF length and nothing after
+        // it, neither the name nor the frame bytes, so the peer answers
+        // BadBinary (see `fix_f1_oversized_interface_name_is_always_bad_binary`).
         let wire = encode(&Msg::Inject {
             request_id: 1,
             interface: "a".repeat(65_536),
             bytes: vec![0x45, 0x00],
         });
-        assert_eq!(wire.len(), 4 + 1 + 8 + 2 + 2, "the name is not written");
+        assert_eq!(
+            wire.len(),
+            4 + 1 + 8 + 2,
+            "neither the name nor the frame bytes are written"
+        );
         assert_eq!(&wire[13..15], &[0xff, 0xff]);
         let mut reader = Cursor::new(wire);
         assert_eq!(read_msg(&mut reader), Err(ProtoError::BadBinary));
@@ -1150,14 +1186,27 @@ mod tests {
             read_msg(&mut reader)
         };
 
-        // Unknown fields, at the top and inside an entry, are ignored and the
-        // known fields decode to the literal set. (A `filter` key in
-        // particular is ignored: the helper takes no filter from the core.)
+        // An unknown field inside an entry is ignored (`L4ScopeEntry` is the
+        // core's type) and the known fields decode to the literal set.
         let mut v = base.clone();
-        v["unexpected"] = serde_json::json!({"deep": [1, 2]});
-        v["filter"] = serde_json::json!("not port 22");
         v["scope"][0]["filter"] = serde_json::json!("not port 22");
         assert_eq!(read(&v), Ok(Msg::ScopeSet(set.clone())));
+        // An unknown field at the top level is BadJson naming it. (A `filter`
+        // key in particular: the helper takes no filter from the core.)
+        for (key, value) in [
+            ("unexpected", serde_json::json!({"deep": [1, 2]})),
+            ("filter", serde_json::json!("not port 22")),
+        ] {
+            let mut v = base.clone();
+            v[key] = value;
+            match read(&v) {
+                Err(ProtoError::BadJson(msg)) => assert!(
+                    msg.starts_with(&format!("unknown field `{key}`")),
+                    "{key}: {msg}"
+                ),
+                other => panic!("top-level {key} must be BadJson, got {other:?}"),
+            }
+        }
 
         // Every required top-level field missing is BadJson naming it.
         for field in [
@@ -1254,11 +1303,9 @@ mod tests {
         }
 
         // The decoder passes any proto through: the mismatch is the session's
-        // decision (spec §5.2), not the framing's.
-        let mut reader = Cursor::new(framed(
-            TYPE_HELLO,
-            br#"{"proto":2,"core_version":"9.9.9","future":true}"#,
-        ));
+        // decision (spec §5.2), not the framing's. (A proto-2 body with a new
+        // key is BadJson instead; see `fix_f2_...`.)
+        let mut reader = Cursor::new(framed(TYPE_HELLO, br#"{"proto":2,"core_version":"9.9.9"}"#));
         assert_eq!(
             read_msg(&mut reader),
             Ok(Msg::Hello {
@@ -1428,6 +1475,141 @@ mod tests {
             assert_eq!(reader.position() as usize, bad.len());
             assert_eq!(read_msg(&mut reader), Ok(hello()));
             assert_eq!(read_msg(&mut reader), Err(ProtoError::Eof));
+        }
+    }
+
+    /// Tester F1. An interface name that does not fit a `u16` must be refused
+    /// by the peer whatever the frame length. Before the fix the encoder wrote
+    /// the `0xFFFF` marker and then the frame bytes, so 70 000 frame bytes
+    /// satisfied the claimed 65 535-byte name and the peer decoded an `Inject`
+    /// with a 65 535-byte name of `'A'`s and the last 4 465 bytes as the frame.
+    #[test]
+    fn fix_f1_oversized_interface_name_is_always_bad_binary() {
+        let wire = encode(&Msg::Inject {
+            request_id: 1,
+            interface: "a".repeat(65_536),
+            bytes: vec![0x41; 70_000],
+        });
+        let mut reader = Cursor::new(wire);
+        match read_msg(&mut reader) {
+            Err(ProtoError::BadBinary) => {}
+            Ok(Msg::Inject {
+                interface, bytes, ..
+            }) => panic!(
+                "decoded as an Inject with a {}-byte name and {} frame bytes",
+                interface.len(),
+                bytes.len()
+            ),
+            other => panic!("must be BadBinary, got {other:?}"),
+        }
+
+        // Whatever the frame length, the wire is the request id, the 0xFFFF
+        // marker and nothing else: the frame bytes are dropped, so the claimed
+        // name is always longer than the payload and the peer always refuses.
+        for frame_len in [0usize, 1, 2, 65_534, 65_535, 65_536, 70_000, 200_000] {
+            let wire = encode(&Msg::Inject {
+                request_id: 1,
+                interface: "a".repeat(65_536),
+                bytes: vec![0x41; frame_len],
+            });
+            assert_eq!(
+                wire.len(),
+                4 + 1 + 8 + 2,
+                "frame_len {frame_len}: the frame bytes must not be written"
+            );
+            assert_eq!(&wire[..4], &11u32.to_be_bytes());
+            assert_eq!(wire[4], TYPE_INJECT);
+            assert_eq!(&wire[5..13], &1u64.to_be_bytes());
+            assert_eq!(&wire[13..15], &[0xff, 0xff]);
+            let mut reader = Cursor::new(wire);
+            assert_eq!(
+                read_msg(&mut reader),
+                Err(ProtoError::BadBinary),
+                "frame_len {frame_len}"
+            );
+        }
+    }
+
+    /// Tester F2. An unknown key at the top level of any JSON control payload
+    /// is `BadJson` at this trust boundary (version skew is [`PROTO`]'s job),
+    /// while an unknown key inside a scope entry is still ignored:
+    /// `L4ScopeEntry` is the core's type, not this module's to tighten.
+    #[test]
+    fn fix_f2_unknown_top_level_key_is_bad_json_entry_level_key_is_ignored() {
+        let set = scope_set();
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&to_json(&set)).expect("a ScopeSet serializes");
+        v["scope"][0]["filter"] = serde_json::json!("not port 22");
+        let mut reader = Cursor::new(framed(TYPE_SCOPE_SET, v.to_string().as_bytes()));
+        assert_eq!(
+            read_msg(&mut reader),
+            Ok(Msg::ScopeSet(set.clone())),
+            "an unknown key inside an entry is ignored"
+        );
+
+        v["filter"] = serde_json::json!("not port 22");
+        let mut reader = Cursor::new(framed(TYPE_SCOPE_SET, v.to_string().as_bytes()));
+        match read_msg(&mut reader) {
+            Err(ProtoError::BadJson(msg)) => {
+                assert!(msg.starts_with("unknown field `filter`"), "{msg}");
+            }
+            other => panic!("a top-level unknown key must be BadJson, got {other:?}"),
+        }
+
+        // Every JSON control type: the canonical body decodes, the same body
+        // with one stray key is BadJson naming that key.
+        let bodies: [(u8, &[u8], &[u8]); 6] = [
+            (
+                TYPE_HELLO,
+                &br#"{"proto":1,"core_version":"0.5.9"}"#[..],
+                &br#"{"proto":1,"core_version":"0.5.9","future":true}"#[..],
+            ),
+            (
+                TYPE_HELLO_ACK,
+                &br#"{"proto":1,"helper_version":"0.5.9","caps":[]}"#[..],
+                &br#"{"proto":1,"helper_version":"0.5.9","caps":[],"future":true}"#[..],
+            ),
+            (
+                TYPE_CAPTURE_OPEN,
+                &br#"{"id":11,"interface":"lo0","direction":"inbound","read_timeout_ms":250}"#[..],
+                &br#"{"id":11,"interface":"lo0","direction":"inbound","read_timeout_ms":250,"future":true}"#[..],
+            ),
+            (
+                TYPE_CAPTURE_CLOSE,
+                &br#"{"id":11}"#[..],
+                &br#"{"id":11,"future":true}"#[..],
+            ),
+            (
+                TYPE_CAPTURE_CLOSED,
+                &br#"{"capture_id":11,"reason":"x"}"#[..],
+                &br#"{"capture_id":11,"reason":"x","future":true}"#[..],
+            ),
+            (
+                TYPE_INJECT_RESULT,
+                &br#"{"request_id":1,"error":null}"#[..],
+                &br#"{"request_id":1,"error":null,"future":true}"#[..],
+            ),
+        ];
+        for (ty, ok_body, bad_body) in bodies {
+            let mut reader = Cursor::new(framed(ty, ok_body));
+            assert!(
+                read_msg(&mut reader).is_ok(),
+                "{ty:#04x}: {}",
+                String::from_utf8_lossy(ok_body)
+            );
+            let mut reader = Cursor::new(framed(ty, bad_body));
+            match read_msg(&mut reader) {
+                Err(ProtoError::BadJson(msg)) => {
+                    assert!(
+                        msg.starts_with("unknown field `future`"),
+                        "{ty:#04x}: {msg}"
+                    );
+                }
+                other => panic!(
+                    "{ty:#04x}: {} must be BadJson, got {other:?}",
+                    String::from_utf8_lossy(bad_body)
+                ),
+            }
         }
     }
 }
