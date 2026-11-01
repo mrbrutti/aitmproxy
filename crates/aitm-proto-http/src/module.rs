@@ -16,9 +16,11 @@ use std::sync::{Arc, OnceLock};
 use std::task::{Context as TaskCx, Poll};
 use std::time::SystemTime;
 
+use aitm_core::proxy::parse_client_hello_sni;
 use aitm_core::{
-    Body, CaConfig, ConnInfo, Event, Flow, FlowId, FlowMeta, HeaderMap, HttpFlow, HttpRequest,
-    HttpResponse, HttpVersion, InterceptState, StreamBody,
+    classify_client_failure, relay, Authority, Body, CaConfig, ConnInfo, Event, Flow, FlowId,
+    FlowMeta, HeaderMap, HttpFlow, HttpRequest, HttpResponse, HttpVersion, InterceptState,
+    StreamBody, TunnelInfo, TunnelReason, TunnelRequest, TunnelRow,
 };
 use aitm_plugin::{ByteStream, ModuleCtx, NextLayerHint, ProtocolModule};
 use anyhow::{anyhow, bail, Context as _, Result};
@@ -39,6 +41,15 @@ use crate::sansio::{content_length, Http1Machine, HttpSansIoEvent, HttpStateMach
 const TLS_HANDSHAKE: u8 = 0x16;
 /// Largest CONNECT head accepted.
 const MAX_CONNECT_HEAD: usize = 16 * 1024;
+/// The most of a raw-TLS ClientHello the module buffers itself to read its SNI
+/// when the acceptor's peek did not hold it: one TLS record (a 5-byte header and
+/// at most 2^14 bytes of payload, RFC 8446 §5.1), which is where a ClientHello's
+/// `server_name` lives.
+const MAX_CLIENT_HELLO: usize = 5 + 16 * 1024;
+/// The acknowledgement a `CONNECT` gets once the tunnel's route is decided.
+const CONNECT_ACK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
+/// The port a `CONNECT` authority or an explicit-proxy SNI defaults to (spec D1).
+const DEFAULT_TLS_PORT: u16 = 443;
 /// Socket read size.
 const READ_CHUNK: usize = 16 * 1024;
 
@@ -246,38 +257,18 @@ impl HttpModule {
         Ok(Arc::new(cfg))
     }
 
-    /// Peek the first bytes and route: CONNECT tunnel (then TLS or cleartext
-    /// inside it), raw TLS (SNI picks the upstream), or cleartext HTTP.
+    /// Peek the first bytes and route: a `CONNECT` tunnel, a raw TLS connection
+    /// (the capture path), or cleartext HTTP. The two TLS-capable routes decide
+    /// per connection, against the live Scope, whether the connection is
+    /// decrypted or relayed (spec D1/D2), and record every tunnel as a row.
     async fn drive(&self, io: ByteStream, ctx: ModuleCtx) -> Result<()> {
         let peer = ctx.hint().map(|h| h.dst).unwrap_or_else(unknown_peer);
         let mut client = Prefixed::new(io);
         let first = client.peek(8).await?.to_vec();
         if first.starts_with(b"CONNECT ") {
-            let head = client.read_head(MAX_CONNECT_HEAD).await?;
-            let authority = parse_connect(&head)?;
-            let target = Target::resolve(&authority, 443).await?;
-            client
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await?;
-            client.flush().await?;
-            let next = client.peek(1).await?.to_vec();
-            if next.first() == Some(&TLS_HANDSHAKE) {
-                self.mitm(client, ctx, peer, Some(target)).await
-            } else {
-                let conn = Conn::plain(peer, Some((target.authority(), target.addr)))
-                    .with_attribution(ctx.hint());
-                serve(
-                    &ctx,
-                    Box::pin(client),
-                    None,
-                    None,
-                    conn,
-                    self.max_body_bytes,
-                )
-                .await
-            }
+            self.tunnel(client, ctx, peer).await
         } else if first.first() == Some(&TLS_HANDSHAKE) {
-            self.mitm(client, ctx, peer, None).await
+            self.raw_tls(client, ctx, peer).await
         } else {
             serve(
                 &ctx,
@@ -291,80 +282,263 @@ impl HttpModule {
         }
     }
 
-    /// TLS MITM: read the ClientHello (SNI), connect upstream over TLS, sniff
-    /// its leaf's names, mint an impersonating leaf, finish the client
-    /// handshake, then serve HTTP between the two decrypted streams.
+    /// A `CONNECT` tunnel, spec D6 step by step. The head is read and its
+    /// authority normalised (port 443 when absent); an authority outside the
+    /// live Scope is relayed to the origin untouched (D2: the module's own
+    /// relay, so the invariant does not depend on the passthrough module having
+    /// claimed the connection first); one in Scope is resolved, acknowledged and
+    /// decrypted — TLS through [`HttpModule::mitm`], cleartext served inside the
+    /// tunnel. Every outcome is a tunnel row; the ones decided here:
+    ///
+    /// - a head that cannot be read (EOF, reset, over the cap) or an authority
+    ///   token that is not one → `failed`, with the reason the error's type
+    ///   gives (`client_closed` for a client that left, else `protocol_error`);
+    /// - an origin that does not resolve → `failed/upstream_unreachable`, with
+    ///   no acknowledgement (as before, the client gets no `200` for it);
+    /// - the client gone after the acknowledgement, before its first byte →
+    ///   `failed/client_closed`;
+    /// - cleartext inside an in-scope tunnel → `decrypted` with `client.tls =
+    ///   false`, closed when the connection ends.
+    ///
+    /// A row needs an authority. A head that never yields one (no token after
+    /// `CONNECT`, a non-UTF-8 head) and that the acceptor's peek does not name
+    /// either ends the connection with the error and no row: there is nothing
+    /// to key a row on. An authority token that does not parse is recorded under
+    /// the label `Authority::new(raw, 443)` — the raw text, lowercased, as the
+    /// host — so the operator sees what the client asked for; it is never
+    /// dialled.
+    async fn tunnel(
+        &self,
+        mut client: Prefixed<ByteStream>,
+        ctx: ModuleCtx,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        let opened_at = SystemTime::now();
+        let head = match client.read_head(MAX_CONNECT_HEAD).await {
+            Ok(head) => head,
+            Err(e) => {
+                let err = anyhow::Error::from(e);
+                if let Some(authority) = ctx.hint().and_then(NextLayerHint::tunnel_authority) {
+                    let head = TunnelHead {
+                        authority,
+                        headers: HeaderMap::new(),
+                        opened_at,
+                    };
+                    let reason = classify_client_failure(&err);
+                    TunnelRow::open(
+                        &ctx,
+                        tunnel_request(&ctx, peer, head, false),
+                        TunnelInfo::failed(reason),
+                    )
+                    .await;
+                }
+                return Err(err);
+            }
+        };
+        let ConnectHead {
+            authority: raw,
+            headers,
+        } = parse_connect(&head)?;
+        let authority = match Authority::parse_with_default(&raw, DEFAULT_TLS_PORT) {
+            Ok(authority) => authority,
+            Err(e) => {
+                let head = TunnelHead {
+                    authority: Authority::new(&raw, DEFAULT_TLS_PORT),
+                    headers,
+                    opened_at,
+                };
+                TunnelRow::open(
+                    &ctx,
+                    tunnel_request(&ctx, peer, head, false),
+                    TunnelInfo::failed(TunnelReason::ProtocolError),
+                )
+                .await;
+                bail!("malformed CONNECT authority: {e}");
+            }
+        };
+        let head = TunnelHead {
+            authority,
+            headers,
+            opened_at,
+        };
+
+        if !ctx.in_scope(&head.authority.to_string()) {
+            return relay_out_of_scope(client, &ctx, peer, head, true).await;
+        }
+        let target = match Target::from_authority(&head.authority).await {
+            Ok(target) => target,
+            Err(e) => {
+                TunnelRow::open(
+                    &ctx,
+                    tunnel_request(&ctx, peer, head, false),
+                    TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        if let Err(e) = acknowledge(&mut client).await {
+            let err = anyhow::Error::from(e);
+            let reason = classify_client_failure(&err);
+            TunnelRow::open(
+                &ctx,
+                tunnel_request(&ctx, peer, head, false),
+                TunnelInfo::failed(reason),
+            )
+            .await;
+            return Err(err);
+        }
+        let next = match client.peek(1).await {
+            Ok([first, ..]) => *first,
+            Ok([]) => {
+                // EOF before the first byte: a speculative pre-connect, a client
+                // that gave up. A row, but not an error worth the acceptor's log.
+                TunnelRow::open(
+                    &ctx,
+                    tunnel_request(&ctx, peer, head, false),
+                    TunnelInfo::failed(TunnelReason::ClientClosed),
+                )
+                .await;
+                return Ok(());
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e);
+                let reason = classify_client_failure(&err);
+                TunnelRow::open(
+                    &ctx,
+                    tunnel_request(&ctx, peer, head, false),
+                    TunnelInfo::failed(reason),
+                )
+                .await;
+                return Err(err);
+            }
+        };
+        if next == TLS_HANDSHAKE {
+            return self.mitm(client, ctx, peer, target, head).await;
+        }
+
+        // Cleartext inside the tunnel (`curl -p`): served as HTTP/1 with the
+        // tunnel's route; the row is `decrypted` with a cleartext client side.
+        let conn =
+            Conn::plain(peer, Some((target.authority(), target.addr))).with_attribution(ctx.hint());
+        let mut request = tunnel_request(&ctx, peer, head, false);
+        request.client = conn.client_conn.clone();
+        let row = TunnelRow::open(&ctx, request, TunnelInfo::decrypted()).await;
+        let served = serve(
+            &ctx,
+            Box::pin(client),
+            None,
+            None,
+            conn,
+            self.max_body_bytes,
+        )
+        .await;
+        row.close(&ctx, None).await;
+        served
+    }
+
+    /// A TLS connection with no `CONNECT` (a capture ingress, a transparent
+    /// client). Its tunnel authority is the hint's (spec D1: the SNI with the
+    /// capture destination's port, else `sni:443`); when the acceptor's peek
+    /// did not hold the ClientHello, the module buffers its first record itself
+    /// — it stays in the stream — and reads the SNI from it. Out of Scope → the
+    /// same relay as a CONNECT, with the buffered bytes going first; in Scope →
+    /// [`HttpModule::mitm`]. No SNI → `failed/protocol_error` and the error as
+    /// before: nothing names an origin to decrypt. A capture ingress knows the
+    /// destination, so that row is keyed on it; on the explicit-proxy path
+    /// `dst` is the client's own address, so there is no authority to key a row
+    /// on and the connection ends with the error alone.
+    async fn raw_tls(
+        &self,
+        mut client: Prefixed<ByteStream>,
+        ctx: ModuleCtx,
+        peer: SocketAddr,
+    ) -> Result<()> {
+        let opened_at = SystemTime::now();
+        let captured_dst = ctx
+            .hint()
+            .filter(|h| h.capture_interface.is_some())
+            .map(|h| h.dst);
+        let authority = match ctx.hint().and_then(NextLayerHint::tunnel_authority) {
+            Some(authority) => Some(authority),
+            None => {
+                let hello = client.peek_tls_record(MAX_CLIENT_HELLO).await?;
+                let port = captured_dst.map_or(DEFAULT_TLS_PORT, |dst| dst.port());
+                parse_client_hello_sni(hello).map(|sni| Authority::new(&sni, port))
+            }
+        };
+        let Some(authority) = authority else {
+            if let Some(dst) = captured_dst {
+                let head = TunnelHead {
+                    authority: Authority::new(&dst.ip().to_string(), dst.port()),
+                    headers: HeaderMap::new(),
+                    opened_at,
+                };
+                TunnelRow::open(
+                    &ctx,
+                    tunnel_request(&ctx, peer, head, true),
+                    TunnelInfo::failed(TunnelReason::ProtocolError),
+                )
+                .await;
+            }
+            bail!("TLS without CONNECT or SNI: no upstream to pick");
+        };
+        let head = TunnelHead {
+            authority,
+            headers: HeaderMap::new(),
+            opened_at,
+        };
+
+        if !ctx.in_scope(&head.authority.to_string()) {
+            return relay_out_of_scope(client, &ctx, peer, head, false).await;
+        }
+        let target = match Target::from_authority(&head.authority).await {
+            Ok(target) => target,
+            Err(e) => {
+                TunnelRow::open(
+                    &ctx,
+                    tunnel_request(&ctx, peer, head, true),
+                    TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
+                )
+                .await;
+                return Err(e);
+            }
+        };
+        self.mitm(client, ctx, peer, target, head).await
+    }
+
+    /// TLS MITM of an in-scope tunnel (`target` is where `head.authority`
+    /// resolved): read the ClientHello (SNI), connect to the origin over TLS,
+    /// sniff its leaf's names, mint an impersonating leaf, finish the client
+    /// handshake, then serve HTTP between the two decrypted streams. The tunnel
+    /// row appears at the outcome (spec D5): `decrypted` once the client
+    /// handshake completes, closed with its duration when the connection ends;
+    /// or `failed` with the step that broke it ([`HttpModule::establish`]), the
+    /// connection ending with that step's error unchanged.
     async fn mitm(
         &self,
         client: Prefixed<ByteStream>,
         ctx: ModuleCtx,
         peer: SocketAddr,
-        target: Option<Target>,
+        target: Target,
+        head: TunnelHead,
     ) -> Result<()> {
-        let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client)
-            .await
-            .context("read ClientHello")?;
-        let sni = start.client_hello().server_name().map(str::to_string);
-        // The client's ALPN offer (an absent extension ⇒ assume `http/1.1`). We
-        // offer upstream exactly this list and mirror whatever it negotiates.
-        let client_alpn: Vec<Vec<u8>> = start
-            .client_hello()
-            .alpn()
-            .map(|offers| offers.map(|p| p.to_vec()).collect())
-            .unwrap_or_else(|| vec![b"http/1.1".to_vec()]);
-        let target = match target {
-            Some(t) => t,
-            None => {
-                let host = sni
-                    .clone()
-                    .ok_or_else(|| anyhow!("TLS without CONNECT or SNI: no upstream to pick"))?;
-                Target::resolve(&host, 443).await?
+        let mut request = tunnel_request(&ctx, peer, head, true);
+        let session = match self.establish(client, &ctx, &target, &mut request).await {
+            Ok(session) => session,
+            Err(Refused { reason, error }) => {
+                TunnelRow::open(&ctx, request, TunnelInfo::failed(reason)).await;
+                return Err(error);
             }
         };
-
-        let tcp = ctx
-            .connect_upstream(&target.authority(), target.addr)
-            .await?;
-        let server_name = ServerName::try_from(target.host.clone())
-            .map_err(|e| anyhow!("invalid upstream name {:?}: {e}", target.host))?;
-        let upstream = self
-            .tls_handshake(&client_alpn, server_name.clone(), tcp, &target.authority())
-            .await?;
-        // What upstream agreed to; mirror it down to the client (absent ⇒ h1).
-        let negotiated: Vec<u8> = upstream
-            .get_ref()
-            .1
-            .alpn_protocol()
-            .map(|p| p.to_vec())
-            .unwrap_or_else(|| b"http/1.1".to_vec());
-
-        // Fail closed: an h1-only client cannot be mirrored to an h2-only upstream
-        // (spec §1 edge case). The mirror offers upstream the client's list, so
-        // this is only reachable defensively; log and drop rather than bridge.
-        if negotiated == b"h2" && !client_alpn.iter().any(|p| p.as_slice() == b"h2") {
-            tracing::warn!(
-                authority = %target.authority(),
-                "upstream negotiated h2 but the client cannot speak it; failing closed"
-            );
-            bail!(
-                "cannot mirror h2 to an h1-only client for {}",
-                target.authority()
-            );
-        }
-
-        let sans = upstream
-            .get_ref()
-            .1
-            .peer_certificates()
-            .and_then(|chain| chain.first())
-            .map(cert_names)
-            .unwrap_or_default();
-
-        let leaf = self.ca()?.leaf_for(&target.host, &sans)?;
-        let client_tls = start
-            .into_stream(self.impersonating_config(&leaf, &negotiated)?)
-            .await
-            .context("client TLS handshake")?;
+        let Established {
+            client_tls,
+            upstream,
+            server_name,
+            sni,
+            negotiated,
+            h2_upstream_tls,
+        } = session;
 
         let alpn = String::from_utf8_lossy(&negotiated).into_owned();
         let now = SystemTime::now();
@@ -390,21 +564,23 @@ impl HttpModule {
             capture_interface: None,
         }
         .with_attribution(ctx.hint());
+        // The row records the two connections exactly as the inner flows will.
+        request.client = conn.client_conn.clone();
+        request.server = conn.server_conn.clone();
+        let row = TunnelRow::open(&ctx, request, TunnelInfo::decrypted()).await;
 
         // Branch on the negotiated protocol: h2 runs the per-stream `serve_h2`
-        // driver; everything else runs the h1 `serve` loop.
-        if negotiated == b"h2" {
+        // driver; everything else runs the h1 `serve` loop. `serve_h2` shares
+        // the context across its stream tasks, so it takes an `Arc`; the row is
+        // closed through the same handle once either driver returns, whatever
+        // it returned, so the connection's end is the row's duration.
+        let ctx = Arc::new(ctx);
+        let served = if let Some(upstream_h2_tls) = h2_upstream_tls {
             // Unlike the h1 branch below, an h2 upstream gets no stale-connection
             // probe or reconnect. That is out of scope here; `serve_h2` has the
             // same exposure and is a follow-up.
-
-            // A Map Remote rewrite to a different authority needs a SECOND upstream
-            // (an h2 connection is pinned to one `:authority`, spec §6). The TLS
-            // client config lives here (provider + insecure verifier), so hand
-            // `serve_h2` an h2-ALPN config it can dial new origins with (Task 4).
-            let upstream_h2_tls = self.upstream_tls_alpn(&[b"h2".to_vec()])?;
             crate::h2::serve_h2(
-                ctx,
+                ctx.clone(),
                 Box::pin(client_tls),
                 Box::pin(upstream),
                 conn,
@@ -432,8 +608,271 @@ impl HttpModule {
                 self.max_body_bytes,
             )
             .await
+        };
+        row.close(&ctx, None).await;
+        served
+    }
+
+    /// The handshakes of a MITM tunnel, in order, each failure mapped to the
+    /// reason its row records (spec D5) with the error itself untouched: the
+    /// ClientHello read and the client handshake by the error's type
+    /// ([`classify_client_failure`]: a certificate alert is the client
+    /// rejecting our leaf, an EOF or reset a client that left, any other TLS
+    /// error a client TLS error); the origin dial → `upstream_unreachable`; the
+    /// origin handshake, its timeout included → `upstream_tls_failed`; the
+    /// h2-to-h1 mirror refusal, an unusable origin name and the proxy's own
+    /// leaf/config work → `protocol_error`. Fills in what the row learns on the
+    /// way: the client's SNI and the origin once it is dialled.
+    async fn establish(
+        &self,
+        client: Prefixed<ByteStream>,
+        ctx: &ModuleCtx,
+        target: &Target,
+        request: &mut TunnelRequest,
+    ) -> std::result::Result<Established, Refused> {
+        let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), client)
+            .await
+            .context("read ClientHello")
+            .map_err(Refused::client)?;
+        let sni = start.client_hello().server_name().map(str::to_string);
+        request.client.sni = sni.clone();
+        // The client's ALPN offer (an absent extension ⇒ assume `http/1.1`). We
+        // offer upstream exactly this list and mirror whatever it negotiates.
+        let client_alpn: Vec<Vec<u8>> = start
+            .client_hello()
+            .alpn()
+            .map(|offers| offers.map(|p| p.to_vec()).collect())
+            .unwrap_or_else(|| vec![b"http/1.1".to_vec()]);
+
+        let server_name = ServerName::try_from(target.host.clone())
+            .map_err(|e| anyhow!("invalid upstream name {:?}: {e}", target.host))
+            .map_err(Refused::with(TunnelReason::ProtocolError))?;
+        let tcp = ctx
+            .connect_upstream(&target.authority(), target.addr)
+            .await
+            .map_err(Refused::with(TunnelReason::UpstreamUnreachable))?;
+        request.server = Some(ConnInfo {
+            peer: target.addr,
+            sni: Some(target.host.clone()),
+            alpn: None,
+            tls: true,
+            established: SystemTime::now(),
+        });
+        let upstream = self
+            .tls_handshake(&client_alpn, server_name.clone(), tcp, &target.authority())
+            .await
+            .map_err(Refused::with(TunnelReason::UpstreamTlsFailed))?;
+        // What upstream agreed to; mirror it down to the client (absent ⇒ h1).
+        let negotiated: Vec<u8> = upstream
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .map(|p| p.to_vec())
+            .unwrap_or_else(|| b"http/1.1".to_vec());
+
+        // Fail closed: an h1-only client cannot be mirrored to an h2-only upstream
+        // (spec §1 edge case). The mirror offers upstream the client's list, so
+        // this is only reachable defensively; log and drop rather than bridge.
+        if negotiated == b"h2" && !client_alpn.iter().any(|p| p.as_slice() == b"h2") {
+            tracing::warn!(
+                authority = %target.authority(),
+                "upstream negotiated h2 but the client cannot speak it; failing closed"
+            );
+            return Err(Refused {
+                reason: TunnelReason::ProtocolError,
+                error: anyhow!(
+                    "cannot mirror h2 to an h1-only client for {}",
+                    target.authority()
+                ),
+            });
+        }
+        // A Map Remote rewrite to a different authority needs a SECOND upstream
+        // (an h2 connection is pinned to one `:authority`, spec §6). The TLS
+        // client config lives here (provider + insecure verifier), so hand
+        // `serve_h2` an h2-ALPN config it can dial new origins with (Task 4).
+        let h2_upstream_tls = if negotiated == b"h2" {
+            Some(
+                self.upstream_tls_alpn(&[b"h2".to_vec()])
+                    .map_err(Refused::with(TunnelReason::ProtocolError))?,
+            )
+        } else {
+            None
+        };
+
+        let sans = upstream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .map(cert_names)
+            .unwrap_or_default();
+        let config = self
+            .ca()
+            .and_then(|ca| ca.leaf_for(&target.host, &sans))
+            .and_then(|leaf| self.impersonating_config(&leaf, &negotiated))
+            .map_err(Refused::with(TunnelReason::ProtocolError))?;
+        let client_tls = start
+            .into_stream(config)
+            .await
+            .context("client TLS handshake")
+            .map_err(Refused::client)?;
+
+        Ok(Established {
+            client_tls,
+            upstream,
+            server_name,
+            sni,
+            negotiated,
+            h2_upstream_tls,
+        })
+    }
+}
+
+/// What the CONNECT path knows about a tunnel before its outcome: the
+/// normalised authority Scope is decided on, the `CONNECT` request headers
+/// (empty for a raw-TLS connection) and when the head (or ClientHello) was
+/// read — the row's `created`, which its duration is measured from.
+struct TunnelHead {
+    authority: Authority,
+    headers: HeaderMap,
+    opened_at: SystemTime,
+}
+
+/// Both halves of an established MITM tunnel, as [`HttpModule::establish`]
+/// hands them to the serving driver.
+struct Established {
+    client_tls: tokio_rustls::server::TlsStream<Prefixed<ByteStream>>,
+    upstream: tokio_rustls::client::TlsStream<ByteStream>,
+    server_name: ServerName<'static>,
+    /// The client's SNI, for the connection record.
+    sni: Option<String>,
+    /// The protocol the origin negotiated, mirrored to the client.
+    negotiated: Vec<u8>,
+    /// `Some` iff the mirror landed on h2: the TLS client config `serve_h2`
+    /// dials a Map Remote origin with.
+    h2_upstream_tls: Option<Arc<ClientConfig>>,
+}
+
+/// Why a tunnel could not be established: the reason its row records and the
+/// error the connection ends with, unchanged.
+struct Refused {
+    reason: TunnelReason,
+    error: anyhow::Error,
+}
+
+impl Refused {
+    /// Record any error of a step under `reason`.
+    fn with(reason: TunnelReason) -> impl FnOnce(anyhow::Error) -> Refused {
+        move |error| Refused { reason, error }
+    }
+
+    /// A client-side handshake failure, classified by its type.
+    fn client(error: anyhow::Error) -> Refused {
+        Refused {
+            reason: classify_client_failure(&error),
+            error,
         }
     }
+}
+
+/// The row request for `head` as a connection knows it before anything was
+/// dialled: the client peer with `tls` as given and no SNI yet, no origin, and
+/// the hint's capture attribution. Producers fill in what they learn.
+fn tunnel_request(ctx: &ModuleCtx, peer: SocketAddr, head: TunnelHead, tls: bool) -> TunnelRequest {
+    let (source_app, capture_interface) = ctx.hint().map_or((None, None), |h| {
+        (h.peer_identity.clone(), h.capture_interface.clone())
+    });
+    TunnelRequest {
+        authority: head.authority,
+        headers: head.headers,
+        client: ConnInfo {
+            peer,
+            sni: None,
+            alpn: None,
+            tls,
+            established: head.opened_at,
+        },
+        server: None,
+        opened_at: head.opened_at,
+        source_app,
+        capture_interface,
+    }
+}
+
+/// Write the `200 Connection Established` acknowledgement.
+async fn acknowledge<S: AsyncWrite + Unpin>(client: &mut S) -> io::Result<()> {
+    client.write_all(CONNECT_ACK).await?;
+    client.flush().await
+}
+
+/// Spec D2/D5: a tunnel whose authority is outside the live Scope is not
+/// decrypted. The origin is resolved and dialled through the connector (a
+/// failure there is `failed/upstream_unreachable`, answered with nothing), the
+/// `CONNECT` is acknowledged when `acknowledge_connect` is set (a raw-TLS
+/// connection expects no acknowledgement), the `passthrough/out_of_scope` row is
+/// opened, and the two streams are relayed byte for byte — whatever `client`
+/// has buffered (a ClientHello sent before the acknowledgement, or the one a
+/// raw-TLS connection opened with) goes first — until either side closes. The
+/// row then closes with the bytes moved and its duration. The client completes
+/// TLS with the origin's own certificate; nothing inside the tunnel becomes a
+/// row.
+async fn relay_out_of_scope(
+    client: Prefixed<ByteStream>,
+    ctx: &ModuleCtx,
+    peer: SocketAddr,
+    head: TunnelHead,
+    acknowledge_connect: bool,
+) -> Result<()> {
+    let mut request = tunnel_request(ctx, peer, head, true);
+    let target = match Target::from_authority(&request.authority).await {
+        Ok(target) => target,
+        Err(e) => {
+            TunnelRow::open(
+                ctx,
+                request,
+                TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    let mut upstream = match ctx.connect_upstream(&target.authority(), target.addr).await {
+        Ok(upstream) => upstream,
+        Err(e) => {
+            TunnelRow::open(
+                ctx,
+                request,
+                TunnelInfo::failed(TunnelReason::UpstreamUnreachable),
+            )
+            .await;
+            return Err(e);
+        }
+    };
+    request.server = Some(ConnInfo {
+        peer: target.addr,
+        sni: Some(target.host),
+        alpn: None,
+        tls: true,
+        established: SystemTime::now(),
+    });
+    let mut client: ByteStream = Box::pin(client);
+    if acknowledge_connect {
+        if let Err(e) = acknowledge(&mut client).await {
+            let err = anyhow::Error::from(e);
+            let reason = classify_client_failure(&err);
+            TunnelRow::open(ctx, request, TunnelInfo::failed(reason)).await;
+            return Err(err);
+        }
+    }
+    let row = TunnelRow::open(
+        ctx,
+        request,
+        TunnelInfo::passthrough(TunnelReason::OutOfScope),
+    )
+    .await;
+    let (up, down, relayed) = relay(&mut client, &mut upstream).await;
+    row.close(ctx, Some((up, down))).await;
+    relayed.map_err(Into::into)
 }
 
 impl ProtocolModule for HttpModule {
@@ -1256,15 +1695,34 @@ fn close_delimited(method: &str, head: &HttpResponse) -> bool {
     !head.headers.has("content-length") && !head.headers.has("transfer-encoding")
 }
 
-/// The CONNECT target `host:port` from a CONNECT head.
-fn parse_connect(head: &[u8]) -> Result<String> {
+/// What a `CONNECT` head says: the authority token as the client wrote it (not
+/// yet parsed as an [`Authority`]) and the request headers.
+struct ConnectHead {
+    authority: String,
+    headers: HeaderMap,
+}
+
+/// Parse a CONNECT head: the authority token of its request line and its
+/// headers. A header line that is not a valid field is left out of the row
+/// rather than failing the tunnel over it; the authority is what matters.
+fn parse_connect(head: &[u8]) -> Result<ConnectHead> {
     let text = std::str::from_utf8(head).context("non-UTF-8 CONNECT head")?;
-    let line = text.lines().next().unwrap_or("");
+    let mut lines = text.lines();
+    let line = lines.next().unwrap_or("");
     let mut parts = line.split(' ');
-    match (parts.next(), parts.next()) {
-        (Some("CONNECT"), Some(authority)) if !authority.is_empty() => Ok(authority.to_string()),
+    let authority = match (parts.next(), parts.next()) {
+        (Some("CONNECT"), Some(authority)) if !authority.is_empty() => authority.to_string(),
         _ => bail!("malformed CONNECT line {line:?}"),
+    };
+    let mut headers = HeaderMap::new();
+    for field in lines.take_while(|l| !l.is_empty()) {
+        if let Some((name, value)) = field.split_once(':') {
+            // Wire input: `try_set` validates; an invalid field is simply not
+            // part of the row.
+            let _ = headers.try_set(name.trim(), value.trim());
+        }
     }
+    Ok(ConnectHead { authority, headers })
 }
 
 /// An upstream endpoint: the name the client asked for and where it resolves.
@@ -1284,6 +1742,24 @@ impl Target {
             .next()
             .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
         Ok(Self { host, port, addr })
+    }
+
+    /// Resolve a normalised tunnel authority: an IP literal needs no lookup; a
+    /// name takes the first address the resolver returns.
+    async fn from_authority(authority: &Authority) -> Result<Self> {
+        let addr = match authority.ip() {
+            Some(ip) => SocketAddr::new(ip, authority.port),
+            None => tokio::net::lookup_host((authority.host.as_str(), authority.port))
+                .await
+                .with_context(|| format!("resolve {authority}"))?
+                .next()
+                .ok_or_else(|| anyhow!("no address for {authority}"))?,
+        };
+        Ok(Self {
+            host: authority.host.clone(),
+            port: authority.port,
+            addr,
+        })
     }
 
     fn authority(&self) -> String {
@@ -1467,6 +1943,19 @@ impl<S: AsyncRead + Unpin> Prefixed<S> {
             self.prefix.extend_from_slice(&tmp[..k]);
         }
         Ok(&self.prefix)
+    }
+
+    /// Buffer the first TLS record whole — its 5-byte header declares its
+    /// payload length — capped at `max`, and return the buffer. Fewer bytes only
+    /// at EOF; a buffer that does not even hold a record header is returned as
+    /// is. Nothing is consumed: the record is still the first thing read.
+    async fn peek_tls_record(&mut self, max: usize) -> io::Result<&[u8]> {
+        const HEADER: usize = 5;
+        let total = match self.peek(HEADER).await? {
+            [_, _, _, hi, lo, ..] => HEADER + usize::from(u16::from_be_bytes([*hi, *lo])),
+            _ => HEADER,
+        };
+        self.peek(total.min(max)).await
     }
 
     /// Consume and return one HTTP head, through its blank line.
@@ -1781,6 +2270,23 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)), 8443)
     }
 
+    /// `origin.test:8443` as a tunnel: where it resolved ([`origin_addr`]) and
+    /// the head `drive` would have handed `mitm` for it.
+    fn origin_tunnel() -> (Target, TunnelHead) {
+        (
+            Target {
+                host: "origin.test".into(),
+                port: 8443,
+                addr: origin_addr(),
+            },
+            TunnelHead {
+                authority: Authority::new("origin.test", 8443),
+                headers: HeaderMap::new(),
+                opened_at: SystemTime::now(),
+            },
+        )
+    }
+
     fn reconnect_to(module: &HttpModule) -> Reconnect<'_> {
         Reconnect {
             module,
@@ -1974,18 +2480,10 @@ mod tests {
         });
         let proxy_side: ByteStream = Box::pin(proxy_side);
 
+        let (target, head) = origin_tunnel();
         let result = tokio::time::timeout(
             STALL_GUARD,
-            module.mitm(
-                Prefixed::new(proxy_side),
-                ctx,
-                unknown_peer(),
-                Some(Target {
-                    host: "origin.test".into(),
-                    port: 8443,
-                    addr: origin_addr(),
-                }),
-            ),
+            module.mitm(Prefixed::new(proxy_side), ctx, unknown_peer(), target, head),
         )
         .await
         .expect("the handshake was never bounded");
@@ -6297,7 +6795,7 @@ mod tests {
         use super::*;
 
         /// A CA in a fresh temp dir, so a MITM test never touches the user's CA.
-        fn test_ca() -> Arc<CertAuthority> {
+        pub(super) fn test_ca() -> Arc<CertAuthority> {
             let dir = std::env::temp_dir().join(format!("aitm-attr-ca-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&dir).expect("ca dir");
             Arc::new(CertAuthority::load_or_generate(&dir, 0o600).expect("test CA"))
@@ -6342,7 +6840,7 @@ mod tests {
 
         /// Read one `Content-Length`-framed 200 from any stream (the TLS client end
         /// is not a `DuplexStream`, so [`client_get`] does not apply).
-        async fn read_one_200<S: AsyncRead + Unpin>(io: &mut S) -> String {
+        pub(super) async fn read_one_200<S: AsyncRead + Unpin>(io: &mut S) -> String {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 1024];
             let head_end = loop {
@@ -6421,16 +6919,8 @@ mod tests {
                 body
             };
             let proxy_side: ByteStream = Box::pin(proxy_side);
-            let serving = module.mitm(
-                Prefixed::new(proxy_side),
-                ctx,
-                unknown_peer(),
-                Some(Target {
-                    host: "origin.test".into(),
-                    port: 8443,
-                    addr: origin_addr(),
-                }),
-            );
+            let (target, head) = origin_tunnel();
+            let serving = module.mitm(Prefixed::new(proxy_side), ctx, unknown_peer(), target, head);
             let (_served, body) =
                 tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
                     .await
@@ -6489,7 +6979,7 @@ mod tests {
                 .upstream_tls_alpn(&[b"h2".to_vec()])
                 .expect("h2 client config");
             let serving = crate::h2::serve_h2(
-                ctx,
+                Arc::new(ctx),
                 Box::pin(proxy_side),
                 Box::pin(up_ours),
                 conn,
@@ -6650,6 +7140,796 @@ mod tests {
             assert_eq!(hint.peer_identity.as_deref(), Some("com.apple.Safari"));
             assert_eq!(hint.capture_interface.as_deref(), Some("macos-ne"));
             assert_attributed(&stored_in(&store, "/chat"));
+        }
+    }
+
+    mod tunnel_rows {
+        //! Spec D5/D6 through `spawn`: every `CONNECT` the HTTP module handles
+        //! leaves one tunnel row with its outcome, the module decrypts only hosts
+        //! in the live Scope and relays the rest itself (AC16: no passthrough
+        //! module is registered here, so the relay is the HTTP module's own), and
+        //! the flip follows the guard per connection (AC2–AC4). In-memory
+        //! transports throughout: client, proxy and origin are duplex pairs.
+
+        use super::attribution::{read_one_200, test_ca};
+        use super::*;
+        use aitm_core::{
+            ScopeEntry, ScopeRateGuard, StdGuard, TunnelInfo, TunnelMode, TunnelReason,
+        };
+        use rustls::pki_types::pem::PemObject;
+        use rustls::RootCertStore;
+
+        /// The authority every test tunnels to: an IP literal, so resolving it
+        /// needs no DNS and the forged leaf carries an IP SAN a verifying client
+        /// accepts.
+        const ORIGIN: &str = "127.0.0.1:8443";
+
+        fn origin_peer() -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], 8443))
+        }
+
+        /// A live guard with `entries` in scope: what `scope.add` / `scope.remove`
+        /// mutate, handed to the module context as the acceptor hands its own.
+        fn scoped(entries: &[&str]) -> Arc<StdGuard> {
+            let guard = Arc::new(StdGuard::default());
+            for host in entries {
+                guard.add_scope(ScopeEntry {
+                    host: host.to_string(),
+                });
+            }
+            guard
+        }
+
+        /// A context over `store` whose connector hands out `streams` (and refuses
+        /// once they are gone), consulting `guard` for Scope.
+        fn scoped_ctx(
+            streams: Vec<ByteStream>,
+            store: Arc<MemFlowStore>,
+            guard: Arc<StdGuard>,
+        ) -> (ModuleCtx, DialLog) {
+            let (ctx, dialed) = ctx_with_sink(streams, store, Arc::new(NoSink));
+            (ctx.with_scope(guard), dialed)
+        }
+
+        /// An origin's own TLS identity: a self-signed leaf for `origin.test`
+        /// offering `http/1.1`, and its DER so a test can check which certificate
+        /// a client was shown.
+        fn origin_identity() -> (Arc<ServerConfig>, CertificateDer<'static>) {
+            let key = rcgen::KeyPair::generate().expect("key");
+            let cert = rcgen::CertificateParams::new(vec!["origin.test".to_string()])
+                .expect("params")
+                .self_signed(&key)
+                .expect("cert");
+            let der = cert.der().clone();
+            let mut cfg = ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![der.clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .expect("server config");
+            cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            (Arc::new(cfg), der)
+        }
+
+        /// A TLS origin over a duplex: it accepts a handshake as `identity`, then
+        /// answers each request with the next of `bodies` (keep-alive, held open
+        /// until the far end hangs up). Returns the proxy-facing end.
+        fn tls_origin(
+            identity: Arc<ServerConfig>,
+            bodies: Vec<&'static str>,
+        ) -> (ByteStream, tokio::task::JoinHandle<()>) {
+            let (ours, theirs) = duplex(64 * 1024);
+            let task = tokio::spawn(async move {
+                if let Ok(tls) = TlsAcceptor::from(identity).accept(theirs).await {
+                    origin_serve(tls, bodies, false).await;
+                }
+            });
+            (Box::pin(ours), task)
+        }
+
+        /// A client config trusting exactly `root`, offering `http/1.1`: a browser
+        /// with that one certificate installed.
+        fn trusting(root: CertificateDer<'static>) -> Arc<ClientConfig> {
+            let mut roots = RootCertStore::empty();
+            roots.add(root).expect("add root");
+            let mut cfg = ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+            Arc::new(cfg)
+        }
+
+        /// The proxy CA's root, as a client that trusts the proxy installs it.
+        fn ca_root(ca: &CertAuthority) -> CertificateDer<'static> {
+            CertificateDer::from_pem_slice(ca.root_cert_pem().as_bytes()).expect("root PEM")
+        }
+
+        /// A client config that verifies nothing, for looking at which certificate
+        /// the far end presented.
+        fn accepting_any() -> Arc<ClientConfig> {
+            HttpModule::new()
+                .with_insecure(true)
+                .upstream_tls_alpn(&[b"http/1.1".to_vec()])
+                .expect("client config")
+        }
+
+        fn ip_name() -> ServerName<'static> {
+            ServerName::try_from("127.0.0.1".to_string()).expect("ip name")
+        }
+
+        fn origin_name() -> ServerName<'static> {
+            ServerName::try_from("origin.test").expect("name")
+        }
+
+        /// Send `CONNECT authority` on `client` and return the proxy's answer head
+        /// (empty when the proxy closed without one). Read a byte at a time so
+        /// nothing past the head is consumed: the TLS handshake follows it.
+        async fn connect(client: &mut DuplexStream, authority: &str) -> String {
+            client
+                .write_all(
+                    format!(
+                        "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Connection: keep-alive\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("send CONNECT");
+            read_head(client).await
+        }
+
+        async fn read_head<S: AsyncRead + Unpin>(io: &mut S) -> String {
+            let mut got = Vec::new();
+            let mut byte = [0u8; 1];
+            while !got.ends_with(b"\r\n\r\n") {
+                match io.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => got.push(byte[0]),
+                }
+            }
+            String::from_utf8_lossy(&got).into_owned()
+        }
+
+        /// `GET path` over `io` (a TLS session through the tunnel) and its 200 body.
+        async fn get<S: AsyncRead + AsyncWrite + Unpin>(io: &mut S, path: &str) -> String {
+            io.write_all(get_request(path, ORIGIN).as_bytes())
+                .await
+                .expect("send GET");
+            io.flush().await.expect("flush");
+            read_one_200(io).await
+        }
+
+        /// The certificate the far end of `tls` presented.
+        fn presented<IO>(tls: &tokio_rustls::client::TlsStream<IO>) -> CertificateDer<'static> {
+            tls.get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|chain| chain.first())
+                .cloned()
+                .expect("the far end presented a certificate")
+        }
+
+        /// The stored tunnel rows (`CONNECT` requests), oldest first.
+        fn tunnel_rows(store: &MemFlowStore) -> Vec<HttpFlow> {
+            store
+                .list()
+                .into_iter()
+                .filter_map(|id| match store.get(id) {
+                    Some(Flow::Http(f)) if f.request.method == "CONNECT" => Some(f),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The paths of every stored request that is not a tunnel row, oldest first.
+        fn request_paths(store: &MemFlowStore) -> Vec<String> {
+            store
+                .list()
+                .into_iter()
+                .filter_map(|id| match store.get(id) {
+                    Some(Flow::Http(f)) if f.request.method != "CONNECT" => Some(f.request.path),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// The stored request row for `path`.
+        fn request_row(store: &MemFlowStore, path: &str) -> HttpFlow {
+            store
+                .list()
+                .into_iter()
+                .find_map(|id| match store.get(id) {
+                    Some(Flow::Http(f)) if f.request.path == path => Some(f),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no stored flow for {path}"))
+        }
+
+        /// `(mode, reason)` of a tunnel row's outcome.
+        fn outcome(row: &HttpFlow) -> (TunnelMode, Option<TunnelReason>) {
+            let tunnel = row
+                .metadata
+                .tunnel
+                .as_ref()
+                .expect("a tunnel row carries its outcome");
+            (tunnel.mode, tunnel.reason)
+        }
+
+        fn status(row: &HttpFlow) -> Option<u16> {
+            row.response.as_ref().map(|r| r.status)
+        }
+
+        /// AC2 (unit), D5: an in-scope CONNECT is decrypted. One `decrypted` row
+        /// with the acknowledgement's 200, open (no duration) while the client
+        /// holds the connection and closed with a duration when it leaves; the
+        /// request inside it is its own row, not passive, not a tunnel.
+        #[tokio::test]
+        async fn in_scope_connect_records_a_decrypted_row_and_its_inner_request() {
+            let ca = test_ca();
+            let module = HttpModule::with_ca(ca.clone()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (identity, _origin_der) = origin_identity();
+            let (upstream, origin) = tls_origin(identity, vec!["secret"]);
+            let (ctx, dialed) = scoped_ctx(vec![upstream], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut tls = TlsConnector::from(trusting(ca_root(&ca)))
+                    .connect(ip_name(), client)
+                    .await
+                    .expect("a client that trusts the proxy CA completes the handshake");
+                let body = get(&mut tls, "/secret").await;
+                // While the client holds the tunnel, its row is open.
+                let rows = tunnel_rows(&store);
+                assert_eq!(rows.len(), 1, "one tunnel row while the tunnel is open");
+                assert_eq!(outcome(&rows[0]), (TunnelMode::Decrypted, None));
+                assert_eq!(status(&rows[0]), Some(200));
+                assert_eq!(
+                    rows[0].metadata.duration, None,
+                    "an open tunnel has no duration yet"
+                );
+                let _ = tls.shutdown().await;
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the decrypted tunnel hung");
+            served.expect("the module ends cleanly when the client hangs up");
+            assert_eq!(body, "secret");
+            origin.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.method, "CONNECT");
+            assert_eq!(row.request.scheme, "https");
+            assert_eq!(row.request.authority, "127.0.0.1:8443");
+            assert_eq!(row.request.path, "");
+            assert_eq!(row.request.headers.get("host"), Some("127.0.0.1:8443"));
+            assert_eq!(
+                row.request.headers.get("proxy-connection"),
+                Some("keep-alive")
+            );
+            assert_eq!(status(row), Some(200));
+            assert_eq!(row.metadata.tunnel, Some(TunnelInfo::decrypted()));
+            assert!(
+                row.metadata.duration.is_some(),
+                "closing the connection closes the row"
+            );
+            assert!(!row.metadata.passive);
+            assert!(row.client_conn.tls);
+            assert_eq!(row.client_conn.alpn.as_deref(), Some("http/1.1"));
+            assert_eq!(
+                row.server_conn.as_ref().map(|c| c.peer),
+                Some(origin_peer()),
+                "the decrypted row names the origin it dialled"
+            );
+            assert_eq!(
+                *dialed.lock().expect("dialed lock"),
+                vec![("127.0.0.1:8443".to_string(), origin_peer())]
+            );
+
+            let inner = request_row(&store, "/secret");
+            assert_eq!(inner.request.method, "GET");
+            assert_eq!(inner.request.scheme, "https");
+            assert_eq!(inner.request.authority, "127.0.0.1:8443");
+            assert_eq!(status(&inner), Some(200));
+            assert!(
+                !inner.metadata.passive,
+                "a request inside a decrypted tunnel is acted on"
+            );
+            assert_eq!(
+                inner.metadata.tunnel, None,
+                "an inner request is not a tunnel row"
+            );
+            assert_eq!(request_paths(&store), vec!["/secret".to_string()]);
+        }
+
+        /// AC1 (unit), AC16, D2: with an empty Scope the HTTP module itself relays
+        /// the CONNECT byte for byte — the client completes TLS against the
+        /// origin's own certificate — and records one `passthrough/out_of_scope`
+        /// row with the bytes moved; nothing inside the tunnel becomes a row.
+        #[tokio::test]
+        async fn out_of_scope_connect_is_relayed_not_decrypted() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (identity, origin_der) = origin_identity();
+            let (upstream, origin) = tls_origin(identity, vec!["secret"]);
+            let (ctx, dialed) = scoped_ctx(vec![upstream], store.clone(), scoped(&[]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut tls = TlsConnector::from(accepting_any())
+                    .connect(origin_name(), client)
+                    .await
+                    .expect("the handshake with the origin goes through the relay");
+                assert_eq!(
+                    presented(&tls),
+                    origin_der,
+                    "the client must see the origin's own certificate, not a proxy leaf"
+                );
+                let body = get(&mut tls, "/secret").await;
+                let rows = tunnel_rows(&store);
+                assert_eq!(rows.len(), 1, "one tunnel row while the relay is open");
+                assert_eq!(
+                    outcome(&rows[0]),
+                    (TunnelMode::Passthrough, Some(TunnelReason::OutOfScope))
+                );
+                assert_eq!(status(&rows[0]), Some(200));
+                assert_eq!(rows[0].metadata.duration, None, "open: no duration yet");
+                let _ = tls.shutdown().await;
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the relayed tunnel hung");
+            served.expect("the relay ends cleanly when the client hangs up");
+            assert_eq!(body, "secret", "the origin's answer was relayed");
+            origin.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.method, "CONNECT");
+            assert_eq!(row.request.authority, "127.0.0.1:8443");
+            assert_eq!(row.request.headers.get("host"), Some("127.0.0.1:8443"));
+            assert_eq!(status(row), Some(200));
+            let tunnel = row.metadata.tunnel.clone().expect("tunnel outcome");
+            assert_eq!(tunnel.mode, TunnelMode::Passthrough);
+            assert_eq!(tunnel.reason, Some(TunnelReason::OutOfScope));
+            assert!(tunnel.bytes_up.is_some_and(|n| n > 0), "{tunnel:?}");
+            assert!(tunnel.bytes_down.is_some_and(|n| n > 0), "{tunnel:?}");
+            assert!(row.metadata.duration.is_some(), "closed: duration set");
+            assert!(!row.metadata.passive);
+            assert!(row.client_conn.tls);
+            assert_eq!(
+                row.server_conn.as_ref().map(|c| c.peer),
+                Some(origin_peer())
+            );
+            assert_eq!(
+                *dialed.lock().expect("dialed lock"),
+                vec![("127.0.0.1:8443".to_string(), origin_peer())]
+            );
+            assert!(
+                request_paths(&store).is_empty(),
+                "nothing inside a relayed tunnel is a row: {:?}",
+                request_paths(&store)
+            );
+            assert_eq!(
+                store.count(),
+                1,
+                "the tunnel row is the only row for the host"
+            );
+        }
+
+        /// AC5 (unit): an in-scope host, a client that does not trust the proxy CA
+        /// (Safari, curl without --cacert). The handshake fails with the client's
+        /// alert and the row says so: `failed/client_rejected_certificate`, no
+        /// status, closed.
+        #[tokio::test]
+        async fn client_that_rejects_our_leaf_is_a_failed_row() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (identity, _origin_der) = origin_identity();
+            let (upstream, origin) = tls_origin(identity, vec![]);
+            let (ctx, _dialed) = scoped_ctx(vec![upstream], store.clone(), scoped(&["127.0.0.1"]));
+            // The client trusts one unrelated root and nothing else.
+            let (_unrelated, unrelated_root) = origin_identity();
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                TlsConnector::from(trusting(unrelated_root))
+                    .connect(ip_name(), client)
+                    .await
+                    .expect_err("a client that does not trust the proxy CA must refuse the leaf")
+            };
+            let (served, client_err) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the refused handshake hung");
+            origin.abort();
+            let err = served.expect_err("the connection ends with the handshake error");
+            assert_eq!(err.to_string(), "client TLS handshake");
+            assert!(
+                client_err.to_string().contains("UnknownIssuer"),
+                "the client refused the issuer: {client_err}"
+            );
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, "127.0.0.1:8443");
+            assert_eq!(
+                outcome(row),
+                (
+                    TunnelMode::Failed,
+                    Some(TunnelReason::ClientRejectedCertificate)
+                )
+            );
+            assert_eq!(status(row), None, "a failed tunnel reports no status");
+            assert!(row.metadata.duration.is_some(), "a failed row is closed");
+            assert!(row.client_conn.tls);
+            assert_eq!(
+                row.server_conn.as_ref().map(|c| c.peer),
+                Some(origin_peer()),
+                "the origin had been dialled when the client refused"
+            );
+            assert!(request_paths(&store).is_empty());
+        }
+
+        /// AC6: a CONNECT acknowledged and then abandoned before a single byte
+        /// (a speculative pre-connect) is `failed/client_closed`; nothing was
+        /// dialled.
+        #[tokio::test]
+        async fn connect_then_eof_is_client_closed() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                drop(client);
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the abandoned tunnel hung");
+            served.expect("a client that leaves is not an error");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, "127.0.0.1:8443");
+            assert_eq!(
+                outcome(row),
+                (TunnelMode::Failed, Some(TunnelReason::ClientClosed))
+            );
+            assert_eq!(status(row), None);
+            assert!(row.metadata.duration.is_some());
+            assert!(!row.client_conn.tls, "no TLS byte was ever seen");
+            assert!(row.server_conn.is_none(), "nothing was dialled");
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+            assert_eq!(store.count(), 1);
+        }
+
+        /// AC6: the origin cannot be dialled (the connector refuses) →
+        /// `failed/upstream_unreachable`, no origin on the row.
+        #[tokio::test]
+        async fn unreachable_origin_is_upstream_unreachable() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            // No streams: every dial is refused.
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                // The ClientHello goes out; the handshake fails once the proxy gives up.
+                let _ = TlsConnector::from(accepting_any())
+                    .connect(ip_name(), client)
+                    .await;
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the refused dial hung");
+            let err = served.expect_err("the connection ends with the dial error");
+            assert_eq!(err.to_string(), "scope guard refused the dial");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, "127.0.0.1:8443");
+            assert_eq!(
+                outcome(row),
+                (TunnelMode::Failed, Some(TunnelReason::UpstreamUnreachable))
+            );
+            assert_eq!(status(row), None);
+            assert!(row.metadata.duration.is_some());
+            assert!(row.client_conn.tls);
+            assert!(row.server_conn.is_none(), "no origin was reached");
+            assert_eq!(
+                *dialed.lock().expect("dialed lock"),
+                vec![("127.0.0.1:8443".to_string(), origin_peer())],
+                "the dial was attempted once"
+            );
+        }
+
+        /// AC6: the origin accepts the connection and closes before the TLS
+        /// handshake → `failed/upstream_tls_failed`, with the origin on the row.
+        #[tokio::test]
+        async fn origin_tls_failure_is_upstream_tls_failed() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ours, theirs) = duplex(64 * 1024);
+            // An origin that hung up right after the TCP accept.
+            drop(theirs);
+            let (ctx, _dialed) =
+                scoped_ctx(vec![Box::pin(ours)], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let _ = TlsConnector::from(accepting_any())
+                    .connect(ip_name(), client)
+                    .await;
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the failed origin handshake hung");
+            let err = served.expect_err("the connection ends with the origin handshake error");
+            assert_eq!(err.to_string(), "TLS to upstream 127.0.0.1:8443");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.authority, "127.0.0.1:8443");
+            assert_eq!(
+                outcome(row),
+                (TunnelMode::Failed, Some(TunnelReason::UpstreamTlsFailed))
+            );
+            assert_eq!(status(row), None);
+            assert!(row.metadata.duration.is_some());
+            assert_eq!(
+                row.server_conn.as_ref().map(|c| c.peer),
+                Some(origin_peer()),
+                "the origin was dialled before its handshake failed"
+            );
+        }
+
+        /// AC6: a CONNECT whose authority is not one (`CONNECT /secret`) is
+        /// `failed/protocol_error`, recorded with the raw text as its label and
+        /// its headers, and answered with nothing.
+        #[tokio::test]
+        async fn malformed_connect_is_protocol_error() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, dialed) = scoped_ctx(vec![], store.clone(), scoped(&["127.0.0.1"]));
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(b"CONNECT /secret HTTP/1.1\r\nHost: 127.0.0.1:8443\r\n\r\n")
+                    .await
+                    .expect("send the malformed CONNECT");
+                read_head(&mut client).await
+            };
+            let (served, reply) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the malformed CONNECT hung");
+            let err = served.expect_err("a malformed CONNECT fails the connection");
+            assert_eq!(
+                err.to_string(),
+                "malformed CONNECT authority: authority \"/secret\" has an invalid host"
+            );
+            assert_eq!(reply, "", "the proxy replies nothing and closes");
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            let row = &rows[0];
+            assert_eq!(row.request.method, "CONNECT");
+            assert_eq!(
+                row.request.authority, "/secret:443",
+                "the raw authority text is the row's label"
+            );
+            assert_eq!(row.request.headers.get("host"), Some("127.0.0.1:8443"));
+            assert_eq!(
+                outcome(row),
+                (TunnelMode::Failed, Some(TunnelReason::ProtocolError))
+            );
+            assert_eq!(status(row), None);
+            assert!(row.metadata.duration.is_some());
+            assert!(!row.client_conn.tls);
+            assert!(row.server_conn.is_none());
+            assert!(dialed.lock().expect("dialed lock").is_empty());
+        }
+
+        /// AC2 + AC4: `scope.add` while a relayed tunnel is open. That tunnel stays
+        /// a relay (its next request is still not captured); the next connection
+        /// to the host is decrypted.
+        #[tokio::test]
+        async fn scope_add_decrypts_the_next_connection_not_the_open_one() {
+            let ca = test_ca();
+            let module = HttpModule::with_ca(ca.clone()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let guard = scoped(&[]);
+            let (identity, origin_der) = origin_identity();
+            let (up_a, origin_a) = tls_origin(identity.clone(), vec!["one", "two"]);
+            let (up_b, origin_b) = tls_origin(identity, vec!["three"]);
+            let (ctx_a, _) = scoped_ctx(vec![up_a], store.clone(), guard.clone());
+            let (ctx_b, _) = scoped_ctx(vec![up_b], store.clone(), guard.clone());
+
+            let (mut client_a, proxy_a) = duplex(64 * 1024);
+            let (mut client_b, proxy_b) = duplex(64 * 1024);
+            let serving_a = module.spawn(Box::pin(proxy_a), ctx_a);
+            let serving_b = module.spawn(Box::pin(proxy_b), ctx_b);
+            let script = async {
+                // A: opened under the empty Scope, so relayed.
+                let ack = connect(&mut client_a, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut tls_a = TlsConnector::from(accepting_any())
+                    .connect(origin_name(), client_a)
+                    .await
+                    .expect("the first connection reaches the origin through the relay");
+                assert_eq!(presented(&tls_a), origin_der);
+                assert_eq!(get(&mut tls_a, "/one").await, "one");
+
+                // The operator adds the host while A is open.
+                guard.add_scope(ScopeEntry {
+                    host: "127.0.0.1".to_string(),
+                });
+
+                // A is still a relay: its next request is not captured either.
+                assert_eq!(get(&mut tls_a, "/two").await, "two");
+                assert!(
+                    request_paths(&store).is_empty(),
+                    "a tunnel opened before scope.add stays a tunnel: {:?}",
+                    request_paths(&store)
+                );
+
+                // B, opened now, is decrypted with the proxy's leaf.
+                let ack = connect(&mut client_b, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut tls_b = TlsConnector::from(trusting(ca_root(&ca)))
+                    .connect(ip_name(), client_b)
+                    .await
+                    .expect("the next connection is decrypted with the proxy's leaf");
+                assert_eq!(get(&mut tls_b, "/three").await, "three");
+
+                let _ = tls_a.shutdown().await;
+                let _ = tls_b.shutdown().await;
+            };
+            let (served_a, served_b, ()) = tokio::time::timeout(STALL_GUARD, async {
+                tokio::join!(serving_a, serving_b, script)
+            })
+            .await
+            .expect("the scope.add flip hung");
+            served_a.expect("the relay ends cleanly");
+            served_b.expect("the decrypted tunnel ends cleanly");
+            origin_a.abort();
+            origin_b.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 2, "one row per connection");
+            assert_eq!(
+                outcome(&rows[0]),
+                (TunnelMode::Passthrough, Some(TunnelReason::OutOfScope))
+            );
+            assert!(rows[0].metadata.duration.is_some());
+            assert_eq!(outcome(&rows[1]), (TunnelMode::Decrypted, None));
+            assert_eq!(status(&rows[1]), Some(200));
+            assert_eq!(request_paths(&store), vec!["/three".to_string()]);
+            assert!(!request_row(&store, "/three").metadata.passive);
+        }
+
+        /// AC3 + AC4: `scope.remove` while a decrypted tunnel is open. That tunnel
+        /// keeps serving decrypted, captured requests (not passive); the next
+        /// connection to the host is relayed and leaves no request row.
+        #[tokio::test]
+        async fn scope_remove_tunnels_the_next_connection_not_the_open_one() {
+            let ca = test_ca();
+            let module = HttpModule::with_ca(ca.clone()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let guard = scoped(&["127.0.0.1"]);
+            let (identity, origin_der) = origin_identity();
+            let (up_a, origin_a) = tls_origin(identity.clone(), vec!["one", "two"]);
+            let (up_b, origin_b) = tls_origin(identity, vec!["three"]);
+            let (ctx_a, _) = scoped_ctx(vec![up_a], store.clone(), guard.clone());
+            let (ctx_b, _) = scoped_ctx(vec![up_b], store.clone(), guard.clone());
+
+            let (mut client_a, proxy_a) = duplex(64 * 1024);
+            let (mut client_b, proxy_b) = duplex(64 * 1024);
+            let serving_a = module.spawn(Box::pin(proxy_a), ctx_a);
+            let serving_b = module.spawn(Box::pin(proxy_b), ctx_b);
+            let script = async {
+                // A: opened in scope, so decrypted.
+                let ack = connect(&mut client_a, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut tls_a = TlsConnector::from(trusting(ca_root(&ca)))
+                    .connect(ip_name(), client_a)
+                    .await
+                    .expect("the first connection is decrypted with the proxy's leaf");
+                assert_eq!(get(&mut tls_a, "/one").await, "one");
+                assert_eq!(request_paths(&store), vec!["/one".to_string()]);
+
+                // The operator removes the host while A is open.
+                assert!(guard.remove_scope("127.0.0.1"));
+
+                // A keeps serving decrypted: the next request is captured, not passive.
+                assert_eq!(get(&mut tls_a, "/two").await, "two");
+                assert_eq!(
+                    request_paths(&store),
+                    vec!["/one".to_string(), "/two".to_string()],
+                    "a tunnel decrypted before scope.remove keeps capturing"
+                );
+                assert!(!request_row(&store, "/two").metadata.passive);
+
+                // B, opened now, is relayed to the origin's own certificate.
+                let ack = connect(&mut client_b, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut tls_b = TlsConnector::from(accepting_any())
+                    .connect(origin_name(), client_b)
+                    .await
+                    .expect("the next connection reaches the origin through the relay");
+                assert_eq!(presented(&tls_b), origin_der);
+                assert_eq!(get(&mut tls_b, "/three").await, "three");
+
+                let _ = tls_a.shutdown().await;
+                let _ = tls_b.shutdown().await;
+            };
+            let (served_a, served_b, ()) = tokio::time::timeout(STALL_GUARD, async {
+                tokio::join!(serving_a, serving_b, script)
+            })
+            .await
+            .expect("the scope.remove flip hung");
+            served_a.expect("the decrypted tunnel ends cleanly");
+            served_b.expect("the relay ends cleanly");
+            origin_a.abort();
+            origin_b.abort();
+
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 2, "one row per connection");
+            assert_eq!(outcome(&rows[0]), (TunnelMode::Decrypted, None));
+            assert_eq!(
+                outcome(&rows[1]),
+                (TunnelMode::Passthrough, Some(TunnelReason::OutOfScope))
+            );
+            assert_eq!(status(&rows[1]), Some(200));
+            assert!(rows[1].metadata.duration.is_some());
+            assert_eq!(
+                request_paths(&store),
+                vec!["/one".to_string(), "/two".to_string()],
+                "no request inside the relayed tunnel is a row"
+            );
         }
     }
 }

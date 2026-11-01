@@ -86,9 +86,11 @@ const MAX_EXTRA_UPSTREAMS: usize = 8;
 /// mirror guarantees it). Spawns one task per accepted client stream; returns
 /// when the client stops accepting (GOAWAY / close) or the connection sits idle
 /// with no in-flight streams past [`READ_TIMEOUT`]. In-flight stream tasks,
-/// spawned onto the runtime, finish on their own.
+/// spawned onto the runtime, finish on their own. The context is shared (an
+/// `Arc`) because the stream tasks clone it, and because the caller closes the
+/// connection's tunnel row through the same context once this returns.
 pub(crate) async fn serve_h2(
-    ctx: ModuleCtx,
+    ctx: Arc<ModuleCtx>,
     client_tls: ByteStream,
     upstream_tls: ByteStream,
     conn: Conn,
@@ -137,7 +139,6 @@ pub(crate) async fn serve_h2(
         }
     });
 
-    let ctx = Arc::new(ctx);
     // The per-connection upstream pool: the pinned origin's shared `send_req`, plus
     // a lazily-opened, cached `SendRequest` per rewritten authority a Map Remote
     // redirect targets (spec §6). Shared (cloned) into every stream task.
