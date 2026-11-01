@@ -590,14 +590,6 @@ struct Row {
     file_args_ends: Option<String>,
     /// What the file's `client_label` must be.
     file_label: Option<String>,
-    /// The cut leaves a fragment of a registered secret that is shorter than its
-    /// mask (6 to 9 bytes against the 10 of `[redacted]`). The writer caps `args`
-    /// and then masks the fragment, so the mask lengthens the capped text past the
-    /// cap, and a second pass cuts the mask in half: a known defect of the writer,
-    /// not a leak (see [`a_masked_short_fragment_keeps_args_within_the_cap`]).
-    /// The one fixed-point comparison skips these rows; every no-leak assertion
-    /// still holds for them.
-    cap_overrun: bool,
 }
 
 impl Row {
@@ -620,7 +612,6 @@ impl Row {
             ring_ends: None,
             file_args_ends: None,
             file_label: None,
-            cap_overrun: false,
         }
     }
 
@@ -1855,7 +1846,6 @@ fn cap_row(n: u32, name: &str, secret: &str, into: usize, marker: &str) -> Row {
     .in_ring(fragment)
     .ring_ends(&format!("{fragment}…"))
     .file_ends("xxxxxx[redacted]…");
-    row.cap_overrun = into < "[redacted]".len();
     // The head is in the ring only when the cut leaves at least that much.
     if into >= head_of(secret).len() {
         row = row.in_ring(head_of(secret));
@@ -2897,16 +2887,6 @@ fn fixed_point_failures(run: &Run) -> Vec<String> {
     }
     for (before, after) in first.iter().zip(&second) {
         if before != after {
-            // A line of a row flagged `cap_overrun` is the known defect, asserted
-            // by its own (ignored) test.
-            let args = args_of_line(before);
-            if run
-                .rows
-                .iter()
-                .any(|row| row.cap_overrun && row.owns(&args))
-            {
-                continue;
-            }
             failures.push(format!(
                 "the writer's pass is not a fixed point\n    first:  {before}\n    second: {after}"
             ));
@@ -3429,24 +3409,28 @@ fn registered_sources_failures(streamable: bool) -> Vec<String> {
     failures
 }
 
-/// FINDING (task W15, for a fix task; ignored until the writer is fixed). When a
+/// FINDING (task W15, fixed by the fix task that followed it). When a
 /// cap leaves a fragment of a registered secret that is 6 to 9 bytes long, the
 /// writer masks it with the 10-byte `[redacted]` *after* it capped `args`, so the
 /// entry's `args` ends up to 4 bytes past the cap (519 bytes for a 6-byte
 /// fragment, against 512 and the 3-byte marker). Nothing leaks, but the size
 /// bound of Design 6 does not hold, and the line is not a fixed point of the
-/// writer: a second pass over it cuts the mask to `[redac…`.
-///
-/// Run it with `cargo test -p aitm --test audit_log_redaction -- --ignored`.
+/// writer: a second pass over it cuts the mask to `[redac…`. The writer now
+/// cuts the text before the fragment until the mask fits.
 #[test]
-#[ignore = "finding: the fragment mask lengthens a capped args past 512 bytes and the marker"]
 fn a_masked_short_fragment_keeps_args_within_the_cap() {
     let run = Run::execute("overrun");
     assert_none("the run", &run.problems);
     let limit = DEFAULT_ARGS_SUMMARY_CAP + "…".len();
     let mut failures = Vec::new();
     let mut checked = 0;
-    for row in run.rows.iter().filter(|row| row.cap_overrun) {
+    // The rows whose cut leaves the shortest fragment the registry masks: 6 bytes,
+    // against the 10 of its mask.
+    for row in run
+        .rows
+        .iter()
+        .filter(|row| row.what.contains(" cut 6 bytes in by the 512-byte cap"))
+    {
         checked += 1;
         match run.line_for(row) {
             Err(why) => failures.push(why),
@@ -3469,7 +3453,7 @@ fn a_masked_short_fragment_keeps_args_within_the_cap() {
     assert_none("the writer's cap on args", &failures);
 }
 
-/// FINDING (task W15, for a fix task; ignored until the writer is fixed). A
+/// FINDING (task W15, fixed by the fix task that followed it). A
 /// registered secret that holds a quote or a backslash is masked in its raw form
 /// (a plain text field) and in its JSON form (inside `args`, which is JSON text),
 /// but not when it sits inside a string field that is itself JSON text, say a
@@ -3477,11 +3461,8 @@ fn a_masked_short_fragment_keeps_args_within_the_cap() {
 /// form once more makes (`\\\"` for `"`), which the registry does not store. A
 /// 64-hex token (what `generate_token` makes) has no such character, so the
 /// tokens the process mints are not exposed; a configured one that does have one
-/// is.
-///
-/// Run it with `cargo test -p aitm --test audit_log_redaction -- --ignored`.
+/// was. The registry now stores the JSON form at depths 1 to 3.
 #[test]
-#[ignore = "finding: a registered secret with a quote is not masked inside JSON text held in a string"]
 fn a_registered_secret_with_a_quote_is_masked_inside_json_text_in_a_string() {
     let seed = run_seed();
     // A small cap and a second call make the agent file rotate (the guard).

@@ -3,11 +3,14 @@
 //! (a `key=`, a `Bearer` prefix, a header name) and whichever encoding they
 //! arrive in. The replacement is always `[redacted]`.
 //!
-//! A secret is stored raw and, when different, in its JSON-escaped form (the
-//! way `serde_json` writes a string body), its percent-encoded form with
-//! upper-case hex and, when different again, with lower-case hex. How a stored
-//! form is matched depends on the secret's length in bytes, because masking a
-//! short secret as a substring would corrupt every word that holds it:
+//! A secret is stored in every form the writer can meet it in (see [`forms_of`]):
+//! raw; JSON-escaped once, twice and three times over (the way `serde_json`
+//! writes a string body, so also inside a document held in a string, and inside
+//! a document in a document); percent-encoded with upper-case and with lower-case
+//! hex; and a JSON-escaped form percent-encoded (a document in a URL or a form).
+//! Every form is stored once. How a stored form is matched depends on the length
+//! of the **raw** secret in bytes, because masking a short secret as a substring
+//! would corrupt every word that holds it:
 //!
 //! | bytes | tier | masked |
 //! |---|---|---|
@@ -32,8 +35,9 @@ use std::sync::{Arc, PoisonError, RwLock};
 
 use tracing::warn;
 
-/// What replaces a registered secret.
-const MASK: &str = "[redacted]";
+/// What replaces a registered secret. The writer's pipeline needs the literal to
+/// make room for it (see `pipeline`).
+pub(super) const MASK: &str = "[redacted]";
 
 /// The literals the redaction passes write. A secret that is a substring of
 /// one of them is ignored: masking it would rewrite the replacement itself.
@@ -47,8 +51,18 @@ const WHOLE_TOKEN_MIN_BYTES: usize = 4;
 const SUBSTRING_MIN_BYTES: usize = 8;
 
 /// The ending of a text must be at least this many bytes of a secret for
-/// [`SecretRegistry::mask_trailing_fragment`] to take it for one cut in half.
+/// [`SecretRegistry::trailing_fragment`] to take it for one cut in half.
 const FRAGMENT_MIN_BYTES: usize = 6;
+
+/// How many times over a secret can be JSON-escaped where the writer meets it: a
+/// document (1), a document held in a string (2), a document in a document in a
+/// string (3). Each deeper level escapes every `\` and `"` of the one before.
+const JSON_DEPTHS: usize = 3;
+
+/// The deepest JSON level a percent form is built on. A document percent-encoded
+/// into a URL or a form holds the secret JSON-escaped once; a document in a
+/// document, twice. The percent form of the raw secret is level 0.
+const PERCENT_OF_JSON_DEPTHS: usize = 2;
 
 /// The marker a producer's cap puts after the text it cut: the ring's own, which
 /// the writer's caps use too (see `pipeline`).
@@ -64,6 +78,15 @@ pub enum Registration {
     /// Fewer than 4 bytes, empty, or a substring of the mask literals: not
     /// stored, never masked by value.
     Ignored,
+}
+
+/// A registered secret cut in half at the end of a text, as
+/// [`SecretRegistry::trailing_fragment`] finds it. It borrows from the text.
+pub(crate) struct Fragment<'a> {
+    /// The text before the fragment.
+    pub(crate) prefix: &'a str,
+    /// The `…` a producer's cap put after the cut, or empty when there was none.
+    pub(crate) marker: &'a str,
 }
 
 /// The known-secret registry. Shared as an `Arc`; every method takes `&self`.
@@ -140,17 +163,20 @@ impl SecretRegistry {
         self.current().mask(text)
     }
 
-    /// `text` with a registered secret that a cut left at its end masked: when
-    /// `text` (ignoring one trailing `…`, the marker a producer's cap puts after
-    /// a cut) ends with a prefix of 6 bytes or more of a secret of 8 bytes or
-    /// more, in any stored form, that fragment becomes `[redacted]` and the
-    /// marker is put back. The longest such ending wins. A whole secret is
-    /// masked by [`mask`](Self::mask); this is for the part of one that a cap
-    /// kept. A fragment shorter than 6 bytes is not masked: it is too common to
-    /// tell from text (Design 14.4, Residual risks). No lock is held while this
-    /// runs.
-    pub(crate) fn mask_trailing_fragment(&self, text: &str) -> String {
-        self.current().mask_trailing_fragment(text)
+    /// Where a registered secret that a cut left at the end of `text` begins:
+    /// when `text` (ignoring one trailing `…`, the marker a producer's cap puts
+    /// after a cut) ends with a prefix of 6 bytes or more of a secret of 8 bytes
+    /// or more, in any stored form, the text before that fragment and the marker
+    /// that was set aside. The longest such ending wins. A whole secret is for
+    /// [`mask`](Self::mask); this is for the part of one that a cap kept. A
+    /// fragment shorter than 6 bytes is not found: it is too common to tell from
+    /// text (Design 14.4, Residual risks). No lock is held while this runs.
+    ///
+    /// The caller replaces the fragment with [`MASK`] (the writer's pipeline does,
+    /// and makes room for it: the mask is longer than a fragment of 6 to 9
+    /// bytes).
+    pub(crate) fn trailing_fragment<'a>(&self, text: &'a str) -> Option<Fragment<'a>> {
+        self.current().trailing_fragment(text)
     }
 
     /// How many distinct secrets are stored (ignored ones are not).
@@ -242,22 +268,19 @@ impl Snapshot {
         out
     }
 
-    /// See [`SecretRegistry::mask_trailing_fragment`].
-    fn mask_trailing_fragment(&self, text: &str) -> String {
+    /// See [`SecretRegistry::trailing_fragment`].
+    fn trailing_fragment<'a>(&self, text: &'a str) -> Option<Fragment<'a>> {
         let (body, marker) = match text.strip_suffix(CUT_MARK) {
             Some(body) => (body, CUT_MARK),
             None => (text, ""),
         };
-        let Some(start) = self.fragment_start(body) else {
-            return text.to_string();
-        };
-        let mut out = String::with_capacity(start + MASK.len() + marker.len());
+        let start = self.fragment_start(body)?;
         // `start` is a character boundary of `body`; a failed `get` would drop
         // text, never keep it.
-        out.push_str(body.get(..start).unwrap_or_default());
-        out.push_str(MASK);
-        out.push_str(marker);
-        out
+        Some(Fragment {
+            prefix: body.get(..start).unwrap_or_default(),
+            marker,
+        })
     }
 
     /// Where the longest ending of `body` that is a prefix of a stored form
@@ -292,18 +315,42 @@ fn tier_of(secret: &str) -> Registration {
     }
 }
 
-/// The forms a secret is looked for in: raw, JSON-escaped, percent-encoded in
-/// upper-case hex and in lower-case hex, each kept once.
+/// The forms a secret is looked for in, each kept once:
+///
+/// - the raw secret;
+/// - its JSON-escaped form at depth 1, 2 and 3 ([`JSON_DEPTHS`]): each depth
+///   escapes the one before, so depth 2 is what a document that holds the secret
+///   becomes inside the string of another document;
+/// - the percent-encoded form of the raw secret and of its JSON forms at depth 1
+///   and 2 ([`PERCENT_OF_JSON_DEPTHS`]), in upper-case and in lower-case hex.
+///
+/// JSON-escaping a percent form is the identity (a percent form has no `"`, no
+/// `\` and no control character left), so "a percent form inside JSON" is the
+/// percent form itself and needs no form of its own. A secret with nothing to
+/// escape has one form (a hex token) or two (percent-encoded only).
+///
+/// A form deeper than these is not stored: a fourth JSON level or a double
+/// percent encoding is a residual, not covered by value masking (the other rules
+/// of the pipeline still apply).
 fn forms_of(secret: &str) -> Vec<String> {
-    let mut forms = vec![secret.to_string()];
-    let candidates = [
-        json_body(secret),
-        Some(percent_encode(secret, HEX_UPPER)),
-        Some(percent_encode(secret, HEX_LOWER)),
-    ];
-    for form in candidates.into_iter().flatten() {
+    let mut forms: Vec<String> = Vec::new();
+    let mut add = |form: String| {
         if !forms.contains(&form) {
             forms.push(form);
+        }
+    };
+    let mut json = secret.to_string();
+    for depth in 0..=JSON_DEPTHS {
+        if depth > 0 {
+            match json_body(&json) {
+                Some(deeper) => json = deeper,
+                None => break,
+            }
+        }
+        add(json.clone());
+        if depth <= PERCENT_OF_JSON_DEPTHS {
+            add(percent_encode(&json, HEX_UPPER));
+            add(percent_encode(&json, HEX_LOWER));
         }
     }
     forms
@@ -804,6 +851,15 @@ mod tests {
         assert_eq!(format!("{:?}", Registration::Ignored), "Ignored");
     }
 
+    /// `text` with its trailing fragment replaced by the mask and the marker put
+    /// back: what the pipeline makes of it when the mask fits.
+    fn with_fragment_masked(registry: &SecretRegistry, text: &str) -> String {
+        match registry.trailing_fragment(text) {
+            Some(fragment) => format!("{}{MASK}{}", fragment.prefix, fragment.marker),
+            None => text.to_string(),
+        }
+    }
+
     /// The rows whose trailing-fragment mask is not the wanted text.
     fn failing_fragment_rows(
         registry: &SecretRegistry,
@@ -811,7 +867,7 @@ mod tests {
     ) -> Vec<String> {
         rows.iter()
             .filter_map(|(name, text, want)| {
-                let got = registry.mask_trailing_fragment(text);
+                let got = with_fragment_masked(registry, text);
                 (got != *want).then(|| format!("{name}: {text:?} gave {got:?}, wanted {want:?}"))
             })
             .collect()
@@ -929,5 +985,248 @@ mod tests {
             &[("an empty registry", "see CUT12SECRE…", "see CUT12SECRE…")],
         );
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // ---- the escaping depths a secret can be met at (fix task, finding 1) ----
+
+    /// A configured secret with every character an encoder rewrites: `"` and `\`
+    /// (JSON), `/`, `+` and `=` (percent).
+    const SECRET_91: &str = "CNRY91xAb/c+d=e\"q\\z9";
+    /// [`SECRET_91`] as `serde_json` writes the inside of a string, once, twice
+    /// and three times over: every `\` and `"` of the one before is escaped again.
+    const SECRET_91_JSON_1: &str = r#"CNRY91xAb/c+d=e\"q\\z9"#;
+    const SECRET_91_JSON_2: &str = r#"CNRY91xAb/c+d=e\\\"q\\\\z9"#;
+    const SECRET_91_JSON_3: &str = r#"CNRY91xAb/c+d=e\\\\\\\"q\\\\\\\\z9"#;
+    /// [`SECRET_91`] percent-encoded, in upper-case and in lower-case hex.
+    const SECRET_91_PERCENT_UPPER: &str = "CNRY91xAb%2Fc%2Bd%3De%22q%5Cz9";
+    const SECRET_91_PERCENT_LOWER: &str = "CNRY91xAb%2fc%2bd%3de%22q%5cz9";
+    /// A JSON document that holds the secret, percent-encoded into a URL or a
+    /// form: the JSON form at depth 1 (and at depth 2), then percent-encoded.
+    const SECRET_91_JSON_1_PERCENT_UPPER: &str = "CNRY91xAb%2Fc%2Bd%3De%5C%22q%5C%5Cz9";
+    const SECRET_91_JSON_1_PERCENT_LOWER: &str = "CNRY91xAb%2fc%2bd%3de%5c%22q%5c%5cz9";
+    const SECRET_91_JSON_2_PERCENT_UPPER: &str = "CNRY91xAb%2Fc%2Bd%3De%5C%5C%5C%22q%5C%5C%5C%5Cz9";
+    const SECRET_91_JSON_2_PERCENT_LOWER: &str = "CNRY91xAb%2fc%2bd%3de%5c%5c%5c%22q%5c%5c%5c%5cz9";
+
+    /// `text` as `serde_json` writes the inside of a string.
+    fn json_once(text: &str) -> String {
+        let quoted = serde_json::to_string(text).expect("a string is JSON");
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
+    /// A JSON document whose innermost string is `secret`, nested `depth` times:
+    /// depth 1 is `{"k":"<secret>"}` and every further depth holds the one before
+    /// as the string of a `body` member, so that the writer meets the secret
+    /// escaped `depth` times over (R91 of the corpus is depth 2).
+    fn nested_document(secret: &str, depth: usize) -> String {
+        let mut document = serde_json::json!({ "k": secret }).to_string();
+        for _ in 1..depth {
+            document = serde_json::json!({ "body": document }).to_string();
+        }
+        document
+    }
+
+    /// What `nested_document` holds innermost, read back through `depth - 1`
+    /// strings of JSON text, or why it cannot be read.
+    fn innermost(document: &str, depth: usize) -> Result<String, String> {
+        let mut text = document.to_string();
+        for _ in 1..depth {
+            let value: Value = serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))?;
+            text = value["body"]
+                .as_str()
+                .ok_or_else(|| format!("no body string in {value}"))?
+                .to_string();
+        }
+        let value: Value = serde_json::from_str(&text).map_err(|e| format!("{e}: {text}"))?;
+        value["k"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| format!("no k string in {value}"))
+    }
+
+    /// The forms of `SECRET_91` above are what the helpers say they are, so the
+    /// tests that follow do not pass by agreeing with a wrong constant.
+    #[test]
+    fn the_secret_91_constants_are_the_forms_they_name() {
+        assert_eq!(json_once(SECRET_91), SECRET_91_JSON_1);
+        assert_eq!(json_once(SECRET_91_JSON_1), SECRET_91_JSON_2);
+        assert_eq!(json_once(SECRET_91_JSON_2), SECRET_91_JSON_3);
+        assert_eq!(
+            percent_encode(SECRET_91, HEX_UPPER),
+            SECRET_91_PERCENT_UPPER
+        );
+        assert_eq!(
+            percent_encode(SECRET_91, HEX_LOWER),
+            SECRET_91_PERCENT_LOWER
+        );
+        for (form, want) in [
+            (SECRET_91_JSON_1, SECRET_91_JSON_1_PERCENT_UPPER),
+            (SECRET_91_JSON_2, SECRET_91_JSON_2_PERCENT_UPPER),
+        ] {
+            assert_eq!(percent_encode(form, HEX_UPPER), want);
+        }
+        for (form, want) in [
+            (SECRET_91_JSON_1, SECRET_91_JSON_1_PERCENT_LOWER),
+            (SECRET_91_JSON_2, SECRET_91_JSON_2_PERCENT_LOWER),
+        ] {
+            assert_eq!(percent_encode(form, HEX_LOWER), want);
+        }
+        // JSON-escaping a percent form is the identity: it holds neither `"` nor `\`.
+        assert_eq!(json_once(SECRET_91_PERCENT_UPPER), SECRET_91_PERCENT_UPPER);
+        assert_eq!(
+            json_once(SECRET_91_JSON_2_PERCENT_LOWER),
+            SECRET_91_JSON_2_PERCENT_LOWER
+        );
+    }
+
+    /// Finding 1: the writer meets a secret as it is, JSON-escaped once (in
+    /// `args`), twice (in a string that holds a JSON document) and three times
+    /// over (a document inside a document), percent-encoded in either case, as a
+    /// JSON form that is then percent-encoded (a document in a URL or a form), and
+    /// as a percent form that is then JSON-escaped (which writes it as it was: it
+    /// has no character JSON escapes). Each is masked whole.
+    #[test]
+    fn a_secret_is_masked_at_every_escaping_depth() {
+        let registry = SecretRegistry::new();
+        assert_eq!(
+            registry.register("test.depths", SECRET_91),
+            Registration::Substring
+        );
+        let rows: Vec<(String, String)> = vec![
+            ("raw".to_string(), SECRET_91.to_string()),
+            ("JSON depth 1".to_string(), SECRET_91_JSON_1.to_string()),
+            ("JSON depth 2".to_string(), SECRET_91_JSON_2.to_string()),
+            ("JSON depth 3".to_string(), SECRET_91_JSON_3.to_string()),
+            (
+                "percent, upper-case".to_string(),
+                SECRET_91_PERCENT_UPPER.to_string(),
+            ),
+            (
+                "percent, lower-case".to_string(),
+                SECRET_91_PERCENT_LOWER.to_string(),
+            ),
+            (
+                "JSON depth 1 then percent, upper-case".to_string(),
+                SECRET_91_JSON_1_PERCENT_UPPER.to_string(),
+            ),
+            (
+                "JSON depth 1 then percent, lower-case".to_string(),
+                SECRET_91_JSON_1_PERCENT_LOWER.to_string(),
+            ),
+            (
+                "JSON depth 2 then percent, upper-case".to_string(),
+                SECRET_91_JSON_2_PERCENT_UPPER.to_string(),
+            ),
+            (
+                "JSON depth 2 then percent, lower-case".to_string(),
+                SECRET_91_JSON_2_PERCENT_LOWER.to_string(),
+            ),
+            (
+                "percent then JSON depth 1".to_string(),
+                json_once(SECRET_91_PERCENT_UPPER),
+            ),
+            (
+                "percent then JSON depth 2".to_string(),
+                json_once(&json_once(SECRET_91_PERCENT_LOWER)),
+            ),
+        ];
+        let mut failures: Vec<String> = Vec::new();
+        for (name, form) in &rows {
+            let got = registry.mask(&format!("x {form} y"));
+            if got != "x [redacted] y" {
+                failures.push(format!("{name}: left: {got:?}, right: \"x [redacted] y\""));
+            }
+            let in_url = registry.mask(&format!("http://h/?q={form}&z=1"));
+            if in_url != "http://h/?q=[redacted]&z=1" {
+                failures.push(format!("{name} in a URL: left: {in_url:?}"));
+            }
+        }
+        // Only the secret is masked, never a part of it.
+        for part in ["CNRY91xAb", "CNRY91xAb/c+d=e", "q\\z9"] {
+            let got = registry.mask(&format!("x {part} y"));
+            if got != format!("x {part} y") {
+                failures.push(format!("a part, {part:?}: left: {got:?}"));
+            }
+        }
+        assert_eq!(registry.len(), 1, "one secret, however many forms");
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Finding 1: the tier is the raw secret's. A 5-byte secret with a quote is a
+    /// whole token at every depth (its depth-3 form is 13 bytes and is still not
+    /// masked inside a word); it is not taken for a substring because a deeper
+    /// form is long.
+    #[test]
+    fn a_short_secret_is_masked_at_every_depth_as_a_whole_token() {
+        let registry = SecretRegistry::new();
+        let (registrations, log) = register_logged(&registry, &[("test.short", "a\"b\\c")]);
+        assert_eq!(registrations, [Registration::WholeToken]);
+        assert_one_clean_warning(&log, "test.short", "a\"b\\c");
+        let mut failures = failing_rows(
+            &registry,
+            &[
+                ("raw", "x a\"b\\c y", "x [redacted] y"),
+                ("depth 1", r#"x a\"b\\c y"#, "x [redacted] y"),
+                ("depth 2", r#"x a\\\"b\\\\c y"#, "x [redacted] y"),
+                ("depth 3", r#"x a\\\\\\\"b\\\\\\\\c y"#, "x [redacted] y"),
+                (
+                    "a word that holds it",
+                    r#"xa\\\"b\\\\cy"#,
+                    r#"xa\\\"b\\\\cy"#,
+                ),
+            ],
+        );
+        for depth in 1..=3 {
+            let document = nested_document("a\"b\\c", depth);
+            let got = registry.mask(&document);
+            if innermost(&got, depth) != Ok("[redacted]".to_string()) {
+                failures.push(format!("nested {depth}: {got}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Finding 1: masking a secret at any of the stored depths leaves valid JSON,
+    /// and decoding the document down to the secret gives `[redacted]`: the mask
+    /// replaces the whole escaped form, so no `\` is left to escape what follows.
+    /// The secrets include one that begins with a quote (each form is then a
+    /// suffix of the next) and one that ends with a backslash.
+    #[test]
+    fn masking_at_each_depth_keeps_the_json_valid() {
+        let mut failures: Vec<String> = Vec::new();
+        for secret in [SECRET_91, "\"abcdefgh", "abcdefg\\", "tab\tand\nline-12345"] {
+            let registry = SecretRegistry::new();
+            registry.register("test.valid", secret);
+            for depth in 1..=3 {
+                let document = nested_document(secret, depth);
+                let masked = registry.mask(&document);
+                match innermost(&masked, depth) {
+                    Ok(inner) if inner == "[redacted]" => {}
+                    other => failures.push(format!(
+                        "{secret:?} at depth {depth}: {other:?} from {masked}"
+                    )),
+                }
+                if masked.contains(secret) || masked.contains(&json_once(secret)) {
+                    failures.push(format!(
+                        "{secret:?} at depth {depth} is still there: {masked}"
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Finding 1: a registration with every form is still a count and nothing
+    /// else in `Debug`, and a long secret with many forms warns about nothing.
+    #[test]
+    fn many_forms_change_neither_the_count_nor_the_log() {
+        let registry = SecretRegistry::new();
+        let (registration, log) = logged(|| registry.register("test.many", SECRET_91));
+        assert_eq!(registration, Registration::Substring);
+        assert_eq!(format!("{registry:?}"), "SecretRegistry { secrets: 1 }");
+        assert_eq!(format!("{registry:#?}").matches("CNRY91").count(), 0);
+        assert!(
+            log.is_empty(),
+            "a secret of 8 bytes or more logs nothing: {log}"
+        );
     }
 }

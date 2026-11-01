@@ -17,7 +17,10 @@
 //!    cannot drive the terminal of whoever runs `cat` on the file.
 //! 5. **Cap**, and then the mask of a trailing fragment of a registered secret the
 //!    cap (or the producer's own) cut in half. The controls come first so that
-//!    U+FFFD, three bytes, is counted by the cap.
+//!    U+FFFD, three bytes, is counted by the cap. The mask is longer than a short
+//!    fragment, so the text before the fragment gives way until the field is as
+//!    its cap leaves it: a field never ends past its cap, and a second pass over
+//!    it changes nothing.
 //! 6. **Render** with `entry_to_jsonl`, the one renderer of an entry line.
 //!
 //! For an entry `record_audit` produced, steps 2 to 5 change nothing, so the
@@ -38,7 +41,7 @@ use aitm_core::{
 };
 
 use super::jsonscan::redact_args_text;
-use super::registry::{SecretRegistry, CUT_MARK};
+use super::registry::{SecretRegistry, CUT_MARK, MASK};
 
 /// Every string field is cut to this many bytes before any pass reads it: the
 /// work bound of Design 14.5 step 1. Far above every cap below, so nothing a
@@ -64,32 +67,39 @@ enum Cap {
 }
 
 /// Steps 3 to 5 for one field: what differs from field to field is whether the
-/// controls are replaced and how the cap cuts.
+/// controls are replaced, whether the text is JSON, and how the cap cuts.
 #[derive(Clone, Copy)]
 struct Tail {
     controls: bool,
+    /// The field is JSON text, in which a backslash escapes the character after
+    /// it: a cut must not leave one in front of what follows.
+    json_text: bool,
     cap: Cap,
 }
 
 /// `args`: a JSON text cut at 512 bytes by its producer.
 const ARGS: Tail = Tail {
     controls: true,
+    json_text: true,
     cap: Cap::Marked(DEFAULT_ARGS_SUMMARY_CAP),
 };
 
 /// The refusal reason: at most 1024 bytes and the marker.
 const REASON: Tail = Tail {
     controls: true,
+    json_text: false,
     cap: Cap::Marked(DEFAULT_RESULT_REASON_CAP),
 };
 
 const COMMAND: Tail = Tail {
     controls: true,
+    json_text: false,
     cap: Cap::Chars(MAX_COMMAND_CHARS),
 };
 
 const CONNECTION_ID: Tail = Tail {
     controls: true,
+    json_text: false,
     cap: Cap::Bytes(MAX_CONNECTION_ID_BYTES),
 };
 
@@ -97,8 +107,31 @@ const CONNECTION_ID: Tail = Tail {
 /// them, so only the cap (a pass can lengthen a label) applies.
 const LABEL: Tail = Tail {
     controls: false,
+    json_text: false,
     cap: Cap::Chars(MAX_CLIENT_LABEL_CHARS),
 };
+
+impl Cap {
+    /// `text` cut as this cap cuts it.
+    fn apply(self, text: String) -> String {
+        match self {
+            Cap::Marked(bytes) => cap_marked(text, bytes),
+            Cap::Chars(chars) => cap_chars(text, chars),
+            Cap::Bytes(bytes) => cap_bytes(text, bytes),
+        }
+    }
+
+    /// Whether `text` is as this cap leaves it, so that cutting it again changes
+    /// nothing: within the cap, or a cut text that ends with the marker.
+    fn holds(self, text: &str) -> bool {
+        self.apply(text.to_string()) == text
+    }
+
+    /// Whether a cut text ends with the `…` marker.
+    fn marks(self) -> bool {
+        matches!(self, Cap::Marked(_))
+    }
+}
 
 impl Tail {
     /// Masks `passed` (a field after its text pass) with every registered
@@ -111,12 +144,40 @@ impl Tail {
         } else {
             masked
         };
-        let capped = match self.cap {
-            Cap::Marked(bytes) => cap_marked(clean, bytes),
-            Cap::Chars(chars) => cap_chars(clean, chars),
-            Cap::Bytes(bytes) => cap_bytes(clean, bytes),
+        let capped = self.cap.apply(clean);
+        self.mask_fragment(registry, capped)
+    }
+
+    /// Replaces the fragment of a registered secret at the end of `capped` (the
+    /// cap, or the producer's, cut a secret in half) with the mask, and keeps the
+    /// field within its cap while it does.
+    ///
+    /// The mask is 10 bytes and a fragment is 6 or more, so the mask can take up to
+    /// four bytes the cap had no room for. The text before the fragment is then
+    /// cut, a character at a time and never the mask, until the field is as the cap
+    /// leaves it ([`Cap::holds`]): a second pass over it changes nothing. A field
+    /// that is cut here ends with the marker when its cap marks cuts, as the
+    /// producer's cut would have. In JSON text the cut does not end inside an
+    /// escape either (see [`without_dangling_backslash`]).
+    fn mask_fragment(self, registry: &SecretRegistry, capped: String) -> String {
+        let Some(fragment) = registry.trailing_fragment(&capped) else {
+            return capped;
         };
-        registry.mask_trailing_fragment(&capped)
+        let mut prefix = fragment.prefix;
+        let mut marker = fragment.marker;
+        loop {
+            let candidate = format!("{prefix}{MASK}{marker}");
+            if self.cap.holds(&candidate) || prefix.is_empty() {
+                return candidate;
+            }
+            prefix = without_last_char(prefix);
+            if self.json_text {
+                prefix = without_dangling_backslash(prefix);
+            }
+            if self.cap.marks() {
+                marker = CUT_MARK;
+            }
+        }
     }
 }
 
@@ -184,6 +245,28 @@ fn bounded(text: &str) -> &str {
     }
     text.get(..floor_boundary(text, FIELD_BOUND_BYTES))
         .unwrap_or_default()
+}
+
+/// `text` without its last character.
+fn without_last_char(text: &str) -> &str {
+    match text.char_indices().next_back() {
+        Some((last, _)) => text.get(..last).unwrap_or_default(),
+        None => text,
+    }
+}
+
+/// `text` without its last character when that is a backslash that begins an
+/// escape (an odd run of them at the end), which a cut through `\n` leaves. Left
+/// in front of the mask it would escape the `[`, and the text would no longer
+/// read back as it was written.
+fn without_dangling_backslash(text: &str) -> &str {
+    let run = text.bytes().rev().take_while(|byte| *byte == b'\\').count();
+    if run % 2 == 1 {
+        // A backslash is one byte, so this index is a character boundary.
+        text.get(..text.len() - 1).unwrap_or_default()
+    } else {
+        text
+    }
 }
 
 /// The largest index at or below `at` that is a character boundary of `text`.
@@ -859,6 +942,346 @@ mod tests {
             let got = string_at(&value, &["args"]);
             if got != args {
                 failures.push(format!("left: {got:?}, right: {args:?}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    // ---- a fragment mask never pushes a field past its cap (fix task, finding 2) ----
+
+    /// The registered secret whose first bytes a cap leaves at the end of a field.
+    const CUT_SECRET: &str = "CUT12SECRETVALUE0123456789";
+
+    fn registry_with_the_cut_secret() -> SecretRegistry {
+        let registry = SecretRegistry::new();
+        assert_eq!(
+            registry.register("test.cut", CUT_SECRET),
+            Registration::Substring
+        );
+        registry
+    }
+
+    /// The first `bytes` bytes of [`CUT_SECRET`]: what a cap that cuts it that far
+    /// in leaves.
+    fn fragment(bytes: usize) -> &'static str {
+        &CUT_SECRET[..bytes]
+    }
+
+    /// The entry a line holds, so that a line can be put through the pipeline
+    /// again.
+    fn entry_of_line(line: &str) -> AuditEntry {
+        let value = parsed(line);
+        let optional = |key: &str| value[key].as_str().map(str::to_string);
+        AuditEntry {
+            at: UNIX_EPOCH + Duration::from_millis(value["at"].as_u64().unwrap_or(0)),
+            origin: Frontend::Mcp,
+            client_label: optional("client_label"),
+            connection_id: optional("connection_id"),
+            command: string_at(&value, &["command"]).to_string(),
+            args_summary: string_at(&value, &["args"]).to_string(),
+            result: match value["result"]["error"].as_str() {
+                Some(reason) => AuditResult::Error(reason.to_string()),
+                None => AuditResult::Ok,
+            },
+        }
+    }
+
+    /// The line for `entry`, and a failure message when putting that line through
+    /// the pipeline again gives another line (the writer's pass is not a fixed
+    /// point on it).
+    fn render_twice(entry: &AuditEntry, registry: &SecretRegistry) -> (String, Option<String>) {
+        let first = render_line(entry, registry);
+        let second = render_line(&entry_of_line(&first), registry);
+        let failure = (second != first)
+            .then(|| format!("not a fixed point\n    first:  {first}\n    second: {second}"));
+        (first, failure)
+    }
+
+    /// Finding 2, `args`: the producer's cap left `fragment` bytes of a registered
+    /// secret (6 to 12) at the end of a 512-byte `args`. The 10-byte mask is longer
+    /// than a fragment of 6 to 9 bytes, so it takes room: the text before the
+    /// fragment is cut (on a character boundary, never inside the mask) until the
+    /// mask fits, and the field stays at 512 bytes and the marker. The line is a
+    /// fixed point. The expected `x` counts are literal.
+    #[test]
+    fn a_fragment_mask_at_the_cap_edge_leaves_args_within_its_cap() {
+        let registry = registry_with_the_cut_secret();
+        let mut failures: Vec<String> = Vec::new();
+        // (bytes of the secret the cap left, `x` bytes kept before the mask)
+        for (bytes, kept) in [
+            (6, 493),
+            (7, 493),
+            (8, 493),
+            (9, 493),
+            (10, 493),
+            (11, 492),
+            (12, 491),
+        ] {
+            let args = format!(
+                "{{\"note\":\"{}{}…",
+                "x".repeat(503 - bytes),
+                fragment(bytes)
+            );
+            assert_eq!(args.len(), 512 + "…".len(), "the producer's own cut");
+            let hostile = AuditEntry {
+                args_summary: args,
+                ..entry("flow.get")
+            };
+            let (line, not_fixed) = render_twice(&hostile, &registry);
+            failures.extend(not_fixed.map(|why| format!("{bytes} bytes: {why}")));
+            let value = parsed(&line);
+            let got = string_at(&value, &["args"]);
+            let want = format!("{{\"note\":\"{}[redacted]…", "x".repeat(kept));
+            if got != want {
+                failures.push(format!("{bytes} bytes: left: {got:?}, right: {want:?}"));
+            }
+            if got.len() > DEFAULT_ARGS_SUMMARY_CAP + "…".len() {
+                failures.push(format!(
+                    "{bytes} bytes: {} bytes is over the cap",
+                    got.len()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Finding 2, the other capped fields, where the helper is shared: the reason
+    /// (1024 bytes and the marker), the command (128 characters), the connection
+    /// id (64 bytes) and the label (64 characters), each with a 6, 9 and 10 byte
+    /// fragment at the very end of a field that is exactly at its cap. 6 and 9
+    /// need room for the mask; 10 fits as it is. A reason with no marker that has
+    /// to be cut gets one: it was cut. The expected counts are literal.
+    #[test]
+    fn a_fragment_mask_at_the_cap_edge_leaves_every_field_within_its_cap() {
+        let registry = registry_with_the_cut_secret();
+        let mask = "[redacted]";
+        let mut failures: Vec<String> = Vec::new();
+        for bytes in [6, 9, 10] {
+            let frag = fragment(bytes);
+            let rows: Vec<(&str, AuditEntry, Vec<&str>, String)> = vec![
+                (
+                    "reason cut by its producer",
+                    AuditEntry {
+                        result: AuditResult::Error(format!("{}{frag}…", "r".repeat(1024 - bytes))),
+                        ..entry("flow.get")
+                    },
+                    vec!["result", "error"],
+                    format!("{}{mask}…", "r".repeat(1014)),
+                ),
+                (
+                    "reason at its cap, no marker",
+                    AuditEntry {
+                        result: AuditResult::Error(format!("{}{frag}", "r".repeat(1024 - bytes))),
+                        ..entry("flow.get")
+                    },
+                    vec!["result", "error"],
+                    // A fragment of 10 bytes is replaced by the mask in place: not cut.
+                    if bytes == 10 {
+                        format!("{}{mask}", "r".repeat(1014))
+                    } else {
+                        format!("{}{mask}…", "r".repeat(1014))
+                    },
+                ),
+                (
+                    "command",
+                    AuditEntry {
+                        command: format!("{}{frag}", "c".repeat(128 - bytes)),
+                        ..entry("unused")
+                    },
+                    vec!["command"],
+                    format!("{}{mask}", "c".repeat(118)),
+                ),
+                (
+                    "connection id",
+                    AuditEntry {
+                        connection_id: Some(format!("{}{frag}", "i".repeat(64 - bytes))),
+                        ..entry("flow.get")
+                    },
+                    vec!["connection_id"],
+                    format!("{}{mask}", "i".repeat(54)),
+                ),
+                (
+                    "label",
+                    AuditEntry {
+                        client_label: Some(format!("{}{frag}", "l".repeat(64 - bytes))),
+                        ..entry("flow.get")
+                    },
+                    vec!["client_label"],
+                    format!("{}{mask}", "l".repeat(54)),
+                ),
+            ];
+            for (field, hostile, path, want) in rows {
+                let (line, not_fixed) = render_twice(&hostile, &registry);
+                failures.extend(not_fixed.map(|why| format!("{field}, {bytes} bytes: {why}")));
+                let value = parsed(&line);
+                let got = string_at(&value, &path);
+                if got != want {
+                    failures.push(format!(
+                        "{field}, {bytes} bytes: left: {got:?}, right: {want:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Finding 2: the cut before the fragment lands on a character boundary. The
+    /// 512 bytes are `{"note":"`, 248 two-byte characters and 7 bytes of the
+    /// secret; the mask needs the text to end by byte 502, which is inside a
+    /// character, so the 246 characters before it (501 bytes) are kept.
+    #[test]
+    fn the_cut_before_a_fragment_lands_on_a_character_boundary() {
+        let registry = registry_with_the_cut_secret();
+        let args = format!("{{\"note\":\"{}{}…", "é".repeat(248), fragment(7));
+        assert_eq!(args.len(), 512 + "…".len());
+        let hostile = AuditEntry {
+            args_summary: args,
+            ..entry("flow.get")
+        };
+        let (line, not_fixed) = render_twice(&hostile, &registry);
+        assert_eq!(not_fixed, None);
+        let value = parsed(&line);
+        let want = format!("{{\"note\":\"{}[redacted]…", "é".repeat(246));
+        assert_eq!(string_at(&value, &["args"]), want);
+    }
+
+    /// Finding 2: the cut before the fragment may land between the backslash of a
+    /// JSON escape and the character it escapes (`\n` is two bytes), which would
+    /// leave a lone backslash in front of the mask. Over every alignment of
+    /// escapes against the cut, for two kinds of escape (`\n`, and `\\`, a
+    /// backslash that is itself escaped, which must not be trimmed when the cut
+    /// falls after it), the field ends with the mask and the marker, the text
+    /// before the mask holds no odd run of backslashes at its end, the field is
+    /// within its cap, and the line is a fixed point.
+    #[test]
+    fn a_cut_before_a_fragment_never_leaves_a_lone_backslash() {
+        let registry = registry_with_the_cut_secret();
+        let mut failures: Vec<String> = Vec::new();
+        for (name, escape) in [("newline", "\\n"), ("backslash", "\\\\")] {
+            for bytes in 6..=12_usize {
+                // One `x` when needed so that the escapes and the fragment fill 512 bytes.
+                let spare = usize::from((503 - bytes) % 2 == 1);
+                let escapes = (503 - bytes - spare) / 2;
+                let args = format!(
+                    "{{\"note\":\"{}{}{}…",
+                    "x".repeat(spare),
+                    escape.repeat(escapes),
+                    fragment(bytes)
+                );
+                assert_eq!(args.len(), 512 + "…".len(), "{name}, {bytes} bytes");
+                let hostile = AuditEntry {
+                    args_summary: args,
+                    ..entry("flow.get")
+                };
+                let (line, not_fixed) = render_twice(&hostile, &registry);
+                failures.extend(not_fixed.map(|why| format!("{name}, {bytes} bytes: {why}")));
+                let value = parsed(&line);
+                let got = string_at(&value, &["args"]);
+                let Some(before) = got.strip_suffix("[redacted]…") else {
+                    failures.push(format!(
+                        "{name}, {bytes} bytes: no mask and marker at the end: {got:?}"
+                    ));
+                    continue;
+                };
+                let run = before.chars().rev().take_while(|c| *c == '\\').count();
+                if run % 2 == 1 {
+                    failures.push(format!(
+                        "{name}, {bytes} bytes: a lone backslash before the mask: {got:?}"
+                    ));
+                }
+                if got.len() > DEFAULT_ARGS_SUMMARY_CAP + "…".len() {
+                    failures.push(format!(
+                        "{name}, {bytes} bytes: {} bytes is over the cap",
+                        got.len()
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} row(s) failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Finding 2: a backslash that is itself escaped (`\\`) before the cut is kept.
+    /// The text before the 9-byte fragment is 503 bytes and ends `\\x`: dropping
+    /// the `x` is all the room the mask needs, and what is left ends in an even
+    /// run, which reads back as one backslash. Trimming it would leave a lone one.
+    #[test]
+    fn an_escaped_backslash_before_the_cut_is_kept() {
+        let registry = registry_with_the_cut_secret();
+        let args = format!("{{\"note\":\"{}\\\\x{}…", "x".repeat(491), fragment(9));
+        assert_eq!(args.len(), 512 + "…".len());
+        let hostile = AuditEntry {
+            args_summary: args,
+            ..entry("flow.get")
+        };
+        let (line, not_fixed) = render_twice(&hostile, &registry);
+        assert_eq!(not_fixed, None);
+        let value = parsed(&line);
+        let want = format!("{{\"note\":\"{}\\\\[redacted]…", "x".repeat(491));
+        assert_eq!(string_at(&value, &["args"]), want);
+    }
+
+    /// Finding 1, end to end: a registered secret with a quote and a backslash
+    /// held in a JSON document, in a document in a document, and in a document in
+    /// a document in a document (the `args` the writer sees holds it escaped once,
+    /// twice, three times over) is masked in the line, and the line's `args` is
+    /// still the JSON it was, with `[redacted]` where the secret was.
+    #[test]
+    fn nested_json_that_holds_a_registered_secret_is_masked_end_to_end() {
+        const SECRET: &str = "CNRY91xAb/c+d=e\"q\\z9";
+        let registry = SecretRegistry::new();
+        registry.register("test.nested", SECRET);
+        let mut failures: Vec<String> = Vec::new();
+        for depth in 1..=3_usize {
+            let mut document = serde_json::json!({ "k": SECRET }).to_string();
+            for _ in 1..depth {
+                document = serde_json::json!({ "body": document }).to_string();
+            }
+            let hostile = AuditEntry {
+                args_summary: document,
+                ..entry("demo.accept")
+            };
+            let (line, not_fixed) = render_twice(&hostile, &registry);
+            failures.extend(not_fixed.map(|why| format!("depth {depth}: {why}")));
+            if line.contains("CNRY91") {
+                failures.push(format!("depth {depth}: the secret is in the line: {line}"));
+            }
+            // Read it back down to the innermost string.
+            let value = parsed(&line);
+            let mut text = string_at(&value, &["args"]).to_string();
+            for _ in 1..depth {
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(inner) => text = inner["body"].as_str().unwrap_or("?").to_string(),
+                    Err(e) => {
+                        failures.push(format!(
+                            "depth {depth}: the args are not JSON ({e}): {text}"
+                        ));
+                        break;
+                    }
+                }
+            }
+            match serde_json::from_str::<Value>(&text) {
+                Ok(inner) if inner["k"] == "[redacted]" => {}
+                other => failures.push(format!("depth {depth}: innermost is {other:?}")),
             }
         }
         assert!(
