@@ -91,8 +91,26 @@ pub(crate) fn same_origin(a: &Url, b: &Url) -> bool {
 /// The request's URL rebuilt from its parts (`path` already carries the
 /// query), run through [`parse_absolute`] so it is normalised and credential-
 /// free like every other URL the lane handles.
+///
+/// A captured authority is `host[:port]` only. It is checked before anything
+/// is composed: an empty one would read as `http:///a`, which the url crate
+/// parses as host `a` (a bogus host that would silently get a site-map node),
+/// and a `/ ? # @` or whitespace inside it would let the path, query or
+/// userinfo masquerade as the host. Either shape yields `None`.
 pub(crate) fn request_url(req: &HttpRequest) -> Option<Url> {
+    if !is_plain_authority(&req.authority) {
+        return None;
+    }
     parse_absolute(&format!("{}://{}{}", req.scheme, req.authority, req.path))
+}
+
+/// Whether `authority` is a bare `host[:port]`: non-empty after trimming and
+/// free of the URL delimiters and whitespace that would end or re-shape it.
+fn is_plain_authority(authority: &str) -> bool {
+    !authority.trim().is_empty()
+        && !authority
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '@') || c.is_whitespace())
 }
 
 /// The visited-set key for a page: its normalised serialisation.
@@ -158,16 +176,48 @@ mod tests {
 
     #[test]
     fn request_url_builds_from_parts() {
-        let req = HttpRequest {
+        assert_eq!(
+            request_url(&req("http", "t:8080", "/a?b=1"))
+                .unwrap()
+                .as_str(),
+            "http://t:8080/a?b=1"
+        );
+    }
+
+    /// A captured authority is `host[:port]` only. An empty one would compose
+    /// to `http:///a`, which the url crate reads as host `a` (a bogus site-map
+    /// node); a delimiter inside it would let the path or query masquerade as
+    /// the host. Both are refused before anything is composed.
+    #[test]
+    fn request_url_refuses_malformed_authority() {
+        assert!(request_url(&req("http", "", "/a")).is_none());
+        assert!(request_url(&req("http", "   ", "/a")).is_none());
+        assert!(request_url(&req("http", "a/b", "/x")).is_none());
+        assert!(request_url(&req("http", "t?x=1", "/")).is_none());
+        assert!(request_url(&req("http", "t#f", "/")).is_none());
+        assert!(request_url(&req("http", "u@t", "/")).is_none());
+        assert!(request_url(&req("http", "t 8080", "/")).is_none());
+        // The well-formed shapes still resolve.
+        assert_eq!(
+            request_url(&req("https", "t", "/")).unwrap().as_str(),
+            "https://t/"
+        );
+        assert_eq!(
+            request_url(&req("http", "t:8080", "/")).unwrap().as_str(),
+            "http://t:8080/"
+        );
+    }
+
+    fn req(scheme: &str, authority: &str, path: &str) -> HttpRequest {
+        HttpRequest {
             method: "GET".into(),
-            scheme: "http".into(),
-            authority: "t:8080".into(),
-            path: "/a?b=1".into(),
+            scheme: scheme.into(),
+            authority: authority.into(),
+            path: path.into(),
             version: HttpVersion::Http11,
             headers: HeaderMap::new(),
             body: Body::Empty,
             timestamp: SystemTime::now(),
-        };
-        assert_eq!(request_url(&req).unwrap().as_str(), "http://t:8080/a?b=1");
+        }
     }
 }
