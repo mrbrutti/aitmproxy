@@ -1669,4 +1669,117 @@ mod tests {
         registry.forget_marker(&job.marker());
         assert!(registry.is_empty());
     }
+
+    /// Tester (stage 5): the budget runs out during the recovery wait. The
+    /// candidate case had two failed probes but **no replay ran** and the
+    /// target was never given the recovery bound, so spec D8.4 / call 14 ("two
+    /// failed liveness probes, reproduced 3 times") and call C27 ("a target
+    /// that never recovers within 10 s") both say this is a `Budget` stop, not
+    /// an `l4-crash`.
+    ///
+    /// BLOCKED (tester finding F1, 2026-11-01): `triage` starts with
+    /// `recovered: false` and returns it unchanged when `await_recovery`
+    /// fails with `Stopped(Budget)`, so `drive` reads `!triage.recovered` as a
+    /// persistent outage and records a crash with `reproduced: (0, 0)`. Red
+    /// until the Coder's fix; the fix task un-ignores it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "BLOCKED: tester finding F1 — a Budget stop inside the recovery wait is recorded as a crash"]
+    async fn budget_exhausted_mid_triage_is_a_stop_not_a_crash() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // 1 baseline + 2 cases + the 2 failed probes = 5; the first recovery
+        // poll is the charge that fails.
+        let job = job.with_budget(5);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        assert_eq!(mock.inject_count(), 5);
+        assert_eq!(job.charged(), 5);
+        assert_eq!(run.cases.len(), 2);
+        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(run.stopped, Some(StopReason::Budget));
+        assert!(
+            run.crash.is_none(),
+            "a budget stop before any replay is not a reproduced crash: {:?}",
+            run.crash
+        );
+        assert_eq!(
+            shared.state.counters(job.job_id()),
+            Some(L4Counters {
+                cases: 2,
+                crashes: 0,
+                liveness_failures: 2,
+                retired_elements: 0,
+            })
+        );
+        assert!(!shared.state.is_retired(job.job_id(), &run.point_id));
+    }
+
+    /// Tester (stage 5): the job deadline passes while the runner is polling
+    /// for recovery. The target was given neither the recovery bound nor a
+    /// replay, so the run must end as a `Deadline` stop with no crash recorded
+    /// (call C27's "did not recover within 10 s" needs the 10 s).
+    ///
+    /// BLOCKED (tester finding F1, 2026-11-01): `await_recovery` answers
+    /// `Ok(false)` when the deadline passes, which `triage` cannot tell from
+    /// "polled ten times, never came back", so the run records a crash and
+    /// never marks the job `Deadline`. Red until the Coder's fix; the fix task
+    /// un-ignores it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "BLOCKED: tester finding F1 — a Deadline during the recovery wait is recorded as a crash"]
+    async fn deadline_during_recovery_wait_is_a_stop_not_a_crash() {
+        let mock = MockBackend::new(MockReply::Echo);
+        // Dead for far longer than the deadline allows, but the recovery bound
+        // (10 polls x (20 ms window + 20 ms gap) = 400 ms) is never reached.
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 1000, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let shared = Arc::new(Shared {
+            guard: Arc::clone(&shared.guard),
+            backend: Arc::clone(&shared.backend),
+            case_store: Arc::clone(&shared.case_store),
+            seed_store: shared.seed_store.clone(),
+            timing: Timing {
+                reply_window: Duration::from_millis(20),
+                liveness_retry: Duration::from_millis(5),
+                replay_spacing: Duration::from_millis(5),
+                recovery_poll: Duration::from_millis(20),
+                recovery_polls: 10,
+                ..Timing::default()
+            },
+            state: Arc::clone(&shared.state),
+        });
+        // Baseline + two cases + two failed probes take about 75 ms; the
+        // deadline lands in the middle of the recovery polls.
+        let job = job.with_deadline(Instant::now() + Duration::from_millis(200));
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let run = runner.run_point().await;
+
+        assert_eq!(run.cases.len(), 2, "{:?}", run.cases);
+        assert_eq!(run.cases[1].liveness, Some((false, false)));
+        assert_eq!(run.stopped, Some(StopReason::Deadline));
+        assert_eq!(
+            shared.state.stopped(job.job_id()),
+            Some(StopReason::Deadline)
+        );
+        assert!(
+            run.crash.is_none(),
+            "a deadline stop during the recovery wait is not a crash: {:?}",
+            run.crash
+        );
+        let counters = shared.state.counters(job.job_id()).expect("counters");
+        assert_eq!(counters.crashes, 0);
+        assert_eq!(counters.retired_elements, 0);
+        assert_eq!(counters.cases, 2);
+        // The ten recovery polls were never completed.
+        assert!(
+            mock.inject_count() < 15,
+            "the deadline cut the recovery polls short: {} injects",
+            mock.inject_count()
+        );
+    }
 }

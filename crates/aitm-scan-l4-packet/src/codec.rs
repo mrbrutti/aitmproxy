@@ -188,4 +188,97 @@ mod tests {
             Err(CodecError::BadChar { .. })
         ));
     }
+
+    /// Tester (stage 5): empty and whitespace-only strings decode to nothing
+    /// (an operator can write `hex: ""` for an empty seed payload), and the
+    /// encoder of nothing is the empty string.
+    #[test]
+    fn empty_and_whitespace_only_inputs_decode_to_nothing() {
+        assert_eq!(hex_decode(""), Ok(Vec::new()));
+        assert_eq!(hex_decode(" \t\r\n"), Ok(Vec::new()));
+        assert_eq!(base64_decode(""), Ok(Vec::new()));
+        assert_eq!(base64_decode("\n \t"), Ok(Vec::new()));
+        assert_eq!(hex_encode(&[]), "");
+    }
+
+    /// Tester (stage 5): a bad character is located by its **byte** offset in
+    /// the original string, whitespace included, and a non-ASCII character is
+    /// reported as the character, not as a byte.
+    #[test]
+    fn hex_locates_bad_characters_by_byte_offset() {
+        assert_eq!(
+            hex_decode("ab\u{e9}"),
+            Err(CodecError::BadChar {
+                offset: 2,
+                ch: '\u{e9}'
+            })
+        );
+        assert_eq!(
+            hex_decode("ab cd 0g"),
+            Err(CodecError::BadChar { offset: 7, ch: 'g' })
+        );
+        assert_eq!(
+            hex_decode("\u{e9}\u{e9}ab"),
+            Err(CodecError::BadChar {
+                offset: 0,
+                ch: '\u{e9}'
+            })
+        );
+        // Whitespace is ignored even between the two nibbles of one byte, and
+        // the odd-length check runs over the digits that remain.
+        assert_eq!(hex_decode("d e a d"), Ok(vec![0xde, 0xad]));
+        assert_eq!(hex_decode("abc "), Err(CodecError::OddLength));
+        assert_eq!(hex_decode("0"), Err(CodecError::OddLength));
+        // A bad character is reported before an odd length.
+        assert_eq!(
+            hex_decode("abz"),
+            Err(CodecError::BadChar { offset: 2, ch: 'z' })
+        );
+        assert_eq!(
+            hex_decode("0x00"),
+            Err(CodecError::BadChar { offset: 1, ch: 'x' })
+        );
+    }
+
+    /// Tester (stage 5): a megabyte of hex round-trips byte for byte.
+    #[test]
+    fn hex_megabyte_round_trips() {
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(1 << 20).collect();
+        let text = hex_encode(&bytes);
+        assert_eq!(text.len(), 2 << 20);
+        assert_eq!(hex_decode(&text), Ok(bytes));
+    }
+
+    /// Tester (stage 5): the padding rules, each as a literal.
+    #[test]
+    fn base64_padding_rules_are_literal() {
+        assert_eq!(base64_decode("AA"), Ok(vec![0]));
+        assert_eq!(base64_decode("AA=="), Ok(vec![0]));
+        assert_eq!(base64_decode("AAA"), Ok(vec![0, 0]));
+        assert_eq!(base64_decode("AAA="), Ok(vec![0, 0]));
+        assert_eq!(base64_decode("AAAA"), Ok(vec![0, 0, 0]));
+        assert_eq!(base64_decode("AAAA\nAAAA"), Ok(vec![0; 6]));
+        assert_eq!(base64_decode("/+8="), Ok(vec![0xff, 0xef]));
+        for bad in ["A", "AAAAA", "AA=", "A===", "AA=A", "=", "==", "AAA=="] {
+            assert_eq!(base64_decode(bad), Err(CodecError::BadPadding), "{bad:?}");
+        }
+        // The URL-safe alphabet is not the standard one.
+        assert_eq!(
+            base64_decode("AA-A"),
+            Err(CodecError::BadChar { offset: 2, ch: '-' })
+        );
+        assert_eq!(
+            base64_decode("AA_A"),
+            Err(CodecError::BadChar { offset: 2, ch: '_' })
+        );
+        assert_eq!(
+            CodecError::BadChar { offset: 2, ch: '-' }.to_string(),
+            "invalid character '-' at offset 2"
+        );
+        assert_eq!(
+            CodecError::OddLength.to_string(),
+            "hex string has an odd number of digits"
+        );
+        assert_eq!(CodecError::BadPadding.to_string(), "invalid base64 padding");
+    }
 }

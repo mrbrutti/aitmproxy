@@ -248,6 +248,47 @@ impl EchoService {
     }
 }
 
+/// Tester (stage 5): the privilege SKIP is printed only for a
+/// `lane_unavailable` refusal; this runs without privilege and without the
+/// opt-in, so the SKIP wording is pinned in every gate run.
+#[test]
+fn skip_or_fail_prints_the_privilege_skip_for_lane_unavailable() {
+    skip_or_fail("lane_unavailable: pcap on lo0: no capture privilege (mock)");
+    skip_or_fail("the engine wrapped it: lane_unavailable: pcap on lo: Operation not permitted");
+}
+
+/// Tester (stage 5): any other refusal — out of scope, an invalid profile, a
+/// guard refusal — fails the live test instead of hiding behind a SKIP.
+#[test]
+#[should_panic(expected = "the live lane refused for a reason other than pcap privilege")]
+fn skip_or_fail_fails_the_test_on_any_other_refusal() {
+    skip_or_fail(
+        "out_of_scope: 127.0.0.1:9/udp: no L4 scope entry with Inject (outbound) and Capture (inbound) covers it",
+    );
+}
+
+#[test]
+#[should_panic(expected = "the live lane refused for a reason other than pcap privilege")]
+fn skip_or_fail_fails_the_test_on_an_unavailable_stop_that_is_not_the_lane_code() {
+    // The runner's `l4 unavailable:` stop reason is not the D3 `lane_unavailable` code.
+    skip_or_fail("l4 unavailable: the send_recv task did not finish");
+}
+
+/// Tester (stage 5): `live_lane` builds a lane exactly when the operator
+/// opted in; without the variable it prints the not-opted-in SKIP and sends
+/// nothing (no privilege is needed to construct a `PcapBackend`).
+#[test]
+fn live_lane_follows_the_opt_in_variable() {
+    let opted_in = std::env::var(OPT_IN).ok().as_deref() == Some("1");
+    let lane = live_lane();
+    assert_eq!(lane.is_some(), opted_in);
+    if let Some((lane, guard)) = lane {
+        assert_eq!(lane.lane(), aitm_scan_model::LaneKind::L4Packet);
+        assert_eq!(guard.list_scope().len(), 2);
+        assert!(guard.self_ports().is_empty());
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs raw pcap privilege; run with AITM_L4_TESTS=1 and -- --ignored"]
 async fn live_closed_udp_port_yields_icmp_3_3() {

@@ -637,6 +637,152 @@ mod tests {
         assert_eq!(mock.inject_count(), 0);
     }
 
+    /// Tester (stage 5): a point one job minted is not hosted for another job
+    /// of the same lane, even one that discovered a target of its own; each
+    /// job's points stay its own, and the refusal names the job.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_point_is_hosted_only_for_the_job_that_minted_it() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let lane = lane_with(Arc::clone(&mock), &["raw"]);
+        let profile_a = l4_profile(vec![udp_target(9)], 10);
+        let job_a = TestJob::new(profile_a.clone());
+        let profile_b = l4_profile(vec![udp_target(10)], 10);
+        let job_b = TestJob::new(profile_b.clone()).with_job_id("scan-b");
+
+        let a = lane
+            .discover(&profile_a.target, job_a.as_ref())
+            .await
+            .expect("job a plans");
+        let b = lane
+            .discover(&profile_b.target, job_b.as_ref())
+            .await
+            .expect("job b plans");
+        assert_eq!(a.points[0].id, "l4:127.0.0.1:9/udp/raw");
+        assert_eq!(b.points[0].id, "l4:127.0.0.1:10/udp/raw");
+
+        let Err(err) = lane.probe_host_for(&a.points[0], Arc::clone(&job_b) as Arc<dyn JobCtx>)
+        else {
+            panic!("job b never minted job a's point");
+        };
+        assert_eq!(
+            err.to_string(),
+            "point l4:127.0.0.1:9/udp/raw was not minted by the packet lane for job scan-b"
+        );
+        let Err(err) = lane.probe_host_for(&b.points[0], Arc::clone(&job_a) as Arc<dyn JobCtx>)
+        else {
+            panic!("job a never minted job b's point");
+        };
+        assert!(err.to_string().contains("for job scan-1a2b3c4d"), "{err}");
+
+        // Each job's own point is hosted, and the two jobs count apart.
+        let host_b = lane
+            .probe_host_for(&b.points[0], Arc::clone(&job_b) as Arc<dyn JobCtx>)
+            .expect("job b hosts its own point");
+        let verdict = lane.checks()[0].run(&b.points[0], host_b.as_ref()).await;
+        assert_eq!(verdict.outcome, Outcome::Clean);
+        assert_eq!(lane.counters("scan-b").map(|c| c.cases), Some(10));
+        assert_eq!(lane.counters(JOB_ID).map(|c| c.cases), Some(0));
+        assert_eq!(mock.inject_count(), 11);
+        assert_eq!(lane.counters("scan-never"), None);
+    }
+
+    /// Tester (stage 5): an IPv6 loopback target runs end to end through the
+    /// mock — the bracketed plan key is matched by `probe_host_for`, the v6
+    /// seed is echoed and correlated, and the counters are exact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ipv6_loopback_end_to_end() {
+        let entry = |direction, capability| L4ScopeEntry {
+            id: L4ScopeId::new(),
+            cidr: IpCidr {
+                addr: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                prefix: 128,
+            },
+            ports: PortRange {
+                lo: 0,
+                hi: u16::MAX,
+            },
+            interface: "*".to_string(),
+            direction,
+            capability,
+            inject_rate: RateCap {
+                pps: 1000,
+                burst: 1000,
+            },
+            source: L4ScopeSource::Config,
+        };
+        let guard = Arc::new(L4Guard::new(&L4Config {
+            enabled: true,
+            scope: vec![
+                entry(L4Direction::Outbound, L4Capability::Inject),
+                entry(L4Direction::Inbound, L4Capability::Capture),
+            ],
+            global_inject_pps: 1000,
+            ..L4Config::default()
+        }));
+        let mock = MockBackend::new(MockReply::Echo);
+        let backend: Arc<dyn CaptureInjectBackend> =
+            Arc::clone(&mock) as Arc<dyn CaptureInjectBackend>;
+        let lane = PacketLane::with_backend(guard, None, backend)
+            .with_timing(fast())
+            .with_default_fields(fields(&["raw"]));
+        let profile = l4_profile(
+            vec![aitm_scan_model::L4TargetSpec {
+                ip: "::1".to_string(),
+                port: 53,
+                proto: aitm_scan_model::L4Transport::Udp,
+                grammar: None,
+            }],
+            10,
+        );
+        let job = TestJob::new(profile.clone());
+
+        let discovery = lane
+            .discover(&profile.target, job.as_ref())
+            .await
+            .expect("::1 plans under a ::1/128 entry");
+        assert_eq!(discovery.points.len(), 1);
+        let point = discovery.points[0].clone();
+        assert_eq!(point.id, "l4:[::1]:53/udp/raw");
+        assert_eq!(point.url.as_deref(), Some("udp://[::1]:53"));
+        let host = lane
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the bracketed key matches its plan");
+
+        let checks = lane.checks();
+        let crash = checks[0].run(&point, host.as_ref()).await;
+        let reaction = checks[1].run(&point, host.as_ref()).await;
+        assert_eq!(crash.outcome, Outcome::Clean, "{}", crash.detail);
+        assert_eq!(reaction.outcome, Outcome::Clean, "{}", reaction.detail);
+        assert_eq!(
+            lane.counters(JOB_ID),
+            Some(L4Counters {
+                cases: 10,
+                crashes: 0,
+                liveness_failures: 0,
+                retired_elements: 0,
+            })
+        );
+        assert_eq!(mock.inject_count(), 11);
+        for frame in mock.injected() {
+            let ends = aitm_proto_l4::craft::PacketSpec::endpoints(&frame);
+            assert_eq!(ends.dst, Some(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+            assert_eq!(ends.dst_port, Some(53));
+        }
+    }
+
+    /// Tester (stage 5): `with_timing` on a handle-less lane keeps refusing,
+    /// and its counters/stats/state are all `None`.
+    #[test]
+    fn handle_less_lane_has_no_state() {
+        let lane = PacketLane::new(None, None).with_timing(fast());
+        assert!(lane.state().is_none());
+        assert_eq!(lane.counters(JOB_ID), None);
+        assert!(lane.stats(JOB_ID).is_none());
+        assert_eq!(lane.checks().len(), 2);
+        let printed = format!("{lane:?}");
+        assert!(printed.contains("inner: None"), "{printed}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dry_run_end_to_end() {
         let mock = MockBackend::new(MockReply::Echo);

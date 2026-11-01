@@ -245,4 +245,191 @@ mod tests {
             assert_eq!(transport_payload(&pkt), None, "{:?}", pkt.bytes);
         }
     }
+
+    /// A hand-written 20-byte IPv4 header `127.0.0.1 -> 127.0.0.1` with the
+    /// given `ihl` nibble, protocol and declared total length; the checksum is
+    /// left zero (the parser does not verify it).
+    fn ipv4_header(ihl: u8, protocol: u8, total_length: u16) -> Vec<u8> {
+        let mut h = vec![0u8; 20];
+        h[0] = 0x40 | (ihl & 0x0f);
+        h[2..4].copy_from_slice(&total_length.to_be_bytes());
+        h[8] = 64;
+        h[9] = protocol;
+        h[12..16].copy_from_slice(&[127, 0, 0, 1]);
+        h[16..20].copy_from_slice(&[127, 0, 0, 1]);
+        h
+    }
+
+    /// Tester (stage 5): hostile reply frames — truncated ICMP, a header
+    /// length that overruns the frame, a total length that lies both ways, an
+    /// Ethernet header over nothing, an AF word over garbage — all read as
+    /// "not decodable", never as a type/code or a payload, and never panic.
+    #[test]
+    fn hostile_frames_yield_none() {
+        // IPv4 says ICMP, but only two ICMP bytes follow (ICMP needs eight).
+        let mut truncated_icmp = ipv4_header(5, 1, 22);
+        truncated_icmp.extend_from_slice(&[3, 3]);
+        // `ihl` 15 claims a 60-byte header over a 20-byte frame.
+        let mut long_ihl = ipv4_header(15, 17, 60);
+        long_ihl.extend_from_slice(&[0u8; 40]);
+        // Total length claims more bytes than the frame carries.
+        let mut long_total = ipv4_header(5, 17, 200);
+        long_total.extend_from_slice(&[0u8; 13]);
+        // Total length claims fewer bytes than a UDP header needs.
+        let mut short_total = ipv4_header(5, 17, 24);
+        short_total
+            .extend_from_slice(&[0x9c, 0x40, 0, 9, 0, 13, 0, 0, b'p', b'r', b'o', b'b', b'e']);
+        // An Ethernet header announcing IPv4 over ten bytes.
+        let mut ether_truncated = vec![0u8; 12];
+        ether_truncated.extend_from_slice(&[0x08, 0x00]);
+        ether_truncated.extend_from_slice(&[0x45; 10]);
+        // The BSD loopback AF word in front of garbage.
+        let mut af_garbage = vec![2u8, 0, 0, 0];
+        af_garbage.extend_from_slice(&[0xff; 30]);
+        // The AF word in front of a truncated IPv4 header.
+        let mut af_truncated = vec![2u8, 0, 0, 0];
+        af_truncated.extend_from_slice(&ipv4_header(5, 17, 33)[..12]);
+        // An IPv4 header alone, protocol UDP, nothing after it.
+        let bare_header = ipv4_header(5, 17, 20);
+
+        for (name, bytes) in [
+            ("truncated icmp", truncated_icmp),
+            ("ihl 15 over 20 bytes", long_ihl),
+            ("total_length > frame", long_total),
+            ("total_length < udp header", short_total),
+            ("ethernet over 10 bytes", ether_truncated),
+            ("af word + garbage", af_garbage),
+            ("af word + truncated ipv4", af_truncated),
+            ("bare ipv4 header, protocol udp", bare_header),
+            ("version nibble 7", vec![0x75; 40]),
+            ("version nibble 0", vec![0x05; 40]),
+        ] {
+            let pkt = captured(bytes);
+            assert_eq!(icmp_error(&pkt), None, "{name}");
+            assert!(!tcp_rst(&pkt), "{name}");
+            assert_eq!(transport_payload(&pkt), None, "{name}");
+        }
+    }
+
+    /// Tester (stage 5): ICMPv6 is documented as `None` in v2 — a real
+    /// `::1` port-unreachable (type 1, code 4) must not be mistaken for an
+    /// IPv4 pair, and it carries no transport payload either.
+    #[test]
+    fn icmpv6_yields_none_in_v2() {
+        let mut bytes = vec![0x60, 0, 0, 0, 0, 8, 58, 64];
+        bytes.extend_from_slice(&[0u8; 15]);
+        bytes.push(1); // src ::1
+        bytes.extend_from_slice(&[0u8; 15]);
+        bytes.push(1); // dst ::1
+        bytes.extend_from_slice(&[1, 4, 0, 0, 0, 0, 0, 0]); // ICMPv6 dst-unreachable / port
+        assert_eq!(bytes.len(), 48);
+        assert_eq!(
+            PacketSpec::summarize(&bytes).layers,
+            vec!["IPv6".to_string(), "ICMPv6".to_string()],
+            "the frame itself decodes as ICMPv6; only the v2 reading is None"
+        );
+
+        let pkt = captured(bytes);
+        assert_eq!(icmp_error(&pkt), None);
+        assert!(!tcp_rst(&pkt));
+        assert_eq!(transport_payload(&pkt), None);
+    }
+
+    /// Tester (stage 5): a zero-length UDP datagram is a decodable packet with
+    /// an empty payload — the shape an echo of an empty seed comes back as.
+    #[test]
+    fn zero_length_udp_has_an_empty_payload() {
+        let bytes = PacketSpec {
+            layers: vec![
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(9),
+                    dst_port: Some(40000),
+                    ..UdpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("craft builds the empty datagram");
+        assert_eq!(bytes.len(), 28);
+
+        let pkt = captured(bytes);
+        assert_eq!(
+            transport_payload(&pkt),
+            Some(TransportPayload {
+                src: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                src_port: 9,
+                dst: IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                dst_port: 40000,
+                proto: L4Proto::Udp,
+                payload: b"",
+            })
+        );
+        assert_eq!(icmp_error(&pkt), None);
+        assert!(!tcp_rst(&pkt));
+        assert_eq!(
+            format!("{:?}", transport_payload(&pkt).expect("decodes")),
+            "TransportPayload { src: 127.0.0.1, src_port: 9, dst: 127.0.0.1, dst_port: 40000, proto: Udp, payload: <0 bytes> }"
+        );
+    }
+
+    /// Tester (stage 5): the loopback AF word in front of a TCP reset and an
+    /// Ethernet header in front of a UDP datagram both decode — the two link
+    /// framings the lane sends on.
+    #[test]
+    fn link_framings_decode_for_every_view() {
+        let rst = PacketSpec {
+            layers: vec![
+                Layer::Raw(vec![2, 0, 0, 0]),
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Tcp(TcpSpec {
+                    src_port: Some(80),
+                    dst_port: Some(40000),
+                    flags: Some(0x14),
+                    ..TcpSpec::default()
+                }),
+            ],
+        }
+        .build()
+        .expect("craft builds the framed reset");
+        let pkt = captured(rst);
+        assert!(tcp_rst(&pkt));
+        assert_eq!(
+            transport_payload(&pkt).map(|t| (t.src_port, t.dst_port, t.payload.len())),
+            Some((80, 40000, 0))
+        );
+
+        let udp = PacketSpec {
+            layers: vec![
+                Layer::Ether(crate::craft::EtherSpec::default()),
+                Layer::Ipv4(Ipv4Spec {
+                    src: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                    ..Ipv4Spec::default()
+                }),
+                Layer::Udp(UdpSpec {
+                    src_port: Some(9),
+                    dst_port: Some(40000),
+                    ..UdpSpec::default()
+                }),
+                Layer::Raw(b"echo".to_vec()),
+            ],
+        }
+        .build()
+        .expect("craft builds the ethernet datagram");
+        let pkt = captured(udp);
+        assert_eq!(icmp_error(&pkt), None);
+        assert_eq!(
+            transport_payload(&pkt).map(|t| t.payload),
+            Some(&b"echo"[..])
+        );
+    }
 }

@@ -442,6 +442,139 @@ mod tests {
         assert_eq!(window.median(), Some(16));
     }
 
+    /// Tester (stage 5): a hostile `Other` reply — empty, truncated, a lying
+    /// length, ICMPv6, an AF word over garbage — classifies as a protocol
+    /// error (the target answered *something*) with the frame's real length,
+    /// never as `icmp(...)`, never as a reset, and never panics.
+    #[test]
+    fn hostile_other_frames_are_protocol_errors() {
+        let mut truncated_icmp = vec![
+            0x45, 0, 0, 22, 0, 0, 0, 0, 64, 1, 0, 0, 127, 0, 0, 1, 127, 0, 0, 1,
+        ];
+        truncated_icmp.extend_from_slice(&[3, 3]);
+        let mut af_garbage = vec![2u8, 0, 0, 0];
+        af_garbage.extend_from_slice(&[0xff; 30]);
+        let mut icmpv6 = vec![0x60, 0, 0, 0, 0, 8, 58, 64];
+        icmpv6.extend_from_slice(&[0u8; 15]);
+        icmpv6.push(1);
+        icmpv6.extend_from_slice(&[0u8; 15]);
+        icmpv6.push(1);
+        icmpv6.extend_from_slice(&[1, 4, 0, 0, 0, 0, 0, 0]);
+
+        for (name, bytes) in [
+            ("empty", Vec::new()),
+            ("one byte", vec![0x45]),
+            ("truncated icmp", truncated_icmp),
+            ("af word + garbage", af_garbage),
+            ("icmpv6 port unreachable", icmpv6),
+            ("all ones", vec![0xff; 1500]),
+        ] {
+            let len = bytes.len();
+            let classified = classify(
+                &SendRecvOutcome::Other(captured(bytes)),
+                Duration::from_millis(3),
+            );
+            assert_eq!(classified.class, CaseClass::ProtocolError, "{name}");
+            assert_eq!(classified.reply_len, len, "{name}");
+            assert_eq!(classified.elapsed_ms, 3, "{name}");
+            assert_eq!(
+                classified.class.oracle(),
+                Some(L4Oracle::ProtocolError),
+                "{name}"
+            );
+            assert!(!classified.class.is_candidate(), "{name}");
+        }
+    }
+
+    /// Tester (stage 5): a zero-length UDP reply is clean when the correlator
+    /// accepted it and a protocol error when it did not; the class comes from
+    /// the outcome variant, the bytes only give the length.
+    #[test]
+    fn zero_length_udp_reply_follows_the_outcome_variant() {
+        let empty = captured(
+            PacketSpec {
+                layers: vec![
+                    Layer::Ipv4(Ipv4Spec {
+                        src: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                        dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                        ..Ipv4Spec::default()
+                    }),
+                    Layer::Udp(UdpSpec {
+                        src_port: Some(9),
+                        dst_port: Some(40000),
+                        ..UdpSpec::default()
+                    }),
+                ],
+            }
+            .build()
+            .expect("craft builds the empty datagram"),
+        );
+        assert_eq!(empty.bytes.len(), 28);
+
+        let clean = classify(&SendRecvOutcome::Response(empty.clone()), Duration::ZERO);
+        assert_eq!(clean.class, CaseClass::Clean);
+        assert_eq!(clean.reply_len, 28);
+        assert_eq!(clean.elapsed_ms, 0);
+
+        let other = classify(&SendRecvOutcome::Other(empty), Duration::ZERO);
+        assert_eq!(other.class, CaseClass::ProtocolError);
+        assert_eq!(other.reply_len, 28);
+    }
+
+    /// Tester (stage 5): an ICMP type/code other than `(3, 3)` is still an
+    /// ICMP reaction with its own label, and `is_outlier` saturates rather than
+    /// overflowing on a huge median.
+    #[test]
+    fn other_icmp_codes_and_saturating_outlier() {
+        let host_unreachable = captured(
+            PacketSpec {
+                layers: vec![
+                    Layer::Ipv4(Ipv4Spec {
+                        src: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                        dst: Some(Ipv4Addr::new(127, 0, 0, 1)),
+                        ..Ipv4Spec::default()
+                    }),
+                    Layer::Icmp(IcmpSpec {
+                        icmp_type: Some(11),
+                        code: Some(0),
+                        rest_of_header: Some(0),
+                        ..IcmpSpec::default()
+                    }),
+                    Layer::Raw(vec![0u8; 28]),
+                ],
+            }
+            .build()
+            .expect("craft builds the time-exceeded frame"),
+        );
+        let classified = classify(
+            &SendRecvOutcome::Other(host_unreachable),
+            Duration::from_millis(1),
+        );
+        assert_eq!(
+            classified.class,
+            CaseClass::Icmp {
+                icmp_type: 11,
+                code: 0
+            }
+        );
+        assert_eq!(classified.class.label(), "icmp(11,0)");
+        assert!(!classified.class.is_candidate());
+
+        let mut window = LatencyWindow::new();
+        for _ in 0..LatencyWindow::MIN_SAMPLES {
+            window.record(u32::MAX);
+        }
+        assert_eq!(window.median(), Some(u32::MAX));
+        assert!(
+            !window.is_outlier(u32::MAX),
+            "median x 5 saturates; nothing exceeds it"
+        );
+        assert!(
+            !LatencyWindow::new().is_outlier(u32::MAX),
+            "an empty window has no outliers"
+        );
+    }
+
     #[test]
     fn liveness_compares_classes() {
         let unreachable = CaseClass::Icmp {

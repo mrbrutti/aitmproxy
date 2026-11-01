@@ -122,4 +122,37 @@ mod tests {
         assert_ne!(a, derive_seed("aitm7f3a", "l4:127.0.0.1:9/udp/ipv4.ttl"));
         assert_ne!(a, derive_seed("aitm7f3b", "l4:127.0.0.1:9/udp/raw"));
     }
+
+    /// Tester (stage 5): `pick` on an empty table is `None`, never a panic,
+    /// and a pick is always one of the items.
+    #[test]
+    fn pick_is_total_and_in_range() {
+        let mut rng = Rng::new(9);
+        assert_eq!(rng.pick::<u8>(&[]), None);
+        let items = [10u8, 20, 30];
+        let mut seen = [false; 3];
+        for _ in 0..300 {
+            let picked = *rng.pick(&items).expect("a non-empty table always picks");
+            let index = items
+                .iter()
+                .position(|item| *item == picked)
+                .expect("the pick is one of the items");
+            seen[index] = true;
+        }
+        assert_eq!(seen, [true, true, true], "300 draws reach every item");
+    }
+
+    /// Tester (stage 5): the `0` separator between marker and point id keeps
+    /// `("ab", "c")` apart from `("a", "bc")`, and the empty pair is defined.
+    #[test]
+    fn derive_seed_separator_prevents_aliasing() {
+        assert_ne!(derive_seed("ab", "c"), derive_seed("a", "bc"));
+        assert_ne!(derive_seed("abc", ""), derive_seed("", "abc"));
+        assert_eq!(derive_seed("", ""), derive_seed("", ""));
+        // The reference splitmix64 sequence continues as published.
+        let mut rng = Rng::new(0);
+        assert_eq!(rng.next_u64(), 0xe220_a839_7b1d_cdaf);
+        assert_eq!(rng.next_u64(), 0x6e78_9e6a_a1b9_65f4);
+        assert_eq!(rng.next_u64(), 0x06c4_5d18_8009_454f);
+    }
 }

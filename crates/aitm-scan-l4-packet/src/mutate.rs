@@ -1326,4 +1326,240 @@ mod tests {
             Err(MutateError::LayerAbsent(FieldPath::Tcp(TcpField::Seq)))
         );
     }
+
+    /// Tester (stage 5): `Mutation::apply` is total over the lane's own
+    /// inputs. Every boundary case of every default field, plus 50 seeded
+    /// random cases per field, applies and builds on every seed shape the lane
+    /// crafts — IPv4 and IPv6, UDP and TCP, BSD-loopback and Ethernet framing,
+    /// an empty, a short and a full-MTU payload. This is the regression net
+    /// over the `craft.rs` verbatim-length fix (dc07f736): before it, the
+    /// `ipv4.ihl`, `ipv4.total_length` and `tcp.data_offset` tables aborted
+    /// the build.
+    #[test]
+    fn every_default_case_applies_on_every_seed_shape() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        use aitm_scan_model::vocab::L4Transport;
+
+        use crate::fields::{default_fields, IpVersion};
+        use crate::plan::{seed_spec, LinkFraming};
+
+        let full_mtu = vec![0x41u8; 1472];
+        let payloads: [&[u8]; 3] = [b"", b"probe", full_mtu.as_slice()];
+        let mut boundary_applied = 0usize;
+        let mut random_applied = 0usize;
+
+        for (ip, local) in [
+            (IpVersion::V4, IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            (IpVersion::V6, IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ] {
+            for transport in [L4Transport::Udp, L4Transport::Tcp] {
+                for framing in [LinkFraming::Null, LinkFraming::Ethernet] {
+                    for payload in payloads {
+                        let shape = format!("{ip:?}/{transport:?}/{framing:?}/{}B", payload.len());
+                        let seed = seed_spec(
+                            framing,
+                            local,
+                            local,
+                            9,
+                            transport,
+                            40000,
+                            payload,
+                            "seed".to_string(),
+                        )
+                        .unwrap_or_else(|err| panic!("{shape}: the seed builds: {err}"));
+                        let link_len = framing.header_len();
+
+                        for field in default_fields(ip, transport) {
+                            if field != FieldPath::Raw {
+                                assert!(
+                                    declared_value(&seed.spec, field, link_len).is_some(),
+                                    "{shape}: {field} has a declared value"
+                                );
+                            }
+                            let table = boundary_cases(field, &seed.spec, link_len, 1472);
+                            if field == FieldPath::Raw {
+                                let expected = match payload.len() {
+                                    // {1,2,16,64,256,1024,1472} x 2 fills; nothing to cut.
+                                    0 => 14,
+                                    // {6,7,10,16,64,256,1024,1472} x 2 + cuts {4,1,0}.
+                                    5 => 19,
+                                    // Nothing longer fits under 1472; cuts {1471,1,0}.
+                                    _ => 3,
+                                };
+                                assert_eq!(table.len(), expected, "{shape}: raw table size");
+                            }
+                            for case in &table {
+                                let mutated = case.apply(&seed.spec, 1472).unwrap_or_else(|err| {
+                                    panic!("{shape}: {} must apply: {err}", case.label())
+                                });
+                                let bytes = mutated.build().unwrap_or_else(|err| {
+                                    panic!("{shape}: {} must build: {err}", case.label())
+                                });
+                                assert!(
+                                    bytes.len() <= link_len + 40 + 20 + 1472,
+                                    "{shape}: {} is {} bytes",
+                                    case.label(),
+                                    bytes.len()
+                                );
+                                assert!(
+                                    payload_of(&mutated).len() <= 1472,
+                                    "{shape}: {} grew the payload past the ceiling",
+                                    case.label()
+                                );
+                                boundary_applied += 1;
+                            }
+
+                            let mut rng = Rng::new(0x7e57_0005);
+                            for _ in 0..50 {
+                                let case = random_case(field, &seed.spec, &mut rng);
+                                let mutated = case.apply(&seed.spec, 1472).unwrap_or_else(|err| {
+                                    panic!("{shape}: random {} must apply: {err}", case.label())
+                                });
+                                assert!(
+                                    mutated.build().is_ok(),
+                                    "{shape}: random {} must build",
+                                    case.label()
+                                );
+                                assert!(payload_of(&mutated).len() <= 1472);
+                                random_applied += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Header tables: v4 71 + udp 21 = 92, v4 + tcp 55 = 126, v6 34 + udp = 55,
+        // v6 + tcp = 89; 362 per framing, x 2 framings x 3 payloads = 2172.
+        // Raw: (14 + 19 + 3) per (ip, transport, framing) = 36 x 8 = 288.
+        assert_eq!(boundary_applied, 2172 + 288);
+        // 50 random cases x (14 + 19 + 9 + 14 = 56 fields) x 2 framings x 3 payloads.
+        assert_eq!(random_applied, 50 * 56 * 2 * 3);
+    }
+
+    /// Tester (stage 5): the declared values the tables bracket are the bytes
+    /// the craft layer really writes, read back through the link header.
+    #[test]
+    fn declared_values_are_read_from_the_built_frame() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        use aitm_scan_model::vocab::L4Transport;
+
+        use crate::fields::{Ipv6Field, TcpField};
+        use crate::plan::{seed_spec, LinkFraming};
+
+        let v4 = seed_spec(
+            LinkFraming::Null,
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            9,
+            L4Transport::Udp,
+            40000,
+            b"probe",
+            "v4".to_string(),
+        )
+        .expect("the v4 seed builds");
+        let at = |field| declared_value(&v4.spec, field, 4);
+        assert_eq!(at(FieldPath::Ipv4(Ipv4Field::Ttl)), Some(64));
+        assert_eq!(at(FieldPath::Ipv4(Ipv4Field::Ihl)), Some(5));
+        assert_eq!(at(FieldPath::Ipv4(Ipv4Field::TotalLength)), Some(33));
+        assert_eq!(at(FieldPath::Ipv4(Ipv4Field::Protocol)), Some(17));
+        assert_eq!(at(FieldPath::Ipv4(Ipv4Field::Flags)), Some(0));
+        assert_eq!(at(FieldPath::Udp(UdpField::SrcPort)), Some(40000));
+        assert_eq!(at(FieldPath::Udp(UdpField::Length)), Some(13));
+        assert_eq!(at(FieldPath::Raw), None);
+        // A link length past the frame reads nothing rather than panicking.
+        assert_eq!(
+            declared_value(&v4.spec, FieldPath::Ipv4(Ipv4Field::Ttl), 4096),
+            None
+        );
+
+        let v6 = seed_spec(
+            LinkFraming::Ethernet,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            443,
+            L4Transport::Tcp,
+            40001,
+            b"probe",
+            "v6".to_string(),
+        )
+        .expect("the v6 seed builds");
+        let at = |field| declared_value(&v6.spec, field, 14);
+        assert_eq!(at(FieldPath::Ipv6(Ipv6Field::HopLimit)), Some(64));
+        assert_eq!(at(FieldPath::Ipv6(Ipv6Field::PayloadLength)), Some(25));
+        assert_eq!(at(FieldPath::Ipv6(Ipv6Field::NextHeader)), Some(6));
+        assert_eq!(at(FieldPath::Ipv6(Ipv6Field::FlowLabel)), Some(0));
+        assert_eq!(at(FieldPath::Tcp(TcpField::SrcPort)), Some(40001));
+        assert_eq!(at(FieldPath::Tcp(TcpField::DataOffset)), Some(5));
+        assert_eq!(at(FieldPath::Tcp(TcpField::Flags)), Some(0x02));
+        assert_eq!(at(FieldPath::Tcp(TcpField::Seq)), Some(0x0000_1000));
+        assert_eq!(at(FieldPath::Ipv4(Ipv4Field::Ttl)), None, "no IPv4 layer");
+    }
+
+    /// Tester (stage 5): a hostile `arg`/`offset` pair never panics a byte
+    /// mutator — every mutator at every extreme on a 1-byte, a 2-byte and a
+    /// full-MTU payload, including offsets past the end and `u64::MAX`.
+    #[test]
+    fn raw_mutators_survive_extreme_offsets_and_args() {
+        let full_mtu = vec![0x5a_u8; 1472];
+        for payload in [&[0x01_u8][..], &[0x01, 0x02], full_mtu.as_slice()] {
+            let seed = udp_seed(payload);
+            for mutator in RawMutator::ALL {
+                for offset in [0usize, 1, 2, payload.len(), usize::MAX] {
+                    for arg in [0u64, 1, 7, 0xffff_ffff, u64::MAX] {
+                        let case = Mutation::Raw {
+                            mutator,
+                            offset,
+                            arg,
+                        };
+                        let mutated = case.apply(&seed, 1472).unwrap_or_else(|err| {
+                            panic!(
+                                "{} on {} bytes must apply: {err}",
+                                case.label(),
+                                payload.len()
+                            )
+                        });
+                        let out = payload_of(&mutated);
+                        assert!(out.len() <= 1472, "{}: {} bytes", case.label(), out.len());
+                        if mutator == RawMutator::LongRun {
+                            assert!(
+                                [256, 1024, 1472].contains(&out.len()),
+                                "{}: a long run is one of the three sizes, got {}",
+                                case.label(),
+                                out.len()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // A `Grow` past the ceiling is clamped to it, and one at or below the
+        // payload's length is a no-op. (`len` is kept bounded here: `apply`
+        // grows to `len` *before* it clamps, so a `usize::MAX` length would
+        // allocate without bound — tester finding F3; the lane's own tables
+        // never emit a length above `max_raw_bytes`.)
+        let seed = udp_seed(b"probe");
+        let grown = Mutation::Grow {
+            len: 100_000,
+            fill: GrowFill::Repeat,
+        }
+        .apply(&seed, 64)
+        .expect("grow applies");
+        assert_eq!(payload_of(&grown).len(), 64);
+        assert_eq!(&payload_of(&grown)[..10], b"probeprobe");
+        let same = Mutation::Grow {
+            len: 5,
+            fill: GrowFill::Zeros,
+        }
+        .apply(&seed, 1472)
+        .expect("grow applies");
+        assert_eq!(payload_of(&same), b"probe".to_vec());
+        // `Truncate` beyond the length keeps everything.
+        let kept = Mutation::Truncate { len: usize::MAX }
+            .apply(&seed, 1472)
+            .expect("truncate applies");
+        assert_eq!(payload_of(&kept), b"probe".to_vec());
+    }
 }

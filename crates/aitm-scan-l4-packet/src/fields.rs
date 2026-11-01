@@ -654,4 +654,163 @@ mod tests {
         assert_eq!(FieldPath::Tcp(TcpField::Seq).class(), FieldClass::U32);
         assert_eq!(FieldPath::Ipv4(Ipv4Field::Dscp).class(), FieldClass::U8);
     }
+
+    /// Tester (stage 5): surrounding whitespace is trimmed; case changes,
+    /// interior whitespace, empty and partial paths are unknown — refused with
+    /// the same `invalid_profile` code, never silently accepted.
+    #[test]
+    fn paths_are_case_sensitive_and_only_trimmed_at_the_ends() {
+        assert_eq!(
+            validate_fields(IpVersion::V4, L4Transport::Udp, &["  raw\t".to_string()]),
+            Ok(vec![FieldPath::Raw])
+        );
+        assert_eq!(
+            validate_fields(
+                IpVersion::V4,
+                L4Transport::Udp,
+                &["\n ipv4.ttl \r\n".to_string()]
+            ),
+            Ok(vec![FieldPath::Ipv4(Ipv4Field::Ttl)])
+        );
+        for p in [
+            "RAW",
+            "Raw",
+            "Ipv4.ttl",
+            "ipv4.TTL",
+            "ipv4 .ttl",
+            "ipv4. ttl",
+            "ipv4..ttl",
+            "",
+            "   ",
+            ".",
+            "ipv4.",
+            ".ttl",
+            "raw.",
+            "udp",
+            "tcp",
+            "ipv4",
+            "ipv4.ttl.extra",
+        ] {
+            let err = validate_fields(IpVersion::V4, L4Transport::Udp, &[p.to_string()])
+                .expect_err("not a field path");
+            assert!(
+                err.starts_with("invalid_profile: unknown field path "),
+                "{p:?}: {err}"
+            );
+            assert!(err.contains(&format!("{:?}", p.trim())), "{p:?}: {err}");
+        }
+        // An upper-cased pin is not recognised as a pin, but it is still
+        // refused rather than fuzzed.
+        assert_eq!(
+            parse_field("IPV4.SRC"),
+            Err(FieldError::Unknown("IPV4.SRC".to_string()))
+        );
+        assert_eq!(
+            parse_field("Dst"),
+            Err(FieldError::Unknown("Dst".to_string()))
+        );
+    }
+
+    /// Tester (stage 5): the `ether.` prefix pins everything under it, and
+    /// nothing that merely resembles it.
+    #[test]
+    fn ether_prefix_pins_everything_beneath_it() {
+        for p in ["ether.", "ether.type", "ether.src.oui", "ether.anything"] {
+            assert_eq!(
+                parse_field(p),
+                Err(FieldError::Pinned(p.to_string())),
+                "{p}"
+            );
+        }
+        for p in ["ether", "ethernet.src", "eth.src", " ether.src"] {
+            assert_eq!(
+                parse_field(p),
+                Err(FieldError::Unknown(p.to_string())),
+                "{p}"
+            );
+        }
+        assert!(super::is_pinned("ether.src"));
+        assert!(!super::is_pinned("ether"));
+        assert_eq!(super::PINNED.len(), 10);
+    }
+
+    /// Tester (stage 5): duplicates collapse after trimming, and the surviving
+    /// order is first-seen.
+    #[test]
+    fn duplicates_collapse_after_trimming() {
+        let requested = [
+            "tcp.flags".to_string(),
+            " raw".to_string(),
+            "raw ".to_string(),
+            "raw".to_string(),
+            "tcp.flags ".to_string(),
+            "tcp.seq".to_string(),
+        ];
+        assert_eq!(
+            validate_fields(IpVersion::V4, L4Transport::Tcp, &requested),
+            Ok(vec![
+                FieldPath::Tcp(TcpField::Flags),
+                FieldPath::Raw,
+                FieldPath::Tcp(TcpField::Seq),
+            ])
+        );
+    }
+
+    /// Tester (stage 5): the three error renderings are literal, so the
+    /// harness and the engine can match them.
+    #[test]
+    fn error_renderings_are_literal() {
+        assert_eq!(
+            FieldError::Pinned("dst".to_string()).to_string(),
+            "invalid_profile: field path \"dst\" is pinned and cannot be fuzzed"
+        );
+        assert_eq!(
+            FieldError::Unknown("ipv4.bogus".to_string()).to_string(),
+            "invalid_profile: unknown field path \"ipv4.bogus\""
+        );
+        assert_eq!(
+            FieldError::NotApplicable {
+                path: "tcp.seq".to_string(),
+                target: "ipv4/udp".to_string(),
+            }
+            .to_string(),
+            "invalid_profile: field path \"tcp.seq\" does not apply to a ipv4/udp target"
+        );
+        assert_eq!(
+            validate_fields(IpVersion::V6, L4Transport::Tcp, &["udp.length".to_string()]),
+            Err(
+                "invalid_profile: field path \"udp.length\" does not apply to a ipv6/tcp target"
+                    .to_string()
+            )
+        );
+    }
+
+    /// Tester (stage 5): every header path of the other IP version and the
+    /// other transport is inapplicable; only `raw` crosses over.
+    #[test]
+    fn every_foreign_header_path_is_inapplicable() {
+        for path in default_fields(IpVersion::V6, L4Transport::Tcp) {
+            let result = validate_fields(IpVersion::V4, L4Transport::Udp, &[path.to_string()]);
+            if path == FieldPath::Raw {
+                assert_eq!(result, Ok(vec![FieldPath::Raw]));
+            } else {
+                let err = result.expect_err("a v6/tcp path on a v4/udp target");
+                assert!(
+                    err.contains("does not apply to a ipv4/udp target"),
+                    "{path}: {err}"
+                );
+                assert!(
+                    err.contains(&format!("{:?}", path.to_string())),
+                    "{path}: {err}"
+                );
+            }
+        }
+        for path in default_fields(IpVersion::V4, L4Transport::Udp) {
+            assert_eq!(
+                path.applies_to(IpVersion::V6, L4Transport::Tcp),
+                path == FieldPath::Raw,
+                "{path}"
+            );
+        }
+    }
 }

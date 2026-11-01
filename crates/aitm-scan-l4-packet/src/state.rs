@@ -870,4 +870,255 @@ mod tests {
         report_counters(&*job, L4Counters::default());
         assert_eq!(job.charged(), 0);
     }
+
+    /// Tester (stage 5): more points than cases still gives every point one
+    /// case until the cap is spent; zero points is read as one.
+    #[test]
+    fn allocation_when_points_outnumber_cases() {
+        let state = LaneState::new();
+        state.begin_job("scan-p", vec![plan_fixture()], points(14), 10, 20, false);
+        assert_eq!(state.allocate_cases("scan-p"), Some(1));
+        for _ in 0..9 {
+            assert_eq!(state.record_case("scan-p", CaseClass::Clean, true), Ok(()));
+        }
+        assert_eq!(state.allocate_cases("scan-p"), Some(1));
+        assert_eq!(state.record_case("scan-p", CaseClass::Clean, true), Ok(()));
+        assert_eq!(state.allocate_cases("scan-p"), Some(0));
+        assert_eq!(state.stats("scan-p").expect("known").points, 14);
+
+        state.begin_job("scan-z", vec![plan_fixture()], Vec::new(), 7, 20, false);
+        assert_eq!(state.allocate_cases("scan-z"), Some(7));
+        assert_eq!(state.stats("scan-z").expect("known").points, 0);
+
+        // A profile asking for zero cases allocates nothing.
+        state.begin_job("scan-0", vec![plan_fixture()], points(3), 0, 20, false);
+        assert_eq!(state.allocate_cases("scan-0"), Some(0));
+    }
+
+    /// Tester (stage 5): at the 5000 ceiling the allocation runs down to zero
+    /// exactly at 5000 sent cases, whatever the profile asked for.
+    #[test]
+    fn ceiling_allocation_is_exhausted_at_5000() {
+        let state = LaneState::new();
+        state.begin_job(
+            "scan-max",
+            vec![plan_fixture()],
+            points(1),
+            u32::MAX,
+            20,
+            false,
+        );
+        assert_eq!(state.allocate_cases("scan-max"), Some(CASES_CEILING));
+        for sent in 0..CASES_CEILING {
+            assert_eq!(
+                state.allocate_cases("scan-max"),
+                Some(CASES_CEILING - sent),
+                "after {sent} cases"
+            );
+            assert_eq!(
+                state.record_case("scan-max", CaseClass::Clean, true),
+                Ok(())
+            );
+        }
+        assert_eq!(state.allocate_cases("scan-max"), Some(0));
+        let stats = state.stats("scan-max").expect("known");
+        assert_eq!(stats.cases_cap, 5000);
+        assert_eq!(stats.l4.cases, 5000);
+        assert_eq!(
+            stats.stopped, None,
+            "the ceiling is not a stop reason; it is an allocation of 0"
+        );
+
+        // Exactly the ceiling is not clamped.
+        state.begin_job(
+            "scan-5000",
+            vec![plan_fixture()],
+            points(1),
+            5000,
+            20,
+            false,
+        );
+        assert_eq!(state.stats("scan-5000").expect("known").cases_cap, 5000);
+        state.begin_job(
+            "scan-5001",
+            vec![plan_fixture()],
+            points(1),
+            5001,
+            20,
+            false,
+        );
+        assert_eq!(state.stats("scan-5001").expect("known").cases_cap, 5000);
+    }
+
+    /// Tester (stage 5): a configured threshold of `0` stops on the first
+    /// silent case rather than never; `1` behaves the same.
+    #[test]
+    fn zero_threshold_stops_on_the_first_silence() {
+        let state = LaneState::new();
+        state.begin_job("scan-0t", vec![plan_fixture()], points(1), 100, 0, false);
+        assert_eq!(
+            state.record_case("scan-0t", CaseClass::Silence, true),
+            Err(StopReason::ConsecutiveTimeouts(1))
+        );
+        state.begin_job("scan-1t", vec![plan_fixture()], points(1), 100, 1, false);
+        assert_eq!(state.record_case("scan-1t", CaseClass::Clean, true), Ok(()));
+        assert_eq!(
+            state.record_case("scan-1t", CaseClass::Silence, true),
+            Err(StopReason::ConsecutiveTimeouts(1))
+        );
+    }
+
+    /// Tester (stage 5): the first stop reason sticks; a later ladder trip
+    /// still reports itself to the caller but cannot rewrite the job's reason.
+    #[test]
+    fn first_stop_reason_wins() {
+        let state = LaneState::new();
+        state.begin_job("scan-s", vec![plan_fixture()], points(1), 100, 2, false);
+        state.mark_stopped("scan-s", StopReason::Budget);
+        state.mark_stopped("scan-s", StopReason::Deadline);
+        assert_eq!(state.stopped("scan-s"), Some(StopReason::Budget));
+
+        assert_eq!(
+            state.record_case("scan-s", CaseClass::Silence, true),
+            Ok(())
+        );
+        assert_eq!(
+            state.record_case("scan-s", CaseClass::Silence, true),
+            Err(StopReason::ConsecutiveTimeouts(2))
+        );
+        assert_eq!(state.stopped("scan-s"), Some(StopReason::Budget));
+        assert_eq!(state.stats("scan-s").expect("known").timeouts, 2);
+    }
+
+    /// Tester (stage 5): re-beginning a known job resets its counters without
+    /// taking a second eviction slot, so it is still the oldest.
+    #[test]
+    fn re_begin_replaces_state_and_keeps_its_slot() {
+        let state = LaneState::new();
+        state.begin_job("j-first", vec![plan_fixture()], points(1), 100, 20, false);
+        for _ in 0..5 {
+            assert_eq!(state.record_case("j-first", CaseClass::Clean, true), Ok(()));
+        }
+        state.record_crash("j-first", "p0");
+        state.begin_job("j-first", vec![plan_fixture()], points(2), 50, 20, true);
+
+        assert_eq!(state.counters("j-first"), Some(L4Counters::default()));
+        assert!(!state.is_retired("j-first", "p0"));
+        assert_eq!(state.dry_run("j-first"), Some(true));
+        assert!(state.point_known("j-first", "p1"));
+
+        for i in 2..=8 {
+            state.begin_job(
+                &format!("j{i}"),
+                vec![plan_fixture()],
+                points(1),
+                100,
+                20,
+                false,
+            );
+        }
+        assert!(state.counters("j-first").is_some(), "eight jobs fit");
+        state.begin_job("j9", vec![plan_fixture()], points(1), 100, 20, false);
+        assert_eq!(
+            state.counters("j-first"),
+            None,
+            "the re-begun job was still the oldest"
+        );
+        assert!(state.counters("j2").is_some());
+    }
+
+    /// Tester (stage 5): every stop reason renders as the literal the engine
+    /// and the harness match on.
+    #[test]
+    fn stop_reason_renderings_are_literal() {
+        assert_eq!(
+            StopReason::ConsecutiveTimeouts(20).to_string(),
+            "consecutive_timeouts: 20 silent cases in a row"
+        );
+        assert_eq!(StopReason::Budget.to_string(), "budget exhausted");
+        assert_eq!(StopReason::Deadline.to_string(), "job deadline passed");
+        assert_eq!(StopReason::Cancelled.to_string(), "job cancelled");
+        assert_eq!(
+            StopReason::GuardRefused("rate".to_string()).to_string(),
+            "guard refused: rate"
+        );
+        assert_eq!(
+            StopReason::Unavailable("no bpf".to_string()).to_string(),
+            "l4 unavailable: no bpf"
+        );
+    }
+
+    /// Tester (stage 5): `CrashRecord` and `PointRun` print bytes as counts,
+    /// never the hex, and a `PointRun` summarises its cases.
+    #[test]
+    fn crash_and_run_debug_hide_hex() {
+        let crash = CrashRecord {
+            case_index: 1,
+            recovered: true,
+            evidence: L4Evidence {
+                sent_hex: "deadbeef".to_string(),
+                seed_id: "127.0.0.1:9/udp#0".to_string(),
+                rng_seed: 7,
+                mutation_chain: vec!["grow:8".to_string()],
+                prior_messages: 0,
+                oracle: aitm_scan_model::L4Oracle::LivenessFailed,
+                liveness_before: true,
+                liveness_after: false,
+                reproduced: (3, 3),
+                scope_entry: "entry".to_string(),
+            },
+        };
+        let printed = format!("{crash:?}");
+        assert!(!printed.contains("deadbeef"), "{printed}");
+        assert!(printed.contains("sent_hex: <4 bytes>"), "{printed}");
+        assert!(printed.contains("reproduced: (3, 3)"), "{printed}");
+
+        let run = PointRun {
+            point_id: "l4:127.0.0.1:9/udp/raw".to_string(),
+            target: "127.0.0.1:9/udp".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 7,
+            dry_run: false,
+            recovery_wait: Duration::from_secs(10),
+            baseline: Some(CaseClass::Clean),
+            cases: vec![case(0, CaseClass::Clean), case(1, CaseClass::Silence)],
+            crash: Some(crash),
+            stopped: None,
+        };
+        let printed = format!("{run:?}");
+        assert!(!printed.contains("deadbeef"), "{printed}");
+        assert!(printed.contains("cases: <2 cases>"), "{printed}");
+        assert_eq!(run.sent_count(), 2);
+        assert_eq!(
+            run.reactions(),
+            Vec::new(),
+            "silence and clean are not reactions"
+        );
+    }
+
+    /// Tester (stage 5): unsent cases never count toward `sent_count`, and an
+    /// outlier is counted from the flag alone.
+    #[test]
+    fn sent_and_outlier_counts_read_the_flags() {
+        let mut unsent = case(0, CaseClass::Clean);
+        unsent.sent = false;
+        unsent.class = None;
+        let mut slow = case(1, CaseClass::Clean);
+        slow.latency_outlier = true;
+        let run = PointRun {
+            point_id: "p".to_string(),
+            target: "t".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 0,
+            dry_run: false,
+            recovery_wait: Duration::ZERO,
+            baseline: None,
+            cases: vec![unsent, slow, case(2, CaseClass::Reset)],
+            crash: None,
+            stopped: None,
+        };
+        assert_eq!(run.sent_count(), 2);
+        assert_eq!(run.outlier_count(), 1);
+        assert_eq!(run.reactions(), vec![(CaseClass::Reset, 1)]);
+    }
 }

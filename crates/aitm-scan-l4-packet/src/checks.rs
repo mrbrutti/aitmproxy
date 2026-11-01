@@ -770,6 +770,185 @@ mod tests {
         assert_eq!(mock.inject_count(), 0);
     }
 
+    /// Tester (stage 5): once the stop ladder tripped on one point, a second
+    /// point of the same job gets the `error`/`tentative` stopped verdict from
+    /// **both** checks, naming the reason, and nothing more goes out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopped_job_is_an_error_verdict_for_an_untouched_point() {
+        let mock = MockBackend::new(MockReply::Silence);
+        let mut profile = l4_profile(vec![udp_target(9)], 50);
+        profile.l4.consecutive_timeouts = 3;
+        let (shared, job, plans, disc) = setup(
+            Arc::clone(&mock),
+            profile,
+            &fields(&["raw", "udp.length"]),
+            1000,
+        );
+        let first = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let second = runner_for(&shared, &job, &plans, &disc.points, "udp.length");
+        let registry = registry_with(&job, &first);
+        registry.register(
+            &job.marker(),
+            second.point().id.as_str(),
+            Arc::clone(&second),
+        );
+
+        let tripped = run_check(&CrashCheck::new(Arc::clone(&registry)), &first).await;
+        // Three silent cases went out; the run has cases, so it is judged, not
+        // reported as stopped: silence alone is never a crash.
+        assert_eq!(tripped.outcome, Outcome::Clean);
+        assert!(
+            tripped
+                .detail
+                .contains("3 cases sent on 127.0.0.1:9/udp field raw; no crash"),
+            "{}",
+            tripped.detail
+        );
+        let injected = mock.inject_count();
+        // Baseline (silent, so silence *is* the baseline), three silent cases,
+        // and one passing liveness probe after each of the first two; the third
+        // case trips the ladder, so no probe follows it.
+        assert_eq!(injected, 1 + 3 + 2);
+
+        let crash = run_check(&CrashCheck::new(Arc::clone(&registry)), &second).await;
+        let reaction = run_check(&ReactionCheck::new(registry), &second).await;
+        for verdict in [&crash, &reaction] {
+            assert_eq!(verdict.outcome, Outcome::Error);
+            assert_eq!(verdict.confidence, Confidence::Tentative);
+            assert_eq!(
+                verdict.detail,
+                "the packet lane stopped before any case on 127.0.0.1:9/udp field udp.length: consecutive_timeouts: 3 silent cases in a row"
+            );
+            assert!(verdict.evidence.l4.is_none());
+            assert!(verdict.evidence.payload.is_none());
+        }
+        assert_eq!(
+            mock.inject_count(),
+            injected,
+            "a stopped job sends nothing more"
+        );
+    }
+
+    /// Tester (stage 5): the three operator-facing detail lines, each as a
+    /// literal over a hand-built run.
+    #[test]
+    fn detail_lines_are_literal() {
+        use crate::oracle::CaseClass;
+        use crate::state::{CaseRecord, CrashRecord, PointRun};
+        use aitm_scan_model::L4Evidence;
+
+        let case = |index: u32, class: CaseClass, hex: &str, outlier: bool| CaseRecord {
+            index,
+            seed_id: "127.0.0.1:9/udp#0".to_string(),
+            chain: vec![format!("case{index}")],
+            sent_hex: hex.to_string(),
+            class: Some(class),
+            sent: true,
+            elapsed_ms: 1,
+            latency_outlier: outlier,
+            liveness: None,
+        };
+        let icmp = CaseClass::Icmp {
+            icmp_type: 3,
+            code: 3,
+        };
+        let long_hex = "ab".repeat(40);
+        let run = PointRun {
+            point_id: "l4:127.0.0.1:9/udp/raw".to_string(),
+            target: "127.0.0.1:9/udp".to_string(),
+            field: FieldPath::Raw,
+            rng_seed: 1,
+            dry_run: false,
+            recovery_wait: Duration::from_secs(10),
+            baseline: Some(CaseClass::Clean),
+            cases: vec![
+                case(0, icmp, &long_hex, false),
+                case(1, CaseClass::Reset, "00", true),
+                case(2, icmp, "01", false),
+                case(3, CaseClass::Clean, "02", true),
+            ],
+            crash: None,
+            stopped: None,
+        };
+        assert_eq!(
+            super::reaction_detail(&run),
+            "l4 reactions on 127.0.0.1:9/udp field raw: icmp(3,3) x 2; reset x 1; latency outliers 2"
+        );
+        assert_eq!(
+            super::dry_run_detail(&run),
+            format!(
+                "dry run: 4 cases rendered for raw; first {}...",
+                "ab".repeat(32)
+            )
+        );
+
+        let evidence = L4Evidence {
+            sent_hex: "deadbeef00000000".to_string(),
+            seed_id: "127.0.0.1:9/udp#0".to_string(),
+            rng_seed: 1,
+            mutation_chain: vec!["grow:8".to_string(), "raw:bit_flip@3".to_string()],
+            prior_messages: 0,
+            oracle: L4Oracle::LivenessFailed,
+            liveness_before: true,
+            liveness_after: false,
+            reproduced: (3, 3),
+            scope_entry: "entry".to_string(),
+        };
+        let recovered = CrashRecord {
+            case_index: 1,
+            recovered: true,
+            evidence: evidence.clone(),
+        };
+        assert_eq!(
+            super::crash_detail(&run, &recovered),
+            "l4 crash on 127.0.0.1:9/udp field raw mutation grow:8;raw:bit_flip@3; reproduced 3/3; liveness before true, after false"
+        );
+        let mut outage_evidence = evidence;
+        outage_evidence.reproduced = (0, 0);
+        let outage = CrashRecord {
+            case_index: 1,
+            recovered: false,
+            evidence: outage_evidence,
+        };
+        assert_eq!(
+            super::crash_detail(&run, &outage),
+            "l4 crash on 127.0.0.1:9/udp field raw mutation grow:8;raw:bit_flip@3; reproduced 0/0; liveness before true, after false; target did not recover within 10s"
+        );
+        let mut fast = run.clone();
+        fast.recovery_wait = Duration::from_millis(100);
+        assert!(
+            super::crash_detail(&fast, &outage).ends_with("; target did not recover within 100ms")
+        );
+        let verdict = super::crash_verdict(&fast, &outage);
+        assert_eq!(
+            verdict.evidence.matched.as_deref(),
+            Some("liveness failed after case; target did not recover within 100ms")
+        );
+        assert_eq!(
+            verdict.evidence.payload.as_deref(),
+            Some("deadbeef00000000")
+        );
+        let verdict = super::crash_verdict(&run, &recovered);
+        assert_eq!(
+            verdict.evidence.matched.as_deref(),
+            Some("liveness failed after case; reproduced 3/3")
+        );
+
+        // A short first case is printed whole, with no ellipsis.
+        let mut short = run;
+        short.cases.truncate(1);
+        short.cases[0].sent_hex = "0102".to_string();
+        assert_eq!(
+            super::dry_run_detail(&short),
+            "dry run: 1 cases rendered for raw; first 0102"
+        );
+        short.cases.clear();
+        assert_eq!(
+            super::dry_run_detail(&short),
+            "dry run: 0 cases rendered for raw; first "
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn order_is_irrelevant() {
         let mock = MockBackend::new(MockReply::Echo);

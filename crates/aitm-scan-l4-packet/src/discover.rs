@@ -1175,4 +1175,286 @@ mod tests {
         probe_privilege(&guard, backend.as_ref(), loopback_interface()).expect("the probe opens");
         assert_eq!(guard.in_flight(), 0);
     }
+
+    /// Tester (stage 5): a seed flow that exists but holds only our own
+    /// injected stimuli, inbound replies or packets to another target is
+    /// `invalid_profile` naming the flow and the target; the same store
+    /// without a profile seed falls through to the default payload.
+    #[test]
+    fn flow_seed_with_no_usable_packet_is_invalid_profile() {
+        let guard = loopback_guard("*", 100);
+        let target = resolve_target(&guard, &udp_target(9)).expect("resolves");
+        let (store, id) = store_with(vec![
+            udp_packet(9, b"ours", L4Direction::Outbound, true),
+            udp_packet(9, b"reply", L4Direction::Inbound, false),
+            udp_packet(10, b"elsewhere", L4Direction::Outbound, false),
+        ]);
+        let uuid = serde_json::to_value(id)
+            .expect("a flow id serialises")
+            .as_str()
+            .expect("as a uuid string")
+            .to_string();
+
+        let options = L4Options {
+            seeds: vec![L4Seed::Flow { flow: flow_ref(id) }],
+            ..L4Options::default()
+        };
+        let err = seed_payloads(
+            &target,
+            &options,
+            Some(&store as &dyn L4FlowStore),
+            "aitm7f3a",
+        )
+        .expect_err("nothing in the flow may seed this target");
+        let DiscoverError::InvalidProfile(message) = &err else {
+            panic!("expected invalid_profile, got {err:?}");
+        };
+        assert_eq!(
+            message,
+            &format!("seed flow {uuid} carries no outbound packet to 127.0.0.1:9/udp")
+        );
+        assert_eq!(err.to_string(), format!("invalid_profile: {message}"));
+
+        // A flow seed with no store at all is refused the same way.
+        let err =
+            seed_payloads(&target, &options, None, "aitm7f3a").expect_err("no store, no flow");
+        assert!(
+            err.to_string().contains("is not a captured L4 flow"),
+            "{err}"
+        );
+
+        let fallback = seed_payloads(
+            &target,
+            &L4Options::default(),
+            Some(&store as &dyn L4FlowStore),
+            "aitm7f3a",
+        )
+        .expect("the default seed");
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].origin, SeedOrigin::Default);
+        assert_eq!(fallback[0].bytes, default_payload("aitm7f3a"));
+    }
+
+    /// Tester (stage 5): an empty or whitespace-only hex seed is an empty
+    /// payload, which still plans — one raw point with an empty example and a
+    /// 28-byte seed datagram (link word + IPv4 + UDP, nothing after).
+    #[test]
+    fn empty_hex_seed_is_an_empty_payload_that_still_plans() {
+        let guard = loopback_guard("*", 100);
+        let backend = MockBackend::new(MockReply::Echo);
+        for hex in ["", " \n\t"] {
+            let mut profile = l4_profile(vec![udp_target(9)], 10);
+            profile.l4.seeds.push(L4Seed::Hex {
+                hex: hex.to_string(),
+            });
+            let (plans, discovery) = discover_all(
+                &guard,
+                backend.as_ref(),
+                None,
+                &profile.target,
+                &profile,
+                &fields(&["raw"]),
+                "aitm7f3a",
+            )
+            .expect("an empty seed plans");
+            assert_eq!(plans[0].seeds.len(), 1, "{hex:?}");
+            assert_eq!(plans[0].seeds[0].bytes, Vec::<u8>::new(), "{hex:?}");
+            assert_eq!(plans[0].seeds[0].origin, SeedOrigin::Profile, "{hex:?}");
+            let seed = plans[0].seed_spec(0).expect("the empty seed builds");
+            assert_eq!(seed.payload_len, 0);
+            assert_eq!(
+                seed.spec.build().expect("builds").len(),
+                plans[0].target.framing.header_len() + 20 + 8
+            );
+            assert_eq!(discovery.points.len(), 1);
+            assert_eq!(discovery.points[0].example.as_deref(), Some(""));
+        }
+    }
+
+    /// Tester (stage 5): the second seed's error is still the first error the
+    /// operator sees, with the codec's own message behind the code.
+    #[test]
+    fn bad_base64_seed_is_invalid_profile_with_the_codec_message() {
+        let guard = loopback_guard("*", 100);
+        let target = resolve_target(&guard, &udp_target(9)).expect("resolves");
+        let options = L4Options {
+            seeds: vec![
+                L4Seed::Hex {
+                    hex: "00".to_string(),
+                },
+                L4Seed::Base64 {
+                    base64: "AA=A".to_string(),
+                },
+            ],
+            ..L4Options::default()
+        };
+        let err = seed_payloads(&target, &options, None, "aitm7f3a").expect_err("bad padding");
+        assert_eq!(
+            err,
+            DiscoverError::InvalidProfile("invalid base64 padding".to_string())
+        );
+        assert_eq!(err.to_string(), "invalid_profile: invalid base64 padding");
+    }
+
+    /// Tester (stage 5): captured packets that do not decode are skipped, not
+    /// seeds and not a panic.
+    #[test]
+    fn undecodable_captured_packets_are_skipped() {
+        let guard = loopback_guard("*", 100);
+        let target = resolve_target(&guard, &udp_target(9)).expect("resolves");
+        let garbage = L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: SystemTime::now(),
+            decoded: PacketSpec::summarize(&[0xff; 7]),
+            bytes: vec![0xff; 7],
+            injected: false,
+        };
+        let empty = L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: SystemTime::now(),
+            decoded: PacketSpec::summarize(&[]),
+            bytes: Vec::new(),
+            injected: false,
+        };
+        let (store, _) = store_with(vec![
+            garbage,
+            empty,
+            udp_packet(9, b"real", L4Direction::Outbound, false),
+        ]);
+        let seeds = seed_payloads(
+            &target,
+            &L4Options::default(),
+            Some(&store as &dyn L4FlowStore),
+            "aitm7f3a",
+        )
+        .expect("captured seeds");
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(seeds[0].bytes, b"real".to_vec());
+        assert_eq!(seeds[0].id, "127.0.0.1:9/udp#0");
+    }
+
+    /// Tester (stage 5): an IPv6 loopback target resolves against a `::1/128`
+    /// entry — local address `::1`, bracketed ids and url, the v6 default
+    /// table — and a v4-only guard refuses it as out of scope.
+    #[test]
+    fn ipv6_loopback_target_resolves_with_a_v6_entry() {
+        let v6 = aitm_scan_model::profile::L4TargetSpec {
+            ip: "::1".to_string(),
+            port: 53,
+            proto: L4Transport::Udp,
+            grammar: None,
+        };
+        let err = resolve_target(&loopback_guard("*", 100), &v6).expect_err("v4 entries only");
+        assert!(matches!(err, DiscoverError::OutOfScope(_)), "{err:?}");
+        assert!(
+            err.to_string().starts_with("out_of_scope: [::1]:53/udp"),
+            "{err}"
+        );
+
+        let guard = guard_over(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128, "*", &BOTH);
+        let resolved = resolve_target(&guard, &v6).expect("::1/128 admits ::1");
+        assert_eq!(resolved.ip, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(resolved.local_ip, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
+        assert_eq!(resolved.interface, loopback_interface());
+        assert_eq!(guard.in_flight(), 0);
+
+        let seeds = seed_payloads(&resolved, &L4Options::default(), None, "aitm7f3a")
+            .expect("default seed");
+        assert_eq!(seeds[0].id, "[::1]:53/udp#0");
+        let plan = TargetPlan {
+            target: resolved,
+            fields: default_fields(IpVersion::V6, L4Transport::Udp),
+            seeds,
+            src_port: 40_000,
+        };
+        assert_eq!(plan.key(), "[::1]:53/udp");
+        let seed = plan.seed_spec(0).expect("the v6 seed builds");
+        assert_eq!(
+            seed.spec.build().expect("builds").len(),
+            plan.target.framing.header_len() + 40 + 8 + 16
+        );
+        let points = points_for(&plan.target, &plan.fields, &seed);
+        assert_eq!(points.len(), 9);
+        assert_eq!(points[0].id, "l4:[::1]:53/udp/ipv6.hop_limit");
+        assert_eq!(points[8].id, "l4:[::1]:53/udp/raw");
+        assert!(points
+            .iter()
+            .all(|p| p.url.as_deref() == Some("udp://[::1]:53")));
+        let example = |name: &str| {
+            points
+                .iter()
+                .find(|p| p.name == name)
+                .and_then(|p| p.example.clone())
+        };
+        assert_eq!(example("ipv6.hop_limit").as_deref(), Some("64"));
+        assert_eq!(example("ipv6.payload_length").as_deref(), Some("24"));
+        assert_eq!(example("ipv6.next_header").as_deref(), Some("17"));
+        assert_eq!(example("udp.length").as_deref(), Some("24"));
+    }
+
+    /// Tester (stage 5): `cidr_contains` at the prefix extremes, in both
+    /// families, and never across families.
+    #[test]
+    fn cidr_contains_edges() {
+        use super::cidr_contains;
+        let v4 = |addr: [u8; 4], prefix: u8| IpCidr {
+            addr: IpAddr::from(addr),
+            prefix,
+        };
+        assert!(cidr_contains(
+            &v4([0, 0, 0, 0], 0),
+            IpAddr::from([203, 0, 113, 7])
+        ));
+        assert!(cidr_contains(
+            &v4([127, 0, 0, 1], 32),
+            IpAddr::from([127, 0, 0, 1])
+        ));
+        assert!(!cidr_contains(
+            &v4([127, 0, 0, 1], 32),
+            IpAddr::from([127, 0, 0, 2])
+        ));
+        assert!(cidr_contains(
+            &v4([127, 0, 0, 0], 8),
+            IpAddr::from([127, 255, 255, 255])
+        ));
+        assert!(!cidr_contains(
+            &v4([127, 0, 0, 0], 8),
+            IpAddr::from([128, 0, 0, 0])
+        ));
+        // A prefix past the width is read as the full width.
+        assert!(cidr_contains(
+            &v4([10, 0, 0, 1], 200),
+            IpAddr::from([10, 0, 0, 1])
+        ));
+        assert!(!cidr_contains(
+            &v4([10, 0, 0, 1], 200),
+            IpAddr::from([10, 0, 0, 2])
+        ));
+        // Never across families, in either direction.
+        assert!(!cidr_contains(
+            &v4([0, 0, 0, 0], 0),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        ));
+        let v6 = IpCidr {
+            addr: IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            prefix: 0,
+        };
+        assert!(cidr_contains(
+            &v6,
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        ));
+        assert!(!cidr_contains(&v6, IpAddr::from([127, 0, 0, 1])));
+        let exact = IpCidr {
+            addr: IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            prefix: 128,
+        };
+        assert!(cidr_contains(
+            &exact,
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        ));
+        assert!(!cidr_contains(
+            &exact,
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        ));
+    }
 }
