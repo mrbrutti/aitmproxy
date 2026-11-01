@@ -320,10 +320,10 @@ fn grammar_for(job: &JobState, dp: &DiscoveredPoint) -> Arc<dyn Grammar> {
     grammar::by_kind(dp.grammar)
 }
 
-/// This point's share of the job's cases (spec S6.2).
-///
-/// `pub` so a test that rebuilds the campaign's deterministic schedule takes
-/// the plan size from the campaign rather than from a copy of this rule.
+/// This point's share of the job's cases (spec S6.2). Reachable for
+/// `tests/campaign.rs`, which rebuilds the deterministic schedule from this
+/// one rule rather than a copy; not part of the public API.
+#[doc(hidden)]
 pub fn cases_planned(profile_cases: u32, points_total: u32, budget_left: u32) -> u32 {
     let capped = profile_cases.min(MAX_CASES_PER_JOB);
     let share = (capped / points_total.max(1)).max(1);
@@ -331,10 +331,10 @@ pub fn cases_planned(profile_cases: u32, points_total: u32, budget_left: u32) ->
 }
 
 /// The other seeds of the same endpoint, which `Crossover*` and `Splice` draw
-/// from (spec S6.4).
-///
-/// `pub` for the same reason as [`cases_planned`]: a schedule built without
-/// the campaign's own donors diverges from it after stage one.
+/// from (spec S6.4). Reachable for `tests/campaign.rs` for the same reason as
+/// [`cases_planned`] — a schedule built without the campaign's own donors
+/// diverges from it after stage one — and not part of the public API.
+#[doc(hidden)]
 pub fn donors_for(job: &JobState, dp: &DiscoveredPoint) -> Vec<Vec<u8>> {
     let mut donors: Vec<Vec<u8>> = Vec::new();
     for other in lock(&job.points).values() {

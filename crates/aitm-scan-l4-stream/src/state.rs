@@ -382,9 +382,11 @@ pub struct JobState {
     /// Why each node's grammar was selected, keyed by node id.
     pub selection: Mutex<HashMap<String, String>>,
     /// Why a profile seed yielded nothing, keyed by node id: one note per
-    /// seed `corpus::seeds_from_profile` skipped. Counts and reasons only —
+    /// seed `corpus::seeds_from_profile` skipped. The profile's seeds are the
+    /// same for every endpoint, so the note list is decoded once and shared
+    /// behind an [`Arc`] rather than held per node. Counts and reasons only —
     /// a note never carries a seed byte (spec S9, C11).
-    pub seed_notes: Mutex<HashMap<String, Vec<String>>>,
+    pub seed_notes: Mutex<HashMap<String, Arc<Vec<String>>>>,
     /// The discovery cache `probe_host_for` reads, keyed by point id.
     pub points: Mutex<HashMap<String, DiscoveredPoint>>,
     /// The grammar each node speaks, keyed by node id. Only the per-endpoint

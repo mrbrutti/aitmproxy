@@ -711,8 +711,7 @@ impl ProbeHost for StreamHost {
         })
     }
 
-    fn probe_raw(&self, req: RawProbe) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
-        let _ = req;
+    fn probe_raw(&self, _req: RawProbe) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
         Box::pin(async {
             Err(anyhow::Error::new(HostError::Unsupported(
                 "probe_raw is not available on the L4 stream lane",

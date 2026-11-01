@@ -208,14 +208,20 @@ impl L4StreamLane {
     /// [`Lane::discover`] without the future: discovery is pure computation
     /// over the profile, the captured flows and the grammars (spec S5.2).
     fn discover_now(&self, target: &ProfileTarget, job: &dyn JobCtx) -> anyhow::Result<Discovery> {
-        if self.guard.is_none() {
-            return Err(anyhow!(L4_DISABLED));
-        }
+        // No early guard check: `authorise_preview` is the one refusal point
+        // for discovery. A disabled lane is refused there, per endpoint, with
+        // the endpoint named and the S9 WARN emitted (spec S5.1, S9).
         let job_state = self.state.job_for(job);
         let mut discovery = Discovery {
             points: Vec::new(),
             nodes: Vec::new(),
         };
+
+        // The profile's seeds are the same for every endpoint, so decode
+        // them once: the notes are held once behind an `Arc` and shared under
+        // each node's id (spec S5.2).
+        let (profile_seeds, profile_notes) = corpus::seeds_from_profile(&job.profile().l4.seeds)?;
+        let profile_notes = Arc::new(profile_notes);
 
         for spec in &target.l4 {
             let ip: IpAddr = spec.ip.parse().map_err(|_| {
@@ -237,8 +243,7 @@ impl L4StreamLane {
             if let Some(store) = self.store.as_deref() {
                 seeds.extend(corpus::seeds_from_store(store, ip, spec.port, spec.proto));
             }
-            let (profile_seeds, seed_notes) = corpus::seeds_from_profile(&job.profile().l4.seeds)?;
-            seeds.extend(profile_seeds);
+            seeds.extend(profile_seeds.iter().cloned());
             dedupe_seeds(&mut seeds);
 
             let selected =
@@ -272,7 +277,7 @@ impl L4StreamLane {
                 reason = %selection,
                 seeds = seeds.len(),
                 seeds_dropped_credential = dropped_credential,
-                seeds_skipped = seed_notes.len(),
+                seeds_skipped = profile_notes.len(),
                 points = points.len(),
                 points_dropped,
                 "l4_stream discover"
@@ -283,8 +288,8 @@ impl L4StreamLane {
             // back the pending stub (spec S5.5).
             lock(&job_state.grammars).insert(node_id.clone(), Arc::clone(&grammar));
             lock(&job_state.selection).insert(node_id.clone(), selection);
-            if !seed_notes.is_empty() {
-                lock(&job_state.seed_notes).insert(node_id.clone(), seed_notes);
+            if !profile_notes.is_empty() {
+                lock(&job_state.seed_notes).insert(node_id.clone(), Arc::clone(&profile_notes));
             }
             {
                 let mut held = lock(&job_state.points);
