@@ -155,13 +155,22 @@ impl AuditLog for FileAuditLog {
     }
 }
 
-/// Route the core F2 audit through the CA plugin's JSONL file machinery (spec
-/// D3a.2): the general command-invocation audit reuses the same append-only,
-/// fail-closed JSONL the CA log uses, so **every** command's [`aitm_core::AuditEntry`]
-/// — the `ca.*` ones among them — is a line of one format, not a second log.
+/// `FileAuditLog` as a core [`aitm_core::AuditSink`]: the per-server tap that
+/// `McpServer::with_durable_audit` takes. Tests use it; the `aitm` binary does
+/// not, it attaches its own durable writer to the shared ring instead. The impl
+/// appends each [`aitm_core::AuditEntry`] as one [`entry_to_jsonl`] line, through
+/// the same append-only `0600` handle the CA records use, to the path this
+/// `FileAuditLog` was built with.
 ///
-/// Durable audit is best-effort: it must never break the command that produced
-/// the entry, so a write failure is logged and the line dropped (the always-on
+/// That path must be the tap's own file. The CA log written by
+/// [`AuditLog::record`] is a separate file in a different shape (the eight-key
+/// [`AuditRecord`], fail-closed through [`AuditLog::open`], appended to and never
+/// rotated or truncated), and these entry lines are not part of it. The `ca.*`
+/// commands show up in the general audit as ordinary entries made by the call
+/// path.
+///
+/// This tap is best-effort: it must never break the command that produced the
+/// entry, so a write failure is logged and the line dropped (the always-on
 /// in-memory ring remains the authoritative live view).
 impl aitm_core::AuditSink for FileAuditLog {
     fn append(&self, entry: aitm_core::AuditEntry) {
@@ -188,13 +197,17 @@ impl aitm_core::AuditSink for FileAuditLog {
     }
 }
 
-/// One core [`aitm_core::AuditEntry`] as a JSON Lines object — the general-audit
-/// format, one shape shared by the in-memory ring's rendering
-/// ([`aitm_core::AuditEntry::to_value`]), the agent stream, and this durable log,
-/// so CA entries are a subset of it. The key set is the same as `to_value`'s:
-/// `at`, `origin`, `client_label`, `connection_id`, `command`, `args`, `result`.
+/// One core [`aitm_core::AuditEntry`] as a JSON Lines object: the one renderer of
+/// a general-audit entry line. The durable writer the `aitm` binary attaches to
+/// the ring calls it for every line it writes (after it has bounded and redacted
+/// the fields), and the per-server tap above calls it too. The shape is shared
+/// with the in-memory ring's rendering ([`aitm_core::AuditEntry::to_value`]) and
+/// the agent stream, and the key set is the same as `to_value`'s: `at`, `origin`,
+/// `client_label`, `connection_id`, `command`, `args`, `result`.
 /// `connection_id` is the server-assigned connection id (a string), or `null`
-/// when the call is not attributable to a streaming connection.
+/// when the call is not attributable to a streaming connection. The CA's own log
+/// ([`AuditRecord`], eight different keys) is a separate file and is not rendered
+/// here.
 pub fn entry_to_jsonl(entry: &aitm_core::AuditEntry) -> String {
     let result = match &entry.result {
         aitm_core::AuditResult::Ok => serde_json::json!("ok"),

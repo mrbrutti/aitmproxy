@@ -106,7 +106,7 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
 }
 
 pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let area = centered(screen, 96, 36);
+    let area = centered(screen, 96, 37);
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     let k = |a: &str, b: &str| key_line(theme, a, b);
     let mut lines = vec![
@@ -136,6 +136,10 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         k(
             "b / l / t",
             "toggle sidebar · layout below/right · auto-select",
+        ),
+        k(
+            "s",
+            "set / restore the system proxy (:sysproxy on|off|status)",
         ),
         k("y / o", "copy URL (OSC 52) · open externally"),
         k(
