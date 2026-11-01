@@ -178,8 +178,9 @@ aitm tui          # or the terminal UI
 aitm              # or headless: proxy plus the stdio MCP server
 ```
 
-`aitm web` prints a one-time `web UI (agent): http://127.0.0.1:8082/#t=…` link on
-stdout; open it in a browser. Nothing is opened for you.
+`aitm web` prints a ready card on stderr whose `Web UI` row is
+`http://127.0.0.1:8082/#t=…` (and an `Operator` row with `&expect=operator` when
+operator access is configured); open it in a browser. Nothing is opened for you.
 
 Point a browser, simulator or client at `127.0.0.1:8080` and flows appear in
 whichever UI you launched. Active tools — replay, `request.send`, the browser,

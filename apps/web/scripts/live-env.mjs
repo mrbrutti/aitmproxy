@@ -131,11 +131,12 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
   const dir = mkdtempSync(join(tmpdir(), 'aitm-live-'));
   const token = 'live-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   // Configuring `mcp.operator_token` (any non-empty secret) ENABLES operator access: the server then
-  // mints a FRESH per-run operator *bridge* token and prints it in its stdout start-up block
-  // (`web::startup_summary`) on the line `  Operator   http://…/#t=<tok>&expect=operator`, next to
-  // the agent `  Web UI     http://…/#t=<tok>` line; the secret itself never appears in a URL/log.
-  // We parse that URL + token below so a script can connect to /bus as a real `Frontend::Operator`
-  // (vs the agent `--token` = Mcp), exactly as the UI opened from that URL does.
+  // mints a FRESH per-run operator *bridge* token and prints it in its ready card on stderr. A spawn
+  // pipe is not a TTY, so the card arrives in the plain `Label: value` form: the row
+  // `Operator: http://…/#t=<tok>&expect=operator`, next to the agent `Web UI: http://…/#t=<tok>`
+  // row; the secret itself never appears in a URL/log. We parse that URL + token below so a script
+  // can connect to /bus as a real `Frontend::Operator` (vs the agent `--token` = Mcp), exactly as
+  // the UI opened from that URL does.
   const operatorSecret = 'opsecret-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
   const pocDir = join(dir, 'poc');
   const pocOut = join(dir, 'poc-out');
@@ -170,20 +171,21 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
   let stderr = '';
   let out = '';
   let operatorUiUrl = null;
-  // The `Operator` line of the stdout start-up block (see the comment above `operatorSecret`).
-  const opMatch = () => out.match(/^\s*Operator\s+(https?:\/\/\S+)/m);
+  // The `Operator` row of the ready card (see the comment above `operatorSecret`): on stderr, in the
+  // plain `Label: value` form, so the match is colon-tolerant and runs over both streams.
+  const opMatch = () => (out + stderr).match(/^\s*Operator:?\s+(https?:\/\/\S+)/m);
   child.stderr.on('data', (d) => {
     stderr += d;
     log(String(d).trimEnd());
   });
   await new Promise((res, rej) => {
-    // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the start-up
-    // block with the `Web UI` and `Operator` URLs on stdout. Resolve once the operator URL is
-    // captured, or on the listening log / the `Web UI` line (operator access not configured).
+    // Readiness: the server logs "web UI listening" via tracing (stderr) and prints the ready
+    // card with the `Web UI` and `Operator` URLs, also on stderr. Resolve once the operator URL is
+    // captured, or on the listening log / the `Web UI` row (operator access not configured).
     const check = () => {
       const m = opMatch();
       if (m) operatorUiUrl = m[1];
-      if (operatorUiUrl || /web UI listening/i.test(stderr) || /^\s*Web UI\s+https?:\/\//m.test(out)) res();
+      if (operatorUiUrl || /web UI listening/i.test(stderr) || /^\s*Web UI:?\s+https?:\/\//m.test(out + stderr)) res();
     };
     child.stdout.on('data', (d) => {
       out += d;
@@ -193,7 +195,8 @@ export async function startAitm({ scope = [], l4 = null, aitmBin = process.env.A
     child.on('exit', (code) => rej(new Error(`aitm exited ${code}\n${stderr}`)));
     setTimeout(() => rej(new Error('aitm did not start in 20 s\n' + stderr)), 20000);
   });
-  // The operator URL println can trail the stderr "listening" log we resolved on; give stdout a beat.
+  // The ready card follows the `binding ports` line on the same stream (stderr), so its `Operator` row
+  // can trail the "listening" log we resolved on; give the card a beat.
   for (let i = 0; i < 20 && !operatorUiUrl; i++) {
     const m = opMatch();
     if (m) operatorUiUrl = m[1];

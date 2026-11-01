@@ -25,7 +25,7 @@ page instead of the UI. Design, degradations and the bus contract are in
 ## Dev loop
 
 1. Build `aitm` (`cargo build -p aitm`) and start it with the UI:
-   `./target/debug/aitm web`. It prints a start-up block on stdout whose
+   `./target/debug/aitm web`. It prints a ready card on stderr whose
    `Web UI` line is `http://127.0.0.1:8082/#t=<token>` (and an `Operator` line
    with `&expect=operator` when operator access is configured). The token is
    the bridge's per-run token; it travels in the URL fragment, which the

@@ -271,7 +271,7 @@ impl RhaiLoader {
     pub fn load_one(&self, entry: &ScriptEntry) -> Result<LoadedScript, ScriptError> {
         let (ast, meta) = self.compile(&entry.path)?;
         self.check_api(&meta)?;
-        tracing::info!(
+        tracing::debug!(
             target: LOADER_TARGET,
             script = %meta.name,
             path = %meta.path.display(),
@@ -758,5 +758,136 @@ fn warn_hook_shapes(script: &str, functions: &[(String, usize)]) {
             ),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt;
+    use std::fs;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
+
+    use aitm_core::{HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber};
+
+    use super::{RhaiLoader, LOADER_TARGET};
+    use crate::config::{RhaiConfig, ScriptEntry};
+    use crate::host_core::{MemoryFindingSink, ScriptServices};
+
+    /// A client that is never reached: this module sends nothing.
+    struct StubClient;
+
+    impl ProxyClient for StubClient {
+        fn send(
+            &self,
+            _req: HttpRequest,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<HttpFlow>> + Send + '_>> {
+            Box::pin(async { anyhow::bail!("stub client") })
+        }
+    }
+
+    /// Every event's `(level, target, message)`, in order. The crate has no
+    /// `tracing-subscriber` dev-dependency, so the capturing subscriber is
+    /// hand-rolled over `tracing::Subscriber`; spans are ignored.
+    struct Recorder {
+        events: Arc<Mutex<Vec<(Level, String, String)>>>,
+    }
+
+    /// Pulls the `message` field out of an event; other fields are ignored.
+    struct MessageVisitor(String);
+
+    impl Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl Subscriber for Recorder {
+        fn enabled(&self, _: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            let meta = event.metadata();
+            self.events.lock().expect("recorder lock").push((
+                *meta.level(),
+                meta.target().to_string(),
+                visitor.0,
+            ));
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    /// Spec D7 "Per-script lines": `loaded script` is a per-script detail for
+    /// the log file, not the terminal, so the loader records it at DEBUG (the
+    /// terminal's `-v` stream and the default file filter sit at INFO).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn loaded_script_is_recorded_at_debug() {
+        let services = ScriptServices {
+            store: Arc::new(MemFlowStore::new()),
+            client: Arc::new(StubClient),
+            browser: None,
+            guard: Arc::new(StdGuard::default()),
+            findings: Arc::new(MemoryFindingSink::new()),
+            rt: tokio::runtime::Handle::current(),
+        };
+        let loader = RhaiLoader::new(RhaiConfig::default(), services).expect("the loader builds");
+        let path = std::env::temp_dir().join(format!(
+            "aitm-loader-debug-level-{}.rhai",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "const NAME = \"debug-level\";\nconst API = \"1\";\nfn on_request(flow) {}\n",
+        )
+        .expect("the temp script is written");
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Recorder {
+            events: Arc::clone(&events),
+        };
+        let loaded = tracing::subscriber::with_default(recorder, || {
+            loader.load_one(&ScriptEntry::new(&path))
+        });
+        let _ = fs::remove_file(&path);
+        loaded.expect("the script loads");
+
+        let events = events.lock().expect("recorder lock");
+        let loaded_line = events
+            .iter()
+            .find(|(_, target, message)| target == LOADER_TARGET && message == "loaded script")
+            .expect("the loader records `loaded script`");
+        assert_eq!(
+            loaded_line.0,
+            Level::DEBUG,
+            "`loaded script` must not reach the INFO stream (spec D7)"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|(level, target, message)| *level == Level::INFO
+                    && target == LOADER_TARGET
+                    && message == "loaded script"),
+            "no INFO `loaded script` line: {events:?}"
+        );
     }
 }
