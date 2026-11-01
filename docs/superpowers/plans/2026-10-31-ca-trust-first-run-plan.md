@@ -118,6 +118,7 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 
 | Date | PR | Reviewer | Finding | Severity | Disposition |
 |---|---|---|---|---|---|
+| 2026-11-01 | A core | C2 note | `Op::delete_copy` returns `Result<Option<String>, TrustError>` (None = gone; Some = both attempts' failure texts), not the `(CmdLine, CmdOutput)` the task sketched, so the replace-path error keeps the SHA-256 attempt's real reason | — | accepted; the `dry_run` param text reads "Never gated by `ca.allow_agent_install`." |
 | 2026-11-01 | D mac | security + quality | needs-admin latch overrides the read-back; step done while state warning | Important | fix task M1 (A) |
 | 2026-11-01 | D mac | security | `changeCATrust` trusts its callers; Status row buttons not gated | Minor | fix task M1 (B) |
 | 2026-11-01 | D mac | security + spec | tripwire: dotted-only rule 2, absent rule-4 file skipped, harness files not denied, self-check proves one rule | Minor / Important (spec) | fix task M1 (J) |
