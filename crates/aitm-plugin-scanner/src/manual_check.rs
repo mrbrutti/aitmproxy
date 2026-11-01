@@ -37,7 +37,7 @@ use aitm_scan_model::{
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{bounded_await, JobBudget, JobClient, ProbeMeter};
-use crate::jobs::{bounded_secs, Engine};
+use crate::jobs::Engine;
 use crate::util;
 use crate::verbs::result_of;
 
@@ -158,11 +158,10 @@ impl Command for ManualCheck {
         // asked about the same `host:port` it will see at request time (the
         // explicit port, else the scheme default): a ported scope entry matches
         // only on port equality, so a bare host would never be admitted by it.
-        let (host_name, port) = util::split_authority(&request.authority);
-        let port = port
-            .or_else(|| util::default_port(&request.scheme))
-            .unwrap_or(0);
-        if !services.guard.in_scope(&format!("{host_name}:{port}")) {
+        if !services
+            .guard
+            .in_scope(&util::guard_authority(&request.scheme, &request.authority))
+        {
             return Err(scan_error(
                 ScanErrorCode::OutOfScope,
                 format!("{origin} is not in the HTTP scope"),
@@ -178,9 +177,7 @@ impl Command for ManualCheck {
         let job_id = util::job_id();
         let profile = manual_profile(&origin, self.engine.cfg.check_timeout_s);
         let cancel = CancellationToken::new();
-        let deadline = Instant::now()
-            .checked_add(bounded_secs(profile.budget.time_s))
-            .unwrap_or_else(|| Instant::now() + std::time::Duration::from_secs(60));
+        let deadline = crate::jobs::deadline_in(profile.budget.time_s);
         let budget = Arc::new(JobBudget::new(
             u64::from(MANUAL_PROBE_BUDGET),
             deadline,
@@ -411,10 +408,7 @@ impl JobCtx for ManualJob {
     }
 
     fn marker(&self) -> String {
-        format!(
-            "aitm{:08x}",
-            self.markers.fetch_add(1, Ordering::SeqCst) & 0xffff_ffff
-        )
+        util::marker(self.markers.fetch_add(1, Ordering::SeqCst))
     }
 }
 

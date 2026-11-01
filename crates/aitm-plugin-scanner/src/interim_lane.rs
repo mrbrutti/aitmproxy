@@ -161,7 +161,11 @@ impl InterimHttpLane {
     ///
     /// Returns why the crawl stopped when the reason is worth saying, so the
     /// caller can log it beside the job; an exhausted graph says nothing.
-    async fn client_crawl(&self, origin: &str, job: &dyn JobCtx) -> Option<&'static str> {
+    async fn client_crawl(
+        &self,
+        origin: &str,
+        job: &dyn JobCtx,
+    ) -> Option<crate::interim_crawl::CrawlStop> {
         let profile = job.profile();
         let browser_crawls =
             job.browser().is_some() && profile.crawl.use_browser != UseBrowser::Never;
@@ -296,7 +300,7 @@ impl Lane for InterimHttpLane {
                     tracing::debug!(
                         job = job.job_id(),
                         origin,
-                        stopped,
+                        stopped = stopped.as_str(),
                         "interim lane: the client crawl stopped early"
                     );
                 }

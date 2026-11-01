@@ -31,8 +31,9 @@ use anyhow::Context;
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
-    scan_error, BySeverity, Confidence, Evidence, InsertionKind, Issue, IssueId, IssueLocation,
-    IssueStatus, IssueTarget, IssuesResult, JobId, L4Transport, LaneKind, ScanErrorCode,
+    scan_error, ByConfidence, BySeverity, Confidence, Evidence, InsertionKind, Issue, IssueId,
+    IssueLocation, IssueStatus, IssueTarget, IssuesResult, JobId, L4Transport, LaneKind,
+    ScanErrorCode,
 };
 
 use crate::util::{issue_id, normalize_origin, origin_key, scan_dir, scrub, wire_token};
@@ -665,6 +666,25 @@ impl IssueStore {
         sorted(&inner, &filter).into_iter().cloned().collect()
     }
 
+    /// One job's issue counters: `(total, by_severity, by_confidence)`.
+    ///
+    /// The worker calls this after **every** scheduled item, so it must not
+    /// do what [`IssueStore::for_job`] does — sort the job's issues and clone
+    /// each one, evidence and all, only to count them (whole-branch quality
+    /// finding). Nothing here allocates per issue.
+    pub fn tally_for_job(&self, job: &str) -> (u64, BySeverity, ByConfidence) {
+        let inner = self.read();
+        let mut total = 0u64;
+        let mut by_severity = BySeverity::default();
+        let mut by_confidence = ByConfidence::default();
+        for issue in inner.issues.values().filter(|i| i.job == job) {
+            total = total.saturating_add(1);
+            by_severity.bump(issue.severity);
+            by_confidence.bump(issue.confidence);
+        }
+        (total, by_severity, by_confidence)
+    }
+
     /// How many issues the store holds.
     pub fn count(&self) -> usize {
         self.read().issues.len()
@@ -946,6 +966,11 @@ fn issue_json(key: Option<&str>, issue: &Issue) -> anyhow::Result<String> {
 
 /// Write `name` under `dir` through a sibling temporary file, so a reader never
 /// sees a half-written issue or index.
+///
+/// Blocking filesystem work, reached from the async job path through
+/// `IssueStore::upsert`, deliberately: one small JSON file per issue upsert,
+/// bounded by the job's `max_issues` ceiling. Accepted with this note rather
+/// than moved to `spawn_blocking` (whole-branch quality finding).
 fn write_atomically(dir: &Path, name: &str, text: &str) -> anyhow::Result<()> {
     let path = dir.join(name);
     let tmp = dir.join(format!("{name}.tmp"));
@@ -1386,6 +1411,37 @@ mod tests {
             .expect("set links");
         assert_eq!(linked.poc_ref.as_deref(), Some("poc-1"));
         assert_eq!(linked.finding_id.as_deref(), Some("finding-1"));
+    }
+
+    /// `tally_for_job` is `for_job` counted without the clone: the same total
+    /// and the same severity/confidence breakdown, for the job asked about and
+    /// no other.
+    #[test]
+    fn tally_for_job_agrees_with_for_job_without_cloning() {
+        let store = graded_store();
+        let mut other = graded("high", Severity::High, "z");
+        other.job = "scan-aaaabbbb".into();
+        store.upsert(other, 40).expect("other job upsert");
+
+        for job in ["scan-01020304", "scan-aaaabbbb", "scan-00000000"] {
+            let listed = store.for_job(job);
+            let (total, by_severity, by_confidence) = store.tally_for_job(job);
+
+            assert_eq!(total, listed.len() as u64, "total for {job}");
+            let mut want_severity = BySeverity::default();
+            let mut want_confidence = ByConfidence::default();
+            for issue in &listed {
+                want_severity.bump(issue.severity);
+                want_confidence.bump(issue.confidence);
+            }
+            assert_eq!(by_severity, want_severity, "by_severity for {job}");
+            assert_eq!(by_confidence, want_confidence, "by_confidence for {job}");
+        }
+
+        let (total, by_severity, _) = store.tally_for_job("scan-01020304");
+        assert_eq!(total, 3, "the graded store holds three issues for this job");
+        assert_eq!(by_severity.high, 1);
+        assert_eq!(store.tally_for_job("scan-00000000").0, 0);
     }
 
     // ---- persistence ------------------------------------------------------

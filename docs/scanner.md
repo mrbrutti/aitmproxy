@@ -28,8 +28,11 @@ profile, resolves the lanes, checks scope and the gates, mints a job id
   `cancelled` or `failed` event, carrying `job`, `kind` (`"scan"`), `event`,
   `seq` (strictly increasing within the job), `ts_ms`, a `JobSummary` and, on an
   `issue` line, an `IssueSummary`. `progress` lines are coalesced to at most
-  **4 per second per job**, so a gap in `seq` is normal and a UI that
-  reconstructs job state from the lines alone will be wrong. Refresh from
+  **4 per second per job**: a coalesced line is never published and never
+  takes a `seq`, so the sequence a subscriber sees stays dense — a gap means
+  the subscriber's own MCP dispatcher skipped a lagged line, not that the
+  engine dropped one. Either way the lines are not a state machine: a UI that
+  reconstructs job state from them alone will be wrong, so refresh from
   `scan.status` and `scan.issues` when a line arrives.
 - **`scan.cancel { job }`** asks a job to stop. It is idempotent, it returns the
   status (`cancelling`, then `cancelled`), and the issues the job already raised
@@ -51,22 +54,41 @@ missing confirmation through the bus `_confirm` handshake below.
 
 ### What runs today
 
-Every lane crate (`aitm-scan-http`, `aitm-scan-ws`, `aitm-scan-l4-packet`,
-`aitm-scan-l4-stream`) is still a skeleton that contributes no lane, and the
-native check slot (`aitm-scan-checks-http`) is still empty. The engine therefore
-falls back to the **interim HTTP lane** built into the scanner plugin, and a
-profile that asks for `ws`, `l4_packet` or `l4_stream` is not refused: those
-lanes are reported in `lanes.skipped` with the reason "lane not available on
-this build", and the job runs the lanes it has. The interim lane carries five
-checks — two active (`xss-reflected`, `open-redirect`) and three passive
-(`reflection`, `security-header`, `cookie-flag`) — and derives query and body
-points from captured requests. Those are check **ids**; the issue **classes**
-they emit are `reflected-xss` and `open-redirect`.
+The **WebSocket lane is wired**: `aitm-scan-ws` contributes a real `ws` lane
+with eight checks, each also reachable by hand as its own `check.<id>` verb
+(`check.cswsh` and seven `check.ws-*`). The HTTP lane crate
+(`aitm-scan-http`) and the native check slot (`aitm-scan-checks-http`) are
+still empty, so the engine falls back to the **interim HTTP lane** built
+into the scanner plugin; `aitm-scan-l4-packet` and `aitm-scan-l4-stream` are
+still skeletons that contribute no lane. A profile that asks for a lane this
+build does not have is not refused: the lane is reported in `lanes.skipped`
+with the reason "lane not available on this build" and the job runs the lanes
+it has. Only when **every** requested lane is missing is the call
+`lane_unavailable`.
 
-Its crawl drives the **embedded browser**, so a real crawl needs a running core
-that has one. With no browser, with `crawl.use_browser: never`, or with
-`crawl.max_pages: 0`, the lane degrades rather than failing: it maps and audits
-what the proxy has already captured for the origin.
+The interim HTTP lane carries five checks — two active (`xss-reflected`,
+`open-redirect`) and three passive (`reflection`, `security-header`,
+`cookie-flag`) — and derives query and body points from captured requests.
+Those are check **ids**; the issue **classes** they emit are `reflected-xss`
+and `open-redirect`.
+
+Its crawl has three modes, and the lane picks one per origin:
+
+- **Browser crawl** when the core has an embedded browser bound and
+  `crawl.use_browser` is not `never`. It runs the page's script, so it is the
+  only mode that reaches a route only JavaScript builds.
+- **Client crawl** when there is no browser, or `crawl.use_browser: never`.
+  The lane fetches pages itself: breadth-first `GET`s of the links it
+  extracts, plus one navigation per `<form>` when `crawl.submit_forms` is set
+  (a GET form becomes a query, a POST form a body). Every fetch goes through
+  the job's own client, so it is paced, scoped and charged to the one job
+  budget like a probe. This is a fallback, not "nothing is fetched".
+- **No crawl at all** when `crawl.max_pages: 0`. That one setting turns every
+  crawl off; the lane maps and audits only what the proxy has already
+  captured for the origin.
+
+(`scan.map` uses the same crawl with `submit_forms` forced off: it never
+submits a form, because a form POST is a write the target did not see coming.)
 
 ## The verbs
 
@@ -254,6 +276,24 @@ naming the key.
 
 Every ceiling key is independent: raising one leaves the other five alone.
 
+**Legacy `scan.discover` budgets.** `ScannerConfig` carries five more fields,
+left over from the Stage 1 crawl that the legacy `scan.discover` /
+`scan.passive` / `scan.report` verbs still run. A v2 job is bounded by its
+profile and by the ceilings above and never reads them.
+
+| Field | Default | What it does |
+|---|---|---|
+| `max_depth` | `3` | Link depth the legacy crawl follows from each seed. |
+| `max_pages` | `200` | Distinct pages the legacy crawl visits. |
+| `request_budget` | `2000` | Requests the whole legacy run may issue. |
+| `time_budget` | `600s` | Wall-clock ceiling for a legacy run. |
+| `per_class_payload_cap` | `25` | Payloads tried per class per insertion point. |
+
+These five are **not** `config.yaml` keys: the `scanner:` section refuses them
+like any other unknown key, and they keep the defaults above. They are listed
+here so the table above can be read as the complete set of keys the file
+accepts.
+
 ```yaml
 scanner:
   allow_agent_active: false
@@ -381,9 +421,15 @@ The class vocabulary is pinned. A UI may key off these tokens:
 | `cors`, `missing-security-headers`, `risky-http-methods` | http |
 | `exposed-path` (one issue per path) | http |
 | `information-disclosure` (generic leaks only) | http |
-| `h2-settings`, `h2-pseudo-header`, `h2-header-crlf`, `h2-smuggling-indicator`, `h2-rapid-reset` | http |
-| `ws-cswsh`, `ws-auth-bypass`, `ws-injection` | ws |
-| `l4-parser-fault`, `l4-crash` | l4_stream, l4_packet |
+| `h2-settings-observe`, `h2-pseudo-header-validation`, `h2-header-crlf-tolerance`, `h2-cl-te-downgrade-indicator`, `h2-rapid-reset-mitigation` | http |
+| `cswsh`, `ws-auth-bypass`, `ws-input-reflection`, `ws-oversize-frame`, `ws-subprotocol` | ws |
+| `l4-protocol-reaction`, `l4-parser-fault`, `l4-crash` | l4_stream, l4_packet |
+
+The h2 tokens are one per observe-only check, spelled exactly as the check id.
+Injection carried over a WebSocket frame reports the **family** token, not a
+`ws-` one: an SQL injection reachable over HTTP and over WS is one `sqli`
+family, so the shipped WS lane's injection checks report `sqli`, `ssti` and
+`cmdi` (`crates/aitm-scan-ws/src/checks/`).
 
 The **technique** a check used (`reflected`, `error`, `boolean`, `timing`,
 `handshake`, `malformed`, `observe`, `passive`) is never part of the class, and
@@ -391,9 +437,12 @@ the dedupe key hashes class + location — so a timing-based and an error-based
 SQL injection at one parameter are one `sqli` issue, while `exposed-path` at
 `/.git/` and at `/.env` are two.
 
-The interim HTTP lane additionally emits `reflection`, `security-header` and
-`cookie-flag`. These three are **interim, removed with T2's integration** — do
-not pin them in a UI.
+Today the only HTTP-lane classes a run actually produces are the interim
+lane's: `reflected-xss` and `open-redirect` from its two active checks, plus
+`reflection`, `security-header` and `cookie-flag` from its passive ones. The
+first two keep their spec tokens when T2's lane crate replaces the interim
+lane; the last three are **interim, removed with T2's integration** — do not
+pin them in a UI. Every other HTTP token above arrives with T3.
 
 ## Writing a check in Rhai
 

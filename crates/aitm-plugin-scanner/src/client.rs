@@ -398,6 +398,19 @@ impl JobClient {
     }
 }
 
+/// The key one host's error ladder lives under: [`util::guard_authority`]'s
+/// `host:port`, always with an explicit port.
+///
+/// Every probe records its outcome under this key and the worker reads the
+/// same key before every scheduled item ([`crate::worker`]'s `host_of_point`).
+/// They were once two spellings — the raw request authority here and
+/// `host:port` there — so a target on a default port tripped the ladder,
+/// refused the rest of its probes, and still ended with no `stopped_reason`
+/// (whole-branch quality finding).
+pub(crate) fn ladder_key(scheme: &str, authority: &str) -> String {
+    crate::util::guard_authority(scheme, authority)
+}
+
 impl ProxyClient for JobClient {
     /// A bare `send` is a **probe**: it goes out with `record: Never` (not
     /// `SendOptions::default()`, whose `Always` would put every probe in the
@@ -425,7 +438,7 @@ impl ProxyClient for JobClient {
         opts: SendOptions,
     ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         Box::pin(async move {
-            let host = req.authority.clone();
+            let host = ladder_key(&req.scheme, &req.authority);
             // A tripped host costs the job nothing more: refused before the
             // budget is charged and before the guard is touched.
             if self.meter.ladder_state(&host) == LadderState::Tripped {
@@ -643,6 +656,13 @@ mod tests {
             metadata: FlowMeta::default(),
             intercept: InterceptState::Observed,
         }
+    }
+
+    /// The ladder key [`req_to`]'s request is recorded under: the probe is
+    /// `https`, so the key the client writes and the worker reads is
+    /// `host:443` ([`ladder_key`]), never the bare host.
+    fn key(host: &str) -> String {
+        ladder_key("https", host)
     }
 
     fn req_to(host: &str) -> HttpRequest {
@@ -890,7 +910,7 @@ mod tests {
         for _ in 0..3 {
             client.send(req_to("ex.test")).await.expect("a 5xx is sent");
         }
-        assert_eq!(meter.ladder_state("ex.test"), LadderState::Tripped);
+        assert_eq!(meter.ladder_state(&key("ex.test")), LadderState::Tripped);
 
         let err = client
             .send(req_to("ex.test"))
@@ -931,13 +951,13 @@ mod tests {
             client.send(req_to("ex.test")).await.expect("probe");
         }
         assert_eq!(
-            meter.ladder_state("ex.test"),
+            meter.ladder_state(&key("ex.test")),
             LadderState::Ok,
             "five failures in ten is not over the 0.5 ratio"
         );
 
         client.send(req_to("ex.test")).await.expect("probe");
-        assert_eq!(meter.ladder_state("ex.test"), LadderState::Tripped);
+        assert_eq!(meter.ladder_state(&key("ex.test")), LadderState::Tripped);
     }
 
     /// Spec D5 "Cancellation": `scan.cancel` ends a probe that is still in
@@ -971,9 +991,10 @@ mod tests {
             .send(req_to("ex.test"))
             .await
             .expect_err("a cancelled job does not finish its probe");
-        assert!(
-            err.to_string().contains("cancelled"),
-            "refusal does not name the cancellation: {err}"
+        assert_eq!(
+            err.downcast_ref::<ProbeRefused>(),
+            Some(&ProbeRefused::Cancelled),
+            "not the typed cancellation refusal: {err}"
         );
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -1046,11 +1067,13 @@ mod tests {
             },
         );
 
-        let err = client.await_end_error(AwaitEnd::Timeout, "ex.test");
+        // `send_opts` hands the ladder key down, so the refusal names the same
+        // `host:port` the ladder is written under.
+        let err = client.await_end_error(AwaitEnd::Timeout, &key("ex.test"));
         assert_eq!(
             err.downcast_ref::<ProbeRefused>(),
             Some(&ProbeRefused::Timeout {
-                host: "ex.test".to_string(),
+                host: key("ex.test"),
                 after: MAX_AWAIT,
             })
         );
@@ -1060,7 +1083,7 @@ mod tests {
         );
         assert_eq!(meter.timeouts.load(Ordering::SeqCst), 1);
         assert_eq!(meter.errors.load(Ordering::SeqCst), 1);
-        assert_eq!(meter.ladder_state("ex.test"), LadderState::Tripped);
+        assert_eq!(meter.ladder_state(&key("ex.test")), LadderState::Tripped);
 
         let cancelled = client.await_end_error(AwaitEnd::Cancelled, "ex.test");
         assert_eq!(
@@ -1202,7 +1225,7 @@ mod tests {
             "one probe, one unit, however many retries"
         );
         assert_eq!(
-            meter.ladder_state("ex.test"),
+            meter.ladder_state(&key("ex.test")),
             LadderState::Ok,
             "being rate limited is not a host failure"
         );
@@ -1234,7 +1257,7 @@ mod tests {
                 .await
                 .expect("a 5xx is an answer");
             assert_eq!(
-                meter.ladder_state("ex.test"),
+                meter.ladder_state(&key("ex.test")),
                 LadderState::Ok,
                 "{} failures of {} is below the sample floor",
                 i + 1,
@@ -1246,14 +1269,14 @@ mod tests {
             .await
             .expect("the tenth answer");
         assert_eq!(
-            meter.ladder_state("ex.test"),
+            meter.ladder_state(&key("ex.test")),
             LadderState::Tripped,
             "ten of ten over 0.5 trips at the floor"
         );
         assert_eq!(stub.calls(), 10);
 
         // The ratio is per host: another host starts clean.
-        assert_eq!(meter.ladder_state("other.test"), LadderState::Ok);
+        assert_eq!(meter.ladder_state(&key("other.test")), LadderState::Ok);
     }
 
     /// A guard refusal other than a rate limit is a typed `ProbeRefused::Guard`
@@ -1292,7 +1315,7 @@ mod tests {
         assert!(err.to_string().contains("out of scope"), "{err}");
         assert_eq!(meter.errors.load(Ordering::SeqCst), 1);
         assert_eq!(
-            meter.ladder_state("ex.test"),
+            meter.ladder_state(&key("ex.test")),
             LadderState::Ok,
             "one failure under lenient rules is not a trip"
         );
@@ -1303,7 +1326,7 @@ mod tests {
             .expect_err("a disabled host is refused");
         assert_eq!(
             err.downcast_ref::<ProbeRefused>(),
-            Some(&ProbeRefused::HostLadder("ex.test".into())),
+            Some(&ProbeRefused::HostLadder(key("ex.test"))),
             "{err}"
         );
         assert_eq!(stub.calls(), 2);

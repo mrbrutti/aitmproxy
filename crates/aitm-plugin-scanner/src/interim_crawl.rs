@@ -96,14 +96,54 @@ impl Navigation {
     }
 }
 
+/// Why a client crawl stopped before the reachable graph was exhausted.
+///
+/// A typed reason rather than a loose string, like the job's own
+/// [`aitm_scan_model::StoppedReason`]: it is only logged today, but a token a
+/// log line carries is still a vocabulary (whole-branch quality finding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrawlStop {
+    /// `crawl.max_pages` pages were fetched.
+    MaxPages,
+    /// Every frontier link left was deeper than `crawl.max_depth`.
+    MaxDepth,
+    /// The job's probe budget could not pay for another page.
+    Budget,
+    /// The job was cancelled mid-crawl.
+    Cancelled,
+    /// The client refused a send (scope, ladder, deadline).
+    Refused,
+    /// The origin is not a URL with a host, so there was nothing to seed from.
+    BadOrigin,
+}
+
+impl CrawlStop {
+    /// The lowercase token the log line carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxPages => "max_pages",
+            Self::MaxDepth => "max_depth",
+            Self::Budget => "budget",
+            Self::Cancelled => "cancelled",
+            Self::Refused => "refused",
+            Self::BadOrigin => "bad_origin",
+        }
+    }
+}
+
+impl std::fmt::Display for CrawlStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a client crawl reached and why it stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientCrawl {
     /// Pages fetched successfully.
     pub pages: u32,
-    /// `"max_pages"`, `"max_depth"`, `"budget"`, `"cancelled"`, `"refused"`,
-    /// `"bad_origin"`, or `None` when the reachable graph was exhausted.
-    pub stopped: Option<&'static str>,
+    /// Why it stopped, or `None` when the reachable graph was exhausted.
+    pub stopped: Option<CrawlStop>,
 }
 
 /// Crawl `origin` breadth-first through the job's client.
@@ -122,7 +162,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
     let Some(seed) = Url::parse(origin).ok().filter(|u| u.has_host()) else {
         return ClientCrawl {
             pages: 0,
-            stopped: Some("bad_origin"),
+            stopped: Some(CrawlStop::BadOrigin),
         };
     };
     // Spec D5 "one budget per job": a page is a stimulus, so the crawl asks
@@ -141,19 +181,23 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
     let mut pages = 0u32;
     let mut attempts = 0u32;
     let mut depth_hit = false;
-    let mut stopped: Option<&'static str> = None;
+    let mut stopped: Option<CrawlStop> = None;
 
     while let Some((nav, depth)) = queue.pop_front() {
         if attempts >= max_pages {
-            stopped = Some(if budget_bound { "budget" } else { "max_pages" });
+            stopped = Some(if budget_bound {
+                CrawlStop::Budget
+            } else {
+                CrawlStop::MaxPages
+            });
             break;
         }
         if job.cancelled() {
-            stopped = Some("cancelled");
+            stopped = Some(CrawlStop::Cancelled);
             break;
         }
         if job.budget_left() == 0 {
-            stopped = Some("budget");
+            stopped = Some(CrawlStop::Budget);
             break;
         }
 
@@ -169,7 +213,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
                 // error ladder speaking: the crawl is over. Any other failure
                 // is one unreachable page.
                 if err.downcast_ref::<ProbeRefused>().is_some() {
-                    stopped = Some("refused");
+                    stopped = Some(CrawlStop::Refused);
                     break;
                 }
                 continue;
@@ -229,7 +273,7 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
 
     ClientCrawl {
         pages,
-        stopped: stopped.or(depth_hit.then_some("max_depth")),
+        stopped: stopped.or(depth_hit.then_some(CrawlStop::MaxDepth)),
     }
 }
 
@@ -313,7 +357,7 @@ fn authority(url: &Url) -> String {
 /// - Comments are not markup, and the text of `<script>` / `<style>` is not
 ///   markup either (their `src` still is).
 pub fn navigations(base: &Url, html: &str, submit_forms: bool) -> Vec<Navigation> {
-    let html = truncate_on_char_boundary(html, MAX_HTML_BYTES);
+    let html = crate::util::truncate_on_char_boundary(html, MAX_HTML_BYTES);
     let mut out: Vec<Navigation> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut i = 0;
@@ -346,7 +390,8 @@ pub fn navigations(base: &Url, html: &str, submit_forms: bool) -> Vec<Navigation
             // Raw text, not markup: skip the content, keep the `src`.
             "script" | "style" => {
                 push(link(base, tag.attr("src")), &mut out);
-                i = find_close_tag(html, &tag.name, tag.end, html.len()).unwrap_or(html.len());
+                i = crate::util::find_close_tag(html, &tag.name, tag.end, html.len())
+                    .unwrap_or(html.len());
             }
             "img" | "iframe" | "frame" | "source" | "embed" | "track" | "audio" | "video"
             | "input" => push(link(base, tag.attr("src")), &mut out),
@@ -405,7 +450,7 @@ fn form(base: &Url, tag: &Tag, html: &str, budget: &mut usize) -> Option<Navigat
 /// budget; each tag parsed here spends one unit of it.
 fn fields(html: &str, from: usize, budget: &mut usize) -> Vec<(String, String)> {
     let next_form = find_open_tag(html, "form", from).unwrap_or(html.len());
-    let end = find_close_tag(html, "form", from, next_form).unwrap_or(next_form);
+    let end = crate::util::find_close_tag(html, "form", from, next_form).unwrap_or(next_form);
     let mut fields: Vec<(String, String)> = Vec::new();
     let mut i = from;
     while fields.len() < MAX_FORM_FIELDS && *budget > 0 {
@@ -610,7 +655,7 @@ fn attributes(html: &str, from: usize) -> (Vec<(String, String)>, usize) {
                 (&html[start..start + len], start + len)
             }
         };
-        push_attr(&mut attrs, name, decode_entities(value));
+        push_attr(&mut attrs, name, crate::util::decode_entities(value));
         i = next;
     }
     (attrs, bytes.len())
@@ -622,27 +667,6 @@ fn push_attr(attrs: &mut Vec<(String, String)>, name: String, value: String) {
         return;
     }
     attrs.push((name, value));
-}
-
-/// The index just past `</tag`, searched case-insensitively in
-/// `html[from..until]`. The bound is what keeps a search linear: a caller
-/// that knows where the element must have ended passes that, never the end
-/// of the document.
-fn find_close_tag(html: &str, tag: &str, from: usize, until: usize) -> Option<usize> {
-    let from = from.min(html.len());
-    let hay = &html.as_bytes()[from..until.clamp(from, html.len())];
-    let tag = tag.as_bytes();
-    let needle_len = tag.len() + 2;
-    if hay.len() < needle_len {
-        return None;
-    }
-    (0..=hay.len() - needle_len)
-        .find(|&i| {
-            hay[i] == b'<'
-                && hay[i + 1] == b'/'
-                && hay[i + 2..i + needle_len].eq_ignore_ascii_case(tag)
-        })
-        .map(|i| from + i + needle_len)
 }
 
 /// The index of the `<` of the next `<tag` opening tag at or after `from`,
@@ -664,35 +688,6 @@ fn find_open_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
                     .is_some_and(u8::is_ascii_alphanumeric)
         })
         .map(|i| from + i)
-}
-
-/// Decode the entities an attribute value commonly carries. `&amp;` is decoded
-/// **last**, so `&amp;lt;` decodes to the text `&lt;` and never to `<`.
-fn decode_entities(value: &str) -> String {
-    if !value.contains('&') {
-        return value.to_string();
-    }
-    value
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&#x27;", "'")
-        .replace("&amp;", "&")
-}
-
-/// The longest prefix of `s` that is at most `max` bytes and ends on a `char`
-/// boundary.
-fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 #[cfg(test)]

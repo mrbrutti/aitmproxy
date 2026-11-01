@@ -26,7 +26,7 @@
 use std::path::Path;
 use std::time::SystemTime;
 
-use aitm_core::{Body, CommandHost, Frontend, HttpFlow, HttpRequest, Value};
+use aitm_core::{Body, CommandHost, HttpFlow, HttpRequest, Value};
 use aitm_findings::{FindingArtifacts, FindingRecord, Reproduction};
 use aitm_poc::{
     Assertion, Poc, PocBuilder, PocInfo, PocRunResult, PocRunner, PocSpec, StdPocBuilder,
@@ -71,9 +71,9 @@ pub struct Reproduced {
     /// Whether the benign control behaved as the hint expected; `None` when the
     /// hint gave no control or the payload was not in the probe request.
     pub control_passed: Option<bool>,
-    /// Why no finding was recorded, when none was. The crate carries no
-    /// `tracing` dependency, so the reason is returned rather than logged (the
-    /// caller logs it with the job's context).
+    /// Why no finding was recorded, when none was. It is returned rather than
+    /// logged here so the caller can log it with the job's context, which this
+    /// module does not have; the worker does exactly that.
     pub note: Option<String>,
 }
 
@@ -330,7 +330,7 @@ fn record_for(
             issue.target.scheme, issue.target.host, issue.target.port, issue.location.path
         ),
         discovered_at: now,
-        origin: frontend_of(&input.started_by.frontend),
+        origin: crate::util::frontend_of_token(&input.started_by.frontend),
         client_label: input.started_by.client_label.clone(),
         poc_ref: poc_ref.to_string(),
         reproduction: Reproduction {
@@ -345,17 +345,6 @@ fn record_for(
         },
         flows: issue.evidence.probe_flows.iter().map(|f| f.0).collect(),
         notes: Some(issue.description.clone()),
-    }
-}
-
-/// The [`Frontend`] behind `StartedBy.frontend` (its lowercase name). An
-/// unknown name reads as [`Frontend::Mcp`], the least-trusted caller class, so
-/// a malformed job record can never upgrade a finding's recorded origin.
-fn frontend_of(name: &str) -> Frontend {
-    match name {
-        "cli" => Frontend::Cli,
-        "operator" => Frontend::Operator,
-        _ => Frontend::Mcp,
     }
 }
 

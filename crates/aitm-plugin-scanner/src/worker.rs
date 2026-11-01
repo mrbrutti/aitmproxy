@@ -139,27 +139,40 @@ impl ProbeHost for ArcHost {
     }
 }
 
+/// Where [`Progress`] reads the time from. The process clock in production;
+/// a test clock a test steps by hand, so the coalescing rule can be checked
+/// without sleeping through it (whole-branch quality finding).
+type ProgressClock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
 /// The push side of one job (spec D3 "Progress push", call B13).
 pub struct Progress {
     bus: Arc<aitm_core::JobBus>,
     job: String,
     seq: AtomicU64,
     last_progress: Mutex<Instant>,
+    now: ProgressClock,
 }
 
 impl Progress {
-    /// A publisher for `job`. The first `progress` line is eligible at once:
-    /// the window starts one interval in the past, so a short job still
-    /// reports before it finishes.
+    /// A publisher for `job`, on the process clock.
     pub fn new(bus: Arc<aitm_core::JobBus>, job: String) -> Self {
-        let start = Instant::now()
+        Self::with_clock(bus, job, Arc::new(Instant::now))
+    }
+
+    /// A publisher reading `now` instead of the process clock.
+    ///
+    /// The first `progress` line is eligible at once: the window starts one
+    /// interval in the past, so a short job still reports before it finishes.
+    pub(crate) fn with_clock(bus: Arc<aitm_core::JobBus>, job: String, now: ProgressClock) -> Self {
+        let start = (now)()
             .checked_sub(MIN_PROGRESS_INTERVAL)
-            .unwrap_or_else(Instant::now);
+            .unwrap_or_else(&*now);
         Self {
             bus,
             job,
             seq: AtomicU64::new(0),
             last_progress: Mutex::new(start),
+            now,
         }
     }
 
@@ -178,11 +191,12 @@ impl Progress {
         issue: Option<aitm_scan_model::IssueSummary>,
     ) -> bool {
         if event == JobEvent::Progress {
+            let now = (self.now)();
             let mut last = self.last_progress.lock().unwrap_or_else(|e| e.into_inner());
-            if last.elapsed() < MIN_PROGRESS_INTERVAL {
+            if now.saturating_duration_since(*last) < MIN_PROGRESS_INTERVAL {
                 return false;
             }
-            *last = Instant::now();
+            *last = now;
         }
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
         let notification = JobNotification {
@@ -200,20 +214,12 @@ impl Progress {
         self.bus.publish(aitm_core::JobEvent {
             job: self.job.clone(),
             kind: JOB_KIND_SCAN.to_string(),
-            event: event_token(event),
+            event: crate::util::wire_token(&event),
             seq,
             payload,
         });
         true
     }
-}
-
-/// The wire token of a push event, as spec D3 names it.
-fn event_token(event: JobEvent) -> String {
-    serde_json::to_value(event)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{event:?}"))
 }
 
 /// The per-job surface a lane sees (spec D5 "Where a probe goes").
@@ -388,10 +394,7 @@ impl JobCtx for JobRuntime {
     }
 
     fn marker(&self) -> String {
-        format!(
-            "aitm{:08x}",
-            self.markers.fetch_add(1, Ordering::SeqCst) & 0xffff_ffff
-        )
+        crate::util::marker(self.markers.fetch_add(1, Ordering::SeqCst))
     }
 
     /// Fold the lane's counters in by **per-field maximum** (call B27), so a
@@ -520,9 +523,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         }
     };
 
-    let deadline = Instant::now()
-        .checked_add(crate::jobs::bounded_secs(profile.budget.time_s))
-        .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+    let deadline = crate::jobs::deadline_in(profile.budget.time_s);
     let budget = Arc::new(JobBudget::new(
         u64::from(profile.budget.probes),
         deadline,
@@ -618,7 +619,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
                 };
                 runtime.set_crawling(false);
                 sync_counters(&status, &meter, &runtime, &engine.issues, &job);
-                finish_terminal(&engine, &status, progress, &job, &started_by, Some(reason));
+                finish_terminal(&engine, &status, progress, &job, Some(reason));
                 return;
             }
         }
@@ -717,7 +718,7 @@ async fn drive(engine: Arc<Engine>, ctx: JobStart, progress: &Progress) {
         (None, true) => Some(StoppedReason::Cancelled),
         (None, false) => None,
     };
-    finish_terminal(&engine, &status, progress, &job, &started_by, reason);
+    finish_terminal(&engine, &status, progress, &job, reason);
 }
 
 /// Everything one phase loop needs, gathered so the per-item code reads as the
@@ -835,7 +836,7 @@ impl RunCtx<'_> {
         };
         let meta = item.check.meta().clone();
         let Some(lane) = self.lanes.iter().find(|l| l.lane() == point.lane) else {
-            self.item_done(item.point, owed, &meta.id);
+            self.item_done(item.point, owed);
             return;
         };
         // Whatever this item charges belongs to this lane (spec D5,
@@ -846,18 +847,15 @@ impl RunCtx<'_> {
             Ok(host) => ArcHost(Arc::from(host)),
             Err(e) => {
                 self.note_lane_text(&e.to_string());
-                self.item_done(item.point, owed, &meta.id);
+                self.item_done(item.point, owed);
                 return;
             }
         };
 
         self.running_push(&meta.id);
-        let check_deadline = Instant::now()
-            .checked_add(crate::jobs::bounded_secs(
-                self.profile.budget.check_timeout_s,
-            ))
-            .unwrap_or(self.budget.deadline)
-            .min(self.budget.deadline);
+        // Never past the job's own deadline: one check may not outlast it.
+        let check_deadline =
+            crate::jobs::deadline_in(self.profile.budget.check_timeout_s).min(self.budget.deadline);
         // A check that panics is one `error` verdict, not a dead job: the
         // item is still accounted for and the next one runs.
         let verdict = AssertUnwindSafe(bounded_await(
@@ -868,13 +866,28 @@ impl RunCtx<'_> {
         .catch_unwind()
         .await;
         self.running_pop(&meta.id);
-        self.item_done(item.point, owed, &meta.id);
+        self.item_done(item.point, owed);
 
         let verdict = match verdict {
             Ok(Ok(verdict)) => verdict,
             // A check that did not finish is not a verdict: the job's own
-            // counters already recorded the time or the cancellation.
-            Ok(Err(_)) => return,
+            // counters already recorded its deadline or its cancellation.
+            // Its *own* `check_timeout_s` is not recorded anywhere else
+            // though — `probes.timeouts` counts probes, not checks — so it is
+            // logged with the check id rather than vanishing (whole-branch
+            // quality finding).
+            Ok(Err(end)) => {
+                if end == crate::client::AwaitEnd::Timeout {
+                    tracing::debug!(
+                        target: "aitm::scanner",
+                        job = %self.job,
+                        check = %meta.id,
+                        timeout_s = self.profile.budget.check_timeout_s,
+                        "the check hit its own timeout and reported no verdict",
+                    );
+                }
+                return;
+            }
             Err(payload) => {
                 let detail = format!("the check panicked: {}", panic_text(payload.as_ref()));
                 tracing::warn!(target: "aitm::scanner", job = %self.job, check = %meta.id, "{detail}");
@@ -1000,6 +1013,10 @@ impl RunCtx<'_> {
             return;
         };
         let out_dir = util::scan_dir(&findings_dir, "pocs");
+        // Blocking filesystem work on the async job path, deliberately: one
+        // small PoC file per *issue*, not per probe, and the write is already
+        // bounded by the issue ceiling. Accepted with this note rather than
+        // moved to `spawn_blocking` (whole-branch quality finding).
         if let Err(e) = std::fs::create_dir_all(&out_dir) {
             tracing::warn!(target: "aitm::scanner", job = %self.job, "no reproduction: {e}");
             return;
@@ -1015,7 +1032,7 @@ impl RunCtx<'_> {
             None,
         )
         .with_config(Arc::clone(self.config))
-        .with_frontend(frontend_of(&self.started_by.frontend))
+        .with_frontend(crate::util::frontend_of_token(&self.started_by.frontend))
         .with_poc_dir(Some(out_dir.clone()));
         let host = match self.started_by.client_label.as_deref() {
             Some(label) => host.with_client_label(label),
@@ -1090,12 +1107,7 @@ impl RunCtx<'_> {
 
     /// One item finished: the check counter rises, and the point's counter
     /// rises with the last item that named it.
-    fn item_done(
-        &self,
-        point: usize,
-        owed: &mut std::collections::HashMap<usize, usize>,
-        _check: &str,
-    ) {
+    fn item_done(&self, point: usize, owed: &mut std::collections::HashMap<usize, usize>) {
         let last = match owed.get_mut(&point) {
             Some(left) => {
                 *left = left.saturating_sub(1);
@@ -1190,7 +1202,7 @@ fn parts_of(point: &InsertionPoint) -> (String, String, u16, String) {
         return fallback;
     };
     let scheme = parsed.scheme().to_string();
-    let default_port = if scheme == "https" { 443 } else { 80 };
+    let default_port = crate::util::default_port(&scheme).unwrap_or(80);
     (
         scheme,
         parsed.host_str().unwrap_or_default().to_string(),
@@ -1199,22 +1211,18 @@ fn parts_of(point: &InsertionPoint) -> (String, String, u16, String) {
     )
 }
 
-/// The host a point's probes go to, for the per-host error ladder.
+/// The key a point's host is laddered under, or empty when the point carries
+/// no usable URL.
+///
+/// It is [`crate::client::ladder_key`] and nothing else: the client writes the
+/// ladder under that key on every probe, so reading it under any other
+/// spelling is reading an empty ladder (whole-branch quality finding).
 fn host_of_point(point: &InsertionPoint) -> String {
-    let (_, host, port, _) = parts_of(point);
+    let (scheme, host, port, _) = parts_of(point);
     if host.is_empty() {
         return String::new();
     }
-    format!("{host}:{port}")
-}
-
-/// The frontend a `started_by` token names, defaulting to the gated posture.
-fn frontend_of(token: &str) -> aitm_core::Frontend {
-    match token {
-        "cli" => aitm_core::Frontend::Cli,
-        "operator" => aitm_core::Frontend::Operator,
-        _ => aitm_core::Frontend::Mcp,
-    }
+    crate::client::ladder_key(&scheme, &format!("{host}:{port}"))
 }
 
 /// Pick the session to reuse, when the profile asked for one (spec D7).
@@ -1294,7 +1302,7 @@ fn sync_counters(
     issues: &IssueStore,
     job: &str,
 ) {
-    let found = issues.for_job(job);
+    let (issues_total, by_severity, by_confidence) = issues.tally_for_job(job);
     let charges = runtime.charges_by_lane();
     let sent = meter.sent.load(Ordering::SeqCst);
     let mut guarded = status.write().unwrap_or_else(|e| e.into_inner());
@@ -1324,13 +1332,7 @@ fn sync_counters(
         &mut guarded.probes.rate_waits,
         meter.rate_waits.load(Ordering::SeqCst),
     );
-    raise(&mut guarded.issues.total, found.len() as u64);
-    let mut by_severity = aitm_scan_model::BySeverity::default();
-    let mut by_confidence = aitm_scan_model::ByConfidence::default();
-    for issue in &found {
-        by_severity.bump(issue.severity);
-        by_confidence.bump(issue.confidence);
-    }
+    raise(&mut guarded.issues.total, issues_total);
     guarded.issues.by_severity = by_severity;
     guarded.issues.by_confidence = by_confidence;
 }
@@ -1385,7 +1387,6 @@ fn finish_terminal(
     status: &Arc<RwLock<JobStatus>>,
     progress: &Progress,
     job: &str,
-    _started_by: &aitm_scan_model::StartedBy,
     reason: Option<StoppedReason>,
 ) {
     // A job somebody (or a policy) stopped is `cancelled`; a job that ran out
@@ -1434,6 +1435,10 @@ fn persist(engine: &Arc<Engine>, status: &JobStatus, job: &str) {
         return;
     };
     let jobs_dir = util::scan_dir(dir, "jobs");
+    // Blocking filesystem work on the async job path, deliberately: one small
+    // JSON file, written once per job on the terminal path, where nothing is
+    // waiting on the task. Accepted with this note rather than moved to
+    // `spawn_blocking` (whole-branch quality finding).
     if let Err(e) = std::fs::create_dir_all(&jobs_dir) {
         tracing::warn!(target: "aitm::scanner", job = %job, "the job was not persisted: {e}");
         return;
@@ -1562,6 +1567,54 @@ mod tests {
         assert_eq!(again.state, JobState::Cancelled);
     }
 
+    /// Spec D5 / call B15: a host whose answers are all unusable trips the
+    /// per-host error ladder, and the job ends `done` with
+    /// `stopped_reason: errors`.
+    ///
+    /// Whole-branch quality finding: the ladder was keyed two ways — the
+    /// client recorded under the raw request authority (`scan.test`) and
+    /// `stop_now` read `host_of_point`'s `host:port` (`scan.test:80`) — so for
+    /// a point whose URL carries **no explicit port** (every ordinary target;
+    /// `FakeLane::http` points are `http://scan.test/search`) the two never
+    /// met and the reason was never reported. Both sides now go through
+    /// `client::ladder_key`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_all_erroring_host_stops_the_job_with_stopped_reason_errors() {
+        let h = Harness::new()
+            .answering(500)
+            .with_lane(FakeLane::http().with_check(FakeCheck::new(
+                "fake.probe",
+                "demo",
+                FakeRun::clean().with_probes(1),
+            )));
+        h.bind();
+
+        let mut profile = h.profile(&["http://scan.test"]);
+        // One unusable answer is enough; the ratio rule can never fire, so the
+        // only thing under test is the consecutive ladder and its key.
+        profile.budget.per_host_errors = aitm_scan_model::PerHostErrors {
+            consecutive: 1,
+            ratio: 1.0,
+        };
+        let started =
+            crate::jobs::start(&h.engine, profile, operator(), false).expect("the job starts");
+
+        let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
+        assert_eq!(
+            h.client.authorities().first().map(String::as_str),
+            Some("scan.test"),
+            "the premise: the probe's authority carries no explicit port"
+        );
+        assert_eq!(status.state, JobState::Done);
+        assert_eq!(status.stopped_reason, Some(StoppedReason::Errors));
+        assert!(
+            status.checks.done < status.checks.scheduled,
+            "the tripped ladder must leave an item unrun: {} of {}",
+            status.checks.done,
+            status.checks.scheduled
+        );
+    }
+
     /// Spec D5 "Budget and pacing": one budget across the job, and the job ends
     /// when it is spent.
     #[tokio::test(flavor = "multi_thread")]
@@ -1615,7 +1668,7 @@ mod tests {
             assert_eq!(event.kind, "scan");
             assert_eq!(event.job, started.job);
             lines.push(
-                serde_json::from_value(value_to_json(event.payload))
+                serde_json::from_value(crate::verbs::value_to_json(&event.payload))
                     .expect("the payload is a JobNotification"),
             );
         }
@@ -1644,20 +1697,44 @@ mod tests {
         );
     }
 
-    /// Call B13 in isolation: `progress` is dropped while the 250 ms window has
-    /// not elapsed; a `phase` line in between is always published.
+    /// Call B13 in isolation, on a clock the test steps by hand: `progress` is
+    /// dropped while the 250 ms window has not elapsed, a `phase` line in
+    /// between is always published, and `seq` counts published lines only so
+    /// it is dense.
+    ///
+    /// It used to sleep fifty times for 10 ms and assert `<= 4` lines, which
+    /// held only while the whole loop ran inside a second — a flake under a
+    /// loaded gate (whole-branch quality finding). With an injected clock the
+    /// count is exact and nothing sleeps.
     #[tokio::test(flavor = "multi_thread")]
     async fn progress_is_coalesced_to_four_a_second_and_phase_never_is() {
-        use crate::worker::Progress;
+        use crate::worker::{Progress, MIN_PROGRESS_INTERVAL};
+        use std::sync::Mutex;
+
+        // A clock that only moves when the test moves it.
+        let clock = Arc::new(Mutex::new(std::time::Instant::now()));
+        let read = Arc::clone(&clock);
+        let advance = |by: Duration| {
+            let mut at = clock.lock().expect("clock lock");
+            *at = at.checked_add(by).expect("the test clock stays in range");
+        };
 
         let bus = Arc::new(aitm_core::JobBus::default());
         let mut rx = bus.subscribe();
-        let progress = Progress::new(bus.clone(), "scan-1a2b3c4d".to_string());
+        let progress = Progress::with_clock(
+            bus.clone(),
+            "scan-1a2b3c4d".to_string(),
+            Arc::new(move || *read.lock().expect("clock lock")),
+        );
         let status = JobStatus::default();
 
+        // Fifty ticks of 10 ms: the window opens at tick 0 (the first line is
+        // always eligible) and again at 250 ms. 490 ms of ticks is two.
+        let step = Duration::from_millis(10);
+        let ticks = 50u32;
         let mut sent_progress = 0usize;
         let mut sent_phase = 0usize;
-        for i in 0..50 {
+        for i in 0..ticks {
             if progress.emit(JobEvent::Progress, &status, None) {
                 sent_progress += 1;
             }
@@ -1668,14 +1745,27 @@ mod tests {
                 );
                 sent_phase += 1;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            advance(step);
         }
 
-        assert!(
-            sent_progress <= 4,
-            "{sent_progress} progress lines in ~0.5 s"
+        let elapsed = step * (ticks - 1);
+        let want = 1 + (elapsed.as_millis() / MIN_PROGRESS_INTERVAL.as_millis()) as usize;
+        assert_eq!(
+            sent_progress, want,
+            "one line at the start and one per {MIN_PROGRESS_INTERVAL:?} of {elapsed:?}"
         );
+        assert_eq!(sent_progress, 2, "the arithmetic above, spelled out");
         assert_eq!(sent_phase, 1);
+
+        // One more window, and exactly one more line: the rule is per window,
+        // not per call.
+        advance(MIN_PROGRESS_INTERVAL);
+        assert!(progress.emit(JobEvent::Progress, &status, None));
+        assert!(
+            !progress.emit(JobEvent::Progress, &status, None),
+            "a second line inside the same window is coalesced"
+        );
+        sent_progress += 1;
 
         let mut seqs = Vec::new();
         while let Ok(event) = rx.try_recv() {
@@ -1686,6 +1776,7 @@ mod tests {
             sent_progress + sent_phase,
             "seq counts sent lines only"
         );
+        assert_eq!(seqs.first(), Some(&1), "seq starts at one");
         assert!(
             seqs.windows(2).all(|p| p[1] == p[0] + 1),
             "seq is dense over sent lines: {seqs:?}"
@@ -2071,7 +2162,7 @@ mod tests {
 
         let mut saw_issue = false;
         while let Ok(event) = rx.try_recv() {
-            let text = serde_json::to_string(&value_to_json(event.payload))
+            let text = serde_json::to_string(&crate::verbs::value_to_json(&event.payload))
                 .expect("the payload serializes");
             assert!(
                 !text.contains("\"evidence\""),
@@ -2236,7 +2327,7 @@ mod tests {
         let mut lines: Vec<JobNotification> = Vec::new();
         while let Ok(event) = rx.try_recv() {
             lines.push(
-                serde_json::from_value(value_to_json(event.payload))
+                serde_json::from_value(crate::verbs::value_to_json(&event.payload))
                     .expect("the payload is a JobNotification"),
             );
         }
@@ -2410,25 +2501,5 @@ mod tests {
         let status = h.wait_terminal(&started.job, Duration::from_secs(5)).await;
         assert_eq!(status.state, JobState::Done);
         assert_eq!(status.crawl.pages, 2, "two pages, counted once each");
-    }
-
-    fn value_to_json(value: aitm_core::Value) -> serde_json::Value {
-        use aitm_core::Value;
-        match value {
-            Value::Null => serde_json::Value::Null,
-            Value::Bool(b) => serde_json::Value::Bool(b),
-            Value::Int(i) => serde_json::Value::from(i),
-            Value::Float(f) => serde_json::Value::from(f),
-            Value::Str(s) => serde_json::Value::String(s),
-            Value::Array(items) => {
-                serde_json::Value::Array(items.into_iter().map(value_to_json).collect())
-            }
-            Value::Object(map) => serde_json::Value::Object(
-                map.into_iter()
-                    .map(|(k, v)| (k, value_to_json(v)))
-                    .collect(),
-            ),
-            Value::Bytes(bytes) => serde_json::Value::from(bytes.len()),
-        }
     }
 }

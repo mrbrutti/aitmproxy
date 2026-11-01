@@ -117,6 +117,57 @@ pub fn split_authority(authority: &str) -> (&str, Option<u16>) {
     }
 }
 
+/// The lowercase wire name of a frontend — the `started_by.frontend` token
+/// every job record, push line and finding carries (T1a Task 6).
+///
+/// `Frontend` is `#[non_exhaustive]`: a frontend this build does not know
+/// reads as `mcp`, the gated posture, never as a trusted control surface.
+pub fn frontend_token(frontend: aitm_core::Frontend) -> &'static str {
+    match frontend {
+        aitm_core::Frontend::Cli => "cli",
+        aitm_core::Frontend::Operator => "operator",
+        _ => "mcp",
+    }
+}
+
+/// The inverse of [`frontend_token`]: the frontend a `started_by` token names.
+///
+/// An unknown token is [`aitm_core::Frontend::Mcp`], the least-trusted caller
+/// class, so a malformed or hand-edited job record can never upgrade the
+/// agent-ness of a reloaded job or the recorded origin of a finding. The two
+/// directions live together so a new `Frontend` variant is added in one place
+/// rather than four (whole-branch quality finding).
+pub fn frontend_of_token(token: &str) -> aitm_core::Frontend {
+    match token {
+        "cli" => aitm_core::Frontend::Cli,
+        "operator" => aitm_core::Frontend::Operator,
+        _ => aitm_core::Frontend::Mcp,
+    }
+}
+
+/// The `host:port` a scope guard — and the per-host error ladder — is asked
+/// about: always an explicit port, the scheme's default when the authority
+/// elides it (`http`/`ws` 80, `https`/`wss` 443), `0` for a scheme with no
+/// default.
+///
+/// The one spelling of that rule in the engine. It is a rule rather than a
+/// formatting detail twice over:
+///
+/// * a ported scope entry (`127.0.0.1:54010`) matches only on port equality,
+///   so asking the guard about a bare host would never be admitted by it
+///   (the Critical fixed in 27970b12); and
+/// * the per-host error ladder is a map keyed by this string, written by
+///   [`crate::client::ladder_key`] on every probe and read by the worker
+///   before every item — two spellings meant `stopped_reason: errors` could
+///   never fire for a default-port host (whole-branch quality finding).
+pub fn guard_authority(scheme: &str, authority: &str) -> String {
+    let scheme = scheme.to_ascii_lowercase();
+    let authority = authority.to_ascii_lowercase();
+    let (host, port) = split_authority(&authority);
+    let port = port.or_else(|| default_port(&scheme)).unwrap_or(0);
+    format!("{host}:{port}")
+}
+
 /// The origin normal form over an already-split `(scheme, authority)`:
 /// `scheme://host[:port]`, lowercased, with the scheme's default port elided
 /// (`http`/`ws` 80, `https`/`wss` 443) and any other port kept.
@@ -182,6 +233,79 @@ pub fn normalize_origin(input: &str) -> Result<String, String> {
         None => host.to_string(),
     };
     Ok(origin_key(scheme, &authority))
+}
+
+/// The probe marker a check injects and looks for in the answer:
+/// `aitm<8 lowercase hex>` of `counter`.
+///
+/// One spelling, because the shipped Rhai checks and the PoC assertions match
+/// on this literal shape: `ProbeHost::marker` is implemented twice (the job
+/// worker and the manual `check.<id>` path) and the two must agree.
+pub fn marker(counter: u64) -> String {
+    format!("aitm{:08x}", counter & 0xffff_ffff)
+}
+
+// --- HTML scanning helpers --------------------------------------------------
+//
+// One copy each, shared by the browser crawl ([`crate::crawl`]) and the client
+// crawl ([`crate::interim_crawl`]). They were byte-for-byte duplicates, and
+// `find_close_tag` carries a performance invariant a fix to one copy would
+// have missed (whole-branch quality finding).
+
+/// The longest prefix of `s` that is at most `max` bytes and ends on a `char`
+/// boundary.
+pub fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Decode the entities an attribute value commonly carries. `&amp;` is decoded
+/// **last**, so `&amp;lt;` decodes to the text `&lt;` and never to `<`.
+pub fn decode_entities(value: &str) -> String {
+    if !value.contains('&') {
+        return value.to_string();
+    }
+    value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&amp;", "&")
+}
+
+/// The index just past `</tag`, searched case-insensitively in
+/// `html[from..until]`.
+///
+/// A single forward pass over the bytes, comparing in place: nothing is
+/// allocated or lowercased per call, so a page of a hundred thousand empty
+/// `<script></script>` pairs costs one linear scan in total, not one copy of
+/// the remaining DOM per tag. **This runs synchronously between awaits, where
+/// the time budget cannot interrupt it, so it has to stay linear.** A caller
+/// that knows where the element must have ended passes that as `until` rather
+/// than the end of the document.
+pub fn find_close_tag(html: &str, tag: &str, from: usize, until: usize) -> Option<usize> {
+    let from = from.min(html.len());
+    let hay = &html.as_bytes()[from..until.clamp(from, html.len())];
+    let tag = tag.as_bytes();
+    let needle_len = tag.len() + 2;
+    if hay.len() < needle_len {
+        return None;
+    }
+    (0..=hay.len() - needle_len)
+        .find(|&i| {
+            hay[i] == b'<'
+                && hay[i + 1] == b'/'
+                && hay[i + 2..i + needle_len].eq_ignore_ascii_case(tag)
+        })
+        .map(|i| from + i + needle_len)
 }
 
 /// Map a `serde_json::Value` onto the bus [`aitm_core::Value`].
@@ -463,6 +587,113 @@ mod tests {
         assert_eq!(split_authority("h:"), ("h:", None));
         assert_eq!(split_authority("h:abc"), ("h:abc", None));
         assert_eq!(split_authority("h:99999"), ("h", None));
+    }
+
+    /// The one `started_by` token map, both ways: every `Frontend` variant
+    /// this build knows round-trips, and an unknown token (or an unknown
+    /// variant) lands on the gated `Mcp` posture rather than a trusted one.
+    #[test]
+    fn frontend_tokens_round_trip_and_default_to_the_gated_posture() {
+        use aitm_core::Frontend;
+        for frontend in [Frontend::Cli, Frontend::Operator, Frontend::Mcp] {
+            let token = frontend_token(frontend);
+            assert_eq!(
+                frontend_of_token(token),
+                frontend,
+                "{frontend:?} does not round-trip through {token:?}"
+            );
+        }
+        assert_eq!(frontend_token(Frontend::Cli), "cli");
+        assert_eq!(frontend_token(Frontend::Operator), "operator");
+        assert_eq!(frontend_token(Frontend::Mcp), "mcp");
+        for unknown in ["", "agent", "CLI", "web"] {
+            assert_eq!(
+                frontend_of_token(unknown),
+                Frontend::Mcp,
+                "{unknown:?} is not the gated posture"
+            );
+            assert!(
+                !frontend_of_token(unknown).is_trusted_control(),
+                "{unknown:?} reads as a trusted control surface"
+            );
+        }
+    }
+
+    /// The one copy of the three HTML helpers both crawlers use: the entity
+    /// decode never double-decodes, the truncation never splits a `char`, and
+    /// the close-tag search is case-insensitive and bounded by `until`.
+    #[test]
+    fn the_shared_html_helpers_keep_their_rules() {
+        assert_eq!(decode_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_entities("a&amp;b"), "a&b");
+        assert_eq!(decode_entities("&lt;tag&gt;"), "<tag>");
+        assert_eq!(decode_entities("plain"), "plain");
+
+        assert_eq!(truncate_on_char_boundary("abcdef", 3), "abc");
+        assert_eq!(truncate_on_char_boundary("abc", 9), "abc");
+        assert_eq!(
+            truncate_on_char_boundary("é", 1),
+            "",
+            "a multi-byte char is dropped rather than split"
+        );
+
+        let html = "<script>x</SCRIPT>tail";
+        assert_eq!(
+            find_close_tag(html, "script", 0, html.len()),
+            Some("<script>x</script".len()),
+            "the close tag is matched case-insensitively"
+        );
+        assert_eq!(
+            find_close_tag(html, "script", 0, 10),
+            None,
+            "`until` bounds the search"
+        );
+        assert_eq!(find_close_tag("<a>", "script", 0, 3), None);
+        assert_eq!(
+            find_close_tag(html, "script", html.len() + 99, html.len()),
+            None,
+            "a `from` past the end is not a panic"
+        );
+    }
+
+    /// The probe marker's literal shape: `aitm` plus exactly eight lowercase
+    /// hex digits, wrapping at 32 bits rather than growing a ninth.
+    #[test]
+    fn marker_is_aitm_plus_eight_hex_digits() {
+        assert_eq!(marker(0), "aitm00000000");
+        assert_eq!(marker(1), "aitm00000001");
+        assert_eq!(marker(0xdead_beef), "aitmdeadbeef");
+        assert_eq!(
+            marker(0x1_0000_0000),
+            "aitm00000000",
+            "the counter wraps at 32 bits; the marker never grows"
+        );
+        let m = marker(0xffff_ffff);
+        assert_eq!(m, "aitmffffffff");
+        assert_eq!(m.len(), 12);
+    }
+
+    /// `guard_authority` is the one `host:port` rule: an explicit port always,
+    /// the scheme's default folded in, `0` for a scheme with no default, an
+    /// IPv6 literal kept whole, the host lowercased.
+    #[test]
+    fn guard_authority_always_carries_an_explicit_port() {
+        assert_eq!(guard_authority("http", "target.test"), "target.test:80");
+        assert_eq!(guard_authority("https", "target.test"), "target.test:443");
+        assert_eq!(guard_authority("ws", "target.test"), "target.test:80");
+        assert_eq!(guard_authority("wss", "target.test"), "target.test:443");
+        assert_eq!(
+            guard_authority("https", "target.test:8443"),
+            "target.test:8443"
+        );
+        assert_eq!(guard_authority("HTTPS", "Target.Test"), "target.test:443");
+        assert_eq!(guard_authority("http", "[::1]"), "[::1]:80");
+        assert_eq!(guard_authority("http", "[::1]:8080"), "[::1]:8080");
+        assert_eq!(
+            guard_authority("ftp", "target.test"),
+            "target.test:0",
+            "a scheme with no default port asks about port 0, never a guess"
+        );
     }
 
     /// `wire_token` is the serde wire form of a value, unquoted: the one helper

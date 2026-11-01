@@ -12,10 +12,14 @@
 //! * **Every refusal is `scan: <code>: <message>`** built with
 //!   [`aitm_scan_model::scan_error`], so a frontend matches on the code token
 //!   and never on prose.
-//! * **`scan.start` asks the agent gate first** (call B6). Under
+//! * **`scan.start` owes an agent the `refused_agent` code** (call B6). Under
 //!   `agent.policy: auto` the MCP layer defers `scan.start` to the command, so
-//!   the command owes the caller the `refused_agent` code — and owes it before
-//!   it mints a job id, resolves lanes or touches the registry.
+//!   the refusal must come from the engine, before a job id is minted, the
+//!   registry is touched or anything is sent. [`crate::jobs::start`] takes
+//!   that gate at its steps (5)/(6), which is both early enough for call B6
+//!   and late enough for spec D3's order (`lane_unavailable` →
+//!   `out_of_scope` → `refused_l4` → `refused_agent`); no verb here takes it
+//!   a second time.
 //! * **`scan.start` is `Sensitive` whatever the profile does** (spec D4, "tier
 //!   laundering guard"): the job's gate is taken once, at start, and the
 //!   catalogue then runs script checks without a per-call policy decision.
@@ -377,10 +381,14 @@ impl Command for ScanStart {
     fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let caller = caller_of(host);
         let profile = resolve(&self.engine, &args)?;
-        // Call B6, first and before any work: under `agent.policy: auto` the
-        // MCP gate defers this verb to us, so an agent must get the
-        // `refused_agent` code here — with no job minted and nothing sent.
-        jobs::agent_gate(&self.engine, &caller, &profile, false)?;
+        // Call B6 is honoured inside `jobs::start`, which takes the same
+        // `agent_gate` at its steps (5)/(6) — after lane availability and
+        // scope, and before a job id is minted, the registry is touched or
+        // anything is sent. So under `agent.policy: auto` an agent still gets
+        // `refused_agent` from this verb with no job and no traffic, and a
+        // caller that is wrong in two ways still learns spec D3's first
+        // reason. Gating here as well put `refused_agent` ahead of
+        // `lane_unavailable` and `out_of_scope` (whole-branch spec finding).
         let result = jobs::start(&self.engine, profile, caller, false)?;
         result_of(&result)
     }
@@ -854,11 +862,12 @@ impl Command for ScanSitemap {
                     })?
             }
         };
-        let (_status, _cancel, discovery) = self
+        let discovery = self
             .engine
             .registry
             .entry_handles(&job)
-            .ok_or_else(|| no_such_job(&job))?;
+            .ok_or_else(|| no_such_job(&job))?
+            .discovery;
 
         let limit = opt_usize(&args, "limit")?
             .unwrap_or(DEFAULT_SITEMAP_PAGE)
@@ -1328,19 +1337,12 @@ mod tests {
 
         /// Poll the registry until `job` is terminal.
         async fn wait_terminal(&self, job: &str) {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let status = self
-                    .engine
-                    .registry
-                    .status(job)
-                    .unwrap_or_else(|| panic!("job {job} is in the registry"));
-                if status.state.is_terminal() {
-                    return;
-                }
-                assert!(Instant::now() < deadline, "job {job} never finished");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            crate::jobs::test_support::wait_terminal(
+                &self.engine.registry,
+                job,
+                Duration::from_secs(5),
+            )
+            .await;
         }
 
         /// A captured, in-scope flow the interim lane can map.
@@ -2102,6 +2104,83 @@ mod tests {
         assert_eq!(as_array(obj(lanes, "run")), &[s("http")]);
         assert_eq!(as_array(obj(lanes, "skipped")).len(), 0);
         h.wait_terminal(as_str(obj(&result, "job"))).await;
+    }
+
+    /// A whole-`ScanProfile` JSON over `origins`, running `lanes`.
+    fn profile_json(origins: &[&str], lanes: &[&str]) -> serde_json::Value {
+        let mut json = full_profile("order");
+        let fields = json.as_object_mut().expect("the profile is an object");
+        fields.insert(
+            "target".to_string(),
+            serde_json::json!({ "origins": origins, "l4": [] }),
+        );
+        fields.insert("lanes".to_string(), serde_json::json!(lanes));
+        json
+    }
+
+    /// Spec D3's refusal order, reached through the verb rather than through
+    /// `jobs::start`: `lane_unavailable` → `out_of_scope` → `refused_l4` →
+    /// `refused_agent`. An agent that is wrong in two ways learns the same
+    /// reason an operator would, and learns `refused_agent` last.
+    ///
+    /// Whole-branch spec finding: `ScanStart::invoke` called `jobs::agent_gate`
+    /// **before** `jobs::start`, so every one of these answered
+    /// `refused_agent`. `jobs::start` already takes the same gate at its steps
+    /// (5)/(6) — after lanes and scope and before a job is minted or anything
+    /// is sent — so the pre-call only reordered the codes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agents_scan_start_is_refused_in_d3_order() {
+        let h = Harness::new();
+        h.set_policy(AgentPolicy::Auto);
+
+        // (3) No lane this build has: `lane_unavailable`, before the agent gate.
+        let err = h
+            .call_as(
+                "scan.start",
+                Frontend::Mcp,
+                &[(
+                    "profile",
+                    util::json_to_value(profile_json(&["http://scan.test"], &["ws"])),
+                )],
+            )
+            .expect_err("no requested lane is available");
+        assert_eq!(code(&err), ScanErrorCode::LaneUnavailable);
+        assert!(
+            err.to_string().starts_with("scan: lane_unavailable:"),
+            "{err}"
+        );
+
+        // (4) Scope, still before the agent gate.
+        let err = h
+            .call_as(
+                "scan.start",
+                Frontend::Mcp,
+                &[(
+                    "profile",
+                    util::json_to_value(profile_json(&["http://nope.test"], &["http"])),
+                )],
+            )
+            .expect_err("the origin is not in scope");
+        assert_eq!(code(&err), ScanErrorCode::OutOfScope);
+        assert!(err.to_string().starts_with("scan: out_of_scope:"), "{err}");
+
+        // (6) Only a caller that passes both reaches the agent gate.
+        let err = h
+            .call_as(
+                "scan.start",
+                Frontend::Mcp,
+                &[(
+                    "profile",
+                    util::json_to_value(profile_json(&["http://scan.test"], &["http"])),
+                )],
+            )
+            .expect_err("an agent under `auto` is refused");
+        assert_eq!(code(&err), ScanErrorCode::RefusedAgent);
+        assert!(err.to_string().starts_with("scan: refused_agent:"), "{err}");
+
+        // None of the three minted a job or sent anything.
+        assert_eq!(h.engine.registry.list(true, 16).len(), 0);
+        assert_eq!(h.client.calls(), 0);
     }
 
     /// AC T1-4, through the verbs: under `agent.policy: auto` an agent's

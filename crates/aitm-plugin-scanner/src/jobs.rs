@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aitm_core::{
     AgentPolicy, BrowserDriver, ConfinementToken, EgressConfinement, FlowStore, Frontend,
@@ -29,7 +29,6 @@ use aitm_scan_model::{
     JobSummary, L4TargetSpec, L4Transport, Lane, LaneKind, LaneReport, Phase, ProbeCounters,
     ScanErrorCode, ScanProfile, SessionMode, SessionStatus, SkippedLane, StartResult, StartedBy,
 };
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::catalogue::{assemble, Catalogue};
@@ -129,8 +128,6 @@ pub struct JobEntry {
     pub status: Arc<RwLock<JobStatus>>,
     /// Set by `scan.cancel`; observed between probes and in every await.
     pub cancel: CancellationToken,
-    /// The worker, dropped when the job finishes.
-    pub task: Option<JoinHandle<()>>,
     /// The egress hold the job keeps for its lifetime.
     pub confine: Option<ConfinementToken>,
     /// Who started it.
@@ -148,7 +145,10 @@ impl std::fmt::Debug for JobEntry {
         f.debug_struct("JobEntry")
             .field("origins", &self.origins)
             .field("is_agent", &self.is_agent)
-            .field("running", &self.task.is_some())
+            .field(
+                "state",
+                &self.status.read().unwrap_or_else(|e| e.into_inner()).state,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -174,18 +174,17 @@ impl JobRegistry {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Admit `entry`, keyed by the job id on its status.
+    /// Admit `entry` only if its id is free, keyed by the job id on its
+    /// status. Returns `false` (and gives the entry back to the drop) when the
+    /// id is taken.
     ///
     /// An id the registry already holds is **not** overwritten: a live job's
     /// handles are never dropped on the floor by a colliding mint. [`start`]
-    /// mints through [`JobRegistry::admit`], which re-mints instead.
-    pub fn insert(&self, entry: JobEntry) {
-        let _ = self.try_insert(entry);
-    }
-
-    /// Admit `entry` only if its id is free. Returns `false` (and gives the
-    /// entry back to the drop) when the id is taken.
-    fn try_insert(&self, entry: JobEntry) -> bool {
+    /// mints through [`JobRegistry::admit`], which re-mints instead. The
+    /// answer is `#[must_use]` so no caller can admit a job, lose it to a
+    /// collision and carry on as if it were running.
+    #[must_use]
+    pub(crate) fn try_insert(&self, entry: JobEntry) -> bool {
         let id = entry
             .status
             .read()
@@ -255,12 +254,10 @@ impl JobRegistry {
 
     /// The three handles the worker needs to drive one job.
     pub fn entry_handles(&self, id: &str) -> Option<JobHandles> {
-        self.lock().get(id).map(|e| {
-            (
-                Arc::clone(&e.status),
-                e.cancel.clone(),
-                Arc::clone(&e.discovery),
-            )
+        self.lock().get(id).map(|e| JobHandles {
+            status: Arc::clone(&e.status),
+            cancel: e.cancel.clone(),
+            discovery: Arc::clone(&e.discovery),
         })
     }
 
@@ -310,7 +307,6 @@ impl JobRegistry {
         let mut inner = self.lock();
         if let Some(entry) = inner.get_mut(id) {
             entry.confine = None;
-            entry.task = None;
         }
         prune(&mut inner, self.history);
     }
@@ -372,13 +368,12 @@ impl JobRegistry {
             }
             let started_by = record.status.started_by.clone();
             let origins = record.status.targets.clone();
-            let is_agent = !frontend_of_token(&started_by.frontend).is_trusted_control();
+            let is_agent = !util::frontend_of_token(&started_by.frontend).is_trusted_control();
             if self.try_insert(JobEntry {
                 status: Arc::new(RwLock::new(record.status)),
                 // A reloaded job is already over; the token is pre-cancelled so
                 // nothing can mistake it for something still worth stopping.
                 cancel: cancelled_token(),
-                task: None,
                 confine: None,
                 started_by,
                 discovery: Arc::new(RwLock::new(Discovery::default())),
@@ -410,13 +405,16 @@ impl JobRegistry {
 }
 
 /// What one job's live handles are, as [`JobRegistry::entry_handles`] hands
-/// them out: the status every verb reads, the token `scan.cancel` sets, and
-/// the discovery `scan.sitemap` pages.
-pub type JobHandles = (
-    Arc<RwLock<JobStatus>>,
-    CancellationToken,
-    Arc<RwLock<Discovery>>,
-);
+/// them out. Named fields rather than a 3-tuple, because every call site used
+/// one of the three and had to spell two `_`s to say so.
+pub struct JobHandles {
+    /// The status every verb reads.
+    pub status: Arc<RwLock<JobStatus>>,
+    /// The token `scan.cancel` sets.
+    pub cancel: CancellationToken,
+    /// What discovery found, which `scan.sitemap` pages.
+    pub discovery: Arc<RwLock<Discovery>>,
+}
 
 /// Why [`JobRegistry::admit`] did not admit a job.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -533,32 +531,9 @@ impl Caller {
     /// The caller as the `started_by` record `JobStatus` carries.
     pub fn started_by(&self) -> StartedBy {
         StartedBy {
-            frontend: frontend_token(self.frontend).to_string(),
+            frontend: util::frontend_token(self.frontend).to_string(),
             client_label: self.client_label.clone(),
         }
-    }
-}
-
-/// The lowercase wire name of a frontend (T1a Task 6).
-fn frontend_token(frontend: Frontend) -> &'static str {
-    match frontend {
-        Frontend::Cli => "cli",
-        Frontend::Mcp => "mcp",
-        Frontend::Operator => "operator",
-        // `Frontend` is `#[non_exhaustive]`: a frontend this build does not
-        // know is treated as the gated posture, never as a trusted control.
-        _ => "mcp",
-    }
-}
-
-/// The frontend a `started_by` token names, for a job reloaded from disk.
-/// An unknown token is the gated posture, so the agent-ness of a reloaded job
-/// is still decided by `Frontend::is_trusted_control`, never by a string.
-fn frontend_of_token(token: &str) -> Frontend {
-    match token {
-        "cli" => Frontend::Cli,
-        "operator" => Frontend::Operator,
-        _ => Frontend::Mcp,
     }
 }
 
@@ -755,11 +730,24 @@ pub fn agent_gate(
 /// `scan.start` (and, with `force_map`, `scan.map`): validate, gate, admit and
 /// spawn (spec D3, D5).
 ///
-/// Every refusal is checked in spec D3's order — lane availability, then the
-/// check selection, then scope, then the L4 gate, then the agent gate, then
-/// concurrency — so a caller that is wrong in two ways always learns the same
-/// reason first. Nothing sends: by the time this returns, the job exists, is
-/// `queued`, and the worker owns it.
+/// Every refusal is checked in one fixed order, so a caller that is wrong in
+/// two ways always learns the same reason first. The order the body below
+/// implements, which is spec D3's:
+///
+/// 1. the `scan.map` shape (`force_map`), then profile validation and clamping
+///    (`invalid_profile`);
+/// 2. the check selection (`unknown_check`);
+/// 3. lane availability (`lane_unavailable`), then the l4-target rule and the
+///    per-lane validation of the lanes that will actually run
+///    (`invalid_profile`);
+/// 4. scope, for every HTTP origin and L4 target (`out_of_scope`);
+/// 5. and 6. the L4 layer gate and the agent gate, both in [`agent_gate`]
+///    (`refused_l4`, then `refused_agent`);
+/// 7. and 8. the concurrency gate and the admission (`busy`).
+///
+/// Nothing sends: by the time this returns, the job exists, is `queued`, and
+/// the worker owns it. Step (6) is also why no verb takes the agent gate
+/// itself — doing so would move `refused_agent` ahead of (3) and (4).
 pub fn start(
     engine: &Arc<Engine>,
     mut profile: ScanProfile,
@@ -802,7 +790,7 @@ pub fn start(
         let names = profile
             .lanes
             .iter()
-            .map(lane_token)
+            .map(util::wire_token)
             .collect::<Vec<_>>()
             .join(", ");
         return Err(scan_error(
@@ -857,10 +845,6 @@ pub fn start(
         }
         origins.push(normalized);
     }
-    let l4_requested = profile
-        .lanes
-        .iter()
-        .any(|lane| matches!(lane, LaneKind::L4Packet | LaneKind::L4Stream));
     if let Some(guard) = &services.l4 {
         for target in &profile.target.l4 {
             check_l4_target(guard.as_ref(), target)?;
@@ -901,7 +885,7 @@ pub fn start(
         },
         lanes: lanes.clone(),
         clamped: clamped.clone(),
-        l4: l4_requested.then(Default::default),
+        l4: l4_will_run.then(Default::default),
         session: (profile.session.mode == SessionMode::Observed).then(SessionStatus::default),
         ..JobStatus::default()
     };
@@ -916,7 +900,6 @@ pub fn start(
             JobEntry {
                 status: Arc::clone(&status),
                 cancel: cancel.clone(),
-                task: None,
                 confine,
                 started_by: started_by.clone(),
                 discovery: Arc::clone(&discovery),
@@ -948,13 +931,14 @@ pub fn start(
         is_agent: caller.is_agent(),
         started_by,
     };
+    // The worker is detached on purpose: it owns its own cancellation token
+    // (`scan.cancel`) and ends by moving the entry to a terminal state, so
+    // there is nothing a retained `JoinHandle` could do that the token does
+    // not do better (whole-branch quality finding).
     let engine_for_worker = Arc::clone(engine);
-    let handle = services
+    services
         .rt
         .spawn(async move { crate::worker::run_job(engine_for_worker, ctx).await });
-    if let Some(entry) = engine.registry.lock().get_mut(&job) {
-        entry.task = Some(handle);
-    }
 
     let snapshot = status.read().unwrap_or_else(|e| e.into_inner()).clone();
     Ok(StartResult {
@@ -962,7 +946,7 @@ pub fn start(
         status: snapshot,
         clamped,
         lanes,
-        dry_run: l4_requested.then_some(profile.l4.dry_run),
+        dry_run: l4_will_run.then_some(profile.l4.dry_run),
     })
 }
 
@@ -1021,17 +1005,24 @@ fn check_l4_target(
     Ok(())
 }
 
-/// The wire token of a lane, for the `lane_unavailable` message.
-fn lane_token(lane: &LaneKind) -> String {
-    serde_json::to_value(lane)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| format!("{lane:?}"))
-}
-
 /// A duration that never overflows an `Instant`.
 pub(crate) fn bounded_secs(seconds: u64) -> Duration {
     Duration::from_secs(seconds.min(60 * 60 * 24 * 7))
+}
+
+/// `now + bounded_secs(seconds)` — the one way a job, a manual check or a
+/// per-check timeout turns a configured number of seconds into a deadline.
+///
+/// Three sites spelled this out with three different fallbacks for an
+/// `Instant` that cannot represent the sum (whole-branch quality finding).
+/// It is unreachable in practice — [`bounded_secs`] caps at a week — and the
+/// one fallback here is a minute, then now, so a clock at the end of its
+/// range ends the job rather than running it unbounded.
+pub(crate) fn deadline_in(seconds: u64) -> Instant {
+    let now = Instant::now();
+    now.checked_add(bounded_secs(seconds))
+        .or_else(|| now.checked_add(Duration::from_secs(60)))
+        .unwrap_or(now)
 }
 
 /// The stubs Task 14's own tests share: a `ProxyClient` that answers from
@@ -1087,6 +1078,9 @@ pub(crate) mod test_support {
         /// An HTML page every send is answered with, when a test serves one;
         /// otherwise the canned `200 ok`.
         page: Option<String>,
+        /// The status every send is answered with (`200` unless a test asks
+        /// for another). A `5xx` is what the per-host error ladder counts.
+        status: u16,
     }
 
     impl StubClient {
@@ -1097,6 +1091,7 @@ pub(crate) mod test_support {
                 seen: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
                 page: None,
+                status: 200,
             })
         }
 
@@ -1109,7 +1104,32 @@ pub(crate) mod test_support {
                 seen: Mutex::new(Vec::new()),
                 requests: Mutex::new(Vec::new()),
                 page: Some(html.to_string()),
+                status: 200,
             })
+        }
+
+        /// A client that answers every send with `status` — a `5xx` is the
+        /// unusable answer the per-host error ladder counts (`client.rs`
+        /// `ProbeMeter::record`).
+        pub(crate) fn answering(status: u16) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU64::new(0),
+                last_call_ms: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                page: None,
+                status,
+            })
+        }
+
+        /// The authority of every request the client was handed, in order.
+        pub(crate) fn authorities(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .iter()
+                .map(|req| req.authority.clone())
+                .collect()
         }
 
         /// `METHOD path` for every request the client was handed, in order.
@@ -1158,6 +1178,9 @@ pub(crate) mod test_support {
                 self.last_call_ms
                     .store(crate::util::now_ms(), Ordering::SeqCst);
                 let mut flow = stub_flow(req);
+                if let Some(response) = flow.response.as_mut() {
+                    response.status = self.status;
+                }
                 if let (Some(page), Some(response)) = (&self.page, flow.response.as_mut()) {
                     response
                         .headers
@@ -1941,6 +1964,13 @@ pub(crate) mod test_support {
             self
         }
 
+        /// Answer every send with `status`, so a test can make a host fail.
+        /// Call before [`Harness::bind`].
+        pub(crate) fn answering(mut self, status: u16) -> Self {
+            self.client = StubClient::answering(status);
+            self
+        }
+
         /// Bind an egress posture, so a test can watch a job's hold on it.
         pub(crate) fn with_egress(mut self) -> Self {
             self.egress = Some(Arc::new(EgressConfinement::new(false)));
@@ -2051,24 +2081,64 @@ pub(crate) mod test_support {
             job: &str,
             within: std::time::Duration,
         ) -> aitm_scan_model::JobStatus {
-            let deadline = Instant::now() + within;
-            loop {
-                let status = self
-                    .engine
-                    .registry
-                    .status(job)
-                    .unwrap_or_else(|| panic!("job {job} is in the registry"));
-                if status.state.is_terminal() {
-                    return status;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "job {job} is still {:?}/{:?} after {within:?}",
-                    status.state,
-                    status.phase
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            wait_terminal(&self.engine.registry, job, within).await
+        }
+    }
+
+    /// One poll of a job, for the three test harnesses' `wait_terminal`.
+    ///
+    /// `Some(status)` once the job is terminal, `None` while it is still
+    /// going. Past `deadline` it panics naming the state and phase the job is
+    /// stuck in — a test that waits forever tells you nothing.
+    fn poll_terminal(
+        registry: &crate::jobs::JobRegistry,
+        job: &str,
+        deadline: Instant,
+        within: std::time::Duration,
+    ) -> Option<aitm_scan_model::JobStatus> {
+        let status = registry
+            .status(job)
+            .unwrap_or_else(|| panic!("job {job} is in the registry"));
+        if status.state.is_terminal() {
+            return Some(status);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "job {job} is still {:?}/{:?} after {within:?}",
+            status.state,
+            status.phase
+        );
+        None
+    }
+
+    /// Poll `registry.status(job)` until it is terminal, or give up. The one
+    /// copy; the `jobs`, `verbs` and `commands` harnesses all call it.
+    pub(crate) async fn wait_terminal(
+        registry: &crate::jobs::JobRegistry,
+        job: &str,
+        within: std::time::Duration,
+    ) -> aitm_scan_model::JobStatus {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = poll_terminal(registry, job, deadline, within) {
+                return status;
             }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// [`wait_terminal`] for a harness polling from **outside** a runtime.
+    pub(crate) fn wait_terminal_blocking(
+        registry: &crate::jobs::JobRegistry,
+        job: &str,
+        within: std::time::Duration,
+    ) -> aitm_scan_model::JobStatus {
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = poll_terminal(registry, job, deadline, within) {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -2555,7 +2625,7 @@ mod tests {
             (30, "http://b.test", JobState::Running),
         ] {
             let job = format!("scan-{at:08x}");
-            registry.insert(crate::jobs::JobEntry {
+            assert!(registry.try_insert(crate::jobs::JobEntry {
                 status: Arc::new(std::sync::RwLock::new(JobStatus {
                     job: job.clone(),
                     state,
@@ -2565,13 +2635,12 @@ mod tests {
                     ..JobStatus::default()
                 })),
                 cancel: tokio_util::sync::CancellationToken::new(),
-                task: None,
                 confine: None,
                 started_by: Default::default(),
                 discovery: Arc::new(std::sync::RwLock::new(Default::default())),
                 origins: vec![origin.to_string()],
                 is_agent: false,
-            });
+            }));
             if !state.is_terminal() {
                 live = Some(job);
             }
@@ -2603,9 +2672,10 @@ mod tests {
 
         // The handles are the entry's own, and cancelling through the registry
         // is what the worker observes.
-        let (status, cancel, discovery) = registry
+        let handles = registry
             .entry_handles(&live)
             .expect("the live job has handles");
+        let (status, cancel, discovery) = (handles.status, handles.cancel, handles.discovery);
         assert!(!cancel.is_cancelled());
         assert!(discovery.read().expect("discovery").points.is_empty());
         registry.cancel(&live);
@@ -2617,20 +2687,22 @@ mod tests {
         );
 
         // A colliding id never displaces the job already admitted.
-        registry.insert(crate::jobs::JobEntry {
-            status: Arc::new(std::sync::RwLock::new(JobStatus {
-                job: live.clone(),
-                profile_name: "impostor".to_string(),
-                ..JobStatus::default()
-            })),
-            cancel: tokio_util::sync::CancellationToken::new(),
-            task: None,
-            confine: None,
-            started_by: Default::default(),
-            discovery: Arc::new(std::sync::RwLock::new(Default::default())),
-            origins: Vec::new(),
-            is_agent: false,
-        });
+        assert!(
+            !registry.try_insert(crate::jobs::JobEntry {
+                status: Arc::new(std::sync::RwLock::new(JobStatus {
+                    job: live.clone(),
+                    profile_name: "impostor".to_string(),
+                    ..JobStatus::default()
+                })),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                confine: None,
+                started_by: Default::default(),
+                discovery: Arc::new(std::sync::RwLock::new(Default::default())),
+                origins: Vec::new(),
+                is_agent: false,
+            }),
+            "a colliding id is refused, not silently dropped"
+        );
         assert_ne!(
             registry.status(&live).expect("still held").profile_name,
             "impostor"

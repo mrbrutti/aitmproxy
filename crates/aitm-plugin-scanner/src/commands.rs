@@ -54,7 +54,7 @@ use aitm_scan_model::{
 use crate::config::ScannerConfig;
 use crate::crawl::normalize_url;
 use crate::inject::target_flows;
-use crate::jobs::{self, Caller, Engine};
+use crate::jobs::{self, Engine};
 use crate::passive::{passive_checks, PassiveFinding};
 use crate::report;
 use crate::util::{default_port, origin_key, wire_token};
@@ -175,10 +175,7 @@ impl Command for ScanDiscover {
         }
 
         let profile = map_profile(cfg, target, max_depth, max_pages)?;
-        let caller = Caller {
-            frontend: host.frontend(),
-            client_label: host.client_label().map(str::to_string),
-        };
+        let caller = crate::verbs::caller_of(host);
         // `force_map`: one HTTP lane, `passive` intensity, no probe. Every
         // refusal (scope, agent policy, concurrency) is the engine's, in spec
         // D3's order; only `busy` is rephrased, because the shipped verb's
@@ -201,8 +198,9 @@ impl Command for ScanDiscover {
             .engine
             .registry
             .entry_handles(&started.job)
-            .map(|(_, _, discovery)| {
-                discovery
+            .map(|handles| {
+                handles
+                    .discovery
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clone()
@@ -2794,23 +2792,7 @@ mod tests {
 
         /// Poll a job to its terminal state from outside the runtime.
         fn wait_terminal(&self, job: &str, within: Duration) -> aitm_scan_model::JobStatus {
-            let deadline = std::time::Instant::now() + within;
-            loop {
-                let status = self
-                    .engine
-                    .registry
-                    .status(job)
-                    .unwrap_or_else(|| panic!("job {job} is in the registry"));
-                if status.state.is_terminal() {
-                    return status;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "job {job} is still {:?} after {within:?}",
-                    status.state
-                );
-                std::thread::sleep(Duration::from_millis(10));
-            }
+            crate::jobs::test_support::wait_terminal_blocking(&self.engine.registry, job, within)
         }
     }
 
