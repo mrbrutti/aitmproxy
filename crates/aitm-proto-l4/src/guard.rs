@@ -4,9 +4,11 @@
 //! passes before reaching the network: raw capture, crafted inject, send-and-
 //! receive, and in-path mangling verdicts. It is intentionally **stronger** than
 //! the core [`ScopeRateGuard`](aitm-core) (host-string + rps only): it matches on
-//! interface + direction + CIDR + port, splits Capture / Inject / Intercept into
-//! separate capabilities, enforces a dangerous-destination denylist, and meters
-//! injection with per-entry and global token buckets plus packet size/count caps.
+//! interface + direction + CIDR + port (an entry's interface may be the
+//! [`ANY_INTERFACE`] wildcard `"*"`, matching any target interface; nothing else
+//! is widened), splits Capture / Inject / Intercept into separate capabilities,
+//! enforces a dangerous-destination denylist, and meters injection with
+//! per-entry and global token buckets plus packet size/count caps.
 //!
 //! The crate composes this guard with the core guard for defense in depth at the
 //! command layer (M5 Task 9), where a resolved authority also passes
@@ -507,12 +509,23 @@ fn describe(target: &L4Target) -> String {
     }
 }
 
+/// The entry-side interface wildcard: a scope entry whose `interface` is `"*"`
+/// matches a target on any interface (D9.5). It is **entry-side only**: a target
+/// whose `interface` is literally `"*"` matches no literal entry, so a caller
+/// cannot widen its own match by naming the wildcard.
+pub const ANY_INTERFACE: &str = "*";
+
 /// Whether a scope entry matches the target's *location* — interface + direction,
 /// plus CIDR and (for Tcp/Udp) port when the target carries them. Capability is
 /// checked separately so "no entry here" and "entry here, wrong capability" are
 /// distinguishable.
+///
+/// The interface clause accepts an entry whose `interface` is [`ANY_INTERFACE`]
+/// (`"*"`) for any target interface; otherwise the two strings must be equal.
+/// Direction, CIDR and port matching are unaffected by the wildcard.
 fn entry_matches_location(entry: &L4ScopeEntry, target: &L4Target) -> bool {
-    if entry.interface != target.interface || entry.direction != target.direction {
+    let interface_ok = entry.interface == ANY_INTERFACE || entry.interface == target.interface;
+    if !interface_ok || entry.direction != target.direction {
         return false;
     }
     if let Some(dst) = target.dst {
@@ -1103,6 +1116,141 @@ mod tests {
         assert!(g.remove_scope(id));
         assert!(matches!(
             g.check(L4Action::Inject, &t),
+            Err(L4GuardError::OutOfL4Scope(_))
+        ));
+    }
+
+    /// D9.5 — an entry with `interface: "*"` matches an `Inject` target on any
+    /// interface (`lo0`, `en0`); the operator authorises a destination, not a NIC.
+    #[test]
+    fn wildcard_interface_matches_any_interface() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("10.0.0.0", 8),
+            "*",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        assert!(g
+            .check(
+                L4Action::Inject,
+                &target("lo0", L4Direction::Outbound, "10.1.2.3", 6379)
+            )
+            .is_ok());
+        assert!(g
+            .check(
+                L4Action::Inject,
+                &target("en0", L4Direction::Outbound, "10.1.2.3", 6379)
+            )
+            .is_ok());
+    }
+
+    /// D9.5 — a literal interface entry still refuses a target on another
+    /// interface; the wildcard changes nothing for literal entries.
+    #[test]
+    fn literal_interface_still_refuses_other_interface() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("10.0.0.0", 8),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        assert_eq!(
+            g.check(
+                L4Action::Inject,
+                &target("en0", L4Direction::Outbound, "10.1.2.3", 6379)
+            )
+            .unwrap_err(),
+            L4GuardError::OutOfL4Scope("10.1.2.3".into())
+        );
+    }
+
+    /// D9.5 — the wildcard covers the interface only: an `Outbound` wildcard
+    /// entry does not match an `Inbound` target.
+    #[test]
+    fn wildcard_does_not_widen_direction() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("10.0.0.0", 8),
+            "*",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        assert!(matches!(
+            g.check(
+                L4Action::Inject,
+                &target("en0", L4Direction::Inbound, "10.1.2.3", 6379)
+            ),
+            Err(L4GuardError::OutOfL4Scope(_))
+        ));
+    }
+
+    /// D9.5 — the wildcard covers the interface only: CIDR and port matching
+    /// still apply to a wildcard entry.
+    #[test]
+    fn wildcard_does_not_widen_cidr_or_port() {
+        let g = L4Guard::new(&cfg());
+        let mut e = entry(
+            ("10.0.0.0", 8),
+            "*",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        );
+        e.ports = PortRange { lo: 6379, hi: 6379 };
+        g.add_scope(e).unwrap();
+        // In CIDR, in port range: the baseline the next two assertions narrow from.
+        assert!(g
+            .check(
+                L4Action::Inject,
+                &target("en0", L4Direction::Outbound, "10.1.2.3", 6379)
+            )
+            .is_ok());
+        // Outside the CIDR.
+        assert_eq!(
+            g.check(
+                L4Action::Inject,
+                &target("en0", L4Direction::Outbound, "192.168.1.1", 6379)
+            )
+            .unwrap_err(),
+            L4GuardError::OutOfL4Scope("192.168.1.1".into())
+        );
+        // Outside the port range.
+        assert_eq!(
+            g.check(
+                L4Action::Inject,
+                &target("en0", L4Direction::Outbound, "10.1.2.3", 6380)
+            )
+            .unwrap_err(),
+            L4GuardError::OutOfL4Scope("10.1.2.3".into())
+        );
+    }
+
+    /// D9.5 — the wildcard is entry-side only: a target whose `interface` is
+    /// literally `"*"` matches no literal entry.
+    #[test]
+    fn wildcard_is_entry_side_only() {
+        let g = L4Guard::new(&cfg());
+        g.add_scope(entry(
+            ("10.0.0.0", 8),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (100, 100),
+        ))
+        .unwrap();
+        assert!(matches!(
+            g.check(
+                L4Action::Inject,
+                &target("*", L4Direction::Outbound, "10.1.2.3", 6379)
+            ),
             Err(L4GuardError::OutOfL4Scope(_))
         ));
     }
