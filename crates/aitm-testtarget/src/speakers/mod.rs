@@ -207,17 +207,6 @@ pub fn take_line(buf: &[u8], max: usize) -> LineScan<'_> {
     LineScan::TooLong
 }
 
-/// The `classified` token the driver logs for a step (spec D2:
-/// `ok|protocol_error|denylisted|trigger`).
-pub fn classify(step: &Step) -> &'static str {
-    match step {
-        Step::Reply(_) | Step::Close(_) => "ok",
-        Step::ProtocolError(_) | Step::Fault(_) => "protocol_error",
-        Step::Denylisted(_) => "denylisted",
-        Step::Trigger => "trigger",
-    }
-}
-
 /// The step for a speaker's deliberate bug: the Vulnerable origin crashes,
 /// the Patched control answers `p_reply` and closes.
 pub fn mode_bug(mode: SeedMode, p_reply: Vec<u8>) -> Step {
@@ -292,23 +281,6 @@ mod tests {
             mode_bug(SeedMode::Patched, b"x".to_vec()),
             Step::Fault(b"x".to_vec())
         );
-    }
-
-    #[test]
-    fn classify_names_the_log_token() {
-        assert_eq!(classify(&Step::Reply(b"+PONG\r\n".to_vec())), "ok");
-        assert_eq!(
-            classify(&Step::ProtocolError(b"-ERR\r\n".to_vec())),
-            "protocol_error"
-        );
-        assert_eq!(classify(&Step::Fault(Vec::new())), "protocol_error");
-        assert_eq!(
-            classify(&Step::Denylisted(b"-ERR denylisted command\r\n".to_vec())),
-            "denylisted"
-        );
-        assert_eq!(classify(&Step::Trigger), "trigger");
-        assert_eq!(classify(&Step::Close(Some(b"+OK\r\n".to_vec()))), "ok");
-        assert_eq!(classify(&Step::Close(None)), "ok");
     }
 
     #[test]

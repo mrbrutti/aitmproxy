@@ -234,7 +234,7 @@ fn unquote(s: &str) -> &str {
 // --- Seed 3: time-based SQLi (`GET /items?id=`, same route) ------------------
 
 /// The sleep a time-based payload asks for, in seconds, capped at
-/// [`MAX_SLEEP_SECS`]. Recognises `SLEEP(n)` (which also covers MySQL's
+/// [`MAX_SLEEP_SECS`]. Recognises `SLEEP(n)` (which also covers PostgreSQL's
 /// `pg_sleep(n)` spelling) and `WAITFOR DELAY '0:0:n'`, case-insensitively.
 fn sleep_seconds(id: &str) -> Option<u64> {
     let lower = id.to_ascii_lowercase();

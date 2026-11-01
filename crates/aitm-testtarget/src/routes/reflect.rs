@@ -164,16 +164,16 @@ fn file(mode: crate::seed::SeedMode, name: &str) -> Resp {
 /// One `multipart/form-data` part: the `name` and optional `filename` from its
 /// `Content-Disposition`, and its raw body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Part {
-    pub name: String,
-    pub filename: Option<String>,
-    pub body: Vec<u8>,
+struct Part {
+    name: String,
+    filename: Option<String>,
+    body: Vec<u8>,
 }
 
 /// The `boundary` parameter of a `multipart/form-data` content type, quoted or
 /// bare; `None` when the type is not multipart or the parameter is absent,
 /// empty or longer than [`MAX_BOUNDARY`].
-pub(crate) fn multipart_boundary(content_type: &str) -> Option<String> {
+fn multipart_boundary(content_type: &str) -> Option<String> {
     let mut params = content_type.split(';');
     let media_type = params.next()?.trim();
     if !media_type.eq_ignore_ascii_case("multipart/form-data") {
@@ -198,7 +198,7 @@ pub(crate) fn multipart_boundary(content_type: &str) -> Option<String> {
 /// most [`MAX_PARTS`] parts are returned and at most [`MAX_PART_HEADER_LINES`]
 /// header lines are read per part. Never panics on malformed input: anything
 /// that does not look like a part is simply absent from the result.
-pub(crate) fn parse_multipart(body: &[u8], boundary: &str) -> Vec<Part> {
+fn parse_multipart(body: &[u8], boundary: &str) -> Vec<Part> {
     let delimiter = format!("--{boundary}").into_bytes();
     let mut parts = Vec::new();
     let mut cursor = match find(body, &delimiter, 0) {
@@ -312,7 +312,7 @@ fn find(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 /// Walk a dotted `path` (`profile.address.city`) through objects by key and
 /// arrays by index; `None` as soon as a step is missing.
-pub(crate) fn json_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
+fn json_path<'a>(v: &'a Value, path: &str) -> Option<&'a Value> {
     path.split('.').try_fold(v, |cur, key| match cur {
         Value::Object(map) => map.get(key),
         Value::Array(items) => key.parse::<usize>().ok().and_then(|i| items.get(i)),

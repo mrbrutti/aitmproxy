@@ -88,8 +88,6 @@ pub(crate) struct RequestInfo {
     pub host: String,
 }
 
-// Routes land in A13-A17; until then only the legacy six and the tests read
-// these accessors.
 impl RequestInfo {
     /// A request header as text (`None` when absent or not UTF-8).
     pub(crate) fn header(&self, name: &str) -> Option<&str> {
@@ -624,7 +622,7 @@ pub(crate) fn index() -> Resp {
 /// Does `/` make `path` discoverable? True when an anchor `href`, a form
 /// `action` or a `data-href` equals `path` (or `path` plus a query), or the
 /// inline script carries `path` as a quoted literal.
-#[allow(dead_code)] // only the `index_links_every_seed_route` unit test calls it
+#[cfg(test)]
 pub(crate) fn index_mentions(path: &str) -> bool {
     let page = index_html();
     let (markup, script) = match (page.find("<script>"), page.find("</script>")) {

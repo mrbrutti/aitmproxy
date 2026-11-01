@@ -10,8 +10,6 @@
 //! and 15, and wrong reserved flag bits, are a `Fault` with no bytes in both
 //! modes.
 
-// consumed by A19 (the driver registers `DEF`); nothing links it yet.
-
 use super::{mode_bug, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;
 

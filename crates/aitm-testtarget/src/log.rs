@@ -422,7 +422,7 @@ impl<T> Ring<T> {
 
 impl<T: Clone> Ring<T> {
     /// The items oldest-first plus the drop count.
-    #[allow(dead_code)] // only the `ring_is_bounded` unit test reads a ring this way; routes use `to_json`
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> (Vec<T>, u64) {
         (self.items.iter().cloned().collect(), self.dropped)
     }
@@ -558,7 +558,7 @@ impl ControlLog {
         })
     }
 
-    #[allow(dead_code)] // only the `reset_clears_and_returns_last_seq` unit test reads it; routes use `mode_token`
+    #[cfg(test)]
     pub(crate) fn mode(&self) -> SeedMode {
         self.mode
     }

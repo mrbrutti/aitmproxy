@@ -23,7 +23,7 @@
 //!
 //! [`TestTarget::builder`] adds the T10 scanner surfaces on the same shared state:
 //! TLS listeners (ALPN `h2`+`http/1.1` and `http/1.1`-only), the loopback
-//! control origin (spec D2) and the nine L4 speakers ([`speakers`]).
+//! control origin (spec D2) and the nine L4 speakers ([`L4Services`]).
 
 mod app;
 mod control;
@@ -34,7 +34,7 @@ mod log;
 pub mod manifest;
 mod routes;
 mod seed;
-pub mod speakers;
+mod speakers;
 mod tls;
 mod ws;
 
@@ -49,7 +49,7 @@ pub use manifest::{
     l4_manifest, manifest, manifest_yaml, seed_index, Discovery, L4Asset, PlantedVuln, SeedRoute,
 };
 pub use seed::SeedMode;
-pub use speakers::{L4Services, RunningService};
+pub use speakers::{L4Services, Proto, RunningService};
 
 /// A running test target: the bound loopback addresses plus the per-instance
 /// state its listeners share (comment store, sessions, control log).
@@ -66,7 +66,7 @@ pub struct TestTarget {
     // target lets the accept loops wind down with it.
     _state: Arc<app::AppState>,
     // Dropping the target aborts every speaker task (and its connections).
-    _l4: Option<L4Services>,
+    l4: Option<L4Services>,
     // The legacy UDP echo + minimal TCP pair ([`l4`]), started alongside the
     // speakers under `l4(true)` so `/services` lists it (spec D2); dropping
     // the target aborts its loops too.
@@ -177,7 +177,7 @@ impl TargetBuilder {
             tls_h1_url,
             control_url,
             _state: state,
-            _l4: l4,
+            l4,
             _legacy_l4: legacy_l4,
         })
     }
@@ -279,12 +279,12 @@ impl TestTarget {
         self.control_url.as_deref()
     }
 
-    /// The running L4 speakers in [`speakers::driver::all`] order; empty unless
+    /// The running L4 speakers in spec D5 table order; empty unless
     /// the builder's `l4(true)` was set. The legacy `l4-udp-echo` /
     /// `l4-tcp-service` pair is not in this list; it is reachable through the
     /// control origin's `/services`.
     pub fn l4_services(&self) -> &[RunningService] {
-        self._l4.as_ref().map(L4Services::services).unwrap_or(&[])
+        self.l4.as_ref().map(L4Services::services).unwrap_or(&[])
     }
 
     /// The seed mode this target serves.

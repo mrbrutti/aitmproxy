@@ -8,8 +8,6 @@
 //! ([`Step::Trigger`]), the Patched control answers `500 line too long` and
 //! closes ([`Step::Fault`]).
 
-// `DEF` is consumed by A19 (the driver's service table); nothing links it yet.
-
 use super::{mode_bug, take_line, LineScan, Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;
 

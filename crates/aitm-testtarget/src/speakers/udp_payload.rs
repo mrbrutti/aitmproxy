@@ -5,8 +5,6 @@
 //! 8 bytes starting `DE AD BE EF` crashes the Vulnerable origin (AC T5-2b);
 //! the Patched control echoes it like any other.
 
-// consumed by A19 (the driver registers `DEF`); nothing links it yet.
-
 use super::{Parsed, Proto, ServiceDef, Speaker, Step};
 use crate::SeedMode;
 

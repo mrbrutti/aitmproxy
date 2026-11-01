@@ -186,8 +186,8 @@ pub(crate) fn apply(step: Step) -> Vec<Action> {
     write.into_iter().chain(std::iter::once(then)).collect()
 }
 
-/// The `classified` token of an `in` message for a step (the enum twin of
-/// [`super::classify`]).
+/// The `classified` token of an `in` message for a step (spec D2:
+/// `ok|protocol_error|denylisted|trigger`; [`Classified`] serialises it).
 pub(crate) fn classified(step: &Step) -> Classified {
     match step {
         Step::Reply(_) | Step::Close(_) => Classified::Ok,
@@ -449,12 +449,14 @@ async fn run_tcp(
                     Ok((stream, peer)) => {
                         let n = conn_ids.fetch_add(1, Ordering::SeqCst) + 1;
                         let conn_id = format!("c-{n:08x}");
-                        log.l4_accept(def.name, &conn_id, peer);
+                        let speaker = (def.new_conn)();
+                        let service = speaker.name();
+                        log.l4_accept(service, &conn_id, peer);
                         let conn = TcpConn {
-                            service: def.name,
+                            service,
                             conn_id,
                             stream,
-                            speaker: (def.new_conn)(),
+                            speaker,
                             mode,
                             log: log.clone(),
                             window: window.clone(),
@@ -521,6 +523,7 @@ async fn run_udp(
     window: Arc<CrashWindow>,
 ) {
     let mut speaker = (def.new_conn)();
+    let service = speaker.name();
     let mut buf = vec![0u8; MAX_DATAGRAM];
     loop {
         let (n, peer) = match socket.recv_from(&mut buf).await {
@@ -542,7 +545,7 @@ async fn run_udp(
             Parsed::Message { verb, step, .. } => (verb, step),
         };
         log.l4_message(
-            def.name,
+            service,
             &conn_id,
             Dir::In,
             datagram,
@@ -553,7 +556,7 @@ async fn run_udp(
             match action {
                 Action::Write(bytes) => {
                     if socket.send_to(&bytes, peer).await.is_ok() {
-                        log.l4_message(def.name, &conn_id, Dir::Out, &bytes, None, Classified::Ok);
+                        log.l4_message(service, &conn_id, Dir::Out, &bytes, None, Classified::Ok);
                     }
                 }
                 // No connection to keep or close over UDP.
@@ -562,7 +565,7 @@ async fn run_udp(
                     let down_at_ms = ControlLog::now_ms();
                     window.trigger_at(Instant::now());
                     log.l4_downtime(
-                        def.name,
+                        service,
                         &conn_id,
                         down_at_ms,
                         up_at_ms(down_at_ms),
@@ -578,7 +581,7 @@ async fn run_udp(
 mod tests {
     use super::*;
     use crate::log::CloseReason;
-    use crate::speakers::{classify, Proto, Step};
+    use crate::speakers::{Proto, Step};
 
     #[test]
     fn all_has_nine_distinct_names_and_grammars() {
@@ -683,22 +686,6 @@ mod tests {
             apply(Step::Close(Some(x.clone()))),
             vec![Action::Write(x), Action::CloseConn(CloseReason::Quit)]
         );
-    }
-
-    #[test]
-    fn classified_agrees_with_classify_token() {
-        let steps = [
-            Step::Reply(vec![1]),
-            Step::ProtocolError(vec![]),
-            Step::Denylisted(vec![1]),
-            Step::Fault(vec![]),
-            Step::Trigger,
-            Step::Close(None),
-        ];
-        for step in steps {
-            let token = serde_json::to_value(classified(&step)).expect("serialize token");
-            assert_eq!(token, serde_json::json!(classify(&step)), "{step:?}");
-        }
     }
 
     #[test]

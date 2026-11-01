@@ -19,8 +19,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use aitm_testtarget::speakers::Proto;
-use aitm_testtarget::{SeedMode, TestTarget};
+use aitm_testtarget::{Proto, SeedMode, TestTarget};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

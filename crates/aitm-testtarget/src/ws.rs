@@ -79,20 +79,6 @@ impl Opcode {
             Opcode::Pong => 0xA,
         }
     }
-
-    /// Lower-case wire token (the `frame` log entry serialises
-    /// [`WsOpcode`] instead; kept for callers that print opcodes).
-    #[allow(dead_code)] // only the `opcode_table` unit test calls it
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            Opcode::Continuation => "continuation",
-            Opcode::Text => "text",
-            Opcode::Binary => "binary",
-            Opcode::Close => "close",
-            Opcode::Ping => "ping",
-            Opcode::Pong => "pong",
-        }
-    }
 }
 
 /// One decoded (and unmasked) frame.
@@ -709,12 +695,6 @@ mod tests {
         assert_eq!(Opcode::from_u8(0xA), Some(Opcode::Pong));
         assert_eq!(Opcode::from_u8(0x3), None);
         assert_eq!(Opcode::from_u8(0xB), None);
-        assert_eq!(Opcode::Text.as_str(), "text");
-        assert_eq!(Opcode::Binary.as_str(), "binary");
-        assert_eq!(Opcode::Close.as_str(), "close");
-        assert_eq!(Opcode::Ping.as_str(), "ping");
-        assert_eq!(Opcode::Pong.as_str(), "pong");
-        assert_eq!(Opcode::Continuation.as_str(), "continuation");
         // A reserved opcode on the wire is Malformed, not a panic.
         let wire = [0x83, 0x80, 1, 2, 3, 4];
         assert!(matches!(decode_frame(&wire), Decoded::Malformed));
