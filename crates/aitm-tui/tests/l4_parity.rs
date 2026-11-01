@@ -1591,3 +1591,310 @@ fn mutate_craft_pane_lists_the_keys_only_when_they_can_act() {
     assert!(!text.contains("apply to parked"), "{text}");
     assert!(!text.contains("u revert"), "{text}");
 }
+
+// ------------------------------------------------------------ scope_add_l4
+
+/// The operator L4 scope add (spec §3 / AC13, AC39). With a core whose
+/// `tools/list` marks `l4.scope.add` `confirmable: true`, the palette line
+/// sends exactly the five strings the core's `ScopeAdd` reads.
+#[test]
+fn scope_add_l4_sends_the_five_strings_when_confirmable() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let reqs = on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture");
+    assert_eq!(
+        reqs,
+        vec![BusRequest::Call {
+            name: "l4.scope.add".into(),
+            args: json!({
+                "cidr": "127.0.0.1/32",
+                "ports": "9100-9199",
+                "interface": "lo0",
+                "direction": "inbound",
+                "capability": "capture"
+            }),
+        }]
+    );
+    assert!(on.current_toast().is_none(), "{:?}", toast_text(&on));
+}
+
+/// The core answers the first call with the confirm handshake
+/// (`{"status":"needs_confirmation","prompt","confirm_token"}`, the shape
+/// `aitm-mcp`'s `needs_confirmation()` builds). The TUI opens the existing
+/// confirm overlay with the core's prompt, and `y` re-issues the identical args
+/// plus `_confirm`.
+#[test]
+fn scope_add_l4_confirm_handshake_reissues_with_the_token() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let _ = on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture");
+    let reqs = on.on_bus(BusEvent::CallOk {
+        name: "l4.scope.add".into(),
+        value: json!({"status": "needs_confirmation", "prompt": "P", "confirm_token": "tok-1"}),
+    });
+    assert_eq!(on.mode, Mode::L4Confirm);
+    let confirm = on.l4.confirm.as_ref().expect("confirm overlay state");
+    assert_eq!(confirm.prompt, "P");
+    assert_eq!(confirm.call, "l4.scope.add");
+    assert!(
+        !reqs.iter().any(|r| matches!(r, BusRequest::Call { .. })),
+        "the handshake reply itself sends nothing: {reqs:?}"
+    );
+
+    assert_eq!(
+        keys::map(press('y'), Mode::L4Confirm),
+        Some(Action::L4Confirm(true))
+    );
+    let reqs = on.update(Action::L4Confirm(true));
+    assert_eq!(
+        reqs,
+        vec![BusRequest::Call {
+            name: "l4.scope.add".into(),
+            args: json!({
+                "cidr": "127.0.0.1/32",
+                "ports": "9100-9199",
+                "interface": "lo0",
+                "direction": "inbound",
+                "capability": "capture",
+                "_confirm": "tok-1"
+            }),
+        }]
+    );
+    assert_eq!(
+        on.mode,
+        Mode::Scope,
+        "back to the scope panel after confirming"
+    );
+
+    // The confirmed call's success re-reads the L4 scope so the new entry
+    // shows without waiting for the slow poll.
+    let reqs = on.on_bus(BusEvent::CallOk {
+        name: "l4.scope.add".into(),
+        value: json!("S4"),
+    });
+    assert!(
+        reqs.contains(&BusRequest::Call {
+            name: "l4.scope.list".into(),
+            args: json!({}),
+        }),
+        "{reqs:?}"
+    );
+    assert_eq!(on.mode, Mode::Scope);
+}
+
+/// Wrong arity or a wrong word is a usage toast and no request.
+#[test]
+fn scope_add_l4_refuses_bad_arity_and_words_locally() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    assert_eq!(on.run_command("scope add l4 127.0.0.1/32"), vec![]);
+    assert!(toast_text(&on).contains("usage"), "{:?}", toast_text(&on));
+    assert_eq!(
+        on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 sideways capture"),
+        vec![]
+    );
+    assert!(toast_text(&on).contains("usage"), "{:?}", toast_text(&on));
+    assert_eq!(
+        on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound sniff"),
+        vec![]
+    );
+    assert!(toast_text(&on).contains("usage"), "{:?}", toast_text(&on));
+}
+
+/// Against a core without unit (a') (`confirmable` false) the full command is
+/// refused locally with the plan's toast and nothing reaches the bus (AC13,
+/// AC33).
+#[test]
+fn scope_add_l4_is_refused_locally_when_not_confirmable() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(false));
+    let reqs = on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture");
+    assert_eq!(reqs, vec![]);
+    assert_eq!(
+        toast_text(&on),
+        "this core cannot confirm an operator L4 scope add"
+    );
+    assert_eq!(on.mode, Mode::Flows, "no confirm overlay opened");
+
+    // No tools at all: the same refusal.
+    let mut bare = app();
+    assert_eq!(
+        bare.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture"),
+        vec![]
+    );
+}
+
+/// HTTP `:scope add <host>` is unchanged by the L4 form.
+#[test]
+fn scope_add_host_is_unchanged() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    assert_eq!(
+        on.run_command("scope add api.test"),
+        vec![BusRequest::ScopeAdd("api.test".into())]
+    );
+    let mut off = app();
+    let _ = connected(&mut off, l4_tools(false));
+    assert_eq!(
+        off.run_command("scope add api.test"),
+        vec![BusRequest::ScopeAdd("api.test".into())]
+    );
+}
+
+/// `l4.scope.list` entries carry `id` and `source` (unit (a) A5) into the
+/// app's state.
+#[test]
+fn scope_add_l4_entries_keep_id_and_source() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let _ = on.on_bus(BusEvent::L4Scope(vec![
+        json!({
+            "id": "S1", "interface": "lo0", "capability": "capture",
+            "cidr": "127.0.0.1/32", "ports": "9000-9999", "direction": "inbound",
+            "source": "config"
+        }),
+        json!({
+            "id": "S4", "interface": "lo0", "capability": "inject",
+            "cidr": "127.0.0.1/32", "ports": "9100-9199", "direction": "inbound",
+            "source": "runtime"
+        }),
+    ]));
+    assert_eq!(on.l4.scope.len(), 2);
+    assert_eq!(on.l4.scope[0].id, "S1");
+    assert_eq!(on.l4.scope[0].source, "config");
+    assert_eq!(on.l4.scope[1].id, "S4");
+    assert_eq!(on.l4.scope[1].source, "runtime");
+    // An entry from a core before A5 still parses, with an empty id and an
+    // empty source (shown as-is, never invented).
+    let _ = on.on_bus(BusEvent::L4Scope(vec![json!({
+        "interface": "en0", "capability": "capture", "cidr": "10.0.0.0/8",
+        "ports": "0-65535", "direction": "outbound"
+    })]));
+    assert_eq!(on.l4.scope.len(), 1);
+    assert_eq!(on.l4.scope[0].id, "");
+    assert_eq!(on.l4.scope[0].source, "");
+}
+
+/// The scope panel (`S`) renders an "L4 scope" section listing every entry with
+/// its interface, cidr, ports, direction, capability and source; the add hint
+/// shows only when the core can confirm it.
+#[test]
+fn scope_add_l4_panel_lists_entries_with_source() {
+    let theme = Theme::new(true);
+    let area = Rect::new(0, 0, 120, 24);
+    let render = |app: &App| -> String {
+        let mut buf = Buffer::empty(area);
+        aitm_tui::ui::overlays::scope(app, &theme, area, &mut buf);
+        buffer_text(&buf).join("\n")
+    };
+
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let _ = on.on_bus(BusEvent::L4Scope(vec![
+        json!({
+            "id": "S1", "interface": "lo0", "capability": "capture",
+            "cidr": "127.0.0.1/32", "ports": "9000-9999", "direction": "inbound",
+            "source": "config"
+        }),
+        json!({
+            "id": "S4", "interface": "lo0", "capability": "inject",
+            "cidr": "127.0.0.1/32", "ports": "9100-9199", "direction": "inbound",
+            "source": "runtime"
+        }),
+    ]));
+    let text = render(&on);
+    assert!(text.contains("L4 scope"), "{text}");
+    let config_row = text
+        .lines()
+        .find(|l| l.contains("9000-9999"))
+        .unwrap_or_else(|| panic!("config entry row: {text}"));
+    for word in [
+        "lo0",
+        "127.0.0.1/32",
+        "9000-9999",
+        "inbound",
+        "capture",
+        "config",
+    ] {
+        assert!(config_row.contains(word), "{word:?} in {config_row:?}");
+    }
+    let runtime_row = text
+        .lines()
+        .find(|l| l.contains("9100-9199"))
+        .unwrap_or_else(|| panic!("runtime entry row: {text}"));
+    for word in [
+        "lo0",
+        "127.0.0.1/32",
+        "9100-9199",
+        "inbound",
+        "inject",
+        "runtime",
+    ] {
+        assert!(runtime_row.contains(word), "{word:?} in {runtime_row:?}");
+    }
+    assert!(
+        text.contains(
+            ":scope add l4 <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>"
+        ),
+        "{text}"
+    );
+
+    // Without (a') the section lists the entries but offers no add form.
+    let mut off = app();
+    let _ = connected(&mut off, l4_tools(false));
+    let _ = off.on_bus(BusEvent::L4Scope(vec![json!({
+        "id": "S1", "interface": "lo0", "capability": "capture",
+        "cidr": "127.0.0.1/32", "ports": "9000-9999", "direction": "inbound",
+        "source": "config"
+    })]));
+    let text = render(&off);
+    assert!(text.contains("L4 scope"), "{text}");
+    assert!(text.contains("9000-9999"), "{text}");
+    assert!(!text.contains("scope add l4"), "{text}");
+
+    // No L4 scope at all: the section says so rather than vanishing.
+    let mut empty = app();
+    let _ = connected(&mut empty, l4_tools(true));
+    let text = render(&empty);
+    assert!(text.contains("L4 scope"), "{text}");
+    assert!(text.contains("no L4 scope"), "{text}");
+}
+
+/// Palette completion offers `scope add l4` (and the direction / capability
+/// words) only against a confirmable core; the HTTP `scope add` stays.
+#[test]
+fn scope_add_l4_completion_is_gated_on_confirmable() {
+    let labels = |app: &mut App, line: &str| -> Vec<String> {
+        app.prompt = line.to_string();
+        app.palette_items().into_iter().map(|i| i.label).collect()
+    };
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let _ = on.on_bus(BusEvent::L4Scope(vec![json!({
+        "id": "S1", "interface": "lo0", "capability": "capture",
+        "cidr": "127.0.0.1/32", "ports": "9000-9999", "direction": "inbound",
+        "source": "config"
+    })]));
+    let l = labels(&mut on, "scope add ");
+    assert!(l.contains(&":scope add l4".to_string()), "{l:?}");
+    let l = labels(&mut on, "scope add l4 127.0.0.1/32 9100-9199 ");
+    assert!(
+        l.contains(&":scope add l4 127.0.0.1/32 9100-9199 lo0".to_string()),
+        "{l:?}"
+    );
+    let l = labels(&mut on, "scope add l4 127.0.0.1/32 9100-9199 lo0 ");
+    assert!(
+        l.contains(&":scope add l4 127.0.0.1/32 9100-9199 lo0 inbound".to_string()),
+        "{l:?}"
+    );
+    let l = labels(&mut on, "scope add l4 127.0.0.1/32 9100-9199 lo0 inbound ");
+    assert!(
+        l.contains(&":scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture".to_string()),
+        "{l:?}"
+    );
+
+    let mut off = app();
+    let _ = connected(&mut off, l4_tools(false));
+    let l = labels(&mut off, "scope add ");
+    assert!(!l.iter().any(|s| s.contains("scope add l4")), "{l:?}");
+}

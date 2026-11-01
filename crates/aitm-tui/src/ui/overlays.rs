@@ -105,7 +105,7 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     }
 }
 
-pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
+pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
     let area = centered(screen, 96, 38);
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     let k = |a: &str, b: &str| key_line(theme, a, b);
@@ -154,6 +154,17 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         lines.push(Line::from(vec![
             Span::styled(format!("   :{cmd:<26}"), theme.accent()),
             Span::styled((*detail).to_string(), theme.text_tertiary()),
+        ]));
+    }
+    // The L4 scope add form exists only where the core can confirm it (spec
+    // §3 / AC39); against any other core help does not offer it.
+    if crate::l4::supports_operator_scope_add(&app.tools) {
+        lines.push(Line::from(vec![
+            Span::styled("   :scope add l4 …             ", theme.accent()),
+            Span::styled(
+                "Add an L4 scope entry: <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>",
+                theme.text_tertiary(),
+            ),
         ]));
     }
     lines.push(Line::raw(""));
@@ -355,6 +366,42 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         for h in oos {
             lines.push(Line::styled(format!("   {h}"), theme.text_tertiary()));
         }
+    }
+    // The L4 scope (L4 parity spec §3, AC13): every `l4.scope.list` entry
+    // with its provenance; the add form only where the core can confirm it.
+    lines.push(Line::raw(""));
+    lines.push(heading(theme, "L4 scope"));
+    if app.l4.scope.is_empty() {
+        lines.push(Line::styled(
+            " no L4 scope — nothing is captured, injected or intercepted at L4.",
+            theme.text_tertiary(),
+        ));
+    }
+    for e in &app.l4.scope {
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(
+                    " {} {:<8} {:<20} {:<12} {:<9} {:<10}",
+                    glyph::SCOPE,
+                    fit(&e.interface, 8),
+                    fit(&e.cidr, 20),
+                    fit(&e.ports, 12),
+                    e.direction,
+                    e.capability
+                ),
+                theme.text_primary(),
+            ),
+            Span::styled(e.source.clone(), theme.text_tertiary()),
+        ]));
+    }
+    if crate::l4::supports_operator_scope_add(&app.tools) {
+        lines.push(Line::styled(
+            format!(
+                " {} (the core asks you to confirm)",
+                crate::l4::SCOPE_ADD_L4_USAGE.trim_start_matches("usage: ")
+            ),
+            theme.text_tertiary(),
+        ));
     }
     lines.push(Line::raw(""));
     let remove_note = if app.has_tool("scope.remove") {

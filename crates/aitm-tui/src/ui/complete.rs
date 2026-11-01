@@ -453,6 +453,85 @@ pub fn l4_command_candidates(
     out
 }
 
+// ---- The `:scope` command line -------------------------------------------
+
+/// Completion for the palette's `:scope` line. `scope add l4 …` and its words
+/// are offered only when `l4_supported` (the core's `l4.scope.add` is
+/// `confirmable`, L4 parity spec §3 / AC39); the HTTP `scope add <host>` is
+/// typed free, so no candidate shadows it. Interface names are the caller's
+/// live state, as for `:l4`.
+pub fn scope_command_candidates(
+    line: &str,
+    l4_supported: bool,
+    interfaces: &[String],
+) -> Vec<Candidate> {
+    let Some(rest) = line.strip_prefix("scope ") else {
+        return Vec::new();
+    };
+    let words: Vec<&str> = rest.split_whitespace().collect();
+    let (done, partial): (&[&str], &str) = match words.split_last() {
+        Some((last, head)) if !rest.ends_with(' ') => (head, last),
+        _ => (&words[..], ""),
+    };
+    let cand = |label: String, detail: &str| Candidate {
+        label,
+        detail: detail.to_string(),
+    };
+    let mut out = Vec::new();
+    match done {
+        [] => {
+            for (sub, detail) in [
+                ("add", "add a host to scope: :scope add <host>"),
+                ("rm", "remove a host from scope: :scope rm <host>"),
+            ] {
+                if sub.starts_with(partial) {
+                    out.push(cand(format!("scope {sub}"), detail));
+                }
+            }
+        }
+        ["add"] if l4_supported => {
+            if "l4".starts_with(partial) {
+                out.push(cand(
+                    "scope add l4".to_string(),
+                    "add an L4 scope entry: <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>",
+                ));
+            }
+        }
+        ["add", "l4", cidr, ports] if l4_supported => {
+            for iface in interfaces {
+                if iface.starts_with(partial) {
+                    out.push(cand(
+                        format!("scope add l4 {cidr} {ports} {iface}"),
+                        "interface (from the L4 scope and flows)",
+                    ));
+                }
+            }
+        }
+        ["add", "l4", cidr, ports, iface] if l4_supported => {
+            for dir in ["inbound", "outbound"] {
+                if dir.starts_with(partial) {
+                    out.push(cand(
+                        format!("scope add l4 {cidr} {ports} {iface} {dir}"),
+                        "direction",
+                    ));
+                }
+            }
+        }
+        ["add", "l4", cidr, ports, iface, dir] if l4_supported => {
+            for cap in ["capture", "inject", "intercept"] {
+                if cap.starts_with(partial) {
+                    out.push(cand(
+                        format!("scope add l4 {cidr} {ports} {iface} {dir} {cap}"),
+                        "capability",
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 // ---- The popup ----------------------------------------------------------
 
 /// The floating completion popup an editor anchors at the caret.

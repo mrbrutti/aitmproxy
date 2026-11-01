@@ -442,6 +442,36 @@ pub fn supports_operator_scope_add(tools: &[ToolInfo]) -> bool {
     tool(tools, "l4.scope.add").is_some_and(|t| t.confirmable)
 }
 
+/// The usage line of `:scope add l4` (shown as the toast on a bad line and as
+/// the scope panel's hint).
+pub const SCOPE_ADD_L4_USAGE: &str =
+    "usage: :scope add l4 <cidr> <ports> <iface> <inbound|outbound> <capture|inject|intercept>";
+
+/// The `l4.scope.add` args of `:scope add l4 <cidr> <ports> <iface> <direction>
+/// <capability>` (spec §3 / AC13): exactly five words, the direction and
+/// capability from their closed vocabularies; everything else is `Err` with the
+/// usage line. The strings go to the core verbatim: its `entry_from_params`
+/// validates the CIDR, ports and interface name.
+pub fn scope_add_args(words: &str) -> Result<Value, &'static str> {
+    let w: Vec<&str> = words.split_whitespace().collect();
+    let [cidr, ports, interface, direction, capability] = w[..] else {
+        return Err(SCOPE_ADD_L4_USAGE);
+    };
+    if !matches!(direction, "inbound" | "outbound") {
+        return Err(SCOPE_ADD_L4_USAGE);
+    }
+    if !matches!(capability, "capture" | "inject" | "intercept") {
+        return Err(SCOPE_ADD_L4_USAGE);
+    }
+    Ok(json!({
+        "cidr": cidr,
+        "ports": ports,
+        "interface": interface,
+        "direction": direction,
+        "capability": capability,
+    }))
+}
+
 // ------------------------------------------------------------- packet text
 
 /// The ASCII column of a hex view (spec §2.3 / AC40): printable ASCII
@@ -557,18 +587,30 @@ pub fn layer_tree_lines(layers: &[String]) -> Vec<String> {
 /// (the authoritative CIDR/port matching is the core's `L4Guard`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct L4ScopeEntry {
+    /// The core's scope id (`l4.scope.remove` takes it); empty from a core
+    /// that does not list ids.
+    pub id: String,
     pub interface: String,
     /// `capture` | `inject` | `intercept`.
     pub capability: String,
     pub cidr: String,
     pub ports: String,
     pub direction: String,
+    /// Provenance (unit (a) A5): `config` | `runtime`; empty from a core
+    /// before it, shown as-is and never invented.
+    pub source: String,
 }
 
 impl L4ScopeEntry {
     /// Parse one serialized `L4ScopeEntry`. `None` without an `interface`.
     pub fn from_json(v: &Value) -> Option<Self> {
         let interface = v.get("interface").and_then(Value::as_str)?.to_string();
+        let text = |key: &str| {
+            v.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
         // `l4.scope.list` serializes `cidr` and `ports` as STRINGS ("127.0.0.1/32",
         // "0-65535") — see `commands::scope_entry_to_value`. Read them as such (the
         // web + macOS surfaces do the same); collapse the port range to its display
@@ -588,6 +630,7 @@ impl L4ScopeEntry {
             })
             .unwrap_or_else(|| "any".to_string());
         Some(Self {
+            id: text("id"),
             interface,
             capability: v
                 .get("capability")
@@ -601,6 +644,7 @@ impl L4ScopeEntry {
                 .and_then(Value::as_str)
                 .unwrap_or("outbound")
                 .to_string(),
+            source: text("source"),
         })
     }
 
@@ -964,11 +1008,13 @@ mod tests {
                 .unwrap();
         assert!(!st.in_scope(&flow), "deny-by-default with empty scope");
         st.scope.push(L4ScopeEntry {
+            id: "S1".into(),
             interface: "lo0".into(),
             capability: "capture".into(),
             cidr: "127.0.0.0/8".into(),
             ports: "any".into(),
             direction: "outbound".into(),
+            source: "config".into(),
         });
         assert!(st.in_scope(&flow));
         assert!(

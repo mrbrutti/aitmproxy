@@ -1348,6 +1348,22 @@ impl App {
         // the sub-commands, the known interface names, the directions and the
         // running capture ids. Case matters (ids), so the raw text is used.
         let raw = self.prompt.trim_start().trim_start_matches(':');
+        // A `:scope …` line likewise: `add l4` and its words only against a
+        // core that can confirm the add (spec §3 / AC39).
+        if raw.starts_with("scope ") {
+            return crate::ui::complete::scope_command_candidates(
+                raw,
+                crate::l4::supports_operator_scope_add(&self.tools),
+                &self.l4_interfaces(),
+            )
+            .into_iter()
+            .map(|c| PaletteItem {
+                label: format!(":{}", c.label),
+                detail: c.detail,
+                kind: PaletteKind::Command(c.label),
+            })
+            .collect();
+        }
         if raw.starts_with("l4 ") {
             return crate::ui::complete::l4_command_candidates(
                 raw,
@@ -2007,7 +2023,12 @@ impl App {
     /// Answer the inject confirm overlay (L4OPS-AC10): `yes` re-issues the
     /// identical call plus the reserved `_confirm` token; `no` cancels.
     fn l4_answer_confirm(&mut self, yes: bool) -> Vec<BusRequest> {
-        self.mode = Mode::Inspector;
+        // The scope add was typed from the palette, not the inspector: go
+        // back to the scope panel, where the entry will appear.
+        self.mode = match self.l4.confirm.as_ref().map(|c| c.call.as_str()) {
+            Some("l4.scope.add") => Mode::Scope,
+            _ => Mode::Inspector,
+        };
         let Some(c) = self.l4.confirm.take() else {
             return Vec::new();
         };
@@ -2019,6 +2040,36 @@ impl App {
         } else {
             self.toast(Level::Info, format!("{} cancelled", c.call));
             Vec::new()
+        }
+    }
+
+    /// `:scope add l4 <cidr> <ports> <iface> <direction> <capability>` (L4
+    /// parity spec §3, AC13): the operator L4 scope add through the core's
+    /// confirm-over-the-wire handshake. Only when `tools/list` marks
+    /// `l4.scope.add` `confirmable` (a core with unit (a')); against any other
+    /// core it is refused here and nothing reaches the bus (AC39, AC33). The
+    /// five strings go verbatim; the core validates and summarises them in the
+    /// prompt its `needs_confirmation` reply carries.
+    fn l4_scope_add(&mut self, words: &str) -> Vec<BusRequest> {
+        if !crate::l4::supports_operator_scope_add(&self.tools) {
+            self.toast(
+                Level::Warn,
+                "this core cannot confirm an operator L4 scope add",
+            );
+            return Vec::new();
+        }
+        match crate::l4::scope_add_args(words) {
+            Ok(args) => {
+                self.l4.pending = Some(("l4.scope.add".to_string(), args.clone()));
+                vec![BusRequest::Call {
+                    name: "l4.scope.add".into(),
+                    args,
+                }]
+            }
+            Err(usage) => {
+                self.toast(Level::Error, usage);
+                Vec::new()
+            }
         }
     }
 
@@ -2642,7 +2693,7 @@ impl App {
                     Some(PaletteItem {
                         kind: PaletteKind::Command(cmd),
                         ..
-                    }) if cmd.starts_with("l4 ") => {
+                    }) if cmd.starts_with("l4 ") || cmd.starts_with("scope ") => {
                         self.close_prompt();
                         out.extend(self.run_command(&cmd));
                     }
@@ -3428,6 +3479,11 @@ impl App {
             "scope" => {
                 let mut p = rest.splitn(2, ' ');
                 match (p.next().unwrap_or(""), p.next().unwrap_or("").trim()) {
+                    // `:scope add l4 …` is the operator L4 scope add (spec §3);
+                    // a host that happens to start with "l4" is not it.
+                    ("add", h) if h == "l4" || h.starts_with("l4 ") => {
+                        out.extend(self.l4_scope_add(h.trim_start_matches("l4")));
+                    }
                     ("add", h) if !h.is_empty() => out.push(BusRequest::ScopeAdd(h.to_string())),
                     ("rm", h) | ("remove", h) if !h.is_empty() => {
                         if self.has_tool("scope.remove") {
@@ -4071,6 +4127,44 @@ impl App {
                                 self.toast(Level::Info, format!("{name}: {shown}"));
                             }
                         }
+                    }
+                    // The operator L4 scope add (spec §3): the first reply is
+                    // the confirm handshake; the confirmed one is the new id,
+                    // and the scope is re-read so the panel shows it now.
+                    "l4.scope.add" => {
+                        let (call, args) = self
+                            .l4
+                            .pending
+                            .take()
+                            .unwrap_or((name.clone(), Value::Null));
+                        match crate::l4::L4Confirm::from_reply(&call, &args, &value) {
+                            Some(confirm) => {
+                                self.l4.confirm = Some(confirm);
+                                self.mode = Mode::L4Confirm;
+                                return out;
+                            }
+                            None => {
+                                let shown: String = value_text(&value).chars().take(60).collect();
+                                self.toast(Level::Info, format!("L4 scope + {shown}"));
+                                if self.has_tool("l4.scope.list") {
+                                    out.push(BusRequest::Call {
+                                        name: "l4.scope.list".into(),
+                                        args: json!({}),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    // A direct `l4.scope.list` read (after a scope add): the
+                    // same fold as the slow poll's, silently.
+                    "l4.scope.list" => {
+                        if let Value::Array(entries) = &value {
+                            self.l4.scope = entries
+                                .iter()
+                                .filter_map(crate::l4::L4ScopeEntry::from_json)
+                                .collect();
+                        }
+                        return out;
                     }
                     // L4 agent gate set/status reply: the four gate states.
                     "l4.agent.set" => {
