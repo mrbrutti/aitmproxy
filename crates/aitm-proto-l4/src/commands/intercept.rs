@@ -1321,6 +1321,7 @@ mod tests {
                 policy_file_present: false,
                 pkexec_present: false,
                 prompt_possible: false,
+                last_session_error: None,
             }),
             request: None,
             now_ms: NOW,

@@ -32,14 +32,14 @@ use crate::guard::L4Guard;
 use crate::helper::client::{
     ensure_socket_dir, socket_path, HelperListener, HelperSession, SessionError,
 };
-use crate::privilege::derive::{derive, text, LinuxInputs, ProbeInputs};
+use crate::privilege::derive::{derive, text, LinuxInputs, ProbeInputs, SessionFailure};
 use crate::privilege::linux::{
-    direct_helper_argv, gather_linux, msg, request_linux, watch_step, Child, NoopSignalGuard,
-    SignalGuard, Spawned, Spawner, StdSpawner, WatchOutcome,
+    direct_helper_argv, gather_linux, msg, request_linux, watch_step, Child, HoldCount, Spawned,
+    Spawner, StdSpawner, WatchOutcome,
 };
 use crate::privilege::macos::gather_mac;
 use crate::privilege::report::{
-    Capability, Platform, PrivilegeReport, RequestProgress, RequestState,
+    bounded_text, Capability, Platform, PrivilegeReport, RequestProgress, RequestState, TEXT_BOUND,
 };
 
 /// How old a not-available cached report may be before `report()` re-probes.
@@ -67,6 +67,8 @@ const LIVE_POLL: Duration = Duration::from_millis(250);
 const REAP_WAIT: Duration = Duration::from_secs(10);
 /// How long a first use waits for a directly started helper to attach.
 const LAZY_START_WAIT: Duration = Duration::from_secs(5);
+/// How long `request()` waits for another caller's first probe to land.
+const SETTLE_WAIT: Duration = Duration::from_secs(10);
 
 /// What `l4.privilege.request` answers (spec §2.3): the outcome, a message for
 /// the operator, and the report as it stands right after the request.
@@ -191,6 +193,12 @@ pub(crate) struct Shared {
     /// The Linux inputs of the last platform probe, for the requester and the
     /// lazy direct start.
     last_linux: Mutex<Option<LinuxInputs>>,
+    /// How the last helper session failed its handshake (spec §5.2), for the
+    /// `version_mismatch` row; cleared when a session attaches.
+    session_failure: Mutex<Option<SessionFailure>>,
+    /// The SIGINT hold (spec §5.5): raised around a launcher child, read by
+    /// the binary's shutdown future through a clone.
+    hold: Mutex<HoldCount>,
     /// A watcher thread is running (a request in flight or a helper serving).
     watching: AtomicBool,
 }
@@ -208,10 +216,40 @@ pub(crate) struct Cache {
     dirty: bool,
     /// Capture-state changes seen so far; one `info!` line each.
     changes: u64,
+    /// A probe is running outside this lock (single flight): another caller
+    /// answers from `report` as it stands instead of waiting.
+    probing: bool,
+    /// The inputs `report` was derived from, for a re-derive under a new
+    /// request without another gather.
+    inputs: Option<ProbeInputs>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// What `claim_probe` decided for one `report()` caller.
+enum Claim {
+    /// This caller probes, with the request as it stood at the claim.
+    Probe(Option<RequestProgress>),
+    /// The cache answers (fresh, or another caller's probe is in flight).
+    Fresh,
+    /// Another caller's **first** probe is in flight: there is no report yet.
+    InFlightNoReport,
+}
+
+/// Releases the single-flight claim if the prober unwinds.
+struct ProbeClaim<'a> {
+    shared: &'a Shared,
+    armed: bool,
+}
+
+impl Drop for ProbeClaim<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.shared.lock_cache().probing = false;
+        }
+    }
 }
 
 impl Shared {
@@ -223,6 +261,8 @@ impl Shared {
             live: Mutex::new(None),
             guard: Mutex::new(None),
             last_linux: Mutex::new(None),
+            session_failure: Mutex::new(None),
+            hold: Mutex::new(HoldCount::default()),
             watching: AtomicBool::new(false),
         })
     }
@@ -280,6 +320,20 @@ impl Shared {
         lock(&self.last_linux).clone()
     }
 
+    /// How the last helper session failed its handshake, if it did.
+    pub(crate) fn session_failure(&self) -> Option<SessionFailure> {
+        lock(&self.session_failure).clone()
+    }
+
+    fn set_session_failure(&self, failure: Option<SessionFailure>) {
+        *lock(&self.session_failure) = failure;
+    }
+
+    /// The SIGINT hold; clones share the count.
+    fn sigint_hold(&self) -> HoldCount {
+        lock(&self.hold).clone()
+    }
+
     fn watching(&self) -> bool {
         self.watching.load(Ordering::SeqCst)
     }
@@ -331,6 +385,23 @@ impl PrivilegeState {
     pub(crate) fn with_requester(mut self, requester: Box<dyn Requester>) -> Self {
         self.requester = requester;
         self
+    }
+
+    /// Share the SIGINT hold with the binary (spec §5.5): the Linux request
+    /// raises it for the launcher child's lifetime and the binary's shutdown
+    /// future keeps serving on a Ctrl-C while it is held. Without this call
+    /// the state counts holds nobody reads.
+    #[must_use]
+    pub fn with_sigint_hold(self, hold: HoldCount) -> Self {
+        *lock(&self.shared.hold) = hold;
+        self
+    }
+
+    /// The SIGINT hold this state raises around a launcher child (a clone
+    /// sharing the count).
+    #[must_use]
+    pub fn sigint_hold(&self) -> HoldCount {
+        self.shared.sigint_hold()
     }
 
     /// The one capture/inject backend every production caller holds (spec §2.1,
@@ -386,11 +457,50 @@ impl PrivilegeState {
     /// just recorded, and whenever the cached capture is not `Available` and
     /// at least [`REPROBE_MS`] old; otherwise answers from the cache. The
     /// `request` field is always the current one.
+    ///
+    /// The probe runs **outside** the cache lock (the platform gatherers spawn
+    /// subprocesses) and in single flight: while one caller probes, another
+    /// answers from the report in hand instead of waiting, and the progress
+    /// writers never block behind a gather.
     #[must_use]
     pub fn report(&self) -> PrivilegeReport {
         let now = self.shared.now();
-        let mut cache = self.shared.lock_cache();
+        if let Claim::Probe(request) = self.claim_probe(now) {
+            self.probe(request, now);
+        }
+        self.report_in_hand(now)
+    }
 
+    /// `report()` for a caller that must not act on an empty first report: if
+    /// another thread's first probe is in flight, wait (bounded) for it.
+    fn report_settled(&self) -> PrivilegeReport {
+        let deadline = Instant::now() + SETTLE_WAIT;
+        loop {
+            let now = self.shared.now();
+            match self.claim_probe(now) {
+                Claim::Probe(request) => self.probe(request, now),
+                Claim::InFlightNoReport if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Claim::InFlightNoReport | Claim::Fresh => {}
+            }
+            return self.report_in_hand(now);
+        }
+    }
+
+    /// Under the cache: decide whether this caller probes. Claiming the probe
+    /// also consumes the dirty mark; a `set_request` during the gather sets it
+    /// again, so the next `report()` re-probes under the new request.
+    fn claim_probe(&self, now: u64) -> Claim {
+        let mut cache = self.shared.lock_cache();
+        if cache.probing {
+            return if cache.report.is_some() {
+                Claim::Fresh
+            } else {
+                Claim::InFlightNoReport
+            };
+        }
         let stale = match &cache.report {
             None => true,
             Some(cached) => {
@@ -398,10 +508,18 @@ impl PrivilegeState {
                     && now.saturating_sub(cache.probed_at) >= REPROBE_MS
             }
         };
-        if stale || cache.dirty {
-            self.probe(&mut cache, now);
+        if !(stale || cache.dirty) {
+            return Claim::Fresh;
         }
+        cache.probing = true;
+        cache.dirty = false;
+        Claim::Probe(cache.request.clone())
+    }
 
+    /// The cached report (or, before the first probe landed, the empty one)
+    /// under the current request.
+    fn report_in_hand(&self, now: u64) -> PrivilegeReport {
+        let cache = self.shared.lock_cache();
         let mut report = cache
             .report
             .clone()
@@ -417,14 +535,15 @@ impl PrivilegeState {
     /// same progress; otherwise the platform [`Requester`] is asked once and
     /// its answer is recorded as this core's request progress
     /// (`HandedToApp` / `Pending` as themselves, `CannotPrompt` as `failed`),
-    /// then the requester's `after_recorded` runs. The returned report is
-    /// taken after that, so it carries the progress and the request-dependent
-    /// rows.
+    /// then the requester's `after_recorded` runs. The returned report is the
+    /// one in hand re-derived under the recorded progress, so it carries the
+    /// request-dependent rows without a second gather (one probe per
+    /// request at most).
     #[must_use]
     pub fn request(&self) -> RequestOutcome {
         let _one_at_a_time = lock(&self.requesting);
 
-        let report = self.report();
+        let report = self.report_settled();
         if !self.cfg.enabled {
             return RequestOutcome {
                 outcome: Outcome::CannotPrompt,
@@ -470,7 +589,7 @@ impl PrivilegeState {
         RequestOutcome {
             outcome,
             message,
-            privilege: self.report(),
+            privilege: self.rederived_report(),
         }
     }
 
@@ -488,14 +607,27 @@ impl PrivilegeState {
         self.shared.lock_cache().changes
     }
 
-    /// Run the prober, derive, move a waiting request to `approved` when
-    /// capture became available, and log a capture-state change.
-    fn probe(&self, cache: &mut Cache, now: u64) {
-        let mut inputs = self.prober.gather(cache.request.as_ref());
+    /// Gather and derive outside the cache lock, then merge under it. A
+    /// prober that panics still releases the single-flight claim.
+    fn probe(&self, request: Option<RequestProgress>, now: u64) {
+        let mut claim = ProbeClaim {
+            shared: &self.shared,
+            armed: true,
+        };
+        let mut inputs = self.prober.gather(request.as_ref());
         inputs.now_ms = now;
-        inputs.request.clone_from(&cache.request);
-        let mut fresh = derive(&inputs);
+        inputs.request = request;
+        let fresh = derive(&inputs);
 
+        let mut cache = self.shared.lock_cache();
+        Self::merge(&mut cache, inputs, fresh, now);
+        cache.probing = false;
+        claim.armed = false;
+    }
+
+    /// Under the lock: move a waiting request to `approved` when capture
+    /// became available, log a capture-state change, and store the result.
+    fn merge(cache: &mut Cache, inputs: ProbeInputs, mut fresh: PrivilegeReport, now: u64) {
         if matches!(fresh.capture, Capability::Available { .. }) {
             let waiting = cache.request.as_ref().is_some_and(|req| {
                 matches!(req.state, RequestState::Pending | RequestState::HandedToApp)
@@ -523,9 +655,23 @@ impl PrivilegeState {
             }
         }
 
+        cache.inputs = Some(inputs);
         cache.report = Some(fresh);
         cache.probed_at = now;
-        cache.dirty = false;
+    }
+
+    /// The report in hand re-derived under the current request (the
+    /// request-dependent rows), without another gather. The dirty mark the
+    /// request left stands, so the next `report()` re-gathers.
+    fn rederived_report(&self) -> PrivilegeReport {
+        let cache = self.shared.lock_cache();
+        let Some(inputs) = &cache.inputs else {
+            drop(cache);
+            return self.report_in_hand(self.shared.now());
+        };
+        let mut inputs = inputs.clone();
+        inputs.request.clone_from(&cache.request);
+        derive(&inputs)
     }
 
     /// Inputs for a platform with nothing gathered; only reached if a probe
@@ -617,7 +763,8 @@ impl Prober for PlatformProber {
         // `session_connected` is whether the helper session the watcher
         // attached is still open (plan P1b.13 hand-over).
         let linux = (platform == Platform::Linux).then(|| {
-            let inputs = gather_linux(self.l4.helper_path.as_deref(), self.shared.live_is_up());
+            let mut inputs = gather_linux(self.l4.helper_path.as_deref(), self.shared.live_is_up());
+            inputs.last_session_error = self.shared.session_failure();
             *lock(&self.shared.last_linux) = Some(inputs.clone());
             inputs
         });
@@ -639,6 +786,7 @@ impl Prober for PlatformProber {
 ///   report already offers (`how.label`), so an operator reads the same one
 ///   action everywhere.
 /// - Linux (plan P1b.14): [`request_linux`] over the last probe's inputs,
+///   under the state's SIGINT hold ([`PrivilegeState::with_sigint_hold`]),
 ///   spawning through the real [`StdSpawner`] once the listener is bound in
 ///   the socket directory; the child and listener wait in `pending` until
 ///   [`Requester::after_recorded`] starts the watcher thread.
@@ -646,7 +794,6 @@ impl Prober for PlatformProber {
 struct PlatformRequester {
     shared: Arc<Shared>,
     spawner: Arc<dyn Spawner>,
-    signal: Arc<dyn SignalGuard>,
     pending: Mutex<Option<PendingWatch>>,
 }
 
@@ -662,7 +809,6 @@ impl PlatformRequester {
         PlatformRequester {
             shared,
             spawner: Arc::new(StdSpawner),
-            signal: Arc::new(NoopSignalGuard),
             pending: Mutex::new(None),
         }
     }
@@ -673,7 +819,9 @@ impl PlatformRequester {
         });
         let binder = BindingSpawner::new(Arc::clone(&self.spawner));
         let socket = binder.socket();
-        let request = request_linux(cfg, &inputs, &binder, &*self.signal, &socket, display_set());
+        // The hold is the state's (shared with the binary's shutdown future).
+        let hold = self.shared.sigint_hold();
+        let request = request_linux(cfg, &inputs, &binder, &hold, &socket, display_set());
         if let Some(spawned) = request.spawned {
             match binder.take_listener() {
                 Some(listener) => {
@@ -982,11 +1130,18 @@ fn attach_session(
     shared: &Shared,
     mut session: HelperSession,
 ) -> Result<Arc<HelperBackend>, String> {
-    session
-        .handshake(CORE_VERSION, HANDSHAKE_TIMEOUT)
-        .map_err(|err| {
-            format!("the packet-capture helper did not complete its handshake ({err})")
-        })?;
+    if let Err(err) = session.handshake(CORE_VERSION, HANDSHAKE_TIMEOUT) {
+        // Spec §5.2: the next report says `version_mismatch`, naming the
+        // protocols or the defect, until a session attaches.
+        shared.set_session_failure(Some(match &err {
+            SessionError::VersionMismatch(theirs) => SessionFailure::VersionMismatch(*theirs),
+            other => SessionFailure::Protocol(bounded_text(&other.to_string(), TEXT_BOUND)),
+        }));
+        return Err(format!(
+            "the packet-capture helper did not complete its handshake ({err})"
+        ));
+    }
+    shared.set_session_failure(None);
     session
         .start_reader()
         .map_err(|err| format!("the packet-capture helper session could not start ({err})"))?;
@@ -1036,21 +1191,28 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::privilege::derive::{MacInputs, ProbeInputs};
+    use crate::privilege::derive::{HelperCandidate, LinuxInputs, MacInputs, ProbeInputs};
     use crate::privilege::report::{
-        Capability, Platform, PrivilegeReport, RequestProgress, RequestState, Via,
+        Capability, HelperStatus, Platform, PrivilegeReport, RequestProgress, RequestState, Via,
     };
 
     /// A prober that answers from a queue of macOS inputs, repeating the last.
     struct Scripted {
         enabled: bool,
         rows: Mutex<Vec<MacInputs>>,
-        calls: AtomicU64,
+        calls: Arc<AtomicU64>,
     }
 
     impl Scripted {
         fn new(rows: Vec<MacInputs>) -> Box<Self> {
             Self::with_enabled(true, rows)
+        }
+
+        /// The same prober plus a handle on its `gather` count.
+        fn counted(rows: Vec<MacInputs>) -> (Box<Self>, Arc<AtomicU64>) {
+            let prober = Self::new(rows);
+            let calls = Arc::clone(&prober.calls);
+            (prober, calls)
         }
 
         /// The same prober reporting `l4.enabled` as `enabled` (the production
@@ -1059,7 +1221,7 @@ mod tests {
             Box::new(Self {
                 enabled,
                 rows: Mutex::new(rows),
-                calls: AtomicU64::new(0),
+                calls: Arc::new(AtomicU64::new(0)),
             })
         }
     }
@@ -1338,8 +1500,8 @@ mod tests {
     use crate::guard::L4Guard;
     use crate::helper::client::{HelperSession, SessionError};
     use crate::helper::proto::{encode, read_msg, Msg, PROTO};
-    use crate::privilege::linux::fakes::{CountingGuard, FakeChild};
-    use crate::privilege::linux::{ChildExit, SignalGuard};
+    use crate::privilege::linux::fakes::FakeChild;
+    use crate::privilege::linux::{ChildExit, HoldCount, SignalGuard};
 
     /// Generous: the machine running these may be under heavy load.
     const WAIT: Duration = Duration::from_secs(30);
@@ -1398,9 +1560,9 @@ mod tests {
     fn watcher_releases_hold_and_records_dismissal() {
         let (state, now) = state_over(vec![row6()]);
         now.store(1_000, Ordering::SeqCst);
-        let holds = Arc::new(AtomicUsize::new(0));
-        let hold = CountingGuard(Arc::clone(&holds)).hold();
-        assert_eq!(holds.load(Ordering::SeqCst), 1);
+        let holds = HoldCount::default();
+        let hold = holds.hold();
+        assert_eq!(holds.count(), 1);
 
         let child = FakeChild {
             ticks_left: 2,
@@ -1417,11 +1579,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(
-            holds.load(Ordering::SeqCst),
-            0,
-            "the hold is released with the child"
-        );
+        assert_eq!(holds.count(), 0, "the hold is released with the child");
         assert_eq!(
             state.report().request,
             Some(RequestProgress {
@@ -1439,8 +1597,8 @@ mod tests {
         let state = Arc::new(state);
         now.store(5_000, Ordering::SeqCst);
         state.set_guard(Arc::new(L4Guard::new(&L4Config::default())));
-        let holds = Arc::new(AtomicUsize::new(0));
-        let hold = CountingGuard(Arc::clone(&holds)).hold();
+        let holds = HoldCount::default();
+        let hold = holds.hold();
 
         let (core, peer) = UnixStream::pair().expect("socketpair");
         let close = helper_peer(peer, true);
@@ -1477,11 +1635,7 @@ mod tests {
                 message: "Packet capture is available through the helper".to_string(),
             })
         );
-        assert_eq!(
-            holds.load(Ordering::SeqCst),
-            0,
-            "the hold is released on connect"
-        );
+        assert_eq!(holds.count(), 0, "the hold is released on connect");
         assert!(state.shared.live_is_up());
 
         // The helper goes away: the slot clears, the session is no longer
@@ -1500,8 +1654,8 @@ mod tests {
     fn watcher_without_guard_fails_the_attach() {
         let (state, now) = state_over(vec![row6()]);
         now.store(9_000, Ordering::SeqCst);
-        let holds = Arc::new(AtomicUsize::new(0));
-        let hold = CountingGuard(Arc::clone(&holds)).hold();
+        let holds = HoldCount::default();
+        let hold = holds.hold();
 
         let (core, peer) = UnixStream::pair().expect("socketpair");
         let _close = helper_peer(peer, false);
@@ -1528,7 +1682,7 @@ mod tests {
             })
         );
         assert!(state.helper_backend().is_none());
-        assert_eq!(holds.load(Ordering::SeqCst), 0);
+        assert_eq!(holds.count(), 0);
     }
 
     /// The binding spawner binds the listener before it spawns; where no
@@ -1538,7 +1692,7 @@ mod tests {
         use crate::privilege::linux::fakes::FakeSpawner;
         use crate::privilege::linux::{pkexec_argv, Spawner};
 
-        let holds = Arc::new(AtomicUsize::new(0));
+        let holds = HoldCount::default();
         let inner = Arc::new(FakeSpawner::new(&holds));
         let binder = BindingSpawner::new(Arc::clone(&inner) as Arc<dyn Spawner>);
         let socket = binder.socket();
@@ -1675,8 +1829,8 @@ mod tests {
             let (state, now) = state_over(vec![row6()]);
             now.store(11_000, Ordering::SeqCst);
             state.set_guard(Arc::new(L4Guard::new(&L4Config::default())));
-            let holds = Arc::new(AtomicUsize::new(0));
-            let hold = CountingGuard(Arc::clone(&holds)).hold();
+            let holds = HoldCount::default();
+            let hold = holds.hold();
 
             let (core, peer) = UnixStream::pair().expect("socketpair");
             let peer_thread = garbage_peer(peer, reply);
@@ -1705,7 +1859,7 @@ mod tests {
             );
             assert_eq!(request.at, 11_000);
             assert_eq!(killed.load(Ordering::SeqCst), 1, "the launcher is killed");
-            assert_eq!(holds.load(Ordering::SeqCst), 0, "the hold is released");
+            assert_eq!(holds.count(), 0, "the hold is released");
             assert!(state.helper_backend().is_none());
             assert!(!state.shared.live_is_up());
             for word in ["sudo", "pkexec", "chmod", "setcap", "chown"] {
@@ -1734,8 +1888,8 @@ mod tests {
 
         let (state, now) = state_over(vec![row6()]);
         now.store(2_000, Ordering::SeqCst);
-        let holds = Arc::new(AtomicUsize::new(0));
-        let hold = CountingGuard(Arc::clone(&holds)).hold();
+        let holds = HoldCount::default();
+        let hold = holds.hold();
         let accepts = Arc::new(AtomicUsize::new(0));
         let child = FakeChild {
             ticks_left: 3,
@@ -1772,8 +1926,294 @@ mod tests {
             0,
             "the child ended on its own"
         );
-        assert_eq!(holds.load(Ordering::SeqCst), 0);
+        assert_eq!(holds.count(), 0);
         assert!(state.helper_backend().is_none());
         assert!(!state.shared.live_is_up());
+    }
+
+    // ---- fix task 2026-11-01: I1 (single-flight probe), I3 (version_mismatch) ----
+
+    /// A prober that blocks in `gather` until its gate opens, and says when it
+    /// entered; once opened it answers at once from then on.
+    struct Blocking {
+        entered: mpsc::Sender<()>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        calls: Arc<AtomicU64>,
+    }
+
+    impl Prober for Blocking {
+        fn gather(&self, request: Option<&RequestProgress>) -> ProbeInputs {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered.send(());
+            let (open, changed) = &*self.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                let (next, _) = changed.wait_timeout(open, WAIT).unwrap();
+                open = next;
+            }
+            ProbeInputs {
+                enabled: true,
+                platform: Platform::Macos,
+                mac: Some(row6()),
+                linux: None,
+                request: request.cloned(),
+                now_ms: 0,
+            }
+        }
+    }
+
+    /// I1: `report()` must not hold the cache while the platform prober runs
+    /// (it spawns subprocesses). While one caller's probe is blocked, a second
+    /// `report()` returns the report in hand, the progress writers do not wait,
+    /// and the second caller starts no probe of its own (single flight).
+    #[test]
+    fn report_does_not_hold_the_cache_while_the_prober_runs() {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let calls = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(PrivilegeState::with_prober(
+            &cfg(),
+            Box::new(Blocking {
+                entered: entered_tx,
+                gate: Arc::clone(&gate),
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(|| 0),
+        ));
+
+        let first = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.report())
+        };
+        entered_rx
+            .recv_timeout(WAIT)
+            .expect("the first probe started");
+
+        // A second report while the first probe is blocked.
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let _ = done_tx.send(state.report());
+            });
+        }
+        let second = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a second report() returned while the first probe was still blocked");
+        assert_eq!(second.request, None);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second caller started no probe of its own"
+        );
+
+        // The progress writers do not block behind the probe either.
+        let (wrote_tx, wrote_rx) = mpsc::channel();
+        {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                state.set_request(Some(RequestProgress {
+                    state: RequestState::Pending,
+                    at: 1,
+                    message: "Waiting".to_string(),
+                }));
+                state.shared.mark_dirty();
+                let _ = wrote_tx.send(());
+            });
+        }
+        wrote_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("set_request/mark_dirty returned while the probe was blocked");
+
+        // Release: the first report lands with the probe's result and the
+        // request recorded meanwhile; the probe ran once for all of this.
+        {
+            let (open, changed) = &*gate;
+            *open.lock().unwrap() = true;
+            changed.notify_all();
+        }
+        let first = first.join().expect("first report");
+        assert_eq!(first.capture.state_str(), "needs_approval");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // The request written during the probe is on the next report, and the
+        // dirty mark it left makes that report probe again (now unblocked).
+        let next = state.report();
+        assert_eq!(
+            next.request.as_ref().map(|r| r.state),
+            Some(RequestState::Pending)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// I1: one `request()` gathers at most once: the report in hand serves the
+    /// pre-checks and the reply is derived under the recorded progress.
+    #[test]
+    fn request_probes_at_most_once() {
+        let (prober, calls) = Scripted::counted(vec![row6()]);
+        let state = PrivilegeState::with_prober(&cfg(), prober, Arc::new(|| 300));
+        let outcome = state.request();
+        assert_eq!(outcome.outcome, Outcome::CannotPrompt);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a fresh state's request() probes exactly once"
+        );
+        // The reply still carries the progress the request recorded.
+        assert_eq!(
+            outcome.privilege.request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 300,
+                message: outcome.message.clone(),
+            })
+        );
+        assert_eq!(outcome.privilege.helper.status, HelperStatus::NotInstalled);
+    }
+
+    /// A Linux prober over the state's own shared half: `session_connected`
+    /// and the last session failure come from the watcher, as in production.
+    struct LinuxOverShared(Arc<Mutex<Option<Arc<Shared>>>>);
+
+    impl Prober for LinuxOverShared {
+        fn gather(&self, request: Option<&RequestProgress>) -> ProbeInputs {
+            let shared = self.0.lock().unwrap().clone().expect("shared");
+            ProbeInputs {
+                enabled: true,
+                platform: Platform::Linux,
+                mac: None,
+                linux: Some(LinuxInputs {
+                    cap_net_raw: false,
+                    cap_net_admin: false,
+                    session_connected: shared.live_is_up(),
+                    helper: Some(HelperCandidate {
+                        path: PathBuf::from(crate::privilege::contract::LINUX_HELPER_PATH),
+                        at_policy_path: true,
+                        root_owned_chain: true,
+                        file_caps_net_raw: false,
+                    }),
+                    policy_file_present: true,
+                    pkexec_present: true,
+                    prompt_possible: true,
+                    last_session_error: shared.session_failure(),
+                }),
+                request: request.cloned(),
+                now_ms: 0,
+            }
+        }
+    }
+
+    fn linux_state_over_shared() -> Arc<PrivilegeState> {
+        let slot = Arc::new(Mutex::new(None));
+        let prober = LinuxOverShared(Arc::clone(&slot));
+        let state = Arc::new(PrivilegeState::with_prober(
+            &cfg(),
+            Box::new(prober),
+            Arc::new(|| 11_000),
+        ));
+        // The prober reads the state's own shared half.
+        *slot.lock().unwrap() = Some(Arc::clone(&state.shared));
+        state.set_guard(Arc::new(L4Guard::new(&L4Config::default())));
+        state
+    }
+
+    /// I3 (spec §5.2): a helper that answers `Hello` with another protocol
+    /// version fails the request **and** the next report says
+    /// `helper.status: version_mismatch` naming both protocol numbers; a
+    /// malformed handshake does the same with the defect; a session that then
+    /// attaches clears it (`running`), and after it ends the row is `installed`.
+    #[test]
+    fn watcher_reports_version_mismatch_until_a_session_attaches() {
+        let state = linux_state_over_shared();
+        let holds = HoldCount::default();
+
+        // Protocol 2.
+        let (core, peer) = UnixStream::pair().expect("socketpair");
+        let peer_thread = garbage_peer(
+            peer,
+            encode(&Msg::HelloAck {
+                proto: 2,
+                helper_version: "9.9.9".to_string(),
+                caps: vec![],
+            }),
+        );
+        let session = HelperSession::from_stream(core).expect("session");
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(FakeChild {
+                exit: Some(ChildExit::Exited(0)),
+                ..FakeChild::alive(4242)
+            }),
+            Box::new(OnePeer(Mutex::new(Some(session)))),
+            holds.hold(),
+            11_000,
+            true,
+        );
+        peer_thread.join().expect("peer");
+        let report = state.report();
+        assert_eq!(report.helper.status, HelperStatus::VersionMismatch);
+        assert_eq!(report.helper.status.as_str(), "version_mismatch");
+        assert_eq!(
+            report.helper.detail.as_deref(),
+            Some("helper speaks protocol 2, this core speaks 1")
+        );
+        assert_eq!(
+            report.request.as_ref().map(|r| r.state),
+            Some(RequestState::Failed)
+        );
+        assert!(!holds.is_held());
+
+        // Garbage: the defect is carried, status is the same.
+        let (core, peer) = UnixStream::pair().expect("socketpair");
+        let peer_thread = garbage_peer(peer, vec![0, 0, 0, 5, 0xff, 1, 2, 3, 4]);
+        let session = HelperSession::from_stream(core).expect("session");
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(FakeChild {
+                exit: Some(ChildExit::Exited(0)),
+                ..FakeChild::alive(4242)
+            }),
+            Box::new(OnePeer(Mutex::new(Some(session)))),
+            holds.hold(),
+            11_000,
+            true,
+        );
+        peer_thread.join().expect("peer");
+        let report = state.report();
+        assert_eq!(report.helper.status, HelperStatus::VersionMismatch);
+        assert_eq!(
+            report.helper.detail.as_deref(),
+            Some("helper did not speak protocol 1 (unknown message type 0xff)")
+        );
+
+        // A good session attaches: the failure is cleared and the row is
+        // `running`; once it ends, `installed` (nothing remembered).
+        let (core, peer) = UnixStream::pair().expect("socketpair");
+        let close = helper_peer(peer, true);
+        let session = HelperSession::from_stream(core).expect("session");
+        let shared = Arc::clone(&state.shared);
+        let hold = holds.hold();
+        let watcher = std::thread::spawn(move || {
+            run_watcher(
+                shared,
+                Box::new(FakeChild {
+                    exit: Some(ChildExit::Exited(0)),
+                    ..FakeChild::alive(4242)
+                }),
+                Box::new(OnePeer(Mutex::new(Some(session)))),
+                hold,
+                11_000,
+                true,
+            );
+        });
+        until("the attached session", || state.shared.live_is_up());
+        let report = state.report();
+        assert_eq!(report.helper.status, HelperStatus::Running);
+        assert_eq!(report.helper.detail, None);
+        assert_eq!(report.capture, Capability::Available { via: Via::Helper });
+        close.send(()).expect("close");
+        watcher.join().expect("watcher");
+        let report = state.report();
+        assert_eq!(report.helper.status, HelperStatus::Installed);
+        assert_eq!(report.helper.detail, None);
     }
 }

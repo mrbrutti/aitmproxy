@@ -37,6 +37,7 @@ use aitm_core::{
 };
 use aitm_findings::FindingsPlugin;
 use aitm_plugin_rhai::{MemoryFindingSink, ScriptEntry, ScriptServices};
+use aitm_proto_l4::privilege::linux::HoldCount;
 use aitm_proto_l4::privilege::state::{PrivilegeConfig, ProcessLifetime};
 use aitm_proto_l4::PrivilegeState;
 use aitm_sysproxy::watchdog::{self, WatchdogArgs};
@@ -374,11 +375,19 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         | Mode::OperatorToken { .. }
         | Mode::SysproxyWatchdog { .. } => ProcessLifetime::Serving,
     };
-    let privilege_state = Arc::new(PrivilegeState::new(&PrivilegeConfig {
-        enabled: l4.enabled,
-        l4: l4.privilege.clone(),
-        lifetime: l4_lifetime,
-    }));
+    // The SIGINT hold (privilege spec §5.5): the state raises it while a
+    // launcher child (the pkexec prompt) is alive; the shutdown futures below
+    // read it, so a Ctrl-C at the prompt cancels the prompt and not the core.
+    let sigint_hold = HoldCount::default();
+    let privilege_state = Arc::new(
+        PrivilegeState::new(&PrivilegeConfig {
+            enabled: l4.enabled,
+            l4: l4.privilege.clone(),
+            lifetime: l4_lifetime,
+        })
+        .with_sigint_hold(sigint_hold.clone()),
+    );
+    let prompt_held = move || sigint_hold.is_held();
     // A script's `browser.navigate` decides SSRF under the same policy as the
     // `browser.navigate` command.
     rhai_cfg.ssrf = cfg.browser.ssrf.clone();
@@ -778,9 +787,12 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     // or the shutdown signal end the `select!`. When another arm wins, dropping this
     // future tears the session down: its rendezvous guard and sockets remove their
     // files and its pumps see the stop.
+    let capture_held = prompt_held.clone();
     let capture_run = async move {
         if let Some(session) = capture_session {
-            session.run(aitm::shutdown_signal()).await;
+            session
+                .run(aitm::shutdown_signal_unless_held(capture_held))
+                .await;
         }
         std::future::pending::<std::convert::Infallible>().await
     };
@@ -940,7 +952,7 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
             result = mcp.serve() => result,
             result = web_run => result,
             never = capture_run => match never {},
-            () = aitm::shutdown_signal() => {
+            () = aitm::shutdown_signal_unless_held(prompt_held) => {
                 info!("shutdown signal received");
                 Ok(())
             }

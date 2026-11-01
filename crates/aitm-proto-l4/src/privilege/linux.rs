@@ -16,6 +16,7 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -153,6 +154,8 @@ pub(crate) fn gather_linux(helper_path: Option<&Path>, session_connected: bool) 
             std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
             std::fs::File::open("/dev/tty").is_ok(),
         ),
+        // The session owner (`PrivilegeState`) knows the last handshake.
+        last_session_error: None,
     }
 }
 
@@ -168,6 +171,7 @@ pub(crate) fn gather_linux(_helper_path: Option<&Path>, session_connected: bool)
         policy_file_present: false,
         pkexec_present: false,
         prompt_possible: false,
+        last_session_error: None,
     }
 }
 
@@ -296,33 +300,60 @@ pub trait Spawner: Send + Sync {
     fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>>;
 }
 
-/// The SIGINT seam of spec §5.5 (S7): while a launcher child is alive the core
-/// is meant to hold a SIGINT **handler** (never `SIG_IGN`) so Ctrl-C cancels
-/// the prompt without ending the core, restoring the previous disposition
-/// when the token drops.
+/// The SIGINT seam of spec §5.5 (S7, corrected in the p1b review log): while
+/// a launcher child is alive, Ctrl-C must cancel the prompt without ending
+/// the core, and `SIG_IGN` is never installed (it would be inherited across
+/// `execve` and make the prompt un-cancellable).
 ///
-/// The real install is `sigaction`, which is an `unsafe fn` in `nix`, and this
-/// crate forbids `unsafe` (plan Rule 8). So this crate carries only the seam:
-/// the trait has a single operation, `hold`, there is nothing through which an
-/// ignore could be installed, and the production default is
-/// [`NoopSignalGuard`]. A real guard belongs in a leaf crate with a
-/// `// SAFETY:` comment and the Security reviewer's sign-off (spec
-/// Constraints); when it lands, note that the `aitm` binary's tokio `ctrl_c`
-/// shutdown future (`shutdown_signal` in `crates/aitm/src/lib.rs`) is displaced
-/// for the prompt window and returns when the token restores the previous
-/// `sigaction`.
+/// The `aitm` binary already owns SIGINT through tokio's `ctrl_c`
+/// (`shutdown_signal` in `crates/aitm/src/lib.rs`), so the signal never kills
+/// the process by itself: what ends the run is the shutdown future. The hold
+/// is therefore a count, [`HoldCount`], that the request raises for the
+/// child's lifetime and the shutdown future consults: a Ctrl-C while held is
+/// logged and the core keeps serving; the child, with the default disposition
+/// restored across exec, dies of it and the watcher records `dismissed`. No
+/// `unsafe`, no `sigaction`, no new crate (plan Rule 8 holds).
+///
+/// The trait has one operation, `hold`; nothing can install an ignore through
+/// it. Tests count holds through the same type.
 pub trait SignalGuard: Send + Sync {
     /// Take a hold for one child's lifetime; dropping the token releases it.
     fn hold(&self) -> Box<dyn Any + Send>;
 }
 
-/// The default seam: a token that does nothing (see [`SignalGuard`]).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoopSignalGuard;
+/// The production [`SignalGuard`]: a shared count of live holds. Clones share
+/// the counter, so the binary's shutdown future can hold one clone while the
+/// privilege state holds another.
+#[derive(Debug, Default, Clone)]
+pub struct HoldCount(Arc<AtomicUsize>);
 
-impl SignalGuard for NoopSignalGuard {
+/// One hold on a [`HoldCount`]; dropping it releases the hold.
+struct HoldToken(Arc<AtomicUsize>);
+
+impl Drop for HoldToken {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl HoldCount {
+    /// At least one hold is out: a prompt is up, Ctrl-C must not end the core.
+    #[must_use]
+    pub fn is_held(&self) -> bool {
+        self.count() > 0
+    }
+
+    /// How many holds are out right now.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl SignalGuard for HoldCount {
     fn hold(&self) -> Box<dyn Any + Send> {
-        Box::new(())
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Box::new(HoldToken(Arc::clone(&self.0)))
     }
 }
 
@@ -781,13 +812,12 @@ pub fn watch_step(
 /// Scripted stand-ins for the request's seams, shared with `state`'s tests.
 #[cfg(test)]
 pub(crate) mod fakes {
-    use std::any::Any;
     use std::ffi::OsString;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use super::{Child, ChildExit, SignalGuard, Spawner};
+    use super::{Child, ChildExit, HoldCount, Spawner};
 
     /// A child that answers `try_wait` with `None` `ticks` times, then `exit`.
     pub(crate) struct FakeChild {
@@ -830,18 +860,18 @@ pub(crate) mod fakes {
     }
 
     /// Records every argv it spawns and how many SIGINT holds were out at
-    /// that moment.
+    /// that moment (read off the production [`HoldCount`]).
     pub(crate) struct FakeSpawner {
         pub(crate) argvs: Mutex<Vec<Vec<OsString>>>,
-        pub(crate) holds: Arc<AtomicUsize>,
+        pub(crate) holds: HoldCount,
         pub(crate) holds_at_spawn: Mutex<Vec<usize>>,
     }
 
     impl FakeSpawner {
-        pub(crate) fn new(holds: &Arc<AtomicUsize>) -> Self {
+        pub(crate) fn new(holds: &HoldCount) -> Self {
             FakeSpawner {
                 argvs: Mutex::new(Vec::new()),
-                holds: Arc::clone(holds),
+                holds: holds.clone(),
                 holds_at_spawn: Mutex::new(Vec::new()),
             }
         }
@@ -853,29 +883,8 @@ pub(crate) mod fakes {
     impl Spawner for FakeSpawner {
         fn spawn(&self, argv: &[OsString]) -> io::Result<Box<dyn Child>> {
             self.argvs.lock().unwrap().push(argv.to_vec());
-            self.holds_at_spawn
-                .lock()
-                .unwrap()
-                .push(self.holds.load(Ordering::SeqCst));
+            self.holds_at_spawn.lock().unwrap().push(self.holds.count());
             Ok(Box::new(FakeChild::alive(4242)))
-        }
-    }
-
-    /// A SIGINT guard whose tokens count: +1 on `hold`, -1 when the token drops.
-    /// Its only operation is `hold`; there is no "ignore" to call.
-    pub(crate) struct CountingGuard(pub(crate) Arc<AtomicUsize>);
-    pub(crate) struct Held(Arc<AtomicUsize>);
-
-    impl Drop for Held {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    impl SignalGuard for CountingGuard {
-        fn hold(&self) -> Box<dyn Any + Send> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::new(Held(Arc::clone(&self.0)))
         }
     }
 }
@@ -1009,10 +1018,10 @@ mod tests {
     use std::ffi::OsString;
     use std::io::Write;
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
 
-    use super::fakes::{CountingGuard, FakeChild, FakeSpawner};
+    use super::fakes::{FakeChild, FakeSpawner};
     use crate::config::L4PrivilegeConfig;
     use crate::privilege::derive::{HelperCandidate, LinuxInputs};
     use crate::privilege::report::RequestState;
@@ -1035,6 +1044,7 @@ mod tests {
             policy_file_present: true,
             pkexec_present: true,
             prompt_possible: true,
+            last_session_error: None,
         }
     }
 
@@ -1055,13 +1065,13 @@ mod tests {
 
     #[test]
     fn one_shot_refuses_and_spawns_nothing() {
-        let holds = Arc::new(AtomicUsize::new(0));
+        let holds = HoldCount::default();
         let spawner = FakeSpawner::new(&holds);
         let req = request_linux(
             &cfg(ProcessLifetime::OneShot, None),
             &packaged(),
             &spawner,
-            &CountingGuard(Arc::clone(&holds)),
+            &holds,
             Path::new(SOCKET),
             true,
         );
@@ -1073,18 +1083,14 @@ mod tests {
         );
         assert!(req.spawned.is_none());
         assert!(spawner.argvs().is_empty(), "nothing is spawned");
-        assert_eq!(
-            holds.load(Ordering::SeqCst),
-            0,
-            "no SIGINT hold without a child"
-        );
+        assert_eq!(holds.count(), 0, "no SIGINT hold without a child");
     }
 
     #[test]
     fn no_prompt_is_cannot_prompt_and_spawns_nothing() {
-        let holds = Arc::new(AtomicUsize::new(0));
+        let holds = HoldCount::default();
         let spawner = FakeSpawner::new(&holds);
-        let guard = CountingGuard(Arc::clone(&holds));
+        let guard = holds.clone();
         let serving = cfg(ProcessLifetime::Serving, None);
 
         let no_prompt = LinuxInputs {
@@ -1147,14 +1153,14 @@ mod tests {
             spawner.argvs().is_empty(),
             "nothing is spawned on any refusal"
         );
-        assert_eq!(holds.load(Ordering::SeqCst), 0);
+        assert_eq!(holds.count(), 0);
     }
 
     #[test]
     fn pkexec_argv_is_policy_path_only() {
-        let holds = Arc::new(AtomicUsize::new(0));
+        let holds = HoldCount::default();
         let spawner = FakeSpawner::new(&holds);
-        let guard = CountingGuard(Arc::clone(&holds));
+        let guard = holds.clone();
         // `l4.privilege.helper_path` points under $HOME; the request still runs
         // only the policy's exec path.
         let configured = cfg(ProcessLifetime::Serving, Some("/home/u/aitm-l4-helper"));
@@ -1366,15 +1372,18 @@ mod tests {
             .any(|arg| arg.to_string_lossy().contains("pkexec")));
     }
 
-    /// Rule 8 keeps the real `sigaction` out of this crate (it is `unsafe` in
-    /// `nix`), so the guard is a seam: the only operation a `SignalGuard` has
-    /// is `hold`, nothing can install `SIG_IGN` through it, and this pins that
-    /// the spawn happens under exactly one hold that the token releases.
+    /// Spec §5.5 as corrected (p1b review log, P1b.14 SIGINT): the guard is
+    /// the production [`HoldCount`], not a fake. Its only operation is `hold`
+    /// (nothing can install `SIG_IGN` through it); the spawn happens under
+    /// exactly one hold, the token releases it, and the binary's shutdown
+    /// future reads the same count through a clone.
     #[test]
     fn sigint_handler_installed_not_ignored() {
-        let holds = Arc::new(AtomicUsize::new(0));
+        let holds = HoldCount::default();
         let spawner = FakeSpawner::new(&holds);
-        let guard = CountingGuard(Arc::clone(&holds));
+        // What the binary's shutdown future would hold.
+        let guard = holds.clone();
+        assert!(!guard.is_held());
 
         let req = request_linux(
             &cfg(ProcessLifetime::Serving, None),
@@ -1385,25 +1394,26 @@ mod tests {
             true,
         );
         let spawned = req.spawned.expect("spawned");
-        assert_eq!(
-            holds.load(Ordering::SeqCst),
-            1,
-            "one hold while the child lives"
-        );
+        assert_eq!(holds.count(), 1, "one hold while the child lives");
         assert_eq!(
             *spawner.holds_at_spawn.lock().unwrap(),
             vec![1],
             "nothing is spawned without a hold"
         );
 
+        assert!(guard.is_held(), "the shutdown future sees the hold");
+
         // The watcher drops the token when the child ends or connects; the
         // previous disposition is back.
         drop(spawned.hold);
-        assert_eq!(holds.load(Ordering::SeqCst), 0);
+        assert_eq!(holds.count(), 0);
+        assert!(!guard.is_held());
 
-        // The production default is the no-op seam: it hands out a token too.
-        let token = NoopSignalGuard.hold();
-        drop(token);
+        // The state's production guard is this type, by construction.
+        let state =
+            crate::privilege::state::PrivilegeState::new(&cfg(ProcessLifetime::Serving, None));
+        let production: HoldCount = state.sigint_hold();
+        assert!(!production.is_held());
     }
 
     #[test]
@@ -1572,15 +1582,12 @@ mod tests {
     #[test]
     fn spawn_failure_is_cannot_prompt_and_releases_the_hold() {
         struct Failing {
-            holds: Arc<AtomicUsize>,
+            holds: HoldCount,
             holds_at_spawn: Mutex<Vec<usize>>,
         }
         impl Spawner for Failing {
             fn spawn(&self, _argv: &[OsString]) -> std::io::Result<Box<dyn Child>> {
-                self.holds_at_spawn
-                    .lock()
-                    .unwrap()
-                    .push(self.holds.load(Ordering::SeqCst));
+                self.holds_at_spawn.lock().unwrap().push(self.holds.count());
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "no pkexec here",
@@ -1588,16 +1595,16 @@ mod tests {
             }
         }
 
-        let holds = Arc::new(AtomicUsize::new(0));
+        let holds = HoldCount::default();
         let spawner = Failing {
-            holds: Arc::clone(&holds),
+            holds: holds.clone(),
             holds_at_spawn: Mutex::new(Vec::new()),
         };
         let req = request_linux(
             &cfg(ProcessLifetime::Serving, None),
             &packaged(),
             &spawner,
-            &CountingGuard(Arc::clone(&holds)),
+            &holds,
             Path::new(SOCKET),
             true,
         );
@@ -1612,11 +1619,7 @@ mod tests {
             vec![1],
             "the hold was taken for the spawn"
         );
-        assert_eq!(
-            holds.load(Ordering::SeqCst),
-            0,
-            "and released when the spawn failed"
-        );
+        assert_eq!(holds.count(), 0, "and released when the spawn failed");
     }
 
     /// Tester: a `try_wait` error (the launcher was reaped by someone else, or
@@ -1680,5 +1683,33 @@ mod tests {
             .err()
             .expect("missing program");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ---- fix task 2026-11-01: I2 (the production SIGINT hold) ----
+
+    /// The production `SignalGuard` is a hold count the binary's shutdown
+    /// future consults: `hold` increments, the token's drop decrements, a
+    /// clone shares the counter, `is_held` is "any token out".
+    #[test]
+    fn hold_count_tokens_increment_and_decrement_on_drop() {
+        let hold = HoldCount::default();
+        assert!(!hold.is_held());
+        assert_eq!(hold.count(), 0);
+
+        let a = hold.hold();
+        assert!(hold.is_held());
+        assert_eq!(hold.count(), 1);
+        let b = hold.hold();
+        assert_eq!(hold.count(), 2);
+
+        let shared = hold.clone();
+        assert!(shared.is_held());
+        drop(a);
+        assert_eq!(shared.count(), 1);
+        assert!(hold.is_held());
+        drop(b);
+        assert_eq!(hold.count(), 0);
+        assert!(!hold.is_held());
+        assert!(!shared.is_held());
     }
 }
