@@ -1,9 +1,10 @@
 //! The libpcap capture/inject backend (M5 Task 6).
 //!
 //! [`PcapBackend`] implements [`CaptureInjectBackend`] over the `pcap` crate — the
-//! same code path on macOS and Linux (research note 08). Injection is L2:
-//! `Capture::sendpacket` writes a frame whose link-layer header the caller already
-//! supplied. Capture opens a live handle with an optional BPF filter.
+//! same code path on macOS and Linux (research note 08). Injection is L2 except
+//! on Linux loopback (below): `Capture::sendpacket` writes a frame whose
+//! link-layer header the caller already supplied. Capture opens a live handle
+//! with an optional BPF filter.
 //!
 //! **Fail-closed.** Every libpcap failure (no privilege, device missing, library
 //! absent) is mapped to [`L4Error::Unavailable`] or [`L4Error::WireWrite`]; the
@@ -31,10 +32,13 @@
 //! Linux loopback injection reads the frame as Ethernet-framed IP, which is what
 //! libpcap reports for Linux `lo` (`DLT_EN10MB`); the destination it routes on is
 //! compared with the guard's own parse of the same frame, so a buffer the guard
-//! read differently is refused rather than injected. Residual, accepted and
-//! recorded in the plan: a buffer the guard could not decode at all is admitted
-//! blindly by the guard (pre-existing) and injected on the header read; the
-//! lane's own frames are always Ethernet-framed with correct fixed headers.
+//! read differently — or could not decode at all — is refused rather than
+//! injected. The raw socket is bound to the named device (`SO_BINDTODEVICE`), so
+//! this path can reach only what `sendpacket` on that device could. Residual,
+//! recorded in the plan and not on this path: `L4Guard::admit_endpoints`, the
+//! capture-side decision whether a frame may be *recorded*, admits an
+//! undecodable frame blindly (pre-existing); injection refuses anything the
+//! admitting parser cannot decode.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
@@ -87,7 +91,14 @@ impl CaptureInjectBackend for PcapBackend {
     /// from a parameter, so this fn cannot redirect a packet the guard admitted.
     /// **Both views are compared**: that header read is cross-checked against the
     /// destination the guard's own parse of the same bytes decodes
-    /// ([`admitted_destination`]), and a disagreement is refused rather than sent.
+    /// ([`admitted_destination`]), and a disagreement — or a frame that parse
+    /// cannot decode — is refused rather than sent. **The device is the
+    /// operator's**: the raw socket is bound to the named device
+    /// (`SO_BINDTODEVICE`), so the new path can reach only what `sendpacket` on
+    /// that device could; an off-host destination on a loopback device fails
+    /// `ENETUNREACH` and is a [`L4Error::WireWrite`], never a packet out of the
+    /// real NIC. **Privilege is reported as such**: `EPERM` from the raw socket is
+    /// [`L4Error::Unavailable`], the same variant the `sendpacket` path returns.
     /// **No handle outlives a guard decision**: both the pcap handle and the raw
     /// socket are opened inside this call and dropped when it returns, so nothing
     /// is cached across `L4Guard` scope/rate/denylist checks — those stay upstream
@@ -98,8 +109,8 @@ impl CaptureInjectBackend for PcapBackend {
         // The lookup is skipped off Linux, so no other OS changes behaviour.
         if cfg!(target_os = "linux") {
             let devices = capture_devices()?;
-            if inject_path(cfg!(target_os = "linux"), iface, &devices) == InjectPath::RawIp {
-                return inject_ip_packet(bytes);
+            if inject_path(true, iface, &devices) == InjectPath::RawIp {
+                return inject_ip_packet(iface, bytes);
             }
         }
         let mut cap = ::pcap::Capture::from_device(iface)
@@ -172,17 +183,22 @@ fn no_ip_packet() -> L4Error {
 ///
 /// The whole remainder of the frame comes back.
 ///
-/// **The lengths are the kernel's.** Only the fixed header has to be there —
-/// enough for [`ip_destination`] to read the destination out of it. Linux
-/// `raw_send_hdrinc` (`net/ipv4/raw.c`, v6.8) unconditionally sets
-/// `iph->tot_len` to the number of bytes it was handed and recomputes
-/// `iph->check` for `ihl >= 5`, so a total length or header checksum that
-/// disagrees with the frame is overwritten before the packet reaches the stack.
-/// Hence no length is checked here, for two reasons: refusing one would turn
-/// the lane's first `ipv4.total_length` / `ipv6.payload_length` mutation into a
-/// `StopReason::WireWrite` job stop, and the check would be moot anyway. The
-/// documented limitation of this path: `ipv4.total_length` and `ipv4.checksum`
-/// mutations do not reach the stack on Linux loopback.
+/// **No length is policed here.** Only the fixed header has to be there —
+/// enough for [`ip_destination`] to read the destination out of it. For IPv4
+/// the lengths are the kernel's: Linux `raw_send_hdrinc` (`net/ipv4/raw.c`,
+/// v6.8) unconditionally sets `iph->tot_len` to the number of bytes it was
+/// handed and recomputes `iph->check` for `ihl >= 5`, so a total length or
+/// header checksum that disagrees with the frame is overwritten before the
+/// packet reaches the stack — the documented limitation of this path:
+/// `ipv4.total_length` and `ipv4.checksum` mutations do not reach the stack on
+/// Linux loopback. IPv6 is different in direction: `rawv6_send_hdrinc`
+/// (`net/ipv6/raw.c`) sends the header **verbatim**, so an `ipv6.payload_length`
+/// mutation does reach the stack (the IPv6 input path drops a bad one).
+/// `IPV6_HDRINCL` needs Linux >= 4.5; a link-local destination with scope id 0
+/// fails `EINVAL` at `send_to`, which is a `WireWrite`, fail-closed — only `::1`
+/// is live-tested. Refusing a length here would turn the lane's first
+/// `ipv4.total_length` / `ipv6.payload_length` mutation into a
+/// `StopReason::WireWrite` job stop, and for IPv4 the check would be moot.
 ///
 /// Anything else — including a buffer that already starts with an IP header — is
 /// [`no_ip_packet`]. An L3-first buffer is refused, never guessed: bytes 12..14 of
@@ -239,23 +255,74 @@ fn ip_destination(packet: &[u8]) -> Result<SocketAddr, L4Error> {
 /// read. When those two parses disagree about where the packet is going, the
 /// frame that was admitted is not the frame that would be sent: refuse,
 /// fail-closed, with no payload bytes in the message. When the guard's parse
-/// yields no destination at all — an undecodable buffer, which the guard admits
-/// blindly by design — there is nothing to disagree with and the path proceeds
-/// on its own read. So amendment 49's "the destination comes from the frame"
-/// holds by construction against the authorising parser.
+/// yields no destination at all — an undecodable buffer — nothing was
+/// authorised, so that is refused too (security panel M3): every production
+/// write path already turns away such a frame before the guard, because
+/// [`crate::capture::packet_target`] is the same decode and yields `None`, so
+/// this arm costs nothing that worked and closes the path against a future
+/// caller that skips the upstream check. So amendment 49's "the destination
+/// comes from the frame" holds by construction against the authorising parser.
 fn admitted_destination(frame: &[u8], dst: IpAddr) -> Result<(), L4Error> {
     match crate::craft::PacketSpec::endpoints(frame).dst {
-        Some(admitted) if admitted != dst => Err(L4Error::WireWrite(
+        Some(admitted) if admitted == dst => Ok(()),
+        Some(_) => Err(L4Error::WireWrite(
             "linux loopback inject: destination disagrees with the admitted frame".to_string(),
         )),
-        _ => Ok(()),
+        None => Err(L4Error::WireWrite(
+            "linux loopback inject: destination not decodable by the admitting parser".to_string(),
+        )),
     }
 }
 
-/// Write one IP packet through a header-included raw socket — the Linux loopback
-/// injection path (module docs). Fail-closed: every socket error becomes
-/// [`L4Error::WireWrite`], and no payload byte reaches the message.
-fn inject_ip_packet(frame: &[u8]) -> Result<(), L4Error> {
+/// Classify a raw-socket failure on the Linux loopback path. `EPERM`
+/// (`PermissionDenied`: no `CAP_NET_RAW`) is [`L4Error::Unavailable`], the
+/// variant this crate documents for "no privilege" and the one the `sendpacket`
+/// path returns for the same condition, so the lane stops with
+/// `StopReason::Unavailable` and the privilege probe reads it correctly. Every
+/// other kind is [`L4Error::WireWrite`]. The message carries the context and the
+/// `io::Error` text only — never a payload byte.
+fn socket_error(context: &str, e: &std::io::Error) -> L4Error {
+    let message = format!("linux loopback inject: {context}: {e}");
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        L4Error::Unavailable(message)
+    } else {
+        L4Error::WireWrite(message)
+    }
+}
+
+/// The [`socket_error`] context for a failed `SO_BINDTODEVICE`: names the
+/// interface, nothing else.
+fn bind_context(iface: &str) -> String {
+    format!("bind to {iface} failed")
+}
+
+/// Bind the raw socket to `iface` (`SO_BINDTODEVICE`), so the kernel routes
+/// only through the device the operator named: a destination with no route via
+/// that device fails `ENETUNREACH` at `send_to` instead of leaving through
+/// another NIC (security panel M1). socket2 exposes `bind_device` on Linux only.
+#[cfg(target_os = "linux")]
+fn bind_to_device(socket: &Socket, iface: &str) -> Result<(), L4Error> {
+    socket
+        .bind_device(Some(iface.as_bytes()))
+        .map_err(|e| socket_error(&bind_context(iface), &e))
+}
+
+/// Off Linux this path is never selected ([`inject_path`] is Linux-only), and
+/// `SO_BINDTODEVICE` is not available; if it were ever reached, fail closed
+/// rather than send through an unbound socket.
+#[cfg(not(target_os = "linux"))]
+fn bind_to_device(_socket: &Socket, iface: &str) -> Result<(), L4Error> {
+    Err(L4Error::Unavailable(format!(
+        "linux loopback inject: {}: SO_BINDTODEVICE is Linux-only",
+        bind_context(iface)
+    )))
+}
+
+/// Write one IP packet through a header-included raw socket bound to `iface` —
+/// the Linux loopback injection path (module docs). Fail-closed: `EPERM` is
+/// [`L4Error::Unavailable`], every other socket error is [`L4Error::WireWrite`]
+/// ([`socket_error`]), and no payload byte reaches the message.
+fn inject_ip_packet(iface: &str, frame: &[u8]) -> Result<(), L4Error> {
     /// `IPPROTO_RAW`: the kernel sends the packet's own header verbatim.
     const IPPROTO_RAW: i32 = 255;
 
@@ -263,30 +330,27 @@ fn inject_ip_packet(frame: &[u8]) -> Result<(), L4Error> {
     let dst = ip_destination(packet)?;
     admitted_destination(frame, dst.ip())?;
 
-    let wire_write = |context: &str, e: &std::io::Error| {
-        L4Error::WireWrite(format!("linux loopback inject: {context}: {e}"))
-    };
-
     let domain = if dst.is_ipv4() {
         Domain::IPV4
     } else {
         Domain::IPV6
     };
     let socket = Socket::new(domain, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))
-        .map_err(|e| wire_write("raw socket", &e))?;
+        .map_err(|e| socket_error("raw socket", &e))?;
     if dst.is_ipv4() {
         socket
             .set_header_included_v4(true)
-            .map_err(|e| wire_write("IP_HDRINCL", &e))?;
+            .map_err(|e| socket_error("IP_HDRINCL", &e))?;
     } else {
         socket
             .set_header_included_v6(true)
-            .map_err(|e| wire_write("IPV6_HDRINCL", &e))?;
+            .map_err(|e| socket_error("IPV6_HDRINCL", &e))?;
     }
+    bind_to_device(&socket, iface)?;
 
     let written = socket
         .send_to(packet, &SockAddr::from(dst))
-        .map_err(|e| wire_write("send_to", &e))?;
+        .map_err(|e| socket_error("send_to", &e))?;
     if written != packet.len() {
         return Err(L4Error::WireWrite(format!(
             "linux loopback inject: short write ({written} of {} bytes)",
@@ -322,12 +386,17 @@ mod tests {
     /// A real crafted `[Ether, Ipv4, Udp, Raw]` loopback frame — the exact shape
     /// `l4.send_recv` puts on the wire.
     fn ether_ipv4_udp_frame(dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        ether_ipv4_udp_frame_to(Ipv4Addr::LOCALHOST, dst_port, payload)
+    }
+
+    /// The same crafted frame from `127.0.0.1` to an arbitrary `dst`.
+    fn ether_ipv4_udp_frame_to(dst: Ipv4Addr, dst_port: u16, payload: &[u8]) -> Vec<u8> {
         PacketSpec {
             layers: vec![
                 Layer::Ether(EtherSpec::default()),
                 Layer::Ipv4(Ipv4Spec {
                     src: Some(Ipv4Addr::LOCALHOST),
-                    dst: Some(Ipv4Addr::LOCALHOST),
+                    dst: Some(dst),
                     ..Ipv4Spec::default()
                 }),
                 Layer::Udp(UdpSpec {
@@ -508,13 +577,14 @@ mod tests {
     }
 
     /// Tester F1 round 2: the loopback path does **not** police the IP length
-    /// fields. Linux `raw_send_hdrinc` (`net/ipv4/raw.c`, v6.8) overwrites
-    /// `iph->tot_len` with the number of bytes it was handed and recomputes
-    /// `iph->check`, so a length that disagrees with the frame is the kernel's
-    /// business, not ours — and refusing one would turn the lane's first
-    /// `ipv4.total_length` mutation into a `StopReason::WireWrite` job stop.
-    /// Every total/payload length here is accepted and the whole remainder of
-    /// the frame comes back.
+    /// fields. For IPv4, Linux `raw_send_hdrinc` (`net/ipv4/raw.c`, v6.8)
+    /// overwrites `iph->tot_len` with the number of bytes it was handed and
+    /// recomputes `iph->check`, so a length that disagrees with the frame is the
+    /// kernel's business, not ours; for IPv6 the header goes out verbatim and
+    /// the stack's input path judges it. Refusing one here would turn the
+    /// lane's first `ipv4.total_length` / `ipv6.payload_length` mutation into a
+    /// `StopReason::WireWrite` job stop. Every total/payload length here is
+    /// accepted and the whole remainder of the frame comes back.
     #[test]
     fn strip_link_header_leaves_lengths_to_the_kernel() {
         let mut packet = vec![0x45; 48];
@@ -535,7 +605,8 @@ mod tests {
         let mut v6 = vec![0x60; 48];
         v6[24..40].copy_from_slice(&Ipv6Addr::LOCALHOST.octets());
         // 40 + 9 = 49 runs one past the 48 bytes present; 0 leaves 8 bytes of
-        // padding; 8 is exact. The kernel owns the IPv6 payload length too.
+        // padding; 8 is exact. Unlike IPv4, the kernel sends the IPv6 header
+        // verbatim (`rawv6_send_hdrinc`), so these reach the stack as written.
         for payload_length in [9u16, 0, 8] {
             v6[4..6].copy_from_slice(&payload_length.to_be_bytes());
             assert_eq!(
@@ -615,15 +686,17 @@ mod tests {
         );
     }
 
-    /// Amendment 49, round 2: the guard admits an undecodable frame blindly by
-    /// design (`guard.rs`, `admit_endpoints(.., &PacketEndpoints::default())`),
-    /// so a frame it cannot decode leaves nothing to cross-check and the path
-    /// proceeds on its own header read. Observed here for an Ethernet/IPv4 frame
-    /// whose total length (1500) runs past the 48 bytes present: every
-    /// [`crate::craft::PacketSpec::endpoints`] field is `None`, and the loopback
-    /// path still accepts the frame (the kernel rewrites `tot_len`).
+    /// Security panel M3 (amendment 49): a frame the admitting parser cannot
+    /// decode at all is **refused**, never injected on our own header read. The
+    /// frame here is Ethernet/IPv4 whose total length (1500) runs past the 48
+    /// bytes present, so every [`crate::craft::PacketSpec::endpoints`] field is
+    /// `None`. Every production write path already refuses such a frame before
+    /// the guard (`capture::packet_target` is the same decode and yields `None`),
+    /// so this arm is reachable only by calling the backend directly — and it
+    /// fails closed there too, so a future caller that skips the upstream check
+    /// cannot route a frame the authorising parser never saw.
     #[test]
-    fn destination_cross_check_proceeds_when_the_guard_view_is_undecodable() {
+    fn destination_cross_check_refuses_an_undecodable_guard_view() {
         let mut packet = vec![0x45; 48];
         packet[2..4].copy_from_slice(&1500u16.to_be_bytes());
         packet[9] = 17; // UDP
@@ -643,8 +716,11 @@ mod tests {
         assert_eq!(dst.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert_eq!(
             admitted_destination(&frame, dst.ip()),
-            Ok(()),
-            "no guard destination to disagree with: proceed on our own read"
+            Err(L4Error::WireWrite(
+                "linux loopback inject: destination not decodable by the admitting parser"
+                    .to_string()
+            )),
+            "fail-closed: no admitted destination means nothing was authorised"
         );
     }
 
@@ -657,6 +733,46 @@ mod tests {
         assert_eq!(
             err,
             L4Error::WireWrite("linux loopback inject: frame carries no IP packet".to_string())
+        );
+    }
+
+    /// Quality panel I2 + security panel M1: a raw-socket failure is classified
+    /// by its `io::ErrorKind`. `PermissionDenied` (EPERM without `CAP_NET_RAW`)
+    /// is [`L4Error::Unavailable`] — the documented "no privilege" variant the
+    /// `sendpacket` path and the lane's `StopReason::Unavailable` already use —
+    /// and every other kind is [`L4Error::WireWrite`]. A bind failure names the
+    /// interface it tried to bind, and no message carries payload bytes.
+    #[test]
+    fn socket_error_classifies_eperm_as_unavailable_and_the_rest_as_wire_write() {
+        use std::io::{Error, ErrorKind};
+
+        assert_eq!(
+            socket_error("raw socket", &Error::from(ErrorKind::PermissionDenied)),
+            L4Error::Unavailable(
+                "linux loopback inject: raw socket: permission denied".to_string()
+            ),
+            "EPERM is the privilege signal, not a broken send path"
+        );
+        assert_eq!(
+            socket_error("send_to", &Error::from(ErrorKind::NetworkUnreachable)),
+            L4Error::WireWrite("linux loopback inject: send_to: network unreachable".to_string()),
+            "ENETUNREACH from the device-bound socket is a refused write"
+        );
+        assert_eq!(
+            socket_error("IP_HDRINCL", &Error::other("boom")),
+            L4Error::WireWrite("linux loopback inject: IP_HDRINCL: boom".to_string())
+        );
+
+        let bind = socket_error(
+            &bind_context("lo-alias"),
+            &Error::from(ErrorKind::PermissionDenied),
+        );
+        assert_eq!(
+            bind,
+            L4Error::Unavailable(
+                "linux loopback inject: bind to lo-alias failed: permission denied".to_string()
+            ),
+            "the bind message names the interface and nothing else"
         );
     }
 
@@ -886,8 +1002,12 @@ mod tests {
     /// asserts a bound UDP socket receives the payload; part two re-injects to the
     /// now-closed port and asserts the kernel answers ICMP destination unreachable
     /// / port unreachable (type 3, code 3). Before this fix both halves were
-    /// silent. Needs `CAP_NET_RAW`: unprivileged, `inject` is `L4Unavailable` and
-    /// the test skips through the crate's fail-closed path.
+    /// silent. Part three (security panel M1): the raw socket is bound to `lo`,
+    /// so a datagram to `10.255.255.254` — RFC 1918, no route via `lo` — is
+    /// refused `ENETUNREACH` as a `WireWrite` instead of leaving through the
+    /// real NIC. Needs `CAP_NET_RAW`: unprivileged, the raw socket's `EPERM` is
+    /// classified `L4Error::Unavailable` ([`socket_error`]) and the test skips
+    /// through the crate's fail-closed path.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires raw-inject privilege (CAP_NET_RAW); run with AITM_L4_TESTS=1 and -- --ignored"]
@@ -949,6 +1069,14 @@ mod tests {
             seen,
             Some((3, 3)),
             "the closed port answers ICMP destination unreachable / port unreachable"
+        );
+
+        // Part three: the socket is bound to `lo`, so an off-host destination
+        // has no route through it and the write is refused, fail-closed.
+        let off_host = ether_ipv4_udp_frame_to(Ipv4Addr::new(10, 255, 255, 254), port, b"stray");
+        assert!(
+            matches!(backend.inject("lo", &off_host), Err(L4Error::WireWrite(_))),
+            "an off-host destination is refused by the device-bound socket"
         );
     }
 }
