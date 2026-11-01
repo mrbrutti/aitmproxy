@@ -193,9 +193,9 @@ PY
 
 # Prints `true`/`false` from proxy.status, or `unknown` (and returns 1) when the bus read fails.
 bus_capturing() {
-  local status
-  status=$(bus_json proxy.status) || { print -r -- unknown; return 1 }
-  print -r -- "$status" | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["capturing"]).lower())' 2>/dev/null \
+  local reply_json
+  reply_json=$(bus_json proxy.status) || { print -r -- unknown; return 1 }
+  print -r -- "$reply_json" | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["capturing"]).lower())' 2>/dev/null \
     || { print -r -- unknown; return 1 }
 }
 
