@@ -195,6 +195,7 @@ pub(crate) fn encode_frame(opcode: Opcode, payload: &[u8]) -> Vec<u8> {
 }
 
 /// A close frame carrying only the two-byte status code.
+#[cfg(test)]
 pub(crate) fn close_frame(code: u16) -> Vec<u8> {
     encode_frame(Opcode::Close, &code.to_be_bytes())
 }

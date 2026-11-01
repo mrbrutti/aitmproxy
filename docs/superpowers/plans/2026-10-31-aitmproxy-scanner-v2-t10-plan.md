@@ -578,6 +578,10 @@ Kept by the main session during stage 6. One row per finding.
 | PR C fix round 1 | quality (re-review) | Minor x2 | `LARGE_LINE_WITHIN` rationale understated the cost and cited a /tmp file; `accepting`/`MAX_CONNS` `pub(crate)` with no outside user, test mirrors the body | fixed in 946d0ea6 |
 | PR C fix round 2 (6f9e136f..946d0ea6) | security (round 3) | PASS, Minor | the array path re-walks already-complete elements on every read (per-call cost bounded by the 1 MiB buffer; one-byte pacing costs CPU, no memory, loopback-only) | accepted residual (orchestrator 2026-11-01); follow-up: memoise the element walk and cap `*N` at redis's 1 048 576 |
 | PR C fix round 2 | quality (round 3) | PASS, Minor | the memo's soundness relied on an unstated driver property (buffer only shrinks on a returned message or a closing idle step) | fixed in the final commit (`on_idle` drops the memo on every non-`Wait` step; the `scanned` doc names the condition) |
+| Seeds: `--latency-ms` (T7 ruling, cbfaaa09..6969d64b) | spec | Important | server-initiated WS closes (1002/1003/1009) bypassed the delay, contradicting the D1 clause "every WebSocket server frame" | fixed in 45dc6aec + follow-up (`close_with` goes through `send`; a 1002 row in `ws::tests::latency_delays_every_server_frame`) |
+| Seeds: `--latency-ms` | spec | Minor x3 | D1 did not exclude the control origin; plan A20 Files row stale; D1 Library row lacked `.latency_ms(u64)` | fixed in 45dc6aec (D1 clause, A20 Files row, Library row) |
+| Seeds: `--latency-ms` | security | Minor | no sanity ceiling on the flag (a typo answers hours late) | fixed in 45dc6aec (`MAX_LATENCY_MS = 60_000` rejected at parse, tested) |
+| Seeds: `--latency-ms` | quality | Minor x4 | `close_with` bypassed `send` (duplicated write+log); wall-clock zero-case assertion could flake; `assert!(a != b)` and a discarded `JoinResult`; over-long doc line | fixed in 45dc6aec + follow-up (`send` from `close_with`; both timing tests on tokio virtual time via the `test-util` dev feature, zero case == `Duration::ZERO`; `assert_ne!` / `expect`; doc rewrapped) |
 
 ## Shipped
 
