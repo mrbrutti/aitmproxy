@@ -1,7 +1,7 @@
 // Pure helpers behind the Findings panel: ordering, filtering, counts, the "when" text and the
 // Run-again `vars` round trip. Kept free of Solid so they test as plain functions.
 
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 import { fmtClock } from '~/lib/format';
 
 export const SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'] as const;
@@ -31,7 +31,7 @@ export type Verdict = 'passed' | 'failed' | 'not-run';
 /**
  * The core keeps no run history, so a library entry has no verdict until `poc.run` happened in
  * this session (`ran`); a PoC built here but not saved (`local`) cannot have run. A run that
- * arrived with its own timestamp (fixtures, a future core) counts as run.
+ * arrived with its own timestamp (a core that reports its own timestamp) counts as run.
  */
 export function verdictOf(r: Pick<PocRun, 'local' | 'ran' | 'at' | 'passed'>): Verdict {
   if (r.local) return 'not-run';
