@@ -118,6 +118,10 @@ G48. Canary path shown as received (`crates/aitm-tui/src/scan/profiles.rs` `fold
 
 G49. Typed profile names are file-ish keys with no shape check (`crates/aitm-tui/src/app.rs` `submit_scan_profile_name`, `crates/aitm-tui/src/scan/profiles.rs` `set_text(Name)`): refuse a name containing `/`, `\`, `..`, a leading `.`, a control character, or over `SELECTOR_MAX` bytes with `profile name must be a plain file name`; one `fn plain_file_name(s) -> bool` used by both. Test: `../../x`, `/abs`, `.hidden`, a 200-byte name all refused with the prompt kept open. Core-track note (relayed to the coordinator): `scan.profile.save` must validate `name` and `grammar` server-side; the client check is defence only.
 
+## Task 10 spec panel
+
+G50. `request_session_preview` returns early when `previews` already holds the origin (`crates/aitm-tui/src/app.rs`): drop the `contains_key` early return; the in-flight tag dedupe stops duplicates, and re-opening a profile re-reads the session (D11 as amended). Test (`tests/scan_v2_profiles.rs`): open `standard`, fold the preview, Esc, `Enter` again: a second `scan.session.preview:<origin>` request leaves.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
