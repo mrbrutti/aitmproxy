@@ -380,6 +380,15 @@ Kept by the main session during stage 6. One row per finding.
 | 7 | spec | Minor | thirteen helpers public beyond the plan's names | accepted (as for Task 6) |
 | 7 | spec | Minor | three builder rules unpinned (`S` off-tab, `OpenScan` on Issues, Detail-focused landing) | fix round D (D6) |
 | 7 | spec | note | ownership matrix and spec D3 `IssuesState` stale after the hand-offs | matrix row and D3 updated in this commit |
+| 7 | quality | Important | `fetched` records that the TUI asked, not what it got: wrong detail under the cursor, stale reads after a filtered job ends, failed reads block retries | fix round D (D1, merged): `read: BTreeMap<IssueId, Issue>` filled on reply, pruned per fold; `detail()` is the cursor lookup (spec D3/D6 amended) |
+| 7 | quality | Minor | `fetched_at_tick` is write-only | fix round D (D7): the Issues timer counts from it |
+| 7 | quality | Minor | `cycle` hand-rolls four rings | fix round D (D8) |
+| 7 | quality | Minor | keyed-reply arm written twice (`OTHER_JOB`/`OTHER_ISSUE`) | fix round D (D9): `scan_reply_keyed` |
+| 7 | quality | Minor | one tertiary line drawn four ways | fix round D (D10): `hint()` |
+| 7 | quality | Minor | `token()` serde round trip per cell; duplicates `lane_name` | fix round D (D11) |
+| 7 | quality | Minor | severity order and `BySeverity` walk spelled three times | fix round D (D12) |
+| 7 | quality | Minor | tests `contains` where a row literal exists; one `assert!(a == b)` | fix round D (D13) |
+| 7 | quality | Minor | four overstated doc comments; small hygiene | fix round D (D14) |
 
 ## Shipped
 
