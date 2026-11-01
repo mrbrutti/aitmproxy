@@ -29,6 +29,10 @@
 #                        exitcodes log warnings unwritable raw stdout tokens
 #                        clistartup liveenv perf tty
 #
+# Needs `python3` on PATH (free ports, port holders, byte counts, secrets);
+# without it the script exits 2 at once instead of mis-reporting every
+# section as a sandbox that cannot bind a port.
+#
 # A section whose precondition is missing SKIPs with a reason and never FAILs:
 #   - section 14 (TTY recordings) needs stdout to be a terminal (`[ -t 1 ]`)
 #     and a pty `script` can allocate;
@@ -40,7 +44,9 @@
 # Tokens are generated into 0600 files, read into variables and only ever
 # compared with `grep -c -F`; nothing here prints one. Failure-context dumps
 # redact `#t=` URL fragments. The script never uses a global `pkill`: the
-# aitm child of a `script` recording is found through `pgrep -P`.
+# aitm child of a `script` recording is found through `pgrep -P`, and the
+# recordings' stdin feeders write into named pipes under the scratch dir and
+# are tracked by PID, so no `sleep` outlives the run.
 #
 # Exit status is non-zero if any assertion fails.
 # shellcheck disable=SC2016  # the single-quoted `…` below are literal texts the binary prints
@@ -68,6 +74,7 @@ if [ ! -x "$AITM_BIN" ]; then
   echo "FATAL: AITM_BIN=$AITM_BIN is not an executable file; build one (cargo build -p aitm) or set AITM_BIN" >&2
   exit 2
 fi
+command -v python3 >/dev/null || { echo "FATAL: python3 is required (ports, byte counts, secrets)" >&2; exit 2; }
 AITM_BIN="$(cd "$(dirname "$AITM_BIN")" && pwd)/$(basename "$AITM_BIN")"
 OBSCURA="$(dirname "$AITM_BIN")/obscura"
 TUI_BIN="$(dirname "$AITM_BIN")/aitm-tui"
@@ -107,12 +114,12 @@ if [ -z "$ROOT" ] || [ ! -d "$ROOT" ]; then
   exit 2
 fi
 PASS=0; FAIL=0; SKIP=0
-SERVER_PID=""; SERVER_RC=""; RC=""; SCRIPT_PID=""; REC_PID=""; SECTION_FAIL0=0
+SERVER_PID=""; SERVER_RC=""; RC=""; SCRIPT_PID=""; REC_PID=""; FEEDER_PID=""; FEEDER_FIFO=""; SECTION_FAIL0=0
 HOME_DIR=""; CFG=""; CFG_STDIO=""; PROXY_PORT=""; BROWSER_PORT=""; WEB_PORT=""; BUS_PORT=""
 
 cleanup() {
   local p
-  for p in $(jobs -p) ${SERVER_PID:-} ${REC_PID:-} ${SCRIPT_PID:-}; do kill "$p" 2>/dev/null; done
+  for p in $(jobs -p) ${SERVER_PID:-} ${REC_PID:-} ${SCRIPT_PID:-} ${FEEDER_PID:-}; do kill "$p" 2>/dev/null; done
   sleep 0.3
   for p in $(jobs -p); do kill -9 "$p" 2>/dev/null; done
   chmod -R u+rwX "$ROOT" 2>/dev/null
@@ -142,12 +149,19 @@ starts_with() { case "$1" in "$2"*) return 0 ;; esac; return 1; }
 count_re() { local n; n="$(grep -a -c -E -- "$1" "$2" 2>/dev/null)"; printf '%s\n' "${n:-0}"; }
 count_fx() { local n; n="$(grep -a -c -F -- "$1" "$2" 2>/dev/null)"; printf '%s\n' "${n:-0}"; }
 
-# bytecount <file> <python bytes regex>: how many times the byte pattern
-# occurs (locale-independent; for the `script` casts).
+# bytecount <file> <python bytes regex> [path-prefix]: how many times the
+# byte pattern occurs (locale-independent; for the `script` casts). With a
+# third argument, every run of non-blank bytes that starts with that literal
+# path is removed first (the scratch paths a cast echoes); the prefix is
+# escaped, so a TMPDIR with `|`, `+`, `.` or `[` in it cannot break the
+# expression (an unescaped sed would error out and leave an empty file,
+# turning the assertion into a false PASS).
 bytecount() {
-  python3 - "$1" "$2" <<'PY'
-import re, sys
+  python3 - "$1" "$2" "${3:-}" <<'PY'
+import os, re, sys
 data = open(sys.argv[1], 'rb').read()
+if sys.argv[3]:
+    data = re.sub(re.escape(os.fsencode(sys.argv[3])) + rb'[^\s]*', b'', data)
 print(len(re.findall(sys.argv[2].encode('latin-1'), data)))
 PY
 }
@@ -359,6 +373,29 @@ end_recording() {
     sleep 0.25; i=$((i+1))
   done
   wait "$SCRIPT_PID" 2>/dev/null
+  reap_feeder
+}
+
+# start_feeder <cmd...>: run <cmd> in the background with its stdout on a
+# fresh named pipe under $ROOT, as a recording's stdin. Sets FEEDER_FIFO and
+# FEEDER_PID; end_recording (and cleanup) reap the writer. A `<(…)` process
+# substitution would do the same job, but its `sleep` is invisible to
+# `jobs -p`, so one lingered per recording for up to 90 s after the run.
+start_feeder() {
+  FEEDER_PID=""; FEEDER_FIFO="$ROOT/feed.$RANDOM$RANDOM.fifo"
+  mkfifo "$FEEDER_FIFO" || { FEEDER_FIFO=""; return 1; }
+  "$@" >"$FEEDER_FIFO" &
+  FEEDER_PID=$!
+}
+
+# reap_feeder: end the recording's stdin writer and remove its pipe.
+reap_feeder() {
+  if [ -n "$FEEDER_PID" ]; then
+    kill "$FEEDER_PID" 2>/dev/null
+    wait "$FEEDER_PID" 2>/dev/null
+  fi
+  [ -n "$FEEDER_FIFO" ] && rm -f "$FEEDER_FIFO"
+  FEEDER_PID=""; FEEDER_FIFO=""
 }
 
 # record_server <cast> <cmd...>: a serving aitm in a pty, run until its ready
@@ -366,7 +403,10 @@ end_recording() {
 # Returns 1 when the card never appeared.
 record_server() {
   local cast="$1"; shift
-  start_recording "$cast" <(sleep 90) "$@"
+  if ! start_feeder sleep 90; then
+    note "recording: cannot create a named pipe under $ROOT"; return 1
+  fi
+  start_recording "$cast" "$FEEDER_FIFO" "$@"
   local ok=0
   if [ -z "$REC_PID" ]; then
     note "recording: aitm child of script($SCRIPT_PID) not found"
@@ -395,7 +435,9 @@ tui_feeder() {
   done
   sleep 1.5
   printf 'q'
-  sleep 60
+  # Keep the pipe open; `exec` so the tracked FEEDER_PID is this sleeper and
+  # reap_feeder ends it (a killed subshell would leave its `sleep` behind).
+  exec sleep 60
 }
 
 # ===========================================================================
@@ -650,9 +692,9 @@ section_raw() {
 
 # ===========================================================================
 section_stdout() {
-  begin_section "9. stdout silence on the stdio transport (AC-W1-21)"
+  begin_section "9. stdout silence on the stdio transport (AC-W1-21; spec Open question 3 default)"
   new_env stdio || return
-  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG_STDIO" >"$ROOT/stdio.out" 2>/dev/null </dev/null &
+  HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG_STDIO" >"$ROOT/stdio.out" 2>"$ROOT/stdio.err" </dev/null &
   local pid=$! i=0 exited=0
   while [ "$i" -lt 80 ]; do
     kill -0 "$pid" 2>/dev/null || { exited=1; break; }
@@ -664,7 +706,12 @@ section_stdout() {
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; fail "stdio transport did not exit within 20 s of stdin EOF"
   fi
   check "stdout received 0 bytes" [ "$(wc -c <"$ROOT/stdio.out" | tr -d ' ')" = 0 ]
-  end_section
+  # Spec Open question 3 (default in force): when the stdio MCP arm ends on
+  # stdin EOF the reporter says so once, as its last line on stderr; a UTF-8
+  # pipe is plain mode, so the note carries the `·` separator and no glyph.
+  local eof_notes; eof_notes="$(count_re '^stdin closed · stdio MCP transport ended$' "$ROOT/stdio.err")"
+  check "spec Open question 3 default: stderr has exactly one 'stdin closed · stdio MCP transport ended' line ($eof_notes)" [ "$eof_notes" = 1 ]
+  end_section "$ROOT/stdio.err"
 }
 
 # ===========================================================================
@@ -844,8 +891,7 @@ section_tty() {
   cast="$ROOT/tty-ascii.cast"; txt="$cast.txt"
   record_server "$cast" env TERM="$REC_TERM" LC_ALL=C LC_CTYPE=C LANG=C "$AITM_BIN" --config "$CFG" || note "see the assertions below"
   stripped "$cast" > "$txt"
-  LC_ALL=C sed "s|${ROOT}[^[:space:]]*||g" "$cast" > "$cast.noroot"
-  check "LC_ALL=C: no byte ≥ 0x80 in the recording (outside the scratch paths)" [ "$(bytecount "$cast.noroot" '[\x80-\xff]')" = 0 ]
+  check "LC_ALL=C: no byte ≥ 0x80 in the recording (outside the scratch paths)" [ "$(bytecount "$cast" '[\x80-\xff]' "$ROOT")" = 0 ]
   check "LC_ALL=C: done glyph is '+' ('  + N detections ready')" grep -q -E '^  \+ [0-9]+ detections ready' "$txt"
   check "LC_ALL=C: pill is '* aitmproxy - listening'" grep -q -F "* aitmproxy - listening 127.0.0.1:$PROXY_PORT" "$txt"
 
@@ -877,11 +923,15 @@ section_tty() {
 
   # (i) aitm tui: phases, the clear, the alternate screen; `q` leaves only the header.
   cast="$ROOT/tui.cast"
-  start_recording "$cast" <(tui_feeder "$cast") env TERM="$REC_TERM" "$AITM_BIN" --config "$CFG" tui
-  local i=0
-  while kill -0 "$SCRIPT_PID" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.25; i=$((i+1)); done
-  kill -0 "$SCRIPT_PID" 2>/dev/null && note "aitm tui did not exit on 'q' within 50 s; sending Ctrl-C"
-  end_recording INT
+  if start_feeder tui_feeder "$cast"; then
+    start_recording "$cast" "$FEEDER_FIFO" env TERM="$REC_TERM" "$AITM_BIN" --config "$CFG" tui
+    local i=0
+    while kill -0 "$SCRIPT_PID" 2>/dev/null && [ "$i" -lt 200 ]; do sleep 0.25; i=$((i+1)); done
+    kill -0 "$SCRIPT_PID" 2>/dev/null && note "aitm tui did not exit on 'q' within 50 s; sending Ctrl-C"
+    end_recording INT
+  else
+    note "aitm tui recording: cannot create a named pipe under $ROOT"
+  fi
   local verdict
   verdict="$(python3 - "$cast" "›•‹ aitmproxy $EXPECT_VERSION" <<'PY'
 import re, sys

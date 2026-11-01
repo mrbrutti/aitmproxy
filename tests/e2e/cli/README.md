@@ -73,6 +73,16 @@ tests/e2e/cli/term-reporting.sh                      # everything
 AITM_TERM_SECTIONS=preboot,exitcodes tests/e2e/cli/term-reporting.sh
 ```
 
+### Prerequisites
+
+- A built `aitm` (`cargo build -p aitm`) — or set `AITM_BIN=/path/to/aitm`.
+- `python3` on `PATH`: the script uses it to find free loopback ports, hold a
+  port, grow the log for the rotation check, count bytes in the `script`
+  casts and mint the test secrets. Without it the script exits 2 at once
+  (`FATAL: python3 is required`) rather than mis-reporting every section as
+  a sandbox that cannot bind a port.
+- For section 14, `script` able to allocate a pty (see the SKIP reasons).
+
 Run it **directly in a terminal** (not through `| tee`): section 14 records
 real TTY sessions and is guarded by `[ -t 1 ]`; when stdout is a pipe it
 SKIPs with that reason. Capture the output with `script -q <log> tests/e2e/cli/term-reporting.sh`
