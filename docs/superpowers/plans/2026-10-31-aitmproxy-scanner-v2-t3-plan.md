@@ -1361,6 +1361,27 @@ forwarded to the coordinator for the spec file.
 
 **Coordinator decisions received (2026-10-31, after the table above):** (1) D8.2 will say `HttpResponse.version`; the T3-1/T3-2 oracle is `flow.detail` `response.version`. (2) T1b adds `Timing.correlated: bool` (default `false`) to the model: Task 8 builds `Timing` with the fields that exist on this branch, and Task 11 (the T1b merge) adds `correlated: timing::correlated(&t)` at the single construction site in `blind_timing.rs`, so the T10 cell reads it from `evidence.timing`. (3) `CheckMeta.scope: point | node | origin` arrives via T1b; the per-authority TTL guard stays until then. (4) Raw-h2 accept-any TLS is allowed only under S6's conditions (same authority, after `host.baseline()` passed the guarded client, no session headers, observe-only); Task 6 states them in the `raw_h2` doc comment and Task 18 repeats them in the PR body for the security reviewer's explicit sign-off. (5) Check ids as chosen.
 
+
+**Coordinator decision on the raw-h2 gate (2026-11-01, option A).** `aitm-scan-checks-http`
+exports `checks_with(SsrfPolicy, Arc<dyn ScopeRateGuard>)`; `checks()` returns only the
+gate-free checks (the five h2 checks excluded); T3's integration commit (Task 18) swaps
+the one call in `crates/aitm/src/wire.rs` to `checks_with(features.ssrf_policy, guard)`,
+authorised as an integration-shared exception. The interim (seam present, unwired) is
+accepted in writing by the orchestrator for this branch only, provided the PR body
+states it and the `wire.rs` edit is in the same PR; if T3 must merge without it, the h2
+checks ship disabled. T1b adds `ProbeHost::baseline_peer_addr() -> Option<SocketAddr>`
+(default `None`) as a follow-up; the checks use it when present. PR #213 merged as
+`1f1cec4`; `origin/main` is merged into this branch before the checks-crate fix round.
+
+**T1b bridge contract received (2026-11-01), corrections to S5:** `origin` is supplied by
+the host (a script declaring it is a load error); `scope: point|node|origin` is an
+optional meta key; `headers` in every probe response map is a MAP name -> value (not
+pairs); `poc_hint` matchers use the PoC loader's own item vocabulary
+(`#{ type: "status"|"word"|"regex"|..., ...fields }`, parsed as `Assertion::All`,
+negation via a `not` combinator, no `negative` flag); `confidence` defaults to
+`tentative`; `probe.*` outside a check closure is an error; a Rhai check's id is used
+verbatim for `check.<id>`, so `id: "sqli"` keeps `check.sqli`. Tasks 11-16 follow this.
+
 ## Review log
 
 Kept by the main session during stage 6. One row per finding.
