@@ -1,8 +1,8 @@
 # macOS app icons and display names for clients design
 
-**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode; see docs/research/MEMORY.md)
+**Status:** approved — self-approved 2026-10-31 (Matt pre-approved this work in autonomous mode; see docs/research/MEMORY.md); amended 2026-11-01 (self-approved, autonomous mode): stage-6 fix pass on docs PR #242 (see Amendments)
 **Research inputs:** `docs/research/21-macos-app-icon-resolution.md` (facts table, resolution order, open questions); `docs/research/experiments/2026-10-29-macos-ne-spike.md` (the `sourceApp` values the NE really reports); live observation 2026-10-31, apps-attribution session, provider log of the installed extension (see "What the extension sends" below); Matt's acceptance picture 2026-10-31, a Proxyman screenshot with its extension on (see "The acceptance picture"); sibling spec `docs/superpowers/specs/2026-10-31-ne-source-app-on-the-wire-design.md` (PR B, branch `fix/ne-source-app`, D5)
-**Builds on:** PR B — `FlowSummary.sourceApp` and `FlowRow.client = ClientInfo(sourceApp:)` (`apps/mac/Sources/AitmproxyKit/FlowSummary.swift:110,153`, `Flow.swift:125-174` on that branch); main `5eac2a5` (PR #196, revision 2) for `Shell/SidebarView.swift` and `Bus/BusService.swift`
+**Builds on:** PR B — `FlowSummary.sourceApp` and `FlowRow.client = ClientInfo(sourceApp:)` (`apps/mac/Sources/AitmproxyKit/FlowSummary.swift`, `Flow.swift`), merged as PR #195 `3fe92f66` and released in v0.5.9; PR #196 (`5eac2a50`) for `Shell/SidebarView.swift` and `Bus/BusService.swift`; the design is against `main 8e19c2e3`. **Ships second** from this branch, after the traffic-route plan's PR (plan gate 4)
 **Prefix for criteria:** AI-AC
 
 ## Intent
@@ -65,7 +65,7 @@ Where this spec deviates from the picture it says so (D2 service rule: "Claude H
 
 ## Constraints
 
-- **Sequencing and file claims.** PR B (`fix/ne-source-app`) merges before this is coded; revision 2 (PR #196) is on `main` as `5eac2a5` and the working tree's `Shell/SidebarView.swift`, `Bus/BusService.swift` are the shipping versions this spec cites. `AitmproxyKit/Flow.swift` and `AitmproxyKit/FlowSummary.swift` are the NE session's files and are **not edited** by this change (D3 keeps Kit's rule as the no-bundle fallback and adds everything else in new files).
+- **Sequencing and file claims.** PR B is on `main` (PR #195, `3fe92f66`; released in v0.5.9) and PR #196 is `5eac2a50`; the files this spec cites are read on `main 8e19c2e3`. Two PRs ship from this branch: the traffic-route plan's PR **first**, this one second — its Tasks 5/6 edit `Session.swift` and `Bus/BusService.swift` only after that plan's Tasks 2/2b, never concurrently (plan gate 4). `AitmproxyKit/Flow.swift` and `AitmproxyKit/FlowSummary.swift` are the NE session's files and are **not edited** by this change (D3 keeps Kit's rule as the no-bundle fallback and adds everything else in new files).
 - **No new dependencies.** Foundation, AppKit, SwiftUI only. `AitmproxyKit` stays free of AppKit and SwiftUI (`apps/mac/CLAUDE.md` Layout).
 - **Platform.** macOS 26 floor (`Package.swift` `.macOS(.v26)`), Swift tools 6.2 with strict concurrency. SF Symbol `terminal` (macOS 11) is inside the floor.
 - **Threading.** `NSWorkspace.urlForApplication(withBundleIdentifier:)`, `icon(forFile:)`, `Bundle` and `FileManager` are documented any-thread (research 21 Q3/Q6). `NSImage` objects are created off-main and handed to the main actor once; views read only the main-actor cache. The poll loop (`Bus/BusService.swift:139-180`) performs no awaited work for identity: a cache read and, on a miss, a scheduled lookup.
@@ -139,8 +139,8 @@ public struct BoundedCache<Key: Hashable, Value> {
 - `sanitized`: filter Unicode general categories `.control` and `.format` (the same categories PR B's private `withoutControlAndBidi` uses; `Flow.swift` is not edited, so the six lines are repeated here and a Kit test pins both to the same output), trim whitespace and newlines, drop one trailing `.app`, keep the first 64 characters, nil if empty. `"\u{200E}WhatsApp"` → `WhatsApp` (research 21 Q4 trap b); `"Visual Studio Code.app"` → `Visual Studio Code`; `"\u{202E}"` → nil.
 - `isServicePath`: `/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/1/Helpers/Google Chrome Helper.app` → true; `/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/com.apple.WebKit.Networking.xpc` → true; `/Applications/Slack.app/Contents/Library/LoginItems/Slack Helper.app` → true; `/Applications/Safari.app`, `/Applications/Google Chrome.app` → false.
 - `withResolvedName` is `ClientInfo(name: name, bundleID: bundleID, pid: pid)` (the init recomputes the monogram), returning `self` when `name == self.name` so a settled row never changes value.
-- `ClientTree.clients` is today's `Session.clients` body (`Session.swift:479-483`) moved into the Kit; `Session.clients` becomes a one-line call. `ClientTree.hosts(forClient:in:)` counts `authority` over rows whose `client?.groupKey == key`.
-- `Pins.pin/unpin/contains(_ group:)` carry the mapping `Session.pin/unpin/isPinned` do today (`Session.swift:529-549`) plus the new case; `Session` delegates.
+- `ClientTree.clients` is today's `Session.clients` body (`Session.clients`, `Session.swift:343` on `main 8e19c2e3`) moved into the Kit; `Session.clients` becomes a one-line call. `ClientTree.hosts(forClient:in:)` counts `authority` over rows whose `client?.groupKey == key`.
+- `Pins.pin/unpin/contains(_ group:)` carry the mapping `Session.pin/unpin/isPinned` do today (`Session.pin` :393, `unpin` :400, `isPinned` :408 on `main 8e19c2e3`) plus the new case; `Session` delegates.
 - `BoundedCache` evicts the oldest-inserted key when a new key would exceed `capacity`; overwriting an existing key does not change its age.
 
 New app file `apps/mac/Sources/Aitmproxy/UI/AppIdentity.swift`:
@@ -244,11 +244,11 @@ func hosts(forClient key: String) -> [(String, Int)] { ClientTree.hosts(forClien
 func toggleExpanded(_ key: String)
 ```
 
-`show(_:group:)` (`Session.swift:524-527`): when `group` is `.client(key)` or `.clientHost(key, _)` it also inserts `key` into `expandedApps` **(Architect's call: selecting an app opens it; collapsing is explicit via the chevron; collapsing a selected app keeps the selection and the narrowing)**. `pin`/`unpin`/`isPinned` (`:529-549`) delegate to `Pins.pin/unpin/contains(_ group:)`: `.clientHost(_, host)` behaves as `.host(host)` — a domain under an app is a host pin. `unpin` clears `self.group` when it equals the unpinned group, as today.
+`show(_:group:)` (`Session.swift:388` on `main 8e19c2e3`): when `group` is `.client(key)` or `.clientHost(key, _)` it also inserts `key` into `expandedApps` **(Architect's call: selecting an app opens it; collapsing is explicit via the chevron; collapsing a selected app keeps the selection and the narrowing)**. `pin`/`unpin`/`isPinned` (`:393`/`:400`/`:408`) delegate to `Pins.pin/unpin/contains(_ group:)`: `.clientHost(_, host)` behaves as `.host(host)` — a domain under an app is a host pin. `unpin` clears `self.group` when it equals the unpinned group, as today.
 
 | Thing | Today | After |
 |---|---|---|
-| `Session.clients` group (`Session.swift:479-483`) | `ClientInfo` hash (name + monogram + bundleID + pid) | unchanged: still the `ClientInfo` value; because `bundleID` is in the hash and every live client carries one, one identifier ⇒ one group and two identifiers ⇒ two groups even with equal names. Tie-break sort by `name` (display name) |
+| `Session.clients` group (`Session.swift:343`) | `ClientInfo` hash (name + monogram + bundleID + pid) | unchanged: still the `ClientInfo` value; because `bundleID` is in the hash and every live client carries one, one identifier ⇒ one group and two identifiers ⇒ two groups even with equal names. Tie-break sort by `name` (display name) |
 | Apps count (`SidebarView.swift:30`) | `session.clients.count` | unchanged: distinct apps |
 | App row narrowing (`FlowGroup.client`) | the name | the **group key** `client.groupKey` (= `bundleID ?? name`) |
 | Domain-under-app narrowing | — | `.clientHost(client: key, host: authority)`; count = that app's flows to that host; the counts under an app sum to the app's count |
@@ -267,7 +267,7 @@ A client with no identifier (an imported row) keys on its name, so nothing that 
 Apps block (lines 30-38) becomes, per visible client (most flows first, as `session.clients` orders):
 
 - **App row** (replaces `subItem(.client(name) …)` at line 35): anatomy `[chevron 12 in a 16 frame at inset 12] [gap 0] [ClientMark 16 at inset 28] [gap Space.sm] [title] [spacer] [count]`, height `Tok.Size.control`, selection fill `Tok.Ground.active` when `session.page == .apps && session.group == .client(key)`. The chevron is `Image(systemName: Tok.Glyph.chevron)` in `Tok.Ink.tertiary`, rotated 90° when `expandedApps.contains(key)`, inside its own `Button` so a click toggles expansion **without** changing selection or narrowing; a click anywhere else on the row calls `session.show(.apps, group: .client(key))` (which also expands). No animation on the rotation. Tooltip `.help(client.bundleID ?? client.name)` on the row; the chevron button's accessibility label is "Expand <name>" / "Collapse <name>"; the row's accessibility label is `"<name>, <count> flows[, pinned], expanded|collapsed"` and it carries `.accessibilityAction(named: "Expand")`/`"Collapse"` so VoiceOver can toggle without the pointer. Context menu: Pin/Unpin App (unchanged).
-- **Domain sub-rows**, shown when `expandedApps.contains(key)` (or while querying, the matching hosts): one per `session.hosts(forClient: key)`, `subItem(.clientHost(client: key, host: host), title: host, monogram: "◎", count: n, page: .apps)` with leading inset **52** (`Monogram` for hosts stays; the mark is the generic host mark), selected when `session.group == .clientHost(key, host)`; context menu "Pin Host"/"Unpin Host" (D4: a host pin); accessibility label `"<host>, <n> flows[, pinned]"`. `.help(host)`.
+- **Domain sub-rows**, shown when `expandedApps.contains(key)` (or while querying, the matching hosts): one per `session.hosts(forClient: key)`, `subItem(.clientHost(client: key, host: host), title: host, count: n, page: .apps, leadingInset: 52, mark: { Monogram(text: "◎") })` with leading inset **52** (`Monogram` for hosts stays; the mark is the generic host mark), selected when `session.group == .clientHost(key, host)`; context menu "Pin Host"/"Unpin Host" (D4: a host pin); accessibility label `"<host>, <n> flows[, pinned]"`. `.help(host)`.
 - Selecting a domain sub-row calls `session.show(.apps, group: .clientHost(client: key, host: host))`.
 - `AppMark` (lines 215-235) is replaced by `ClientMark(client: ClientInfo)` in `UI/AppIdentity.swift` (SwiftUI). It reads `AppIdentityResolver.shared.identity(for: client.bundleID ?? client.name)`:
   - verdict with icon → `Image(nsImage:)` `.resizable()` in a `Tok.Size.icon` square, `.accessibilityLabel(client.name)`;
@@ -292,7 +292,7 @@ Apps block (lines 30-38) becomes, per visible client (most flows first, as `sess
 
 ### D7. Pins **(Architect's call: no migration)**
 
-`Pins.apps` holds group keys from now on; `Pins.hosts` is untouched and also receives pins made from a domain under an app. An app pinned before this change was stored by name; after it, such an entry matches only a client whose key is its name. It still appears under Pinned with its stored text and can be unpinned from the context menu. Nobody has pinned an NE-attributed app yet (PR B is not released), so a pre-existing app pin by name is a rarity and keeps matching a name-keyed client.
+`Pins.apps` holds group keys from now on; `Pins.hosts` is untouched and also receives pins made from a domain under an app. An app pinned before this change was stored by name; after it, such an entry matches only a client whose key is its name. It still appears under Pinned with its stored text and can be unpinned from the context menu. PR B is released (v0.5.9), so an operator may have pinned an NE-attributed app by name since; such a pin keeps matching a name-keyed client, stays listed and unpinnable, and is re-made by key with one click — accepted, no migration.
 
 ### D8. First sight of an identifier **(Architect's call: no warm-up)**
 
@@ -303,7 +303,7 @@ Apps block (lines 30-38) becomes, per visible client (most flows first, as `sess
 
 One mark for every identifier that resolves to no bundle: SF Symbol `terminal`, regular weight, `Tok.Ink.secondary`, 12 pt in the 16 pt frame, token role `glyph.process`.
 
-Why it reads as "process", not "command line": macOS's own generic icon for a bundle-less executable — what Finder and `NSWorkspace.icon(for: .unixExecutable)` show for `curl`, `dataaccessd` and `a.out` alike — is a terminal window labelled `exec`; `terminal` is that mark in SF Symbol form, so the user who has seen a daemon in Finder recognises it. It is flat and monochrome (KIT rule 1) and says what is true for every case the extension has produced so far (CLI tools, ad-hoc binaries, Apple daemons). Rejected: `gearshape.2` reads as settings/system preferences; `app.dashed` reads as "an app that is missing", wrong for a daemon that was never an app; the raster `.unixExecutable` icon itself would be faithful but is not token-governed and mixes a system-styled raster into a column the design rule keeps flat for everything but real app icons. It is wrong only for a GUI app not installed for this user and for the shared WebKit services, where the text label (`WebKit Networking`) carries the honesty and the tooltip shows the identifier.
+Why it reads as "process", not "command line": macOS's own generic icon for a bundle-less executable — what Finder and `NSWorkspace.icon(for: .unixExecutable)` show for `curl`, `dataaccessd` and `a.out` alike — is, from memory, a terminal window labelled `exec` (unverified: research 21 Q3/Q5 verified only that the call returns a generic image and that the `terminal` symbol exists); `terminal` is that mark in SF Symbol form, so the user who has seen a daemon in Finder recognises it. It is flat and monochrome (KIT rule 1) and says what is true for every case the extension has produced so far (CLI tools, ad-hoc binaries, Apple daemons). Rejected: `gearshape.2` reads as settings/system preferences; `app.dashed` reads as "an app that is missing", wrong for a daemon that was never an app; the raster `.unixExecutable` icon itself would be faithful but is not token-governed and mixes a system-styled raster into a column the design rule keeps flat for everything but real app icons. It is wrong only for a GUI app not installed for this user and for the shared WebKit services, where the text label (`WebKit Networking`) carries the honesty and the tooltip shows the identifier.
 
 Token: add `"process": { "mac": "terminal", "web": "terminal", "tui": "$" }` to the `icon.glyph` table in `docs/design/tokens.json` and regenerate `UI/Tokens.swift` (`Tok.Glyph.process`). The row is additive; any other generator that consumes the glyph table must still pass its gate.
 
@@ -386,7 +386,7 @@ Real app, real traffic (**L**; the installed notarized `--ne` build at `/Applica
 Review and gates:
 
 22. **AI-AC22** Poll loop unchanged in shape: the diff of `Bus/BusService.swift` adds no `await` and no synchronous lookup to `pollLoop`, only the cache-read step in the per-row transform (the Security and Quality reviewers confirm from the diff).
-23. **AI-AC23** `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build` green; `swift tools/gen-tokens.swift` leaves no diff after the token row is in; `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` green (no Rust change, run anyway per the workflow).
+23. **AI-AC23** `swift test --package-path apps/mac --scratch-path ~/Library/Developer/Aitmproxy/test-build-icons` green; `swift tools/gen-tokens.swift` leaves no diff after the token row is in; `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` green (no Rust change, run anyway per the workflow).
 24. **AI-AC24** `design/KIT.md` describes the client mark, the app row anatomy with its three insets, and the Client column as icon + name; the `Monogram` TODO is gone.
 
 ## Left to the builder
@@ -428,3 +428,7 @@ The Kit gains a pure `AppIdentifier` (candidate prefixes, ad-hoc trimming, a tin
 12. Sidebar text filter matches app name, identifier or any of the app's hosts; `client:` filter, sort, Overview, Inspector, palette and CSV use the display name only; icons only in the sidebar and the table.
 13. No `pins.json` migration; a stored key with no current client stays listed and unpinnable.
 14. Name cap 64 characters after sanitising, before the "(Service)" suffix.
+
+## Amendments after approval
+
+- 2026-11-01 (stage-6 fix pass on docs PR #242, spec + quality panel; self-approved, autonomous mode): base `main 8e19c2e3`; PR B recorded as merged (PR #195 `3fe92f66`, v0.5.9) and D7's "PR B is not released" corrected; `Session.swift` citations by symbol (`Session.clients` :343, `show(_:group:)` :388, `pin` :393 / `unpin` :400 / `isPinned` :408); D5's `subItem` call matches the plan's `@ViewBuilder mark:` signature (`mark: { Monogram(text: "◎") }`); the `exec` icon remark labelled unverified; AI-AC23's scratch path = the plan's (`test-build-icons`); PR shape stated: two PRs from this branch, traffic-route first, this second (plan gate 4; Tasks 5/6 after the traffic-route plan's Tasks 2/2b on the shared `Session.swift` / `BusService.swift`).
