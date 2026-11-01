@@ -14,17 +14,6 @@ use aitm_tui::app::{App, Mode, SidebarItem};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{MapPane, ScanTab};
 use common::*;
-use serde_json::Value;
-
-macro_rules! fixture {
-    ($name:literal) => {
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../aitm-scan-model/fixtures/",
-            $name
-        ))
-    };
-}
 
 /// The text of every tab of the Scan view, in strip order.
 fn tab_texts(app: &mut App) -> Vec<(ScanTab, String)> {
@@ -227,40 +216,56 @@ fn v2_first_open_lands_on_profiles_and_remembers_the_tab() {
     );
 }
 
-/// Fix round A, A2: the Site map's pane-to-list choice is made once, keyed on
-/// the bus. On a v2 bus with `scan.sitemap` nodes on screen and the legacy
-/// lists empty, `Down` walks the v2 nodes and `Enter` opens the selected
-/// node's first flow; no legacy row is ever read.
+/// Fix round A, A2 (fixture widened in fix round C, C14): the Site map's
+/// pane-to-list choice is made once, keyed on the bus. On a v2 bus with two
+/// `scan.sitemap` nodes on screen and a legacy endpoint also present, `Down`
+/// walks the v2 nodes (the cursor lands on the second) and leaves the legacy
+/// cursor alone; `Enter` opens the selected node's first flow; no legacy
+/// row is ever read.
 #[test]
 fn v2_site_map_enter_opens_the_v2_nodes_first_flow() {
     let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
     let _ = app.update(Action::Resize(200, 50));
     let _ = connect(&mut app, &["scan.start", "scan.sitemap", "flow.list"], None);
-    let sitemap: Value = serde_json::from_str(fixture!("scan.sitemap.json")).expect("fixture");
+    let sitemap = fixture("scan.sitemap.json");
     let result: aitm_scan_model::SitemapResult =
-        serde_json::from_value(sitemap).expect("fixture parses");
-    let flow_id = result.nodes[0].flows[0].to_string();
-    let _ = app.on_bus(BusEvent::Flows(vec![summary(
-        &flow_id,
-        "GET",
-        "127.0.0.1:8080",
-        "/account/1",
-        Some(200),
-        "none",
-    )]));
+        serde_json::from_value(sitemap.clone()).expect("fixture parses");
+    let first_flow = result.nodes[0].flows[0].to_string();
+    const SECOND_FLOW: &str = "550e8400-e29b-41d4-a716-446655440099";
+    let mut second_json = sitemap["nodes"][0].clone();
+    second_json["id"] = serde_json::json!("node-2");
+    second_json["path_template"] = serde_json::json!("/second");
+    second_json["flows"] = serde_json::json!([SECOND_FLOW]);
+    let second: aitm_scan_model::SiteNode =
+        serde_json::from_value(second_json).expect("the second node parses");
+    for (id, path) in [
+        (first_flow.as_str(), "/account/1"),
+        (SECOND_FLOW, "/second"),
+    ] {
+        let _ = app.on_bus(BusEvent::Flows(vec![summary(
+            id,
+            "GET",
+            "127.0.0.1:8080",
+            path,
+            Some(200),
+            "none",
+        )]));
+    }
     app.selected = None;
 
     let _ = app.update(Action::OpenScan);
     let _ = app.update(Action::ScanTab(ScanTab::SiteMap));
     app.scan.sitemap.nodes = result.nodes;
+    app.scan.sitemap.nodes.push(second);
     app.scan.sitemap.points = result.points;
     app.scan.sitemap.pane = MapPane::Nodes;
-    assert!(app.scan.legacy.endpoints.is_empty() && app.scan.legacy.points.is_empty());
+    app.scan.legacy.endpoints = vec!["http://127.0.0.1:8080/legacy".into()];
+    assert_eq!(app.scan.sitemap.nodes.len(), 2);
 
     let _ = app.update(Action::Down);
     assert_eq!(
-        app.scan.sitemap.node_cursor, 0,
-        "one node: Down stays on it"
+        app.scan.sitemap.node_cursor, 1,
+        "Down walks the v2 nodes to the second"
     );
     assert_eq!(
         app.scan.legacy.endpoint_cursor, 0,
@@ -269,8 +274,8 @@ fn v2_site_map_enter_opens_the_v2_nodes_first_flow() {
     let _ = app.update(Action::Enter);
     assert_eq!(
         app.selected.as_deref(),
-        Some(flow_id.as_str()),
-        "Enter selects the v2 node's first flow"
+        Some(SECOND_FLOW),
+        "Enter selects the second v2 node's first flow"
     );
     assert_eq!(app.mode, Mode::Inspector, "and opens it in the inspector");
 }

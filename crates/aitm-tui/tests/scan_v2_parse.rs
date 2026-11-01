@@ -85,8 +85,8 @@ fn every_fixture_parses_into_its_contract_type() {
         (fixture("job.cancelled.json"), JobEvent::Cancelled),
         (fixture("job.failed.json"), JobEvent::Failed),
     ];
-    for (text, event) in pushes {
-        let line: JobNotification = parse("notifications/aitm/job", &text);
+    for (params, event) in pushes {
+        let line: JobNotification = parse("notifications/aitm/job", &params);
         assert_eq!(line.kind, "scan");
         assert_eq!(line.event, event);
     }
