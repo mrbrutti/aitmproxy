@@ -8,12 +8,16 @@ invalidates it mid-scan (seeded `GET /logout-after?n=20`: the session dies after
 Capture order matters (parent spec D7: the canary replays the NEWEST captured
 authenticated GET): login -> `GET /account?tab=overview` -> `GET /logout-after?n=20`
 -> `GET /account?tab=overview` again, so the canary is `/account` (asserted from
-`scan.status`), not `/logout-after` (which would re-arm the countdown). That last
-authenticated GET consumes one of the 20, so the scanner has 19 left.
+`scan.status`), not `/logout-after` (which would re-arm the countdown). The arm
+counts N further authenticated `GET /account`s and the one that drives the counter
+to 0 is still answered 200 (the 302 starts on the next); the cell's own pre-arm GET
+is a 200 in the same log, so the first session-cookie 302 comes after exactly
+N + 1 = 21 authenticated `/account` 200s (T2 live run 2, 2026-11-01).
 
 Observers: the target's control log (`/log/http`): the first `/account` 302 that
-carries the session cookie comes after exactly 19 authenticated `/account` 200s
-and after >= 20 requests carrying the session cookie overall.
+carries the session cookie comes after exactly 21 authenticated `/account` 200s
+(1 pre-arm + the 20 the arm allows) and after >= 20 requests carrying the session
+cookie overall.
 
 SKIP 77: serve binary missing, a missing `scan.start`/`scan.status` verb, or no
 `http` lane in `scan.checks`.
@@ -76,7 +80,7 @@ def main() -> None:
                 check(r.status == 200 and r.text == f'{{"armed":{ARMED}}}',
                       f"GET /logout-after?n={ARMED} -> {{\"armed\":{ARMED}}} (got {r.status} {r.text[:40]!r})")
                 r = via_proxy(proxy, "GET", V.base + "/account?tab=overview", headers=cookie)
-                check(r.status == 200, "GET /account?tab=overview again -> 200 (newest authenticated GET; 19 left)")
+                check(r.status == 200, "GET /account?tab=overview again -> 200 (newest authenticated GET; 1 of 20 used)")
 
                 section("scan.start with session.mode observed")
                 seq0 = V.logs.reset()
@@ -103,8 +107,11 @@ def main() -> None:
                       f"V log shows a /account 302 carrying the session cookie ({len(acct)} authenticated /account requests)")
                 before = acct[:first_302] if first_302 is not None else []
                 n200 = sum(1 for e in before if e.get("status") == 200)
-                check(n200 == ARMED - 1 and len(before) == n200,
-                      f"exactly {ARMED - 1} authenticated /account 200s precede the first 302 (got {n200} 200s of {len(before)})")
+                # 1 pre-arm GET + the ARMED post-arm GETs the arm allows (the one that
+                # drives the counter to 0 is still a 200); the 302 starts on the next.
+                check(n200 == ARMED + 1 and len(before) == n200,
+                      f"exactly {ARMED + 1} authenticated /account 200s precede the first 302 "
+                      f"(1 pre-arm + {ARMED} allowed; got {n200} 200s of {len(before)})")
                 first_seq = int(acct[first_302].get("seq", 0)) if first_302 is not None else 0
                 total_auth_before = sum(1 for e in reqs if with_session(e) and int(e.get("seq", 0)) < first_seq)
                 check(total_auth_before >= ARMED,
