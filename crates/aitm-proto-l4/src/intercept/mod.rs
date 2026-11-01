@@ -223,10 +223,13 @@ struct ParkedEntry {
     parked: ParkedPacket,
 }
 
-/// The process-wide arrival sequence every parked packet is stamped from (spec §4
-/// / AC37). One counter for every session, so `l4.intercept.list` interleaves
-/// sessions in true arrival order; taken inside [`ParkedTable::park`], under the
-/// table's lock, so the stamp order is exactly the insertion order.
+/// The arrival sequence every parked packet is stamped from (spec §4 / AC37).
+/// Stamps are unique and increasing process-wide — one counter for every
+/// session, so `l4.intercept.list` interleaves sessions in true arrival order —
+/// and within one table they follow insertion order, because the stamp is taken
+/// in [`ParkedTable::park`] under that table's lock. `fetch_add` is atomic
+/// whatever its ordering, and no other memory is published through it, so
+/// `Relaxed` suffices.
 static NEXT_PARKED_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The parked-packet table shared between the reader thread and the handle: the
@@ -252,7 +255,7 @@ impl ParkedTable {
     ) {
         // `&mut self` means the caller holds the table lock, so the sequence is
         // taken and the entry inserted with nothing in between.
-        let parked_seq = NEXT_PARKED_SEQ.fetch_add(1, Ordering::SeqCst);
+        let parked_seq = NEXT_PARKED_SEQ.fetch_add(1, Ordering::Relaxed);
         let parked = ParkedPacket {
             id,
             flow,
