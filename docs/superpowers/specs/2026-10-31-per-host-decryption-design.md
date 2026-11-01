@@ -128,6 +128,9 @@ certificate).
   already tunnelled keeps going until it closes ("existing tunnels are left alone").
 - Pins win over Scope: a pinned host in Scope is still tunnelled, with
   `tunnel_reason: "pinned"`.
+- An upgrade hand-off (`NextLayerHint::from_upgrade`) has **no** tunnel authority: it
+  continues a connection whose decision was already made, so neither the passthrough
+  module nor the HTTP module re-decides it (added 2026-11-01 from the Task 3 report).
 
 ### D2. Where the decision is made (Architect's call)
 
