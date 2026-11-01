@@ -163,7 +163,7 @@ final class BusService: FlowActions {
             let coreID = session.activeCoreID
             func scoped(_ row: FlowRow) -> FlowRow {
                 var row = row
-                row.inScope = session.scopeHosts.isEmpty || session.scopeHosts.contains { Self.hostMatches(row.authority, $0) }
+                row.inScope = session.scopeHosts.isEmpty || Scope.contains(row.authority, in: session.scopeHosts)
                 return row
             }
             let polled = ids.enumerated().compactMap { index, id in summaries[id]?.row(seq: index + 1, coreID: coreID) }.map(scoped)
@@ -356,13 +356,6 @@ final class BusService: FlowActions {
             }
         }
         return nil
-    }
-
-    /// `host`, `host:port`, `*.wildcard` against a row's authority.
-    static func hostMatches(_ authority: String, _ entry: String) -> Bool {
-        let host = authority.split(separator: ":").first.map(String.init) ?? authority
-        if entry.hasPrefix("*.") { return host.hasSuffix(String(entry.dropFirst(1))) || host == String(entry.dropFirst(2)) }
-        return authority == entry || host == entry
     }
 
     static func describe(_ error: Error) -> String {
