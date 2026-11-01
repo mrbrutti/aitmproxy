@@ -428,16 +428,12 @@ async fn no_evidence_field_carries_a_session_value_from_the_body_or_the_point() 
 /// must balance at each step: every unit missing from `budget_left` is a
 /// stimulus the host recorded.
 ///
-/// The three checks that consult the gate before their baseline are also held
-/// to the stricter rule — baseline included, nothing is attempted past the
-/// budget. The two timing checks are not, because they ask for a baseline
-/// first; that is finding **B1**, pinned by
-/// [`a_stopped_timing_check_does_not_even_take_a_baseline`].
+/// Every check consults the gate before its baseline, so all five are held to
+/// the stricter rule: baseline included, nothing is attempted past the budget.
 #[tokio::test]
 async fn no_check_asks_for_a_probe_the_budget_cannot_pay_for() {
     for check in value_checks() {
         let id = check.meta().id.clone();
-        let gates_before_the_baseline = id != "sqli-time" && id != "cmdi-time";
         for budget in 0u32..=6 {
             let host = ScriptedHost::new()
                 .with_marker(MARKER)
@@ -459,13 +455,11 @@ async fn no_check_asks_for_a_probe_the_budget_cannot_pay_for() {
                 "{id}: the host spent {served} units on {} recorded stimuli",
                 host.sent().len() + host.baseline_calls()
             );
-            if gates_before_the_baseline {
-                let asked = host.sent().len() + host.baseline_calls();
-                assert!(
-                    asked <= usize::try_from(budget).unwrap(),
-                    "{id}: asked for {asked} stimuli on a budget of {budget}"
-                );
-            }
+            let asked = host.sent().len() + host.baseline_calls();
+            assert!(
+                asked <= usize::try_from(budget).unwrap(),
+                "{id}: asked for {asked} stimuli on a budget of {budget}"
+            );
             assert_ne!(
                 verdict.outcome,
                 Outcome::Error,
@@ -504,15 +498,12 @@ async fn a_deadline_already_passed_sends_no_payload() {
     }
 }
 
-/// **Known defect, reported to the Coder (finding B1).** `blind_timing.rs`
-/// calls `host.baseline()` before it consults the cancel/budget/deadline gate,
-/// so a cancelled job, an expired job and a job with no budget left are each
-/// still asked for one request. `sqli-boolean`, `xss-reflected`,
-/// `open-redirect` and the five h2 checks all gate first, and `sqli_boolean.rs`
-/// says why: "Nothing at all, not even a baseline, once the job has stopped."
-/// Un-ignore when the gate moves above the baseline.
+/// Every check consults the cancel/budget/deadline gate *before* it asks for a
+/// baseline, the timing pair included: a cancelled job, an expired job and a
+/// job with no budget left are not asked for a single request.
+/// `sqli_boolean.rs` says why — "Nothing at all, not even a baseline, once the
+/// job has stopped."
 #[tokio::test]
-#[ignore = "B1: the timing checks take a baseline before checking the stop gate (finding for the Coder)"]
 async fn a_stopped_timing_check_does_not_even_take_a_baseline() {
     for check in [
         aitm_scan_checks_http::blind_timing::sqli_time(),

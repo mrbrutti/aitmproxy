@@ -343,6 +343,18 @@ impl Check for TimingCheck {
             let families = &self.families[..self.families.len().min(MAX_FAMILIES_PER_POINT)];
             let planned = families.len() * delays.len();
 
+            // Nothing at all, not even a baseline, once the job has stopped:
+            // the gate goes above every request a check makes, as it does in
+            // `sqli_boolean.rs` and `h2_observe.rs` (tester finding B1).
+            if !may_send(host) {
+                return no_finding(
+                    Outcome::Inconclusive,
+                    "the job was cancelled, out of budget or past its deadline before the \
+                     baseline"
+                        .to_string(),
+                );
+            }
+
             // The baseline re-centres the series. It moves neither the slope nor
             // the correlation (`timing::fit` documents that invariant), so a
             // point whose baseline the lane could not fetch is still decidable:
