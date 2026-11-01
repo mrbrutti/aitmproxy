@@ -91,7 +91,7 @@ export const Toolbar: Component = () => {
   };
 
   /** Copy the env line; a failure reaches the notice toast (D15), never the console. */
-  const copyEnvLine = (guidance: string) => void copyText(guidance).then((ok) => app.notice(ok ? 'Copied env line' : 'copy env line failed', ok ? 'info' : 'error'));
+  const copyEnvLine = (guidance: string) => void copyText(guidance).then((ok) => app.notice(ok ? 'Copied env line' : 'Copy env line failed', ok ? 'info' : 'error'));
 
   /** The D15 menu: the checkbox from `menuState`, the `detail` line, and "Copy env line" when `guidance` is present. */
   const sysItems = () => {

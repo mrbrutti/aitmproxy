@@ -187,7 +187,7 @@ describe('Toolbar system-proxy pill', () => {
     await waitFor(() => expect(copyEnv()).not.toBeNull());
     fireEvent.click(copyEnv()!);
 
-    await waitFor(() => expect(app.toast()).toEqual({ text: 'copy env line failed', kind: 'error' }));
+    await waitFor(() => expect(app.toast()).toEqual({ text: 'Copy env line failed', kind: 'error' }));
   });
 
   it('the kept guidance survives the next 2 s poll: a reopened menu offers "Copy env line" at once', async () => {
@@ -245,7 +245,9 @@ describe('Toolbar system-proxy pill (tester)', () => {
     expect(item.disabled).toBe(true);
     expect(item.title).toBe('setting system proxy…');
     fireEvent.click(item); // a disabled item sends nothing
-    await waitFor(() => expect(calls).toEqual(['proxy.system.status', 'proxy.system.set', 'proxy.system.status']));
+    await new Promise((r) => setTimeout(r, 20));
+    // The reopen sends nothing either: refreshSystemProxy skips the full read while our own change is in flight.
+    expect(calls).toEqual(['proxy.system.status', 'proxy.system.set']);
 
     ctl.status = POINTS_AT_US; // the core's next poll agrees with the reply
     release(POINTS_AT_US);

@@ -38,15 +38,13 @@
 }
 /* The pill as a <button> (system-proxy menu): the same look as the static pill, no icon beyond the
    dot; hover lifts it to the active ground (the hover token equals the raised one in light mode).
-   The pill is clamped: the `other` endpoint comes from the OS and could be long, so it ellipsises
-   rather than pushing the Agent toggle out of the toolbar. */
+   The pill is clamped: the `other` endpoint comes from the OS and could be long, so it must not push
+   the Agent toggle out of the toolbar. Only the width cap lives here; the ellipsis itself comes from
+   `.listen span`, which the button shares with the static pill. */
 .listenButton {
   text-align: left;
   flex: 0 1 auto;
   max-width: min(560px, 50vw);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   transition: background-color var(--motion-hover) ease;
 }
 @media (hover: hover) and (pointer: fine) {

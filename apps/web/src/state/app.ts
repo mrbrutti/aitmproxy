@@ -1224,9 +1224,12 @@ export function createAppStore(bus: BusClient) {
      * The full status read the pill menu asks for when it opens (spec D15, amended 2026-11-01): the
      * compact `proxy.status` sub-object has no `guidance`/`remedy`, so "Copy env line" and the
      * privilege remedy come only from here. Gated on the tool being offered. A reply that is not a
-     * status object keeps what the poll already stored rather than wiping the pill.
+     * status object keeps what the poll already stored rather than wiping the pill. Skipped while this
+     * client's own set/unset is in flight: the change's reply stores the status, and a concurrent full
+     * read could race it with a stale object.
      */
     async function refreshSystemProxy(): Promise<void> {
+      if (proxy.systemProxySetting) return;
       if (!proxy.tools.some((t) => t.name === 'proxy.system.status')) return;
       const full = parseSystemProxy(await bus.call<unknown>('proxy.system.status'));
       if (full) setProxy('systemProxy', full);
