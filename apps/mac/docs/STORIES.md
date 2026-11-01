@@ -744,7 +744,7 @@ Screens: scope, scope-sheet
 Depends: S-005
 Acceptance:
 - [snap] The Scope page lists entries with their limit readout (`10 req/s · back-off 2×`) and the count of flows in scope; the sheet has a text field with validation and `Add ⌘⏎`.
-- [unit] Entry validation accepts the three forms and rejects schemes and paths; `hostMatches` handles wildcard and port.
+- [unit] Entry validation accepts the three forms and rejects schemes and paths; `Scope.matches` (Kit, the one in-scope rule the poll uses too) handles wildcard and port.
 - [self] `scope.add` is sent; the Scope count in the sidebar and `N hosts in scope` in the status bar update; affected rows lose their dimming.
 UX:
 - Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once

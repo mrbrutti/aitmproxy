@@ -106,7 +106,7 @@ extension SelfTest {
                     await settle(timeout: .seconds(6)) { !session.paused.contains { $0.id == parked.id } && !curl1.isRunning }
                     check("flow.resume releases a parked flow and the client gets its response",
                           !session.paused.contains { $0.id == parked.id } && !curl1.isRunning && curl1.terminationStatus == 0 && session.lastError == nil,
-                          "paused \(session.paused.count) curl running \(curl1.isRunning) exit \(curl1.terminationStatus) err \(session.lastError ?? "-")")
+                          "paused \(session.paused.count) curl \(exitText(curl1)) err \(session.lastError ?? "-")")
                 } else {
                     check("a request through the armed proxy parks", false, "rows \(session.rows.count) paused 0; curl running \(curl1.isRunning)")
                     curl1.terminate()
@@ -123,11 +123,11 @@ extension SelfTest {
                         // Core gap (2026-10-28): the chain wakes on the same oneshot for kill and
                         // resume and marks the flow Resumed, so the request is forwarded and the
                         // client gets its 2xx. Reported to the core; strict when APP_LIVE_STRICT=1.
-                        let aborted = curl2.terminationStatus != 0 && state != .complete
+                        let aborted = !curl2.isRunning && curl2.terminationStatus != 0 && state != .complete
                         if ProcessInfo.processInfo.environment["APP_LIVE_STRICT"] == "1" {
-                            check("flow.kill denies the client a response (curl exit \(curl2.terminationStatus), row \(state.map { "\($0)" } ?? "gone"))", aborted)
+                            check("flow.kill denies the client a response (curl \(exitText(curl2)), row \(state.map { "\($0)" } ?? "gone"))", aborted)
                         } else if !aborted {
-                            print("GAP core flow.kill forwarded the request like resume (curl exit \(curl2.terminationStatus), row \(state.map { "\($0)" } ?? "gone")); APP_LIVE_STRICT=1 fails on this")
+                            print("GAP core flow.kill forwarded the request like resume (curl \(exitText(curl2)), row \(state.map { "\($0)" } ?? "gone")); APP_LIVE_STRICT=1 fails on this")
                         }
                     } else {
                         check("a second request through the armed proxy parks", false, "paused 0")
@@ -176,8 +176,8 @@ extension SelfTest {
                         let lines = received.replacingOccurrences(of: "\r\n", with: "\n").split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
                         check("the client received the edited status and header (flow.mutate on the parked response, then flow.resume)",
                               lines.first?.contains(" 203 ") == true && lines.contains { $0.lowercased() == "x-aitm-edited: 1" } && session.lastError == nil,
-                              "curl exit \(curl3.terminationStatus) head \(lines.prefix(6).joined(separator: " | ")) err \(session.lastError ?? "-")")
-                        check("the client received the edited body", received.hasSuffix("edited by aitmproxy") && curl3.terminationStatus == 0,
+                              "curl \(exitText(curl3)) head \(lines.prefix(6).joined(separator: " | ")) err \(session.lastError ?? "-")")
+                        check("the client received the edited body", received.hasSuffix("edited by aitmproxy") && !curl3.isRunning && curl3.terminationStatus == 0,
                               "tail \(received.suffix(80).replacingOccurrences(of: "\r\n", with: "⏎"))")
                         await settle { session.rows.first { $0.id == parked.id }?.edited == true }
                         check("the Edited pencil appears on the resumed row", session.rows.first { $0.id == parked.id }?.edited == true)
@@ -214,7 +214,7 @@ extension SelfTest {
                 let newlyParked = session.paused.filter { !alreadyPaused.contains($0.id) }.map(\.path)
                 check("the matching request parks and the other completes (rule url → core wildcard)",
                       newlyParked == ["/park"] && !other.isRunning && other.terminationStatus == 0,
-                      "newly paused \(newlyParked) other running \(other.isRunning) exit \(other.terminationStatus)")
+                      "newly paused \(newlyParked) other \(exitText(other))")
                 if let parked = session.paused.first(where: { !alreadyPaused.contains($0.id) }) {
                     session.resume(parked.id)
                     await settle(timeout: .seconds(6)) { !matching.isRunning }
@@ -225,6 +225,61 @@ extension SelfTest {
             session.setBreakpointRules(BreakpointRules())
             session.arm(false)
             await settle { !session.interceptArmed }
+
+            // Host-bearing rules (core #208: a rule's url is matched against the FULL URL, and the
+            // app's preview mirrors the core): a wildcard and a regex that name this upstream park
+            // the matching request on the core while `matchCount` counts exactly that row; a rule
+            // for another host leaves the next request flowing and counts nothing. The paths carry
+            // a per-run tag, so rows a previous run left on a shared core cannot change the count.
+            let tag = String(UUID().uuidString.prefix(8)).lowercased()
+            let hostRegex = "^http://\(NSRegularExpression.escapedPattern(for: upstream))/host-regex-\(tag)$"
+            let hostRules: [(rule: BreakpointRule, path: String)] = [
+                (BreakpointRule(name: "wildcard with host", url: "*\(upstream)/host-wild-\(tag)*"), "/host-wild-\(tag)"),
+                (BreakpointRule(name: "regex with host", url: hostRegex, matching: .regex), "/host-regex-\(tag)"),
+            ]
+            for (rule, path) in hostRules {
+                guard await armIntercept(session, rules: [rule], label: "the \(rule.name) rule") else { continue }
+                let pausedBefore = Set(session.paused.map(\.id))
+                guard let hit = curlThroughProxy(upstream, listen: session.listenAddress, path: path) else {
+                    print("SKIP \(rule.name): /usr/bin/curl could not start")
+                    await disarm(session)
+                    continue
+                }
+                await settle(timeout: .seconds(8)) { session.paused.contains { !pausedBefore.contains($0.id) } }
+                let newlyParked = session.paused.filter { !pausedBefore.contains($0.id) }
+                check("the \(rule.name) rule parks the matching request on the core (full URL)", newlyParked.map(\.path) == [path],
+                      "newly paused paths \(newlyParked.map(\.path))")
+                check("the app's preview agrees with the core: matchCount == 1 for the \(rule.name) rule over the live rows",
+                      session.breakpointRules.matchCount(of: rule, in: session.rows) == 1,
+                      "matched \(session.rows.filter(rule.matches).map(\.path)) over \(session.rows.count) rows")
+                if let parked = newlyParked.first {
+                    session.resume(parked.id)
+                    await settle(timeout: .seconds(6)) { !hit.isRunning }
+                } else {
+                    hit.terminate()
+                }
+                await disarm(session)
+            }
+            let otherHost = BreakpointRule(name: "another host", url: "*other.invalid/*")
+            if await armIntercept(session, rules: [otherHost], label: "the \(otherHost.name) rule") {
+                let pausedBeforeOther = Set(session.paused.map(\.id))
+                // `/` (the upstream's listing, 200): a 404 path would fail curl -f even when nothing parks.
+                if let pass = curlThroughProxy(upstream, listen: session.listenAddress, path: "/") {
+                    await settle(timeout: .seconds(8)) { !pass.isRunning }
+                    let newlyParked = session.paused.filter { !pausedBeforeOther.contains($0.id) }
+                    check("a rule for another host leaves the request flowing (nothing parks, curl exit 0)",
+                          !pass.isRunning && pass.terminationStatus == 0 && newlyParked.isEmpty,
+                          "curl \(exitText(pass)) newly paused paths \(newlyParked.map(\.path))")
+                    check("the preview counts no live row for the other host",
+                          session.breakpointRules.matchCount(of: otherHost, in: session.rows) == 0,
+                          "matched \(session.rows.filter(otherHost.matches).map(\.path))")
+                    if pass.isRunning { pass.terminate() }
+                } else {
+                    print("SKIP another host: /usr/bin/curl could not start")
+                }
+            }
+            session.setBreakpointRules(BreakpointRules())
+            await disarm(session)
 
             // F6 / F7: the call is made, the outcome is recorded, nothing hangs.
             let pending: [(String, () -> Void)] = [
@@ -292,6 +347,28 @@ extension SelfTest {
         check("a real menu key equivalent (⌘K) drives the UI from the keyboard, not the bus",
               session.paletteVisible != before, "palette \(session.paletteVisible) was \(before)")
         session.paletteVisible = false
+    }
+
+    /// Sets the rules and arms intercept, waiting for the `flow.intercept` call to be
+    /// recorded (not only the optimistic flag), and checks that the core accepted them.
+    private static func armIntercept(_ session: Session, rules: [BreakpointRule], label: String) async -> Bool {
+        let calls = session.activity.entries.filter { $0.command == "flow.intercept" }.count
+        session.setBreakpointRules(BreakpointRules(rules: rules))
+        session.arm(true)
+        await settle { session.interceptArmed && session.activity.entries.filter { $0.command == "flow.intercept" }.count > calls }
+        check("flow.intercept accepts \(label)", session.interceptArmed && session.lastError == nil, session.lastError ?? "")
+        return session.interceptArmed
+    }
+
+    private static func disarm(_ session: Session) async {
+        session.arm(false)
+        await settle { !session.interceptArmed }
+    }
+
+    /// `exit N` once the process ended, `running` while it has not: `Process.terminationStatus`
+    /// raises on a live process, which would turn a failed check into a crash.
+    private static func exitText(_ process: Process) -> String {
+        process.isRunning ? "running" : "exit \(process.terminationStatus)"
     }
 
     /// `curl -x <listen> http://<upstream>/`, left running: while intercept is
