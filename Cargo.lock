@@ -27,7 +27,7 @@ dependencies = [
 
 [[package]]
 name = "aitm"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-browser",
  "aitm-bus-client",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-browser"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-bus-client"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "serde",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-ca"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-cli"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-mcp",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-core"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "anyhow",
  "dirs",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-findings"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-mcp"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-plugins",
@@ -185,14 +185,14 @@ dependencies = [
 
 [[package]]
 name = "aitm-peer-token"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "aitm-plugin"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-maprules"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-rules",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-passthrough"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-rhai"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-browser",
  "aitm-core",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-scanner"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-findings",
@@ -267,7 +267,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-sessionio"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugin-wsctl"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-plugins"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-proto-http",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-poc"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-browser",
  "aitm-core",
@@ -335,7 +335,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-http"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-l4"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-test"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-proto-ws"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-rules"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "anyhow",
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-checks-http"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -433,14 +433,14 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-http"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-scan-model",
 ]
 
 [[package]]
 name = "aitm-scan-l4-packet"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -454,7 +454,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-l4-stream"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-proto-l4",
  "aitm-scan-model",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-model"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-poc",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-scan-ws"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-plugin",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-sysproxy"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-ca",
  "aitm-core",
@@ -517,7 +517,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-testtarget"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-core",
  "aitm-findings",
@@ -540,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "aitm-tui"
-version = "0.5.9"
+version = "0.5.10"
 dependencies = [
  "aitm-bus-client",
  "anyhow",

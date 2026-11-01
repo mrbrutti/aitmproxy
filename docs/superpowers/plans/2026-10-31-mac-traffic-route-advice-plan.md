@@ -13,7 +13,7 @@ Within this plan, if gate 3 slips, the CA halves may follow as a small third PR 
 ## Gates: nothing below starts until 1, 2 and 5 hold; the CA parts (and Task 2's `Session+Connection.swift` edits) also wait for 3; Task 1c for 4
 
 1. **The fixture-removal mac PR is on `main` and this branch has rebased once onto its merge
-   SHA** (the orchestrator sends it; record here: `__________`). That PR deletes the mac app's
+   SHA** (the orchestrator sends it; record here: `c3a4fd37` (confirmed by the orchestrator 2026-11-01)). That PR deletes the mac app's
    fixture, sample-data, snapshot, self-test and gallery modes and modifies
    `tools/check-capture-toggle.sh`. **This plan references none of them.** A Coder who meets
    `Store.usesFixtures`, `Fixtures.`, `SelfTest`, `SnapshotScenes` or `APP_FIXTURES` in a file it
@@ -83,7 +83,7 @@ Within this plan, if gate 3 slips, the CA halves may follow as a small third PR 
    orchestrator 2026-11-01** ("Coordinator contract for Task 1c" below). Until Task 1c is in, the
    `tunnel` → `tls` mapping is not written, `tunnelledFlowCount` stays 0 on every build, and TR-AC20 / B8
    are recorded as deferred. Nothing else waits on it.
-5. **PR #246 merged, SHA `__________`.** The system-proxy session's PR 4a = **PR #246** (branch
+5. **PR #246 merged, SHA `2461a300`.** The system-proxy session's PR 4a = **PR #246** (branch
    `claude/system-proxy-kit-type` off `main c8e4b6e5`, head `c8ed92f4` after its panel) ships only
    `apps/mac/Sources/AitmproxyKit/SystemProxyState.swift` + 31 tests — the type exactly as spec D2
    defines it (TR-AC1/2) plus `init?(compact:listenAddress:)` (points_at_us → both endpoints at the
@@ -189,6 +189,8 @@ greps, Task 6, and the diff review.
 ## Tasks
 
 ### Task 1: Kit model — `TrafficRoutes`, `make(systemProxy:tunnelledFlowCount:decrypt:)`, the predicate table (no CA derivation)
+
+> **Amendment 2026-11-01 (system-proxy session, orchestrator ruling):** `SystemProxyState.swift` and `SystemProxyStateTests.swift` are CREATED by system-proxy PR 4a (#246, branch `claude/system-proxy-kit-type`); this task ADOPTS them as-is (fields are `let`; IPv6 brackets normalised in the match; `init?(compact: JSONValue, listenAddress:)` added) and creates neither file. Base this PR on #246's merge.
 
 - **Satisfies:** TR-AC3 (quoted, fallback, stale list, bus not `.ok`), TR-AC4, TR-AC5, TR-AC6, TR-AC18 (non-CA cases), TR-AC21. (TR-AC1/2 are PR #246's tests — gate 5.)
 - **Depends on:** **gate 5** (PR #246's `SystemProxyState.swift` on `main`, this branch rebased onto it); not gated on PR D

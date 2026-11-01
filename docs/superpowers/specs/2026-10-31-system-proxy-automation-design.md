@@ -566,8 +566,18 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
 
 ### D13. macOS app (PR 4)
 
+- **Shipped Kit type (PR 4a, 2026-11-01).** `SystemProxyState` is a struct of two optional
+  `Endpoint { host, port }` (`http`, `https`), built by `init(settings:)` from the CFNetwork
+  dictionary or `init?(compact: JSONValue, listenAddress:)` from the bus object (`points_at_us`
+  → both at the listen address, `other` → both at host:port unless that endpoint is our own, in
+  which case nil; `off` → `.off`; `unsupported`/`needs_privilege`/`unknown`/malformed → nil, never
+  off); `route(to:) -> SystemProxyRoute { off, thisCore(http:https:), other(host:port:) }`
+  (ports equal and hosts equal case-insensitively with IPv6 brackets stripped, or both loopback,
+  or a wildcard listen host with a loopback proxy host; `thisCore` when at least one protocol
+  matches). `SystemProxyFacts` carries `route` plus the verb facts; the three non-endpoint states
+  come from the verb's `state` string, not from the type.
 - **Facts in.** `Session` polls `proxy.status` already; it parses
-  `system_proxy` into `SystemProxyFacts { state: SystemProxyState, managedByUs:
+  `system_proxy` into `SystemProxyFacts { route: SystemProxyRoute, managedByUs:
   Bool, setting: Bool, supported: Bool, remedy: String?, guidance: String? }`
   (Kit, `Hashable`). `ConnectionSummary.make` gains one parameter
   `systemProxy: SystemProxyFacts?` (nil = no verb on this bus) and one output
