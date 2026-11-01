@@ -1,11 +1,12 @@
 # Animation audit — apps/mac
 
-Date: 2026-10-31. Commit audited: `1854fae7` (v0.5.4), re-checked against `0f000174`.
+Date: 2026-10-31. Commit audited: `1854fae7` (v0.5.4), re-checked against `0f000174`. Fixes landed as
+#204 (plan 001) and #203 (plan 002), both re-verified on `3fe92f66`.
 Method: the `improve-animations` workflow (recon, audit against its eight categories, vet
 every finding at its file:line, plan the fixes). Evidence comes from real runs of a debug
 bundle (`DEV_TAG=anim tools/snap-dev.sh none` → `/tmp/Aitmproxy-dev-anim.app`) with its
-real embedded core and real `curl` traffic through that proxy; the fixture session was used
-only for the first attribution pass and is marked as such. Plans live in
+real embedded core and real `curl` traffic through that proxy. Fixture and snapshot runs are not
+evidence (Matt's rule of 2026-10-31) and none is cited below. Plans live in
 [`animation-plans/`](animation-plans/README.md).
 
 ## The bar
@@ -49,10 +50,10 @@ behaviour, measured on the real run described under Evidence.
 
 | # | Severity | Category | Location | Finding | Fix |
 | --- | --- | --- | --- | --- | --- |
-| 1 | **HIGH** | Performance | `Shell/InterceptBar.swift:46-53` | The armed-intercept pulse is a SwiftUI `repeatForever` opacity animation. Every frame re-enters the SwiftUI graph and AppKit layout of the hosting view: **17–23 % of a core, continuously, for as long as any flow is paused** (real core, real paused request, nothing selected: an empty inspector). 0.1–0.6 % the moment the flow is resumed and intercept disarmed. The one motion the brief allows is the app's single biggest idle cost. | Drive the pulse from Core Animation (a layer-backed dot with a `CABasicAnimation` on `opacity`, autoreverses, repeats): the render server animates it, the main thread does nothing per frame. Plan [001](animation-plans/001-intercept-pulse-core-animation.md). |
-| 2 | MEDIUM | Accessibility · Interruptibility | `Shell/InterceptBar.swift:49-53` | Reduce Motion is only consulted in `onAppear`. Toggled on while the bar is showing, the opacity jumps to 1 (right) but the repeating animation is only abandoned, not removed; toggled off again, `pulse` is already `true`, so the dot sits at 0.45 with no animation: a half-lit, static dot that reads as a wrong state. | Same plan as 1: the CA animation is added and removed from `updateNSView` as the environment's `accessibilityReduceMotion` changes, so both directions of a live toggle are correct. Proven with the switch toggled live. |
+| 1 | **HIGH** | Performance | `Shell/InterceptBar.swift:46-53` | The armed-intercept pulse is a SwiftUI `repeatForever` opacity animation. Every frame re-enters the SwiftUI graph and AppKit layout of the hosting view: **17–23 % of a core, continuously, for as long as any flow is paused** (real core, real paused request, nothing selected: an empty inspector). 0.1–0.6 % the moment the flow is resumed and intercept disarmed. The one motion the brief allows is the app's single biggest idle cost. | Drive the pulse from Core Animation (a layer-backed dot with a `CABasicAnimation` on `opacity`, autoreverses, repeats): the render server animates it, the main thread does nothing per frame. Plan [001](animation-plans/001-intercept-pulse-core-animation.md). **Fixed in #204: 0.2–0.8 % with the bar on screen.** |
+| 2 | MEDIUM | Accessibility · Interruptibility | `Shell/InterceptBar.swift:49-53` | Reduce Motion is only consulted in `onAppear`. Toggled on while the bar is showing, the opacity jumps to 1 (right) but the repeating animation is only abandoned, not removed; toggled off again, `pulse` is already `true`, so the dot sits at 0.45 with no animation: a half-lit, static dot that reads as a wrong state. | Same plan as 1: the CA animation is added and removed from `updateNSView` as the environment's `accessibilityReduceMotion` changes, so both directions of a live toggle are correct. **Fixed in #204**, proven with the real System Settings switch flipped on and off during one recording. |
 | 3 | MEDIUM | Cohesion · Tokens | `Shell/InterceptBar.swift:52`, `design/KIT.md:252`, `docs/design/tokens.json:225` | The pulse curve is SwiftUI's literal `.easeInOut`, not a token, and the period is `Tok.Motion.interceptPulse / 2` arithmetic at the call site. The docs disagree with the code and each other: tokens.json says "1 → 0.5", the code does 1 → 0.45, KIT.md says "still under Reduce Motion" where the brief and tokens say it stops. | Same plan as 1: add `motion.pulse` (cubic-bezier 0.42, 0, 0.58, 1 — a sine-like ease-in-out; the strong `easeInOut` token is for travel, not breathing) to tokens.json and regenerate; one period token; align KIT.md, DESIGN-SYSTEM.md and the token description with the code. |
-| 4 | LOW | Purpose & frequency · Dead code | `Shell/ShellView.swift:49-62` | The mouse-opened palette is given a 160 ms scale-from-top entrance, but the `.animation(_:value:)` that should drive it sits inside the `if session.paletteVisible` branch it is meant to insert and remove, so it never applies. **Measured: a real toolbar click opens the palette in one frame and the backdrop click closes it in one frame.** The palette already behaves as the brief and the 100+/day rule want; the transition, the Reduce Motion branch and the keyboard/mouse distinction are dead code that promises motion the app does not have. | Delete the transition and the animation modifier, keep the instant behaviour, document that ⌘K never animates. Plan [002](animation-plans/002-palette-remove-dead-transition.md). `Session.paletteOpenedByKeyboard` then has no reader in ShellView; retiring the flag touches `Session.swift`, `ShellToolbar.swift`, `App.swift` and `SnapshotScenes.swift`, which other sessions hold — a follow-up. |
+| 4 | LOW | Purpose & frequency · Dead code | `Shell/ShellView.swift:49-62` | The mouse-opened palette is given a 160 ms scale-from-top entrance, but the `.animation(_:value:)` that should drive it sits inside the `if session.paletteVisible` branch it is meant to insert and remove, so it never applies. **Measured: a real toolbar click opens the palette in one frame and the backdrop click closes it in one frame.** The palette already behaves as the brief and the 100+/day rule want; the transition, the Reduce Motion branch and the keyboard/mouse distinction are dead code that promises motion the app does not have. | Delete the transition and the animation modifier, keep the instant behaviour, document that ⌘K never animates. Plan [002](animation-plans/002-palette-remove-dead-transition.md). **Fixed in #203.** `Session.paletteOpenedByKeyboard` then has no reader in ShellView; retiring the flag touches `Session.swift`, `ShellToolbar.swift`, `App.swift` and `SnapshotScenes.swift`, which other sessions hold — a follow-up. |
 | 5 | LOW | Cohesion · Tokens | `UI/Tokens.swift:333-342`, `design/DESIGN-SYSTEM.md:33-36` | `Tok.Motion.hover` (100 ms) and `Tok.Motion.sheet` (220 ms) have no readers; `popover` will have none after 4. Hover fills snap on and off everywhere (correct for a dense tool: Finder and Raycast do the same). Sheets are system. | Documentation only: mark `hover`, `popover`, `sheet` as *reserved / system-provided* in DESIGN-SYSTEM.md and KIT.md so nobody "applies" them to a 100+/day surface. Folded into plan 001's docs step. No code change. |
 
 ### Vetted and not reported (by design)
@@ -68,8 +69,13 @@ behaviour, measured on the real run described under Evidence.
   Motion, disabled state kept legible. Symmetric press/release at 120 ms is within the
   100–160 ms budget; nothing to change.
 - **Hover** is instant, see finding 5.
-- **Sheets, popovers, menus, the toolbar switches** (`Toggle`, `Menu`, `Picker`,
-  `ProgressView`) are system controls; their motion and Reduce Motion handling are Apple's.
+- **Sheets, popovers, menus** (`Menu`, `Picker`, `ProgressView`, system `Toggle`s) are system
+  controls; their motion and Reduce Motion handling are Apple's.
+- **The toolbar switches** (`ToolbarSwitch` / `SwitchGlyph` in `Shell/ShellToolbar.swift`, from
+  #196) move the knob from one end of the track to the other with no slide, by design. Each
+  switch also has a keyboard shortcut, so a slide would have to tell pointer flips from keyboard
+  flips to honour the brief; the snap is the consistent choice. If one is ever added: the knob
+  only, `Tok.Motion.easeOut(Tok.Motion.press)`, off under Reduce Motion.
 - **Selection** in the AppKit table does not animate; the status-bar and lane-card dots
   change colour instantly (state indication, not decoration).
 - **Status page lane cards, chip and filter bars, the intercept bar's own appearance** all
@@ -104,7 +110,8 @@ ScreenCaptureKit stream at ~58 fps (frames are delivered only when the window's 
 | Idle CPU, 3 flows captured, nothing paused | 0.1–0.8 % |
 | CPU with one **real** paused request, armed from Flow ▸ Arm Intercept, bar + pulse on screen, nothing selected (6 × 2 s samples) | **23.1, 18.1, 16.7, 16.9, 18.4, 17.4 %** |
 | CPU after Flow ▸ Resume All + Disarm Intercept, same page | 0.2, 0.1, 0.1, 0.6 % |
-| Fixture session (first pass): Apps page with the fixture's paused bar / Status page / Apps page disarmed | 17.4–18.5 % / 0.0 % / 0.0 % |
+| **After #204**, same recipe: CPU with the real paused bar on screen (2 s samples) | 0.5, 0.8, 0.4, 0.3, 0.3, 0.3 % (0.2–0.8 % again on the merged `3fe92f66` tree) |
+| After #204: one 55 s window-id recording of the bar row while the real System Settings ▸ Accessibility ▸ Motion ▸ Reduce motion switch is flipped | pixels change every frame until the ON click (8.1 s), **no change at all for 14.4 s**, changes resume at the OFF click (22.5 s) and continue to the end |
 | Where the time goes (`sample`, 3 s, main thread) | `NSHostingView.beginTransaction → ViewGraphRootValueUpdater.updateGraph` and `NSWindow layoutIfNeeded → _layoutSubtreeWithOldSize` on every display-link tick; no app code |
 | Six real requests landing (window-id recording, 5 s) | Five single-frame changes at 1167, 1625, 2152, 2673, 3199 ms (12 710 / 3 618 / 7 311 / 3 673 / 3 640 px); every other frame identical to its predecessor: **no row animation** |
 | ⌘K from a real toolbar click, then a real backdrop click | Open: one changed frame at 2218 ms (42 986 px). Close: one changed frame at 4207 ms (42 986 px). **No entrance or exit motion runs** |
@@ -115,12 +122,11 @@ core on an 8 pt dot.
 
 ## Found on the way (not motion, handed to the orchestrator)
 
-- **Intercept armed over the bus never shows the intercept bar.** `session.interceptArmed`
-  is set only by the app's own `BusService.setIntercept`; nothing polls the core's armed
-  state. With `flow.intercept {"enabled": true}` sent by an agent, a real request paused
-  (row badge *Paused*, status bar "1 paused") and the amber bar — with Resume, Edit, Kill —
-  never appeared. The MCP supervision story depends on this bar. Needs a poll or a push of the
-  armed state (`BusService.swift:128-150`, `Session.swift:214`).
+- **Intercept armed over the bus did not show the intercept bar** on the `1854fae7` bundle:
+  `session.interceptArmed` was set only by the app's own `BusService.setIntercept`. Already fixed
+  by #196 (`proxy.status.intercept_armed` drives it); the macOS review session verified live on
+  `5eac2a5` that a second bus client arming intercept shows the bar within one poll, and the
+  later runs here on `3fe92f66` saw the bar appear after a bus-side `flow.intercept` too.
 - `FlowTableView.updateNSView` calls `reloadData()` for any change that is not a pure append
   (`FlowTableView.swift:116-122`), so every response arriving for an existing row reloads
   the whole table. Not a motion issue; a throughput one.

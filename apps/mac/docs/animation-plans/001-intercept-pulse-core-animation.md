@@ -1,6 +1,6 @@
 # 001 — Move the armed-intercept pulse to Core Animation
 
-- **Status**: TODO
+- **Status**: DONE — #204
 - **Commit**: 0f000174
 - **Severity**: HIGH (performance), with the MEDIUM Reduce Motion and token findings of the same site
 - **Category**: Performance · Accessibility · Cohesion & tokens
@@ -192,16 +192,14 @@ available too. `Tokens.swift` already imports AppKit, which brings QuartzCore.)
 
 ## Verification
 
-- **Mechanical** (Terminal panel, logs under `/tmp/claude`):
-  - `DEV_TAG=<tag> tools/snap-dev.sh none` — build exit 0, bundle at `/tmp/Aitmproxy-dev-<tag>.app`.
+- **Mechanical** (Terminal panel, logs under `/tmp/claude`; no fixture, snapshot or `--selftest`
+  runs — they are not evidence):
+  - `swift build -c debug --package-path apps/mac --scratch-path ~/Library/Developer/Aitmproxy/ui-redesign-<tag>`
+    and assemble `/tmp/Aitmproxy-dev-<tag>.app` from the installed bundle's Info.plist + `Resources/core`
+    (the bundle half of the old snap-dev, without its snapshot pass).
   - `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build-<tag>` — exit 0.
-  - `APP_BIN=/tmp/Aitmproxy-dev-<tag>.app/Contents/MacOS/Aitmproxy-<tag> tools/selftest.sh` — `SELFTEST PASS`.
-  - `DEV_TAG=<tag> tools/snap-dev.sh edit-paused,apps` then
-    `swift tools/check-layout.swift /tmp/Aitmproxy-shots-dev-<tag>/*-layout.json` — all PASS;
-    `zsh tools/grid-lint.sh` — PASS; `tools/check-capture-operator-only.sh`,
-    `tools/check-capture-toggle.sh`, `tools/check-connection-words.sh` — all PASS.
-  - Snapshot `edit-paused-light/dark.png`: the dot is present at the same place and size as
-    before (compare against a baseline snap of main).
+  - `tools/check-capture-operator-only.sh`, `tools/check-capture-toggle.sh`,
+    `tools/check-connection-words.sh`, `tools/grid-lint.sh` — all PASS.
 - **Feel check / real run** (dev bundle with its embedded core, `APP_STORE` in /tmp, no
   fixtures; upstream `python3 -m http.server 28199`; `scope.add 127.0.0.1:28199` over the bus;
   arm from the app's Flow ▸ Arm Intercept; `curl -x 127.0.0.1:<proxy> http://127.0.0.1:28199/paused`):

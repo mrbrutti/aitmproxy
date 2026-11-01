@@ -5,8 +5,8 @@ Each plan is self-contained: an executor with no context can run it from the fil
 
 | # | Plan | Severity | Status |
 | --- | --- | --- | --- |
-| 001 | [Move the armed-intercept pulse to Core Animation](001-intercept-pulse-core-animation.md) | HIGH | TODO |
-| 002 | [Remove the palette's dead entrance transition](002-palette-remove-dead-transition.md) | LOW | TODO |
+| 001 | [Move the armed-intercept pulse to Core Animation](001-intercept-pulse-core-animation.md) | HIGH | DONE — #204 |
+| 002 | [Remove the palette's dead entrance transition](002-palette-remove-dead-transition.md) | LOW | DONE — #203 |
 
 ## Order and dependencies
 
@@ -25,8 +25,10 @@ Nothing in either plan touches the files other sessions hold on 2026-10-31
 
 - `Session.paletteOpenedByKeyboard` has no reader after 002; retire it when `Session.swift`,
   `App.swift`, `Shell/ShellToolbar.swift` and `SnapshotScenes.swift` are free.
-- Product, not motion (handed to the orchestrator): intercept armed over the bus never shows
-  the intercept bar; `FlowTableView` reloads the whole table on any non-append change.
+- Product, not motion: `FlowTableView` reloads the whole table on any non-append change. (The
+  intercept-bar-over-the-bus gap seen on `1854fae7` was already fixed by #196.)
+- Fixture and snapshot modes are being deleted from every frontend (Matt, 2026-10-31); the
+  verification sections above no longer rely on them.
 
 ## Verification harness (what worked on a shared Mac with sibling sessions)
 

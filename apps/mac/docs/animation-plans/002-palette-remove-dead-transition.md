@@ -1,6 +1,6 @@
 # 002 — Remove the palette's dead entrance transition
 
-- **Status**: TODO
+- **Status**: DONE — #203
 - **Commit**: 0f000174
 - **Severity**: LOW
 - **Category**: Purpose & frequency · dead code
@@ -88,10 +88,9 @@ away if it has no other reader in that file (it has none at the audited commit).
 
 ## Verification
 
-- **Mechanical**: `DEV_TAG=<tag> tools/snap-dev.sh palette,palette-flows` builds and the
-  `palette-*.png` snapshots are pixel-identical to a baseline from main (the palette never had
-  a transition at rest); `swift test …` exit 0; `tools/selftest.sh` PASS (it opens the palette
-  through the live self-test); the three `tools/check-*.sh` tripwires PASS; `grid-lint` PASS.
+- **Mechanical** (no fixture, snapshot or `--selftest` runs — they are not evidence): the debug
+  build + dev bundle as in plan 001; `swift test …` exit 0; the three `tools/check-*.sh`
+  tripwires PASS (`check-capture-operator-only.sh` parses this file); `grid-lint` PASS.
 - **Feel check / real run**: dev bundle with its embedded core and real traffic captured; click
   the toolbar ⌘ button, then the backdrop; press ⌘K, then Escape. A window-id recording shows
   one changed frame per open and one per close — the same as before the change, which is the
