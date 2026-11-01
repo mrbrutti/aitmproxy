@@ -151,11 +151,28 @@ pub fn build_poc(
         success: def.success_assertion(payload),
     };
     let mut poc = StdPocBuilder.build(&mutated, spec)?;
+    scrub_poc(&mut poc, &mutated.request, &payload.value);
+    Ok(poc)
+}
 
-    let mut scrubber = Scrubber::new(&payload.value);
+/// Strip every credential out of a PoC [`StdPocBuilder`] just built from
+/// `request`, declaring each as a required `{{var}}` the runner must be handed
+/// at run time.
+///
+/// The one credential-safety step between building a PoC and writing it: the
+/// scanner v2 engine's hint-driven reproduction
+/// ([`crate::reproduce_link::reproduce_and_record`]) calls it for exactly the
+/// same reason [`build_poc`] does — the builder's own text scrub is too narrow
+/// (and, over a mutated request, destructive: see [`Scrubber`]), so the step is
+/// re-derived from `request` and scrubbed structurally.
+///
+/// `payload` is the scanner's own inert probe value: it is left alone wherever
+/// it appears, or the PoC could not reproduce the issue it proves.
+pub(crate) fn scrub_poc(poc: &mut Poc, request: &HttpRequest, payload: &str) {
+    let mut scrubber = Scrubber::new(payload);
     for step in &mut poc.steps {
         if let Step::Http(http) = step {
-            scrubber.scrub_step(http, &mutated.request);
+            scrubber.scrub_step(http, request);
         }
     }
     // A name the builder already declared (a credential header it templated) is
@@ -167,7 +184,6 @@ pub fn build_poc(
             poc.variables.push(var);
         }
     }
-    Ok(poc)
 }
 
 /// Strips request credentials out of a built [`HttpStep`].
@@ -575,7 +591,11 @@ fn form_encode(s: &str) -> String {
 /// A template-variable name for a redacted header / parameter / key: lowercase
 /// ASCII, every other character `_`, led by a letter or `_` (`X-API-Key` →
 /// `x_api_key`, the same name `aitm_poc`'s builder gives its credential headers).
-fn secret_var_name(key: &str) -> String {
+///
+/// Visible to the crate so the reproduction path
+/// ([`crate::reproduce_link`]) can map a declared `{{var}}` back to the request
+/// header it was minted from and bind the live credential at run time.
+pub(crate) fn secret_var_name(key: &str) -> String {
     let mut name: String = key
         .chars()
         .take(MAX_VAR_NAME_CHARS)
