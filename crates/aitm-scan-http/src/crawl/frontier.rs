@@ -96,8 +96,6 @@ pub(crate) struct Frontier {
     queue: VecDeque<(Url, u32)>,
     visited: HashSet<String>,
     fingerprints: HashSet<u64>,
-    /// Pages the engine attempted to fetch, counted against `max_pages`.
-    pub attempts: u32,
     /// Whether a URL was ever refused for being deeper than `max_depth`.
     pub depth_hit: bool,
     /// How many URLs were dropped because the frontier was full.
@@ -524,7 +522,6 @@ mod tests {
         assert!(f.note_fingerprint(7));
         assert!(!f.note_fingerprint(7));
         assert!(f.note_fingerprint(8));
-        assert_eq!(f.attempts, 0);
     }
 
     /// Q2: the stop reasons are one enum whose `as_str` is the documented

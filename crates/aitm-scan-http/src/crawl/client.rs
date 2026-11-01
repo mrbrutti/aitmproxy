@@ -143,13 +143,13 @@ impl<'a> Run<'a> {
                 self.report.stopped_reason = Some(StopReason::Time);
                 return;
             };
-            if self.frontier.attempts >= self.limits.max_pages {
+            if self.report.attempts >= self.limits.max_pages {
                 self.report.stopped_reason = Some(StopReason::MaxPages);
                 return;
             }
 
             if let Some(submission) = self.pending.pop_front() {
-                self.frontier.attempts = self.frontier.attempts.saturating_add(1);
+                self.report.attempts = self.report.attempts.saturating_add(1);
                 self.report.forms_submitted = self.report.forms_submitted.saturating_add(1);
                 if let Some(flow) = self.send(submission.request, &submission.url, left).await {
                     self.absorb(flow, &submission.url, submission.depth);
@@ -160,7 +160,7 @@ impl<'a> Run<'a> {
             let Some((url, depth)) = self.frontier.pop() else {
                 return;
             };
-            self.frontier.attempts = self.frontier.attempts.saturating_add(1);
+            self.report.attempts = self.report.attempts.saturating_add(1);
             if !self.may_visit(&url) {
                 tracing::debug!(
                     job = %self.job.job_id(),
@@ -306,10 +306,8 @@ impl<'a> Run<'a> {
         same_origin(url, self.origin) && self.guard.in_scope(&guard_authority(url))
     }
 
-    /// The finished report, with the counters the frontier owns copied in and
-    /// the stop reason a quiet end implies.
+    /// The finished report, with the stop reason a quiet end implies.
     fn finish(mut self) -> CrawlReport {
-        self.report.attempts = self.frontier.attempts;
         if self.report.stopped_reason.is_none() {
             if self.frontier.depth_hit {
                 self.report.stopped_reason = Some(StopReason::MaxDepth);
