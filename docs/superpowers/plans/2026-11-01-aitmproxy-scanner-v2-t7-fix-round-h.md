@@ -123,6 +123,8 @@ H60 (Rust, at Task 17 after the integration merge brings the model). `Issue.loca
 
 Satisfied already: `poc_ref` not in the Findings list toasts the ref path (`POC_TOAST_MAX`), the spec's fallback.
 
+H61 (Rust, at Task 17 with H60). Umbrella amendment 27: `scan.sitemap {}` returns the newest job's map (`not_found` when no job has run), never an all-jobs merge; when the response names the job it chose, the Site map summary head reads `<n> nodes · job <id>` and `J` pins or clears as today. Needs the response field from T1b's final head; H58 is closed by this ruling.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.

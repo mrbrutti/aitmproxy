@@ -729,6 +729,7 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | spec re-review | PASS | every H item and spec ruling verified with its test; T7-1 to T7-15 mapped; three Minors | H53 (`build.rs` em dash), D6/D3 amended, `cut` wrappers ratified |
 | 15 | live smoke | run 3 | 29 ok, 1 noted (the standard job finished before `x`; a fresh job was cancelled live), 3 failed: subscriber saw zero lines; zero issues (the seeded `/search?q=` became the session canary); Site map wait short-circuited by a stale cross-tab `lane_unavailable` banner, and the engine refuses `scan.sitemap {}` | H54, H55, H57 (cell); H56 (Rust, D13 ruling); H58 relayed to the coordinator |
 | 17 | coordinator | note | `l4.scope.add` needs explicit `inject_rate_pps`; `Issue.location.l4` arrives on T1b's final head; `poc_ref` fallback already the TUI's | H59 (cell), H60 (Rust at Task 17), none |
+| 17 | coordinator | ruling | `scan.sitemap {}` = newest job's map (umbrella amendment 27); D13 own-error ruling confirmed; canary and `wait_notification` fixes right | H58 closed; D6 amended; H61 at Task 17 |
 
 ## Shipped
 
