@@ -9,7 +9,14 @@ import Testing
 /// views render. The pack files are the parsing contract, never evidence (D14).
 @Suite struct ScanSurfaceTests {
     static let startTool = ToolDescriptor(name: "scan.start", description: "", inputSchema: ["type": "object"])
-    static var toolsWithStart: [ToolDescriptor] { Fixtures.tools + [startTool] }
+    /// The hosts the removed fixture scope carried; the gate tests still speak of them.
+    static let scope = ["api.shop-staging.test", "auth.shop-staging.test", "cdn.shop-staging.test"]
+    /// A legacy core's tool list: `scan.discover` without `scan.start`, with the L4 scope verbs.
+    static let legacyTools: [ToolDescriptor] = ["flow.list", "flow.get", "scope.add", "scope.list", "scan.discover",
+                                                 "l4.scope.add", "l4.scope.list", "poc.build", "poc.run"].map {
+        ToolDescriptor(name: $0, description: "", inputSchema: ["type": "object"])
+    }
+    static var toolsWithStart: [ToolDescriptor] { legacyTools + [startTool] }
 
     static func load(_ file: String) throws -> JSONValue { try ScanPack.load(file) }
 
@@ -28,11 +35,11 @@ import Testing
         #expect(ScanSurface.mode(for: Self.toolsWithStart) == .surface)
         #expect(ScanSurface.isOffered(in: Self.toolsWithStart))
         #expect(!ScanSurface.legacyOffered(in: Self.toolsWithStart))
-        #expect(ScanSurface.mode(for: Fixtures.tools) == .legacy)
-        #expect(ScanSurface.legacyOffered(in: Fixtures.tools))
-        #expect(!ScanSurface.isOffered(in: Fixtures.tools))
+        #expect(ScanSurface.mode(for: Self.legacyTools) == .legacy)
+        #expect(ScanSurface.legacyOffered(in: Self.legacyTools))
+        #expect(!ScanSurface.isOffered(in: Self.legacyTools))
         #expect(ScanSurface.mode(for: []) == .unavailable)
-        #expect(ScanSurface.has("l4.scope.list", in: Fixtures.tools))
+        #expect(ScanSurface.has("l4.scope.list", in: Self.legacyTools))
         #expect(!ScanSurface.has("l4.scope.list", in: []))
     }
 
@@ -45,7 +52,7 @@ import Testing
         model.editedProfile = profile
         model.l4InjectScopeKnown = nil
 
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == nil)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == nil)
         let launch = model.launchArguments(map: false)
         #expect(launch.tool == "scan.start")
         #expect(launch.args["profile"]?["target"]?["origins"] == JSONValue.array(["http://api.shop-staging.test"]))
@@ -67,7 +74,7 @@ import Testing
         profile.target.origins = ["http://telemetry.vendor-analytics.example"]
         var model = ScanSurfaceModel()
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart)
                 == "Out of scope — add telemetry.vendor-analytics.example to scope to scan it")
     }
 
@@ -78,14 +85,14 @@ import Testing
         model.editedProfile = profile
 
         model.l4InjectScopeKnown = nil
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == scanL4Hint)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == scanL4Hint)
         model.l4InjectScopeKnown = false
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == scanL4Hint)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == scanL4Hint)
 
         profile.target.l4 = [["ip": "127.0.0.1", "port": 9000, "proto": "tcp", "grammar": nil]]
         model.editedProfile = profile
         model.l4InjectScopeKnown = true
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == nil)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == nil)
     }
 
     @Test func aBusWithoutScanStartIsRefused() throws {
@@ -93,16 +100,16 @@ import Testing
         profile.target.origins = ["http://api.shop-staging.test"]
         var model = ScanSurfaceModel()
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Fixtures.tools) == "scan.start is not on this bus")
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: []) == "scan.start is not on this bus")
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.legacyTools) == "scan.start is not on this bus")
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: []) == "scan.start is not on this bus")
     }
 
     @Test func emptyOriginsAreRefused() throws {
         var model = ScanSurfaceModel()
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == "Choose a profile.")
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == "Choose a profile.")
         model.editedProfile = try Self.standardProfile()
         #expect(model.editedProfile?.target.origins == [])
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart)
                 == "Choose at least one in-scope origin.")
     }
 
@@ -500,49 +507,49 @@ extension ScanSurfaceTests {
         var model = ScanSurfaceModel()
         model.editedProfile = profile
         model.l4InjectScopeKnown = true
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == Self.noL4Targets)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == Self.noL4Targets)
 
         // An L4 entry missing one of ip / port / proto is not a target.
         profile.target.l4 = [["ip": "127.0.0.1", "proto": "tcp"]]
         model.editedProfile = profile
         #expect(profile.target.l4Rows == [])
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == Self.noL4Targets)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == Self.noL4Targets)
         profile.target.l4 = [["ip": "127.0.0.1", "port": "9000", "proto": "tcp"]]
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == Self.noL4Targets)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == Self.noL4Targets)
 
         // A complete entry is; a malformed sibling is left out of the rows.
         profile.target.l4 = [["ip": "127.0.0.1", "port": 9000, "proto": "tcp", "grammar": .null], ["ip": "10.0.0.1"]]
         model.editedProfile = profile
         #expect(profile.target.l4Rows == ["127.0.0.1:9000/tcp"])
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == nil)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == nil)
         #expect(model.launchRefusal(scopeHosts: [], tools: Self.toolsWithStart) == nil)
 
         // The hint wins over the missing-target message while no Inject entry is known.
         profile.target.l4 = []
         model.editedProfile = profile
         model.l4InjectScopeKnown = false
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == scanL4Hint)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == scanL4Hint)
         model.l4InjectScopeKnown = nil
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == scanL4Hint)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == scanL4Hint)
 
         // A mixed HTTP + L4 profile with nothing to aim at asks for an origin.
         profile.lanes = [.http, .l4Stream]
         model.editedProfile = profile
         model.l4InjectScopeKnown = true
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == "Choose at least one in-scope origin.")
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == "Choose at least one in-scope origin.")
 
         // An L4 target plus an out-of-scope origin is still refused on the origin.
         profile.target.l4 = [["ip": "127.0.0.1", "port": 9000, "proto": "tcp"]]
         profile.target.origins = ["http://telemetry.vendor-analytics.example"]
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart)
                 == "Out of scope — add telemetry.vendor-analytics.example to scope to scan it")
 
         // The bus check comes before everything else, even with no profile.
         let bare = ScanSurfaceModel()
-        #expect(bare.launchRefusal(scopeHosts: Fixtures.scope, tools: []) == "scan.start is not on this bus")
-        #expect(bare.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == "Choose a profile.")
+        #expect(bare.launchRefusal(scopeHosts: Self.scope, tools: []) == "scan.start is not on this bus")
+        #expect(bare.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == "Choose a profile.")
     }
 
     @Test func theGateChecksEveryOriginAgainstScope() throws {
@@ -552,7 +559,7 @@ extension ScanSurfaceTests {
         // Mixed case, a port and a trailing slash still match the scope host.
         profile.target.origins = ["HTTP://API.shop-staging.test:8443/"]
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == nil)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == nil)
         #expect(model.launchRefusal(scopeHosts: ["*.shop-staging.test"], tools: Self.toolsWithStart) == nil)
         #expect(model.launchRefusal(scopeHosts: ["api.shop-staging.test:8443"], tools: Self.toolsWithStart) == nil)
         // An empty scope covers nothing (deny by default); the refusal names the authority with its port.
@@ -565,23 +572,23 @@ extension ScanSurfaceTests {
         // One bad origin among good ones names the bad one; nothing is sent for the good ones.
         profile.target.origins = ["http://api.shop-staging.test", "http://auth.shop-staging.test", "http://evil.example"]
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart)
                 == "Out of scope — add evil.example to scope to scan it")
 
         // A subdomain is not covered by a plain host entry.
         profile.target.origins = ["http://dev.api.shop-staging.test"]
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart)
                 == "Out of scope — add dev.api.shop-staging.test to scope to scan it")
 
         // Not an http(s) URL: never sent, the text shows the origin as typed.
         profile.target.origins = ["ftp://api.shop-staging.test"]
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart)
                 == "Out of scope — add ftp://api.shop-staging.test to scope to scan it")
         profile.target.origins = ["api.shop-staging.test"]
         model.editedProfile = profile
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart)
                 == "Out of scope — add api.shop-staging.test to scope to scan it")
     }
 
@@ -632,7 +639,7 @@ extension ScanSurfaceTests {
         model.loadedProfile = try Self.standardProfile()
         model.editedProfile = profile
         model.l4InjectScopeKnown = true
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == nil)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == nil)
         let launch = model.launchArguments(map: true)
         #expect(launch.tool == "scan.map")
         #expect(launch.args == ["profile": profile.json()])
@@ -2022,12 +2029,12 @@ extension ScanSurfaceTests {
         #expect(model.launchArguments(map: false).args.isEmpty)
         #expect(model.launchArguments(map: true).args.isEmpty)
         #expect(model.launchArguments(map: false).tool == "scan.start")
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == "Choose a profile.")
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == "Choose a profile.")
 
         var profile = try Self.standardProfile()
         profile.target.origins = ["http://api.shop-staging.test"]
         model.applyProfile(profile)
-        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == nil)
+        #expect(model.launchRefusal(scopeHosts: Self.scope, tools: Self.toolsWithStart) == nil)
         let launch = model.launchArguments(map: false)
         #expect(launch.args.keys.sorted() == ["profile"])
         let request = try #require(L4ConfirmRequest(json: [
