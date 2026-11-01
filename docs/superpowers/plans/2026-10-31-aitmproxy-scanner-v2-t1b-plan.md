@@ -1606,6 +1606,12 @@ Kept by the main session during stage 6. One row per finding.
 | 11 | Spec (w2+3) | Minor | Additions beyond the plan text (`MAX_POC_NAME_CHARS`, `bindings_for`, `frontend_of`, `secret_var_name` pub(crate)) | accepted by orchestrator 2026-11-01: each required by the plan's own `poc_text_is_scrubbed` or `aitm_poc`'s precheck |
 | 1 | Spec (w2+3) | Minor | Wave-1 disposition for `as_str` overstated: a const assert was added, the index stays | disposition reworded 2026-11-01: accepted with the const assert + round-trip test as the pin |
 | 5-12 | Spec (w2+3) | Minor | Declared deviations (B21 alias unused, `override` test via `target`, allowlist in get/list, `delete` without dir, cookie excluded from headers, canary header drops, `from_flow` fallback, no `shared: Weak`, `confidence_max`) | accepted by orchestrator 2026-11-01: each required by the plan's own tests or recorded as an amendment |
+| 5-13 | Tester (w2+3) | PASS | Every plan-named test present with literal values; 43 tests added (8aa77207 + `tests/check_bridge.rs`); gate run in a scratch tree because Task 14's red-phase WIP blocked the shared one | pins to re-set: the dedupe hex when fields are length-prefixed |
+| 7 | Tester (w2+3) | Minor | `optional(None)` and `Some("-")` both render `-` in the dedupe preimage | fix (wave-2/3 fix task): presence tagged with the length prefix |
+| 8 | Tester (w2+3) | Minor | A `Deadline`/`Cancelled` refusal is charged a budget unit before the check | fix (wave-2/3 fix task): check before charging |
+| 7 | Tester (w2+3) | Minor | `merged_paths` re-splits a truncated `matched` string (cosmetic fragment) | accepted by orchestrator 2026-11-01: bounded and scrubbed |
+| 11,14 | Tester (w2+3) | Note | The PoC runner's HTTP steps rely on the client's guard; Task 14 must hand the `JobClient` | routed to Task 14 |
+| 8,14 | Tester (w2+3) | Note | `send_opts(req, SendOptions::default())` records Always; engine sends must use `send` or explicit Never | routed to Task 14 |
 
 ## Shipped
 
