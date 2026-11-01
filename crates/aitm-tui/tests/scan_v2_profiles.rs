@@ -2113,3 +2113,59 @@ fn a_prompt_draws_over_the_view_it_was_opened_from() {
         "the Scan view is not drawn under a Flows prompt: {text}"
     );
 }
+
+/// Fix round H, H48 (D11 as amended): with an editor held, `e` edits the
+/// field under the Fields cursor only while the Fields pane is focused.
+/// From the List, Origins or Checks pane it changes no field, sends
+/// nothing and toasts `e edits a field: Tab to the Fields pane`; from
+/// Fields it cycles as before.
+#[test]
+fn e_edits_a_field_only_from_the_fields_pane() {
+    const TOAST: &str = "e edits a field: Tab to the Fields pane";
+    let mut app = app();
+    open_standard(&mut app);
+    focus_field(&mut app, EditorField::Intensity);
+    assert_eq!(
+        app.scan
+            .profiles
+            .editor
+            .as_ref()
+            .expect("editor")
+            .draft
+            .intensity,
+        Intensity::Medium,
+        "the fixture's starting intensity"
+    );
+
+    for pane in [ProfilePane::List, ProfilePane::Origins, ProfilePane::Checks] {
+        app.toasts.clear();
+        app.scan.profiles.pane = pane;
+        let reqs = app.update(Action::ScanEdit);
+        assert!(reqs.is_empty(), "{pane:?}: nothing sent: {reqs:?}");
+        let editor = app.scan.profiles.editor.as_ref().expect("editor");
+        assert_eq!(
+            editor.draft.intensity,
+            Intensity::Medium,
+            "{pane:?}: e off the Fields pane changes no field"
+        );
+        assert!(!editor.dirty, "{pane:?}: the draft stays clean");
+        assert_eq!(toast(&app), TOAST, "{pane:?}: the toast names the pane");
+        assert_eq!(
+            app.scan.profiles.pane, pane,
+            "{pane:?}: the focused pane is kept"
+        );
+        assert_eq!(app.mode, Mode::Scan, "{pane:?}: no prompt opened");
+    }
+
+    app.toasts.clear();
+    app.scan.profiles.pane = ProfilePane::Fields;
+    assert!(app.update(Action::ScanEdit).is_empty());
+    let editor = app.scan.profiles.editor.as_ref().expect("editor");
+    assert_eq!(
+        editor.draft.intensity,
+        Intensity::Intrusive,
+        "from Fields, e cycles as before"
+    );
+    assert!(editor.dirty);
+    assert_ne!(toast(&app), TOAST, "no pane toast from Fields");
+}

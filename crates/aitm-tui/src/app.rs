@@ -206,6 +206,11 @@ const POC_TOAST_MAX: usize = 80;
 /// What the Profiles keys say when no editor is open (plan task 10).
 const NO_EDITOR: &str = "open a profile first (Enter on a row, or N for a new one)";
 
+/// Profiles `e` with an editor held but another pane focused (D11 as
+/// amended; fix round H, H48): the key edits the Fields cursor only from
+/// the Fields pane.
+const E_NEEDS_FIELDS: &str = "e edits a field: Tab to the Fields pane";
+
 /// The most cells a toast keeps (fix round H, H47): every `CallFailed`
 /// message reaches [`App::toast`] whole, so the text is bounded once, when
 /// it is stored, never per frame.
@@ -4825,14 +4830,22 @@ impl App {
     }
 
     /// Profiles `e` (D11): edit the field under the Fields cursor by its
-    /// kind; inert off the tab or without an editor (a toast says what to
-    /// open).
+    /// kind; inert off the tab, without an editor (a toast says what to
+    /// open) or with another pane focused (a toast names the Fields pane;
+    /// fix round H, H48).
     fn scan_edit(&mut self, out: &mut Vec<BusRequest>) {
         if self.scan.tab != ScanTab::Profiles {
             return;
         }
-        let Some(editor) = self.scan.profiles.editor.as_mut() else {
+        if self.scan.profiles.editor.is_none() {
             self.toast(Level::Info, NO_EDITOR);
+            return;
+        }
+        if self.scan.profiles.pane != ProfilePane::Fields {
+            self.toast(Level::Info, E_NEEDS_FIELDS);
+            return;
+        }
+        let Some(editor) = self.scan.profiles.editor.as_mut() else {
             return;
         };
         let field = editor.field();
