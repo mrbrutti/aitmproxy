@@ -23,7 +23,7 @@
 use std::sync::{Arc, OnceLock};
 
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, Frame, FrameKind,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, Frame, FrameKind,
     InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, Technique, Verdict,
 };
 use futures::future::BoxFuture;
@@ -76,6 +76,7 @@ fn meta() -> &'static CheckMeta {
         needs_baseline: false,
         wants_traits: None,
         targets_session: false,
+        scope: CheckScope::Point,
         cwe: Some(400),
         description: "Sends one frame padded to twice the largest frame the capture observed, \
                       capped by the profile's maximum frame size, and reports whether the \
@@ -187,6 +188,8 @@ fn verdict(
         evidence,
         detail,
         poc_hint: None,
+        location: None,
+        more: Vec::new(),
     }
 }
 

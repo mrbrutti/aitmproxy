@@ -1102,7 +1102,7 @@ mod tests {
     /// contribute nothing. Each lane track's landing bumps these literals; that
     /// track re-pins this test.
     #[test]
-    fn skeleton_lane_slots_are_empty_today() {
+    fn lane_slots_collect_the_landed_lanes() {
         assert_eq!(collect_lanes(None).len(), 1);
         assert_eq!(collect_native_checks().len(), 0);
 

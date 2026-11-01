@@ -23,8 +23,9 @@ use std::sync::{Arc, OnceLock};
 
 use aitm_core::redact::scrub_text;
 use aitm_scan_model::{
-    Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, Frame, InsertionKind,
-    InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, RawProbe, Technique, Verdict,
+    Check, CheckCost, CheckMeta, CheckOrigin, CheckScope, Confidence, Evidence, Frame,
+    InsertionKind, InsertionPoint, Intensity, LaneKind, Outcome, ProbeHost, RawProbe, Technique,
+    Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -64,6 +65,7 @@ fn meta() -> &'static CheckMeta {
         needs_baseline: true,
         wants_traits: None,
         targets_session: false,
+        scope: CheckScope::Point,
         cwe: Some(287),
         description: "Re-sends the captured WebSocket upgrade with the Cookie and Authorization \
                       headers stripped and reports a server that still completes the upgrade and \
@@ -167,6 +169,8 @@ impl Check for WsAuthBypassHandshake {
                                      reply equals the authenticated baseline"
                                 .to_string(),
                             poc_hint: None,
+                            location: None,
+                            more: Vec::new(),
                         }
                     }
                     (reply, _) => Verdict {
@@ -182,6 +186,8 @@ impl Check for WsAuthBypassHandshake {
                         },
                         detail: "reply differs or absent without credentials".to_string(),
                         poc_hint: None,
+                        location: None,
+                        more: Vec::new(),
                     },
                 },
                 Some(status) => Verdict {
@@ -190,6 +196,8 @@ impl Check for WsAuthBypassHandshake {
                     evidence,
                     detail: format!("upgrade refused with status {status} without credentials"),
                     poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
                 },
                 None => Verdict {
                     outcome: Outcome::Inconclusive,
@@ -197,6 +205,8 @@ impl Check for WsAuthBypassHandshake {
                     evidence,
                     detail: "the upgrade produced no handshake status".to_string(),
                     poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
                 },
             }
         })
