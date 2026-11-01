@@ -163,7 +163,7 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 
 ### Task A10: self-exclusion of the core's own listeners
 
-> Amended after the panel (Review log): the choke point is `L4Guard::admit_frame`/`admit_endpoints`, used by every recorder (capture loop, send_recv reply listener, intercept park, NE ingress) and `main.rs`/`tui.rs` add bound ports with `add_self_ports`; files also include `sendrecv.rs`, `ingress.rs`, `tui.rs`.
+> Amended after the panel (Review log): the choke point is `L4Guard::admit_frame`/`admit_endpoints`, used by every recorder (capture loop, send_recv reply listener, intercept park, NE ingress) and `main.rs`/`tui.rs` add bound ports with `add_self_ports` through the shared `self_port_hook` in `wire.rs`; `is_self_traffic` was dropped and `self_exclusion_bpf(interface)` is `pub(crate)` on the guard; files also include `sendrecv.rs`, `ingress.rs`, `tui.rs`.
 
 
 - **Satisfies:** AC34
@@ -635,13 +635,14 @@ Kept by the main session during stage 6. One row per finding.
 | (a) A2 | security | Minor | `l4.flow.get` clones the whole flow under the store lock whatever the window | accepted by the orchestrator 2026-11-01 as follow-up (windowed store accessor in `src/flow.rs`, the store, outside (a)) |
 | (a) §2.1 | security | Minor | Other cores on the host and the CDP port are not excluded | accepted; recorded as a known limit in spec §2.1 |
 | (a) A14 | quality | Minor | `docs/design/languages/rhai.api.json` still lists `flow.get` with only `id` | follow-up for unit (e) (file outside (a)) |
-| (a) A11 (re-panel) | security | Important | Per-flow-kind bytes gate let an Inject-only agent read captured send_recv replies | fixed in fix task 3: per-packet rule (captured→Capture gate, injected→Inject gate); spec §2.2/AC35 amended |
-| (a) A13 (re-panel) | quality | Important | `expire_due` deep-cloned every parked packet per reader pass | fixed in fix task 3: `ParkedTable::due()` by reference |
-| (a) fix 2 (re-panel) | security | Minor ×2 | NE ingress ran the frame decoder over UDP payloads (crafted payload could suppress a record); intercept self-check parsed as Ethernet while `ip_target` parses L3 | fixed in fix task 3 (target-only admission; one L3 parse) |
+| (a) A11 (re-panel) | security | Important | Per-flow-kind bytes gate let an Inject-only agent read captured send_recv replies | fixed 28af06e3: per-packet rule (captured→Capture gate, injected→Inject gate); spec §2.2/AC35 amended 262b15ab |
+| (a) A13 (re-panel) | quality | Important | `expire_due` deep-cloned every parked packet per reader pass | fixed f3d5a4f2: `ParkedTable::due()` by reference |
+| (a) fix 2 (re-panel) | security | Minor ×2 | NE ingress ran the frame decoder over UDP payloads (crafted payload could suppress a record); intercept self-check parsed as Ethernet while `ip_target` parses L3 | fixed e5ac6f63 (target-only admission), 0b95ef21 (one L3 parse) |
 | (a) fix 2 (re-panel) | security | Minor | Intercept gate alone shows parked bytes | superseded by the per-packet rule (parked packets are captured → Capture gate) |
-| (a) fix 1/2 (re-panel) | quality | Minor ×9 | source-grep tui test, dead `is_self_traffic`, caller-side loopback check for the BPF clause, `&[]` frame marker in ingress, duplicated self-port hook, triple transport mapping, needless clones in scoped send_recv, SeqCst + overclaiming doc, fifth fixture builder | fixed in fix task 3 |
-| (a) docs (re-panel) | spec | Important | §2.2 amendment not carried into Goals, AC35, Decision 2, A11, E2 | fixed in this docs commit (per-packet rule everywhere) |
-| (a) docs (re-panel) | spec | Minor ×4 | AC34 names only the capture loop; Constraints bullet lacks tui/ingress; A10/A13/A9 task text drifted; Review log SHAs missing; `is_loopback_interface` pub | fixed in this docs commit; `is_loopback_interface` becomes `pub(crate)` in fix task 3 |
+| (a) fix 1/2 (re-panel) | quality | Minor ×9 | source-grep tui test, dead `is_self_traffic`, caller-side loopback check for the BPF clause, `&[]` frame marker in ingress, duplicated self-port hook, triple transport mapping, needless clones in scoped send_recv, SeqCst + overclaiming doc, fifth fixture builder | fixed 7570eb39, 2e3514d2, e5ac6f63, 5d841ec9, 7f5aac56, fed99d25 (`is_self_traffic` deleted and `self_exclusion_bpf(interface)` in 2e3514d2) |
+| (a) docs (re-panel) | spec | Important | §2.2 amendment not carried into Goals, AC35, Decision 2, A11, E2 | fixed 262b15ab (per-packet rule everywhere) |
+| (a) docs (re-panel) | spec | Minor ×4 | AC34 names only the capture loop; Constraints bullet lacks tui/ingress; A10/A13/A9 task text drifted; Review log SHAs missing; `is_loopback_interface` pub | fixed 262b15ab; `is_loopback_interface` `pub(crate)` in 2e3514d2 |
+| (a) merge | spec | Minor | `Cargo.lock` touched (d2261658) outside §7(a) | accepted by the orchestrator 2026-11-01: mechanical re-resolution after merging main 3d710ab (`aitm-sysproxy` 0.5.6→0.5.7, the workspace version); cargo makes the same edit on any build |
 
 ## Shipped
 
