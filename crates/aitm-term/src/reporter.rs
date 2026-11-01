@@ -11,7 +11,9 @@
 //! live. [`Reporter::card`], [`Reporter::error`], [`Reporter::finish`] and
 //! [`Reporter::finish_and_clear`] block on an acknowledgement (2 s at most);
 //! `finish` closes the channel, joins the thread and leaves the reporter in a
-//! synchronous plain-line mode so a late warning still prints (C10).
+//! synchronous plain-line mode so a late warning still prints (C10); only
+//! [`Reporter::note`] keeps its `✓` there, for the `stdin closed` line `main`
+//! prints after the serving loop ends.
 //!
 //! The `Renderer` is pure over its inputs: time comes from a [`Clock`], the
 //! terminal width from an injected probe, and every byte goes to one
@@ -150,6 +152,10 @@ struct Renderer {
     /// Warnings and events dropped by `Reporter::send` while the queue was
     /// full, not yet reported (S3); shared with the `Reporter`.
     suppressed: Arc<AtomicUsize>,
+    /// Set by `into_plain` when the renderer was rich: after `finish` every
+    /// line is plain except the note, which keeps its `✓` (spec Open
+    /// question 3; `main` prints it after the serving loop ends).
+    rich_before_finish: bool,
 }
 
 impl Renderer {
@@ -177,6 +183,7 @@ impl Renderer {
             scrolled: 0,
             header_blank: 0,
             frame: 0,
+            rich_before_finish: false,
         }
     }
 
@@ -192,9 +199,11 @@ impl Renderer {
         !self.running.is_empty()
     }
 
-    /// After `finish`: plain lines only, on the caller's thread (C10). Phases
-    /// still open keep their start time so a late `done` prints its line.
+    /// After `finish`: plain lines only, on the caller's thread (C10), the
+    /// note excepted (see [`Renderer::note`]). Phases still open keep their
+    /// start time so a late `done` prints its line.
     fn into_plain(mut self) -> Renderer {
+        self.rich_before_finish = self.caps.animate;
         self.caps.animate = false;
         self
     }
@@ -341,12 +350,16 @@ impl Renderer {
 
     /// `✓ <line>` (rich, the glyph painted Success) or `<line>` (plain): a
     /// success note outside any phase, a done line without a duration. Quiet
-    /// drops it like every other non-warning line.
+    /// drops it like every other non-warning line. On a terminal that was
+    /// rich before `finish` the glyph form stays: the live region is empty
+    /// by then, so `emit` writes the line straight out, no cursor movement
+    /// and no synchronized update, only the glyph's own SGR when colour is
+    /// on. Every other post-finish line keeps its plain form.
     fn note(&mut self, line: &str) {
         if self.quiet() {
             return;
         }
-        let line = if self.rich() {
+        let line = if self.rich() || self.rich_before_finish {
             format!(
                 "{INDENT}{} {line}",
                 paint(&self.caps, Role::Success, self.glyphs.done)
@@ -811,9 +824,11 @@ impl Reporter {
     /// plain, nothing under `-q`. Usable at any time, after
     /// [`Reporter::finish`] included; `main` prints `stdin closed · stdio
     /// MCP transport ended` with it when the stdio MCP transport ends (spec
-    /// Open question 3). On a TTY the glyph form needs the live renderer, so
-    /// call it before `finish`; afterwards the plain-line mode (C10) prints
-    /// the bare line.
+    /// Open question 3), which is after the serving loop and so after
+    /// `finish`. It is the one message that keeps its glyph after `finish()`:
+    /// on a TTY the post-finish synchronous path still writes `  ✓ <line>`
+    /// (the live region is empty, so no cursor moves), while every other
+    /// late line takes the plain form (C10).
     pub fn note(&self, line: &str) {
         self.send(Msg::Note(clean(line)));
     }
@@ -841,7 +856,7 @@ impl Reporter {
 
     /// Stops the ticker and joins the render thread, keeping every line on
     /// screen. Idempotent; afterwards every call renders synchronously in
-    /// plain-line form (C10).
+    /// plain-line form (C10), [`Reporter::note`] alone keeping its glyph.
     pub fn finish(&self) {
         self.shutdown(Msg::Flush);
     }
@@ -3009,6 +3024,154 @@ mod tests {
         reporter.note("a\x1b[2Ab\nc");
         reporter.finish();
         assert_eq!(sink.text(), "a\u{FFFD}[2Ab c\n");
+    }
+
+    /// Fix task (spec Open question 3 / AC-W1-32 wiring gap): `main` calls
+    /// `note` after the serving `select!` returns, which is after
+    /// `finish()`. On a TTY the note keeps its `✓` there, the one post-finish
+    /// message that does: the live region is empty, so the line is written
+    /// straight out with no cursor movement and no synchronized update.
+    /// Plain caps keep the bare line; Quiet stays silent.
+    #[test]
+    fn note_after_finish_keeps_its_glyph_on_a_tty_and_moves_no_cursor() {
+        const LINE: &str = "stdin closed · stdio MCP transport ended";
+
+        // Rich, no colour: header, a done phase, finish, then the note.
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let reporter = Reporter::with_clock(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+            clock.clone(),
+        )
+        .checklist(true);
+        reporter.header("aitmproxy", "0.5.11");
+        reporter.phase("reading config").done("config defaults");
+        reporter.finish();
+        let before = sink.text();
+        assert_eq!(
+            before,
+            format!("›•‹ aitmproxy 0.5.11\n\n{BEGIN}{CLR}  ✓ config defaults\n{END}"),
+            "the live renderer drew a rich frame before finish"
+        );
+        reporter.note(LINE);
+        let text = sink.text();
+        assert!(text.starts_with(&before), "{text:?}");
+        let tail = &text[before.len()..];
+        assert_eq!(tail, "  ✓ stdin closed · stdio MCP transport ended\n");
+        assert!(
+            text.ends_with("  ✓ stdin closed · stdio MCP transport ended\n"),
+            "{text:?}"
+        );
+
+        // With colour the glyph is painted Success and nothing else written
+        // after the finish is an escape: no MoveUp, no column/clear, no
+        // synchronized-update bracket.
+        let clock = FakeClock::new();
+        let sink = SharedSink::new();
+        let reporter = Reporter::with_clock(
+            rich_caps(true, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+            clock.clone(),
+        )
+        .checklist(true);
+        reporter.header("aitmproxy", "0.5.11");
+        reporter.phase("reading config").done("config defaults");
+        reporter.finish();
+        let before = sink.text();
+        assert!(
+            before.ends_with(&format!("{CLR}  \x1b[32m✓\x1b[0m config defaults\n{END}")),
+            "{before:?}"
+        );
+        reporter.note(LINE);
+        let text = sink.text();
+        let tail = &text[before.len()..];
+        assert_eq!(
+            tail,
+            "  \x1b[32m✓\x1b[0m stdin closed · stdio MCP transport ended\n"
+        );
+        assert!(
+            !text::strip_sgr(tail).contains('\x1b'),
+            "only SGR after finish: {tail:?}"
+        );
+        for seq in [BEGIN, END, CLR, UP1] {
+            assert!(
+                !tail.contains(seq),
+                "{seq:?} written after finish: {tail:?}"
+            );
+        }
+
+        // An ASCII rich terminal after finish: the ASCII twins, no byte
+        // above 0x7f.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, false),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        reporter.finish();
+        reporter.note(LINE);
+        assert_eq!(
+            sink.text(),
+            "  + stdin closed - stdio MCP transport ended\n"
+        );
+        assert!(sink.bytes().iter().all(|b| *b < 0x80));
+
+        // Plain stays the bare line after finish: a UTF-8 pipe keeps `·`,
+        // `Caps::plain()` (no Unicode) gets the ASCII twin.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(utf8_pipe(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.finish();
+        reporter.note(LINE);
+        assert_eq!(sink.text(), "stdin closed · stdio MCP transport ended\n");
+        no_escape_bytes(&sink);
+
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(Caps::plain(), Box::new(sink.clone()), Verbosity::Normal);
+        reporter.finish();
+        reporter.note(LINE);
+        assert_eq!(sink.text(), "stdin closed - stdio MCP transport ended\n");
+        no_escape_bytes(&sink);
+
+        // Quiet on a TTY prints nothing after finish either.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Quiet,
+        );
+        reporter.finish();
+        reporter.note(LINE);
+        assert_eq!(sink.text(), "");
+
+        // Every other post-finish message keeps its plain form on a TTY.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        )
+        .checklist(true);
+        reporter.finish();
+        reporter.warn("late");
+        reporter.phase("x").done("y");
+        reporter.phase("z").fail("z");
+        assert_eq!(sink.text(), "warning: late\ny\nerror: z\n");
+        no_escape_bytes(&sink);
+
+        // Still sanitised, still the glyph form: the content never carries
+        // its own escape to the terminal.
+        let sink = SharedSink::new();
+        let reporter = Reporter::new(
+            rich_caps(false, true),
+            Box::new(sink.clone()),
+            Verbosity::Normal,
+        );
+        reporter.finish();
+        reporter.note("a\x1b[2Ab\nc");
+        assert_eq!(sink.text(), "  ✓ a\u{FFFD}[2Ab c\n");
     }
 
     /// S3: the line the renderer prints for warnings dropped while its

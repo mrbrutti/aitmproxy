@@ -89,7 +89,10 @@ SKIPs with that reason. Capture the output with `script -q <log> tests/e2e/cli/t
 if you need a file. Exit status is non-zero if any assertion fails. Every
 section uses an isolated `HOME` under a scratch dir with its own free ports;
 nothing touches `~/Library/Application Support/aitmproxy`, the system proxy
-or a keychain.
+or a keychain. Sections 2 and 14 run in a fresh `HOME`, where the newly
+minted CA is in no trust store, so they prove the untrusted-CA path
+(`· CA untrusted`, `▸ aitm ca install`, the `System proxy` row); the trusted
+path is the recipe's run on the operator's own `HOME`.
 
 ### Environment
 
