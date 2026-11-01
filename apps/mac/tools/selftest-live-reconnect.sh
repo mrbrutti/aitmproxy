@@ -11,6 +11,10 @@
 # (T1: never `bus failed` in between), then ONE View ▸ Pause Proxy click must flip
 # `proxy.status.capturing` to false within 10 s and ONE Resume Proxy click must flip it back.
 # The action travels menu → Session → BusService.live(); only the OBSERVATION is a bus read.
+# Before each click the script waits (MENU_BOUND) for the item's title to settle: the View menu
+# flips Pause Proxy ⇄ Resume Proxy only after the app has handled its own proxy.pause/resume
+# reply, which can land after the separate observation connection already reads the new state.
+# That wait never clicks; each action is still exactly one click.
 # The pre-fix build fails at T1's pause: the superseded run's cleanup has nulled the client the
 # new run owns, `live()` throws "the bus connection closed", and capturing stays true.
 #
@@ -27,6 +31,7 @@
 #   CONNECT_BOUND 20 s   trigger → `bus: connected` (T2/T3's respawn wait shares this deadline)
 #   FAILED_BOUND   5 s   T3: kill -KILL → `bus failed`
 #   ACTION_BOUND  10 s   one menu click → `capturing` flips (measured from the click)
+#   MENU_BOUND     5 s   a menu item's title settles (Pause/Resume Proxy) before its one click
 #   QUIT_BOUND    15 s   ⌘Q → app gone
 #
 # Hygiene (BR-AC8): nothing is written to the defaults domain; no path under the operator's
@@ -60,9 +65,11 @@ CORE_DIR=${CORE_DIR:-}
 CONNECT_BOUND=20   # trigger → `bus: connected`; T2/T3's respawn wait shares this one deadline
 FAILED_BOUND=5     # T3: kill -KILL → `bus failed`
 ACTION_BOUND=10    # one menu click → `capturing` flips
+MENU_BOUND=5       # a menu item's title settles (View ▸ Pause/Resume Proxy re-renders after the app handles its reply)
 QUIT_BOUND=15      # ⌘Q → app gone
 AX_SLEEP=0.1       # between AX reads; an osascript read itself takes ~100 ms, so reads land ≤ 250 ms apart
 BUS_SLEEP=0.5      # between proxy.status polls
+MENU_SLEEP=0.2     # between menu-item existence checks
 T1_MIN_SETTLE=1    # after Reconnect Bus the label may still read the OLD `bus: connected`; keep polling at least this long
 
 # The toolbar connection pill (ShellToolbar → ListeningPill) as System Events exposes it: its
@@ -91,6 +98,20 @@ menu_click() {
   local item=$1 menu=$2
   se 'set frontmost to true' >/dev/null || return 1
   se "click menu item \"$item\" of menu 1 of (item -1 of (menu bar items of menu bar 1 whose name is \"$menu\"))" >/dev/null
+}
+
+# wait_menu_item <item> <menu> <bound_s>: poll every MENU_SLEEP until the menu has an item named
+# <item> (same last-menu-bar-item addressing as menu_click); 0 when present, 1 at the bound. A
+# title-settle, never a retry: it only reads, it never clicks. An osascript error counts as
+# not-there-yet and is polled again until the bound.
+wait_menu_item() {
+  local item=$1 menu=$2 bound=$3 start=$EPOCHREALTIME got
+  while true; do  # bounded: gives up at start + bound (MENU_BOUND)
+    got=$(se "exists menu item \"$item\" of menu 1 of (item -1 of (menu bar items of menu bar 1 whose name is \"$menu\"))" 2>/dev/null) || got=""
+    [[ $got == true ]] && return 0
+    (( EPOCHREALTIME - start >= bound )) && return 1
+    sleep $MENU_SLEEP
+  done
 }
 
 # The pill's tooltip text; empty on any error (no window yet, no Accessibility grant, app gone).
@@ -223,12 +244,15 @@ operator_action() {
   base=$(bus_capturing)
   [[ $base != unknown ]] || fail "$trig baseline proxy.status over the bus at $bus_addr failed"
   if [[ $base != true ]]; then
+    wait_menu_item "Resume Proxy" View $MENU_BOUND || fail "$trig baseline the View menu has no Resume Proxy item"
     menu_click "Resume Proxy" View || fail "$trig baseline the View menu has no Resume Proxy item"
     wait_capturing true $ACTION_BOUND || fail "$trig baseline capturing stayed false for ${ACTION_BOUND} s after one Resume Proxy click"
   fi
+  wait_menu_item "Pause Proxy" View $MENU_BOUND || fail "$trig pause the View menu has no Pause Proxy item"
   menu_click "Pause Proxy" View || fail "$trig pause the View menu has no Pause Proxy item"
   wait_capturing false $ACTION_BOUND || fail "$trig pause capturing stayed true for ${ACTION_BOUND} s after one Pause Proxy click"
   pause_s=$capturing_elapsed
+  wait_menu_item "Resume Proxy" View $MENU_BOUND || fail "$trig resume the View menu has no Resume Proxy item"
   menu_click "Resume Proxy" View || fail "$trig resume the View menu has no Resume Proxy item"
   wait_capturing true $ACTION_BOUND || fail "$trig resume capturing stayed false for ${ACTION_BOUND} s after one Resume Proxy click"
   note "$trig: Pause Proxy → proxy.status.capturing=false in ${pause_s} s; Resume Proxy → capturing=true in ${capturing_elapsed} s"
