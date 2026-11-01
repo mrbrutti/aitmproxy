@@ -20,6 +20,11 @@ use aitm_scan_model::{Confidence, Evidence, Outcome, ProbeHost, Verdict};
 /// so the sentence cannot drift between modules (Q2-2).
 pub(crate) const STOPPED: &str = "the job was cancelled, out of budget or past its deadline";
 
+/// The list form of [`STOPPED`], for a check that appends a fourth reason of
+/// its own: `format!("{STOPPED_LIST}, or {extra}")`. Spelled out rather than
+/// edited out of [`STOPPED`] at run time, so each reads as written (FQ-2).
+pub(crate) const STOPPED_LIST: &str = "the job was cancelled, out of budget, past its deadline";
+
 /// Whether the check may spend `need` more stimuli right now.
 ///
 /// Three reasons to stop and the check owns all three: the job was cancelled,
@@ -105,7 +110,7 @@ impl ProbeTally {
                 // The list form of the same sentence, with the extra reason
                 // as its last item: "cancelled, out of budget, past its
                 // deadline, or <extra>".
-                Some(extra) => format!("{}, or {extra}", STOPPED.replacen(" or ", ", ", 1)),
+                Some(extra) => format!("{STOPPED_LIST}, or {extra}"),
                 None => STOPPED.to_string(),
             };
             return Some(no_finding(
@@ -142,7 +147,7 @@ impl ProbeTally {
 mod tests {
     use aitm_scan_model::{Confidence, Evidence, Outcome};
 
-    use super::{no_finding, ProbeTally, STOPPED};
+    use super::{no_finding, ProbeTally, STOPPED, STOPPED_LIST};
 
     /// A verdict that concluded nothing is always `tentative`: the caller
     /// names the outcome and the detail, and nothing else (Q2-1). Both a
@@ -169,12 +174,18 @@ mod tests {
     }
 
     /// The one spelling of the standing stop reason every check composes
-    /// its own sentence from (Q2-2).
+    /// its own sentence from (Q2-2), and its list form, which takes a fourth
+    /// reason after a comma (FQ-2). Both are pinned: the second is not
+    /// derived from the first by a string edit.
     #[test]
     fn the_stop_reason_is_spelled_once() {
         assert_eq!(
             STOPPED,
             "the job was cancelled, out of budget or past its deadline"
+        );
+        assert_eq!(
+            STOPPED_LIST,
+            "the job was cancelled, out of budget, past its deadline"
         );
     }
 
