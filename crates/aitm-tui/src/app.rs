@@ -4054,13 +4054,9 @@ impl App {
         out: &mut Vec<BusRequest>,
     ) -> bool {
         if !self.has_tool(name) {
-            let detail = format!("{name} is not on this bus");
-            self.scan.set_error(ScanError {
-                verb: name.to_string(),
-                code: None,
-                detail: detail.clone(),
-            });
-            self.toast(Level::Warn, detail);
+            let err = ScanError::missing_verb(name);
+            self.toast(Level::Warn, err.wording());
+            self.scan.set_error(err);
             return false;
         }
         if self.scan.inflight.contains(&tag) {

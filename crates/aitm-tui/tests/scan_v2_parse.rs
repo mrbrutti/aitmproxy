@@ -120,12 +120,33 @@ fn a_malformed_reply_is_a_contract_error() {
     assert_eq!(err.verb, "scan.status");
     assert_eq!(err.code, None);
     assert!(
-        err.detail
-            .starts_with("scan.status: reply did not match the contract ("),
-        "detail was {:?}",
+        err.detail.starts_with("reply did not match the contract ("),
+        "the detail carries no verb (D10): {:?}",
         err.detail
     );
-    assert_eq!(err.wording(), format!("scan.status: {}", err.detail));
+    assert!(
+        err.wording()
+            .starts_with("scan.status: reply did not match the contract ("),
+        "wording was {:?}",
+        err.wording()
+    );
+    assert!(
+        !err.wording().contains("scan.status: scan.status"),
+        "the verb is prefixed once, not twice: {:?}",
+        err.wording()
+    );
+}
+
+/// A verb the bus lacks (fix round A, A21): the constructor is uncoded with
+/// the detail `is not on this bus`, and its wording reads `<verb> is not on
+/// this bus` with no colon and the verb named once.
+#[test]
+fn a_missing_verb_is_worded_without_repeating_the_verb() {
+    let err = ScanError::missing_verb("scan.cancel");
+    assert_eq!(err.verb, "scan.cancel");
+    assert_eq!(err.code, None);
+    assert_eq!(err.detail, "is not on this bus");
+    assert_eq!(err.wording(), "scan.cancel is not on this bus");
 }
 
 #[test]

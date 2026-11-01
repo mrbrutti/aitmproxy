@@ -308,6 +308,10 @@ pub enum ScanOffer {
     None,
 }
 
+/// The detail of a [`ScanError::missing_verb`]: the inline text D2 fixes for
+/// a control whose verb the bus lacks, minus the verb itself.
+pub const MISSING_VERB: &str = "is not on this bus";
+
 /// A failed `scan.*` call, coded when the core's message carries a D9 code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanError {
@@ -338,11 +342,27 @@ impl ScanError {
         }
     }
 
+    /// A verb this bus does not offer (spec D2): uncoded, with the detail
+    /// [`MISSING_VERB`], so [`ScanError::wording`] reads `<verb> is not on
+    /// this bus`.
+    pub fn missing_verb(verb: &str) -> Self {
+        Self {
+            verb: verb.to_string(),
+            code: None,
+            detail: MISSING_VERB.to_string(),
+        }
+    }
+
     /// The operator wording (spec D9): the code's fixed text, then `: `, then
-    /// the detail; an uncoded error reads `<verb>: <detail>`.
+    /// the detail; an uncoded error reads `<verb>: <detail>`, except a
+    /// missing verb, which reads `<verb> is not on this bus` (D2's inline
+    /// text, the verb named once).
     pub fn wording(&self) -> String {
         match self.code {
             Some(code) => format!("{}: {}", code_wording(code), self.detail),
+            None if self.detail.starts_with(MISSING_VERB) => {
+                format!("{} {}", self.verb, self.detail)
+            }
             None => format!("{}: {}", self.verb, self.detail),
         }
     }
@@ -382,16 +402,17 @@ fn code_wording(code: ScanErrorCode) -> &'static str {
 }
 
 /// Parse a `scan.*` reply into its D10 type. A mismatch is a [`ScanError`]
-/// with `code: None` and the serde message in the detail; nothing panics on
-/// bus data.
+/// with `code: None` and the serde message in the detail (the verb is not
+/// in the detail: `wording()` prefixes it); nothing panics on bus data. The
+/// reply is read in place, never cloned.
 pub fn parse_result<T: serde::de::DeserializeOwned>(
     verb: &str,
     value: &Value,
 ) -> Result<T, ScanError> {
-    serde_json::from_value(value.clone()).map_err(|e| ScanError {
+    T::deserialize(value).map_err(|e| ScanError {
         verb: verb.to_string(),
         code: None,
-        detail: format!("{verb}: reply did not match the contract ({e})"),
+        detail: format!("reply did not match the contract ({e})"),
     })
 }
 
