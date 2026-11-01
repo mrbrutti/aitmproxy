@@ -395,8 +395,8 @@ crate's tests green before the commit; the full gate before hand-off.
      `tunnel_reason == "client_rejected_certificate"`, `status is None`, `duration_ms
      is not None`.
   5. **plain HTTP out of scope is passive**: `scope.remove 127.0.0.1`;
-     `intercept.rule.add` with `url` `*127.0.0.1:<plain>*` (as `test_intercept_url_rules.py`
-     does), arm; `curl -x proxy http://127.0.0.1:<plain>/p` returns 200 immediately
+     `flow.intercept {enabled: true, rules: [{url: "*127.0.0.1:<plain>*"}]}` (exactly as
+     `test_intercept_url_rules.py` arms a breakpoint rule); `curl -x proxy http://127.0.0.1:<plain>/p` returns 200 immediately
      (no park), the `Upstream` record has `/p`, the row has `passive == true`,
      `proxy.status.paused == 0`; then `scope.add 127.0.0.1`, same request parks
      (`state == "intercepted"`, upstream record lacks `/q` until `flow.resume`), row
