@@ -8,7 +8,7 @@
 //! No fixture, snapshot or seeded store is used anywhere in this file.
 
 use aitm_tui::action::{Action, BusEvent, BusRequest, ToolInfo};
-use aitm_tui::app::{App, Chip, Mode, SidebarItem};
+use aitm_tui::app::{App, Chip, Mode, PromptKind, SidebarItem};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::l4::{
@@ -2109,4 +2109,171 @@ fn chips_filters_confirm_footer_only_for_inject() {
         "{inject}"
     );
     assert!(inject.contains("y confirm"), "{inject}");
+}
+
+// ------------------------------------------------------- no_http_verbs_on_l4
+
+/// An app whose bus also offers the HTTP verbs, with an in-scope HTTP row `H1`
+/// (its authority in the HTTP scope) and an in-scope L4 row `F` (interface
+/// `lo`, covered by an L4 scope entry), so that a refusal below can only come
+/// from the row's kind, never from a missing tool or the scope gate.
+fn http_and_l4_app() -> App {
+    let mut app = app();
+    let mut tools = l4_tools(false);
+    for name in ["flow.replay", "flow.mark", "flow.comment", "poc.build"] {
+        tools.push(ToolInfo {
+            name: name.to_string(),
+            description: format!("{name} (rig)"),
+            input_schema: json!({"type": "object", "properties": {}}),
+            confirmable: false,
+        });
+    }
+    let _ = connected(&mut app, tools);
+    let _ = app.on_bus(BusEvent::Scope(vec!["127.0.0.1:9099".into()]));
+    let _ = app.on_bus(BusEvent::L4Scope(vec![json!({
+        "id": "S1", "interface": "lo", "capability": "intercept",
+        "cidr": "127.0.0.1/32", "ports": "9000-9999", "direction": "inbound",
+        "source": "config"
+    })]));
+    let _ = app.on_bus(BusEvent::Flows(vec![http_summary("H1")]));
+    let _ = app.on_bus(BusEvent::L4Flows(vec![intercept_flow("F")]));
+    assert_eq!(app.mode, Mode::Flows);
+    let h1 = app.row("H1").expect("H1 listed").clone();
+    assert!(app.in_scope(&h1), "H1 is in HTTP scope");
+    let f = app.row("F").expect("F listed").clone();
+    assert_eq!(f.kind, aitm_tui::model::FlowKind::L4);
+    assert!(app.in_scope(&f), "F is in L4 scope");
+    app
+}
+
+/// AC16: with the L4 row selected, `r` / `m` / `c` / `P` (Replay, Mark,
+/// Comment, Build PoC) put nothing on the bus, open no prompt, and toast
+/// `<Verb> is not available for L4 flows`.
+#[test]
+fn no_http_verbs_on_l4_replay_mark_comment_and_poc_send_nothing() {
+    assert_eq!(keys::map(press('r'), Mode::Flows), Some(Action::Replay));
+    assert_eq!(keys::map(press('m'), Mode::Flows), Some(Action::Mark));
+    assert_eq!(keys::map(press('c'), Mode::Flows), Some(Action::Comment));
+    assert_eq!(keys::map(press('P'), Mode::Flows), Some(Action::BuildPoc));
+
+    let mut app = http_and_l4_app();
+    app.selected = Some("F".into());
+    for (action, verb) in [
+        (Action::Replay, "Replay"),
+        (Action::Mark, "Mark"),
+        (Action::Comment, "Comment"),
+        (Action::BuildPoc, "Build PoC"),
+    ] {
+        app.toasts.clear();
+        assert_eq!(
+            app.update(action.clone()),
+            vec![],
+            "{action:?} on an L4 row"
+        );
+        assert_eq!(
+            toast_text(&app),
+            format!("{verb} is not available for L4 flows"),
+            "{action:?}"
+        );
+        assert!(toast_text(&app).contains("not available for L4 flows"));
+        assert_eq!(app.mode, Mode::Flows, "{action:?} opened no prompt");
+    }
+    // The palette spellings route through the same reducer arms.
+    app.toasts.clear();
+    assert_eq!(app.run_command("replay"), vec![]);
+    assert_eq!(toast_text(&app), "Replay is not available for L4 flows");
+    app.toasts.clear();
+    assert_eq!(app.run_command("poc build"), vec![]);
+    assert_eq!(toast_text(&app), "Build PoC is not available for L4 flows");
+    assert_eq!(app.mode, Mode::Flows);
+}
+
+/// AC16, the pick: a Mark or Comment prompt opened on the HTTP row whose
+/// selection has moved to the L4 row by the time ⏎ is pressed sends nothing,
+/// closes, and toasts the same refusal.
+#[test]
+fn no_http_verbs_on_l4_mark_pick_and_comment_submit_refuse_on_an_l4_row() {
+    let mut app = http_and_l4_app();
+    app.selected = Some("H1".into());
+    assert_eq!(app.update(Action::Mark), vec![]);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Mark));
+    for c in "red".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    app.selected = Some("F".into());
+    assert_eq!(
+        app.update(Action::Submit),
+        vec![],
+        "the mark pick on an L4 row"
+    );
+    assert_eq!(toast_text(&app), "Mark is not available for L4 flows");
+    assert_eq!(app.mode, Mode::Flows, "the prompt closed");
+
+    app.selected = Some("H1".into());
+    app.toasts.clear();
+    assert_eq!(app.update(Action::Comment), vec![]);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Comment));
+    for c in "note".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    app.selected = Some("F".into());
+    assert_eq!(
+        app.update(Action::Submit),
+        vec![],
+        "the comment submit on an L4 row"
+    );
+    assert_eq!(toast_text(&app), "Comment is not available for L4 flows");
+    assert_eq!(app.mode, Mode::Flows, "the prompt closed");
+}
+
+/// AC16, the other side: the same verbs on the HTTP row still work, so the
+/// refusal is the row's kind and nothing else.
+#[test]
+fn no_http_verbs_on_l4_http_row_still_replays_and_marks() {
+    let mut app = http_and_l4_app();
+    app.selected = Some("H1".into());
+    assert_eq!(
+        app.update(Action::Replay),
+        vec![BusRequest::Replay("H1".into())]
+    );
+    assert!(app.current_toast().is_none(), "{:?}", toast_text(&app));
+
+    assert_eq!(app.update(Action::Mark), vec![]);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Mark));
+    for c in "red".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    assert_eq!(
+        app.update(Action::Submit),
+        vec![BusRequest::Mark {
+            id: "H1".into(),
+            marks: vec!["red".into()],
+        }]
+    );
+    assert_eq!(app.mode, Mode::Flows);
+
+    assert_eq!(app.update(Action::Comment), vec![]);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::Comment));
+    for c in "note".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    assert_eq!(
+        app.update(Action::Submit),
+        vec![BusRequest::Comment {
+            id: "H1".into(),
+            text: "note".into(),
+        }]
+    );
+
+    assert_eq!(app.update(Action::BuildPoc), vec![]);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::PocName));
+    assert_eq!(app.update(Action::Submit), vec![], "name → param prompt");
+    assert_eq!(
+        app.update(Action::Submit),
+        vec![BusRequest::PocBuild {
+            flow_id: "H1".into(),
+            name: None,
+            param: None,
+        }]
+    );
 }

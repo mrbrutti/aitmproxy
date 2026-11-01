@@ -1712,6 +1712,9 @@ impl App {
                 }
             }
             Action::Replay => {
+                if self.refuse_http_verb_on_l4("Replay") {
+                    return out;
+                }
                 if let Some(r) = self.selected_row().cloned() {
                     if r.kind != FlowKind::Http {
                         self.toast(
@@ -1743,6 +1746,9 @@ impl App {
                 }
             }
             Action::Mark => {
+                if self.refuse_http_verb_on_l4("Mark") {
+                    return out;
+                }
                 if self.selected.is_some() {
                     if self.has_tool("flow.mark") {
                         self.open_prompt(PromptKind::Mark);
@@ -1752,6 +1758,9 @@ impl App {
                 }
             }
             Action::Comment => {
+                if self.refuse_http_verb_on_l4("Comment") {
+                    return out;
+                }
                 if self.selected.is_some() {
                     if self.has_tool("flow.comment") {
                         self.open_prompt(PromptKind::Comment);
@@ -1764,6 +1773,9 @@ impl App {
                 }
             }
             Action::BuildPoc => {
+                if self.refuse_http_verb_on_l4("Build PoC") {
+                    return out;
+                }
                 if let Some(r) = self.selected_row().cloned() {
                     if self.gate(&r) {
                         self.poc_pending = Some((r.id, None));
@@ -2254,6 +2266,19 @@ impl App {
             self.flows.push(row);
         }
         self.l4.flows.insert(f.id.clone(), f);
+    }
+
+    /// The HTTP verbs (replay, mark, comment, PoC) have no L4 meaning (L4
+    /// parity spec AC16): on a selected L4 row, toast
+    /// `<verb> is not available for L4 flows` and report `true` so the caller
+    /// sends nothing. Checked when the verb is pressed and again when its
+    /// prompt is submitted, in case the selection moved in between.
+    fn refuse_http_verb_on_l4(&mut self, verb: &str) -> bool {
+        if self.selected_row().is_some_and(|r| r.kind == FlowKind::L4) {
+            self.toast(Level::Warn, format!("{verb} is not available for L4 flows"));
+            return true;
+        }
+        false
     }
 
     fn gate(&mut self, r: &FlowRow) -> bool {
@@ -2747,15 +2772,19 @@ impl App {
                 }
             },
             Mode::Prompt(PromptKind::Comment) => {
-                if let Some(id) = self.selected.clone() {
-                    out.push(BusRequest::Comment { id, text });
+                if !self.refuse_http_verb_on_l4("Comment") {
+                    if let Some(id) = self.selected.clone() {
+                        out.push(BusRequest::Comment { id, text });
+                    }
                 }
                 self.close_prompt();
             }
             Mode::Prompt(PromptKind::Mark) => {
-                if let Some(id) = self.selected.clone() {
-                    let marks = text.split_whitespace().map(str::to_string).collect();
-                    out.push(BusRequest::Mark { id, marks });
+                if !self.refuse_http_verb_on_l4("Mark") {
+                    if let Some(id) = self.selected.clone() {
+                        let marks = text.split_whitespace().map(str::to_string).collect();
+                        out.push(BusRequest::Mark { id, marks });
+                    }
                 }
                 self.close_prompt();
             }
