@@ -1,21 +1,28 @@
 import AitmproxyKit
 import SwiftUI
 
-/// The first-run sheet (spec 2026-10-31-system-proxy-automation-design §D17.8, order per
+/// The first-run sheet (spec 2026-10-31-system-proxy-automation-design §D13 and §D17.8, order per
 /// Matt's per-host-decryption decision): the ordered steps that make this Mac's traffic show
-/// up. Step 1 trusts the CA through `Session.trustCA()` with no alert of its own — the row
-/// says what it does and macOS shows its own password dialog. Step 2 points at Scope: nothing
-/// is decrypted until a host is in it. The system-proxy row (PR 4) goes above step 1. Every
-/// CA word comes from `CATrustFacts`, the sheet's own from `SetupWords`; the buttons carry
-/// `ConnectionAction` titles.
+/// up. Step 1 sets aitmproxy as the system proxy through `Session.setSystemProxy()` and turns on
+/// "Set system proxy at launch" with it. Step 2 trusts the CA through `Session.trustCA()` with no
+/// alert of its own — the row says what it does and macOS shows its own password dialog. Step 3
+/// points at Scope: nothing is decrypted until a host is in it. Every system-proxy word is the
+/// route's (`TrafficRoute.line`/`.detail`), every CA word comes from `CATrustFacts`, the sheet's
+/// own from `SetupWords`; the buttons carry `ConnectionAction` titles.
 struct SetupSheet: View {
     @Environment(Session.self) private var session
     @Environment(\.dismiss) private var dismiss
+    /// "Don't ask again", mirrored from `Store.defaults` on appear and written on every change.
+    @State private var promptSuppressed = false
 
     /// The Scope step of the Getting-started list: one title, one done state, shared with the Status page.
     private var scopeStep: GettingStartedStep? { session.connectionSummary.steps.first { $0.kind == .scopeSet } }
     private var scopeDone: Bool { scopeStep?.done ?? false }
     private var caDone: Bool { session.caTrust?.step.done ?? false }
+    /// The system-proxy route and its Getting-started step: nil while the system proxy is unknown.
+    private var systemProxyRoute: TrafficRoute? { session.connectionSummary.routes.systemProxy }
+    private var systemProxyStep: GettingStartedStep? { session.connectionSummary.steps.first { $0.kind == .systemProxy } }
+    private var systemProxyDone: Bool { systemProxyRoute?.open == true }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -24,6 +31,8 @@ struct SetupSheet: View {
                 .foregroundStyle(Tok.Ink.primary.color)
                 .padding(.horizontal, Space.lg).padding(.top, Space.xl).padding(.bottom, Space.md)
             VStack(alignment: .leading, spacing: Space.lg) {
+                systemProxyRow
+                Rule(color: Tok.Line.rule)
                 caRow
                 if let scopeStep {
                     Rule(color: Tok.Line.rule)
@@ -33,25 +42,60 @@ struct SetupSheet: View {
             .padding(.horizontal, Space.lg).padding(.bottom, Space.lg)
             Rule()
             HStack {
+                Toggle("Don't ask again", isOn: $promptSuppressed)
+                    .toggleStyle(.checkbox)
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                    .onChange(of: promptSuppressed) { _, on in
+                        Store.defaults.set(on, forKey: SystemProxyPreferences.promptSuppressedKey)
+                    }
                 Spacer()
-                FlatButton(caDone && scopeDone ? "Done" : "Not Now") { dismiss() }
+                FlatButton(systemProxyDone && caDone && scopeDone ? "Done" : "Not Now") { dismiss() }
                     .keyboardShortcut(.cancelAction)
             }
             .padding(.horizontal, Space.md).padding(.vertical, Space.sm)
         }
         .frame(width: 560)
         .background(Tok.Ground.surface.color)
+        .onAppear { promptSuppressed = Store.defaults.bool(forKey: SystemProxyPreferences.promptSuppressedKey) }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(SetupWords.sheetTitle)
     }
 
-    /// Step 1: the fact's word (or the step's, while there is no fact), the needs-an-administrator
+    /// Step 1: the route's line as the title (the step's; `SetupWords.systemProxyRowTitle` while the
+    /// route is unknown, with nothing under it), the route's detail, the primary button while the route
+    /// offers it (hidden once open; the Kit drops it while a change is in flight, when an administrator is
+    /// needed and when the platform has no mechanism), the launch-preference caption, the lane sentence.
+    private var systemProxyRow: some View {
+        let route = systemProxyRoute
+        return SetupRow(number: 1, title: systemProxyStep?.title ?? SetupWords.systemProxyRowTitle, done: systemProxyDone) {
+            if let route, !route.open {
+                Text(route.detail)
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                if route.actions.contains(.setSystemProxy) {
+                    PrimaryButton(ConnectionAction.setSystemProxy.title) {
+                        // Set now and at every launch (§D13, Architect's call): the core restores on quit.
+                        Store.defaults.set(true, forKey: SystemProxyPreferences.autoKey)
+                        Task { await session.setSystemProxy() }
+                    }
+                    .disabled(!session.systemProxyControlLive)
+                    Text(SetupWords.systemProxyAutoCaption)
+                        .font(Tok.Face.ui(Tok.Typography.Size.xs))
+                        .foregroundStyle(Tok.Ink.tertiary.color)
+                }
+                Hint(text: ConnectionSummary.systemProxyLaneSentence)
+            }
+        }
+    }
+
+    /// Step 2: the fact's word (or the step's, while there is no fact), the needs-an-administrator
     /// remedy when that is the fact, the primary button (hidden once trusted, absent while the
     /// core has no certificate yet), the QUIC caveat.
     private var caRow: some View {
         let facts = session.caTrust
         let generated = session.caStatus?.exists != false
-        return SetupRow(number: 1, title: ConnectionAction.trustCA.title, done: caDone) {
+        return SetupRow(number: 2, title: ConnectionAction.trustCA.title, done: caDone) {
             Group {
                 if let facts {
                     LaneDot(state: facts.state, word: facts.text, title: CATrustFacts.laneTitle)
@@ -72,9 +116,9 @@ struct SetupSheet: View {
         }
     }
 
-    /// Step 2: Scope, the Getting-started step's own title and state, the same page Proxy ▸ Scope… opens.
+    /// Step 3: Scope, the Getting-started step's own title and state, the same page Proxy ▸ Scope… opens.
     private func scopeRow(_ step: GettingStartedStep) -> some View {
-        SetupRow(number: 2, title: step.title, done: step.done) {
+        SetupRow(number: 3, title: step.title, done: step.done) {
             if !step.done {
                 Text(SetupWords.scopeCaption)
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))

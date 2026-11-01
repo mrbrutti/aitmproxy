@@ -83,7 +83,7 @@ struct StatusPanel: View {
         let busy = session.coreHealth.captureBusy
         return layout {
             ForEach(summary.lanes, id: \.kind) { lane in
-                LaneCard(lane: lane, captureBusy: busy, run: run)
+                LaneCard(lane: lane, captureBusy: busy, live: isLive, run: run)
                     .frame(width: cardWidth, alignment: .leading)
                     .gridProbe("status.\(lane.kind.rawValue)", area: "status", edge: nil)
             }
@@ -106,7 +106,7 @@ struct StatusPanel: View {
             } else {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(steps, id: \.kind) { step in
-                        StepRow(step: step, run: run)
+                        StepRow(step: step, live: isLive, run: run)
                         if step.kind != steps.last?.kind {
                             Rule(color: Tok.Line.rule)
                         }
@@ -193,8 +193,23 @@ struct StatusPanel: View {
         case .trustCA:
             // Operator-only, like the capture switch: the one call path (Session+CATrust.swift).
             Task { await session.trustCA() }
+        case .setSystemProxy:
+            // Operator-only, like trusting the CA: the one call path (Session+SystemProxy.swift).
+            Task { await session.setSystemProxy() }
+        case .unsetSystemProxy:
+            Task { await session.restoreSystemProxy() }
         case .showCoreLog, .reconnectBus, .openScope, .addScopeHost, .openBrowser, .copyListenAddress, .approveInSystemSettings, .openCAPanel:
             break // handled by Session.perform(connection:) above
+        }
+    }
+
+    /// Whether a card or step button may be pressed now. The system-proxy pair is a bus call the
+    /// operator makes: it stands down while the bus is not the operator's or a change is in flight
+    /// (`Session.setSystemProxy()` refuses it then), as the sheet's row and the Flows banner do.
+    private func isLive(_ action: ConnectionAction) -> Bool {
+        switch action {
+        case .setSystemProxy, .unsetSystemProxy: session.systemProxyControlLive
+        default: true
         }
     }
 }
@@ -206,6 +221,8 @@ struct StatusPanel: View {
 private struct LaneCard: View {
     var lane: ConnectionLane
     var captureBusy: Bool
+    /// Per-action gate from the page (the operator-only bus calls); the capture gate is this card's own.
+    var live: (ConnectionAction) -> Bool
     var run: (ConnectionAction) -> Void
 
     /// Actions that live in the trailing menu rather than inline (never the primary one).
@@ -254,17 +271,17 @@ private struct LaneCard: View {
         HStack(spacing: Space.xs) {
             if let primary {
                 FlatButton(primary.title) { run(primary) }
-                    .disabled(captureBusy && Self.isCaptureAction(primary))
+                    .disabled(captureBusy && Self.isCaptureAction(primary) || !live(primary))
             }
             ForEach(inline, id: \.self) { action in
                 FlatButton(action.title) { run(action) }
-                    .disabled(captureBusy && Self.isCaptureAction(action))
+                    .disabled(captureBusy && Self.isCaptureAction(action) || !live(action))
             }
             if !menu.isEmpty {
                 Menu {
                     ForEach(menu, id: \.self) { action in
                         Button(action.title, role: action.isDestructive ? .destructive : nil) { run(action) }
-                            .disabled(captureBusy && Self.isCaptureAction(action))
+                            .disabled(captureBusy && Self.isCaptureAction(action) || !live(action))
                     }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -285,9 +302,11 @@ private struct LaneCard: View {
 
 // MARK: - Getting-started row
 
-/// `✓` (done: success + secondary word) or `○` (to do: primary word + its one action).
+/// `✓` (done: success + secondary word) or `○` (to do: primary word + its one action, which stands
+/// down while the page's `live` gate says its bus call cannot be made now).
 private struct StepRow: View {
     var step: GettingStartedStep
+    var live: (ConnectionAction) -> Bool
     var run: (ConnectionAction) -> Void
 
     var body: some View {
@@ -305,6 +324,7 @@ private struct StepRow: View {
             Spacer(minLength: Space.sm)
             if !step.done, let action = step.action {
                 FlatButton(action.title) { run(action) }
+                    .disabled(!live(action))
             }
         }
         .frame(height: Tok.Size.Row.default)
