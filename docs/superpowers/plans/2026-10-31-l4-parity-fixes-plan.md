@@ -368,6 +368,16 @@ Spec §7(b) file list. `tests/l4_parity.rs` builds the app with `App::new(TermCa
 - **Live check:** on `local/l4par-tui-with-core` (with (a) and (a')) exits 0, output quoted; on this branch with (a) only, the AC13 add block takes the refused path and the rest pass. Verdicts quoted for AC10/AC12 [Linux] and AC14/AC15/AC16 [D0] halves.
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
+### Task B10: the inject key is refused locally while capture/inject is unavailable
+
+- **Satisfies:** AC33 (TUI half: "no `L4 unavailable` result for `aitm-tui` after any enabled control"); found by B9's live run (the craft pane's `s` sent `l4.inject` and got `L4 unavailable: …` back on an unprivileged host)
+- **Depends on:** B9
+- **Files:** `crates/aitm-tui/src/app.rs`, `src/ui/l4.rs` (craft header hint only), `tests/l4_parity.rs`
+- **Change:** `App::l4_inject` (the `s` key and the confirm it opens) checks `self.l4.capture` availability first (the status contract's `needs_privilege` covers capture *and* inject, spec §1): when unavailable it emits nothing and toasts `inject unavailable: <reason>`; the craft header shows `s inject (unavailable)` instead of `s inject (guarded)`. Available → unchanged.
+- **Test first** (`--test l4_parity inject_gate`): with capture availability `needs_privilege` + reason `R`, `s` on an L4 row emits `vec![]` and the toast is `inject unavailable: R`; with availability available, `s` emits the `l4.inject` call as before; the rendered craft header contains the matching hint.
+- **Live check:** the B9 cell gains one check: `s` in the craft pane on this rig puts no `l4.inject` on the ring and the toast carries the core's reason (run on the rig; output quoted).
+- **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
+
 ---
 
 ## Unit (c) web — `fix/l4-parity-web`
