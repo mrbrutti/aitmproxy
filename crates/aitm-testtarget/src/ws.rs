@@ -28,7 +28,7 @@ use hyper_util::rt::TokioIo;
 use sha1::{Digest as _, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::app::{html, AppState, RequestInfo, Resp};
+use crate::app::{html, html_escape, AppState, RequestInfo, Resp};
 use crate::log::{
     sha256_hex, ConnInfo, Dir, WsCloseEntry, WsFrameEntry, WsHandshakeEntry, WsLogEntry, WsOpcode,
 };
@@ -276,23 +276,6 @@ pub(crate) fn subprotocol_reply(mode: SeedMode, requested: Option<&str>) -> Opti
             .filter(|t| !t.is_empty())
             .map(str::to_string),
     }
-}
-
-/// Private copy of `app.rs::html_escape` (A4 owns only this file): escapes
-/// `& < > " '` as `&amp; &lt; &gt; &quot; &#x27;`.
-fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#x27;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// Initial receive buffer; it grows as a frame needs, up to [`MAX_BUFFER`].
