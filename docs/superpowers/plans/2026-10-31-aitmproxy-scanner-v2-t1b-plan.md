@@ -1619,8 +1619,8 @@ Kept by the main session during stage 6. One row per finding.
 | 13 | Coder (host_probe fix) | Important | `script.reload` (`commands.rs` `Reload::invoke`) only swaps the AST; it never re-runs `load`, so a reload does not swap the script's checks (contrary to the B9 doc comments) | fixed in f26d74ed: `LoadedScript::rerun_load`; `tests/script_reload_checks.rs`; `script.save`'s overwrite branch gets the same call (follow-up in flight) |
 | 13 | Coder (host_probe fix) | Note | Pre-existing `tests/engine.rs` wall-clock flake | fixed in c52dd6ca: deterministic budget test, green 5x under load |
 | T10-3 | T10 live run (external) | Important | Pre-existing: WS flows exposed no `request` to scripts, so `ws-cleartext-transport` and `ws-cross-site-hijack-indicator` never fired on live traffic | fixed in d2dda88a: handshake resolved from the store and projected as the script-visible request; `tests/ws_flow_view.rs` pins both scripts on real handshakes |
-| 14 | Coder (Task 15) | Important | `jobs::agent_gate` refuses an agent's `scan.map` under `auto`, contrary to AC T1-4 | fix dispatched 2026-11-01: `force_map` skips the policy check; Task 15's test flipped to `agent_under_auto_is_refused_agent_map_is_not` |
-| 14 | Coder (Task 15) | Important | `trust_gate_scan` fails: `Caller::is_agent` deny-lists `Frontend::Mcp` instead of allow-listing trusted control | fix dispatched 2026-11-01: derive from the allow-list |
+| 14 | Coder (Task 15) | Important | `jobs::agent_gate` refuses an agent's `scan.map` under `auto`, contrary to AC T1-4 | fixed in 03158a6b |
+| 14 | Coder (Task 15) | Important | `trust_gate_scan` fails: `Caller::is_agent` deny-lists `Frontend::Mcp` instead of allow-listing trusted control | fixed in 03158a6b (`load_history` too) |
 
 ## Shipped
 
