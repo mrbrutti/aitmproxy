@@ -1435,6 +1435,40 @@ mod tests {
             mutations,
             "m0 > m1 > m2 > m3 > m4 > m5 > m6 > m7 > m8 > m9 > m10 > m11 > m12 > m13 > m14 > m15 ... 984 more"
         );
+
+        // Fix round H, H21 (G2): the same issue with 100 probe flows folded
+        // through the state pins the one layout arithmetic with both the L4
+        // lines above the flows and the `... n more` row below them: the
+        // total is `detail_len`, 64 flows are kept and 36 counted, and the
+        // first row past the flows and the overflow row is `After(0)`.
+        let probe = fixture_issue().evidence.probe_flows[0];
+        issue.evidence.probe_flows = vec![probe; 100];
+        let mut state = IssuesState::default();
+        state.list = vec![issue.summary()];
+        state.rows = vec![issue_row(&state.list[0])];
+        state.fold_issue(issue);
+        let read = state.detail().unwrap_or_else(|| panic!("read"));
+        assert_eq!(read.evidence.probe_flows.len(), FLOWS_MAX);
+        assert_eq!(read.dropped.flows, 36);
+        let lines = issue_detail_lines(read);
+        assert!(
+            lines.before_flows.iter().any(|(l, _)| *l == "l4 case"),
+            "the L4 lines sit above the flows: {:?}",
+            lines.before_flows
+        );
+        let layout = DetailLayout::of(read);
+        assert_eq!(layout.total, state.detail_len());
+        assert_eq!(layout.flows_label, 1 + lines.before_flows.len());
+        assert_eq!(layout.flows, FLOWS_MAX);
+        assert!(layout.more);
+        assert_eq!(layout.first_after, layout.first_flow + FLOWS_MAX + 1);
+        assert_eq!(
+            layout.row(layout.first_flow + FLOWS_MAX - 1),
+            DetailRow::Flow(FLOWS_MAX - 1)
+        );
+        assert_eq!(layout.row(layout.first_after - 1), DetailRow::More);
+        assert_eq!(layout.row(layout.first_after), DetailRow::After(0));
+        assert_eq!(layout.total, layout.first_after + lines.after_flows.len());
     }
 
     /// Fix round G, G12: the timing series are cut to `TIMING_ROWS_MAX + 1`
