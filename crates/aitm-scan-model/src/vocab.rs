@@ -336,9 +336,12 @@ pub enum PayloadMode {
     Suffix,
 }
 
-/// The eleven error codes a `scan.*` verb can fail with (spec D3).
+/// The nine error codes a `scan.*` verb can fail with (spec D3).
 ///
 /// `h2_not_negotiated` is a sender error, not a verb error code, and is not here.
+/// Clamping and cancellation are not errors either: clamping is the `clamped`
+/// list in the `scan.start` result and cancellation is `JobStatus.state:
+/// cancelled`, so neither has a code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScanErrorCode {
@@ -360,10 +363,6 @@ pub enum ScanErrorCode {
     UnknownCheck,
     /// The verb needs an operator confirmation it did not get.
     ConfirmRequired,
-    /// The job was cancelled.
-    Cancelled,
-    /// A requested value exceeded a configured ceiling.
-    Clamped,
 }
 
 impl ScanErrorCode {
@@ -379,8 +378,6 @@ impl ScanErrorCode {
             ScanErrorCode::InvalidProfile => "invalid_profile",
             ScanErrorCode::UnknownCheck => "unknown_check",
             ScanErrorCode::ConfirmRequired => "confirm_required",
-            ScanErrorCode::Cancelled => "cancelled",
-            ScanErrorCode::Clamped => "clamped",
         }
     }
 
@@ -415,8 +412,6 @@ impl FromStr for ScanErrorCode {
             "invalid_profile" => Ok(ScanErrorCode::InvalidProfile),
             "unknown_check" => Ok(ScanErrorCode::UnknownCheck),
             "confirm_required" => Ok(ScanErrorCode::ConfirmRequired),
-            "cancelled" => Ok(ScanErrorCode::Cancelled),
-            "clamped" => Ok(ScanErrorCode::Clamped),
             other => Err(anyhow::anyhow!("unknown scan error code: {other}")),
         }
     }
@@ -523,8 +518,6 @@ mod tests {
             ScanErrorCode::InvalidProfile,
             ScanErrorCode::UnknownCheck,
             ScanErrorCode::ConfirmRequired,
-            ScanErrorCode::Cancelled,
-            ScanErrorCode::Clamped,
         ];
         let mut seen = std::collections::BTreeSet::new();
         for code in codes {
@@ -542,14 +535,15 @@ mod tests {
                 Some((code, "why"))
             );
         }
-        assert_eq!(seen.len(), 11);
+        assert_eq!(seen.len(), 9, "spec D3 names exactly nine codes");
     }
 
     /// Tester: `parse_message` is fed raw `anyhow` text from anywhere, so every
     /// malformed shape must fall back to `None` rather than mis-parse. The empty
     /// string, a bare prefix, an unknown code, a missing message separator and a
-    /// code buried mid-string are all refused; a message containing `": "` keeps
-    /// its whole tail.
+    /// code buried mid-string are all refused, as are `cancelled` and `clamped`,
+    /// which spec D3 says are outcomes, not error codes; a message containing
+    /// `": "` keeps its whole tail.
     #[test]
     fn parse_message_refuses_malformed_input() {
         for junk in [
@@ -560,6 +554,8 @@ mod tests {
             "scan: busy",
             "scan: busy:",
             "scan: nonsense: why",
+            "scan: cancelled: why",
+            "scan: clamped: why",
             "scan:busy: why",
             "SCAN: busy: why",
             "prefixed scan: busy: why",
@@ -600,5 +596,25 @@ mod tests {
             Some((ScanErrorCode::LaneUnavailable, "ws not built"))
         );
         assert_eq!(ScanErrorCode::parse_message("boom"), None);
+    }
+
+    /// Spec D3: "clamping is not an error ... and cancellation is not an error",
+    /// so neither token is an error code on any of the three paths.
+    #[test]
+    fn cancelled_and_clamped_are_not_error_codes() {
+        for token in ["cancelled", "clamped"] {
+            assert!(
+                token.parse::<ScanErrorCode>().is_err(),
+                "{token} must not parse as an error code"
+            );
+            assert!(
+                serde_json::from_str::<ScanErrorCode>(&format!("\"{token}\"")).is_err(),
+                "{token} must not deserialize as an error code"
+            );
+            assert_eq!(
+                ScanErrorCode::parse_message(&format!("scan: {token}: why")),
+                None
+            );
+        }
     }
 }
