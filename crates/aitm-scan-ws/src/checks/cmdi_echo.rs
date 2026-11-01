@@ -308,8 +308,7 @@ mod tests {
     impl WsTransport for DeadTransport {
         fn connect<'a>(
             &'a self,
-            _host: &'a str,
-            _port: u16,
+            _addr: std::net::SocketAddr,
             _tls: bool,
             _sni: &'a str,
         ) -> BoxFuture<'a, anyhow::Result<ByteStream>> {

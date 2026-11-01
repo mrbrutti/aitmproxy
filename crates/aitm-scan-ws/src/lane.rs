@@ -205,15 +205,26 @@ impl Lane for WsLane {
 /// The WebSocket lane, registered by `crates/aitm/src/wire.rs` through
 /// [`crate::lane`].
 ///
-/// **Security review, named item (plan call 3).** The production dialer accepts
-/// *any* upstream certificate ([`TlsPolicy::AcceptAny`]). The scanner only ever
-/// dials an authority the operator put in scope, and the lab targets this tool
-/// exists for routinely present self-signed certificates, so verifying would
-/// turn every such target into a connect error rather than a finding. It is the
-/// same posture `aitm-proto-http`'s `Http1Sender` takes for upstream probes.
+/// **Security review, named item (plan call 3; finding S2).** The production
+/// dialer **verifies** upstream certificates against the webpki roots
+/// ([`TlsPolicy::Verify`]), the same default `aitm-proto-http`'s `Http1Sender`
+/// has (`Config.ssl_insecure = false`). A lab of self-signed targets is served
+/// by [`build_with`]`(TlsPolicy::AcceptAny)`, which is what the operator's
+/// `ssl_insecure` setting should select; wiring that setting through
+/// `wire.rs` is a coordinator hand-off. Every dial still passes the scope guard
+/// and the SSRF check before a socket is opened, under either policy.
 #[must_use]
 pub fn build() -> Option<Arc<dyn Lane>> {
-    let transport = Arc::new(TcpTransport::new(TlsPolicy::AcceptAny, DIAL_TIMEOUT));
+    build_with(TlsPolicy::Verify)
+}
+
+/// The WebSocket lane with an explicit certificate policy.
+///
+/// `TlsPolicy::AcceptAny` skips chain validation (the handshake signature is
+/// still verified) and is for `Config.ssl_insecure`; see [`build`].
+#[must_use]
+pub fn build_with(tls: TlsPolicy) -> Option<Arc<dyn Lane>> {
+    let transport = Arc::new(TcpTransport::new(tls, DIAL_TIMEOUT));
     Some(Arc::new(WsLane::new(Arc::new(WsDialer::new(transport)))))
 }
 

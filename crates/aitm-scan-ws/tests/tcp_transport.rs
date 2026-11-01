@@ -7,6 +7,7 @@
 //! cargo test -p aitm-scan-ws --test tcp_transport -- --ignored
 //! ```
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,7 +43,7 @@ fn self_signed_server() -> Arc<rustls::ServerConfig> {
 #[ignore = "binds a loopback port; run in the Terminal"]
 async fn tcp_plain_connect_loopback() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
     let serving = tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.expect("accept");
         let mut byte = [0u8; 1];
@@ -53,7 +54,7 @@ async fn tcp_plain_connect_loopback() {
 
     let transport = TcpTransport::new(TlsPolicy::AcceptAny, Duration::from_secs(2));
     let mut stream = transport
-        .connect("127.0.0.1", port, false, "127.0.0.1")
+        .connect(addr, false, "127.0.0.1")
         .await
         .expect("plain connect");
     stream.write_all(b"x").await.expect("client write");
@@ -69,7 +70,7 @@ async fn tcp_plain_connect_loopback() {
 #[ignore = "binds a loopback port; run in the Terminal"]
 async fn tcp_tls_accept_any_loopback() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let port = listener.local_addr().expect("local addr").port();
+    let addr: SocketAddr = listener.local_addr().expect("local addr");
     let acceptor = TlsAcceptor::from(self_signed_server());
     let serving = tokio::spawn(async move {
         // Two connections: the accept-any client, then the verifying one.
@@ -87,7 +88,7 @@ async fn tcp_tls_accept_any_loopback() {
 
     let accept_any = TcpTransport::new(TlsPolicy::AcceptAny, Duration::from_secs(5));
     let mut stream = accept_any
-        .connect("127.0.0.1", port, true, "127.0.0.1")
+        .connect(addr, true, "127.0.0.1")
         .await
         .expect("accept-any TLS connect");
     let mut got = [0u8; 6];
@@ -95,10 +96,7 @@ async fn tcp_tls_accept_any_loopback() {
     assert_eq!(&got, b"tls-ok");
 
     let verifying = TcpTransport::new(TlsPolicy::Verify, Duration::from_secs(5));
-    let text = match verifying
-        .connect("127.0.0.1", port, true, "127.0.0.1")
-        .await
-    {
+    let text = match verifying.connect(addr, true, "127.0.0.1").await {
         Ok(_) => panic!("verify must reject a self-signed certificate"),
         Err(err) => format!("{err:#}"),
     };

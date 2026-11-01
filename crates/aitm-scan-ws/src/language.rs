@@ -122,33 +122,50 @@ impl WsLanguage {
     /// `OutOfScope`. Nothing is dialled and no thread is started.
     #[must_use]
     pub fn for_catalog() -> Self {
-        Self::new(Arc::new(StdGuard::default()), Arc::new(production_dialer()))
+        Self::new(
+            Arc::new(StdGuard::default()),
+            Arc::new(production_dialer(TlsPolicy::Verify)),
+        )
     }
 }
 
-/// The production dialer: a real TCP/TLS socket, accepting any certificate.
+/// The production dialer: a real TCP/TLS socket under `tls`.
 ///
-/// [`TlsPolicy::AcceptAny`] is deliberate and is a named security-review item
-/// (plan call 3): the scanner only ever reaches an authority the operator put
-/// in scope, and lab targets routinely present self-signed certificates — the
-/// same posture `Http1Sender` takes.
-fn production_dialer() -> WsDialer {
-    WsDialer::new(Arc::new(TcpTransport::new(
-        TlsPolicy::AcceptAny,
-        CONNECT_TIMEOUT,
-    )))
+/// **Security review, named item (plan call 3; finding S2).** [`build`] passes
+/// [`TlsPolicy::Verify`]: upstream certificates are checked against the webpki
+/// roots, the same default `aitm-proto-http`'s `Http1Sender` has
+/// (`Config.ssl_insecure = false`). [`TlsPolicy::AcceptAny`] skips chain
+/// validation (the handshake signature is still verified) and is for the
+/// operator's `ssl_insecure` setting through [`build_with`]. Either way every
+/// dial passes the scope guard and the SSRF check before a socket is opened.
+fn production_dialer(tls: TlsPolicy) -> WsDialer {
+    WsDialer::new(Arc::new(TcpTransport::new(tls, CONNECT_TIMEOUT)))
 }
 
 /// The `ws.*` protocol language, or `None` while the namespace is unimplemented.
 ///
 /// `crate::language()` delegates here, so flipping the slot is an edit inside
 /// this module and `lib.rs` is written once (plan call 11). Every `ws.*` host
-/// fn is `Guarded` through `guard`.
+/// fn is `Guarded` through `guard`, and the dialer verifies upstream
+/// certificates ([`TlsPolicy::Verify`]); see [`build_with`] for the
+/// `ssl_insecure` posture.
 #[must_use]
 pub fn build(guard: Arc<dyn ScopeRateGuard>) -> Option<Box<dyn ProtocolLanguage>> {
+    build_with(guard, TlsPolicy::Verify)
+}
+
+/// The `ws.*` protocol language with an explicit certificate policy.
+///
+/// `TlsPolicy::AcceptAny` is for `Config.ssl_insecure`; wiring that setting
+/// through `main.rs` is a coordinator hand-off.
+#[must_use]
+pub fn build_with(
+    guard: Arc<dyn ScopeRateGuard>,
+    tls: TlsPolicy,
+) -> Option<Box<dyn ProtocolLanguage>> {
     Some(Box::new(WsLanguage::new(
         guard,
-        Arc::new(production_dialer()),
+        Arc::new(production_dialer(tls)),
     )))
 }
 
@@ -712,7 +729,7 @@ impl DriverState {
                 frame,
                 reply,
             } => {
-                let answer = self.send(handle, &frame).await;
+                let answer = self.send(handle, frame).await;
                 let _ = reply.send(answer);
             }
             DriverCmd::Recv {
@@ -776,7 +793,7 @@ impl DriverState {
     }
 
     /// Send one frame on `handle`.
-    async fn send(&mut self, handle: i64, frame: &Frame) -> Result<(), HostError> {
+    async fn send(&mut self, handle: i64, frame: Frame) -> Result<(), HostError> {
         let open = self
             .handles
             .get_mut(&handle)
@@ -1056,7 +1073,11 @@ mod tests {
         assert_eq!(handle, 1);
         assert_eq!(
             transport.connects(),
-            vec![("127.0.0.1".to_string(), 8443, true, "127.0.0.1".to_string())]
+            vec![(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 8443)),
+                true,
+                "127.0.0.1".to_string()
+            )]
         );
     }
     // --- Refusals the `ws.*` surface owes an operator (tester, stage 5) ---

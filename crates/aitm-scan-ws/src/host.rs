@@ -108,6 +108,7 @@ fn pad_limits(target: usize) -> DialLimits {
         max_frame_bytes: target
             .saturating_mul(2)
             .max(target.saturating_add(PAD_READ_HEADROOM)),
+        ..DialLimits::default()
     }
 }
 
@@ -261,6 +262,7 @@ impl WsProbeHost {
     fn dial_limits(&self) -> DialLimits {
         DialLimits {
             max_frame_bytes: self.job.profile().ws.max_frame_bytes as usize,
+            ..DialLimits::default()
         }
     }
 
@@ -381,25 +383,30 @@ impl WsProbeHost {
             if !self.job.charge(1) {
                 bail!("the job budget is exhausted");
             }
-            if conn.send(&prerequisite).await.is_err() {
+            if conn.send(prerequisite).await.is_err() {
                 over = true;
                 break;
             }
             let drained = drain_reply(&mut conn, window, deadline, cancelled).await;
             if drained.ended != CollectEnd::Window {
-                // The conversation ended while catching up on the prerequisites;
-                // what arrived is the observation, and nothing more can be sent.
+                // The conversation ended while catching up on the prerequisites
+                // (a Close, a drop, the deadline, a cancel, or the collection
+                // ceiling — `Limit` is data like `Transport`); what arrived is
+                // the observation, and nothing more can be sent.
                 frames.extend(drained.frames);
                 over = true;
                 break;
             }
         }
         if !over {
-            let sent = match &frame {
+            let sent = match frame {
                 Some(frame) => {
                     if !self.job.charge(1) {
                         bail!("the job budget is exhausted");
                     }
+                    // A payload above the dial's frame cap is refused here
+                    // without reaching the wire (tester finding F2); like any
+                    // failed send, the conversation ends as data.
                     conn.send(frame).await.is_ok()
                 }
                 None => true,
@@ -412,7 +419,7 @@ impl WsProbeHost {
 
         let elapsed_ms = millis_since(started);
         let status = conn.status();
-        let headers = conn.response_headers();
+        let headers = conn.response_headers().to_vec();
         let body = text_body(&frames);
         let (handshake, conversation) =
             conn.into_flows(vec![format!("scan:{}", self.job.job_id())]);
@@ -631,11 +638,10 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{pad_payload, WsProbeHost, PAD_SENTINEL};
-    use crate::dialer::WsDialer;
-    use crate::discover::{discover_flow, IdGen};
+    use crate::dialer::{WsDialer, DEFAULT_MAX_COLLECT_FRAMES};
     use crate::testing::{
-        captured_conversation, echo_handler, ws_server, DuplexTransport, HandshakeDecision,
-        ServerConn, ServerLog, TestJob,
+        captured_conversation, echo_handler, handshake_header, host_for, ws_server,
+        DuplexTransport, HandshakeDecision, ServerConn, TestJob,
     };
     use crate::transport::WsTransport;
 
@@ -645,27 +651,6 @@ mod tests {
     /// The fixture's second client frame, the one the `msg` point lives in.
     const CHOSEN: &[u8] = br#"{"msg":"hi","user":"bob"}"#;
 
-    /// A host over the fixture conversation's point named `name`.
-    fn host_for(name: &str, job: &Arc<TestJob>, transport: Arc<DuplexTransport>) -> WsProbeHost {
-        let (handshake, ws) = captured_conversation();
-        let mut ids = IdGen::new("job-1");
-        let found = discover_flow(&ws, &handshake, &mut ids);
-        let at = found
-            .points
-            .iter()
-            .position(|point| point.name == name)
-            .unwrap_or_else(|| panic!("the fixture has a point named {name}"));
-        WsProbeHost::new(
-            found.points[at].clone(),
-            found.specs[at].1.clone(),
-            handshake,
-            ws,
-            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-        )
-        .expect("the fixture point builds a host")
-    }
-
     /// A text payload in `mode`.
     fn text(value: &str, mode: PayloadMode) -> Payload {
         Payload {
@@ -673,19 +658,6 @@ mod tests {
             mode,
             bytes: None,
         }
-    }
-
-    /// The value of one (lowercase) header of the server's `nth` handshake.
-    fn handshake_header(log: &ServerLog, nth: usize, name: &str) -> Option<String> {
-        log.handshakes()
-            .get(nth)
-            .and_then(|headers| {
-                headers
-                    .iter()
-                    .find(|(header, _)| header == name)
-                    .map(|(_, value)| value.clone())
-            })
-            .clone()
     }
 
     /// The frame kinds of a response, in order.
@@ -1318,14 +1290,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_profile_frame_cap_bounds_reads_not_writes() {
-        // Observed, and pinned so a change is noticed: `DialLimits` becomes
-        // tungstenite's `max_frame_size`/`max_message_size`, and tungstenite
-        // 0.28 applies those to *incoming* frames only. A probe payload
-        // therefore goes out at whatever length the check asked for, while the
-        // server's answer above the cap ends the collection as a transport end
-        // (plan call 18) rather than being delivered. The only thing that
-        // bounds an outgoing frame today is the oversize check's pad target.
+    async fn the_profile_frame_cap_bounds_writes_too() {
+        // Tester finding F2: `DialLimits.max_frame_bytes` becomes tungstenite's
+        // read limit *and* the dialer's own write limit. A probe payload above
+        // the profile cap is refused before it reaches the wire; the
+        // conversation ends there as data (status 101, no reply), the way any
+        // failed send does, rather than as an error.
         let (transport, log) = ws_server(None, echo_handler);
         let job = TestJob::with(100, |profile| {
             profile.ws.max_frame_bytes = 64;
@@ -1348,29 +1318,105 @@ mod tests {
         let response = host
             .probe(&text(&"B".repeat(4096), PayloadMode::Replace))
             .await
-            .expect("a frame the read limit refuses is data, not an error");
+            .expect("a frame the write limit refuses is data, not an error");
 
         assert_eq!(
             log.received().iter().map(Vec::len).collect::<Vec<_>>(),
-            vec![4096],
-            "the write is not bounded by the profile cap"
+            Vec::<usize>::new(),
+            "the 4096-byte frame never reaches the wire at a 64-byte cap"
         );
         assert_eq!(response.status, Some(101));
-        assert_eq!(
-            response.body,
-            Vec::<u8>::new(),
-            "the 4101-byte echo is above the 64-byte read limit and is dropped"
-        );
+        assert_eq!(response.body, Vec::<u8>::new());
         assert_eq!(
             response.ws_frames.as_ref().map(|frames| frames
                 .iter()
                 .filter(|frame| frame.kind == FrameKind::Text)
                 .count()),
             Some(0),
-            "no text frame survives the read limit: {:?}",
+            "no text frame was exchanged: {:?}",
             response.ws_frames
         );
         assert_eq!(job.charged(), 2, "the dial and the frame");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_flood_of_replies_is_bounded_as_data() {
+        // Security finding S5 at the host: a server answering one frame with
+        // a thousand frames yields an `Ok` probe response, status 101, whose
+        // frames are bounded by the dial's collection ceiling — once for the
+        // reply window and once for the close window (`WsConn::close` waits
+        // for the peer's Close through the same bounded collection), so 512
+        // of the thousand, and never the Close that was queued behind them.
+        // The recorded replay conversation is capped at the ceiling itself.
+        let (transport, _log) = ws_server(None, |conn: ServerConn| async move {
+            let mut ws = conn.ws().await;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(_) => {
+                        for _ in 0..1000 {
+                            if ws.send(Message::text("r")).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+        let job = TestJob::with(100, |profile| {
+            profile.ws.reply_window_ms = 5_000;
+        });
+        let host = host_for("msg", &job, transport);
+
+        let response = host
+            .probe(&text("X", PayloadMode::Replace))
+            .await
+            .expect("a flooded reply is data");
+
+        assert_eq!(response.status, Some(101));
+        let frames = response
+            .ws_frames
+            .as_ref()
+            .expect("the ws lane always sets ws_frames");
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.kind == FrameKind::Text)
+                .count(),
+            2 * DEFAULT_MAX_COLLECT_FRAMES,
+            "one ceiling for the reply window, one for the close window"
+        );
+        assert_eq!(frames.len(), 2 * DEFAULT_MAX_COLLECT_FRAMES);
+        let recorded = host
+            .held_flows()
+            .into_iter()
+            .find_map(|flow| match flow {
+                Flow::WebSocket(ws) => Some(ws),
+                Flow::Http(_) => None,
+            })
+            .expect("the probe conversation is held");
+        assert_eq!(
+            recorded.messages.len(),
+            DEFAULT_MAX_COLLECT_FRAMES,
+            "the replay flow stops recording at the ceiling"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_job_does_not_dial() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+        job.expire();
+        let host = host_for("msg", &job, Arc::clone(&transport));
+
+        let err = host
+            .probe(&text("X", PayloadMode::Replace))
+            .await
+            .expect_err("a job past its deadline sends nothing");
+
+        assert!(err.to_string().contains("deadline"), "{err}");
+        assert!(transport.connects().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]

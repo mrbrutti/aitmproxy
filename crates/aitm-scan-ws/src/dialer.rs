@@ -5,11 +5,15 @@
 //! hosts share four connections however many of them there are. Every dial is
 //! gated by [`ScopeRateGuard::check_active`] on the handshake authority
 //! *before* a socket is opened, and the resulting `ActionPermit` is held for
-//! the connection's life (spec D8.3, plan call 2).
+//! the connection's life (spec D8.3, plan call 2). The authority is then
+//! resolved here and every candidate address passes [`aitm_core::ssrf_check`]
+//! before the transport is handed the one it connects to (security finding
+//! S3), so a scoped hostname that resolves to a private address is refused the
+//! way every other upstream connect in the product refuses it.
 //!
 //! Nothing here logs a header value or a frame payload: `tracing` lines carry
 //! an authority, a frame kind and a byte length, and [`DialError`] carries the
-//! transport's own text, never a header.
+//! transport's own text, never a header, a path or a query.
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -18,8 +22,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::guard::ActionPermit;
 use aitm_core::{
-    Body, ByteStream, ConnInfo, FlowId, FlowMeta, GuardError, HeaderMap, HttpFlow, HttpRequest,
-    HttpResponse, HttpVersion, InterceptState, ScopeRateGuard, WsDir, WsFlow, WsMessage, WsOpcode,
+    ssrf_check, Body, ByteStream, ConnInfo, FlowId, FlowMeta, GuardError, HeaderMap, HttpFlow,
+    HttpRequest, HttpResponse, HttpVersion, InterceptState, ScopeRateGuard, SsrfPolicy, WsDir,
+    WsFlow, WsMessage, WsOpcode,
 };
 use aitm_scan_model::{Frame, FrameKind, WsOptions};
 use anyhow::{anyhow, bail, Context};
@@ -34,7 +39,7 @@ use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
 use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::WebSocketStream;
 
 use crate::transport::WsTransport;
@@ -113,7 +118,8 @@ fn header_value(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
 ///
 /// When the captured authority and path do not form a URL, when a captured
 /// header cannot be put on the wire, or when an override names a regenerated
-/// header.
+/// header. The error names the scheme, the authority and a header *name*; it
+/// never carries the path, the query or a header value (security finding S1).
 pub fn build_request(
     handshake: &HttpFlow,
     overrides: &HandshakeOverrides,
@@ -126,10 +132,19 @@ pub fn build_request(
         &captured.path
     };
     let url = format!("{scheme}://{}{path}", captured.authority);
+    // The parser's own message is replaced: `http`'s and tungstenite's texts
+    // are generic today, but the captured path and query must never be able to
+    // reach an error through them.
     let mut request = url
         .as_str()
         .into_client_request()
-        .with_context(|| format!("building an upgrade request for {url}"))?;
+        .map_err(|_| anyhow!("the captured authority and path do not form a websocket url"))
+        .with_context(|| {
+            format!(
+                "building an upgrade request for {scheme}://{}",
+                captured.authority
+            )
+        })?;
 
     let headers = request.headers_mut();
     for (name, value) in captured.headers.iter() {
@@ -160,17 +175,35 @@ pub fn build_request(
 /// The frame/message cap is a property of the *job* profile
 /// (`ScanProfile.ws.max_frame_bytes`) while a [`WsDialer`] is shared by every
 /// probe host of a lane, so the cap travels with each dial rather than being
-/// baked into the dialer (plan call 26).
+/// baked into the dialer (plan call 26). The collection ceilings bound what one
+/// [`WsConn::collect`] gathers and what a connection records over its life
+/// (security finding S5): a server that floods replies ends the collection as
+/// [`CollectEnd::Limit`] instead of growing it without bound.
 #[derive(Debug, Clone, Copy)]
 pub struct DialLimits {
-    /// The largest frame and message this connection will read or write.
+    /// The largest frame and message this connection will read **or write**:
+    /// tungstenite enforces it on incoming frames, [`WsConn::send`] on outgoing.
     pub max_frame_bytes: usize,
+    /// Payload bytes one `collect` gathers before ending as `Limit`; also the
+    /// most a connection records for its replay flow.
+    pub max_collect_bytes: usize,
+    /// Frames one `collect` gathers before ending as `Limit`; also the most a
+    /// connection records for its replay flow.
+    pub max_collect_frames: usize,
 }
+
+/// Default [`DialLimits::max_collect_bytes`]: 8 MiB.
+pub const DEFAULT_MAX_COLLECT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default [`DialLimits::max_collect_frames`].
+pub const DEFAULT_MAX_COLLECT_FRAMES: usize = 256;
 
 impl Default for DialLimits {
     fn default() -> Self {
         Self {
             max_frame_bytes: WsOptions::default().max_frame_bytes as usize,
+            max_collect_bytes: DEFAULT_MAX_COLLECT_BYTES,
+            max_collect_frames: DEFAULT_MAX_COLLECT_FRAMES,
         }
     }
 }
@@ -198,13 +231,18 @@ pub enum DialOutcome {
 
 /// Why a dial could not be made at all.
 ///
-/// A refused *upgrade* is not here — see [`DialOutcome::Refused`]. `Connect`
-/// and `Handshake` carry the underlying error's text, which is a socket or
-/// protocol message and never a header value.
+/// A refused *upgrade* is not here — see [`DialOutcome::Refused`]. `Request`,
+/// `Connect` and `Handshake` carry text that names a header, an authority or
+/// a socket/protocol condition and never a header value, a path or a query.
 #[derive(Debug)]
 pub enum DialError {
-    /// The scope/rate guard refused the authority.
+    /// The scope/rate guard refused the authority, or the SSRF check refused
+    /// every address it resolved to.
     Guard(GuardError),
+    /// The upgrade request could not be built from the capture and overrides
+    /// (a header that cannot go on the wire, an override of a regenerated
+    /// header, an authority and path that form no URL).
+    Request(String),
     /// The job deadline passed while waiting for a slot, a socket or the
     /// handshake.
     Timeout,
@@ -218,6 +256,9 @@ impl fmt::Display for DialError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DialError::Guard(err) => write!(f, "guard refused the dial: {err}"),
+            DialError::Request(text) => {
+                write!(f, "the upgrade request could not be built: {text}")
+            }
             DialError::Timeout => write!(f, "the deadline passed before the dial completed"),
             DialError::Connect(text) => write!(f, "connect failed: {text}"),
             DialError::Handshake(text) => write!(f, "websocket handshake failed: {text}"),
@@ -243,16 +284,28 @@ impl std::error::Error for DialError {
 pub struct WsDialer {
     transport: Arc<dyn WsTransport>,
     slots: Arc<Semaphore>,
+    ssrf: SsrfPolicy,
 }
 
 impl WsDialer {
-    /// A dialer over `transport` with [`MAX_CONNECTIONS`] free slots.
+    /// A dialer over `transport` with [`MAX_CONNECTIONS`] free slots and the
+    /// product's default SSRF posture ([`SsrfPolicy::default`]: private and
+    /// loopback addresses are refused unless the literal address, or
+    /// `localhost`, is itself in scope).
     #[must_use]
     pub fn new(transport: Arc<dyn WsTransport>) -> Self {
         Self {
             transport,
             slots: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            ssrf: SsrfPolicy::default(),
         }
+    }
+
+    /// The same dialer with `policy` as its SSRF posture.
+    #[must_use]
+    pub fn with_ssrf(mut self, policy: SsrfPolicy) -> Self {
+        self.ssrf = policy;
+        self
     }
 
     /// How many more connections this dialer will open before it makes a caller
@@ -266,10 +319,12 @@ impl WsDialer {
     ///
     /// # Errors
     ///
+    /// [`DialError::Request`] when the request cannot be built;
     /// [`DialError::Guard`] when the authority is out of scope, rate limited
-    /// past the deadline or otherwise refused; [`DialError::Timeout`],
-    /// [`DialError::Connect`] or [`DialError::Handshake`] when the dial itself
-    /// fails. A non-101 answer is `Ok(`[`DialOutcome::Refused`]`)`.
+    /// past the deadline, resolves only to refused addresses or is otherwise
+    /// refused; [`DialError::Timeout`], [`DialError::Connect`] or
+    /// [`DialError::Handshake`] when the dial itself fails. A non-101 answer is
+    /// `Ok(`[`DialOutcome::Refused`]`)`.
     pub async fn dial(
         &self,
         handshake: &HttpFlow,
@@ -279,15 +334,18 @@ impl WsDialer {
         limits: DialLimits,
     ) -> Result<DialOutcome, DialError> {
         let request = build_request(handshake, overrides)
-            .map_err(|err| DialError::Handshake(err.to_string()))?;
+            .map_err(|err| DialError::Request(format!("{err:#}")))?;
         self.dial_request(request, guard, deadline, limits).await
     }
 
     /// Dial a request built elsewhere (the `ws.*` language builds its own).
     ///
-    /// The order is fixed and load-bearing: guard first (no socket is opened
-    /// for an authority the operator did not put in scope), then a connection
-    /// slot, then the socket, then the handshake — each bounded by `deadline`.
+    /// The order is fixed and load-bearing: a connection slot first (so a
+    /// dialer with all four slots busy does not pin a guard permit while it
+    /// waits; security finding S8), then the guard (no socket is opened for an
+    /// authority the operator did not put in scope), then resolution with the
+    /// SSRF check on every candidate, then the socket, then the handshake —
+    /// each bounded by `deadline`.
     ///
     /// # Errors
     ///
@@ -299,6 +357,13 @@ impl WsDialer {
         deadline: Instant,
         limits: DialLimits,
     ) -> Result<DialOutcome, DialError> {
+        // Checked up front: `timeout_at` polls its future before it looks at
+        // the clock, so a dial whose every step is immediately ready (a free
+        // slot, a literal address, a fast socket) would otherwise complete
+        // after its deadline instead of refusing.
+        if Instant::now() >= deadline {
+            return Err(DialError::Timeout);
+        }
         let uri = request.uri().clone();
         let scheme = uri.scheme_str().unwrap_or("ws").to_ascii_lowercase();
         let tls = scheme == "wss";
@@ -317,8 +382,6 @@ impl WsDialer {
             .unwrap_or(host)
             .to_string();
 
-        let permit = check_authority(guard, &authority, deadline).await?;
-
         let until = tokio::time::Instant::from_std(deadline);
         let slot = match timeout_at(until, Arc::clone(&self.slots).acquire_owned()).await {
             Ok(Ok(slot)) => slot,
@@ -330,13 +393,16 @@ impl WsDialer {
             Err(_elapsed) => return Err(DialError::Timeout),
         };
 
-        tracing::debug!(authority = %authority, tls, "ws dial");
-        let stream = match timeout_at(
-            until,
-            self.transport.connect(&dial_host, port, tls, &dial_host),
-        )
-        .await
+        let permit = check_authority(guard, &authority, deadline).await?;
+
+        let addr = match timeout_at(until, self.resolve(guard, &authority, &dial_host, port)).await
         {
+            Ok(resolved) => resolved?,
+            Err(_elapsed) => return Err(DialError::Timeout),
+        };
+
+        tracing::debug!(authority = %authority, %addr, tls, "ws dial");
+        let stream = match timeout_at(until, self.transport.connect(addr, tls, &dial_host)).await {
             Ok(Ok(stream)) => stream,
             Ok(Err(err)) => return Err(DialError::Connect(err.to_string())),
             Err(_elapsed) => return Err(DialError::Timeout),
@@ -427,15 +493,63 @@ impl WsDialer {
             request: sent,
             status,
             response_headers,
-            peer: peer_of(&authority, port),
+            peer: addr,
             tls,
             sni: tls.then(|| dial_host.clone()),
             opened: SystemTime::now(),
             started: Instant::now(),
+            limits,
             recorded: Vec::new(),
+            recorded_bytes: 0,
+            unrecorded: 0,
             _permit: permit,
             _slot: slot,
         }))
+    }
+
+    /// Resolve `host:port` and return the first address the SSRF check admits.
+    ///
+    /// Every candidate is checked with `confine_to_scope = false`, exactly as
+    /// `aitm-proto-http`'s sender does: scope confinement is the guard's job
+    /// and has already run; this is the private/loopback/rebinding gate. When
+    /// every candidate is refused the last refusal is returned as a guard
+    /// error, and nothing has been connected.
+    async fn resolve(
+        &self,
+        guard: &dyn ScopeRateGuard,
+        authority: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<SocketAddr, DialError> {
+        // `lookup_host` answers an IP literal without touching a resolver, so
+        // the hermetic tests and a literal-scoped lab target never leave the
+        // process here.
+        let candidates = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|_| DialError::Connect(format!("{authority} could not be resolved")))?;
+        let scope = guard.list_scope();
+        // The last refusal, when every candidate was refused; `None` after the
+        // loop means there was no candidate at all.
+        let mut refused: Option<GuardError> = None;
+        for candidate in candidates {
+            match ssrf_check(&self.ssrf, &scope, false, authority, candidate.ip()) {
+                Ok(()) => return Ok(SocketAddr::new(candidate.ip(), port)),
+                Err(err) => {
+                    tracing::debug!(
+                        authority,
+                        addr = %candidate,
+                        "ws dial address refused by the SSRF check"
+                    );
+                    refused = Some(err);
+                }
+            }
+        }
+        match refused {
+            Some(err) => Err(DialError::Guard(err)),
+            None => Err(DialError::Connect(format!(
+                "{authority} resolved to no address"
+            ))),
+        }
     }
 }
 
@@ -531,17 +645,6 @@ async fn check_authority(
     }
 }
 
-/// The peer address to record for `authority`.
-///
-/// A literal `host:port` is the real peer; a DNS name has no address here (the
-/// transport owns resolution), so the port is recorded against the unspecified
-/// address rather than inventing one.
-fn peer_of(authority: &str, port: u16) -> SocketAddr {
-    authority
-        .parse::<SocketAddr>()
-        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], port)))
-}
-
 /// The upgrade request as it went out, kept for the replay flow.
 struct RequestRecord {
     scheme: &'static str,
@@ -595,6 +698,10 @@ pub enum CollectEnd {
     Deadline,
     /// The job was cancelled.
     Cancelled,
+    /// The collection reached [`DialLimits::max_collect_frames`] or
+    /// [`DialLimits::max_collect_bytes`]. Data, like `Transport`: the frames
+    /// gathered so far are the observation (security finding S5).
+    Limit,
 }
 
 /// The frames one [`WsConn::collect`] gathered, and why it stopped.
@@ -622,7 +729,10 @@ pub struct WsConn {
     sni: Option<String>,
     opened: SystemTime,
     started: Instant,
+    limits: DialLimits,
     recorded: Vec<Recorded>,
+    recorded_bytes: usize,
+    unrecorded: usize,
     _permit: ActionPermit,
     _slot: OwnedSemaphorePermit,
 }
@@ -649,8 +759,15 @@ impl WsConn {
 
     /// The upgrade response headers, lowercase names, in order.
     #[must_use]
-    pub fn response_headers(&self) -> Vec<(String, String)> {
-        self.response_headers.clone()
+    pub fn response_headers(&self) -> &[(String, String)] {
+        &self.response_headers
+    }
+
+    /// Frames this connection saw but did not record because the replay flow
+    /// had reached the dial's collection ceilings (security finding S5).
+    #[must_use]
+    pub fn unrecorded(&self) -> usize {
+        self.unrecorded
     }
 
     /// The subprotocol the server echoed in its 101, if any.
@@ -659,54 +776,84 @@ impl WsConn {
     /// observation, not a failure (plan call 28): `ws-subprotocol-observe`
     /// reads exactly this.
     #[must_use]
-    pub fn subprotocol(&self) -> Option<String> {
-        header_of(&self.response_headers, "sec-websocket-protocol").map(str::to_string)
+    pub fn subprotocol(&self) -> Option<&str> {
+        header_of(&self.response_headers, "sec-websocket-protocol")
     }
 
     /// Send one frame and record it.
     ///
+    /// The payload is moved into the message and copied once for the record
+    /// (quality finding Q6). A payload above the dial's `max_frame_bytes` is
+    /// refused before anything reaches the wire (tester finding F2): the read
+    /// cap and the write cap are the same number.
+    ///
     /// # Errors
     ///
-    /// When a Text frame's payload is not UTF-8, or the stream refuses the
-    /// write.
-    pub async fn send(&mut self, frame: &Frame) -> anyhow::Result<()> {
-        let message = match frame.kind {
-            FrameKind::Text => Message::text(
-                String::from_utf8(frame.payload.clone())
+    /// When the payload exceeds the dial's frame limit, when a Text frame's
+    /// payload is not UTF-8, or when the stream refuses the write. The text
+    /// names lengths and kinds, never the payload.
+    pub async fn send(&mut self, frame: Frame) -> anyhow::Result<()> {
+        let len = frame.payload.len();
+        let max = self.limits.max_frame_bytes;
+        if len > max {
+            bail!("a {len}-byte frame exceeds this dial's {max}-byte frame limit");
+        }
+        let kind = frame.kind;
+        let message = match kind {
+            FrameKind::Close => {
+                // The model payload is the RFC 6455 layout (code, then reason),
+                // the same bytes `close_payload` records; shorter than a code is
+                // a plain normal close.
+                let close = match frame.payload.get(..2) {
+                    Some(&[high, low]) => CloseFrame {
+                        code: CloseCode::from(u16::from_be_bytes([high, low])),
+                        reason: String::from_utf8_lossy(frame.payload.get(2..).unwrap_or_default())
+                            .into_owned()
+                            .into(),
+                    },
+                    _ => CloseFrame {
+                        code: CloseCode::Normal,
+                        reason: String::new().into(),
+                    },
+                };
+                tracing::debug!(kind = ?kind, bytes = len, "ws send");
+                self.stream
+                    .send(Message::Close(Some(close)))
+                    .await
+                    .context("sending a websocket frame")?;
+                self.record(WsDir::ClientToServer, frame);
+                return Ok(());
+            }
+            FrameKind::Text => Message::Text(
+                Utf8Bytes::try_from(Bytes::from(frame.payload))
                     .context("a text frame payload must be valid UTF-8")?,
             ),
-            FrameKind::Binary => Message::Binary(Bytes::from(frame.payload.clone())),
-            FrameKind::Ping => Message::Ping(Bytes::from(frame.payload.clone())),
-            FrameKind::Pong => Message::Pong(Bytes::from(frame.payload.clone())),
-            // The model payload is the RFC 6455 layout (code, then reason), the
-            // same bytes `close_payload` records; shorter than a code is a
-            // plain normal close.
-            FrameKind::Close => Message::Close(match frame.payload.get(..2) {
-                Some(&[high, low]) => Some(CloseFrame {
-                    code: CloseCode::from(u16::from_be_bytes([high, low])),
-                    reason: String::from_utf8_lossy(frame.payload.get(2..).unwrap_or_default())
-                        .into_owned()
-                        .into(),
-                }),
-                _ => Some(CloseFrame {
-                    code: CloseCode::Normal,
-                    reason: String::new().into(),
-                }),
-            }),
+            FrameKind::Binary => Message::Binary(Bytes::from(frame.payload)),
+            FrameKind::Ping => Message::Ping(Bytes::from(frame.payload)),
+            FrameKind::Pong => Message::Pong(Bytes::from(frame.payload)),
         };
-        tracing::debug!(kind = ?frame.kind, bytes = frame.payload.len(), "ws send");
+        // One copy, for the record; `Bytes` shares the buffer with the message.
+        let payload: Vec<u8> = match &message {
+            Message::Text(text) => text.as_bytes().to_vec(),
+            Message::Binary(bytes) | Message::Ping(bytes) | Message::Pong(bytes) => bytes.to_vec(),
+            Message::Close(_) | Message::Frame(_) => Vec::new(),
+        };
+        tracing::debug!(kind = ?kind, bytes = len, "ws send");
         self.stream
             .send(message)
             .await
             .context("sending a websocket frame")?;
-        self.record(WsDir::ClientToServer, frame.clone());
+        self.record(WsDir::ClientToServer, Frame { kind, payload });
         Ok(())
     }
 
     /// Read frames for `window`, answering Ping and stopping on Close.
     ///
     /// `cancelled` is polled at least every 50 ms so a cancelled job stops
-    /// waiting; `deadline` bounds the window the same way.
+    /// waiting; `deadline` bounds the window the same way. The dial's
+    /// collection ceilings ([`DialLimits::max_collect_frames`],
+    /// [`DialLimits::max_collect_bytes`]) end it as [`CollectEnd::Limit`] with
+    /// what was gathered so far.
     ///
     /// The `Sync` bound on `cancelled` is load-bearing: it is held across this
     /// method's awaits, and a bare `&dyn Fn` is not `Sync`, so without it this
@@ -719,7 +866,8 @@ impl WsConn {
         cancelled: &(dyn Fn() -> bool + Sync),
     ) -> CollectOutcome {
         let window_end = Instant::now() + window;
-        let first = self.recorded.len();
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut bytes = 0usize;
         let ended = loop {
             if cancelled() {
                 break CollectEnd::Cancelled;
@@ -740,7 +888,9 @@ impl WsConn {
             };
             match message {
                 Message::Text(text) => {
-                    self.record(
+                    self.collected(
+                        &mut frames,
+                        &mut bytes,
                         WsDir::ServerToClient,
                         Frame {
                             kind: FrameKind::Text,
@@ -748,17 +898,21 @@ impl WsConn {
                         },
                     );
                 }
-                Message::Binary(bytes) => {
-                    self.record(
+                Message::Binary(payload) => {
+                    self.collected(
+                        &mut frames,
+                        &mut bytes,
                         WsDir::ServerToClient,
                         Frame {
                             kind: FrameKind::Binary,
-                            payload: bytes.to_vec(),
+                            payload: payload.to_vec(),
                         },
                     );
                 }
                 Message::Ping(payload) => {
-                    self.record(
+                    self.collected(
+                        &mut frames,
+                        &mut bytes,
                         WsDir::ServerToClient,
                         Frame {
                             kind: FrameKind::Ping,
@@ -771,7 +925,9 @@ impl WsConn {
                     if let Err(err) = self.stream.flush().await {
                         break CollectEnd::Transport(err.to_string());
                     }
-                    self.record(
+                    self.collected(
+                        &mut frames,
+                        &mut bytes,
                         WsDir::ClientToServer,
                         Frame {
                             kind: FrameKind::Pong,
@@ -780,7 +936,9 @@ impl WsConn {
                     );
                 }
                 Message::Pong(payload) => {
-                    self.record(
+                    self.collected(
+                        &mut frames,
+                        &mut bytes,
                         WsDir::ServerToClient,
                         Frame {
                             kind: FrameKind::Pong,
@@ -790,7 +948,9 @@ impl WsConn {
                 }
                 Message::Close(frame) => {
                     let code = frame.as_ref().map(|frame| u16::from(frame.code));
-                    self.record(
+                    self.collected(
+                        &mut frames,
+                        &mut bytes,
                         WsDir::ServerToClient,
                         Frame {
                             kind: FrameKind::Close,
@@ -801,14 +961,25 @@ impl WsConn {
                 }
                 Message::Frame(_) => {}
             }
+            if frames.len() >= self.limits.max_collect_frames
+                || bytes >= self.limits.max_collect_bytes
+            {
+                tracing::debug!(
+                    frames = frames.len(),
+                    bytes,
+                    "ws collect reached the dial's collection ceiling"
+                );
+                break CollectEnd::Limit;
+            }
         };
-        CollectOutcome {
-            frames: self.recorded[first..]
-                .iter()
-                .map(|recorded| recorded.frame.clone())
-                .collect(),
-            ended,
-        }
+        CollectOutcome { frames, ended }
+    }
+
+    /// Keep one collected frame: in this collection's list, and in the record.
+    fn collected(&mut self, frames: &mut Vec<Frame>, bytes: &mut usize, dir: WsDir, frame: Frame) {
+        *bytes = bytes.saturating_add(frame.payload.len());
+        frames.push(frame.clone());
+        self.record(dir, frame);
     }
 
     /// Close the conversation and return whatever the peer answered with.
@@ -822,7 +993,7 @@ impl WsConn {
         };
         // An already-closed stream is the normal case when the peer closed
         // first; the conversation is recorded either way.
-        if self.send(&frame).await.is_err() {
+        if self.send(frame).await.is_err() {
             return Vec::new();
         }
         let until = Instant::now() + CLOSE_REPLY_WINDOW;
@@ -911,8 +1082,17 @@ impl WsConn {
         (handshake, conversation)
     }
 
-    /// Add one frame to the recorded conversation.
+    /// Add one frame to the recorded conversation, unless the replay flow has
+    /// reached the dial's collection ceilings — then count it instead
+    /// (security finding S5).
     fn record(&mut self, dir: WsDir, frame: Frame) {
+        if self.recorded.len() >= self.limits.max_collect_frames
+            || self.recorded_bytes >= self.limits.max_collect_bytes
+        {
+            self.unrecorded = self.unrecorded.saturating_add(1);
+            return;
+        }
+        self.recorded_bytes = self.recorded_bytes.saturating_add(frame.payload.len());
         self.recorded.push(Recorded {
             dir,
             frame,
@@ -946,11 +1126,13 @@ fn opcode_of(kind: FrameKind) -> WsOpcode {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use aitm_core::{
-        GuardError, HttpFlow, LimitConfig, ScopeEntry, ScopeRateGuard, StdGuard, WsDir, WsOpcode,
+        GuardError, HttpFlow, LimitConfig, ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard, WsDir,
+        WsOpcode,
     };
     use aitm_scan_model::{Frame, FrameKind};
     use bytes::Bytes;
@@ -1051,8 +1233,7 @@ mod tests {
         assert_eq!(
             transport.connects(),
             vec![(
-                "127.0.0.1".to_string(),
-                8080u16,
+                SocketAddr::from(([127, 0, 0, 1], 8080)),
                 false,
                 "127.0.0.1".to_string()
             )]
@@ -1373,7 +1554,7 @@ mod tests {
         let guard = guard_in_scope();
         let mut conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
 
-        conn.send(&Frame {
+        conn.send(Frame {
             kind: FrameKind::Text,
             payload: b"hi".to_vec(),
         })
@@ -1678,6 +1859,7 @@ mod tests {
                 soon(),
                 DialLimits {
                     max_frame_bytes: 1024,
+                    ..DialLimits::default()
                 },
             )
             .await
@@ -1687,7 +1869,7 @@ mod tests {
             DialOutcome::Refused { status, .. } => panic!("expected an upgrade, got {status}"),
         };
 
-        conn.send(&Frame {
+        conn.send(Frame {
             kind: FrameKind::Text,
             payload: b"hi".to_vec(),
         })
@@ -1727,5 +1909,432 @@ mod tests {
             shown.contains("127.0.0.1:8080") && shown.contains("101"),
             "Debug still has to identify the connection: {shown}"
         );
+    }
+    // --- Panel round 1a (security S1, S8; tester F2) ----------------------
+
+    #[test]
+    fn a_request_build_error_carries_no_url() {
+        // Security finding S1: the captured path and query (a `?token=`) must
+        // never reach an error text, and from there a check's `detail`.
+        let (mut handshake, _) = captured_conversation();
+        handshake.request.path = r#"/ws?token=eyJsecret&q="x""#.to_string();
+
+        let err = build_request(&handshake, &HandshakeOverrides::default())
+            .expect_err("a path with a raw quote does not form a url");
+
+        let text = format!("{err:#}");
+        assert!(
+            !text.contains("eyJsecret") && !text.contains("\"x\""),
+            "the error must not quote the path or query: {text}"
+        );
+        assert!(
+            text.contains("ws://127.0.0.1:8080"),
+            "the error still names the scheme and authority: {text}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_refuses_a_frame_above_the_dial_limit() {
+        // Tester finding F2: `max_frame_bytes` must bound what the dialer
+        // writes as well as what it reads. The refusal names the two lengths
+        // and never the payload.
+        let (transport, log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        let mut conn = match dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                soon(),
+                DialLimits {
+                    max_frame_bytes: 64,
+                    ..DialLimits::default()
+                },
+            )
+            .await
+            .expect("the upgrade completes")
+        {
+            DialOutcome::Upgraded(conn) => conn,
+            DialOutcome::Refused { status, .. } => panic!("expected an upgrade, got {status}"),
+        };
+
+        let err = conn
+            .send(Frame {
+                kind: FrameKind::Text,
+                payload: b"B".repeat(4096),
+            })
+            .await
+            .expect_err("a 4096-byte frame is above a 64-byte limit");
+
+        assert_eq!(
+            err.to_string(),
+            "a 4096-byte frame exceeds this dial's 64-byte frame limit"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            log.received().is_empty(),
+            "nothing may reach the wire: {:?}",
+            log.received().iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        conn.send(Frame {
+            kind: FrameKind::Text,
+            payload: b"ok".to_vec(),
+        })
+        .await
+        .expect("a frame within the limit still sends");
+    }
+
+    /// A guard that counts `check_active` calls and delegates the rest.
+    struct CountingGuard {
+        inner: Arc<StdGuard>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScopeRateGuard for CountingGuard {
+        fn check_active(&self, host: &str) -> Result<aitm_core::guard::ActionPermit, GuardError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.check_active(host)
+        }
+        fn add_scope(&self, entry: ScopeEntry) {
+            self.inner.add_scope(entry);
+        }
+        fn remove_scope(&self, entry: &str) -> bool {
+            self.inner.remove_scope(entry)
+        }
+        fn list_scope(&self) -> Vec<ScopeEntry> {
+            self.inner.list_scope()
+        }
+        fn in_scope(&self, host: &str) -> bool {
+            self.inner.in_scope(host)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_dialer_times_out_before_the_guard_is_asked() {
+        // Security finding S8: the connection slot is taken before the guard's
+        // concurrency permit, so a dialer with all four slots held does not
+        // pin a guard permit while it waits.
+        let hold = Arc::new(Notify::new());
+        let hold_in_handler = Arc::clone(&hold);
+        let (transport, _log) = ws_server(None, move |_conn| {
+            let hold = Arc::clone(&hold_in_handler);
+            async move {
+                hold.notified().await;
+            }
+        });
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await);
+        }
+        assert_eq!(dialer.slots_available(), 0);
+        let counting = CountingGuard {
+            inner: guard_in_scope(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let err = dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &counting,
+                Instant::now() + Duration::from_millis(100),
+                DialLimits::default(),
+            )
+            .await
+            .expect_err("no slot frees within the deadline");
+
+        assert!(matches!(err, DialError::Timeout), "got {err:?}");
+        assert_eq!(
+            counting.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the guard must not be asked before a slot is held"
+        );
+        hold.notify_waiters();
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dial_maps_a_request_build_error_to_request() {
+        // Quality finding Q7: a request that cannot be built is its own
+        // `DialError`, not a handshake failure; and (S1) the text carries no
+        // path or query.
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(Arc::clone(&transport) as Arc<_>);
+        let (mut handshake, _) = captured_conversation();
+        handshake.request.path = r#"/ws?token=eyJsecret&q="x""#.to_string();
+        let guard = guard_in_scope();
+
+        let err = dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                soon(),
+                DialLimits::default(),
+            )
+            .await
+            .expect_err("an unbuildable request never dials");
+
+        match &err {
+            DialError::Request(text) => {
+                assert!(!text.contains("eyJsecret"), "{text}");
+                assert!(!text.contains("\"x\""), "{text}");
+            }
+            other => panic!("expected DialError::Request, got {other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .starts_with("the upgrade request could not be built: "),
+            "{err}"
+        );
+        assert!(transport.connects().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_private_resolution_is_refused_before_connect() {
+        // Security finding S3: the dialer resolves the authority and runs the
+        // product's SSRF check on every candidate address before a socket is
+        // opened. With the in-scope lift turned off, a loopback literal is
+        // refused even though the guard admits the authority.
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(Arc::clone(&transport) as Arc<_>).with_ssrf(SsrfPolicy {
+            allow_if_in_scope: false,
+            ..SsrfPolicy::default()
+        });
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+
+        let err = dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                soon(),
+                DialLimits::default(),
+            )
+            .await
+            .expect_err("a blocked private address must refuse");
+
+        assert!(
+            matches!(
+                err,
+                DialError::Guard(GuardError::PrivateAddressBlocked(ref host)) if host == "127.0.0.1"
+            ),
+            "expected a private-address guard error, got: {err:?}"
+        );
+        assert!(
+            transport.connects().is_empty(),
+            "no socket may be opened for a refused address"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scoped_loopback_literal_is_admitted() {
+        // The default policy lifts the private-address block for an IP literal
+        // the operator put in scope, which is how every lab target is scoped.
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(Arc::clone(&transport) as Arc<_>);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+
+        let _conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
+
+        assert_eq!(
+            transport.connects(),
+            vec![(
+                SocketAddr::from(([127, 0, 0, 1], 8080)),
+                false,
+                "127.0.0.1".to_string()
+            )]
+        );
+    }
+
+    /// A server that answers the first Text frame with `count` frames of `each`
+    /// bytes, then waits for the client's Close.
+    fn flooding_server(count: usize, each: usize) -> Arc<crate::testing::DuplexTransport> {
+        let (transport, _log) =
+            ws_server(None, move |conn: crate::testing::ServerConn| async move {
+                let mut ws = conn.ws().await;
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(_) => {
+                            for _ in 0..count {
+                                if ws.send(Message::text("r".repeat(each))).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+        transport
+    }
+
+    async fn upgrade_with(
+        transport: Arc<crate::testing::DuplexTransport>,
+        limits: DialLimits,
+    ) -> WsConn {
+        let dialer = WsDialer::new(transport as Arc<_>);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        match dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                soon(),
+                limits,
+            )
+            .await
+        {
+            Ok(DialOutcome::Upgraded(conn)) => conn,
+            Ok(DialOutcome::Refused { status, .. }) => panic!("expected an upgrade, got {status}"),
+            Err(err) => panic!("expected an upgrade, got {err}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collect_ends_at_the_frame_ceiling() {
+        // Security finding S5: a server that floods replies cannot make one
+        // collection grow without bound; 256 frames end it as `Limit`.
+        let mut conn = upgrade_with(flooding_server(300, 8), DialLimits::default()).await;
+        conn.send(Frame {
+            kind: FrameKind::Text,
+            payload: b"go".to_vec(),
+        })
+        .await
+        .expect("send");
+
+        let outcome = conn
+            .collect(Duration::from_secs(5), soon(), &|| false)
+            .await;
+
+        assert_eq!(outcome.ended, CollectEnd::Limit);
+        assert_eq!(outcome.frames.len(), 256);
+        assert!(outcome
+            .frames
+            .iter()
+            .all(|frame| frame.kind == FrameKind::Text));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collect_ends_at_the_byte_ceiling() {
+        // Ten 1 MiB frames at the default 8 MiB ceiling: the eighth ends it.
+        let mut conn = upgrade_with(
+            flooding_server(10, 1 << 20),
+            DialLimits {
+                max_frame_bytes: 2 << 20,
+                ..DialLimits::default()
+            },
+        )
+        .await;
+        conn.send(Frame {
+            kind: FrameKind::Text,
+            payload: b"go".to_vec(),
+        })
+        .await
+        .expect("send");
+
+        let outcome = conn
+            .collect(Duration::from_secs(10), soon(), &|| false)
+            .await;
+
+        assert_eq!(outcome.ended, CollectEnd::Limit);
+        assert_eq!(outcome.frames.len(), 8);
+        assert_eq!(
+            outcome
+                .frames
+                .iter()
+                .map(|frame| frame.payload.len())
+                .sum::<usize>(),
+            8 << 20
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_recorded_conversation_is_capped_too() {
+        // The replay flow a connection records is bounded by the same
+        // ceilings; past them frames are counted, not kept.
+        let mut conn = upgrade_with(flooding_server(300, 8), DialLimits::default()).await;
+        conn.send(Frame {
+            kind: FrameKind::Text,
+            payload: b"go".to_vec(),
+        })
+        .await
+        .expect("send");
+        let outcome = conn
+            .collect(Duration::from_secs(5), soon(), &|| false)
+            .await;
+        assert_eq!(outcome.ended, CollectEnd::Limit);
+        assert_eq!(
+            conn.unrecorded(),
+            1,
+            "the sent frame plus 256 replies is one over"
+        );
+
+        let (_http, ws) = conn.into_flows(Vec::new());
+
+        assert_eq!(ws.messages.len(), 256);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dial_at_the_deadline_is_a_timeout_and_never_connects() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(Arc::clone(&transport) as Arc<_>);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+
+        let err = dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                Instant::now(),
+                DialLimits::default(),
+            )
+            .await
+            .expect_err("a dial at its deadline cannot proceed");
+
+        assert!(matches!(err, DialError::Timeout), "got {err:?}");
+        assert!(transport.connects().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_collect_at_the_deadline_ends_as_deadline() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        let mut conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
+
+        let outcome = conn
+            .collect(Duration::from_secs(5), Instant::now(), &|| false)
+            .await;
+
+        assert_eq!(outcome.ended, CollectEnd::Deadline);
+        assert!(outcome.frames.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn response_headers_and_subprotocol_are_borrowed() {
+        // Quality finding Q6: the accessors borrow instead of cloning.
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        let conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
+
+        let headers: &[(String, String)] = conn.response_headers();
+        let subprotocol: Option<&str> = conn.subprotocol();
+
+        assert!(headers
+            .iter()
+            .any(|(name, _)| name == "sec-websocket-accept"));
+        assert_eq!(subprotocol, None);
     }
 }

@@ -30,6 +30,9 @@ use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, 
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{accept_hdr_async, WebSocketStream};
 
+use crate::dialer::WsDialer;
+use crate::discover::{discover_flow, IdGen};
+use crate::host::WsProbeHost;
 use crate::transport::WsTransport;
 use crate::types::PointSpec;
 
@@ -43,7 +46,7 @@ const TEST_MARKER: &str = "mk7f3a9e";
 /// the server side of the protocol.
 pub struct DuplexTransport {
     on_connect: Box<dyn Fn(DuplexStream) + Send + Sync>,
-    connects: Mutex<Vec<(String, u16, bool, String)>>,
+    connects: Mutex<Vec<(SocketAddr, bool, String)>>,
 }
 
 impl DuplexTransport {
@@ -58,9 +61,12 @@ impl DuplexTransport {
         })
     }
 
-    /// Every `(host, port, tls, sni)` the dialer asked for, in order.
+    /// Every `(addr, tls, sni)` the dialer asked for, in order.
+    ///
+    /// The address is what the dialer resolved and passed its SSRF check; a
+    /// test asserts on it to prove a refused address never reached the seam.
     #[must_use]
-    pub fn connects(&self) -> Vec<(String, u16, bool, String)> {
+    pub fn connects(&self) -> Vec<(SocketAddr, bool, String)> {
         self.connects
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -71,8 +77,7 @@ impl DuplexTransport {
 impl WsTransport for DuplexTransport {
     fn connect<'a>(
         &'a self,
-        host: &'a str,
-        port: u16,
+        addr: SocketAddr,
         tls: bool,
         sni: &'a str,
     ) -> BoxFuture<'a, anyhow::Result<ByteStream>> {
@@ -81,7 +86,7 @@ impl WsTransport for DuplexTransport {
             self.connects
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push((host.to_string(), port, tls, sni.to_string()));
+                .push((addr, tls, sni.to_string()));
             (self.on_connect)(server);
             Ok(Box::pin(client) as ByteStream)
         })
@@ -393,7 +398,7 @@ pub struct TestJob {
     budget: AtomicU32,
     charged: AtomicU32,
     cancelled: AtomicBool,
-    deadline: Instant,
+    deadline: Mutex<Instant>,
 }
 
 impl TestJob {
@@ -443,13 +448,24 @@ impl TestJob {
             budget: AtomicU32::new(budget),
             charged: AtomicU32::new(0),
             cancelled: AtomicBool::new(false),
-            deadline: Instant::now() + Duration::from_secs(60),
+            deadline: Mutex::new(Instant::now() + Duration::from_secs(60)),
         })
     }
 
     /// Cancel the job, as the engine would.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    /// Move the job's deadline to `at` (the default is a minute from
+    /// construction).
+    pub fn set_deadline(&self, at: Instant) {
+        *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) = at;
+    }
+
+    /// Put the deadline in the past, as a job that ran out of time would be.
+    pub fn expire(&self) {
+        self.set_deadline(Instant::now());
     }
 
     /// How many budget units have been charged so far.
@@ -514,7 +530,7 @@ impl JobCtx for TestJob {
     }
 
     fn deadline(&self) -> Instant {
-        self.deadline
+        *self.deadline.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn cancelled(&self) -> bool {
@@ -550,8 +566,52 @@ pub fn point(
     }
 }
 
+/// A [`WsProbeHost`] over the fixture conversation's point named `name`.
+///
+/// Discovery runs over [`captured_conversation`] exactly as the lane's would,
+/// so the point and its spec are the real ones; the host dials through
+/// `transport` with a fresh [`WsDialer`].
+///
+/// # Panics
+///
+/// When the fixture has no point named `name`: a test-harness contract, not a
+/// runtime path.
+#[must_use]
+pub fn host_for(name: &str, job: &Arc<TestJob>, transport: Arc<DuplexTransport>) -> WsProbeHost {
+    let (handshake, ws) = captured_conversation();
+    let mut ids = IdGen::new("job-1");
+    let found = discover_flow(&ws, &handshake, &mut ids);
+    let at = found
+        .points
+        .iter()
+        .position(|point| point.name == name)
+        .unwrap_or_else(|| panic!("the fixture has a point named {name}"));
+    WsProbeHost::new(
+        found.points[at].clone(),
+        found.specs[at].1.clone(),
+        handshake,
+        ws,
+        Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
+        Arc::clone(job) as Arc<dyn JobCtx>,
+    )
+    .expect("the fixture point builds a host")
+}
+
+/// The value of one (lowercase) header of the server's `nth` handshake.
+#[must_use]
+pub fn handshake_header(log: &ServerLog, nth: usize, name: &str) -> Option<String> {
+    log.handshakes().get(nth).and_then(|headers| {
+        headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
     use futures::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::client_async_with_config;
@@ -574,8 +634,9 @@ mod tests {
             });
         });
 
+        let addr = SocketAddr::from(([10, 0, 0, 1], 1));
         let mut stream = transport
-            .connect("h", 1, false, "h")
+            .connect(addr, false, "h")
             .await
             .expect("duplex connect");
         stream.write_all(b"ping").await.expect("client write");
@@ -584,17 +645,14 @@ mod tests {
         let mut back = [0u8; 4];
         stream.read_exact(&mut back).await.expect("client read");
         assert_eq!(&back, b"ping");
-        assert_eq!(
-            transport.connects(),
-            vec![("h".to_string(), 1u16, false, "h".to_string())]
-        );
+        assert_eq!(transport.connects(), vec![(addr, false, "h".to_string())]);
     }
 
     #[tokio::test]
     async fn ws_server_echoes_and_logs_handshake() {
         let (transport, log) = ws_server(None, echo_handler);
         let stream = transport
-            .connect("app.test", 80, false, "app.test")
+            .connect(SocketAddr::from(([10, 0, 0, 1], 80)), false, "app.test")
             .await
             .expect("duplex connect");
 

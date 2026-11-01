@@ -83,15 +83,17 @@ impl HandshakeOverrides {
 
 /// How the dialer treats the upstream server certificate.
 ///
-/// The lane and the language both dial with [`TlsPolicy::AcceptAny`] (plan call
-/// 3): the scanner only ever connects to authorities the operator put in scope,
-/// and lab targets routinely carry self-signed certificates. A named item for
-/// the security review.
+/// The lane and the language both dial with [`TlsPolicy::Verify`] by default
+/// (`crate::lane::build`, `crate::language::build`), matching the product's
+/// `ssl_insecure = false` default; [`TlsPolicy::AcceptAny`] is for the
+/// operator's `ssl_insecure` setting and is reached through the `build_with`
+/// variants. A named item for the security review (S2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsPolicy {
     /// Verify the certificate chain against the webpki root store.
     Verify,
-    /// Accept any certificate the server presents.
+    /// Skip chain validation (self-signed and internal certificates complete
+    /// the handshake); the handshake signature is still verified.
     AcceptAny,
 }
 
