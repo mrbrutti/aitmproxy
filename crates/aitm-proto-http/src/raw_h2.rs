@@ -40,7 +40,7 @@
 //! There is deliberately **no** general HPACK decoder. The observe checks'
 //! oracle is reset-vs-answer, not the response body, so the driver records
 //! "HEADERS received, N bytes" and reads a `:status` only when the server
-//! encoded it as a static-table index ([`parse_status_indexed`]). Decoding a
+//! encoded it as a static-table index (`parse_status_indexed`). Decoding a
 //! literal response field would need the dynamic table this module does not
 //! keep.
 
@@ -61,7 +61,7 @@ use crate::sender::{
 };
 
 /// The client connection preface (RFC 9113 §3.4), sent before any frame.
-pub const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+pub(crate) const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 /// Length of a frame header in bytes (RFC 9113 §4.1). Internal: the public
 /// surface of this module is the nine-byte array [`frame_header`] returns.
@@ -73,11 +73,11 @@ pub(crate) const FRAME_HEADER_LEN: usize = 9;
 /// a raw probe advertises: a peer that declares more than this is not answering
 /// the probe we sent, and [`parse_frame`] refuses it rather than sizing a buffer
 /// from an attacker-chosen length.
-pub const MAX_FRAME_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024;
 
 /// The frame types this codec writes or recognises (RFC 9113 §6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameType {
+pub(crate) enum FrameType {
     /// `DATA` (0x0).
     Data = 0x0,
     /// `HEADERS` (0x1).
@@ -116,7 +116,7 @@ impl FrameType {
 ///
 /// `ACK` and `END_STREAM` share bit 0; which one a `0x1` means depends on the
 /// frame type, so they are two names for one value on purpose.
-pub mod flags {
+pub(crate) mod flags {
     /// `END_STREAM` on DATA and HEADERS.
     pub const END_STREAM: u8 = 0x1;
     /// `END_HEADERS` on HEADERS.
@@ -132,7 +132,7 @@ pub mod flags {
 /// the field holds; every caller in this crate writes a payload well under
 /// [`MAX_FRAME_BYTES`].
 #[must_use]
-pub fn frame_header(len: u32, kind: FrameType, flags: u8, stream: u32) -> [u8; 9] {
+pub(crate) fn frame_header(len: u32, kind: FrameType, flags: u8, stream: u32) -> [u8; 9] {
     let l = len.to_be_bytes();
     let s = (stream & 0x7fff_ffff).to_be_bytes();
     [l[1], l[2], l[3], kind as u8, flags, s[0], s[1], s[2], s[3]]
@@ -144,7 +144,7 @@ pub fn frame_header(len: u32, kind: FrameType, flags: u8, stream: u32) -> [u8; 9
 /// does not model still round-trips through the driver's read loop and can be
 /// skipped by length.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Frame {
+pub(crate) struct Frame {
     /// The wire type byte (see [`FrameType::from_u8`]).
     pub kind: u8,
     /// The flag bits (see [`flags`]).
@@ -166,7 +166,7 @@ pub struct Frame {
 ///
 /// Returns an error whose message contains `frame too large` when the peer
 /// declares a payload longer than [`MAX_FRAME_BYTES`].
-pub fn parse_frame(buf: &[u8]) -> anyhow::Result<Option<(Frame, usize)>> {
+pub(crate) fn parse_frame(buf: &[u8]) -> anyhow::Result<Option<(Frame, usize)>> {
     let Some(header) = buf.get(..FRAME_HEADER_LEN) else {
         return Ok(None);
     };
@@ -251,7 +251,7 @@ impl RawHeader {
 /// the caller passes only the pattern bits (for example `0x20` for a
 /// dynamic-table size update's 5-bit prefix).
 #[must_use]
-pub fn encode_integer(value: usize, prefix_bits: u8, first_byte: u8) -> Vec<u8> {
+pub(crate) fn encode_integer(value: usize, prefix_bits: u8, first_byte: u8) -> Vec<u8> {
     let prefix_bits = prefix_bits.clamp(1, 8);
     let max_prefix = (1usize << prefix_bits) - 1;
     // `max_prefix` is at most 255, so both casts below are exact.
@@ -279,7 +279,7 @@ pub fn encode_integer(value: usize, prefix_bits: u8, first_byte: u8) -> Vec<u8> 
 /// dynamic-table insert, and no validation of either the name or the value — a
 /// probe's whole purpose can be the byte the `http` crate would reject.
 #[must_use]
-pub fn encode_block(headers: &[RawHeader]) -> Vec<u8> {
+pub(crate) fn encode_block(headers: &[RawHeader]) -> Vec<u8> {
     let mut out = Vec::new();
     for header in headers {
         // 0x00: literal without indexing, name not in the table.
@@ -296,7 +296,7 @@ pub fn encode_block(headers: &[RawHeader]) -> Vec<u8> {
 /// Read a SETTINGS payload into its `(identifier, value)` pairs (RFC 9113
 /// §6.5.1). A trailing partial pair is ignored.
 #[must_use]
-pub fn parse_settings(payload: &[u8]) -> Vec<(u16, u32)> {
+pub(crate) fn parse_settings(payload: &[u8]) -> Vec<(u16, u32)> {
     payload
         .chunks_exact(6)
         .filter_map(|c| match c {
@@ -312,7 +312,7 @@ pub fn parse_settings(payload: &[u8]) -> Vec<(u16, u32)> {
 /// Read an RST_STREAM payload's error code (RFC 9113 §6.4), or `None` when the
 /// payload is not exactly four bytes.
 #[must_use]
-pub fn parse_rst_stream(payload: &[u8]) -> Option<u32> {
+pub(crate) fn parse_rst_stream(payload: &[u8]) -> Option<u32> {
     match payload {
         [e0, e1, e2, e3] => Some(u32::from_be_bytes([*e0, *e1, *e2, *e3])),
         _ => None,
@@ -323,7 +323,7 @@ pub fn parse_rst_stream(payload: &[u8]) -> Option<u32> {
 /// `None` when the payload is shorter than eight bytes. Any trailing opaque
 /// debug data is ignored — it is peer-controlled and never surfaced as evidence.
 #[must_use]
-pub fn parse_goaway(payload: &[u8]) -> Option<(u32, u32)> {
+pub(crate) fn parse_goaway(payload: &[u8]) -> Option<(u32, u32)> {
     match payload {
         [l0, l1, l2, l3, e0, e1, e2, e3, ..] => Some((
             u32::from_be_bytes([*l0, *l1, *l2, *l3]) & 0x7fff_ffff,
@@ -370,7 +370,7 @@ fn headers_block_fragment(frame_flags: u8, payload: &[u8]) -> Option<&[u8]> {
 /// status not in the static table. That is enough for the observe-only checks,
 /// whose oracle is reset-vs-answer; see the module docs.
 #[must_use]
-pub fn parse_status_indexed(block: &[u8]) -> Option<u16> {
+pub(crate) fn parse_status_indexed(block: &[u8]) -> Option<u16> {
     match block.first()? {
         0x88 => Some(200),
         0x89 => Some(204),
@@ -506,7 +506,7 @@ pub struct RawH2Plan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamOutcome {
     /// The peer answered with HEADERS. `status` is filled only when the peer
-    /// encoded `:status` as a static-table index (see [`parse_status_indexed`]).
+    /// encoded `:status` as a static-table index (see `parse_status_indexed`).
     Headers {
         /// The response status, when it was readable without HPACK state.
         status: Option<u16>,
@@ -1060,6 +1060,57 @@ async fn read_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The module's public surface is the driver and its types — what
+    /// `crates/aitm-scan-checks-http` imports — and nothing else: the codec
+    /// (preface, frame header, HPACK literal encoder, payload parsers) is
+    /// `pub(crate)`, used by the driver and by `h2_sender`'s tests (final
+    /// quality review FQ-3). Pinned on the source, the way the checks crate
+    /// pins its one raw-client construction, because the compiler cannot say
+    /// "nothing else is public".
+    #[test]
+    fn only_the_driver_and_its_types_are_public() {
+        // The library half only: this test's own literals must not satisfy it.
+        let src = include_str!("raw_h2.rs")
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("split yields at least one piece");
+        for private in [
+            "pub(crate) const PREFACE:",
+            "pub(crate) const MAX_FRAME_BYTES:",
+            "pub(crate) enum FrameType {",
+            "pub(crate) mod flags {",
+            "pub(crate) fn frame_header(",
+            "pub(crate) struct Frame {",
+            "pub(crate) fn parse_frame(",
+            "pub(crate) fn encode_integer(",
+            "pub(crate) fn encode_block(",
+            "pub(crate) fn parse_settings(",
+            "pub(crate) fn parse_rst_stream(",
+            "pub(crate) fn parse_goaway(",
+            "pub(crate) fn parse_status_indexed(",
+        ] {
+            assert!(src.contains(private), "{private} is not crate-private");
+        }
+        for public in [
+            "pub const MAX_RAW_STREAMS:",
+            "pub struct RawHeader {",
+            "pub struct RawH2Target {",
+            "pub enum RawH2Mode {",
+            "pub struct RawH2Plan {",
+            "pub enum StreamOutcome {",
+            "pub struct RawH2Observation {",
+            "pub enum TlsVerify {",
+            "pub struct RawH2Client {",
+            "pub fn new(verify: TlsVerify)",
+            "pub fn with_ssrf(",
+            "pub fn with_dialer(",
+            "pub fn with_resolver(",
+            "pub async fn probe(",
+        ] {
+            assert!(src.contains(public), "{public} is not public");
+        }
+    }
 
     /// Q4: the raw driver shares the sender's dialer, but not its 30 s connect
     /// timeout — a probe gives a target ten seconds to answer and no more, and

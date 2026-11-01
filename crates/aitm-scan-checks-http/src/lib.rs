@@ -39,18 +39,20 @@
 //!
 //! - [`timing`] — the least-squares [`timing::fit`] and its acceptance rule
 //!   [`timing::correlated`], behind every blind time-based technique. It is
-//!   the same algorithm the Rhai host function `probe.timing_fit` exposes
-//!   (spec D4, "Timing without `sleep`"), so both halves of the catalogue
-//!   agree on what "correlated" means.
-//! - [`matching`] — bounded, scrubbed response matching. Every body a check reads is
-//!   capped at [`aitm_scan_model::MAX_MATCH_BODY`] and every excerpt it quotes
-//!   is capped by [`aitm_scan_model::Evidence::excerpt`], so a hostile response
-//!   cannot grow an issue without limit.
+//!   the one public toolbox: the plan's D4 contract offers the pair to the
+//!   Rhai bridge, whose host function `probe.timing_fit` is the same
+//!   algorithm (spec D4, "Timing without `sleep`"), so both halves of the
+//!   catalogue agree on what "correlated" means.
+//! - `matching` — bounded, scrubbed response matching, crate-private. Every
+//!   body a check reads is capped at [`aitm_scan_model::MAX_MATCH_BODY`] and
+//!   every excerpt it quotes is capped by
+//!   [`aitm_scan_model::Evidence::excerpt`], so a hostile response cannot grow
+//!   an issue without limit.
 
 #![forbid(unsafe_code)]
 
 mod gate;
-pub mod matching;
+pub(crate) mod matching;
 pub mod timing;
 mod url;
 

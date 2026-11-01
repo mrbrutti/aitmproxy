@@ -7,10 +7,11 @@
 //! [`correlated`] applies ZAP's published acceptance rule to the result
 //! (`docs/research/17-burp-style-scanner-architecture.md` §3.6).
 //!
-//! Both are `pub` and free of any scanner state so that the Rhai host function
-//! `probe.timing_fit` can reuse them verbatim: the native catalogue and the
-//! scripted one must agree on what "correlated" means, or two checks for one
-//! class would disagree about the same target.
+//! Both are `pub` and free of any scanner state because the plan's D4
+//! contract offers them to the Rhai bridge: its host function
+//! `probe.timing_fit` reuses [`fit`] and [`correlated`] verbatim, so the
+//! native catalogue and the scripted one agree on what "correlated" means,
+//! and two checks for one class cannot disagree about the same target.
 //!
 //! The regression runs in `f64` and is narrowed to the `f32` the model carries,
 //! so a long series cannot lose precision to accumulation.

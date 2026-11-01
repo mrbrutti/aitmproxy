@@ -293,6 +293,37 @@ fn no_source_path_builds_an_ungated_raw_h2_runner() {
     );
 }
 
+/// What the crate exposes is the two slots, the check modules, and
+/// `timing` — the latter because the plan's D4 contract offers
+/// `timing::{fit, correlated}` to the Rhai bridge. `matching` is the checks'
+/// own toolbox and stays crate-private, so no second scrub entry point exists
+/// to keep in step with the core's (final quality review FQ-3, spec
+/// re-review SP2-1).
+#[test]
+fn the_public_modules_are_the_checks_and_timing() {
+    let lib = include_str!("../src/lib.rs");
+    let public: BTreeSet<&str> = lib
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub mod "))
+        .map(|rest| rest.trim_end_matches(';'))
+        .collect();
+    assert_eq!(
+        public,
+        BTreeSet::from([
+            "blind_timing",
+            "h2_observe",
+            "redirect",
+            "sqli_boolean",
+            "timing",
+            "xss",
+        ])
+    );
+    assert!(
+        lib.contains("\npub(crate) mod matching;\n"),
+        "matching must be crate-private"
+    );
+}
+
 /// The ten checks `checks_with` returns carry the same metadata whether they
 /// came through `checks()` or not: the gated slot does not re-shape the five
 /// gate-free checks, it only adds the h2 five.
