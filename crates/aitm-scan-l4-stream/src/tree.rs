@@ -448,9 +448,16 @@ impl<'a> Parser<'a> {
         let mut i = 0usize;
 
         loop {
+            // The element cap is the parser's, not the frame's: a declared
+            // count is a number read off the wire, so a frame may declare a
+            // million elements and must not be allowed to allocate them
+            // (SEC-M1).
+            if i >= MAX_REPEAT_ELEMENTS {
+                break;
+            }
             match declared {
                 Some(n) if i >= n => break,
-                None if self.stop_repeating(spec, i) => break,
+                None if self.stop_repeating(spec) => break,
                 _ => {}
             }
 
@@ -491,9 +498,11 @@ impl<'a> Parser<'a> {
         ))
     }
 
-    /// Whether an unbounded `repeat` stops before element `i`.
-    fn stop_repeating(&self, spec: &FieldSpec, i: usize) -> bool {
-        if i >= MAX_REPEAT_ELEMENTS || self.pos >= self.limit {
+    /// Whether an unbounded `repeat` stops before its next element.
+    ///
+    /// [`MAX_REPEAT_ELEMENTS`] is the caller's check, for every repeat.
+    fn stop_repeating(&self, spec: &FieldSpec) -> bool {
+        if self.pos >= self.limit {
             return true;
         }
         match (spec.until, spec.terminator.as_ref()) {
@@ -598,9 +607,14 @@ impl<'a> Parser<'a> {
                 adjust,
             } => {
                 let own = i64::try_from(node.bytes.len()).unwrap_or(i64::MAX);
-                let body = value - i64::from(*adjust) - if *inclusive { own } else { 0 };
+                // Every term here comes off the wire, so every step is
+                // checked: a declared length near i64's ends must mark the
+                // relation broken, not overflow (SEC-M2).
+                let body = value
+                    .checked_sub(i64::from(*adjust))
+                    .and_then(|v| v.checked_sub(if *inclusive { own } else { 0 }));
                 let available = i64::try_from(self.remaining()).unwrap_or(i64::MAX);
-                let Ok(body) = usize::try_from(body) else {
+                let Some(Ok(body)) = body.map(usize::try_from) else {
                     node.relation_broken = true;
                     return;
                 };
@@ -1329,6 +1343,75 @@ message:
     /// A `len` relation whose recomputed value does not fit the field is
     /// marked broken and left alone: a fuzzing lane never writes a wrong
     /// number over an operator's bytes.
+    /// SEC-M1: a declared element count is bounded by
+    /// [`MAX_REPEAT_ELEMENTS`] like any other, so a frame that declares a
+    /// million elements allocates at most the cap.
+    ///
+    /// The element here is zero-width once the buffer is spent (`bytes` with
+    /// no size takes what is left, which is nothing), so without the cap the
+    /// loop runs the declared count to the end.
+    #[test]
+    fn a_declared_count_is_capped_like_an_unbounded_repeat() {
+        let spec = MessageSpec::from_yaml(concat!(
+            "grammar: synthetic\n",
+            "transport: tcp\n",
+            "message:\n",
+            "  - { name: n, type: decimal, count: { of: items } }\n",
+            "  - { name: crlf, type: delim, value: \"\\r\\n\" }\n",
+            "  - name: items\n",
+            "    type: repeat\n",
+            "    count_from: n\n",
+            "    fields:\n",
+            "      - { name: data, type: bytes }\n",
+        ))
+        .expect("the synthetic counted-repeat grammar parses");
+
+        let parsed = parse(&spec, b"1000000\r\n");
+
+        match parsed {
+            None => {}
+            Some(tree) => {
+                let items = tree
+                    .get(&FieldPath::new("items"))
+                    .expect("an `items` repeat");
+                assert!(
+                    items.children.len() <= MAX_REPEAT_ELEMENTS,
+                    "a declared million elements yielded {} nodes, over the \
+                     {MAX_REPEAT_ELEMENTS} cap",
+                    items.children.len(),
+                );
+            }
+        }
+    }
+
+    /// SEC-M2: an extreme declared length is arithmetic the parser must not
+    /// panic on — it is read, found not to fit, and the node is marked.
+    #[test]
+    fn an_extreme_declared_length_is_broken_not_a_panic() {
+        let spec = MessageSpec::from_yaml(concat!(
+            "grammar: synthetic\n",
+            "transport: tcp\n",
+            "message:\n",
+            "  - { name: len, type: decimal, len: { of: rest, inclusive: true } }\n",
+            "  - { name: crlf, type: delim, value: \"\\r\\n\" }\n",
+            "  - { name: body, type: bytes }\n",
+        ))
+        .expect("the synthetic decimal-length grammar parses");
+
+        for declared in ["9223372036854775807", "-9223372036854775808"] {
+            let wire = format!("{declared}\r\nabc").into_bytes();
+            let tree = parse(&spec, &wire)
+                .unwrap_or_else(|| panic!("`{declared}` is read, not trusted, and still parses"));
+            assert!(
+                tree.get(&FieldPath::new("len"))
+                    .expect("a `len` node")
+                    .relation_broken,
+                "`{declared}` does not fit what is left, so the relation is broken"
+            );
+            assert_eq!(render(&tree), wire, "the message is still rendered whole");
+        }
+    }
+
     #[test]
     fn a_relation_that_does_not_fit_is_marked_broken() {
         let spec = MessageSpec::from_yaml(concat!(
