@@ -96,7 +96,7 @@ extension Session {
         if command == "proxy.system.set" {
             // The field as typed in Settings ▸ Proxy, parsed the way the spawn parses it; the key travels
             // only when there is something in it (the core's default applies otherwise, D5).
-            let hosts = SystemProxyPreferences.bypassHosts(Store.defaults.string(forKey: SystemProxyPreferences.bypassKey) ?? "")
+            let hosts = SystemProxyPreferences.bypassHosts(SystemProxyPreferences.bypassField(Store.defaults))
             if !hosts.isEmpty { args["bypass"] = .array(hosts.map(JSONValue.string)) }
         }
         let reply: JSONValue

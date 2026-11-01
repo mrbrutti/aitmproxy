@@ -14,6 +14,16 @@ public enum SystemProxyPreferences {
     /// String, default "": the "Bypass hosts" field as typed → `system_proxy.bypass`
     /// and the `bypass` param of a live `proxy.system.set`.
     public static let bypassKey = "systemProxy.bypass"
+    /// The §D5 recommended list the "Bypass hosts" field shows until the operator edits it: the
+    /// operator's own tooling (Claude Desktop, browsers, `gh`) does not trust the MITM CA and
+    /// would fail TLS while the system proxy points at the core. A UI default for the setting,
+    /// not part of the core's loopback/local `BYPASS_DEFAULT`. Read through `bypassField(_:)`.
+    public static let defaultBypassField = "*.anthropic.com, api.anthropic.com, claude.ai, *.claude.ai, github.com, *.githubusercontent.com"
+
+    /// The stored field, or the recommended list when the key has never been written.
+    public static func bypassField(_ defaults: UserDefaults) -> String {
+        defaults.string(forKey: bypassKey) ?? defaultBypassField
+    }
     /// Bool, default false: the first-run sheet's "Don't ask again".
     public static let promptSuppressedKey = "systemProxy.promptSuppressed"
     /// Bool, default false: the first-run sheet has been shown once on this install.

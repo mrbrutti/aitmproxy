@@ -170,7 +170,7 @@ struct ProxySettings: View {
     @AppStorage("proxy.preferredPort", store: Store.defaults) private var port = 8080
     @AppStorage("proxy.verifyUpstreamTLS", store: Store.defaults) private var verifyTLS = true
     @AppStorage(SystemProxyPreferences.autoKey, store: Store.defaults) private var systemProxyAuto = false
-    @AppStorage(SystemProxyPreferences.bypassKey, store: Store.defaults) private var systemProxyBypass = ""
+    @AppStorage(SystemProxyPreferences.bypassKey, store: Store.defaults) private var systemProxyBypass = SystemProxyPreferences.defaultBypassField
 
     /// Why the live toggle is disabled (§D13: "disabled with the reason"). Settings-only
     /// footnotes, not lane or route words: nothing else spells them.
@@ -211,7 +211,7 @@ struct ProxySettings: View {
               let appliedVerifyTLS = connection.appliedVerifyUpstreamTLS else { return true }
         return port != appliedPort || verifyTLS != appliedVerifyTLS
             || systemProxyAuto != (connection.appliedSystemProxyAuto ?? false)
-            || systemProxyBypass != (connection.appliedSystemProxyBypass ?? "")
+            || systemProxyBypass != (connection.appliedSystemProxyBypass ?? SystemProxyPreferences.defaultBypassField)
     }
 
     var body: some View {

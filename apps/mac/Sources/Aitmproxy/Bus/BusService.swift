@@ -287,7 +287,8 @@ final class BusService: FlowActions {
         // address the summary compares the services with; the endpoint half follows it (nil = unknown,
         // never off). Absent on an older core → nil, which the route model reads as "no verb on this bus".
         let listenAddress = session.coreHealth.connection?.proxyAddress ?? session.listenAddress
-        let facts = status["system_proxy"].flatMap { SystemProxyFacts(compact: $0, listenAddress: listenAddress) }
+        let facts = status["system_proxy"].flatMap { SystemProxyFacts(compact: $0, listenAddress: listenAddress) }?
+            .keepingFullFields(from: session.systemProxyFacts)
         if session.systemProxyFacts != facts { session.systemProxyFacts = facts }
         if session.systemProxy != facts?.state { session.systemProxy = facts?.state }
     }

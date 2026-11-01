@@ -125,7 +125,7 @@ final class EmbeddedCoreController {
             // The two system-proxy keys, with the defaults EmbeddedCore.spawn() uses; the bypass
             // field is kept as typed so the dirty-check compares what the operator sees.
             let appliedSystemProxyAuto = defaults.object(forKey: SystemProxyPreferences.autoKey) as? Bool ?? false
-            let appliedSystemProxyBypass = defaults.string(forKey: SystemProxyPreferences.bypassKey) ?? ""
+            let appliedSystemProxyBypass = SystemProxyPreferences.bypassField(defaults)
             update {
                 $0.endpoint = runtime.endpoint
                 $0.status = .ready

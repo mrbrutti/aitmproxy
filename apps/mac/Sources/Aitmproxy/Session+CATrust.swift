@@ -135,7 +135,9 @@ extension Session {
     var setupSheetDue: Bool {
         guard embeddedCoreActive, coreHealth.connection?.status == .ready, caTrustControlLive else { return false }
         let caUndone = caTrust.map { !$0.trusted } ?? false
-        let systemProxyUndone = systemProxyFacts?.supported == true && !systemProxyPointsAtUs && !(systemProxyFacts?.setting ?? false)
+        // D13: the row is not due while "Set system proxy at launch" is on — the core sets it at launch.
+        let systemProxyUndone = systemProxyFacts?.supported == true && !systemProxyPointsAtUs
+            && !(systemProxyFacts?.setting ?? false) && !Store.defaults.bool(forKey: SystemProxyPreferences.autoKey)
         guard caUndone || systemProxyUndone else { return false }
         let defaults = Store.defaults
         return !defaults.bool(forKey: Self.setupSheetShownKey) && !defaults.bool(forKey: Self.setupSheetSuppressedKey)

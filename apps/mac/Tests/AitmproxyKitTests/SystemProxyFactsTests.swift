@@ -172,4 +172,20 @@ import Testing
         #expect(SystemProxyFacts(compact: ["state": "other", "supported": true], listenAddress: listen)?.state == nil)
         #expect(SystemProxyFacts(compact: ["state": "other", "host": "10.0.0.5", "port": 0], listenAddress: listen)?.state == nil)
     }
+
+    /// D13 "Facts in": the 500 ms compact poll keeps the last full read's guidance and remedy
+    /// while the word is unchanged, and drops them when the word changes.
+    @Test func aCompactPollKeepsTheFullReadsGuidanceAndRemedy() {
+        let full = SystemProxyFacts(word: .unsupported, supported: false, detail: "no mechanism",
+                                    guidance: "export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080")
+        let compact = SystemProxyFacts(word: .unsupported, supported: false, detail: "no mechanism")
+        #expect(compact.keepingFullFields(from: full).guidance
+                == "export http_proxy=http://127.0.0.1:8080 https_proxy=http://127.0.0.1:8080")
+        #expect(compact.keepingFullFields(from: nil) == compact)
+        let off = SystemProxyFacts(word: .off, detail: "HTTP and HTTPS off")
+        #expect(off.keepingFullFields(from: full) == off, "a new word drops the old guidance")
+        let fresh = SystemProxyFacts(word: .needsPrivilege, detail: "x", remedy: "new remedy")
+        #expect(fresh.keepingFullFields(from: SystemProxyFacts(word: .needsPrivilege, detail: "x", remedy: "old")).remedy == "new remedy",
+                "a value that carries its own fields keeps them")
+    }
 }

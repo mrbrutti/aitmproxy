@@ -60,4 +60,20 @@ import Testing
     @Test func singleHostIsOneEntry() {
         #expect(SystemProxyPreferences.bypassHosts("corp.test") == ["corp.test"])
     }
+
+    /// §D5: the field shows the recommended operator-tooling list until the operator writes the key.
+    @Test func theBypassFieldDefaultsToTheRecommendedListUntilWritten() {
+        let suite = "com.mrbrutti.aitmproxy.tests.sysproxy-prefs-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        #expect(SystemProxyPreferences.defaultBypassField
+                == "*.anthropic.com, api.anthropic.com, claude.ai, *.claude.ai, github.com, *.githubusercontent.com")
+        #expect(SystemProxyPreferences.bypassField(defaults) == SystemProxyPreferences.defaultBypassField)
+        #expect(SystemProxyPreferences.bypassHosts(SystemProxyPreferences.bypassField(defaults))
+                == ["*.anthropic.com", "api.anthropic.com", "claude.ai", "*.claude.ai", "github.com", "*.githubusercontent.com"])
+        defaults.set("", forKey: SystemProxyPreferences.bypassKey)
+        #expect(SystemProxyPreferences.bypassField(defaults) == "", "a cleared field stays cleared")
+        defaults.set("corp.test", forKey: SystemProxyPreferences.bypassKey)
+        #expect(SystemProxyPreferences.bypassField(defaults) == "corp.test")
+    }
 }
