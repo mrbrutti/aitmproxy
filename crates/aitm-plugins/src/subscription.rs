@@ -45,6 +45,13 @@ impl Plugin for SubscriptionPlugin {
         reg.add_command(Arc::new(FlowUnsubscribe));
     }
 
+    /// The tap is a pure observer, so it is the one plugin that also sees passive
+    /// flows (plain HTTP outside Scope, tunnel rows — spec D4): frontends still get
+    /// those rows pushed live while nothing acts on them.
+    fn observes_passive_flows(&self) -> bool {
+        true
+    }
+
     fn on_event(&mut self, ev: &Event, _ctx: &mut FlowCtx<'_>) -> Verdict {
         // A lagging/absent receiver must never block the proxy data path: a
         // broadcast `send` is non-blocking and its error (no live receiver, or a
