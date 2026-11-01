@@ -26,21 +26,25 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
         first probe flow in the inspector (Request and Response panes, the flow's method
         and path, the Scan strip gone), f -> false_positive, u -> open (screen AND
         scan.issue; after each the cursor is watched for CURSOR_HOLD_S and must stay on
-        the marked issue's row, H76), P opens Findings on the PoC or records the toast.
+        the marked issue's row, H76), P opens Findings on the PoC, or the `PoC <ref> is not
+        in the Findings list` toast names the issue's poc_ref (the spec's fallback, its own
+        check; the self-booted core's `poc_dir` is the engine's `findings/scan/pocs`, H78).
   T7-16 (UI-1) the held `standard` editor re-entered (never assumed fresh), `browser
         never`, `speed thorough` and `intensity intrusive` asserted on their Fields lines
         (H62, H70), s -> the engine's `needs_confirmation` overlay for the intrusive
         launch (`Confirm over the wire: scan launch`, recorded as a check and answered
-        with y by `launch`, H77) -> a Jobs row with the id scan.list reports, sampled as soon as it
-        is on screen at 0.5 s spacing: three or more screen samples whose on-screen
-        `sent/budget` is non-decreasing and inside a scan.status bracket taken around the
-        sample; the state/phase cell changes at least once; x right after the third
-        sample yields `cancelled` on screen and in scan.status (on a fresh `thorough`
-        `intrusive` job cancelled in its first second when the sampled one finished
-        before x, H37); the second client saw a `progress` and a `cancelled` line for the
-        cancelled job. Every launch (s, m, the confirm's y) returns only once its start
-        reply has landed on the Jobs tab with the new row, since that reply switches the
-        tab and undoes a tab key pressed before it (H72).
+        with y by `launch`, H77; the prompt is read across the box's line wrap, H79) -> a
+        Jobs row with the id scan.list reports, sampled as soon as it is on screen at 0.5 s
+        spacing: three or more screen samples (on until the state/phase cell changes or
+        SAMPLES_MAX, H80) whose on-screen `sent/budget` is non-decreasing and inside a
+        scan.status bracket taken around the sample; x right after the last sample yields
+        `cancelled` on screen and in scan.status (on a fresh `thorough` `intrusive` job
+        cancelled in its first second when the sampled one finished before x, H37), and the
+        state/phase cell changes at least once across the samples and that `cancelled` row;
+        the second client saw a `progress` and a `cancelled` line for the cancelled job.
+        Every launch (s, m, the confirm's y) returns only once its start reply has landed
+        on the Jobs tab with the new row, since that reply switches the tab and undoes a
+        tab key pressed before it (H72).
   T7-18 (UI-3) `l4-stream-safe` + t 127.0.0.1:<port>/tcp: the D7 gate text is on screen and
         s starts nothing (scan.list unchanged for 3 s); after the harness adds an inject
         L4 scope entry (removed again at the end of the run), s shows the confirm overlay
@@ -93,10 +97,12 @@ Exit 0 PASS / 1 FAIL / 77 SKIP.
 
 `python3 -I tests/e2e/tui/test_tui_scan_live.py --selftest` runs the screen readers
 (cursor row, severity group, editor header, surface tag, inspector, Findings head, the
-Site map node and marker, the wire-confirm overlay, the crawl `browser` line, the strip
-banner, the Site map settle rule (H54) and head-first wait (H63), the prompt bar and the
-Fields `origins`/`l4`/`speed`/`intensity` lines), the failure-screen writer, the L4 scope
-read and add arguments (H59), the prompt, `browser`, `speed` and `intensity` key helpers
+Site map node and marker, the wire-confirm overlay and its wrapped prompt (H79), the `P`
+fallback toast's ref (H78), the crawl `browser` line, the strip banner, the Site map settle
+rule (H54) and head-first wait (H63), the T7-16 sampling rule (H80), the prompt bar and the
+Fields `origins`/`l4`/`speed`/`intensity` lines), the failure-screen writer, the self-boot
+`CoreConfig` (H78), the L4 scope read and add arguments (H59), the prompt, `browser`, `speed`
+and `intensity` key helpers
 against a scripted terminal (H49, H44, H62, H70), the launch's landing wait against
 scripted screens and a scripted scan.list (H72), the tab markers against footers painted
 from the Rust key tables and read back from the Rust sources (H71), and the push-counting
@@ -152,7 +158,10 @@ ROW_APPEAR_S = 20.0
 # (the fifth: one `done` sample), so the sampled job runs `thorough` AND `intrusive` and
 # is sampled at this spacing, the first sample as soon as its row is on screen (H62, H70).
 SAMPLE_GAP_S = 0.5
-SAMPLES_MIN, SAMPLES_MAX = 3, 6
+# Never fewer than SAMPLES_MIN samples; the sampling goes on past them until the row's
+# state/phase cell changes or SAMPLES_MAX samples exist (the seventh live run's three all
+# read `running/audit`: the crawl phase had passed before the row appeared, H80).
+SAMPLES_MIN, SAMPLES_MAX = 3, 8
 CATCHUP_S = 8.0
 CANCEL_S = 25.0
 ISSUE_WAIT_S = 150.0
@@ -310,6 +319,13 @@ REFUSAL_WORDINGS = {
     "refused_agent": "Refused for the agent role",
 }
 CONFIRM_TITLE = "Confirm over the wire: scan launch"
+# The Issues `P` fallback toast (`app.rs` `scan_open_poc`): `PoC <ref> is not in the
+# Findings list`, the ref cut by `truncate` to POC_TOAST_MAX cells (`w - 1` chars and `…`)
+# when the Findings panel lists no finding whose PoC file stem or name is the issue's
+# `poc_ref` (or whose title is its name); the spec's fallback, so it passes as its own
+# check when the ref it carries is the issue's (H78).
+POC_TOAST_RE = re.compile(r"PoC (\S+) is not in the Findings list")
+POC_TOAST_MAX = 80
 NO_L4_ID = "no id"
 # A job's terminal states (`aitm_scan_model::JobState`): after one of them `x` is inert
 # (the banner reads `already <state>`), so T7-16 cancels a fresh job instead (H37).
@@ -1137,6 +1153,59 @@ def wordings_on(text):
     return sorted(code for code, w in REFUSAL_WORDINGS.items() if w in text)
 
 
+def confirm_text(text):
+    """The wire-confirm overlay's inner rows joined with single spaces, or None without
+    the overlay (H79). The box (`ui/scan/confirm.rs` `render`: `centered`, then `boxed`
+    with CONFIRM_TITLE on its top border) wraps the engine's prompt to its width
+    (`wrap`), and the live prompt names the origin (`.. traffic to http://127.0.0.1:50795
+    and may disrupt the target. Continue?`), so `may disrupt the` ends one row and
+    `target. Continue?` starts the next (the seventh live run's `fail-2-t7-16.txt`): a
+    substring search over the raw screen misses the phrase. The rows are cut between the
+    box's left border (the `┌` before the title) and its right border (the `┐` on the
+    title row), so nothing of the body beside the box is read, and end at the first row
+    whose cell under the `┌` is not the border `│` (the bottom `└`)."""
+    lines = text.split("\n")
+    top = next((i for i, ln in enumerate(lines) if CONFIRM_TITLE in ln), None)
+    if top is None:
+        return None
+    head = lines[top]
+    left = head.rfind("┌", 0, head.find(CONFIRM_TITLE))
+    if left < 0:
+        return None
+    right = head.find("┐", left)
+    right = right if right > left else None
+    rows = []
+    for ln in lines[top + 1:]:
+        if len(ln) <= left or ln[left] != "│":
+            break
+        rows.append(ln[left + 1:right].strip(" │"))
+    return " ".join(r for r in rows if r)
+
+
+def confirm_says(text, phrase):
+    """True when the wire-confirm overlay is up and its prompt carries `phrase` across
+    the box's line wrap (`confirm_text`, H79): what `launch` and T7-18 poll for."""
+    return phrase in (confirm_text(text) or "")
+
+
+def poc_toast_ref(text):
+    """The ref the `PoC <ref> is not in the Findings list` toast carries, as the status
+    row shows it (cut to POC_TOAST_MAX cells by `truncate`), or None without the toast
+    (H78)."""
+    m = POC_TOAST_RE.search(text)
+    return m.group(1) if m else None
+
+
+def ref_shown_is(shown, poc_ref):
+    """True when the toast's ref `shown` names the issue's `poc_ref`: equal, or cut by
+    `truncate` (`text.rs`: `w - 1` chars and `…`) to a prefix of it (H78)."""
+    if not shown or not poc_ref:
+        return False
+    if shown == poc_ref:
+        return True
+    return shown.endswith("…") and len(shown) > 1 and poc_ref.startswith(shown[:-1])
+
+
 def browser_value(text):
     """The held editor's crawl `browser` value as the Fields line reads it (`auto`,
     `always`, `never`), or None without an editor on screen (H42)."""
@@ -1512,9 +1581,11 @@ def launch(ctx, key, timeout=JOB_APPEAR_S, land_s=ROW_APPEAR_S, step="launch"):
     job = answer.get("job")
     if answer.get("confirm"):
         text = ctx.snap(f"{step_slug(step)}-confirm")
+        # The phrase is read across the box's line wrap (`confirm_says`, H79).
         ctx.c.check(f"{step}: the engine asked to confirm the intrusive launch (the `{CONFIRM_TITLE}` "
                     f"overlay after `{key}` carries \"may disrupt the target\"); `y` answers it (H77)",
-                    "may disrupt the target" in text, f"{ctx.ev.redact(text)[-900:]!r}")
+                    confirm_says(text, "may disrupt the target"),
+                    f"overlay text {confirm_text(text)!r}; {ctx.ev.redact(text)[-900:]!r}")
         ctx.term.press("y")
         job = wait_new_job(ctx.bus, before, timeout)
     if job:
@@ -1540,6 +1611,32 @@ def back_to_scan_list(ctx, step):
 def phases_of(samples):
     """The state/phase cells the samples carry (the empty ones dropped)."""
     return [s["screen_state_phase"] for s in samples if s["screen_state_phase"]]
+
+
+def more_samples(samples):
+    """True while T7-16 keeps sampling the job's row (H80): fewer than SAMPLES_MIN samples
+    yet, or SAMPLES_MIN or more whose state/phase cells have not changed and fewer than
+    SAMPLES_MAX. The seventh live run's three samples at 0.5 s all read `running/audit`
+    (the crawl phase had passed before the row appeared), so a fixed three could never
+    see a change; a job that leaves `running` ends the sampling from the caller (H37)."""
+    if len(samples) < SAMPLES_MIN:
+        return True
+    if len(samples) >= SAMPLES_MAX:
+        return False
+    return len(set(phases_of(samples))) <= 1
+
+
+def sample_of(n, text, job, before, after, caught_up):
+    """One T7-16 sample of `job`'s row on the screen `text`, bracketed by the scan.status
+    reads `before` and `after` (`status-pairs.json`): the on-screen `sent/budget` and
+    state/phase cells, the bracket's `sent` and `state`. `n` is the sample's ordinal, or
+    `cancel` for the post-`x` row that ends the phase-change assertion (H80)."""
+    probes = row_probes(text, job)
+    return {"n": n, "job": job, "screen_sent": None if probes is None else probes[0],
+            "screen_budget": None if probes is None else probes[1],
+            "screen_state_phase": row_state(text, job), "caught_up": caught_up,
+            "status_before_sent": sent_of(before), "status_after_sent": sent_of(after),
+            "status_before_state": before.get("state"), "status_after_state": after.get("state")}
 
 
 # --------------------------------------------------------------------- steps
@@ -1646,24 +1743,20 @@ def step_t7_16(ctx):
             on_jobs = re.search(TAB_MARKERS["2"], text) is not None
             c.check(f"T7-16: the Jobs tab drew and carries the row for {job}",
                     on_jobs and row_tail(text, job) is not None, f"jobs tab {on_jobs}; {ctx.screen('t7-16')}")
-        probes = row_probes(text, job)
-        state = row_state(text, job)
-        samples.append({"n": n, "screen_sent": None if probes is None else probes[0],
-                        "screen_budget": None if probes is None else probes[1],
-                        "screen_state_phase": state, "caught_up": caught_up,
-                        "status_before_sent": b_sent, "status_after_sent": sent_of(after),
-                        "status_before_state": before.get("state"),
-                        "status_after_state": after.get("state")})
+        samples.append(sample_of(n, text, job, before, after, caught_up))
         ctx.ev.write(f"screen-T7-16-{n}.txt", text)
-        # `x` goes as soon as SAMPLES_MIN samples exist: a wait for a phase change let
-        # the job finish first (H37); the phase check reads whatever the samples hold.
-        if len(samples) >= SAMPLES_MIN:
+        # The sampling goes on at SAMPLE_GAP_S until the state/phase cell changes or
+        # SAMPLES_MAX samples exist, never fewer than SAMPLES_MIN (`more_samples`, H80: the
+        # seventh live run's three all read `running/audit`); a job already out of
+        # `running` ends it too, since a wait for its phase to change could only watch it
+        # finish (H37).
+        if not more_samples(samples):
             break
         if (after.get("state") or "") in TERMINAL_STATES:
             break
         time.sleep(SAMPLE_GAP_S)
 
-    # `x` cancels the job under the Jobs cursor, and it goes RIGHT after the third sample
+    # `x` cancels the job under the Jobs cursor, and it goes RIGHT after the last sample
     # (H62): the bracketing read and the key come before the sample checks below. Against
     # the small target a `standard` job can finish inside the sampling window (the first
     # live run: 182 probes in about 6 s; the fourth: in about a second), and `x` on a
@@ -1690,8 +1783,7 @@ def step_t7_16(ctx):
             "taken just before and just after it",
             bool(bracketed) and all(s["status_before_sent"] <= s["screen_sent"] <= s["status_after_sent"]
                                     for s in bracketed), samples)
-    phases = phases_of(samples)
-    c.check("T7-16: the row's state/phase text changed at least once", len(set(phases)) > 1, phases)
+    # The phase-change assertion comes after `x`: the `cancelled` row is its last sample (H80).
 
     if sampled_terminal:
         c.note(f"T7-16: {job} read `{pre_x.get('state')}` before `x`; a fresh `standard` job is "
@@ -1715,10 +1807,22 @@ def step_t7_16(ctx):
                 on_row and on_cursor(term.text(), fresh), f"landed {on_row}; {ctx.screen('t7-16')}")
         term.press("x")
     cancelled = poll(lambda: "cancelled" in (row_state(term.text(), cancel_job) or ""), CANCEL_S, 0.3)
+    # The `cancelled` row is bracketed by status reads like every sample and, when it is
+    # the sampled job's own row, folds in as the last sample of the phase-change
+    # assertion (H80); a fresh job's row (H37) is another row and proves nothing about the
+    # sampled one's phases, so it stays out of it.
+    before_cancel = status_of(ctx.bus, cancel_job)
     text = ctx.snap("t7-16-cancel")
+    after_cancel = status_of(ctx.bus, cancel_job)
     ctx.ev.write("screen-T7-16-cancel.txt", text)
+    if cancel_job == job:
+        samples.append(sample_of("cancel", text, job, before_cancel, after_cancel, cancelled))
+        ctx.ev.write_json("status-pairs.json", samples)
     c.check(f"T7-16: `x` left the row of {cancel_job} reading `cancelled`", cancelled,
             f"pre-x state {pre_x.get('state')}; banner {banner_of(text)!r}; {ctx.screen('t7-16')}")
+    phases = phases_of(samples)
+    c.check("T7-16: the row's state/phase text changed at least once across the samples and the "
+            "post-`x` `cancelled` row (H80)", len(set(phases)) > 1, phases)
     final = wait_field(lambda: status_of(ctx.bus, cancel_job), "state", "cancelled", CANCEL_S)
     c.check(f"T7-16: scan.status agrees {cancel_job} is `cancelled`", final.get("state") == "cancelled",
             final.get("state"))
@@ -1906,10 +2010,22 @@ def step_t7_17(ctx):
     text = ctx.snap("t7-17-poc")
     ctx.ev.write("screen-T7-17-poc.txt", text)
     if poc_ref:
-        toast = "is not in the Findings list" in text
-        c.check("T7-17: `P` opened the Findings surface on the issue's PoC",
-                opened, f"poc_ref {poc_ref!r} toast {toast} answered {answered}; "
-                        f"{ctx.ev.redact(text)[-900:]!r}")
+        # Two sanctioned answers (spec D11, coordinator note 3): the Findings surface open
+        # on the PoC (the strong branch, checked below as before), or the fallback toast
+        # `PoC <ref> is not in the Findings list` naming this issue's `poc_ref` when the
+        # Findings panel (`poc.list` over the core's `poc.dir`) lists no finding for it,
+        # which passes as its own check (H78). Any other screen fails the strong check.
+        shown = poc_toast_ref(text)
+        if not opened and shown is not None:
+            c.check("T7-17: `P` reported the PoC path the Findings panel does not list (the `PoC <ref> "
+                    "is not in the Findings list` toast names the issue's `poc_ref`, whole or cut to "
+                    f"{POC_TOAST_MAX} cells; the spec's fallback, H78)",
+                    ref_shown_is(shown, poc_ref), f"toast ref {shown!r} poc_ref {poc_ref!r}; "
+                                                  f"{ctx.ev.redact(text)[-900:]!r}")
+        else:
+            c.check("T7-17: `P` opened the Findings surface on the issue's PoC",
+                    opened, f"poc_ref {poc_ref!r} toast ref {shown!r} answered {answered}; "
+                            f"{ctx.ev.redact(text)[-900:]!r}")
         if opened:
             # The Findings list marks its selection by highlight only (ui/overlays.rs), so
             # the selected finding is read from the detail pane alone: its `poc <path>`
@@ -2139,11 +2255,11 @@ def step_t7_18(ctx):
 
     before = job_ids(ctx.bus)
     term.press("s")
-    overlay = poll(lambda: CONFIRM_TITLE in term.text() and "may disrupt the target" in term.text(),
-                   OVERLAY_S, 0.3)
+    # The phrase is read across the box's line wrap (`confirm_says`, H79).
+    overlay = poll(lambda: confirm_says(term.text(), "may disrupt the target"), OVERLAY_S, 0.3)
     ctx.ev.write("screen-T7-18-overlay.txt", ctx.snap("t7-18-overlay"))
     c.check("T7-18: `s` opened the wire-confirm overlay containing \"may disrupt the target\"",
-            overlay, ctx.screen("t7-18"))
+            overlay, f"overlay text {confirm_text(term.text())!r}; {ctx.screen('t7-18')}")
 
     # A wording already on screen before `y` does not count as its answer.
     pre_codes = set(wordings_on(term.text()))
@@ -2388,6 +2504,22 @@ def quietly(step):
         pass
 
 
+def self_boot_config(work, authority, ports):
+    """The self-booted core's `CoreConfig`: the three ports (proxy, browser proxy, bus),
+    the target's authority and loopback in scope, the findings store under `work`, the
+    L4 lane on (`l4_enabled` only: the operator confirm path skips the agent widen gate,
+    so no agent-widen flag is needed for the cell's own l4.scope.add), and `poc_dir`
+    pointed at the engine's PoC store `<work>/findings/scan/pocs` (where the seventh live
+    run's `poc_ref` lay), so the Findings panel (`poc.list`) lists the scan PoCs it can
+    and T7-17's `P` may open on one (H78)."""
+    proxy_port, browser_port, bus_port = ports
+    findings = os.path.join(work, "findings")
+    return CoreConfig(proxy_port=proxy_port, browser_proxy_port=browser_port, bus_port=bus_port,
+                      scope_entries=[authority, "127.0.0.1"],
+                      poc_dir=os.path.join(findings, "scan", "pocs"),
+                      findings_dir=findings, l4_enabled=True)
+
+
 def run(tui, ev, marker, cookie_secret):
     booted = tgt = bus = push_client = pushes = term = ctx = None
     work = token_file = None
@@ -2409,13 +2541,7 @@ def run(tui, ev, marker, cookie_secret):
                        "or set AITM_TESTTARGET_BIN)")
             work = tempfile.mkdtemp(prefix="aitm-tui-scan-run-")
             tgt = Target("vulnerable")
-            # l4_enabled only: the operator confirm path skips the agent widen gate, so no
-            # agent-widen flag is needed for the cell's own l4.scope.add.
-            cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
-                             bus_port=free_port(),
-                             scope_entries=[tgt.authority, "127.0.0.1"],
-                             findings_dir=os.path.join(work, "findings"),
-                             l4_enabled=True)
+            cfg = self_boot_config(work, tgt.authority, (free_port(), free_port(), free_port()))
             try:
                 booted = Aitm.server(cfg)
             except FileNotFoundError as e:
@@ -2795,12 +2921,51 @@ POC_PATH = "/work/findings/pocs/reflected-xss-q.yaml"
 
 
 CONFIRM_PROMPT = "This scan sends malformed traffic and may disrupt the target. Continue?"
+# The prompt the engine sent in the seventh live run (`fail-2-t7-16.txt`): with the origin
+# it is 97 cells, over the box's 86 text cells, so the TUI wraps it after `may disrupt the`.
+LIVE_CONFIRM_PROMPT = "This scan sends malformed traffic to http://127.0.0.1:50795 and may disrupt the target. Continue?"
+# The `poc_ref` the seventh live run's issue carried (`fail-1-t7-17.txt`): the engine's
+# PoC under the findings store's `scan/pocs`, longer than the toast's 80 cells.
+LIVE_POC_REF = ("/var/folders/0t/zkzp_fls4cx5nvx_7zhbw7580000gn/T/aitm-tui-scan-run-0i4i8gks/findings/scan/pocs/"
+                "aitm-poc-open-redirect-67108-0-1793557916878198000/open-redirect.poc.yaml")
 
 
-def wire_confirm_over(body_text):
+def wrap_prompt(text, w):
+    """`ui/scan/mod.rs` `wrap` for the self-test frames: the text cut after every `,` `.`
+    `:` or `;` that whitespace or the end follows (`clauses`), a clause wider than `w`
+    split into words, the units packed greedily into rows of at most `w` cells (one
+    space between units); `max_rows` is never reached by the prompts painted here."""
+    units = []
+    for clause in re.split(r"(?<=[,.:;])\s+", text.strip()):
+        clause = clause.strip()
+        if not clause:
+            continue
+        units.extend([clause] if len(clause) <= w else clause.split())
+    rows, row = [], ""
+    for unit in units:
+        if not row:
+            row = unit[:w]
+        elif len(row) + 1 + len(unit) <= w:
+            row = f"{row} {unit}"
+        else:
+            rows.append(row)
+            row = unit[:w]
+    if row:
+        rows.append(row)
+    return rows
+
+
+def truncate_cells(s, w):
+    """`text.rs` `truncate` for ASCII: `s` whole when it fits `w` cells, else its first
+    `w - 1` chars and `…`."""
+    return s if len(s) <= w else s[:w - 1] + "…"
+
+
+def wire_confirm_over(body_text, prompt=CONFIRM_PROMPT):
     """The wire-confirm overlay (ui/scan/confirm.rs `render`) over `body_text`:
     `centered(screen, 90, 16)` at 200x50 (x 55, y 17), `boxed` (cleared, the title on
-    the top border), then the call line, the prompt, the footnote and the key line.
+    the top border), then the call line, the prompt wrapped to the inner width less two
+    (`wrap`, each row drawn after one pad cell, H79), the footnote and the key line.
     `ui/mod.rs` `render` draws it last over the body of the view the launch came from
     (`wire_confirm_from`, H18): the Scan view for a Scan launch, `main_region` for an
     L4 confirm from Flows (H15)."""
@@ -2809,11 +2974,23 @@ def wire_confirm_over(body_text):
     x, y = (COLS - w) // 2, (ROWS - h) // 2
     f.blank(x, y, w, h)
     ix, iy, iw, ih = box(f, x, y, w, h, CONFIRM_TITLE)
-    lines = [" scan.start", "", f" {CONFIRM_PROMPT}", "",
-             " Confirming starts the job now; x in Jobs cancels it at any time.",
-             " y confirm (re-issues with _confirm) · n / Esc cancel"]
+    lines = ([" scan.start", ""] + [f" {chunk}" for chunk in wrap_prompt(prompt, iw - 2)]
+             + ["", " Confirming starts the job now; x in Jobs cancels it at any time.",
+                " y confirm (re-issues with _confirm) · n / Esc cancel"])
     for k, line in enumerate(lines[:ih]):
         f.put(ix, iy + k, line[:iw])
+    return f.text()
+
+
+def poc_toast_frame(poc_ref):
+    """The Issues frame with the `P` fallback toast on the status row, as `app.rs`
+    `scan_open_poc` toasts it (`PoC <ref cut to POC_TOAST_MAX> is not in the Findings
+    list`) and the seventh live run's `fail-1-t7-17.txt` showed it after the Issues
+    footer's first hints (H78)."""
+    f = Frame.from_text(issues_frame())
+    f.put(0, ROWS - 1, " " * COLS)
+    f.put(0, ROWS - 1, f" c confirm  f false positive   PoC {truncate_cells(poc_ref, POC_TOAST_MAX)} is not in "
+                       "the Findings list   6.2 KB (F4)  ● bus 127.0.0.1:50798 · operator")
     return f.text()
 
 
@@ -3145,6 +3322,59 @@ def selftest():
     poc = re.search(r"\bpoc\s+(\S+)", findings)
     c.check("selftest: Findings: the detail's `poc` line names the PoC file",
             poc is not None and poc.group(1) == POC_PATH, repr(poc and poc.group(1)))
+
+    # Cell item from the seventh live smoke run: H78. `P` on an issue whose `poc_ref` the
+    # Findings panel does not list toasts `PoC <ref> is not in the Findings list` with the
+    # ref cut to POC_TOAST_MAX cells (`fail-1-t7-17.txt`); the toast's ref is read off the
+    # status row and compared with the issue's `poc_ref` as a whole or as its cut prefix
+    # (all the cut toast gives: a ref of another run's store differs inside it, one of a
+    # sibling PoC in the same store only beyond it).
+    issues_only = issues_frame()
+    shown_long = poc_toast_ref(poc_toast_frame(LIVE_POC_REF))
+    shown_short = poc_toast_ref(poc_toast_frame(POC_PATH))
+    c.check("selftest: `P` fallback toast: the ref is read off the status row (cut to 80 cells and `…` "
+            "as `truncate` does) and names the issue's `poc_ref` by prefix, not another store's; no "
+            "toast, no ref (H78)",
+            shown_long is not None and shown_long.endswith("…") and len(shown_long) == POC_TOAST_MAX
+            and ref_shown_is(shown_long, LIVE_POC_REF)
+            and not ref_shown_is(shown_long, LIVE_POC_REF.replace("run-0i4i8gks", "run-9z9z9z9z"))
+            and shown_short == POC_PATH and ref_shown_is(shown_short, POC_PATH)
+            and not ref_shown_is(shown_short, POC_PATH + ".bak") and poc_toast_ref(issues_only) is None
+            and not ref_shown_is(None, POC_PATH) and not ref_shown_is(shown_short, ""),
+            f"long {shown_long!r} short {shown_short!r}")
+    boot_cfg = self_boot_config("/work/run", "127.0.0.1:8080", (18080, 18081, 19001))
+    c.check("selftest: the self-booted core's CoreConfig points `poc_dir` at the engine's PoC store "
+            "under the findings dir (`<work>/findings/scan/pocs`), with the findings dir, the L4 "
+            "lane and the scope entries as before (H78)",
+            boot_cfg.poc_dir == "/work/run/findings/scan/pocs"
+            and boot_cfg.findings_dir == "/work/run/findings" and boot_cfg.l4_enabled is True
+            and boot_cfg.scope_entries == ["127.0.0.1:8080", "127.0.0.1"]
+            and (boot_cfg.proxy_port, boot_cfg.browser_proxy_port, boot_cfg.bus_port) == (18080, 18081, 19001)
+            and 'dir: "/work/run/findings/scan/pocs"' in boot_cfg.to_yaml(),
+            f"poc_dir {boot_cfg.poc_dir!r} findings_dir {boot_cfg.findings_dir!r}")
+
+    # Cell item from the seventh live smoke run: H79. The engine's prompt names the origin
+    # (`.. traffic to http://127.0.0.1:50795 and may disrupt the target. Continue?`), longer
+    # than the box's 86 text cells, so `ui/scan/confirm.rs` wraps it: `.. and may disrupt
+    # the` on one row, `target. Continue?` on the next (`fail-2-t7-16.txt` line 21), and a
+    # substring search over the raw screen misses `may disrupt the target`. `confirm_text`
+    # joins the box's inner rows with single spaces; `confirm_says` is what `launch` and
+    # T7-18 poll.
+    wrapped = wire_confirm_over(held, LIVE_CONFIRM_PROMPT)
+    disrupt_row = line_with(wrapped, "may disrupt the") or ""
+    joined = confirm_text(wrapped) or ""
+    c.check("selftest: wire confirm: the live prompt wraps in the box after `may disrupt the` (the "
+            "run 7 screen) so the raw text lacks `may disrupt the target`; the joined inner rows "
+            "carry it, the call line and the key line, and nothing of the body beside the box (H79)",
+            "may disrupt the target" not in wrapped and "target" not in disrupt_row
+            and line_with(wrapped, "target. Continue?") is not None
+            and confirm_says(wrapped, "may disrupt the target")
+            and joined.startswith("scan.start This scan sends malformed traffic to http://127.0.0.1:50795")
+            and "n / Esc cancel" in joined and "s start" not in joined and "profile standard" not in joined
+            and confirm_says(wire_confirm_over(held), "may disrupt the target")
+            and confirm_text(held) is None and not confirm_says(held, "may disrupt the target")
+            and not confirm_says(wrapped, "may unsettle the target"),
+            f"row {disrupt_row.strip()!r}; joined {joined[:200]!r}")
 
     # Fix round H re-review residuals, H12 to H17.
     thirteen = sitemap_frame(count=13)
@@ -3478,7 +3708,7 @@ def selftest():
         c.check("selftest: the T7-16 launch sequence, `browser never`, `speed thorough`, `intensity "
                 "intrusive` on one held editor, leaves all three on the Fields lines with four `e` "
                 "presses and three passed checks; a second pass presses no `e`; the samples come "
-                f"every 0.5 s and `x` right after the third (H70)",
+                f"every 0.5 s, three at least (H70)",
                 three_ok is True and three.browser == "never" and three.speed == "thorough"
                 and three.intensity == "intrusive" and three.keys.count("e") == 4
                 and three_checks.tally() == (3, 0, 0)
@@ -3487,6 +3717,31 @@ def selftest():
                 and SAMPLE_GAP_S == 0.5 and SAMPLES_MIN == 3,
                 f"{three_ok} browser {three.browser!r} speed {three.speed!r} intensity "
                 f"{three.intensity!r} keys {three.keys!r}; gap {SAMPLE_GAP_S}")
+
+        # Cell item from the seventh live smoke run: H80. Three samples at 0.5 s all read
+        # `running/audit` (`status-pairs.json`: the crawl phase had passed before the row
+        # appeared), so the sampling goes on until the state/phase cell changes or SAMPLES_MAX
+        # (8) samples exist, never fewer than SAMPLES_MIN, and the post-`x` `cancelled` row
+        # is the last sample of the phase-change assertion.
+        audit = {"screen_state_phase": "running/audit", "screen_sent": 1}
+        report = {"screen_state_phase": "running/report", "screen_sent": 2}
+        cancel_row = sample_of("cancel", "│>" + JOB + "  standard  http://127.0.0.1:8080  cancelled"
+                               "      220/2000", JOB, {"probes": {"sent": 220}, "state": "cancelled"},
+                               {"probes": {"sent": 220}, "state": "cancelled"}, True)
+        c.check("selftest: T7-16 sampling: three identical samples keep sampling (the run 7 case), a "
+                "fourth with a changed phase ends it, eight identical end it, two with a change go on to "
+                "the third; the `cancelled` row folds as a bracketed sample whose phase differs (H80)",
+                SAMPLES_MAX == 8 and more_samples([]) and more_samples([audit, audit])
+                and more_samples([audit, audit, audit]) and not more_samples([audit, audit, audit, report])
+                and more_samples([audit] * 7) and not more_samples([audit] * 8)
+                and more_samples([audit, report]) and not more_samples([audit, report, report])
+                and len(set(phases_of([audit, audit, audit]))) == 1
+                and phases_of([audit, audit, audit, cancel_row]) == ["running/audit"] * 3 + ["cancelled"]
+                and cancel_row["n"] == "cancel" and cancel_row["job"] == JOB
+                and cancel_row["screen_sent"] == 220 and cancel_row["screen_budget"] == 2000
+                and cancel_row["status_before_sent"] == 220 and cancel_row["status_after_state"] == "cancelled"
+                and cancel_row["caught_up"] is True,
+                f"cancel sample {cancel_row}")
 
         # Cell item from the fifth live smoke run: H72. The start reply switches the Scan tab
         # to Jobs (`fold_start_result`), so a `4` pressed before it lands is undone: `launch`
@@ -3527,8 +3782,9 @@ def selftest():
         # engine's `needs_confirmation` overlay (`fail-3-t7-16.txt`): `launch` reads the
         # title after the key, records the check, presses `y`, and only then reads the new
         # id and waits for the landing. The scripted bus lists the job only once `y` was
-        # pressed, so a launch that never answered the overlay could not pass here.
-        over_held = wire_confirm_over(held)
+        # pressed, so a launch that never answered the overlay could not pass here. The
+        # overlay carries the engine's live prompt, wrapped in the box as run 7 drew it (H79).
+        over_held = wire_confirm_over(held, LIVE_CONFIRM_PROMPT)
         asked = ScriptedScreens([over_held, over_held, jobs_frame()])
         asked_checks = Checks(out=io.StringIO())
         asked_ctx = Ctx(asked_checks, asked, ScriptedListBus(JOB, armed=lambda: "y" in asked.keys), None,
@@ -3547,9 +3803,10 @@ def selftest():
                 f"got {got_asked!r} keys {asked.keys} landed {asked_ctx.landed} checks {asked_checks.results}; "
                 f"outright {lands_ctx.c.results} {never_ctx.c.results}")
         # An overlay whose prompt is not the engine's "may disrupt the target" wording still
-        # gets its `y` (the launch must go on) but the check reads FAIL and names the screen.
+        # gets its `y` (the launch must go on) but the check reads FAIL and names the screen
+        # (the wrap splits the phrase, so the first row's `may disrupt the` is what changes).
         odd = Frame.from_text(over_held)
-        odd_text = odd.text().replace("may disrupt the target", "may unsettle the target")
+        odd_text = odd.text().replace("may disrupt the", "may unsettle the")
         odd_screens = ScriptedScreens([odd_text, jobs_frame()])
         odd_checks = Checks(out=io.StringIO())
         odd_ctx = Ctx(odd_checks, odd_screens, ScriptedListBus(JOB, armed=lambda: "y" in odd_screens.keys),
