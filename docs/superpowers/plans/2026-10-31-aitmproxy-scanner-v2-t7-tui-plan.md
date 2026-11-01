@@ -713,6 +713,11 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | coder note | Minor | "finished before `x`" is a note with a fresh job's own check; failure screens double as Evidence samples; `no site map yet` recorded; Fields pane by Esc then Tab; `EDITOR_FIELDS` copied as a tuple; H42 a hard check | ratified |
 | 15 | live smoke | run 2 | 7 ok, 2 failed: the editor's Fields walk by key did not reach `use_browser`, `e` opened a `value:` prompt and `s` typed into it; H38's failure screens captured it | H45 (Rust, Important: no test drives the Fields pane by keys), H43 (Rust: a Scan prompt draws over the Flows view), H44 (cell guard) |
 | 15 | engine | answered | T1b: zero issues = browser crawl bound but unreachable with no client-crawl fallback on 8be3e070 (fix landing); `use_browser: never` yields `reflected-xss` on `/search?q`; push fans out to every `flow.subscribe` connection, no replay | H42 stands; H46 makes the push thread's state visible; proof core re-pointed to 8be3e070 |
+| H (Rust) | fix round | done | H22-H36, H40, H43, H45 in ten commits `63906899..058e72e5`; crate gate green (528 tests) | final Rust re-review after H47/H48 |
+| H (Rust) | coder note | Minor | H45 not a reducer bug: the cell's `type_origin` returned on the prompt echo before Enter was processed | H49 (cell) |
+| H (Rust) | coder note | Important | `App::toast` unbounded; `bars.rs` `u16` add panics in debug on a 1 MiB `CallFailed` message | fix round H Rust (H47) |
+| H (Rust) | coder note | Minor | `scan_edit` acts from any Profiles pane; D11 says "on a field" | ruling: inert outside Fields with a toast (H48); D11 amended |
+| H (Rust) | coder note | Minor | `const fn join` in `key_table!`; `OnceLock` help rows; `rows` locals renamed `table`; 11 s `JOBS_MAX` test | ratified |
 
 ## Shipped
 
