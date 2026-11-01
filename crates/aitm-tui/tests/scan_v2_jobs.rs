@@ -489,3 +489,32 @@ fn bars_are_box_drawing_cells() {
     };
     assert_eq!(severity_bar(&lopsided, 4), "█▂▂▂");
 }
+
+/// Fix round F, F15 (spec D3: the notice is "cleared by the next key only,
+/// never by a reply"): job A done and job B running, `x` on A leaves
+/// `already done` in the banner; a `scan.status` reply for B, the kind of
+/// background poll that lands within a second, leaves it there; the next
+/// key clears it.
+#[test]
+fn a_status_reply_does_not_clear_the_notice() {
+    let mut app = app();
+    let _ = app.on_bus(list_reply());
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.jobs.cursor_job().map(String::as_str), Some(OTHER));
+    let reqs = app.update(Action::ScanCancel);
+    assert!(reqs.is_empty(), "a done job is not cancelled: {reqs:?}");
+    assert_eq!(app.scan.notice.as_deref(), Some("already done"));
+
+    let reqs = app.on_bus(status_reply(fixture("scan.status.json")));
+    assert!(reqs.is_empty(), "{reqs:?}");
+    assert_eq!(
+        app.scan.notice.as_deref(),
+        Some("already done"),
+        "a reply for another job erased the notice"
+    );
+    let strip = banner_row(&screen(&app)).to_string();
+    assert!(strip.contains("already done"), "{strip:?}");
+
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.notice, None, "the next key clears the notice");
+}

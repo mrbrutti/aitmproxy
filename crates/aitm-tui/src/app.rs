@@ -4466,10 +4466,12 @@ impl App {
 
     /// Parse a `scan.*` reply into its D10 type: the one parse /
     /// clear-or-set scaffold every verb arm shares. A match clears the error
-    /// this tag left behind (D13) and the banner notice (the reply changes
-    /// the tab) and is returned for the fold; a mismatch records the
-    /// contract error under the tag and yields `None`, so the prior state
-    /// stays on screen.
+    /// this tag left behind (D13) and is returned for the fold; a mismatch
+    /// records the contract error under the tag and yields `None`, so the
+    /// prior state stays on screen. The banner notice is not touched here:
+    /// only the next key clears it (spec D3; fix round F, F15), so a
+    /// background status poll cannot erase `already done` before the
+    /// operator reads it.
     fn scan_reply<T: serde::de::DeserializeOwned>(
         &mut self,
         tag: &str,
@@ -4478,7 +4480,6 @@ impl App {
         match parse_result::<T>(tag, value) {
             Ok(parsed) => {
                 self.scan.clear_error(tag);
-                self.scan.notice = None;
                 Some(parsed)
             }
             Err(e) => {

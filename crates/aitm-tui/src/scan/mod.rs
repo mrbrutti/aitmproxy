@@ -117,8 +117,10 @@ pub struct ScanState {
     pub last_error: Option<ScanError>,
     /// A non-error notice for the banner (D11: `already <state>` when `x`
     /// lands on a terminal job): the answer to one key, cleared by the next
-    /// key or by the next reply that changes the tab. Drawn in secondary
-    /// text, never in the error hue, and never recorded as a `ScanError`.
+    /// key only, never by a reply (spec D3; fix round F, F15), so a
+    /// background poll cannot erase it before the operator reads it. Drawn
+    /// in secondary text, never in the error hue, and never recorded as a
+    /// `ScanError`.
     pub notice: Option<String>,
     /// The tick the view was first opened on; `None` until then.
     pub opened_at_tick: Option<u64>,
