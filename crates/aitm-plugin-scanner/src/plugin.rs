@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use crate::config::ScannerConfig;
+use crate::jobs::ScanLate;
 use aitm_core::{Plugin, Registry};
-use aitm_scan_model::{Check, Lane};
+use aitm_scan_model::{Check, CheckRegistry, Lane};
 
 /// The scanner plugin. It holds its config and registers the `scan.*` command
 /// set.
@@ -23,6 +24,8 @@ pub struct ScannerPlugin {
     cfg: ScannerConfig,
     lanes: Vec<Arc<dyn Lane>>,
     native_checks: Vec<Arc<dyn Check>>,
+    script_checks: Arc<CheckRegistry>,
+    late: Arc<ScanLate>,
 }
 
 impl ScannerPlugin {
@@ -33,6 +36,8 @@ impl ScannerPlugin {
             cfg,
             lanes: Vec::new(),
             native_checks: Vec::new(),
+            script_checks: Arc::new(CheckRegistry::new()),
+            late: ScanLate::new(),
         }
     }
 
@@ -56,9 +61,40 @@ impl ScannerPlugin {
         &self.lanes
     }
 
+    /// Hand the plugin the scripting tier's check registry, replacing any
+    /// already set.
+    ///
+    /// The registry rides on `RhaiLoader`/`ScriptTier` rather than on
+    /// `ScriptServices` (call B9): `ScriptServices` is constructed in
+    /// seventeen files, two of them integration-shared, so a new field there
+    /// would force edits no task may make.
+    #[must_use]
+    pub fn with_script_checks(mut self, checks: Arc<CheckRegistry>) -> Self {
+        self.script_checks = checks;
+        self
+    }
+
     /// The native checks this plugin was handed. Empty until track T3 lands.
     pub fn native_checks(&self) -> &[Arc<dyn Check>] {
         &self.native_checks
+    }
+
+    /// The scripting tier's check registry. Empty until a script declares a
+    /// check with `reg.add_check`.
+    pub fn script_checks(&self) -> Arc<CheckRegistry> {
+        Arc::clone(&self.script_checks)
+    }
+
+    /// The cell the binary binds [`crate::jobs::ScanServices`] into once the
+    /// proxy exists (call B3). Handed out before `load` so `main.rs` can bind
+    /// it beside `handles.bind_proxy(..)`.
+    pub fn late(&self) -> Arc<ScanLate> {
+        Arc::clone(&self.late)
+    }
+
+    /// The scanner configuration this plugin was built with.
+    pub fn cfg(&self) -> &ScannerConfig {
+        &self.cfg
     }
 }
 
@@ -170,6 +206,8 @@ mod tests {
                     evidence: Evidence::default(),
                     detail: "the test check concludes nothing".into(),
                     poc_hint: None,
+                    location: None,
+                    more: Vec::new(),
                 }
             })
         }

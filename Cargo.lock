@@ -257,6 +257,7 @@ dependencies = [
  "aitm-core",
  "aitm-findings",
  "aitm-poc",
+ "aitm-proto-l4",
  "aitm-scan-model",
  "anyhow",
  "blake3",
@@ -266,6 +267,7 @@ dependencies = [
  "serde_yaml",
  "tokio",
  "tokio-util",
+ "tracing",
  "url",
  "uuid",
 ]

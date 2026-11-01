@@ -12,6 +12,9 @@ workspace = true
 aitm-core = { workspace = true }
 aitm-findings = { workspace = true }
 aitm-poc = { workspace = true }
+# `L4Guard::check(Inject, ..)`: `scan.start` refuses an L4 target the operator
+# did not grant injection on, before the job is spawned (spec D3/D5).
+aitm-proto-l4 = { workspace = true }
 # Scanner v2's shared data model: the `Lane` and `Check` traits whose handles the
 # binary collects from the lane crates and hands to `ScannerPlugin` (spec D1).
 aitm-scan-model = { workspace = true }
@@ -36,6 +39,9 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time"]
 # `CancellationToken`: `scan.cancel` sets it and the worker observes it between
 # probes and inside every bounded await (spec D5 "Cancellation").
 tokio-util = { workspace = true }
+# The worker has nowhere to return a note to: a skipped reproduction, a check-id
+# conflict in the catalogue and a failed persist are logged, not raised.
+tracing = { workspace = true }
 url = "2"
 # Job and issue ids (`scan-<8 hex>`, `issue-<8 hex>`, spec D5/D6).
 uuid = { workspace = true }
