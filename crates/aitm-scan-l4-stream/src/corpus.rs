@@ -540,6 +540,8 @@ pub fn build_node(
 ///
 /// Inference runs on the target's own transport, so a UDP TLV service gets a
 /// liveness probe that insists on a reply where a TCP one may just stay open.
+/// This is also the closure a profile that *names* `tlv` reaches: naming the
+/// family selects the relation inference recovers here, not a fixed grammar.
 ///
 /// # Errors
 ///

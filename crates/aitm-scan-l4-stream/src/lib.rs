@@ -644,6 +644,19 @@ mod tests {
         }
     }
 
+    /// One endpoint whose profile names a grammar.
+    fn one_target_named(ip: &str, port: u16, grammar: &str) -> ProfileTarget {
+        ProfileTarget {
+            origins: Vec::new(),
+            l4: vec![L4TargetSpec {
+                ip: ip.to_string(),
+                port,
+                proto: L4Transport::Tcp,
+                grammar: Some(grammar.to_string()),
+            }],
+        }
+    }
+
     /// A point this lane never produced.
     fn foreign_point() -> InsertionPoint {
         InsertionPoint {
@@ -881,6 +894,44 @@ mod tests {
 
         assert_eq!(lane.job_counters("scan-20").map(|c| c.cases), Some(0));
         assert!(lane.job_counters("no-such-job").is_none());
+    }
+
+    /// Naming `tlv` in the profile selects the family, not the pending stub:
+    /// discovery still infers the relation from the corpus and yields points.
+    #[tokio::test]
+    async fn discover_builds_points_for_a_named_tlv_target() {
+        let lane = dry_lane(Some(loopback_guard()));
+        let job = TestJob::with_seeds(&["0003616263", "0001ff"]);
+
+        let found = lane
+            .discover(&one_target_named("127.0.0.1", 9000, "tlv"), &job)
+            .await
+            .expect("two TLV seeds infer a grammar");
+
+        assert_eq!(found.nodes.len(), 1);
+        let node = &found.nodes[0];
+        assert_eq!(node.id, "l4s-tcp-127.0.0.1-9000");
+        assert_eq!(node.path_template, "/tlv");
+
+        assert!(!found.points.is_empty());
+        let paths: Vec<String> = found
+            .points
+            .iter()
+            .map(|point| point.path.clone().unwrap_or_default())
+            .collect();
+        assert!(paths.contains(&"length".to_string()), "{paths:?}");
+        assert!(paths.contains(&"payload".to_string()), "{paths:?}");
+
+        let state = lane.state().get("scan-20").expect("the job's state");
+        let selection = lock(&state.selection)
+            .get(&node.id)
+            .cloned()
+            .expect("the node's selection text");
+        assert!(selection.starts_with("inferred"), "{selection}");
+        assert_eq!(
+            selection,
+            "inferred 2-byte be length at offset 0 counting body only"
+        );
     }
 
     // -----------------------------------------------------------------

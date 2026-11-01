@@ -9,7 +9,9 @@
 //!
 //! [`select_grammar`] implements S3's order: a named grammar, else the port's
 //! grammar when at least one seed parses under it, else TLV inference over the
-//! seeds, else [`crate::grammars::raw`].
+//! seeds, else [`crate::grammars::raw`]. Naming `tlv` or `raw` names a
+//! *family*: the corpus still decides the relation a `tlv` target is mutated
+//! through, and a named `raw` takes the corpus for its liveness probe.
 
 use std::fmt;
 use std::sync::Arc;
@@ -394,7 +396,10 @@ pub type InferFn<'a> = dyn Fn(&[Vec<u8>]) -> Result<(Arc<dyn Grammar>, LenDescri
 
 /// Choose a grammar for one target (spec S3's order).
 ///
-/// 1. the named grammar, with `modbus-tcp` accepted for `modbus`;
+/// 1. the named grammar, with `modbus-tcp` accepted for `modbus`. `tlv` and
+///    `raw` name a family rather than a fixed grammar: a named `tlv` runs
+///    step 3 over the corpus and falls to step 4 on a refusal, and a named
+///    `raw` is built over the corpus so its liveness probe replays a seed;
 /// 2. else the port's grammar, when the corpus is empty or at least one seed
 ///    parses under it (a port is a convention, a seed is evidence);
 /// 3. else TLV inference over the corpus;
@@ -403,7 +408,8 @@ pub type InferFn<'a> = dyn Fn(&[Vec<u8>]) -> Result<(Arc<dyn Grammar>, LenDescri
 /// # Errors
 ///
 /// `scan: invalid_profile: ...` when the named grammar is unknown, or when it
-/// speaks a transport the target does not.
+/// speaks a transport the target does not. `tlv` and `raw` speak the target's
+/// own transport, so neither is ever refused for one.
 pub fn select_grammar(
     named: Option<&str>,
     proto: L4Transport,
@@ -419,11 +425,24 @@ pub fn select_grammar(
                 "scan: invalid_profile: unknown grammar '{name}'; known: {KNOWN_GRAMMARS}"
             ));
         };
+        // `tlv` and `raw` name a *family*, not a fixed grammar: both speak
+        // whatever the target speaks, so neither is transport-checked, and
+        // both are built from the corpus rather than taken from the registry
+        // — the registry's `tlv` is the stub that parses nothing, and its
+        // `raw` has no seed to probe liveness with.
+        match kind {
+            GrammarKind::Tlv => return Ok(infer_or_raw(seeds, infer)),
+            GrammarKind::Raw => {
+                return Ok(Selected {
+                    grammar: raw_over(seeds),
+                    reason: SelectionReason::Named,
+                })
+            }
+            _ => {}
+        }
+
         let grammar = by_kind(kind);
-        // `tlv` and `raw` speak whatever the target speaks; the seven others
-        // are fixed to one transport.
-        let fixed_transport = !matches!(kind, GrammarKind::Tlv | GrammarKind::Raw);
-        if fixed_transport && grammar.transport() != transport {
+        if grammar.transport() != transport {
             return Err(anyhow!(
                 "scan: invalid_profile: grammar '{name}' speaks {grammar_transport}, but the target's transport is {target_transport}",
                 grammar_transport = transport_name(grammar.transport()),
@@ -447,15 +466,31 @@ pub fn select_grammar(
         }
     }
 
+    Ok(infer_or_raw(seeds, infer))
+}
+
+/// S3 steps 3 and 4: the grammar inference recovers from the corpus, else
+/// `raw` naming the refusal. Both the unnamed path and a target that names
+/// `tlv` end here, so naming the family changes nothing but the order.
+fn infer_or_raw(seeds: &[Vec<u8>], infer: &InferFn<'_>) -> Selected {
     match infer(seeds) {
-        Ok((grammar, descriptor)) => Ok(Selected {
+        Ok((grammar, descriptor)) => Selected {
             grammar,
             reason: SelectionReason::Inferred(descriptor),
-        }),
-        Err(refusal) => Ok(Selected {
+        },
+        Err(refusal) => Selected {
             grammar: crate::grammars::raw::grammar(),
             reason: SelectionReason::RawFallback(format!("tlv inference refused: {refusal}")),
-        }),
+        },
+    }
+}
+
+/// `raw` whose liveness probe replays the corpus's first seed, or the bare
+/// registry `raw` when the corpus is empty and there is nothing to replay.
+fn raw_over(seeds: &[Vec<u8>]) -> Arc<dyn Grammar> {
+    match seeds.first() {
+        Some(seed) => Arc::new(crate::grammars::raw::Raw::with_seed(seed.clone())),
+        None => crate::grammars::raw::grammar(),
     }
 }
 
@@ -469,8 +504,9 @@ mod tests {
         by_kind, by_port, registry, select_grammar, Exchange, Expect, Grammar, SelectionReason,
     };
     use crate::client::Ended;
-    use crate::infer::LenDescriptor;
-    use crate::spec::{GrammarKind, MessageSpec, Transport};
+    use crate::infer::{Counts, LenDescriptor};
+    use crate::spec::{Endian, GrammarKind, MessageSpec, Transport};
+    use crate::tree::FieldPath;
     use rand::{Rng, RngCore, SeedableRng};
     use rand_chacha::ChaCha8Rng;
 
@@ -528,6 +564,92 @@ mod tests {
             "{mismatch}"
         );
         assert!(mismatch.contains("transport"), "{mismatch}");
+    }
+
+    /// Selection's real TLV inference, as `corpus::select_for` builds it.
+    fn infer_tcp(seeds: &[Vec<u8>]) -> Result<(Arc<dyn Grammar>, LenDescriptor), String> {
+        crate::grammars::tlv::from_seeds_on(seeds, Transport::Tcp)
+            .map_err(|refusal| refusal.to_string())
+    }
+
+    /// Three seeds of one length relation.
+    fn tlv_seeds() -> Vec<Vec<u8>> {
+        vec![
+            vec![0x00, 0x03, b'a', b'b', b'c'],
+            vec![0x00, 0x01, 0xff],
+            vec![0x00, 0x05, 0x01, 0x02, 0x03, 0x04, 0x05],
+        ]
+    }
+
+    /// Naming `tlv` selects the *family*, not the pending stub: the corpus
+    /// still decides the relation, so the target is mutated field by field.
+    #[test]
+    fn named_tlv_infers_from_the_corpus() {
+        let seeds = tlv_seeds();
+        let chosen = select_grammar(Some("tlv"), L4Transport::Tcp, 9000, &seeds, &infer_tcp)
+            .expect("a named tlv target infers from its corpus");
+
+        assert_eq!(chosen.grammar.kind(), GrammarKind::Tlv);
+        assert_eq!(
+            chosen.reason,
+            SelectionReason::Inferred(LenDescriptor {
+                offset: 0,
+                width: 2,
+                endian: Endian::Be,
+                counts: Counts::BodyOnly,
+                adjust: 0,
+            })
+        );
+
+        // The stub parses nothing; the inferred grammar parses its own seeds.
+        let tree = chosen
+            .grammar
+            .parse(&seeds[0])
+            .expect("the inferred grammar parses seed 0");
+        let paths: Vec<&str> = tree
+            .leaves()
+            .iter()
+            .map(|node| node.path.as_str())
+            .collect();
+        assert_eq!(paths, ["length", "payload"]);
+        assert_eq!(
+            tree.get(&FieldPath::new("payload"))
+                .map(|node| node.bytes.clone()),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(crate::tree::render(&tree), seeds[0]);
+    }
+
+    /// A named `tlv` whose corpus cannot carry a relation falls to `raw` with
+    /// the refusal named, exactly as the unnamed path does.
+    #[test]
+    fn named_tlv_with_one_seed_falls_to_raw() {
+        let seeds = vec![vec![0x00, 0x03, b'a', b'b', b'c']];
+        let chosen = select_grammar(Some("tlv"), L4Transport::Tcp, 9000, &seeds, &infer_tcp)
+            .expect("the fallback never fails");
+        assert_eq!(chosen.grammar.kind(), GrammarKind::Raw);
+        assert_eq!(
+            chosen.reason,
+            SelectionReason::RawFallback("tlv inference refused: too_few_seeds".to_string())
+        );
+    }
+
+    /// A named `raw` takes the corpus too: its liveness probe replays the
+    /// first seed instead of writing nothing.
+    #[test]
+    fn named_raw_takes_the_seed() {
+        let seeds = tlv_seeds();
+        let chosen = select_grammar(Some("raw"), L4Transport::Tcp, 9000, &seeds, &infer_tcp)
+            .expect("raw is a known grammar");
+        assert_eq!(chosen.grammar.kind(), GrammarKind::Raw);
+        assert_eq!(chosen.reason, SelectionReason::Named);
+        assert_eq!(chosen.grammar.liveness_probe().send, seeds[0]);
+
+        // With no corpus there is nothing to replay.
+        let bare = select_grammar(Some("raw"), L4Transport::Tcp, 9000, &[], &infer_tcp)
+            .expect("raw is a known grammar");
+        assert_eq!(bare.reason, SelectionReason::Named);
+        assert!(bare.grammar.liveness_probe().send.is_empty());
     }
 
     #[test]
