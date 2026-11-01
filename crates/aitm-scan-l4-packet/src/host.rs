@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aitm_proto_l4::backend::{CaptureInjectBackend, L4Error};
@@ -47,6 +47,7 @@ use crate::rng::{derive_seed, Rng};
 use crate::state::{
     report_counters, Candidate, CaseRecord, CrashRecord, LaneState, PointRun, StopReason,
 };
+use crate::sync::lock;
 
 /// How long one case waits for its reply (spec D8.4's reply window).
 pub const CASE_REPLY_WINDOW: Duration = Duration::from_millis(500);
@@ -54,13 +55,6 @@ pub const CASE_REPLY_WINDOW: Duration = Duration::from_millis(500);
 /// How long a silent target is given to come back before the outage is called
 /// persistent (plan call C27).
 pub const RECOVERY_WAIT: Duration = Duration::from_secs(10);
-
-/// Take a lock without panicking on a poisoned mutex: the state behind it is a
-/// cached class and a runner table, so a panic elsewhere must not take the lane
-/// down with it.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Every wait and ceiling the fuzz loop obeys. Set by the lane (plan call C3),
 /// never by a profile; tests shrink it so a run costs milliseconds.
@@ -113,6 +107,10 @@ impl Timing {
 /// stimulus, the backend that puts it on the wire, the lane-private case store
 /// (call C8), the operator's store for seeds only, the timings and the per-job
 /// bookkeeping.
+///
+/// `Clone` is a shallow clone of the shared `Arc`s and the `Copy` timing, so a
+/// caller can re-time one field with struct update (review finding M5).
+#[derive(Clone)]
 pub struct Shared {
     /// The deny-by-default L4 guard; every send is checked against it.
     pub guard: Arc<L4Guard>,
@@ -1334,110 +1332,23 @@ impl RunnerRegistry {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
 
-    use aitm_proto_l4::backend::CaptureInjectBackend;
     use aitm_proto_l4::craft::PacketSpec;
-    use aitm_proto_l4::flow::{InMemoryL4FlowStore, L4FlowStore, L4Packet};
+    use aitm_proto_l4::flow::L4Packet;
     use aitm_proto_l4::icmp::transport_payload;
     use aitm_proto_l4::types::L4Direction;
-    use aitm_scan_model::{
-        Discovery, InsertionPoint, JobCtx, L4Counters, Payload, PayloadMode, ProbeHost, ScanProfile,
-    };
+    use aitm_scan_model::{JobCtx, L4Counters, Payload, PayloadMode, ProbeHost};
 
-    use super::{join_error_message, PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
+    use super::{join_error_message, PacketHost, RunnerRegistry, Shared, Timing};
     use crate::codec::hex_encode;
-    use crate::discover::discover_all;
-    use crate::fields::FieldPath;
     use crate::oracle::CaseClass;
-    use crate::plan::{point_id, TargetPlan};
-    use crate::state::{Candidate, JobKey, LaneState, StopReason};
+    use crate::state::{Candidate, StopReason};
+    use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
-        fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
-        MockReply, TestJob,
+        fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply,
     };
-
-    /// The lane context every test drives: the loopback guard, the mock backend,
-    /// a lane-private case store, a separate seed store and a `LaneState` with
-    /// the job already begun. Timings are shrunk so a test spends milliseconds
-    /// where the lane spends seconds.
-    fn setup(
-        mock: Arc<MockBackend>,
-        profile: ScanProfile,
-        requested: &[String],
-        pps: u32,
-    ) -> (Arc<Shared>, Arc<TestJob>, Vec<TargetPlan>, Discovery) {
-        let guard = loopback_guard("*", pps);
-        let seed_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::default());
-        let case_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::with_limits(1024, 16));
-        let backend: Arc<dyn CaptureInjectBackend> = mock;
-        let job = TestJob::new(profile.clone());
-        let (plans, discovery) = discover_all(
-            guard.as_ref(),
-            backend.as_ref(),
-            Some(seed_store.as_ref()),
-            &profile.target,
-            &profile,
-            requested,
-            &job.marker(),
-        )
-        .expect("the loopback profile discovers");
-        let state = Arc::new(LaneState::new());
-        state.begin_job(
-            JobKey::new(job.job_id(), &job.marker()),
-            plans.clone(),
-            discovery.points.iter().map(|p| p.id.clone()).collect(),
-            profile.l4.cases,
-            profile.l4.consecutive_timeouts,
-            profile.l4.dry_run,
-        );
-        let shared = Arc::new(Shared {
-            guard,
-            backend,
-            case_store,
-            seed_store: Some(seed_store),
-            timing: Timing {
-                reply_window: Duration::from_millis(50),
-                liveness_retry: Duration::from_millis(10),
-                replay_spacing: Duration::from_millis(10),
-                recovery_poll: Duration::from_millis(10),
-                recovery_polls: 10,
-                ..Timing::default()
-            },
-            state,
-        });
-        (shared, job, plans, discovery)
-    }
-
-    /// The runner for one field of the job's first target.
-    fn runner_for(
-        shared: &Arc<Shared>,
-        job: &Arc<TestJob>,
-        plans: &[TargetPlan],
-        points: &[InsertionPoint],
-        field: &str,
-    ) -> Arc<PointRunner> {
-        let path = FieldPath::from_str(field).expect("a known field path");
-        let plan = plans.first().expect("one target plan").clone();
-        let id = point_id(&plan.target, path);
-        let point = points
-            .iter()
-            .find(|point| point.id == id)
-            .expect("the field's point")
-            .clone();
-        Arc::new(
-            PointRunner::new(
-                Arc::clone(shared),
-                Arc::clone(job) as Arc<dyn JobCtx>,
-                point,
-                plan,
-                path,
-            )
-            .expect("the field's seed builds"),
-        )
-    }
 
     /// Read an injected frame back as the packet views see it.
     fn as_packet(bytes: &[u8]) -> L4Packet {
@@ -2235,10 +2146,6 @@ mod tests {
         let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
         let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
         let shared = Arc::new(Shared {
-            guard: Arc::clone(&shared.guard),
-            backend: Arc::clone(&shared.backend),
-            case_store: Arc::clone(&shared.case_store),
-            seed_store: shared.seed_store.clone(),
             timing: Timing {
                 reply_window: Duration::from_millis(20),
                 liveness_retry: Duration::from_millis(5),
@@ -2247,7 +2154,7 @@ mod tests {
                 recovery_polls: 10,
                 ..Timing::default()
             },
-            state: Arc::clone(&shared.state),
+            ..(*shared).clone()
         });
         // Baseline + two cases + two failed probes take about 75 ms; the
         // deadline lands in the middle of the recovery polls.

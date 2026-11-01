@@ -44,8 +44,8 @@ use crate::codec::{base64_decode, hex_decode, hex_encode, truncate_hex, CodecErr
 use crate::fields::{validate_fields, FieldError, FieldPath, IpVersion};
 use crate::mutate::declared_value;
 use crate::plan::{
-    link_framing, point_id, src_port_for, ResolvedTarget, SeedOrigin, SeedPayload, SeedSpec,
-    TargetPlan,
+    host_port, link_framing, point_id, src_port_for, target_key, transport_name, PlanError,
+    ResolvedTarget, SeedOrigin, SeedPayload, SeedSpec, TargetPlan,
 };
 
 /// Why discovery refused to plan a job, carrying its D3 refusal code.
@@ -65,7 +65,7 @@ pub enum DiscoverError {
 impl DiscoverError {
     /// The D3 refusal code this error renders with.
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub(crate) const fn code(&self) -> &'static str {
         match self {
             Self::InvalidProfile(_) => "invalid_profile",
             Self::OutOfScope(_) => "out_of_scope",
@@ -75,7 +75,7 @@ impl DiscoverError {
 
     /// The message behind the code.
     #[must_use]
-    pub fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         match self {
             Self::InvalidProfile(m) | Self::OutOfScope(m) | Self::LaneUnavailable(m) => m,
         }
@@ -84,28 +84,38 @@ impl DiscoverError {
 
 impl fmt::Display for DiscoverError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (code, message) = (self.code(), self.message());
-        // A message handed through verbatim from `FieldError` or `PlanError`
-        // already carries the code (that is how the offending path keeps its
-        // `invalid_profile: ` prefix), so print it once, never twice.
-        if message
-            .strip_prefix(code)
-            .is_some_and(|rest| rest.starts_with(": "))
-        {
-            f.write_str(message)
-        } else {
-            write!(f, "{code}: {message}")
-        }
+        // Every variant stores the bare message (the code is stripped once at
+        // construction, review finding M4), so `Display` is the one place the
+        // code is prepended and it is never doubled.
+        write!(f, "{}: {}", self.code(), self.message())
     }
 }
 
 impl std::error::Error for DiscoverError {}
 
+/// Strip a leading `invalid_profile: ` from a message a source already rendered
+/// with it, so a `DiscoverError` stores the bare message and `Display` is the
+/// single place the code is added (review finding M4).
+fn bare_invalid_profile(message: String) -> String {
+    match message.strip_prefix("invalid_profile: ") {
+        Some(rest) => rest.to_string(),
+        None => message,
+    }
+}
+
 impl From<FieldError> for DiscoverError {
     fn from(err: FieldError) -> Self {
-        // `FieldError`'s rendering already starts with `invalid_profile: ` and
-        // names the offending path; keep it verbatim.
-        Self::InvalidProfile(err.to_string())
+        // `FieldError` renders with its own `invalid_profile: ` prefix; strip it
+        // once so the stored message is bare.
+        Self::InvalidProfile(bare_invalid_profile(err.to_string()))
+    }
+}
+
+impl From<PlanError> for DiscoverError {
+    fn from(err: PlanError) -> Self {
+        // `PlanError` renders with its own `invalid_profile: ` prefix; strip it
+        // once so the stored message is bare.
+        Self::InvalidProfile(bare_invalid_profile(err.to_string()))
     }
 }
 
@@ -230,28 +240,6 @@ fn capture_target(interface: &str) -> L4Target {
         dst_port: None,
         proto: L4Proto::Raw,
     }
-}
-
-/// `"<ip>:<port>"`, IPv6 bracketed so the port stays unambiguous.
-fn host_port(ip: IpAddr, port: u16) -> String {
-    match ip {
-        IpAddr::V4(v4) => format!("{v4}:{port}"),
-        IpAddr::V6(v6) => format!("[{v6}]:{port}"),
-    }
-}
-
-/// The wire name of a transport, as a target key and a point id spell it.
-const fn transport_name(proto: L4Transport) -> &'static str {
-    match proto {
-        L4Transport::Tcp => "tcp",
-        L4Transport::Udp => "udp",
-    }
-}
-
-/// `"<ip>:<port>/<proto>"` — the key a seed id and a refusal message name a
-/// target by (`crate::plan` keeps its own private copy for `TargetPlan::key`).
-fn target_key(ip: IpAddr, port: u16, proto: L4Transport) -> String {
-    format!("{}/{}", host_port(ip, port), transport_name(proto))
 }
 
 /// Whether any `Inject`/`Outbound` scope entry covers `ip:port` by CIDR and
@@ -693,7 +681,7 @@ pub fn discover_all(
     for (index, spec) in target.l4.iter().enumerate() {
         let resolved = resolve_target(guard, spec)?;
         let fields = validate_fields(ip_version(resolved.ip), resolved.proto, requested)
-            .map_err(DiscoverError::InvalidProfile)?;
+            .map_err(|message| DiscoverError::InvalidProfile(bare_invalid_profile(message)))?;
         let seeds = seed_payloads(&resolved, &profile.l4, seed_store, marker)?;
         let src_port = choose_src_port(guard, index);
 
@@ -711,9 +699,7 @@ pub fn discover_all(
         // The seed corpus is never empty, so case 0 always has a seed; a seed
         // that does not build is the operator's bytes, and is refused here
         // rather than at send time.
-        let seed = plan
-            .seed_spec(0)
-            .map_err(|err| DiscoverError::InvalidProfile(err.to_string()))?;
+        let seed = plan.seed_spec(0).map_err(DiscoverError::from)?;
         let origin = plan
             .seeds
             .first()
@@ -1244,8 +1230,16 @@ mod tests {
             let DiscoverError::InvalidProfile(message) = &err else {
                 panic!("expected invalid_profile, got {err:?}");
             };
-            assert!(message.starts_with("invalid_profile:"), "{message}");
+            // The stored message is bare; `Display` is the one place the code is
+            // added, and it is never doubled (review finding M4).
+            assert!(!message.starts_with("invalid_profile:"), "{message}");
             assert!(message.contains(pin), "{message}");
+            let rendered = err.to_string();
+            assert!(rendered.starts_with("invalid_profile:"), "{rendered}");
+            assert!(
+                !rendered.contains("invalid_profile: invalid_profile:"),
+                "{rendered}"
+            );
         }
 
         let (plans, discovery) = discover_all(

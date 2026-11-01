@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aitm_scan_model::check::L4Evidence;
@@ -28,6 +28,7 @@ use aitm_scan_model::traits::JobCtx;
 use crate::fields::FieldPath;
 use crate::oracle::CaseClass;
 use crate::plan::TargetPlan;
+use crate::sync::lock;
 
 /// The hard ceiling on cases per job (spec D8.4 "cases per job <= 5000", D11).
 /// A profile asking for more is clamped to this; nothing lifts it.
@@ -35,12 +36,6 @@ pub const CASES_CEILING: u32 = 5000;
 
 /// How many jobs the lane's state remembers before evicting the oldest.
 pub const MAX_JOBS_REMEMBERED: usize = 8;
-
-/// Take a lock without panicking on a poisoned mutex: the state behind it is
-/// plain counters, so a panic elsewhere must not take the lane down with it.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
 
 /// Why the lane stopped sending for a job.
 ///

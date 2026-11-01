@@ -476,107 +476,23 @@ fn human_wait(wait: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use aitm_proto_l4::backend::CaptureInjectBackend;
-    use aitm_proto_l4::flow::{InMemoryL4FlowStore, L4FlowStore};
     use aitm_scan_model::{
-        Check, CheckOrigin, Confidence, Discovery, InsertionKind, InsertionPoint, Intensity,
-        JobCtx, L4Oracle, LaneKind, Outcome, ScanProfile, Technique, Verdict,
+        Check, CheckOrigin, Confidence, InsertionKind, Intensity, JobCtx, L4Oracle, LaneKind,
+        Outcome, Technique, Verdict,
     };
 
     use super::{checks, crash_meta, reaction_meta, CrashCheck, ReactionCheck};
     use crate::codec::hex_encode;
-    use crate::discover::discover_all;
     use crate::fields::FieldPath;
-    use crate::host::{PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
-    use crate::plan::{point_id, TargetPlan};
-    use crate::state::{Candidate, JobKey, LaneState, StopReason};
+    use crate::host::{PacketHost, PointRunner, RunnerRegistry};
+    use crate::state::{Candidate, StopReason};
+    use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
-        fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
-        MockReply, TestJob,
+        fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply, TestJob,
     };
-
-    /// The lane context every test drives, exactly as task 9's `host.rs` tests
-    /// build it: the loopback guard, the mock backend, a lane-private case
-    /// store, a separate seed store and a `LaneState` with the job begun.
-    fn setup(
-        mock: Arc<MockBackend>,
-        profile: ScanProfile,
-        requested: &[String],
-        pps: u32,
-    ) -> (Arc<Shared>, Arc<TestJob>, Vec<TargetPlan>, Discovery) {
-        let guard = loopback_guard("*", pps);
-        let seed_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::default());
-        let case_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::with_limits(1024, 16));
-        let backend: Arc<dyn CaptureInjectBackend> = mock;
-        let job = TestJob::new(profile.clone());
-        let (plans, discovery) = discover_all(
-            guard.as_ref(),
-            backend.as_ref(),
-            Some(seed_store.as_ref()),
-            &profile.target,
-            &profile,
-            requested,
-            &job.marker(),
-        )
-        .expect("the loopback profile discovers");
-        let state = Arc::new(LaneState::new());
-        state.begin_job(
-            JobKey::new(job.job_id(), &job.marker()),
-            plans.clone(),
-            discovery.points.iter().map(|p| p.id.clone()).collect(),
-            profile.l4.cases,
-            profile.l4.consecutive_timeouts,
-            profile.l4.dry_run,
-        );
-        let shared = Arc::new(Shared {
-            guard,
-            backend,
-            case_store,
-            seed_store: Some(seed_store),
-            timing: Timing {
-                reply_window: Duration::from_millis(50),
-                liveness_retry: Duration::from_millis(10),
-                replay_spacing: Duration::from_millis(10),
-                recovery_poll: Duration::from_millis(10),
-                recovery_polls: 10,
-                ..Timing::default()
-            },
-            state,
-        });
-        (shared, job, plans, discovery)
-    }
-
-    /// The runner for one field of the job's first target.
-    fn runner_for(
-        shared: &Arc<Shared>,
-        job: &Arc<TestJob>,
-        plans: &[TargetPlan],
-        points: &[InsertionPoint],
-        field: &str,
-    ) -> Arc<PointRunner> {
-        let path = FieldPath::from_str(field).expect("a known field path");
-        let plan = plans.first().expect("one target plan").clone();
-        let id = point_id(&plan.target, path);
-        let point = points
-            .iter()
-            .find(|point| point.id == id)
-            .expect("the field's point")
-            .clone();
-        Arc::new(
-            PointRunner::new(
-                Arc::clone(shared),
-                Arc::clone(job) as Arc<dyn JobCtx>,
-                point,
-                plan,
-                path,
-            )
-            .expect("the field's seed builds"),
-        )
-    }
 
     /// A registry holding the one runner of the point under test, the way
     /// `Lane::probe_host_for` registers it before a check ever runs.

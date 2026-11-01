@@ -438,7 +438,6 @@ dependencies = [
  "aitm-scan-model",
  "anyhow",
  "futures",
- "serde",
  "serde_json",
  "tokio",
 ]

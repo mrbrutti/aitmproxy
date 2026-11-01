@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use aitm_core::{
@@ -39,10 +39,7 @@ use aitm_scan_model::{
 };
 use futures::future::BoxFuture;
 
-/// Lock a mutex, recovering a poisoned one as the rest of the tree does.
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
-}
+use crate::sync::lock;
 
 /// What [`MockBackend`] answers an injected stimulus with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -720,6 +717,116 @@ pub fn with_hex_seed(mut profile: ScanProfile, hex: &str) -> ScanProfile {
 #[must_use]
 pub fn fields(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// The shared unit-test fixtures the lane's own modules drive, so `host.rs`,
+/// `checks.rs` and `lane.rs` build one lane context the one way (review finding
+/// M3). Only compiled for tests, but `pub` so each module's `#[cfg(test)]`
+/// block reaches it through `crate::testing::harness`.
+#[cfg(test)]
+pub mod harness {
+    use std::str::FromStr;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use aitm_proto_l4::backend::CaptureInjectBackend;
+    use aitm_proto_l4::flow::{InMemoryL4FlowStore, L4FlowStore};
+    use aitm_scan_model::{Discovery, InsertionPoint, JobCtx, ScanProfile};
+
+    use super::{loopback_guard, MockBackend, TestJob};
+    use crate::discover::discover_all;
+    use crate::fields::FieldPath;
+    use crate::host::{PointRunner, Shared, Timing};
+    use crate::plan::{point_id, TargetPlan};
+    use crate::state::{JobKey, LaneState};
+
+    /// Millisecond timings, so a hundred cases cost milliseconds while the
+    /// recovery ladder keeps its ten polls (so inject counts stay exact).
+    #[must_use]
+    pub fn fast_timing() -> Timing {
+        Timing {
+            reply_window: Duration::from_millis(50),
+            liveness_retry: Duration::from_millis(10),
+            replay_spacing: Duration::from_millis(10),
+            recovery_poll: Duration::from_millis(10),
+            recovery_polls: 10,
+            ..Timing::default()
+        }
+    }
+
+    /// The lane context every unit test drives: the loopback guard, the mock
+    /// backend, a lane-private case store, a separate seed store and a
+    /// `LaneState` with the job already begun, timed by [`fast_timing`].
+    #[must_use]
+    pub fn setup(
+        mock: Arc<MockBackend>,
+        profile: ScanProfile,
+        requested: &[String],
+        pps: u32,
+    ) -> (Arc<Shared>, Arc<TestJob>, Vec<TargetPlan>, Discovery) {
+        let guard = loopback_guard("*", pps);
+        let seed_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::default());
+        let case_store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::with_limits(1024, 16));
+        let backend: Arc<dyn CaptureInjectBackend> = mock;
+        let job = TestJob::new(profile.clone());
+        let (plans, discovery) = discover_all(
+            guard.as_ref(),
+            backend.as_ref(),
+            Some(seed_store.as_ref()),
+            &profile.target,
+            &profile,
+            requested,
+            &job.marker(),
+        )
+        .expect("the loopback profile discovers");
+        let state = Arc::new(LaneState::new());
+        state.begin_job(
+            JobKey::new(job.job_id(), &job.marker()),
+            plans.clone(),
+            discovery.points.iter().map(|p| p.id.clone()).collect(),
+            profile.l4.cases,
+            profile.l4.consecutive_timeouts,
+            profile.l4.dry_run,
+        );
+        let shared = Arc::new(Shared {
+            guard,
+            backend,
+            case_store,
+            seed_store: Some(seed_store),
+            timing: fast_timing(),
+            state,
+        });
+        (shared, job, plans, discovery)
+    }
+
+    /// The runner for one field of the job's first target.
+    #[must_use]
+    pub fn runner_for(
+        shared: &Arc<Shared>,
+        job: &Arc<TestJob>,
+        plans: &[TargetPlan],
+        points: &[InsertionPoint],
+        field: &str,
+    ) -> Arc<PointRunner> {
+        let path = FieldPath::from_str(field).expect("a known field path");
+        let plan = plans.first().expect("one target plan").clone();
+        let id = point_id(&plan.target, path);
+        let point = points
+            .iter()
+            .find(|point| point.id == id)
+            .expect("the field's point")
+            .clone();
+        Arc::new(
+            PointRunner::new(
+                Arc::clone(shared),
+                Arc::clone(job) as Arc<dyn JobCtx>,
+                point,
+                plan,
+                path,
+            )
+            .expect("the field's seed builds"),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ pub mod oracle;
 pub mod plan;
 pub mod rng;
 pub mod state;
+pub(crate) mod sync;
 #[doc(hidden)]
 pub mod testing;
 

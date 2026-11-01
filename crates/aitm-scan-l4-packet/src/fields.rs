@@ -26,19 +26,11 @@ pub enum IpVersion {
 impl IpVersion {
     /// The path prefix this version's fields carry (`ipv4` or `ipv6`).
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::V4 => "ipv4",
             Self::V6 => "ipv6",
         }
-    }
-}
-
-/// The path prefix a transport's fields carry (`udp` or `tcp`).
-const fn transport_name(transport: L4Transport) -> &'static str {
-    match transport {
-        L4Transport::Udp => "udp",
-        L4Transport::Tcp => "tcp",
     }
 }
 
@@ -84,7 +76,7 @@ impl Ipv4Field {
 
     /// The field's name inside the `ipv4.` path.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Ttl => "ttl",
             Self::Ihl => "ihl",
@@ -131,7 +123,7 @@ impl Ipv6Field {
 
     /// The field's name inside the `ipv6.` path.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::HopLimit => "hop_limit",
             Self::PayloadLength => "payload_length",
@@ -163,7 +155,7 @@ impl UdpField {
 
     /// The field's name inside the `udp.` path.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::SrcPort => "src_port",
             Self::Length => "length",
@@ -212,7 +204,7 @@ impl TcpField {
 
     /// The field's name inside the `tcp.` path.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::SrcPort => "src_port",
             Self::Seq => "seq",
@@ -328,7 +320,7 @@ impl FieldPath {
 
     /// Whether the field exists on a target of this IP version and transport.
     #[must_use]
-    pub const fn applies_to(&self, ip: IpVersion, transport: L4Transport) -> bool {
+    pub(crate) const fn applies_to(&self, ip: IpVersion, transport: L4Transport) -> bool {
         match self {
             Self::Ipv4(_) => matches!(ip, IpVersion::V4),
             Self::Ipv6(_) => matches!(ip, IpVersion::V6),
@@ -485,7 +477,7 @@ pub fn validate_fields(
     if requested.is_empty() {
         return Ok(default_fields(ip, transport));
     }
-    let target = format!("{}/{}", ip.name(), transport_name(transport));
+    let target = format!("{}/{}", ip.name(), crate::plan::transport_name(transport));
     let mut out: Vec<FieldPath> = Vec::with_capacity(requested.len());
     for entry in requested {
         let trimmed = entry.trim();

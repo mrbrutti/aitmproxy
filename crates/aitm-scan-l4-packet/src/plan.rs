@@ -299,20 +299,27 @@ impl TargetPlan {
     }
 }
 
-/// The wire name of a transport, as a point id and a scope entry spell it.
-const fn transport_name(proto: L4Transport) -> &'static str {
+/// The wire name of a transport, as a point id, a target key and a scope entry
+/// spell it. The one copy for the whole lane (review finding M3).
+pub(crate) const fn transport_name(proto: L4Transport) -> &'static str {
     match proto {
         L4Transport::Tcp => "tcp",
         L4Transport::Udp => "udp",
     }
 }
 
-/// `"<ip>:<port>/<proto>"`, IPv6 bracketed so the port stays unambiguous.
-fn target_key(ip: IpAddr, port: u16, proto: L4Transport) -> String {
+/// `"<ip>:<port>"`, IPv6 bracketed so the port stays unambiguous.
+pub(crate) fn host_port(ip: IpAddr, port: u16) -> String {
     match ip {
-        IpAddr::V4(v4) => format!("{v4}:{port}/{}", transport_name(proto)),
-        IpAddr::V6(v6) => format!("[{v6}]:{port}/{}", transport_name(proto)),
+        IpAddr::V4(v4) => format!("{v4}:{port}"),
+        IpAddr::V6(v6) => format!("[{v6}]:{port}"),
     }
+}
+
+/// `"<ip>:<port>/<proto>"`, IPv6 bracketed so the port stays unambiguous. The
+/// one copy for the whole lane (review finding M3).
+pub(crate) fn target_key(ip: IpAddr, port: u16, proto: L4Transport) -> String {
+    format!("{}/{}", host_port(ip, port), transport_name(proto))
 }
 
 /// The insertion-point id for one `(target, field)` pair:

@@ -31,7 +31,7 @@ use futures::future::BoxFuture;
 use crate::checks::checks;
 use crate::discover::discover_all;
 use crate::host::{PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
-use crate::plan::{parse_point_id, requested_fields};
+use crate::plan::{parse_point_id, requested_fields, target_key};
 use crate::state::{JobKey, JobStats, LaneState};
 
 /// How many case flows the lane's own store holds before it evicts the oldest.
@@ -123,12 +123,8 @@ impl PacketLane {
     pub fn with_timing(mut self, timing: Timing) -> Self {
         if let Some(shared) = self.inner.take() {
             self.inner = Some(Arc::new(Shared {
-                guard: Arc::clone(&shared.guard),
-                backend: Arc::clone(&shared.backend),
-                case_store: Arc::clone(&shared.case_store),
-                seed_store: shared.seed_store.clone(),
                 timing,
-                state: Arc::clone(&shared.state),
+                ..(*shared).clone()
             }));
         }
         self
@@ -299,14 +295,12 @@ impl Lane for PacketLane {
                 point.id
             ));
         }
-        let (.., field) = parse_point_id(&point.id)
+        // The point id round-trips through `parse_point_id` to the target it
+        // names, and the plan is found by that target's key — no string surgery
+        // on the id itself (review finding M3).
+        let (ip, port, proto, field) = parse_point_id(&point.id)
             .ok_or_else(|| anyhow!("point {} is not a packet-lane point id", point.id))?;
-        let suffix = format!("/{field}");
-        let key = point
-            .id
-            .strip_prefix("l4:")
-            .and_then(|rest| rest.strip_suffix(suffix.as_str()))
-            .ok_or_else(|| anyhow!("point {} names no target", point.id))?;
+        let key = target_key(ip, port, proto);
         let plan = shared
             .state
             .plans(&job_id)
@@ -349,7 +343,6 @@ pub fn build(
 mod tests {
     use std::net::IpAddr;
     use std::sync::Arc;
-    use std::time::Duration;
 
     use aitm_proto_l4::backend::CaptureInjectBackend;
     use aitm_proto_l4::config::L4Config;
@@ -373,16 +366,10 @@ mod tests {
     const JOB_ID: &str = "scan-1a2b3c4d";
 
     /// Millisecond timings, so a hundred cases cost milliseconds; task 9's
-    /// recovery ladder keeps its ten polls so inject counts stay exact.
+    /// recovery ladder keeps its ten polls so inject counts stay exact. The one
+    /// copy lives in the shared harness (review finding M3).
     fn fast() -> Timing {
-        Timing {
-            reply_window: Duration::from_millis(50),
-            liveness_retry: Duration::from_millis(10),
-            replay_spacing: Duration::from_millis(10),
-            recovery_poll: Duration::from_millis(10),
-            recovery_polls: 10,
-            ..Timing::default()
-        }
+        crate::testing::harness::fast_timing()
     }
 
     /// A lane over the mock backend, the loopback guard and [`fast`] timings.
