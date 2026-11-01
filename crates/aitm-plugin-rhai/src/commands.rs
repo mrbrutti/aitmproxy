@@ -171,8 +171,9 @@ struct ScriptFindings {
 /// `on_request` runs on the next event. `restart_required` is `true` only when
 /// the script registers commands or options — those still need a restart,
 /// because the command/option `Registry` is sealed once built. Saving over a
-/// script that is already loaded swaps its AST through the shared handle,
-/// exactly as `script.reload` does, so the new hooks run live too.
+/// script that is already loaded swaps its AST through the shared handle and
+/// re-runs its `load(reg)`, exactly as `script.reload` does, so the new hooks
+/// run live and its checks are replaced in the catalogue too.
 struct Save {
     loader: Arc<RhaiLoader>,
     scripts: ScriptSet,
@@ -345,16 +346,7 @@ impl Command for Reload {
         let hooks = meta.hooks.clone();
         handle.swap(ast, meta);
         self.errors.clear(&name);
-        // The new source's `load(reg)` decides which checks this script now
-        // provides; the bridge replaces exactly this script's catalogue entries
-        // (and refreshes its option defaults). The hooks are already live, so a
-        // failure here is reported as such — not as "nothing changed".
-        script.rerun_load().map_err(|err| {
-            anyhow::anyhow!(
-                "script `{name}` recompiled and its hooks are live, but its load(reg) failed, \
-                 so its checks were not re-registered: {err}"
-            )
-        })?;
+        rerun_load_after_swap(&script, &name)?;
         tracing::info!(
             target: "aitm_plugin_rhai::loader",
             script = %name,
@@ -564,9 +556,11 @@ impl Command for Save {
 
         let registers = &validated.registers;
         let registers_present = !registers.commands.is_empty() || !registers.options.is_empty();
-        let restart_required = match self.scripts.find_handle(&name) {
-            Some(handle) => {
-                // Overwrite: `script.reload` semantics over the file just written.
+        let restart_required = match self.scripts.find(&name) {
+            Some(script) => {
+                // Overwrite: `script.reload` semantics over the file just written,
+                // checks included.
+                let handle = script.handle();
                 let (ast, fresh) = self
                     .loader
                     .compile(&path)
@@ -578,6 +572,7 @@ impl Command for Save {
                 // cannot keep its operator-level seam powers (fail-closed).
                 handle.set_authoring_trust(CallerTrust::from(host.frontend()));
                 self.errors.clear(&name);
+                rerun_load_after_swap(&script, &name)?;
                 tracing::info!(
                     target: "aitm_plugin_rhai::loader",
                     script = %name,
@@ -617,7 +612,8 @@ impl Command for Save {
                         restart_required = registers_present,
                         "script saved and appended live; its hooks run with no restart"
                     );
-                } else if let Some(handle) = self.scripts.find_handle(&name) {
+                } else if let Some(script) = self.scripts.find(&name) {
+                    let handle = script.handle();
                     let (ast, fresh) = self
                         .loader
                         .compile(&path)
@@ -626,6 +622,7 @@ impl Command for Save {
                     handle.set_enabled(enable);
                     handle.set_authoring_trust(CallerTrust::from(host.frontend()));
                     self.errors.clear(&name);
+                    rerun_load_after_swap(&script, &name)?;
                     tracing::info!(
                         target: "aitm_plugin_rhai::loader",
                         script = %name,
@@ -758,6 +755,21 @@ impl Command for List {
 /// Read from the live set, so a script appended at runtime is found.
 fn find_script(scripts: &ScriptSet, name: &str) -> anyhow::Result<Arc<ScriptHandle>> {
     find_loaded(scripts, name).map(|script| script.handle())
+}
+
+/// After a recompiled AST was swapped in (`script.reload`, or `script.save`
+/// over a loaded script), re-run the script's `load(reg)`: the new source
+/// decides which checks this script now provides, and the bridge replaces
+/// exactly this script's catalogue entries (and refreshes its option
+/// defaults). The hooks are already live, so a failure here is reported as
+/// such — not as "nothing changed" — in one wording for both commands.
+fn rerun_load_after_swap(script: &LoadedScript, name: &str) -> anyhow::Result<()> {
+    script.rerun_load().map_err(|err| {
+        anyhow::anyhow!(
+            "script `{name}` recompiled and its hooks are live, but its load(reg) failed, \
+             so its checks were not re-registered: {err}"
+        )
+    })
 }
 
 /// The loaded script itself (`script.reload` re-runs its `load`), or the same

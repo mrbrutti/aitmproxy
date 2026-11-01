@@ -74,6 +74,11 @@ struct Harness {
 
 impl Harness {
     fn new(scripts: Vec<ScriptEntry>) -> Self {
+        Self::with_scripts_dir(scripts, None)
+    }
+
+    /// `new`, with `rhai.scripts_dir` set so `script.save` is allowed to write.
+    fn with_scripts_dir(scripts: Vec<ScriptEntry>, scripts_dir: Option<PathBuf>) -> Self {
         let store = Arc::new(MemFlowStore::new());
         let services = ScriptServices {
             store: store.clone(),
@@ -85,6 +90,7 @@ impl Harness {
         };
         let cfg = RhaiConfig {
             scripts,
+            scripts_dir,
             ..RhaiConfig::default()
         };
         let tier = wire::build(cfg, services).expect("tier builds");
@@ -102,19 +108,33 @@ impl Harness {
 
     /// `script.reload { name }` as the human CLI invokes it.
     fn reload(&self, name: &str) -> anyhow::Result<Value> {
+        self.invoke(
+            "script.reload",
+            BTreeMap::from([("name".to_string(), Value::Str(name.to_string()))]),
+        )
+    }
+
+    /// `script.save { name, source }` as the human CLI invokes it.
+    fn save(&self, name: &str, source: &str) -> anyhow::Result<Value> {
+        self.invoke(
+            "script.save",
+            BTreeMap::from([
+                ("name".to_string(), Value::Str(name.to_string())),
+                ("source".to_string(), Value::Str(source.to_string())),
+            ]),
+        )
+    }
+
+    fn invoke(&self, command: &str, params: BTreeMap<String, Value>) -> anyhow::Result<Value> {
         let cmd = self
             .registry
-            .command("script.reload")
-            .expect("script.reload is registered");
+            .command(command)
+            .unwrap_or_else(|| panic!("{command} is registered"));
         let client = StubClient;
         let guard = StdGuard::default();
         let host = CommandHost::new(self.store.as_ref(), &client, &guard, None)
             .with_frontend(Frontend::Cli);
-        let params = Params::new(BTreeMap::from([(
-            "name".to_string(),
-            Value::Str(name.to_string()),
-        )]));
-        cmd.invoke(params, &host)
+        cmd.invoke(Params::new(params), &host)
     }
 
     /// The catalogue's check ids, in `snapshot()` (sorted) order.
@@ -266,4 +286,38 @@ async fn script_reload_whose_load_throws_reports_the_load_error() {
         vec!["r1".to_string()],
         "a load that throws installs nothing; the previous checks stay"
     );
+}
+
+/// `script.save` over an already-loaded script has `script.reload` semantics,
+/// checks included: the saved source's `load(reg)` is re-run, so the catalogue
+/// holds exactly the new file's checks and the old one is gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn script_save_over_a_loaded_script_swaps_its_checks() {
+    let dir = TempScripts::new();
+    let target = dir.write("target", &check_src("target", "r1", "Round one"));
+    let h = Harness::with_scripts_dir(vec![ScriptEntry::new(&target)], Some(dir.0.clone()));
+    assert_eq!(h.ids(), vec!["r1".to_string()]);
+
+    let out = h
+        .save("target", &check_src("target", "r2", "Round two"))
+        .expect("overwrite-save of a compiling script succeeds");
+    match &out {
+        Value::Object(fields) => assert_eq!(
+            fields.get("restart_required"),
+            Some(&Value::Bool(false)),
+            "a check needs no restart; only commands/options do: {out:?}"
+        ),
+        other => panic!("the reply is an object, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("file"),
+        check_src("target", "r2", "Round two"),
+        "the file was written"
+    );
+    assert_eq!(
+        h.ids(),
+        vec!["r2".to_string()],
+        "the saved script's checks are exactly the new source's"
+    );
+    assert_eq!(h.checks.snapshot()[0].meta().name, "Round two");
 }
