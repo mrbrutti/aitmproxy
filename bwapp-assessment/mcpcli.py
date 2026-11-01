@@ -41,8 +41,21 @@ class Bus:
         })
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
 
+    def _wire(self, direction, line):
+        path = os.environ.get("AITM_WIRE")
+        if not path:
+            return
+        red = line
+        # Redact the bare token-handshake line so the transcript carries no secret.
+        if '"token"' in line and '"method"' not in line:
+            red = '{"token":"<redacted>"}'
+        with open(path, "a") as f:
+            f.write("%s %s\n" % (direction, red))
+
     def _send(self, obj):
-        self.sock.sendall((json.dumps(obj) + "\n").encode())
+        line = json.dumps(obj)
+        self._wire("-> SEND", line)
+        self.sock.sendall((line + "\n").encode())
 
     def _readline(self):
         while b"\n" not in self.buf:
@@ -51,7 +64,9 @@ class Bus:
                 raise RuntimeError("bus closed")
             self.buf += chunk
         line, self.buf = self.buf.split(b"\n", 1)
-        return line.decode()
+        line = line.decode()
+        self._wire("<- RECV", line)
+        return line
 
     def rpc(self, method, params):
         self._id += 1
