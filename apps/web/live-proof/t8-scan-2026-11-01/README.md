@@ -15,3 +15,10 @@ obscura so the client crawl stood in.
 Files: one screenshot per step (`NN-*.png`), the witness bus transcript (`bus-transcript.jsonl`; the
 single-use confirm tokens and URL fragments are scrubbed), and the step log with the `--json` summary
 (`scan-live.log`). Nothing here came from the fixture pack.
+
+## Re-run after merging main `e12b3e20` (6b812662)
+
+Main's #247 rewrote `apps/web/src/panels/l4/inject.ts`, which the launch handshake imports, so the proof
+was re-run on the merged head against the same `ca852f71` engine: **26 PASS · 0 FAIL · 1 GAP** (the same
+8b GAP). Step log: `scan-live-after-main-merge.log`. Web gate on the merged head: typecheck 0, vitest
+870/870, build 0.
