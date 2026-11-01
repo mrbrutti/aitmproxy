@@ -434,6 +434,64 @@ struct MonitorTable {
     lost_ids: HashSet<String>,
 }
 
+impl MonitorTable {
+    /// The monitor held for `key`, if any.
+    fn get(&self, key: &str) -> Option<Arc<SessionMonitor>> {
+        self.monitors.get(key).map(Arc::clone)
+    }
+
+    /// Whether `key`'s last monitor was evicted while lost (S-M5), so a
+    /// rebuilt one must start lost.
+    fn was_lost(&self, key: &str) -> bool {
+        self.lost_ids.contains(key)
+    }
+
+    /// Hold `monitor` for `key`, newest in the eviction order.
+    fn insert(&mut self, key: String, monitor: Arc<SessionMonitor>) {
+        self.monitors.insert(key.clone(), monitor);
+        self.order.push_back(key);
+    }
+
+    /// Whether more monitors are held than [`MAX_SESSION_MONITORS`].
+    fn over_capacity(&self) -> bool {
+        self.monitors.len() > MAX_SESSION_MONITORS
+    }
+
+    /// Evict the oldest monitor, remembering its job when the monitor was
+    /// lost; `false` when there was nothing to evict.
+    fn evict_oldest(&mut self) -> bool {
+        let Some(oldest) = self.order.pop_front() else {
+            return false;
+        };
+        let was_lost = self
+            .monitors
+            .remove(&oldest)
+            .is_some_and(|evicted| evicted.is_lost());
+        if was_lost {
+            tracing::debug!(job = %oldest, "scan: evicting a lost session monitor");
+            self.remember_lost(oldest);
+        }
+        true
+    }
+
+    /// Remember that `key`'s monitor was evicted lost, keeping at most
+    /// [`MAX_LOST_MONITOR_IDS`] such jobs, the oldest forgotten first.
+    fn remember_lost(&mut self, key: String) {
+        if !self.lost_ids.insert(key.clone()) {
+            return;
+        }
+        self.lost_order.push_back(key);
+        while self.lost_ids.len() > MAX_LOST_MONITOR_IDS {
+            match self.lost_order.pop_front() {
+                Some(stale) => {
+                    self.lost_ids.remove(&stale);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
 /// One [`SessionMonitor`] per job, bounded at [`MAX_SESSION_MONITORS`].
 ///
 /// Every host of a job shares its monitor, so a loss seen by one probe stops
@@ -461,8 +519,8 @@ impl SessionMonitors {
             .inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if let Some(found) = table.monitors.get(&key) {
-            return Arc::clone(found);
+        if let Some(found) = table.get(&key) {
+            return found;
         }
 
         let profile = job.profile();
@@ -484,32 +542,13 @@ impl SessionMonitors {
         let monitor = Arc::new(monitor);
         // A rebuilt monitor for a job whose monitor was evicted while lost starts
         // lost, so probing does not resume after a `session_lost` stop (S-M5).
-        if table.lost_ids.contains(&key) {
+        if table.was_lost(&key) {
             monitor.force_lost();
         }
-        table.monitors.insert(key.clone(), Arc::clone(&monitor));
-        table.order.push_back(key);
-        while table.monitors.len() > MAX_SESSION_MONITORS {
-            let Some(oldest) = table.order.pop_front() else {
+        table.insert(key, Arc::clone(&monitor));
+        while table.over_capacity() {
+            if !table.evict_oldest() {
                 break;
-            };
-            let was_lost = table
-                .monitors
-                .remove(&oldest)
-                .is_some_and(|evicted| evicted.is_lost());
-            if was_lost {
-                tracing::debug!(job = %oldest, "scan: evicting a lost session monitor");
-                if table.lost_ids.insert(oldest.clone()) {
-                    table.lost_order.push_back(oldest);
-                    while table.lost_ids.len() > MAX_LOST_MONITOR_IDS {
-                        match table.lost_order.pop_front() {
-                            Some(stale) => {
-                                table.lost_ids.remove(&stale);
-                            }
-                            None => break,
-                        }
-                    }
-                }
             }
         }
         monitor
