@@ -54,6 +54,12 @@ const MAX_HTML_BYTES: usize = 2 * 1024 * 1024;
 /// Fields one form contributes to its submission.
 const MAX_FORM_FIELDS: usize = 32;
 
+/// Tags parsed from one page, across the page walk and every form's field
+/// scan together, before extraction stops. Together with the per-form bound
+/// below it makes the work a page can demand linear in the page, whatever its
+/// structure (security review, whole branch, 2026-11-01).
+pub const MAX_TAGS_PER_PAGE: usize = 50_000;
+
 /// Attributes read from one tag.
 const MAX_ATTRS: usize = 64;
 
@@ -193,9 +199,21 @@ pub(crate) async fn crawl_with_client(origin: &str, job: &dyn JobCtx) -> ClientC
             if let Some(bytes) = crate::discover::body_bytes(&response.body) {
                 // Bounded before the decode, so a huge page costs the scan one
                 // bounded copy rather than its own size.
-                let head = &bytes[..bytes.len().min(MAX_HTML_BYTES)];
-                let text = String::from_utf8_lossy(head);
-                found.extend(navigations(&nav.url, &text, submit_forms));
+                let head = bytes[..bytes.len().min(MAX_HTML_BYTES)].to_vec();
+                let base = nav.url.clone();
+                // The extractor is synchronous and bounded, but a 2 MiB page
+                // is still real CPU: it runs on a blocking thread so it never
+                // holds a runtime worker the other jobs need (security
+                // review, whole branch, 2026-11-01). A parse that panicked
+                // contributes nothing rather than ending the crawl.
+                let parsed = tokio::task::spawn_blocking(move || {
+                    let text = String::from_utf8_lossy(&head);
+                    navigations(&base, &text, submit_forms)
+                })
+                .await;
+                if let Ok(navs) = parsed {
+                    found.extend(navs);
+                }
             }
         }
 
@@ -299,6 +317,10 @@ pub fn navigations(base: &Url, html: &str, submit_forms: bool) -> Vec<Navigation
     let mut out: Vec<Navigation> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut i = 0;
+    // One budget of tag parses for the whole page, spent by this walk and by
+    // every form's field scan, so the work a page can demand is bounded by
+    // its length and not by its structure.
+    let mut budget = MAX_TAGS_PER_PAGE;
 
     let mut push = |nav: Option<Navigation>, out: &mut Vec<Navigation>| {
         if let Some(nav) = nav {
@@ -308,22 +330,23 @@ pub fn navigations(base: &Url, html: &str, submit_forms: bool) -> Vec<Navigation
         }
     };
 
-    while out.len() < MAX_LINKS_PER_PAGE {
+    while out.len() < MAX_LINKS_PER_PAGE && budget > 0 {
         let Some(tag) = next_tag(html, i) else {
             break;
         };
+        budget -= 1;
         i = tag.end;
         match tag.name.as_str() {
             "a" | "area" => push(link(base, tag.attr("href")), &mut out),
             "form" => {
                 if submit_forms {
-                    push(form(base, &tag, html), &mut out);
+                    push(form(base, &tag, html, &mut budget), &mut out);
                 }
             }
             // Raw text, not markup: skip the content, keep the `src`.
             "script" | "style" => {
                 push(link(base, tag.attr("src")), &mut out);
-                i = find_close_tag(html, &tag.name, tag.end).unwrap_or(html.len());
+                i = find_close_tag(html, &tag.name, tag.end, html.len()).unwrap_or(html.len());
             }
             "img" | "iframe" | "frame" | "source" | "embed" | "track" | "audio" | "video"
             | "input" => push(link(base, tag.attr("src")), &mut out),
@@ -341,8 +364,9 @@ fn link(base: &Url, href: Option<&str>) -> Option<Navigation> {
 }
 
 /// The navigation one `<form>` describes, `None` when the crawl will not
-/// submit it.
-fn form(base: &Url, tag: &Tag, html: &str) -> Option<Navigation> {
+/// submit it. `budget` is the page's remaining tag budget, which the field
+/// scan draws on.
+fn form(base: &Url, tag: &Tag, html: &str, budget: &mut usize) -> Option<Navigation> {
     let enctype = tag.attr("enctype").unwrap_or("").to_ascii_lowercase();
     if !enctype.is_empty() && !enctype.contains("application/x-www-form-urlencoded") {
         return None;
@@ -353,7 +377,7 @@ fn form(base: &Url, tag: &Tag, html: &str) -> Option<Navigation> {
         action => resolve(base, action)?,
     };
     let encoded = url::form_urlencoded::Serializer::new(String::new())
-        .extend_pairs(fields(html, tag.end))
+        .extend_pairs(fields(html, tag.end, budget))
         .finish();
     let post = tag
         .attr("method")
@@ -370,18 +394,28 @@ fn form(base: &Url, tag: &Tag, html: &str) -> Option<Navigation> {
 }
 
 /// The `(name, value)` pairs a form submits, read from the controls between
-/// its opening tag and `</form>`.
-fn fields(html: &str, from: usize) -> Vec<(String, String)> {
-    let end = find_close_tag(html, "form", from).unwrap_or(html.len());
+/// its opening tag and the end of the form.
+///
+/// Forms do not nest, so a form ends at its `</form>` **or** at the next
+/// `<form`, whichever comes first: an unclosed form does not swallow the
+/// controls of the one after it, and — because every form's scan is confined
+/// to its own stretch of the page — a page of N unclosed forms costs N scans
+/// of disjoint ranges, not N scans to the end of the document (security
+/// review, whole branch, 2026-11-01). `budget` is the page's remaining tag
+/// budget; each tag parsed here spends one unit of it.
+fn fields(html: &str, from: usize, budget: &mut usize) -> Vec<(String, String)> {
+    let next_form = find_open_tag(html, "form", from).unwrap_or(html.len());
+    let end = find_close_tag(html, "form", from, next_form).unwrap_or(next_form);
     let mut fields: Vec<(String, String)> = Vec::new();
     let mut i = from;
-    while fields.len() < MAX_FORM_FIELDS {
+    while fields.len() < MAX_FORM_FIELDS && *budget > 0 {
         let Some(tag) = next_tag(html, i) else {
             break;
         };
         if tag.end > end {
             break;
         }
+        *budget -= 1;
         i = tag.end;
         if !matches!(tag.name.as_str(), "input" | "select" | "textarea") {
             continue;
@@ -590,9 +624,13 @@ fn push_attr(attrs: &mut Vec<(String, String)>, name: String, value: String) {
     attrs.push((name, value));
 }
 
-/// The index just past `</tag`, searched case-insensitively from `from`.
-fn find_close_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
-    let hay = &html.as_bytes()[from.min(html.len())..];
+/// The index just past `</tag`, searched case-insensitively in
+/// `html[from..until]`. The bound is what keeps a search linear: a caller
+/// that knows where the element must have ended passes that, never the end
+/// of the document.
+fn find_close_tag(html: &str, tag: &str, from: usize, until: usize) -> Option<usize> {
+    let from = from.min(html.len());
+    let hay = &html.as_bytes()[from..until.clamp(from, html.len())];
     let tag = tag.as_bytes();
     let needle_len = tag.len() + 2;
     if hay.len() < needle_len {
@@ -605,6 +643,27 @@ fn find_close_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
                 && hay[i + 2..i + needle_len].eq_ignore_ascii_case(tag)
         })
         .map(|i| from + i + needle_len)
+}
+
+/// The index of the `<` of the next `<tag` opening tag at or after `from`,
+/// matched case-insensitively and whole (`<formal` is not `<form`).
+fn find_open_tag(html: &str, tag: &str, from: usize) -> Option<usize> {
+    let from = from.min(html.len());
+    let hay = &html.as_bytes()[from..];
+    let tag = tag.as_bytes();
+    let needle_len = tag.len() + 1;
+    if hay.len() < needle_len {
+        return None;
+    }
+    (0..=hay.len() - needle_len)
+        .find(|&i| {
+            hay[i] == b'<'
+                && hay[i + 1..i + needle_len].eq_ignore_ascii_case(tag)
+                && !hay
+                    .get(i + needle_len)
+                    .is_some_and(u8::is_ascii_alphanumeric)
+        })
+        .map(|i| from + i)
 }
 
 /// Decode the entities an attribute value commonly carries. `&amp;` is decoded
@@ -813,5 +872,84 @@ mod tests {
             .collect();
 
         assert_eq!(navigations(&base(), &html, true).len(), MAX_LINKS_PER_PAGE);
+    }
+
+    /// Security review (whole branch, 2026-11-01): forms do not nest, so a
+    /// form's fields end at the next `<form` as well as at `</form>`. An
+    /// unclosed form must not swallow the next form's controls — and a hostile
+    /// page must not make every form re-scan the rest of the document.
+    #[test]
+    fn nested_or_unclosed_forms_end_at_the_next_form_tag() {
+        let navs = navigations(
+            &base(),
+            "<form action=\"/a\"><input name=\"x\">\
+             <form action=\"/b\"><input name=\"y\"></form>\
+             <form action=\"/c\"><input name=\"z\">",
+            true,
+        );
+
+        assert_eq!(
+            shape(&navs),
+            vec![
+                ("GET", "http://target.test/a?x=a", None),
+                ("GET", "http://target.test/b?y=a", None),
+                ("GET", "http://target.test/c?z=a", None),
+            ]
+        );
+    }
+
+    /// Security review (whole branch, 2026-11-01): a 2 MiB page made of
+    /// nothing but unclosed forms used to cost O(N^2) tag parses — minutes of
+    /// CPU on a pinned runtime worker. Extraction is linear in the page and
+    /// bounded by [`MAX_TAGS_PER_PAGE`], so it finishes in well under a
+    /// second, and the one navigation the forms describe is all that comes
+    /// out.
+    #[test]
+    fn a_two_mebibyte_page_of_unclosed_forms_is_extracted_in_bounded_time() {
+        let unit = "<form action=\"/x\"><input name=\"a\">";
+        let html: String =
+            std::iter::repeat_n(unit, MAX_HTML_BYTES / unit.len() + 1).collect::<String>();
+        assert!(
+            html.len() >= MAX_HTML_BYTES,
+            "the page fills the scanned head"
+        );
+
+        // Parse on a helper thread so a regression fails in seconds rather
+        // than pinning the test run for the half hour the old code took.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let navs = navigations(&base(), &html, true);
+            let _ = tx.send((started.elapsed(), shape(&navs).len(), navs));
+        });
+        let (elapsed, count, navs) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("extraction finished within 10 s (a regression to quadratic time)");
+
+        eprintln!("2 MiB page of unclosed forms extracted in {elapsed:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "a 2 MiB page of unclosed forms took {elapsed:?}"
+        );
+        assert_eq!(count, 1, "every form is the same navigation");
+        assert_eq!(
+            shape(&navs),
+            vec![("GET", "http://target.test/x?a=a", None)]
+        );
+    }
+
+    /// The per-page tag budget bounds the work a page can demand: once
+    /// [`MAX_TAGS_PER_PAGE`] tags have been parsed, extraction stops, so an
+    /// anchor past that point is not reached.
+    #[test]
+    fn extraction_stops_once_the_tag_budget_is_spent() {
+        let mut html: String = "<a href=\"/first\">first</a>".to_string();
+        html.extend(std::iter::repeat_n("<b>", MAX_TAGS_PER_PAGE));
+        html.push_str("<a href=\"/last\">last</a>");
+
+        assert_eq!(
+            shape(&navigations(&base(), &html, true)),
+            vec![("GET", "http://target.test/first", None)]
+        );
     }
 }

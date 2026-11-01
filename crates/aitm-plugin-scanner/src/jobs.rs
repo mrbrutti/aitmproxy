@@ -178,7 +178,7 @@ impl JobRegistry {
     ///
     /// An id the registry already holds is **not** overwritten: a live job's
     /// handles are never dropped on the floor by a colliding mint. [`start`]
-    /// mints through [`JobRegistry::try_insert`] and re-mints instead.
+    /// mints through [`JobRegistry::admit`], which re-mints instead.
     pub fn insert(&self, entry: JobEntry) {
         let _ = self.try_insert(entry);
     }
@@ -205,6 +205,45 @@ impl JobRegistry {
     /// Whether the registry already holds this id.
     fn holds(&self, id: &str) -> bool {
         self.lock().contains_key(id)
+    }
+
+    /// `scan.start`'s concurrency gate and admission as **one** critical
+    /// section (spec D5 "Registry"/`busy`; security review, whole branch,
+    /// 2026-11-01): the `max_jobs` ceiling and the per-origin single flight
+    /// are checked, a free id is minted and the entry `build(id)` returns is
+    /// inserted, all under the same lock, so two callers racing each other
+    /// cannot both see a free slot and both take it.
+    ///
+    /// `build` runs under the lock: it must only assemble the entry (it is
+    /// handed the minted id to stamp on the status) and never touch the
+    /// registry.
+    pub fn admit(
+        &self,
+        max_jobs: usize,
+        origins: &[String],
+        build: impl FnOnce(&JobId) -> JobEntry,
+    ) -> Result<JobId, AdmitRefused> {
+        let mut inner = self.lock();
+        if active_count_in(&inner) >= max_jobs {
+            return Err(AdmitRefused::MaxJobs);
+        }
+        let active = active_origins_in(&inner);
+        if let Some(origin) = origins.iter().find(|o| active.contains(*o)) {
+            return Err(AdmitRefused::Origin(origin.clone()));
+        }
+        let mut id = None;
+        for _ in 0..MAX_ID_ATTEMPTS {
+            let candidate = util::job_id();
+            if !inner.contains_key(&candidate) {
+                id = Some(candidate);
+                break;
+            }
+        }
+        let Some(id) = id else {
+            return Err(AdmitRefused::NoFreeId);
+        };
+        inner.insert(id.clone(), build(&id));
+        Ok(id)
     }
 
     /// A snapshot of one job's status.
@@ -255,31 +294,12 @@ impl JobRegistry {
 
     /// How many jobs are not yet terminal.
     pub fn active_count(&self) -> usize {
-        self.lock()
-            .values()
-            .filter(|e| {
-                !e.status
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .state
-                    .is_terminal()
-            })
-            .count()
+        active_count_in(&self.lock())
     }
 
     /// The origins a non-terminal job is already running against.
     pub fn active_origins(&self) -> HashSet<String> {
-        self.lock()
-            .values()
-            .filter(|e| {
-                !e.status
-                    .read()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .state
-                    .is_terminal()
-            })
-            .flat_map(|e| e.origins.iter().cloned())
-            .collect()
+        active_origins_in(&self.lock())
     }
 
     /// Release a finished job's live handles and prune the history.
@@ -301,6 +321,15 @@ impl JobRegistry {
     /// left alone (the live one is the truth), and a file that does not parse
     /// is skipped rather than failing the load: one corrupt record must not
     /// hide the rest of an operator's history.
+    ///
+    /// A record is data, not truth (security review, whole branch,
+    /// 2026-11-01). Its id must be a job id and must name the file it sits in,
+    /// or the file is skipped with a warning. And nothing on disk can be
+    /// running — no worker owns it — so a non-terminal `state` is forced to
+    /// `failed` with `stopped_reason: failed`, `finished_at` set and an
+    /// `error` saying why; left as written, such a record would hold a
+    /// `max_jobs` slot and its origin's single flight forever, with a
+    /// pre-cancelled token nothing could act on.
     pub fn load_history(&self, dir: &Path) -> anyhow::Result<usize> {
         let jobs_dir = util::scan_dir(dir, "jobs");
         if !jobs_dir.is_dir() {
@@ -315,11 +344,31 @@ impl JobRegistry {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Ok(record) = serde_json::from_str::<PersistedJob>(&text) else {
+            let Ok(mut record) = serde_json::from_str::<PersistedJob>(&text) else {
                 continue;
             };
-            if record.status.job.is_empty() || self.holds(&record.status.job) {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+            if !is_job_id(&record.status.job) || record.status.job != stem {
+                tracing::warn!(
+                    target: "aitm::scanner",
+                    file = %path.display(),
+                    "skipped a job record whose id is not a job id naming its file"
+                );
                 continue;
+            }
+            if self.holds(&record.status.job) {
+                continue;
+            }
+            if !record.status.state.is_terminal() {
+                let now = util::now_ms();
+                let status = &mut record.status;
+                status.state = JobState::Failed;
+                status.phase = Phase::Done;
+                status.stopped_reason = Some(aitm_scan_model::StoppedReason::Failed);
+                status.error = Some("reloaded a non-terminal job record".to_string());
+                status.finished_at = Some(now);
+                status.elapsed_ms = now.saturating_sub(status.started_at);
+                status.checks.running.clear();
             }
             let started_by = record.status.started_by.clone();
             let origins = record.status.targets.clone();
@@ -368,6 +417,56 @@ pub type JobHandles = (
     CancellationToken,
     Arc<RwLock<Discovery>>,
 );
+
+/// Why [`JobRegistry::admit`] did not admit a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmitRefused {
+    /// `max_jobs` jobs are already running.
+    MaxJobs,
+    /// A job is already running against this origin.
+    Origin(String),
+    /// Every id minted in [`MAX_ID_ATTEMPTS`] tries was taken. Not a verb
+    /// refusal: no D3 code describes "the random source keeps repeating
+    /// itself".
+    NoFreeId,
+}
+
+/// Whether an entry's job is not yet terminal.
+fn is_active(entry: &JobEntry) -> bool {
+    !entry
+        .status
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .state
+        .is_terminal()
+}
+
+/// [`JobRegistry::active_count`] over an already-locked map.
+fn active_count_in(inner: &HashMap<JobId, JobEntry>) -> usize {
+    inner.values().filter(|e| is_active(e)).count()
+}
+
+/// [`JobRegistry::active_origins`] over an already-locked map.
+fn active_origins_in(inner: &HashMap<JobId, JobEntry>) -> HashSet<String> {
+    inner
+        .values()
+        .filter(|e| is_active(e))
+        .flat_map(|e| e.origins.iter().cloned())
+        .collect()
+}
+
+/// Whether `id` has the shape of a job id, `scan-<8 lowercase hex>`
+/// (`util::job_id`). A record on disk is admitted to the registry only under
+/// such an id, so a hand-edited or planted file cannot register a job under
+/// an arbitrary key.
+fn is_job_id(id: &str) -> bool {
+    id.strip_prefix("scan-").is_some_and(|hex| {
+        hex.len() == 8
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
 
 /// A token that is already cancelled, for a job reloaded from disk.
 fn cancelled_token() -> CancellationToken {
@@ -671,9 +770,14 @@ pub fn start(
 
     // (1) `scan.map` is the passive, HTTP-only shape: it crawls and reads, and
     // sends no probe, so it is a `Write` verb rather than a `Sensitive` one.
+    // Its crawl follows GET links only: a form POST is a write the target did
+    // not see coming, and a map job is admitted to an agent under `auto` on
+    // the strength of sending none (security review, whole branch,
+    // 2026-11-01).
     if force_map {
         profile.lanes = vec![LaneKind::Http];
         profile.intensity = Intensity::Passive;
+        profile.crawl.submit_forms = false;
     }
     profiles::validate(&profile).map_err(|e| scan_error(ScanErrorCode::InvalidProfile, e))?;
     let clamped: Vec<Clamped> = profiles::clamp(
@@ -767,23 +871,11 @@ pub fn start(
     // verb layer (Task 15) refuses with exactly the same words.
     agent_gate(engine, &caller, &profile, force_map)?;
 
-    // (7) Concurrency: the job ceiling and per-origin single flight.
-    if engine.registry.active_count() >= engine.cfg.max_jobs as usize {
-        return Err(scan_error(
-            ScanErrorCode::Busy,
-            format!("{} scan jobs are already running", engine.cfg.max_jobs),
-        ));
-    }
-    let active = engine.registry.active_origins();
-    if let Some(origin) = origins.iter().find(|o| active.contains(*o)) {
-        return Err(scan_error(
-            ScanErrorCode::Busy,
-            format!("a scan is already running against {origin}"),
-        ));
-    }
-
-    // (8) Admit the job. The confinement token lives on the entry and drops
-    // with it, so a job can never leave the egress posture held.
+    // (7) and (8): the concurrency gate — the job ceiling and the per-origin
+    // single flight — and the admission, in one critical section of the
+    // registry (`JobRegistry::admit`). The confinement token lives on the
+    // entry and drops with it, so a job can never leave the egress posture
+    // held.
     let confine = services.egress.as_ref().map(|e| e.confine());
     let started_by = caller.started_by();
     let mut targets = origins.clone();
@@ -817,30 +909,34 @@ pub fn start(
     let cancel = CancellationToken::new();
     let discovery = Arc::new(RwLock::new(Discovery::default()));
     let status = Arc::new(RwLock::new(status));
-    let mut confine = confine;
-    let mut admitted = None;
-    for _ in 0..MAX_ID_ATTEMPTS {
-        let candidate = util::job_id();
-        status.write().unwrap_or_else(|e| e.into_inner()).job = candidate.clone();
-        if engine.registry.try_insert(JobEntry {
-            status: Arc::clone(&status),
-            cancel: cancel.clone(),
-            task: None,
-            confine: confine.take(),
-            started_by: started_by.clone(),
-            discovery: Arc::clone(&discovery),
-            origins: origins.clone(),
-            is_agent: caller.is_agent(),
-        }) {
-            admitted = Some(candidate);
-            break;
-        }
-    }
-    let Some(job) = admitted else {
-        // Not a verb refusal: no D3 code describes "the random source keeps
-        // repeating itself".
-        anyhow::bail!("job registry: no free job id after {MAX_ID_ATTEMPTS} attempts");
-    };
+    let job = engine
+        .registry
+        .admit(engine.cfg.max_jobs as usize, &origins, |id| {
+            status.write().unwrap_or_else(|e| e.into_inner()).job = id.clone();
+            JobEntry {
+                status: Arc::clone(&status),
+                cancel: cancel.clone(),
+                task: None,
+                confine,
+                started_by: started_by.clone(),
+                discovery: Arc::clone(&discovery),
+                origins: origins.clone(),
+                is_agent: caller.is_agent(),
+            }
+        })
+        .map_err(|refused| match refused {
+            AdmitRefused::MaxJobs => scan_error(
+                ScanErrorCode::Busy,
+                format!("{} scan jobs are already running", engine.cfg.max_jobs),
+            ),
+            AdmitRefused::Origin(origin) => scan_error(
+                ScanErrorCode::Busy,
+                format!("a scan is already running against {origin}"),
+            ),
+            AdmitRefused::NoFreeId => {
+                anyhow::anyhow!("job registry: no free job id after {MAX_ID_ATTEMPTS} attempts")
+            }
+        })?;
 
     let ctx = JobStart {
         job: job.clone(),
@@ -987,6 +1083,10 @@ pub(crate) mod test_support {
         calls: AtomicU64,
         last_call_ms: AtomicU64,
         seen: Mutex<Vec<SendOptions>>,
+        requests: Mutex<Vec<HttpRequest>>,
+        /// An HTML page every send is answered with, when a test serves one;
+        /// otherwise the canned `200 ok`.
+        page: Option<String>,
     }
 
     impl StubClient {
@@ -995,7 +1095,31 @@ pub(crate) mod test_support {
                 calls: AtomicU64::new(0),
                 last_call_ms: AtomicU64::new(0),
                 seen: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                page: None,
             })
+        }
+
+        /// A client that answers every send with `html` as `text/html`, so the
+        /// client crawl has something to extract.
+        pub(crate) fn serving(html: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: AtomicU64::new(0),
+                last_call_ms: AtomicU64::new(0),
+                seen: Mutex::new(Vec::new()),
+                requests: Mutex::new(Vec::new()),
+                page: Some(html.to_string()),
+            })
+        }
+
+        /// `METHOD path` for every request the client was handed, in order.
+        pub(crate) fn trail(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .iter()
+                .map(|req| format!("{} {}", req.method, req.path))
+                .collect()
         }
 
         /// How many sends the client was handed.
@@ -1027,9 +1151,20 @@ pub(crate) mod test_support {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.seen.lock().expect("seen lock").push(opts);
+                self.requests
+                    .lock()
+                    .expect("requests lock")
+                    .push(req.clone());
                 self.last_call_ms
                     .store(crate::util::now_ms(), Ordering::SeqCst);
-                Ok(stub_flow(req))
+                let mut flow = stub_flow(req);
+                if let (Some(page), Some(response)) = (&self.page, flow.response.as_mut()) {
+                    response
+                        .headers
+                        .set("content-type", "text/html; charset=utf-8");
+                    response.body = Body::Bytes(page.as_bytes().to_vec());
+                }
+                Ok(flow)
             })
         }
     }
@@ -1695,7 +1830,7 @@ pub(crate) mod test_support {
     pub(crate) struct ScratchDir(PathBuf);
 
     impl ScratchDir {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let dir = std::env::temp_dir().join(format!("aitm-scanner-jobs-{}", FlowId::new()));
             std::fs::create_dir_all(&dir).expect("the scratch directory is creatable");
             Self(dir)
@@ -1797,6 +1932,13 @@ pub(crate) mod test_support {
         /// started job stays active for the length of the test.
         pub(crate) fn with_blocking_check(self) -> Self {
             self.with_lane(FakeLane::http().with_check(FakeCheck::blocking("blocker")))
+        }
+
+        /// Serve `html` from every URL, so the interim lane's client crawl
+        /// has a page to extract. Call before [`Harness::bind`].
+        pub(crate) fn with_page(mut self, html: &str) -> Self {
+            self.client = StubClient::serving(html);
+            self
         }
 
         /// Bind an egress posture, so a test can watch a job's hold on it.
@@ -2583,5 +2725,215 @@ mod tests {
         .expect("the 443 entry admits the default-port https origin");
         assert_eq!(started.lanes.run, vec![LaneKind::Http]);
         h.cancel_all();
+    }
+
+    /// Security review (whole branch, 2026-11-01): a `scan.map` job is
+    /// admitted to an agent under `auto` because it sends no probe (spec D3),
+    /// so its client crawl must follow GET links only — a form POST is a
+    /// write the target did not see coming. An ordinary passive scan of the
+    /// same page still submits the form, which is what makes the map job's
+    /// restraint visible.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_map_job_never_submits_forms() {
+        const PAGE: &str = "<html><body><a href=\"/about\">about</a>\
+             <form action=\"/comments\" method=\"post\"><input name=\"comment\"></form>\
+             </body></html>";
+
+        let h = Harness::bare().with_page(PAGE);
+        h.bind();
+        let mut profile = h.profile(&["http://scan.test"]);
+        profile.intensity = Intensity::Passive;
+        let started = crate::jobs::start(&h.engine, profile, operator(), false)
+            .expect("a passive scan starts");
+        h.wait_terminal(&started.job, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            h.client.trail(),
+            vec!["GET /", "GET /about", "POST /comments"],
+            "a scan.start crawl submits the form"
+        );
+
+        let h = Harness::bare().with_page(PAGE);
+        h.bind();
+        let started = crate::jobs::start(
+            &h.engine,
+            h.profile(&["http://scan.test"]),
+            operator(),
+            true,
+        )
+        .expect("a map job starts");
+        h.wait_terminal(&started.job, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(
+            h.client.trail(),
+            vec!["GET /", "GET /about"],
+            "a scan.map crawl follows GET links only"
+        );
+    }
+
+    /// One persisted record under `<dir>/scan/jobs/<job>.json`.
+    fn write_record(dir: &std::path::Path, file_stem: &str, status: aitm_scan_model::JobStatus) {
+        let jobs_dir = crate::util::scan_dir(dir, "jobs");
+        std::fs::create_dir_all(&jobs_dir).expect("the jobs dir is creatable");
+        let record = crate::jobs::PersistedJob {
+            status,
+            issues: Vec::new(),
+        };
+        std::fs::write(
+            jobs_dir.join(format!("{file_stem}.json")),
+            serde_json::to_vec(&record).expect("the record serializes"),
+        )
+        .expect("the record is written");
+    }
+
+    /// Security review (whole branch, 2026-11-01): a record on disk is data,
+    /// not truth. Its id must be a job id (`scan-<8 hex>`) and must name the
+    /// file it sits in; anything else is skipped and the rest of the history
+    /// still loads.
+    #[test]
+    fn history_refuses_a_record_whose_id_disagrees_with_its_file() {
+        use aitm_scan_model::{JobState, JobStatus};
+        let scratch = ScratchDir::new();
+        let done = |job: &str| JobStatus {
+            job: job.to_string(),
+            state: JobState::Done,
+            started_at: 10,
+            finished_at: Some(11),
+            ..JobStatus::default()
+        };
+        write_record(scratch.path(), "scan-0000abcd", done("scan-deadbeef"));
+        write_record(scratch.path(), "scan-ZZZZZZZZ", done("scan-ZZZZZZZZ"));
+        write_record(scratch.path(), "scan-00000001", done("scan-00000001"));
+
+        let registry = crate::jobs::JobRegistry::new(50);
+        assert_eq!(
+            registry
+                .load_history(scratch.path())
+                .expect("history loads"),
+            1,
+            "only the record whose id is a job id and names its own file"
+        );
+        assert!(registry.status("scan-deadbeef").is_none());
+        assert!(registry.status("scan-0000abcd").is_none());
+        assert!(registry.status("scan-ZZZZZZZZ").is_none());
+        assert!(registry.status("scan-00000001").is_some());
+    }
+
+    /// Security review (whole branch, 2026-11-01): a reloaded record cannot
+    /// be running — nothing is running it — so a non-terminal `state` on disk
+    /// becomes `failed` on load. Otherwise it would hold a `max_jobs` slot and
+    /// its origin's single flight forever, with no worker to ever release it
+    /// and a pre-cancelled token nothing can act on (spec D5 anti-goal: a job
+    /// that outlives its cancellation).
+    #[test]
+    fn a_reloaded_running_record_becomes_failed_and_frees_the_origin() {
+        use aitm_scan_model::{JobState, JobStatus, Phase, StoppedReason};
+        let scratch = ScratchDir::new();
+        write_record(
+            scratch.path(),
+            "scan-00000002",
+            JobStatus {
+                job: "scan-00000002".to_string(),
+                state: JobState::Running,
+                phase: Phase::Auditing,
+                targets: vec!["http://scan.test".to_string()],
+                started_at: 10,
+                ..JobStatus::default()
+            },
+        );
+
+        let registry = crate::jobs::JobRegistry::new(50);
+        assert_eq!(
+            registry
+                .load_history(scratch.path())
+                .expect("history loads"),
+            1
+        );
+        let status = registry
+            .status("scan-00000002")
+            .expect("the record was reloaded");
+        assert_eq!(status.state, JobState::Failed);
+        assert_eq!(status.phase, Phase::Done);
+        assert_eq!(status.stopped_reason, Some(StoppedReason::Failed));
+        assert_eq!(
+            status.error.as_deref(),
+            Some("reloaded a non-terminal job record")
+        );
+        assert!(status.finished_at.is_some(), "a terminal record has an end");
+        assert_eq!(registry.active_count(), 0, "it holds no max_jobs slot");
+        assert!(
+            registry.active_origins().is_empty(),
+            "and its origin is not busy"
+        );
+        assert!(registry.list(true, 10).is_empty());
+    }
+
+    /// Security review (whole branch, 2026-11-01): the `max_jobs` check and
+    /// the insert are one critical section. Eight callers released together
+    /// against eight distinct origins admit exactly `max_jobs` jobs; the rest
+    /// are `busy`. With the check and the insert under separate locks, two
+    /// callers could both see a free slot and both take it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_starts_cannot_exceed_max_jobs() {
+        const MAX_JOBS: u32 = 2;
+        const STARTERS: usize = 8;
+        const ROUNDS: usize = 10;
+
+        let h = Harness::new().with_blocking_check().with_max_jobs(MAX_JOBS);
+        for i in 0..STARTERS {
+            h.guard.add_scope(aitm_core::ScopeEntry {
+                host: format!("o{i}.test"),
+            });
+        }
+        h.bind();
+
+        for round in 0..ROUNDS {
+            let barrier = std::sync::Barrier::new(STARTERS);
+            let results: Vec<anyhow::Result<aitm_scan_model::StartResult>> =
+                std::thread::scope(|scope| {
+                    let starters: Vec<_> = (0..STARTERS)
+                        .map(|i| {
+                            let engine = &h.engine;
+                            let barrier = &barrier;
+                            let profile = h.profile(&[&format!("http://o{i}.test")]);
+                            scope.spawn(move || {
+                                barrier.wait();
+                                crate::jobs::start(engine, profile, operator(), false)
+                            })
+                        })
+                        .collect();
+                    starters
+                        .into_iter()
+                        .map(|t| t.join().expect("a starter thread finishes"))
+                        .collect()
+                });
+
+            let admitted: Vec<String> = results
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .map(|started| started.job.clone())
+                .collect();
+            let busy = results
+                .iter()
+                .filter(|r| {
+                    r.as_ref()
+                        .err()
+                        .is_some_and(|e| code(e) == ScanErrorCode::Busy)
+                })
+                .count();
+            assert_eq!(
+                admitted.len(),
+                MAX_JOBS as usize,
+                "round {round}: {} jobs admitted over max_jobs {MAX_JOBS}",
+                admitted.len()
+            );
+            assert_eq!(busy, STARTERS - MAX_JOBS as usize, "round {round}");
+
+            h.cancel_all();
+            for job in &admitted {
+                h.wait_terminal(job, std::time::Duration::from_secs(5))
+                    .await;
+            }
+        }
     }
 }

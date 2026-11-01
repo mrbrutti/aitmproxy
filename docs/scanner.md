@@ -100,7 +100,9 @@ a partial profile merged over it key by key, and a mistyped override key is an
 
 `scan.map` is `scan.start` with `lanes: [http]` and `intensity: passive` forced:
 it crawls, runs the passive checks and enumerates insertion points, and sends no
-probe. Read its result with `scan.sitemap` and `scan.issues`.
+probe. Its crawl follows GET links only (`crawl.submit_forms` is forced off), so
+a map job never submits a form. Read its result with `scan.sitemap` and
+`scan.issues`.
 
 `scan.discover` is **deprecated**. It is now a `scan.map` job plus a bounded
 wait, kept so an older UI keeps working; the wait is bounded by the configured
