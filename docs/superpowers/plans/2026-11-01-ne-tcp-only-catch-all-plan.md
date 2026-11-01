@@ -392,15 +392,15 @@ Kept by the main session during stage 6. One row per finding.
 | 3 | Quality (r2) | Minor | R2-4: Redundant `v4.isLoopback ||` beside the 127/8 octet test. | Fixed in `1d149b2c`. |
 | 3 | Security (r2) | — (note) | The cap's eviction order (address text) lets a token set decide which 256 targets survive. | No finding: Scope tokens come only from the peer-authenticated core at operator privilege (confirm handshake); under-inclusive only. Recorded 2026-11-01. |
 | 4 | Tester (r2) | — (note) | Vector G proves the detach-driven reconcile is inert after `stop()` at the reconciler level; the provider's `startProxy` error-branch call order is verifiable by inspection only (no NE runtime in the sandbox). | Accepted 2026-11-01: same status as every provider line; TR-AC8 exercises the provider live. |
-| 4 | Quality (r3) | Minor | R3-1: `begin`'s lead sentence ("`completion` receives THAT apply's result, never a reconcile apply's") contradicts the parked-begin arms enumerated below it. | Fix task round 3 (comment-only), see the commit recorded in Shipped. |
-| 4 | Quality (r3) | Minor | R3-2: provider error-branch comment opens with "Already reported by `logRuleEvent(.applyFailed)`", untrue on the ECANCELED arm until the parenthetical four lines later. | Fix task round 3 (comment-only), see Shipped. |
+| 4 | Quality (r3) | Minor | R3-1: `begin`'s lead sentence ("`completion` receives THAT apply's result, never a reconcile apply's") contradicts the parked-begin arms enumerated below it. | Fixed in `5ea7a3d8` (comment-only). |
+| 4 | Quality (r3) | Minor | R3-2: provider error-branch comment opens with "Already reported by `logRuleEvent(.applyFailed)`", untrue on the ECANCELED arm until the parenthetical four lines later. | Fixed in `5ea7a3d8` (comment-only). |
 | — | Quality (r3) | Minor | R3-3: `fix R2-n` labels in code comments did not resolve to this Review log (rows were labelled "(r2)" only). | Fixed in the docs commit that carries this row: the four round-2 rows now start with their `R2-n` label. |
 | — | Security (r3), Spec (r3) | — | Round 3: PASS, no findings (security: every re-entrancy claim verified from source, `handleNewFlow`/`handleNewUDPFlow` md5-identical to base; spec: every amended sentence pinned, Review log matches the code). | Recorded 2026-11-01. |
 
 ## Shipped
 
 **Status line:** shipped pending merge (2026-11-01). Tasks 1–4 built and panel-reviewed over three rounds
-(all PASS; every Minor fixed or accepted above); Task 5 (TR-AC8) run on Matt's Mac 2026-11-01 14:25–14:31
+(all PASS; every Minor fixed or accepted above; round-3 comment fixes `5ea7a3d8`); Task 5 (TR-AC8) run on Matt's Mac 2026-11-01 14:25–14:31
 PST under his go ("Yes, when ready", via the orchestrator, display lock held); **Tasks 6 (T2) and 7 (R1) were
 NOT built** — the ladder's first rung held: the in-place `setTunnelNetworkSettings` re-apply takes effect on
 macOS 27.0 and a `/32` UDP host rule diverts the datagram.
