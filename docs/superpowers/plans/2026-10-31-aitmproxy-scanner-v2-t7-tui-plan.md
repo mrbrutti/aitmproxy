@@ -471,6 +471,17 @@ Kept by the main session during stage 6. One row per finding.
 | 9 | spec | Minor | terminal-line re-read only while the tab is shown | accepted; spec D6 amended in this commit |
 | 9 | spec | Minor | a scope entry's port kept in its https origin | accepted; spec D8 amended; one-line test in fix round G (G21) |
 | 9 | spec | Minor | D11 spelled `points n` where the code and AC say `pts n`; plan said "two expectations" | spec D11 and plan Task 9 aligned in this commit |
+| 9 | quality | Important | `show_legacy` overwrites the v2 lists from any `scan.discover` reply | fix round G (G19, already queued from the security note) |
+| 9 | quality | Important | the Nodes cursor walks wire order while the pane draws host-grouped order; Down can move the highlight up | fix round G (G22, priority): sort `nodes` into group order at fold |
+| 9 | quality | Minor | third serde-token reader; vocabulary tokens owned by `issues.rs` | fix round G (G23): `scan::tokens` |
+| 9 | quality | Minor | `point_cursor` whole-list indexing with a settle call the reducer must remember | fix round G (G24): `point_offset` |
+| 9 | quality | Minor | dead `appending` resets; incomplete doc | fix round G (G25) |
+| 9 | quality | Minor | stringly-typed origin errors | fix round G (G26): `OriginError` |
+| 9 | quality | Minor | `legacy_nodes` duplicates helpers; `FlowRef` via JSON round trip | fix round G (G27) |
+| 9 | quality | Minor | tab-entry fetch pairs and due arithmetic duplicated | fix round G (G28) |
+| 9 | quality | Minor | two `too_many_arguments` allows, redundant binding, early-built row | fix round G (G29) |
+| 9 | quality | Minor | tests assert fragments where literals exist; magic `801`; dead modulo | fix round G (G30) |
+| 9 | quality | Minor | `J` refetches an unchanged query; default-port normalisation differs between typed and bare origins | fix round G (G31) |
 
 ## Shipped
 

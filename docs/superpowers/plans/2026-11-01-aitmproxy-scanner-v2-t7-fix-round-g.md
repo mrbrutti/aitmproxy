@@ -54,6 +54,28 @@ G20 (priority). **Orphan points are dropped at fold** (`crates/aitm-tui/src/scan
 
 G21. `authority_parts` becomes `pub(crate)` (`crates/aitm-tui/src/scan/profiles.rs`); add the one-line test that a scope entry `api.test:8443` yields `https://api.test:8443`.
 
+## Task 9 quality panel
+
+G22 (priority). **The Nodes cursor walks `nodes` in wire order while the pane draws `lines` in host-grouped order** (`crates/aitm-tui/src/scan/sitemap.rs`, `crates/aitm-tui/src/scan/mod.rs` `cursor_mut`, `crates/aitm-tui/src/ui/scan/sitemap.rs`): sort `nodes` into group order at fold (stable, by first-appearance `host_key`) so `lines[k].node == k` and the twin is index-for-index like Issues `rows`; drop `NodeLine.node`; on an appending fold remember the selected node's `id` and re-find it. Unit test: the interleaved four-node page, cursor 0, `Down` selects `c` (the next row on screen); with an appended page the cursor stays on the same id.
+
+G23. Third serde-token reader; vocabulary tokens live in `issues.rs` (`crates/aitm-tui/src/scan/{issues,jobs,sitemap}.rs`, new `crates/aitm-tui/src/scan/tokens.rs`): one `scan::tokens` module with `severity_token`, `confidence_token`, `lane_token`, `status_token`, `severity_header`, `SEVERITY_ORDER`, `severity_counts` and one `pub(crate) fn wire_token<T: Serialize>(v: &T) -> String`; delete `kind_token`, `token`, `serde_name`; the Profiles check tree (Tasks 10/11) uses it.
+
+G24. `point_cursor` indexes the whole list but means "within the selected node" (`crates/aitm-tui/src/scan/sitemap.rs`, `scan/mod.rs`, `ui/scan/sitemap.rs`, `app.rs`): `point_offset: usize` within the node; `cursor_mut` `(V2, Points)` returns `(&mut point_offset, node_points(node_cursor).len())`; a Nodes walk and a fold reset/clamp it; `SitemapState::selected_point() -> Option<&InsertionPoint>` used by `sitemap_selected_flow` and the view; delete `settle_point_cursor`, the sentinel and the `checked_sub`.
+
+G25. `appending` resets on failure are dead; doc incomplete (`crates/aitm-tui/src/app.rs`, `scan/sitemap.rs`): delete both resets; doc "the mode of the last `scan.sitemap` that left; overwritten by every send, taken by the fold".
+
+G26. Stringly-typed origin errors (`crates/aitm-tui/src/scan/profiles.rs`, callers in `app.rs`): `pub enum OriginError { Host, Port, Scheme }` with `Display` carrying today's wording; `typed_origin -> Result<String, OriginError>`; tests assert the variant.
+
+G27. `legacy_nodes` re-implements helpers and round-trips a `FlowRef` through JSON (`crates/aitm-tui/src/scan/{sitemap,profiles}.rs`): `pub(super) fn authority_of` in `profiles.rs`; `fn default_port(scheme) -> u16` used by `host_key` and `legacy_nodes`; `fn flow_ref(id) -> Option<FlowRef>` via `FlowId::from_str` used by both legacy readers.
+
+G28. Tab-entry fetch pairs and since-last-fetch arithmetic duplicated (`crates/aitm-tui/src/app.rs`, `scan/mod.rs`, `scan/sitemap.rs`): `fn enter_tab_reads(&mut self, tab, out)` called from `scan_tab` and `OpenScan`; one `pub(crate) fn due(last: Option<u64>, now: u64, every: u64) -> bool` in `scan/mod.rs`; `SitemapState.fetched_at_tick: Option<u64>`.
+
+G29. View hygiene (`crates/aitm-tui/src/ui/scan/sitemap.rs`): a `Pane<'a> { cursor, focused, head, empty }` argument instead of two `too_many_arguments` allows; inline the redundant `Style` binding; build `row` after the `Head::Hint` early return.
+
+G30. Test hygiene (`tests/scan_v2_sitemap.rs`, `scan/sitemap.rs` tests): assert the trimmed row literals (`GET  /account/{id}  flows 1 · pts 2 · ✓`, the fixed-width point rows); `assert_eq!(points.len(), SITEMAP_PAGE_LIMIT)`; name `801` as `4 * SITEMAP_VALUE_MAX + 1` (export the const); drop the dead modulo.
+
+G31. `J` with no Jobs-cursor job refetches an unchanged query (`crates/aitm-tui/src/scan/sitemap.rs`, `app.rs`): `SitemapQuery::toggle_job(&mut self, cursor: Option<JobId>) -> bool`; refetch only when it changed. Typed and bare origins normalise port 443 differently (`scan/profiles.rs`): one `origin(scheme, host, port)` that drops the scheme's default port in both paths; test `typed_origin("https://h:443") == "https://h"`.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
