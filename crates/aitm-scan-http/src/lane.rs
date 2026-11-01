@@ -39,7 +39,7 @@ use anyhow::{anyhow, Result};
 use futures::future::BoxFuture;
 use url::Url;
 
-use aitm_core::{Body, Flow, FlowKind, FlowQuery, HttpFlow, RecordPolicy, SendOptions};
+use aitm_core::{Flow, FlowKind, FlowQuery, HttpFlow, RecordPolicy, SendOptions};
 use aitm_scan_model::{
     Check, Discovery, InsertionPoint, JobCtx, Lane, LaneKind, ProbeHost, ProfileTarget,
     SessionMaterial, UseBrowser,
@@ -47,7 +47,7 @@ use aitm_scan_model::{
 
 use crate::crawl::browser::{origin_root, prime_session, BrowserCrawler};
 use crate::crawl::client::ClientCrawler;
-use crate::crawl::frontier::{limits_for, Crawler, StopReason};
+use crate::crawl::frontier::{held_copy, limits_for, Crawler, StopReason};
 use crate::crawl::seeds::fetch_seeds;
 use crate::host::{HttpProbeHost, SessionMonitors};
 use crate::limits::{job_mark, MARK_CRAWL, MAX_SEED_URLS, MAX_STORED_FLOWS};
@@ -302,17 +302,11 @@ fn stored_flows(job: &dyn JobCtx, origin: &Url, job_mark: &str) -> Vec<HttpFlow>
         if is_another_jobs_crawl(&flow, job_mark) {
             continue;
         }
-        flows.push(request_only(flow));
+        // Held the way a crawl holds its flows (R-M3): the stored pass reads
+        // the request, so the response body is dropped here too.
+        flows.push(held_copy(flow));
     }
     flows
-}
-
-/// `flow` with its response body dropped; the stored pass reads the request.
-fn request_only(mut flow: HttpFlow) -> HttpFlow {
-    if let Some(response) = flow.response.as_mut() {
-        response.body = Body::Empty;
-    }
-    flow
 }
 
 /// Whether `flow` carries the crawl mark of some *other* job of this run.
