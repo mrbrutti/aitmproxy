@@ -11,10 +11,12 @@
 //!
 //! Two rules the file must keep:
 //!
-//! - **Severity is per check, not per verdict.** `Verdict` carries no severity
-//!   and `CheckMeta.severity` is `Medium`, so the spec's "low otherwise" for an
-//!   encoded reflection is said in the detail line instead of in a field (plan
-//!   call 20; `Verdict.severity_override` is a T1b follow-up).
+//! - **An encoded reflection is `Clean`.** A marker that comes back with its
+//!   `<`, `>` and `'` HTML-escaped reaches the output but is not exploitable as
+//!   written, so it is `Clean`/`Tentative` with a detail that says why (plan
+//!   call 36). `Verdict` carries no severity, so the spec's "low otherwise" arm
+//!   — reporting it as a low-severity observation — waits on
+//!   `Verdict.severity_override`, a T1b follow-up already in the hand-off list.
 //! - **Nothing of the server's own text leaves here.** `Evidence.matched` is
 //!   the canary or the marker — both scanner constants for this job — so no
 //!   cookie, header value or captured message can ride out in a verdict. The
@@ -39,7 +41,8 @@ pub const ID: &str = "ws-input-reflection";
 const UNENCODED_DETAIL: &str = "marker reflected with < and > unencoded";
 
 /// Detail for a reflection whose metacharacters the server encoded.
-const ENCODED_DETAIL: &str = "marker reflected with special characters encoded (low impact)";
+const ENCODED_DETAIL: &str =
+    "marker reflected with special characters encoded (not exploitable as written)";
 
 /// Detail for a reply that carried neither the canary nor the marker.
 const ABSENT_DETAIL: &str = "the marker did not come back in any reply frame";
@@ -161,7 +164,7 @@ impl Check for InputReflection {
                 Reflection::Unencoded => {
                     (Outcome::Vulnerable, UNENCODED_DETAIL, Some(canary.clone()))
                 }
-                Reflection::Encoded => (Outcome::Vulnerable, ENCODED_DETAIL, Some(marker)),
+                Reflection::Encoded => (Outcome::Clean, ENCODED_DETAIL, None),
                 Reflection::Absent => (Outcome::Clean, ABSENT_DETAIL, None),
             };
 
@@ -385,7 +388,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn encoded_reflection_is_flagged_low_impact() {
+    async fn encoded_reflection_is_clean() {
         let (transport, _log) = ws_server(None, patched_target);
         let job = TestJob::new(100);
         let host = host_for("msg", &job, transport as Arc<dyn WsTransport>);
@@ -395,17 +398,17 @@ mod tests {
 
         assert_eq!(
             (verdict.outcome, verdict.confidence),
-            (Outcome::Vulnerable, Confidence::Certain)
+            (Outcome::Clean, Confidence::Tentative),
+            "an HTML-escaped reflection is not a vulnerability (plan call 36)"
         );
         assert_eq!(
             verdict.detail,
-            "marker reflected with special characters encoded (low impact)"
+            "marker reflected with special characters encoded (not exploitable as written)"
         );
         assert_eq!(verdict.evidence.payload.as_deref(), Some(CANARY));
         assert_eq!(
-            verdict.evidence.matched.as_deref(),
-            Some("mk7f3a9e"),
-            "an encoded reflection evidences the marker, not the canary"
+            verdict.evidence.matched, None,
+            "a clean verdict evidences no match"
         );
     }
 

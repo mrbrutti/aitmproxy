@@ -29,29 +29,20 @@
 //! |---|---|
 //! | T4-1 | discovery over the captured conversation yields a `ws_json_value` point named `msg` |
 //! | T4-2 | `cswsh` is `(Vulnerable, Certain)` on V and not vulnerable on P; the target's handshake log shows the dialer's regenerated `Sec-WebSocket-Key` and the kept `session` cookie |
-//! | T4-3 | one `ws-oversize-frame` run puts exactly one frame of `2 x largest captured client frame` on the wire, by the target's frame log |
+//! | T4-3 | `ws-input-reflection` on `msg` is `Vulnerable` with the canary unencoded on V and not vulnerable on P (P HTML-escapes the field, which is `Clean`, plan call 36); one `ws-oversize-frame` run puts exactly one frame of `2 x largest captured client frame` on the wire, by the target's frame log |
+//! | — | `ws-subprotocol-observe` is `Vulnerable` on V (echoes any offered token) and not vulnerable on P (selects none, plan call 33) |
 //! | — | at no instant were more than [`MAX_CONNECTIONS`] dialer connections open, by the target's connection log |
 //! | — | the session cookie's literal value is in no verdict `Debug` and in no discovery JSON |
 //!
-//! ## Two assertions this file deliberately does **not** make
+//! ## One assertion this file deliberately does **not** make
 //!
-//! Both are recorded as gaps for the architect in the task 18 hand-back; the
-//! evidence for each is printed instead, so the Terminal run still shows what
-//! happened.
-//!
-//! 1. **`ws-input-reflection` on P.** Spec AC T4-3 says the reflection is
-//!    "found on V (`ws-input-reflection`) and not on P", but the landed check
-//!    returns `Outcome::Vulnerable` for an *encoded* reflection too (plan call
-//!    20: `Verdict` carries no severity, so the "low impact" reading is in the
-//!    detail), and T10's patched seed HTML-escapes the `msg` field while
-//!    leaving the alphanumeric marker intact. The real V/P difference is
-//!    therefore unencoded-vs-encoded, which is what is asserted here.
-//! 2. **The cookie in `held_flows()`.** Task 18 asks for an empty grep of
-//!    every held flow's `Debug`, but a held flow is the replayed handshake
-//!    with its `Cookie` header, i.e. store data the engine re-records, and
-//!    `aitm_core::HeaderMap` derives `Debug`. The redaction rule the spec
-//!    states covers verdicts, evidence, examples and log lines; those are
-//!    asserted. Whether the cookie is in the held flows is printed.
+//! **The cookie in `held_flows()`.** Task 18 asked for an empty grep of every
+//! held flow's `Debug`, but a held flow is the replayed handshake with its
+//! `Cookie` header — store data the engine re-records only for an issue — and
+//! `aitm_core::HeaderMap` derives `Debug`. Accepted as by design (task 18
+//! ruling on gap 2): the redaction rule covers verdicts, evidence, points and
+//! log lines, and those are asserted. Whether the cookie is in a held flow is
+//! printed as a fact, not asserted either way.
 
 use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
@@ -794,17 +785,23 @@ async fn patched_target_yields_none_of_them() {
         subprotocol.detail
     );
 
-    // The V/P difference the landed check expresses: P HTML-escapes the echoed
-    // field, so the canary does not survive even though the marker does. See
-    // the module docs for why "not Vulnerable on P" is not asserted here.
+    // AC T4-3 on P: the echoed field is HTML-escaped, so the marker comes back
+    // but the canary does not, and an encoded reflection is Clean (plan call
+    // 36).
     let reflection = proof.verdict(checks::reflection::ID, "msg");
+    assert_ne!(
+        reflection.outcome,
+        Outcome::Vulnerable,
+        "reflection on P: {}",
+        reflection.detail
+    );
     assert!(
         !reflection.detail.contains("unencoded"),
         "P must not reflect the canary unencoded; detail was {:?}",
         reflection.detail
     );
     println!(
-        "gap[patched]: ws-input-reflection is {:?}/{:?} — {} (spec AC T4-3 says \"not on P\")",
+        "patched: ws-input-reflection is {:?}/{:?} — {}",
         reflection.outcome, reflection.confidence, reflection.detail
     );
 }
