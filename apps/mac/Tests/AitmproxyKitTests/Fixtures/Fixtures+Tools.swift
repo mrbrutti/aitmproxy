@@ -1,10 +1,11 @@
+@testable import AitmproxyKit
 import AitmBusClient
 import Foundation
 
 extension Fixtures {
-    /// The 22 M2 commands as `tools/list` reports them, so the palette and its
-    /// forms work on fixtures exactly as on the live bus.
-    public static let tools: [ToolDescriptor] = {
+    /// The M2 commands as `tools/list` reports them: input for the palette,
+    /// verb-table and command-map tests.
+    static let tools: [ToolDescriptor] = {
         func tool(_ name: String, _ description: String, _ params: [(String, JSONValue, Bool)] = []) -> ToolDescriptor {
             var properties: [String: JSONValue] = [:]
             var required: [JSONValue] = []

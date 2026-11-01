@@ -1,9 +1,10 @@
+@testable import AitmproxyKit
 import Foundation
 
 extension Fixtures {
     /// The three fixture hosts with plausible limits (S-047): the API throttled
     /// hard with an error budget, auth harder still, the CDN loose and budgetless.
-    public static let scopeEntries: [ScopeEntry] = [
+    static let scopeEntries: [ScopeEntry] = [
         ScopeEntry(host: "api.shop-staging.test",
                    limit: RateLimit(requestsPerSecond: 10, burst: 20, backoffFactor: 2, errorBudget: 50)),
         ScopeEntry(host: "auth.shop-staging.test",
@@ -13,7 +14,7 @@ extension Fixtures {
     ]
 
     /// Limits by host, for pairing with the live `scope.list`.
-    public static var scopeLimits: [String: RateLimit] {
+    static var scopeLimits: [String: RateLimit] {
         Dictionary(uniqueKeysWithValues: scopeEntries.compactMap { entry in entry.limit.map { (entry.host, $0) } })
     }
 }

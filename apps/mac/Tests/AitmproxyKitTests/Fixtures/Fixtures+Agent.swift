@@ -1,26 +1,14 @@
+@testable import AitmproxyKit
 import AitmBusClient
 import Foundation
 
-/// A page the fixture browser shows: title, URL and the last frame as PNG.
-public struct BrowserPage: Hashable, Sendable {
-    public var title: String
-    public var url: String
-    public var png: Data
-
-    public init(title: String, url: String, png: Data) {
-        self.title = title
-        self.url = url
-        self.png = png
-    }
-}
-
-/// The Agent page, the activity log, the Scripts page and the Browser view
-/// without a live bus (S-054–S-057, S-060).
+/// Inputs for the Agent-page activity log and the Scripts-page unit tests
+/// (S-054–S-057).
 extension Fixtures {
     /// Twelve invocations over the three minutes before `base`: the agent
     /// probing, the operator replaying, the CLI listing; one gated
     /// `ca.install` from the agent still pending, one error.
-    public static let activity: [ActivityEntry] = {
+    static let activity: [ActivityEntry] = {
         func entry(_ seconds: Double, _ origin: ActivityEntry.Origin, _ command: String,
                    _ args: [String: JSONValue] = [:], _ result: ActivityEntry.Result = .ok) -> ActivityEntry {
             ActivityEntry(at: at(seconds), origin: origin, command: command, args: args, result: result)
@@ -45,7 +33,7 @@ extension Fixtures {
     }()
 
     /// Three scripts: one active, one switched off, one that failed to compile.
-    public static let scripts: [ScriptInfo] = [
+    static let scripts: [ScriptInfo] = [
         ScriptInfo(id: "strip-hsts", name: "Strip HSTS", ruleSummary: "*.shop-staging.test · response",
                    phases: ["response"], enabled: true),
         ScriptInfo(id: "tag-agent-replays", name: "Tag agent replays", ruleSummary: "api.shop-staging.test/api/* · GET POST",
@@ -53,28 +41,5 @@ extension Fixtures {
         ScriptInfo(id: "ws-logger", name: "WebSocket frame logger", ruleSummary: "wss://api.shop-staging.test/ws/*",
                    phases: ["websocket"], enabled: true,
                    error: "line 12: unknown function 'frame.len' — did you mean 'frame.length'?"),
-    ]
-
-    /// The fixture browser's one tab. The 4×4 PNG scales to fill the viewport.
-    public static let browserPage = BrowserPage(
-        title: "Shop staging — Sign in",
-        url: "https://auth.shop-staging.test/login?next=%2Faccount",
-        png: tinyPNG)
-
-    /// `browser.get_dom` as the Browser view's DOM drawer outlines it.
-    public static let domOutline: [String] = [
-        "html lang=\"en\"",
-        "  head",
-        "    title  Shop staging — Sign in",
-        "    link rel=\"stylesheet\" href=\"/assets/app.3f1c.css\"",
-        "  body.theme-light",
-        "    header#top",
-        "      a.logo href=\"/\"",
-        "    main",
-        "      form#login method=\"post\" action=\"/api/auth/login\"",
-        "        input#email name=\"email\" type=\"email\"",
-        "        input#password name=\"password\" type=\"password\"",
-        "        button.primary type=\"submit\"  Sign in",
-        "    script src=\"/assets/app.3f1c.js\"",
     ]
 }

@@ -1,3 +1,4 @@
+@testable import AitmproxyKit
 import Foundation
 
 /// Sample bodies for the Body viewer stories (S-021, S-027, S-029): one
@@ -13,7 +14,7 @@ extension Fixtures {
     }
 
     /// A nested product payload, 40 lines pretty-printed.
-    public static let prettyJSON = response("application/json; charset=utf-8", """
+    static let prettyJSON = response("application/json; charset=utf-8", """
     {
       "id": 7,
       "name": "Headphones",
@@ -57,7 +58,7 @@ extension Fixtures {
     """)
 
     /// An order feed as one line, so the indenter has work to do.
-    public static let xmlBody = response("application/xml", """
+    static let xmlBody = response("application/xml", """
     <?xml version="1.0" encoding="UTF-8"?><orders page="3"><!-- staging export --><order id="9001" status="shipped">\
     <customer>ops@shop-staging.test</customer><items><item sku="HP-ANC-700" qty="1"/><item sku="CH-USB-C" qty="2"/>\
     </items><note><![CDATA[Leave at <reception>]]></note></order><order id="9002" status="pending"><customer/>\
@@ -65,7 +66,7 @@ extension Fixtures {
     """)
 
     /// A page with a remote script, stylesheet and image — the Rendered view must strip all three.
-    public static let htmlBody = response("text/html; charset=utf-8", """
+    static let htmlBody = response("text/html; charset=utf-8", """
     <!DOCTYPE html>
     <html lang="en">
     <head>
@@ -84,7 +85,7 @@ extension Fixtures {
     </html>
     """)
 
-    public static let markdownBody = response("text/markdown; charset=utf-8", """
+    static let markdownBody = response("text/markdown; charset=utf-8", """
     # Release notes
 
     Version **2.4.1** of the staging API.
@@ -96,7 +97,7 @@ extension Fixtures {
     See the [changelog](https://shop-staging.test/changelog) for details.
     """)
 
-    public static let formBody: HTTPMessage = {
+    static let formBody: HTTPMessage = {
         let data = Data("email=ops%40shop-staging.test&password=correct-horse-battery&remember=on&redirect=%2Fapi%2Fme".utf8)
         return HTTPMessage(
             startLine: "POST /api/auth/login HTTP/2",
@@ -106,7 +107,7 @@ extension Fixtures {
     }()
 
     /// Two parts: a text field and a small JSON file upload.
-    public static let multipartBody: HTTPMessage = {
+    static let multipartBody: HTTPMessage = {
         let boundary = "----aitm7f1c"
         let body = "--\(boundary)\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nQ4 export\r\n"
             + "--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"orders.json\"\r\n"
@@ -120,8 +121,8 @@ extension Fixtures {
     }()
 
     /// A pretty-printed JSON array of at least `megabytes` MB (decimal), for the
-    /// "opens without blocking a frame" self-test.
-    public static func largeJSON(megabytes: Int) -> HTTPMessage {
+    /// large-body viewer tests.
+    static func largeJSON(megabytes: Int) -> HTTPMessage {
         let target = max(1, megabytes) * 1_000_000
         var text = "[\n"
         text.reserveCapacity(target + 256)
@@ -145,7 +146,7 @@ extension Fixtures {
     }
 
     /// Flow 60: an 18.4 MB export of which the core sent the first 2 MB (S-027).
-    public static let truncatedDetail: FlowDetail = {
+    static let truncatedDetail: FlowDetail = {
         var page = largeJSON(megabytes: 2)
         page.headers = page.headers.map { $0.name == "content-length" ? .init("content-length", "18400000") : $0 }
         return FlowDetail(

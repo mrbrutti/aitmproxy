@@ -1,7 +1,7 @@
 import Testing
 @testable import AitmproxyKit
 
-/// The self-test's count checks, replayed on the Kit value.
+/// `FlowQuery` on the sample rows: scope, group, chip, filter, sort and pins.
 @Suite struct FlowQueryTests {
     let rows = Fixtures.rows
     let details = Dictionary(uniqueKeysWithValues: Fixtures.rows.map { ($0.id, Fixtures.detail(for: $0)) })
@@ -27,5 +27,13 @@ import Testing
         let compiled = q.compiled()
         #expect(compiled.apply(rows, details: details).count == 3)
         #expect(q.isNarrowing)
+    }
+
+    @Test func pinnedQueryNarrowsToPinnedHostsAndApps() {
+        let pins = Pins(hosts: ["auth.shop-staging.test"], apps: ["curl"])
+        let rows = FlowQuery(pins: pins).apply(Fixtures.rows + Fixtures.l4Rows, details: [:])
+        // curl's three flows (45, 49, 50) plus the auth host (50, already in): capture order.
+        #expect(rows.map(\.seq) == [45, 49, 50])
+        #expect(FlowQuery(pins: Pins()).apply(Fixtures.rows, details: [:]).isEmpty)
     }
 }

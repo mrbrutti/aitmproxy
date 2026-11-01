@@ -1,3 +1,4 @@
+@testable import AitmproxyKit
 import Foundation
 
 /// Fixtures for the inspector stories S-019, S-020, S-025 and S-026: a
@@ -7,13 +8,13 @@ import Foundation
 extension Fixtures {
     // MARK: S-025 SSE
 
-    public static let sseRow = FlowRow(
+    static let sseRow = FlowRow(
         id: id(60), seq: 60, method: .post, scheme: "https", authority: "ai.shop-staging.test",
         path: "/v1/chat/completions", status: 200, state: .complete, client: python, startedAt: at(40.2),
         duration: ms(2_410), requestBytes: 612, responseBytes: 1_480)
 
     /// An OpenAI-style stream: one comment line, six content deltas, `[DONE]`.
-    public static let sseDetail = FlowDetail(
+    static let sseDetail = FlowDetail(
         id: sseRow.id,
         request: HTTPMessage(
             startLine: "POST /v1/chat/completions HTTP/2",
@@ -44,7 +45,7 @@ extension Fixtures {
                                    serverAddress: "10.0.4.20:443"),
         timing: FlowTiming(dns: ms(3), connect: ms(14), tls: ms(27), wait: ms(506), download: ms(1_860)))
 
-    public static let sseDeltas = ["Order", " 4471", " shipped", " on Monday", " and arrives", " Thursday."]
+    static let sseDeltas = ["Order", " 4471", " shipped", " on Monday", " and arrives", " Thursday."]
 
     static let sseBody: String = {
         var out = ": keep-alive\n\n"
@@ -58,13 +59,13 @@ extension Fixtures {
 
     // MARK: S-019 cookies
 
-    public static let cookieRow = FlowRow(
+    static let cookieRow = FlowRow(
         id: id(61), seq: 61, method: .get, scheme: "https", authority: "api.shop-staging.test",
         path: "/api/me", status: 200, state: .complete, client: obscura, startedAt: at(41.0),
         duration: ms(58), requestBytes: 498, responseBytes: 412)
 
     /// A request with three cookies (one quoted) and a response that sets two.
-    public static let cookieDetail = FlowDetail(
+    static let cookieDetail = FlowDetail(
         id: cookieRow.id,
         request: HTTPMessage(
             startLine: "GET /api/me HTTP/2",
@@ -93,7 +94,7 @@ extension Fixtures {
     // MARK: S-020 timing
 
     /// The paused login with every phase reported: 4 + 18 + 31 + 289 + 70 = 412 ms.
-    public static let timedDetail: FlowDetail = {
+    static let timedDetail: FlowDetail = {
         var detail = pausedLogin
         detail.timing = FlowTiming(dns: ms(4), connect: ms(18), tls: ms(31), wait: ms(289), download: ms(70))
         return detail
@@ -102,7 +103,7 @@ extension Fixtures {
     // MARK: S-026 diff
 
     /// Two product listings that differ in one request header and one JSON field.
-    public static let diffPair: (FlowDetail, FlowDetail) = {
+    static let diffPair: (FlowDetail, FlowDetail) = {
         let left = detail(for: rows[0])
         var right = left
         right.id = id(62)

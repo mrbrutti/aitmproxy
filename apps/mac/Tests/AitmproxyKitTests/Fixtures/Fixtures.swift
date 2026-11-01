@@ -1,18 +1,19 @@
+@testable import AitmproxyKit
 import Foundation
 
-/// Recorded-looking bus traffic for UI development and snapshots: the rows of
-/// the reference mockup (docs/design/mockup/index.html), with request and
-/// response messages for the inspector. The live bus replaces this once F4/F5 land.
-public enum Fixtures {
-    public static let obscura = ClientInfo(name: "obscura", monogram: "o", bundleID: "obscura")
-    public static let curl = ClientInfo(name: "curl", monogram: "$")
-    public static let safari = ClientInfo(name: "Safari", monogram: "S", bundleID: "com.apple.Safari")
-    public static let python = ClientInfo(name: "python3", monogram: "P")
-    public static let aitm = ClientInfo(name: "aitm", monogram: "a")
+/// Sample rows and messages the Kit unit tests feed to pure logic (`FlowQuery`,
+/// `Overview`, `Transfer`, the viewers, …). Test input only: these files live in
+/// the test target, so no binary can render them.
+enum Fixtures {
+    static let obscura = ClientInfo(name: "obscura", monogram: "o", bundleID: "obscura")
+    static let curl = ClientInfo(name: "curl", monogram: "$")
+    static let safari = ClientInfo(name: "Safari", monogram: "S", bundleID: "com.apple.Safari")
+    static let python = ClientInfo(name: "python3", monogram: "P")
+    static let aitm = ClientInfo(name: "aitm", monogram: "a")
 
-    public static let scope = ["api.shop-staging.test", "auth.shop-staging.test", "cdn.shop-staging.test"]
+    static let scope = ["api.shop-staging.test", "auth.shop-staging.test", "cdn.shop-staging.test"]
 
-    /// 11:04:58 local on a fixed day, so snapshots never change.
+    /// 11:04:58 local on a fixed day, so expected values are stable.
     static let base: Date = {
         var c = DateComponents()
         c.year = 2026; c.month = 10; c.day = 27; c.hour = 11; c.minute = 4; c.second = 58
@@ -24,7 +25,7 @@ public enum Fixtures {
     static func ms(_ n: Int) -> Duration { .milliseconds(n) }
     static func id(_ n: Int) -> FlowID { FlowID(String(format: "0000%04d-0000-4000-8000-00000000%04d", n, n)) }
 
-    public static let rows: [FlowRow] = [
+    static let rows: [FlowRow] = [
         FlowRow(id: id(41), seq: 41, method: .get, scheme: "https", authority: "api.shop-staging.test",
                 path: "/api/products", query: "category=electronics&limit=20", status: 200, state: .complete,
                 client: obscura, startedAt: at(0), duration: ms(89), requestBytes: 412, responseBytes: 18_200),
@@ -68,7 +69,7 @@ public enum Fixtures {
     ]
 
     /// The paused login (flow 50): one header edited while paused.
-    public static let pausedLogin = FlowDetail(
+    static let pausedLogin = FlowDetail(
         id: id(50),
         request: HTTPMessage(
             startLine: "POST /api/auth/login HTTP/2",
@@ -108,7 +109,7 @@ public enum Fixtures {
     )
 
     /// The last response to the login endpoint (flow 38), shown for reference while 50 is paused.
-    public static let previousLoginResponse = HTTPMessage(
+    static let previousLoginResponse = HTTPMessage(
         startLine: "HTTP/2 200 OK",
         headers: [
             .init("content-type", "application/json; charset=utf-8"),
@@ -130,8 +131,8 @@ public enum Fixtures {
         }
         """.utf8))
 
-    /// A plausible detail for any other fixture row, so every selection shows something.
-    public static func detail(for row: FlowRow) -> FlowDetail {
+    /// A plausible detail for any other sample row.
+    static func detail(for row: FlowRow) -> FlowDetail {
         if row.id == pausedLogin.id { return pausedLogin }
         let pathAndQuery = row.query.map { "\(row.path)?\($0)" } ?? row.path
         let accept = row.path.hasSuffix(".js") ? "*/*" : "application/json"
@@ -177,32 +178,6 @@ public enum Fixtures {
                                        clientAddress: "127.0.0.1:\(52_000 + row.seq)", serverAddress: "10.0.4.12:443"))
     }
 
-    /// The WebSocket detail for the `wss://…/ws/notifications` fixture row (S-045):
-    /// a subscribe, an ack, two server pushes, a binary frame, a ping, and one
-    /// operator-injected frame, so the frames viewer has every opcode and direction.
-    public static func wsDetail(for row: FlowRow) -> WSDetail {
-        func text(_ dir: WSFrameDetail.Direction, _ s: String, at time: Double, injected: Bool = false) -> WSFrameDetail {
-            let data = Data(s.utf8)
-            return WSFrameDetail(direction: dir, opcode: "text", length: data.count, injected: injected,
-                                 timestamp: Format.rfc3339(at(time)), data: data)
-        }
-        let frames: [WSFrameDetail] = [
-            text(.clientToServer, #"{"type":"subscribe","channel":"orders","since":1730000000}"#, at: 6.901),
-            text(.serverToClient, #"{"type":"ack","channel":"orders"}"#, at: 6.944),
-            text(.serverToClient, "{\n  \"type\": \"order.created\",\n  \"id\": 8841,\n  \"total\": 129.0,\n  \"currency\": \"USD\"\n}", at: 7.512),
-            text(.serverToClient, "{\n  \"type\": \"order.updated\",\n  \"id\": 8841,\n  \"status\": \"paid\"\n}", at: 9.133),
-            WSFrameDetail(direction: .serverToClient, opcode: "binary", length: 8, timestamp: Format.rfc3339(at(10.004)),
-                          data: Data([0x00, 0x01, 0x02, 0xFF, 0xFE, 0x03, 0x04, 0x05])),
-            WSFrameDetail(direction: .clientToServer, opcode: "ping", length: 0, timestamp: Format.rfc3339(at(12.600))),
-            text(.clientToServer, #"{"type":"unsubscribe","channel":"orders"}"#, at: 14.220, injected: true),
-        ]
-        return WSDetail(
-            id: row.id, handshakeFlowID: id(46).raw, frames: frames,
-            connection: ConnectionInfo(httpVersion: "HTTP/1.1", tlsVersion: "TLS 1.3", alpn: "http/1.1",
-                                       sni: row.authority, clientAddress: "127.0.0.1:\(52_000 + row.seq)",
-                                       serverAddress: "10.0.4.12:443"))
-    }
-
     static func userAgent(_ client: ClientInfo?) -> String {
         switch client?.name {
         case "curl": "curl/8.7.1"
@@ -215,8 +190,8 @@ public enum Fixtures {
 }
 
 extension FlowRow {
-    /// A copy with another id and sequence number (tests and the self-test).
-    public func withID(_ raw: String, seq: Int) -> FlowRow {
+    /// A copy with another id and sequence number (tests).
+    func withID(_ raw: String, seq: Int) -> FlowRow {
         var copy = self
         copy.id = FlowID(raw)
         copy.seq = seq

@@ -1,16 +1,16 @@
+@testable import AitmproxyKit
 import Foundation
 
-/// Binary bodies for the image / hex / protobuf / MessagePack viewers
-/// (stories S-023, S-024) and the flow details that carry them, so the
-/// inspector can be snapshotted without a live bus.
+/// Binary bodies for the image / hex / protobuf / MessagePack viewer tests
+/// (stories S-023, S-024) and the flow details that carry them.
 extension Fixtures {
     /// A valid 4×4 RGBA PNG with an sRGB chunk (97 bytes).
-    public static let tinyPNG = Data(base64Encoded:
+    static let tinyPNG = Data(base64Encoded:
         "iVBORw0KGgoAAAANSUhEUgAAAAQAAAAECAYAAACp8Z5+AAAAAXNSR0IArs4c6QAAABtJREFUeNpjUE1+/f8/EEPpBgYkDohuYCCo"
         + "AgDXYSv1p0H72AAAAABJRU5ErkJggg==")!
 
     /// The same 4×4 image as a baseline JPEG (850 bytes, JFIF + Exif).
-    public static let tinyJPEG = Data(base64Encoded:
+    static let tinyJPEG = Data(base64Encoded:
         "/9j/4AAQSkZJRgABAQAASABIAAD/4QBMRXhpZgAATU0AKgAAAAgAAYdpAAQAAAABAAAAGgAAAAAAA6ABAAMAAAABAAEAAKACAAQA"
         + "AAABAAAABKADAAQAAAABAAAABAAAAAD/7QA4UGhvdG9zaG9wIDMuMAA4QklNBAQAAAAAAAA4QklNBCUAAAAAABDUHYzZjwCyBOmA"
         + "CZjs+EJ+/8AAEQgABAAEAwEiAAIRAQMRAf/EAB8AAAEFAQEBAQEBAAAAAAAAAAABAgMEBQYHCAkKC//EALUQAAIBAwMCBAMFBQQE"
@@ -26,7 +26,7 @@ extension Fixtures {
 
     /// A message with a varint, a string, a nested message, a float and a zigzag-encoded sint:
     /// `1: 150 · 2: "testing" · 3: {1: 1, 2: "ok"} · 4: 1.0f · 5: -1 (sint32)`.
-    public static let protobufSample = Data([
+    static let protobufSample = Data([
         0x08, 0x96, 0x01,
         0x12, 0x07, 0x74, 0x65, 0x73, 0x74, 0x69, 0x6E, 0x67,
         0x1A, 0x06, 0x08, 0x01, 0x12, 0x02, 0x6F, 0x6B,
@@ -36,7 +36,7 @@ extension Fixtures {
 
     /// A 12-entry map touching every MessagePack family: nil, bool, negative
     /// fixint, uint8, int16, float32, float64, str, bin, array, map, fixext1.
-    public static let msgpackSample = Data([
+    static let msgpackSample = Data([
         0x8C,
         0xA3, 0x6E, 0x69, 0x6C, 0xC0,                                     // "nil": nil
         0xA4, 0x62, 0x6F, 0x6F, 0x6C, 0xC3,                               // "bool": true
@@ -54,17 +54,17 @@ extension Fixtures {
     ])
 
     /// Flow 60: `GET /assets/logo.png` → the 4×4 PNG.
-    public static let imageDetail = binaryDetail(
+    static let imageDetail = binaryDetail(
         n: 60, method: "GET", path: "/assets/logo.png", host: "cdn.shop-staging.test",
         contentType: "image/png", body: tinyPNG)
 
     /// Flow 61: `POST /grpc/cart.CartService/Get` → a protobuf response.
-    public static let protobufDetail = binaryDetail(
+    static let protobufDetail = binaryDetail(
         n: 61, method: "POST", path: "/grpc/cart.CartService/Get", host: "api.shop-staging.test",
         contentType: "application/x-protobuf", body: protobufSample, requestBody: Data([0x08, 0x2A]))
 
     /// Flow 62: `GET /api/cart.msgpack` → a MessagePack response.
-    public static let msgpackDetail = binaryDetail(
+    static let msgpackDetail = binaryDetail(
         n: 62, method: "GET", path: "/api/cart.msgpack", host: "api.shop-staging.test",
         contentType: "application/msgpack", body: msgpackSample)
 

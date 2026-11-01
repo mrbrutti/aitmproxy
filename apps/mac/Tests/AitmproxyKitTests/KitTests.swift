@@ -409,11 +409,4 @@ import Testing
         #expect(ContentCategory.shortcutChips[4...6] == [.tcp, .udp, .l4])
         #expect(ContentCategory.allCases.allSatisfy { !$0.help.isEmpty })
     }
-
-    @Test func fixturesMatchTheMockup() {
-        #expect(Fixtures.rows.count == 14)
-        #expect(Fixtures.rows.map(\.seq) == Array(41...54))
-        #expect(Fixtures.rows.filter { $0.state == .paused }.count == 2)
-        #expect(Fixtures.detail(for: Fixtures.rows[9]).request.header("x-forwarded-for") == "127.0.0.1")
-    }
 }
