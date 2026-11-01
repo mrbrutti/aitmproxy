@@ -9,15 +9,20 @@ Capture order matters (parent spec D7: the canary replays the NEWEST captured
 authenticated GET): login -> `GET /account?tab=overview` -> `GET /logout-after?n=20`
 -> `GET /account?tab=overview` again, so the canary is `/account` (asserted from
 `scan.status`), not `/logout-after` (which would re-arm the countdown). The arm
-counts N further authenticated `GET /account`s and the one that drives the counter
-to 0 is still answered 200 (the 302 starts on the next); the cell's own pre-arm GET
-is a 200 in the same log, so the first session-cookie 302 comes after exactly
-N + 1 = 21 authenticated `/account` 200s (T2 live run 2, 2026-11-01).
+allows N further authenticated `GET /account`s, the one that drives the counter to
+0 is still answered 200 and the 302 starts on the next (`SessionStore::touch`); the
+cell's own second GET consumes one, so the seed alone leaves N - 1 = 19 for the
+scanner. But the scanner also replays the captured `GET /logout-after?n=20` with the
+session (crawl / baseline), which RE-ARMS the countdown to 20 whenever it runs, and
+the scheduler decides when. So the observer derives its expectation inside the
+window (`V.logs.reset()` is taken after the cell's own GETs): with no authenticated
+`/logout-after` 200 before the first 302, exactly N - 1 authenticated `/account`
+200s precede it; otherwise exactly N `/account` 200s lie between the last such
+re-arm and the 302 (T2 live run 2 saw 21 = 1 before the re-arm + 20 after).
 
 Observers: the target's control log (`/log/http`): the first `/account` 302 that
-carries the session cookie comes after exactly 21 authenticated `/account` 200s
-(1 pre-arm + the 20 the arm allows) and after >= 20 requests carrying the session
-cookie overall.
+carries the session cookie comes after the derived count of `/account` 200s and
+after >= 20 requests carrying the session cookie overall.
 
 SKIP 77: serve binary missing, a missing `scan.start`/`scan.status` verb, or no
 `http` lane in `scan.checks`.
@@ -80,7 +85,7 @@ def main() -> None:
                 check(r.status == 200 and r.text == f'{{"armed":{ARMED}}}',
                       f"GET /logout-after?n={ARMED} -> {{\"armed\":{ARMED}}} (got {r.status} {r.text[:40]!r})")
                 r = via_proxy(proxy, "GET", V.base + "/account?tab=overview", headers=cookie)
-                check(r.status == 200, "GET /account?tab=overview again -> 200 (newest authenticated GET; 1 of 20 used)")
+                check(r.status == 200, "GET /account?tab=overview again -> 200 (newest authenticated GET; 19 of 20 left)")
 
                 section("scan.start with session.mode observed")
                 seq0 = V.logs.reset()
@@ -107,12 +112,26 @@ def main() -> None:
                       f"V log shows a /account 302 carrying the session cookie ({len(acct)} authenticated /account requests)")
                 before = acct[:first_302] if first_302 is not None else []
                 n200 = sum(1 for e in before if e.get("status") == 200)
-                # 1 pre-arm GET + the ARMED post-arm GETs the arm allows (the one that
-                # drives the counter to 0 is still a 200); the 302 starts on the next.
-                check(n200 == ARMED + 1 and len(before) == n200,
-                      f"exactly {ARMED + 1} authenticated /account 200s precede the first 302 "
-                      f"(1 pre-arm + {ARMED} allowed; got {n200} 200s of {len(before)})")
                 first_seq = int(acct[first_302].get("seq", 0)) if first_302 is not None else 0
+                # The scanner may replay the captured `GET /logout-after?n=20` with the
+                # session, which re-arms the countdown to ARMED; derive the expectation
+                # from the window: no re-arm -> the seed's own ARMED - 1 (the cell's
+                # second GET used one); re-arm(s) -> exactly ARMED /account 200s after
+                # the last re-arm. The request that reaches 0 is still a 200.
+                rearms = [e for e in reqs if e.get("path") == "/logout-after" and with_session(e)
+                          and e.get("status") == 200 and int(e.get("seq", 0)) < first_seq]
+                if rearms:
+                    last_rearm_seq = int(rearms[-1].get("seq", 0))
+                    after_rearm = [e for e in before if int(e.get("seq", 0)) > last_rearm_seq]
+                    n_after = sum(1 for e in after_rearm if e.get("status") == 200)
+                    check(n_after == ARMED and len(after_rearm) == n_after,
+                          f"exactly {ARMED} authenticated /account 200s lie between the last "
+                          f"/logout-after re-arm and the first 302 ({len(rearms)} re-arm(s); "
+                          f"got {n_after} 200s of {len(after_rearm)}; {n200} 200s in the whole window)")
+                else:
+                    check(n200 == ARMED - 1 and len(before) == n200,
+                          f"exactly {ARMED - 1} authenticated /account 200s precede the first 302 "
+                          f"(no re-arm in the window; got {n200} 200s of {len(before)})")
                 total_auth_before = sum(1 for e in reqs if with_session(e) and int(e.get("seq", 0)) < first_seq)
                 check(total_auth_before >= ARMED,
                       f">= {ARMED} requests carrying the session cookie precede the 302 (got {total_auth_before})")
