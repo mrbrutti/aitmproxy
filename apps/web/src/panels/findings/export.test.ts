@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { exportFilename, fileStamp, slugify } from './export';
 import { fmtWhen, filterRuns, matchedCount, parseVars, sortNewest, varsFromYaml } from './model';
-import type { PocRun } from '~/bus/mock';
+import type { PocRun } from '~/bus/types';
 
 const at = new Date(2026, 9, 27, 11, 5).getTime();
 

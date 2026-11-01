@@ -139,7 +139,7 @@ describe('toDetail (bus flow.detail)', () => {
     expect(ws.ws).toEqual({ up: 1, down: 1 });
   });
 
-  it('still accepts the fixture (client-model) shape', () => {
+  it('still accepts the model shape', () => {
     const fx = toDetail(
       { id: 'x', kind: 'http', method: 'GET', scheme: 'https', authority: 'h', path: '/p', query: 'q=1', status: 204, startedAt: 5, client: { id: 'curl', name: 'curl' }, intercept: 'none', request: { headers: [{ name: 'a', value: 'b' }], body: { text: 'hi', contentType: 'text/plain', size: 2, truncated: false } }, response: null },
       1,
@@ -152,7 +152,7 @@ describe('toDetail (bus flow.detail)', () => {
 
 // The audit line the server pushes on `notifications/aitm/agent` and returns from `agent.activity`
 // (crates/aitm-core/src/audit.rs): `at` epoch ms, `client_label`, `args` a redacted JSON string,
-// `result` `"ok"` or `{error}`. The fixture bus sends the UI model directly.
+// `result` `"ok"` or `{error}`. A line already in the UI model shape is accepted as it is.
 describe('toAgentEntry (audit line)', () => {
   const wire = { at: 1730000000000, origin: 'mcp', client_label: 'claude-code', command: 'flow.replay', args: '{"id":"f_1"}', result: 'ok' };
 
@@ -173,7 +173,7 @@ describe('toAgentEntry (audit line)', () => {
     const e = toAgentEntry({ ...wire, result: { error: 'refused: x' } });
     expect(e?.result).toBe('error');
     expect(e?.detail).toBe('refused: x');
-    // An already-model error (fixture bus) stays as it is.
+    // An already-model error (the model shape) stays as it is.
     const model = toAgentEntry({ origin: 'cli', command: 'scope.add', result: 'error', detail: 'refused', at: '2024-10-27T03:33:20.000Z' });
     expect(model?.result).toBe('error');
     expect(model?.detail).toBe('refused');
@@ -185,7 +185,7 @@ describe('toAgentEntry (audit line)', () => {
     expect(toAgentEntry({ ...wire, args: '"f_1"' })?.args).toBe('"f_1"');
   });
 
-  it('accepts the fixture model', () => {
+  it('accepts the model shape', () => {
     const fx = { origin: 'web', command: 'flow.kill', args: { id: 'f_2' }, result: 'ok', at: '2024-10-27T03:33:20.000Z' };
     const e = toAgentEntry(fx);
     expect(e?.origin).toBe('web');
@@ -264,7 +264,7 @@ describe('toAgentEntry (audit line)', () => {
     const cut = '{"id":"' + 'f'.repeat(2040) + '"';
     expect(cut).toHaveLength(2048);
     expect(toAgentEntry({ ...wire, args: over })?.args).toBe(cut);
-    // A non-string args (the fixture model's object) is not text and is passed through.
+    // A non-string args (the model shape's object) is not text and is passed through.
     expect(toAgentEntry({ ...wire, args: { id: 'f_1' } })?.args).toEqual({ id: 'f_1' });
   });
 
