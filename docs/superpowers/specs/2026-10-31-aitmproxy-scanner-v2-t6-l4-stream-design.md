@@ -246,14 +246,14 @@ pub struct JobState {
     pub selection: Mutex<HashMap<String /* node id */, SelectionReason>>,
     pub points: Mutex<HashMap<String /* point id */, DiscoveredPoint>>, // the discovery cache probe_host_for reads
     pub grammars: Mutex<HashMap<String /* node id */, Arc<dyn Grammar>>>, // the selected grammar per endpoint
-    pub seed_notes: Mutex<HashMap<String /* node id */, Vec<String>>>,     // S5.2 (b) skip notes, for the verdict detail
+    pub seed_notes: Mutex<HashMap<String /* node id */, Arc<Vec<String>>>>, // S5.2 (b) skip notes (decoded once per job, shared by every node), for the verdict detail
 }
 impl JobState { pub fn counters(&self) -> aitm_scan_model::L4Counters; }   // cases, crashes, liveness_failures, retired_elements (u64)
 ```
 
 **Pacer (F2).** `BytePacer` is a sliding one-second window, not a token bucket: no one-second window carries more than `max_bytes_per_s` bytes, so a burst can never exceed the rate; a single message larger than the rate goes alone in an empty window. `wait_for_at(len, now)` returns how long the caller sleeps before writing `len` bytes at `now`.
 
-**Guard `None` (L4 disabled).** `lane()` still returns `Some` (D1, call A18, so the engine's refusal order says `refused_l4`). Defence in depth: `discover` returns `Err(anyhow!("scan: refused_l4: L4 is disabled (l4.enabled: false); the stream lane sends nothing"))` and `probe_host_for` returns the same error; the engine, which has already refused at `scan.start`, never sees either on a correctly configured core. **(Architect's call)**: the lane re-uses the D3 error form so a misordered engine still surfaces the right token.
+**Guard `None` (L4 disabled).** `lane()` still returns `Some` (D1, call A18, so the engine's refusal order says `refused_l4`). Defence in depth: `discover` refuses every endpoint through its authorisation preview with `Err(anyhow!("scan: refused_l4: L4 is disabled (l4.enabled: false); the stream lane sends nothing"))` (a target with no L4 endpoints has nothing to refuse and yields an empty discovery) and `probe_host_for` returns the same error; the engine, which has already refused at `scan.start`, never sees either on a correctly configured core. **(Architect's call)**: the lane re-uses the D3 error form so a misordered engine still surfaces the right token.
 
 #### S5.2 `discover(target, job)`
 
@@ -502,7 +502,7 @@ The L4 stream lane is one `Arc<dyn Lane>` returning `Some` on every build, with 
 12. Point id `l4s-<fnv1a64 hex>` of node|seed|path; `rng_seed = fnv1a64(marker|point id)`; FNV-1a is the crate's only hash.
 13. Lane ceilings as constants: 5000 cases, 1 MiB/s, 4 connections, 64 KiB reply and message, 2 s reply/connect, 500 ms liveness retry, 15 s recovery, 1 s reproduction spacing, 8 prelude messages, 16 job states, 64 seeds and 256 points per endpoint, repeat elements `[0..=3]`.
 14. Dry run opens no socket and mints no permit; the `l4-crash` verdict `detail` carries the first 50 rendered cases (hex of the first 64 bytes each, denylisted ones marked), bounded to 16 KiB.
-15. Guard `None`: `lane()` is `Some`; `discover`/`probe_host_for` fail with the D3 `scan: refused_l4:` form as defence in depth.
+15. Guard `None`: `lane()` is `Some`; `discover` (per endpoint; an empty `target.l4` discovers nothing) and `probe_host_for` fail with the D3 `scan: refused_l4:` form as defence in depth.
 16. Frame payloads are extracted by a hand-rolled IPv4/IPv6/TCP/UDP header skipper (no `etherparse` dependency in this crate), TCP/UDP only, no IPv6 extension headers.
 17. `probe_raw` unsupported; `held_flows` empty; `InsertionPoint.flow` is `None` with provenance in `seed_id`; `method: "L4"`, `url: "<proto>://ip:port/<grammar>"` on points for the UIs.
 18. The byte-level set is the 25 non-`Mapped` LibAFL names; stage 2 stacks 1..=3 mutators per case; AFL's interesting-value tables.

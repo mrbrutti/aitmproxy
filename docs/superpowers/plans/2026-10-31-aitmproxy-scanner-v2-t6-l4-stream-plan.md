@@ -32,10 +32,12 @@ T6 fills the `aitm-scan-l4-stream` skeleton that T1a handed over: a grammar form
 | F3 | The live harness seeds the TLV speaker with distinct-length messages so inference has a corpus (`tests/live_t10.rs`). |
 | F4 | The latency oracle skips frame-incomplete cases (declared length/count, removed delimiter, over-long varint), counted as `latency_skipped_framing` (`checks.rs`, `mutate/structure.rs`). |
 | F5 | The latency-outlier inner-loop test drives the payload point, not the framing length node (`tests/campaign.rs`). |
-| A | Stage-6 panel round 1, fix task A (run concurrently with B): `count_from` names the count field and validation requires it to carry `count: { of: <repeat> }`; SMTP/FTP `sp` is a `present`/`absent` choice with only `absent` immutable; the S9 `warn!` lines on guard refusal and target-down. |
-| B | Stage-6 panel round 1, fix task B: seed skip notes (over-size, empty, 65th, `flow`) reach the discovery line as `seeds_skipped=<n>` and the verdict detail as `seed_notes=[...]` through `JobState.seed_notes`. |
+| A | Stage-6 panel round 1, fix task A (host/lib/checks/state/tree/corpus/spec, resp+dns YAML, campaign+gates tests): guard `PacketTooLarge` is skipped and counted (SPEC-C1); `count_from` names the count field and validation requires `count: { of: <repeat> }`; seed skip notes reach the discovery line (`seeds_skipped=`) and the detail (`seed_notes=[...]`); S9 `warn!` on guard refusal, discovery refusal and target-down; `StreamHost` lost its dead tree and accessors; one `RECOVERY_POLL`; shared `proto_of`/`proto_name`/error strings/`record_case`/`L4_DISABLED`; `ceilings` split in four; tree.rs element ceiling on declared counts and checked length arithmetic (SEC-M1/M2). |
+| B | Stage-6 panel round 1, fix task B (grammars, denylist, mutators, client, YAML, live harness): SMTP/FTP `sp` is a `present`/`absent` choice with only `absent` immutable and `delim_inject` steps out of a `choice`; `Grammar::specs()` so C1 covers all 11 documents; the denylist uses `mqtt::{read_varint, read_string}`; const interesting tables; underscored unused parameters; allow reasons; `tlv.yaml` prose; `codec::decode_hex` in the harness. |
+| R2 | Stage-6 panel round 2 (Minors from the re-review): the count is registered under the count field's name only; capped-repeat test asserts equality; profile seeds decoded once per job with notes shared across nodes; `authorise_preview` is the single discovery refusal point (the disabled lane warns too); `mqtt::connect_flags` shared with the denylist; `capture_tracing` returns the serial lock; WARN test split in three on an ephemeral port; duplicate DNS test removed, RESP count test moved to `resp.rs`; `grammars::testkit` shared by SMTP/FTP; `FieldPath::parent`; `#[doc(hidden)]` on the two test-reachable fns. |
+| R3 | Round-2 re-review leftovers: `TracingCapture` drops the sink guard before the serial lock; test rename; stale port comment; spec errata (empty-target clause, `Arc<Vec<String>>`). |
 
-The A/B split above follows the orchestrator's two fix briefs; the Review log holds the findings each one closes.
+The Review log holds the findings each round closes.
 
 Shared facts for every coder:
 
@@ -371,6 +373,52 @@ Kept by the T6 session during stage 6. One row per finding. Range reviewed: `395
 | live | T6 session | Important | TLV had no corpus in the live harness | Fixed in ff6cfae0 (F3, three hex seeds; TLV unnamed so inference runs) |
 | live | T6 session | External | T10 patched speakers closed without the protocol-error reply (RESP malformed header, unterminated lines) | Fixed in T10 PR C (`fix/scanner-v2-t10-patched-speaker-replies` defdfb5a -> 6f9e136f); evidence `t6-reset-diag.out` |
 
+**Re-review of the fix round (range `a1b9a6c8..3d5ff8b9`; Security PASS, Quality PASS, Spec PASS):**
+
+| Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| fix A/B | Security | Minor | R2-S1 declared count registered under two names; a hand-built spec could alias repeats | Fixed in round 2 (397d4ef0: count keyed by the count field only; parser agrees with the validator) |
+| fix A/B | Security | Info | `PacketTooLarge` arm verified safe; MQTT decoder sharing adds no unchecked arithmetic; no bytes in `seed_notes`/WARN lines; no `unsafe`/`unwrap` on non-test paths | No change |
+| fix A/B | Spec | Minor | R2-SP1 `dns.rs` module doc described the old `count_from` inversion | Fixed in 5e202bb6 (Task 24) |
+| fix A/B | Spec | Info | SP-C1, SP-I1..I7 closed with tests; SP-M1..15 applied; umbrella ACs T6-1..T6-5 recorded as NOT satisfied (bus-level, need T1b) | No change |
+| fix A/B | Quality | Minor | R2-Q1 dead `of` count registration (= R2-S1) | Fixed in round 2 |
+| fix A/B | Quality | Minor | R2-Q2 stale `dns.rs` doc (= R2-SP1) | Fixed in 5e202bb6 |
+| fix A/B | Quality | Minor | R2-Q3 `seeds_from_profile` computed per endpoint, notes repeated per node | Fixed in round 2 (hoisted above the endpoint loop, notes held once) |
+| fix A/B | Quality | Minor | R2-Q4 `authorise_preview`'s L4-disabled arm unreachable | Fixed in round 2 (single refusal point, WARN covered) |
+| fix A/B | Quality | Minor | R2-Q5 denylist re-walks the MQTT CONNECT header | Fixed in round 2 (`mqtt::connect_flags` shared) |
+| fix A/B | Quality | Minor | R2-Q6 tracing-capture lock convention duplicated and unenforced | Fixed in round 2 (`capture_tracing` returns the guard) |
+| fix A/B | Quality | Minor | R2-Q7 three-scenario WARN test in one, fixed port 9010 | Fixed in round 2 (three tests, ephemeral closed port) |
+| fix A/B | Quality | Minor | R2-Q8 gates DNS half duplicates `dns_qdcount_bounds_the_questions` | Fixed in round 2 (DNS half removed, RESP half kept) |
+| fix A/B | Quality | Minor | R2-Q9 separator test copied smtp/ftp, FTP missing `delim_dup` | Fixed in round 2 (`grammars::testkit`) |
+| fix A/B | Quality | Minor | R2-Q10 `parent_path` re-implements `split_index` | Fixed in round 2 (`FieldPath::parent`) |
+| fix A/B | Quality | Minor | R2-Q11 one `let _ = req;` survived | Fixed in round 2 |
+| fix A/B | Quality | Minor | R2-Q12 SEC-M1 cap test tolerated a `None` parse | Fixed in round 2 (`expect` + equality) |
+| fix A/B | Quality | Minor | R2-Q13 `cases_planned`/`donors_for` public for tests; `specs()` allocates | Fixed in round 2 (`#[doc(hidden)]`, documented) |
+| fix A/B | Quality | Minor | R2-Q14 doc comment orphaned by inserted tests | Fixed in round 2 |
+| fix A/B | Quality | Info | `GuardedClient` double justified; `interesting_at` generic correct; `is_parser_fault_candidate(oracle, true)` acceptable; `report_l4_hook` honest; two name-resolution rules deliberate | No change |
+
+**Live proof after the fix rounds** (`run-both-4.log`, lane HEAD 5e202bb6 + round 2, target built from main `c30e34b6`): vulnerable 8/8 `l4-crash` with 4 downtime windows each (tlv by inferred relation), patched 8/8 clean, `denylisted=0` everywhere, max client->server bytes per 1 s window 5813 <= 8192, both modes exit 0; the whole crate passes in the Terminal with no SKIP (lib 206, campaign 8, gates 13, live self-checks 3).
+
+**Re-review of round 2 (range `5e202bb6..1e31bbf4`; Security PASS, Quality PASS, Spec PASS):**
+
+| Task | Reviewer | Severity | Finding | Disposition |
+|---|---|---|---|---|
+| R2 | Quality | Minor | R3-Q1 `TracingCapture` releases the serial lock before the sink-clearing guard drops (latent flake) | Fixed in R3 (field order; comment says it is load-bearing) |
+| R2 | Quality | Minor | R3-Q2 `one_profile_seed_is_decoded_once_for_every_endpoint` cannot observe "once" | Fixed in R3 (renamed `every_endpoint_reports_the_one_skipped_profile_seed`) |
+| R2 | Quality | Minor | R3-Q3 stale "ports 9009 and 9010" comment | Fixed in R3 |
+| R2 | Quality | Info | empty `target.l4` + disabled lane discovers nothing instead of erroring | Accepted (T6 session, 2026-11-01): nothing to refuse, no socket, `probe_host_for` and the host still refuse; spec S5.1/call 15 amended |
+| R2 | Spec | Minor | R3-SP1 S5.1/call 15 literal "discover returns Err" vs the per-endpoint refusal | Accepted as erratum, applied (empty-target clause) |
+| R2 | Spec | Minor | R3-SP2 S5.1 `seed_notes` type is `Arc<Vec<String>>` | Accepted as erratum, applied |
+| R2 | Security | Minor | R3-S1 a disabled lane decodes the operator's profile seeds before it refuses (ordering of `invalid_profile` vs `refused_l4`; no socket, no bytes) | Accepted (T6 session, 2026-11-01): operator-authored input already accepted by the bus; a malformed seed is reported even when the lane is disabled, which is the more useful order |
+| R2 | Security | Info | R2-S1 closed; single refusal point verified; MQTT `connect_flags` bounded; no bytes in notes; no `unsafe`/`unwrap` | No change |
+
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**Status at PR open (2026-11-01, branch `claude/scanner-v2-t6-e91bd9`, draft PR):**
+
+- Landed: Tasks 1-22, 23a (lane-level live harness), 24 (merge of `origin/main` through 42cdaf2, `wire.rs` lane-count re-pin, grammar docs); fixes F1-F5; panel rounds A, B, R2, R3. Everything under `crates/aitm-scan-l4-stream/**` plus `Cargo.lock`, the two T6 docs and the one `wire.rs` test literal its own comment assigns to the landing lane track.
+- Panel: round 1 Security PASS / Quality FAIL / Spec FAIL -> fixed; re-review of the fix round PASS/PASS/PASS; re-review of round 2 PASS/PASS/PASS with three Minors fixed in R3 and three accepted in writing (Review log).
+- Rust gate: green in the sandbox at every step; the whole-workspace `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test` ran in the Terminal at the final head (exit code in the PR body); every socket-bound test of this crate ran for real in the Terminal (no SKIP).
+- Live proof (interim, lane level): `tests/live_t10.sh both` against `aitm-testtarget-serve --l4` built from main (`c30e34b6`, T10 PR A/B/C) with the target's control origin as the independent observer: vulnerable 8/8 grammars `l4-crash` with 4 downtime windows each (TLV by inferred relation), patched 8/8 clean, `denylisted=0` everywhere, max client->server bytes per 1 s window <= 5885 under an 8192 cap, both modes exit 0 (`run-both-4.log`; artifacts in the shared notes folder `t6-live-proof/`).
+- **Cut / deferred:** Task 23, the bus-level acceptance run of T6-1..T6-5 (`tests/e2e/scan/test_t6_*.py`, on main via #222) — needs T1b's engine (`scan.start`), not on main at PR time; the PR is a draft until those cells run. A5 (`JobCtx::report_l4`) stays a documented no-op until T1b lands it. No `check.l4-*` command pins to re-pin yet (T1b's catalogue bridge).
+- Follow-ups: run the five cells when T1b merges and promote the PR; wire `report_l4_hook`; T6-3 against a real redis/memcached (capstone tier, `needs=redis`); consider `FieldPath`-keyed count registration if operator-authored grammars are ever loaded at runtime; T10 PR C (#224) fixed the patched speakers' reply-before-close contract found by this lane.
