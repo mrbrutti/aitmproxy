@@ -1438,6 +1438,8 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
 
 **Task 19 step 2 done (a68fb92d):** `EXPECTED_TOOLS` 62 → 82, `CORE_TOOLS` 65 → 85, `bus-fixture.json` 65 → 85 (+ the two `tester_shell.rs` count literals); the frontends set is three short of the TUI pins because that test builds its server without the Rhai/findings plugins (pre-existing). Open naming note for the coordinator: `aitmproxy-plugin/docs/tool-reference.md` now lists both the bundled scripts' hand verbs (`check.open_redirect`, `check.xss`, underscore) and the catalogue manual verbs (`check.open-redirect`, `check.xss-reflected`, hyphen); T3's conversion retires the former.
 
+**Task 19 after T4 merges (coordinator heads-up, 2026-11-01):** T4's WS lane PR #227 lands before this PR: on the final main merge re-pin `skeleton_lane_slots_are_empty_today` (lane count flips to 1), re-run `api_catalog` (the `ws` namespace sits beside `probe.*` in `rhai.api.json`) and `production_languages()`; in `wire.rs`/`main.rs` pass `cfg.ssl_insecure` into `aitm_scan_ws::lane::build_with` / `language::build_with` (the WS lane verifies TLS by default); the `HostCallContextSource` run-kind signal (Task 4) is what T4's hook refusal relies on. Details: shared note `t4-ws-lane-handover.md`.
+
 Within a wave no two tasks share a file. `crates/aitm-plugin-rhai/src/lib.rs` is edited in
 wave 1 (Task 4) and wave 2 (Task 13); `crates/aitm-plugin-scanner/src/plugin.rs` in wave 4
 (Task 14) and wave 5 (Task 15); `crates/aitm-plugin-scanner/Cargo.toml` in wave 1 (Task 3) and
