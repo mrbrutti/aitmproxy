@@ -29,7 +29,8 @@ Partial skips. The lane ships three GENERIC checks for every grammar
 (`l4-crash`, `l4-parser-fault`, `l4-latency-outlier`, kind `l4_field`; T6 child
 spec S6.3): a check id never names a grammar, the grammar lives in
 `Issue.location.l4.grammar` and the site node's `path_template`. So "landed" is
-one question for the whole lane (at least one `l4_field` check in `scan.checks`),
+one question for the whole lane (at least one `l4_stream` check of kind `l4_field`
+in `scan.checks`),
 and the per-grammar question is answered by `scan.start`: an unknown grammar is
 refused with `invalid_profile: unknown grammar '<x>'; known: ...`, printed as
 `[SKIP-PART] <grammar>` and the cell moves on -- but if EVERY grammar skips that
@@ -101,11 +102,13 @@ expect = EXPECT.expect
 
 
 def lane_landed(checks: list[dict]) -> bool:
-    """Has the stream lane landed at all: at least one `scan.checks` entry with the
-    `l4_field` insertion kind, whatever its id (the three generic checks carry no
-    grammar name; T6 child spec S6.3). Per-grammar support is decided by
-    `scan.start`, never by the catalogue."""
-    return any("l4_field" in (c.get("kinds") or []) for c in checks)
+    """Has the stream lane landed at all: at least one `scan.checks` entry of the
+    `l4_stream` lane with the `l4_field` insertion kind, whatever its id (the
+    three generic checks carry no grammar name; T6 child spec S6.3). The packet
+    lane's checks carry `l4_field` too, hence the lane filter. Per-grammar
+    support is decided by `scan.start`, never by the catalogue."""
+    return any("l4_field" in (c.get("kinds") or []) and "l4_stream" in (c.get("lanes") or [])
+               for c in checks)
 
 
 def worst_window(messages: list[dict]) -> tuple[int, int]:
@@ -155,7 +158,8 @@ def check_grammar(op: BusClient, vuln: ScanTarget, patched: ScanTarget,
     skipped as not landed."""
     section(f"grammar {grammar} -- speaker {service}")
     if not lane_landed(checks):
-        print(f"  [SKIP-PART] {grammar}: scan.checks has no `l4_field` check (lane not landed)", flush=True)
+        print(f"  [SKIP-PART] {grammar}: scan.checks has no `l4_stream` check of kind `l4_field` "
+              "(lane not landed)", flush=True)
         return False
 
     vuln.logs.reset()
