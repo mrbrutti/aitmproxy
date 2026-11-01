@@ -430,6 +430,14 @@ Kept by the main session during stage 6. One row per finding.
 | 8 | security | Minor | per-frame `format!` over unbounded `Issue` strings and the whole flow list; raw `poc_ref` in a toast | fix round F (F4): bound every rendered string and the flow list at insert, draw only the visible window |
 | 8 | security | Minor | head line's verdict forgeable by a name with three spaces (string re-split) | fix round F (F5): structured head, hue from the typed severity |
 | 8 | security | Minor | `flow_cursor` unclamped when an update shrinks the flow list | fix round F (F6) |
+| 8 | quality | Important | the view overrides `detail_scroll` to follow the flow cursor; paging keys cannot reach the top of a tall detail | fix round F (F7): `follow_flow` in state |
+| 8 | quality | Important | model bakes `label value` layout into strings; view re-parses them; head split on three spaces | fix round F (F8): pairs plus a structured head and one shared `labelled()` line builder |
+| 8 | quality | Minor | `Enter` reads an unclamped `flow_cursor` and materialises the whole flow list | fix round F (F9): `flow_under_cursor` with `FlowTag` |
+| 8 | quality | Minor | `scan_open_poc` matches on `contains` so an empty ref matches everything; two avoidable clones | fix round F (F3, F10) |
+| 8 | quality | Minor | three identical `u16` scroll steps in `navigate` | fix round F (F11) |
+| 8 | quality | Minor | seven public items with no external caller | fix round F (F12) |
+| 8 | quality | Minor | tests `contains` where literals exist; unit fixture loader hides a missing file | fix round F (F13) |
+| 8 | quality | Minor | Findings `Enter` arm duplicates `open_scan_flow` | fix round F (F14): shared `open_flow(id, toast)` |
 
 ## Shipped
 

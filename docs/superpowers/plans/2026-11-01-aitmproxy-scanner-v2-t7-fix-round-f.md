@@ -16,6 +16,24 @@ F5. **Head line verdict is forgeable by a name containing three spaces** (`crate
 
 F6. **`flow_cursor` not clamped when an update shrinks the flow list** (`crates/aitm-tui/src/scan/issues.rs` `fold_issue`): clamp `flow_cursor` to `flow_refs_len - 1` after replacing the issue. Test: cursor on flow 3 of 3, an update with one probe flow, `Enter` opens that flow.
 
+## Quality panel items (Task 8)
+
+F7. **The view overrides `detail_scroll` to follow the flow cursor; paging keys cannot reach the top of a tall detail** (`crates/aitm-tui/src/scan/issues.rs`, `crates/aitm-tui/src/app.rs`, `crates/aitm-tui/src/ui/scan/issues.rs`): add `IssuesState.follow_flow: bool`, set by `Up`/`Down` in the Issues Detail arm, cleared by `PageUp`/`PageDown`/`Home`/`End` and by the list-cursor reset; the view pulls `top` to the flow line only while `follow_flow`; `detail_scroll` is otherwise exactly what is drawn. Test (`tests/scan_v2_issues.rs`): a tall detail (12 timing rows, L4 evidence, 3 flows) at 90x40 with Detail focused: `Home` shows the name line; `Down` brings the flow row back on screen.
+
+F8. **The model bakes `label value` layout into strings and the view re-parses them** (`crates/aitm-tui/src/scan/issues.rs`, `crates/aitm-tui/src/ui/scan/issues.rs`, `crates/aitm-tui/src/ui/scan/jobs.rs`, `crates/aitm-tui/src/ui/scan/mod.rs`): `issue_detail_lines` returns `Vec<(&'static str, String)>` pairs like the Jobs model, with the head as a structured `IssueHead { name, severity, confidence, status }` accessor (this also delivers F5); one shared `fn labelled(theme, label, value, w, label_w: Option<usize>) -> Line<'static>` in `ui/scan/mod.rs` used by both panes (Jobs with `None`, Issues with `Some(DETAIL_LABEL_W)`); delete `head_line`'s `split_once` and `labelled_line`'s `char_indices`. Unit tests assert pairs, not padded strings.
+
+F9. `Enter` reads an unclamped `flow_cursor` and builds the whole flow list to take one element (`crates/aitm-tui/src/scan/issues.rs`, `crates/aitm-tui/src/app.rs`): `IssuesState::flow_under_cursor(&self) -> Option<(FlowRef, FlowTag)>` with `enum FlowTag { Probe, Baseline }` that clamps and indexes directly; the view and the `Enter` arm both call it (delivers F6 too); `flow_list_len` inlined; `PROBE`/`BASELINE` consts become the tag's `label()`.
+
+F10. `scan_open_poc` clones before the match (`crates/aitm-tui/src/app.rs`): compute the match before the first `&mut self` call; document that the match is on the file stem/name (F3).
+
+F11. Three identical `u16` scroll steps in `navigate` (`crates/aitm-tui/src/app.rs`): `fn scroll(scroll: &mut u16, action: &Action, len: usize, page: usize)` beside `walk`; both detail arms use it.
+
+F12. Public items with no external caller in `scan/issues.rs` (`DETAIL_VALUE_MAX`, `TIMING_ROWS_MAX`, `PROBE`, `BASELINE`, `issue_detail_line_count`, `flow_list_len`, `seen_text`, and `DETAIL_LABEL_W` once padding moves to the view): make them private.
+
+F13. Tests assert `contains` where the literal is on screen; the unit fixture loader hides a missing file (`tests/scan_v2_issues.rs`, `crates/aitm-tui/src/scan/issues.rs` tests): pin the trimmed detail lines (or pairs after F8) literally; `line_with(&text, "note ")`; `unwrap_or_else(|e| panic!("scan.issue.json: cannot read {path}: {e}"))`; add the `1999-12-31 23:59:59` and `2100-03-01 00:00:00` pins to `seen_text_is_utc_civil_time`.
+
+F14. The Findings `Enter` arm duplicates `open_scan_flow` minus `reset_view()` (`crates/aitm-tui/src/app.rs`): rename `open_scan_flow` to `open_flow(id, missing_toast: &str)` and have the Findings arm call it with its existing toast text (`finding capture is not in the flow store`), adding the `reset_view()` the other callers get; existing Findings tests are the guard.
+
 ## Not in this round
 
 Items the fix round E re-review adds are appended below when it reports.
