@@ -661,6 +661,27 @@ mod tests {
         );
     }
 
+    /// Panel S1 — a `"*"` Capture entry authorises its CIDR on every interface,
+    /// so the BPF filter for this interface must include it; a literal entry on
+    /// another interface must not contribute.
+    #[test]
+    fn scope_filter_includes_wildcard_interface_entries() {
+        let g = guard_with(vec![
+            L4ScopeEntry {
+                interface: crate::guard::ANY_INTERFACE.to_string(),
+                ..entry(("127.0.0.5", 32), (0, u16::MAX), L4Capability::Capture)
+            },
+            L4ScopeEntry {
+                interface: "other0".to_string(),
+                ..entry(("127.0.0.9", 32), (0, u16::MAX), L4Capability::Capture)
+            },
+        ]);
+        assert_eq!(
+            scope_filter(&g, MOCK_IFACE),
+            Some("host 127.0.0.5".to_string())
+        );
+    }
+
     /// A `Capture` entry on `lo0`, the macOS loopback (the plan's A10 tests speak
     /// of the rig's interface).
     fn lo0_entry(ports: (u16, u16)) -> L4ScopeEntry {
@@ -1026,27 +1047,6 @@ mod tests {
             store.get(flow_id).expect("flow").packets.len(),
             0,
             "no empty or truncated frame is recorded"
-        );
-    }
-
-    /// Panel S1 — a `"*"` Capture entry authorises its CIDR on every interface,
-    /// so the BPF filter for this interface must include it; a literal entry on
-    /// another interface must not contribute.
-    #[test]
-    fn scope_filter_includes_wildcard_interface_entries() {
-        let g = guard_with(vec![
-            L4ScopeEntry {
-                interface: crate::guard::ANY_INTERFACE.to_string(),
-                ..entry(("127.0.0.5", 32), (0, u16::MAX), L4Capability::Capture)
-            },
-            L4ScopeEntry {
-                interface: "other0".to_string(),
-                ..entry(("127.0.0.9", 32), (0, u16::MAX), L4Capability::Capture)
-            },
-        ]);
-        assert_eq!(
-            scope_filter(&g, MOCK_IFACE),
-            Some("host 127.0.0.5".to_string())
         );
     }
 

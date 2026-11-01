@@ -1009,6 +1009,26 @@ mod tests {
         assert!(disabled.l4_guard.is_none());
     }
 
+    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
+    /// every slot is a skeleton returning `None`, so the collected list is empty.
+    /// A `None` slot is skipped rather than collected — with the L4 handles present
+    /// the two L4 slots are still called and still contribute nothing. A lane
+    /// track's landing flips these literals; that track re-pins this test.
+    #[test]
+    fn skeleton_lane_slots_are_empty_today() {
+        assert_eq!(collect_lanes(None).len(), 0);
+        assert_eq!(collect_native_checks().len(), 0);
+
+        let shared = L4Shared {
+            guard: Arc::new(L4Guard::new(&L4Config {
+                enabled: true,
+                ..L4Config::default()
+            })),
+            store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
+        };
+        assert_eq!(collect_lanes(Some(&shared)).len(), 0);
+    }
+
     /// L4PAR-AC34 / spec §2.1: the hook both the server path and `aitm tui` hand
     /// the agent `McpServer`'s `on_bound` unions the bound port — the ephemeral
     /// one a `port: 0` resolved to included — into the live L4 guard's self ports,
@@ -1062,26 +1082,6 @@ mod tests {
         let guard = assembled.l4_guard.expect("l4 enabled exposes the guard");
         assert_eq!(guard.self_ports(), vec![27431, 28180, 28181, 28182]);
         let _ = std::fs::remove_dir_all(&cfg.ca.dir);
-    }
-
-    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
-    /// every slot is a skeleton returning `None`, so the collected list is empty.
-    /// A `None` slot is skipped rather than collected — with the L4 handles present
-    /// the two L4 slots are still called and still contribute nothing. A lane
-    /// track's landing flips these literals; that track re-pins this test.
-    #[test]
-    fn skeleton_lane_slots_are_empty_today() {
-        assert_eq!(collect_lanes(None).len(), 0);
-        assert_eq!(collect_native_checks().len(), 0);
-
-        let shared = L4Shared {
-            guard: Arc::new(L4Guard::new(&L4Config {
-                enabled: true,
-                ..L4Config::default()
-            })),
-            store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
-        };
-        assert_eq!(collect_lanes(Some(&shared)).len(), 0);
     }
 
     /// `Assembled::governance` hands out the assembly's own `agent_state` and
