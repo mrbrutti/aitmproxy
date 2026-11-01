@@ -11,10 +11,6 @@
 //! Everything here is a plain value or a mutex over one `Option<Instant>`, so
 //! the state machine is unit-testable with a mocked clock.
 
-// consumed by A7-A12/A19 (the speakers and the driver); nothing links the
-// trait yet.
-#![allow(dead_code)]
-
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -30,6 +26,8 @@ pub mod resp;
 pub mod smtp;
 pub mod tlv;
 pub mod udp_payload;
+
+pub use driver::{L4Services, RunningService};
 
 /// How long a Vulnerable-mode trigger keeps a service down (spec D5).
 pub const CRASH_WINDOW: Duration = Duration::from_secs(5);
@@ -113,6 +111,7 @@ pub trait Speaker: Send {
 }
 
 /// Static description of one L4 service.
+#[derive(Clone, Copy)]
 pub struct ServiceDef {
     pub name: &'static str,
     pub grammar: &'static str,
