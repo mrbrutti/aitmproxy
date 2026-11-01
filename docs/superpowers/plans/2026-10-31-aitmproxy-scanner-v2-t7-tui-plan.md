@@ -765,6 +765,7 @@ Kept by the main session during stage 6. One row per finding.
 | 17 | integration | draft PR | `claude/scanner-v2-t7-c8c950` pushed at `0ded0aeb`; draft PR #255 against main (depends on #232; body carries the eight runs, the (b) caveat, the panel so far and the plan to leave draft) | merge main after #232, port tests, H60/H61, gates, run 9, definitive run, panel comment, un-draft |
 | H (cell) | fix round | done | H81 in `b093da9b`; `--selftest` 75 ok; target boots with 40 ms where the harness offers `latency_ms` | latency run (pre-merge) with T10's harness checked out |
 | 15 | live smoke | latency 40 ms | 55 ok, 1 noted, 6 failed: T7-17 "while running" passed; the sampled job still finished within one sample (engine probes about four at a time, 100 probes/s at 40 ms) | H82 (cell): 300 ms |
+| H (cell) | fix round | done | H82 in `a84b8d63`; `--selftest` 76 ok; cell complete | latency run at 300 ms (pre-merge) |
 
 ## Shipped
 
