@@ -461,6 +461,11 @@ Kept by the main session during stage 6. One row per finding.
 | 9 | coder note | note | legacy `endpoint_flows` ids that are not UUIDs cannot be carried in `SiteNode.flows` (fixture-only); `Enter` still opens them through `legacy.endpoint_flows` | accepted |
 | 9 | coder note | Minor | `tests/scan_v2_matrix.rs` sets `sitemap.nodes` directly, bypassing the fold | fix round G (G13): route through `fold_result` |
 | 9 | coder note | Minor | two pre-existing em dashes in legacy toast literals in `app.rs` | fix round G (G14): replace with a colon |
+| 9 | security | Minor | `traits` unbounded at fold; per-frame serde tokens per trait | fix round G (G15) |
+| 9 | security | Minor | `next_cursor` echoed to the core unbounded | fix round G (G16) |
+| 9 | security | Minor | no total cap across appended pages; quadratic fold | fix round G (G17) |
+| 9 | security | Minor | `authority_parts` accepts `@` and other delimiters in a host | fix round G (G18) |
+| 9 | security | note | on a bus offering both `scan.start` and `scan.discover`, the legacy fold overwrites the v2 Site map lists without clamping cursors (no panic) | fix round G (G19): `show_legacy` only under `MapSource::Legacy`, else the legacy result stays in `legacy.*` |
 
 ## Shipped
 

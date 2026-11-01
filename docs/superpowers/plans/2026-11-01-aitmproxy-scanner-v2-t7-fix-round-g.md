@@ -36,6 +36,18 @@ G13. `tests/scan_v2_matrix.rs` sets `sitemap.nodes` directly (bypassing the fold
 
 G14. Two pre-existing em dashes in legacy toast literals in `crates/aitm-tui/src/app.rs` ("Scan needs an in-scope host — ...", "Out of scope — add ..."): replace the dash with a colon; update the `scan_surface.rs` assertion if it pins the text.
 
+## Task 9 security panel
+
+G15. `bound_point` leaves `traits` unbounded and `point_line` tokenises every trait per frame (`crates/aitm-tui/src/scan/sitemap.rs`): `dedup` and `truncate(POINT_TRAITS_MAX = 8)` at fold, and precompute each point's display line at fold (a `PointLine` twin like `NodeLine`) so the view only copies. Test: a point with 10^6 `url` traits folds to 8 and renders at 200x50.
+
+G16. `next_cursor` is echoed back to the core unbounded (`crates/aitm-tui/src/scan/sitemap.rs` `fold_result`): if `next_cursor.len() > CURSOR_MAX = 1024` set it to `None` and record `ScanError::uncoded("scan.sitemap", "next_cursor exceeds 1024 bytes")`. Test: a 1 MiB cursor yields `next_cursor == None` and `n` sends nothing.
+
+G17. No total cap across appended pages; quadratic fold (`crates/aitm-tui/src/scan/sitemap.rs`): `SITEMAP_TOTAL_LIMIT = 8192` nodes and points after which the fold drops `next_cursor` and the summary says `limit reached`; `order_points`/`node_points` index node ids in a `HashMap<&str, usize>` so a fold is linear. Test: 17 appended full pages leave 8192 nodes and `next_cursor == None`.
+
+G18. `authority_parts` accepts `@`, `/`, `?`, `#` and whitespace in a host (`crates/aitm-tui/src/scan/profiles.rs`): refuse them with `ORIGIN_HOST_ERROR`; add `http://a@b` and `http://a b` to the refusal tests.
+
+G19. On a bus offering both `scan.start` and `scan.discover` the legacy fold overwrites the v2 Site map lists (`crates/aitm-tui/src/app.rs` `scan.discover` arm, `crates/aitm-tui/src/scan/sitemap.rs`): call `show_legacy` only when `MapSource::from(scan_offer()) == Legacy`; under V2 the legacy result stays in `legacy.*` and the Site map shows v2 content. Test: a V2 app with a folded `scan.sitemap` page then a `scan.discover` reply keeps its nodes.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
