@@ -347,9 +347,11 @@ fn an_l4_confirm_from_flows_still_shows_the_flow_list() {
 /// Fix round H, H34 (D6 hostile-core bounds): the server's prompt is
 /// bounded once, in `WireConfirm::from_reply`, to `PROMPT_MAX` cells with
 /// control characters stripped, and the overlay wraps it to the box's rows
-/// only. A 1 MiB prompt of words renders in the box ending in an ellipsis
-/// at 200x50, every row within the box's width, and the footer line is
-/// still drawn under it.
+/// only. A 1 MiB prompt of tab-joined words folds to one unit; a 1 MiB
+/// prompt of space-separated words (the one that wraps) renders in the box
+/// ending in an ellipsis at 200x50, every row within the box's width, and
+/// (fix round H, H50) the `y confirm` key line is the last row drawn
+/// inside the box.
 #[test]
 fn a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box() {
     use aitm_tui::scan::launch::PROMPT_MAX;
@@ -374,6 +376,18 @@ fn a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box() {
     assert!(confirm.prompt.ends_with('…'), "cut once at fold");
     assert!(!confirm.prompt.contains('\t'), "tabs stripped");
 
+    // The wrapping case: `PROMPT_MAX` cells of space-separated words need
+    // more rows than the 16-row box holds.
+    let spaced = "word ".repeat(1 << 18);
+    let reply = json!({
+        "status": "needs_confirmation",
+        "prompt": spaced,
+        "confirm_token": "tok-9",
+    });
+    let confirm =
+        WireConfirm::from_reply("scan.start", &json!({ "profile_name": "standard" }), &reply)
+            .expect("a confirmation handshake");
+    assert!(width(&confirm.prompt) <= PROMPT_MAX);
     let mut app = fixture_app_core(200, 50);
     app.wire_confirm = Some(confirm);
     app.mode = Mode::WireConfirm;
@@ -388,17 +402,23 @@ fn a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box() {
         .take_while(|l| !l.contains('└'))
         .collect();
     assert!(
-        rows.iter().any(|l| l.contains("wordwordword")),
+        rows.iter().any(|l| l.contains("word word word")),
         "the cleaned prompt is drawn: {text}"
     );
     assert!(
         rows.iter()
-            .filter(|l| l.contains("wordword"))
+            .filter(|l| l.contains("word word"))
             .any(|l| l.contains('…')),
         "a prompt the box cannot hold ends in an ellipsis: {text}"
     );
+    let key = rows
+        .iter()
+        .position(|l| l.contains("y confirm (re-issues with _confirm) · n / Esc cancel"))
+        .unwrap_or_else(|| panic!("the key line is drawn inside the box: {text}"));
     assert!(
-        text.contains("y confirm (re-issues with _confirm)"),
-        "the footer survives under the prompt: {text}"
+        rows[key + 1..].iter().all(|l| l
+            .trim_matches(|c: char| c == '│' || c.is_whitespace())
+            .is_empty()),
+        "the key line is the last row drawn in the box: {text}"
     );
 }

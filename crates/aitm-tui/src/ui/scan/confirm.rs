@@ -61,6 +61,10 @@ impl Family {
     }
 }
 
+/// The rows around the prompt: the call-name line and its blank above, the
+/// blank, the footnote and the key line below.
+const PROMPT_FRAME_ROWS: usize = 5;
+
 /// Draw the wire-confirm overlay for the pending `App::wire_confirm`: a
 /// `scan.*` call reads the scan-launch wording, any other call (the `l4.*`
 /// verbs) the guarded-L4 wording ([`Family`]).
@@ -83,12 +87,14 @@ pub fn render(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         Line::raw(""),
     ];
     // Wrap the server's prompt (bounded at fold, fix round H, H34) to the
-    // panel width by cell width (fix round G, G55) and to no more rows than
-    // the box has; an empty prompt keeps its one blank row.
+    // panel width by cell width (fix round G, G55) and to the rows the box
+    // has left after the two header rows and the three trailer rows (fix
+    // round H, H50), so the key line is always the last row drawn; an
+    // empty prompt keeps its one blank row.
     let mut chunks = wrap(
         &c.prompt,
         usize::from(inner.width).saturating_sub(2),
-        usize::from(inner.height),
+        usize::from(inner.height).saturating_sub(PROMPT_FRAME_ROWS),
     );
     if chunks.is_empty() {
         chunks.push(String::new());
