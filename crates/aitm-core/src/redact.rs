@@ -2472,4 +2472,168 @@ mod tests {
             "a standard key was not masked across half a million line breaks"
         );
     }
+
+    /// Five thousand `(parent, credential)` pairs from a seeded xorshift64
+    /// generator, so every run sees the same ones. A credential is 4 to 43
+    /// characters of `A-Za-z0-9` followed by `=` or `==`, the shape of padded
+    /// base64; the parent is a standard secret key.
+    fn padded_credentials() -> Vec<(&'static str, String)> {
+        const PARENTS: [&str; 6] = ["token", "password", "secret", "session", "auth", "api_key"];
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        (0..5_000)
+            .map(|_| {
+                let parent = PARENTS[(next() % PARENTS.len() as u64) as usize];
+                let len = 4 + (next() % 40) as usize;
+                let mut credential: String = (0..len)
+                    .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize] as char)
+                    .collect();
+                credential.push_str(if next() % 2 == 0 { "=" } else { "==" });
+                (parent, credential)
+            })
+            .collect()
+    }
+
+    /// After a secret key the first token is the value, even on the next line,
+    /// and it is masked whole. A secret pair that starts after that token is
+    /// masked as a pair; none of these rows has one that starts inside it.
+    #[test]
+    fn scrub_text_keeps_the_output_it_had_when_no_secret_pair_starts_inside_a_masked_value() {
+        let rows = [
+            ("auth:\n  password=hunter2", "auth:\n  [redacted]"),
+            ("auth=\n  password=hunter2", "auth=\n  [redacted]"),
+            (
+                "auth:\n  creds:\n    password: hunter2",
+                "auth:\n  [redacted]\n    password: [redacted]",
+            ),
+            ("auth:\n  user: bob", "auth:\n  [redacted] bob"),
+            ("token:\n  author: bob", "token:\n  [redacted] bob"),
+            (
+                "auth:\n  authority: example.com",
+                "auth:\n  [redacted] example.com",
+            ),
+            (
+                "auth:\n  user: bob\n  password: hunter2",
+                "auth:\n  [redacted] bob\n  password: [redacted]",
+            ),
+            (
+                "auth:\n  # note\n  password: hunter2",
+                "auth:\n  [redacted] note\n  password: [redacted]",
+            ),
+            (
+                "credentials:\n  - password: hunter2",
+                "credentials:\n  [redacted] password: [redacted]",
+            ),
+            (
+                "auth: x\n  password: hunter2",
+                "auth: [redacted]\n  password: [redacted]",
+            ),
+            ("auth:\n", "auth:\n"),
+            ("auth:\n  sessionKey: abc123", "auth:\n  [redacted] abc123"),
+            (
+                "Authorization:\n  password: hunter2",
+                "Authorization:\n  [redacted]",
+            ),
+            ("password:\n  hunter2", "password:\n  [redacted]"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A value that reads like a pair (`YWJj=`, `s3cr:et`, `user:pass`) on the
+    /// line after a standard secret key is that key's value and is masked whole,
+    /// whatever separator or secret-looking word it contains.
+    #[test]
+    fn scrub_text_masks_a_value_that_looks_like_a_pair_under_a_secret_parent() {
+        let rows = [
+            ("token:\n  YWJj=", "token:\n  [redacted]"),
+            ("token:\n  YWJj==", "token:\n  [redacted]"),
+            ("password:\n  s3cr:et", "password:\n  [redacted]"),
+            ("token:\n  dXNlcjpwYXNz", "token:\n  [redacted]"),
+            ("password:\n  user:pass", "password:\n  [redacted]"),
+            ("token:\n  AApwdBB=", "token:\n  [redacted]"),
+            (
+                "token:\n  AApwdBB==\n  other: 1",
+                "token:\n  [redacted]\n  other: 1",
+            ),
+            ("password:\n  sid:abc", "password:\n  [redacted]"),
+            ("password:\n  auth=xyz", "password:\n  [redacted]"),
+            ("secret:\n  a=b", "secret:\n  [redacted]"),
+            ("auth:\n  user:pass", "auth:\n  [redacted]"),
+            ("token:\r\n  YWJj=\r\n", "token:\r\n  [redacted]\r\n"),
+            (
+                "session:\n\tQWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+                "session:\n\t[redacted]",
+            ),
+            (
+                "password:\n  jwt=eyJhbGciOi.eyJzdWIi.sig=",
+                "password:\n  [redacted]",
+            ),
+            ("api_key:\n  Key=AAA=:", "api_key:\n  [redacted]"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
+
+    /// A padded base64 credential on the line after a standard secret key is the
+    /// key's value, whatever its length and whichever key: the whole credential
+    /// is masked and nothing of it is left in the clear.
+    #[test]
+    fn scrub_text_masks_a_padded_base64_credential_on_the_next_line() {
+        let mut checked = 0;
+        for (parent, credential) in padded_credentials() {
+            let input = format!("{parent}:\n  {credential}");
+            let expected = format!("{parent}:\n  [redacted]");
+            let actual = scrub_text(&input);
+            assert!(
+                actual == expected,
+                "a padded credential was not masked whole: {input:?} gave {actual:?}"
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 5_000, "the generator changed its count");
+    }
+
+    /// The closing quote of a masked quoted value is not an opening quote: the
+    /// text that follows it is scanned as it always was, so a `sid:` inside the
+    /// quotes is part of the masked value and the quote after it ends that value.
+    #[test]
+    fn scrub_text_does_not_read_the_closing_quote_of_a_masked_value_as_an_opener() {
+        let rows = [
+            (
+                "token=\"sid: \" tail=\"x\"",
+                "token=\"[redacted]\" tail=\"x\"",
+            ),
+            (
+                "token=\"sid:\" tail=\"x\"",
+                "token=\"[redacted]\" tail=\"x\"",
+            ),
+            (
+                "token=\"a sid:\" tail=\"x\"",
+                "token=\"[redacted]\" tail=\"x\"",
+            ),
+            (
+                "x=1&token='auth='&y=\"z\"",
+                "x=1&token='[redacted]'&y=\"z\"",
+            ),
+            ("x=1&token=\"sid:\t\"\ny=2", "x=1&token=\"[redacted]\"\ny=2"),
+        ];
+        let bad = mismatches(&rows);
+        assert!(
+            bad.is_empty(),
+            "(input, expected, actual) is wrong: {bad:#?}"
+        );
+    }
 }
