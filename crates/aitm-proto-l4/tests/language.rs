@@ -36,7 +36,10 @@ use aitm_proto_l4::types::{
     IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange, RateCap,
 };
 
-const IFACE: &str = "lo";
+/// The scope interface: the per-OS loopback the `l4:` step defaults to
+/// (`lo0` on macOS/BSD, `lo` on Linux), so the normative no-`interface`
+/// step bodies below prove the default on the OS the tests compiled for.
+const IFACE: &str = aitm_proto_l4::language::DEFAULT_INTERFACE;
 
 // --- a hermetic capture/inject backend (no socket, no privilege) ------------
 
@@ -163,10 +166,14 @@ fn synack_reply() -> Vec<u8> {
 
 /// A Rhai UDP `send_recv` stimulus to 127.0.0.1:9 (the serde `PacketSpec` form,
 /// mirroring the `l4.craft`/`l4.send_recv` command arguments).
-const SEND_RECV_SCRIPT: &str = r#"
-    let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
-    l4.send_recv(spec, "127.0.0.1", "lo", 9, 50)
-"#;
+fn send_recv_script() -> String {
+    format!(
+        r#"
+    let spec = #{{ layers: [ #{{ ipv4: #{{ dst: "127.0.0.1" }} }}, #{{ udp: #{{ dst_port: 9 }} }} ] }};
+    l4.send_recv(spec, "127.0.0.1", "{IFACE}", 9, 50)
+"#
+    )
+}
 
 #[test]
 fn ac4_sensitive_verb_refused_when_agent_gate_closed() {
@@ -184,7 +191,7 @@ fn ac4_sensitive_verb_refused_when_agent_gate_closed() {
     // the closed inject gate refuses this call.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
-        .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+        .eval::<rhai::Dynamic>(&send_recv_script())
         .expect_err("a closed agent gate refuses l4.send_recv");
     let msg = err.to_string();
     assert!(
@@ -210,7 +217,7 @@ fn ac4_sensitive_verb_runs_when_agent_gate_open() {
     // Seed `Agent`: with the inject gate open, the live-trust gate admits the call.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let out = engine
-        .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+        .eval::<rhai::Dynamic>(&send_recv_script())
         .expect("an open agent gate admits l4.send_recv");
     let map = out
         .try_cast::<rhai::Map>()
@@ -260,7 +267,7 @@ fn ac4_operator_engine_bypasses_the_agent_gate() {
     // Seed `Operator`: the closed agent gate is bypassed for operator trust.
     let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let _ = engine
-        .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+        .eval::<rhai::Dynamic>(&send_recv_script())
         .expect("operator engine bypasses the agent gate");
 }
 
@@ -279,15 +286,17 @@ fn ac4_out_of_scope_send_recv_refusal_surfaces_to_the_script() {
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
-    let script = r#"
-        let spec = #{ layers: [ #{ ipv4: #{ dst: "10.9.9.9" } }, #{ udp: #{ dst_port: 9 } } ] };
-        l4.send_recv(spec, "10.9.9.9", "lo", 9, 50)
-    "#;
+    let script = format!(
+        r#"
+        let spec = #{{ layers: [ #{{ ipv4: #{{ dst: "10.9.9.9" }} }}, #{{ udp: #{{ dst_port: 9 }} }} ] }};
+        l4.send_recv(spec, "10.9.9.9", "{IFACE}", 9, 50)
+    "#
+    );
     // Seed `Agent` with the inject gate OPEN, so the refusal under test is the scope
     // check, not the agent gate or the missing-context fail-closed.
     let _seed = seed_call_context(CallerTrust::Agent, None, None);
     let err = engine
-        .eval::<rhai::Dynamic>(script)
+        .eval::<rhai::Dynamic>(&script)
         .expect_err("an out-of-scope send_recv is refused");
     assert!(
         err.to_string().contains("out of L4 scope"),
@@ -313,14 +322,16 @@ fn inject_count_zero_is_a_no_op() {
     let engine =
         build_engine_with_languages(&RhaiLimits::default(), Duration::from_secs(5), &[&lang])
             .expect("engine builds");
-    let script = r#"
-        let spec = #{ layers: [ #{ ipv4: #{ dst: "127.0.0.1" } }, #{ udp: #{ dst_port: 9 } } ] };
-        l4.inject(spec, "127.0.0.1", "lo", 0)
-    "#;
+    let script = format!(
+        r#"
+        let spec = #{{ layers: [ #{{ ipv4: #{{ dst: "127.0.0.1" }} }}, #{{ udp: #{{ dst_port: 9 }} }} ] }};
+        l4.inject(spec, "127.0.0.1", "{IFACE}", 0)
+    "#
+    );
     // Seed `Operator` so dispatch reaches the inject no-op.
     let _seed = seed_call_context(CallerTrust::Operator, None, None);
     let out = engine
-        .eval::<rhai::Dynamic>(script)
+        .eval::<rhai::Dynamic>(&script)
         .expect("inject with count:0 runs and is a no-op");
     let map = out.try_cast::<rhai::Map>().expect("inject returns a map");
     let sent = map
@@ -374,7 +385,7 @@ fn per_call_trust_decides_on_one_rhai_registration() {
     {
         let _seed = seed_call_context(CallerTrust::Agent, None, None);
         let err = engine
-            .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+            .eval::<rhai::Dynamic>(&send_recv_script())
             .expect_err("an Agent caller is refused by the closed inject gate");
         let msg = err.to_string();
         assert!(
@@ -392,7 +403,7 @@ fn per_call_trust_decides_on_one_rhai_registration() {
     {
         let _seed = seed_call_context(CallerTrust::Operator, None, None);
         let _ok = engine
-            .eval::<rhai::Dynamic>(SEND_RECV_SCRIPT)
+            .eval::<rhai::Dynamic>(&send_recv_script())
             .expect("an Operator caller bypasses the agent gate on the same registration");
     }
     assert_eq!(

@@ -19,7 +19,7 @@
 | # | Decision | Tasks |
 |---|---|---|
 | 1 | Status shape `{available, code, reason, captures\|sessions}` and the `code` vocabulary are (a)'s; the privilege spec only adds an optional `privilege` key. Tests assert `code`; literal reasons only in A9. | A4, A14, A9 |
-| 2 | `l4.flow.get` bytes: the core never records its own listeners; `bytes` only for trusted callers or an open agent Capture gate; at most 4 MiB of raw bytes per reply. | A10, A11, A12 |
+| 2 | `l4.flow.get` bytes: the core never records its own listeners; `bytes` per packet: trusted callers always; an agent sees captured packets with its Capture gate open and injected packets with its Inject gate open (spec §2.2 as amended after the re-panel); at most 4 MiB of raw bytes per reply. | A10, A11, A12 |
 | 3 | `l4.intercept.list` is arrival-ordered (oldest first, `parked_at`); every UI acts on the first listed entry for the flow (plan question 2, decided). | A13, B1, C1, M1 |
 | 4 | Availability is read through an `AvailabilitySource` at invoke time, so D0 swaps in `PrivilegeState` without touching commands. | A14 |
 | 5 | Operator scope add (fork ii, with Matt) moves to (a') as A6. A5 (`source` provenance on `l4.scope.list`) stays in (a): it landed as be9d15e4, is harmless on its own, and the UI units read `source` regardless of fork ii. UI scope-add controls render only when `tools/list` shows `l4.scope.add` `confirmable: true`. | A5, A6, B1, B6, C1, C7, M2, M7 |
@@ -163,6 +163,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 
 ### Task A10: self-exclusion of the core's own listeners
 
+> Amended after the panel (Review log): the choke point is `L4Guard::admit_frame`/`admit_endpoints`, used by every recorder (capture loop, send_recv reply listener, intercept park, NE ingress) and `main.rs`/`tui.rs` add bound ports with `add_self_ports` through the shared `self_port_hook` in `wire.rs`; `is_self_traffic` was dropped and `self_exclusion_bpf(interface)` is `pub(crate)` on the guard; files also include `sendrecv.rs`, `ingress.rs`, `tui.rs`.
+
+
 - **Satisfies:** AC34
 - **Depends on:** A15
 - **Files:** `crates/aitm-proto-l4/src/{capture,guard,module}.rs`, `crates/aitm/src/wire.rs`, `crates/aitm/src/main.rs` (both in spec §7(a); name them in the claim)
@@ -177,6 +180,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
 ### Task A11: bytes only to trusted callers
+
+> Amended after the re-panel (Review log): the gate is per packet (captured→Capture gate, injected→Inject gate), not per caller or per flow kind; tests `…_per_packet`.
+
 
 - **Satisfies:** AC35
 - **Depends on:** A10
@@ -196,6 +202,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 
 ### Task A13: `l4.intercept.list` in arrival order
 
+> Amended after the panel (Review log): the sequence is process-wide (`NEXT_PARKED_SEQ`), sort key `(parked_seq, id)`.
+
+
 - **Satisfies:** AC37
 - **Depends on:** A12
 - **Files:** `crates/aitm-proto-l4/src/intercept/mod.rs`, `src/commands/intercept.rs`
@@ -205,6 +214,9 @@ Spec §7(a) file list. Constraint for every (a) task: **zero `aitm-core` edits**
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
 ### Task A9: unprivileged live checks and the blocked-aware privileged walk
+
+> Amended after the panel (Review log): the core cell asserts the 22 module verbs, not a total count; the AC6 agent scope-add check runs here and AC5 is skipped until (a').
+
 
 - **Satisfies:** AC2 (live), AC3, AC4, AC9, AC34 [D0] verdict, AC1/AC8 [D0] verdicts
 - **Depends on:** A13
@@ -235,10 +247,11 @@ Cut from `main` after (a) merges (spec §7(a'), fork (ii)). The security reviewe
 
 - **Satisfies:** AC5, AC6, AC7
 - **Depends on:** A5
-- **Files:** `crates/aitm-proto-l4/src/guard.rs`, `src/commands/{scope,mod}.rs`, `tests/operator_surfaces.rs`, `tests/language.rs`, `crates/aitm/tests/l4_operator_surfaces.rs`, `tests/e2e/l4/test_l4_parity_core.py`
+- **Files:** `crates/aitm-proto-l4/src/guard.rs`, `src/commands/{scope,mod}.rs`, `tests/operator_surfaces.rs`, `tests/language.rs`, `crates/aitm/tests/l4_operator_surfaces.rs`, `tests/e2e/l4/test_l4_parity_core.py`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`, `aitmproxy-plugin/docs/tool-reference.md` (the two 'not shipped yet' sentences only)
 - **Change:**
   - `scope.rs`: `pub struct OperatorConfirmed(());` with its only constructor `pub(in crate::commands::scope) fn new() -> Self`. `ScopeAdd::confirm_prompt` is always `Some`: with valid args `"Confirm l4.scope.add: {capability} scope for {cidr} {ports} on {interface} ({direction}), {rate}. A runtime entry never lifts the dangerous-destination denylist. Re-issue with `_confirm` to add."`, where `{ports}` is `ports 9100-9199` or `all ports`, `{rate}` is `inject rate {pps}pps/{burst}burst` or `inject refused (rate 0)`, and a prefix shorter than /16 (IPv4) or /48 (IPv6) appends ` WARNING: /{n} is a wide range.`; with missing or invalid args `"Confirm l4.scope.add: add an L4 scope entry ({error}). Re-issue with `_confirm` to add."`. `invoke` builds the entry, then trusted control → `self.guard.add_operator_scope(entry, OperatorConfirmed::new())`, else `self.guard.add_runtime_scope(entry)?`.
   - `guard.rs`: `pub(crate) fn add_operator_scope(&self, entry: L4ScopeEntry, _proof: OperatorConfirmed) -> L4ScopeId` (no widen check) and the existing `add_runtime_scope` both end in one private `fn push_runtime(&self, entry: L4ScopeEntry) -> L4ScopeId` that forces `source = Runtime`. `commands/mod.rs`: `cidr_to_string`, `ports_to_string` become `pub(crate)`. `language.rs` is not changed.
+  - Docs: flip the 'not shipped yet' sentences in those two files (the overview's L4 scope paragraph and the tool-reference's `l4.scope.add` bullet) to state that the operator-confirmed add shipped.
 - **Test first:**
   - `cargo test --offline -p aitm-proto-l4 --lib`: `scope::tests::confirm_prompt_some_for_empty_args`; `confirm_prompt_summarises_entry` (AC5 args → contains `127.0.0.1/32`, `9100-9199`, `lo0`, `inbound`, `capture`); `confirm_prompt_variants` (ports omitted → `all ports`; `inject_rate {pps: 0, burst: 0}` → `inject refused (rate 0)`; `10.0.0.0/8` → `WARNING: /8 is a wide range`); `guard::tests::operator_scope_cannot_lift_denylist` (AC7: `dangerous_dst_override: true`; operator add of `169.254.169.254/32` eth0 outbound inject passed in with `source: Config` → stored `Runtime`; `check(Inject, 169.254.169.254:80 on eth0)` → `Err(DangerousDestinationBlocked("169.254.169.254".into()))`).
   - `--test operator_surfaces operator_scope_add_skips_widen_gate`: widen off; `ScopeAdd` invoked with `Parts::host(Frontend::Operator)` → `Ok(Str(id))`, list gains `source: "runtime"`; `Parts::host(Frontend::Cli)` → `Ok`; `Parts::host(Frontend::Mcp)` → `Err` with text `R_WIDEN`, list unchanged.
@@ -599,8 +612,8 @@ Spec §7(e) file list. Starts after (a) is reviewed; merges after (a) and (a').
 - **Satisfies:** AC32 (second half)
 - **Depends on:** E1
 - **Files:** `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`, `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md`
-- **Change:** overview gains an "L4 (raw TCP/UDP)" section: the status verbs answer `available`, `code`, `reason` (and what `needs_privilege`, `unsupported_platform`, `not_configured` mean); `l4.scope.add` is operator-confirmed and an agent is refused unless the operator opened the Widen gate; `l4.intercept.*` is Linux NFQUEUE only; verdict verbs take the **parked id** from `l4.intercept.list` (oldest first), never the flow id; `l4.flow.get` takes `offset`/`limit` (`limit: 0` for listing), returns `bytes` only to the operator or an agent with the Capture gate open, and pages with `next_offset` when `truncated`. Intercept-mutate gains one paragraph separating HTTP `flow.intercept` / `flow.resume` from `l4.intercept.*`.
-- **Test first (the check):** `grep -c` for `available`, `code`, `reason`, `l4.scope.add`, `parked`, `Linux`, `next_offset` in the overview; each 0 on `origin/main`.
+- **Change:** overview gains an "L4 (raw TCP/UDP)" section: the status verbs answer `available`, `code`, `reason` (and what `needs_privilege`, `unsupported_platform`, `not_configured` mean); `l4.scope.add` is operator-confirmed and an agent is refused unless the operator opened the Widen gate; `l4.intercept.*` is Linux NFQUEUE only; verdict verbs take the **parked id** from `l4.intercept.list` (oldest first), never the flow id; `l4.flow.get` takes `offset`/`limit` (`limit: 0` for listing), returns `bytes` per packet: always to the operator or the CLI; to an agent only for captured packets when its Capture gate is open and for injected packets when its Inject gate is open, and pages with `next_offset` when `truncated`. Intercept-mutate gains one paragraph separating HTTP `flow.intercept` / `flow.resume` from `l4.intercept.*`.
+- **Test first (the check):** `grep -c` for `available`, `code`, `reason`, `l4.scope.add`, `parked id`, `Linux`, `next_offset` in the overview; each 0 on `origin/main`.
 - **Live check:** each ≥ 1; human read-through by the spec reviewer.
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
@@ -610,6 +623,33 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| (a) A10/A11 | security | Critical | Self-exclusion guarded only the capture loop; send_recv replies, Linux parks and NE ingress units reach the same store that `l4.flow.get` now serves with bytes | fixed: `L4Guard::admit_frame`/`admit_endpoints` choke point + intercept forwards self traffic (d9f01f95); send_recv BPF + Ignore, NE ingress, tui on_bound (53a95d1a) |
+| (a) A11 | security | Important | Capture gate alone exposed bytes of intercept/craft flows an agent could not capture | fixed d9f01f95: bytes gate keyed on flow kind (Capture→Capture, SendRecv/craft→Inject, Intercept→Intercept); spec §2.2 amended |
+| (a) A10 | security | Important | `aitm tui` with an ephemeral bus port never added it to the self-port set | fixed 53a95d1a (tui.rs on_bound hook) |
+| (a) A13 | quality, spec | Important | `parked_seq` per session: unfiltered `l4.intercept.list` interleaved sessions | fixed d9f01f95: process-wide `NEXT_PARKED_SEQ`, sort `(parked_seq, id)`, tester's cross-session test un-ignored |
+| (a) A9 | spec | Important | priv cell's BPF assertion false-fails on a multi-port rig | fixed 8b5fed22 (tester): parses both filter forms |
+| (a) A9 | spec | Important | Agent scope-add live check (AC6) landed in (a) though planned for (a') | accepted by the orchestrator 2026-11-01: the check is correct and runs against R_WIDEN; A6's live check on (a') turns the AC5 skip into a pass |
+| (a) A4/A10/A13/A15/e2e | quality | Minor ×14 | description whitespace, `epoch_ms`/`field` duplication, triple frame decode, three self-port writers, status verbs exempted by name, Rhai `flow.get` unpaged, `ParkedTable` leaks `entries`, test helper duplication, implementation-asserting tests, e2e helper duplication, never-ran `[ok]`, missing `serial`, hard-coded tool count, duplicated cfg list | fixed d9f01f95 except: e2e status-parsing helpers stay per cell (a shared `aitm_e2e/l4.py` is follow-up work for unit (e), file outside (a)) |
+| (a) A4 | spec | Minor | macOS probe unit test asserted the literal reason | fixed d9f01f95: asserts `code` and a non-empty reason |
+| (a) A7 | spec | Minor | `pub const DEFAULT_INTERFACE` not recorded | accepted by the orchestrator 2026-11-01: recorded here; needed so both test files share one per-OS constant |
+| (a) A5 | spec | Minor | `commands/scope.rs` missing from §7(a); A5 filed under (a') | fixed: spec §7(a) lists it; A5 stays in (a) (Decision 5) |
+| (a) A2 | security | Minor | `l4.flow.get` clones the whole flow under the store lock whatever the window | accepted by the orchestrator 2026-11-01 as follow-up (windowed store accessor in `src/flow.rs`, the store, outside (a)) |
+| (a) §2.1 | security | Minor | Other cores on the host and the CDP port are not excluded | accepted; recorded as a known limit in spec §2.1 |
+| (a) A14 | quality | Minor | `docs/design/languages/rhai.api.json` still lists `flow.get` with only `id` | fixed in (a) after the Terminal gate's `shipped_namespaces_equal_production_assembly` golden went red: the `l4` namespace entry regenerated to the production signature (offset, limit, per-packet bytes text); file claimed through the orchestrator |
+| (a) A11 (re-panel) | security | Important | Per-flow-kind bytes gate let an Inject-only agent read captured send_recv replies | fixed 28af06e3: per-packet rule (captured→Capture gate, injected→Inject gate); spec §2.2/AC35 amended 262b15ab |
+| (a) A13 (re-panel) | quality | Important | `expire_due` deep-cloned every parked packet per reader pass | fixed f3d5a4f2: `ParkedTable::due()` by reference |
+| (a) fix 2 (re-panel) | security | Minor ×2 | NE ingress ran the frame decoder over UDP payloads (crafted payload could suppress a record); intercept self-check parsed as Ethernet while `ip_target` parses L3 | fixed e5ac6f63 (target-only admission), 0b95ef21 (one L3 parse) |
+| (a) fix 2 (re-panel) | security | Minor | Intercept gate alone shows parked bytes | superseded by the per-packet rule (parked packets are captured → Capture gate) |
+| (a) fix 1/2 (re-panel) | quality | Minor ×9 | source-grep tui test, dead `is_self_traffic`, caller-side loopback check for the BPF clause, `&[]` frame marker in ingress, duplicated self-port hook, triple transport mapping, needless clones in scoped send_recv, SeqCst + overclaiming doc, fifth fixture builder | fixed 7570eb39, 2e3514d2, e5ac6f63, 5d841ec9, 7f5aac56, fed99d25 (`is_self_traffic` deleted and `self_exclusion_bpf(interface)` in 2e3514d2) |
+| (a) docs (re-panel) | spec | Important | §2.2 amendment not carried into Goals, AC35, Decision 2, A11, E2 | fixed 262b15ab (per-packet rule everywhere) |
+| (a) docs (re-panel) | spec | Minor ×4 | AC34 names only the capture loop; Constraints bullet lacks tui/ingress; A10/A13/A9 task text drifted; Review log SHAs missing; `is_loopback_interface` pub | fixed 262b15ab; `is_loopback_interface` `pub(crate)` in 2e3514d2 |
+| (a) merge | spec | Minor | `Cargo.lock` touched (d2261658) outside §7(a) | accepted by the orchestrator 2026-11-01: mechanical re-resolution after merging main 3d710ab (`aitm-sysproxy` 0.5.6→0.5.7, the workspace version); cargo makes the same edit on any build |
+| (a) merge (pass 3) | security, quality | Minor / Important | Two fallible `local_addr()?` calls left after the system-proxy auto-set (restore-on-exit invariant); addresses read twice | fixed 5015b1f2 (pre-bound addresses), 340a5bfb (one iterator, duplicate configured-port add dropped) |
+| (a) fix 3 (pass 3) | quality | Minor ×4 | tui bind test failed in the sandbox instead of skipping; `ip_endpoints` duplicated the address extraction; two adjacent bools in `bytes_visible`; test helpers duplicated again | fixed 340a5bfb (`PermissionDenied` skip, `endpoints_of`, `BytesView`, shared helpers) |
+| (a) docs (pass 3) | spec | Minor ×3 | Review log SHAs; AC34 tui test name; `Cargo.lock` row | fixed d55b0fc9 and this row |
+| (a) pass 3 | spec, security | PASS | third-pass verdicts: spec PASS, security PASS; quality FAIL only on the fallible-call item fixed in 5015b1f2 before its report landed | closed; fix task 4 touched Minors only, verified by the Terminal gate on the final head (no fourth panel pass) |
+| (e) order | spec | Important | (e) merged after (a) only, ahead of (a') | accepted by the orchestrator 2026-11-01 (it released (e) after #215); A6 on (a') gains a step that flips the two 'not shipped' passages (overview scope paragraph; tool-reference L4 bullet) |
+| (e) E2 | spec | Minor | frontmatter `description` edits in both skills | accepted by the orchestrator 2026-11-01: safe, single-line scalars, under 1024 chars, pinned phrases intact |
 
 ## Shipped
 

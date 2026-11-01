@@ -232,3 +232,120 @@ fn entry_from_params(args: &Params) -> anyhow::Result<L4ScopeEntry> {
         source: L4ScopeSource::Runtime,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::L4Config;
+    use crate::types::{IpCidr, L4Capability, L4Direction, PortRange};
+
+    struct StubClient;
+    impl aitm_core::ProxyClient for StubClient {
+        fn send(
+            &self,
+            _req: aitm_core::HttpRequest,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<aitm_core::HttpFlow>> {
+            Box::pin(async { anyhow::bail!("stub client") })
+        }
+    }
+
+    fn entry(ports: PortRange, source: L4ScopeSource) -> L4ScopeEntry {
+        L4ScopeEntry {
+            id: L4ScopeId::new(),
+            cidr: IpCidr {
+                addr: "127.0.0.1".parse().expect("literal v4 address"),
+                prefix: 32,
+            },
+            ports,
+            interface: "lo0".to_string(),
+            direction: L4Direction::Inbound,
+            capability: L4Capability::Capture,
+            inject_rate: RateCap { pps: 0, burst: 0 },
+            source,
+        }
+    }
+
+    /// Plan Task A5 (L4PAR-AC5, the `source` half): `l4.scope.list` labels each
+    /// entry's provenance — `"config"` for an operator config-block entry, `"runtime"`
+    /// for one added over the bus — in list order, so UIs can label them.
+    #[test]
+    fn scope_list_reports_source() {
+        let cfg = L4Config {
+            scope: vec![entry(
+                PortRange { lo: 9000, hi: 9999 },
+                L4ScopeSource::Config,
+            )],
+            ..L4Config::default()
+        };
+        let guard = Arc::new(L4Guard::new(&cfg));
+        // Test-only push (no widen gate): the provenance is whatever the entry says.
+        guard
+            .add_scope(entry(
+                PortRange { lo: 9100, hi: 9199 },
+                L4ScopeSource::Runtime,
+            ))
+            .expect("test-only add_scope never refuses");
+
+        let mem = aitm_core::MemFlowStore::new();
+        let client = StubClient;
+        let core = aitm_core::StdGuard::default();
+        let host = CommandHost::new(&mem, &client, &core, None);
+
+        let listed = ScopeList::new(guard)
+            .invoke(Params::default(), &host)
+            .expect("l4.scope.list ok");
+        let Value::Array(entries) = listed else {
+            panic!("l4.scope.list must return an array, got {listed:?}");
+        };
+        assert_eq!(entries.len(), 2);
+
+        let field = |i: usize, key: &str| -> Option<Value> {
+            let Value::Object(obj) = &entries[i] else {
+                panic!("a scope entry must be an object, got {:?}", entries[i]);
+            };
+            obj.get(key).cloned()
+        };
+        assert_eq!(field(0, "ports"), Some(Value::Str("9000-9999".into())));
+        assert_eq!(field(0, "source"), Some(Value::Str("config".into())));
+        assert_eq!(field(1, "ports"), Some(Value::Str("9100-9199".into())));
+        assert_eq!(field(1, "source"), Some(Value::Str("runtime".into())));
+    }
+
+    /// The `l4.scope.list` result schema declares `source` as a required string, so
+    /// `tools/list` consumers learn the field without reading a live entry.
+    #[test]
+    fn scope_list_schema_declares_source() {
+        let cfg = L4Config::default();
+        let schema = ScopeList::new(Arc::new(L4Guard::new(&cfg))).schema();
+        let TypeDesc::Array(elem) = schema.result else {
+            panic!(
+                "l4.scope.list result must be an array, got {:?}",
+                schema.result
+            );
+        };
+        let TypeDesc::Object(fields) = *elem else {
+            panic!("l4.scope.list elements must be objects, got {elem:?}");
+        };
+        let source = fields
+            .iter()
+            .find(|f| f.name == "source")
+            .unwrap_or_else(|| {
+                panic!(
+                    "scope entry fields must list `source`; got {:?}",
+                    fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            matches!(source.ty, TypeDesc::Str),
+            "`source` must be a Str, got {:?}",
+            source.ty
+        );
+        assert!(source.required, "`source` must be required");
+        assert!(
+            source.description.contains("config") && source.description.contains("runtime"),
+            "the description names both provenances, got {}",
+            source.description
+        );
+    }
+}

@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use aitm_browser::BrowserPlugin;
 use aitm_ca::CaPlugin;
@@ -36,6 +37,8 @@ use aitm_proto_l4::flow::L4FlowStore;
 use aitm_proto_l4::guard::L4Guard;
 use aitm_proto_l4::{L4Module, L4Privilege};
 use aitm_proto_ws::{InjectRegistry, WsModule};
+use aitm_sysproxy::plugin::SysProxyPlugin;
+use aitm_sysproxy::{SystemProxy, SystemProxyConfig};
 use tracing::{info, warn};
 
 use crate::ingress::CoreIngress;
@@ -68,10 +71,26 @@ pub struct Features {
     /// scripting engine, so a script's `l4.scope.add` and the bus see one state (no
     /// divergent L4 engagement state).
     pub l4_shared: Option<L4Shared>,
+    /// The core's own listener ports **beyond** the proxy and browser-proxy ports
+    /// `cfg` already names: the loopback bus, the web UI and the MCP streamable-HTTP
+    /// port, each when the binary binds one. Assembly hands all of them to the L4
+    /// module, so no capture ever records a loopback frame to or from the core
+    /// itself — the bus's plaintext token line among it (L4PAR-AC34, spec §2.1).
+    /// The binary refines the set with the bound ports after binding.
+    pub l4_self_ports: Vec<u16>,
     /// The macOS NE live-capture feeder config. Opt-in and deny-by-default:
     /// `enabled` is false by default, so the default feature set never binds the
     /// capture listener. The feeder runs only when `enabled` and the build is macOS.
     pub macos_capture: MacosCaptureConfig,
+    /// The system-proxy engine behind `proxy.system.*` and `proxy.status.system_proxy`
+    /// (system-proxy spec §D8). `None` (production) detects this host's mechanism
+    /// over a real executor from [`Features::system_proxy`]; `Some` injects a
+    /// scripted engine (tests). Detection runs no command (plan C2).
+    pub sysproxy: Option<Arc<SystemProxy>>,
+    /// The `system_proxy:` config section (`auto`, `bypass`, `state_file`), read
+    /// only when [`Features::sysproxy`] is `None`. The binary passes
+    /// `Settings.system_proxy`, whose `state_file` is always `Some` (plan C6).
+    pub system_proxy: SystemProxyConfig,
 }
 
 /// A shared L4 guard + flow store, built once by the binary and threaded into both
@@ -92,7 +111,10 @@ impl Default for Features {
             l4: L4Config::default(),
             l4_privilege: None,
             l4_shared: None,
+            l4_self_ports: Vec::new(),
             macos_capture: MacosCaptureConfig::default(),
+            sysproxy: None,
+            system_proxy: SystemProxyConfig::default(),
         }
     }
 }
@@ -185,6 +207,11 @@ pub struct Assembled {
     /// [`build_capture_session`]. Dropping it unused leaves the verb reporting the
     /// constructor's `off` state.
     pub capture_status: CaptureStatusWriter,
+    /// The system-proxy engine the `proxy.system.*` verbs and `proxy.status`
+    /// act over (system-proxy spec §D8), so `main.rs` can call
+    /// `recover_at_startup(auto)` before serving and `on_orderly_exit()` on the
+    /// exit path. The injected one when [`Features::sysproxy`] was `Some`.
+    pub sysproxy: Arc<SystemProxy>,
     /// The sealed [`Governance`] that [`Assembled::governance`] hands out;
     /// private so the `pub` fields above cannot substitute it.
     governance: Governance,
@@ -329,6 +356,22 @@ pub fn assemble_with_scripts(
     let armed = intercept.armed_flag();
     let listening = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // The system-proxy engine (system-proxy spec §D8): one instance shared by the
+    // `proxy.system.*` verbs, `proxy.status.system_proxy`, and the binary's
+    // startup-recovery / orderly-exit calls. Detection runs no command; the
+    // real executor is the CA crate's (10 s per read, 30 s per write).
+    let sysproxy = features.sysproxy.clone().unwrap_or_else(|| {
+        Arc::new(SystemProxy::detect(
+            Arc::new(aitm_ca::exec::RealExecutor::with_timeouts(
+                Duration::from_secs(10),
+                Duration::from_secs(30),
+            )),
+            &features.system_proxy,
+            aitm_sysproxy::ours_from(cfg.listen),
+            std::env::current_exe().ok(),
+        ))
+    });
+
     // The F4 push tap: a chain plugin forwards lifecycle events to this broadcast,
     // which the MCP server's dispatcher drains into per-connection push sinks.
     let (push_tx, _push_rx) = tokio::sync::broadcast::channel(aitm_mcp::DEFAULT_BROADCAST_CAPACITY);
@@ -385,7 +428,15 @@ pub fn assemble_with_scripts(
         ))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(intercept))
-        .register_plugin(Box::new(ControlPlugin::new(armed, listening.clone())))
+        .register_plugin(Box::new(
+            ControlPlugin::new(armed, listening.clone()).with_system_proxy(sysproxy.clone()),
+        ))
+        // The three `proxy.system.*` verbs over the same engine `proxy.status`
+        // summarises; `listening` lets `set` refuse a one-shot process (§D10).
+        .register_plugin(Box::new(SysProxyPlugin::new(
+            sysproxy.clone(),
+            listening.clone(),
+        )))
         // The macOS NE capture feeder's read-only state (`capture.status`), beside
         // `proxy.status`: registered on every platform and for every `Features`, so
         // a client can always ask why nothing is captured (capture-status spec D8).
@@ -479,6 +530,15 @@ pub fn assemble_with_scripts(
             ),
             None => L4Module::with_privilege(&features.l4, privilege),
         };
+        // Self-exclusion (L4PAR-AC34, spec §2.1): the core's own listener ports —
+        // the proxy and browser-proxy ports from `cfg`, plus the bus / web UI / MCP
+        // HTTP ports the binary knows — are handed to the module so no capture ever
+        // records the core's own loopback traffic, whatever the scope says.
+        let module = module.with_self_ports(
+            [cfg.listen.port(), cfg.browser.proxy_addr.port()]
+                .into_iter()
+                .chain(features.l4_self_ports.iter().copied()),
+        );
         l4_half = Some((module.guard(), module.store()));
         builder = builder.register_plugin(Box::new(module));
     }
@@ -519,6 +579,7 @@ pub fn assemble_with_scripts(
         l4_ingress,
         l4_guard,
         capture_status,
+        sysproxy,
         governance,
     })
 }
@@ -675,6 +736,24 @@ impl Plugin for PocCommands {
 /// `aitm-proto-http`'s `Http1Machine` (chunked decode, clean framing) with TLS
 /// for `https`. Re-exported from `aitm-proto-http`.
 pub use aitm_proto_http::Http1Sender;
+
+/// What the binary does with an agent transport's bound address, through
+/// `McpServer::on_bound`: the same `FnOnce(SocketAddr)` that method takes.
+pub type BoundHook = Box<dyn FnOnce(std::net::SocketAddr) + Send + 'static>;
+
+/// The [`BoundHook`] that unions the agent transport's bound port into the live
+/// L4 guard's self ports ([`L4Guard::add_self_ports`]), so a loopback capture
+/// never records the bus's own frames — its plaintext `{"token": …}` first line
+/// among them (L4PAR-AC34, spec §2.1). The bound port is the configured one or
+/// the ephemeral port a `port: 0` resolved to, which only `on_bound` can know.
+/// The one hook both the bare-`aitm` server path and `aitm tui` attach, so the
+/// two cannot drift.
+#[must_use]
+pub fn self_port_hook(guard: Arc<L4Guard>) -> BoundHook {
+    Box::new(move |addr: std::net::SocketAddr| {
+        guard.add_self_ports([addr.port()]);
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -950,6 +1029,61 @@ mod tests {
         assert_eq!(collect_lanes(Some(&shared)).len(), 0);
     }
 
+    /// L4PAR-AC34 / spec §2.1: the hook both the server path and `aitm tui` hand
+    /// the agent `McpServer`'s `on_bound` unions the bound port — the ephemeral
+    /// one a `port: 0` resolved to included — into the live L4 guard's self ports,
+    /// so a loopback capture never records the bus's plaintext token line. Port 0
+    /// is never a bound listener and stays out.
+    #[test]
+    fn the_bound_port_hook_adds_the_agent_port_to_the_l4_guard() {
+        let guard = Arc::new(L4Guard::new(&L4Config::default()));
+        assert_eq!(guard.self_ports(), Vec::<u16>::new());
+
+        let hook = self_port_hook(guard.clone());
+        hook("127.0.0.1:41234".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![41234]);
+
+        // A second bind (a later run on the same guard) adds, never replaces.
+        self_port_hook(guard.clone())("127.0.0.1:27431".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![27431, 41234]);
+
+        self_port_hook(guard.clone())("127.0.0.1:0".parse().expect("socket addr"));
+        assert_eq!(guard.self_ports(), vec![27431, 41234], "port 0 is ignored");
+    }
+
+    /// L4PAR-AC34 (plan A10): assembly hands the L4 module the core's own
+    /// listener ports — the proxy and browser-proxy ports from `cfg` plus
+    /// `Features::l4_self_ports` (bus, web UI, MCP HTTP) — so no capture ever
+    /// records them.
+    #[test]
+    fn l4_self_ports_cover_the_cores_listeners() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("l4-self-ports");
+        cfg.listen = "127.0.0.1:28180".parse().unwrap();
+        cfg.browser.proxy_addr = "127.0.0.1:28181".parse().unwrap();
+        let shared = L4Shared {
+            guard: Arc::new(L4Guard::new(&L4Config {
+                enabled: true,
+                ..L4Config::default()
+            })),
+            store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
+        };
+        let features = Features {
+            l4: L4Config {
+                enabled: true,
+                ..L4Config::default()
+            },
+            l4_privilege: Some(L4Privilege::available()),
+            l4_shared: Some(shared.clone()),
+            l4_self_ports: vec![28182, 27431],
+            ..Features::default()
+        };
+        let assembled = assemble_with(&cfg, &features).expect("assemble with l4 enabled");
+        let guard = assembled.l4_guard.expect("l4 enabled exposes the guard");
+        assert_eq!(guard.self_ports(), vec![27431, 28180, 28181, 28182]);
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
     /// `Assembled::governance` hands out the assembly's own `agent_state` and
     /// `audit_ring` `Arc`s, not copies, and `Clone` keeps that identity: a
     /// policy set through the `Governance` is the policy the core reads.
@@ -1076,5 +1210,240 @@ mod tests {
             Vec::<String>::new(),
             "only the config-driven startup may build or run the capture session"
         );
+    }
+}
+
+/// System-proxy wiring (plan 2026-10-31-system-proxy-automation, Task 9).
+#[cfg(test)]
+mod sysproxy_tests {
+    use super::*;
+    use aitm_ca::exec::Executor;
+    use aitm_ca::testing::ScriptedExecutor;
+    use aitm_core::{CommandHost, Frontend, Params, TypeDesc, Value};
+    use aitm_sysproxy::{Endpoint, Mechanism, SystemProxy, SystemProxyConfig, STATE_FILE_NAME};
+    use std::sync::atomic::Ordering;
+
+    const LIST: &str = "/usr/sbin/networksetup -listallnetworkservices";
+    const LIST_OUT: &str = "An asterisk (*) denotes that a network service is disabled.\nDisplay Ethernet\n*Thunderbolt Bridge\nWi-Fi\n";
+    const SCUTIL: &str = "/usr/sbin/scutil --proxy";
+    const DE: &str = "'Display Ethernet'";
+    const WIFI: &str = "Wi-Fi";
+    const BYPASS_OUT: &str = "*.local\n169.254/16\n";
+
+    /// A unique temp directory for the CA and the state file.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("aitm-wire-sysproxy-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    /// `-getwebproxy` / `-getsecurewebproxy` output; port 0 is "Enabled: No".
+    fn proxy_out(host: &str, port: u16) -> String {
+        if port == 0 {
+            "Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0\n".to_string()
+        } else {
+            format!("Enabled: Yes\nServer: {host}\nPort: {port}\nAuthenticated Proxy Enabled: 0\n")
+        }
+    }
+
+    /// `scutil --proxy` output with both protocols at `host:port`.
+    fn scutil_out(host: &str, port: u16) -> String {
+        format!("<dictionary> {{\n  ExceptionsList : <array> {{\n    0 : *.local\n    1 : 169.254/16\n  }}\n  HTTPEnable : 1\n  HTTPPort : {port}\n  HTTPProxy : {host}\n  HTTPSEnable : 1\n  HTTPSPort : {port}\n  HTTPSProxy : {host}\n}}\n")
+    }
+
+    /// Queue one per-service round: `Display Ethernet` at `de`, `Wi-Fi` at `wifi`.
+    fn answer_round(
+        exec: ScriptedExecutor,
+        de: (&str, u16),
+        wifi: (&str, u16),
+    ) -> ScriptedExecutor {
+        let get = |verb: &str, svc: &str| format!("/usr/sbin/networksetup {verb} {svc}");
+        exec.respond(LIST, 0, LIST_OUT, "")
+            .respond(&get("-getwebproxy", DE), 0, &proxy_out(de.0, de.1), "")
+            .respond(
+                &get("-getsecurewebproxy", DE),
+                0,
+                &proxy_out(de.0, de.1),
+                "",
+            )
+            .respond(&get("-getproxybypassdomains", DE), 0, BYPASS_OUT, "")
+            .respond(
+                &get("-getwebproxy", WIFI),
+                0,
+                &proxy_out(wifi.0, wifi.1),
+                "",
+            )
+            .respond(
+                &get("-getsecurewebproxy", WIFI),
+                0,
+                &proxy_out(wifi.0, wifi.1),
+                "",
+            )
+            .respond(&get("-getproxybypassdomains", WIFI), 0, BYPASS_OUT, "")
+    }
+
+    /// A scripted engine over `exec` with the given mechanism, its state file in `dir`.
+    fn scripted(
+        exec: ScriptedExecutor,
+        dir: &std::path::Path,
+        mechanism: Mechanism,
+    ) -> (Arc<ScriptedExecutor>, Arc<SystemProxy>) {
+        let exec = Arc::new(exec.with_real_fs());
+        let cfg = SystemProxyConfig {
+            auto: false,
+            bypass: vec![],
+            state_file: Some(dir.join(STATE_FILE_NAME)),
+        };
+        let as_exec: Arc<dyn Executor> = exec.clone();
+        let ours = Endpoint {
+            host: "127.0.0.1".into(),
+            port: 8080,
+        };
+        let sp = Arc::new(SystemProxy::with_mechanism(
+            as_exec, &cfg, ours, None, mechanism,
+        ));
+        (exec, sp)
+    }
+
+    /// Assemble over an injected scripted engine; the CA lives in `dir` too.
+    fn assemble_over(dir: &std::path::Path, sp: Arc<SystemProxy>) -> (Config, Assembled) {
+        let mut cfg = Config::default();
+        cfg.ca.dir = dir.join("ca");
+        let assembled = assemble_with(
+            &cfg,
+            &Features {
+                sysproxy: Some(sp),
+                ..Features::default()
+            },
+        )
+        .expect("assemble with a scripted system proxy");
+        (cfg, assembled)
+    }
+
+    /// Invoke a registered command the way a frontend does, as `frontend`.
+    fn invoke(proxy: &Proxy, cfg: &Config, name: &str, frontend: Frontend) -> Value {
+        let services = crate::tui::services(proxy, cfg, None, crate::tui::TuiLog::Off);
+        let host = CommandHost::new(&*services.store, &*services.client, &*services.guard, None)
+            .with_frontend(frontend);
+        proxy
+            .registry()
+            .command(name)
+            .unwrap_or_else(|| panic!("{name} registered"))
+            .invoke(Params::default(), &host)
+            .unwrap_or_else(|e| panic!("{name} succeeds: {e}"))
+    }
+
+    fn field<'a>(v: &'a Value, name: &str) -> &'a Value {
+        match v {
+            Value::Object(map) => map
+                .get(name)
+                .unwrap_or_else(|| panic!("field `{name}` in {v:?}")),
+            other => panic!("expected an object, got {other:?}"),
+        }
+    }
+
+    fn scutil_runs(exec: &ScriptedExecutor) -> usize {
+        exec.runs().iter().filter(|l| *l == SCUTIL).count()
+    }
+
+    /// D8 + SP-AC17 (registered-schema half): assembly over an injected engine
+    /// registers the three `proxy.system.*` verbs, and `set` takes exactly one
+    /// optional `bypass: Array(Str)`.
+    #[test]
+    fn sysproxy_verbs_are_registered_with_control() {
+        let dir = temp_dir("registered");
+        let (_exec, sp) = scripted(ScriptedExecutor::new(), &dir, Mechanism::Networksetup);
+        let (_cfg, assembled) = assemble_over(&dir, sp.clone());
+        let reg = assembled.proxy.registry();
+        for name in [
+            "proxy.system.status",
+            "proxy.system.set",
+            "proxy.system.unset",
+        ] {
+            assert!(reg.command(name).is_some(), "{name} is registered");
+        }
+        let schema = reg.command("proxy.system.set").expect("set").schema();
+        assert_eq!(schema.params.len(), 1);
+        assert_eq!(schema.params[0].name, "bypass");
+        assert!(!schema.params[0].required);
+        assert!(
+            matches!(&schema.params[0].ty, TypeDesc::Array(inner) if matches!(**inner, TypeDesc::Str)),
+            "ty: {:?}",
+            schema.params[0].ty
+        );
+        assert!(
+            Arc::ptr_eq(&assembled.sysproxy, &sp),
+            "Assembled.sysproxy is the injected engine"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SP-AC18: `proxy.status.system_proxy` is the §D6 compact object, served
+    /// from a ≤ 5 s cache (two calls, one `scutil --proxy`) and refreshed at
+    /// once by a `set` (the next call flips to `points_at_us` with no new read).
+    #[test]
+    fn proxy_status_carries_system_proxy_cached_and_refreshed() {
+        let dir = temp_dir("cached");
+        let exec = ScriptedExecutor::new()
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 9090), "")
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "");
+        let exec = answer_round(exec, ("127.0.0.1", 9090), ("", 0));
+        let exec = answer_round(exec, ("127.0.0.1", 8080), ("127.0.0.1", 8080));
+        let (exec, sp) = scripted(exec, &dir, Mechanism::Networksetup);
+        let (cfg, assembled) = assemble_over(&dir, sp);
+        assembled.listening.store(true, Ordering::SeqCst);
+
+        let first = invoke(&assembled.proxy, &cfg, "proxy.status", Frontend::Cli);
+        let sys = field(&first, "system_proxy");
+        assert_eq!(field(sys, "state"), &Value::Str("other".into()));
+        assert_eq!(field(sys, "host"), &Value::Str("127.0.0.1".into()));
+        assert_eq!(field(sys, "port"), &Value::Int(9090));
+        assert_eq!(field(sys, "managed_by_us"), &Value::Bool(false));
+        assert_eq!(field(sys, "setting"), &Value::Bool(false));
+        assert_eq!(field(sys, "supported"), &Value::Bool(true));
+        assert_eq!(
+            field(sys, "detail"),
+            &Value::Str("HTTP and HTTPS → 127.0.0.1:9090 (not this core)".into())
+        );
+        let second = invoke(&assembled.proxy, &cfg, "proxy.status", Frontend::Cli);
+        assert_eq!(field(&second, "system_proxy"), sys);
+        assert_eq!(scutil_runs(&exec), 1, "two calls within 5 s read once");
+
+        let set = invoke(
+            &assembled.proxy,
+            &cfg,
+            "proxy.system.set",
+            Frontend::Operator,
+        );
+        assert_eq!(field(&set, "changed"), &Value::Bool(true));
+        let after_set = scutil_runs(&exec);
+
+        let third = invoke(&assembled.proxy, &cfg, "proxy.status", Frontend::Cli);
+        let sys = field(&third, "system_proxy");
+        assert_eq!(field(sys, "state"), &Value::Str("points_at_us".into()));
+        assert_eq!(field(sys, "host"), &Value::Null);
+        assert_eq!(field(sys, "port"), &Value::Null);
+        assert_eq!(field(sys, "managed_by_us"), &Value::Bool(true));
+        assert_eq!(scutil_runs(&exec), after_set, "set refreshed the cache");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §D6: with no mechanism the sub-object is present as `unsupported` and
+    /// nothing is ever run.
+    #[test]
+    fn unsupported_mechanism_reports_without_a_shell_out() {
+        let dir = temp_dir("unsupported");
+        let (exec, sp) = scripted(ScriptedExecutor::new(), &dir, Mechanism::None);
+        let (cfg, assembled) = assemble_over(&dir, sp);
+        let status = invoke(&assembled.proxy, &cfg, "proxy.status", Frontend::Cli);
+        let sys = field(&status, "system_proxy");
+        assert_eq!(field(sys, "state"), &Value::Str("unsupported".into()));
+        assert_eq!(field(sys, "supported"), &Value::Bool(false));
+        assert!(exec.runs().is_empty(), "ran: {:?}", exec.runs());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

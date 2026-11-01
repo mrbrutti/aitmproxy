@@ -744,7 +744,7 @@ Screens: scope, scope-sheet
 Depends: S-005
 Acceptance:
 - [snap] The Scope page lists entries with their limit readout (`10 req/s · back-off 2×`) and the count of flows in scope; the sheet has a text field with validation and `Add ⌘⏎`.
-- [unit] Entry validation accepts the three forms and rejects schemes and paths; `hostMatches` handles wildcard and port.
+- [unit] Entry validation accepts the three forms and rejects schemes and paths; `Scope.matches` (Kit, the one in-scope rule the poll uses too) handles wildcard and port.
 - [self] `scope.add` is sent; the Scope count in the sidebar and `N hosts in scope` in the status bar update; affected rows lose their dimming.
 UX:
 - Flow: sidebar ▸ Scope (or Proxy ▸ Scope… ⇧⌘O) -> the Scope page: entries table over the in-scope flow list -> "Add Host…" or type in the field at the top -> ⌘⏎ adds -> the row loses its dimming at once
@@ -1153,6 +1153,16 @@ UX:
 - Words: none
 - Access: none
 Notes: two Strong cards done as pure moves — `Session` split into state + `Session+Verbs/Editing/Filters/Palette` (809 → 406 lines), `FlowColumn`/`Density` out of `FlowTableView.swift` (542 → 430). No file past 600. Carried: one verb table for row actions (next Strong, before S-041/S-045), viewers behind one `ViewerKind` (with S-045). `docs/ARCHITECTURE.md` and `docs/FIXLOG.md` started.
+Status: done
+
+### S-079 The flow list follows the capture on every page
+As the operator, I watch the Flows page (or any list page) and every change the poll brings — a new row, a parked row resumed, a status landing — is drawn within the poll interval, without switching pages.
+Screens: apps
+Depends: S-002, S-005
+Acceptance:
+- [live] Dev bundle with a real core, Flows page, intercept armed from the Flow menu: a curl parks and its row appears within a poll; Flow ▸ Resume turns the row to its status within a poll; a second curl's row appears; no page switch (before/after screenshots in `docs/evidence/S-079/`).
+- [live] The same on the Apps page (unchanged).
+Live: 2026-10-31, found on the installed v0.5.6 during the S-041 check (FIXLOG 2026-10-31 "The Flows page stopped redrawing"); S-073 to S-078 are reserved for the Proxyman capture-flow stories drafted in `docs/research/proxyman-capture-flow-gaps.md`.
 Status: done
 
 ### S-072 See what is running and what to do first

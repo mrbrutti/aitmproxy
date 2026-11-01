@@ -8,7 +8,8 @@
 //!   dedicated reader thread and records the session. `L4Unavailable` when in-path
 //!   is disabled (`intercept: None`) or on a non-Linux OS / without `CAP_NET_ADMIN`.
 //! - `l4.intercept.stop` — end a session (fail-open forwards anything still parked).
-//! - `l4.intercept.status` — the live sessions and their parked counts (read-only).
+//! - `l4.intercept.status` — in-path availability (`available` / `code` / `reason`)
+//!   and the live sessions with their parked counts (read-only, never privilege-gated).
 //! - `l4.intercept.list` — the parked packets awaiting a verdict (read-only).
 //! - `l4.intercept.mutate` / `.revert` — edit (or revert) a parked packet via a
 //!   [`PacketSpec`] or raw bytes; the original is kept as a backup.
@@ -27,11 +28,13 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
 
 use aitm_core::{
     Command, CommandHost, ParamDef, ParamSchema, Params, Sensitivity, TypeDesc, Value,
 };
 
+use super::{epoch_ms, field};
 use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
 use crate::craft::PacketSpec;
@@ -41,6 +44,7 @@ use crate::intercept::{
     start_intercept, InterceptBackend, InterceptHandle, InterceptParams, NfqueueBackend, ParkedId,
     ParkedPacket,
 };
+use crate::module::AvailabilitySource;
 use crate::types::{L4Action, L4Direction};
 
 /// How the `start` command obtains the in-path backend for a queue number. The
@@ -97,6 +101,12 @@ impl InterceptSessions {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
+
+/// The `L4Unavailable` text `l4.intercept.start` refuses with when in-path is
+/// disabled (no `intercept` config); also the `reason` `l4.intercept.status` carries
+/// under `code: not_configured`, so the two can never disagree (spec §1).
+pub(crate) const INTERCEPT_NOT_CONFIGURED: &str =
+    "in-path interception is disabled (no `intercept` config)";
 
 // ---- l4.intercept.start -------------------------------------------------------
 
@@ -192,9 +202,7 @@ impl Command for InterceptStart {
         // or any backend. Fail-closed is also what a non-Linux backend returns on
         // open, so `l4.intercept.*` is honest about platform support either way.
         let mut config = self.config.clone().ok_or_else(|| {
-            anyhow::Error::new(L4Error::Unavailable(
-                "in-path interception is disabled (no `intercept` config)".into(),
-            ))
+            anyhow::Error::new(L4Error::Unavailable(INTERCEPT_NOT_CONFIGURED.into()))
         })?;
 
         let interface = args.get_str("interface")?.to_string();
@@ -291,15 +299,19 @@ impl Command for InterceptStop {
 
 // ---- l4.intercept.status ------------------------------------------------------
 
-/// `l4.intercept.status` — the live interception sessions (read-only).
+/// `l4.intercept.status` — whether in-path interception is available on this core
+/// (`available`, `code`, `reason`) and the live interception sessions (read-only).
+/// Never privilege-gated (spec §1): it always answers.
 pub(crate) struct InterceptStatus {
     sessions: Arc<InterceptSessions>,
+    source: AvailabilitySource,
 }
 
 impl InterceptStatus {
-    /// A status command over the shared session registry.
-    pub(crate) fn new(sessions: Arc<InterceptSessions>) -> Self {
-        Self { sessions }
+    /// A status command over the shared session registry and the in-path class's
+    /// [`AvailabilitySource`], read on every invoke (L4PAR-AC38).
+    pub(crate) fn new(sessions: Arc<InterceptSessions>, source: AvailabilitySource) -> Self {
+        Self { sessions, source }
     }
 }
 
@@ -314,11 +326,17 @@ impl Command for InterceptStatus {
 
     fn schema(&self) -> ParamSchema {
         ParamSchema {
-            description: "List the live interception sessions and their parked-packet counts \
-                          (read-only)."
+            description: "Report whether in-path interception is available on this core \
+                          (`available`, `code`, `reason`) and the live interception sessions \
+                          with their parked-packet counts. Always answers, never `L4 \
+                          unavailable`."
                 .into(),
             params: vec![],
-            result: TypeDesc::Array(Box::new(TypeDesc::Object(session_fields()))),
+            result: TypeDesc::Object(super::availability_fields(
+                "sessions",
+                TypeDesc::Array(Box::new(TypeDesc::Object(session_fields()))),
+                "The live interception sessions; `[]` when unavailable.",
+            )),
         }
     }
 
@@ -334,7 +352,11 @@ impl Command for InterceptStatus {
             .collect();
         // Stable, caller-friendly order (the registry is a HashMap).
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(Value::Array(out.into_iter().map(|(_, v)| v).collect()))
+        Ok(super::availability_object(
+            &(self.source)(),
+            "sessions",
+            out.into_iter().map(|(_, v)| v).collect(),
+        ))
     }
 }
 
@@ -364,7 +386,7 @@ impl Command for InterceptList {
     fn schema(&self) -> ParamSchema {
         ParamSchema {
             description: "List the packets currently parked awaiting a verdict, across sessions \
-                          or for one `flow` (read-only)."
+                          or for one `flow` (read-only), in arrival order, oldest first."
                 .into(),
             params: vec![ParamDef {
                 name: "flow".into(),
@@ -379,7 +401,11 @@ impl Command for InterceptList {
     fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
         let filter = optional_flow(&args)?;
         let map = self.sessions.lock();
-        let mut out: Vec<(String, Value)> = Vec::new();
+        // Arrival order, oldest first (spec §4 / AC37): the process-wide
+        // sequence stamped when the packet was parked (one counter for every
+        // session, so sessions interleave in true arrival order), never the
+        // random uuid string; the id string is the deterministic tie-break.
+        let mut out: Vec<((u64, String), Value)> = Vec::new();
         for (fid, session) in map.iter() {
             if let Some(want) = filter {
                 if *fid != want {
@@ -390,8 +416,16 @@ impl Command for InterceptList {
                 let edit = session.edits.get(&parked.id);
                 let state = if edit.is_some() { "mutated" } else { "parked" };
                 let bytes = edit.map_or(parked.packet.bytes.as_slice(), |e| e.mutated.as_slice());
-                let value = parked_value(parked.id, *fid, state, bytes, parked.packet.dir);
-                out.push((parked_id_to_string(parked.id), value));
+                let value = parked_value(
+                    parked.id,
+                    *fid,
+                    state,
+                    bytes,
+                    parked.packet.dir,
+                    parked.parked_at,
+                );
+                let key = (parked.parked_seq, parked_id_to_string(parked.id));
+                out.push((key, value));
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -483,6 +517,7 @@ impl Command for InterceptMutate {
             "mutated",
             &new_bytes,
             parked.packet.dir,
+            parked.parked_at,
         ))
     }
 }
@@ -711,47 +746,51 @@ impl Command for InterceptDrop {
 // ---- registration -------------------------------------------------------------
 
 /// Build the `l4.intercept.*` commands over the shared guard, store, and session
-/// registry, using the production NFQUEUE backend. Kept additive and separate from
-/// [`super::active_commands`] so the two command groups register independently.
+/// registry, using the production NFQUEUE backend: the seven privilege-gated
+/// verbs, and **separately** the `l4.intercept.status` verb over the same
+/// registry, which [`crate::module::L4Module::load`] registers ungated beside
+/// them so it always answers (spec §1, L4PAR-AC9). Kept additive and separate
+/// from [`super::active_commands`] so the command groups register independently.
 pub(crate) fn intercept_commands(
     guard: Arc<L4Guard>,
     store: Arc<dyn L4FlowStore>,
     sessions: Arc<InterceptSessions>,
     config: Option<InterceptConfig>,
-) -> Vec<Arc<dyn Command>> {
+    availability: AvailabilitySource,
+) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
     let start = InterceptStart::new(guard.clone(), store, sessions.clone(), config);
-    commands_over(start, guard, sessions)
+    commands_over(start, guard, sessions, availability)
 }
 
-/// The eight intercept commands over one start command + session registry. The
-/// guard is threaded to `forward` so a staged mutation is re-checked before reinject.
+/// The seven gated intercept commands over one start command + session registry,
+/// plus the status verb. The guard is threaded to `forward` so a staged mutation
+/// is re-checked before reinject; `availability` (the in-path class's source,
+/// read at invoke time) to `status`.
 fn commands_over(
     start: InterceptStart,
     guard: Arc<L4Guard>,
     sessions: Arc<InterceptSessions>,
-) -> Vec<Arc<dyn Command>> {
-    vec![
+    availability: AvailabilitySource,
+) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
+    let gated: Vec<Arc<dyn Command>> = vec![
         Arc::new(start),
         Arc::new(InterceptStop::new(sessions.clone())),
-        Arc::new(InterceptStatus::new(sessions.clone())),
         Arc::new(InterceptList::new(sessions.clone())),
         Arc::new(InterceptMutate::new(sessions.clone())),
         Arc::new(InterceptRevert::new(sessions.clone())),
         Arc::new(InterceptForward::new(guard, sessions.clone())),
-        Arc::new(InterceptDrop::new(sessions)),
-    ]
+        Arc::new(InterceptDrop::new(sessions.clone())),
+    ];
+    (
+        gated,
+        Arc::new(InterceptStatus::new(sessions, availability)),
+    )
 }
 
 // ---- shared helpers -----------------------------------------------------------
 
 /// The fields a session reports (`start` result, `status` elements).
 fn session_fields() -> Vec<ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
     vec![
         field(
             "flow",
@@ -767,12 +806,6 @@ fn session_fields() -> Vec<ParamDef> {
 
 /// The fields a parked packet reports (`list` elements, `mutate` result).
 fn parked_fields() -> Vec<ParamDef> {
-    let field = |name: &str, ty: TypeDesc, required: bool, description: &str| ParamDef {
-        name: name.into(),
-        ty,
-        required,
-        description: description.into(),
-    };
     vec![
         field("id", TypeDesc::Str, true, "The parked packet id."),
         field(
@@ -794,6 +827,13 @@ fn parked_fields() -> Vec<ParamDef> {
             TypeDesc::Array(Box::new(TypeDesc::Str)),
             true,
             "Decoded layer names of the (current) packet.",
+        ),
+        field(
+            "parked_at",
+            TypeDesc::Int,
+            true,
+            "When the packet was parked, epoch milliseconds. `list` is ordered by \
+             arrival, oldest first.",
         ),
     ]
 }
@@ -949,17 +989,19 @@ fn session_value(flow: &str, interface: &str, queue: u16, parked: usize) -> Valu
 }
 
 /// A parked packet as a transport-neutral object (`list` elements, `mutate` result),
-/// summarizing the current (possibly mutated) bytes.
+/// summarizing the current (possibly mutated) bytes, stamped with `parked_at`.
 fn parked_value(
     id: ParkedId,
     flow: L4FlowId,
     state: &str,
     bytes: &[u8],
     dir: L4Direction,
+    parked_at: SystemTime,
 ) -> Value {
     let summary = PacketSpec::summarize(bytes);
     let mut o = BTreeMap::new();
     o.insert("id".to_string(), Value::Str(parked_id_to_string(id)));
+    o.insert("parked_at".to_string(), Value::Int(epoch_ms(parked_at)));
     o.insert(
         "flow".to_string(),
         Value::Str(super::flow_id_to_string(flow)),
@@ -983,13 +1025,13 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
 
     use aitm_core::{CommandHost, HttpFlow, HttpRequest, MemFlowStore, ProxyClient, StdGuard};
     use futures::future::BoxFuture;
 
     use crate::craft::{Ipv4Spec, Layer, PacketSpec, UdpSpec};
-    use crate::flow::InMemoryL4FlowStore;
+    use crate::flow::{InMemoryL4FlowStore, L4Packet};
     use crate::guard::{L4Guard, L4GuardError};
     use crate::intercept::{InterceptQueue, QueuedPacket, WireVerdict};
     use crate::types::{
@@ -1228,21 +1270,28 @@ mod tests {
         let guard = guard_with(vec![]);
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
         let sessions = Arc::new(InterceptSessions::new());
-        let cmds = intercept_commands(guard, store, sessions, Some(cfg(0)));
-        let names: Vec<&str> = cmds.iter().map(|c| c.name()).collect();
+        let (gated, status) = intercept_commands(
+            guard,
+            store,
+            sessions,
+            Some(cfg(0)),
+            Arc::new(|| crate::module::L4Availability::Available),
+        );
+        let names: Vec<&str> = gated.iter().map(|c| c.name()).collect();
         assert_eq!(
             names,
             vec![
                 "l4.intercept.start",
                 "l4.intercept.stop",
-                "l4.intercept.status",
                 "l4.intercept.list",
                 "l4.intercept.mutate",
                 "l4.intercept.revert",
                 "l4.intercept.forward",
                 "l4.intercept.drop",
-            ]
+            ],
+            "the gated list never carries the status verb"
         );
+        assert_eq!(status.name(), "l4.intercept.status");
     }
 
     /// Plan Task 12 / AC3: a `Capture`-only scope refuses `l4.intercept.start` with
@@ -1575,6 +1624,323 @@ mod tests {
         // Null spec counts as absent, so this is the bytes path, not "both".
         assert!(mutated_bytes(&Params::new(both)).is_ok());
         assert!(mutated_bytes(&one_param("bytes", Value::Array(vec![Value::Int(256)]))).is_err());
+    }
+
+    /// AC37 (plan A13): `l4.intercept.list` is in **arrival order**, oldest first,
+    /// and every entry carries `parked_at` (epoch ms). The order comes from the
+    /// per-session arrival sequence assigned when a packet is parked, never from the
+    /// random uuid string: `P2` (uuid `…0002`) is parked first and `P1` (uuid `…0001`,
+    /// which sorts *lower* as a string) second, so the list must be `[P2, P1]`.
+    #[test]
+    fn intercept_list_is_arrival_ordered() {
+        let guard = guard_with(vec![scope_entry(("10.0.0.5", 32), L4Capability::Intercept)]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let sessions = Arc::new(InterceptSessions::new());
+        let (backend, _verdicts) = MockBackend::with(vec![]);
+        let start = InterceptStart::with_backend(
+            guard,
+            store,
+            sessions.clone(),
+            Some(cfg(0)),
+            mock_factory(backend),
+        );
+        let list = InterceptList::new(sessions.clone());
+        let parts = HostParts::new();
+        let host = parts.host();
+        start.invoke(start_params(0), &host).expect("start ok");
+
+        let p2 = ParkedId::from_u128(2);
+        let p1 = ParkedId::from_u128(1);
+        let packet = |payload: &[u8]| {
+            let bytes = ip_udp("10.0.0.5", payload);
+            L4Packet {
+                dir: L4Direction::Outbound,
+                timestamp: SystemTime::now(),
+                decoded: PacketSpec::summarize(&bytes),
+                bytes,
+                injected: false,
+            }
+        };
+        {
+            let map = sessions.lock();
+            let session = map.values().next().expect("one live session");
+            let deadline = SystemTime::now() + Duration::from_secs(30);
+            session
+                .handle
+                .park_for_test(p2, packet(b"arrives first"), deadline);
+            session
+                .handle
+                .park_for_test(p1, packet(b"arrives second"), deadline);
+        }
+
+        let Value::Array(items) = list.invoke(Params::default(), &host).expect("list ok") else {
+            panic!("list returns an array");
+        };
+        let field = |v: &Value, name: &str| -> Value {
+            let Value::Object(o) = v else {
+                panic!("a parked entry is an object");
+            };
+            o.get(name)
+                .unwrap_or_else(|| panic!("entry lacks `{name}`"))
+                .clone()
+        };
+        let ids: Vec<Value> = items.iter().map(|v| field(v, "id")).collect();
+        assert_eq!(
+            ids,
+            vec![
+                Value::Str("00000000-0000-0000-0000-000000000002".into()),
+                Value::Str("00000000-0000-0000-0000-000000000001".into()),
+            ],
+            "arrival order, not uuid string order"
+        );
+        let parked_at: Vec<i64> = items
+            .iter()
+            .map(|v| match field(v, "parked_at") {
+                Value::Int(ms) => ms,
+                other => panic!("`parked_at` must be an Int (epoch ms), got {other:?}"),
+            })
+            .collect();
+        assert!(
+            parked_at[0] <= parked_at[1],
+            "the first-listed (oldest) entry's parked_at {} must be <= the next {}",
+            parked_at[0],
+            parked_at[1]
+        );
+        // Epoch milliseconds, not seconds or nanoseconds: after 2020-01-01T00:00:00Z
+        // and before 3000-01-01T00:00:00Z.
+        assert!(
+            parked_at[0] > 1_577_836_800_000 && parked_at[0] < 32_503_680_000_000,
+            "parked_at {} is not an epoch-ms timestamp",
+            parked_at[0]
+        );
+
+        // The schema advertises the new field as an Int.
+        let TypeDesc::Array(elem) = list.schema().result else {
+            panic!("list result is an array");
+        };
+        let TypeDesc::Object(fields) = *elem else {
+            panic!("list elements are objects");
+        };
+        let parked_at_field = fields
+            .iter()
+            .find(|f| f.name == "parked_at")
+            .expect("schema lists `parked_at`");
+        assert!(
+            matches!(parked_at_field.ty, TypeDesc::Int),
+            "`parked_at` is an Int in the schema, got {:?}",
+            parked_at_field.ty
+        );
+        assert!(parked_at_field.required);
+    }
+
+    // ---- Tester (stage 5): L4PAR-AC37 edge cases -----------------------------
+
+    /// The `(id, parked_at, state)` of every entry `l4.intercept.list` returns for
+    /// `params`, in reply order.
+    fn list_entries(
+        list: &InterceptList,
+        host: &CommandHost,
+        params: Params,
+    ) -> Vec<(String, i64, String)> {
+        let Value::Array(items) = list.invoke(params, host).expect("list ok") else {
+            panic!("list returns an array");
+        };
+        items
+            .into_iter()
+            .map(|v| {
+                let Value::Object(o) = v else {
+                    panic!("a parked entry is an object");
+                };
+                let id = match o.get("id") {
+                    Some(Value::Str(s)) => s.clone(),
+                    other => panic!("id must be a string, got {other:?}"),
+                };
+                let at = match o.get("parked_at") {
+                    Some(Value::Int(ms)) => *ms,
+                    other => panic!("parked_at must be an Int, got {other:?}"),
+                };
+                let state = match o.get("state") {
+                    Some(Value::Str(s)) => s.clone(),
+                    other => panic!("state must be a string, got {other:?}"),
+                };
+                (id, at, state)
+            })
+            .collect()
+    }
+
+    /// A parked UDP packet to `10.0.0.5:9` carrying `payload`.
+    fn parked_packet(payload: &[u8]) -> L4Packet {
+        let bytes = ip_udp("10.0.0.5", payload);
+        L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: SystemTime::now(),
+            decoded: PacketSpec::summarize(&bytes),
+            bytes,
+            injected: false,
+        }
+    }
+
+    /// AC37 (tester): mutating the oldest parked packet does not move it. The
+    /// order is the arrival sequence, not "last touched", so the intercept bar's
+    /// default (the first listed) stays on the same packet after a Mutate, and the
+    /// `flow` filter keeps that order.
+    #[test]
+    fn intercept_list_order_survives_mutate_and_flow_filter() {
+        let guard = guard_with(vec![scope_entry(("10.0.0.5", 32), L4Capability::Intercept)]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let sessions = Arc::new(InterceptSessions::new());
+        let (backend, _verdicts) = MockBackend::with(vec![]);
+        let start = InterceptStart::with_backend(
+            guard,
+            store,
+            sessions.clone(),
+            Some(cfg(0)),
+            mock_factory(backend),
+        );
+        let list = InterceptList::new(sessions.clone());
+        let mutate = InterceptMutate::new(sessions.clone());
+        let parts = HostParts::new();
+        let host = parts.host();
+        start.invoke(start_params(0), &host).expect("start ok");
+
+        let deadline = SystemTime::now() + Duration::from_secs(30);
+        let ids = [3_u128, 1, 2].map(ParkedId::from_u128);
+        let flow = {
+            let map = sessions.lock();
+            let (fid, session) = map.iter().next().expect("one live session");
+            for (i, id) in ids.iter().enumerate() {
+                session
+                    .handle
+                    .park_for_test(*id, parked_packet(&[b'a' + i as u8]), deadline);
+            }
+            *fid
+        };
+        let want: Vec<String> = ids.iter().map(|id| parked_id_to_string(*id)).collect();
+        assert_eq!(
+            want,
+            vec![
+                "00000000-0000-0000-0000-000000000003",
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+            ]
+        );
+
+        // Mutate the oldest (uuid ...0003) with new raw bytes.
+        let mut m = BTreeMap::new();
+        m.insert("id".to_string(), Value::Str(want[0].clone()));
+        m.insert(
+            "bytes".to_string(),
+            Value::Bytes(ip_udp("10.0.0.5", b"mutated")),
+        );
+        mutate.invoke(Params::new(m), &host).expect("mutate ok");
+
+        let got = list_entries(&list, &host, Params::default());
+        let got_ids: Vec<&str> = got.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(got_ids, want, "a mutate must not reorder the list");
+        assert_eq!(got[0].2, "mutated");
+        assert_eq!(got[1].2, "parked");
+        assert_eq!(got[2].2, "parked");
+        assert!(
+            got[0].1 <= got[1].1 && got[1].1 <= got[2].1,
+            "parked_at is non-decreasing in arrival order: {got:?}"
+        );
+
+        // The same order through the `flow` filter the UIs use.
+        let filtered = list_entries(
+            &list,
+            &host,
+            one_param("flow", Value::Str(super::super::flow_id_to_string(flow))),
+        );
+        let filtered_ids: Vec<&str> = filtered.iter().map(|(id, _, _)| id.as_str()).collect();
+        assert_eq!(filtered_ids, want);
+
+        // A well-formed flow id with no session lists nothing.
+        let other = list_entries(
+            &list,
+            &host,
+            one_param(
+                "flow",
+                Value::Str(super::super::flow_id_to_string(crate::flow::L4FlowId::new())),
+            ),
+        );
+        assert!(other.is_empty(), "an unknown flow lists nothing: {other:?}");
+    }
+
+    /// AC37 (tester): a malformed `flow` filter is an error, not an unfiltered list.
+    #[test]
+    fn intercept_list_rejects_malformed_flow_filter() {
+        let sessions = Arc::new(InterceptSessions::new());
+        let list = InterceptList::new(sessions);
+        let parts = HostParts::new();
+        let host = parts.host();
+        assert!(list
+            .invoke(one_param("flow", Value::Str("not-a-uuid".into())), &host)
+            .is_err());
+        assert!(list
+            .invoke(one_param("flow", Value::Int(7)), &host)
+            .is_err());
+        // `null` counts as absent: the (empty) unfiltered list.
+        assert_eq!(
+            list.invoke(one_param("flow", Value::Null), &host)
+                .expect("null flow is no filter"),
+            Value::Array(vec![])
+        );
+    }
+
+    /// AC37 (tester, fixed): across two live sessions the unfiltered
+    /// `l4.intercept.list` is in true arrival order. The arrival sequence is
+    /// process-wide (one counter for every session), and the sort key is
+    /// `(parked_seq, id)`, so session A's second packet lists before session B's
+    /// first packet when it arrived first. Spec §4: "in arrival order, oldest
+    /// first".
+    #[test]
+    fn intercept_list_is_arrival_ordered_across_sessions() {
+        let guard = guard_with(vec![scope_entry(("10.0.0.5", 32), L4Capability::Intercept)]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+        let sessions = Arc::new(InterceptSessions::new());
+        let (backend, _verdicts) = MockBackend::with(vec![]);
+        let start = InterceptStart::with_backend(
+            guard,
+            store,
+            sessions.clone(),
+            Some(cfg(0)),
+            mock_factory(backend),
+        );
+        let list = InterceptList::new(sessions.clone());
+        let parts = HostParts::new();
+        let host = parts.host();
+        start.invoke(start_params(0), &host).expect("start A");
+        start.invoke(start_params(1), &host).expect("start B");
+
+        let deadline = SystemTime::now() + Duration::from_secs(30);
+        let park = |session_index: usize, id: u128| {
+            let map = sessions.lock();
+            let mut flows: Vec<_> = map.keys().copied().collect();
+            flows.sort_by_key(|f| super::super::flow_id_to_string(*f));
+            let session = map.get(&flows[session_index]).expect("session");
+            session
+                .handle
+                .park_for_test(ParkedId::from_u128(id), parked_packet(b"x"), deadline);
+        };
+        // Arrival: A1 (A seq 0), A2 (A seq 1), then B1 (B seq 0), with a gap so
+        // `parked_at` differs by at least one millisecond each time.
+        park(0, 0xA1);
+        std::thread::sleep(Duration::from_millis(5));
+        park(0, 0xA2);
+        std::thread::sleep(Duration::from_millis(5));
+        park(1, 0xB1);
+
+        let got = list_entries(&list, &host, Params::default());
+        let got_ids: Vec<String> = got.into_iter().map(|(id, _, _)| id).collect();
+        assert_eq!(
+            got_ids,
+            vec![
+                parked_id_to_string(ParkedId::from_u128(0xA1)),
+                parked_id_to_string(ParkedId::from_u128(0xA2)),
+                parked_id_to_string(ParkedId::from_u128(0xB1)),
+            ],
+            "oldest first across sessions"
+        );
     }
 
     // ---- Linux-gated functional tests (real NFQUEUE on a loopback nft queue) ---
