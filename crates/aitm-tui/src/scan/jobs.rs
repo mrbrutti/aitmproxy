@@ -60,8 +60,16 @@ pub struct JobsState {
 impl JobsState {
     /// Fold a `scan.status` / `scan.cancel` reply (spec D10): the full view
     /// replaces `full[job]`, its summary replaces `summaries[job]`, and a job
-    /// not yet in `order` goes to the front (newest first).
-    pub fn fold_status(&mut self, status: JobStatus) {
+    /// not yet in `order` goes to the front (newest first). The core's
+    /// strings are bounded here, once (D6: "row strings are bounded once at
+    /// fold time"): `profile_name` is cut to [`PROFILE_MAX`] and every
+    /// `targets` entry to four times [`TARGETS_MAX`], so [`row`] and the
+    /// Detail pane only copy bounded text.
+    pub fn fold_status(&mut self, mut status: JobStatus) {
+        status.profile_name = truncate(&status.profile_name, PROFILE_MAX);
+        for target in &mut status.targets {
+            *target = truncate(target, 4 * TARGETS_MAX);
+        }
         let id = status.job.clone();
         if !self.order.contains(&id) {
             self.order.insert(0, id.clone());
@@ -222,10 +230,11 @@ impl JobsState {
 pub const WAITING_FOR_STATUS: &str = "waiting for scan.status...";
 
 /// The widest a `profile` cell grows before it is cut (the column cap, and
-/// the bound [`row`] applies when it is built).
+/// the bound [`JobsState::fold_status`] applies to the core's string).
 pub const PROFILE_MAX: usize = 16;
-/// The widest a `targets` column grows before its middle is elided; [`row`]
-/// keeps at most four times this of the joined targets.
+/// The widest a `targets` column grows before its middle is elided;
+/// [`JobsState::fold_status`] cuts every target to four times this and
+/// [`row`] keeps at most four times this of the joined targets.
 pub const TARGETS_MAX: usize = 48;
 /// How many targets [`row`] joins; the rest are counted (`+n`).
 const TARGETS_JOINED: usize = 4;
@@ -245,12 +254,12 @@ pub const UNKNOWN: &str = "...";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobRow {
     pub id: String,
-    /// The profile name cut to [`PROFILE_MAX`], `...` until a full status
-    /// is known.
+    /// The profile name, cut to [`PROFILE_MAX`] by the fold; `...` until a
+    /// full status is known.
     pub profile: String,
-    /// The first [`TARGETS_JOINED`] targets joined by a space (`+n` for the
-    /// rest), cut to four times [`TARGETS_MAX`]; `...` until a full status
-    /// is known.
+    /// The first [`TARGETS_JOINED`] targets (each cut by the fold) joined
+    /// by a space (`+n` for the rest), the whole cut to four times
+    /// [`TARGETS_MAX`]; `...` until a full status is known.
     pub targets: String,
     /// [`state_phase_text`].
     pub state_phase: String,
@@ -286,15 +295,13 @@ impl JobRow {
 /// The row for a job (spec D11): the counters from `summary`, which both
 /// `scan.list` and `scan.status` refresh; the profile and targets from `full`,
 /// which only `scan.status` carries, `...` until then. The core's strings
-/// are bounded here (D6 hostile-core bounds), so a frame's measuring and
-/// eliding runs over at most a few hundred cells per row.
+/// were bounded when the status was folded ([`JobsState::fold_status`], D6
+/// hostile-core bounds), so this only copies bounded text and a frame's
+/// measuring and eliding runs over at most a few hundred cells per row.
 pub fn row(summary: &JobSummary, full: Option<&JobStatus>) -> JobRow {
     JobRow {
         id: summary.job.clone(),
-        profile: full.map_or_else(
-            || UNKNOWN.to_string(),
-            |f| truncate(&f.profile_name, PROFILE_MAX),
-        ),
+        profile: full.map_or_else(|| UNKNOWN.to_string(), |f| f.profile_name.clone()),
         targets: full.map_or_else(|| UNKNOWN.to_string(), |f| targets_text(&f.targets)),
         state_phase: state_phase_text(summary.state, summary.phase),
         probes: format!("{}/{}", summary.probes.sent, summary.probes.budget),
@@ -305,13 +312,14 @@ pub fn row(summary: &JobSummary, full: Option<&JobStatus>) -> JobRow {
     }
 }
 
-/// The row's `targets` cell: the first [`TARGETS_JOINED`] targets joined by
-/// a space, `+n` for any more, the whole cut to four times [`TARGETS_MAX`].
+/// The row's `targets` cell: the first [`TARGETS_JOINED`] targets (each
+/// already cut by the fold) joined by a space, `+n` for any more, the whole
+/// cut to four times [`TARGETS_MAX`].
 fn targets_text(targets: &[String]) -> String {
     let mut text = targets
         .iter()
         .take(TARGETS_JOINED)
-        .map(|t| truncate(t, 4 * TARGETS_MAX))
+        .map(String::as_str)
         .collect::<Vec<_>>()
         .join(" ");
     if targets.len() > TARGETS_JOINED {

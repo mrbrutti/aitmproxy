@@ -30,25 +30,37 @@ pub fn fit(s: &str, w: usize) -> String {
 }
 
 /// Cut `s` to at most `w` cells, ending in `…` when anything was removed.
+///
+/// Bounded in work and in output (D6 hostile-core bounds; fix round E, E1):
+/// the walk stops as soon as `s` is known not to fit, so a call is O(w)
+/// whatever the input's length, and a string is also cut once it runs past
+/// `4 * w` chars, so a run of width-0 characters (U+200B and kin) cannot
+/// pass whole. The result is therefore at most `w` cells and `4 * w` chars.
 pub fn truncate(s: &str, w: usize) -> String {
-    if width(s) <= w {
-        return s.to_string();
-    }
     if w == 0 {
         return String::new();
     }
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
+    let max_chars = w.saturating_mul(4);
+    let mut cells_used = 0;
+    let mut chars_used = 0;
+    // The byte length of the longest prefix that leaves room for the
+    // ellipsis: at most `w - 1` cells and `4 * w - 1` chars.
+    let mut keep = 0;
+    for (i, c) in s.char_indices() {
         let cw = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + cw > w - 1 {
-            break;
+        if cells_used + cw > w || chars_used + 1 > max_chars {
+            let mut out = String::with_capacity(keep + '…'.len_utf8());
+            out.push_str(&s[..keep]);
+            out.push('…');
+            return out;
         }
-        out.push(c);
-        used += cw;
+        cells_used += cw;
+        chars_used += 1;
+        if cells_used < w && chars_used < max_chars {
+            keep = i + c.len_utf8();
+        }
     }
-    out.push('…');
-    out
+    s.to_string()
 }
 
 /// Right-align `s` in `w` cells.
@@ -101,6 +113,26 @@ mod tests {
         assert_eq!(cells(65_535), u16::MAX);
         assert_eq!(cells(70_000), u16::MAX);
         assert_eq!(cells(usize::MAX), u16::MAX);
+    }
+
+    /// Fix round E, E1: `truncate` is O(w) whatever the input. A string of a
+    /// million width-0 characters (U+200B) is cut to at most `4 * w` chars,
+    /// so the result is bounded in bytes as well as cells; a million `x`
+    /// gives exactly `w` cells; a string that fits is returned whole.
+    #[test]
+    fn truncate_is_bounded_in_chars_and_cells() {
+        let zero_width = "\u{200B}".repeat(1_000_000);
+        let cut = truncate(&zero_width, 40);
+        assert!(cut.chars().count() <= 160, "{} chars", cut.chars().count());
+        assert!(cut.ends_with('…'));
+        let wide = "x".repeat(1_000_000);
+        let cut = truncate(&wide, 10);
+        assert_eq!(width(&cut), 10);
+        assert_eq!(cut, "xxxxxxxxx…");
+        assert_eq!(truncate("abc", 3), "abc");
+        assert_eq!(truncate("", 5), "");
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("ab", 1), "…");
     }
 
     #[test]

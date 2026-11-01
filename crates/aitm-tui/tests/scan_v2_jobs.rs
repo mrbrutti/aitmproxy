@@ -16,8 +16,8 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::{
-    detail_lines, probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ScanTab,
-    PROFILE_MAX, TARGETS_MAX,
+    probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ScanTab, PROFILE_MAX,
+    TARGETS_MAX,
 };
 use aitm_tui::ui::text::width;
 use common::*;
@@ -296,20 +296,35 @@ fn detail_lists_lanes_and_session() {
     }
 }
 
-/// Fix round C, C20 (D6 hostile-core bounds): the row is bounded when it is
-/// built, not per frame. A 1 MiB `targets[0]` and a long profile name give
-/// a row whose text is at most four target cells wide and whose profile is
-/// cut to the column cap, more than four targets are counted rather than
-/// joined, the table still draws the targets cell at most `TARGETS_MAX`
-/// wide with an ellipsis, and the Detail pane's length is counted without
-/// building its lines.
+/// Fix round C, C20 and fix round E, E1 (D6 hostile-core bounds): the
+/// core's strings are bounded once, when the status is folded, so the row
+/// only copies bounded text. A 1 MiB `targets[0]` and a 300-char profile
+/// name leave `full[job]` holding at most `4 * TARGETS_MAX` cells (and one
+/// more char than four times that) and a `PROFILE_MAX`-cell profile; the
+/// row reads the same; more than four targets are counted rather than
+/// joined; the table still draws the targets cell at most `TARGETS_MAX`
+/// wide with an ellipsis.
 #[test]
-fn rows_are_bounded_at_construction_not_at_render() {
+fn rows_are_bounded_at_construction() {
     let mut app = app();
     let mut body = fixture("scan.status.json");
     body["targets"] = json!(["h".repeat(1 << 20)]);
     body["profile_name"] = json!("p".repeat(300));
     let _ = app.on_bus(status_reply(body));
+
+    let full = app
+        .scan
+        .jobs
+        .full
+        .get(JOB)
+        .unwrap_or_else(|| panic!("the status was folded"));
+    assert!(
+        full.targets[0].chars().count() <= 4 * TARGETS_MAX + 1,
+        "targets[0] is {} chars after the fold",
+        full.targets[0].chars().count()
+    );
+    assert!(width(&full.targets[0]) <= 4 * TARGETS_MAX);
+    assert_eq!(width(&full.profile_name), PROFILE_MAX);
 
     let built = app.scan.jobs.row_of(JOB);
     assert!(
@@ -336,22 +351,32 @@ fn rows_are_bounded_at_construction_not_at_render() {
         serde_json::from_value(fixture("scan.status.json")).expect("the fixture parses");
     let many = JobStatus {
         targets: (1..=6).map(|n| format!("http://h{n}.test")).collect(),
-        ..status.clone()
+        ..status
     };
     let crowded = row(&many.summary(), Some(&many));
     assert_eq!(
         crowded.targets,
         "http://h1.test http://h2.test http://h3.test http://h4.test +2"
     );
+}
 
+/// Fix round C, C20 and fix round E, E5: the Detail pane's length is
+/// counted without building its lines, and it counts exactly the id line
+/// plus what `detail_text` draws, for a job with a full status and for one
+/// nothing has answered for (the placeholder line).
+#[test]
+fn detail_len_counts_what_detail_text_draws() {
+    let status: JobStatus =
+        serde_json::from_value(fixture("scan.status.json")).expect("the fixture parses");
     let mut jobs = JobsState::default();
-    jobs.fold_status(status.clone());
-    assert_eq!(jobs.detail_len(), 1 + detail_lines(&status).len());
+    jobs.fold_status(status);
+    assert_eq!(jobs.detail_len(), 1 + jobs.detail_text().len());
     assert_eq!(
-        jobs.detail_text(),
-        detail_lines(&status),
-        "the view and the count read the same lines"
+        jobs.detail_len(),
+        8,
+        "the id line and the seven fixed lines"
     );
+    assert_eq!(jobs.detail_text()[0].0, "lanes");
     let mut bare = JobsState::default();
     bare.order.push(JOB.to_string());
     assert_eq!(
@@ -359,6 +384,7 @@ fn rows_are_bounded_at_construction_not_at_render() {
         vec![("", "waiting for scan.status...".to_string())],
         "no status: the placeholder line"
     );
+    assert_eq!(bare.detail_len(), 1 + bare.detail_text().len());
     assert_eq!(bare.detail_len(), 2, "the id line and the placeholder");
 }
 

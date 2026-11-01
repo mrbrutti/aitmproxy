@@ -19,7 +19,9 @@ use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::model::Finding;
-use aitm_tui::scan::{is_issue_id, IssueFilterKey, IssueFilters, IssuePane, ScanTab};
+use aitm_tui::scan::{
+    is_issue_id, IssueFilterKey, IssueFilters, IssuePane, ScanTab, DETAIL_VALUE_MAX, READ_MAX,
+};
 use common::*;
 use serde_json::{json, Value};
 
@@ -116,6 +118,24 @@ fn issues_requests(reqs: &[BusRequest]) -> Vec<&Value> {
             _ => None,
         })
         .collect()
+}
+
+/// A `scan.issues` page of `n` rows cut from the fixture's first row, the
+/// `k`th row's id being `id_of(k)`, every row high so the tally reads it.
+fn page_of(n: usize, id_of: impl Fn(usize) -> String) -> Value {
+    let template = fixture("scan.issues.json")["issues"][0].clone();
+    let rows: Vec<Value> = (0..n)
+        .map(|k| {
+            let mut row = template.clone();
+            row["id"] = json!(id_of(k));
+            row
+        })
+        .collect();
+    json!({
+        "issues": rows,
+        "next_cursor": null,
+        "by_severity": { "critical": 0, "high": n, "medium": 0, "low": 0, "info": 0 },
+    })
 }
 
 fn screen(app: &App) -> String {
@@ -478,6 +498,98 @@ fn read_never_outgrows_the_page() {
         app.scan.issues.list.len()
     );
     assert!(app.scan.inflight.is_empty());
+}
+
+/// Fix round E, E1 (D6 hostile-core bounds): `read` keeps at most `READ_MAX`
+/// entries between folds, the oldest inserted leaving first, so a page of
+/// a hundred rows walked and read one by one never holds more than 64 full
+/// issues; the row under the cursor is always among them.
+#[test]
+fn read_keeps_at_most_read_max_entries_dropping_the_oldest() {
+    assert_eq!(READ_MAX, 64);
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let ids: Vec<String> = (0..100u32).map(|k| format!("issue-{k:08x}")).collect();
+    let reqs = app.on_bus(issues_reply(page_of(100, |k| ids[k].clone())));
+    assert_eq!(reqs, vec![issue_request(&ids[0])]);
+    let _ = app.on_bus(issue_reply(&ids[0]));
+    for (k, id) in ids.iter().enumerate().take(71).skip(1) {
+        let reqs = app.update(Action::Down);
+        assert_eq!(reqs, vec![issue_request(id)], "row {k}");
+        let _ = app.on_bus(issue_reply(id));
+    }
+    assert_eq!(app.scan.issues.read.len(), READ_MAX);
+    assert!(
+        !app.scan.issues.read.contains_key(&ids[0]),
+        "the oldest read left first"
+    );
+    assert!(
+        !app.scan.issues.read.contains_key(&ids[6]),
+        "the seven oldest are gone"
+    );
+    assert!(app.scan.issues.read.contains_key(&ids[7]));
+    assert!(app.scan.issues.read.contains_key(&ids[70]));
+    assert_eq!(
+        app.scan.issues.detail().map(|i| i.id.as_str()),
+        Some(ids[70].as_str())
+    );
+    // The evicted row is unread again: landing on it reads it once more.
+    for _ in 0..70 {
+        let _ = app.update(Action::Up);
+        let _ = app.on_bus(issue_reply(
+            ids.get(app.scan.issues.cursor).unwrap_or(&ids[0]),
+        ));
+    }
+    assert_eq!(app.scan.issues.cursor, 0);
+    assert!(app.scan.issues.read.contains_key(&ids[0]));
+    assert_eq!(app.scan.issues.read.len(), READ_MAX);
+}
+
+/// Fix round E, E19 (D6 hostile-core bounds): the `Issue` strings the
+/// detail lines are built from are bounded once when the reply is folded
+/// into `read`, so a 1 MiB `description`, `payload`, `matched`,
+/// `remediation` and `note` leave an entry of at most `DETAIL_VALUE_MAX`
+/// cells (and four times that in chars) each, and the pane still draws the
+/// description cut with an ellipsis.
+#[test]
+fn read_issue_strings_are_bounded_at_fold_time() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let _ = app.on_bus(issues_reply(fixture("scan.issues.json")));
+    let mut issue = fixture("scan.issue.json");
+    issue["description"] = json!("D".repeat(1 << 20));
+    issue["evidence"]["payload"] = json!("P".repeat(1 << 20));
+    issue["evidence"]["matched"] = json!("M".repeat(1 << 20));
+    issue["remediation"] = json!("R".repeat(1 << 20));
+    issue["note"] = json!("N".repeat(1 << 20));
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: format!("scan.issue:{XSS}"),
+        name: "scan.issue".into(),
+        value: issue,
+    });
+    let read = app
+        .scan
+        .issues
+        .read
+        .get(XSS)
+        .unwrap_or_else(|| panic!("the reply was folded"));
+    let bounded = |s: &str| s.chars().count() <= 4 * DETAIL_VALUE_MAX && s.ends_with('…');
+    assert!(
+        bounded(&read.description),
+        "description: {} chars",
+        read.description.chars().count()
+    );
+    assert!(bounded(
+        read.evidence.payload.as_deref().unwrap_or_default()
+    ));
+    assert!(bounded(
+        read.evidence.matched.as_deref().unwrap_or_default()
+    ));
+    assert!(bounded(read.remediation.as_deref().unwrap_or_default()));
+    assert!(bounded(read.note.as_deref().unwrap_or_default()));
+    let text = screen(&app);
+    let line = line_with(&text, "description DDDD").unwrap_or_else(|| panic!("no line: {text}"));
+    assert!(line.contains("D…"), "{line:?}");
 }
 
 /// D1 (1): the issue-id wire form, `issue-` and exactly eight lowercase hex

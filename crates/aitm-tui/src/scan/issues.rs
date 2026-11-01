@@ -4,7 +4,7 @@
 //! view measures and draws what [`issue_row`] already cut, never the core's
 //! strings.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
@@ -36,6 +36,10 @@ pub const POINT_MAX: usize = 24;
 /// bounds: a detail line is built from the core's strings when the pane is
 /// drawn, so every value is cut here before the view measures it).
 pub const DETAIL_VALUE_MAX: usize = 400;
+/// The most full issues `IssuesState::read` holds between folds (D6
+/// hostile-core bounds; fix round E, E1): a cheap memory bound beside the
+/// per-fold prune, the oldest inserted leaving first.
+pub const READ_MAX: usize = 64;
 /// The most rows of the timing table [`issue_detail_lines`] prints; a longer
 /// series ends in a `... n more` line.
 pub const TIMING_ROWS_MAX: usize = 12;
@@ -375,6 +379,10 @@ pub struct IssuesState {
     /// `read.len() <= list.len()` (spec D3, D6; fix round D, D1). An entry
     /// also leaves on a terminal line for its job ([`IssuesState::forget_job`]).
     pub read: BTreeMap<IssueId, Issue>,
+    /// The keys of `read` in insertion order, oldest first: the eviction
+    /// order once `read` holds [`READ_MAX`] entries (fix round E, E1). Kept
+    /// in step with `read` by every insert and prune.
+    pub read_order: VecDeque<IssueId>,
     /// Cursor over the detail's probe flows ([`flow_refs`]), walked by
     /// `Up`/`Down` while the Detail pane is focused (spec D11).
     pub flow_cursor: usize,
@@ -410,6 +418,13 @@ impl IssuesState {
         self.cursor = self.cursor.min(self.list.len().saturating_sub(1));
         let listed: BTreeSet<&str> = self.list.iter().map(|i| i.id.as_str()).collect();
         self.read.retain(|id, _| listed.contains(id.as_str()));
+        self.prune_read_order();
+    }
+
+    /// Drop from `read_order` every id no longer in `read`, after a prune
+    /// of `read`.
+    fn prune_read_order(&mut self) {
+        self.read_order.retain(|id| self.read.contains_key(id));
     }
 
     /// The row under the list cursor, if the list has one.
@@ -429,13 +444,35 @@ impl IssuesState {
     /// display row are rebuilt from `issue.summary()`, so the list shows
     /// the status the reply carries. An issue the page does not list is
     /// still kept in `read` (the next fold prunes it if it stays unlisted).
-    pub fn fold_issue(&mut self, issue: Issue) {
+    /// Hostile-core bounds (D6; fix round E, E1, E19): the strings the
+    /// detail lines are built from are cut here, once ([`bound_issue`]),
+    /// and `read` keeps at most [`READ_MAX`] entries, the oldest inserted
+    /// leaving first.
+    pub fn fold_issue(&mut self, mut issue: Issue) {
+        bound_issue(&mut issue);
         if let Some(k) = self.list.iter().position(|row| row.id == issue.id) {
             let summary = issue.summary();
             self.rows[k] = issue_row(&summary);
             self.list[k] = summary;
         }
-        self.read.insert(issue.id.clone(), issue);
+        let id = issue.id.clone();
+        if self.read.insert(id.clone(), issue).is_none() {
+            self.read_order.push_back(id);
+            while self.read.len() > READ_MAX {
+                match self.read_order.pop_front() {
+                    Some(oldest) => {
+                        self.read.remove(&oldest);
+                    }
+                    // Nothing tracked (entries written past this fold): drop
+                    // the first key, so the bound holds whatever happened.
+                    None => {
+                        if let Some(first) = self.read.keys().next().cloned() {
+                            self.read.remove(&first);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// How many lines the Detail pane has for the row under the cursor:
@@ -452,6 +489,36 @@ impl IssuesState {
     /// job the issue itself names, so a filtered-out job's issues leave too.
     pub fn forget_job(&mut self, job: &str) {
         self.read.retain(|_, i| i.job != job);
+        self.prune_read_order();
+    }
+}
+
+/// Cut the strings [`issue_detail_lines`] reads off an `Issue` to
+/// [`DETAIL_VALUE_MAX`] cells (and so at most four times that in chars),
+/// once, when the issue enters `read` (D6 hostile-core bounds; fix round E,
+/// E19): `description`, `evidence.payload`, `evidence.matched`,
+/// `remediation` and `note`, the free-text fields a core fills; the rest
+/// are ids, enums and numbers the contract already bounds. The per-frame
+/// line building then runs over bounded text only.
+fn bound_issue(issue: &mut Issue) {
+    let cut = |s: &mut String| {
+        // A char is never more cells than bytes, so a string within the cap
+        // in bytes needs no walk and no new allocation.
+        if s.len() > DETAIL_VALUE_MAX {
+            *s = truncate(s, DETAIL_VALUE_MAX);
+        }
+    };
+    cut(&mut issue.description);
+    for field in [
+        issue.evidence.payload.as_mut(),
+        issue.evidence.matched.as_mut(),
+        issue.remediation.as_mut(),
+        issue.note.as_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        cut(field);
     }
 }
 
