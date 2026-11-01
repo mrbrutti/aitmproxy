@@ -39,6 +39,7 @@ T6 fills the `aitm-scan-l4-stream` skeleton that T1a handed over: a grammar form
 | F7 | The host carries the marker it was built with (`StreamHost::marker()` is constant; `probe_host_for` registers one marker per host): the engine's `JobCtx::marker()` mints a fresh token per call, which left every campaign without its job state on the first bus-level run (`host.rs`, `lib.rs`, `state.rs`). |
 | F8 | A crash retires the field path on its node for every seed (matching the L4 dedupe key), so one crashing `len` path costs one reproduction round, not one per seed (`state.rs`, `host.rs`, `checks.rs`). |
 | F9 | A connect refused before a case is sent waits for recovery and retries the same case once (`connect_waits=` in the detail); only a second refusal or an expired window is `target_down` (`checks.rs`). |
+| F10 | A node whose campaign ends `target_down` is marked down for the job; later campaigns on it stop at once (`HostError::TargetDown`, `StopReason::NodeDown`), bounding F9's recovery waits to one per node (`state.rs`, `host.rs`, `checks.rs`). |
 | R3 | Round-2 re-review leftovers: `TracingCapture` drops the sink guard before the serial lock; test rename; stale port comment; spec errata (empty-target clause, `Arc<Vec<String>>`). |
 
 The Review log holds the findings each round closes.
@@ -411,6 +412,7 @@ Kept by the T6 session during stage 6. One row per finding. Range reviewed: `395
 | 23 | T6 session (cells) | Important | `JobCtx::marker()` is a generator in T1b's engine; the lane's by-marker lookup (A2) never matched, 18 checks ran in 1 ms with `probes.sent: 0` | Fixed in fc735c2d (F7) |
 | 23 | T6 session (cells) | Important | A DNS target yields 104 points; every `len` point crashed the speaker once per seed (~40 s each), so the V job exceeded the cell's 300 s | Fixed in d4e61b11 (F8) |
 | 23 | T6 session (cells) | Important | Campaigns that started inside the speaker's 5 s down window stopped instantly as `target_down` on a refused connect with zero cases | Fixed in d4e61b11 (F9) |
+| 23 | T6 session (F9 review) | Minor | With F9 a dead endpoint costs one 15 s recovery window per point | Fixed in 4c564303 (F10) |
 | 23 | T6 session (cells) | External | T1b's issue builder leaves `Issue.location.l4` `null` (cells assert `location.l4.grammar`); the S6.3 derivation contract is routed to T1b via the coordinator | Open, T1b |
 | 23 | T6 session (cells) | External | `test_t6_grammars_live.py::advertises()` required the grammar name as a token in an `l4_field` check id; T6 ships three generic checks (S6.3) | Fixed by T10 in PR #233 (`lane_landed`) |
 | 23 | T6 session (cells) | Info | T1b's contract additions (`Verdict.location`/`more`, `CheckMeta.scope`, `L4Options.fields`) break the lane's build until #232 merges | Adapted on the proof branch; applied to #229 at integration once #232 is on main |
