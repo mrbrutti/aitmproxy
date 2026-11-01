@@ -14,7 +14,7 @@ use aitm_core::{
 
 use super::{epoch_ms, field};
 use crate::craft::{PacketEndpoints, PacketSpec};
-use crate::flow::{L4Flow, L4FlowStore};
+use crate::flow::{L4Flow, L4FlowStore, L4Packet};
 use crate::gates::{AgentGate, L4AgentGates};
 
 /// How many packets `l4.flow.get` returns when the caller gives no `limit`.
@@ -126,7 +126,7 @@ impl Command for FlowList {
 ///
 /// A packet's `bytes` reach only a trusted-control caller (operator, CLI) or an
 /// agent holding the gate that could have produced **that packet** (spec §2.2 as
-/// amended, L4PAR-AC35; see [`bytes_visible`]): an agent that could not have
+/// amended, L4PAR-AC35; see [`BytesView`]): an agent that could not have
 /// obtained the bytes itself must not read them, and in particular must not read
 /// the bus-token line off a loopback capture. Every other packet field is
 /// reported to every caller.
@@ -143,28 +143,43 @@ impl FlowGet {
     }
 }
 
-/// Whether a caller sees **one packet's** `bytes` (spec §2.2 as amended, decided
-/// per packet, never per flow kind): trusted control always; an agent only while
-/// it holds the gate that could have produced that packet — the Inject gate for an
-/// `injected` packet (one the core put on the wire for it), the Capture gate for
-/// every other (captured traffic, whatever flow recorded it: a capture, a
-/// `send_recv` reply, an intercept-parked packet). An agent with that gate open
-/// could have obtained the bytes itself, so this widens nothing; a gate for
-/// another primitive (Intercept, Widen) reveals nothing. Shared by the command
-/// path and the Rhai `l4.flow.get`, so the two faces cannot drift.
-pub(crate) fn bytes_visible(
-    caller_is_trusted_control: bool,
+/// Which packets' `bytes` one caller sees in one `l4.flow.get` reply (spec §2.2
+/// as amended, decided per packet, never per flow kind), built once per reply
+/// from the caller's trust and the agent gates: trusted control sees every
+/// packet; an agent sees a packet only while it holds the gate that could have
+/// produced it — the Inject gate for an `injected` packet (one the core put on
+/// the wire for it), the Capture gate for every other (captured traffic,
+/// whatever flow recorded it: a capture, a `send_recv` reply, an intercept-parked
+/// packet). An agent with that gate open could have obtained the bytes itself,
+/// so this widens nothing; a gate for another primitive (Intercept, Widen)
+/// reveals nothing. Shared by the command path and the Rhai `l4.flow.get`, so
+/// the two faces cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BytesView {
+    /// Captured packets' bytes are emitted.
+    captured: bool,
+    /// Injected packets' bytes are emitted.
     injected: bool,
-    gates: &L4AgentGates,
-) -> bool {
-    if caller_is_trusted_control {
-        return true;
+}
+
+impl BytesView {
+    /// The view for a caller whose trust is `caller_is_trusted_control` under the
+    /// current `gates`.
+    pub(crate) fn new(caller_is_trusted_control: bool, gates: &L4AgentGates) -> Self {
+        Self {
+            captured: caller_is_trusted_control || gates.allowed(AgentGate::Capture),
+            injected: caller_is_trusted_control || gates.allowed(AgentGate::Inject),
+        }
     }
-    gates.allowed(if injected {
-        AgentGate::Inject
-    } else {
-        AgentGate::Capture
-    })
+
+    /// Whether this view emits `p`'s bytes: by its `injected` flag alone.
+    fn shows(&self, p: &L4Packet) -> bool {
+        if p.injected {
+            self.injected
+        } else {
+            self.captured
+        }
+    }
 }
 
 impl Command for FlowGet {
@@ -223,8 +238,7 @@ impl Command for FlowGet {
         Ok(flow_to_value(
             &flow,
             window,
-            host.caller_is_trusted_control(),
-            &self.gates,
+            BytesView::new(host.caller_is_trusted_control(), &self.gates),
         ))
     }
 }
@@ -421,14 +435,9 @@ fn insert_endpoints(o: &mut BTreeMap<String, Value>, e: &PacketEndpoints) {
 /// An [`L4Flow`] as a transport-neutral object carrying the `window` slice of
 /// its packet log. `packet_count`, `injected_count` and the flow-level endpoints
 /// are over the whole log, so a `limit: 0` read still names the flow's target.
-/// Each packet carries `bytes` only when [`bytes_visible`] says so for **that
-/// packet** given the caller's trust and the agent `gates`.
-pub(crate) fn flow_to_value(
-    flow: &L4Flow,
-    window: PacketWindow,
-    caller_is_trusted_control: bool,
-    gates: &L4AgentGates,
-) -> Value {
+/// Each packet carries `bytes` only when the caller's `view` ([`BytesView`],
+/// built once per reply) shows **that packet**.
+pub(crate) fn flow_to_value(flow: &L4Flow, window: PacketWindow, view: BytesView) -> Value {
     use crate::flow::L4FlowKind;
     use crate::types::L4Direction;
 
@@ -460,7 +469,7 @@ pub(crate) fn flow_to_value(
     let mut raw_bytes = 0usize;
     let mut truncated = false;
     for p in flow.packets.iter().skip(window.offset).take(window.limit) {
-        let with_bytes = bytes_visible(caller_is_trusted_control, p.injected, gates);
+        let with_bytes = view.shows(p);
         if with_bytes
             && !packets.is_empty()
             && raw_bytes.saturating_add(p.bytes.len()) > FLOW_GET_MAX_REPLY_BYTES
@@ -997,60 +1006,85 @@ mod tests {
     }
 
     /// Invoke `l4.flow.get {id}` as `frontend` over `store` with the given gates,
-    /// returning the first packet object.
+    /// returning the first packet object: the head of [`packets_as`].
     fn get_as(
         store: Arc<dyn L4FlowStore>,
         gates: Arc<L4AgentGates>,
         frontend: Frontend,
         id: &str,
     ) -> BTreeMap<String, Value> {
-        let mem = MemFlowStore::new();
-        let client = StubClient;
-        let core = StdGuard::default();
-        let host = CommandHost::new(&mem, &client, &core, None).with_frontend(frontend);
-        let mut m = BTreeMap::new();
-        m.insert("id".to_string(), Value::Str(id.to_string()));
-        let got = FlowGet::new(store, gates)
-            .invoke(Params::new(m), &host)
-            .expect("flow.get ok");
-        let Value::Object(flow) = got else {
-            panic!("l4.flow.get returns an object, got {got:?}");
-        };
-        let Some(Value::Array(packets)) = flow.get("packets") else {
-            panic!("packets is an array: {flow:?}");
-        };
-        let Some(Value::Object(packet)) = packets.first() else {
-            panic!("one packet object: {packets:?}");
-        };
-        packet.clone()
+        packets_as(store, gates, frontend, id)
+            .into_iter()
+            .next()
+            .expect("one packet object")
     }
 
-    /// L4PAR-AC35, spec §2.2 as amended — `bytes_visible` is the one per-packet
-    /// rule both faces share: trusted control always; an agent sees an injected
-    /// packet's bytes only with the Inject gate open and a captured packet's only
-    /// with the Capture gate open; Intercept and Widen open nothing. Literal truth
-    /// table over (trusted, injected, open gate).
+    /// L4PAR-AC35, spec §2.2 as amended — `BytesView` is the one per-packet rule
+    /// both faces share, built once per reply: trusted control sees every
+    /// packet's bytes; an agent sees an injected packet's only with the Inject
+    /// gate open and a captured packet's only with the Capture gate open;
+    /// Intercept and Widen open nothing. Literal truth table over (trusted, open
+    /// gates), then `shows` routes each packet by its `injected` flag.
     #[test]
     fn bytes_visible_is_per_packet() {
         let gates = closed_gates();
-        for injected in [false, true] {
-            assert!(bytes_visible(true, injected, &gates), "trusted, all closed");
-            assert!(!bytes_visible(false, injected, &gates), "agent, all closed");
-        }
+        let all = BytesView {
+            captured: true,
+            injected: true,
+        };
+        let none = BytesView {
+            captured: false,
+            injected: false,
+        };
+        assert_eq!(BytesView::new(true, &gates), all, "trusted, all closed");
+        assert_eq!(BytesView::new(false, &gates), none, "agent, all closed");
         only(&gates, &[AgentGate::Capture]);
-        assert!(bytes_visible(false, false, &gates), "Capture → captured");
-        assert!(!bytes_visible(false, true, &gates), "Capture ↛ injected");
+        assert_eq!(
+            BytesView::new(false, &gates),
+            BytesView {
+                captured: true,
+                injected: false,
+            },
+            "Capture → captured only"
+        );
         only(&gates, &[AgentGate::Inject]);
-        assert!(!bytes_visible(false, false, &gates), "Inject ↛ captured");
-        assert!(bytes_visible(false, true, &gates), "Inject → injected");
+        assert_eq!(
+            BytesView::new(false, &gates),
+            BytesView {
+                captured: false,
+                injected: true,
+            },
+            "Inject → injected only"
+        );
         for other in [AgentGate::Intercept, AgentGate::Widen] {
             only(&gates, &[other]);
-            assert!(!bytes_visible(false, false, &gates), "{other:?} ↛ captured");
-            assert!(!bytes_visible(false, true, &gates), "{other:?} ↛ injected");
+            assert_eq!(
+                BytesView::new(false, &gates),
+                none,
+                "{other:?} opens nothing"
+            );
+            assert_eq!(BytesView::new(true, &gates), all, "{other:?}, trusted");
         }
         only(&gates, &[AgentGate::Capture, AgentGate::Inject]);
-        assert!(bytes_visible(false, false, &gates));
-        assert!(bytes_visible(false, true, &gates));
+        assert_eq!(BytesView::new(false, &gates), all);
+
+        // `shows` picks the side by the packet's `injected` flag alone.
+        let captured = packet_at(0, vec![0xaa], false);
+        let injected = packet_at(1, vec![0xbb], true);
+        assert!(all.shows(&captured) && all.shows(&injected));
+        assert!(!none.shows(&captured) && !none.shows(&injected));
+        let capture_only = BytesView {
+            captured: true,
+            injected: false,
+        };
+        assert!(capture_only.shows(&captured));
+        assert!(!capture_only.shows(&injected));
+        let inject_only = BytesView {
+            captured: false,
+            injected: true,
+        };
+        assert!(!inject_only.shows(&captured));
+        assert!(inject_only.shows(&injected));
     }
 
     /// Invoke `l4.flow.get {id}` as `frontend` over `store` with the given gates,

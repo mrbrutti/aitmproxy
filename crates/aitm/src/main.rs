@@ -625,13 +625,11 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     })
     .await?;
 
-    // Self-exclusion of the core's own listeners (L4PAR-AC34, spec §2.1). Now that
-    // the proxy, browser-proxy and (for `aitm web`) web UI listeners are bound,
-    // the live L4 guard — the one every `l4.capture.*`, CLI and Rhai capture
-    // records through — unions the bound ports into the set assembly seeded, so
-    // a loopback capture never records the bus's plaintext token line or any
-    // other frame to or from the core itself. The agent transport's port is the
-    // configured one here; the bound one (an ephemeral `0` included) is added by
+    // Self-exclusion of the core's own listeners (L4PAR-AC34, spec §2.1): the
+    // bound proxy, browser-proxy and (for `aitm web`) web UI ports top up the set
+    // assembly seeded from the config, so a loopback capture never records the
+    // bus's plaintext token line or any other frame to or from the core itself.
+    // The agent transport's bound port (an ephemeral `0` included) is added by
     // `on_bound` below. Each step only adds; none can drop an earlier port.
     let l4_live_guard = features
         .l4_shared
@@ -639,13 +637,12 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         .map(|shared| shared.guard.clone());
     // Bound addresses from the pre-bind step: nothing fallible may run between
     // the system-proxy auto-set and the `select!` (its restore-on-exit depends on it).
-    let mut l4_self_ports = vec![proxy_addr.port(), browser_addr.port()];
-    if let Some((_, bound)) = &web_listener {
-        l4_self_ports.push(bound.port());
-    }
-    l4_self_ports.extend(configured_agent_port(&cfg.mcp.transport));
     if let Some(guard) = &l4_live_guard {
-        guard.add_self_ports(l4_self_ports.iter().copied());
+        guard.add_self_ports(
+            [proxy_addr.port(), browser_addr.port()]
+                .into_iter()
+                .chain(web_listener.as_ref().map(|(_, bound)| bound.port())),
+        );
     }
 
     // Server path: launch the configured engine so the browser.* commands reach

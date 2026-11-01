@@ -40,7 +40,6 @@ pub use nfqueue_linux::NfqueueBackend;
 pub use unsupported::NfqueueBackend;
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -52,7 +51,7 @@ use uuid::Uuid;
 
 use crate::backend::L4Error;
 use crate::config::{InterceptConfig, Verdict};
-use crate::craft::{transport_ports, transport_proto, PacketEndpoints, PacketSpec};
+use crate::craft::{endpoints_of, PacketEndpoints, PacketSpec};
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
 use crate::guard::{L4Guard, L4Permit};
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
@@ -654,32 +653,10 @@ fn wire_of(verdict: Verdict, mutated: Option<Vec<u8>>) -> WireVerdict {
 /// definition); `src` and `dst` are always `Some` otherwise. The one parse behind
 /// [`process_packet`]'s self-exclusion and scope checks and behind [`ip_target`].
 fn ip_endpoints(payload: &[u8]) -> Option<PacketEndpoints> {
-    let parsed = SlicedPacket::from_ip(payload).ok()?;
-    let (src, dst) = match parsed.net? {
-        NetSlice::Ipv4(ip) => {
-            let h = ip.header();
-            (
-                IpAddr::V4(h.source_addr()),
-                IpAddr::V4(h.destination_addr()),
-            )
-        }
-        NetSlice::Ipv6(ip) => {
-            let h = ip.header();
-            (
-                IpAddr::V6(h.source_addr()),
-                IpAddr::V6(h.destination_addr()),
-            )
-        }
-        NetSlice::Arp(_) => return None,
-    };
-    let (src_port, dst_port) = transport_ports(&parsed.transport);
-    Some(PacketEndpoints {
-        proto: transport_proto(&parsed.transport),
-        src: Some(src),
-        dst: Some(dst),
-        src_port,
-        dst_port,
-    })
+    SlicedPacket::from_ip(payload)
+        .ok()
+        .filter(|p| matches!(p.net, Some(NetSlice::Ipv4(_) | NetSlice::Ipv6(_))))
+        .map(|p| endpoints_of(&p))
 }
 
 /// The `L4Target` the guard checks for a payload whose decoded endpoints are
@@ -750,7 +727,7 @@ mod tests {
     use crate::craft::{Ipv4Spec, Layer, PacketSpec, UdpSpec};
     use crate::flow::InMemoryL4FlowStore;
     use crate::types::{IpCidr, L4Capability, L4ScopeEntry, L4ScopeId, PortRange, RateCap};
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::AtomicU32;
 
     const IFACE: &str = "eth0";

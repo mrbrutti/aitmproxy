@@ -504,7 +504,8 @@ fn do_flow_list(live: &L4Live) -> Value {
 /// `l4.flow.get` — the `window` of one stored L4 flow; each packet's `bytes` only
 /// under the §2.2 rule (as amended) for **that packet** (injected or captured) and
 /// the caller's trust, decided by the same
-/// [`bytes_visible`](crate::commands::flow::bytes_visible) the command path uses.
+/// [`BytesView`](crate::commands::flow::BytesView) the command path uses, built
+/// once per reply.
 fn do_flow_get(
     live: &L4Live,
     id: &str,
@@ -519,8 +520,7 @@ fn do_flow_get(
     Ok(crate::commands::flow::flow_to_value(
         &flow,
         window,
-        caller_is_trusted_control,
-        &live.guard.agent_gates(),
+        crate::commands::flow::BytesView::new(caller_is_trusted_control, &live.guard.agent_gates()),
     ))
 }
 
@@ -1505,13 +1505,13 @@ mod tests {
         }
     }
 
-    /// The first packet object of a `l4.flow.get` reply made through the Rhai
-    /// dispatch as `caller`.
-    fn rhai_flow_get_packet(
+    /// Every packet object of a `l4.flow.get` reply made through the Rhai
+    /// dispatch as `caller`, in window order.
+    fn rhai_flow_get_packets(
         live: &L4Live,
         caller: aitm_core::CallerTrust,
         id: &str,
-    ) -> BTreeMap<String, Value> {
+    ) -> Vec<BTreeMap<String, Value>> {
         let src = NoSource;
         let ctx = HostCallCtx::new(caller, &src);
         let got =
@@ -1522,14 +1522,30 @@ mod tests {
         let Some(Value::Array(packets)) = flow.get("packets") else {
             panic!("packets is an array: {flow:?}");
         };
-        let Some(Value::Object(packet)) = packets.first() else {
-            panic!("one packet object: {packets:?}");
-        };
-        packet.clone()
+        packets
+            .iter()
+            .map(|p| match p {
+                Value::Object(o) => o.clone(),
+                other => panic!("a packet object, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// The first packet object of [`rhai_flow_get_packets`].
+    fn rhai_flow_get_packet(
+        live: &L4Live,
+        caller: aitm_core::CallerTrust,
+        id: &str,
+    ) -> BTreeMap<String, Value> {
+        rhai_flow_get_packets(live, caller, id)
+            .into_iter()
+            .next()
+            .expect("one packet object")
     }
 
     /// A flow of `kind` holding one packet per `(bytes, injected)` element, in
-    /// order, inserted into `store`; its id string.
+    /// order, inserted into `store`; its id string. An injected packet is
+    /// outbound (one the core put on the wire), a captured one inbound.
     fn insert_flow(store: &dyn L4FlowStore, kind: L4FlowKind, packets: &[(&[u8], bool)]) -> String {
         use crate::flow::{L4Bind, L4Meta, L4Packet};
         let id = store.insert(L4Flow {
@@ -1543,7 +1559,11 @@ mod tests {
             packets: packets
                 .iter()
                 .map(|(bytes, injected)| L4Packet {
-                    dir: L4Direction::Inbound,
+                    dir: if *injected {
+                        L4Direction::Outbound
+                    } else {
+                        L4Direction::Inbound
+                    },
                     timestamp: std::time::SystemTime::now(),
                     decoded: PacketSpec::summarize(bytes),
                     bytes: bytes.to_vec(),
@@ -1562,22 +1582,9 @@ mod tests {
         caller: aitm_core::CallerTrust,
         id: &str,
     ) -> Vec<Option<Value>> {
-        let src = NoSource;
-        let ctx = HostCallCtx::new(caller, &src);
-        let got =
-            host_fn(live, "flow.get", &ctx, &[Value::Str(id.to_string())]).expect("flow.get ok");
-        let Value::Object(flow) = got else {
-            panic!("flow.get returns an object, got {got:?}");
-        };
-        let Some(Value::Array(packets)) = flow.get("packets") else {
-            panic!("packets is an array: {flow:?}");
-        };
-        packets
+        rhai_flow_get_packets(live, caller, id)
             .iter()
-            .map(|p| match p {
-                Value::Object(o) => o.get("bytes").cloned(),
-                other => panic!("a packet object, got {other:?}"),
-            })
+            .map(|o| o.get("bytes").cloned())
             .collect()
     }
 

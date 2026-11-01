@@ -429,7 +429,8 @@ mod tests {
     /// attached through `attach_bound_hook`, served, reports the ephemeral port it
     /// actually bound into the L4 guard's self ports — exactly one non-zero port
     /// — before anything else learns it. Binds a port: in a sandbox that refuses
-    /// `bind`, `serve` ends with that error and the test reports it.
+    /// `bind` (`PermissionDenied`), `serve` ends with that error and the test
+    /// skips with a note; any other early end fails it.
     #[tokio::test]
     async fn attach_bound_hook_feeds_the_bound_port_to_the_l4_guard() {
         let guard = Arc::new(L4Guard::new(&aitm_proto_l4::config::L4Config::default()));
@@ -456,6 +457,24 @@ mod tests {
             }
             if serving.is_finished() {
                 let ended = serving.await;
+                // A sandbox that refuses `bind` ends `serve` with EPERM before any
+                // port exists: not a bug, so skip with a note, the way
+                // `tests/l4_cua_tui.rs` does. Any other early end is a failure.
+                if let Ok(Err(e)) = &ended {
+                    if e.chain().any(|c| {
+                        c.downcast_ref::<io::Error>()
+                            .is_some_and(|io| io.kind() == io::ErrorKind::PermissionDenied)
+                    }) {
+                        eprintln!(
+                            "tui::attach_bound_hook_feeds_the_bound_port_to_the_l4_guard: \
+                             skipped — this sandbox refuses to bind 127.0.0.1:0 \
+                             (PermissionDenied). Run `cargo test -p aitm --lib \
+                             attach_bound_hook_feeds_the_bound_port_to_the_l4_guard` in the \
+                             Terminal panel."
+                        );
+                        return;
+                    }
+                }
                 panic!("serve ended before reporting a bound port: {ended:?}");
             }
             assert!(
@@ -495,8 +514,7 @@ mod tests {
             .expect("tui.rs defines `run`")
             .split("#[cfg(test)]")
             .next()
-            .expect("the test module follows `run`")
-            .to_string();
+            .expect("the test module follows `run`");
         assert!(run_body.contains("attach_bound_hook(agent, on_agent_bound)"));
     }
 

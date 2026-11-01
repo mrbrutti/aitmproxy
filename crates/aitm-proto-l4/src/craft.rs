@@ -290,28 +290,9 @@ impl PacketSpec {
     /// undecodable buffer returns [`PacketEndpoints::default`].
     #[must_use]
     pub fn endpoints(bytes: &[u8]) -> PacketEndpoints {
-        use etherparse::NetSlice;
-
-        let mut out = PacketEndpoints::default();
-        let Some(p) = parse_frame(bytes) else {
-            return out;
-        };
-        match &p.net {
-            Some(NetSlice::Ipv4(v4)) => {
-                let h = v4.header();
-                out.src = Some(IpAddr::V4(h.source_addr()));
-                out.dst = Some(IpAddr::V4(h.destination_addr()));
-            }
-            Some(NetSlice::Ipv6(v6)) => {
-                let h = v6.header();
-                out.src = Some(IpAddr::V6(h.source_addr()));
-                out.dst = Some(IpAddr::V6(h.destination_addr()));
-            }
-            _ => {}
-        }
-        out.proto = transport_proto(&p.transport);
-        (out.src_port, out.dst_port) = transport_ports(&p.transport);
-        out
+        parse_frame(bytes)
+            .map(|p| endpoints_of(&p))
+            .unwrap_or_default()
     }
 
     /// The first network layer's addresses, used as the pseudo-header for
@@ -353,6 +334,38 @@ pub(crate) fn transport_proto(
         Some(TransportSlice::Icmpv4(_)) => Some(L4Proto::Icmp),
         Some(TransportSlice::Icmpv6(_)) => Some(L4Proto::IcmpV6),
         _ => None,
+    }
+}
+
+/// The endpoints an already-parsed slice carries: network-layer addresses (IPv4
+/// or IPv6; `None` for no or another network layer), transport and ports. The one
+/// decode behind [`PacketSpec::endpoints`] and the intercept path's L3-only parse.
+pub(crate) fn endpoints_of(p: &etherparse::SlicedPacket<'_>) -> PacketEndpoints {
+    use etherparse::NetSlice;
+    let (src, dst) = match &p.net {
+        Some(NetSlice::Ipv4(v4)) => {
+            let h = v4.header();
+            (
+                Some(IpAddr::V4(h.source_addr())),
+                Some(IpAddr::V4(h.destination_addr())),
+            )
+        }
+        Some(NetSlice::Ipv6(v6)) => {
+            let h = v6.header();
+            (
+                Some(IpAddr::V6(h.source_addr())),
+                Some(IpAddr::V6(h.destination_addr())),
+            )
+        }
+        _ => (None, None),
+    };
+    let (src_port, dst_port) = transport_ports(&p.transport);
+    PacketEndpoints {
+        proto: transport_proto(&p.transport),
+        src,
+        dst,
+        src_port,
+        dst_port,
     }
 }
 
