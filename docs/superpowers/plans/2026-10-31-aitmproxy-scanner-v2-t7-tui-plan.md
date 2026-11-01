@@ -405,6 +405,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix D | coder note | Minor | a landing suppressed while a read is pending is not retried when the reply lands (row under the cursor stays unread) | ruling: re-land once on a successful reply when the cursor's id differs from the reply's; fix round E (E10) |
 | fix D | coder note | note | with `scan.issues` present and `scan.issue` absent the list draws while the banner names the missing verb | accepted: the list is content, the banner is the state |
 | fix D | coder note | note | the legacy Jobs key line is a fifth tertiary line not routed through `hint` | Task 14 replaces it with the `bars.rs` hints |
+| fix D | security | re-review | D1, D2, D3, D9 closed; bounds: at most one `scan.issues` and one `scan.issue` in flight, `read` at most 513 full issues | closed |
+| fix D | security | Minor | a width-0 string (U+200B and kin) passes the cell-based `truncate` whole, so a hostile page defeats D2's per-frame bound in bytes | fix round E (E1): `truncate` also caps at `4 * w` chars; `read` capped at 64 entries (drop the oldest) |
 
 ## Shipped
 
