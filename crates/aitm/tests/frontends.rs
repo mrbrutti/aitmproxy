@@ -19,7 +19,7 @@ use aitm_mcp::McpServer;
 use futures::future::BoxFuture;
 use serde_json::{json, Value as JsonValue};
 
-const EXPECTED_TOOLS: [&str; 62] = [
+const EXPECTED_TOOLS: [&str; 64] = [
     // M4 agent-control and F4 subscription tools, registered unconditionally by
     // the `AgentPlugin` and `SubscriptionPlugin` in `wire.rs`.
     "agent.status",
@@ -52,6 +52,12 @@ const EXPECTED_TOOLS: [&str; 62] = [
     "proxy.system.status",
     "proxy.system.set",
     "proxy.system.unset",
+    // l4.privilege / l4.privilege.request (spec 2026-10-31-l4-capture-privilege-design
+    // §2.2/§2.3): the packet-capture privilege read (Read) and the operator-only,
+    // confirmed request (Sensitive), registered on every core whether or not L4 is
+    // enabled (L4PRIV-AC2); with L4 off they are the only `l4.*` names.
+    "l4.privilege",
+    "l4.privilege.request",
     "config.get",
     "request.send",
     "browser.navigate",
