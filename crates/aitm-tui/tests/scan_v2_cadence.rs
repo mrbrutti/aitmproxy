@@ -15,9 +15,11 @@ use std::collections::BTreeSet;
 
 use aitm_scan_model::{JobStatus, ListResult};
 use aitm_tui::action::{Action, BusEvent, BusRequest};
-use aitm_tui::app::App;
+use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
-use aitm_tui::scan::{is_job_id, parse_result, tag_keyed, JobsState, MAX_STATUS_FOLLOWUPS};
+use aitm_tui::scan::{
+    is_job_id, parse_result, tag_keyed, JobsState, PendingLaunch, ScanTab, MAX_STATUS_FOLLOWUPS,
+};
 use common::*;
 use serde_json::{json, Value};
 
@@ -61,6 +63,32 @@ fn status_requests(reqs: &[BusRequest]) -> usize {
     reqs.iter()
         .filter(|r| matches!(r, BusRequest::CallTagged { name, .. } if name == "scan.status"))
         .count()
+}
+
+/// Every tagged call in `reqs`, whatever its verb (fix round B, B9: the
+/// dedupe pin counts them all, not only `scan.status`).
+fn tagged_requests(reqs: &[BusRequest]) -> usize {
+    reqs.iter()
+        .filter(|r| matches!(r, BusRequest::CallTagged { .. }))
+        .count()
+}
+
+/// The `scan.list {}` request under its single-slot tag.
+fn list_request() -> BusRequest {
+    BusRequest::CallTagged {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        args: json!({}),
+    }
+}
+
+/// An empty `scan.list` reply, settling the tag without adding a job.
+fn empty_list_reply() -> BusEvent {
+    BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: json!({ "jobs": [] }),
+    }
 }
 
 fn tick(app: &mut App) -> Vec<BusRequest> {
@@ -111,9 +139,9 @@ fn four_progress_lines_yield_one_inflight_status() {
     let mut app = app();
     let mut total = 0;
     for _ in 0..4 {
-        total += status_requests(&app.on_bus(progress_line()));
+        total += tagged_requests(&app.on_bus(progress_line()));
     }
-    assert_eq!(total, 1, "one tagged status in total");
+    assert_eq!(total, 1, "one tagged call in total, the status");
     assert_eq!(
         app.scan.inflight,
         BTreeSet::from([format!("scan.status:{JOB}")])
@@ -509,4 +537,82 @@ fn a_keyed_error_is_cleared_only_by_the_same_key() {
         app.scan.last_error, None,
         "a single-slot verb clears as before"
     );
+}
+
+/// D6, first row (fix round B, B9): `OpenScan` on a v2 bus requests the
+/// list exactly once; a second open while it is in flight requests nothing.
+#[test]
+fn open_scan_requests_the_list_once() {
+    let mut app = app();
+    assert_eq!(app.update(Action::OpenScan), vec![list_request()]);
+    assert_eq!(app.mode, Mode::Scan);
+    assert_eq!(app.scan.jobs.listed_at_tick, 0);
+    let again = app.update(Action::OpenScan);
+    assert!(again.is_empty(), "the tag is still in flight: {again:?}");
+}
+
+/// D6, first row (fix round B, B9): 40 `Tick`s in `Mode::Scan` give exactly
+/// one `scan.list`; 40 in `Mode::Flows` give none.
+#[test]
+fn forty_ticks_in_scan_mode_list_once() {
+    let mut scan = app();
+    let _ = scan.update(Action::OpenScan);
+    let _ = scan.on_bus(empty_list_reply());
+    let mut all = Vec::new();
+    for _ in 0..40 {
+        all.extend(tick(&mut scan));
+    }
+    assert_eq!(all, vec![list_request()]);
+    assert_eq!(scan.scan.jobs.listed_at_tick, 40);
+
+    let mut flows = app();
+    assert_eq!(flows.mode, Mode::Flows);
+    let mut none = Vec::new();
+    for _ in 0..40 {
+        none.extend(tick(&mut flows));
+    }
+    assert!(none.is_empty(), "no list outside the Scan view: {none:?}");
+}
+
+/// D6, third row (fix round B, B9): in `Mode::Scan` on the Issues tab, a
+/// `finished` line yields `scan.status {job}` and `scan.issues {limit: 512}`.
+#[test]
+fn a_terminal_line_on_the_issues_tab_requests_issues() {
+    let mut app = app();
+    let _ = app.update(Action::OpenScan);
+    let _ = app.on_bus(empty_list_reply());
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let reqs = app.on_bus(BusEvent::Notification(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/aitm/job",
+        "params": fixture("job.finished.json"),
+    })));
+    assert_eq!(
+        reqs,
+        vec![
+            BusRequest::CallTagged {
+                tag: format!("scan.status:{JOB}"),
+                name: "scan.status".into(),
+                args: json!({ "job": JOB }),
+            },
+            BusRequest::CallTagged {
+                tag: "scan.issues".into(),
+                name: "scan.issues".into(),
+                args: json!({ "limit": 512 }),
+            },
+        ]
+    );
+}
+
+/// D4 (fix round B, B9): `Disconnected` drops a launch in flight.
+#[test]
+fn disconnect_clears_pending_launch() {
+    let mut app = app();
+    app.scan.launch.pending = Some(PendingLaunch {
+        call: "scan.start".into(),
+        args: json!({ "profile_name": "standard" }),
+        profile_name: Some("standard".into()),
+    });
+    let _ = app.on_bus(BusEvent::Disconnected("x".into()));
+    assert_eq!(app.scan.launch.pending, None);
 }
