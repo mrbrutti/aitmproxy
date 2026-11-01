@@ -343,6 +343,8 @@ pub const CORE_TOOLS: &[&str] = &[
     "check.ws-sql-error",
     "check.ws-ssti",
     "check.ws-subprotocol-observe",
+    "check.l4-packet-crash",
+    "check.l4-packet-reaction",
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,

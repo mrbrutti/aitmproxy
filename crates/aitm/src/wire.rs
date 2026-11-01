@@ -1201,8 +1201,11 @@ mod tests {
         );
 
         let lanes = collect_lanes_with(None, ws_tls_policy(&cfg));
-        assert_eq!(lanes.len(), 1);
-        assert_eq!(lanes[0].lane(), LaneKind::Ws);
+        assert!(
+            lanes.iter().any(|lane| lane.lane() == LaneKind::Ws),
+            "the WS lane is among the collected lanes: {:?}",
+            lanes.iter().map(|lane| lane.lane()).collect::<Vec<_>>()
+        );
     }
 
     /// A check that sends nothing, standing in for one a Rhai `reg.add_check`

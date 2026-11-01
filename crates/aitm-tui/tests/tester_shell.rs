@@ -921,7 +921,7 @@ fn inspector_frames_with_a_five_megabyte_body_do_not_freeze() {
 }
 
 /// The honest second snapshot (`aitm-tui --snapshot-core`): the fixture
-/// limited to the 93 commands the bus serves today (the 2026-10-29 M4 merge on
+/// limited to the 95 commands the bus serves today (the 2026-10-29 M4 merge on
 /// top of the M6 parity additions, plus the scanner v2 job family and its
 /// `check.<id>` manual verbs). F5/F6/F7/F12/F13, the M3 commands, the M6
 /// F9/F10/F11/Map commands and the M4 F1 agent / F4 subscription commands are
@@ -934,7 +934,7 @@ fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     let mut want: Vec<&str> = CORE_TOOLS.to_vec();
     want.sort_unstable();
     assert_eq!(names, want);
-    assert_eq!(app.tools.len(), 93);
+    assert_eq!(app.tools.len(), 95);
     for lit in [
         "flow.detail",
         "flow.mark",
@@ -994,7 +994,7 @@ fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     assert_eq!(app.selected.as_deref(), Some("f50"));
 
     // With M4 merged the whole fixture is core: the core app equals the full one.
-    assert_eq!(fixture_app(200, 50).tools.len(), 93);
+    assert_eq!(fixture_app(200, 50).tools.len(), 95);
     let text = text_of(&app, 200, 50);
     assert!(text.contains("11 / 15 rows"), "{text}");
     assert!(text.contains("Agent ● all tools · 14/min"), "{text}");
