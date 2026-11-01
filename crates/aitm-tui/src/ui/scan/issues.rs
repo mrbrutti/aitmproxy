@@ -4,9 +4,9 @@
 //! and the filter keys foot it. The detail half: the read issue's head and
 //! `label value` pairs (`scan::issue_head`, `scan::issue_detail_lines`,
 //! bounded by the model at fold time) around the walkable flow list
-//! (`scan::flow_at`), scrolled by `detail_scroll`, pulled to the flow under
-//! the flow cursor while `follow_flow` is set (the last key was a flow
-//! key), and the status-control footer. The degraded states are the state
+//! (`scan::flow_at`), scrolled by `detail_view.scroll`, pulled to the flow
+//! under the flow cursor while `detail_view.follow_flow` is set (the last
+//! key was a flow key), and the status-control footer. The degraded states are the state
 //! banner's (D13: one state on screen).
 //!
 //! Row layout (builder's call, from the D11 mockup): `>` cursor mark, the
@@ -27,7 +27,7 @@ use ratatui::text::{Line, Span};
 use crate::app::App;
 use crate::scan::{
     confidence_token, count_of, flow_at, grouped, issue_detail_lines, issue_head, severity_header,
-    severity_token, status_token, DetailLines, FlowTag, IssueHead, IssuePane, IssueRow, ReadIssue,
+    severity_token, status_token, DetailLayout, DetailRow, FlowTag, IssueHead, IssuePane, IssueRow,
     ScanOffer, LOCATION_MAX, NAME_MAX, POINT_MAX,
 };
 use crate::text::{cells, fit, truncate, width};
@@ -210,11 +210,12 @@ fn list(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 /// `... n more` line when the fold dropped any), then the lines after the
 /// flows (fix round F, F1), or the placeholder while the row under the
 /// cursor has no read; the footer takes the last row when there are two
-/// or more. The scroll is `detail_scroll`, exactly as drawn, except that
-/// while the Detail pane is focused and `follow_flow` is set (the last key
-/// was a flow key; fix round F, F7) it is pulled so the flow under the
-/// flow cursor is on screen. Only the rows on screen are built (fix round
-/// F, F4).
+/// or more. The scroll is `detail_view.scroll`, exactly as drawn, except
+/// that while the Detail pane is focused and `follow_flow` is set (the
+/// last key was a flow key; fix round F, F7) it is pulled so the flow under
+/// the flow cursor is on screen. The row arithmetic is the model's
+/// (`DetailLayout`, fix round G, G2); only the rows on screen are built
+/// (fix round F, F4).
 fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if area.height == 0 || area.width < 2 {
         return;
@@ -229,10 +230,20 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             let focused = issues.pane == IssuePane::Detail;
             let w = usize::from(area.width);
             let lines = issue_detail_lines(read);
-            let layout = DetailLayout::of(&lines, read);
+            let layout = DetailLayout::of(read);
+            debug_assert_eq!(
+                layout.total,
+                1 + lines.before_flows.len()
+                    + 1
+                    + layout.flows
+                    + usize::from(layout.more)
+                    + lines.after_flows.len(),
+                "the layout counts the lines built"
+            );
             let flow_index = issues.flow_index();
-            let mut top = usize::from(issues.detail_scroll).min(layout.total.saturating_sub(1));
-            if focused && issues.follow_flow {
+            let view = &issues.detail_view;
+            let mut top = usize::from(view.scroll).min(layout.total.saturating_sub(1));
+            if focused && view.follow_flow {
                 if let Some(f) = flow_index {
                     let flow_line = layout.first_flow + f;
                     if flow_line < top {
@@ -268,7 +279,7 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
                     DetailRow::More => labelled(
                         theme,
                         "",
-                        &format!("... {} more", read.dropped_flows),
+                        &format!("... {} more", read.dropped.flows),
                         w,
                         DETAIL_LABEL_W,
                     ),
@@ -288,70 +299,6 @@ fn detail(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             &key_text(&[ISSUES_KEYS]),
             buf,
         );
-    }
-}
-
-/// What one row of the Detail pane is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetailRow {
-    Head,
-    /// `before_flows[i]`.
-    Before(usize),
-    FlowsLabel,
-    /// The `f`th flow of [`flow_at`].
-    Flow(usize),
-    /// The `... n more` line under the flows.
-    More,
-    /// `after_flows[i]`.
-    After(usize),
-}
-
-/// The row arithmetic of the Detail pane: where each run starts, so a frame
-/// maps a row index to what it draws without building the rows before it.
-struct DetailLayout {
-    /// The row of the `flows` label.
-    flows_label: usize,
-    /// The row of the first flow.
-    first_flow: usize,
-    /// How many flows are listed.
-    flows: usize,
-    /// Whether a `... n more` row follows the flows.
-    more: bool,
-    /// The rows in all; `IssuesState::detail_len` counts the same.
-    total: usize,
-}
-
-impl DetailLayout {
-    fn of(lines: &DetailLines, read: &ReadIssue) -> Self {
-        let flows_label = 1 + lines.before_flows.len();
-        let first_flow = flows_label + 1;
-        let flows =
-            read.evidence.probe_flows.len() + usize::from(read.evidence.baseline_flow.is_some());
-        let more = read.dropped_flows > 0;
-        let total = first_flow + flows + usize::from(more) + lines.after_flows.len();
-        Self {
-            flows_label,
-            first_flow,
-            flows,
-            more,
-            total,
-        }
-    }
-
-    fn row(&self, k: usize) -> DetailRow {
-        if k == 0 {
-            DetailRow::Head
-        } else if k < self.flows_label {
-            DetailRow::Before(k - 1)
-        } else if k == self.flows_label {
-            DetailRow::FlowsLabel
-        } else if k < self.first_flow + self.flows {
-            DetailRow::Flow(k - self.first_flow)
-        } else if self.more && k == self.first_flow + self.flows {
-            DetailRow::More
-        } else {
-            DetailRow::After(k - self.first_flow - self.flows - usize::from(self.more))
-        }
     }
 }
 

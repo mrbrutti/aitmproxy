@@ -10,7 +10,9 @@ use aitm_scan_model::{
     Phase, StoppedReason,
 };
 
-use super::{is_job_id, lane_token, severity_counts, severity_token, SEVERITY_ORDER};
+use super::{
+    is_job_id, lane_token, severity_counts, severity_token, DETAIL_VALUE_MAX, SEVERITY_ORDER,
+};
 use crate::text::{clean, truncate};
 
 /// Which pane of the Jobs tab holds the cursor.
@@ -243,12 +245,6 @@ impl JobsState {
 /// The Detail pane's one line while no `scan.status` has answered.
 const WAITING_FOR_STATUS: &str = "waiting for scan.status...";
 
-/// The widest any free-text field of a full status grows, in cells (fix
-/// round G, G11; D6 hostile-core bounds): `error`, the frontend and client
-/// label, each clamped field, skipped reason and running check id, and
-/// the canary path are cut to this once, at fold ([`bound_status`]), so the
-/// Detail pane formats bounded text only.
-pub const DETAIL_VALUE_MAX: usize = 400;
 /// The most entries the Detail pane lists of `checks.running`, `clamped`
 /// and `lanes.skipped` (fix round G, G11; the builder's number): the fold
 /// keeps this many and counts the rest into [`StatusDropped`], which the

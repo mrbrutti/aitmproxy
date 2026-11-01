@@ -32,11 +32,12 @@ use crate::model::{
 use crate::open::{self, OpenTarget};
 use crate::scan::{
     due, fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
-    parse_result, row_gate, scan_host, state_text, status_token, step, tag_keyed, tag_parts,
-    typed_origin, usable_selector, Dir, EditorField, FieldKind, IssueFilterKey, IssuePane, JobPane,
-    MapPane, PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab,
-    ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
-    OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
+    parse_result, row_gate, scan_host, scroll, state_text, status_token, step, tag_keyed,
+    tag_parts, typed_origin, usable_selector, walk, Dir, EditorField, FieldKind, IssueFilterKey,
+    IssuePane, JobPane, MapPane, PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer,
+    ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER,
+    OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SITEMAP_POLL_TICKS,
+    STATUS_POLL_TICKS,
 };
 use crate::text::truncate;
 use crate::theme::Theme;
@@ -222,37 +223,10 @@ fn scan_confirm_tag(name: &str, args: &Value) -> Option<String> {
     }
 }
 
-/// One step of a Scan cursor or scroll over `len` entries (D11): `Up`/`Down`
-/// by one, `PageUp`/`PageDown` by `page`, `Home`/`End` to the ends, any
-/// other action stays; the result is clamped to the last entry (0 when
-/// there is none). The one walk the Jobs list, the Jobs detail scroll, the
-/// Site map, Profiles and Issues cursors share.
-fn walk(action: &Action, cursor: usize, len: usize, page: usize) -> usize {
-    let last = len.saturating_sub(1);
-    match action {
-        Action::Up => cursor.saturating_sub(1),
-        Action::Down => cursor + 1,
-        Action::PageUp => cursor.saturating_sub(page),
-        Action::PageDown => cursor + page,
-        Action::Home => 0,
-        Action::End => last,
-        _ => cursor,
-    }
-    .min(last)
-}
-
 /// The toast the Scan views raise when `⏎` names a flow the store no
 /// longer holds (D11): the one "not in the flow list" wording.
 fn not_in_flow_list(id: &str) -> String {
     format!("flow {id} is not in the flow list (cleared, or not captured here)")
-}
-
-/// One step of a Scan Detail pane's scroll over `len` lines: [`walk`] on
-/// the `u16` the pane keeps, saturating at the type's end (fix round F,
-/// F11). The Jobs and Issues Detail panes share it.
-fn scroll(scroll: &mut u16, action: &Action, len: usize, page: usize) {
-    let next = walk(action, usize::from(*scroll), len, page);
-    *scroll = u16::try_from(next).unwrap_or(u16::MAX);
 }
 
 /// Whether the browser view counts a call as in flight: exactly the calls
@@ -2978,13 +2952,11 @@ impl App {
                     match action {
                         Action::Up | Action::Down => {
                             let flows = issues.flow_count();
-                            issues.flow_cursor = walk(action, issues.flow_cursor, flows, page);
-                            issues.follow_flow = true;
+                            issues.detail_view.walk_flow(action, flows, page);
                         }
                         _ => {
                             let n = issues.detail_len();
-                            scroll(&mut issues.detail_scroll, action, n, page);
-                            issues.follow_flow = false;
+                            issues.detail_view.scroll(action, n, page);
                         }
                     }
                 } else if self.scan.tab == ScanTab::Profiles
@@ -3017,9 +2989,7 @@ impl App {
                         // The Issues cursor landing on a row reads it (D6)
                         // and shows its detail from the top.
                         if moved && self.scan.tab == ScanTab::Issues {
-                            self.scan.issues.flow_cursor = 0;
-                            self.scan.issues.detail_scroll = 0;
-                            self.scan.issues.follow_flow = false;
+                            self.scan.issues.detail_view.reset();
                             self.issue_cursor_landed(out);
                         }
                         // A new node under the Site map's Nodes cursor
@@ -4524,7 +4494,10 @@ impl App {
         let Some(id) = self.scan.issues.cursor_issue().map(|i| i.id.clone()) else {
             return;
         };
-        if self.scan.issues.read.contains_key(&id) {
+        if self.scan.issues.read.contains(&id) {
+            // A landing on a read row keeps it from the next eviction
+            // (fix round G, G3).
+            self.scan.issues.read.touch(&id);
             return;
         }
         if self.scan_poll(

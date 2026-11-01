@@ -25,6 +25,8 @@ use std::collections::BTreeSet;
 use aitm_scan_model::ScanErrorCode;
 use serde_json::Value;
 
+use crate::action::Action;
+
 use crate::text::{clean, truncate};
 
 pub use issues::*;
@@ -64,6 +66,12 @@ pub const MAX_STATUS_FOLLOWUPS: usize = 16;
 
 /// The `limit` of every `scan.issues` page the TUI asks for (spec D6).
 pub const ISSUES_PAGE_LIMIT: usize = 512;
+
+/// The widest any one string a Detail pane reads grows, in cells (D6
+/// hostile-core bounds; fix round G, G11, E19): the Issues and Jobs folds
+/// cut every free-text field of a read issue or a full status to this,
+/// once, so the per-frame line building runs over bounded text only.
+pub const DETAIL_VALUE_MAX: usize = 400;
 
 /// The widest a `ScanError`'s core-controlled `detail` grows, in cells
 /// (fix round G, G82; D6 hostile-core bounds): bounded once in
@@ -578,6 +586,33 @@ fn is_wire_id(s: &str, prefix: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
+}
+
+/// One step of a Scan cursor or scroll over `len` entries (D11): `Up`/`Down`
+/// by one, `PageUp`/`PageDown` by `page`, `Home`/`End` to the ends, any
+/// other action stays; the result is clamped to the last entry (0 when
+/// there is none). The one walk the Jobs list, the Jobs detail scroll, the
+/// Site map, Profiles and Issues cursors share.
+pub(crate) fn walk(action: &Action, cursor: usize, len: usize, page: usize) -> usize {
+    let last = len.saturating_sub(1);
+    match action {
+        Action::Up => cursor.saturating_sub(1),
+        Action::Down => cursor + 1,
+        Action::PageUp => cursor.saturating_sub(page),
+        Action::PageDown => cursor + page,
+        Action::Home => 0,
+        Action::End => last,
+        _ => cursor,
+    }
+    .min(last)
+}
+
+/// One step of a Detail pane's scroll over `len` lines: [`walk`] on the
+/// `u16` the pane keeps at `at`, saturating at the type's end (fix round
+/// F, F11). The Jobs and Issues Detail panes and the help overlay share it.
+pub(crate) fn scroll(at: &mut u16, action: &Action, len: usize, page: usize) {
+    let next = walk(action, usize::from(*at), len, page);
+    *at = u16::try_from(next).unwrap_or(u16::MAX);
 }
 
 /// Whether a timer-driven read is due (spec D6; fix round G, G28): `every`

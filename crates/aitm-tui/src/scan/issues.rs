@@ -14,9 +14,10 @@ use aitm_scan_model::{
 use serde_json::{json, Map, Value};
 
 use super::{
-    confidence_token, is_issue_id, lane_token, severity_token, status_token, step, wire_token, Dir,
-    ScanError, ISSUES_PAGE_LIMIT, SEVERITY_ORDER,
+    confidence_token, is_issue_id, lane_token, scroll, severity_token, status_token, step, walk,
+    wire_token, Dir, ScanError, DETAIL_VALUE_MAX, ISSUES_PAGE_LIMIT, SEVERITY_ORDER,
 };
+use crate::action::Action;
 use crate::text::{clean, truncate};
 
 /// How many `Tick`s between two `scan.issues` refreshes while the Issues tab
@@ -35,12 +36,6 @@ pub const NAME_MAX: usize = 40;
 pub const LOCATION_MAX: usize = 32;
 /// The widest a row's `kind:name` cell grows before it is cut.
 pub const POINT_MAX: usize = 24;
-/// The widest any one string of a read issue grows before it is cut (D6
-/// hostile-core bounds): every string the detail lines read off an
-/// `Issue` is cut to this many cells once, when the issue enters `read`
-/// ([`bound_issue`]), so the per-frame line building runs over bounded
-/// text only.
-const DETAIL_VALUE_MAX: usize = 400;
 /// The most full issues `IssuesState::read` holds between folds (D6
 /// hostile-core bounds; fix round E, E1): a cheap memory bound beside the
 /// per-fold prune, the oldest inserted leaving first.
@@ -284,25 +279,140 @@ pub fn issue_row(i: &IssueSummary) -> IssueRow {
 }
 
 /// A full issue as `IssuesState::read` holds it (fix round F, F4): the
-/// `Issue` with its strings bounded by [`bound_issue`], and how many probe
-/// flows that bound dropped, so the detail pane can say `... n more` under
-/// the [`FLOWS_MAX`] it kept. Derefs to the `Issue`, so a reader that wants
-/// a field writes `read.name` as before.
+/// `Issue` with its strings bounded by [`bound_issue`], and what that bound
+/// dropped ([`Dropped`]), so the detail pane can say `... n more` under the
+/// lists it kept. Derefs to the `Issue`, so a reader that wants a field
+/// writes `read.name` as before.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadIssue {
     pub issue: Issue,
-    /// Probe flows the fold dropped past [`FLOWS_MAX`]; 0 when none were.
-    pub dropped_flows: usize,
-    /// Timing rows the fold dropped past `TIMING_ROWS_MAX + 1` (fix round
-    /// G, G12), so the table's `... n more` line names the real count; 0
-    /// when none were.
-    pub dropped_timing: usize,
+    pub dropped: Dropped,
 }
 
-/// What [`bound_issue`] dropped, for [`ReadIssue`].
-struct Bounded {
-    flows: usize,
-    timing: usize,
+/// What [`bound_issue`] cut off a read issue's lists (fix round G, G6,
+/// G12), so the Detail pane's `... n more` lines name the real counts; all
+/// zero when nothing was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Dropped {
+    /// Probe flows past [`FLOWS_MAX`].
+    pub flows: usize,
+    /// Mutators of the L4 mutation chain past `MUTATIONS_MAX + 1`.
+    pub mutations: usize,
+    /// Timing rows past `TIMING_ROWS_MAX + 1`.
+    pub timing: usize,
+}
+
+/// The full issues read so far (fix round G, G3): by id, with the
+/// insertion order the cap evicts in, kept in step by every operation.
+/// At most [`READ_MAX`] entries, the oldest leaving first; a landing on
+/// an already-read row moves it to the back ([`ReadCache::touch`]), so
+/// eviction never drops the row under the cursor (G4).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ReadCache {
+    by_id: BTreeMap<IssueId, ReadIssue>,
+    order: VecDeque<IssueId>,
+}
+
+impl ReadCache {
+    pub fn get(&self, id: &str) -> Option<&ReadIssue> {
+        self.by_id.get(id)
+    }
+
+    pub fn contains(&self, id: &str) -> bool {
+        self.by_id.contains_key(id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+
+    /// The ids held, in id order.
+    pub fn keys(&self) -> impl Iterator<Item = &IssueId> {
+        self.by_id.keys()
+    }
+
+    /// Insert or replace `id`'s issue; a new id joins the back of the
+    /// order and, past [`READ_MAX`], the oldest leaves.
+    pub fn insert(&mut self, id: IssueId, read: ReadIssue) {
+        if self.by_id.insert(id.clone(), read).is_none() {
+            self.order.push_back(id);
+            while self.by_id.len() > READ_MAX {
+                let Some(oldest) = self.order.pop_front() else {
+                    break;
+                };
+                self.by_id.remove(&oldest);
+            }
+        }
+        debug_assert_eq!(self.order.len(), self.by_id.len(), "order is by_id's twin");
+    }
+
+    /// Move `id` to the back of the eviction order (the cursor landed on
+    /// it); nothing for an id not held.
+    pub fn touch(&mut self, id: &str) {
+        if let Some(k) = self.order.iter().position(|held| held == id) {
+            if let Some(held) = self.order.remove(k) {
+                self.order.push_back(held);
+            }
+        }
+    }
+
+    /// Keep the entries `keep` says yes to, dropping the rest from the
+    /// order as well.
+    pub fn retain(&mut self, mut keep: impl FnMut(&IssueId, &ReadIssue) -> bool) {
+        self.by_id.retain(|id, read| keep(id, read));
+        self.order.retain(|id| self.by_id.contains_key(id));
+    }
+}
+
+/// The Detail pane's view state (fix round G, G7): what is scrolled, which
+/// flow the cursor is on and whether the view follows it. One struct, so
+/// the three reset together when the list cursor lands on a new row.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DetailView {
+    /// The first detail line on screen, exactly what the view draws; the
+    /// paging keys move it while the Detail pane is focused (plan task 8).
+    pub scroll: u16,
+    /// Cursor over the detail's flow list ([`flow_at`]), walked by
+    /// `Up`/`Down` while the Detail pane is focused (spec D11); read
+    /// clamped through [`IssuesState::flow_index`].
+    pub flow_cursor: usize,
+    /// Whether the view pulls the scroll so the flow under `flow_cursor`
+    /// is on screen (fix round F, F7): set by `Up`/`Down` with the Detail
+    /// pane focused (a flow key moves a cursor the operator must see),
+    /// cleared by the paging keys and by a new row, so `scroll` alone
+    /// decides what is drawn after `PageUp`/`PageDown`/`Home`/`End`.
+    pub follow_flow: bool,
+}
+
+impl DetailView {
+    /// A new row under the list cursor: the detail from the top, the
+    /// first flow, nothing followed.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// A paging key over `len` lines: the scroll moves, the flow no longer
+    /// leads.
+    pub fn scroll(&mut self, action: &Action, len: usize, page: usize) {
+        scroll(&mut self.scroll, action, len, page);
+        self.follow_flow = false;
+    }
+
+    /// A flow key over `flows` flows: the cursor moves and the view
+    /// follows it.
+    pub fn walk_flow(&mut self, action: &Action, flows: usize, page: usize) {
+        self.flow_cursor = walk(action, self.flow_cursor, flows, page);
+        self.follow_flow = true;
+    }
+
+    /// Keep the flow cursor on the list of `flows` flows (fix round F, F6).
+    pub fn clamp_flow(&mut self, flows: usize) {
+        self.flow_cursor = self.flow_cursor.min(flows.saturating_sub(1));
+    }
 }
 
 impl std::ops::Deref for ReadIssue {
@@ -361,26 +471,12 @@ pub struct IssuesState {
     /// every fold to the page's ids, so `read.len() <= list.len()` (spec
     /// D3, D6; fix round D, D1; fix round E, E11). An entry also leaves on
     /// a terminal line for its job ([`IssuesState::forget_job`]) or as the
-    /// oldest once [`READ_MAX`] are held.
-    pub read: BTreeMap<IssueId, ReadIssue>,
-    /// The keys of `read` in insertion order, oldest first: the eviction
-    /// order once `read` holds [`READ_MAX`] entries (fix round E, E1). Kept
-    /// in step with `read` by every insert and prune.
-    pub read_order: VecDeque<IssueId>,
-    /// Cursor over the detail's flow list ([`flow_at`]), walked by
-    /// `Up`/`Down` while the Detail pane is focused (spec D11); read
-    /// clamped through [`IssuesState::flow_index`].
-    pub flow_cursor: usize,
-    /// The first detail line on screen, exactly what the view draws; the
-    /// paging keys scroll it while the Detail pane is focused (plan task
-    /// 8), a new row resets it.
-    pub detail_scroll: u16,
-    /// Whether the view pulls the scroll so the flow under `flow_cursor`
-    /// is on screen (fix round F, F7): set by `Up`/`Down` with the Detail
-    /// pane focused (a flow key moves a cursor the operator must see),
-    /// cleared by the paging keys and by a new row, so `detail_scroll`
-    /// alone decides what is drawn after `PageUp`/`PageDown`/`Home`/`End`.
-    pub follow_flow: bool,
+    /// oldest once [`READ_MAX`] are held ([`ReadCache`]).
+    pub read: ReadCache,
+    /// The Detail pane's scroll, flow cursor and follow flag
+    /// ([`DetailView`]), reset together when the list cursor lands on a
+    /// new row.
+    pub detail_view: DetailView,
     /// The tick of the last `scan.issues` request this tab sent; `None`
     /// until the tab was first opened (spec D6: "when the Issues tab was
     /// ever opened" reads `is_some()`, and the 20-tick timer counts from
@@ -410,18 +506,11 @@ impl IssuesState {
         self.cursor = self.cursor.min(self.list.len().saturating_sub(1));
         let listed: BTreeSet<&str> = self.list.iter().map(|i| i.id.as_str()).collect();
         self.read.retain(|id, _| listed.contains(id.as_str()));
-        self.prune_read_order();
         debug_assert_eq!(
             self.list.len(),
             self.rows.len(),
             "rows is list's display twin, index for index"
         );
-    }
-
-    /// Drop from `read_order` every id no longer in `read`, after a prune
-    /// of `read`.
-    fn prune_read_order(&mut self) {
-        self.read_order.retain(|id| self.read.contains_key(id));
     }
 
     /// The row under the list cursor, if the list has one.
@@ -452,35 +541,15 @@ impl IssuesState {
         let Some(k) = self.list.iter().position(|row| row.id == issue.id) else {
             return;
         };
-        let bounded = bound_issue(&mut issue);
+        let dropped = bound_issue(&mut issue);
         let summary = issue.summary();
         self.rows[k] = issue_row(&summary);
         self.list[k] = summary;
         let id = issue.id.clone();
-        let read = ReadIssue {
-            issue,
-            dropped_flows: bounded.flows,
-            dropped_timing: bounded.timing,
-        };
-        if self.read.insert(id.clone(), read).is_none() {
-            self.read_order.push_back(id.clone());
-            while self.read.len() > READ_MAX {
-                match self.read_order.pop_front() {
-                    Some(oldest) => {
-                        self.read.remove(&oldest);
-                    }
-                    // Nothing tracked (entries written past this fold): drop
-                    // the first key, so the bound holds whatever happened.
-                    None => {
-                        if let Some(first) = self.read.keys().next().cloned() {
-                            self.read.remove(&first);
-                        }
-                    }
-                }
-            }
-        }
+        self.read.insert(id, ReadIssue { issue, dropped });
         if k == self.cursor {
-            self.flow_cursor = self.flow_cursor.min(self.flow_count().saturating_sub(1));
+            let flows = self.flow_count();
+            self.detail_view.clamp_flow(flows);
         }
     }
 
@@ -494,7 +563,7 @@ impl IssuesState {
     /// Detail pane highlights, `None` when the list is empty.
     pub fn flow_index(&self) -> Option<usize> {
         let n = self.flow_count();
-        (n > 0).then(|| self.flow_cursor.min(n - 1))
+        (n > 0).then(|| self.detail_view.flow_cursor.min(n - 1))
     }
 
     /// The flow under the (clamped) flow cursor and its tag: what `Enter`
@@ -504,19 +573,11 @@ impl IssuesState {
         flow_at(self.detail()?, self.flow_index()?)
     }
 
-    /// How many lines the Detail pane has for the row under the cursor:
-    /// the head line, the lines before the flows, the `flows` label, one
-    /// line per flow, the `... n more` line when the fold dropped any, and
-    /// the lines after the flows ([`issue_detail_lines`]), counted without
-    /// building them; 0 while the row is unread. The reducer clamps
-    /// `detail_scroll` to it.
+    /// How many lines the Detail pane has for the row under the cursor
+    /// ([`DetailLayout::total`]), counted without building them; 0 while
+    /// the row is unread. The reducer clamps the scroll to it.
     pub fn detail_len(&self) -> usize {
-        self.detail().map_or(0, |read| {
-            1 + detail_line_count(read)
-                + 1
-                + flow_count_of(read)
-                + usize::from(read.dropped_flows > 0)
-        })
+        self.detail().map_or(0, |read| DetailLayout::of(read).total)
     }
 
     /// Drop every read issue that belongs to `job` (spec D6: a terminal
@@ -524,7 +585,79 @@ impl IssuesState {
     /// job the issue itself names, so a filtered-out job's issues leave too.
     pub fn forget_job(&mut self, job: &str) {
         self.read.retain(|_, i| i.job != job);
-        self.prune_read_order();
+    }
+}
+
+/// What one row of the Detail pane is ([`DetailLayout::row`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetailRow {
+    Head,
+    /// `before_flows[i]` of [`issue_detail_lines`].
+    Before(usize),
+    FlowsLabel,
+    /// The `f`th flow of [`flow_at`].
+    Flow(usize),
+    /// The `... n more` line under the flows.
+    More,
+    /// `after_flows[i]`.
+    After(usize),
+}
+
+/// The row arithmetic of the Detail pane (fix round G, G2): where each run
+/// starts, over the read issue alone, so the reducer counts the rows and
+/// the view maps a row index to what it draws without building the rows
+/// before it. The head line, the lines before the flows, the `flows`
+/// label, one line per flow, the `... n more` line when the fold dropped
+/// any, then the lines after the flows ([`issue_detail_lines`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DetailLayout {
+    /// The row of the `flows` label.
+    pub flows_label: usize,
+    /// The row of the first flow.
+    pub first_flow: usize,
+    /// How many flows are listed.
+    pub flows: usize,
+    /// Whether a `... n more` row follows the flows.
+    pub more: bool,
+    /// The row of the first line after the flows.
+    pub first_after: usize,
+    /// The rows in all; `IssuesState::detail_len` reads it.
+    pub total: usize,
+}
+
+impl DetailLayout {
+    pub fn of(read: &ReadIssue) -> Self {
+        let (before, after) = detail_line_counts(read);
+        let flows_label = 1 + before;
+        let first_flow = flows_label + 1;
+        let flows = flow_count_of(read);
+        let more = read.dropped.flows > 0;
+        let first_after = first_flow + flows + usize::from(more);
+        Self {
+            flows_label,
+            first_flow,
+            flows,
+            more,
+            first_after,
+            total: first_after + after,
+        }
+    }
+
+    /// What row `k` draws.
+    pub fn row(&self, k: usize) -> DetailRow {
+        if k == 0 {
+            DetailRow::Head
+        } else if k < self.flows_label {
+            DetailRow::Before(k - 1)
+        } else if k == self.flows_label {
+            DetailRow::FlowsLabel
+        } else if k < self.first_flow + self.flows {
+            DetailRow::Flow(k - self.first_flow)
+        } else if self.more && k == self.first_flow + self.flows {
+            DetailRow::More
+        } else {
+            DetailRow::After(k - self.first_after)
+        }
     }
 }
 
@@ -540,10 +673,11 @@ impl IssuesState {
 /// [`MUTATIONS_MAX`] plus one, the probe flow list [`FLOWS_MAX`], each
 /// timing series [`TIMING_ROWS_MAX`] plus one (fix round G, G12); the
 /// probe flows and timing rows dropped are returned, so the pane can count
-/// them, and every truncated vector gives its capacity back. Ids, enums
-/// and numbers the contract already bounds are left alone. The per-frame
-/// line building then runs over bounded text only.
-fn bound_issue(issue: &mut Issue) -> Bounded {
+/// them, and every truncated vector gives its capacity back. Ids the fold
+/// matched (`id`), enums and numbers the contract already bounds are left
+/// alone; `job`, a free string on the wire, is cut like the rest (G1). The
+/// per-frame line building then runs over bounded text only.
+fn bound_issue(issue: &mut Issue) -> Dropped {
     let cut = |s: &mut String| {
         // Control characters go first (fix round G, G10): a tab or an
         // escape would move the cursor or shift a column on screen.
@@ -559,6 +693,7 @@ fn bound_issue(issue: &mut Issue) -> Bounded {
     let loc = &mut issue.location;
     let mut fields: Vec<&mut String> = vec![
         &mut issue.description,
+        &mut issue.job,
         &mut issue.name,
         &mut issue.class,
         &mut issue.check_id,
@@ -595,7 +730,9 @@ fn bound_issue(issue: &mut Issue) -> Bounded {
             .flatten(),
         );
     }
+    let mut dropped_mutations = 0;
     if let Some(l4) = &mut issue.evidence.l4 {
+        dropped_mutations = l4.mutation_chain.len().saturating_sub(MUTATIONS_MAX + 1);
         l4.mutation_chain.truncate(MUTATIONS_MAX + 1);
         l4.mutation_chain.shrink_to_fit();
         fields.push(&mut l4.seed_id);
@@ -623,8 +760,9 @@ fn bound_issue(issue: &mut Issue) -> Bounded {
             t.baseline_ms.shrink_to_fit();
         }
     }
-    Bounded {
+    Dropped {
         flows: dropped_flows,
+        mutations: dropped_mutations,
         timing: dropped_timing,
     }
 }
@@ -701,7 +839,7 @@ pub fn issue_detail_lines(read: &ReadIssue) -> DetailLines {
         before.push(("matched", m.clone()));
     }
     if let Some(t) = &ev.timing {
-        timing_lines(t, read.dropped_timing, &mut before);
+        timing_lines(t, read.dropped.timing, &mut before);
     }
     if let Some(d) = &ev.diff {
         before.push((
@@ -713,7 +851,7 @@ pub fn issue_detail_lines(read: &ReadIssue) -> DetailLines {
         ));
     }
     if let Some(l4) = &ev.l4 {
-        l4_lines(l4, &mut before);
+        l4_lines(l4, read.dropped.mutations, &mut before);
     }
     let mut after: Vec<DetailLine> = Vec::with_capacity(AFTER_FIXED_LINES + 2);
     after.push((
@@ -755,21 +893,30 @@ const BEFORE_FIXED_LINES: usize = 4;
 /// The lines every `after_flows` has: poc, finding, seen.
 const AFTER_FIXED_LINES: usize = 3;
 
-/// How many lines [`issue_detail_lines`] builds for the read issue, both
-/// runs together, counted without building them (the reducer clamps the
-/// scroll on every key). Pinned to the built lines by a unit test.
-fn detail_line_count(read: &ReadIssue) -> usize {
+/// How many lines [`issue_detail_lines`] builds for the read issue, as
+/// `(before_flows, after_flows)`, counted without building them (the
+/// reducer clamps the scroll on every key). Pinned to the built lines by a
+/// unit test.
+fn detail_line_counts(read: &ReadIssue) -> (usize, usize) {
     let issue = &read.issue;
     let ev = &issue.evidence;
-    BEFORE_FIXED_LINES
-        + AFTER_FIXED_LINES
+    let before = BEFORE_FIXED_LINES
         + usize::from(ev.payload.is_some())
         + usize::from(ev.matched.is_some())
         + ev.timing.as_ref().map_or(0, timing_line_count)
         + usize::from(ev.diff.is_some())
-        + ev.l4.as_ref().map_or(0, |_| L4_LINES)
+        + ev.l4.as_ref().map_or(0, |_| L4_LINES);
+    let after = AFTER_FIXED_LINES
         + usize::from(issue.remediation.is_some())
-        + usize::from(issue.note.is_some())
+        + usize::from(issue.note.is_some());
+    (before, after)
+}
+
+/// Both runs of [`detail_line_counts`] together (the unit tests' pin).
+#[cfg(test)]
+fn detail_line_count(read: &ReadIssue) -> usize {
+    let (before, after) = detail_line_counts(read);
+    before + after
 }
 
 /// `METHOD path_template · kind name`, then the request path when it is
@@ -867,9 +1014,10 @@ const L4_LINES: usize = 5;
 
 /// The L4 evidence (spec D11, "L4 evidence fields when present"): the seed
 /// and reproduction counts, the oracle's reading, the liveness probes, the
-/// mutation chain (the first [`MUTATIONS_MAX`], then `...` when
-/// [`bound_issue`] kept the one past them) and the bytes sent (hex).
-fn l4_lines(l4: &L4Evidence, out: &mut Vec<DetailLine>) {
+/// mutation chain (the first [`MUTATIONS_MAX`], then `... n more` counting
+/// the one [`bound_issue`] kept past them and the `dropped` it cut; fix
+/// round G, G6) and the bytes sent (hex).
+fn l4_lines(l4: &L4Evidence, dropped: usize, out: &mut Vec<DetailLine>) {
     out.push((
         "l4 case",
         format!(
@@ -900,7 +1048,8 @@ fn l4_lines(l4: &L4Evidence, out: &mut Vec<DetailLine>) {
         .collect::<Vec<_>>()
         .join(" > ");
     if l4.mutation_chain.len() > MUTATIONS_MAX {
-        chain.push_str(" > ...");
+        let more = l4.mutation_chain.len() - MUTATIONS_MAX + dropped;
+        chain.push_str(&format!(" ... {more} more"));
     }
     if chain.is_empty() {
         chain.push_str("none");
@@ -1047,8 +1196,7 @@ mod tests {
     fn read_of(issue: &Issue) -> ReadIssue {
         ReadIssue {
             issue: issue.clone(),
-            dropped_flows: 0,
-            dropped_timing: 0,
+            dropped: Dropped::default(),
         }
     }
 
@@ -1143,7 +1291,7 @@ mod tests {
             "head, pairs, label, flows"
         );
         assert_eq!(state.flow_count(), 3);
-        state.flow_cursor = 9;
+        state.detail_view.flow_cursor = 9;
         assert_eq!(state.flow_index(), Some(2), "clamped to the baseline");
         assert_eq!(
             state
@@ -1265,7 +1413,7 @@ mod tests {
         let l4 = issue.evidence.l4.as_ref().unwrap_or_else(|| panic!("l4"));
         assert_eq!(l4.mutation_chain.len(), MUTATIONS_MAX + 1);
         let read = ReadIssue {
-            dropped_timing: bounded.timing,
+            dropped: bounded,
             ..read_of(&issue)
         };
         let lines = issue_detail_lines(&read);
@@ -1285,7 +1433,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             mutations,
-            "m0 > m1 > m2 > m3 > m4 > m5 > m6 > m7 > m8 > m9 > m10 > m11 > m12 > m13 > m14 > m15 > ..."
+            "m0 > m1 > m2 > m3 > m4 > m5 > m6 > m7 > m8 > m9 > m10 > m11 > m12 > m13 > m14 > m15 ... 984 more"
         );
     }
 
@@ -1317,8 +1465,8 @@ mod tests {
         assert_eq!(t.requested_s.len(), TIMING_ROWS_MAX + 1);
         assert_eq!(t.observed_ms.len(), TIMING_ROWS_MAX + 1);
         assert_eq!(t.baseline_ms.len(), 10, "a short series is left alone");
-        assert_eq!(read.dropped_timing, 1_000_000 - (TIMING_ROWS_MAX + 1));
-        assert_eq!(read.dropped_timing, 999_987);
+        assert_eq!(read.dropped.timing, 1_000_000 - (TIMING_ROWS_MAX + 1));
+        assert_eq!(read.dropped.timing, 999_987);
         assert!(t.observed_ms.capacity() < 1000, "capacity given back");
         assert!(read.evidence.probe_flows.capacity() < 1000);
         let lines = issue_detail_lines(read);
@@ -1348,18 +1496,43 @@ mod tests {
         let mut state = IssuesState::default();
         state.list = vec![issue.summary()];
         state.rows = vec![issue_row(&state.list[0])];
-        state.flow_cursor = 999;
+        state.detail_view.flow_cursor = 999;
         state.fold_issue(issue);
         let read = state.detail().unwrap_or_else(|| panic!("read"));
         assert_eq!(read.evidence.probe_flows.len(), 64);
-        assert_eq!(read.dropped_flows, 936);
+        assert_eq!(read.dropped.flows, 936);
         assert_eq!(state.flow_count(), 65);
-        assert_eq!(state.flow_cursor, 64, "clamped to the baseline (F6)");
+        assert_eq!(
+            state.detail_view.flow_cursor, 64,
+            "clamped to the baseline (F6)"
+        );
         assert_eq!(
             state.flow_under_cursor().map(|(_, tag)| tag),
             Some(FlowTag::Baseline)
         );
         assert_eq!(state.detail_len(), 1 + 10 + 1 + 65 + 1);
+        // Fix round G, G2: the layout is the one arithmetic; its total is
+        // `detail_len`, its runs are the lines built, and `first_after`
+        // sits past the flows and the `... n more` row.
+        let read = state.detail().expect("read");
+        let layout = DetailLayout::of(read);
+        assert_eq!(layout.total, state.detail_len());
+        let lines = issue_detail_lines(read);
+        assert_eq!(layout.flows_label, 1 + lines.before_flows.len());
+        assert_eq!(layout.first_flow, layout.flows_label + 1);
+        assert_eq!(layout.flows, 65);
+        assert!(layout.more);
+        assert_eq!(layout.first_after, layout.first_flow + 65 + 1);
+        assert_eq!(layout.total, layout.first_after + lines.after_flows.len());
+        assert_eq!(layout.row(0), DetailRow::Head);
+        assert_eq!(layout.row(layout.flows_label), DetailRow::FlowsLabel);
+        assert_eq!(layout.row(layout.first_flow + 64), DetailRow::Flow(64));
+        assert_eq!(layout.row(layout.first_after - 1), DetailRow::More);
+        assert_eq!(layout.row(layout.first_after), DetailRow::After(0));
+        assert_eq!(
+            layout.row(layout.total - 1),
+            DetailRow::After(lines.after_flows.len() - 1)
+        );
     }
 
     #[test]
