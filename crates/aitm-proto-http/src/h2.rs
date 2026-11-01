@@ -338,6 +338,10 @@ fn same_origin(a: &str, b: &str) -> bool {
 /// or a [`READ_TIMEOUT`] expiry) it emits `Event::Error` for the still-open flow
 /// before returning, as the h1 path does, so the failure reaches the typed error
 /// bus rather than only `tracing`.
+///
+/// Every stream's flow takes its metadata from the connection (`Conn::flow_meta`),
+/// its passive stamp included (spec D4): an h2 connection is always a decrypted
+/// tunnel, in Scope when it was admitted, so its streams are never passive.
 async fn stream_task(
     ctx: Arc<ModuleCtx>,
     conn: Arc<Conn>,

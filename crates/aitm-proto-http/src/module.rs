@@ -50,6 +50,10 @@ const MAX_CLIENT_HELLO: usize = 5 + 16 * 1024;
 const CONNECT_ACK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 /// The port a `CONNECT` authority or an explicit-proxy SNI defaults to (spec D1).
 const DEFAULT_TLS_PORT: u16 = 443;
+/// The port a cleartext request's `Host` defaults to when it names none: what a
+/// forward-proxy request's authority is normalised with before it is judged
+/// against Scope (spec D4).
+const DEFAULT_HTTP_PORT: u16 = 80;
 /// Socket read size.
 const READ_CHUNK: usize = 16 * 1024;
 
@@ -562,6 +566,8 @@ impl HttpModule {
             }),
             source_app: None,
             capture_interface: None,
+            // In Scope when admitted; the decision is per connection (spec D4).
+            passive: false,
         }
         .with_attribution(ctx.hint());
         // The row records the two connections exactly as the inner flows will.
@@ -930,13 +936,22 @@ pub(crate) struct Conn {
     /// The capture backend that delivered this connection (the hint's
     /// `capture_interface`). `None` on a proxied connection.
     pub(crate) capture_interface: Option<String>,
+    /// Spec D4: the flows on this connection are observed only, nothing acts on
+    /// them. Always `false` on a tunnel connection (`tunnel_authority` set): the
+    /// tunnel was in Scope when it was admitted and the decision is per
+    /// connection, so its inner requests stay acted on even after
+    /// `scope.remove`. On a forward-proxy cleartext connection [`serve`]
+    /// recomputes it per request, before the flow is stored, since a keep-alive
+    /// connection may carry requests for several hosts.
+    pub(crate) passive: bool,
 }
 
 impl Conn {
     /// A cleartext connection. `tunnel` is the `CONNECT` authority and the
     /// address it resolved to, for a connection inside a tunnel, and `None` for
     /// a forward-proxy connection. No capture attribution; see
-    /// [`Conn::with_attribution`].
+    /// [`Conn::with_attribution`]. Starts acted on (`passive == false`); a
+    /// forward-proxy connection is re-stamped per request by [`serve`].
     fn plain(peer: SocketAddr, tunnel: Option<(String, SocketAddr)>) -> Self {
         let (tunnel_authority, tunnel_addr) = match tunnel {
             Some((authority, addr)) => (Some(authority), Some(addr)),
@@ -956,6 +971,7 @@ impl Conn {
             server_conn: None,
             source_app: None,
             capture_interface: None,
+            passive: false,
         }
     }
 
@@ -971,10 +987,24 @@ impl Conn {
     }
 
     /// A fresh [`FlowMeta`] for a flow on this connection: exactly the capture
-    /// attribution is carried over; marks, comment, replay flag and timing are
-    /// the flow's own.
+    /// attribution and the passive stamp (spec D4) are carried over; marks,
+    /// comment, replay flag and timing are the flow's own.
     pub(crate) fn flow_meta(&self) -> FlowMeta {
-        FlowMeta::with_attribution(self.source_app.clone(), self.capture_interface.clone())
+        FlowMeta {
+            passive: self.passive,
+            ..FlowMeta::with_attribution(self.source_app.clone(), self.capture_interface.clone())
+        }
+    }
+}
+
+/// Spec D4: whether a cleartext forward-proxy request to `authority`
+/// (`host[:port]`, port 80 when absent) is observed only. In the live Scope it
+/// is acted on; outside it, or not an authority at all (nothing could be in
+/// Scope), it is passive.
+fn cleartext_is_passive(ctx: &ModuleCtx, authority: &str) -> bool {
+    match Authority::parse_with_default(authority, DEFAULT_HTTP_PORT) {
+        Ok(authority) => !ctx.in_scope(&authority.to_string()),
+        Err(_) => true,
     }
 }
 
@@ -1059,6 +1089,12 @@ async fn serve(
                         } else {
                             head.authority.clone()
                         };
+                        // Spec D4: a forward-proxy request is passive when its
+                        // host is outside the live Scope, decided per request. A
+                        // tunnel's requests inherit the tunnel's decision instead.
+                        if conn.tunnel_authority.is_none() {
+                            conn.passive = cleartext_is_passive(ctx, &authority);
+                        }
                         let request = HttpRequest {
                             scheme: conn.scheme.clone(),
                             authority,
@@ -2946,6 +2982,7 @@ mod tests {
             }),
             source_app: None,
             capture_interface: None,
+            passive: false,
         }
     }
 
@@ -4231,6 +4268,7 @@ mod tests {
             server_conn: None,
             source_app: None,
             capture_interface: None,
+            passive: false,
         };
         let (mut client, proxy_side) = duplex(64 * 1024);
 
@@ -7154,7 +7192,8 @@ mod tests {
         use super::attribution::{read_one_200, test_ca};
         use super::*;
         use aitm_core::{
-            ScopeEntry, ScopeRateGuard, StdGuard, TunnelInfo, TunnelMode, TunnelReason,
+            Chain, FlowCtx, Plugin, Registry, ResumeHandle, ScopeEntry, ScopeRateGuard, StdGuard,
+            TunnelInfo, TunnelMode, TunnelReason,
         };
         use rustls::pki_types::pem::PemObject;
         use rustls::RootCertStore;
@@ -7929,6 +7968,336 @@ mod tests {
                 request_paths(&store),
                 vec!["/one".to_string(), "/two".to_string()],
                 "no request inside the relayed tunnel is a row"
+            );
+        }
+
+        // ---- Spec D4: passive stamping (Task 7) -------------------------------
+
+        /// The cleartext origin the forward-proxy tests request: an IP literal, so
+        /// resolving it needs no DNS; port 8080, so the bare `127.0.0.1` Scope
+        /// entry is what admits it.
+        const PLAIN_ORIGIN: &str = "127.0.0.1:8080";
+
+        fn plain_origin_peer() -> SocketAddr {
+            SocketAddr::from(([127, 0, 0, 1], 8080))
+        }
+
+        /// A forward-proxy request for `path` at [`PLAIN_ORIGIN`]: absolute-form
+        /// target and a matching `Host`, as a browser sends it to an explicit proxy.
+        fn forward_get(path: &str) -> String {
+            format!("GET http://{PLAIN_ORIGIN}{path} HTTP/1.1\r\nHost: {PLAIN_ORIGIN}\r\n\r\n")
+        }
+
+        /// A cleartext origin over a duplex answering each request with the next
+        /// of `bodies` (keep-alive, held open until the proxy hangs up). Returns
+        /// the proxy-facing end.
+        fn plain_origin(bodies: Vec<&'static str>) -> (ByteStream, tokio::task::JoinHandle<()>) {
+            let (ours, theirs) = duplex(64 * 1024);
+            let task = tokio::spawn(origin_serve(theirs, bodies, false));
+            (Box::pin(ours), task)
+        }
+
+        /// Acts on every request: backs the flow up and parks it, as the intercept
+        /// plugin does for a breakpoint rule, and logs each event it is shown. A
+        /// passive flow must never reach it (spec D4).
+        struct ParkOnRequest {
+            seen: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl Plugin for ParkOnRequest {
+            fn name(&self) -> &str {
+                "park-on-request"
+            }
+            fn on_event(&mut self, ev: &Event, ctx: &mut FlowCtx<'_>) -> Verdict {
+                let label = match ev {
+                    Event::RequestHeaders(_) => "RequestHeaders",
+                    Event::Request(_) => "Request",
+                    Event::ResponseHeaders(_) => "ResponseHeaders",
+                    Event::Response(_) => "Response",
+                    _ => "other",
+                };
+                self.seen.lock().expect("seen lock").push(label);
+                if matches!(ev, Event::Request(_)) {
+                    ctx.backup();
+                    ctx.intercept();
+                }
+                Verdict::Continue
+            }
+        }
+
+        /// A context whose events go through a real [`Chain`] over `store` with
+        /// exactly `plugins` registered, consulting `guard` for Scope, with a
+        /// connector that hands out `streams`.
+        fn chained_ctx(
+            streams: Vec<ByteStream>,
+            store: Arc<MemFlowStore>,
+            guard: Arc<StdGuard>,
+            plugins: Vec<Box<dyn Plugin>>,
+        ) -> (ModuleCtx, DialLog) {
+            let mut registry = Registry::new();
+            for plugin in plugins {
+                registry.add_plugin(plugin);
+            }
+            let chain = Chain::new(Arc::new(registry), store.clone());
+            let (ctx, dialed) = ctx_with_sink(streams, store, Arc::new(chain));
+            (ctx.with_scope(guard), dialed)
+        }
+
+        /// The resume handle of the flow for `path`, once a plugin has parked it.
+        async fn wait_until_parked(store: &MemFlowStore, path: &str) -> ResumeHandle {
+            loop {
+                let parked = store.list().into_iter().find_map(|id| match store.get(id) {
+                    Some(Flow::Http(f)) if f.request.path == path => match f.intercept {
+                        InterceptState::Intercepted { resume, .. } => Some(resume),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                if let Some(resume) = parked {
+                    return resume;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// AC9 (unit), spec D4: plain HTTP to a host outside Scope is relayed and
+        /// stored, marked passive, and nothing acts on it: a plugin that parks
+        /// every request never sees it, so the client has its 200 at once.
+        #[tokio::test]
+        async fn plain_http_to_an_out_of_scope_host_is_passive_and_not_acted_on() {
+            let module = HttpModule::new();
+            let store = Arc::new(MemFlowStore::new());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (upstream, origin) = plain_origin(vec!["plain"]);
+            let (ctx, dialed) = chained_ctx(
+                vec![upstream],
+                store.clone(),
+                scoped(&[]),
+                vec![Box::new(ParkOnRequest { seen: seen.clone() })],
+            );
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(forward_get("/x").as_bytes())
+                    .await
+                    .expect("send GET");
+                let body = read_one_200(&mut client).await;
+                drop(client);
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("a passive request is answered at once, never parked");
+            served.expect("the module ends cleanly when the client hangs up");
+            assert_eq!(body, "plain", "the request was relayed to the origin");
+            origin.abort();
+
+            let row = request_row(&store, "/x");
+            assert_eq!(row.request.method, "GET");
+            assert_eq!(row.request.scheme, "http");
+            assert_eq!(row.request.authority, "127.0.0.1:8080");
+            assert_eq!(status(&row), Some(200));
+            assert!(
+                row.metadata.passive,
+                "plain HTTP to a host outside Scope is passive"
+            );
+            assert_eq!(
+                row.intercept.label(),
+                "observed",
+                "nothing parks a passive flow"
+            );
+            assert_eq!(
+                row.metadata.tunnel, None,
+                "a cleartext request is not a tunnel row"
+            );
+            let seen = seen.lock().expect("seen lock").clone();
+            assert!(
+                seen.is_empty(),
+                "a plugin that acts on flows never sees a passive one: {seen:?}"
+            );
+            assert!(tunnel_rows(&store).is_empty());
+            assert_eq!(
+                *dialed.lock().expect("dialed lock"),
+                vec![("127.0.0.1:8080".to_string(), plain_origin_peer())],
+                "passive means observed, not blocked: the request still reaches the origin"
+            );
+        }
+
+        /// The mirror: the same request to a host in Scope is acted on. The parking
+        /// plugin sees it and parks it (`intercepted`), the row is not passive, and
+        /// the client is answered once the flow is resumed.
+        #[tokio::test]
+        async fn plain_http_to_an_in_scope_host_is_acted_on() {
+            let module = HttpModule::new();
+            let store = Arc::new(MemFlowStore::new());
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let (upstream, origin) = plain_origin(vec!["plain"]);
+            let (ctx, _dialed) = chained_ctx(
+                vec![upstream],
+                store.clone(),
+                scoped(&["127.0.0.1"]),
+                vec![Box::new(ParkOnRequest { seen: seen.clone() })],
+            );
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(forward_get("/x").as_bytes())
+                    .await
+                    .expect("send GET");
+                // The plugin parks the request; the client is left waiting.
+                let resume = wait_until_parked(&store, "/x").await;
+                let parked = request_row(&store, "/x");
+                assert_eq!(parked.intercept.label(), "intercepted");
+                assert!(
+                    !parked.metadata.passive,
+                    "a request to a host in Scope is acted on"
+                );
+                assert!(parked.response.is_none(), "parked: not forwarded yet");
+                assert_eq!(
+                    *seen.lock().expect("seen lock"),
+                    vec!["RequestHeaders", "Request"]
+                );
+                // Release it as `flow.resume` does.
+                resume.fire();
+                let body = read_one_200(&mut client).await;
+                drop(client);
+                body
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the resumed request hung");
+            served.expect("the module ends cleanly when the client hangs up");
+            assert_eq!(body, "plain");
+            origin.abort();
+
+            let row = request_row(&store, "/x");
+            assert!(!row.metadata.passive);
+            assert_eq!(row.intercept.label(), "resumed");
+            assert_eq!(status(&row), Some(200));
+            assert_eq!(
+                *seen.lock().expect("seen lock"),
+                vec!["RequestHeaders", "Request", "ResponseHeaders", "Response"]
+            );
+        }
+
+        /// AC4 (inner requests): a tunnel decrypted while its host was in Scope
+        /// keeps its decision. After `scope.remove` the next request on the same
+        /// connection is still captured and still acted on (`passive == false`);
+        /// only a new connection would be tunnelled.
+        #[tokio::test]
+        async fn requests_inside_a_decrypted_tunnel_are_not_passive_even_after_scope_remove() {
+            let ca = test_ca();
+            let module = HttpModule::with_ca(ca.clone()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let guard = scoped(&["127.0.0.1"]);
+            let (identity, _origin_der) = origin_identity();
+            let (upstream, origin) = tls_origin(identity, vec!["one", "two"]);
+            let (ctx, _dialed) = scoped_ctx(vec![upstream], store.clone(), guard.clone());
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let ack = connect(&mut client, ORIGIN).await;
+                assert!(ack.starts_with("HTTP/1.1 200 "), "ack: {ack:?}");
+                let mut tls = TlsConnector::from(trusting(ca_root(&ca)))
+                    .connect(ip_name(), client)
+                    .await
+                    .expect("the in-scope tunnel is decrypted with the proxy's leaf");
+                assert_eq!(get(&mut tls, "/one").await, "one");
+                assert!(!request_row(&store, "/one").metadata.passive);
+
+                assert!(guard.remove_scope("127.0.0.1"));
+                assert!(
+                    !guard.in_scope(ORIGIN),
+                    "the host is out of Scope from here on"
+                );
+
+                assert_eq!(get(&mut tls, "/two").await, "two");
+                let _ = tls.shutdown().await;
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the decrypted tunnel hung");
+            served.expect("the module ends cleanly when the client hangs up");
+            origin.abort();
+
+            assert_eq!(
+                request_paths(&store),
+                vec!["/one".to_string(), "/two".to_string()],
+                "both requests were captured"
+            );
+            let two = request_row(&store, "/two");
+            assert!(
+                !two.metadata.passive,
+                "a request inside a tunnel decrypted before scope.remove is still acted on"
+            );
+            assert_eq!(two.request.scheme, "https");
+            assert_eq!(status(&two), Some(200));
+            assert!(!request_row(&store, "/one").metadata.passive);
+            let rows = tunnel_rows(&store);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(outcome(&rows[0]), (TunnelMode::Decrypted, None));
+        }
+
+        /// Spec D4: a keep-alive forward-proxy connection is stamped per request,
+        /// not per connection. With an empty Scope the first request is passive;
+        /// after `scope.add` the next request on the same connection is acted on.
+        #[tokio::test]
+        async fn keep_alive_cleartext_connection_recomputes_passive_per_request() {
+            let module = HttpModule::new();
+            let store = Arc::new(MemFlowStore::new());
+            let guard = scoped(&[]);
+            let (upstream, origin) = plain_origin(vec!["one", "two"]);
+            let (ctx, dialed) = scoped_ctx(vec![upstream], store.clone(), guard.clone());
+
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                let target = format!("http://{PLAIN_ORIGIN}/one");
+                assert_eq!(client_get(&mut client, &target, PLAIN_ORIGIN).await, "one");
+                assert!(
+                    request_row(&store, "/one").metadata.passive,
+                    "out of Scope: passive"
+                );
+
+                guard.add_scope(ScopeEntry {
+                    host: "127.0.0.1".to_string(),
+                });
+
+                let target = format!("http://{PLAIN_ORIGIN}/two");
+                assert_eq!(client_get(&mut client, &target, PLAIN_ORIGIN).await, "two");
+                drop(client);
+            };
+            let (served, ()) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the keep-alive connection hung");
+            served.expect("the module ends cleanly when the client hangs up");
+            origin.abort();
+
+            assert_eq!(
+                request_paths(&store),
+                vec!["/one".to_string(), "/two".to_string()]
+            );
+            assert!(
+                request_row(&store, "/one").metadata.passive,
+                "the first row keeps its stamp"
+            );
+            assert!(
+                !request_row(&store, "/two").metadata.passive,
+                "in Scope now: acted on"
+            );
+            assert_eq!(
+                dialed.lock().expect("dialed lock").len(),
+                1,
+                "one upstream connection carried both requests"
             );
         }
     }
