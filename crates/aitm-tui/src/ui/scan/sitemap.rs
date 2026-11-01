@@ -28,10 +28,10 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         // The legacy result is the map on a legacy bus (D12); the v2 nodes
         // render with the Site map task.
         _ => {
-            let (left, right) = panes(area);
-            pane_rule(theme, area, buf);
-            endpoints(app, theme, left, buf);
-            points(app, theme, right, buf);
+            let split = panes(area);
+            pane_rule(theme, &split, buf);
+            endpoints(app, theme, split.list, buf);
+            points(app, theme, split.detail, buf);
         }
     }
 }

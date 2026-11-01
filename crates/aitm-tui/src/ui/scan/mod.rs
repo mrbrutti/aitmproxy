@@ -170,41 +170,68 @@ fn refreshing(app: &App) -> Option<&'static str> {
     (empty && waiting).then_some(verb)
 }
 
+/// A tab body split into its list and detail panes, with the rule between
+/// them (D11). Both panes exclude the rule; `rule` is `None` when the body is
+/// too small to leave a cell for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Panes {
+    pub list: Rect,
+    pub detail: Rect,
+    pub rule: Option<Rect>,
+}
+
 /// Split a tab's body into its list and detail panes: side by side (45/55)
 /// from 100 columns, stacked (40/60) below that, with one rule between them
-/// (D11). Both rects exclude the rule.
-pub fn panes(area: Rect) -> (Rect, Rect) {
+/// (D11). The split is decided once, here, and the arithmetic runs in `u32`
+/// so a very wide terminal cannot overflow `u16` (fix round A, A12).
+pub fn panes(area: Rect) -> Panes {
+    let percent = |whole: u16, pct: u32| -> u16 {
+        // `whole * pct / 100 <= whole`, so the narrowing cannot lose bits.
+        u16::try_from(u32::from(whole) * pct / 100).unwrap_or(whole)
+    };
     if area.width >= 100 {
-        let left = area.width * 45 / 100;
+        let left = percent(area.width, 45);
         let list = Rect::new(area.x, area.y, left, area.height);
+        let rule_x = area.x.saturating_add(left);
         let detail = Rect::new(
-            area.x + left + 1,
+            rule_x.saturating_add(1),
             area.y,
-            area.width.saturating_sub(left + 1),
+            area.width.saturating_sub(left.saturating_add(1)),
             area.height,
         );
-        (list, detail)
+        let rule = (left < area.width).then(|| Rect::new(rule_x, area.y, 1, area.height));
+        Panes { list, detail, rule }
     } else {
-        let top = (area.height * 40 / 100).max(1);
+        let top = percent(area.height, 40).max(1);
         let list = Rect::new(area.x, area.y, area.width, top);
-        let rest = area.height.saturating_sub(top + 1);
-        let detail = Rect::new(area.x, area.y + top + 1, area.width, rest);
-        (list, detail)
+        let rule_y = area.y.saturating_add(top);
+        let detail = Rect::new(
+            area.x,
+            rule_y.saturating_add(1),
+            area.width,
+            area.height.saturating_sub(top.saturating_add(1)),
+        );
+        let rule = (top < area.height).then(|| Rect::new(area.x, rule_y, area.width, 1));
+        Panes { list, detail, rule }
     }
 }
 
-/// Draw the rule [`panes`] leaves between the two panes.
-pub fn pane_rule(theme: &Theme, area: Rect, buf: &mut Buffer) {
-    if area.width >= 100 {
-        let x = area.x + area.width * 45 / 100;
-        for y in area.y..area.bottom() {
-            buf.set_string(x, y, "│", theme.rule());
+/// Draw the rule [`panes`] left between the two panes, if it left one.
+pub fn pane_rule(theme: &Theme, panes: &Panes, buf: &mut Buffer) {
+    let Some(rule) = panes.rule else {
+        return;
+    };
+    if rule.width == 1 {
+        for y in rule.y..rule.bottom() {
+            buf.set_string(rule.x, y, "│", theme.rule());
         }
     } else {
-        let y = area.y + (area.height * 40 / 100).max(1);
-        if y < area.bottom() {
-            buf.set_string(area.x, y, "─".repeat(usize::from(area.width)), theme.rule());
-        }
+        buf.set_string(
+            rule.x,
+            rule.y,
+            "─".repeat(usize::from(rule.width)),
+            theme.rule(),
+        );
     }
 }
 
@@ -225,4 +252,34 @@ pub fn note(theme: &Theme, area: Rect, text: &str, buf: &mut Buffer) {
 /// The inline wording of a control whose verb this bus does not offer (D2).
 pub fn missing_verb(verb: &str) -> String {
     format!("{verb} is not on this bus")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix round A, A12: the split is computed in `u32`, so a very wide
+    /// terminal (1500 columns overflows `u16` at `width * 45`) neither
+    /// panics nor loses the rule; the list is 45 percent of the width.
+    #[test]
+    fn panes_split_a_1500_column_rect_without_overflow() {
+        let area = Rect::new(0, 0, 1500, 60);
+        let p = panes(area);
+        assert_eq!(u32::from(p.list.width), 1500 * 45 / 100);
+        assert_eq!(p.list, Rect::new(0, 0, 675, 60));
+        assert_eq!(p.rule, Some(Rect::new(675, 0, 1, 60)));
+        assert_eq!(p.detail, Rect::new(676, 0, 824, 60));
+        let mut buf = Buffer::empty(area);
+        pane_rule(&Theme::new(true), &p, &mut buf);
+        assert_eq!(buf.cell((675, 59)).map(|c| c.symbol()), Some("│"));
+    }
+
+    /// Below 100 columns the panes stack 40/60 with one rule row between.
+    #[test]
+    fn panes_stack_below_100_columns() {
+        let p = panes(Rect::new(0, 3, 80, 20));
+        assert_eq!(p.list, Rect::new(0, 3, 80, 8));
+        assert_eq!(p.rule, Some(Rect::new(0, 11, 80, 1)));
+        assert_eq!(p.detail, Rect::new(0, 12, 80, 11));
+    }
 }
