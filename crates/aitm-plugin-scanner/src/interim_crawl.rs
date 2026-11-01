@@ -1111,8 +1111,13 @@ mod tests {
             .expect("extraction finished within 10 s (a regression to quadratic time)");
 
         eprintln!("2 MiB page of unclosed forms extracted in {elapsed:?}");
+        // The regression this guards is quadratic (~30 min on this page); the
+        // linear pass takes ~0.1 s in debug on an idle machine and ~1.7 s at a
+        // load average near 300 (2026-11-01 gate), so the bound leaves room for
+        // a loaded shared machine while still catching the regression by orders
+        // of magnitude.
         assert!(
-            elapsed < std::time::Duration::from_secs(1),
+            elapsed < std::time::Duration::from_secs(5),
             "a 2 MiB page of unclosed forms took {elapsed:?}"
         );
         assert_eq!(count, 1, "every form is the same navigation");
