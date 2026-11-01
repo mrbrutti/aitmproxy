@@ -419,6 +419,8 @@ Kept by the T6 session during stage 6. One row per finding. Range reviewed: `395
 | 23 | T6 session (cells) | External | `test_t6_grammars_live.py::advertises()` required the grammar name as a token in an `l4_field` check id; T6 ships three generic checks (S6.3) | Fixed by T10 in PR #233 (`lane_landed`) |
 | 23 | T6 session (cells) | Info | T1b's contract additions (`Verdict.location`/`more`, `CheckMeta.scope`, `L4Options.fields`) break the lane's build until #232 merges | Adapted on the proof branch; applied to #229 at integration once #232 is on main |
 
+**Bus-level run 5 (proof branch `3da008ec`: #229 `bfabd34d` with F10/F11, T1b `ca852f71`, T10 #233/#235/#236 + cells-3 `c67dbc83`; logs in the coordinator's notes `t6-live-proof/bus-run-5/`):** `test_t6_gates` 13/13; `test_t6_grammars_live` finds `l4-crash` on every Vulnerable speaker (tlv 1, resp 5, memcached 1, dns 4, modbus 2, mqtt 1, smtp 2, ftp 1 issues; 4 downtime windows per issue in the target's log), every Patched job `done` with 0 issues and no downtime, worst pacer window 18649 B <= 20480; `test_t6_tlv_crash` exactly one `l4-crash`; `test_t6_dns_udp` 4 `l4-crash`. Every remaining `[FAIL]` is the same external assertion, `location.l4.grammar` None (T1b issue builder); `test_t6_denylist_real_servers` SKIP 77 (no redis/memcached on PATH).
+
 **Re-review of round 2 (range `5e202bb6..1e31bbf4`; Security PASS, Quality PASS, Spec PASS):**
 
 | Task | Reviewer | Severity | Finding | Disposition |
