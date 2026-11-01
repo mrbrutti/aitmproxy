@@ -305,6 +305,64 @@ fn scan_command_with_an_origin_sends_target_or_refuses() {
     assert_eq!(app.scan.launch.pending, None);
 }
 
+/// Fix round G, G61 and G14: the D8 scope refusal is one rule with one
+/// literal on every path: `:scan <origin>` under v2, `s` from an editor
+/// whose draft holds an uncovered origin, the `o` prompt, and the legacy
+/// `:scan <host>`; none of them reaches the wire.
+#[test]
+fn every_scope_refusal_path_toasts_the_one_literal() {
+    const LITERAL: &str = "Out of scope: add `evil.test` to scope to scan it";
+
+    let mut app = connected_with(TOOLS);
+    let reqs = app.run_command("scan https://evil.test");
+    assert!(launch_requests(&reqs).is_empty(), "{reqs:?}");
+    assert_eq!(toast(&app), LITERAL, ":scan under v2");
+
+    let mut app = opened();
+    open_standard(&mut app);
+    app.scan
+        .profiles
+        .editor
+        .as_mut()
+        .expect("editor")
+        .draft
+        .target
+        .origins
+        .push("https://evil.test".to_string());
+    let reqs = app.update(Action::ScanStart);
+    assert!(launch_requests(&reqs).is_empty(), "{reqs:?}");
+    assert_eq!(toast(&app), LITERAL, "s from the editor");
+
+    let mut app = opened();
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanOriginPrompt);
+    for c in "https://evil.test".chars() {
+        let _ = app.update(Action::Input(c));
+    }
+    let reqs = app.update(Action::Submit);
+    assert!(launch_requests(&reqs).is_empty(), "{reqs:?}");
+    assert_eq!(toast(&app), LITERAL, "the o prompt");
+
+    let mut app = legacy_app(200, 50);
+    app.scope = vec![SCOPE_HOST.to_string()];
+    let reqs = app.run_command("scan evil.test");
+    assert!(launch_requests(&reqs).is_empty(), "{reqs:?}");
+    assert_eq!(toast(&app), LITERAL, "the legacy :scan");
+
+    // The legacy launch with nothing in scope names what to do, without
+    // an em dash (G14).
+    let mut app = legacy_app(200, 50);
+    app.scope.clear();
+    app.selected = None;
+    let _ = app.update(Action::OpenScan);
+    let reqs = app.update(Action::ScanLaunch);
+    assert!(launch_requests(&reqs).is_empty(), "{reqs:?}");
+    assert_eq!(
+        toast(&app),
+        "Scan needs an in-scope host: add one to scope (S) first"
+    );
+}
+
 /// D7: `scan.start` is not a local `y/N` tool; the server decides whether a
 /// launch needs a confirmation over the wire.
 #[test]

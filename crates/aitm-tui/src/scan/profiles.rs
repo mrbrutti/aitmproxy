@@ -12,8 +12,8 @@ use aitm_scan_model::{
     ProfileListResult, RecordProbes, ScanProfile, SessionMode, SessionProfile, Speed, UseBrowser,
 };
 
-use super::{lane_token, step, Dir, ScanError};
-use crate::model::FlowRow;
+use super::{lane_token, scan_host, step, Dir, ScanError};
+use crate::model::{scope_covers, FlowRow};
 use crate::text::{truncate, width};
 
 /// The most `scan.profile.list` rows kept at fold (spec D6, hostile-core
@@ -443,6 +443,19 @@ fn seed_within(seed: &L4Seed) -> bool {
     match seed {
         L4Seed::Flow { .. } => true,
         L4Seed::Hex { hex: s } | L4Seed::Base64 { base64: s } => s.len() <= SEED_BYTES_MAX,
+    }
+}
+
+/// The D8 scope guard, one rule for every launch and origin path (fix round
+/// G, G61): the toast text when `raw`'s host ([`scan_host`]) is empty or no
+/// entry of `scope` covers it (`Out of scope: add \`<host>\` to scope to
+/// scan it`), `None` when it is covered.
+pub fn out_of_scope(scope: &[String], raw: &str) -> Option<String> {
+    let host = scan_host(raw);
+    if host.is_empty() || !scope_covers(scope, &host) {
+        Some(format!("Out of scope: add `{host}` to scope to scan it"))
+    } else {
+        None
     }
 }
 

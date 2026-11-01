@@ -31,10 +31,10 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    fold_profile, is_job_id, l4_gate, lane_token, launch_args, parse_l4_target, parse_result,
-    scan_host, state_text, status_token, step, tag_keyed, tag_parts, typed_origin, Dir, FieldKind,
-    IssueFilterKey, IssuePane, JobPane, MapSource, PendingLaunch, ProfileEditor, ProfilePane,
-    ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
+    fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
+    parse_result, scan_host, state_text, status_token, step, tag_keyed, tag_parts, typed_origin,
+    Dir, FieldKind, IssueFilterKey, IssuePane, JobPane, MapSource, PendingLaunch, ProfileEditor,
+    ProfilePane, ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
     MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
     SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
@@ -2440,24 +2440,20 @@ impl App {
             );
             return;
         }
-        let (host, raw) = match explicit {
-            Some(raw) => (crate::scan::scan_host(&raw), raw),
+        let raw = match explicit {
+            Some(raw) => raw,
             None => match self.scan_target_host() {
-                Some(h) => (h.clone(), h),
+                Some(h) => h,
                 None => {
                     self.toast(
                         Level::Warn,
-                        "Scan needs an in-scope host — add one to scope (S) first",
+                        "Scan needs an in-scope host: add one to scope (S) first",
                     );
                     return;
                 }
             },
         };
-        if host.is_empty() || !scope_covers(&self.scope, &host) {
-            self.toast(
-                Level::Warn,
-                format!("Out of scope — add `{host}` to scope to scan it"),
-            );
+        if self.scope_host(&raw).is_none() {
             return;
         }
         // D8: a typed origin keeps its scheme and port (authority only), a
@@ -2503,6 +2499,19 @@ impl App {
             .iter()
             .find(|e| !e.starts_with("*.") && !e.is_empty())
             .map(|e| crate::scan::scan_host(e))
+    }
+
+    /// The D8 scope guard on a launch or origin path (fix round G, G61):
+    /// `raw`'s host when the scope covers it; otherwise the one refusal
+    /// toast ([`out_of_scope`]) and `None`, and the caller sends nothing.
+    fn scope_host(&mut self, raw: &str) -> Option<String> {
+        match out_of_scope(&self.scope, raw) {
+            Some(text) => {
+                self.toast(Level::Warn, text);
+                None
+            }
+            None => Some(scan_host(raw)),
+        }
     }
 
     /// The operator answered the confirm prompt.
@@ -4650,28 +4659,27 @@ impl App {
             self.toast(Level::Info, LAUNCH_IN_FLIGHT);
             return;
         }
-        let origins: Vec<String> = self
-            .scan
-            .profiles
-            .editor
-            .as_ref()
-            .map(|e| e.draft.target.origins.clone())
-            .unwrap_or_default();
-        for origin in &origins {
-            let host = scan_host(origin);
-            if host.is_empty() || !scope_covers(&self.scope, &host) {
-                self.toast(
-                    Level::Warn,
-                    format!("Out of scope: add `{host}` to scope to scan it"),
-                );
-                return;
-            }
+        // Every draft origin's host against the scope (the D8 rule, one
+        // helper for every path; fix round G, G61): the first uncovered
+        // one is toasted and nothing leaves.
+        let editor = self.scan.profiles.editor.as_ref();
+        let refused = editor.and_then(|e| {
+            e.draft
+                .target
+                .origins
+                .iter()
+                .find_map(|o| out_of_scope(&self.scope, o))
+        });
+        if let Some(text) = refused {
+            self.toast(Level::Warn, text);
+            return;
         }
         if verb == "scan.map" && !self.has_tool("scan.map") && self.has_tool("scan.discover") {
             if self.scan.legacy.running {
                 self.toast(Level::Info, "a scan is already running");
             } else {
-                match origins.first().cloned() {
+                let first = editor.and_then(|e| e.draft.target.origins.first().cloned());
+                match first {
                     Some(origin) => self.scan_launch(Some(origin), out),
                     None => self.toast(Level::Info, "map needs an origin: add one (o) first"),
                 }
@@ -4708,12 +4716,7 @@ impl App {
             self.toast(Level::Info, LAUNCH_IN_FLIGHT);
             return;
         }
-        let host = scan_host(raw);
-        if host.is_empty() || !scope_covers(&self.scope, &host) {
-            self.toast(
-                Level::Warn,
-                format!("Out of scope: add `{host}` to scope to scan it"),
-            );
+        if self.scope_host(raw).is_none() {
             return;
         }
         let target = match typed_origin(raw, &self.flows) {
@@ -4944,12 +4947,7 @@ impl App {
                 return;
             }
         };
-        let host = crate::scan::scan_host(&origin);
-        if host.is_empty() || !scope_covers(&self.scope, &host) {
-            self.toast(
-                Level::Warn,
-                format!("Out of scope: add `{host}` to scope to scan it"),
-            );
+        if self.scope_host(&origin).is_none() {
             return;
         }
         let Some(editor) = self.scan.profiles.editor.as_mut() else {
