@@ -1108,6 +1108,10 @@ crates/aitm-scan-http/
   4. **`wire.rs` pin check**: Task 20 already re-pinned `lane_slots_hold_the_http_lane` to `1`;
      after the merge confirm the literal survived and `collect_native_checks().len()` is whatever
      `main` pins (T3 may have flipped it).
+  4b. **`wire.rs` lane-count re-pin after other lanes merged**: T4 (`aitm-scan-ws`, main 348ddb16) landed
+     before T2, so the one test literal is re-pinned to `2` and the test renamed
+     `lane_slots_hold_the_http_and_ws_lanes` in the merge of main (the integration-shared-file rule:
+     each merging track bumps it, in merge order).
   5. Contract check, no re-pin expected: `cargo test -p aitm --test frontends` passes with
      `EXPECTED_TOOLS` untouched (T2 adds no verb); `cargo test -p aitm --test bundled_startup` and
      `cargo test -p aitm-plugin-rhai --test bundled_scripts` pass (T2 adds no check). Quote them.
