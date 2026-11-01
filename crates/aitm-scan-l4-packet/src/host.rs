@@ -1202,9 +1202,24 @@ impl RunnerRegistry {
         Self::default()
     }
 
-    /// Remember `runner` as the one runner for this marker and point.
-    pub fn register(&self, marker: &str, point_id: &str, runner: Arc<PointRunner>) {
-        lock(&self.runners).insert((marker.to_string(), point_id.to_string()), runner);
+    /// Remember `runner` as the one runner for this marker and point, and
+    /// hand back the runner this point now has.
+    ///
+    /// Idempotent: a point already registered keeps its runner and `runner` is
+    /// dropped, so two hosts for one point share one `PointRunner` and
+    /// therefore one idempotent [`PointRunner::run_point`] — never two runs of
+    /// the same point against the same job (review finding Q3).
+    pub fn register(
+        &self,
+        marker: &str,
+        point_id: &str,
+        runner: Arc<PointRunner>,
+    ) -> Arc<PointRunner> {
+        Arc::clone(
+            lock(&self.runners)
+                .entry((marker.to_string(), point_id.to_string()))
+                .or_insert(runner),
+        )
     }
 
     /// The runner for this marker and point, if one was registered.

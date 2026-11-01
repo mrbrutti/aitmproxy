@@ -290,15 +290,20 @@ impl Lane for PacketLane {
             .ok_or_else(|| anyhow!("no target plan for point {} in job {job_id}", point.id))?;
 
         let marker = job.marker();
-        let runner = Arc::new(PointRunner::new(
-            Arc::clone(shared),
-            job,
-            point.clone(),
-            plan,
-            field,
-        ));
-        self.registry
-            .register(&marker, &point.id, Arc::clone(&runner));
+        // The registry owns the point's runner: a second host for the same
+        // point wraps the runner already registered, so both hosts drive one
+        // idempotent run (review finding Q3).
+        let runner = self.registry.register(
+            &marker,
+            &point.id,
+            Arc::new(PointRunner::new(
+                Arc::clone(shared),
+                job,
+                point.clone(),
+                plan,
+                field,
+            )),
+        );
         Ok(Box::new(PacketHost::new(runner)))
     }
 
@@ -561,6 +566,65 @@ mod tests {
             })
         );
         assert_eq!(mock.inject_count(), 105);
+    }
+
+    /// Review finding Q3: two hosts for the same point are two views of one
+    /// run, not two runs. The engine may hand a point to the crash check and
+    /// the reaction check through hosts it asked for separately, so
+    /// `probe_host_for` must hand back the registered runner, whose
+    /// `run_point` is idempotent — concurrently, the point still sends exactly
+    /// what one host sends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_hosts_for_one_point_share_one_run() {
+        let mock = MockBackend::new(MockReply::Echo);
+        let lane = lane_with(Arc::clone(&mock), &["raw"]);
+        let profile = l4_profile(vec![udp_target(9)], 100);
+        let job = TestJob::new(profile.clone());
+
+        let discovery = lane
+            .discover(&profile.target, job.as_ref())
+            .await
+            .expect("one raw point");
+        let point = discovery.points[0].clone();
+        let first = lane
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("the lane hosts the point it minted");
+        let runner = lane
+            .registry
+            .get(&job.marker(), &point.id)
+            .expect("the first host registered the point's runner");
+        let second = lane
+            .probe_host_for(&point, Arc::clone(&job) as Arc<dyn JobCtx>)
+            .expect("a second host for the same point");
+        let again = lane
+            .registry
+            .get(&job.marker(), &point.id)
+            .expect("the second host finds a runner too");
+        assert!(
+            Arc::ptr_eq(&runner, &again),
+            "one point, one runner: the second host must not orphan the first's"
+        );
+
+        let checks = lane.checks();
+        let (crash, reaction) = tokio::join!(
+            checks[0].run(&point, first.as_ref()),
+            checks[1].run(&point, second.as_ref())
+        );
+
+        assert_eq!(crash.outcome, Outcome::Clean);
+        assert_eq!(reaction.outcome, Outcome::Clean);
+        // Exactly the single-host figures of `end_to_end_hundred_clean`:
+        // 1 baseline + 100 cases + 4 scheduled liveness probes.
+        assert_eq!(mock.inject_count(), 105);
+        assert_eq!(
+            lane.counters(JOB_ID),
+            Some(L4Counters {
+                cases: 100,
+                crashes: 0,
+                liveness_failures: 0,
+                retired_elements: 0,
+            })
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
