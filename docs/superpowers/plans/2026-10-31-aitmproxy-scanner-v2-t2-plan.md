@@ -1249,6 +1249,15 @@ Kept by the main session during stage 6. One row per finding.
 | 18 | Coder (stage 4) | Minor | `browser_crawl_pins` log token is `type <sel> = <text>` (the double's spelling); `prime_session_pins` uses a test-local scripted browser for the HttpOnly read-back; `budget_stops_crawl` uses a plain two-page site | accepted (orchestrator): same assertions, counts and order as the plan |
 | 19 | Coder (stage 4) | Minor | Sender errors scrubbed before they become `anyhow` messages; `probe_raw` keeps the capture's authority as `Host` | accepted (orchestrator): strengthens T2-6 |
 | 20 | Coder (stage 4) | Minor | `SessionMonitor::canary()` unreachable across the track boundary (no `JobCtx` seam) | T1b added `JobCtx::report_session_canary` / `report_session_browser_partial` on its branch (26b2a6a4); wired in Task 22 once on `main` |
+| whole branch | Tester (stage 5) | Important | F1: browser-driver and crawler error texts logged verbatim (`crawl/browser.rs`, `lane.rs`) could echo a URL with a token or a `document.cookie` statement | fixed in 8c922891 (`redact::scrub_error`, applied in `bounded()` and the lane's warn sites; call-site tests with tracing capture) |
+| whole branch | Tester (stage 5) | Important (ruling) | F2: `InsertionPoint.url` "as captured" carried query credentials into `scan.sitemap` results | fixed in 21243e44: `url` passes through `safe_url` (orchestrator ruling under the anti-goal "no result carries a value"); bounded to 256 chars; origin/path parseable |
+| whole branch | Tester (stage 5) | Minor | F3: `xml::scan`/`multipart::parse` error names logged verbatim | fixed in 9dbccbf8 |
+| whole branch | Tester (stage 5) | Important | F4: `apply_session` merged only the first `Cookie` header, dropping cookies from a second one | fixed in 23d0042d |
+| 20 | Coder (stage 4) | Minor | R1: log-site lint false positive on `use tracing::` import lines | fixed in 139e7834 |
+| 20 | Coder (stage 4) | Minor | R2: duplicate boundary parsers; the stricter one was dead | fixed in dc9e6cae (`body_format` delegates to `multipart::boundary_of`) |
+| 20 | Coder (stage 4) | Minor | R3: a crawl that failed mid-way lost the captures it had already produced | fixed in 1f753ce1 (store re-queried on `Err`; `Crawlers` injection seam for the test) |
+| 21 prep | Tester (stage 5) | Important | N1: `session.mode: none` still replayed a captured flow's own `Cookie`/`Authorization`, so AC T2-4's `none` half could not hold for a seed captured while logged in | fixed in bfe7b789 (strip at host construction and on `probe_raw`); plan amended (d1f5d359, 292e0d9d) |
+| 21 prep | Tester (stage 5) | Minor | N2: client crawler posted `multipart/form-data` forms as urlencoded (A18) | fixed in 171c8689 (multipart body with an inert file part) |
 
 ## Shipped
 
