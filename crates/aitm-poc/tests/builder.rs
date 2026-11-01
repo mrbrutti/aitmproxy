@@ -906,3 +906,112 @@ fn build_masks_a_credential_nested_under_a_secret_parent_on_every_surface() {
         "text canary leaked"
     );
 }
+
+/// A nested credential in a header the builder keeps (its name is not a secret), on one line
+/// and across a tab and a no-break space (a header value cannot hold a line break:
+/// `HeaderMap::set` drops it); in a query value, where the pair has no blank to read across;
+/// and in a body a connection dropped mid-stream, cut at every byte (a multi-byte character
+/// split included). No canary survives in any of them.
+#[test]
+fn build_masks_a_nested_credential_in_a_header_a_query_value_and_a_body_cut_at_every_byte() {
+    // Headers: the value is content-scrubbed as free text.
+    let mut flow = flow_with("/go?q=hello", Body::Empty);
+    flow.request.headers.set("X-Note", "auth: password: HDRPW5");
+    flow.request
+        .headers
+        .set("X-Trace", "auth:\t\u{a0}password: HDRPW6");
+    let poc = StdPocBuilder.build(&flow, basic_spec()).expect("build");
+    let step = http_step(&poc);
+    let header = |name: &str| {
+        step.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    assert_eq!(header("X-Note"), Some("auth: [redacted] [redacted]"));
+    assert_eq!(
+        header("X-Trace"),
+        Some("auth:\t\u{a0}[redacted] [redacted]")
+    );
+    let serialized = serde_json::to_string(&poc).unwrap();
+    assert!(
+        !serialized.contains("HDRPW5") && !serialized.contains("HDRPW6"),
+        "header canary leaked"
+    );
+
+    // A query value with the blanks percent-encoded is one token, masked whole.
+    let poc = StdPocBuilder
+        .build(
+            &flow_with(
+                "/go?q=hello&note=auth:%0A%20%20password:%20QRYPW7",
+                Body::Empty,
+            ),
+            basic_spec(),
+        )
+        .expect("build");
+    assert_eq!(
+        http_step(&poc).url,
+        "{{target}}/go?{{param}}=hello&note=auth:[redacted]"
+    );
+    assert!(
+        !serde_json::to_string(&poc).unwrap().contains("QRYPW7"),
+        "query canary leaked"
+    );
+
+    // The body, cut at every byte. `\u{e9}` is two bytes and `\u{1f600}` four, so some
+    // cuts split a character and the lossy decode puts U+FFFD there.
+    let body = "auth:\n  password: \u{e9}QQQQ\u{1f600}".as_bytes();
+    let mut cuts = 0;
+    let mut leaks: Vec<(usize, String)> = Vec::new();
+    for cut in 0..=body.len() {
+        let poc = StdPocBuilder
+            .build(
+                &flow_with("/x", Body::Bytes(body[..cut].to_vec())),
+                basic_spec(),
+            )
+            .expect("build");
+        let text = http_step(&poc).body.clone().unwrap_or_default();
+        cuts += 1;
+        if text.contains('Q') {
+            leaks.push((cut, text));
+        }
+    }
+    assert!(cuts >= 25, "the body is too short: {cuts} cuts");
+    assert!(leaks.is_empty(), "a credential survived a cut: {leaks:#?}");
+    let poc = StdPocBuilder
+        .build(&flow_with("/x", Body::Bytes(body.to_vec())), basic_spec())
+        .expect("build");
+    assert_eq!(
+        http_step(&poc).body.as_deref(),
+        Some("auth:\n  [redacted] [redacted]")
+    );
+}
+
+/// An opaque body of a mebibyte or more with a nested pair on every other line: the scrub
+/// finishes, masks every canary and keeps the line structure. The count is clamped to a body of
+/// at most two mebibytes before the repeat.
+#[test]
+fn build_masks_a_nested_credential_in_an_oversized_opaque_body() {
+    const UNIT: &str = "auth:\n  password: BIGPW8\n";
+    const FLOOR: usize = 1 << 20;
+    const CEILING: usize = 1 << 21;
+    let copies = (FLOOR / UNIT.len() + 1).min(CEILING / UNIT.len());
+    let body = UNIT.repeat(copies);
+    assert!(body.len() >= FLOOR && body.len() <= CEILING);
+
+    let poc = StdPocBuilder
+        .build(
+            &flow_with("/x", Body::Bytes(body.into_bytes())),
+            basic_spec(),
+        )
+        .expect("build");
+    let text = http_step(&poc).body.clone().expect("a body");
+    assert!(
+        !text.contains("BIGPW8"),
+        "a canary of the large body leaked"
+    );
+    assert!(
+        text == "auth:\n  [redacted] [redacted]\n".repeat(copies),
+        "the large body was not masked line by line"
+    );
+}
