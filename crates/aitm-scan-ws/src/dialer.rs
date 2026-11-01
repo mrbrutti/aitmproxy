@@ -103,17 +103,28 @@ fn header_name(name: &str) -> anyhow::Result<HeaderName> {
         .with_context(|| format!("{name} is not a valid header name"))
 }
 
-/// `value` as an HTTP header value; the error names the header, never the value.
+/// `value` as an HTTP header value, or `None` when it cannot go on the wire.
 ///
 /// Visible ASCII only. `HeaderValue::from_str` also accepts obs-text (bytes
 /// 0x80-0xFF), which every serialiser downstream then refuses — tungstenite's
 /// by quoting the whole value back in its error text (security finding S9). A
-/// value this crate cannot put on the wire is refused here, where the refusal
-/// names the header alone.
-fn header_value(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
+/// value this crate cannot put on the wire is refused here instead, by a
+/// caller whose refusal names the header alone.
+///
+/// The one place the rule lives: the replay dialer ([`header_value`]) and the
+/// `ws.*` language's `build_request` both go through it, each turning the
+/// `None` into its own error type (quality round-2 Minor 1).
+pub(crate) fn visible_ascii_header_value(value: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(value)
         .ok()
         .filter(|value| value.to_str().is_ok())
+}
+
+/// `value` as an HTTP header value; the error names the header, never the value.
+///
+/// The rule is [`visible_ascii_header_value`]'s.
+fn header_value(name: &str, value: &str) -> anyhow::Result<HeaderValue> {
+    visible_ascii_header_value(value)
         .ok_or_else(|| anyhow!("the value of header {name} cannot be sent on the wire"))
 }
 
@@ -837,9 +848,10 @@ impl WsConn {
     /// Frames this connection saw but did not record because the replay flow
     /// had reached the dial's collection ceilings (security finding S5).
     ///
-    /// Read only by the tests that assert the ceilings held: the counter is
-    /// maintained on every dial, but nothing in a shipped path asks for it.
-    #[cfg(test)]
+    /// The count alone: a frame nobody recorded is never carried out of here.
+    /// The probe host reads it after every probe and logs a truncated
+    /// conversation at `debug`, so an operator reading an evidence flow that
+    /// stops mid-exchange can tell a ceiling from a server that went quiet.
     #[must_use]
     pub(crate) fn unrecorded(&self) -> usize {
         self.unrecorded

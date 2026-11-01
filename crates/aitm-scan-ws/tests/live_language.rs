@@ -20,8 +20,12 @@
 //!
 //! The scripts themselves run blocking on purpose — a seam host fn is a
 //! synchronous closure and the language owns its own driver thread and
-//! runtime — while the control origin is read through the live harness's one
-//! async HTTP client, shared with `tests/live_lane.rs` (quality finding N3).
+//! runtime. So these are plain `#[test]`s: an `Engine::eval` on a `#[tokio::
+//! test]`'s runtime would block that runtime, and the caller context the
+//! engine is seeded with is a thread-local, which rules out handing the eval
+//! to `spawn_blocking` (quality round-2 Minor 3). The control origin is still
+//! read with the live harness's one async HTTP client, shared with
+//! `tests/live_lane.rs` (quality finding N3), through its blocking wrapper.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +39,7 @@ use serde_json::Value;
 
 mod common;
 
-use common::live::{control_json, Target};
+use common::live::{control_json_blocking, Target};
 
 /// An address nothing listens on and the guard was never told about.
 const OUT_OF_SCOPE_URL: &str = "ws://127.0.0.2:1/ws";
@@ -44,15 +48,15 @@ const OUT_OF_SCOPE_URL: &str = "ws://127.0.0.2:1/ws";
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many rows `/log/conns` holds.
-async fn conn_rows(control: &str) -> usize {
-    control_json(control, "/log/conns").await["entries"]
+fn conn_rows(control: &str) -> usize {
+    control_json_blocking(control, "/log/conns")["entries"]
         .as_array()
         .map_or(0, Vec::len)
 }
 
 /// Every accepted `/ws` handshake the target logged.
-async fn accepted_handshakes(control: &str) -> Vec<Value> {
-    control_json(control, "/log/ws").await["entries"]
+fn accepted_handshakes(control: &str) -> Vec<Value> {
+    control_json_blocking(control, "/log/ws")["entries"]
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default()
@@ -102,9 +106,9 @@ fn round_trip_script(authority: &str) -> String {
 
 // --- the proofs ---------------------------------------------------------------
 
-#[tokio::test]
+#[test]
 #[ignore = "binds a loopback port; run in the Terminal"]
-async fn script_round_trips_a_frame_to_the_real_target() {
+fn script_round_trips_a_frame_to_the_real_target() {
     let target = Target::start("vulnerable");
     let authority = target.authority();
     let engine = engine_for(&authority);
@@ -119,7 +123,7 @@ async fn script_round_trips_a_frame_to_the_real_target() {
         "the seeded target answers with a hello frame and an echo frame, saw {frames}"
     );
 
-    let handshakes = accepted_handshakes(&target.control).await;
+    let handshakes = accepted_handshakes(&target.control);
     for entry in &handshakes {
         println!(
             "handshake: path={} key={} accepted={} status={}",
@@ -138,9 +142,9 @@ async fn script_round_trips_a_frame_to_the_real_target() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "binds a loopback port; run in the Terminal"]
-async fn out_of_scope_dial_is_refused_before_any_connection() {
+fn out_of_scope_dial_is_refused_before_any_connection() {
     let target = Target::start("vulnerable");
     let authority = target.authority();
     let engine = engine_for(&authority);
@@ -151,7 +155,7 @@ async fn out_of_scope_dial_is_refused_before_any_connection() {
         .eval(&round_trip_script(&authority))
         .expect("the in-scope round trip evaluates");
     assert!(frames >= 2, "the in-scope dial reached the target");
-    let before = conn_rows(&target.control).await;
+    let before = conn_rows(&target.control);
 
     let error = engine
         .eval::<Dynamic>(&format!(r#"ws.dial(#{{ url: "{OUT_OF_SCOPE_URL}" }})"#))
@@ -163,7 +167,7 @@ async fn out_of_scope_dial_is_refused_before_any_connection() {
         "the guard's refusal names OutOfScope; was {text}"
     );
 
-    let after = conn_rows(&target.control).await;
+    let after = conn_rows(&target.control);
     println!("conns: {before} rows before the refused dial, {after} after");
     assert_eq!(
         before, after,
@@ -171,9 +175,9 @@ async fn out_of_scope_dial_is_refused_before_any_connection() {
     );
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "binds a loopback port; run in the Terminal"]
-async fn fifth_concurrent_handle_is_refused() {
+fn fifth_concurrent_handle_is_refused() {
     let target = Target::start("vulnerable");
     let authority = target.authority();
     let engine = engine_for(&authority);
@@ -197,7 +201,7 @@ async fn fifth_concurrent_handle_is_refused() {
         "the fifth dial names the handle bound; was {text}"
     );
 
-    let handshakes = accepted_handshakes(&target.control).await;
+    let handshakes = accepted_handshakes(&target.control);
     println!(
         "handle bound: the target accepted {} upgrades",
         handshakes.len()

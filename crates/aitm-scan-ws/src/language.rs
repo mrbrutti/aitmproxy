@@ -38,7 +38,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -52,10 +52,11 @@ use aitm_scan_model::{Frame, FrameKind};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue, Request};
+use tokio_tungstenite::tungstenite::http::{HeaderName, Request};
 
 use crate::dialer::{
-    request_authority, DialError, DialLimits, DialOutcome, WsConn, WsDialer, REGENERATED_HEADERS,
+    request_authority, visible_ascii_header_value, DialError, DialLimits, DialOutcome, WsConn,
+    WsDialer, REGENERATED_HEADERS,
 };
 use crate::transport::TcpTransport;
 use crate::types::{TlsPolicy, HANDLE_IDLE_REAP, MAX_HANDLES, RECV_TIMEOUT_CAP_MS};
@@ -122,6 +123,8 @@ impl WsLanguage {
                 guard,
                 dialer,
                 sender: Arc::new(Mutex::new(None)),
+                #[cfg(test)]
+                joined: Mutex::new(None),
             }),
         }
     }
@@ -534,17 +537,13 @@ fn build_request(url: &str, headers: Option<&Value>) -> Result<Request<()>, Host
         }
         let name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|_| HostError::BadArgs(format!("{name} is not a valid header name")))?;
-        // Visible ASCII only: `from_str` also accepts obs-text (bytes
-        // 0x80-0xFF), which tungstenite's serialiser later refuses by quoting
-        // the whole value back in its error (security finding S9).
-        let header = HeaderValue::from_str(value)
-            .ok()
-            .filter(|header| header.to_str().is_ok())
-            .ok_or_else(|| {
-                HostError::BadArgs(format!(
-                    "the value of header {name} cannot be sent on the wire"
-                ))
-            })?;
+        // Visible ASCII only (security finding S9); the rule is the dialer's,
+        // shared so a script's header and a replayed one are judged alike.
+        let header = visible_ascii_header_value(value).ok_or_else(|| {
+            HostError::BadArgs(format!(
+                "the value of header {name} cannot be sent on the wire"
+            ))
+        })?;
         request.headers_mut().insert(name, header);
     }
     Ok(request)
@@ -634,9 +633,20 @@ enum DriverCmd {
 
 /// The one place the driver's command channel is kept.
 ///
-/// Shared with the driver thread so a driver that cannot start clears it and
-/// the next `ws.dial` spawns again (quality finding N7).
+/// Held by the [`DriverLink`] alone. The slot owns a sender of the driver's
+/// own channel, so a strong reference from the driver thread would keep that
+/// channel open for as long as the thread lives — and the thread lives until
+/// the channel closes. The thread therefore gets a [`WeakSenderSlot`].
 type SenderSlot = Arc<Mutex<Option<UnboundedSender<DriverCmd>>>>;
+
+/// The driver thread's view of the slot it was started from.
+///
+/// Weak on purpose (quality round-2 Important): the thread needs the slot only
+/// to clear it when its runtime will not build, so that the next `ws.dial`
+/// spawns again (quality finding N7), and must not be what keeps the slot — and
+/// with it the sender of its own command channel — alive. An upgrade that fails
+/// means the language is already gone and there is nothing left to clear.
+type WeakSenderSlot = Weak<Mutex<Option<UnboundedSender<DriverCmd>>>>;
 
 /// Forget the driver this slot points at, so the next `ws.dial` starts one.
 fn clear_sender(slot: &SenderSlot) {
@@ -653,6 +663,11 @@ struct DriverLink {
     guard: Arc<dyn ScopeRateGuard>,
     dialer: Arc<WsDialer>,
     sender: SenderSlot,
+    /// Test-only: the driver thread, kept so a test can join it and prove the
+    /// loop really ends when the last link drops. A shipped build detaches the
+    /// thread — nothing joins it, the closed channel is what ends it.
+    #[cfg(test)]
+    joined: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl DriverLink {
@@ -665,9 +680,9 @@ impl DriverLink {
     ///
     /// A thread that will not spawn leaves the slot empty and is logged at
     /// `warn!` with the OS error (quality finding N7); so does a driver whose
-    /// runtime will not build, from the thread itself. Either way the next
-    /// `ws.dial` tries again rather than reporting a driver that was never
-    /// there.
+    /// runtime will not build, from the thread itself, through the
+    /// [`WeakSenderSlot`] it is given. Either way the next `ws.dial` tries
+    /// again rather than reporting a driver that was never there.
     fn start(&self) -> Result<UnboundedSender<DriverCmd>, HostError> {
         let mut slot = self.sender.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(sender) = slot.as_ref() {
@@ -676,16 +691,40 @@ impl DriverLink {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let guard = Arc::clone(&self.guard);
         let dialer = Arc::clone(&self.dialer);
-        let own_slot = Arc::clone(&self.sender);
-        thread::Builder::new()
+        // Weak: a strong clone here would keep the slot — and so the sender of
+        // the channel the thread is reading — alive for the thread's whole life,
+        // which is until that channel closes.
+        let own_slot = Arc::downgrade(&self.sender);
+        let thread = thread::Builder::new()
             .name("aitm-ws-script".to_string())
             .spawn(move || run_driver(receiver, guard, dialer, &own_slot))
             .map_err(|err| {
                 tracing::warn!(error = %err, "the ws script driver thread could not be spawned");
                 driver_unavailable()
             })?;
+        self.keep(thread);
         *slot = Some(sender.clone());
         Ok(sender)
+    }
+
+    /// Detach the driver thread: a shipped build never joins it.
+    #[cfg(not(test))]
+    fn keep(&self, _thread: thread::JoinHandle<()>) {}
+
+    /// Remember the driver thread so [`DriverLink::take_thread`] can join it.
+    #[cfg(test)]
+    fn keep(&self, thread: thread::JoinHandle<()>) {
+        *self.joined.lock().unwrap_or_else(PoisonError::into_inner) = Some(thread);
+    }
+
+    /// Test-only: take the driver thread's handle, to join it after the
+    /// language drops.
+    #[cfg(test)]
+    fn take_thread(&self) -> Option<thread::JoinHandle<()>> {
+        self.joined
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     /// The channel to the driver, or `None` when no `ws.dial` has run yet.
@@ -741,7 +780,7 @@ fn run_driver(
     mut commands: UnboundedReceiver<DriverCmd>,
     guard: Arc<dyn ScopeRateGuard>,
     dialer: Arc<WsDialer>,
-    slot: &SenderSlot,
+    slot: &WeakSenderSlot,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -754,7 +793,9 @@ fn run_driver(
         // is a `warn!`: an operator's script just lost its websocket verbs.
         Err(err) => {
             tracing::warn!(error = %err, "the ws script driver could not start a runtime");
-            clear_sender(slot);
+            if let Some(slot) = slot.upgrade() {
+                clear_sender(&slot);
+            }
             return;
         }
     };
@@ -1598,6 +1639,87 @@ mod tests {
             "the new driver's sender is stored for the calls after it"
         );
         drop(kept_alive);
+    }
+
+    /// An echo server that records the client's Close as the payload `close`.
+    ///
+    /// [`echo_handler`] breaks on a Close without a trace, and this test needs
+    /// the server's own word that the driver closed its handle before it ended.
+    async fn closing_handler(conn: crate::testing::ServerConn) {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let mut ws = conn.ws().await;
+        while let Some(Ok(message)) = ws.next().await {
+            match message {
+                Message::Text(text) => {
+                    if ws
+                        .send(Message::text(format!("echo:{text}")))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Message::Close(_) => {
+                    conn.record(b"close".to_vec());
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn the_driver_ends_when_the_language_drops() {
+        // The driver thread used to be handed an `Arc` of the slot that holds
+        // the sender of its own command channel, so `commands.recv()` could
+        // never return `None`: dropping the language and every engine left the
+        // loop running, `close_all` unreachable, and the thread, its runtime
+        // and its open sockets alive until the process exited. The thread now
+        // holds a `Weak`, so the last link to drop closes the channel.
+        use std::sync::mpsc;
+        use std::thread;
+
+        let (transport, log) = ws_server(None, closing_handler);
+        let dialer = Arc::new(WsDialer::new(Arc::clone(&transport) as Arc<dyn WsTransport>));
+        let language = WsLanguage::new(scoped_guard(), dialer);
+        let engine = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(5),
+            &[&language],
+        )
+        .expect("the ws language installs");
+        let seed = seed_call_context(CallerTrust::Operator, None, None);
+
+        let handle: i64 = engine
+            .eval(r#"ws.dial(#{ url: "ws://127.0.0.1:8080/ws" })"#)
+            .expect("the dial evaluates");
+        assert_eq!(handle, 1);
+        let driver = language
+            .link
+            .take_thread()
+            .expect("the first dial started the driver thread");
+
+        // The engine holds a clone of the link per host fn, so both must go.
+        drop(seed);
+        drop(engine);
+        drop(language);
+
+        let (done, ended) = mpsc::channel();
+        thread::spawn(move || {
+            let joined = driver.join();
+            let _ = done.send(joined.is_ok());
+        });
+        let joined = ended
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the driver thread ends within 5s of the language dropping");
+        assert!(joined, "the driver thread ended without panicking");
+
+        assert!(
+            log.received().iter().any(|payload| payload == b"close"),
+            "the driver closed its open handle before ending: the server saw a Close"
+        );
     }
 
     #[test]

@@ -128,8 +128,17 @@ impl Check for WsAuthBypassHandshake {
             }
             let probe = match host.probe_raw(stripped_credentials()).await {
                 Ok(response) => response,
+                // The probe never connected, so it has no flow of its own; the
+                // baseline's flow is the baseline's, and goes in the field that
+                // says so — as every other check's connect error does.
                 Err(error) => {
-                    return common::connect_error(&error, baseline.flow.into_iter().collect())
+                    return Verdict {
+                        evidence: Evidence {
+                            baseline_flow: baseline.flow,
+                            ..Evidence::default()
+                        },
+                        ..common::connect_error(&error, Vec::new())
+                    }
                 }
             };
 
@@ -196,11 +205,15 @@ impl Check for WsAuthBypassHandshake {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use aitm_core::ByteStream;
     use aitm_scan_model::{
-        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome, Technique,
+        CheckCost, CheckOrigin, Confidence, InsertionKind, Intensity, LaneKind, Outcome,
+        RecordProbes, Technique,
     };
+    use futures::future::BoxFuture;
     use futures::SinkExt;
     use tokio_tungstenite::tungstenite::handshake::server::{
         create_response, ErrorResponse, Request,
@@ -210,8 +223,10 @@ mod tests {
 
     use super::{check, ID};
     use crate::testing::{
-        echo_handler, handshake_header, host_for, ws_server, HandshakeDecision, ServerConn, TestJob,
+        echo_handler, handshake_header, host_for, ws_server, DuplexTransport, HandshakeDecision,
+        ServerConn, TestJob,
     };
+    use crate::transport::WsTransport;
 
     /// The seeded target's authenticated greeting, sent right after the upgrade.
     const ALICE: &str = r#"{"type":"hello","user":"alice"}"#;
@@ -263,6 +278,62 @@ mod tests {
             *refusal.status_mut() = StatusCode::UNAUTHORIZED;
             Err(refusal)
         })
+    }
+
+    /// A transport whose first connect succeeds and whose later ones refuse,
+    /// so a check takes its baseline and then loses the target.
+    struct RefuseAfterFirst {
+        inner: Arc<DuplexTransport>,
+        seen: AtomicUsize,
+    }
+
+    impl WsTransport for RefuseAfterFirst {
+        fn connect<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+            tls: bool,
+            sni: &'a str,
+        ) -> BoxFuture<'a, anyhow::Result<ByteStream>> {
+            if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                return self.inner.connect(addr, tls, sni);
+            }
+            Box::pin(async { Err(anyhow::anyhow!("connection refused")) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_that_never_connected_has_no_probe_flow() {
+        // The baseline's flow used to be handed to `connect_error` as the
+        // probe's, so evidence claimed a probe flow for a probe that never
+        // opened a socket. It belongs in `baseline_flow`, where every other
+        // check's connect error puts it.
+        let (inner, _log) = ws_server(None, echo_handler);
+        let transport = Arc::new(RefuseAfterFirst {
+            inner,
+            seen: AtomicUsize::new(0),
+        });
+        let job = TestJob::with(100, |profile| {
+            profile.http.record_probes = RecordProbes::All;
+        });
+        let host = host_for("cookie", &job, transport);
+
+        let verdict = check().run(host.point(), &host).await;
+
+        assert_eq!(verdict.outcome, Outcome::Inconclusive, "{}", verdict.detail);
+        assert!(
+            verdict.detail.starts_with("connect error: "),
+            "{}",
+            verdict.detail
+        );
+        assert_eq!(
+            verdict.evidence.probe_flows,
+            Vec::new(),
+            "a probe that never connected has no flow of its own"
+        );
+        assert!(
+            verdict.evidence.baseline_flow.is_some(),
+            "the baseline's flow is recorded as the baseline's"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

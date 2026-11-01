@@ -191,6 +191,30 @@ pub async fn http(
     )
 }
 
+/// [`control_json`] from a blocking test.
+///
+/// `tests/live_language.rs` drives the **blocking** `Engine::eval`: a seam host
+/// fn is a synchronous closure, and the caller context the engine is seeded
+/// with is a thread-local, so the script must run on the test's own thread and
+/// its tests are plain `#[test]`s rather than `#[tokio::test]`s that would
+/// block the runtime they are running on (quality round-2 Minor 3). They read
+/// the control origin through this wrapper, which owns the runtime the shared
+/// async client needs.
+///
+/// # Panics
+///
+/// When no runtime can be built, or for everything [`control_json`] panics on.
+// `tests/live_lane.rs` compiles this module too and is async throughout, so
+// this wrapper is dead code in that binary.
+#[allow(dead_code)]
+pub fn control_json_blocking(control: &str, path: &str) -> Value {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|err| panic!("a runtime to read {path} with: {err}"))
+        .block_on(control_json(control, path))
+}
+
 /// `GET <path>` on the control origin, parsed as JSON.
 ///
 /// # Panics

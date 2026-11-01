@@ -420,6 +420,13 @@ impl WsProbeHost {
         let elapsed_ms = millis_since(started);
         let status = conn.status();
         let headers = conn.response_headers().to_vec();
+        // How many frames the dial's collection ceilings dropped (S5) — the
+        // count only, never a payload, so an evidence flow that ends mid
+        // exchange is explained rather than silently short.
+        let unrecorded = conn.unrecorded();
+        if unrecorded > 0 {
+            tracing::debug!(unrecorded, "replay conversation truncated");
+        }
         let body = text_body(&frames);
         let (handshake, conversation) =
             conn.into_flows(vec![format!("scan:{}", self.job.job_id())]);
