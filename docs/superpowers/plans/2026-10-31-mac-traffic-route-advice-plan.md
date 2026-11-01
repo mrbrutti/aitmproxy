@@ -300,6 +300,17 @@ greps, Task 6, and the diff review.
   `.openScope`, detail `"Nothing is decrypted until a host is in Scope."`; done
   `"Scope: N hosts decrypted"` (`Format.count`), action nil, detail = the scope entry's detail.
 
+> **Ruling 2026-11-01 (coordinating session, on the Task 1 coder's stop-and-report):** (1) `routes.advice` has NO
+> `flowCount` dependence — it is the list of closed facts (spec D3); whether to show it is the empty-state view's
+> decision (Task 3). TR-AC3's former `flows: 6 → advice == []` clause and the `predicateTable` literal
+> `[.allApps]` were leftovers and now read `[.systemProxy, .scope]` / `[.scope]`. (2) Because `ConnectionAction` is
+> switched exhaustively in `Session+Connection.swift` (`perform(connection:)`) and `Panels/StatusPanel.swift`
+> (`run(_:)`), Task 1 is GRANTED the two one-line `case .addScopeHost:` additions there (each delegating to the
+> Scope page with the add sheet, exactly what Task 2/Task 3 would write), so `swift test` builds every target
+> after Task 1 alone; Tasks 2 and 3 keep ownership of everything else in those files and run after Task 1.
+> (3) A third existing expectation changes: `gettingStartedStepsFollowTheFacts` pins `done.steps[3].title ==
+> "Scope has 2 hosts"`, which D4 renames to `"Scope: 2 hosts decrypted"`.
+
   **Existing tests this changes** (update them in the same commit; they are the spec's new words):
   in `gettingStartedStepsFollowTheFacts`, `fresh.steps[2].title` becomes
   `"All Apps off — turn it on to capture every app's traffic (macOS asks you to approve its extension)"`
@@ -330,7 +341,7 @@ greps, Task 6, and the diff review.
     `advice.map(\.detail) == ["every proxy-aware app, regardless of Scope", "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"]`,
     `advice[0].actions == []` (PR4 fills `.setSystemProxy`), `advice[1].actions == [.addScopeHost, .openScope]`,
     `routes.scope.state == "Nothing is decrypted until a host is in Scope."`,
-    `banner == nil`, `bannerAction == nil`, `anyOpen == true`. Same with `flows: 6` → `advice == []`, `banner == nil`;
+    `banner == nil`, `bannerAction == nil`, `anyOpen == true`. Same with `flows: 6` → `advice.map(\.kind) == [.systemProxy, .scope]` (unchanged by rows), `banner == nil`;
     **quoted** (`core = DecryptStatus(scopeHosts: 0, decrypting: false, advice: "Nothing is decrypted until a host is in Scope.")`):
     same inputs + `decrypt: core` → `routes.scope.line == "Nothing is decrypted until a host is in Scope."`, `state == "Nothing is decrypted until a host is in Scope."`,
     `open == false`, `actions == [.addScopeHost, .openScope]`; + `flows: 6, tunnelled: 6` → `banner == "Nothing is decrypted until a host is in Scope."`;
@@ -362,7 +373,7 @@ greps, Task 6, and the diff review.
     `supported: false, systemProxy: .off, hosts: 0, flows: 0` → `advice.map(\.kind) == [.systemProxy, .scope]`;
     `systemProxy: .off, .capturing, hosts: 2, flows: 3` → `banner == nil`, `anyOpen == true`;
     `both("127.0.0.1", 9090), .capturing, hosts: 2, flows: 3` → `banner == nil`;
-    `both("127.0.0.1", 8080), .capturing, hosts: 0, flows: 3` → `banner == nil`, `advice.map(\.kind) == [.allApps]`;
+    `both("127.0.0.1", 8080), .capturing, hosts: 0, flows: 3` → `banner == nil`, `advice.map(\.kind) == [.scope]` (All Apps is open under `.capturing`; only the Scope fact is closed);
     `bus: .disconnected, systemProxy: .off, .capturing, hosts: 0` → `advice == []`, `banner == nil`;
     `bus: .connected("x"), role: "agent", roleWarning: true, systemProxy: .off` → `advice == []` (lane not `.ok`);
     `kind: .external, bus: .connected("x"), role: "operator", .capturing, hosts: 2, systemProxy: .off` → `routes.allApps == nil`, `advice.map(\.kind) == [.systemProxy]`;

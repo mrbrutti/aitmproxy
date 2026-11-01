@@ -990,7 +990,7 @@ Ordinals are the ids. Kit tests (literal strings), `L = "127.0.0.1:8080"`; TR-AC
    ["every proxy-aware app, regardless of Scope", "Only hosts in Scope are decrypted, on either route; every other HTTPS connection passes through as a TLS tunnel"]`;
    `advice[0].actions == []` (PR4 fills `.setSystemProxy`); `advice[1].actions == [.addScopeHost, .openScope]`;
    `routes.scope.state == "Nothing is decrypted until a host is in Scope."` (= its line);
-   `banner == nil`, `bannerAction == nil`; `anyOpen == true` (All Apps). The same with `flowCount: 6` → `advice == []` and
+   `banner == nil`, `bannerAction == nil`; `anyOpen == true` (All Apps). The same with `flowCount: 6` → `advice.map(\.kind) == [.systemProxy, .scope]` (advice lists closed facts regardless of rows; the empty-state view alone decides when to show it) and
    `banner == nil` (a route is open and the rows are readable); with `flowCount: 6, tunnelledFlowCount: 6`
    → `banner == "Nothing is decrypted until a host is in Scope."`; with `capability: .inactive, flowCount: 6` →
    `banner == "system proxy off · All Apps off · Nothing is decrypted until a host is in Scope."`, `bannerAction == .openCaptureSettings`
