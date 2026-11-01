@@ -285,11 +285,12 @@ mod tests {
         path: String,
         scheme: String,
         header_names: Vec<String>,
+        body: Vec<u8>,
     }
 
     type Seen = Arc<Mutex<Vec<SeenRequest>>>;
 
-    fn record(seen: &Seen, parts: &http::request::Parts) {
+    fn record(seen: &Seen, parts: &http::request::Parts, body: Vec<u8>) {
         if let Ok(mut log) = seen.lock() {
             log.push(SeenRequest {
                 method: parts.method.as_str().to_string(),
@@ -300,13 +301,16 @@ mod tests {
                     .keys()
                     .map(|k| k.as_str().to_string())
                     .collect(),
+                body,
             });
         }
     }
 
-    /// An h2 origin over one duplex half: record every stream it accepts and
-    /// answer it `200` with `body`. With `goaway`, it shuts the connection down
-    /// abruptly after the first stream, so the client's pooled handle goes bad.
+    /// An h2 origin over one duplex half: record every stream it accepts (head
+    /// and full request body) and answer it `200` with `body`. With `goaway`,
+    /// it shuts the connection down after the first stream, so the client's
+    /// pooled handle goes bad. Each stream runs on its own task so the accept
+    /// loop keeps driving the connection while a request body streams in.
     async fn h2_origin(io: DuplexStream, body: &'static [u8], seen: Seen, goaway: bool) {
         let Ok(mut conn) = h2::server::handshake(io).await else {
             return;
@@ -315,17 +319,22 @@ mod tests {
             let Ok((req, mut respond)) = accepted else {
                 break;
             };
-            let (parts, mut rbody) = req.into_parts();
-            while let Some(Ok(chunk)) = rbody.data().await {
-                let _ = rbody.flow_control().release_capacity(chunk.len());
-            }
-            record(&seen, &parts);
-            let Ok(resp) = http::Response::builder().status(200).body(()) else {
-                break;
-            };
-            if let Ok(mut send) = respond.send_response(resp, false) {
-                let _ = send.send_data(Bytes::from_static(body), true);
-            }
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let (parts, mut rbody) = req.into_parts();
+                let mut got = Vec::new();
+                while let Some(Ok(chunk)) = rbody.data().await {
+                    let _ = rbody.flow_control().release_capacity(chunk.len());
+                    got.extend_from_slice(&chunk);
+                }
+                record(&seen, &parts, got);
+                let Ok(resp) = http::Response::builder().status(200).body(()) else {
+                    return;
+                };
+                if let Ok(mut send) = respond.send_response(resp, false) {
+                    let _ = send.send_data(Bytes::from_static(body), true);
+                }
+            });
             if goaway {
                 // GOAWAY once this stream has been answered: the response the
                 // client is already waiting for still arrives, and the
@@ -358,23 +367,75 @@ mod tests {
         let _ = send.send_data(Bytes::new(), true);
     }
 
-    /// An h2 origin that answers one stream with a `total`-byte body.
+    /// An h2 origin that answers its first stream with a `total`-byte body and
+    /// every later stream with a small `200 hi`, so a test can check that the
+    /// connection is still usable after the client cut the big one short.
     async fn streaming_h2_origin(io: DuplexStream, total: usize) {
         let Ok(mut conn) = h2::server::handshake(io).await else {
             return;
         };
-        let pumping = match conn.accept().await {
-            Some(Ok((_req, mut respond))) => http::Response::builder()
-                .status(200)
-                .body(())
-                .ok()
-                .and_then(|resp| respond.send_response(resp, false).ok())
-                .map(|send| tokio::spawn(pump(send, total))),
-            _ => None,
-        };
-        while conn.accept().await.is_some() {}
+        let mut pumping = None;
+        while let Some(accepted) = conn.accept().await {
+            let Ok((_req, mut respond)) = accepted else {
+                break;
+            };
+            let Ok(resp) = http::Response::builder().status(200).body(()) else {
+                break;
+            };
+            let Ok(mut send) = respond.send_response(resp, false) else {
+                break;
+            };
+            if pumping.is_none() {
+                pumping = Some(tokio::spawn(pump(send, total)));
+            } else {
+                let _ = send.send_data(Bytes::from_static(b"hi"), true);
+            }
+        }
         if let Some(task) = pumping {
             task.abort();
+        }
+    }
+
+    /// An h2 origin that starts answering its first stream and then drops the
+    /// whole connection with the body still open — a peer dying mid-stream.
+    async fn h2_origin_dropping_mid_body(io: DuplexStream) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        let Some(Ok((_req, mut respond))) = conn.accept().await else {
+            return;
+        };
+        let Ok(resp) = http::Response::builder().status(200).body(()) else {
+            return;
+        };
+        let Ok(mut send) = respond.send_response(resp, false) else {
+            return;
+        };
+        let _ = send.send_data(Bytes::from_static(b"partial"), false);
+        // Drive the connection briefly so the head and the partial frame are
+        // actually written, then hang up without ending the stream.
+        let _ = tokio::time::timeout(Duration::from_millis(50), conn.accept()).await;
+        drop(send);
+        drop(conn);
+    }
+
+    /// An h2 origin that answers every stream `200`, body `hello`, and a trailer
+    /// section `x-sum: abc`.
+    async fn h2_origin_with_trailers(io: DuplexStream) {
+        let Ok(mut conn) = h2::server::handshake(io).await else {
+            return;
+        };
+        while let Some(Ok((_req, mut respond))) = conn.accept().await {
+            let Ok(resp) = http::Response::builder().status(200).body(()) else {
+                break;
+            };
+            let Ok(mut send) = respond.send_response(resp, false) else {
+                break;
+            };
+            let _ = send.send_data(Bytes::from_static(b"hello"), false);
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("x-sum", http::HeaderValue::from_static("abc"));
+            let _ = send.send_trailers(trailers);
         }
     }
 
@@ -431,6 +492,24 @@ mod tests {
                 .pop_front()
                 .map(|s| Box::new(s) as Box<dyn ProbeStream>);
             Box::pin(async move { next.ok_or_else(|| anyhow!("the dialer ran out of streams")) })
+        }
+    }
+
+    /// A dialer that takes `latency` to connect (virtual time under a paused
+    /// clock), so a connect + handshake costs time the way a real TCP dial does.
+    struct SlowDialer {
+        inner: Arc<DuplexDialer>,
+        latency: Duration,
+    }
+
+    impl Dialer for SlowDialer {
+        fn dial(&self, addr: SocketAddr) -> BoxFuture<'static, Result<Box<dyn ProbeStream>>> {
+            let latency = self.latency;
+            let next = self.inner.dial(addr);
+            Box::pin(async move {
+                tokio::time::sleep(latency).await;
+                next.await
+            })
         }
     }
 
@@ -686,5 +765,306 @@ mod tests {
             "error was {err}"
         );
         origin.abort();
+    }
+
+    // ---- Tester pass (plan 2026-10-31-aitmproxy-scanner-v2-t3, Tasks 1 + 3) ---
+
+    /// The request body goes out intact over h2, through `send_body`'s
+    /// flow-control loop: 200 KiB is larger than the 64 KiB initial window, so
+    /// the sender must wait for `WINDOW_UPDATE`s rather than send once.
+    #[tokio::test]
+    async fn an_h2_request_body_reaches_the_origin_intact() {
+        let (client, server) = duplex(64 * 1024);
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let origin = tokio::spawn(h2_origin(server, b"ok", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = sender_with(dialer.clone());
+
+        let payload: Vec<u8> = (0..200 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut req = h2c_get("/upload");
+        req.method = "POST".into();
+        req.body = Body::Bytes(payload.clone());
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the POST over h2c succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"ok".to_vec());
+
+        let log = seen.lock().expect("seen").clone();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].method, "POST");
+        assert_eq!(log[0].path, "/upload");
+        assert_eq!(log[0].body.len(), payload.len(), "body length on the wire");
+        assert!(log[0].body == payload, "body bytes on the wire differ");
+        drop(sender);
+        origin.abort();
+    }
+
+    /// Plan Task 3 item 3: trailers are collected into `HttpResponse.trailers`
+    /// and never merged into the headers.
+    #[tokio::test]
+    async fn h2_response_trailers_are_returned_separately_from_headers() {
+        let (client, server) = duplex(64 * 1024);
+        let origin = tokio::spawn(h2_origin_with_trailers(server));
+
+        let pool = H2Pool::new();
+        let resp = exchange(
+            &pool,
+            Box::new(client),
+            "origin.test:443",
+            &https_get("/t"),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("the h2 exchange succeeds");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"hello".to_vec());
+        assert_eq!(resp.trailers.get("x-sum"), Some("abc"));
+        assert_eq!(
+            resp.headers.get("x-sum"),
+            None,
+            "a trailer is never merged into the headers"
+        );
+        origin.abort();
+    }
+
+    /// Connection drop mid-stream: the send that was on the wire fails (as a
+    /// transport error, not `h2_not_negotiated`), the dead connection is
+    /// forgotten, and the next send redials. No retry inside the sender.
+    #[tokio::test]
+    async fn a_connection_dropped_mid_body_fails_that_send_and_is_forgotten() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let first = tokio::spawn(h2_origin_dropping_mid_body(server1));
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let second = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        let sender = sender_with(dialer.clone());
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/drop"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("a connection that dies mid-body fails the send");
+        assert!(
+            !crate::sender::is_h2_not_negotiated(&err),
+            "a transport failure must not be classified as a version failure: {err}"
+        );
+        assert_eq!(dialer.calls(), 1, "the failing send itself never redials");
+        let _ = first.await;
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/again"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the next send redials and succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"hi".to_vec());
+        assert_eq!(
+            dialer.calls(),
+            2,
+            "the dead connection was dropped from the pool and redialled"
+        );
+        drop(sender);
+        second.abort();
+    }
+
+    /// Oversized input: after the 16 MiB cap cut a body short, the pooled
+    /// connection is still usable — the next send rides it without a redial.
+    #[tokio::test]
+    async fn a_capped_h2_body_leaves_the_pooled_connection_usable() {
+        let (client, server) = duplex(64 * 1024);
+        let origin = tokio::spawn(streaming_h2_origin(server, 17 * 1024 * 1024));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = sender_with(dialer.clone());
+
+        let big = tokio::time::timeout(
+            Duration::from_secs(60),
+            sender.send_with(&h2c_get("/big"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the capped exchange succeeds");
+        assert_eq!(big.status, 200);
+        assert_eq!(big.body.buffered_len(), Some(16 * 1024 * 1024));
+
+        let small = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&h2c_get("/small"), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the pooled connection still carries a stream after a capped body");
+        assert_eq!(small.status, 200);
+        assert_eq!(body_bytes(&small), b"hi".to_vec());
+        assert_eq!(dialer.calls(), 1, "no redial after the cap");
+        drop(sender);
+        origin.abort();
+    }
+
+    /// `MAX_POOLED_AUTHORITIES`: the authority past the cap is still served, on
+    /// a fresh connection each time, while the first authority stays pooled.
+    #[tokio::test]
+    async fn the_pool_remembers_at_most_max_pooled_authorities() {
+        let n = MAX_POOLED_AUTHORITIES + 1;
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let mut clients = VecDeque::new();
+        let mut origins = Vec::new();
+        // One stream per authority, plus one for the unpooled authority's redial.
+        for _ in 0..=n {
+            let (client, server) = duplex(64 * 1024);
+            clients.push_back(client);
+            origins.push(tokio::spawn(h2_origin(server, b"hi", seen.clone(), false)));
+        }
+        let dialer = Arc::new(DuplexDialer::new(clients));
+        let sender = sender_with(dialer.clone());
+
+        let send = |authority: String| {
+            let sender = &sender;
+            async move {
+                let req = get("http", &authority, "/");
+                let resp = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    sender.send_with(&req, VersionPolicy::H2c),
+                )
+                .await
+                .expect("the send finished within the guard")
+                .expect("the h2c exchange succeeds");
+                assert_eq!(resp.status, 200);
+            }
+        };
+
+        for i in 1..=n {
+            send(format!("a{i}.test:80")).await;
+        }
+        assert_eq!(dialer.calls(), n, "one dial per new authority");
+
+        // The authority past the cap was served but not remembered.
+        send(format!("a{n}.test:80")).await;
+        assert_eq!(
+            dialer.calls(),
+            n + 1,
+            "the {n}th authority was not pooled and had to redial"
+        );
+
+        // The first authority is still pooled.
+        send("a1.test:80".to_string()).await;
+        assert_eq!(
+            dialer.calls(),
+            n + 1,
+            "the first authority reused its connection"
+        );
+        assert_eq!(seen.lock().expect("seen").len(), n + 2);
+        drop(sender);
+        for origin in origins {
+            origin.abort();
+        }
+    }
+
+    /// The SSRF gate runs on every send, including one that would ride a
+    /// pooled h2 connection: a target that became forbidden between two sends
+    /// is refused before the pool is consulted, and no stream is opened.
+    #[tokio::test]
+    async fn the_ssrf_gate_runs_before_a_pooled_h2_connection_is_reused() {
+        use aitm_core::{ScopeEntry, ScopeRateGuard, SsrfPolicy, StdGuard};
+
+        let (client, server) = duplex(64 * 1024);
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let origin = tokio::spawn(h2_origin(server, b"hi", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let guard = Arc::new(StdGuard::default());
+        // The resolver answers loopback; scoping the literal lifts the block.
+        guard.add_scope(ScopeEntry {
+            host: "127.0.0.1".into(),
+        });
+        let sender = sender_with(dialer.clone()).with_ssrf(SsrfPolicy::default(), guard.clone());
+        let req = h2c_get("/a");
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("a scoped loopback literal passes the gate");
+        assert_eq!(resp.status, 200);
+        assert_eq!(dialer.calls(), 1);
+
+        assert!(guard.remove_scope("127.0.0.1"), "the entry was present");
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("the pooled connection must not bypass the SSRF gate");
+        assert!(err.to_string().contains("SSRF"), "error was {err}");
+        assert_eq!(dialer.calls(), 1, "a refused send never dials");
+        assert_eq!(
+            seen.lock().expect("seen").len(),
+            1,
+            "no stream was opened for the refused send"
+        );
+        drop(sender);
+        origin.abort();
+    }
+
+    /// D8.2 "closed on error": an exchange that fails while the connection is
+    /// still open (a stream the origin never answers, timed out) must drop the
+    /// connection from the pool, so the next send redials instead of reusing a
+    /// peer that just stalled. Virtual time: the 5 s response timeout elapses
+    /// without a real wait.
+    #[tokio::test(start_paused = true)]
+    #[ignore = "defect D1 (tester pass over tasks 1+3): the sender's whole-exchange timeout fires before h2_sender::exchange_pooled's and drops it before `pool.remove`, so a stalled connection stays pooled and every later send to the authority times out on it; un-ignore with the fix"]
+    async fn a_timed_out_exchange_drops_the_still_open_connection_from_the_pool() {
+        let (client1, server1) = duplex(64 * 1024);
+        let (client2, server2) = duplex(64 * 1024);
+        let silent = tokio::spawn(silent_h2_origin(server1));
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let healthy = tokio::spawn(h2_origin(server2, b"hi", seen.clone(), false));
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client1, client2])));
+        // A 10 ms dial, as a real TCP connect costs: the sender's whole-exchange
+        // deadline is then earlier than the h2 layer's own, as in production.
+        let slow = Arc::new(SlowDialer {
+            inner: dialer.clone(),
+            latency: Duration::from_millis(10),
+        });
+        let sender = HttpSender::new()
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(slow)
+            .with_response_timeout(Duration::from_secs(5));
+
+        let err = sender
+            .send_with(&h2c_get("/hang"), VersionPolicy::H2c)
+            .await
+            .expect_err("an origin that never answers must time the exchange out");
+        assert!(err.to_string().contains("timed out"), "error was {err}");
+        assert_eq!(dialer.calls(), 1);
+
+        let resp = sender
+            .send_with(&h2c_get("/next"), VersionPolicy::H2c)
+            .await
+            .expect("the next send redials a healthy origin");
+        assert_eq!(resp.status, 200);
+        assert_eq!(body_bytes(&resp), b"hi".to_vec());
+        assert_eq!(
+            dialer.calls(),
+            2,
+            "the stalled connection was dropped from the pool, not reused"
+        );
+        drop(sender);
+        silent.abort();
+        healthy.abort();
     }
 }

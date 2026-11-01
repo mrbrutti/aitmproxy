@@ -948,6 +948,13 @@ mod tests {
     /// It returns once the client closes the connection, so a test awaits it
     /// after dropping the sender.
     async fn tls_h2_origin(io: DuplexStream, alpn: &[&[u8]]) -> OriginLog {
+        tls_h2_origin_for(io, alpn, usize::MAX).await
+    }
+
+    /// [`tls_h2_origin`] that sends `GOAWAY` once it has answered `max_streams`
+    /// streams, so the client's pooled handle to it goes stale while the ALPN
+    /// cache still says `H2`. Returns once the connection has closed.
+    async fn tls_h2_origin_for(io: DuplexStream, alpn: &[&[u8]], max_streams: usize) -> OriginLog {
         let Ok(start) =
             tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io).await
         else {
@@ -974,6 +981,7 @@ mod tests {
             };
         };
         let mut request = Vec::new();
+        let mut answered = 0usize;
         while let Some(Ok((req, mut respond))) = conn.accept().await {
             let (parts, _body) = req.into_parts();
             request = format!("{} {}", parts.method, parts.uri.path()).into_bytes();
@@ -981,6 +989,12 @@ mod tests {
                 if let Ok(mut send) = respond.send_response(resp, false) {
                     let _ = send.send_data(bytes::Bytes::from_static(b"hi"), true);
                 }
+            }
+            answered += 1;
+            if answered >= max_streams {
+                // The answer already queued still goes out; the connection then
+                // closes, and `accept` returns `None` once it has.
+                conn.graceful_shutdown();
             }
         }
         OriginLog {
@@ -1093,7 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn forced_h2_on_an_h1_only_origin_is_h2_not_negotiated() {
-        let (_sender, mut results, logs, _dialer) =
+        let (sender, mut results, logs, _dialer) =
             tls_sends(&[b"http/1.1"], VersionPolicy::H2, 1).await;
         assert_eq!(logs[0].alpn, vec!["h2".to_string()]);
         let err = results.remove(0).expect_err("forced h2 cannot be served");
@@ -1106,11 +1120,25 @@ mod tests {
             "error was {err}"
         );
         assert!(is_h2_not_negotiated(&err), "error was {err}");
+        // A rustls server with its own ALPN list answers a ClientHello that
+        // overlaps none of it with a fatal `no_application_protocol` alert, so
+        // this case exercises the handshake-*failure* mapping (plan Task 1
+        // item 8), not the completed-handshake arm. Pin the detail so the two
+        // paths cannot be confused.
+        assert!(
+            err.to_string().contains("no_application_protocol"),
+            "error was {err}"
+        );
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            None,
+            "a forced send must never write the ALPN cache"
+        );
     }
 
     #[tokio::test]
     async fn forced_h2_on_a_server_without_alpn_is_h2_not_negotiated() {
-        let (_sender, mut results, logs, _dialer) = tls_sends(&[], VersionPolicy::H2, 1).await;
+        let (sender, mut results, logs, _dialer) = tls_sends(&[], VersionPolicy::H2, 1).await;
         assert_eq!(logs[0].alpn, vec!["h2".to_string()]);
         let err = results.remove(0).expect_err("forced h2 cannot be served");
         assert!(
@@ -1122,6 +1150,60 @@ mod tests {
             "error was {err}"
         );
         assert!(is_h2_not_negotiated(&err), "error was {err}");
+        // A server with no ALPN list completes the handshake without selecting
+        // a protocol: the completed-handshake arm, with its own detail.
+        assert!(
+            err.to_string().contains("no ALPN protocol"),
+            "error was {err}"
+        );
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            None,
+            "a forced send must never write the ALPN cache"
+        );
+    }
+
+    #[test]
+    fn send_error_displays_the_wire_prefix_exactly() {
+        let err = SendError::H2NotNegotiated {
+            authority: "ex.test:443".into(),
+            detail: "nope".into(),
+        };
+        assert_eq!(err.to_string(), "h2_not_negotiated: ex.test:443: nope");
+        let as_anyhow: anyhow::Error = err.into();
+        assert_eq!(
+            as_anyhow.to_string(),
+            "h2_not_negotiated: ex.test:443: nope",
+            "the anyhow conversion keeps the prefix at the front"
+        );
+    }
+
+    #[test]
+    fn is_h2_not_negotiated_walks_a_context_wrapped_chain() {
+        let typed: anyhow::Error = SendError::H2NotNegotiated {
+            authority: "ex.test:443".into(),
+            detail: "nope".into(),
+        }
+        .into();
+        let wrapped = typed.context("probe 3 of 7 failed");
+        assert!(
+            !wrapped.to_string().starts_with("h2_not_negotiated:"),
+            "precondition: the context hides the prefix from Display: {wrapped}"
+        );
+        assert!(
+            is_h2_not_negotiated(&wrapped),
+            "the typed link deeper in the chain must still classify: {wrapped}"
+        );
+
+        let round_tripped =
+            anyhow!("h2_not_negotiated: ex.test:443: nope").context("command failed");
+        assert!(
+            is_h2_not_negotiated(&round_tripped),
+            "the string link deeper in the chain must still classify: {round_tripped}"
+        );
+
+        let unrelated = anyhow!("connection reset by peer").context("probe 3 of 7 failed");
+        assert!(!is_h2_not_negotiated(&unrelated), "{unrelated}");
     }
 
     #[tokio::test]
@@ -1272,5 +1354,219 @@ mod tests {
             sender.negotiated_for("origin.test:443"),
             Some(Negotiated::H1)
         );
+    }
+
+    // ---- Tester pass (plan 2026-10-31-aitmproxy-scanner-v2-t3, Tasks 1 + 3) ---
+
+    /// Session call S2: on an `https://` origin `H2c` behaves exactly as `H2` —
+    /// it offers only `h2` and fails as `h2_not_negotiated` when refused.
+    #[tokio::test]
+    async fn h2c_on_an_https_h1_only_origin_fails_like_forced_h2() {
+        let (sender, mut results, logs, dialer) =
+            tls_sends(&[b"http/1.1"], VersionPolicy::H2c, 1).await;
+        assert_eq!(
+            logs[0].alpn,
+            vec!["h2".to_string()],
+            "h2c over TLS offers only h2"
+        );
+        let err = results
+            .remove(0)
+            .expect_err("h2c over TLS cannot be served by an h1 origin");
+        assert!(
+            err.to_string().starts_with("h2_not_negotiated:"),
+            "error was {err}"
+        );
+        assert!(is_h2_not_negotiated(&err), "error was {err}");
+        assert_eq!(dialer.calls(), 1, "h2c over TLS dials and runs ALPN");
+        assert_eq!(sender.negotiated_for("origin.test:443"), None);
+    }
+
+    /// Session call S2, the positive half: `H2c` on an `https://` h2 origin runs
+    /// TLS + ALPN and speaks h2, instead of blasting the cleartext preface.
+    #[tokio::test]
+    async fn h2c_on_an_https_h2_origin_speaks_h2_over_tls() {
+        let (client, server) = duplex(64 * 1024);
+        let origin =
+            tokio::spawn(async move { tls_h2_origin(server, &[b"h2", b"http/1.1"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&https_get(), VersionPolicy::H2c),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("h2c on an https origin negotiates h2 over TLS");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.version, aitm_core::HttpVersion::H2);
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            None,
+            "a forced h2c send must not write the ALPN cache"
+        );
+        drop(sender);
+        let log = tokio::time::timeout(Duration::from_secs(10), origin)
+            .await
+            .expect("the origin finished within the guard")
+            .expect("origin task");
+        assert_eq!(log.alpn, vec!["h2".to_string()]);
+        assert_eq!(String::from_utf8_lossy(&log.request), "GET /x");
+    }
+
+    /// Plan Task 1 item 4: an `Auto` send with a cached `Negotiated::H2` offers
+    /// only `h2`. When the origin has since dropped to h1-only (and the pooled
+    /// connection is gone), that send fails as `h2_not_negotiated` and the stale
+    /// entry stays until the TTL expires — the behaviour the plan describes;
+    /// the scanner's probe-error ladder owns what happens next.
+    #[tokio::test]
+    async fn a_stale_h2_cache_entry_makes_auto_offer_only_h2_and_fail_as_h2_not_negotiated() {
+        let (first_client, first_server) = duplex(64 * 1024);
+        let first =
+            tokio::spawn(
+                async move { tls_h2_origin_for(first_server, &[b"h2", b"http/1.1"], 1).await },
+            );
+        let (second_client, second_server) = duplex(64 * 1024);
+        let second =
+            tokio::spawn(
+                async move { tls_origin(second_server, &[b"http/1.1"], RESPONSE_200).await },
+            );
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([
+            first_client,
+            second_client,
+        ])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+        let req = https_get();
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the send finished within the guard")
+            .expect("the first auto exchange speaks h2");
+        assert_eq!(resp.version, aitm_core::HttpVersion::H2);
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            Some(Negotiated::H2)
+        );
+
+        // The origin sent GOAWAY and closed; let the client's connection task
+        // observe that before the next send looks in the pool.
+        let first_log = tokio::time::timeout(Duration::from_secs(10), first)
+            .await
+            .expect("the first origin finished within the guard")
+            .expect("first origin task");
+        assert_eq!(
+            first_log.alpn,
+            vec!["h2".to_string(), "http/1.1".to_string()]
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let err = tokio::time::timeout(Duration::from_secs(10), sender.send(&req))
+            .await
+            .expect("the send finished within the guard")
+            .expect_err("an h1-only origin cannot serve the cached h2 offer");
+        assert!(is_h2_not_negotiated(&err), "error was {err}");
+        assert!(
+            err.to_string().contains("no_application_protocol"),
+            "error was {err}"
+        );
+        assert_eq!(
+            dialer.calls(),
+            2,
+            "the dead pooled connection was redialled, not reused"
+        );
+        let second_log = second.await.expect("second origin task");
+        assert_eq!(
+            second_log.alpn,
+            vec!["h2".to_string()],
+            "a cached H2 makes Auto offer only h2"
+        );
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            Some(Negotiated::H2),
+            "a failed handshake does not rewrite the cache; the entry ages out with the TTL"
+        );
+    }
+
+    /// Invalid TLS: a certificate the verifying sender rejects is a TLS error
+    /// named after the host, never `h2_not_negotiated` — a probe that failed on
+    /// trust must not be counted as a version-negotiation failure.
+    #[tokio::test]
+    async fn a_certificate_failure_is_not_classified_as_h2_not_negotiated() {
+        let (client, server) = duplex(64 * 1024);
+        let origin =
+            tokio::spawn(async move { tls_h2_origin(server, &[b"h2", b"http/1.1"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        // No `with_insecure`: the self-signed `origin.test` leaf must be refused.
+        let sender = HttpSender::new()
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&https_get(), VersionPolicy::H2),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect_err("a self-signed leaf must fail verification");
+        assert!(
+            !is_h2_not_negotiated(&err),
+            "a trust failure was classified as a version failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("TLS to origin.test"),
+            "error was {err}"
+        );
+        assert_eq!(sender.negotiated_for("origin.test:443"), None);
+        drop(sender);
+        let log = tokio::time::timeout(Duration::from_secs(10), origin)
+            .await
+            .expect("the origin finished within the guard")
+            .expect("origin task");
+        assert_eq!(log.alpn, vec!["h2".to_string()], "the ClientHello went out");
+        assert!(
+            log.request.is_empty(),
+            "no request may reach an origin whose certificate failed"
+        );
+    }
+
+    /// Malformed input: an empty authority is refused before any resolve or dial.
+    #[tokio::test]
+    async fn an_empty_authority_is_refused_before_dialing() {
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::new()));
+        let sender = HttpSender::new()
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+        let req = HttpRequest {
+            authority: String::new(),
+            ..https_get()
+        };
+        let err = sender
+            .send(&req)
+            .await
+            .expect_err("an empty authority cannot be sent");
+        assert!(err.to_string().contains("bad authority"), "error was {err}");
+        assert!(!is_h2_not_negotiated(&err), "error was {err}");
+        assert_eq!(dialer.calls(), 0);
+    }
+
+    /// Oversized input on the h1 path: a 17 MiB `Content-Length` body is
+    /// truncated to the 16 MiB cap (D8.2 "response caps stay"), and the
+    /// exchange still completes.
+    #[tokio::test]
+    async fn drive_caps_an_h1_body_at_16_mib() {
+        let total = MAX_RESPONSE_BYTES + 1024 * 1024;
+        let mut segment =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n").into_bytes();
+        segment.resize(segment.len() + total, b'a');
+        let (result, _) = exchange(get_x(), vec![segment]).await;
+        let resp = result.expect("the capped exchange succeeds");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body.buffered_len(), Some(MAX_RESPONSE_BYTES));
     }
 }
