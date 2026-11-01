@@ -464,6 +464,19 @@ pub fn parse_result<T: serde::de::DeserializeOwned>(
     })
 }
 
+/// Whether `s` is a job id in its wire form: `scan-` followed by exactly eight
+/// lowercase hex digits (spec D6, hostile-core bounds). An id from a push
+/// line or a `scan.list` row is used as a tag key, an argument and an
+/// `inflight` entry only when this holds; the rest are ignored.
+pub fn is_job_id(s: &str) -> bool {
+    s.strip_prefix("scan-").is_some_and(|hex| {
+        hex.len() == 8
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 /// The tag of a keyed tagged call: `<verb>:<key>` (spec D5).
 pub fn tag_keyed(verb: &str, key: &str) -> String {
     format!("{verb}:{key}")

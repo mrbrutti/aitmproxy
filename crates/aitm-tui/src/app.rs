@@ -28,7 +28,7 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    parse_result, step, tag_keyed, tag_parts, ScanError, ScanOffer, ScanState, ScanTab,
+    is_job_id, parse_result, step, tag_keyed, tag_parts, ScanError, ScanOffer, ScanState, ScanTab,
     LIST_POLL_TICKS, NO_SCANNER, OTHER_JOB, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
@@ -3942,6 +3942,11 @@ impl App {
     /// which `scan.status` refreshes, so it never needs `scan.issues`).
     fn on_job_line(&mut self, line: &JobNotification, out: &mut Vec<BusRequest>) {
         let job = line.job.as_str();
+        // D6 hostile-core bound: a malformed id never becomes a tag key, an
+        // argument or an `inflight` entry.
+        if !is_job_id(job) {
+            return;
+        }
         self.scan_poll(
             tag_keyed("scan.status", job),
             "scan.status",

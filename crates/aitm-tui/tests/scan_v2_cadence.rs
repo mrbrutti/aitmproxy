@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use aitm_tui::action::{Action, BusEvent, BusRequest};
 use aitm_tui::app::App;
 use aitm_tui::caps::TermCaps;
+use aitm_tui::scan::is_job_id;
 use common::*;
 use serde_json::{json, Value};
 
@@ -248,5 +249,60 @@ fn a_status_reply_naming_another_job_is_not_folded() {
     assert!(
         app.scan.inflight.is_empty(),
         "the tag is settled even when the reply is refused"
+    );
+}
+
+/// D6 hostile-core bounds (fix round B, B4): a push line whose job id is not
+/// `scan-` + eight lowercase hex digits is dropped, so a forged id never
+/// becomes a tag key, an argument or an `inflight` entry.
+#[test]
+fn a_push_line_with_a_forged_job_id_is_dropped() {
+    let mut app = app();
+    let mut params = fixture("job.progress.json");
+    params["job"] = json!("scan-../../x");
+    let reqs = app.on_bus(BusEvent::Notification(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/aitm/job",
+        "params": params,
+    })));
+    assert!(reqs.is_empty(), "a forged id yields no request: {reqs:?}");
+    assert!(app.scan.inflight.is_empty());
+    assert!(
+        !app.flows_dirty,
+        "a job line never marks the flow list dirty"
+    );
+
+    assert!(is_job_id("scan-1a2b3c4d"));
+    assert!(
+        !is_job_id("scan-1A2B3C4D"),
+        "upper case is not the wire form"
+    );
+    assert!(!is_job_id("scan-1a2b3c4"), "seven digits");
+    assert!(!is_job_id("scan-1a2b3c4d5"), "nine digits");
+    assert!(!is_job_id("scan-../../x"));
+    assert!(!is_job_id(""));
+}
+
+/// D6 hostile-core bounds (fix round B, B4): a `scan.list` row with a forged
+/// id is skipped; the well-formed rows are folded and polled as before.
+#[test]
+fn a_list_row_with_a_forged_job_id_is_skipped() {
+    let mut app = app();
+    let mut list = fixture("scan.list.json");
+    list["jobs"][1]["job"] = json!("scan-ZZZZZZZZ");
+    let reqs = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: list,
+    });
+    assert_eq!(app.scan.jobs.order, vec![JOB.to_string()]);
+    assert_eq!(app.scan.jobs.summaries.len(), 1);
+    assert_eq!(
+        reqs,
+        vec![BusRequest::CallTagged {
+            tag: format!("scan.status:{JOB}"),
+            name: "scan.status".into(),
+            args: json!({ "job": JOB }),
+        }]
     );
 }

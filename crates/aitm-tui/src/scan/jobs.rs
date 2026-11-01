@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 
 use aitm_scan_model::{JobId, JobState, JobStatus, JobSummary, ListResult, Phase};
 
+use super::is_job_id;
+
 /// Which pane of the Jobs tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum JobPane {
@@ -55,7 +57,10 @@ impl JobsState {
     /// entry that is not terminal": a launch (Task 12) folds its `StartResult`
     /// status into `full` before any list carries it, while a forgotten job
     /// only ever reaches a terminal state before it leaves the retained list.
-    pub fn fold_list(&mut self, list: ListResult) -> Vec<JobId> {
+    pub fn fold_list(&mut self, mut list: ListResult) -> Vec<JobId> {
+        // D6 hostile-core bound: a row whose id is not in the wire form is
+        // skipped, never polled or listed.
+        list.jobs.retain(|j| is_job_id(&j.job));
         let listed: Vec<JobId> = list.jobs.iter().map(|j| j.job.clone()).collect();
         let kept: Vec<JobId> = self
             .order
