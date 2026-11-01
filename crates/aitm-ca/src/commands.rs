@@ -29,8 +29,8 @@ use crate::audit::{now_rfc3339, AuditLog, AuditRecord, FileAuditLog};
 use crate::cert::CaCert;
 use crate::exec::{DryRunExecutor, Executor, RealExecutor};
 use crate::store::{
-    store_for, unsupported_message, LinuxFamily, Platform, Scope, TrustError, TrustErrorKind,
-    DEBIAN_ANCHOR_DIR, FEDORA_ANCHOR_DIR,
+    store_for, trust_statuses, unsupported_message, LinuxFamily, Platform, Scope, TrustError,
+    TrustErrorKind, DEBIAN_ANCHOR_DIR, FEDORA_ANCHOR_DIR,
 };
 
 /// On every `ca.status` answer and in every prompt: the embedded engine does
@@ -633,14 +633,12 @@ impl Command for Status {
                 detail.push(unsupported_message(os, &cert.path));
             }
             (Some(cert), _) => {
-                let store = store_for(&platform);
-                for scope in platform.scopes() {
-                    let st = store.status(cert, *scope, shared.exec())?;
+                for st in trust_statuses(cert, &platform, shared.exec())? {
                     let mut entry = BTreeMap::new();
                     entry.insert("installed".to_string(), str_value(st.installed.label()));
                     entry.insert("trusted".to_string(), str_value(st.trusted.label()));
                     entry.insert("location".to_string(), str_value(st.location));
-                    stores.insert(scope.label().to_string(), Value::Object(entry));
+                    stores.insert(st.scope.label().to_string(), Value::Object(entry));
                     for line in st.detail {
                         if !detail.contains(&line) {
                             detail.push(line);

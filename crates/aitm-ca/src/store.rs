@@ -355,6 +355,25 @@ pub fn store_for(platform: &Platform) -> Box<dyn TrustStore> {
     }
 }
 
+/// What every trust store on `platform` says about `cert`, one
+/// [`StoreStatus`] per scope in [`Platform::scopes`] order (least privileged
+/// first); empty on an unsupported platform, which has no scopes. The one
+/// code path behind `ca.status` and the CLI's `checking CA trust` phase, so
+/// the two can never disagree on the word (CLI terminal reporting plan C16).
+/// Blocking: every store shells out to the OS tools through `exec`.
+pub fn trust_statuses(
+    cert: &CaCert,
+    platform: &Platform,
+    exec: &dyn Executor,
+) -> anyhow::Result<Vec<StoreStatus>> {
+    let store = store_for(platform);
+    platform
+        .scopes()
+        .iter()
+        .map(|scope| store.status(cert, *scope, exec))
+        .collect()
+}
+
 /// Why a store operation failed; the message carries the user-facing hint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrustErrorKind {
@@ -414,3 +433,49 @@ impl fmt::Display for TrustError {
 }
 
 impl std::error::Error for TrustError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::ScriptedExecutor;
+    use std::path::PathBuf;
+
+    /// A certificate by value: `trust_statuses` never reads it from disk.
+    fn cert() -> CaCert {
+        CaCert {
+            path: PathBuf::from("/ca/ca.crt"),
+            pem: String::new(),
+            der: Vec::new(),
+            sha256: [0; 32],
+            sha1: [0; 20],
+        }
+    }
+
+    #[test]
+    fn trust_statuses_on_an_unsupported_platform_is_empty() {
+        let exec = ScriptedExecutor::new();
+        let got =
+            trust_statuses(&cert(), &Platform::Unsupported("plan9".to_string()), &exec).unwrap();
+        assert_eq!(got, Vec::<StoreStatus>::new());
+        assert!(exec.runs().is_empty(), "ran {:?}", exec.runs());
+        assert!(exec.reads().is_empty(), "read {:?}", exec.reads());
+    }
+
+    #[test]
+    fn trust_statuses_visits_every_scope_in_platform_order() {
+        // macOS has two scopes, user first (`Platform::scopes`); the scripted
+        // host answers every `security` query with exit 0 and no output, so
+        // each store reports the certificate absent.
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::MacOs, &exec).unwrap();
+        let scopes: Vec<Scope> = got.iter().map(|s| s.scope).collect();
+        assert_eq!(scopes, vec![Scope::User, Scope::System]);
+        assert!(got.iter().all(|s| s.trusted == Trust::No), "{got:?}");
+
+        // Linux has one scope.
+        let exec = ScriptedExecutor::new();
+        let got = trust_statuses(&cert(), &Platform::Linux(LinuxFamily::Debian), &exec).unwrap();
+        let scopes: Vec<Scope> = got.iter().map(|s| s.scope).collect();
+        assert_eq!(scopes, vec![Scope::System]);
+    }
+}
