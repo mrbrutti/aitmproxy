@@ -22,7 +22,7 @@
 //! probe cannot eat the whole per-check wall budget (spec D4).
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -239,9 +239,24 @@ fn baseline(services: &ScriptServices) -> ScriptResult<Map> {
 /// The keys `probe.raw(...)` accepts, for the error a typo gets.
 const RAW_KEYS: [&str; 4] = ["method", "url", "headers", "body"];
 
+/// The longest `method` `probe.raw` accepts, in bytes. The longest registered
+/// HTTP method is 17 bytes (`UPDATEREDIRECTREF`); 32 leaves room for a custom
+/// verb and nothing else.
+pub const RAW_METHOD_MAX_BYTES: usize = 32;
+
+/// The RFC 9110 `tchar` set less the alphanumerics: the only bytes a method may
+/// contain besides letters and digits.
+const TCHAR_PUNCT: &[u8] = b"!#$%&'*+-.^_`|~";
+
 /// `probe.raw(#{ method, url, headers, body })`: a request the check built
 /// itself, for a handshake or header check a payload-at-a-point cannot express.
 /// The host applies the same scope, budget and deadline rules as `probe.send`.
+///
+/// `method` defaults to `GET` and must otherwise be an RFC 9110 token: one to
+/// [`RAW_METHOD_MAX_BYTES`] bytes of letters, digits and ``!#$%&'*+-.^_`|~``.
+/// It is copied onto the wire as the request line's first word, so anything
+/// else — a space, a CR/LF that would start a second request on the
+/// connection, an empty string — is refused here by name.
 fn raw(services: &ScriptServices, req: Map) -> ScriptResult<Map> {
     if let Some(unknown) = req.keys().find(|k| !RAW_KEYS.contains(&k.as_str())) {
         return Err(error(format!(
@@ -251,7 +266,7 @@ fn raw(services: &ScriptServices, req: Map) -> ScriptResult<Map> {
     }
     let url = text_field(&req, "url")
         .ok_or_else(|| error("probe.raw(...) needs a 'url' like \"http://host/path\""))?;
-    let method = text_field(&req, "method").unwrap_or_else(|| "GET".to_string());
+    let method = raw_method(&req)?;
 
     let mut headers = Vec::new();
     if let Some(value) = req.get("headers").filter(|value| !value.is_unit()) {
@@ -292,6 +307,38 @@ fn raw(services: &ScriptServices, req: Map) -> ScriptResult<Map> {
     })
 }
 
+/// `probe.raw`'s `method`: `GET` when absent (or `()`), else the token the
+/// script gave, refused by name unless it is a well-formed one. Read directly
+/// rather than through [`text_field`], which treats an empty string as absent —
+/// an empty method is a mistake to report, not a GET.
+fn raw_method(req: &Map) -> ScriptResult<String> {
+    let Some(value) = req.get("method").filter(|value| !value.is_unit()) else {
+        return Ok("GET".to_string());
+    };
+    let text = value.read_lock::<ImmutableString>().ok_or_else(|| {
+        error(format!(
+            "probe.raw(...) 'method' must be a string, got a {}",
+            value.type_name()
+        ))
+    })?;
+    if is_http_token(&text) && text.len() <= RAW_METHOD_MAX_BYTES {
+        Ok(text.to_string())
+    } else {
+        Err(error(format!(
+            "probe.raw(...) 'method' must be an HTTP token (1 to {RAW_METHOD_MAX_BYTES} bytes of \
+             letters, digits and !#$%&'*+-.^_`|~), got {:?}",
+            text.as_str()
+        )))
+    }
+}
+
+/// Whether `s` is a non-empty RFC 9110 `token` (`1*tchar`).
+fn is_http_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || TCHAR_PUNCT.contains(&b))
+}
+
 /// A string field of a script-supplied map, when present and a string.
 fn text_field(map: &Map, key: &str) -> Option<String> {
     map.get(key)
@@ -311,6 +358,11 @@ fn text_field(map: &Map, key: &str) -> Option<String> {
 ///
 /// `status` and `flow_id` are `()` when the lane had none (an L4 probe has no
 /// status; an unrecorded probe has no flow).
+///
+/// Header names in `headers` are the wire names as the sender stored them —
+/// not re-cased here. A lane that holds its response in an `http::HeaderMap`
+/// has already normalised them to lower-case, so a script should index
+/// lower-case keys: `r.headers["content-type"]`, not `r.headers["Content-Type"]`.
 fn response_map(response: &ProbeResponse) -> Map {
     let mut out = Map::new();
     out.insert(
@@ -500,13 +552,25 @@ fn longer_delays_took_longer(requested_s: &[f32], observed_s: &[f32]) -> bool {
     true
 }
 
+/// The most of each input `levenshtein_ratio` compares: 32 KiB, cut on a char
+/// boundary. The inputs are target-controlled bodies (up to 1 MiB each) and the
+/// comparison runs natively on the worker thread, where neither the check
+/// budget nor `scan.cancel` can interrupt it, so the work must be bounded by
+/// construction rather than by the caller's good behaviour.
+pub const LEVENSHTEIN_MAX_BYTES: usize = 32 * 1024;
+
 /// How alike two strings are: `1 - distance / max(len)`, so `1.0` is identical
 /// (two empty strings included) and `0.0` shares nothing. The boolean-blind
 /// companion to [`timing_fit`]: a check compares a payloaded body against the
 /// baseline without shipping its own string metric.
+///
+/// **Bounded.** Only the first [`LEVENSHTEIN_MAX_BYTES`] of each input take
+/// part (cut on a char boundary); the ratio is over the compared prefixes. Two
+/// bodies that agree for 32 KiB and differ after are `1.0`. The script-facing
+/// `probe.levenshtein_ratio` is this function.
 pub fn levenshtein_ratio(a: &str, b: &str) -> f32 {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
+    let a: Vec<char> = capped(a).chars().collect();
+    let b: Vec<char> = capped(b).chars().collect();
     let longest = a.len().max(b.len());
     if longest == 0 {
         return 1.0;
@@ -515,19 +579,121 @@ pub fn levenshtein_ratio(a: &str, b: &str) -> f32 {
     1.0 - distance / longest as f32
 }
 
-/// Levenshtein edit distance over two character sequences, one row at a time.
-fn levenshtein(a: &[char], b: &[char]) -> usize {
-    let mut previous: Vec<usize> = (0..=b.len()).collect();
-    let mut current = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        current[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let substitution = previous[j] + usize::from(ca != cb);
-            current[j + 1] = substitution.min(previous[j + 1] + 1).min(current[j] + 1);
-        }
-        std::mem::swap(&mut previous, &mut current);
+/// The first [`LEVENSHTEIN_MAX_BYTES`] of `s`, or all of it when shorter; the
+/// cut backs up to a char boundary so a multibyte char at the edge is dropped
+/// whole rather than split.
+fn capped(s: &str) -> &str {
+    if s.len() <= LEVENSHTEIN_MAX_BYTES {
+        return s;
     }
-    previous[b.len()]
+    let mut end = LEVENSHTEIN_MAX_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Levenshtein edit distance over two character sequences, by Myers' bit-parallel
+/// algorithm in Hyyrö's global-distance form.
+///
+/// The shorter sequence is the pattern, held as one bit per char across
+/// `⌈m / 64⌉` machine words; each char of the longer sequence then advances a
+/// whole column of the DP matrix in a handful of word operations. Time is
+/// `O(|long| · ⌈|short| / 64⌉)`, memory `O(|short|)`. At the
+/// [`LEVENSHTEIN_MAX_BYTES`] cap that is ~17 M word steps where the cell-by-cell
+/// two-row DP is ~1.1 G cell updates (measured 38 s unoptimized) — the
+/// difference between a bounded host call and one that holds the worker for a
+/// minute. The result is exactly the textbook distance;
+/// `tests/host_probe_bounds.rs::levenshtein_ratio_matches_the_textbook_distance`
+/// pins it against the full table, across word boundaries.
+fn levenshtein(a: &[char], b: &[char]) -> usize {
+    /// How often a char must occur in the pattern to earn a dense bit-row.
+    const DENSE_MIN: usize = 64;
+
+    let (pattern, text) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    let m = pattern.len();
+    if m == 0 {
+        return text.len();
+    }
+    let words = m.div_ceil(64);
+
+    // Where each char occurs in the pattern. A char that occurs at least
+    // `DENSE_MIN` times gets a ready-made bit-row (bit `i` set where
+    // `pattern[i] == c`); a rarer one is expanded into `sparse_row` on demand.
+    // Dense rows for every distinct char would let a body of ~16 k distinct
+    // chars cost ~32 MiB per call; this keeps the tables under 2 MiB at the cap
+    // while an expansion never costs more than a word-pass of the main loop.
+    let mut positions: HashMap<char, Vec<usize>> = HashMap::new();
+    for (i, c) in pattern.iter().enumerate() {
+        positions.entry(*c).or_default().push(i);
+    }
+    let mut dense: HashMap<char, Vec<u64>> = HashMap::new();
+    for (c, at) in &positions {
+        if at.len() >= DENSE_MIN {
+            let mut row = vec![0u64; words];
+            for &i in at {
+                row[i / 64] |= 1u64 << (i % 64);
+            }
+            dense.insert(*c, row);
+        }
+    }
+    let mut sparse_row = vec![0u64; words];
+
+    // Vertical positive/negative deltas down the column; `pv` all ones is the
+    // first column, `D[i][0] = i`. Bits above `m - 1` in the top word are never
+    // read: every step moves information upward only (carries, left shifts).
+    // Indexed loads and stores on purpose: in an unoptimized build (the test
+    // profile) the zipped-iterator form of this loop measured 5x slower.
+    let mut pv = vec![u64::MAX; words];
+    let mut mv = vec![0u64; words];
+    let last = words - 1;
+    let top = 1u64 << ((m - 1) % 64);
+    let mut score = m;
+
+    for c in text {
+        let eq: &[u64] = match dense.get(c) {
+            Some(row) => row,
+            None => {
+                sparse_row.fill(0);
+                if let Some(at) = positions.get(c) {
+                    for &i in at {
+                        sparse_row[i / 64] |= 1u64 << (i % 64);
+                    }
+                }
+                &sparse_row
+            }
+        };
+        let mut carry = false;
+        // The first row's horizontal delta is +1 (`D[0][j] = j`): this is what
+        // makes the figure a global distance rather than a substring search.
+        let mut ph_in = 1u64;
+        let mut mh_in = 0u64;
+        for k in 0..words {
+            let (eq_k, pv_k, mv_k) = (eq[k], pv[k], mv[k]);
+            let xv = eq_k | mv_k;
+            let (sum, carried_1) = (eq_k & pv_k).overflowing_add(pv_k);
+            let (sum, carried_2) = sum.overflowing_add(u64::from(carry));
+            carry = carried_1 || carried_2;
+            let xh = (sum ^ pv_k) | eq_k;
+            let ph = mv_k | !(xh | pv_k);
+            let mh = pv_k & xh;
+            if k == last {
+                if ph & top != 0 {
+                    score += 1;
+                } else if mh & top != 0 {
+                    score -= 1;
+                }
+            }
+            let (ph_out, mh_out) = (ph >> 63, mh >> 63);
+            let ph = (ph << 1) | ph_in;
+            let mh = (mh << 1) | mh_in;
+            ph_in = ph_out;
+            mh_in = mh_out;
+            pv[k] = mh | !(xv | ph);
+            mv[k] = ph & xv;
+        }
+    }
+    score
 }
 
 /// A catchable runtime error; the engine fills in the call position.
