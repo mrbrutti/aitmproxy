@@ -1,1 +1,13 @@
-//! The `resp` grammar (spec S3). Placeholder: filled by a later T6 task.
+//! The `resp` grammar (spec S3 row 2 (Redis RESP)). Stub: a later T6 task fills it.
+
+use std::sync::Arc;
+
+use crate::grammar::Grammar;
+use crate::grammars::Pending;
+use crate::spec::GrammarKind;
+
+/// The `resp` grammar, pending its own task.
+#[must_use]
+pub fn grammar() -> Arc<dyn Grammar> {
+    Pending::grammar(GrammarKind::Resp)
+}
