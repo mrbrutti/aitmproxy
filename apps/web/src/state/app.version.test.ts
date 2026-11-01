@@ -10,8 +10,8 @@ import { memoryBus, TEST_VERSION } from './bridgeBus.testkit';
  * The in-memory bus with `proxy.status` rewritten, standing in for cores that report another version
  * or none. It pushes nothing (like the /bus bridge), so the poll loop is the live source.
  */
-function withStatus(rewrite: (status: Record<string, unknown>) => Record<string, unknown>, address = '127.0.0.1:8082'): BusClient {
-  const mem = memoryBus({ address });
+function withStatus(rewrite: (status: Record<string, unknown>) => Record<string, unknown>): BusClient {
+  const mem = memoryBus();
   return {
     ...mem,
     async call<T>(tool: string, args: Record<string, unknown> = {}): Promise<T> {

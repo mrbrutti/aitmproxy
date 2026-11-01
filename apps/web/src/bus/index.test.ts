@@ -108,7 +108,9 @@ describe('createBus', () => {
   it('survives a malformed percent-encoding and an oversized token without throwing', () => {
     history.replaceState(null, '', '/#t=%E0%A4%A&expect=operator'); // a truncated UTF-8 sequence
     expect(() => build()).not.toThrow();
-    expect(sessionStorage.getItem('aitm.bus.token')).not.toBeNull();
+    // The literal `URLSearchParams` yields: `%E0%A4` is a truncated 3-byte sequence, so one U+FFFD;
+    // `%A` has a single hex digit, so it stays as typed. Stored as decoded, neither re-encoded nor dropped.
+    expect(sessionStorage.getItem('aitm.bus.token')).toBe('\uFFFD%A');
     sessionStorage.clear();
 
     const huge = 'x'.repeat(64 * 1024);

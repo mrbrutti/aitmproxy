@@ -100,10 +100,8 @@ export function flow(id: string, over: Partial<FlowWire> = {}): FlowWire {
 export interface MemoryBusOptions {
   /** The names `tools/list` returns. Default: every tool this bus answers, plus `flow.subscribe`. */
   tools?: string[];
-  /** Flows present before the first call, by their `id`. */
-  flows?: FlowWire[];
-  /** Written over the default `proxy.status` reply. */
-  status?: Record<string, unknown>;
+  /** Names appended to that catalogue: the tools a test's own host answers on top of the bus (`script.enable`, …). */
+  extraTools?: string[];
   /** What `script.list` returns. */
   scripts?: unknown[];
   address?: string;
@@ -117,7 +115,7 @@ export interface MemoryControls {
 }
 
 /** Every tool `memoryBus` answers; anything else throws `BusError`. */
-export const SERVED_TOOLS = ['flow.list', 'flow.get', 'flow.detail', 'flow.intercept', 'proxy.status', 'scope.list', 'agent.status', 'agent.activity', 'script.list', 'script.findings', 'poc.list'] as const;
+const SERVED_TOOLS = ['flow.list', 'flow.get', 'flow.detail', 'flow.intercept', 'proxy.status', 'scope.list', 'agent.status', 'agent.activity', 'script.list', 'script.findings', 'poc.list'] as const;
 
 /** A simulated loopback round trip on the fake clock, so loading states and in-flight counts are real. */
 const LATENCY_MS = 5;
@@ -130,13 +128,13 @@ const LATENCY_MS = 5;
  * role, and pushes nothing by itself.
  */
 export function memoryBus(opts: MemoryBusOptions = {}): BusClient & MemoryControls {
-  const flows = new Map<string, FlowWire>((opts.flows ?? []).map((f): [string, FlowWire] => [String(f.id), f]));
-  const catalogue: ToolDef[] = (opts.tools ?? [...SERVED_TOOLS, SUBSCRIBE.name]).map((name) =>
+  const flows = new Map<string, FlowWire>();
+  const catalogue: ToolDef[] = [...(opts.tools ?? [...SERVED_TOOLS, SUBSCRIBE.name]), ...(opts.extraTools ?? [])].map((name) =>
     name === SUBSCRIBE.name ? SUBSCRIBE : { name, description: `${name} (test bus)`, inputSchema: { type: 'object', properties: {} } },
   );
   const handlers = new Set<NotificationHandler>();
   const [state, setState] = createSignal<BusState>('open');
-  const [lastError] = createSignal<string | null>(null);
+  const lastError: Accessor<string | null> = () => null;
   const role: Accessor<BusRole | null> = () => 'operator';
   let armed = false;
 
@@ -156,7 +154,7 @@ export function memoryBus(opts: MemoryBusOptions = {}): BusClient & MemoryContro
         armed = typeof args.enabled === 'boolean' ? args.enabled : true;
         return armed;
       case 'proxy.status':
-        return { listening: true, address: '127.0.0.1:8080', capturing: true, intercept_armed: armed, paused: 0, flows: flows.size, version: TEST_VERSION, ...opts.status };
+        return { listening: true, address: '127.0.0.1:8080', capturing: true, intercept_armed: armed, paused: 0, flows: flows.size, version: TEST_VERSION };
       case 'scope.list':
         return [];
       case 'agent.status':
@@ -250,8 +248,8 @@ export type TestBus = BusClient &
  * injection, `flow.subscribe` advertised, and NO notifications of its own. It starts `open`;
  * `ctl.setState` plays out an outage.
  */
-export function bridgeBus(address = '127.0.0.1:8082'): TestBus {
-  const mem = memoryBus({ address });
+export function bridgeBus(): TestBus {
+  const mem = memoryBus();
   const calls: string[] = [];
   const log: { tool: string; args: Record<string, unknown> }[] = [];
   const peak = { detail: 0 };

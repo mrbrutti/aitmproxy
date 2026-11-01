@@ -301,10 +301,6 @@ export function createAppStore(bus: BusClient) {
       if (untrack(selectedId) === id) void loadDetail(id, true);
     }
 
-    function onFlowEvent(n: FlowNotification) {
-      onFlowTrigger(n);
-    }
-
     /**
      * A real bus: the push is a trigger, never data. The server's summary is the full `flow.get`
      * object (same keys, `kind:"websocket"`), but it is still not applied: refetching by id keeps
@@ -456,7 +452,7 @@ export function createAppStore(bus: BusClient) {
           // Validated before the clock moves: a malformed line proves nothing about the stream.
           if (!isFlowNotification(params)) break;
           lastFlowPushAt = Date.now();
-          onFlowEvent(params);
+          onFlowTrigger(params);
           break;
         case 'notifications/aitm/state':
           if ((params as { lagged?: unknown } | null | undefined)?.lagged === true) {

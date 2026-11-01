@@ -4,7 +4,7 @@ import { BusError, type BusClient, type ToolDef } from '~/bus/types';
 import { AppProvider } from '~/state/context';
 import { createAppStore } from '~/state/app';
 import { scriptsStore } from '~/panels/scripts/store';
-import { memoryBus, SERVED_TOOLS, SUBSCRIBE, TEST_VERSION } from '~/state/bridgeBus.testkit';
+import { memoryBus, TEST_VERSION } from '~/state/bridgeBus.testkit';
 import { Sidebar } from './Sidebar';
 
 /** The in-memory bus, optionally without a `version` in `proxy.status` (a core older than the field). */
@@ -90,7 +90,7 @@ describe('Sidebar Scripts count', () => {
    */
   function mountScripts(opts: { tools?: (all: ToolDef[]) => ToolDef[]; list?: () => Promise<unknown> | undefined } = {}) {
     const scripts = loadedScripts();
-    const mem = memoryBus({ scripts, tools: [...SERVED_TOOLS, SUBSCRIBE.name, 'script.enable', 'script.disable'] });
+    const mem = memoryBus({ scripts, extraTools: ['script.enable', 'script.disable'] });
     buses.push(mem);
     const calls: string[] = [];
     const bus: BusClient = {

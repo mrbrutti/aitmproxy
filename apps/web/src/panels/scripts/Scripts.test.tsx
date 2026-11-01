@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@solidjs/testing-library';
 import { BusError, type BusClient, type BusRole, type ToolDef } from '~/bus/types';
 import { createAppStore } from '~/state/app';
-import { memoryBus, SERVED_TOOLS, SUBSCRIBE } from '~/state/bridgeBus.testkit';
+import { memoryBus } from '~/state/bridgeBus.testkit';
 import { AppProvider } from '~/state/context';
 import { ScriptsPanel } from '../ScriptsPanel';
 import { scriptsStore } from './store';
@@ -46,7 +46,7 @@ const SCRIPT_TOOLS = ['script.enable', 'script.disable', 'script.reload', 'scrip
 function mount(opts: MountOpts = {}) {
   const scripts = loadedScripts();
   const host = scriptHost(scripts, findingsOldestFirst());
-  const mem = memoryBus({ scripts, tools: [...SERVED_TOOLS, SUBSCRIBE.name, ...SCRIPT_TOOLS] });
+  const mem = memoryBus({ scripts, extraTools: SCRIPT_TOOLS });
   const calls: { tool: string; args: Record<string, unknown> }[] = [];
   const bus: BusClient = {
     ...mem,
@@ -117,7 +117,7 @@ const REPORTS: Record<string, { name: string; api: string; hooks: string[]; regi
   [GOOD_SRC]: { name: 'probe', api: '1', hooks: ['on_request'], registers: { commands: [], options: [] } },
   [REG_SRC]: { name: 'probe', api: '1', hooks: ['on_request'], registers: { commands: ['probe.run'], options: ['probe.depth'] } },
 };
-/** The core's pinned compile-error text (`ScriptError::Compile`, crates/aitm-plugin-rhai/src/error.rs) for BAD_SRC, whose `{` at 1:21 is never closed. */
+/** The core's pinned compile-error text (`ScriptError::Compile`, crates/aitm-plugin-rhai/src/error.rs) for BAD_SRC, whose `{` at 1:21 is never closed. The panel shows it verbatim, the `<source>:3:1` position included, not stripped. */
 const BAD_SRC_ERROR = "error: <source>:3:1 — expecting '}' to end the block opened at 1:21\n  help: the file ends mid-statement; look for an unclosed brace, bracket, or string";
 
 /** Script findings as the core's in-memory sink lists them: oldest first, `at` in Unix milliseconds. */
@@ -127,7 +127,8 @@ const findingsOldestFirst = () => [
   { name: 'Verbose error body', severity: 'medium', flow_id: 'flow_0031', detail: 'Stack trace in a 500 response', tags: [], source: 'flaky-parser', at: 1_700_000_270_000 },
 ];
 
-const HOST_TOOLS = new Set(['script.enable', 'script.disable', 'script.reload', 'script.validate', 'script.save', 'script.findings']);
+/** What `scriptHost` answers: the advertised `script.*` tools plus `script.findings`, which the memory bus also serves but the host answers from the test's own list. */
+const HOST_TOOLS = new Set([...SCRIPT_TOOLS, 'script.findings']);
 
 /**
  * The rhai host's side of the `script.*` commands the panel drives, over the mount's own `scripts`, in
@@ -178,8 +179,6 @@ function scriptHost(scripts: ScriptInfo[], findings: ReturnType<typeof findingsO
         const keep = typeof args.limit === 'number' ? Math.min(Math.max(0, args.limit), findings.length) : findings.length;
         return { findings: findings.slice(findings.length - keep), dropped: 0 };
       }
-      default:
-        throw new Error(`scriptHost: ${tool} is not a script command`);
     }
   };
   return (tool: string, args: Record<string, unknown>): Promise<unknown> | undefined =>
@@ -444,7 +443,6 @@ describe('ScriptsPanel — new-script editor', () => {
 
     const alert = await within(await screen.findByLabelText('Result')).findByRole('alert');
     expect(alert.textContent).toBe(BAD_SRC_ERROR);
-    expect(alert.textContent).toMatch(/^error: <source>:3:1 — /); // the position is shown, not stripped
     expect(calls.some((c) => c.tool === 'script.save')).toBe(false);
   });
 

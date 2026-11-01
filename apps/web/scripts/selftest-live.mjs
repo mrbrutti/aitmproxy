@@ -469,7 +469,7 @@ try {
   await step('gap F4: push notifications over /bus', async () => {
     const n = bus.notifications.length;
     ok(n === 0, `received ${n} unsolicited notifications: ${JSON.stringify(bus.notifications.slice(0, 3))}`);
-    gap('F4', `0 server notifications after ${results.length} steps of traffic — the bus is request/response only, the UI must poll`);
+    gap('F4', `0 server notifications after ${results.length} steps of traffic — this script never calls flow.subscribe, so it sees no push; the core serves flow.subscribe / flow.unsubscribe and the UI subscribes. A subscribe probe is a follow-up`);
   });
   await step('gap F1 closed: agent tools — agent.status answers with the policy; agent.set, agent.activity and agent.approve are served', async () => {
     const names = tools.map((t) => t.name);

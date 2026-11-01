@@ -113,7 +113,7 @@ export interface FlowNotification {
  * converts it; a line already in this model shape is accepted as it is.
  */
 export interface AgentNotification {
-  /** `operator`, `mcp` and `cli` are what the server records; `mac`, `web` and `tui` are frontend labels the model shape may carry (all read as human). */
+  /** `operator`, `mcp` and `cli` are what the server records; `mac`, `web` and `tui` are frontend labels the model shape may carry, shown by name (only `mcp` renders as the agent). */
   origin: 'mcp' | 'cli' | 'operator' | 'mac' | 'web' | 'tui';
   /** The caller's `initialize.clientInfo.name`; `null` for an unlabelled connection (the bridge today). */
   clientLabel?: string | null;
@@ -214,7 +214,7 @@ export interface PocRun {
   evaluated: { assertion: string; matched: boolean }[];
   /** Built in this session but not yet saved under poc.dir (the core returns YAML text only). */
   local?: boolean;
-  /** True once the core has been asked for the source (poc.get) or none exists. */
+  /** The PoC's description text, when its `poc.list` entry carries one (`poc.get` answers it too, but only its YAML is kept); absent when none exists. */
   description?: string;
   /** Set when this entry has a run result in this session (poc.run keeps no history). */
   ran?: boolean;

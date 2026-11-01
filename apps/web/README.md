@@ -72,13 +72,18 @@ Run in `apps/web`. A change is done when all three hold.
    `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/`, and see it in the
    list.
 
-`?perf=1` (`src/shell/perf.ts`, dev builds only) is a frame probe: it samples
+`?perf=1` turns on two probes. The frame probe (`src/shell/perf.ts`) runs in
+dev builds only (it is gated on `import.meta.env.DEV`): it samples
 `requestAnimationFrame` deltas for 10 s and reports
 `{frames, p50, p95, max, dropped}` to the console and `window.__aitmPerf`
-(`perfDelay` and `perfSeconds` adjust it; `src/viewers/perf.ts` logs
-inspector timings under the same flag). It now measures real traffic only:
-the mock's `rate=` stream that used to feed it is gone, so drive the proxy
-yourself while it runs.
+(`perfDelay` and `perfSeconds` adjust it). The inspector probe
+(`src/viewers/perf.ts`) is not gated on the build: in any build, including
+the one `aitm web` serves, a page opened with `?perf` present logs inspector
+timings to the console (`[perf] inspector.<step> <n> ms`, with the document
+key and character counts, never body text or tokens) and to
+`window.__aitmInspectorPerf`. Both measure real traffic only: the mock's
+`rate=` stream that used to feed them is gone, so drive the proxy yourself
+while they run.
 
 ## No mock bus
 
