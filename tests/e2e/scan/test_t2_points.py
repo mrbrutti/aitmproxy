@@ -5,7 +5,8 @@ routes (`POST /api/profile` JSON, `POST /xml`, `POST /upload` multipart, `GET /p
 with a `theme` cookie, `GET /whoami` with `X-Forwarded-For`, `GET /docs/intro`,
 `GET /files/readme.txt`), a `scan.map` (client crawler) site map's insertion points
 cover the kinds `json_value` (nested path `profile.address.city`), `xml_value`,
-`multipart_value`, `header`, `cookie`, `path_segment` (non-numeric, on `/docs/intro`)
+`multipart_value`, `header`, `cookie`, `path_segment` (a non-numeric one on `/docs/intro`;
+numeric `/account/{id}` segments are insertion points too, D8.1, coordinator ruling 2026-11-01)
 and `path_filename`; the `theme` cookie point's `example` is `<redacted>`.
 
 Observers: the target's control log (`/log/http`) shows the cell's proxied captures
@@ -137,8 +138,8 @@ def main() -> None:
                 seg = [p for p in points if p.get("kind") == "path_segment"]
                 check(any(url_path(p) == "/docs/intro" or p.get("example") == "intro" for p in seg),
                       f"a path_segment point is on /docs/intro ({[(url_path(p), p.get('example')) for p in seg]})")
-                check(not any(url_path(p) in ("/account/1", "/account/2") for p in seg),
-                      "no path_segment point on the numeric /account/{id} segments")
+                check(any(not str(p.get("example", "")).isdigit() for p in seg),
+                      f"a non-numeric path_segment point exists ({[p.get('example') for p in seg]})")
                 fname = [p for p in points if p.get("kind") == "path_filename"]
                 check(any(url_path(p) == "/files/readme.txt" or (p.get("example") or "").startswith("readme")
                           for p in fname),
