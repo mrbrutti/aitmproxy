@@ -63,6 +63,8 @@ H39. T7-19's Site map head stayed blank after `3` then `J` while the harness's `
 
 H41 (cell, after H37-H39). The self-test's Findings frame literal follows H40: `Findings · PoCs and runs`; the live `P` poll keeps matching `PoCs and runs`.
 
+H42 (cell). A `standard` job under `crawl.use_browser: auto` with no reachable browser burns its probes without discovering points (coordinator, from T2's diagnosis; the first live run's 182 probes and zero issues): before every `s`/`m` from the held editor (T7-16, T7-17, T7-19), the cell moves the Fields cursor to the crawl `browser` field and cycles it with `e` until the Fields line reads `browser never` (the ring is auto, always, never), asserting the line; the T7-18 `l4-stream-safe` launch needs no browser. The harness's own `scan.start` comparison in T7-18 sends the same `crawl.use_browser = "never"` override.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
