@@ -38,8 +38,8 @@ use crate::grammars::tlv;
 use crate::infer::Counts;
 use crate::spec::{Endian, FieldKind};
 use crate::state::{
-    DiscoveredPoint, EndpointAddr, MAX_MESSAGE, MAX_POINTS_PER_ENDPOINT, MAX_REPEAT_INDEX,
-    MAX_SEEDS_PER_ENDPOINT,
+    proto_name, DiscoveredPoint, EndpointAddr, MAX_MESSAGE, MAX_POINTS_PER_ENDPOINT,
+    MAX_REPEAT_INDEX, MAX_SEEDS_PER_ENDPOINT,
 };
 use crate::tree::Node;
 
@@ -322,14 +322,6 @@ pub fn node_id(ip: IpAddr, port: u16, proto: L4Transport) -> String {
 pub fn point_id(node_id: &str, seed_id: &str, path: &str) -> String {
     let label = format!("{node_id}|{seed_id}|{path}");
     format!("l4s-{digest}", digest = hex16(fnv1a64(label.as_bytes())))
-}
-
-/// `tcp` or `udp`.
-fn proto_name(proto: L4Transport) -> &'static str {
-    match proto {
-        L4Transport::Tcp => "tcp",
-        L4Transport::Udp => "udp",
-    }
 }
 
 /// How a point's `url` names its endpoint: `<tcp|udp>://<ip>:<port>/<grammar>`,

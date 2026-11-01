@@ -22,13 +22,13 @@
 use std::fmt;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use aitm_core::redact::scrub_text;
 use aitm_scan_model::{
     Check, CheckCost, CheckMeta, CheckOrigin, Confidence, Evidence, InsertionKind, InsertionPoint,
-    Intensity, L4Evidence, L4Oracle, L4Transport, LaneKind, Outcome, Payload, PayloadMode,
-    ProbeHost, ProbeResponse, Technique, Verdict,
+    Intensity, L4Evidence, L4Oracle, LaneKind, Outcome, Payload, PayloadMode, ProbeHost,
+    ProbeResponse, Technique, Verdict,
 };
 use futures::future::BoxFuture;
 
@@ -41,8 +41,8 @@ use crate::mutate::structure::{affects_framing, Case};
 use crate::oracle;
 use crate::spec::GrammarKind;
 use crate::state::{
-    lock, DiscoveredPoint, JobState, LaneState, MAX_CASES_PER_JOB, MAX_PRELUDE, RECOVERY_WINDOW,
-    REPRODUCE_SPACING,
+    lock, not_this_lanes_point, proto_name, seed_does_not_parse, DiscoveredPoint, JobState,
+    LaneState, MAX_CASES_PER_JOB, MAX_PRELUDE, RECOVERY_POLL, RECOVERY_WINDOW, REPRODUCE_SPACING,
 };
 use crate::tree::{FieldPath, Node};
 
@@ -66,9 +66,6 @@ const MAX_REPLY_EXCERPT: usize = 256;
 
 /// The bound on the `seed_notes=[...]` clause of the S6.5 detail line.
 const MAX_SEED_NOTES: usize = 2048;
-
-/// How often the recovery wait re-probes a target that went away (S6.2).
-const RECOVERY_POLL: Duration = Duration::from_secs(1);
 
 /// The A2 miss: a check whose host belongs to no known job sends nothing.
 const NO_JOB_STATE: &str = "l4_stream: no job state for this host";
@@ -324,7 +321,10 @@ fn grammar_for(job: &JobState, dp: &DiscoveredPoint) -> Arc<dyn Grammar> {
 }
 
 /// This point's share of the job's cases (spec S6.2).
-fn cases_planned(profile_cases: u32, points_total: u32, budget_left: u32) -> u32 {
+///
+/// `pub` so a test that rebuilds the campaign's deterministic schedule takes
+/// the plan size from the campaign rather than from a copy of this rule.
+pub fn cases_planned(profile_cases: u32, points_total: u32, budget_left: u32) -> u32 {
     let capped = profile_cases.min(MAX_CASES_PER_JOB);
     let share = (capped / points_total.max(1)).max(1);
     share.min(budget_left)
@@ -332,7 +332,10 @@ fn cases_planned(profile_cases: u32, points_total: u32, budget_left: u32) -> u32
 
 /// The other seeds of the same endpoint, which `Crossover*` and `Splice` draw
 /// from (spec S6.4).
-fn donors_for(job: &JobState, dp: &DiscoveredPoint) -> Vec<Vec<u8>> {
+///
+/// `pub` for the same reason as [`cases_planned`]: a schedule built without
+/// the campaign's own donors diverges from it after stage one.
+pub fn donors_for(job: &JobState, dp: &DiscoveredPoint) -> Vec<Vec<u8>> {
     let mut donors: Vec<Vec<u8>> = Vec::new();
     for other in lock(&job.points).values() {
         if other.node_id != dp.node_id || other.seed_id == dp.seed_id {
@@ -353,19 +356,14 @@ async fn run(
     job: &Arc<JobState>,
 ) -> Result<Campaign, Verdict> {
     let Some(dp) = lock(&job.points).get(&point.id).cloned() else {
-        return Err(error_verdict(format!(
-            "l4_stream: point {id} was not produced by this lane for job {job_id}",
-            id = point.id,
-            job_id = job.job_id
-        )));
+        return Err(error_verdict(not_this_lanes_point(&point.id, &job.job_id)));
     };
     let grammar = grammar_for(job, &dp);
     let Some(tree) = grammar.parse(&dp.seed_bytes) else {
-        return Err(error_verdict(format!(
-            "l4_stream: the seed {seed} of point {id} does not parse under {grammar}",
-            seed = dp.seed_id,
-            id = point.id,
-            grammar = grammar.name()
+        return Err(error_verdict(seed_does_not_parse(
+            &dp.seed_id,
+            &point.id,
+            grammar.name(),
         )));
     };
 
@@ -662,7 +660,11 @@ impl Runner<'_> {
                         return;
                     }
                 }
-                Some(L4Oracle::Reset) => {
+                // A `Reset` reaching the campaign means the liveness probe
+                // that followed the case passed — a failed one would be
+                // `LivenessFailed` — which is exactly the oracle's own
+                // parser-fault predicate (A7).
+                Some(oracle) if oracle::is_parser_fault_candidate(oracle, true) => {
                     if self.parser_fault(&case, &response, campaign).await {
                         return;
                     }
@@ -949,13 +951,13 @@ impl Class {
     fn clause(self, finding: &Finding) -> String {
         let (confirmed, attempts) = finding.evidence.reproduced;
         match self {
-            Class::Crash => format!(
-                "crash reproduced {confirmed}/{attempts} after case #{index} chain=[{chain}]",
-                index = finding.case.index,
-                chain = finding.evidence.mutation_chain.join(","),
-            ),
-            Class::ParserFault => format!(
-                "parser fault reproduced {confirmed}/{attempts} after case #{index} chain=[{chain}]",
+            Class::Crash | Class::ParserFault => format!(
+                "{what} reproduced {confirmed}/{attempts} after case #{index} chain=[{chain}]",
+                what = if self == Class::Crash {
+                    "crash"
+                } else {
+                    "parser fault"
+                },
                 index = finding.case.index,
                 chain = finding.evidence.mutation_chain.join(","),
             ),
@@ -1236,14 +1238,6 @@ fn seed_notes(job: &JobState, dp: Option<&DiscoveredPoint>) -> Option<String> {
     Some(truncate(notes, MAX_SEED_NOTES))
 }
 
-/// `tcp` or `udp`.
-fn proto_name(proto: L4Transport) -> &'static str {
-    match proto {
-        L4Transport::Tcp => "tcp",
-        L4Transport::Udp => "udp",
-    }
-}
-
 /// The oracle's name, for a finding whose reply was empty.
 fn oracle_token(oracle: L4Oracle) -> &'static str {
     match oracle {
@@ -1486,9 +1480,9 @@ mod tests {
 
     /// A `ProbeHost` that sends nothing and answers from a script.
     ///
-    /// It mirrors the two bookkeeping steps `StreamHost::send_case` performs
-    /// on the job state — the latency window and the case counter — so the
-    /// campaign reads the same medians it would read live.
+    /// It takes the same bookkeeping step `StreamHost::send_case` takes on
+    /// the job state — [`JobState::record_case`] — so the campaign reads the
+    /// same medians and counts it would read live.
     struct FakeHost {
         profile: ScanProfile,
         marker: String,
@@ -1537,12 +1531,14 @@ mod tests {
             }
         }
 
-        fn record_latency(&self, response: &anyhow::Result<ProbeResponse>) {
+        /// The bookkeeping `StreamHost::send_case` does after an exchange,
+        /// through the host's own helper, so the campaign reads the same
+        /// medians and counts it would read live.
+        fn record_case(&self, response: &anyhow::Result<ProbeResponse>) {
             let (Some(state), Ok(response)) = (self.state.as_ref(), response) else {
                 return;
             };
-            state.push_latency(response.elapsed_ms);
-            state.cases_sent.fetch_add(1, Ordering::SeqCst);
+            state.record_case(response.elapsed_ms);
         }
     }
 
@@ -1551,7 +1547,7 @@ mod tests {
             Box::pin(async move {
                 lock(&self.calls).push(Call::Baseline);
                 let response = self.next();
-                self.record_latency(&response);
+                self.record_case(&response);
                 response
             })
         }
@@ -1570,7 +1566,7 @@ mod tests {
                     Some(bytes) => {
                         lock(&self.calls).push(Call::Case(bytes.to_vec()));
                         let response = self.next();
-                        self.record_latency(&response);
+                        self.record_case(&response);
                         response
                     }
                 }

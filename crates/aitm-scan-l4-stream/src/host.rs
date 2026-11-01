@@ -23,10 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aitm_proto_l4::guard::{L4Guard, L4GuardError, L4Permit, ANY_INTERFACE};
-use aitm_proto_l4::types::{L4Action, L4Direction, L4Proto, L4Target};
+use aitm_proto_l4::types::{L4Action, L4Direction, L4Target};
 use aitm_scan_model::{
-    JobCtx, L4Oracle, L4Reply, L4Transport, Payload, ProbeHost, ProbeResponse, RawProbe,
-    ScanProfile,
+    JobCtx, L4Oracle, L4Reply, Payload, ProbeHost, ProbeResponse, RawProbe, ScanProfile,
 };
 use futures::future::BoxFuture;
 use tokio::sync::{OnceCell, OwnedSemaphorePermit};
@@ -38,10 +37,10 @@ use crate::grammars::smtp;
 use crate::oracle::{self, Reading};
 use crate::spec::GrammarKind;
 use crate::state::{
-    lock, DiscoveredPoint, JobState, CONNECT_TIMEOUT, LIVENESS_RETRY, MAX_AWAIT, MAX_MESSAGE,
-    MAX_PRELUDE, RECOVERY_WINDOW, REPLY_TIMEOUT,
+    lock, proto_of, DiscoveredPoint, JobState, CONNECT_TIMEOUT, LIVENESS_RETRY, MAX_AWAIT,
+    MAX_MESSAGE, MAX_PRELUDE, REPLY_TIMEOUT,
 };
-use crate::tree::Tree;
+use crate::L4_DISABLED;
 
 /// The `Payload::value` a check sends, with no `bytes`, to ask for a liveness
 /// probe rather than a case (plan call P5).
@@ -57,11 +56,6 @@ const MAX_RATE_WAITS: u32 = 10;
 
 /// The longest one rate-refusal retry sleeps (spec S5.4).
 const MAX_RATE_SLEEP: Duration = Duration::from_secs(1);
-
-/// How often [`StreamHost::wait_recovery`] re-probes a target that went away
-/// (spec S6.2).
-#[allow(dead_code, reason = "Task 19's campaign is the only caller")]
-const RECOVERY_POLL: Duration = Duration::from_secs(1);
 
 /// Why a probe sent nothing, or could not finish (spec S5.6).
 ///
@@ -181,9 +175,6 @@ pub struct StreamHost {
     pub(crate) point: DiscoveredPoint,
     /// The grammar selected for the endpoint.
     pub(crate) grammar: Arc<dyn Grammar>,
-    /// The seed's parse tree, which the campaign mutates.
-    #[allow(dead_code, reason = "Task 19's campaign is the only reader")]
-    pub(crate) tree: Tree,
     /// The job: budget, deadline, cancellation, profile, marker.
     pub(crate) job: Arc<dyn JobCtx>,
     /// The job's lane state: counters, pacer, semaphore, latency window.
@@ -225,7 +216,6 @@ impl StreamHost {
     pub fn new(
         point: DiscoveredPoint,
         grammar: Arc<dyn Grammar>,
-        tree: Tree,
         job: Arc<dyn JobCtx>,
         state: Arc<JobState>,
         guard: Option<Arc<L4Guard>>,
@@ -234,7 +224,6 @@ impl StreamHost {
         Self {
             point,
             grammar,
-            tree,
             job,
             state,
             guard,
@@ -243,30 +232,6 @@ impl StreamHost {
             liveness_before: AtomicBool::new(true),
             banner_host: Mutex::new(None),
         }
-    }
-
-    /// The point this host sends for.
-    #[allow(dead_code, reason = "Task 19's campaign is the only caller")]
-    pub(crate) fn point(&self) -> &DiscoveredPoint {
-        &self.point
-    }
-
-    /// The seed's parse tree, which the campaign mutates.
-    #[allow(dead_code, reason = "Task 19's campaign is the only caller")]
-    pub(crate) fn tree(&self) -> &Tree {
-        &self.tree
-    }
-
-    /// The job behind this host.
-    #[allow(dead_code, reason = "Task 19's campaign is the only caller")]
-    pub(crate) fn job(&self) -> &Arc<dyn JobCtx> {
-        &self.job
-    }
-
-    /// The job's lane state.
-    #[allow(dead_code, reason = "Task 19's campaign is the only caller")]
-    pub(crate) fn state(&self) -> &Arc<JobState> {
-        &self.state
     }
 
     // -----------------------------------------------------------------
@@ -281,11 +246,7 @@ impl StreamHost {
     fn mint_permit(&self) -> Result<L4Permit, HostError> {
         let ep = self.point.endpoint;
         let Some(guard) = self.guard.as_ref() else {
-            return Err(self.guard_refusal(
-                "scan: refused_l4: L4 is disabled (l4.enabled: false); the stream lane sends \
-                 nothing"
-                    .to_string(),
-            ));
+            return Err(self.guard_refusal(L4_DISABLED.to_string()));
         };
         if ep.ip.is_loopback() && guard.self_ports().contains(&ep.port) {
             return Err(self.guard_refusal(format!(
@@ -301,10 +262,7 @@ impl StreamHost {
                     direction: L4Direction::Outbound,
                     dst: Some(ep.ip),
                     dst_port: Some(ep.port),
-                    proto: match ep.proto {
-                        L4Transport::Tcp => L4Proto::Tcp,
-                        L4Transport::Udp => L4Proto::Udp,
-                    },
+                    proto: proto_of(ep.proto),
                 },
             )
             .map_err(|e| self.guard_refusal(guard_message(&e)))
@@ -485,7 +443,6 @@ impl StreamHost {
         let steps = self
             .run_exchange(&messages, self.grammar.expects_banner())
             .await?;
-        self.state.cases_sent.fetch_add(1, Ordering::SeqCst);
         self.record_banner(&steps);
 
         // 8. The oracle reads the case's own step: the last one.
@@ -494,6 +451,7 @@ impl StreamHost {
             // A client that returns no step sent nothing it could read.
             None => (Vec::new(), Ended::Silence, 0),
         };
+        self.state.record_case(elapsed_ms);
         let class = self.grammar.classify_reply(&reply);
         let reading = oracle::read(
             ended,
@@ -501,7 +459,6 @@ impl StreamHost {
             reply.is_empty(),
             self.grammar.close_on_malformed_is_expected(),
         );
-        self.state.push_latency(elapsed_ms);
         match ended {
             Ended::Silence => {
                 self.state
@@ -534,7 +491,7 @@ impl StreamHost {
             self.liveness_before.store(liveness_after, Ordering::SeqCst);
         }
 
-        self.report();
+        self.report_l4_hook();
 
         // 11.
         Ok(CaseOutcome {
@@ -605,26 +562,12 @@ impl StreamHost {
         self.liveness().await
     }
 
-    /// Poll liveness every second for up to [`RECOVERY_WINDOW`] (spec S6.2).
-    #[allow(dead_code, reason = "Task 19's campaign is the only caller")]
-    pub(crate) async fn wait_recovery(&self) -> Result<bool, HostError> {
-        let started = Instant::now();
-        loop {
-            if self.liveness().await? {
-                return Ok(true);
-            }
-            if started.elapsed() >= RECOVERY_WINDOW {
-                return Ok(false);
-            }
-            tokio::time::sleep(RECOVERY_POLL).await;
-        }
-    }
-
-    /// Report the job's L4 counters to the engine.
-    fn report(&self) {
-        // A5: wired by the integration task — `JobCtx` has no `report_l4` yet,
-        // and this crate may not add one to the T1a contract (Task 24 does).
-    }
+    /// Report the job's L4 counters to the engine (spec amendment A5).
+    ///
+    /// Deliberately empty: `JobCtx` has no `report_l4` yet and this crate may
+    /// not add one to the T1a contract, so the call site is here and the
+    /// integration task fills the body in.
+    fn report_l4_hook(&self) {}
 
     /// The denylist verdict for one message.
     ///
@@ -1035,15 +978,10 @@ mod tests {
         job: &Arc<TestJob>,
         client: Arc<dyn StreamClient>,
     ) -> StreamHost {
-        let grammar = grammar::by_kind(GrammarKind::Resp);
-        let tree = grammar
-            .parse(b"PING\r\n")
-            .expect("the RESP grammar parses its own liveness message");
         let state = JobState::new("scan-18", "aitm18", job.profile.l4.max_bytes_per_s);
         StreamHost::new(
             discovered(ep),
-            grammar,
-            tree,
+            grammar::by_kind(GrammarKind::Resp),
             Arc::clone(job) as Arc<dyn JobCtx>,
             state,
             guard,
@@ -1051,8 +989,8 @@ mod tests {
         )
     }
 
-    /// A host for any grammar: the point's tree comes from the grammar's own
-    /// generator, so every grammar can be driven through the probe sequence.
+    /// A host for any grammar, seeded from that grammar's own generator, so
+    /// every grammar can be driven through the probe sequence.
     fn host_for(
         kind: GrammarKind,
         ep: Endpoint,
@@ -1062,9 +1000,6 @@ mod tests {
         use rand::SeedableRng;
         let grammar = grammar::by_kind(kind);
         let seed = grammar.generate(&mut rand_chacha::ChaCha8Rng::seed_from_u64(7));
-        let tree = grammar
-            .parse(&seed)
-            .unwrap_or_else(|| panic!("{kind:?} parses its own generated message"));
         let mut point = discovered(ep);
         point.grammar = kind;
         point.seed_bytes = seed;
@@ -1072,7 +1007,6 @@ mod tests {
         StreamHost::new(
             point,
             grammar,
-            tree,
             Arc::clone(job) as Arc<dyn JobCtx>,
             state,
             Some(loopback_guard()),
@@ -1107,7 +1041,7 @@ mod tests {
     }
 
     impl StreamClient for ScriptedClient {
-        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments, reason = "the StreamClient signature")]
         fn exchange<'a>(
             &'a self,
             _ep: &'a Endpoint,
@@ -1276,7 +1210,7 @@ mod tests {
         assert_eq!(response.body, b"+PONG\r\n".to_vec());
         assert_eq!(client.count(), 1);
         assert_eq!(job.charges(), 1);
-        assert_eq!(host.state().cases_sent.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state.cases_sent.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1297,10 +1231,10 @@ mod tests {
         assert_eq!(client.count(), 0);
         assert_eq!(job.charges(), 0);
         assert_eq!(
-            host.state().cases_skipped_denylisted.load(Ordering::SeqCst),
+            host.state.cases_skipped_denylisted.load(Ordering::SeqCst),
             1
         );
-        assert_eq!(host.state().cases_sent.load(Ordering::SeqCst), 0);
+        assert_eq!(host.state.cases_sent.load(Ordering::SeqCst), 0);
     }
 
     /// C4's host half across the whole profile surface: no built-in profile,
@@ -1431,10 +1365,7 @@ mod tests {
         assert!(matches!(host_error(&error), HostError::TooLarge), "{error}");
         assert_eq!(client.count(), 0);
         assert_eq!(job.charges(), 0);
-        assert_eq!(
-            host.state().cases_skipped_too_large.load(Ordering::SeqCst),
-            1
-        );
+        assert_eq!(host.state.cases_skipped_too_large.load(Ordering::SeqCst), 1);
     }
 
     /// SPEC-C1: the guard's own packet ceiling is the same skip as the lane's
@@ -1492,7 +1423,7 @@ mod tests {
         let job = Arc::new(TestJob::new());
         let client = Arc::new(CountingClient::live());
         let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
-        assert!(host.state().retire("l4s-0123456789abcdef"));
+        assert!(host.state.retire("l4s-0123456789abcdef"));
 
         let error = host
             .probe(&payload(b"PING\r\n"))
@@ -1521,9 +1452,9 @@ mod tests {
         assert_eq!(reply.oracle, L4Oracle::LivenessFailed);
         assert_eq!(reply.bytes, Vec::<u8>::new());
         assert_eq!(client.count(), 3);
-        assert_eq!(host.state().liveness_probes.load(Ordering::SeqCst), 2);
-        assert_eq!(host.state().liveness_failures.load(Ordering::SeqCst), 1);
-        assert_eq!(host.state().consecutive_timeouts.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state.liveness_probes.load(Ordering::SeqCst), 2);
+        assert_eq!(host.state.liveness_failures.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state.consecutive_timeouts.load(Ordering::SeqCst), 1);
 
         // The same reading through `send_case`, which carries the liveness
         // flags the campaign reads.
@@ -1532,7 +1463,7 @@ mod tests {
         assert!(!outcome.liveness_after);
         assert_eq!(outcome.prior_messages, 0);
         assert_eq!(client.count(), 6);
-        assert_eq!(host.state().consecutive_timeouts.load(Ordering::SeqCst), 2);
+        assert_eq!(host.state.consecutive_timeouts.load(Ordering::SeqCst), 2);
 
         // Two silent cases in a row is the profile's ceiling: the next probe
         // never reaches the socket.
@@ -1595,27 +1526,17 @@ mod tests {
             other => panic!("expected a guard refusal, got {other:?}"),
         }
         assert_eq!(client.count(), 0);
-
-        // The recovery poll of S6.2 mints a permit too, so it refuses at once
-        // rather than waiting out the fifteen-second window.
-        let error = host
-            .wait_recovery()
-            .await
-            .expect_err("no guard, no recovery probe");
-        assert!(matches!(error, HostError::Guard(_)), "{error}");
-        assert_eq!(client.count(), 0);
     }
 
     #[tokio::test]
-    async fn accessors_name_the_point_the_tree_and_the_job() {
+    async fn the_host_names_its_point_and_its_job() {
         let job = Arc::new(TestJob::new());
         let client = Arc::new(CountingClient::live());
         let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
 
-        assert_eq!(host.point().point.id, "l4s-0123456789abcdef");
-        assert_eq!(host.point().seed_id, "gen:0");
-        assert_eq!(host.tree().grammar, "resp");
-        assert_eq!(host.job().marker(), "aitm18");
+        assert_eq!(host.point.point.id, "l4s-0123456789abcdef");
+        assert_eq!(host.point.seed_id, "gen:0");
+        assert_eq!(host.job.marker(), "aitm18");
         assert_eq!(host.marker(), "aitm18");
         assert_eq!(host.budget_left(), 1000);
         assert!(!host.cancelled());
@@ -1694,8 +1615,8 @@ mod tests {
 
         assert!(response.l4.is_none(), "{:?}", response.l4);
         assert_eq!(client.count(), 1);
-        assert_eq!(host.state().cases_sent.load(Ordering::SeqCst), 0);
-        assert_eq!(host.state().liveness_probes.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state.cases_sent.load(Ordering::SeqCst), 0);
+        assert_eq!(host.state.liveness_probes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1736,8 +1657,8 @@ mod tests {
         // One exchange, carrying the case alone: RESP has no prelude.
         assert_eq!(client.exchanges(), vec![vec![b"PING\r\n".to_vec()]]);
         assert_eq!(job.charges(), 1);
-        assert_eq!(host.state().cases_sent.load(Ordering::SeqCst), 1);
-        assert_eq!(host.state().consecutive_timeouts.load(Ordering::SeqCst), 0);
+        assert_eq!(host.state.cases_sent.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state.consecutive_timeouts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1766,9 +1687,9 @@ mod tests {
                 vec![b"PING\r\n".to_vec()],
             ]
         );
-        assert_eq!(host.state().liveness_probes.load(Ordering::SeqCst), 2);
-        assert_eq!(host.state().liveness_failures.load(Ordering::SeqCst), 1);
-        assert_eq!(host.state().consecutive_timeouts.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state.liveness_probes.load(Ordering::SeqCst), 2);
+        assert_eq!(host.state.liveness_failures.load(Ordering::SeqCst), 1);
+        assert_eq!(host.state.consecutive_timeouts.load(Ordering::SeqCst), 1);
         // The case plus two liveness probes, one budget unit each.
         assert_eq!(job.charges(), 3);
     }

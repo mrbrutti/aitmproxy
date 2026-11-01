@@ -42,9 +42,7 @@ use std::sync::Arc;
 
 use aitm_proto_l4::flow::L4FlowStore;
 use aitm_proto_l4::guard::{interface_covers, L4Guard, ANY_INTERFACE};
-use aitm_proto_l4::types::{
-    IpCidr, L4Action, L4Capability, L4Direction, L4Proto, L4ScopeEntry, L4Target,
-};
+use aitm_proto_l4::types::{IpCidr, L4Action, L4Capability, L4Direction, L4ScopeEntry, L4Target};
 use aitm_scan_model::{
     Discovery, InsertionPoint, JobCtx, L4Counters, L4Transport, Lane, LaneKind, ProbeHost,
     ProfileTarget,
@@ -56,14 +54,17 @@ use crate::client::{StreamClient, TokioStreamClient};
 use crate::codec::fnv1a64;
 use crate::corpus::Seed;
 use crate::host::StreamHost;
-use crate::state::{lock, DiscoveredPoint, EndpointAddr, LaneState, MAX_SEEDS_PER_ENDPOINT};
+use crate::state::{
+    lock, not_this_lanes_point, proto_of, DiscoveredPoint, EndpointAddr, LaneState,
+    MAX_SEEDS_PER_ENDPOINT,
+};
 
 /// What the lane says when L4 is disabled (spec S5.1).
 ///
 /// The engine has already refused at `scan.start`; this is the same D3 token
 /// from the lane itself, so a misordered caller still gets `refused_l4` rather
 /// than a surprise.
-const L4_DISABLED: &str =
+pub(crate) const L4_DISABLED: &str =
     "scan: refused_l4: L4 is disabled (l4.enabled: false); the stream lane sends nothing";
 
 /// What [`L4StreamLane::scope_entry_for`] says when no entry renders — a race
@@ -326,30 +327,20 @@ impl Lane for L4StreamLane {
 
         let found: Option<DiscoveredPoint> = lock(&job_state.points).get(&point.id).cloned();
         let Some(discovered) = found else {
-            return Err(anyhow!(
-                "l4_stream: point {id} was not produced by this lane for job {job_id}",
-                id = point.id,
-                job_id = job.job_id()
-            ));
+            return Err(anyhow!(not_this_lanes_point(&point.id, job.job_id())));
         };
 
+        // The seed is not parsed here: the host sends bytes, and the campaign
+        // is the one parser (spec S5.5, S6.2). A seed that no longer parses
+        // is the campaign's error, raised once rather than in two places.
         let grammar = lock(&job_state.grammars)
             .get(&discovered.node_id)
             .map(Arc::clone)
             .unwrap_or_else(|| grammar::by_kind(discovered.grammar));
-        let Some(tree) = grammar.parse(&discovered.seed_bytes) else {
-            return Err(anyhow!(
-                "l4_stream: the seed {seed} of point {id} does not parse under {grammar}",
-                seed = discovered.seed_id,
-                id = point.id,
-                grammar = grammar.name()
-            ));
-        };
 
         Ok(Box::new(StreamHost::new(
             discovered,
             grammar,
-            tree,
             job,
             job_state,
             self.guard.clone(),
@@ -411,14 +402,6 @@ fn direction_name(direction: L4Direction) -> &'static str {
     match direction {
         L4Direction::Inbound => "inbound",
         L4Direction::Outbound => "outbound",
-    }
-}
-
-/// The guard's protocol selector for a scan profile's transport.
-fn proto_of(proto: L4Transport) -> L4Proto {
-    match proto {
-        L4Transport::Tcp => L4Proto::Tcp,
-        L4Transport::Udp => L4Proto::Udp,
     }
 }
 

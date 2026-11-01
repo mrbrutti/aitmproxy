@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use aitm_proto_l4::types::L4Proto;
 use aitm_scan_model::{InsertionPoint, JobCtx, L4Counters, L4Transport};
 use tokio::sync::Semaphore;
 
@@ -54,6 +55,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 pub const LIVENESS_RETRY: Duration = Duration::from_millis(500);
 /// How long the campaign waits for a target to come back (spec S6.2).
 pub const RECOVERY_WINDOW: Duration = Duration::from_secs(15);
+/// How often the recovery wait re-probes a target that went away (spec S6.2).
+pub const RECOVERY_POLL: Duration = Duration::from_secs(1);
 /// The gap between two reproduction attempts.
 pub const REPRODUCE_SPACING: Duration = Duration::from_secs(1);
 /// The most prelude messages a grammar may send before a case.
@@ -71,6 +74,36 @@ pub const LATENCY_WINDOW: usize = 20;
 /// Samples the latency window needs before a median is meaningful (S6.1,
 /// "with at least 10 samples in the window").
 pub const MIN_LATENCY_SAMPLES: usize = 10;
+
+/// The lane's refusal when a point is not one of this job's (spec S5.5).
+///
+/// Both the host factory and the campaign check it, and an operator reading
+/// a verdict should not have to tell two spellings of one fact apart.
+pub(crate) fn not_this_lanes_point(point_id: &str, job_id: &str) -> String {
+    format!("l4_stream: point {point_id} was not produced by this lane for job {job_id}")
+}
+
+/// The lane's refusal when a point's seed no longer parses (spec S5.5).
+pub(crate) fn seed_does_not_parse(seed_id: &str, point_id: &str, grammar: &str) -> String {
+    format!("l4_stream: the seed {seed_id} of point {point_id} does not parse under {grammar}")
+}
+
+/// The guard's protocol selector for a scan profile's transport.
+pub(crate) fn proto_of(proto: L4Transport) -> L4Proto {
+    match proto {
+        L4Transport::Tcp => L4Proto::Tcp,
+        L4Transport::Udp => L4Proto::Udp,
+    }
+}
+
+/// `tcp` or `udp`: the wire spelling of a transport, in an id, a URL or a
+/// verdict line.
+pub(crate) fn proto_name(proto: L4Transport) -> &'static str {
+    match proto {
+        L4Transport::Tcp => "tcp",
+        L4Transport::Udp => "udp",
+    }
+}
 
 /// Lock a state mutex, taking the data back if a thread panicked while holding
 /// it.
@@ -425,6 +458,16 @@ impl JobState {
             liveness_failures: u64::from(self.liveness_failures.load(Ordering::Relaxed)),
             retired_elements: lock(&self.retired).len() as u64,
         }
+    }
+
+    /// Record one sent case: its reply time and the case itself.
+    ///
+    /// The two steps `StreamHost::send_case` takes after an exchange, in one
+    /// place so a test double can take them too and read back the medians a
+    /// live run would.
+    pub fn record_case(&self, elapsed_ms: u32) {
+        self.push_latency(elapsed_ms);
+        self.cases_sent.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Record one reply time, keeping the last [`LATENCY_WINDOW`].

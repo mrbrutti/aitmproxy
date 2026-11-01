@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 
-use aitm_scan_l4_stream::checks::Campaign;
+use aitm_scan_l4_stream::checks::{self, Campaign};
 use aitm_scan_l4_stream::client::testing::CountingClient;
 use aitm_scan_l4_stream::client::StreamClient;
 use aitm_scan_l4_stream::codec::encode_hex;
@@ -603,13 +603,9 @@ async fn no_bytes_in_logs_or_debug() {
         .get(&dp.node_id)
         .map(Arc::clone)
         .expect("discovery stored the inferred TLV grammar");
-    let tree = grammar
-        .parse(&dp.seed_bytes)
-        .expect("the seed parses under its own inferred grammar");
     let host = StreamHost::new(
         dp.clone(),
         Arc::clone(&grammar),
-        tree,
         Arc::clone(&run.job),
         Arc::clone(&state),
         None,
@@ -675,22 +671,15 @@ fn nth_case_bytes(run: &Run, point: &InsertionPoint, index: u32) -> Vec<u8> {
         format!("{}|{}", run.job.marker(), point.id).as_bytes(),
     );
 
-    // `checks::donors_for`: the other seeds of the same endpoint, deduped and
-    // sorted. They feed the crossover and splice mutators, so a schedule built
-    // without them diverges from the campaign's after stage one.
-    let mut donors: Vec<Vec<u8>> = Vec::new();
-    for other in locked(&state.points).values() {
-        if other.node_id != dp.node_id || other.seed_id == dp.seed_id {
-            continue;
-        }
-        if !donors.contains(&other.seed_bytes) {
-            donors.push(other.seed_bytes.clone());
-        }
-    }
-    donors.sort();
-
-    let points_total = u32::try_from(run.points.len()).unwrap_or(1).max(1);
-    let planned = (run.job.profile().l4.cases / points_total).max(1);
+    // The campaign's own two inputs, not a copy of them: the donor seeds that
+    // feed the crossover and splice mutators (a schedule without them
+    // diverges after stage one) and the plan size.
+    let donors = checks::donors_for(&state, &dp);
+    let planned = checks::cases_planned(
+        run.job.profile().l4.cases,
+        state.points_total.load(Ordering::SeqCst),
+        run.job.budget_left(),
+    );
     assert!(
         planned > index,
         "a plan of {planned} cases never reaches case #{index}"

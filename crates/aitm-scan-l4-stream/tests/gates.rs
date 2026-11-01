@@ -494,15 +494,19 @@ async fn wildcard_authorises_literal_refuses() {
 // ---------------------------------------------------------------------------
 // C15: the four ceilings
 // ---------------------------------------------------------------------------
+//
+// One test each, so that the three that need no socket still assert where the
+// sandbox refuses to bind — only the connection ceiling needs a real speaker.
 
+/// (1) Cases per job: a profile asking for a million over three points plans
+/// at most the lane's own ceiling in total.
+///
+/// The job's deadline has already passed, so every campaign stops at its
+/// first case: the planned count is what is under test, not a million real
+/// sends.
 #[tokio::test(flavor = "multi_thread")]
-async fn ceilings() {
+async fn ceiling_cases_per_job() {
     let seeds = hex_seeds(&[b"aaa", b"bbb", b"ccc"]);
-
-    // (1) Cases per job: a profile asking for a million over three points
-    // plans at most the lane's own ceiling in total. The job's deadline has
-    // already passed, so every campaign stops at its first case: the planned
-    // count is what is under test, not a million real sends.
     let client = Arc::new(CountingClient::dry_run());
     let mut profile = profile_for("127.0.0.1", 9000, Some("raw"), 999_999, &seeds);
     profile.l4.max_bytes_per_s = 1_000_000_000;
@@ -539,9 +543,26 @@ async fn ceilings() {
     );
     assert_eq!(total_planned, 4998, "5000 / 3 points, three times");
     assert_eq!(client.count(), 0, "a passed deadline opens no exchange");
+}
 
-    // (2) Bytes per second: a gigabyte-per-second profile is paced at 1 MiB/s.
-    let state = lane.state().get("22cap").expect("discovery left state");
+/// (2) Bytes per second: a gigabyte-per-second profile is paced at 1 MiB/s.
+///
+/// The pacer is the job's, built at discovery, so no socket is needed to read
+/// the rate it was clamped to.
+#[tokio::test(flavor = "multi_thread")]
+async fn ceiling_bytes_per_second() {
+    let mut profile = profile_for("127.0.0.1", 9000, Some("raw"), 10, &hex_seeds(&[b"aaa"]));
+    profile.l4.max_bytes_per_s = 1_000_000_000;
+    let (lane, _job, found) = discover_with(
+        Some(common::wildcard_guard(&[9000])),
+        Arc::new(CountingClient::dry_run()),
+        profile,
+        "22rate",
+    )
+    .await;
+    found.expect("one `raw` seed over a scoped endpoint");
+
+    let state = lane.state().get("22rate").expect("discovery left state");
     let rate = state
         .pacer
         .lock()
@@ -549,9 +570,15 @@ async fn ceilings() {
         .rate();
     assert_eq!(rate, MAX_BYTES_PER_S);
     assert_eq!(rate, 1_048_576);
+}
 
-    // (3) Concurrent connections: eight probes from eight hosts of one job
-    // never hold more than four connections at once.
+/// (3) Concurrent connections: eight probes from eight hosts of one job never
+/// hold more than four connections at once.
+///
+/// The one ceiling that needs a real speaker, so the one that is left to the
+/// Terminal run where the sandbox refuses to bind.
+#[tokio::test(flavor = "multi_thread")]
+async fn ceiling_concurrent_connections() {
     let Some(speaker) = holder(Duration::from_millis(500)).await else {
         return;
     };
@@ -590,8 +617,11 @@ async fn ceilings() {
         u32::try_from(MAX_CONNECTIONS).expect("four fits"),
         "the job's connection ceiling is {MAX_CONNECTIONS}"
     );
+}
 
-    // (4) Message size: a seed over the message ceiling contributes nothing.
+/// (4) Message size: a seed over the message ceiling contributes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn ceiling_message_size() {
     let oversize = "00".repeat(70_000);
     assert!(
         oversize.len() / 2 > MAX_MESSAGE,
