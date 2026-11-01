@@ -25,6 +25,7 @@ extension Session {
             flowCount: rows.count,
             listenAddress: coreHealth.connection?.proxyAddress ?? listenAddress,
             systemProxy: systemProxy,
+            systemProxyFacts: systemProxyFacts,
             caTrust: caTrust,
             tunnelledFlowCount: tunnelledFlowCount,
             decrypt: decrypt
@@ -62,6 +63,9 @@ extension Session {
             show(.ca)
         case .trustCA:
             // Operator-only, like the capture switch: the view performs the trust action itself.
+            return false
+        case .setSystemProxy, .unsetSystemProxy:
+            // Operator-only, like `.trustCA`: the views call the Session entries (Session+SystemProxy.swift).
             return false
         case .openBrowser:
             show(.browser)

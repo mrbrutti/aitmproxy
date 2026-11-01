@@ -128,18 +128,21 @@ extension Session {
 
     // MARK: First-run sheet (spec D17.8)
 
-    /// The sheet is due once per store: the embedded core is ready, the bus is the operator's,
-    /// the OS store has answered and says the CA is not trusted, and neither `Store.defaults`
-    /// key (shared with the system-proxy step) says it was shown or suppressed.
+    /// The sheet is due once per store: the embedded core is ready, the bus is the operator's, EITHER
+    /// row is undone — the OS store has answered and says the CA is not trusted, or the system-proxy
+    /// route is known, closed and `supported` (system-proxy spec D13 "First-run sheet", D17.8) — and
+    /// neither `Store.defaults` key (shared by the two steps) says it was shown or suppressed.
     var setupSheetDue: Bool {
-        guard embeddedCoreActive, coreHealth.connection?.status == .ready,
-              caTrustControlLive, let facts = caTrust, !facts.trusted else { return false }
+        guard embeddedCoreActive, coreHealth.connection?.status == .ready, caTrustControlLive else { return false }
+        let caUndone = caTrust.map { !$0.trusted } ?? false
+        let systemProxyUndone = systemProxyFacts?.supported == true && !systemProxyPointsAtUs && !(systemProxyFacts?.setting ?? false)
+        guard caUndone || systemProxyUndone else { return false }
         let defaults = Store.defaults
         return !defaults.bool(forKey: Self.setupSheetShownKey) && !defaults.bool(forKey: Self.setupSheetSuppressedKey)
     }
 
-    static let setupSheetShownKey = "systemProxy.sheetShown"
-    static let setupSheetSuppressedKey = "systemProxy.promptSuppressed"
+    static let setupSheetShownKey = SystemProxyPreferences.sheetShownKey
+    static let setupSheetSuppressedKey = SystemProxyPreferences.promptSuppressedKey
 
     func presentSetupSheetIfDue() {
         guard setupSheetDue else { return }
