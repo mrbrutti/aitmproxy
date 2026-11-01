@@ -78,6 +78,8 @@ test backend::pcap::tests::linux_loopback_inject_reaches_the_ip_stack ... ok
 
 The listener received the injected datagram and the closed port answered ICMP type 3 code 3 through `PcapBackend::inject` itself, the same probe that failed at layer 2 in (ii). `tcpdump` alongside: `127.0.0.1.40000 > 127.0.0.1.45817: UDP, length 8` twice, then `ICMP 127.0.0.1 udp port 45817 unreachable`. (The run was stopped afterwards because the pre-existing ignored `capture::tests::capture_excludes_out_of_scope` hangs under `--ignored` on the rig; it is unrelated to this change and is listed as a follow-up for the `aitm-proto-l4` owner.)
 
+**What the layer-3 path costs the fuzzer.** With `IP_HDRINCL`, Linux `raw_send_hdrinc` (net/ipv4/raw.c, v6.8) unconditionally rewrites `iph->tot_len` to the real length and recomputes `iph->check`, and fills `iph->id` / `iph->saddr` only when they are zero. So on Linux loopback a mutation of `ipv4.total_length` or `ipv4.checksum` never reaches the receiving stack (the kernel repairs it on the way out), while every other IPv4 field, the whole IPv6 header and everything above IP are delivered verbatim. The injector therefore does not police lengths itself (a refusal would turn a legitimate fuzz case into a `WireWrite` job stop); it only requires Ethernet framing whose ethertype matches the IP version and a full fixed header, and it cross-checks the destination it reads against the guard's own parse of the same frame (tester finding F1, two rounds). Real NICs and macOS `lo0` keep `sendpacket`, where the kernel touches nothing.
+
 ### (iii) Lane-level counters on the rig at the fixed head (Task 2, run 3)
 
 **Run 3** (`scripts/t5-live-proof-linux.sh lane`; rig evidence `~/t5-proof/20261101T194235Z/{summary.txt,lane.log}`, copied as text to `/tmp/claude/t5-proof-linux/run3-summary.txt`, `run3-lane.log` and `run3-console.txt`). Header of the summary:
@@ -162,7 +164,7 @@ exit 77: aitm-l4-helper not present: Mac leg pending the notarized bundle (units
 ## Carry into the spec
 
 - `send_recv` invariant (D8.4/D12): the capture ignores the stimulus's own direction (same src addr/port, dst addr/port, protocol) before any match; a mock backend echoes the stimulus first so unit tests keep the regression covered.
-- Linux loopback injects at layer 3 (`SOCK_RAW` + `IP_HDRINCL`, `IPV6_HDRINCL` for v6); layer-2 `sendpacket` only for real NICs and macOS `lo0`.
+- Linux loopback injects at layer 3 (`SOCK_RAW` + `IP_HDRINCL`, `IPV6_HDRINCL` for v6), decided by libpcap's `IFF_LOOPBACK` flag; layer-2 `sendpacket` only for real NICs and macOS `lo0`. Spec D8.4 should state the Linux-loopback limitation: `ipv4.total_length` and `ipv4.checksum` mutations are repaired by the kernel on that path and cannot be fuzzed there; the injector requires Ethernet framing (ethertype ↔ version) and compares its destination with the guard's parse.
 - ICMP-paced points (amendment 46): `L4Options.icmp_pace_ms` default 1100, ceiling `l4_icmp_pace_ms_min: 1000`, `no_reply (icmp_ratelimit)` note, a closed port never yields `l4-crash`.
 - Linux ICMP facts for D8.4: `icmp_ratelimit` 1000 ms per destination, `icmp_ratemask` 6168, burst about 6; verified on the rig, not assumed.
 - Privilege spec: on macOS the lane needs read+write on `/dev/bpf*` in the core process (`via: process`); the Linux rig uses file capabilities (`cap_net_raw,cap_net_admin+ep`) on the binary, never a root cargo. Nothing in the lane needs the NE system extension.
