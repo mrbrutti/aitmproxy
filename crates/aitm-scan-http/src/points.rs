@@ -237,7 +237,7 @@ impl<'a> Collector<'a> {
         if json {
             found.push(PointTrait::Json);
         }
-        if session_trait(kind, name, self.session) {
+        if session_trait(kind, name, self.session) || path_is_secret(kind, path.as_deref()) {
             found.push(PointTrait::Session);
         }
         let traits: Vec<PointTrait> = TRAIT_ORDER
@@ -261,6 +261,19 @@ impl<'a> Collector<'a> {
             example,
         });
     }
+}
+
+/// Whether a structured-body point is session material by its *path* rather
+/// than its leaf name: a `json_value`, `xml_value` or `xml_attr` whose dotted
+/// path reads as a secret (`session.id`, `credentials.value`, `auth.value`)
+/// must be redacted and skipped even though its leaf (`id`, `value`) looks
+/// innocent (S-I1, D7, AC T2-6). The leaf alone is what [`session_trait`]
+/// already checks; this covers the containing object's name.
+fn path_is_secret(kind: InsertionKind, path: Option<&str>) -> bool {
+    matches!(
+        kind,
+        InsertionKind::JsonValue | InsertionKind::XmlValue | InsertionKind::XmlAttr
+    ) && path.is_some_and(redact::is_secret_name)
 }
 
 /// Whether a point carries session state: its name is a session cookie or (case
@@ -826,6 +839,98 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), count, "point ids are not pairwise distinct");
+    }
+
+    /// A structured-body point whose *path* reads as a secret (`session.id`,
+    /// `credentials.value`, `auth.value`) is redacted and carries the `Session`
+    /// trait even though its leaf name (`id`, `value`) looks innocent, so it is
+    /// skipped by the default ignore rule and only ever shown `<redacted>`
+    /// (S-I1, D7, AC T2-6). A non-secret path (`profile.address.city`) stays
+    /// cleartext.
+    #[test]
+    fn secret_by_path_in_structured_bodies_is_redacted() {
+        const BODY: &[u8] = br#"{"session":{"id":"3f9c9e"},"credentials":{"value":"s"},"profile":{"address":{"city":"Lisbon"}}}"#;
+        let json_flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/x",
+                &[],
+                Some(("application/json", BODY)),
+            ),
+            200,
+            &[],
+            b"",
+        );
+        let xml_flow = captured_flow(
+            request(
+                "POST",
+                "http://t:8080/x",
+                &[],
+                Some(("application/xml", b"<auth><value>tok</value></auth>")),
+            ),
+            200,
+            &[],
+            b"",
+        );
+
+        let profile = ScanProfile::default();
+        let empty = CompiledIgnore::compile(&[]).unwrap();
+
+        let json_out = enumerate_v2(
+            &json_flow,
+            &EnumerateOptions {
+                intensity: profile.intensity,
+                kinds: &profile.audit.kinds,
+                ignore: &empty,
+                max_points: profile.audit.max_points_per_request,
+                session: None,
+            },
+        );
+        let id = point(&json_out, JsonValue, "id");
+        assert_eq!(id.path.as_deref(), Some("session.id"));
+        assert!(id.traits.contains(&PointTrait::Session), "{:?}", id.traits);
+        assert_eq!(id.example.as_deref(), Some("<redacted>"));
+
+        let value = point(&json_out, JsonValue, "value");
+        assert_eq!(value.path.as_deref(), Some("credentials.value"));
+        assert!(value.traits.contains(&PointTrait::Session));
+        assert_eq!(value.example.as_deref(), Some("<redacted>"));
+
+        let city = point(&json_out, JsonValue, "city");
+        assert!(!city.traits.contains(&PointTrait::Session));
+        assert_eq!(city.example.as_deref(), Some("Lisbon"));
+
+        let xml_out = xml_out_points(&xml_flow, &empty, &profile);
+        let xml_value = point(&xml_out, XmlValue, "value");
+        assert_eq!(xml_value.path.as_deref(), Some("auth.value"));
+        assert!(xml_value.traits.contains(&PointTrait::Session));
+        assert_eq!(xml_value.example.as_deref(), Some("<redacted>"));
+
+        // With the default ignore rule, the session-material points are skipped.
+        let default_ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+        let default_out = enumerate_v2(
+            &json_flow,
+            &EnumerateOptions::from_profile(&profile, &default_ignore, None),
+        );
+        assert!(!has_named(&default_out, JsonValue, "id"));
+        assert!(has_named(&default_out, JsonValue, "city"));
+    }
+
+    fn xml_out_points(
+        flow: &HttpFlow,
+        ignore: &CompiledIgnore,
+        profile: &ScanProfile,
+    ) -> Enumerated {
+        enumerate_v2(
+            flow,
+            &EnumerateOptions {
+                intensity: profile.intensity,
+                kinds: &profile.audit.kinds,
+                ignore,
+                max_points: profile.audit.max_points_per_request,
+                session: None,
+            },
+        )
     }
 
     #[test]
