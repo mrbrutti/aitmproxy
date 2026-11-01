@@ -2073,3 +2073,43 @@ fn the_fields_pane_walks_by_key_after_an_origin_prompt() {
     let line = line_with(&text, "browser ").unwrap_or_else(|| panic!("no crawl line: {text}"));
     assert!(line.contains("browser never"), "{line:?}");
 }
+
+/// Fix round H, H43 (same class as H18): a prompt draws over the view it
+/// was opened from. `o` on the `standard` editor keeps the Scan view (the
+/// tab strip and the editor head) under the `origin:` prompt bar at
+/// 200x50 instead of the Flows view; a `/` filter prompt from the flow
+/// list still keeps the flow list.
+#[test]
+fn a_prompt_draws_over_the_view_it_was_opened_from() {
+    let mut app = app();
+    open_standard(&mut app);
+    let _ = app.update(Action::ScanOriginPrompt);
+    assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanOrigin));
+    let text = text_of(&app, 200, 50);
+    assert!(text.contains("origin:"), "the prompt bar is up: {text}");
+    assert!(
+        text.contains(" 1 Profiles"),
+        "the Scan tab strip stays under the prompt: {text}"
+    );
+    assert!(
+        text.contains("profile standard"),
+        "the editor head stays under the prompt: {text}"
+    );
+    assert!(
+        !text.contains("No flows yet"),
+        "the Flows view is not drawn under a Scan prompt: {text}"
+    );
+
+    let mut flows = aitm_tui::fixture_app_core(200, 50);
+    let _ = flows.update(Action::FilterOpen);
+    assert_eq!(flows.mode, Mode::Prompt(PromptKind::Filter));
+    let text = text_of(&flows, 200, 50);
+    assert!(
+        text.contains("shop-staging.test"),
+        "the flow list stays under a Flows prompt: {text}"
+    );
+    assert!(
+        !text.contains(" 1 Profiles"),
+        "the Scan view is not drawn under a Flows prompt: {text}"
+    );
+}

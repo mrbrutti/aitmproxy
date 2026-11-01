@@ -107,8 +107,11 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     // The wire-confirm overlay sits over the view the launch came from (fix
     // round H, H18): its body is `wire_confirm_from`'s, the Scan view for a
     // `scan.*` launch, the flow list and inspector for a guarded L4 verb.
+    // A prompt likewise draws the view it was opened from under its bar
+    // (H43): `prompt_from`, the mode `Esc` returns to.
     let body_mode = match app.mode {
         Mode::WireConfirm => app.wire_confirm_from,
+        Mode::Prompt(_) => app.prompt_from,
         mode => mode,
     };
     match body_mode {
