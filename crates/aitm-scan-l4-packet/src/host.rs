@@ -202,6 +202,11 @@ struct Delivery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Triage {
     /// Whether the target ever answered a liveness probe again.
+    ///
+    /// `false` is a *finding*, not a default: it is set only when the whole
+    /// recovery bound ran and every one of its `recovery_polls` probes failed
+    /// (tester finding F1). A triage cut short by a stop leaves it `true`,
+    /// because nothing was learned about recovery.
     recovered: bool,
     /// How many replays were attempted.
     attempts: u32,
@@ -741,6 +746,16 @@ impl PointRunner {
                     let triage = self
                         .triage(&spec, &seed.id, &chain, index, reproduce_count)
                         .await;
+                    // A triage any stop cut short proves nothing: the point
+                    // keeps its `(false, false)` candidate case, the run ends
+                    // on the stop and no crash is recorded or retired (tester
+                    // finding F1). `checks::CrashCheck` surfaces the
+                    // unconfirmed candidate as inconclusive.
+                    if let Some(reason) = triage.stop {
+                        run.cases.push(record);
+                        run.stopped = Some(reason);
+                        break;
+                    }
                     let crashed = !triage.recovered
                         || (triage.attempts == reproduce_count
                             && triage.reproduced == triage.attempts);
@@ -763,12 +778,6 @@ impl PointRunner {
                             },
                         });
                         run.cases.push(record);
-                        run.stopped = triage.stop;
-                        break;
-                    }
-                    if let Some(reason) = triage.stop {
-                        run.cases.push(record);
-                        run.stopped = Some(reason);
                         break;
                     }
                 }
@@ -829,7 +838,7 @@ impl PointRunner {
         reproduce_count: u32,
     ) -> Triage {
         let mut triage = Triage {
-            recovered: false,
+            recovered: true,
             attempts: 0,
             reproduced: 0,
             stop: None,
@@ -842,7 +851,8 @@ impl PointRunner {
                 match self.await_recovery().await {
                     // The replay below sets `alive` from its own probes.
                     Ok(true) => {}
-                    // A target that never answers again is the strongest
+                    // A target that never answers again — the whole recovery
+                    // bound polled, every probe failed — is the strongest
                     // evidence there is; stop replaying into it.
                     Ok(false) => {
                         triage.recovered = false;
@@ -888,13 +898,21 @@ impl PointRunner {
 
     /// Poll liveness until the target answers again or the bound runs out.
     ///
+    /// `Ok(false)` is reserved for the persistent outage: all
+    /// `recovery_polls` probes ran and all of them failed. A wait the job's
+    /// deadline cuts short is a [`StopReason::Deadline`] stop, because the
+    /// target was never given the recovery bound call C27 measures it against
+    /// (tester finding F1).
+    ///
     /// # Errors
-    /// [`HostError::Stopped`] when the job stopped while waiting.
+    /// [`HostError::Stopped`] when the job stopped while waiting, including
+    /// when this wait is what ran it past its deadline.
     async fn await_recovery(&self) -> Result<bool, HostError> {
         let timing = self.shared.timing;
         for attempt in 0..timing.recovery_polls {
             if Instant::now() >= self.job.deadline() {
-                return Ok(false);
+                self.stop(StopReason::Deadline);
+                return Err(HostError::Stopped(StopReason::Deadline));
             }
             if self.liveness_probe().await? {
                 return Ok(true);
@@ -1677,13 +1695,10 @@ mod tests {
     /// that never recovers within 10 s") both say this is a `Budget` stop, not
     /// an `l4-crash`.
     ///
-    /// BLOCKED (tester finding F1, 2026-11-01): `triage` starts with
-    /// `recovered: false` and returns it unchanged when `await_recovery`
-    /// fails with `Stopped(Budget)`, so `drive` reads `!triage.recovered` as a
-    /// persistent outage and records a crash with `reproduced: (0, 0)`. Red
-    /// until the Coder's fix; the fix task un-ignores it.
+    /// Fixed by tester finding F1: `triage` now starts from `recovered: true`
+    /// and `drive` reads any `triage.stop` as the end of the run, so a
+    /// `Stopped(Budget)` inside the recovery wait never becomes a crash.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "BLOCKED: tester finding F1 — a Budget stop inside the recovery wait is recorded as a crash"]
     async fn budget_exhausted_mid_triage_is_a_stop_not_a_crash() {
         let mock = MockBackend::new(MockReply::Echo);
         mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
@@ -1723,13 +1738,10 @@ mod tests {
     /// replay, so the run must end as a `Deadline` stop with no crash recorded
     /// (call C27's "did not recover within 10 s" needs the 10 s).
     ///
-    /// BLOCKED (tester finding F1, 2026-11-01): `await_recovery` answers
-    /// `Ok(false)` when the deadline passes, which `triage` cannot tell from
-    /// "polled ten times, never came back", so the run records a crash and
-    /// never marks the job `Deadline`. Red until the Coder's fix; the fix task
-    /// un-ignores it.
+    /// Fixed by tester finding F1: `await_recovery` keeps `Ok(false)` for the
+    /// exhausted recovery bound and raises `Stopped(Deadline)` — marking the
+    /// job stopped — when the deadline is what cut the wait short.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "BLOCKED: tester finding F1 — a Deadline during the recovery wait is recorded as a crash"]
     async fn deadline_during_recovery_wait_is_a_stop_not_a_crash() {
         let mock = MockBackend::new(MockReply::Echo);
         // Dead for far longer than the deadline allows, but the recovery bound

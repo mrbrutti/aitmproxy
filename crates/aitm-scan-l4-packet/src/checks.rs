@@ -150,6 +150,9 @@ impl Check for CrashCheck {
             if run.dry_run {
                 return dry_run_verdict(&run);
             }
+            if let Some(verdict) = candidate_verdict(&run) {
+                return verdict;
+            }
             if let Some(verdict) = stopped_verdict(&run) {
                 return verdict;
             }
@@ -325,6 +328,41 @@ fn dry_run_verdict(run: &PointRun) -> Verdict {
         detail: dry_run_detail(run),
         poc_hint: None,
     }
+}
+
+/// The verdict for a run whose crash triage a stop cut short: the candidate
+/// case left the target silent on both liveness probes, but no replay ever
+/// confirmed it, so the point is neither clean nor crashed —
+/// `inconclusive`/`tentative`, naming the stop that interrupted the triage
+/// (tester finding F1).
+///
+/// The candidate carried is the most recent one, which is the case the
+/// interrupted triage was reproducing. `Evidence.l4` stays `None`: an
+/// `L4Evidence` asserts a reproduction count, and nothing was reproduced.
+/// `None` when the run was not stopped or holds no silent candidate; the
+/// caller has already returned for a run that does hold a crash.
+fn candidate_verdict(run: &PointRun) -> Option<Verdict> {
+    let reason = run.stopped.as_ref()?;
+    let case = run
+        .cases
+        .iter()
+        .rev()
+        .find(|case| case.liveness == Some((false, false)))?;
+    Some(Verdict {
+        outcome: Outcome::Inconclusive,
+        confidence: Confidence::Tentative,
+        evidence: Evidence {
+            payload: Some(case.sent_hex.clone()),
+            ..Evidence::default()
+        },
+        detail: format!(
+            "crash candidate on {} field {} mutation {}: {reason} before reproduction",
+            run.target,
+            run.field,
+            case.chain.join(";")
+        ),
+        poc_hint: None,
+    })
 }
 
 /// The verdict for a run the stop ladder ended before any case went out:
@@ -635,6 +673,50 @@ mod tests {
             verdict.detail
         );
         assert_eq!(mock.inject_count(), 19);
+    }
+
+    /// Tester finding F1: a triage the stop ladder cut short leaves an
+    /// unconfirmed candidate. The run has no crash, so the check must say so
+    /// — `inconclusive`/`tentative`, with the candidate's bytes but no
+    /// `L4Evidence`, because nothing was reproduced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupted_triage_is_inconclusive_not_vulnerable() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, true);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 50), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        // 1 baseline + 2 cases + the 2 failed probes = 5; the first recovery
+        // poll is the charge that fails, mid-triage.
+        let job = job.with_budget(5);
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+        let registry = registry_with(&job, &runner);
+
+        let verdict = run_check(&CrashCheck::new(registry), &runner).await;
+
+        assert_eq!(verdict.outcome, Outcome::Inconclusive);
+        assert_eq!(verdict.confidence, Confidence::Tentative);
+        let trigger = mock.injected().get(2).cloned().expect("the third inject");
+        assert_eq!(verdict.evidence.payload, Some(hex_encode(&trigger)));
+        assert!(
+            verdict.evidence.l4.is_none(),
+            "nothing was reproduced, so there is no crash evidence: {:?}",
+            verdict.evidence.l4
+        );
+        assert_eq!(
+            verdict.detail,
+            "crash candidate on 127.0.0.1:9/udp field raw mutation grow:8: \
+             budget exhausted before reproduction"
+        );
+        assert!(verdict.detail.contains("crash candidate"));
+        assert!(verdict.detail.contains("budget"));
+        assert_eq!(
+            shared
+                .state
+                .counters(job.job_id())
+                .expect("counters")
+                .crashes,
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
