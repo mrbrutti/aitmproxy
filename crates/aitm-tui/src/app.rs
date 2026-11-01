@@ -4157,6 +4157,10 @@ pub const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("poc run <path> [target]", "Run a PoC YAML"),
     ("agent all|readonly|paused", "Set the agent policy"),
     ("agent", "Open the agent panel and activity log"),
+    (
+        "sysproxy on|off|status",
+        "set / restore the OS system proxy (key s)",
+    ),
     ("ca", "CA panel: status, export, install, uninstall"),
     ("config", "Config panel: the redacted config.get view"),
     (

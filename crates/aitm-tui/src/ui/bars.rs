@@ -89,10 +89,21 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         (_, _, None) if app.has_tool("proxy.status") => "listen address unknown".to_string(),
         (_, _, None) => "listen address unknown (core follow-up F7)".to_string(),
     };
+    // The §D12 system-proxy word sits after the address and before the
+    // state; this TUI's own in-flight set/unset reads `setting…` (D14).
+    let sysproxy = app
+        .system_proxy
+        .as_ref()
+        .and_then(|w| w.pill(app.sysproxy_setting))
+        .map(|p| format!(" {p}"))
+        .unwrap_or_default();
     let pill = Line::from(vec![
         Span::styled("● ", dot_style),
         Span::styled("aitmproxy", bold),
-        Span::styled(format!(" · {listen}{state}"), theme.text_secondary()),
+        Span::styled(
+            format!(" · {listen}{sysproxy}{state}"),
+            theme.text_secondary(),
+        ),
     ]);
 
     let agent_style = match app.agent.policy {
@@ -114,23 +125,25 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         crate::app::Layout::Horizontal => "▄▄ below",
         crate::app::Layout::Vertical => "▌▐ right",
     };
+    let lw = cells(Line::from(left.clone()).width());
+    let pw = cells(pill.width());
     let mut right = vec![Span::styled(format!("[{agent_label}]"), agent_style)];
-    // The key hints are a courtesy; below this width they would squeeze the
-    // listening pill into the agent toggle.
-    if area.width >= TOOLBAR_HINTS_COLS {
-        right.push(Span::styled(
-            format!("  {} palette  {}  b sidebar", glyph::PALETTE, layout),
-            theme.text_tertiary(),
-        ));
+    // The key hints are a courtesy; below this width — or when the pill,
+    // which now carries the system-proxy word, would otherwise be clipped
+    // against the agent toggle — they are dropped.
+    let hints = Span::styled(
+        format!("  {} palette  {}  b sidebar", glyph::PALETTE, layout),
+        theme.text_tertiary(),
+    );
+    let with_hints = lw + pw + cells(Line::from(right.clone()).width()) + cells(hints.width()) + 4;
+    if area.width >= TOOLBAR_HINTS_COLS && with_hints <= area.width {
+        right.push(hints);
     }
     right.push(Span::raw(" "));
     let right = Line::from(right);
-
-    let lw = cells(Line::from(left.clone()).width());
     let rw = cells(right.width());
     buf.set_line(area.x, area.y, &Line::from(left), area.width);
     if lw + rw + 2 < area.width {
-        let pw = cells(pill.width());
         let free_start = lw;
         let free_end = area.width.saturating_sub(rw);
         let x = if pw + 2 <= free_end.saturating_sub(free_start) {
