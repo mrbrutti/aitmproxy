@@ -718,6 +718,8 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | coder note | Important | `App::toast` unbounded; `bars.rs` `u16` add panics in debug on a 1 MiB `CallFailed` message | fix round H Rust (H47) |
 | H (Rust) | coder note | Minor | `scan_edit` acts from any Profiles pane; D11 says "on a field" | ruling: inert outside Fields with a toast (H48); D11 amended |
 | H (Rust) | coder note | Minor | `const fn join` in `key_table!`; `OnceLock` help rows; `rows` locals renamed `table`; 11 s `JOBS_MAX` test | ratified |
+| H (Rust) | fix round | done | H47 `f954c766`, H48 `03757f77`; crate gate green (530 tests) | final Rust re-review over `fbdc4513..03757f77` |
+| H (Rust) | coder note | Minor | the H35 test reads the banner on the tab-strip row; `POC_TOAST_MAX` stays the tighter PoC cut under `TOAST_MAX`; `Toast.text` is `pub` so the bars fix also covers direct pushes | ratified |
 
 ## Shipped
 

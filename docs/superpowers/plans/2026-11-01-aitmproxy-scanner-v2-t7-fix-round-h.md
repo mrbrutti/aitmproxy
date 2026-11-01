@@ -87,6 +87,8 @@ H48 (Rust). `scan_edit` acts on the Fields cursor from any Profiles pane; D11 sa
 
 H49 (cell). `type_origin` (and `type_l4_target`, the `w` name prompt) must wait for the prompt to close before returning: the bottom bar no longer shows the prompt label (`origin:` / `l4 target:` / `profile name:`) and the typed value is on the Fields `origins`/`l4` line (or the save toast arrived); only then `focus_profiles_list` may press `Esc` (after H43 an `Esc` into a still-open prompt would discard the typed value). Self-test row: a frame with the prompt bar still up is "not closed".
 
+**Rust H47-H48 result (2026-11-01):** done, `f954c766` (TOAST_MAX = 400 in `App::toast`, saturating sums in `bars.rs`; the bars overflow proven with a scratch test) and `03757f77` (`E_NEEDS_FIELDS` toast, no-editor toast keeps precedence); crate gate green (530 tests). Round H's Rust range is `0817f035..03757f77` plus H18-H21 (`c55c6695..0817f035`): final re-review over `fbdc4513..03757f77 -- crates/`.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
