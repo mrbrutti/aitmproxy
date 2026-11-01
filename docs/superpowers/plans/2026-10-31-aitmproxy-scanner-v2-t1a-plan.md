@@ -105,7 +105,7 @@ Shared facts for every coder:
      `pub type NodeId = String; pub type JobId = String; pub type IssueId = String;`.
   5. `vocab.rs`, every enum `Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize`,
      snake_case tokens exactly as spec D2:
-     `LaneKind { Http, Ws, L4Packet, L4Stream }` (tokens `http|ws|l4_packet|l4_stream`; the
+     `LaneKind { Http, Ws, L4Packet, L4Stream }` (derives `PartialOrd, Ord` too, so it can key `ProbeCounters.by_lane`; tokens `http|ws|l4_packet|l4_stream`; the
      **enum** is `LaneKind` because `Lane` is the trait, Architect's call A1);
      `Intensity { Passive, Light, Medium, Intrusive }` plus `PartialOrd, Ord` in that order;
      `Speed { Fast, Normal, Thorough }`; `Accuracy { FewerFalseNegatives, Normal, FewerFalsePositives }`;
@@ -638,7 +638,7 @@ Shared facts for every coder:
   existing plugin tests still pass unchanged (the registry still exposes exactly `scan.discover`,
   `scan.passive`, `scan.report`).
 - **Done when:** `cargo test -p aitm --lib --offline wire` and `cargo test -p aitm-plugin-scanner --offline`
-  pass in the sandbox; `cargo tree -p aitm --offline -e normal | grep -c 'aitm-scan-'` prints `6`
+  pass in the sandbox; `cargo tree -p aitm --offline -e normal --depth 1 | grep -c 'aitm-scan-'` prints `6` (without `--depth 1` it prints 12, because each lane crate re-lists the model crate)
   (quoted); the full gate passes in the Terminal (port-binding tests).
 
 ### Task 12: integration: merge `origin/main`, gate, real boot proof
