@@ -160,6 +160,7 @@ The prepared privileged walk (capture lo0, real HTTP/TCP/UDP traffic, `l4.flow.g
 - `crates/aitm-proto-l4/src/commands/{scope,mod}.rs`, `src/guard.rs`
 - `crates/aitm-proto-l4/tests/{operator_surfaces,language}.rs`, `crates/aitm/tests/l4_operator_surfaces.rs`
 - `tests/e2e/l4/test_l4_parity_core.py` (adds the scope-add live checks)
+- `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`, `aitmproxy-plugin/docs/tool-reference.md` (the two 'not shipped yet' sentences only: the overview's L4 scope paragraph and the tool-reference's `l4.scope.add` bullet)
 
 **(b) TUI**, branch `fix/l4-parity-tui`. Covers D2, D5 UI, D6, D9 UI, D10, D10c, and capture controls.
 - `crates/aitm-tui/src/{app,bus,l4,model,filter,keys,action}.rs`, `src/ui/{l4,overlays,flows,sidebar,bars,complete}.rs`

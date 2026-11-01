@@ -38,8 +38,7 @@ know about the family:
   `code` is one of `available`, `needs_privilege`, `unsupported_platform` or
   `not_configured`, `reason` is the text the gated verbs would return after
   `L4 unavailable: ` (null when available), and the payload (`captures` /
-  `sessions`) is `[]` when unavailable. UIs re-read both on every poll rather
-  than caching availability.
+  `sessions`) is `[]` when unavailable.
 - `l4.flow.get` takes `offset` (default 0) and `limit` (default 256, clamped to
   4096; `limit: 0` returns the flow fields with `packets: []`); `packet_count`
   is always the total, and when the 4 MiB raw-byte budget stops the window
@@ -121,7 +120,7 @@ know about the family:
 | `browser.screenshot` | — | Capture the current page as PNG bytes. |
 | `browser.eval` | `--expr <string>` | Evaluate a JavaScript expression in the page and return its value. |
 | `browser.get_dom` | — | The page's current outer HTML. |
-| `browser.confine` | `--on <true\|false>` | Confine the embedded browser's egress to the current scope (on), or restore free public browsing (off). Private/loopback handling is unaffected either way. |
+| `browser.confine` | `--on <true\|false>` | Confine the embedded browser's egress to the current scope (on), or restore free public browsing (off). Private/loopback handling is unaffected either way. Sensitive tier (gated like `scope.add`). |
 
 ## `poc.*`
 
@@ -292,6 +291,6 @@ know about the family:
 
 | Tool | Parameters | Description |
 | --- | --- | --- |
-| `scan.discover` | `--target <string> [--max_depth <int>] [--max_pages <int>]` | Discover reachable in-scope URLs under `target` (same-origin, scope-bound, budget-capped) and enumerate the injection points visible in captured requests. No injection or fuzzing is performed. `max_depth`/`max_pages` may lower the configured caps, never raise them. A navigation that lands off-origin or out of scope (a redirect) aborts the crawl with `stopped_reason = "left_scope"`. While the crawl runs the proxy's browser-egress posture is held confined, so the embedded browser cannot fetch an out-of-scope public host (sub-resource or redirect target); the hold is released when the command returns. Only one discovery runs at a time (crawls share one browser page); a second call while one is running is refused immediately — wait for it to finish. |
+| `scan.discover` | `--target <string> [--max_depth <int>] [--max_pages <int>]` | Discover reachable in-scope URLs under `target` (same-origin, scope-bound, budget-capped) and enumerate the injection points visible in captured requests. No injection or fuzzing is performed. `max_depth`/`max_pages` may lower the configured caps, never raise them. A navigation that lands off-origin or out of scope (a redirect) aborts the crawl with `stopped_reason = "left_scope"`. While the crawl runs the proxy's browser-egress posture is held confined, so the embedded browser cannot fetch an out-of-scope public host (sub-resource or redirect target); the hold is released when the command returns. Only one discovery runs at a time (crawls share one browser page); a second call while one is running is refused immediately — wait for it to finish. Needs the embedded browser for a real crawl; see `docs/scanner.md`. |
 | `scan.passive` | `[--target <string>]` | Run the passive checks (reflected request parameters, missing security headers, cookie flags) over the flows already captured for `target`, or over every captured flow when `target` is absent. Issues no traffic. Findings carry the parameter, header or cookie NAME, never its value. |
 | `scan.report` | `[--target <string>]` | Fold the recorded findings into `report_md` (one markdown section per finding) and `index` (one {poc_path, target_path, class, passed, control_passed, finding_capture, screenshot_path} entry per finding). `target` selects the findings recorded against that origin, or against a path under it. Empty when no findings directory is configured. Credentials are masked. |

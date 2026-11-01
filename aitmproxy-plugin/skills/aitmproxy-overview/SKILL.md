@@ -113,11 +113,11 @@ config …`) unless the operator opened the Widen gate with
 `l4.scope.add` (a confirm prompt, no Widen gate for a confirmed operator or CLI
 call, still refused to an agent) is designed but not shipped yet (unit (a') of
 the L4 parity fixes); until it lands, ask the operator to declare the entry in
-config or to open the Widen gate. Narrowing with `l4.scope.remove` is always
-allowed. Four per-capability gates govern the agent path: `inject`, `capture`,
-`intercept` and `widen`. `l4.agent.status` reads them; only the operator can flip
-them with `l4.agent.set`. The agent can never open its own gates; respect a
-closed one.
+config or to open the Widen gate. Narrowing with `l4.scope.remove` is never
+Widen-gated (agent policy still applies). Four per-capability gates govern the
+agent path: `inject`, `capture`, `intercept` and `widen`. `l4.agent.status`
+reads them; only the operator can flip them with `l4.agent.set`. The agent can
+never open its own gates; respect a closed one.
 
 **Capture and read packets.** `l4.capture.start {interface, direction?}`
 (Capture gate) returns a capture flow id; `l4.capture.stop {id}` ends it.
@@ -135,19 +135,23 @@ injected packet (`injected: true`) only while its Inject gate is open. A packet
 you may not read keeps every other field and simply has no `bytes` key; a
 missing key is not an empty packet. One reply carries at most 4 MiB of raw
 bytes; when that cuts the window short the reply has `truncated: true` and
-`next_offset`, so page with `offset: next_offset` until `truncated` is false
-(`next_offset: null`). The core excludes its own listener ports (proxy, bus, web
-UI, MCP) on loopback from every L4 recorder, so operator bus traffic never
-appears in a capture.
+`next_offset`. To read a whole flow keep advancing `offset` until it reaches
+`packet_count`; `truncated`/`next_offset` only mark a window the byte budget
+cut short. The core excludes its own listener ports (proxy, bus, web UI, MCP)
+on loopback from every L4 recorder, so operator bus traffic never appears in a
+capture.
 
 **Craft, inject, send/recv.** `l4.interfaces` lists the capture-capable
 interfaces. `l4.craft {spec}` is pure: it builds bytes and a summary with no
 privilege and no wire. `l4.inject {spec, dst, interface, port?, count?}` (Inject
 gate; scope, dangerous-destination denylist and rate caps apply) and
-`l4.send_recv {spec, dst, interface, port?, timeout_ms?, expect?}` (Inject and
-Capture gates; bounded by `timeout_ms`; returns the reply classification, not
-the payload, which you read with `l4.flow.get`) are **active egress**. Apply the
-same authorization discipline as for `request.send`.
+`l4.send_recv {spec, dst, interface, port?, timeout_ms?, expect?}` (the agent's
+**Inject gate only**; the guard additionally needs an Inject and a Capture
+*scope* entry for the interface, scope, not gates; bounded by `timeout_ms`;
+returns `flow_id` and an `outcome` classification, not the payload) are
+**active egress**. Read the reply with `l4.flow.get {id: <flow_id>}`; the reply
+is a captured packet, so an agent sees its `bytes` only while its Capture gate
+is open. Apply the same authorization discipline as for `request.send`.
 
 **In-path intercept (Linux NFQUEUE only).** `l4.intercept.*` parks live packets
 in a kernel queue for a verdict. It exists only on Linux with `CAP_NET_ADMIN`
@@ -157,13 +161,13 @@ and an `l4.intercept` config block; on macOS `l4.intercept.status` reports
 an `Intercept` scope entry) returns a session flow id; `l4.intercept.stop {flow}`
 ends the session and forwards whatever is still parked. `l4.intercept.list
 {flow?}` returns the parked packets in arrival order, oldest first, each
-`{id, flow, state: parked | mutated, dir, length, parked_at}`. The verdict verbs
-`l4.intercept.forward {id}`, `l4.intercept.drop {id}`, `l4.intercept.mutate
-{id, spec | bytes}` and `l4.intercept.revert {id}` take the **parked id** (the
-`id` of an `l4.intercept.list` entry), never the session's flow id. Work the
-oldest first: a parked packet is live traffic waiting on you. Parked packets are
-captured packets, so an agent sees their `bytes` in `l4.flow.get` only with its
-Capture gate open.
+`{id, flow, state: parked | mutated, dir, length, layers, parked_at}`. The
+verdict verbs `l4.intercept.forward {id}`, `l4.intercept.drop {id}`,
+`l4.intercept.mutate {id, spec | bytes}` and `l4.intercept.revert {id}` take the
+**parked id** (the `id` of an `l4.intercept.list` entry), never the session's
+flow id. Work the oldest first: a parked packet is live traffic waiting on you.
+Parked packets are captured packets, so an agent sees their `bytes` in
+`l4.flow.get` only with its Capture gate open.
 
 ## How output renders
 

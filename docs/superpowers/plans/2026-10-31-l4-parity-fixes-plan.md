@@ -247,10 +247,11 @@ Cut from `main` after (a) merges (spec §7(a'), fork (ii)). The security reviewe
 
 - **Satisfies:** AC5, AC6, AC7
 - **Depends on:** A5
-- **Files:** `crates/aitm-proto-l4/src/guard.rs`, `src/commands/{scope,mod}.rs`, `tests/operator_surfaces.rs`, `tests/language.rs`, `crates/aitm/tests/l4_operator_surfaces.rs`, `tests/e2e/l4/test_l4_parity_core.py`
+- **Files:** `crates/aitm-proto-l4/src/guard.rs`, `src/commands/{scope,mod}.rs`, `tests/operator_surfaces.rs`, `tests/language.rs`, `crates/aitm/tests/l4_operator_surfaces.rs`, `tests/e2e/l4/test_l4_parity_core.py`, `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`, `aitmproxy-plugin/docs/tool-reference.md` (the two 'not shipped yet' sentences only)
 - **Change:**
   - `scope.rs`: `pub struct OperatorConfirmed(());` with its only constructor `pub(in crate::commands::scope) fn new() -> Self`. `ScopeAdd::confirm_prompt` is always `Some`: with valid args `"Confirm l4.scope.add: {capability} scope for {cidr} {ports} on {interface} ({direction}), {rate}. A runtime entry never lifts the dangerous-destination denylist. Re-issue with `_confirm` to add."`, where `{ports}` is `ports 9100-9199` or `all ports`, `{rate}` is `inject rate {pps}pps/{burst}burst` or `inject refused (rate 0)`, and a prefix shorter than /16 (IPv4) or /48 (IPv6) appends ` WARNING: /{n} is a wide range.`; with missing or invalid args `"Confirm l4.scope.add: add an L4 scope entry ({error}). Re-issue with `_confirm` to add."`. `invoke` builds the entry, then trusted control → `self.guard.add_operator_scope(entry, OperatorConfirmed::new())`, else `self.guard.add_runtime_scope(entry)?`.
   - `guard.rs`: `pub(crate) fn add_operator_scope(&self, entry: L4ScopeEntry, _proof: OperatorConfirmed) -> L4ScopeId` (no widen check) and the existing `add_runtime_scope` both end in one private `fn push_runtime(&self, entry: L4ScopeEntry) -> L4ScopeId` that forces `source = Runtime`. `commands/mod.rs`: `cidr_to_string`, `ports_to_string` become `pub(crate)`. `language.rs` is not changed.
+  - Docs: flip the 'not shipped yet' sentences in those two files (the overview's L4 scope paragraph and the tool-reference's `l4.scope.add` bullet) to state that the operator-confirmed add shipped.
 - **Test first:**
   - `cargo test --offline -p aitm-proto-l4 --lib`: `scope::tests::confirm_prompt_some_for_empty_args`; `confirm_prompt_summarises_entry` (AC5 args → contains `127.0.0.1/32`, `9100-9199`, `lo0`, `inbound`, `capture`); `confirm_prompt_variants` (ports omitted → `all ports`; `inject_rate {pps: 0, burst: 0}` → `inject refused (rate 0)`; `10.0.0.0/8` → `WARNING: /8 is a wide range`); `guard::tests::operator_scope_cannot_lift_denylist` (AC7: `dangerous_dst_override: true`; operator add of `169.254.169.254/32` eth0 outbound inject passed in with `source: Config` → stored `Runtime`; `check(Inject, 169.254.169.254:80 on eth0)` → `Err(DangerousDestinationBlocked("169.254.169.254".into()))`).
   - `--test operator_surfaces operator_scope_add_skips_widen_gate`: widen off; `ScopeAdd` invoked with `Parts::host(Frontend::Operator)` → `Ok(Str(id))`, list gains `source: "runtime"`; `Parts::host(Frontend::Cli)` → `Ok`; `Parts::host(Frontend::Mcp)` → `Err` with text `R_WIDEN`, list unchanged.
@@ -612,7 +613,7 @@ Spec §7(e) file list. Starts after (a) is reviewed; merges after (a) and (a').
 - **Depends on:** E1
 - **Files:** `aitmproxy-plugin/skills/aitmproxy-overview/SKILL.md`, `aitmproxy-plugin/skills/aitmproxy-intercept-mutate/SKILL.md`
 - **Change:** overview gains an "L4 (raw TCP/UDP)" section: the status verbs answer `available`, `code`, `reason` (and what `needs_privilege`, `unsupported_platform`, `not_configured` mean); `l4.scope.add` is operator-confirmed and an agent is refused unless the operator opened the Widen gate; `l4.intercept.*` is Linux NFQUEUE only; verdict verbs take the **parked id** from `l4.intercept.list` (oldest first), never the flow id; `l4.flow.get` takes `offset`/`limit` (`limit: 0` for listing), returns `bytes` per packet: always to the operator or the CLI; to an agent only for captured packets when its Capture gate is open and for injected packets when its Inject gate is open, and pages with `next_offset` when `truncated`. Intercept-mutate gains one paragraph separating HTTP `flow.intercept` / `flow.resume` from `l4.intercept.*`.
-- **Test first (the check):** `grep -c` for `available`, `code`, `reason`, `l4.scope.add`, `parked`, `Linux`, `next_offset` in the overview; each 0 on `origin/main`.
+- **Test first (the check):** `grep -c` for `available`, `code`, `reason`, `l4.scope.add`, `parked id`, `Linux`, `next_offset` in the overview; each 0 on `origin/main`.
 - **Live check:** each ≥ 1; human read-through by the spec reviewer.
 - **Done when:** the tests and checks above pass with their output quoted, and the unit's gate passes.
 
@@ -647,6 +648,8 @@ Kept by the main session during stage 6. One row per finding.
 | (a) fix 3 (pass 3) | quality | Minor ×4 | tui bind test failed in the sandbox instead of skipping; `ip_endpoints` duplicated the address extraction; two adjacent bools in `bytes_visible`; test helpers duplicated again | fixed 340a5bfb (`PermissionDenied` skip, `endpoints_of`, `BytesView`, shared helpers) |
 | (a) docs (pass 3) | spec | Minor ×3 | Review log SHAs; AC34 tui test name; `Cargo.lock` row | fixed d55b0fc9 and this row |
 | (a) pass 3 | spec, security | PASS | third-pass verdicts: spec PASS, security PASS; quality FAIL only on the fallible-call item fixed in 5015b1f2 before its report landed | closed; fix task 4 touched Minors only, verified by the Terminal gate on the final head (no fourth panel pass) |
+| (e) order | spec | Important | (e) merged after (a) only, ahead of (a') | accepted by the orchestrator 2026-11-01 (it released (e) after #215); A6 on (a') gains a step that flips the two 'not shipped' passages (overview scope paragraph; tool-reference L4 bullet) |
+| (e) E2 | spec | Minor | frontmatter `description` edits in both skills | accepted by the orchestrator 2026-11-01: safe, single-line scalars, under 1024 chars, pinned phrases intact |
 
 ## Shipped
 
