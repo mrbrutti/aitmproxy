@@ -89,6 +89,10 @@ H49 (cell). `type_origin` (and `type_l4_target`, the `w` name prompt) must wait 
 
 **Rust H47-H48 result (2026-11-01):** done, `f954c766` (TOAST_MAX = 400 in `App::toast`, saturating sums in `bars.rs`; the bars overflow proven with a scratch test) and `03757f77` (`E_NEEDS_FIELDS` toast, no-editor toast keeps precedence); crate gate green (530 tests). Round H's Rust range is `0817f035..03757f77` plus H18-H21 (`c55c6695..0817f035`): final re-review over `fbdc4513..03757f77 -- crates/`.
 
+**Cell H41, H44, H46, H49 result (2026-11-01):** done in `1293cf6c` (+467/-73); `--selftest` 44 ok with a mutation check per new row; py_compile and discovery clean; the sandbox run dies at the bind denial before any claim. Ratified: no `w` save helper exists so none was added (the reader knows `profile name:`); any Scan prompt label after `e` counts as stray; `set_browser_never` records its own check; `push-counts.json` carries the H46 record with the old counts under `by_job`; `stopped_by` null while running; `profiles_frame` `l4` default `none`. Doc-only residual: the H15 self-test row and two docstrings still call H18 pending (H51).
+
+H51 (cell, doc-only, with the final cell look): the H15 self-test row text and the `Evidence`/`wire_confirm_over` docstrings say H18 is pending; H18 landed in `c55c6695`, so they read "the body under the overlay is the view it came from".
+
 ## Round H Rust re-review residuals
 
 H50 (Rust). A maximal wire-confirm prompt pushes the key line out of the box (`ui/scan/confirm.rs`): wrap the prompt into `inner.height.saturating_sub(5)` rows (two header and three trailer rows) so `y confirm (re-issues with _confirm) · n / Esc cancel` is always the last drawn row; one assertion in `a_huge_prompt_is_bounded_at_fold_and_wrapped_to_the_box` that the `y confirm` line is on screen.

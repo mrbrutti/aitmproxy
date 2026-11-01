@@ -722,6 +722,9 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | coder note | Minor | the H35 test reads the banner on the tab-strip row; `POC_TOAST_MAX` stays the tighter PoC cut under `TOAST_MAX`; `Toast.text` is `pub` so the bars fix also covers direct pushes | ratified |
 | H (Rust) | security re-review | PASS | every H bound verified (lanes, prompt, legacy error, JOBS_MAX vs started_here, toasts, cut_to byte-vs-cell contract, legacy gate); body dispatch cannot panic or draw an overlay from a stale mode | one Minor to H50 |
 | H (Rust) | security | Minor | a maximal prompt hides the confirm key line | fix round H Rust (H50) |
+| H (cell) | fix round | done | H41, H44, H46, H49 in `1293cf6c`; `--selftest` 44 ok with mutation checks | third live run; H51 doc-only residual |
+| H (cell) | coder note | Minor | no `w` helper to fix; any prompt label after `e` is stray; `set_browser_never` records its check; new `push-counts.json` shape; `l4` default `none` | ratified |
+| H (cell) | coder note | note | harness `drain_notifications` drops a batch on one unparsable line and swallows `ECONNRESET` as quiet | follow-up for T10 (shared notes) |
 
 ## Shipped
 
