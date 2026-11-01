@@ -51,6 +51,11 @@ Python stdlib has no h2 server).
   response-phase park → rewrite status/body → resume, with the CLIENT receiving the
   edit; `flow.replay` re-issues and captures; `request.send` captures and is
   scope-gated; `flow.kill mode=503` fails the client request with 503.
+- **test_intercept_url_rules.py** — a breakpoint rule whose `url` names a host or
+  a scheme (`*127.0.0.1:<port>*`, `http://…/scheme*`, a `^http://` regex, a
+  star-less substring) parks a real request on a real core: the UPSTREAM record is
+  empty while the flow is parked and has the request after `flow.resume`; a rule
+  naming another host leaves the request unpaused (`observed`, 200).
 
 ## The kill-503 regression
 

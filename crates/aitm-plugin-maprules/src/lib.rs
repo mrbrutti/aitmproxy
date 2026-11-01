@@ -514,7 +514,9 @@ impl Command for MapAdd {
                 map_object_param(
                     "condition",
                     "The shared match condition: {url:{wildcard|regex}, method, \
-                     host:{exact|wildcard}, phase}. Matches the request target path and authority.",
+                     host:{exact|wildcard}, phase}. url is matched against the full request \
+                     URL (scheme://host[:port]/path?query) and against the path alone; host \
+                     against the authority.",
                 ),
                 map_object_param(
                     "action",

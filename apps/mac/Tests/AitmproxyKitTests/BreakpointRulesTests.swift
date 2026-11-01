@@ -20,7 +20,20 @@ import Testing
         #expect(rows.filter(posts.matches).map(\.seq) == [44, 50])
         let regex = BreakpointRule(url: #"/api/(cart|me)$"#, matching: .regex)
         #expect(rows.filter(regex.matches).map(\.seq) == [51, 53])
-        #expect(BreakpointRule.wildcardMatches(pattern: "https://?pi.*", text: "https://api.x"))
+        // `?` is literal (it starts a query), as in the core; it is not a one-character wildcard.
+        #expect(BreakpointRule.wildcardMatches(pattern: "https://?pi.*", text: "https://api.x") == false)
+        #expect(BreakpointRule.wildcardMatches(pattern: "*/search?q=*", text: "https://h/search?q=1"))
+    }
+
+    @Test func emptyPatternMatchesNoRow() {
+        // One literal row, not `Fixtures.rows`, so the result does not depend
+        // on the fixture set.
+        let row = FlowRow(id: FlowID("empty"), seq: 1, method: .get, scheme: "https", authority: "h.test", path: "/x")
+        // Positive control: the row is matchable, so the two `false`s below come
+        // from the empty-pattern guard rather than from an unmatchable row.
+        #expect(BreakpointRule(url: "*h.test*").matches(row) == true)
+        #expect(BreakpointRule(url: "").matches(row) == false)
+        #expect(BreakpointRule(url: "", matching: .regex).matches(row) == false)
     }
 
     @Test func noticeAndWireForm() throws {
@@ -28,15 +41,14 @@ import Testing
         #expect(set.armedNotice == "Intercept armed — every request pauses here")
         set.rules = [BreakpointRule(name: "login", url: "*/login", onResponse: true, flag: .red), BreakpointRule(url: "x", enabled: false)]
         #expect(set.armedNotice == "Intercept armed — 1 rule")
-        // Only the core's rule fields travel (`match` and `flag` would reject the whole call), and
-        // `url` is the core's `{regex}` object built by the same conversion the preview uses.
-        #expect(set.rules[0].arguments == ["id": .string(set.rules[0].id.uuidString), "url": ["regex": "(?i)^.*/login$"],
+        // Only the core's rule fields travel (`match` and `flag` would reject the whole call); a
+        // wildcard goes as typed in the core's `{wildcard}` object, whose semantics the preview mirrors.
+        #expect(set.rules[0].arguments == ["id": .string(set.rules[0].id.uuidString), "url": ["wildcard": "*/login"],
                                             "phase": "any", "name": "login"])
-        // No `*`/`?` → substring; `?` → one character; regex metacharacters are escaped for both engines.
-        #expect(BreakpointRule(url: "login").arguments["url"] == ["regex": "(?i)^.*login.*$"])
-        #expect(BreakpointRule(url: "/api/?", onRequest: false, onResponse: true).arguments["url"] == ["regex": "(?i)^/api/.$"])
+        #expect(BreakpointRule(url: "login").arguments["url"] == ["wildcard": "login"])
+        #expect(BreakpointRule(url: "/api/?", onRequest: false, onResponse: true).arguments["url"] == ["wildcard": "/api/?"])
         #expect(BreakpointRule(url: "/api/?", onRequest: false, onResponse: true).arguments["phase"] == "response")
-        #expect(BreakpointRule.wildcardRegex("*/search?q=(1+1)") == "^.*/search.q=\\(1\\+1\\)$")
+        // Regex metacharacters in a wildcard are literal in the preview, as in the core.
         #expect(BreakpointRule.wildcardMatches(pattern: "*/search?q=(1+1)", text: "https://a.test/search?q=(1+1)"))
         #expect(!BreakpointRule.wildcardMatches(pattern: "*/search?q=(1+1)", text: "https://a.test/search?q=11"))
         #expect(BreakpointRule(url: "^/x$", matching: .regex, method: "post").arguments["url"] == ["regex": "^/x$"])
