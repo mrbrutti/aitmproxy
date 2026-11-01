@@ -577,6 +577,10 @@ Kept by the main session during stage 6. One row per finding.
 | PR C fix round 1 | quality (re-review) | Minor x2 | `LARGE_LINE_WITHIN` rationale understated the cost and cited a /tmp file; `accepting`/`MAX_CONNS` `pub(crate)` with no outside user, test mirrors the body | fixed in 946d0ea6 |
 | PR C fix round 2 (6f9e136f..946d0ea6) | security (round 3) | PASS, Minor | the array path re-walks already-complete elements on every read (per-call cost bounded by the 1 MiB buffer; one-byte pacing costs CPU, no memory, loopback-only) | accepted residual (orchestrator 2026-11-01); follow-up: memoise the element walk and cap `*N` at redis's 1 048 576 |
 | PR C fix round 2 | quality (round 3) | PASS, Minor | the memo's soundness relied on an unstated driver property (buffer only shrinks on a returned message or a closing idle step) | fixed in the final commit (`on_idle` drops the memo on every non-`Wait` step; the `scanned` doc names the condition) |
+| Seeds: Patched `/redirect` allowlist (8e19c2e3..dbc95a98) | T3 lane (live run) | Important | Patched honoured `/\host`: browsers read it as scheme-relative, so the open-redirect check reported a true positive on P | fixed in dbc95a98 (second char `/` or `\`, and `%2f`/`%5c` after the one decode, rejected; D3 row amended) |
+| Seeds: Patched `/redirect` allowlist | security | Important | the allowlist ran before `redirect()` stripped CR/LF and `HeaderValue` keeps TAB, so `/%0d/host`, `/%0a\host`, `/%09/host` still left as scheme-relative Locations | fixed in 1b4f71b5 (TAB/CR/LF stripped before the check; the stripped value is emitted; five rejected rows added; D3 row says so) |
+| Seeds: Patched `/redirect` allowlist | quality | Minor x3 | duplicated `location` test closure; computed instead of literal expectations; allocating `%` arm | fixed in 1b4f71b5 (shared `location()` helper, `(input, expected)` pairs, byte compare) |
+| Seeds: Patched `/redirect` allowlist | spec | PASS | code matches the request and the D3 row; no plan line pinned the old rule; legacy target/grader/self-check expectations hold | this row |
 
 ## Shipped
 
