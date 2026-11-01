@@ -9,7 +9,8 @@ target's certificate is self-signed) and every target authority in scope;
 default `standard` profile against that origin).
 
 Assert: `probes.by_lane.http > 0`; the seeded reflected XSS on `/search`
-(class `xss`) and the seeded SQLi error on `/products` (class `sqli`) are found
+(class `reflected-xss`, T3's corrected token) and the seeded SQLi error on
+`/products` (class `sqli`) are found
 on V and neither is found on P; `flow.detail` of `evidence.probe_flows[0]` of one
 of those issues renders `request.version` as `h2` or `HTTP/2` (the cell prints
 which; plan call P7).
@@ -103,9 +104,10 @@ def main() -> None:
 
             section("the seeded vulns are found over h2 on V")
             iss_v = issues(op, "operator", job=job_v)
-            xss = find(iss_v, "xss", "/search")
+            xss = find(iss_v, "reflected-xss", "/search")
             sqli = find(iss_v, "sqli", "/products")
-            check(len(xss) >= 1, f"V: class 'xss' on /search found over h2 [{brief(iss_v)}]")
+            check(len(xss) >= 1,
+                  f"V: class 'reflected-xss' on /search found over h2 [{brief(iss_v)}]")
             check(len(sqli) >= 1, f"V: class 'sqli' on /products found over h2 [{brief(iss_v)}]")
 
             section("one issue's probe flow was captured as an h2 flow")
@@ -129,8 +131,8 @@ def main() -> None:
             section("the patched twin yields neither class over h2")
             job_p, ctx_p = run_job(op, p, p.tls_base)
             iss_p = issues(op, "operator", job=job_p)
-            check(not find(iss_p, "xss", "/search"),
-                  f"P: no 'xss' issue on /search [{brief(iss_p)}]")
+            check(not find(iss_p, "reflected-xss", "/search"),
+                  f"P: no 'reflected-xss' issue on /search [{brief(iss_p)}]")
             check(not find(iss_p, "sqli", "/products"),
                   f"P: no 'sqli' issue on /products [{brief(iss_p)}]")
             p_h2 = [e for e in p.logs.scanner_requests(ctx_p["seq0"])
