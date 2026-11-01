@@ -46,7 +46,7 @@ use aitm_mcp::{ConnCtx, McpServer};
 use aitm_tui::{RunOptions, TransportChoice};
 use tracing::{info, warn};
 
-use crate::wire::{Governance, Http1Sender};
+use crate::wire::{BoundHook, Governance, Http1Sender};
 
 /// The usage line printed (exit status 2) when `tui` is given arguments.
 pub const USAGE: &str = "usage: aitm [--config <path>] tui (takes no further arguments)";
@@ -344,6 +344,21 @@ pub fn build_servers(
     (agent, handler)
 }
 
+/// Attach `hook` to the agent server's `on_bound`, so the caller learns the port
+/// the transport actually bound — `main.rs` passes
+/// [`self_port_hook`](crate::wire::self_port_hook) over the live L4 guard, as it
+/// does on the server path (L4PAR-AC34, spec §2.1). With no agent server (stdio)
+/// the hook is dropped unfired; with no hook the server is returned as it was.
+pub(crate) fn attach_bound_hook(
+    agent: Option<McpServer>,
+    hook: Option<BoundHook>,
+) -> Option<McpServer> {
+    match (agent, hook) {
+        (Some(server), Some(hook)) => Some(server.on_bound(hook)),
+        (agent, _) => agent,
+    }
+}
+
 /// Build the two servers over the shared `services` and run the proxy, the
 /// agent transport (loopback TCP or streamable HTTP) and the TUI side by side
 /// until one of them ends — the TUI returning on operator quit is the ordinary
@@ -354,6 +369,12 @@ pub fn build_servers(
 /// The caller launches and reaps the browser, as it does for the server path,
 /// and pre-binds the proxy and browser listeners so a port conflict is reported
 /// before the terminal UI takes over the screen.
+///
+/// `on_agent_bound` is attached to the agent server's `on_bound` through
+/// [`attach_bound_hook`], so the caller learns the port the transport actually
+/// bound; `main.rs` passes [`self_port_hook`](crate::wire::self_port_hook) over
+/// the live L4 guard, as it does on the server path (L4PAR-AC34). With no agent
+/// server (stdio) the hook is dropped unused.
 pub async fn run(
     cfg: &Config,
     proxy: &Proxy,
@@ -361,9 +382,11 @@ pub async fn run(
     governance: Governance,
     main_listener: tokio::net::TcpListener,
     browser_listener: tokio::net::TcpListener,
+    on_agent_bound: Option<BoundHook>,
 ) -> anyhow::Result<()> {
     let startup_note = services.log.startup_note();
     let (agent, handler) = build_servers(cfg, services, governance);
+    let agent = attach_bound_hook(agent, on_agent_bound);
     let agent_serve = async move {
         match agent {
             Some(server) => server.serve().await,
@@ -399,6 +422,101 @@ pub async fn run(
 mod tests {
     use super::*;
     use aitm_core::{AgentPolicy, AuditResult};
+    use aitm_proto_l4::guard::L4Guard;
+
+    /// L4PAR-AC34 / spec §2.1 (security Critical, second half), live: an agent
+    /// `McpServer` on loopback TCP port 0 with [`crate::wire::self_port_hook`]
+    /// attached through `attach_bound_hook`, served, reports the ephemeral port it
+    /// actually bound into the L4 guard's self ports — exactly one non-zero port
+    /// — before anything else learns it. Binds a port: in a sandbox that refuses
+    /// `bind` (`PermissionDenied`), `serve` ends with that error and the test
+    /// skips with a note; any other early end fails it.
+    #[tokio::test]
+    async fn attach_bound_hook_feeds_the_bound_port_to_the_l4_guard() {
+        let guard = Arc::new(L4Guard::new(&aitm_proto_l4::config::L4Config::default()));
+        let server = McpServer::new(
+            Arc::new(Registry::new()),
+            McpTransport::LoopbackTcp {
+                port: 0,
+                token: "attach-bound-hook-test".into(),
+                endpoint_file: None,
+            },
+        );
+        let agent = attach_bound_hook(
+            Some(server),
+            Some(crate::wire::self_port_hook(guard.clone())),
+        )
+        .expect("the agent server is kept");
+        let serving = tokio::spawn(agent.serve());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let ports = loop {
+            let ports = guard.self_ports();
+            if !ports.is_empty() {
+                break ports;
+            }
+            if serving.is_finished() {
+                let ended = serving.await;
+                // A sandbox that refuses `bind` ends `serve` with EPERM before any
+                // port exists: not a bug, so skip with a note, the way
+                // `tests/l4_cua_tui.rs` does. Any other early end is a failure.
+                if let Ok(Err(e)) = &ended {
+                    if e.chain().any(|c| {
+                        c.downcast_ref::<io::Error>()
+                            .is_some_and(|io| io.kind() == io::ErrorKind::PermissionDenied)
+                    }) {
+                        eprintln!(
+                            "tui::attach_bound_hook_feeds_the_bound_port_to_the_l4_guard: \
+                             skipped — this sandbox refuses to bind 127.0.0.1:0 \
+                             (PermissionDenied). Run `cargo test -p aitm --lib \
+                             attach_bound_hook_feeds_the_bound_port_to_the_l4_guard` in the \
+                             Terminal panel."
+                        );
+                        return;
+                    }
+                }
+                panic!("serve ended before reporting a bound port: {ended:?}");
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the bound port never reached the L4 guard"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        serving.abort();
+        assert_eq!(ports.len(), 1, "exactly one port: the agent transport's");
+        assert_ne!(
+            ports[0], 0,
+            "the ephemeral port a `port: 0` bind resolved to"
+        );
+    }
+
+    /// Without an agent server (stdio) the hook is dropped unfired: nothing
+    /// reaches the guard; without a hook the server is passed through.
+    #[test]
+    fn attach_bound_hook_without_an_agent_server_fires_nothing() {
+        let guard = Arc::new(L4Guard::new(&aitm_proto_l4::config::L4Config::default()));
+        assert!(
+            attach_bound_hook(None, Some(crate::wire::self_port_hook(guard.clone()))).is_none()
+        );
+        assert_eq!(guard.self_ports(), Vec::<u16>::new());
+        let server = McpServer::new(Arc::new(Registry::new()), McpTransport::Stdio);
+        assert!(attach_bound_hook(Some(server), None).is_some());
+    }
+
+    /// Tripwire: `run` attaches the caller's hook through `attach_bound_hook`,
+    /// the one place the agent server's `on_bound` is set under `aitm tui`.
+    #[test]
+    fn run_wires_the_bound_port_hook_into_the_agent_server() {
+        let run_body = include_str!("tui.rs")
+            .split("pub async fn run(")
+            .nth(1)
+            .expect("tui.rs defines `run`")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the test module follows `run`");
+        assert!(run_body.contains("attach_bound_hook(agent, on_agent_bound)"));
+    }
 
     /// SEC-3: the default log is per process (`aitm-tui-<pid>.log`), so two
     /// `aitm tui` runs never share a file in the world-writable temp dir;

@@ -186,56 +186,71 @@ pub fn send_recv(
     let iface = spec.interface;
     let timeout = spec.timeout;
 
+    // The reply listener is a recorder, so on a loopback interface it is opened
+    // with the kernel-side self-exclusion clause (`not port <bus> …`), exactly as
+    // `capture::scope_filter` does for a background capture (L4PAR-AC34, spec
+    // §2.1): the core's own frames — the bus's plaintext token line among them —
+    // are not even delivered. `L4Guard::admit_frame` in `await_reply` is the
+    // authoritative second boundary. `self_exclusion_bpf` is `None` on a
+    // non-loopback interface, which is left unfiltered on purpose.
+    let reply_filter = guard.self_exclusion_bpf(&iface);
+
     // The `!Send` libpcap source is opened, the stimulus injected, and the reply
     // awaited all on one dedicated thread: the handle never crosses a boundary and
     // the capture is open *before* the inject, so a fast reply is not missed. The
     // permits move in and are released when the thread (hence the operation) ends.
-    // The correlated reply is returned (not recorded here): the capture-scope
-    // re-check that gates recording needs the guard, which stays on this thread.
-    let worker_iface = iface.clone();
-    let worker_store = store.clone();
-    let worker = thread::spawn(move || -> Result<(L4FlowId, SendRecvOutcome), L4Error> {
-        let mut inject_permit = inject_permit;
-        let _capture_permit = capture_permit;
+    // The thread is scoped so it borrows the guard (the self-exclusion choke point
+    // every reply frame is asked of), the interface name and the store rather
+    // than copies of them. The correlated reply is returned (not recorded here):
+    // the capture-scope re-check that gates recording stays with the caller.
+    let (flow_id, outcome) = thread::scope(|s| {
+        let iface: &str = &iface;
+        let store: &dyn L4FlowStore = store.as_ref();
+        let worker = s.spawn(move || -> Result<(L4FlowId, SendRecvOutcome), L4Error> {
+            let mut inject_permit = inject_permit;
+            let _capture_permit = capture_permit;
 
-        // Open the capture first (fail-closed on missing privilege/libpcap).
-        let mut source = backend.open_capture(&worker_iface, None, poll)?;
+            // Open the capture first (fail-closed on missing privilege/libpcap).
+            let mut source = backend.open_capture(iface, reply_filter.as_deref(), poll)?;
 
-        // Send the stimulus through the single guarded choke point.
-        send_on_wire(&mut inject_permit, backend.as_ref(), &worker_iface, &bytes)?;
+            // Send the stimulus through the single guarded choke point.
+            send_on_wire(&mut inject_permit, backend.as_ref(), iface, &bytes)?;
 
-        // The stimulus is on the wire: record it in a fresh SendRecv flow (no stray
-        // flow if the open or the inject failed above).
-        let flow_id = worker_store.insert(L4Flow {
-            id: L4FlowId::new(),
-            kind: L4FlowKind::SendRecv,
-            bind: L4Bind {
-                interface: worker_iface.clone(),
-                filter: None,
-                queue: None,
-            },
-            packets: std::collections::VecDeque::new(),
-            metadata: L4Meta::default(),
+            // The stimulus is on the wire: record it in a fresh SendRecv flow (no
+            // stray flow if the open or the inject failed above).
+            let flow_id = store.insert(L4Flow {
+                id: L4FlowId::new(),
+                kind: L4FlowKind::SendRecv,
+                bind: L4Bind {
+                    interface: iface.to_string(),
+                    filter: None,
+                    queue: None,
+                },
+                packets: std::collections::VecDeque::new(),
+                metadata: L4Meta::default(),
+            });
+            store.append_packet(flow_id, make_packet(&bytes, L4Direction::Outbound, true));
+
+            // Await the correlated reply, bounded by the timeout — never hangs.
+            let outcome = await_reply(source.as_mut(), guard, iface, &correlation, timeout);
+            Ok((flow_id, outcome))
         });
-        worker_store.append_packet(flow_id, make_packet(&bytes, L4Direction::Outbound, true));
-
-        // Await the correlated reply, bounded by the timeout — never hangs.
-        let outcome = await_reply(source.as_mut(), &correlation, timeout);
-        Ok((flow_id, outcome))
-    });
-
-    let (flow_id, outcome) = worker
-        .join()
-        .unwrap_or_else(|_| Err(L4Error::Unavailable("send_recv worker panicked".into())))?;
+        worker
+            .join()
+            .unwrap_or_else(|_| Err(L4Error::Unavailable("send_recv worker panicked".into())))
+    })?;
 
     // Capture-scope the correlated reply before recording it, exactly as the
     // background capture re-checks every delivered frame (`capture::record_frame`):
     // the bind-time `Capture` permit was minted with `dst: None`, so a reply must
     // still resolve to a `Capture`-authorized target or it is dropped — never
-    // recorded. An undecodable reply (no IP target) is likewise not recorded.
+    // recorded. An undecodable reply (no IP target) is likewise not recorded, and
+    // the self-exclusion choke point is asked once more here, so nothing of the
+    // core's own reaches the flow whatever the classification above did.
     if let SendRecvOutcome::Response(ref pkt) | SendRecvOutcome::Other(ref pkt) = outcome {
-        let authorized = crate::capture::packet_target(&pkt.bytes, &iface, L4Direction::Inbound)
-            .is_some_and(|t| guard.check(L4Action::Capture, &t).is_ok());
+        let authorized = guard.admit_frame(&iface, &pkt.bytes)
+            && crate::capture::packet_target(&pkt.bytes, &iface, L4Direction::Inbound)
+                .is_some_and(|t| guard.check(L4Action::Capture, &t).is_ok());
         if authorized {
             store.append_packet(flow_id, pkt.clone());
         }
@@ -247,8 +262,16 @@ pub fn send_recv(
 /// source so the deadline is honoured promptly. Returns the matched reply as a
 /// typed outcome, or [`SendRecvOutcome::NoResponse`] on silence — it always
 /// returns within roughly `timeout`.
+///
+/// Every frame is first asked of the self-exclusion choke point
+/// ([`L4Guard::admit_frame`]): one the core itself sent or received on
+/// `interface` — a loopback frame to or from one of its own listener ports — is
+/// ignored before correlation, so it is never a `Response` or `Other`, under any
+/// [`ReplyMatch`] (L4PAR-AC34, spec §2.1).
 fn await_reply(
     source: &mut dyn crate::backend::CaptureSource,
+    guard: &L4Guard,
+    interface: &str,
     correlation: &Correlation,
     timeout: Duration,
 ) -> SendRecvOutcome {
@@ -260,6 +283,9 @@ fn await_reply(
             };
         }
         match source.next_frame() {
+            // The core's own traffic is not a reply to anything: skip it before
+            // correlation, whatever the match mode, and keep waiting.
+            Ok(Some(frame)) if !guard.admit_frame(interface, &frame) => {}
             Ok(Some(frame)) => match correlation.classify(&frame) {
                 Classified::Response => {
                     return SendRecvOutcome::Response(make_packet(
@@ -430,6 +456,11 @@ mod tests {
     }
 
     fn entry(dir: L4Direction, cap: L4Capability) -> L4ScopeEntry {
+        entry_on(IFACE, dir, cap)
+    }
+
+    /// A 127.0.0.1/32, all-ports scope entry on `iface`.
+    fn entry_on(iface: &str, dir: L4Direction, cap: L4Capability) -> L4ScopeEntry {
         L4ScopeEntry {
             id: L4ScopeId::new(),
             cidr: IpCidr {
@@ -440,7 +471,7 @@ mod tests {
                 lo: 0,
                 hi: u16::MAX,
             },
-            interface: IFACE.to_string(),
+            interface: iface.to_string(),
             direction: dir,
             capability: cap,
             inject_rate: RateCap {
@@ -454,10 +485,15 @@ mod tests {
     /// A guard scoped so send_recv can both inject (outbound) and capture the
     /// reply (inbound) on the loopback host.
     fn send_recv_guard() -> L4Guard {
+        send_recv_guard_on(IFACE)
+    }
+
+    /// [`send_recv_guard`] on an arbitrary interface name.
+    fn send_recv_guard_on(iface: &str) -> L4Guard {
         let g = L4Guard::new(&cfg());
-        g.add_scope(entry(L4Direction::Outbound, L4Capability::Inject))
+        g.add_scope(entry_on(iface, L4Direction::Outbound, L4Capability::Inject))
             .unwrap();
-        g.add_scope(entry(L4Direction::Inbound, L4Capability::Capture))
+        g.add_scope(entry_on(iface, L4Direction::Inbound, L4Capability::Capture))
             .unwrap();
         g
     }
@@ -501,11 +537,16 @@ mod tests {
     }
 
     fn spec(expect: ReplyMatch, timeout: Duration) -> SendRecvSpec {
+        spec_on(IFACE, expect, timeout)
+    }
+
+    /// [`spec`] on an arbitrary interface name.
+    fn spec_on(iface: &str, expect: ReplyMatch, timeout: Duration) -> SendRecvSpec {
         SendRecvSpec {
             packet: udp_packet("127.0.0.1", 9, b"probe"),
             dst: "127.0.0.1".parse().unwrap(),
             dst_port: Some(9),
-            interface: IFACE.to_string(),
+            interface: iface.to_string(),
             timeout,
             expect,
         }
@@ -514,10 +555,12 @@ mod tests {
     /// A backend that records injected frames and replays a scripted set of reply
     /// frames into the awaiting capture, then idles like a real read timeout.
     /// `available == false` simulates missing privilege/libpcap (fail-closed).
+    /// Every `open_capture` records the BPF filter it was handed.
     struct MockBackend {
         available: bool,
         replies: Mutex<Option<Vec<Vec<u8>>>>,
         injected: Mutex<Vec<Vec<u8>>>,
+        filters: Mutex<Vec<Option<String>>>,
     }
 
     impl MockBackend {
@@ -526,6 +569,7 @@ mod tests {
                 available: true,
                 replies: Mutex::new(Some(replies)),
                 injected: Mutex::new(Vec::new()),
+                filters: Mutex::new(Vec::new()),
             })
         }
 
@@ -534,11 +578,17 @@ mod tests {
                 available: false,
                 replies: Mutex::new(Some(Vec::new())),
                 injected: Mutex::new(Vec::new()),
+                filters: Mutex::new(Vec::new()),
             })
         }
 
         fn injected(&self) -> Vec<Vec<u8>> {
             self.injected.lock().unwrap().clone()
+        }
+
+        /// The BPF filter of each `open_capture`, in call order.
+        fn filters(&self) -> Vec<Option<String>> {
+            self.filters.lock().unwrap().clone()
         }
     }
 
@@ -546,9 +596,13 @@ mod tests {
         fn open_capture(
             &self,
             _iface: &str,
-            _filter: Option<&str>,
+            filter: Option<&str>,
             _read_timeout: Duration,
         ) -> Result<Box<dyn CaptureSource>, L4Error> {
+            self.filters
+                .lock()
+                .unwrap()
+                .push(filter.map(str::to_string));
             if !self.available {
                 return Err(L4Error::Unavailable("no privilege (mock)".into()));
             }
@@ -727,6 +781,105 @@ mod tests {
             "the one recorded packet is the injected stimulus"
         );
         assert_eq!(g.in_flight(), 0, "both permits released");
+    }
+
+    /// The bus port the tests below register as one of the core's own listeners.
+    const BUS_PORT: u16 = 27431;
+
+    /// A loopback frame from the bus port to an operator client's ephemeral port —
+    /// what the reply capture sees when a client connects while a send_recv waits.
+    /// Carries the plaintext token line the bus's first frame carries.
+    fn bus_frame() -> Vec<u8> {
+        udp_reply("127.0.0.1", BUS_PORT, br#"{"token":"operator-secret"}"#)
+    }
+
+    /// L4PAR-AC34 / spec §2.1 (security Critical, second half): the send_recv reply
+    /// capture is a recorder, so it asks the one self-exclusion choke point before
+    /// it classifies anything. A frame to or from one of the core's own listener
+    /// ports on a loopback interface is `Ignore`d — never a `Response`, never
+    /// appended to the SendRecv flow — even under `ReplyMatch::Any`, which would
+    /// otherwise take the first decodable non-stimulus frame. The genuine reply
+    /// behind it is still correlated. The reply listener is also opened with the
+    /// kernel-side `not port <bus>` clause.
+    #[test]
+    fn send_recv_reply_capture_ignores_self_traffic() {
+        let g = send_recv_guard_on("lo0");
+        g.set_self_ports([BUS_PORT]);
+        let backend =
+            MockBackend::with_replies(vec![bus_frame(), udp_reply("127.0.0.1", 9, b"echo")]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend.clone(),
+            store.clone(),
+            spec_on("lo0", ReplyMatch::Any, Duration::from_secs(1)),
+        )
+        .expect("authorized send_recv runs");
+
+        let reply = match outcome {
+            SendRecvOutcome::Response(p) => p,
+            other => panic!("expected the genuine reply as Response, got {other:?}"),
+        };
+        assert!(
+            reply.bytes.windows(4).any(|w| w == b"echo"),
+            "the Response is the genuine reply, not the bus frame"
+        );
+        assert!(
+            !reply.bytes.windows(5).any(|w| w == b"token"),
+            "the bus's token line is never returned as a reply"
+        );
+
+        let flow = store.get(flow_id).expect("send_recv flow present");
+        assert_eq!(
+            flow.packets.len(),
+            2,
+            "the flow holds the stimulus and the genuine reply only"
+        );
+        for p in &flow.packets {
+            assert!(
+                !p.bytes.windows(5).any(|w| w == b"token"),
+                "no recorded packet carries the bus's token line: {:?}",
+                String::from_utf8_lossy(&p.bytes)
+            );
+        }
+
+        assert_eq!(
+            backend.filters(),
+            vec![Some(format!("not port {BUS_PORT}"))],
+            "the reply listener is opened with the self-exclusion BPF clause"
+        );
+        assert_eq!(g.in_flight(), 0);
+    }
+
+    /// L4PAR-AC34: with only the core's own frame in the reply window, a
+    /// `FiveTuple` send_recv reports silence — the bus frame is not `Other`
+    /// (today's classification for a wrong-port frame from the host) and the flow
+    /// holds only the stimulus.
+    #[test]
+    fn send_recv_self_traffic_alone_is_silence() {
+        let g = send_recv_guard_on("lo0");
+        g.set_self_ports([BUS_PORT]);
+        let backend = MockBackend::with_replies(vec![bus_frame()]);
+        let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
+
+        let timeout = Duration::from_millis(80);
+        let (flow_id, outcome) = send_recv(
+            &g,
+            backend,
+            store.clone(),
+            spec_on("lo0", ReplyMatch::FiveTuple, timeout),
+        )
+        .expect("authorized send_recv runs");
+
+        assert!(
+            matches!(outcome, SendRecvOutcome::NoResponse { .. }),
+            "the core's own frame is never a reply, got {outcome:?}"
+        );
+        let flow = store.get(flow_id).expect("send_recv flow present");
+        assert_eq!(flow.packets.len(), 1, "only the stimulus is recorded");
+        assert!(flow.packets[0].injected);
+        assert_eq!(g.in_flight(), 0);
     }
 
     /// C3 (security): a stimulus whose crafted IP destination is a denylisted host,

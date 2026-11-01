@@ -27,7 +27,9 @@ use aitm::render::render_cli_value;
 use aitm::scripts::LateHandles;
 use aitm::tui::TuiLog;
 use aitm::web::{self, WebArgs, WebCommand, WebState};
-use aitm::wire::{assemble_with_scripts, build_capture_session, Assembled, Features, ScriptWiring};
+use aitm::wire::{
+    assemble_with_scripts, build_capture_session, self_port_hook, Assembled, Features, ScriptWiring,
+};
 use aitm::{config_file, env, operator_token, tui};
 use aitm_core::{engine_may_reach_private, BrowserDriver, Chain, McpTransport, Plugin};
 use aitm_findings::FindingsPlugin;
@@ -457,6 +459,16 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         l4,
         l4_shared,
         macos_capture,
+        // Self-exclusion (L4PAR-AC34, spec §2.1): the core's own listener ports the
+        // config already names — the web UI port (`aitm web` only) and the agent
+        // transport's port (loopback bus / MCP streamable HTTP). The proxy and
+        // browser-proxy ports are added by assembly; the bound ports are unioned
+        // in right after the listeners bind, below.
+        l4_self_ports: web_settings
+            .iter()
+            .map(|settings| settings.listen.port())
+            .chain(configured_agent_port(&cfg.mcp.transport))
+            .collect(),
         system_proxy: system_proxy.clone(),
         ..Features::default()
     };
@@ -613,6 +625,26 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
     })
     .await?;
 
+    // Self-exclusion of the core's own listeners (L4PAR-AC34, spec §2.1): the
+    // bound proxy, browser-proxy and (for `aitm web`) web UI ports top up the set
+    // assembly seeded from the config, so a loopback capture never records the
+    // bus's plaintext token line or any other frame to or from the core itself.
+    // The agent transport's bound port (an ephemeral `0` included) is added by
+    // `on_bound` below. Each step only adds; none can drop an earlier port.
+    let l4_live_guard = features
+        .l4_shared
+        .as_ref()
+        .map(|shared| shared.guard.clone());
+    // Bound addresses from the pre-bind step: nothing fallible may run between
+    // the system-proxy auto-set and the `select!` (its restore-on-exit depends on it).
+    if let Some(guard) = &l4_live_guard {
+        guard.add_self_ports(
+            [proxy_addr.port(), browser_addr.port()]
+                .into_iter()
+                .chain(web_listener.as_ref().map(|(_, bound)| bound.port())),
+        );
+    }
+
     // Server path: launch the configured engine so the browser.* commands reach
     // a live driver. No fallback to the other engine.
     //
@@ -702,8 +734,19 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         // its calls land in `agent.activity`. `push_tx` is not fed to it
         // (follow-up "tui-mode push"): a loopback subscriber still gets the
         // `notifications/aitm/agent` lines but no `notifications/aitm/flow`.
+        // Its bound port joins the L4 self-port set through `on_bound`, exactly
+        // as the server path's does below (L4PAR-AC34).
+        let on_agent_bound = l4_live_guard.clone().map(self_port_hook);
         tokio::select! {
-            result = tui::run(&cfg, &proxy, services, governance, proxy_listener, browser_listener) => result,
+            result = tui::run(
+                &cfg,
+                &proxy,
+                services,
+                governance,
+                proxy_listener,
+                browser_listener,
+                on_agent_bound,
+            ) => result,
             never = capture_run => match never {},
         }
     } else {
@@ -724,6 +767,13 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         )
         .with_mcp_roles(cfg.mcp.operator_token.clone(), cfg.mcp.stdio_role)
         .with_push(push_tx.clone());
+        // The agent transport binds inside `serve`; once it has, the bound port
+        // (the configured one, or the ephemeral port a `0` resolved to) joins the
+        // L4 self-port set beside the listeners bound above (L4PAR-AC34).
+        let mcp = match l4_live_guard.clone() {
+            Some(guard) => mcp.on_bound(self_port_hook(guard)),
+            None => mcp,
+        };
 
         // `aitm web`: a second McpServer over the same registry and services
         // (`serve` consumes the first), driven by the bridge's `handle_on` calls.
@@ -841,6 +891,19 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         }
     }
     result
+}
+
+/// The port the configured agent transport will bind, when it names one: the
+/// loopback-TCP bus port or the streamable-HTTP bind port. `None` for stdio (no
+/// listener) and for an ephemeral `0` (unknown until bound; `McpServer::on_bound`
+/// then reports the real one). Feeds the L4 self-port set (L4PAR-AC34).
+fn configured_agent_port(transport: &McpTransport) -> Option<u16> {
+    let port = match transport {
+        McpTransport::Stdio => return None,
+        McpTransport::LoopbackTcp { port, .. } => *port,
+        McpTransport::StreamableHttp { bind, .. } => bind.port(),
+    };
+    (port != 0).then_some(port)
 }
 
 /// Split a leading `--config <path>` / `--config=<path>` off `argv`, returning
@@ -1032,13 +1095,42 @@ mod tests {
 
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
-        build_env_filter, manages_system_proxy, parse_invocation, parse_mode,
-        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation, Mode,
-        OPERATOR_TOKEN_USAGE,
+        build_env_filter, configured_agent_port, manages_system_proxy, parse_invocation,
+        parse_mode, split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation,
+        Mode, OPERATOR_TOKEN_USAGE,
     };
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// L4PAR-AC34 (plan A10): the configured agent-transport port joins the L4
+    /// self-port set when it names a real port — loopback-TCP bus or streamable
+    /// HTTP — and not for stdio or an ephemeral `0` (that one arrives through
+    /// `McpServer::on_bound` once bound).
+    #[test]
+    fn configured_agent_port_names_bound_listeners_only() {
+        assert_eq!(
+            configured_agent_port(&McpTransport::LoopbackTcp {
+                port: 27431,
+                token: "t".into(),
+                endpoint_file: None,
+            }),
+            Some(27431)
+        );
+        assert_eq!(
+            configured_agent_port(&McpTransport::LoopbackTcp {
+                port: 0,
+                token: "t".into(),
+                endpoint_file: None,
+            }),
+            None
+        );
+        assert_eq!(
+            configured_agent_port(&McpTransport::streamable_http_default("t".into())),
+            Some(8084)
+        );
+        assert_eq!(configured_agent_port(&McpTransport::Stdio), None);
     }
 
     /// A `MakeWriter` that appends every formatted log line to a shared buffer,
