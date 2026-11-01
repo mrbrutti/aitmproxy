@@ -2772,4 +2772,407 @@ mod tests {
             Some(RequestState::Dismissed)
         );
     }
+
+    // ---- tester, fix range (p1b panel I1, S1): the single flight under
+    // contention, the claim after a panic, the settle bound, the attach arm ----
+
+    /// A requester that answers `CannotPrompt` and keeps every report it was
+    /// handed, so a test can see which report the request acted on.
+    struct Recording(Arc<Mutex<Vec<PrivilegeReport>>>);
+
+    impl Requester for Recording {
+        fn request(&self, _cfg: &PrivilegeConfig, report: &PrivilegeReport) -> (Outcome, String) {
+            self.0.lock().unwrap().push(report.clone());
+            (Outcome::CannotPrompt, "no".to_string())
+        }
+    }
+
+    fn open_gate(gate: &(Mutex<bool>, std::sync::Condvar)) {
+        let (open, changed) = gate;
+        *open.lock().unwrap() = true;
+        changed.notify_all();
+    }
+
+    /// A state over a [`Blocking`] prober and a [`Recording`] requester, with
+    /// the handles a test drives them through.
+    struct BlockingRig {
+        state: Arc<PrivilegeState>,
+        /// One message per `gather` the prober entered.
+        entered_rx: mpsc::Receiver<()>,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        /// How many times the prober gathered.
+        calls: Arc<AtomicU64>,
+        /// Every report the requester was handed.
+        seen: Arc<Mutex<Vec<PrivilegeReport>>>,
+    }
+
+    /// A [`BlockingRig`] with the gate as given and the clock pinned at `now`.
+    fn blocking_state(gate_open: bool, now: u64) -> BlockingRig {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new((Mutex::new(gate_open), std::sync::Condvar::new()));
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(
+            PrivilegeState::with_prober(
+                &cfg(),
+                Box::new(Blocking {
+                    entered: entered_tx,
+                    gate: Arc::clone(&gate),
+                    calls: Arc::clone(&calls),
+                }),
+                Arc::new(move || now),
+            )
+            .with_requester(Box::new(Recording(Arc::clone(&seen)))),
+        );
+        BlockingRig {
+            state,
+            entered_rx,
+            gate,
+            calls,
+            seen,
+        }
+    }
+
+    /// I1: a `request()` that arrives while another caller's **first** probe
+    /// is in flight waits for that probe instead of acting on the empty
+    /// report, starts no probe of its own, and completes as soon as the probe
+    /// lands: one gather serves the report and the request together.
+    #[test]
+    fn request_waits_for_an_in_flight_first_probe_and_gathers_once() {
+        let BlockingRig {
+            state,
+            entered_rx,
+            gate,
+            calls,
+            seen,
+        } = blocking_state(false, 500);
+
+        let first = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.report())
+        };
+        entered_rx
+            .recv_timeout(WAIT)
+            .expect("the first probe started");
+
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let _ = done_tx.send(state.request());
+            });
+        }
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(2)).is_err(),
+            "request() must not act on the empty report while the first probe is in flight"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the waiting request starts no probe of its own"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the requester is never asked over the empty report"
+        );
+
+        open_gate(&gate);
+        let opened = Instant::now();
+        let outcome = done_rx
+            .recv_timeout(WAIT)
+            .expect("request() returned once the probe landed");
+        assert!(
+            opened.elapsed() < Duration::from_secs(5),
+            "it returned on the probe landing, not at the settle bound ({:?})",
+            opened.elapsed()
+        );
+        let first = first.join().expect("first report");
+        assert_eq!(first.capture.state_str(), "needs_approval");
+        assert_eq!(outcome.outcome, Outcome::CannotPrompt);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].capture.state_str(),
+            "needs_approval",
+            "the requester saw the probe's report, not the empty one"
+        );
+        assert_eq!(outcome.privilege.capture.state_str(), "needs_approval");
+        assert_eq!(
+            outcome.privilege.request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 500,
+                message: "no".to_string(),
+            })
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one gather for the report and the request together"
+        );
+    }
+
+    /// I1: with a report in hand, a `request()` that arrives while a re-probe
+    /// is blocked in the prober answers at once from that report and starts
+    /// no gather of its own; the blocked report lands with the progress the
+    /// request recorded meanwhile, and the dirty mark it left makes the next
+    /// `report()` gather again.
+    #[test]
+    fn request_with_a_report_in_hand_does_not_wait_for_a_running_probe() {
+        let BlockingRig {
+            state,
+            entered_rx,
+            gate,
+            calls,
+            ..
+        } = blocking_state(true, 600);
+        assert_eq!(state.report().capture.state_str(), "needs_approval");
+        entered_rx.recv_timeout(WAIT).expect("the first probe");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Close the gate; the next probe blocks in the prober.
+        *gate.0.lock().unwrap() = false;
+        state.shared.mark_dirty();
+        let blocked = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.report())
+        };
+        entered_rx
+            .recv_timeout(WAIT)
+            .expect("the re-probe started and is blocked");
+
+        let started = Instant::now();
+        let outcome = state.request();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "request() did not wait behind the running probe ({:?})",
+            started.elapsed()
+        );
+        assert_eq!(outcome.outcome, Outcome::CannotPrompt);
+        assert_eq!(outcome.privilege.capture.state_str(), "needs_approval");
+        assert_eq!(
+            outcome.privilege.request.as_ref().map(|r| r.state),
+            Some(RequestState::Failed)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the request started no probe of its own"
+        );
+
+        open_gate(&gate);
+        let landed = blocked.join().expect("the blocked report");
+        assert_eq!(
+            landed.request.map(|r| r.state),
+            Some(RequestState::Failed),
+            "the blocked report carries the progress recorded meanwhile"
+        );
+        let next = state.report();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the dirty mark the request left makes the next report() gather again"
+        );
+        assert_eq!(next.request.map(|r| r.state), Some(RequestState::Failed));
+    }
+
+    /// A prober whose first `gather` panics; every later one answers row 6.
+    struct PanicsOnce(Arc<AtomicU64>);
+
+    impl Prober for PanicsOnce {
+        fn gather(&self, request: Option<&RequestProgress>) -> ProbeInputs {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("the gatherer blew up");
+            }
+            ProbeInputs {
+                enabled: true,
+                platform: Platform::Macos,
+                mac: Some(row6()),
+                linux: None,
+                request: request.cloned(),
+                now_ms: 0,
+            }
+        }
+    }
+
+    /// I1: a prober that panics releases the single-flight claim, so the next
+    /// `report()` gathers again instead of reading "in flight" forever, and a
+    /// `request()` after it needs no settle wait.
+    #[test]
+    fn a_panicking_prober_releases_the_single_flight_claim() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = Arc::new(
+            PrivilegeState::with_prober(
+                &cfg(),
+                Box::new(PanicsOnce(Arc::clone(&calls))),
+                Arc::new(|| 700),
+            )
+            .with_requester(Box::new(Recording(Arc::clone(&seen)))),
+        );
+        let crashed = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.report()).join()
+        };
+        assert!(crashed.is_err(), "the first probe panicked");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let started = Instant::now();
+        let report = state.report();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the claim was released: this report() gathered again"
+        );
+        assert_eq!(report.capture.state_str(), "needs_approval");
+        let outcome = state.request();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "no settle wait after the panic ({:?})",
+            started.elapsed()
+        );
+        assert_eq!(outcome.outcome, Outcome::CannotPrompt);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// I1: a `request()` waiting on a first probe that never lands gives up
+    /// at [`SETTLE_WAIT`] (bounded, never a deadlock), acts on the report in
+    /// hand, starts no probe of its own, and records its answer; the probe
+    /// that lands late carries that progress.
+    #[test]
+    fn request_stops_waiting_for_a_first_probe_at_the_settle_bound() {
+        let BlockingRig {
+            state,
+            entered_rx,
+            gate,
+            calls,
+            seen,
+        } = blocking_state(false, 800);
+        let stuck = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || state.report())
+        };
+        entered_rx
+            .recv_timeout(WAIT)
+            .expect("the first probe started");
+
+        let started = Instant::now();
+        let outcome = state.request();
+        let waited = started.elapsed();
+        assert!(waited >= SETTLE_WAIT, "returned early: {waited:?}");
+        assert!(
+            waited < SETTLE_WAIT + Duration::from_secs(20),
+            "not bounded: {waited:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the request started no probe of its own"
+        );
+        assert_eq!(outcome.outcome, Outcome::CannotPrompt);
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert_eq!(
+            outcome.privilege.request,
+            Some(RequestProgress {
+                state: RequestState::Failed,
+                at: 800,
+                message: "no".to_string(),
+            })
+        );
+
+        open_gate(&gate);
+        let first = stuck.join().expect("the stuck report");
+        assert_eq!(first.capture.state_str(), "needs_approval");
+        assert_eq!(
+            first.request.map(|r| r.state),
+            Some(RequestState::Failed),
+            "the probe that landed late carries the progress recorded meanwhile"
+        );
+    }
+
+    /// One prepared session, then timeouts; on drop, the progress as it stands.
+    struct OnePeerDropWatch {
+        session: Mutex<Option<HelperSession>>,
+        shared: Arc<Shared>,
+        progress_at_drop: Arc<Mutex<Option<Option<RequestState>>>>,
+    }
+
+    impl Acceptor for OnePeerDropWatch {
+        fn accept(&self, _pid: u32, _timeout: Duration) -> Result<HelperSession, SessionError> {
+            self.session
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or(SessionError::Timeout)
+        }
+    }
+
+    impl Drop for OnePeerDropWatch {
+        fn drop(&mut self) {
+            let state = self.shared.lock_cache().request.as_ref().map(|r| r.state);
+            *self.progress_at_drop.lock().unwrap() = Some(state);
+        }
+    }
+
+    /// S1 in the third terminal arm: when the helper connects but fails its
+    /// handshake, the listener is dropped **before** the `failed` row is
+    /// recorded (and before the kill and reap), the hold is released, the
+    /// launcher is killed once, and the failure is remembered for the
+    /// `version_mismatch` row.
+    #[test]
+    fn watcher_drops_the_acceptor_before_the_failed_row_on_a_handshake_failure() {
+        let (state, now) = state_over(vec![row6()]);
+        now.store(12_000, Ordering::SeqCst);
+        state.set_guard(Arc::new(L4Guard::new(&L4Config::default())));
+        let holds = HoldCount::default();
+
+        let (core, peer) = UnixStream::pair().expect("socketpair");
+        let peer_thread = garbage_peer(
+            peer,
+            encode(&Msg::HelloAck {
+                proto: 2,
+                helper_version: "9.9.9".to_string(),
+                caps: vec![],
+            }),
+        );
+        let session = HelperSession::from_stream(core).expect("session");
+        let child = FakeChild {
+            exit: Some(ChildExit::Exited(0)),
+            ..FakeChild::alive(4242)
+        };
+        let killed = Arc::clone(&child.killed);
+        let progress_at_drop = Arc::new(Mutex::new(None));
+        run_watcher(
+            Arc::clone(&state.shared),
+            Box::new(child),
+            Box::new(OnePeerDropWatch {
+                session: Mutex::new(Some(session)),
+                shared: Arc::clone(&state.shared),
+                progress_at_drop: Arc::clone(&progress_at_drop),
+            }),
+            holds.hold(),
+            12_000,
+            true,
+        );
+        assert_eq!(
+            *progress_at_drop.lock().unwrap(),
+            Some(None),
+            "the acceptor (and its socket path) went before the failed row was recorded"
+        );
+        let request = state.report().request.expect("progress recorded");
+        assert_eq!(request.state, RequestState::Failed);
+        assert_eq!(request.at, 12_000);
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            1,
+            "the launcher is killed once"
+        );
+        assert!(!holds.is_held(), "the hold is released");
+        assert_eq!(
+            state.shared.session_failure(),
+            Some(SessionFailure::VersionMismatch(2))
+        );
+        assert!(state.helper_backend().is_none());
+        peer_thread.join().expect("peer");
+    }
 }

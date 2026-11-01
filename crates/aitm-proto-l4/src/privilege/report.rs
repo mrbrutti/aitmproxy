@@ -423,4 +423,57 @@ mod tests {
         assert_eq!(bounded_text_or("ok", 10, "fallback"), "ok");
         assert_eq!(TEXT_BOUND, 512);
     }
+
+    // ---- tester, fix range (p1b panel S5): the bound at the edges ----
+
+    /// The cut lands on a character boundary for 3- and 4-byte characters,
+    /// an exact-fit text is untouched, a cut that exposes trailing whitespace
+    /// is trimmed again, a bound smaller than the first character is empty,
+    /// and every control character (C0, DEL, C1, the ESC of a colour
+    /// sequence) becomes a space, so no operator terminal ever receives one.
+    #[test]
+    fn bounded_text_edges_utf8_boundaries_and_control_characters() {
+        // A 4-byte character straddling the bound backs off to the boundary.
+        let s = format!("{}\u{1F600}", "a".repeat(510));
+        assert_eq!(s.len(), 514);
+        assert_eq!(bounded_text(&s, 512), "a".repeat(510));
+        // A 3-byte character ending exactly at the bound stays.
+        let s = format!("{}\u{20AC}", "a".repeat(509));
+        assert_eq!(s.len(), 512);
+        assert_eq!(bounded_text(&s, 512), s);
+        // Exact fit is untouched; one byte over loses one character.
+        let exact = "b".repeat(512);
+        assert_eq!(bounded_text(&exact, 512), exact);
+        assert_eq!(bounded_text(&"b".repeat(513), 512), exact);
+        // A cut that exposes trailing whitespace is trimmed again.
+        let s = format!("{} tail", "c".repeat(511));
+        assert_eq!(bounded_text(&s, 512), "c".repeat(511));
+        // Bounds smaller than one character.
+        assert_eq!(bounded_text("\u{E9}", 1), "");
+        assert_eq!(bounded_text("abc", 0), "");
+        // Control characters: C0, DEL, C1 (NEL), the ESC of a colour sequence.
+        assert_eq!(bounded_text("x\u{0}y\u{1F}z", 512), "x y z");
+        assert_eq!(bounded_text("x\u{7F}y", 512), "x y");
+        assert_eq!(bounded_text("x\u{85}y", 512), "x y");
+        assert_eq!(
+            bounded_text("x\u{1B}[31mred\u{1B}[0m", 512),
+            "x [31mred [0m"
+        );
+        assert_eq!(bounded_text("a\r\nb", 512), "a  b");
+        // Every C0, DEL and C1 code point is gone from the output.
+        for code in (0u32..=0x1F).chain(0x7F..=0x9F) {
+            let c = char::from_u32(code).expect("control code point");
+            let out = bounded_text(&format!("a{c}b"), 512);
+            assert_eq!(out, "a b", "U+{code:04X}");
+            assert!(!out.chars().any(char::is_control), "U+{code:04X}");
+        }
+        // Nothing but control characters is blank, and the fallback applies.
+        assert_eq!(bounded_text("\u{0}\u{1B}\u{7F}\u{9F}", 512), "");
+        assert_eq!(
+            bounded_text_or("\u{0}\u{1B}\u{7F}", 512, "fallback"),
+            "fallback"
+        );
+        // The fallback form bounds a long text like the plain one.
+        assert_eq!(bounded_text_or(&"d".repeat(600), 512, "f").len(), 512);
+    }
 }

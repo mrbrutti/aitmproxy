@@ -162,4 +162,88 @@ mod tests {
             .await
             .is_err());
     }
+
+    // ---- tester, fix range (p1b panel I2): the hold as the operator meets it ----
+
+    /// A sink the fmt subscriber writes into, so a test can read the log line.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Sink {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    /// Plan P1b.14 `held_ctrl_c_keeps_serving` (spec §5.5 as corrected by the
+    /// panel): every Ctrl-C that arrives while the hold is up is swallowed and
+    /// logged with exactly the spec's line, once each; releasing the hold
+    /// replays none of them (the core keeps serving until a *new* Ctrl-C);
+    /// the first Ctrl-C after the release ends the run and is not logged as a
+    /// cancelled prompt.
+    #[tokio::test]
+    async fn held_ctrl_c_keeps_serving() {
+        const LINE: &str = "Ctrl-C cancelled the packet-capture prompt; the core keeps serving";
+        let sink = Sink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let (tx, rx) = futures::channel::mpsc::unbounded::<()>();
+        let held = Arc::new(AtomicBool::new(true));
+        let is_held = {
+            let held = Arc::clone(&held);
+            move || held.load(Ordering::SeqCst)
+        };
+        let fut = interrupt_unless_held(rx, is_held);
+        tokio::pin!(fut);
+
+        for _ in 0..3 {
+            tx.unbounded_send(()).expect("ctrl-c while held");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut fut)
+                .await
+                .is_err(),
+            "three Ctrl-Cs while held must not end the run"
+        );
+        let text = sink.text();
+        assert_eq!(
+            text.matches(LINE).count(),
+            3,
+            "one spec line per swallowed Ctrl-C, verbatim: {text:?}"
+        );
+
+        held.store(false, Ordering::SeqCst);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut fut)
+                .await
+                .is_err(),
+            "releasing the hold replays no swallowed Ctrl-C"
+        );
+
+        tx.unbounded_send(()).expect("ctrl-c after release");
+        tokio::time::timeout(Duration::from_secs(5), &mut fut)
+            .await
+            .expect("the first Ctrl-C after the release ends the run");
+        assert_eq!(
+            sink.text().matches(LINE).count(),
+            3,
+            "the Ctrl-C that ends the run is not logged as a cancelled prompt"
+        );
+    }
 }
