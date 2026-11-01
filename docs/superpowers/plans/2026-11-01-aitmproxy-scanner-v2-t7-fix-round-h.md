@@ -35,6 +35,14 @@ Ratified builder decisions (recorded here, no change): needle prefix widths (`na
 
 Done, one commit `c34a08b0` (+565/-83); `--selftest` paints 200x50 frames from the renderer's geometry and passes 22 assertions offline; py_compile and discovery clean; the sandbox run dies at the bind denial before any claim. Premise correction: `Mode::Scan` bypasses `main_region`, so the Scan view draws no sidebar; the box border alone offsets `>` to column 1, and the reader anchors on the border column found from the tab-strip row, so it holds at any offset (the self-test covers a 28-column-sidebar variant too).
 
+## Round H cell re-review residuals (spec lane PASS, 2026-11-01)
+
+H12. `SITEMAP_MARKER = "{n} nodes"` is a bare substring (`"3 nodes"` matches `"13 nodes"` from the job-less answer): `SITEMAP_MARKER = " {n} nodes"` (the hint's leading pad cell) or `(?<!\d){n} nodes`; add the `n=13` negative beside the self-test's `n=4` one.
+
+H13. T7-19 identifies the node under the cursor by prefix (`GET  /` claims `GET  /search`): match `under.startswith(node_needle(n).rstrip() + "  flows")`; in `inspector_open` require the path be followed by whitespace, `?` or end of line (`re.escape(path) + r"(?=\s|\?|$)"`). Self-test row for the root-node case.
+
+H14. T7-18's post-`y` `row_shown` reads the id anywhere (the start toast carries it) and does not wait on the Jobs marker: `row_shown = bool(new_job) and term.wait_for(TAB_MARKERS["2"], ROW_APPEAR_S) and poll(row_tail ..)`, H5 parity.
+
 ## Not in this round
 
 The harness's shared default operator token on a loopback bus and the parent env inherited by the TUI child are pre-existing harness conventions (T10).

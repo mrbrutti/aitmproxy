@@ -667,6 +667,10 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | coder note | Minor | H2 adopts the exact-tuple entry's id for the `finally` removal and continues the step | ratified |
 | H (cell) | coder note | Minor | `TAB_MARKERS["3"]` replaced by `SITEMAP_MARKER = "{n} nodes"`; `cursor_row` right-strips; T7-16's Jobs-tab wait and row wait are one check | ratified |
 | H (cell) | coder note | note | T7-18's post-`y` `row_shown` does not wait on the Jobs marker; `on_cursor`'s `{0,8}` allowance can accept a sibling row containing the needle | accepted residuals; the live run will tell |
+| H (cell) | spec re-review | PASS | H9/H10 closed against the renderer geometry (body rows, border, strip, 45/55 rule at 90, Site map Points row); `--selftest` 22 ok run by the reviewer | three Minors to H12-H14 |
+| H (cell) | spec | Minor | node-count marker is a bare substring (`3 nodes` in `13 nodes`) | fix round H (H12) |
+| H (cell) | spec | Minor | node under the cursor matched by prefix; `inspector_open` path `/` matches anywhere | fix round H (H13) |
+| H (cell) | spec | Minor | post-`y` `row_shown` lacks the Jobs-marker wait | fix round H (H14) |
 
 ## Shipped
 
