@@ -644,6 +644,10 @@ Kept by the main session during stage 6. One row per finding.
 | G-C | coder note | Minor | a T7-19 node without flows is a failing check; evidence dir created lazily so a skip leaves none | ratified |
 | G-C | coder note | note | `harness_scan_start` reuses the old profile shape for `target.l4`; a schema mismatch fails loudly | accepted; the live run will tell |
 | G-C | coder note | note | a bind denial in the sandbox is reported as FAIL, not SKIP | accepted (not a plan capability gate) |
+| G-C | security re-review | PASS | G97/G98 verified against the core (`add_operator_scope`, `scope_id_to_string`, `Aitm.stop` waits) | three Minors to fix round H |
+| G-C | security | Minor | a raising cleanup step skips the work-dir removal | fix round H (H1) |
+| G-C | security | Minor | a lost `l4.scope.add` reply leaves the entry on a runner core | fix round H (H2): exact-tuple removal on `BusError` only |
+| G-C | security | Minor | inspector failure sample tagged `inspector` when it did not open | fix round H (H3) |
 
 ## Shipped
 
