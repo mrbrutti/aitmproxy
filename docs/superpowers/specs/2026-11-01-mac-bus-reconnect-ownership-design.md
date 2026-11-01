@@ -412,7 +412,10 @@ changes.
 
 `apps/mac/Sources/Aitmproxy/Bus/BusService.swift` (the fix), `apps/mac/Sources/Aitmproxy/SelfTest+Live.swift`
 (D5), `apps/mac/tools/selftest-live-reconnect.sh` (new, D6), `apps/mac/CLAUDE.md` (D7), this spec
-and its plan. Nothing else.
+and its plan. Nothing else. **Orchestrator amendment (Tester pass 2, F6):** plus the three window
+shots the shell check writes after each trigger, committed as PR evidence under the repo's existing
+convention, `apps/mac/docs/evidence/192-reconnect-ownership/after-{reconnect-bus,restart-core,crash-respawn}.png`
+(byte-identical to the green run's `/tmp/claude/reconnect-r192fix-*.png`).
 
 ## Acceptance criteria
 
@@ -466,8 +469,9 @@ check or script line, run in the Terminal panel, with the output quoted in the r
    path; every wait has a numeric bound (`grep` evidence quoted by the Tester).
 9. **BR-AC9 — scope of the diff.** `git diff --stat <base>..<head>` lists only
    `apps/mac/Sources/Aitmproxy/Bus/BusService.swift`, `apps/mac/Sources/Aitmproxy/SelfTest+Live.swift`,
-   `apps/mac/tools/selftest-live-reconnect.sh`, `apps/mac/CLAUDE.md`, and files under
-   `docs/superpowers/`. `BusClient.swift`, `BusError.swift`, `Session*.swift`, `App.swift`,
+   `apps/mac/tools/selftest-live-reconnect.sh`, `apps/mac/CLAUDE.md`, files under
+   `docs/superpowers/`, and (orchestrator amendment, Tester pass 2 F6) the three evidence shots under
+   `apps/mac/docs/evidence/192-reconnect-ownership/`. `BusClient.swift`, `BusError.swift`, `Session*.swift`, `App.swift`,
    `Shell/*.swift`, `SettingsView.swift`, `Bus/Embedded*.swift`, `Bus/LiveConnectionDriver.swift`,
    `Bus/ExtensionController.swift`, `CaptureAdvice.swift`, `Sources/AitmproxyKit/**`, `crates/**`
    are unchanged.
