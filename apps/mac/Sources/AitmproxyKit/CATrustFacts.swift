@@ -41,6 +41,8 @@ public struct CATrustFacts: Hashable, Sendable {
     public static let laneTitle = "Certificate Authority"
     /// A trust change ran but the forced `ca.status` re-read did not land (D17.5: the reply is not the fact).
     public static let readBackFailedLine = "the CA may have changed but ca.status could not be read"
+    /// The re-read landed, but every store answered `unknown`, so there is no fact to show.
+    public static let storesUnknownLine = "ca.status did not report trust for any store"
     /// The one call path refused: the bus is connected, but not as the operator.
     public static let notOperatorLine = "the bus is not the operator's"
 
@@ -107,15 +109,37 @@ public struct CATrustFacts: Hashable, Sendable {
 }
 
 /// The last trust change's failure, kept with the verb it came from so a read-back clears it only
-/// when that verb's end state is what the store now says; the CA panel shows `line`.
+/// when that verb's end state is what the store now says (`resolved(by:)`); the CA panel shows `line`.
 public struct CATrustFailure: Hashable, Sendable {
+    /// The verb by name: the bus literals live in Session+CATrust.swift alone, which maps them here.
+    public enum Verb: Hashable, Sendable {
+        case install
+        case uninstall
+        /// Not a trust verb; nothing in a read-back resolves it.
+        case other
+    }
+
+    /// The bus verb as the panel shows it.
     public var command: String
+    public var verb: Verb
     public var message: String
 
-    public init(command: String, message: String) {
+    public init(command: String, verb: Verb, message: String) {
         self.command = command
+        self.verb = verb
         self.message = message
     }
 
     public var line: String { "\(command): \(message)" }
+
+    /// D17.5: the store's answer clears the failure, never the reply. True when `status` reported
+    /// trust and says the verb's end state holds: trusted after an install, not trusted after an uninstall.
+    public func resolved(by status: CAStatus) -> Bool {
+        guard status.trustReported else { return false }
+        switch verb {
+        case .install: return status.trustedScope != nil
+        case .uninstall: return status.trustedScope == nil
+        case .other: return false
+        }
+    }
 }

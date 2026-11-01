@@ -51,10 +51,10 @@ extension Session {
     func untrustCA() async { await changeCATrust("ca.uninstall") }
 
     /// `ca.status` read directly on the bus (no activity-log entry, like `proxy.status`),
-    /// assigned only when it changed. A trusted store clears the needs-admin latch, and a failed
-    /// install's error (its end state holds); a failed uninstall's stays until an uninstall's does.
-    /// Returns whether the read-back landed: false for a core without the verb, no bus, or an
-    /// unparseable reply, which leaves the status as is.
+    /// assigned only when it changed. A trusted store clears the needs-admin latch; the one place a
+    /// read-back clears the last failure, when it says that failure's verb reached its end state
+    /// (`CATrustFailure.resolved(by:)`). Returns whether the read-back landed: false for a core
+    /// without the verb, no bus, or an unparseable reply, which leaves the status as is.
     @discardableResult
     func refreshCAStatus() async -> Bool {
         guard let commandRunner else { return false }
@@ -70,10 +70,8 @@ extension Session {
             return false
         }
         if status != caStatus { caStatus = status }
-        if status.trustedScope != nil {
-            caTrustNeedsAdmin = false
-            if caTrustLastError?.command == "ca.install" { caTrustLastError = nil }
-        }
+        if status.trustedScope != nil { caTrustNeedsAdmin = false }
+        if let failure = caTrustLastError, failure.resolved(by: status) { caTrustLastError = nil }
         return true
     }
 
@@ -85,7 +83,7 @@ extension Session {
     }
 
     private func changeCATrust(_ command: String) async {
-        guard !caTrustInstalling else { return }
+        guard !caTrustInstalling, case .connected = bus else { return }
         guard caTrustControlLive else {
             fail(command, CATrustFacts.notOperatorLine)
             return
@@ -115,17 +113,16 @@ extension Session {
                 fail(command, message)
             }
         }
-        // The fact is the store's (D17.5). A failure clears only when the store now says the verb's
-        // end state holds: trusted after an install, not trusted after an uninstall.
-        guard await refreshCAStatus(), let caStatus, caStatus.trustReported else {
+        // The fact is the store's (D17.5): the forced re-read clears a resolved failure itself.
+        guard await refreshCAStatus() else {
             if caTrustLastError == nil { fail(command, CATrustFacts.readBackFailedLine) }
             return
         }
-        if (caStatus.trustedScope != nil) == (command == "ca.install") { caTrustLastError = nil }
+        if caTrustLastError == nil, caStatus?.trustReported == false { fail(command, CATrustFacts.storesUnknownLine) }
     }
 
     private func fail(_ command: String, _ message: String) {
-        caTrustLastError = CATrustFailure(command: command, message: message)
+        caTrustLastError = CATrustFailure(command: command, verb: .init(command: command), message: message)
         lastError = caTrustLastError?.line
     }
 
@@ -148,5 +145,16 @@ extension Session {
         guard setupSheetDue else { return }
         Store.defaults.set(true, forKey: Self.setupSheetShownKey)
         setupSheetVisible = true
+    }
+}
+
+private extension CATrustFailure.Verb {
+    /// The verb literals' one home names them for the Kit.
+    init(command: String) {
+        switch command {
+        case "ca.install": self = .install
+        case "ca.uninstall": self = .uninstall
+        default: self = .other
+        }
     }
 }

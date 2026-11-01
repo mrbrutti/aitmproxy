@@ -316,23 +316,50 @@ import Testing
     }
 
     /// The words every CA surface shares: the spoken lane title (one speaker per row), the line
-    /// for a post-change read-back that did not land, the line for a refused call when the bus is
-    /// not the operator's.
+    /// for a post-change read-back that did not land, the line for one that landed with every store
+    /// unknown, the line for a refused call when the connected bus is not the operator's.
     @Test func surfaceWordsHaveOneHome() {
         #expect(CATrustFacts.laneTitle == "Certificate Authority")
         #expect(CATrustFacts.readBackFailedLine == "the CA may have changed but ca.status could not be read")
+        #expect(CATrustFacts.storesUnknownLine == "ca.status did not report trust for any store")
         #expect(CATrustFacts.notOperatorLine == "the bus is not the operator's")
     }
 
-    /// A trust failure keeps the verb it came from, so a later read-back clears it only when that
-    /// verb's end state is what the store now says; the CA panel shows "<verb>: <message>".
-    @Test func failureCarriesItsCommand() {
-        let failure = CATrustFailure(command: "ca.uninstall", message: "security: exit 1")
+    /// A trust failure keeps the verb it came from, named by the Kit's `Verb` (the bus literal is
+    /// Session+CATrust.swift's alone) and by the command text the CA panel shows as "<verb>: <message>".
+    @Test func failureCarriesItsCommandAndVerb() {
+        let failure = CATrustFailure(command: "ca.uninstall", verb: .uninstall, message: "security: exit 1")
         #expect(failure.command == "ca.uninstall")
+        #expect(failure.verb == .uninstall)
         #expect(failure.message == "security: exit 1")
         #expect(failure.line == "ca.uninstall: security: exit 1")
-        let refused = CATrustFailure(command: "ca.install", message: CATrustFacts.notOperatorLine)
+        let refused = CATrustFailure(command: "ca.install", verb: .install, message: CATrustFacts.notOperatorLine)
+        #expect(refused.verb == .install)
         #expect(refused.line == "ca.install: the bus is not the operator's")
         #expect(failure != refused)
+    }
+
+    /// The one clearing rule (D17.5): a failure is resolved by a read-back that reported trust and
+    /// says its verb's end state holds — trusted after an install, not trusted after an uninstall —
+    /// never by one where every store is unknown, and never for a verb with no end state.
+    @Test func failureResolvesOnlyWhenItsVerbsEndStateHolds() throws {
+        let trusted = try status(Self.trustedUserJSON)
+        let trustedBySystem = try status(Self.trustedSystemJSON)
+        let notTrusted = try status(Self.notTrustedJSON)
+        let unknown = try status(Self.allUnknownJSON)
+        let install = CATrustFailure(command: "ca.install", verb: .install, message: "security: exit 1")
+        let uninstall = CATrustFailure(command: "ca.uninstall", verb: .uninstall, message: "security: exit 1")
+        #expect(install.resolved(by: trusted))
+        #expect(install.resolved(by: trustedBySystem))
+        #expect(!install.resolved(by: notTrusted))
+        #expect(!uninstall.resolved(by: trusted))
+        #expect(!uninstall.resolved(by: trustedBySystem))
+        #expect(uninstall.resolved(by: notTrusted))
+        #expect(!install.resolved(by: unknown))
+        #expect(!uninstall.resolved(by: unknown))
+        let other = CATrustFailure(command: "ca.export", verb: .other, message: "no such verb")
+        #expect(!other.resolved(by: trusted))
+        #expect(!other.resolved(by: notTrusted))
+        #expect(!other.resolved(by: unknown))
     }
 }

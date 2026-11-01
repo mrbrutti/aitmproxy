@@ -234,8 +234,10 @@ final class Session {
     var caTrustInstalling = false
     /// The last change came back `HeadlessAuth` (macOS) or `NeedsRoot` (Linux).
     var caTrustNeedsAdmin = false
-    /// The last change's failure other than a cancelled dialog, with the verb it came from; the CA
-    /// panel shows it until a read-back says that verb's end state holds (Session+CATrust.swift).
+    /// The last change's failure other than a cancelled dialog, with the verb it came from. The CA
+    /// panel shows it until a `ca.status` read-back says that verb's end state holds
+    /// (`CATrustFailure.resolved(by:)`, applied in `refreshCAStatus`), a later change succeeds or
+    /// is cancelled, or the bus goes (`forgetCATrust`).
     var caTrustLastError: CATrustFailure?
     /// The first-run sheet (Shell/SetupSheet.swift) is up.
     var setupSheetVisible = false
