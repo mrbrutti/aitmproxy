@@ -59,6 +59,12 @@ H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm
 
 H19. Em dashes remain in operator-visible `app.rs` strings and in doc comments beyond G103's four (around lines 1622, 2033, 2137, 2144, 2149, 2171, 2199 and doc comments; `grep -n '—' crates/aitm-tui/src`): replace every one in the crate with a colon, comma or sentence break as the sentence wants (Matt's TUI-wide rule); update the tests that pin them. Not the `Findings — PoCs and runs` box title if a test outside this crate pins it; report it instead.
 
+H20. **Critical (was G19, claimed by round G-A, not in the range).** `app.rs` `scan.discover` arm calls `show_legacy` unconditionally; gate it on `MapSource::from(scan_offer()) == Legacy`; test: a V2 app with a folded `scan.sitemap.json` page then a `scan.discover` reply keeps `sitemap.nodes`/`lines` and fills `legacy.endpoints`.
+
+H21. G2's prescribed unit test: in `scan/issues.rs` the L4 mirror test folds 100 probe flows through `IssuesState::fold_issue` and asserts `DetailLayout::of(read).total == detail_len()` and `layout.row(first_after) == DetailRow::After(0)`.
+
+Ratified from the G-A+G-B spec re-review: `ui::scan::{Hint, hints, HELP, key_text, rows, wrap, blocked_footer, launch_reason}` stay `pub` because `tests/scan_v2_layout.rs` (G88) reads `HELP`/`key_text` from outside the crate; `scroll(at, ..)` lives in `scan/mod.rs` as `pub(crate)` so `DetailView::scroll` can use it; `LaunchVerb::parse`, `ReadCache::is_empty`/`keys`, `CURSOR_TOO_LONG` and `GATE_OPEN_PROFILE` are accepted helpers.
+
 ## Core track (outside T7, relayed to the coordinator 2026-11-01)
 
 `l4.scope.add` refuses `interface: "*"`: `crates/aitm-proto-l4/src/commands/scope.rs` `validate_interface` (`^[A-Za-z0-9._:-]{1,15}$`, landed in #218) has no `ANY_INTERFACE` branch, while `guard.rs` defines `"*"` as the entry-side wildcard and the TUI's D7 text tells the operator to add exactly that entry. Until the core accepts `"*"` the live T7-18 cleared-gate sub-steps (overlay, `y`, `n`) can only be noted as a core refusal; the cell must not paper over it with a literal interface (the guard's `interface_covers` would then demand the engine's target interface equal it).

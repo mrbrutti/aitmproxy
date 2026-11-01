@@ -627,7 +627,7 @@ Kept by the main session during stage 6. One row per finding.
 | 15 | spec | Minor | T7-19 opens `nodes[0]` of the reply, TUI renders in host-group order | fix round G-C (G101) |
 | 15 | spec | Minor | `tab()` markers present on every tab | fix round G-C (G96) |
 | 15 | spec | Minor | builder decisions unrecorded (Fatal policy, T7-18 ordering, child env, token file, skip format, `J` on Site map) | ratified in G101's text |
-| G-A | fix round | done | G10-G22, G31-G37, G42-G54, G57, G61, G66-G67, G71-G75, G82-G83 in 14 commits `0665f147..36ca1095`; crate gate green (496 tests) | D6/D8 amended with the builder's bounds; G102/G103 queued; combined panel after G-B and G-C |
+| G-A | fix round | done except G19 | G10-G18, G20-G22, G31-G37, G42-G54, G57, G61, G66-G67, G71-G75, G82-G83 in 14 commits `0665f147..36ca1095`; crate gate green (496 tests); G19 was claimed but not implemented (found by the spec re-review) | D6/D8 amended; G102/G103 queued; G19 is H20 |
 | G-A | coder note | Minor | `truncate` charges a control char one cell; `clean` strips `is_control` only (bidi/format filter stays out of track) | ratified |
 | G-A | coder note | Minor | G15 dedups before the cap (a million identical traits fold to one); G17 drops the cursor at 16 full pages | ratified; D6 amended |
 | G-A | coder note | Minor | G22 also groups legacy `scan.discover` nodes and re-finds the Nodes cursor by id on every fold; legacy `Enter` reads the grouped node | ratified (AC3 kept, `scan_surface` green) |
@@ -692,6 +692,11 @@ Kept by the main session during stage 6. One row per finding.
 | G-B | coder note | Minor | G1's generic leaf walk found `job` unbounded; `bound_issue` cuts it too; one `scan::DETAIL_VALUE_MAX` for both Detail panes | ratified; D6 amended |
 | G-B | coder note | Minor | G102 reuses `DETAIL_LIST_MAX` (8) for targets; the row joins the first four | ratified |
 | G-B | coder note | Minor | more em dashes remain in `app.rs` strings and doc comments | fix round H Rust (H19) |
+| G-A+G-B | spec re-review | FAIL | every other G item and spec ruling verified with its test; T7-1 to T7-15 mapped to tests | H20 (G19), H21 (G2 test), D3 amended, visibility ratified |
+| G-A+G-B | spec | Critical | G19 claimed by G-A but `show_legacy` still unconditional | fix round H Rust (H20) |
+| G-A+G-B | spec | Minor | G2's single layout pin (L4 lines plus dropped flows) missing | fix round H Rust (H21) |
+| G-A+G-B | spec | Minor | `ui::scan` helpers `pub` not `pub(crate)` | ratified: the layout suite reads `HELP`/`key_text` |
+| G-A+G-B | spec | Minor | spec D3 state shapes predate G-B | D3 amended |
 
 ## Shipped
 
