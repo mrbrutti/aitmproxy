@@ -1644,6 +1644,13 @@ Kept by the main session during stage 6. One row per finding.
 | 12 | Live run | Critical | Interim lane discovers nothing without a browser or captured flows; every T1 cell's job ends with 0 points | fixed in 54223f7f (`interim_crawl.rs`; `use_browser: never` skips the browser, `max_pages: 0` skips every crawl) |
 | 15 | Live run | Important | `scan.start` `profile`/`overrides` ParamSchema refuses valid ScanProfile keys (`name`, `accuracy`) | fixed in 587e5bdd (the param was an empty closed Object) |
 | 14 | Coder (client crawl) | Minor | `worker.rs` counts `crawl.pages` as store growth + lane charges, so browser-crawl pages count twice | whole-branch fix round |
+| 14 | Live run 2 | Important | An unavailable L4 lane in `lanes` is validated (`invalid_profile`: needs `target.l4`) before being skipped; `test_t1_lane_skip` picks any dead lane | fix dispatched 2026-11-01: resolve availability first; lane-specific validation only for lanes that run |
+| 6 | Live run 2 | Important | `scan.profile.save` refuses targetless templates (`test_t10_harness_config`) | fix dispatched 2026-11-01: shape rules at save, target rule at start |
+| 13 | Live run 2 | Minor | A failed script load is not visible on the core's stderr (`test_t1_catalogue` core C) | fix dispatched 2026-11-01: one `warn!` line naming the script and the key; subscriber lets warn through |
+| T10 harness | Live run 2 | Important | `aitm_e2e.scan._ERROR_CODE_RE` was `[a-z_]+`, so `refused_l4` never parsed (`test_t6_gates` all `?`) | fixed in 6ec7e0b7 (integration-shared helper; one character) |
+| T10 cell | Live run 2 | Minor | `test_t1_finding_link` counted the issue/job JSON under `scan/` as finding files | fixed in d3867d40: FindingRecord files only |
+| T4 lane | Live run 2 | Important | `test_t4_cswsh`/`test_t4_injection_oversize` finish `done` with 0 issues under the engine (`test_t4_points` passes) | diagnostic driver p13 in progress |
+| T2/T3 cells | Live run 2 | Note | `test_t2_*` (5) and `test_t3_version_override` FAIL rather than SKIP: they need T2's lane / T3's HttpSender, not on this build | expected until those PRs merge; stated in the PR body |
 
 ## Shipped
 
