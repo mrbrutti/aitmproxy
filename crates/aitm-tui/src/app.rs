@@ -4915,8 +4915,33 @@ mod tests {
     /// body (written to a private temp file), and says why otherwise.
     #[test]
     fn open_externally_targets_screenshots_images_and_large_bodies() {
-        let mut app = crate::fixture_app(200, 50);
-        // Findings: the fixture bus is not on this machine, so the screenshot
+        let mut app = crate::connected_app(200, 50);
+        // Two `poc.run` results, oldest first: the newest lands on top, so
+        // the cursor starts on the one with a screenshot.
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.run".into(),
+            value: json!({
+                "title": "Missing rate limit on /api/auth/login", "severity": "medium",
+                "target": "https://auth.example.test", "passed": false,
+                "at": "2026-10-31T12:00:01.000Z", "origin": "agent",
+                "poc_path": "pocs/login-rate-limit.yaml",
+                "evaluated": [{"assertion": "status == 429", "matched": false}]
+            }),
+        });
+        let _ = app.on_bus(BusEvent::CallOk {
+            name: "poc.run".into(),
+            value: json!({
+                "title": "Reflected XSS in /api/search q", "severity": "high",
+                "target": "https://api.example.test", "passed": true,
+                "at": "2026-10-31T12:00:02.000Z", "origin": "agent",
+                "poc_path": "pocs/reflected-xss-search.yaml",
+                "finding_capture": "f48",
+                "screenshot_path": "pocs/reflected-xss-search.png",
+                "evaluated": [{"assertion": "status == 200", "matched": true}]
+            }),
+        });
+        assert_eq!(app.findings.len(), 2);
+        // Findings: the bus address `test` is not loopback, so the screenshot
         // is fetched through `poc.artifact` (C10) rather than opened from a
         // local path; nothing opens before the bytes arrive.
         let _ = app.update(Action::OpenFindings);
@@ -4944,7 +4969,20 @@ mod tests {
             app.current_toast().map(|t| t.text.as_str()),
             Some("this finding has no screenshot to open")
         );
-        // A small text body (f41's products JSON) is shown inline: nothing to open.
+        // A small text body (a short JSON document) is shown inline: nothing to open.
+        let _ = app.on_bus(BusEvent::Flows(vec![summary(
+            "f41",
+            "GET",
+            "api.example.test",
+            "/api/products",
+            Some(200),
+            "observed",
+        )]));
+        let d = FlowDetail::from_json(&json!({"id":"f41","kind":"http",
+            "response":{"status":200,"headers":[["content-type","application/json"]],
+                        "body": crate::base64::encode(br#"{"items":[],"total":0}"#)}}))
+        .unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
         app.selected = Some("f41".into());
         app.mode = Mode::Inspector;
         app.inspector.pane = Pane::Response;
@@ -5244,10 +5282,33 @@ mod tests {
         );
     }
 
-    /// The fixture app on `f41` (products JSON) with the Response pane's JSON
-    /// tab focused.
+    /// An app on `f41` — a completed GET whose response is a small JSON
+    /// document, 18 lines as a tree — with the Response pane's JSON tab
+    /// focused. Both the summary and the body are written here.
     fn json_tab_app() -> App {
-        let mut app = crate::fixture_app(200, 50);
+        let mut app = crate::connected_app(200, 50);
+        let _ = app.on_bus(BusEvent::Flows(vec![summary(
+            "f41",
+            "GET",
+            "api.example.test",
+            "/api/products?category=widgets&limit=2",
+            Some(200),
+            "observed",
+        )]));
+        let body = json!({
+            "items": [
+                {"id": 1, "name": "Widget", "price": 9.5, "in_stock": true},
+                {"id": 2, "name": "Gadget", "price": 12.0, "in_stock": false}
+            ],
+            "page": 1,
+            "total": 2
+        })
+        .to_string();
+        let d = FlowDetail::from_json(&json!({"id":"f41","kind":"http",
+            "response":{"status":200,"headers":[["content-type","application/json"]],
+                        "body": crate::base64::encode(body.as_bytes())}}))
+        .unwrap();
+        let _ = app.on_bus(BusEvent::Detail(Box::new(d)));
         app.selected = Some("f41".into());
         app.mode = Mode::Inspector;
         app.inspector.pane = Pane::Response;
@@ -5361,7 +5422,7 @@ mod tests {
         app.mode = Mode::Flows;
         assert_eq!(
             app.copy_text().as_deref(),
-            Some("https://api.shop-staging.test/api/products?category=electronics&limit=20")
+            Some("https://api.example.test/api/products?category=widgets&limit=2")
         );
         let _ = app.update(Action::CopyUrl);
         assert_eq!(

@@ -2,8 +2,8 @@
 //! the toolbar, chip bar and status bar; a 28-column sidebar (`b` toggles);
 //! the flow list; the intercept bar when armed; the inspector below (or right)
 //! of the list on wide terminals and full-screen on narrow ones (§2.10(c)).
-//! Everything draws into a `Buffer`, so a snapshot renders the same way the
-//! live terminal does.
+//! Everything draws into a `Buffer`, so a test renders the same way the live
+//! terminal does.
 
 pub mod bars;
 pub mod browser;
@@ -187,6 +187,36 @@ fn main_region(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut
     }
 }
 
+/// Test-only: draw `app` into a fresh `cols`×`rows` buffer with the truecolor
+/// theme, through [`render`] — the path the live terminal takes.
+#[cfg(test)]
+pub(crate) fn render_buffer(app: &App, cols: u16, rows: u16) -> Buffer {
+    let area = Rect::new(0, 0, cols, rows);
+    let mut buf = Buffer::empty(area);
+    render(app, &Theme::new(true), area, &mut buf);
+    buf
+}
+
+/// Test-only: [`render_buffer`] as text, styles dropped — one symbol per
+/// cell, each line trimmed of trailing spaces, `\n`-joined, ending in `\n`.
+#[cfg(test)]
+pub(crate) fn render_text(app: &App, cols: u16, rows: u16) -> String {
+    let buf = render_buffer(app, cols, rows);
+    let area = buf.area;
+    let mut out = String::new();
+    for y in area.y..area.bottom() {
+        let mut line = String::new();
+        for x in area.x..area.right() {
+            if let Some(c) = buf.cell((x, y)) {
+                line.push_str(c.symbol());
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
 /// A centred box of at most `w`×`h` inside `area`.
 pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
@@ -202,14 +232,30 @@ pub fn centered(area: Rect, w: u16, h: u16) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::BusEvent;
     use crate::app::Mode;
     use ratatui::style::Modifier;
+    use serde_json::{json, Value};
+
+    /// A `flow.get` summary in the core's wire shape.
+    fn summary(
+        id: &str,
+        method: &str,
+        authority: &str,
+        path: &str,
+        status: Option<u16>,
+        intercept: &str,
+    ) -> Value {
+        json!({"id": id, "kind": "http", "method": method, "scheme": "https",
+               "authority": authority, "path": path, "status": status,
+               "is_replay": false, "intercept": intercept})
+    }
 
     /// S8: a compose field whose body area is zero cells wide must not
     /// underflow; `overlays::compose` is reachable with any `Rect`.
     #[test]
     fn compose_survives_a_zero_width_field_area() {
-        let mut app = crate::fixture_app(200, 50);
+        let mut app = crate::connected_app(200, 50);
         app.mode = Mode::Compose;
         let theme = Theme::new(true);
         for w in [0u16, 1, 2, 3, 4] {
@@ -235,12 +281,42 @@ mod tests {
         assert!(s.add_modifier.contains(Modifier::REVERSED));
     }
 
-    /// Q6: the per-frame view is computed once and agrees with the queries.
+    /// Q6: the per-frame view is computed once and agrees with the queries:
+    /// three flows, two of them paused; the intercept target is the selected
+    /// row when it is paused, else the oldest paused one.
     #[test]
     fn frame_view_is_the_visible_and_paused_sets() {
-        let app = crate::fixture_app(200, 50);
+        let mut app = crate::connected_app(200, 50);
+        let _ = app.on_bus(BusEvent::Flows(vec![
+            summary(
+                "f41",
+                "GET",
+                "api.example.test",
+                "/api/products",
+                Some(200),
+                "observed",
+            ),
+            summary(
+                "f50",
+                "POST",
+                "auth.example.test",
+                "/api/auth/login",
+                None,
+                "intercepted",
+            ),
+            summary(
+                "f51",
+                "GET",
+                "api.example.test",
+                "/api/me",
+                None,
+                "intercepted",
+            ),
+        ]));
+        app.selected = Some("f41".into());
         let view = FrameView::of(&app);
         assert_eq!(view.visible, app.visible());
+        assert_eq!(view.visible.len(), 3);
         assert_eq!(
             view.paused
                 .iter()
@@ -248,11 +324,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["f50", "f51"]
         );
+        // f41 is selected but not paused: the oldest paused row is the target.
         assert_eq!(
             view.intercept_target(&app).map(|r| r.id.as_str()),
             Some("f50")
         );
-        let mut app = app;
         app.selected = Some("f51".into());
         assert_eq!(
             FrameView::of(&app)
