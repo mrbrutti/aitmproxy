@@ -29,6 +29,7 @@ mod app;
 mod control;
 pub mod grader;
 pub mod l4;
+mod listeners;
 mod log;
 pub mod manifest;
 mod routes;
@@ -216,17 +217,10 @@ async fn bind_plain(port: u16, state: Arc<app::AppState>) -> std::io::Result<Soc
         grammar: None,
     });
 
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            let conn_state = state.clone();
-            tokio::spawn(async move {
-                app::serve_connection(stream, conn_state).await;
-            });
-        }
-    });
+    tokio::spawn(listeners::accept_loop(listener, move |stream, _peer| {
+        let conn_state = state.clone();
+        async move { app::serve_connection(stream, conn_state).await }
+    }));
     Ok(addr)
 }
 

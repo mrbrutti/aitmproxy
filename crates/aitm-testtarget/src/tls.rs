@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::app::{self, AppState};
+use crate::listeners::accept_loop;
 use crate::log::{Listener, ServiceInfo};
 
 /// ALPN list offered by the `tls` listener: HTTP/2 preferred, HTTP/1.1 fallback.
@@ -113,18 +114,11 @@ pub(crate) async fn bind(
         grammar: None,
     });
 
-    tokio::spawn(async move {
-        loop {
-            let Ok((stream, peer)) = listener.accept().await else {
-                continue;
-            };
-            let acceptor = acceptor.clone();
-            let state = state.clone();
-            tokio::spawn(async move {
-                serve_tls(kind, acceptor, stream, peer, state).await;
-            });
-        }
-    });
+    tokio::spawn(accept_loop(listener, move |stream, peer| {
+        let acceptor = acceptor.clone();
+        let state = state.clone();
+        async move { serve_tls(kind, acceptor, stream, peer, state).await }
+    }));
     Ok(addr)
 }
 

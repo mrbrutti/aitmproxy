@@ -8,7 +8,6 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
@@ -19,6 +18,7 @@ use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 
+use crate::listeners::accept_loop;
 use crate::log::{ControlLog, ServiceInfo};
 
 /// Every control response: a JSON document in a [`Full`] body.
@@ -40,30 +40,19 @@ pub(crate) async fn bind(port: u16, log: Arc<ControlLog>) -> std::io::Result<Soc
         grammar: None,
     });
 
-    tokio::spawn(async move {
-        loop {
-            let (stream, _peer) = match listener.accept().await {
-                Ok(accepted) => accepted,
-                Err(_) => {
-                    // A transient accept failure (e.g. EMFILE) must not spin
-                    // the loop hot; back off briefly and try again.
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    continue;
-                }
-            };
-            let conn_log = log.clone();
-            tokio::spawn(async move {
-                let io = TokioIo::new(stream);
-                let svc = service_fn(move |req| {
-                    let log = conn_log.clone();
-                    async move { route(req, log).await }
-                });
-                let _ = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(io, svc)
-                    .await;
+    tokio::spawn(accept_loop(listener, move |stream, _peer| {
+        let conn_log = log.clone();
+        async move {
+            let io = TokioIo::new(stream);
+            let svc = service_fn(move |req| {
+                let log = conn_log.clone();
+                async move { route(req, log).await }
             });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(io, svc)
+                .await;
         }
-    });
+    }));
 
     Ok(addr)
 }

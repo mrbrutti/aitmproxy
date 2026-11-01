@@ -29,6 +29,7 @@ use tokio::time::{sleep, timeout};
 
 use super::{dns, ftp, memcached, modbus, mqtt, resp, smtp, tlv, udp_payload};
 use super::{CrashWindow, Parsed, Proto, ServiceDef, Speaker, Step, CRASH_WINDOW, IDLE_TIMEOUT};
+use crate::listeners::SOCKET_ERROR_BACKOFF;
 use crate::log::{Classified, CloseReason, ControlLog, Dir, ServiceInfo};
 use crate::SeedMode;
 
@@ -46,10 +47,6 @@ const MAX_DATAGRAM: usize = 65_535;
 /// (plan P3: every 50 ms, up to 2 s).
 const REBIND_RETRY: Duration = Duration::from_millis(50);
 const REBIND_BUDGET: Duration = Duration::from_secs(2);
-
-/// Back-off after an `accept` / `recv_from` error so a persistent failure
-/// (EMFILE, a closed socket) cannot spin the task.
-const SOCKET_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 
 /// The nine services in spec D5 table order.
 pub fn all() -> Vec<ServiceDef> {
