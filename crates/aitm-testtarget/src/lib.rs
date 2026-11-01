@@ -22,10 +22,16 @@
 //! its in-scope assets are declared in the grader-only [`l4_manifest`].
 
 mod app;
+mod control;
 pub mod grader;
 pub mod l4;
+mod log;
 pub mod manifest;
+mod routes;
 mod seed;
+pub mod speakers;
+mod tls;
+mod ws;
 
 use std::sync::Arc;
 
