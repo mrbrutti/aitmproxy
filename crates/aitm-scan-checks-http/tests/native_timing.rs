@@ -266,9 +266,7 @@ async fn the_check_never_exceeds_eight_probes_per_point() {
     assert_eq!(verdict.outcome, Outcome::Clean);
     assert_eq!(host.sent().len(), 8);
 
-    // The second family is PostgreSQL, rendered as the canonical payload. The
-    // check's own source may not spell that function call (see
-    // `no_sleep_call_in_the_source`), so this is where it is pinned.
+    // The second family is PostgreSQL, rendered as the canonical payload.
     assert_eq!(
         &host.sent()[4..],
         &[
@@ -295,22 +293,39 @@ async fn the_check_never_sleeps() {
 
     assert_eq!(verdict.outcome, Outcome::Clean);
     assert_eq!(host.sent().len(), 8);
+    // Two seconds, not a tight bound: the assertion is "it did not wait for
+    // the three seconds it asked for", and a loaded CI box must not be able
+    // to turn that into a flake.
     assert!(
-        wall < Duration::from_millis(250),
+        wall < Duration::from_secs(2),
         "the run took {wall:?}; a timing check must never wait"
     );
 }
 
-/// The source pin behind AC T3-4's "the scripts never call `sleep`": no sleep
-/// call may appear in this check's source at all. The payload templates that
-/// *ask a target* to sleep are assembled without the literal, so this stays a
-/// true statement about the scanner's own behaviour.
+/// The source pin behind AC T3-4's "the scripts never call `sleep`". The AC's
+/// subject is the **scanner's own** behaviour: this check must never wait, so
+/// its source may not call a sleep. It may perfectly well *spell* one, because
+/// `'||pg_sleep(n)--` is a payload asking the target to wait, and hiding that
+/// payload behind a constant to satisfy a substring search made the code less
+/// readable without making the scanner any less patient (review finding C4).
 #[test]
 fn no_sleep_call_in_the_source() {
     let src = include_str!("../src/blind_timing.rs");
+    for call in [
+        "tokio::time::sleep(",
+        "thread::sleep(",
+        "std::thread::sleep",
+    ] {
+        assert!(
+            !src.contains(call),
+            "blind_timing.rs must never call {call}: the check reads elapsed_ms"
+        );
+    }
+    // And the payload is written out, not assembled: an operator reading the
+    // module sees exactly what goes on the wire.
     assert!(
-        !src.contains("sleep("),
-        "blind_timing.rs must contain no sleep call"
+        src.contains(r#"format!("'||pg_sleep({n})--")"#),
+        "the postgres payload must be written inline"
     );
 }
 

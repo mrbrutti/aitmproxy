@@ -29,10 +29,10 @@
 //! the `elapsed_ms` the lane measured (spec D4, "Timing without `sleep`"), so a
 //! check that probes for a three-second pause still returns in microseconds in a
 //! test and costs the job nothing but the target's own latency in a real run.
-//! The integration test `no_sleep_call_in_the_source` pins that literally: no
-//! sleep call appears anywhere in this file, which is why the one payload family
-//! whose SQL function name would otherwise spell one assembles its name from
-//! [`PG_DELAY_FN`].
+//! The integration test `no_sleep_call_in_the_source` pins that literally: this
+//! file calls no sleep, in any form. It does *spell* one — `pg_sleep(n)` is the
+//! payload that asks PostgreSQL to wait — and that is the point: what the
+//! module asks a target for is written out where an operator can read it.
 //!
 //! **Cost.** Four probes per family, [`MAX_TIMING_PROBES_PER_POINT`] per point,
 //! hence at most two families tried per point (AC T3-4's "<= 8 probes per
@@ -73,13 +73,6 @@ const DELAYS_S: [f32; PROBES_PER_FAMILY] = [1.0, 3.0, 1.0, 3.0];
 /// fourteen seconds per family.
 const THOROUGH_DELAYS_S: [f32; PROBES_PER_FAMILY] = [2.0, 5.0, 2.0, 5.0];
 
-/// The PostgreSQL delay function's name, spelled here rather than inline.
-///
-/// `pg_` + this is the function the payload calls. Written as a constant so the
-/// rendered payload is exactly the canonical one while this file's source stays
-/// free of anything that reads as a sleep call (see the module docs).
-const PG_DELAY_FN: &str = "sleep";
-
 /// One payload shape, named for the engine it targets.
 ///
 /// `template` renders the family's payload for a requested delay in seconds.
@@ -100,7 +93,7 @@ fn mysql(n: f32) -> String {
 
 /// PostgreSQL: concatenate the delay call onto the quoted value.
 fn postgres(n: f32) -> String {
-    format!("'||pg_{PG_DELAY_FN}({n})--")
+    format!("'||pg_sleep({n})--")
 }
 
 /// Microsoft SQL Server, whose delay is a statement rather than a function.
