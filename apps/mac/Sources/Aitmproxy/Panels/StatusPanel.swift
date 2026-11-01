@@ -83,16 +83,9 @@ struct StatusPanel: View {
         let busy = session.coreHealth.captureBusy
         return layout {
             ForEach(summary.lanes, id: \.kind) { lane in
-                VStack(alignment: .leading, spacing: Space.md) {
-                    LaneCard(lane: lane, captureBusy: busy, run: run)
-                    // The CA fact sits under the Core card (spec D17.6); no row while the OS store
-                    // has not answered, so "unread" never reads as "not trusted".
-                    if lane.kind == .core, let facts = session.caTrust {
-                        CATrustRow(facts: facts, live: session.caTrustControlLive, run: run)
-                    }
-                }
-                .frame(width: cardWidth, alignment: .leading)
-                .gridProbe("status.\(lane.kind.rawValue)", area: "status", edge: nil)
+                LaneCard(lane: lane, captureBusy: busy, run: run)
+                    .frame(width: cardWidth, alignment: .leading)
+                    .gridProbe("status.\(lane.kind.rawValue)", area: "status", edge: nil)
             }
             // No trailing Spacer: it would add one more HStack spacing (20 pt) and push the
             // row past the viewport, which centres the whole page on a half point.
@@ -102,7 +95,7 @@ struct StatusPanel: View {
     // MARK: Getting started
 
     private func gettingStarted(_ summary: ConnectionSummary) -> some View {
-        let steps = stepsWithCATrust(summary)
+        let steps = summary.steps
         return VStack(alignment: .leading, spacing: Space.md) {
             TrackedLabel("Getting started").accessibilityAddTraits(.isHeader)
             if steps.allSatisfy(\.done) {
@@ -124,15 +117,6 @@ struct StatusPanel: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Getting started")
-    }
-
-    /// The summary's steps with the session's CA step after Bus (spec D17.9); no row at all
-    /// while `ca.status` has never been read.
-    private func stepsWithCATrust(_ summary: ConnectionSummary) -> [GettingStartedStep] {
-        var steps = summary.steps
-        guard let step = session.caTrustStep, let at = steps.firstIndex(where: { $0.kind == .busConnected }) else { return steps }
-        steps.insert(step, at: at + 1)
-        return steps
     }
 
     // MARK: Recent
@@ -296,37 +280,6 @@ private struct LaneCard: View {
                 .accessibilityLabel("More \(lane.kind.title) actions")
             }
         }
-    }
-}
-
-// MARK: - CA trust row
-
-/// The CA fact under the Core card (spec D17.6): state dot + the fact's text, the remedy, its
-/// actions. Every word is `CATrustFacts`'; the buttons stand down unless the bus is the
-/// operator's and no change is in flight (`live`).
-private struct CATrustRow: View {
-    var facts: CATrustFacts
-    var live: Bool
-    var run: (ConnectionAction) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: Space.sm) {
-            LaneDot(state: facts.state, word: facts.text, title: CATrustFacts.laneTitle)
-                .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
-                .foregroundStyle(Tok.Ink.primary.color)
-            if let remedy = facts.remedy {
-                RemedyText(remedy)
-            }
-            if !facts.actions.isEmpty {
-                HStack(spacing: Space.xs) {
-                    ForEach(facts.actions, id: \.self) { action in
-                        FlatButton(action.title) { run(action) }.disabled(!live)
-                    }
-                }
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .accessibilityElement(children: .contain)
     }
 }
 

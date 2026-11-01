@@ -25,6 +25,7 @@ extension Session {
             flowCount: rows.count,
             listenAddress: coreHealth.connection?.proxyAddress ?? listenAddress,
             systemProxy: systemProxy,
+            caTrust: caTrust,
             tunnelledFlowCount: tunnelledFlowCount,
             decrypt: decrypt
         )
