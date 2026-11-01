@@ -476,7 +476,13 @@ impl Rig {
     /// A server built the way `main.rs` builds its primary and its `aitm web`
     /// server: `tui::server` plus `tui::with_shared_governance`.
     fn server(&self) -> McpServer {
-        let services = tui::services(&self.assembled.proxy, &self.cfg, None, TuiLog::Off);
+        let services = tui::services(
+            &self.assembled.proxy,
+            &self.cfg,
+            None,
+            TuiLog::Off,
+            self.assembled.job_bus.clone(),
+        );
         tui::with_shared_governance(
             tui::server(&self.cfg, self.cfg.mcp.transport.clone(), &services),
             &self.assembled.agent_state,
