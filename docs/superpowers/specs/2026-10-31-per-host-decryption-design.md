@@ -91,10 +91,13 @@ the explicit-proxy path now agree.
 - The push summary (`aitm-mcp` `flow_summary`) and `flow.get` (`aitm-plugins`
   `summarize`) are locked together by
   `push_summary_equals_flow_get_for_http_and_websocket_flows`; both gain the same keys.
-- Secrets: a tunnel row stores the CONNECT request headers (they are the request);
-  `proxy-authorization` is already a secret key under `is_secret_key` (`auth`
-  segment), so `flow.detail` redaction covers it. Failure reasons are a fixed code
-  set, never free text copied from an error.
+- Secrets: a tunnel row stores the CONNECT request headers (they are the request)
+  **except** that the value of `proxy-authorization` (and any header whose name
+  `is_secret_key` flags) is stored as the literal `<redacted>` by `TunnelRow::open`,
+  because `flow.detail` and session files carry headers verbatim (corrected
+  2026-11-01 from the panel's S3). Failure reasons are a fixed code set, never free
+  text copied from an error. A relay that sees no byte in either direction for ten
+  minutes is shut down so an idle tunnel cannot pin an open row forever (S2).
 - `crates/aitm/src/wire.rs`, `ingress.rs` and the `aitm-mcp` server pins were touched
   today by #214/#215; this change adds no bus verb, so `EXPECTED_TOOLS`/`CORE_TOOLS`/
   `bus-fixture.json` are untouched. Only `proxy.status` gains a sub-object.
@@ -109,6 +112,16 @@ A TLS connection is **decrypted** iff its tunnel authority is in Scope and not o
 the `tls.passthrough` pin list. Otherwise it is **passed through** (tunnelled
 byte-for-byte to the origin; the client completes TLS against the origin's own
 certificate).
+
+A passthrough relays **TLS only** (amended 2026-11-01 from the panel's S1): after
+the `200 Connection Established` acknowledgement the first byte the client sends
+must be a TLS handshake record (`0x16`); then the relay starts with that byte.
+EOF before it is `failed/client_closed`; any other first byte is
+`failed/protocol_error` and nothing is relayed. This holds for out-of-scope and
+pinned hosts alike (the feature is *TLS* passthrough) and restores the pre-branch
+posture: the only bytes that reach an arbitrary `host:port` through the proxy are
+a TLS handshake, never a client-chosen raw protocol (a cleartext `CONNECT` to an
+out-of-scope host, `curl -p http://…`, is therefore refused rather than relayed).
 
 - *Tunnel authority* is `host:port` from the `CONNECT host:port` line (port defaults
   to 443 when absent). For a raw TLS connection (no CONNECT) it is the ClientHello
@@ -319,8 +332,11 @@ client's own address), so that connection stays rowless as before (amended
 2026-11-01 from the Tester's T3).
 
 The passthrough module's path is the same list minus the TLS branch: parse →
-dial → (dial error → `failed/upstream_unreachable`) → ack → row `passthrough` →
-relay → close: bytes + duration.
+dial → (dial error → `failed/upstream_unreachable`) → ack → peek the first byte
+(EOF → `failed/client_closed`; not `0x16` → `failed/protocol_error`) → row
+`passthrough` → relay → close: bytes + duration. The HTTP module's out-of-scope
+relay (`!ctx.in_scope(authority)` above) applies the same first-byte rule after
+its ack.
 
 ### D7. Wire contract (every surface, same names)
 
@@ -365,7 +381,9 @@ tests that pinned the mark move to `tunnel == passthrough`.
   > `failed` with the reason, including "client rejected the proxy certificate",
   > the silent cause of empty captures on an untrusted CA. Plain HTTP to a host
   > outside Scope is still shown, marked passive: no script, breakpoint or map rule
-  > touches it. `tls.passthrough` pins still win over Scope.
+  > touches it. `tls.passthrough` pins still win over Scope. A tunnel relays TLS
+  > only: a CONNECT whose first byte is not a TLS record is refused and shown as a
+  > `failed` row, so the proxy never becomes a raw relay to an arbitrary host.
 
 - Existing configs with `scope.entries` keep decrypting those hosts; configs with no
   entries change behaviour (nothing decrypted) by design. No config migration.
