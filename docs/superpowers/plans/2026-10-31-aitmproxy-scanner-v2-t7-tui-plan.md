@@ -536,6 +536,16 @@ Kept by the main session during stage 6. One row per finding.
 | 12 | coder note | Minor | IPv6 L4 target renders `/128` in the third gate text | ratified (D7 text is IPv4-exact) |
 | 12 | coder note | Minor | Jobs footer shows the blocked reason on one truncated row when the Detail pane has 3+ rows | ratified; Task 14 may widen |
 | 12 | coder note | Minor | `scan.map` without an origin toasts `map needs an origin: add one (o) first` | ratified |
+| 12 | quality | Important | D8 scope-refusal rule copied at four sites with two wordings | fix round G (G61, with G14): one `out_of_scope` helper |
+| 12 | quality | Minor | legacy "already running" guard at four sites | fix round G (G62) |
+| 12 | quality | Minor | `launch_args` and the toast decide the profile-name precedence twice | fix round G (G63, with G39) |
+| 12 | quality | Minor | `fold_start_result`'s Jobs writes belong on `JobsState` | fix round G (G64, with G39) |
+| 12 | quality | Minor | Jobs and Profiles draw the blocked reason with two layouts; Jobs cuts the tail at 90 columns | fix round G (G65, after G55) |
+| 12 | quality | Minor | `l4_gate` decides IPv6 by `contains(':')` | fix round G (G66) |
+| 12 | quality | Minor | dead `wire_confirm_from` write; scan overlay arm copies the `l4.*` one; `Null` fallback papers over an invariant | fix round G (G67) |
+| 12 | quality | Minor | stringly-typed launch verb; stale `PendingLaunch` doc; family re-derived by `starts_with` | fix round G (G68) |
+| 12 | quality | Minor | vacuous `contains("P")`; clamped toast and `:scan` asserts as fragments | fix round G (G69) |
+| 12 | quality | Minor | `CLAMPED_MAX`/`CLAMPED_FIELD_MAX` in `app.rs` | fix round G (G70, addendum to G41) |
 
 ## Shipped
 

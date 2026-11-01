@@ -148,6 +148,28 @@ G59. View hygiene (`crates/aitm-tui/src/ui/scan/profiles.rs`): bind `area.width`
 
 G60. Addendum to G44, Task 11's tests (`crates/aitm-tui/tests/scan_v2_profiles.rs`): one trimmed row literal per pane (the `standard` list row, the lanes line, the budget line, one tree row, one picker row) beside the fragment asserts; `line_with(..).unwrap_or_default()` becomes `unwrap_or_else(|| panic!(..))` naming the missing row.
 
+## Task 12 quality panel
+
+G61. **Important.** The D8 scope-refusal rule is copied at four sites with two wordings (`crates/aitm-tui/src/app.rs` `scan_launch_v2` origins loop, `scan_start_typed`, legacy `scan_launch` (G14's em-dash copy), `submit_scan_origin`): one `pub fn out_of_scope(scope: &[String], raw: &str) -> Option<String>` in `scan/profiles.rs` beside `typed_origin` (returns the refusal toast text `Out of scope: add \`<host>\` to scope to scan it` for an empty or uncovered host, `None` when covered), and one `App::scope_host(&mut self, raw) -> Option<String>` that toasts it; the four sites call it. The origins loop becomes `find_map` over `&draft.target.origins` with no `Vec<String>` clone (compute the failing host, then toast). Pairs with G14. Test: the four paths all produce the one literal.
+
+G62. The legacy "already running, else `scan_launch`" guard is at four sites (`app.rs` `r`, `:scan` legacy, `s`/`m` legacy, `scan.map` fallback): move the `running` check and its toast into `scan_launch` and delete the four guards.
+
+G63. `launch_args` and the toast's profile name decide the same precedence twice (`app.rs` `scan_launch_v2`; `scan/launch.rs` `launch_args`): `launch_args` returns `Option<Launch { args: Value, profile_name: Option<String> }>` so the request and the toast read one rule. Rides with G39.
+
+G64. `fold_start_result`'s six Jobs writes belong on `JobsState` (`app.rs`): `JobsState::land_started(&mut self, status: JobStatus)` holding `started_here.insert`, `fold_status`, move-to-front, `cursor = 0`, `pane = List`, `detail_scroll = 0`, with a unit test for the already-listed case; `fold_start_result` keeps the D6 bounds and the toasts. Rides with G39.
+
+G65. Jobs and Profiles draw the blocked reason with two layouts and two copies of the footer arithmetic (`ui/scan/jobs.rs`, `ui/scan/profiles.rs`): after G55, one `pub fn blocked_footer(theme, area, blocked: Option<&str>, footer: &str, buf) -> Rect` in `ui/scan/mod.rs` drawing the wrapped reason over the hint and returning the body rect; both `detail` functions call it (the Jobs copy stops cutting the actionable tail at 90 columns). Test: the D7 fragments whole at 90x40 on the Jobs tab too.
+
+G66. `l4_gate` decides IPv6 by `contains(':')` (`scan/launch.rs`): `match first.ip.parse::<IpAddr>() { Ok(IpAddr::V6(_)) => 128, _ => 32 }` with a comment that an unparseable ip still yields a suggestion because G53 refuses it at fold.
+
+G67. `wire_confirm_from = Mode::Scan` written at send time with no reader before the overlay arm overwrites it; the scan overlay-opening arm copies the `l4.*` one (`app.rs`): delete the dead write; `fn open_wire_confirm(&mut self, confirm: WireConfirm, from: Mode)` used by both arms; the scan arm's `map_or((name, Null))` fallback becomes `let Some(p) = pending else { set_error(uncoded(tag, "reply with no pending launch")); return }`.
+
+G68. Stringly-typed launch verb and a stale `PendingLaunch` doc (`app.rs`, `scan/launch.rs`, `ui/scan/confirm.rs`): `pub enum LaunchVerb { Start, Map }` with `as_str()`/`Display`; `PendingLaunch.call: LaunchVerb`; `on_scan_failed` tests `pending.as_ref().is_some_and(|p| p.call.as_str() == tag)`; the doc drops `scan.discover`; `WireConfirm::is_scan()` (or `pub(crate) Family::of`) used by the reducer and the view instead of `starts_with("scan.")`.
+
+G69. Test assertions in `tests/scan_v2_launch.rs`: delete the vacuous `contains("P")`; the clamped toast asserted as the full literal `(Level::Warn, "clamped: budget.probes 50000 -> 20000")`; the `:scan` success half uses `launch_requests(&reqs)` like the second half.
+
+G70. Addendum to G41: `CLAMPED_MAX`/`CLAMPED_FIELD_MAX` move with `SAVED_NAME_MAX`/`SAVED_PATH_MAX` to the model with one doc line each.
+
 ## Not in this round
 
 The TUI-wide bidi/format-character filter (follow-up outside this track).
