@@ -349,8 +349,8 @@ greps, Task 6, and the diff review.
   and in `ConnectionSummaryTests`, `decrypt: DecryptStatus(scopeHosts: 0, decrypting: false, advice: "")` →
   `routes.scope.line == "Nothing is decrypted until a host is in Scope."` (the fallback, never an empty line —
   the memberwise init bypasses the decoder, so `make`'s Scope derivation normalises the blank itself; stage-6
-  SP-I1, fixed in a code commit, SHA to be stamped).
-  **Bounded advice and negative count (stage-6 S2/S3; fixed in a code commit, SHA to be stamped):**
+  SP-I1, fixed in a code commit, 544fcc3f).
+  **Bounded advice and negative count (stage-6 S2/S3; fixed in a code commit, 544fcc3f):**
   `{"scope_hosts": 0, "decrypting": false, "advice": "line one\nline two"}` → `advice == "line one line two"`;
   an `advice` of 600 `"a"` characters → `advice?.count == 512`; the core's 47-character sentence unchanged;
   `{"scope_hosts": -1, "decrypting": false}` → `DecryptStatus(json:) == nil`.
@@ -710,7 +710,7 @@ greps, Task 6, and the diff review.
   action is `.openCaptureSettings` (the fresh-install button until PR4), set `session.settingsTab = .capture`
   and call `openSettings()` exactly as `AppsAttributionBanner` does (ruling 2026-11-01). The `.trustCA` button
   (banner and empty-state row) is `.disabled(!session.caTrustControlLive)`, as the Status page's was (stage-6 S1;
-  fixed in a code commit, SHA to be stamped). Icon + text pairs are a `Label` (stage-6 Q9). Glyph `"network"` (a
+  fixed in a code commit, 544fcc3f). Icon + text pairs are a `Label` (stage-6 Q9). Glyph `"network"` (a
   string literal for now — stage-6 Q10 accepted; follow-up in Shipped). The file mentions
   none of `connectionSummary`, `ConnectionSummary`, `LaneDot`, `LaneState`, `CaptureSwitch`,
   `capture.enabled`, `extensionController`, `CaptureAdvice`.
@@ -1249,7 +1249,7 @@ docs PR from this branch. Rows whose Reviewer reads "Tester (whole branch)" or "
 `ce296c83` … `e60a13e8`); a "fixed in <code commit>" disposition gets its SHA stamped by the orchestrator when the
 coder's commit lands. Rows whose Task reads "PR #265" are the **stage-6 panel on the shipped code** (range
 `58724ef7..6ebc9e8f`, PR #265; security PASS with 3 Minor, quality PASS with 14 Minor, spec FAIL with 2 Important
-and 5 Minor); "fixed in <code commit> (SHA to be stamped)" is the one stage-6 fix commit, stamped by the
+and 5 Minor); "fixed in 544fcc3f" is the one stage-6 fix commit, stamped by the
 orchestrator; "accepted" rows carry the orchestrator's 2026-11-01 ruling and, where one is owed, the follow-up
 named in Shipped.
 
@@ -1319,30 +1319,30 @@ named in Shipped.
 | 6 | Architect (amendment) | Minor | item 10 — Half A ran with the session's own bundle script and the installed app left running, so `L` = `127.0.0.1:63109`, not 8080; evidence `/tmp/claude/route-advice/` + shared note `traffic-route-live-proof-half-A.md`; Half B on the first DMG containing this PR | fixed in docs (this commit): plan Task 6 "As run", Half B header, call 8, Q2, Shipped pre-fill |
 | all | Architect (amendment) | Minor | `tools/grid-lint.sh` is zsh; the four tripwires are bash | fixed in docs (this commit): plan Environment adaptation says which is which and to run grid-lint by path, never under `bash` |
 | all | Architect (amendment) | Minor | plan header named the branch `claude/apps-attribution-8ab619`; the implementation shipped on `feat/mac-traffic-route-advice` (Architect's call to correct it) | fixed in docs (this commit) |
-| PR #265 | security | Minor | S1 — the Flows trust-CA button (banner and empty-state row) is not `.disabled(!caTrustControlLive)` as the Status row's is; the downstream guard in `Session+CATrust` refuses the call, so a UX gap, not a bypass | fixed in <code commit> (SHA to be stamped): the `.trustCA` button is disabled unless `session.caTrustControlLive`; docs: spec D7, plan Task 3 (stage-6 docs pass) |
-| PR #265 | security | Minor | S2 — `decrypt.advice` is unbounded, and `TrafficRoute.state` is parsed from `line` by splitting on " — " (a core sentence containing " — ", a multi-line or a huge string reaches the one-line banner, its tooltip and the Status row) | fixed in <code commit> (SHA to be stamped): `TrafficRoute` stores `state` and `remedy`, `line` is computed, nothing parses; `DecryptStatus(json:)` flattens line breaks and caps `advice` at 512 characters; docs: spec D2/D3/TR-AC21, plan Task 1 (stage-6 docs pass) |
-| PR #265 | security | Minor | S3 — a negative `scope_hosts` is accepted (a malformed reply could render `Scope: -1 hosts decrypted`) | fixed in <code commit> (SHA to be stamped): `DecryptStatus(json:)` is nil on `scope_hosts < 0`; docs: spec D2/TR-AC21, plan Task 1 (stage-6 docs pass) |
+| PR #265 | security | Minor | S1 — the Flows trust-CA button (banner and empty-state row) is not `.disabled(!caTrustControlLive)` as the Status row's is; the downstream guard in `Session+CATrust` refuses the call, so a UX gap, not a bypass | fixed in 544fcc3f: the `.trustCA` button is disabled unless `session.caTrustControlLive`; docs: spec D7, plan Task 3 (stage-6 docs pass) |
+| PR #265 | security | Minor | S2 — `decrypt.advice` is unbounded, and `TrafficRoute.state` is parsed from `line` by splitting on " — " (a core sentence containing " — ", a multi-line or a huge string reaches the one-line banner, its tooltip and the Status row) | fixed in 544fcc3f: `TrafficRoute` stores `state` and `remedy`, `line` is computed, nothing parses; `DecryptStatus(json:)` flattens line breaks and caps `advice` at 512 characters; docs: spec D2/D3/TR-AC21, plan Task 1 (stage-6 docs pass) |
+| PR #265 | security | Minor | S3 — a negative `scope_hosts` is accepted (a malformed reply could render `Scope: -1 hosts decrypted`) | fixed in 544fcc3f: `DecryptStatus(json:)` is nil on `scope_hosts < 0`; docs: spec D2/TR-AC21, plan Task 1 (stage-6 docs pass) |
 | PR #265 | security | — | `unsafe` sign-off: no `unsafe` block in the range | n/a |
-| PR #265 | quality | Minor | Q1 — `state` parsed from `line` | fixed in <code commit> (SHA to be stamped), as S2 |
-| PR #265 | quality | Minor | Q2 — duplicate open/closed filters in `make`'s route derivation | fixed in <code commit> (SHA to be stamped): one filter |
-| PR #265 | quality | Minor | Q3 — external-core `allApps == nil` carried two meanings (no extension vs external core), decided in two places | fixed in <code commit> (SHA to be stamped): decided in one place |
+| PR #265 | quality | Minor | Q1 — `state` parsed from `line` | fixed in 544fcc3f, as S2 |
+| PR #265 | quality | Minor | Q2 — duplicate open/closed filters in `make`'s route derivation | fixed in 544fcc3f: one filter |
+| PR #265 | quality | Minor | Q3 — external-core `allApps == nil` carried two meanings (no extension vs external core), decided in two places | fixed in 544fcc3f: decided in one place |
 | PR #265 | quality | Minor | Q4 — `ScopeBanner` is a dead struct in `Panels/ScopePanel.swift` | accepted for this PR (orchestrator 2026-11-01: the file is outside this plan's claim); follow-up in Shipped: delete it |
 | PR #265 | quality | Minor | Q5 — `AppsAttributionBanner` kept alive only so the NS-AC3 pins hold | accepted for this PR (orchestrator 2026-11-01: the `ShellView` grant is `EmptyFlows` + the banner insertion only); follow-up in Shipped: retarget the NS-AC3 pins at `RouteBanner`, delete the struct |
-| PR #265 | quality | Minor | Q6 — three `make` evaluations per render (`MainView.flows`'s guard, `RouteBanner` and `EmptyFlows` each read `session.trafficRoutes`) | fixed in <code commit> (SHA to be stamped): routes computed once in `MainView.flows`, passed to `RouteBanner(routes:)` and `EmptyFlows(routes:run:)`; docs: spec D5/D7/D8, plan Tasks 3/5 (stage-6 docs pass) |
-| PR #265 | quality | Minor | Q7 — `EmptyFlows` half-pure (routes by parameter, actions via the environment) | fixed in <code commit> (SHA to be stamped): a `run` closure parameter; docs: spec D7, plan Task 3 (stage-6 docs pass) |
-| PR #265 | quality | Minor | Q8 — `?? ""` on the banner text in `RouteBanner` | fixed in <code commit> (SHA to be stamped) |
-| PR #265 | quality | Minor | Q9 — icon + text built as an `HStack`, not a `Label` (apps/mac/CLAUDE.md design rule) | fixed in <code commit> (SHA to be stamped); docs: spec D7, plan Task 3 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q6 — three `make` evaluations per render (`MainView.flows`'s guard, `RouteBanner` and `EmptyFlows` each read `session.trafficRoutes`) | fixed in 544fcc3f: routes computed once in `MainView.flows`, passed to `RouteBanner(routes:)` and `EmptyFlows(routes:run:)`; docs: spec D5/D7/D8, plan Tasks 3/5 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q7 — `EmptyFlows` half-pure (routes by parameter, actions via the environment) | fixed in 544fcc3f: a `run` closure parameter; docs: spec D7, plan Task 3 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q8 — `?? ""` on the banner text in `RouteBanner` | fixed in 544fcc3f |
+| PR #265 | quality | Minor | Q9 — icon + text built as an `HStack`, not a `Label` (apps/mac/CLAUDE.md design rule) | fixed in 544fcc3f; docs: spec D7, plan Task 3 (stage-6 docs pass) |
 | PR #265 | quality | Minor | Q10 — glyph string literals (`"network"`, `"app.badge"`) beside `Tok.Glyph.*` tokens | accepted for this PR (orchestrator 2026-11-01); follow-up in Shipped: `Tok.Glyph.network` / `Tok.Glyph.apps` via gen-tokens, together with the icons PR's `glyph.process` |
-| PR #265 | quality | Minor | Q11 — the words tripwire's FAIL message and exclusion list duplicated between rule 1's two greps | fixed in <code commit> (SHA to be stamped); docs: plan Task 5 (stage-6 docs pass) |
-| PR #265 | quality | Minor | Q12 — the grid-invariant test's oracle re-derived the shown set instead of reading `shown` | fixed in <code commit> (SHA to be stamped): the oracle is `routes.shown` |
-| PR #265 | quality | Minor | Q13 — a magic step count and positional `steps[n]` indexing in the step tests | fixed in <code commit> (SHA to be stamped): steps looked up by kind |
+| PR #265 | quality | Minor | Q11 — the words tripwire's FAIL message and exclusion list duplicated between rule 1's two greps | fixed in 544fcc3f; docs: plan Task 5 (stage-6 docs pass) |
+| PR #265 | quality | Minor | Q12 — the grid-invariant test's oracle re-derived the shown set instead of reading `shown` | fixed in 544fcc3f: the oracle is `routes.shown` |
+| PR #265 | quality | Minor | Q13 — a magic step count and positional `steps[n]` indexing in the step tests | fixed in 544fcc3f: steps looked up by kind |
 | PR #265 | quality | Minor | Q14 — `FlowRow.tls` and `tunnel` are independent stored fields | accepted by design (orchestrator 2026-11-01): `tls` has non-tunnel sources (the scheme rule on rows without `tunnel`, every row from an older core); noted in spec D2 (stage-6 docs pass) |
 | PR #265 | quality | Minor | Q15 — `Session.systemProxy` is declared but never written | accepted by design (spec D6, plan call 4): PR4 writes it; nil = unknown, never "off" |
-| PR #265 | spec | Important | SP-I1 — the blank-advice rule lived only in the decoder, and the plan's memberwise `advice: ""` test was absent, so a memberwise-built `DecryptStatus` would print an empty Scope line | fixed in <code commit> (SHA to be stamped): `make`'s Scope derivation guards a blank advice and the `ConnectionSummaryTests` memberwise-`""` case is added; docs: spec D3/TR-AC21 say both layers normalise, plan Task 1 (stage-6 docs pass) |
+| PR #265 | spec | Important | SP-I1 — the blank-advice rule lived only in the decoder, and the plan's memberwise `advice: ""` test was absent, so a memberwise-built `DecryptStatus` would print an empty Scope line | fixed in 544fcc3f: `make`'s Scope derivation guards a blank advice and the `ConnectionSummaryTests` memberwise-`""` case is added; docs: spec D3/TR-AC21 say both layers normalise, plan Task 1 (stage-6 docs pass) |
 | PR #265 | spec | Important | SP-I2 — no quoted Swift gate for the head commit in the plan | fixed in docs (stage-6 docs pass): Task 6 "Gate record for the stage-6 head commit `6ebc9e8f`" quotes `/tmp/claude/attr/gate-routes.log` — `✔ Test run with 624 tests in 77 suites passed`, `✔ Test run with 31 tests in 6 suites passed`, `swift-test-exit=0`, `check-connection-words-exit=0`, `check-capture-operator-only-exit=0`, `check-capture-toggle-exit=0`, `check-ca-trust-path-exit=0`, `grid-lint-exit=0`; the same lines sit on the e58b267a rows above; Rust gate at `6ebc9e8f`: `FMT_OK`, `CLIPPY_OK`, `cargo test` result `cargo test` exit 0, 265 test binaries ok (Terminal, rust-gate.log) |
 | PR #265 | spec | Minor | SP-M3 — the `TrafficRoutes` signature in spec D2 / plan Task 1 differed from the shipped one (`banner`, `bannerAction`, `bannerDetail` are computed from `shown`; the init is `(systemProxy:allApps:scope:caTrust:advice:shown:)`) | fixed in docs (stage-6 docs pass): spec D2, D5, Left to the builder; plan Task 1 |
 | PR #265 | spec | Minor | SP-M4 — the StatusPanel hand-over (`cb9f59be`) also deleted the private `CATrustRow` struct and the `VStack` wrapper around `LaneCard`, unstated in D7/TR-AC8/Task 2b | fixed in docs (stage-6 docs pass): spec D7 and TR-AC8, plan Task 2b |
-| PR #265 | spec | Minor | SP-M5 — TR-AC18's `.off`-led `shown` literal (`[.systemProxy, .allApps, .scope, .caTrust]`) was not pinned by a test | fixed in <code commit> (SHA to be stamped): the test is added; spec TR-AC18 notes the pin (stage-6 docs pass) |
+| PR #265 | spec | Minor | SP-M5 — TR-AC18's `.off`-led `shown` literal (`[.systemProxy, .allApps, .scope, .caTrust]`) was not pinned by a test | fixed in 544fcc3f: the test is added; spec TR-AC18 notes the pin (stage-6 docs pass) |
 | PR #265 | spec | Minor | SP-M6 — Half A's header-offset numbers (≈141 px vs ≈110 px at an unknown scale) do not establish the 28 pt figure | fixed in docs (stage-6 docs pass): Task 6 "As run" reads "one banner row, not two; the 28 pt measurement is Half B's B4 (AX frame or known-scale shot)" |
 | PR #265 | spec | Minor | SP-M7 — gate 3 blank; coverage row 17 and three Task 6 paragraphs still said "NOT-trusted only" against the TR-AC17 TRUSTED ruling | fixed in docs (stage-6 docs pass): gate 3 = PR #254 / `58724ef7`; the Environment hard-gate paragraph, Task 6's Satisfies and Change paragraphs and coverage row 17 aligned with the ruling (the hard-gate text — no `ca.install`, no clicks — unchanged) |
 
