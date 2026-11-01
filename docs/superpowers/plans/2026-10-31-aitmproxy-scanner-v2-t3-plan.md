@@ -392,6 +392,11 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
   4. `sender.rs`: the `https` arm dispatches on the negotiated protocol; the `H2c`
      policy on an `http://` origin skips TLS and hands the raw stream to `exchange`
      (prior-knowledge h2); `H2c` on `https` behaves as `H2`.
+  5. **(Amendment from the Task 1 report, T3 session 2026-11-01.)** `sender.rs`: the
+     ALPN cache is written only by a `VersionPolicy::Auto` exchange. A forced `H1`
+     or `H2` send never records `Negotiated` for the authority, so a later `Auto`
+     send still offers both protocols. This is the one further `sender.rs` edit
+     Task 3 may make.
 - **Test** (`h2_sender.rs` `#[cfg(test)]`, `#[tokio::test]`, far end = `h2::server::handshake`
   over `tokio::io::duplex`; plus two cases in `sender.rs`'s module reusing its TLS helper):
   - `an_h2_exchange_round_trips_over_a_duplex_server`: server answers `200` with body
@@ -412,6 +417,10 @@ Tasks inside a wave touch disjoint files and fan out to parallel coders.
     a server that never answers yields an error whose string contains `"timed out"`.
   - `h2_requests_carry_no_connection_close`: the server's received header map has no
     `connection` key (S1/D8.2: `Connection: close` is h1-only).
+  - `a_forced_h1_send_does_not_pollute_the_alpn_cache` (`sender.rs` tests): a
+    `VersionPolicy::H1` send to an h2-capable origin leaves
+    `negotiated_for("origin.test:443") == None`, and the following `Auto` send offers
+    `["h2", "http/1.1"]` and caches `Some(Negotiated::H2)`.
 - **Done when:** `cargo test -p aitm-proto-http --offline` passes and the full gate passes.
 
 ### Task 4: raw h2 — frame codec and HPACK literal encoder (pure)
