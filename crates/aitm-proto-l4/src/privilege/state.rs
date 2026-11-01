@@ -3993,4 +3993,142 @@ mod tests {
         assert!(state.shared.prompt_child().is_none());
         assert!(!state.shared.watching(), "B's end cleared its own flag");
     }
+
+    // ---- tester, fix-D range: the D1 primitives pinned on their own, and
+    // D4 `cancel_prompt` proven non-blocking (the cancel tests above only
+    // prove that a retry eventually lands) --------------------------------
+
+    /// D1: `stop_watching` clears only its own id. This is also the
+    /// `start_watch_with` hand-off: the placeholder id taken before the
+    /// spawn is never stopped on the success path, the thread's `Watch`
+    /// takes its own, and `watching` still reads false once that one is
+    /// cleared. A stale id (an ended watch still in its reap) is a no-op
+    /// against a later watch's id, and against an already cleared flag.
+    #[test]
+    fn stop_watching_clears_only_its_own_id() {
+        let (state, _now) = state_over(vec![row6()]);
+        assert!(!state.shared.watching(), "nothing watches yet");
+
+        let placeholder = state.shared.start_watching();
+        let own = state.shared.start_watching();
+        assert_ne!(placeholder, 0);
+        assert_ne!(own, 0);
+        assert_ne!(placeholder, own, "every watch id is fresh");
+        assert!(state.shared.watching());
+
+        // The stale (placeholder, or ended-and-reaping) id cannot clear the
+        // live watch's flag.
+        state.shared.stop_watching(placeholder);
+        assert!(
+            state.shared.watching(),
+            "a stale id leaves the live watch's flag set"
+        );
+        // The live watch clears it, though its placeholder was never stopped.
+        state.shared.stop_watching(own);
+        assert!(!state.shared.watching(), "the live watch clears its own id");
+        // And late stops on a clear flag stay no-ops.
+        state.shared.stop_watching(placeholder);
+        state.shared.stop_watching(own);
+        assert!(!state.shared.watching());
+
+        // The next watch's id is newer than any handed out so far.
+        let next = state.shared.start_watching();
+        assert!(next > own, "ids never repeat: {next} after {own}");
+        state.shared.stop_watching(next);
+        assert!(!state.shared.watching());
+    }
+
+    /// D1: `unregister_prompt_child` clears the slot only for the child in
+    /// it. A later watch's child, registered over an ended one, survives the
+    /// ended watch's late `release_prompt`; unregistering on an empty slot
+    /// is harmless.
+    #[test]
+    fn unregister_prompt_child_leaves_another_watchs_child() {
+        let (state, _now) = state_over(vec![row6()]);
+        let a: SharedChild = Arc::new(Mutex::new(Box::new(FakeChild::alive(1))));
+        let b: SharedChild = Arc::new(Mutex::new(Box::new(FakeChild::alive(2))));
+        let prompt_pid = || state.shared.prompt_child().map(|child| lock(&child).id());
+
+        state.shared.unregister_prompt_child(&a);
+        assert_eq!(prompt_pid(), None, "unregistering an empty slot is a no-op");
+
+        state.shared.register_prompt_child(&a);
+        assert_eq!(prompt_pid(), Some(1));
+        state.shared.register_prompt_child(&b);
+        assert_eq!(
+            prompt_pid(),
+            Some(2),
+            "the later watch's child is the prompt"
+        );
+
+        state.shared.unregister_prompt_child(&a);
+        assert_eq!(prompt_pid(), Some(2), "A's late release leaves B's child");
+        state.shared.unregister_prompt_child(&b);
+        assert_eq!(prompt_pid(), None, "B releases its own");
+        // A second release by B is a no-op too.
+        state.shared.unregister_prompt_child(&b);
+        assert_eq!(prompt_pid(), None);
+    }
+
+    /// D4: `cancel_prompt` never blocks on the watcher's child lock. With the
+    /// lock held (the watcher mid-step) the call returns at once and sends
+    /// nothing; once the lock is free, one call sends exactly one SIGINT; and
+    /// a lock poisoned by a panicking holder is no bar: the cancel still
+    /// lands through the poison.
+    #[test]
+    fn cancel_prompt_skips_a_held_child_lock_and_lands_on_a_free_one() {
+        let (state, _now) = state_over(vec![row6()]);
+        let state = Arc::new(state);
+        let fake = FakeChild::alive(4242);
+        let signals = Arc::clone(&fake.signals);
+        let child: SharedChild = Arc::new(Mutex::new(Box::new(fake)));
+        state.shared.register_prompt_child(&child);
+
+        // The lock is held here, as the watcher holds it across one step.
+        let held = lock(&child);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let cancelling = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                state.cancel_prompt();
+                done_tx.send(()).expect("the test is waiting");
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(WAIT).is_ok(),
+            "cancel_prompt returned while the child lock was held (it did not block)"
+        );
+        cancelling.join().expect("the cancelling thread");
+        assert!(
+            signals.lock().unwrap().is_empty(),
+            "a cancel that found the lock held sent nothing"
+        );
+        drop(held);
+
+        // Free: exactly one SIGINT per call.
+        state.cancel_prompt();
+        assert_eq!(
+            *signals.lock().unwrap(),
+            vec![crate::privilege::linux::SIGINT],
+            "one call, one SIGINT"
+        );
+
+        // Poisoned: a holder that panicked leaves the mutex poisoned; the
+        // cancel still reaches the child.
+        signals.lock().unwrap().clear();
+        let poisoner = Arc::clone(&child);
+        let crashed = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("the watcher blew up holding the child");
+        })
+        .join();
+        assert!(crashed.is_err(), "the holder panicked");
+        assert!(child.is_poisoned(), "the child lock is poisoned");
+        state.cancel_prompt();
+        assert_eq!(
+            *signals.lock().unwrap(),
+            vec![crate::privilege::linux::SIGINT],
+            "the cancel lands through a poisoned lock"
+        );
+    }
 }
