@@ -1538,17 +1538,7 @@ mod tests {
         );
     }
 
-    // BLOCKED, not a lane bug: rendering this point's own boundary table panics
-    // inside `aitm_proto_l4::craft::build_ipv4` (`craft.rs:542`,
-    // `pnet_packet::ipv4::MutableIpv4Packet::set_payload`, which asserts
-    // `payload.len() <= total_length - ihl * 4`). `ipv4.ihl` 6/7/15,
-    // `ipv4.total_length` 0/1/declared-1 and `tcp.data_offset` 6/7/15 all abort
-    // the task instead of returning `CraftError`, so `Mutation::apply` cannot
-    // keep its "`MutateError::Craft` when the mutated spec does not build"
-    // contract. The fix is in `aitm-proto-l4`, which task 9 does not own: write
-    // the payload with the header fields still well-formed and stamp the
-    // mutated `ihl`/`total_length`/`data_offset` afterwards. Un-ignore with that
-    // fix; the assertions below are the plan's, unchanged.
+    // An `ipv4.ihl` case that cannot reach the wire is recorded unsent and charged to nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unsendable_cases_are_not_charged() {
         let mock = MockBackend::new(MockReply::Echo);
