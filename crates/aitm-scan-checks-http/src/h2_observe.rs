@@ -11,7 +11,7 @@
 //! |---|---|---|---|---|
 //! | `h2-settings-observe` | `h2-settings` | `SettingsOnly` | 0 | the advertised SETTINGS, as an `Info` observation |
 //! | `h2-pseudo-header-validation` | `h2-pseudo-header` | `Blocks` | 3 | a variant the server answered instead of rejecting |
-//! | `h2-header-crlf-tolerance` | `h2-header-crlf` | `Blocks` | 2 | a CR/LF variant the server answered |
+//! | `h2-header-crlf-tolerance` | `h2-header-crlf` | `Blocks` | 2 | a CR/LF variant the server answered, as a `Medium` |
 //! | `h2-cl-te-downgrade-indicator` | `h2-smuggling-indicator` | `Blocks` | 2 | a length/encoding variant the server answered |
 //! | `h2-rapid-reset-mitigation` | `h2-rapid-reset` | `RapidReset { pairs: 8 }` | 8 | whether any reset-rate mitigation showed |
 //!
@@ -57,6 +57,7 @@
 //! ten-minute once-per-authority guard: the first point of an authority probes,
 //! later points return [`Outcome::Inconclusive`] and send nothing at all.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -171,84 +172,11 @@ impl Kind {
     }
 
     fn meta(self) -> CheckMeta {
-        let (id, name, class, technique, severity, confidence_max, cwe, description, remediation) =
-            match self {
-                Kind::Settings => (
-                    "h2-settings-observe",
-                    "HTTP/2 SETTINGS observation",
-                    "h2-settings",
-                    Technique::Observe,
-                    Severity::Info,
-                    Confidence::Certain,
-                    None,
-                    "Opens one HTTP/2 connection and records the SETTINGS the server \
-                     advertises (concurrency, window and header-list limits).",
-                    "None required; review the advertised limits against the deployment's \
-                     intent.",
-                ),
-                Kind::PseudoHeader => (
-                    "h2-pseudo-header-validation",
-                    "HTTP/2 pseudo-header validation",
-                    "h2-pseudo-header",
-                    Technique::Malformed,
-                    Severity::Info,
-                    Confidence::Tentative,
-                    Some(444),
-                    "Sends three malformed header blocks (a missing :path, a duplicated \
-                     :method, a pseudo-header after a regular header) on one HTTP/2 \
-                     connection and reports a variant the server answered instead of \
-                     rejecting (RFC 9113 section 8.3).",
-                    "Reject requests with a malformed pseudo-header set with a stream error \
-                     of type PROTOCOL_ERROR before they reach the application.",
-                ),
-                Kind::HeaderCrlf => (
-                    "h2-header-crlf-tolerance",
-                    "HTTP/2 header CRLF tolerance",
-                    "h2-header-crlf",
-                    Technique::Malformed,
-                    Severity::Info,
-                    Confidence::Tentative,
-                    Some(113),
-                    "Sends a CR LF inside a header value and inside a header name on one \
-                     HTTP/2 connection and reports a variant the server answered instead \
-                     of rejecting (RFC 9113 section 8.2.1).",
-                    "Treat a header field containing CR or LF as malformed and reset the \
-                     stream; never forward it to an HTTP/1.1 backend.",
-                ),
-                Kind::ClTe => (
-                    "h2-cl-te-downgrade-indicator",
-                    "HTTP/2 length and encoding downgrade indicator",
-                    "h2-smuggling-indicator",
-                    Technique::Observe,
-                    Severity::Info,
-                    Confidence::Tentative,
-                    Some(444),
-                    "Sends a content-length one byte longer than the body, and separately a \
-                     transfer-encoding header, on one HTTP/2 connection and reports a \
-                     variant the server answered instead of rejecting. Indicator only: it \
-                     never sends a second request.",
-                    "Reject HTTP/2 requests whose content-length disagrees with the body or \
-                     that carry transfer-encoding (RFC 9113 sections 8.1.1 and 8.2.2).",
-                ),
-                Kind::RapidReset => (
-                    "h2-rapid-reset-mitigation",
-                    "HTTP/2 rapid-reset mitigation",
-                    "h2-rapid-reset",
-                    Technique::Observe,
-                    Severity::Info,
-                    Confidence::Firm,
-                    Some(400),
-                    "Opens and immediately cancels eight streams on one connection, once, \
-                     and reports whether the server showed any reset-rate mitigation (a \
-                     GOAWAY or a refused stream). It is a bounded probe, not a flood.",
-                    "Apply a reset-rate limit per connection and close abusive connections \
-                     with GOAWAY (CVE-2023-44487).",
-                ),
-            };
+        let spec = self.spec();
         CheckMeta {
-            id: id.to_string(),
-            name: name.to_string(),
-            class: class.to_string(),
+            id: spec.id.to_string(),
+            name: spec.name.to_string(),
+            class: spec.class.to_string(),
             lanes: vec![LaneKind::Http],
             kinds: vec![
                 InsertionKind::Query,
@@ -258,19 +186,131 @@ impl Kind {
                 InsertionKind::PathSegment,
             ],
             intensity: Intensity::Medium,
-            cost: CheckCost::Light,
-            technique,
-            severity,
-            confidence_max,
+            cost: spec.cost,
+            technique: spec.technique,
+            severity: spec.severity,
+            confidence_max: spec.confidence_max,
             needs_baseline: true,
             wants_traits: None,
             targets_session: false,
-            cwe,
-            description: description.to_string(),
-            remediation: Some(remediation.to_string()),
+            cwe: spec.cwe,
+            description: spec.description.to_string(),
+            remediation: Some(spec.remediation.to_string()),
             origin: CheckOrigin::Native,
         }
     }
+
+    /// This kind's catalogue entry, one named field at a time (review finding
+    /// Q-M7: a nine-field positional tuple is unreadable and mis-orderable).
+    fn spec(self) -> KindSpec {
+        match self {
+            Kind::Settings => KindSpec {
+                id: "h2-settings-observe",
+                name: "HTTP/2 SETTINGS observation",
+                class: "h2-settings",
+                technique: Technique::Observe,
+                // Zero streams: the connection preface is the whole probe.
+                cost: CheckCost::Light,
+                severity: Severity::Info,
+                // Observe is never `certain`: what a server advertises is not
+                // a reflected or handshake proof (spec D2, review SP-1).
+                confidence_max: Confidence::Firm,
+                cwe: None,
+                description: "Opens one HTTP/2 connection and records the SETTINGS the server \
+                              advertises (concurrency, window and header-list limits).",
+                remediation: "None required; review the advertised limits against the \
+                              deployment's intent.",
+            },
+            Kind::PseudoHeader => KindSpec {
+                id: "h2-pseudo-header-validation",
+                name: "HTTP/2 pseudo-header validation",
+                class: "h2-pseudo-header",
+                technique: Technique::Malformed,
+                cost: CheckCost::Light,
+                severity: Severity::Info,
+                confidence_max: Confidence::Tentative,
+                cwe: Some(444),
+                description: "Sends three malformed header blocks (a missing :path, a \
+                              duplicated :method, a pseudo-header after a regular header) on \
+                              one HTTP/2 connection and reports a variant the server answered \
+                              instead of rejecting (RFC 9113 section 8.3).",
+                remediation: "Reject requests with a malformed pseudo-header set with a \
+                              stream error of type PROTOCOL_ERROR before they reach the \
+                              application.",
+            },
+            Kind::HeaderCrlf => KindSpec {
+                id: "h2-header-crlf-tolerance",
+                name: "HTTP/2 header CRLF tolerance",
+                class: "h2-header-crlf",
+                technique: Technique::Malformed,
+                cost: CheckCost::Light,
+                // A CR or LF the origin accepted inside a header is what an
+                // HTTP/1.1 backend downstream turns into a second request
+                // (review finding C5), so this is not a note.
+                severity: Severity::Medium,
+                confidence_max: Confidence::Tentative,
+                cwe: Some(113),
+                description: "Sends a CR LF inside a header value and inside a header name on \
+                              one HTTP/2 connection and reports a variant the server answered \
+                              instead of rejecting (RFC 9113 section 8.2.1).",
+                remediation: "Treat a header field containing CR or LF as malformed and reset \
+                              the stream; never forward it to an HTTP/1.1 backend.",
+            },
+            Kind::ClTe => KindSpec {
+                id: "h2-cl-te-downgrade-indicator",
+                name: "HTTP/2 length and encoding downgrade indicator",
+                class: "h2-smuggling-indicator",
+                technique: Technique::Observe,
+                cost: CheckCost::Light,
+                severity: Severity::Info,
+                confidence_max: Confidence::Tentative,
+                cwe: Some(444),
+                description: "Sends a content-length one byte longer than the body, and \
+                              separately a transfer-encoding header, on one HTTP/2 connection \
+                              and reports a variant the server answered instead of rejecting. \
+                              Indicator only: it never sends a second request.",
+                remediation: "Reject HTTP/2 requests whose content-length disagrees with the \
+                              body or that carry transfer-encoding (RFC 9113 sections 8.1.1 \
+                              and 8.2.2).",
+            },
+            Kind::RapidReset => KindSpec {
+                id: "h2-rapid-reset-mitigation",
+                name: "HTTP/2 rapid-reset mitigation",
+                class: "h2-rapid-reset",
+                technique: Technique::Observe,
+                // Eight streams on one connection is not a light probe
+                // (review SP-2); it is still bounded, and still sent once.
+                cost: CheckCost::Medium,
+                severity: Severity::Info,
+                confidence_max: Confidence::Firm,
+                cwe: Some(400),
+                description: "Opens and immediately cancels eight streams on one connection, \
+                              once, and reports whether the server showed any reset-rate \
+                              mitigation (a GOAWAY or a refused stream). It is a bounded \
+                              probe, not a flood.",
+                remediation: "Apply a reset-rate limit per connection and close abusive \
+                              connections with GOAWAY (CVE-2023-44487).",
+            },
+        }
+    }
+}
+
+/// One kind's catalogue entry, before it becomes a [`CheckMeta`].
+///
+/// Everything the five checks share — the lanes, the insertion kinds, the
+/// intensity, `needs_baseline`, the origin — lives in [`Kind::meta`]; this is
+/// only what differs between them.
+struct KindSpec {
+    id: &'static str,
+    name: &'static str,
+    class: &'static str,
+    technique: Technique,
+    cost: CheckCost,
+    severity: Severity,
+    confidence_max: Confidence,
+    cwe: Option<u32>,
+    description: &'static str,
+    remediation: &'static str,
 }
 
 /// Authorities already probed by one check instance, each with when.
@@ -552,16 +592,18 @@ fn no_finding(outcome: Outcome, detail: &str) -> Verdict {
 }
 
 /// The name of a SETTINGS identifier (RFC 9113 section 6.5.2, RFC 8441).
-fn setting_name(id: u16) -> String {
+///
+/// Borrowed for every identifier the RFCs name; only an unknown one allocates.
+fn setting_name(id: u16) -> Cow<'static, str> {
     match id {
-        1 => "header_table_size".to_string(),
-        2 => "enable_push".to_string(),
-        3 => "max_concurrent_streams".to_string(),
-        4 => "initial_window_size".to_string(),
-        5 => "max_frame_size".to_string(),
-        6 => "max_header_list_size".to_string(),
-        8 => "enable_connect_protocol".to_string(),
-        other => format!("setting_{other}"),
+        1 => Cow::Borrowed("header_table_size"),
+        2 => Cow::Borrowed("enable_push"),
+        3 => Cow::Borrowed("max_concurrent_streams"),
+        4 => Cow::Borrowed("initial_window_size"),
+        5 => Cow::Borrowed("max_frame_size"),
+        6 => Cow::Borrowed("max_header_list_size"),
+        8 => Cow::Borrowed("enable_connect_protocol"),
+        other => Cow::Owned(format!("setting_{other}")),
     }
 }
 
@@ -578,7 +620,9 @@ fn settings_verdict(obs: &RawH2Observation) -> Verdict {
     let listed = Evidence::excerpt(&crate::matching::scrub(&listed));
     Verdict {
         outcome: Outcome::Vulnerable,
-        confidence: Confidence::Certain,
+        // Never `certain`: this is what the peer *said* it would do, read
+        // once, not a behaviour the probe reproduced (spec D2, review SP-1).
+        confidence: Confidence::Firm,
         evidence: Evidence {
             matched: Some(listed.clone()),
             ..Evidence::default()
@@ -606,7 +650,11 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
     }
     Verdict {
         outcome: Outcome::Vulnerable,
-        confidence: Confidence::Tentative,
+        // A complete repeated observation — all eight pairs sent, nothing at
+        // all from the peer — so the meta's `firm` ceiling is reachable
+        // (review SP-3). It is still not `certain`: a mitigation could exist
+        // above this threshold.
+        confidence: Confidence::Firm,
         evidence: Evidence {
             matched: Some(format!(
                 "{RESET_PAIRS} reset pairs, no GOAWAY, no refused stream"

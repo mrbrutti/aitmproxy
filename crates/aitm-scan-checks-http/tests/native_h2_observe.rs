@@ -173,7 +173,7 @@ fn the_five_checks_carry_the_decided_ids_classes_and_shape() {
             )
         })
         .collect();
-    use aitm_poc::Severity::Info;
+    use aitm_poc::Severity::{Info, Medium};
     assert_eq!(
         got,
         vec![
@@ -191,11 +191,13 @@ fn the_five_checks_carry_the_decided_ids_classes_and_shape() {
                 Info,
                 Technique::Malformed
             ),
+            // A header the origin accepted with a CR or LF in it is what an
+            // HTTP/1.1 backend turns into a second request: Medium, not Info.
             (
                 "h2-header-crlf-tolerance".to_string(),
                 "h2-header-crlf".to_string(),
                 Some(113),
-                Info,
+                Medium,
                 Technique::Malformed
             ),
             (
@@ -214,6 +216,45 @@ fn the_five_checks_carry_the_decided_ids_classes_and_shape() {
             ),
         ]
     );
+    // Per-kind ceilings and costs (spec D2, spec-review SP-1 and SP-2).
+    let shape: Vec<(String, CheckCost, Confidence)> = metas
+        .iter()
+        .map(|m| (m.id.clone(), m.cost, m.confidence_max))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Observe is never `certain`: it reads what a server advertises,
+            // which is not a reflected or handshake proof.
+            (
+                "h2-settings-observe".to_string(),
+                CheckCost::Light,
+                Confidence::Firm
+            ),
+            (
+                "h2-pseudo-header-validation".to_string(),
+                CheckCost::Light,
+                Confidence::Tentative
+            ),
+            (
+                "h2-header-crlf-tolerance".to_string(),
+                CheckCost::Light,
+                Confidence::Tentative
+            ),
+            (
+                "h2-cl-te-downgrade-indicator".to_string(),
+                CheckCost::Light,
+                Confidence::Tentative
+            ),
+            // Eight streams is not a light probe.
+            (
+                "h2-rapid-reset-mitigation".to_string(),
+                CheckCost::Medium,
+                Confidence::Firm
+            ),
+        ]
+    );
+
     for m in &metas {
         assert_eq!(m.lanes, vec![LaneKind::Http], "{}", m.id);
         assert_eq!(
@@ -228,7 +269,6 @@ fn the_five_checks_carry_the_decided_ids_classes_and_shape() {
             "{}",
             m.id
         );
-        assert_eq!(m.cost, CheckCost::Light, "{}", m.id);
         assert!(m.needs_baseline, "{}", m.id);
         assert!(!m.targets_session, "{}", m.id);
         assert_eq!(m.origin, CheckOrigin::Native, "{}", m.id);
@@ -262,7 +302,7 @@ async fn settings_observe_reports_the_advertised_values() {
     let v = run(&check, &host).await;
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
-    assert_eq!(v.confidence, Confidence::Certain);
+    assert_eq!(v.confidence, Confidence::Firm);
     assert_eq!(check.meta().severity, aitm_poc::Severity::Info);
     assert!(
         v.detail.contains("max_concurrent_streams=128"),
@@ -368,7 +408,7 @@ async fn pseudo_header_validation_sends_three_variants_on_one_connection() {
 }
 
 #[tokio::test]
-async fn pseudo_header_validation_is_clean_when_every_stream_is_rejected() {
+async fn pseudo_header_validation_is_clean_when_every_stream_is_reset() {
     let runner = FakeRunner::answering(obs(vec![
         reset(),
         StreamOutcome::Refused,
@@ -380,6 +420,25 @@ async fn pseudo_header_validation_is_clean_when_every_stream_is_rejected() {
 
     assert_eq!(v.outcome, Outcome::Clean);
     assert_eq!(v.evidence.matched, None);
+}
+
+/// The plan's name for the case below, kept as its own test so the AC's
+/// vocabulary and the suite's agree: a malformed stream the server *answered*
+/// is the finding.
+#[tokio::test]
+async fn pseudo_header_validation_is_vulnerable_when_a_malformed_stream_is_answered() {
+    let runner = FakeRunner::answering(obs(vec![
+        reset(),
+        StreamOutcome::Headers { status: Some(200) },
+        reset(),
+    ]));
+    let check = check_named(&runner, "h2-pseudo-header-validation");
+
+    let v = run(&check, &h2host()).await;
+
+    assert_eq!(v.outcome, Outcome::Vulnerable);
+    assert_eq!(v.confidence, Confidence::Tentative);
+    assert_eq!(check.meta().severity, aitm_poc::Severity::Info);
 }
 
 #[tokio::test]
@@ -577,7 +636,9 @@ async fn rapid_reset_without_goaway_reports_no_mitigation_observed() {
     let v = run(&check, &h2host()).await;
 
     assert_eq!(v.outcome, Outcome::Vulnerable);
-    assert_eq!(v.confidence, Confidence::Tentative);
+    // A complete repeated observation — eight pairs, nothing from the peer —
+    // is `firm`, and reaches the meta's ceiling (spec review SP-3).
+    assert_eq!(v.confidence, Confidence::Firm);
     assert_eq!(
         v.detail,
         "no reset-rate mitigation observed in 8 reset pairs"
@@ -1035,7 +1096,11 @@ async fn the_t3_3_expected_set_on_a_conforming_server() {
                 Outcome::Clean,
                 Info
             ),
-            ("h2-header-crlf-tolerance".to_string(), Outcome::Clean, Info),
+            (
+                "h2-header-crlf-tolerance".to_string(),
+                Outcome::Clean,
+                aitm_poc::Severity::Medium
+            ),
             (
                 "h2-cl-te-downgrade-indicator".to_string(),
                 Outcome::Clean,
