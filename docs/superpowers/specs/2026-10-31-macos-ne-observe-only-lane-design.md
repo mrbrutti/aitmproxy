@@ -3,7 +3,9 @@
 **Status:** draft
 **Research inputs:** `docs/research/12-macos-observe-only-lane.md` (primary; "research
 12" below), `docs/research/10-macos-network-extension.md` (§3.1, §3.5, §3.7, §3.9),
-`docs/research/experiments/2026-10-29-macos-ne-spike.md`.
+`docs/research/experiments/2026-10-29-macos-ne-spike.md`,
+`docs/research/experiments/2026-10-31-macos-ne-observe-survey.md` (the pre-plan survey of
+fields, rates, costs and UDP `false` on Matt's Mac; "survey §R1" etc. below).
 **Extends / reconciles with:** `2026-10-29-aitmproxy-macos-network-extension-design.md`
 (D1–D4, D8, D9, NE-AC3/5/6/8/11, resolved OQ10);
 `2026-10-30-aitmproxy-macos-ne-live-feeder-design.md` (LF-AC1/4/8/12, the
@@ -95,6 +97,15 @@ while MITM stays deny-by-default and the provider stays fail-open. Design only.
 - **Protocol-version discipline.** A new `ControlMessage` variant is a decode error on
   today's core and detaches the provider (research 12 §3.1, §3.2.6); the version must bump
   so skew fails loudly at `Hello`, never mid-stream.
+- **An inherited UDP rule defect, not the lane's (survey §R4 / item 5).** UDP `return
+  false` itself is safe on macOS 27 (DNS, NTP and QUIC packets flow after `false`; the
+  macOS-15 header's "the flow is terminated" is wrong for a transparent proxy). But the
+  shipped catch-all `.any` rule makes `setsockopt(IP_DONTFRAG)` return `ECONNRESET` on every
+  connected non-loopback UDP socket while capture is on, which breaks Chromium QUIC (Chrome
+  and Electron silently lose HTTP/3; QUIC-only origins fail) while Safari, Firefox and
+  `URLSession` keep h3 (DevForums 770707, reproduced). This is pre-existing in v0.5.3/v0.5.4
+  and independent of the lane; the lane inherits it unchanged and Open question 9 decides
+  the fix.
 - **Bounds everywhere.** `MAX_FRAME_LEN` (1 MiB) stays; new queues and stores have fixed
   caps with oldest-eviction; `MemFlowStore` (50 000 flows) is not shared.
 - **Gates.** Rust gate green before review; `forbid(unsafe_code)` holds; the Swift side
@@ -181,18 +192,20 @@ body-typed field exists on the struct:
 | Field | Type | Source (research 12 §3.2.1, §3.2.3) |
 |---|---|---|
 | `kind` | `FlowKind` (`Tcp`\|`Udp`) | which delegate fired |
-| `remote` | `SocketAddr` | `remoteFlowEndpoint` / `initialRemoteFlowEndpoint` |
-| `remote_hostname` | `Option<String>` | `remoteHostname` (connect-by-name only; ≤ 253 bytes) |
-| `source_app` | `Option<String>` | `metaData.sourceAppSigningIdentifier`; `None` when empty |
-| `source_path` | `Option<String>` | `proc_pidpath_audittoken`, resolved **only when `source_app` is `None`**; the provider truncates to 1 024 bytes |
+| `remote` | `SocketAddr` | `remoteFlowEndpoint` / `initialRemoteFlowEndpoint`; always `ip:port` in 15 846 flows (survey §R2) — keep the fail-open `nil` guard |
+| `remote_hostname` | `Option<String>` | `remoteHostname` (connect-by-name only; ≤ 253 bytes); present on 76 % of TCP / 48 % of UDP flows (survey §R2), so it stays optional |
+| `source_app` | `Option<String>` | `metaData.sourceAppSigningIdentifier`; `None` when empty — empty on 0 of 16 957 flows, system daemons report their own id (survey §R2) |
+| `source_path` | `Option<String>` | `proc_pidpath_audittoken`, resolved **only when `source_app` is `None`**; the provider truncates to 1 024 bytes; the lookup fails on ≈5 % of flows, but those still carry a signing id, so a row is never nameless (survey §R2) |
 | `source_pid` | `Option<u32>` | `audit_token_to_pid`; display-only, never a grouping key (pid reuse) |
-| `source_uid` | `Option<u32>` | `audit_token_to_euid`; already filtered provider-side (Part 3) |
+| `source_uid` | `Option<u32>` | `audit_token_to_euid`; token and euid present on every declined flow surveyed; already filtered provider-side (Part 3) |
 | `seen_at_ms` | `u64` | provider wall clock, ms since the Unix epoch |
 | `dropped` | `u64` | the provider's cumulative count of queue drops |
 
 Reserved for (b), absent from the struct until (b) lands: `bytes_in`, `bytes_out`,
 `closed_at_ms`. The store row (Part 4) already has optional slots for them, so (b) is a
-field addition, not a reshape.
+field addition, not a reshape. A future (b) correlation must not key on
+`filterFlowIdentifier` for UDP: it was nil on 25–50 % of UDP flows even with a content
+filter installed (survey §R2 / item 4).
 
 `ObserveSpec { enabled: bool }`: the feeder sends it right after `Scope` on attach and
 again on change; a provider that has not received `Observe(true)` emits nothing. The
@@ -209,8 +222,9 @@ bumps per build). Rejected: accepting `{1, 2}`, which hides skew.
 ### Part 3 — the provider: enqueue-only emit, dedicated writer, uid filter
 
 In `handleNewFlow` / `handleNewUDPFlow` the existing order holds and one step is appended
-for the declined case: (1) `SelfExclusion.isSelf` (self flows are neither claimed nor
-observed); (2) `claim()` unchanged — a claimed flow returns `true` and is **not** observed
+for the declined case: (1) `SelfExclusion.isSelf` through the per-process verdict cache,
+skipped while detached (self flows are neither claimed nor observed; see the hot-path
+bullet below); (2) `claim()` unchanged — a claimed flow returns `true` and is **not** observed
 (it appears as a captured flow via Part 1); (3) **new, on decline only:** if the
 attachment has `observe == true` and the flow's audit-token euid equals the attached
 core's uid, build a `FlowSeenDescriptor` from fields already read for the claim decision
@@ -221,10 +235,14 @@ then return `false` as today.
   it, no JSON encoding, no syscalls beyond the audit-token extraction and (only when the
   signing id is empty) one `proc_pidpath_audittoken`. Never `CoreLink.send` (it takes
   `writeLock` and blocks up to 2 s; research 12 §3.2.4).
-- **Bounded, drop-oldest.** `ObserveQueue` capacity **2 048** **(Architect's call**, a
-  multi-second browser burst at the §3.2.5 estimate; the §5 item 7 experiment can retune).
-  On overflow the oldest entry is dropped and a counter increments; it rides the next
-  `FlowSeen.dropped`.
+- **Bounded, drop-oldest.** `ObserveQueue` capacity **2 048** **(Architect's call**, sized
+  from the survey, §R1 / item 1: the worst burst measured on Matt's Mac was 1 243 flows in
+  8 s, peak 336/s, a cold Chromium profile loading a heavy page; organic peaks 60–70/s for a
+  second and 235 flows in 10 s; sustained 1–1.7/s. 2 048 holds the whole worst burst with
+  room for a second one, ≈400 KiB at ≈200 B per entry; 1 024 would drop a heavy page load's
+  tail if the writer stalled 3 s). The binding constraint is the writer's 2 s `SO_SNDTIMEO`,
+  not the queue. On overflow the oldest entry is dropped and a counter increments; it rides
+  the next `FlowSeen.dropped`.
 - **One writer thread** (`ObserveWriter`) drains the queue, encodes one frame per event,
   and writes through `CoreLink.send` under the existing 2 s `SO_SNDTIMEO`. A failed send
   tears the channel down exactly as a failed `FlowOpen` does (detach → every flow direct).
@@ -238,14 +256,30 @@ then return `false` as today.
   send fails, `send` tears the channel down (`shutdownBoth`), the queued `claim()` send
   fails at once, and every flow fails open — the same 2 s bound the claim path has today.
   **Declined** flows are never affected (`tryPush` only).
+- **`isSelf` leaves the per-flow hot path (new requirement, survey §R3 / item 3).** Today
+  `SelfExclusion.isSelf` (`SecCodeCopyGuestWithAttributes` + `SecCodeCheckValidity`) costs
+  **3.6 ms median / 11.4 ms p99** per flow, is not cached by the framework, runs on every
+  flow claimed or not, attached or not, and caps the provider at **≈200 flows/s**: during a
+  heavy page load new connections queued for up to ~1 s inside the shipped provider. The
+  observe lane must add nothing to that path, and the plan must move `isSelf` off it: cache
+  the verdict per source process in a bounded LRU keyed by the audit token's
+  `(pid, pidversion)` (or the 20-byte `sourceAppUniqueIdentifier` cdhash), cap **4 096**
+  entries (333 distinct pids in a day), and skip the check entirely while detached — a self
+  flow and a foreign flow get the same `false`. Target: `handleNewFlow` ≈60 µs when
+  detached (`proc_pidpath` + the detached claim path), ceiling > 1 000 flows/s.
+  **(Architect's call)**: this lands in the **same plan** as the lane, because the lane's
+  value (every connection seen, none queued) depends on it.
 - **Nothing produced or kept while detached.** `Observe` state and the queue are cleared
   in `CoreLink.detach`; the provider holds no history for an absent core (a root process
   holding all apps' history is a privacy exposure, research 12 §3.2.4).
 - **uid filter (resolves OQ10 for observed rows).** At attach the provider already reads
   the core's peer audit token (`PeerAuth.peerAuditToken(of:)`); it keeps its
   `audit_token_to_euid` as `coreUID`. A flow whose euid differs, or whose token is
-  missing, is not observed. So root daemons (`mDNSResponder`) and other users' apps never
-  appear **(Architect's call**, Open question 4). The claim path's OQ10 is not retro-fitted here.
+  missing, is not observed. So system daemons (`_mdnsresponder`, `_usbmuxd`, root) and other
+  users' apps never appear **(Architect's call**, Open question 4). Implementable as written:
+  the token and euid were present on all 15 846 declined flows; the filter drops ≈7 %
+  (`_usbmuxd` 4.8 %, `_mdnsresponder` 1.5 %, root 0.45 %, four other daemons; survey §R2 /
+  item 4). The claim path's OQ10 is not retro-fitted here.
 - A flow that matched scope but failed `claim()` (data-socket dial or peer check failed)
   went direct and is observed like any declined flow.
 
@@ -264,9 +298,14 @@ enum, not `L4Flow`, not `MemFlowStore` — research 12 §3.1, §4.3).
   last_seen_ms, hostname }>` capped at **10 000** keys, both drop-oldest (by `last_seen_ms`
   for the aggregate) **(Architect's call)**. Counters: `received`; `dropped_core` (ring
   evictions plus rate-cap drops); `aggregate_evicted`; `dropped_provider` (the max
-  `FlowSeen.dropped` seen). No `std::fs`/`tokio::fs`; empty on every core restart.
+  `FlowSeen.dropped` seen). No `std::fs`/`tokio::fs`; empty on every core restart. At the
+  survey's sustained 1–1.7 flows/s, 20 000 events hold ≈3–5 h of a working day (≈2 h in a
+  heavy page-load hour; survey §R1 / item 2).
 - **Soft rate cap (Architect's call):** above **5 000** `FlowSeen`/s the feeder counts
-  the excess as `dropped_core` and skips the insert (memory is already bounded; this caps CPU).
+  the excess as `dropped_core` and skips the insert (memory is already bounded; this caps
+  CPU). Measured basis (survey §R1 / item 2): 15× the worst arrival second seen (336/s, cold
+  Chromium) and 25× the shipped provider's ≈200/s handling ceiling. Kept at 5 000 rather than
+  lowered to 1 000 so the cap guards a pathological loop only and never sheds a real burst.
 - Feeder (`feeder.rs` control loop): act on `FlowSeen` (insert) beside `FlowOpen`; never
   touch the pairing map for a `FlowSeen`; send `Observe` after the initial `Scope` and
   whenever `observe.enabled` changes. The "detach on decode error" branch stays.
@@ -370,6 +409,7 @@ untouched: observed rows reach no module, plugin, guard, or capture-path store.
 | Stale sysex after upgrade | silent observe-less run | exact version match at `Hello`; capability degraded until `enable()` replaces it |
 | Agent exfiltrates the app/destination timeline | privacy | `agent_readable` default off; `Paused` refuses; every `observe.*` call is audited like any command |
 | Operator leaves observe on | same-uid app metadata in a user-level process's memory | bounded, in-memory only; state visible in the Capture tab; off clears |
+| Catch-all `.any` rule breaks `IP_DONTFRAG` on connected UDP sockets (survey §R4) | Chromium QUIC fails or falls back to h2 while capture is on | pre-existing in the shipped provider, independent of the lane; the lane adds no UDP exposure; fix per Open question 9 plus an Apple Feedback citing DevForums 770707 with the survey's `dontfrag-core.py` reproduction |
 
 **Fail-open proof obligations** (each has an AC): (1) for a declined flow the NE thread
 does no I/O and takes no lock held during I/O; for a claimed flow the pre-existing ≤ 2 s
@@ -384,8 +424,9 @@ token.
 **Trade-off, stated plainly.** A slow-but-alive core is more likely to hit the 2 s send
 timeout under observe load than before (more frames on the same channel); that detaches
 the provider and pauses in-scope capture until the ~2 s re-attach. The bounded queue,
-per-event frames under 2 KiB, and the kernel socket buffer are the mitigations, and the
-research §5 item 7 rate experiment sizes them.
+per-event frames under 2 KiB, and the kernel socket buffer are the mitigations; the
+survey's measured rates size them (§R1: 1–1.7 flows/s sustained, 336/s worst burst, so a
+2 s stall at the worst burst is ≈700 frames, a third of the queue).
 
 ### Apple-approval impact assessment
 
@@ -393,7 +434,10 @@ research §5 item 7 rate experiment sizes them.
 change, no new provider class, no new consent, no portal or profile change. The sysex
 `CFBundleVersion` bumps as on every build and is replaced through the normal `enable()`
 activation (NE-AC14 reconcile). Signing/notarization are the usual Developer ID release
-steps Matt performs in the Terminal panel.
+steps Matt performs in the Terminal panel. Measured (survey §Setup, §R5 / item 6): a
+same-team, same-short-version, newer-`CFBundleVersion` sysex replaced the activated one
+with **no** System Settings prompt on macOS 27.0, and notarizing the `.app` zip sufficed
+for activation.
 
 **Option (b), if ever chosen** (research 12 §3.3.5–3.3.6): add
 `content-filter-provider-systemextension` to the `networkextension` array in **both**
@@ -530,6 +574,15 @@ source tripwire; **[review]** a Stage-6 finding.
     detach-on-failure (OL-AC7/8/20), exact version match (OL-AC4), no new unauthenticated
     path, and no change to `claim()` inputs or the scope-spec emitter. Findings block the
     merge. **[review]**
+24. **OL-AC24 — `isSelf` off the hot path.** With an injected verifier that counts
+    Security.framework calls: two flows from the same `(pid, pidversion)` cause exactly one
+    call (the second is a cache hit); distinct keys past the 4 096 cap evict the least
+    recently used; while detached (`link.current() == nil`) `handleNewFlow` makes **zero**
+    Security calls and still returns `false` for a self flow **[Swift-unit]**. On a real Mac,
+    the survey's burst recipe (cold headless Chrome loading theverge.com, §R1) shows handled
+    flows per second tracking arrivals with a measured ceiling **> 1 000 flows/s**, and the
+    detached `handleNewFlow` at ≈60 µs median, read from the framework's `New flow` lines
+    and a debug timing line **[Mac]**.
 
 ## Left to the builder
 
@@ -547,6 +600,11 @@ source tripwire; **[review]** a Stage-6 finding.
   shortcut; the web panel layout and polling hook.
 - Test plumbing for `Frontend::Mcp` vs `Operator` hosts (reuse the `L4AgentGate` tests);
   whether `FlowSummary` stores `process` or only threads it through `row()`.
+- The `isSelf` cache key (`(pid, pidversion)` vs the `sourceAppUniqueIdentifier` cdhash)
+  and LRU shape, within "bounded, one Security call per distinct key, none while detached".
+- For every `[Mac]` AC, the framework's own per-flow lines are a zero-cost oracle:
+  `log show --predicate 'process == "AitmproxyNE"'` prints one `New flow` line per flow
+  with app, hostname, endpoints and interface (survey §Setup / item 6).
 
 ## Open questions
 
@@ -562,20 +620,38 @@ Only Matt can answer these; each carries the Architect's recommendation.
    but refused for `Frontend::Mcp` unless `macos_capture.observe.agent_readable` is set in
    the config file (no app control in v1).
 4. **Whose flows appear?** Recommend **same-uid only, self excluded**: other users' apps
-   and root daemons are not observed; `aitm`/obscura never are. To list root daemons the
-   rule becomes `euid ∈ {coreUID, 0}`, a one-line change with a privacy note.
+   and system daemons are not observed; `aitm`/obscura never are. Measured (survey §R2 /
+   item 4): the token and euid are present on every declined flow, so the filter is
+   implementable as written, and on Matt's Mac it drops ≈7 % of flows (`_usbmuxd` 4.8 %,
+   `_mdnsresponder` 1.5 %, root 0.45 %, four other daemons). To list system daemons the rule
+   becomes an allow-set of system uids (not just 0: `_mdnsresponder` is 65, `_usbmuxd`
+   213), a small change with a privacy note.
 5. **Is a third consent prompt acceptable?** Only relevant to (b); recommend deferring
    until bytes are required.
-6. **Run the research §5 experiments before the plan?** Recommend **items 6 and 8** (a
-   one-day field survey of the §3.2.1 fields; UDP `return false` on macOS 27 with
-   DNS/QUIC/Chromium) as one throwaway `experiment/macos-ne-observe-survey` session before
-   Stage 3: they size the queue and settle the UDP unknown the shipped provider already
-   carries. Defer 7 and 9; defer the (b) items 10–17 entirely.
+6. **Run the research §5 experiments before the plan?** **DONE** for items 6, 7 and 8:
+   the survey ran on Matt's Mac on 2026-10-31
+   (`docs/research/experiments/2026-10-31-macos-ne-observe-survey.md`); its results are
+   folded into Parts 2–4, Constraints, and Open questions 4 and 9. Item 9 (another
+   transparent proxy) and the (b) items 10–17 stay deferred.
 7. **Approve the parent-spec wording amendment** (§Security analysis) so the anti-goal
    reads as flow bytes and names this lane as the sanctioned metadata path.
 8. **Hostnames: connect-by-name only, else IP:port, no reverse DNS?** Recommend yes
    (Little Snitch calls reverse DNS "of little use"; it would also originate DNS traffic
    from the core).
+9. **The inherited UDP rule defect (survey §R4 / item 5): how to fix it?** Either (a)
+   exclude UDP from the catch-all rule by default — a TCP-only rule, with a UDP rule added
+   only when the operator's scope holds a UDP (L4) target, at the cost of a tunnel restart
+   on that transition (rules cannot be hot-edited) and of the observe lane seeing **no UDP
+   flows** (no DNS or QUIC rows) by default; or (b) keep `.any` and add
+   `excludedNetworkRules` for UDP:443, accepting blind QUIC. In either case file an Apple
+   Feedback citing DevForums 770707 with the survey's `dontfrag-core.py` reproduction.
+   **Recommend (a)**, as its own small fix landing before this plan's `[Mac]` acceptance:
+   it is deterministic, restores Chromium HTTP/3 for every user with capture on, and matches
+   deny-by-default (UDP enters the provider only when scoped); (b) rests on
+   `excludedNetworkRules` semantics that are unverified here and reported leaky (research
+   10 §3.9), and still leaves UDP:53/123 sockets affected. If Matt wants UDP visibility in
+   the Apps page by default, (b) can be verified first by re-running `dontfrag-core.py`
+   against an excluded-rule build.
 
 ---
 
@@ -614,3 +690,7 @@ and left for when bytes are required.
 - **C9:** `agent_readable` has no app control in v1 (config file only).
 - **C10:** UIs poll; no `flow.subscribe` push; no TUI observe view; a `[web-unit]` tag.
 - **C11:** The parent-spec reconciling wording proposed in §Security analysis.
+- **C12:** The `isSelf` per-process verdict cache (bounded LRU, skipped while detached) lands
+  in the same plan as the lane (survey item 3).
+- **C13:** The core soft cap stays at 5 000/s with the survey's measured basis; the queue
+  stays at 2 048; Open question 9 recommends a TCP-only catch-all rule as a separate fix.
