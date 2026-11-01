@@ -44,9 +44,11 @@ function l4Block(l4) {
         `      ports:`,
         `        lo: ${e.portLo ?? 0}`,
         `        hi: ${e.portHi ?? 65535}`,
-        `      interface: ${e.interface}`,
-        `      direction: ${e.direction ?? 'outbound'}`,
-        `      capability: ${e.capability}`,
+        // String values are quoted: a bare `*` (the wildcard interface) is a YAML alias marker and
+        // made the core exit 1 on an unquoted `interface: *`; the core's serde accepts the quoted forms.
+        `      interface: ${JSON.stringify(String(e.interface))}`,
+        `      direction: ${JSON.stringify(String(e.direction ?? 'outbound'))}`,
+        `      capability: ${JSON.stringify(String(e.capability))}`,
         `      inject_rate:`,
         `        pps: ${e.pps ?? 100}`,
         `        burst: ${e.burst ?? 100}`,
@@ -342,6 +344,8 @@ export async function startAitm({
     stderr: () => stderr,
     stop: () =>
       new Promise((r) => {
+        // A core that already exited (e.g. a config it refused) fires no second `exit`: resolve now.
+        if (child.exitCode != null || child.signalCode != null) return r();
         child.once('exit', () => r());
         child.kill('SIGINT');
         setTimeout(() => child.kill('SIGKILL'), 3000);
