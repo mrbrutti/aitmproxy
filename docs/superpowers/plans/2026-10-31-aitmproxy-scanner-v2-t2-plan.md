@@ -580,7 +580,7 @@ crates/aitm-scan-http/
 - **Test:** (helpers build points by hand with the given kind/name/path)
   `query_pins`: `/search?q=hello&x=1`, point `q`, payload `<s>` Replace → path
   `"/search?q=%3Cs%3E&x=1"`; Suffix → `"/search?q=hello%3Cs%3E&x=1"`; Prefix → `"/search?q=%3Cs%3Ehello&x=1"`.
-  `form_pins`: body `a=1&b=2`, point `b`, payload `x y` → body `b"a=1&b=x+y"`, `content-length` `"7"`.
+  `form_pins`: body `a=1&b=2`, point `b`, payload `x y` → body `b"a=1&b=x+y"`, `content-length` `"9"` (corrected 2026-11-01: the recomputed length of the new body; `7` was the original body's).
   `json_typed`: `{"n":3,"s":"a"}` point path `n` payload `7` → body `{"n":7,"s":"a"}`; payload
   `7'` → `{"n":"7'","s":"a"}`; nested `profile.address.city` replaced in place; path `missing` →
   `Err` containing `json_value`.
@@ -961,6 +961,8 @@ crates/aitm-scan-http/
     fn checks(&self) → Vec::new()
   }
   ```
+  Also in this task: collapse `mutate::kind_token` (derived from the serde token) and `points::kind_token`
+  into one callable (orchestrator note 2026-11-01), and sweep every placeholder `#![allow(dead_code)]`.
   `lib.rs`: `pub fn lane() -> Option<Arc<dyn Lane>> { Some(Arc::new(lane::HttpLane::new())) }`;
   rename the test to `lane_slot_is_populated` asserting `is_some()`, `.lane() == LaneKind::Http`,
   `.checks().is_empty()`. Remove every placeholder `#![allow(dead_code)]`.
