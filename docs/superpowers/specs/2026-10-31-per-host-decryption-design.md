@@ -270,7 +270,9 @@ pub struct TunnelInfo {
     `AccessDenied`, `BadCertificateStatusResponse`, `CertificateRequired`). This is
     the untrusted-CA case (Safari, curl without `--cacert`).
   - `client_closed`: EOF / reset / broken pipe before the tunnel was established
-    (speculative pre-connects, a client that gave up).
+    (speculative pre-connects, a client that gave up), and a received `close_notify`
+    alert during the client handshake (a graceful close, not a protocol fault;
+    amended 2026-11-01 from the Task 4 report).
   - `client_tls_error`: any other alert or TLS protocol error on the client side.
   - `upstream_unreachable`: DNS, refused, timed out, or any I/O failure dialling the
     origin.
@@ -400,10 +402,11 @@ What a row renderer needs and gets:
 1. **AC1 (empty Scope decrypts nothing).** Real core, empty Scope, `curl --cacert
    <aitm ca> -x <proxy> https://<origin>` fails to verify (the client saw the
    origin's own self-signed cert, not an aitm leaf) and `curl -k` succeeds with the
-   origin's body; `flow.table` holds exactly one row for the origin: `method
-   CONNECT`, `tunnel "passthrough"`, `tunnel_reason "out_of_scope"`, `status 200`,
-   `bytes_up > 0`, `bytes_down > 0`, `duration_ms` not null after the client closed;
-   no row for that authority has `tunnel == null`. [e2e + unit]
+   origin's body; `flow.table` holds one row per CONNECT for the origin (one after
+   the first curl, two after the second), each `method CONNECT`, `tunnel
+   "passthrough"`, `tunnel_reason "out_of_scope"`, `status 200`, `bytes_up > 0`,
+   `bytes_down > 0`, `duration_ms` not null after the client closed; no row for that
+   authority has `tunnel == null`. [e2e + unit]
 2. **AC2 (live flip on `scope.add`).** On the same running core, `scope.add
    <origin host>` over the operator bus, then the same `curl --cacert` succeeds
    (aitm leaf) and `flow.table` gains a `CONNECT` row with `tunnel "decrypted"`,
