@@ -60,15 +60,31 @@ pub(crate) fn path_template(path: &str) -> String {
 
 /// The template for one path segment, or the segment itself.
 fn template_segment(segment: &str) -> &str {
+    placeholder_for(segment).unwrap_or(segment)
+}
+
+/// The template placeholder [`path_template`] renders `segment` as, or `None`
+/// when it is kept verbatim: `{id}` for all digits, `{uuid}` for a UUID, `{oid}`
+/// for a 24-hex object id (S-M2, so a point naming an id-like segment shows the
+/// placeholder instead of the token).
+pub(crate) fn placeholder_for(segment: &str) -> Option<&'static str> {
     if is_all_digits(segment) {
-        "{id}"
+        Some("{id}")
     } else if is_uuid(segment) {
-        "{uuid}"
+        Some("{uuid}")
     } else if is_oid(segment) {
-        "{oid}"
+        Some("{oid}")
     } else {
-        segment
+        None
     }
+}
+
+/// Whether a path segment is an opaque token whose example must be withheld: a
+/// UUID, or a run of 16 or more hex characters (a 24-hex object id, a 64-hex
+/// reset token, a session handle). A plain numeric id is not opaque — its
+/// example is safe to show (S-M2).
+pub(crate) fn is_opaque_token(segment: &str) -> bool {
+    is_uuid(segment) || (segment.len() >= 16 && is_hex(segment))
 }
 
 /// Whether `segment` reads as a file name rather than a route component.

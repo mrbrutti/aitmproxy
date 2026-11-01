@@ -40,7 +40,9 @@ use aitm_scan_model::{
 
 use crate::limits::MAX_BODY_PARSE_BYTES;
 use crate::params::{self, BodyFormat, JsonStep};
-use crate::template::{looks_like_filename, traits_for};
+use crate::template::{
+    is_id_like, is_opaque_token, looks_like_filename, placeholder_for, traits_for,
+};
 use crate::{multipart, redact, xml};
 
 /// Headers that are never insertion points, ASCII-lowercased.
@@ -248,7 +250,14 @@ impl<'a> Collector<'a> {
             .collect();
 
         // D8.1: a session point never shows its value, whatever it is named.
+        // A path segment that is an opaque token (a UUID, a long hex run) or a
+        // base64 blob also has its example withheld, so a token in the path does
+        // not leak through `example` (S-M2); a plain numeric id keeps its value.
         let example = if traits.contains(&PointTrait::Session) {
+            redact::REDACTED.to_string()
+        } else if is_path_kind(kind)
+            && (is_opaque_token(value) || traits.contains(&PointTrait::Base64))
+        {
             redact::REDACTED.to_string()
         } else {
             redact::example(kind, name, value)
@@ -262,6 +271,14 @@ impl<'a> Collector<'a> {
             example,
         });
     }
+}
+
+/// Whether `kind` is a path segment or path file name.
+fn is_path_kind(kind: InsertionKind) -> bool {
+    matches!(
+        kind,
+        InsertionKind::PathSegment | InsertionKind::PathFilename
+    )
 }
 
 /// Whether a structured-body point is session material by its *path* rather
@@ -323,9 +340,18 @@ pub(crate) fn enumerate_v2(flow: &HttpFlow, opts: &EnumerateOptions<'_>) -> Enum
         } else {
             InsertionKind::PathSegment
         };
-        // 1-based index, so `build_request` replaces the right segment even
-        // when two segments share a text (plan call A9).
-        collector.push(kind, segment, Some((index + 1).to_string()), segment, false);
+        // A token in the path is never shown as a point name: an id-like segment
+        // is named by its template placeholder (`{id}`, `{uuid}`, `{oid}`), so a
+        // customer id or a reset token does not leak through `name` (S-M2). The
+        // 1-based index in `path` still addresses the segment, so
+        // `build_request` replaces the right one even when two share a text
+        // (plan call A9).
+        let name = if is_id_like(segment) {
+            placeholder_for(segment).unwrap_or(segment)
+        } else {
+            segment
+        };
+        collector.push(kind, name, Some((index + 1).to_string()), segment, false);
     }
 
     // 3. Body values, by format.
@@ -937,6 +963,41 @@ mod tests {
     /// `Expect` is a framing header (plan Task 10 lists it): mutating it changes
     /// the request's shape, not the application's input, so it is never a point
     /// (Sp1).
+    /// A token carried in the path must not leak as a point's name or example
+    /// (S-M2). An id-like segment is named by its template placeholder; a UUID,
+    /// an object id or a long hex run has its example withheld; a plain numeric
+    /// id keeps its example because the 1-based `path` index still addresses it.
+    #[test]
+    fn path_tokens_are_templated_and_redacted() {
+        fn seg(url: &str) -> InsertionPoint {
+            let flow = captured_flow(request("GET", url, &[], None), 200, &[], b"");
+            let profile = ScanProfile::default();
+            let ignore = CompiledIgnore::compile(&profile.audit.ignore).unwrap();
+            let out = enumerate_v2(
+                &flow,
+                &EnumerateOptions::from_profile(&profile, &ignore, None),
+            );
+            out.points
+                .into_iter()
+                .filter(|p| p.kind == PathSegment)
+                .next_back()
+                .unwrap_or_else(|| panic!("no trailing path segment for {url}"))
+        }
+
+        let numeric = seg("http://t:8080/account/42");
+        assert_eq!(numeric.name, "{id}");
+        assert_eq!(numeric.path.as_deref(), Some("2"));
+        assert_eq!(numeric.example.as_deref(), Some("42"));
+
+        let long_hex = seg(&format!("http://t:8080/reset/{}", "a".repeat(64)));
+        assert_eq!(long_hex.name, "a".repeat(64));
+        assert_eq!(long_hex.example.as_deref(), Some("<redacted>"));
+
+        let uuid = seg("http://t:8080/s/550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(uuid.name, "{uuid}");
+        assert_eq!(uuid.example.as_deref(), Some("<redacted>"));
+    }
+
     #[test]
     fn expect_header_is_not_a_point() {
         let flow = captured_flow(
