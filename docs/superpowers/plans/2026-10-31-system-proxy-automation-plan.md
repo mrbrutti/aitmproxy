@@ -851,7 +851,7 @@ rebase onto main first. **`crates/aitm-tui/src/fixture.rs` and `fixtures/bus-fix
 - **Satisfies:** SP-AC26 (render half).
 - **Depends on:** Task 17.
 - **Files:** `crates/aitm-tui/src/ui/bars.rs` (modify `toolbar`), `crates/aitm-tui/src/ui/overlays.rs`
-  (help line), `crates/aitm-tui/src/ui/complete.rs` (`BUILTIN_COMMANDS` entry
+  (help line), `crates/aitm-tui/src/app.rs` — NOT `ui/complete.rs`, corrected 2026-11-01 — (`BUILTIN_COMMANDS` entry
   `("sysproxy on|off|status", "set / restore the OS system proxy (key s)")`).
 - **Change:** in `toolbar`, after `format!(" · {listen}")` and before `{state}`
   (`· intercept armed` / `· capture paused`), append `app.system_proxy.as_ref().and_then(|w| w.pill(app.sysproxy_setting)).map(|p| format!(" {p}")).unwrap_or_default()`.
@@ -1624,6 +1624,14 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 17 | security, quality, tester (PR 2) | Minor | no client-side guard against a second `s`/`:sysproxy` while a change is in flight; the core's refusal clears the flag for the first call | fixed in F-tui (guard + Warn toast "system proxy change already in flight") |
+| 18 | security (PR 2) | Minor | `toolbar` sums four `u16` widths with plain `+`; an unbounded host could overflow in debug builds | fixed in F-tui (saturating / usize arithmetic) |
+| 17 | quality (PR 2) | Minor | `"points_at_us"` literal compared in `app.rs` as well as `model.rs` | fixed in F-tui (`SystemProxyWord::points_at_us()`) |
+| 17 | quality, spec (PR 2) | Minor | set/unset reply re-reads `detail` from raw JSON; `sysproxy_detail` falls back to `"<verb>: ok"` (not a spec string); `:sysproxy status` reply does not update the word | fixed in F-tui: the status reply updates the word when it parses; fallback kept and recorded (TUI-only string, only reachable on a malformed reply, pinned by the tester) |
+| 18 | quality (PR 2) | Minor | `toolbar_hints_yield_to_the_pill_word` depends on ambient text widths; `palette_lists_the_sysproxy_command` asserts the const; palette description casing | fixed in F-tui (long-host + wide-width assertions, named constants; the tester's driven palette test covers the render); casing → "Set / restore the OS system proxy (s)" |
+| 18 | spec (PR 2) | Minor | Task 18 edited `src/app.rs` (the plan named `ui/complete.rs`, which never held `BUILTIN_COMMANDS`); toolbar hints yield when the pill word would clip (beyond "append the word"); help box 36→37 rows | recorded: plan error on the file; the yield is required for the §D12 word to render whole at the plan's 160-col test width; accepted by the orchestrator in Matt's name |
+| 17 | spec (PR 2) | Minor | set/unset reply keeps the previous word when the reply is not a status object (plan said replace unconditionally) | accepted (recorded): robustness reading; unreachable with a conforming core |
+| tester (PR 2) | tester | Minor | `keys::flows()` ignores `ctrl` for plain letters so Ctrl-S also toggles (pre-existing convention); the help `:` list shows only the first 14 commands so `sysproxy` appears on the key line, not the list | recorded; no change |
 | 16 | coder (stop-on-gap) | Minor | Task 16 declared only `model.rs`, but `ProxyStatus` is built with exhaustive struct literals in `src/app.rs` (test helper), `tests/core_sync.rs`, `tests/common/mod.rs`; adding `system_proxy` there is required to compile | file list extended to those three one-line edits, orchestrator 2026-11-01 |
 | 7 | quality (F4) | Minor | `decide` rustdoc misstates the call graph; the `else { return 0 }` after `decide(Some(..))` is unreachable | accepted (recorded), orchestrator 2026-10-31; fold into the scaffolding follow-up (reword doc or `unreachable!`) |
 | crate | quality (F4) | Minor | rustdoc intra-doc links to `pub(crate)` items (not gated) | accepted (recorded); `#![allow(rustdoc::private_intra_doc_links)]` or plain backticks in the follow-up |
