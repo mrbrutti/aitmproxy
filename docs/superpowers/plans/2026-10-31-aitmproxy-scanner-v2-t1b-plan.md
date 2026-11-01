@@ -1586,9 +1586,9 @@ Kept by the main session during stage 6. One row per finding.
 | 5 | Quality (w2+3) | Minor | `JOB_NOTIFICATION_METHOD` literal duplicated across crates without a pin | fix: Task 19 adds the cross-crate `assert_eq!` in `crates/aitm/tests` |
 | 8 | Quality (w2+3) | Minor | 30 s timeout mapping tested on the helper, not through `send_opts` | accepted by orchestrator 2026-11-01: tokio `test-util` is not in the crate's dev-deps; the helper test pins the mapping and the bound is `MAX_AWAIT` |
 | 12 | Security (w2+3) | Important | Browser-crawl navigations charged after the fact; `crawl.max_pages` has no ceiling, so the crawl escapes the probes budget | fix (wave-2/3 fix task): cap `max_pages` by `budget_left()` before crawling, drain the budget if the charge is refused; test budget 3 / max_pages 50 → <= 3 navigations, `budget_left() == 0` |
-| 13 | Security (w2+3) | Important | `probe.levenshtein_ratio` is unbounded O(|a|·|b|) CPU on target-controlled bodies, uninterruptible | fix dispatched 2026-11-01 (host_probe coder): inputs capped at `LEVENSHTEIN_MAX_BYTES = 32 KiB`, two-row DP, bounded-time test; documented in `rhai.api.json` |
+| 13 | Security (w2+3) | Important | `probe.levenshtein_ratio` is unbounded O(|a|·|b|) CPU on target-controlled bodies, uninterruptible | fixed in c52dd6ca: inputs capped at 32 KiB, exact bit-parallel distance (the two-row DP measured 38 s at the cap), bounded-time + differential tests; documented in `rhai.api.json` |
 | 13 | Security (w2+3) | Minor | A check whose host lends no client runs on the unbudgeted namespace client | fix (wave-2/3 fix task): `client() == None` is an error verdict like `shared() == None`; `ModeRecordingHost` in the tester's file gains a `client()` override first |
-| 13 | Security (w2+3) | Minor | `probe.raw` method reaches the wire unvalidated (request splitting on the in-scope peer) | fix dispatched (host_probe coder): RFC 9110 token only |
+| 13 | Security (w2+3) | Minor | `probe.raw` method reaches the wire unvalidated (request splitting on the in-scope peer) | fixed in c52dd6ca: RFC 9110 token, <= 32 bytes, refused by name |
 | 7 | Security (w2+3) | Minor | `issues_md` renders attacker-controlled text as Markdown structure | fix (wave-2/3 fix task): `md_inline()` collapses CR/LF and escapes backticks for every interpolated field |
 | 7 | Security (w2+3) | Minor | Dedupe-key fields joined on U+001F without escaping | fix (wave-2/3 fix task): length-prefix each field |
 | 7 | Security (w2+3) | Minor | Issue ids read from disk trusted as file names | fix (wave-2/3 fix task): require `id == file stem` and `^issue-[0-9a-f]{8}$` on load |
@@ -1597,7 +1597,7 @@ Kept by the main session during stage 6. One row per finding.
 | 6 | Security (w2+3) | Minor | `check_timeout_s: 0` passes validation | fix (wave-2/3 fix task): floor at 1 |
 | 5,13,3 | Security (w2+3) | Minor | No `#![forbid(unsafe_code)]` attribute in `aitm-plugin-scanner`, `aitm-plugin-rhai`, `aitm-mcp` | fix (wave-2/3 fix task): add the attribute (the workspace lint already forbids it; belt and braces) |
 | 13 | Spec (w2+3) | Critical | `META_KEYS` omits `remediation` (spec D4 lists it) | fixed in 0a0828e1 |
-| 13 | Spec (w2+3) | Important | Plan test `add_check_registers_a_script_check_with_meta` dropped the `loader.checks()`/`tier.checks` assertions; B9/B17 wiring untested | fix dispatched 2026-11-01 (host_probe coder): `tests/loader_checks.rs` through the real loader, origin `bundled`/`custom`, reload swap |
+| 13 | Spec (w2+3) | Important | Plan test `add_check_registers_a_script_check_with_meta` dropped the `loader.checks()`/`tier.checks` assertions; B9/B17 wiring untested | fixed in c52dd6ca: `tests/loader_checks.rs` (passed first run: the wiring was right, the pin was missing) |
 | 13 | Spec (w2+3) | Important | Unrequested `probe.send(#{ value, mode })` overload | accepted by orchestrator 2026-11-01: requested by the T3 track for the converted scripts; maps 1:1 onto the T1a `Payload.mode` the lane host already honours; documented in `rhai.api.json` and tested |
 | 6 | Spec (w2+3) | Minor | `normalize_origin` drops a scheme-default port (plan said "explicit port kept") | accepted by orchestrator 2026-11-01: `http://h:80` and `http://h` are one origin; the wave-2/3 fix task centralises the rule in `util` |
 | 13 | Spec (w2+3) | Minor | Bridge refuses unknown meta keys (stricter than the plan) | accepted by orchestrator 2026-11-01: D4 "keys are exactly"; a typo'd optional key must not be a silent no-op |
@@ -1612,6 +1612,8 @@ Kept by the main session during stage 6. One row per finding.
 | 7 | Tester (w2+3) | Minor | `merged_paths` re-splits a truncated `matched` string (cosmetic fragment) | accepted by orchestrator 2026-11-01: bounded and scrubbed |
 | 11,14 | Tester (w2+3) | Note | The PoC runner's HTTP steps rely on the client's guard; Task 14 must hand the `JobClient` | routed to Task 14 |
 | 8,14 | Tester (w2+3) | Note | `send_opts(req, SendOptions::default())` records Always; engine sends must use `send` or explicit Never | routed to Task 14 |
+| 13 | Coder (host_probe fix) | Important | `script.reload` (`commands.rs` `Reload::invoke`) only swaps the AST; it never re-runs `load`, so a reload does not swap the script's checks (contrary to the B9 doc comments) | fix task after the WS coder leaves `plugin.rs`: reload re-runs `load` through `LoadedScript::run_load`; test via `script.reload` |
+| 13 | Coder (host_probe fix) | Note | Pre-existing `tests/engine.rs` wall-clock flake | fixed in c52dd6ca: deterministic budget test, green 5x under load |
 
 ## Shipped
 
