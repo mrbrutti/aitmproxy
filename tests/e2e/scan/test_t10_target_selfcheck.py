@@ -14,10 +14,20 @@ What it proves, Vulnerable (V) next to Patched (P), both booted with `--l4`:
     entries with `version` h2/h1 and `conn_req_index == 1`
   - one seed per D3 class answers on V with the row's literal signal and on P
     with the row's patched answer (the rows are the child spec's D3 table)
+  - S3: five `curl --http2` requests in one invocation ride ONE h2 connection: one
+    `/log/conns` row on `tls` with `alpn h2` and `requests == 5`, and the five
+    `request` entries carry `conn_req_index` 1..5 on that `conn_id`
+  - S4 `/ws` (raw RFC 6455 client, no proxy): V upgrades a foreign `Origin` (101,
+    hello `anonymous`) and echoes `<i>` raw; after `POST /login` the hello is
+    `alice`; a header declaring 1 048 577 bytes is closed with 1009 and logged; P
+    answers 403 to the foreign `Origin`, 401 without a session, and with the
+    session cookie upgrades (hello `alice`) and escapes `<i>`; `/log/ws` holds each
+    handshake under the client's own `Sec-WebSocket-Key` with `cookie_names`
   - the TLV speaker (D5): V closes on the trigger frame, refuses connects, is back
     inside the 5 s window and logs one `downtime` row with
     `up_at_ms - down_at_ms == 5000`; P answers `00 03 45 52 52` and never goes down
-  - `/manifest` and `/manifest.yaml` are 404 on both origins
+  - S6: `/manifest`, `/manifest.yaml` and `/<seed id>` for all 28 manifest ids are
+    404 on the target AND on the control origin (the manifest is never served)
   - the control log never stores a `cookie` key or the session value; a request
     carrying `session=` logs `cookie_names == ["session"]` + a 16-hex hash
 
@@ -28,11 +38,14 @@ Binds loopback ports: run from a real shell, not the Claude sandbox. Exit 0 pass
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
+import os
 import re
 import secrets
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -43,7 +56,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aitm_e2e import check, fail, ok, section, skip  # noqa: E402
 from aitm_e2e.scan import ScanTarget  # noqa: E402
-from aitm_e2e.tls import curl_http_version, have  # noqa: E402
+from aitm_e2e.tls import curl, curl_http_version, have  # noqa: E402
+from aitm_e2e.ws import ws_encode, ws_read_frame  # noqa: E402
 
 RUN = secrets.token_hex(4)
 MARK = f"<t-{RUN}>"                      # a raw-vs-escaped reflection marker
@@ -61,6 +75,30 @@ EXPECTED_SERVICES: dict[str, str | None] = {
     "l4-udp-echo": None, "l4-tcp-service": None,
 }
 EXPECTED_ALPN = {"http": ["http/1.1"], "tls": ["h2", "http/1.1"], "tls_h1": ["http/1.1"]}
+
+# Every manifest id (crates/aitm-testtarget/src/manifest.rs: the 25 `seed_index()`
+# routes + the three passive rows). S6: `/<id>` is 404 on both origins -- the
+# cell cannot read the never-served manifest, so the list is pinned here.
+MANIFEST_IDS = (
+    "reflected-xss-search-q", "stored-xss-comments", "ssrf-fetch-preview", "idor-account",
+    "auth-bypass-admin-role", "open-redirect-next", "sqli-error-products-id",
+    "sqli-boolean-items-id", "sqli-time-orders-id", "cmdi-ping-host", "ssti-greet-name",
+    "traversal-static-file", "xxe-order-name", "crlf-lang-set", "nosqli-json-login",
+    "ldapi-ldap-user", "header-reflection-whoami", "cookie-reflection-prefs",
+    "nested-json-reflection-profile", "multipart-reflection-upload", "path-segment-docs-slug",
+    "path-filename-files", "auth-only-account-tab", "ws-cswsh", "ws-input-reflection",
+    "missing-hsts", "missing-csp", "missing-nosniff",
+)
+assert len(MANIFEST_IDS) == 28
+
+# S4 / D4 literals (child spec; mirrored from crates/aitm-testtarget/tests/scan_http.rs).
+WS_HELLO_ANON = '{"type":"hello","user":"anonymous"}'
+WS_HELLO_ALICE = '{"type":"hello","user":"alice"}'
+WS_ECHO_REQ = '{"type":"echo","msg":"<i>"}'
+WS_ECHO_V = '{"type":"echo","msg":"<i>","html":"<b><i></b>"}'
+WS_ECHO_P = '{"type":"echo","msg":"&lt;i&gt;","html":"<b>&lt;i&gt;</b>"}'
+WS_MAX_FRAME = 1_048_576
+FOREIGN_ORIGIN = "http://evil.example"
 
 TLV_SERVICE = "l4-tlv-crash"
 TLV_BENIGN = bytes.fromhex("0003616263")   # len 3 + "abc" -> echoed (D5 benign exchange)
@@ -261,8 +299,11 @@ def do_login(base: str) -> str | None:
                          body=b"user=alice&pass=wonderland")
     sc = header(h, "set-cookie") or ""
     m = SESSION_RE.match(sc)
+    # Never print the cookie value: only the status and the attribute names.
+    shape = ("session=<32 hex>" if m else "no session= match") + "".join(
+        "; " + a.strip().split("=", 1)[0] for a in sc.split(";")[1:] if a.strip())
     check(status == 302 and m is not None,
-          f"login: POST /login mints a 32-hex session cookie (status {status}, set-cookie {sc!r})")
+          f"login: POST /login mints a 32-hex session cookie (status {status}, set-cookie shape {shape!r})")
     return m.group(1) if m else None
 
 
@@ -369,11 +410,230 @@ def check_tlv_patched(p: ScanTarget) -> None:
     check(p.logs.downtime(TLV_SERVICE) == [], f"P tlv: no downtime (got {p.logs.downtime(TLV_SERVICE)})")
 
 
+def check_h2_conn_counter(t: ScanTarget) -> None:
+    """S3: five requests over one h2 connection -> one `/log/conns` row with
+    `requests: 5` and `conn_req_index` 1..5 on `version: "h2"` request entries.
+    curl reuses the connection for every URL of one invocation."""
+    m = t.mode
+    seq0 = t.logs.reset()
+    url = t.tls_base + "/preview?msg=x"
+    rc, out, err = curl(["-k", "--http2", "-w", "%{http_version}\n", *(["-o", "/dev/null", url] * 5)])
+    versions = out.decode("utf-8", "replace").split()
+    check(rc == 0 and versions == ["2"] * 5,
+          f"{m}: five curl --http2 requests in one invocation all negotiated HTTP/2 "
+          f"(rc={rc} versions={versions} {err.strip()[:120]})")
+    time.sleep(0.2)
+    entries = [e for e in t.logs.http() if int(e.get("seq", 0)) > seq0]
+    reqs = sorted((e for e in entries if e.get("kind") == "request" and e.get("path") == "/preview"),
+                  key=lambda e: int(e.get("seq", 0)))
+    check(len(reqs) == 5, f"{m}: the target logged exactly five /preview requests (got {len(reqs)})")
+    conn_ids = {e.get("conn_id") for e in reqs}
+    check(len(conn_ids) == 1, f"{m}: all five requests share one conn_id (got {sorted(map(str, conn_ids))})")
+    check([e.get("conn_req_index") for e in reqs] == [1, 2, 3, 4, 5],
+          f"{m}: conn_req_index runs 1..5 on that connection (got {[e.get('conn_req_index') for e in reqs]})")
+    check(all(e.get("version") == "h2" and e.get("listener") == "tls" and e.get("status") == 200
+              and e.get("query") == "msg=x" for e in reqs),
+          f"{m}: every entry is version h2, listener tls, status 200, query msg=x "
+          f"(got {[(e.get('version'), e.get('listener'), e.get('status'), e.get('query')) for e in reqs]})")
+    hs = [e.get("alpn") for e in entries if e.get("kind") == "tls_handshake"]
+    check(hs == ["h2"], f"{m}: exactly one TLS handshake (alpn h2) for the five requests (got {hs})")
+    conn_id = next(iter(conn_ids), None)
+    rows = [c for c in t.logs.conns() if c.get("conn_id") == conn_id]
+    check(len(rows) == 1 and rows[0].get("listener") == "tls" and rows[0].get("alpn") == "h2",
+          f"{m}: /log/conns has one row for {conn_id} on listener tls with alpn h2 (got {rows})")
+    check(bool(rows) and rows[0].get("requests") == 5,
+          f"{m}: /log/conns row requests == 5 (got {rows[0].get('requests') if rows else None})")
+    check(isinstance(conn_id, str) and conn_id.startswith("c-") and len(conn_id) == 10,
+          f"{m}: conn_id is `c-<8 hex>` (got {conn_id!r})")
+
+
+# ---------------------------------------------------------------------------
+# a raw RFC 6455 client straight to the target (no proxy); the frame codec is
+# the harness's (aitm_e2e.ws), the handshake is written here so the cell owns
+# the Sec-WebSocket-Key it later looks up in /log/ws.
+# ---------------------------------------------------------------------------
+def ws_connect(base: str, key: str, headers: dict | None = None, timeout: float = 5.0):
+    """Upgrade `GET /ws` on `base`; returns (status, headers, body, sock, rd). On a
+    non-101 answer the body is read and the socket closed."""
+    u = urllib.parse.urlsplit(base)
+    sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
+    rd = sock.makefile("rb")
+    lines = ["GET /ws HTTP/1.1", f"Host: {u.netloc}", "Upgrade: websocket", "Connection: Upgrade",
+             f"Sec-WebSocket-Key: {key}", "Sec-WebSocket-Version: 13"]
+    lines += [f"{k}: {v}" for k, v in (headers or {}).items()]
+    sock.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("utf-8"))
+    status_line = rd.readline().decode("latin1").strip()
+    parts = status_line.split()
+    status = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else 0
+    hdrs: dict[str, str] = {}
+    while True:
+        line = rd.readline()
+        if line in (b"\r\n", b"\n", b""):
+            break
+        k, _, val = line.decode("latin1").partition(":")
+        hdrs[k.strip().lower()] = val.strip()
+    body = b""
+    if status != 101:
+        n = int(hdrs.get("content-length") or 0)
+        try:
+            body = rd.read(n) if n else rd.read()
+        except (OSError, ValueError):
+            body = b""
+        sock.close()
+    return status, hdrs, body, sock, rd
+
+
+def ws_key() -> str:
+    return base64.b64encode(os.urandom(16)).decode("ascii")
+
+
+def ws_send_text(sock, text: str) -> None:
+    sock.sendall(ws_encode(0x1, text.encode("utf-8"), mask=True))
+
+
+def ws_read_text(rd) -> str | None:
+    opcode, payload = ws_read_frame(rd)
+    return payload.decode("utf-8", "replace") if opcode == 0x1 and payload is not None else None
+
+
+def ws_close(sock) -> None:
+    try:
+        sock.sendall(ws_encode(0x8, struct.pack("!H", 1000), mask=True))
+    except OSError:
+        pass
+    sock.close()
+
+
+def ws_oversize_header(declared: int) -> bytes:
+    """FIN|Binary, MASK|127, a 64-bit length, a mask key and NO payload bytes: the
+    server must refuse on the header alone (close 1009)."""
+    return bytes([0x82, 0xFF]) + struct.pack("!Q", declared) + os.urandom(4)
+
+
+def ws_handshake_entry(t: ScanTarget, key: str, tries: int = 15) -> dict:
+    for _ in range(tries):
+        for e in t.logs.ws():
+            if e.get("kind") == "handshake" and e.get("sec_websocket_key") == key:
+                return e
+        time.sleep(0.2)
+    return {}
+
+
+def ws_close_entry(t: ScanTarget, conn_id: str | None, tries: int = 15) -> dict:
+    for _ in range(tries):
+        for e in t.logs.ws():
+            if e.get("kind") == "close" and conn_id and e.get("conn_id") == conn_id:
+                return e
+        time.sleep(0.2)
+    return {}
+
+
+def check_ws(v: ScanTarget, p: ScanTarget) -> None:
+    """S4 / D4, mirrored from crates/aitm-testtarget/tests/scan_http.rs::ws_round_trip_v_and_p."""
+    section("S4 /ws on V: foreign Origin upgrades, hello anonymous, raw echo")
+    k1 = ws_key()
+    st, _, body, sock, rd = ws_connect(v.base, k1, {"Origin": FOREIGN_ORIGIN})
+    check(st == 101, f"V: /ws with Origin {FOREIGN_ORIGIN} -> 101 (got {st} {text(body)[:80]!r})")
+    if st == 101:
+        hello = ws_read_text(rd)
+        check(hello == WS_HELLO_ANON, f"V: hello frame is {WS_HELLO_ANON} (got {hello!r})")
+        ws_send_text(sock, WS_ECHO_REQ)
+        echo = ws_read_text(rd)
+        check(echo == WS_ECHO_V, f"V: echo of <i> is raw (got {echo!r})")
+        ws_close(sock)
+
+    section("S4 /ws on V: after POST /login the hello names alice")
+    v_cookie = do_login(v.base)
+    k2 = ws_key()
+    st, _, body, sock, rd = ws_connect(v.base, k2, {"Cookie": f"session={v_cookie}"})
+    check(st == 101, f"V: /ws with the login cookie and no Origin -> 101 (got {st})")
+    if st == 101:
+        hello = ws_read_text(rd)
+        check(hello == WS_HELLO_ALICE, f"V: hello frame is {WS_HELLO_ALICE} (got {hello!r})")
+        ws_close(sock)
+
+    section("S4 /ws on V: a 1 048 577-byte frame header is refused with close 1009")
+    k3 = ws_key()
+    st, _, body, sock, rd = ws_connect(v.base, k3)
+    check(st == 101, f"V: plain /ws upgrade -> 101 (got {st})")
+    close_code = None
+    if st == 101:
+        hello = ws_read_text(rd)
+        check(hello == WS_HELLO_ANON, f"V: hello before the oversize frame (got {hello!r})")
+        sock.sendall(ws_oversize_header(WS_MAX_FRAME + 1))
+        try:
+            opcode, payload = ws_read_frame(rd)
+        except OSError:
+            opcode, payload = None, None
+        if opcode == 0x8 and payload and len(payload) >= 2:
+            close_code = struct.unpack("!H", payload[:2])[0]
+        check(opcode == 0x8 and close_code == 1009,
+              f"V: the server answered the header with a close frame, code 1009 (got opcode {opcode} code {close_code})")
+        sock.close()
+
+    section("S4 /log/ws on V: each handshake under the client's own key, cookie redacted, 1009 logged")
+    hs1 = ws_handshake_entry(v, k1)
+    check(hs1.get("accepted") is True and hs1.get("status") == 101 and hs1.get("origin") == FOREIGN_ORIGIN,
+          f"V: handshake {k1[:6]}.. logged accepted/101 with origin {FOREIGN_ORIGIN} "
+          f"(got accepted={hs1.get('accepted')!r} status={hs1.get('status')!r} origin={hs1.get('origin')!r})")
+    check(hs1.get("cookie_names") == [], f"V: the anonymous handshake logs cookie_names == [] (got {hs1.get('cookie_names')!r})")
+    hs2 = ws_handshake_entry(v, k2)
+    check(hs2.get("cookie_names") == ["session"] and hs2.get("session_valid") is True and hs2.get("accepted") is True,
+          f"V: the logged-in handshake logs cookie_names == ['session'], session_valid, accepted "
+          f"(got {hs2.get('cookie_names')!r} / {hs2.get('session_valid')!r} / {hs2.get('accepted')!r})")
+    raw = json.dumps(v.logs.ws())
+    check(bool(v_cookie) and v_cookie not in raw, "V: the raw session id never appears anywhere in /log/ws")
+    hs3 = ws_handshake_entry(v, k3)
+    close_entry = ws_close_entry(v, hs3.get("conn_id"))
+    check(close_entry.get("code") == 1009,
+          f"V: /log/ws holds a `close` entry with code 1009 for the oversize connection (got {close_entry or None})")
+
+    section("S4 /ws on P: foreign Origin 403, no session 401, session cookie upgrades + escapes")
+    k4 = ws_key()
+    st, _, body, _, _ = ws_connect(p.base, k4, {"Origin": FOREIGN_ORIGIN})
+    check(st == 403 and text(body) == "<p>forbidden origin</p>",
+          f"P: /ws with Origin {FOREIGN_ORIGIN} -> 403 <p>forbidden origin</p> (got {st} {text(body)[:60]!r})")
+    k5 = ws_key()
+    st, _, body, _, _ = ws_connect(p.base, k5)
+    check(st == 401 and text(body) == "<p>login required</p>",
+          f"P: /ws with no Origin and no cookie -> 401 <p>login required</p> (got {st} {text(body)[:60]!r})")
+    p_cookie = do_login(p.base)
+    k6 = ws_key()
+    st, _, body, sock, rd = ws_connect(p.base, k6, {"Cookie": f"session={p_cookie}"})
+    check(st == 101, f"P: /ws with the login cookie and no Origin -> 101 (got {st} {text(body)[:60]!r})")
+    if st == 101:
+        hello = ws_read_text(rd)
+        check(hello == WS_HELLO_ALICE, f"P: hello frame is {WS_HELLO_ALICE} (got {hello!r})")
+        ws_send_text(sock, WS_ECHO_REQ)
+        echo = ws_read_text(rd)
+        check(echo == WS_ECHO_P, f"P: echo of <i> is HTML-escaped (got {echo!r})")
+        ws_close(sock)
+    hs4, hs5, hs6 = ws_handshake_entry(p, k4), ws_handshake_entry(p, k5), ws_handshake_entry(p, k6)
+    check(hs4.get("accepted") is False and hs4.get("status") == 403,
+          f"P: the foreign-Origin handshake is logged accepted False / 403 (got {hs4.get('accepted')!r} / {hs4.get('status')!r})")
+    check(hs5.get("accepted") is False and hs5.get("status") == 401 and hs5.get("session_valid") is False,
+          f"P: the no-session handshake is logged accepted False / 401 (got {hs5.get('accepted')!r} / {hs5.get('status')!r})")
+    check(hs6.get("accepted") is True and hs6.get("status") == 101 and hs6.get("cookie_names") == ["session"],
+          f"P: the logged-in handshake is accepted / 101 with cookie_names ['session'] "
+          f"(got {hs6.get('accepted')!r} / {hs6.get('status')!r} / {hs6.get('cookie_names')!r})")
+    check(bool(p_cookie) and p_cookie not in json.dumps(p.logs.ws()), "P: the raw session id never appears in /log/ws")
+
+
 def check_manifest_404(v: ScanTarget, p: ScanTarget) -> None:
+    """S6: the manifest and every seed id are 404 on the target AND the control origin."""
     for t in (v, p):
-        for path in ("/manifest", "/manifest.yaml"):
-            s, _, _ = http1(t.base, "GET", path)
-            check(s == 404, f"{t.mode}: GET {path} is 404 (got {s})")
+        for origin_name, base in (("target", t.base), ("control", t.control)):
+            for path in ("/manifest", "/manifest.yaml"):
+                s, _, _ = http1(base, "GET", path)
+                check(s == 404, f"{t.mode}/{origin_name}: GET {path} is 404 (got {s})")
+            not_404 = {}
+            for sid in MANIFEST_IDS:
+                s, _, _ = http1(base, "GET", "/" + sid)
+                if s != 404:
+                    not_404[sid] = s
+            check(not not_404,
+                  f"{t.mode}/{origin_name}: GET /<id> is 404 for all {len(MANIFEST_IDS)} manifest ids "
+                  f"(non-404: {not_404 or 'none'})")
 
 
 def check_cookie_redaction(v: ScanTarget) -> None:
@@ -410,18 +670,22 @@ def main() -> int:
         section("TLS ALPN per listener, read back from the control log")
         check_alpn(v)
         check_alpn(p)
+        section("S3: five requests on one h2 connection are one /log/conns row with requests 5")
+        check_h2_conn_counter(v)
         check_seeds(v, p)
+        check_ws(v, p)
         section("the TLV speaker's 5 s crash window (V) vs the protocol-error reply (P)")
         check_tlv_vulnerable(v)
         check_tlv_patched(p)
-        section("`/manifest` and `/manifest.yaml` are 404 on both origins")
+        section("S6: `/manifest`, `/manifest.yaml` and every seed id are 404 on the target and the control origin")
         check_manifest_404(v, p)
         section("the control log redacts `cookie` to names + a 16-hex hash")
         check_cookie_redaction(v)
     finally:
         v.stop()
         p.stop()
-    ok("T10 self-check: the seeded target serves every class, ALPN, the crash window and redaction as pinned")
+    ok("T10 self-check: the seeded target serves every class, ALPN, the h2 counter, /ws, the crash window, "
+       "the unserved manifest and redaction as pinned")
     return 0
 
 

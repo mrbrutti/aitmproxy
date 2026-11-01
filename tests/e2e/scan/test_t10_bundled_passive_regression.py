@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# e2e: tier=T1 surface=scan needs=http
+# e2e: tier=T1 surface=scan needs=ws
 """The bundled passive catalogue still fires on real proxied traffic, Vulnerable
 vs Patched (T10 spec S10; parent AC T10-3) — with NO scanner engine and NO
 `scan.*` call at all. The observer is the core's own `script.findings` after real
@@ -12,7 +12,11 @@ MITM'd HTTPS and real cleartext `ws://` traffic through the proxy.
     on V's host.
   - The same two actions against the PATCHED target add NONE of the three for P's
     host (P sends HSTS + CSP, so the header scripts stay silent; its `/ws` requires
-    a session so no cleartext WebSocket flow is established).
+    a session so no cleartext WebSocket flow is established). Two assertions close
+    the attribution hole: no finding from the three scripts attributes to a P host,
+    AND every finding from them that arrived after the V phase attributes to V (a
+    P finding whose flow cannot be resolved and whose detail lacks the host would
+    otherwise slip through as "not P").
 
 Before polling, the cell asserts on the core's OWN flow store that the ws://
 conversation went through it (the 101 handshake flow to V's plain listener and the
@@ -254,6 +258,9 @@ def main() -> int:
             check(False, f"V: bundled `{sid}` recorded a finding on V's host")
 
         section("the same two actions against the PATCHED target add none of the three")
+        # Snapshot BEFORE the P traffic: `script.findings` is oldest-first, so every
+        # finding past this index arrived during (or after) the P phase.
+        n_before_p = len(findings_now(op))
         drive_https(proxy, ca, p.tls_authority, "P")
         drive_ws("127.0.0.1", cfg.proxy_port, p.authority, "P", expect_upgrade=False)
         time.sleep(SETTLE_P_S)
@@ -262,6 +269,12 @@ def main() -> int:
         for sid in SCRIPT_IDS:
             hits = fired_for(op, sid, p_hosts, fs, cache)
             check(hits == [], f"P: bundled `{sid}` fired zero times on P's host (got {len(hits)})")
+        new_three = [f for f in fs[n_before_p:] if f.get("source") in SCRIPT_IDS]
+        stray = [(f.get("source"), f.get("flow_id"), (f.get("detail") or "")[:60]) for f in new_three
+                 if not any(on_host(op, f, h, cache) for h in v_hosts)]
+        check(not stray,
+              f"P: every finding from the three scripts that arrived after the V phase attributes to V "
+              f"({len(new_three)} new; unattributed: {stray or 'none'})")
     finally:
         if op:
             op.close()

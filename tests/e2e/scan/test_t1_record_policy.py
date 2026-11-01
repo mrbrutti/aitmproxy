@@ -113,6 +113,11 @@ def main() -> int:
         check(all(scan_mark in marks_of(r) for r in crawl_rows),
               f"every `crawl` row also carries {scan_mark} ({len(crawl_rows)} crawl row(s))")
         probe_rows = [r for r in scan_rows if "crawl" not in marks_of(r)]
+        # V is vulnerable and `standard` finds issues there (T1-3 demands an `issue`
+        # push line), so issues_only must have kept at least one evidence probe: without
+        # this the `issue:<id>` assertion below would pass over an empty list.
+        check(len(probe_rows) >= 1,
+              f"at least one issue-evidence probe flow was kept by issues_only ({len(probe_rows)} non-crawl scan row(s))")
         no_issue = [(r.get("id"), r.get("path")) for r in probe_rows
                     if not any(m.startswith("issue:") for m in marks_of(r))]
         check(not no_issue, f"no probe flow without an issue: every non-crawl scan row carries issue:<id> "

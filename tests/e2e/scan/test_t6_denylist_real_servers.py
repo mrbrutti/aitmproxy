@@ -212,6 +212,10 @@ def main() -> int:
               f"INFO commandstats answered with a commandstats section ({len(info)} bytes)")
         seen = sorted(line.split(":", 1)[0].strip()
                       for line in info.splitlines() if line.startswith("cmdstat_"))
+        # `name not in seen` over an EMPTY `seen` would prove nothing: a RESP job of
+        # 200 cases must have made redis execute at least one (benign) command.
+        check(len(seen) >= 1,
+              f"redis's own commandstats show the RESP job executed at least one command ({len(seen)} cmdstat row(s))")
         for name in DENYLISTED_CMDSTATS:
             check(name not in seen, f"redis never executed {name[len('cmdstat_'):].upper()}")
         ok(f"redis executed only: {seen}")

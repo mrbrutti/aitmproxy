@@ -17,7 +17,10 @@ opens five handles to exercise the 4-handle cap.
   (an out-of-scope loopback listener) records ZERO hits — the scope guard stopped the
   dial before it left.
 - `e2e.ws_many {url: ws://<V>/ws}` -> an error (the fifth dial refused) or a result
-  naming the 4-handle cap.
+  naming the 4-handle cap; either way the target's own WS log, reset just before the
+  call, shows exactly four handshakes: four dials reached the target and the fifth
+  never did. (An error for any OTHER reason -- a script fault, a scope refusal -- would
+  leave fewer than four handshakes and fail here instead of passing as "the cap".)
 
 SKIP 77 when: the `ws` lane / namespace is not live on this build (`require_lane`).
 
@@ -100,13 +103,24 @@ def main() -> int:
             check(canary.hits == [], f"the out-of-scope canary recorded zero hits ({len(canary.hits)})")
 
             section("the 4-handle cap holds")
+            seq_many = v.logs.reset()  # every WS entry from here is ws_many's
             status, payload = op.try_call("e2e.ws_many", {"url": f"ws://{v.authority}/ws"})
             if status == "error":
-                ok(f"e2e.ws_many refused the fifth dial over the 4-handle cap ({str(payload)[:80]!r})")
+                check("OutOfScope" not in str(payload),
+                      f"the ws_many error is not a scope refusal ({str(payload)[:80]!r})")
+                ok(f"e2e.ws_many errored on the fifth dial ({str(payload)[:80]!r})")
             else:
                 text = str(payload).lower()
                 check("4" in text or "four" in text or "cap" in text or "limit" in text,
                       f"e2e.ws_many result names the 4-handle cap ({str(payload)[:80]!r})")
+            many_hs = [e for e in v.logs.ws()
+                       if e.get("kind") == "handshake" and int(e.get("seq", 0)) > seq_many]
+            check(len(many_hs) == 4,
+                  f"the target's own log shows exactly 4 handshakes for the five dials: "
+                  f"four handles opened, the fifth was refused before it left (got {len(many_hs)})")
+            check(all(e.get("accepted") is True for e in many_hs),
+                  f"every one of the four dials was accepted by the target "
+                  f"({[e.get('status') for e in many_hs]})")
             ok("AC T4-4 proven on the target's WS log and the out-of-scope canary")
     return 0
 

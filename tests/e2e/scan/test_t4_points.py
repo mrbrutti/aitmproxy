@@ -10,9 +10,11 @@ frame. A `scan.start` with `lanes: ["ws"]` then derives insertion points from th
 captured WsFlow; `scan.sitemap` must list `ws_json_value` points named `type` and
 `msg` (the two JSON leaves of the frame).
 
-Independent observer: the target's own WS log (`V.logs.ws()`) — the handshake the
-cell sent (its `Sec-WebSocket-Key`) and the lane's later dials (other keys), proving
-the lane really dialled the target.
+Independent observer: the target's own WS log (`V.logs.ws()`). The cell records the
+`Sec-WebSocket-Key`s of its own conversation, then resets the target log; every
+handshake logged after the reset is the lane's, must carry a key the cell never
+sent, and at least one must exist -- proving the lane really dialled the target
+rather than only re-reading the captured flow.
 
 SKIP 77 when: the scanner verbs are absent (`require_verbs`), or the `ws` lane has
 no `scan.checks` entry on this build (`require_lane`) — the ws lane is not on `main`.
@@ -52,6 +54,28 @@ def _authority_parts(authority: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def sitemap_points(op, job: str) -> list[dict]:
+    """Every `scan.sitemap` point for `job`, walking `next_cursor` (D3 paging)."""
+    points: list[dict] = []
+    cursor = None
+    seen: set[str] = set()
+    while True:
+        args: dict = {"job": job, "limit": 1024}
+        if cursor:
+            args["cursor"] = cursor
+        page = scan_call(op, "operator", "scan.sitemap", args)
+        points.extend((page or {}).get("points") or [])
+        cursor = (page or {}).get("next_cursor")
+        if not cursor or cursor in seen:
+            return points
+        seen.add(cursor)
+
+
+def _handshake_keys(entries: list[dict]) -> set[str]:
+    return {e.get("sec_websocket_key") for e in entries
+            if e.get("kind") == "handshake" and e.get("sec_websocket_key")}
+
+
 def main() -> int:
     section("AC T4-1: ws_json_value points from a captured /ws conversation")
     with ScanTarget("vulnerable") as v:
@@ -78,6 +102,12 @@ def main() -> int:
                   "the target answered the hello + echo through the proxy")
             check(b"echo" in (reply or b""),
                   f"echo reply observed through the proxy ({(reply or b'')[:60]!r})")
+            cell_log = v.logs.ws()
+            cell_keys = _handshake_keys(cell_log)
+            check(len(cell_keys) == 1 and any(e.get("kind") == "frame" for e in cell_log),
+                  f"the target logged the cell's own handshake (one key) and its frames "
+                  f"({len(cell_keys)} key(s), {len(cell_log)} entries)")
+            seq0 = v.logs.reset()  # from here on, every WS entry is the lane's
 
             section("scan with lanes: [ws] and read the site map points")
             r = start_job(op, "operator",
@@ -86,20 +116,24 @@ def main() -> int:
                                    "lanes": ["ws"]})
             job = r["job"]
             wait_terminal(op, "operator", job)
-            pts = scan_call(op, "operator", "scan.sitemap", {"job": job}).get("points", [])
+            pts = sitemap_points(op, job)
             ws_json = [p for p in pts if p.get("kind") == "ws_json_value"]
             names = {p.get("name") for p in ws_json}
             check("type" in names and "msg" in names,
                   f"ws_json_value points include the frame's JSON leaves type and msg ({sorted(names)})")
 
-            section("independent observer: the target's WS log")
-            ws_log = v.logs.ws()
-            handshakes = [e for e in ws_log if e.get("kind") == "handshake"]
-            frames = [e for e in ws_log if e.get("kind") == "frame"]
-            check(len(handshakes) >= 1, f"target WS log holds handshake entries ({len(handshakes)})")
-            check(len(frames) >= 1, f"target WS log holds frame entries ({len(frames)})")
-            keys = {e.get("sec_websocket_key") for e in handshakes if e.get("sec_websocket_key")}
-            check(len(keys) >= 1, f"handshakes carry distinct Sec-WebSocket-Keys ({len(keys)})")
+            section("independent observer: the target's WS log since the reset is the lane's")
+            lane_log = [e for e in v.logs.ws() if int(e.get("seq", 0)) > seq0]
+            lane_hs = [e for e in lane_log if e.get("kind") == "handshake"]
+            lane_frames = [e for e in lane_log if e.get("kind") == "frame"]
+            check(len(lane_hs) >= 1, f"the lane dialled the target: handshake entries after the reset ({len(lane_hs)})")
+            check(len(lane_frames) >= 1, f"the lane exchanged frames with the target ({len(lane_frames)})")
+            lane_keys = _handshake_keys(lane_hs)
+            check(bool(lane_keys) and not (lane_keys & cell_keys),
+                  f"every lane handshake carries a Sec-WebSocket-Key the cell never sent "
+                  f"({len(lane_keys)} lane key(s), overlap with the cell's: {len(lane_keys & cell_keys)})")
+            check(all(e.get("path") == "/ws" for e in lane_hs),
+                  f"every lane handshake targets /ws ({sorted({str(e.get('path')) for e in lane_hs})})")
             ok("AC T4-1 proven on the captured conversation and the target's own log")
     return 0
 
