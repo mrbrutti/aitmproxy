@@ -840,3 +840,104 @@ extension ScanModelTests {
         #expect(status.issues.byConfidence == ByConfidence(certain: 1, firm: 1, tentative: 1))
     }
 }
+
+/// Tester — stage 6 fix round, S1 at the edges a JSON double has: negative zero,
+/// the first integer past 2^53 (which the wire cannot carry), a power-of-ten
+/// double that is an exact `Int`, a fraction, and the sums and subtractions the
+/// Kit runs on a top-of-range value. With the range rule reverted the 1e16 cases
+/// below read as values and the five-tally sum is the trap S1 named.
+extension ScanModelTests {
+    @Test func wholeNumbersAtTheDoubleBoundary() throws {
+        let status = try ScanPack.load("scan.status.json")
+        let top = 9_007_199_254_740_992
+
+        // `-0` is a JSON number; it is the whole number 0, in range.
+        let negativeZero = try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "sent"], to: -0.0))
+        #expect(negativeZero.probes.sent == 0)
+
+        // 1e16 is integral and an exact `Int`, but past 2^53: the range rule, not the type rule, refuses it.
+        #expect(throws: BusError.malformed("ScanProbeCounters.sent is not a whole number in 0...9007199254740992")) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "sent"], to: 1e16))
+        }
+        // A fraction is refused by the type rule, with its own words (no range suffix).
+        #expect(throws: BusError.malformed("ScanProbeCounters.sent is not a whole number")) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "sent"], to: 0.5))
+        }
+        // 2^53 + 1 cannot be a JSON double: it arrives as 2^53 and reads as 2^53.
+        let rounded = try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "sent"], to: 9_007_199_254_740_993))
+        #expect(rounded.probes.sent == top)
+
+        // Every tally at the top of the range: the sum the Kit takes still fits, and the bar divides.
+        var all = status
+        for key in ["critical", "high", "medium", "low", "info"] {
+            all = ScanPack.edited(all, path: ["issues", "by_severity", key], to: 9_007_199_254_740_992)
+        }
+        let full = try ScanJobStatus(json: all)
+        #expect(full.issues.bySeverity.total == 45_035_996_273_704_960)
+        let segments = ScanSurfaceModel.severityBarSegments(full.issues.bySeverity)
+        #expect(segments.count == 5)
+        let evenFifths = segments.allSatisfy { abs($0.fraction - 0.2) < 1e-9 }
+        #expect(evenFifths)
+
+        // The formatters subtract and divide a top-of-range stamp without a trap.
+        // Tester finding T-F2: `elapsed(ms:)` formats its 64-bit hour count with `%d`, so
+        // every elapsed_ms from 7_730_941_132_800_000 to the S1 ceiling prints a negative
+        // hour count (`-1792967504:59:00` here); `%ld` prints the value below.
+        #expect(ScanFormat.elapsed(ms: top) == "2501999792:59:00")
+        #expect(ScanFormat.elapsed(ms: 7_730_941_132_800_000) == "2147483648:00:00")
+        #expect(ScanFormat.elapsed(ms: 7_730_941_132_800_000 - 3_600_000) == "2147483647:00:00")
+        #expect(ScanFormat.relative(ms: top, now: 0) == "0 s ago")
+        #expect(ScanFormat.relative(ms: 0, now: top) == "2501999792 h ago")
+        let late = try ScanJobStatus(json: ScanPack.edited(status, path: ["elapsed_ms"], to: 9_007_199_254_740_992))
+        #expect(late.elapsedMs == top)
+        #expect(ScanFormat.jobRowLine2(late.summary).hasPrefix("probes 418 / 2000 · points 80 / 120 audited · "))
+
+        // The other whole-number readers of a status refuse the same way.
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["elapsed_ms"], to: -1)) }
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["elapsed_ms"], to: 1e16)) }
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["points", "found"], to: 1e16)) }
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["points", "skipped", "limit"], to: -1)) }
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["issues", "total"], to: -1)) }
+        #expect(throws: BusError.self) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["issues", "by_confidence", "certain"], to: 1e16))
+        }
+        #expect(throws: BusError.malformed("ScanProbeCounters.by_lane is not an object of whole numbers in 0...9007199254740992")) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "by_lane", "http"], to: 1e16))
+        }
+
+        // A push line's `ts_ms` and its embedded status: the same rule.
+        let line = try ScanPack.load("job.progress.json")
+        #expect(throws: BusError.malformed("ScanJobNotification.ts_ms is not a whole number in 0...9007199254740992")) {
+            try ScanJobNotification(json: ScanPack.edited(line, path: ["ts_ms"], to: 1e16))
+        }
+        #expect(throws: BusError.self) {
+            try ScanJobNotification(json: ScanPack.edited(line, path: ["status", "probes", "sent"], to: -1))
+        }
+        let zeroStamp = try ScanJobNotification(json: ScanPack.edited(line, path: ["ts_ms"], to: -0.0))
+        #expect(zeroStamp.tsMs == 0)
+
+        // A list page and an issues page carry the rule into their rows and tallies.
+        let list = try ScanPack.load("scan.list.json")
+        #expect(throws: BusError.self) {
+            try ScanListResult(json: ScanPack.edited(list, path: ["jobs", "0", "probes", "budget"], to: 1e16))
+        }
+        #expect(throws: BusError.self) {
+            try ScanListResult(json: ScanPack.edited(list, path: ["jobs", "1", "issues", "by_severity", "info"], to: -1))
+        }
+        let issues = try ScanPack.load("scan.issues.json")
+        #expect(throws: BusError.malformed("BySeverity.high is not a whole number in 0...9007199254740992")) {
+            try ScanIssuesResult(json: ScanPack.edited(issues, path: ["by_severity", "high"], to: 1e16))
+        }
+        #expect(throws: BusError.self) {
+            try ScanIssuesResult(json: ScanPack.edited(issues, path: ["issues", "0", "occurrences"], to: 1e16))
+        }
+
+        // An issue's stamps at the top of the range format without a trap.
+        let issue = try ScanPack.load("scan.issue.json")
+        let topIssue = try ScanIssue(json: ScanPack.edited(issue, path: ["first_seen"], to: 9_007_199_254_740_992))
+        #expect(topIssue.firstSeen == top)
+        #expect(topIssue.summary.firstSeen == top)
+        #expect(ScanFormat.relative(ms: topIssue.firstSeen, now: 1_761_900_000_000) == "0 s ago")
+        #expect(ScanFormat.relative(ms: 0, now: topIssue.firstSeen) == "2501999792 h ago")
+    }
+}

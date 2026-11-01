@@ -466,7 +466,7 @@ final class ScanPanelState {
         // One launch at a time: a confirm sheet or an in-flight call owns the bus until it settles.
         guard surface.confirm == nil, !surface.launchInFlight else { return }
         if let refusal = launchRefusal {
-            surface.statusLine = refusal
+            surface.setStatusLine(refusal)
             return
         }
         let call = surface.launchArguments(map: map)
@@ -547,21 +547,23 @@ final class ScanPanelState {
             let result = try ScanProfileSaveResult(json: value)
             surface.loadedProfile = profile
             let line = "Saved \(result.saved)"
-            surface.statusLine = line
+            surface.setStatusLine(line)
             clearStatusLine(line, after: .seconds(4))
         } catch {
-            surface.statusLine = scanUnableText("save profile", BusService.describe(error))
+            surface.setStatusLine(scanUnableText("save profile", BusService.describe(error)))
             return
         }
         await refreshProfiles()
     }
 
     /// Duplicate…: the edited values under a new name, unsaved and unloaded, so a
-    /// launch sends the whole profile and Save Profile writes a new file.
+    /// launch sends the whole profile and Save Profile writes a new file. The name
+    /// rule is checked here, not only by the popover's button: a name the core
+    /// could not store as a file never becomes a profile's.
     func duplicateProfile(as name: String) {
         guard var profile = surface.editedProfile else { return }
         let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty else { return }
+        guard ScanSurface.isValidProfileName(trimmed) else { return }
         profile.name = trimmed
         surface.loadedProfile = nil
         surface.editedProfile = profile
@@ -577,7 +579,11 @@ final class ScanPanelState {
         do {
             let value = try await session.runCommand("scan.profile.delete", ["name": .string(name)])
             let result = try ScanProfileDeleteResult(json: value)
-            if !result.deleted { surface.statusLine = scanNothingToDeleteText(name: name) }
+            if !result.deleted {
+                let line = scanNothingToDeleteText(name: name)
+                surface.setStatusLine(line)
+                clearStatusLine(line, after: .seconds(4))
+            }
         } catch {
             surface.profilesError = scanUnableText("delete profile \(name)", BusService.describe(error))
             return
@@ -659,11 +665,11 @@ final class ScanPanelState {
     /// Open the PoC an issue points at on the Findings page. The match is the
     /// Kit's `ScanFindingLink.match` over the findings' PoC paths, nothing looser;
     /// a reference no finding carries is refused, never guessed.
-    func openPoC(ref: String?) {
+    func openPoC(ref: String) {
         if session.poc.findings.isEmpty { session.poc.load() }
         let findings = session.poc.findings
         guard let index = ScanFindingLink.match(pocRef: ref, in: findings.map(\.pocPath)) else {
-            session.lastError = "PoC \(ref ?? "") is not in this app's findings list"
+            session.lastError = "PoC \(ref) is not in this app's findings list"
             return
         }
         session.show(.findings)
@@ -717,7 +723,7 @@ final class ScanPanelState {
         Task { [weak self] in
             try? await Task.sleep(for: delay)
             guard let self, savedLine == line, surface.statusLine == line else { return }
-            surface.statusLine = nil
+            surface.setStatusLine(nil)
             savedLine = nil
         }
     }
@@ -1303,9 +1309,11 @@ struct ScanSectionTitle: View {
 }
 
 /// A failed read or update, inline (D11): the list it could not refresh stays
-/// as it was. Selectable so the reason can be copied into a bug report.
+/// as it was. Selectable so the reason can be copied into a bug report. `inset`
+/// is the list inset it sits in; 0 inside a block that carries its own.
 struct ScanInlineError: View {
     var text: String
+    var inset: CGFloat = Space.md
 
     var body: some View {
         Text(text)
@@ -1313,7 +1321,7 @@ struct ScanInlineError: View {
             .foregroundStyle(Tok.Status.serverError.color)
             .lineLimit(2)
             .textSelection(.enabled)
-            .padding(.horizontal, Space.md)
+            .padding(.horizontal, inset)
             .padding(.vertical, Space.xs)
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityElement(children: .ignore)
@@ -1355,10 +1363,11 @@ private extension View {
 
 extension View {
     /// The Scan page's text field, on every tab: plain, on `surface`, a
-    /// control-border outline.
-    func scanFieldChrome() -> some View {
+    /// control-border outline. `face` is the data face unless the field holds
+    /// prose (the Issues note).
+    func scanFieldChrome(face: Font = Tok.Face.data(Tok.Typography.Size.md)) -> some View {
         textFieldStyle(.plain)
-            .font(Tok.Face.data(Tok.Typography.Size.md))
+            .font(face)
             .padding(.horizontal, Space.sm)
             .frame(height: Tok.Size.control)
             .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))

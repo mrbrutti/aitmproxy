@@ -180,17 +180,17 @@ struct ScanProfilesTab: View {
         }
     }
 
-    /// The one line under the buttons (D4): the refusal first, then the launch
-    /// error (its code beside it) or the model's status line ("Saved <name>"),
-    /// then the edited-builtin note, else the idle text.
+    /// The one line under the buttons (D4): the refusal first, then the model's
+    /// status line (a launch error's words with its code beside them, or "Saved
+    /// <name>"), then the edited-builtin note, else the idle text.
     @ViewBuilder private var statusLine: some View {
         Group {
             if let refusal = state.launchRefusal {
                 Text(refusal).foregroundStyle(Tok.Intercept.deep.color)
-            } else if let line = state.surface.launchError?.display ?? state.surface.statusLine {
+            } else if let line = state.surface.statusLine {
                 HStack(spacing: Space.sm) {
                     Text(line).foregroundStyle(Tok.Ink.secondary.color)
-                    if let code = state.surface.launchError?.code {
+                    if let error = state.surface.launchError, error.display == line, let code = error.code {
                         // The engine's error code beside its words, for a bug report.
                         Text(code)
                             .font(Tok.Face.data(Tok.Typography.Size.sm))
@@ -426,9 +426,8 @@ private struct ScanProfileEditor: View {
         block("Checks") {
             if let error = state.checksError {
                 // The catalogue already loaded stays; the failed re-read says so here (D11).
-                // The shared line carries the list inset; undone here so it sits on the block's edge.
-                ScanInlineError(text: error)
-                    .padding(.horizontal, -Space.md)
+                // The block carries its own inset, so the line takes none.
+                ScanInlineError(text: error, inset: 0)
             }
             TextField("Search checks", text: $state.surface.checkQuery)
                 .scanFieldChrome()
@@ -693,7 +692,7 @@ private struct ScanProfileDuplicatePopover: View {
                 .frame(width: 240)
                 .onSubmit { if valid { duplicate() } }
             if !trimmedName.isEmpty, !ScanSurface.isValidProfileName(trimmedName) {
-                Hint(text: "Use letters, digits, - _ . (not leading)")
+                Hint(text: scanProfileNameRuleText)
             }
             HStack(spacing: Space.sm) {
                 Spacer(minLength: 0)
@@ -715,11 +714,13 @@ private struct ScanProfileDuplicatePopover: View {
     private var trimmedName: String { (state.duplicateName ?? "").trimmingCharacters(in: .whitespaces) }
 
     /// A name the core would accept as a file name (`ScanSurface.isValidProfileName`)
-    /// that the list does not already carry (the core would refuse to overwrite a
-    /// builtin, and a saved custom one is not a duplicate's to replace).
+    /// that the list does not already carry in any case (the core would refuse to
+    /// overwrite a builtin, a saved custom one is not a duplicate's to replace, and
+    /// a case-folding store must not be reached through `My-API` beside `my-api`).
     private var valid: Bool {
         let trimmed = trimmedName
-        return ScanSurface.isValidProfileName(trimmed) && !state.surface.profiles.contains { $0.name == trimmed }
+        return ScanSurface.isValidProfileName(trimmed)
+            && !ScanSurface.profileNameCollides(trimmed, with: state.surface.profiles.map(\.name))
     }
 
     private func duplicate() {

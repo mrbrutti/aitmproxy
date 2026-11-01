@@ -1228,7 +1228,7 @@ extension ScanSurfaceTests {
         entry.lanes = [.http, .other("quic")]
         #expect(ScanFormat.profileRowLine2(entry) == "http, quic · passive · normal")
         entry.lanes = []
-        #expect(ScanFormat.profileRowLine2(entry) == " · passive · normal")
+        #expect(ScanFormat.profileRowLine2(entry) == "no lanes · passive · normal")
 
         // Launch notices for a clamp and a skipped lane are one line each, in that order.
         var model = ScanSurfaceModel()
@@ -1491,8 +1491,9 @@ extension ScanSurfaceTests {
         #expect(scanSelectJobText == "Select a job.")
         #expect(scanNoJobsText == "No jobs yet — pick a profile and Start Scan.")
         #expect(scanNoIssuesText == "No issues — start a scan, or widen the filters.")
-        #expect(scanNoSitemapTitle == "No site map yet")
-        #expect(scanNoSitemapText == "A running job fills this as it crawls.")
+        #expect(scanNoSitemapText == "No site map yet — a running job fills this as it crawls.")
+        #expect(scanProfileNameRuleText == "Use letters, digits, - _ . (not leading)")
+        #expect(ScanFormat.findingText("f-3b1c") == "Finding f-3b1c")
         #expect(scanNoProfilesText == "No profiles — the core lists none.")
         #expect(scanNothingToDeleteText(name: "my-api") == "Nothing to delete: my-api is not on the core")
         #expect(scanUnableText("save profile", "bus closed") == "Unable to save profile: bus closed")
@@ -1514,6 +1515,7 @@ extension ScanSurfaceTests {
 
         model.select(profile: "thorough")
         #expect(model.launchError == nil, "picking another profile clears it")
+        #expect(model.statusLine == nil, "and its line with it")
 
         model.applyLaunchError(ScanLaunchError(busMessage: "scan: out_of_scope: no", origins: ["http://a.test:8443/x"]))
         #expect(model.launchError?.code == "out_of_scope")
@@ -1597,12 +1599,17 @@ extension ScanSurfaceTests {
         let leaves = tree.groups.flatMap(\.leaves)
         let sqli = try #require(leaves.first { $0.meta.id == "http.sqli-error" })
         #expect(sqli.aboveIntensity)
+        // The row's visible words (name, class, intensity, cost, origin); the choice menu reads its own.
         #expect(ScanFormat.checkAccessibilityLabel(sqli)
-                == "Error-based SQL injection, sqli-error, medium, Default, above this profile's intensity")
+                == "Error-based SQL injection, sqli-error, medium, light, bundled, above this profile's intensity")
         var included = sqli
         included.choice = .include
         included.aboveIntensity = false
-        #expect(ScanFormat.checkAccessibilityLabel(included) == "Error-based SQL injection, sqli-error, medium, Include")
+        #expect(ScanFormat.checkAccessibilityLabel(included)
+                == "Error-based SQL injection, sqli-error, medium, light, bundled")
+        let xss = try #require(leaves.first { $0.meta.id == "http.reflected-xss" })
+        #expect(ScanFormat.checkAccessibilityLabel(xss)
+                == "reflected-xss check, reflected-xss, medium, light, native, above this profile's intensity")
 
         #expect(ScanFormat.originAccessibilityLabel(origin: "http://127.0.0.1:8080", count: 3, collapsed: true)
                 == "http://127.0.0.1:8080, 3 endpoints, collapsed")
@@ -1657,5 +1664,452 @@ extension ScanSurfaceTests {
         started.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
         started.seedSitemapJobIfNeeded()
         #expect(started.sitemapJob == "scan-1a2b3c4d")
+    }
+}
+
+// MARK: - Tester — stage 6 fix round edges
+
+/// Tester — the edges of the panel round 1 fixes (Review log S4, S5, S6, P1, P4,
+/// Q1, Q9). Each test pins a literal the fix decides; with that fix reverted the
+/// test fails (a `profile_name` key, an accepted `../x`, a stranger's `seq`
+/// kept, a launch error wiped by a list read, a re-seeded Site map job, a PoC
+/// matched by prefix).
+extension ScanSurfaceTests {
+    /// S5: the name rule at its boundaries — the 64th scalar is the last allowed,
+    /// a leading `.` / `-` is refused but a trailing one is not, and nothing
+    /// outside ASCII (accented or full-width letters, combining marks, zero-width
+    /// or NUL scalars) passes however many scalars it has.
+    @Test func profileNameRuleAtItsBoundaries() {
+        let sixtyThree = String(repeating: "a", count: 63)
+        #expect(ScanSurface.isValidProfileName(sixtyThree + "Z"))
+        #expect(ScanSurface.isValidProfileName(sixtyThree + "."))
+        #expect(ScanSurface.isValidProfileName(sixtyThree + "-"))
+        #expect(ScanSurface.isValidProfileName(sixtyThree + "_"))
+        #expect(!ScanSurface.isValidProfileName(sixtyThree + "ab"), "65 scalars")
+        #expect(!ScanSurface.isValidProfileName(sixtyThree + "é"), "64 scalars, one outside ASCII")
+        #expect(!ScanSurface.isValidProfileName(sixtyThree + " "))
+
+        // A trailing `.` or `-` is allowed; a leading one is not, nor is a dot-only name.
+        #expect(ScanSurface.isValidProfileName("api."))
+        #expect(ScanSurface.isValidProfileName("api.."))
+        #expect(ScanSurface.isValidProfileName("api-"))
+        #expect(ScanSurface.isValidProfileName("_api"))
+        #expect(ScanSurface.isValidProfileName("0"))
+        #expect(ScanSurface.isValidProfileName("9-lives"))
+        #expect(ScanSurface.isValidProfileName("a..b"), "two dots inside a name are not a path segment")
+        #expect(!ScanSurface.isValidProfileName("."))
+        #expect(!ScanSurface.isValidProfileName(".."))
+        #expect(!ScanSurface.isValidProfileName("..."))
+        #expect(!ScanSurface.isValidProfileName("-"))
+        #expect(!ScanSurface.isValidProfileName("--help"))
+        #expect(!ScanSurface.isValidProfileName("./api"))
+        #expect(!ScanSurface.isValidProfileName("..\\api"))
+
+        // Letters outside ASCII, in any form.
+        #expect(!ScanSurface.isValidProfileName("Ünïcode"))
+        #expect(!ScanSurface.isValidProfileName("naïve"))
+        #expect(!ScanSurface.isValidProfileName("e\u{301}"), "a combining acute on a plain e")
+        #expect(!ScanSurface.isValidProfileName("\u{FF41}pi"), "a full-width a")
+        #expect(!ScanSurface.isValidProfileName("a\u{200B}pi"), "a zero-width space")
+        #expect(!ScanSurface.isValidProfileName("api\u{0}"))
+        #expect(!ScanSurface.isValidProfileName("\u{0}"))
+        #expect(!ScanSurface.isValidProfileName("api🔒"))
+        #expect(!ScanSurface.isValidProfileName("ａｐｉ"))
+        #expect(!ScanSurface.isValidProfileName("ᴀpi"), "a small-capital a")
+        #expect(!ScanSurface.isValidProfileName("ap\u{2024}"), "a one-dot leader is not a `.`")
+        #expect(!ScanSurface.isValidProfileName("ap\u{2010}i"), "a Unicode hyphen is not a `-`")
+
+        // Whitespace anywhere: the view trims, the Kit never does.
+        #expect(!ScanSurface.isValidProfileName(" api"))
+        #expect(!ScanSurface.isValidProfileName("api "))
+        #expect(!ScanSurface.isValidProfileName("\u{A0}api"), "a no-break space")
+        #expect(!ScanSurface.isValidProfileName("api\r"))
+        #expect(!ScanSurface.isValidProfileName("\n"))
+
+        // Separators and shell / URL punctuation.
+        let punctuated = [
+            "a/b", "/api", "api/", "a\\b", "a:b", "a;b", "a|b", "a&b", "a$b", "a*b", "a?b", "a#b", "a%b", "a@b",
+            "a=b", "a+b", "a,b", "a'b", "a\"b", "a`b", "a~b", "a!b", "a(b)", "a[b]", "a{b}", "a<b>", "a^b",
+        ]
+        for bad in punctuated {
+            #expect(!ScanSurface.isValidProfileName(bad), "\(bad)")
+        }
+        // The names the core ships all pass.
+        for good in ["passive-only", "map-only", "light-http", "standard", "thorough", "l4-stream-safe", "l4-full"] {
+            #expect(ScanSurface.isValidProfileName(good), "\(good)")
+        }
+    }
+
+    /// Q1: a ref matches a whole file name, never a prefix, a suffix or a
+    /// substring of one; a directory in the ref must land on a `/` boundary; the
+    /// first listed match wins; a ref of whitespace matches nothing.
+    @Test func pocRefMatchesWholeFileNamesOnly() throws {
+        let paths = [
+            "/x/pocs/poc-3b1c-extra.poc.yaml", "/x/pocs/poc-3b1c2.poc.yaml", "/x/pocs/poc-3b1c.poc.yaml",
+            "/x/pocs/poc-3b1c.poc.yaml.bak",
+        ]
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: paths) == 2, "a ref that is a prefix of two other names picks its own")
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c.poc.yaml", in: paths) == 2)
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c2", in: paths) == 1)
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c-extra", in: paths) == 0)
+        #expect(ScanFindingLink.match(pocRef: "3b1c.poc.yaml", in: paths) == nil, "a suffix of a file name is not a match")
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c.poc", in: paths) == nil, "a prefix of a file name is not a match")
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c.poc.yaml.bak", in: paths) == 3)
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: ["/x/pocs/poc-3b1c.yaml"]) == nil, "another extension")
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: ["/x/pocs/POC-3B1C.poc.yaml"]) == nil, "case matters")
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: ["/x/pocs/poc-3b1c/"]) == nil, "a directory named like the ref")
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c/", in: paths) == nil)
+
+        // A directory in the ref must sit on a `/` boundary and names the file exactly.
+        #expect(ScanFindingLink.match(pocRef: "pocs/poc-3b1c", in: ["/x/mypocs/poc-3b1c", "/x/pocs/poc-3b1c"]) == 1)
+        #expect(ScanFindingLink.match(pocRef: "pocs/poc-3b1c", in: ["/x/pocs/poc-3b1c.poc.yaml"]) == nil,
+                "a directory ref does not take the extension")
+        #expect(ScanFindingLink.match(pocRef: "x/pocs/poc-3b1c.poc.yaml", in: paths) == 2)
+
+        // The first listed match wins when two directories hold the same file name.
+        #expect(ScanFindingLink.match(pocRef: "p", in: ["/a/p.poc.yaml", "/b/p.poc.yaml"]) == 0)
+        #expect(ScanFindingLink.match(pocRef: "p", in: ["/a/q.poc.yaml", "/b/p.poc.yaml", "/c/p"]) == 1)
+
+        // Whitespace is not empty, and matches nothing; an empty path entry matches nothing.
+        #expect(ScanFindingLink.match(pocRef: " ", in: paths) == nil)
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: ["", "poc-3b1c.poc.yaml"]) == 1)
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: [""]) == nil)
+
+        // The pack's own issues resolve against a findings list: the one with a PoC, the one without.
+        let issues = try ScanIssuesResult(json: Self.load("scan.issues.json")).issues
+        #expect(issues[0].pocRef == "poc-3b1c")
+        #expect(ScanFindingLink.match(pocRef: issues[0].pocRef, in: ["/x/other.poc.yaml", "/x/poc-3b1c.poc.yaml"]) == 1)
+        #expect(issues[1].pocRef == nil)
+        #expect(ScanFindingLink.match(pocRef: issues[1].pocRef, in: ["/x/poc-3b1c.poc.yaml"]) == nil, "an issue without a PoC")
+    }
+
+    /// S6: after a prune, a line for the pruned stranger is again a list request
+    /// only; a kept job's `seq` survives the prune so its replays stay ignored; a
+    /// job this app started and the list omits keeps its status, notices and `seq`;
+    /// a stranger's issue or terminal line raises no issues flag; an empty model
+    /// treats every line as a list request and keeps nothing.
+    @Test func prunedJobsForgetTheirSeqAndLocalJobsKeepTheirs() throws {
+        var model = try Self.listed()
+        model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
+        let strangerStatus = try ScanJobStatus(json: ScanPack.edited(Self.load("scan.status.json"), path: ["job"], to: "scan-elsewhere"))
+        model.applyStatus(strangerStatus)
+        let progress = try Self.load("job.progress.json")
+        let strangerLine = ScanPack.edited(
+            ScanPack.edited(progress, path: ["job"], to: "scan-elsewhere"), path: ["status", "job"], to: "scan-elsewhere")
+        let acceptedStranger = model.noteJobEvent(strangerLine)
+        #expect(acceptedStranger, "a stranger with a status read is known")
+        #expect(model.lastSeq["scan-elsewhere"] == 3)
+        let acceptedKnown = model.noteJobEvent(progress)
+        #expect(acceptedKnown)
+        model.clearRefreshFlags()
+
+        // The list omits the stranger: its tables go, the listed job's stay.
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        #expect(model.statuses["scan-elsewhere"] == nil)
+        #expect(model.lastSeq["scan-elsewhere"] == nil)
+        #expect(model.statuses["scan-1a2b3c4d"]?.probes.sent == 418)
+        #expect(model.lastSeq["scan-1a2b3c4d"] == 3)
+
+        // The stranger's next line, a higher seq even, is a list request only: no seq, no flag.
+        let laterStranger = ScanPack.edited(strangerLine, path: ["seq"], to: 9)
+        let acceptedLater = model.noteJobEvent(laterStranger)
+        #expect(acceptedLater)
+        #expect(model.listRefreshNeeded)
+        #expect(model.refreshNeeded.isEmpty)
+        #expect(model.lastSeq["scan-elsewhere"] == nil)
+        #expect(Set(model.lastSeq.keys) == ["scan-1a2b3c4d"])
+        model.clearRefreshFlags()
+
+        // The kept job's seq survived the prune: a replay of seq 3 is still ignored; seq 4 lands.
+        let replay = model.noteJobEvent(progress)
+        #expect(!replay)
+        #expect(model.refreshNeeded.isEmpty)
+        let next = model.noteJobEvent(ScanPack.edited(progress, path: ["seq"], to: 4))
+        #expect(next)
+        #expect(model.lastSeq["scan-1a2b3c4d"] == 4)
+        model.clearRefreshFlags()
+
+        // A job this app started that the list omits: status, notices and seq all stay.
+        var start = try Self.load("scan.start.json")
+        start = ScanPack.edited(start, path: ["job"], to: "scan-local")
+        start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
+        model.applyStart(try ScanStartResult(json: start))
+        let localLine = ScanPack.edited(
+            ScanPack.edited(progress, path: ["job"], to: "scan-local"), path: ["status", "job"], to: "scan-local")
+        let acceptedLocal = model.noteJobEvent(localLine)
+        #expect(acceptedLocal)
+        #expect(model.lastSeq["scan-local"] == 3)
+        model.clearRefreshFlags()
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
+        #expect(model.statuses["scan-local"]?.state == .queued)
+        #expect(model.launchNotices["scan-local"]
+                == ["Clamped budget.probes 50000 → 20000", "Skipped ws: lane not available on this build"])
+        #expect(model.lastSeq["scan-local"] == 3)
+        let localReplay = model.noteJobEvent(localLine)
+        #expect(!localReplay, "its seq survived the prune")
+        #expect(model.refreshNeeded.isEmpty)
+        #expect(!model.listRefreshNeeded)
+
+        // The same list twice changes nothing.
+        var twice = model
+        twice.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        #expect(twice == model)
+
+        // A stranger's issue or terminal line is a list request only: the issues flag is not raised for it.
+        var fresh = try Self.listed()
+        let strangerIssue = ScanPack.edited(try Self.load("job.issue.json"), path: ["job"], to: "scan-elsewhere")
+        let acceptedIssue = fresh.noteJobEvent(strangerIssue)
+        #expect(acceptedIssue)
+        #expect(fresh.listRefreshNeeded)
+        #expect(!fresh.issuesRefreshNeeded)
+        #expect(fresh.lastSeq.isEmpty)
+        #expect(fresh.refreshNeeded.isEmpty)
+        let strangerDone = ScanPack.edited(try Self.load("job.finished.json"), path: ["job"], to: "scan-elsewhere")
+        let acceptedDone = fresh.noteJobEvent(strangerDone)
+        #expect(acceptedDone)
+        #expect(!fresh.issuesRefreshNeeded)
+        #expect(fresh.issues.isEmpty)
+
+        // An empty model knows no job: every line is a list request, the tables stay empty.
+        var empty = ScanSurfaceModel()
+        let files = [
+            "job.started.json", "job.phase.json", "job.progress.json", "job.issue.json", "job.finished.json",
+            "job.cancelled.json", "job.failed.json",
+        ]
+        for file in files {
+            let accepted = empty.noteJobEvent(try Self.load(file))
+            #expect(accepted, "\(file)")
+        }
+        #expect(empty.lastSeq.isEmpty)
+        #expect(empty.refreshNeeded.isEmpty)
+        #expect(empty.statuses.isEmpty)
+        #expect(empty.jobs.isEmpty)
+        #expect(empty.listRefreshNeeded)
+        #expect(!empty.issuesRefreshNeeded)
+    }
+
+    /// P1: the kept launch error survives every read that is not a launch step
+    /// (lists, statuses, issues, profiles, checks, site map, selections, pushes,
+    /// tab changes, an edit) and goes only with a start, a confirm request or a
+    /// profile pick — the same profile or none included.
+    @Test func aLaunchErrorSurvivesEveryNonLaunchRead() throws {
+        var model = try Self.listed()
+        model.select(profile: "standard")
+        let error = ScanLaunchError(busMessage: "scan: lane_unavailable: ws not built", origins: [])
+        model.applyLaunchError(error)
+        #expect(model.launchError == error)
+
+        model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
+        model.applyIssue(try ScanIssue(json: Self.load("scan.issue.json")))
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
+        model.applyProfiles(try ScanProfileListResult(json: Self.load("scan.profile.list.json")))
+        model.applyProfile(try Self.standardProfile())
+        model.applyChecks(try ScanChecksResult(json: Self.load("scan.checks.json")))
+        model.applySitemap(try ScanSitemapResult(json: Self.load("scan.sitemap.json")), append: false)
+        model.select(job: "scan-1a2b3c4d")
+        model.select(issue: "issue-9f8e7d6c")
+        model.select(node: "node-1")
+        let pushed = model.noteJobEvent(try Self.load("job.progress.json"))
+        #expect(pushed)
+        model.clearRefreshFlags()
+        model.tab = .issues
+        model.moveSelection(in: .jobs, by: 1)
+        model.editedProfile?.budget.probes = 10
+        model.seedSitemapJobIfNeeded()
+        #expect(model.launchError == error)
+        #expect(model.launchError?.code == "lane_unavailable")
+        #expect(model.statusLine == "ws not built")
+
+        // Re-picking the same profile clears it; so does picking none.
+        model.select(profile: "standard")
+        #expect(model.launchError == nil)
+        #expect(model.statusLine == nil)
+        model.applyLaunchError(error)
+        #expect(model.launchError == error)
+        model.select(profile: nil)
+        #expect(model.launchError == nil)
+        #expect(model.statusLine == nil)
+
+        // A confirm request clears it; an error while the sheet is up closes the sheet and is kept whole.
+        model.applyLaunchError(error)
+        let request = try #require(L4ConfirmRequest(json: [
+            "structuredContent": ["status": "needs_confirmation", "prompt": "Really?", "confirm_token": "t"],
+        ]))
+        model.applyConfirm(tool: "scan.start", args: ["profile": "x"], request: request)
+        #expect(model.launchError == nil)
+        #expect(model.confirm != nil)
+        let busy = ScanLaunchError(busMessage: "scan: busy: already", origins: [])
+        model.applyLaunchError(busy)
+        #expect(model.confirm == nil)
+        #expect(model.launchError == busy)
+        #expect(model.launchError?.message == "already")
+        #expect(model.statusLine == "A scan on this origin is already running")
+        #expect(!model.launchInFlight)
+    }
+
+    /// P4: the seed happens once. An operator's "All jobs" after it survives a new
+    /// job and a new list; a chosen job survives the list changing; "All jobs"
+    /// chosen before the first job is overtaken by the first seed (the model
+    /// cannot tell it from never having chosen), which is the documented rule.
+    @Test func theSitemapSeedNeverOverridesALaterChoice() throws {
+        var model = try Self.listed()
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == "scan-1a2b3c4d")
+
+        // The operator picks All jobs; a new job lands in front; the view seeds again on every list change.
+        model.sitemapJob = nil
+        var start = try Self.load("scan.start.json")
+        start = ScanPack.edited(start, path: ["job"], to: "scan-new")
+        start = ScanPack.edited(start, path: ["status", "job"], to: "scan-new")
+        model.applyStart(try ScanStartResult(json: start))
+        #expect(model.jobs.first?.job == "scan-new")
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == nil, "All jobs stands after the first seed")
+        model.applyList(try ScanListResult(json: ["jobs": []]))
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == nil)
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == nil)
+
+        // A chosen job survives the list dropping and re-adding jobs.
+        model.sitemapJob = "scan-55667788"
+        model.applyList(try ScanListResult(json: ["jobs": []]))
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == "scan-55667788")
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == "scan-55667788")
+
+        // Before the first seed, All jobs is indistinguishable from no choice: the first job seeds.
+        var early = ScanSurfaceModel()
+        early.sitemapJob = nil
+        early.seedSitemapJobIfNeeded()
+        #expect(early.sitemapJob == nil)
+        early.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        early.seedSitemapJobIfNeeded()
+        #expect(early.sitemapJob == "scan-1a2b3c4d")
+
+        // The seed takes the list's first row, whatever its state.
+        var doneFirst = ScanSurfaceModel()
+        let list = try Self.load("scan.list.json")
+        let rows = try #require(list["jobs"]?.arrayValue)
+        let reversed = ScanPack.edited(list, path: ["jobs"], to: .array(Array(rows.reversed())))
+        doneFirst.applyList(try ScanListResult(json: reversed))
+        doneFirst.seedSitemapJobIfNeeded()
+        #expect(doneFirst.sitemapJob == "scan-55667788")
+    }
+
+    /// S4: with no profile the launch has nothing to send and the gate refuses; the
+    /// confirmed retry carries the very `profile` object plus the token, and
+    /// still no `profile_name`.
+    @Test func launchArgumentsCarryTheProfileThroughTheConfirmRetry() throws {
+        var model = ScanSurfaceModel()
+        #expect(model.launchArguments(map: false).args.isEmpty)
+        #expect(model.launchArguments(map: true).args.isEmpty)
+        #expect(model.launchArguments(map: false).tool == "scan.start")
+        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == "Choose a profile.")
+
+        var profile = try Self.standardProfile()
+        profile.target.origins = ["http://api.shop-staging.test"]
+        model.applyProfile(profile)
+        #expect(model.launchRefusal(scopeHosts: Fixtures.scope, tools: Self.toolsWithStart) == nil)
+        let launch = model.launchArguments(map: false)
+        #expect(launch.args.keys.sorted() == ["profile"])
+        let request = try #require(L4ConfirmRequest(json: [
+            "structuredContent": ["status": "needs_confirmation", "prompt": "Really?", "confirm_token": "tok-1"],
+        ]))
+        model.applyConfirm(tool: launch.tool, args: launch.args, request: request)
+        let confirm = try #require(model.confirm)
+        #expect(confirm.tool == "scan.start")
+        #expect(confirm.arguments == launch.args)
+        let confirmed = confirm.confirmedArguments
+        #expect(confirmed.keys.sorted() == ["_confirm", "profile"])
+        #expect(confirmed["profile"] == profile.json())
+        #expect(confirmed["_confirm"] == "tok-1")
+        #expect(confirmed["profile_name"] == nil)
+        // The profile sent is the object the gate checked: the edited origins, not the core's copy.
+        #expect(confirmed["profile"]?["target"]?["origins"] == JSONValue.array(["http://api.shop-staging.test"]))
+        #expect(confirmed["profile"]?["name"] == "standard")
+
+        // A map launch of the same profile sends the same object to `scan.map`.
+        let map = model.launchArguments(map: true)
+        #expect(map.tool == "scan.map")
+        #expect(map.args == launch.args)
+    }
+
+    /// Q9 / Q10: a custom profile the operator saved with every lane unticked
+    /// (the editor allows it; only the launch gate refuses it) lists with no lane
+    /// word. Its row line and its VoiceOver label must not open on a separator.
+    /// Tester finding T-F1: `profileRowLine2` joins an empty lane list as `""`,
+    /// so the line reads ` · medium · normal` and the label `no-lanes,  · medium · normal`.
+    @Test func aProfileWithNoLanesReadsCleanly() throws {
+        let entry = try ScanProfileListEntry(json: [
+            "name": "no-lanes", "builtin": false,
+            "summary": ["lanes": [], "intensity": "medium", "speed": "normal"],
+        ])
+        #expect(entry.lanes.isEmpty)
+        let line = ScanFormat.profileRowLine2(entry)
+        #expect(!line.hasPrefix(" · "), "row line 2 opens on a separator: \(line.debugDescription)")
+        #expect(line == "no lanes · medium · normal")
+        let label = ScanFormat.profileAccessibilityLabel(entry)
+        #expect(!label.contains(",  · "), "VoiceOver label carries an empty lane slot: \(label.debugDescription)")
+        #expect(label == "no-lanes, no lanes · medium · normal")
+    }
+}
+
+// MARK: - Stage 6 fix round 2
+
+extension ScanSurfaceTests {
+    /// QR2-1: the footer has one status line. A line the app writes (`Saved x`, the
+    /// delete line, a refusal) replaces a kept launch error rather than hiding
+    /// behind it; a profile pick clears both; `nil` takes both down.
+    @Test func aStatusLineReplacesTheLaunchError() throws {
+        var model = try Self.listed()
+        model.select(profile: "standard")
+        let error = ScanLaunchError(busMessage: "scan: lane_unavailable: ws not built", origins: [])
+        model.applyLaunchError(error)
+        #expect(model.launchError == error)
+        #expect(model.statusLine == "ws not built")
+
+        model.setStatusLine("Saved x")
+        #expect(model.launchError == nil, "a new status line retires the launch error")
+        #expect(model.statusLine == "Saved x")
+
+        model.applyLaunchError(error)
+        #expect(model.statusLine == "ws not built")
+        model.select(profile: "thorough")
+        #expect(model.launchError == nil)
+        #expect(model.statusLine == nil)
+
+        model.applyLaunchError(error)
+        model.setStatusLine(nil)
+        #expect(model.launchError == nil)
+        #expect(model.statusLine == nil)
+
+        // The error after a line: the error is the line again, whole.
+        model.setStatusLine(scanNothingToDeleteText(name: "my-api"))
+        model.applyLaunchError(error)
+        #expect(model.launchError?.code == "lane_unavailable")
+        #expect(model.statusLine == "ws not built")
+    }
+
+    /// SR2: a duplicate's name collides with a listed one case-insensitively, so a
+    /// case-folding store cannot be made to overwrite a builtin or a saved profile.
+    @Test func profileNameCollisionIsCaseInsensitive() throws {
+        #expect(ScanSurface.profileNameCollides("My-API", with: ["my-api"]))
+        #expect(ScanSurface.profileNameCollides("my-api", with: ["My-API"]))
+        #expect(ScanSurface.profileNameCollides("STANDARD", with: ["passive-only", "standard"]))
+        #expect(ScanSurface.profileNameCollides("standard", with: ["standard"]))
+        #expect(!ScanSurface.profileNameCollides("my-api", with: ["standard", "thorough"]))
+        #expect(!ScanSurface.profileNameCollides("my-api2", with: ["my-api"]), "a longer name is not the same name")
+        #expect(!ScanSurface.profileNameCollides("my-ap", with: ["my-api"]), "nor a shorter one")
+        #expect(!ScanSurface.profileNameCollides("my-api", with: []))
+        #expect(!ScanSurface.profileNameCollides("", with: ["my-api"]))
+        let listed = try ScanProfileListResult(json: Self.load("scan.profile.list.json")).profiles.map(\.name)
+        #expect(ScanSurface.profileNameCollides("Standard", with: listed))
+        #expect(!ScanSurface.profileNameCollides("standard-2", with: listed))
     }
 }

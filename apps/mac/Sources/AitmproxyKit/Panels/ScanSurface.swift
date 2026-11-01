@@ -34,9 +34,8 @@ public let scanNoJobsText = "No jobs yet — pick a profile and Start Scan."
 /// Jobs: no row selected.
 public let scanSelectJobText = "Select a job."
 
-/// Site map: no job has crawled yet.
-public let scanNoSitemapTitle = "No site map yet"
-public let scanNoSitemapText = "A running job fills this as it crawls."
+/// Site map: no job has crawled yet (D11, one sentence, the empty state's title).
+public let scanNoSitemapText = "No site map yet — a running job fills this as it crawls."
 
 /// Site map: the filter leaves no endpoint.
 public let scanNoEndpointsMatchText = "No endpoints match."
@@ -64,6 +63,9 @@ public func scanNothingToDeleteText(name: String) -> String { "Nothing to delete
 
 /// `Unable to save profile: <reason>`: a bus error behind one of the page's actions.
 public func scanUnableText(_ what: String, _ reason: String) -> String { "Unable to \(what): \(reason)" }
+
+/// The Duplicate… popover's hint under a name `ScanSurface.isValidProfileName` refuses.
+public let scanProfileNameRuleText = "Use letters, digits, - _ . (not leading)"
 
 // MARK: - Offering
 
@@ -101,6 +103,13 @@ public enum ScanSurface {
             default: false
             }
         }
+    }
+
+    /// Whether `name` is already one of `names`, compared case-insensitively: the
+    /// core's store may fold case, so `My-API` must not be offered as a new name
+    /// beside a saved `my-api` (nor beside a builtin).
+    public static func profileNameCollides(_ name: String, with names: [String]) -> Bool {
+        names.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
     }
 
     public static func mode(for tools: [ToolDescriptor]) -> Mode {
@@ -660,6 +669,13 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         launchInFlight = false
     }
 
+    /// The footer has one line. A line the app writes (`Saved <name>`, the delete
+    /// line, a refusal) replaces a kept launch error; `nil` takes both down.
+    public mutating func setStatusLine(_ line: String?) {
+        statusLine = line
+        launchError = nil
+    }
+
     // MARK: Mutations: issues and site map
 
     /// A `scan.issues` page; `append` for Load More (rows already listed are not repeated).
@@ -744,9 +760,12 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     public mutating func select(node: String?) { selectedNode = node }
 
+    /// Picking a profile (the same one or none included) starts afresh: the launch
+    /// error and the status line go together.
     public mutating func select(profile: String?) {
         selectedProfile = profile
         launchError = nil
+        statusLine = nil
     }
 
     /// The Site map tab's first opening picks the newest job once `jobs` has one;
@@ -799,8 +818,9 @@ public enum ScanFormat {
         let hours = total / 3600
         let minutes = (total % 3600) / 60
         let seconds = total % 60
-        if hours > 0 { return String(format: "%d:%02d:%02d", hours, minutes, seconds) }
-        return String(format: "%d:%02d", minutes, seconds)
+        // `%ld`: every component is a 64-bit `Int`; `%d` would read the hour count as 32 bits.
+        if hours > 0 { return String(format: "%ld:%02ld:%02ld", hours, minutes, seconds) }
+        return String(format: "%ld:%02ld", minutes, seconds)
     }
 
     /// `42 s ago` / `2 min ago` / `3 h ago`, from two epoch-millisecond stamps.
@@ -861,7 +881,7 @@ public enum ScanFormat {
     }
 
     /// The status's profile name; nil when there is no status or it carries none (`""`).
-    static func profileName(_ status: ScanJobStatus?) -> String? {
+    private static func profileName(_ status: ScanJobStatus?) -> String? {
         guard let name = status?.profileName, !name.isEmpty else { return nil }
         return name
     }
@@ -899,10 +919,10 @@ public enum ScanFormat {
         return "\(plural(total, "issue")): \(parts.joined(separator: ", "))"
     }
 
-    /// `http, ws · medium · normal`.
+    /// `http, ws · medium · normal`; `no lanes · medium · normal` for a saved profile with every lane unticked.
     public static func profileRowLine2(_ entry: ScanProfileListEntry) -> String {
-        [entry.lanes.map(\.rawValue).joined(separator: ", "), entry.intensity.rawValue, entry.speed.rawValue]
-            .joined(separator: " · ")
+        let lanes = entry.lanes.isEmpty ? "no lanes" : entry.lanes.map(\.rawValue).joined(separator: ", ")
+        return [lanes, entry.intensity.rawValue, entry.speed.rawValue].joined(separator: " · ")
     }
 
     /// `standard, builtin, http, ws · medium · normal` (D13); `builtin` only when it is one.
@@ -913,13 +933,19 @@ public enum ScanFormat {
         return parts.joined(separator: ", ")
     }
 
-    /// `Error-based SQL injection, sqli-error, medium, Default` (D13), plus
-    /// `above this profile's intensity` when the profile will not run it.
+    /// The check row's visible words (D13): `Error-based SQL injection, sqli-error,
+    /// medium, light, bundled`, plus `above this profile's intensity` when the profile
+    /// will not run it. The choice menu beside the row reads its own word.
     public static func checkAccessibilityLabel(_ leaf: ScanCheckTree.Leaf) -> String {
-        var parts = [leaf.meta.name, leaf.meta.klass, leaf.meta.intensity.rawValue, leaf.choice.word]
+        var parts = [
+            leaf.meta.name, leaf.meta.klass, leaf.meta.intensity.rawValue, leaf.meta.cost, leaf.meta.origin.word,
+        ]
         if leaf.aboveIntensity { parts.append("above this profile's intensity") }
         return parts.joined(separator: ", ")
     }
+
+    /// `Finding f-3b1c`: the Issues detail's `finding_id`, as text (D6).
+    public static func findingText(_ id: String) -> String { "Finding \(id)" }
 
     /// `http://127.0.0.1:8080, 3 endpoints, collapsed` (D13): a Site map origin row.
     public static func originAccessibilityLabel(origin: String, count: Int, collapsed: Bool) -> String {

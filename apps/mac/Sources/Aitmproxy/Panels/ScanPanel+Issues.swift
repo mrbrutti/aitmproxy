@@ -483,7 +483,7 @@ struct ScanIssueDetail: View {
                     .help("Open the PoC in Findings")
             }
             if let findingId = issue.findingId {
-                Text("Finding \(findingId)")
+                Text(ScanFormat.findingText(findingId))
                     .font(Tok.Face.data(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.secondary.color)
                     .lineLimit(1)
@@ -496,7 +496,7 @@ struct ScanIssueDetail: View {
     private var noteField: some View {
         HStack(spacing: Space.sm) {
             TextField("Add a note", text: $note)
-                .scanFieldChrome()
+                .scanFieldChrome(face: Tok.Face.ui(Tok.Typography.Size.md))
                 .onSubmit { Task { await state.saveNote(issue.id, note: note) } }
                 .accessibilityLabel("Note")
             FlatButton("Save Note") { Task { await state.saveNote(issue.id, note: note) } }

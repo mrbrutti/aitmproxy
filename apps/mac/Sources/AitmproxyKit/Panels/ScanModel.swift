@@ -1343,7 +1343,9 @@ extension ScanIssueSummary {
 /// `Issue`: the full finding `scan.issue` and `scan.issue.update` return (spec D6).
 /// The list's fields live in `summary`, parsed once; the evidence and prose are
 /// what the detail adds. Every summary field is also reachable directly
-/// (`issue.severity`), so a view reads a detail and a row the same way.
+/// (`issue.severity`, `issue.occurrences = 2`) through dynamic member lookup, so
+/// a view reads a detail and a row the same way.
+@dynamicMemberLookup
 public struct ScanIssue: Hashable, Sendable {
     /// The list's view of this issue: every field `scan.issues` carries.
     public var summary: ScanIssueSummary
@@ -1363,72 +1365,10 @@ public struct ScanIssue: Hashable, Sendable {
         self.note = note
     }
 
-    // The summary's fields, forwarded.
-    public var id: String {
-        get { summary.id }
-        set { summary.id = newValue }
-    }
-    public var job: String {
-        get { summary.job }
-        set { summary.job = newValue }
-    }
-    public var checkId: String {
-        get { summary.checkId }
-        set { summary.checkId = newValue }
-    }
-    /// The weakness class (`reflected-xss`, `sqli-error`, ...); `class` on the wire.
-    public var klass: String {
-        get { summary.klass }
-        set { summary.klass = newValue }
-    }
-    public var name: String {
-        get { summary.name }
-        set { summary.name = newValue }
-    }
-    public var severity: ScanSeverity {
-        get { summary.severity }
-        set { summary.severity = newValue }
-    }
-    public var confidence: ScanConfidence {
-        get { summary.confidence }
-        set { summary.confidence = newValue }
-    }
-    public var status: ScanIssueStatus {
-        get { summary.status }
-        set { summary.status = newValue }
-    }
-    public var lane: ScanLane {
-        get { summary.lane }
-        set { summary.lane = newValue }
-    }
-    public var target: ScanTarget {
-        get { summary.target }
-        set { summary.target = newValue }
-    }
-    public var location: ScanIssueLocation {
-        get { summary.location }
-        set { summary.location = newValue }
-    }
-    /// Epoch milliseconds.
-    public var firstSeen: Int {
-        get { summary.firstSeen }
-        set { summary.firstSeen = newValue }
-    }
-    public var lastSeen: Int {
-        get { summary.lastSeen }
-        set { summary.lastSeen = newValue }
-    }
-    public var occurrences: Int {
-        get { summary.occurrences }
-        set { summary.occurrences = newValue }
-    }
-    public var pocRef: String? {
-        get { summary.pocRef }
-        set { summary.pocRef = newValue }
-    }
-    public var findingId: String? {
-        get { summary.findingId }
-        set { summary.findingId = newValue }
+    /// The summary's fields, read and written in place (`issue.id`, `issue.status = .confirmed`).
+    public subscript<T>(dynamicMember keyPath: WritableKeyPath<ScanIssueSummary, T>) -> T {
+        get { summary[keyPath: keyPath] }
+        set { summary[keyPath: keyPath] = newValue }
     }
 }
 

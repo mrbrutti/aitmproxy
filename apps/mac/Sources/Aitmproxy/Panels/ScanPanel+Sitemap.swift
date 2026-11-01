@@ -149,10 +149,9 @@ struct ScanSitemapTab: View {
     // MARK: Empty
 
     private var empty: some View {
+        // The D11 sentence is the title; there is no second line.
         ContentUnavailableView {
-            Label(scanNoSitemapTitle, systemImage: Tok.Glyph.search)
-        } description: {
-            Text(scanNoSitemapText)
+            Label(scanNoSitemapText, systemImage: Tok.Glyph.search)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
