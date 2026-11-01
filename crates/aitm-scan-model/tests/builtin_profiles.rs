@@ -194,6 +194,9 @@ fn a_mistyped_key_inside_a_block_is_rejected() {
         ),
         ("name: t\nl4:\n  case: 5\n", "case"),
         ("name: t\nhttp:\n  versions: h2\n", "versions"),
+        // Panel Q1: a typo inside an L4 seed names the key too, rather than
+        // the opaque "did not match any variant of untagged enum".
+        ("name: t\nl4:\n  seeds:\n    - hxe: \"0001\"\n", "hxe"),
     ] {
         let err = serde_yaml::from_str::<ScanProfile>(yaml)
             .expect_err("a mistyped nested key is an error");
@@ -202,6 +205,16 @@ fn a_mistyped_key_inside_a_block_is_rejected() {
             "error should name {key}: {err}"
         );
     }
+
+    // Panel Q1: a seed written with two forms is ambiguous and says so.
+    let err = serde_yaml::from_str::<ScanProfile>(
+        "name: t\nl4:\n  seeds:\n    - hex: \"0001\"\n      base64: \"AAE=\"\n",
+    )
+    .expect_err("a two-form seed is an error");
+    assert!(
+        err.to_string().contains("exactly one"),
+        "error should say exactly one form is allowed: {err}"
+    );
 }
 
 /// Tester: malformed operator input never panics and never yields a profile.

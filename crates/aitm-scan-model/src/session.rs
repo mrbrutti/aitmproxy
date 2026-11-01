@@ -51,6 +51,7 @@ pub enum Canary {
 /// A session, on the wire as **names only** (spec D7). Cookies and headers are the
 /// names observed on the source flow; their values never leave the worker's memory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct SessionProfile {
     /// The origin (`scheme://host[:port]`) the session authenticates to.
     pub origin: String,

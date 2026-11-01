@@ -22,28 +22,13 @@ pub mod session;
 pub mod traits;
 pub mod vocab;
 
-pub use ids::*;
-pub use vocab::*;
-
-// Tasks 4 to 8 of the T1a plan each own exactly one of the modules below and fill
-// it in; until then the module is a doc line only, and a glob re-export of an empty
-// module is an `unused_imports` warning (an error under the workspace's `-D
-// warnings` gate). The glob list is the crate's final public surface, so the
-// warning is silenced here rather than `lib.rs` being edited once per landing
-// module. Each attribute becomes a no-op the moment its module exports anything.
-#[allow(unused_imports)]
 pub use check::*;
-#[allow(unused_imports)]
+pub use ids::*;
 pub use issue::*;
-#[allow(unused_imports)]
 pub use job::*;
-#[allow(unused_imports)]
 pub use point::*;
-#[allow(unused_imports)]
 pub use profile::*;
-#[allow(unused_imports)]
 pub use results::*;
-#[allow(unused_imports)]
 pub use session::*;
-#[allow(unused_imports)]
 pub use traits::*;
+pub use vocab::*;

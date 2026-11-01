@@ -18,9 +18,11 @@ pub enum LaneKind {
     Http,
     /// WebSocket handshakes and frames.
     Ws,
-    /// Datagram-oriented layer 4 (UDP).
+    /// Crafted IP/TCP/UDP/ICMP packets over `PacketSpec` + `l4.send_recv` (any
+    /// transport; needs pcap privilege).
     L4Packet,
-    /// Stream-oriented layer 4 (TCP).
+    /// Unprivileged TCP and UDP socket client; corpus = captured L4 flows;
+    /// mutation + grammar generation.
     L4Stream,
 }
 

@@ -365,9 +365,12 @@ impl Default for L4Options {
 /// One seed message for L4 mutation, written the way the operator has it: a
 /// captured flow, a hex string, or base64.
 ///
-/// Untagged, so the YAML is `- hex: "0001"` rather than a variant wrapper.
+/// Untagged, so the YAML is `- hex: "0001"` rather than a variant wrapper. It is
+/// read through [`L4SeedRaw`] so a mistyped key is reported by name and a seed
+/// with no form or two forms gets a plain "exactly one of" message, instead of
+/// serde's opaque "did not match any variant of untagged enum".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged, deny_unknown_fields, rename_all = "snake_case")]
+#[serde(untagged, try_from = "L4SeedRaw")]
 pub enum L4Seed {
     /// Take the seed bytes from a captured flow.
     Flow {
@@ -384,6 +387,51 @@ pub enum L4Seed {
         /// Base64, decoded by the lane.
         base64: String,
     },
+}
+
+/// The wire shape an [`L4Seed`] is read from: the three forms as optional keys,
+/// unknown keys rejected by name. [`TryFrom`] then insists on exactly one form.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct L4SeedRaw {
+    #[serde(default)]
+    flow: Option<FlowRef>,
+    #[serde(default)]
+    hex: Option<String>,
+    #[serde(default)]
+    base64: Option<String>,
+}
+
+impl TryFrom<L4SeedRaw> for L4Seed {
+    type Error = String;
+
+    fn try_from(raw: L4SeedRaw) -> Result<Self, Self::Error> {
+        let present: Vec<&str> = [
+            raw.flow.is_some().then_some("flow"),
+            raw.hex.is_some().then_some("hex"),
+            raw.base64.is_some().then_some("base64"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match (raw.flow, raw.hex, raw.base64) {
+            (Some(flow), None, None) => Ok(L4Seed::Flow { flow }),
+            (None, Some(hex), None) => Ok(L4Seed::Hex { hex }),
+            (None, None, Some(base64)) => Ok(L4Seed::Base64 { base64 }),
+            _ if present.is_empty() => Err(
+                "an L4 seed needs exactly one of `flow`, `hex` or `base64`; none was given"
+                    .to_string(),
+            ),
+            _ => Err(format!(
+                "an L4 seed needs exactly one of `flow`, `hex` or `base64`; got {}",
+                present
+                    .iter()
+                    .map(|k| format!("`{k}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )),
+        }
+    }
 }
 
 impl From<HttpVersionPolicy> for aitm_core::VersionPolicy {
@@ -538,6 +586,28 @@ mod tests {
             format!(r#"{{"flow":"{UUID}"}}"#),
             "an untagged seed carries no variant wrapper"
         );
+    }
+
+    /// Panel Q1 — a seed must carry exactly one of `flow`, `hex`, `base64`:
+    /// none is an error that says so, two is an error that names both, and a
+    /// mistyped key is an error that names the key.
+    #[test]
+    fn l4_seed_requires_exactly_one_form() {
+        let err = serde_json::from_str::<L4Seed>("{}").expect_err("an empty seed is an error");
+        assert!(err.to_string().contains("exactly one"), "zero keys: {err}");
+
+        let err = serde_json::from_str::<L4Seed>(r#"{"hex":"00","base64":"AA=="}"#)
+            .expect_err("two forms are an error");
+        let shown = err.to_string();
+        assert!(shown.contains("exactly one"), "two keys: {shown}");
+        assert!(
+            shown.contains("hex") && shown.contains("base64"),
+            "names both keys: {shown}"
+        );
+
+        let err = serde_json::from_str::<L4Seed>(r#"{"hxe":"00"}"#)
+            .expect_err("a mistyped key is an error");
+        assert!(err.to_string().contains("hxe"), "names the key: {err}");
     }
 
     #[test]

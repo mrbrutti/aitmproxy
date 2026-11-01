@@ -229,7 +229,7 @@ pub struct SkippedLane {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct Clamped {
-    /// The field that was clamped (e.g. `probes`).
+    /// The field that was clamped, as the dotted profile path, e.g. `budget.probes`.
     pub field: String,
     /// The value that was asked for.
     pub requested: u64,
@@ -360,6 +360,63 @@ mod tests {
             !json.contains("started_by"),
             "summary dropped started_by: {json}"
         );
+    }
+
+    /// Panel Q4 — the summary is structurally the status minus exactly the
+    /// per-phase detail: every surviving key carries the same value, and no
+    /// key is added.
+    #[test]
+    fn summary_is_the_status_minus_the_detail_fields() {
+        let status = JobStatus {
+            job: "scan-1a2b3c4d".into(),
+            state: JobState::Running,
+            phase: Phase::Auditing,
+            elapsed_ms: 4321,
+            profile_name: "standard".into(),
+            probes: ProbeCounters {
+                sent: 42,
+                by_lane: BTreeMap::from([(LaneKind::Http, 42)]),
+                ..ProbeCounters::default()
+            },
+            points: PointCounters {
+                found: 7,
+                ..PointCounters::default()
+            },
+            issues: IssueCounters {
+                total: 2,
+                ..IssueCounters::default()
+            },
+            crawl: CrawlCounters {
+                pages: 9,
+                ..CrawlCounters::default()
+            },
+            ..JobStatus::default()
+        };
+
+        let mut full = serde_json::to_value(&status).expect("status serializes");
+        let object = full.as_object_mut().expect("status is a JSON object");
+        for dropped in [
+            "profile_name",
+            "targets",
+            "started_by",
+            "started_at",
+            "finished_at",
+            "stopped_reason",
+            "crawl",
+            "checks",
+            "l4",
+            "session",
+            "lanes",
+            "clamped",
+            "error",
+        ] {
+            assert!(
+                object.remove(dropped).is_some(),
+                "the status carries `{dropped}`"
+            );
+        }
+        let summary = serde_json::to_value(status.summary()).expect("summary serializes");
+        assert_eq!(full, summary);
     }
 
     #[test]

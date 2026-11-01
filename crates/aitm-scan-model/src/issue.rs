@@ -301,6 +301,24 @@ mod tests {
         );
     }
 
+    /// Panel Q4 — the summary is structurally the issue minus exactly
+    /// `evidence`, `description`, `remediation` and `note`: every other key
+    /// carries the same value, and no key is added.
+    #[test]
+    fn summary_is_the_issue_minus_four_fields() {
+        let issue = sample_issue();
+        let mut full = serde_json::to_value(&issue).expect("issue serializes");
+        let object = full.as_object_mut().expect("issue is a JSON object");
+        for dropped in ["evidence", "description", "remediation", "note"] {
+            assert!(
+                object.remove(dropped).is_some(),
+                "the issue carries `{dropped}`"
+            );
+        }
+        let summary = serde_json::to_value(issue.summary()).expect("summary serializes");
+        assert_eq!(full, summary);
+    }
+
     #[test]
     fn by_severity_bump() {
         let mut tally = BySeverity::default();

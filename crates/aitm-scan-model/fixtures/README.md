@@ -69,6 +69,8 @@ The push method is `notifications/aitm/job` (`JOB_NOTIFICATION_METHOD`) with
 `crates/aitm-scan-model/tests/fixtures.rs` parses every file back into its model
 type, pins its key literals, checks the set of files is exactly this contract
 surface (no stray, no missing), checks the push `seq` values run `1..=7`, and runs
-the secret scan above. These examples are authored by serializing the model types
-themselves, so they track the types; if a type changes shape, regenerate the
-pack and re-run the tests.
+the secret scan above. The files are hand-authored to match the serialised shape;
+`tests/fixtures.rs` keeps them in sync.
+
+Note that `dry_run` appears in `scan.start` results only for profiles with an L4
+lane; `scan.start.json` is an HTTP-lane job, so it carries no `dry_run` key.

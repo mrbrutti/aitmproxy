@@ -28,26 +28,28 @@
     },
     {
       "id": "http.sqli-error",
-      "name": "sqli check",
-      "class": "sqli",
+      "name": "Error-based SQL injection",
+      "class": "sqli-error",
       "lanes": [
         "http"
       ],
       "kinds": [
         "query",
-        "body_param"
+        "body_param",
+        "cookie",
+        "json_value"
       ],
       "intensity": "medium",
       "cost": "light",
-      "technique": "reflected",
+      "technique": "error",
       "severity": "high",
-      "confidence_max": "certain",
-      "needs_baseline": false,
+      "confidence_max": "firm",
+      "needs_baseline": true,
       "wants_traits": null,
       "targets_session": false,
-      "cwe": 79,
-      "description": "Detects sqli.",
-      "remediation": "Validate and encode untrusted input.",
+      "cwe": 89,
+      "description": "Sends SQL metacharacters and quote-breaking payloads into the point and matches the response against database error signatures (MySQL, PostgreSQL, SQLite, MSSQL, Oracle) that a correctly parameterised query would never surface.",
+      "remediation": "Use parameterised queries or a prepared-statement API for every database call; never build SQL by concatenating request values. Return a generic error page so database errors are not echoed to the client.",
       "origin": {
         "kind": "bundled",
         "path": "scripts/bundled/active/sqli.rhai"
@@ -55,26 +57,25 @@
     },
     {
       "id": "http.custom-marker",
-      "name": "custom check",
-      "class": "custom",
+      "name": "Debug marker header exposure",
+      "class": "information-disclosure",
       "lanes": [
         "http"
       ],
       "kinds": [
-        "query",
-        "body_param"
+        "header"
       ],
-      "intensity": "medium",
+      "intensity": "passive",
       "cost": "light",
-      "technique": "reflected",
-      "severity": "high",
+      "technique": "passive",
+      "severity": "low",
       "confidence_max": "certain",
       "needs_baseline": false,
       "wants_traits": null,
       "targets_session": false,
-      "cwe": 79,
-      "description": "Detects custom.",
-      "remediation": "Validate and encode untrusted input.",
+      "cwe": 200,
+      "description": "An operator-authored passive check: flags responses carrying the in-house X-Debug-Marker header, which this engagement's target leaves on when a staging build is deployed.",
+      "remediation": "Strip the debug header at the edge for production builds, or gate it behind an authenticated internal flag.",
       "origin": {
         "kind": "custom",
         "path": "~/.aitmproxy/scripts/marker.rhai"

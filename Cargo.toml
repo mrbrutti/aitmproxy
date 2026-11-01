@@ -59,7 +59,7 @@ uuid = { version = "1", features = ["v4"] }
 # new external dependency once, here; each track's crates opt in with
 # `workspace = true`. An entry no member inherits is never resolved and never enters
 # `Cargo.lock`, so a declaration may land ahead of the track that consumes it.
-blake3 = "1"                                        # T1b: probe/response fingerprints
+blake3 = "1"                                        # T1b: issue dedupe key (D6)
 bytes = "1"                                         # T4: WS frame payloads
 hickory-proto = "0.26"                              # T6: DNS grammar (research 18 3.6: 0.26.3)
 rand = "0.9"                                        # T6: L4 mutation RNG
