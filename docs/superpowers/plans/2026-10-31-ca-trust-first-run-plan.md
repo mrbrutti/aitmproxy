@@ -137,6 +137,8 @@ Uninstall) waits for Matt's explicit yes; it runs only through the app's own ste
 - **Web (PR #247):** the real `aitm web` from head 204960cb (this branch's `dist` embedded) at 127.0.0.1:38082 against its own core (listen 38084, bus 38092); a real Chromium (the Code tab's browser pane) with the `#t=` token shows the toolbar status `aitmproxy · listening 127.0.0.1:38084 · CA trusted`; `ca.status` over that bus: user present/trusted yes, system absent/no. No install, uninstall or proxy change. Artifacts `/tmp/claude/ca-proof/web/`.
 - The TUI/web-driven install → `· CA trusting…` → flip → uninstall stays pending Matt's yes for a change driven from those frontends.
 
+25. **After the fake-data removal (#249).** `Store.usesFixtures`, `Fixtures.caStatus`, `FixtureBus.swift`, `SnapshotScenes.swift` and `Session+Fixtures.swift` are gone from the mac app: the CA panel and `Session.setupSheetDue` no longer consult a fixture store, and `tools/check-ca-trust-path.sh` rule 4 denies the nine surfaces that remain (BusService, CommandMap, CommandPalette, Session+Palette, Session+Verbs, AgentPanel, SelfTest, SelfTest+Live) with `deny_present` removed. PR D's base is main e12b3e2 (v0.5.10); PRs #248 (TUI) and #247 (web) merged before it.
+
 ## Review log
 
 | Date | PR | Reviewer | Finding | Severity | Disposition |
