@@ -835,6 +835,30 @@ fn rows_are_bounded_at_fold_time() {
     assert_eq!(app.scan.issues.rows.len(), 512);
 }
 
+/// Fix round G, G10: a name made of a million tabs is stripped at fold, so
+/// the row's other columns sit where the neighbouring row's do (a control
+/// character is charged one cell by `truncate` and `width` alike, and the
+/// fold strips them before the row is built).
+#[test]
+fn a_tab_only_name_does_not_shift_the_other_columns() {
+    let mut app = app();
+    let _ = app.update(Action::ScanTab(ScanTab::Issues));
+    let mut page = fixture("scan.issues.json");
+    page["issues"][0]["name"] = json!("\t".repeat(1 << 20));
+    let _ = app.on_bus(issues_reply(page));
+    assert_eq!(app.scan.issues.rows.len(), 2);
+    assert_eq!(app.scan.issues.rows[0].name, "", "the tabs are stripped");
+    let text = screen(&app);
+    let tabbed = line_with(&text, "GET /search").unwrap_or_else(|| panic!("no row: {text}"));
+    let other = line_with(&text, "GET /go").unwrap_or_else(|| panic!("no row: {text}"));
+    assert!(!tabbed.contains('\t'), "{tabbed:?}");
+    assert_eq!(
+        col_of(tabbed, "open"),
+        col_of(other, "open"),
+        "the status column lines up:\n{tabbed}\n{other}"
+    );
+}
+
 /// D4 (spec D11, amended): on a v2 bus with `scan.issues` but no
 /// `scan.issue`, the Issues strip row names the missing verb, and a cursor
 /// landing sends nothing (the quiet `scan_poll` path, ruling b).

@@ -15,7 +15,7 @@ mod common;
 use aitm_tui::action::{Action, BusEvent, BusRequest, Level};
 use aitm_tui::app::{App, Mode};
 use aitm_tui::caps::TermCaps;
-use aitm_tui::scan::{ScanError, ScanTab};
+use aitm_tui::scan::{ScanError, ScanTab, ERROR_DETAIL_MAX};
 use common::*;
 use serde_json::{json, Value};
 
@@ -212,6 +212,42 @@ fn each_code_renders_its_wording_in_the_tab_and_the_toast() {
             .unwrap_or_else(|| panic!("{code}: scan.start is the Profiles tab's error"));
         assert_eq!(err.wording(), expected);
     }
+}
+
+/// Fix round G, G82: the core's `detail` is bounded once, where the error
+/// is made, so the banner, the footer wrap and the toast all read at most
+/// `ERROR_DETAIL_MAX` cells (four times that in chars) of it, control
+/// characters stripped; a 1 MiB detail still renders.
+#[test]
+fn a_huge_error_detail_is_bounded_at_the_error() {
+    let mut app = opened();
+    let detail = format!("\x1b[2J{}", "d".repeat(1 << 20));
+    let _ = app.on_bus(failed(
+        "scan.start",
+        "scan.start",
+        &format!("scan: out_of_scope: {detail}"),
+    ));
+    let err = app
+        .scan
+        .profiles
+        .error
+        .clone()
+        .expect("the Profiles tab's error");
+    assert!(
+        err.detail.chars().count() <= 4 * ERROR_DETAIL_MAX,
+        "{} chars",
+        err.detail.chars().count()
+    );
+    assert!(!err.detail.contains('\x1b'), "control characters stripped");
+    assert!(err.detail.ends_with('…'), "{:?}", &err.detail[..40]);
+    let shown = toast(&app);
+    assert!(
+        shown.chars().count() <= 4 * ERROR_DETAIL_MAX + 160,
+        "the toast is the bounded wording: {} chars",
+        shown.chars().count()
+    );
+    let text = screen(&app);
+    assert!(text.contains("Out of scope"), "{text}");
 }
 
 /// D9: a message outside the `scan: <code>: <detail>` shape is shown

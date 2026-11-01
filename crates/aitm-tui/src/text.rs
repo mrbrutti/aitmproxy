@@ -29,6 +29,14 @@ pub fn fit(s: &str, w: usize) -> String {
     truncate(s, w)
 }
 
+/// `s` without its control characters (`char::is_control`: C0, DEL, C1),
+/// so a tab, an escape sequence or a newline from a core cannot move the
+/// cursor or shift a column; the one place the Scan folds strip them (fix
+/// round G, G10). A string without any is copied as it is.
+pub fn clean(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 /// Cut `s` to at most `w` cells, ending in `…` when anything was removed.
 ///
 /// Bounded in work and in output (D6 hostile-core bounds; fix round E, E1):
@@ -36,6 +44,8 @@ pub fn fit(s: &str, w: usize) -> String {
 /// whatever the input's length, and a string is also cut once it runs past
 /// `4 * w` chars, so a run of width-0 characters (U+200B and kin) cannot
 /// pass whole. The result is therefore at most `w` cells and `4 * w` chars.
+/// A control character is charged one cell, as [`width`] charges it (fix
+/// round G, G10), so the two never disagree on what fits.
 pub fn truncate(s: &str, w: usize) -> String {
     if w == 0 {
         return String::new();
@@ -47,7 +57,7 @@ pub fn truncate(s: &str, w: usize) -> String {
     // ellipsis: at most `w - 1` cells and `4 * w - 1` chars.
     let mut keep = 0;
     for (i, c) in s.char_indices() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        let cw = UnicodeWidthChar::width(c).unwrap_or(1);
         if cells_used + cw > w || chars_used + 1 > max_chars {
             let mut out = String::with_capacity(keep + '…'.len_utf8());
             out.push_str(&s[..keep]);
@@ -133,6 +143,20 @@ mod tests {
         assert_eq!(truncate("", 5), "");
         assert_eq!(truncate("abc", 0), "");
         assert_eq!(truncate("ab", 1), "…");
+    }
+
+    /// Fix round G, G10: a control character is charged one cell, as
+    /// `width()` charges it, so the "at most `w` cells" contract holds for a
+    /// run of tabs too, and `clean` strips every control character.
+    #[test]
+    fn truncate_charges_a_control_char_one_cell_and_clean_strips_them() {
+        let tabs = "\t".repeat(1000);
+        let cut = truncate(&tabs, 8);
+        assert!(width(&cut) <= 8, "{} cells", width(&cut));
+        assert_eq!(cut.chars().count(), 8, "seven tabs and the ellipsis");
+        assert_eq!(clean("a\tb\u{1b}[2Jc\nd"), "ab[2Jcd");
+        assert_eq!(clean("plain"), "plain");
+        assert_eq!(clean(""), "");
     }
 
     #[test]

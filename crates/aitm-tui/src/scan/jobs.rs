@@ -10,7 +10,7 @@ use aitm_scan_model::{
 };
 
 use super::{is_job_id, lane_token, severity_counts, severity_token, SEVERITY_ORDER};
-use crate::text::truncate;
+use crate::text::{clean, truncate};
 
 /// Which pane of the Jobs tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -70,9 +70,9 @@ impl JobsState {
     /// `targets` entry to four times [`TARGETS_MAX`], so [`row`] and the
     /// Detail pane only copy bounded text.
     pub fn fold_status(&mut self, mut status: JobStatus) {
-        status.profile_name = truncate(&status.profile_name, PROFILE_MAX);
+        status.profile_name = truncate(&clean(&status.profile_name), PROFILE_MAX);
         for target in &mut status.targets {
-            *target = truncate(target, 4 * TARGETS_MAX);
+            *target = truncate(&clean(target), 4 * TARGETS_MAX);
         }
         let id = status.job.clone();
         if !self.order.contains(&id) {

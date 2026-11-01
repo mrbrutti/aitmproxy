@@ -14,7 +14,7 @@ use aitm_scan_model::{
 use serde_json::{json, Map, Value};
 
 use super::{is_issue_id, step, Dir, ScanError, ISSUES_PAGE_LIMIT};
-use crate::text::truncate;
+use crate::text::{clean, truncate};
 
 /// How many `Tick`s between two `scan.issues` refreshes while the Issues tab
 /// is shown and a job is live (spec D6: five seconds).
@@ -353,12 +353,18 @@ pub fn issue_row(i: &IssueSummary) -> IssueRow {
         Some(m) => format!("{m} {}", i.location.path_template),
         None => i.location.path_template.clone(),
     };
+    // Control characters are stripped before the cut (fix round G, G10),
+    // so a tab-only name cannot shift the row's other columns.
     IssueRow {
         glyphs: confidence_glyphs(i.confidence),
-        name: truncate(&i.name, NAME_MAX),
-        location: truncate(&location, LOCATION_MAX),
+        name: truncate(&clean(&i.name), NAME_MAX),
+        location: truncate(&clean(&location), LOCATION_MAX),
         point: truncate(
-            &format!("{}:{}", kind_token(i.location.kind), i.location.name),
+            &clean(&format!(
+                "{}:{}",
+                kind_token(i.location.kind),
+                i.location.name
+            )),
             POINT_MAX,
         ),
         status: status_token(i.status),
@@ -614,6 +620,11 @@ impl IssuesState {
 /// per-frame line building then runs over bounded text only.
 fn bound_issue(issue: &mut Issue) -> usize {
     let cut = |s: &mut String| {
+        // Control characters go first (fix round G, G10): a tab or an
+        // escape would move the cursor or shift a column on screen.
+        if s.chars().any(char::is_control) {
+            *s = clean(s);
+        }
         // A char is never more cells than bytes, so a string within the cap
         // in bytes needs no walk and no new allocation.
         if s.len() > DETAIL_VALUE_MAX {

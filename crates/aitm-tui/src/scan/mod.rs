@@ -23,6 +23,8 @@ use std::collections::BTreeSet;
 use aitm_scan_model::ScanErrorCode;
 use serde_json::Value;
 
+use crate::text::{clean, truncate};
+
 pub use issues::*;
 pub use jobs::*;
 pub use launch::*;
@@ -59,6 +61,12 @@ pub const MAX_STATUS_FOLLOWUPS: usize = 16;
 
 /// The `limit` of every `scan.issues` page the TUI asks for (spec D6).
 pub const ISSUES_PAGE_LIMIT: usize = 512;
+
+/// The widest a `ScanError`'s core-controlled `detail` grows, in cells
+/// (fix round G, G82; D6 hostile-core bounds): bounded once in
+/// [`ScanError::new`], the one choke point, so the banner, the Profiles
+/// footer wrap, the toast and every clone of the error read bounded text.
+pub const ERROR_DETAIL_MAX: usize = 240;
 
 /// The tab a `scan.*` verb's error line belongs to (spec D9: "the owning
 /// tab"; plan task 13). The profile verbs, the catalogue, the session
@@ -403,12 +411,18 @@ pub struct ScanError {
 impl ScanError {
     /// An error under `tag`, the tag of the call that failed; the verb is
     /// the tag's verb part ([`tag_parts`]), so a bare verb tags itself.
+    ///
+    /// The detail is bounded here, once (fix round G, G82): control
+    /// characters stripped and the text cut to [`ERROR_DETAIL_MAX`] cells,
+    /// then shrunk to what is kept, so no consumer walks or holds more.
     fn new(tag: &str, code: Option<ScanErrorCode>, detail: impl Into<String>) -> Self {
+        let mut detail = truncate(&clean(&detail.into()), ERROR_DETAIL_MAX);
+        detail.shrink_to_fit();
         Self {
             tag: tag.to_string(),
             verb: tag_parts(tag).0.to_string(),
             code,
-            detail: detail.into(),
+            detail,
         }
     }
 
