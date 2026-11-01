@@ -1993,4 +1993,102 @@ mod tester_tests {
         ));
         assert!(exec.runs().is_empty());
     }
+
+    fn kread(key: &str) -> String {
+        line(
+            "kreadconfig6",
+            &[
+                "--file",
+                "kioslaverc",
+                "--group",
+                "Proxy Settings",
+                "--key",
+                key,
+            ],
+        )
+    }
+
+    /// Tester, F4 item 6: on Linux `Snapshot.rows` is the synthetic row(s)
+    /// `read_services` returns over the same answers — one `gsettings` row;
+    /// one `kde` row; `kde` then `gsettings` when KDE also mirrors into
+    /// GNOME — so the engine judges an idempotent `set` on the snapshot it
+    /// already took, never on a second read.
+    #[test]
+    fn linux_snapshot_rows_are_the_read_services_rows() {
+        let before = ["'none'", "''", "8080", "''", "0", "['localhost']"];
+
+        // gsettings alone.
+        let snap = GsettingsOps
+            .snapshot(&gets_answering(before))
+            .expect("snapshot");
+        let live = GsettingsOps
+            .read_services(&gets_answering(before))
+            .expect("read_services");
+        assert_eq!(snap.rows, live);
+        assert!(snap.skipped.is_empty());
+        let Previous::Gsettings { keys } = &snap.previous else {
+            panic!("gsettings previous, got {:?}", snap.previous);
+        };
+        assert_eq!(snap.rows, vec![gsettings_row(keys)]);
+        assert_eq!(snap.rows[0].service, GSETTINGS_SERVICE);
+        assert!(!snap.rows[0].http.enabled, "mode 'none' is not enabled");
+        assert_eq!(snap.rows[0].bypass, vec!["localhost".to_string()]);
+
+        // KDE alone: one `kde` row from the four kioslaverc reads.
+        let kde_exec = || {
+            ScriptedExecutor::new()
+                .respond(&kread("ProxyType"), 0, "0\n", "")
+                .respond(&kread("httpProxy"), 0, "\n", "")
+                .respond(&kread("httpsProxy"), 0, "\n", "")
+                .respond(&kread("NoProxyFor"), 0, "\n", "")
+        };
+        let kde = KdeOps {
+            kwrite: "kwriteconfig6".into(),
+            kread: "kreadconfig6".into(),
+            dbus_send: "dbus-send".into(),
+            gsettings_too: false,
+        };
+        let snap = kde.snapshot(&kde_exec()).expect("kde snapshot");
+        let live = kde.read_services(&kde_exec()).expect("kde read_services");
+        assert_eq!(snap.rows, live);
+        let Previous::Kde {
+            kioslaverc,
+            gsettings,
+        } = &snap.previous
+        else {
+            panic!("kde previous, got {:?}", snap.previous);
+        };
+        assert!(gsettings.is_none());
+        assert_eq!(snap.rows, vec![kde_row(kioslaverc)]);
+        assert_eq!(snap.rows[0].service, KDE_SERVICE);
+        assert!(!snap.rows[0].http.enabled);
+
+        // KDE mirroring into GNOME: `kde` then `gsettings`.
+        let both_exec = || {
+            let mut exec = kde_exec();
+            for (i, (schema, key)) in GSETTINGS_KEYS.iter().enumerate() {
+                exec = exec.respond(&get(schema, key), 0, before[i], "");
+            }
+            exec
+        };
+        let both = KdeOps {
+            gsettings_too: true,
+            ..kde
+        };
+        let snap = both.snapshot(&both_exec()).expect("both snapshot");
+        let live = both
+            .read_services(&both_exec())
+            .expect("both read_services");
+        assert_eq!(snap.rows, live);
+        let Previous::Kde {
+            kioslaverc,
+            gsettings: Some(keys),
+        } = &snap.previous
+        else {
+            panic!("kde+gsettings previous, got {:?}", snap.previous);
+        };
+        assert_eq!(snap.rows, vec![kde_row(kioslaverc), gsettings_row(keys)]);
+        let names: Vec<&str> = snap.rows.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(names, vec![KDE_SERVICE, GSETTINGS_SERVICE]);
+    }
 }

@@ -2218,6 +2218,71 @@ mod engine_tests {
         assert_eq!(r.exec.runs().len(), 8, "one scutil and one snapshot round");
     }
 
+    /// Tester, F4 item 3: `wrote.bypass` is `bypass_for(&[], &extra)` —
+    /// [`BYPASS_DEFAULT`] first, then the config's list, then the request's,
+    /// de-duplicated once (a request entry already among the defaults or the
+    /// config is not repeated) — and the per-service write line is that
+    /// service's previous list ∪ the same union, in that order.
+    #[test]
+    fn set_records_defaults_then_config_then_request_bypass_once_in_wrote() {
+        let exec = ScriptedExecutor::new().respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "");
+        let exec = at_us_round(before_round(exec));
+        let dir = temp_dir("bypass-wrote");
+        let file = dir.join(STATE_FILE_NAME);
+        let exec = Arc::new(FileWatch {
+            inner: exec.with_real_fs(),
+            state_file: file.clone(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let cfg = SystemProxyConfig {
+            auto: false,
+            bypass: strs(&["corp.test", "localhost"]),
+            state_file: Some(file.clone()),
+        };
+        let as_exec: Arc<dyn Executor> = exec.clone();
+        let sp = SystemProxy::with_mechanism(as_exec, &cfg, ours(), None, Mechanism::Networksetup);
+        let r = Rig {
+            exec,
+            sp,
+            dir,
+            file,
+        };
+
+        let (status, changed, commands) =
+            r.sp.set(&SetRequest {
+                bypass: strs(&["Dev.local", "corp.test", "*.local"]),
+            })
+            .expect("set");
+        assert!(changed);
+        assert_eq!(status.state, State::PointsAtUs);
+
+        let saved = StateFile::load(&r.file).expect("load").expect("file");
+        assert_eq!(
+            saved.wrote.bypass,
+            strs(&[
+                "localhost",
+                "127.0.0.1",
+                "::1",
+                "*.local",
+                "169.254/16",
+                "corp.test",
+                "Dev.local",
+            ]),
+            "defaults, then config, then request; each host once"
+        );
+        assert_eq!(
+            saved.wrote.bypass,
+            bypass_for(
+                &[],
+                &strs(&["corp.test", "localhost", "Dev.local", "*.local"])
+            )
+        );
+        // `localhost` and `*.local` are already in the service's previous ∪
+        // defaults, so only the two new hosts trail the write line.
+        assert_eq!(commands, set_lines(" corp.test Dev.local"));
+        assert_eq!(r.exec.mutating_runs(), set_lines(" corp.test Dev.local"));
+    }
+
     /// Pointing at us with NO file (set by hand): snapshot and write anyway so
     /// a restore is possible.
     #[test]

@@ -1262,4 +1262,77 @@ mod tester_tests {
             Err(ReadError::Failed(_))
         ));
     }
+
+    /// Tester, F4 item 6: `Snapshot.rows` is every live row, the
+    /// authenticated service included — exactly what `read_services`
+    /// returns over the same answers — while `previous` drops that service
+    /// and `skipped` names it. The engine's idempotent `set` reports `rows`
+    /// as its `services`, so this is what makes that equal to a `status`.
+    #[test]
+    fn snapshot_rows_keep_the_authenticated_service_that_previous_drops() {
+        let de_on = "Enabled: Yes\nServer: 127.0.0.1\nPort: 9090\nAuthenticated Proxy Enabled: 0\n";
+        let auth = "Enabled: Yes\nServer: proxy.corp\nPort: 3128\nAuthenticated Proxy Enabled: 1\n";
+        let off = "Enabled: No\nServer: \nPort: 0\nAuthenticated Proxy Enabled: 0\n";
+        let scripted = || {
+            ScriptedExecutor::new()
+                .respond(LIST, 0, LIST_OUT, "")
+                .respond(
+                    "/usr/sbin/networksetup -getwebproxy 'Display Ethernet'",
+                    0,
+                    de_on,
+                    "",
+                )
+                .respond(
+                    "/usr/sbin/networksetup -getsecurewebproxy 'Display Ethernet'",
+                    0,
+                    de_on,
+                    "",
+                )
+                .respond(
+                    "/usr/sbin/networksetup -getproxybypassdomains 'Display Ethernet'",
+                    0,
+                    "*.local\n169.254/16\n",
+                    "",
+                )
+                .respond("/usr/sbin/networksetup -getwebproxy Wi-Fi", 0, auth, "")
+                .respond(
+                    "/usr/sbin/networksetup -getsecurewebproxy Wi-Fi",
+                    0,
+                    off,
+                    "",
+                )
+                .respond(
+                    "/usr/sbin/networksetup -getproxybypassdomains Wi-Fi",
+                    0,
+                    "There aren't any bypass domains set on Wi-Fi.\n",
+                    "",
+                )
+        };
+        let snap_exec = scripted();
+        let snap = MacosOps.snapshot(&snap_exec).expect("snapshot");
+        let live = MacosOps.read_services(&scripted()).expect("read_services");
+
+        assert_eq!(snap.rows, live, "rows are the read_services rows");
+        let names: Vec<&str> = snap.rows.iter().map(|r| r.service.as_str()).collect();
+        assert_eq!(names, vec!["Display Ethernet", "Wi-Fi"]);
+        assert_eq!(snap.rows[0].http, on("127.0.0.1", 9090));
+        assert_eq!(snap.rows[1].http, on("proxy.corp", 3128));
+        assert_eq!(snap.rows[1].https, ProtocolProxy::default());
+        assert_eq!(snap.rows[1].bypass, Vec::<String>::new());
+
+        assert_eq!(snap.skipped, vec!["Wi-Fi".to_string()]);
+        let Previous::Networksetup { services } = &snap.previous else {
+            panic!("networksetup previous, got {:?}", snap.previous);
+        };
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service, "Display Ethernet");
+        assert_eq!(
+            snap.rows.len(),
+            services.len() + snap.skipped.len(),
+            "rows = previous + skipped"
+        );
+        // One list and three gets per enabled service; nothing mutating.
+        assert_eq!(snap_exec.runs().len(), 7, "{:?}", snap_exec.runs());
+        assert!(snap_exec.runs().iter().all(|l| !l.contains(" -set")));
+    }
 }
