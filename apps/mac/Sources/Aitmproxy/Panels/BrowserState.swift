@@ -62,15 +62,6 @@ final class BrowserState {
 
     init(session: Session) {
         self.session = session
-        if Store.usesFixtures {
-            let page = Fixtures.browserPage
-            var tab = BrowserTab(title: page.title, url: page.url, lastFrame: page.png)
-            tab.pushHistory()
-            tabs = [tab]
-            currentID = tab.id
-            urlText = page.url
-            domOutline = Fixtures.domOutline
-        }
         syncCount()
     }
 
@@ -82,9 +73,8 @@ final class BrowserState {
         }
     }
 
-    /// The bus is connected, or fixtures stand in for it.
+    /// The bus is connected.
     var available: Bool {
-        if Store.usesFixtures { return true }
         if case .connected = session.bus { return true }
         return false
     }
@@ -137,13 +127,6 @@ final class BrowserState {
         current = tab
         urlText = url
         defer { if var done = current { done.isLoading = false; current = done } }
-        if Store.usesFixtures {
-            tab.title = URL(string: url)?.host() ?? url
-            tab.pushHistory()
-            current = tab
-            consoleLines.append("navigate \(url) → 200 (fixture)")
-            return
-        }
         do {
             let outcome = try await session.runCommand("browser.navigate", ["url": .string(url)])
             let finalURL = outcome["final_url"]?.stringValue ?? url
@@ -183,7 +166,6 @@ final class BrowserState {
     /// True when the expression ran on the page.
     @discardableResult
     private func evalQuietly(_ expr: String) async -> Bool {
-        guard !Store.usesFixtures else { consoleLines.append("› \(expr)"); return true }
         do {
             _ = try await session.runCommand("browser.eval", ["expr": .string(expr)])
             _ = await screenshot()
@@ -198,7 +180,7 @@ final class BrowserState {
     /// Read where the page is now; when it moved, the tab follows and, unless the move was
     /// our own back/forward, it is a new history entry so Back/Forward stay truthful.
     private func syncLocation(pushing: Bool = true) async {
-        guard !Store.usesFixtures, var tab = current else { return }
+        guard var tab = current else { return }
         guard let href = try? await session.runCommand("browser.eval", ["expr": .string("location.href")]).stringValue,
               !href.isEmpty, href != tab.url else { return }
         tab.url = href
@@ -214,10 +196,6 @@ final class BrowserState {
     @discardableResult
     func screenshot() async -> Data? {
         guard let tab = current else { return nil }
-        if Store.usesFixtures {
-            noteFrame()
-            return tab.lastFrame
-        }
         do {
             let value = try await session.runCommand("browser.screenshot", [:])
             guard let text = value.stringValue, let data = Data(base64Encoded: text) else {
@@ -283,7 +261,6 @@ final class BrowserState {
     func click(at point: CGPoint, imageSize: CGSize) async {
         guard imageSize.width > 0, imageSize.height > 0 else { return }
         let x = min(max(point.x, 0), imageSize.width), y = min(max(point.y, 0), imageSize.height)
-        if Store.usesFixtures { consoleLines.append("click (\(Int(x)), \(Int(y)))"); return }
         do {
             _ = try await session.runCommand("browser.click", ["x": .number(Double(x)), "y": .number(Double(y))])
             _ = await screenshot()
@@ -296,7 +273,6 @@ final class BrowserState {
     /// `browser.type` needs a selector: the focused element (`:focus`) is where a keystroke goes.
     func type(_ text: String) async {
         guard !text.isEmpty else { return }
-        if Store.usesFixtures { consoleLines.append("type \(text.debugDescription)"); return }
         do {
             _ = try await session.runCommand("browser.type", ["selector": ":focus", "text": .string(text)])
             _ = await screenshot()
@@ -311,7 +287,6 @@ final class BrowserState {
         let trimmed = expr.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return }
         consoleLines.append("› \(trimmed)")
-        if Store.usesFixtures { consoleLines.append(trimmed); return }
         do {
             let value = try await session.runCommand("browser.eval", ["expr": .string(trimmed)])
             consoleLines.append(value.stringValue ?? value.serialized())
@@ -323,7 +298,6 @@ final class BrowserState {
 
     /// `browser.get_dom` → an indented outline of the page's elements.
     func dom() async {
-        if Store.usesFixtures { domOutline = Fixtures.domOutline; return }
         do {
             let html = try await session.runCommand("browser.get_dom", [:]).stringValue ?? ""
             domOutline = DOMOutline.lines(from: html)
