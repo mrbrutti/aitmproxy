@@ -350,17 +350,6 @@ impl L4Guard {
             .collect()
     }
 
-    /// Whether a decoded frame is the core's own traffic: its source **or**
-    /// destination is a loopback address **and** its source **or** destination port
-    /// is one of [`self_ports`](L4Guard::self_ports). Such a frame must never be
-    /// recorded (L4PAR-AC34). A frame with no loopback address, or no port in the
-    /// set, is not self traffic. [`admit_endpoints`](Self::admit_endpoints) adds
-    /// the interface-name test; this is the address-only half.
-    #[must_use]
-    pub fn is_self_traffic(&self, ep: &PacketEndpoints) -> bool {
-        has_loopback_addr(ep) && self.touches_self_port(ep)
-    }
-
     /// **The one choke point for self-exclusion** (spec §2.1, L4PAR-AC34). Whether
     /// a frame seen on `interface` may be recorded, parked or listed: it may
     /// **not** when it touches one of the core's own listener ports (source or
@@ -385,14 +374,19 @@ impl L4Guard {
         !(is_loopback_interface(interface) || has_loopback_addr(ep))
     }
 
-    /// The BPF clause that keeps the core's own listener ports out of a loopback
-    /// capture — the kernel-side first boundary ([`admit_frame`](Self::admit_frame)
-    /// is the authoritative second): `not port P` for one self port, `not (port A
-    /// or port B …)` ascending for several, `None` when there are none. The
-    /// capture ANDs it onto its scope filter on a loopback interface; the
-    /// send_recv reply capture does the same.
+    /// The BPF clause that keeps the core's own listener ports out of a capture
+    /// on `interface` — the kernel-side first boundary
+    /// ([`admit_frame`](Self::admit_frame) is the authoritative second): `not
+    /// port P` for one self port, `not (port A or port B …)` ascending for
+    /// several; `None` when there are none **or** `interface` is not a loopback
+    /// interface, where a remote target may legitimately answer from a port
+    /// number the core also happens to listen on locally. The capture ANDs it
+    /// onto its scope filter; the send_recv reply capture opens with it.
     #[must_use]
-    pub fn self_exclusion_bpf(&self) -> Option<String> {
+    pub(crate) fn self_exclusion_bpf(&self, interface: &str) -> Option<String> {
+        if !is_loopback_interface(interface) {
+            return None;
+        }
         let ports = self.self_ports();
         match ports.as_slice() {
             [] => None,
@@ -690,9 +684,9 @@ fn cidr_within(cidr: &IpCidr, outer_addr: IpAddr, outer_prefix: u8) -> bool {
 
 /// Whether `interface` is a loopback interface by name: `lo` (Linux) or
 /// `lo<digits>` (`lo0` on macOS and the BSDs). One of the two tests
-/// [`L4Guard::admit_frame`] applies; the capture's BPF builder uses it too.
+/// [`L4Guard::admit_frame`] applies; [`L4Guard::self_exclusion_bpf`] uses it too.
 #[must_use]
-pub fn is_loopback_interface(interface: &str) -> bool {
+pub(crate) fn is_loopback_interface(interface: &str) -> bool {
     interface
         .strip_prefix("lo")
         .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
@@ -815,11 +809,12 @@ mod tests {
     }
 
     /// L4PAR-AC34 (plan A10): the self-port set is replaced on each `set`,
-    /// read back ascending, ignores port 0 (never a bound listener), and
-    /// `is_self_traffic` is true only for a loopback frame whose src **or** dst
-    /// port is in the set.
+    /// read back ascending, ignores port 0 (never a bound listener), and on a
+    /// **non-loopback** interface name (`en0`, so only the address test can
+    /// fire) `admit_endpoints` refuses exactly a loopback-addressed frame whose
+    /// src **or** dst port is in the set.
     #[test]
-    fn self_ports_and_self_traffic() {
+    fn self_ports_and_admit_endpoints_by_address() {
         use crate::craft::PacketEndpoints;
         let g = L4Guard::new(&cfg());
         assert!(
@@ -837,31 +832,31 @@ mod tests {
             src_port: Some(src_port),
             dst_port: Some(dst_port),
         };
-        assert!(g.is_self_traffic(&ep("127.0.0.1", 51000, "127.0.0.1", 27431)));
-        assert!(g.is_self_traffic(&ep("127.0.0.1", 27431, "127.0.0.1", 51000)));
-        assert!(g.is_self_traffic(&ep("::1", 51000, "::1", 28182)));
+        assert!(!g.admit_endpoints("en0", &ep("127.0.0.1", 51000, "127.0.0.1", 27431)));
+        assert!(!g.admit_endpoints("en0", &ep("127.0.0.1", 27431, "127.0.0.1", 51000)));
+        assert!(!g.admit_endpoints("en0", &ep("::1", 51000, "::1", 28182)));
         assert!(
-            !g.is_self_traffic(&ep("127.0.0.1", 51000, "127.0.0.1", 9099)),
+            g.admit_endpoints("en0", &ep("127.0.0.1", 51000, "127.0.0.1", 9099)),
             "a loopback frame to a non-self port is not the core's own traffic"
         );
         assert!(
-            !g.is_self_traffic(&ep("10.0.0.5", 51000, "10.0.0.9", 27431)),
-            "a non-loopback frame is never self traffic, whatever its ports"
+            g.admit_endpoints("en0", &ep("10.0.0.5", 51000, "10.0.0.9", 27431)),
+            "a non-loopback frame on a real NIC is never self traffic, whatever its ports"
         );
-        assert!(!g.is_self_traffic(&PacketEndpoints::default()));
+        assert!(g.admit_endpoints("en0", &PacketEndpoints::default()));
 
         g.set_self_ports([9]);
         assert_eq!(g.self_ports(), vec![9], "set replaces, it does not union");
-        assert!(!g.is_self_traffic(&ep("127.0.0.1", 51000, "127.0.0.1", 27431)));
+        assert!(g.admit_endpoints("en0", &ep("127.0.0.1", 51000, "127.0.0.1", 27431)));
     }
 
-    /// L4PAR-AC34 (tester): `is_self_traffic` edge cases. An IPv4-mapped IPv6
-    /// loopback (`::ffff:127.0.0.1`) is loopback; a frame with only one loopback
-    /// side still counts; UDP is covered like TCP; a frame with no ports (ICMP, or
-    /// an undecodable transport) is never self traffic; the empty set excludes
-    /// nothing.
+    /// L4PAR-AC34 (tester): `admit_endpoints` address edge cases on a non-loopback
+    /// interface name. An IPv4-mapped IPv6 loopback (`::ffff:127.0.0.1`) is
+    /// loopback; a frame with only one loopback side still counts; UDP is covered
+    /// like TCP; a frame with no ports (ICMP, or an undecodable transport) is never
+    /// self traffic; the empty set excludes nothing.
     #[test]
-    fn self_traffic_edge_cases() {
+    fn admit_endpoints_address_edge_cases() {
         use crate::craft::PacketEndpoints;
         let g = L4Guard::new(&cfg());
         let ep = |proto: L4Proto, src: &str, sp: Option<u16>, dst: &str, dp: Option<u16>| {
@@ -881,61 +876,79 @@ mod tests {
             Some(27431),
         );
         assert!(
-            !g.is_self_traffic(&bus),
+            g.admit_endpoints("en0", &bus),
             "an empty self-port set excludes nothing"
         );
 
         g.set_self_ports([27431]);
-        assert!(g.is_self_traffic(&bus));
-        assert!(g.is_self_traffic(&ep(
-            L4Proto::Tcp,
-            "::ffff:127.0.0.1",
-            Some(51000),
-            "::ffff:127.0.0.1",
-            Some(27431)
-        )));
-        assert!(g.is_self_traffic(&ep(
-            L4Proto::Udp,
-            "127.0.0.1",
-            Some(27431),
-            "127.0.0.1",
-            Some(51000)
-        )));
-        assert!(
-            g.is_self_traffic(&ep(
+        assert!(!g.admit_endpoints("en0", &bus));
+        assert!(!g.admit_endpoints(
+            "en0",
+            &ep(
                 L4Proto::Tcp,
-                "10.0.0.5",
+                "::ffff:127.0.0.1",
                 Some(51000),
-                "127.0.0.1",
+                "::ffff:127.0.0.1",
                 Some(27431)
-            )),
+            )
+        ));
+        assert!(!g.admit_endpoints(
+            "en0",
+            &ep(
+                L4Proto::Udp,
+                "127.0.0.1",
+                Some(27431),
+                "127.0.0.1",
+                Some(51000)
+            )
+        ));
+        assert!(
+            !g.admit_endpoints(
+                "en0",
+                &ep(
+                    L4Proto::Tcp,
+                    "10.0.0.5",
+                    Some(51000),
+                    "127.0.0.1",
+                    Some(27431)
+                )
+            ),
             "one loopback side is enough"
         );
-        assert!(g.is_self_traffic(&ep(
-            L4Proto::Tcp,
-            "127.0.0.2",
-            Some(51000),
-            "127.0.0.9",
-            Some(27431)
-        )));
+        assert!(!g.admit_endpoints(
+            "en0",
+            &ep(
+                L4Proto::Tcp,
+                "127.0.0.2",
+                Some(51000),
+                "127.0.0.9",
+                Some(27431)
+            )
+        ));
         assert!(
-            !g.is_self_traffic(&ep(L4Proto::Icmp, "127.0.0.1", None, "127.0.0.1", None)),
+            g.admit_endpoints(
+                "en0",
+                &ep(L4Proto::Icmp, "127.0.0.1", None, "127.0.0.1", None)
+            ),
             "no ports, no self traffic"
         );
         assert!(
-            !g.is_self_traffic(&ep(
-                L4Proto::Tcp,
-                "::ffff:10.0.0.5",
-                Some(51000),
-                "::ffff:10.0.0.9",
-                Some(27431)
-            )),
+            g.admit_endpoints(
+                "en0",
+                &ep(
+                    L4Proto::Tcp,
+                    "::ffff:10.0.0.5",
+                    Some(51000),
+                    "::ffff:10.0.0.9",
+                    Some(27431)
+                )
+            ),
             "a mapped non-loopback address is not loopback"
         );
 
         g.set_self_ports(std::iter::empty());
         assert!(g.self_ports().is_empty(), "set to empty clears the set");
-        assert!(!g.is_self_traffic(&bus));
+        assert!(g.admit_endpoints("en0", &bus));
     }
 
     /// A crafted TCP frame `src:sp → dst:dp` (IPv4 or IPv6 by address family)
@@ -1047,19 +1060,31 @@ mod tests {
     }
 
     /// The BPF self-exclusion clause the capture (and the send_recv reply
-    /// capture) AND into their filters: `None` with no self ports, `not port P`
-    /// for one, `not (port A or port B)` ascending for several.
+    /// capture) AND into their filters on a loopback interface: `None` with no
+    /// self ports, `not port P` for one, `not (port A or port B)` ascending for
+    /// several; `None` on a non-loopback interface whatever the set, since a
+    /// remote target may answer from a port number the core also listens on.
     #[test]
     fn self_exclusion_bpf_clause() {
         let g = L4Guard::new(&cfg());
-        assert_eq!(g.self_exclusion_bpf(), None);
+        assert_eq!(g.self_exclusion_bpf("lo0"), None);
         g.set_self_ports([27431]);
-        assert_eq!(g.self_exclusion_bpf(), Some("not port 27431".to_string()));
+        assert_eq!(
+            g.self_exclusion_bpf("lo0"),
+            Some("not port 27431".to_string())
+        );
+        assert_eq!(
+            g.self_exclusion_bpf("lo"),
+            Some("not port 27431".to_string())
+        );
         g.set_self_ports([28182, 27431]);
         assert_eq!(
-            g.self_exclusion_bpf(),
+            g.self_exclusion_bpf("lo0"),
             Some("not (port 27431 or port 28182)".to_string())
         );
+        for nic in ["en0", "eth0", "utun3", ""] {
+            assert_eq!(g.self_exclusion_bpf(nic), None, "{nic:?} is not loopback");
+        }
     }
 
     /// L4PAR-AC34 (tester): which interface names count as loopback.

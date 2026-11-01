@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime};
 use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
-use crate::guard::{is_loopback_interface, L4Guard, L4Permit};
+use crate::guard::{L4Guard, L4Permit};
 use crate::types::{
     IpCidr, L4Action, L4Capability, L4Direction, L4Proto, L4ScopeEntry, L4Target, PortRange,
 };
@@ -311,10 +311,7 @@ pub fn start_capture(
 #[must_use]
 pub fn scope_filter(guard: &L4Guard, interface: &str) -> Option<String> {
     let scope = scope_clause(guard, interface);
-    if !is_loopback_interface(interface) {
-        return scope;
-    }
-    let Some(exclusion) = guard.self_exclusion_bpf() else {
+    let Some(exclusion) = guard.self_exclusion_bpf(interface) else {
         return scope;
     };
     Some(match scope {

@@ -36,7 +36,7 @@ use etherparse::{NetSlice, TransportSlice};
 use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::craft::PacketSpec;
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
-use crate::guard::{is_loopback_interface, L4Guard, L4GuardError};
+use crate::guard::{L4Guard, L4GuardError};
 use crate::types::{L4Action, L4Direction, L4Proto, L4Target};
 use crate::wire::send_on_wire;
 
@@ -191,53 +191,48 @@ pub fn send_recv(
     // `capture::scope_filter` does for a background capture (L4PAR-AC34, spec
     // §2.1): the core's own frames — the bus's plaintext token line among them —
     // are not even delivered. `L4Guard::admit_frame` in `await_reply` is the
-    // authoritative second boundary. A non-loopback interface is left unfiltered:
-    // a remote target may legitimately answer from a port number the core also
-    // happens to listen on locally.
-    let reply_filter = if is_loopback_interface(&iface) {
-        guard.self_exclusion_bpf()
-    } else {
-        None
-    };
+    // authoritative second boundary. `self_exclusion_bpf` is `None` on a
+    // non-loopback interface, which is left unfiltered on purpose.
+    let reply_filter = guard.self_exclusion_bpf(&iface);
 
     // The `!Send` libpcap source is opened, the stimulus injected, and the reply
     // awaited all on one dedicated thread: the handle never crosses a boundary and
     // the capture is open *before* the inject, so a fast reply is not missed. The
     // permits move in and are released when the thread (hence the operation) ends.
     // The thread is scoped so it borrows the guard (the self-exclusion choke point
-    // every reply frame is asked of) rather than a copy of its state. The
-    // correlated reply is returned (not recorded here): the capture-scope re-check
-    // that gates recording stays with the caller.
-    let worker_iface = iface.clone();
-    let worker_store = store.clone();
+    // every reply frame is asked of), the interface name and the store rather
+    // than copies of them. The correlated reply is returned (not recorded here):
+    // the capture-scope re-check that gates recording stays with the caller.
     let (flow_id, outcome) = thread::scope(|s| {
+        let iface: &str = &iface;
+        let store: &dyn L4FlowStore = store.as_ref();
         let worker = s.spawn(move || -> Result<(L4FlowId, SendRecvOutcome), L4Error> {
             let mut inject_permit = inject_permit;
             let _capture_permit = capture_permit;
 
             // Open the capture first (fail-closed on missing privilege/libpcap).
-            let mut source = backend.open_capture(&worker_iface, reply_filter.as_deref(), poll)?;
+            let mut source = backend.open_capture(iface, reply_filter.as_deref(), poll)?;
 
             // Send the stimulus through the single guarded choke point.
-            send_on_wire(&mut inject_permit, backend.as_ref(), &worker_iface, &bytes)?;
+            send_on_wire(&mut inject_permit, backend.as_ref(), iface, &bytes)?;
 
             // The stimulus is on the wire: record it in a fresh SendRecv flow (no
             // stray flow if the open or the inject failed above).
-            let flow_id = worker_store.insert(L4Flow {
+            let flow_id = store.insert(L4Flow {
                 id: L4FlowId::new(),
                 kind: L4FlowKind::SendRecv,
                 bind: L4Bind {
-                    interface: worker_iface.clone(),
+                    interface: iface.to_string(),
                     filter: None,
                     queue: None,
                 },
                 packets: std::collections::VecDeque::new(),
                 metadata: L4Meta::default(),
             });
-            worker_store.append_packet(flow_id, make_packet(&bytes, L4Direction::Outbound, true));
+            store.append_packet(flow_id, make_packet(&bytes, L4Direction::Outbound, true));
 
             // Await the correlated reply, bounded by the timeout — never hangs.
-            let outcome = await_reply(source.as_mut(), guard, &worker_iface, &correlation, timeout);
+            let outcome = await_reply(source.as_mut(), guard, iface, &correlation, timeout);
             Ok((flow_id, outcome))
         });
         worker
