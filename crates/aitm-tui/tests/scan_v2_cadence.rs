@@ -448,3 +448,65 @@ fn status_followups_are_capped_per_fold_and_per_firing() {
     assert_eq!(distinct.len(), 32, "none duplicated");
     assert_eq!(app.scan.inflight.len(), 32);
 }
+
+/// D13 error granularity (fix round B, B7): a keyed verb's error is cleared
+/// only by a success under the same tag, so job B's success never clears job
+/// A's error; a single-slot verb keeps clearing on its own next success.
+#[test]
+fn a_keyed_error_is_cleared_only_by_the_same_key() {
+    let mut app = app();
+    let _ = app.on_bus(BusEvent::CallTaggedFailed {
+        tag: "scan.status:scan-aaaaaaaa".into(),
+        name: "scan.status".into(),
+        message: "boom".into(),
+    });
+    let err = app
+        .scan
+        .last_error
+        .clone()
+        .expect("the failure is recorded");
+    assert_eq!(err.tag, "scan.status:scan-aaaaaaaa");
+    assert_eq!(err.verb, "scan.status");
+    assert_eq!(err.wording(), "scan.status: boom");
+
+    let mut sibling = fixture("scan.status.json");
+    sibling["job"] = json!("scan-bbbbbbbb");
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.status:scan-bbbbbbbb".into(),
+        name: "scan.status".into(),
+        value: sibling,
+    });
+    assert_eq!(
+        app.scan.last_error.as_ref().map(|e| e.tag.as_str()),
+        Some("scan.status:scan-aaaaaaaa"),
+        "job B's success leaves job A's error"
+    );
+
+    let mut same = fixture("scan.status.json");
+    same["job"] = json!("scan-aaaaaaaa");
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.status:scan-aaaaaaaa".into(),
+        name: "scan.status".into(),
+        value: same,
+    });
+    assert_eq!(app.scan.last_error, None, "job A's own success clears it");
+
+    let _ = app.on_bus(BusEvent::CallTaggedFailed {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        message: "boom".into(),
+    });
+    assert_eq!(
+        app.scan.last_error.as_ref().map(|e| e.tag.as_str()),
+        Some("scan.list")
+    );
+    let _ = app.on_bus(BusEvent::CallTaggedOk {
+        tag: "scan.list".into(),
+        name: "scan.list".into(),
+        value: json!({ "jobs": [] }),
+    });
+    assert_eq!(
+        app.scan.last_error, None,
+        "a single-slot verb clears as before"
+    );
+}

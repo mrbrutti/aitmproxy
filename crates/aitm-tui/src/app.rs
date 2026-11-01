@@ -29,7 +29,8 @@ use crate::model::{
 use crate::open::{self, OpenTarget};
 use crate::scan::{
     is_job_id, parse_result, step, tag_keyed, tag_parts, ScanError, ScanOffer, ScanState, ScanTab,
-    LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_JOB, STATUS_POLL_TICKS,
+    ISSUES_PAGE_LIMIT, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_JOB,
+    STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -3992,7 +3993,7 @@ impl App {
         if let Some(j) = &f.job {
             args.insert("job".into(), json!(j));
         }
-        args.insert("limit".into(), json!(512));
+        args.insert("limit".into(), json!(ISSUES_PAGE_LIMIT));
         Value::Object(args)
     }
 
@@ -4092,36 +4093,60 @@ impl App {
     }
 
     /// A tagged `scan.*` call answered: settle the tag and fold the reply by
-    /// verb (spec D10). A reply that does not match the contract leaves the
-    /// state and records a `ScanError { code: None }`. No `Refresh` is ever
-    /// pushed from here (D4). Later tasks add their verbs to this match.
+    /// verb (spec D10) through [`App::scan_reply`]. A reply that does not
+    /// match the contract leaves the state and records a
+    /// `ScanError { code: None }`. No `Refresh` is ever pushed from here
+    /// (D4). Later tasks add their verbs to this match.
     fn on_scan_ok(&mut self, tag: &str, name: &str, value: Value, out: &mut Vec<BusRequest>) {
         self.scan.inflight.remove(tag);
         match name {
-            "scan.status" | "scan.cancel" => match parse_result::<JobStatus>(name, &value) {
-                // D6 hostile-core bound: the reply is folded only under the
-                // job the tag asked about, so a core cannot mint a new live
-                // job (and a new poll) per reply.
-                Ok(status) if Some(status.job.as_str()) == tag_parts(tag).1 => {
-                    self.scan.clear_error(name);
-                    self.scan.jobs.fold_status(status);
+            "scan.status" | "scan.cancel" => {
+                if let Some(status) = self.scan_reply::<JobStatus>(tag, name, &value) {
+                    // D6 hostile-core bound: the reply is folded only under
+                    // the job the tag asked about, so a core cannot mint a
+                    // new live job (and a new poll) per reply.
+                    if Some(status.job.as_str()) == tag_parts(tag).1 {
+                        self.scan.jobs.fold_status(status);
+                    } else {
+                        self.scan.set_error(ScanError {
+                            tag: tag.to_string(),
+                            verb: name.to_string(),
+                            code: None,
+                            detail: OTHER_JOB.to_string(),
+                        });
+                    }
                 }
-                Ok(_) => self.scan.set_error(ScanError {
-                    verb: name.to_string(),
-                    code: None,
-                    detail: OTHER_JOB.to_string(),
-                }),
-                Err(e) => self.scan.set_error(e),
-            },
-            "scan.list" => match parse_result::<ListResult>(name, &value) {
-                Ok(list) => {
-                    self.scan.clear_error(name);
+            }
+            "scan.list" => {
+                if let Some(list) = self.scan_reply::<ListResult>(tag, name, &value) {
                     let followups = self.scan.jobs.fold_list(list);
                     self.request_scan_statuses(followups.iter().map(String::as_str), out);
                 }
-                Err(e) => self.scan.set_error(e),
-            },
+            }
             _ => {}
+        }
+    }
+
+    /// Parse a `scan.*` reply into its D10 type (fix round B, B6: the one
+    /// parse / clear-or-set scaffold every verb arm shares). A match clears
+    /// the error this tag left behind (D13) and is returned for the fold; a
+    /// mismatch records the contract error under the tag and yields `None`,
+    /// so the prior state stays on screen.
+    fn scan_reply<T: serde::de::DeserializeOwned>(
+        &mut self,
+        tag: &str,
+        name: &str,
+        value: &Value,
+    ) -> Option<T> {
+        match parse_result::<T>(name, value) {
+            Ok(parsed) => {
+                self.scan.clear_error(tag);
+                Some(parsed)
+            }
+            Err(e) => {
+                self.scan.set_error(e.tagged(tag));
+                None
+            }
         }
     }
 
@@ -4136,7 +4161,8 @@ impl App {
         _out: &mut Vec<BusRequest>,
     ) {
         self.scan.inflight.remove(tag);
-        self.scan.set_error(ScanError::from_message(name, &message));
+        self.scan
+            .set_error(ScanError::from_message(name, &message).tagged(tag));
     }
 
     /// A `browser.*` call answered: fill the view. A navigate re-reads the

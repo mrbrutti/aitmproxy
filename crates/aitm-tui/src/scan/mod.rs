@@ -57,6 +57,9 @@ pub const LIST_POLL_TICKS: u64 = 40;
 /// one request per job in flight.
 pub const MAX_STATUS_FOLLOWUPS: usize = 16;
 
+/// The `limit` of every `scan.issues` page the TUI asks for (spec D6).
+pub const ISSUES_PAGE_LIMIT: usize = 512;
+
 impl ScanTab {
     /// The tab a `scan.*` verb's error line belongs to (spec D9: "the owning
     /// tab"). Launch, list, status and cancel are the Jobs tab's; the Jobs
@@ -119,7 +122,8 @@ pub struct ScanState {
     /// Tags of tagged calls awaiting their reply (dedupe, D6).
     pub inflight: BTreeSet<String>,
     /// The most recent `scan.*` failure, shown until the next successful
-    /// reply of that verb.
+    /// reply under the same tag (D13: a keyed verb's error outlives a
+    /// sibling key's success).
     pub last_error: Option<ScanError>,
     /// The tick the view was first opened on; `None` until then.
     pub opened_at_tick: Option<u64>,
@@ -139,14 +143,16 @@ impl ScanState {
         self.last_error = Some(err);
     }
 
-    /// A successful reply of `verb` clears the error it had left behind
-    /// (`last_error` is "shown until the next successful reply of that verb").
-    pub fn clear_error(&mut self, verb: &str) {
-        let same = |e: &Option<ScanError>| e.as_ref().is_some_and(|e| e.verb == verb);
+    /// A successful reply under `tag` clears the error that exact tag left
+    /// behind (spec D13): a single-slot verb's tag is the verb itself, a
+    /// keyed verb's is `<verb>:<key>`, so job B's success never clears job
+    /// A's error (fix round B, B7).
+    pub fn clear_error(&mut self, tag: &str) {
+        let same = |e: &Option<ScanError>| e.as_ref().is_some_and(|e| e.tag == tag);
         if same(&self.last_error) {
             self.last_error = None;
         }
-        match ScanTab::owning(verb) {
+        match ScanTab::owning(tag_parts(tag).0) {
             ScanTab::Profiles if same(&self.profiles.error) => self.profiles.error = None,
             ScanTab::SiteMap if same(&self.sitemap.error) => self.sitemap.error = None,
             ScanTab::Issues if same(&self.issues.error) => self.issues.error = None,
@@ -369,6 +375,11 @@ pub const OTHER_JOB: &str = "reply named a different job";
 /// A failed `scan.*` call, coded when the core's message carries a D9 code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanError {
+    /// The tag of the call that failed: the verb itself for a single-slot
+    /// verb, `<verb>:<key>` for a keyed one (spec D13: the error is cleared
+    /// by the next success under this exact tag, so job B's success never
+    /// clears job A's error).
+    pub tag: String,
     /// The verb that failed.
     pub verb: String,
     /// The parsed code, `None` for a message outside the `scan: <code>: ...`
@@ -384,11 +395,13 @@ impl ScanError {
     pub fn from_message(verb: &str, message: &str) -> Self {
         match ScanErrorCode::parse_message(message) {
             Some((code, detail)) => Self {
+                tag: verb.to_string(),
                 verb: verb.to_string(),
                 code: Some(code),
                 detail: detail.to_string(),
             },
             None => Self {
+                tag: verb.to_string(),
                 verb: verb.to_string(),
                 code: None,
                 detail: message.to_string(),
@@ -401,10 +414,18 @@ impl ScanError {
     /// this bus`.
     pub fn missing_verb(verb: &str) -> Self {
         Self {
+            tag: verb.to_string(),
             verb: verb.to_string(),
             code: None,
             detail: MISSING_VERB.to_string(),
         }
+    }
+
+    /// The same error under the tag of the call that produced it (a keyed
+    /// verb's `<verb>:<key>`); the constructors default the tag to the verb.
+    pub fn tagged(mut self, tag: &str) -> Self {
+        self.tag = tag.to_string();
+        self
     }
 
     /// The operator wording (spec D9): the code's fixed text, then `: `, then
@@ -464,6 +485,7 @@ pub fn parse_result<T: serde::de::DeserializeOwned>(
     value: &Value,
 ) -> Result<T, ScanError> {
     T::deserialize(value).map_err(|e| ScanError {
+        tag: verb.to_string(),
         verb: verb.to_string(),
         code: None,
         detail: format!("reply did not match the contract ({e})"),
