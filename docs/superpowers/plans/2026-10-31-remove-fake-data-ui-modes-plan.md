@@ -294,6 +294,24 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| W1–W4 | Tester | — | PASS on AC1/AC5-static/AC7/AC8/AC9/AC10; strengthened `src/bus/index.test.ts` (bridge host, expectRole, fragment edge cases) | tests committed in 77aed542 |
+| W1–W4 | Tester | note | AC5's live half not met at 77aed542: `scripts/selftest-live.mjs` lagged the core (37-tool pin, agent-role refusals, `findings.list limit`, closed-gap checks) | fixed by task W5 (0ec1dbdc): operator connection, current shapes → 23 PASS / 0 FAIL / 4 SKIP, exit 0 against the core built from this branch |
+| W1–W4 | Security | Minor | README called `?perf=1` dev-only; `src/viewers/perf.ts` logs inspector timings in any build | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `AgentNotification.origin` comment claimed `mac`/`web`/`tui` are read as human | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | three sample `ScriptInfo` rows and the toggle reply duplicated between `Scripts.test.tsx` and `Sidebar.test.tsx` | accepted (autonomous mode, orchestrator 2026-11-01): spec D6 asks each test for its own inline inputs |
+| W1–W4 | Quality | Minor | `MemoryBusOptions.flows` / `.status` had no caller | fixed in 1b49d25d (deleted) |
+| W1–W4 | Quality | Minor | dead `address` parameters on `bridgeBus()` / `withStatus()` | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `onFlowEvent` one-line shim with a single caller | fixed in 1b49d25d (`onFlowTrigger` called directly) |
+| W1–W4 | Quality | Minor | `index.test.ts` malformed-token case asserted `not.toBeNull()` | fixed in 1b49d25d (`'\uFFFD%A'` pinned) |
+| W1–W4 | Quality | Minor | redundant regex after an exact-text assertion in `Scripts.test.tsx` | fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `SCRIPT_TOOLS`/`HOST_TOOLS` duplication and an unreachable `default` | fixed in 1b49d25d |
+| W1–W4 | Quality + Spec | Minor | `tools` replaced the default catalogue so callers re-spelt it; `SERVED_TOOLS` exported beyond the plan | fixed in 1b49d25d (`extraTools`; `SERVED_TOOLS` module-private) |
+| W1–W4 | Quality | Minor | `flow()` exported with one user; `lastError` a signal whose setter is discarded | `flow()` accepted (spec D6 names it); `lastError` fixed in 1b49d25d |
+| W1–W4 | Quality | Minor | `PocRun.description` carried a boolean's doc comment | fixed in 1b49d25d |
+| W1–W4 | Spec | Minor | README has two sections beyond the plan (Layout, `?perf=1`) | accepted (autonomous mode, orchestrator 2026-11-01): both accurate; the perf note records that the mock's `rate=` stream is gone |
+| W1–W4 | Spec | note | sanctioned deviations: `normalize.test.ts` reworded in W3, `export.ts:89` / `model.ts:34` comments in W4 (orchestrator additions); `app.resync.test.ts` listed as "modify" but never imported the mock | recorded |
+| W1–W5 | Spec | note | plan text drift after the fix task: `bridgeBus()` / `withStatus()` lost their `address` parameter, `MemoryBusOptions` is `{ tools?, extraTools?, scripts?, address? }`; W3's grep claim about `import.meta.env.DEV` hits the pre-existing `src/shell/perf.ts:59` | recorded; the code is the record |
+| W5 | Coder | note | F4 stays SKIP with honest text (the script does not subscribe); a `flow.subscribe` probe is a follow-up | recorded |
 
 ## Shipped
 
