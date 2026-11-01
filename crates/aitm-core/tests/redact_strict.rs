@@ -178,7 +178,7 @@ fn scrub_strict_masks_every_pass_and_keeps_the_benign() {
     t.row("see Cookie: a=b; c=d\nnext", "see Cookie: [redacted]\nnext");
     t.row("pass: a b\nok", "pass: [redacted]\nok");
     t.unchanged("Cookie:");
-    // Regression (found by fuzzing): `scrub_text` already masked the next line and
+    // Regression: `scrub_text` already masked the next line and
     // kept the CRLF inside its match, so the header's value is whitespace alone
     // (U+2028 is whitespace to it). P2 must not rewrite that whitespace, or a second
     // `scrub_text` eats the CR (its `.+` matches a CR) and the second pass differs.
@@ -191,6 +191,14 @@ fn scrub_strict_masks_every_pass_and_keeps_the_benign() {
     // P3: Basic, Negotiate and NTLM credentials.
     t.row("use Basic dXNlcjpwYXNz now", "use Basic [redacted] now");
     t.row("negotiate AAAAAAAAAAAAAAAAAAAA", "negotiate [redacted]");
+
+    // P3 at its length gate: a Basic token of exactly 8 characters that decodes to
+    // `user:pass` is masked, one of 7 is not, and the same at the port gate: five
+    // digits are a port, six are not.
+    t.row("use Basic dTpwYXNz now", "use Basic [redacted] now");
+    t.unchanged("use Basic dTpwYXN now");
+    t.unchanged("pass.example.com:65535");
+    t.row("pass.example.com:655350", "pass.example.com: [redacted]");
 
     // P3 gates: a Basic token of 8 or more characters that decodes to no `:`
     // ("foobar"), and a Negotiate or NTLM token one character short of 16, stay.
@@ -302,8 +310,8 @@ fn scrub_strict_masks_every_pass_and_keeps_the_benign() {
     );
     t.unchanged("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----");
 
-    // Regressions found by fuzzing, each a case where one mask changed how a
-    // neighbour read, so that a second call masked what the first left. A name glued
+    // Regressions, each a case where one mask changed how a neighbour read, so
+    // that a second call masked what the first left. A name glued
     // to the closing dashes stays: the block is masked before any other pass runs, so
     // the name is read as a name by the first call, and its value is masked with it.
     t.row(
@@ -431,6 +439,9 @@ fn is_secret_key_strict_vocabulary() {
         "sessionKey",
         "userPASS",
         "user2Pass",
+        "privatekey",
+        "signing_key",
+        "accesskey",
         "oauth2Token",
         // Everything the shared `is_secret_key` says stays true.
         "token",
@@ -470,8 +481,9 @@ fn is_secret_key_strict_vocabulary() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Shapes the fuzzer found where one call did not leave a fixed point. Each is
-/// `scrub_strict`'s to settle: the result of a second call must equal the first.
+/// Shapes from a fuzz run (a sample, not all there are) where one round did not
+/// leave a fixed point. Each changes under `scrub_strict`, and the result of a second
+/// call must equal the first.
 const FUZZ_FOUND_SHAPES: &[&str] = &[
     // The value rule masks a trailing backslash, so a quote stops being escaped.
     "secret=\"\rpw\n:\\\"",
@@ -514,12 +526,15 @@ const FUZZ_FOUND_SHAPES: &[&str] = &[
 
 #[test]
 fn shapes_found_by_fuzzing_are_fixed_points() {
-    // scrub_strict runs its passes again until the text stops changing, so a second
-    // call over any output changes nothing, including the shapes that no single
-    // round settles.
+    // scrub_strict runs its rounds again until the text stops changing, so a second
+    // call over the result changes nothing for these shapes, which no single round
+    // settles. Each must also change: a shape the passes leave alone settles nothing.
     let mut failures = Vec::new();
     for shape in FUZZ_FOUND_SHAPES {
         let first = scrub_strict(shape);
+        if first == *shape {
+            failures.push(format!("{shape:?} is not changed by scrub_strict"));
+        }
         let second = scrub_strict(&first);
         if first != second {
             failures.push(format!("{shape:?}: first {first:?}, second {second:?}"));
@@ -743,6 +758,14 @@ fn rust_debug_wrappers_around_a_secret_are_masked_whole() {
         "Object({\n    \"password\": Str(\n        \"CNRYx9q7\",\n    ),\n})",
         "Object({\n    \"password\": [redacted],\n})",
     );
+    t.row(
+        r#"Config { token: Some({"a": 1}) }"#,
+        "Config { token: [redacted] }",
+    );
+    t.row(
+        r#"got Object({"password": Array([Str("a)b")])})"#,
+        r#"got Object({"password": [redacted]})"#,
+    );
     // Text cut by a cap in the middle of the string.
     t.row(
         r#"got Object({"password": Str("CNRYx9"#,
@@ -935,6 +958,20 @@ fn xml_elements_with_a_secret_name_are_masked() {
         r#"<password hint="a>b">[redacted]</password>"#,
     );
     t.row("<password>CNRYx9q7", "<password>[redacted]");
+    // The start tag of a secret element holds frames of its own. A pair whose value
+    // is not quoted is read to the next delimiter, which `>` is not, so the rest of
+    // the tag and its content go with it: more is masked, never less.
+    t.row(r#"<pw="CNRYx9q7">)"#, r#"<pw="[redacted]">[redacted]"#);
+    t.row(r#"<pw=Str("CNRYx9q7")>)"#, "<pw=[redacted]");
+    t.row(r#"<otp: Some("CNRYx9q7")>'"#, "<otp: [redacted]");
+    t.row(
+        r#"<token pass=\"CNRYx9q7\">x</token>"#,
+        "<token pass=[redacted]",
+    );
+    // A frame in the start tag that runs past the start of the content covers it,
+    // to the end of the text or to a closer further on.
+    t.row("<otp: Some([>x</otp>", "<otp: [redacted]");
+    t.row("<otp: Some([>x</otp>]) tail", "<otp: [redacted] tail");
     // Not secret names, empty elements, and a tag that is not closed.
     t.unchanged("<author>bob</author>");
     t.unchanged("<passed>yes</passed>");
@@ -979,6 +1016,24 @@ fn multipart_fields_with_a_secret_name_are_masked() {
         "name=\"api_token\"\r\nContent-Type: text/plain\r\n\r\nCNRYx9q7\r\n--b",
         "name=\"api_token\"\r\nContent-Type: text/plain\r\n\r\n[redacted]\r\n--b",
     );
+    // A value of several lines runs to the boundary line, or to the end of the text.
+    t.row(
+        "name=\"private_key\"\r\n\r\nline1\r\nCNRYx9q7\r\n--b--",
+        "name=\"private_key\"\r\n\r\n[redacted]\r\n--b--",
+    );
+    t.row(
+        "name=\"private_key\"\n\nline1\nCNRYx9q7\n--b",
+        "name=\"private_key\"\n\n[redacted]\n--b",
+    );
+    t.row(
+        "name=\"password\"\r\n\r\nline1\r\nline2",
+        "name=\"password\"\r\n\r\n[redacted]",
+    );
+    // Only a line that starts with two dashes is a boundary.
+    t.row(
+        "name=\"password\"\r\n\r\nline1\r\n-x\r\nline3\r\n--b",
+        "name=\"password\"\r\n\r\n[redacted]\r\n--b",
+    );
     // Other fields, an empty value, and a `name` with no part body after it.
     t.unchanged("name=\"username\"\r\n\r\nalice\r\n--b");
     t.unchanged("name=\"password\"\r\n\r\n\r\n--b");
@@ -1019,6 +1074,7 @@ fn cli_flags_with_a_secret_name_are_masked() {
     t.unchanged("run --user admin");
     t.unchanged("run --token");
     t.unchanged("run -p hunter2");
+    t.unchanged("run -token x");
 
     // Hostile, 2 MiB: a flag that is the value of the one before it.
     t.hostile_completes("`--token ` x N", "--token ".repeat((2 << 20) / 8 + 1));
@@ -1065,6 +1121,13 @@ fn the_pair_value_rule_matches_scrub_text() {
         "='a b y='c' z",
         "=\"a b' c=d",
         ":\"a b\" ,\"c\":\"d\"",
+        // Whitespace around the separator, and a quote that is not an opener.
+        "\u{a0}=abc def",
+        "=\u{a0}abc def",
+        "=\u{b}abc def",
+        "=\"a b y=\"]c",
+        "=\"a b y=\t\"c\" z",
+        "=\"a b y:\"c\" z",
     ];
     let mut failures = Vec::new();
     for tail in tails {
@@ -1095,8 +1158,9 @@ fn scrub_text_after(text: &str, prefix: &str) -> Option<String> {
 
 #[test]
 fn every_prefix_of_every_shape_fires() {
-    // (prefixes, one body character, the shortest body). A table that gained a
-    // prefix without a way to reach it would fail here.
+    // The prefixes the spec names (Design 14.3, P5), each with one body character
+    // and the shortest body: a prefix the table lacks or misspells fails here. The
+    // table's own entries are walked by a test in the module.
     let shapes: &[(&[&str], &str, usize)] = &[
         (
             &["AKIA", "ASIA", "AGPA", "AIDA", "AROA", "ANPA", "ANVA"],
@@ -1112,10 +1176,8 @@ fn every_prefix_of_every_shape_fires() {
         (&["AIza"], "a", 35),
     ];
     let mut failures = Vec::new();
-    let mut prefixes = 0;
     for (names, body, shortest) in shapes {
         for prefix in *names {
-            prefixes += 1;
             let full = format!("{prefix}{}", body.repeat(*shortest));
             let short = format!("{prefix}{}", body.repeat(shortest - 1));
             let glued = format!("x{full}");
@@ -1132,10 +1194,6 @@ fn every_prefix_of_every_shape_fires() {
             }
         }
     }
-    assert_eq!(
-        prefixes, 25,
-        "the list above names every prefix of the shape table (7 AWS, 5 GitHub, 1 github_pat, 1 GitLab, 5 Slack, 4 Stripe, 1 sk-, 1 Google)"
-    );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -1202,8 +1260,234 @@ fn a_bounded_scrub_cuts_first_and_masks_what_straddles_the_cut() {
 }
 
 #[test]
+fn bracketed_values_under_a_secret_key_are_masked_whole() {
+    // A `[..]` or `{..}` value is one group: its quotes and brackets are read, and a
+    // group that is not closed (a text cut by a cap) runs to the end of the text, so
+    // the mask fails closed.
+    let mut t = Table::default();
+    t.row(
+        r#"{"passwords":["CNRYx9q7","CNRYx9q72"]}"#,
+        r#"{"passwords":[redacted]}"#,
+    );
+    t.row(
+        r#"{"cookies":[{"name":"sid","value":"CNRYx9q7"}]}"#,
+        r#"{"cookies":[redacted]}"#,
+    );
+    t.row(
+        r#"{"auth":{"u":"a","v":"CNRYx9q7"}}"#,
+        r#"{"auth":[redacted]}"#,
+    );
+    t.row(r#"{"secret":{"v":"C"}}"#, r#"{"secret":[redacted]}"#);
+    t.row(r#"{"tokens":["C"]}"#, r#"{"tokens":[redacted]}"#);
+    t.row(r#"{"api_key":["C"]}"#, r#"{"api_key":[redacted]}"#);
+    t.row(r#"{'password': ['C']}"#, "{'password': [redacted]}");
+    t.row(r#"password = ["C"]"#, "password = [redacted]");
+    // The extra vocabulary and camelCase names are read the same way.
+    t.row(r#"{"pass":["C"]}"#, r#"{"pass":[redacted]}"#);
+    t.row(r#"{"userPass":{"v":"C"}}"#, r#"{"userPass":[redacted]}"#);
+    // A closing bracket inside a string, in either quote, and an escaped quote.
+    t.row(r#"{"tokens":["a]b","c"]}"#, r#"{"tokens":[redacted]}"#);
+    t.row(r#"{'tokens': ['a]b', 'c']}"#, "{'tokens': [redacted]}");
+    t.row(r#"{"tokens":["a\"]b"]}"#, r#"{"tokens":[redacted]}"#);
+    // What follows the group stays.
+    t.row(
+        r#"{"passwords":["a"],"user":"u"}"#,
+        r#"{"passwords":[redacted],"user":"u"}"#,
+    );
+    // A group that is cut.
+    t.row(r#"{"passwords":["CNRYx9"#, r#"{"passwords":[redacted]"#);
+    // Names that are not secret keep their groups.
+    t.unchanged(r#"{"user":["a","b"]}"#);
+    t.unchanged(r#"{"passed":[1]}"#);
+    t.unchanged(r#"{"items":[{"name":"x"}]}"#);
+
+    // Hostile, 2 MiB each: groups that never close, and that close at once.
+    t.hostile_completes(
+        "`password: [` x N",
+        "password: [".repeat((2 << 20) / 11 + 1),
+    );
+    t.hostile_completes(
+        "`\"tokens\":[]` x N",
+        r#""tokens":[]"#.repeat((2 << 20) / 11 + 1),
+    );
+    t.hostile_completes(
+        "`secret: {\"` x N",
+        r#"secret: {""#.repeat((2 << 20) / 10 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn bracket_notation_form_keys_are_pairs() {
+    // `user[password]=x` is a form field named `user[password]`: the key is judged on
+    // the whole text, brackets and all, and the value is read as any pair's value.
+    let mut t = Table::default();
+    t.row(
+        "user[password]=CNRYx9q7&user[token]=CNRYx9q7",
+        "user[password]=[redacted]&user[token]=[redacted]",
+    );
+    t.row("login[password]=C", "login[password]=[redacted]");
+    t.row(
+        "password[]=C&password[]=C2",
+        "password[]=[redacted]&password[]=[redacted]",
+    );
+    t.row(
+        "user[pass]=C&a[userPass]=D",
+        "user[pass]=[redacted]&a[userPass]=[redacted]",
+    );
+    t.row("a[b][password]=C", "a[b][password]=[redacted]");
+    t.row("x user[password]=C y", "x user[password]=[redacted] y");
+    t.row("user[password]: x y", "user[password]: [redacted] y");
+    t.row(
+        "user[password]=\"a b\"&x=1",
+        "user[password]=\"[redacted]\"&x=1",
+    );
+    t.row("user[password]=C\nok", "user[password]=[redacted]\nok");
+    // Fields and indexes that are not secret keep their values.
+    t.unchanged("a[b]=c");
+    t.unchanged("items[0]=x");
+    t.unchanged("redirect[url]=https://x/");
+    t.unchanged("user[name]=bob&user[email]=a@b.test");
+    t.unchanged("a[b=c");
+    t.unchanged("a[b c]=d");
+
+    // Hostile, 2 MiB each: groups that never close, and key after key.
+    t.hostile_completes("`a[` x N", "a[".repeat((2 << 20) / 2 + 1));
+    t.hostile_completes(
+        "`user[password]=x&` x N",
+        "user[password]=x&".repeat((2 << 20) / 17 + 1),
+    );
+    t.finish();
+}
+
+#[test]
+fn userinfo_may_hold_a_quote_and_ends_at_the_quote_that_opened_the_url() {
+    // A password can hold an apostrophe or a double quote. A quote ends the authority
+    // only when it is the quote that stands in front of the scheme.
+    let mut t = Table::default();
+    t.row("https://u:O'Brien@h/x", "https://u:[redacted]@h/x");
+    t.row(
+        "postgres://u:O'Brien@db:5432/x",
+        "postgres://u:[redacted]@db:5432/x",
+    );
+    t.row("redis://:O'Brien@h:6379", "redis://:[redacted]@h:6379");
+    t.row("ftp://u:p'w'd@h", "ftp://u:[redacted]@h");
+    t.row("https://u:p\"w@h/x", "https://u:[redacted]@h/x");
+    // Quoted URLs: the opening quote ends the authority, the other quote does not.
+    t.row("\"https://u:O'Brien@h/x\"", "\"https://u:[redacted]@h/x\"");
+    t.row("'https://u:p\"w@h/x'", "'https://u:[redacted]@h/x'");
+    t.row("'https://u:pw@h'", "'https://u:[redacted]@h'");
+    t.row("\"https://u:pw@h\" x", "\"https://u:[redacted]@h\" x");
+    // A URL with no userinfo, then a quote and an address.
+    t.unchanged("see 'https://h' and 'a@b.com'");
+    t.unchanged("\"https://h/x\" \"a@b\"");
+    t.unchanged("{\"url\":\"https://h\",\"mail\":\"a@b.test\"}");
+
+    // Hostile, 2 MiB each: quoted URLs, and apostrophes in one endless authority.
+    t.hostile_completes(
+        "`'https://a:b@h' ` x N",
+        "'https://a:b@h' ".repeat((2 << 20) / 16 + 1),
+    );
+    t.hostile_completes(
+        "`https://` + `a'@` x N",
+        format!("https://{}", "a'@".repeat((2 << 20) / 3 + 1)),
+    );
+    t.finish();
+}
+
+#[test]
+fn curl_user_flags_mask_the_password_part() {
+    // `-u user:password`, `--user` and `--proxy-user` carry a password after the
+    // first colon of the next word. A word with no colon has none.
+    let mut t = Table::default();
+    t.row(
+        "curl --user admin:CNRYx9q7 https://x.test",
+        "curl --user admin:[redacted] https://x.test",
+    );
+    t.row(
+        "curl -u user:pw https://x",
+        "curl -u user:[redacted] https://x",
+    );
+    t.row(
+        "curl --proxy-user u:p https://x",
+        "curl --proxy-user u:[redacted] https://x",
+    );
+    t.row("curl -U u:p https://x", "curl -U u:[redacted] https://x");
+    t.row("run -u a:b:c x", "run -u a:[redacted] x");
+    t.row("run -u 'admin:pa ss' x", "run -u 'admin:[redacted]' x");
+    t.row("run -u \"a:b\" x", "run -u \"a:[redacted]\" x");
+    t.row("run -u\tu:p x", "run -u\tu:[redacted] x");
+    // A word with no colon, an empty password, no word, and a flag in a word.
+    t.unchanged("run -u admin x");
+    t.unchanged("run --user admin");
+    t.unchanged("run -u admin:");
+    t.unchanged("run -u");
+    t.unchanged("run -u --verbose");
+    t.unchanged("run --username a:b");
+    t.unchanged("run x-u u:p");
+    t.finish();
+}
+
+#[test]
 fn is_benign_header_table() {
+    // The names of the spec (Design 14.2, 43 of them) less `sec-websocket-protocol`.
+    let spec_names = [
+        "accept",
+        "accept-charset",
+        "accept-encoding",
+        "accept-language",
+        "accept-ranges",
+        "access-control-request-headers",
+        "access-control-request-method",
+        "cache-control",
+        "connection",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-length",
+        "content-type",
+        "date",
+        "dnt",
+        "expect",
+        "forwarded",
+        "host",
+        "if-modified-since",
+        "if-unmodified-since",
+        "origin",
+        "pragma",
+        "range",
+        "referer",
+        "sec-websocket-extensions",
+        "sec-websocket-version",
+        "te",
+        "transfer-encoding",
+        "upgrade",
+        "upgrade-insecure-requests",
+        "user-agent",
+        "via",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-proto",
+        "x-http-method-override",
+        "x-original-url",
+        "x-real-ip",
+        "x-requested-with",
+        "x-rewrite-url",
+    ];
+    assert_eq!(
+        spec_names.len(),
+        42,
+        "the spec lists 43 benign names and `sec-websocket-protocol` is not one of them now"
+    );
     let mut failures = Vec::new();
+    for name in spec_names {
+        for spelling in [name.to_string(), name.to_ascii_uppercase()] {
+            if !is_benign_header(&spelling) {
+                failures.push(format!("`{spelling}` should be benign"));
+            }
+        }
+    }
     for name in [
         "Accept",
         "CONTENT-TYPE",

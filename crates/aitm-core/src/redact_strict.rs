@@ -4,11 +4,12 @@
 //! scanner, the findings store and the PoC builder, so they are not edited for the
 //! audit log. This module calls them and adds to them, for the audit path only:
 //!
-//! - [`scrub_strict`]: one round is the PEM pre-pass, the frames pre-pass,
-//!   `scrub_text`, then the strict passes P2 (header lines), P3 (Basic, Negotiate
-//!   and NTLM credentials), P4 (URL userinfo), P5 (credential shapes with a
-//!   distinctive prefix) and P6 (pairs of the extra key words). The round is
-//!   repeated until its output stops changing, at most `MAX_ROUNDS` times.
+//! - [`scrub_strict`]: one round is the PEM pre-pass, the frames pre-pass, P1
+//!   (`scrub_text` itself, unchanged), then the strict passes P2 (header lines), P3
+//!   (Basic, Negotiate and NTLM credentials), P4 (URL userinfo), P5 (credential
+//!   shapes with a distinctive prefix) and P6 (pairs of the extra key words, and
+//!   form fields written with bracket groups). The round is repeated until its
+//!   output stops changing, at most `MAX_ROUNDS` times.
 //! - [`scrub_strict_bounded`]: `scrub_strict` over a text cut to a byte bound.
 //! - [`is_secret_key_strict`]: the shared vocabulary plus a few extra key words,
 //!   read in camelCase too.
@@ -17,10 +18,19 @@
 //!
 //! Every pass runs on **plain decoded text** (a string leaf, an error reason, a
 //! label), never on JSON text. Every pass is linear in the length of the text and
-//! replaces with the literal `[redacted]`. A mask can change how a neighbour reads,
-//! so one round does not always settle a text; the bounded repetition is what makes
-//! `scrub_strict(scrub_strict(x)) == scrub_strict(x)` hold on every input the fuzz
-//! has produced.
+//! replaces with the literal `[redacted]`.
+//!
+//! What is guaranteed: a mask can change how a neighbour reads, so one round does not
+//! always settle a text, and the rounds are repeated until it does. A second call over
+//! a result changes nothing for every input in the tests and for the shapes a fuzz run
+//! found (`FUZZ_FOUND_SHAPES` in the tests); no counter-example is known. A text that does not settle within
+//! `MAX_ROUNDS` rounds is returned as the last round left it, and is not claimed to
+//! be a fixed point.
+//!
+//! Accepted residuals, which no pass reads: a credential with no key, frame or known
+//! shape around it; percent-encoded frames and SQL (`SET PASSWORD = 'x'`); an XML
+//! attribute that holds a `<` (`<password a="x<y">C</password>`) and an element whose
+//! content starts with a comment or a child (`<password><!-- c -->C</password>`).
 
 use std::borrow::Cow;
 
@@ -196,10 +206,10 @@ pub fn is_benign_header(name: &str) -> bool {
 }
 
 /// Mask credential material in plain text. One round is the PEM pre-pass, the frames
-/// pre-pass, `scrub_text` (unchanged), then the strict passes in order: P2 header
+/// pre-pass, P1 (`scrub_text`, unchanged), then the strict passes in order: P2 header
 /// lines, P3 Basic, Negotiate and NTLM credentials, P4 URL userinfo, P5 credential
-/// shapes, P6 pairs of the extra key words. The round is repeated until it changes
-/// nothing (see below).
+/// shapes, P6 pairs of the extra key words and form fields written with bracket
+/// groups. The round is repeated until it changes nothing (see below).
 ///
 /// - **PEM pre-pass.** A private key block, from `-----BEGIN ... PRIVATE KEY-----`
 ///   (or the PGP `... PRIVATE KEY BLOCK-----`) through the matching `-----END ...`
@@ -211,13 +221,17 @@ pub fn is_benign_header(name: &str) -> bool {
 /// - **Frames pre-pass.** Values that `scrub_text` cuts in the wrong place, and
 ///   frames it does not read, before it can mangle them. Under a secret key (the
 ///   strict vocabulary, camelCase included): a Rust `Debug` wrapper (`Str("x")`,
-///   `Some(Str("x"))`, `Bytes([1, 2])`, nested, over several lines) and a value in
+///   `Some(Str("x"))`, `Bytes([1, 2])`, nested, over several lines), a value in
 ///   escaped quotes (`{\"password\":\"x\"}`, one level or two, to the quote with
-///   the same run of backslashes) are masked whole. Also an XML or HTML element
-///   with a secret name (`<password>x</password>`, attributes allowed, CDATA
-///   included), a multipart field (`name="password"`, then the part headers, a blank
-///   line and the value line) and a command-line flag (`--password x`, `--token
-///   'a b'`; `--key=x` is a pair) are masked.
+///   the same run of backslashes) and a `[..]` or `{..}` group (`"tokens":["x"]`,
+///   strings in either quote read, a group that is cut running to the end) are
+///   masked whole. Also an XML or HTML element with a secret name
+///   (`<password>x</password>`, CDATA included; the start tag is scanned for frames
+///   too), a multipart field (`name="password"`, then the part headers, a blank
+///   line and the value, which runs to the boundary line), a command-line flag
+///   (`--password x`, `--token 'a b'`; `--key=x` is a pair) and the password of a
+///   `user:password` flag (`-u`, `-U`, `--user`, `--proxy-user`: what follows the
+///   first colon of the word).
 /// - **P2.** The name `authorization`, `proxy-authorization`, `cookie`, `cookie2`
 ///   or `set-cookie` (ASCII case-insensitive, a whole name: not preceded by an
 ///   ASCII alphanumeric, `_`, `.` or `-`) followed by optional blanks and `:`
@@ -235,8 +249,10 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   `ntlm` followed by blanks and a token of 16 or more such characters masks the
 ///   token.
 /// - **P4.** In `scheme://userinfo@host`, the authority ends at the first `/`, `?`,
-///   `#`, blank or quote, and the userinfo is the text up to the last `@` before
-///   that, as a browser reads it. With a `:` the part after the first `:` is
+///   `#` or whitespace, and at the quote that stands in front of the scheme when the
+///   URL is in a quoted string (`'https://h'`); any other quote is part of the
+///   password (`O'Brien`). The userinfo is the text up to the last `@` of the
+///   authority, as a browser reads it. With a `:` the part after the first `:` is
 ///   masked and the user name stays (`https://user:[redacted]@host`); with no `:`
 ///   the whole userinfo is masked only when it is 20 or more bytes long or holds a
 ///   P5 shape (`ssh://git@host` stays). A userinfo with no scheme in front of it
@@ -251,20 +267,24 @@ pub fn is_benign_header(name: &str) -> bool {
 ///   header and four more segments, to its tag.
 /// - **P6.** A `key=value`, `key: value` or `"key":"value"` pair whose key is a
 ///   strict secret key that `scrub_text` does not know (an extra word, a camelCase
-///   name) is masked with the value rule of `scrub_text`. P2 has already taken a
-///   `pass: value` that starts a line.
+///   name) is masked with the value rule of `scrub_text`. A form field name written
+///   with bracket groups (`user[password]=x`, `password[]=x`, `a[b][token]=x`) is
+///   read as a pair under the whole vocabulary, shared words included, because
+///   `scrub_text` never read it. P2 has already taken a `pass: value` that starts a
+///   line.
 ///
 /// Plain text only: never call this over JSON text, where a line break is the two
 /// characters `\r\n` and a value is followed by `"}`.
 ///
-/// A fixed point: the round is repeated until its output equals its input, at most
-/// `MAX_ROUNDS` (four) times, so a second call over the result changes nothing. One
-/// round does not always settle a text, because a mask can change how a neighbour
-/// reads: masking a value that ends in a backslash un-escapes the quote after it, and
-/// masking a span can remove the `.` that made `scrub_text` read a host and a port,
-/// or a `/` that ended a P4 authority. A text the round leaves alone costs one
-/// round, and the work is at most four passes, each linear in the length of `text`.
-/// A text that has not settled after four rounds is returned as the fourth left it.
+/// The round is repeated until its output equals its input, at most `MAX_ROUNDS`
+/// (four) times. One round does not always settle a text, because a mask can change
+/// how a neighbour reads: masking a value that ends in a backslash un-escapes the
+/// quote after it, and masking a span can remove the `.` that made `scrub_text` read
+/// a host and a port, or a `/` that ended a P4 authority. A second call over the
+/// result changes nothing for every input in the tests and for the fuzz-found shapes
+/// there; no counter-example is known. A text the round leaves alone costs one round,
+/// and the work is at most four passes, each linear in the length of `text`. A text
+/// that has not settled after `MAX_ROUNDS` rounds is returned as the last one left it.
 pub fn scrub_strict(text: &str) -> String {
     converge(text, scrub_round)
 }
@@ -290,7 +310,7 @@ pub fn scrub_strict_bounded(text: &str, max_bytes: usize) -> String {
 }
 
 /// The most rounds [`scrub_strict`] runs over one text.
-const MAX_ROUNDS: usize = 4;
+const MAX_ROUNDS: usize = 6;
 
 /// Run `round` over `text` until its output equals its input, at most
 /// [`MAX_ROUNDS`] times, and return that output (the last one, when the text has
@@ -332,6 +352,12 @@ fn is_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
 }
 
+/// An ASCII alphanumeric or `_`: a word of an identifier (`Some`, `Str`), and the body
+/// alphabet of a `github_pat_` token.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 /// A space or a tab: the blank between a keyword and its token (P3), and the first
 /// byte of a folded header line (P2).
 fn is_space_or_tab(b: u8) -> bool {
@@ -365,7 +391,7 @@ fn is_zero_width(c: char) -> bool {
 /// rewritten here, and the CR after it then be eaten by a second `scrub_text` (its
 /// `.+` matches a CR), which breaks idempotence. `from` not on a char boundary, or
 /// past the end, is returned unchanged.
-fn skip_inline_blanks(text: &str, from: usize) -> usize {
+fn skip_blanks_in_line(text: &str, from: usize) -> usize {
     let Some(rest) = text.get(from..) else {
         return from;
     };
@@ -401,12 +427,15 @@ fn is_host_port(bytes: &[u8], start: usize, end: usize) -> bool {
 
 // What `scrub_text` does to a pair is private to `redact.rs`, which is not edited
 // for the audit log, so the frames pre-pass (`mask_value_frames`) and P6
-// (`mask_extra_pairs`) read a pair with copies of its helpers: `run_end`,
-// `blank_len`, `skip_unicode_blanks` (its `skip_blanks`), `ends_value`,
-// `unquoted_value_end`, `is_opening_quote` and `closing_quote`. They must end a
-// value where `scrub_text` ends it, and the test
-// `the_pair_value_rule_matches_scrub_text` holds the two together. A change to the
-// value rule there is a change here.
+// (`mask_extra_pairs`) read a pair with copies of its helpers: `is_name_byte` (its
+// `is_key_byte`), `is_ascii_ws` (its `is_ascii_blank`), `run_end`, `blank_len`,
+// `skip_blanks_and_breaks` (its `skip_blanks`), `ends_value`, `unquoted_value_end`,
+// `is_opening_quote` and `closing_quote`, and `is_host_port`, which here ends a port
+// at `/`, `?`, `#` or whitespace and not at the other value delimiters `scrub_text`
+// also accepts (P6 uses it only for keys `scrub_text` does not know, so the narrower
+// exemption masks more). They must end a value where `scrub_text` ends it, and the
+// test `the_pair_value_rule_matches_scrub_text` holds the two together. A change to
+// the value rule there is a change here.
 
 /// The index where the run of characters starting at `from` ends: at the first
 /// ASCII byte for which `ascii_continues` is false, at the first whitespace
@@ -449,7 +478,7 @@ fn blank_len(text: &str, i: usize) -> usize {
 
 /// The index of the first byte at or after `i` that does not start a whitespace
 /// character of any kind, a line break included.
-fn skip_unicode_blanks(text: &str, mut i: usize) -> usize {
+fn skip_blanks_and_breaks(text: &str, mut i: usize) -> usize {
     loop {
         match blank_len(text, i) {
             0 => return i,
@@ -642,10 +671,6 @@ fn is_ident_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
 
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 fn is_xml_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b':')
 }
@@ -666,14 +691,15 @@ fn quoted_end(bytes: &[u8], open: usize) -> usize {
 }
 
 /// The index just past the bracketed group that opens at `open` (a `[` or a `{`):
-/// brackets of every kind are counted, strings are skipped whole, and a group that
-/// never closes runs to the end of the text.
+/// brackets of every kind are counted, strings in either quote are skipped whole, and
+/// a group that never closes runs to the end of the text, so a mask over it fails
+/// closed.
 fn bracket_end(bytes: &[u8], open: usize) -> usize {
     let mut depth = 0usize;
     let mut k = open;
     while k < bytes.len() {
         match bytes[k] {
-            b'"' => {
+            b'"' | b'\'' => {
                 k = quoted_end(bytes, k);
                 continue;
             }
@@ -733,14 +759,14 @@ fn wrapper_frame_end(text: &str, value: usize) -> Option<usize> {
     let mut at = value;
     let mut depth = 0usize;
     let core = loop {
-        let ident_end = skip_while(bytes, at, is_ident_byte);
+        let ident_end = skip_while(bytes, at, is_word_byte);
         if !bytes.get(at).copied().is_some_and(is_ident_start)
             || bytes.get(ident_end) != Some(&b'(')
         {
             return None;
         }
         depth += 1;
-        at = skip_unicode_blanks(text, ident_end + 1);
+        at = skip_blanks_and_breaks(text, ident_end + 1);
         match bytes.get(at) {
             Some(b'"' | b'[' | b'{') => break at,
             Some(&b) if is_ident_start(b) => {}
@@ -772,24 +798,28 @@ fn separator_after_key(text: &str, key_end: usize) -> Option<usize> {
     if matches!(bytes.get(slashes_end), Some(b'"' | b'\'')) {
         at = slashes_end + 1;
     }
-    at = skip_unicode_blanks(text, at);
+    at = skip_blanks_and_breaks(text, at);
     matches!(bytes.get(at), Some(b'=' | b':')).then_some(at)
 }
 
-/// Whether `value` starts the shape of a frame that [`pair_frame`] reads: a run of
-/// backslashes and a quote, or `Ident(`. A cheap look, with no scan to a closer, so
-/// the key is not consulted for a value that is neither.
+/// Whether `value` starts the shape of a frame that [`pair_frame`] reads: a `[` or a
+/// `{`, a run of backslashes and a quote, or `Ident(`. A cheap look, with no scan to a
+/// closer, so the key is not consulted for a value that is none of them.
 fn starts_frame(bytes: &[u8], value: usize) -> bool {
+    if matches!(bytes.get(value), Some(b'[' | b'{')) {
+        return true;
+    }
     let slashes_end = skip_while(bytes, value, |b| b == b'\\');
     if slashes_end > value {
         return matches!(bytes.get(slashes_end), Some(b'"' | b'\''));
     }
-    let ident_end = skip_while(bytes, value, is_ident_byte);
+    let ident_end = skip_while(bytes, value, is_word_byte);
     bytes.get(value).copied().is_some_and(is_ident_start) && bytes.get(ident_end) == Some(&b'(')
 }
 
 /// The value span of a pair under a secret key whose value is a frame `scrub_text`
-/// reads wrongly: a value in escaped quotes, or a Rust `Debug` wrapper. The shape of
+/// reads wrongly: a value in escaped quotes, a Rust `Debug` wrapper, or a `[..]` or
+/// `{..}` group, which `scrub_text` would cut after its opening bracket. The shape of
 /// the frame is looked at first, then the key, and only then is the frame scanned to
 /// its end: a scan for a closer that a key which is not secret would cause, again and
 /// again, could add up to more than a pass over the text. A frame that is not closed
@@ -797,11 +827,13 @@ fn starts_frame(bytes: &[u8], value: usize) -> bool {
 fn pair_frame(text: &str, key_start: usize, key_end: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     let separator = separator_after_key(text, key_end)?;
-    let value = skip_unicode_blanks(text, separator + 1);
+    let value = skip_blanks_and_breaks(text, separator + 1);
     if !starts_frame(bytes, value) || !is_secret_key_strict(&text[key_start..key_end]) {
         return None;
     }
-    let end = escaped_frame_end(bytes, value).or_else(|| wrapper_frame_end(text, value))?;
+    let end = escaped_frame_end(bytes, value)
+        .or_else(|| wrapper_frame_end(text, value))
+        .or_else(|| matches!(bytes[value], b'[' | b'{').then(|| bracket_end(bytes, value)))?;
     Some((value, end))
 }
 
@@ -880,12 +912,33 @@ fn empty_line_end(window: &[u8]) -> Option<usize> {
     })
 }
 
-/// The value line of a multipart field named by a secret key: `name="password"`, the
-/// rest of that line and any further part header lines, an empty line, then the
-/// value up to the next line break. The field name is read within
+/// The index of the first line break at or after `from` that is followed by a
+/// boundary line (one that starts with `--`), or the end of the text.
+fn boundary_or_end(bytes: &[u8], from: usize) -> usize {
+    let mut k = from;
+    while k < bytes.len() {
+        if matches!(bytes[k], b'\r' | b'\n') {
+            let after = if bytes[k] == b'\r' && bytes.get(k + 1) == Some(&b'\n') {
+                k + 2
+            } else {
+                k + 1
+            };
+            if bytes[after..].starts_with(b"--") {
+                return k;
+            }
+        }
+        k += 1;
+    }
+    bytes.len()
+}
+
+/// The value of a multipart field named by a secret key: `name="password"`, the rest
+/// of that line and any further part header lines, an empty line, then the value up to
+/// the boundary line, or to the end of the text when there is none (a value may run
+/// over several lines, and the first line is not all of it). The field name is read within
 /// [`MULTIPART_FIELD_MAX`] bytes and the blank line looked for within
 /// [`MULTIPART_HEADER_WINDOW`], so a field name repeated without a part body costs a
-/// constant each. `None` for an empty value.
+/// constant each, and a masked value is consumed. `None` for an empty value.
 fn multipart_value(text: &str, key_start: usize, key_end: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
     if !text[key_start..key_end].eq_ignore_ascii_case("name") || bytes.get(key_end) != Some(&b'=') {
@@ -905,7 +958,7 @@ fn multipart_value(text: &str, key_start: usize, key_end: usize) -> Option<(usiz
     let after_name = field_start + field_len + 1;
     let window = &bytes[after_name..bytes.len().min(after_name + MULTIPART_HEADER_WINDOW)];
     let value_start = after_name + empty_line_end(window)?;
-    let value_end = skip_while(bytes, value_start, |b| !matches!(b, b'\r' | b'\n'));
+    let value_end = boundary_or_end(bytes, value_start);
     if value_end == value_start {
         return None;
     }
@@ -938,6 +991,35 @@ fn cli_value(text: &str, key_start: usize, key_end: usize) -> Option<(usize, usi
     (end > value).then_some((value, end))
 }
 
+/// The flags whose word is `user:password` (curl's `-u`, `--user`, and the proxy's
+/// `-U`, `--proxy-user`).
+const USERPASS_FLAGS: &[&str] = &["-u", "-U", "--user", "--proxy-user"];
+
+/// The password of the word after a `user:password` flag: `-u admin:secret`,
+/// `--proxy-user 'u:p w'`. The span is what follows the first colon of the word, and
+/// the closing quote stays. A word with no colon, or nothing after it, has no password
+/// (the tool asks for one). `None` for any other flag.
+fn userpass_value(text: &str, key_start: usize, key_end: usize) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    if !USERPASS_FLAGS.contains(&&text[key_start..key_end]) {
+        return None;
+    }
+    let value = skip_while(bytes, key_end, is_space_or_tab);
+    let first = *bytes.get(value)?;
+    if value == key_end || matches!(first, b'\r' | b'\n') {
+        return None;
+    }
+    let (word_start, word_end) = if matches!(first, b'"' | b'\'') {
+        let end = quoted_end(bytes, value);
+        let closed = end > value + 1 && bytes[end - 1] == first;
+        (value + 1, if closed { end - 1 } else { end })
+    } else {
+        (value, run_end(text, value, |b| !is_ascii_ws(b)))
+    };
+    let colon = word_start + text[word_start..word_end].find(':')?;
+    (colon + 1 < word_end).then_some((colon + 1, word_end))
+}
+
 /// The frames pre-pass. Run before `scrub_text`, because `scrub_text` would cut
 /// these values in the wrong place (`Str("x")` after a key becomes
 /// `[redacted]"x")`, and `token=\"x\"` becomes `token=[redacted]"x\"`), and for
@@ -948,17 +1030,37 @@ fn cli_value(text: &str, key_start: usize, key_end: usize) -> Option<(usize, usi
 /// vocabulary is consulted only after the cheap shape of a rule is found. A masked
 /// span is skipped whole, a frame that never closes runs to the end of the text, and
 /// the multipart and element scans are bounded, so the work is linear.
+///
+/// A secret-named element's content is masked when the scan reaches it (`pending`),
+/// not when the element is found, so that the scan first reads the start tag, whose
+/// interior is where a name and a frame can sit (`<otp: Some("x")>`).
 fn mask_value_frames(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
     let len = bytes.len();
     let mut masks = Masks::new(text);
+    // The content of an element whose start tag is being scanned: masked once the
+    // scan reaches it, unless a frame in the tag has covered it. The content starts
+    // after the `>` that ends the tag, and the scan steps over that byte one at a time,
+    // so it always reaches the start before the end of the text, or a frame has
+    // covered the content; nothing is left pending when the loop ends.
+    let mut pending: Option<(usize, usize)> = None;
     let mut i = 0;
     while i < len {
+        if let Some((start, end)) = pending.filter(|&(start, _)| i >= start) {
+            pending = None;
+            if start >= masks.copied {
+                masks.mask(start, end);
+                i = end;
+                continue;
+            }
+        }
         if bytes[i] == b'<' {
+            // The start tag is scanned too, for frames of its own (`<otp: Some("x")>`):
+            // the scan goes on at the name, and the content is masked when it is reached.
             match xml_content(text, i) {
-                Some((start, end)) => {
-                    masks.mask(start, end);
-                    i = end;
+                Some(content) => {
+                    pending = Some(content);
+                    i += 1;
                 }
                 None => i += 1,
             }
@@ -974,6 +1076,7 @@ fn mask_value_frames(text: &str) -> Cow<'_, str> {
         i = key_end;
         let span = multipart_value(text, key_start, key_end)
             .or_else(|| cli_value(text, key_start, key_end))
+            .or_else(|| userpass_value(text, key_start, key_end))
             .or_else(|| pair_frame(text, key_start, key_end));
         if let Some((start, end)) = span {
             masks.mask(start, end);
@@ -1025,7 +1128,7 @@ fn mask_header_lines(text: &str) -> String {
 
         // Optional blanks, then the colon. The vocabulary is consulted only for a
         // run that is followed by one.
-        let colon = skip_inline_blanks(text, end);
+        let colon = skip_blanks_in_line(text, end);
         if bytes.get(colon) != Some(&b':') {
             continue;
         }
@@ -1043,7 +1146,7 @@ fn mask_header_lines(text: &str) -> String {
         // The rest of the line after the colon and its blanks, and the folded lines
         // after it. An empty value with no folded line is left alone, as
         // `scrub_text` leaves one.
-        let value_start = skip_inline_blanks(text, colon + 1);
+        let value_start = skip_blanks_in_line(text, colon + 1);
         let first_end = skip_while(bytes, value_start, |b| !matches!(b, b'\r' | b'\n'));
         let value_end = folded_end(bytes, first_end);
         if value_end == value_start {
@@ -1104,45 +1207,49 @@ fn decodes_with_colon(token: &[u8]) -> bool {
     false
 }
 
+/// The fewest characters of a Basic token that P3 reads: `user:pass` is 6 bytes, which
+/// is 8 characters of base64.
+const BASIC_TOKEN_MIN: usize = 8;
+
+/// The fewest characters of a Negotiate or NTLM token that P3 reads: such a token is a
+/// binary message, much longer than a word.
+const NEGOTIATE_TOKEN_MIN: usize = 16;
+
 /// A credential scheme keyword that P3 reads, and what its token must be.
 struct Scheme {
-    /// The length of the keyword.
-    keyword_len: usize,
+    /// The keyword, matched ASCII case-insensitively.
+    keyword: &'static str,
     /// The fewest token characters that make a credential.
     min_token: usize,
     /// The token must decode to the `user:pass` shape (only Basic has one).
     must_decode: bool,
 }
 
-/// The scheme keyword that `bytes[at..]` starts with, or `None`. Matched ASCII
-/// case-insensitively.
-fn scheme_at(bytes: &[u8], at: usize) -> Option<Scheme> {
+const SCHEMES: &[Scheme] = &[
+    Scheme {
+        keyword: "basic",
+        min_token: BASIC_TOKEN_MIN,
+        must_decode: true,
+    },
+    Scheme {
+        keyword: "negotiate",
+        min_token: NEGOTIATE_TOKEN_MIN,
+        must_decode: false,
+    },
+    Scheme {
+        keyword: "ntlm",
+        min_token: NEGOTIATE_TOKEN_MIN,
+        must_decode: false,
+    },
+];
+
+/// The scheme whose keyword `bytes[at..]` starts with, or `None`.
+fn scheme_at(bytes: &[u8], at: usize) -> Option<&'static Scheme> {
     let rest = bytes.get(at..)?;
-    let starts = |word: &str| {
-        rest.get(..word.len())
-            .is_some_and(|head| head.eq_ignore_ascii_case(word.as_bytes()))
-    };
-    if starts("basic") {
-        Some(Scheme {
-            keyword_len: 5,
-            min_token: 8,
-            must_decode: true,
-        })
-    } else if starts("negotiate") {
-        Some(Scheme {
-            keyword_len: 9,
-            min_token: 16,
-            must_decode: false,
-        })
-    } else if starts("ntlm") {
-        Some(Scheme {
-            keyword_len: 4,
-            min_token: 16,
-            must_decode: false,
-        })
-    } else {
-        None
-    }
+    SCHEMES.iter().find(|scheme| {
+        rest.get(..scheme.keyword.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(scheme.keyword.as_bytes()))
+    })
 }
 
 /// P3. See [`scrub_strict`]. One left-to-right scan. A keyword's token is read once
@@ -1161,7 +1268,7 @@ fn mask_basic_credentials(text: &str) -> String {
             i += 1;
             continue;
         };
-        let after_keyword = i + scheme.keyword_len;
+        let after_keyword = i + scheme.keyword.len();
         let token_start = skip_while(bytes, after_keyword, is_space_or_tab);
         if token_start == after_keyword {
             // No blank after the keyword (`basicbasicbasic...`): not a credential
@@ -1189,6 +1296,10 @@ fn mask_basic_credentials(text: &str) -> String {
 
 // ---- P4: URL userinfo
 
+/// A userinfo with no password part (no colon) is masked when it is this long: a user
+/// name is a word, a longer one is a token (`ssh://git@host` stays).
+const USERINFO_NAME_ONLY_MIN: usize = 20;
+
 /// Whether `b` can end the scheme in front of `://`: an ASCII alphanumeric, `+`,
 /// `.` or `-`.
 fn is_scheme_byte(b: u8) -> bool {
@@ -1197,19 +1308,20 @@ fn is_scheme_byte(b: u8) -> bool {
 
 /// The index of the last `@` of the authority that starts at `from`, which ends its
 /// userinfo, or `None` when the authority has none. The authority ends at the first
-/// `/`, `?`, `#`, quote or whitespace character, or at the end of the text; a
-/// browser takes the host after the last `@`, so a password holding a raw `@` is all
-/// userinfo. Whitespace is Unicode whitespace, as `scrub_text` reads it: it ends the
-/// value of a `key:value` pair there, so a pass that masked across one (a no-break
-/// space inside a "password") would let the next call read that value further than
-/// this one did.
-fn userinfo_end(text: &str, from: usize) -> Option<usize> {
+/// `/`, `?`, `#` or whitespace character, at the end of the text, or at `opening_quote`
+/// when the URL stood in a quoted string (the quote in front of its scheme); any other
+/// quote belongs to the password (`O'Brien`). A browser takes the host after the last
+/// `@`, so a password holding a raw `@` is all userinfo. Whitespace is Unicode
+/// whitespace, as `scrub_text` reads it: it ends the value of a `key:value` pair
+/// there, so a pass that masked across one (a no-break space inside a "password")
+/// would let the next call read that value further than this one did.
+fn userinfo_end(text: &str, from: usize, opening_quote: Option<char>) -> Option<usize> {
     let mut last_at = None;
     for (offset, c) in text.get(from..)?.char_indices() {
         match c {
             '@' => last_at = Some(from + offset),
-            '/' | '?' | '#' | '"' | '\'' => break,
-            c if c.is_whitespace() => break,
+            '/' | '?' | '#' => break,
+            c if c.is_whitespace() || Some(c) == opening_quote => break,
             _ => {}
         }
     }
@@ -1218,7 +1330,8 @@ fn userinfo_end(text: &str, from: usize) -> Option<usize> {
 
 /// P4. See [`scrub_strict`]. The text is searched for `://` once, left to right.
 /// The authority scan after a `://` stops at the first `/` at the latest, and a later
-/// `://` has a `/` in it, so two scans never overlap and the work is linear.
+/// `://` has a `/` in it, so two scans never overlap and the work is linear (so do the
+/// look back over the scheme, which no other scheme's look back shares).
 fn mask_url_userinfo(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -1233,7 +1346,16 @@ fn mask_url_userinfo(text: &str) -> String {
         if separator == 0 || !is_scheme_byte(bytes[separator - 1]) {
             continue;
         }
-        let Some(at) = userinfo_end(text, authority) else {
+        // The quote in front of the scheme, if the URL stands in a quoted string.
+        let scheme_start = bytes[..separator]
+            .iter()
+            .rposition(|&b| !is_scheme_byte(b))
+            .map_or(0, |at| at + 1);
+        let opening_quote = scheme_start
+            .checked_sub(1)
+            .map(|at| char::from(bytes[at]))
+            .filter(|c| matches!(c, '"' | '\''));
+        let Some(at) = userinfo_end(text, authority, opening_quote) else {
             continue;
         };
         // `authority` and `at` (an ASCII `@`) are char boundaries.
@@ -1241,7 +1363,8 @@ fn mask_url_userinfo(text: &str) -> String {
         let mask_from = match userinfo.find(':') {
             // The part after the first colon; an empty one is no secret.
             Some(colon) => (colon + 1 < userinfo.len()).then_some(authority + colon + 1),
-            None => (userinfo.len() >= 20 || contains_shape(userinfo)).then_some(authority),
+            None => (userinfo.len() >= USERINFO_NAME_ONLY_MIN || contains_shape(userinfo))
+                .then_some(authority),
         };
         if let Some(from) = mask_from {
             out.push_str(&text[copied..from]);
@@ -1270,10 +1393,6 @@ struct Shape {
 
 fn body_alnum(b: u8) -> bool {
     b.is_ascii_alphanumeric()
-}
-
-fn body_alnum_underscore(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 fn body_alnum_dash(b: u8) -> bool {
@@ -1307,7 +1426,7 @@ const SHAPES: &[Shape] = &[
     },
     Shape {
         prefixes: &["github_pat_"],
-        body: body_alnum_underscore,
+        body: is_word_byte,
         min: 22,
         exact: false,
     },
@@ -1419,6 +1538,10 @@ fn table_shape_end(bytes: &[u8], at: usize) -> Option<usize> {
     })
 }
 
+/// The fewest characters of the first and the second segment of a JWT (the header and
+/// the payload, which a JSON object makes at least this long in base64url).
+const JWT_SEGMENT_MIN: usize = 8;
+
 /// How many dot-separated segments a compact JWE has: the header, the encrypted
 /// key, the initialisation vector, the ciphertext and the tag.
 const JWE_SEGMENTS: usize = 5;
@@ -1451,7 +1574,7 @@ fn jwt_end(bytes: &[u8], at: usize, dead_until: &mut usize) -> Option<usize> {
 
 /// The rest of [`jwt_end`], given the end of the first segment.
 fn jwt_after_first(bytes: &[u8], at: usize, first_end: usize) -> Option<usize> {
-    if first_end - at < 8 || bytes.get(first_end) != Some(&b'.') {
+    if first_end - at < JWT_SEGMENT_MIN || bytes.get(first_end) != Some(&b'.') {
         return None;
     }
     // `ends[k]` is the end of segment `k`; each later one follows a dot.
@@ -1466,7 +1589,7 @@ fn jwt_after_first(bytes: &[u8], at: usize, first_end: usize) -> Option<usize> {
         return Some(ends[JWE_SEGMENTS - 1]);
     }
     // A JWT: the second segment is at least 8, and a dot and a third segment follow.
-    (count >= 3 && ends[1] - (first_end + 1) >= 8).then_some(ends[2])
+    (count >= 3 && ends[1] - (first_end + 1) >= JWT_SEGMENT_MIN).then_some(ends[2])
 }
 
 /// The end of the P5 credential that starts at `at`, or `None`. `from` is where the
@@ -1523,6 +1646,21 @@ fn mask_credential_shapes(text: &str) -> String {
 
 // ---- P6: pairs of the extra key words
 
+/// The index just past the bracket groups that follow a key run ending at `from`:
+/// any number of `[` and a name and `]` (`user[password]`, `a[b][c]`, `password[]`).
+/// `from` itself when there is none. A `[` that does not open such a group ends it.
+fn bracket_groups_end(bytes: &[u8], from: usize) -> usize {
+    let mut end = from;
+    while bytes.get(end) == Some(&b'[') {
+        let name_end = skip_while(bytes, end + 1, is_name_byte);
+        if bytes.get(name_end) != Some(&b']') {
+            break;
+        }
+        end = name_end + 1;
+    }
+    end
+}
+
 /// P6. See [`scrub_strict`]. One linear scan, structured as the pair pass of
 /// `scrub_text` and reading a value with copies of its helpers (see the note above
 /// `run_end`): a key run is followed by an optional closing quote, whitespace and
@@ -1552,12 +1690,16 @@ fn mask_extra_pairs(text: &str) -> String {
         }
         i = key_end;
 
-        // Key run, optional closing quote, whitespace, then `=` or `:`.
-        let mut j = key_end;
+        // Bracket groups after the run belong to the key (`user[password]`).
+        let groups_end = bracket_groups_end(bytes, key_end);
+        let bracketed = groups_end > key_end;
+
+        // Key run and groups, optional closing quote, whitespace, then `=` or `:`.
+        let mut j = groups_end;
         if j < len && matches!(bytes[j], b'"' | b'\'') {
             j += 1;
         }
-        j = skip_unicode_blanks(text, j);
+        j = skip_blanks_and_breaks(text, j);
         if j >= len || !matches!(bytes[j], b'=' | b':') {
             continue;
         }
@@ -1565,17 +1707,26 @@ fn mask_extra_pairs(text: &str) -> String {
         j += 1;
 
         // The scan only stops on char boundaries and `run_end` steps whole chars,
-        // so `key_start..key_end` is on char boundaries.
-        let key = &text[key_start..key_end];
-        if !is_extra_secret_key(key) {
+        // so `key_start..groups_end` is on char boundaries. A key with groups is a
+        // form field name that `scrub_text` never read as a pair, so the whole
+        // vocabulary applies; one without is read as `scrub_text` read it, and only
+        // what `scrub_text` does not know is masked here.
+        // The whole text is judged, brackets included: every group is a segment of it
+        // and every needle a substring, so a word in the run or in any group is found.
+        let secret = if bracketed {
+            is_secret_key_strict(&text[key_start..groups_end])
+        } else {
+            is_extra_secret_key(&text[key_start..key_end])
+        };
+        if !secret {
             continue;
         }
-        if separator == b':' && is_host_port(bytes, key_start, key_end) {
+        if !bracketed && separator == b':' && is_host_port(bytes, key_start, key_end) {
             continue;
         }
 
         // Whitespace, an optional opening quote, then the value.
-        j = skip_unicode_blanks(text, j);
+        j = skip_blanks_and_breaks(text, j);
         let quote = match bytes.get(j) {
             Some(&q) if matches!(q, b'"' | b'\'') => {
                 j += 1;
@@ -1617,7 +1768,7 @@ fn mask_extra_pairs(text: &str) -> String {
 mod tests {
     use std::cell::Cell;
 
-    use super::{converge, MAX_ROUNDS};
+    use super::{converge, scrub_strict, MAX_ROUNDS, SHAPES};
 
     /// `converge` over `round`, and how many times it called it.
     fn run(text: &str, round: impl Fn(&str) -> String) -> (String, usize) {
@@ -1627,6 +1778,37 @@ mod tests {
             round(t)
         });
         (out, calls.get())
+    }
+
+    #[test]
+    fn every_entry_of_the_shape_table_fires_at_its_minimum_and_not_below() {
+        // `A` is in every body alphabet of the table. For each prefix: the shortest
+        // body is masked whole, one byte less is not a credential, and the prefix
+        // glued to the end of a word is not the start of one.
+        let mut failures = Vec::new();
+        for shape in SHAPES {
+            assert!(
+                (shape.body)(b'A'),
+                "`A` must be in the body alphabet of {:?}",
+                shape.prefixes
+            );
+            for prefix in shape.prefixes {
+                let full = format!("{prefix}{}", "A".repeat(shape.min));
+                let short = format!("{prefix}{}", "A".repeat(shape.min - 1));
+                let glued = format!("x{full}");
+                for (label, input, want) in [
+                    ("shortest body", &full, "[redacted]"),
+                    ("one byte short", &short, short.as_str()),
+                    ("glued to a word", &glued, glued.as_str()),
+                ] {
+                    let got = scrub_strict(input);
+                    if got != want {
+                        failures.push(format!("{prefix} {label}: {input:?} gives {got:?}"));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     #[test]
@@ -1645,11 +1827,10 @@ mod tests {
     #[test]
     fn the_rounds_are_bounded() {
         // A round that never settles is cut off after MAX_ROUNDS calls, and the last
-        // output is the result.
-        assert_eq!(MAX_ROUNDS, 4);
+        // output is the result: one more `x` per round.
         assert_eq!(
             run("", |t| format!("{t}x")),
-            ("xxxx".to_string(), MAX_ROUNDS)
+            ("x".repeat(MAX_ROUNDS), MAX_ROUNDS)
         );
     }
 }
