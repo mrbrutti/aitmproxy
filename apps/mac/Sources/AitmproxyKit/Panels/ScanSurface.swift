@@ -14,6 +14,15 @@ public let scanL4Hint = "The L4 lanes need an L4 scope entry with interface *, d
 /// The Profiles footer's idle status line (D4).
 public let scanIdleText = "Opening this page never scans. Start Scan sends probes to the origins above."
 
+/// D4: a builtin's edits are launch overrides, never saved.
+public let scanEditedBuiltinText = "Edited builtin — Start Scan uses these values; Duplicate… to keep them."
+
+/// D4: shown under the dials while Intensity is Intrusive.
+public let scanIntrusiveHint = "Intrusive checks may disrupt the target; the engine asks before starting."
+
+/// D4: the help on a check the profile's intensity will not run.
+public let scanAboveIntensityHelp = "Above this profile's intensity; raise Intensity to run it."
+
 // MARK: - Offering
 
 /// Which Scan page the bus can back: the four-surface model needs `scan.start`;
@@ -204,7 +213,7 @@ public struct ScanLaunchError: Hashable, Sendable {
             return "A scan on this origin is already running"
         case "out_of_scope":
             guard let first = origins.first else { return message }
-            return "Out of scope — add \(ScanFormat.hostOf(origin: first)) to scope to scan it"
+            return ScanFormat.outOfScopeText(origin: first)
         default:
             return message
         }
@@ -219,6 +228,15 @@ public struct ScanLaunchError: Hashable, Sendable {
 public struct ScanCheckTree: Hashable, Sendable {
     public enum Choice: String, Hashable, Sendable, CaseIterable {
         case `default`, include, exclude
+
+        /// The tri-state's words (D4): Default · Include · Exclude.
+        public var word: String {
+            switch self {
+            case .default: "Default"
+            case .include: "Include"
+            case .exclude: "Exclude"
+            }
+        }
     }
 
     public struct Leaf: Hashable, Sendable {
@@ -417,7 +435,7 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         }
         for origin in origins {
             guard let authority = ScanForm.authority(of: origin), Scope.contains(authority, in: scopeHosts) else {
-                return "Out of scope — add \(ScanFormat.hostOf(origin: origin)) to scope to scan it"
+                return ScanFormat.outOfScopeText(origin: origin)
             }
         }
         return nil
@@ -529,8 +547,8 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         } else {
             jobs.insert(result.status.summary, at: 0)
         }
-        launchNotices[result.job] = result.clamped.map { "Clamped \($0.field) \($0.requested) → \($0.applied)" }
-            + result.lanes.skipped.map { "Skipped \($0.lane.rawValue): \($0.reason)" }
+        launchNotices[result.job] = result.clamped.map(ScanFormat.clampedText)
+            + result.lanes.skipped.map(ScanFormat.skippedLaneText)
         selectedJob = result.job
         tab = .jobs
         confirm = nil
@@ -691,6 +709,32 @@ public enum ScanFormat {
         ScanForm.authority(of: origin) ?? origin
     }
 
+    /// `Out of scope — add a.test:8443 to scope to scan it` (D12): the launch gate,
+    /// the `out_of_scope` error and the origin row all say this.
+    public static func outOfScopeText(origin: String) -> String {
+        "Out of scope — add \(hostOf(origin: origin)) to scope to scan it"
+    }
+
+    /// `Clamped budget.probes 50000 → 20000`: a `scan.start` / `scan.status` clamp notice.
+    public static func clampedText(_ clamped: ScanClamped) -> String {
+        "Clamped \(clamped.field) \(clamped.requested) → \(clamped.applied)"
+    }
+
+    /// `Skipped ws: lane not available on this build`: a `lanes.skipped` notice.
+    public static func skippedLaneText(_ skipped: ScanSkippedLane) -> String {
+        "Skipped \(skipped.lane.rawValue): \(skipped.reason)"
+    }
+
+    /// A timing-evidence double: up to three fraction digits, no grouping, `.` as the
+    /// decimal mark whatever the locale (`0.857`, `2`).
+    public static func number(_ value: Double) -> String {
+        value.formatted(
+            .number.precision(.fractionLength(0...3)).grouping(.never).locale(Locale(identifier: "en_US_POSIX")))
+    }
+
+    /// `yes` / `no`, for the session and L4 evidence flags.
+    public static func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
+
     /// The state word, or the phase word while running.
     static func stateWord(_ summary: ScanJobSummary) -> String {
         summary.state == .running ? summary.phase.word : summary.state.word
@@ -801,5 +845,6 @@ public enum ScanFormat {
         }
     }
 
-    static func plural(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
+    /// `1 endpoint` / `3 endpoints`.
+    public static func plural(_ n: Int, _ noun: String) -> String { "\(n) \(noun)\(n == 1 ? "" : "s")" }
 }

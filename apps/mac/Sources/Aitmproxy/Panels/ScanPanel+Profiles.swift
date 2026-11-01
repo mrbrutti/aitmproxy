@@ -193,7 +193,7 @@ struct ScanProfilesTab: View {
             } else if let line = state.surface.statusLine {
                 Text(line).foregroundStyle(Tok.Ink.secondary.color)
             } else if editedBuiltin {
-                Text(ScanProfileWords.editedBuiltin).foregroundStyle(Tok.Ink.secondary.color)
+                Text(scanEditedBuiltinText).foregroundStyle(Tok.Ink.secondary.color)
             } else {
                 Text(scanIdleText).foregroundStyle(Tok.Ink.tertiary.color)
             }
@@ -330,12 +330,12 @@ private struct ScanProfileEditor: View {
     }
 
     /// Why this origin cannot be scanned, nil when it can. The words are the Kit's
-    /// `out_of_scope` display, so the row and the launch gate say the same thing.
+    /// `ScanFormat.outOfScopeText`, so the row and the launch gate say the same thing.
     private func outOfScope(_ origin: String) -> String? {
         if let authority = ScanForm.authority(of: origin), Scope.contains(authority, in: state.session.scopeHosts) {
             return nil
         }
-        return ScanLaunchError(code: "out_of_scope", message: origin, origins: [origin]).display
+        return ScanFormat.outOfScopeText(origin: origin)
     }
 
     private func addOrigin(_ origin: String) {
@@ -416,7 +416,7 @@ private struct ScanProfileEditor: View {
                 .fixedSize()
             }
             if edited.isIntrusive {
-                Hint(text: ScanProfileWords.intrusiveHint)
+                Hint(text: scanIntrusiveHint)
             }
         }
     }
@@ -663,17 +663,17 @@ private struct ScanProfileCheckRow: View {
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(accessibilityWords)
             Spacer(minLength: Space.sm)
-            FlatMenu(title: ScanProfileWords.choice(leaf.choice), width: 96) {
+            FlatMenu(title: leaf.choice.word, width: 96) {
                 ForEach(ScanCheckTree.Choice.allCases, id: \.self) { choice in
-                    Button(ScanProfileWords.choice(choice)) { set(choice) }
+                    Button(choice.word) { set(choice) }
                 }
             }
-            .accessibilityLabel("\(meta.name): \(ScanProfileWords.choice(leaf.choice))")
+            .accessibilityLabel("\(meta.name): \(leaf.choice.word)")
         }
         .padding(.leading, Space.lg)
         .padding(.vertical, Space.xs)
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
-        .help(leaf.aboveIntensity ? ScanProfileWords.aboveIntensityHelp : meta.description)
+        .help(leaf.aboveIntensity ? scanAboveIntensityHelp : meta.description)
     }
 
     private var accessibilityWords: String {
@@ -723,29 +723,6 @@ private struct ScanProfileDuplicatePopover: View {
 
     private func duplicate() {
         state.duplicateProfile(as: state.duplicateName ?? "")
-    }
-}
-
-// MARK: - Words the Kit does not carry (view-local; flagged in the task report)
-
-/// Strings this tab needs that `ScanSurface.swift` (Task 3) does not define. They
-/// sit here rather than in the Kit because a coder task does not edit Kit files;
-/// the report names them as a gap.
-private enum ScanProfileWords {
-    /// D4: a builtin's edits are launch overrides, never saved.
-    static let editedBuiltin = "Edited builtin — Start Scan uses these values; Duplicate… to keep them."
-    /// D4: shown under the dials while Intensity is Intrusive.
-    static let intrusiveHint = "Intrusive checks may disrupt the target; the engine asks before starting."
-    /// D4: the help on a check the profile's intensity will not run.
-    static let aboveIntensityHelp = "Above this profile's intensity; raise Intensity to run it."
-
-    /// The tri-state's words (D4): Default · Include · Exclude.
-    static func choice(_ choice: ScanCheckTree.Choice) -> String {
-        switch choice {
-        case .default: "Default"
-        case .include: "Include"
-        case .exclude: "Exclude"
-        }
     }
 }
 

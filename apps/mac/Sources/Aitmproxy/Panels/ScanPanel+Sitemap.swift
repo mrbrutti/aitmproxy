@@ -205,7 +205,7 @@ private struct ScanSitemapOriginRow: View {
         .onTapGesture(perform: toggle)
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(origin), \(scanSitemapPlural(count, "endpoint")), \(collapsed ? "collapsed" : "expanded")")
+        .accessibilityLabel("\(origin), \(ScanFormat.plural(count, "endpoint")), \(collapsed ? "collapsed" : "expanded")")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction(named: "Collapse or expand", toggle)
     }
@@ -403,9 +403,4 @@ private struct ScanSitemapErrorLine: View {
             .padding(.vertical, Space.xs)
             .frame(maxWidth: .infinity, alignment: .leading)
     }
-}
-
-/// `1 endpoint` / `3 endpoints` — the Kit's `ScanFormat.plural` is not public.
-private func scanSitemapPlural(_ n: Int, _ noun: String) -> String {
-    "\(n) \(noun)\(n == 1 ? "" : "s")"
 }

@@ -1372,4 +1372,33 @@ extension ScanSurfaceTests {
         #expect(model.sitemap == sitemap)
         #expect(model.sitemapGroupedByOrigin().count == 1)
     }
+
+    /// Task 3's rule: every string a Scan view renders has one home in the Kit.
+    /// These were view-local copies in the five view files; now the views read them here.
+    @Test func viewStringsHaveOneHome() {
+        #expect(scanEditedBuiltinText == "Edited builtin — Start Scan uses these values; Duplicate… to keep them.")
+        #expect(scanIntrusiveHint == "Intrusive checks may disrupt the target; the engine asks before starting.")
+        #expect(scanAboveIntensityHelp == "Above this profile's intensity; raise Intensity to run it.")
+        let clamped = ScanClamped(field: "budget.probes", requested: 50000, applied: 20000)
+        #expect(ScanFormat.clampedText(clamped) == "Clamped budget.probes 50000 → 20000")
+        let skipped = ScanSkippedLane(lane: .ws, reason: "lane not available on this build")
+        #expect(ScanFormat.skippedLaneText(skipped) == "Skipped ws: lane not available on this build")
+        #expect(ScanFormat.outOfScopeText(origin: "http://a.test:8443/x") == "Out of scope — add a.test:8443 to scope to scan it")
+        #expect(ScanLaunchError(code: "out_of_scope", message: "x", origins: ["http://a.test:8443/x"]).display
+            == ScanFormat.outOfScopeText(origin: "http://a.test:8443/x"))
+        #expect(ScanConfidence.tentative.word == "Tentative")
+        #expect(ScanConfidence.firm.word == "Firm")
+        #expect(ScanConfidence.certain.word == "Certain")
+        #expect(ScanConfidence.other("sure-ish").word == "sure-ish")
+        #expect(ScanCheckTree.Choice.default.word == "Default")
+        #expect(ScanCheckTree.Choice.include.word == "Include")
+        #expect(ScanCheckTree.Choice.exclude.word == "Exclude")
+        #expect(ScanFormat.number(0.8571) == "0.857")
+        #expect(ScanFormat.number(2) == "2")
+        #expect(ScanFormat.number(12345.5) == "12345.5", "no grouping separator")
+        #expect(ScanFormat.yesNo(true) == "yes")
+        #expect(ScanFormat.yesNo(false) == "no")
+        #expect(ScanFormat.plural(1, "endpoint") == "1 endpoint")
+        #expect(ScanFormat.plural(3, "endpoint") == "3 endpoints")
+    }
 }

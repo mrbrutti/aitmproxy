@@ -397,7 +397,7 @@ private struct ScanJobDetail: View {
     /// already spell out.
     private var clampedLines: [String] {
         let notices = state.surface.launchNotices[summary.job] ?? []
-        let fromStatus = (status?.clamped ?? []).map { "Clamped \($0.field) \($0.requested) → \($0.applied)" }
+        let fromStatus = (status?.clamped ?? []).map(ScanFormat.clampedText)
         return notices + fromStatus.filter { !notices.contains($0) }
     }
 
@@ -417,9 +417,9 @@ private struct ScanJobDetail: View {
         VStack(alignment: .leading, spacing: Space.sm) {
             section("Session")
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Reused", yesNo(session.reused))
-                stat("Lost", yesNo(session.lost))
-                stat("Browser partial", yesNo(session.browserPartial))
+                stat("Reused", ScanFormat.yesNo(session.reused))
+                stat("Lost", ScanFormat.yesNo(session.lost))
+                stat("Browser partial", ScanFormat.yesNo(session.browserPartial))
             }
             Text(ScanFormat.canaryText(session.canary))
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
@@ -485,8 +485,6 @@ private struct ScanJobDetail: View {
     private func laneWords(_ lanes: [ScanLane]) -> String? {
         lanes.isEmpty ? nil : lanes.map(\.word).joined(separator: ", ")
     }
-
-    private func yesNo(_ flag: Bool) -> String { flag ? "yes" : "no" }
 }
 
 // MARK: - Progress rule

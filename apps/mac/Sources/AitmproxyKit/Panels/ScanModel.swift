@@ -311,6 +311,15 @@ public enum ScanConfidence: ScanVocabulary {
         case .other: 99
         }
     }
+
+    public var word: String {
+        switch self {
+        case .tentative: "Tentative"
+        case .firm: "Firm"
+        case .certain: "Certain"
+        case .other(let raw): raw
+        }
+    }
 }
 
 /// `IssueStatus`: an issue's triage state.

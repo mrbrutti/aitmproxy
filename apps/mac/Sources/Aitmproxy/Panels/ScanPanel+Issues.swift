@@ -147,10 +147,10 @@ private struct ScanIssueFilterBar: View {
                 }
             }
             .help("Show issues of at least this severity")
-            FlatMenu(title: "Confidence ≥ \(filters.confidenceMin.map(ScanIssueWords.confidence) ?? "Any")", width: 160) {
+            FlatMenu(title: "Confidence ≥ \(filters.confidenceMin.map(\.word) ?? "Any")", width: 160) {
                 Button("Any") { state.surface.filters.confidenceMin = nil }
                 ForEach(Self.confidences, id: \.self) { confidence in
-                    Button(ScanIssueWords.confidence(confidence)) { state.surface.filters.confidenceMin = confidence }
+                    Button(confidence.word) { state.surface.filters.confidenceMin = confidence }
                 }
             }
             .help("Show issues of at least this confidence")
@@ -198,24 +198,6 @@ private struct ScanIssueErrorLine: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .accessibilityLabel("Error: \(text)")
     }
-}
-
-/// Words the Kit vocabularies do not spell for the views. `ScanConfidence` has
-/// a `rawValue` and a `rank` but no `word`; the menu and the badge capitalise it
-/// here. Doubles in the timing evidence are shown with up to three decimals.
-private enum ScanIssueWords {
-    static func confidence(_ confidence: ScanConfidence) -> String {
-        confidence.rawValue.capitalized
-    }
-
-    static func number(_ value: Double) -> String {
-        value.formatted(.number.precision(.fractionLength(0...3)))
-    }
-
-    static func yesNo(_ value: Bool) -> String { value ? "yes" : "no" }
-
-    /// Milliseconds since the epoch, for `ScanFormat.issueMetaLine`.
-    static var nowMs: Int { Int(Date().timeIntervalSince1970 * 1000) }
 }
 
 // MARK: - List parts
@@ -321,6 +303,9 @@ struct ScanIssueDetail: View {
         .onChange(of: issue.note) { _, new in note = new ?? "" }
     }
 
+    /// Milliseconds since the epoch, for `ScanFormat.issueMetaLine`.
+    private static var nowMs: Int { Int(Date().timeIntervalSince1970 * 1000) }
+
     // MARK: Header
 
     private var header: some View {
@@ -328,7 +313,7 @@ struct ScanIssueDetail: View {
             Text(issue.name).font(Tok.Face.ui(Tok.Typography.Size.xl, .medium))
                 .foregroundStyle(Tok.Ink.primary.color).lineLimit(1)
             Badge(text: issue.severity.word, pair: issue.severity.known?.pair ?? Tok.Severity.info)
-            Badge(text: ScanIssueWords.confidence(issue.confidence), pair: Tok.State.neutral)
+            Badge(text: issue.confidence.word, pair: Tok.State.neutral)
             Badge(text: issue.lane.word, pair: Tok.State.neutral)
             Spacer(minLength: Space.sm)
             Picker("Status", selection: $status) {
@@ -379,7 +364,7 @@ struct ScanIssueDetail: View {
                 sectionTitle("Note")
                 noteField
 
-                Text(ScanFormat.issueMetaLine(issue, now: ScanIssueWords.nowMs))
+                Text(ScanFormat.issueMetaLine(issue, now: Self.nowMs))
                     .font(Tok.Face.data(Tok.Typography.Size.sm))
                     .foregroundStyle(Tok.Ink.tertiary.color)
                     .textSelection(.enabled)
@@ -452,7 +437,7 @@ struct ScanIssueDetail: View {
 
     private func timingBlock(_ timing: ScanTiming) -> some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            Text("slope \(ScanIssueWords.number(timing.slope)) · r \(ScanIssueWords.number(timing.r))")
+            Text("slope \(ScanFormat.number(timing.slope)) · r \(ScanFormat.number(timing.r))")
                 .font(Tok.Face.data(Tok.Typography.Size.sm))
                 .foregroundStyle(Tok.Ink.primary.color)
                 .textSelection(.enabled)
@@ -465,7 +450,7 @@ struct ScanIssueDetail: View {
                 }
                 ForEach(0..<rows, id: \.self) { index in
                     GridRow {
-                        cell(timing.requestedS.indices.contains(index) ? ScanIssueWords.number(timing.requestedS[index]) : "—")
+                        cell(timing.requestedS.indices.contains(index) ? ScanFormat.number(timing.requestedS[index]) : "—")
                         cell(timing.observedMs.indices.contains(index) ? String(timing.observedMs[index]) : "—")
                         cell(timing.baselineMs.indices.contains(index) ? String(timing.baselineMs[index]) : "—")
                     }
@@ -483,8 +468,8 @@ struct ScanIssueDetail: View {
                 keyValue("rng seed", String(l4.rngSeed))
                 if !l4.mutationChain.isEmpty { keyValue("mutation chain", l4.mutationChain.joined(separator: " → ")) }
                 keyValue("prior messages", String(l4.priorMessages))
-                keyValue("liveness before", ScanIssueWords.yesNo(l4.livenessBefore))
-                keyValue("liveness after", ScanIssueWords.yesNo(l4.livenessAfter))
+                keyValue("liveness before", ScanFormat.yesNo(l4.livenessBefore))
+                keyValue("liveness after", ScanFormat.yesNo(l4.livenessAfter))
                 keyValue("reproduced", "\(l4.reproducedHits) / \(l4.reproducedTries)")
                 keyValue("scope entry", l4.scopeEntry)
                 if !l4.oracle.isNull { keyValue("oracle", l4.oracle.serialized()) }
