@@ -319,6 +319,7 @@ Kept by the main session during stage 6. One row per finding.
 | primitives, 1 | tester (re-test) | Minor | duplicate ids trap `listboxKeys` ArrowDown; list parsers do not dedupe | fixed in `eb379134` (`uniqueRows`, walk to the next distinct id) |
 | 4 | tester (re-test) | Minor | PA12 claimed `parseOperatorUrl`/YAML quoting were tested; they were not | fixed by the tester's `tester.live-env.test.ts` (`d6b8eece`) |
 | 15 | live run 7 (`42fb1da5` web on T1b `ca852f71`) | — | 26 PASS · 0 FAIL · 1 GAP (8b `lane_unavailable`: the dialog showed the core's prompt, `_confirm` was sent, the core has no L4 lane built; the UI rendered the refusal) | accepted (orchestrator, 2026-11-01): the GAP the plan foresaw; final run on `eb379134` recorded in the PR |
+| 16 | live run 8 (`eb379134` web on T1b `ca852f71`, final head) | — | 26 PASS · 0 FAIL · 1 GAP (8b `lane_unavailable`, no L4 lane on this core); artefacts in `apps/web/live-proof/t8-scan-2026-11-01/` | PASS; acceptance evidence for W-7, W-8, W-9, W-10, W-20 |
 
 ## Shipped
 
