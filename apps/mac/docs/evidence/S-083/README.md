@@ -9,3 +9,6 @@
 
 Engine note for T1b: `scan.sitemap` without `job` or `target` is refused (`invalid_profile: give either job or
 target`); the app always sends the selected job, and its "All jobs" choice would hit that refusal.
+
+## Second run (engine abaf5264)
+`03-abaf5264-sitemap.png`: the same 30 nodes from the harness `scan.sitemap {job}` read (`ac9-harness-abaf5264.log` in S-081 lists the templates).

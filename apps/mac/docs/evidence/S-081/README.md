@@ -15,3 +15,8 @@ Jobs tab frames paired with harness `scan.status` reads over the bus at the same
 
 Engine note for T1b: `elapsed_ms` is reported as 0 while a job runs (only set at the end), so the row's elapsed
 reads 0:00 until done.
+
+## Second run (engine abaf5264, external core)
+`07-abaf5264-running-227.png` (Running · Auditing, 227 probes with the harness at 227 → 285 done), `08-abaf5264-before-cancel.png`
+(207 probes running), `09-abaf5264-cancelled.png` (Cancel clicked 08:01:10 → `cancelled` at 08:01:13, 248 probes in row and
+harness); `ac9-harness-abaf5264.log`.

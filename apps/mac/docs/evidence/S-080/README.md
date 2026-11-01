@@ -23,6 +23,24 @@ with `APP_STORE` in /tmp, no fixtures), embedded core = `aitm` built from T1b's 
   origin operator, result ok.
 - `core-config-redacted.yaml` — the embedded core's per-launch config, tokens redacted.
 
-Note: the engine proof used an Intrusive launch for the handshake. The L4 half of the sheet needs an L4-enabled
-core with an Inject scope entry, which the app's embedded config does not carry; the gate half (disabled with the
-hint) is proven above.
+## L4-lane half (second run, engine abaf5264, external core)
+
+Because the app's embedded core has no L4, this half ran the same `.app` against an external core built from T1b
+abaf5264 (`external-core-config-redacted.yaml`: `l4.enabled: true`, `findings.dir`, the target in scope; the app
+connected as operator via `APP_LIVE=1 AITM_CONFIG=…`), with the test target's nine L4 speakers up
+(`--l4 --control-port 8098`). Over the bus (operator-confirmed `_confirm` handshake, see `ac11-l4-harness.log`):
+an inject L4 scope entry `cidr 127.0.0.1/32, interface "*", direction outbound, capability inject` (the
+`interface: "*"` acceptance abaf5264 adds), and a saved copy of `l4-stream-safe` named `l4proof` whose
+`target.l4` is the target's TLV speaker.
+
+- `11-external-core-profiles-with-saved-l4proof.png` — the saved profile listed beside the builtins.
+- `08-l4-lane-profile-enabled.png` — `l4proof` selected: L4 stream lane, target `127.0.0.1:56657/tcp`, Start Scan
+  enabled now that an Inject entry exists.
+- `09-l4-lane-confirm-sheet.png` — Start Scan → the engine's L4 prompt verbatim ("This scan sends malformed
+  traffic to 127.0.0.1:56657 and may disrupt the target. Continue?"); Cancel → no job (`scan.list` empty).
+- `10-l4-lane-engine-refusal-code.png` — Start Scan in the sheet → the confirmed call reached the engine, which
+  refused: `no requested lane is available on this build: l4_stream` with the code `lane_unavailable` beside it
+  in the footer (this engine build carries no L4 stream lane; the audit shows one `scan.start` from `aitm-mac`
+  with that error). The handshake and the D9 error rendering are proven; a running L4 job needs a build with the
+  lane.
+- `tools-list-names-abaf5264.txt` — that core's verbs (`l4.scope.*`, every `scan.*`, `flow.subscribe`).

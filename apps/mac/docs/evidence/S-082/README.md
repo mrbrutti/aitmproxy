@@ -10,6 +10,14 @@
 - `04-false-positive.png` — Status set to False positive; the harness `scan.issue {id}` returns
   `false_positive` (`ac10-harness.log`).
 
-Not exercised on this core: Open PoC. None of the six issues carries a `poc_ref` because the embedded core has
-no `findings.dir`, so the engine writes no PoC / finding; the button is therefore absent (one Open PoC when
-`poc_ref` is set). The resolver is unit-tested (`pocRefResolvesToAListedPath`).
+## Second run (engine abaf5264, external core with `findings.dir`)
+
+- `05-abaf5264-issues-grouped.png` — the same grouping on the abaf5264 core (MEDIUM 2 / LOW 4 = harness).
+- `06-abaf5264-issue-detail-with-poc.png`, `07-abaf5264-issue-with-poc-ref.png` — with `findings.dir` set the
+  engine reproduced the XSS and wrote a PoC: the issue carries `poc_ref` (the PoC file's absolute path) and
+  `finding_id` (`reflected-xss-c388095c`); the detail shows the Open PoC button and "Finding <id>".
+- `08-abaf5264-open-poc-fallback.png` — Open PoC: the resolver now matches an absolute `poc_ref` by path equality
+  (fixed from this run: the first version matched only a bare name), but the core's `poc.list` returns `[]`
+  (it does not list `<findings.dir>/scan/pocs/…`), so the Findings page has nothing to select and the status bar
+  shows the spec's fallback "PoC <path> is not in this app's findings list". Engine/contract gap for T1b:
+  `poc.list` should include the scanner's PoCs (or `scan.issue` should carry a finding the Findings page lists).

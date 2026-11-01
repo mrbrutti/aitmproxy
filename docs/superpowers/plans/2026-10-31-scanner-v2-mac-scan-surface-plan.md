@@ -288,6 +288,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix 2 | spec | Minor | plan Task 8/10 bodies still named "Open Finding" / `openPoC(ref:findingId:)` (M6 residual) | fixed in f31deb75 (plan body) |
 | fix 2 | spec | Minor | tester-authored tests landed inside the fix commit, not a `test(...): tester —` commit | accepted (orchestrator): tests only, all literal-pinned; splitting the commit mid-review would churn the range |
 | fix 2 | spec | — | M1–M7 verified closed; no Important open; MS-AC9/10/11/13 pending the engine, MS-AC7/12 deferred to Task 12 | — |
+| live | orchestrator | Minor | `ScanFindingLink.match` matched a bare name or a `dir/name` tail only; the engine's live `poc_ref` is the PoC file's absolute path, so Open PoC could never resolve it (found in the abaf5264 run) | fixed in 31839632 (path equality first; `anAbsolutePocRefResolvesByEquality`) |
+| live | orchestrator | — | engine observations for T1b from the live runs: `elapsed_ms` 0 while running; `scan.sitemap` needs `job` or `target`; `poc.list` does not list `<findings.dir>/scan/pocs`, so Open PoC lands on the fallback text; this build has no L4 stream lane (`lane_unavailable`) | recorded; relayed to the coordinator |
 
 ## Shipped
 
