@@ -330,11 +330,18 @@ async function addL4Target() {
   if (!listed) throw new Error(`the L4 targets list shows no 127.0.0.1:${target.port} row after Add L4 target`);
 }
 
-/** Composes `http://127.0.0.1:<target port>` in the origin picker and clicks `Add origin`. */
+/**
+ * Composes `http://127.0.0.1:<target port>` in the origin picker and clicks `Add origin`.
+ * When the chosen `Origin host` option already carries a port (the proof's scope host is
+ * `127.0.0.1:<target port>`) the editor disables `Origin port` by design (D-T8.5 amendment A2);
+ * typing into a disabled input cannot take focus, so the port is typed only when the input is enabled.
+ */
 async function addTargetOrigin() {
   await pickScheme('http');
   await pickSelectUnless('select[aria-label="Origin host"]', /127\.0\.0\.1/);
-  await typeInto('input[aria-label="Origin port"]', String(target.port));
+  const portDisabled = await d.ev(`document.querySelector('input[aria-label="Origin port"]')?.disabled ?? null`);
+  if (portDisabled === true) out('  Origin port is disabled (host carries the port); not typed');
+  else await typeInto('input[aria-label="Origin port"]', String(target.port));
   await d.click({ role: 'button', text: 'Add origin', match: 'startsWith' });
   return d.q('text', '[aria-label="Origins"]');
 }
