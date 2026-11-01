@@ -193,9 +193,12 @@ fn inspector(key: KeyEvent) -> Option<Action> {
         KeyCode::Char('y') => Action::CopyUrl,
         KeyCode::Char('o') => Action::OpenExternally,
         KeyCode::Char('i') => Action::ToggleIntercept,
-        // L4 inspector (a no-op on a non-L4 flow): b build craft, s inject.
+        // L4 inspector (a no-op on a non-L4 flow): b build craft, s inject,
+        // m apply the craft spec to the parked packet, u revert that edit.
         KeyCode::Char('b') => Action::L4Build,
         KeyCode::Char('s') => Action::L4Inject,
+        KeyCode::Char('m') => Action::L4MutateParked,
+        KeyCode::Char('u') => Action::L4RevertParked,
         KeyCode::Char(':') => Action::PaletteOpen,
         KeyCode::Char('/') => Action::FilterOpen,
         KeyCode::Char('?') => Action::Help,

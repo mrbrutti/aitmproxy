@@ -1929,6 +1929,8 @@ impl App {
             Action::L4Build => out.extend(self.l4_build()),
             Action::L4Inject => out.extend(self.l4_inject()),
             Action::L4Confirm(yes) => out.extend(self.l4_answer_confirm(yes)),
+            Action::L4MutateParked => out.extend(self.l4_mutate_parked()),
+            Action::L4RevertParked => out.extend(self.l4_revert_parked()),
             Action::L4ToggleGate(gate) => out.extend(self.l4_toggle_gate(gate)),
         }
         out
@@ -2046,6 +2048,23 @@ impl App {
     /// packet's id** from `l4.intercept.list`, the first listed for this flow
     /// (oldest first), never the flow id (AC10).
     fn l4_intercept_verb(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Vec<BusRequest> {
+        let Some(parked_id) = self.l4_parked_target(tool, flow) else {
+            return Vec::new();
+        };
+        let args = json!({ "id": parked_id });
+        self.l4.pending = Some((tool.to_string(), args.clone()));
+        vec![BusRequest::Call {
+            name: tool.to_string(),
+            args,
+        }]
+    }
+
+    /// The parked packet an `l4.intercept.*` verb acts on for `flow`, after the
+    /// refusals every parked-packet verb shares (B4/B5): intercept unavailable
+    /// (toast with the core's reason, AC11), the verb not on the bus, no parked
+    /// packet listed for the flow, or the flow out of L4 scope. `None` means
+    /// nothing may reach the bus; the toast says why.
+    fn l4_parked_target(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Option<String> {
         if !self.l4.intercept.available {
             let reason = self
                 .l4
@@ -2057,28 +2076,69 @@ impl App {
                 Level::Warn,
                 format!("in-path intercept unavailable: {reason}"),
             );
-            return Vec::new();
+            return None;
         }
         if !self.has_tool(tool) {
             self.toast(
                 Level::Warn,
                 format!("{tool} is not on this bus — in-path intercept is documented-limited here"),
             );
-            return Vec::new();
+            return None;
         }
         let Some(parked_id) = self.l4.parked_for(&flow.id).map(|p| p.id.clone()) else {
             self.toast(Level::Info, "no parked packet on this flow");
-            return Vec::new();
+            return None;
         };
         if !self.l4.in_scope(flow) {
             self.toast(Level::Warn, "Out of L4 scope — intercept actions disabled");
-            return Vec::new();
+            return None;
         }
-        let args = json!({ "id": parked_id });
-        self.l4.pending = Some((tool.to_string(), args.clone()));
+        Some(parked_id)
+    }
+
+    /// Craft pane `m` (L4 parity spec §4, AC12): apply the editor's spec to the
+    /// selected intercept flow's parked packet — `l4.intercept.mutate {id, spec}`
+    /// with the parked id from `l4.intercept.list` and the same spec the pane's
+    /// Build sends to `l4.craft`. Same refusals as Forward / Drop; a spec the
+    /// editor cannot parse stays in the pane as its error and sends nothing. The
+    /// reply needs no confirm; the parked list refreshes on the slow poll.
+    fn l4_mutate_parked(&mut self) -> Vec<BusRequest> {
+        let Some(flow) = self.selected_l4().cloned() else {
+            return Vec::new();
+        };
+        let Some(parked_id) = self.l4_parked_target("l4.intercept.mutate", &flow) else {
+            return Vec::new();
+        };
+        let spec = match parse_craft_yaml(&self.l4.craft.text()) {
+            Ok(s) => s,
+            Err(e) => {
+                self.l4.craft.error = Some(e);
+                self.toast(
+                    Level::Warn,
+                    "Fix the craft YAML before applying it to the parked packet",
+                );
+                return Vec::new();
+            }
+        };
+        self.l4.craft.error = None;
         vec![BusRequest::Call {
-            name: tool.to_string(),
-            args,
+            name: "l4.intercept.mutate".into(),
+            args: json!({ "id": parked_id, "spec": spec }),
+        }]
+    }
+
+    /// Craft pane `u` (AC12): discard the staged edit of the selected intercept
+    /// flow's parked packet — `l4.intercept.revert {id}`. Same refusals.
+    fn l4_revert_parked(&mut self) -> Vec<BusRequest> {
+        let Some(flow) = self.selected_l4().cloned() else {
+            return Vec::new();
+        };
+        let Some(parked_id) = self.l4_parked_target("l4.intercept.revert", &flow) else {
+            return Vec::new();
+        };
+        vec![BusRequest::Call {
+            name: "l4.intercept.revert".into(),
+            args: json!({ "id": parked_id }),
         }]
     }
 

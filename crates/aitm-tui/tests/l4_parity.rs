@@ -1413,3 +1413,181 @@ fn parked_id_packet_pane_render_is_inert() {
         "control character reached the terminal: {text:?}"
     );
 }
+
+// ------------------------------------------------------------------ mutate
+
+/// The spec the test types into the craft editor: JSON is valid YAML, so the
+/// editor's parser yields exactly this value for `l4.intercept.mutate.spec`.
+const EDITOR_SPEC: &str = r#"{"layers":[{"ipv4":{"src":"127.0.0.1","dst":"127.0.0.1"}},{"udp":{"src_port":40000,"dst_port":9053}},{"raw":[104,105]}]}"#;
+
+fn editor_spec() -> Value {
+    serde_json::from_str(EDITOR_SPEC).expect("literal spec is JSON")
+}
+
+/// An intercept-ready app with `P1` parked and `EDITOR_SPEC` in the craft pane.
+fn craft_ready(parked: Vec<Value>) -> App {
+    let mut app = intercept_ready(parked);
+    app.l4.craft.lines = vec![EDITOR_SPEC.to_string()];
+    app.l4.pane = L4Pane::Craft;
+    app
+}
+
+/// AC12: "apply to parked packet" emits exactly `l4.intercept.mutate {id: <parked
+/// id>, spec: <the editor's spec>}` — the parked id from `l4.intercept.list`,
+/// never the flow id, and the spec parsed from the editor's text.
+#[test]
+fn mutate_apply_sends_the_parked_id_and_the_editor_spec() {
+    let mut app = craft_ready(vec![parked_p1()]);
+    let out = app.update(Action::L4MutateParked);
+    assert_eq!(
+        out,
+        vec![BusRequest::Call {
+            name: "l4.intercept.mutate".into(),
+            args: json!({"id": "P1", "spec": editor_spec()}),
+        }]
+    );
+    let BusRequest::Call { args, .. } = &out[0] else {
+        panic!("{out:?}");
+    };
+    assert_eq!(args["id"], json!("P1"));
+    assert_eq!(args["spec"]["layers"][1]["udp"]["dst_port"], json!(9053));
+    assert!(!args.to_string().contains("\"F\""), "{args}");
+    assert!(app.l4.craft.error.is_none());
+}
+
+/// AC12: revert emits exactly `l4.intercept.revert {id: <parked id>}`.
+#[test]
+fn mutate_revert_sends_the_parked_id() {
+    let mut app = craft_ready(vec![parked_p1()]);
+    assert_eq!(
+        app.update(Action::L4RevertParked),
+        vec![BusRequest::Call {
+            name: "l4.intercept.revert".into(),
+            args: json!({"id": "P1"}),
+        }]
+    );
+}
+
+/// Both act on the first listed parked packet for the flow (decision 3), never
+/// another flow's.
+#[test]
+fn mutate_and_revert_act_on_the_first_listed_for_the_flow() {
+    let mut app = craft_ready(vec![
+        json!({"id": "P9", "flow": "OTHER", "state": "parked", "length": 1, "layers": []}),
+        json!({"id": "P2", "flow": "F", "state": "parked", "length": 1, "layers": []}),
+        json!({"id": "P3", "flow": "F", "state": "parked", "length": 1, "layers": []}),
+    ]);
+    let out = app.update(Action::L4MutateParked);
+    assert_eq!(out.len(), 1, "{out:?}");
+    let BusRequest::Call { name, args } = &out[0] else {
+        panic!("{out:?}");
+    };
+    assert_eq!(name, "l4.intercept.mutate");
+    assert_eq!(args["id"], json!("P2"));
+    assert_eq!(
+        app.update(Action::L4RevertParked),
+        vec![BusRequest::Call {
+            name: "l4.intercept.revert".into(),
+            args: json!({"id": "P2"}),
+        }]
+    );
+}
+
+/// The B4 refusal: intercept unavailable (reason `Y`) → neither verb reaches the
+/// bus and the toast carries the core's reason.
+#[test]
+fn mutate_unavailable_intercept_refuses_both_with_the_reason() {
+    let mut app = craft_ready(vec![parked_p1()]);
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable("X"),
+        intercept: L4Availability::from_reply(&json!({
+            "available": false, "code": "unsupported_platform", "reason": "Y", "sessions": []
+        })),
+        captures: vec![],
+    });
+    assert_eq!(app.update(Action::L4MutateParked), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+    assert_eq!(app.update(Action::L4RevertParked), Vec::<BusRequest>::new());
+    assert!(toast_text(&app).contains('Y'), "{}", toast_text(&app));
+}
+
+/// The B4 refusal: no parked packet for the flow → nothing on the bus, an
+/// honest toast.
+#[test]
+fn mutate_without_a_parked_packet_refuses_both() {
+    let mut app = craft_ready(vec![]);
+    assert_eq!(app.update(Action::L4MutateParked), Vec::<BusRequest>::new());
+    assert!(
+        toast_text(&app).contains("no parked packet"),
+        "{}",
+        toast_text(&app)
+    );
+    assert_eq!(app.update(Action::L4RevertParked), Vec::<BusRequest>::new());
+    assert!(
+        toast_text(&app).contains("no parked packet"),
+        "{}",
+        toast_text(&app)
+    );
+}
+
+/// A spec the editor cannot parse never reaches the bus: the error lands in
+/// the craft pane.
+#[test]
+fn mutate_with_unparsable_yaml_sends_nothing() {
+    let mut app = craft_ready(vec![parked_p1()]);
+    app.l4.craft.lines = vec!["layers: [".to_string()];
+    assert_eq!(app.update(Action::L4MutateParked), Vec::<BusRequest>::new());
+    assert!(app.l4.craft.error.is_some(), "{:?}", app.l4.craft.error);
+}
+
+/// On an HTTP row the two actions are no-ops (the key map is per mode, the
+/// reducer routes by flow kind).
+#[test]
+fn mutate_and_revert_are_noops_off_an_l4_flow() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert_eq!(app.update(Action::L4MutateParked), Vec::<BusRequest>::new());
+    assert_eq!(app.update(Action::L4RevertParked), Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "");
+}
+
+/// The inspector keys for the two verbs.
+#[test]
+fn mutate_keys_are_bound_in_the_inspector() {
+    assert_eq!(
+        keys::map(press('m'), Mode::Inspector),
+        Some(Action::L4MutateParked)
+    );
+    assert_eq!(
+        keys::map(press('u'), Mode::Inspector),
+        Some(Action::L4RevertParked)
+    );
+}
+
+/// The craft pane names the two keys and the parked id only when they can act
+/// (intercept available, a parked packet listed); otherwise it offers nothing
+/// that can only fail (AC33).
+#[test]
+fn mutate_craft_pane_lists_the_keys_only_when_they_can_act() {
+    let app = craft_ready(vec![parked_p1()]);
+    let text = render_inspector(&app);
+    assert!(text.contains("m apply to parked P1"), "{text}");
+    assert!(text.contains("u revert"), "{text}");
+
+    let none = craft_ready(vec![]);
+    let text = render_inspector(&none);
+    assert!(!text.contains("apply to parked"), "{text}");
+    assert!(!text.contains("u revert"), "{text}");
+
+    let mut off = craft_ready(vec![parked_p1()]);
+    let _ = off.on_bus(BusEvent::L4Availability {
+        capture: unavailable("X"),
+        intercept: L4Availability::from_reply(&json!({
+            "available": false, "code": "unsupported_platform", "reason": "Y", "sessions": []
+        })),
+        captures: vec![],
+    });
+    let text = render_inspector(&off);
+    assert!(!text.contains("apply to parked"), "{text}");
+    assert!(!text.contains("u revert"), "{text}");
+}

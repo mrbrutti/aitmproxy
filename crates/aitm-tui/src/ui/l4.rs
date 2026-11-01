@@ -314,10 +314,26 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     // The YAML editor (read + highlighted; editing lands via the command bus
     // and the palette today — the hook for in-pane Rhai craft is the
     // protocol-extensible seam, ui-ext §3.2).
+    // The parked-packet keys (spec §4 / AC12) are offered only when they can
+    // act: intercept available and a packet listed for this flow. Otherwise the
+    // header offers nothing that can only fail (AC33); the Intercept pane
+    // carries the documented-limited line.
+    let parked = if app.l4.intercept.available {
+        app.l4.parked_for(&flow.id)
+    } else {
+        None
+    };
+    let header = match parked {
+        Some(p) => format!(
+            "PacketSpec (YAML) — b build · s inject (guarded) · m apply to parked {} · u revert",
+            inert(&p.id)
+        ),
+        None => "PacketSpec (YAML) — b build · s inject (guarded)".to_string(),
+    };
     buf.set_string(
         editor.x + 1,
         editor.y,
-        "PacketSpec (YAML) — b build · s inject (guarded)",
+        header,
         theme.accent().add_modifier(Modifier::BOLD),
     );
     let body = Rect::new(
@@ -443,7 +459,7 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
                 theme.intercept_bar(),
             );
             let right = Line::styled(
-                "[a Forward] [e Mutate] [d Drop] (confirm) ".to_string(),
+                "[a Forward] [e Mutate] [u Revert] [d Drop] (confirm) ".to_string(),
                 theme.intercept_bar(),
             );
             put_sides(buf, bar, left, right);

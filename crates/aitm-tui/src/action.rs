@@ -124,6 +124,13 @@ pub enum Action {
     L4Inject,
     /// Answer the inject confirm overlay: `true` re-issues with `_confirm`.
     L4Confirm(bool),
+    /// Craft pane `m`: apply the editor's spec to the selected intercept
+    /// flow's parked packet (`l4.intercept.mutate {id, spec}`, L4 parity spec
+    /// §4 / AC12). The id is the parked packet's from `l4.intercept.list`.
+    L4MutateParked,
+    /// Craft pane `u`: discard the staged edit of that parked packet
+    /// (`l4.intercept.revert {id}`).
+    L4RevertParked,
     /// Toggle one per-feature agent gate in the Agent view (`l4.agent.set`).
     L4ToggleGate(crate::l4::L4Gate),
 }
