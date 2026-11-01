@@ -66,10 +66,20 @@
               "name": "id",
               "type": "string",
               "description": "The L4 flow id to summarize."
+            },
+            {
+              "name": "offset",
+              "type": "int",
+              "description": "First packet index to return (optional, default 0)."
+            },
+            {
+              "name": "limit",
+              "type": "int",
+              "description": "How many packets to return (optional, default 256, at most 4096; 0 returns none)."
             }
           ],
           "returns": "object",
-          "description": "Summarize one stored L4 flow and its packets (read-only)."
+          "description": "Summarize one stored L4 flow and a window of its packets (read-only); each packet's bytes only for trusted callers or an agent holding the gate that could have produced that packet (Inject for an injected one, Capture for a captured one)."
         },
         {
           "name": "inject",

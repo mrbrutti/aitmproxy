@@ -634,7 +634,7 @@ Kept by the main session during stage 6. One row per finding.
 | (a) A5 | spec | Minor | `commands/scope.rs` missing from §7(a); A5 filed under (a') | fixed: spec §7(a) lists it; A5 stays in (a) (Decision 5) |
 | (a) A2 | security | Minor | `l4.flow.get` clones the whole flow under the store lock whatever the window | accepted by the orchestrator 2026-11-01 as follow-up (windowed store accessor in `src/flow.rs`, the store, outside (a)) |
 | (a) §2.1 | security | Minor | Other cores on the host and the CDP port are not excluded | accepted; recorded as a known limit in spec §2.1 |
-| (a) A14 | quality | Minor | `docs/design/languages/rhai.api.json` still lists `flow.get` with only `id` | follow-up for unit (e) (file outside (a)) |
+| (a) A14 | quality | Minor | `docs/design/languages/rhai.api.json` still lists `flow.get` with only `id` | fixed in (a) after the Terminal gate's `shipped_namespaces_equal_production_assembly` golden went red: the `l4` namespace entry regenerated to the production signature (offset, limit, per-packet bytes text); file claimed through the orchestrator |
 | (a) A11 (re-panel) | security | Important | Per-flow-kind bytes gate let an Inject-only agent read captured send_recv replies | fixed 28af06e3: per-packet rule (captured→Capture gate, injected→Inject gate); spec §2.2/AC35 amended 262b15ab |
 | (a) A13 (re-panel) | quality | Important | `expire_due` deep-cloned every parked packet per reader pass | fixed f3d5a4f2: `ParkedTable::due()` by reference |
 | (a) fix 2 (re-panel) | security | Minor ×2 | NE ingress ran the frame decoder over UDP payloads (crafted payload could suppress a record); intercept self-check parsed as Ethernet while `ip_target` parses L3 | fixed e5ac6f63 (target-only admission), 0b95ef21 (one L3 parse) |
