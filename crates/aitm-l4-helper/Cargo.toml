@@ -26,3 +26,14 @@ workspace = true
 # keeps the workspace `unsafe_code = "forbid"`.
 [target.'cfg(target_os = "macos")'.dependencies]
 oslog = { version = "0.2.0", default-features = false }
+
+# Linux `serve` mode (plan P2.6, spec §5.1, spike S7): the privilege drop to
+# the invoking user keeping only CAP_NET_RAW. `caps` for the bounding /
+# ambient / permitted+effective sets, `nix` for setgroups/setresgid/setresuid,
+# prctl (keepcaps, no_new_privs, PDEATHSIG), SO_PEERCRED and the raw IP socket
+# used for local-destination injects (IP_HDRINCL). Both expose safe APIs; this
+# crate keeps the workspace `unsafe_code = "forbid"`. `nix` 0.31 was already in
+# the lock; `caps` 0.5.6 is new (fetched once in the Terminal).
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = "0.5.6"
+nix = { version = "0.31", features = ["user", "process", "socket", "fs", "uio"] }
