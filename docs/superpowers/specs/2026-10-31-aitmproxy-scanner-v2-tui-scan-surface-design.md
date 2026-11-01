@@ -158,7 +158,7 @@ Every `CallTaggedFailed` for a `scan.*` verb becomes a `ScanError`; the wording 
 | push `notifications/aitm/job` | `JobNotification` | a trigger only (D6); `status`/`issue` payloads are not folded |
 | `scan.discover` (legacy) | today's hand-rolled read, moved to `scan/legacy.rs` unchanged | `legacy.*` |
 
-A result that fails to parse is a `ScanError` with `code: None`, detail `"<verb>: reply did not match the contract (<serde error>)"`; the previous state stays on screen.
+A result that fails to parse is a `ScanError` with `code: None`, detail `"reply did not match the contract (<serde error>)"` (the `wording()` of an uncoded error already prefixes `<verb>: `, so the detail carries no verb; amended on panel review 2026-11-01); the previous state stays on screen.
 
 ### D11. The four tabs
 
