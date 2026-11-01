@@ -425,7 +425,7 @@ async function run() {
 
   // 2 ----------------------------------------------------------------------------------------
   await step('02 start a standard scan against the test target', async () => {
-    await d.click({ sel: `${PROFILES} [data-profile="standard"]` });
+    if (!(await selectProfile('standard', '02'))) return;
     const origins = await addTargetOrigin();
     const want = `http://127.0.0.1:${target.port}`;
     expect((origins ?? '').includes(want), '02a the origin picker composed the target origin', `Origins reads ${j(origins)}, wanted ${want}`);

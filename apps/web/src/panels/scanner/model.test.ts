@@ -407,6 +407,65 @@ describe('garbage payloads', () => {
   });
 });
 
+describe('unsafe and duplicate ids', () => {
+  // A Solid store refuses to traverse `__proto__` (`Refusing to traverse unsafe key`), so a row keyed
+  // by that id would be accepted here and then silently never held: the parsers refuse it instead.
+  it('parseJobStatus is null for a job id of __proto__', () => {
+    const raw = fixture('scan.status.json') as Record<string, unknown>;
+    expect(parseJobStatus({ ...raw, job: '__proto__' })).toBeNull();
+    expect(parseJobSummary({ ...raw, job: '__proto__' })).toBeNull();
+  });
+
+  it('an issues page drops the __proto__ row and keeps the others', () => {
+    const issues = (fixture('scan.issues.json') as { issues: Record<string, unknown>[] }).issues;
+    const page = parseIssuesResult({
+      issues: [{ ...issues[0]!, id: '__proto__' }, issues[1]],
+      next_cursor: null,
+      by_severity: {},
+    });
+    expect(page!.issues.map((i) => i.id)).toEqual(['issue-4c3b2a19']);
+  });
+
+  it('parseProfileList drops a __proto__ entry', () => {
+    const profiles = (fixture('scan.profile.list.json') as { profiles: Record<string, unknown>[] }).profiles;
+    const list = parseProfileList({ profiles: [{ ...profiles[0]!, name: '__proto__' }, profiles[3]] });
+    expect(list!.profiles.map((p) => p.name)).toEqual(['standard']);
+  });
+
+  it('a sitemap drops a __proto__ node or point id and blanks a __proto__ ref', () => {
+    const map = fixture('scan.sitemap.json') as { nodes: Record<string, unknown>[]; points: Record<string, unknown>[] };
+    const parsed = parseSitemapResult({
+      nodes: [{ ...map.nodes[0]!, id: '__proto__' }, { ...map.nodes[0]!, flows: ['__proto__', 'flow-1'] }],
+      points: [{ ...map.points[0]!, id: '__proto__' }, { ...map.points[1]!, site_node: '__proto__', flow: '__proto__' }],
+      next_cursor: null,
+    });
+    expect(parsed!.nodes.map((n) => n.id)).toEqual(['node-1']);
+    expect(parsed!.nodes[0]!.flows).toEqual(['flow-1']);
+    expect(parsed!.points.map((p) => p.id)).toEqual(['point-cookie-1']);
+    expect(parsed!.points[0]!.site_node).toBeNull();
+    expect(parsed!.points[0]!.flow).toBeNull();
+  });
+
+  it('a duplicate id on a page keeps the first occurrence only', () => {
+    const issues = (fixture('scan.issues.json') as { issues: Record<string, unknown>[] }).issues;
+    const page = parseIssuesResult({
+      issues: [issues[0], { ...issues[1]!, id: 'issue-9f8e7d6c', name: 'second' }, issues[1]],
+      next_cursor: null,
+      by_severity: {},
+    });
+    expect(page!.issues.map((i) => i.id)).toEqual(['issue-9f8e7d6c', 'issue-4c3b2a19']);
+    expect(page!.issues[0]!.name).not.toBe('second');
+
+    const jobs = (fixture('scan.list.json') as { jobs: Record<string, unknown>[] }).jobs;
+    const list = parseListResult({ jobs: [jobs[0], jobs[0], jobs[1]] });
+    expect(list!.jobs.map((j) => j.job)).toEqual(['scan-1a2b3c4d', 'scan-55667788']);
+
+    const profiles = (fixture('scan.profile.list.json') as { profiles: Record<string, unknown>[] }).profiles;
+    const plist = parseProfileList({ profiles: [profiles[3], profiles[3], profiles[0]] });
+    expect(plist!.profiles.map((p) => p.name)).toEqual(['standard', 'passive-only']);
+  });
+});
+
 describe('parseScanError', () => {
   it('splits a scan error message into its code and detail', () => {
     expect(parseScanError('scan: out_of_scope: host x')).toEqual({

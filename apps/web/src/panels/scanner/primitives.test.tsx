@@ -64,6 +64,17 @@ describe('listboxKeys', () => {
     expect(h.focusDetail).not.toHaveBeenCalled();
   });
 
+  it('a duplicated id never traps the arrow: ArrowDown moves to the next different id', () => {
+    const h = harness(['a', 'a', 'b'], 'a');
+    h.key('ArrowDown');
+    expect(h.current()).toBe('b');
+    h.key('ArrowUp');
+    expect(h.current()).toBe('a');
+    h.key('ArrowUp');
+    expect(h.current()).toBe('a');
+    expect(h.select).toHaveBeenCalledTimes(3);
+  });
+
   it('Enter calls focusDetail and selects nothing; an unrelated key does nothing', () => {
     const h = harness(['a', 'b'], 'a');
     h.key('Enter');

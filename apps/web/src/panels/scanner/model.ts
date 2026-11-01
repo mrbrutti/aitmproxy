@@ -673,6 +673,31 @@ function str(v: unknown): string {
   return typeof v === 'string' ? v : '';
 }
 
+/**
+ * The one key a Solid store will not hold: `setStore(path, '__proto__', …)` logs "Refusing to
+ * traverse unsafe key" and writes nothing, so a row keyed by it would be polled forever and never
+ * shown. Every id and id reference on this wire goes through `idStr`/`optId`/`idList`; an unsafe
+ * id is `null` (the enclosing row is dropped), an unsafe reference reads as absent.
+ */
+const UNSAFE_ID = '__proto__';
+
+/** A required id: a non-empty string that a store can key on, or `null`. */
+function idStr(v: unknown): string | null {
+  const s = reqStr(v);
+  return s === null || s === UNSAFE_ID ? null : s;
+}
+
+/** An optional id reference (a flow, a site node): absent, or a string a store can key on. */
+function optId(v: unknown): string | null {
+  const s = optStr(v);
+  return s === null || s === UNSAFE_ID ? null : s;
+}
+
+/** A list of id references with the unsafe key filtered out. */
+function idList(v: unknown): string[] {
+  return strList(v).filter((x) => x !== UNSAFE_ID);
+}
+
 function optStr(v: unknown): string | null {
   return typeof v === 'string' ? v : null;
 }
@@ -725,6 +750,20 @@ function rows<T>(v: unknown, parse: (raw: unknown) => T | null, cap = MAX_LIST):
     if (parsed !== null) out.push(parsed);
   }
   return out;
+}
+
+/**
+ * `rows`, keeping the first row of each id only. A listbox walks ids, so a page that repeats one
+ * (a core bug, a cursor overlap) would otherwise trap ArrowDown on the repeated row.
+ */
+function uniqueRows<T>(v: unknown, parse: (raw: unknown) => T | null, key: (row: T) => string, cap = MAX_LIST): T[] {
+  const seen = new Set<string>();
+  return rows(v, parse, cap).filter((row) => {
+    const k = key(row);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 
 /** Map a list of tokens, dropping unknown ones. For read-only report types only. */
@@ -900,7 +939,7 @@ function startedBy(v: unknown): StartedBy {
 export function parseJobStatus(raw: unknown): JobStatus | null {
   const o = dict(raw);
   if (!o) return null;
-  const job = reqStr(o.job);
+  const job = idStr(o.job);
   const state = token(JOB_STATES, o.state);
   const phase = token(PHASES, o.phase);
   if (job === null || state === null || phase === null) return null;
@@ -932,7 +971,7 @@ export function parseJobStatus(raw: unknown): JobStatus | null {
 export function parseJobSummary(raw: unknown): JobSummary | null {
   const o = dict(raw);
   if (!o) return null;
-  const job = reqStr(o.job);
+  const job = idStr(o.job);
   const state = token(JOB_STATES, o.state);
   const phase = token(PHASES, o.phase);
   if (job === null || state === null || phase === null) return null;
@@ -951,7 +990,7 @@ export function parseJobSummary(raw: unknown): JobSummary | null {
 export function parseStartResult(raw: unknown): StartResult | null {
   const o = dict(raw);
   if (!o) return null;
-  const job = reqStr(o.job);
+  const job = idStr(o.job);
   const status = parseJobStatus(o.status);
   if (job === null || status === null) return null;
   return {
@@ -968,7 +1007,7 @@ export function parseStartResult(raw: unknown): StartResult | null {
 export function parseListResult(raw: unknown): ListResult | null {
   const o = dict(raw);
   if (!o) return null;
-  return { jobs: rows(o.jobs, parseJobSummary) };
+  return { jobs: uniqueRows(o.jobs, parseJobSummary, (j) => j.job) };
 }
 
 /* ------------------------------------------------------------------ issue parsers */
@@ -1076,7 +1115,7 @@ function evidence(v: unknown): Evidence {
     payload: optStr(o.payload),
     matched: optStr(o.matched),
     probe_flows: strList(o.probe_flows),
-    baseline_flow: optStr(o.baseline_flow),
+    baseline_flow: optId(o.baseline_flow),
     timing: timing(o.timing),
     diff: diff(o.diff),
     l4: l4Evidence(o.l4),
@@ -1087,8 +1126,8 @@ function evidence(v: unknown): Evidence {
 function issueCore(raw: unknown): IssueSummary | null {
   const o = dict(raw);
   if (!o) return null;
-  const id = reqStr(o.id);
-  const job = reqStr(o.job);
+  const id = idStr(o.id);
+  const job = idStr(o.job);
   const severity = isSeverity(o.severity) ? o.severity : null;
   const confidence = token(CONFIDENCES, o.confidence);
   const status = token(ISSUE_STATUSES, o.status);
@@ -1110,7 +1149,7 @@ function issueCore(raw: unknown): IssueSummary | null {
   return {
     id,
     job,
-    jobs: strList(o.jobs),
+    jobs: idList(o.jobs),
     check_id: str(o.check_id),
     class: str(o.class),
     name: str(o.name),
@@ -1152,7 +1191,7 @@ export function parseIssuesResult(raw: unknown): IssuesResult | null {
   const o = dict(raw);
   if (!o) return null;
   return {
-    issues: rows(o.issues, parseIssueSummary, ISSUES_LIMIT),
+    issues: uniqueRows(o.issues, parseIssueSummary, (i) => i.id, ISSUES_LIMIT),
     next_cursor: optStr(o.next_cursor),
     by_severity: bySeverity(o.by_severity),
   };
@@ -1172,7 +1211,7 @@ function paramRef(v: unknown): ParamRef | null {
 export function parseSiteNode(raw: unknown): SiteNode | null {
   const o = dict(raw);
   if (!o) return null;
-  const id = reqStr(o.id);
+  const id = idStr(o.id);
   const path_template = optStr(o.path_template);
   if (id === null || path_template === null) return null;
   return {
@@ -1182,7 +1221,7 @@ export function parseSiteNode(raw: unknown): SiteNode | null {
     host: str(o.host),
     port: num(o.port),
     path_template,
-    flows: strList(o.flows),
+    flows: idList(o.flows),
     params: rows(o.params, paramRef),
     auth: bool(o.auth),
     points: num(o.points),
@@ -1194,7 +1233,7 @@ export function parseSiteNode(raw: unknown): SiteNode | null {
 export function parseInsertionPoint(raw: unknown): InsertionPoint | null {
   const o = dict(raw);
   if (!o) return null;
-  const id = reqStr(o.id);
+  const id = idStr(o.id);
   const lane = token(LANES, o.lane);
   const kind = token(INSERTION_KINDS, o.kind);
   if (id === null || lane === null || kind === null) return null;
@@ -1205,8 +1244,8 @@ export function parseInsertionPoint(raw: unknown): InsertionPoint | null {
     name: str(o.name),
     path: optStr(o.path),
     example: optStr(o.example),
-    flow: optStr(o.flow),
-    site_node: optStr(o.site_node),
+    flow: optId(o.flow),
+    site_node: optId(o.site_node),
     traits: tokenList(POINT_TRAITS, o.traits),
     frequency: num(o.frequency),
     method: optStr(o.method),
@@ -1243,7 +1282,7 @@ function checkOrigin(v: unknown): CheckOrigin | null {
 export function parseCheckMeta(raw: unknown): CheckMeta | null {
   const o = dict(raw);
   if (!o) return null;
-  const id = reqStr(o.id);
+  const id = idStr(o.id);
   const intensity = token(INTENSITIES, o.intensity);
   const cost = token(CHECK_COSTS, o.cost);
   const technique = token(TECHNIQUES, o.technique);
@@ -1294,7 +1333,7 @@ export function parseChecksResult(raw: unknown): ChecksResult | null {
 function profileListEntry(v: unknown): ProfileListEntry | null {
   const o = dict(v);
   if (!o) return null;
-  const name = reqStr(o.name);
+  const name = idStr(o.name);
   const s = dict(o.summary);
   if (name === null || s === null) return null;
   const intensity = token(INTENSITIES, s.intensity);
@@ -1311,7 +1350,7 @@ function profileListEntry(v: unknown): ProfileListEntry | null {
 export function parseProfileList(raw: unknown): ProfileListResult | null {
   const o = dict(raw);
   if (!o) return null;
-  return { profiles: rows(o.profiles, profileListEntry) };
+  return { profiles: uniqueRows(o.profiles, profileListEntry, (p) => p.name) };
 }
 
 function l4TargetSpec(v: unknown): L4TargetSpec | null {
@@ -1336,7 +1375,7 @@ function ignoreRule(v: unknown): IgnoreRule | null {
 function l4Seed(v: unknown): L4Seed | null {
   const o = dict(v);
   if (!o) return null;
-  const flow = optStr(o.flow);
+  const flow = optId(o.flow);
   const hex = optStr(o.hex);
   const base64 = optStr(o.base64);
   const given = [flow, hex, base64].filter((x) => x !== null);
@@ -1423,7 +1462,7 @@ export function parseScanProfile(raw: unknown): ScanProfile | null {
       max_points_per_request: num(a.max_points_per_request, 64),
       frequent_point_threshold: num(a.frequent_point_threshold, 8),
     },
-    session: { mode, from_flow: optStr(s.from_flow), on_lost },
+    session: { mode, from_flow: optId(s.from_flow), on_lost },
     budget: {
       probes: num(b.probes, 2000),
       time_s: num(b.time_s, 600),
@@ -1449,7 +1488,7 @@ export function parseScanProfile(raw: unknown): ScanProfile | null {
 export function parseProfileSaveResult(raw: unknown): ProfileSaveResult | null {
   const o = dict(raw);
   if (!o) return null;
-  const saved = reqStr(o.saved);
+  const saved = idStr(o.saved);
   const path = reqStr(o.path);
   if (saved === null || path === null) return null;
   return { saved, path };
@@ -1472,7 +1511,7 @@ export function parseSessionProfile(raw: unknown): SessionProfile | null {
     origin,
     cookies: strList(o.cookies),
     headers: strList(o.headers),
-    source_flow: optStr(o.source_flow),
+    source_flow: optId(o.source_flow),
     observed_at: num(o.observed_at),
     canary: canary(o.canary),
   };
@@ -1485,7 +1524,7 @@ export function parseJobNotification(raw: unknown): JobNotification | null {
   const o = dict(raw);
   if (!o) return null;
   if (o.kind !== JOB_KIND_SCAN) return null;
-  const job = reqStr(o.job);
+  const job = idStr(o.job);
   const event = token(JOB_EVENTS, o.event);
   const status = parseJobSummary(o.status);
   if (job === null || event === null || status === null) return null;

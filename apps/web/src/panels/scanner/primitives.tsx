@@ -104,6 +104,10 @@ export interface ListboxKeys {
  * The `onKeyDown` of a `role="listbox"` (W-17, `Findings.tsx:46-72`): ArrowDown/ArrowUp move one
  * row (from nothing: first / last), Home/End jump, Enter focuses the detail; a keyboard selection
  * scrolls its row into view. Every move is clamped; an empty list is a no-op. Nothing animates.
+ *
+ * A move starts at the first occurrence of the selected id and lands on the next *different* id,
+ * so a page that repeats an id (the parsers dedupe, but the keyboard must not depend on it) never
+ * traps the arrow on the repeated row.
  */
 export function listboxKeys(opts: ListboxKeys): (e: KeyboardEvent) => void {
   const pick = (id: string): void => {
@@ -113,8 +117,15 @@ export function listboxKeys(opts: ListboxKeys): (e: KeyboardEvent) => void {
   const move = (delta: number): void => {
     const all = opts.ids();
     if (all.length === 0) return;
-    const at = all.indexOf(opts.selectedId() ?? '');
-    const next = at < 0 ? (delta > 0 ? 0 : all.length - 1) : Math.max(0, Math.min(all.length - 1, at + delta));
+    const current = opts.selectedId();
+    const at = current === null ? -1 : all.indexOf(current);
+    let next = at < 0 ? (delta > 0 ? 0 : all.length - 1) : at;
+    for (let i = at + delta; at >= 0 && i >= 0 && i < all.length; i += delta) {
+      if (all[i] !== current) {
+        next = i;
+        break;
+      }
+    }
     const id = all[next];
     if (id !== undefined) pick(id);
   };
