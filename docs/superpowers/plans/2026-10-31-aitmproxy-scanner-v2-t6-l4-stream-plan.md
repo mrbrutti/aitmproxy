@@ -36,6 +36,7 @@ T6 fills the `aitm-scan-l4-stream` skeleton that T1a handed over: a grammar form
 | B | Stage-6 panel round 1, fix task B (grammars, denylist, mutators, client, YAML, live harness): SMTP/FTP `sp` is a `present`/`absent` choice with only `absent` immutable and `delim_inject` steps out of a `choice`; `Grammar::specs()` so C1 covers all 11 documents; the denylist uses `mqtt::{read_varint, read_string}`; const interesting tables; underscored unused parameters; allow reasons; `tlv.yaml` prose; `codec::decode_hex` in the harness. |
 | R2 | Stage-6 panel round 2 (Minors from the re-review): the count is registered under the count field's name only; capped-repeat test asserts equality; profile seeds decoded once per job with notes shared across nodes; `authorise_preview` is the single discovery refusal point (the disabled lane warns too); `mqtt::connect_flags` shared with the denylist; `capture_tracing` returns the serial lock; WARN test split in three on an ephemeral port; duplicate DNS test removed, RESP count test moved to `resp.rs`; `grammars::testkit` shared by SMTP/FTP; `FieldPath::parent`; `#[doc(hidden)]` on the two test-reachable fns. |
 | F6 | A named `tlv` target still infers its length relation from the corpus and a named `raw` takes the seeds (found by the first bus-level run on T1b's engine: `grammar="tlv" reason=named ... points=0`); `grammar.rs` `infer_or_raw`/`raw_over` (`grammar.rs`, `lib.rs` test). |
+| F7 | The host carries the marker it was built with (`StreamHost::marker()` is constant; `probe_host_for` registers one marker per host): the engine's `JobCtx::marker()` mints a fresh token per call, which left every campaign without its job state on the first bus-level run (`host.rs`, `lib.rs`, `state.rs`). |
 | R3 | Round-2 re-review leftovers: `TracingCapture` drops the sink guard before the serial lock; test rename; stale port comment; spec errata (empty-target clause, `Arc<Vec<String>>`). |
 
 The Review log holds the findings each round closes.
@@ -405,6 +406,7 @@ Kept by the T6 session during stage 6. One row per finding. Range reviewed: `395
 | Task | Reviewer | Severity | Finding | Disposition |
 |---|---|---|---|---|
 | 23 | T6 session (cells) | Important | A target naming `grammar: "tlv"` selected the inference-less registry stub: `discover` logged `reason=named ... points=0`, jobs finished `done` with zero issues | Fixed in 2aa0e2c4 (F6) |
+| 23 | T6 session (cells) | Important | `JobCtx::marker()` is a generator in T1b's engine; the lane's by-marker lookup (A2) never matched, 18 checks ran in 1 ms with `probes.sent: 0` | Fixed in fc735c2d (F7) |
 | 23 | T6 session (cells) | External | `test_t6_grammars_live.py::advertises()` required the grammar name as a token in an `l4_field` check id; T6 ships three generic checks (S6.3) | Fixed by T10 in PR #233 (`lane_landed`) |
 | 23 | T6 session (cells) | Info | T1b's contract additions (`Verdict.location`/`more`, `CheckMeta.scope`, `L4Options.fields`) break the lane's build until #232 merges | Adapted on the proof branch; applied to #229 at integration once #232 is on main |
 
