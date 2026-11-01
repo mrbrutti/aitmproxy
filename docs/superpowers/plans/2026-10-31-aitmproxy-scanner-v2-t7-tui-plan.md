@@ -636,6 +636,14 @@ Kept by the main session during stage 6. One row per finding.
 | G-A | coder note | Minor | G46 a mismatching `saved` skips the toast but still refreshes the list; the builtin save-as test's reply now names the draft | ratified |
 | G-A | coder note | Minor | G49 `set_text(Name)` refuses an empty name; G67 let-else applies to any launch reply with no pending; G83 `healed` cleared when the 40-tick list request fires | ratified |
 | G-A | coder note | Minor | `ScanError::new` cleans the whole message once before truncating | accepted (error path) |
+| G-C | fix round | done | G93-G101 in `e32e7275`; py_compile and discovery clean; sandbox run dies at the bind denial before any claim | cell re-review (combined panel) |
+| G-C | coder note | Minor | Site map tab marker is the summary `\d+ nodes` (the v2 Nodes pane has no title) | ratified |
+| G-C | coder note | Minor | `P` selection read from the detail pane's `poc` line or the issue name on list and detail (the Findings overlay marks its selection by highlight only) | ratified |
+| G-C | coder note | Minor | focus is a style, not text: `back_to_scan_list` and `focus_profiles_list` press one `Esc` and recover with `:scan` if the strip leaves | ratified |
+| G-C | coder note | Minor | the TUI's own job is cancelled before the harness `scan.start` comparison (one running job per origin) | ratified |
+| G-C | coder note | Minor | a T7-19 node without flows is a failing check; evidence dir created lazily so a skip leaves none | ratified |
+| G-C | coder note | note | `harness_scan_start` reuses the old profile shape for `target.l4`; a schema mismatch fails loudly | accepted; the live run will tell |
+| G-C | coder note | note | a bind denial in the sandbox is reported as FAIL, not SKIP | accepted (not a plan capability gate) |
 
 ## Shipped
 
