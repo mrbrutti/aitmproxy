@@ -406,6 +406,15 @@ a bounded scrubbed excerpt of what matched, timing correlation, response diff,
 the probe flows and the baseline flow), and its triage **status**: `open`,
 `confirmed` or `false_positive`, set with `scan.issue.update` and persisted.
 
+An issue belongs to **every job that found it**: spec D6 dedupes across jobs,
+so a later job that re-finds a known weakness merges into the existing record
+(`occurrences` grows, `last_seen` moves, evidence is replaced only on higher
+confidence); `job` names the first finder and `jobs` lists every job that found
+or re-found it, and `scan.issues { job }` and a job's `issues` tally include the
+issue for each of them (amendment 27c). An `issue` push line means found **or**
+re-found. `scan.sitemap` names the job its map came from in `job`, also when it
+fell back to the newest job (27b).
+
 **Dedupe.** One weakness at one place is one issue however many checks report
 it: the dedupe key is a blake3 digest of the **class plus the location**, and
 the check id is deliberately not part of it, so a second check finding the same
@@ -592,6 +601,15 @@ replayed **every 25 probes**. A `2xx` that turns into a redirect, a `401` or a
 `403` means the session is gone. Under `session.on_lost: stop` (the default) the
 job ends with `stopped_reason: session_lost`; under `continue` it keeps going
 unauthenticated.
+
+Two consequences for anyone seeding a session for a scan: points whose **name**
+looks like session material (cookies such as `sid`, headers such as
+`Authorization`, token-like parameters) carry the `session` trait and the
+default `audit.ignore` rule skips them (`points.skipped.ignored`); the canary
+request's own point is **not** excluded from the audit. Seed the session with
+the cookie alone, on `/`, and send the pages you want audited without session
+headers; a fabricated `Authorization` header is re-sent on every probe and a
+target that refuses it answers nothing worth reflecting.
 
 ## Running one check by hand
 

@@ -810,7 +810,8 @@ impl Command for ScanSitemap {
             description: "The site map one job discovered: its nodes (method and path \
                           template per origin) and the insertion points on them. Name the \
                           job, name a `target` origin and get its newest job, or give \
-                          neither and get the newest job of all. `nodes` is \
+                          neither and get the newest job of all; `job` names the job \
+                          the map came from. `nodes` is \
                           always complete; `points` is paged — at most `limit` (default \
                           1024, capped 4096), then pass `next_cursor` back as `cursor`."
                 .into(),
@@ -894,6 +895,7 @@ impl Command for ScanSitemap {
         let next = offset.saturating_add(points.len());
         let next_cursor = (next < guarded.points.len()).then(|| next.to_string());
         let result = SitemapResult {
+            job: Some(job.clone()),
             nodes: guarded.nodes.clone(),
             points,
             next_cursor,
@@ -1715,6 +1717,57 @@ mod tests {
             .call("scan.issue", &[("id", s("issue-00000000"))])
             .expect_err("an unknown issue is refused");
         assert_eq!(code(&missing), ScanErrorCode::NotFound);
+    }
+
+    /// Amendment 27c (T7 live run 3): a second job on the same core and target
+    /// re-finds the issue the first job recorded; D6 merges it, and the per-job
+    /// view still lists it for the re-finder — `scan.issues { job: <second> }`
+    /// returns it with `jobs` of length 2 and `job` naming the first finder.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_job_lists_the_issue_it_refound() {
+        let h = Harness::with_check(FakeCheck::new("fake.vuln", "demo", FakeRun::vulnerable()));
+        h.capture("/search?q=1", HeaderMap::new(), "ok");
+
+        let first = h.ok("scan.start", &[("target", s("http://scan.test"))]);
+        let first_job = as_str(obj(&first, "job")).to_string();
+        h.wait_terminal(&first_job).await;
+        let second = h.ok("scan.start", &[("target", s("http://scan.test"))]);
+        let second_job = as_str(obj(&second, "job")).to_string();
+        assert_ne!(first_job, second_job);
+        h.wait_terminal(&second_job).await;
+
+        let mine = h.ok("scan.issues", &[("job", s(&second_job))]);
+        let listed = as_array(obj(&mine, "issues"));
+        assert!(
+            !listed.is_empty(),
+            "the second job lists the issue it re-found"
+        );
+        let issue = &listed[0];
+        assert_eq!(
+            as_str(obj(issue, "job")),
+            first_job,
+            "`job` names the first finder"
+        );
+        let jobs: Vec<&str> = as_array(obj(issue, "jobs"))
+            .iter()
+            .map(|j| as_str(j))
+            .collect();
+        assert_eq!(jobs, vec![first_job.as_str(), second_job.as_str()]);
+        assert_eq!(
+            as_array(obj(
+                &h.ok("scan.issues", &[("job", s(&first_job))]),
+                "issues"
+            ))
+            .len(),
+            listed.len(),
+            "the first finder still lists the same issues"
+        );
+        let status = h.ok("scan.status", &[("job", s(&second_job))]);
+        let total = obj(obj(&status, "issues"), "total");
+        assert!(
+            matches!(total, Value::Int(n) if *n >= 1),
+            "the second job's issues tally counts the re-found issue: {total:?}"
+        );
     }
 
     /// Spec D3 / call B12: `scan.sitemap` pages its points by a decimal cursor

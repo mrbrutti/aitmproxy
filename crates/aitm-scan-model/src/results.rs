@@ -80,6 +80,11 @@ pub struct IssuesResult {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "snake_case")]
 pub struct SitemapResult {
+    /// The job this map came from: the `job` given, the newest job against
+    /// `target`, or the newest job of all when neither was given (additive,
+    /// amendment 27b; always set by the engine, `None` only on an older core).
+    #[serde(default)]
+    pub job: Option<JobId>,
     /// The site nodes in this page.
     pub nodes: Vec<SiteNode>,
     /// The insertion points in this page, at most the requested `limit`.
@@ -454,6 +459,7 @@ mod tests {
         );
 
         let sitemap = SitemapResult {
+            job: Some("scan-1a2b3c4d".to_string()),
             nodes: Vec::new(),
             points: Vec::new(),
             next_cursor: Some("node-42".to_string()),
