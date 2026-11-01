@@ -119,10 +119,17 @@ the `200 Connection Established` acknowledgement the first byte the client sends
 must be a TLS handshake record (`0x16`); then the relay starts with that byte.
 EOF before it is `failed/client_closed`; any other first byte is
 `failed/protocol_error` and nothing is relayed. This holds for out-of-scope and
-pinned hosts alike (the feature is *TLS* passthrough) and restores the pre-branch
-posture: the only bytes that reach an arbitrary `host:port` through the proxy are
-a TLS handshake, never a client-chosen raw protocol (a cleartext `CONNECT` to an
-out-of-scope host, `curl -p http://…`, is therefore refused rather than relayed).
+pinned hosts alike (the feature is *TLS* passthrough). What it guarantees, exactly:
+the first byte inside the tunnel is a TLS record type and nothing is relayed before
+it, so a cleartext `CONNECT` to an out-of-scope host (`curl -p http://…`) is refused
+rather than relayed. It does not inspect what follows the first byte: a local
+process that prefixes a raw protocol with `0x16` can still reach a junk-tolerant
+service through an out-of-scope relay (the panel's S6). A destination-port
+allow-list for relays (443 plus ports named by Scope entries and pins) and/or the
+browser connector's private-network policy on relays is a follow-up decision for
+Matt, recorded in the plan's Review log. The wait for that first byte is bounded
+(`FIRST_BYTE_TIMEOUT`, 30 s): a client that acknowledges and then sends nothing is
+recorded as `failed/client_closed` and both sockets are closed (S7).
 
 - *Tunnel authority* is `host:port` from the `CONNECT host:port` line (port defaults
   to 443 when absent). For a raw TLS connection (no CONNECT) it is the ClientHello
