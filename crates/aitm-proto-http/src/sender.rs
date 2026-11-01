@@ -37,6 +37,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use crate::h2_sender::H2Pool;
 use crate::sansio::{Http1Machine, HttpSansIoEvent, HttpStateMachine, Side};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -163,6 +164,7 @@ pub struct HttpSender {
     dialer: Arc<dyn Dialer>,
     ssrf: Option<SsrfGate>,
     alpn: Cache<String, Negotiated>,
+    h2_pool: H2Pool,
 }
 
 /// The pre-h2 name of [`HttpSender`], kept so every existing construction site
@@ -189,6 +191,7 @@ impl HttpSender {
                 .time_to_live(ALPN_CACHE_TTL)
                 .max_capacity(ALPN_CACHE_CAPACITY)
                 .build(),
+            h2_pool: H2Pool::new(),
         }
     }
 
@@ -248,6 +251,20 @@ impl HttpSender {
                 Some(Negotiated::H1) => vec![ALPN_HTTP11],
                 None => vec![ALPN_H2, ALPN_HTTP11],
             },
+        }
+    }
+
+    /// Whether this send already knows it will speak h2 — the case where a
+    /// pooled connection to `authority` can carry it instead of a fresh dial.
+    /// An `Auto` send only knows that once ALPN has settled on h2 here before;
+    /// a forced `h2`/`h2c` always does. (A forced `h2` on a plaintext origin
+    /// has already failed by this point, so `tls` decides that arm.)
+    fn h2_without_negotiating(&self, authority: &str, version: VersionPolicy, tls: bool) -> bool {
+        match version {
+            VersionPolicy::H1 => false,
+            VersionPolicy::H2 => tls,
+            VersionPolicy::H2c => true,
+            VersionPolicy::Auto => tls && self.negotiated_for(authority) == Some(Negotiated::H2),
         }
     }
 
@@ -312,9 +329,29 @@ impl HttpSender {
             .next()
             .map(|ip| SocketAddr::new(ip, port))
             .ok_or_else(|| anyhow!("no address for {host}:{port}"))?;
-        let stream = self.dialer.dial(addr).await?;
+
+        // When this send is going to speak h2 whatever ALPN says, a live
+        // pooled connection to the authority serves it without a second dial.
+        // The resolve and the SSRF gate above still run every time, so reuse
+        // never skips the check that decides whether this target is allowed.
+        let pooled = if self.h2_without_negotiating(&authority, version, tls) {
+            self.h2_pool.take(&authority)
+        } else {
+            None
+        };
 
         let exchange = async {
+            if let Some(send_req) = pooled {
+                return crate::h2_sender::exchange_pooled(
+                    &self.h2_pool,
+                    send_req,
+                    &authority,
+                    &req,
+                    self.response_timeout,
+                )
+                .await;
+            }
+            let stream = self.dialer.dial(addr).await?;
             if tls {
                 let offer = self.alpn_offer(&authority, version);
                 let name = ServerName::try_from(host.clone())
@@ -331,9 +368,24 @@ impl HttpSender {
                     Some(ALPN_H2) => Negotiated::H2,
                     _ => Negotiated::H1,
                 };
-                self.alpn.insert(authority.clone(), negotiated);
+                // Only an `Auto` send records what the authority settled on: a
+                // forced h1 or h2 offer carries one protocol, so what came
+                // back says nothing about what would have been negotiated and
+                // must not steer a later `Auto` send (plan Task 3, item 5).
+                if matches!(version, VersionPolicy::Auto) {
+                    self.alpn.insert(authority.clone(), negotiated);
+                }
                 match negotiated {
-                    Negotiated::H2 => h2_exchange(&authority, &req).await,
+                    Negotiated::H2 => {
+                        crate::h2_sender::exchange(
+                            &self.h2_pool,
+                            Box::new(tls_stream),
+                            &authority,
+                            &req,
+                            self.response_timeout,
+                        )
+                        .await
+                    }
                     // `h2c` over TLS is just `h2` (session call S2), so both
                     // forced-h2 policies fail the same way here.
                     Negotiated::H1 if matches!(version, VersionPolicy::H2 | VersionPolicy::H2c) => {
@@ -352,8 +404,16 @@ impl HttpSender {
                     Negotiated::H1 => drive(tls_stream, &prepare_h1(&req)).await,
                 }
             } else if matches!(version, VersionPolicy::H2c) {
-                // Prior-knowledge cleartext h2.
-                h2_exchange(&authority, &req).await
+                // Prior-knowledge cleartext h2: no TLS, no ALPN, straight into
+                // the h2 preface on the raw stream.
+                crate::h2_sender::exchange(
+                    &self.h2_pool,
+                    stream,
+                    &authority,
+                    &req,
+                    self.response_timeout,
+                )
+                .await
             } else {
                 drive(stream, &prepare_h1(&req)).await
             }
@@ -383,18 +443,6 @@ impl RequestSender for HttpSender {
         let req = req.clone();
         Box::pin(async move { self.send_impl(req, version).await })
     }
-}
-
-/// The h2 half of the dispatch. Task 3 of the scanner-v2 T3 plan replaces this
-/// body with the real `h2::client::handshake` exchange; until then a negotiated
-/// h2 connection is reported with the same error the forced-h2 path uses, so
-/// the caller treats it as a probe error.
-async fn h2_exchange(authority: &str, _req: &HttpRequest) -> Result<HttpResponse> {
-    Err(SendError::H2NotNegotiated {
-        authority: authority.to_string(),
-        detail: "h2 dispatch not yet wired".into(),
-    }
-    .into())
 }
 
 /// Classify a TLS handshake failure: a `no_application_protocol` alert means
@@ -894,6 +942,53 @@ mod tests {
         }
     }
 
+    /// A TLS origin over one duplex half that speaks **h2**: record the offered
+    /// ALPN list, finish the handshake with a server offering `alpn`, then
+    /// answer every h2 stream `200` with body `hi`, recording the request line.
+    /// It returns once the client closes the connection, so a test awaits it
+    /// after dropping the sender.
+    async fn tls_h2_origin(io: DuplexStream, alpn: &[&[u8]]) -> OriginLog {
+        let Ok(start) =
+            tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io).await
+        else {
+            return OriginLog::default();
+        };
+        let offered: Vec<String> = start
+            .client_hello()
+            .alpn()
+            .map(|list| {
+                list.map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Ok(tls) = start.into_stream(server_config(alpn)).await else {
+            return OriginLog {
+                alpn: offered,
+                request: Vec::new(),
+            };
+        };
+        let Ok(mut conn) = h2::server::handshake(tls).await else {
+            return OriginLog {
+                alpn: offered,
+                request: Vec::new(),
+            };
+        };
+        let mut request = Vec::new();
+        while let Some(Ok((req, mut respond))) = conn.accept().await {
+            let (parts, _body) = req.into_parts();
+            request = format!("{} {}", parts.method, parts.uri.path()).into_bytes();
+            if let Ok(resp) = http::Response::builder().status(200).body(()) {
+                if let Ok(mut send) = respond.send_response(resp, false) {
+                    let _ = send.send_data(bytes::Bytes::from_static(b"hi"), true);
+                }
+            }
+        }
+        OriginLog {
+            alpn: offered,
+            request,
+        }
+    }
+
     /// A `GET https://origin.test/x`.
     fn https_get() -> HttpRequest {
         let mut map = HeaderMap::new();
@@ -1066,6 +1161,94 @@ mod tests {
             "request was {:?}",
             String::from_utf8_lossy(&logs[0].request)
         );
+    }
+
+    #[tokio::test]
+    async fn auto_dispatches_to_h2_when_alpn_picks_h2() {
+        let (client, server) = duplex(64 * 1024);
+        let origin =
+            tokio::spawn(async move { tls_h2_origin(server, &[b"h2", b"http/1.1"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([client])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+
+        let resp = tokio::time::timeout(Duration::from_secs(10), sender.send(&https_get()))
+            .await
+            .expect("the send finished within the guard")
+            .expect("the negotiated h2 exchange succeeds");
+
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.version, aitm_core::HttpVersion::H2);
+        match &resp.body {
+            Body::Bytes(b) => assert_eq!(b.as_slice(), b"hi"),
+            other => panic!("body was {other:?}, want Bytes(hi)"),
+        }
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            Some(Negotiated::H2)
+        );
+        drop(sender);
+        let log = tokio::time::timeout(Duration::from_secs(10), origin)
+            .await
+            .expect("the origin finished within the guard")
+            .expect("origin task");
+        assert_eq!(log.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+        assert_eq!(String::from_utf8_lossy(&log.request), "GET /x");
+    }
+
+    #[tokio::test]
+    async fn a_forced_h1_send_does_not_pollute_the_alpn_cache() {
+        let (h1_client, h1_server) = duplex(64 * 1024);
+        let h1_origin = tokio::spawn(async move {
+            tls_origin(h1_server, &[b"h2", b"http/1.1"], RESPONSE_200).await
+        });
+        let (h2_client, h2_server) = duplex(64 * 1024);
+        let h2_origin =
+            tokio::spawn(async move { tls_h2_origin(h2_server, &[b"h2", b"http/1.1"]).await });
+        let dialer = Arc::new(DuplexDialer::new(VecDeque::from([h1_client, h2_client])));
+        let sender = HttpSender::new()
+            .with_insecure(true)
+            .with_resolver(Arc::new(FixedResolver))
+            .with_dialer(dialer.clone());
+        let req = https_get();
+
+        let forced = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::H1),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the forced-h1 exchange succeeds");
+        assert_eq!(forced.status, 200);
+        assert_eq!(forced.version, aitm_core::HttpVersion::Http11);
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            None,
+            "a forced-h1 send must not record what the authority negotiated"
+        );
+        let h1_log = h1_origin.await.expect("h1 origin task");
+        assert_eq!(h1_log.alpn, vec!["http/1.1".to_string()]);
+
+        let auto = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_with(&req, VersionPolicy::Auto),
+        )
+        .await
+        .expect("the send finished within the guard")
+        .expect("the following auto exchange succeeds");
+        assert_eq!(auto.version, aitm_core::HttpVersion::H2);
+        assert_eq!(
+            sender.negotiated_for("origin.test:443"),
+            Some(Negotiated::H2)
+        );
+        drop(sender);
+        let h2_log = tokio::time::timeout(Duration::from_secs(10), h2_origin)
+            .await
+            .expect("the origin finished within the guard")
+            .expect("h2 origin task");
+        assert_eq!(h2_log.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
     }
 
     #[tokio::test]
