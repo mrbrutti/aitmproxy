@@ -67,6 +67,14 @@ H42 (cell). A `standard` job under `crawl.use_browser: auto` with no reachable b
 
 **Cell H37-H39, H42 result (2026-11-01):** done in `8ecd6c9d` (+271/-34); `--selftest` 33 ok with mutation checks per new row; py_compile and discovery clean; the sandbox run dies at the bind denial before any claim. Decisions ratified: the "finished before `x`" path is a `note` and the fresh job carries its own check; failure screens are also Evidence samples; H39 also records `no site map yet`; the Fields pane is reached by Esc then Tab and `EDITOR_FIELDS` is copied as a reviewable tuple; the H42 line is a hard check.
 
+## From the second live smoke run (`/tmp/claude/t7-live-smoke3`, 7 ok, 2 failed at H42)
+
+H43 (Rust). `Mode::Prompt` opened from the Scan view draws its body as the Flows view (`ui/mod.rs` `render`): the saved failure screen shows the flow list and inspector under a `value: standard` prompt bar. Same class as H18: draw the body of the mode the prompt returns to. Test: `o` on the `standard` editor renders ` 1 Profiles` and `profile standard` under the `origin:` prompt at 200x50; a Flows prompt still shows the flow list.
+
+H44 (cell, after H45). `set_browser_never` must not type into a stray prompt: after each `e`, if the bottom bar reads `value:` the field cursor was not on `use_browser`; press `Esc`, fail the check with the screen and stop pressing keys (the second failure screen shows `standards` typed into the prompt). After H45 the walk itself works; this is the guard.
+
+H45 (Rust, Important). No test drives the Fields pane by keys (every profile test sets `editor.field` directly); live, `Esc`, `Tab`, `g`, `j` x12 left the field cursor on `name`. Test first: open `standard`, `Esc`, `Tab`, `Home`, `Down` x12, assert `editor.field() == UseBrowser`, `e` twice, assert the crawl line reads `browser never`; fix what it exposes (pane ring, `cursor_mut(Fields)`, key map, `e` dispatch) and report what was wrong.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
