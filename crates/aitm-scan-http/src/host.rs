@@ -564,15 +564,6 @@ impl SessionMonitors {
             .monitors
             .len()
     }
-
-    /// Whether no monitor is held. The conventional partner of
-    /// [`SessionMonitors::len`] (`clippy::len_without_is_empty`); test-only, and
-    /// no test needs it yet.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 #[cfg(test)]

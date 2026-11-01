@@ -982,13 +982,11 @@ mod tests {
         )
     }
 
-    /// `Expect` is a framing header (plan Task 10 lists it): mutating it changes
-    /// the request's shape, not the application's input, so it is never a point
-    /// (Sp1).
     /// A token carried in the path must not leak as a point's name or example
-    /// (S-M2). An id-like segment is named by its template placeholder; a UUID,
-    /// an object id or a long hex run has its example withheld; a plain numeric
-    /// id keeps its example because the 1-based `path` index still addresses it.
+    /// (S-M2, R-M1). An id-like segment is named by its template placeholder
+    /// and any other opaque token by `{token}`; every placeholder but `{id}`
+    /// has its example withheld; a plain numeric id keeps its example because
+    /// the 1-based `path` index still addresses it.
     #[test]
     fn path_tokens_are_templated_and_redacted() {
         fn seg(url: &str) -> InsertionPoint {
@@ -1118,6 +1116,9 @@ mod tests {
         assert_eq!(plain.example.as_deref(), Some("7"));
     }
 
+    /// `Expect` is a framing header (plan Task 10 lists it): mutating it changes
+    /// the request's shape, not the application's input, so it is never a point
+    /// (Sp1).
     #[test]
     fn expect_header_is_not_a_point() {
         let flow = captured_flow(

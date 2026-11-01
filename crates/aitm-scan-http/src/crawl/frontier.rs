@@ -162,17 +162,10 @@ impl Frontier {
     /// How many URLs are waiting.
     ///
     /// Test-only: an engine drains the queue with [`Frontier::pop`] and never
-    /// asks for its size (Q8). `is_empty` is its conventional partner
-    /// (`clippy::len_without_is_empty`).
+    /// asks for its size (Q8).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.queue.len()
-    }
-
-    /// Whether no URL is waiting.
-    #[cfg(test)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queue.is_empty()
     }
 }
 
@@ -519,7 +512,6 @@ mod tests {
         );
         assert_eq!(frontier.pop(), None);
         assert_eq!(frontier.len(), 0);
-        assert!(frontier.is_empty());
 
         // A full frontier refuses and counts.
         let mut full = Frontier::new();
