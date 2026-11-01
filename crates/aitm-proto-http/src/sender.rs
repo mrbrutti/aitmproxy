@@ -781,10 +781,16 @@ fn conn_key(scheme: &str, authority: &str) -> String {
 
 /// Split `host[:port]` with the scheme's default port; handles bracketed IPv6.
 /// Shared with [`crate::raw_h2`], which splits its target the same way.
+///
+/// Userinfo is credential material: everything up to and including the last
+/// `@` is dropped before the parse — the rule [`prepare_common`] applies to
+/// the `Host` field — so a password never reaches the resolver, the SSRF
+/// gate's authority string, or an error message (security review FS-4).
 pub(crate) fn split_authority(authority: &str, scheme: &str) -> Result<(String, u16)> {
     let default = if scheme == "https" { 443 } else { 80 };
-    let auth = aitm_core::Authority::parse_with_default(authority, default)
-        .map_err(|e| anyhow!("bad authority {authority:?}: {e}"))?;
+    let bare = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let auth = aitm_core::Authority::parse_with_default(bare, default)
+        .map_err(|e| anyhow!("bad authority {bare:?}: {e}"))?;
     let port = if auth.port == 0 { default } else { auth.port };
     Ok((auth.host, port))
 }
@@ -1532,6 +1538,35 @@ mod tests {
             Some("kept"),
             "every other field is left alone"
         );
+    }
+
+    /// The same rule where the authority is split for the resolver: userinfo
+    /// is dropped before the parse, so a password never reaches the resolver,
+    /// the SSRF gate's `authority` string, or an error message (final
+    /// security review FS-4). Shared with `raw_h2`, which splits its target
+    /// here too.
+    #[test]
+    fn split_authority_drops_userinfo_before_resolving_or_erroring() {
+        let (host, port) =
+            split_authority("user:pass@origin.test:443", "https").expect("a usable authority");
+        assert_eq!((host.as_str(), port), ("origin.test", 443));
+
+        let (host, port) =
+            split_authority("user:p@ss@origin.test", "https").expect("the last @ splits");
+        assert_eq!((host.as_str(), port), ("origin.test", 443));
+
+        // The host after the userinfo is bad: the error names it, never the
+        // credential before it.
+        for bad in [
+            "user:pass@",
+            "user:pass@origin.test:notaport",
+            "user:pass@ /",
+        ] {
+            let err = split_authority(bad, "https").expect_err("a bad host is refused");
+            let text = err.to_string();
+            assert!(!text.contains("pass"), "{bad:?} leaked: {text}");
+            assert!(!text.contains("user"), "{bad:?} leaked: {text}");
+        }
     }
 
     /// Userinfo in the authority is credential material: the `Host` field
