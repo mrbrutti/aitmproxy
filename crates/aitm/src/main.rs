@@ -265,23 +265,39 @@ fn main() -> anyhow::Result<()> {
     let Some(invocation) = parse_invocation(std::env::args().skip(1).collect())? else {
         return Ok(());
     };
-    // The system-proxy watchdog (spec §D9 (b)) needs no config, no tracing,
-    // no service and no runtime: it sleeps on stdin until the core dies,
-    // then shells out to restore, so it is dispatched before the runtime is
-    // built. Its parent nulled its stdout/stderr, so it never prints; its
-    // exit code is the whole report (0 done, 2 bad arguments, 3 restore
-    // failed).
-    if let Mode::SysproxyWatchdog {
-        pid,
-        state,
-        no_pipe,
-    } = &invocation.mode
-    {
-        std::process::exit(watchdog::run(&WatchdogArgs {
-            pid: *pid,
-            state: state.clone(),
-            no_pipe: *no_pipe,
-        }));
+    // The two modes that exit before anything is built — no config load, no
+    // tracing sink, no service, no runtime — are dispatched here, in one
+    // place, so `run` only ever sees a mode that serves something.
+    match &invocation.mode {
+        // The system-proxy watchdog (spec §D9 (b)) sleeps on stdin until the
+        // core dies, then shells out to restore. Its parent nulled its
+        // stdout/stderr, so it never prints; its exit code is the whole
+        // report (0 done, 2 bad arguments, 3 restore failed).
+        Mode::SysproxyWatchdog {
+            pid,
+            state,
+            no_pipe,
+        } => {
+            std::process::exit(watchdog::run(&WatchdogArgs {
+                pid: *pid,
+                state: state.clone(),
+                no_pipe: *no_pipe,
+            }));
+        }
+        // `operator-token generate` edits the config file and exits; it must
+        // run even if the current config would fail to assemble. The path is
+        // resolved exactly as the rest of the binary does.
+        Mode::OperatorToken { force } => {
+            let config_path = invocation
+                .config_arg
+                .clone()
+                .or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from))
+                .unwrap_or_else(config_file::default_config_path);
+            let written = operator_token::generate_and_store(&config_path, *force)?;
+            println!("{}", operator_token::confirmation_message(&written));
+            return Ok(());
+        }
+        Mode::Server | Mode::Cli(_) | Mode::Tui | Mode::Web => {}
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -302,20 +318,10 @@ async fn run(invocation: Invocation) -> anyhow::Result<()> {
         Some(args) => Some(args.resolve(|k| std::env::var(k).ok())?),
         None => None,
     };
-    // `operator-token generate` edits the config file and exits before any
-    // service, tracing sink or scripting tier is built — it never needs them,
-    // and it must run even if the current config would fail to assemble. The
-    // path is resolved exactly as the rest of the binary does.
-    if let Mode::OperatorToken { force } = mode {
-        let config_path = config_arg
-            .or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from))
-            .unwrap_or_else(config_file::default_config_path);
-        let written = operator_token::generate_and_store(&config_path, force)?;
-        println!("{}", operator_token::confirmation_message(&written));
-        return Ok(());
-    }
     // The TUI owns the terminal, so its subscriber must not write there.
-    // (`SysproxyWatchdog` never reaches here: `main` dispatched it.)
+    // (`OperatorToken` and `SysproxyWatchdog` never reach here: `main`
+    // dispatched both before the runtime was built. Their arms stay so the
+    // match is exhaustive over `Mode` rather than hiding behind `_`.)
     let tui_log = match mode {
         Mode::Tui => tui::init_tracing(),
         Mode::Server

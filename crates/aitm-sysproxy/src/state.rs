@@ -658,11 +658,11 @@ mod tester_tests {
         assert_eq!(StateFile::load(&path).expect("not an error"), None);
         assert!(!path.exists());
         assert_eq!(corrupt_count(&dir), 1);
-        // And a save afterwards works at the now-free path.
-        small_file()
-            .save_atomic(&path)
-            .expect("save after the move");
-        assert_eq!(StateFile::load(&path).expect("load"), Some(small_file()));
+        // And a save afterwards works at the now-free path. `expected` is
+        // built once, before the save: `saved_at` is stamped to the second.
+        let expected = small_file();
+        expected.save_atomic(&path).expect("save after the move");
+        assert_eq!(StateFile::load(&path).expect("load"), Some(expected));
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
@@ -719,13 +719,15 @@ mod tester_tests {
         let tmp = temp_path(&path);
         std::os::unix::fs::symlink(&victim, &tmp).expect("plant the link");
 
-        small_file().save_atomic(&path).expect("save");
+        // Built once, before the save: `saved_at` is stamped to the second.
+        let expected = small_file();
+        expected.save_atomic(&path).expect("save");
 
         assert_eq!(fs::read(&victim).expect("victim"), b"victim\n");
         let meta = fs::symlink_metadata(&path).expect("state file meta");
         assert!(meta.is_file(), "a regular file, not a link");
         assert!(!tmp.exists(), "no temp entry left");
-        assert_eq!(StateFile::load(&path).expect("load"), Some(small_file()));
+        assert_eq!(StateFile::load(&path).expect("load"), Some(expected));
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
@@ -825,7 +827,9 @@ mod tester_tests {
             .status()
             .expect("mkfifo runs");
         assert!(status.success(), "mkfifo {}", tmp.display());
-        small_file()
+        // Built once, before the save: `saved_at` is stamped to the second.
+        let expected = small_file();
+        expected
             .save_atomic(&path)
             .expect("save over a FIFO at the temp name");
         assert!(
@@ -835,7 +839,7 @@ mod tester_tests {
             "a regular file at the state path"
         );
         assert!(!tmp.exists(), "no temp entry left");
-        assert_eq!(StateFile::load(&path).expect("load"), Some(small_file()));
+        assert_eq!(StateFile::load(&path).expect("load"), Some(expected));
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 

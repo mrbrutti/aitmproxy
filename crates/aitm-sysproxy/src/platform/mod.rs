@@ -12,7 +12,8 @@ use aitm_ca::exec::{CmdLine, Executor};
 use crate::state::Previous;
 use crate::{Effective, Endpoint, Mechanism, ReadError, ServiceRow, WriteError};
 
-/// The before-state a set records (§D7) and the services it must not write.
+/// The before-state a set records (§D7), the services it must not write,
+/// and the live rows the read saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     /// What `restore` puts back; excludes `skipped`.
@@ -21,6 +22,11 @@ pub(crate) struct Snapshot {
     /// password cannot be restored, so the engine leaves them alone and
     /// reports "skipped <svc>: authenticated proxy". Empty on Linux.
     pub skipped: Vec<String>,
+    /// Every live row the snapshot read, `skipped` included: exactly what
+    /// [`PlatformOps::read_services`] would return at the same instant, so
+    /// an idempotent `set` reports the same `services` a `status` would
+    /// without a second read. Linux: the synthetic row(s).
+    pub rows: Vec<ServiceRow>,
 }
 
 /// One mechanism's reads and writes, each a sequence of [`CmdLine`]s run

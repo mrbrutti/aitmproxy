@@ -237,7 +237,7 @@ impl Status {
     }
 
     /// The §D6 object's fields, for a verb that adds its own beside them.
-    pub fn to_map(&self) -> BTreeMap<String, Value> {
+    pub(crate) fn to_map(&self) -> BTreeMap<String, Value> {
         let mut map = BTreeMap::from([
             (
                 "state".to_string(),
@@ -449,7 +449,11 @@ pub fn classify(effective: &Effective, ours: &Endpoint) -> (State, String) {
 /// are enabled at `wrote`'s host and port; the bypass list is not compared.
 /// The one rule behind [`service_equals_wrote`] (a per-service row) and the
 /// effective view's "still ours" in [`SystemProxy::summary`].
-pub fn endpoints_equal_wrote(http: &ProtocolProxy, https: &ProtocolProxy, wrote: &Wrote) -> bool {
+pub(crate) fn endpoints_equal_wrote(
+    http: &ProtocolProxy,
+    https: &ProtocolProxy,
+    wrote: &Wrote,
+) -> bool {
     [http, https]
         .iter()
         .all(|p| p.enabled && p.host == wrote.host && p.port == wrote.port)
@@ -539,9 +543,9 @@ pub enum Recovery {
 pub struct SystemProxy {
     exec: Arc<dyn Executor>,
     ops: Box<dyn PlatformOps>,
-    /// The `std::env::consts::OS` word detection ran with; picks the
-    /// `unsupported` detail.
-    target_os: String,
+    /// Detection ran with the `windows` OS word: picks the `unsupported`
+    /// detail (the one thing the OS word decides once `ops` is chosen).
+    is_windows: bool,
     state_file: PathBuf,
     ours: Endpoint,
     /// `system_proxy.bypass` from the config, merged into every set (§D5).
@@ -677,7 +681,7 @@ impl SystemProxy {
         SystemProxy {
             exec,
             ops,
-            target_os: target_os.to_string(),
+            is_windows: target_os == "windows",
             state_file,
             ours,
             config_bypass: cfg.bypass.clone(),
@@ -713,7 +717,7 @@ impl SystemProxy {
     }
 
     fn unsupported_detail(&self) -> String {
-        if self.target_os == "windows" {
+        if self.is_windows {
             platform::windows::NOT_MANAGED.to_string()
         } else {
             NO_MECHANISM_DETAIL.to_string()
@@ -995,12 +999,19 @@ impl SystemProxy {
             return Ok((status, false, Vec::new()));
         }
         let existing = StateFile::load(&self.state_file)?;
-        let Snapshot { previous, skipped } = self
+        let Snapshot {
+            previous,
+            skipped,
+            rows,
+        } = self
             .ops
             .snapshot(self.exec.as_ref())
             .map_err(|e| anyhow::anyhow!("cannot snapshot the current system proxy: {e}"))?;
         if let Some(file) = &existing {
-            let status = self.status_with(Some(file), Some(rows_of(&previous)), false);
+            // Every live row (authenticated ones included) is what `status`
+            // would report; `managed_by_us` is judged by the file's names,
+            // which an authenticated row never carries.
+            let status = self.status_with(Some(file), Some(rows), false);
             if status.state == State::PointsAtUs {
                 self.refresh_cache(&status);
                 return Ok((status, false, Vec::new()));
@@ -1016,7 +1027,7 @@ impl SystemProxy {
         let wrote = Wrote {
             host: self.ours.host.clone(),
             port: self.ours.port,
-            bypass: merge_bypass(&defaults(), &extra),
+            bypass: bypass_for(&[], &extra),
         };
         let file = StateFile::new(self.mechanism(), std::process::id(), wrote, previous);
         // §D7: on disk before the first mutating command.
@@ -1750,7 +1761,7 @@ mod tests {
         );
     }
 
-    fn status_with(state: State, detail: &str) -> Status {
+    fn bare_status(state: State, detail: &str) -> Status {
         Status {
             state,
             detail: detail.into(),
@@ -1775,7 +1786,7 @@ mod tests {
     fn status_to_value_has_host_and_port_only_for_other() {
         use aitm_core::Value;
 
-        let other = status_with(
+        let other = bare_status(
             State::Other {
                 host: "127.0.0.1".into(),
                 port: 9090,
@@ -1821,7 +1832,7 @@ mod tests {
             assert!(map.contains_key(key), "missing {key}");
         }
 
-        let off = status_with(State::Off, "HTTP and HTTPS off");
+        let off = bare_status(State::Off, "HTTP and HTTPS off");
         let Value::Object(map) = off.to_value() else {
             panic!("status is an object");
         };
@@ -2166,6 +2177,45 @@ mod engine_tests {
         assert!(status.managed_by_us);
         assert!(r.exec.mutating_runs().is_empty(), "{:?}", r.exec.runs());
         assert!(r.file.exists());
+    }
+
+    /// Q4 side effect: the idempotent path judges `managed_by_us` against
+    /// the snapshot's `previous`, which excludes authenticated services
+    /// (§D3), but the `services` it reports must be every live row, exactly
+    /// as a fresh `status` lists them: `Display Ethernet` (ours) and the
+    /// authenticated `Wi-Fi` the file never named.
+    #[test]
+    fn idempotent_set_reports_every_live_service_including_authenticated_ones() {
+        let auth = "Enabled: Yes\nServer: proxy.corp\nPort: 3128\nAuthenticated Proxy Enabled: 1\n";
+        let exec = ScriptedExecutor::new()
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "")
+            .respond(LIST, 0, LIST_OUT, "")
+            .respond(&get_web(DE), 0, &proxy_out("127.0.0.1", 8080), "")
+            .respond(&get_secure(DE), 0, &proxy_out("127.0.0.1", 8080), "")
+            .respond(&get_bypass(DE), 0, BYPASS_OUT, "")
+            .respond(&get_web(WIFI), 0, auth, "")
+            .respond(&get_secure(WIFI), 0, &proxy_out("", 0), "")
+            .respond(&get_bypass(WIFI), 0, BYPASS_OUT, "");
+        let r = macos_rig("ac7-auth", exec);
+        // The file a set that skipped `Wi-Fi` wrote: one service named.
+        let mut file = d7_file();
+        file.previous = Previous::Networksetup {
+            services: vec![row("Display Ethernet", "127.0.0.1", 9090)],
+        };
+        file.save_atomic(&r.file).expect("seed file");
+
+        let (status, changed, commands) = r.sp.set(&SetRequest::default()).expect("set");
+        assert!(!changed);
+        assert!(commands.is_empty());
+        assert_eq!(status.state, State::PointsAtUs);
+        assert!(status.managed_by_us);
+        let names: Vec<&str> = status.services.iter().map(|s| s.service.as_str()).collect();
+        assert_eq!(names, vec!["Display Ethernet", "Wi-Fi"]);
+        assert_eq!(status.services.len(), 2);
+        assert_eq!(status.services[1].http.host, "proxy.corp");
+        assert_eq!(status.services[1].http.port, 3128);
+        assert!(r.exec.mutating_runs().is_empty(), "{:?}", r.exec.runs());
+        assert_eq!(r.exec.runs().len(), 8, "one scutil and one snapshot round");
     }
 
     /// Pointing at us with NO file (set by hand): snapshot and write anyway so

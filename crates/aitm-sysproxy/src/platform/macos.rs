@@ -368,12 +368,14 @@ impl PlatformOps for MacosOps {
             authenticated,
         } = self.read_services_full(exec)?;
         let services = rows
-            .into_iter()
+            .iter()
             .filter(|row| !authenticated.contains(&row.service))
+            .cloned()
             .collect();
         Ok(Snapshot {
             previous: Previous::Networksetup { services },
             skipped: authenticated,
+            rows,
         })
     }
 
@@ -468,10 +470,6 @@ mod tests {
 
     fn rendered(lines: &[CmdLine]) -> Vec<String> {
         lines.iter().map(CmdLine::render).collect()
-    }
-
-    fn err_text(e: &WriteError) -> String {
-        e.to_string()
     }
 
     const SCUTIL_FULL: &str = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : *.local\n    1 : 169.254/16\n  }\n  FTPPassive : 1\n  HTTPEnable : 1\n  HTTPPort : 9090\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 9090\n  HTTPSProxy : 127.0.0.1\n}\n";
@@ -642,6 +640,10 @@ mod tests {
             services: d7_previous(),
         };
         let err = MacosOps.write(&exec, &previous, &ours(), &[]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "needs privilege: /usr/sbin/networksetup -setwebproxy 'Display Ethernet' 127.0.0.1 8080"
+        );
         let WriteError::NeedsPrivilege { line } = err else {
             panic!("expected NeedsPrivilege, got {err:?}");
         };
@@ -650,10 +652,6 @@ mod tests {
         assert_eq!(
             line,
             "/usr/sbin/networksetup -setwebproxy 'Display Ethernet' 127.0.0.1 8080"
-        );
-        assert_eq!(
-            err_text(&WriteError::NeedsPrivilege { line: line.clone() }),
-            format!("needs privilege: {line}")
         );
         let sets: Vec<_> = exec
             .runs()

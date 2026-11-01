@@ -491,9 +491,11 @@ impl PlatformOps for GsettingsOps {
     /// The before-state for the state file: six `get`s, raw text.
     fn snapshot(&self, exec: &dyn Executor) -> Result<Snapshot, ReadError> {
         let keys = gsettings_read_keys(exec, &mut Vec::new())?;
+        let rows = vec![gsettings_row(&keys)];
         Ok(Snapshot {
             previous: Previous::Gsettings { keys },
             skipped: Vec::new(),
+            rows,
         })
     }
 
@@ -699,12 +701,17 @@ impl PlatformOps for KdeOps {
         } else {
             None
         };
+        let mut rows = vec![kde_row(&kioslaverc)];
+        if let Some(keys) = &gsettings {
+            rows.push(gsettings_row(keys));
+        }
         Ok(Snapshot {
             previous: Previous::Kde {
                 kioslaverc,
                 gsettings,
             },
             skipped: Vec::new(),
+            rows,
         })
     }
 

@@ -58,7 +58,9 @@ pub enum Decision {
 /// The pure §D6 unset rule over the state file and a live read: each of the
 /// file's `service_names()` is restored when its live row still equals
 /// `wrote` (C3, `service_equals_wrote`); a name absent from `live` counts
-/// as not equal.
+/// as not equal. This is the rule the woken watchdog runs
+/// ([`run_after_wake`]); `Exit0` is reached only through `decide(None, ..)`,
+/// which is [`wake`]'s "no file: an orderly unset beat us" arm.
 pub fn decide(file: Option<&StateFile>, live: &[ServiceRow]) -> Decision {
     let Some(file) = file else {
         return Decision::Exit0;
@@ -257,7 +259,7 @@ fn wait_for_death(args: &WatchdogArgs, exec: &dyn Executor) {
 }
 
 /// The restore rule over a loaded `file`: read the live services through
-/// `ops`, [`partition`], restore, remove the file, log. One C8 line per
+/// `ops`, [`decide`], restore, remove the file, log. One C8 line per
 /// decision: `restored` for the services put back, `left-alone` for the
 /// rest, and `left-alone services=0` when there was nothing to put back
 /// at all (a file naming no service), so every wake leaves a line.
@@ -277,7 +279,12 @@ pub(crate) fn run_after_wake(
             return EXIT_RESTORE_FAILED;
         }
     };
-    let (only, left_alone) = partition(file, &live);
+    // A present file always decides `Restore`; `Exit0` is `decide(None, ..)`
+    // alone (see [`decide`]), and it would mean nothing to restore and
+    // nothing to remove, which is exit 0 here too.
+    let Decision::Restore { only, left_alone } = decide(Some(file), &live) else {
+        return 0;
+    };
     if !only.is_empty() {
         if ops.restore(exec, &file.previous, &only).is_err() {
             log_line(log, "restore-failed", only.len(), started);
