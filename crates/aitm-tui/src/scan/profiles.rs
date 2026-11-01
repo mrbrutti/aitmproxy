@@ -12,7 +12,7 @@ use aitm_scan_model::{
     ProfileListResult, RecordProbes, ScanProfile, SessionMode, SessionProfile, Speed, UseBrowser,
 };
 
-use super::{lane_token, scan_host, step, Dir, ScanError};
+use super::{lane_token, scan_host, step, wire_token, Dir, ScanError};
 use crate::model::{scope_covers, FlowRow};
 use crate::text::{truncate, width};
 
@@ -655,16 +655,6 @@ const HTTP_VERSIONS: [HttpVersionPolicy; 4] = [
 ];
 const RECORDINGS: [RecordProbes; 2] = [RecordProbes::IssuesOnly, RecordProbes::All];
 
-/// The wire token of a contract enum (`medium`, `fewer_false_negatives`):
-/// what the editor shows and the YAML carries. Empty for a value serde
-/// cannot write (none of the rings has one).
-pub(crate) fn token<T: serde::Serialize>(v: &T) -> String {
-    serde_json::to_value(v)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
-}
-
 impl ProfileEditor {
     /// An editor over `draft`, loaded from the profile `loaded_from` (`None`
     /// for a new one), `builtin` when that profile ships with aitmproxy (a
@@ -728,26 +718,26 @@ impl ProfileEditor {
             | EditorField::LaneWs
             | EditorField::LaneL4Packet
             | EditorField::LaneL4Stream) => on_off(f.lane().is_some_and(|l| d.lanes.contains(&l))),
-            EditorField::Intensity => token(&d.intensity),
-            EditorField::Speed => token(&d.speed),
-            EditorField::Accuracy => token(&d.accuracy),
+            EditorField::Intensity => wire_token(&d.intensity),
+            EditorField::Speed => wire_token(&d.speed),
+            EditorField::Accuracy => wire_token(&d.accuracy),
             EditorField::Checks => format!(
                 "include {} · exclude {}",
                 d.checks.include.len(),
                 d.checks.exclude.len()
             ),
-            EditorField::CrawlStrategy => token(&d.crawl.strategy),
-            EditorField::UseBrowser => token(&d.crawl.use_browser),
+            EditorField::CrawlStrategy => wire_token(&d.crawl.strategy),
+            EditorField::UseBrowser => wire_token(&d.crawl.use_browser),
             EditorField::MaxDepth => d.crawl.max_depth.to_string(),
             EditorField::MaxPages => d.crawl.max_pages.to_string(),
             EditorField::SubmitForms => on_off(d.crawl.submit_forms),
-            EditorField::SessionMode => token(&d.session.mode),
-            EditorField::OnLost => token(&d.session.on_lost),
+            EditorField::SessionMode => wire_token(&d.session.mode),
+            EditorField::OnLost => wire_token(&d.session.on_lost),
             EditorField::BudgetProbes => d.budget.probes.to_string(),
             EditorField::BudgetTimeS => d.budget.time_s.to_string(),
             EditorField::BudgetMaxIssues => d.budget.max_issues.to_string(),
-            EditorField::HttpVersion => token(&d.http.version),
-            EditorField::RecordProbes => token(&d.http.record_probes),
+            EditorField::HttpVersion => wire_token(&d.http.version),
+            EditorField::RecordProbes => wire_token(&d.http.record_probes),
         }
     }
 
@@ -1161,7 +1151,7 @@ pub fn session_line(editor: &ProfileEditor, previews: &BTreeMap<String, SessionP
     };
     let canary = match &preview.canary {
         Canary::None => "canary none".to_string(),
-        Canary::Flow { method, path, .. } => format!("canary {} {path}", token(method)),
+        Canary::Flow { method, path, .. } => format!("canary {} {path}", wire_token(method)),
     };
     format!("session: observed · {names} (names) · {canary}")
 }

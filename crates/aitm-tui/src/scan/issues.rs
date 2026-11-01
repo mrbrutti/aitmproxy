@@ -8,12 +8,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use aitm_poc::Severity;
 use aitm_scan_model::{
-    BySeverity, Confidence, FlowRef, InsertionKind, Issue, IssueId, IssueStatus, IssueSummary,
-    IssuesResult, JobId, L4Evidence, L4Location, L4Oracle, L4Transport, LaneKind, Timing,
+    BySeverity, Confidence, FlowRef, Issue, IssueId, IssueStatus, IssueSummary, IssuesResult,
+    JobId, L4Evidence, L4Location, L4Oracle, L4Transport, LaneKind, Timing,
 };
 use serde_json::{json, Map, Value};
 
-use super::{is_issue_id, step, Dir, ScanError, ISSUES_PAGE_LIMIT};
+use super::{
+    confidence_token, is_issue_id, lane_token, severity_token, status_token, step, wire_token, Dir,
+    ScanError, ISSUES_PAGE_LIMIT, SEVERITY_ORDER,
+};
 use crate::text::{clean, truncate};
 
 /// How many `Tick`s between two `scan.issues` refreshes while the Issues tab
@@ -60,17 +63,6 @@ const FLOWS_MAX: usize = 64;
 /// firms up, so the reading survives without colour. Read through
 /// [`confidence_glyphs`].
 const CONFIDENCE_GLYPHS: [&str; 3] = ["○○", "●○", "●●"];
-
-/// The five severities in header order, gravest first (spec D11). Every
-/// per-severity table of the crate ([`severity_counts`], the Jobs tab's bar
-/// glyphs) is indexed like this.
-pub const SEVERITY_ORDER: [Severity; 5] = [
-    Severity::Critical,
-    Severity::High,
-    Severity::Medium,
-    Severity::Low,
-    Severity::Info,
-];
 
 /// Which pane of the Issues tab holds the cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -220,86 +212,6 @@ impl IssueFilters {
 /// What the filter line reads for an unset filter.
 const NONE: &str = "none";
 
-/// A severity's wire token (`"high"`): the wire spelling is the operator
-/// spelling throughout the tab. Pinned to the serde names by a unit test.
-pub fn severity_token(s: Severity) -> &'static str {
-    match s {
-        Severity::Critical => "critical",
-        Severity::High => "high",
-        Severity::Medium => "medium",
-        Severity::Low => "low",
-        Severity::Info => "info",
-    }
-}
-
-/// A confidence's wire token (`"firm"`).
-pub fn confidence_token(c: Confidence) -> &'static str {
-    match c {
-        Confidence::Tentative => "tentative",
-        Confidence::Firm => "firm",
-        Confidence::Certain => "certain",
-    }
-}
-
-/// A lane's wire token (`"l4_packet"`).
-pub fn lane_token(l: LaneKind) -> &'static str {
-    match l {
-        LaneKind::Http => "http",
-        LaneKind::Ws => "ws",
-        LaneKind::L4Packet => "l4_packet",
-        LaneKind::L4Stream => "l4_stream",
-    }
-}
-
-/// An issue status's wire token (`"false_positive"`).
-pub fn status_token(s: IssueStatus) -> &'static str {
-    match s {
-        IssueStatus::Open => "open",
-        IssueStatus::Confirmed => "confirmed",
-        IssueStatus::FalsePositive => "false_positive",
-    }
-}
-
-/// An insertion kind's wire token (`"query"`, `"ws_json_value"`), read off
-/// serde: twenty kinds, built once per fold by [`issue_row`], never per
-/// frame. A kind that does not serialise to a string (none) reads `?`.
-fn kind_token(kind: InsertionKind) -> String {
-    serde_json::to_value(kind)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "?".to_string())
-}
-
-/// The header label of a severity (`CRITICAL`, `HIGH`, ...).
-pub fn severity_header(s: Severity) -> &'static str {
-    match s {
-        Severity::Critical => "CRITICAL",
-        Severity::High => "HIGH",
-        Severity::Medium => "MEDIUM",
-        Severity::Low => "LOW",
-        Severity::Info => "INFO",
-    }
-}
-
-/// The tally's five counts in [`SEVERITY_ORDER`] order: the one walk of a
-/// `BySeverity` the headers and the Jobs tab's severity bar share, read
-/// through [`count_of`].
-pub fn severity_counts(b: &BySeverity) -> [u64; 5] {
-    SEVERITY_ORDER.map(|s| count_of(b, s))
-}
-
-/// The `by_severity` count for `s`: the one exhaustive match from a
-/// severity to its tally field, so a new severity fails to compile here.
-pub fn count_of(b: &BySeverity, s: Severity) -> u64 {
-    match s {
-        Severity::Critical => b.critical,
-        Severity::High => b.high,
-        Severity::Medium => b.medium,
-        Severity::Low => b.low,
-        Severity::Info => b.info,
-    }
-}
-
 /// The row indices of `list` grouped under the five severities in
 /// [`SEVERITY_ORDER`] (critical, high, medium, low, info), every group
 /// present even when empty so the view draws its zero header; within a group
@@ -362,7 +274,7 @@ pub fn issue_row(i: &IssueSummary) -> IssueRow {
         point: truncate(
             &clean(&format!(
                 "{}:{}",
-                kind_token(i.location.kind),
+                wire_token(&i.location.kind),
                 i.location.name
             )),
             POINT_MAX,
@@ -869,7 +781,7 @@ fn location_text(issue: &Issue) -> String {
         Some(m) => format!("{m} {}", loc.path_template),
         None => loc.path_template.clone(),
     };
-    text.push_str(&format!(" · {} {}", kind_token(loc.kind), loc.name));
+    text.push_str(&format!(" · {} {}", wire_token(&loc.kind), loc.name));
     if loc.path != loc.path_template {
         text.push_str(&format!(" · path {}", loc.path));
     }
@@ -1054,6 +966,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn confidence_glyphs_fill_as_the_verdict_firms() {
+        assert_eq!(confidence_glyphs(Confidence::Certain), "●●");
+        assert_eq!(confidence_glyphs(Confidence::Tentative), "○○");
+    }
+
+    #[test]
     fn severity_cycles_from_none_through_critical_and_back() {
         let mut f = IssueFilters::default();
         let mut seen = Vec::new();
@@ -1111,62 +1029,6 @@ mod tests {
         assert_eq!(f.job.as_deref(), Some("scan-1a2b3c4d"));
         f.cycle(IssueFilterKey::Job, Some("scan-55667788"));
         assert_eq!(f.job, None, "a second press clears, whatever the cursor");
-    }
-
-    #[test]
-    fn headers_and_counts_follow_the_tally() {
-        let b = BySeverity {
-            high: 1,
-            medium: 1,
-            ..Default::default()
-        };
-        let labels: Vec<String> = SEVERITY_ORDER
-            .iter()
-            .map(|s| format!("{} {}", severity_header(*s), count_of(&b, *s)))
-            .collect();
-        assert_eq!(
-            labels,
-            vec!["CRITICAL 0", "HIGH 1", "MEDIUM 1", "LOW 0", "INFO 0"]
-        );
-        assert_eq!(severity_counts(&b), [0, 1, 1, 0, 0]);
-        assert_eq!(confidence_glyphs(Confidence::Certain), "●●");
-        assert_eq!(confidence_glyphs(Confidence::Tentative), "○○");
-    }
-
-    /// Fix round D, D11: the static tokens are the serde names, variant for
-    /// variant, so the filter arguments and the row cells never drift from
-    /// the contract.
-    #[test]
-    fn static_tokens_match_the_serde_names() {
-        fn serde_name<T: serde::Serialize>(v: T) -> String {
-            serde_json::to_value(v)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_default()
-        }
-        for s in SEVERITY_ORDER {
-            assert_eq!(severity_token(s), serde_name(s));
-            assert_eq!(severity_header(s), severity_token(s).to_ascii_uppercase());
-        }
-        for c in [Confidence::Tentative, Confidence::Firm, Confidence::Certain] {
-            assert_eq!(confidence_token(c), serde_name(c));
-        }
-        for l in [
-            LaneKind::Http,
-            LaneKind::Ws,
-            LaneKind::L4Packet,
-            LaneKind::L4Stream,
-        ] {
-            assert_eq!(lane_token(l), serde_name(l));
-        }
-        for st in [
-            IssueStatus::Open,
-            IssueStatus::Confirmed,
-            IssueStatus::FalsePositive,
-        ] {
-            assert_eq!(status_token(st), serde_name(st));
-        }
-        assert_eq!(kind_token(InsertionKind::WsJsonValue), "ws_json_value");
     }
 
     /// The contract pack's issue, parsed; a missing or malformed file is a

@@ -15,12 +15,11 @@ use std::ops::Range;
 use aitm_scan_model::{
     FlowRef, InsertionKind, InsertionPoint, JobId, LaneKind, PointTrait, SiteNode, SitemapResult,
 };
-use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 use super::legacy::LegacyState;
 use super::profiles::authority_parts;
-use super::{ScanError, ScanOffer};
+use super::{wire_token, ScanError, ScanOffer};
 use crate::text::truncate;
 
 /// How many `Tick`s between two `scan.sitemap` refreshes while the Site map
@@ -528,10 +527,14 @@ pub fn point_line(p: &InsertionPoint) -> String {
     let traits = if p.traits.is_empty() {
         "-".to_string()
     } else {
-        p.traits.iter().map(token).collect::<Vec<_>>().join(",")
+        p.traits
+            .iter()
+            .map(wire_token)
+            .collect::<Vec<_>>()
+            .join(",")
     };
     point_columns(
-        &token(&p.kind),
+        &wire_token(&p.kind),
         &p.name,
         p.path.as_deref().unwrap_or("-"),
         &traits,
@@ -547,15 +550,6 @@ pub fn point_header() -> String {
 fn point_columns(kind: &str, name: &str, path: &str, traits: &str, example: &str) -> String {
     let [kw, nw, pw, tw] = POINT_COLUMNS;
     format!("{kind:<kw$} {name:<nw$} {path:<pw$} {traits:<tw$} {example}")
-}
-
-/// A vocabulary value's wire token (`"json_value"`, `"url"`), read off
-/// serde, so the screen spells it as the contract does.
-fn token<T: Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_else(|| "?".to_string())
 }
 
 /// The legacy `scan.discover` result as site nodes (D12): one node per

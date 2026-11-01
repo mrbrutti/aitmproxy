@@ -37,7 +37,7 @@ use aitm_scan_model::{LaneKind, ProfileListEntry};
 
 use crate::app::App;
 use crate::scan::{
-    lane_token, session_line, token, EditorField, ListWidths, NodeKind, OriginSource,
+    lane_token, session_line, wire_token, EditorField, ListWidths, NodeKind, OriginSource,
     ProfileEditor, ProfilePane, ProfilesState, ScanError, ScanOffer, TreeNode, BUILTIN_MARK,
     COLLAPSED_MARK, OPEN_MARK,
 };
@@ -228,8 +228,8 @@ fn row_line(
                 format!(
                     "{GAP}{}{GAP}{}{GAP}{}",
                     fit(lanes, cols.lanes),
-                    fit(&token(&p.summary.intensity), INTENSITY_W),
-                    fit(&token(&p.summary.speed), SPEED_W),
+                    fit(&wire_token(&p.summary.intensity), INTENSITY_W),
+                    fit(&wire_token(&p.summary.speed), SPEED_W),
                 ),
                 theme.text_primary(),
             ),

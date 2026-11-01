@@ -3,7 +3,8 @@
 //! Plain data and pure helpers only: the reducer in `app.rs` owns every
 //! transition, `ui::scan` draws. Sub-modules hold one tab's state each
 //! ([`profiles`], [`jobs`], [`sitemap`], [`issues`]), the launch bookkeeping
-//! ([`launch`]) and the legacy `scan.discover` state ([`legacy`]); every type is
+//! ([`launch`]), the legacy `scan.discover` state ([`legacy`]) and the wire
+//! vocabulary ([`tokens`]); every type is
 //! re-exported here so callers write `crate::scan::JobsState`.
 //!
 //! Wire shapes come from `aitm_scan_model`; [`parse_result`] is the one door a
@@ -17,6 +18,7 @@ pub mod launch;
 pub mod legacy;
 pub mod profiles;
 pub mod sitemap;
+pub mod tokens;
 
 use std::collections::BTreeSet;
 
@@ -31,6 +33,7 @@ pub use launch::*;
 pub use legacy::*;
 pub use profiles::*;
 pub use sitemap::*;
+pub use tokens::*;
 
 /// The four tabs of `Mode::Scan` (spec D2), in strip order.
 ///
