@@ -13,20 +13,22 @@
 //! over the step's URL and body — a scrub that erases the inject payload at a
 //! secret-named point and corrupts a JSON body — so `build_poc` re-derives the
 //! URL and body from the mutated request and scrubs them, and the rest of what
-//! it copies, itself (see `Scrubber`): every secret-named
-//! header, query parameter, form field and JSON key becomes a required `{{var}}`
-//! placeholder the runner must be given at run time, and every other value is
-//! passed through `scrub_embedded` — [`aitm_core::redact::scrub_text`] plus the
-//! same widened name vocabulary ([`is_secret_name`]) the name scrub uses, so a
-//! credential embedded in an innocuously named value cannot slip past a
-//! narrower list. `record_finding` is a thin
-//! wrapper over [`aitm_findings::DiskFindingStore`]: the store itself scrubs
-//! `title`/`notes` of credential material before anything reaches disk, and the
-//! record's `target` is scrubbed here.
+//! it copies, itself (see `Scrubber`): every secret-named header, query
+//! parameter, form field and JSON key becomes a required `{{var}}` placeholder
+//! the runner must be given at run time, and every other value is passed
+//! through `scrub_embedded` — URL userinfo stripped, then
+//! [`aitm_core::redact::scrub_text_wide`], the wide reading of the same
+//! vocabulary [`is_secret_name`] applies to a name, so a credential embedded in
+//! an innocuously named value is judged by the same wide reading, not a narrower
+//! one.
+//!
+//! `record_finding` is a thin wrapper over [`aitm_findings::DiskFindingStore`]:
+//! the store itself scrubs `title`/`notes` of credential material before
+//! anything reaches disk, and the record's `target` is scrubbed here.
 
 use std::collections::HashSet;
 
-use aitm_core::redact::scrub_text;
+use aitm_core::redact::{scrub_text, scrub_text_wide};
 use aitm_core::{Body, CommandHost, HttpFlow, HttpRequest};
 use aitm_findings::{DiskFindingStore, FindingRecord, FindingStore};
 use aitm_poc::{
@@ -35,7 +37,7 @@ use aitm_poc::{
 
 use crate::checks::{CheckDefinition, Payload, CLASS_OPEN_REDIRECT, CLASS_REFLECTED_XSS};
 use crate::crawl::strip_userinfo;
-use crate::discover::{is_secret_name, InjectionPoint, EXTRA_SECRET_NEEDLES};
+use crate::discover::{is_secret_name, InjectionPoint};
 
 /// Characters of the (network-supplied) injection-point name that feed the PoC
 /// name and, through its slug, the PoC id. Bounded so the id always fits
@@ -378,149 +380,17 @@ impl<'a> Scrubber<'a> {
 /// Mask credential material embedded in a value that is *not* itself under a
 /// secret name, using the one vocabulary the name scrub uses.
 ///
-/// [`scrub_text`] alone only knows `api_key` / `token` / `secret` / `password` /
-/// `pwd` / `credential` / `cookie` and `Bearer`, so a `sid=`, `jwt=`, `csrf=`,
-/// `session=` or `auth=` pair — all of which [`is_secret_name`] masks when they
-/// are the *name* of a header or parameter — passed straight through when
-/// embedded in a `Referer`-style or URL-valued value. This closes that gap in
-/// three steps:
-///
-/// 1. URL userinfo is stripped ([`strip_userinfo`]: `//user:pw@host` →
-///    `//host`) — first, so a `user:pw@` prefix cannot make the next steps
-///    swallow the host;
-/// 2. [`scrub_text`] masks its own base vocabulary;
-/// 3. every `key=value` / `key: value` whose *key* contains an
-///    [`EXTRA_SECRET_NEEDLES`] needle has its value replaced by `[redacted]`
-///    ([`redact_needle_pairs`]).
+/// URL userinfo is stripped first ([`strip_userinfo`]: `//user:pw@host` →
+/// `//host`), so a `user:pw@` prefix cannot make the scan swallow the host. Then
+/// [`scrub_text_wide`] masks every `key=value` / `key: value` pair whose key
+/// reads as a secret: it runs core's one pair scan twice, first with the
+/// standard reading and then with the wide one. This scrub and
+/// [`is_secret_name`], which decides the *name* of a header or parameter, judge
+/// a key by the same predicate, so a `sid=`, `auth=` or `author=` pair embedded
+/// in a `Referer`-style or URL-valued value is masked as it would be under a
+/// name.
 fn scrub_embedded(text: &str) -> String {
-    redact_needle_pairs(&scrub_text(&strip_userinfo(text)))
-}
-
-/// Whether `b` can be part of a `key` in a `key=value` pair.
-fn is_key_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
-}
-
-/// Whether `b` ends an unquoted value: ASCII whitespace or a pair, list or JSON
-/// delimiter. A non-ASCII byte never does, so a value is over- rather than
-/// under-redacted.
-fn ends_value(b: u8) -> bool {
-    b.is_ascii_whitespace() || matches!(b, b'&' | b';' | b',' | b'"' | b'\'' | b'}')
-}
-
-/// Whether `key` contains an [`EXTRA_SECRET_NEEDLES`] needle (ASCII
-/// case-insensitive, as a substring — exactly how `discover::is_secret_name`
-/// matches the same slice).
-fn names_a_secret(key: &str) -> bool {
-    let key = key.as_bytes();
-    // No per-key allocation: this runs once per key run of a body that may be
-    // megabytes long. (`windows(0)` would panic, so an empty needle is skipped.)
-    EXTRA_SECRET_NEEDLES.iter().any(|needle| {
-        let needle = needle.as_bytes();
-        !needle.is_empty()
-            && key
-                .windows(needle.len())
-                .any(|window| window.eq_ignore_ascii_case(needle))
-    })
-}
-
-/// Redact the value of every `key=value` / `key: value` pair in `text` whose key
-/// reads as a secret under [`EXTRA_SECRET_NEEDLES`].
-///
-/// Equivalent to replacing, case-insensitively,
-/// `(["']?[a-z0-9_.-]*(?:needle…)[a-z0-9_.-]*["']?[ \t]*[=:][ \t]*["']?)<value>`
-/// with `${1}[redacted]`, where `<value>` is a run up to `[\s&;,"'}]` — or, when
-/// it opens with a quote, everything up to the matching unescaped quote, so a
-/// JSON value holding spaces is masked whole. Optional quotes around the key
-/// and value make a JSON-encoded pair (`"sid":"…"`) match the way
-/// `scrub_text`'s own pass does.
-///
-/// Written as one linear scan, not a regex: the crate carries no `regex`
-/// dependency, and each key run and each value is consumed exactly once, so a
-/// hostile ~10 MiB body cannot make this quadratic. An empty value is left
-/// alone (nothing to leak).
-fn redact_needle_pairs(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-    let mut out = String::with_capacity(text.len());
-    // Start of the text not yet copied into `out`.
-    let mut copied = 0;
-    let mut i = 0;
-    while i < len {
-        if !is_key_byte(bytes[i]) {
-            i += 1;
-            continue;
-        }
-        let key_start = i;
-        while i < len && is_key_byte(bytes[i]) {
-            i += 1;
-        }
-        // `key_start..i` is all ASCII, so these are char boundaries.
-        if !names_a_secret(&text[key_start..i]) {
-            continue;
-        }
-
-        // key, optional closing quote, blanks, `=` or `:`, blanks, optional
-        // opening quote, then the value.
-        let mut j = i;
-        if j < len && matches!(bytes[j], b'"' | b'\'') {
-            j += 1;
-        }
-        while j < len && matches!(bytes[j], b' ' | b'\t') {
-            j += 1;
-        }
-        if j >= len || !matches!(bytes[j], b'=' | b':') {
-            continue;
-        }
-        j += 1;
-        while j < len && matches!(bytes[j], b' ' | b'\t') {
-            j += 1;
-        }
-        let quote = match bytes.get(j) {
-            Some(&q) if matches!(q, b'"' | b'\'') => {
-                j += 1;
-                Some(q)
-            }
-            _ => None,
-        };
-        let value_start = j;
-        let value_end = match quote.and_then(|q| closing_quote(bytes, value_start, q)) {
-            Some(end) => end,
-            // Unquoted, or an opening quote that never closes: the plain rule.
-            None => {
-                let mut end = value_start;
-                while end < len && !ends_value(bytes[end]) {
-                    end += 1;
-                }
-                end
-            }
-        };
-        if value_end == value_start {
-            continue;
-        }
-        // `value_start` follows an ASCII byte and `value_end` precedes one (or
-        // is the end of the text), so both are char boundaries.
-        out.push_str(&text[copied..value_start]);
-        out.push_str("[redacted]");
-        copied = value_end;
-        i = value_end;
-    }
-    out.push_str(&text[copied..]);
-    out
-}
-
-/// The index of the unescaped `quote` byte that closes a quoted value starting
-/// at `from`, or `None` if it never closes.
-fn closing_quote(bytes: &[u8], from: usize, quote: u8) -> Option<usize> {
-    let mut k = from;
-    while k < bytes.len() {
-        match bytes[k] {
-            b'\\' => k += 2,
-            b if b == quote => return Some(k),
-            _ => k += 1,
-        }
-    }
-    None
+    scrub_text_wide(&strip_userinfo(text))
 }
 
 /// `value` with a `Referer` / `Referrer` header cut back to origin + path: the
@@ -1331,9 +1201,10 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The reviewer's measured leak: every one of these names is in the shared
-    /// name vocabulary, but none is in `scrub_text`'s, so a `Referer` carrying
-    /// them was emitted verbatim.
+    /// The reviewer's measured leak: `scrub_text` alone did not know these
+    /// names until PR 171, so a `Referer` scrubbed by it alone was emitted
+    /// verbatim. The embedded-value scrub must mask all of them, and the shared
+    /// vocabulary now holds all of them, read the same way by the name scrub.
     #[test]
     fn build_poc_drops_the_referer_query_and_leaks_no_session_id() {
         let def = CheckDefinition::reflected_xss();
@@ -1389,8 +1260,8 @@ mod tests {
         assert_eq!(poc.success, def.success_assertion(payload));
     }
 
-    /// The needle layer on its own: a non-`Referer` header whose name is not a
-    /// secret, so only the embedded-value scrub can mask what it carries.
+    /// The embedded-value scrub on its own: a non-`Referer` header whose name is
+    /// not a secret, so only the embedded-value scrub can mask what it carries.
     #[test]
     fn build_poc_scrubs_session_ids_embedded_in_a_non_secret_header() {
         let def = CheckDefinition::reflected_xss();
@@ -1527,7 +1398,8 @@ mod tests {
             scrub_embedded(r#"{"session":"a b c","n":1}"#),
             r#"{"session":"[redacted]","n":1}"#
         );
-        // The base vocabulary still applies (one pass, two vocabularies).
+        // The long words of the shared list apply alongside the short ones:
+        // one list, read by the wide scrub.
         assert_eq!(
             scrub_embedded("access_token=T&sid=S"),
             "access_token=[redacted]&sid=[redacted]"
@@ -1539,17 +1411,18 @@ mod tests {
         );
     }
 
-    /// One vocabulary: the embedded-value scrub is built from the very slice
-    /// `is_secret_name` matches, so a needle added there is masked here too.
+    /// One vocabulary: the embedded-value scrub masks every short secret word
+    /// `is_secret_name` matches. The list is spelled out here on purpose, so a
+    /// word dropped from core's vocabulary fails this test instead of passing it.
     #[test]
-    fn scrub_embedded_covers_every_extra_secret_needle() {
-        for needle in EXTRA_SECRET_NEEDLES {
-            assert!(is_secret_name(needle), "`{needle}` is a secret name");
+    fn scrub_embedded_covers_every_segment_word() {
+        for word in ["sid", "jwt", "csrf", "session", "auth"] {
+            assert!(is_secret_name(word), "`{word}` is a secret name");
             assert_eq!(
-                scrub_embedded(&format!("x_{needle}_y=V1&z=2")),
-                format!("x_{needle}_y=[redacted]&z=2")
+                scrub_embedded(&format!("x_{word}_y=V1&z=2")),
+                format!("x_{word}_y=[redacted]&z=2")
             );
-            let upper = needle.to_ascii_uppercase();
+            let upper = word.to_ascii_uppercase();
             assert_eq!(
                 scrub_embedded(&format!("{upper}: V1")),
                 format!("{upper}: [redacted]")
@@ -1698,5 +1571,823 @@ mod tests {
         assert_eq!(percent_decode("100%zz%4"), "100%zz%4");
         assert_eq!(percent_decode("a+b%"), "a+b%");
         assert_eq!(percent_decode(""), "");
+    }
+
+    // ---- Pins: the name decisions, and the output of the old two-scan pipeline ----
+
+    /// The rows whose `scrub_embedded` output is not the expected one, as
+    /// `(input, expected, actual)`, so a failing test lists every bad row at once.
+    fn embedded_mismatches<'a>(rows: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str, String)> {
+        rows.iter()
+            .filter_map(|&(input, expected)| {
+                let actual = scrub_embedded(input);
+                (actual != expected).then_some((input, expected, actual))
+            })
+            .collect()
+    }
+
+    /// Every prefix of `text` that ends on a char boundary, the empty one and
+    /// `text` itself included: what a connection that drops mid-stream hands over.
+    fn prefixes(text: &str) -> impl Iterator<Item = &str> {
+        text.char_indices()
+            .map(|(at, _)| at)
+            .chain(std::iter::once(text.len()))
+            .map(move |cut| &text[..cut])
+    }
+
+    /// A parameter whose name only contains one of the short secret words
+    /// (`author` holds `auth`) is placeholdered in a PoC and never recorded.
+    #[test]
+    fn build_poc_placeholders_a_wide_only_parameter() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with_query("/search?q=hello&author=ALICE");
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let url = &http_step(&poc).url;
+        assert!(url.contains("author={{author}}"), "{url}");
+        assert!(url.contains("q=%3Caitm-canary-0001%3E"), "{url}");
+        let author = poc
+            .variables
+            .iter()
+            .find(|v| v.name == "author")
+            .expect("an `author` variable is declared");
+        assert!(author.required, "{author:?}");
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        assert!(!serialized.contains("ALICE"), "{serialized}");
+    }
+
+    /// The name decision and the embedded-value scrub agree on every ASCII key:
+    /// `is_secret_name(key)` and "`scrub_embedded` masks `key=VALUE9`" both equal
+    /// the literal expectation in the table. Keys hold only ASCII alphanumerics
+    /// and `_ . -`; a key with a non-ASCII character glued to a secret word is
+    /// not in the table.
+    #[test]
+    fn scrub_embedded_and_is_secret_name_agree_on_every_key() {
+        let rows: &[(&str, bool)] = &[
+            // Names that only contain one of the five short words.
+            ("author", true),
+            ("authority", true),
+            ("authenticated", true),
+            ("inside", true),
+            ("side", true),
+            ("sidebar", true),
+            ("subsidiary", true),
+            ("sessions", true),
+            ("userSession", true),
+            ("X-Authority", true),
+            ("Author", true),
+            ("rhai.allow_agent_authoring", true),
+            // The five short words themselves.
+            ("sid", true),
+            ("jwt", true),
+            ("csrf", true),
+            ("session", true),
+            ("auth", true),
+            // The long distinctive words.
+            ("Authorization", true),
+            ("token", true),
+            ("password", true),
+            ("passwd", true),
+            ("pwd", true),
+            ("secret", true),
+            ("cookie", true),
+            ("api_key", true),
+            ("apikey", true),
+            ("api-key", true),
+            ("bearer", true),
+            ("credential", true),
+            ("sessionid", true),
+            ("phpsessid", true),
+            // A short word as a whole segment of a longer key.
+            ("x-auth", true),
+            ("_csrf", true),
+            ("connect.sid", true),
+            ("ASP.NET_SessionId", true),
+            // Not secret.
+            ("path", false),
+            ("host", false),
+            ("body", false),
+            ("note", false),
+            ("method", false),
+            ("page", false),
+            ("q", false),
+            ("username", false),
+            ("next", false),
+            ("Content-Type", false),
+            ("Referer", false),
+            ("Content-Length", false),
+        ];
+        assert!(rows.len() >= 40, "the table shrank: {} keys", rows.len());
+
+        let mut bad = Vec::new();
+        for &(key, is_secret) in rows {
+            let pair = format!("{key}=VALUE9");
+            let by_name = is_secret_name(key);
+            let by_scrub = scrub_embedded(&pair) != pair;
+            if by_name != is_secret || by_scrub != is_secret {
+                bad.push((key, is_secret, by_name, by_scrub));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "(key, expected, is_secret_name, scrub_embedded masks it): {bad:?}"
+        );
+    }
+
+    /// Rows recorded by running the old two-scan pipeline's `scrub_embedded` on
+    /// `15009b2`, as `(input, output)`. The outputs are what that code printed,
+    /// not what anyone expected, and each family is a shape a user can send.
+    const RECORDED_SCRUB_EMBEDDED: &[(&str, &str)] = &[
+        // (i) every string the existing scrub_embedded_* and build_poc_scrubs_* tests reach
+        (
+            "username=admin&password=PWSECRET789&q=hello",
+            "username=admin&password=[redacted]&q=hello",
+        ),
+        ("/cb?access_token=DBLSECRET1", "/cb?access_token=[redacted]"),
+        (
+            "application/x-www-form-urlencoded",
+            "application/x-www-form-urlencoded",
+        ),
+        (
+            "{\"password\":\"FORMJSONPW1\"}",
+            "{\"password\":\"[redacted]\"}",
+        ),
+        ("application/json", "application/json"),
+        ("http://target.test/app", "http://target.test/app"),
+        ("admin", "admin"),
+        ("Bearer JSONBEARER3", "Bearer [redacted]"),
+        (
+            "/cb?access_token=NESTED999&x=1",
+            "/cb?access_token=[redacted]&x=1",
+        ),
+        (
+            "http://t/cb?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]\
+             &session=[redacted]&csrf=[redacted]&access_token=[redacted]&page=2",
+            "http://t/cb?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]\
+             &session=[redacted]&csrf=[redacted]&access_token=[redacted]&page=2",
+        ),
+        (
+            "/cb?sid=NEXTSID&jwt=NEXTJWT&session=NEXTSESS",
+            "/cb?sid=[redacted]&jwt=[redacted]&session=[redacted]",
+        ),
+        (
+            "http://t/cb?sid=JSONSID1&jwt=JSONJWT2",
+            "http://t/cb?sid=[redacted]&jwt=[redacted]",
+        ),
+        ("csrf: JSONCSRF3", "csrf: [redacted]"),
+        (
+            "username=admin&sid=BODYSID1&jwt=BODYJWT2",
+            "username=admin&sid=[redacted]&jwt=[redacted]",
+        ),
+        ("x_sid_y=V1&z=2", "x_sid_y=[redacted]&z=2"),
+        ("SID: V1", "SID: [redacted]"),
+        ("x_jwt_y=V1&z=2", "x_jwt_y=[redacted]&z=2"),
+        ("JWT: V1", "JWT: [redacted]"),
+        ("x_csrf_y=V1&z=2", "x_csrf_y=[redacted]&z=2"),
+        ("CSRF: V1", "CSRF: [redacted]"),
+        ("x_session_y=V1&z=2", "x_session_y=[redacted]&z=2"),
+        ("SESSION: V1", "SESSION: [redacted]"),
+        ("x_auth_y=V1&z=2", "x_auth_y=[redacted]&z=2"),
+        ("AUTH: V1", "AUTH: [redacted]"),
+        (
+            "{\"sid\":\"a\\\"b c\",\"n\":1}",
+            "{\"sid\":\"[redacted]\",\"n\":1}",
+        ),
+        ("{'jwt' : 'a b','n':1}", "{'jwt' : '[redacted]','n':1}"),
+        ("sid=\"abc&x=1", "sid=\"[redacted]&x=1"),
+        ("{\"sid\":\"\",\"n\":1}", "{\"sid\":\"\",\"n\":1}"),
+        ("page=2&q=hello", "page=2&q=hello"),
+        ("sid=&x=1", "sid=&x=1"),
+        ("session expired", "session expired"),
+        ("auth", "auth"),
+        ("", ""),
+        ("plain text with no pairs", "plain text with no pairs"),
+        ("subsidiary=acme", "subsidiary=[redacted]"),
+        (
+            "h\u{e9}llo sid=w\u{f6}rld \u{fc}n\u{ef}",
+            "h\u{e9}llo sid=[redacted] \u{fc}n\u{ef}",
+        ),
+        (
+            "PHPSESSID=A&sid=B&jwt=C&auth=D&session=E&csrf=F&page=2",
+            "PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]&session=[redacted]\
+             &csrf=[redacted]&page=2",
+        ),
+        ("X-CSRF: abc", "X-CSRF: [redacted]"),
+        ("sid:abc", "sid:[redacted]"),
+        ("sid = abc", "sid = [redacted]"),
+        (
+            "{\"sid\":\"S1\",\"jwt\": \"J2\", \"n\":1}",
+            "{\"sid\":\"[redacted]\",\"jwt\": \"[redacted]\", \"n\":1}",
+        ),
+        (
+            "{\"session\":\"a b c\",\"n\":1}",
+            "{\"session\":\"[redacted]\",\"n\":1}",
+        ),
+        (
+            "access_token=T&sid=S",
+            "access_token=[redacted]&sid=[redacted]",
+        ),
+        ("go to http://user:pw@host/p?x=1", "go to http://host/p?x=1"),
+        // (ii) quotes and escapes
+        (
+            "{\"token\":\"a\\\\b c\",\"n\":1}",
+            "{\"token\":\"[redacted]\",\"n\":1}",
+        ),
+        (
+            "{\"sid\":\"S1\\\\\",\"n\":1}",
+            "{\"sid\":\"[redacted]\",\"n\":1}",
+        ),
+        ("{'sid':'it\\'s','n':1}", "{'sid':'[redacted]','n':1}"),
+        (
+            "{\"auth\":\"x\\\"y z\",\"n\":1}",
+            "{\"auth\":\"[redacted]\",\"n\":1}",
+        ),
+        (
+            "{\"session\":\"tab\\there\\nnext\",\"n\":1}",
+            "{\"session\":\"[redacted]\",\"n\":1}",
+        ),
+        ("sid=\"a b\"&x=1", "sid=\"[redacted]\"&x=1"),
+        ("password='a b' z=1", "password='[redacted]' z=1"),
+        (
+            "{\"sid\":\"a\",\"jwt\":\"b\",\"csrf\":\"c\"}",
+            "{\"sid\":\"[redacted]\",\"jwt\":\"[redacted]\",\"csrf\":\"[redacted]\"}",
+        ),
+        ("sid=\"abc", "sid=\"[redacted]"),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
+        ("sid='abc def", "sid='[redacted] def"),
+        (
+            "subsidiary=\"acme corp\"&x=1",
+            "subsidiary=\"[redacted]\"&x=1",
+        ),
+        (
+            "{\"subsidiary\":\"a b\",\"n\":1}",
+            "{\"subsidiary\":\"[redacted]\",\"n\":1}",
+        ),
+        // (iii) pairs nested in a non-secret key's value
+        ("next=/cb?sid=S1", "next=/cb?sid=[redacted]"),
+        ("next=/cb?author=S1&x=1", "next=/cb?author=[redacted]&x=1"),
+        ("next=/cb?sidebar=S1", "next=/cb?sidebar=[redacted]"),
+        (
+            "redirect=http://t/cb?jwt=J1&session=S2&page=3",
+            "redirect=http://t/cb?jwt=[redacted]&session=[redacted]&page=3",
+        ),
+        (
+            "url=/a?x=1&password=P1&y=2",
+            "url=/a?x=1&password=[redacted]&y=2",
+        ),
+        ("back=/cb%3Fsid%3DS1", "back=/cb%3Fsid%3DS1"),
+        ("ref=a?b=c&author=Z9;x=1", "ref=a?b=c&author=[redacted];x=1"),
+        ("author=password=S3", "author=[redacted]"),
+        ("msg=hello sid=S1 world", "msg=hello sid=[redacted] world"),
+        // (iv) URL userinfo
+        (
+            "http://user:pw@host/p?sid=S1",
+            "http://host/p?sid=[redacted]",
+        ),
+        ("//auth:pw@host/x", "//host/x"),
+        (
+            "see http://user:pw@host:8080/p?x=1 now",
+            "see http://host:8080/p?x=1 now",
+        ),
+        ("a=//u1:p1@h1/x&b=//u2@h2", "a=//h1/x&b=//h2"),
+        (
+            "http://u:p@ss@host/x?author=Z",
+            "http://host/x?author=[redacted]",
+        ),
+        (
+            "ftp://admin:hunter2@files.example.com/pub",
+            "ftp://files.example.com/pub",
+        ),
+        (
+            "https://token:abc@api.example.com:8443/v1?session=S9",
+            "https://api.example.com:8443/v1?session=[redacted]",
+        ),
+        (
+            "http://user:pw@host/a@b?e=me@x.com",
+            "http://host/a@b?e=me@x.com",
+        ),
+        // (v) empty values
+        ("sid=", "sid="),
+        ("subsidiary=&x=1", "subsidiary=&x=1"),
+        ("token=&sid=&jwt=", "token=&sid=&jwt="),
+        (
+            "{\"sid\":\"\",\"jwt\":\"\",\"n\":1}",
+            "{\"sid\":\"\",\"jwt\":\"\",\"n\":1}",
+        ),
+        ("sid= &x=1", "sid= &x=1"),
+        ("sid=&password=x", "sid=&password=[redacted]"),
+        ("auth:", "auth:"),
+        ("session=\"\"", "session=\"\""),
+        // (vi) Authorization and Bearer
+        (
+            "Authorization: Bearer abc.def.ghi",
+            "Authorization: [redacted]",
+        ),
+        (
+            "Authorization: Basic dXNlcjpwdw==",
+            "Authorization: [redacted]",
+        ),
+        ("authorization=Bearer abc", "authorization=[redacted]"),
+        ("Bearer abc123 and more", "Bearer [redacted] and more"),
+        (
+            "curl -H \"Authorization: Bearer T0K3N\" http://t/x",
+            "curl -H \"Authorization: [redacted]",
+        ),
+        ("X-Auth: Bearer abc", "X-Auth: [redacted] [redacted]"),
+        (
+            "Proxy-Authorization: Basic Zm9v",
+            "Proxy-Authorization: [redacted]",
+        ),
+        (
+            "{\"Authorization\":\"Bearer abc\"}",
+            "{\"Authorization\":\"[redacted] [redacted]",
+        ),
+        ("X-Api-Key: K1", "X-Api-Key: [redacted]"),
+        // (vii) Referer-shaped values given directly
+        (
+            "http://t/app?PHPSESSID=REFPHP1&sid=REFSID2&jwt=REFJWT3&auth=REFAUTH4&session=REFSESS5\
+             &csrf=REFCSRF6",
+            "http://t/app?PHPSESSID=[redacted]&sid=[redacted]&jwt=[redacted]&auth=[redacted]\
+             &session=[redacted]&csrf=[redacted]",
+        ),
+        ("http://t/cb#sid=FRAGSID7", "http://t/cb#sid=[redacted]"),
+        (
+            "https://shop.example.com/cart?author=A1&page=2#session=S2",
+            "https://shop.example.com/cart?author=[redacted]&page=2#session=[redacted]",
+        ),
+        ("http://t/app", "http://t/app"),
+        (
+            "https://example.com:8443/path?next=/cb%3Fsid%3DS1",
+            "https://example.com:8443/path?next=/cb%3Fsid%3DS1",
+        ),
+        // (viii) percent-decoded values as scrub_decoded hands them over
+        (
+            "/cb?sid=NEXTSID&jwt=NEXTJWT",
+            "/cb?sid=[redacted]&jwt=[redacted]",
+        ),
+        (
+            "/cb?author=A1&sidebar=S2&page=3",
+            "/cb?author=[redacted]&sidebar=[redacted]&page=3",
+        ),
+        (
+            "/cb?next=/x?password=P1&sid=S1",
+            "/cb?next=/x?password=[redacted]&sid=[redacted]",
+        ),
+        (
+            "/cb?redirect=http://t/x?token=T1&csrf=C2",
+            "/cb?redirect=http://t/x?token=[redacted]&csrf=[redacted]",
+        ),
+        ("/cb?q=a b&sid=S1", "/cb?q=a b&sid=[redacted]"),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
+        ("/cb?sid=a b c&x=1", "/cb?sid=[redacted] b c&x=1"),
+        ("/cb?note=100%&sid=S1", "/cb?note=100%&sid=[redacted]"),
+        (
+            "/cb?subsidiary=a+b&sid=S1",
+            "/cb?subsidiary=[redacted]&sid=[redacted]",
+        ),
+        // (ix) host:port rows for the five words
+        ("auth.example.com:8443", "auth.example.com:[redacted]"),
+        ("sid.example.com:8443/x", "sid.example.com:[redacted]"),
+        ("jwt.example.com:443", "jwt.example.com:[redacted]"),
+        ("csrf.example.com:8080/", "csrf.example.com:[redacted]"),
+        (
+            "session.example.com:9000?x=1",
+            "session.example.com:[redacted]",
+        ),
+        (
+            "https://auth.example.com:8443/login",
+            "https://auth.example.com:[redacted]",
+        ),
+        (
+            "connect.sid.example.com:12345",
+            "connect.sid.example.com:[redacted]",
+        ),
+        ("sid:12345", "sid:[redacted]"),
+        ("example.com:8443/x", "example.com:8443/x"),
+        // (x) malformed families
+        ("=", "="),
+        (":", ":"),
+        ("sid", "sid"),
+        ("sid=\"", "sid=\""),
+        ("sid=\\", "sid=[redacted]"),
+        ("'", "'"),
+        ("\"", "\""),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
+        ("auth==\"x\"", "auth=[redacted]\"x\""),
+        ("sid=a=b=c", "sid=[redacted]"),
+        ("&&&sid=1&&&", "&&&sid=[redacted]&&&"),
+        ("sid:::abc", "sid:[redacted]"),
+        ("sid=a;b,c", "sid=[redacted];b,c"),
+        ("session=}", "session=}"),
+        ("{{{\"sid\":", "{{{\"sid\":"),
+        ("sid = ", "sid = "),
+        ("sid\t=\tabc", "sid\t=\t[redacted]"),
+        ("sid=a\0b", "sid=[redacted]"),
+        // rows in this group record a tail the shared value rule leaves beside the mask; they pin the unchanged behaviour of the standard scan, they are not requirements
+        ("sid=a\rb", "sid=[redacted]\rb"),
+        ("sid=a\u{c}b", "sid=[redacted]\u{c}b"),
+        ("sid:\nabc", "sid:\n[redacted]"),
+        ("x=1&y=2&z=3", "x=1&y=2&z=3"),
+        ("sid=\u{4e2d}\u{6587}&x=1", "sid=[redacted]&x=1"),
+        // (xi) wide-only keys in well-formed framings
+        ("author=bob&page=2", "author=[redacted]&page=2"),
+        ("author: bob", "author: [redacted]"),
+        ("authority=example.com", "authority=[redacted]"),
+        ("authenticated=true&x=1", "authenticated=[redacted]&x=1"),
+        ("inside=out", "inside=[redacted]"),
+        ("side=left", "side=[redacted]"),
+        ("sessions=3", "sessions=[redacted]"),
+        ("userSession=abc&x=1", "userSession=[redacted]&x=1"),
+        ("X-Authority: example", "X-Authority: [redacted]"),
+        ("Author=Bob", "Author=[redacted]"),
+        (
+            "rhai.allow_agent_authoring=1",
+            "rhai.allow_agent_authoring=[redacted]",
+        ),
+        ("sidebar='x y' z=1", "sidebar='[redacted]' z=1"),
+        (
+            "{\"sidebar\":\"YWJj=\",\"user\":\"bob\"}",
+            "{\"sidebar\":\"[redacted]\",\"user\":\"bob\"}",
+        ),
+        // (xii) a standard-secret pair nested under a wide-only parent (YAML and
+        // inline), and a line break or form feed beside the separator of a wide-only key
+        (
+            "authentication:\n  password: hunter2",
+            "authentication:\n  password: [redacted]",
+        ),
+        ("author:\n  token: abc123", "author:\n  token: [redacted]"),
+        ("sessions:\n  jwt: J1", "sessions:\n  jwt: [redacted]"),
+        (
+            "sidebar:\n    api_key: K1",
+            "sidebar:\n    api_key: [redacted]",
+        ),
+        (
+            "authentication: {password: hunter2}",
+            "authentication: [redacted] [redacted]}",
+        ),
+        ("sidebar=sid=\"C1\"", "sidebar=[redacted]\"[redacted]\""),
+        ("author=password='C2'", "author=[redacted]'[redacted]'"),
+        ("inside=x?sid\t=\tC9", "inside=[redacted]\t=\t[redacted]"),
+        ("Auths:Pwd: C", "Auths:[redacted] [redacted]"),
+        (
+            "authentication:\n  sessionKey: abc123",
+            "authentication:\n  sessionKey: [redacted]",
+        ),
+        ("side:\nSid2':C", "side:\nSid2':[redacted]"),
+        ("bsid:\rSIDE:'C", "bsid:\rSIDE:'[redacted]"),
+        ("author:\nJohn", "author:\nJohn"),
+        ("sidebar\n:v", "sidebar\n:v"),
+        ("sidebar=\u{c}v", "sidebar=\u{c}v"),
+    ];
+
+    /// The recorded output of the old two-scan pipeline at `15009b2`, row by
+    /// row: for every input of [`RECORDED_SCRUB_EMBEDDED`] the embedded-value
+    /// scrub returns exactly what that pipeline printed.
+    #[test]
+    fn scrub_embedded_matches_the_recorded_pipeline_output() {
+        assert!(
+            RECORDED_SCRUB_EMBEDDED.len() >= 80,
+            "the corpus shrank: {} rows",
+            RECORDED_SCRUB_EMBEDDED.len()
+        );
+        let distinct: HashSet<&str> = RECORDED_SCRUB_EMBEDDED
+            .iter()
+            .map(|&(input, _)| input)
+            .collect();
+        assert!(
+            distinct.len() == RECORDED_SCRUB_EMBEDDED.len(),
+            "an input is listed twice"
+        );
+
+        let bad = embedded_mismatches(RECORDED_SCRUB_EMBEDDED);
+        assert!(
+            bad.is_empty(),
+            "rows that differ from the recorded output (input, recorded, actual): {bad:#?}"
+        );
+    }
+
+    /// One row per deliberate change, DC1 to DC6 of the spec
+    /// (`docs/superpowers/specs/2026-10-31-scanner-vocab-consolidation-design.md`),
+    /// each with the output of the old two-scan pipeline at `15009b2` in a
+    /// comment. Every row of [`RECORDED_SCRUB_EMBEDDED`] is unchanged. DC5 and
+    /// DC6 mask less than that pipeline did, and only on malformed input (a
+    /// vertical tab or a non-ASCII space inside an unquoted value, a quote that
+    /// never closes).
+    #[test]
+    fn scrub_embedded_deliberate_changes_are_exactly_these() {
+        let rows: &[(&str, &str)] = &[
+            // old pipeline: `xsid\u{e9}y=v`, unchanged (DC1)
+            ("xsid\u{e9}y=v", "xsid\u{e9}y=[redacted]"),
+            // old pipeline: `sidebar\u{a0}:\u{a0}v`, unchanged (DC2)
+            ("sidebar\u{a0}:\u{a0}v", "sidebar\u{a0}:\u{a0}[redacted]"),
+            // old pipeline: `sidebar=[redacted]` (DC2)
+            ("sidebar=\u{b}v", "sidebar=\u{b}[redacted]"),
+            // old pipeline: `token.example.com:8443/x`, unchanged (DC3)
+            ("token.example.com:8443/x", "token.example.com:[redacted]"),
+            // old pipeline: `sidebar='[redacted]'[redacted]'` (DC4)
+            ("sidebar='abc def token='S3'", "sidebar='[redacted]'"),
+            // old pipeline: `sid=[redacted]` (DC5)
+            ("sid=abc\u{a0}def", "sid=[redacted]\u{a0}def"),
+            // old pipeline: `sidebar=[redacted]` (DC5)
+            ("sidebar=abc\u{b}def", "sidebar=[redacted]\u{b}def"),
+            // old pipeline: `sid='[redacted]'[redacted]` (DC6)
+            (
+                "sid='abc def token='S3",
+                "sid='[redacted] def token='[redacted]",
+            ),
+        ];
+        assert!(rows.len() >= 8, "the table shrank: {} rows", rows.len());
+
+        let bad = embedded_mismatches(rows);
+        assert!(
+            bad.is_empty(),
+            "rows that differ from the new output (input, expected, actual): {bad:#?}"
+        );
+    }
+
+    // ---- Edges of the embedded-value scrub: userinfo first, the ends of the text,
+    // ---- non-ASCII boundaries, a text cut short, and the name call sites.
+
+    /// URL userinfo goes first, so a username that reads as a secret word cannot
+    /// make the scan swallow the host, and the password is gone from every output.
+    #[test]
+    fn scrub_embedded_strips_userinfo_before_it_scans() {
+        let rows: &[(&str, &str)] = &[
+            ("//auth:pw@host/x", "//host/x"),
+            ("//sid:pw@host/x?q=1", "//host/x?q=1"),
+            ("//author:pw@host:8443/x", "//host:8443/x"),
+            (
+                "//token:pw@host/x?sidebar=S1",
+                "//host/x?sidebar=[redacted]",
+            ),
+            ("http://auth:pw@host", "http://host"),
+            ("//auth:pw@", "//"),
+            ("x=//auth:pw@h1/a&y=//sid:pw@h2/b", "x=//h1/a&y=//h2/b"),
+            (
+                "\u{e9}//auth:pw@h\u{f6}st/\u{fc}",
+                "\u{e9}//h\u{f6}st/\u{fc}",
+            ),
+        ];
+        let bad = embedded_mismatches(rows);
+        assert!(
+            bad.is_empty(),
+            "rows that differ (input, expected, actual): {bad:#?}"
+        );
+
+        // Cut at every char boundary, as a dropped connection would leave it:
+        // neither the password nor any canary value survives.
+        let doc = "//auth:pw@host/x?sid=QQQQ&author=QQQQ";
+        let mut bad: Vec<(usize, String)> = Vec::new();
+        for prefix in prefixes(doc) {
+            let out = scrub_embedded(prefix);
+            if out.contains('Q') || out.contains("pw") {
+                bad.push((prefix.len(), out));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a credential survived in a prefix: {bad:#?}"
+        );
+        assert_eq!(
+            scrub_embedded(doc),
+            "//host/x?sid=[redacted]&author=[redacted]"
+        );
+    }
+
+    /// The ends of the text and the non-ASCII boundaries, as the wide scrub
+    /// reads them. The non-ASCII rows are the shapes of DC1 and DC5 of the spec,
+    /// pinned here as the new output.
+    #[test]
+    fn scrub_embedded_reads_the_edges_of_the_text() {
+        let rows: &[(&str, &str)] = &[
+            ("", ""),
+            ("author", "author"),
+            ("author:", "author:"),
+            ("x=1&author=", "x=1&author="),
+            ("x=1&author=v", "x=1&author=[redacted]"),
+            ("sidebar=\u{e9}", "sidebar=[redacted]"),
+            ("sidebar=v\u{a0}", "sidebar=[redacted]\u{a0}"),
+            ("\u{e9}author=v", "\u{e9}author=[redacted]"),
+            ("author\u{e9}", "author\u{e9}"),
+            ("si\u{e9}d=v", "si\u{e9}d=v"),
+        ];
+        let bad = embedded_mismatches(rows);
+        assert!(
+            bad.is_empty(),
+            "rows that differ (input, expected, actual): {bad:#?}"
+        );
+    }
+
+    /// A wide-only name is a placeholder wherever a PoC step carries a name: a
+    /// header and a JSON key, which are `Scrubber` call sites that no other test
+    /// reaches with a name outside the standard reading.
+    #[test]
+    fn build_poc_placeholders_a_wide_only_header_and_json_key() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with(
+            "POST",
+            "/search?q=hello",
+            &[
+                ("Content-Type", "application/json"),
+                ("X-Authority", "HDRVAL1"),
+            ],
+            Some(
+                r#"{"user":"admin","sidebar":"JSONVAL2","nested":{"subsidiary":"JSONVAL3"},"note":"ok"}"#,
+            ),
+        );
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        for secret in ["HDRVAL1", "JSONVAL2", "JSONVAL3"] {
+            assert!(
+                !serialized.contains(secret),
+                "leaked `{secret}`: {serialized}"
+            );
+        }
+        let step = http_step(&poc);
+        assert_eq!(header_of(step, "X-Authority"), Some("{{x_authority}}"));
+        let body: serde_json::Value =
+            serde_json::from_str(step.body.as_deref().expect("a json body")).expect("valid json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "user": "admin",
+                "sidebar": "{{sidebar}}",
+                "nested": {"subsidiary": "{{subsidiary}}"},
+                "note": "ok",
+            })
+        );
+        for name in ["x_authority", "sidebar", "subsidiary"] {
+            let var = poc
+                .variables
+                .iter()
+                .find(|v| v.name == name)
+                .unwrap_or_else(|| panic!("no `{name}` variable: {:?}", poc.variables));
+            assert!(var.required && var.default.is_none(), "{var:?}");
+        }
+    }
+
+    /// Each of the five short words is read as a substring, by the name decision
+    /// and by the embedded-value scrub alike, inside a key that is no whole
+    /// segment (`myjwt2`, `JWTX`, `ajwt`). The expected output is literal.
+    #[test]
+    fn scrub_embedded_masks_a_key_that_merely_contains_each_segment_word() {
+        let mut bad: Vec<(String, bool, String)> = Vec::new();
+        for word in ["sid", "jwt", "csrf", "session", "auth"] {
+            let upper = word.to_ascii_uppercase();
+            for key in [
+                format!("my{word}2"),
+                format!("{upper}X"),
+                format!("a{word}"),
+            ] {
+                let actual = scrub_embedded(&format!("{key}=VALUE9&page=2"));
+                let expected = format!("{key}=[redacted]&page=2");
+                let named = is_secret_name(&key);
+                if !named || actual != expected {
+                    bad.push((key, named, actual));
+                }
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "(key, is_secret_name, scrub_embedded output): {bad:#?}"
+        );
+    }
+
+    /// The part of a PoC URL before the `?` is free text and keeps the standard
+    /// reading: a host:port in the path stays readable. The same text as a query
+    /// value is an embedded value, read the wide way, so its port is masked.
+    #[test]
+    fn build_poc_reads_the_url_path_by_the_standard_reading() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let flow = flow_with_query("/go/auth.example.com:8443/x?q=hello&u=auth.example.com:8443");
+        let q = point(&flow, Location::Query, "q", "hello");
+
+        let poc = build_poc(&flow, &def, &q, payload).expect("poc builds");
+
+        let url = &http_step(&poc).url;
+        assert!(
+            url.starts_with("{{target}}/go/auth.example.com:8443/x?"),
+            "{url}"
+        );
+        assert!(
+            url.ends_with("&u=auth.example.com%3A%5Bredacted%5D"),
+            "{url}"
+        );
+    }
+
+    /// `safe_target` cleans free text for an error message and keeps the
+    /// standard reading: a query whose names hold a short secret word only inside
+    /// a longer name stays readable. The same text handed to `scrub_embedded` is
+    /// read the wide way and masked, so this pin tells the two readings apart.
+    #[test]
+    fn safe_target_reads_a_query_by_the_standard_reading() {
+        let text = "http://t/x?authority=ex&author=3&side=left";
+        assert_eq!(crate::crawl::safe_target(text), text);
+        assert_eq!(
+            scrub_embedded(text),
+            "http://t/x?authority=[redacted]&author=[redacted]&side=[redacted]"
+        );
+    }
+
+    /// A standard-secret pair nested under a wide-only key is masked wherever a
+    /// PoC carries free text: a JSON string leaf (the line break is a real one once
+    /// the JSON is parsed), a form value (`%0A`), an untyped body and a header
+    /// value. No canary survives in the serialized PoC, and each text is exactly
+    /// what the wide scrub makes of it.
+    #[test]
+    fn build_poc_masks_a_nested_standard_pair_under_a_wide_only_key() {
+        let def = CheckDefinition::reflected_xss();
+        let payload = def.payloads.first().expect("a payload");
+        let build = |headers: &[(&str, &str)], body: Option<&str>| {
+            let flow = flow_with("POST", "/search?q=hello", headers, body);
+            let q = point(&flow, Location::Query, "q", "hello");
+            build_poc(&flow, &def, &q, payload).expect("poc builds")
+        };
+
+        // JSON string leaves, one of them inside an array.
+        let poc = build(
+            &[("Content-Type", "application/json")],
+            Some(
+                r#"{"note":"authentication:\n  password: JSONPW1","memo":"sidebar=sid=\"JSONSID2\"","list":["author:\n  token: JSONTOK3"]}"#,
+            ),
+        );
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        for canary in ["JSONPW1", "JSONSID2", "JSONTOK3"] {
+            assert!(
+                !serialized.contains(canary),
+                "leaked `{canary}`: {serialized}"
+            );
+        }
+        let body: serde_json::Value =
+            serde_json::from_str(http_step(&poc).body.as_deref().expect("a json body"))
+                .expect("valid json");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "note": "authentication:\n  password: [redacted]",
+                "memo": "sidebar=[redacted]\"[redacted]\"",
+                "list": ["author:\n  token: [redacted]"],
+            })
+        );
+
+        // Form values, percent-encoded: `%0A` is a line break, `+` a space.
+        let poc = build(
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            Some(
+                "note=authentication%3A%0A++password%3A+FORMPW4\
+                 &memo=sidebar%3Dsid%3D%22FORMSID5%22&page=2",
+            ),
+        );
+        let serialized = serde_json::to_string(&poc).expect("poc serializes");
+        for canary in ["FORMPW4", "FORMSID5"] {
+            assert!(
+                !serialized.contains(canary),
+                "leaked `{canary}`: {serialized}"
+            );
+        }
+        let body = http_step(&poc).body.clone().expect("a form body");
+        let pairs: Vec<(String, String)> = url::form_urlencoded::parse(body.as_bytes())
+            .into_owned()
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("note", "authentication:\n  password: [redacted]"),
+                ("memo", "sidebar=[redacted]\"[redacted]\""),
+                ("page", "2"),
+            ]
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+
+        // A body with no content type is scrubbed whole.
+        let poc = build(&[], Some("authentication:\n  password: RAWPW6"));
+        assert_eq!(
+            http_step(&poc).body.as_deref(),
+            Some("authentication:\n  password: [redacted]")
+        );
+
+        // A header value.
+        let poc = build(&[("X-Note", "sidebar=sid=\"HDRSID7\"")], None);
+        assert_eq!(
+            header_of(http_step(&poc), "X-Note"),
+            Some("sidebar=[redacted]\"[redacted]\"")
+        );
+
+        // A JSON body cut short by a dropped connection does not parse, so it is
+        // scrubbed as text, and the credential still goes.
+        let poc = build(
+            &[("Content-Type", "application/json")],
+            Some(r#"{"note":"authentication:\n  password: TRUNCPW8"#),
+        );
+        let body = http_step(&poc).body.clone().expect("a body");
+        assert!(!body.contains("TRUNCPW8"), "a cut JSON body leaked: {body}");
     }
 }
