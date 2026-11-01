@@ -50,6 +50,12 @@ dependencies = [
  "aitm-proto-l4",
  "aitm-proto-ws",
  "aitm-rules",
+ "aitm-scan-checks-http",
+ "aitm-scan-http",
+ "aitm-scan-l4-packet",
+ "aitm-scan-l4-stream",
+ "aitm-scan-model",
+ "aitm-scan-ws",
  "aitm-sysproxy",
  "aitm-testtarget",
  "aitm-tui",
@@ -249,6 +255,7 @@ dependencies = [
  "aitm-core",
  "aitm-findings",
  "aitm-poc",
+ "aitm-scan-model",
  "anyhow",
  "futures",
  "serde_json",
@@ -405,6 +412,58 @@ dependencies = [
  "anyhow",
  "regex",
  "serde_json",
+]
+
+[[package]]
+name = "aitm-scan-checks-http"
+version = "0.5.8"
+dependencies = [
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-http"
+version = "0.5.8"
+dependencies = [
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-l4-packet"
+version = "0.5.8"
+dependencies = [
+ "aitm-proto-l4",
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-l4-stream"
+version = "0.5.8"
+dependencies = [
+ "aitm-proto-l4",
+ "aitm-scan-model",
+]
+
+[[package]]
+name = "aitm-scan-model"
+version = "0.5.8"
+dependencies = [
+ "aitm-core",
+ "aitm-poc",
+ "anyhow",
+ "futures",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+]
+
+[[package]]
+name = "aitm-scan-ws"
+version = "0.5.8"
+dependencies = [
+ "aitm-core",
+ "aitm-plugin",
+ "aitm-scan-model",
 ]
 
 [[package]]

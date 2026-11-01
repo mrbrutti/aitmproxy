@@ -1,0 +1,84 @@
+{
+  "jobs": [
+    {
+      "job": "scan-1a2b3c4d",
+      "state": "running",
+      "phase": "auditing",
+      "elapsed_ms": 42000,
+      "probes": {
+        "sent": 418,
+        "budget": 2000,
+        "errors": 2,
+        "timeouts": 1,
+        "rate_waits": 0,
+        "by_lane": {
+          "http": 418
+        }
+      },
+      "points": {
+        "found": 120,
+        "queued": 40,
+        "audited": 80,
+        "skipped": {
+          "ignored": 5,
+          "frequent": 3,
+          "limit": 0
+        }
+      },
+      "issues": {
+        "total": 3,
+        "by_severity": {
+          "critical": 0,
+          "high": 1,
+          "medium": 1,
+          "low": 1,
+          "info": 0
+        },
+        "by_confidence": {
+          "certain": 1,
+          "firm": 1,
+          "tentative": 1
+        }
+      }
+    },
+    {
+      "job": "scan-55667788",
+      "state": "done",
+      "phase": "done",
+      "elapsed_ms": 42000,
+      "probes": {
+        "sent": 0,
+        "budget": 0,
+        "errors": 0,
+        "timeouts": 0,
+        "rate_waits": 0,
+        "by_lane": {}
+      },
+      "points": {
+        "found": 0,
+        "queued": 0,
+        "audited": 0,
+        "skipped": {
+          "ignored": 0,
+          "frequent": 0,
+          "limit": 0
+        }
+      },
+      "issues": {
+        "total": 0,
+        "by_severity": {
+          "critical": 0,
+          "high": 0,
+          "medium": 0,
+          "low": 0,
+          "info": 0
+        },
+        "by_confidence": {
+          "certain": 0,
+          "firm": 0,
+          "tentative": 0
+        }
+      }
+    }
+  ]
+}

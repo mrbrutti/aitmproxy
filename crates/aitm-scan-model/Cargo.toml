@@ -1,0 +1,28 @@
+[package]
+name = "aitm-scan-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Scanner v2 shared data model: wire types, built-in profiles, lane/check traits. No I/O."
+
+[dependencies]
+# Flow identity, client, store and guard types: the model expresses its
+# references and traits in core's vocabulary and performs no I/O of its own.
+aitm-core.workspace = true
+# `Severity` and `Assertion`: an issue's severity and a check's PoC hint reuse
+# the PoC engine's vocabulary rather than minting a parallel one.
+aitm-poc.workspace = true
+anyhow.workspace = true
+# `BoxFuture`, so the `Check`/`Lane`/`ProbeHost` traits stay object-safe.
+futures.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+# Built-in profiles are operator-authored YAML (spec D11); the profile tests
+# read them the way an operator's file is read.
+serde_yaml.workspace = true
+
+[lints]
+workspace = true
