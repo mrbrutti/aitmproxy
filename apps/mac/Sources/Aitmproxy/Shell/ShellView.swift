@@ -49,11 +49,10 @@ struct ShellView: View {
             if session.paletteVisible {
                 ZStack(alignment: .top) {
                     Color.black.opacity(0.001).ignoresSafeArea().onTapGesture { session.paletteVisible = false }
-                    // ⌘K is used all day: it opens and closes in the same frame, from the keyboard and
-                    // from the toolbar alike, with or without Reduce Motion (brief: no entrance motion;
-                    // keyboard actions never animate). A popover transition once sat here, but its
-                    // `.animation` lived inside this branch and never ran; measured on a real run, a
-                    // toolbar click opened and closed the palette in one frame each.
+                    // ⌘K is used all day: it opens and closes in the same frame, from the keyboard
+                    // and from the toolbar alike, with or without Reduce Motion (brief: no entrance
+                    // motion; keyboard actions never animate). Deliberately no transition: see
+                    // docs/ANIMATION-AUDIT.md finding 4.
                     CommandPalette()
                         .padding(.top, Space.section * 2)
                 }
