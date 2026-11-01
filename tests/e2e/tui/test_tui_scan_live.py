@@ -16,26 +16,34 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
         sample; the state/phase cell changes at least once; x yields `cancelled` on screen
         and in scan.status; the second client saw a `progress` and a `cancelled` line.
   T7-17 (UI-2) a second `standard` job: while scan.status still says `running`, the Issues
-        tab shows the issue under its severity header, the detail shows the evidence
-        payload scan.issue reports, Tab + Enter opens the first probe flow in the
-        inspector at that flow's path, f -> false_positive, u -> open (screen AND
-        scan.issue), P opens Findings on the PoC or records the toast.
+        tab shows a reflected-xss issue (else one carrying a payload and a probe flow)
+        under its severity header, the detail shows the evidence payload scan.issue
+        reports, Tab + Enter opens the first probe flow in the inspector (Request and
+        Response panes, the flow's method and path, the Scan strip gone), f ->
+        false_positive, u -> open (screen AND scan.issue), P opens Findings on the PoC
+        or records the toast.
   T7-18 (UI-3) `l4-stream-safe` + t 127.0.0.1:<port>/tcp: the D7 gate text is on screen and
         s starts nothing (scan.list unchanged for 3 s); after the harness adds an inject
-        L4 scope entry, s shows the confirm overlay containing "may disrupt the target",
-        y is answered by a Jobs row or the refused_l4 / lane_unavailable wording (matching
-        the harness's own scan.start), and n on a fresh prompt shows `scan.start cancelled`
-        with no new job.
+        L4 scope entry (removed again at the end of the run), s shows the confirm overlay
+        containing "may disrupt the target", y is answered by what the harness's own
+        scan.start answers for the same profile (a Jobs row for a job, the D9 wording for
+        `refused_l4` or `lane_unavailable`), and n on a fresh prompt shows `scan.start
+        cancelled` with no new job. A core without the `l4-stream-safe` profile FAILS
+        the step; only an l4.scope.add the core refuses skips its cleared-gate sub-steps.
   T7-19 (UI-5) a `map-only` job that reached `done`: every host, `METHOD path_template` and
         point name of the harness's live scan.sitemap read is in the rendered text (never
-        a fixture); Enter on the first node opens its first flow in the inspector.
-  T7-20 hygiene: the seeded Cookie and Authorization values never appear in any screen
-        sample (every sample is kept and grepped), and q ends the process with exit 0.
+        a fixture); Enter on the node under the cursor opens its first flow in the
+        inspector.
+  T7-20 hygiene: the seeded Cookie and Authorization values (and their first 12 hex
+        chars) never appear in any screen sample taken on the Scan surface (every sample
+        is kept, tagged with its surface, and grepped), and q ends the process with exit 0.
 
 Capability gates -> exit 77 (SKIP), nothing claimed:
   * no aitm-tui binary (AITM_TUI_BIN, a build output, or PATH);
   * no aitm-testtarget-serve / no aitm binary when self-booting;
+  * a runner core named by AITM_BUS_ADDR with an incomplete operator environment;
   * `scan.start` absent from tools/list (the scanner v2 engine is not on this core).
+A v2 core lacking scan.sitemap / scan.issues / scan.issue FAILS the step that reads it.
 
 Attaches to a runner core (AITM_BUS_ADDR + AITM_BUS_OPERATOR_TOKEN + AITM_PROXY_ADDR +
 AITM_TARGET_URL) or self-boots Target("vulnerable") + Aitm.server(CoreConfig(..)). Uses a
@@ -43,6 +51,10 @@ real pty and real ports, so it runs from a real shell or rig, NEVER from the san
 (which denies socket binds). Evidence (screen captures, status brackets, push counts,
 summary) is written to $AITM_E2E_ARTIFACTS, else to a temp dir named on stdout; the
 seeded secrets are redacted from everything written or printed, and are never printed.
+Results are three-state: `ok`, `FAIL`, and `note` (a sub-step the core could not offer,
+recorded and tallied apart, never a pass). The per-run work dir (the TUI's HOME, the
+0600 token file, the self-booted core's findings store with the seeded session values)
+is removed with the run; the L4 scope entry the cell adds is removed by its id.
 
 Exit 0 PASS / 1 FAIL / 77 SKIP.
 """
@@ -79,6 +91,9 @@ from aitm_e2e.target import Target, testtarget_bin  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(E2E))
 SKIP_EXIT = 77
 COLS, ROWS = 200, 50
+# The Scan tabs split side by side at 100 columns or more: the list pane takes the left
+# 45 % (crates/aitm-tui/src/ui/scan/mod.rs `panes`), the detail the rest.
+LIST_SPAN = int(COLS * 45 / 100)
 
 # Timings. The TUI polls scan.status about once a second (spec D6), so every
 # screen claim is polled, never read once.
@@ -97,6 +112,8 @@ L4_SCOPE_S = 5.0
 GATE_CLEAR_S = 25.0
 OVERLAY_S = 20.0
 EXIT_S = 15.0
+# The first hex chars of a seeded secret that a truncated pane cell must still betray.
+SECRET_PREFIX = 12
 
 REDACTED = "<seeded-secret-redacted>"
 JOB_ID_RE = re.compile(r"scan-[0-9a-f]{8}")
@@ -104,12 +121,29 @@ STATE_RE = re.compile(
     r"\b(queued|running|cancelling|done|cancelled|failed)(?:/(queued|crawl|passive|audit|report|done))?\b"
 )
 PROBES_RE = re.compile(r"(\d+)/(\d+)")
+CURSOR_ROW_RE = re.compile(r"(?:^|\n)>")
+# The held editor's header (`crates/aitm-tui/src/ui/scan/profiles.rs` `header`): ` profile `
+# then the name. The D7 gate's `open the profile (⏎)` does not match (no `(` in a name).
+EDITOR_HEAD_RE = re.compile(r"\bprofile [A-Za-z0-9_.-]+")
+# The core's scan error text (`aitm_scan_model::ScanErrorCode::parse_message`): `scan: <code>`.
+SCAN_CODE_RE = re.compile(r"scan: ([a-z_]+)")
 TOKEN = re.compile(
     r"\x1b\[([0-?]*)[ -/]*([@-~])|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][@-~]|\x1b[@-Z\\-_]|[\r\n\x08]|[^\x1b\r\n\x08]+"
 )
 
 ENTER, ESC = "\r", "\x1b"
-# Spec D9 wordings a refused launch can show instead of a Jobs row (T7-18).
+SCAN_STRIP = "1 Profiles"
+# A text each tab alone draws (crates/aitm-tui/src/ui/scan/{profiles,jobs,sitemap,issues}.rs):
+# the Profiles list header, the Jobs footer, the v2 Nodes pane's summary head, the Issues
+# footer. The tab strip is on every tab and proves nothing about which one drew.
+TAB_MARKERS = {
+    "1": r"name\s+lanes\s+intensity",
+    "2": r"x cancel · ⏎ issues of this job",
+    "3": r"\d+ nodes",
+    "4": r"S severity · C confidence",
+}
+# Spec D9 wordings a refused launch can show instead of a Jobs row (T7-18), by the
+# core's error code (crates/aitm-tui/src/scan/mod.rs `code_wording`).
 REFUSAL_WORDINGS = {
     "refused_l4": "L4 refused",
     "lane_unavailable": "No requested lane can run on this core",
@@ -117,6 +151,8 @@ REFUSAL_WORDINGS = {
     "busy": "Scanner busy",
     "refused_agent": "Refused for the agent role",
 }
+CONFIRM_TITLE = "Confirm over the wire: scan launch"
+NO_L4_ID = "no id"
 
 
 class Fatal(Exception):
@@ -150,6 +186,22 @@ def poll(pred, timeout, interval=0.2):
         if time.monotonic() >= deadline:
             return False
         time.sleep(interval)
+
+
+def wait_field(read, key, want, timeout, interval=0.4):
+    """Poll `read()` (a dict-returning bus read) until its `key` is `want`; the last
+    dict read, so the caller can print what the core said instead."""
+    last = {}
+
+    def hit():
+        nonlocal last
+        got = read()
+        if isinstance(got, dict):
+            last = got
+        return last.get(key) == want
+
+    poll(hit, timeout, interval)
+    return last
 
 
 class Screen:
@@ -289,30 +341,42 @@ class Terminal:
 
 
 class Evidence:
-    """Every screen sample is kept RAW in memory (T7-20 greps the raw samples) and
-    written REDACTED to the artifacts dir, so no file and no printed line can carry a
-    seeded secret."""
+    """Every screen sample is kept RAW in memory (T7-20 greps the raw samples), tagged
+    with the surface it was taken on (`scan`: the four tabs and their overlays;
+    `inspector`: a flow detail; `other`: Flows, Findings, the exit), and written
+    REDACTED to the artifacts dir, so no file and no printed line can carry a seeded
+    secret. A secret is matched whole and by its first SECRET_PREFIX hex chars, so a
+    pane that truncates the value is still caught."""
 
     def __init__(self, secret_values):
         self.secrets = [s for s in secret_values if s]
-        self.samples = []  # (step, raw text)
-        named = os.environ.get("AITM_E2E_ARTIFACTS")
-        if named:
-            self.dir = named
-            os.makedirs(self.dir, exist_ok=True)
+        self.needles = []
+        for s in self.secrets:
+            self.needles.append(s)
+            if len(s) > SECRET_PREFIX:
+                self.needles.append(s[:SECRET_PREFIX])
+        self.samples = []  # (step, tag, raw text)
+        self._dir = os.environ.get("AITM_E2E_ARTIFACTS") or None
+
+    @property
+    def dir(self):
+        """The artifacts dir, created on first use so a skip leaves nothing behind."""
+        if self._dir is None:
+            self._dir = tempfile.mkdtemp(prefix="aitm-tui-scan-")
+            print(f"evidence dir: {self._dir}", flush=True)
         else:
-            self.dir = tempfile.mkdtemp(prefix="aitm-tui-scan-")
-        print(f"evidence dir: {self.dir}", flush=True)
+            os.makedirs(self._dir, exist_ok=True)
+        return self._dir
 
     def redact(self, text):
         out = str(text)
-        for s in self.secrets:
+        for s in self.needles:  # whole values first, then their prefixes
             out = out.replace(s, REDACTED)
         return out
 
-    def sample(self, step, text):
-        """Record one screen sample under `step` and return it (raw, for assertions)."""
-        self.samples.append((step, text))
+    def sample(self, step, text, tag):
+        """Record one screen sample under `step` on surface `tag` and return it (raw)."""
+        self.samples.append((step, tag, text))
         return text
 
     def write(self, name, text):
@@ -324,27 +388,33 @@ class Evidence:
     def write_json(self, name, obj):
         return self.write(name, json.dumps(obj, indent=2, sort_keys=True, default=str))
 
-    def leaks(self):
-        """(index, step) of every sample carrying a seeded secret (T7-20)."""
-        return [(i, step) for i, (step, text) in enumerate(self.samples)
-                if any(s in text for s in self.secrets)]
+    def leaks(self, tag):
+        """(index, tag, step) of every sample on surface `tag` carrying a seeded secret
+        or its prefix (T7-20)."""
+        return [(i, t, step) for i, (step, t, text) in enumerate(self.samples)
+                if t == tag and any(n in text for n in self.needles)]
+
+    def tagged(self, tag):
+        return sum(1 for _, t, _ in self.samples if t == tag)
 
 
 class Checks:
+    """Three-state results: `ok`, `FAIL`, `note` (a sub-step the core could not offer,
+    recorded and tallied apart; never a pass, never a failure)."""
+
     def __init__(self, redact=str):
-        self.results = []
+        self.results = []  # (name, state)
         self._redact = redact
 
     def check(self, name, ok, detail=""):
         ok = bool(ok)
-        self.results.append((name, ok))
+        self.results.append((name, "ok" if ok else "FAIL"))
         tail = "" if ok or not detail else f"  -- {self._redact(detail)[:700]}"
         print(("ok   " if ok else "FAIL ") + name + tail, flush=True)
         return ok
 
     def note(self, name, detail=""):
-        """A sub-step the core could not offer (recorded, not a failure)."""
-        self.results.append((name, True))
+        self.results.append((name, "note"))
         tail = f"  -- {self._redact(detail)[:300]}" if detail else ""
         print("note " + name + tail, flush=True)
 
@@ -353,15 +423,21 @@ class Checks:
         raise Fatal(name)
 
     def failed(self):
-        return [n for n, ok in self.results if not ok]
+        return [n for n, state in self.results if state == "FAIL"]
+
+    def tally(self):
+        """(ok, noted, failed) counts."""
+        states = [s for _, s in self.results]
+        return states.count("ok"), states.count("note"), states.count("FAIL")
 
     def lines(self):
-        return [("ok   " if ok else "FAIL ") + n for n, ok in self.results]
+        return [f"{state:<5}{n}" for n, state in self.results]
 
 
 class Pushes:
     """The second bus client: holds a flow.subscribe subscription and tallies
-    notifications/aitm/job lines by job and params.event (spec D3 push kind)."""
+    notifications/aitm/job lines by job and params.event (spec D3 push kind). Only
+    the counts are kept; the client's own stash is cleared after each drain."""
 
     def __init__(self, client):
         self.client = client
@@ -386,6 +462,7 @@ class Pushes:
                 with self._lock:
                     per = self.counts.setdefault(job, {})
                     per[event] = per.get(event, 0) + 1
+            self.client.notifications.clear()
 
     def of(self, job):
         with self._lock:
@@ -447,6 +524,15 @@ def issue_of(bus, issue_id):
     return res if isinstance(res, dict) else {}
 
 
+def cancel_quietly(bus, job):
+    if not job:
+        return
+    try:
+        bus.call("scan.cancel", {"job": job})
+    except (ToolError, BusError):
+        pass
+
+
 # -------------------------------------------------------------- screen reads
 
 
@@ -485,9 +571,17 @@ def on_cursor(text, needle):
     return re.search(r">[^\n]{0,8}" + re.escape(needle), text) is not None
 
 
+def cursor_row(text):
+    """The text of the row the `>` cursor marks (after the mark), or None."""
+    m = re.search(r"(?:^|\n)>([^\n]*)", text)
+    return m.group(1) if m else None
+
+
 def group_of(text, needle, headers):
-    """The severity header (of `headers`) the line carrying `needle` sits under, or None."""
-    lines = text.split("\n")
+    """The severity header (of `headers`) the LIST row carrying `needle` sits under, or
+    None. Only the list pane's columns are read: the detail head on the right shares its
+    row with the filter line and would otherwise claim the needle first."""
+    lines = [ln[:LIST_SPAN] for ln in text.split("\n")]
     idx = next((i for i, ln in enumerate(lines) if needle in ln), None)
     if idx is None:
         return None
@@ -503,7 +597,7 @@ def host_label(node):
     """The Site map's group key: `host[:port]`, the port only when it is not the
     scheme's default (crates/aitm-tui/src/scan/sitemap.rs)."""
     default = 443 if node.get("scheme") == "https" else 80
-    port = node.get("port")
+    port = node.get("port") or default
     return node.get("host", "") if port == default else f"{node.get('host', '')}:{port}"
 
 
@@ -513,13 +607,29 @@ def node_needle(node):
     return "{:<4} {}".format(node.get("method", ""), node.get("path_template", ""))[:40]
 
 
+def inspector_open(text, method, path):
+    """The flow inspector, and nothing else: its Request and Response pane titles
+    (crates/aitm-tui/src/ui/inspector.rs), the flow's method then its path on the header
+    row, and the Scan tab strip gone. `path` alone is everywhere (`/`)."""
+    return (bool(method) and bool(path)
+            and re.search(r"Request\s+Headers", text) is not None
+            and re.search(r"Response\s+Headers", text) is not None
+            and re.search(r"\b" + re.escape(method) + r"\b[^\n]*" + re.escape(path), text) is not None
+            and SCAN_STRIP not in text)
+
+
+def wordings_on(text):
+    """The D9 refusal codes whose wording is on screen."""
+    return sorted(code for code, w in REFUSAL_WORDINGS.items() if w in text)
+
+
 # ------------------------------------------------------------------- driving
 
 
 class Ctx:
     """Everything a step needs; built once in main()."""
 
-    def __init__(self, c, term, bus, pushes, ev, proxy_port, target, origin, target_port):
+    def __init__(self, c, term, bus, pushes, ev, proxy_port, target, origin, target_port, names):
         self.c = c
         self.term = term
         self.bus = bus
@@ -529,23 +639,25 @@ class Ctx:
         self.target = target
         self.origin = origin
         self.target_port = target_port
+        self.names = names
         self.marker = ""
         self.cookie_secret = ""
         self.auth_secret = ""
-        self.status_pairs = []
         self.jobs = {}
+        self.l4_entry_id = None
 
-    def snap(self, step):
-        """One screen sample: recorded for the T7-20 grep, returned raw."""
-        return self.ev.sample(step, self.term.text())
+    def snap(self, step, tag="scan"):
+        """One screen sample on surface `tag`: recorded for the T7-20 grep, returned raw."""
+        return self.ev.sample(step, self.term.text(), tag)
 
-    def screen(self, step="detail"):
+    def screen(self, step="detail", tag="scan"):
         """The screen as a failure detail: redacted and cut."""
-        return f"screen: {self.ev.redact(self.snap(step))[-1400:]!r}"
+        return f"screen: {self.ev.redact(self.snap(step, tag))[-1400:]!r}"
 
 
 def open_scan(ctx):
-    """`:scan` opens the Scan view (the palette's first match is the `:scan` command)."""
+    """`:scan` opens the Scan view (the palette's first match is the `:scan` command) on
+    the tab it was left on."""
     term = ctx.term
     term.press(":")
     if not term.wait_for(r"command or tool", 10):
@@ -553,22 +665,33 @@ def open_scan(ctx):
     term.press("scan")
     time.sleep(UI_SETTLE)
     term.press(ENTER)
-    return term.wait_for(r"1 Profiles", 10)
+    return term.wait_for(re.escape(SCAN_STRIP), 10)
 
 
-def reopen_scan(ctx):
-    """Back to the Scan view on the tab it was left on (the inspector's Esc lands in
-    Flows, so every step that opens a flow comes back through `:scan`)."""
-    return open_scan(ctx)
-
-
-def tab(ctx, key, marker, timeout=10):
+def tab(ctx, key, timeout=10):
+    """Press a tab key and wait for the text that tab alone draws."""
     ctx.term.press(key)
-    return ctx.term.wait_for(marker, timeout)
+    return ctx.term.wait_for(TAB_MARKERS[key], timeout)
+
+
+def focus_profiles_list(ctx):
+    """The Profiles List pane focused before a cursor walk (G99): while an editor is held
+    its Fields pane owns the cursor keys, so one `Esc` (`close_pane`: pane = List, draft
+    kept) comes first whenever the editor header `profile <name>` is on screen. The `>`
+    row is drawn whichever pane is focused, so a List that was already focused is told
+    by the strip leaving on that `Esc`, and `:scan` brings the view back on this tab."""
+    term = ctx.term
+    if EDITOR_HEAD_RE.search(term.text()):
+        term.press(ESC)
+        time.sleep(UI_SETTLE)
+        if SCAN_STRIP not in term.text() and not open_scan(ctx):
+            return False
+    return poll(lambda: CURSOR_ROW_RE.search(term.text()) is not None, 5)
 
 
 def cursor_to(ctx, needle, tries=64):
-    """Walk a list pane from its top until the cursor marks the row carrying `needle`."""
+    """Walk the focused list pane from its top until the cursor marks the row carrying
+    `needle`. On Profiles call `focus_profiles_list` first (G99)."""
     ctx.term.press("g")
     time.sleep(UI_SETTLE)
     for _ in range(tries):
@@ -580,10 +703,10 @@ def cursor_to(ctx, needle, tries=64):
 
 
 def open_profile(ctx, name):
-    """Profiles tab, cursor to `name`, Enter: the editor over scan.profile.get."""
-    if not tab(ctx, "1", r"1 Profiles"):
+    """Profiles tab, List pane, cursor to `name`, Enter: the editor over scan.profile.get."""
+    if not tab(ctx, "1"):
         return False
-    if not cursor_to(ctx, name):
+    if not focus_profiles_list(ctx) or not cursor_to(ctx, name):
         return False
     ctx.term.press(ENTER)
     return ctx.term.wait_for(r"profile " + re.escape(name), 15)
@@ -593,8 +716,8 @@ def ensure_editor(ctx, name, origin):
     """The Profiles tab with `name`'s editor held over a draft carrying `origin`. A
     launch does not close the editor, so a second launch reuses the same draft; only a
     closed editor is re-opened (re-opening re-reads the profile and drops a typed
-    origin, spec D11)."""
-    if not tab(ctx, "1", r"1 Profiles"):
+    origin, spec D11). The launch keys read the held editor whichever pane is focused."""
+    if not tab(ctx, "1"):
         return False
     time.sleep(UI_SETTLE)
     text = ctx.term.text()
@@ -634,6 +757,26 @@ def launch(ctx, key, timeout=JOB_APPEAR_S):
     return wait_new_job(ctx.bus, before, timeout)
 
 
+def back_to_scan_list(ctx, step):
+    """After the inspector: `:scan` restores the Scan view with the pane it was left on.
+    The flow was opened from a Detail pane (Tab, then Enter), so that pane is focused
+    and one `Esc` returns to the list (`close_pane`); should the list already be
+    focused, that `Esc` leaves the view and `:scan` brings it back."""
+    if not open_scan(ctx):
+        return False
+    ctx.term.press(ESC)
+    time.sleep(UI_SETTLE)
+    if SCAN_STRIP not in ctx.term.text():
+        ctx.c.note(f"{step}: the list pane was already focused on re-entry (Esc left the view; reopened)")
+        return open_scan(ctx)
+    return True
+
+
+def phases_of(samples):
+    """The state/phase cells the samples carry (the empty ones dropped)."""
+    return [s["screen_state_phase"] for s in samples if s["screen_state_phase"]]
+
+
 # --------------------------------------------------------------------- steps
 
 
@@ -663,7 +806,7 @@ def step_seed(ctx):
     c.check("seed: the core captured the seeded flow (flow.table)",
             poll(lambda: row() is not None, 20), "no row carries the marker")
     c.check("seed: the TUI painted the seeded flow", poll(lambda: ctx.marker in ctx.term.text(), 20),
-            ctx.screen("seed"))
+            ctx.screen("seed", "other"))
 
 
 def step_t7_16(ctx):
@@ -706,12 +849,11 @@ def step_t7_16(ctx):
                         "status_before_state": before.get("state"),
                         "status_after_state": after.get("state")})
         ctx.ev.write(f"screen-T7-16-{n}.txt", text)
-        if len(samples) >= SAMPLES_MIN and len({s["screen_state_phase"] for s in samples}) > 1:
+        if len(samples) >= SAMPLES_MIN and len(set(phases_of(samples))) > 1:
             break
         if (after.get("state") or "") in ("done", "cancelled", "failed"):
             break
         time.sleep(SAMPLE_GAP_S)
-    ctx.status_pairs = samples
     ctx.ev.write_json("status-pairs.json", samples)
 
     c.check(f"T7-16: at least {SAMPLES_MIN} screen samples carry the row's probes cell",
@@ -725,7 +867,7 @@ def step_t7_16(ctx):
             "taken just before and just after it",
             bool(bracketed) and all(s["status_before_sent"] <= s["screen_sent"] <= s["status_after_sent"]
                                     for s in bracketed), samples)
-    phases = [s["screen_state_phase"] for s in samples if s["screen_state_phase"]]
+    phases = phases_of(samples)
     c.check("T7-16: the row's state/phase text changed at least once", len(set(phases)) > 1, phases)
 
     term.press("x")
@@ -733,8 +875,7 @@ def step_t7_16(ctx):
     text = ctx.snap("t7-16-cancel")
     ctx.ev.write("screen-T7-16-cancel.txt", text)
     c.check("T7-16: `x` left the row reading `cancelled`", cancelled, ctx.screen("t7-16"))
-    final = {}
-    poll(lambda: final.update(status_of(ctx.bus, job)) or final.get("state") == "cancelled", CANCEL_S, 0.4)
+    final = wait_field(lambda: status_of(ctx.bus, job), "state", "cancelled", CANCEL_S)
     c.check("T7-16: scan.status agrees the job is `cancelled`", final.get("state") == "cancelled",
             final.get("state"))
 
@@ -743,9 +884,37 @@ def step_t7_16(ctx):
             counts.get("progress", 0) >= 1 and counts.get("cancelled", 0) >= 1, counts)
 
 
+def pick_issue(ctx, job, found):
+    """One poll tick of T7-17's issue search: a reflected-xss issue of `job`, else one
+    whose scan.issue read carries both an evidence payload and a probe flow. Fills
+    `found` (summary, full) and returns True; False while there is none yet."""
+    try:
+        res = ctx.bus.call("scan.issues", {"job": job, "limit": 64})
+    except (ToolError, BusError) as e:
+        found["error"] = str(e)
+        return False
+    issues = [i for i in (res.get("issues") or []) if isinstance(i, dict)]
+    found["seen"] = len(issues)
+    if not issues:
+        return False
+    xss = [i for i in issues if "reflected-xss" in f"{i.get('check_id') or ''} {i.get('class') or ''}"]
+    for summary in xss + [i for i in issues if i not in xss][:8]:
+        full = issue_of(ctx.bus, summary.get("id"))
+        evidence = full.get("evidence") or {}
+        if summary in xss or (evidence.get("payload") and evidence.get("probe_flows")):
+            found["summary"], found["full"] = summary, full
+            return True
+    return False
+
+
 def step_t7_17(ctx):
     """T7-17 (UI-2): a live issue, its evidence, a probe flow, the status round trip."""
     c, term = ctx.c, ctx.term
+    for verb in ("scan.issues", "scan.issue"):
+        if verb not in ctx.names:
+            c.check(f"T7-17: the core offers {verb} (the ground truth this step reads)", False,
+                    "absent from tools/list")
+            return
     if not ensure_editor(ctx, "standard", ctx.origin):
         c.check("T7-17: the `standard` editor with the target origin was available", False,
                 ctx.screen("t7-17"))
@@ -758,29 +927,26 @@ def step_t7_17(ctx):
 
     found = {}
 
-    def has_issue():
-        try:
-            res = ctx.bus.call("scan.issues", {"job": job, "limit": 64})
-        except (ToolError, BusError):
-            return False
-        issues = res.get("issues") or []
-        if not issues:
-            return False
-        found["issue"] = issues[0]
-        found["state"] = (status_of(ctx.bus, job) or {}).get("state")
-        return True
+    def picked():
+        if pick_issue(ctx, job, found):
+            return True
+        # Stop early once the job has left `running`: the comparison needs a live job.
+        return (status_of(ctx.bus, job).get("state") or "running") not in ("queued", "running")
 
-    if not poll(has_issue, ISSUE_WAIT_S, 1.0):
-        c.check("T7-17: the job produced an issue scan.issues reports", False,
-                f"job {job} status {status_of(ctx.bus, job).get('state')}")
+    poll(picked, ISSUE_WAIT_S, 1.0)
+    if "summary" not in found:
+        c.check("T7-17: the running job produced a reflected-xss issue (else one with an "
+                "evidence payload and a probe flow) that scan.issues reports", False,
+                f"job {job} status {status_of(ctx.bus, job).get('state')}; "
+                f"{found.get('seen', 0)} issues seen; {found.get('error', '')}")
         return
-    summary = found["issue"]
+    summary, full = found["summary"], found["full"]
     issue_id, name = summary.get("id"), str(summary.get("name") or "")
     severity = str(summary.get("severity") or "").upper()
     # The list cuts the name column to fit the pane, so the needle is a prefix.
     needle = name[:20]
 
-    if not tab(ctx, "4", r"1 Profiles", 10):
+    if not tab(ctx, "4"):
         c.check("T7-17: the Issues tab drew", False, ctx.screen("t7-17"))
         return
     # `J` pins the filter to the Jobs cursor's job (D11), so the row under the cursor is
@@ -800,85 +966,82 @@ def step_t7_17(ctx):
             f"group {group_of(text, needle, headers)}; {ctx.ev.redact(text)[-900:]!r}")
 
     c.check("T7-17: the cursor lands on the issue row", cursor_to(ctx, needle), ctx.screen("t7-17"))
-    try:
-        full = ctx.bus.call("scan.issue", {"id": issue_id})
-    except (ToolError, BusError) as e:
-        full = {}
-        c.check("T7-17: scan.issue read the issue the harness compares against", False, str(e))
-    payload = ((full.get("evidence") or {}).get("payload") or "")
-    if payload:
+    evidence = full.get("evidence") or {}
+    payload = str(evidence.get("payload") or "")
+    if c.check("T7-17: scan.issue reports an evidence.payload for the issue", bool(payload),
+               f"class {full.get('class')!r} evidence keys {sorted(evidence)}"):
         # The detail draws the payload on one row: match its first whitespace-free run,
         # which no wrap, pad or truncation can break.
         pay_needle = next((w for w in payload.split() if w), payload)[:20]
         c.check("T7-17: the detail shows the `payload` scan.issue reports",
                 poll(lambda: pay_needle in term.text(), 20),
                 f"payload head {pay_needle!r}; {ctx.screen('t7-17')}")
-    else:
-        c.note("T7-17: this issue carries no evidence.payload (nothing to compare)", str(full.get("class")))
 
-    flows = [str(f) for f in ((full.get("evidence") or {}).get("probe_flows") or [])]
-    if flows:
+    flows = [str(f) for f in (evidence.get("probe_flows") or [])]
+    if c.check("T7-17: scan.issue reports a probe flow for the issue", bool(flows), issue_id):
         try:
             first = ctx.bus.call("flow.get", {"id": flows[0]})
         except (ToolError, BusError) as e:
             first = {}
             c.check("T7-17: flow.get read the first probe flow", False, str(e))
-        path = str(first.get("path") or "")
+        method, path = str(first.get("method") or ""), str(first.get("path") or "")
         term.press("\t")
         time.sleep(UI_SETTLE)
         term.press(ENTER)
-        opened = poll(lambda: path and path in term.text(), 15)
-        ctx.ev.write("screen-T7-17-inspector.txt", ctx.snap("t7-17-inspector"))
-        c.check("T7-17: `⏎` on the first probe flow opened the inspector at that flow's path",
-                opened, f"path {path!r}; {ctx.screen('t7-17')}")
-        if not reopen_scan(ctx):
+        opened = poll(lambda: inspector_open(term.text(), method, path), 15)
+        ctx.ev.write("screen-T7-17-inspector.txt", ctx.snap("t7-17-inspector", "inspector"))
+        c.check("T7-17: `⏎` on the first probe flow opened the inspector (Request/Response panes, "
+                "the flow's method and path, the Scan strip gone)",
+                opened, f"{method} {path!r}; {ctx.screen('t7-17', 'inspector')}")
+        if not back_to_scan_list(ctx, "T7-17"):
             c.check("T7-17: the Scan view came back after the inspector", False, ctx.screen("t7-17"))
             return
-        term.press(ESC)  # detail pane -> list pane (the Scan view stays open)
-        time.sleep(UI_SETTLE)
-    else:
-        c.note("T7-17: the issue carries no probe flow (nothing to open)", issue_id)
 
     term.press("f")
     on_screen = poll(lambda: "false_positive" in term.text(), 20)
-    after_f = {}
-    poll(lambda: after_f.update(issue_of(ctx.bus, issue_id))
-         or after_f.get("status") == "false_positive", 20, 0.4)
+    after_f = wait_field(lambda: issue_of(ctx.bus, issue_id), "status", "false_positive", 20)
     ctx.ev.write("screen-T7-17.txt", ctx.snap("t7-17-false-positive"))
     c.check("T7-17: `f` marked the issue `false_positive` on screen and in scan.issue",
             on_screen and after_f.get("status") == "false_positive",
             f"scan.issue status {after_f.get('status')}; {ctx.screen('t7-17')}")
 
     term.press("u")
-    after_u = {}
-    poll(lambda: after_u.update(issue_of(ctx.bus, issue_id))
-         or after_u.get("status") == "open", 20, 0.4)
+    after_u = wait_field(lambda: issue_of(ctx.bus, issue_id), "status", "open", 20)
     c.check("T7-17: `u` cleared `false_positive` from the screen and scan.issue reads `open`",
             poll(lambda: "false_positive" not in term.text(), 15) and after_u.get("status") == "open",
             f"scan.issue status {after_u.get('status')}; {ctx.screen('t7-17')}")
 
     poc_ref = str(full.get("poc_ref") or "").strip()
-    finding_id = str(full.get("finding_id") or "").strip()
+    stem = os.path.splitext(os.path.basename(poc_ref))[0] if poc_ref else ""
     term.press("P")
-    time.sleep(1.0)
-    text = ctx.snap("t7-17-poc")
+    answered = poll(lambda: "PoCs and runs" in term.text() or "is not in the Findings list" in term.text()
+                    or "this issue has no PoC" in term.text(), 10, 0.2)
+    opened = "PoCs and runs" in term.text()
+    text = ctx.snap("t7-17-poc", "other" if opened else "scan")
     ctx.ev.write("screen-T7-17-poc.txt", text)
-    if poc_ref or finding_id:
-        opened = "PoCs and runs" in text
+    if poc_ref:
         toast = "is not in the Findings list" in text
         c.check("T7-17: `P` opened the Findings surface on the issue's PoC",
-                opened, f"poc_ref {poc_ref!r} finding {finding_id!r} toast {toast}; "
+                opened, f"poc_ref {poc_ref!r} toast {toast} answered {answered}; "
                         f"{ctx.ev.redact(text)[-900:]!r}")
         if opened:
-            reopen_scan(ctx)
+            # The Findings list marks its selection by highlight only (ui/overlays.rs), so
+            # the selected finding is read from the detail pane: its `poc <path>` line
+            # names the PoC file, and its head repeats the title the list row carries.
+            poc_line = re.search(r"\bpoc\s+(\S+)", text)
+            selected = ((poc_line is not None and (stem in poc_line.group(1) or poc_ref in poc_line.group(1)))
+                        or (bool(needle) and text.count(needle) >= 2))
+            c.check("T7-17: the Findings selection is the issue's PoC (its file stem on the "
+                    "detail's `poc` line, or the issue name on both list and detail)",
+                    selected, f"stem {stem!r} name {needle!r}; {ctx.ev.redact(text)[-900:]!r}")
+            term.press(ESC)
+            time.sleep(UI_SETTLE)
+            open_scan(ctx)
     else:
-        c.note("T7-17: no PoC for this issue (the TUI toasted it; sub-step passed as recorded)",
+        c.note("T7-17: no PoC for this issue (the TUI toasted it; nothing to open)",
                "this issue has no PoC" if "no PoC" in text else text[-200:])
 
-    try:
-        ctx.bus.call("scan.cancel", {"job": job})
-    except (ToolError, BusError):
-        pass
+    cancel_quietly(ctx.bus, job)
 
 
 def l4_add_args(bus, cidr, ports):
@@ -901,18 +1064,54 @@ def l4_add_args(bus, cidr, ports):
     return {k: v for k, v in wanted.items() if k in declared}, unknown
 
 
+def l4_entry_by_id(bus, entry_id):
+    """The l4.scope.list entry carrying `entry_id`, or None (never matched by cidr)."""
+    try:
+        entries = bus.call("l4.scope.list", {})
+    except (ToolError, BusError):
+        return None
+    rows = entries if isinstance(entries, list) else (entries.get("entries") or [])
+    return next((e for e in rows if isinstance(e, dict) and str(e.get("id")) == entry_id), None)
+
+
+def l4_remove_quietly(bus, entry_id):
+    """Best-effort `l4.scope.remove` of the entry the cell added (run from `finally`)."""
+    if not entry_id or entry_id == NO_L4_ID:
+        return
+    try:
+        bus.call("l4.scope.remove", {"id": entry_id})
+    except (ToolError, BusError, OSError):
+        pass
+
+
+def harness_scan_start(ctx):
+    """What the core answers the harness for the L4 profile and target the TUI launched:
+    ("job", id) or ("code", scan error code) or ("error", text)."""
+    try:
+        profile = ctx.bus.call("scan.profile.get", {"name": "l4-stream-safe"})
+        target = profile.setdefault("target", {})
+        target["l4"] = [{"ip": "127.0.0.1", "port": ctx.target_port, "proto": "tcp"}]
+        res = ctx.bus.confirm("scan.start", {"profile": profile})
+        job = res.get("job") if isinstance(res, dict) else None
+        return ("job", job) if job else ("error", f"scan.start answered {str(res)[:120]!r} without a job")
+    except (ToolError, BusError, AttributeError, TypeError) as e:
+        m = SCAN_CODE_RE.search(str(e))
+        return ("code", m.group(1)) if m else ("error", f"{type(e).__name__}: {e}")
+
+
 def step_t7_18(ctx):
     """T7-18 (UI-3): the L4 gate, the confirm overlay, y and n."""
     c, term = ctx.c, ctx.term
-    if not tab(ctx, "1", r"1 Profiles"):
+    if not tab(ctx, "1"):
         c.check("T7-18: the Profiles tab drew for the L4 profile", False, ctx.screen("t7-18"))
         return
-    if not cursor_to(ctx, "l4-stream-safe"):
+    if not focus_profiles_list(ctx) or not cursor_to(ctx, "l4-stream-safe"):
         try:
             names = [p.get("name") for p in (ctx.bus.call("scan.profile.list", {}).get("profiles") or [])]
         except (ToolError, BusError) as e:
             names = str(e)
-        c.note("T7-18: this core ships no `l4-stream-safe` profile (UI-3 sub-steps skipped)", names)
+        c.check("T7-18: the Profiles list carries l4-stream-safe", False,
+                f"profiles {names}; {ctx.screen('t7-18')}")
         return
     term.press(ENTER)
     if not term.wait_for(r"profile l4-stream-safe", 15):
@@ -936,22 +1135,18 @@ def step_t7_18(ctx):
     args, unknown = l4_add_args(ctx.bus, "127.0.0.1/32", str(ctx.target_port))
     answer = ""
     try:
-        answer = str(ctx.bus.confirm("l4.scope.add", args))
+        answer = str(ctx.bus.confirm("l4.scope.add", args) or "")
     except (ToolError, BusError) as e:
-        answer = str(e)
+        answer = f"{type(e).__name__}: {e}"
+        ctx.l4_entry_id = NO_L4_ID
+    else:
+        ctx.l4_entry_id = answer.strip() or NO_L4_ID
 
-    def inject_entry():
-        try:
-            entries = ctx.bus.call("l4.scope.list", {})
-        except (ToolError, BusError):
-            return False
-        rows = entries if isinstance(entries, list) else (entries.get("entries") or [])
-        return any(isinstance(e, dict) and e.get("capability") == "inject"
-                   and "127.0.0.1" in str(e.get("cidr")) for e in rows)
-
-    if not poll(inject_entry, L4_SCOPE_S, 0.4):
-        c.note("T7-18: the core refused the inject L4 scope entry, so the cleared-gate "
-               "sub-steps (overlay, y, n) are skipped",
+    if ctx.l4_entry_id == NO_L4_ID or not poll(
+            lambda: l4_entry_by_id(ctx.bus, ctx.l4_entry_id) is not None, L4_SCOPE_S, 0.4):
+        c.note("T7-18: the core refused the operator-confirmed inject L4 scope entry, so the "
+               "cleared-gate sub-steps (overlay, y, n) are skipped. The operator confirm "
+               "path skips the agent widen gate, so a refusal here is a core bug to report",
                f"l4.scope.add answered {answer[:200]!r}; unknown args {unknown}")
         return
 
@@ -960,49 +1155,49 @@ def step_t7_18(ctx):
 
     before = job_ids(ctx.bus)
     term.press("s")
-    overlay = poll(lambda: "Confirm over the wire: scan launch" in term.text()
-                   and "may disrupt the target" in term.text(), OVERLAY_S, 0.3)
+    overlay = poll(lambda: CONFIRM_TITLE in term.text() and "may disrupt the target" in term.text(),
+                   OVERLAY_S, 0.3)
     ctx.ev.write("screen-T7-18-overlay.txt", ctx.snap("t7-18-overlay"))
     c.check("T7-18: `s` opened the wire-confirm overlay containing \"may disrupt the target\"",
             overlay, ctx.screen("t7-18"))
 
+    # A wording already on screen before `y` does not count as its answer.
+    pre_codes = set(wordings_on(term.text()))
     term.press("y")
     new_job = wait_new_job(ctx.bus, before, OVERLAY_S)
-    refusals = [w for w in REFUSAL_WORDINGS.values() if w in term.text()]
     row_shown = bool(new_job) and poll(lambda: row_tail(term.text(), new_job) is not None, ROW_APPEAR_S)
+    if not new_job:
+        poll(lambda: set(wordings_on(term.text())) - pre_codes, OVERLAY_S, 0.3)
+    tui_codes = sorted(set(wordings_on(term.text())) - pre_codes)
     ctx.ev.write("screen-T7-18.txt", ctx.snap("t7-18-after-y"))
 
-    # What the core answers the harness for the same profile and target.
-    harness_answer = ""
-    harness_job = None
-    try:
-        profile = ctx.bus.call("scan.profile.get", {"name": "l4-stream-safe"})
-        target = profile.setdefault("target", {})
-        target["l4"] = [{"ip": "127.0.0.1", "port": ctx.target_port, "proto": "tcp"}]
-        res = ctx.bus.confirm("scan.start", {"profile": profile})
-        harness_job = res.get("job") if isinstance(res, dict) else None
-        harness_answer = f"ok job {harness_job}"
-    except (ToolError, BusError, AttributeError, TypeError) as e:
-        harness_answer = f"{type(e).__name__}: {e}"
-    c.check("T7-18: `y` re-issued the launch and the screen shows either the new Jobs row "
-            "or the D9 refusal wording the core answered",
-            row_shown or bool(refusals),
-            f"tui job {new_job}; refusals on screen {refusals}; harness scan.start: "
-            f"{harness_answer[:200]}; {ctx.screen('t7-18')}")
+    # The harness asks the core the same question after `y`. The TUI's own job is
+    # cancelled first so the comparison is not refused `busy` by it (one running job per
+    # origin): that would be the cell's doing, not the core's answer.
+    if new_job:
+        cancel_quietly(ctx.bus, new_job)
+        wait_field(lambda: status_of(ctx.bus, new_job), "state", "cancelled", CANCEL_S)
+    kind, value = harness_scan_start(ctx)
+    harness_job = value if kind == "job" else None
+    if kind == "job":
+        expected, agrees = "a Jobs row", row_shown
+    elif kind == "code" and value in ("refused_l4", "lane_unavailable"):
+        expected, agrees = f"the D9 `{REFUSAL_WORDINGS[value]}` wording", value in tui_codes
+    else:
+        expected, agrees = "(no sanctioned branch)", False
+    c.check("T7-18: `y` re-issued the launch and the screen answered as the harness's own "
+            "scan.start did (a Jobs row for a job; the D9 wording for refused_l4 / lane_unavailable)",
+            agrees, f"tui job {new_job} row {row_shown} wordings {tui_codes} (pre-existing "
+                    f"{sorted(pre_codes)}); harness scan.start: {kind} {value}; expected "
+                    f"{expected}; {ctx.screen('t7-18')}")
+    cancel_quietly(ctx.bus, harness_job)
 
-    for jid in [new_job, harness_job]:
-        if jid:
-            try:
-                ctx.bus.call("scan.cancel", {"job": jid})
-            except (ToolError, BusError):
-                pass
-
-    if not tab(ctx, "1", r"1 Profiles"):
+    if not tab(ctx, "1"):
         c.check("T7-18: the Profiles tab came back for the `n` sub-step", False, ctx.screen("t7-18"))
         return
     before = job_ids(ctx.bus)
     term.press("s")
-    if not poll(lambda: "Confirm over the wire: scan launch" in term.text(), OVERLAY_S, 0.3):
+    if not poll(lambda: CONFIRM_TITLE in term.text(), OVERLAY_S, 0.3):
         c.check("T7-18: a fresh confirm prompt opened for the `n` sub-step", False, ctx.screen("t7-18"))
         return
     term.press("n")
@@ -1017,6 +1212,10 @@ def step_t7_18(ctx):
 def step_t7_19(ctx):
     """T7-19 (UI-5): the Site map against a live scan.sitemap read."""
     c, term = ctx.c, ctx.term
+    if "scan.sitemap" not in ctx.names:
+        c.check("T7-19: the core offers scan.sitemap (the ground truth this step reads)", False,
+                "absent from tools/list")
+        return
     if not open_profile(ctx, "map-only"):
         c.check("T7-19: the `map-only` profile editor never opened", False, ctx.screen("t7-19"))
         return
@@ -1028,18 +1227,12 @@ def step_t7_19(ctx):
         c.check("T7-19: `m` started no map job", False, ctx.screen("t7-19"))
         return
     ctx.jobs["map"] = job
-    done = {}
-    reached = poll(lambda: done.update(status_of(ctx.bus, job) or {}) or done.get("state") == "done",
-                   MAP_WAIT_S, 1.0)
+    done = wait_field(lambda: status_of(ctx.bus, job), "state", "done", MAP_WAIT_S, 1.0)
+    reached = done.get("state") == "done"
     c.check("T7-19: the map job reached `done`", reached, done.get("state"))
     if not reached:
         return
 
-    if not tab(ctx, "3", r"1 Profiles"):
-        c.check("T7-19: the Site map tab never drew", False, ctx.screen("t7-19"))
-        return
-    term.press("J")  # follow the Jobs cursor's job, the one the harness reads
-    time.sleep(1.0)
     try:
         live = ctx.bus.call("scan.sitemap", {"job": job})
     except (ToolError, BusError) as e:
@@ -1047,19 +1240,23 @@ def step_t7_19(ctx):
         return
     nodes = [n for n in (live.get("nodes") or []) if isinstance(n, dict)]
     points = [p for p in (live.get("points") or []) if isinstance(p, dict)]
-    node_ids = {n.get("id") for n in nodes}
-    # A point naming no node of the page is dropped at fold time (the pane lists the
-    # selected node's points), so the rendered comparison is over the attached ones.
-    attached = [p for p in points if p.get("site_node") in node_ids]
-    dropped = len(points) - len(attached)
 
+    if not tab(ctx, "3"):
+        c.check("T7-19: the Site map tab never drew", False, ctx.screen("t7-19"))
+        return
+    term.press("J")  # follow the Jobs cursor's job, the one the harness reads
+    c.check(f"T7-19: the Nodes pane head counts the live read's {len(nodes)} nodes",
+            poll(lambda: f"{len(nodes)} nodes" in term.text(), 15), ctx.screen("t7-19"))
+
+    # Walk the Nodes pane from the top, one row per `j`, polling for the cursor to move.
     seen_text = []
     term.press("g")
-    time.sleep(UI_SETTLE)
+    poll(lambda: cursor_row(term.text()) is not None, 5)
     for _ in range(min(len(nodes), 60)):
+        was = cursor_row(term.text())
         seen_text.append(ctx.snap("t7-19-walk"))
         term.press("j")
-        time.sleep(0.25)
+        poll(lambda: cursor_row(term.text()) != was, 2.0, 0.1)
     seen_text.append(ctx.snap("t7-19-walk"))
     walked = "\n".join(seen_text)
     ctx.ev.write("screen-T7-19.txt", walked[-60000:])
@@ -1069,43 +1266,54 @@ def step_t7_19(ctx):
     missing_nodes = sorted({node_needle(n) for n in nodes if node_needle(n) not in walked})
     c.check("T7-19: every `METHOD path_template` of the live scan.sitemap is rendered",
             bool(nodes) and not missing_nodes, f"{missing_nodes}; {len(nodes)} nodes")
-    missing_points = sorted({str(p.get("name")) for p in attached
-                             if str(p.get("name"))[:16] not in walked})
+    # Every point of the live read, attached to a listed node or not (fix round G, G20
+    # keeps the orphans on the page).
+    missing_points = sorted({str(p.get("name")) for p in points if str(p.get("name"))[:16] not in walked})
     c.check("T7-19: every point name of the live scan.sitemap is rendered",
-            not missing_points, f"missing {missing_points}; {dropped} points name no listed node")
+            not missing_points, f"missing {missing_points}; {len(points)} points in the live read")
 
-    first_flows = [str(f) for f in ((nodes[0].get("flows") or []) if nodes else [])]
-    if not first_flows:
-        c.note("T7-19: the first node carries no flow to open", nodes[0].get("id") if nodes else "no nodes")
+    # `⏎` on the node under the cursor after `g` (the pane renders in host-group order,
+    # so the first row is not necessarily the reply's first node).
+    term.press("g")
+    poll(lambda: cursor_row(term.text()) is not None, 5)
+    under = (cursor_row(term.text()) or "").strip()
+    node = next((n for n in nodes if under.startswith(node_needle(n).rstrip())), None)
+    if not c.check("T7-19: the row under the cursor after `g` is a node of the live read",
+                   node is not None, f"row {under!r}; {ctx.screen('t7-19')}"):
+        return
+    first_flows = [str(f) for f in (node.get("flows") or [])]
+    if not c.check("T7-19: the node under the cursor carries a flow to open", bool(first_flows),
+                   f"node {node.get('id')}"):
         return
     try:
         flow = ctx.bus.call("flow.get", {"id": first_flows[0]})
     except (ToolError, BusError) as e:
-        c.check("T7-19: flow.get read the first node's first flow", False, str(e))
+        c.check("T7-19: flow.get read the node's first flow", False, str(e))
         return
-    path = str(flow.get("path") or "")
-    term.press("g")
-    time.sleep(UI_SETTLE)
+    method, path = str(flow.get("method") or ""), str(flow.get("path") or "")
     term.press(ENTER)
-    opened = poll(lambda: path and path in term.text(), 15)
-    ctx.ev.write("screen-T7-19-inspector.txt", ctx.snap("t7-19-inspector"))
-    c.check("T7-19: `⏎` on the first node opened its first flow in the inspector",
-            opened, f"path {path!r}; {ctx.screen('t7-19')}")
-    reopen_scan(ctx)
+    opened = poll(lambda: inspector_open(term.text(), method, path), 15)
+    ctx.ev.write("screen-T7-19-inspector.txt", ctx.snap("t7-19-inspector", "inspector"))
+    c.check("T7-19: `⏎` on the node under the cursor opened its first flow in the inspector "
+            "(Request/Response panes, the flow's method and path, the Scan strip gone)",
+            opened, f"{method} {path!r}; {ctx.screen('t7-19', 'inspector')}")
+    open_scan(ctx)
 
 
 def step_t7_20(ctx):
-    """T7-20: no seeded secret on any screen sample; `q` exits 0."""
+    """T7-20: no seeded secret on any Scan-surface screen sample; `q` exits 0."""
     c, term = ctx.c, ctx.term
-    leaks = ctx.ev.leaks()
-    c.check("T7-20: no screen sample carried the seeded Cookie or Authorization value",
-            not leaks, f"{len(leaks)} of {len(ctx.ev.samples)} samples: {leaks[:8]}")
+    leaks = ctx.ev.leaks("scan")
+    c.check("T7-20: no Scan-surface screen sample carried the seeded Cookie or Authorization "
+            f"value (whole or its first {SECRET_PREFIX} hex chars)",
+            not leaks, f"{len(leaks)} of {ctx.ev.tagged('scan')} scan samples (index, tag, step): "
+                       f"{leaks[:8]}; {len(ctx.ev.samples)} samples in all")
     for _ in range(4):
         term.press(ESC)
         time.sleep(0.25)
     term.press("q")
     code = term.wait_exit(EXIT_S)
-    c.check("T7-20: `q` ended aitm-tui with exit 0", code == 0, f"exit {code}; {ctx.screen('t7-20')}")
+    c.check("T7-20: `q` ended aitm-tui with exit 0", code == 0, f"exit {code}; {ctx.screen('t7-20', 'other')}")
 
 
 def scenario(ctx):
@@ -1130,7 +1338,23 @@ def main():
     if not tui:
         skip77("no aitm-tui binary found (set AITM_TUI_BIN or `cargo build -p aitm-tui`)")
 
-    booted = tgt = bus = push_client = pushes = term = ev = None
+    # The secrets and the redactor exist before anything can fail, so the top-level
+    # handler can redact whatever an exception carries.
+    marker = "ts" + secrets.token_hex(4)
+    cookie_secret = secrets.token_hex(16)
+    auth_secret = secrets.token_hex(16)
+    ev = Evidence([cookie_secret, auth_secret])
+    try:
+        return run(tui, ev, marker, cookie_secret, auth_secret)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print(f"FAIL  {type(e).__name__}: {ev.redact(str(e))}", flush=True)
+        return 1
+
+
+def run(tui, ev, marker, cookie_secret, auth_secret):
+    booted = tgt = bus = push_client = pushes = term = ctx = None
     work = token_file = None
     try:
         if os.environ.get("AITM_BUS_ADDR"):
@@ -1150,12 +1374,13 @@ def main():
                        "or set AITM_TESTTARGET_BIN)")
             work = tempfile.mkdtemp(prefix="aitm-tui-scan-run-")
             tgt = Target("vulnerable")
+            # l4_enabled only: the operator confirm path skips the agent widen gate, so no
+            # agent-widen flag is needed for the cell's own l4.scope.add.
             cfg = CoreConfig(proxy_port=free_port(), browser_proxy_port=free_port(),
                              bus_port=free_port(),
                              scope_entries=[tgt.authority, "127.0.0.1"],
                              findings_dir=os.path.join(work, "findings"),
-                             l4_enabled=True,
-                             l4_flags={"allow_agent_widen": True})
+                             l4_enabled=True)
             try:
                 booted = Aitm.server(cfg)
             except FileNotFoundError as e:
@@ -1170,11 +1395,6 @@ def main():
         names = set(bus.tool_names())
         if "scan.start" not in names:
             skip77("built, awaiting engine for live proof (scan.start is not in tools/list)")
-        missing = [t for t in ("scan.list", "scan.status", "scan.cancel", "scan.issues", "scan.issue",
-                               "scan.sitemap", "scan.profile.list", "scan.profile.get", "flow.get",
-                               "flow.table") if t not in names]
-        if missing:
-            skip77(f"the core is missing the verbs this cell reads as ground truth: {missing}")
 
         push_client = BusClient(host, port, token, client_name="aitm-e2e-scan-pushes").connect()
         subscribed = ""
@@ -1191,10 +1411,6 @@ def main():
         target_port = u.port or (443 if u.scheme == "https" else 80)
         origin = f"{u.scheme}://{u.hostname}:{target_port}"
 
-        marker = "ts" + secrets.token_hex(4)
-        cookie_secret = secrets.token_hex(16)
-        auth_secret = secrets.token_hex(16)
-        ev = Evidence([cookie_secret, auth_secret])
         c = Checks(ev.redact)
 
         work = work or tempfile.mkdtemp(prefix="aitm-tui-scan-run-")
@@ -1207,7 +1423,7 @@ def main():
         term = Terminal([tui, "--bus", tui_bus, "--token-file", token_file,
                          "--expect-role", "operator", "--ansi", "--poll", "200"], child_env)
 
-        ctx = Ctx(c, term, bus, pushes, ev, proxy_port, target, origin, target_port)
+        ctx = Ctx(c, term, bus, pushes, ev, proxy_port, target, origin, target_port, names)
         ctx.marker, ctx.cookie_secret, ctx.auth_secret = marker, cookie_secret, auth_secret
 
         if subscribed:
@@ -1219,17 +1435,15 @@ def main():
         c.check(f"ui: the TUI attached to bus {tui_bus} as the operator", role == "operator",
                 f"role {role}; exit {term.proc.poll()}; {ev.redact(term.text())[-900:]!r}")
 
-        try:
-            scenario(ctx)
-        except Fatal:
-            pass
+        scenario(ctx)
 
         ev.write_json("push-counts.json", pushes.snapshot())
         failed = c.failed()
-        passed = len(c.results) - len(failed)
-        head = ("PASS" if not failed else "FAIL") + (
-            f": aitm-tui Scan surface on bus {tui_bus}: jobs {sorted(ctx.jobs.values())}; "
-            f"{passed}/{len(c.results)} checks" + ("" if not failed else f"; failed: {failed}"))
+        n_ok, n_noted, n_failed = c.tally()
+        head = (("PASS" if not failed else "FAIL")
+                + f": {n_ok} ok, {n_noted} noted, {n_failed} failed"
+                + f"; aitm-tui Scan surface on bus {tui_bus}: jobs {sorted(ctx.jobs.values())}"
+                + ("" if not failed else f"; failed: {failed}"))
         ev.write("summary.txt", "\n".join(c.lines() + ["", head, f"evidence dir: {ev.dir}"]) + "\n")
         print(head, flush=True)
         return 0 if not failed else 1
@@ -1244,6 +1458,9 @@ def main():
                 os.unlink(token_file)
             except OSError:
                 pass
+        if bus is not None and ctx is not None:
+            # The L4 scope widening the cell added leaves with it (matched by its id).
+            l4_remove_quietly(bus, ctx.l4_entry_id)
         if push_client is not None:
             push_client.close()
         if bus is not None:
@@ -1252,13 +1469,11 @@ def main():
             booted.stop()
         if tgt is not None:
             tgt.stop()
+        if work:
+            # The run's HOME, token file and (self-booted) findings store, which holds
+            # the seeded session values raw, go with the run.
+            shutil.rmtree(work, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except SystemExit:
-        raise
-    except Exception as e:  # noqa: BLE001
-        print(f"FAIL  {type(e).__name__}: {e}", flush=True)
-        sys.exit(1)
+    sys.exit(main())
