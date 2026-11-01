@@ -13,6 +13,8 @@
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::backend::routed::RoutedBackend;
+use crate::backend::CaptureInjectBackend;
 pub use crate::config::{L4PrivilegeConfig, RequestMode};
 use crate::privilege::derive::{derive, ProbeInputs};
 use crate::privilege::linux::gather_linux;
@@ -66,6 +68,10 @@ pub struct PrivilegeState {
     prober: Box<dyn Prober>,
     clock: Clock,
     cache: Mutex<Cache>,
+    /// The helper session's capture/inject backend while one is connected
+    /// (plan P1b.8 seam; P1b.13 sets and clears it). [`RoutedBackend`] takes
+    /// it for `Available { via: Helper }`.
+    helper: Mutex<Option<Arc<dyn CaptureInjectBackend>>>,
 }
 
 /// What `report()` keeps between probes.
@@ -110,7 +116,32 @@ impl PrivilegeState {
             prober,
             clock,
             cache: Mutex::new(Cache::default()),
+            helper: Mutex::new(None),
         }
+    }
+
+    /// The one capture/inject backend every production caller holds (spec §2.1,
+    /// plan P1b.8): a [`RoutedBackend`] that reads this state on every call and
+    /// delegates to libpcap in process, to the helper session, or refuses
+    /// fail-closed with the gated text.
+    #[must_use]
+    pub fn backend(self: &Arc<Self>) -> Arc<dyn CaptureInjectBackend> {
+        Arc::new(RoutedBackend::new(Arc::clone(self)))
+    }
+
+    /// Set (or clear) the helper session's backend. The routed backend takes it
+    /// for `Available { via: Helper }` from the next call on.
+    #[allow(dead_code)] // wired by P1b.13 (the Linux helper session)
+    pub(crate) fn set_helper_backend(&self, backend: Option<Arc<dyn CaptureInjectBackend>>) {
+        *self.helper.lock().unwrap_or_else(PoisonError::into_inner) = backend;
+    }
+
+    /// The helper session's backend, if one is connected.
+    pub(crate) fn helper_backend(&self) -> Option<Arc<dyn CaptureInjectBackend>> {
+        self.helper
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The configuration this state was built from.

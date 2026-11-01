@@ -492,7 +492,9 @@ mod tests {
     fn wire_commands_registered() {
         let guard = Arc::new(L4Guard::new(&L4Config::default()));
         let store: Arc<dyn L4FlowStore> = Arc::new(InMemoryL4FlowStore::new());
-        let (gated, status) = super::super::wire_commands(guard, store, always_available());
+        let backend: Arc<dyn CaptureInjectBackend> = Arc::new(IdleBackend { available: true });
+        let (gated, status) =
+            super::super::wire_commands(guard, store, always_available(), backend);
         let names: Vec<&str> = gated.iter().map(|c| c.name()).collect();
         assert_eq!(
             names,

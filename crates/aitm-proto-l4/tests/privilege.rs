@@ -286,7 +286,7 @@ fn gated_verbs_flip_live_and_stay_confirmable() {
     assert_eq!(err.to_string(), ROW5_GATED);
 
     // 2. After the flip and 1.1 s: the SAME registry reaches the inner command.
-    // `wire_commands` builds its own libpcap backend (P1b.8 makes it injectable),
+    // The module hands `wire_commands` the state's routed libpcap backend (P1b.8),
     // so the proof that the inner `l4.capture.start` ran is its guard's refusal:
     // no Capture scope entry exists, and only the inner command consults the
     // guard. It is not an `L4 unavailable:` error and nothing touched the wire.

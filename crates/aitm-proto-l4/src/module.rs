@@ -31,7 +31,8 @@ use std::sync::Arc;
 
 use aitm_core::{Command, CommandHost, ParamSchema, Params, Plugin, Registry, Value};
 
-use crate::backend::L4Error;
+use crate::backend::pcap::PcapBackend;
+use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::commands::intercept::InterceptSessions;
 use crate::config::{InterceptConfig, L4Config};
 use crate::flow::{InMemoryL4FlowStore, L4FlowStore};
@@ -316,6 +317,18 @@ enum PrivilegeSource {
 }
 
 impl PrivilegeSource {
+    /// The capture/inject backend the wire verbs hold (privilege spec §2.1, plan
+    /// P1b.8): the live state's [`RoutedBackend`](crate::backend::routed::RoutedBackend),
+    /// which routes every call on the current report; or, for a fixed test
+    /// privilege, the plain in-process libpcap backend (the fixed gate already
+    /// refuses an unavailable class before any call reaches it).
+    fn backend(&self) -> Arc<dyn CaptureInjectBackend> {
+        match self {
+            Self::Live(state) => state.backend(),
+            Self::Fixed(_) => Arc::new(PcapBackend::new()),
+        }
+    }
+
     /// One class's availability now (spec §2.4 mapping, plan P1b.4).
     fn availability(&self, class: GateClass) -> L4Availability {
         match (self, class) {
@@ -598,8 +611,15 @@ impl Plugin for L4Module {
             let privilege = self.privilege.clone();
             Arc::new(move || privilege.availability(intercept_class))
         };
-        let (wire, capture_status) =
-            crate::commands::wire_commands(self.guard(), self.store(), capture_source);
+        // The wire verbs share one backend: in production the state's routed
+        // backend, so a helper session or a later approval is seen per call
+        // (privilege spec §2.1, plan P1b.8).
+        let (wire, capture_status) = crate::commands::wire_commands(
+            self.guard(),
+            self.store(),
+            capture_source,
+            self.privilege.backend(),
+        );
         for cmd in gate(
             crate::commands::agent_gate(wire, &gates),
             &self.privilege,

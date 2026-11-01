@@ -447,22 +447,23 @@ fn gate_for(name: &str) -> Option<AgentGate> {
 }
 
 /// Build the Task 10 wire commands (`l4.capture.start` / `.stop`, `l4.inject`,
-/// `l4.send_recv`) over the shared guard + store, a fresh libpcap wire backend, and
+/// `l4.send_recv`) over the shared guard + store, the caller's wire `backend`, and
 /// one shared [`CaptureRegistry`](crate::capture::CaptureRegistry) the capture
 /// commands manage together — plus, **separately**, the `l4.capture.status` verb
 /// over the same registry. `capture` is the capture/inject class's
 /// [`AvailabilitySource`]; the status verb reads it at invoke time. The split is
 /// the registration contract: [`crate::module::L4Module::load`] gates the first
 /// list on privilege and registers the status verb beside it, ungated, so it
-/// always answers (spec §1, L4PAR-AC9). The backend construction is pure (no
-/// privilege, fail-closed at call time).
+/// always answers (spec §1, L4PAR-AC9). In production `backend` is the state's
+/// [`RoutedBackend`](crate::backend::routed::RoutedBackend) (privilege spec §2.1,
+/// plan P1b.8), which routes every call on the live privilege report; nothing
+/// here opens libpcap on its own.
 pub(crate) fn wire_commands(
     guard: Arc<crate::guard::L4Guard>,
     store: Arc<dyn crate::flow::L4FlowStore>,
     capture: AvailabilitySource,
+    backend: Arc<dyn crate::backend::CaptureInjectBackend>,
 ) -> (Vec<Arc<dyn Command>>, Arc<dyn Command>) {
-    let backend: Arc<dyn crate::backend::CaptureInjectBackend> =
-        Arc::new(crate::backend::pcap::PcapBackend::new());
     let registry = Arc::new(crate::capture::CaptureRegistry::new());
     let gated: Vec<Arc<dyn Command>> = vec![
         Arc::new(CaptureStart::new(

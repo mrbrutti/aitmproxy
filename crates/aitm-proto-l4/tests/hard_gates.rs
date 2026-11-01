@@ -11,7 +11,10 @@
 //! - **AC21 — one choke point:** exactly one production call site puts bytes on the
 //!   wire (`backend.inject(..)` in `wire.rs::send_on_wire`), and that function cannot
 //!   be reached without an `L4Permit` (by type); the mangling-verdict path likewise
-//!   holds an `L4Permit` minted only by `L4Guard::check`.
+//!   holds an `L4Permit` minted only by `L4Guard::check`. The one other production
+//!   `.inject(..)` site, in `backend/routed.rs`, is `RoutedBackend::inject`'s
+//!   backend-layer delegation to the in-process or helper backend (privilege plan
+//!   P1b.8); it has no caller other than `send_on_wire` and is pinned to exactly one.
 //!
 //! AC19 ("core untouched") is a hard gate too, but it needs the repo's `aitm-core`
 //! tree and the merge-base with `main`, so it lives where the whole workspace is in
@@ -73,8 +76,13 @@ fn crate_root_forbids_unsafe() {
 }
 
 /// AC21 — there is exactly **one** production wire-write call site in the whole
-/// crate, and it is in `wire.rs` (the `send_on_wire` choke point). A new `.inject(..)`
-/// call anywhere else in production code fails this test.
+/// crate, and it is in `wire.rs` (the `send_on_wire` choke point). The only other
+/// production `.inject(..)` site is `RoutedBackend::inject`'s backend-layer
+/// delegation in `backend/routed.rs` (privilege plan P1b.8): it routes the call the
+/// choke point already authorized to the in-process or helper backend and has no
+/// caller other than `send_on_wire`. Both are pinned to exactly one; a new
+/// `.inject(..)` call anywhere else in production code, or a second one in either
+/// file, fails this test.
 #[test]
 fn exactly_one_production_wire_write() {
     let mut sites: Vec<(String, usize)> = Vec::new();
@@ -91,10 +99,15 @@ fn exactly_one_production_wire_write() {
         }
     }
 
+    sites.sort();
     assert_eq!(
         sites,
-        vec![("wire.rs".to_string(), 1)],
-        "the only production wire write must be the single `send_on_wire` choke point; found: {sites:?}"
+        vec![
+            ("backend/routed.rs".to_string(), 1),
+            ("wire.rs".to_string(), 1)
+        ],
+        "the only production wire write must be the single `send_on_wire` choke point, plus \
+         `RoutedBackend::inject`'s one delegation in backend/routed.rs; found: {sites:?}"
     );
 }
 
