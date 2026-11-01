@@ -83,6 +83,7 @@ __all__ = [
     "l4_endpoint",
     "login",
     "login_via_proxy",
+    "post_form_direct",
     "until",
     "Expectations",
     "TargetLogs",
@@ -561,6 +562,22 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 # `ALL_PROXY` in the environment, so an observer read can never be routed off the
 # machine -- or, worse, through the aitm proxy this suite is testing.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+
+
+def post_form_direct(url: str, fields: dict) -> int:
+    """`POST` a form to a target origin DIRECTLY (loopback, no proxy env, no redirect
+    followed) and return the status the target answered (a 3xx is an answer)."""
+    body = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with _OPENER.open(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310  (loopback only)
+            resp.read()
+            return resp.status
+    except urllib.error.HTTPError as e:
+        e.read()
+        e.close()
+        return e.code
 
 
 def _http_json(method: str, url: str, body: bytes | None = None) -> Any:

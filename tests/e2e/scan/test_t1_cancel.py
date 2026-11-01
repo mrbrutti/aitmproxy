@@ -21,9 +21,6 @@ import shutil
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 E2E = Path(__file__).resolve().parents[1]
@@ -37,6 +34,7 @@ from aitm_e2e.scan import (  # noqa: E402
     Canary,
     boot_target,
     cancel,
+    post_form_direct,
     require_verbs,
     scan_call,
     start_job,
@@ -55,15 +53,7 @@ def plant_canary_link(target_base: str, canary: Canary) -> int:
     """`POST /comments` on the target with a link to the out-of-scope canary, sent
     DIRECTLY (not via the proxy) so the link is the target's own stored content.
     Returns the HTTP status the target answered."""
-    body = urllib.parse.urlencode({"comment": canary.link_html("/leak")}).encode("utf-8")
-    req = urllib.request.Request(
-        target_base + "/comments", data=body, method="POST",
-        headers={"Content-Type": "application/x-www-form-urlencoded"})
-    try:
-        with urllib.request.urlopen(req, timeout=5.0) as resp:  # noqa: S310  (loopback only)
-            return resp.status
-    except urllib.error.HTTPError as e:  # a 3xx/4xx is still an answer we can report
-        return e.code
+    return post_form_direct(target_base + "/comments", {"comment": canary.link_html("/leak")})
 
 
 def main() -> None:
@@ -86,7 +76,7 @@ def main() -> None:
                 check(status in {200, 302, 303},
                       f"POST /comments accepted the planted canary link (status {status})")
                 check(canary.hits == [],
-                      f"planting did not itself hit the canary (hits={canary.hits})")
+                      f"planting did not itself hit the canary (hit paths={[h['path'] for h in canary.hits]})")
 
                 # Reset AFTER planting: every request the log holds from here is the job's.
                 seq0 = v.logs.reset()
