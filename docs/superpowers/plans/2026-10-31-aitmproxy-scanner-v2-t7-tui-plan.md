@@ -725,6 +725,9 @@ Kept by the main session during stage 6. One row per finding.
 | H (cell) | fix round | done | H41, H44, H46, H49 in `1293cf6c`; `--selftest` 44 ok with mutation checks | third live run; H51 doc-only residual |
 | H (cell) | coder note | Minor | no `w` helper to fix; any prompt label after `e` is stray; `set_browser_never` records its check; new `push-counts.json` shape; `l4` default `none` | ratified |
 | H (cell) | coder note | note | harness `drain_notifications` drops a batch on one unparsable line and swallows `ECONNRESET` as quiet | follow-up for T10 (shared notes) |
+| H (Rust) | quality re-review | PASS | every H tidy item verified; six Minors | H52 |
+| H (Rust) | spec re-review | PASS | every H item and spec ruling verified with its test; T7-1 to T7-15 mapped; three Minors | H53 (`build.rs` em dash), D6/D3 amended, `cut` wrappers ratified |
+| 15 | live smoke | run 3 | 29 ok, 1 noted (the standard job finished before `x`; a fresh job was cancelled live), 3 failed: subscriber saw zero lines; zero issues (the seeded `/search?q=` became the session canary); Site map wait short-circuited by a stale cross-tab `lane_unavailable` banner, and the engine refuses `scan.sitemap {}` | H54, H55, H57 (cell); H56 (Rust, D13 ruling); H58 relayed to the coordinator |
 
 ## Shipped
 
