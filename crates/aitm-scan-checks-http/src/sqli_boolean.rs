@@ -153,20 +153,30 @@ struct Baseline {
 /// compared. A control character no HTML page carries.
 const ECHO_MARK: &str = "\u{1}";
 
-/// A response body with every echo of `sent` — raw, percent-encoded (both
-/// `%20` and `+` for a space) and HTML-escaped — replaced by [`ECHO_MARK`],
-/// bounded like [`body_len`] is.
-fn normalized(resp: &ProbeResponse, sent: &str) -> String {
+/// A response body with every echo of each of `sent` — raw, percent-encoded
+/// (both `%20` and `+` for a space) and HTML-escaped — replaced by
+/// [`ECHO_MARK`], bounded like [`body_len`] is.
+///
+/// Every body of one point is scrubbed of the point's own value, and an arm's
+/// body of the whole value it sent as well, so the three bodies are scrubbed
+/// alike: a page that echoes the parameter compares equal to itself, and a
+/// value as short as `1` that also happens to appear in the page's content
+/// (`items: 1`, the live seed) is scrubbed out of the baseline and the arms
+/// the same way rather than out of the baseline alone.
+fn normalized(resp: &ProbeResponse, sent: &[&str]) -> String {
     let mut text = body_text(resp).into_owned();
-    if sent.is_empty() {
-        return text;
-    }
-    let mut forms = vec![
-        sent.to_string(),
-        percent_encode(sent, false),
-        percent_encode(sent, true),
-        html_escape(sent),
-    ];
+    let mut forms: Vec<String> = sent
+        .iter()
+        .filter(|value| !value.is_empty())
+        .flat_map(|value| {
+            [
+                (*value).to_string(),
+                percent_encode(value, false),
+                percent_encode(value, true),
+                html_escape(value),
+            ]
+        })
+        .collect();
     // Longest first, so a form that contains another is replaced whole.
     forms.sort_by_key(|f| std::cmp::Reverse(f.len()));
     forms.dedup();
@@ -339,8 +349,8 @@ impl SqliBoolean {
         let run = PairRun {
             true_len: body_len(&t),
             false_len: body_len(&f),
-            true_body: normalized(&t, &format!("{example}{true_arm}")),
-            false_body: normalized(&f, &format!("{example}{false_arm}")),
+            true_body: normalized(&t, &[example, &format!("{example}{true_arm}")]),
+            false_body: normalized(&f, &[example, &format!("{example}{false_arm}")]),
             true_flow: t.flow,
             false_flow: f.flow,
         };
@@ -508,9 +518,9 @@ impl Check for SqliBoolean {
             let baseline_flow = baseline.flow;
             let baseline = Baseline {
                 len: baseline_len,
-                body: normalized(&baseline, &example),
+                body: normalized(&baseline, &[&example]),
             };
-            let signature = if normalized(&control, &example) == baseline.body {
+            let signature = if normalized(&control, &[&example]) == baseline.body {
                 Signature::Content
             } else {
                 Signature::Length
@@ -750,33 +760,51 @@ mod tests {
         };
         let sent = "1' AND '1'='1";
         assert_eq!(
-            normalized(&resp("<p>1' AND '1'='1</p>"), sent),
+            normalized(&resp("<p>1' AND '1'='1</p>"), &[sent]),
             "<p>\u{1}</p>",
             "raw"
         );
         assert_eq!(
-            normalized(&resp("<p>1%27%20AND%20%271%27%3D%271</p>"), sent),
+            normalized(&resp("<p>1%27%20AND%20%271%27%3D%271</p>"), &[sent]),
             "<p>\u{1}</p>",
             "percent-encoded"
         );
         assert_eq!(
-            normalized(&resp("<p>1%27+AND+%271%27%3D%271</p>"), sent),
+            normalized(&resp("<p>1%27+AND+%271%27%3D%271</p>"), &[sent]),
             "<p>\u{1}</p>",
             "form-encoded"
         );
         assert_eq!(
-            normalized(&resp("<p>1&#39; AND &#39;1&#39;=&#39;1</p>"), sent),
+            normalized(&resp("<p>1&#39; AND &#39;1&#39;=&#39;1</p>"), &[sent]),
             "<p>\u{1}</p>",
             "html-escaped"
         );
         assert_eq!(
-            normalized(&resp("<p>items: 1</p>"), sent),
+            normalized(&resp("<p>items: 1</p>"), &[sent]),
             "<p>items: 1</p>"
         );
         assert_eq!(
-            normalized(&resp("<p>x</p>"), ""),
+            normalized(&resp("<p>x</p>"), &[""]),
             "<p>x</p>",
             "an empty value scrubs nothing"
+        );
+        // The live seed's shape: the point's value `1` also appears in the page's
+        // content, and an arm's body is scrubbed of the bare value too, so the
+        // baseline and the true arm compare equal.
+        assert_eq!(
+            normalized(&resp("<p>items: 1</p>"), &["1"]),
+            "<p>items: \u{1}</p>"
+        );
+        assert_eq!(
+            normalized(&resp("<p>items: 1</p>"), &["1", "1 AND 1=1"]),
+            "<p>items: \u{1}</p>"
+        );
+        assert_eq!(
+            normalized(
+                &resp("<p>you sent 1 AND 1=1</p><p>items: 1</p>"),
+                &["1", "1 AND 1=1"]
+            ),
+            "<p>you sent \u{1}</p><p>items: \u{1}</p>"
         );
     }
 

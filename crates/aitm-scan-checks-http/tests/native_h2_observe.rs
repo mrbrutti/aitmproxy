@@ -1666,7 +1666,10 @@ async fn rapid_reset_with_the_connection_open_is_no_mitigation_however_the_peer_
     );
     assert_eq!(
         v.evidence.matched.as_deref(),
-        Some("8 reset pairs, no GOAWAY, no refused stream, connection open")
+        Some(
+            "no reset-rate mitigation in 8 reset pairs: no GOAWAY, no refused stream, \
+             connection still open"
+        )
     );
 }
 

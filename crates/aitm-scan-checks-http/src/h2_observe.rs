@@ -826,8 +826,11 @@ fn rapid_reset_verdict(obs: &RawH2Observation) -> Verdict {
         outcome: Outcome::Vulnerable,
         confidence: Confidence::Firm,
         evidence: Evidence {
+            // The issue carries the evidence, not the detail, so the finding's
+            // name sits in `matched` for every reader of the issue.
             matched: Some(format!(
-                "{RESET_PAIRS} reset pairs, no GOAWAY, no refused stream, connection open"
+                "no reset-rate mitigation in {RESET_PAIRS} reset pairs: no GOAWAY, no refused \
+                 stream, connection still open"
             )),
             ..Evidence::default()
         },
