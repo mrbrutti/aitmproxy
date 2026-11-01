@@ -481,4 +481,18 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7. Record here which branch of T5-2 held on the proof host (applied or SKIP 77) and the live counters.
+**Status at PR time (2026-11-01, branch `claude/scanner-v2-t5-9ffa6b`, PR against `main`; merged by the orchestrator merge point, not by this session).**
+
+What landed (Tasks 1-13 plus four panel fix rounds):
+
+- `crates/aitm-scan-l4-packet`: the full `Lane` for `l4_packet` (`lane()` returns `Some`): discovery of operator-declared loopback L4 targets under the `L4Guard` (Inject outbound + Capture inbound, self-port exclusion, pcap privilege probe), seeds from profile hex/base64/flow, captured flows or a default (every seed built at discovery), one `l4_field` point per fuzzable path with the ten pins refused by name, boundary tables plus the deterministic raw length pass and the 15 D8.5 byte mutators, one `send_recv` per case under the job budget, rate-wait, the per-job case ceiling `min(cases, 5000)` enforced for every counted send, consecutive-timeout stop, the oracle ladder, liveness now and after 500 ms, recovery-aware reproduction with replay spacing, retirement, dry run, the two checks (`l4-packet-crash` critical/firm, `l4-packet-reaction` info/firm) sharing one point run, bounded per-job state and registry, redacting `Debug` on every byte-carrying type.
+- `crates/aitm-proto-l4`: `icmp.rs` (new: `icmp_error`, `tcp_rst`, `transport_payload`); `craft.rs` (coordinator-granted extension): verbatim `ihl`/`total_length`/`data_offset`/`payload_length` stamped after the payload (dc07f736) and an auto-length guard so an oversize payload is `TooLarge`, never a pnet panic (889707a4); `sendrecv.rs` (coordinator-granted extension): reply correlation by the decoded protocol of the built frame (8206c7b1).
+- `crates/aitm/src/wire.rs`: the lane-slot test re-pinned to the two landed lanes (ws, l4_packet) after the T4 merge.
+
+Cut: the D8.4 "ICMP type/code sweep" (no ICMP target proto exists in D2's `L4TargetSpec`; a later spec change can add `proto: icmp`).
+
+Not flipped in this PR (T1b not on `main` at the merge point): `plan::requested_fields` still returns the empty list (full default table) and `state::report_counters` is a no-op; both flip in one commit each once `L4Options.fields` and `JobCtx::report_l4` reach `main`, together with `tests/live_loopback.rs` switching from `with_default_fields` to `profile.l4.fields`.
+
+Live proof: **SKIP 77 held on the proof host** in every Terminal run (sandbox and Matt's own shell): `/dev/bpf*` is `crw------- root`; the three live tests print the plan's SKIP line and the lane-level counters were not obtained. The real e2e runner (`python3 tests/e2e/run.py scan --build`) against a core built from this branch skipped the three T5 cells with "missing verb scan.start" (T1b's engine), ledger exit 0. The lane's mechanics are pinned by 207 unit tests over a mock backend that drives the real `send_recv`, including the T10 crash-service shape (`deadbeef0000` seed, `grow:8` trigger, 5 s recovery), 100 clean cases = 105 permits, ICMP 3/3 and RST classification.
+
+Follow-ups (outside this PR): export `craft::MAX_PACKET_BYTES` so the lane's `MAX_FRAME_BYTES` copy goes; a debug assertion that `liveness_probe` is never called before the baseline; `Lane::job_finished` and `L4Oracle::Clean` for T1b; the coordinator amends the AC T5-2a clause ("info reactions, no issue") to the decided Info-severity issue; the applied branch of the live proof once Matt grants BPF or names a Linux rig.
