@@ -709,6 +709,8 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | coder note | Minor | the overlay body runs through the same mode match on `wire_confirm_from` (Inspector draws the inspector, Scan draws Scan, else `main_region`) | ratified |
 | H (Rust) | coder note | Minor | the lone `—` missing-value glyph (§2.8) stays; `Findings — PoCs and runs` and the fixture's `Shop — staging` page data left | glyph ratified as foundation design; title becomes `Findings · PoCs and runs` (H40, cell H41); fixture data untouched |
 | H (Rust) | coder note | Minor | `rustfmt <file>` needs `--edition 2021` on files with `async fn` | noted for the parallel-coders memory |
+| H (cell) | fix round | done | H37-H39, H42 in `8ecd6c9d`; `--selftest` 33 ok; mutation checks per row | second live smoke run; H41 after H40 |
+| H (cell) | coder note | Minor | "finished before `x`" is a note with a fresh job's own check; failure screens double as Evidence samples; `no site map yet` recorded; Fields pane by Esc then Tab; `EDITOR_FIELDS` copied as a tuple; H42 a hard check | ratified |
 
 ## Shipped
 
