@@ -1,6 +1,6 @@
 # `capture.status` verb implementation plan
 
-**Status:** approved — self-approved 2026-10-31 by the orchestrating session (autonomous mode, memory `aitmproxy-autonomous-approve-merge-mode`); plan-level calls P1–P4 accepted.
+**Status:** shipped (2026-10-31) — PR #200, squash b1bd898, in v0.5.5; approved 2026-10-31 by the orchestrating session (autonomous mode, memory `aitmproxy-autonomous-approve-merge-mode`); plan-level calls P1–P4 accepted.
 **Spec:** `docs/superpowers/specs/2026-10-31-capture-status-verb-design.md` (approved 2026-10-31, commit `ff1105d`)
 **Branch / worktree:** `claude/blissful-boyd-34f6a5` (already cut; this worktree, no new one)
 
@@ -623,4 +623,35 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**Merged:** PR #200 (`claude/blissful-boyd-34f6a5` → `main`), squash `b1bd898`, 2026-10-31; ships in
+v0.5.5. All five tasks plus the gate fix (d59abdb: `aitm_tui::CORE_TOOLS` + bus fixture) and the panel
+fix (9892258: generation-guarded `Attachment`, `test_support`, literal derivation table). Gate on the
+merged head 769862e (main 3fe92f6): fmt, clippy `-D warnings`, `cargo test --no-fail-fast` 230 binaries
+ok / 0 failed (live loopback and `tui_live_bus` on real sockets), `swift test` 515 + 31.
+
+**Acceptance evidence (real extension, not fixtures):** the NE session ran the recipe on the installed
+notarized 0.5.5 app against the real system extension and posted each step's `capture.status` on PR #200.
+Capture on with an empty scope: `provider attached` (team `995PCLM9KH`), `approved_attached`,
+`scope_entries 0`, never `capturing` (the incident state, now honest). In-scope browse: `capturing`,
+`flows_handed_off.tcp 2` (4 after a curl A/B), `last_handoff_at` set, `scope_tokens ["www.example.com"]`.
+Two real-app facts the spec's D7 narrative did not anticipate, both reported honestly by the verb:
+Capture **off** closes the core gate and restarts the core, so the verb reads `enabled false` /
+`feeder off, "macos_capture.enabled is false"` / `feeder_off` whenever the app has capture off (the
+`listening` / `awaiting_provider` row appears only for a core whose gate is on with no provider, e.g. an
+external core before approval); and after Restart Core with capture on the provider re-attaches within
+3 s, so `awaiting_provider` was not observable there. A dev session cannot take this evidence itself
+(the provider refuses an ad-hoc-signed core; a second capture-enabled core unlinks the running core's
+fixed sockets), which is why the PR body labels the fake-provider loopback run as not acceptance evidence.
+
+**Cut / deferred:** no UI change (the macOS review session folds `CaptureStatus.swift` into the Status
+lane after #189/#196); `Command::summarize` left `None`; no `capture.subscribe` push; no counters for
+shed/evicted/refused flows; the `catch_unwind` → `stopped()` branch stays untested (needs a production
+seam; accepted in the Review log).
+
+**Follow-ups:** unify the `object`/`obj` test-builder names on the next touch (accepted nit); a
+`Value::get(&str)` accessor in `aitm-core` would retire the four test-local `at` helpers; two findings
+from the acceptance run routed elsewhere: Safari's TLS handoffs fail the MITM when the aitm CA is
+untrusted and Safari falls back to QUIC (CA-trust/onboarding owner), and a bus-added scope entry dies with
+the Capture toggle's core restart (#193 owner). Lesson recorded in memory
+(`aitmproxy-new-bus-verb-three-contracts`): a new verb must be added to `EXPECTED_TOOLS`,
+`aitm_tui::CORE_TOOLS` and the TUI bus fixture; only a Terminal run catches the TUI contract.
