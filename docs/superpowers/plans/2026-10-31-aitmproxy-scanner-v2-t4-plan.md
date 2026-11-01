@@ -273,7 +273,7 @@ Waves (tasks inside a wave touch disjoint files and fan out to parallel coders):
   `json_bracket_path_replaces_array_element`: `{"items":[{"id":1},{"id":2}]}` + `items[1].id` Replace `"P"` -> `["items"][1]["id"] == "P"` and `["items"][0]["id"] == 1`;
   `json_non_string_leaf_prefix_stringifies`: `{"c":1}` + `c` Prefix `"P"` -> `["c"] == "P1"`; Suffix -> `"1P"`;
   `json_missing_path_is_err`: `{"a":1}` + `b` -> `Err` whose text contains `b`;
-  `form_param_replaced_and_reencoded`: `place(b"a=1&b=h%20i", &FormParam("b"), Replace "x y") == b"a=1&b=x+y"`; `Suffix "!"` -> `b"a=1&b=h+i!"`;
+  `form_param_replaced_and_reencoded`: `place(b"a=1&b=h%20i", &FormParam("b"), Replace "x y") == b"a=1&b=x+y"`; `Suffix "!"` -> `b"a=1&b=h+i%21"`;
   `form_param_missing_is_err`;
   `whole_text_modes`: `place(b"hi", &WholeText, Prefix "P") == b"Phi"`, Suffix -> `b"hiP"`, Replace -> `b"P"`;
   `binary_uses_bytes_when_present`: `Payload { value: "ignored", bytes: Some(vec![9,9]), mode: Suffix }` on `[1,2]` -> `[1,2,9,9]`;
