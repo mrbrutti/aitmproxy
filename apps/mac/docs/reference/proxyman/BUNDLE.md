@@ -3,13 +3,15 @@
 Reference for aitmproxy's macOS app. Every fact below was produced by the
 command quoted next to it, run against `/Applications/Proxyman.app`
 (Proxyman 26.3.0, build 260300) on 2026-10-31, unless it carries a tag:
-**[docs]** (proxyman.com), **[Matt]** (observed on his Mac), or **Reading:**
-(an inference from symbols, stated as such). Nothing was patched, launched or
+**[docs]** (proxyman.com), **[Matt]** (observed by Matt on his Mac),
+**[live]** (this session's screenshots of Matt's running Proxyman on
+2026-11-01, SCREENS.md), or **Reading:** (an inference from symbols, stated
+as such). Nothing was patched, launched or
 licensed; the app was not running during the inspection, and this session
 never launched it.
 
 Companion documents: [FLOWS.md](FLOWS.md) (operator flows and prompts),
-[SCREENS.md](SCREENS.md) (screen index, when captured), [DELTA.md](DELTA.md)
+[SCREENS.md](SCREENS.md) (screen index of Matt's live run), [DELTA.md](DELTA.md)
 (what aitmproxy does differently).
 
 ## 1. Layout
@@ -182,7 +184,7 @@ strings -a Contents/Frameworks/ProxymanCore.framework/ProxymanCore | grep networ
 
 `networksetup -setwebproxy "`, `networksetup -setsecurewebproxy "`,
 `networksetup -setwebproxystate "`, `networksetup -setsecurewebproxystate "`.
-Seen live [SCREENS.md shot 31]: Settings ▸ Advanced ▸ `Proxy Helper Tool: ⚠ Not
+Seen [live, SCREENS.md shot 31]: Settings ▸ Advanced ▸ `Proxy Helper Tool: ⚠ Not
 Installed`, `Your current HTTP/HTTPS Proxy is overridden by networksetup CLI.`,
 and `Restore the Previous HTTP/HTTPS Proxy When Proxyman Closes` **disabled**
 until the helper exists. Also seen: reopening the main window re-applies the
@@ -321,7 +323,7 @@ constant and the race with short-lived connections were not traced; our own
 design must handle them. No privilege is needed for the user's own
 processes; system daemons resolve by name only.
 
-Confirmed live on 2026-11-01 [Matt's Proxyman, SCREENS.md shots 30 and 34]:
+Confirmed [live, SCREENS.md shots 30 and 34]:
 with the Network Extension toggle off and Pro-locked, the Apps sidebar named
 twelve clients with icons (`Mail`, `trustd`, `cloudd`, `nsurlsessiond`,
 `dataaccessd`, `Claude Helper`, `codex`, `Google Chrome`, …) from the system
