@@ -323,7 +323,7 @@ impl JobRegistry {
             }
             let started_by = record.status.started_by.clone();
             let origins = record.status.targets.clone();
-            let is_agent = started_by.frontend == "mcp";
+            let is_agent = !frontend_of_token(&started_by.frontend).is_trusted_control();
             if self.try_insert(JobEntry {
                 status: Arc::new(RwLock::new(record.status)),
                 // A reloaded job is already over; the token is pre-cancelled so
@@ -422,10 +422,13 @@ pub struct Caller {
 }
 
 impl Caller {
-    /// An agent is exactly an MCP caller; the CLI and an operator-token
-    /// connection are the human control surfaces.
+    /// An agent is any caller that is not a trusted control surface. This asks
+    /// the workspace's one predicate (`Frontend::is_trusted_control`, an
+    /// allow-list of the CLI and an operator-token connection) rather than
+    /// comparing against the agent role, so a `Frontend` variant this build
+    /// does not know is gated, never trusted.
     pub fn is_agent(&self) -> bool {
-        self.frontend == Frontend::Mcp
+        !self.frontend.is_trusted_control()
     }
 
     /// The caller as the `started_by` record `JobStatus` carries.
@@ -446,6 +449,17 @@ fn frontend_token(frontend: Frontend) -> &'static str {
         // `Frontend` is `#[non_exhaustive]`: a frontend this build does not
         // know is treated as the gated posture, never as a trusted control.
         _ => "mcp",
+    }
+}
+
+/// The frontend a `started_by` token names, for a job reloaded from disk.
+/// An unknown token is the gated posture, so the agent-ness of a reloaded job
+/// is still decided by `Frontend::is_trusted_control`, never by a string.
+fn frontend_of_token(token: &str) -> Frontend {
+    match token {
+        "cli" => Frontend::Cli,
+        "operator" => Frontend::Operator,
+        _ => Frontend::Mcp,
     }
 }
 
@@ -579,9 +593,13 @@ impl Engine {
 /// `engine.cfg` and the **live** agent policy from the bound services, because
 /// an operator may have changed the policy since the process started.
 ///
-/// `force_map` is the `scan.map` exemption: a map job sends no probe, so it
-/// does not need `allow_agent_active` and the `intrusive` bar does not apply —
-/// but the policy itself still does.
+/// `force_map` is the `scan.map` exemption (AC T1-4): a map job is a `Write`
+/// verb that sends no probe, so an agent's map is admitted under `auto`, needs
+/// no `allow_agent_active`, and the `intrusive` bar does not apply (`start`
+/// forces the map shape to `passive`). Only `scan.start` is deferred to this
+/// gate under `auto` (call B6). The worker's policy re-check still stops a
+/// running map job when the operator pauses the agent. The L4 checks above
+/// cannot apply to a map job either: `start` forces `lanes: [http]`.
 pub fn agent_gate(
     engine: &Engine,
     caller: &Caller,
@@ -611,7 +629,7 @@ pub fn agent_gate(
         }
     }
 
-    if !caller.is_agent() {
+    if !caller.is_agent() || force_map {
         return Ok(());
     }
     if (services.agent_policy)() == AgentPolicy::Auto {
@@ -619,9 +637,6 @@ pub fn agent_gate(
             ScanErrorCode::RefusedAgent,
             "the agent policy is `auto`; an operator can switch to `all` with agent.set",
         ));
-    }
-    if force_map {
-        return Ok(());
     }
     if !engine.cfg.allow_agent_active {
         return Err(scan_error(
@@ -1127,6 +1142,24 @@ pub(crate) mod test_support {
             Arc::new(Self {
                 meta: fake_meta(id, class),
                 script: Mutex::new(script.into_iter().collect()),
+                fallback: FakeRun::clean(),
+                runs: AtomicU64::new(0),
+                block_until_cancelled: false,
+                hint: None,
+                locations: Vec::new(),
+            })
+        }
+
+        /// A passive check (`intensity: passive`, `technique: passive`), the
+        /// only kind a `scan.map` job schedules. Its fake run still goes
+        /// through the job client, so the harness can count it.
+        pub(crate) fn passive(id: &str, class: &str) -> Arc<Self> {
+            let mut meta = fake_meta(id, class);
+            meta.intensity = Intensity::Passive;
+            meta.technique = Technique::Passive;
+            Arc::new(Self {
+                meta,
+                script: Mutex::new(VecDeque::new()),
                 fallback: FakeRun::clean(),
                 runs: AtomicU64::new(0),
                 block_until_cancelled: false,
@@ -1818,9 +1851,12 @@ mod tests {
         );
     }
 
-    /// A caller is an agent exactly when its frontend is MCP (shared facts).
+    /// A caller is an agent unless its frontend is a trusted control surface
+    /// (`Frontend::is_trusted_control`, the allow-list every gate derives
+    /// from): the CLI and an operator-token connection are human; MCP is the
+    /// agent (shared facts).
     #[test]
-    fn caller_is_agent_only_for_mcp() {
+    fn caller_is_agent_unless_its_frontend_is_trusted_control() {
         for (frontend, is_agent) in [
             (Frontend::Mcp, true),
             (Frontend::Cli, false),
@@ -2029,14 +2065,15 @@ mod tests {
         h.set_policy(AgentPolicy::Auto);
         assert!(agent_gate(&h.engine, &operator(), &profile, false).is_ok());
 
-        // `auto` refuses an agent, and `scan.map` is not exempt from it.
+        // `auto` refuses an agent's `scan.start`; `scan.map` is a `Write` verb
+        // that sends no probe, so it is exempt (AC T1-4, orchestrator ruling
+        // 2026-11-01).
         let err = agent_gate(&h.engine, &agent(), &profile, false).unwrap_err();
         assert_eq!(code(&err), ScanErrorCode::RefusedAgent);
         assert!(err.to_string().contains("agent.set"), "{err}");
-        assert_eq!(
-            code(&agent_gate(&h.engine, &agent(), &profile, true).unwrap_err()),
-            ScanErrorCode::RefusedAgent,
-            "a map job still obeys the policy"
+        assert!(
+            agent_gate(&h.engine, &agent(), &profile, true).is_ok(),
+            "an agent's map job is admitted under `auto`"
         );
 
         // Under `all` the flag decides, and a map job is exempt from it.
@@ -2046,6 +2083,12 @@ mod tests {
             ScanErrorCode::RefusedAgent
         );
         assert!(agent_gate(&h.engine, &agent(), &profile, true).is_ok());
+
+        // Even an `intrusive` request from an agent maps: `scan.start` forces
+        // the map shape to `passive`, so the bar cannot apply to it.
+        let mut intrusive_map = h.profile(&["http://scan.test"]);
+        intrusive_map.intensity = Intensity::Intrusive;
+        assert!(agent_gate(&h.engine, &agent(), &intrusive_map, true).is_ok());
 
         // With the flag, `intrusive` is still operator-only.
         let h = Harness::new().with_agent_active();
@@ -2066,6 +2109,32 @@ mod tests {
             assert_eq!(code(&err), ScanErrorCode::RefusedL4);
             assert!(err.to_string().contains("l4 layer is disabled"), "{err}");
         }
+    }
+
+    /// Orchestrator ruling (2026-11-01): a map job is exempt from the agent
+    /// gate under `auto`, but it is still an agent's job. The worker's policy
+    /// re-check (spec D5) applies to it unchanged: when the operator pauses
+    /// the agent mid-map, the job stops with `stopped_reason: policy`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_map_job_started_under_auto_still_stops_when_the_operator_pauses() {
+        let h = Harness::new()
+            .with_lane(FakeLane::http().with_check(FakeCheck::passive("fake.passive", "demo")));
+        h.bind();
+        h.set_policy(AgentPolicy::Auto);
+        h.flip_policy_after(1, AgentPolicy::Paused);
+
+        let started =
+            crate::jobs::start(&h.engine, h.profile(&["http://scan.test"]), agent(), true)
+                .expect("an agent's map job is admitted under `auto`");
+        let status = h
+            .wait_terminal(&started.job, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(status.state, aitm_scan_model::JobState::Cancelled);
+        assert_eq!(
+            status.stopped_reason,
+            Some(aitm_scan_model::StoppedReason::Policy)
+        );
+        assert_eq!(status.started_by.frontend, "mcp");
     }
 
     /// Security review (2026-11-01): a `time_s` or `check_timeout_s` near

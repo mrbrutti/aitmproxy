@@ -1941,24 +1941,37 @@ mod tests {
         h.wait_terminal(as_str(obj(&result, "job"))).await;
     }
 
-    /// The `agent_gate` of Task 14 refuses a map job under `auto` too, because
-    /// it checks the live policy before applying the `force_map` exemption.
-    ///
-    /// Plan Task 15's test name says `scan.map` should be `Ok` here; plan Task 14
-    /// says the map job "keep[s] the policy check". The two disagree and the
-    /// gate lives in `jobs.rs`, which this task does not own, so this pins what
-    /// the engine actually does today. See the coder's report.
+    /// AC T1-4, through the verbs: under `agent.policy: auto` an agent's
+    /// `scan.start` is `refused_agent`, and its `scan.map` succeeds — a map
+    /// job sends no probe, so only `scan.start` is deferred to its own gate
+    /// (call B6; orchestrator ruling 2026-11-01).
     #[tokio::test(flavor = "multi_thread")]
-    async fn agent_map_under_auto_is_refused_too() {
+    async fn agent_under_auto_is_refused_agent_map_is_not() {
         let h = Harness::new();
         h.set_policy(AgentPolicy::Auto);
+
         let err = h
+            .call_as(
+                "scan.start",
+                Frontend::Mcp,
+                &[("target", s("http://scan.test"))],
+            )
+            .expect_err("an agent's `scan.start` under `auto` is refused");
+        assert_eq!(code(&err), ScanErrorCode::RefusedAgent);
+        assert_eq!(h.engine.registry.list(false, 16).len(), 0);
+
+        let result = h
             .call_as(
                 "scan.map",
                 Frontend::Mcp,
                 &[("target", s("http://scan.test"))],
             )
-            .expect_err("today's `agent_gate` refuses a map job under `auto`");
-        assert_eq!(code(&err), ScanErrorCode::RefusedAgent);
+            .expect("an agent's `scan.map` under `auto` is admitted");
+        let job = as_str(obj(&result, "job")).to_string();
+        assert!(job.starts_with("scan-"), "job was {job}");
+        assert_eq!(h.engine.registry.list(false, 16).len(), 1);
+        h.wait_terminal(&job).await;
+        let status = h.engine.registry.status(&job).expect("the map job exists");
+        assert_eq!(status.started_by.frontend, "mcp");
     }
 }
