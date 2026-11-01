@@ -133,6 +133,11 @@ pub struct ScanState {
     pub notice: Option<String>,
     /// The tick the view was first opened on; `None` until then.
     pub opened_at_tick: Option<u64>,
+    /// The tag of the `not_found` error whose self-heal requested a
+    /// `scan.list` (`scan.status:<job>` or `scan.cancel:<job>`; D13 as
+    /// amended, fix round G, G74): that list's success clears it, since no
+    /// success under the tag itself can ever come.
+    pub heal_pending: Option<String>,
 }
 
 impl ScanState {
@@ -478,12 +483,29 @@ impl ScanError {
 
     pub fn wording(&self) -> String {
         match self.code {
+            // The refresh clause only where the self-heal ran (D9 as
+            // amended on the Task 13 spec panel; fix round G, G75): a
+            // keyed `scan.status` / `scan.cancel` tag.
+            Some(ScanErrorCode::NotFound) if !self.is_healed_tag() => {
+                format!("{NOT_FOUND}: {}", self.detail)
+            }
             Some(code) => format!("{}: {}", code_wording(code), self.detail),
             None if self.detail == MISSING_VERB => format!("{} {}", self.verb, self.detail),
             None => format!("{}: {}", self.verb, self.detail),
         }
     }
+
+    /// Whether this error's tag is one the `not_found` self-heal answers:
+    /// a keyed `scan.status:<job>` or `scan.cancel:<job>`.
+    fn is_healed_tag(&self) -> bool {
+        matches!(self.verb.as_str(), "scan.status" | "scan.cancel")
+            && tag_parts(&self.tag).1.is_some()
+    }
 }
+
+/// The D9 `not_found` wording without its refresh clause: what a tag the
+/// self-heal does not answer reads (G75).
+const NOT_FOUND: &str = "No longer known to the core (it may have restarted)";
 
 /// The D9 table.
 fn code_wording(code: ScanErrorCode) -> &'static str {
@@ -664,6 +686,31 @@ mod tests {
         assert!(!ScanError::from_message("scan.start", "scan: busy: x").is_refused_launch());
         assert!(!ScanError::from_message("scan.list", "scan: out_of_scope: x").is_refused_launch());
         assert!(!ScanError::from_message("scan.start", "boom").is_refused_launch());
+    }
+
+    /// Fix round G, G75 (D9 as amended): the refresh clause only on a
+    /// keyed status or cancel tag.
+    #[test]
+    fn not_found_keeps_the_refresh_clause_only_where_the_heal_ran() {
+        let long =
+            "No longer known to the core (it may have restarted); the list is being refreshed: x";
+        assert_eq!(
+            ScanError::from_message("scan.status:scan-1a2b3c4d", "scan: not_found: x").wording(),
+            long
+        );
+        assert_eq!(
+            ScanError::from_message("scan.cancel:scan-1a2b3c4d", "scan: not_found: x").wording(),
+            long
+        );
+        assert_eq!(
+            ScanError::from_message("scan.start", "scan: not_found: x").wording(),
+            "No longer known to the core (it may have restarted): x"
+        );
+        assert_eq!(
+            ScanError::from_message("scan.status", "scan: not_found: x").wording(),
+            "No longer known to the core (it may have restarted): x",
+            "a bare status tag ran no heal"
+        );
     }
 
     #[test]

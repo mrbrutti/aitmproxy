@@ -61,6 +61,13 @@ pub struct JobsState {
     /// [`JobsState::fold_list`] keeps at the front exactly the marked ids a
     /// list omits.
     pub started_here: BTreeSet<JobId>,
+    /// The jobs a `not_found` self-heal dropped since the last timer-driven
+    /// `scan.list` (fix round G, G83): [`JobsState::fold_list`] asks no
+    /// `scan.status` for them, so a core that lists a job and answers
+    /// `not_found` for it is polled at most once per timer window instead
+    /// of driving a reply-paced list/status ping-pong. The forty-tick timer
+    /// clears it when its list leaves.
+    pub healed: BTreeSet<JobId>,
 }
 
 impl JobsState {
@@ -87,8 +94,9 @@ impl JobsState {
     /// jobs in `order`, so a job the core forgot, or one learned only from a
     /// reply or a push line, leaves with the list. A row whose id is not in
     /// the wire form is skipped (D6 hostile-core bounds). Returns the listed
-    /// ids with no `full` entry yet, in list order, for one `scan.status`
-    /// each (the caller caps them at [`super::MAX_STATUS_FOLLOWUPS`]).
+    /// ids with no `full` entry yet and not in `healed` (G83), in list
+    /// order, for one `scan.status` each (the caller caps them at
+    /// [`super::MAX_STATUS_FOLLOWUPS`]).
     pub fn fold_list(&mut self, mut list: ListResult) -> Vec<JobId> {
         list.jobs.retain(|j| is_job_id(&j.job));
         let listed: BTreeSet<JobId> = list.jobs.iter().map(|j| j.job.clone()).collect();
@@ -115,7 +123,9 @@ impl JobsState {
         self.summaries.retain(|id, _| kept.contains(id));
         let followups = order
             .iter()
-            .filter(|id| listed.contains(*id) && !self.full.contains_key(*id))
+            .filter(|id| {
+                listed.contains(*id) && !self.full.contains_key(*id) && !self.healed.contains(*id)
+            })
             .cloned()
             .collect();
         debug_assert!(

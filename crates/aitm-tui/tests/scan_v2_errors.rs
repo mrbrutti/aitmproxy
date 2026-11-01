@@ -40,10 +40,9 @@ const PROFILES_FOOTER: &str = "s start · m map · w save as · e edit · Space 
 
 /// The D9 table, pinned literally: wire code, operator wording.
 const D9: [(&str, &str); 9] = [
-    (
-        "not_found",
-        "No longer known to the core (it may have restarted); the list is being refreshed",
-    ),
+    // On a launch tag nothing is refreshed, so the clause is omitted (D9
+    // as amended; fix round G, G75).
+    ("not_found", "No longer known to the core (it may have restarted)"),
     (
         "busy",
         "Scanner busy: the job limit is reached or this origin already has a running job; wait or cancel one in Jobs (x)",
@@ -306,6 +305,117 @@ fn not_found_on_status_drops_the_job_and_refreshes_the_list() {
     // mark went with it).
     let _ = app.on_bus(reply("scan.list", "scan.list", json!({ "jobs": [] })));
     assert!(app.scan.jobs.order.is_empty(), "{:?}", app.scan.jobs.order);
+}
+
+/// Fix round G, G75: `not_found` on a keyed `scan.cancel` is the same
+/// self-heal as on `scan.status`: the job leaves `order`, `summaries`,
+/// `full` and `started_here`, exactly one `scan.list {}` leaves, and the
+/// wording keeps the refresh clause.
+#[test]
+fn not_found_on_cancel_drops_the_job_and_refreshes_the_list() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(reply(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        fixture("scan.status.json"),
+    ));
+    app.scan.jobs.started_here.insert(JOB.to_string());
+    let out = app.on_bus(BusEvent::CallTaggedFailed {
+        tag: format!("scan.cancel:{JOB}"),
+        name: "scan.cancel".into(),
+        message: "scan: not_found: gone".into(),
+    });
+    assert!(app.scan.jobs.order.is_empty());
+    assert!(!app.scan.jobs.summaries.contains_key(JOB));
+    assert!(!app.scan.jobs.full.contains_key(JOB));
+    assert!(!app.scan.jobs.started_here.contains(JOB));
+    assert_eq!(out, vec![tagged("scan.list", "scan.list", json!({}))]);
+    assert_eq!(
+        toast(&app),
+        "No longer known to the core (it may have restarted); the list is being refreshed: gone"
+    );
+}
+
+/// Fix round G, G74 (D13 as amended) and G83: the `scan.list` the
+/// self-heal requested clears the `not_found` error when it lands (no
+/// same-tag success can ever come); a list that still carries the healed
+/// job asks no `scan.status` for it until the timer's list, so a core
+/// that lists a job and answers `not_found` cannot drive a ping-pong.
+#[test]
+fn the_heal_list_clears_the_error_and_does_not_repoll_the_job() {
+    let mut app = opened();
+    let _ = app.update(Action::ScanTab(ScanTab::Jobs));
+    let _ = app.on_bus(reply(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        fixture("scan.status.json"),
+    ));
+    let out = app.on_bus(failed(
+        &format!("scan.status:{JOB}"),
+        "scan.status",
+        "scan: not_found: gone",
+    ));
+    assert_eq!(out, vec![tagged("scan.list", "scan.list", json!({}))]);
+    assert!(app.scan.last_error.is_some());
+    assert!(banner_line(&screen(&app)).contains("No longer known to the core"));
+
+    // The requested list lands, still carrying the job (a hostile core),
+    // listed as done so the four-tick status timer leaves it alone and
+    // only the list path is observed.
+    let mut list = fixture("scan.list.json");
+    list["jobs"][0]["state"] = json!("done");
+    let out = app.on_bus(reply("scan.list", "scan.list", list.clone()));
+    assert_eq!(
+        app.scan.last_error, None,
+        "the heal's list clears the error"
+    );
+    assert!(
+        !banner_line(&screen(&app)).contains("No longer known to the core"),
+        "{}",
+        screen(&app)
+    );
+    let status_jobs: Vec<&str> = out
+        .iter()
+        .filter_map(|r| match r {
+            BusRequest::CallTagged { name, args, .. } if name == "scan.status" => {
+                args["job"].as_str()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        status_jobs,
+        vec!["scan-55667788"],
+        "no scan.status for the healed job: {out:?}"
+    );
+
+    // The timer's list polls it again.
+    let mut list_sent = false;
+    let mut out = Vec::new();
+    for _ in 0..40 {
+        let reqs = app.update(Action::Tick);
+        if reqs.contains(&tagged("scan.list", "scan.list", json!({}))) {
+            list_sent = true;
+        }
+        out.extend(reqs);
+    }
+    assert!(list_sent, "the forty-tick list left: {out:?}");
+    assert!(
+        !out.iter().any(|r| matches!(
+            r,
+            BusRequest::CallTagged { name, args, .. } if name == "scan.status" && args["job"] == JOB
+        )),
+        "nothing polled the healed job inside the window: {out:?}"
+    );
+    let out = app.on_bus(reply("scan.list", "scan.list", list));
+    assert!(
+        out.iter().any(|r| matches!(
+            r,
+            BusRequest::CallTagged { name, args, .. } if name == "scan.status" && args["job"] == JOB
+        )),
+        "the timer window re-polls the job: {out:?}"
+    );
 }
 
 /// D13 refused state, D7: `out_of_scope` on a launch clears `pending`,
