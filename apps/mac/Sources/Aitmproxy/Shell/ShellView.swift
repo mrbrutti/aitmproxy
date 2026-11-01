@@ -72,7 +72,7 @@ struct ShellView: View {
         .sheet(isPresented: Binding(get: { session.setupSheetVisible }, set: { session.setupSheetVisible = $0 })) {
             SetupSheet().environment(session).themed().noInitialFocus().fitsContent()
         }
-        .onChange(of: session.setupSheetDue) { _, due in if due { session.presentSetupSheetIfDue() } }
+        .onChange(of: session.setupSheetDue, initial: true) { _, due in if due { session.presentSetupSheetIfDue() } }
         .toolbar { ShellToolbar(sidebarVisible: $session.sidebarVisible) }
         .onChange(of: session.detachRequestTick) { openWindow(id: "inspector") }
         .onChange(of: session.reconnectTick) { bus?.start() }

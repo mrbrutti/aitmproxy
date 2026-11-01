@@ -15,14 +15,14 @@ struct CAPanel: View {
     @State private var busy = false
     /// Export errors; trust errors come from the session (`caTrustLastError`).
     @State private var actionError: String?
-    /// The first `ca.status` read has been attempted, so a core without the verb shows
-    /// "No certificate" rather than loading forever.
-    @State private var loaded = false
 
+    /// The session's read-back; "No certificate" only for a connected core that has no `ca.status`
+    /// verb at all, and the loading lines until the first read lands otherwise.
     private var status: CAStatus? {
         if Store.usesFixtures { return Fixtures.caStatus }
         if let live = session.caStatus { return live }
-        return loaded ? CAStatus(fingerprint: "", installed: false, trusted: false, exists: false) : nil
+        guard case .connected = session.bus, !session.tools.contains(where: { $0.name == "ca.status" }) else { return nil }
+        return CAStatus(fingerprint: "", installed: false, trusted: false, exists: false)
     }
 
     var body: some View {
@@ -64,20 +64,20 @@ struct CAPanel: View {
             if let path = status.path { pathRow(path) }
             // The remedy is the read-back's word (D17.6), shown only while the OS store says not trusted.
             if let facts = session.caTrust, !facts.trusted, let remedy = facts.remedy {
-                Text(remedy)
-                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                    .foregroundStyle(Tok.State.warning.fg.color)
-                    .fixedSize(horizontal: false, vertical: true)
+                RemedyText(remedy, color: Tok.State.warning.fg)
             }
-            if let error = session.caTrustLastError ?? actionError {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                    .foregroundStyle(Tok.Status.serverError.color)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            if let error = session.caTrustLastError { errorLabel(error) }
+            if let actionError { errorLabel(actionError) }
             Hint(text: CATrustFacts.quicCaveat)
         }
+    }
+
+    private func errorLabel(_ text: String) -> some View {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(Tok.Face.ui(Tok.Typography.Size.sm))
+            .foregroundStyle(Tok.Status.serverError.color)
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     /// Green when installed and trusted, amber when installed but not trusted, grey
@@ -200,7 +200,6 @@ struct CAPanel: View {
         Task {
             await session.refreshCAStatus()
             if session.caStatus?.allowAgentInstall == true { agentMayInstall = true }
-            loaded = true
         }
     }
 

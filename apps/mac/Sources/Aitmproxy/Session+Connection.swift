@@ -46,7 +46,7 @@ extension Session {
         case .openCAPanel:
             show(.ca)
         case .trustCA:
-            // Operator-only, like the capture switch: the view calls `trustCA()` itself.
+            // Operator-only, like the capture switch: the view performs the trust action itself.
             return false
         case .openBrowser:
             show(.browser)

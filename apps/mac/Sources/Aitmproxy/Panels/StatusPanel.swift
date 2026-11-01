@@ -88,7 +88,7 @@ struct StatusPanel: View {
                     // The CA fact sits under the Core card (spec D17.6); no row while the OS store
                     // has not answered, so "unread" never reads as "not trusted".
                     if lane.kind == .core, let facts = session.caTrust {
-                        CATrustRow(facts: facts, run: run)
+                        CATrustRow(facts: facts, live: session.caTrustControlLive, run: run)
                     }
                 }
                 .frame(width: cardWidth, alignment: .leading)
@@ -126,13 +126,12 @@ struct StatusPanel: View {
         .accessibilityLabel("Getting started")
     }
 
-    /// The summary's steps with the CA step after Bus (spec D17.9): the facts' row when the OS
-    /// store answered, the "unknown" row when it was read but every store is unknown, and no
-    /// row at all while `ca.status` has never been read.
+    /// The summary's steps with the session's CA step after Bus (spec D17.9); no row at all
+    /// while `ca.status` has never been read.
     private func stepsWithCATrust(_ summary: ConnectionSummary) -> [GettingStartedStep] {
         var steps = summary.steps
-        guard session.caStatus != nil, let at = steps.firstIndex(where: { $0.kind == .busConnected }) else { return steps }
-        steps.insert(session.caTrust?.step ?? CATrustFacts.unknownStep(), at: at + 1)
+        guard let step = session.caTrustStep, let at = steps.firstIndex(where: { $0.kind == .busConnected }) else { return steps }
+        steps.insert(step, at: at + 1)
         return steps
     }
 
@@ -303,30 +302,25 @@ private struct LaneCard: View {
 // MARK: - CA trust row
 
 /// The CA fact under the Core card (spec D17.6): state dot + the fact's text, the remedy, its
-/// actions. Every word is `CATrustFacts`'; the buttons stand down while a change is in flight.
+/// actions. Every word is `CATrustFacts`'; the buttons stand down unless the bus is the
+/// operator's and no change is in flight (`live`).
 private struct CATrustRow: View {
     var facts: CATrustFacts
+    var live: Bool
     var run: (ConnectionAction) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            HStack(spacing: Tok.Metric.gapTight) {
-                Circle().fill(facts.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                    .accessibilityHidden(true)
-                Text(facts.text)
-            }
-            .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
-            .foregroundStyle(Tok.Ink.primary.color)
+            LaneDot(state: facts.state, word: facts.text, label: "Certificate Authority: \(facts.text)")
+                .font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))
+                .foregroundStyle(Tok.Ink.primary.color)
             if let remedy = facts.remedy {
-                Text(remedy)
-                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                    .foregroundStyle(Tok.Ink.secondary.color)
-                    .fixedSize(horizontal: false, vertical: true)
+                RemedyText(remedy)
             }
             if !facts.actions.isEmpty {
                 HStack(spacing: Space.xs) {
                     ForEach(facts.actions, id: \.self) { action in
-                        FlatButton(action.title) { run(action) }
+                        FlatButton(action.title) { run(action) }.disabled(!live)
                     }
                 }
             }

@@ -15,7 +15,8 @@ public struct CATrustFacts: Hashable, Sendable {
     public var platform: String
     /// A `ca.install` / `ca.uninstall` call is in flight (set by the session).
     public var installing = false
-    /// Linux `NeedsRoot` or macOS `HeadlessAuth` came back from the last change.
+    /// Linux `NeedsRoot` or macOS `HeadlessAuth` came back from the last change. The
+    /// read-back outranks it: a trusted store renders trusted whatever the latch says.
     public var needsAdmin = false
 
     /// Nil unless some store answered `yes` or `no` (`CAStatus.trustReported`), so an older
@@ -34,41 +35,40 @@ public struct CATrustFacts: Hashable, Sendable {
     public static let notTrustedLine = "HTTPS is not captured until the CA is trusted — browsers using QUIC load directly until then"
     static let needsAdminLinuxLine = "Linux trust stores need root: run `aitm ca install` in a terminal where sudo can prompt"
     static let needsAdminMacLine = "macOS did not show its authentication dialog. Open the Certificate Authority panel, export the certificate and trust it in Keychain Access."
+    /// The Agent log's answer to an agent's `ca.install` / `ca.uninstall` request: the operator trusts the CA from the app's own surfaces.
+    public static let operatorOnlyNote = "not approved from the Agent log — the operator uses \(ConnectionAction.trustCA.title)"
 
     /// The fact text (D17.6).
     public var text: String {
         if installing { return "trusting CA…" }
-        if needsAdmin { return "CA trust needs an administrator" }
         if trusted { return scope == "system" ? "CA trusted (System keychain)" : "CA trusted (user keychain)" }
+        if needsAdmin { return "CA trust needs an administrator" }
         return "HTTPS is not captured until the CA is trusted"
     }
 
     public var state: LaneState {
         if installing { return .working }
-        if needsAdmin || !trusted { return .warning }
-        return .ok
+        return trusted ? .ok : .warning
     }
 
     public var remedy: String? {
-        if installing { return nil }
+        if installing || trusted { return nil }
         if needsAdmin { return platform.hasPrefix("linux") ? Self.needsAdminLinuxLine : Self.needsAdminMacLine }
-        return trusted ? nil : Self.notTrustedLine
+        return Self.notTrustedLine
     }
 
     /// What a surface may offer, primary first.
     public var actions: [ConnectionAction] {
         if installing { return [] }
-        if needsAdmin || trusted { return [.openCAPanel] }
+        if trusted || needsAdmin { return [.openCAPanel] }
         return [.trustCA, .openCAPanel]
     }
 
-    /// The Getting-started row (D17.9): done once a store says yes and nothing is in flight.
+    /// The Getting-started row (D17.9): done only when the fact is `ok`, with the first offered action otherwise.
     public var step: GettingStartedStep {
-        let done = trusted && !installing
-        if done { return GettingStartedStep(kind: .caTrusted, title: text, done: true) }
-        if installing { return GettingStartedStep(kind: .caTrusted, title: text, done: false) }
-        if needsAdmin { return GettingStartedStep(kind: .caTrusted, title: text, done: false, action: .openCAPanel) }
-        return GettingStartedStep(kind: .caTrusted, title: ConnectionAction.trustCA.title, done: false, action: .trustCA)
+        let done = state == .ok
+        let title = !done && !installing && !needsAdmin ? ConnectionAction.trustCA.title : text
+        return GettingStartedStep(kind: .caTrusted, title: title, done: done, action: done ? nil : actions.first)
     }
 
     /// The row when the facts are nil: `ca.status` was read but every store is unknown.
@@ -77,19 +77,25 @@ public struct CATrustFacts: Hashable, Sendable {
                            done: false, action: .openCAPanel)
     }
 
+    /// The row when `ca.status.exists == false` (D17.6 last row): nothing to trust yet, nothing to press.
+    public static func notGeneratedStep() -> GettingStartedStep {
+        GettingStartedStep(kind: .caTrusted, title: "CA not generated yet — the core creates it on first start", done: false)
+    }
+
     /// D17.1: the scope every frontend passes on `ca.install` / `ca.uninstall` — always the
     /// user store on macOS and Windows, nothing on Linux (its only scope is the system one).
     public static func scopeArgs(platform: String) -> [String: JSONValue] {
         platform == "macos" || platform == "windows" ? ["scope": .string("user")] : [:]
     }
 
-    /// The core's D17.4 text for a dismissed macOS dialog: no toast, nothing to fix.
+    /// The core's D17.4 text for a dismissed macOS dialog, for either verb (correction 15), wherever
+    /// the bus wrapper put it: no toast, nothing to fix.
     public static func isCancelled(_ errorText: String) -> Bool {
-        errorText.hasPrefix("ca.install cancelled")
+        ["ca.install cancelled", "ca.uninstall cancelled"].contains { errorText.contains($0) }
     }
 
     /// The core's `HeadlessAuth` (macOS) or `NeedsRoot` (Linux) texts: the change needs an administrator.
     public static func signalsNeedsAdmin(_ errorText: String) -> Bool {
-        errorText.contains("without a GUI session") || errorText.hasPrefix("needs root")
+        errorText.contains("without a GUI session") || errorText.contains("needs root")
     }
 }

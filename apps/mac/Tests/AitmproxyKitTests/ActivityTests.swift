@@ -46,6 +46,17 @@ import Testing
         #expect(ActivityEntry.summary(of: .null) == "")
     }
 
+    /// A confirm token is a capability: the log names the key and elides the value.
+    @Test func summaryElidesConfirmTokens() {
+        let summary = ActivityEntry.summary(of: ["_confirm": "7f3a9c1e-token", "scope": "user"])
+        #expect(summary == "_confirm=… scope=user")
+        #expect(!summary.contains("7f3a9c1e"))
+        let entry = ActivityEntry(origin: .operator, command: "ca.install", args: ["_confirm": "7f3a9c1e-token"], result: .ok)
+        #expect(entry.argsSummary == "_confirm=…")
+        #expect(entry.args["_confirm"] == "7f3a9c1e-token")
+        #expect(ActivityEntry.summary(of: ["l4_confirm": "abc", "id": "1"]) == "id=1 l4_confirm=…")
+    }
+
     @Test func ringKeepsTheLastFiveHundredAndCountsAgentActions() {
         let now = Date(timeIntervalSince1970: 1_800_000_000)
         var ring = ActivityRing()

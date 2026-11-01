@@ -6,24 +6,29 @@ import SwiftUI
 /// up. Step 1 trusts the CA through `Session.trustCA()` with no alert of its own — the row
 /// says what it does and macOS shows its own password dialog. Step 2 points at Scope: nothing
 /// is decrypted until a host is in it. The system-proxy row (PR 4) goes above step 1. Every
-/// CA word comes from `CATrustFacts`; the buttons carry `ConnectionAction` titles.
+/// CA word comes from `CATrustFacts`, the sheet's own from `SetupWords`; the buttons carry
+/// `ConnectionAction` titles.
 struct SetupSheet: View {
     @Environment(Session.self) private var session
     @Environment(\.dismiss) private var dismiss
 
-    private var scopeDone: Bool { !session.scopeHosts.isEmpty }
-    private var caDone: Bool { session.caTrust?.trusted == true && !session.caTrustInstalling }
+    /// The Scope step of the Getting-started list: one title, one done state, shared with the Status page.
+    private var scopeStep: GettingStartedStep? { session.connectionSummary.steps.first { $0.kind == .scopeSet } }
+    private var scopeDone: Bool { scopeStep?.done ?? false }
+    private var caDone: Bool { session.caTrust?.step.done ?? false }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("Set up aitmproxy on this Mac")
+            Text(SetupWords.sheetTitle)
                 .font(Tok.Face.ui(Tok.Typography.Size.lg, .semibold))
                 .foregroundStyle(Tok.Ink.primary.color)
                 .padding(.horizontal, Space.lg).padding(.top, Space.xl).padding(.bottom, Space.md)
             VStack(alignment: .leading, spacing: Space.lg) {
                 caRow
-                Rule(color: Tok.Line.rule)
-                scopeRow
+                if let scopeStep {
+                    Rule(color: Tok.Line.rule)
+                    scopeRow(scopeStep)
+                }
             }
             .padding(.horizontal, Space.lg).padding(.bottom, Space.lg)
             Rule()
@@ -37,31 +42,29 @@ struct SetupSheet: View {
         .frame(width: 560)
         .background(Tok.Ground.surface.color)
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("Set up aitmproxy on this Mac")
+        .accessibilityLabel(SetupWords.sheetTitle)
     }
 
-    /// Step 1: the fact's word, the primary button (hidden once trusted), the QUIC caveat.
+    /// Step 1: the fact's word (or the step's, while there is no fact), the needs-an-administrator
+    /// remedy when that is the fact, the primary button (hidden once trusted, absent while the
+    /// core has no certificate yet), the QUIC caveat.
     private var caRow: some View {
         let facts = session.caTrust
+        let generated = session.caStatus?.exists != false
         return SetupRow(number: 1, title: ConnectionAction.trustCA.title, done: caDone) {
-            HStack(spacing: Space.sm) {
+            Group {
                 if let facts {
-                    Circle().fill(facts.state.color.color).frame(width: Tok.Size.statusDot, height: Tok.Size.statusDot)
-                        .accessibilityHidden(true)
-                    Text(facts.text)
+                    LaneDot(state: facts.state, word: facts.text, label: "Certificate Authority: \(facts.text)")
                 } else {
-                    Text(CATrustFacts.unknownStep().title)
+                    Text((session.caTrustStep ?? CATrustFacts.unknownStep()).title)
                 }
             }
             .font(Tok.Face.ui(Tok.Typography.Size.sm))
             .foregroundStyle(Tok.Ink.secondary.color)
-            if let remedy = facts?.remedy {
-                Text(remedy)
-                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                    .foregroundStyle(Tok.Ink.secondary.color)
-                    .fixedSize(horizontal: false, vertical: true)
+            if let facts, facts.needsAdmin, let remedy = facts.remedy {
+                RemedyText(remedy)
             }
-            if !caDone {
+            if !caDone, generated {
                 PrimaryButton(ConnectionAction.trustCA.title) { Task { await session.trustCA() } }
                     .disabled(!session.caTrustControlLive)
             }
@@ -69,14 +72,13 @@ struct SetupSheet: View {
         }
     }
 
-    /// Step 2: Scope, the same page Proxy ▸ Scope… opens.
-    private var scopeRow: some View {
-        SetupRow(number: 2, title: "Add a host to Scope", done: scopeDone) {
-            Text(scopeDone ? "\(Format.count(session.scopeHosts.count, "host")) in scope"
-                           : "Nothing is decrypted until a host is in Scope")
-                .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                .foregroundStyle(Tok.Ink.secondary.color)
-            if !scopeDone {
+    /// Step 2: Scope, the Getting-started step's own title and state, the same page Proxy ▸ Scope… opens.
+    private func scopeRow(_ step: GettingStartedStep) -> some View {
+        SetupRow(number: 2, title: step.title, done: step.done) {
+            if !step.done {
+                Text(SetupWords.scopeCaption)
+                    .font(Tok.Face.ui(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
                 FlatButton(ConnectionAction.openScope.title) {
                     dismiss()
                     session.perform(connection: .openScope)

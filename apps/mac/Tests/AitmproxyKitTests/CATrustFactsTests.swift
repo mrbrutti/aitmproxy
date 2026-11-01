@@ -77,6 +77,34 @@ import Testing
     }
     """
 
+    /// Trusted in both keychains: the user store is named first (D17.5 `trustedScope`, user before system).
+    static let trustedBothJSON = """
+    {
+      "exists": true,
+      "dir": "/Users/op/Library/Application Support/aitmproxy/ca",
+      "path": "/Users/op/Library/Application Support/aitmproxy/ca/ca.crt",
+      "fingerprint_sha256": "9F:86:D0:81:88:4C:7D:65:9A:2F:EA:A0:C5:5A:D0:15:A3:BF:4F:1B:2B:0B:82:2C:D1:5D:6C:15:B0:F0:0A:08",
+      "fingerprint_sha1": "A9:4A:8F:E5:CC:B1:9B:A6:1C:4C:08:73:D3:91:E9:87:98:2F:BB:D3",
+      "platform": "macos",
+      "stores": {
+        "user": { "installed": "present", "trusted": "yes", "location": "/Users/op/Library/Keychains/login.keychain-db" },
+        "system": { "installed": "present", "trusted": "yes", "location": "/Library/Keychains/System.keychain" }
+      },
+      "detail": []
+    }
+    """
+
+    /// The core has not generated the certificate yet (D17.6 last row).
+    static let notGeneratedJSON = """
+    {
+      "exists": false,
+      "dir": "/Users/op/Library/Application Support/aitmproxy/ca",
+      "platform": "macos",
+      "stores": {},
+      "detail": []
+    }
+    """
+
     /// Linux has one scope; the anchor is absent.
     static let linuxNotTrustedJSON = """
     {
@@ -110,6 +138,9 @@ import Testing
         #expect(trusted.trustedScope == "user")
         let system = try status(Self.trustedSystemJSON)
         #expect(system.trustedScope == "system")
+        let both = try status(Self.trustedBothJSON)
+        #expect(both.trustReported)
+        #expect(both.trustedScope == "user")
         let none = try status(Self.notTrustedJSON)
         #expect(none.trustReported)
         #expect(none.trustedScope == nil)
@@ -192,6 +223,50 @@ import Testing
         #expect(linux.remedy == "Linux trust stores need root: run `aitm ca install` in a terminal where sudo can prompt")
     }
 
+    /// A stale needs-admin latch never outranks the keychain read-back: once a store says yes
+    /// the fact is trusted, the step is done and the only action opens the panel.
+    @Test func trustedWinsOverTheNeedsAdminLatch() throws {
+        var f = try facts(Self.trustedUserJSON)
+        f.needsAdmin = true
+        #expect(f.text == "CA trusted (user keychain)")
+        #expect(f.state == .ok)
+        #expect(f.remedy == nil)
+        #expect(f.actions == [.openCAPanel])
+        #expect(f.step.done)
+        #expect(f.step.title == "CA trusted (user keychain)")
+        #expect(f.step.action == nil)
+    }
+
+    /// The step is never done while the fact is a warning, and its action is the first offered one.
+    @Test func stepFollowsStateAndActions() throws {
+        var f = try facts(Self.notTrustedJSON)
+        #expect(f.state == .warning)
+        #expect(!f.step.done)
+        #expect(f.step.action == f.actions.first)
+        #expect(f.step.action == .trustCA)
+        f.needsAdmin = true
+        #expect(f.state == .warning)
+        #expect(!f.step.done)
+        #expect(f.step.action == f.actions.first)
+        #expect(f.step.action == .openCAPanel)
+        f.needsAdmin = false
+        f.installing = true
+        #expect(f.actions.isEmpty)
+        #expect(f.step.action == nil)
+    }
+
+    /// D17.6 last row: no certificate yet, so nothing to trust and nothing to press.
+    @Test func notGeneratedStepHasNoAction() throws {
+        let notGenerated = try status(Self.notGeneratedJSON)
+        #expect(notGenerated.exists == false)
+        #expect(CATrustFacts(status: notGenerated) == nil)
+        let step = CATrustFacts.notGeneratedStep()
+        #expect(step.kind == .caTrusted)
+        #expect(!step.done)
+        #expect(step.title == "CA not generated yet — the core creates it on first start")
+        #expect(step.action == nil)
+    }
+
     @Test func trustedInTheSystemKeychainSaysSo() throws {
         let f = try facts(Self.trustedSystemJSON)
         #expect(f.trusted)
@@ -220,6 +295,7 @@ import Testing
         #expect(ConnectionAction.openCAPanel.title == "Certificate Authority…")
         #expect(!ConnectionAction.trustCA.isDestructive)
         #expect(!ConnectionAction.openCAPanel.isDestructive)
+        #expect(CATrustFacts.operatorOnlyNote == "not approved from the Agent log — the operator uses Trust the aitmproxy CA")
     }
 
     /// The core's error texts the app keys on (D17.4 cancelled → silent; D17.6 needs an administrator).
@@ -230,5 +306,18 @@ import Testing
         #expect(CATrustFacts.signalsNeedsAdmin("needs root: run aitm ca install from a shell where sudo can prompt, or start the proxy as root (tee: exit 1)"))
         #expect(!CATrustFacts.signalsNeedsAdmin("ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted"))
         #expect(!CATrustFacts.signalsNeedsAdmin("the bus connection closed"))
+        // The same texts as the bus wraps them (a tool prefix, a code), and the uninstall verb (correction 15).
+        #expect(CATrustFacts.isCancelled("tool ca.install failed: ca.install cancelled: the macOS authentication dialog was dismissed; the CA is not trusted"))
+        #expect(CATrustFacts.isCancelled("ca.uninstall cancelled: the macOS authentication dialog was dismissed; the CA is still trusted"))
+        #expect(CATrustFacts.isCancelled("tool ca.uninstall failed: ca.uninstall cancelled: the macOS authentication dialog was dismissed"))
+        #expect(!CATrustFacts.isCancelled("ca.install: the operator cancelled nothing; security exited 1"))
+        #expect(CATrustFacts.signalsNeedsAdmin("tool ca.install failed (code -32000): macOS refused to change trust settings without a GUI session; run aitm ca install from a terminal in a logged-in desktop session (security: exit 1)"))
+        #expect(CATrustFacts.signalsNeedsAdmin("tool ca.install failed (code -32000): needs root: run aitm ca install from a shell where sudo can prompt, or start the proxy as root (tee: exit 1)"))
+    }
+
+    /// E: the sheet's words have one Kit home.
+    @Test func setupWordsAreTheSheetsWords() {
+        #expect(SetupWords.sheetTitle == "Set up aitmproxy on this Mac")
+        #expect(SetupWords.scopeCaption == "Nothing is decrypted until a host is in Scope")
     }
 }

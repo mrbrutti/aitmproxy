@@ -10,12 +10,22 @@ import Foundation
 /// sheet, the Status card and the Proxy menu all come here; `tools/check-ca-trust-path.sh` pins it.
 extension Session {
     /// The CA fact of the Core lane and its Getting-started step; nil until `ca.status` has been
-    /// read and some store has said yes or no.
+    /// read, the certificate exists and some store has said yes or no. The read-back outranks the
+    /// needs-admin latch: a trusted store is trusted whatever the last change said.
     var caTrust: CATrustFacts? {
-        guard let caStatus, var facts = CATrustFacts(status: caStatus) else { return nil }
+        guard let caStatus, caStatus.exists, var facts = CATrustFacts(status: caStatus) else { return nil }
         facts.installing = caTrustInstalling
-        facts.needsAdmin = caTrustNeedsAdmin
+        facts.needsAdmin = caTrustNeedsAdmin && !facts.trusted
         return facts
+    }
+
+    /// The Getting-started row for CA trust (D17.6, D17.9), shared by the Status page and the
+    /// first-run sheet: nil until `ca.status` has been read; "not generated" when the core has no
+    /// certificate yet; the facts' row; or the "unknown" row when every store is unknown.
+    var caTrustStep: GettingStartedStep? {
+        guard let caStatus else { return nil }
+        if !caStatus.exists { return CATrustFacts.notGeneratedStep() }
+        return caTrust?.step ?? CATrustFacts.unknownStep()
     }
 
     /// Trusting is a bus call that changes the OS store: live while the bus is connected AS the
@@ -25,6 +35,12 @@ extension Session {
         return !caTrustInstalling
     }
 
+    /// The confirm-gated trust verbs, for the surfaces that must not offer them generically
+    /// (the palette's Commands list, the Agent log's Approve).
+    static func isCATrustVerb(_ name: String) -> Bool {
+        name == "ca.install" || name == "ca.uninstall"
+    }
+
     /// Install the CA into the user trust store (macOS asks for the login password itself).
     func trustCA() async { await changeCATrust("ca.install") }
 
@@ -32,15 +48,23 @@ extension Session {
     func untrustCA() async { await changeCATrust("ca.uninstall") }
 
     /// `ca.status` read directly on the bus (no activity-log entry, like `proxy.status`),
-    /// assigned only when it changed. A core without the verb, or no bus, leaves it as is.
-    func refreshCAStatus() async {
+    /// assigned only when it changed; a trusted store clears the needs-admin latch and the last
+    /// trust error. Returns whether the read-back landed: false for a core without the verb, no
+    /// bus, or an unparseable reply, which leaves the status as is.
+    @discardableResult
+    func refreshCAStatus() async -> Bool {
         guard let commandRunner, let json = try? await commandRunner("ca.status", [:]),
-              let status = CAStatus(json: json) else { return }
+              let status = CAStatus(json: json) else { return false }
         if status != caStatus { caStatus = status }
+        if status.trustedScope != nil {
+            caTrustNeedsAdmin = false
+            caTrustLastError = nil
+        }
+        return true
     }
 
     private func changeCATrust(_ command: String) async {
-        guard !caTrustInstalling else { return }
+        guard caTrustControlLive else { return }
         caTrustInstalling = true
         defer { caTrustInstalling = false }
         if caStatus == nil { await refreshCAStatus() }
@@ -59,6 +83,7 @@ extension Session {
         } catch {
             let message = BusService.describe(error)
             if CATrustFacts.isCancelled(message) {
+                caTrustNeedsAdmin = false
                 caTrustLastError = nil
             } else {
                 caTrustNeedsAdmin = CATrustFacts.signalsNeedsAdmin(message)
@@ -66,7 +91,11 @@ extension Session {
                 lastError = caTrustLastError
             }
         }
-        await refreshCAStatus()
+        let readBack = await refreshCAStatus()
+        if !readBack, caTrustLastError == nil {
+            caTrustLastError = "the CA may have changed but ca.status could not be read"
+            lastError = caTrustLastError
+        }
     }
 
     // MARK: First-run sheet (spec D17.8)

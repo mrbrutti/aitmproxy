@@ -12,14 +12,16 @@
 # source and fails closed.
 #
 # Usage: tools/check-ca-trust-path.sh [mac-dir]   (default: the apps/mac that holds this script)
-#        tools/check-ca-trust-path.sh --self-check   plants a violation in a copy and expects exit 1
+#        tools/check-ca-trust-path.sh --self-check   plants one violation per rule in a copy and
+#                                                    expects each rule's tag on its file
 # Exit 0 and "PASS" on a clean tree. Exit 1 on any violation, printing each offending
 # "file:line" (relative to apps/mac) with its text.
 #
 # A match counts anywhere in a file, comments included. To add a legitimate operator
 # surface, add it to the allow-list below in the same commit, and say why. Every
 # allow-list entry must still match (an `expect` line), so the list stays exactly the set
-# that legitimately does and cannot quietly widen when code moves.
+# that legitimately does and cannot quietly widen when code moves. A file a rule names
+# that is not there is a violation, never a skip: a surface that moved takes its rule along.
 #
 # This tripwire greps TOKENS. It guards honest changes (a refactor that moves a call into
 # the wrong file, a surface that copies a neighbour's code), not deliberately obfuscated
@@ -33,17 +35,23 @@
 #      expect, until the fake-data-removal PR deletes them.
 #   2. `.trustCA(` / `.untrustCA(` are called from Panels/CAPanel.swift,
 #      Shell/SetupSheet.swift, Panels/StatusPanel.swift and App.swift only (each with an
-#      expect). The definitions in Session+CATrust.swift have no leading dot.
+#      expect). An UNDOTTED `trustCA(` / `untrustCA(` (a call from inside an `extension
+#      Session`, or a second definition) may appear in those four files and in
+#      Session+CATrust.swift only, where the undotted matches are exactly the two `func`
+#      definitions (pinned by count).
 #   3. The scope: AitmproxyKit/CATrustFacts.swift renders `.string("user")` (expect);
 #      Session+CATrust.swift calls `scopeArgs(platform:` (expect) and never spells "system"
 #      (deny); no file under the scan roots spells `.string("system")`.
 #      (SP-AC34 words rule 3 as `.string("user")` in Session+CATrust.swift; the CA-trust
 #      plan record moved the scope rendering into the Kit's CATrustFacts.scopeArgs so the
 #      Kit test can pin it, and this rule follows the literal to its one home.)
-#   4. The agent-reachable surfaces of check-capture-operator-only.sh's rule 4 match none
-#      of ca.install | ca.uninstall | trustCA | untrustCA. CommandMap.swift carries the menu
-#      TITLE "Trust the aitmproxy CA" only, which the pattern does not match. The two
-#      fixture files of rule 1 are allowed here for the same reason, by file.
+#   4. The agent-reachable surfaces of check-capture-operator-only.sh's rule 4, plus the
+#      self-test, the snapshot scenes and the fixture session, match none of
+#      ca.install | ca.uninstall | trustCA | untrustCA. CommandMap.swift carries the menu
+#      TITLE "Trust the aitmproxy CA" only, which the pattern does not match;
+#      `Session.isCATrustVerb` (the palette's and the Agent log's guard) does not match it
+#      either. The two fixture files of rule 1 are allowed here for the same reason, by
+#      file, and skipped once deleted.
 set -u
 set -o pipefail
 export LC_ALL=C
@@ -60,14 +68,25 @@ if [ "${1:-}" = "--self-check" ]; then
     echo "SELF-CHECK FAIL: the clean copy does not pass; fix the tree first"
     exit 1
   fi
+  # One plant per rule: a quoted verb (rule 1), an undotted call from inside an extension
+  # Session outside the allow-list (rule 2), a bare token on an agent-reachable surface (rule 4).
   printf '\nlet _ = "ca.install"\n' >> "$work/Sources/Aitmproxy/Session+Verbs.swift"
+  printf '\nextension Session {\n    func plantedTrust() async { await trustCA() }\n}\n' >> "$work/Sources/Aitmproxy/Session+Connection.swift"
+  printf '\n// planted: trustCA\n' >> "$work/Sources/Aitmproxy/Panels/AgentPanel.swift"
   out=$(bash "$self" "$work" 2>&1); rc=$?
   printf '%s\n' "$out"
-  if [ "$rc" -eq 1 ] && grep -q 'Session+Verbs.swift' <<<"$out"; then
-    echo "SELF-CHECK PASS: the planted \"ca.install\" in Session+Verbs.swift was caught"
+  ok=1
+  if [ "$rc" -ne 1 ]; then echo "SELF-CHECK FAIL: expected exit 1, got exit $rc"; ok=0; fi
+  grep -qE '^VIOLATION \[1 [^]]*\] Sources/Aitmproxy/Session\+Verbs\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 1 did not name the planted \"ca.install\" in Session+Verbs.swift"; ok=0; }
+  grep -qE '^VIOLATION \[2 [^]]*\] Sources/Aitmproxy/Session\+Connection\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 2 did not name the planted undotted trustCA() in Session+Connection.swift"; ok=0; }
+  grep -qE '^VIOLATION \[4 [^]]*\] Sources/Aitmproxy/Panels/AgentPanel\.swift:' <<<"$out" \
+    || { echo "SELF-CHECK FAIL: rule 4 did not name the planted trustCA token in Panels/AgentPanel.swift"; ok=0; }
+  if [ "$ok" -eq 1 ]; then
+    echo "SELF-CHECK PASS: rules 1, 2 and 4 each caught their planted violation"
     exit 0
   fi
-  echo "SELF-CHECK FAIL: expected exit 1 naming Session+Verbs.swift, got exit $rc"
   exit 1
 fi
 
@@ -131,14 +150,28 @@ expect() {
   fi
 }
 
+# expect_count RULE FILE REGEX N WHAT
+# FILE must match REGEX on exactly N lines.
+expect_count() {
+  local found
+  if [ ! -f "$2" ]; then
+    flag "$1" "$2: not found, but the allow-list names it"
+    return
+  fi
+  found=$(grep -cE -e "$3" "$2" || true)
+  if [ "${found:-0}" -ne "$4" ]; then
+    flag "$1" "$2: expected exactly $4 line(s) matching $5, found ${found:-0}"
+  fi
+}
+
 # deny RULE REGEX FILE...
-# None of the FILEs may match REGEX. A file that does not exist is noted and skipped.
+# None of the FILEs may match REGEX. A file that does not exist is a violation.
 deny() {
   local rule=$1 regex=$2 f hit line text
   shift 2
   for f in "$@"; do
     if [ ! -f "$f" ]; then
-      echo "NOTE: surface not present, skipped: $f" >&2
+      flag "$rule" "$f: not found; the surface moved, so move its rule to the file that replaced it"
       continue
     fi
     checked=$((checked + 1))
@@ -149,6 +182,17 @@ deny() {
       flag "$rule" "$f:$line: $text"
     done < <(grep -nE -e "$regex" "$f")
   done
+}
+
+# deny_present RULE REGEX FILE...
+# `deny` for fixture DATA scheduled for deletion: a missing file is skipped with a note.
+deny_present() {
+  local rule=$1 regex=$2 f present=()
+  shift 2
+  for f in "$@"; do
+    if [ -f "$f" ]; then present+=("$f"); else echo "NOTE: fixture file gone, skipped: $f" >&2; fi
+  done
+  [ "${#present[@]}" -gt 0 ] && deny "$rule" "$regex" "${present[@]}"
 }
 
 # ---- 1. the verbs' quoted literals: Session+CATrust.swift only -----------------------
@@ -165,9 +209,13 @@ expect "2 trustCA()/untrustCA() call" "$ca_panel" '\.untrustCA[[:space:]]*\(' 't
 expect "2 trustCA()/untrustCA() call" "$setup_sheet" '\.trustCA[[:space:]]*\(' 'the sheet'"'"'s Trust the aitmproxy CA button'
 expect "2 trustCA()/untrustCA() call" "$status_panel" '\.trustCA[[:space:]]*\(' 'the Status page'"'"'s .trustCA action'
 expect "2 trustCA()/untrustCA() call" "$app_swift" '\.trustCA[[:space:]]*\(' 'the Proxy menu item'
-# The definitions live in the one file.
+# Undotted: a call from inside an `extension Session` (self is implicit) or a second definition.
+undotted_re='(^|[^A-Za-z0-9_.])(un)?trustCA[[:space:]]*\('
+scan "2 trustCA()/untrustCA() call" "$undotted_re" "$ca_panel" "$setup_sheet" "$status_panel" "$app_swift" "$ca_trust"
+# The definitions live in the one file, and they are its only undotted matches.
 expect "2 trustCA()/untrustCA() call" "$ca_trust" 'func trustCA\(\)' 'func trustCA()'
 expect "2 trustCA()/untrustCA() call" "$ca_trust" 'func untrustCA\(\)' 'func untrustCA()'
+expect_count "2 trustCA()/untrustCA() call" "$ca_trust" "$undotted_re" 2 'an undotted trustCA(/untrustCA( (the two func definitions)'
 
 # ---- 3. the scope is the user store, never "system" ----------------------------------
 expect "3 user scope" "$ca_facts" '\.string\("user"\)' 'the .string("user") scope'
@@ -177,7 +225,8 @@ scan "3 user scope" '\.string\("system"\)'
 
 # ---- 4. the agent-reachable surfaces reference none of it ----------------------------
 # FixtureBus.swift is the bus's stand-in in fixture, snapshot and self-test runs (the test
-# adapter behind Session.commandRunner), so it is held to the same rule as BusService.swift.
+# adapter behind Session.commandRunner), so it is held to the same rule as BusService.swift;
+# the self-test, the snapshot scenes and the fixture session drive Session without an operator.
 deny "4 agent-reachable surface" 'ca\.install|ca\.uninstall|trustCA|untrustCA' \
   Sources/Aitmproxy/Bus/BusService.swift \
   Sources/Aitmproxy/Bus/FixtureBus.swift \
@@ -185,9 +234,13 @@ deny "4 agent-reachable surface" 'ca\.install|ca\.uninstall|trustCA|untrustCA' \
   Sources/Aitmproxy/Shell/CommandPalette.swift \
   Sources/Aitmproxy/Session+Palette.swift \
   Sources/Aitmproxy/Session+Verbs.swift \
-  Sources/Aitmproxy/Panels/AgentPanel.swift
+  Sources/Aitmproxy/Panels/AgentPanel.swift \
+  Sources/Aitmproxy/SelfTest.swift \
+  Sources/Aitmproxy/SelfTest+Live.swift \
+  Sources/Aitmproxy/SnapshotScenes.swift \
+  Sources/Aitmproxy/Session+Fixtures.swift
 # The two fixture DATA files of rule 1: not a call path, but they must not grow one either.
-deny "4 agent-reachable surface" 'trustCA|untrustCA|runCommand|commandRunner' "$fixture_tools" "$fixture_agent"
+deny_present "4 agent-reachable surface" 'trustCA|untrustCA|runCommand|commandRunner' "$fixture_tools" "$fixture_agent"
 
 if [ "$violations" -ne 0 ]; then
   echo "FAIL check-ca-trust-path: $violations violation(s). CA trust has one call path and one scope."
