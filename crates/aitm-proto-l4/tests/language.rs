@@ -20,7 +20,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aitm_core::{CallerTrust, Value};
-use aitm_plugin::language::{PocStepInputs, ProtocolLanguage};
+use aitm_plugin::language::{
+    Guarded, HostCallContextSource, HostCallCtx, HostFn, PocStepInputs, ProtocolLanguage,
+    RegisterError, ScriptHostRegistry,
+};
 use aitm_plugin_rhai::{
     build_engine_with_languages, production_languages, registered_host_fns, seed_call_context,
     RhaiLimits,
@@ -410,6 +413,87 @@ fn per_call_trust_decides_on_one_rhai_registration() {
         backend.injected().len(),
         1,
         "the admitted Operator call reached the (mock) wire exactly once"
+    );
+}
+
+/// A [`ScriptHostRegistry`] that captures what a language registers, so a test can
+/// drive one production-registered `<ns>.<name>` host fn (guard permit, then the fn)
+/// exactly as the Rhai dispatcher does — needed for dotted names such as
+/// `scope.add`, which Rhai's `ns.name(...)` syntax cannot spell.
+#[derive(Default)]
+struct CapturingRegistry {
+    fns: BTreeMap<(String, String), Guarded<HostFn>>,
+}
+impl ScriptHostRegistry for CapturingRegistry {
+    fn register(&mut self, ns: &str, name: &str, f: Guarded<HostFn>) -> Result<(), RegisterError> {
+        self.fns.insert((ns.to_string(), name.to_string()), f);
+        Ok(())
+    }
+}
+
+/// A tag-less call source for a [`HostCallCtx`].
+struct NoSource;
+impl HostCallContextSource for NoSource {
+    fn tag(&self) -> Option<Value> {
+        None
+    }
+    fn call_source(&self) -> &str {
+        "test"
+    }
+}
+
+/// L4PAR-AC6 (plan A6) — the Rhai face keeps calling `add_runtime_scope`: a script
+/// cannot be confirmed, so even a **trusted-control** caller (`Operator`) is still
+/// refused by the widen gate when it is off, and so is an `Agent`. Only the
+/// `l4.scope.add` *command* (behind the operator handshake / CLI confirmer) reaches
+/// the ungated path. Driven through the production `register_host_fns` seam.
+#[test]
+fn rhai_scope_add_trusted_caller_still_widen_gated() {
+    let guard = loopback_guard(false); // allow_agent_widen defaults to false
+    let lang = L4Language::new(
+        guard.clone(),
+        MockBackend::with_replies(vec![]),
+        Arc::new(InMemoryL4FlowStore::new()),
+    );
+    let mut reg = CapturingRegistry::default();
+    lang.register_host_fns(&mut reg)
+        .expect("the L4 language registers its host fns");
+    let (gate, scope_add) = reg
+        .fns
+        .remove(&("l4".to_string(), "scope.add".to_string()))
+        .expect("`l4.scope.add` is registered")
+        .into_parts();
+
+    let entry: BTreeMap<String, Value> = [
+        ("cidr", "127.0.0.1/32"),
+        ("ports", "9100-9199"),
+        ("interface", IFACE),
+        ("direction", "inbound"),
+        ("capability", "capture"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), Value::Str(v.to_string())))
+    .collect();
+    let before = guard.list_scope().len();
+    let src = NoSource;
+
+    for caller in [CallerTrust::Operator, CallerTrust::Agent] {
+        let ctx = HostCallCtx::new(caller, &src);
+        gate.permit(&ctx, "scope.add")
+            .expect("scope.add carries no agent gate of its own; the widen gate is the guard's");
+        let err = scope_add(&ctx, &[Value::Object(entry.clone())])
+            .expect_err("a Rhai scope.add is widen-gated for every caller");
+        assert_eq!(
+            err.to_string(),
+            "`l4` guard refused the call: runtime L4 scope widening is disabled; declare scope \
+             in the `l4.scope` config block or set `l4.allow_agent_widen`",
+            "{caller:?}"
+        );
+    }
+    assert_eq!(
+        guard.list_scope().len(),
+        before,
+        "a refused Rhai scope.add widens nothing"
     );
 }
 

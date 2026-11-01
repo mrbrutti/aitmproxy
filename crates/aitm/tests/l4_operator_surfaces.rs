@@ -381,6 +381,158 @@ fn agent_cannot_self_grant() {
     assert_eq!(status["structuredContent"]["inject"], json!(true));
 }
 
+// ---- L4PAR-AC5 / AC6: operator scope add through confirm-over-the-wire ---------
+
+/// The AC5 entry (spec L4PAR-AC5).
+fn scope_add_args() -> JsonValue {
+    json!({
+        "cidr": "127.0.0.1/32", "ports": "9100-9199", "interface": "lo0",
+        "direction": "inbound", "capability": "capture",
+    })
+}
+
+/// `tools/list` as `role`, the `tools` array.
+fn list_tools(srv: &McpServer, role: Frontend) -> Vec<JsonValue> {
+    let req = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {}});
+    let resp = srv
+        .handle_on(&ConnCtx::new(role), &req.to_string())
+        .expect("tools/list gets a response");
+    let parsed: JsonValue = serde_json::from_str(&resp).expect("json");
+    parsed["result"]["tools"]
+        .as_array()
+        .cloned()
+        .expect("tools is an array")
+}
+
+/// The `l4.scope.list` entries as (id, source) pairs, read as the operator.
+fn scope_sources(srv: &McpServer) -> Vec<(String, String)> {
+    let listed = call(srv, Frontend::Operator, "l4.scope.list", json!({}));
+    assert!(
+        !is_error(&listed),
+        "l4.scope.list failed: {}",
+        text(&listed)
+    );
+    listed["structuredContent"]
+        .as_array()
+        .expect("scope list is an array")
+        .iter()
+        .map(|e| {
+            (
+                e["id"].as_str().expect("id").to_string(),
+                e["source"].as_str().expect("source").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn widen(srv: &McpServer) -> JsonValue {
+    let status = call(srv, Frontend::Operator, "l4.agent.status", json!({}));
+    assert!(!is_error(&status), "{}", text(&status));
+    status["structuredContent"]["widen"].clone()
+}
+
+/// L4PAR-AC5 (plan A6) — over the real MCP server with widen OFF, an operator
+/// `l4.scope.add` returns `needs_confirmation` with a token and a prompt naming the
+/// five entry fields; re-issuing with `_confirm` returns the new id; `l4.scope.list`
+/// shows it `runtime` beside the config entry; `widen` reads false before and after;
+/// `l4.scope.remove {id}` returns true and the list is back to the config entry.
+#[test]
+fn operator_scope_add_confirm_handshake() {
+    let cfg = l4_cfg();
+    assert!(!cfg.allow_agent_widen);
+    let (srv, _r) = server(&cfg, AgentPolicy::Auto);
+    assert_eq!(widen(&srv), json!(false), "widen off before");
+    let before = scope_sources(&srv);
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].1, "config");
+
+    let asked = call(&srv, Frontend::Operator, "l4.scope.add", scope_add_args());
+    assert!(!is_error(&asked), "{}", text(&asked));
+    assert_eq!(
+        asked["structuredContent"]["status"],
+        json!("needs_confirmation")
+    );
+    let prompt = asked["structuredContent"]["prompt"]
+        .as_str()
+        .expect("prompt");
+    for word in ["127.0.0.1/32", "9100-9199", "lo0", "inbound", "capture"] {
+        assert!(prompt.contains(word), "prompt must name `{word}`: {prompt}");
+    }
+    let token = asked["structuredContent"]["confirm_token"]
+        .as_str()
+        .expect("confirm_token")
+        .to_string();
+    assert_eq!(
+        scope_sources(&srv),
+        before,
+        "the handshake step adds nothing"
+    );
+
+    let mut confirmed = scope_add_args();
+    confirmed["_confirm"] = json!(token);
+    let added = call(&srv, Frontend::Operator, "l4.scope.add", confirmed);
+    assert!(!is_error(&added), "{}", text(&added));
+    let id = added["structuredContent"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the confirmed add returns the id string, got {added}"))
+        .to_string();
+
+    let after = scope_sources(&srv);
+    assert_eq!(after.len(), 2);
+    assert_eq!(after[0], before[0]);
+    assert_eq!(after[1], (id.clone(), "runtime".to_string()));
+    assert_eq!(widen(&srv), json!(false), "widen still off after");
+
+    let removed = call(
+        &srv,
+        Frontend::Operator,
+        "l4.scope.remove",
+        json!({"id": id}),
+    );
+    assert!(!is_error(&removed), "{}", text(&removed));
+    assert_eq!(removed["structuredContent"], json!(true));
+    assert_eq!(scope_sources(&srv), before);
+}
+
+/// L4PAR-AC6 (plan A6) — an agent (`Frontend::Mcp`) under policy `All` with widen
+/// OFF is refused with the widen text, is offered **no** handshake (no
+/// `needs_confirmation`, `confirm_token` null) and the list is unchanged.
+#[test]
+fn agent_scope_add_not_offered_confirmation() {
+    let (srv, _r) = server(&l4_cfg(), AgentPolicy::All);
+    let before = scope_sources(&srv);
+
+    let res = call(&srv, Frontend::Mcp, "l4.scope.add", scope_add_args());
+    assert!(is_error(&res), "agent l4.scope.add must be refused");
+    assert!(
+        text(&res).contains("runtime L4 scope widening is disabled"),
+        "the refusal is the widen text, got: {}",
+        text(&res)
+    );
+    assert_ne!(
+        res["structuredContent"]["status"],
+        json!("needs_confirmation"),
+        "an agent is never offered a handshake"
+    );
+    assert!(res["structuredContent"]["confirm_token"].is_null());
+    assert_eq!(scope_sources(&srv), before);
+}
+
+/// L4PAR-AC5 — `tools/list` reports `l4.scope.add` `confirmable: true` to the
+/// operator and the agent alike (the UIs render their add control on it).
+#[test]
+fn scope_add_is_confirmable_in_tools_list() {
+    let (srv, _r) = server(&l4_cfg(), AgentPolicy::Auto);
+    for role in [Frontend::Operator, Frontend::Mcp] {
+        let tools = list_tools(&srv, role);
+        let add = tools
+            .iter()
+            .find(|t| t["name"] == json!("l4.scope.add"))
+            .unwrap_or_else(|| panic!("{role:?}: tools/list has l4.scope.add"));
+        assert_eq!(add["confirmable"], json!(true), "{role:?}: {add}");
+    }
+}
+
 /// A real MCP server over an L4 module built from `cfg` (privilege present), whose
 /// store holds one `capture` flow on `lo0` with a single inbound packet of
 /// `bytes`. Returns the server and the flow's id string — the fixture the three

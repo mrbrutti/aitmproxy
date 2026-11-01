@@ -16,9 +16,13 @@ as operator AND as agent and asserted on the core's verbatim replies -- never a 
     `code == "unsupported_platform"` and R_INT on macOS) and `l4.intercept.start`.
   * AC5 (half): every `l4.scope.list` entry carries `source: "config" | "runtime"`, and the
     rig's three config entries are there.
-  * AC5/AC6 operator add: run only when `tools/list` shows `l4.scope.add` `confirmable: true`
-    (unit (a'), `fix/l4-parity-core-scope`); otherwise those checks are reported as skipped
-    with that precise reason and the cell still passes (an honest "not on this core").
+  * AC5 (1b): `tools/list` shows `l4.scope.add` with `confirmable: true` (unit (a'), plan A6):
+    the operator-confirmed scope add is on this core; a core without it FAILS here.
+  * AC5 operator add (unit (a')): with `widen: false`, an operator `l4.scope.add` returns
+    `needs_confirmation` with a `confirm_token` and a prompt naming the cidr, ports,
+    interface, direction and capability; re-issuing with `_confirm` returns the id; the list
+    shows it `source: "runtime"` beside the three `config` entries; `widen` is still false;
+    `l4.scope.remove` returns true and the list is back to its starting ids.
   * AC6: with the agent policy `all` and widen off, an agent `l4.scope.add` is refused with
     the widen text, is offered no confirmation, and leaves the list unchanged; under `auto`
     it is refused by policy. The original policy is restored.
@@ -359,6 +363,15 @@ def main() -> int:
         agent_names = l4_names(agent.tools())
         expect(agent_names == names, "the agent's tools/list carries the same l4.* names", agent_names)
 
+        section("(1b) tools/list: l4.scope.add is confirmable (unit (a'): operator confirm-over-the-wire)")
+        show("l4.scope.add tool", {k: v for k, v in (tool_by_name(tools, "l4.scope.add") or {}).items()
+                                   if k != "inputSchema"})
+        expect(scope_add_confirmable(tools),
+               "tools/list shows l4.scope.add with confirmable: true (the UIs render their add control on it)",
+               tool_by_name(tools, "l4.scope.add"))
+        expect(scope_add_confirmable(agent.tools()),
+               "the agent's tools/list shows the same confirmable: true (static per tool, never per role)")
+
         section("(2) AC3: l4.capture.status is honest for operator and agent; capture.start still refuses")
         check_status_verb(op, agent, "l4.capture.status", "l4.capture.start", "captures", ("needs_privilege",), iface)
 
@@ -384,9 +397,10 @@ def main() -> int:
         if scope_add_confirmable(tools):
             run_operator_scope_add(op, before_ids)
         else:
+            # (1b) already failed the cell; do not also send an un-confirmable add.
             skipped_check("AC5 operator l4.scope.add confirm handshake, runtime provenance, widen unchanged, remove",
                           "tools/list shows l4.scope.add confirmable=false: this core lacks unit (a') "
-                          "(fix/l4-parity-core-scope, task A6); operator l4.scope.add is still Widen-gated here")
+                          "(fix/l4-parity-core-scope, task A6) -- already a FAIL at (1b)")
 
         section("(6) AC6 agents unchanged: the widen gate, not a handshake")
         run_agent_scope_add(op, agent, before_ids)

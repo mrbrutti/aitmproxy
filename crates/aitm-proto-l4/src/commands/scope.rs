@@ -16,6 +16,69 @@ use aitm_core::{
 use crate::guard::L4Guard;
 use crate::types::{L4ScopeEntry, L4ScopeId, L4ScopeSource, RateCap};
 
+/// Proof that a present human confirmed an `l4.scope.add` (spec §3, fork (ii)).
+///
+/// A zero-sized token [`L4Guard::add_operator_scope`] demands. Its only constructor
+/// is private to this module, so the one place that can mint it is
+/// [`ScopeAdd::invoke`] on the trusted-control branch — after the MCP server's
+/// confirm-over-the-wire handshake (`Frontend::Operator`) or the CLI's `Confirmer`
+/// (`Frontend::Cli`) has asked the human. Rhai, the PoC `l4:` step and every other
+/// in-process caller cannot name a value of this type, so they cannot reach the
+/// ungated path: the compiler enforces it, not a source grep.
+pub struct OperatorConfirmed(());
+
+impl OperatorConfirmed {
+    /// Mint the proof. Reachable only from this module (see the type docs).
+    pub(in crate::commands::scope) fn new() -> Self {
+        Self(())
+    }
+
+    /// A proof for **unit tests of the guard** (absent from every non-test build, so
+    /// the production invariant — only this module mints one — is untouched).
+    #[cfg(test)]
+    pub(crate) fn test_only() -> Self {
+        Self(())
+    }
+}
+
+/// The wide-range threshold the confirm prompt warns below: a prefix shorter than
+/// `/16` (IPv4) or `/48` (IPv6) covers more than one operator usually means.
+fn wide_range_warning(cidr: &crate::types::IpCidr) -> Option<String> {
+    let floor: u8 = if cidr.addr.is_ipv4() { 16 } else { 48 };
+    (cidr.prefix < floor).then(|| format!(" WARNING: /{} is a wide range.", cidr.prefix))
+}
+
+/// The operator confirm prompt for a parsed entry (spec §3): capability, cidr, ports
+/// (`all ports` for the full range), interface, direction and the inject rate
+/// (`inject refused (rate 0)` when 0), the denylist rule, and how to proceed.
+fn confirm_prompt_for(entry: &L4ScopeEntry) -> String {
+    let ports = if entry.ports.lo == 0 && entry.ports.hi == 65535 {
+        "all ports".to_string()
+    } else {
+        format!("ports {}", super::ports_to_string(&entry.ports))
+    };
+    let rate = if entry.inject_rate.pps == 0 {
+        "inject refused (rate 0)".to_string()
+    } else {
+        format!(
+            "inject rate {}pps/{}burst",
+            entry.inject_rate.pps, entry.inject_rate.burst
+        )
+    };
+    let mut prompt = format!(
+        "Confirm l4.scope.add: {} scope for {} {ports} on {} ({}), {rate}. A runtime entry \
+         never lifts the dangerous-destination denylist. Re-issue with `_confirm` to add.",
+        super::capability_to_string(entry.capability),
+        super::cidr_to_string(&entry.cidr),
+        entry.interface,
+        super::direction_to_string(entry.direction),
+    );
+    if let Some(warning) = wide_range_warning(&entry.cidr) {
+        prompt.push_str(&warning);
+    }
+    prompt
+}
+
 /// `l4.scope.add {..}` → add a scope entry; returns its minted id.
 pub struct ScopeAdd {
     guard: Arc<L4Guard>,
@@ -25,8 +88,9 @@ impl ScopeAdd {
     /// A command over the shared guard. The SEC-2 widen gate (reading the shared
     /// [`L4AgentGates`](crate::gates::L4AgentGates) **widen** gate, so
     /// `l4.agent.set {capability:"widen"}` governs it live) and the forced
-    /// `source = Runtime` both live in [`L4Guard::add_runtime_scope`], so the command
-    /// is a thin wrapper and carries no gate of its own.
+    /// `source = Runtime` both live in the guard ([`L4Guard::add_runtime_scope`] for
+    /// an agent, [`L4Guard::add_operator_scope`] for a confirmed operator), so the
+    /// command is a thin wrapper and carries no gate of its own.
     pub fn new(guard: Arc<L4Guard>) -> Self {
         Self { guard }
     }
@@ -99,18 +163,42 @@ impl Command for ScopeAdd {
         }
     }
 
-    fn invoke(&self, args: Params, _host: &CommandHost) -> anyhow::Result<Value> {
-        // Deny-by-default widening is enforced in the guard: `add_runtime_scope`
-        // refuses with the typed `L4GuardError::ScopeWideningDisabled` (adding nothing)
-        // when the shared **widen** gate is off, and forces `source = Runtime`. Keeping
-        // the gate in the guard (not this command) is SEC-2: no second in-process
-        // caller of the shared guard can bypass it, and an operator `l4.agent.set`
-        // flips the very gate the guard reads.
+    /// Always `Some` (spec §3): with valid arguments it summarises the entry, with
+    /// missing or invalid ones it names the error — so `tools/list`, which probes
+    /// with no arguments, reports `confirmable: true` and every UI renders its add
+    /// control. The MCP server offers the handshake only to `Frontend::Operator`
+    /// and the CLI asks its `Confirmer`; an agent is never handed one.
+    fn confirm_prompt(&self, args: &Params) -> Option<String> {
+        Some(match entry_from_params(args) {
+            Ok(entry) => confirm_prompt_for(&entry),
+            Err(e) => format!(
+                "Confirm l4.scope.add: add an L4 scope entry ({e:#}). Re-issue with \
+                 `_confirm` to add."
+            ),
+        })
+    }
+
+    fn invoke(&self, args: Params, host: &CommandHost) -> anyhow::Result<Value> {
         let entry = entry_from_params(&args)?;
-        let id = self
-            .guard
-            .add_runtime_scope(entry)
-            .map_err(anyhow::Error::new)?;
+        let id = if host.caller_is_trusted_control() {
+            // A present human (operator over the bus, or the CLI) has already been
+            // asked through `confirm_prompt` — the server's confirm-over-the-wire
+            // handshake or the CLI `Confirmer` — so the agent **widen** gate does
+            // not apply (spec §3, fork (ii)). The proof is mintable only here.
+            self.guard
+                .add_operator_scope(entry, OperatorConfirmed::new())
+        } else {
+            // Everyone else (an agent over MCP, including one approved under `Ask`):
+            // deny-by-default widening is enforced in the guard. `add_runtime_scope`
+            // refuses with the typed `L4GuardError::ScopeWideningDisabled` (adding
+            // nothing) when the shared **widen** gate is off. Keeping the gate in the
+            // guard (not this command) is SEC-2: no second in-process caller of the
+            // shared guard can bypass it, and an operator `l4.agent.set` flips the
+            // very gate the guard reads.
+            self.guard
+                .add_runtime_scope(entry)
+                .map_err(anyhow::Error::new)?
+        };
         Ok(Value::Str(super::scope_id_to_string(id)))
     }
 }
@@ -226,8 +314,9 @@ fn entry_from_params(args: &Params) -> anyhow::Result<L4ScopeEntry> {
         direction,
         capability,
         inject_rate: RateCap { pps, burst },
-        // Provenance is set here for completeness, but `L4Guard::add_runtime_scope`
-        // re-forces `source = Runtime` at the boundary — a runtime add can never mint
+        // Provenance is set here for completeness, but the guard re-forces
+        // `source = Runtime` at the boundary (both add paths end in its private
+        // `push_runtime`) — a runtime add, operator-confirmed or not, can never mint
         // operator (`Config`) provenance and so can never lift the denylist.
         source: L4ScopeSource::Runtime,
     })
@@ -346,6 +435,131 @@ mod tests {
             source.description.contains("config") && source.description.contains("runtime"),
             "the description names both provenances, got {}",
             source.description
+        );
+    }
+
+    fn params(pairs: &[(&str, Value)]) -> Params {
+        Params::new(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    fn ac5_params() -> Vec<(&'static str, Value)> {
+        vec![
+            ("cidr", Value::Str("127.0.0.1/32".into())),
+            ("ports", Value::Str("9100-9199".into())),
+            ("interface", Value::Str("lo0".into())),
+            ("direction", Value::Str("inbound".into())),
+            ("capability", Value::Str("capture".into())),
+        ]
+    }
+
+    fn scope_add() -> ScopeAdd {
+        ScopeAdd::new(Arc::new(L4Guard::new(&L4Config::default())))
+    }
+
+    /// Spec §3 / plan A6: `confirm_prompt` is `Some` even with empty args, so
+    /// `tools/list` (which probes with `Params::default()`) reports `confirmable:
+    /// true` and every UI renders its scope-add control.
+    #[test]
+    fn confirm_prompt_some_for_empty_args() {
+        let prompt = scope_add()
+            .confirm_prompt(&Params::default())
+            .expect("l4.scope.add is always confirmable");
+        assert!(
+            prompt.starts_with("Confirm l4.scope.add: add an L4 scope entry ("),
+            "the no-args prompt names the verb and the missing-arg error, got: {prompt}"
+        );
+        assert!(
+            prompt.ends_with("Re-issue with `_confirm` to add."),
+            "the prompt tells the operator how to proceed, got: {prompt}"
+        );
+    }
+
+    /// L4PAR-AC5: with the AC5 arguments the prompt summarises the entry — it names
+    /// the cidr, ports, interface, direction and capability, and the denylist rule.
+    #[test]
+    fn confirm_prompt_summarises_entry() {
+        let prompt = scope_add()
+            .confirm_prompt(&params(&ac5_params()))
+            .expect("valid args are confirmable");
+        assert_eq!(
+            prompt,
+            "Confirm l4.scope.add: capture scope for 127.0.0.1/32 ports 9100-9199 on lo0 \
+             (inbound), inject refused (rate 0). A runtime entry never lifts the \
+             dangerous-destination denylist. Re-issue with `_confirm` to add."
+        );
+        for word in ["127.0.0.1/32", "9100-9199", "lo0", "inbound", "capture"] {
+            assert!(
+                prompt.contains(word),
+                "prompt must contain `{word}`: {prompt}"
+            );
+        }
+    }
+
+    /// L4PAR-AC5 (unit): ports omitted ⇒ `all ports`; `inject_rate_pps: 0` ⇒
+    /// `inject refused (rate 0)`; a non-zero rate is spelled out; a prefix shorter
+    /// than /16 (IPv4) or /48 (IPv6) appends the wide-range warning, /16 and /48
+    /// themselves do not.
+    #[test]
+    fn confirm_prompt_variants() {
+        let cmd = scope_add();
+        let prompt_for = |overrides: &[(&str, Value)]| -> String {
+            let mut p = ac5_params();
+            p.retain(|(k, _)| !overrides.iter().any(|(ok, _)| ok == k) && *k != "ports");
+            p.extend(overrides.iter().cloned());
+            cmd.confirm_prompt(&params(&p))
+                .expect("valid args are confirmable")
+        };
+
+        // Ports omitted.
+        let p = prompt_for(&[]);
+        assert!(p.contains(" all ports on lo0 "), "got: {p}");
+        assert!(!p.contains("0-65535"), "got: {p}");
+
+        // Rate 0 (explicit) ⇒ refused.
+        let p = prompt_for(&[
+            ("inject_rate_pps", Value::Int(0)),
+            ("inject_rate_burst", Value::Int(0)),
+        ]);
+        assert!(p.contains("inject refused (rate 0)"), "got: {p}");
+
+        // A real rate is spelled out as pps/burst.
+        let p = prompt_for(&[
+            ("inject_rate_pps", Value::Int(50)),
+            ("inject_rate_burst", Value::Int(200)),
+        ]);
+        assert!(p.contains("inject rate 50pps/200burst"), "got: {p}");
+        assert!(!p.contains("refused"), "got: {p}");
+
+        // Wide IPv4 prefix ⇒ warning; /16 exactly does not warn.
+        let p = prompt_for(&[("cidr", Value::Str("10.0.0.0/8".into()))]);
+        assert!(p.contains("WARNING: /8 is a wide range"), "got: {p}");
+        assert!(
+            p.ends_with("Re-issue with `_confirm` to add. WARNING: /8 is a wide range."),
+            "got: {p}"
+        );
+        let p = prompt_for(&[("cidr", Value::Str("10.0.0.0/16".into()))]);
+        assert!(!p.contains("WARNING"), "got: {p}");
+
+        // Wide IPv6 prefix ⇒ warning; /48 exactly does not warn.
+        let p = prompt_for(&[("cidr", Value::Str("2001:db8::/32".into()))]);
+        assert!(p.contains("WARNING: /32 is a wide range"), "got: {p}");
+        let p = prompt_for(&[("cidr", Value::Str("2001:db8::/48".into()))]);
+        assert!(!p.contains("WARNING"), "got: {p}");
+
+        // Invalid args still confirmable, naming the error (so tools/list is static).
+        let p = cmd
+            .confirm_prompt(&params(&[("cidr", Value::Str("nonsense".into()))]))
+            .expect("invalid args are still confirmable");
+        assert!(
+            p.starts_with(
+                "Confirm l4.scope.add: add an L4 scope entry (bad CIDR address `nonsense`"
+            ),
+            "got: {p}"
         );
     }
 }

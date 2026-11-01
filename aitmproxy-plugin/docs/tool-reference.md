@@ -48,14 +48,17 @@ know about the family:
   carries `bytes` only while the agent's Capture gate is open, an authored
   packet (`injected: true`) only while its Inject gate is open. A packet the
   caller may not read keeps every other field and simply has no `bytes` key.
-- `l4.scope.add` at runtime is refused (`runtime L4 scope widening is
+- `l4.scope.add` from an agent is refused (`runtime L4 scope widening is
   disabled; declare scope in the l4.scope config …`) unless the Widen gate
-  (`l4.agent.set --capability widen --allowed true`) is open, for every caller
-  including the operator; only `config.yaml` scope entries bypass it. The
-  operator-confirmed scope add (a confirm prompt, `confirmable: true` in
-  `tools/list`, no Widen gate for a confirmed operator or CLI call) is not on
-  `main` yet: it ships with unit (a') of the L4 parity fixes, pending Matt's
-  decision on fork (ii) of that spec.
+  (`l4.agent.set --capability widen --allowed true`) is open. The operator and
+  the CLI are not Widen-gated: `l4.scope.add` is confirmable (`confirmable:
+  true` in `tools/list`); an operator call answers `needs_confirmation` with a
+  prompt summarising the entry (cidr, ports or `all ports`, interface,
+  direction, capability, inject rate or `inject refused (rate 0)`, and a
+  `WARNING` for a prefix wider than /16 or /48) and proceeds when re-issued
+  with `_confirm`; the CLI asks its confirmer unless `--yes`. The entry is
+  stored with `source: runtime` and never lifts the dangerous-destination
+  denylist; only `config.yaml` entries can.
 
 ## `flow.*`
 

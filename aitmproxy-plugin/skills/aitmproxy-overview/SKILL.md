@@ -106,15 +106,18 @@ the core runs.
 
 **Scope and the agent gates.** L4 scope is separate from HTTP scope.
 `l4.scope.list` shows the entries, each with `source: config | runtime`; scope is
-normally declared in `config.yaml`. Runtime `l4.scope.add` is refused for every
-caller (`runtime L4 scope widening is disabled; declare scope in the l4.scope
-config …`) unless the operator opened the Widen gate with
-`l4.agent.set {capability: widen, allowed: true}`. The operator-confirmed
-`l4.scope.add` (a confirm prompt, no Widen gate for a confirmed operator or CLI
-call, still refused to an agent) is designed but not shipped yet (unit (a') of
-the L4 parity fixes); until it lands, ask the operator to declare the entry in
-config or to open the Widen gate. Narrowing with `l4.scope.remove` is never
-Widen-gated (agent policy still applies). Four per-capability gates govern the
+normally declared in `config.yaml`. A runtime `l4.scope.add` from an agent is refused
+(`runtime L4 scope widening is disabled; declare scope in the l4.scope config
+…`) unless the operator opened the Widen gate with
+`l4.agent.set {capability: widen, allowed: true}`. The operator adds scope
+without the Widen gate: an operator (or CLI) `l4.scope.add` is a confirmed
+call (`confirmable: true` in `tools/list`; the core answers
+`needs_confirmation` with a prompt summarising the entry, and the operator
+re-issues it with `_confirm`); the entry is stored with `source: runtime` and
+never lifts the dangerous-destination denylist. An agent is never offered that
+handshake, so ask the operator to add the entry (or to open the Widen gate).
+Narrowing with `l4.scope.remove` is never Widen-gated (agent policy still
+applies). Four per-capability gates govern the
 agent path: `inject`, `capture`, `intercept` and `widen`. `l4.agent.status`
 reads them; only the operator can flip them with `l4.agent.set`. The agent can
 never open its own gates; respect a closed one.

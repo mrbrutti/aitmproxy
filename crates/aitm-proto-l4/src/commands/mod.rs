@@ -219,7 +219,7 @@ pub(crate) fn parse_cidr(s: &str) -> anyhow::Result<IpCidr> {
 }
 
 /// `addr/prefix` for display / round-trip.
-fn cidr_to_string(cidr: &IpCidr) -> String {
+pub(crate) fn cidr_to_string(cidr: &IpCidr) -> String {
     format!("{}/{}", cidr.addr, cidr.prefix)
 }
 
@@ -289,7 +289,7 @@ pub(crate) fn parse_ports(s: &str) -> anyhow::Result<PortRange> {
 }
 
 /// `lo-hi` for display / round-trip.
-fn ports_to_string(ports: &PortRange) -> String {
+pub(crate) fn ports_to_string(ports: &PortRange) -> String {
     format!("{}-{}", ports.lo, ports.hi)
 }
 
