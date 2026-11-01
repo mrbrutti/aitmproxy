@@ -364,4 +364,65 @@ mod tests {
         let lane = crate::lane().expect("the lane slot is filled");
         assert_eq!(lane.lane(), LaneKind::Ws);
     }
+
+    // --- The redaction rule, swept over the whole catalogue (tester) -----
+    //
+    // Each check file asserts its own vulnerable case is scrubbed. This runs
+    // *every* check against *every* discovered point of the fixture — whose
+    // handshake carries `Cookie: sid=s3cr3t-cookie` — against a server that
+    // echoes whatever it is given, and greps the `Debug` of every verdict and
+    // every insertion point. A ninth check added without its own assertion is
+    // caught here.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_verdict_or_point_of_any_check_carries_the_captured_cookie() {
+        use crate::testing::{echo_handler, ws_server};
+
+        let (transport, _log) = ws_server(None, echo_handler);
+        // A short reply window: this test greps text, it does not time anything.
+        let job = TestJob::with(4096, |profile| {
+            profile.ws.reply_window_ms = 40;
+        });
+        let store = job.store();
+        let (handshake, ws) = captured_conversation();
+        store.insert(Flow::Http(handshake));
+        store.insert(Flow::WebSocket(ws));
+        let lane = WsLane::new(Arc::new(WsDialer::new(transport)));
+
+        let found = lane
+            .discover(&job.profile().target, &*job)
+            .await
+            .expect("discovery over the fixture");
+        assert_eq!(found.points.len(), 6, "the fixture's six points");
+
+        let mut verdicts = 0usize;
+        for found_point in &found.points {
+            let shown = format!("{found_point:?}");
+            assert!(
+                !shown.contains("s3cr3t-cookie"),
+                "a discovered point leaked the cookie: {shown}"
+            );
+            for check in lane.checks() {
+                let host = lane
+                    .probe_host_for(found_point, job.clone())
+                    .expect("every discovered point is hostable");
+                let verdict = check.run(found_point, host.as_ref()).await;
+                let shown = format!("{verdict:?}");
+                assert!(
+                    !shown.contains("s3cr3t-cookie"),
+                    "{} @ {} leaked the cookie: {shown}",
+                    check.meta().id,
+                    found_point.name
+                );
+                assert!(
+                    !shown.contains("aitm-pad"),
+                    "{} @ {} leaked the pad sentinel: {shown}",
+                    check.meta().id,
+                    found_point.name
+                );
+                verdicts += 1;
+            }
+        }
+        assert_eq!(verdicts, 48, "eight checks over six points");
+    }
 }

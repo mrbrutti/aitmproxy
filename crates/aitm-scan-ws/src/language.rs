@@ -849,14 +849,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use aitm_core::{CallerTrust, ScopeEntry, ScopeRateGuard, StdGuard};
-    use aitm_plugin::language::ProtocolLanguage;
+    use aitm_core::{CallerTrust, ScopeEntry, ScopeRateGuard, StdGuard, Value};
+    use aitm_plugin::language::{
+        GuardHandle, HostCallContextSource, HostCallCtx, HostError, ProtocolLanguage,
+    };
     use aitm_plugin_rhai::config::RhaiLimits;
     use aitm_plugin_rhai::engine::build_engine_with_languages;
     use aitm_plugin_rhai::host_registry::seed_call_context;
     use rhai::{Blob, Dynamic, Engine, Map};
 
-    use super::{clamp_timeout, WsLanguage};
+    use super::{clamp_timeout, WsLanguage, WsSeamGuard};
     use crate::dialer::WsDialer;
     use crate::testing::{echo_handler, ws_server, DuplexTransport, ServerLog};
     use crate::transport::WsTransport;
@@ -1055,6 +1057,161 @@ mod tests {
         assert_eq!(
             transport.connects(),
             vec![("127.0.0.1".to_string(), 8443, true, "127.0.0.1".to_string())]
+        );
+    }
+    // --- Refusals the `ws.*` surface owes an operator (tester, stage 5) ---
+    //
+    // The namespace is deny-by-default: a url it does not understand, a header
+    // the dialer regenerates, a handle that is not open and a verb that is not
+    // one of the four must each come back as an error naming the reason, never
+    // as a silent no-op or a connection.
+
+    /// The text of an error a one-line script produced, with no socket opened.
+    fn refusal(script: &str) -> String {
+        let (engine, transport, _log) = engine_over(scoped_guard());
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+        let err = engine
+            .eval::<Dynamic>(script)
+            .expect_err("the script must be refused");
+        assert_eq!(
+            transport.connects(),
+            Vec::new(),
+            "a refused call may not open a socket: {script}"
+        );
+        err.to_string()
+    }
+
+    #[test]
+    fn a_non_websocket_scheme_is_bad_args() {
+        for url in [
+            "http://127.0.0.1:8080/ws",
+            "file:///etc/passwd",
+            "",
+            "wss:/",
+        ] {
+            let text = refusal(&format!(r#"ws.dial(#{{ url: "{url}" }})"#));
+            assert!(
+                text.contains("ws.dial needs a ws:// or wss:// url"),
+                "unexpected refusal for {url}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dial_without_a_url_is_bad_args() {
+        let text = refusal(r#"ws.dial(#{ headers: #{ "X": "1" } })"#);
+        assert!(
+            text.to_lowercase().contains("bad arguments"),
+            "unexpected refusal: {text}"
+        );
+    }
+
+    #[test]
+    fn a_script_may_not_set_a_regenerated_header() {
+        // A replayed key would make `Sec-WebSocket-Accept` meaningless and a
+        // forged Host would lie about the authority the guard just admitted.
+        for header in [
+            "Sec-WebSocket-Key",
+            "host",
+            "Upgrade",
+            "Connection",
+            "Sec-WebSocket-Version",
+            "Sec-WebSocket-Accept",
+        ] {
+            let text = refusal(&format!(
+                r#"ws.dial(#{{ url: "ws://127.0.0.1:8080/ws", headers: #{{ "{header}": "x" }} }})"#
+            ));
+            assert!(
+                text.contains("is regenerated for every dial and cannot be set by a script"),
+                "unexpected refusal for {header}: {text}"
+            );
+            assert!(
+                text.contains(header),
+                "the refusal must name the header: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_string_header_value_is_refused_without_quoting_it() {
+        let text =
+            refusal(r#"ws.dial(#{ url: "ws://127.0.0.1:8080/ws", headers: #{ "X-N": 1 } })"#);
+        assert!(
+            text.contains("the value of header X-N must be a string"),
+            "unexpected refusal: {text}"
+        );
+    }
+
+    #[test]
+    fn recv_and_close_on_an_unknown_handle_are_bad_args() {
+        for script in ["ws.recv(42, 10)", "ws.close(42)"] {
+            let text = refusal(script);
+            assert!(
+                text.contains("no open websocket handle 42"),
+                "unexpected refusal for {script}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_seam_guard_admits_the_four_verbs_and_nothing_else() {
+        /// The minimum a `HostCallCtx` needs: no tag, a named origin.
+        struct NoTag;
+        impl HostCallContextSource for NoTag {
+            fn tag(&self) -> Option<Value> {
+                None
+            }
+            fn call_source(&self) -> &str {
+                "tester"
+            }
+        }
+
+        let guard = WsSeamGuard;
+        assert_eq!(guard.guard_name(), "ws");
+        let source = NoTag;
+        let ctx = HostCallCtx::new(CallerTrust::Operator, &source);
+        for verb in ["dial", "send", "recv", "close"] {
+            assert!(guard.permit(&ctx, verb).is_ok(), "{verb} must be admitted");
+        }
+        match guard.permit(&ctx, "exec") {
+            Err(HostError::GuardRefused { namespace, reason }) => {
+                assert_eq!(namespace, "ws");
+                assert_eq!(reason, "`exec` is not a `ws` verb");
+            }
+            other => panic!("a verb outside the namespace must be refused, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_refused_upgrade_is_reported_with_its_status() {
+        // The `Err` half is tungstenite's own `ErrorResponse`; the
+        // `HandshakeDecision` contract fixes it, so it cannot be boxed away.
+        #[allow(clippy::result_large_err)]
+        let decide: crate::testing::HandshakeDecision = Arc::new(|_request| {
+            let mut response =
+                tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(None);
+            *response.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+            Err(response)
+        });
+        let (transport, _log) = ws_server(Some(decide), echo_handler);
+        let dialer = Arc::new(WsDialer::new(Arc::clone(&transport) as Arc<dyn WsTransport>));
+        let language = WsLanguage::new(scoped_guard(), dialer);
+        let engine = build_engine_with_languages(
+            &RhaiLimits::default(),
+            Duration::from_secs(2),
+            &[&language],
+        )
+        .expect("the ws language installs");
+        let _seed = seed_call_context(CallerTrust::Operator, None, None);
+
+        let err = engine
+            .eval::<Dynamic>(r#"ws.dial(#{ url: "ws://127.0.0.1:8080/ws" })"#)
+            .expect_err("a script that asked for a connection did not get one");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("upgrade refused with status 401"),
+            "unexpected error: {text}"
         );
     }
 }

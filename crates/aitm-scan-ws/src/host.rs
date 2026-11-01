@@ -1132,4 +1132,328 @@ mod tests {
             "the window ended on the peer's Close, not on a read error: {frames:?}"
         );
     }
+
+    // --- Specs and frames that do not fit (tester, stage 5) --------------
+    //
+    // `WsProbeHost::new`'s three refusals and the three ways a frame can fail
+    // to leave. The documented reason for all of them is the same: a probe
+    // that silently sends nothing reads to a check as a clean target, so each
+    // one must be an `Err` the check turns into `Inconclusive`, or a response
+    // that carries no reply.
+
+    use aitm_core::{WsMessage, WsOpcode};
+
+    use crate::types::{Locator, PointSpec};
+
+    /// The message of a `WsProbeHost::new` that was expected to refuse.
+    ///
+    /// `WsProbeHost` deliberately has no `Debug` (nothing about a probe host
+    /// may be printed), so `expect_err` cannot be used on its constructor.
+    fn build_error(built: anyhow::Result<WsProbeHost>, why: &str) -> String {
+        match built {
+            Ok(_) => panic!("{why}"),
+            Err(err) => err.to_string(),
+        }
+    }
+
+    /// A host over the fixture built straight from `spec`, bypassing discovery.
+    fn host_with_spec(
+        spec_of: impl FnOnce(&aitm_core::HttpFlow, &aitm_core::WsFlow) -> PointSpec,
+        edit_ws: impl FnOnce(&mut aitm_core::WsFlow),
+        job: &Arc<TestJob>,
+        transport: Arc<DuplexTransport>,
+    ) -> anyhow::Result<WsProbeHost> {
+        let (handshake, mut ws) = captured_conversation();
+        edit_ws(&mut ws);
+        let spec = spec_of(&handshake, &ws);
+        let point = crate::testing::point(
+            aitm_scan_model::InsertionKind::WsJsonValue,
+            "msg",
+            Some("msg"),
+            spec.clone(),
+        );
+        WsProbeHost::new(
+            point,
+            spec,
+            handshake,
+            ws,
+            Arc::new(WsDialer::new(transport as Arc<dyn WsTransport>)),
+            Arc::clone(job) as Arc<dyn JobCtx>,
+        )
+    }
+
+    #[test]
+    fn a_spec_naming_a_server_frame_is_rejected() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+
+        // Message 2 of the fixture is the server's reply.
+        let built = host_with_spec(
+            |handshake, ws| PointSpec {
+                ws_flow: ws.id,
+                handshake: handshake.id,
+                frame_index: Some(2),
+                locator: Locator::JsonPath("echo".to_string()),
+            },
+            |_| {},
+            &job,
+            transport,
+        );
+
+        assert_eq!(
+            build_error(built, "only client->server frames can be re-sent"),
+            "frame 2 is not a client->server frame; only those are re-sent"
+        );
+    }
+
+    #[test]
+    fn a_spec_past_the_end_of_the_conversation_is_rejected() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+
+        let built = host_with_spec(
+            |handshake, ws| PointSpec {
+                ws_flow: ws.id,
+                handshake: handshake.id,
+                frame_index: Some(99),
+                locator: Locator::JsonPath("msg".to_string()),
+            },
+            |_| {},
+            &job,
+            transport,
+        );
+
+        assert_eq!(
+            build_error(built, "a frame index must address a captured frame"),
+            "frame 99 is past the end of the captured conversation"
+        );
+    }
+
+    #[test]
+    fn a_frame_locator_without_an_index_is_rejected() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+
+        let built = host_with_spec(
+            |handshake, ws| PointSpec {
+                ws_flow: ws.id,
+                handshake: handshake.id,
+                frame_index: None,
+                locator: Locator::JsonPath("msg".to_string()),
+            },
+            |_| {},
+            &job,
+            transport,
+        );
+
+        assert_eq!(
+            build_error(built, "a point inside a frame needs its frame"),
+            "a point inside a frame needs the index of the frame it was found in"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_json_path_that_is_not_in_the_frame_errs_before_any_dial() {
+        let (transport, log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+        let host = host_with_spec(
+            |handshake, ws| PointSpec {
+                ws_flow: ws.id,
+                handshake: handshake.id,
+                frame_index: Some(1),
+                locator: Locator::JsonPath("gone".to_string()),
+            },
+            |_| {},
+            &job,
+            transport,
+        )
+        .expect("the spec itself is well formed; only the path is wrong");
+
+        let err = host
+            .probe(&text("X", PayloadMode::Replace))
+            .await
+            .expect_err("a payload that cannot be placed is never sent");
+
+        assert!(
+            err.to_string().contains("gone"),
+            "the error must name the path it could not find: {err}"
+        );
+        assert_eq!(log.connections(), 0, "nothing is dialled for a dead point");
+        assert_eq!(job.charged(), 0, "nothing is charged for a dead point");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capture_with_no_client_frame_still_dials_the_handshake() {
+        // The empty-conversation case: a capture whose only message came from
+        // the server. The handshake point has no frame to replay, so the probe
+        // is a bare upgrade — and must still be a `ProbeResponse`, not an error.
+        let (transport, log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+        let host = host_with_spec(
+            |handshake, ws| PointSpec {
+                ws_flow: ws.id,
+                handshake: handshake.id,
+                frame_index: None,
+                locator: Locator::HandshakeHeader("origin".to_string()),
+            },
+            |ws| {
+                ws.messages
+                    .retain(|message| message.dir == WsDir::ServerToClient)
+            },
+            &job,
+            transport,
+        )
+        .expect("a handshake point needs no frame");
+
+        let response = host
+            .probe(&text("https://attacker.invalid", PayloadMode::Replace))
+            .await
+            .expect("a handshake-only probe is a conversation like any other");
+
+        assert_eq!(response.status, Some(101));
+        assert!(response.body.is_empty(), "{:?}", response.body);
+        assert_eq!(log.received(), Vec::<Vec<u8>>::new(), "no frame was sent");
+        assert_eq!(log.connections(), 1);
+        assert_eq!(job.charged(), 1, "one unit for the dial and no frames");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_profile_frame_cap_bounds_reads_not_writes() {
+        // Observed, and pinned so a change is noticed: `DialLimits` becomes
+        // tungstenite's `max_frame_size`/`max_message_size`, and tungstenite
+        // 0.28 applies those to *incoming* frames only. A probe payload
+        // therefore goes out at whatever length the check asked for, while the
+        // server's answer above the cap ends the collection as a transport end
+        // (plan call 18) rather than being delivered. The only thing that
+        // bounds an outgoing frame today is the oversize check's pad target.
+        let (transport, log) = ws_server(None, echo_handler);
+        let job = TestJob::with(100, |profile| {
+            profile.ws.max_frame_bytes = 64;
+        });
+        let host = host_with_spec(
+            |handshake, ws| PointSpec {
+                ws_flow: ws.id,
+                handshake: handshake.id,
+                frame_index: Some(0),
+                locator: Locator::WholeText,
+            },
+            |ws| {
+                ws.messages.truncate(1);
+            },
+            &job,
+            transport,
+        )
+        .expect("the spec addresses the one client frame");
+
+        let response = host
+            .probe(&text(&"B".repeat(4096), PayloadMode::Replace))
+            .await
+            .expect("a frame the read limit refuses is data, not an error");
+
+        assert_eq!(
+            log.received().iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![4096],
+            "the write is not bounded by the profile cap"
+        );
+        assert_eq!(response.status, Some(101));
+        assert_eq!(
+            response.body,
+            Vec::<u8>::new(),
+            "the 4101-byte echo is above the 64-byte read limit and is dropped"
+        );
+        assert_eq!(
+            response.ws_frames.as_ref().map(|frames| frames
+                .iter()
+                .filter(|frame| frame.kind == FrameKind::Text)
+                .count()),
+            Some(0),
+            "no text frame survives the read limit: {:?}",
+            response.ws_frames
+        );
+        assert_eq!(job.charged(), 2, "the dial and the frame");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_non_utf8_text_prerequisite_ends_the_conversation_as_data() {
+        // A captured Text frame whose bytes are not UTF-8 cannot be replayed
+        // (RFC 6455 section 5.6). The conversation stops there and returns what
+        // arrived, so a check reads "no reply", never a crash.
+        let (transport, log) = ws_server(None, echo_handler);
+        let job = TestJob::new(100);
+        let host = host_with_spec(
+            |handshake, ws| PointSpec {
+                ws_flow: ws.id,
+                handshake: handshake.id,
+                frame_index: Some(1),
+                locator: Locator::JsonPath("msg".to_string()),
+            },
+            |ws| {
+                ws.messages[0] = WsMessage {
+                    dir: WsDir::ClientToServer,
+                    opcode: WsOpcode::Text,
+                    data: vec![0xff, 0xfe, 0xfd],
+                    timestamp: ws.messages[0].timestamp,
+                    injected: false,
+                };
+            },
+            &job,
+            transport,
+        )
+        .expect("the spec is well formed; the captured bytes are not");
+
+        let response = host
+            .probe(&text("X", PayloadMode::Replace))
+            .await
+            .expect("an unsendable prerequisite is data, not an error");
+
+        assert_eq!(response.status, Some(101));
+        assert_eq!(
+            log.received(),
+            Vec::<Vec<u8>>::new(),
+            "the bad prerequisite stops the replay before the mutated frame"
+        );
+        assert_eq!(
+            response.ws_frames.as_ref().map(|frames| frames
+                .iter()
+                .filter(|frame| frame.kind == FrameKind::Text)
+                .count()),
+            Some(0),
+            "nothing was echoed: {:?}",
+            response.ws_frames
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_during_the_reply_window_returns_what_arrived() {
+        // Cancellation mid-collect, not before the dial: the probe must come
+        // back well inside the window with the frames it already had.
+        let (transport, _log) = ws_server(None, echo_handler);
+        let job = TestJob::with(100, |profile| {
+            profile.ws.reply_window_ms = 10_000;
+        });
+        let host = host_for("msg", &job, transport);
+        let cancel_job = Arc::clone(&job);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            cancel_job.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let response = host
+            .probe(&text("X", PayloadMode::Replace))
+            .await
+            .expect("a cancel after the dial returns what arrived");
+        let took = started.elapsed();
+
+        assert!(
+            took < std::time::Duration::from_secs(5),
+            "a cancelled collect must not wait out a 10 s window, took {took:?}"
+        );
+        assert_eq!(response.status, Some(101));
+        assert_eq!(
+            response.body,
+            br#"echo:{"msg":"X","user":"bob"}"#.to_vec(),
+            "the frames already collected are kept"
+        );
+    }
 }

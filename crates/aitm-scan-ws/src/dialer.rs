@@ -955,6 +955,7 @@ mod tests {
     use aitm_scan_model::{Frame, FrameKind};
     use bytes::Bytes;
     use futures::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
     use tokio_tungstenite::tungstenite::handshake::server::{
         create_response, ErrorResponse, Request,
@@ -1468,5 +1469,263 @@ mod tests {
             "the refusal must be immediate, took {waited:?}"
         );
         assert_eq!(transport.connects().len(), 1);
+    }
+
+    // --- Malformed upgrade responses (tester, stage 5) -------------------
+    //
+    // `dial_request` parses the 101 head by hand (plan call 28), so the parser
+    // is this crate's own code and the server it has to survive is hostile, not
+    // tungstenite. These drive raw bytes straight at the dialer through a bare
+    // `DuplexTransport`: every one of them must come back as a `DialError`,
+    // never a hang, a panic or an unbounded buffer.
+
+    /// A transport whose server half writes `bytes` once and then holds the
+    /// socket open, so the dialer's own bound is what ends the read.
+    fn raw_server(bytes: Vec<u8>) -> Arc<crate::testing::DuplexTransport> {
+        crate::testing::DuplexTransport::new(move |mut server| {
+            let bytes = bytes.clone();
+            tokio::spawn(async move {
+                // The dialer writes its request first; read it so the duplex
+                // buffer cannot fill and stall the write.
+                let mut sink = [0u8; 4096];
+                let _ = server.read(&mut sink).await;
+                let _ = server.write_all(&bytes).await;
+                let _ = server.flush().await;
+                // Hold the half open: an EOF here would be a different error.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        })
+    }
+
+    /// A transport whose server half writes `bytes` and then drops the socket.
+    fn raw_server_then_eof(bytes: Vec<u8>) -> Arc<crate::testing::DuplexTransport> {
+        crate::testing::DuplexTransport::new(move |mut server| {
+            let bytes = bytes.clone();
+            tokio::spawn(async move {
+                let mut sink = [0u8; 4096];
+                let _ = server.read(&mut sink).await;
+                let _ = server.write_all(&bytes).await;
+                let _ = server.shutdown().await;
+            });
+        })
+    }
+
+    /// Dial the fixture through `transport` and return the error it produced.
+    async fn dial_error(transport: Arc<crate::testing::DuplexTransport>) -> DialError {
+        let dialer = WsDialer::new(transport as Arc<_>);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                soon(),
+                DialLimits::default(),
+            )
+            .await
+            .expect_err("a malformed upgrade response is never an upgrade")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_head_that_never_ends_is_bounded_at_sixteen_kibibytes() {
+        // 40 KiB of well-formed header lines and no `\r\n\r\n` anywhere: the
+        // read has to stop at MAX_HEAD_BYTES instead of buffering the stream.
+        let mut head = b"HTTP/1.1 101 Switching Protocols\r\n".to_vec();
+        while head.len() < 40 * 1024 {
+            head.extend_from_slice(b"x-filler: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+        }
+
+        let err = dial_error(raw_server(head)).await;
+
+        match err {
+            DialError::Handshake(text) => assert_eq!(
+                text, "the upgrade response head exceeded 16384 bytes",
+                "the bound must be the dialer's, and it must say so"
+            ),
+            other => panic!("expected a bounded-head handshake error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_garbage_status_line_is_a_handshake_error() {
+        let err = dial_error(raw_server(
+            b"this is not an http response\r\nx: y\r\n\r\n".to_vec(),
+        ))
+        .await;
+
+        match err {
+            DialError::Handshake(text) => assert!(
+                text.starts_with("the upgrade response head is malformed: "),
+                "a parse failure must name itself, got: {text}"
+            ),
+            other => panic!("expected a malformed-head handshake error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn more_than_sixty_four_response_headers_is_a_handshake_error() {
+        // 80 headers in a complete, otherwise valid 101 head: httparse is given
+        // exactly MAX_HEAD_HEADERS slots, so this must be refused rather than
+        // silently truncated into a head that looks like a clean upgrade.
+        let mut head = b"HTTP/1.1 101 Switching Protocols\r\n".to_vec();
+        for nth in 0..80 {
+            head.extend_from_slice(format!("x-filler-{nth}: v\r\n").as_bytes());
+        }
+        head.extend_from_slice(b"\r\n");
+
+        let err = dial_error(raw_server(head)).await;
+
+        match err {
+            DialError::Handshake(text) => assert!(
+                text.starts_with("the upgrade response head is malformed: "),
+                "too many headers is a parse failure, got: {text}"
+            ),
+            other => panic!("expected a malformed-head handshake error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_that_closes_mid_handshake_is_a_handshake_error() {
+        let err = dial_error(raw_server_then_eof(
+            b"HTTP/1.1 101 Switching Protocols\r\nupgrade: websocket\r\n".to_vec(),
+        ))
+        .await;
+
+        match err {
+            DialError::Handshake(text) => assert_eq!(
+                text, "the server closed before finishing the upgrade response head",
+                "an EOF mid-head is a handshake failure, not a connect failure"
+            ),
+            other => panic!("expected a truncated-head handshake error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_response_is_a_handshake_error() {
+        let err = dial_error(raw_server_then_eof(Vec::new())).await;
+
+        match err {
+            DialError::Handshake(text) => assert_eq!(
+                text,
+                "the server closed before finishing the upgrade response head"
+            ),
+            other => panic!("expected a handshake error for an empty answer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collect_stops_on_a_cancelled_job_inside_the_window() {
+        // A five-second window against a server that never answers: the only
+        // thing that can end this collection in time is the cancel poll.
+        let (transport, _log) = ws_server(None, |conn: crate::testing::ServerConn| async move {
+            let mut ws = conn.ws().await;
+            while let Some(Ok(message)) = ws.next().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        });
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        let mut conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
+
+        let cancel_at = Instant::now() + Duration::from_millis(150);
+        let cancelled = move || Instant::now() >= cancel_at;
+        let started = Instant::now();
+        let outcome = conn
+            .collect(
+                Duration::from_secs(5),
+                Instant::now() + Duration::from_secs(30),
+                &cancelled,
+            )
+            .await;
+        let waited = started.elapsed();
+
+        assert_eq!(outcome.ended, CollectEnd::Cancelled);
+        assert!(outcome.frames.is_empty(), "{:?}", outcome.frames);
+        assert!(
+            waited < Duration::from_secs(1),
+            "the cancel must be seen within a poll interval, waited {waited:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reply_above_the_dial_limit_ends_the_collection_as_transport() {
+        // Our own read limit must end the conversation as data (plan call 18),
+        // never as an error and never as a silent empty window.
+        let (transport, _log) = ws_server(None, |conn: crate::testing::ServerConn| async move {
+            let mut ws = conn.ws().await;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(_) => {
+                        let _ = ws.send(Message::text("a".repeat(8192))).await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        });
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+        let mut conn = match dialer
+            .dial(
+                &handshake,
+                &HandshakeOverrides::default(),
+                &*guard,
+                soon(),
+                DialLimits {
+                    max_frame_bytes: 1024,
+                },
+            )
+            .await
+            .expect("the upgrade completes")
+        {
+            DialOutcome::Upgraded(conn) => conn,
+            DialOutcome::Refused { status, .. } => panic!("expected an upgrade, got {status}"),
+        };
+
+        conn.send(&Frame {
+            kind: FrameKind::Text,
+            payload: b"hi".to_vec(),
+        })
+        .await
+        .expect("a small frame is within the limit");
+        let outcome = conn
+            .collect(Duration::from_millis(500), soon(), &|| false)
+            .await;
+
+        assert!(
+            matches!(outcome.ended, CollectEnd::Transport(_)),
+            "an 8 KiB reply at a 1 KiB limit ends the stream: {:?}",
+            outcome.ended
+        );
+        assert!(
+            outcome.frames.is_empty(),
+            "the oversized frame is not delivered: {:?}",
+            outcome.frames
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn conn_debug_carries_no_header_value() {
+        let (transport, _log) = ws_server(None, echo_handler);
+        let dialer = WsDialer::new(transport);
+        let (handshake, _) = captured_conversation();
+        let guard = guard_in_scope();
+
+        let conn = upgrade(&dialer, &handshake, &HandshakeOverrides::default(), &*guard).await;
+
+        let shown = format!("{conn:?}");
+        assert!(
+            !shown.contains("s3cr3t-cookie"),
+            "the replayed cookie must not reach a Debug output: {shown}"
+        );
+        assert!(
+            shown.contains("127.0.0.1:8080") && shown.contains("101"),
+            "Debug still has to identify the connection: {shown}"
+        );
     }
 }
