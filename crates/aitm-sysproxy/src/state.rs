@@ -790,4 +790,166 @@ mod tester_tests {
         assert_eq!(loaded.service_names().len(), 2_000);
         fs::remove_dir_all(&dir).expect("remove temp dir");
     }
+
+    /// S1 (tester): a FIFO at the state path is never opened for reading —
+    /// a plain `fs::read` on a FIFO with no writer blocks for ever, which
+    /// would hang the engine's `status` and the watchdog's wake. The
+    /// `symlink_metadata` guard sees it is not a regular file, moves it
+    /// aside unread and reports the file absent. A FIFO left at the temp
+    /// name is removed before the save, so the save still lands.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_state_or_temp_path_is_quarantined_not_read() {
+        let dir = temp_dir("fifo");
+        let path = dir.join(STATE_FILE_NAME);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", path.display());
+
+        assert_eq!(
+            StateFile::load(&path).expect("quarantine is not an error"),
+            None,
+            "a FIFO is never a state file"
+        );
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the FIFO is gone from the state path"
+        );
+        assert_eq!(corrupt_count(&dir), 1, "moved aside, not opened");
+
+        let tmp = temp_path(&path);
+        let status = std::process::Command::new("mkfifo")
+            .arg(&tmp)
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success(), "mkfifo {}", tmp.display());
+        small_file()
+            .save_atomic(&path)
+            .expect("save over a FIFO at the temp name");
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("state file meta")
+                .is_file(),
+            "a regular file at the state path"
+        );
+        assert!(!tmp.exists(), "no temp entry left");
+        assert_eq!(StateFile::load(&path).expect("load"), Some(small_file()));
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// Q6 (tester): `service_names` is the names of `rows_of`, for every
+    /// `previous` kind, so the watchdog's partition (by name) and the
+    /// engine's idempotency check (by row) can never disagree on which
+    /// services a file describes. The literal names are the §D7 ones.
+    #[test]
+    fn service_names_are_exactly_the_names_of_rows_of() {
+        let gs_keys: BTreeMap<String, String> = BTreeMap::from([
+            (
+                "org.gnome.system.proxy mode".to_string(),
+                "'manual'".to_string(),
+            ),
+            (
+                "org.gnome.system.proxy.http host".to_string(),
+                "'127.0.0.1'".to_string(),
+            ),
+            (
+                "org.gnome.system.proxy.http port".to_string(),
+                "8080".to_string(),
+            ),
+            (
+                "org.gnome.system.proxy.https host".to_string(),
+                "'127.0.0.1'".to_string(),
+            ),
+            (
+                "org.gnome.system.proxy.https port".to_string(),
+                "8080".to_string(),
+            ),
+            (
+                "org.gnome.system.proxy ignore-hosts".to_string(),
+                "['localhost']".to_string(),
+            ),
+        ]);
+        let kio: BTreeMap<String, String> = BTreeMap::from([
+            ("ProxyType".to_string(), "1".to_string()),
+            ("httpProxy".to_string(), "http://127.0.0.1 8080".to_string()),
+            (
+                "httpsProxy".to_string(),
+                "http://127.0.0.1 8080".to_string(),
+            ),
+            ("NoProxyFor".to_string(), "localhost".to_string()),
+        ]);
+        let cases: [(Mechanism, Previous, &[&str]); 5] = [
+            (
+                Mechanism::Networksetup,
+                Previous::Networksetup {
+                    services: vec![
+                        ServiceRow {
+                            service: "Display Ethernet".into(),
+                            http: ProtocolProxy::default(),
+                            https: ProtocolProxy::default(),
+                            bypass: vec![],
+                        },
+                        ServiceRow {
+                            service: "Wi-Fi".into(),
+                            http: ProtocolProxy::default(),
+                            https: ProtocolProxy::default(),
+                            bypass: vec![],
+                        },
+                    ],
+                },
+                &["Display Ethernet", "Wi-Fi"],
+            ),
+            (
+                Mechanism::Networksetup,
+                Previous::Networksetup { services: vec![] },
+                &[],
+            ),
+            (
+                Mechanism::Gsettings,
+                Previous::Gsettings {
+                    keys: gs_keys.clone(),
+                },
+                &["gsettings"],
+            ),
+            (
+                Mechanism::Kde,
+                Previous::Kde {
+                    kioslaverc: kio.clone(),
+                    gsettings: None,
+                },
+                &["kde"],
+            ),
+            (
+                Mechanism::Kde,
+                Previous::Kde {
+                    kioslaverc: kio,
+                    gsettings: Some(gs_keys),
+                },
+                &["kde", "gsettings"],
+            ),
+        ];
+        for (mechanism, previous, names) in cases {
+            let file = StateFile::new(mechanism, 7, wrote(), previous);
+            let expected: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            assert_eq!(file.service_names(), expected, "{mechanism:?}");
+            let from_rows: Vec<String> = rows_of(&file.previous)
+                .into_iter()
+                .map(|row| row.service)
+                .collect();
+            assert_eq!(from_rows, expected, "{mechanism:?}: rows_of names");
+            // Every row a Linux snapshot yields is judged against `wrote`
+            // like a macOS row: the synthetic rows carry the endpoints.
+            if mechanism != Mechanism::Networksetup {
+                for row in rows_of(&file.previous) {
+                    assert!(
+                        crate::service_equals_wrote(&row, &file.wrote),
+                        "{mechanism:?}: {} should read back as ours: {row:?}",
+                        row.service
+                    );
+                }
+            }
+        }
+    }
 }

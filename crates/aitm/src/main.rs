@@ -1026,8 +1026,9 @@ mod tests {
 
     use super::{
         addr_in_use_error, apply_bus_endpoint_file, bind_then_recover_system_proxy,
-        build_env_filter, manages_system_proxy, parse_mode, split_bus_endpoint_file_arg,
-        split_config_arg, split_script_args, Mode, OPERATOR_TOKEN_USAGE,
+        build_env_filter, manages_system_proxy, parse_invocation, parse_mode,
+        split_bus_endpoint_file_arg, split_config_arg, split_script_args, Invocation, Mode,
+        OPERATOR_TOKEN_USAGE,
     };
 
     fn args(a: &[&str]) -> Vec<String> {
@@ -1606,5 +1607,113 @@ mod tests {
         let (scripts, rest) = split_script_args(args(&["--script", "a.rhai", "tui"])).unwrap();
         assert_eq!(scripts, [PathBuf::from("a.rhai")]);
         assert_eq!(parse_mode(rest), Ok(Mode::Tui));
+    }
+
+    /// Q1 (tester): the engine logs every recovery outcome at `info` as it
+    /// happens, so `log_recovery` must add nothing for them (one line per
+    /// event, not two); only a `Failed` recovery earns a second line, a
+    /// `warn!` carrying the phase and the engine's message verbatim.
+    #[test]
+    fn log_recovery_warns_only_for_a_failed_recovery() {
+        let capture = |recovery: &aitm_sysproxy::Recovery| -> String {
+            let buf = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(BufWriter(buf.clone()))
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                super::log_recovery("startup", recovery)
+            });
+            let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+            out
+        };
+        for quiet in [
+            aitm_sysproxy::Recovery::Nothing,
+            aitm_sysproxy::Recovery::Adopted { pid: 7 },
+            aitm_sysproxy::Recovery::Restored {
+                restored: vec!["Wi-Fi".into()],
+                left_alone: vec!["Display Ethernet".into()],
+            },
+            aitm_sysproxy::Recovery::Forgot,
+        ] {
+            assert_eq!(
+                capture(&quiet),
+                "",
+                "{quiet:?} is already logged by the engine; main.rs must not log it again"
+            );
+        }
+        let out = capture(&aitm_sysproxy::Recovery::Failed(
+            "write failed: networksetup exit 1; the state file /x is kept".into(),
+        ));
+        assert!(out.contains("WARN"), "{out:?}");
+        assert!(
+            out.contains(
+                "system proxy: write failed: networksetup exit 1; the state file /x is kept"
+            ),
+            "{out:?}"
+        );
+        assert!(out.contains("phase=\"startup\""), "{out:?}");
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+    }
+
+    /// F3 (tester): `main` dispatches the hidden watchdog on the mode
+    /// `parse_invocation` classified, before any runtime is built; the
+    /// classification must therefore survive the global flags that may
+    /// precede the subcommand. `aitm --config <p> sysproxy-watchdog …` (a
+    /// spelling the spawner never emits; a hand launch may) is the watchdog
+    /// with that config path recorded, never a server start.
+    #[test]
+    fn parse_invocation_classifies_the_watchdog_behind_a_leading_config_flag() {
+        for argv in [
+            args(&[
+                "--config",
+                "/etc/aitm.yaml",
+                "sysproxy-watchdog",
+                "--pid",
+                "1",
+                "--state",
+                "/x",
+            ]),
+            args(&[
+                "--config=/etc/aitm.yaml",
+                "sysproxy-watchdog",
+                "--pid",
+                "1",
+                "--state",
+                "/x",
+                "--no-pipe",
+            ]),
+            args(&["sysproxy-watchdog", "--pid", "1", "--state", "/x"]),
+        ] {
+            let no_pipe = argv.last().map(String::as_str) == Some("--no-pipe");
+            let with_config = argv[0].starts_with("--config");
+            let Invocation {
+                config_arg,
+                script_args,
+                bus_endpoint_file,
+                web_args,
+                mode,
+            } = parse_invocation(argv.clone())
+                .expect("parses")
+                .expect("something to run");
+            assert_eq!(
+                mode,
+                Mode::SysproxyWatchdog {
+                    pid: 1,
+                    state: PathBuf::from("/x"),
+                    no_pipe,
+                },
+                "{argv:?}"
+            );
+            assert_eq!(
+                config_arg,
+                with_config.then(|| PathBuf::from("/etc/aitm.yaml")),
+                "{argv:?}"
+            );
+            assert!(script_args.is_empty(), "{argv:?}");
+            assert!(bus_endpoint_file.is_none(), "{argv:?}");
+            assert!(web_args.is_none(), "{argv:?}");
+        }
     }
 }

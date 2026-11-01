@@ -2890,6 +2890,170 @@ mod engine_tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SystemProxy>();
     }
+
+    /// S2 (tester) at the engine's own door: a Linux core that
+    /// `detect_with` classifies as KDE spawns its tools by the absolute
+    /// path resolved on `PATH` at detection, never by a bare name the
+    /// spawn would look up again. The first line a `status()` runs is the
+    /// `kreadconfig6` read of `ProxyType`, by that path.
+    #[test]
+    fn detect_with_kde_runs_its_tools_by_absolute_path() {
+        let dir = temp_dir("detect-kde-path");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).expect("bin dir");
+        for tool in ["kwriteconfig6", "kreadconfig6", "dbus-send"] {
+            fs::write(bin.join(tool), b"#!/bin/sh\n").expect("fake tool");
+        }
+        let cfg = SystemProxyConfig {
+            auto: false,
+            bypass: vec![],
+            state_file: Some(dir.join(STATE_FILE_NAME)),
+        };
+        let scripted = Arc::new(ScriptedExecutor::new());
+        let exec: Arc<dyn Executor> = scripted.clone();
+        let path = bin.to_string_lossy().into_owned();
+        let env = move |k: &str| match k {
+            "PATH" => Some(path.clone()),
+            "XDG_CURRENT_DESKTOP" => Some("KDE".to_string()),
+            _ => None,
+        };
+        let sp = SystemProxy::detect_with(exec, &cfg, ours(), None, "linux", &env);
+        assert_eq!(sp.mechanism(), Mechanism::Kde);
+        assert!(scripted.runs().is_empty(), "detection runs no command");
+
+        let _ = sp.status();
+        let runs = scripted.runs();
+        let kread = bin.join("kreadconfig6").to_string_lossy().into_owned();
+        let expected = CmdLine {
+            program: kread,
+            args: strs(&[
+                "--file",
+                "kioslaverc",
+                "--group",
+                "Proxy Settings",
+                "--key",
+                "ProxyType",
+            ]),
+            stdin: None,
+            mutating: false,
+        }
+        .render();
+        assert_eq!(runs.first(), Some(&expected), "{runs:?}");
+        let bare = ["kreadconfig6 ", "kwriteconfig6 ", "dbus-send "];
+        assert!(
+            runs.iter()
+                .all(|l| bare.iter().all(|name| !l.starts_with(name))),
+            "a tool was spawned by its bare name: {runs:?}"
+        );
+        fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    /// S3 (tester) at the engine: `status_cached` serves the last full
+    /// status while it is at most `STATUS_TTL` (2 s) old and runs nothing;
+    /// the `setting` bit on a hit is live, not the cached one; an entry
+    /// older than the TTL is read fresh; and a trusted `status()` primes the
+    /// entry the agent path then hits.
+    #[test]
+    fn status_cached_serves_within_ttl_and_reads_fresh_when_stale() {
+        let exec = ScriptedExecutor::new().respond(SCUTIL, 0, &scutil_out("127.0.0.1", 9090), "");
+        let r = macos_rig("status-cache", before_round(exec));
+
+        let first = r.sp.status_cached();
+        let round = r.exec.runs().len();
+        assert_eq!(
+            round,
+            8,
+            "scutil + list + three gets × two services: {:?}",
+            r.exec.runs()
+        );
+        assert_eq!(
+            first.state,
+            State::Other {
+                host: "127.0.0.1".into(),
+                port: 9090
+            }
+        );
+        assert_eq!(first.services.len(), 2);
+
+        let second = r.sp.status_cached();
+        assert_eq!(
+            r.exec.runs().len(),
+            round,
+            "a hit within the TTL runs nothing: {:?}",
+            r.exec.runs()
+        );
+        assert_eq!(second, first);
+
+        {
+            let _guard = r.sp.begin().expect("take the in-flight flag");
+            let hit = r.sp.status_cached();
+            assert!(hit.setting, "`setting` is live on a cached hit");
+            assert_eq!(r.exec.runs().len(), round);
+        }
+        assert!(!r.sp.status_cached().setting);
+
+        {
+            let mut cache = lock(&r.sp.status_cache);
+            let (at, _) = cache.as_mut().expect("primed by the first read");
+            *at = std::time::Instant::now()
+                .checked_sub(STATUS_TTL + std::time::Duration::from_millis(1))
+                .expect("uptime longer than the TTL");
+        }
+        let third = r.sp.status_cached();
+        assert_eq!(
+            r.exec.runs().len(),
+            2 * round,
+            "an entry older than the TTL is read fresh"
+        );
+        assert_eq!(third.state, first.state);
+
+        let _ = r.sp.status();
+        assert_eq!(r.exec.runs().len(), 3 * round, "a trusted read is fresh");
+        let _ = r.sp.status_cached();
+        assert_eq!(
+            r.exec.runs().len(),
+            3 * round,
+            "and it primes the entry the agent path hits"
+        );
+        assert_eq!(STATUS_TTL, std::time::Duration::from_secs(2));
+    }
+
+    /// S3 (tester): a `set` primes the status cache with its verified
+    /// outcome, so the next agent `proxy.system.status` sees `points_at_us`
+    /// and `managed_by_us` without a read round of its own, and never a
+    /// stale pre-set view.
+    #[test]
+    fn a_set_primes_the_status_cache_for_the_next_agent_read() {
+        let exec = ScriptedExecutor::new()
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 9090), "")
+            .respond(SCUTIL, 0, &scutil_out("127.0.0.1", 8080), "");
+        let r = macos_rig("set-primes-cache", at_us_round(before_round(exec)));
+
+        let stale = r.sp.status_cached();
+        assert_eq!(
+            stale.state,
+            State::Other {
+                host: "127.0.0.1".into(),
+                port: 9090
+            }
+        );
+        let (status, changed, _) = r.sp.set(&SetRequest::default()).expect("set");
+        assert!(changed);
+        assert_eq!(status.state, State::PointsAtUs);
+        let after_set = r.exec.runs().len();
+
+        let cached = r.sp.status_cached();
+        assert_eq!(
+            r.exec.runs().len(),
+            after_set,
+            "no read of its own: {:?}",
+            r.exec.runs()
+        );
+        assert_eq!(cached.state, State::PointsAtUs);
+        assert!(cached.managed_by_us);
+        assert!(!cached.setting);
+        assert_eq!(cached.services, status.services);
+    }
 }
 
 /// Tester (stage 5) additions: the spec literals the Coder's tests compared
