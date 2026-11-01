@@ -30,8 +30,9 @@
 //!   `read_timeout_ms` is floored at [`MIN_READ_TIMEOUT_MS`] so a poll
 //!   always returns and a `CaptureClose` always takes effect.
 //! - **`ScopeSet`** governs captures already open too: one whose interface
-//!   the new scope no longer covers is stopped and reported as
-//!   `CaptureClosed { reason: "scope changed" }`.
+//!   the new scope no longer covers is stopped, and its thread reports
+//!   `CaptureClosed { reason: "scope changed" }` after the last frame it
+//!   already had; a frame its poll returns after the stop is dropped.
 //! - **Protocol violations** end the session with [`ServeExit::Protocol`]:
 //!   anything but `Hello` first, a `proto` other than [`PROTO`] (no reply is
 //!   sent, so the core reports `version_mismatch`), a second `Hello`, a
@@ -49,15 +50,19 @@
 //!
 //! The loop blocks in `read_msg`, so each open capture runs on its own
 //! thread that owns the [`CaptureSource`] and writes `Frame`s through the
-//! shared, locked writer. `CaptureClose` sets that capture's stop flag,
-//! which the thread checks between polls (each poll returns within the
-//! capture's read timeout); on any loop exit every flag is set by a drop
-//! guard. Threads are not joined: the process exits right after the loop.
+//! shared, locked writer. `CaptureClose` and a `ScopeSet` that drops the
+//! interface each request a stop with its reason ([`StopFlag`]); the thread
+//! checks the flag before and after every poll (each poll returns within the
+//! capture's read timeout), sends the one `CaptureClosed` itself and only
+//! then frees the id, so the core never sees a `Frame` after the close, nor
+//! a reused id while a stale thread could still write. On any loop exit
+//! every flag is set by a drop guard. Threads are not joined: the process
+//! exits right after the loop.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -78,6 +83,40 @@ const REASON_CLOSED: &str = "closed";
 /// The reason a capture reports when a new `ScopeSet` no longer covers its
 /// interface.
 const REASON_SCOPE_CHANGED: &str = "scope changed";
+
+/// [`StopFlag`] states: still capturing, or the code of the reason the
+/// thread reports when it stops.
+const RUNNING: u8 = 0;
+const STOP_CLOSED: u8 = 1;
+const STOP_SCOPE_CHANGED: u8 = 2;
+
+/// A capture thread's stop request and its reason, in one atomic: the loop
+/// requests (the first request wins), the thread polls and, once it sees a
+/// request, reports that reason as its `CaptureClosed`.
+struct StopFlag(AtomicU8);
+
+impl StopFlag {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicU8::new(RUNNING)))
+    }
+
+    /// Ask the thread to stop for `code` (`STOP_CLOSED` or
+    /// `STOP_SCOPE_CHANGED`); a request already made is kept.
+    fn request(&self, code: u8) {
+        let _ = self
+            .0
+            .compare_exchange(RUNNING, code, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The reason to report, once a stop was requested.
+    fn requested(&self) -> Option<&'static str> {
+        match self.0.load(Ordering::Acquire) {
+            RUNNING => None,
+            STOP_SCOPE_CHANGED => Some(REASON_SCOPE_CHANGED),
+            _ => Some(REASON_CLOSED),
+        }
+    }
+}
 
 /// The least read timeout a capture is opened with. The core's
 /// `read_timeout_ms` is clamped up to this before the wire opens: libpcap
@@ -177,14 +216,17 @@ impl Scope {
 /// One open capture: the flag its thread polls and the interface it is on
 /// (so a new scope can be checked against it).
 struct CaptureEntry {
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopFlag>,
     interface: String,
 }
 
-/// The open captures by id. Shared with the threads so a capture that ends
-/// on its own removes itself; a thread only ever removes its own entry
-/// ([`Captures::finish`] checks the flag's identity), so an id freed and
-/// reused by the loop is never removed by the thread that lost it.
+/// The open captures by id. An entry lives until its thread ends: the loop
+/// only requests stops, and the thread removes the entry itself just before
+/// it reports `CaptureClosed`, so the core sees the id freed exactly when
+/// the thread can no longer write. A thread only ever removes its own entry
+/// ([`Captures::finish`] checks the flag's identity), so an id freed early
+/// (an open or a thread start that failed) and reused is never removed by a
+/// thread that does not own it.
 #[derive(Default)]
 struct Captures {
     open: Mutex<HashMap<u64, CaptureEntry>>,
@@ -197,12 +239,12 @@ impl Captures {
 
     /// Register `id` on `interface` with a fresh stop flag; `None` when it is
     /// already open.
-    fn insert(&self, id: u64, interface: &str) -> Option<Arc<AtomicBool>> {
+    fn insert(&self, id: u64, interface: &str) -> Option<Arc<StopFlag>> {
         let mut open = self.lock();
         if open.contains_key(&id) {
             return None;
         }
-        let stop = Arc::new(AtomicBool::new(false));
+        let stop = StopFlag::new();
         open.insert(
             id,
             CaptureEntry {
@@ -216,7 +258,7 @@ impl Captures {
     /// Ask `id`'s thread to stop; it reports `closed` and removes itself.
     fn stop(&self, id: u64) {
         if let Some(entry) = self.lock().get(&id) {
-            entry.stop.store(true, Ordering::Release);
+            entry.stop.request(STOP_CLOSED);
         }
     }
 
@@ -229,7 +271,7 @@ impl Captures {
     /// A thread ending: remove `id` only if the entry is still this
     /// thread's (`stop` is the flag it was given). Returns whether it was,
     /// i.e. whether the thread owes the core a `CaptureClosed`.
-    fn finish(&self, id: u64, stop: &Arc<AtomicBool>) -> bool {
+    fn finish(&self, id: u64, stop: &Arc<StopFlag>) -> bool {
         let mut open = self.lock();
         match open.get(&id) {
             Some(entry) if Arc::ptr_eq(&entry.stop, stop) => {
@@ -240,28 +282,21 @@ impl Captures {
         }
     }
 
-    /// Stop and forget every capture whose interface `guard` no longer
-    /// covers; the ids, in ascending order, for the loop to report as
-    /// `scope changed`. Their threads find their entry gone and stay silent.
-    fn stop_uncovered(&self, guard: &HelperGuard) -> Vec<u64> {
-        let mut open = self.lock();
-        let mut gone: Vec<u64> = open
-            .iter()
-            .filter(|(_, entry)| guard.capture_filter(&entry.interface).is_err())
-            .map(|(id, _)| *id)
-            .collect();
-        gone.sort_unstable();
-        for id in &gone {
-            if let Some(entry) = open.remove(id) {
-                entry.stop.store(true, Ordering::Release);
+    /// Ask every capture whose interface `guard` no longer covers to stop
+    /// with reason `scope changed`. Each thread reports its own
+    /// `CaptureClosed` and frees its id then (SEC-R2-M1), so the loop sends
+    /// nothing here and the id stays taken until the thread is done.
+    fn stop_uncovered(&self, guard: &HelperGuard) {
+        for entry in self.lock().values() {
+            if guard.capture_filter(&entry.interface).is_err() {
+                entry.stop.request(STOP_SCOPE_CHANGED);
             }
         }
-        gone
     }
 
     fn stop_all(&self) {
         for entry in self.lock().values() {
-            entry.stop.store(true, Ordering::Release);
+            entry.stop.request(STOP_CLOSED);
         }
     }
 }
@@ -333,16 +368,12 @@ pub fn serve_loop<R: Read, W: Write + Send + 'static>(
             Msg::ScopeSet(s) => {
                 let next = Scope::new(s);
                 // The new scope governs the captures already open: one on an
-                // interface it no longer covers closes now (SEC-M4). The new
+                // interface it no longer covers is asked to stop now (SEC-M4)
+                // and its thread reports `scope changed` itself. The new
                 // guard's rate buckets start fresh, so an inject budget the
                 // old scope had spent is not carried over: accepted (spec S3),
                 // since the core's own guard meters independently anyway.
-                for id in captures.stop_uncovered(&next.guard) {
-                    out.send(&Msg::CaptureClosed {
-                        capture_id: id,
-                        reason: REASON_SCOPE_CHANGED.to_string(),
-                    })?;
-                }
+                captures.stop_uncovered(&next.guard);
                 scope = Some(next);
             }
             Msg::CaptureOpen {
@@ -410,7 +441,7 @@ fn open_capture(
     id: u64,
     interface: &str,
     timeout: Duration,
-) -> Result<(Box<dyn CaptureSource + Send>, Arc<AtomicBool>), String> {
+) -> Result<(Box<dyn CaptureSource + Send>, Arc<StopFlag>), String> {
     let guard = guard.ok_or_else(|| "capture before scope: no scope set yet".to_string())?;
     check_interface_name(interface)?;
     let filter = guard.capture_filter(interface)?;
@@ -444,9 +475,9 @@ fn inject(scope: &Scope, wire: &dyn Wire, interface: &str, bytes: &[u8]) -> Resu
 }
 
 /// Stream frames from `source` on a thread of its own until the source fails
-/// or the capture's flag is set. The thread reports `CaptureClosed` only
-/// while the entry is still its own ([`Captures::finish`]); a capture the
-/// loop already closed for a scope change stays silent.
+/// or a stop is requested. The thread then frees the id and reports the
+/// requested reason (or the source's error) as `CaptureClosed`, only while
+/// the entry is still its own ([`Captures::finish`]).
 ///
 /// # Errors
 /// The thread could not be started (`EAGAIN` and the like); nothing runs
@@ -454,7 +485,7 @@ fn inject(scope: &Scope, wire: &dyn Wire, interface: &str, bytes: &[u8]) -> Resu
 fn spawn_capture<W: Write + Send + 'static>(
     id: u64,
     mut source: Box<dyn CaptureSource + Send>,
-    stop: Arc<AtomicBool>,
+    stop: Arc<StopFlag>,
     out: Arc<Outbound<W>>,
     captures: Arc<Captures>,
 ) -> std::io::Result<()> {
@@ -462,11 +493,18 @@ fn spawn_capture<W: Write + Send + 'static>(
         .name(format!("capture-{id}"))
         .spawn(move || {
             let reason = loop {
-                if stop.load(Ordering::Acquire) {
-                    break REASON_CLOSED.to_string();
+                if let Some(why) = stop.requested() {
+                    break why.to_string();
                 }
                 match source.next_frame() {
                     Ok(Some(bytes)) => {
+                        // A stop that arrived while the poll was blocked: this
+                        // frame belongs to a capture the core is about to see
+                        // closed, so it is dropped and the `CaptureClosed`
+                        // below is the thread's last word (SEC-R2-M1).
+                        if let Some(why) = stop.requested() {
+                            break why.to_string();
+                        }
                         let frame = Msg::Frame {
                             capture_id: id,
                             ts_us: now_us(),
@@ -491,7 +529,7 @@ fn spawn_capture<W: Write + Send + 'static>(
                 });
             }
         })
-        .map(|_handle| ())
+        .map(drop)
 }
 
 /// The name of a message's variant, for protocol-violation texts.
@@ -695,6 +733,7 @@ impl CaptureSource for PcapSource {
 mod tests {
     use std::io::{Cursor, Read, Write};
     use std::net::Ipv4Addr;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{channel, Receiver, Sender};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread;
@@ -712,7 +751,7 @@ mod tests {
         RateCap,
     };
 
-    use super::{serve_loop, ServeExit, Wire};
+    use super::{serve_loop, Captures, ServeExit, Wire};
 
     /// The helper version every test hands the loop.
     const VERSION: &str = "0.5.9";
@@ -915,6 +954,32 @@ mod tests {
         }
     }
 
+    /// Tester: a capture whose poll blocks until the test sends it a frame
+    /// through the gate, so a stop can arrive while the thread is mid-poll;
+    /// `ended` is set when the capture thread drops it.
+    struct GatedSource {
+        rx: Receiver<Vec<u8>>,
+        ended: Arc<AtomicBool>,
+    }
+
+    impl CaptureSource for GatedSource {
+        fn next_frame(&mut self) -> Result<Option<Vec<u8>>, L4Error> {
+            match self.rx.recv() {
+                Ok(f) => Ok(Some(f)),
+                Err(_) => {
+                    thread::sleep(Duration::from_millis(2));
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    impl Drop for GatedSource {
+        fn drop(&mut self) {
+            self.ended.store(true, Ordering::Release);
+        }
+    }
+
     #[derive(Default)]
     struct FakeWire {
         /// `(interface, filter, timeout)` of every `open`.
@@ -932,6 +997,9 @@ mod tests {
         fail_open: Mutex<Option<String>>,
         /// Tester: when set, every `inject` is recorded, then fails with this.
         fail_inject: Mutex<Option<String>>,
+        /// Tester: when set, the next `open` hands out this source instead
+        /// of a scripted one.
+        gated: Mutex<Option<GatedSource>>,
         /// How many times the loop asked for an interface's link type (a real
         /// wire opens a pcap handle for that, so a refusal must come first).
         link_calls: Mutex<u32>,
@@ -965,6 +1033,9 @@ mod tests {
                 .fail_inject
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = why.map(str::to_string);
+        }
+        fn set_gated(&self, source: GatedSource) {
+            *self.gated.lock().unwrap_or_else(PoisonError::into_inner) = Some(source);
         }
         fn opens(&self) -> Vec<(String, Option<String>, Duration)> {
             self.opens
@@ -1010,6 +1081,14 @@ mod tests {
                 .clone()
             {
                 return Err(why);
+            }
+            if let Some(gated) = self
+                .gated
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+            {
+                return Ok(Box::new(gated));
             }
             let frames = {
                 let mut first = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1445,6 +1524,17 @@ mod tests {
         use super::PcapWire;
         use std::net::{IpAddr, UdpSocket};
 
+        // SP2-M1: the claim is about the default sysctls. On a rig with
+        // `route_localnet` on, an L2 inject on `lo` would be delivered too
+        // and a pass here would prove nothing, so refuse to run there.
+        for path in [
+            "/proc/sys/net/ipv4/conf/all/route_localnet",
+            "/proc/sys/net/ipv4/conf/lo/route_localnet",
+        ] {
+            let value = std::fs::read_to_string(path).expect("route_localnet sysctl is readable");
+            assert_eq!(value.trim(), "0", "test assumes default sysctls: {path}");
+        }
+
         let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket on loopback");
         let port = socket.local_addr().expect("local address").port();
         socket
@@ -1808,6 +1898,119 @@ mod tests {
                 reason: "closed".to_string()
             }]
         );
+    }
+
+    #[test]
+    fn tester_stale_capture_thread_after_scope_change_never_touches_a_reused_id() {
+        // QR2-M2: `Captures::finish` removes an entry only for the flag it
+        // was created with. Thread `a` holds id 5 on `lo`; the loop frees
+        // the id early (as `remove` does for an open or a thread start that
+        // failed) and a new capture `b` takes id 5 on `eth0`. `a` finishing
+        // must leave `b`'s entry alone and owe no CaptureClosed; `b`
+        // finishing frees the id.
+        let captures = Captures::default();
+        let a = captures.insert(5, "lo").expect("id 5 is free");
+        captures.stop(5);
+        assert_eq!(a.requested(), Some("closed"));
+        captures.remove(5);
+        let b = captures.insert(5, "eth0").expect("id 5 is free again");
+        assert_eq!(b.requested(), None, "a fresh flag for the new capture");
+
+        assert!(!captures.finish(5, &a), "the stale thread owes nothing");
+        assert_eq!(
+            captures.lock().get(&5).map(|e| e.interface.clone()),
+            Some("eth0".to_string()),
+            "the new capture's entry is untouched"
+        );
+        assert!(captures.finish(5, &b), "the owner frees the id");
+        assert!(captures.lock().get(&5).is_none());
+        assert!(!captures.finish(5, &b), "a second finish finds nothing");
+
+        // A scope change only requests the stop: the entry stays (so the id
+        // is not reusable) until the thread finishes, and the first request
+        // wins over a later CaptureClose.
+        let c = captures.insert(7, "lo").expect("id 7 is free");
+        let eth0_only = HelperGuard::from_scope_set(&scope_set_on("eth0"));
+        captures.stop_uncovered(&eth0_only);
+        assert_eq!(c.requested(), Some("scope changed"));
+        assert!(captures.insert(7, "eth0").is_none(), "id 7 is still taken");
+        captures.stop(7);
+        assert_eq!(c.requested(), Some("scope changed"));
+        assert!(captures.finish(7, &c));
+        assert!(captures.lock().is_empty());
+    }
+
+    #[test]
+    fn tester_frame_is_never_sent_after_scope_change_closes_the_capture() {
+        // SEC-R2-M1: the capture's thread is blocked in `next_frame` when the
+        // ScopeSet that no longer covers `lo` arrives. The frame that poll
+        // returns belongs to the old scope: it must never reach the core,
+        // and the one `CaptureClosed { "scope changed" }` is the thread's
+        // own last word, so Frame-before-Closed ordering holds as it does
+        // on the "closed" path.
+        let wire: Arc<FakeWire> = Arc::default();
+        let (gate, gate_rx) = channel::<Vec<u8>>();
+        let ended = Arc::new(AtomicBool::new(false));
+        wire.set_gated(GatedSource {
+            rx: gate_rx,
+            ended: Arc::clone(&ended),
+        });
+        let out = SharedBuf::default();
+        let (tx, reader) = ChanReader::new();
+        let loop_out = out.clone();
+        let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
+        let handle =
+            thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION, caps()));
+
+        for m in [hello(), Msg::ScopeSet(scope_set()), capture_open(5, "lo")] {
+            tx.send(encode(&m)).expect("loop is reading");
+        }
+        out.wait_until("first open", |_| wire.opens().len() == 1);
+
+        // The thread is parked in `next_frame` on the gate; the scope moves
+        // to `eth0`. An inject the new scope refuses tells us the ScopeSet
+        // was processed before the gate opens.
+        tx.send(encode(&Msg::ScopeSet(scope_set_on("eth0"))))
+            .expect("loop is reading");
+        tx.send(encode(&inject(1, "lo", eth_udp(9053))))
+            .expect("loop is reading");
+        out.wait_until("inject refused under the new scope", |msgs| {
+            inject_results(msgs)
+                == vec![(
+                    1,
+                    Some("interface lo is out of L4 inject scope".to_string()),
+                )]
+        });
+
+        // Release the gate: the poll returns a frame of the old scope.
+        gate.send(eth_udp(9001))
+            .expect("the capture thread holds the gate");
+        out.wait_until("capture thread ended", |_| ended.load(Ordering::Acquire));
+        let msgs = out.wait_until("CaptureClosed 5", |msgs| {
+            msgs.iter()
+                .any(|m| matches!(m, Msg::CaptureClosed { capture_id: 5, .. }))
+        });
+
+        assert_eq!(frames_of(5, &msgs), Vec::<Vec<u8>>::new(), "{msgs:?}");
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Frame { .. })),
+            "{msgs:?}"
+        );
+        let closed_5: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::CaptureClosed {
+                    capture_id: 5,
+                    reason,
+                } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed_5, vec!["scope changed".to_string()]);
+        assert_eq!(wire.opens().len(), 1);
+
+        drop(tx);
+        assert_eq!(handle.join().expect("loop thread"), Ok(()));
     }
 
     #[test]

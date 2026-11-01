@@ -19,10 +19,11 @@ pub const CATEGORY: &str = "bpf";
 ///
 /// `Ok`: `"bpf-permissions applied: 256 nodes, group access_bpf, added matt"`;
 /// the user list is `nobody` when the receipt names no one and comma-separated
-/// otherwise, each name passed through [`str::escape_default`] so a control
-/// character in an account name cannot break the one-line shape; when the
-/// receipt carries `errors`, `", {n} nodes refused"` is appended. `Err`:
-/// `"{mode} failed: {reason}"`.
+/// otherwise, each name passed through [`str::escape_debug`] so a control
+/// character in an account name cannot break the one-line shape (a printable
+/// name such as `josé` stays as it is; control characters, `\` and `"` are
+/// escaped); when the receipt carries `errors`, `", {n} nodes refused"` is
+/// appended. `Err`: `"{mode} failed: {reason}"`.
 #[must_use]
 pub fn run_line(mode: &str, r: &Result<Receipt, String>) -> String {
     match r {
@@ -33,7 +34,7 @@ pub fn run_line(mode: &str, r: &Result<Receipt, String>) -> String {
                 receipt
                     .members_added
                     .iter()
-                    .map(|name| name.escape_default().to_string())
+                    .map(|name| name.escape_debug().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
             };
@@ -186,16 +187,17 @@ mod tests {
             assert!(!line.contains('\n'), "{line:?}");
         }
         // A control character in a member name is escaped, not emitted: the
-        // line stays one line and shows the escape literally.
+        // line stays one line and shows the escape literally. A printable
+        // non-ASCII name passes through as it is (QR2-M3: `escape_debug`, not
+        // `escape_default`, which would write `jos\u{e9}`); `str::escape_debug`
+        // still escapes an apostrophe, so `o'brien` is shown as `o\'brien`.
         let line = run_line(
             "bpf-permissions",
-            &Ok(receipt(&["ma\ntt", "al\u{1b}ice"], &[])),
+            &Ok(receipt(&["ma\ntt", "al\u{1b}ice", "josé", "o'brien"], &[])),
         );
         assert_eq!(
             line,
-            "bpf-permissions applied: 256 nodes, group access_bpf, added ma\\ntt, al\\u{1b}ice"
+            "bpf-permissions applied: 256 nodes, group access_bpf, added ma\\ntt, al\\u{1b}ice, josé, o\\'brien"
         );
-        assert!(line.contains("ma\\ntt"), "{line:?}");
-        assert!(!line.contains('\n'), "{line:?}");
     }
 }
