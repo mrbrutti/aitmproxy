@@ -305,6 +305,8 @@ async fn run() -> anyhow::Result<()> {
         // `l4.capture.*`'s own and nothing calls `accept`.
         l4_ingress,
         l4_guard,
+        // The write side of `capture.status`, consumed by the feeder below.
+        capture_status,
         // `..` stands only for the private `governance` (taken above). Any new
         // `pub` field of `Assembled` must be named here, not absorbed by it.
         ..
@@ -450,6 +452,7 @@ async fn run() -> anyhow::Result<()> {
                 l4_guard,
                 Arc::new(CodeSignatureVerifier::default()),
                 PathBuf::from(feeder::DEFAULT_SOCKET_DIR),
+                capture_status,
             )
         })
     } else {

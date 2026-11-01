@@ -2656,6 +2656,8 @@ fn flow_summary(flow: &Flow) -> JsonValue {
             "response_bytes": f.response.as_ref().and_then(|r| r.body.buffered_len()),
             "started_at": f.metadata.started_at_ms(),
             "duration_ms": f.metadata.duration_ms(),
+            "source_app": f.metadata.source_app,
+            "capture_interface": f.metadata.capture_interface,
         }),
         Flow::WebSocket(f) => json!({
             "id": f.id.to_string(),
@@ -2666,6 +2668,8 @@ fn flow_summary(flow: &Flow) -> JsonValue {
             "messages": f.messages.len(),
             "started_at": f.metadata.started_at_ms(),
             "duration_ms": f.metadata.duration_ms(),
+            "source_app": f.metadata.source_app,
+            "capture_interface": f.metadata.capture_interface,
         }),
     }
 }

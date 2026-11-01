@@ -49,6 +49,7 @@ use super::listener::{
 };
 use super::peer_auth::PeerVerifier;
 use super::scope_spec::provider_scope_spec;
+use super::status::{scope_tokens, CaptureStatusWriter};
 use crate::ingress::CoreIngress;
 
 /// The production socket directory: short enough for the `sun_path` budget, created
@@ -235,13 +236,17 @@ pub struct CaptureSession {
     hello_timeout: Duration,
     pump_slots: Arc<Semaphore>,
     stop: watch::Sender<bool>,
+    /// The write side of the `capture.status` handle: every state change the
+    /// session goes through is recorded here for the bus verb to read (spec D3).
+    status: CaptureStatusWriter,
 }
 
 impl CaptureSession {
-    /// A session over the given ingress, guards, verifier, and socket directory,
-    /// with the default tuning (`DEFAULT_SCOPE_POLL`, `DEFAULT_PENDING_CAP`,
-    /// `DEFAULT_PENDING_TTL`, `DEFAULT_MAX_CONCURRENT_FLOWS`). `l4_guard` is `None`
-    /// when L4 is not enabled.
+    /// A session over the given ingress, guards, verifier, socket directory and
+    /// status writer, with the default tuning (`DEFAULT_SCOPE_POLL`,
+    /// `DEFAULT_PENDING_CAP`, `DEFAULT_PENDING_TTL`, `DEFAULT_MAX_CONCURRENT_FLOWS`).
+    /// `l4_guard` is `None` when L4 is not enabled. `status` is required, not
+    /// optional, so no caller can build a session the verb cannot see.
     #[must_use]
     pub fn new(
         ingress: Arc<CoreIngress>,
@@ -249,6 +254,7 @@ impl CaptureSession {
         l4_guard: Option<Arc<L4Guard>>,
         verifier: Arc<dyn PeerVerifier>,
         socket_dir: PathBuf,
+        status: CaptureStatusWriter,
     ) -> Self {
         Self {
             ingress,
@@ -262,6 +268,7 @@ impl CaptureSession {
             hello_timeout: HELLO_TIMEOUT,
             pump_slots: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_FLOWS)),
             stop: watch::channel(false).0,
+            status,
         }
     }
 
@@ -310,11 +317,15 @@ impl CaptureSession {
     /// failure is logged and ends only that step; the call never panics out, so a
     /// feeder bug cannot take the proxy's accept loops down with it.
     pub async fn run(self, shutdown: impl Future<Output = ()> + Send) {
+        // Taken before the session is polled: a panic unwinds the session and its
+        // own writer with it, and the handle must not read `listening` forever.
+        let status = self.status.clone();
         if AssertUnwindSafe(self.run_session(shutdown))
             .catch_unwind()
             .await
             .is_err()
         {
+            status.stopped();
             error!("macOS capture feeder panicked and stopped; the proxy keeps serving");
         }
     }
@@ -324,9 +335,14 @@ impl CaptureSession {
     async fn run_session(self, shutdown: impl Future<Output = ()> + Send) {
         tokio::pin!(shutdown);
 
+        // The status reasons carry only the `io::ErrorKind` text, never `e` itself:
+        // the bind and rendezvous errors embed the directory path, and the bus result
+        // must carry no path (spec D3). The operator log keeps the full error.
         let listener = match CaptureListener::bind(&self.socket_dir) {
             Ok(listener) => listener,
             Err(e) => {
+                self.status
+                    .bind_failed(format!("cannot bind the capture sockets ({})", e.kind()));
                 warn!(dir = %self.socket_dir.display(), error = %e,
                     "macOS capture feeder cannot bind its sockets; capture is off");
                 return;
@@ -338,11 +354,14 @@ impl CaptureSession {
         let _rendezvous = match listener.publish_rendezvous() {
             Ok(guard) => guard,
             Err(e) => {
+                self.status
+                    .bind_failed(format!("cannot publish the rendezvous file ({})", e.kind()));
                 warn!(error = %e, "macOS capture feeder cannot publish its rendezvous file; capture is off");
                 return;
             }
         };
         info!(dir = %listener.dir().display(), "macOS capture feeder listening");
+        self.status.listening();
 
         loop {
             let control = tokio::select! {
@@ -368,6 +387,7 @@ impl CaptureSession {
         // Abort every running pump; the rendezvous guard and the listener then drop.
         self.stop.send_replace(true);
         info!("macOS capture feeder stopped");
+        self.status.stopped();
     }
 
     /// Serve one attached provider: its control channel and the data sockets that
@@ -455,6 +475,13 @@ impl CaptureSession {
             return;
         }
         info!("capture provider attached");
+        // Held to the end of this function: its drop records the detach, so a
+        // detach is recorded whether we return (provider gone, push failed) or this
+        // future is dropped mid-flight at shutdown, where the log line below never
+        // runs (spec D3). The team is the verifier's pinned one, not read from the peer.
+        let _attachment = self
+            .status
+            .attached(self.verifier.team_id(), scope_tokens(&last_sent));
         debug!(scope = %last_sent.spec, "initial capture scope sent");
 
         // The two loops run concurrently inside the select below and are only ever
@@ -489,6 +516,7 @@ impl CaptureSession {
                         warn!(error = %e, "could not push the updated scope; detaching the provider");
                         return;
                     }
+                    self.status.scope_pushed(scope_tokens(&spec));
                     debug!(scope = %spec.spec, "capture scope updated");
                     last_sent = spec;
                 }
@@ -577,7 +605,8 @@ impl CaptureSession {
     }
 
     /// Start the pump for a paired flow, or shed it (dropping both sockets) when the
-    /// concurrency cap is reached.
+    /// concurrency cap is reached. A started pump is one handoff in `capture.status`;
+    /// a shed pair is not counted.
     fn start_pump(&self, open: FlowOpen, data: DataConnection) {
         let Some(permit) = self.claim_slot() else {
             warn!(
@@ -586,6 +615,7 @@ impl CaptureSession {
             );
             return;
         };
+        self.status.handed_off(open.kind);
         spawn_pump(
             Arc::clone(&self.ingress),
             open,
@@ -650,7 +680,7 @@ mod tests {
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use aitm_core::{ActionPermit, GuardError, ScopeEntry};
+    use aitm_core::{ActionPermit, GuardError, ScopeEntry, Value};
     use aitm_proto_l4::config::L4Config;
     use aitm_proto_l4::types::{
         IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
@@ -660,16 +690,24 @@ mod tests {
 
     use super::*;
     use crate::macos_capture::adapter::{CAPTURE_INTERFACE, HANDOFF_PROTOCOL_VERSION};
+    use crate::macos_capture::capability::CaptureCapability;
     use crate::macos_capture::listener::{FlowKind, Hello};
+    use crate::macos_capture::status::{
+        CaptureStatus, CaptureStatusReader, CaptureStatusSnapshot, CaptureStatusWriter,
+        FeederState, OffReason, ProviderState,
+    };
+    use crate::macos_capture::test_support::{at, now_ms, obj, s};
 
     /// How long a test waits for something that should happen promptly.
     const PROMPT: Duration = Duration::from_secs(5);
     /// The scope poll the session tests run at.
     const POLL: Duration = Duration::from_millis(25);
 
-    /// A verifier that records the fds it was asked about and answers a fixed way.
+    /// A verifier that records the fds it was asked about and answers a fixed way,
+    /// reporting `team` from `team_id()` (`None` unless built with `with_team`).
     struct StubVerifier {
         accept: bool,
+        team: Option<String>,
         seen: Mutex<Vec<RawFd>>,
     }
 
@@ -677,6 +715,16 @@ mod tests {
         fn new(accept: bool) -> Arc<Self> {
             Arc::new(Self {
                 accept,
+                team: None,
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// As [`new`](Self::new), but pinning `team` as the verified team id.
+        fn with_team(accept: bool, team: &str) -> Arc<Self> {
+            Arc::new(Self {
+                accept,
+                team: Some(team.to_string()),
                 seen: Mutex::new(Vec::new()),
             })
         }
@@ -686,6 +734,10 @@ mod tests {
         fn verify(&self, fd: RawFd) -> bool {
             lock(&self.seen).push(fd);
             self.accept
+        }
+
+        fn team_id(&self) -> Option<String> {
+            self.team.clone()
         }
     }
 
@@ -733,10 +785,12 @@ mod tests {
         }
     }
 
-    fn session_with(
+    /// A session over an empty ingress, recording into `status`, at the test poll.
+    fn session_with_status(
         verifier: Arc<dyn PeerVerifier>,
         guard: Arc<TestGuard>,
         l4: Option<Arc<L4Guard>>,
+        status: CaptureStatusWriter,
     ) -> CaptureSession {
         CaptureSession::new(
             Arc::new(CoreIngress::empty()),
@@ -744,8 +798,73 @@ mod tests {
             l4,
             verifier,
             PathBuf::from("/nonexistent-feeder-test-dir"),
+            status,
         )
         .with_scope_poll_interval(POLL)
+    }
+
+    /// [`session_with_status`] over a fresh handle nobody reads.
+    fn session_with(
+        verifier: Arc<dyn PeerVerifier>,
+        guard: Arc<TestGuard>,
+        l4: Option<Arc<L4Guard>>,
+    ) -> CaptureSession {
+        session_with_status(verifier, guard, l4, CaptureStatus::channel(true).0)
+    }
+
+    /// Poll `ready` every 5 ms until it holds, panicking with `what` after `PROMPT`.
+    async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+        timeout(PROMPT, async {
+            while !ready() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    }
+
+    /// Spec D7's `provider` object when detached.
+    fn detached_provider() -> Value {
+        obj([
+            ("attached_at", Value::Null),
+            ("state", s("detached")),
+            ("team_id", Value::Null),
+        ])
+    }
+
+    /// The CS-AC9 snapshot after a detach: provider cleared, counters zero, no
+    /// handoff time, feeder still listening, so the capability is `awaiting_provider`.
+    fn assert_detached_and_awaiting(snap: &CaptureStatusSnapshot) {
+        assert_eq!(snap.provider, ProviderState::Detached, "{snap:?}");
+        assert_eq!(snap.scope_tokens, Vec::<String>::new());
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
+        assert_eq!(snap.feeder, FeederState::Listening);
+        assert_eq!(snap.capability(), CaptureCapability::AwaitingProvider);
+        assert_eq!(at(&snap.to_value(), "provider"), &detached_provider());
+    }
+
+    /// Hand a verified provider to `serve_control` on its own task and consume the
+    /// initial `Scope` frame it is sent, then wait until the status handle `r` shows
+    /// the attachment recorded. Returns the task and the provider's channel.
+    async fn attach_and_receive_scope(
+        session: &Arc<CaptureSession>,
+        pairing: &Arc<Mutex<FlowPairing>>,
+        r: &CaptureStatusReader,
+        expected_scope: &str,
+    ) -> (ControlChannel, JoinHandle<()>) {
+        let (mut provider, core) = control_pair();
+        provider
+            .send(&hello(HANDOFF_PROTOCOL_VERSION))
+            .await
+            .unwrap();
+        let task = attach(session, pairing, core);
+        assert_eq!(next_frame(&mut provider).await, Some(scope(expected_scope)));
+        until("the attachment to be recorded", || {
+            matches!(r.snapshot().provider, ProviderState::Attached { .. })
+        })
+        .await;
+        (provider, task)
     }
 
     fn session(verifier: Arc<dyn PeerVerifier>, guard: Arc<TestGuard>) -> Arc<CaptureSession> {
@@ -1162,6 +1281,246 @@ mod tests {
         timeout(PROMPT, task).await.unwrap().unwrap();
     }
 
+    // ---- capture.status: the feeder's update points (spec D3) ----
+
+    /// **CS-AC7, CS-AC19.** Once the provider holds its initial `Scope`, the handle
+    /// reports the attachment: the verifier's team, an attach time inside the test's
+    /// bounds, the pushed tokens, zero handoffs, and `approved_attached`.
+    #[tokio::test]
+    async fn attach_records_provider_facts() {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let session = Arc::new(session_with_status(
+            StubVerifier::with_team(true, "995PCLM9KH"),
+            TestGuard::with_hosts(&["example.com"]),
+            None,
+            w,
+        ));
+        let pairing = new_pairing(&session);
+
+        let before = now_ms();
+        let (provider, task) =
+            attach_and_receive_scope(&session, &pairing, &r, "example.com").await;
+        let after = now_ms();
+
+        let snap = r.snapshot();
+        let ProviderState::Attached {
+            attached_at_ms: t,
+            team_id,
+        } = snap.provider.clone()
+        else {
+            panic!("expected an attached provider: {snap:?}");
+        };
+        assert_eq!(team_id, Some("995PCLM9KH".to_string()));
+        assert!(before <= t && t <= after, "{before} <= {t} <= {after}");
+        assert_eq!(snap.scope_tokens, vec!["example.com".to_string()]);
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
+        assert_eq!(snap.capability(), CaptureCapability::ApprovedAttached);
+        let v = snap.to_value();
+        assert_eq!(at(&v, "scope_entries"), &Value::Int(1));
+        assert_eq!(at(at(&v, "provider"), "state"), &s("attached"));
+        assert_eq!(at(at(&v, "provider"), "team_id"), &s("995PCLM9KH"));
+        assert_eq!(
+            at(at(&v, "provider"), "attached_at"),
+            &Value::Int(i64::try_from(t).unwrap())
+        );
+        assert_eq!(at(&v, "capability"), &s("approved_attached"));
+
+        drop(provider);
+        timeout(PROMPT, task).await.unwrap().unwrap();
+    }
+
+    /// **CS-AC7.** A verifier that pins no team (the default `StubVerifier`, like
+    /// any `PeerVerifier` that does not override `team_id`) reports `team_id: null`.
+    #[tokio::test]
+    async fn default_stub_verifier_reports_no_team() {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let session = Arc::new(session_with_status(
+            StubVerifier::new(true),
+            TestGuard::with_hosts(&["example.com"]),
+            None,
+            w,
+        ));
+        let pairing = new_pairing(&session);
+        let (provider, task) =
+            attach_and_receive_scope(&session, &pairing, &r, "example.com").await;
+
+        let snap = r.snapshot();
+        assert!(
+            matches!(snap.provider, ProviderState::Attached { team_id: None, .. }),
+            "{snap:?}"
+        );
+        assert_eq!(
+            at(at(&snap.to_value(), "provider"), "team_id"),
+            &Value::Null
+        );
+
+        drop(provider);
+        timeout(PROMPT, task).await.unwrap().unwrap();
+    }
+
+    /// **CS-AC8.** A scope re-push replaces the tokens the handle reports.
+    #[tokio::test]
+    async fn scope_repush_updates_tokens() {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let guard = TestGuard::with_hosts(&["example.com"]);
+        let session = Arc::new(session_with_status(
+            StubVerifier::new(true),
+            guard.clone(),
+            None,
+            w,
+        ));
+        let pairing = new_pairing(&session);
+        let (mut provider, task) =
+            attach_and_receive_scope(&session, &pairing, &r, "example.com").await;
+        assert_eq!(r.snapshot().scope_tokens, vec!["example.com".to_string()]);
+
+        guard.add_scope(ScopeEntry {
+            host: "api.test".to_string(),
+        });
+        assert_eq!(
+            next_frame(&mut provider).await,
+            Some(scope("example.com api.test"))
+        );
+        until("the re-pushed tokens to be recorded", || {
+            r.snapshot().scope_tokens.len() == 2
+        })
+        .await;
+
+        let snap = r.snapshot();
+        assert_eq!(
+            snap.scope_tokens,
+            vec!["example.com".to_string(), "api.test".to_string()]
+        );
+        assert_eq!(at(&snap.to_value(), "scope_entries"), &Value::Int(2));
+
+        drop(provider);
+        timeout(PROMPT, task).await.unwrap().unwrap();
+    }
+
+    /// **CS-AC9.** When the provider drops its channel, `serve_control` returns and
+    /// the attachment is cleared back to `awaiting_provider`.
+    #[tokio::test]
+    async fn detach_resets_to_awaiting_provider() {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let session = Arc::new(session_with_status(
+            StubVerifier::with_team(true, "995PCLM9KH"),
+            TestGuard::with_hosts(&["example.com"]),
+            None,
+            w,
+        ));
+        let pairing = new_pairing(&session);
+        let (provider, task) =
+            attach_and_receive_scope(&session, &pairing, &r, "example.com").await;
+
+        drop(provider);
+        timeout(PROMPT, task).await.unwrap().unwrap();
+
+        assert_detached_and_awaiting(&r.snapshot());
+    }
+
+    /// **CS-AC9 (RAII).** Cancelling the attachment task — what shutdown does to a
+    /// live attachment — records the same detach, because the guard's drop runs.
+    #[tokio::test]
+    async fn aborted_attachment_also_records_detach() {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let session = Arc::new(session_with_status(
+            StubVerifier::with_team(true, "995PCLM9KH"),
+            TestGuard::with_hosts(&["example.com"]),
+            None,
+            w,
+        ));
+        let pairing = new_pairing(&session);
+        let (provider, task) =
+            attach_and_receive_scope(&session, &pairing, &r, "example.com").await;
+
+        task.abort();
+        let _ = timeout(PROMPT, task)
+            .await
+            .expect("the aborted task settles");
+
+        assert_detached_and_awaiting(&r.snapshot());
+        drop(provider);
+    }
+
+    /// **CS-AC10, CS-AC19.** A paired flow that claims a slot is counted by its
+    /// kind and stamps the handoff time, turning the capability `capturing`.
+    #[tokio::test]
+    async fn start_pump_counts_handoffs_by_kind() {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let session = session_with_status(
+            StubVerifier::new(true),
+            TestGuard::with_hosts(&[]),
+            None,
+            w.clone(),
+        );
+        let _attachment = w.attached(None, vec![]);
+
+        let (tcp_half, _tcp_provider_half) = tokio::net::UnixStream::pair().unwrap();
+        let before = now_ms();
+        session.start_pump(open(1), DataConnection::for_test(1, tcp_half));
+        let after = now_ms();
+        let snap = r.snapshot();
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (1, 0));
+        let t = snap.last_handoff_at_ms.expect("a handoff time");
+        assert!(before <= t && t <= after, "{before} <= {t} <= {after}");
+        assert_eq!(snap.capability(), CaptureCapability::Capturing);
+        let v = snap.to_value();
+        assert_eq!(
+            at(&v, "flows_handed_off"),
+            &obj([("tcp", Value::Int(1)), ("udp", Value::Int(0))])
+        );
+        assert_eq!(
+            at(&v, "last_handoff_at"),
+            &Value::Int(i64::try_from(t).unwrap())
+        );
+        assert_eq!(at(&v, "capability"), &s("capturing"));
+
+        let (udp_half, _udp_provider_half) = tokio::net::UnixStream::pair().unwrap();
+        let udp = FlowOpen {
+            kind: FlowKind::Udp,
+            local: Some("127.0.0.1:5353".parse().unwrap()),
+            ..open(2)
+        };
+        session.start_pump(udp, DataConnection::for_test(2, udp_half));
+        let snap = r.snapshot();
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (1, 1));
+        assert_eq!(
+            at(&snap.to_value(), "flows_handed_off"),
+            &obj([("tcp", Value::Int(1)), ("udp", Value::Int(1))])
+        );
+    }
+
+    /// **CS-AC10.** A pair offered at the concurrency cap is shed before it is
+    /// counted: no handoff, no handoff time, still `approved_attached`.
+    #[tokio::test]
+    async fn shed_pair_is_not_counted() {
+        let (w, r) = CaptureStatus::channel(true);
+        w.listening();
+        let session = session_with_status(
+            StubVerifier::new(true),
+            TestGuard::with_hosts(&[]),
+            None,
+            w.clone(),
+        )
+        .with_max_concurrent_flows(0);
+        let _attachment = w.attached(None, vec![]);
+
+        let (half, _provider_half) = tokio::net::UnixStream::pair().unwrap();
+        session.start_pump(open(1), DataConnection::for_test(1, half));
+
+        let snap = r.snapshot();
+        assert_eq!((snap.tcp_handed_off, snap.udp_handed_off), (0, 0));
+        assert_eq!(snap.last_handoff_at_ms, None);
+        assert_eq!(snap.capability(), CaptureCapability::ApprovedAttached);
+    }
+
     fn capture_l4_entry(addr: &str) -> L4ScopeEntry {
         L4ScopeEntry {
             id: L4ScopeId::new(),
@@ -1425,21 +1784,39 @@ mod tests {
 
     /// LF-AC9: a socket directory that cannot be created (here, a path beneath a
     /// regular file) makes `run` log and return at once, without panicking and
-    /// without binding or publishing anything.
+    /// without binding or publishing anything. **CS-AC5:** the handle then reports
+    /// `bind_failed` with a path-free `io::ErrorKind` reason, derived `degraded`,
+    /// and the failure is terminal — `run` returning does not record `stopped`.
     #[tokio::test]
     async fn run_returns_when_the_socket_dir_is_unusable() {
         let blocker = TempPath::new();
         std::fs::write(blocker.path(), b"not a directory").unwrap();
+        let (w, r) = CaptureStatus::channel(true);
         let session = CaptureSession::new(
             Arc::new(CoreIngress::empty()),
             TestGuard::with_hosts(&[]),
             None,
             StubVerifier::new(true),
             blocker.path().join("sub"),
+            w,
         );
         timeout(PROMPT, session.run(std::future::pending::<()>()))
             .await
             .expect("run returns instead of waiting on a session that never started");
+
+        let reason = "cannot bind the capture sockets (not a directory)";
+        let snap = r.snapshot();
+        assert_eq!(snap.feeder, FeederState::BindFailed(reason.to_string()));
+        assert_ne!(snap.feeder, FeederState::Off(OffReason::Stopped));
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::Degraded(reason.to_string())
+        );
+        let v = snap.to_value();
+        assert_eq!(at(at(&v, "feeder"), "state"), &s("bind_failed"));
+        assert_eq!(at(at(&v, "feeder"), "reason"), &s(reason));
+        assert_eq!(at(&v, "capability"), &s("degraded"));
+        assert_eq!(at(&v, "capability_reason"), at(at(&v, "feeder"), "reason"));
     }
 
     /// `run` can be spawned as its own task (what the runtime wiring does): its
@@ -1450,5 +1827,184 @@ mod tests {
         let session = session_with(StubVerifier::new(true), TestGuard::with_hosts(&[]), None);
         let fut = session.run(std::future::pending::<()>());
         assert_send(&fut);
+    }
+
+    // ---- the two "cannot start" reasons never carry a path ----------------------
+
+    /// **CS-AC5, CS-AC15.** The one bind error whose `Display` embeds the
+    /// socket directory — `refuse_symlink`'s — reaches the handle as its
+    /// `io::ErrorKind` text only. The test first proves the full error does carry
+    /// the path (so the no-path assertion on the status reason discriminates), then
+    /// runs the session against the same symlinked dir. No socket is bound: the
+    /// refusal comes first.
+    #[tokio::test]
+    async fn bind_failure_reason_carries_the_error_kind_not_the_path() {
+        let scratch = TempPath::new();
+        std::fs::create_dir(scratch.path()).unwrap();
+        let target = scratch.path().join("squatter");
+        std::fs::create_dir(&target).unwrap();
+        let link = scratch.path().join("capture.d");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_text = link.display().to_string();
+
+        let logged = CaptureListener::bind(&link)
+            .err()
+            .expect("a symlinked socket dir is refused");
+        assert_eq!(logged.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            logged.to_string().contains(&link_text),
+            "the operator-log error names the path: {logged}"
+        );
+
+        let (w, r) = CaptureStatus::channel(true);
+        let session = CaptureSession::new(
+            Arc::new(CoreIngress::empty()),
+            TestGuard::with_hosts(&[]),
+            None,
+            StubVerifier::new(true),
+            link.clone(),
+            w,
+        );
+        timeout(PROMPT, session.run(std::future::pending::<()>()))
+            .await
+            .expect("run returns at once when the bind is refused");
+
+        let snap = r.snapshot();
+        let FeederState::BindFailed(reason) = &snap.feeder else {
+            panic!("expected bind_failed, got {:?}", snap.feeder);
+        };
+        assert_eq!(
+            reason,
+            &format!(
+                "cannot bind the capture sockets ({})",
+                io::ErrorKind::InvalidInput
+            )
+        );
+        assert!(
+            !reason.contains(&link_text),
+            "the status reason must not carry the path: {reason}"
+        );
+        assert!(!reason.contains('/'), "{reason}");
+        assert!(
+            !reason.contains("symlink"),
+            "nor the full error text: {reason}"
+        );
+        let rendered = format!("{:?}", snap.to_value());
+        assert!(
+            !rendered.contains(&link_text) && !rendered.contains('/'),
+            "{rendered}"
+        );
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::Degraded(reason.clone())
+        );
+        assert_ne!(
+            snap.feeder,
+            FeederState::Off(OffReason::Stopped),
+            "a bind failure is terminal"
+        );
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "nothing was created in the link target"
+        );
+
+        let _ = std::fs::remove_dir_all(scratch.path());
+    }
+
+    /// **CS-AC5 (the second "cannot start" step).** A socket dir whose
+    /// canonical path is too long for `sun_path` binds fine under a short spelling
+    /// (a symlinked *parent*, the system's own `/tmp` → `/private/tmp` shape, which
+    /// `refuse_symlink` allows) but cannot be published: `publish_rendezvous` fails
+    /// on its length check before it touches the rendezvous path, and the handle
+    /// reports `bind_failed` with the rendezvous wording and the error kind only.
+    /// Needs a real UDS bind, so it self-skips where the sandbox refuses one and
+    /// runs on Linux CI and in the Terminal panel.
+    #[tokio::test]
+    async fn rendezvous_publish_failure_is_reported_as_bind_failed() {
+        let scratch = TempPath::new();
+        std::fs::create_dir(scratch.path()).unwrap();
+        let probe = scratch.path().join("probe.sock");
+        match std::os::unix::net::UnixListener::bind(&probe) {
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                ) =>
+            {
+                eprintln!("skipped: UDS bind unavailable (run via Terminal panel)");
+                let _ = std::fs::remove_dir_all(scratch.path());
+                return;
+            }
+            Err(e) => panic!("the probe bind failed unexpectedly: {e}"),
+        }
+        let _ = std::fs::remove_file(&probe);
+
+        // A real directory whose canonical path is far past the `sun_path` budget,
+        // reached through a short symlinked parent so the bind path itself fits.
+        let real_parent = scratch.path().join(format!("real-{}", "x".repeat(120)));
+        std::fs::create_dir(&real_parent).unwrap();
+        let short_parent = scratch.path().join("p");
+        std::os::unix::fs::symlink(&real_parent, &short_parent).unwrap();
+        let socket_dir = short_parent.join("s");
+        let bind_path_len = socket_dir
+            .join(crate::macos_capture::listener::CONTROL_SOCK)
+            .as_os_str()
+            .len();
+        if bind_path_len >= 104 {
+            eprintln!(
+                "skipped: the temp dir is too long for a sun_path bind ({bind_path_len} bytes)"
+            );
+            let _ = std::fs::remove_dir_all(scratch.path());
+            return;
+        }
+
+        let (w, r) = CaptureStatus::channel(true);
+        let session = CaptureSession::new(
+            Arc::new(CoreIngress::empty()),
+            TestGuard::with_hosts(&[]),
+            None,
+            StubVerifier::new(true),
+            socket_dir.clone(),
+            w,
+        );
+        timeout(PROMPT, session.run(std::future::pending::<()>()))
+            .await
+            .expect("run returns at once when the rendezvous cannot be published");
+
+        let snap = r.snapshot();
+        let FeederState::BindFailed(reason) = &snap.feeder else {
+            panic!("expected bind_failed, got {:?}", snap.feeder);
+        };
+        assert_eq!(
+            reason,
+            &format!(
+                "cannot publish the rendezvous file ({})",
+                io::ErrorKind::InvalidInput
+            )
+        );
+        assert!(!reason.contains('/'), "{reason}");
+        assert_eq!(
+            snap.capability(),
+            CaptureCapability::Degraded(reason.clone())
+        );
+        let v = snap.to_value();
+        assert_eq!(at(at(&v, "feeder"), "state"), &s("bind_failed"));
+        assert_eq!(at(&v, "capability"), &s("degraded"));
+        assert_eq!(at(&v, "capability_reason"), at(at(&v, "feeder"), "reason"));
+        assert_ne!(
+            snap.feeder,
+            FeederState::Off(OffReason::Stopped),
+            "a publish failure is terminal"
+        );
+        assert!(
+            !socket_dir
+                .join(crate::macos_capture::listener::CONTROL_SOCK)
+                .exists(),
+            "the sockets bound under the short path were removed when the listener dropped"
+        );
+
+        let _ = std::fs::remove_dir_all(scratch.path());
     }
 }

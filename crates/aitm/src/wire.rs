@@ -42,6 +42,7 @@ use crate::ingress::CoreIngress;
 use crate::macos_capture::config::MacosCaptureConfig;
 use crate::macos_capture::feeder::CaptureSession;
 use crate::macos_capture::peer_auth::PeerVerifier;
+use crate::macos_capture::status::{CaptureStatus, CaptureStatusPlugin, CaptureStatusWriter};
 
 /// Which removable first-party feature plugins to register. Dropping one here is
 /// the whole of AC-P3: the command disappears from the registry with no core edit.
@@ -141,6 +142,10 @@ pub struct Assembled {
     /// divergent copy. Read-only use: the feeder only lists scope here; every
     /// authorization still goes through the ingress's own `L4Guard::check`.
     pub l4_guard: Option<Arc<L4Guard>>,
+    /// Write side of the `capture.status` handle; move it into
+    /// [`build_capture_session`]. Dropping it unused leaves the verb reporting the
+    /// constructor's `off` state.
+    pub capture_status: CaptureStatusWriter,
     /// The sealed [`Governance`] that [`Assembled::governance`] hands out;
     /// private so the `pub` fields above cannot substitute it.
     governance: Governance,
@@ -316,6 +321,10 @@ pub fn assemble_with_scripts(
     for module in ordered_modules(http, passthrough_list, inject) {
         builder = builder.register_module(module);
     }
+    // The `capture.status` handle: the writer leaves in `Assembled` for the macOS
+    // capture feeder (`build_capture_session`); the reader serves the bus verb.
+    let (capture_status, capture_status_reader) =
+        CaptureStatus::channel(features.macos_capture.enabled);
     builder = builder
         // First-party plugins, in chain order. Intercept precedes mutate so a
         // request is parked before mutate would act (data-flow 2).
@@ -332,7 +341,11 @@ pub fn assemble_with_scripts(
         )))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(intercept))
-        .register_plugin(Box::new(ControlPlugin::new(armed, listening.clone())));
+        .register_plugin(Box::new(ControlPlugin::new(armed, listening.clone())))
+        // The macOS NE capture feeder's read-only state (`capture.status`), beside
+        // `proxy.status`: registered on every platform and for every `Features`, so
+        // a client can always ask why nothing is captured (capture-status spec D8).
+        .register_plugin(Box::new(CaptureStatusPlugin::new(capture_status_reader)));
     if features.mutate {
         builder = builder.register_plugin(Box::new(MutatePlugin::new()));
     }
@@ -461,6 +474,7 @@ pub fn assemble_with_scripts(
         audit_ring,
         l4_ingress,
         l4_guard,
+        capture_status,
         governance,
     })
 }
@@ -474,7 +488,9 @@ pub fn assemble_with_scripts(
 /// [`CaptureSession::run`], so the disabled path costs nothing and is testable in a
 /// sandbox. `ingress`, `l7_guard` and `l4_guard` are the assembled proxy's own
 /// ([`Assembled::l4_ingress`], `Proxy::guard`, [`Assembled::l4_guard`]), so a
-/// captured flow is gated by exactly the guards a proxied one is.
+/// captured flow is gated by exactly the guards a proxied one is. `status` is the
+/// assembly's [`Assembled::capture_status`]; when the switch is off it is dropped
+/// here, so the `capture.status` verb keeps reporting `off`.
 #[must_use]
 pub fn build_capture_session(
     features: &Features,
@@ -483,11 +499,18 @@ pub fn build_capture_session(
     l4_guard: Option<Arc<L4Guard>>,
     verifier: Arc<dyn PeerVerifier>,
     socket_dir: PathBuf,
+    status: CaptureStatusWriter,
 ) -> Option<CaptureSession> {
-    features
-        .macos_capture
-        .enabled
-        .then(|| CaptureSession::new(Arc::new(ingress), l7_guard, l4_guard, verifier, socket_dir))
+    features.macos_capture.enabled.then(|| {
+        CaptureSession::new(
+            Arc::new(ingress),
+            l7_guard,
+            l4_guard,
+            verifier,
+            socket_dir,
+            status,
+        )
+    })
 }
 
 /// The protocol modules in registration order. [`PassthroughModule`] is **first**
@@ -613,6 +636,9 @@ pub use aitm_proto_http::Http1Sender;
 mod tests {
     use super::*;
     use crate::macos_capture::peer_auth::CodeSignatureVerifier;
+    use crate::macos_capture::status::{FeederState, OffReason};
+    use crate::macos_capture::test_support::{at, disabled_literal, s};
+    use aitm_core::{CommandHost, Params, Value};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
@@ -646,6 +672,7 @@ mod tests {
             sni: Some("example.com".to_string()),
             first_bytes: vec![0x16, 0x03, 0x01],
             peer_identity: None,
+            interface: "test-if".to_string(),
         };
         assert_eq!(
             ingress.dispatch_tcp(flow).await,
@@ -665,9 +692,13 @@ mod tests {
         }
     }
 
-    /// `build_capture_session` over inert parts: nothing here binds or runs, because
-    /// building a session is pure and only `run` touches a socket.
-    fn build_with(features: &Features) -> Option<CaptureSession> {
+    /// `build_capture_session` over inert parts and the given status writer: nothing
+    /// here binds or runs, because building a session is pure and only `run` touches
+    /// a socket.
+    fn build_with_status(
+        features: &Features,
+        status: CaptureStatusWriter,
+    ) -> Option<CaptureSession> {
         build_capture_session(
             features,
             crate::ingress::CoreIngress::empty(),
@@ -675,7 +706,40 @@ mod tests {
             None,
             Arc::new(CodeSignatureVerifier::default()),
             std::path::PathBuf::from("/nonexistent-wire-test-dir"),
+            status,
         )
+    }
+
+    /// [`build_with_status`] over a fresh handle nobody reads.
+    fn build_with(features: &Features) -> Option<CaptureSession> {
+        build_with_status(
+            features,
+            CaptureStatus::channel(features.macos_capture.enabled).0,
+        )
+    }
+
+    /// CS-AC20: with the feature off, `build_capture_session` builds nothing and
+    /// drops the writer, so the handle keeps reporting the constructor's disabled
+    /// state, the D7 literal.
+    #[test]
+    fn disabled_capture_session_leaves_status_off() {
+        let (w, r) = CaptureStatus::channel(false);
+        assert!(build_with_status(&capture_features(false), w).is_none());
+        assert_eq!(r.snapshot().to_value(), disabled_literal());
+    }
+
+    /// Building an enabled session is pure: until `run` binds, the handle reports
+    /// `not started` on macOS and `not a macOS build` elsewhere.
+    #[test]
+    fn enabled_capture_session_is_not_started_until_run() {
+        let (w, r) = CaptureStatus::channel(true);
+        assert!(build_with_status(&capture_features(true), w).is_some());
+        let expected = if cfg!(target_os = "macos") {
+            OffReason::NotStarted
+        } else {
+            OffReason::NotMacos
+        };
+        assert_eq!(r.snapshot().feeder, FeederState::Off(expected));
     }
 
     /// LF-AC1: with `macos_capture.enabled = false` (the default) no capture session
@@ -693,6 +757,95 @@ mod tests {
     #[test]
     fn capture_session_present_when_enabled() {
         assert!(build_with(&capture_features(true)).is_some());
+    }
+
+    /// Invoke the registered `capture.status` the way a frontend does: through the
+    /// proxy's registry, over the service handles `main` shares with the frontends.
+    fn invoke_capture_status(proxy: &Proxy, cfg: &Config) -> Value {
+        let services = crate::tui::services(proxy, cfg, None, crate::tui::TuiLog::Off);
+        let host = CommandHost::new(&*services.store, &*services.client, &*services.guard, None);
+        proxy
+            .registry()
+            .command("capture.status")
+            .expect("registered")
+            .invoke(Params::default(), &host)
+            .expect("capture.status never errors")
+    }
+
+    /// **CS-AC3.** The default feature set and an explicit
+    /// `macos_capture.enabled = false` both register a `capture.status` that
+    /// returns exactly the D7 disabled literal.
+    #[test]
+    fn capture_status_verb_reports_the_disabled_literal() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("capture-status-default");
+        let assembled = assemble(&cfg).expect("assemble with default features");
+        assert_eq!(
+            invoke_capture_status(&assembled.proxy, &cfg),
+            disabled_literal(),
+            "default features"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("capture-status-off");
+        let assembled =
+            assemble_with(&cfg, &capture_features(false)).expect("assemble, capture off");
+        assert_eq!(
+            invoke_capture_status(&assembled.proxy, &cfg),
+            disabled_literal(),
+            "capture_features(false)"
+        );
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// **CS-AC20.** The registered verb reads the handle built from the `Features`
+    /// passed to assembly: with the switch on it reports `enabled: true` and the
+    /// constructor's platform-derived `off` reason.
+    #[test]
+    fn capture_status_verb_follows_the_feature_switch() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("capture-status-on");
+        let assembled = assemble_with(&cfg, &capture_features(true)).expect("assemble, capture on");
+        let status = invoke_capture_status(&assembled.proxy, &cfg);
+        assert_eq!(at(&status, "enabled"), &Value::Bool(true));
+        assert_eq!(at(&status, "capability"), &s("feeder_off"));
+        let reason = if cfg!(target_os = "macos") {
+            "not started"
+        } else {
+            "not a macOS build"
+        };
+        assert_eq!(at(at(&status, "feeder"), "reason"), &s(reason));
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
+    }
+
+    /// **CS-AC20.** `Assembled.capture_status` is the writer of the channel the
+    /// registered verb reads: handing it to `build_capture_session` with the switch
+    /// off builds nothing, drops the writer, and the verb keeps reporting the
+    /// disabled literal.
+    #[test]
+    fn disabled_session_drops_the_writer_and_the_verb_stays_off() {
+        let mut cfg = Config::default();
+        cfg.ca.dir = temp_ca_dir("capture-status-dropped");
+        let features = capture_features(false);
+        let Assembled {
+            proxy,
+            l4_ingress,
+            capture_status,
+            ..
+        } = assemble_with(&cfg, &features).expect("assemble, capture off");
+        let session = build_capture_session(
+            &features,
+            l4_ingress.expect("the stream half of the capture ingress is wired for every build"),
+            proxy.guard(),
+            None,
+            Arc::new(CodeSignatureVerifier::default()),
+            PathBuf::from("/nonexistent-wire-test-dir"),
+            capture_status,
+        );
+        assert!(session.is_none(), "the switch is off: no session");
+        assert_eq!(invoke_capture_status(&proxy, &cfg), disabled_literal());
+        let _ = std::fs::remove_dir_all(&cfg.ca.dir);
     }
 
     /// `Assembled.l4_guard` is `Some` exactly when L4 is enabled, and it is the
