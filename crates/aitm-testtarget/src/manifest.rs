@@ -175,52 +175,52 @@ pub fn manifest() -> &'static [PlantedVuln] {
                     &format!("GET /ldap?user=* — the filter (uid=<user>) is built raw: * lists {}, bob, carol plus the marker; )( or an unbalanced filter answers 500 {}; patched applies RFC 4515 escaping of * ( ) \\ NUL", seed::SESSION_USER, seed::LDAPI_ERROR_SIGNAL),
                     seed::LDAPI_ALL_USERS_MARKER,
                 ),
-                // --- T10 reflection seeds (D3; class xss, kind per row) ---
+                // --- T10 reflection seeds (D3; class reflected-xss, kind per row) ---
                 planted(
                     "header-reflection-whoami",
-                    "xss",
+                    "reflected-xss",
                     "/whoami",
                     "GET /whoami — User-Agent and X-Forwarded-For are reflected raw into <p>agent: ...</p><p>from: ...</p>; patched escapes",
                     "reflection kind header (AC T2-3)",
                 ),
                 planted(
                     "cookie-reflection-prefs",
-                    "xss",
+                    "reflected-xss",
                     "/prefs",
                     "GET /prefs with Cookie: theme=<value> — reflected raw into <body class=\"...\">; no cookie -> Set-Cookie: theme=light; Path=/; patched escapes",
                     "reflection kind cookie (AC T2-3)",
                 ),
                 planted(
                     "nested-json-reflection-profile",
-                    "xss",
+                    "reflected-xss",
                     "/api/profile",
                     "POST /api/profile JSON {\"profile\":{\"address\":{\"city\":\"<value>\"}}} — city is reflected raw into text/html <div class=\"city\">...</div>; patched escapes",
                     "reflection kind json_value path profile.address.city (AC T2-2)",
                 ),
                 planted(
                     "multipart-reflection-upload",
-                    "xss",
+                    "reflected-xss",
                     "/upload",
                     "POST /upload multipart with a file part (filename) and a note field — both reflected raw into <p>uploaded <filename> (<n> bytes): <note></p>; patched escapes",
                     "reflection kinds multipart_value and multipart_filename",
                 ),
                 planted(
                     "path-segment-docs-slug",
-                    "xss",
+                    "reflected-xss",
                     "/docs/{slug}",
                     "GET /docs/<slug> (non-numeric segment) — reflected raw into <h1>Doc: ...</h1>; patched escapes",
                     "reflection kind path_segment",
                 ),
                 planted(
                     "path-filename-files",
-                    "xss",
+                    "reflected-xss",
                     "/files/{name}.txt",
                     "GET /files/<name>.txt — the stem is reflected raw into <p>file <name>.txt</p>; patched escapes",
                     "reflection kind path_filename",
                 ),
                 planted(
                     "auth-only-account-tab",
-                    "xss",
+                    "reflected-xss",
                     "/account",
                     &format!("GET /account?tab=<value> with a valid session cookie (POST /login user={}&pass={}) — reflected raw into <h2>Account: ...</h2>; without a session -> 302 /login in both modes; patched escapes", seed::SESSION_USER, seed::SESSION_PASS),
                     "reflection reachable only with the observed session (AC T2-4)",
@@ -550,7 +550,6 @@ mod tests {
             "crlf",
             "nosqli",
             "ldapi",
-            "xss",
             "cswsh",
             "ws-input-reflection",
             "missing-hsts",
@@ -560,6 +559,31 @@ mod tests {
         .into_iter()
         .collect();
         assert_eq!(classes, expected);
+
+        // T3's class token: every reflection kind is `reflected-xss`, the
+        // same class as the legacy `/search` row (there is no `xss` class).
+        for id in [
+            "header-reflection-whoami",
+            "cookie-reflection-prefs",
+            "nested-json-reflection-profile",
+            "multipart-reflection-upload",
+            "path-segment-docs-slug",
+            "path-filename-files",
+            "auth-only-account-tab",
+        ] {
+            let row = manifest()
+                .iter()
+                .find(|v| v.id == id)
+                .unwrap_or_else(|| panic!("row {id}"));
+            assert_eq!(row.class, "reflected-xss", "{id}");
+        }
+        assert_eq!(
+            manifest()
+                .iter()
+                .filter(|v| v.class == "reflected-xss")
+                .count(),
+            8
+        );
 
         // Ids are unique: the grader reports `missing` by id.
         let ids: BTreeSet<&str> = manifest().iter().map(|v| v.id.as_str()).collect();
