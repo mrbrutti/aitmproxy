@@ -564,6 +564,12 @@ impl ProbeHost for ModeRecordingHost {
     fn shared(&self) -> Option<Arc<dyn ProbeHost>> {
         self.me.upgrade().map(|host| host as Arc<dyn ProbeHost>)
     }
+    /// A script check must never run on the unbudgeted namespace client, so
+    /// the bridge treats `client() == None` as an error verdict; this host
+    /// lends the model's `NullClient` the way `RecordingHost` does.
+    fn client(&self) -> Option<Arc<dyn aitm_core::ProxyClient>> {
+        Some(Arc::new(aitm_scan_model::testing::NullClient))
+    }
 }
 
 /// T3: `probe.send` takes the map form too, so a check can append to the value
@@ -647,4 +653,328 @@ async fn probe_response_has_the_http_send_shape() {
         verdict.detail, "body,elapsed_ms,flow_id,headers,status|yes|body|7|()",
         "a probe response must read like an http.send response"
     );
+}
+
+// ---- tester additions -------------------------------------------------------
+
+/// Spec D4: `origin` is the bridge's to supply from where the script came from.
+/// A script that declares one — claiming to be `native` or `bundled` — is
+/// refused on that key at load, and nothing from it is registered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_declaring_origin_is_refused_on_that_key() {
+    let loader = loader();
+    let checks = Arc::new(CheckRegistry::new());
+    for claimed in [r#""native""#, r#"#{ kind: "bundled", path: "x" }"#] {
+        let Err(err) = run_load(
+            &loader,
+            &checks,
+            "liar.rhai",
+            &check_script(&meta_src(&format!(", origin: {claimed}")), r#""nothing""#),
+        ) else {
+            panic!("a script declaring origin {claimed} must not load");
+        };
+        match &err {
+            ScriptError::CheckMeta {
+                key, check, script, ..
+            } => {
+                assert_eq!(key, "origin", "{err}");
+                assert_eq!(check.as_deref(), Some("demo-check"), "{err}");
+                assert_eq!(script, "liar.rhai", "{err}");
+            }
+            other => panic!("expected a CheckMeta error, got {other:?}"),
+        }
+        assert!(err.to_string().contains("origin"), "{err}");
+        assert!(checks.is_empty(), "a refused script registers nothing");
+    }
+}
+
+/// Spec D4 "a load error naming the key": a key that is not `CheckMeta`'s is
+/// refused by name with the legal keys listed, and a legal key holding a token
+/// outside its vocabulary is refused on *that* key, not on the map as a whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_and_invalid_meta_keys_are_refused_by_name() {
+    let loader = loader();
+    let checks = Arc::new(CheckRegistry::new());
+
+    let Err(err) = run_load(
+        &loader,
+        &checks,
+        "<source>",
+        &check_script(&meta_src(r#", colour: "red""#), r#""nothing""#),
+    ) else {
+        panic!("an unknown meta key must not load");
+    };
+    match &err {
+        ScriptError::CheckMeta { key, message, .. } => {
+            assert_eq!(key, "colour");
+            assert!(
+                message.contains("kinds"),
+                "the legal keys are listed: {message}"
+            );
+            assert!(message.contains("remediation"), "{message}");
+        }
+        other => panic!("expected a CheckMeta error, got {other:?}"),
+    }
+    assert!(checks.is_empty());
+
+    for (replace, with, key) in [
+        (r#"kinds: ["query"]"#, r#"kinds: ["telepathy"]"#, "kinds"),
+        (
+            r#"lanes: ["http"]"#,
+            r#"lanes: ["carrier-pigeon"]"#,
+            "lanes",
+        ),
+        (r#"severity: "low""#, r#"severity: "scary""#, "severity"),
+        (r#"intensity: "light""#, r#"intensity: 3"#, "intensity"),
+        (r#"id: "demo-check""#, r#"id: 42"#, "id"),
+        (r#"name: "Demo""#, r#"name: ()"#, "name"),
+    ] {
+        let Err(err) = run_load(
+            &loader,
+            &checks,
+            "<source>",
+            &check_script(&meta_src("").replace(replace, with), r#""nothing""#),
+        ) else {
+            panic!("`{with}` must not load");
+        };
+        match &err {
+            ScriptError::CheckMeta { key: got, .. } => assert_eq!(got, key, "`{with}`: {err}"),
+            other => panic!("expected a CheckMeta error for `{with}`, got {other:?}"),
+        }
+        assert!(checks.is_empty(), "`{with}` registered something");
+    }
+
+    // The optional keys are accepted and land on the meta (T3 live-run bug:
+    // `remediation` was once refused).
+    run_load(
+        &loader,
+        &checks,
+        "<source>",
+        &check_script(
+            &meta_src(
+                r#", remediation: "fix it", cwe: 79, wants_traits: ["url"],
+                   needs_baseline: true, targets_session: true"#,
+            ),
+            r#""nothing""#,
+        ),
+    )
+    .expect("every optional key is legal");
+    let meta = checks.snapshot()[0].meta().clone();
+    assert_eq!(meta.remediation.as_deref(), Some("fix it"));
+    assert_eq!(meta.cwe, Some(79));
+    assert_eq!(
+        meta.wants_traits,
+        Some(vec![aitm_scan_model::vocab::PointTrait::Url])
+    );
+    assert!(meta.needs_baseline);
+    assert!(meta.targets_session);
+}
+
+/// The hint speaks the PoC vocabulary in full: `not`, `any` and `regex` parse,
+/// and a `control` becomes a `ControlHint` with its own assertion list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poc_hint_accepts_not_any_regex_and_a_control() {
+    let (verdict, _host) = verdict_of(
+        r#"#{ outcome: "vulnerable", confidence: "firm", detail: "d",
+             poc_hint: #{
+                 matchers: [ #{ not: #{ type: "status", status: 500 } },
+                             #{ any: [ #{ type: "word", word: "AITM" },
+                                       #{ type: "regex", regex: "A.TM", part: "header" } ] } ],
+                 control: #{ payload: "benign",
+                             matchers: [ #{ type: "status", status: 200 } ] } } }"#,
+        200,
+        "body",
+    )
+    .await;
+
+    assert_eq!(verdict.outcome, Outcome::Vulnerable);
+    assert_eq!(
+        verdict.poc_hint,
+        Some(PocHint {
+            assertions: vec![Assertion::All(vec![
+                Assertion::Not(Box::new(Assertion::Status(500))),
+                Assertion::Any(vec![
+                    Assertion::Word {
+                        word: "AITM".to_string(),
+                        part: MatchPart::Body,
+                    },
+                    Assertion::Regex {
+                        regex: "A.TM".to_string(),
+                        part: MatchPart::Header,
+                    },
+                ]),
+            ])],
+            control: Some(aitm_scan_model::check::ControlHint {
+                payload: "benign".to_string(),
+                expect: vec![Assertion::All(vec![Assertion::Status(200)])],
+            }),
+        })
+    );
+}
+
+/// A hint the PoC vocabulary cannot read is an `error` verdict naming
+/// `poc_hint` — never a vulnerable verdict with a hint that would later fail
+/// to reproduce, and never a silent drop of the hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_poc_hint_is_an_error_verdict() {
+    for hint in [
+        r#"#{ matchers: "nope" }"#,
+        r#"#{ matchers: [ #{ type: "telepathy" } ] }"#,
+        r#"#{ }"#,
+        r#"#{ matchers: [ #{ type: "status", status: 200 } ], control: #{ matchers: [] } }"#,
+        r#""just a string""#,
+    ] {
+        let (verdict, _host) = verdict_of(
+            &format!(r#"#{{ outcome: "vulnerable", detail: "d", poc_hint: {hint} }}"#),
+            200,
+            "body",
+        )
+        .await;
+        assert_eq!(
+            verdict.outcome,
+            Outcome::Error,
+            "{hint}: {:?}",
+            verdict.detail
+        );
+        assert!(
+            verdict.detail.contains("poc_hint"),
+            "{hint}: the detail names the field: {:?}",
+            verdict.detail
+        );
+        assert_eq!(verdict.poc_hint, None, "{hint}");
+    }
+
+    // An unknown verdict key is refused the same way (spec D4: no silent no-op).
+    let (verdict, _host) = verdict_of(
+        r#"#{ outcome: "vulnerable", severity: "high" }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert_eq!(verdict.outcome, Outcome::Error);
+    assert!(verdict.detail.contains("severity"), "{:?}", verdict.detail);
+
+    // And an unknown confidence token.
+    let (verdict, _host) =
+        verdict_of(r#"#{ outcome: "clean", confidence: "sure" }"#, 200, "body").await;
+    assert_eq!(verdict.outcome, Outcome::Error);
+    assert!(verdict.detail.contains("sure"), "{:?}", verdict.detail);
+}
+
+/// `timing_fit`'s three gates, each alone: fewer than two distinct delays is
+/// never a correlation; a slope far from one is not; and observations that do
+/// not grow with the requested delay are not, however high `r` is. Empty and
+/// mismatched inputs are handled, not panicked on.
+#[test]
+fn timing_fit_edges_and_levenshtein_bounds() {
+    let one_delay = timing_fit(&[2.0, 2.0, 2.0], &[2000, 2100, 1900]);
+    assert!(!one_delay.correlated, "{one_delay:?}");
+    assert_eq!(one_delay.r, 0.0);
+
+    let empty = timing_fit(&[], &[]);
+    assert!(!empty.correlated, "{empty:?}");
+    let short = timing_fit(&[1.0, 3.0, 1.0], &[1000]);
+    assert!(
+        !short.correlated,
+        "mismatched lengths take the shorter: {short:?}"
+    );
+
+    // Perfectly linear, r == 1, but twice as slow as requested: the slope gate.
+    let doubled = timing_fit(&[1.0, 3.0, 1.0, 3.0], &[2000, 6000, 2000, 6000]);
+    assert!(doubled.r > 0.99, "{doubled:?}");
+    assert!((doubled.slope - 2.0).abs() < 0.05, "{doubled:?}");
+    assert!(!doubled.correlated, "{doubled:?}");
+
+    // The target got slower while the probes ran: a short delay observed late
+    // outlasted a long delay observed early (ZAP's alternating rule).
+    let drifting = timing_fit(&[1.0, 3.0, 1.0, 3.0], &[1000, 3000, 3200, 3100]);
+    assert!(!drifting.correlated, "{drifting:?}");
+
+    // Two points are enough when they agree.
+    let two = timing_fit(&[1.0, 3.0], &[1000, 3000]);
+    assert!(two.correlated, "{two:?}");
+
+    assert_eq!(levenshtein_ratio("abc", ""), 0.0);
+    assert_eq!(levenshtein_ratio("same", "same"), 1.0);
+    assert!((levenshtein_ratio("héllo", "hello") - 0.8).abs() < 1e-6);
+    let long = "a".repeat(4_000);
+    assert_eq!(levenshtein_ratio(&long, &long), 1.0);
+}
+
+/// `probe.*` is refused outside a check for every verb that reaches the host,
+/// not only `marker`, and the refusal points the author at `http.send`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_probe_verb_is_refused_outside_a_check() {
+    let loader = loader();
+    let checks = Arc::new(CheckRegistry::new());
+    let registry = run_load(
+        &loader,
+        &checks,
+        "<source>",
+        r#"fn load(reg) {
+               reg.add_command("demo.send", "", |args| probe.send("x"));
+               reg.add_command("demo.baseline", "", |args| probe.baseline());
+               reg.add_command("demo.raw", "", |args| probe.raw(#{ method: "GET", url: "http://ex.test/" }));
+               reg.add_command("demo.budget", "", |args| probe.budget_left());
+           }"#,
+    )
+    .expect("the script loads");
+
+    let store = MemFlowStore::new();
+    let client = StubClient;
+    let guard = StdGuard::default();
+    let host = CommandHost::new(&store, &client, &guard, None);
+    for name in ["demo.send", "demo.baseline", "demo.raw", "demo.budget"] {
+        let err = registry
+            .command(name)
+            .expect("the command is registered")
+            .invoke(Params::default(), &host)
+            .expect_err("probe.* outside a check must be refused");
+        assert!(
+            err.to_string().contains("only available inside a check"),
+            "{name}: {err}"
+        );
+        assert!(err.to_string().contains("http.send"), "{name}: {err}");
+    }
+}
+
+/// `probe.send` with an empty payload and a payload map missing `value` are
+/// handled explicitly: the empty string is a legal (if odd) payload the host
+/// sees, and a map without `value` is refused by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn probe_send_empty_payload_and_missing_value() {
+    let (verdict, host) = verdict_of(
+        r#"{ let r = probe.send(""); if r.status == 200 { "sent" } else { "no" } }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert_eq!(verdict.detail, "sent");
+    assert_eq!(host.payloads(), vec![String::new()]);
+
+    let (verdict, host) = verdict_of(
+        r#"{ let out = "no error";
+             try { probe.send(#{ mode: "suffix" }); } catch (e) { out = "" + e; }
+             out }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert!(
+        verdict.detail.contains("value"),
+        "a map without `value` is refused by name: {:?}",
+        verdict.detail
+    );
+    assert!(host.payloads().is_empty(), "nothing was sent");
+
+    let (verdict, host) = verdict_of(
+        r#"{ let out = "no error";
+             try { probe.send(#{ value: "x", colour: "red" }); } catch (e) { out = "" + e; }
+             out }"#,
+        200,
+        "body",
+    )
+    .await;
+    assert!(verdict.detail.contains("colour"), "{:?}", verdict.detail);
+    assert!(host.payloads().is_empty(), "nothing was sent");
 }
