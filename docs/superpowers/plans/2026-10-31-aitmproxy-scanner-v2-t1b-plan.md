@@ -1639,8 +1639,9 @@ Kept by the main session during stage 6. One row per finding.
 | 14 | Proof prep (Task 19) | Critical | `jobs::start` strips the port before `guard.in_scope`, so a `host:port` scope entry never admits a `scan.start` origin (every e2e cell seeds one) | fixed in 27970b12 (jobs.rs and manual_check.rs; four tests) |
 | 19 | Proof prep | Note | P12 must use MITM'd HTTPS (`missing-hsts` is guarded on `https://`); P3 "zero issues on Patched" means zero active-class issues (passive ones may fire); P9 is `EXPECTED_TOOLS ⊆ live` (frontends.rs builds a server without the Rhai/findings plugins) with the `scan.*` slice equal; the relay is a second wire witness only (the target's control log is on main) | plan wording amended for Task 19 |
 | T10 cell | Proof prep (external) | Important | `tests/e2e/scan/test_t1_catalogue.py` pins `NATIVE_IDS = {"xss-reflected", ...}`; the interim ids are `reflected-xss` etc. | coordinator 2026-11-01: interim ids renamed to `xss-reflected`/`open-redirect` (rename task after the scope fix); Task 19 makes the cell a subset assertion |
-| 12 | Live run | Critical | Interim lane discovers nothing without a browser or captured flows; every T1 cell's job ends with 0 points | fix dispatched 2026-11-01: client crawl fallback (root, same-origin links/forms, bounded, `crawl`-marked captures) |
+| 12 | Live run | Critical | Interim lane discovers nothing without a browser or captured flows; every T1 cell's job ends with 0 points | fixed in 54223f7f (`interim_crawl.rs`; `use_browser: never` skips the browser, `max_pages: 0` skips every crawl) |
 | 15 | Live run | Important | `scan.start` `profile`/`overrides` ParamSchema refuses valid ScanProfile keys (`name`, `accuracy`) | fixed in 587e5bdd (the param was an empty closed Object) |
+| 14 | Coder (client crawl) | Minor | `worker.rs` counts `crawl.pages` as store growth + lane charges, so browser-crawl pages count twice | whole-branch fix round |
 
 ## Shipped
 
