@@ -20,23 +20,24 @@ struct ScanIssuesTab: View {
             ScanIssueFilterBar(state: state)
             Rule()
             if let error = state.surface.issuesError {
-                ScanIssueErrorLine(text: error)
+                // A failed read or update, inline under the filter bar; the list it
+                // could not refresh stays as it was (D11).
+                ScanInlineError(text: error)
                 Rule()
             }
             HStack(spacing: 0) {
                 list
                     .frame(width: 360)
-                    .gridProbe("scan-issues-list", area: "scan-issues", edge: nil)
+                    .gridProbe("scan-issues-list", area: "scan", edge: nil)
                 VRule()
                 detail
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .gridProbe("scan-issues-detail", area: "scan-issues", edge: nil)
+                    .gridProbe("scan-issues-detail", area: "scan", edge: nil)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        .gridArea("scan-issues", inset: 0)
     }
 
     // MARK: List
@@ -45,9 +46,7 @@ struct ScanIssuesTab: View {
         let sections = state.surface.issuesGroupedBySeverity()
         if sections.isEmpty {
             ContentUnavailableView {
-                Label("No issues", systemImage: Tok.Glyph.search)
-            } description: {
-                Text("Start a scan, or widen the filters.")
+                Label(scanNoIssuesText, systemImage: Tok.Glyph.search)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -98,12 +97,10 @@ struct ScanIssuesTab: View {
             ScanIssueDetail(state: state, issue: issue)
                 .id(issue.id)
         } else {
-            ContentUnavailableView {
-                Label("No issue selected", systemImage: Tok.Glyph.search)
-            } description: {
-                Text("Select an issue to read its evidence.")
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Text(scanSelectIssueText)
+                .font(Tok.Face.ui(Tok.Typography.Size.md))
+                .foregroundStyle(Tok.Ink.tertiary.color)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }
@@ -182,24 +179,6 @@ private struct ScanIssueFilterBar: View {
     }
 }
 
-/// A failed read or update, inline under the filter bar; the list it could not
-/// refresh stays as it was (D11).
-private struct ScanIssueErrorLine: View {
-    var text: String
-
-    var body: some View {
-        Text(text)
-            .font(Tok.Face.ui(Tok.Typography.Size.sm))
-            .foregroundStyle(Tok.Status.serverError.color)
-            .lineLimit(2)
-            .textSelection(.enabled)
-            .padding(.horizontal, Space.md)
-            .padding(.vertical, Space.xs)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityLabel("Error: \(text)")
-    }
-}
-
 // MARK: - List parts
 
 /// "HIGH 1": tracked xs caps in the severity's colour — the one header with hue.
@@ -244,7 +223,7 @@ struct ScanIssueRow: View {
         .background(selected ? Tok.Ground.active.color : .clear)
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(issue.severity.word), \(issue.name), \(line2), \(issue.status.word)")
+        .accessibilityLabel(ScanFormat.issueAccessibilityLabel(issue))
     }
 
     @ViewBuilder private var glyphs: some View {
@@ -336,32 +315,32 @@ struct ScanIssueDetail: View {
     private var content: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.lg) {
-                sectionTitle("Where")
+                ScanSectionTitle("Where")
                 whereBlock
 
-                sectionTitle("Description")
+                ScanSectionTitle("Description")
                 paragraph(issue.description)
 
                 if let remediation = issue.remediation, !remediation.isEmpty {
-                    sectionTitle("Remediation")
+                    ScanSectionTitle("Remediation")
                     paragraph(remediation)
                 }
 
-                sectionTitle("Evidence")
+                ScanSectionTitle("Evidence")
                 evidence
 
-                sectionTitle("Probe flows")
+                ScanSectionTitle("Probe flows")
                 flowRows(issue.evidence.probeFlows)
 
-                sectionTitle("Baseline flow")
+                ScanSectionTitle("Baseline flow")
                 flowRows(issue.evidence.baselineFlow.map { [$0] } ?? [])
 
                 if issue.pocRef != nil || issue.findingId != nil {
-                    sectionTitle("Links")
+                    ScanSectionTitle("Links")
                     links
                 }
 
-                sectionTitle("Note")
+                ScanSectionTitle("Note")
                 noteField
 
                 Text(ScanFormat.issueMetaLine(issue, now: Self.nowMs))
@@ -405,7 +384,7 @@ struct ScanIssueDetail: View {
     @ViewBuilder private var evidence: some View {
         let ev = issue.evidence
         if ev.payload == nil, ev.matched == nil, ev.timing == nil, ev.diff == nil, ev.l4 == nil {
-            Hint(text: "No evidence recorded for this issue.")
+            Hint(text: scanNoEvidenceText)
         } else {
             VStack(alignment: .leading, spacing: Space.md) {
                 if let payload = ev.payload {
@@ -483,7 +462,10 @@ struct ScanIssueDetail: View {
         } else {
             VStack(spacing: 0) {
                 ForEach(ids, id: \.self) { id in
-                    ScanEndpointRow(url: state.flowLabel(id) ?? id, linked: true, openable: state.isListed(id)) {
+                    ScanEndpointRow(
+                        url: state.flowLabel(id) ?? id, linked: true, openable: state.isListed(id),
+                        help: "Open this flow in the inspector"
+                    ) {
                         state.openFlow(id)
                     }
                 }
@@ -492,15 +474,21 @@ struct ScanIssueDetail: View {
         }
     }
 
+    /// One Open PoC, resolved by the PoC reference alone; the finding id is shown
+    /// as data, not offered as a second way to the same place.
     private var links: some View {
-        HStack(spacing: Space.sm) {
+        HStack(spacing: Space.md) {
             if let ref = issue.pocRef {
-                FlatButton("Open PoC") { state.openPoC(ref: ref, findingId: issue.findingId) }
+                FlatButton("Open PoC") { state.openPoC(ref: ref) }
                     .help("Open the PoC in Findings")
             }
             if let findingId = issue.findingId {
-                FlatButton("Open Finding") { state.openPoC(ref: issue.pocRef, findingId: findingId) }
-                    .help("Open the finding in Findings")
+                Text("Finding \(findingId)")
+                    .font(Tok.Face.data(Tok.Typography.Size.sm))
+                    .foregroundStyle(Tok.Ink.secondary.color)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
             }
         }
     }
@@ -508,12 +496,7 @@ struct ScanIssueDetail: View {
     private var noteField: some View {
         HStack(spacing: Space.sm) {
             TextField("Add a note", text: $note)
-                .textFieldStyle(.plain)
-                .font(Tok.Face.ui(Tok.Typography.Size.md))
-                .padding(.horizontal, Space.sm)
-                .frame(height: Tok.Size.control)
-                .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
-                .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.control.color))
+                .scanFieldChrome()
                 .onSubmit { Task { await state.saveNote(issue.id, note: note) } }
                 .accessibilityLabel("Note")
             FlatButton("Save Note") { Task { await state.saveNote(issue.id, note: note) } }
@@ -523,12 +506,6 @@ struct ScanIssueDetail: View {
     }
 
     // MARK: Parts
-
-    private func sectionTitle(_ title: String) -> some View {
-        Text(title.uppercased()).font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
-            .foregroundStyle(Tok.Ink.tertiary.color)
-            .accessibilityAddTraits(.isHeader)
-    }
 
     private func subTitle(_ title: String) -> some View {
         Text(title).font(Tok.Face.ui(Tok.Typography.Size.sm, .medium))

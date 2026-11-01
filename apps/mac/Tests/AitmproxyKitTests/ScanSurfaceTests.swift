@@ -15,20 +15,11 @@ import Testing
 
     static func standardProfile() throws -> ScanProfile { try ScanProfile(json: load("scan.profile.get.json")) }
 
-    /// `json` with the value at `path` replaced; a path element that reads as an
-    /// integer indexes an array. Builds the edited pack lines the tests need.
-    static func set(_ json: JSONValue, path: [String], to value: JSONValue) -> JSONValue {
-        guard let head = path.first else { return value }
-        let rest = Array(path.dropFirst())
-        if let index = Int(head), case .array(var items) = json, items.indices.contains(index) {
-            items[index] = set(items[index], path: rest, to: value)
-            return .array(items)
-        }
-        if case .object(var members) = json {
-            members[head] = set(members[head] ?? .null, path: rest, to: value)
-            return .object(members)
-        }
-        return json
+    /// A model that has read `scan.list.json`, so it knows `scan-1a2b3c4d` and `scan-55667788`.
+    static func listed() throws -> ScanSurfaceModel {
+        var model = ScanSurfaceModel()
+        model.applyList(try ScanListResult(json: load("scan.list.json")))
+        return model
     }
 
     // MARK: Mode
@@ -60,11 +51,15 @@ import Testing
         #expect(launch.args["profile"]?["target"]?["origins"] == JSONValue.array(["http://api.shop-staging.test"]))
         #expect(launch.args["profile_name"] == nil)
 
+        // An unedited profile goes whole too: the core runs the object the gate checked, never a name it resolves.
         model.loadedProfile = profile
         #expect(!model.profileIsEdited)
-        #expect(model.launchArguments(map: false).args == ["profile_name": "standard"])
+        let unedited = model.launchArguments(map: false)
+        #expect(unedited.args["profile_name"] == nil)
+        #expect(unedited.args["profile"]?["name"] == "standard")
+        #expect(unedited.args["profile"] == profile.json())
         #expect(model.launchArguments(map: true).tool == "scan.map")
-        #expect(model.launchArguments(map: true).args == ["profile_name": "standard"])
+        #expect(model.launchArguments(map: true).args == ["profile": profile.json()])
     }
 
     @Test func anOutOfScopeOriginIsRefused() throws {
@@ -160,7 +155,7 @@ import Testing
         model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
         let before = model.jobs
 
-        let line = Self.set(try Self.load("job.progress.json"), path: ["status", "probes", "sent"], to: 999)
+        let line = ScanPack.edited(try Self.load("job.progress.json"), path: ["status", "probes", "sent"], to: 999)
         #expect(line["status"]?["probes"]?["sent"] == 999)
         let accepted1 = model.noteJobEvent(line)
         #expect(accepted1)
@@ -178,20 +173,20 @@ import Testing
 
     @Test func staleAndDuplicateSeqAreIgnored() throws {
         let progress = try Self.load("job.progress.json")
-        var model = ScanSurfaceModel()
-        let accepted2 = model.noteJobEvent(Self.set(progress, path: ["seq"], to: 3))
+        var model = try Self.listed()
+        let accepted2 = model.noteJobEvent(ScanPack.edited(progress, path: ["seq"], to: 3))
         #expect(accepted2)
-        let accepted3 = model.noteJobEvent(Self.set(progress, path: ["seq"], to: 3))
+        let accepted3 = model.noteJobEvent(ScanPack.edited(progress, path: ["seq"], to: 3))
         #expect(!accepted3)
-        let accepted4 = model.noteJobEvent(Self.set(progress, path: ["seq"], to: 2))
+        let accepted4 = model.noteJobEvent(ScanPack.edited(progress, path: ["seq"], to: 2))
         #expect(!accepted4)
-        let accepted5 = model.noteJobEvent(Self.set(progress, path: ["seq"], to: 4))
+        let accepted5 = model.noteJobEvent(ScanPack.edited(progress, path: ["seq"], to: 4))
         #expect(accepted5)
         #expect(model.lastSeq["scan-1a2b3c4d"] == 4)
     }
 
     @Test func issueAndTerminalEventsFlagIssuesAndTheList() throws {
-        var model = ScanSurfaceModel()
+        var model = try Self.listed()
         let accepted6 = model.noteJobEvent(try Self.load("job.issue.json"))
         #expect(accepted6)
         #expect(model.issuesRefreshNeeded)
@@ -202,14 +197,14 @@ import Testing
         #expect(accepted7)
         #expect(model.issuesRefreshNeeded && model.listRefreshNeeded)
 
-        var fresh = ScanSurfaceModel()
+        var fresh = try Self.listed()
         let accepted8 = fresh.noteJobEvent(try Self.load("job.started.json"))
         #expect(accepted8)
         #expect(fresh.listRefreshNeeded)
         #expect(!fresh.issuesRefreshNeeded)
 
-        var other = ScanSurfaceModel()
-        let accepted9 = other.noteJobEvent(Self.set(try Self.load("job.progress.json"), path: ["kind"], to: "backup"))
+        var other = try Self.listed()
+        let accepted9 = other.noteJobEvent(ScanPack.edited(try Self.load("job.progress.json"), path: ["kind"], to: "backup"))
         #expect(!accepted9)
         #expect(other.refreshNeeded.isEmpty)
         #expect(other.lastSeq.isEmpty)
@@ -264,9 +259,9 @@ import Testing
         for segment in segments {
             #expect(abs(segment.fraction - 1.0 / 3.0) < 1e-9)
         }
-        let none = BySeverity(critical: 0, high: 0, medium: 0, low: 0, info: 0)
-        #expect(ScanSurfaceModel.severityBarSegments(none).isEmpty)
-        #expect(ScanSurfaceModel().issuesBySeverity == none)
+        #expect(ScanSurfaceModel.severityBarSegments(.zero).isEmpty)
+        #expect(ScanSurfaceModel().issuesBySeverity == .zero)
+        #expect(BySeverity.zero == BySeverity(critical: 0, high: 0, medium: 0, low: 0, info: 0))
     }
 
     // MARK: Profile edits (MS-AC6)
@@ -365,7 +360,7 @@ import Testing
         #expect(model.runningJobs.map(\.job) == ["scan-1a2b3c4d"])
         #expect(model.sidebarCount == 1)
 
-        let finished = Self.set(try Self.load("scan.list.json"), path: ["jobs", "0", "state"], to: "done")
+        let finished = ScanPack.edited(try Self.load("scan.list.json"), path: ["jobs", "0", "state"], to: "done")
         model.applyList(try ScanListResult(json: finished))
         #expect(model.runningJobs.isEmpty)
         #expect(model.sidebarCount == 0)
@@ -419,6 +414,11 @@ import Testing
 
         #expect(ScanFormat.profileRowLine2(profileList.profiles[3]) == "http, ws · medium · normal")
         #expect(ScanFormat.profileRowLine2(profileList.profiles[5]) == "l4_stream · medium · normal")
+        #expect(ScanFormat.profileAccessibilityLabel(profileList.profiles[3]) == "standard, builtin, http, ws · medium · normal")
+        #expect(ScanFormat.issueAccessibilityLabel(issues.issues[0])
+                == "High, Reflected cross-site scripting, GET /search · query q · certain, Open")
+        #expect(ScanFormat.originAccessibilityLabel(origin: "http://127.0.0.1:8080", count: 3, collapsed: true)
+                == "http://127.0.0.1:8080, 3 endpoints, collapsed")
 
         #expect(ScanFormat.issueRowLine2(issues.issues[0]) == "GET /search · query q · certain")
         #expect(ScanFormat.issueRowLine2(issues.issues[1]) == "GET /go · query next · firm")
@@ -595,7 +595,10 @@ extension ScanSurfaceTests {
         profile.target.origins = ["http://api.shop-staging.test"]
         model.applyProfile(profile)
         #expect(!model.profileIsEdited)
-        #expect(model.launchArguments(map: false).args == ["profile_name": "standard"])
+        let unedited = model.launchArguments(map: false)
+        #expect(unedited.args["profile_name"] == nil)
+        #expect(unedited.args["profile"]?["name"] == "standard")
+        #expect(unedited.args["profile"]?["budget"]?["probes"] == 2000)
 
         model.editedProfile?.budget.probes = 10
         #expect(model.profileIsEdited)
@@ -611,9 +614,12 @@ extension ScanSurfaceTests {
         model.editedProfile?.name = "my-api"
         #expect(model.launchArguments(map: false).args["profile"]?["name"] == "my-api")
 
-        // Reverting the edit sends the name again.
+        // Reverting the edit sends the loaded profile whole, under its name; never `profile_name`.
         model.editedProfile = profile
-        #expect(model.launchArguments(map: false).args == ["profile_name": "standard"])
+        let reverted = model.launchArguments(map: false)
+        #expect(reverted.args == ["profile": profile.json()])
+        #expect(reverted.args["profile"]?["name"] == "standard")
+        #expect(reverted.args["profile_name"] == nil)
     }
 
     // MARK: Confirm handshake (MS-AC3)
@@ -678,10 +684,10 @@ extension ScanSurfaceTests {
         var model = ScanSurfaceModel()
         model.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
         var second = try Self.load("scan.start.json")
-        second = Self.set(second, path: ["job"], to: "scan-second")
-        second = Self.set(second, path: ["status", "job"], to: "scan-second")
-        second = Self.set(second, path: ["clamped"], to: [])
-        second = Self.set(second, path: ["lanes", "skipped"], to: [])
+        second = ScanPack.edited(second, path: ["job"], to: "scan-second")
+        second = ScanPack.edited(second, path: ["status", "job"], to: "scan-second")
+        second = ScanPack.edited(second, path: ["clamped"], to: [])
+        second = ScanPack.edited(second, path: ["lanes", "skipped"], to: [])
         model.launchInFlight = true
         model.applyStart(try ScanStartResult(json: second))
         #expect(model.jobs.map(\.job) == ["scan-second", "scan-1a2b3c4d"])
@@ -702,22 +708,30 @@ extension ScanSurfaceTests {
         model.applyIssues(try ScanIssuesResult(json: Self.load("scan.issues.json")), append: false)
         let before = model
 
-        // A job this model never saw is flagged; no row or status is invented.
-        let unknown = Self.set(try Self.load("job.progress.json"), path: ["job"], to: "scan-never-seen")
+        // A job this model never saw (not listed, not started here, no status) only asks
+        // for the list: no row, status, seq or per-job flag is kept for a stranger.
+        let unknown = ScanPack.edited(try Self.load("job.progress.json"), path: ["job"], to: "scan-never-seen")
         let acceptedUnknown = model.noteJobEvent(unknown)
         #expect(acceptedUnknown)
-        #expect(model.refreshNeeded == ["scan-never-seen"])
-        #expect(model.lastSeq["scan-never-seen"] == 3)
+        #expect(model.listRefreshNeeded)
+        #expect(model.refreshNeeded.isEmpty)
+        #expect(model.lastSeq["scan-never-seen"] == nil)
+        #expect(model.lastSeq.isEmpty)
         #expect(model.jobs == before.jobs)
         #expect(model.statuses.isEmpty)
-        #expect(!model.listRefreshNeeded)
         #expect(!model.issuesRefreshNeeded)
+        // Its lines never dedupe either: every one is the same request for the list.
+        let acceptedUnknownAgain = model.noteJobEvent(unknown)
+        #expect(acceptedUnknownAgain)
+        #expect(model.lastSeq.isEmpty)
+        model.clearRefreshFlags()
 
-        // Each job's `seq` is tracked on its own.
+        // A known job's `seq` is tracked on its own.
         let acceptedKnown = model.noteJobEvent(try Self.load("job.progress.json"))
         #expect(acceptedKnown)
-        #expect(model.refreshNeeded == ["scan-never-seen", "scan-1a2b3c4d"])
-        #expect(model.lastSeq == ["scan-never-seen": 3, "scan-1a2b3c4d": 3])
+        #expect(model.refreshNeeded == ["scan-1a2b3c4d"])
+        #expect(model.lastSeq == ["scan-1a2b3c4d": 3])
+        #expect(!model.listRefreshNeeded)
 
         // An `issue` line without its `issue` object is still an issue trigger.
         let bare = ScanPack.removing(try Self.load("job.issue.json"), path: ["issue"])
@@ -729,7 +743,7 @@ extension ScanSurfaceTests {
         #expect(model.issues == before.issues)
 
         // A carried issue is never inserted into the list either: the next `scan.issues` is the truth.
-        var carried = ScanSurfaceModel()
+        var carried = try Self.listed()
         let acceptedCarried = carried.noteJobEvent(try Self.load("job.issue.json"))
         #expect(acceptedCarried)
         #expect(carried.issues.isEmpty)
@@ -737,39 +751,39 @@ extension ScanSurfaceTests {
         #expect(carried.issuesBySeverity == .zero)
 
         // `cancelled` and `failed` are terminal: both flags.
-        var cancelled = ScanSurfaceModel()
+        var cancelled = try Self.listed()
         let acceptedCancelled = cancelled.noteJobEvent(try Self.load("job.cancelled.json"))
         #expect(acceptedCancelled)
         #expect(cancelled.listRefreshNeeded && cancelled.issuesRefreshNeeded)
-        var failed = ScanSurfaceModel()
+        var failed = try Self.listed()
         let acceptedFailed = failed.noteJobEvent(try Self.load("job.failed.json"))
         #expect(acceptedFailed)
         #expect(failed.listRefreshNeeded && failed.issuesRefreshNeeded)
 
         // `phase` and an unknown event flag the job alone.
-        var phase = ScanSurfaceModel()
+        var phase = try Self.listed()
         let acceptedPhase = phase.noteJobEvent(try Self.load("job.phase.json"))
         #expect(acceptedPhase)
         #expect(phase.refreshNeeded == ["scan-1a2b3c4d"])
         #expect(!phase.listRefreshNeeded && !phase.issuesRefreshNeeded)
-        let acceptedOther = phase.noteJobEvent(Self.set(try Self.load("job.phase.json"), path: ["event"], to: "paused"))
+        let acceptedOther = phase.noteJobEvent(ScanPack.edited(try Self.load("job.phase.json"), path: ["event"], to: "paused"))
         #expect(!acceptedOther, "same seq as the phase line: ignored")
         let acceptedOtherNext = phase.noteJobEvent(
-            Self.set(Self.set(try Self.load("job.phase.json"), path: ["event"], to: "paused"), path: ["seq"], to: 3))
+            ScanPack.edited(ScanPack.edited(try Self.load("job.phase.json"), path: ["event"], to: "paused"), path: ["seq"], to: 3))
         #expect(acceptedOtherNext)
         #expect(!phase.listRefreshNeeded && !phase.issuesRefreshNeeded)
         #expect(phase.lastSeq["scan-1a2b3c4d"] == 3)
 
         // A malformed line changes nothing at all.
-        var untouched = ScanSurfaceModel()
+        var untouched = try Self.listed()
         let snapshot = untouched
         let progress = try Self.load("job.progress.json")
         let brokenLines: [JSONValue] = [
-            Self.set(progress, path: ["seq"], to: "3"),
-            Self.set(progress, path: ["seq"], to: -1),
+            ScanPack.edited(progress, path: ["seq"], to: "3"),
+            ScanPack.edited(progress, path: ["seq"], to: -1),
             ScanPack.removing(progress, path: ["status"]),
             ScanPack.removing(progress, path: ["job"]),
-            Self.set(progress, path: ["kind"], to: "Scan"),
+            ScanPack.edited(progress, path: ["kind"], to: "Scan"),
             .object([:]), .array([]), .null, .number(1),
         ]
         for broken in brokenLines {
@@ -779,7 +793,7 @@ extension ScanSurfaceTests {
         #expect(untouched == snapshot)
 
         // A terminal line after a stale one: the stale one is dropped, the terminal one lands.
-        var ordered = ScanSurfaceModel()
+        var ordered = try Self.listed()
         let acceptedFinished = ordered.noteJobEvent(try Self.load("job.finished.json"))
         #expect(acceptedFinished)
         ordered.clearRefreshFlags()
@@ -788,6 +802,72 @@ extension ScanSurfaceTests {
         #expect(ordered.refreshNeeded.isEmpty)
         #expect(!ordered.listRefreshNeeded && !ordered.issuesRefreshNeeded)
         #expect(ordered.lastSeq["scan-1a2b3c4d"] == 5)
+
+        // A job this app started, or one with a status read, is known before the list carries it.
+        var local = ScanSurfaceModel()
+        local.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
+        let acceptedLocal = local.noteJobEvent(try Self.load("job.progress.json"))
+        #expect(acceptedLocal)
+        #expect(local.lastSeq["scan-1a2b3c4d"] == 3)
+        #expect(local.refreshNeeded == ["scan-1a2b3c4d"])
+        var withStatus = ScanSurfaceModel()
+        withStatus.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
+        let acceptedStatus = withStatus.noteJobEvent(try Self.load("job.progress.json"))
+        #expect(acceptedStatus)
+        #expect(withStatus.lastSeq["scan-1a2b3c4d"] == 3)
+        #expect(!withStatus.listRefreshNeeded)
+    }
+
+    /// S6: `scan.list` prunes every per-job side table to the jobs it lists plus
+    /// the ones this app started and is still waiting on.
+    @Test func applyListPrunesThePerJobTablesToListedAndLocallyStarted() throws {
+        var model = try Self.listed()
+        model.applyStatus(try ScanJobStatus(json: Self.load("scan.status.json")))
+        let elsewhere = ScanPack.edited(try Self.load("scan.status.json"), path: ["job"], to: "scan-elsewhere")
+        model.applyStatus(try ScanJobStatus(json: elsewhere))
+        let acceptedKnown = model.noteJobEvent(try Self.load("job.progress.json"))
+        #expect(acceptedKnown)
+        let acceptedElsewhere = model.noteJobEvent(
+            ScanPack.edited(try Self.load("job.progress.json"), path: ["job"], to: "scan-elsewhere"))
+        #expect(acceptedElsewhere, "a job with a status read is known")
+        var start = try Self.load("scan.start.json")
+        start = ScanPack.edited(start, path: ["job"], to: "scan-local")
+        start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
+        model.applyStart(try ScanStartResult(json: start))
+        #expect(Set(model.statuses.keys) == ["scan-1a2b3c4d", "scan-elsewhere", "scan-local"])
+        #expect(Set(model.lastSeq.keys) == ["scan-1a2b3c4d", "scan-elsewhere"])
+        #expect(model.refreshNeeded == ["scan-1a2b3c4d", "scan-elsewhere"])
+        #expect(Set(model.launchNotices.keys) == ["scan-local"])
+
+        // The list carries scan-1a2b3c4d and scan-55667788 but not scan-elsewhere; scan-local waits.
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        #expect(model.jobs.map(\.job) == ["scan-local", "scan-1a2b3c4d", "scan-55667788"])
+        #expect(Set(model.statuses.keys) == ["scan-1a2b3c4d", "scan-local"])
+        #expect(Set(model.lastSeq.keys) == ["scan-1a2b3c4d"])
+        #expect(model.refreshNeeded == ["scan-1a2b3c4d"])
+        #expect(Set(model.launchNotices.keys) == ["scan-local"])
+        #expect(model.locallyStarted == ["scan-local"])
+
+        // An empty list keeps only what this app started.
+        model.applyList(try ScanListResult(json: ["jobs": []]))
+        #expect(model.jobs.map(\.job) == ["scan-local"])
+        #expect(Set(model.statuses.keys) == ["scan-local"])
+        #expect(model.lastSeq.isEmpty)
+        #expect(model.refreshNeeded.isEmpty)
+        #expect(Set(model.launchNotices.keys) == ["scan-local"])
+
+        // Once the list carries scan-local too, and then drops it, nothing is left behind.
+        var listed = try Self.load("scan.list.json")
+        var jobs = try #require(listed["jobs"]?.arrayValue)
+        jobs.append(ScanPack.edited(jobs[1], path: ["job"], to: "scan-local"))
+        listed = ScanPack.edited(listed, path: ["jobs"], to: .array(jobs))
+        model.applyList(try ScanListResult(json: listed))
+        #expect(model.locallyStarted.isEmpty)
+        #expect(Set(model.statuses.keys) == ["scan-local"])
+        model.applyList(try ScanListResult(json: ["jobs": []]))
+        #expect(model.jobs.isEmpty)
+        #expect(model.statuses.isEmpty)
+        #expect(model.launchNotices.isEmpty)
     }
 
     // MARK: Grouping (MS-AC5)
@@ -847,11 +927,11 @@ extension ScanSurfaceTests {
     @Test func issuesGroupInSeverityOrderWithUnknownsLast() throws {
         var file = try Self.load("scan.issues.json")
         var items = try #require(file["issues"]?.arrayValue)
-        items.append(Self.set(Self.set(items[0], path: ["id"], to: "issue-info"), path: ["severity"], to: "info"))
-        items.append(Self.set(Self.set(items[0], path: ["id"], to: "issue-blocker"), path: ["severity"], to: "blocker"))
-        items.append(Self.set(Self.set(items[1], path: ["id"], to: "issue-critical"), path: ["severity"], to: "critical"))
-        items.append(Self.set(Self.set(items[1], path: ["id"], to: "issue-high-2"), path: ["severity"], to: "high"))
-        file = Self.set(file, path: ["issues"], to: .array(items))
+        items.append(ScanPack.edited(ScanPack.edited(items[0], path: ["id"], to: "issue-info"), path: ["severity"], to: "info"))
+        items.append(ScanPack.edited(ScanPack.edited(items[0], path: ["id"], to: "issue-blocker"), path: ["severity"], to: "blocker"))
+        items.append(ScanPack.edited(ScanPack.edited(items[1], path: ["id"], to: "issue-critical"), path: ["severity"], to: "critical"))
+        items.append(ScanPack.edited(ScanPack.edited(items[1], path: ["id"], to: "issue-high-2"), path: ["severity"], to: "high"))
+        file = ScanPack.edited(file, path: ["issues"], to: .array(items))
         var model = ScanSurfaceModel()
         model.applyIssues(try ScanIssuesResult(json: file), append: false)
 
@@ -890,7 +970,7 @@ extension ScanSurfaceTests {
     }
 
     @Test func checkTreeListsAMultiLaneCheckUnderEachLane() throws {
-        let file = Self.set(try Self.load("scan.checks.json"), path: ["checks", "0", "lanes"], to: ["ws", "http"])
+        let file = ScanPack.edited(try Self.load("scan.checks.json"), path: ["checks", "0", "lanes"], to: ["ws", "http"])
         let checks = try ScanChecksResult(json: file).checks
         #expect(checks[0].lanes == [.ws, .http])
         var selection = ScanCheckSelection(include: [], exclude: [])
@@ -913,8 +993,8 @@ extension ScanSurfaceTests {
         #expect(selection.exclude == [])
 
         // An unknown lane sorts after the known four; a check with no lane is in no group.
-        var exotic = Self.set(file, path: ["checks", "1", "lanes"], to: ["quic"])
-        exotic = Self.set(exotic, path: ["checks", "2", "lanes"], to: [])
+        var exotic = ScanPack.edited(file, path: ["checks", "1", "lanes"], to: ["quic"])
+        exotic = ScanPack.edited(exotic, path: ["checks", "2", "lanes"], to: [])
         let exoticChecks = try ScanChecksResult(json: exotic).checks
         let exoticTree = ScanCheckTree(checks: exoticChecks, selection: ScanCheckSelection(include: [], exclude: []),
                                        intensity: .intrusive, query: "")
@@ -922,9 +1002,9 @@ extension ScanSurfaceTests {
         #expect(exoticTree.groups.flatMap(\.leaves).map(\.meta.id) == ["http.reflected-xss", "http.reflected-xss", "http.sqli-error"])
 
         // The four known lanes order HTTP, WebSocket, L4 packet, L4 stream regardless of arrival.
-        var lanes = Self.set(file, path: ["checks", "0", "lanes"], to: ["l4_stream", "l4_packet", "ws", "http"])
-        lanes = Self.set(lanes, path: ["checks", "1", "lanes"], to: [])
-        lanes = Self.set(lanes, path: ["checks", "2", "lanes"], to: [])
+        var lanes = ScanPack.edited(file, path: ["checks", "0", "lanes"], to: ["l4_stream", "l4_packet", "ws", "http"])
+        lanes = ScanPack.edited(lanes, path: ["checks", "1", "lanes"], to: [])
+        lanes = ScanPack.edited(lanes, path: ["checks", "2", "lanes"], to: [])
         let laneTree = ScanCheckTree(checks: try ScanChecksResult(json: lanes).checks,
                                      selection: ScanCheckSelection(include: [], exclude: []), intensity: .light, query: "")
         #expect(laneTree.groups.map(\.lane) == [.http, .ws, .l4Packet, .l4Stream])
@@ -1012,10 +1092,10 @@ extension ScanSurfaceTests {
 
     @Test func unknownProfileKeysPassThroughASave() throws {
         var file = try Self.load("scan.profile.get.json")
-        file = Self.set(file, path: ["future_section"], to: ["knob": 1])
-        file = Self.set(file, path: ["crawl", "new_crawl_knob"], to: true)
-        file = Self.set(file, path: ["budget", "per_host_errors", "window_s"], to: 30)
-        file = Self.set(file, path: ["l4"], to: .null)
+        file = ScanPack.edited(file, path: ["future_section"], to: ["knob": 1])
+        file = ScanPack.edited(file, path: ["crawl", "new_crawl_knob"], to: true)
+        file = ScanPack.edited(file, path: ["budget", "per_host_errors", "window_s"], to: 30)
+        file = ScanPack.edited(file, path: ["l4"], to: .null)
         var profile = try ScanProfile(json: file)
         #expect(profile.extra["future_section"] == JSONValue.object(["knob": 1]))
         #expect(profile.extra.count == 1)
@@ -1068,7 +1148,7 @@ extension ScanSurfaceTests {
         let list = try ScanListResult(json: Self.load("scan.list.json"))
 
         // MS-AC1: an unknown state renders as it came, in the row and for VoiceOver.
-        let paused = try ScanListResult(json: Self.set(Self.load("scan.list.json"), path: ["jobs", "0", "state"], to: "paused")).jobs[0]
+        let paused = try ScanListResult(json: ScanPack.edited(Self.load("scan.list.json"), path: ["jobs", "0", "state"], to: "paused")).jobs[0]
         #expect(ScanFormat.jobRowLine1(paused, status: nil) == "paused · — · —")
         #expect(ScanFormat.jobAccessibilityLabel(paused, status: nil)
                 == "paused, auditing, 418 of 2000 probes, 80 of 120 points audited, 3 issues: 1 high, 1 medium, 1 low")
@@ -1089,10 +1169,10 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.severityCountsInWords(BySeverity(critical: 2, high: 0, medium: 0, low: 0, info: 3)) == "5 issues: 2 critical, 3 info")
 
         // Two targets join with a comma; a target with a path or scheme in capitals is reduced to its authority.
-        let two = Self.set(try Self.load("scan.status.json"), path: ["targets"], to: ["http://127.0.0.1:8080", "HTTPS://api.shop-staging.test/"])
+        let two = ScanPack.edited(try Self.load("scan.status.json"), path: ["targets"], to: ["http://127.0.0.1:8080", "HTTPS://api.shop-staging.test/"])
         let status = try ScanJobStatus(json: two)
         #expect(ScanFormat.jobRowLine1(status.summary, status: status) == "Auditing · standard · 127.0.0.1:8080, api.shop-staging.test")
-        let noTargets = try ScanJobStatus(json: Self.set(try Self.load("scan.status.json"), path: ["targets"], to: []))
+        let noTargets = try ScanJobStatus(json: ScanPack.edited(try Self.load("scan.status.json"), path: ["targets"], to: []))
         #expect(ScanFormat.jobRowLine1(noTargets.summary, status: noTargets) == "Auditing · standard · —")
 
         // An issue row without a method (a WS or L4 lane) shows the path alone.
@@ -1153,11 +1233,11 @@ extension ScanSurfaceTests {
         // Launch notices for a clamp and a skipped lane are one line each, in that order.
         var model = ScanSurfaceModel()
         var start = try Self.load("scan.start.json")
-        start = Self.set(start, path: ["clamped"], to: [
+        start = ScanPack.edited(start, path: ["clamped"], to: [
             ["field": "budget.probes", "requested": 50000, "applied": 20000],
             ["field": "budget.time_s", "requested": 7200, "applied": 3600],
         ])
-        start = Self.set(start, path: ["lanes", "skipped"], to: [
+        start = ScanPack.edited(start, path: ["lanes", "skipped"], to: [
             ["lane": "ws", "reason": "lane not available on this build"],
             ["lane": "l4_stream", "reason": "no L4 scope entry"],
         ])
@@ -1226,11 +1306,11 @@ extension ScanSurfaceTests {
         // applyProfiles: builtins as listed, then custom profiles alphabetically; the error clears.
         var list = try Self.load("scan.profile.list.json")
         let zeta: JSONValue = ["name": "zeta", "builtin": false, "summary": ["lanes": ["http"], "intensity": "light", "speed": "fast"]]
-        let alpha = Self.set(zeta, path: ["name"], to: "alpha")
+        let alpha = ScanPack.edited(zeta, path: ["name"], to: "alpha")
         var profiles = try #require(list["profiles"]?.arrayValue)
         profiles.insert(zeta, at: 0)
         profiles.append(alpha)
-        list = Self.set(list, path: ["profiles"], to: .array(profiles))
+        list = ScanPack.edited(list, path: ["profiles"], to: .array(profiles))
         model.profilesError = "old"
         model.applyProfiles(try ScanProfileListResult(json: list))
         #expect(model.profiles.map(\.name)
@@ -1253,8 +1333,8 @@ extension ScanSurfaceTests {
 
         // applyList keeps a job this app started that the list lacks yet, in front; the error clears.
         var start = try Self.load("scan.start.json")
-        start = Self.set(start, path: ["job"], to: "scan-local")
-        start = Self.set(start, path: ["status", "job"], to: "scan-local")
+        start = ScanPack.edited(start, path: ["job"], to: "scan-local")
+        start = ScanPack.edited(start, path: ["status", "job"], to: "scan-local")
         model.applyStart(try ScanStartResult(json: start))
         model.jobsError = "old"
         model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
@@ -1265,8 +1345,8 @@ extension ScanSurfaceTests {
         // Once the list carries it, the list's order and values win.
         var listed = try Self.load("scan.list.json")
         var jobs = try #require(listed["jobs"]?.arrayValue)
-        jobs.append(Self.set(jobs[1], path: ["job"], to: "scan-local"))
-        listed = Self.set(listed, path: ["jobs"], to: .array(jobs))
+        jobs.append(ScanPack.edited(jobs[1], path: ["job"], to: "scan-local"))
+        listed = ScanPack.edited(listed, path: ["jobs"], to: .array(jobs))
         model.applyList(try ScanListResult(json: listed))
         #expect(model.jobs.map(\.job) == ["scan-1a2b3c4d", "scan-55667788", "scan-local"])
         #expect(model.jobs[2].state == .done)
@@ -1275,12 +1355,12 @@ extension ScanSurfaceTests {
         // applyStatus replaces the matching row and only that row; a stranger is stored without a row.
         var statusModel = ScanSurfaceModel()
         statusModel.applyList(try ScanListResult(json: Self.load("scan.list.json")))
-        let status = try ScanJobStatus(json: Self.set(Self.load("scan.status.json"), path: ["probes", "sent"], to: 777))
+        let status = try ScanJobStatus(json: ScanPack.edited(Self.load("scan.status.json"), path: ["probes", "sent"], to: 777))
         statusModel.applyStatus(status)
         #expect(statusModel.jobs[0].probes.sent == 777)
         #expect(statusModel.jobs[1].probes.sent == 0)
         #expect(statusModel.statuses["scan-1a2b3c4d"]?.probes.sent == 777)
-        let stranger = try ScanJobStatus(json: Self.set(Self.load("scan.status.json"), path: ["job"], to: "scan-elsewhere"))
+        let stranger = try ScanJobStatus(json: ScanPack.edited(Self.load("scan.status.json"), path: ["job"], to: "scan-elsewhere"))
         statusModel.applyStatus(stranger)
         #expect(statusModel.jobs.count == 2)
         #expect(statusModel.statuses["scan-elsewhere"] != nil)
@@ -1293,9 +1373,9 @@ extension ScanSurfaceTests {
         model.applyIssues(page, append: true)
         #expect(model.issues.count == 2)
         var more = try Self.load("scan.issues.json")
-        more = Self.set(more, path: ["issues", "0", "id"], to: "issue-new")
-        more = Self.set(more, path: ["next_cursor"], to: "issue-new")
-        more = Self.set(more, path: ["by_severity", "high"], to: 2)
+        more = ScanPack.edited(more, path: ["issues", "0", "id"], to: "issue-new")
+        more = ScanPack.edited(more, path: ["next_cursor"], to: "issue-new")
+        more = ScanPack.edited(more, path: ["by_severity", "high"], to: 2)
         model.applyIssues(try ScanIssuesResult(json: more), append: true)
         #expect(model.issues.map(\.id) == ["issue-9f8e7d6c", "issue-4c3b2a19", "issue-new"])
         #expect(model.issuesCursor == "issue-new")
@@ -1343,12 +1423,12 @@ extension ScanSurfaceTests {
         model.applySitemap(sitemap, append: true)
         #expect(model.sitemap == sitemap)
         var next = try Self.load("scan.sitemap.json")
-        next = Self.set(next, path: ["nodes", "0", "id"], to: "node-2")
-        next = Self.set(next, path: ["nodes", "0", "host"], to: "api.shop-staging.test")
-        next = Self.set(next, path: ["nodes", "0", "path_template"], to: "/orders")
-        next = Self.set(next, path: ["points", "0", "id"], to: "point-json-2")
-        next = Self.set(next, path: ["points", "0", "site_node"], to: "node-2")
-        next = Self.set(next, path: ["next_cursor"], to: .null)
+        next = ScanPack.edited(next, path: ["nodes", "0", "id"], to: "node-2")
+        next = ScanPack.edited(next, path: ["nodes", "0", "host"], to: "api.shop-staging.test")
+        next = ScanPack.edited(next, path: ["nodes", "0", "path_template"], to: "/orders")
+        next = ScanPack.edited(next, path: ["points", "0", "id"], to: "point-json-2")
+        next = ScanPack.edited(next, path: ["points", "0", "site_node"], to: "node-2")
+        next = ScanPack.edited(next, path: ["next_cursor"], to: .null)
         model.applySitemap(try ScanSitemapResult(json: next), append: true)
         #expect(model.sitemap?.nodes.map(\.id) == ["node-1", "node-2"])
         #expect(model.sitemap?.points.map(\.id) == ["point-json-1", "point-cookie-1", "point-json-2"])
@@ -1400,5 +1480,182 @@ extension ScanSurfaceTests {
         #expect(ScanFormat.yesNo(false) == "no")
         #expect(ScanFormat.plural(1, "endpoint") == "1 endpoint")
         #expect(ScanFormat.plural(3, "endpoint") == "3 endpoints")
+
+        // Q10: the empty states and placeholders the four tabs render.
+        #expect(scanNoEndpointsMatchText == "No endpoints match.")
+        #expect(scanSelectEndpointText == "Select an endpoint.")
+        #expect(scanNoPointsOnEndpointText == "None on this endpoint.")
+        #expect(scanNoFlowsOnEndpointText == "None recorded for this endpoint.")
+        #expect(scanNoEvidenceText == "No evidence recorded for this issue.")
+        #expect(scanSelectIssueText == "Select an issue to read its evidence.")
+        #expect(scanSelectJobText == "Select a job.")
+        #expect(scanNoJobsText == "No jobs yet — pick a profile and Start Scan.")
+        #expect(scanNoIssuesText == "No issues — start a scan, or widen the filters.")
+        #expect(scanNoSitemapTitle == "No site map yet")
+        #expect(scanNoSitemapText == "A running job fills this as it crawls.")
+        #expect(scanNoProfilesText == "No profiles — the core lists none.")
+        #expect(scanNothingToDeleteText(name: "my-api") == "Nothing to delete: my-api is not on the core")
+        #expect(scanUnableText("save profile", "bus closed") == "Unable to save profile: bus closed")
+    }
+
+    // MARK: Stage 6 fixes
+
+    /// P1: a launch error is kept whole (code, origins) beside its display line, and
+    /// cleared by a start, a confirm request, or picking another profile.
+    @Test func aLaunchErrorIsKeptWholeUntilTheNextLaunchStep() throws {
+        var model = ScanSurfaceModel()
+        #expect(model.launchError == nil)
+        model.launchInFlight = true
+        model.applyLaunchError(ScanLaunchError(busMessage: "scan: lane_unavailable: ws not built", origins: []))
+        #expect(model.launchError?.code == "lane_unavailable")
+        #expect(model.launchError?.message == "ws not built")
+        #expect(model.statusLine == "ws not built")
+        #expect(!model.launchInFlight)
+
+        model.select(profile: "thorough")
+        #expect(model.launchError == nil, "picking another profile clears it")
+
+        model.applyLaunchError(ScanLaunchError(busMessage: "scan: out_of_scope: no", origins: ["http://a.test:8443/x"]))
+        #expect(model.launchError?.code == "out_of_scope")
+        #expect(model.launchError?.origins == ["http://a.test:8443/x"])
+        #expect(model.statusLine == ScanFormat.outOfScopeText(origin: "http://a.test:8443/x"))
+        model.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
+        #expect(model.launchError == nil, "a start clears it")
+        #expect(model.statusLine == nil)
+
+        model.applyLaunchError(ScanLaunchError(busMessage: "plain words", origins: []))
+        #expect(model.launchError?.code == nil)
+        #expect(model.statusLine == "plain words")
+        let request = try #require(L4ConfirmRequest(json: [
+            "structuredContent": ["status": "needs_confirmation", "prompt": "Really?", "confirm_token": "t"],
+        ]))
+        model.applyConfirm(tool: "scan.start", args: [:], request: request)
+        #expect(model.launchError == nil, "a confirm request clears it")
+    }
+
+    /// S5: a profile name is a store key on the core; only a plain token may go there.
+    @Test func profileNamesAreValidatedBeforeTheyReachTheCore() {
+        #expect(ScanSurface.isValidProfileName("my-api"))
+        #expect(ScanSurface.isValidProfileName("My.API_2"))
+        #expect(ScanSurface.isValidProfileName("standard"))
+        #expect(ScanSurface.isValidProfileName("a"))
+        #expect(ScanSurface.isValidProfileName(String(repeating: "a", count: 64)))
+        #expect(!ScanSurface.isValidProfileName("../x"))
+        #expect(!ScanSurface.isValidProfileName(".hidden"))
+        #expect(!ScanSurface.isValidProfileName("-flag"))
+        #expect(!ScanSurface.isValidProfileName("a b"))
+        #expect(!ScanSurface.isValidProfileName(""))
+        #expect(!ScanSurface.isValidProfileName(String(repeating: "a", count: 65)))
+        #expect(!ScanSurface.isValidProfileName("standard/.."))
+        #expect(!ScanSurface.isValidProfileName("a\\b"))
+        #expect(!ScanSurface.isValidProfileName("a\u{0}b"))
+        #expect(!ScanSurface.isValidProfileName("a\tb"))
+        #expect(!ScanSurface.isValidProfileName("a\nb"))
+        #expect(!ScanSurface.isValidProfileName("café"))
+        #expect(!ScanSurface.isValidProfileName("a:b"))
+    }
+
+    /// Q1: the Issues detail resolves `poc_ref` to a listed PoC path in the Kit, not the view.
+    @Test func pocRefResolvesToAListedPath() {
+        let paths = ["/x/pocs/poc-3b1c.poc.yaml", "/x/pocs/other.poc.yaml"]
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: paths) == 0)
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c.poc.yaml", in: paths) == 0)
+        #expect(ScanFindingLink.match(pocRef: "other", in: paths) == 1)
+        #expect(ScanFindingLink.match(pocRef: "pocs/other.poc.yaml", in: paths) == 1, "a suffix after a slash matches")
+        #expect(ScanFindingLink.match(pocRef: "nope", in: paths) == nil)
+        #expect(ScanFindingLink.match(pocRef: "", in: paths) == nil)
+        #expect(ScanFindingLink.match(pocRef: nil, in: paths) == nil)
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: []) == nil)
+        #expect(ScanFindingLink.match(pocRef: "3b1c", in: paths) == nil, "a bare substring is not a match")
+        #expect(ScanFindingLink.match(pocRef: "poc-3b1c", in: ["poc-3b1c", "/x/poc-3b1c"]) == 0)
+        #expect(ScanFindingLink.match(pocRef: "x/poc-3b1c", in: ["/x/poc-3b1c"]) == 0)
+    }
+
+    /// Q9: the row words VoiceOver reads for an issue, a profile, a check and an origin (D13).
+    @Test func accessibilityLabelsForTheOtherRows() throws {
+        let issues = try ScanIssuesResult(json: Self.load("scan.issues.json"))
+        #expect(ScanFormat.issueAccessibilityLabel(issues.issues[0])
+                == "High, Reflected cross-site scripting, GET /search · query q · certain, Open")
+        var fp = issues.issues[1]
+        fp.status = .falsePositive
+        #expect(ScanFormat.issueAccessibilityLabel(fp) == "Medium, Open redirect, GET /go · query next · firm, False positive")
+        fp.severity = .other("blocker")
+        fp.status = .other("wontfix")
+        #expect(ScanFormat.issueAccessibilityLabel(fp) == "blocker, Open redirect, GET /go · query next · firm, wontfix")
+
+        let profiles = try ScanProfileListResult(json: Self.load("scan.profile.list.json")).profiles
+        #expect(ScanFormat.profileAccessibilityLabel(profiles[0]) == "passive-only, builtin, http · passive · normal")
+        #expect(ScanFormat.profileAccessibilityLabel(profiles[3]) == "standard, builtin, http, ws · medium · normal")
+        var custom = profiles[3]
+        custom.name = "my-api"
+        custom.builtin = false
+        #expect(ScanFormat.profileAccessibilityLabel(custom) == "my-api, http, ws · medium · normal")
+
+        let checks = try ScanChecksResult(json: Self.load("scan.checks.json")).checks
+        let profile = try Self.standardProfile()
+        let tree = ScanCheckTree(checks: checks, selection: profile.checks, intensity: .light, query: "")
+        let leaves = tree.groups.flatMap(\.leaves)
+        let sqli = try #require(leaves.first { $0.meta.id == "http.sqli-error" })
+        #expect(sqli.aboveIntensity)
+        #expect(ScanFormat.checkAccessibilityLabel(sqli)
+                == "Error-based SQL injection, sqli-error, medium, Default, above this profile's intensity")
+        var included = sqli
+        included.choice = .include
+        included.aboveIntensity = false
+        #expect(ScanFormat.checkAccessibilityLabel(included) == "Error-based SQL injection, sqli-error, medium, Include")
+
+        #expect(ScanFormat.originAccessibilityLabel(origin: "http://127.0.0.1:8080", count: 3, collapsed: true)
+                == "http://127.0.0.1:8080, 3 endpoints, collapsed")
+        #expect(ScanFormat.originAccessibilityLabel(origin: "http://127.0.0.1:8080", count: 1, collapsed: false)
+                == "http://127.0.0.1:8080, 1 endpoint, expanded")
+    }
+
+    /// Q12: a status with an empty profile name reads as not told yet, in the row and for VoiceOver.
+    @Test func anEmptyProfileNameReadsAsAbsent() throws {
+        let list = try ScanListResult(json: Self.load("scan.list.json"))
+        let nameless = try ScanJobStatus(json: ScanPack.edited(Self.load("scan.status.json"), path: ["profile_name"], to: ""))
+        #expect(nameless.profileName == "")
+        #expect(ScanFormat.jobRowLine1(list.jobs[0], status: nameless) == "Auditing · — · 127.0.0.1:8080")
+        #expect(ScanFormat.jobAccessibilityLabel(list.jobs[0], status: nameless)
+                == "Running, auditing, 127.0.0.1:8080, 418 of 2000 probes, 80 of 120 points audited, "
+                + "3 issues: 1 high, 1 medium, 1 low")
+        let absent = try ScanJobStatus(json: ScanPack.removing(Self.load("scan.status.json"), path: ["profile_name"]))
+        #expect(ScanFormat.jobRowLine1(list.jobs[0], status: absent) == "Auditing · — · 127.0.0.1:8080")
+        let bare = try ScanJobStatus(json: ScanPack.edited(
+            ScanPack.edited(Self.load("scan.status.json"), path: ["profile_name"], to: ""), path: ["targets"], to: []))
+        #expect(ScanFormat.jobRowLine1(list.jobs[0], status: bare) == "Auditing · — · —")
+        #expect(ScanFormat.jobAccessibilityLabel(list.jobs[0], status: bare)
+                == "Running, auditing, 418 of 2000 probes, 80 of 120 points audited, 3 issues: 1 high, 1 medium, 1 low")
+    }
+
+    /// P4: the Site map tab picks the newest job once, the first time there is one;
+    /// after that the operator's choice (a job or All jobs) stands.
+    @Test func theSitemapJobIsSeededOnce() throws {
+        var model = ScanSurfaceModel()
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == nil, "nothing to seed from")
+        model.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == "scan-1a2b3c4d")
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == "scan-1a2b3c4d")
+
+        // All jobs, chosen by the operator, is not re-seeded.
+        model.sitemapJob = nil
+        model.seedSitemapJobIfNeeded()
+        #expect(model.sitemapJob == nil)
+
+        // A chosen job is never overridden.
+        var chosen = ScanSurfaceModel()
+        chosen.sitemapJob = "scan-55667788"
+        chosen.applyList(try ScanListResult(json: Self.load("scan.list.json")))
+        chosen.seedSitemapJobIfNeeded()
+        #expect(chosen.sitemapJob == "scan-55667788")
+
+        // A job this app started seeds it too.
+        var started = ScanSurfaceModel()
+        started.applyStart(try ScanStartResult(json: Self.load("scan.start.json")))
+        started.seedSitemapJobIfNeeded()
+        #expect(started.sitemapJob == "scan-1a2b3c4d")
     }
 }

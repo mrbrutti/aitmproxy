@@ -25,10 +25,6 @@ struct ScanProfilesTab: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
-        // ↑↓ and a tap both move `selectedProfile`; the one place a selection
-        // becomes an editor load, so a duplicate (a name the list does not carry)
-        // never asks the core for a profile it does not have.
-        .onChange(of: state.surface.selectedProfile) { _, name in loadIfListed(name) }
     }
 
     // MARK: List (D4 left, D11 Profiles list)
@@ -44,7 +40,7 @@ struct ScanProfilesTab: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 ContentUnavailableView {
-                    Label("No profiles — the core lists none.", systemImage: Tok.Glyph.search)
+                    Label(scanNoProfilesText, systemImage: Tok.Glyph.search)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -52,13 +48,7 @@ struct ScanProfilesTab: View {
             VStack(spacing: 0) {
                 if let error = state.surface.profilesError {
                     // A failed refresh keeps the cached rows and says so under the header (D11).
-                    Text(error)
-                        .font(Tok.Face.ui(Tok.Typography.Size.sm))
-                        .foregroundStyle(Tok.Status.serverError.color)
-                        .lineLimit(2)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, Space.md)
-                        .padding(.vertical, Space.xs)
+                    ScanInlineError(text: error)
                         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
                 }
                 ScrollView {
@@ -79,8 +69,8 @@ struct ScanProfilesTab: View {
                 .focusEffectDisabled()
                 .onMoveCommand { direction in
                     switch direction {
-                    case .up: state.surface.moveSelection(in: .profiles, by: -1)
-                    case .down: state.surface.moveSelection(in: .profiles, by: 1)
+                    case .up: move(by: -1)
+                    case .down: move(by: 1)
                     default: break
                     }
                 }
@@ -90,16 +80,23 @@ struct ScanProfilesTab: View {
         }
     }
 
-    /// A tap on the selected row reloads it (a failed load gets its retry); any
-    /// other row goes through `selectedProfile` and `loadIfListed`.
+    /// A tap selects the row and loads it only when the editor does not already
+    /// hold it, so tapping the row being edited never throws the edits away. A
+    /// row whose load failed (nothing loaded under that name) gets its retry here.
     private func select(_ name: String) {
-        if state.surface.selectedProfile == name {
-            Task { await state.loadProfile(name) }
-        } else {
-            state.surface.select(profile: name)
-        }
+        state.surface.select(profile: name)
+        loadIfListed(name)
     }
 
+    /// ↑↓ move the selection and load the row they land on, by the same rule as a tap.
+    private func move(by delta: Int) {
+        state.surface.moveSelection(in: .profiles, by: delta)
+        loadIfListed(state.surface.selectedProfile)
+    }
+
+    /// The one place a selection becomes an editor load: only a name the list
+    /// carries (a duplicate's fresh name is not asked of the core) and only when
+    /// the editor does not already hold that profile.
     private func loadIfListed(_ name: String?) {
         guard let name, state.surface.profiles.contains(where: { $0.name == name }),
               state.surface.loadedProfile?.name != name else { return }
@@ -183,15 +180,24 @@ struct ScanProfilesTab: View {
         }
     }
 
-    /// The one line under the buttons (D4): the refusal first, then the model's
-    /// status line (a launch error or "Saved <name>"), then the edited-builtin note,
-    /// else the idle text.
+    /// The one line under the buttons (D4): the refusal first, then the launch
+    /// error (its code beside it) or the model's status line ("Saved <name>"),
+    /// then the edited-builtin note, else the idle text.
     @ViewBuilder private var statusLine: some View {
         Group {
             if let refusal = state.launchRefusal {
                 Text(refusal).foregroundStyle(Tok.Intercept.deep.color)
-            } else if let line = state.surface.statusLine {
-                Text(line).foregroundStyle(Tok.Ink.secondary.color)
+            } else if let line = state.surface.launchError?.display ?? state.surface.statusLine {
+                HStack(spacing: Space.sm) {
+                    Text(line).foregroundStyle(Tok.Ink.secondary.color)
+                    if let code = state.surface.launchError?.code {
+                        // The engine's error code beside its words, for a bug report.
+                        Text(code)
+                            .font(Tok.Face.data(Tok.Typography.Size.sm))
+                            .foregroundStyle(Tok.Ink.tertiary.color)
+                            .textSelection(.enabled)
+                    }
+                }
             } else if editedBuiltin {
                 Text(scanEditedBuiltinText).foregroundStyle(Tok.Ink.secondary.color)
             } else {
@@ -260,15 +266,8 @@ struct ScanProfileRow: View {
         // Long names middle-truncate; the tooltip carries the whole name (D11).
         .help(entry.name)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(accessibilityWords)
+        .accessibilityLabel(ScanFormat.profileAccessibilityLabel(entry))
         .accessibilityAddTraits(selected ? .isSelected : [])
-    }
-
-    private var accessibilityWords: String {
-        var parts = [entry.name]
-        if entry.builtin { parts.append("builtin") }
-        parts.append(ScanFormat.profileRowLine2(entry))
-        return parts.joined(separator: ", ")
     }
 }
 
@@ -425,8 +424,14 @@ private struct ScanProfileEditor: View {
 
     private var checks: some View {
         block("Checks") {
+            if let error = state.checksError {
+                // The catalogue already loaded stays; the failed re-read says so here (D11).
+                // The shared line carries the list inset; undone here so it sits on the block's edge.
+                ScanInlineError(text: error)
+                    .padding(.horizontal, -Space.md)
+            }
             TextField("Search checks", text: $state.surface.checkQuery)
-                .scanProfileFieldChrome()
+                .scanFieldChrome()
                 .frame(width: 240)
                 .help("Filter the checks by id, name or class")
             let tree = ScanCheckTree(
@@ -464,22 +469,22 @@ private struct ScanProfileEditor: View {
             HStack(alignment: .top, spacing: Space.md) {
                 field("Probes") {
                     TextField("Probes", value: bind(\.budget.probes), format: .number.grouping(.never))
-                        .scanProfileFieldChrome()
+                        .scanFieldChrome()
                 }
                 .frame(width: 96)
                 field("Time (s)") {
                     TextField("Time (s)", value: bind(\.budget.timeS), format: .number.grouping(.never))
-                        .scanProfileFieldChrome()
+                        .scanFieldChrome()
                 }
                 .frame(width: 96)
                 field("Max issues") {
                     TextField("Max issues", value: bind(\.budget.maxIssues), format: .number.grouping(.never))
-                        .scanProfileFieldChrome()
+                        .scanFieldChrome()
                 }
                 .frame(width: 96)
                 field("Check timeout (s)") {
                     TextField("Check timeout (s)", value: bind(\.budget.checkTimeoutS), format: .number.grouping(.never))
-                        .scanProfileFieldChrome()
+                        .scanFieldChrome()
                 }
                 .frame(width: 120)
             }
@@ -544,14 +549,10 @@ private struct ScanProfileEditor: View {
             set: { state.surface.editedProfile?[keyPath: keyPath] = $0 })
     }
 
-    /// A section: tracked xs caps title, then its rows (the legacy `section(_:)` style).
+    /// A section: the shared `ScanSectionTitle`, then its rows.
     private func block<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            Text(title.uppercased())
-                .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
-                .tracking(0.6)
-                .foregroundStyle(Tok.Ink.tertiary.color)
-                .accessibilityAddTraits(.isHeader)
+            ScanSectionTitle(title)
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -661,7 +662,7 @@ private struct ScanProfileCheckRow: View {
                     .lineLimit(1)
             }
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(accessibilityWords)
+            .accessibilityLabel(ScanFormat.checkAccessibilityLabel(leaf))
             Spacer(minLength: Space.sm)
             FlatMenu(title: leaf.choice.word, width: 96) {
                 ForEach(ScanCheckTree.Choice.allCases, id: \.self) { choice in
@@ -674,12 +675,6 @@ private struct ScanProfileCheckRow: View {
         .padding(.vertical, Space.xs)
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
         .help(leaf.aboveIntensity ? scanAboveIntensityHelp : meta.description)
-    }
-
-    private var accessibilityWords: String {
-        var parts = [meta.name, meta.klass, meta.intensity.rawValue, meta.cost, meta.origin.word]
-        if leaf.aboveIntensity { parts.append("above this profile's intensity") }
-        return parts.joined(separator: ", ")
     }
 }
 
@@ -694,9 +689,12 @@ private struct ScanProfileDuplicatePopover: View {
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
                 .foregroundStyle(Tok.Ink.secondary.color)
             TextField("Name", text: name)
-                .scanProfileFieldChrome()
+                .scanFieldChrome()
                 .frame(width: 240)
                 .onSubmit { if valid { duplicate() } }
+            if !trimmedName.isEmpty, !ScanSurface.isValidProfileName(trimmedName) {
+                Hint(text: "Use letters, digits, - _ . (not leading)")
+            }
             HStack(spacing: Space.sm) {
                 Spacer(minLength: 0)
                 FlatButton("Cancel") { state.duplicateName = nil }
@@ -714,11 +712,14 @@ private struct ScanProfileDuplicatePopover: View {
         Binding(get: { state.duplicateName ?? "" }, set: { state.duplicateName = $0 })
     }
 
-    /// A non-blank name the list does not already carry (the core would refuse to
-    /// overwrite a builtin, and a saved custom one is not a duplicate's to replace).
+    private var trimmedName: String { (state.duplicateName ?? "").trimmingCharacters(in: .whitespaces) }
+
+    /// A name the core would accept as a file name (`ScanSurface.isValidProfileName`)
+    /// that the list does not already carry (the core would refuse to overwrite a
+    /// builtin, and a saved custom one is not a duplicate's to replace).
     private var valid: Bool {
-        let trimmed = (state.duplicateName ?? "").trimmingCharacters(in: .whitespaces)
-        return !trimmed.isEmpty && !state.surface.profiles.contains { $0.name == trimmed }
+        let trimmed = trimmedName
+        return ScanSurface.isValidProfileName(trimmed) && !state.surface.profiles.contains { $0.name == trimmed }
     }
 
     private func duplicate() {
@@ -730,17 +731,4 @@ private extension ScanCheckTree.Group {
     /// A stable `ForEach` id: a check in two lanes sits in two groups, so the
     /// group's identity is lane and class together.
     var rowID: String { "\(lane.rawValue)/\(klass)" }
-}
-
-private extension View {
-    /// The editor's text field: plain, on `surface`, a control-border outline (the
-    /// legacy `scanFieldChrome()`, which is private to `ScanPanel.swift`).
-    func scanProfileFieldChrome() -> some View {
-        textFieldStyle(.plain)
-            .font(Tok.Face.data(Tok.Typography.Size.md))
-            .padding(.horizontal, Space.sm)
-            .frame(height: Tok.Size.control)
-            .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
-            .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.control.color))
-    }
 }

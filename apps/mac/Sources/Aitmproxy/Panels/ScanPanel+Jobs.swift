@@ -29,13 +29,13 @@ struct ScanJobsTab: View {
     @ViewBuilder private var list: some View {
         VStack(spacing: 0) {
             if let error = state.surface.jobsError {
-                ScanJobsErrorLine(text: error)
+                // `jobsError` inline above the rows (D11): the list it could not refresh stays.
+                ScanInlineError(text: error)
+                Rule(color: Tok.Line.rule)
             }
             if state.surface.jobs.isEmpty {
                 ContentUnavailableView {
-                    Label("No jobs yet", systemImage: Tok.Glyph.search)
-                } description: {
-                    Text("Pick a profile and Start Scan.")
+                    Label(scanNoJobsText, systemImage: Tok.Glyph.search)
                 } actions: {
                     FlatButton("Open Profiles") { state.surface.tab = .profiles }
                 }
@@ -112,7 +112,7 @@ struct ScanJobsTab: View {
            let summary = state.surface.jobs.first(where: { $0.job == job }) {
             ScanJobDetail(state: state, summary: summary, status: state.surface.statuses[job])
         } else {
-            Text("Select a job.")
+            Text(scanSelectJobText)
                 .font(Tok.Face.ui(Tok.Typography.Size.md))
                 .foregroundStyle(Tok.Ink.tertiary.color)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -284,18 +284,18 @@ private struct ScanJobDetail: View {
 
     private var probesSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Probes")
+            ScanSectionTitle("Probes")
             Text("\(probes.sent) / \(probes.budget)")
                 .font(Tok.Face.data(Tok.Typography.Size.xl, .medium))
                 .foregroundStyle(Tok.Ink.primary.color)
             ScanJobProgressRule(done: probes.sent, total: probes.budget)
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Errors", "\(probes.errors)")
-                stat("Timeouts", "\(probes.timeouts)")
-                stat("Rate waits", "\(probes.rateWaits)")
+                ScanStat("Errors", "\(probes.errors)")
+                ScanStat("Timeouts", "\(probes.timeouts)")
+                ScanStat("Rate waits", "\(probes.rateWaits)")
             }
             if !probes.byLane.isEmpty {
-                stat("By lane", probes.byLane.keys.sorted().map { "\($0) \(probes.byLane[$0] ?? 0)" }
+                ScanStat("By lane", probes.byLane.keys.sorted().map { "\($0) \(probes.byLane[$0] ?? 0)" }
                     .joined(separator: " · "))
             }
         }
@@ -303,38 +303,38 @@ private struct ScanJobDetail: View {
 
     private var crawlSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Crawl")
+            ScanSectionTitle("Crawl")
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Pages", status.map { "\($0.crawl.pages)" })
-                stat("Queued", status.map { "\($0.crawl.queued)" })
-                stat("Depth", status.map { "\($0.crawl.depth)" })
-                stat("Forms", status.map { "\($0.crawl.formsSubmitted)" })
+                ScanStat("Pages", status.map { "\($0.crawl.pages)" })
+                ScanStat("Queued", status.map { "\($0.crawl.queued)" })
+                ScanStat("Depth", status.map { "\($0.crawl.depth)" })
+                ScanStat("Forms", status.map { "\($0.crawl.formsSubmitted)" })
             }
         }
     }
 
     private var pointsSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Points")
+            ScanSectionTitle("Points")
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Found", "\(points.found)")
-                stat("Queued", "\(points.queued)")
-                stat("Audited", "\(points.audited)")
+                ScanStat("Found", "\(points.found)")
+                ScanStat("Queued", "\(points.queued)")
+                ScanStat("Audited", "\(points.audited)")
             }
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Skipped ignored", "\(points.skipped.ignored)")
-                stat("Skipped frequent", "\(points.skipped.frequent)")
-                stat("Skipped limit", "\(points.skipped.limit)")
+                ScanStat("Skipped ignored", "\(points.skipped.ignored)")
+                ScanStat("Skipped frequent", "\(points.skipped.frequent)")
+                ScanStat("Skipped limit", "\(points.skipped.limit)")
             }
         }
     }
 
     private var checksSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Checks")
+            ScanSectionTitle("Checks")
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Scheduled", status.map { "\($0.checks.scheduled)" })
-                stat("Done", status.map { "\($0.checks.done)" })
+                ScanStat("Scheduled", status.map { "\($0.checks.scheduled)" })
+                ScanStat("Done", status.map { "\($0.checks.done)" })
             }
             if let running = status?.checks.running, !running.isEmpty {
                 VStack(alignment: .leading, spacing: Space.xs) {
@@ -353,30 +353,30 @@ private struct ScanJobDetail: View {
 
     private var issuesSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Issues")
+            ScanSectionTitle("Issues")
             ScanSeverityBar(by: issues.bySeverity, height: 12)
             // The counts in words beside the bar, so severity is never colour alone.
             HStack(alignment: .top, spacing: Space.xl) {
-                stat(ScanSeverity.critical.word, "\(issues.bySeverity.critical)")
-                stat(ScanSeverity.high.word, "\(issues.bySeverity.high)")
-                stat(ScanSeverity.medium.word, "\(issues.bySeverity.medium)")
-                stat(ScanSeverity.low.word, "\(issues.bySeverity.low)")
-                stat(ScanSeverity.info.word, "\(issues.bySeverity.info)")
+                ScanStat(ScanSeverity.critical.word, "\(issues.bySeverity.critical)")
+                ScanStat(ScanSeverity.high.word, "\(issues.bySeverity.high)")
+                ScanStat(ScanSeverity.medium.word, "\(issues.bySeverity.medium)")
+                ScanStat(ScanSeverity.low.word, "\(issues.bySeverity.low)")
+                ScanStat(ScanSeverity.info.word, "\(issues.bySeverity.info)")
             }
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Certain", "\(issues.byConfidence.certain)")
-                stat("Firm", "\(issues.byConfidence.firm)")
-                stat("Tentative", "\(issues.byConfidence.tentative)")
+                ScanStat("Certain", "\(issues.byConfidence.certain)")
+                ScanStat("Firm", "\(issues.byConfidence.firm)")
+                ScanStat("Tentative", "\(issues.byConfidence.tentative)")
             }
         }
     }
 
     private func lanesSection(_ lanes: ScanLaneReport) -> some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Lanes")
+            ScanSectionTitle("Lanes")
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Requested", laneWords(lanes.requested))
-                stat("Run", laneWords(lanes.run))
+                ScanStat("Requested", laneWords(lanes.requested))
+                ScanStat("Run", laneWords(lanes.run))
             }
             if !lanes.skipped.isEmpty {
                 VStack(alignment: .leading, spacing: Space.xs) {
@@ -403,7 +403,7 @@ private struct ScanJobDetail: View {
 
     private var clampedSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Clamped")
+            ScanSectionTitle("Clamped")
             ForEach(Array(clampedLines.enumerated()), id: \.offset) { _, line in
                 Text(line)
                     .font(Tok.Face.ui(Tok.Typography.Size.sm))
@@ -415,11 +415,11 @@ private struct ScanJobDetail: View {
 
     private func sessionSection(_ session: ScanSessionStatus) -> some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Session")
+            ScanSectionTitle("Session")
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Reused", ScanFormat.yesNo(session.reused))
-                stat("Lost", ScanFormat.yesNo(session.lost))
-                stat("Browser partial", ScanFormat.yesNo(session.browserPartial))
+                ScanStat("Reused", ScanFormat.yesNo(session.reused))
+                ScanStat("Lost", ScanFormat.yesNo(session.lost))
+                ScanStat("Browser partial", ScanFormat.yesNo(session.browserPartial))
             }
             Text(ScanFormat.canaryText(session.canary))
                 .font(Tok.Face.ui(Tok.Typography.Size.sm))
@@ -430,21 +430,21 @@ private struct ScanJobDetail: View {
 
     private func l4Section(_ l4: ScanL4Counters) -> some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("L4")
+            ScanSectionTitle("L4")
             HStack(alignment: .top, spacing: Space.xl) {
-                stat("Cases", "\(l4.cases)")
-                stat("Crashes", "\(l4.crashes)")
-                stat("Liveness failures", "\(l4.livenessFailures)")
-                stat("Retired elements", "\(l4.retiredElements)")
+                ScanStat("Cases", "\(l4.cases)")
+                ScanStat("Crashes", "\(l4.crashes)")
+                ScanStat("Liveness failures", "\(l4.livenessFailures)")
+                ScanStat("Retired elements", "\(l4.retiredElements)")
             }
         }
     }
 
     private var stoppedSection: some View {
         VStack(alignment: .leading, spacing: Space.sm) {
-            section("Stopped")
+            ScanSectionTitle("Stopped")
             if let reason = status?.stoppedReason {
-                stat("Reason", reason.rawValue)
+                ScanStat("Reason", reason.rawValue)
             }
             if let error = status?.error {
                 Text(error)
@@ -458,28 +458,10 @@ private struct ScanJobDetail: View {
 
     // MARK: Pieces
 
-    /// A section title: tracked xs caps in tertiary, the legacy panel's style.
-    private func section(_ title: String) -> some View {
-        Text(title.uppercased()).font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
-            .foregroundStyle(Tok.Ink.tertiary.color)
-    }
-
     /// A sub-caption inside a section, one step down from the title.
     private func caption(_ title: String) -> some View {
         Text(title).font(Tok.Face.ui(Tok.Typography.Size.xs))
             .foregroundStyle(Tok.Ink.tertiary.color)
-    }
-
-    /// A label over a value; `—` for a value `scan.status` has not told us yet.
-    private func stat(_ label: String, _ value: String?) -> some View {
-        VStack(alignment: .leading, spacing: Space.xs) {
-            caption(label)
-            Text(value ?? "—")
-                .font(Tok.Face.data(Tok.Typography.Size.md, .medium))
-                .foregroundStyle((value == nil ? Tok.Ink.tertiary : Tok.Ink.primary).color)
-                .lineLimit(1)
-                .textSelection(.enabled)
-        }
     }
 
     private func laneWords(_ lanes: [ScanLane]) -> String? {
@@ -512,24 +494,5 @@ private struct ScanJobProgressRule: View {
         .frame(height: 4)
         .frame(maxWidth: .infinity)
         .accessibilityHidden(true)
-    }
-}
-
-// MARK: - Error line
-
-/// `jobsError` inline above the rows (D11): the list it could not refresh stays.
-private struct ScanJobsErrorLine: View {
-    var text: String
-
-    var body: some View {
-        Text(text)
-            .font(Tok.Face.ui(Tok.Typography.Size.sm))
-            .foregroundStyle(Tok.Status.serverError.color)
-            .lineLimit(2)
-            .textSelection(.enabled)
-            .padding(.horizontal, Space.md)
-            .padding(.vertical, Space.sm)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
     }
 }

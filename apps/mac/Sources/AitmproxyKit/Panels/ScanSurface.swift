@@ -23,6 +23,48 @@ public let scanIntrusiveHint = "Intrusive checks may disrupt the target; the eng
 /// D4: the help on a check the profile's intensity will not run.
 public let scanAboveIntensityHelp = "Above this profile's intensity; raise Intensity to run it."
 
+// The empty states and placeholders of the four tabs (D4–D7), one home each.
+
+/// Profiles: the core's `scan.profile.list` came back empty.
+public let scanNoProfilesText = "No profiles — the core lists none."
+
+/// Jobs: nothing started yet.
+public let scanNoJobsText = "No jobs yet — pick a profile and Start Scan."
+
+/// Jobs: no row selected.
+public let scanSelectJobText = "Select a job."
+
+/// Site map: no job has crawled yet.
+public let scanNoSitemapTitle = "No site map yet"
+public let scanNoSitemapText = "A running job fills this as it crawls."
+
+/// Site map: the filter leaves no endpoint.
+public let scanNoEndpointsMatchText = "No endpoints match."
+
+/// Site map: no endpoint selected.
+public let scanSelectEndpointText = "Select an endpoint."
+
+/// Site map: the selected endpoint has no insertion points.
+public let scanNoPointsOnEndpointText = "None on this endpoint."
+
+/// Site map: the selected endpoint has no recorded flows.
+public let scanNoFlowsOnEndpointText = "None recorded for this endpoint."
+
+/// Issues: nothing to list.
+public let scanNoIssuesText = "No issues — start a scan, or widen the filters."
+
+/// Issues: no row selected.
+public let scanSelectIssueText = "Select an issue to read its evidence."
+
+/// Issues: the detail carries no evidence.
+public let scanNoEvidenceText = "No evidence recorded for this issue."
+
+/// `Nothing to delete: my-api is not on the core`: Delete on a profile the core does not list.
+public func scanNothingToDeleteText(name: String) -> String { "Nothing to delete: \(name) is not on the core" }
+
+/// `Unable to save profile: <reason>`: a bus error behind one of the page's actions.
+public func scanUnableText(_ what: String, _ reason: String) -> String { "Unable to \(what): \(reason)" }
+
 // MARK: - Offering
 
 /// Which Scan page the bus can back: the four-surface model needs `scan.start`;
@@ -43,6 +85,22 @@ public enum ScanSurface {
     /// The legacy form is offered when the bus lists `scan.discover` and not `scan.start`.
     public static func legacyOffered(in tools: [ToolDescriptor]) -> Bool {
         has(ScanForm.toolName, in: tools) && !isOffered(in: tools)
+    }
+
+    /// Whether `name` may go to `scan.profile.save` / `.delete` as a profile name
+    /// (the core stores a profile under its name): 1...64 ASCII letters, digits,
+    /// `-`, `_` or `.`, not starting with `.` or `-`. So no path separator, no
+    /// whitespace, no NUL, no `..` segment can reach the core's store.
+    public static func isValidProfileName(_ name: String) -> Bool {
+        let scalars = name.unicodeScalars
+        guard (1...64).contains(scalars.count) else { return false }
+        guard let first = scalars.first, first != ".", first != "-" else { return false }
+        return scalars.allSatisfy { scalar in
+            switch scalar {
+            case "a"..."z", "A"..."Z", "0"..."9", "-", "_", ".": true
+            default: false
+            }
+        }
     }
 
     public static func mode(for tools: [ToolDescriptor]) -> Mode {
@@ -147,6 +205,24 @@ public struct ScanSeveritySegment: Hashable, Sendable {
         self.severity = severity
         self.count = count
         self.fraction = fraction
+    }
+}
+
+// MARK: - PoC link (D6)
+
+/// Resolves an issue's `poc_ref` to one of the PoC files the app lists, so the
+/// Issues detail can open the finding's PoC without guessing a path.
+public enum ScanFindingLink {
+    /// The index of the first path in `pocPaths` whose file name is `pocRef`,
+    /// `pocRef + ".poc.yaml"`, or that ends in `/` + `pocRef`; nil for a nil or
+    /// empty ref, or no match.
+    public static func match(pocRef: String?, in pocPaths: [String]) -> Int? {
+        guard let ref = pocRef, !ref.isEmpty else { return nil }
+        let withExtension = ref + ".poc.yaml"
+        return pocPaths.firstIndex { path in
+            let file = path.split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? path
+            return file == ref || file == withExtension || path.hasSuffix("/" + ref)
+        }
     }
 }
 
@@ -360,13 +436,15 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     public var sitemap: ScanSitemapResult?
     public var selectedNode: String?
     public var sitemapQuery = ""
+    /// Whether the Site map tab has had its job picked for it once (P4).
+    private var sitemapSeeded = false
 
     // Issues
     public var filters = ScanIssueFilters()
     public var issues: [ScanIssueSummary] = []
     public var issuesCursor: String?
     /// The `by_severity` tally of the last `scan.issues` page.
-    public var issuesBySeverity = BySeverity(critical: 0, high: 0, medium: 0, low: 0, info: 0)
+    public var issuesBySeverity: BySeverity = .zero
     public var selectedIssue: String?
     public var issueDetail: ScanIssue?
     public var issuesError: String?
@@ -376,6 +454,9 @@ public struct ScanSurfaceModel: Equatable, Sendable {
     public var confirm: ScanConfirm?
     /// The footer's status line: a refusal, the last launch error, or nil for `scanIdleText`.
     public var statusLine: String?
+    /// The last launch error whole (its code and origins), for the footer's detail;
+    /// cleared by a start, a confirm request or picking another profile.
+    public var launchError: ScanLaunchError?
 
     // Push
     public var lastSeq: [String: UInt64] = [:]
@@ -441,14 +522,14 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         return nil
     }
 
-    /// What a launch sends: `scan.map` when `map`; the name alone for an unedited
-    /// profile, the whole edited profile otherwise. The caller sends nothing while
-    /// `launchRefusal` is non-nil.
+    /// What a launch sends: `scan.map` when `map`, `scan.start` otherwise, and
+    /// always the whole `editedProfile` — the exact object `launchRefusal` checked,
+    /// never a name the core would resolve to something else. The caller sends
+    /// nothing while `launchRefusal` is non-nil.
     public func launchArguments(map: Bool) -> (tool: String, args: [String: JSONValue]) {
         let tool = map ? "scan.map" : ScanSurface.startTool
         guard let profile = editedProfile else { return (tool, [:]) }
-        if profileIsEdited { return (tool, ["profile": profile.json()]) }
-        return (tool, ["profile_name": .string(profile.name)])
+        return (tool, ["profile": profile.json()])
     }
 
     /// The Issues list: `filters` applied, one section per severity in severity
@@ -527,6 +608,13 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         locallyStarted.subtract(listed)
         jobs = pending + result.jobs
         jobsError = nil
+        // The per-job side tables follow the list: a job the core no longer lists
+        // (and this app is not waiting on) takes its seq, status, notices and flag with it.
+        let kept = listed.union(locallyStarted)
+        lastSeq = lastSeq.filter { kept.contains($0.key) }
+        statuses = statuses.filter { kept.contains($0.key) }
+        launchNotices = launchNotices.filter { kept.contains($0.key) }
+        refreshNeeded = refreshNeeded.intersection(kept)
     }
 
     /// `scan.status`: stored, and the matching list row takes its summary.
@@ -553,16 +641,20 @@ public struct ScanSurfaceModel: Equatable, Sendable {
         tab = .jobs
         confirm = nil
         statusLine = nil
+        launchError = nil
         launchInFlight = false
     }
 
     /// A `needs_confirmation` answer: the sheet opens; nothing is sent until Start Scan.
     public mutating func applyConfirm(tool: String, args: [String: JSONValue], request: L4ConfirmRequest) {
         confirm = ScanConfirm(tool: tool, arguments: args, request: request)
+        launchError = nil
         launchInFlight = false
     }
 
+    /// A launch the bus refused: the error is kept whole and its display becomes the status line.
     public mutating func applyLaunchError(_ error: ScanLaunchError) {
+        launchError = error
         statusLine = error.display
         confirm = nil
         launchInFlight = false
@@ -608,13 +700,25 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     // MARK: Push (D8)
 
+    /// Whether `job` is one this model tracks: listed, started here, or with a status read.
+    func knowsJob(_ job: String) -> Bool {
+        locallyStarted.contains(job) || statuses[job] != nil || jobs.contains { $0.job == job }
+    }
+
     /// A `notifications/aitm/job` line. A trigger only: records `seq`, flags the
     /// job (and the list / issues as the event warrants) and returns true; false
     /// and no change for a non-scan kind, an unreadable line, or a `seq` at or
-    /// below the last seen. Never touches `statuses`, `jobs` or `issues`.
+    /// below the last seen. A line for a job this model does not know (not listed,
+    /// not started here, no status) only asks for the list: no `seq` or flag is
+    /// kept for it, so a stranger's lines cannot grow the tables. Never touches
+    /// `statuses`, `jobs` or `issues`.
     @discardableResult
     public mutating func noteJobEvent(_ params: JSONValue) -> Bool {
         guard let line = try? ScanJobNotification(json: params), line.kind == "scan" else { return false }
+        guard knowsJob(line.job) else {
+            listRefreshNeeded = true
+            return true
+        }
         if let last = lastSeq[line.job], line.seq <= last { return false }
         lastSeq[line.job] = line.seq
         refreshNeeded.insert(line.job)
@@ -640,7 +744,18 @@ public struct ScanSurfaceModel: Equatable, Sendable {
 
     public mutating func select(node: String?) { selectedNode = node }
 
-    public mutating func select(profile: String?) { selectedProfile = profile }
+    public mutating func select(profile: String?) {
+        selectedProfile = profile
+        launchError = nil
+    }
+
+    /// The Site map tab's first opening picks the newest job once `jobs` has one;
+    /// after that the operator's choice (a job or All jobs) stands.
+    public mutating func seedSitemapJobIfNeeded() {
+        guard !sitemapSeeded, sitemapJob == nil, let first = jobs.first else { return }
+        sitemapJob = first.job
+        sitemapSeeded = true
+    }
 
     /// ↑↓ over the visible list of a tab, clamped at both ends; from no selection
     /// a step down lands on the first row and a step up on the last.
@@ -745,9 +860,15 @@ public enum ScanFormat {
         return targets.map(hostOf(origin:)).joined(separator: ", ")
     }
 
+    /// The status's profile name; nil when there is no status or it carries none (`""`).
+    static func profileName(_ status: ScanJobStatus?) -> String? {
+        guard let name = status?.profileName, !name.isEmpty else { return nil }
+        return name
+    }
+
     /// `Auditing · standard · 127.0.0.1:8080`; `—` for what `scan.status` has not told us yet.
     public static func jobRowLine1(_ summary: ScanJobSummary, status: ScanJobStatus?) -> String {
-        [stateWord(summary), status?.profileName ?? "—", hosts(status) ?? "—"].joined(separator: " · ")
+        [stateWord(summary), profileName(status) ?? "—", hosts(status) ?? "—"].joined(separator: " · ")
     }
 
     /// `probes 418 / 2000 · points 80 / 120 audited · 0:42`.
@@ -758,7 +879,7 @@ public enum ScanFormat {
     /// The row's words for VoiceOver (D13); the severity bar hides behind it.
     public static func jobAccessibilityLabel(_ summary: ScanJobSummary, status: ScanJobStatus?) -> String {
         var parts = [summary.state.word, summary.phase.rawValue]
-        if let name = status?.profileName { parts.append(name) }
+        if let name = profileName(status) { parts.append(name) }
         if let hosts = hosts(status) { parts.append(hosts) }
         parts.append("\(summary.probes.sent) of \(summary.probes.budget) probes")
         parts.append("\(summary.points.audited) of \(summary.points.found) points audited")
@@ -784,6 +905,27 @@ public enum ScanFormat {
             .joined(separator: " · ")
     }
 
+    /// `standard, builtin, http, ws · medium · normal` (D13); `builtin` only when it is one.
+    public static func profileAccessibilityLabel(_ entry: ScanProfileListEntry) -> String {
+        var parts = [entry.name]
+        if entry.builtin { parts.append("builtin") }
+        parts.append(profileRowLine2(entry))
+        return parts.joined(separator: ", ")
+    }
+
+    /// `Error-based SQL injection, sqli-error, medium, Default` (D13), plus
+    /// `above this profile's intensity` when the profile will not run it.
+    public static func checkAccessibilityLabel(_ leaf: ScanCheckTree.Leaf) -> String {
+        var parts = [leaf.meta.name, leaf.meta.klass, leaf.meta.intensity.rawValue, leaf.choice.word]
+        if leaf.aboveIntensity { parts.append("above this profile's intensity") }
+        return parts.joined(separator: ", ")
+    }
+
+    /// `http://127.0.0.1:8080, 3 endpoints, collapsed` (D13): a Site map origin row.
+    public static func originAccessibilityLabel(origin: String, count: Int, collapsed: Bool) -> String {
+        [origin, plural(count, "endpoint"), collapsed ? "collapsed" : "expanded"].joined(separator: ", ")
+    }
+
     /// `GET /search` (the path alone when the lane has no method).
     static func requestLine(_ location: ScanIssueLocation) -> String {
         [location.method, location.path].compactMap { $0 }.joined(separator: " ")
@@ -793,6 +935,11 @@ public enum ScanFormat {
     public static func issueRowLine2(_ issue: ScanIssueSummary) -> String {
         [requestLine(issue.location), "\(issue.location.kind) \(issue.location.name)", issue.confidence.rawValue]
             .joined(separator: " · ")
+    }
+
+    /// `High, Reflected cross-site scripting, GET /search · query q · certain, Open` (D13).
+    public static func issueAccessibilityLabel(_ issue: ScanIssueSummary) -> String {
+        [issue.severity.word, issue.name, issueRowLine2(issue), issue.status.word].joined(separator: ", ")
     }
 
     /// `http://127.0.0.1:8080 · GET /search · query q`.

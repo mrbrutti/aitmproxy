@@ -18,7 +18,8 @@ struct ScanSitemapTab: View {
                 .gridProbe("scan-sitemap-bar", area: "scan", edge: nil)
             Rule()
             if let error = state.sitemapError {
-                ScanSitemapErrorLine(text: error)
+                // The `sitemapError` line under the bar (D11: inline).
+                ScanInlineError(text: error)
                 Rule(color: Tok.Line.rule)
             }
             if hasNodes {
@@ -36,6 +37,12 @@ struct ScanSitemapTab: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Tok.Ground.surface.color)
+        // The tab opens on a job, not on "All jobs": the newest one, the moment the
+        // list has any (D6). Only the model decides; a job the operator picked stays.
+        .onAppear { state.surface.seedSitemapJobIfNeeded() }
+        .onChange(of: state.surface.jobs.isEmpty) { _, empty in
+            if !empty { state.surface.seedSitemapJobIfNeeded() }
+        }
     }
 
     // MARK: Bar
@@ -44,18 +51,9 @@ struct ScanSitemapTab: View {
 
     private var groups: [ScanOriginGroup] { state.surface.sitemapGroupedByOrigin() }
 
-    /// The job filter's choices, newest first: by the `scan.status` start time where
-    /// this app has read one, else in the list's order behind those.
-    private var jobChoices: [String] {
-        let statuses = state.surface.statuses
-        return state.surface.jobs.enumerated()
-            .sorted { lhs, rhs in
-                let left = statuses[lhs.element.job]?.startedAt ?? Int.min
-                let right = statuses[rhs.element.job]?.startedAt ?? Int.min
-                return left != right ? left > right : lhs.offset < rhs.offset
-            }
-            .map { $0.element.job }
-    }
+    /// The job filter's choices in the model's order (newest first), the same
+    /// order the Issues tab's Job menu shows.
+    private var jobChoices: [String] { state.surface.jobs.map(\.job) }
 
     private var jobTitle: String { state.surface.sitemapJob ?? "All jobs" }
 
@@ -70,13 +68,8 @@ struct ScanSitemapTab: View {
             }
             .help("Show the site map of one job, or of all jobs")
             TextField("Search host or path", text: $state.surface.sitemapQuery)
-                .textFieldStyle(.plain)
-                .font(Tok.Face.data(Tok.Typography.Size.md))
-                .padding(.horizontal, Space.sm)
+                .scanFieldChrome()
                 .frame(maxWidth: 320)
-                .frame(height: Tok.Size.control)
-                .background(Tok.Ground.surface.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
-                .overlay(RoundedRectangle(cornerRadius: Tok.Radius.control).strokeBorder(Tok.Line.control.color))
                 .accessibilityLabel("Search the site map")
             Spacer(minLength: 0)
         }
@@ -89,7 +82,7 @@ struct ScanSitemapTab: View {
     @ViewBuilder private var tree: some View {
         if groups.isEmpty {
             // Nodes exist but the query matches none of them.
-            Text("No endpoints match.")
+            Text(scanNoEndpointsMatchText)
                 .font(Tok.Face.ui(Tok.Typography.Size.md))
                 .foregroundStyle(Tok.Ink.tertiary.color)
                 .padding(.horizontal, Space.md)
@@ -157,9 +150,9 @@ struct ScanSitemapTab: View {
 
     private var empty: some View {
         ContentUnavailableView {
-            Label("No site map yet", systemImage: Tok.Glyph.search)
+            Label(scanNoSitemapTitle, systemImage: Tok.Glyph.search)
         } description: {
-            Text("No site map yet — a running job fills this as it crawls.")
+            Text(scanNoSitemapText)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -205,7 +198,7 @@ private struct ScanSitemapOriginRow: View {
         .onTapGesture(perform: toggle)
         .overlay(alignment: .bottom) { Rule(color: Tok.Line.rule) }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(origin), \(ScanFormat.plural(count, "endpoint")), \(collapsed ? "collapsed" : "expanded")")
+        .accessibilityLabel(ScanFormat.originAccessibilityLabel(origin: origin, count: count, collapsed: collapsed))
         .accessibilityAddTraits(.isButton)
         .accessibilityAction(named: "Collapse or expand", toggle)
     }
@@ -338,9 +331,9 @@ private struct ScanSitemapDetail: View {
                     }
                     .frame(minHeight: Tok.Size.Row.dense)
 
-                    section("Insertion points", count: points.count)
+                    ScanSectionTitle("Insertion points", count: points.count)
                     if points.isEmpty {
-                        Hint(text: "None on this endpoint.")
+                        Hint(text: scanNoPointsOnEndpointText)
                     } else {
                         VStack(spacing: 0) {
                             ForEach(points, id: \.id) { point in
@@ -349,13 +342,16 @@ private struct ScanSitemapDetail: View {
                         }
                     }
 
-                    section("Flows", count: node.flows.count)
+                    ScanSectionTitle("Flows", count: node.flows.count)
                     if node.flows.isEmpty {
-                        Hint(text: "None recorded for this endpoint.")
+                        Hint(text: scanNoFlowsOnEndpointText)
                     } else {
                         VStack(spacing: 0) {
                             ForEach(Array(node.flows.enumerated()), id: \.offset) { _, id in
-                                ScanEndpointRow(url: state.flowLabel(id) ?? id, linked: true, openable: state.isListed(id)) {
+                                ScanEndpointRow(
+                                    url: state.flowLabel(id) ?? id, linked: true, openable: state.isListed(id),
+                                    help: "Open this flow in the inspector"
+                                ) {
                                     state.openFlow(id)
                                 }
                             }
@@ -366,41 +362,10 @@ private struct ScanSitemapDetail: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else {
-            Text("Select an endpoint.")
+            Text(scanSelectEndpointText)
                 .font(Tok.Face.ui(Tok.Typography.Size.md))
                 .foregroundStyle(Tok.Ink.tertiary.color)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-    }
-
-    private func section(_ title: String, count: Int) -> some View {
-        HStack(spacing: Space.sm) {
-            Text(title.uppercased())
-                .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
-                .tracking(0.6)
-                .foregroundStyle(Tok.Ink.tertiary.color)
-            Text("\(count)")
-                .font(Tok.Face.ui(Tok.Typography.Size.xs))
-                .foregroundStyle(Tok.Ink.tertiary.color)
-                .monospacedDigit()
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isHeader)
-    }
-}
-
-/// The `sitemapError` line under the bar (D11: inline).
-private struct ScanSitemapErrorLine: View {
-    var text: String
-
-    var body: some View {
-        Text(text)
-            .font(Tok.Face.ui(Tok.Typography.Size.sm))
-            .foregroundStyle(Tok.Status.serverError.color)
-            .lineLimit(2)
-            .textSelection(.enabled)
-            .padding(.horizontal, Space.md)
-            .padding(.vertical, Space.xs)
-            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

@@ -76,8 +76,11 @@ private struct ScanConfirmSheet: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: Space.md) {
                 Spacer()
+                // Once the confirmed call is on the wire there is nothing left to
+                // cancel: the engine has the token, and the answer settles the sheet.
                 FlatButton("Cancel") { state.dismissConfirm() }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(state.surface.launchInFlight)
                 if state.surface.launchInFlight {
                     // D11: the confirmed call is in flight; the button is gone, so
                     // the same launch cannot be sent twice.

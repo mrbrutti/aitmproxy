@@ -596,10 +596,26 @@ struct ScanWire {
         return text
     }
 
+    /// The largest whole number a wire field may carry: 2^53, the last integer a
+    /// JSON double represents exactly. Every count, port and epoch-millisecond
+    /// stamp the scanner sends is non-negative and far below it, so a value
+    /// outside `0...2^53` is malformed, never stored: the tallies are added
+    /// (`BySeverity.total`) and the stamps subtracted (`ScanFormat.relative`),
+    /// and a full-range `Int` would trap there.
+    static let wholeNumberRange: ClosedRange<Int> = 0...9_007_199_254_740_992
+
+    /// `value` as a whole number in `wholeNumberRange`, or the malformed error for `key`.
+    private func whole(_ value: JSONValue, _ key: String, _ expected: String = "a whole number") throws -> Int {
+        guard let number = value.intValue else { throw wrong(key, expected) }
+        guard Self.wholeNumberRange.contains(number) else {
+            throw wrong(key, "\(expected) in 0...9007199254740992")
+        }
+        return number
+    }
+
     func int(_ key: String) throws -> Int {
         guard let value = self[key] else { throw missing(key) }
-        guard let number = value.intValue else { throw wrong(key, "a whole number") }
-        return number
+        return try whole(value, key)
     }
 
     /// A counter: absent reads as `fallback` (the crate's `#[serde(default)]`).
@@ -609,8 +625,7 @@ struct ScanWire {
 
     func optionalInt(_ key: String) throws -> Int? {
         guard let value = self[key] else { return nil }
-        guard let number = value.intValue else { throw wrong(key, "a whole number") }
-        return number
+        return try whole(value, key)
     }
 
     func uint64(_ key: String) throws -> UInt64 {
@@ -666,10 +681,7 @@ struct ScanWire {
     }
 
     func ints(_ key: String) throws -> [Int] {
-        try array(key).map { item in
-            guard let number = item.intValue else { throw wrong(key, "an array of whole numbers") }
-            return number
-        }
+        try array(key).map { try whole($0, key, "an array of whole numbers") }
     }
 
     func doubles(_ key: String) throws -> [Double] {
@@ -694,10 +706,7 @@ struct ScanWire {
     /// An object of whole numbers (`by_lane`); absent reads as empty.
     func counts(_ key: String) throws -> [String: Int] {
         guard let value = try optionalObject(key)?.objectValue else { return [:] }
-        return try value.mapValues { item in
-            guard let number = item.intValue else { throw wrong(key, "an object of whole numbers") }
-            return number
-        }
+        return try value.mapValues { try whole($0, key, "an object of whole numbers") }
     }
 
     func vocab<V: ScanVocabulary>(_ key: String) throws -> V {
@@ -1332,58 +1341,101 @@ extension ScanIssueSummary {
 }
 
 /// `Issue`: the full finding `scan.issue` and `scan.issue.update` return (spec D6).
+/// The list's fields live in `summary`, parsed once; the evidence and prose are
+/// what the detail adds. Every summary field is also reachable directly
+/// (`issue.severity`), so a view reads a detail and a row the same way.
 public struct ScanIssue: Hashable, Sendable {
-    public var id: String
-    public var job: String
-    public var checkId: String
-    public var klass: String
-    public var name: String
-    public var severity: ScanSeverity
-    public var confidence: ScanConfidence
-    public var status: ScanIssueStatus
-    public var lane: ScanLane
-    public var target: ScanTarget
-    public var location: ScanIssueLocation
+    /// The list's view of this issue: every field `scan.issues` carries.
+    public var summary: ScanIssueSummary
     public var evidence: ScanEvidence
-    public var firstSeen: Int
-    public var lastSeen: Int
-    public var occurrences: Int
-    public var pocRef: String?
-    public var findingId: String?
     public var description: String
     public var remediation: String?
     /// The operator's triage note, set through `scan.issue.update`.
     public var note: String?
 
-    /// The list's view of this issue.
-    public var summary: ScanIssueSummary {
-        ScanIssueSummary(
-            id: id, job: job, checkId: checkId, klass: klass, name: name, severity: severity,
-            confidence: confidence, status: status, lane: lane, target: target, location: location,
-            firstSeen: firstSeen, lastSeen: lastSeen, occurrences: occurrences, pocRef: pocRef, findingId: findingId)
+    public init(
+        summary: ScanIssueSummary, evidence: ScanEvidence, description: String, remediation: String?, note: String?
+    ) {
+        self.summary = summary
+        self.evidence = evidence
+        self.description = description
+        self.remediation = remediation
+        self.note = note
+    }
+
+    // The summary's fields, forwarded.
+    public var id: String {
+        get { summary.id }
+        set { summary.id = newValue }
+    }
+    public var job: String {
+        get { summary.job }
+        set { summary.job = newValue }
+    }
+    public var checkId: String {
+        get { summary.checkId }
+        set { summary.checkId = newValue }
+    }
+    /// The weakness class (`reflected-xss`, `sqli-error`, ...); `class` on the wire.
+    public var klass: String {
+        get { summary.klass }
+        set { summary.klass = newValue }
+    }
+    public var name: String {
+        get { summary.name }
+        set { summary.name = newValue }
+    }
+    public var severity: ScanSeverity {
+        get { summary.severity }
+        set { summary.severity = newValue }
+    }
+    public var confidence: ScanConfidence {
+        get { summary.confidence }
+        set { summary.confidence = newValue }
+    }
+    public var status: ScanIssueStatus {
+        get { summary.status }
+        set { summary.status = newValue }
+    }
+    public var lane: ScanLane {
+        get { summary.lane }
+        set { summary.lane = newValue }
+    }
+    public var target: ScanTarget {
+        get { summary.target }
+        set { summary.target = newValue }
+    }
+    public var location: ScanIssueLocation {
+        get { summary.location }
+        set { summary.location = newValue }
+    }
+    /// Epoch milliseconds.
+    public var firstSeen: Int {
+        get { summary.firstSeen }
+        set { summary.firstSeen = newValue }
+    }
+    public var lastSeen: Int {
+        get { summary.lastSeen }
+        set { summary.lastSeen = newValue }
+    }
+    public var occurrences: Int {
+        get { summary.occurrences }
+        set { summary.occurrences = newValue }
+    }
+    public var pocRef: String? {
+        get { summary.pocRef }
+        set { summary.pocRef = newValue }
+    }
+    public var findingId: String? {
+        get { summary.findingId }
+        set { summary.findingId = newValue }
     }
 }
 
 extension ScanIssue {
     public init(json: JSONValue) throws {
         let wire = try ScanWire(json, as: "ScanIssue")
-        let summary = try ScanIssueSummary(wire: wire)
-        id = summary.id
-        job = summary.job
-        checkId = summary.checkId
-        klass = summary.klass
-        name = summary.name
-        severity = summary.severity
-        confidence = summary.confidence
-        status = summary.status
-        lane = summary.lane
-        target = summary.target
-        location = summary.location
-        firstSeen = summary.firstSeen
-        lastSeen = summary.lastSeen
-        occurrences = summary.occurrences
-        pocRef = summary.pocRef
-        findingId = summary.findingId
+        summary = try ScanIssueSummary(wire: wire)
         evidence = try ScanEvidence(json: wire.object("evidence"))
         description = try wire.string("description")
         remediation = try wire.optionalString("remediation")

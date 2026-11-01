@@ -146,6 +146,10 @@ final class ScanPanelState {
     /// the header shows a spinner (D11: the cached list is shown first).
     var profilesLoadingSlow = false
 
+    /// The last `scan.checks` read failed. Rendered inside the editor's Checks
+    /// block; the catalogue already loaded stays (D11).
+    var checksError: String?
+
     /// The Site map tab's last read failed. The Kit model carries `profilesError`,
     /// `jobsError` and `issuesError` but no site-map slot, so the page keeps this
     /// one; like the others it never blanks the list it could not refresh.
@@ -196,7 +200,7 @@ final class ScanPanelState {
             let value = try await session.runCommand("scan.profile.list", [:])
             surface.applyProfiles(try ScanProfileListResult(json: value))
         } catch {
-            surface.profilesError = "Unable to load profiles: \(BusService.describe(error))"
+            surface.profilesError = scanUnableText("load profiles", BusService.describe(error))
         }
     }
 
@@ -208,7 +212,7 @@ final class ScanPanelState {
             surface.applyProfile(try ScanProfile(json: value))
             surface.profilesError = nil
         } catch {
-            surface.profilesError = "Unable to load profiles: \(BusService.describe(error))"
+            surface.profilesError = scanUnableText("load profile \(name)", BusService.describe(error))
             return
         }
         await refreshSessionPreview()
@@ -219,8 +223,9 @@ final class ScanPanelState {
         do {
             let value = try await session.runCommand("scan.checks", [:])
             surface.applyChecks(try ScanChecksResult(json: value))
+            checksError = nil
         } catch {
-            surface.profilesError = "Unable to load checks: \(BusService.describe(error))"
+            checksError = scanUnableText("load checks", BusService.describe(error))
         }
     }
 
@@ -266,7 +271,7 @@ final class ScanPanelState {
             surface.applyList(try ScanListResult(json: value))
             statusRequested.formIntersection(Set(surface.jobs.map(\.job)))
         } catch {
-            surface.jobsError = "Unable to list jobs: \(BusService.describe(error))"
+            surface.jobsError = scanUnableText("list jobs", BusService.describe(error))
         }
     }
 
@@ -277,7 +282,7 @@ final class ScanPanelState {
             surface.applyStatus(try ScanJobStatus(json: value))
             surface.jobsError = nil
         } catch {
-            surface.jobsError = "Unable to read job \(job): \(BusService.describe(error))"
+            surface.jobsError = scanUnableText("read job \(job)", BusService.describe(error))
         }
     }
 
@@ -290,7 +295,7 @@ final class ScanPanelState {
             let value = try await session.runCommand("scan.issues", args)
             surface.applyIssues(try ScanIssuesResult(json: value), append: append)
         } catch {
-            surface.issuesError = "Unable to load issues: \(BusService.describe(error))"
+            surface.issuesError = scanUnableText("load issues", BusService.describe(error))
         }
     }
 
@@ -300,7 +305,7 @@ final class ScanPanelState {
             let value = try await session.runCommand("scan.issue", ["id": .string(id)])
             surface.applyIssue(try ScanIssue(json: value))
         } catch {
-            surface.issuesError = "Unable to load issue \(id): \(BusService.describe(error))"
+            surface.issuesError = scanUnableText("load issue \(id)", BusService.describe(error))
         }
     }
 
@@ -316,7 +321,7 @@ final class ScanPanelState {
             surface.applySitemap(try ScanSitemapResult(json: value), append: append)
             sitemapError = nil
         } catch {
-            sitemapError = "Unable to load the site map: \(BusService.describe(error))"
+            sitemapError = scanUnableText("load the site map", BusService.describe(error))
         }
     }
 
@@ -362,21 +367,34 @@ final class ScanPanelState {
         let listFlagged = surface.listRefreshNeeded
         let issuesFlagged = surface.issuesRefreshNeeded
         surface.clearRefreshFlags()
-        for job in flagged.sorted() { await refreshStatus(job) }
+        // A page leave or a launch's `pollGeneration` bump cancels this task between
+        // reads; every await below is a point where the next read must not start.
+        for job in flagged.sorted() {
+            guard !Task.isCancelled else { return }
+            await refreshStatus(job)
+        }
+        guard !Task.isCancelled else { return }
         if listFlagged { await refreshList() }
+        guard !Task.isCancelled else { return }
         if issuesFlagged, surface.tab == .issues { await refreshIssues() }
 
         // Timers: the list every 2 s.
+        guard !Task.isCancelled else { return }
         if tick.isMultiple(of: 8), !listFlagged { await refreshList() }
         // The selected job every 1 s while it runs, and once for every listed job
         // whose status this app has not read yet.
+        guard !Task.isCancelled else { return }
         if tick.isMultiple(of: 4) { await pollStatuses(flagged: flagged) }
+        guard !Task.isCancelled else { return }
         if surface.tab == .issues {
             // Issues every 2 s while a job is running, offset from the list beat.
             if tick % 8 == 4, !issuesFlagged, !surface.runningJobs.isEmpty { await refreshIssues() }
+            guard !Task.isCancelled else { return }
             await loadIssuesIfFiltersChanged()
+            guard !Task.isCancelled else { return }
             await loadSelectedIssueDetail()
         }
+        guard !Task.isCancelled else { return }
         if surface.tab == .sitemap { await loadSitemapIfJobChanged() }
     }
 
@@ -386,6 +404,7 @@ final class ScanPanelState {
             await refreshStatus(job)
         }
         for summary in surface.jobs where surface.statuses[summary.job] == nil {
+            guard !Task.isCancelled else { return }
             guard !flagged.contains(summary.job), !statusRequested.contains(summary.job) else { continue }
             statusRequested.insert(summary.job)
             await refreshStatus(summary.job)
@@ -456,16 +475,18 @@ final class ScanPanelState {
     }
 
     /// The second half of the handshake: the identical arguments plus `_confirm`.
+    /// A second Start Scan while the first is on the wire sends nothing.
     func confirmLaunch() async {
-        guard let confirm = surface.confirm else { return }
+        guard let confirm = surface.confirm, !surface.launchInFlight else { return }
         surface.launchInFlight = true
         await send(tool: confirm.tool, args: confirm.confirmedArguments)
     }
 
-    /// Cancel on the confirm sheet: nothing more is sent.
+    /// Cancel on the confirm sheet: nothing more is sent. Only the pending confirm
+    /// is cleared; a confirmed call already on the wire keeps `launchInFlight`
+    /// until `send` settles it, so the footer cannot start a second job meanwhile.
     func dismissConfirm() {
         surface.confirm = nil
-        surface.launchInFlight = false
     }
 
     /// One launch call, read as D9 reads it: a `needs_confirmation` answer first,
@@ -505,7 +526,7 @@ final class ScanPanelState {
                 await refreshStatus(job)
             }
         } catch {
-            surface.jobsError = "Unable to cancel job \(job): \(BusService.describe(error))"
+            surface.jobsError = scanUnableText("cancel job \(job)", BusService.describe(error))
         }
     }
 
@@ -529,7 +550,7 @@ final class ScanPanelState {
             surface.statusLine = line
             clearStatusLine(line, after: .seconds(4))
         } catch {
-            surface.statusLine = "Unable to save profile: \(BusService.describe(error))"
+            surface.statusLine = scanUnableText("save profile", BusService.describe(error))
             return
         }
         await refreshProfiles()
@@ -549,13 +570,16 @@ final class ScanPanelState {
     }
 
     /// `scan.profile.delete {name}`. The editor never ends up blank: the first
-    /// profile left takes its place.
+    /// profile left takes its place. `deleted: false` (nothing on file under that
+    /// name) is said in the footer, not treated as a failure.
     func deleteProfile(_ name: String) async {
         deleteCandidate = nil
         do {
-            _ = try await session.runCommand("scan.profile.delete", ["name": .string(name)])
+            let value = try await session.runCommand("scan.profile.delete", ["name": .string(name)])
+            let result = try ScanProfileDeleteResult(json: value)
+            if !result.deleted { surface.statusLine = scanNothingToDeleteText(name: name) }
         } catch {
-            surface.profilesError = "Unable to delete profile \(name): \(BusService.describe(error))"
+            surface.profilesError = scanUnableText("delete profile \(name)", BusService.describe(error))
             return
         }
         if surface.selectedProfile == name {
@@ -581,7 +605,7 @@ final class ScanPanelState {
             surface.issuesError = nil
         } catch {
             setIssueStatus(id, previous)
-            surface.issuesError = "Unable to update the issue: \(BusService.describe(error))"
+            surface.issuesError = scanUnableText("update the issue", BusService.describe(error))
         }
     }
 
@@ -595,7 +619,7 @@ final class ScanPanelState {
             surface.applyIssue(try ScanIssue(json: value))
             surface.issuesError = nil
         } catch {
-            surface.issuesError = "Unable to save the note: \(BusService.describe(error))"
+            surface.issuesError = scanUnableText("save the note", BusService.describe(error))
         }
     }
 
@@ -632,21 +656,18 @@ final class ScanPanelState {
         return "\(row.method.label) \(row.path)"
     }
 
-    /// Open the PoC an issue points at on the Findings page. The reference is the
-    /// finding id when the issue carries one, else the PoC path's tail.
-    func openPoC(ref: String?, findingId: String?) {
-        session.show(.findings)
+    /// Open the PoC an issue points at on the Findings page. The match is the
+    /// Kit's `ScanFindingLink.match` over the findings' PoC paths, nothing looser;
+    /// a reference no finding carries is refused, never guessed.
+    func openPoC(ref: String?) {
         if session.poc.findings.isEmpty { session.poc.load() }
-        let match = session.poc.findings.first { finding in
-            if let findingId, finding.id.uuidString == findingId { return true }
-            if let ref, !ref.isEmpty, finding.pocPath.hasSuffix(ref) { return true }
-            return false
-        }
-        guard let match else {
-            session.lastError = "PoC \(ref ?? findingId ?? "") is not in this app's findings list"
+        let findings = session.poc.findings
+        guard let index = ScanFindingLink.match(pocRef: ref, in: findings.map(\.pocPath)) else {
+            session.lastError = "PoC \(ref ?? "") is not in this app's findings list"
             return
         }
-        session.poc.select(match.id)
+        session.show(.findings)
+        session.poc.select(findings[index].id)
     }
 
     // MARK: Surface intents: navigation
@@ -1016,6 +1037,8 @@ struct ScanEndpointRow: View {
     var linked: Bool
     /// That flow is still in the flow list, so opening it can succeed.
     var openable: Bool
+    /// The chevron's tooltip while the flow can be opened.
+    var help: String = "Open Flow"
     var open: () -> Void
 
     var body: some View {
@@ -1032,7 +1055,7 @@ struct ScanEndpointRow: View {
                 }
                 .buttonStyle(PressStyle())
                 .disabled(!openable)
-                .help(openable ? "Open Flow" : "This flow is no longer in the flow list (cleared, or not captured here).")
+                .help(openable ? help : "This flow is no longer in the flow list (cleared, or not captured here).")
             } else {
                 label.textSelection(.enabled)
             }
@@ -1111,7 +1134,7 @@ struct ScanPointDetail: View {
                 Rule()
                 ScrollView {
                     VStack(alignment: .leading, spacing: Space.lg) {
-                        section("Example")
+                        ScanSectionTitle("Example")
                         Text(point.example.isEmpty ? "(empty)" : point.example)
                             .font(Tok.Face.data(Tok.Typography.Size.md))
                             .foregroundStyle(point.example.isEmpty ? Tok.Ink.tertiary.color : Tok.Ink.primary.color)
@@ -1121,7 +1144,7 @@ struct ScanPointDetail: View {
                             .background(Tok.Ground.raised.color, in: RoundedRectangle(cornerRadius: Tok.Radius.control))
                         Hint(text: "Shown as the scanner returned it; secrets are redacted at the source.")
 
-                        section("Flow")
+                        ScanSectionTitle("Flow")
                         flowReference(point)
                         if !state.canOpen(point) {
                             Hint(text: "This flow is no longer in the flow list (cleared, or not captured here).")
@@ -1153,13 +1176,13 @@ struct ScanPointDetail: View {
     private var scanSummary: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: Space.lg) {
-                section("Coverage")
+                ScanSectionTitle("Coverage")
                 HStack(alignment: .top, spacing: Space.section) {
                     stat("Endpoints", "\(state.endpoints.count)")
                     stat("Injection points", "\(state.points.count)")
                 }
                 if !state.points.isEmpty {
-                    section("Injection points by type")
+                    ScanSectionTitle("Injection points by type")
                     typeBreakdown
                 }
                 if let reason = state.model.stoppedReason {
@@ -1245,10 +1268,80 @@ struct ScanPointDetail: View {
         .padding(.horizontal, Space.md)
         .frame(height: Tok.Size.inspectorHeader)
     }
+}
 
-    private func section(_ title: String) -> some View {
-        Text(title.uppercased()).font(Tok.Face.ui(Tok.Typography.Size.xs, .medium)).tracking(0.6)
-            .foregroundStyle(Tok.Ink.tertiary.color)
+// MARK: - Shared chrome
+
+/// A section title on any Scan tab: tracked xs caps in tertiary, read as a
+/// header. With `count`, the count sits beside it in the same ink (the site
+/// map's "INSERTION POINTS 3").
+struct ScanSectionTitle: View {
+    var title: String
+    var count: Int?
+
+    init(_ title: String, count: Int? = nil) {
+        self.title = title
+        self.count = count
+    }
+
+    var body: some View {
+        HStack(spacing: Space.sm) {
+            Text(title.uppercased())
+                .font(Tok.Face.ui(Tok.Typography.Size.xs, .medium))
+                .tracking(0.6)
+                .foregroundStyle(Tok.Ink.tertiary.color)
+            if let count {
+                Text("\(count)")
+                    .font(Tok.Face.ui(Tok.Typography.Size.xs))
+                    .foregroundStyle(Tok.Ink.tertiary.color)
+                    .monospacedDigit()
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// A failed read or update, inline (D11): the list it could not refresh stays
+/// as it was. Selectable so the reason can be copied into a bug report.
+struct ScanInlineError: View {
+    var text: String
+
+    var body: some View {
+        Text(text)
+            .font(Tok.Face.ui(Tok.Typography.Size.sm))
+            .foregroundStyle(Tok.Status.serverError.color)
+            .lineLimit(2)
+            .textSelection(.enabled)
+            .padding(.horizontal, Space.md)
+            .padding(.vertical, Space.xs)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Error: \(text)")
+    }
+}
+
+/// A label over a value; `—` in tertiary for a value the bus has not told us yet.
+struct ScanStat: View {
+    var label: String
+    var value: String?
+
+    init(_ label: String, _ value: String?) {
+        self.label = label
+        self.value = value
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Space.xs) {
+            Text(label)
+                .font(Tok.Face.ui(Tok.Typography.Size.xs))
+                .foregroundStyle(Tok.Ink.tertiary.color)
+            Text(value ?? "—")
+                .font(Tok.Face.data(Tok.Typography.Size.md, .medium))
+                .foregroundStyle((value == nil ? Tok.Ink.tertiary : Tok.Ink.primary).color)
+                .lineLimit(1)
+                .textSelection(.enabled)
+        }
     }
 }
 
@@ -1258,8 +1351,11 @@ private extension View {
     @ViewBuilder func opensOnDoubleClick(_ enabled: Bool, _ action: @escaping () -> Void) -> some View {
         if enabled { onTapGesture(count: 2, perform: action) } else { self }
     }
+}
 
-    /// The launch bar's text field: plain, on `surface`, a control-border outline.
+extension View {
+    /// The Scan page's text field, on every tab: plain, on `surface`, a
+    /// control-border outline.
     func scanFieldChrome() -> some View {
         textFieldStyle(.plain)
             .font(Tok.Face.data(Tok.Typography.Size.md))

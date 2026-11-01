@@ -401,6 +401,99 @@ extension ScanModelTests {
         #expect(throws: BusError.self) { try ScanProfile(json: .null) }
     }
 
+    /// S1: a whole number outside `0...2^53` is malformed at parse, so the tallies
+    /// the Kit adds (`BySeverity.total`) and the stamps it subtracts
+    /// (`ScanFormat.relative`) can never trap on a hostile core's value.
+    @Test func wholeNumbersOutsideTheSafeRangeAreRefused() throws {
+        let status = try ScanPack.load("scan.status.json")
+        #expect(throws: BusError.self) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["issues", "by_severity", "critical"], to: 9_223_372_036_854_775_807))
+        }
+        // 2^62 reads as an exact `Int`; only the range rule refuses it, and the sum of two would trap.
+        #expect(throws: BusError.malformed("BySeverity.critical is not a whole number in 0...9007199254740992")) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["issues", "by_severity", "critical"], to: 4_611_686_018_427_387_904))
+        }
+        #expect(throws: BusError.self) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["issues", "by_severity", "low"], to: 9_007_199_254_740_994))
+        }
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "sent"], to: -1)) }
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["started_at"], to: -1)) }
+        #expect(throws: BusError.self) { try ScanJobStatus(json: ScanPack.edited(status, path: ["finished_at"], to: -1)) }
+        #expect(throws: BusError.self) {
+            try ScanJobStatus(json: ScanPack.edited(status, path: ["probes", "by_lane", "http"], to: -1))
+        }
+        // The top of the range is still a value; `null` and absence still read as the default.
+        let top = try ScanJobStatus(json: ScanPack.edited(status, path: ["issues", "by_severity", "critical"], to: 9_007_199_254_740_992))
+        #expect(top.issues.bySeverity.critical == 9_007_199_254_740_992)
+        #expect(top.issues.bySeverity.total == 9_007_199_254_740_992 + 3)
+        let nulled = try ScanJobStatus(json: ScanPack.edited(status, path: ["issues", "by_severity", "critical"], to: .null))
+        #expect(nulled.issues.bySeverity.critical == 0)
+
+        let issue = try ScanPack.load("scan.issue.json")
+        #expect(throws: BusError.malformed("ScanIssue.first_seen is not a whole number in 0...9007199254740992")) {
+            try ScanIssue(json: ScanPack.edited(issue, path: ["first_seen"], to: -1))
+        }
+        #expect(throws: BusError.self) { try ScanIssue(json: ScanPack.edited(issue, path: ["last_seen"], to: -1)) }
+        #expect(throws: BusError.self) { try ScanIssue(json: ScanPack.edited(issue, path: ["occurrences"], to: -1)) }
+        // `timing` is null in the pack; a timing object with a negative sample is refused through `ints`.
+        let timing: JSONValue = ["requested_s": [1.0], "observed_ms": [-1], "baseline_ms": [0], "slope": 1.0, "r": 1.0]
+        #expect(throws: BusError.malformed("ScanTiming.observed_ms is not an array of whole numbers in 0...9007199254740992")) {
+            try ScanIssue(json: ScanPack.edited(issue, path: ["evidence", "timing"], to: timing))
+        }
+        #expect(throws: BusError.self) {
+            try ScanIssue(json: ScanPack.edited(issue, path: ["last_seen"], to: 9_223_372_036_854_775_807))
+        }
+        let zero = try ScanIssue(json: ScanPack.edited(issue, path: ["first_seen"], to: 0))
+        #expect(zero.firstSeen == 0)
+
+        // The `seq` reader has its own rule (any UInt64 up to 2^53); it is not widened by this one.
+        let line = try ScanPack.load("job.progress.json")
+        #expect(throws: BusError.self) { try ScanJobNotification(json: ScanPack.edited(line, path: ["seq"], to: -1)) }
+    }
+
+    /// Q4: a detail is its summary plus the evidence and prose; the summary is
+    /// parsed once and every list field reads and writes through it.
+    @Test func anIssueComposesItsSummary() throws {
+        let json = try ScanPack.load("scan.issue.json")
+        let issue = try ScanIssue(json: json)
+        let summary = try ScanIssueSummary(json: json)
+        #expect(issue.summary == summary)
+        #expect(issue.id == "issue-9f8e7d6c")
+        #expect(issue.job == "scan-1a2b3c4d")
+        #expect(issue.checkId == "http.reflected-xss")
+        #expect(issue.klass == "reflected-xss")
+        #expect(issue.name == summary.name)
+        #expect(issue.severity == .high)
+        #expect(issue.confidence == summary.confidence)
+        #expect(issue.status == .open)
+        #expect(issue.lane == .http)
+        #expect(issue.target == summary.target)
+        #expect(issue.location == summary.location)
+        #expect(issue.firstSeen == 1_761_900_000_000)
+        #expect(issue.lastSeen == 1_761_900_000_000)
+        #expect(issue.occurrences == 1)
+        #expect(issue.pocRef == summary.pocRef)
+        #expect(issue.findingId == summary.findingId)
+
+        var edited = issue
+        edited.status = .confirmed
+        edited.occurrences = 2
+        edited.id = "issue-other"
+        #expect(edited.summary.status == .confirmed)
+        #expect(edited.summary.occurrences == 2)
+        #expect(edited.summary.id == "issue-other")
+        #expect(edited.evidence == issue.evidence)
+        #expect(edited.description == issue.description)
+        #expect(edited != issue)
+        edited.summary = summary
+        #expect(edited == issue)
+
+        let rebuilt = ScanIssue(
+            summary: summary, evidence: issue.evidence, description: issue.description, remediation: issue.remediation,
+            note: issue.note)
+        #expect(rebuilt == issue)
+    }
+
     @Test func nullInARequiredFieldIsRefused() throws {
         let issue = try ScanPack.load("scan.issue.json")
         #expect(throws: BusError.malformed("ScanIssue needs `id`")) {
