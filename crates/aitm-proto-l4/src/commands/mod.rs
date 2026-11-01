@@ -41,6 +41,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aitm_core::{Command, CommandHost, ParamDef, ParamSchema, Params, TypeDesc, Value};
 
 use crate::flow::L4FlowId;
+use crate::guard::interface_covers;
 use crate::module::{AvailabilitySource, L4Availability};
 use crate::types::{
     IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
@@ -562,7 +563,7 @@ pub(crate) fn covering_scope_entry(
     port: Option<u16>,
 ) -> Option<L4ScopeEntry> {
     guard.list_scope().into_iter().find(|e| {
-        e.interface == iface
+        interface_covers(e, iface)
             && e.direction == dir
             && e.capability == cap
             && dst.is_none_or(|ip| cidr_display_contains(&e.cidr, ip))
@@ -638,4 +639,54 @@ pub(crate) fn wire_confirm_summary(
         layers.join("/"),
         direction_to_string(direction),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::L4Config;
+    use crate::guard::{L4Guard, ANY_INTERFACE};
+    use crate::types::{L4ScopeSource, RateCap};
+
+    fn entry(cidr: (&str, u8), iface: &str, cap: L4Capability) -> L4ScopeEntry {
+        L4ScopeEntry {
+            id: L4ScopeId::new(),
+            cidr: IpCidr {
+                addr: cidr.0.parse().unwrap(),
+                prefix: cidr.1,
+            },
+            ports: PortRange { lo: 0, hi: 65535 },
+            interface: iface.to_string(),
+            direction: L4Direction::Outbound,
+            capability: cap,
+            inject_rate: RateCap { pps: 5, burst: 5 },
+            source: L4ScopeSource::Config,
+        }
+    }
+
+    /// Panel S1 — the confirm summary names the entry that actually authorised
+    /// the target. When that entry is a `"*"` wildcard, it must be the one
+    /// returned; a literal entry on another interface must not be.
+    #[test]
+    fn covering_scope_entry_returns_the_wildcard_entry() {
+        let guard = L4Guard::new(&L4Config::default());
+        guard
+            .add_scope(entry(("10.0.0.0", 8), "other0", L4Capability::Inject))
+            .unwrap();
+        let wild = entry(("10.0.0.0", 8), ANY_INTERFACE, L4Capability::Inject);
+        let wild_id = wild.id;
+        guard.add_scope(wild).unwrap();
+
+        let found = covering_scope_entry(
+            &guard,
+            "en0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            Some("10.1.2.3".parse().unwrap()),
+            Some(6379),
+        )
+        .expect("the wildcard entry covers en0");
+        assert_eq!(found.id, wild_id);
+        assert_eq!(found.interface, ANY_INTERFACE);
+    }
 }

@@ -25,12 +25,18 @@ members = [
     "crates/aitm-bus-client",
     "crates/aitm-tui",
     "crates/aitm-peer-token",
+    "crates/aitm-scan-model",
+    "crates/aitm-scan-http",
+    "crates/aitm-scan-checks-http",
+    "crates/aitm-scan-ws",
+    "crates/aitm-scan-l4-packet",
+    "crates/aitm-scan-l4-stream",
     "crates/aitm-sysproxy",
     "crates/aitm",
 ]
 
 [workspace.package]
-version = "0.5.8"
+version = "0.5.9"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.97"
@@ -49,6 +55,23 @@ indexmap = "2"
 tokio = "1"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+
+# Scanner v2 (spec 2026-10-31, Constraints "Dependencies"): track T1a declares every
+# new external dependency once, here; each track's crates opt in with
+# `workspace = true`. An entry no member inherits is never resolved and never enters
+# `Cargo.lock`, so a declaration may land ahead of the track that consumes it.
+blake3 = "1"                                        # T1b: issue dedupe key (D6)
+bytes = "1"                                         # T4: WS frame payloads
+hickory-proto = "0.26"                              # T6: DNS grammar (research 18 3.6: 0.26.3)
+rand = "0.9"                                        # T6: L4 mutation RNG
+rand_chacha = "0.9"                                 # T6: reproducible seeded RNG
+regex = "1"                                         # T2: insertion-point ignore rules
+serde = { version = "1", features = ["derive"] }    # model: wire types
+serde_json = "1"                                    # model: wire types
+serde_yaml = "0.9"                                  # model: operator-authored profiles
+tokio-tungstenite = "0.28"                          # T4: WS lane client
+tokio-util = { version = "0.7", features = ["rt"] } # T1b: job cancellation tokens
+url = "2"                                           # T2: crawl URL normalisation
 
 # Internal crates, referenced by path so the workspace builds in-tree.
 aitm-core = { path = "crates/aitm-core" }
@@ -75,4 +98,10 @@ aitm-bus-client = { path = "crates/aitm-bus-client" }
 aitm-tui = { path = "crates/aitm-tui" }
 aitm-plugin-scanner = { path = "crates/aitm-plugin-scanner" }
 aitm-peer-token = { path = "crates/aitm-peer-token" }
+aitm-scan-model = { path = "crates/aitm-scan-model" }
+aitm-scan-http = { path = "crates/aitm-scan-http" }
+aitm-scan-checks-http = { path = "crates/aitm-scan-checks-http" }
+aitm-scan-ws = { path = "crates/aitm-scan-ws" }
+aitm-scan-l4-packet = { path = "crates/aitm-scan-l4-packet" }
+aitm-scan-l4-stream = { path = "crates/aitm-scan-l4-stream" }
 aitm-sysproxy = { path = "crates/aitm-sysproxy" }
