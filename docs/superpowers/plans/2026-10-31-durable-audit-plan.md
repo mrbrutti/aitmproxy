@@ -2886,4 +2886,47 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+**What this change delivers.** The F2 audit trail is durable and on by default. A writer attached to the shared
+`AuditRing` appends every audited call from every server this binary builds to three JSONL streams under
+`<config_dir>/aitmproxy/` (`audit.jsonl` operator and CLI evidence, `audit.agent.jsonl`, `audit.reads.jsonl`), `0600` in a
+`0700` directory, through bounded queues and one thread per stream so `record_audit` never does file I/O; numbered
+rotation, a hardened preflight, a path re-check, drop-newest with `gap` markers, a flush at shutdown, config
+`mcp.audit_log` and `AITM_AUDIT_LOG`, `agent.status.durable_audit`. Matt's hard requirement, no credential value on
+disk, is met by new strict redaction beside the shared vocabulary (`aitm-core::redact_strict`,
+`aitm-mcp::redact_args`, a known-secret registry in the writer) that also cleans the ring, the push and
+`agent.activity`; texts that never settle fail closed. README and INSTALL document it, with its limits.
+
+**Verification, as run.**
+- Full gate (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`), Terminal panel:
+  head `68cc7b4` (second `origin/main` merge): fmt, clippy and `cargo test --workspace` all exit 0, the socket tests
+  of `audit_log_binary` included. Head `40712ff` (third merge): fmt and clippy exit 0, `cargo test` exit 101 on ONE
+  test, `web_bus_write_deadline::a_stopped_reader_of_large_replies_is_disconnected_by_the_write_deadline` (a 6 s
+  wall-clock bound; the machine's load average was in the hundreds); it passes 5 of 5 in isolation (7.5 to 7.8 s).
+  Head `402a94a` (fourth merge, main v0.5.10): `cargo check --workspace --all-targets` and every audit suite re-run
+  green (fmt exit 0; `redact_strict` 28, `redact_args` 46, `audit_integrity` 13, `audit_redaction` 12, `audit_log::` 152,
+  `audit_log_redaction` 10, `audit_log_wiring` 5, `audit_log_config` 6, `agent_status_durable` 3,
+  `durable_audit_hook` 2, `trust_gate_scan` 9, `classifier_wildcard_free` 5); no further full gate was run after the
+  last merge (CI tests the branch merged with current `main`).
+- e2e, `python3 tests/e2e/run.py --build --shared-core web audit neg` (head `04963fa`): 13 pass, 0 skip, 1 fail:
+  `web/test_bus_push_ui_contract.py` asserts an exact key set for the flow push summary and fails on keys other PRs on
+  `main` added (`bytes_down`, `bytes_up`, `capture_interface`, `passive`, `source_app`, `tunnel`, `tunnel_reason`);
+  this branch touches no flow-summary file. Both `audit/test_audit_log.py` (the AC59 assertion) and
+  `audit/test_audit_identity.py` pass.
+- Closing mutation run (C1) on `c1bdcce`: 54 rows, 52 killed on assertions; row 43 (the tail `shutdown` call in
+  `main.rs`, no observable test) is the expected survivor; row 4a (the file create mode) was a real survivor and is
+  now covered by `open_private_creates_the_file_owner_only` (red `left: 420 right: 384` under the mutation).
+- Panel: five rounds on the redaction chain and one on the whole branch, every finding in the Review log.
+
+**Cut or deferred.** `aitm audit tail` (documentation only for the reader), a per-origin write budget, auditing the
+`aitm tui` in-process operator server and one-shot CLI commands, tamper evidence, a split of `audit_log.rs`,
+percent-encoded frames and SQL in the redaction, the `\u000a`/`\x0a`/`%0a` newline spellings, and the PoC builder's own
+older scrubber (frozen by AC62).
+
+**Follow-ups.** Audit write budget; audit the TUI-facing operator server and the CLI; `aitm audit tail`; PoC
+builder scrubber consolidation (its scrubber leaves AKIA, JWT and `ghp_` shapes in non-credential header values: the
+audit masks them); export `KEY_REDACTED` once; Masks migration for P3 to P6; module split of `audit_log.rs`; confine
+`session_io` paths by default; `web/test_bus_push_ui_contract.py` is stale on `main`.
+
+**Open for Matt.** Countersign of every Minor marked "accepted by the orchestrator" in the Review log, and a veto of
+the calls in the spec's Architect's calls 1 to 36 (default-on is Matt's own confirmed decision; header values
+default-deny in the audit copy flips one e2e assertion; fail-closed `[redacted]`; the wedged-rotation 2 x cap).
