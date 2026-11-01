@@ -141,6 +141,69 @@
           "description": "Scapy sr1: inject a stimulus and return the correlated reply (Inject+Capture)."
         }
       ]
+    },
+    "ws": {
+      "api_version": "1",
+      "fns": [
+        {
+          "name": "dial",
+          "params": [
+            {
+              "name": "options",
+              "type": "object",
+              "description": "`#{ url: \"ws://host/path\", headers: #{ name: value } }`; the URL must be `ws://` or `wss://` and its authority must be in scope."
+            }
+          ],
+          "returns": "int",
+          "description": "Open a scope-guarded WebSocket connection and return its handle; at most 4 are open at once."
+        },
+        {
+          "name": "send",
+          "params": [
+            {
+              "name": "handle",
+              "type": "int",
+              "description": "A handle returned by `ws.dial`."
+            },
+            {
+              "name": "frame",
+              "type": "string|blob",
+              "description": "A string is sent as a Text frame, a blob as a Binary frame."
+            }
+          ],
+          "returns": "null",
+          "description": "Send one frame on an open handle."
+        },
+        {
+          "name": "recv",
+          "params": [
+            {
+              "name": "handle",
+              "type": "int",
+              "description": "A handle returned by `ws.dial`."
+            },
+            {
+              "name": "timeout_ms",
+              "type": "int",
+              "description": "How long to collect replies for, clamped to 30000 ms."
+            }
+          ],
+          "returns": "object",
+          "description": "Collect the frames the server sent, as `#{ frames: [ #{ kind, text, bytes } ] }`; Pings are answered."
+        },
+        {
+          "name": "close",
+          "params": [
+            {
+              "name": "handle",
+              "type": "int",
+              "description": "A handle returned by `ws.dial`."
+            }
+          ],
+          "returns": "null",
+          "description": "Send a Close frame and free the handle."
+        }
+      ]
     }
   },
   "hooks": [
