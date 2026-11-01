@@ -10,10 +10,10 @@ use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use crate::app::{App, PaletteKind, BUILTIN_COMMANDS};
 use crate::model::{clock_of, scope_covers, value_text, AgentPolicy, FlowKind, Origin};
+use crate::text::{cells, fit, truncate};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph};
 use crate::ui::centered;
-use crate::ui::text::{cells, fit, truncate};
 use crate::viewers;
 
 /// A bordered, titled panel filling `area`; returns the drawable inside.

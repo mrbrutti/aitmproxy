@@ -10,9 +10,9 @@ use ratatui::text::{Line, Span};
 use crate::app::{App, SidebarItem};
 use crate::model::AgentPolicy;
 use crate::scan::ScanOffer;
+use crate::text::{fit, truncate};
 use crate::theme::Theme;
 use crate::tokens::glyph;
-use crate::ui::text::{fit, truncate};
 
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.surface());

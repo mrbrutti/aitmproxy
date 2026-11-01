@@ -10,9 +10,9 @@ use ratatui::text::{Line, Span};
 use crate::action::Level;
 use crate::app::{App, BusStatus, Chip, Mode, PromptKind};
 use crate::model::{human_bytes, AgentPolicy};
+use crate::text::{cells, truncate, width};
 use crate::theme::Theme;
 use crate::tokens::glyph;
-use crate::ui::text::{cells, truncate, width};
 use crate::ui::FrameView;
 
 /// The toolbar shows its `: palette · layout · b sidebar` hints from this

@@ -19,7 +19,7 @@ use aitm_tui::scan::{
     probe_bar, probe_fill, row, severity_bar, severity_runs, JobsState, ReadStatus, ScanTab,
     DETAIL_LIST_MAX, DETAIL_VALUE_MAX, PROFILE_MAX, TARGETS_MAX,
 };
-use aitm_tui::ui::text::width;
+use aitm_tui::text::width;
 use common::*;
 use serde_json::{json, Value};
 

@@ -1249,7 +1249,7 @@ fn compose_form_imports_curl_prefills_from_flows_and_prechecks_scope() {
     assert!(app.update(Action::ComposeSend).is_empty());
     assert_eq!(
         toast(&app),
-        "Out of scope — add `evil.example` to scope to send"
+        "Out of scope: add `evil.example` to scope to send"
     );
     assert_eq!(app.mode, Mode::Compose, "stays on the form");
     let _ = app.update(Action::Back);

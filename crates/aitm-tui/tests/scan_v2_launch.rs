@@ -234,24 +234,16 @@ fn start_from_the_list_sends_the_name() {
 fn scan_command_with_an_origin_sends_target_or_refuses() {
     let mut app = connected_with(TOOLS);
     let reqs = app.run_command(&format!("scan {ORIGIN}"));
-    let starts: Vec<&BusRequest> = reqs
-        .iter()
-        .filter(|r| matches!(r, BusRequest::CallTagged { name, .. } if name == "scan.start"))
-        .collect();
+    // The one launch among the open's reads: a tagged `scan.start`, never
+    // the legacy `scan.discover` (which `launch_requests` would list).
     assert_eq!(
-        starts,
+        launch_requests(&reqs),
         vec![&tagged(
             "scan.start",
             "scan.start",
             json!({ "target": ORIGIN })
         )],
         "all requests: {reqs:?}"
-    );
-    assert!(
-        !reqs
-            .iter()
-            .any(|r| matches!(r, BusRequest::Call { name, .. } if name == "scan.discover")),
-        "v2 never falls to scan.discover for a start: {reqs:?}"
     );
     assert_eq!(
         app.scan.launch.pending.as_ref().map(|p| p.call.as_str()),
@@ -370,7 +362,6 @@ fn needs_confirmation_opens_the_overlay_y_reissues_n_cancels() {
     );
     let text = text_of(&app, 200, 50);
     assert!(text.contains("Prompt-7Q verbatim"), "{text}");
-    assert!(text.contains("P"), "{text}");
     assert!(text.contains("scan launch"), "{text}");
 
     let reqs = app.update(Action::WireConfirm(true));
@@ -457,9 +448,10 @@ fn a_start_result_lands_in_jobs_with_its_toasts() {
         "{toasts:?}"
     );
     assert!(
-        toasts
-            .iter()
-            .any(|(l, t)| *l == Level::Warn && t.contains("clamped: budget.probes 50000 -> 20000")),
+        toasts.contains(&(
+            Level::Warn,
+            "clamped: budget.probes 50000 -> 20000".to_string()
+        )),
         "{toasts:?}"
     );
     let text = text_of(&app, 200, 50);

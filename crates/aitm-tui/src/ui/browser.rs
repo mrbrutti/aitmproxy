@@ -14,10 +14,10 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::model::human_bytes;
+use crate::text::truncate;
 use crate::theme::Theme;
 use crate::tokens::color;
 use crate::ui::overlays::{boxed, lines_into};
-use crate::ui::text::truncate;
 
 /// At most this many outline lines are kept (plan task 10: "first 200 lines").
 pub const OUTLINE_MAX: usize = 200;

@@ -380,7 +380,7 @@ fn a_websocket_row_without_a_listed_handshake_makes_no_empty_domains_group() {
     assert!(app.update(Action::BuildPoc).is_empty());
     assert_eq!(
         toast(&app),
-        "Out of scope — unknown host (the WebSocket handshake is not listed)"
+        "Out of scope: unknown host (the WebSocket handshake is not listed)"
     );
 }
 

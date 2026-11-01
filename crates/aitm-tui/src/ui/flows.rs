@@ -9,9 +9,9 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::model::{clock_of, human_bytes, human_ms, FlowKind, FlowRow, Origin};
+use crate::text::{cells, elide_middle, fit, right, width};
 use crate::theme::Theme;
 use crate::tokens::{color, glyph, ColorToken};
-use crate::ui::text::{cells, elide_middle, fit, right, width};
 use crate::ui::{selection_bg, FrameView};
 
 /// The glyph of the mark swatch in the Tick column (§2.7 "marked: colour

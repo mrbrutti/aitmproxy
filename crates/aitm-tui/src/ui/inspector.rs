@@ -12,11 +12,11 @@ use crate::app::{tab_follow_up, App, Mode, Pane, REQUEST_TABS, RESPONSE_TABS};
 use crate::model::{
     clock_of, human_bytes, human_ms, FlowDetail, FlowKind, FlowRow, Intercept, Message, WsDir,
 };
+use crate::text::{cells, fit, truncate};
 use crate::theme::Theme;
 use crate::tokens::color;
 use crate::ui::bars::{put, put_sides};
 use crate::ui::selection_bg;
-use crate::ui::text::{cells, fit, truncate};
 use crate::viewers;
 
 /// What a tab that waits on a core follow-up says instead of a viewer.

@@ -11,12 +11,12 @@ use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::l4::{L4Flow, L4Pane};
+use crate::text::{cells, truncate};
 use crate::theme::Theme;
 use crate::tokens::glyph;
 use crate::ui::bars::{put, put_sides};
 use crate::ui::overlays::lines_into;
 use crate::ui::selection_bg;
-use crate::ui::text::{cells, truncate};
 use crate::viewers;
 
 /// Draw the L4 inspector for the selected flow into `area`.

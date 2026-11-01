@@ -177,6 +177,12 @@ fn narrow_frames_stack_the_detail_below_the_list() {
         row_of(&narrow, "payload") > row_of(&narrow, "Open redirect"),
         "at 90 columns the evidence sits under the last issue row:\n{narrow}"
     );
+    // T7-14's sentence (fix round G, G87): the detail's first line sits
+    // below the list's last row (`INFO 0`, the last severity header).
+    assert!(
+        row_of(&narrow, "Reflected cross-site scripting   high") > row_of(&narrow, "INFO 0"),
+        "at 90 columns the detail head is below the last list row:\n{narrow}"
+    );
 
     let wide = screen_at(&mut app, 200, 50);
     assert_eq!(
@@ -197,6 +203,12 @@ fn narrow_frames_stack_the_detail_below_the_list() {
     assert!(
         row_of(&narrow, "profile standard") > row_of(&narrow, "thorough"),
         "at 90 columns the editor sits under the profile list:\n{narrow}"
+    );
+    // The fixture pack's last list row is `l4-full` (the D11 mockup's
+    // `team-staging` is not in it).
+    assert!(
+        row_of(&narrow, "profile standard") > row_of(&narrow, "l4-full"),
+        "below the last list row too (G87):\n{narrow}"
     );
 }
 
@@ -246,6 +258,20 @@ fn jobs_narrow_row_drops_profile_and_targets_into_the_detail() {
     );
 
     let wide = screen_at(&mut app, 200, 50);
+    // Jobs stacks at every width (G87): the rule row is there at 200
+    // columns too and the detail's job line sits below it.
+    let wide_rule = wide
+        .lines()
+        .position(|l| l.starts_with("│─"))
+        .unwrap_or_else(|| panic!("no rule row at 200 columns:\n{wide}"));
+    let wide_detail = wide
+        .lines()
+        .position(|l| l.trim_start_matches(['│', ' ']).starts_with(JOB))
+        .unwrap_or_else(|| panic!("no detail job line at 200 columns:\n{wide}"));
+    assert!(
+        wide_detail > wide_rule,
+        "the detail's job line sits below the rule:\n{wide}"
+    );
     let header = wide
         .lines()
         .find(|l| l.contains("state/phase"))

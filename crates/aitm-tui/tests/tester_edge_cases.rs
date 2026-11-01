@@ -19,7 +19,7 @@ use aitm_tui::model::{
     scope_covers, AgentPolicy, AgentState, Finding, FlowDetail, FlowKind, FlowRow, Intercept,
     Message, Meta, Origin, Severity, WsDir,
 };
-use aitm_tui::ui::text::{elide_middle, fit, right, truncate, width};
+use aitm_tui::text::{elide_middle, fit, right, truncate, width};
 use aitm_tui::viewers;
 use common::*;
 use crossterm::event::{

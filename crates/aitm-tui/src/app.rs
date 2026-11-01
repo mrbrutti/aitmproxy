@@ -199,6 +199,9 @@ const SCAN_CHROME_ROWS: u16 = 10;
 /// The local refusal while a launch waits for its reply (spec D7).
 const LAUNCH_IN_FLIGHT: &str = "a launch is already in flight";
 
+/// The widest a `poc_ref` grows in the "not in the Findings list" toast.
+const POC_TOAST_MAX: usize = 80;
+
 /// What the Profiles keys say when no editor is open (plan task 10).
 const NO_EDITOR: &str = "open a profile first (Enter on a row, or N for a new one)";
 
@@ -2093,7 +2096,7 @@ impl App {
         if !self.has_tool("l4.agent.set") {
             self.toast(
                 Level::Warn,
-                "L4 agent gates are read-only here — set `l4.allow_agent_*` in config and restart (l4.agent.set is not on this bus)",
+                "L4 agent gates are read-only here: set `l4.allow_agent_*` in config and restart (l4.agent.set is not on this bus)",
             );
             return Vec::new();
         }
@@ -2143,7 +2146,7 @@ impl App {
         let msg = if host.is_empty() {
             // Only a WebSocket row can lack a host: its summary carries the
             // handshake id alone, and that flow is not in the list.
-            "Out of scope — unknown host (the WebSocket handshake is not listed)".to_string()
+            "Out of scope: unknown host (the WebSocket handshake is not listed)".to_string()
         } else {
             format!("Out of scope — add `{host}` to scope to act")
         };
@@ -2822,7 +2825,7 @@ impl App {
                         if !scope_covers(&self.scope, &authority) {
                             self.toast(
                                 Level::Warn,
-                                format!("Out of scope — add `{authority}` to scope to send"),
+                                format!("Out of scope: add `{authority}` to scope to send"),
                             );
                             return out;
                         }
@@ -3729,7 +3732,7 @@ impl App {
             BusEvent::DetailFailed(id) => {
                 self.toast(
                     Level::Warn,
-                    format!("flow.detail {id}: malformed reply — not asking again"),
+                    format!("flow.detail {id}: malformed reply, not asking again"),
                 );
                 self.detail_failed.insert(id);
             }
@@ -4415,9 +4418,9 @@ impl App {
             self.toast(Level::Info, "this issue has no PoC");
             return;
         }
-        let wanted = std::ffi::OsStr::new(poc_ref);
+        let wanted = OsStr::new(poc_ref);
         let found = self.findings.iter().position(|f| {
-            let path = std::path::Path::new(&f.poc_path);
+            let path = Path::new(&f.poc_path);
             path.file_stem() == Some(wanted)
                 || path.file_name() == Some(wanted)
                 || f.title == row.name
@@ -4431,7 +4434,7 @@ impl App {
             None => {
                 let text = format!(
                     "PoC {} is not in the Findings list",
-                    crate::text::truncate(poc_ref, 80)
+                    truncate(poc_ref, POC_TOAST_MAX)
                 );
                 self.toast(Level::Warn, text);
             }

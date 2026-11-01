@@ -26,7 +26,7 @@ use aitm_tui::scan::{
     check_tree, parse_l4_target, session_line, tri_state, EditorField, L4TargetError, OriginSource,
     ProfilePane, ScanTab, TriState, BUILTIN_MARK, CHECKS_MAX, COLLAPSED_MARK, EDITING_MARK,
     EDITOR_FIELDS, L4_TARGET_ERROR, OPEN_MARK, ORIGIN_HOST_ERROR, ORIGIN_SCHEME_ERROR,
-    PROFILES_MAX,
+    PROFILES_MAX, SELECTOR_MAX, VALUE_MAX,
 };
 use aitm_tui::ui::selection_bg;
 use common::*;
@@ -145,6 +145,17 @@ fn type_text(app: &mut App, text: &str) {
     for c in text.chars() {
         let _ = app.update(Action::Input(c));
     }
+}
+
+/// The pane segment (between box or pane rules) of the first row carrying
+/// `needle`, trimmed, so a test pins the row as drawn (fix round G, G60).
+fn row_text(text: &str, needle: &str) -> String {
+    let line = line_with(text, needle).unwrap_or_else(|| panic!("no row with {needle:?}:\n{text}"));
+    line.split('│')
+        .find(|seg| seg.contains(needle))
+        .expect("the needle's pane")
+        .trim()
+        .to_string()
 }
 
 /// The Profiles keys of spec D11 and plan task 10, in `Mode::Scan`. `Right`
@@ -798,10 +809,9 @@ fn a_typed_profile_name_follows_the_engine_rule() {
     type_text(&mut app, "  thorough  ");
     assert!(app.update(Action::Submit).is_empty());
     assert_eq!(app.mode, Mode::Prompt(PromptKind::ScanProfileName));
-    assert!(
-        toast(&app).contains("thorough is a builtin"),
-        "{}",
-        toast(&app)
+    assert_eq!(
+        toast(&app),
+        "thorough is a builtin profile; pick another name"
     );
 
     type_text(&mut app, "  team-x.v2  ");
@@ -1061,16 +1071,26 @@ fn hostile_profile_replies_are_bounded() {
         json!({ "checks": checks }),
     ));
     let folded = &app.scan.profiles.checks;
-    assert!(folded.len() <= CHECKS_MAX, "{}", folded.len());
+    assert_eq!(
+        folded.len(),
+        CHECKS_MAX,
+        "the three bad rows go, the rest is cut"
+    );
     assert!(
         folded
             .iter()
-            .all(|c| !c.id.is_empty() && c.id.len() <= 128 && !c.class.is_empty()),
+            .all(|c| !c.id.is_empty() && c.id.len() <= SELECTOR_MAX && !c.class.is_empty()),
         "ids and classes are selectors: bounded or dropped"
     );
-    assert!(folded.iter().all(|c| c.description.len() <= 1000));
+    assert!(folded
+        .iter()
+        .all(|c| c.description.chars().count() <= 4 * VALUE_MAX));
     let tree = check_tree(folded, &Default::default());
-    assert!(tree.len() <= 2 * CHECKS_MAX + 4);
+    assert_eq!(
+        tree.len(),
+        CHECKS_MAX + 2,
+        "one lane, one class, every check"
+    );
 
     let entry = fixture("scan.profile.list.json")["profiles"][0].clone();
     let mut profiles: Vec<Value> = (0..PROFILES_MAX + 50)
@@ -1088,10 +1108,14 @@ fn hostile_profile_replies_are_bounded() {
         json!({ "profiles": profiles }),
     ));
     let list = &app.scan.profiles.list;
-    assert!(list.len() <= PROFILES_MAX, "{}", list.len());
+    assert_eq!(
+        list.len(),
+        PROFILES_MAX,
+        "the two bad rows go, the rest is cut"
+    );
     assert!(list
         .iter()
-        .all(|p| !p.name.is_empty() && p.name.len() <= 128));
+        .all(|p| !p.name.is_empty() && p.name.len() <= SELECTOR_MAX));
 
     // A `scan.profile.get` reply naming another profile is not folded.
     app.scan.profiles.cursor = 2;
@@ -1480,17 +1504,25 @@ fn profile_list_renders_seven_rows_with_the_builtin_mark() {
             "{name} is a builtin: {line:?} lacks {BUILTIN_MARK:?}"
         );
     }
-    let standard = line_with(&list, "standard").unwrap_or_default();
+    let standard = row_text(&list, "standard");
     for want in ["http ws", "medium", "normal"] {
         assert!(standard.contains(want), "{standard:?} lacks {want:?}");
     }
-    let header = line_with(&list, "name").unwrap_or_default();
+    // The row as drawn (fix round G, G60): the name column is the widest
+    // name (`l4-stream-safe`, 14 cells), then the pad, the blank held-mark
+    // cell and the builtin mark, then lanes, intensity and speed.
+    assert_eq!(
+        standard,
+        "standard        ·  http ws              medium     normal"
+    );
+    let header = line_with(&list, "name").unwrap_or_else(|| panic!("no row with {:?}", "name"));
     assert!(
         header.contains("lanes") && header.contains("intensity") && header.contains("speed"),
         "column header: {header:?}"
     );
     // The cursor row (index 0) is marked and highlighted; no other row is.
-    let first = line_with(&list, "passive-only").unwrap_or_default();
+    let first = line_with(&list, "passive-only")
+        .unwrap_or_else(|| panic!("no row with {:?}", "passive-only"));
     assert!(first.trim_start_matches('│').starts_with('>'), "{first:?}");
     assert!(
         !standard.trim_start_matches('│').starts_with('>'),
@@ -1528,6 +1560,15 @@ fn the_editor_renders_fields_tree_and_session() {
         fixture("scan.session.preview.json"),
     ));
     let (_, detail) = halves(&app, 200, 50);
+    // One row per line as drawn (fix round G, G60).
+    assert_eq!(
+        row_text(&detail, "[x] http"),
+        "lanes     [x] http  [x] ws  [ ] l4_packet  [ ] l4_stream"
+    );
+    assert_eq!(
+        row_text(&detail, "probes 2000"),
+        "budget    probes 2000 · time 600 s · issues 1024"
+    );
     for want in [
         "profile standard (builtin)",
         "dirty",
@@ -1564,7 +1605,8 @@ fn the_editor_renders_fields_tree_and_session() {
     assert!(at("probes 2000") < at("version auto"));
     assert!(at("version auto") < at("s start"));
     // The check summary line carries the lane and class glyphs.
-    let checks = line_with(&detail, "checks").unwrap_or_default();
+    let checks =
+        line_with(&detail, "checks").unwrap_or_else(|| panic!("no row with {:?}", "checks"));
     assert!(
         checks.contains(&format!("{} http", TriState::Default.glyph())),
         "{checks:?}"
@@ -1631,6 +1673,15 @@ fn the_editor_renders_fields_tree_and_session() {
         &format!("{COLLAPSED_MARK} {} http", TriState::Default.glyph()),
     );
     assert!(lane_line.is_some(), "collapsed lane row:\n{collapsed}");
+    // The row as drawn (G60): the cursor mark, the collapse marker, the
+    // tri-state glyph and the label.
+    assert_eq!(
+        row_text(
+            &collapsed,
+            &format!("{COLLAPSED_MARK} {} http", TriState::Default.glyph())
+        ),
+        format!(">{COLLAPSED_MARK} {} http", TriState::Default.glyph())
+    );
     assert!(
         !collapsed.contains("http.custom-marker"),
         "the checks under a collapsed lane are hidden:\n{collapsed}"
@@ -1649,10 +1700,11 @@ fn a_held_editor_is_marked_on_its_list_row() {
     assert_eq!(app.scan.profiles.pane, ProfilePane::List);
     assert!(app.scan.profiles.editor.is_some(), "Esc keeps the editor");
     let (list, detail) = halves(&app, 200, 50);
-    let standard = line_with(&list, "standard").unwrap_or_default();
+    let standard =
+        line_with(&list, "standard").unwrap_or_else(|| panic!("no row with {:?}", "standard"));
     assert!(standard.contains(EDITING_MARK), "{standard:?}");
     for other in ["passive-only", "map-only", "thorough"] {
-        let line = line_with(&list, other).unwrap_or_default();
+        let line = line_with(&list, other).unwrap_or_else(|| panic!("no row with {:?}", other));
         assert!(!line.contains(EDITING_MARK), "{line:?}");
     }
     assert!(
@@ -1663,7 +1715,8 @@ fn a_held_editor_is_marked_on_its_list_row() {
     focus_field(&mut app, EditorField::Intensity);
     let _ = app.update(Action::ScanEdit);
     let (_, detail) = halves(&app, 200, 50);
-    let header = line_with(&detail, "profile standard").unwrap_or_default();
+    let header = line_with(&detail, "profile standard")
+        .unwrap_or_else(|| panic!("no row with {:?}", "profile standard"));
     assert!(header.contains("dirty"), "{header:?}");
     // Without an editor the detail says how to open one and no row is marked.
     app.scan.profiles.editor = None;
@@ -1702,12 +1755,15 @@ fn the_origin_picker_offers_scheme_correct_origins() {
         !detail.contains("http://auth.shop-staging.test"),
         "{detail}"
     );
-    let row = line_with(&detail, "] https://auth.shop-staging.test").unwrap_or_default();
+    let row = row_text(&detail, "] https://auth.shop-staging.test");
     assert!(row.contains("scope"), "the source is named: {row:?}");
     assert!(
         row.contains("[ ] https://"),
         "not in the draft yet: {row:?}"
     );
+    // The picker row as drawn (G60): the cursor mark, the tick, the origin
+    // and its source.
+    assert_eq!(row, ">[ ] https://auth.shop-staging.test  scope");
 
     let mut http = summary(
         "f1",
@@ -1729,7 +1785,8 @@ fn the_origin_picker_offers_scheme_correct_origins() {
     assert!(row.contains("flows"), "{row:?}");
     let _ = app.update(Action::ScanOriginAdd);
     let (_, detail) = halves(&app, 200, 50);
-    let row = line_with(&detail, "] https://auth.shop-staging.test").unwrap_or_default();
+    let row = line_with(&detail, "] https://auth.shop-staging.test")
+        .unwrap_or_else(|| panic!("no row with {:?}", "] https://auth.shop-staging.test"));
     assert!(row.contains("[x] https://"), "added to the draft: {row:?}");
 }
 
