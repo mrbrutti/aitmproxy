@@ -1033,6 +1033,66 @@ fn hostile_profile_replies_are_bounded() {
     let _ = text_of(&app, 40, 4);
 }
 
+/// Fix round G, G45 and G53: a `scan.profile.get` reply over the draft
+/// bounds is refused, not cut (the draft is echoed back on `w` and `s`):
+/// the editor stays closed, the uncoded error `profile exceeds bounds` is
+/// recorded under the tag and no `scan.session.preview` leaves. An
+/// unparseable L4 target ip is over bounds too. A reply within bounds
+/// folds with its lanes sorted and deduped.
+#[test]
+fn an_oversized_profile_reply_is_refused_not_adopted() {
+    let mut app = app();
+    app.scan.profiles.cursor = 3;
+    let _ = app.update(Action::Enter);
+    let mut get = fixture("scan.profile.get.json");
+    get["target"]["origins"] = json!((0..100_000)
+        .map(|k| format!("https://h{k}.test"))
+        .collect::<Vec<_>>());
+    let reqs = app.on_bus(reply("scan.profile.get:standard", "scan.profile.get", get));
+    assert!(app.scan.profiles.editor.is_none(), "nothing adopted");
+    let err = app
+        .scan
+        .last_error
+        .as_ref()
+        .expect("the refusal is recorded");
+    assert_eq!(err.detail, "profile exceeds bounds");
+    assert_eq!(err.tag, "scan.profile.get:standard");
+    assert!(err.code.is_none());
+    assert!(
+        !reqs.iter().any(|r| matches!(
+            r,
+            BusRequest::CallTagged { name, .. } if name == "scan.session.preview"
+        )),
+        "no preview leaves for a refused profile: {reqs:?}"
+    );
+
+    // G53: an L4 target whose ip is not an address is over bounds.
+    let _ = app.update(Action::Enter);
+    let mut get = fixture("scan.profile.get.json");
+    get["target"]["l4"] = json!([{ "ip": "x".repeat(1 << 20), "port": 7000 }]);
+    let _ = app.on_bus(reply("scan.profile.get:standard", "scan.profile.get", get));
+    assert!(app.scan.profiles.editor.is_none(), "nothing adopted");
+    assert_eq!(
+        app.scan.last_error.as_ref().map(|e| e.detail.as_str()),
+        Some("profile exceeds bounds")
+    );
+
+    // Within bounds: the reply folds, the lanes sorted and deduped, and
+    // the refusal is cleared by the same-tag success (D13).
+    let _ = app.update(Action::Enter);
+    let mut get = fixture("scan.profile.get.json");
+    get["lanes"] = json!(["ws", "http", "http"]);
+    let _ = app.on_bus(reply("scan.profile.get:standard", "scan.profile.get", get));
+    let editor = app
+        .scan
+        .profiles
+        .editor
+        .as_ref()
+        .expect("the editor opened");
+    assert_eq!(editor.draft.lanes, vec![LaneKind::Http, LaneKind::Ws]);
+    assert_eq!(app.scan.last_error, None);
+}
+
 /// D11: `a` in the Origins pane adds the highlighted choice to the draft,
 /// `d` removes it; the picker rows follow the scope and the captured flows
 /// (D8) and keep what the operator typed.

@@ -31,8 +31,8 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, l4_gate, lane_token, launch_args, parse_l4_target, parse_result, scan_host,
-    state_text, status_token, step, tag_keyed, tag_parts, typed_origin, Dir, FieldKind,
+    fold_profile, is_job_id, l4_gate, lane_token, launch_args, parse_l4_target, parse_result,
+    scan_host, state_text, status_token, step, tag_keyed, tag_parts, typed_origin, Dir, FieldKind,
     IssueFilterKey, IssuePane, JobPane, MapSource, PendingLaunch, ProfileEditor, ProfilePane,
     ScanError, ScanOffer, ScanState, ScanTab, ISSUES_POLL_TICKS, LIST_POLL_TICKS,
     MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB, OTHER_ORIGIN, OTHER_PROFILE,
@@ -5396,21 +5396,29 @@ impl App {
                 // The same hostile-core bound as `scan.status`: the profile
                 // is folded only under the name the tag asked for, so a
                 // reply cannot swap another profile into the editor.
+                // The draft is echoed back on `w` and `s`, so a profile
+                // over the draft bounds is refused whole (fix round G,
+                // G45): the editor stays closed and no preview leaves.
                 if let Some(profile) = self.scan_reply_keyed::<ScanProfile>(
                     tag,
                     &value,
                     |p: &ScanProfile| p.name.as_str(),
                     OTHER_PROFILE,
                 ) {
-                    let name = profile.name.clone();
-                    let builtin = self
-                        .scan
-                        .profiles
-                        .list
-                        .iter()
-                        .find(|p| p.name == name)
-                        .map_or_else(|| is_builtin_name(&name), |p| p.builtin);
-                    self.open_editor(ProfileEditor::new(profile, Some(name), builtin), out);
+                    match fold_profile(tag, profile) {
+                        Ok(profile) => {
+                            let name = profile.name.clone();
+                            let builtin = self
+                                .scan
+                                .profiles
+                                .list
+                                .iter()
+                                .find(|p| p.name == name)
+                                .map_or_else(|| is_builtin_name(&name), |p| p.builtin);
+                            self.open_editor(ProfileEditor::new(profile, Some(name), builtin), out);
+                        }
+                        Err(err) => self.scan.set_error(err),
+                    }
                 }
             }
             "scan.profile.save" => {

@@ -8,8 +8,8 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use aitm_scan_model::{
     Accuracy, Canary, CheckMeta, CheckSelection, ChecksResult, CrawlStrategy, HttpVersionPolicy,
-    Intensity, L4TargetSpec, L4Transport, LaneKind, OnLost, ProfileListEntry, ProfileListResult,
-    RecordProbes, ScanProfile, SessionMode, SessionProfile, Speed, UseBrowser,
+    Intensity, L4Seed, L4TargetSpec, L4Transport, LaneKind, OnLost, ProfileListEntry,
+    ProfileListResult, RecordProbes, ScanProfile, SessionMode, SessionProfile, Speed, UseBrowser,
 };
 
 use super::{lane_token, step, Dir, ScanError};
@@ -47,6 +47,23 @@ const PREVIEWS_MAX: usize = 64;
 /// `name` is not the key of the tag it answers (spec D6, hostile-core
 /// bounds): nothing is folded from such a reply.
 pub const OTHER_PROFILE: &str = "reply named a different profile";
+
+/// The detail of the uncoded error a `scan.profile.get` reply gets when
+/// the profile is over the draft bounds ([`fold_profile`]; fix round G,
+/// G45): the draft is echoed back on `w` and `s`, so it is refused whole,
+/// never cut.
+pub const PROFILE_BOUNDS: &str = "profile exceeds bounds";
+
+/// The most origins a profile reply may carry to be adopted as the draft
+/// (fix round G, G45; the builder's number).
+pub const ORIGINS_MAX: usize = 64;
+/// The longest an origin of a profile reply may be, in bytes.
+const ORIGIN_BYTES_MAX: usize = 2048;
+/// The most L4 targets, `audit.ignore` rules and `l4.seeds` a profile
+/// reply may carry.
+const PROFILE_LIST_MAX: usize = 64;
+/// The longest a seed's hex or base64 string may be, in bytes.
+const SEED_BYTES_MAX: usize = 1 << 20;
 
 /// The detail of the uncoded error a `scan.session.preview` reply gets when
 /// its `origin` is not the key of the tag it answers.
@@ -345,6 +362,72 @@ pub fn typed_origin(raw: &str, flows: &[FlowRow]) -> Result<String, String> {
                 .map(|c| c.origin)
                 .ok_or_else(|| ORIGIN_HOST_ERROR.to_string())
         }
+    }
+}
+
+/// Fold a `scan.profile.get` reply into the draft the editor opens over
+/// (fix round G, G45, G53; D6 hostile-core bounds). The draft is sent back
+/// whole on `w` and `s`, so an over-bounds profile is refused, not cut: an
+/// uncoded [`PROFILE_BOUNDS`] error under `tag` when `target.origins` has
+/// more than [`ORIGINS_MAX`] entries or one that is empty or over 2048
+/// bytes, `target.l4` more than 64 targets or one whose `ip` is not an
+/// address (bracket-stripped, as [`parse_l4_target`] reads it) or whose
+/// `grammar` is over [`SELECTOR_MAX`] bytes or carries a control
+/// character, `checks.include`/`exclude` more than [`CHECKS_MAX`] selectors
+/// or one that fails the selector rule, `audit.ignore` more than 64 rules,
+/// or `l4.seeds` more than 64 seeds or one whose string is over 1 MiB.
+/// Within bounds the lanes are sorted and deduped (the four kinds at
+/// most) and the profile is returned.
+pub fn fold_profile(tag: &str, mut profile: ScanProfile) -> Result<ScanProfile, ScanError> {
+    let target = &profile.target;
+    let checks = &profile.checks;
+    let within = target.origins.len() <= ORIGINS_MAX
+        && target
+            .origins
+            .iter()
+            .all(|o| !o.is_empty() && o.len() <= ORIGIN_BYTES_MAX)
+        && target.l4.len() <= PROFILE_LIST_MAX
+        && target.l4.iter().all(l4_target_within)
+        && checks.include.len() <= CHECKS_MAX
+        && checks.exclude.len() <= CHECKS_MAX
+        && checks
+            .include
+            .iter()
+            .chain(&checks.exclude)
+            .all(|s| usable_selector(s))
+        && profile.audit.ignore.len() <= PROFILE_LIST_MAX
+        && profile.l4.seeds.len() <= PROFILE_LIST_MAX
+        && profile.l4.seeds.iter().all(seed_within);
+    if !within {
+        return Err(ScanError::uncoded(tag, PROFILE_BOUNDS));
+    }
+    profile.lanes.sort();
+    profile.lanes.dedup();
+    Ok(profile)
+}
+
+/// Whether an L4 target of a profile reply is within bounds (G53): its ip
+/// parses as an address once the brackets are stripped, and its grammar,
+/// when named, is a usable selector without control characters.
+fn l4_target_within(t: &L4TargetSpec) -> bool {
+    t.ip.len() <= SELECTOR_MAX
+        && t.ip
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok()
+        && t.grammar
+            .as_deref()
+            .is_none_or(|g| g.len() <= SELECTOR_MAX && !g.chars().any(char::is_control))
+}
+
+/// Whether an L4 seed of a profile reply is within bounds: a flow seed
+/// always is (the id is typed), a hex or base64 seed within
+/// [`SEED_BYTES_MAX`] bytes.
+fn seed_within(seed: &L4Seed) -> bool {
+    match seed {
+        L4Seed::Flow { .. } => true,
+        L4Seed::Hex { hex: s } | L4Seed::Base64 { base64: s } => s.len() <= SEED_BYTES_MAX,
     }
 }
 
@@ -1077,6 +1160,81 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// Fix round G, G45/G53: each draft bound refuses the whole profile
+    /// with the one detail; a profile within them folds with its lanes
+    /// sorted and deduped.
+    #[test]
+    fn fold_profile_refuses_each_bound_and_dedupes_lanes() {
+        let refused = |p: ScanProfile| {
+            fold_profile("scan.profile.get:x", p).map_err(|e| e.detail)
+                == Err(PROFILE_BOUNDS.into())
+        };
+        let mut p = ScanProfile {
+            lanes: vec![LaneKind::Ws, LaneKind::Http, LaneKind::Http],
+            ..ScanProfile::default()
+        };
+        let ok = fold_profile("scan.profile.get:x", p.clone()).expect("within bounds");
+        assert_eq!(ok.lanes, vec![LaneKind::Http, LaneKind::Ws]);
+
+        let mut q = p.clone();
+        q.target.origins = vec!["https://h".into(); ORIGINS_MAX + 1];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.target.origins = vec![String::new()];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.target.origins = vec!["o".repeat(ORIGIN_BYTES_MAX + 1)];
+        assert!(refused(q));
+        let l4 = L4TargetSpec {
+            ip: "10.0.0.1".into(),
+            port: 53,
+            proto: L4Transport::Udp,
+            grammar: None,
+        };
+        let mut q = p.clone();
+        q.target.l4 = vec![l4.clone(); PROFILE_LIST_MAX + 1];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.target.l4 = vec![L4TargetSpec {
+            ip: "not-an-ip".into(),
+            ..l4.clone()
+        }];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.target.l4 = vec![L4TargetSpec {
+            ip: "[::1]".into(),
+            grammar: Some("dns\u{7}".into()),
+            ..l4.clone()
+        }];
+        assert!(refused(q), "a control character in the grammar");
+        let mut q = p.clone();
+        q.target.l4 = vec![L4TargetSpec {
+            ip: "[::1]".into(),
+            grammar: Some("dns".into()),
+            ..l4
+        }];
+        assert!(fold_profile("t", q).is_ok(), "a bracketed v6 ip parses");
+        let mut q = p.clone();
+        q.checks.include = vec!["c".into(); CHECKS_MAX + 1];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.checks.exclude = vec!["x".repeat(SELECTOR_MAX + 1)];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.audit.ignore = vec![Default::default(); PROFILE_LIST_MAX + 1];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.l4.seeds = vec![L4Seed::Hex { hex: "00".into() }; PROFILE_LIST_MAX + 1];
+        assert!(refused(q));
+        let mut q = p.clone();
+        q.l4.seeds = vec![L4Seed::Base64 {
+            base64: "A".repeat(SEED_BYTES_MAX + 1),
+        }];
+        assert!(refused(q));
+        p.l4.seeds = vec![L4Seed::Hex { hex: "00".into() }];
+        assert!(fold_profile("t", p).is_ok());
     }
 
     #[test]
