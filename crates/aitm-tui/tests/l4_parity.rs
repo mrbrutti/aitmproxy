@@ -8,14 +8,15 @@
 //! No fixture, snapshot or seeded store is used anywhere in this file.
 
 use aitm_tui::action::{Action, BusEvent, BusRequest, ToolInfo};
-use aitm_tui::app::{App, Mode, SidebarItem};
+use aitm_tui::app::{App, Chip, Mode, SidebarItem};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::l4::{
     ascii_column, clock_ms, flow_get_args, fold_status, hex_dump, inspect_args, packet_fields,
     slow_l4_reads, status_ids, supports_operator_scope_add, supports_window, L4Availability,
-    L4Flow, L4Pane, L4Parked, L4State,
+    L4Confirm, L4Flow, L4Pane, L4Parked, L4State,
 };
+use aitm_tui::model::FlowRow;
 use aitm_tui::theme::Theme;
 use aitm_tui::ui::complete::l4_command_candidates;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1897,4 +1898,215 @@ fn scope_add_l4_completion_is_gated_on_confirmable() {
     let _ = connected(&mut off, l4_tools(false));
     let l = labels(&mut off, "scope add ");
     assert!(!l.iter().any(|s| s.contains("scope add l4")), "{l:?}");
+}
+
+// ----------------------------------------------------------- chips_filters
+
+/// An HTTP summary in the core's wire shape, for the chip / atom checks.
+fn http_summary(id: &str) -> Value {
+    json!({
+        "id": id, "kind": "http", "method": "GET", "scheme": "http",
+        "authority": "127.0.0.1:9099", "path": "/", "status": 200,
+        "is_replay": false, "intercept": "observed"
+    })
+}
+
+/// The two rows every chip / atom check uses: an L4 row built by
+/// `FlowRow::from_l4` from a TCP intercept flow, and an HTTP row from a summary.
+fn l4_and_http_rows() -> (FlowRow, FlowRow) {
+    let flow = L4Flow::from_json(&intercept_flow("F")).expect("l4 flow");
+    let l4 = FlowRow::from_l4(&flow, 1);
+    assert_eq!(l4.l4.as_ref().and_then(|l| l.proto.as_deref()), Some("TCP"));
+    let http = FlowRow::from_summary(&http_summary("H1"), 2).expect("http row");
+    (l4, http)
+}
+
+fn filter_ctx() -> aitm_tui::filter::Ctx<'static> {
+    aitm_tui::filter::Ctx {
+        detail: None,
+        in_scope: true,
+    }
+}
+
+/// AC14: `~l4` matches the L4 row only; `~tcp` matches it and `~udp` does
+/// not; `~icmp` parses; none of the three protocol atoms match an HTTP row.
+#[test]
+fn chips_filters_l4_atoms_match_the_l4_row_only() {
+    let (l4, http) = l4_and_http_rows();
+    let ctx = filter_ctx();
+    let parse = |s: &str| aitm_tui::filter::parse(s).expect(s).expect(s);
+    let e = parse("~l4");
+    assert!(e.matches(&l4, &ctx), "~l4 matches the L4 row");
+    assert!(!e.matches(&http, &ctx), "~l4 hides the HTTP row");
+    let tcp = parse("~tcp");
+    assert!(tcp.matches(&l4, &ctx), "~tcp matches a TCP L4 row");
+    assert!(!tcp.matches(&http, &ctx));
+    let udp = parse("~udp");
+    assert!(!udp.matches(&l4, &ctx), "~udp does not match a TCP L4 row");
+    assert!(!udp.matches(&http, &ctx));
+    let icmp = parse("~icmp");
+    assert!(!icmp.matches(&l4, &ctx));
+    assert!(!icmp.matches(&http, &ctx));
+    // `!~l4` is the HTTP side of the same split.
+    let not_l4 = parse("!~l4");
+    assert!(not_l4.matches(&http, &ctx));
+    assert!(!not_l4.matches(&l4, &ctx));
+}
+
+/// AC14, in the app: with a real-shaped HTTP row and an L4 row listed,
+/// `/~l4` leaves only the L4 row visible and the `L4` chip does the same.
+#[test]
+fn chips_filters_l4_filter_hides_every_http_row_in_the_app() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let _ = app.on_bus(BusEvent::Flows(vec![
+        http_summary("H1"),
+        http_summary("H2"),
+    ]));
+    let _ = app.on_bus(BusEvent::L4Flows(vec![intercept_flow("F")]));
+    assert_eq!(
+        app.visible().len(),
+        3,
+        "two HTTP rows and one L4 row listed"
+    );
+    let _ = app.run_command("filter ~l4");
+    assert!(app.filter.is_some(), "~l4 parses");
+    let ids: Vec<&str> = app
+        .visible()
+        .into_iter()
+        .map(|i| app.flows[i].id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["F"], "~l4 hides every HTTP row");
+    let _ = app.run_command("filter");
+    app.chip = Chip::L4;
+    let ids: Vec<&str> = app
+        .visible()
+        .into_iter()
+        .map(|i| app.flows[i].id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["F"], "the L4 chip hides every HTTP row");
+    app.chip = Chip::Udp;
+    assert!(
+        app.visible().is_empty(),
+        "a TCP flow is not under the UDP chip"
+    );
+    app.chip = Chip::Tcp;
+    let ids: Vec<&str> = app
+        .visible()
+        .into_iter()
+        .map(|i| app.flows[i].id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["F"]);
+}
+
+/// The chip bar order (web / macOS parity: `TCP UDP L4` as their own group
+/// after `WebSocket`), the three labels, and what each new chip matches.
+#[test]
+fn chips_filters_chip_order_labels_and_matches() {
+    assert_eq!(Chip::ALL.len(), 18);
+    assert_eq!(Chip::ALL[3], Chip::WebSocket);
+    let labels: Vec<&str> = Chip::ALL[4..7].iter().map(|c| c.label()).collect();
+    assert_eq!(labels, vec!["TCP", "UDP", "L4"]);
+    assert_eq!(Chip::ALL[7], Chip::H1);
+    assert_eq!(Chip::ALL[0].label(), "All");
+    assert_eq!(Chip::ALL[17].label(), "Other");
+    let (l4, http) = l4_and_http_rows();
+    assert!(!Chip::L4.matches(&http, None));
+    assert!(Chip::L4.matches(&l4, None));
+    assert!(Chip::Tcp.matches(&l4, None));
+    assert!(!Chip::Udp.matches(&l4, None));
+    assert!(!Chip::Tcp.matches(&http, None));
+    assert!(!Chip::Udp.matches(&http, None));
+    // The HTTP chips do not claim the L4 row.
+    assert!(!Chip::Http.matches(&l4, None));
+    assert!(!Chip::WebSocket.matches(&l4, None));
+    // `Other` is still "has a content type no content chip claims": an L4 row
+    // has no content type, so it is not `Other` either.
+    assert!(!Chip::Other.matches(&l4, None));
+}
+
+/// The chip bar renders the three labels; help and the filter prompt's hint
+/// list `~l4 ~tcp ~udp ~icmp`; help names the craft-pane keys B4/B5 added.
+#[test]
+fn chips_filters_help_bar_and_filter_hint_list_the_atoms() {
+    let theme = Theme::new(true);
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let area = Rect::new(0, 0, 160, 50);
+    // The chip bar.
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert!(text.contains("WebSocket"), "{text}");
+    assert!(text.contains("TCP"), "{text}");
+    assert!(text.contains("UDP"), "{text}");
+    assert!(text.contains(" L4"), "{text}");
+    // Help.
+    app.mode = Mode::Help;
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert!(text.contains("~l4 ~tcp ~udp ~icmp"), "{text}");
+    assert!(text.contains("b / s / m / u"), "{text}");
+    assert!(
+        text.contains("apply to parked packet") && text.contains("revert"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Any key closes this help."),
+        "the last help line is not clipped: {text}"
+    );
+    // The filter prompt's hint.
+    app.mode = Mode::Flows;
+    assert_eq!(keys::map(press('/'), Mode::Flows), Some(Action::FilterOpen));
+    let _ = app.update(Action::FilterOpen);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert!(text.contains("~l4 ~tcp ~udp ~icmp"), "{text}");
+}
+
+fn render_confirm(call: &str, args: Value, prompt: &str) -> String {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(true));
+    app.l4.confirm = Some(L4Confirm {
+        call: call.to_string(),
+        args,
+        prompt: prompt.to_string(),
+        token: "tok-1".to_string(),
+    });
+    app.mode = Mode::L4Confirm;
+    let theme = Theme::new(true);
+    let area = Rect::new(0, 0, 120, 30);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::l4::confirm(&app, &theme, area, &mut buf);
+    buffer_text(&buf).join("\n")
+}
+
+/// The confirm overlay's "reaches the wire only through l4.inject" footer is
+/// true of an inject and false of a scope add: an `l4.scope.add` confirm shows
+/// the core's prompt and no `l4.inject` text; an `l4.inject` confirm shows it.
+#[test]
+fn chips_filters_confirm_footer_only_for_inject() {
+    let scope = render_confirm(
+        "l4.scope.add",
+        json!({"cidr": "127.0.0.1/32", "ports": "9100-9199", "interface": "lo0",
+               "direction": "inbound", "capability": "capture"}),
+        "Add L4 scope 127.0.0.1/32 ports 9100-9199 on lo0 inbound capture",
+    );
+    assert!(scope.contains("l4.scope.add"), "{scope}");
+    assert!(scope.contains("Add L4 scope 127.0.0.1/32"), "{scope}");
+    assert!(!scope.contains("l4.inject"), "{scope}");
+    assert!(scope.contains("y confirm"), "{scope}");
+
+    let inject = render_confirm(
+        "l4.inject",
+        json!({"flow": "F", "spec": {"layers": []}}),
+        "Inject 1 packet to 127.0.0.1:9 via lo0",
+    );
+    assert!(
+        inject.contains("This reaches the wire only through l4.inject; the guard enforces scope."),
+        "{inject}"
+    );
+    assert!(inject.contains("y confirm"), "{inject}");
 }

@@ -147,7 +147,7 @@ pub fn chips(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     buf.set_style(area, theme.surface());
     let mut spans = vec![Span::raw(" ")];
     for (i, c) in Chip::ALL.iter().enumerate() {
-        if matches!(c, Chip::Http | Chip::H1 | Chip::Json) {
+        if matches!(c, Chip::Http | Chip::Tcp | Chip::H1 | Chip::Json) {
             spans.push(Span::styled("│ ", theme.rule()));
         }
         let label = c.label();
@@ -470,7 +470,7 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         PromptKind::Palette => (":", "command or tool · ↑↓ choose · ⏎ run · Esc"),
         PromptKind::Filter => (
             "/",
-            "~u url ~d host ~m method ~s status ~a agent ~paused · & | ! ( )",
+            "~u url ~d host ~m method ~s status ~a agent ~paused ~l4 ~tcp ~udp ~icmp · & | ! ( )",
         ),
         PromptKind::Comment => ("comment:", "⏎ save · Esc"),
         PromptKind::Mark => ("mark:", "colours separated by spaces · ⏎ save"),

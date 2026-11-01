@@ -106,7 +106,7 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
 }
 
 pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    let area = centered(screen, 96, 38);
+    let area = centered(screen, 96, 40);
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     let k = |a: &str, b: &str| key_line(theme, a, b);
     let mut lines =
@@ -137,6 +137,10 @@ pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
             "L4 panel: capture / intercept availability and running captures",
         ),
         k("", ":l4 capture <iface> [inbound|outbound] · :l4 stop [<id>]"),
+        k(
+            "b / s / m / u",
+            "L4 craft pane: build · inject (guarded) · apply to parked packet · revert",
+        ),
         k("1-9 0 Tab", "content-type chips"),
         k("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
         k(
@@ -146,7 +150,7 @@ pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         k("y / o", "copy URL (OSC 52) · open externally"),
         k(
             "/",
-            "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed · & | ! ( )",
+            "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed ~l4 ~tcp ~udp ~icmp · & | ! ( )",
         ),
         k(":", "command palette — every bus tool plus:"),
     ];

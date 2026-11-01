@@ -530,10 +530,15 @@ pub fn confirm(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
         lines.push(Line::styled(format!(" {chunk}"), theme.text_primary()));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " This reaches the wire only through l4.inject; the guard enforces scope.",
-        theme.text_tertiary(),
-    ));
+    // The footer is a fact about `l4.inject` (L4OPS-AC10); the same overlay
+    // also confirms an operator `l4.scope.add` (L4 parity spec §3), where
+    // that sentence would be false, so it is shown for the inject only.
+    if c.call == "l4.inject" {
+        lines.push(Line::styled(
+            " This reaches the wire only through l4.inject; the guard enforces scope.",
+            theme.text_tertiary(),
+        ));
+    }
     lines.push(Line::styled(
         " y confirm (re-issues with _confirm) · n / Esc cancel",
         theme.accent().add_modifier(Modifier::BOLD),

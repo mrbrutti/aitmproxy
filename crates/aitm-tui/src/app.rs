@@ -283,13 +283,17 @@ pub enum Layout {
     Vertical,
 }
 
-/// The content-type chip bar (§2.7).
+/// The content-type chip bar (§2.7). `Tcp` / `Udp` / `L4` are the L4 group
+/// after `WebSocket` (L4 parity AC14; the order web and macOS ship).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chip {
     All,
     Http,
     Https,
     WebSocket,
+    Tcp,
+    Udp,
+    L4,
     H1,
     H2,
     Json,
@@ -304,11 +308,14 @@ pub enum Chip {
 }
 
 impl Chip {
-    pub const ALL: [Chip; 15] = [
+    pub const ALL: [Chip; 18] = [
         Chip::All,
         Chip::Http,
         Chip::Https,
         Chip::WebSocket,
+        Chip::Tcp,
+        Chip::Udp,
+        Chip::L4,
         Chip::H1,
         Chip::H2,
         Chip::Json,
@@ -328,6 +335,9 @@ impl Chip {
             Chip::Http => "HTTP",
             Chip::Https => "HTTPS",
             Chip::WebSocket => "WebSocket",
+            Chip::Tcp => "TCP",
+            Chip::Udp => "UDP",
+            Chip::L4 => "L4",
             Chip::H1 => "h1",
             Chip::H2 => "h2",
             Chip::Json => "JSON",
@@ -357,6 +367,9 @@ impl Chip {
             Chip::Http => row.kind == FlowKind::Http && row.scheme == "http",
             Chip::Https => row.kind == FlowKind::Http && row.scheme == "https",
             Chip::WebSocket => row.kind == FlowKind::WebSocket,
+            Chip::L4 => row.kind == FlowKind::L4,
+            Chip::Tcp => l4_proto(row) == Some("TCP"),
+            Chip::Udp => l4_proto(row) == Some("UDP"),
             Chip::H1 => row
                 .version
                 .as_deref()
@@ -379,10 +392,17 @@ impl Chip {
                     || ct.contains("font")
             }
             Chip::Other => {
-                !ct.is_empty() && !Chip::ALL[6..14].iter().any(|c| c.matches(row, detail))
+                // The content chips, `Json` through `Media`.
+                !ct.is_empty() && !Chip::ALL[9..17].iter().any(|c| c.matches(row, detail))
             }
         }
     }
+}
+
+/// The transport sub-label of an L4 row (`TCP` / `UDP` / `ICMP`); `None` for
+/// an HTTP or WebSocket row.
+fn l4_proto(row: &FlowRow) -> Option<&str> {
+    row.l4.as_ref().and_then(|l| l.proto.as_deref())
 }
 
 /// Sidebar entries (§2.6 "Sidebar groups").
