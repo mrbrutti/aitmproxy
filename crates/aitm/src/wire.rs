@@ -282,7 +282,13 @@ pub struct Assembled {
 ///     let cfg = Config::default();
 ///     let assembled = assemble(&cfg)?;
 ///     let governance: Governance = Governance { agent_state, audit_ring };
-///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let services = services(
+///         &assembled.proxy,
+///         &cfg,
+///         None,
+///         TuiLog::Off,
+///         Arc::clone(&assembled.job_bus),
+///     );
 ///     let _servers = build_servers(&cfg, services, governance);
 ///     Ok(())
 /// }
@@ -304,7 +310,13 @@ pub struct Assembled {
 ///     let assembled = assemble(&cfg)?;
 ///     drop((agent_state, audit_ring));
 ///     let governance: Governance = assembled.governance();
-///     let services = services(&assembled.proxy, &cfg, None, TuiLog::Off);
+///     let services = services(
+///         &assembled.proxy,
+///         &cfg,
+///         None,
+///         TuiLog::Off,
+///         Arc::clone(&assembled.job_bus),
+///     );
 ///     let _servers = build_servers(&cfg, services, governance);
 ///     Ok(())
 /// }
