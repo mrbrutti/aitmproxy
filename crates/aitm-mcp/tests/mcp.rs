@@ -1829,6 +1829,78 @@ fn subscribe_on_an_open_sink_still_works() {
     assert_eq!(note["params"]["id"], id.to_string());
 }
 
+/// SA-AC2 (spec D4): a `notifications/aitm/flow` line's `params.summary`
+/// mirrors `source_app` and `capture_interface` from the stored flow's
+/// `FlowMeta` — the provider's identifier and the backend name on a captured
+/// flow, `null` (key present, never absent) on a proxied flow — on both the
+/// HTTP and the WebSocket arm of `flow_summary`.
+#[test]
+fn pushed_summary_mirrors_source_app_and_capture_interface() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    assert_subscribed(&subscribe_on(&srv, &conn, json!({})));
+
+    // Push `event` and return the one `summary` object the sink received.
+    let pushed_summary = |event: Event| -> JsonValue {
+        srv.push_flow_event(&event);
+        let lines = sink.drain();
+        assert_eq!(lines.len(), 1, "exactly one line was pushed: {lines:?}");
+        let note: JsonValue = serde_json::from_str(&lines[0]).expect("the push is JSON");
+        assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+        note["params"]["summary"].clone()
+    };
+    let attributed = |mut flow: Flow| -> Flow {
+        flow.metadata_mut().source_app = Some("com.apple.Safari".into());
+        flow.metadata_mut().capture_interface = Some("macos-ne".into());
+        flow
+    };
+
+    // A captured HTTP flow: the identifier and the backend name, verbatim.
+    let cap_id = store.insert(attributed(http_flow("example.com:443", "/cap")));
+    let summary = pushed_summary(Event::RequestHeaders(cap_id));
+    assert_eq!(summary["id"], cap_id.to_string(), "{summary}");
+    assert_eq!(summary["source_app"], "com.apple.Safari", "{summary}");
+    assert_eq!(summary["capture_interface"], "macos-ne", "{summary}");
+
+    // A proxied HTTP flow: both keys present and null, never absent.
+    let proxied_id = store.insert(http_flow("example.com:443", "/proxied"));
+    let summary = pushed_summary(Event::RequestHeaders(proxied_id));
+    assert_eq!(summary["id"], proxied_id.to_string(), "{summary}");
+    assert_eq!(
+        summary.get("source_app"),
+        Some(&JsonValue::Null),
+        "{summary}"
+    );
+    assert_eq!(
+        summary.get("capture_interface"),
+        Some(&JsonValue::Null),
+        "{summary}"
+    );
+
+    // The WebSocket arm mirrors the same two fields.
+    let ws_id = store.insert(attributed(Flow::WebSocket(WsFlow {
+        id: aitm_core::FlowId::new(),
+        handshake: cap_id,
+        messages: vec![],
+        client_conn: ConnInfo {
+            peer: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            sni: None,
+            alpn: None,
+            tls: false,
+            established: SystemTime::now(),
+        },
+        server_conn: None,
+        metadata: FlowMeta::default(),
+        intercept: InterceptState::Observed,
+    })));
+    let summary = pushed_summary(Event::WsStart(ws_id));
+    assert_eq!(summary["kind"], "websocket", "{summary}");
+    assert_eq!(summary["source_app"], "com.apple.Safari", "{summary}");
+    assert_eq!(summary["capture_interface"], "macos-ne", "{summary}");
+}
+
 /// `tools/call flow.unsubscribe {sub_id}` on `conn`, parsed.
 fn unsubscribe_on(srv: &McpServer, conn: &ConnCtx, sub_id: u64) -> JsonValue {
     let req = json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
@@ -8560,4 +8632,45 @@ async fn push_summary_equals_flow_get_on_the_null_and_saturated_paths() {
 
     let _ = w.shutdown().await;
     let _ = task.await;
+}
+
+/// Tester addition (whole-branch stage 5, SA-AC2 edge). The push is line-delimited
+/// JSON and `source_app` is text a capture backend supplied about a client. A
+/// value carrying CR/LF, a quote, a NUL and non-ASCII must still arrive as exactly
+/// one line that parses back to the identical string — never a second line (which
+/// a reader would take for another notification), never a truncated or altered one.
+#[test]
+fn pushed_summary_keeps_a_hostile_source_app_on_one_line() {
+    let store = Arc::new(MemFlowStore::new());
+    let srv = push_server(store.clone(), 16);
+    let sink = NotificationSink::new(16);
+    let conn = conn_over(&srv, &sink);
+    assert_subscribed(&subscribe_on(&srv, &conn, json!({})));
+
+    let hostile = format!("com.evil.\"q\"\r\n\u{0}日本語.{}", "x".repeat(4096));
+    let mut flow = http_flow("example.com:443", "/hostile");
+    flow.metadata_mut().source_app = Some(hostile.clone());
+    flow.metadata_mut().capture_interface = Some("macos-ne\n".into());
+    let id = store.insert(flow);
+
+    srv.push_flow_event(&Event::RequestHeaders(id));
+    let lines = sink.drain();
+    assert_eq!(lines.len(), 1, "exactly one line was pushed: {lines:?}");
+    let line = lines[0].trim_end_matches(['\r', '\n']);
+    assert!(
+        !line.contains('\n') && !line.contains('\r'),
+        "the line carries no raw line break: {line:?}"
+    );
+    let note: JsonValue = serde_json::from_str(line).expect("the push is JSON");
+    assert_eq!(note["method"], "notifications/aitm/flow", "{note}");
+    assert_eq!(note["params"]["id"], id.to_string(), "{note}");
+    assert_eq!(
+        note["params"]["summary"]["source_app"],
+        JsonValue::String(hostile),
+        "{note}"
+    );
+    assert_eq!(
+        note["params"]["summary"]["capture_interface"], "macos-ne\n",
+        "{note}"
+    );
 }

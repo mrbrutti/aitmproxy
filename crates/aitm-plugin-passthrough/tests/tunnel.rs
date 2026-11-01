@@ -171,6 +171,8 @@ async fn run_split_proxy(
                     alpn: Vec::new(),
                     first_bytes: first,
                     from_upgrade: false,
+                    peer_identity: None,
+                    capture_interface: None,
                 };
                 let Some(module) = modules.iter().find(|m| m.matches(&hint)).cloned() else {
                     return;
