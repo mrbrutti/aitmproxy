@@ -17,13 +17,21 @@
 //!
 //! - **`Inject`** before any `ScopeSet` is a protocol violation and ends the
 //!   session (`inject before scope`). After one, the interface name is
-//!   checked, then [`HelperGuard::check_inject`] parses the frame and decides;
-//!   a refusal is an `InjectResult { error }` with the parser's or guard's
-//!   text verbatim (plan A8) and the wire is never touched.
+//!   checked, then the loop refuses an interface no `Inject`-capability
+//!   entry of the current scope covers before the wire is asked anything
+//!   (on the real wire, asking for the link type opens a pcap handle), then
+//!   [`HelperGuard::check_inject`] parses the frame and decides; a refusal is
+//!   an `InjectResult { error }` with the parser's or guard's text verbatim
+//!   (plan A8) and the wire is never touched.
 //! - **`CaptureOpen`** gets the filter from [`HelperGuard::capture_filter`]
 //!   (the helper's own scope, never a string from the core); an interface no
 //!   `Capture` entry covers, a malformed name, a duplicate id or a wire that
 //!   will not open is a `CaptureClosed { reason }` and no capture exists.
+//!   `read_timeout_ms` is floored at [`MIN_READ_TIMEOUT_MS`] so a poll
+//!   always returns and a `CaptureClose` always takes effect.
+//! - **`ScopeSet`** governs captures already open too: one whose interface
+//!   the new scope no longer covers is stopped and reported as
+//!   `CaptureClosed { reason: "scope changed" }`.
 //! - **Protocol violations** end the session with [`ServeExit::Protocol`]:
 //!   anything but `Hello` first, a `proto` other than [`PROTO`] (no reply is
 //!   sent, so the core reports `version_mismatch`), a second `Hello`, a
@@ -55,19 +63,27 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aitm_proto_l4::backend::{CaptureSource, L4Error};
+use aitm_proto_l4::guard::interface_covers;
 use aitm_proto_l4::helper::enforce::HelperGuard;
 use aitm_proto_l4::helper::frame::{inject_target, LinkType};
-use aitm_proto_l4::helper::proto::{encode, read_msg, Msg, ProtoError, MAX_FRAME, PROTO};
+use aitm_proto_l4::helper::proto::{encode, read_msg, Msg, ProtoError, ScopeSet, MAX_FRAME, PROTO};
+use aitm_proto_l4::types::L4Capability;
 
 /// `IFNAMSIZ - 1`: the longest interface name Linux accepts.
 const MAX_IFACE_LEN: usize = 15;
 
-/// The capability the helper reports in `HelloAck.caps` (spec §5.1: it holds
-/// exactly this one after start-up).
-const CAP_NET_RAW: &str = "CAP_NET_RAW";
-
 /// The reason a capture reports when the core asked for it to close.
 const REASON_CLOSED: &str = "closed";
+
+/// The reason a capture reports when a new `ScopeSet` no longer covers its
+/// interface.
+const REASON_SCOPE_CHANGED: &str = "scope changed";
+
+/// The least read timeout a capture is opened with. The core's
+/// `read_timeout_ms` is clamped up to this before the wire opens: libpcap
+/// treats `0` as "block until a packet arrives", and a thread blocked there
+/// never sees its stop flag, so a `CaptureClose` would never take effect.
+pub const MIN_READ_TIMEOUT_MS: u32 = 100;
 
 /// The system calls the loop needs, so the loop can be tested against a
 /// recording fake. [`PcapWire`] is the real one.
@@ -85,11 +101,13 @@ pub trait Wire: Send + Sync {
         timeout: Duration,
     ) -> Result<Box<dyn CaptureSource + Send>, String>;
 
-    /// Put a link-layer frame the guard already admitted on `iface`.
+    /// Put a link-layer frame the guard already admitted on `iface`. `link`
+    /// is the framing the loop resolved with [`Wire::link`] for this inject
+    /// and checked the frame under, so the wire need not look it up again.
     ///
     /// # Errors
     /// The wire's own text; the loop passes it through as `InjectResult.error`.
-    fn inject(&self, iface: &str, bytes: &[u8]) -> Result<(), String>;
+    fn inject(&self, iface: &str, link: LinkType, bytes: &[u8]) -> Result<(), String>;
 
     /// The link framing `iface` carries, which an inject frame must match.
     fn link(&self, iface: &str) -> LinkType;
@@ -132,42 +150,118 @@ impl<W: Write> Outbound<W> {
     }
 }
 
-/// The open captures by id, each with the flag its thread polls. Shared with
-/// the threads so a capture that ends on its own removes itself.
+/// The scope the core last sent and the guard built from it. The guard
+/// decides frames and filters; the entries answer the one question the guard
+/// does not expose, whether any `Inject` entry covers an interface at all.
+struct Scope {
+    set: ScopeSet,
+    guard: HelperGuard,
+}
+
+impl Scope {
+    fn new(set: ScopeSet) -> Self {
+        let guard = HelperGuard::from_scope_set(&set);
+        Self { set, guard }
+    }
+
+    /// Whether at least one `Inject`-capability entry covers `iface`
+    /// (exactly, or by the `*` wildcard).
+    fn inject_covers(&self, iface: &str) -> bool {
+        self.set
+            .scope
+            .iter()
+            .any(|e| e.capability == L4Capability::Inject && interface_covers(e, iface))
+    }
+}
+
+/// One open capture: the flag its thread polls and the interface it is on
+/// (so a new scope can be checked against it).
+struct CaptureEntry {
+    stop: Arc<AtomicBool>,
+    interface: String,
+}
+
+/// The open captures by id. Shared with the threads so a capture that ends
+/// on its own removes itself; a thread only ever removes its own entry
+/// ([`Captures::finish`] checks the flag's identity), so an id freed and
+/// reused by the loop is never removed by the thread that lost it.
 #[derive(Default)]
 struct Captures {
-    open: Mutex<HashMap<u64, Arc<AtomicBool>>>,
+    open: Mutex<HashMap<u64, CaptureEntry>>,
 }
 
 impl Captures {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<AtomicBool>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<u64, CaptureEntry>> {
         self.open.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Register `id` with a fresh stop flag; `None` when it is already open.
-    fn insert(&self, id: u64) -> Option<Arc<AtomicBool>> {
+    /// Register `id` on `interface` with a fresh stop flag; `None` when it is
+    /// already open.
+    fn insert(&self, id: u64, interface: &str) -> Option<Arc<AtomicBool>> {
         let mut open = self.lock();
         if open.contains_key(&id) {
             return None;
         }
         let stop = Arc::new(AtomicBool::new(false));
-        open.insert(id, Arc::clone(&stop));
+        open.insert(
+            id,
+            CaptureEntry {
+                stop: Arc::clone(&stop),
+                interface: interface.to_string(),
+            },
+        );
         Some(stop)
     }
 
+    /// Ask `id`'s thread to stop; it reports `closed` and removes itself.
     fn stop(&self, id: u64) {
-        if let Some(flag) = self.lock().get(&id) {
-            flag.store(true, Ordering::Release);
+        if let Some(entry) = self.lock().get(&id) {
+            entry.stop.store(true, Ordering::Release);
         }
     }
 
+    /// Forget `id` outright (an open or a thread start that failed, before
+    /// any thread owns the entry).
     fn remove(&self, id: u64) {
         self.lock().remove(&id);
     }
 
+    /// A thread ending: remove `id` only if the entry is still this
+    /// thread's (`stop` is the flag it was given). Returns whether it was,
+    /// i.e. whether the thread owes the core a `CaptureClosed`.
+    fn finish(&self, id: u64, stop: &Arc<AtomicBool>) -> bool {
+        let mut open = self.lock();
+        match open.get(&id) {
+            Some(entry) if Arc::ptr_eq(&entry.stop, stop) => {
+                open.remove(&id);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Stop and forget every capture whose interface `guard` no longer
+    /// covers; the ids, in ascending order, for the loop to report as
+    /// `scope changed`. Their threads find their entry gone and stay silent.
+    fn stop_uncovered(&self, guard: &HelperGuard) -> Vec<u64> {
+        let mut open = self.lock();
+        let mut gone: Vec<u64> = open
+            .iter()
+            .filter(|(_, entry)| guard.capture_filter(&entry.interface).is_err())
+            .map(|(id, _)| *id)
+            .collect();
+        gone.sort_unstable();
+        for id in &gone {
+            if let Some(entry) = open.remove(id) {
+                entry.stop.store(true, Ordering::Release);
+            }
+        }
+        gone
+    }
+
     fn stop_all(&self) {
-        for flag in self.lock().values() {
-            flag.store(true, Ordering::Release);
+        for entry in self.lock().values() {
+            entry.stop.store(true, Ordering::Release);
         }
     }
 }
@@ -183,6 +277,10 @@ impl Drop for StopAll {
 
 /// Run one helper session over the split halves of the core's socket.
 ///
+/// `caps` is the helper's effective capability set as the caller read it
+/// (on Linux, `/proc/self/status` after the drop); it is echoed in
+/// `HelloAck.caps` as given, never replaced by a literal (spec §5.2, S3).
+///
 /// Returns `Ok(())` when the core closes the socket at a message boundary.
 ///
 /// # Errors
@@ -193,6 +291,7 @@ pub fn serve_loop<R: Read, W: Write + Send + 'static>(
     writer: W,
     wire: Arc<dyn Wire>,
     version: &str,
+    caps: Vec<String>,
 ) -> Result<(), ServeExit> {
     let out = Arc::new(Outbound {
         writer: Mutex::new(writer),
@@ -220,10 +319,10 @@ pub fn serve_loop<R: Read, W: Write + Send + 'static>(
     out.send(&Msg::HelloAck {
         proto: PROTO,
         helper_version: version.to_string(),
-        caps: vec![CAP_NET_RAW.to_string()],
+        caps,
     })?;
 
-    let mut guard: Option<HelperGuard> = None;
+    let mut scope: Option<Scope> = None;
     loop {
         let msg = match read_msg(&mut reader) {
             Ok(msg) => msg,
@@ -231,17 +330,42 @@ pub fn serve_loop<R: Read, W: Write + Send + 'static>(
             Err(e) => return Err(ServeExit::Protocol(e.to_string())),
         };
         match msg {
-            Msg::ScopeSet(s) => guard = Some(HelperGuard::from_scope_set(&s)),
+            Msg::ScopeSet(s) => {
+                let next = Scope::new(s);
+                // The new scope governs the captures already open: one on an
+                // interface it no longer covers closes now (SEC-M4). The new
+                // guard's rate buckets start fresh, so an inject budget the
+                // old scope had spent is not carried over: accepted (spec S3),
+                // since the core's own guard meters independently anyway.
+                for id in captures.stop_uncovered(&next.guard) {
+                    out.send(&Msg::CaptureClosed {
+                        capture_id: id,
+                        reason: REASON_SCOPE_CHANGED.to_string(),
+                    })?;
+                }
+                scope = Some(next);
+            }
             Msg::CaptureOpen {
                 id,
                 interface,
                 direction: _,
                 read_timeout_ms,
             } => {
-                let timeout = Duration::from_millis(u64::from(read_timeout_ms));
-                match open_capture(guard.as_ref(), &*wire, &captures, id, &interface, timeout) {
+                let timeout =
+                    Duration::from_millis(u64::from(read_timeout_ms.max(MIN_READ_TIMEOUT_MS)));
+                let guard = scope.as_ref().map(|s| &s.guard);
+                match open_capture(guard, &*wire, &captures, id, &interface, timeout) {
                     Ok((source, stop)) => {
-                        spawn_capture(id, source, stop, Arc::clone(&out), Arc::clone(&captures));
+                        if let Err(e) =
+                            spawn_capture(id, source, stop, Arc::clone(&out), Arc::clone(&captures))
+                        {
+                            // No thread owns the entry; free the id and say why.
+                            captures.remove(id);
+                            out.send(&Msg::CaptureClosed {
+                                capture_id: id,
+                                reason: format!("capture thread could not start: {e}"),
+                            })?;
+                        }
                     }
                     Err(reason) => out.send(&Msg::CaptureClosed {
                         capture_id: id,
@@ -255,10 +379,10 @@ pub fn serve_loop<R: Read, W: Write + Send + 'static>(
                 interface,
                 bytes,
             } => {
-                let Some(guard) = guard.as_ref() else {
+                let Some(scope) = scope.as_ref() else {
                     return Err(ServeExit::Protocol("inject before scope".to_string()));
                 };
-                let error = inject(guard, &*wire, &interface, &bytes).err();
+                let error = inject(scope, &*wire, &interface, &bytes).err();
                 out.send(&Msg::InjectResult { request_id, error })?;
             }
             other @ (Msg::Hello { .. }
@@ -291,7 +415,7 @@ fn open_capture(
     check_interface_name(interface)?;
     let filter = guard.capture_filter(interface)?;
     let stop = captures
-        .insert(id)
+        .insert(id, interface)
         .ok_or_else(|| format!("capture {id} is already open"))?;
     match wire.open(interface, filter.as_deref(), timeout) {
         Ok(source) => Ok((source, stop)),
@@ -304,58 +428,70 @@ fn open_capture(
 }
 
 /// Decide one inject; `Err` is the `InjectResult.error` text and means the
-/// wire was not touched. Interface name first, then the helper's own guard
-/// over the frame's bytes (plan A8: the parser's text passes through), then
-/// the wire.
-fn inject(
-    guard: &HelperGuard,
-    wire: &dyn Wire,
-    interface: &str,
-    bytes: &[u8],
-) -> Result<(), String> {
+/// wire was not touched. Interface name first; then whether any `Inject`
+/// entry of the scope covers the interface at all, before the wire is asked
+/// for its link type (on the real wire that opens a pcap handle; SEC-M2);
+/// then the helper's own guard over the frame's bytes (plan A8: the parser's
+/// text passes through); then the wire.
+fn inject(scope: &Scope, wire: &dyn Wire, interface: &str, bytes: &[u8]) -> Result<(), String> {
     check_interface_name(interface)?;
-    guard.check_inject(interface, wire.link(interface), bytes)?;
-    wire.inject(interface, bytes)
+    if !scope.inject_covers(interface) {
+        return Err(format!("interface {interface} is out of L4 inject scope"));
+    }
+    let link = wire.link(interface);
+    scope.guard.check_inject(interface, link, bytes)?;
+    wire.inject(interface, link, bytes)
 }
 
-/// Stream frames from `source` until it fails or the capture's flag is set.
+/// Stream frames from `source` on a thread of its own until the source fails
+/// or the capture's flag is set. The thread reports `CaptureClosed` only
+/// while the entry is still its own ([`Captures::finish`]); a capture the
+/// loop already closed for a scope change stays silent.
+///
+/// # Errors
+/// The thread could not be started (`EAGAIN` and the like); nothing runs
+/// and the caller frees the id.
 fn spawn_capture<W: Write + Send + 'static>(
     id: u64,
     mut source: Box<dyn CaptureSource + Send>,
     stop: Arc<AtomicBool>,
     out: Arc<Outbound<W>>,
     captures: Arc<Captures>,
-) {
-    thread::spawn(move || {
-        let reason = loop {
-            if stop.load(Ordering::Acquire) {
-                break REASON_CLOSED.to_string();
-            }
-            match source.next_frame() {
-                Ok(Some(bytes)) => {
-                    let frame = Msg::Frame {
-                        capture_id: id,
-                        ts_us: now_us(),
-                        bytes,
-                    };
-                    if out.send(&frame).is_err() {
-                        // The core is gone; the main loop will see it too.
-                        captures.remove(id);
-                        return;
-                    }
+) -> std::io::Result<()> {
+    thread::Builder::new()
+        .name(format!("capture-{id}"))
+        .spawn(move || {
+            let reason = loop {
+                if stop.load(Ordering::Acquire) {
+                    break REASON_CLOSED.to_string();
                 }
-                Ok(None) => {}
-                Err(e) => break e.to_string(),
+                match source.next_frame() {
+                    Ok(Some(bytes)) => {
+                        let frame = Msg::Frame {
+                            capture_id: id,
+                            ts_us: now_us(),
+                            bytes,
+                        };
+                        if out.send(&frame).is_err() {
+                            // The core is gone; the main loop will see it too.
+                            captures.finish(id, &stop);
+                            return;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => break e.to_string(),
+                }
+            };
+            if captures.finish(id, &stop) {
+                // A failed write here has nowhere to be reported; the loop
+                // exits on its own next read or write.
+                let _ = out.send(&Msg::CaptureClosed {
+                    capture_id: id,
+                    reason,
+                });
             }
-        };
-        captures.remove(id);
-        // A failed write here has nowhere to be reported; the loop exits on
-        // its own next read or write.
-        let _ = out.send(&Msg::CaptureClosed {
-            capture_id: id,
-            reason,
-        });
-    });
+        })
+        .map(|_handle| ())
 }
 
 /// The name of a message's variant, for protocol-violation texts.
@@ -420,6 +556,10 @@ const IPPROTO_RAW: i32 = 255;
 /// Stateless, like the core's `PcapBackend`: a fresh handle per call. The
 /// FFI in `pcap` and `socket2` stays inside those crates; this crate keeps
 /// the workspace forbid lint (see `main.rs`).
+// TODO(p1b/p1a follow-up): wrap PcapBackend once CaptureInjectBackend returns
+// Box<dyn CaptureSource + Send> (QP2-M2: `open`, `sendpacket` and the
+// TimeoutExpired adapter below duplicate it only because of the missing
+// `Send` bound and the `L4Error` type).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PcapWire;
 
@@ -441,8 +581,10 @@ impl Wire for PcapWire {
         Ok(Box::new(PcapSource { cap }))
     }
 
-    fn inject(&self, iface: &str, bytes: &[u8]) -> Result<(), String> {
-        let link = self.link(iface);
+    /// One handle at most: the loop already resolved `link`, so the frame is
+    /// decoded under it here without opening the interface again, and the
+    /// raw-IP path opens no pcap handle at all.
+    fn inject(&self, iface: &str, link: LinkType, bytes: &[u8]) -> Result<(), String> {
         // The guard already admitted this frame; this decode only picks the
         // path, and refuses again rather than guess if it cannot.
         let target = inject_target(iface, link, bytes, MAX_FRAME).map_err(|e| e.to_string())?;
@@ -487,7 +629,6 @@ fn pcap_inject(iface: &str, bytes: &[u8]) -> Result<(), String> {
 
 /// The IP packet behind the link header: 4 bytes for `DLT_NULL`, 14 for
 /// Ethernet, none for raw.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn strip_link(link: LinkType, bytes: &[u8]) -> Result<&[u8], String> {
     let header = match link {
         LinkType::Null => 4,
@@ -501,8 +642,8 @@ fn strip_link(link: LinkType, bytes: &[u8]) -> Result<&[u8], String> {
 
 /// Send an IP packet (header included) to a local destination through a raw
 /// IP socket (spec S1, plan A6). Compiled on every platform so it is checked
-/// here; only the Linux build calls it (spike S8 covers macOS loopback).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// here; only the Linux build calls it (spike S8 covers macOS loopback), and
+/// off Linux the module-level `allow(dead_code)` in `main.rs` covers it.
 fn raw_ip_inject(dst: std::net::IpAddr, packet: &[u8]) -> Result<(), String> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     use std::net::{IpAddr, SocketAddrV4, SocketAddrV6};
@@ -780,6 +921,9 @@ mod tests {
         opens: Mutex<Vec<(String, Option<String>, Duration)>>,
         /// `(interface, bytes)` of every `inject`.
         injects: Mutex<Vec<(String, Vec<u8>)>>,
+        /// The link type the loop handed each `inject` (the one it resolved
+        /// with `link`, so the real wire opens no second handle for it).
+        inject_links: Mutex<Vec<LinkType>>,
         /// What the next scripted capture yields.
         frames: Mutex<Vec<Vec<u8>>>,
         /// Tester: frame lists for the opens after the first, in order.
@@ -788,6 +932,9 @@ mod tests {
         fail_open: Mutex<Option<String>>,
         /// Tester: when set, every `inject` is recorded, then fails with this.
         fail_inject: Mutex<Option<String>>,
+        /// How many times the loop asked for an interface's link type (a real
+        /// wire opens a pcap handle for that, so a refusal must come first).
+        link_calls: Mutex<u32>,
     }
 
     impl FakeWire {
@@ -831,6 +978,18 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
         }
+        fn link_calls(&self) -> u32 {
+            *self
+                .link_calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        }
+        fn inject_links(&self) -> Vec<LinkType> {
+            self.inject_links
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
     }
 
     impl Wire for FakeWire {
@@ -868,11 +1027,15 @@ mod tests {
                 frames: frames.into_iter(),
             }))
         }
-        fn inject(&self, iface: &str, bytes: &[u8]) -> Result<(), String> {
+        fn inject(&self, iface: &str, link: LinkType, bytes: &[u8]) -> Result<(), String> {
             self.injects
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push((iface.to_string(), bytes.to_vec()));
+            self.inject_links
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(link);
             if let Some(why) = self
                 .fail_inject
                 .lock()
@@ -884,6 +1047,10 @@ mod tests {
             Ok(())
         }
         fn link(&self, _iface: &str) -> LinkType {
+            *self
+                .link_calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) += 1;
             LinkType::Ethernet
         }
     }
@@ -899,8 +1066,14 @@ mod tests {
 
     fn run_raw(bytes: Vec<u8>, wire: Arc<FakeWire>) -> (Result<(), ServeExit>, Vec<Msg>) {
         let out = SharedBuf::default();
-        let result = serve_loop(Cursor::new(bytes), out.clone(), wire, VERSION);
+        let result = serve_loop(Cursor::new(bytes), out.clone(), wire, VERSION, caps());
         (result, out.messages())
+    }
+
+    /// The effective set a helper after the drop holds (what `main` reads
+    /// from `/proc/self/status` on Linux); every test hands the loop this.
+    fn caps() -> Vec<String> {
+        vec!["CAP_NET_RAW".to_string()]
     }
 
     fn protocol_text(result: Result<(), ServeExit>) -> String {
@@ -985,6 +1158,39 @@ mod tests {
             }
         );
         assert_eq!(wire.injects(), vec![("lo".to_string(), frame)]);
+        // The loop resolved the link once and handed that to `inject`
+        // (QP2-M1: the real wire opens one handle, not three).
+        assert_eq!(wire.link_calls(), 1);
+        assert_eq!(wire.inject_links(), vec![LinkType::Ethernet]);
+    }
+
+    #[test]
+    fn hello_ack_echoes_the_caps_it_is_given() {
+        // SEC-M3 / SP-M1: `HelloAck.caps` is whatever `main` read as the
+        // effective set, not a literal: an empty set is `[]`, two names come
+        // back in the order given.
+        for caps in [
+            Vec::<String>::new(),
+            vec!["CAP_NET_ADMIN".to_string(), "CAP_NET_RAW".to_string()],
+        ] {
+            let out = SharedBuf::default();
+            let result = serve_loop(
+                Cursor::new(encode(&hello())),
+                out.clone(),
+                Arc::new(FakeWire::default()) as Arc<dyn Wire>,
+                VERSION,
+                caps.clone(),
+            );
+            assert_eq!(result, Ok(()));
+            assert_eq!(
+                out.messages(),
+                vec![Msg::HelloAck {
+                    proto: 1,
+                    helper_version: "0.5.9".to_string(),
+                    caps,
+                }]
+            );
+        }
     }
 
     #[test]
@@ -1083,7 +1289,8 @@ mod tests {
         let (tx, reader) = ChanReader::new();
         let loop_out = out.clone();
         let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
-        let handle = thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION));
+        let handle =
+            thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION, caps()));
 
         for m in [hello(), Msg::ScopeSet(scope_set()), capture_open(5, "lo")] {
             tx.send(encode(&m)).expect("loop is reading");
@@ -1223,6 +1430,43 @@ mod tests {
         assert_eq!(wire.injects().len(), 1);
     }
 
+    /// Plan amendments A1 and A10: an inject whose destination is a loopback
+    /// address goes through the raw IP socket (spec S1) and reaches a UDP
+    /// socket under the default sysctls (`route_localnet=0`), where
+    /// `pcap_inject` of an L2 frame on `lo` is dropped as a martian. Needs
+    /// `CAP_NET_RAW` on `lo`, so it is ignored by default; P2.8 runs it on
+    /// the linux-ci rig with `cargo test -p aitm-l4-helper -- --ignored`.
+    /// Written against the same `craft` shapes as `eth_udp` above; it cannot
+    /// compile on macOS (plan A5) and first compiles on the rig.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs CAP_NET_RAW on lo; P2.8 runs it with --ignored on the linux-ci rig"]
+    fn linux_loopback_inject_reaches_a_udp_socket_with_default_sysctls() {
+        use super::PcapWire;
+        use std::net::{IpAddr, UdpSocket};
+
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind a UDP socket on loopback");
+        let port = socket.local_addr().expect("local address").port();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+
+        // The same Ethernet/IPv4/UDP frame the loop tests use, aimed at the
+        // bound port: 127.0.0.1:40000 -> 127.0.0.1:port, payload "probe".
+        let frame = eth_udp(port);
+        PcapWire
+            .inject("lo", LinkType::Ethernet, &frame)
+            .expect("raw IP inject of a loopback-bound frame");
+
+        let mut buf = [0u8; 64];
+        let (n, from) = socket
+            .recv_from(&mut buf)
+            .expect("the injected datagram arrives within 2 s");
+        assert_eq!(&buf[..n], b"probe");
+        assert_eq!(from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert_eq!(from.port(), 40_000);
+    }
+
     // ---- Tester edge cases (stage 5, unit p2) ------------------------------
 
     /// A writer whose first `ok_left` writes succeed and every later one
@@ -1277,7 +1521,8 @@ mod tests {
         let (tx, reader) = ChanReader::new();
         let loop_out = out.clone();
         let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
-        let handle = thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION));
+        let handle =
+            thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION, caps()));
 
         for m in [
             hello(),
@@ -1376,7 +1621,9 @@ mod tests {
     #[test]
     fn tester_inject_on_an_interface_the_scope_does_not_cover_is_refused_before_the_wire() {
         // The scope covers `lo` only and the frame is in range: a valid name
-        // on another interface is the guard's refusal, not the name check's.
+        // on another interface is refused by the loop's own scope pre-check
+        // (SEC-M2) before the wire is asked for the link type, which on the
+        // real wire opens a pcap handle. Only the admitted inject asks.
         let wire: Arc<FakeWire> = Arc::default();
         let (result, out) = run(
             &[
@@ -1392,12 +1639,175 @@ mod tests {
         assert_eq!(
             inject_results(&out),
             vec![
-                (21, Some("target 127.0.0.1 is out of L4 scope".to_string())),
-                (22, Some("target 127.0.0.1 is out of L4 scope".to_string())),
+                (
+                    21,
+                    Some("interface eth0 is out of L4 inject scope".to_string())
+                ),
+                (
+                    22,
+                    Some("interface lo0 is out of L4 inject scope".to_string())
+                ),
                 (23, None),
             ]
         );
         assert_eq!(wire.injects(), vec![("lo".to_string(), eth_udp(9053))]);
+        assert_eq!(wire.link_calls(), 1, "only the admitted inject asked");
+    }
+
+    #[test]
+    fn read_timeout_is_floored_at_100_ms_before_the_wire_opens() {
+        // Tester F5 / QP2-M4: `read_timeout_ms: 0` would be `pcap timeout(0)`,
+        // a poll that never returns, so a CaptureClose could never take
+        // effect. The loop clamps to MIN_READ_TIMEOUT_MS before `open`; a
+        // value at or above it passes through unchanged.
+        let open = |id: u64, read_timeout_ms: u32| Msg::CaptureOpen {
+            id,
+            interface: "lo".to_string(),
+            direction: L4Direction::Outbound,
+            read_timeout_ms,
+        };
+        let wire: Arc<FakeWire> = Arc::default();
+        let (result, _) = run(
+            &[
+                hello(),
+                Msg::ScopeSet(scope_set()),
+                open(1, 0),
+                open(2, 250),
+                open(3, 99),
+                open(4, 100),
+            ],
+            Arc::clone(&wire),
+        );
+        assert_eq!(result, Ok(()));
+        let timeouts: Vec<Duration> = wire.opens().into_iter().map(|(_, _, t)| t).collect();
+        assert_eq!(
+            timeouts,
+            vec![
+                Duration::from_millis(100),
+                Duration::from_millis(250),
+                Duration::from_millis(100),
+                Duration::from_millis(100),
+            ]
+        );
+    }
+
+    #[test]
+    fn scope_change_closes_a_capture_the_new_scope_no_longer_covers() {
+        // SEC-M4: a new ScopeSet governs captures already open, not only new
+        // ones. A capture on `lo` is stopped with reason "scope changed" when
+        // the scope moves to `eth0`; its thread adds no second CaptureClosed;
+        // a fresh CaptureOpen on `lo` is refused by the new scope; the id is
+        // free again.
+        let wire: Arc<FakeWire> = Arc::default();
+        let out = SharedBuf::default();
+        let (tx, reader) = ChanReader::new();
+        let loop_out = out.clone();
+        let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
+        let handle =
+            thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION, caps()));
+
+        for m in [hello(), Msg::ScopeSet(scope_set()), capture_open(5, "lo")] {
+            tx.send(encode(&m)).expect("loop is reading");
+        }
+        out.wait_until("first open", |_| wire.opens().len() == 1);
+
+        tx.send(encode(&Msg::ScopeSet(scope_set_on("eth0"))))
+            .expect("loop is reading");
+        out.wait_until("scope changed", |msgs| {
+            msgs.contains(&Msg::CaptureClosed {
+                capture_id: 5,
+                reason: "scope changed".to_string(),
+            })
+        });
+
+        tx.send(encode(&capture_open(6, "lo")))
+            .expect("loop is reading");
+        out.wait_until("refusal under the new scope", |msgs| {
+            msgs.contains(&Msg::CaptureClosed {
+                capture_id: 6,
+                reason: "interface lo is outside the capture scope".to_string(),
+            })
+        });
+        assert_eq!(
+            wire.opens().len(),
+            1,
+            "the refused open never reached the wire"
+        );
+
+        // The stopped thread must not add a "closed" of its own.
+        thread::sleep(Duration::from_millis(50));
+        let closed_5: Vec<String> = out
+            .messages()
+            .iter()
+            .filter_map(|m| match m {
+                Msg::CaptureClosed {
+                    capture_id: 5,
+                    reason,
+                } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed_5, vec!["scope changed".to_string()]);
+
+        // Id 5 is free again on an interface the new scope covers.
+        tx.send(encode(&capture_open(5, "eth0")))
+            .expect("loop is reading");
+        out.wait_until("re-open on eth0", |_| wire.opens().len() == 2);
+        assert_eq!(wire.opens()[1].0, "eth0");
+
+        drop(tx);
+        assert_eq!(handle.join().expect("loop thread"), Ok(()));
+    }
+
+    #[test]
+    fn scope_change_keeps_a_capture_the_new_scope_still_covers() {
+        // The counterpart: a new scope that still covers the interface leaves
+        // the capture alone (no CaptureClosed until the session ends).
+        let wire: Arc<FakeWire> = Arc::default();
+        let out = SharedBuf::default();
+        let (tx, reader) = ChanReader::new();
+        let loop_out = out.clone();
+        let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
+        let handle =
+            thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION, caps()));
+
+        for m in [hello(), Msg::ScopeSet(scope_set()), capture_open(5, "lo")] {
+            tx.send(encode(&m)).expect("loop is reading");
+        }
+        out.wait_until("first open", |_| wire.opens().len() == 1);
+        let wider = ScopeSet {
+            scope: vec![
+                entry("eth0", L4Capability::Capture, 10),
+                entry("lo", L4Capability::Capture, 10),
+            ],
+            ..scope_set()
+        };
+        tx.send(encode(&Msg::ScopeSet(wider)))
+            .expect("loop is reading");
+        // Something the loop answers, so we know the ScopeSet was processed.
+        tx.send(encode(&inject(1, "lo", eth_udp(9053))))
+            .expect("loop is reading");
+        let msgs = out.wait_until("inject answered", |msgs| !inject_results(msgs).is_empty());
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::CaptureClosed { .. })),
+            "{msgs:?}"
+        );
+        drop(tx);
+        assert_eq!(handle.join().expect("loop thread"), Ok(()));
+        let msgs = out.wait_until("closed at session end", |msgs| {
+            msgs.iter().any(|m| matches!(m, Msg::CaptureClosed { .. }))
+        });
+        let closed: Vec<&Msg> = msgs
+            .iter()
+            .filter(|m| matches!(m, Msg::CaptureClosed { .. }))
+            .collect();
+        assert_eq!(
+            closed,
+            vec![&Msg::CaptureClosed {
+                capture_id: 5,
+                reason: "closed".to_string()
+            }]
+        );
     }
 
     #[test]
@@ -1443,8 +1853,18 @@ mod tests {
                     Some("scope matches but does not grant the Inject capability".to_string())
                 ),
                 (33, None),
-                (34, Some("target 127.0.0.1 is out of L4 scope".to_string())),
+                // The empty scope has no Inject entry for `lo`: the loop's
+                // pre-check refuses before the wire is asked anything.
+                (
+                    34,
+                    Some("interface lo is out of L4 inject scope".to_string())
+                ),
             ]
+        );
+        assert_eq!(
+            wire.link_calls(),
+            3,
+            "injects 31, 32 and 33 asked; 34 did not"
         );
         assert_eq!(wire.injects().len(), 2);
         // The empty scope governs captures too.
@@ -1463,6 +1883,7 @@ mod tests {
             FlakyWriter { ok_left: 0 },
             Arc::new(FakeWire::default()) as Arc<dyn Wire>,
             VERSION,
+            caps(),
         );
         assert_eq!(result, Err(ServeExit::Io("peer gone".to_string())));
         assert_eq!(
@@ -1486,6 +1907,7 @@ mod tests {
             FlakyWriter { ok_left: 1 },
             Arc::clone(&wire) as Arc<dyn Wire>,
             VERSION,
+            caps(),
         );
         assert_eq!(result, Err(ServeExit::Io("peer gone".to_string())));
         assert_eq!(wire.injects().len(), 1, "the second Inject was never read");
@@ -1683,7 +2105,8 @@ mod tests {
         let (tx, reader) = ChanReader::new();
         let loop_out = out.clone();
         let loop_wire: Arc<dyn Wire> = Arc::clone(&wire) as Arc<dyn Wire>;
-        let handle = thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION));
+        let handle =
+            thread::spawn(move || serve_loop(reader, loop_out, loop_wire, VERSION, caps()));
         for m in [hello(), Msg::ScopeSet(scope_set()), capture_open(4, "lo")] {
             tx.send(encode(&m)).expect("loop is reading");
         }
@@ -1758,14 +2181,17 @@ mod tests {
         );
         assert_eq!(result, Ok(()));
         assert_eq!(wire.opens().len(), 1);
+        // No Inject-capability entry covers `lo`: the loop's pre-check
+        // refuses before the guard (and before any pcap handle).
         assert_eq!(
             inject_results(&out),
             vec![(
                 2,
-                Some("scope matches but does not grant the Inject capability".to_string())
+                Some("interface lo is out of L4 inject scope".to_string())
             )]
         );
         assert_eq!(wire.injects().len(), 0);
+        assert_eq!(wire.link_calls(), 0);
     }
 
     #[test]

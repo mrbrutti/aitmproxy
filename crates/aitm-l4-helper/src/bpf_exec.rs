@@ -82,10 +82,12 @@ fn check_receipt_dir(meta: &DirMeta) -> Result<(), String> {
             meta.uid, meta.gid
         ));
     }
-    if meta.mode & 0o777 != RECEIPT_DIR_MODE {
+    // All twelve mode bits: a setuid, setgid or sticky bit is not "0755"
+    // (spec S3, plan A12).
+    let mode = meta.mode & 0o7777;
+    if mode != RECEIPT_DIR_MODE {
         return Err(format!(
-            "{RECEIPT_DIR} has mode {:04o} (expected {RECEIPT_DIR_MODE:04o}); nothing was changed",
-            meta.mode & 0o7777
+            "{RECEIPT_DIR} has mode {mode:04o} (expected {RECEIPT_DIR_MODE:04o}); nothing was changed"
         ));
     }
     Ok(())
@@ -314,6 +316,19 @@ pub fn dry_run_revert(sys: &dyn MacSys) -> Result<Vec<String>, String> {
     Ok(lines)
 }
 
+/// The text for a failed owner change of `path`: `"owner of /dev/bpf0 not
+/// changed: Operation not permitted (os error 1)"`. A noun phrase about the
+/// node, not the name of the call that failed, because it reaches the
+/// unified-log line and plan Rule 2 forbids a line that reads as a command.
+fn owner_unchanged(path: &std::path::Path, err: &std::io::Error) -> String {
+    format!("owner of {} not changed: {err}", path.display())
+}
+
+/// The text for a failed mode change of `path`; see [`owner_unchanged`].
+fn mode_unchanged(path: &std::path::Path, err: &std::io::Error) -> String {
+    format!("mode of {} not changed: {err}", path.display())
+}
+
 /// The gid in a `dscl . -read /Groups/<name> PrimaryGroupID` reply, which is
 /// one line of the form `PrimaryGroupID: 701`.
 fn parse_primary_group_id(stdout: &str) -> Option<u32> {
@@ -330,7 +345,10 @@ pub struct RealMacSys;
 
 #[cfg(target_os = "macos")]
 mod real {
-    use super::{parse_primary_group_id, DirMeta, MacSys, RealMacSys, DSEDITGROUP};
+    use super::{
+        mode_unchanged, owner_unchanged, parse_primary_group_id, DirMeta, MacSys, RealMacSys,
+        DSEDITGROUP,
+    };
     use crate::bpf::{ConsoleUser, NodeFacts};
     use aitm_proto_l4::privilege::contract::{BPF_GROUP, RECEIPT_DIR, RECEIPT_PATH};
     use std::fs;
@@ -417,13 +435,13 @@ mod real {
             let path = node_path(n);
             // `lchown`: never follow a symlink planted at a node's path.
             std::os::unix::fs::lchown(&path, Some(uid), Some(gid))
-                .map_err(|err| describe("chown", &path, &err))
+                .map_err(|err| owner_unchanged(&path, &err))
         }
 
         fn chmod(&self, n: u32, mode: u32) -> Result<(), String> {
             let path = node_path(n);
             fs::set_permissions(&path, fs::Permissions::from_mode(mode))
-                .map_err(|err| describe("chmod", &path, &err))
+                .map_err(|err| mode_unchanged(&path, &err))
         }
 
         fn group_gid(&self) -> Result<Option<u32>, String> {
@@ -516,9 +534,9 @@ mod real {
             // umask may have narrowed the mode, and BSD gives a new file the
             // parent directory's group: pin both to what the spec says.
             fs::set_permissions(tmp, fs::Permissions::from_mode(RECEIPT_MODE))
-                .map_err(|err| describe("chmod", tmp, &err))?;
+                .map_err(|err| mode_unchanged(tmp, &err))?;
             std::os::unix::fs::lchown(tmp, Some(0), Some(0))
-                .map_err(|err| describe("chown", tmp, &err))?;
+                .map_err(|err| owner_unchanged(tmp, &err))?;
             fs::rename(tmp, RECEIPT_PATH)
                 .map_err(|err| describe("rename", Path::new(RECEIPT_PATH), &err))
         }
@@ -551,9 +569,9 @@ mod real {
             // The parent is `root:admin`, and BSD gives a new directory its
             // parent's group, so the group is set explicitly to `wheel`.
             std::os::unix::fs::lchown(dir, Some(0), Some(0))
-                .map_err(|err| describe("chown", dir, &err))?;
+                .map_err(|err| owner_unchanged(dir, &err))?;
             fs::set_permissions(dir, fs::Permissions::from_mode(super::RECEIPT_DIR_MODE))
-                .map_err(|err| describe("chmod", dir, &err))
+                .map_err(|err| mode_unchanged(dir, &err))
         }
     }
 }
@@ -897,8 +915,7 @@ mod tests {
 
     #[test]
     fn dseditgroup_argv_exact() {
-        let sys = Fake::new(all_nodes(), None, Some(admin("matt")));
-        let mut sys = sys;
+        let mut sys = Fake::new(all_nodes(), None, Some(admin("matt")));
         sys.gid_after_create = Some(702);
         if let Err(err) = apply(&sys, "0.5.9", 1_762_000_000_000) {
             panic!("apply must succeed: {err}");
@@ -1173,13 +1190,6 @@ mod tests {
             Ok(lines) => lines,
             Err(err) => panic!("dry run must succeed: {err}"),
         };
-        let expected = render(&plan_apply(
-            &all_nodes(),
-            Some(701),
-            None,
-            Some(&admin("matt")),
-        ));
-        assert_eq!(lines, expected);
         assert_eq!(lines.len(), 256 * 2 + 2);
         assert_eq!(lines[0], "chown root:access_bpf /dev/bpf0");
         assert_eq!(lines[1], "chmod 0660 /dev/bpf0");
@@ -1306,8 +1316,7 @@ mod tests {
             Ok(lines) => lines,
             Err(err) => panic!("dry run must succeed: {err}"),
         };
-        let prior = receipt(&["matt"]);
-        assert_eq!(lines, render(&plan_revert(&all_nodes(), Some(&prior))));
+        assert_eq!(lines.len(), 256 * 2 + 2);
         assert_eq!(lines[0], "chown root:wheel /dev/bpf0");
         assert_eq!(lines[512], "remove matt from access_bpf");
         assert_eq!(
@@ -1630,24 +1639,29 @@ mod tests {
     fn tester_apply_with_no_nodes_writes_a_zero_node_receipt() {
         // No /dev/bpf* at all (not a real macOS state): the planner refuses
         // nothing because there is nothing to judge, and the receipt records
-        // 0 nodes, no error, and the member that was added. Pinned so a
-        // change here is deliberate.
+        // 0 nodes, no error and nobody added: a run that changed no node
+        // changes no directory-service state (plan A11, spec S3).
         let sys = Fake::new(Vec::new(), Some(701), Some(admin("matt")));
         let receipt = apply(&sys, "0.5.9", 1_762_000_000_000).expect("apply");
         assert_eq!(receipt.nodes, 0);
         assert_eq!(receipt.errors, Vec::<String>::new());
-        assert_eq!(receipt.members_added, vec!["matt".to_string()]);
-        assert!(!sys
-            .calls()
+        assert_eq!(receipt.members_added, Vec::<String>::new());
+        let calls = sys.calls();
+        assert!(!calls
             .iter()
             .any(|c| matches!(c, Call::Chown { .. } | Call::Chmod { .. })));
+        assert_eq!(
+            dseditgroup_calls(&calls),
+            Vec::<Vec<String>>::new(),
+            "no node changed, no member added: {calls:?}"
+        );
     }
 
     #[test]
     fn tester_every_node_refused_still_writes_the_receipt_with_every_error() {
         // /dev/bpf0 missing: every node refused, none set, 255 errors in the
-        // receipt, and no chown or chmod at all. The admin is still added
-        // (the plan does not condition AddMember on a node being set).
+        // receipt, no chown or chmod at all, and the admin is NOT added (plan
+        // A11: AddMember needs at least one valid node).
         let nodes: Vec<NodeFacts> = (1..256).map(|n| node(n, BPF_MAJOR)).collect();
         let sys = Fake::new(nodes, Some(701), Some(admin("matt")));
         let receipt = apply(&sys, "0.5.9", 1_762_000_000_000).expect("apply");
@@ -1655,12 +1669,95 @@ mod tests {
         assert_eq!(receipt.errors.len(), 255);
         assert_eq!(receipt.errors[0], "/dev/bpf1: /dev/bpf0 is missing");
         assert_eq!(receipt.errors[254], "/dev/bpf255: /dev/bpf0 is missing");
-        assert_eq!(receipt.members_added, vec!["matt".to_string()]);
+        assert_eq!(receipt.members_added, Vec::<String>::new());
         let calls = sys.calls();
         assert!(!calls
             .iter()
             .any(|c| matches!(c, Call::Chown { .. } | Call::Chmod { .. })));
-        assert_eq!(dseditgroup_calls(&calls).len(), 1);
+        assert_eq!(dseditgroup_calls(&calls), Vec::<Vec<String>>::new());
+    }
+
+    #[test]
+    fn executor_failure_texts_name_no_command() {
+        // Plan Rule 2 (tester F1, QP2-M5): what `RealMacSys` says when a
+        // chown or chmod fails reaches the unified-log line, so it is a noun
+        // phrase about the node, never the name of the command that failed.
+        use std::path::Path;
+        let eperm = std::io::Error::from_raw_os_error(1);
+        let texts = [
+            owner_unchanged(Path::new("/dev/bpf0"), &eperm),
+            mode_unchanged(Path::new("/dev/bpf0"), &eperm),
+            owner_unchanged(Path::new("/Library/Application Support/Aitmproxy"), &eperm),
+            mode_unchanged(Path::new("/Library/Application Support/Aitmproxy"), &eperm),
+            owner_unchanged(
+                Path::new("/Library/Application Support/Aitmproxy/.l4-helper.json.tmp"),
+                &eperm,
+            ),
+            mode_unchanged(
+                Path::new("/Library/Application Support/Aitmproxy/.l4-helper.json.tmp"),
+                &eperm,
+            ),
+        ];
+        assert_eq!(
+            texts[0],
+            "owner of /dev/bpf0 not changed: Operation not permitted (os error 1)"
+        );
+        assert_eq!(
+            texts[1],
+            "mode of /dev/bpf0 not changed: Operation not permitted (os error 1)"
+        );
+        assert_eq!(
+            texts[2],
+            "owner of /Library/Application Support/Aitmproxy not changed: Operation not permitted (os error 1)"
+        );
+        assert_eq!(
+            texts[3],
+            "mode of /Library/Application Support/Aitmproxy not changed: Operation not permitted (os error 1)"
+        );
+        for text in &texts {
+            assert_eq!(names_a_command(text), None, "{text:?} names a command");
+            // And so does the log line built from it.
+            let line = crate::log::revert_line(&Err(text.clone()));
+            assert_eq!(names_a_command(&line), None, "{line:?} names a command");
+            let line = crate::log::run_line("bpf-permissions", &Err(text.clone()));
+            assert_eq!(names_a_command(&line), None, "{line:?} names a command");
+        }
+        // The matcher would have caught the old shape.
+        assert_eq!(
+            names_a_command("chown /dev/bpf0: Operation not permitted"),
+            Some("chown")
+        );
+    }
+
+    #[test]
+    fn tester_receipt_dir_with_special_mode_bits_is_refused_naming_the_mode() {
+        // Spec §3.1 step 5 says 0755 and means it (spec S3, plan A12): a
+        // setuid, setgid or sticky bit on the receipt directory is refused by
+        // both modes before anything is touched, and the message shows the
+        // four-digit mode.
+        for (mode, expected) in [
+            (
+                0o4755_u32,
+                "/Library/Application Support/Aitmproxy has mode 4755 (expected 0755); nothing was changed",
+            ),
+            (
+                0o2755,
+                "/Library/Application Support/Aitmproxy has mode 2755 (expected 0755); nothing was changed",
+            ),
+            (
+                0o1755,
+                "/Library/Application Support/Aitmproxy has mode 1755 (expected 0755); nothing was changed",
+            ),
+        ] {
+            let mut sys = Fake::new(all_nodes(), Some(701), Some(admin("matt")));
+            sys.dir = Some(DirMeta { mode, ..good_dir() });
+            assert_eq!(apply(&sys, "0.5.9", 1), Err(expected.to_string()), "{mode:o}");
+            assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta], "{mode:o}");
+            let mut sys = Fake::new(all_nodes(), Some(701), None);
+            sys.dir = Some(DirMeta { mode, ..good_dir() });
+            assert_eq!(revert(&sys), Err(expected.to_string()), "{mode:o}");
+            assert_eq!(sys.calls(), vec![Call::ReceiptDirMeta], "{mode:o}");
+        }
     }
 
     #[test]

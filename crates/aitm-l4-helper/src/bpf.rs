@@ -136,17 +136,26 @@ fn judge(nodes: &[NodeFacts]) -> Vec<(u32, Verdict)> {
 }
 
 /// Push the per-node steps: `Chown` + `Chmod` for each valid node, `Refuse`
-/// for the rest, in the order the nodes were given.
-fn push_node_steps(steps: &mut Vec<Step>, nodes: &[NodeFacts], gid: Option<u32>, mode: u32) {
+/// for the rest, in the order the nodes were given. Returns how many nodes
+/// were valid (and so will be changed).
+fn push_node_steps(
+    steps: &mut Vec<Step>,
+    nodes: &[NodeFacts],
+    gid: Option<u32>,
+    mode: u32,
+) -> usize {
+    let mut valid = 0;
     for (n, verdict) in judge(nodes) {
         match verdict {
             Verdict::Valid => {
                 steps.push(Step::Chown { n, gid });
                 steps.push(Step::Chmod { n, mode });
+                valid += 1;
             }
             Verdict::Refused(why) => steps.push(Step::Refuse { n, why }),
         }
     }
+    valid
 }
 
 /// The plan for `bpf-permissions` (spec §3.1 steps 2 to 5).
@@ -156,7 +165,9 @@ fn push_node_steps(steps: &mut Vec<Step>, nodes: &[NodeFacts], gid: Option<u32>,
 /// is logged in. `CreateGroup` comes first when the group is absent; each
 /// node valid against `/dev/bpf0` gets `Chown` to the group and `Chmod` 0660,
 /// others `Refuse`; the console user is added only on the first run (no
-/// receipt) and only if they are an admin; `WriteReceipt` is last.
+/// receipt), only if they are an admin, and only when at least one node is
+/// valid (plan amendment A11, spec S3: a run that fixes no node changes no
+/// directory-service state); `WriteReceipt` is last.
 #[must_use]
 pub fn plan_apply(
     nodes: &[NodeFacts],
@@ -168,8 +179,8 @@ pub fn plan_apply(
     if group_gid.is_none() {
         steps.push(Step::CreateGroup);
     }
-    push_node_steps(&mut steps, nodes, group_gid, APPLY_MODE);
-    if prior.is_none() {
+    let valid = push_node_steps(&mut steps, nodes, group_gid, APPLY_MODE);
+    if prior.is_none() && valid > 0 {
         if let Some(user) = console.filter(|user| user.is_admin) {
             steps.push(Step::AddMember(user.name.clone()));
         }
@@ -555,22 +566,85 @@ mod tests {
     // ---- Tester edge cases (stage 5, unit p2) ------------------------------
 
     #[test]
+    fn add_member_is_planned_only_when_a_node_will_be_changed() {
+        // Plan amendment A11 / spec S3: a run that fixes no node changes no
+        // directory-service state, so the admin console user joins the group
+        // only when at least one node is valid. The receipt is still written.
+        let console = admin("matt");
+        // /dev/bpf0 missing: every node refused, nobody added.
+        assert_eq!(
+            plan_apply(&[node(1, true, BPF_MAJOR)], Some(504), None, Some(&console)),
+            vec![
+                Step::Refuse {
+                    n: 1,
+                    why: "/dev/bpf0 is missing".to_string(),
+                },
+                Step::WriteReceipt,
+            ]
+        );
+        // /dev/bpf0 not a character device: same.
+        assert_eq!(
+            plan_apply(
+                &[node(0, false, BPF_MAJOR)],
+                Some(504),
+                None,
+                Some(&console)
+            ),
+            vec![
+                Step::Refuse {
+                    n: 0,
+                    why: "/dev/bpf0 is not a character device".to_string(),
+                },
+                Step::WriteReceipt,
+            ]
+        );
+        // No node at all: same, with or without the group.
+        assert_eq!(
+            plan_apply(&[], Some(504), None, Some(&console)),
+            vec![Step::WriteReceipt]
+        );
+        assert_eq!(
+            plan_apply(&[], None, None, Some(&console)),
+            vec![Step::CreateGroup, Step::WriteReceipt]
+        );
+        // One valid node among refused ones is enough.
+        assert_eq!(
+            plan_apply(
+                &[node(3, true, 42), node(0, true, BPF_MAJOR)],
+                Some(504),
+                None,
+                Some(&console)
+            ),
+            vec![
+                Step::Refuse {
+                    n: 3,
+                    why: "major 42 differs from /dev/bpf0's major 23".to_string(),
+                },
+                Step::Chown {
+                    n: 0,
+                    gid: Some(504)
+                },
+                Step::Chmod { n: 0, mode: 0o660 },
+                Step::AddMember("matt".to_string()),
+                Step::WriteReceipt,
+            ]
+        );
+    }
+
+    #[test]
     fn tester_empty_node_list_plans_only_the_bookkeeping_steps() {
         // No node at all: nothing to change and nothing to refuse (there is
         // no /dev/bpf0 to judge against, but also no node to judge). The
-        // group and receipt steps still come out; bpf_exec then writes a
-        // receipt with `nodes: 0` (see its tester test).
+        // group and receipt steps still come out, and nobody is added (A11:
+        // no node changed, no member added); bpf_exec then writes a receipt
+        // with `nodes: 0` (see its tester test).
         assert_eq!(
             plan_apply(&[], Some(504), None, None),
             vec![Step::WriteReceipt]
         );
         assert_eq!(
             plan_apply(&[], None, None, Some(&admin("matt"))),
-            vec![
-                Step::CreateGroup,
-                Step::AddMember("matt".to_string()),
-                Step::WriteReceipt
-            ]
+            vec![Step::CreateGroup, Step::WriteReceipt]
         );
         assert_eq!(plan_revert(&[], None), vec![Step::DeleteReceipt]);
         assert_eq!(

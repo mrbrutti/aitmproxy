@@ -19,8 +19,10 @@ pub const CATEGORY: &str = "bpf";
 ///
 /// `Ok`: `"bpf-permissions applied: 256 nodes, group access_bpf, added matt"`;
 /// the user list is `nobody` when the receipt names no one and comma-separated
-/// otherwise; when the receipt carries `errors`, `", {n} nodes refused"` is
-/// appended. `Err`: `"{mode} failed: {reason}"`.
+/// otherwise, each name passed through [`str::escape_default`] so a control
+/// character in an account name cannot break the one-line shape; when the
+/// receipt carries `errors`, `", {n} nodes refused"` is appended. `Err`:
+/// `"{mode} failed: {reason}"`.
 #[must_use]
 pub fn run_line(mode: &str, r: &Result<Receipt, String>) -> String {
     match r {
@@ -28,7 +30,12 @@ pub fn run_line(mode: &str, r: &Result<Receipt, String>) -> String {
             let added = if receipt.members_added.is_empty() {
                 "nobody".to_string()
             } else {
-                receipt.members_added.join(", ")
+                receipt
+                    .members_added
+                    .iter()
+                    .map(|name| name.escape_default().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             };
             let mut line = format!(
                 "{mode} applied: {} nodes, group {}, added {added}",
@@ -157,9 +164,13 @@ mod tests {
     #[test]
     fn revert_line_literals() {
         assert_eq!(revert_line(&Ok(())), "bpf-revert done");
+        // The executor's failure text for a node (plan Rule 2: a noun phrase,
+        // never the name of a command).
         assert_eq!(
-            revert_line(&Err("chown /dev/bpf0: Operation not permitted".to_string())),
-            "bpf-revert failed: chown /dev/bpf0: Operation not permitted"
+            revert_line(&Err(
+                "owner of /dev/bpf0 not changed: Operation not permitted (os error 1)".to_string()
+            )),
+            "bpf-revert failed: owner of /dev/bpf0 not changed: Operation not permitted (os error 1)"
         );
     }
 
@@ -170,8 +181,21 @@ mod tests {
             run_line("bpf-permissions", &Err("boom".to_string())),
             revert_line(&Ok(())),
             revert_line(&Err("boom".to_string())),
+            run_line("bpf-permissions", &Ok(receipt(&["ma\ntt"], &[]))),
         ] {
             assert!(!line.contains('\n'), "{line:?}");
         }
+        // A control character in a member name is escaped, not emitted: the
+        // line stays one line and shows the escape literally.
+        let line = run_line(
+            "bpf-permissions",
+            &Ok(receipt(&["ma\ntt", "al\u{1b}ice"], &[])),
+        );
+        assert_eq!(
+            line,
+            "bpf-permissions applied: 256 nodes, group access_bpf, added ma\\ntt, al\\u{1b}ice"
+        );
+        assert!(line.contains("ma\\ntt"), "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
     }
 }

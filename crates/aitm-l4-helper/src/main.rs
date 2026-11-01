@@ -28,18 +28,17 @@ use std::process::ExitCode;
 
 /// Exit status for a rejected command line (the conventional usage code).
 const EXIT_USAGE: u8 = 2;
-/// Exit status when `probe` could not gather its inputs.
-const EXIT_PROBE_FAILED: u8 = 1;
-/// Exit status when `bpf-permissions` or `bpf-revert` (or their `--dry-run`)
-/// did not complete.
-const EXIT_BPF_FAILED: u8 = 1;
+/// Exit status when a mode ran on the right platform and did not complete:
+/// `probe` could not gather its inputs; `bpf-permissions` or `bpf-revert` (or
+/// their `--dry-run`) stopped on an error; `serve` start-up (spec §5.1 steps
+/// 1–6) failed, its effective capabilities could not be read, or the session
+/// ended on a protocol violation or a socket write failure. One constant for
+/// the three, used on every platform, so no `cfg` leaves it unused on
+/// another OS (quality finding QP2-I1).
+const EXIT_FAILED: u8 = 1;
 /// Exit status for a mode on a platform that cannot run it: a bpf mode where
 /// there is no `/dev/bpf*`, `serve` off Linux (`EX_UNAVAILABLE`).
 const EXIT_WRONG_PLATFORM: u8 = 69;
-/// Exit status when `serve` start-up (spec §5.1 steps 1–6) failed, or the
-/// session ended on a protocol violation or a socket write failure.
-#[cfg(target_os = "linux")]
-const EXIT_SERVE_FAILED: u8 = 1;
 
 /// Which of the two macOS permission modes was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +68,7 @@ fn main() -> ExitCode {
             }
             Err(err) => {
                 eprintln!("aitm-l4-helper: probe: {err}");
-                ExitCode::from(EXIT_PROBE_FAILED)
+                ExitCode::from(EXIT_FAILED)
             }
         },
         cli::Mode::BpfPermissions { dry_run } => run_bpf(BpfMode::Permissions, dry_run),
@@ -79,7 +78,9 @@ fn main() -> ExitCode {
 }
 
 /// `serve` on Linux (spec §5.1, §5.2): start-up first, which exits non-zero
-/// before any other I/O on failure; then the session over the real wire
+/// before any other I/O on failure; then the effective capability set is
+/// read from `/proc/self/status` (after the drop, so it is what the helper
+/// really holds) for `HelloAck.caps`; then the session over the real wire
 /// until the core closes the socket (exit 0) or breaks the protocol.
 #[cfg(target_os = "linux")]
 fn run_serve(connect: &std::path::Path) -> ExitCode {
@@ -90,14 +91,21 @@ fn run_serve(connect: &std::path::Path) -> ExitCode {
         Ok(stream) => stream,
         Err(err) => {
             eprintln!("aitm-l4-helper: serve: {err}");
-            return ExitCode::from(EXIT_SERVE_FAILED);
+            return ExitCode::from(EXIT_FAILED);
+        }
+    };
+    let caps = match probe::effective_caps() {
+        Ok(caps) => caps,
+        Err(err) => {
+            eprintln!("aitm-l4-helper: serve: {err}");
+            return ExitCode::from(EXIT_FAILED);
         }
     };
     let writer = match stream.try_clone() {
         Ok(writer) => writer,
         Err(err) => {
             eprintln!("aitm-l4-helper: serve: cannot clone the socket: {err}");
-            return ExitCode::from(EXIT_SERVE_FAILED);
+            return ExitCode::from(EXIT_FAILED);
         }
     };
     match serve_loop::serve_loop(
@@ -105,11 +113,12 @@ fn run_serve(connect: &std::path::Path) -> ExitCode {
         writer,
         Arc::new(serve_loop::PcapWire),
         env!("CARGO_PKG_VERSION"),
+        caps,
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(exit) => {
             eprintln!("aitm-l4-helper: serve: {exit}");
-            ExitCode::from(EXIT_SERVE_FAILED)
+            ExitCode::from(EXIT_FAILED)
         }
     }
 }
@@ -142,7 +151,7 @@ fn run_bpf(mode: BpfMode, dry_run: bool) -> ExitCode {
             }
             Err(err) => {
                 eprintln!("aitm-l4-helper: dry run: {err}");
-                ExitCode::from(EXIT_BPF_FAILED)
+                ExitCode::from(EXIT_FAILED)
             }
         };
     }
@@ -160,7 +169,7 @@ fn run_bpf(mode: BpfMode, dry_run: bool) -> ExitCode {
     if ok {
         ExitCode::SUCCESS
     } else {
-        ExitCode::from(EXIT_BPF_FAILED)
+        ExitCode::from(EXIT_FAILED)
     }
 }
 

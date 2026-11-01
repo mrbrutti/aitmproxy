@@ -52,7 +52,8 @@ pub struct PathMeta {
     pub is_dir: bool,
     pub is_symlink: bool,
     pub uid: u32,
-    /// The full `st_mode`; only the low nine permission bits are compared.
+    /// The full `st_mode`; the twelve mode bits (`& 0o7777`) are compared,
+    /// the file-type bits above them are not.
     pub mode: u32,
 }
 
@@ -75,7 +76,8 @@ impl PathMeta {
 
 /// Spec §5.1 step 4: the socket is a Unix socket and not a symlink; its
 /// directory is a directory, not a symlink, owned by the invoking user, mode
-/// exactly 0700. Checked only after the drop, as the invoking user.
+/// exactly 0700 (all twelve mode bits, so setuid/setgid/sticky are refused).
+/// Checked only after the drop, as the invoking user.
 pub fn check_socket_path(sock: &PathMeta, dir: &PathMeta, invoking: u32) -> Result<(), String> {
     if sock.is_symlink {
         return Err("socket path is a symlink".to_string());
@@ -95,9 +97,11 @@ pub fn check_socket_path(sock: &PathMeta, dir: &PathMeta, invoking: u32) -> Resu
             dir.uid
         ));
     }
-    let perm = dir.mode & 0o777;
-    if perm != 0o700 {
-        return Err(format!("socket directory mode is {perm:04o}, not 0700"));
+    // All twelve mode bits: a setuid, setgid or sticky bit is not "0700"
+    // (spec S3, plan A12).
+    let mode = dir.mode & 0o7777;
+    if mode != 0o700 {
+        return Err(format!("socket directory mode is {mode:04o}, not 0700"));
     }
     Ok(())
 }
@@ -577,22 +581,27 @@ mod tests {
     }
 
     #[test]
-    fn tester_special_mode_bits_on_the_directory_are_ignored_by_design() {
-        // Only the low nine bits are compared (the existing design, see
-        // `mode_check_compares_only_the_permission_bits`): a setuid, setgid
-        // or sticky bit on an otherwise 0700 directory passes. Tester finding
-        // for the panel: spec §5.1 says "mode 0700"; decide whether the
-        // special bits should refuse too.
-        for mode in [0o044_700_u32, 0o042_700, 0o041_700, 0o047_700] {
+    fn tester_special_mode_bits_on_the_directory_are_refused_naming_the_mode() {
+        // Spec §5.1 step 4 says "mode 0700" and means it (spec amendment S3,
+        // plan A12): a setuid, setgid or sticky bit on an otherwise 0700
+        // directory is refused, and the message shows the four-digit mode.
+        for (mode, text) in [
+            (0o044_700_u32, "socket directory mode is 4700, not 0700"),
+            (0o042_700, "socket directory mode is 2700, not 0700"),
+            (0o041_700, "socket directory mode is 1700, not 0700"),
+            (0o047_700, "socket directory mode is 7700, not 0700"),
+        ] {
             assert_eq!(
                 check_socket_path(&good_socket(), &PathMeta { mode, ..good_dir() }, 1000),
-                Ok(()),
+                Err(text.to_string()),
                 "{mode:o}"
             );
         }
-        // Any difference in the nine bits is refused, naming those bits only.
+        // Any difference in the nine permission bits is refused too, naming
+        // the twelve mode bits and nothing of the file type.
         for (mode, text) in [
-            (0o044_000_u32, "socket directory mode is 0000, not 0700"),
+            (0o044_000_u32, "socket directory mode is 4000, not 0700"),
+            (0o040_000, "socket directory mode is 0000, not 0700"),
             (0o040_777, "socket directory mode is 0777, not 0700"),
             (0o040_600, "socket directory mode is 0600, not 0700"),
             (0o040_701, "socket directory mode is 0701, not 0700"),

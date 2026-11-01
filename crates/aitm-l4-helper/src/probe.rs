@@ -44,6 +44,33 @@ pub fn probe_json(cap_eff: Option<u64>, bpf_rw: Option<bool>) -> String {
     line
 }
 
+/// The names of the capabilities set in `cap_eff` that the core understands,
+/// in ascending bit order: `CAP_NET_ADMIN` (bit 12) and `CAP_NET_RAW` (bit
+/// 13). Any other bit has no name here and is left out; `0` is an empty list.
+/// This is what `serve` reports in `HelloAck.caps` (spec §5.2, S3): the
+/// effective set as read, never a literal.
+#[cfg(any(target_os = "linux", test))]
+pub fn cap_names(cap_eff: u64) -> Vec<String> {
+    [
+        (CAP_NET_ADMIN_BIT, "CAP_NET_ADMIN"),
+        (CAP_NET_RAW_BIT, "CAP_NET_RAW"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| cap_eff & (1u64 << bit) != 0)
+    .map(|(_, name)| name.to_string())
+    .collect()
+}
+
+/// The names of this process's effective capabilities, from
+/// `/proc/self/status`; empty when the line is absent or the set is empty.
+///
+/// # Errors
+/// `/proc/self/status` could not be read.
+#[cfg(target_os = "linux")]
+pub fn effective_caps() -> Result<Vec<String>, String> {
+    read_cap_eff().map(|cap_eff| cap_names(cap_eff.unwrap_or(0)))
+}
+
 /// Gather this host's inputs and format the line. Reads only: on Linux
 /// `/proc/self/status`; on macOS it opens `/dev/bpf0` read-write and drops the
 /// handle at once, which changes no state. `Err` carries a one-sentence
@@ -214,6 +241,32 @@ mod tests {
         assert_eq!(parse_cap_eff("CapPrm:\t0000000000002000\n"), None);
         assert_eq!(parse_cap_eff(""), None);
         assert_eq!(parse_cap_eff("CapEff:\tnot-hex\n"), None);
+    }
+
+    #[test]
+    fn cap_names_lists_the_set_bits_the_core_understands() {
+        // `HelloAck.caps` is the effective set (spec §5.2, S3; plan A12):
+        // nothing for an empty set, the two names the core knows for bits 12
+        // and 13 in ascending bit order, and nothing for any other bit.
+        assert_eq!(cap_names(0), Vec::<String>::new());
+        assert_eq!(cap_names(1 << 13), vec!["CAP_NET_RAW".to_string()]);
+        assert_eq!(cap_names(1 << 12), vec!["CAP_NET_ADMIN".to_string()]);
+        assert_eq!(
+            cap_names(0x3000),
+            vec!["CAP_NET_ADMIN".to_string(), "CAP_NET_RAW".to_string()]
+        );
+        assert_eq!(
+            cap_names(u64::MAX),
+            vec!["CAP_NET_ADMIN".to_string(), "CAP_NET_RAW".to_string()]
+        );
+        assert_eq!(cap_names(!0x3000), Vec::<String>::new());
+        assert_eq!(cap_names((1 << 11) | (1 << 14)), Vec::<String>::new());
+        // From a /proc/self/status excerpt of a helper after the drop.
+        let eff = parse_cap_eff("CapEff:\t0000000000002000\n").unwrap_or(0);
+        assert_eq!(cap_names(eff), vec!["CAP_NET_RAW".to_string()]);
+        // And of one that lost everything (AC17: an unprivileged run).
+        let eff = parse_cap_eff("CapEff:\t0000000000000000\n").unwrap_or(0);
+        assert_eq!(cap_names(eff), Vec::<String>::new());
     }
 
     #[test]
