@@ -6,7 +6,12 @@
 //! [`ProbeResponse`], [`Frame`] and [`L4Reply`] are **in-process** types passed
 //! between a lane's `ProbeHost` and a `Check` (plan call A8); they carry raw
 //! bodies and unredacted headers, so they deliberately have no serde derives and
-//! cannot be serialised onto the bus by accident.
+//! cannot be serialised onto the bus by accident. Their `Debug` impls are
+//! hand-written to print header *names* with `<redacted>` values and bodies as
+//! byte lengths (as `SessionMaterial` does), so a `{:?}` in a log line cannot
+//! leak a cookie, a token or a response body either.
+
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -107,8 +112,23 @@ pub struct SiteNode {
     pub audited: bool,
 }
 
+/// `Debug` helper: header names with every value replaced by `<redacted>`.
+fn redact_headers(pairs: &[(String, String)]) -> Vec<String> {
+    pairs
+        .iter()
+        .map(|(name, _)| format!("{name}=<redacted>"))
+        .collect()
+}
+
+/// `Debug` helper: a body or payload shown only as its length.
+fn byte_len(bytes: &[u8]) -> String {
+    format!("<{} bytes>", bytes.len())
+}
+
 /// A payload a check asks its `ProbeHost` to insert. In-process only (call A8).
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints `value` and `bytes` as byte lengths, never their contents.
+#[derive(Clone)]
 pub struct Payload {
     /// The textual payload.
     pub value: String,
@@ -118,8 +138,20 @@ pub struct Payload {
     pub bytes: Option<Vec<u8>>,
 }
 
+impl fmt::Debug for Payload {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Payload")
+            .field("value", &byte_len(self.value.as_bytes()))
+            .field("mode", &self.mode)
+            .field("bytes", &self.bytes.as_deref().map(byte_len))
+            .finish()
+    }
+}
+
 /// A fully specified request a check builds itself. In-process only (call A8).
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints header names with `<redacted>` values and the body as a length.
+#[derive(Clone)]
 pub struct RawProbe {
     /// The request method.
     pub method: String,
@@ -131,10 +163,22 @@ pub struct RawProbe {
     pub body: Vec<u8>,
 }
 
+impl fmt::Debug for RawProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RawProbe")
+            .field("method", &self.method)
+            .field("url", &self.url)
+            .field("headers", &redact_headers(&self.headers))
+            .field("body", &byte_len(&self.body))
+            .finish()
+    }
+}
+
 /// What a probe got back. In-process only (call A8).
 ///
 /// `body` is bounded at [`MAX_MATCH_BODY`] by the lane before a check sees it.
-#[derive(Debug, Clone)]
+/// `Debug` prints header names with `<redacted>` values and the body as a length.
+#[derive(Clone)]
 pub struct ProbeResponse {
     /// The HTTP status, absent for lanes that have none.
     pub status: Option<u16>,
@@ -152,8 +196,24 @@ pub struct ProbeResponse {
     pub l4: Option<L4Reply>,
 }
 
+impl fmt::Debug for ProbeResponse {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProbeResponse")
+            .field("status", &self.status)
+            .field("headers", &redact_headers(&self.headers))
+            .field("body", &byte_len(&self.body))
+            .field("elapsed_ms", &self.elapsed_ms)
+            .field("flow", &self.flow)
+            .field("ws_frames", &self.ws_frames)
+            .field("l4", &self.l4)
+            .finish()
+    }
+}
+
 /// One WebSocket frame. In-process only (call A8).
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the payload as a length, never its contents.
+#[derive(Clone)]
 pub struct Frame {
     /// The frame's opcode class.
     pub kind: FrameKind,
@@ -161,8 +221,17 @@ pub struct Frame {
     pub payload: Vec<u8>,
 }
 
+impl fmt::Debug for Frame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Frame")
+            .field("kind", &self.kind)
+            .field("payload", &byte_len(&self.payload))
+            .finish()
+    }
+}
+
 /// The WebSocket opcode classes a lane surfaces. In-process only (call A8).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FrameKind {
     /// A text frame.
     Text,
@@ -233,5 +302,73 @@ mod tests {
         assert!(!node.auth);
         assert_eq!(node.points, 0);
         assert!(!node.audited);
+    }
+
+    /// Panel S3 — the in-process probe types carry unredacted headers and raw
+    /// bodies; their `Debug` must print header *names* with `<redacted>` values
+    /// and bodies as byte lengths, so a `{:?}` in a log line cannot leak a
+    /// cookie or a `set-cookie` value (mirrors `SessionMaterial`).
+    #[test]
+    fn probe_types_debug_redacts_header_values_and_bodies() {
+        let probe = RawProbe {
+            method: "GET".into(),
+            url: "http://127.0.0.1:8080/account".into(),
+            headers: vec![("cookie".into(), "sid=s3cr3t".into())],
+            body: b"body-s3cr3t".to_vec(),
+        };
+        let shown = format!("{probe:?}");
+        assert!(shown.contains("cookie"), "header name kept: {shown}");
+        assert!(shown.contains("<redacted>"), "value redacted: {shown}");
+        assert!(!shown.contains("s3cr3t"), "value leaked: {shown}");
+        assert!(shown.contains("11 bytes"), "body as a length: {shown}");
+
+        let response = ProbeResponse {
+            status: Some(200),
+            headers: vec![("set-cookie".into(), "sid=s3cr3t; HttpOnly".into())],
+            body: b"<html>s3cr3t</html>".to_vec(),
+            elapsed_ms: 12,
+            flow: None,
+            ws_frames: Some(vec![Frame {
+                kind: FrameKind::Text,
+                payload: b"s3cr3t".to_vec(),
+            }]),
+            l4: None,
+        };
+        let shown = format!("{response:?}");
+        assert!(shown.contains("set-cookie"), "header name kept: {shown}");
+        assert!(shown.contains("<redacted>"), "value redacted: {shown}");
+        assert!(!shown.contains("s3cr3t"), "value leaked: {shown}");
+        assert!(shown.contains("19 bytes"), "body as a length: {shown}");
+        assert!(
+            shown.contains("6 bytes"),
+            "frame payload as a length: {shown}"
+        );
+        assert!(shown.contains("Text"), "frame kind kept: {shown}");
+
+        let payload = Payload {
+            value: "' OR 's3cr3t'='s3cr3t".into(),
+            mode: PayloadMode::Replace,
+            bytes: Some(vec![0xde, 0xad]),
+        };
+        let shown = format!("{payload:?}");
+        assert!(!shown.contains("s3cr3t"), "payload text leaked: {shown}");
+        assert!(shown.contains("21 bytes"), "value as a length: {shown}");
+        assert!(shown.contains("2 bytes"), "bytes as a length: {shown}");
+        assert!(shown.contains("Replace"), "mode kept: {shown}");
+    }
+
+    /// Panel Q5 — `FrameKind` is a plain opcode class: copyable, comparable and
+    /// hashable like every other vocabulary enum.
+    #[test]
+    fn frame_kind_is_copy_eq_hash() {
+        let kind = FrameKind::Binary;
+        let copy = kind;
+        assert_eq!(kind, copy);
+        assert_ne!(FrameKind::Ping, FrameKind::Pong);
+        let set: std::collections::HashSet<FrameKind> =
+            [FrameKind::Text, FrameKind::Text, FrameKind::Close]
+                .into_iter()
+                .collect();
+        assert_eq!(set.len(), 2);
     }
 }

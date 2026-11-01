@@ -25,7 +25,8 @@ use std::sync::{Arc, OnceLock};
 
 use aitm_core::{
     ActionPermit, BrowserDriver, ClearOutcome, ClickTarget, Flow, FlowId, FlowQuery, FlowStore,
-    GuardError, HttpFlow, HttpRequest, NavOutcome, ProxyClient, ScopeEntry, ScopeRateGuard, Value,
+    GuardError, HttpFlow, HttpRequest, NavOutcome, ProxyClient, ScopeEntry, ScopeRateGuard,
+    SendOptions, Value,
 };
 use futures::future::BoxFuture;
 
@@ -129,11 +130,29 @@ impl FlowStore for LateHandles {
     }
 }
 
+/// What both client verbs answer until the proxy binds its client.
+fn not_running_yet() -> BoxFuture<'static, anyhow::Result<HttpFlow>> {
+    Box::pin(async { anyhow::bail!("the proxy is not running yet") })
+}
+
 impl ProxyClient for LateHandles {
     fn send(&self, req: HttpRequest) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
         match self.client.get() {
             Some(client) => client.send(req),
-            None => Box::pin(async { anyhow::bail!("the proxy is not running yet") }),
+            None => not_running_yet(),
+        }
+    }
+
+    /// Forward the options too: the trait default would drop them and call
+    /// `send`, recording every probe a bulk sender asked not to keep.
+    fn send_opts(
+        &self,
+        req: HttpRequest,
+        opts: SendOptions,
+    ) -> BoxFuture<'_, anyhow::Result<HttpFlow>> {
+        match self.client.get() {
+            Some(client) => client.send_opts(req, opts),
+            None => not_running_yet(),
         }
     }
 }
@@ -260,6 +279,110 @@ mod tests {
                 body: aitm_core::Body::Empty,
                 timestamp: std::time::SystemTime::now(),
             })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not running yet"), "{err}");
+    }
+
+    /// Always answers 200 without touching the network.
+    struct OkSender;
+
+    impl aitm_core::RequestSender for OkSender {
+        fn send(
+            &self,
+            _req: &HttpRequest,
+        ) -> BoxFuture<'_, anyhow::Result<aitm_core::HttpResponse>> {
+            Box::pin(async {
+                Ok(aitm_core::HttpResponse {
+                    status: 200,
+                    version: aitm_core::HttpVersion::Http11,
+                    headers: aitm_core::HeaderMap::new(),
+                    trailers: aitm_core::HeaderMap::new(),
+                    body: aitm_core::Body::Empty,
+                    timestamp: std::time::SystemTime::now(),
+                })
+            })
+        }
+    }
+
+    fn get_ex_test() -> HttpRequest {
+        HttpRequest {
+            method: "GET".into(),
+            scheme: "http".into(),
+            authority: "ex.test".into(),
+            path: "/".into(),
+            version: aitm_core::HttpVersion::Http11,
+            headers: aitm_core::HeaderMap::new(),
+            body: aitm_core::Body::Empty,
+            timestamp: std::time::SystemTime::now(),
+        }
+    }
+
+    /// Panel S2 — `send_opts` must reach the bound client with its options
+    /// intact: a `record: Never` send leaves the store empty (a bulk sender's
+    /// probes must not flood it), and an `Always` send's marks reach the
+    /// stored flow. The trait default would silently record every send.
+    #[tokio::test]
+    async fn bound_handles_forward_send_opts() {
+        use aitm_core::{
+            MemFlowStore, PipelineClient, RecordPolicy, SendOptions, StdGuard, VersionPolicy,
+        };
+
+        let store = Arc::new(MemFlowStore::new());
+        let guard = Arc::new(StdGuard::default());
+        guard.add_scope(ScopeEntry {
+            host: "ex.test".into(),
+        });
+        let client = Arc::new(PipelineClient::new(
+            store.clone(),
+            guard.clone(),
+            Arc::new(OkSender),
+        ));
+        let handles = LateHandles::new();
+        handles.bind_proxy(store.clone(), client, guard);
+
+        let flow = handles
+            .send_opts(
+                get_ex_test(),
+                SendOptions {
+                    record: RecordPolicy::Never,
+                    marks: vec!["scan:job1".into()],
+                    version: VersionPolicy::Auto,
+                },
+            )
+            .await
+            .expect("bound send succeeds");
+        assert!(flow.metadata.is_replay);
+        assert_eq!(store.count(), 0, "record: Never must not store the flow");
+
+        let flow = handles
+            .send_opts(
+                get_ex_test(),
+                SendOptions {
+                    record: RecordPolicy::Always,
+                    marks: vec!["scan:job1".into(), "crawl".into()],
+                    version: VersionPolicy::Auto,
+                },
+            )
+            .await
+            .expect("bound send succeeds");
+        assert_eq!(store.count(), 1);
+        match store.get(flow.id).expect("stored") {
+            Flow::Http(stored) => assert_eq!(
+                stored.metadata.marks,
+                vec!["scan:job1".to_string(), "crawl".to_string()]
+            ),
+            _ => panic!("expected an HTTP flow"),
+        }
+    }
+
+    /// Panel S2 — unbound, `send_opts` errors the same way `send` does rather
+    /// than falling through to a default that pretends to send.
+    #[tokio::test]
+    async fn unbound_send_opts_errors_like_send() {
+        let handles = LateHandles::new();
+        let err = handles
+            .send_opts(get_ex_test(), aitm_core::SendOptions::default())
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not running yet"), "{err}");

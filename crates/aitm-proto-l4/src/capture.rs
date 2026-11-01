@@ -38,7 +38,7 @@ use etherparse::{NetSlice, TransportSlice};
 use crate::backend::{CaptureInjectBackend, L4Error};
 use crate::craft::PacketSpec;
 use crate::flow::{L4Bind, L4Flow, L4FlowId, L4FlowKind, L4FlowStore, L4Meta, L4Packet};
-use crate::guard::{L4Guard, L4Permit};
+use crate::guard::{interface_covers, L4Guard, L4Permit};
 use crate::types::{
     IpCidr, L4Action, L4Capability, L4Direction, L4Proto, L4ScopeEntry, L4Target, PortRange,
 };
@@ -307,7 +307,7 @@ pub fn scope_filter(guard: &L4Guard, interface: &str) -> Option<String> {
     let entries: Vec<L4ScopeEntry> = guard
         .list_scope()
         .into_iter()
-        .filter(|e| e.capability == L4Capability::Capture && e.interface == interface)
+        .filter(|e| e.capability == L4Capability::Capture && interface_covers(e, interface))
         .collect();
     if entries.is_empty() {
         return None;
@@ -637,6 +637,27 @@ mod tests {
         assert_eq!(
             scope_filter(&g, MOCK_IFACE),
             Some("(host 127.0.0.1) or (host 127.0.0.2)".to_string())
+        );
+    }
+
+    /// Panel S1 — a `"*"` Capture entry authorises its CIDR on every interface,
+    /// so the BPF filter for this interface must include it; a literal entry on
+    /// another interface must not contribute.
+    #[test]
+    fn scope_filter_includes_wildcard_interface_entries() {
+        let g = guard_with(vec![
+            L4ScopeEntry {
+                interface: crate::guard::ANY_INTERFACE.to_string(),
+                ..entry(("127.0.0.5", 32), (0, u16::MAX), L4Capability::Capture)
+            },
+            L4ScopeEntry {
+                interface: "other0".to_string(),
+                ..entry(("127.0.0.9", 32), (0, u16::MAX), L4Capability::Capture)
+            },
+        ]);
+        assert_eq!(
+            scope_filter(&g, MOCK_IFACE),
+            Some("host 127.0.0.5".to_string())
         );
     }
 

@@ -515,6 +515,16 @@ fn describe(target: &L4Target) -> String {
 /// cannot widen its own match by naming the wildcard.
 pub const ANY_INTERFACE: &str = "*";
 
+/// Whether `entry` covers the interface `iface`: true when the entry's
+/// `interface` is [`ANY_INTERFACE`] or is exactly `iface`. The one predicate
+/// the guard's location match, the capture BPF filter and the command confirm
+/// summary all share, so the wildcard cannot be honoured in one place and
+/// forgotten in another (panel S1).
+#[must_use]
+pub fn interface_covers(entry: &L4ScopeEntry, iface: &str) -> bool {
+    entry.interface == ANY_INTERFACE || entry.interface == iface
+}
+
 /// Whether a scope entry matches the target's *location* — interface + direction,
 /// plus CIDR and (for Tcp/Udp) port when the target carries them. Capability is
 /// checked separately so "no entry here" and "entry here, wrong capability" are
@@ -524,8 +534,7 @@ pub const ANY_INTERFACE: &str = "*";
 /// (`"*"`) for any target interface; otherwise the two strings must be equal.
 /// Direction, CIDR and port matching are unaffected by the wildcard.
 fn entry_matches_location(entry: &L4ScopeEntry, target: &L4Target) -> bool {
-    let interface_ok = entry.interface == ANY_INTERFACE || entry.interface == target.interface;
-    if !interface_ok || entry.direction != target.direction {
+    if !interface_covers(entry, &target.interface) || entry.direction != target.direction {
         return false;
     }
     if let Some(dst) = target.dst {
@@ -1340,6 +1349,46 @@ mod tests {
                 &target("", L4Direction::Outbound, "10.1.2.3", 6379)
             ),
             Err(L4GuardError::OutOfL4Scope(_))
+        ));
+    }
+
+    /// Panel S1 — the one interface-wildcard predicate every caller shares:
+    /// a `"*"` entry covers any interface (including an unnamed one), a literal
+    /// entry covers only its own name, and a *target* named `"*"` is not a
+    /// wildcard (entry-side only).
+    #[test]
+    fn interface_covers_is_entry_side_only() {
+        let wild = entry(
+            ("10.0.0.0", 8),
+            ANY_INTERFACE,
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (1, 1),
+        );
+        assert!(interface_covers(&wild, "en0"));
+        assert!(interface_covers(&wild, ""));
+        assert!(interface_covers(&wild, "*"));
+
+        let literal = entry(
+            ("10.0.0.0", 8),
+            "lo0",
+            L4Direction::Outbound,
+            L4Capability::Inject,
+            (1, 1),
+        );
+        assert!(interface_covers(&literal, "lo0"));
+        assert!(!interface_covers(&literal, "en0"));
+        assert!(!interface_covers(&literal, ""));
+        assert!(!interface_covers(&literal, "*"));
+
+        // The location match in `check` goes through the same predicate.
+        assert!(entry_matches_location(
+            &wild,
+            &target("en0", L4Direction::Outbound, "10.1.2.3", 80)
+        ));
+        assert!(!entry_matches_location(
+            &literal,
+            &target("*", L4Direction::Outbound, "10.1.2.3", 80)
         ));
     }
 }
