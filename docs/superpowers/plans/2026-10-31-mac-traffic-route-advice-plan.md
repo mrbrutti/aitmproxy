@@ -296,6 +296,7 @@ greps, Task 6, and the diff review.
       public var decrypting: Bool
       public var advice: String?
       public init(scopeHosts: Int, decrypting: Bool, advice: String?)
+      public static let adviceDisplayLimit: Int   // 512 (stage-6 S2 cap; named per stage-6 delta SP-D3)
       public init?(json: JSONValue)   // nil unless the object carries "scope_hosts" AND scope_hosts >= 0 (stage-6 S3); "decrypting" defaults to scopeHosts > 0; "advice" null → nil; empty or whitespace-only → nil (ruling 2026-11-01); a present advice has its line breaks flattened to one space and is capped at 512 characters (stage-6 S2)
   }
   ```
@@ -671,7 +672,7 @@ greps, Task 6, and the diff review.
   shows the CA step, and Task 2b removes it)
 - **Files:**
   - `apps/mac/Sources/Aitmproxy/Shell/RouteBanner.swift` (create)
-  - `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (modify — two hunks only)
+  - `apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` (modify — hunks only inside `MainView` and `EmptyFlows`; stage-6 Q6/Q7 made it eight: `flows`, `listPane(_:routes:)` ×2, `flowTable(routes:)` ×2, the `openSettings` environment read, `EmptyFlows`)
   - `apps/mac/Sources/Aitmproxy/Panels/StatusPanel.swift` (modify — the `.help` line + one switch case; spec D7 states the whole footprint once)
 - **Change:**
 
@@ -755,9 +756,8 @@ greps, Task 6, and the diff review.
 
 - **Test:** none in Kit by construction. Sandbox structural checks the Coder quotes:
   `git diff <wave-C-base> -- apps/mac/Sources/Aitmproxy/Shell/ShellView.swift` shows hunks only
-  inside `MainView.flows` and `EmptyFlows` (+ the one-argument change at the `flowTable` overlay
-  call, which sits inside `flowTable`, `ShellView.swift:258` — report it as the third hunk, it is the `EmptyFlows`
-  call site named in D7); `sed -n 49,62p` before and after identical;
+  inside `MainView` (`flows`, `listPane(_:routes:)`, `flowTable(routes:)`, the `openSettings` environment read —
+  stage-6 Q6/Q7 thread `routes` and `run` down, eight hunks at HEAD) and `EmptyFlows`; `sed -n 49,62p` before and after identical;
   `grep -cE 'ExtensionController[[:space:]]*\(' …/ShellView.swift` → `1`;
   `grep -c 'ScopeBanner()' …/ShellView.swift` → `0`; `grep -c 'AppsAttributionBanner()' …/ShellView.swift` → `0`;
   `grep -c 'RouteBanner(' …/ShellView.swift` → `1` (the call is `RouteBanner(routes: routes)` after stage-6 Q6); `grep -c 'struct AppsAttributionBanner: View' …/ShellView.swift` → `1`;
@@ -801,7 +801,8 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   pins are untouched. Header comment notes spec D8.
   - Rule 1: a second grep with an opening-quote prefix pattern,
     `prefixes='"(system proxy off|system proxy on|All Apps on|All Apps off|All Apps waiting|All Apps degraded|Nothing is decrypted|Scope:|HTTPS is not captured|Trust the aitmproxy CA|CA trusted|trusting CA|CA trust needs)'`,
-    same scan root and exclusions as `words`, same FAIL message family
+    same scan root, the `///` and SelfTest exclusions, **no** `FilterRow(` exclusion (none applies to a route
+    prefix; stage-6 Q11), same FAIL message family
     ("a view spells a route word; read it from ConnectionSummary.routes instead") — the message names the
     rule that fired and the exclusion list is the one shared variable, not a second copy (stage-6 Q11).
   - Rule 2: unchanged.
@@ -1056,9 +1057,22 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
   grid-lint-exit=0
   ```
 
-  Rust gate at `6ebc9e8f` (Terminal): `FMT_OK`, `CLIPPY_OK`; `cargo test` result quoted in the PR panel
-  comment. The stage-6 fix commit re-runs the same gate; its lines are `cargo test` exit 0, 265 test binaries ok (Terminal, rust-gate.log) and
-  its SHA stamped into the Review log.
+  Rust gate at `6ebc9e8f` (Terminal, `/tmp/claude/attr/rust-gate.log`): `FMT_OK`, `CLIPPY_OK`, `cargo test`
+  exit 0, 265 test binaries `test result: ok`; no Rust file changes in the range, so the fix commit does not re-run it.
+
+  **Gate record for the final head `6985dd6f`** (stage-6 fix commit `544fcc3f` + docs; Terminal,
+  `/tmp/claude/attr/gate-routes.log`, header `== 6985dd6f Sun Nov  1 14:08:48 PST 2026`):
+
+  ```
+  ✔ Test run with 630 tests in 77 suites passed after 0.880 seconds.
+  ✔ Test run with 31 tests in 6 suites passed after 0.559 seconds.
+  swift-test-exit=0
+  check-connection-words-exit=0
+  check-capture-operator-only-exit=0
+  check-capture-toggle-exit=0
+  check-ca-trust-path-exit=0
+  grid-lint-exit=0
+  ```
 - **Test:** the screenshots and files above exist and show the literal lines named; the Tester's
   report quotes the `scutil` dumps, the bus replies and (PR4 build) the `diff` result.
 - **Done when:** every TR-AC10(a)/11/13(a)/17/19 clause has its named file, `A2-deferred-to-PR4.txt`
@@ -1082,7 +1096,7 @@ Spec TR-AC14 is deleted; the task number is kept so the waves and the Review log
 | `Aitmproxy/Session.swift` (two properties) | | | M | | | | |
 | `Aitmproxy/Session+Connection.swift` | | | M (on PR D's SHA) | M (after T2) | | | |
 | `Aitmproxy/Shell/RouteBanner.swift` (new) | | | | | C | M (`.trustCA` → `session.trustCA()`, after T3) | |
-| `Aitmproxy/Shell/ShellView.swift` (two hunks + the `EmptyFlows` call; two old banner call sites removed) | | | | | M | | |
+| `Aitmproxy/Shell/ShellView.swift` (hunks inside `MainView` + `EmptyFlows` only; two old banner call sites removed) | | | | | M | | |
 | `Aitmproxy/Panels/StatusPanel.swift` (`.help` line + `.addScopeHost` case; PR D hand-over removal) | | | | M (after T3) | M | | |
 | `apps/mac/tools/check-connection-words.sh` | | | | | | M | |
 | `apps/mac/tools/check-capture-toggle.sh` (NS-AC8 banner pins; on the fixture-removal mac SHA) | | | | | | M | |
@@ -1338,6 +1352,10 @@ named in Shipped.
 | PR #265 | quality | Minor | Q13 — a magic step count and positional `steps[n]` indexing in the step tests | fixed in 544fcc3f: steps looked up by kind |
 | PR #265 | quality | Minor | Q14 — `FlowRow.tls` and `tunnel` are independent stored fields | accepted by design (orchestrator 2026-11-01): `tls` has non-tunnel sources (the scheme rule on rows without `tunnel`, every row from an older core); noted in spec D2 (stage-6 docs pass) |
 | PR #265 | quality | Minor | Q15 — `Session.systemProxy` is declared but never written | accepted by design (spec D6, plan call 4): PR4 writes it; nil = unknown, never "off" |
+| PR #265 | quality (delta re-verification of `544fcc3f`) | Minor | QD1 — the "blank advice is no sentence" predicate is spelled twice (`DecryptStatus.displayAdvice` and `make`'s Scope derivation, the second so the memberwise init cannot smuggle a blank in) | accepted (belt and braces, one comment says why); follow-up in Shipped: one `DecryptStatus.sentence` read by both |
+| PR #265 | quality (delta re-verification of `544fcc3f`) | Minor | QD2 — the trust-button gate predicate `action == .trustCA && !controlLive` is spelled twice in `RouteBanner.swift` (banner button, empty-state row) | accepted (two call sites in one file); follow-up in Shipped: one `RouteActions.isEnabled(_:controlLive:)` |
+| PR #265 | quality (delta re-verification of `544fcc3f`) | Minor | QD3 — positional `steps[2]` remains in `TrafficRouteTesterTests` (every such case passes a non-nil `systemProxy` and asserts the kind first, so the index is self-checking) | accepted; follow-up in Shipped: look the step up by kind as `ConnectionSummaryTests` does |
+| PR #265 | security (delta re-verification of `544fcc3f`) | — | S1/S2/S3 verified fixed at HEAD; tripwires re-run green on HEAD incl. `check-ca-trust-path.sh --self-check`; no `unsafe` in range | PASS, 0 open |
 | PR #265 | spec | Important | SP-I1 — the blank-advice rule lived only in the decoder, and the plan's memberwise `advice: ""` test was absent, so a memberwise-built `DecryptStatus` would print an empty Scope line | fixed in 544fcc3f: `make`'s Scope derivation guards a blank advice and the `ConnectionSummaryTests` memberwise-`""` case is added; docs: spec D3/TR-AC21 say both layers normalise, plan Task 1 (stage-6 docs pass) |
 | PR #265 | spec | Important | SP-I2 — no quoted Swift gate for the head commit in the plan | fixed in docs (stage-6 docs pass): Task 6 "Gate record for the stage-6 head commit `6ebc9e8f`" quotes `/tmp/claude/attr/gate-routes.log` — `✔ Test run with 624 tests in 77 suites passed`, `✔ Test run with 31 tests in 6 suites passed`, `swift-test-exit=0`, `check-connection-words-exit=0`, `check-capture-operator-only-exit=0`, `check-capture-toggle-exit=0`, `check-ca-trust-path-exit=0`, `grid-lint-exit=0`; the same lines sit on the e58b267a rows above; Rust gate at `6ebc9e8f`: `FMT_OK`, `CLIPPY_OK`, `cargo test` result `cargo test` exit 0, 265 test binaries ok (Terminal, rust-gate.log) |
 | PR #265 | spec | Minor | SP-M3 — the `TrafficRoutes` signature in spec D2 / plan Task 1 differed from the shipped one (`banner`, `bannerAction`, `bannerDetail` are computed from `shown`; the init is `(systemProxy:allApps:scope:caTrust:advice:shown:)`) | fixed in docs (stage-6 docs pass): spec D2, D5, Left to the builder; plan Task 1 |
@@ -1345,6 +1363,10 @@ named in Shipped.
 | PR #265 | spec | Minor | SP-M5 — TR-AC18's `.off`-led `shown` literal (`[.systemProxy, .allApps, .scope, .caTrust]`) was not pinned by a test | fixed in 544fcc3f: the test is added; spec TR-AC18 notes the pin (stage-6 docs pass) |
 | PR #265 | spec | Minor | SP-M6 — Half A's header-offset numbers (≈141 px vs ≈110 px at an unknown scale) do not establish the 28 pt figure | fixed in docs (stage-6 docs pass): Task 6 "As run" reads "one banner row, not two; the 28 pt measurement is Half B's B4 (AX frame or known-scale shot)" |
 | PR #265 | spec | Minor | SP-M7 — gate 3 blank; coverage row 17 and three Task 6 paragraphs still said "NOT-trusted only" against the TR-AC17 TRUSTED ruling | fixed in docs (stage-6 docs pass): gate 3 = PR #254 / `58724ef7`; the Environment hard-gate paragraph, Task 6's Satisfies and Change paragraphs and coverage row 17 aligned with the ruling (the hard-gate text — no `ca.install`, no clicks — unchanged) |
+| PR #265 | spec (delta re-verification of `544fcc3f`) | Minor | SP-D1 — D7/TR-AC8/Task 3/file table said "two hunks only" in `ShellView.swift`; Q6/Q7 made it eight, all inside `MainView` and `EmptyFlows` | fixed in docs (this commit): wording = "hunks only inside `MainView` (`flows`, `listPane`, `flowTable`, `openSettings`) and `EmptyFlows`" |
+| PR #265 | spec (delta re-verification of `544fcc3f`) | Minor | SP-D2 — Task 5 said the route-prefix rule shares the `words` exclusions; Q11 dropped the `FilterRow(` exclusion | fixed in docs (this commit) |
+| PR #265 | spec (delta re-verification of `544fcc3f`) | Minor | SP-D3 — new public `DecryptStatus.adviceDisplayLimit` not named in spec D2 / plan Task 1 | fixed in docs (this commit): named in both |
+| PR #265 | spec (delta re-verification of `544fcc3f`) | — | SP-I1/I2, SP-M3–M7 verified fixed; files of `544fcc3f` all inside the file-disjointness table / Task 5 grant; `ShellView` 49–62 identical, `ExtensionController(` ×1, banner counts 1/0/0 | PASS, 0 Critical, 0 Important |
 
 ## Shipped
 
@@ -1371,3 +1393,6 @@ Pre-filled 2026-11-01 — facts the stage-7 entry carries forward:
      `"network"` / `"app.badge"` string literals in `RouteBanner.swift` (quality Q10).
   4. PR4 (system-proxy session) writes `Session.systemProxy` and fills `.setSystemProxy` (quality Q15, by design); the
      Task 6 PR4 addendum (TR-AC10(b)/12/13(b)) runs on its first build.
+  5. One `DecryptStatus.sentence` (blank → nil) read by `displayAdvice` and `make`'s Scope derivation (quality QD1).
+  6. One `RouteActions.isEnabled(_:controlLive:)` for the trust-button gate in `RouteBanner.swift` (quality QD2).
+  7. `TrafficRouteTesterTests`: look the system-proxy step up by kind instead of `steps[2]` (quality QD3).
