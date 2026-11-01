@@ -34,6 +34,9 @@ use crate::ui::text::{cells, elide_middle, fit, right, truncate, width};
 
 /// Blank cells between columns.
 const GAP: usize = 2;
+/// [`GAP`] as the text the header and the rows write between columns.
+const GAP_TEXT: &str = "  ";
+const _: () = assert!(GAP_TEXT.len() == GAP, "GAP_TEXT spells GAP cells");
 /// The Detail pane's footer (D11).
 const FOOTER: &str = "x cancel · ⏎ issues of this job · s start · m map";
 
@@ -179,7 +182,7 @@ fn list(
 /// middle two only in the full layout.
 fn header(theme: &Theme, cols: &Columns) -> Line<'static> {
     let style = theme.text_secondary();
-    let gap = " ".repeat(GAP);
+    let gap = GAP_TEXT;
     let mut spans = vec![Span::styled(format!(" {}", fit("job", cols.job)), style)];
     if cols.full {
         spans.push(Span::styled(
@@ -215,7 +218,7 @@ fn row_line(
     state: Option<JobState>,
     under_cursor: bool,
 ) -> Line<'static> {
-    let gap = " ".repeat(GAP);
+    let gap = GAP_TEXT;
     let mark = if under_cursor { ">" } else { " " };
     let mut spans = vec![
         Span::styled(mark.to_string(), theme.accent()),
@@ -231,7 +234,7 @@ fn row_line(
             theme.text_secondary(),
         ));
     }
-    spans.push(Span::raw(" ".repeat(GAP)));
+    spans.push(Span::raw(GAP_TEXT));
     spans.push(Span::styled(
         fit(&row.state_phase, cols.state),
         state_style(theme, state),

@@ -6,7 +6,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 
 use crate::app::App;
@@ -51,7 +51,7 @@ impl Family {
 
     /// D13, hue only on data: the call-name line reads in the hue of its
     /// family, the accent for a scan launch and the L4 hue for an L4 verb.
-    fn hue(self, theme: &Theme) -> ratatui::style::Style {
+    fn hue(self, theme: &Theme) -> Style {
         match self {
             Family::Scan => theme.accent(),
             Family::L4 => theme.l4(),

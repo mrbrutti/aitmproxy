@@ -28,11 +28,13 @@ pub struct JobsState {
     /// for a job not yet here puts it at the front until the next list, which
     /// drops it unless it is marked.
     pub order: Vec<JobId>,
-    /// The summary of every job in `order`. Invariant, kept by
-    /// [`JobsState::fold_status`] and [`JobsState::fold_list`]:
-    /// `full.keys() ⊆ summaries.keys() ⊆ order` (a status fold writes both
-    /// maps and `order`; a list fold retains both maps to `order`), so the
-    /// walks read `order` alone and a key of either map is always a row.
+    /// The summary of every listed job. Every key is in `order`; an `order`
+    /// id started here and not yet answered has none (`row_of` draws it as
+    /// `...`). Invariant, kept by [`JobsState::fold_status`] and
+    /// [`JobsState::fold_list`]: `full.keys() ⊆ summaries.keys() ⊆ order`
+    /// (a status fold writes both maps and `order`; a list fold retains
+    /// both maps to `order`), so the walks read `order` alone and a key of
+    /// either map is always a row.
     pub summaries: BTreeMap<JobId, JobSummary>,
     /// Full status for the jobs `scan.status` has answered for; every key
     /// is in `summaries` and in `order` (see `summaries`).
@@ -44,7 +46,9 @@ pub struct JobsState {
     /// [`super::MAX_STATUS_FOLLOWUPS`] cap): [`JobsState::live`] rotates
     /// `order` here and [`JobsState::advance_poll`] moves it past the jobs
     /// a firing attempted, so with `n` live jobs every one is reached within
-    /// `ceil(n / 16)` firings instead of the first 16 starving the rest.
+    /// `ceil((n - 1) / 15)` firings while the cursor's job is live (it rides
+    /// at the front out of turn, taking one of the 16 slots) and
+    /// `ceil(n / 16)` otherwise, instead of the first 16 starving the rest.
     pub poll_offset: usize,
     /// Scroll offset of the Detail pane.
     pub detail_scroll: u16,
@@ -152,17 +156,16 @@ impl JobsState {
     pub fn live(&self) -> Vec<JobId> {
         let n = self.order.len();
         let start = if n == 0 { 0 } else { self.poll_offset % n };
-        let mut ids: Vec<JobId> = Vec::with_capacity(n);
         let under_cursor = self.order.get(self.cursor);
-        for id in under_cursor
-            .into_iter()
-            .chain(&self.order[start..])
-            .chain(&self.order[..start])
-        {
-            if Some(id) != under_cursor || ids.is_empty() {
-                ids.push(id.clone());
-            }
-        }
+        let mut ids: Vec<JobId> = Vec::with_capacity(n);
+        ids.extend(under_cursor.cloned());
+        ids.extend(
+            self.order[start..]
+                .iter()
+                .chain(&self.order[..start])
+                .filter(|id| Some(*id) != under_cursor)
+                .cloned(),
+        );
         ids.retain(|id| self.state_of(id).is_some_and(|s| !s.is_terminal()));
         ids
     }
@@ -171,8 +174,10 @@ impl JobsState {
     /// the prefix of [`JobsState::live`] the cap let through, in flight or
     /// sent): the next firing starts at the `order` entry after the last one
     /// walked. The cursor's job rides at the front out of turn, so it is
-    /// skipped unless it is all the firing reached. A job no longer in
-    /// `order` leaves the offset where it was.
+    /// skipped unless it is all the firing reached; with it live each
+    /// firing advances the walk by 15, so `n` live jobs are all reached
+    /// within `ceil((n - 1) / 15)` firings, `ceil(n / 16)` without it. A
+    /// job no longer in `order` leaves the offset where it was.
     pub fn advance_poll(&mut self, polled: &[JobId]) {
         let cursor = self.cursor_job();
         let last = polled
@@ -204,9 +209,11 @@ impl JobsState {
     }
 
     /// The Detail pane's `label value` lines for the cursor's job: the
-    /// [`detail_lines`] of its full status, or the one placeholder line
-    /// (an empty label) while no `scan.status` has answered. The view draws
-    /// exactly these under the id line.
+    /// lines of its full status (lanes, started by, probes, crawl, points,
+    /// checks, session, then `clamped`, `stopped`, `error` and `l4` when
+    /// present), or the one placeholder line (an empty label) while no
+    /// `scan.status` has answered. The view draws exactly these under the
+    /// id line; [`JobsState::detail_len`] counts them without building them.
     pub fn detail_text(&self) -> Vec<(&'static str, String)> {
         match self.cursor_job().and_then(|id| self.full.get(id)) {
             Some(status) => detail_lines(status),
@@ -216,8 +223,7 @@ impl JobsState {
 
     /// How many lines the Detail pane has for the cursor's job: the id line
     /// plus [`JobsState::detail_text`]'s count, counted without building the
-    /// lines ([`detail_line_count`]). The reducer clamps `detail_scroll` to
-    /// it on every key.
+    /// lines. The reducer clamps `detail_scroll` to it on every key.
     pub fn detail_len(&self) -> usize {
         1 + self
             .cursor_job()
@@ -227,7 +233,7 @@ impl JobsState {
 }
 
 /// The Detail pane's one line while no `scan.status` has answered.
-pub const WAITING_FOR_STATUS: &str = "waiting for scan.status...";
+const WAITING_FOR_STATUS: &str = "waiting for scan.status...";
 
 /// The widest a `profile` cell grows before it is cut (the column cap, and
 /// the bound [`JobsState::fold_status`] applies to the core's string).
@@ -437,7 +443,7 @@ pub fn severity_bar(b: &BySeverity, cells: usize) -> String {
 /// How many lines [`detail_lines`] gives `status`, without building them:
 /// the seven fixed lines plus one each for `clamped`, `stopped`, `error`
 /// and `l4` when present. Kept in step with `detail_lines` by its unit test.
-pub fn detail_line_count(status: &JobStatus) -> usize {
+fn detail_line_count(status: &JobStatus) -> usize {
     DETAIL_FIXED_LINES
         + usize::from(!status.clamped.is_empty())
         + usize::from(status.stopped_reason.is_some())
@@ -453,7 +459,9 @@ const DETAIL_FIXED_LINES: usize = 7;
 /// requested/run/skipped with reasons, who started it, the probe, crawl,
 /// point and check counters, the session, then `clamped`, `stopped`,
 /// `error` and `l4` only when present. Plain text; the view styles the label.
-pub fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
+/// Read through [`JobsState::detail_text`], the one public reading of the
+/// pane (fix round E, E5).
+fn detail_lines(status: &JobStatus) -> Vec<(&'static str, String)> {
     let mut lines = Vec::with_capacity(DETAIL_FIXED_LINES + 4);
     let lanes = &status.lanes;
     let mut lane_text = format!(

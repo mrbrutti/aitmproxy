@@ -1414,11 +1414,14 @@ impl App {
             | Action::Home
             | Action::End => self.navigate(&action, &mut out),
             Action::Left | Action::Right => {
-                let d: i32 = if action == Action::Left { -1 } else { 1 };
                 let dir = if action == Action::Left {
                     Dir::Prev
                 } else {
                     Dir::Next
+                };
+                let d: i32 = match dir {
+                    Dir::Prev => -1,
+                    Dir::Next => 1,
                 };
                 match self.mode {
                     Mode::Edit => {

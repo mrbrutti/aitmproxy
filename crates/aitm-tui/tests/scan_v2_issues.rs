@@ -1,8 +1,8 @@
 //! Scanner v2 TUI, plan task 7: the Issues tab's list half (spec D6, D10,
 //! D11, D13).
 //!
-//! Entering Issues, any filter change and every twentieth tick while a job is
-//! live fetch `scan.issues {filters, limit: 512}`; the reply renders grouped
+//! Entering Issues, any filter change and, while a job is live, twenty ticks
+//! after the last fetch read `scan.issues {filters, limit: 512}`; the reply renders grouped
 //! under the five severity headers with their `by_severity` counts; the
 //! cursor landing on a row reads `scan.issue {id}` when `read` lacks the id
 //! and no read is pending; a reply fills `read`, a fold prunes it to the
@@ -605,21 +605,10 @@ fn a_page_of_oversized_ids_is_dropped_without_a_read() {
 fn read_never_outgrows_the_page() {
     let mut app = app();
     let _ = app.update(Action::ScanTab(ScanTab::Issues));
-    let template = fixture("scan.issues.json")["issues"][0].clone();
-    for page_no in 0..100u32 {
-        let rows: Vec<Value> = (0..100u32)
-            .map(|k| {
-                let mut row = template.clone();
-                row["id"] = json!(format!("issue-{:08x}", page_no * 100 + k));
-                row
-            })
-            .collect();
-        let first = rows[0]["id"].as_str().unwrap_or_default().to_string();
-        let reqs = app.on_bus(issues_reply(json!({
-            "issues": rows,
-            "next_cursor": null,
-            "by_severity": { "critical": 0, "high": 100, "medium": 0, "low": 0, "info": 0 },
-        })));
+    for page_no in 0..100usize {
+        let id_of = |k: usize| format!("issue-{:08x}", page_no * 100 + k);
+        let first = id_of(0);
+        let reqs = app.on_bus(issues_reply(page_of(100, id_of)));
         assert_eq!(reqs, vec![issue_request(&first)]);
         let _ = app.on_bus(issue_reply(&first));
     }
@@ -833,19 +822,7 @@ fn rows_are_bounded_at_fold_time() {
     assert_eq!(line.matches('N').count(), 39, "{line:?}");
     assert!(line.contains("N…"), "{line:?}");
 
-    let template = fixture("scan.issues.json")["issues"][0].clone();
-    let rows: Vec<Value> = (0..600u32)
-        .map(|k| {
-            let mut row = template.clone();
-            row["id"] = json!(format!("issue-{k:08x}"));
-            row
-        })
-        .collect();
-    let _ = app.on_bus(issues_reply(json!({
-        "issues": rows,
-        "next_cursor": null,
-        "by_severity": { "critical": 0, "high": 600, "medium": 0, "low": 0, "info": 0 },
-    })));
+    let _ = app.on_bus(issues_reply(page_of(600, |k| format!("issue-{k:08x}"))));
     assert_eq!(app.scan.issues.list.len(), 512);
     assert_eq!(app.scan.issues.rows.len(), 512);
 }

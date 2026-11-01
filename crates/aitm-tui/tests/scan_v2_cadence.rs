@@ -100,6 +100,22 @@ fn running_body(id: &str) -> Value {
     body
 }
 
+/// Forty running jobs as a `scan.list` body: their ids, in list order, and
+/// the reply value.
+fn forty_running_jobs() -> (Vec<String>, Value) {
+    let template = fixture("scan.list.json")["jobs"][0].clone();
+    let ids: Vec<String> = (0..40).map(|n| format!("scan-000000{n:02}")).collect();
+    let jobs: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            let mut row = template.clone();
+            row["job"] = json!(id);
+            row
+        })
+        .collect();
+    (ids, json!({ "jobs": jobs }))
+}
+
 /// The `scan.status {job}` request under its keyed tag.
 fn status_request(job: &str) -> BusRequest {
     BusRequest::CallTagged {
@@ -528,22 +544,6 @@ fn status_followups_are_capped_per_fold_and_per_firing() {
     let distinct: BTreeSet<&String> = first.iter().chain(second.iter()).collect();
     assert_eq!(distinct.len(), 32, "none duplicated");
     assert_eq!(app.scan.inflight.len(), 32);
-}
-
-/// Forty running jobs as a `scan.list` body: their ids, in list order, and
-/// the reply value.
-fn forty_running_jobs() -> (Vec<String>, Value) {
-    let template = fixture("scan.list.json")["jobs"][0].clone();
-    let ids: Vec<String> = (0..40).map(|n| format!("scan-000000{n:02}")).collect();
-    let jobs: Vec<Value> = ids
-        .iter()
-        .map(|id| {
-            let mut row = template.clone();
-            row["job"] = json!(id);
-            row
-        })
-        .collect();
-    (ids, json!({ "jobs": jobs }))
 }
 
 /// Fix round C, C2: under the 16-cap the status walk starts at a rotating
