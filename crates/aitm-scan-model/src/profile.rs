@@ -394,11 +394,8 @@ pub enum L4Seed {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct L4SeedRaw {
-    #[serde(default)]
     flow: Option<FlowRef>,
-    #[serde(default)]
     hex: Option<String>,
-    #[serde(default)]
     base64: Option<String>,
 }
 
@@ -406,30 +403,28 @@ impl TryFrom<L4SeedRaw> for L4Seed {
     type Error = String;
 
     fn try_from(raw: L4SeedRaw) -> Result<Self, Self::Error> {
-        let present: Vec<&str> = [
-            raw.flow.is_some().then_some("flow"),
-            raw.hex.is_some().then_some("hex"),
-            raw.base64.is_some().then_some("base64"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
         match (raw.flow, raw.hex, raw.base64) {
             (Some(flow), None, None) => Ok(L4Seed::Flow { flow }),
             (None, Some(hex), None) => Ok(L4Seed::Hex { hex }),
             (None, None, Some(base64)) => Ok(L4Seed::Base64 { base64 }),
-            _ if present.is_empty() => Err(
+            (None, None, None) => Err(
                 "an L4 seed needs exactly one of `flow`, `hex` or `base64`; none was given"
                     .to_string(),
             ),
-            _ => Err(format!(
-                "an L4 seed needs exactly one of `flow`, `hex` or `base64`; got {}",
-                present
-                    .iter()
-                    .map(|k| format!("`{k}`"))
-                    .collect::<Vec<_>>()
-                    .join(" and ")
-            )),
+            (flow, hex, base64) => {
+                let present: Vec<&str> = [
+                    flow.is_some().then_some("`flow`"),
+                    hex.is_some().then_some("`hex`"),
+                    base64.is_some().then_some("`base64`"),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                Err(format!(
+                    "an L4 seed needs exactly one of `flow`, `hex` or `base64`; got {}",
+                    present.join(" and ")
+                ))
+            }
         }
     }
 }

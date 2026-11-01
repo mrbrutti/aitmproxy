@@ -246,7 +246,9 @@ pub enum FrameKind {
 }
 
 /// What an L4 case got back, with the oracle's reading of it. In-process (A8).
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints `bytes` as a length, never its contents.
+#[derive(Clone)]
 pub struct L4Reply {
     /// The bytes received, empty on silence.
     pub bytes: Vec<u8>,
@@ -254,6 +256,16 @@ pub struct L4Reply {
     pub oracle: L4Oracle,
     /// Wall-clock time from send to reply or timeout.
     pub elapsed_ms: u32,
+}
+
+impl fmt::Debug for L4Reply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("L4Reply")
+            .field("bytes", &byte_len(&self.bytes))
+            .field("oracle", &self.oracle)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -344,6 +356,34 @@ mod tests {
             "frame payload as a length: {shown}"
         );
         assert!(shown.contains("Text"), "frame kind kept: {shown}");
+
+        let reply = L4Reply {
+            bytes: b"s3cr3t-l4".to_vec(),
+            oracle: L4Oracle::Reset,
+            elapsed_ms: 7,
+        };
+        let shown = format!("{reply:?}");
+        assert!(!shown.contains("s3cr3t"), "L4 bytes leaked: {shown}");
+        assert!(
+            shown.contains("<9 bytes>"),
+            "L4 bytes as a length, not a byte list: {shown}"
+        );
+        assert!(
+            !shown.contains("115"),
+            "L4 bytes listed as numbers: {shown}"
+        );
+        assert!(shown.contains("Reset"), "oracle kept: {shown}");
+        assert!(shown.contains("elapsed_ms: 7"), "elapsed kept: {shown}");
+        let response = ProbeResponse {
+            l4: Some(reply),
+            ..response
+        };
+        let shown = format!("{response:?}");
+        assert!(!shown.contains("s3cr3t"), "nested L4 bytes leaked: {shown}");
+        assert!(
+            shown.contains("<9 bytes>"),
+            "nested L4 bytes as a length: {shown}"
+        );
 
         let payload = Payload {
             value: "' OR 's3cr3t'='s3cr3t".into(),

@@ -40,6 +40,7 @@ use std::sync::Arc;
 use aitm_core::{Command, CommandHost, ParamSchema, Params, TypeDesc, Value};
 
 use crate::flow::L4FlowId;
+use crate::guard::interface_covers;
 use crate::types::{IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, PortRange};
 
 pub use crate::gates::{AgentGate, L4AgentGates};
@@ -458,7 +459,7 @@ pub(crate) fn covering_scope_entry(
     port: Option<u16>,
 ) -> Option<L4ScopeEntry> {
     guard.list_scope().into_iter().find(|e| {
-        crate::guard::interface_covers(e, iface)
+        interface_covers(e, iface)
             && e.direction == dir
             && e.capability == cap
             && dst.is_none_or(|ip| cidr_display_contains(&e.cidr, ip))

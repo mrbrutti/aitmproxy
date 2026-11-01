@@ -268,19 +268,7 @@ mod tests {
         assert!(handles.get(FlowId::new()).is_none());
         let err = handles.navigate("http://ex.test/").await.unwrap_err();
         assert!(err.to_string().contains("no browser engine"), "{err}");
-        let err = handles
-            .send(HttpRequest {
-                method: "GET".into(),
-                scheme: "http".into(),
-                authority: "ex.test".into(),
-                path: "/".into(),
-                version: aitm_core::HttpVersion::Http11,
-                headers: aitm_core::HeaderMap::new(),
-                body: aitm_core::Body::Empty,
-                timestamp: std::time::SystemTime::now(),
-            })
-            .await
-            .unwrap_err();
+        let err = handles.send(get_ex_test()).await.unwrap_err();
         assert!(err.to_string().contains("not running yet"), "{err}");
     }
 
