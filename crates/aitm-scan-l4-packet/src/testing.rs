@@ -243,9 +243,10 @@ impl MockBackend {
     }
 
     /// Answer at most one [`MockReply::Icmp`] per `window` per target and stay
-    /// silent in between, the way a target host's kernel rate-limits the ICMP
-    /// errors it generates (Linux: `net.ipv4.icmp_ratelimit = 1000` ms per
-    /// destination, the observation behind spec amendment 46).
+    /// silent in between, the way a remote target's kernel rate-limits the
+    /// ICMP errors it generates (Linux: `net.ipv4.icmp_ratelimit = 1000` ms per
+    /// destination, the remote-host behaviour spec amendment 46 paces for;
+    /// loopback is exempt, write-up `2026-11-01-t5-live-proof.md` section iii).
     ///
     /// The self-echo is unaffected: the capture still reads the injected frame
     /// first, exactly as loopback delivers it, whether or not an ICMP error

@@ -112,22 +112,19 @@ pub struct CaseRecord {
 /// alone does not carry.
 ///
 /// Today there is one: a silent case on a point whose baseline is an ICMP
-/// error. The target host's kernel rate-limits the errors it generates, so the
+/// error. A remote target's kernel rate-limits the errors it generates, so the
 /// silence is the rate limiter, not the service; the case is recorded with the
 /// note, is no crash candidate, and spends no liveness probe (spec D8.4,
-/// amendment 46). The note carries no wire bytes, so `Debug` prints it whole.
+/// amendment 46). Every reason is a unit variant, so the only labels that can
+/// exist are the ones [`CaseNote::label`] spells. The note carries no wire
+/// bytes, so `Debug` prints it whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaseNote {
-    /// Nothing came back, and the lane knows why.
-    NoReply {
-        /// The reason, as the operator reads it: [`ICMP_RATELIMIT`].
-        reason: &'static str,
-    },
+    /// Nothing came back on an ICMP-paced point: the target host's kernel
+    /// rate-limits the ICMP errors it answers with. The operator reads it as
+    /// `no_reply (icmp_ratelimit)`.
+    IcmpRatelimit,
 }
-
-/// The reason of a [`CaseNote::NoReply`] on an ICMP-paced point: the target
-/// host's kernel rate-limits the ICMP errors it answers with.
-pub const ICMP_RATELIMIT: &str = "icmp_ratelimit";
 
 impl CaseNote {
     /// The note as the operator reads it in a verdict detail:
@@ -135,7 +132,7 @@ impl CaseNote {
     #[must_use]
     pub fn label(&self) -> String {
         match *self {
-            CaseNote::NoReply { reason } => format!("no_reply ({reason})"),
+            CaseNote::IcmpRatelimit => "no_reply (icmp_ratelimit)".to_string(),
         }
     }
 }
@@ -377,11 +374,17 @@ impl PointRun {
 
     /// How many of the run's cases carry the `no_reply (icmp_ratelimit)` note
     /// of amendment 46: silent cases on a point whose baseline is an ICMP
-    /// error, which the target host's kernel rate-limited.
+    /// error, which the target host's kernel rate-limited. Counts that note
+    /// alone, so a note of another kind is never mistaken for it.
     #[must_use]
     pub fn no_reply_count(&self) -> u32 {
-        u32::try_from(self.cases.iter().filter(|case| case.note.is_some()).count())
-            .unwrap_or(u32::MAX)
+        u32::try_from(
+            self.cases
+                .iter()
+                .filter(|case| matches!(case.note, Some(CaseNote::IcmpRatelimit)))
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
     }
 
     /// How many of the run's cases came back outside the latency window.
@@ -1109,24 +1112,17 @@ mod tests {
         assert!(printed.contains("4 bytes"), "{printed}");
     }
 
-    /// Tester (T5 stage 5, amendment 46): the note's operator wording is
-    /// `no_reply (icmp_ratelimit)` — the string the crash and reaction details
-    /// are asserted on — `no_reply_count` counts noted cases and nothing else,
-    /// and `Debug` prints the note while still hiding the wire bytes.
+    /// Tester (T5 stage 5, amendment 46) and the quality panel: the note is a
+    /// unit variant whose operator wording is `no_reply (icmp_ratelimit)` —
+    /// the string the crash and reaction details are asserted on —
+    /// `no_reply_count` counts the `IcmpRatelimit` cases and nothing else, and
+    /// `Debug` prints the note while still hiding the wire bytes.
     #[test]
     fn case_note_label_counts_and_debug() {
-        assert_eq!(
-            CaseNote::NoReply {
-                reason: ICMP_RATELIMIT
-            }
-            .label(),
-            "no_reply (icmp_ratelimit)"
-        );
+        assert_eq!(CaseNote::IcmpRatelimit.label(), "no_reply (icmp_ratelimit)");
 
         let mut noted = case(1, CaseClass::Silence);
-        noted.note = Some(CaseNote::NoReply {
-            reason: ICMP_RATELIMIT,
-        });
+        noted.note = Some(CaseNote::IcmpRatelimit);
         let run = PointRun {
             point_id: "p0".to_string(),
             target: "127.0.0.1:9/udp".to_string(),
@@ -1168,7 +1164,7 @@ mod tests {
 
         let printed = format!("{noted:?}");
         assert!(
-            printed.contains("NoReply") && printed.contains("icmp_ratelimit"),
+            printed.contains("note: Some(IcmpRatelimit)"),
             "the note is printed: {printed}"
         );
         assert!(!printed.contains("deadbeef"), "the hex is not: {printed}");

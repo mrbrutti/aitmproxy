@@ -524,9 +524,7 @@ mod tests {
     use crate::fields::FieldPath;
     use crate::host::{PacketHost, PointRunner, RunnerRegistry};
     use crate::oracle::CaseClass;
-    use crate::state::{
-        Candidate, CaseNote, CaseOutcome, CaseRecord, PointRun, StopReason, ICMP_RATELIMIT,
-    };
+    use crate::state::{Candidate, CaseNote, CaseOutcome, CaseRecord, PointRun, StopReason};
     use crate::testing::harness::{runner_for, setup};
     use crate::testing::{
         fields, l4_profile, tcp_target, udp_target, with_hex_seed, MockBackend, MockReply, TestJob,
@@ -1476,9 +1474,7 @@ mod tests {
                 note,
             }
         }
-        let noted = Some(CaseNote::NoReply {
-            reason: ICMP_RATELIMIT,
-        });
+        let noted = Some(CaseNote::IcmpRatelimit);
         let run = PointRun {
             point_id: "p0".to_string(),
             target: "127.0.0.1:9/udp".to_string(),

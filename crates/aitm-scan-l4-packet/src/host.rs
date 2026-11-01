@@ -46,7 +46,7 @@ use crate::plan::{is_decodable, send_recv_spec, PlanError, SeedSpec, TargetPlan}
 use crate::rng::{derive_seed, Rng};
 use crate::state::{
     report_counters, Candidate, CaseNote, CaseOutcome, CaseRecord, CrashRecord, LaneState,
-    PointRun, StopReason, ICMP_RATELIMIT,
+    PointRun, StopReason,
 };
 use crate::sync::lock;
 
@@ -61,12 +61,15 @@ pub const RECOVERY_WAIT: Duration = Duration::from_secs(10);
 /// ICMP-baseline point, whatever the profile asks for (spec amendment 46; D11's
 /// `scanner.ceilings.l4_icmp_pace_ms_min`).
 ///
-/// A target host's kernel rate-limits the ICMP errors it generates — Linux
-/// defaults to `net.ipv4.icmp_ratelimit = 1000` ms per destination — so a point
+/// A remote target's kernel rate-limits the ICMP errors it generates — Linux
+/// defaults to `net.ipv4.icmp_ratelimit = 1000` ms per destination; loopback is
+/// exempt (write-up `2026-11-01-t5-live-proof.md`, section iii) — so a point
 /// stimulated faster than this reads silence where the port is simply closed.
 /// The engine clamps the profile value up to D11's ceiling and reports it in
 /// `scan.start`'s `clamped`; until it passes its ceilings to the lane, the lane
-/// applies this floor itself so no lane caller can under-pace a closed port.
+/// applies this floor itself. The only way under it is [`Timing::icmp_pace`],
+/// and that field is crate-private, so no lane caller can under-pace a closed
+/// port.
 pub const ICMP_PACE_FLOOR_MS: u32 = 1000;
 
 /// Every wait and ceiling the fuzz loop obeys. Set by the lane (plan call C3),
@@ -92,14 +95,14 @@ pub struct Timing {
     pub max_raw_bytes: usize,
     /// How many cases a dry run renders.
     pub dry_run_cases: u32,
-    /// A test's own ICMP pace, replacing both the profile's `icmp_pace_ms` and
-    /// [`ICMP_PACE_FLOOR_MS`]. `None` — the production value — means the
+    /// This crate's own ICMP pace, replacing both the profile's `icmp_pace_ms`
+    /// and [`ICMP_PACE_FLOOR_MS`]. `None` — the production value — means the
     /// profile's, never below the floor (see [`Timing::icmp_pace_for`]).
     ///
-    /// Test-only: honoured in `cfg(test)` builds; a release build always
-    /// applies the floor (spec D11), so no lane caller can under-pace a closed
-    /// port through [`crate::PacketLane::with_timing`].
-    pub icmp_pace: Option<Duration>,
+    /// Crate-private: only the in-crate test harness (`fast_timing`) sets it,
+    /// so a caller of [`crate::PacketLane::with_timing`] cannot under-pace a
+    /// closed port (spec D11); the floor holds by construction.
+    pub(crate) icmp_pace: Option<Duration>,
 }
 
 impl Default for Timing {
@@ -126,25 +129,13 @@ impl Timing {
 
     /// How far apart consecutive stimuli to an ICMP-baseline point are spaced
     /// (spec amendment 46): the profile's `l4.icmp_pace_ms`, raised to
-    /// [`ICMP_PACE_FLOOR_MS`] when it is below it. The [`Timing::icmp_pace`]
-    /// override replaces that in `cfg(test)` builds only; a release build
-    /// always paces at the floored value (spec D11).
+    /// [`ICMP_PACE_FLOOR_MS`] when it is below it, unless the crate-private
+    /// [`Timing::icmp_pace`] override is set.
     #[must_use]
     pub fn icmp_pace_for(&self, options: &L4Options) -> Duration {
         let floored =
             Duration::from_millis(u64::from(options.icmp_pace_ms.max(ICMP_PACE_FLOOR_MS)));
-        pace_with(self.icmp_pace, floored, cfg!(test))
-    }
-}
-
-/// The pace an ICMP-baseline point obeys: the test override, but only in a
-/// test build; otherwise `floored`, the profile value already raised to
-/// [`ICMP_PACE_FLOOR_MS`]. Pure, so the release arm is testable from a
-/// `cfg(test)` build.
-fn pace_with(test_override: Option<Duration>, floored: Duration, test_build: bool) -> Duration {
-    match test_override {
-        Some(pace) if test_build => pace,
-        _ => floored,
+        self.icmp_pace.unwrap_or(floored)
     }
 }
 
@@ -753,9 +744,7 @@ impl PointRunner {
         // limiter, not a service that stopped answering: it is recorded as
         // `no_reply (icmp_ratelimit)` and judged no further (amendment 46).
         if classified.class == CaseClass::Silence && self.is_icmp_paced() {
-            record.note = Some(CaseNote::NoReply {
-                reason: ICMP_RATELIMIT,
-            });
+            record.note = Some(CaseNote::IcmpRatelimit);
         }
         let stop = if counted == Counted::Case {
             self.shared
@@ -3172,9 +3161,9 @@ mod tests {
     }
 
     /// Amendment 46: the pace a point obeys is the profile's, never below the
-    /// lane's defensive floor, and in a test build the override replaces both
+    /// lane's defensive floor, and the crate-private override replaces both
     /// (so a unit test costs milliseconds instead of twenty seconds; see
-    /// `pace_override_is_bounded_to_test_builds` for the release arm).
+    /// `pace_override_is_crate_private_and_floor_holds_otherwise`).
     #[test]
     fn profile_pace_below_the_floor_is_raised() {
         assert_eq!(super::ICMP_PACE_FLOOR_MS, 1000);
@@ -3218,52 +3207,37 @@ mod tests {
     }
 
     /// Tester F2 (spec D11: "the packet lane applies the same floor itself so
-    /// no lane caller can under-pace a closed port"). `Timing::icmp_pace` is a
-    /// `pub` field reachable through `PacketLane::with_timing`, so the
-    /// override is honoured in `cfg(test)` builds only; a release build always
-    /// paces at the floored profile value, whatever the override says. The
-    /// release arm cannot run under `cfg(test)`, so the rule is pinned on the
-    /// pure helper `icmp_pace_for` goes through, over all four combinations.
+    /// no lane caller can under-pace a closed port") and the quality panel:
+    /// `Timing::icmp_pace` is `pub(crate)`, so no caller of
+    /// `PacketLane::with_timing` outside this crate can set it and the floor
+    /// holds by construction for every lane caller. In-crate, the override
+    /// replaces the floored profile value — how `fast_timing` keeps a unit
+    /// test at milliseconds — and without one the floored value stands.
     #[test]
-    fn pace_override_is_bounded_to_test_builds() {
-        let floored = Duration::from_millis(1000);
-        let zero = Some(Duration::ZERO);
-
-        assert_eq!(
-            super::pace_with(zero, floored, true),
-            Duration::ZERO,
-            "a test build honours the override"
-        );
-        assert_eq!(
-            super::pace_with(None, floored, true),
-            floored,
-            "a test build without an override paces at the floored value"
-        );
-        assert_eq!(
-            super::pace_with(zero, floored, false),
-            floored,
-            "a release build ignores the override: the floor always applies"
-        );
-        assert_eq!(
-            super::pace_with(None, floored, false),
-            floored,
-            "a release build without an override paces at the floored value"
-        );
-
-        // `icmp_pace_for` is the `cfg!(test)` arm of the helper, so here the
-        // override is honoured and the floor still raises a profile value.
+    fn pace_override_is_crate_private_and_floor_holds_otherwise() {
         let options = L4Options {
             icmp_pace_ms: 0,
             ..L4Options::default()
         };
-        let timing = Timing {
-            icmp_pace: zero,
+
+        let overridden = Timing {
+            icmp_pace: Some(Duration::ZERO),
             ..Timing::default()
         };
-        assert_eq!(timing.icmp_pace_for(&options), Duration::ZERO);
         assert_eq!(
-            Timing::default().icmp_pace_for(&options),
-            Duration::from_millis(1000)
+            overridden.icmp_pace_for(&options),
+            Duration::ZERO,
+            "an in-crate override is honoured as written"
+        );
+
+        let production = Timing {
+            icmp_pace: None,
+            ..Timing::default()
+        };
+        assert_eq!(
+            production.icmp_pace_for(&options),
+            Duration::from_millis(1000),
+            "without an override the profile value is raised to the floor"
         );
     }
 
@@ -3282,8 +3256,9 @@ mod tests {
     /// Amendment 46, the differential half. A target host whose kernel
     /// rate-limits ICMP errors (Linux: `net.ipv4.icmp_ratelimit = 1000` ms per
     /// destination) answers at most one stimulus per window, so an **unpaced**
-    /// run against a closed port reads mostly silence — the shape the first
-    /// Linux rig run showed. Every such silence is recorded as
+    /// run against a closed port reads mostly silence — the shape a
+    /// rate-limiting remote host shows (the rig's loopback is exempt; write-up
+    /// `2026-11-01-t5-live-proof.md`, section iii). Every such silence is recorded as
     /// `no_reply (icmp_ratelimit)`, spends no liveness probe and is no crash
     /// candidate: a closed port can never yield `l4-crash` (spec D8.4).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3325,9 +3300,7 @@ mod tests {
         for case in &silent {
             assert_eq!(
                 case.note,
-                Some(CaseNote::NoReply {
-                    reason: "icmp_ratelimit"
-                }),
+                Some(CaseNote::IcmpRatelimit),
                 "case {} is silence on an ICMP-paced point",
                 case.index
             );

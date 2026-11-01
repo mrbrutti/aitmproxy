@@ -34,16 +34,20 @@
 //!   the default the run would still pass, but every permit past the first
 //!   hundred would wait on the rate limiter instead of measuring the service.
 //!   `max_packet_bytes` and `max_packets_per_call` stay at their defaults.
-//! * **ICMP generation is rate-limited, so the lane paces the point.** On
-//!   macOS `net.inet.icmp.icmplim` (default 250 per second) sits far above the
-//!   20 cases the reaction tests send. Linux limits ICMP errors per
-//!   destination (`net.ipv4.icmp_ratelimit`, 1000 ms between errors to one
-//!   peer after a small burst, with `icmp_ratemask` covering
+//! * **ICMP generation is rate-limited on a remote host, so the lane paces
+//!   the point.** On macOS `net.inet.icmp.icmplim` (default 250 per second)
+//!   sits far above the 20 cases the reaction tests send. Linux limits ICMP
+//!   errors per destination (`net.ipv4.icmp_ratelimit`, 1000 ms between
+//!   errors to one peer after a small burst, with `icmp_ratemask` covering
 //!   destination-unreachable, plus the global
 //!   `icmp_msgs_per_sec`/`icmp_msgs_burst` budget the lane's liveness probes
-//!   draw from as well), and the first real rig run read most cases as
-//!   `silence` because of it. Spec amendment 46 answers that: a point whose
-//!   baseline is an ICMP error is **paced** — consecutive cases, liveness
+//!   draw from as well) — but not on loopback: `icmpv4_xrlim_allow` skips the
+//!   per-peer limit for `IFF_LOOPBACK` devices, so this file cannot show the
+//!   limit, and the first rig run's silence was the self-echo and the inert
+//!   layer-2 inject, not the rate limiter (write-up
+//!   `docs/research/experiments/2026-11-01-t5-live-proof.md`, sections i to
+//!   iii). Spec amendment 46 paces for the remote target the lane fuzzes in
+//!   practice: a point whose baseline is an ICMP error is **paced** — consecutive cases, liveness
 //!   probes and replays on it are spaced at least `l4.icmp_pace_ms` apart
 //!   (default 1100 ms, floor 1000 ms). The closed-UDP test therefore asserts
 //!   that **every** one of its 20 cases was classified `icmp(3,3)`, and that
@@ -151,13 +155,26 @@ fn live_lane() -> Option<(PacketLane, Arc<L4Guard>)> {
     Some((lane, guard))
 }
 
-/// The privilege SKIP line for a `lane_unavailable` refusal `err`. The
-/// privilege path it names is the product's own: on macOS the app's
-/// packet-capture helper (spec `2026-10-31-l4-capture-privilege-design`), on
-/// Linux the capabilities on the test binary; never a third-party tool.
+/// The privilege SKIP line for a `lane_unavailable` refusal `err`, with this
+/// platform's host sentence (`/dev/bpf*` is a macOS device; Linux names the
+/// missing capability). The privilege path it names is the product's own: on
+/// macOS the app's packet-capture helper (spec
+/// `2026-10-31-l4-capture-privilege-design.md`), on Linux the capabilities on
+/// the test binary; never a third-party tool.
 fn privilege_skip_line(err: &str) -> String {
+    privilege_skip_line_for(err, cfg!(target_os = "macos"))
+}
+
+/// [`privilege_skip_line`] for a given platform, pure so the non-ignored pin
+/// asserts both arms on whichever host runs the gate.
+fn privilege_skip_line_for(err: &str, macos: bool) -> String {
+    let host = if macos {
+        "BPF is root-only on this host (/dev/bpf* are crw------- root)"
+    } else {
+        "The process has no CAP_NET_RAW"
+    };
     format!(
-        "SKIP 77: L4 packet lane live proof skipped: {err}. BPF is root-only on this host (/dev/bpf* are crw------- root); on macOS the Aitmproxy app's packet-capture helper grants it (spec 2026-10-31-l4-capture-privilege-design); on Linux give the test binary cap_net_raw,cap_net_admin or use a rig that has them. This session never obtains privilege itself."
+        "SKIP 77: L4 packet lane live proof skipped: {err}. {host}; on macOS the Aitmproxy app's packet-capture helper grants it (spec 2026-10-31-l4-capture-privilege-design.md); on Linux give the test binary cap_net_raw,cap_net_admin or use a rig that has them. This session never obtains privilege itself."
     )
 }
 
@@ -319,21 +336,41 @@ impl EchoService {
 /// `lane_unavailable` refusal; this runs without privilege and without the
 /// opt-in, so the SKIP wording is pinned in every gate run. The privilege path
 /// it recommends is the product's own helper on macOS and the capabilities on
-/// Linux (Matt's decision, T5 live proof), never Wireshark's ChmodBPF.
+/// Linux (Matt's decision, T5 live proof), never Wireshark's ChmodBPF. The
+/// host sentence is the platform's own (quality panel): `/dev/bpf*` exists on
+/// macOS only; Linux has no such device and names the missing capability. The
+/// spec is named by its file name, `.md` included (spec panel).
 #[test]
 fn skip_or_fail_prints_the_privilege_skip_for_lane_unavailable() {
     skip_or_fail("lane_unavailable: pcap on lo0: no capture privilege (mock)");
     skip_or_fail("the engine wrapped it: lane_unavailable: pcap on lo: Operation not permitted");
 
-    let line = privilege_skip_line("lane_unavailable: pcap on lo0: no capture privilege (mock)");
+    let err = "lane_unavailable: pcap on lo0: no capture privilege (mock)";
+    let macos = privilege_skip_line_for(err, true);
     assert_eq!(
-        line,
-        "SKIP 77: L4 packet lane live proof skipped: lane_unavailable: pcap on lo0: no capture privilege (mock). BPF is root-only on this host (/dev/bpf* are crw------- root); on macOS the Aitmproxy app's packet-capture helper grants it (spec 2026-10-31-l4-capture-privilege-design); on Linux give the test binary cap_net_raw,cap_net_admin or use a rig that has them. This session never obtains privilege itself."
+        macos,
+        "SKIP 77: L4 packet lane live proof skipped: lane_unavailable: pcap on lo0: no capture privilege (mock). BPF is root-only on this host (/dev/bpf* are crw------- root); on macOS the Aitmproxy app's packet-capture helper grants it (spec 2026-10-31-l4-capture-privilege-design.md); on Linux give the test binary cap_net_raw,cap_net_admin or use a rig that has them. This session never obtains privilege itself."
+    );
+    let linux = privilege_skip_line_for(err, false);
+    assert_eq!(
+        linux,
+        "SKIP 77: L4 packet lane live proof skipped: lane_unavailable: pcap on lo0: no capture privilege (mock). The process has no CAP_NET_RAW; on macOS the Aitmproxy app's packet-capture helper grants it (spec 2026-10-31-l4-capture-privilege-design.md); on Linux give the test binary cap_net_raw,cap_net_admin or use a rig that has them. This session never obtains privilege itself."
     );
     assert!(
-        !line.contains("ChmodBPF") && !line.contains("access_bpf"),
-        "the SKIP never recommends a third-party privilege path: {line}"
+        !linux.contains("/dev/bpf"),
+        "Linux has no /dev/bpf* to blame: {linux}"
     );
+    assert_eq!(
+        privilege_skip_line(err),
+        privilege_skip_line_for(err, cfg!(target_os = "macos")),
+        "the printed line is this platform's arm"
+    );
+    for line in [&macos, &linux] {
+        assert!(
+            !line.contains("ChmodBPF") && !line.contains("access_bpf"),
+            "the SKIP never recommends a third-party privilege path: {line}"
+        );
+    }
 }
 
 /// Tester (stage 5): any other refusal — out of scope, an invalid profile, a
@@ -508,9 +545,16 @@ async fn live_closed_tcp_port_yields_reset() {
         run.stopped
     );
 
-    assert!(
-        resets >= 1,
-        "at least one case must be classified reset by the kernel's answer to a syn on a closed port; classes {histogram:?}"
+    // Plan Task 3 literal, matched by rig run 3 (write-up section iii): a
+    // closed TCP port answers every syn with rst, so all 20 cases are `reset`
+    // and none is silent.
+    assert_eq!(
+        resets, 20,
+        "every case must be classified reset by the kernel's answer to a syn on a closed port; classes {histogram:?}"
+    );
+    assert_eq!(
+        silent, 0,
+        "a closed TCP port never goes silent on loopback; classes {histogram:?}"
     );
     assert_eq!(reaction.outcome, Outcome::Vulnerable);
     let l4 = reaction
