@@ -738,6 +738,9 @@ Kept by the main session during stage 6. One row per finding.
 | H (Rust) | fix round | done | H56 `7705cf0b`, H50 `c609d9fa`, H52 `e4923baa`, H53 `4cf42aa6`; crate gate green (532 tests) | final Rust panel over `03757f77..4cf42aa6` |
 | H (Rust) | coder note | Minor | legacy failure toast now 240 cells; `:scan` failure from Flows reaches Jobs by toast only; key line clipped at inner height <= 5 | ratified |
 | 15 | engine | explained | T1b: cross-job issue dedupe; the first finder owns the issue, `scan.issues {job}` for a later job shows nothing; `Issue.jobs` membership coming | H65 (cell): T7-17 runs first on the fresh core |
+| H (Rust) | security review (H50-H56) | PASS | H50 frame rows, `cut_to` contract, H56 symmetry and no cross-tab leak verified | one pre-existing Minor to H66 |
+| H (Rust) | security | Minor | keyed status/cancel error with a non-`not_found` code never clears once the job leaves | fix round H Rust (H66) |
+| H (Rust) | security | note | `browser.*` and `poc.get` `CallFailed` arms store the raw core message | follow-up outside the scan items (TUI-wide bound sweep) |
 
 ## Shipped
 
