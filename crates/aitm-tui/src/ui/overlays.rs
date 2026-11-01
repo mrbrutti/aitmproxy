@@ -173,25 +173,28 @@ pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
             ),
         ]));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " Any key closes this help.",
-        theme.text_tertiary(),
-    ));
-    // The box is as tall as its content (plus the frame) and never taller than
-    // the screen; on a short terminal the tail is replaced by a footer that says
-    // how many lines are hidden, so the closing hint is never clipped.
-    let wanted = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(2);
+    // `lines` is the body: the key and palette lines. The box wants the body,
+    // a blank spacer, the closing hint and the frame, and is never taller than
+    // the screen. On a short terminal the spacer goes first; then the tail of
+    // the body is replaced by a footer that counts exactly the body lines it
+    // hides, so the closing hint is never clipped and a footer never appears
+    // when nothing is hidden.
+    let closing = " Any key closes this help.";
+    let wanted = u16::try_from(lines.len().saturating_add(4)).unwrap_or(u16::MAX);
     let area = centered(screen, 96, wanted.min(screen.height));
     let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
     let visible = usize::from(inner.height);
-    if lines.len() > visible && visible > 0 {
-        let hidden = lines.len() - visible + 1;
-        lines.truncate(visible - 1);
+    if lines.len() + 2 <= visible {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(closing, theme.text_tertiary()));
+    } else if lines.len() < visible {
+        lines.push(Line::styled(closing, theme.text_tertiary()));
+    } else if visible > 0 {
+        let shown = visible - 1;
+        let hidden = lines.len() - shown;
+        lines.truncate(shown);
         lines.push(Line::styled(
-            format!(" … {hidden} more lines need a taller window · Any key closes this help."),
+            format!(" … {hidden} more lines need a taller window ·{closing}"),
             theme.text_tertiary(),
         ));
     }

@@ -597,14 +597,13 @@ async fn tui_l4_cua_against_a_live_core() {
         0,
         "connect to the live core; feature-detect the L4 surface; availability lands (spec §1)",
     );
-    let pending = L4Availability::pending();
     cua.pump_until("the L4 surface and first poll", |a| {
         a.has_tool("l4.flow.list")
             && a.flows.iter().any(|r| r.kind == FlowKind::L4)
             && !a.l4.scope.is_empty()
             && a.l4.gates.present
-            && a.l4.capture != pending
-            && a.l4.intercept != pending
+            && !a.l4.capture.is_pending()
+            && !a.l4.intercept.is_pending()
     })
     .await;
     assert!(

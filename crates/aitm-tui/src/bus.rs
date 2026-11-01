@@ -13,7 +13,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::action::{BusEvent, BusRequest, Level, ToolInfo};
-use crate::l4::{flow_get_args, fold_status, slow_l4_reads, supports_window, L4Availability};
+use crate::l4::{
+    flow_get_args, fold_status, slow_l4_reads, supports_window, L4Availability, L4Read,
+};
 use crate::model::{AgentState, Finding, FlowDetail, ProxyStatus};
 
 /// Client name sent in `initialize.clientInfo` (§4.2).
@@ -300,31 +302,32 @@ impl Session {
     async fn l4_slow_pass(&mut self) -> Result<(), Outcome> {
         let reads = slow_l4_reads(|t| self.has(t), self.intercept.available);
         let mut status_read = false;
-        for name in reads {
-            match name {
-                "l4.scope.list" => {
+        for read in reads {
+            let name = read.tool();
+            match read {
+                L4Read::Scope => {
                     if let Value::Array(entries) = self.panel(name).await? {
                         self.emit(BusEvent::L4Scope(entries)).await?;
                     }
                 }
-                "l4.agent.status" => {
+                L4Read::Agent => {
                     let v = self.panel(name).await?;
                     if v.is_object() {
                         self.emit(BusEvent::L4Agent(v)).await?;
                     }
                 }
-                "l4.capture.status" => {
+                L4Read::CaptureStatus => {
                     let (availability, ids) = self.status(name, "captures").await?;
                     self.capture = availability;
                     self.captures = ids;
                     status_read = true;
                 }
-                "l4.intercept.status" => {
+                L4Read::InterceptStatus => {
                     let (availability, _) = self.status(name, "sessions").await?;
                     self.intercept = availability;
                     status_read = true;
                 }
-                "l4.intercept.list" => {
+                L4Read::Parked => {
                     // Listed because the previous status said available; the
                     // status just read above may have withdrawn that.
                     if !self.intercept.available {
@@ -334,7 +337,6 @@ impl Session {
                         self.emit(BusEvent::L4Parked(parked)).await?;
                     }
                 }
-                _ => {}
             }
         }
         if status_read {

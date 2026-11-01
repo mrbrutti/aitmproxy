@@ -334,6 +334,18 @@ impl Chip {
         Chip::Other,
     ];
 
+    /// The content-type chips; `Other` is "typed, but none of these".
+    pub const CONTENT: [Chip; 8] = [
+        Chip::Json,
+        Chip::Form,
+        Chip::Xml,
+        Chip::Js,
+        Chip::Css,
+        Chip::GraphQl,
+        Chip::Document,
+        Chip::Media,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             Chip::All => "All",
@@ -396,10 +408,7 @@ impl Chip {
                     || ct.starts_with("audio/")
                     || ct.contains("font")
             }
-            Chip::Other => {
-                // The content chips, `Json` through `Media`.
-                !ct.is_empty() && !Chip::ALL[9..17].iter().any(|c| c.matches(row, detail))
-            }
+            Chip::Other => !ct.is_empty() && !Chip::CONTENT.iter().any(|c| c.matches(row, detail)),
         }
     }
 }
@@ -896,6 +905,18 @@ pub enum PaletteKind {
     Command(String),
     Tool(String),
     Flow(String),
+}
+
+/// A completion candidate for a `:` line is a command palette item: the
+/// candidate's label is the command line to run.
+impl From<crate::ui::complete::Candidate> for PaletteItem {
+    fn from(c: crate::ui::complete::Candidate) -> Self {
+        PaletteItem {
+            label: format!(":{}", c.label),
+            detail: c.detail,
+            kind: PaletteKind::Command(c.label),
+        }
+    }
 }
 
 /// The whole UI state.
@@ -1404,11 +1425,7 @@ impl App {
                 &self.l4_interfaces(),
             )
             .into_iter()
-            .map(|c| PaletteItem {
-                label: format!(":{}", c.label),
-                detail: c.detail,
-                kind: PaletteKind::Command(c.label),
-            })
+            .map(PaletteItem::from)
             .collect();
         }
         if raw.starts_with("l4 ") {
@@ -1418,11 +1435,7 @@ impl App {
                 &self.l4.captures,
             )
             .into_iter()
-            .map(|c| PaletteItem {
-                label: format!(":{}", c.label),
-                detail: c.detail,
-                kind: PaletteKind::Command(c.label),
-            })
+            .map(PaletteItem::from)
             .collect();
         }
         let q = self.prompt.trim().to_lowercase();
@@ -2065,14 +2078,8 @@ impl App {
         let Some(flow) = self.selected_l4().cloned() else {
             return Vec::new();
         };
-        if !self.l4.capture.available {
-            let reason = self
-                .l4
-                .capture
-                .reason
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            self.toast(Level::Warn, format!("inject unavailable: {reason}"));
+        let capture = self.l4.capture.clone();
+        if self.refuse_if_unavailable("inject", &capture) {
             return Vec::new();
         }
         if !self.has_tool("l4.inject") {
@@ -2200,23 +2207,32 @@ impl App {
         }]
     }
 
+    /// The one refusal rule for an L4 capability class (L4 parity spec §1 /
+    /// AC33): while `availability` says unavailable, toast
+    /// `<class> unavailable: <reason>` (the core's reason, or `unknown`) and
+    /// report `true` so the caller sends nothing. `class` is `inject`,
+    /// `capture` or `in-path intercept`.
+    fn refuse_if_unavailable(
+        &mut self,
+        class: &str,
+        availability: &crate::l4::L4Availability,
+    ) -> bool {
+        if availability.available {
+            return false;
+        }
+        let text = format!("{class} unavailable: {}", availability.reason_text());
+        self.toast(Level::Warn, text);
+        true
+    }
+
     /// The parked packet an `l4.intercept.*` verb acts on for `flow`, after the
     /// refusals every parked-packet verb shares (B4/B5): intercept unavailable
     /// (toast with the core's reason, AC11), the verb not on the bus, no parked
     /// packet listed for the flow, or the flow out of L4 scope. `None` means
     /// nothing may reach the bus; the toast says why.
     fn l4_parked_target(&mut self, tool: &str, flow: &crate::l4::L4Flow) -> Option<String> {
-        if !self.l4.intercept.available {
-            let reason = self
-                .l4
-                .intercept
-                .reason
-                .clone()
-                .unwrap_or_else(|| "unavailable".to_string());
-            self.toast(
-                Level::Warn,
-                format!("in-path intercept unavailable: {reason}"),
-            );
+        let intercept = self.l4.intercept.clone();
+        if self.refuse_if_unavailable("in-path intercept", &intercept) {
             return None;
         }
         if !self.has_tool(tool) {
@@ -2303,14 +2319,14 @@ impl App {
     /// asks for the window again.
     fn upsert_l4_flow(&mut self, mut f: crate::l4::L4Flow, out: &mut Vec<BusRequest>) {
         if f.packets.is_empty() {
-            if let Some(prev) = self.l4.flows.get(&f.id) {
+            if let Some(prev) = self.l4.flows.get_mut(&f.id) {
                 if !prev.packets.is_empty() {
-                    if self.selected.as_deref() == Some(f.id.as_str())
-                        && f.packet_count != prev.packet_count
-                    {
+                    let grown = f.packet_count != prev.packet_count;
+                    // `prev` is replaced below, so its packets move, not copy.
+                    f.packets = std::mem::take(&mut prev.packets);
+                    if self.selected.as_deref() == Some(f.id.as_str()) && grown {
                         self.request_l4_window(&f.id, out);
                     }
-                    f.packets = prev.packets.clone();
                 }
             }
         }
@@ -3550,14 +3566,8 @@ impl App {
             self.toast(Level::Error, L4_USAGE);
             return Vec::new();
         }
-        if !self.l4.capture.available {
-            let reason = self
-                .l4
-                .capture
-                .reason
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
-            self.toast(Level::Warn, format!("capture unavailable: {reason}"));
+        let capture = self.l4.capture.clone();
+        if self.refuse_if_unavailable("capture", &capture) {
             return Vec::new();
         }
         if !self.has_tool("l4.capture.start") {
@@ -3571,7 +3581,10 @@ impl App {
     }
 
     /// `:l4 stop [<id>]`: one `l4.capture.stop {id}` for the named capture, or
-    /// one per running capture (the ids `l4.capture.status` reported).
+    /// one per running capture (the ids `l4.capture.status` reported). A typed
+    /// id is refused locally while capture is unavailable, like the start (the
+    /// verb is in the core's gated set; AC33); the bare form stops the ids the
+    /// status itself listed, and an unavailable status lists none.
     fn l4_capture_stop(&mut self, id: &str) -> Vec<BusRequest> {
         let mut words = id.split_whitespace();
         let named = words.next();
@@ -3580,7 +3593,13 @@ impl App {
             return Vec::new();
         }
         let ids: Vec<String> = match named {
-            Some(id) => vec![id.to_string()],
+            Some(id) => {
+                let capture = self.l4.capture.clone();
+                if self.refuse_if_unavailable("capture", &capture) {
+                    return Vec::new();
+                }
+                vec![id.to_string()]
+            }
             None => self.l4.captures.clone(),
         };
         if ids.is_empty() {
@@ -3642,7 +3661,7 @@ impl App {
                     // `:scope add l4 …` is the operator L4 scope add (spec §3);
                     // a host that happens to start with "l4" is not it.
                     ("add", h) if h == "l4" || h.starts_with("l4 ") => {
-                        out.extend(self.l4_scope_add(h.trim_start_matches("l4")));
+                        out.extend(self.l4_scope_add(h.strip_prefix("l4").unwrap_or("")));
                     }
                     ("add", h) if !h.is_empty() => out.push(BusRequest::ScopeAdd(h.to_string())),
                     ("rm", h) | ("remove", h) if !h.is_empty() => {
@@ -4307,42 +4326,56 @@ impl App {
                         }
                         return out;
                     }
-                    // L4 guarded wire verbs: a `needs_confirmation` reply opens
-                    // the confirm overlay (L4OPS-AC10); a plain reply is success.
-                    "l4.inject" | "l4.send_recv" | "l4.intercept.forward" | "l4.intercept.drop" => {
-                        let (call, args) = self
-                            .l4
-                            .pending
-                            .take()
-                            .unwrap_or((name.clone(), Value::Null));
-                        match crate::l4::L4Confirm::from_reply(&call, &args, &value) {
-                            Some(confirm) => {
+                    // The L4 guarded verbs (L4OPS-AC10; L4 parity spec §3):
+                    // a `needs_confirmation` reply opens the confirm overlay
+                    // **for the pending call of the same name only** — the
+                    // overlay is the operator's trust point, so what it shows
+                    // is what `y` sends. A handshake with nothing pending for
+                    // its name (the generic tool form never sets `pending`)
+                    // opens nothing; one without a token is malformed, not a
+                    // success. A plain reply is the verb's success.
+                    "l4.inject"
+                    | "l4.send_recv"
+                    | "l4.intercept.forward"
+                    | "l4.intercept.drop"
+                    | "l4.scope.add" => {
+                        let pending = match self.l4.pending.take() {
+                            Some((call, args)) if call == *name => Some((call, args)),
+                            other => {
+                                self.l4.pending = other;
+                                None
+                            }
+                        };
+                        let bound = pending.is_some();
+                        let (call, args) = pending.unwrap_or((name.clone(), Value::Null));
+                        match crate::l4::L4Confirm::classify(&call, &args, &value) {
+                            crate::l4::ConfirmReply::Malformed => {
+                                self.toast(
+                                    Level::Warn,
+                                    format!("{name}: malformed confirmation reply (no token)"),
+                                );
+                                return out;
+                            }
+                            crate::l4::ConfirmReply::Handshake(_) if !bound => {
+                                self.toast(
+                                    Level::Warn,
+                                    format!(
+                                        "{name} needs confirmation: re-run it from the L4 controls"
+                                    ),
+                                );
+                                return out;
+                            }
+                            crate::l4::ConfirmReply::Handshake(confirm) => {
                                 self.l4.confirm = Some(confirm);
                                 self.mode = Mode::L4Confirm;
                                 return out;
                             }
-                            None => {
-                                let shown: String = value_text(&value).chars().take(120).collect();
-                                self.toast(Level::Info, format!("{name}: {shown}"));
-                            }
+                            crate::l4::ConfirmReply::Plain => {}
                         }
-                    }
-                    // The operator L4 scope add (spec §3): the first reply is
-                    // the confirm handshake; the confirmed one is the new id,
-                    // and the scope is re-read so the panel shows it now.
-                    "l4.scope.add" => {
-                        let (call, args) = self
-                            .l4
-                            .pending
-                            .take()
-                            .unwrap_or((name.clone(), Value::Null));
-                        match crate::l4::L4Confirm::from_reply(&call, &args, &value) {
-                            Some(confirm) => {
-                                self.l4.confirm = Some(confirm);
-                                self.mode = Mode::L4Confirm;
-                                return out;
-                            }
-                            None => {
+                        match name.as_str() {
+                            // The confirmed scope add's reply is the new id;
+                            // the scope is re-read so the panel shows it now.
+                            "l4.scope.add" => {
                                 let shown: String = value_text(&value).chars().take(60).collect();
                                 self.toast(Level::Info, format!("L4 scope + {shown}"));
                                 if self.has_tool("l4.scope.list") {
@@ -4351,6 +4384,10 @@ impl App {
                                         args: json!({}),
                                     });
                                 }
+                            }
+                            _ => {
+                                let shown: String = value_text(&value).chars().take(120).collect();
+                                self.toast(Level::Info, format!("{name}: {shown}"));
                             }
                         }
                     }

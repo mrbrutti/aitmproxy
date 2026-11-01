@@ -132,7 +132,7 @@ pub fn toolbar(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             p.label(),
             app.agent.actions_last_minute
         ),
-        None => format!("{} Agent · n/a (F1)", glyph::AGENT),
+        None => format!("{} Agent · n/a", glyph::AGENT),
     };
     let layout = match app.layout {
         crate::app::Layout::Horizontal => "▄▄ below",
@@ -389,7 +389,12 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
             Level::Warn => theme.intercept_armed_quiet(),
             Level::Error => theme.fg(&crate::tokens::color::status::SERVER_ERROR),
         };
-        Line::styled(t.text.clone(), style.add_modifier(Modifier::BOLD))
+        // The toast may quote the core (an availability reason, an error):
+        // through the app's own inert rule like every other core string.
+        Line::styled(
+            crate::l4::inert(&t.text),
+            style.add_modifier(Modifier::BOLD),
+        )
     } else {
         let vis = view.visible.len();
         let pos = view

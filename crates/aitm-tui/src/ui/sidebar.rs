@@ -182,7 +182,8 @@ pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let agent_count = match app.agent.policy {
         Some(AgentPolicy::Paused) => "paused".to_string(),
         Some(_) => format!("{}/min", app.agent.actions_last_minute),
-        None => "F1".to_string(),
+        // No policy reported by `agent.status`: missing is a dash (§2.8).
+        None => "—".to_string(),
     };
     line(buf, item(app, SidebarItem::Agent, Some(agent_count), true));
     // The Scan surface appears only when the bus offers the scanner plugin

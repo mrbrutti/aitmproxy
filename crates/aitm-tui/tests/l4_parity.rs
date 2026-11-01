@@ -7,18 +7,19 @@
 //! render checks draw that same state into a `Buffer` and read the text back.
 //! No fixture, snapshot or seeded store is used anywhere in this file.
 
-use aitm_tui::action::{Action, BusEvent, BusRequest, ToolInfo};
-use aitm_tui::app::{App, Chip, Mode, PromptKind, SidebarItem};
+use aitm_tui::action::{Action, BusEvent, BusRequest, Level, ToolInfo};
+use aitm_tui::app::{App, Chip, Mode, PaletteItem, PaletteKind, PromptKind, SidebarItem};
 use aitm_tui::caps::TermCaps;
 use aitm_tui::keys;
 use aitm_tui::l4::{
-    ascii_column, clock_ms, flow_get_args, fold_status, hex_dump, inspect_args, packet_fields,
-    slow_l4_reads, status_ids, supports_operator_scope_add, supports_window, L4Availability,
-    L4Confirm, L4Flow, L4Pane, L4Parked, L4State, SCOPE_ADD_L4_USAGE,
+    ascii_column, clock_ms, flow_get_args, fold_status, hex_dump, inert, inspect_args,
+    packet_fields, slow_l4_reads, status_ids, supports_operator_scope_add, supports_window,
+    ConfirmReply, L4Availability, L4Confirm, L4Flow, L4Pane, L4Parked, L4Read, L4State,
+    SCOPE_ADD_L4_USAGE,
 };
 use aitm_tui::model::{AgentPolicy, AgentState, FlowRow};
 use aitm_tui::theme::Theme;
-use aitm_tui::ui::complete::l4_command_candidates;
+use aitm_tui::ui::complete::{l4_command_candidates, Candidate};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -461,7 +462,7 @@ fn models_bus_events_fold_into_l4_state() {
 fn polling_slow_reads_status_always_and_parked_only_when_available() {
     // Tester: the unavailable pass is exactly these four, in this order —
     // both status verbs every time, never `l4.intercept.list`.
-    let unavailable = slow_l4_reads(|_| true, false);
+    let unavailable = read_tools(slow_l4_reads(|_| true, false));
     assert_eq!(
         unavailable,
         vec![
@@ -472,7 +473,7 @@ fn polling_slow_reads_status_always_and_parked_only_when_available() {
         ]
     );
 
-    let available = slow_l4_reads(|_| true, true);
+    let available = read_tools(slow_l4_reads(|_| true, true));
     assert!(available.contains(&"l4.intercept.list"));
     assert_eq!(
         available,
@@ -484,6 +485,17 @@ fn polling_slow_reads_status_always_and_parked_only_when_available() {
             "l4.intercept.list",
         ]
     );
+    // The planner's reads are a closed enum; each names exactly one verb.
+    assert_eq!(L4Read::Scope.tool(), "l4.scope.list");
+    assert_eq!(L4Read::Agent.tool(), "l4.agent.status");
+    assert_eq!(L4Read::CaptureStatus.tool(), "l4.capture.status");
+    assert_eq!(L4Read::InterceptStatus.tool(), "l4.intercept.status");
+    assert_eq!(L4Read::Parked.tool(), "l4.intercept.list");
+}
+
+/// The tool names of a planned read list, in order.
+fn read_tools(reads: Vec<L4Read>) -> Vec<&'static str> {
+    reads.into_iter().map(L4Read::tool).collect()
 }
 
 /// Only verbs the bus offers are read: a core without the intercept verbs is
@@ -492,11 +504,11 @@ fn polling_slow_reads_status_always_and_parked_only_when_available() {
 fn polling_slow_reads_only_offered_verbs() {
     let no_intercept = |t: &str| !t.starts_with("l4.intercept.");
     assert_eq!(
-        slow_l4_reads(no_intercept, true),
+        read_tools(slow_l4_reads(no_intercept, true)),
         vec!["l4.scope.list", "l4.agent.status", "l4.capture.status"]
     );
-    assert_eq!(slow_l4_reads(|_| false, true), Vec::<&str>::new());
-    assert_eq!(slow_l4_reads(|_| false, false), Vec::<&str>::new());
+    assert_eq!(slow_l4_reads(|_| false, true), Vec::<L4Read>::new());
+    assert_eq!(slow_l4_reads(|_| false, false), Vec::<L4Read>::new());
 }
 
 /// Spec §1: a status reply folds through `from_reply` + `status_ids`; a tool
@@ -1013,13 +1025,16 @@ fn capture_commands_panel_renders_availability_captures_and_hints() {
         text.contains(":l4 capture <iface> [inbound|outbound]"),
         "{text}"
     );
-    assert!(text.contains(":l4 stop [<id>]"), "{text}");
+    // The stop hint is offered only where it can act (AC33): while capture is
+    // unavailable a typed `:l4 stop <id>` is refused locally, so no hint.
+    assert!(!text.contains(":l4 stop [<id>]"), "{text}");
     assert!(!text.contains("Reading L4 availability…"), "{text}");
     assert!(text.contains("no running capture"), "{text}");
 
     set_capture(&mut app, available(), &["C1", "C2"]);
     let text = render(&app);
     assert!(text.contains("capture: available"), "{text}");
+    assert!(text.contains(":l4 stop [<id>]"), "{text}");
     assert!(text.contains("C1"), "{text}");
     assert!(text.contains("C2"), "{text}");
     assert!(!text.contains("no running capture"), "{text}");
@@ -2609,6 +2624,34 @@ fn no_stale_f1_in_tui_src() {
         }
     }
     assert!(hits.is_empty(), "stale F1 text:\n{}", hits.join("\n"));
+
+    // Stage-6 fix (quality Minor): the bare follow-up tag `F1` must not be
+    // rendered anywhere either — no `src/ui/` string literal may carry it as
+    // a word (`F10`–`F15` and identifiers outside literals are untouched).
+    let bare = regex::Regex::new(r"\bF1\b").expect("regex");
+    let mut ui_hits = Vec::new();
+    for path in files
+        .iter()
+        .filter(|p| p.components().any(|c| c.as_os_str() == "ui"))
+    {
+        let text = std::fs::read_to_string(path).expect("read source");
+        for (i, line) in text.lines().enumerate() {
+            for m in bare.find_iter(line) {
+                // Inside a string literal when an odd number of unescaped
+                // quotes precede it on the line.
+                let before = &line[..m.start()];
+                let quotes = before.matches('"').count() - before.matches("\\\"").count();
+                if quotes % 2 == 1 {
+                    ui_hits.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                }
+            }
+        }
+    }
+    assert!(
+        ui_hits.is_empty(),
+        "bare F1 tag in a ui string literal:\n{}",
+        ui_hits.join("\n")
+    );
 }
 
 // ================================================================== tester
@@ -3312,4 +3355,507 @@ fn tester_nothing_on_the_wire_under_every_unavailable_code() {
             "{out:?}"
         );
     }
+}
+
+// ============================================================ stage-6 fixes
+//
+// Unit (b) panel findings (security Minor 1–2, quality Important + Minors).
+// Every input is built here in the wire shape; expected values are literals.
+
+/// The 36 key / palette lines help always carries (the heading, 21 key lines,
+/// the first 14 palette commands), each by a substring that survives a 100-column
+/// box; the operator scope-add line is the 37th against a confirmable core.
+const HELP_BODY_MARKERS: [&str; 36] = [
+    "Flow list",
+    "move · PgUp/PgDn · g/G first/last",
+    "inspect the selection · back",
+    "quick-look the body",
+    "arm / disarm intercept",
+    "resume the targeted paused flow / resume all",
+    "kill the targeted paused flow",
+    "edit the paused request (raw)",
+    "replay unchanged / compose",
+    "pin host / mark / comment",
+    "build a PoC from the selected flow",
+    "findings · scope · agent panels",
+    "L4 panel: capture / intercept availability",
+    ":l4 capture <iface> [inbound|outbound] · :l4 stop [<id>]",
+    "L4 craft pane: build · inject (guarded)",
+    "content-type chips",
+    "sidebar items (Apps, Domains, Scope, …)",
+    "toggle sidebar · layout below/right · auto-select",
+    "set / restore the system proxy (:sysproxy on|off|status)",
+    "copy URL (OSC 52) · open externally",
+    "filter expression: ~u ~d",
+    "command palette — every bus tool plus:",
+    "Arm/disarm interception (i)",
+    "Resume the targeted paused flow (⏎ in the bar)",
+    "Resume every paused flow",
+    "Kill the targeted paused flow",
+    "Repeat the selected flow unchanged (r)",
+    "Compose a request, prefilled from the selection (n)",
+    "Compose from a template (ws needs F9)",
+    "Import a curl command line into compose",
+    "Set the filter expression (/)",
+    "Add a host to scope (scope-as-authorisation)",
+    "Open the scope panel",
+    "Open the PoC findings panel",
+    "Build a PoC from the selected flow",
+    "Run a PoC YAML",
+];
+const HELP_SCOPE_ADD_MARKER: &str = "Add an L4 scope entry";
+
+/// Quality Important: the help footer's hidden-line count is exactly the number
+/// of key / palette lines that did not make it onto the screen, a footer appears
+/// only when at least one is hidden, and the closing hint is present every time.
+/// Literal per cell: at 100×37 the box's inner height is 35, so 36 body lines
+/// hide 2 and 37 hide 3; at 120×40 (inner 38) nothing is hidden for either body
+/// (37 + the hint fit by dropping the blank spacer); 160×44 and 160×50 fit all.
+#[test]
+fn help_footer_counts_exactly_the_hidden_lines_and_only_when_some_are() {
+    let cells: [(u16, u16, bool, Option<usize>); 8] = [
+        (100, 37, false, Some(2)),
+        (100, 37, true, Some(3)),
+        (120, 40, false, None),
+        (120, 40, true, None),
+        (160, 44, false, None),
+        (160, 44, true, None),
+        (160, 50, false, None),
+        (160, 50, true, None),
+    ];
+    let theme = Theme::new(true);
+    for (cols, rows, confirmable, expected_hidden) in cells {
+        let mut app = app();
+        let _ = connected(&mut app, l4_tools(confirmable));
+        app.mode = Mode::Help;
+        let area = Rect::new(0, 0, cols, rows);
+        let mut buf = Buffer::empty(area);
+        aitm_tui::ui::render(&app, &theme, area, &mut buf);
+        let text = buffer_text(&buf).join("\n");
+        let cell = format!("{cols}×{rows} confirmable={confirmable}");
+
+        assert!(
+            text.contains("Any key closes this help."),
+            "{cell}: closing hint missing:\n{text}"
+        );
+        // The full list, as the rendered screen shows or hides it.
+        let mut missing = HELP_BODY_MARKERS
+            .iter()
+            .filter(|m| !text.contains(*m))
+            .count();
+        if confirmable {
+            assert!(
+                text.contains(HELP_SCOPE_ADD_MARKER) || expected_hidden.is_some(),
+                "{cell}: scope add line missing while nothing is hidden:\n{text}"
+            );
+            if !text.contains(HELP_SCOPE_ADD_MARKER) {
+                missing += 1;
+            }
+        } else {
+            assert!(!text.contains(HELP_SCOPE_ADD_MARKER), "{cell}:\n{text}");
+        }
+        match expected_hidden {
+            Some(n) => {
+                assert_eq!(missing, n, "{cell}: lines off the screen:\n{text}");
+                let footer =
+                    format!("… {n} more lines need a taller window · Any key closes this help.");
+                assert!(
+                    text.contains(&footer),
+                    "{cell}: footer {footer:?} not in:\n{text}"
+                );
+            }
+            None => {
+                assert_eq!(missing, 0, "{cell}: every line is on the screen:\n{text}");
+                assert!(
+                    !text.contains("more lines"),
+                    "{cell}: a footer with nothing hidden:\n{text}"
+                );
+            }
+        }
+    }
+}
+
+fn handshake(prompt: &str, token: &str) -> Value {
+    json!({"status": "needs_confirmation", "prompt": prompt, "confirm_token": token})
+}
+
+fn toast_level(app: &App) -> Option<Level> {
+    app.current_toast().map(|t| t.level)
+}
+
+/// Security Minor 1: a `needs_confirmation` reply binds only to a pending call
+/// of the **same name**. A scope-add handshake landing while an inject is
+/// pending leaves the inject pending, opens nothing and sends nothing; the
+/// inject's own handshake then binds to the inject's args and `y` re-issues
+/// exactly those plus its own token.
+#[test]
+fn confirm_reply_for_another_verb_leaves_the_pending_inject_in_place() {
+    let mut app = inject_ready(available());
+    assert_eq!(
+        app.update(Action::L4Inject),
+        vec![BusRequest::Call {
+            name: "l4.inject".into(),
+            args: inject_args(),
+        }]
+    );
+    let reqs = app.on_bus(BusEvent::CallOk {
+        name: "l4.scope.add".into(),
+        value: handshake("Add 127.0.0.1/32?", "tok-scope"),
+    });
+    assert_eq!(reqs, Vec::<BusRequest>::new());
+    assert_eq!(
+        app.l4.pending,
+        Some(("l4.inject".to_string(), inject_args())),
+        "the inject stays pending"
+    );
+    assert!(app.l4.confirm.is_none(), "{:?}", app.l4.confirm);
+    assert_ne!(app.mode, Mode::L4Confirm);
+    assert_eq!(
+        toast_text(&app),
+        "l4.scope.add needs confirmation: re-run it from the L4 controls"
+    );
+    assert_eq!(toast_level(&app), Some(Level::Warn));
+
+    let reqs = app.on_bus(BusEvent::CallOk {
+        name: "l4.inject".into(),
+        value: handshake("Inject 1 UDP to 127.0.0.1:7?", "tok-inject"),
+    });
+    assert_eq!(reqs, Vec::<BusRequest>::new());
+    assert_eq!(app.mode, Mode::L4Confirm);
+    let c = app.l4.confirm.clone().expect("overlay");
+    assert_eq!(c.call, "l4.inject");
+    assert_eq!(c.args, inject_args());
+    assert_eq!(c.prompt, "Inject 1 UDP to 127.0.0.1:7?");
+    assert_eq!(c.token, "tok-inject");
+    assert!(app.l4.pending.is_none());
+    let mut expected = inject_args();
+    expected["_confirm"] = json!("tok-inject");
+    assert_eq!(
+        app.update(Action::L4Confirm(true)),
+        vec![BusRequest::Call {
+            name: "l4.inject".into(),
+            args: expected,
+        }]
+    );
+}
+
+/// Security Minor 1: a handshake with nothing pending for its name (the generic
+/// palette tool form never sets `pending`) builds no overlay and re-issues
+/// nothing — the toast says to re-run it from the L4 controls.
+#[test]
+fn confirm_reply_with_nothing_pending_toasts_and_sends_nothing() {
+    for name in [
+        "l4.inject",
+        "l4.send_recv",
+        "l4.intercept.forward",
+        "l4.intercept.drop",
+        "l4.scope.add",
+    ] {
+        let mut app = app();
+        let _ = connected(&mut app, l4_tools(true));
+        assert!(app.l4.pending.is_none());
+        let reqs = app.on_bus(BusEvent::CallOk {
+            name: name.into(),
+            value: handshake("P", "tok-1"),
+        });
+        assert_eq!(reqs, Vec::<BusRequest>::new(), "{name}");
+        assert!(app.l4.confirm.is_none(), "{name}: {:?}", app.l4.confirm);
+        assert_ne!(app.mode, Mode::L4Confirm, "{name}");
+        assert_eq!(
+            toast_text(&app),
+            format!("{name} needs confirmation: re-run it from the L4 controls")
+        );
+        assert_eq!(toast_level(&app), Some(Level::Warn), "{name}");
+        assert_eq!(
+            app.update(Action::L4Confirm(true)),
+            Vec::<BusRequest>::new()
+        );
+    }
+}
+
+/// Quality Minor 3: a `needs_confirmation` reply without `confirm_token` is a
+/// malformed handshake, reported as a warning — not as the call's success —
+/// with nothing sent, no overlay and no `l4.scope.list` re-read.
+#[test]
+fn confirm_reply_without_a_token_is_a_malformed_warning() {
+    let mut on = app();
+    let _ = connected(&mut on, l4_tools(true));
+    let _ = on.run_command("scope add l4 127.0.0.1/32 9100-9199 lo0 inbound capture");
+    let reqs = on.on_bus(BusEvent::CallOk {
+        name: "l4.scope.add".into(),
+        value: json!({"status": "needs_confirmation", "prompt": "P"}),
+    });
+    assert_eq!(
+        reqs,
+        Vec::<BusRequest>::new(),
+        "nothing sent, no scope re-read"
+    );
+    assert_eq!(
+        toast_text(&on),
+        "l4.scope.add: malformed confirmation reply (no token)"
+    );
+    assert_eq!(toast_level(&on), Some(Level::Warn));
+    assert!(on.l4.confirm.is_none());
+    assert_ne!(on.mode, Mode::L4Confirm);
+    assert!(on.l4.pending.is_none());
+
+    let mut inj = inject_ready(available());
+    let _ = inj.update(Action::L4Inject);
+    let reqs = inj.on_bus(BusEvent::CallOk {
+        name: "l4.inject".into(),
+        value: json!({"status": "needs_confirmation"}),
+    });
+    assert_eq!(reqs, Vec::<BusRequest>::new());
+    assert_eq!(
+        toast_text(&inj),
+        "l4.inject: malformed confirmation reply (no token)"
+    );
+    assert_eq!(toast_level(&inj), Some(Level::Warn));
+    assert!(inj.l4.confirm.is_none());
+    assert_ne!(inj.mode, Mode::L4Confirm);
+}
+
+/// Security Minor 2 / AC33: `:l4 stop <id>` is refused locally while capture
+/// is unavailable (before the first status reply too), with the same literal as
+/// `:l4 capture`; available, it sends exactly the one stop.
+#[test]
+fn capture_commands_stop_is_refused_locally_while_capture_is_unavailable() {
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert_eq!(app.run_command("l4 stop abc"), Vec::<BusRequest>::new());
+    assert_eq!(
+        toast_text(&app),
+        "capture unavailable: Reading L4 availability…"
+    );
+
+    set_capture(&mut app, unavailable("X"), &[]);
+    assert_eq!(app.run_command("l4 stop abc"), Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "capture unavailable: X");
+    assert_eq!(toast_level(&app), Some(Level::Warn));
+
+    set_capture(&mut app, available(), &[]);
+    assert_eq!(
+        app.run_command("l4 stop abc"),
+        vec![BusRequest::Call {
+            name: "l4.capture.stop".into(),
+            args: json!({"id": "abc"}),
+        }]
+    );
+}
+
+/// Quality Minor: the refusal fallback is one word for every class when the
+/// core sends no `reason` — `unknown` for inject, capture start, capture stop
+/// and the in-path verdicts alike.
+#[test]
+fn quality_refusal_fallback_reason_is_unknown_for_every_class() {
+    let no_reason = L4Availability::from_reply(&json!({"available": false}));
+    assert_eq!(no_reason.reason, None);
+
+    let mut app = inject_ready(no_reason.clone());
+    assert_eq!(app.update(Action::L4Inject), Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "inject unavailable: unknown");
+    assert_eq!(app.run_command("l4 capture lo"), Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "capture unavailable: unknown");
+    assert_eq!(app.run_command("l4 stop abc"), Vec::<BusRequest>::new());
+    assert_eq!(toast_text(&app), "capture unavailable: unknown");
+
+    let mut app = craft_ready(vec![parked_p1()]);
+    let _ = app.on_bus(BusEvent::L4Availability {
+        capture: unavailable("X"),
+        intercept: no_reason,
+        captures: vec![],
+    });
+    for action in [
+        Action::Resume,
+        Action::Kill,
+        Action::L4MutateParked,
+        Action::L4RevertParked,
+    ] {
+        app.toasts.clear();
+        assert!(
+            l4_calls(&app.update(action.clone())).is_empty(),
+            "{action:?}"
+        );
+        assert_eq!(
+            toast_text(&app),
+            "in-path intercept unavailable: unknown",
+            "{action:?}"
+        );
+    }
+}
+
+/// Quality Minor: the status-bar toast goes through the app's own `inert()`
+/// rule like every other core-sourced string — a control character in a toast
+/// renders as `.`, by design rather than by a ratatui rendering detail.
+#[test]
+fn quality_toast_text_renders_inert() {
+    let theme = Theme::new(true);
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    let out = app.on_bus(BusEvent::Toast(
+        Level::Warn,
+        "core said a\u{1b}[31mb\u{7f}c\u{9b}d".to_string(),
+    ));
+    assert_eq!(out, Vec::<BusRequest>::new());
+    let area = Rect::new(0, 0, 160, 44);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    let text = buffer_text(&buf).join("\n");
+    assert!(text.contains("core said a.[31mb.c.d"), "{text}");
+    assert_inert(&text, "status bar with a control-laden toast");
+}
+
+/// Quality Minor: without a reported policy the sidebar's Agent count is the
+/// §2.8 dash and the status bar says `n/a`; the internal tag `F1` is nowhere.
+#[test]
+fn quality_sidebar_agent_count_is_a_dash_without_a_policy() {
+    let theme = Theme::new(true);
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert_eq!(app.agent.policy, None);
+    let area = Rect::new(0, 0, 200, 50);
+    let mut buf = Buffer::empty(area);
+    aitm_tui::ui::render(&app, &theme, area, &mut buf);
+    let rows = buffer_text(&buf);
+    let agent_row = rows
+        .iter()
+        .find(|r| r.starts_with("  Agent"))
+        .unwrap_or_else(|| panic!("no sidebar Agent row in:\n{}", rows.join("\n")));
+    // The sidebar column ends at its right-edge rule; the count sits before it.
+    let (sidebar, _) = agent_row
+        .split_once('│')
+        .unwrap_or_else(|| panic!("no sidebar rule in {agent_row:?}"));
+    assert!(sidebar.ends_with('—'), "{agent_row:?}");
+    let text = rows.join("\n");
+    assert!(text.contains("Agent · n/a"), "{text}");
+    // The word `F1` (not `F10`–`F15`, which are live follow-up notes).
+    let bare_f1 = regex::Regex::new(r"\bF1\b").expect("regex");
+    assert!(!bare_f1.is_match(&text), "{text}");
+}
+
+/// Quality Minor: `reason_text` is the core's reason or the one fallback word.
+#[test]
+fn quality_reason_text_has_one_fallback() {
+    assert_eq!(unavailable("R_CAP").reason_text(), "R_CAP");
+    assert_eq!(
+        L4Availability::from_reply(&json!({"available": false})).reason_text(),
+        "unknown"
+    );
+    assert_eq!(
+        L4Availability::pending().reason_text(),
+        "Reading L4 availability…"
+    );
+    assert_eq!(available().reason_text(), "unknown");
+}
+
+/// Quality Minor: `is_pending` names the pre-first-reply state without a
+/// whole-struct comparison; a core reply never is pending, even with the same
+/// reason text under a code.
+#[test]
+fn quality_is_pending_is_the_pre_reply_state_only() {
+    assert!(L4Availability::pending().is_pending());
+    assert!(L4Availability::default().is_pending());
+    assert!(!available().is_pending());
+    assert!(!unavailable("Reading L4 availability…").is_pending());
+    assert!(!L4Availability::from_reply(&json!([])).is_pending());
+    let mut app = app();
+    let _ = connected(&mut app, l4_tools(false));
+    assert!(app.l4.capture.is_pending() && app.l4.intercept.is_pending());
+    set_capture(&mut app, unavailable("X"), &[]);
+    assert!(!app.l4.capture.is_pending());
+}
+
+/// Quality Minor: the content chips are a named group, not slice indices, and
+/// `Other` is "typed, but none of them".
+#[test]
+fn quality_content_chips_are_a_named_group() {
+    let labels: Vec<&str> = Chip::CONTENT.iter().map(|c| c.label()).collect();
+    assert_eq!(
+        labels,
+        vec!["JSON", "Form", "XML", "JS", "CSS", "GraphQL", "Document", "Media"]
+    );
+    for c in Chip::CONTENT {
+        assert!(Chip::ALL.contains(&c), "{c:?}");
+    }
+    let (_, http) = l4_and_http_rows();
+    let mut json_row = http.clone();
+    json_row.content_type = Some("application/json".into());
+    assert!(Chip::Json.matches(&json_row, None));
+    assert!(!Chip::Other.matches(&json_row, None));
+    let mut octet = http.clone();
+    octet.content_type = Some("application/octet-stream".into());
+    assert!(Chip::Other.matches(&octet, None));
+    assert!(!Chip::CONTENT.iter().any(|c| c.matches(&octet, None)));
+    let mut untyped = http;
+    untyped.content_type = None;
+    assert!(!Chip::Other.matches(&untyped, None));
+}
+
+/// Quality Minor: one conversion from a completion candidate to a palette item.
+#[test]
+fn quality_candidate_becomes_a_command_palette_item() {
+    let item = PaletteItem::from(Candidate {
+        label: "l4 stop C1".to_string(),
+        detail: "stop capture C1".to_string(),
+    });
+    assert_eq!(
+        item,
+        PaletteItem {
+            label: ":l4 stop C1".to_string(),
+            detail: "stop capture C1".to_string(),
+            kind: PaletteKind::Command("l4 stop C1".to_string()),
+        }
+    );
+}
+
+/// Quality Minor 3: the reply classifier is explicit about its three outcomes.
+#[test]
+fn quality_confirm_reply_classifies_handshake_malformed_and_plain() {
+    let args = json!({"id": "P1"});
+    match L4Confirm::classify(
+        "l4.intercept.forward",
+        &args,
+        &handshake("Forward?", "tok-f"),
+    ) {
+        ConfirmReply::Handshake(c) => {
+            assert_eq!(c.call, "l4.intercept.forward");
+            assert_eq!(c.args, args);
+            assert_eq!(c.prompt, "Forward?");
+            assert_eq!(c.token, "tok-f");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        L4Confirm::classify(
+            "l4.inject",
+            &args,
+            &json!({"status": "needs_confirmation", "prompt": "P"})
+        ),
+        ConfirmReply::Malformed
+    );
+    assert_eq!(
+        L4Confirm::classify(
+            "l4.inject",
+            &args,
+            &json!({"status": "needs_confirmation", "confirm_token": 7})
+        ),
+        ConfirmReply::Malformed
+    );
+    assert_eq!(
+        L4Confirm::classify("l4.inject", &args, &json!({"injected": 1})),
+        ConfirmReply::Plain
+    );
+    assert_eq!(
+        L4Confirm::classify("l4.inject", &args, &json!("S4")),
+        ConfirmReply::Plain
+    );
+}
+
+/// Quality Minor: `inert` lives beside `ascii_column` and applies its rule to
+/// a string — every control character (C0, DEL, C1) becomes `.`.
+#[test]
+fn quality_inert_maps_every_control_character_to_a_dot() {
+    assert_eq!(inert("a\u{1b}[31mb\u{7f}c\u{9b}d\n"), "a.[31mb.c.d.");
+    assert_eq!(inert("plain · text"), "plain · text");
+    assert_eq!(inert(""), "");
 }

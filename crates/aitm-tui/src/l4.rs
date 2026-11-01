@@ -207,15 +207,6 @@ impl L4Flow {
     pub fn is_intercept(&self) -> bool {
         self.kind == "intercept"
     }
-
-    /// The parked packet of an interception session: the most recent one.
-    pub fn parked(&self) -> Option<&L4Packet> {
-        if self.is_intercept() {
-            self.packets.last()
-        } else {
-            None
-        }
-    }
 }
 
 /// The `TCP` / `UDP` / `ICMP` transport sub-label for a layer list, if any.
@@ -297,6 +288,18 @@ impl L4Availability {
             reason: Some(PENDING_REASON.to_string()),
         }
     }
+
+    /// Whether this is still [`L4Availability::pending`]: no reply has landed
+    /// yet. A core reply always carries a `code` or a different reason.
+    pub fn is_pending(&self) -> bool {
+        self.code.is_none() && self.reason.as_deref() == Some(PENDING_REASON)
+    }
+
+    /// The reason to show in a refusal: the core's text, or the one fallback
+    /// `unknown` when it sent none.
+    pub fn reason_text(&self) -> &str {
+        self.reason.as_deref().unwrap_or("unknown")
+    }
 }
 
 impl Default for L4Availability {
@@ -364,22 +367,51 @@ impl L4Parked {
 
 // ------------------------------------------------------------- slow reads
 
+/// One `l4.*` read of the bus task's slow pass. A closed set, so the bus
+/// task's match is exhaustive: a read added here must be handled there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L4Read {
+    /// `l4.scope.list`.
+    Scope,
+    /// `l4.agent.status`.
+    Agent,
+    /// `l4.capture.status` (capture + inject availability, running captures).
+    CaptureStatus,
+    /// `l4.intercept.status`.
+    InterceptStatus,
+    /// `l4.intercept.list`, only while intercept is available.
+    Parked,
+}
+
+impl L4Read {
+    /// The bus verb this read calls.
+    pub fn tool(self) -> &'static str {
+        match self {
+            L4Read::Scope => "l4.scope.list",
+            L4Read::Agent => "l4.agent.status",
+            L4Read::CaptureStatus => "l4.capture.status",
+            L4Read::InterceptStatus => "l4.intercept.status",
+            L4Read::Parked => "l4.intercept.list",
+        }
+    }
+}
+
 /// The slow pass's `l4.*` reads, in order (spec §1, §4): the L4 scope and
 /// agent panels, then both status verbs every time (availability is never
 /// cached for the session), then `l4.intercept.list` only while intercept is
 /// available — a core whose intercept is unavailable is never asked for its
 /// parked list. Only verbs the bus offers (`has`) are listed. The statuses
 /// precede the list so a status read in one pass governs that pass's list.
-pub fn slow_l4_reads(has: impl Fn(&str) -> bool, intercept_available: bool) -> Vec<&'static str> {
-    const ALWAYS: [&str; 4] = [
-        "l4.scope.list",
-        "l4.agent.status",
-        "l4.capture.status",
-        "l4.intercept.status",
+pub fn slow_l4_reads(has: impl Fn(&str) -> bool, intercept_available: bool) -> Vec<L4Read> {
+    const ALWAYS: [L4Read; 4] = [
+        L4Read::Scope,
+        L4Read::Agent,
+        L4Read::CaptureStatus,
+        L4Read::InterceptStatus,
     ];
-    let mut out: Vec<&'static str> = ALWAYS.into_iter().filter(|t| has(t)).collect();
-    if intercept_available && has("l4.intercept.list") {
-        out.push("l4.intercept.list");
+    let mut out: Vec<L4Read> = ALWAYS.into_iter().filter(|r| has(r.tool())).collect();
+    if intercept_available && has(L4Read::Parked.tool()) {
+        out.push(L4Read::Parked);
     }
     out
 }
@@ -473,6 +505,16 @@ pub fn scope_add_args(words: &str) -> Result<Value, &'static str> {
 }
 
 // ------------------------------------------------------------- packet text
+
+/// Text from the core, made inert for the terminal: every control character
+/// becomes `.` — [`ascii_column`]'s rule applied to a string (spec §2.3 /
+/// AC40). Used by every surface that renders a core-supplied string, the
+/// status-bar toast included.
+pub fn inert(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '.' } else { c })
+        .collect()
+}
 
 /// The ASCII column of a hex view (spec §2.3 / AC40): printable ASCII
 /// 0x20–0x7e as itself, every other byte as `.`, so no control byte reaches the
@@ -762,14 +804,30 @@ pub struct L4Confirm {
     pub token: String,
 }
 
+/// What a guarded verb's reply is (L4 parity, stage-6 fix): the confirm
+/// handshake bound to the pending call, a handshake the TUI cannot complete,
+/// or a plain result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmReply {
+    /// `needs_confirmation` with a token: the overlay to open.
+    Handshake(L4Confirm),
+    /// `needs_confirmation` without a string `confirm_token`: nothing can be
+    /// re-issued, and it is not a success either.
+    Malformed,
+    /// Not a handshake: the verb's own result.
+    Plain,
+}
+
 impl L4Confirm {
-    /// Build from the pending `(call, args)` and a `needs_confirmation` reply.
-    /// `None` when the reply is not a confirmation handshake.
-    pub fn from_reply(call: &str, args: &Value, reply: &Value) -> Option<Self> {
+    /// Classify a reply against the pending `(call, args)` it answers.
+    pub fn classify(call: &str, args: &Value, reply: &Value) -> ConfirmReply {
         if reply.get("status").and_then(Value::as_str) != Some("needs_confirmation") {
-            return None;
+            return ConfirmReply::Plain;
         }
-        Some(Self {
+        let Some(token) = reply.get("confirm_token").and_then(Value::as_str) else {
+            return ConfirmReply::Malformed;
+        };
+        ConfirmReply::Handshake(Self {
             call: call.to_string(),
             args: args.clone(),
             prompt: reply
@@ -777,11 +835,17 @@ impl L4Confirm {
                 .and_then(Value::as_str)
                 .unwrap_or("Confirm this action?")
                 .to_string(),
-            token: reply
-                .get("confirm_token")
-                .and_then(Value::as_str)?
-                .to_string(),
+            token: token.to_string(),
         })
+    }
+
+    /// Build from the pending `(call, args)` and a `needs_confirmation` reply.
+    /// `None` when the reply is not a complete confirmation handshake.
+    pub fn from_reply(call: &str, args: &Value, reply: &Value) -> Option<Self> {
+        match Self::classify(call, args, reply) {
+            ConfirmReply::Handshake(c) => Some(c),
+            ConfirmReply::Malformed | ConfirmReply::Plain => None,
+        }
     }
 
     /// The args to re-send on confirm: the originals plus the `_confirm` token.

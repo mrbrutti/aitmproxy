@@ -1098,8 +1098,7 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
         "(core follow-up F7)",
         "F10│",
         "M3│",
-        "F1│",
-        "n/a (F1)",
+        "Agent · n/a",
         "↑ — ↓ — (F4)",
     ] {
         assert!(text.contains(label), "{label}: {text}");

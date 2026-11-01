@@ -10,7 +10,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::l4::{L4Availability, L4Flow, L4Pane};
+use crate::l4::{inert, L4Flow, L4Pane};
 use crate::theme::Theme;
 use crate::tokens::glyph;
 use crate::ui::bars::{put, put_sides};
@@ -34,10 +34,9 @@ pub fn panel(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         Line::raw(""),
     ];
     // Spec §1: until the first reply the UI shows exactly the shared literal.
-    let pending = L4Availability::pending();
-    if app.l4.capture == pending || app.l4.intercept == pending {
+    if app.l4.capture.is_pending() || app.l4.intercept.is_pending() {
         lines.push(Line::styled(
-            format!(" {}", pending.reason.clone().unwrap_or_default()),
+            format!(" {}", crate::l4::PENDING_REASON),
             theme.text_tertiary(),
         ));
     }
@@ -45,7 +44,7 @@ pub fn panel(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         ("capture", &app.l4.capture),
         ("intercept", &app.l4.intercept),
     ] {
-        if *a == pending {
+        if a.is_pending() {
             continue;
         }
         if a.available {
@@ -85,23 +84,19 @@ pub fn panel(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         ":l4 capture <iface> [inbound|outbound]",
         "start a capture (refused while capture is unavailable)",
     ));
-    lines.push(hint(
-        ":l4 stop [<id>]",
-        "stop one running capture, or every one",
-    ));
+    // A typed `:l4 stop <id>` is refused locally while capture is unavailable
+    // (AC33), so the hint is offered only where it can act.
+    if app.l4.capture.available {
+        lines.push(hint(
+            ":l4 stop [<id>]",
+            "stop one running capture, or every one",
+        ));
+    }
     lines.push(Line::styled(
         " Esc back · : palette · ? help",
         theme.text_tertiary(),
     ));
     lines_into(buf, area, &lines, 0);
-}
-
-/// Text from the core, made inert for the terminal: every control character
-/// becomes `.` (the same rule as `l4::ascii_column`, applied to a string).
-fn inert(s: &str) -> String {
-    s.chars()
-        .map(|c| if c.is_control() { '.' } else { c })
-        .collect()
 }
 
 /// Draw the L4 inspector for the selected flow into `area`.
@@ -439,9 +434,9 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
     }
     let mut lines: Vec<Line> = Vec::new();
     let intercept = &app.l4.intercept;
-    if *intercept == L4Availability::pending() {
+    if intercept.is_pending() {
         lines.push(Line::styled(
-            intercept.reason.clone().unwrap_or_default(),
+            crate::l4::PENDING_REASON,
             theme.text_tertiary(),
         ));
         lines_into(buf, area, &lines, 0);
