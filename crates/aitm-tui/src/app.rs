@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use aitm_scan_model::{
     Issue, IssueStatus, IssuesResult, JobEvent, JobId, JobNotification, JobStatus, ListResult,
-    JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
+    Phase, SitemapResult, JOB_KIND_SCAN, JOB_NOTIFICATION_METHOD,
 };
 use serde::Deserialize as _;
 use serde_json::{json, Map, Value};
@@ -29,10 +29,10 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    is_job_id, parse_result, state_text, status_token, step, tag_keyed, tag_parts, Dir,
-    IssueFilterKey, IssuePane, JobPane, ScanError, ScanOffer, ScanState, ScanTab,
+    is_job_id, parse_result, state_text, status_token, step, tag_keyed, tag_parts, typed_origin,
+    Dir, IssueFilterKey, IssuePane, JobPane, MapSource, ScanError, ScanOffer, ScanState, ScanTab,
     ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
-    STATUS_POLL_TICKS,
+    SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
 use crate::theme::Theme;
 use crate::viewers::json;
@@ -1794,8 +1794,11 @@ impl App {
                 // and `:scan <host>` are the only paths that reach the wire.
                 if self.scan.legacy.target.is_none() {
                     if let Some(host) = self.scan_target_host() {
-                        // Task 9 replaces this seed with the D8 origin rule.
-                        self.scan.legacy.target = Some(format!("http://{host}/"));
+                        // The seed follows the D8 origin rule (D12): the
+                        // scheme the captured flows show, never a hard-coded
+                        // `http://`. A host the rule refuses seeds nothing;
+                        // the launch keys name the reason when pressed.
+                        self.scan.legacy.target = typed_origin(&host, &self.flows).ok();
                     }
                 }
                 // D6, first row: opening the view lists the jobs. Quiet when
@@ -1806,6 +1809,10 @@ impl App {
                 // (D6): the list may have moved while the operator was away.
                 if self.scan.tab == ScanTab::Issues {
                     self.request_issues(&mut out);
+                }
+                // The same for the Site map (D6, "entering Site map").
+                if self.scan.tab == ScanTab::SiteMap {
+                    self.request_sitemap(None, &mut out);
                 }
             }
             Action::ScanLaunch => {
@@ -1823,6 +1830,7 @@ impl App {
             Action::ScanFilterReset => self.scan_filter_reset(&mut out),
             Action::ScanIssueStatus(status) => self.scan_issue_status(status, &mut out),
             Action::ScanOpenPoc => self.scan_open_poc(),
+            Action::ScanNextPage => self.scan_next_page(&mut out),
             Action::AgentSet(p) => {
                 if self.has_tool("agent.set") {
                     out.push(BusRequest::AgentSet(p));
@@ -2346,10 +2354,10 @@ impl App {
             );
             return;
         }
-        let host = match explicit {
-            Some(raw) => crate::scan::scan_host(&raw),
+        let (host, raw) = match explicit {
+            Some(raw) => (crate::scan::scan_host(&raw), raw),
             None => match self.scan_target_host() {
-                Some(h) => h,
+                Some(h) => (h.clone(), h),
                 None => {
                     self.toast(
                         Level::Warn,
@@ -2366,8 +2374,16 @@ impl App {
             );
             return;
         }
-        // Task 9 replaces this seed with the D8 origin rule.
-        let target = format!("http://{host}/");
+        // D8: a typed origin keeps its scheme and port (authority only), a
+        // bare host gets the scheme its captured flows show; a host the
+        // rule refuses is toasted and nothing reaches the wire.
+        let target = match typed_origin(&raw, &self.flows) {
+            Ok(target) => target,
+            Err(reason) => {
+                self.toast(Level::Warn, reason);
+                return;
+            }
+        };
         self.scan.legacy.running = true;
         self.scan.legacy.error = None;
         self.scan.legacy.target = Some(target.clone());
@@ -2821,6 +2837,14 @@ impl App {
                             self.scan.issues.detail_scroll = 0;
                             self.scan.issues.follow_flow = false;
                             self.issue_cursor_landed(out);
+                        }
+                        // The Site map's point cursor stays on the selected
+                        // node's points (D11: the Points pane lists that
+                        // node's points, the walk is over the whole list).
+                        if self.scan.tab == ScanTab::SiteMap
+                            && MapSource::from(offer) == MapSource::V2
+                        {
+                            self.scan.sitemap.settle_point_cursor();
                         }
                     }
                 }
@@ -3942,6 +3966,9 @@ impl App {
                             .legacy
                             .endpoint_cursor
                             .min(self.scan.legacy.endpoints.len().saturating_sub(1));
+                        // The Site map draws the result as nodes and
+                        // points (D12), built once here.
+                        self.scan.sitemap.show_legacy(&self.scan.legacy);
                         self.toast(
                             Level::Info,
                             format!(
@@ -4080,6 +4107,53 @@ impl App {
         if settles && self.issues_wanted() {
             self.request_issues(out);
         }
+        // A terminal line for a job the Site map query covers re-reads the
+        // map while the tab is on screen (D6); entering the tab reads it
+        // anyway, so a hidden tab waits for that.
+        if terminal
+            && self.mode == Mode::Scan
+            && self.scan.tab == ScanTab::SiteMap
+            && self.scan.sitemap.query.matches(job)
+        {
+            self.request_sitemap(None, out);
+        }
+    }
+
+    /// `scan.sitemap {query, cursor?}` under its single-slot tag (spec D6):
+    /// the one spelling the tab's entry, `n`, `J`, the settling push line
+    /// and the timer share. With a cursor the reply appends (D10), without
+    /// one it replaces. Stamps `fetched_at_tick` when the call leaves.
+    /// Quiet when the bus lacks the verb: the Site map banner already says
+    /// so (D2), and the tag dedupe keeps one request in flight.
+    fn request_sitemap(&mut self, cursor: Option<&str>, out: &mut Vec<BusRequest>) {
+        let args = self.scan.sitemap.query.args(cursor);
+        if self.scan_poll("scan.sitemap".to_string(), "scan.sitemap", args, out) {
+            self.scan.sitemap.fetched_at_tick = self.ticks;
+            self.scan.sitemap.appending = cursor.is_some();
+        }
+    }
+
+    /// Site map `n` (spec D11): the next page under the last reply's
+    /// `next_cursor`; inert without one or off the tab.
+    fn scan_next_page(&mut self, out: &mut Vec<BusRequest>) {
+        if self.scan.tab != ScanTab::SiteMap {
+            return;
+        }
+        let Some(cursor) = self.scan.sitemap.next_cursor.clone() else {
+            return;
+        };
+        self.request_sitemap(Some(&cursor), out);
+    }
+
+    /// Whether a job the Site map query covers is crawling (D6): the
+    /// filtered job when `J` names one, any job otherwise, by its last
+    /// known summary.
+    fn sitemap_crawling(&self) -> bool {
+        self.scan.jobs.summaries.values().any(|s| {
+            self.scan.sitemap.query.matches(&s.job)
+                && !s.state.is_terminal()
+                && s.phase == Phase::Crawling
+        })
     }
 
     /// `scan.issues {filters, limit}` under its single-slot tag (spec D6):
@@ -4103,18 +4177,32 @@ impl App {
         if entering && tab == ScanTab::Issues {
             self.request_issues(out);
         }
+        if entering && tab == ScanTab::SiteMap {
+            self.request_sitemap(None, out);
+        }
     }
 
-    /// Issues `S` `C` `L` `T` `J` (spec D11): cycle one filter and refetch.
-    /// `J` takes the Jobs cursor's job. Only the Issues tab has filters
-    /// here; Task 9 routes `J` on the Site map to its own query.
+    /// Issues `S` `C` `L` `T` `J` (spec D11): cycle one filter and refetch,
+    /// `J` taking the Jobs cursor's job. On the Site map `J` toggles the
+    /// map's job query the same way and re-reads the map; the other filter
+    /// keys have no Site map meaning, and no other tab has filters.
     fn scan_filter(&mut self, key: IssueFilterKey, out: &mut Vec<BusRequest>) {
-        if self.scan.tab != ScanTab::Issues {
-            return;
-        }
         let cursor_job = self.scan.jobs.cursor_job().cloned();
-        self.scan.issues.filters.cycle(key, cursor_job.as_deref());
-        self.request_issues(out);
+        match self.scan.tab {
+            ScanTab::Issues => {
+                self.scan.issues.filters.cycle(key, cursor_job.as_deref());
+                self.request_issues(out);
+            }
+            ScanTab::SiteMap if matches!(key, IssueFilterKey::Job) => {
+                let query = &mut self.scan.sitemap.query;
+                query.job = match query.job {
+                    Some(_) => None,
+                    None => cursor_job,
+                };
+                self.request_sitemap(None, out);
+            }
+            _ => {}
+        }
     }
 
     /// Issues `R` (spec D11): clear every filter and refetch.
@@ -4294,7 +4382,9 @@ impl App {
     /// live, once [`ISSUES_POLL_TICKS`] have passed since the last
     /// `scan.issues` left (`fetched_at_tick`, re-stamped by every request),
     /// so entering the tab just before a modulo boundary does not fetch
-    /// twice (fix round D, D7). Task 9 adds the Site map timer here.
+    /// twice (fix round D, D7), and a `scan.sitemap` by the same rule with
+    /// [`SITEMAP_POLL_TICKS`] while the Site map is shown and a job it
+    /// covers is crawling.
     fn scan_tick(&mut self, t: u64, out: &mut Vec<BusRequest>) {
         if t.is_multiple_of(STATUS_POLL_TICKS) {
             let live = self.scan.jobs.live();
@@ -4315,6 +4405,16 @@ impl App {
             && self.issues_live()
         {
             self.request_issues(out);
+        }
+        // The Site map: forty ticks after the last read, while the tab is
+        // shown and a covered job is crawling (D6).
+        let sitemap_due = t.saturating_sub(self.scan.sitemap.fetched_at_tick) >= SITEMAP_POLL_TICKS;
+        if sitemap_due
+            && self.mode == Mode::Scan
+            && self.scan.tab == ScanTab::SiteMap
+            && self.sitemap_crawling()
+        {
+            self.request_sitemap(None, out);
         }
     }
 
@@ -4436,6 +4536,15 @@ impl App {
                     }
                 }
             }
+            "scan.sitemap" => {
+                // The page replaces the map, or appends after `n` (D10);
+                // a reply that misses the contract leaves the map and
+                // drops the append flag, so the next page starts clean.
+                match self.scan_reply::<SitemapResult>(tag, &value) {
+                    Some(result) => self.scan.sitemap.fold_result(result),
+                    None => self.scan.sitemap.appending = false,
+                }
+            }
             "scan.issue" | "scan.issue.update" => {
                 // The read's reply, ok or not, settles the one read in
                 // flight (D6); an update is its own keyed call.
@@ -4536,6 +4645,9 @@ impl App {
         self.scan.inflight.remove(tag);
         if tag_parts(tag).0 == "scan.issue" {
             self.scan.issues.pending_read = None;
+        }
+        if tag == "scan.sitemap" {
+            self.scan.sitemap.appending = false;
         }
         self.scan.set_error(ScanError::from_message(tag, &message));
     }

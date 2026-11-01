@@ -1,54 +1,176 @@
-//! The Site map tab (spec D2, D11, D12, D13). Plan task 4 draws the legacy
-//! `scan.discover` result in the two panes it moved into: the reached
-//! endpoints as nodes, the discovered injection points as points, with the
-//! text today's view drew. The v2 `scan.sitemap` nodes arrive with the Site
-//! map task.
+//! The Site map tab (spec D2, D11, D12, D13): the nodes grouped under their
+//! `host[:port]` headers on the left, the selected node's points on the
+//! right, both read from `SitemapState`'s bounded lists (built once per
+//! fold, never per frame) and drawn only for the rows on screen.
+//!
+//! Which cursors the panes follow is `MapSource::from(app.scan_offer())`,
+//! never the lists' emptiness: on a v2 bus the `scan.sitemap` cursors, on a
+//! legacy bus the `scan.discover` cursors over the same lists, which the
+//! `scan.discover` fold set from the legacy result (D12). The two sources
+//! differ on screen only in their pane heads: the v2 Nodes pane opens with
+//! the summary line (`12 nodes · 2 points of node-1 · n next page`, the
+//! list pane's first row as the Issues filter line is; the strip banner
+//! carries state) and its Points pane with the column header, the legacy
+//! panes keep today's `Endpoints` and `Injection points` titles and list
+//! every point (D12: nothing changes in behaviour). The degraded states are
+//! the strip banner's (D13: one state on screen).
 
+use aitm_scan_model::InsertionPoint;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
-use crate::scan::{MapPane, ScanOffer};
+use crate::scan::{point_header, point_line, MapPane, MapSource, NodeLine, ScanOffer};
 use crate::theme::Theme;
-use crate::ui::scan::{note, pane_rule, panes};
+use crate::ui::bars::put;
+use crate::ui::scan::{hint, note, pane_rule, panes};
 use crate::ui::selection_bg;
 use crate::ui::text::{cells, truncate};
 
+/// Today's legacy pane titles (D12).
+const LEGACY_NODES_TITLE: &str = "Endpoints";
+const LEGACY_POINTS_TITLE: &str = "Injection points";
+/// Today's legacy empty states.
+const LEGACY_NO_ENDPOINTS: &str = "none yet: r scans an in-scope target";
+const LEGACY_NO_POINTS: &str = "none yet";
+/// The v2 Points pane when the selected node has no point.
+const NO_POINTS: &str = "no points on this node";
+
 pub fn render(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    match app.scan_offer() {
+    let offer = app.scan_offer();
+    match offer {
         // The banner carries the no-scanner and missing-verb states; the
         // body adds nothing to them.
         ScanOffer::None => {}
         ScanOffer::V2 if !app.has_tool("scan.sitemap") => {}
-        ScanOffer::V2 if app.scan.sitemap.nodes.is_empty() => {
-            note(theme, area, "no site map yet", buf)
-        }
-        // The legacy result is the map on a legacy bus (D12); the v2 nodes
-        // render with the Site map task.
-        _ => {
-            let split = panes(area);
-            pane_rule(theme, &split, buf);
-            endpoints(app, theme, split.list, buf);
-            points(app, theme, split.detail, buf);
-        }
+        _ => match MapSource::from(offer) {
+            MapSource::V2 => v2(app, theme, area, buf),
+            MapSource::Legacy => legacy(app, theme, area, buf),
+        },
     }
 }
 
-/// The reached endpoints: a cursor list of URLs rendered verbatim. The cursor
-/// row is highlighted only while the Nodes pane is focused; Enter opens the
-/// selected endpoint's linked flow in the inspector (AC3).
-fn endpoints(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    if area.height == 0 {
+/// The v2 map: the summary over the grouped nodes, the selected node's
+/// points under the column header.
+fn v2(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let map = &app.scan.sitemap;
+    if map.nodes.is_empty() {
+        note(theme, area, "no site map yet", buf);
         return;
     }
-    buf.set_string(
-        area.x + 1,
-        area.y,
-        "Endpoints",
-        theme.accent().add_modifier(Modifier::BOLD),
+    let split = panes(area);
+    pane_rule(theme, &split, buf);
+    let summary = map.summary();
+    nodes(
+        theme,
+        &map.lines,
+        map.node_cursor,
+        map.pane == MapPane::Nodes,
+        Head::Hint(&summary),
+        NO_POINTS,
+        split.list,
+        buf,
     );
+    let range = map.node_points(map.node_cursor);
+    let cursor = map
+        .point_cursor
+        .checked_sub(range.start)
+        .filter(|c| *c < range.len());
+    let header = point_header();
+    points(
+        theme,
+        &map.points[range],
+        cursor,
+        map.pane == MapPane::Points,
+        Head::Columns(&header),
+        NO_POINTS,
+        split.detail,
+        buf,
+    );
+}
+
+/// The legacy result (D12): the same lists under today's titles, walked
+/// by the legacy cursors, every point listed.
+fn legacy(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
+    let map = &app.scan.sitemap;
+    let legacy = &app.scan.legacy;
+    let split = panes(area);
+    pane_rule(theme, &split, buf);
+    nodes(
+        theme,
+        &map.lines,
+        legacy.endpoint_cursor,
+        map.pane == MapPane::Nodes,
+        Head::Title(LEGACY_NODES_TITLE),
+        LEGACY_NO_ENDPOINTS,
+        split.list,
+        buf,
+    );
+    points(
+        theme,
+        &map.points,
+        Some(legacy.cursor),
+        map.pane == MapPane::Points,
+        Head::Title(LEGACY_POINTS_TITLE),
+        LEGACY_NO_POINTS,
+        split.detail,
+        buf,
+    );
+}
+
+/// What a pane's first row carries.
+enum Head<'a> {
+    /// A legacy title, in the accent.
+    Title(&'a str),
+    /// The v2 summary line, a tertiary [`hint`].
+    Hint(&'a str),
+    /// The v2 Points column header, in secondary text.
+    Columns(&'a str),
+}
+
+/// Draw `head` on the first row of `area`.
+fn head(theme: &Theme, area: Rect, head: Head<'_>, buf: &mut Buffer) {
+    let row = Rect::new(area.x, area.y, area.width, 1);
+    let (text, style) = match head {
+        Head::Hint(text) => return hint(theme, area, text, buf),
+        Head::Title(text) => (text, theme.accent().add_modifier(Modifier::BOLD)),
+        Head::Columns(text) => (text, theme.text_secondary()),
+    };
+    let w = usize::from(area.width).saturating_sub(1);
+    put(
+        buf,
+        row,
+        Line::styled(format!(" {}", truncate(text, w)), style),
+    );
+}
+
+/// One line of the Nodes pane: a host header or a node line.
+enum Entry {
+    /// The host of the line at this index opens a group.
+    Header(usize),
+    Row(usize),
+}
+
+/// The Nodes pane: the head, then the lines under their host headers (in
+/// the accent), scrolled so the line of the node at `cursor` is on screen
+/// and highlighted while the pane is focused.
+#[allow(clippy::too_many_arguments)]
+fn nodes(
+    theme: &Theme,
+    lines: &[NodeLine],
+    cursor: usize,
+    focused: bool,
+    top_row: Head<'_>,
+    empty: &str,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    if area.height == 0 || area.width < 2 {
+        return;
+    }
+    head(theme, area, top_row, buf);
     let body = Rect::new(
         area.x,
         area.y + 1,
@@ -58,60 +180,68 @@ fn endpoints(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if body.height == 0 {
         return;
     }
-    if app.scan.legacy.endpoints.is_empty() {
-        buf.set_string(
-            body.x + 1,
-            body.y,
-            "none yet: r scans an in-scope target",
-            theme.text_tertiary(),
-        );
+    if lines.is_empty() {
+        note(theme, body, empty, buf);
         return;
     }
-    let focused = app.scan.sitemap.pane == MapPane::Nodes;
-    let h = usize::from(body.height);
-    let cursor = app
-        .scan
-        .legacy
-        .endpoint_cursor
-        .min(app.scan.legacy.endpoints.len() - 1);
-    let top = cursor.saturating_sub(h.saturating_sub(1));
-    for (k, e) in app
-        .scan
-        .legacy
-        .endpoints
+    let mut entries: Vec<Entry> = Vec::with_capacity(lines.len() * 2);
+    let mut last_host: Option<&str> = None;
+    for (k, line) in lines.iter().enumerate() {
+        if last_host != Some(line.host.as_str()) {
+            entries.push(Entry::Header(k));
+            last_host = Some(&line.host);
+        }
+        entries.push(Entry::Row(k));
+    }
+    let cursor_entry = entries
         .iter()
-        .enumerate()
-        .skip(top)
-        .take(h)
-    {
-        let y = body.y + cells(k - top);
-        if focused && k == cursor {
-            buf.set_style(Rect::new(body.x, y, body.width, 1), selection_bg(theme));
-        }
-        let line = Line::from(vec![
-            Span::styled(" • ", theme.text_tertiary()),
-            Span::styled(
-                truncate(e, usize::from(body.width).saturating_sub(4)),
-                theme.text_primary(),
+        .position(|e| matches!(e, Entry::Row(k) if lines[*k].node == cursor))
+        .unwrap_or(0);
+    let h = usize::from(body.height);
+    let top = cursor_entry.saturating_sub(h - 1);
+    let w = usize::from(body.width);
+    for (k, entry) in entries.iter().enumerate().skip(top).take(h) {
+        let row = Rect::new(body.x, body.y + cells(k - top), body.width, 1);
+        match entry {
+            Entry::Header(i) => put(
+                buf,
+                row,
+                Line::styled(
+                    format!(" {}", truncate(&lines[*i].host, w.saturating_sub(1))),
+                    theme.accent(),
+                ),
             ),
-        ]);
-        buf.set_line(body.x, y, &line, body.width);
+            Entry::Row(i) => {
+                let line = &lines[*i];
+                let is_cursor = line.node == cursor;
+                if is_cursor && focused {
+                    buf.set_style(row, selection_bg(theme));
+                }
+                put(buf, row, marked(theme, &line.text, is_cursor, w));
+            }
+        }
     }
 }
 
-/// The discovered injection points: a cursor list of location + name + a
-/// redacted example (the scanner redacts at the source; the UI never
-/// re-derives a raw value).
-fn points(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    if area.height == 0 {
+/// The Points pane: the head, then one [`point_line`] per point (built for
+/// the rows on screen only), scrolled so `cursor` is on screen and
+/// highlighted while the pane is focused; `cursor` is `None` when no point
+/// is under it.
+#[allow(clippy::too_many_arguments)]
+fn points(
+    theme: &Theme,
+    points: &[InsertionPoint],
+    cursor: Option<usize>,
+    focused: bool,
+    top_row: Head<'_>,
+    empty: &str,
+    area: Rect,
+    buf: &mut Buffer,
+) {
+    if area.height == 0 || area.width < 2 {
         return;
     }
-    buf.set_string(
-        area.x + 1,
-        area.y,
-        "Injection points",
-        theme.accent().add_modifier(Modifier::BOLD),
-    );
+    head(theme, area, top_row, buf);
     let body = Rect::new(
         area.x,
         area.y + 1,
@@ -121,33 +251,32 @@ fn points(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     if body.height == 0 {
         return;
     }
-    if app.scan.legacy.points.is_empty() {
-        buf.set_string(body.x + 1, body.y, "none yet", theme.text_tertiary());
+    if points.is_empty() {
+        note(theme, body, empty, buf);
         return;
     }
-    let focused = app.scan.sitemap.pane == MapPane::Points;
     let h = usize::from(body.height);
-    let cursor = app.scan.legacy.cursor.min(app.scan.legacy.points.len() - 1);
-    let top = cursor.saturating_sub(h.saturating_sub(1));
-    for (k, p) in app.scan.legacy.points.iter().enumerate().skip(top).take(h) {
-        let y = body.y + cells(k - top);
-        if focused && k == cursor {
-            buf.set_style(Rect::new(body.x, y, body.width, 1), selection_bg(theme));
+    let top = cursor
+        .unwrap_or(0)
+        .min(points.len() - 1)
+        .saturating_sub(h - 1);
+    let w = usize::from(body.width);
+    for (k, point) in points.iter().enumerate().skip(top).take(h) {
+        let row = Rect::new(body.x, body.y + cells(k - top), body.width, 1);
+        let is_cursor = Some(k) == cursor;
+        if is_cursor && focused {
+            buf.set_style(row, selection_bg(theme));
         }
-        let line = Line::from(vec![
-            Span::styled(
-                format!(" {:<12} ", truncate(&p.location, 12)),
-                theme.accent(),
-            ),
-            Span::styled(
-                format!("{} ", truncate(&p.name, 24)),
-                theme.text_primary().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                truncate(&p.example, usize::from(body.width).saturating_sub(40)),
-                theme.text_secondary(),
-            ),
-        ]);
-        buf.set_line(body.x, y, &line, body.width);
+        put(buf, row, marked(theme, &point_line(point), is_cursor, w));
     }
+}
+
+/// `> text` on the cursor row, `  text` elsewhere, cut to `w` cells.
+fn marked(theme: &Theme, text: &str, is_cursor: bool, w: usize) -> Line<'static> {
+    let mark = if is_cursor { ">" } else { " " };
+    let style: Style = theme.text_primary();
+    Line::from(vec![
+        Span::styled(mark, theme.text_secondary()),
+        Span::styled(format!(" {}", truncate(text, w.saturating_sub(2))), style),
+    ])
 }

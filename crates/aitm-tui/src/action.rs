@@ -100,6 +100,10 @@ pub enum Action {
     /// (its `poc_ref` in the `poc_path`, or the issue's name as the title),
     /// else toast (spec D11).
     ScanOpenPoc,
+    /// Site map `n`: fetch the next page of `scan.sitemap` with the
+    /// `next_cursor` the last reply carried, appending it (spec D11); inert
+    /// without one.
+    ScanNextPage,
     AgentSet(AgentPolicy),
     // Text prompts
     PaletteOpen,

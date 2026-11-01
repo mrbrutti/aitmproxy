@@ -91,9 +91,11 @@ fn open_scan_opens_without_launching() {
     );
     // The header shows the scope-bound target an explicit launch would crawl:
     // the selected flow's host (f50, in scope).
+    // D8 (D12 ruling): the seed is the origin rule's answer, not a
+    // hard-coded `http://`; the fixture host has only https flows.
     assert_eq!(
         app.scan.legacy.target.as_deref(),
-        Some("http://auth.shop-staging.test/"),
+        Some("https://auth.shop-staging.test"),
         "the target is seeded for display, not launched"
     );
     let text = screen(&app);
@@ -125,9 +127,11 @@ fn explicit_launch_emits_discover_and_result_populates_state() {
 
     let reqs = app.update(Action::ScanLaunch);
     assert!(app.scan.legacy.running, "the launch sets the running flag");
+    // D8 (D12 ruling): the launch sends the origin rule's answer for the
+    // selected flow's host, which the fixture captured over https.
     assert_eq!(
         discover_targets(&reqs),
-        vec!["http://auth.shop-staging.test/".to_string()],
+        vec!["https://auth.shop-staging.test".to_string()],
         "one scope-bound scan.discover was launched: {reqs:?}"
     );
 
@@ -192,10 +196,11 @@ fn scan_command_with_target_is_scope_gated() {
     let reqs = app.run_command("scan https://api.shop-staging.test:8443/admin?x=1");
     assert_eq!(app.mode, Mode::Scan);
     assert!(app.scan.legacy.running);
+    // D8: the typed scheme and port are kept, the path dropped.
     assert_eq!(
         discover_targets(&reqs),
-        vec!["http://api.shop-staging.test/".to_string()],
-        "the typed target is reduced to its in-scope host: {reqs:?}"
+        vec!["https://api.shop-staging.test:8443".to_string()],
+        "the typed target keeps its scheme and port, authority only: {reqs:?}"
     );
 
     let mut app = legacy_app(200, 50);
