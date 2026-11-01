@@ -330,9 +330,9 @@ mod tests {
     #[test]
     fn plan_literal_with_remaining_0a_is_one_byte_short() {
         // Pins the corrected PUBLISH literal (remaining length `09`, as the
-        // manifest and the live suite now spell it): with `0A` only 9 bytes
-        // follow the length byte, so the speaker sees a partial packet (and
-        // the bug after a 200 ms idle), never a PUBLISH.
+        // grader table and the live suite now spell it): with `0A` only 9
+        // bytes follow the length byte, so the speaker sees a partial packet
+        // (and the bug after a 200 ms idle), never a PUBLISH.
         let as_written = [
             0x32, 0x0A, 0x00, 0x03, 0x61, 0x2F, 0x62, 0x00, 0x01, 0x68, 0x69,
         ];

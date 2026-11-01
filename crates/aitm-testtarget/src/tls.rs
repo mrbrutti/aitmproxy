@@ -70,12 +70,11 @@ pub(crate) fn server_config(alpn: &[&[u8]], identity: &Identity) -> io::Result<A
     Ok(Arc::new(cfg))
 }
 
-/// What a TLS listener kind advertises: its `/services` name, the ALPN list it
-/// offers and the same list as `/services` strings.
+/// What a TLS listener kind advertises: its `/services` name and the ALPN
+/// list it offers (the `/services` strings are derived with [`alpn_names`]).
 struct TlsKind {
     name: &'static str,
     alpn: &'static [&'static [u8]],
-    alpn_names: Vec<&'static str>,
 }
 
 /// The advertisement for `kind`; `None` for the plain listener, which has no TLS.
@@ -84,15 +83,21 @@ fn listener_alpn(kind: Listener) -> Option<TlsKind> {
         Listener::Tls => Some(TlsKind {
             name: "tls",
             alpn: ALPN_H2_H1,
-            alpn_names: vec!["h2", "http/1.1"],
         }),
         Listener::TlsH1 => Some(TlsKind {
             name: "tls_h1",
             alpn: ALPN_H1,
-            alpn_names: vec!["http/1.1"],
         }),
         Listener::Plain => None,
     }
+}
+
+/// The ALPN byte list as the `/services` strings (every protocol token is
+/// ASCII; one that were not would simply be left out).
+fn alpn_names(alpn: &'static [&'static [u8]]) -> Vec<&'static str> {
+    alpn.iter()
+        .filter_map(|p| std::str::from_utf8(p).ok())
+        .collect()
 }
 
 /// Bind loopback `port` (0 = ephemeral) as TLS listener `kind` serving
@@ -108,12 +113,7 @@ pub(crate) async fn bind(
     state: Arc<AppState>,
     identity: &Identity,
 ) -> io::Result<SocketAddr> {
-    let Some(TlsKind {
-        name,
-        alpn,
-        alpn_names,
-    }) = listener_alpn(kind)
-    else {
+    let Some(TlsKind { name, alpn }) = listener_alpn(kind) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "tls::bind needs Listener::Tls or Listener::TlsH1",
@@ -129,7 +129,7 @@ pub(crate) async fn bind(
         proto: "tcp",
         addr,
         role: "http",
-        alpn: Some(alpn_names),
+        alpn: Some(alpn_names(alpn)),
         grammar: None,
     });
 
@@ -184,6 +184,25 @@ mod tests {
         );
         let h1 = server_config(ALPN_H1, &identity).expect("h1 config");
         assert_eq!(h1.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn services_alpn_names_derive_from_the_byte_lists() {
+        // `/services` strings are the ALPN byte lists as text, nothing kept
+        // twice: `tls` offers h2 then http/1.1, `tls_h1` only http/1.1.
+        assert_eq!(alpn_names(ALPN_H2_H1), vec!["h2", "http/1.1"]);
+        assert_eq!(alpn_names(ALPN_H1), vec!["http/1.1"]);
+        let tls = listener_alpn(Listener::Tls).expect("tls kind");
+        assert_eq!(
+            (tls.name, alpn_names(tls.alpn)),
+            ("tls", vec!["h2", "http/1.1"])
+        );
+        let tls_h1 = listener_alpn(Listener::TlsH1).expect("tls_h1 kind");
+        assert_eq!(
+            (tls_h1.name, alpn_names(tls_h1.alpn)),
+            ("tls_h1", vec!["http/1.1"])
+        );
+        assert!(listener_alpn(Listener::Plain).is_none());
     }
 
     #[test]

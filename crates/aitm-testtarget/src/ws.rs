@@ -282,24 +282,13 @@ pub(crate) fn serve_upgrade(
 ) -> Resp {
     let mode = state.mode;
     let key = info.header("sec-websocket-key").map(str::trim);
-    let version = info.header("sec-websocket-version").map(str::trim);
     let origin = info.header("origin");
     let session_valid = info
         .cookie("session")
         .is_some_and(|s| state.sessions.is_valid(s));
     let cookie_names = crate::log::redact_headers(&info.headers).cookie_names;
 
-    let verdict = handshake_verdict(
-        mode,
-        key,
-        version,
-        info.conn.alpn.as_deref(),
-        origin,
-        info.scheme,
-        &info.host,
-        session_valid,
-        info.header("sec-websocket-protocol"),
-    );
+    let verdict = handshake_verdict(mode, info, session_valid);
 
     let (status, accepted, subprotocol) = match &verdict {
         Ok(accept) => (
@@ -371,30 +360,27 @@ struct Accepted {
     subprotocol: Option<String>,
 }
 
-/// The D4 handshake decision, in order: h1 only (400 over h2), key + version
-/// 13 (400), `Origin` (403), login (401 in P), then the subprotocol echo.
-#[allow(clippy::too_many_arguments)]
+/// The D4 handshake decision on `info`, in order: h1 only (400 over h2),
+/// key and version 13 (400), `Origin` (403), login (401 in P), then the
+/// subprotocol echo. `session_valid` is the caller's lookup of the `session`
+/// cookie.
 fn handshake_verdict(
     mode: SeedMode,
-    key: Option<&str>,
-    version: Option<&str>,
-    alpn: Option<&str>,
-    origin: Option<&str>,
-    scheme: &str,
-    host: &str,
+    info: &RequestInfo,
     session_valid: bool,
-    requested_protocol: Option<&str>,
 ) -> Result<Accepted, (StatusCode, &'static str)> {
     // An h2 connection cannot carry an upgrade at all, whatever headers came
     // with the request: say so before judging the key and version.
-    if alpn == Some("h2") {
+    if info.conn.alpn.as_deref() == Some("h2") {
         return Err((StatusCode::BAD_REQUEST, "websocket requires HTTP/1.1"));
     }
+    let key = info.header("sec-websocket-key").map(str::trim);
+    let version = info.header("sec-websocket-version").map(str::trim);
     let key = match (key, version) {
         (Some(k), Some("13")) if !k.is_empty() => k,
         _ => return Err((StatusCode::BAD_REQUEST, "bad websocket handshake")),
     };
-    if !origin_allowed(mode, origin, scheme, host) {
+    if !origin_allowed(mode, info.header("origin"), info.scheme, &info.host) {
         return Err((StatusCode::FORBIDDEN, "<p>forbidden origin</p>"));
     }
     if mode == SeedMode::Patched && !session_valid {
@@ -402,7 +388,7 @@ fn handshake_verdict(
     }
     Ok(Accepted {
         accept_key: accept_key(key),
-        subprotocol: subprotocol_reply(mode, requested_protocol),
+        subprotocol: subprotocol_reply(mode, info.header("sec-websocket-protocol")),
     })
 }
 
