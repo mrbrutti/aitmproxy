@@ -425,8 +425,6 @@ dependencies = [
  "anyhow",
  "futures",
  "regex",
- "serde_json",
- "serde_yaml",
  "tokio",
  "tracing",
 ]
