@@ -17,6 +17,74 @@ def _yaml_str(v: str) -> str:
 
 
 @dataclass
+class ScannerSection:
+    """The `scanner:` file section (scanner v2 spec D11). Only the keys that are
+    set (not None / non-empty) are emitted, in D11 order, so a cell pins exactly
+    the knobs it means to and the core's defaults cover the rest."""
+
+    allow_agent_active: bool | None = None
+    allow_agent_l4_fuzz: bool | None = None
+    max_jobs: int | None = None
+    history: int | None = None
+    check_timeout_s: int | None = None
+    default_profile: str | None = None
+    ceilings: dict[str, int] = field(default_factory=dict)
+
+
+def _l4_scope_entry(
+    addr: str,
+    prefix: int,
+    lo: int,
+    hi: int,
+    interface: str,
+    direction: str,
+    capability: str,
+    pps: int,
+    burst: int,
+) -> dict:
+    # Exactly the keys of crates/aitm-proto-l4/src/types.rs::L4ScopeEntry (minus
+    # the `#[serde(default)]` `id` and `source`); enum tokens are snake_case.
+    return {
+        "cidr": {"addr": addr, "prefix": prefix},
+        "ports": {"lo": lo, "hi": hi},
+        "interface": interface,
+        "direction": direction,
+        "capability": capability,
+        "inject_rate": {"pps": pps, "burst": burst},
+    }
+
+
+def l4_inject_entry(
+    addr: str = "127.0.0.1",
+    prefix: int = 32,
+    lo: int = 1,
+    hi: int = 65535,
+    interface: str = "*",
+    direction: str = "outbound",
+    pps: int = 200,
+    burst: int = 400,
+) -> dict:
+    """An `l4.scope` entry granting `inject` (what the scanner's stream lane needs:
+    `interface: "*"`, outbound, the target CIDR + ports)."""
+    return _l4_scope_entry(addr, prefix, lo, hi, interface, direction, "inject", pps, burst)
+
+
+def l4_capture_entry(
+    addr: str = "127.0.0.0",
+    prefix: int = 8,
+    lo: int = 0,
+    hi: int = 65535,
+    interface: str = "*",
+    direction: str = "inbound",
+    pps: int = 200,
+    burst: int = 400,
+) -> dict:
+    """An `l4.scope` entry granting `capture` (the packet lane's inbound permit;
+    `inject_rate` is a required field of L4ScopeEntry so it is emitted here too)."""
+    return _l4_scope_entry(addr, prefix, lo, hi, interface, direction, "capture", pps, burst)
+
+
+@dataclass
 class CoreConfig:
     """The inputs to one `aitm` config.yaml. Ports default to None -> caller fills
     them with free_port() before writing."""
@@ -33,6 +101,11 @@ class CoreConfig:
     findings_dir: str | None = None
     l4_enabled: bool = False
     l4_flags: dict[str, bool] = field(default_factory=dict)
+    # l4_scope_entries: `l4.scope` items (use l4_inject_entry / l4_capture_entry);
+    # any entry forces `l4:` + `enabled: true`.
+    l4_scope_entries: list[dict] = field(default_factory=list)
+    # scanner: the `scanner:` file section (scanner v2 D11); None = omitted.
+    scanner: ScannerSection | None = None
     # CA: a per-run dir isolates the MITM CA from the operator's real store; aitm
     # writes <ca_dir>/ca.crt on boot (use aitm_e2e.tls.ca_cert to locate it).
     ca_dir: str | None = None
@@ -71,11 +144,17 @@ class CoreConfig:
             f"      port: {self.bus_port}",
             f"      token: {_yaml_str(self.agent_token)}",
         ]
-        if self.l4_enabled:
+        if self.scanner is not None:
+            lines.extend(self._scanner_lines(self.scanner))
+        if self.l4_enabled or self.l4_scope_entries:
             lines.append("l4:")
             lines.append("  enabled: true")
             for flag, val in self.l4_flags.items():
                 lines.append(f"  {flag}: {str(bool(val)).lower()}")
+            if self.l4_scope_entries:
+                lines.append("  scope:")
+                for entry in self.l4_scope_entries:
+                    lines.extend(self._l4_scope_lines(entry))
         if self.ca_dir:
             lines.append("ca:")
             lines.append(f"  dir: {_yaml_str(self.ca_dir)}")
@@ -89,6 +168,44 @@ class CoreConfig:
             lines.append("ssl_insecure: true")
         lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _scanner_lines(sc: ScannerSection) -> list[str]:
+        out = ["scanner:"]
+        for key in ("allow_agent_active", "allow_agent_l4_fuzz"):
+            val = getattr(sc, key)
+            if val is not None:
+                out.append(f"  {key}: {str(bool(val)).lower()}")
+        for key in ("max_jobs", "history", "check_timeout_s"):
+            val = getattr(sc, key)
+            if val is not None:
+                out.append(f"  {key}: {int(val)}")
+        if sc.default_profile is not None:
+            out.append(f"  default_profile: {sc.default_profile}")
+        if sc.ceilings:
+            out.append("  ceilings:")
+            out.extend(f"    {k}: {int(v)}" for k, v in sc.ceilings.items())
+        return out
+
+    @staticmethod
+    def _l4_scope_lines(entry: dict) -> list[str]:
+        cidr = entry["cidr"]
+        ports = entry["ports"]
+        rate = entry["inject_rate"]
+        return [
+            "    - cidr:",
+            f"        addr: {cidr['addr']}",
+            f"        prefix: {int(cidr['prefix'])}",
+            "      ports:",
+            f"        lo: {int(ports['lo'])}",
+            f"        hi: {int(ports['hi'])}",
+            f"      interface: {_yaml_str(entry['interface'])}",
+            f"      direction: {entry['direction']}",
+            f"      capability: {entry['capability']}",
+            "      inject_rate:",
+            f"        pps: {int(rate['pps'])}",
+            f"        burst: {int(rate['burst'])}",
+        ]
 
 
 def write_config(path: str, cfg: CoreConfig) -> str:
