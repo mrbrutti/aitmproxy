@@ -10,11 +10,14 @@ that holds a flow.subscribe subscription and counts notifications/aitm/job lines
 seeded test target itself. This cell is the only acceptance evidence for the TUI Scan
 surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
 
-  T7-16 (UI-1) :scan, 1, cursor to `standard`, Enter, o <origin>, Enter, s -> a Jobs row
-        with the id scan.list reports; three or more screen samples whose on-screen
-        `sent/budget` is non-decreasing and inside a scan.status bracket taken around the
-        sample; the state/phase cell changes at least once; x yields `cancelled` on screen
-        and in scan.status; the second client saw a `progress` and a `cancelled` line.
+  T7-16 (UI-1) :scan, 1, cursor to `standard`, Enter, o <origin>, Enter, the crawl
+        `browser` field set to `never` with e (H42, every HTTP launch below too), s -> a
+        Jobs row with the id scan.list reports; three or more screen samples whose
+        on-screen `sent/budget` is non-decreasing and inside a scan.status bracket taken
+        around the sample; the state/phase cell changes at least once; x yields
+        `cancelled` on screen and in scan.status (on a fresh job cancelled in its first
+        second when the sampled one finished before x, H37); the second client saw a
+        `progress` and a `cancelled` line for the cancelled job.
   T7-17 (UI-2) a second `standard` job: while scan.status still says `running`, the Issues
         tab shows a reflected-xss issue (else one carrying a payload and a probe flow)
         under its severity header, the detail shows the evidence payload scan.issue
@@ -33,7 +36,8 @@ surface (spec ACs T7-16 .. T7-20, umbrella UI-1, UI-2, UI-3, UI-5).
   T7-19 (UI-5) a `map-only` job that reached `done`: every host, `METHOD path_template` and
         point name of the harness's live scan.sitemap read is in the rendered text (never
         a fixture); Enter on the node under the cursor opens its first flow in the
-        inspector.
+        inspector. A Site map head that never draws is reported with the strip banner,
+        the Jobs cursor's job and the harness's own node counts (H39).
   T7-20 hygiene: the seeded Cookie and Authorization values (and their first 12 hex
         chars) never appear in any screen sample taken on the Scan surface (every sample
         is kept, tagged with its surface, and grepped), and q ends the process with exit 0.
@@ -52,7 +56,9 @@ real pty and real ports, so it runs from a real shell or rig, NEVER from the san
 summary) is written to $AITM_E2E_ARTIFACTS, else to a temp dir named on stdout; the
 seeded secrets are redacted from everything written or printed, and are never printed.
 Results are three-state: `ok`, `FAIL`, and `note` (a sub-step the core could not offer,
-recorded and tallied apart, never a pass). The per-run work dir (the TUI's HOME, the
+recorded and tallied apart, never a pass); a failing check keeps its whole redacted
+screen as `fail-<n>-<step>.txt` and the summary lists those files (H38). The per-run
+work dir (the TUI's HOME, the
 0600 token file, the self-booted core's findings store with the seeded session values)
 is removed with the run; the L4 scope entry the cell adds is removed by its id.
 
@@ -60,7 +66,8 @@ Exit 0 PASS / 1 FAIL / 77 SKIP.
 
 `python3 -I tests/e2e/tui/test_tui_scan_live.py --selftest` runs the screen readers
 (cursor row, severity group, editor header, surface tag, inspector, Findings head, the
-Site map node and marker, the wire-confirm overlay) and the L4 scope read against frames
+Site map node and marker, the wire-confirm overlay, the crawl `browser` line, the strip
+banner), the failure-screen writer and the L4 scope read against frames
 painted with the TUI's real geometry (the boxed Scan view, its pane rule, a sidebar
 offset), with no core and no pty, one line per assertion; exit 0 when all hold.
 """
@@ -68,6 +75,7 @@ from __future__ import annotations
 
 import codecs
 import fcntl
+import io
 import json
 import os
 import pty
@@ -181,6 +189,30 @@ REFUSAL_WORDINGS = {
 }
 CONFIRM_TITLE = "Confirm over the wire: scan launch"
 NO_L4_ID = "no id"
+# A job's terminal states (`aitm_scan_model::JobState`): after one of them `x` is inert
+# (the banner reads `already <state>`), so T7-16 cancels a fresh job instead (H37).
+TERMINAL_STATES = ("done", "cancelled", "failed")
+# The editor's Fields pane walks these in this order (`crates/aitm-tui/src/scan/profiles.rs`
+# `EDITOR_FIELDS`, spec D3); the cursor is a highlight, not a glyph, so the cell counts
+# its `j` presses from `g` (the first field) to `use_browser` instead of reading it.
+EDITOR_FIELDS = ("name", "origins", "l4_targets", "lane_http", "lane_ws", "lane_l4_packet",
+                 "lane_l4_stream", "intensity", "speed", "accuracy", "checks", "crawl_strategy",
+                 "use_browser", "max_depth", "max_pages", "submit_forms", "session_mode", "on_lost",
+                 "budget_probes", "budget_time_s", "budget_max_issues", "http_version",
+                 "record_probes")
+# The crawl Fields line (`ui/scan/profiles.rs` `field_lines`, the `crawl` row:
+# `<strategy> · browser <value> · depth ..`); `e` on the field cycles the ring auto, always,
+# never (`crates/aitm-scan-model/src/vocab.rs` `UseBrowser`, `scan/profiles.rs` `BROWSERS`).
+# A `standard` job under `auto` with no reachable browser burns its probes without finding
+# a point (the first live run: 182 probes, zero issues), so every HTTP launch from the held
+# editor sets `never` first and asserts the line (H42).
+BROWSER_FIELD_RE = re.compile(r"· browser (auto|always|never) ·")
+BROWSER_RING = ("auto", "always", "never")
+# The strip banner's quiet states (`ui/scan/mod.rs` `banner`): `idle`, a refresh in flight,
+# the `already <state>` notice a key left. Anything else on the strip row is the tab's
+# last error wording (D9) or its degraded text (D2), which T7-19 waits for as the other
+# way the Site map can settle (H39).
+BANNER_QUIET_RE = re.compile(r"^(idle|refreshing \S+\.\.\.|already [a-z]+)$")
 
 
 class Fatal(Exception):
@@ -379,7 +411,7 @@ class Evidence:
     Scan view under it (H15). A secret is matched whole and by its first SECRET_PREFIX
     hex chars, so a pane that truncates the value is still caught."""
 
-    def __init__(self, secret_values):
+    def __init__(self, secret_values, directory=None):
         self.secrets = [s for s in secret_values if s]
         self.needles = []
         for s in self.secrets:
@@ -387,7 +419,7 @@ class Evidence:
             if len(s) > SECRET_PREFIX:
                 self.needles.append(s[:SECRET_PREFIX])
         self.samples = []  # (step, tag, raw text)
-        self._dir = os.environ.get("AITM_E2E_ARTIFACTS") or None
+        self._dir = directory or os.environ.get("AITM_E2E_ARTIFACTS") or None
 
     @property
     def dir(self):
@@ -429,25 +461,57 @@ class Evidence:
         return sum(1 for _, t, _ in self.samples if t == tag)
 
 
+def step_slug(name):
+    """The step a check belongs to, from its name's prefix (`T7-16: ..` -> `t7-16`,
+    `seed: ..` -> `seed`), as a file-name part."""
+    return re.sub(r"[^a-z0-9]+", "-", name.split(":", 1)[0].lower()).strip("-") or "check"
+
+
 class Checks:
     """Three-state results: `ok`, `FAIL`, `note` (a sub-step the core could not offer,
-    recorded and tallied apart; never a pass, never a failure)."""
+    recorded and tallied apart; never a pass, never a failure). A failing check keeps
+    the whole screen as evidence (H38): when `screen` (the raw screen text) and `write`
+    (the Evidence writer, which redacts) are given, the screen goes to
+    `fail-<n>-<step>.txt` (`n` the failure's ordinal), the check's line names the file
+    and `files` lists them for the summary; the detail's 700-character cut stays for
+    the stdout reader."""
 
-    def __init__(self, redact=str):
+    def __init__(self, redact=str, screen=None, write=None, out=None):
         self.results = []  # (name, state)
+        self.files = []  # the failure screens written (H38)
         self._redact = redact
+        self._screen = screen
+        self._write = write
+        self._out = out
+
+    def _say(self, line):
+        print(line, file=self._out if self._out is not None else sys.stdout, flush=True)
+
+    def _keep_screen(self, name):
+        """Write the failing screen; the path, or what stopped the write (never raises:
+        a check must record its failure whatever the terminal is doing)."""
+        if self._screen is None or self._write is None:
+            return ""
+        try:
+            path = self._write(f"fail-{len(self.failed())}-{step_slug(name)}.txt", self._screen())
+        except Exception as e:  # noqa: BLE001
+            return f"  -- screen not kept: {type(e).__name__}"
+        self.files.append(path)
+        return f"  -- screen: {path}"
 
     def check(self, name, ok, detail=""):
         ok = bool(ok)
         self.results.append((name, "ok" if ok else "FAIL"))
         tail = "" if ok or not detail else f"  -- {self._redact(detail)[:700]}"
-        print(("ok   " if ok else "FAIL ") + name + tail, flush=True)
+        if not ok:
+            tail += self._keep_screen(name)
+        self._say(("ok   " if ok else "FAIL ") + name + tail)
         return ok
 
     def note(self, name, detail=""):
         self.results.append((name, "note"))
         tail = f"  -- {self._redact(detail)[:300]}" if detail else ""
-        print("note " + name + tail, flush=True)
+        self._say("note " + name + tail)
 
     def fatal(self, name, detail=""):
         self.check(name, False, detail)
@@ -742,6 +806,39 @@ def wordings_on(text):
     return sorted(code for code, w in REFUSAL_WORDINGS.items() if w in text)
 
 
+def browser_value(text):
+    """The held editor's crawl `browser` value as the Fields line reads it (`auto`,
+    `always`, `never`), or None without an editor on screen (H42)."""
+    m = BROWSER_FIELD_RE.search(text)
+    return m.group(1) if m else None
+
+
+def banner_of(text):
+    """The Scan strip row's state banner (`ui/scan/mod.rs` `banner`): the text after
+    the last tab label, to the box's right border; None off the view (H39)."""
+    line = line_with(text, SCAN_STRIP)
+    if line is None or "4 Issues" not in line:
+        return None
+    return line.split("4 Issues", 1)[1].split("│", 1)[0].strip()
+
+
+def banner_is_error(banner):
+    """True for a banner that is neither `idle`, a refresh in flight nor the `already
+    <state>` notice: the tab's last error wording or its degraded text (H39)."""
+    return bool(banner) and BANNER_QUIET_RE.match(banner) is None
+
+
+def sitemap_node_count(bus, args):
+    """The node count of the harness's own `scan.sitemap` read with `args`, or the
+    error text (H39)."""
+    try:
+        live = bus.call("scan.sitemap", args)
+    except (ToolError, BusError, OSError) as e:
+        return f"{type(e).__name__}: {e}"
+    nodes = live.get("nodes") if isinstance(live, dict) else None
+    return len(nodes) if isinstance(nodes, list) else f"no nodes list in {str(live)[:80]!r}"
+
+
 # ------------------------------------------------------------------- driving
 
 
@@ -862,6 +959,34 @@ def type_origin(ctx, origin):
     return poll(lambda: origin in ctx.term.text(), 10)
 
 
+def set_browser_never(ctx):
+    """The held editor's crawl `use_browser` set to `never` with `e` (H42). The Fields
+    pane is focused by construction, not read (focus is a style): one `Esc` to the List
+    pane (`focus_profiles_list`, draft kept), then one Tab (`step_pane`: List, Fields,
+    Origins, Checks); `g` puts the field cursor on the first field and `j` walks it to
+    `use_browser` (EDITOR_FIELDS, counted, since the cursor is a highlight); then `e`
+    round the ring until the crawl line reads `browser never`, each press checked to
+    have moved the value (an `e` on another field moves nothing and stops the loop).
+    Returns what the line reads afterwards, or None without a crawl line."""
+    term = ctx.term
+    if not focus_profiles_list(ctx):
+        return None
+    term.press("\t")
+    time.sleep(UI_SETTLE)
+    term.press("g")
+    time.sleep(UI_SETTLE)
+    term.press("j" * EDITOR_FIELDS.index("use_browser"))
+    time.sleep(UI_SETTLE)
+    for _ in range(len(BROWSER_RING)):
+        was = browser_value(term.text())
+        if was is None or was == "never":
+            break
+        term.press("e")
+        if not poll(lambda: browser_value(term.text()) not in (None, was), 5, 0.1):
+            break
+    return browser_value(term.text())
+
+
 def type_l4_target(ctx, spec):
     """`t` (PromptKind::ScanL4Target), `ip:port[/tcp|udp]`, Enter."""
     ctx.term.press("t")
@@ -942,6 +1067,8 @@ def step_t7_16(ctx):
                 ctx.screen("t7-16"))
     c.check("T7-16: `o` accepted the target origin into the editor", type_origin(ctx, ctx.origin),
             ctx.screen("t7-16"))
+    c.check("T7-16: the editor's crawl `browser` field reads `never` before the launch (H42)",
+            set_browser_never(ctx) == "never", ctx.screen("t7-16"))
 
     job = launch(ctx, "s")
     if not job:
@@ -976,9 +1103,11 @@ def step_t7_16(ctx):
                         "status_before_state": before.get("state"),
                         "status_after_state": after.get("state")})
         ctx.ev.write(f"screen-T7-16-{n}.txt", text)
-        if len(samples) >= SAMPLES_MIN and len(set(phases_of(samples))) > 1:
+        # `x` goes as soon as SAMPLES_MIN samples exist: a wait for a phase change let
+        # the job finish first (H37); the phase check reads whatever the samples hold.
+        if len(samples) >= SAMPLES_MIN:
             break
-        if (after.get("state") or "") in ("done", "cancelled", "failed"):
+        if (after.get("state") or "") in TERMINAL_STATES:
             break
         time.sleep(SAMPLE_GAP_S)
     ctx.ev.write_json("status-pairs.json", samples)
@@ -997,17 +1126,47 @@ def step_t7_16(ctx):
     phases = phases_of(samples)
     c.check("T7-16: the row's state/phase text changed at least once", len(set(phases)) > 1, phases)
 
+    # `x` cancels the job under the Jobs cursor. Against the small target the `standard`
+    # job can finish inside the sampling window (the first live run: 182 probes in about
+    # 6 s, `done` by the third sample), and `x` on a terminal job is inert (`already
+    # <state>`). So when the bracketing read taken before `x` already shows a terminal
+    # state, a fresh job is launched from the held editor and `x` goes within its first
+    # second, as soon as its row is drawn (the launch lands on the Jobs tab with the new
+    # job under the cursor, `land_started`); the cancel checks and the push counts then
+    # name that job (H37).
+    cancel_job = job
+    pre_x = status_of(ctx.bus, job)
+    if (pre_x.get("state") or "") in TERMINAL_STATES:
+        c.note(f"T7-16: {job} read `{pre_x.get('state')}` before `x`; a fresh `standard` job is "
+               "cancelled in its place (H37)", f"probes {sent_of(pre_x)}")
+        if not ensure_editor(ctx, "standard", ctx.origin):
+            c.check("T7-16: the held `standard` editor was available for the fresh job", False,
+                    ctx.screen("t7-16"))
+            return
+        c.check("T7-16: the fresh job's editor reads `browser never` (H42)",
+                set_browser_never(ctx) == "never", ctx.screen("t7-16"))
+        fresh = launch(ctx, "s")
+        if not fresh:
+            c.check("T7-16: `s` started the fresh job for the cancel (scan.list gained an id)", False,
+                    ctx.screen("t7-16"))
+            return
+        ctx.jobs["cancel"] = cancel_job = fresh
+        on_row = (term.wait_for(TAB_MARKERS["2"], ROW_APPEAR_S)
+                  and poll(lambda: row_tail(term.text(), fresh) is not None, ROW_APPEAR_S, 0.1))
+        c.check(f"T7-16: the Jobs tab drew the fresh job {fresh} under the cursor",
+                on_row and on_cursor(term.text(), fresh), ctx.screen("t7-16"))
     term.press("x")
-    cancelled = poll(lambda: "cancelled" in (row_state(term.text(), job) or ""), CANCEL_S, 0.3)
+    cancelled = poll(lambda: "cancelled" in (row_state(term.text(), cancel_job) or ""), CANCEL_S, 0.3)
     text = ctx.snap("t7-16-cancel")
     ctx.ev.write("screen-T7-16-cancel.txt", text)
-    c.check("T7-16: `x` left the row reading `cancelled`", cancelled, ctx.screen("t7-16"))
-    final = wait_field(lambda: status_of(ctx.bus, job), "state", "cancelled", CANCEL_S)
-    c.check("T7-16: scan.status agrees the job is `cancelled`", final.get("state") == "cancelled",
+    c.check(f"T7-16: `x` left the row of {cancel_job} reading `cancelled`", cancelled,
+            f"pre-x state {pre_x.get('state')}; banner {banner_of(text)!r}; {ctx.screen('t7-16')}")
+    final = wait_field(lambda: status_of(ctx.bus, cancel_job), "state", "cancelled", CANCEL_S)
+    c.check(f"T7-16: scan.status agrees {cancel_job} is `cancelled`", final.get("state") == "cancelled",
             final.get("state"))
 
-    counts = ctx.pushes.of(job)
-    c.check("T7-16: the second bus client saw a `progress` and a `cancelled` job line",
+    counts = ctx.pushes.of(cancel_job)
+    c.check(f"T7-16: the second bus client saw a `progress` and a `cancelled` line for {cancel_job}",
             counts.get("progress", 0) >= 1 and counts.get("cancelled", 0) >= 1, counts)
 
 
@@ -1046,6 +1205,8 @@ def step_t7_17(ctx):
         c.check("T7-17: the `standard` editor with the target origin was available", False,
                 ctx.screen("t7-17"))
         return
+    c.check("T7-17: the editor's crawl `browser` field reads `never` before the launch (H42)",
+            set_browser_never(ctx) == "never", ctx.screen("t7-17"))
     job = launch(ctx, "s")
     if not job:
         c.check("T7-17: the second `s` started a job", False, ctx.screen("t7-17"))
@@ -1273,6 +1434,13 @@ def harness_scan_start(ctx):
         target = {}
         profile["target"] = target
     target["l4"] = [{"ip": "127.0.0.1", "port": ctx.target_port, "proto": "tcp"}]
+    # The same crawl browser setting the TUI's launches carry (H42; `CrawlOptions` is
+    # `deny_unknown_fields`, so the key goes on the profile's own `crawl` object).
+    crawl = profile.get("crawl")
+    if not isinstance(crawl, dict):
+        crawl = {}
+        profile["crawl"] = crawl
+    crawl["use_browser"] = "never"
     try:
         res = ctx.bus.confirm("scan.start", {"profile": profile})
     except (ToolError, BusError) as e:
@@ -1416,6 +1584,8 @@ def step_t7_19(ctx):
     if not type_origin(ctx, ctx.origin):
         c.check("T7-19: `o` never accepted the origin for the map job", False, ctx.screen("t7-19"))
         return
+    c.check("T7-19: the editor's crawl `browser` field reads `never` before the launch (H42)",
+            set_browser_never(ctx) == "never", ctx.screen("t7-19"))
     job = launch(ctx, "m")
     if not job:
         c.check("T7-19: `m` started no map job", False, ctx.screen("t7-19"))
@@ -1441,9 +1611,28 @@ def step_t7_19(ctx):
     term.press("3")
     term.press("J")
     marker = SITEMAP_MARKER.format(n=len(nodes))
+    # The tab settles two ways: the head, or an error wording on the strip banner (a
+    # `scan.sitemap` failure lands there, D9/D13); the failure then says which, with
+    # the strip row, whether the body still reads `no site map yet`, the Jobs cursor's
+    # job as the Jobs tab shows it (the job `J` pinned) and the harness's own node
+    # counts for `scan.sitemap {}` and `{job}` (H39).
+    poll(lambda: marker in term.text() or banner_is_error(banner_of(term.text())), 15)
+    text = ctx.snap("t7-19-sitemap")
+    drew = marker in text
+    detail = ""
+    if not drew:
+        ctx.ev.write("screen-T7-19-sitemap.txt", text)
+        all_count = sitemap_node_count(ctx.bus, {})
+        jobs_cursor = None
+        if tab(ctx, "2", 5):
+            jobs_cursor = (cursor_row(term.text()) or "").split(" ", 1)[0] or None
+        ctx.ev.write("screen-T7-19-jobs.txt", ctx.snap("t7-19-jobs"))
+        detail = (f"banner {banner_of(text)!r} (error wording: {banner_is_error(banner_of(text))}); "
+                  f"body reads `no site map yet`: {'no site map yet' in text}; Jobs cursor job "
+                  f"{jobs_cursor!r} (map job {job}); harness scan.sitemap {{}} {all_count} nodes, "
+                  f"{{job}} {len(nodes)} nodes; strip row {(line_with(text, SCAN_STRIP) or '').strip()!r}")
     if not c.check(f"T7-19: the Site map tab drew the live read's {len(nodes)} nodes for this job "
-                   f"(`{marker}` on the Nodes pane head after `J`)",
-                   poll(lambda: marker in term.text(), 15), ctx.screen("t7-19")):
+                   f"(`{marker}` on the Nodes pane head after `J`)", drew, detail):
         return
 
     # Walk the Nodes pane from the top, one row per `j`, polling for the cursor to move.
@@ -1617,8 +1806,6 @@ def run(tui, ev, marker, cookie_secret, auth_secret):
         target_port = u.port or (443 if u.scheme == "https" else 80)
         origin = f"{u.scheme}://{u.hostname}:{target_port}"
 
-        c = Checks(ev.redact)
-
         work = work or tempfile.mkdtemp(prefix="aitm-tui-scan-run-")
         token_file = os.path.join(work, "bus.token")
         with os.fdopen(os.open(token_file, os.O_WRONLY | os.O_CREAT, 0o600), "w") as f:
@@ -1629,6 +1816,13 @@ def run(tui, ev, marker, cookie_secret, auth_secret):
         term = Terminal([tui, "--bus", tui_bus, "--token-file", token_file,
                          "--expect-role", "operator", "--ansi", "--poll", "200"], child_env)
 
+        def failing_screen():
+            # The screen a failing check keeps (H38), a sample too: taken on the Scan
+            # surface it is in the T7-20 grep like any other (tagged from its text, H3).
+            text = term.text()
+            return ev.sample("fail", text, surface_of(text))
+
+        c = Checks(ev.redact, screen=failing_screen, write=ev.write)
         ctx = Ctx(c, term, bus, pushes, ev, proxy_port, target, origin, target_port, names)
         ctx.marker, ctx.cookie_secret, ctx.auth_secret = marker, cookie_secret, auth_secret
 
@@ -1649,8 +1843,11 @@ def run(tui, ev, marker, cookie_secret, auth_secret):
         head = (("PASS" if not failed else "FAIL")
                 + f": {n_ok} ok, {n_noted} noted, {n_failed} failed"
                 + f"; aitm-tui Scan surface on bus {tui_bus}: jobs {sorted(ctx.jobs.values())}"
-                + ("" if not failed else f"; failed: {failed}"))
-        ev.write("summary.txt", "\n".join(c.lines() + ["", head, f"evidence dir: {ev.dir}"]) + "\n")
+                + ("" if not failed else f"; failed: {failed}")
+                + ("" if not c.files else f"; failure screens: {c.files}"))
+        ev.write("summary.txt", "\n".join(c.lines() + ["", head]
+                                          + [f"failure screen: {p}" for p in c.files]
+                                          + [f"evidence dir: {ev.dir}"]) + "\n")
         print(head, flush=True)
         return 0 if not failed else 1
     finally:
@@ -1765,10 +1962,11 @@ def scan_box(f, tab, offset=0, banner="idle"):
     return ix, body_y, left, rule_x, rule_x + 1, iw - left - 1, body_h
 
 
-def profiles_frame(editor, offset=0):
+def profiles_frame(editor, offset=0, browser="auto"):
     """Profiles (ui/scan/profiles.rs): the column header, three rows with `standard`
     under the cursor, and on the detail side either the no-editor hint over the D7
-    gate text and the key footer, or the held editor's header and Fields block."""
+    gate text and the key footer, or the held editor's header and Fields block (its
+    `crawl` row carrying `browser` as `field_lines` writes it, H42)."""
     f = Frame()
     chrome(f)
     lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 1, offset)
@@ -1788,6 +1986,7 @@ def profiles_frame(editor, offset=0):
         f.put(dx, y + 3, f" {'lanes':<9} [x] http  [x] ws  [ ] l4_packet  [ ] l4_stream")
         f.put(dx, y + 4, f" {'intensity':<9} balanced   speed normal   accuracy balanced")
         f.put(dx, y + 5, f" {'checks':<9} all (12)")
+        f.put(dx, y + 6, f" {'crawl':<9} normal · browser {browser} · depth 3 · pages 200 · forms on")
     else:
         f.put(dx, y, " ⏎ opens the profile under the cursor · N new profile")
         f.put(dx, y + bh - 2, " L4 launch disabled: open the profile (⏎) to check its L4 target and scope")
@@ -1861,15 +2060,16 @@ SITEMAP_NODES = [{"method": "GET", "path_template": "/search", "scheme": "http",
                   "port": 8080, "flows": ["f-3"]}]
 
 
-def sitemap_frame(cursor=0, count=None, nodes=SITEMAP_NODES):
+def sitemap_frame(cursor=0, count=None, nodes=SITEMAP_NODES, banner="idle"):
     """Site map (ui/scan/sitemap.rs): the summary head (`hint`: a pad cell, then
     `summary`'s `N nodes · ..`; `count` overrides N), a host header, the node rows
     (`node_text`: `METHOD path_template  flows n · pts n`) with the cursor on row
     `cursor`, and the Points pane whose cursor row sits one row ABOVE the Nodes cursor
-    row, right after the pane rule (the H9 trap)."""
+    row, right after the pane rule (the H9 trap); `banner` is the strip's state text
+    (H39)."""
     f = Frame()
     chrome(f)
-    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 3)
+    lx, y, lw, rule_x, dx, dw, bh = scan_box(f, 3, banner=banner)
     f.put(lx, y, f" {len(nodes) if count is None else count} nodes · 2 points of n-1")
     f.put(lx, y + 1, f" {host_label(nodes[0])}")
     for k, n in enumerate(nodes):
@@ -2103,6 +2303,43 @@ def selftest():
             cell == ISSUE_NAME[:ISSUE_NAME_MIN - 1] + "…" and name_cell_matches(cell, needle)
             and not name_cell_matches(cell, "Reflecxx") and name_cell_matches(needle, needle),
             repr(cell))
+    # Cell items from the first live smoke run, H37 to H39, and H42.
+    fail_dir = tempfile.mkdtemp(prefix="aitm-tui-scan-selftest-")
+    try:
+        fail_ev = Evidence([secret], directory=fail_dir)
+        captured = io.StringIO()
+        inner = Checks(fail_ev.redact, screen=lambda: f"│ Cookie: sid={secret}", write=fail_ev.write,
+                       out=captured)
+        inner.check("T7-16: a check that fails", False, "the detail")
+        inner.check("T7-16: a check that passes", True)
+        written = inner.files[0] if inner.files else ""
+        body = open(written, encoding="utf-8").read() if written and os.path.isfile(written) else ""
+        c.check("selftest: a failing check writes the full redacted screen to `fail-<n>-<step>.txt`, "
+                "names the file in its line, and a passing one writes nothing (H38)",
+                len(inner.files) == 1 and os.path.basename(written) == "fail-1-t7-16.txt"
+                and REDACTED in body and secret not in body and secret[:SECRET_PREFIX] not in body
+                and written in captured.getvalue() and secret not in captured.getvalue(),
+                f"files {inner.files}; printed {captured.getvalue()[:160]!r}")
+    finally:
+        shutil.rmtree(fail_dir, ignore_errors=True)
+
+    never, auto = profiles_frame(editor=True, browser="never"), profiles_frame(editor=True)
+    c.check("selftest: Profiles: the crawl Fields line reads `browser never` on the never frame "
+            "and `browser auto` on the builtin one, never both (H42)",
+            browser_value(never) == "never" and browser_value(auto) == "auto"
+            and "browser never" not in auto and browser_value(plain) is None,
+            f"{browser_value(never)!r} {browser_value(auto)!r} {browser_value(plain)!r}")
+
+    erred = sitemap_frame(banner="scan.sitemap: reply did not match the contract (missing field `nodes`)")
+    noticed = sitemap_frame(banner="already done")
+    c.check("selftest: Site map: the strip banner is read off the strip row; `idle` and the "
+            "`already <state>` notice are quiet, an error wording is not (H39)",
+            banner_of(sitemap) == "idle" and not banner_is_error(banner_of(sitemap))
+            and banner_of(noticed) == "already done" and not banner_is_error(banner_of(noticed))
+            and banner_is_error(banner_of(erred)) and banner_of(erred).startswith("scan.sitemap: ")
+            and banner_of(insp) is None,
+            f"{banner_of(sitemap)!r} {banner_of(noticed)!r} {banner_of(erred)!r}")
+
     n_ok, n_noted, n_failed = c.tally()
     print(f"{'PASS' if not n_failed else 'FAIL'}: selftest {n_ok} ok, {n_failed} failed", flush=True)
     return 0 if not n_failed else 1
