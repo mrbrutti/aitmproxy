@@ -43,6 +43,22 @@ const READ_CHUNK: usize = 8192;
 /// Largest UDP payload a datagram can carry.
 const MAX_DATAGRAM: usize = 65_535;
 
+/// Most TCP connections one service serves at a time (spec D5). A
+/// connection parked in [`Step::Wait`] pins up to its speaker's
+/// `max_buffer()` bytes until EOF, so this bounds the target at about
+/// 256 MiB per service in the worst case. The accept loop simply does not
+/// `accept` while this many are open: later connects wait in the listen
+/// backlog, never refused, so the Vulnerable "connect refused" oracle stays
+/// unambiguous. There is deliberately no deadline on an incomplete message
+/// (it would reintroduce the silent close D5 forbids).
+const MAX_CONNS: usize = 256;
+
+/// Whether the accept loop may take another connection with `open` in
+/// flight: the [`MAX_CONNS`] gate.
+fn accepting(open: usize) -> bool {
+    open < MAX_CONNS
+}
+
 /// Rebind retry cadence and budget against `AddrInUse` after a crash window
 /// (plan P3: every 50 ms, up to 2 s).
 const REBIND_RETRY: Duration = Duration::from_millis(50);
@@ -166,7 +182,9 @@ pub(crate) enum Action {
     Keep,
     /// Close the connection with this reason.
     CloseConn(CloseReason),
-    /// The Patched-mode fault close: `error` after a parse or an idle,
+    /// The fault close after [`Step::Fault`]'s reply, if any: the P answer
+    /// to a V trigger, and in either mode the answer to malformed
+    /// non-trigger input. Reason `error` after a parse or an idle,
     /// `oversize` past the buffer cap (the driver knows which).
     Fault,
     /// Open the crash window: log `downtime`, close with reason `trigger`,
@@ -177,7 +195,9 @@ pub(crate) enum Action {
 /// The driver's reading of a [`Step`] (spec D5 semantics, plan P2):
 /// `Reply`/`ProtocolError`/`Denylisted` write when non-empty and keep;
 /// `Fault` writes when non-empty and takes the fault close; `Close` writes
-/// when given and closes `quit`; `Trigger` crashes.
+/// when given and closes `quit`; `Trigger` crashes; `Wait` writes nothing
+/// and keeps (the TCP idle path short-circuits it before any logging, see
+/// [`idle_outcome`]).
 pub(crate) fn apply(step: Step) -> Vec<Action> {
     let write = |bytes: Vec<u8>| (!bytes.is_empty()).then_some(Action::Write(bytes));
     let (write, then) = match step {
@@ -185,8 +205,43 @@ pub(crate) fn apply(step: Step) -> Vec<Action> {
         Step::Fault(b) => (write(b), Action::Fault),
         Step::Close(b) => (b.and_then(write), Action::CloseConn(CloseReason::Quit)),
         Step::Trigger => (None, Action::Crash),
+        Step::Wait => (None, Action::Keep),
     };
     write.into_iter().chain(std::iter::once(then)).collect()
+}
+
+/// Why the driver handed a non-empty, incomplete buffer to `on_idle`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IdleCause {
+    /// [`IDLE_TIMEOUT`] passed without new bytes.
+    Timeout,
+    /// The buffer outgrew the speaker's `max_buffer()`.
+    Oversize,
+}
+
+/// What the driver does with an `on_idle` step.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum IdleOutcome {
+    /// Keep the connection and the buffer, log nothing, re-arm the idle
+    /// timer (T10 PR C: a partial line is not a protocol event).
+    Wait,
+    /// A speaker waited past its cap, which would buffer without bound:
+    /// contain the speaker bug by closing `oversize`.
+    CloseOversize,
+    /// Log the buffer as the `in` message and apply the step; a `Fault`
+    /// closes with this reason (`error` after an idle, `oversize` past the
+    /// cap).
+    Step(CloseReason),
+}
+
+/// The idle decision table: `Wait` is honoured only within the cap.
+pub(crate) fn idle_outcome(step: &Step, cause: IdleCause) -> IdleOutcome {
+    match (step, cause) {
+        (Step::Wait, IdleCause::Timeout) => IdleOutcome::Wait,
+        (Step::Wait, IdleCause::Oversize) => IdleOutcome::CloseOversize,
+        (_, IdleCause::Timeout) => IdleOutcome::Step(CloseReason::Error),
+        (_, IdleCause::Oversize) => IdleOutcome::Step(CloseReason::Oversize),
+    }
 }
 
 /// How many of the `pending` buffered bytes are the `in` message for
@@ -204,7 +259,8 @@ pub(crate) fn input_span(step: &Step, consumed: usize, pending: usize) -> usize 
 /// `ok|protocol_error|denylisted|trigger`; [`Classified`] serialises it).
 pub(crate) fn classified(step: &Step) -> Classified {
     match step {
-        Step::Reply(_) | Step::Close(_) => Classified::Ok,
+        // `Wait` is never logged; `Ok` is its defensive total mapping.
+        Step::Reply(_) | Step::Close(_) | Step::Wait => Classified::Ok,
         Step::ProtocolError(_) | Step::Fault(_) => Classified::ProtocolError,
         Step::Denylisted(_) => Classified::Denylisted,
         Step::Trigger => Classified::Trigger,
@@ -278,7 +334,7 @@ impl TcpConn {
                 Event::Eof => return self.close(CloseReason::Eof),
                 Event::ReadError => return self.close(CloseReason::Error),
                 Event::Idle => {
-                    if let Some(end) = self.idle(CloseReason::Error).await {
+                    if let Some(end) = self.idle(IdleCause::Timeout).await {
                         return end;
                     }
                 }
@@ -289,7 +345,7 @@ impl TcpConn {
                         return end;
                     }
                     if self.buf.len() > self.speaker.max_buffer() {
-                        if let Some(end) = self.idle(CloseReason::Oversize).await {
+                        if let Some(end) = self.idle(IdleCause::Oversize).await {
                             return end;
                         }
                     }
@@ -327,10 +383,23 @@ impl TcpConn {
     }
 
     /// Hand the whole pending buffer to `on_idle` (after [`IDLE_TIMEOUT`] or
-    /// past `max_buffer()`); a `Fault` then closes with `fault_reason`.
-    async fn idle(&mut self, fault_reason: CloseReason) -> Option<ConnEnd> {
+    /// past `max_buffer()`). A `Wait` within the cap keeps everything as it
+    /// is, unlogged, and the 200 ms timer re-arms at once: `on_idle` runs
+    /// again on the unchanged buffer every [`IDLE_TIMEOUT`] until bytes or
+    /// EOF arrive (there is no `waiting` flag; the re-poll is bounded by
+    /// `max_buffer()` and harmless on loopback). The connection still ends
+    /// on peer EOF, on the crash window, or when the target drops (the task
+    /// is aborted). Any other step is logged and applied; a `Fault` closes
+    /// with the cause's reason.
+    async fn idle(&mut self, cause: IdleCause) -> Option<ConnEnd> {
         let step = self.speaker.on_idle(self.mode, &self.buf);
-        self.step(self.buf.len(), None, step, fault_reason).await
+        match idle_outcome(&step, cause) {
+            IdleOutcome::Wait => None,
+            IdleOutcome::CloseOversize => Some(self.close(CloseReason::Oversize)),
+            IdleOutcome::Step(fault_reason) => {
+                self.step(self.buf.len(), None, step, fault_reason).await
+            }
+        }
     }
 
     /// Log the first `take` buffered bytes as the `in` message, carry out
@@ -433,7 +502,8 @@ async fn read_event(stream: &mut TcpStream, scratch: &mut [u8], pending: bool) -
 
 /// Accept loop with the crash window: serve `first` (bound on `addr`) until
 /// a connection crashes, then drop it, signal every open connection, wait
-/// out the window and rebind `addr`.
+/// out the window and rebind `addr`. Never more than [`MAX_CONNS`]
+/// connections are open at once (see [`accepting`]).
 async fn run_tcp(
     def: ServiceDef,
     addr: SocketAddr,
@@ -461,8 +531,11 @@ async fn run_tcp(
         let (down_tx, down_rx) = watch::channel(false);
         let mut conns: JoinSet<ConnEnd> = JoinSet::new();
         loop {
+            // At the cap the accept branch is disabled; the join branch is
+            // then live (the set is non-empty) and re-enables it as soon as
+            // one connection ends.
             tokio::select! {
-                accepted = listener.accept() => match accepted {
+                accepted = listener.accept(), if accepting(conns.len()) => match accepted {
                     Ok((stream, peer)) => {
                         let n = conn_ids.fetch_add(1, Ordering::SeqCst) + 1;
                         let conn_id = format!("c-{n:08x}");
@@ -597,7 +670,7 @@ async fn run_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::log::CloseReason;
+    use crate::log::{Classified, CloseReason};
     use crate::speakers::{Proto, Step};
 
     #[test]
@@ -689,6 +762,8 @@ mod tests {
         );
         // Trigger: crash.
         assert_eq!(apply(Step::Trigger), vec![Action::Crash]);
+        // Wait: nothing to write, keep the connection (T10 PR C).
+        assert_eq!(apply(Step::Wait), vec![Action::Keep]);
         // Close: write when given, then close with reason `quit`.
         assert_eq!(
             apply(Step::Close(None)),
@@ -765,6 +840,62 @@ mod tests {
             row["trigger_sha256"],
             serde_json::json!(crate::log::sha256_hex(b""))
         );
+    }
+
+    // --- T10 PR C: `Step::Wait` from `on_idle` ---
+
+    #[test]
+    fn idle_wait_keeps_the_connection_within_the_cap_and_closes_oversize_past_it() {
+        // A stalled partial line after the 200 ms idle: no log entry, no
+        // write, connection kept, the idle timer re-arms on the next read.
+        assert_eq!(
+            idle_outcome(&Step::Wait, IdleCause::Timeout),
+            IdleOutcome::Wait
+        );
+        // A speaker must never wait past its `max_buffer()`; the driver
+        // contains that bug by closing `oversize` rather than buffering
+        // without bound.
+        assert_eq!(
+            idle_outcome(&Step::Wait, IdleCause::Oversize),
+            IdleOutcome::CloseOversize
+        );
+        // Every other step is logged and applied with the cause's fault
+        // reason: `error` after an idle, `oversize` past the cap.
+        for step in [
+            Step::Trigger,
+            Step::Fault(b"x".to_vec()),
+            Step::Fault(vec![]),
+            Step::Close(None),
+            Step::ProtocolError(b"x".to_vec()),
+            Step::Reply(vec![]),
+        ] {
+            assert_eq!(
+                idle_outcome(&step, IdleCause::Timeout),
+                IdleOutcome::Step(CloseReason::Error),
+                "{step:?}"
+            );
+            assert_eq!(
+                idle_outcome(&step, IdleCause::Oversize),
+                IdleOutcome::Step(CloseReason::Oversize),
+                "{step:?}"
+            );
+        }
+        // `Wait` is never logged by the driver; its defensive mappings are
+        // the no-op ones.
+        assert_eq!(classified(&Step::Wait), Classified::Ok);
+        assert_eq!(input_span(&Step::Wait, 2, 10), 2);
+    }
+
+    // --- T10 PR C fix round 1: the per-service connection cap ---
+
+    #[test]
+    fn accept_loop_pauses_at_max_conns() {
+        // The boundary of the gate on `run_tcp`'s accept arm; the why is
+        // on `MAX_CONNS`.
+        assert_eq!(MAX_CONNS, 256);
+        assert!(accepting(255));
+        assert!(!accepting(256));
+        assert!(!accepting(257));
     }
 
     // --- Tester additions (stage 5) ---
