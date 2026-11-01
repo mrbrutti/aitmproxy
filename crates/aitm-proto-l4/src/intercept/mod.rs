@@ -282,9 +282,21 @@ impl ParkedTable {
         self.entries.keys().copied().collect()
     }
 
-    /// A snapshot (clones) of every parked packet (unordered).
+    /// A snapshot (clones) of every parked packet (unordered), for the
+    /// [`InterceptHandle::parked`] API.
     fn parked(&self) -> Vec<ParkedPacket> {
         self.entries.values().map(|e| e.parked.clone()).collect()
+    }
+
+    /// The ids of every live packet whose deadline is at or before `now`, read by
+    /// reference: the reader thread asks this every poll, so it must not clone a
+    /// table of payloads the way [`parked`](Self::parked) does. Removes nothing.
+    fn due(&self, now: SystemTime) -> Vec<ParkedId> {
+        self.entries
+            .values()
+            .filter(|e| e.parked.state.is_live() && e.parked.deadline <= now)
+            .map(|e| e.parked.id)
+            .collect()
     }
 }
 
@@ -528,15 +540,10 @@ fn apply_submitted(
 /// Forward or drop every parked packet whose deadline has passed, per `on_timeout`
 /// (default Forward — fail open). Removes them from the table.
 fn expire_due(queue: &mut dyn InterceptQueue, parked: &Mutex<ParkedTable>, on_timeout: Verdict) {
-    let now = SystemTime::now();
-    let due: Vec<ParkedId> = parked
+    let due = parked
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .parked()
-        .into_iter()
-        .filter(|p| p.state.is_live() && p.deadline <= now)
-        .map(|p| p.id)
-        .collect();
+        .due(SystemTime::now());
     for id in due {
         let entry = parked
             .lock()
@@ -994,6 +1001,55 @@ mod tests {
         );
 
         handle.stop();
+    }
+
+    /// `ParkedTable::due(now)` names exactly the live packets whose deadline is at
+    /// or before `now`, by reference (no packet clone), leaving the table intact;
+    /// a packet whose deadline is `now` exactly is due, one a step later is not.
+    #[test]
+    fn parked_table_due_names_only_the_expired_packets() {
+        let mut t = ParkedTable::default();
+        let now = SystemTime::now();
+        let flow = L4FlowId::new();
+        let packet = || L4Packet {
+            dir: L4Direction::Outbound,
+            timestamp: now,
+            decoded: PacketSpec::summarize(b"x"),
+            bytes: b"x".to_vec(),
+            injected: false,
+        };
+        let (past, exact, future) = (ParkedId::new(), ParkedId::new(), ParkedId::new());
+        t.park(0, past, flow, packet(), now, now - Duration::from_secs(1));
+        t.park(1, exact, flow, packet(), now, now);
+        t.park(
+            2,
+            future,
+            flow,
+            packet(),
+            now,
+            now + Duration::from_secs(60),
+        );
+
+        let by_uuid = |ids: &mut Vec<ParkedId>| ids.sort_by_key(|id| id.0);
+        let mut due = t.due(now);
+        by_uuid(&mut due);
+        let mut want = vec![past, exact];
+        by_uuid(&mut want);
+        assert_eq!(
+            due, want,
+            "the past and the exact deadline are due, the future is not"
+        );
+        assert_eq!(t.len(), 3, "due() only names ids; it removes nothing");
+
+        assert!(
+            t.due(now - Duration::from_secs(2)).is_empty(),
+            "nothing is due before the earliest deadline"
+        );
+        let mut all = t.due(now + Duration::from_secs(60));
+        by_uuid(&mut all);
+        let mut everyone = vec![past, exact, future];
+        by_uuid(&mut everyone);
+        assert_eq!(all, everyone);
     }
 
     /// Spec §4 / L4PAR-AC37: the arrival sequence is **process-wide**, so two
