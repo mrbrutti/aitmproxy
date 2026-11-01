@@ -17,9 +17,9 @@ use crate::craft::{PacketEndpoints, PacketSpec};
 use crate::flow::{L4Flow, L4FlowStore};
 
 /// How many packets `l4.flow.get` returns when the caller gives no `limit`.
-pub const FLOW_GET_DEFAULT_LIMIT: usize = 256;
+pub(crate) const FLOW_GET_DEFAULT_LIMIT: usize = 256;
 /// The most packets one `l4.flow.get` reply carries; a larger `limit` is clamped.
-pub const FLOW_GET_MAX_LIMIT: usize = 4096;
+pub(crate) const FLOW_GET_MAX_LIMIT: usize = 4096;
 
 /// The `[offset, offset + limit)` slice of a flow's packet log that one
 /// `l4.flow.get` reply carries (spec §2, L4PAR-AC2).
@@ -31,13 +31,18 @@ pub(crate) struct PacketWindow {
     pub(crate) limit: usize,
 }
 
-impl PacketWindow {
-    /// The window an argument-less call (or the Rhai `l4.flow.get`) gets.
-    pub(crate) const DEFAULT: PacketWindow = PacketWindow {
-        offset: 0,
-        limit: FLOW_GET_DEFAULT_LIMIT,
-    };
+impl Default for PacketWindow {
+    /// The window an argument-less call (or the Rhai `l4.flow.get`) gets: the
+    /// first [`FLOW_GET_DEFAULT_LIMIT`] packets.
+    fn default() -> Self {
+        PacketWindow {
+            offset: 0,
+            limit: FLOW_GET_DEFAULT_LIMIT,
+        }
+    }
+}
 
+impl PacketWindow {
     /// Read `offset` / `limit` from a command's params: absent ⇒ the default,
     /// negative ⇒ an error naming the param, `limit` clamped to
     /// [`FLOW_GET_MAX_LIMIT`].
@@ -50,8 +55,9 @@ impl PacketWindow {
             usize::try_from(v)
                 .map_err(|_| anyhow::anyhow!("`{name}` must be a non-negative integer"))
         };
-        let offset = read("offset", Self::DEFAULT.offset)?;
-        let limit = read("limit", Self::DEFAULT.limit)?.min(FLOW_GET_MAX_LIMIT);
+        let default = Self::default();
+        let offset = read("offset", default.offset)?;
+        let limit = read("limit", default.limit)?.min(FLOW_GET_MAX_LIMIT);
         Ok(PacketWindow { offset, limit })
     }
 }
@@ -326,7 +332,8 @@ fn epoch_ms(t: SystemTime) -> i64 {
 fn insert_endpoints(o: &mut BTreeMap<String, Value>, e: &PacketEndpoints) {
     o.insert(
         "proto".to_string(),
-        e.proto.map_or(Value::Null, |p| Value::Str(p.to_string())),
+        e.proto
+            .map_or(Value::Null, |p| Value::Str(p.wire_name().to_string())),
     );
     o.insert(
         "src".to_string(),
@@ -790,15 +797,28 @@ mod tests {
         );
     }
 
+    /// A15 (L4PAR-AC2) — the window an argument-less call and the Rhai
+    /// `l4.flow.get` share is the type's `Default`.
+    #[test]
+    fn window_default() {
+        assert_eq!(
+            PacketWindow::default(),
+            PacketWindow {
+                offset: 0,
+                limit: 256
+            }
+        );
+    }
+
     /// L4PAR-AC2 — `PacketWindow::from_params` is the one place the window is read.
     #[test]
     fn window_from_params_defaults_and_clamps() {
         assert_eq!(
             PacketWindow::from_params(&Params::default()).expect("absent is default"),
-            PacketWindow::DEFAULT
+            PacketWindow::default()
         );
         assert_eq!(
-            PacketWindow::DEFAULT,
+            PacketWindow::default(),
             PacketWindow {
                 offset: 0,
                 limit: 256

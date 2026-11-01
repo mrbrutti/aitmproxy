@@ -22,6 +22,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
+use crate::types::L4Proto;
+
 /// Hard ceiling on a crafted packet, independent of the guard's configurable
 /// `max_packet_bytes` (which bounds *injection*, M5 Task 5). This is the pure
 /// builder's own sanity cap, at the IPv4 total-length limit.
@@ -188,11 +190,12 @@ pub struct PacketSummary {
 /// value is [`PacketEndpoints::default`] for a buffer that is not a packet.
 /// Field names match [`PacketSpec`]'s (`src_port` / `dst_port`), so a packet
 /// read back from a flow can seed the craft editor.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PacketEndpoints {
-    /// Transport name, the same names [`PacketSpec::summarize`] uses:
-    /// `"TCP"`, `"UDP"`, `"ICMP"` or `"ICMPv6"`.
-    pub proto: Option<&'static str>,
+    /// Transport the buffer decodes to: only [`L4Proto::Tcp`], [`L4Proto::Udp`],
+    /// [`L4Proto::Icmp`] or [`L4Proto::IcmpV6`]; its [`L4Proto::wire_name`] is
+    /// the name [`PacketSpec::summarize`] uses.
+    pub proto: Option<L4Proto>,
     /// Network-layer source address.
     pub src: Option<IpAddr>,
     /// Network-layer destination address.
@@ -243,8 +246,7 @@ impl PacketSpec {
     /// proto the guard uses for port matching and a `send_recv` reply must share.
     /// `Raw` when the spec declares no transport layer.
     #[must_use]
-    pub fn transport_proto(&self) -> crate::types::L4Proto {
-        use crate::types::L4Proto;
+    pub fn transport_proto(&self) -> L4Proto {
         for layer in &self.layers {
             match layer {
                 Layer::Tcp(_) => return L4Proto::Tcp,
@@ -313,17 +315,17 @@ impl PacketSpec {
         }
         match &p.transport {
             Some(TransportSlice::Tcp(t)) => {
-                out.proto = Some("TCP");
+                out.proto = Some(L4Proto::Tcp);
                 out.src_port = Some(t.source_port());
                 out.dst_port = Some(t.destination_port());
             }
             Some(TransportSlice::Udp(u)) => {
-                out.proto = Some("UDP");
+                out.proto = Some(L4Proto::Udp);
                 out.src_port = Some(u.source_port());
                 out.dst_port = Some(u.destination_port());
             }
-            Some(TransportSlice::Icmpv4(_)) => out.proto = Some("ICMP"),
-            Some(TransportSlice::Icmpv6(_)) => out.proto = Some("ICMPv6"),
+            Some(TransportSlice::Icmpv4(_)) => out.proto = Some(L4Proto::Icmp),
+            Some(TransportSlice::Icmpv6(_)) => out.proto = Some(L4Proto::IcmpV6),
             _ => {}
         }
         out
@@ -730,7 +732,7 @@ mod tests {
         assert_eq!(
             PacketSpec::endpoints(&bytes),
             PacketEndpoints {
-                proto: Some("UDP"),
+                proto: Some(L4Proto::Udp),
                 src: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
                 dst: Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
                 src_port: Some(40000),
@@ -770,7 +772,7 @@ mod tests {
         .build()
         .expect("craft builds");
         let e = PacketSpec::endpoints(&tcp);
-        assert_eq!(e.proto, Some("TCP"));
+        assert_eq!(e.proto, Some(L4Proto::Tcp));
         assert_eq!(e.src, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
         assert_eq!(e.dst, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
         assert_eq!(e.src_port, Some(1234));
@@ -794,7 +796,7 @@ mod tests {
         .build()
         .expect("craft builds");
         let e = PacketSpec::endpoints(&icmp);
-        assert_eq!(e.proto, Some("ICMP"));
+        assert_eq!(e.proto, Some(L4Proto::Icmp));
         assert_eq!(e.dst, Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
         assert_eq!(e.src_port, None);
         assert_eq!(e.dst_port, None);
@@ -815,7 +817,7 @@ mod tests {
         .build()
         .expect("craft builds");
         let e = PacketSpec::endpoints(&v6);
-        assert_eq!(e.proto, Some("UDP"));
+        assert_eq!(e.proto, Some(L4Proto::Udp));
         assert_eq!(e.src, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert_eq!(e.dst, Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
         assert_eq!(e.dst_port, Some(9));
