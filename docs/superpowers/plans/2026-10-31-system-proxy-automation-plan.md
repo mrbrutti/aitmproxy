@@ -1625,6 +1625,16 @@ Kept by the main session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 20–22 | quality, spec (PR 3) | Important | "Copy env line" and the `remedy` title unreachable: the polled compact object has no `guidance`/`remedy` and the web never called `proxy.system.status` | spec §D15 amended 2026-11-01 (menu-open full-status read, fields kept across polls); fixed in F-web (pending SHA) |
+| 22 | spec (PR 3) | Important | `apps/web/src/shell/Toolbar.test.tsx` not in Task 22's file list | authorised by the orchestrator in the dispatch (component unit test, not evidence); recorded 2026-11-01 |
+| 22 | security (PR 3) | Minor | "Copy env line" used a bare `navigator.clipboard.writeText` (throws on a non-secure context, silent on rejection) | fixed in F-web (`copyText` helper + notice on failure) |
+| 20 | security (PR 3) | Minor | server-supplied `host` interpolated unbounded into the pill | fixed in F-web (CSS clamp) |
+| 20 | spec (PR 3) | Minor | `· sys-proxy → ?:?` is outside the §D12 table | fixed in F-web (returns null when `other` lacks an endpoint) |
+| 20 | quality (PR 3) | Minor | `menuState` tests "unsupported" twice; `guidance`/`remedy` typed optional but always set | fixed in F-web |
+| 22 | quality (PR 3) | Minor | CSS comment inaccurate; hover wash invisible in light mode; clipboard stub not restored; `sysWord()` evaluated twice | fixed in F-web |
+| 20–22 | quality (PR 3) | Minor | status fixtures copied into three test files; two hand-rolled bus wrappers; both `proxy.status` readers carry their own wire type | accepted as follow-ups (shared `systemProxy.testkit.ts`; one `applyProxyStatus`), orchestrator 2026-11-01 |
+| 20 | spec (PR 3) | Minor | `SystemProxyMenuState` exported; disabled states beyond the three titled ones (`needs_privilege` with the remedy, `unknown`, no status) | accepted (recorded): the §D12 actions column gives "—" for those rows |
+| 22 | spec (PR 3) | Minor | pill word position before `· intercept armed` untested | fixed in F-web (assertion added) |
 | 7 | quality (F4) | Minor | `decide` rustdoc misstates the call graph; the `else { return 0 }` after `decide(Some(..))` is unreachable | accepted (recorded), orchestrator 2026-10-31; fold into the scaffolding follow-up (reword doc or `unreachable!`) |
 | crate | quality (F4) | Minor | rustdoc intra-doc links to `pub(crate)` items (not gated) | accepted (recorded); `#![allow(rustdoc::private_intra_doc_links)]` or plain backticks in the follow-up |
 | 10 | quality (F4) | Minor | config-path resolution spelled in both `main` and `run` | accepted (recorded); `Invocation::config_path()` in the follow-up |

@@ -672,8 +672,15 @@ keychain)", "HTTPS is not captured until the CA is trusted", `· CA trusted`,
   `setting`, unsupported, or the bus is not operator), a disabled line with
   `detail`, and, when `guidance` is present, a "Copy env line" item.
   Selecting calls `proxy.system.set {}` / `proxy.system.unset`; the pill shows
-  `· sys-proxy setting…` until the reply; an error or refusal goes to the status
-  bar message slot.
+  `· sys-proxy setting…` until the reply; an error or refusal goes to the existing
+  notice toast above the status bar (the web has no separate message slot).
+- **Full status on menu open (amended 2026-11-01 after the PR 3 panel).** The polled
+  compact sub-object carries no `guidance`/`remedy` (§D6), so the pill menu, when it
+  opens, calls `proxy.system.status` (gated on the tool being offered; operator
+  surfaces get the fresh read) and stores the full object; the 2 s poll then keeps
+  the last `guidance`/`remedy` when the compact object lacks them, until the next
+  menu open or a set/unset reply replaces them. Without that call the "Copy env line"
+  item and the privilege remedy would be unreachable.
 - Never touch `apps/web/src/bus/mock.ts` or `apps/web/src/bus/noise.ts`.
 
 ### D16. Logging and audit
