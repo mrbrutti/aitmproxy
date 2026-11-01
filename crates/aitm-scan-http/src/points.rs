@@ -253,11 +253,10 @@ impl<'a> Collector<'a> {
         // A path segment that is an opaque token (a UUID, a long hex run) or a
         // base64 blob also has its example withheld, so a token in the path does
         // not leak through `example` (S-M2); a plain numeric id keeps its value.
-        let example = if traits.contains(&PointTrait::Session) {
-            redact::REDACTED.to_string()
-        } else if is_path_kind(kind)
-            && (is_opaque_token(value) || traits.contains(&PointTrait::Base64))
-        {
+        let withhold = traits.contains(&PointTrait::Session)
+            || (is_path_kind(kind)
+                && (is_opaque_token(value) || traits.contains(&PointTrait::Base64)));
+        let example = if withhold {
             redact::REDACTED.to_string()
         } else {
             redact::example(kind, name, value)
@@ -979,8 +978,7 @@ mod tests {
             );
             out.points
                 .into_iter()
-                .filter(|p| p.kind == PathSegment)
-                .next_back()
+                .rfind(|p| p.kind == PathSegment)
                 .unwrap_or_else(|| panic!("no trailing path segment for {url}"))
         }
 
