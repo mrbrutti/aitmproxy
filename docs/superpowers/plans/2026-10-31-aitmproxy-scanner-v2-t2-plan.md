@@ -420,7 +420,10 @@ crates/aitm-scan-http/
     `[Url, Filename, Number, Email, Base64, Json, Id]` (never `Session`; `points.rs` adds that):
     `Url` when the value starts with `http://`, `https://` or `//`, or starts with `/` and has
     length > 1 and no whitespace; `Filename` when `looks_like_filename` holds for the last `/`
-    segment of a value with no whitespace; `Number` when it parses as `i64` or finite `f64`;
+    segment of a value with no whitespace **and the value is not email-shaped** (orchestrator
+    amendment 2026-11-01: every email ends in `.tld`, so without this tie-break `a@b.co` would carry
+    `[Filename, Email]`; the pinned test `[Email]` is authoritative, and `wants_traits: filename`
+    checks must not probe email fields); `Number` when it parses as `i64` or finite `f64`;
     `Email` when it has exactly one `@` with a `.` after it and no whitespace; `Base64` when
     length >= 16, length % 4 == 0, charset `[A-Za-z0-9+/]` with `=` padding only at the end and
     not all digits; `Json` when it starts with `{` or `[` and `serde_json::from_str` succeeds;
