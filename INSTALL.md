@@ -73,6 +73,18 @@ agent, using the `config.yaml` token — unless you paste an operator token in
 **Settings ▸ Bus ▸ Role** (the core's `mcp.operator_token`; create one with
 `aitm operator-token generate`) and reconnect (**Proxy ▸ Reconnect Bus**).
 
+## Audit log
+
+Every core, the app's embedded one included, appends the calls it receives to
+`audit.jsonl`, `audit.agent.jsonl` and `audit.reads.jsonl` in the config directory
+beside `config.yaml` (macOS: `~/Library/Application Support/aitmproxy/`, Linux:
+`~/.config/aitmproxy/`). They are on by default, mode `0600`, and rotate by size
+(92 MiB at most). Tokens and credentials are redacted before anything is written,
+but the files do name hosts, URLs and paths. Turn them off with
+`mcp.audit_log: off` in `config.yaml` or `AITM_AUDIT_LOG=off` in the environment.
+The format, `jq` recipes, what is redacted and the limits are in the README's
+[Audit log](README.md#audit-log) section.
+
 ## Building from source (`cargo` / bare binary)
 
 Building needs Rust 1.97 or newer (the workspace `rust-version`); on Linux also
