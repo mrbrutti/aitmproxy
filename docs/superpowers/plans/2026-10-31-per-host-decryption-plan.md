@@ -419,6 +419,7 @@ Kept by the session during stage 6. One row per finding.
 
 | Task | Reviewer | Severity | Finding | Disposition (fixed in <sha> / accepted by Matt YYYY-MM-DD, reason) |
 |---|---|---|---|---|
+| 2 | Coder (self-report) | Minor | In `Chain::dispatch`'s passive branch a parked receiver is dropped but the working copy's `Intercepted { .. }` state is still written back, so an opted-in plugin that parked a passive flow would leave the row marked intercepted with a handle nobody awaits (unreachable today: no observer parks) | OPEN — fix task after stage 5: reset the working copy to `Observed` in that branch and assert it in `opted_in_plugin_cannot_park_a_passive_flow` |
 
 ## Shipped
 
