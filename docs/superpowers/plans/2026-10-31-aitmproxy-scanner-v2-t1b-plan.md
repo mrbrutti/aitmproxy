@@ -1614,6 +1614,7 @@ Kept by the main session during stage 6. One row per finding.
 | 8,14 | Tester (w2+3) | Note | `send_opts(req, SendOptions::default())` records Always; engine sends must use `send` or explicit Never | routed to Task 14 |
 | 13 | Coder (host_probe fix) | Important | `script.reload` (`commands.rs` `Reload::invoke`) only swaps the AST; it never re-runs `load`, so a reload does not swap the script's checks (contrary to the B9 doc comments) | fix task after the WS coder leaves `plugin.rs`: reload re-runs `load` through `LoadedScript::run_load`; test via `script.reload` |
 | 13 | Coder (host_probe fix) | Note | Pre-existing `tests/engine.rs` wall-clock flake | fixed in c52dd6ca: deterministic budget test, green 5x under load |
+| T10-3 | T10 live run (external) | Important | Pre-existing: WS flows exposed no `request` to scripts, so `ws-cleartext-transport` and `ws-cross-site-hijack-indicator` never fired on live traffic | fixed in d2dda88a: handshake resolved from the store and projected as the script-visible request; `tests/ws_flow_view.rs` pins both scripts on real handshakes |
 
 ## Shipped
 
