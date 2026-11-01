@@ -2,8 +2,8 @@
 // `flow.detail` (crates/aitm-plugins/src/{capture,detail,meta}.rs on the operator-commands
 // branch): request/response nested, headers as [name, value] pairs, bodies as base64 `body`
 // with `body_size`/`body_truncated`, `client_conn`/`server_conn`, `meta`, intercept as
-// observed|intercepted|resumed|killed, WebSocket `messages`. The fixture bus and push
-// notifications may send the client model directly; both are accepted. Missing stays null.
+// observed|intercepted|resumed|killed, WebSocket `messages`. A push notification may carry the
+// client model directly; both shapes are accepted. Missing stays null.
 
 import { base64ToBytes } from '~/lib/bytes';
 import type { AgentNotification } from '~/bus/types';
@@ -68,7 +68,7 @@ function originOf(v: unknown, isReplay: boolean): Origin {
   return isReplay ? 'human' : 'client';
 }
 
-/** `marks: [str]` (FlowMeta.marks); the UI shows the first. `mark` is the fixture shorthand. */
+/** `marks: [str]` (FlowMeta.marks); the UI shows the first. `mark` is the model shape's singular. */
 function markOf(r: Rec, meta: Rec): FlowSummary['mark'] {
   const marks = r.marks ?? meta.marks;
   if (Array.isArray(marks)) return (str(marks[0]) as FlowSummary['mark']) ?? null;
@@ -140,7 +140,7 @@ function bodyFromBase64(b64: string, contentType: string | null, size: number | 
   return { text, ...(text == null ? { base64: b64 } : {}), contentType, size: size ?? bytes.length, truncated };
 }
 
-/** `body` is base64 (bus) or a model-shaped object (fixtures); `body_size`/`body_truncated` ride beside it. */
+/** `body` is base64 (the server) or a model-shaped object (the tolerated alternative); `body_size`/`body_truncated` ride beside it. */
 function bodyOf(msg: Rec, contentType: string | null): Body {
   const size = num(msg.body_size) ?? num(msg.bodySize);
   const truncated = bool(msg.body_truncated) || bool(msg.bodyTruncated);
@@ -290,7 +290,7 @@ export function toDetail(raw: unknown, seqFallback: number): FlowDetail {
   };
 }
 
-/** Epoch ms (the server) or an ISO string (the fixture bus) to ISO; anything else is now. */
+/** Epoch ms (the server) or an ISO string (the model shape) to ISO; anything else is now. */
 function isoOf(v: unknown): string {
   const n = num(v);
   if (n !== null) {
@@ -330,7 +330,7 @@ function argsOf(v: unknown): unknown {
 
 /**
  * One audit line (`notifications/aitm/agent`, `agent.activity`) to the Activity model. Accepts the
- * server's wire shape (crates/aitm-core/src/audit.rs) and the fixture bus's model shape alike.
+ * server's wire shape (crates/aitm-core/src/audit.rs) and the Activity model shape alike.
  * Returns null for what is not an audit entry: an `approval_requested` line (it carries `event`),
  * a line without a string `command`, or one without a string `origin` (the model requires it and the
  * server always sends it; without it the line could be neither attributed nor filtered). Any `result`

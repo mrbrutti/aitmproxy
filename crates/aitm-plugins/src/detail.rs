@@ -9,6 +9,8 @@
 //! The shape matches the surfaces' recorded expectation (ui-tui architecture note,
 //! web FlowDetail): `request`/`response` objects for HTTP, `messages` for a
 //! WebSocket, `client_conn`/`server_conn`, `meta`, `intercept` and `edited`.
+//! `meta` carries the per-host decryption keys of spec D7: `passive` (bool) and
+//! `tunnel` (`{mode, reason, bytes_up, bytes_down}` for a `CONNECT` row, else null).
 //! Peer→process resolution and per-flow origin are deferred (Q6 / F2) and reported
 //! as `null` rather than omitted, so a surface renders a stable shape.
 //!
@@ -23,8 +25,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use aitm_core::{
-    Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse, HttpVersion,
-    ParamDef, ParamSchema, Params, Plugin, Registry, TypeDesc, Value, WsMessage,
+    saturating_i64, Body, Command, CommandHost, ConnInfo, Flow, FlowMeta, HeaderMap, HttpResponse,
+    HttpVersion, ParamDef, ParamSchema, Params, Plugin, Registry, TunnelInfo, TypeDesc, Value,
+    WsMessage,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -352,6 +355,27 @@ fn meta(m: &FlowMeta) -> Value {
     obj.insert("edited".into(), Value::Bool(m.edited));
     // Per-flow origin (human vs agent) is deferred to the audit work (F2).
     obj.insert("origin".into(), Value::Null);
+    // Per-host decryption (spec D7): observed-only flag and the tunnel object.
+    obj.insert("passive".into(), Value::Bool(m.passive));
+    obj.insert(
+        "tunnel".into(),
+        m.tunnel.as_ref().map_or(Value::Null, tunnel),
+    );
+    Value::Object(obj)
+}
+
+/// `meta.tunnel` for a tunnel row (spec D7): `{mode, reason, bytes_up,
+/// bytes_down}` with the wire codes of `TunnelMode::label` / `TunnelReason::label`,
+/// `reason` null for a decrypted tunnel, the byte counts null until a passthrough
+/// tunnel closes. Counts saturate at `i64::MAX` rather than wrap
+/// (`aitm_core::saturating_i64`, the rule every surface shares).
+fn tunnel(t: &TunnelInfo) -> Value {
+    let count = |n: Option<u64>| n.map_or(Value::Null, |n| Value::Int(saturating_i64(n)));
+    let mut obj = BTreeMap::new();
+    obj.insert("mode".into(), Value::Str(t.mode.label().into()));
+    obj.insert("reason".into(), opt_str(t.reason.map(|r| r.label())));
+    obj.insert("bytes_up".into(), count(t.bytes_up));
+    obj.insert("bytes_down".into(), count(t.bytes_down));
     Value::Object(obj)
 }
 
