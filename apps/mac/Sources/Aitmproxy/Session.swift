@@ -259,16 +259,31 @@ final class Session {
                   chip: chip, filter: filterExpression, sort: sort)
     }
 
-    /// Rows after the query. Compiled once per query change, not per access.
+    /// Rows after the query. The filter is compiled once per query change and the
+    /// rows are re-filtered once per `rows`/`details` change, not per access.
+    ///
+    /// `rows` and `details` are read on every access, before the cache is consulted,
+    /// and the reads must stay: an `@Observable` view depends only on what it read
+    /// during its last body evaluation, so a cache hit that skipped them would leave
+    /// the flow table with no dependency on the capture the first time it re-rendered
+    /// for another reason (the intercept bar appearing, a selection) — and the Flows
+    /// page then stopped redrawing until a page switch (FIXLOG 2026-10-31). `details`
+    /// is an input too: the content-type chips and the filter read it, so a detail
+    /// arriving after its row can change the filtered set. The live self-test pins
+    /// both reads with `withObservationTracking`.
     var visibleRows: [FlowRow] {
         let q = query
-        if cachedQuery != q || cachedRows == nil || cachedRowsVersion != rowsVersion {
+        let current = rows
+        let currentDetails = details
+        if let cached = cachedRows, cachedQuery == q, cachedRowsVersion == rowsVersion { return cached }
+        if cachedQuery != q || cachedCompiled == nil {
             cachedQuery = q
             cachedCompiled = q.compiled()
-            cachedRows = cachedCompiled?.apply(rows, details: details)
-            cachedRowsVersion = rowsVersion
         }
-        return cachedRows ?? rows
+        let filtered = cachedCompiled?.apply(current, details: currentDetails) ?? current
+        cachedRows = filtered
+        cachedRowsVersion = rowsVersion
+        return filtered
     }
 
     // MARK: Panels (M5): each panel owns its state; the session holds one of each.

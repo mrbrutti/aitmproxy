@@ -1,6 +1,7 @@
 import AitmBusClient
 import AitmproxyKit
 import AppKit
+import Observation
 
 /// The live self-test: with `APP_LIVE=1` and a running `aitm` (its config at
 /// `AITM_CONFIG`), every `FlowActions` call goes over the real bus through
@@ -281,6 +282,29 @@ extension SelfTest {
             session.setBreakpointRules(BreakpointRules())
             await disarm(session)
 
+            // S-079: `visibleRows` must register the view's dependency on `rows` and `details` even
+            // when its cache is warm — what SwiftUI does with the same primitive. Warm the cache,
+            // track one read (a cache hit), then let a real request change `rows`.
+            _ = session.visibleRows
+            _ = session.visibleRows
+            let rowsDependency = ObservationFlag()
+            withObservationTracking { _ = session.visibleRows } onChange: { rowsDependency.fire() }
+            let rowsBefore = session.rows.count
+            if let probe = curlThroughProxy(upstream, listen: session.listenAddress, path: "/observe") {
+                await settle(timeout: .seconds(8)) { session.rows.count > rowsBefore && !probe.isRunning }
+                check("a warm visibleRows cache still registers the dependency on rows (the Flows page redraws, FIXLOG 2026-10-31)",
+                      rowsDependency.fired && session.rows.count > rowsBefore,
+                      "fired \(rowsDependency.fired) rows \(rowsBefore) → \(session.rows.count)")
+            }
+            if let newest = session.rows.last {
+                _ = session.visibleRows
+                let detailsDependency = ObservationFlag()
+                withObservationTracking { _ = session.visibleRows } onChange: { detailsDependency.fire() }
+                await session.loadDetail(newest.id)
+                check("a warm visibleRows cache still registers the dependency on details",
+                      detailsDependency.fired && session.details[newest.id] != nil, "fired \(detailsDependency.fired)")
+            }
+
             // F6 / F7: the call is made, the outcome is recorded, nothing hangs.
             let pending: [(String, () -> Void)] = [
                 ("flow.mark", { session.mark(row.id, .red) }),
@@ -402,4 +426,13 @@ extension SelfTest {
         print(failures == 0 ? "LIVE SELFTEST PASS \(count) checks" : "LIVE SELFTEST FAIL \(failures) of \(count) checks")
         finish(code: failures == 0 ? 0 : 1)
     }
+}
+
+/// A flag `withObservationTracking`'s `onChange` can set from any thread (file scope, so it
+/// is not main-actor-isolated like the self-test's own members).
+nonisolated final class ObservationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var fired: Bool { lock.withLock { value } }
+    func fire() { lock.withLock { value = true } }
 }
