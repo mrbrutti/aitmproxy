@@ -72,8 +72,11 @@ pub struct Resp {
     /// so the next scan of that line resumes at `scanned - 1` (a CR may be
     /// the last byte seen). Dropped once a message is returned (the driver
     /// drains it, so the next buffer is a different one) and whenever the
-    /// buffer offered is shorter than the memo. `on_idle` never reads or
-    /// writes it, so the idle stays O(1).
+    /// buffer offered is shorter than the memo. Sound because the driver
+    /// only ever appends to the buffer between `parse` calls unless `parse`
+    /// returned a message (memo dropped) or an idle step ended the
+    /// connection; `on_idle` drops it on every non-`Wait` step so the memo
+    /// never outlives the buffer it describes, and stays O(1) otherwise.
     scanned: usize,
 }
 
@@ -135,15 +138,18 @@ impl Speaker for Resp {
 
     fn on_idle(&mut self, mode: SeedMode, buf: &[u8]) -> Step {
         if buf.first() == Some(&b'*') {
-            // `*N` with fewer than N elements after the idle: the bug.
+            // `*N` with fewer than N elements after the idle: the bug. The
+            // step ends the connection, so the scan memo is dropped with it.
+            self.forget_scan();
             mode_bug(mode, INCOMPLETE_MULTIBULK.to_vec())
         } else if buf.len() > MAX_BULK {
             // An inline line past the bulk cap can never be served (redis:
             // "too big inline request"): say so, then close, both modes.
+            self.forget_scan();
             Step::Fault(TOO_BIG_INLINE.to_vec())
         } else {
             // A stalled inline line is not a protocol event; wait for its
-            // CRLF as redis does.
+            // CRLF as redis does. The memo stays: the line is still arriving.
             Step::Wait
         }
     }
