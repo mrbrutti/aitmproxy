@@ -97,6 +97,45 @@ impl Default for Features {
     }
 }
 
+/// Every scanner v2 lane the build has, in lane order (spec D1).
+///
+/// Each lane crate owns a `lane()` entry point returning `Option<Arc<dyn Lane>>`;
+/// this is the one place that calls them, so a lane track lands by filling its own
+/// crate and edits no shared file ("Registration without shared files"). A slot
+/// that answers `None` — every slot while its track is unimplemented — is skipped,
+/// and `scan.start` refuses that lane with `lane_unavailable`.
+///
+/// The two L4 slots are called with the shared guard and flow store from
+/// [`Features::l4_shared`], so a scanner L4 case acts over the same L4 engagement
+/// state the `l4.*` verbs and the scripting language do. When L4 is disabled `l4`
+/// is `None` and both handles are passed as `None`; a landed L4 lane still returns
+/// `Some` then, so the refusal is `refused_l4` rather than `lane_unavailable`
+/// (spec D3's refusal order).
+#[must_use]
+pub fn collect_lanes(l4: Option<&L4Shared>) -> Vec<Arc<dyn aitm_scan_model::Lane>> {
+    let guard = l4.map(|shared| shared.guard.clone());
+    let store = l4.map(|shared| shared.store.clone());
+    [
+        aitm_scan_http::lane(),
+        aitm_scan_ws::lane(),
+        aitm_scan_l4_packet::lane(guard.clone(), store.clone()),
+        aitm_scan_l4_stream::lane(guard, store),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The native (compiled-in) scanner v2 checks this build ships (spec D1).
+///
+/// `aitm-scan-checks-http` contributes checks to the HTTP lane's catalogue rather
+/// than a second lane, so its slot is `checks()`, not `lane()`. Empty until track
+/// T3 lands.
+#[must_use]
+pub fn collect_native_checks() -> Vec<Arc<dyn aitm_scan_model::Check>> {
+    aitm_scan_checks_http::checks()
+}
+
 /// A built proxy and the CA it serves with.
 pub struct Assembled {
     pub proxy: Proxy,
@@ -336,9 +375,14 @@ pub fn assemble_with_scripts(
         .register_plugin(Box::new(MetaPlugin::new()))
         // The deterministic scanner's command set (scan.discover): a command-only
         // provider that observes no events. Stage 1 uses the default budgets.
-        .register_plugin(Box::new(aitm_plugin_scanner::ScannerPlugin::new(
-            aitm_plugin_scanner::ScannerConfig::default(),
-        )))
+        // Scanner v2 lane slots, spec D1: the lanes and native checks this build
+        // has are collected here and handed over. The shipped engine ignores
+        // them; the v2 engine (track T1b) consumes them.
+        .register_plugin(Box::new(
+            aitm_plugin_scanner::ScannerPlugin::new(aitm_plugin_scanner::ScannerConfig::default())
+                .with_lanes(collect_lanes(features.l4_shared.as_ref()))
+                .with_native_checks(collect_native_checks()),
+        ))
         .register_plugin(Box::new(ReplayPlugin::new()))
         .register_plugin(Box::new(intercept))
         .register_plugin(Box::new(ControlPlugin::new(armed, listening.clone())))
@@ -884,6 +928,26 @@ mod tests {
         cfg.ca.dir = temp_ca_dir("l4-guard-off");
         let disabled = assemble_with(&cfg, &Features::default()).expect("assemble, l4 disabled");
         assert!(disabled.l4_guard.is_none());
+    }
+
+    /// Task 11 / spec D1: the binary already calls every scanner v2 lane slot, and
+    /// every slot is a skeleton returning `None`, so the collected list is empty.
+    /// A `None` slot is skipped rather than collected — with the L4 handles present
+    /// the two L4 slots are still called and still contribute nothing. A lane
+    /// track's landing flips these literals; that track re-pins this test.
+    #[test]
+    fn skeleton_lane_slots_are_empty_today() {
+        assert_eq!(collect_lanes(None).len(), 0);
+        assert_eq!(collect_native_checks().len(), 0);
+
+        let shared = L4Shared {
+            guard: Arc::new(L4Guard::new(&L4Config {
+                enabled: true,
+                ..L4Config::default()
+            })),
+            store: Arc::new(aitm_proto_l4::flow::InMemoryL4FlowStore::new()),
+        };
+        assert_eq!(collect_lanes(Some(&shared)).len(), 0);
     }
 
     /// `Assembled::governance` hands out the assembly's own `agent_state` and
