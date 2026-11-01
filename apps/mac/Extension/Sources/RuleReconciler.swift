@@ -379,6 +379,10 @@ extension HandoffSelfCheck {
     ///  G. the provider's failed-startup sequence (fix F3): `begin` fails, `stop()` runs,
     ///     then the detach that `handoff.stop()` fires reconciles nil -- nothing is
     ///     applied, installed or reported; a later UDP set is dropped too.
+    ///  H. (Tester, round 2) two `begin`s during the startup flight share one apply and
+    ///     are each answered once with its result (success, failure, or `stop()`'s
+    ///     ECANCELED); a `begin` during a reconcile flight with a set installed is
+    ///     answered nil at once and the flight lands without answering it again.
     static func ruleReconcilerStartupAndStop(_ r: Recorder) {
         let fake = FakeApply(r)
         let reconciler = fake.makeReconciler()
@@ -553,6 +557,80 @@ extension HandoffSelfCheck {
         r.check("\(g): G nothing installed", reconciler.installed == nil)
         r.check("\(g): G nothing reported", fake.events.count == eventsBeforeG, "\(fake.events.count) vs \(eventsBeforeG)")
         r.check("\(g): G the startup completion was not answered again", startupG.count == 1, "\(startupG.count)")
+
+        // H. Tester (round 2). Two `begin`s during the STARTUP flight (Tahoe FB21464147
+        //    before the first apply lands): one apply, both completions parked, both
+        //    answered exactly once with that apply's result -- success and failure; a
+        //    `begin` during a RECONCILE flight with a set installed is answered nil at
+        //    once, applies nothing, and the flight lands as usual without answering it
+        //    again; `stop()` with TWO parked startups answers each once with ECANCELED.
+        reconciler.stop()
+        var startupH1: [Error?] = []
+        var startupH2: [Error?] = []
+        reconciler.begin { startupH1.append($0) }
+        reconciler.begin { startupH2.append($0) }
+        r.check("\(g): H two begins during the startup flight apply once", fake.lastApply(12, tcpOnly, false), fake.trail())
+        r.check("\(g): H both startups are parked until the apply lands",
+              startupH1.isEmpty && startupH2.isEmpty, "\(startupH1.count), \(startupH2.count)")
+        fake.complete(12, nil, "\(g): H")
+        r.check("\(g): H both startups answered once with nil",
+              startupH1.count == 1 && startupH1[0] == nil && startupH2.count == 1 && startupH2[0] == nil,
+              "\(startupH1.map { String(describing: $0) }) / \(startupH2.map { String(describing: $0) })")
+        r.check("\(g): H installed == .tcpOnly", reconciler.installed == tcpOnly)
+        r.check("\(g): H nothing further applied", fake.applied.count == 13, fake.trail())
+        reconciler.reconcile(for: m1)
+        r.check("\(g): H reconcile(m1) applies (w1, true)", fake.lastApply(13, w1, true), fake.trail())
+        var startupH3: [Error?] = []
+        let eventsBeforeH3 = fake.events.count
+        reconciler.begin { startupH3.append($0) }
+        r.check("\(g): H a begin during a reconcile flight with a set installed is answered nil at once",
+              startupH3.count == 1 && startupH3[0] == nil, "\(startupH3.map { String(describing: $0) })")
+        r.check("\(g): H that begin applies nothing", fake.applied.count == 14, fake.trail())
+        r.check("\(g): H that begin reports nothing", fake.events.count == eventsBeforeH3, "\(fake.events.count) vs \(eventsBeforeH3)")
+        r.check("\(g): H installed stays .tcpOnly until the flight lands", reconciler.installed == tcpOnly)
+        fake.complete(13, nil, "\(g): H")
+        r.check("\(g): H the flight lands: installed == w1", reconciler.installed == w1)
+        r.check("\(g): H the landing answers no startup again",
+              startupH1.count == 1 && startupH2.count == 1 && startupH3.count == 1,
+              "\(startupH1.count), \(startupH2.count), \(startupH3.count)")
+        r.check("\(g): H events end [.applied(.tcpOnly), .applied(w1)]",
+              Array(fake.events.suffix(2)) == [.applied(tcpOnly), .applied(w1)], "\(fake.events.suffix(2))")
+        r.check("\(g): H nothing further applied after the landing", fake.applied.count == 14, fake.trail())
+        // Failure variant: both parked startups get the startup apply's error, once each.
+        reconciler.stop()
+        var startupH4: [Error?] = []
+        var startupH5: [Error?] = []
+        reconciler.begin { startupH4.append($0) }
+        reconciler.begin { startupH5.append($0) }
+        r.check("\(g): H (failure) two begins apply once", fake.lastApply(14, tcpOnly, false), fake.trail())
+        fake.complete(14, NSError(domain: "test", code: 7), "\(g): H (failure)")
+        r.check("\(g): H (failure) both startups answered once with the error",
+              startupH4.count == 1 && (startupH4[0] as NSError?)?.code == 7
+                  && startupH5.count == 1 && (startupH5[0] as NSError?)?.code == 7,
+              "\(startupH4.map { String(describing: $0) }) / \(startupH5.map { String(describing: $0) })")
+        r.check("\(g): H (failure) nothing installed", reconciler.installed == nil)
+        r.check("\(g): H (failure) the failed startup set is not retried by itself", fake.applied.count == 15, fake.trail())
+        // stop() with two parked startups: each answered once with ECANCELED; the stale
+        // completion answers neither again.
+        reconciler.stop()
+        var startupH6: [Error?] = []
+        var startupH7: [Error?] = []
+        reconciler.begin { startupH6.append($0) }
+        reconciler.begin { startupH7.append($0) }
+        r.check("\(g): H (stop) two begins apply once", fake.lastApply(15, tcpOnly, false), fake.trail())
+        reconciler.stop()
+        r.check("\(g): H (stop) both parked startups answered once with NSPOSIXErrorDomain/ECANCELED",
+              FakeApply.answeredOnceWithCancellation(startupH6) && FakeApply.answeredOnceWithCancellation(startupH7),
+              "\(startupH6.map { String(describing: $0) }) / \(startupH7.map { String(describing: $0) })")
+        let eventsBeforeH7 = fake.events.count
+        fake.complete(15, nil, "\(g): H (stop) stale")
+        r.check("\(g): H (stop) the stale completion answers neither startup again",
+              startupH6.count == 1 && startupH7.count == 1, "\(startupH6.count), \(startupH7.count)")
+        r.check("\(g): H (stop) the stale completion installs nothing", reconciler.installed == nil)
+        r.check("\(g): H (stop) the stale completion reports nothing", fake.events.count == eventsBeforeH7,
+              "\(fake.events.count) vs \(eventsBeforeH7)")
+        r.check("\(g): H every apply parked exactly one completion",
+              fake.completions.count == fake.applied.count, "\(fake.completions.count) vs \(fake.applied.count)")
     }
 }
 #endif

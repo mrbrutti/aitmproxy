@@ -294,8 +294,10 @@ extension HandoffSelfCheck {
     /// yields the SAME /32 IPv4 rule as the plain token; a spec made only of
     /// never-claimed ports, wildcards (any port -- spec H is unconditional) and malformed
     /// tokens is TCP-only; loopback, multicast and the limited broadcast are skipped like
-    /// the wildcards (spec H as amended, fix F5); the summary's count prefix follows the
-    /// rule count.
+    /// the wildcards (spec H as amended, fix F5), in their IPv4-mapped and long-form
+    /// spellings too; the cap counts canonical targets only (duplicates and skipped tokens
+    /// never inflate `dropped`, 257 drops exactly one); the summary's count prefix follows
+    /// the rule count.
     static func providerRulesEdges(_ r: Recorder) {
         typealias Target = ProviderRuleSet.UDPTarget
 
@@ -448,6 +450,47 @@ extension HandoffSelfCheck {
               mixed.udpTargets == [Target("198.51.100.7", 443)] && mixed.dropped == 0, "\(mixed.udpTargets)")
         r.check("providerRulesEdges: skipped tokens are not counted as dropped",
               ProviderRuleSet.wanted(for: ScopeMatcher(spec: "127.0.0.1:9000 [::1]:9000")).dropped == 0)
+
+        // IPv4-mapped IPv6 and long-form spellings of the skipped addresses are
+        // canonicalised by the matcher first (`IPText.canonical` unmaps `::ffff:a.b.c.d`)
+        // and then skipped like the plain text; an IPv6 multicast of another scope too.
+        let spelledSkipped = ["[::ffff:127.0.0.1]:443", "[::ffff:127.200.1.2]:443", "[::ffff:224.0.0.251]:9000",
+                              "[::ffff:255.255.255.255]:1900", "[0:0:0:0:0:0:0:1]:9000",
+                              "[0000:0000:0000:0000:0000:0000:0000:0001]", "[ff0e::1]:9000"]
+        for token in spelledSkipped {
+            let w = ProviderRuleSet.wanted(for: ScopeMatcher(spec: token))
+            r.check("providerRulesEdges: \(token) -> tcpOnly", w == .tcpOnly, "\(w.udpTargets)")
+        }
+        r.check("providerRulesEdges: the matcher holds every re-spelled skipped token as claimable (the skip is in wanted)",
+              ScopeMatcher(spec: spelledSkipped.joined(separator: " ")).udpClaimableIPEntries.count == spelledSkipped.count,
+              "\(ScopeMatcher(spec: spelledSkipped.joined(separator: " ")).udpClaimableIPEntries.count)")
+        r.check("providerRulesEdges: the mapped 127.200.1.2 is unmapped to the IPv4 text before the skip",
+              ScopeMatcher(spec: "[::ffff:127.200.1.2]:443").udpClaimableIPEntries
+                  == [ScopeMatcher.Entry(target: .ip("127.200.1.2"), port: 443)],
+              "\(ScopeMatcher(spec: "[::ffff:127.200.1.2]:443").udpClaimableIPEntries)")
+
+        // -- Cap edges (fix F4): the cap counts CANONICAL targets, so duplicates never
+        //    inflate `dropped`, skipped tokens count toward neither the cap nor `dropped`,
+        //    and exactly one over the cap drops exactly one (the text-last target).
+        let capTwice = ProviderRuleSet.wanted(for: ScopeMatcher(spec: (capTokens + capTokens).joined(separator: " ")))
+        r.check("providerRulesEdges: every cap token twice is the same capped set (duplicates do not inflate dropped)",
+              capTwice == capped, "\(capTwice.udpTargets.count) kept, \(capTwice.dropped) dropped")
+        let skippedNoise = ["127.0.0.1:9000", "[::1]:9000", "224.0.0.251", "255.255.255.255:1900", "0.0.0.0", "10.9.9.9:53", "example.com"]
+        let capPlusSkipped = ProviderRuleSet.wanted(
+            for: ScopeMatcher(spec: (Array(capTokens.prefix(256)) + skippedNoise).joined(separator: " ")))
+        r.check("providerRulesEdges: skipped tokens beside exactly 256 targets count toward neither the cap nor dropped",
+              capPlusSkipped == justKept && capPlusSkipped.dropped == 0 && capPlusSkipped.udpTargets.count == 256,
+              "\(capPlusSkipped.udpTargets.count) kept, \(capPlusSkipped.dropped) dropped")
+        let oneOver = ProviderRuleSet.wanted(for: ScopeMatcher(spec: capTokens.prefix(257).joined(separator: " ")))
+        r.check("providerRulesEdges: 257 targets keep 256 and drop 1",
+              oneOver.udpTargets.count == 256 && oneOver.dropped == 1, "\(oneOver.udpTargets.count) kept, \(oneOver.dropped) dropped")
+        r.check("providerRulesEdges: the one dropped is the text-last 10.2.1.0 (the kept 256 are unchanged)",
+              oneOver.udpTargets == justKept.udpTargets, "\(String(describing: oneOver.udpTargets.last))")
+        r.check("providerRulesEdges: 257-target summary is 257 rules … (+1 dropped)",
+              oneOver.summary.hasPrefix("257 rules (TCP catch-all + UDP 10.2.0.0:5000, ") && oneOver.summary.hasSuffix(", 10.2.0.99:5099) (+1 dropped)"),
+              oneOver.summary)
+        r.check("providerRulesEdges: 257 and 300 targets with the same kept 256 are different sets (dropped 1 vs 44)",
+              oneOver != capped && oneOver.udpTargets == capped.udpTargets)
     }
 }
 #endif
