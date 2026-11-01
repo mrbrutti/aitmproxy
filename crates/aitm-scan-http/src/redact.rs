@@ -442,9 +442,9 @@ mod tests {
     /// Whether `text` names the identifier `url` as a whole word (so `safe_url`,
     /// `url_norm` and `request_url` do not count), case-insensitively.
     fn mentions_url(text: &str) -> bool {
-        #[allow(clippy::unwrap_used)]
-        let re = Regex::new(r"(?i)\burl\b").unwrap();
-        re.is_match(text)
+        static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"(?i)\burl\b").expect("a valid regex literal"))
+            .is_match(text)
     }
 
     /// Whether `text` routes through this module's scrubbers.

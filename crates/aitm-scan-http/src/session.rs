@@ -327,7 +327,7 @@ pub(crate) struct SessionMonitor {
 
 impl SessionMonitor {
     /// A monitor over `canary`, checking every `every` ticks.
-    pub fn new(canary: Option<CanaryRequest>, on_lost: OnLost, every: u32) -> Self {
+    pub(crate) fn new(canary: Option<CanaryRequest>, on_lost: OnLost, every: u32) -> Self {
         Self {
             canary,
             on_lost,
@@ -342,7 +342,7 @@ impl SessionMonitor {
     /// [`SessionMonitor::check`] is [`CanaryOutcome::Unarmed`]. This is what a
     /// job with `session.mode: none`, no material or no eligible flow gets, so
     /// the probe path needs no `Option<SessionMonitor>`.
-    pub fn unarmed(on_lost: OnLost) -> Self {
+    pub(crate) fn unarmed(on_lost: OnLost) -> Self {
         Self::new(None, on_lost, 0)
     }
 
@@ -350,7 +350,7 @@ impl SessionMonitor {
     ///
     /// False for an unarmed monitor and for `every == 0`, so neither can ask
     /// for a check or divide by zero.
-    pub fn tick(&self) -> bool {
+    pub(crate) fn tick(&self) -> bool {
         if self.canary.is_none() || self.every == 0 {
             return false;
         }
@@ -359,7 +359,7 @@ impl SessionMonitor {
     }
 
     /// Whether a check has concluded the session is lost.
-    pub fn is_lost(&self) -> bool {
+    pub(crate) fn is_lost(&self) -> bool {
         self.lost.load(Ordering::SeqCst)
     }
 
@@ -368,12 +368,12 @@ impl SessionMonitor {
     /// Used when a lost monitor is evicted from the registry and later rebuilt
     /// for the same job: the rebuilt monitor starts lost, so probing does not
     /// resume after a `session_lost` stop (S-M5).
-    pub fn force_lost(&self) {
+    pub(crate) fn force_lost(&self) {
         self.lost.store(true, Ordering::SeqCst);
     }
 
     /// Whether the job must stop: the session is lost and `on_lost` is `stop`.
-    pub fn should_stop(&self) -> bool {
+    pub(crate) fn should_stop(&self) -> bool {
         self.is_lost() && matches!(self.on_lost, OnLost::Stop)
     }
 
@@ -384,7 +384,7 @@ impl SessionMonitor {
     /// cannot see the canary this job armed (cross-track seam S1). Kept so the
     /// shape exists the moment that seam does.
     #[allow(dead_code)]
-    pub fn canary(&self) -> Canary {
+    pub(crate) fn canary(&self) -> Canary {
         match &self.canary {
             None => Canary::None,
             Some(canary) => Canary::Flow {
@@ -403,7 +403,7 @@ impl SessionMonitor {
     /// answering `2xx`: a canary that was never `2xx` cannot prove a loss. The
     /// loss is logged once, at warn, naming the path through
     /// [`redact::safe_request_url`] and the two statuses.
-    pub async fn check(
+    pub(crate) async fn check(
         &self,
         client: &dyn ProxyClient,
         opts: SendOptions,
@@ -447,7 +447,7 @@ impl SessionMonitor {
 
     /// The error every probe of a lost job returns: [`SESSION_LOST_PREFIX`]
     /// followed by `context` (a stage name, never a value).
-    pub fn lost_error(&self, context: &str) -> anyhow::Error {
+    pub(crate) fn lost_error(&self, context: &str) -> anyhow::Error {
         anyhow::anyhow!("{SESSION_LOST_PREFIX}{context}")
     }
 }

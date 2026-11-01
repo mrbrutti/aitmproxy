@@ -95,7 +95,7 @@ impl HttpProbeHost {
     /// When the point names no source flow, when that flow is absent from the
     /// store or is not an HTTP flow, or when its request does not address an
     /// absolute `http(s)` origin.
-    pub fn new(
+    pub(crate) fn new(
         point: &InsertionPoint,
         job: Arc<dyn JobCtx>,
         monitor: Arc<SessionMonitor>,
@@ -479,12 +479,12 @@ pub(crate) struct SessionMonitors {
 
 impl SessionMonitors {
     /// An empty registry.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// The monitor for `job`, building it against `origin` the first time.
-    pub fn for_job(&self, job: &dyn JobCtx, origin: &Url) -> Arc<SessionMonitor> {
+    pub(crate) fn for_job(&self, job: &dyn JobCtx, origin: &Url) -> Arc<SessionMonitor> {
         let key = job.job_id().to_string();
         let mut table = self
             .inner
@@ -556,8 +556,10 @@ impl SessionMonitors {
     }
 
     /// Whether no monitor is held. The conventional partner of
-    /// [`SessionMonitors::len`] (`clippy::len_without_is_empty`); test-only.
+    /// [`SessionMonitors::len`] (`clippy::len_without_is_empty`); test-only, and
+    /// no test needs it yet.
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
