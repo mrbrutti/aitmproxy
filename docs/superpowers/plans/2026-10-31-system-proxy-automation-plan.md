@@ -1287,7 +1287,7 @@ under Matt's standing mandate; the deviations marked **(Matt)** are flagged in t
   `expect_count`/`deny`, `--self-check` planting one violation per rule): literals in
   `Session+SystemProxy.swift` only; `.setSystemProxy(`/`.restoreSystemProxy(` calls from
   `SettingsView.swift`, `Panels/StatusPanel.swift`, `Shell/SetupSheet.swift`,
-  `Shell/RouteBanner.swift`, `Shell/ShellView.swift` (empty state), `App.swift` only; the
+  `Shell/RouteBanner.swift`, `App.swift` only (the Flows empty state routes through RouteBanner); the
   agent-reachable surfaces (`Bus/BusService.swift` may parse the STATUS but not spell the verbs or
   the method names, `CommandMap.swift` titles only, `CommandPalette.swift`, `Session+Palette.swift`,
   `Session+Verbs.swift`, `Panels/AgentPanel.swift`, `SelfTest*.swift`) match none of
