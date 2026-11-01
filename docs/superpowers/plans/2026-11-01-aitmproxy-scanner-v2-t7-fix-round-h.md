@@ -177,6 +177,8 @@ H76 (cell). After `f` (and after `u`) assert the cursor row's name cell is still
 
 H77 (cell). An `intrusive` launch raises the engine's `needs_confirmation` overlay (`Confirm over the wire: scan launch`, "may disrupt the target"): `launch()` detects the overlay title after `s`/`m`, asserts it as a check ("the engine asked to confirm the intrusive launch"), presses `y`, then waits for the landing as today; `n` is never pressed there. This exercises UI-1's confirm on an HTTP job as well as T7-18's.
 
+**Cell H76-H77 result (2026-11-01):** done in `783b4af8`; `--selftest` 67 ok with mutation checks. Ratified: the confirm check is recorded only when the overlay appears (an outright launch records nothing); the post-`f`/`u` cursor check is a 2 s hold under watch; the overlay screen is a sample, not a named file. Cell complete at `783b4af8` pending H75 on the Rust side.
+
 ## Rust (after round G-B, one small coder)
 
 H18. `Mode::WireConfirm` has no body arm in `ui/mod.rs` `render()` (`crates/aitm-tui/src/ui/mod.rs`): the body falls to `main_region` (Flows list and inspector), so a Scan launch confirm draws over the Flows view and the operator loses the Scan context under the box; when the selected flow carries session material its inspector shows it under the overlay. Add a `Mode::WireConfirm` arm that draws the body of `wire_confirm_from` (the Scan view when the launch came from Scan, else `main_region`) before `scan::confirm::render`. Test (`tests/scan_v2_confirm.rs`): a `needs_confirmation` on `scan.start` renders the tab strip ` 1 Profiles` under the overlay at 200x50; an L4 confirm from Flows still shows the flow list.
