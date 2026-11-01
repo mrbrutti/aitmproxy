@@ -526,11 +526,11 @@ Kept by the main session during stage 6. One row per finding.
 | PR A whole branch | T3 / coordinator | Important | reflection rows must be class `reflected-xss`; WS rows `ws-cswsh` / `ws-injection` (family vocabulary) | fixed in c73952c3 (item 31) and the item-33 commit |
 | PR A whole branch | B8 coder (spec gap) | Important | boolean and time-based SQLi on one point dedupe into one issue under D6 | fixed in 932f31de (timing seed moved to `/orders?id=`); spec amended in 0211ed84 |
 | PR A fix round 1 | security (re-review) | verdict | PASS: items 1, 2, 7-12 verified fixed; no regression in the fix range | - |
-| PR A fix round 1 | security (re-review) | Minor | control origin trusts any `Host` (DNS rebinding could read, not reset, the logs) | fixed in the round-2 cleanup commit (403 unless Host is `127.0.0.1`/`localhost`/`[::1]`) |
+| PR A fix round 1 | security (re-review) | Minor | control origin trusts any `Host` (DNS rebinding could read, not reset, the logs) | fixed in c927ff52 (403 unless Host is `127.0.0.1`/`localhost`/`[::1]`) |
 | PR A fix round 1 | quality (re-review) | verdict | PASS: items 4, 5, 6, 17-29 verified fixed | - |
-| PR A fix round 1 | quality (re-review) | Minor | `listeners.rs` test asserts a sub-10 ms real-clock gap and mirrors the constant | fixed in the round-2 cleanup commit (lower bounds only) |
-| PR A fix round 1 | quality (re-review) | Minor | tautological assertion in the shared-identity test (`tls.rs`) | fixed in the round-2 cleanup commit |
-| PR A fix round 1 | quality (re-review) | Minor | `SessionStore::create` maintains the `Sessions` invariant by hand | fixed in the round-2 cleanup commit (`Sessions::insert`, private fields) |
+| PR A fix round 1 | quality (re-review) | Minor | `listeners.rs` test asserts a sub-10 ms real-clock gap and mirrors the constant | fixed in 909096ca and c927ff52 (lower bounds only, constant mirror dropped) |
+| PR A fix round 1 | quality (re-review) | Minor | tautological assertion in the shared-identity test (`tls.rs`) | fixed in c927ff52 |
+| PR A fix round 1 | quality (re-review) | Minor | `SessionStore::create` maintains the `Sessions` invariant by hand | fixed in c927ff52 (`Sessions::insert`, private nested module) |
 | PR A fix round 1 | quality (re-review) | Minor | residual `"literal".to_string()` into the `impl Into<Bytes>` builders | accepted by the T10 session 2026-11-01 (no further churn on this PR; one allocation per response on a test target) |
 | PR A fix round 1 | spec (re-review) | verdict | PASS: items 3, 13-16, 31-33 and the doc dispositions verified; `sqli-time-orders-id` consistent end to end | - |
 | PR A fix round 1 | spec (re-review) | Minor | plan A1 still said `/items` twice; B8 route list lacked `GET /orders` | fixed in the docs commit after e86aa91c |
