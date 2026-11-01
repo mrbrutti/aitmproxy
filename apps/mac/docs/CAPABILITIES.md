@@ -41,22 +41,17 @@ The operator workflow is verified two ways, both repeatable:
 - **Agent-driven (MCP bus)** — `tools/selftest-live.sh` (21 checks): intercept →
   `flow.detail` review → edit a paused request → resume, plus mark/comment,
   pause/clear, kill (strict), activity log.
-- **Human UI (computer-use)** — `tools/cua-ne-drive.sh` on the dev bundle (the fixture-session click-through `cua-clickthrough.sh` was removed 2026-10-31), with `tools/cgclick.swift`,
-  two layers, both real input events:
-  - **Pixel path (no Accessibility tree):** normalize the window to a known origin,
-    then **CGEvent-click computed row pixels**; selection is verified by
-    screenshotting the inspector region and confirming it changed (`screencapture`
-    + `md5`, across rows 3/8/1). This clicks pixels, so it has no SwiftUI-AX
-    limitation and selects any rendered element. Proof shots: `/tmp/cua-row*.png`.
-  - **Menu path:** real Accessibility menu-bar clicks (Resume, Build PoC opens a sheet).
-- **Deterministic human-input** — the in-app self-test's menu audit (every action
+- **Human UI (computer-use)** — `tools/cua-ne-drive.sh <pid> [host]`: real input
+  events on the INSTALLED app (a dev bundle embeds no extension). System Events (AX)
+  menu and keystroke actions open Settings ▸ Capture, add a host through the
+  Proxy ▸ Scope… sheet and browse it in Safari, and `tools/winshot.swift <pid>` reads
+  the real window after each step (shots `/tmp/aitm-ne-5.png`, `-6`, `-7`). The
+  fixture-session click-through `cua-clickthrough.sh` (a pixel path that CGEvent-clicked
+  computed row pixels and verified the selection with an inspector-region screenshot
+  diff, and a menu path through Resume and Build PoC) was removed 2026-10-31 and has
+  no replacement.
+- **Deterministic human-input** — the live self-test's menu audit (every action
   has a menu item + shortcut) and key-event checks.
-
-**CUA automation coverage boundary (now closed for selection):** The **coordinate
-path** (screenshot → compute pixel → CGEvent click) does not touch the AX tree, so
-it reliably selects any rendered row — the pixel gate verifies this with a
-`screencapture`+`md5` inspector-region diff across three distinct rows (green every
-run). That is the deterministic coverage.
 
 Stable `.accessibilityIdentifier`s are set on the key views — flow rows
 (`flow-row-<i>-seq<n>`), the inspector URL (`inspector-url`), the Raw editor

@@ -324,7 +324,7 @@ import Testing
     }
 }
 
-/// Sizes reach every sum in the Kit from the bus, imports and fixtures: none may trap.
+/// Sizes reach every sum in the Kit from the bus and imports: none may trap.
 @Suite struct SizeSumSaturationTests {
     private func row(_ seq: Int, request: Int64?, response: Int64?) -> FlowRow {
         FlowRow(

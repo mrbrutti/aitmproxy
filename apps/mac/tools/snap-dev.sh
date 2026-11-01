@@ -70,15 +70,20 @@ elif [[ -d "$installed/Contents/Resources/core" ]]; then
 fi
 echo "== bundle $dev ($exe)"
 
+if [[ ${NO_LAUNCH:-} == 1 ]]; then
+  echo "== build only (NO_LAUNCH=1) · $dev"
+  exit 0
+fi
 # A fresh, isolated store per tag: the harness defaults suite is wiped at startup under APP_STORE,
-# so the dev bundle never reads or writes the operator's settings or database.
+# so the dev bundle never reads or writes the operator's settings or database. Wiped only on a
+# launch, below the NO_LAUNCH exit: a build-only run while a dev bundle is running must not delete
+# its store from under it.
 store="/tmp/$name-dev-state$tag"
 rm -rf "$HOME/Library/Saved Application State/com.mrbrutti.aitmproxy.savedState" "$store"
 mkdir -p "$store"
-if [[ ${NO_LAUNCH:-} == 1 ]]; then
-  echo "== build only (NO_LAUNCH=1) · store $store"
-  exit 0
-fi
+# /tmp is shared: the store must be a directory this user owns (a path someone else planted
+# there survives the rm -rf above, and mkdir -p would silently accept it).
+[[ -O $store && -d $store ]] || { echo "store $store is not a directory we own; refusing to launch"; exit 1; }
 # Live launch: the bundle talks to the core copied in above (or, under APP_LIVE=1 + AITM_CONFIG,
 # to an external one). There is no fixture, snapshot or gallery mode to launch instead.
 unsetopt bg_nice  # zsh nices background jobs by default; the app runs at normal priority, as from Finder

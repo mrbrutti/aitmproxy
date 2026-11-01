@@ -57,6 +57,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate()
         SelfTest.armWatchdog()
+        // Fail closed before any window, BusService, activate() or ExtensionController
+        // exists (spec D3 items 8 and 5): a removed fake-data switch, or a `--selftest`
+        // without its harness, must never run the live stack on the operator's real
+        // defaults. `exit` flushes the one printed line.
+        if let why = RemovedModes.refusal(environment: ProcessInfo.processInfo.environment) {
+            print(why)
+            exit(1)
+        }
+        if SelfTest.requested, let why = SelfTest.refusal() {
+            print(why)
+            exit(1)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -70,14 +82,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// Where surface-local state lives (pins, saved filters, compose history):
 /// ~/Library/Application Support/Aitmproxy/. Flows never persist here; they live in the proxy.
 enum Store {
-    /// True when APP_STORE points somewhere else (tests, snapshots).
+    /// True when APP_STORE points somewhere else (tests, the dev bundle).
     static var isOverridden: Bool {
         !(ProcessInfo.processInfo.environment["APP_STORE"] ?? "").isEmpty
     }
 
     /// The store for the connection settings (`bus.*`, `proxy.*`, `capture.enabled`):
     /// the operator's real defaults in a normal launch, an isolated suite in a
-    /// self-test, snapshot or fixture run (`SettingsDomain`), so stale Settings ▸ Bus
+    /// harness run (`APP_STORE` / `APP_LIVE`; `SettingsDomain`), so stale Settings ▸ Bus
     /// residue never steers a test and a test never overwrites it. `UserDefaults` is
     /// thread-safe but not marked `Sendable`, hence `unsafe`; the embedded core reads
     /// it off the main actor.

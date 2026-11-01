@@ -31,7 +31,7 @@ SwiftData database and no server.
 1. `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build` (Terminal).
 2. `tools/grid-lint.sh` and the three tripwires `tools/check-connection-words.sh`, `tools/check-capture-operator-only.sh`, `tools/check-capture-toggle.sh`, all exit 0.
 3. Build the dev bundle with a real core: `DEV_TAG=<tag> CORE_DIR=<dir with aitm> tools/snap-dev.sh`. It launches the bundle LIVE on an isolated `APP_STORE` and prints the pid, the store path and the `kill <pid>` line. `NO_LAUNCH=1` only builds.
-4. Real traffic through it: `python3 -m http.server 8099 --bind 127.0.0.1` as upstream, `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/` (Safari for HTTPS once the CA is trusted), then read the real window: `swift tools/winshot.swift Aitmproxy-<tag> /tmp/claude/<name>.png`.
+4. Real traffic through it: `python3 -m http.server 8099 --bind 127.0.0.1` as upstream, `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/` (Safari for HTTPS once the CA is trusted), then read the real window: `swift tools/winshot.swift <pid printed by snap-dev.sh> /tmp/claude/<name>.png` (the pid, not `Aitmproxy-<tag>`: a tagged dev bundle keeps the display name `Aitmproxy`, and `winshot` matches an owner name).
 5. `AITM_CONFIG=… tools/selftest-live.sh` (external core) and `tools/selftest-live-embedded.sh`.
 
 No fixture, snapshot, gallery or sample-data run exists any more and none may be added.
@@ -39,8 +39,9 @@ No fixture, snapshot, gallery or sample-data run exists any more and none may be
 **Removed 2026-10-31** with the fake-data modes (spec `docs/superpowers/specs/2026-10-31-remove-fake-data-ui-modes-design.md`), each with what replaces it:
 
 - `tools/snap.sh`, `tools/verify.sh`, `tools/selftest.sh` (fixture snapshots, the fixture self-test, and the wrapper that ran them) → the gate above.
-- `tools/cua-clickthrough.sh`, `tools/cua-l4.sh` (real input events on the fixture session) → `tools/cua-ne-drive.sh` on the dev bundle.
+- `tools/cua-clickthrough.sh`, `tools/cua-l4.sh` (real input events on the fixture session) → removed, no replacement for the pixel-path row click-through. `tools/cua-ne-drive.sh` is a different tool: AX-driven Settings ▸ Capture, Scope add and Safari plus a `winshot` of the real window, on the INSTALLED app (a dev bundle embeds no extension).
 - `tools/check-layout.swift` (read the `-layout.json` files only snapshot mode wrote) → `tools/grid-lint.sh` plus reading the real window.
+- `APP_FIXTURES`, `APP_SNAPSHOT`, `APP_SNAPSHOT_PAGES`, `APP_KIT_GALLERY`, `APP_L4_EMBEDDED` (the switches that selected those modes) → a launch that still sets one prints `<VAR> was removed on 2026-10-31 with the fixture modes; see apps/mac/CLAUDE.md` and exits 1 before any window or core (`RemovedModes`, spec D3 item 8). The harness variables are `APP_STORE` and `APP_LIVE`.
 
 ## Design rules
 

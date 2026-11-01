@@ -71,9 +71,7 @@ final class PocPanelState {
             if let param, !param.isEmpty { args["param"] = .string(param) }
             let returned = try await session.runCommand("poc.build", args).stringValue ?? ""
             let row = session.rows.first { $0.id == flowID }
-            let (yaml, path) = resolveBuilt(returned, name: name)
-            // Empty YAML means the core's answer was unusable; `resolveBuilt` has already set `lastError`.
-            guard !yaml.isEmpty else { return }
+            let (yaml, path) = try resolveBuilt(returned, name: name)
             let info = PocYAML.info(in: yaml)
             let finding = Finding(
                 title: info["name"] ?? name,
@@ -187,23 +185,21 @@ final class PocPanelState {
 
     /// `poc.build` returns YAML text or a path, depending on the build. Derive
     /// both from what the core returned and never synthesize YAML: a path that
-    /// cannot be read, or an answer that is neither YAML nor a path, leaves
-    /// `yaml` empty with the reason in `session.lastError`, and the caller
-    /// inserts no finding.
-    private func resolveBuilt(_ returned: String, name: String) -> (yaml: String, path: String) {
+    /// cannot be read, or an answer that is neither YAML nor a path, throws a
+    /// `BusError.tool` naming the reason; the caller's `catch` shows it in the
+    /// status bar and inserts no finding.
+    private func resolveBuilt(_ returned: String, name: String) throws -> (yaml: String, path: String) {
         let slug = Finding(title: name, severity: .medium, target: "", passed: false, ranAt: Date(), origin: .human, pocPath: "", yaml: "").slug
         if returned.contains("\n"), returned.contains("id:") {
             return (returned, "\(Store.url.path)/pocs/\(slug).poc.yaml")
         }
         if returned.hasSuffix(".yaml") || returned.hasSuffix(".yml") {
             guard let yaml = try? String(contentsOfFile: returned, encoding: .utf8) else {
-                session.lastError = "poc.build: could not read \(returned)"
-                return (yaml: "", path: returned)
+                throw BusError.tool(message: "poc.build: could not read \(returned)")
             }
             return (yaml, returned)
         }
-        session.lastError = "poc.build returned neither YAML nor a path"
-        return (yaml: "", path: "")
+        throw BusError.tool(message: "poc.build returned neither YAML nor a path")
     }
 
     private func loadScreenshot(for id: Finding.ID?) {

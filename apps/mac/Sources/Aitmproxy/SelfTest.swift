@@ -1,4 +1,3 @@
-import AitmBusClient
 import AitmproxyKit
 import AppKit
 import Synchronization
@@ -46,17 +45,23 @@ enum SelfTest {
         }
     }
 
+    /// Why a `--selftest` run must not proceed, or nil: no `APP_STORE` (it would run on
+    /// the operator's real store), or no `APP_LIVE=1` (the fixture self-test is gone).
+    /// `AppDelegate.applicationDidFinishLaunching` prints it and exits before the live
+    /// stack is built (spec D3 item 5); `runIfRequested` re-checks it as a second line
+    /// of defence.
+    static func refusal() -> String? {
+        guard Store.isOverridden else { return "SELFTEST refused: set APP_STORE to a folder in /tmp" }
+        guard live else { return "SELFTEST refused: the fixture self-test was removed on 2026-10-31; run tools/selftest-live.sh (APP_LIVE=1)" }
+        return nil
+    }
+
     static func runIfRequested(session: Session) {
         guard requested else { return }
         started.withLock { $0 = true }
         setvbuf(stdout, nil, _IOLBF, 0)
-        guard Store.isOverridden else {
-            print("SELFTEST refused: set APP_STORE to a folder in /tmp")
-            finish(code: 1)
-            return
-        }
-        guard live else {
-            print("SELFTEST refused: the fixture self-test was removed on 2026-10-31; run tools/selftest-live.sh (APP_LIVE=1)")
+        if let why = refusal() {
+            print(why)
             finish(code: 1)
             return
         }

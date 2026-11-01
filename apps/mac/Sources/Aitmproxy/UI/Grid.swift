@@ -32,11 +32,10 @@ extension View {
 @Observable
 final class GridProbes {
     static let shared = GridProbes()
-    static let enabled = GridOverlay.enabled
 
-    enum Kind: String, Codable { case area, probe }
+    enum Kind: String { case area, probe }
 
-    struct Probe: Codable {
+    struct Probe {
         var kind: Kind
         var name: String
         var area: String
@@ -76,7 +75,7 @@ private struct GridProbeModifier: ViewModifier {
     @State private var owner = UUID()
 
     func body(content: Content) -> some View {
-        if GridProbes.enabled {
+        if GridOverlay.enabled {
             content
                 .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
                     GridProbes.shared.update(.init(kind: kind, name: name, area: area, edge: edge, inset: inset,

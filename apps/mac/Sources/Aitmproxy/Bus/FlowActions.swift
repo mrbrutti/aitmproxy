@@ -1,6 +1,5 @@
 import AitmBusClient
 import AitmproxyKit
-import Foundation
 
 /// What the shell's buttons do: every call is a bus command (§4.5, §4.6), run by
 /// `BusService` once `ShellView` has installed it on the session.

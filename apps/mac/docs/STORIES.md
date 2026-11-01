@@ -15,7 +15,7 @@ Acceptance:
 - [snap] Sidebar 240 px with Traffic / Testing / Automation groups in tracked small caps; brand mark `›•‹ aitmproxy` top-left (a label, no status); filter field at the bottom.
 - [snap] Toolbar holds sidebar toggle, compose, clear; the connection cluster (pill, Proxy switch, Capture switch) in the centre; Agent toggle, palette and layout glyphs on the right; no glass capsules behind any group.
 - [snap] Chip bar 36 px with `All | HTTP HTTPS WebSocket | TCP UDP L4 | h1 h2 | JSON … Other` and the `Filters ▾` affordance; status bar 28 px on `raised` with the list's facts only.
-- [self] Fixtures load 14 rows; the window opens at 1440×900 with a 1100×640 minimum.
+- [live] The rows come from the core over the bus (none are seeded); the window opens at 1440×900 with a 1100×640 minimum.
 Status: done
 
 ### S-002 Watch the flow list
@@ -70,7 +70,7 @@ Acceptance:
 - [unit] `swift test --scratch-path ~/Library/Developer/Aitmproxy/test-build` reports 0 failures.
 - [structural] `tools/grid-lint.sh` and the three tripwires `tools/check-connection-words.sh`, `tools/check-capture-operator-only.sh` and `tools/check-capture-toggle.sh` exit 0.
 - [live] `DEV_TAG=<tag> CORE_DIR=<dir with aitm> tools/snap-dev.sh` builds the dev bundle and launches it LIVE on an isolated `APP_STORE`, printing the pid, the store path and the `kill <pid>` line; `NO_LAUNCH=1` only builds.
-- [live] Real traffic through the bundle: `python3 -m http.server 8099 --bind 127.0.0.1` upstream, `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/` (Safari for HTTPS once the CA is trusted) shows the row in the list; `swift tools/winshot.swift Aitmproxy-<tag> /tmp/claude/<name>.png` reads the real window.
+- [live] Real traffic through the bundle: `python3 -m http.server 8099 --bind 127.0.0.1` upstream, `curl -x 127.0.0.1:<listen> http://127.0.0.1:8099/` (Safari for HTTPS once the CA is trusted) shows the row in the list; `swift tools/winshot.swift <pid printed by snap-dev.sh> /tmp/claude/<name>.png` reads the real window.
 - [live] `AITM_CONFIG=… tools/selftest-live.sh` (external core) and `tools/selftest-live-embedded.sh` end with `LIVE SELFTEST PASS`.
 Status: done
 
@@ -249,7 +249,7 @@ UX:
 - Words: "Mark ▸ Red … Pink, Clear Mark", "Comment…", popover title "Comment", button "Save"
 - Access: swatches have colour names for VoiceOver; the comment field is the only control focused on open (typing-only surface)
 Status: done
-(Fixtures update locally; live `flow.mark`/`flow.comment` wait on S-core-F6 and surface a status-bar error until then.)
+(Marks and comments go over the bus as `flow.mark` / `flow.comment`; a core without S-core-F6 surfaces a status-bar error.)
 
 ### S-018 Pause the proxy and clear the session
 As the operator, I flip the Proxy switch in the toolbar to stop recording and click clear to drop every flow; both are real proxy state, read back from the core.
@@ -267,7 +267,7 @@ UX:
 - Words: "Proxy" (the switch), "Pause Proxy" / "Resume Proxy", "Clear Session", tooltip "Pause the proxy: traffic still passes and new flows are not recorded (⇧⌘R)"
 - Access: both in the menu bar; the pill is a status, not a control, to VoiceOver
 Status: done
-(Fixtures toggle locally; live `proxy.pause/resume`/`flow.clear` wait on S-core-F7 and surface a status-bar error until then.)
+(Pause, resume and clear go over the bus as `proxy.pause` / `proxy.resume` / `flow.clear`; a core without S-core-F7 surfaces a status-bar error.)
 
 ---
 

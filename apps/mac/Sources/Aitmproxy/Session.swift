@@ -219,7 +219,7 @@ final class Session {
 
     /// Where actions go: `OfflineActions` (every call fails with `disconnected`) until
     /// `ShellView` installs the `BusService`.
-    @ObservationIgnored lazy var actions: any FlowActions = OfflineActions()
+    @ObservationIgnored var actions: any FlowActions = OfflineActions()
     /// The last failed action, shown in the status bar until the next one succeeds.
     var lastError: String?
 
