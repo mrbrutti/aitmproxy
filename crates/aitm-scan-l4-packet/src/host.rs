@@ -2701,4 +2701,49 @@ mod tests {
         assert_eq!(err.to_string(), "case cap reached: 1 cases sent");
         assert_eq!(mock.inject_count(), 1);
     }
+
+    /// Tester (fix rounds, review finding S1): a replay that follows a passing
+    /// probe pair is spaced by `replay_spacing`, and the bound is proven with a
+    /// spacing the rest of the run cannot reach on its own. At 300 ms, the two
+    /// spaced replays alone cost 600 ms, while everything else in this run —
+    /// the two 50 ms silent probes, the 10 ms retries, a dozen echoed sends —
+    /// is well under 300 ms; without the sleep the run finishes long before
+    /// the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replays_after_a_passing_pair_are_spaced_by_replay_spacing() {
+        let mock = MockBackend::new(MockReply::Echo);
+        mock.dies_on_pattern(vec![0xde, 0xad, 0xbe, 0xef], 8, 2, false);
+        let profile = with_hex_seed(l4_profile(vec![udp_target(9)], 10), "deadbeef0000");
+        let (shared, job, plans, disc) = setup(Arc::clone(&mock), profile, &fields(&["raw"]), 1000);
+        let spacing = Duration::from_millis(300);
+        let shared = Arc::new(Shared {
+            timing: Timing {
+                replay_spacing: spacing,
+                ..shared.timing
+            },
+            ..(*shared).clone()
+        });
+        let runner = runner_for(&shared, &job, &plans, &disc.points, "raw");
+
+        let started = Instant::now();
+        let run = runner.run_point().await;
+        let elapsed = started.elapsed();
+
+        // The first replay follows the recovery poll (no spacing); the second
+        // and third follow passing pairs, so exactly two spacings are slept.
+        assert_eq!(
+            run.cases[1].candidate,
+            Candidate::NotReproduced {
+                probes: (false, false),
+                reproduced: 0,
+                attempts: 3,
+            }
+        );
+        assert!(
+            elapsed >= 2 * spacing,
+            "two spaced replays need at least {:?}, the run took {elapsed:?}",
+            2 * spacing
+        );
+        assert_eq!(mock.inject_count(), 1 + 7 + 2 + 1 + 3 * 3);
+    }
 }
