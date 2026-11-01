@@ -392,6 +392,8 @@ Kept by the main session during stage 6. One row per finding.
 | fix C | security | re-review | C1, C2, C3, C20, C21, C22 closed | closed |
 | fix C | security | Minor | C20 residual: Jobs rows are still built at render over the raw strings, so per-frame CPU is linear in the retained text | fix round E: bound `profile_name` and `targets` in `fold_status` (or store a prebuilt `JobRow`), and make `ui::text::truncate` early-exit |
 | fix C | security | Minor | C2 doc says `ceil(n/16)` firings; with the cursor's job riding out of turn the bound is `ceil((n-1)/15)` | fix round E: doc wording |
+| fix C | spec | re-review | C1 to C31 closed with the report's literals; D3/D6/D13 re-aligned in this commit (C1/C2 cadence rules, `from_message(tag, ..)`, notice clearing) | closed |
+| fix C | spec | Minor | seven supporting public items beyond the report's names | accepted (as for Tasks 6 and 7) |
 
 ## Shipped
 
