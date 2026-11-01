@@ -391,6 +391,17 @@ pub struct JobState {
     /// reply timeouts and three replays, so the lane retires the path itself
     /// and lets every later point on it read the first one's result.
     pub retired_paths: Mutex<HashSet<(String, String)>>,
+    /// Node ids whose endpoint stopped answering for good: a campaign that
+    /// ends `TargetDown` marks its node, and every later point on that node
+    /// stops at once (spec S6.2, F10).
+    ///
+    /// An endpoint that is simply not listening refuses every connection, and
+    /// F9 makes each refusal cost a recovery window before the campaign gives
+    /// up. One node carries a point per `(seed, field path)` pair — a hundred
+    /// of them on a small grammar — so without this flag a job against a dead
+    /// endpoint pays that window once per point. It is job-scoped: it dies
+    /// with the state, and a later job probes the endpoint again.
+    pub down_nodes: Mutex<HashSet<String>>,
     /// Silent cases in a row, against the profile's `consecutive_timeouts`.
     pub consecutive_timeouts: AtomicU32,
     /// How often the guard's injection-rate cap made an exchange wait and
@@ -464,6 +475,7 @@ impl JobState {
             parser_faults: AtomicU32::new(0),
             retired: Mutex::new(HashSet::new()),
             retired_paths: Mutex::new(HashSet::new()),
+            down_nodes: Mutex::new(HashSet::new()),
             consecutive_timeouts: AtomicU32::new(0),
             rate_waits: AtomicU32::new(0),
             connections: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
@@ -562,6 +574,23 @@ impl JobState {
             .any(|(node, field)| node == node_id && field == path)
     }
 
+    /// Mark a node down for the rest of the job (spec S6.2, F10). `true` the
+    /// first time, `false` afterwards.
+    ///
+    /// The caller is a campaign that stopped `TargetDown`: the endpoint never
+    /// came back after a crash, or refused a connection twice around a
+    /// recovery window. Every later point on it reads that answer instead of
+    /// paying the window again.
+    pub fn mark_node_down(&self, node_id: &str) -> bool {
+        lock(&self.down_nodes).insert(node_id.to_string())
+    }
+
+    /// Whether this node was marked down earlier in the job.
+    #[must_use]
+    pub fn is_node_down(&self, node_id: &str) -> bool {
+        lock(&self.down_nodes).contains(node_id)
+    }
+
     /// Take the job's current deadline and cancellation, for eviction.
     fn refresh_from(&self, job: &dyn JobCtx) {
         *lock(&self.deadline) = job.deadline();
@@ -601,6 +630,7 @@ impl fmt::Debug for JobState {
             .field("parser_faults", &self.parser_faults.load(Ordering::Relaxed))
             .field("retired", &lock(&self.retired).len())
             .field("retired_paths", &lock(&self.retired_paths).len())
+            .field("down_nodes", &lock(&self.down_nodes).len())
             .field(
                 "consecutive_timeouts",
                 &self.consecutive_timeouts.load(Ordering::Relaxed),
@@ -1026,6 +1056,25 @@ mod tests {
         assert!(!state.retire("p"));
         assert!(state.is_retired("p"));
         // A point is not an element: `retired_elements` counts paths (F8).
+        assert_eq!(state.counters().retired_elements, 0);
+    }
+
+    #[test]
+    fn a_down_node_is_remembered() {
+        let state = JobState::new("scan-01", "aitm01", 65_536);
+        assert!(!state.is_node_down("l4s-tcp-127.0.0.1-9000"));
+        assert!(state.mark_node_down("l4s-tcp-127.0.0.1-9000"));
+        assert!(
+            !state.mark_node_down("l4s-tcp-127.0.0.1-9000"),
+            "idempotent"
+        );
+        assert!(state.is_node_down("l4s-tcp-127.0.0.1-9000"));
+
+        // The flag is per node: the job's other endpoints are untouched.
+        assert!(!state.is_node_down("l4s-tcp-127.0.0.1-9001"));
+
+        // An unreachable endpoint is not a crash finding: `retired_elements`
+        // counts retired field paths (F8) and nothing else.
         assert_eq!(state.counters().retired_elements, 0);
     }
 

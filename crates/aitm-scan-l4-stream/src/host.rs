@@ -75,6 +75,9 @@ pub enum HostError {
     NotBytes,
     /// The point was retired after a confirmed crash.
     Retired,
+    /// The point's endpoint was marked down earlier in this job: an earlier
+    /// campaign on it stopped `TargetDown` (spec S6.2, F10).
+    TargetDown,
     /// The job's budget refused the charge for this message.
     Budget,
     /// The job's deadline has passed, or waiting for a connection would cross
@@ -114,6 +117,9 @@ impl fmt::Display for HostError {
             }
             HostError::Retired => {
                 f.write_str("l4_stream: the point was retired after a confirmed crash")
+            }
+            HostError::TargetDown => {
+                f.write_str("l4_stream: the endpoint was marked down earlier in this job")
             }
             HostError::Budget => f.write_str("l4_stream: the job's budget is exhausted"),
             HostError::Deadline => f.write_str("l4_stream: the job's deadline has passed"),
@@ -406,6 +412,12 @@ impl StreamHost {
                 .is_path_retired(&self.point.node_id, self.point.field_path())
         {
             return Err(HostError::Retired);
+        }
+        // The endpoint itself stopped answering an earlier campaign of this
+        // job and never came back (spec S6.2, F10): no point on it opens
+        // another socket.
+        if self.state.is_node_down(&self.point.node_id) {
+            return Err(HostError::TargetDown);
         }
 
         // 2. Too many silent cases in a row: the target is not answering.
@@ -1466,6 +1478,27 @@ mod tests {
             .expect_err("a point on a retired field path sends nothing");
 
         assert!(matches!(host_error(&error), HostError::Retired), "{error}");
+        assert_eq!(client.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_point_on_a_down_node_refuses() {
+        let job = Arc::new(TestJob::new());
+        let client = Arc::new(CountingClient::live());
+        let host = test_host(endpoint(6379), Some(loopback_guard()), &job, &client);
+        // An earlier campaign on this endpoint stopped `TargetDown` (F10).
+        assert!(host.state.mark_node_down(&host.point.node_id));
+        assert!(!host.state.is_retired(&host.point.point.id));
+
+        let error = host
+            .probe(&payload(b"PING\r\n"))
+            .await
+            .expect_err("a point on a node marked down sends nothing");
+
+        assert!(
+            matches!(host_error(&error), HostError::TargetDown),
+            "{error}"
+        );
         assert_eq!(client.count(), 0);
     }
 

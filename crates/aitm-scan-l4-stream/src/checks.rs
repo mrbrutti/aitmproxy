@@ -122,6 +122,14 @@ pub enum StopReason {
     ConsecutiveTimeouts(u32),
     /// The target did not answer a liveness probe within the recovery window.
     TargetDown,
+    /// The point's node was marked down by an earlier campaign of this job,
+    /// so this one sent nothing (spec S6.2, F10).
+    ///
+    /// The same `stop=target_down` token as [`StopReason::TargetDown`] — it
+    /// is the same answer about the same endpoint — with its own clause, so
+    /// the detail does not claim this campaign waited a recovery window it
+    /// never entered.
+    NodeDown,
     /// The L4 guard refused; the message is already in the D3 form.
     Guard(String),
     /// The job reached [`MAX_CASES_PER_JOB`].
@@ -141,7 +149,7 @@ impl StopReason {
             StopReason::Deadline => "deadline".to_string(),
             StopReason::Cancelled => "cancelled".to_string(),
             StopReason::ConsecutiveTimeouts(n) => format!("consecutive_timeouts({n})"),
-            StopReason::TargetDown => "target_down".to_string(),
+            StopReason::TargetDown | StopReason::NodeDown => "target_down".to_string(),
             StopReason::Guard(_) => "guard".to_string(),
             StopReason::LaneCap => "lane_cap".to_string(),
             StopReason::DryRun => "dry_run".to_string(),
@@ -161,6 +169,7 @@ impl StopReason {
                 "target did not recover within {secs} s",
                 secs = RECOVERY_WINDOW.as_secs()
             )),
+            StopReason::NodeDown => Some("node marked down earlier in this job".to_string()),
             StopReason::Guard(message) => Some(format!("guard refused: {message}")),
             StopReason::LaneCap => Some(format!("lane cap {MAX_CASES_PER_JOB} reached")),
             StopReason::DryRun => Some("dry run".to_string()),
@@ -393,6 +402,23 @@ async fn run(
         return Ok(campaign);
     }
 
+    // The endpoint stopped answering an earlier campaign of this job and
+    // never came back (spec S6.2, F10). Every point on the node would pay a
+    // recovery window of its own to learn the same thing, and a node carries
+    // a point per `(seed, field path)` pair, so the campaign is empty and the
+    // three checks read it: no parse, no baseline, no socket.
+    if job.is_node_down(&dp.node_id) {
+        let mut campaign = Campaign::new(point.id.clone(), rng_seed_for(host, point), 0);
+        campaign.stopped = StopReason::NodeDown;
+        tracing::debug!(
+            point = %point.id,
+            node = %dp.node_id,
+            stop = "target_down",
+            "l4 stream campaign skipped: the node was marked down"
+        );
+        return Ok(campaign);
+    }
+
     let grammar = grammar_for(job, &dp);
     let Some(tree) = grammar.parse(&dp.seed_bytes) else {
         return Err(error_verdict(seed_does_not_parse(
@@ -460,15 +486,21 @@ async fn run(
         "l4 stream campaign finished"
     );
     if campaign.stopped == StopReason::TargetDown {
+        // The endpoint never came back, so the rest of the job's points on
+        // it stop at once rather than each paying a recovery window (F10).
+        job.mark_node_down(&dp.node_id);
         // The one stop an operator must see without turning on debug
         // logging: the target stopped answering and did not come back
-        // (spec S9, SPEC-I3). Ids and counts only, never a byte.
+        // (spec S9, SPEC-I3). Ids and counts only, never a byte. The marking
+        // above is part of this same stop and is not logged again.
         tracing::warn!(
             point = %point.id,
+            node = %dp.node_id,
             job = %job.job_id,
             cases_sent = campaign.cases_sent,
             recovery_window_s = RECOVERY_WINDOW.as_secs(),
-            "l4 stream target did not recover"
+            down_nodes = lock(&job.down_nodes).len(),
+            "l4 stream target did not recover; the node is down for this job"
         );
     }
     Ok(campaign)
@@ -508,6 +540,9 @@ fn step_for(error: &anyhow::Error) -> Step {
         HostError::Cancelled => Step::Stop(StopReason::Cancelled),
         HostError::ConsecutiveTimeouts(n) => Step::Stop(StopReason::ConsecutiveTimeouts(*n)),
         HostError::Retired => Step::Stop(StopReason::Retired),
+        // The endpoint was marked down earlier in this job (F10); the host
+        // refuses before the socket, so nothing went out.
+        HostError::TargetDown => Step::Stop(StopReason::NodeDown),
         HostError::Guard(message) => Step::Stop(StopReason::Guard(message.clone())),
         HostError::DryRun => Step::Stop(StopReason::DryRun),
         // The transport could not reach the peer at all. Nothing went out,
@@ -2179,6 +2214,114 @@ mod tests {
             "{detail}",
             detail = verdict.detail
         );
+    }
+
+    /// The same point as [`discovered`], on a second endpoint: the shape
+    /// discovery produces when a job holds more than one L4 node (F10).
+    fn discovered_on(path: &str, node_id: &str, port: u16) -> DiscoveredPoint {
+        let mut dp = discovered(path);
+        dp.point.id = format!("l4s-point-{node_id}-{path}");
+        dp.point.site_node = Some(node_id.to_string());
+        dp.node_id = node_id.to_string();
+        dp.endpoint.port = port;
+        dp
+    }
+
+    #[tokio::test]
+    async fn a_down_node_skips_every_later_campaign_without_sockets() {
+        let job = NullJob::new("m1", 3);
+        let state = Arc::new(LaneState::new());
+        let job_state = state.job_for(&job);
+        let (grammar, _descriptor) = tlv::from_seeds_on(&seeds(), Transport::Tcp)
+            .expect("the two seeds carry a length relation");
+
+        // Two points on one node, and a third on another node.
+        let first = discovered("length");
+        let second = discovered("payload");
+        let elsewhere = discovered_on("length", "l4s-tcp-127.0.0.1-9001", 9001);
+        {
+            let mut points = lock(&job_state.points);
+            for dp in [&first, &second, &elsewhere] {
+                points.insert(dp.point.id.clone(), dp.clone());
+            }
+        }
+        {
+            let mut grammars = lock(&job_state.grammars);
+            grammars.insert(first.node_id.clone(), Arc::clone(&grammar));
+            grammars.insert(elsewhere.node_id.clone(), grammar);
+        }
+        job_state.points_total.store(3, Ordering::SeqCst);
+
+        let host =
+            FakeHost::new("m1", job.profile.clone(), Some(Arc::clone(&job_state))).script(vec![
+                // The first point: the connect is refused, the recovery poll
+                // says the target is back, and the retry is refused again.
+                clean(10),
+                refused_connect(),
+                alive(),
+                refused_connect(),
+                // The third point, on another node, runs normally.
+                clean(10),
+                clean(10),
+            ]);
+
+        let all = checks(Arc::clone(&state));
+        let down = all[0].run(&first.point, &host).await;
+        assert_eq!(down.outcome, Outcome::Inconclusive, "{}", down.detail);
+        assert!(
+            down.detail.contains("stop=target_down"),
+            "{detail}",
+            detail = down.detail
+        );
+        assert!(
+            job_state.is_node_down(&first.node_id),
+            "the node that never came back is marked down for the job"
+        );
+
+        // Every later point on that node stops at once: no grammar parse, no
+        // baseline, no recovery window, and no socket.
+        let after_first = host.calls().len();
+        for check in &all {
+            let verdict = check.run(&second.point, &host).await;
+            assert_eq!(
+                verdict.outcome,
+                Outcome::Inconclusive,
+                "{detail}",
+                detail = verdict.detail
+            );
+            assert!(
+                verdict.detail.contains("stop=target_down"),
+                "{detail}",
+                detail = verdict.detail
+            );
+            assert!(
+                verdict
+                    .detail
+                    .contains("node marked down earlier in this job"),
+                "{detail}",
+                detail = verdict.detail
+            );
+            assert!(
+                verdict.detail.contains("cases=0/0"),
+                "nothing was planned or sent: {detail}",
+                detail = verdict.detail
+            );
+        }
+        assert_eq!(
+            host.calls().len(),
+            after_first,
+            "a point on a down node costs no host call"
+        );
+
+        // The flag is this node's, not the job's: another endpoint still runs.
+        let other = all[0].run(&elsewhere.point, &host).await;
+        assert_eq!(other.outcome, Outcome::Clean, "{}", other.detail);
+        assert!(
+            other.detail.contains("cases=1/1"),
+            "{detail}",
+            detail = other.detail
+        );
+        assert!(!job_state.is_node_down(&elsewhere.node_id));
     }
 
     #[tokio::test]
