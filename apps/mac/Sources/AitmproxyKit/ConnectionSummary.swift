@@ -27,6 +27,9 @@ public enum ConnectionAction: Hashable, Sendable, CaseIterable {
     case openBrowser, copyListenAddress
     /// The Scope fact's remedy button: the Scope page with its add sheet open.
     case addScopeHost
+    /// The system-proxy route's buttons (spec 2026-10-31-system-proxy-automation-design §D12): make this core the
+    /// system proxy (the core records the previous setting), restore that recorded setting.
+    case setSystemProxy, unsetSystemProxy
     case trustCA, openCAPanel
 
     /// The button title (title case; an ellipsis where another view opens).
@@ -47,6 +50,8 @@ public enum ConnectionAction: Hashable, Sendable, CaseIterable {
         case .openBrowser: "Open Browser"
         case .copyListenAddress: "Copy Address"
         case .addScopeHost: "Add Host…"
+        case .setSystemProxy: "Set as System Proxy"
+        case .unsetSystemProxy: "Restore System Proxy"
         case .trustCA: "Trust the aitmproxy CA"
         case .openCAPanel: "Certificate Authority…"
         }
@@ -148,8 +153,10 @@ public struct TrafficRoute: Hashable, Sendable {
     /// What this route carries (the lane principle), the same on every state of the route:
     /// systemProxy → "every proxy-aware app, regardless of Scope"; allApps → "in-scope hosts of every app".
     public let detail: String
-    /// What opens the route, primary first; empty when open — and empty for the system-proxy entry
-    /// until PR4 fills `.setSystemProxy`.
+    /// What opens the route, primary first; empty when closed with nothing to press (an administrator wait, a change
+    /// in flight, a platform with no mechanism, the CFNetwork read without the verb's facts). Empty when open, with
+    /// one exception: the system-proxy entry the app itself set carries `[.unsetSystemProxy]` (§D12's Restore
+    /// button) — the banner never reads it, since an open entry is never shown.
     public let actions: [ConnectionAction]
 
     /// The one line, verbatim on both pages: the state, then " — " and the remedy when there is one. Composed
@@ -169,8 +176,9 @@ public struct TrafficRoute: Hashable, Sendable {
 /// The two routes and the two facts, the Flows empty-state advice and the one banner line, all
 /// derived once inside `ConnectionSummary.make` so Status and Flows can never disagree.
 public struct TrafficRoutes: Hashable, Sendable {
-    /// nil while the system proxy is unknown: before PR4 lands, before its first `proxy.status`
-    /// answer, a session with no live bus, or a state the core cannot classify.
+    /// nil while the system proxy is unknown: before the first `proxy.status` answer with no CFNetwork read
+    /// either, a session with no live bus, or a verb word that names no endpoint (`unsupported`, `unknown`,
+    /// an `other` at our own address).
     public let systemProxy: TrafficRoute?
     /// nil when this build has no extension (`CaptureAdvice.unsupported`) or an external core is active.
     public let allApps: TrafficRoute?
@@ -191,7 +199,7 @@ public struct TrafficRoutes: Hashable, Sendable {
     /// The one-line banner text above the Flows table, or nil: the shown entries' `state`s joined " · ".
     public var banner: String? { shown.isEmpty ? nil : shown.map(\.state).joined(separator: " · ") }
     /// The banner's one button: the first shown entry that has an action, its `actions.first` (nil when
-    /// none has one). Priority: system proxy (PR4's Set as System Proxy, once filled), All Apps, Scope, CA.
+    /// none has one). Priority: system proxy (Set as System Proxy), All Apps, Scope, CA.
     public var bannerAction: ConnectionAction? { shown.first { !$0.actions.isEmpty }?.actions.first }
     /// The banner's tooltip detail: the shown entries' `detail`s joined " · "; nil when nothing is shown.
     public var bannerDetail: String? { shown.isEmpty ? nil : shown.map(\.detail).joined(separator: " · ") }
@@ -271,12 +279,23 @@ public struct ConnectionSummary: Hashable, Sendable {
     /// own copy for a core that lacks `proxy.status.decrypt`, the same words.
     public static let nothingDecryptedAdvice = "Nothing is decrypted until a host is in Scope."
 
+    /// §D12's lane sentence (spec 2026-10-31-system-proxy-automation-design), verbatim wherever both lanes appear:
+    /// the Settings ▸ Proxy footnote, the first-run sheet, the Status page Core card tooltip.
+    public static let systemProxyLaneSentence =
+        "System proxy → every proxy-aware app, regardless of Scope. All Apps → in-scope hosts of every app."
+
+    /// The Settings ▸ Proxy "Bypass hosts" field's help (§D5, §D13), verbatim.
+    public static let bypassFieldCopy = "Hosts that skip the system proxy. Add the hosts your own tools talk to"
+        + " (today's incident: a tool whose API calls were routed to another proxy)."
+
     // MARK: Make
 
-    /// `systemProxy` is `Session.systemProxy` (nil = unknown, never rendered as "off"); `caTrust`
-    /// PR D's `Session.caTrust` (nil = `ca.status` unread or every store unknown, never rendered as
-    /// trusted or not trusted); `tunnelledFlowCount` the rows whose `tls == .tunnelled`; `decrypt`
-    /// the core's `proxy.status.decrypt` (nil from an older core).
+    /// `systemProxy` is `Session.systemProxy`, the CFNetwork read (nil = unknown, never rendered as "off");
+    /// `systemProxyFacts` the verb's `proxy.status.system_proxy` as `Session` parses it (nil = no verb on this
+    /// bus) — when present it is the system-proxy route's one source and `systemProxy` is not read (spec
+    /// 2026-10-31-system-proxy-automation-design D1); `caTrust` PR D's `Session.caTrust` (nil = `ca.status`
+    /// unread or every store unknown, never rendered as trusted or not trusted); `tunnelledFlowCount` the rows
+    /// whose `tls == .tunnelled`; `decrypt` the core's `proxy.status.decrypt` (nil from an older core).
     public static func make(
         core connection: CoreConnection?,
         activeKind: ActiveCoreKind,
@@ -290,6 +309,7 @@ public struct ConnectionSummary: Hashable, Sendable {
         listenAddress: String,
         coreCapture: CoreCaptureStatus? = nil,
         systemProxy: SystemProxyState? = nil,
+        systemProxyFacts: SystemProxyFacts? = nil,
         caTrust: CATrustFacts? = nil,
         tunnelledFlowCount: Int = 0,
         decrypt: DecryptStatus? = nil
@@ -302,7 +322,8 @@ public struct ConnectionSummary: Hashable, Sendable {
         // The All Apps words come from the route table once. An external core runs no extension, so the route
         // is not ours to show (`routes.allApps` nil, D10) while the Status step still prints the same words.
         let allApps = allAppsRoute(advice)
-        let routes = self.routes(systemProxy: systemProxy, caTrust: caTrust, allApps: activeKind == .external ? nil : allApps,
+        let routes = self.routes(systemProxy: systemProxy, systemProxyFacts: systemProxyFacts, caTrust: caTrust,
+                                 allApps: activeKind == .external ? nil : allApps,
                                  bus: busLane, scopeHostCount: scopeHostCount, flowCount: flowCount,
                                  tunnelledFlowCount: tunnelledFlowCount, decrypt: decrypt, listenAddress: listenAddress)
         let steps = self.steps(core: core, bus: busLane, activeKind: activeKind, advice: advice, allApps: allApps, routes: routes,
@@ -442,11 +463,17 @@ public struct ConnectionSummary: Hashable, Sendable {
 
     /// `allApps` is the route table's All Apps entry, or nil when it is not ours to show (no extension in this
     /// build, an external core).
-    private static func routes(systemProxy: SystemProxyState?, caTrust: CATrustFacts?, allApps: TrafficRoute?,
-                               bus: ConnectionLane, scopeHostCount: Int, flowCount: Int, tunnelledFlowCount: Int,
-                               decrypt: DecryptStatus?, listenAddress: String) -> TrafficRoutes {
+    private static func routes(systemProxy: SystemProxyState?, systemProxyFacts: SystemProxyFacts?, caTrust: CATrustFacts?,
+                               allApps: TrafficRoute?, bus: ConnectionLane, scopeHostCount: Int, flowCount: Int,
+                               tunnelledFlowCount: Int, decrypt: DecryptStatus?, listenAddress: String) -> TrafficRoutes {
         let busOK = bus.state == .ok
-        let systemProxyRoute = systemProxy.map { systemProxyRoute($0, listenAddress: listenAddress) }
+        // D1: the verb's facts are the route's source whenever the bus offers them — even when they name nothing
+        // (nil, never filled in from the read); the CFNetwork read is the source only without them.
+        let systemProxyRoute: TrafficRoute? = if let systemProxyFacts {
+            self.systemProxyRoute(systemProxyFacts, listenAddress: listenAddress)
+        } else {
+            systemProxy.map { self.systemProxyRoute($0, listenAddress: listenAddress) }
+        }
         // The Scope fact is known only through the bus: a `decrypt` value is ignored unless the bus lane is ok
         // (the one `BusService` line has no disconnect reset), and the fallback is the live scope count.
         let scope = scopeRoute(busOK ? decrypt : nil, scopeHostCount: scopeHostCount)
@@ -473,7 +500,46 @@ public struct ConnectionSummary: Hashable, Sendable {
                              advice: closedFacts, shown: bannerShown ? shown : [])
     }
 
-    /// D3's system-proxy table. The closed entries carry no action in this PR (PR4 fills `.setSystemProxy`).
+    private static let systemProxyOtherRemedy =
+        "Another app owns the system proxy. Set as System Proxy records its setting and restores it on quit."
+    private static let systemProxyOffRemedy = "Set as System Proxy so Safari and other proxy-aware apps use the core."
+
+    /// §D12's rows from the verb's facts (spec 2026-10-31-system-proxy-automation-design), in precedence order: a
+    /// change in flight ("setting system proxy…", nothing to press) outranks every word; `needs_privilege` is closed
+    /// with the core's own remedy sentence (nil when the compact object lacks it) and nothing to press; a word with
+    /// no endpoint fact (`unsupported`, `unknown`, an `other` at our own address) is nil — unknown is never named.
+    /// The endpoint words take the CFNetwork table's state words, then: at this core → open, " · set outside the
+    /// app" appended when `managed_by_us` is false, `[.unsetSystemProxy]` only when it is true; elsewhere or off →
+    /// closed, §D12's remedy and `[.setSystemProxy]` when `supported`, else the CFNetwork table's remedy and nothing
+    /// to press.
+    private static func systemProxyRoute(_ facts: SystemProxyFacts, listenAddress: String) -> TrafficRoute? {
+        if facts.setting {
+            return TrafficRoute(kind: .systemProxy, open: false, state: "setting system proxy…", detail: systemProxyDetail, actions: [])
+        }
+        if facts.word == .needsPrivilege {
+            return TrafficRoute(kind: .systemProxy, open: false, state: "system proxy needs an administrator", remedy: facts.remedy,
+                                detail: systemProxyDetail, actions: [])
+        }
+        guard let state = facts.state else { return nil }
+        let words = systemProxyRoute(state, listenAddress: listenAddress)
+        switch state.route(to: listenAddress) {
+        case .thisCore:
+            let outside = facts.managedByUs == false ? " · set outside the app" : ""
+            return TrafficRoute(kind: .systemProxy, open: true, state: words.state + outside, detail: systemProxyDetail,
+                                actions: facts.managedByUs == true ? [.unsetSystemProxy] : [])
+        case .other:
+            return TrafficRoute(kind: .systemProxy, open: false, state: words.state,
+                                remedy: facts.supported ? systemProxyOtherRemedy : words.remedy,
+                                detail: systemProxyDetail, actions: facts.supported ? [.setSystemProxy] : [])
+        case .off:
+            return TrafficRoute(kind: .systemProxy, open: false, state: words.state,
+                                remedy: facts.supported ? systemProxyOffRemedy : words.remedy,
+                                detail: systemProxyDetail, actions: facts.supported ? [.setSystemProxy] : [])
+        }
+    }
+
+    /// D3's system-proxy table from the CFNetwork read alone: the state words and the generic remedy, no actions —
+    /// without the verb's facts the app cannot tell whether it may set or restore anything.
     private static func systemProxyRoute(_ state: SystemProxyState, listenAddress: String) -> TrafficRoute {
         let remedy = "set \(listenAddress) as the system proxy, or point a client at it"
         switch state.route(to: listenAddress) {
@@ -565,10 +631,11 @@ public struct ConnectionSummary: Hashable, Sendable {
                                title: busDone ? "Bus connected" : "Connect to the bus",
                                done: busDone, action: busDone ? nil : bus.actions.first),
         ]
-        // Omitted while the system proxy is unknown: a step that cannot name its state would be a lie.
+        // Omitted while the system proxy is unknown: a step that cannot name its state would be a lie. A closed row
+        // offers the route's first button (Set as System Proxy when the verb says it may); a done row offers nothing.
         if let systemProxy = routes.systemProxy {
             steps.append(GettingStartedStep(kind: .systemProxy, title: systemProxy.line, done: systemProxy.open,
-                                            action: nil, detail: systemProxy.detail))
+                                            action: systemProxy.open ? nil : systemProxy.actions.first, detail: systemProxy.detail))
         }
         let extensionAction: ConnectionAction?
         switch advice {
@@ -596,10 +663,26 @@ public struct ConnectionSummary: Hashable, Sendable {
             steps.append(GettingStartedStep(kind: .caTrusted, title: step.title, done: route.open,
                                             action: route.open ? nil : step.action, detail: route.detail))
         }
-        steps.append(GettingStartedStep(kind: .firstFlow,
-                                        title: flowCount > 0 ? "\(Format.count(flowCount, "flow")) captured"
-                                                             : "Point a client at \(listenAddress), or open the browser",
-                                        done: flowCount > 0, action: flowCount > 0 ? nil : .openBrowser))
+        steps.append(firstFlowStep(flowCount: flowCount, systemProxy: routes.systemProxy, listenAddress: listenAddress))
         return steps
+    }
+
+    /// The last row (§D13 "Getting started"): the count once there are rows. Before that the system-proxy route picks
+    /// the words — the Set button when the route is closed and offers it, "waiting for the first flow" when the route
+    /// is open, else the plain pointer (no route, unsupported, an administrator wait, a change in flight).
+    private static func firstFlowStep(flowCount: Int, systemProxy: TrafficRoute?, listenAddress: String) -> GettingStartedStep {
+        if flowCount > 0 {
+            return GettingStartedStep(kind: .firstFlow, title: "\(Format.count(flowCount, "flow")) captured", done: true)
+        }
+        if let systemProxy, !systemProxy.open, systemProxy.actions.contains(.setSystemProxy) {
+            return GettingStartedStep(kind: .firstFlow, title: "Set aitmproxy as the system proxy, or open the browser",
+                                      done: false, action: .setSystemProxy)
+        }
+        if let systemProxy, systemProxy.open {
+            return GettingStartedStep(kind: .firstFlow, title: "System proxy points at \(listenAddress) — waiting for the first flow",
+                                      done: false, action: .openBrowser)
+        }
+        return GettingStartedStep(kind: .firstFlow, title: "Point a client at \(listenAddress), or open the browser",
+                                  done: false, action: .openBrowser)
     }
 }

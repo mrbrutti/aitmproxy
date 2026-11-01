@@ -442,7 +442,8 @@ import Testing
         }
     }
 
-    /// TR-AC6: the Scope entry's remedy button, and the one action list (no PR4 or denied cases).
+    /// TR-AC6: the Scope entry's remedy button, and the one action list (PR4's two system-proxy cases in
+    /// place after it; no denied cases).
     @Test func addScopeHostAction() {
         #expect(ConnectionAction.addScopeHost.title == "Add Host…")
         #expect(ConnectionAction.addScopeHost.isDestructive == false)
@@ -453,6 +454,7 @@ import Testing
             .turnCaptureOn, .turnCaptureOff, .openScope, .approveInSystemSettings, .uninstallExtension, .openCaptureSettings,
             .openBrowser, .copyListenAddress,
             .addScopeHost,
+            .setSystemProxy, .unsetSystemProxy,
             .trustCA, .openCAPanel,
         ])
     }
@@ -840,5 +842,278 @@ import Testing
         #expect(noRows.bannerDetail == nil)
         // The shown entries are the routes' own values, not copies with other words.
         #expect(fresh.shown == [fresh.allApps, fresh.scope, fresh.caTrust].compactMap { $0 })
+    }
+
+    // MARK: System proxy — the verb facts (spec 2026-10-31-system-proxy-automation-design §D12, §D13; plan Tasks 24 + 30)
+
+    /// `make` with the verb facts beside the CFNetwork read: the core ready, the bus connected as operator.
+    private func withFacts(_ facts: SystemProxyFacts?, systemProxy: SystemProxyState? = nil, capability: CaptureCapability = .capturing,
+                           extensionSupported: Bool = true, hosts: Int = 2, flows: Int = 0) -> ConnectionSummary {
+        ConnectionSummary.make(core: core(.ready), activeKind: .embedded, bus: .connected("x"), role: "operator", roleWarning: false,
+                               capability: capability, captureSupported: extensionSupported, scopeHostCount: hosts, flowCount: flows,
+                               listenAddress: "127.0.0.1:8080", systemProxy: systemProxy, systemProxyFacts: facts)
+    }
+
+    /// The verb facts for one word. `state` is what `SystemProxyFacts(compact:listenAddress:)` derives: both protocols at
+    /// our address for `points_at_us`, both at the other endpoint for `other`, `.off` for `off`, nil for the rest.
+    private func facts(_ word: SystemProxyFacts.Word, state: SystemProxyState? = nil, managed: Bool? = nil, setting: Bool = false,
+                       supported: Bool = true, remedy: String? = nil) -> SystemProxyFacts {
+        SystemProxyFacts(word: word, state: state, managedByUs: managed, setting: setting, supported: supported, detail: "", remedy: remedy)
+    }
+
+    private let otherRemedy = "Another app owns the system proxy. Set as System Proxy records its setting and restores it on quit."
+    private let offRemedy = "Set as System Proxy so Safari and other proxy-aware apps use the core."
+    private let todaysRemedy = "set 127.0.0.1:8080 as the system proxy, or point a client at it"
+    private let adminSentence = "macOS asks for an administrator to change network settings on this Mac."
+
+    /// SP-AC23, §D12's rows as the route table: words, remedy and actions per (state, managed_by_us, setting).
+    @Test func systemProxyRouteWordTableWithTheVerbFacts() {
+        let managed = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true)).routes.systemProxy
+        #expect(managed?.open == true)
+        #expect(managed?.state == "system proxy on · 127.0.0.1:8080")
+        #expect(managed?.remedy == nil)
+        #expect(managed?.line == "system proxy on · 127.0.0.1:8080")
+        #expect(managed?.actions == [.unsetSystemProxy])
+
+        let outside = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: false)).routes.systemProxy
+        #expect(outside?.open == true)
+        #expect(outside?.state == "system proxy on · 127.0.0.1:8080 · set outside the app")
+        #expect(outside?.line == "system proxy on · 127.0.0.1:8080 · set outside the app")
+        #expect(outside?.actions == [])
+
+        // Task 30's third shape: managed_by_us unknown (nil) — no suffix, no Restore button.
+        let unknownManaged = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: nil)).routes.systemProxy
+        #expect(unknownManaged?.state == "system proxy on · 127.0.0.1:8080")
+        #expect(unknownManaged?.actions == [])
+
+        let other = withFacts(facts(.other, state: both("127.0.0.1", 9090), managed: false)).routes.systemProxy
+        #expect(other?.open == false)
+        #expect(other?.state == "system proxy on · 127.0.0.1:9090, not this core")
+        #expect(other?.remedy == otherRemedy)
+        #expect(other?.line == "system proxy on · 127.0.0.1:9090, not this core — Another app owns the system proxy."
+                + " Set as System Proxy records its setting and restores it on quit.")
+        #expect(other?.actions == [.setSystemProxy])
+
+        let otherUnsupported = withFacts(facts(.other, state: both("10.0.0.5", 3128), managed: false, supported: false)).routes.systemProxy
+        #expect(otherUnsupported?.state == "system proxy on · 10.0.0.5:3128, not this core")
+        #expect(otherUnsupported?.remedy == todaysRemedy)
+        #expect(otherUnsupported?.actions == [])
+
+        let off = withFacts(facts(.off, state: .off, managed: false)).routes.systemProxy
+        #expect(off?.open == false)
+        #expect(off?.state == "system proxy off")
+        #expect(off?.remedy == offRemedy)
+        #expect(off?.line == "system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.")
+        #expect(off?.actions == [.setSystemProxy])
+
+        let offUnsupported = withFacts(facts(.off, state: .off, managed: false, supported: false)).routes.systemProxy
+        #expect(offUnsupported?.state == "system proxy off")
+        #expect(offUnsupported?.remedy == todaysRemedy)
+        #expect(offUnsupported?.line == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(offUnsupported?.actions == [])
+
+        let admin = withFacts(facts(.needsPrivilege, remedy: adminSentence)).routes.systemProxy
+        #expect(admin?.open == false)
+        #expect(admin?.state == "system proxy needs an administrator")
+        #expect(admin?.remedy == adminSentence)
+        #expect(admin?.line == "system proxy needs an administrator — macOS asks for an administrator to change network settings on this Mac.")
+        #expect(admin?.actions == [])
+        let adminNoRemedy = withFacts(facts(.needsPrivilege)).routes.systemProxy
+        #expect(adminNoRemedy?.remedy == nil)
+        #expect(adminNoRemedy?.line == "system proxy needs an administrator")
+        #expect(adminNoRemedy?.actions == [])
+
+        let setting = withFacts(facts(.off, state: .off, setting: true)).routes.systemProxy
+        #expect(setting?.open == false)
+        #expect(setting?.state == "setting system proxy…")
+        #expect(setting?.remedy == nil)
+        #expect(setting?.line == "setting system proxy…")
+        #expect(setting?.actions == [])
+        // `setting` outranks every word, a restore in flight and an administrator wait included.
+        #expect(withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true, setting: true)).routes.systemProxy?.line
+                == "setting system proxy…")
+        #expect(withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true, setting: true)).routes.systemProxy?.open == false)
+        #expect(withFacts(facts(.needsPrivilege, setting: true, remedy: adminSentence)).routes.systemProxy?.line == "setting system proxy…")
+        #expect(withFacts(facts(.other, state: both("127.0.0.1", 9090), setting: true)).routes.systemProxy?.actions == [])
+
+        // Never named: unsupported, unknown, and an `other` at our own endpoint (no state).
+        #expect(withFacts(facts(.unsupported, supported: false)).routes.systemProxy == nil)
+        #expect(!withFacts(facts(.unsupported, supported: false)).steps.map(\.kind).contains(.systemProxy))
+        #expect(withFacts(facts(.unknown)).routes.systemProxy == nil)
+        #expect(withFacts(facts(.other, state: nil, managed: false)).routes.systemProxy == nil)
+        #expect(withFacts(facts(.pointsAtUs, state: nil, managed: true)).routes.systemProxy == nil)
+
+        for route in [managed, outside, other, off, admin, setting] {
+            #expect(route?.kind == .systemProxy)
+            #expect(route?.detail == "every proxy-aware app, regardless of Scope")
+        }
+    }
+
+    /// D1 (Task 30): the verb's answer wins over the CFNetwork read whenever the facts are present — even when it
+    /// says nothing (unknown), the read does not fill in.
+    @Test func theVerbFactsWinOverTheCFNetworkRead() {
+        let off = withFacts(facts(.off, state: .off), systemProxy: both("127.0.0.1", 8080))
+        #expect(off.routes.systemProxy?.state == "system proxy off")
+        #expect(off.routes.systemProxy?.open == false)
+        #expect(off.routes.systemProxy?.actions == [.setSystemProxy])
+        #expect(step(off, .systemProxy)?.done == false)
+        let atUs = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true), systemProxy: .off)
+        #expect(atUs.routes.systemProxy?.state == "system proxy on · 127.0.0.1:8080")
+        #expect(atUs.routes.systemProxy?.open == true)
+        #expect(step(atUs, .systemProxy)?.done == true)
+        let other = withFacts(facts(.other, state: both("127.0.0.1", 9090), managed: false), systemProxy: both("127.0.0.1", 8080))
+        #expect(other.routes.systemProxy?.state == "system proxy on · 127.0.0.1:9090, not this core")
+        #expect(withFacts(facts(.unknown), systemProxy: .off).routes.systemProxy == nil)
+        #expect(withFacts(facts(.unsupported, supported: false), systemProxy: both("127.0.0.1", 8080)).routes.systemProxy == nil)
+        // With no facts the read is the source, as before.
+        #expect(withFacts(nil, systemProxy: both("127.0.0.1", 8080)).routes.systemProxy?.state == "system proxy on · 127.0.0.1:8080")
+    }
+
+    /// The `.systemProxy` Getting-started row carries the route's first action while closed, nothing when open.
+    @Test func systemProxyStepCarriesTheRouteAction() {
+        let off = withFacts(facts(.off, state: .off))
+        #expect(step(off, .systemProxy)?.title == "system proxy off — Set as System Proxy so Safari and other proxy-aware apps use the core.")
+        #expect(step(off, .systemProxy)?.done == false)
+        #expect(step(off, .systemProxy)?.action == .setSystemProxy)
+        #expect(step(off, .systemProxy)?.detail == "every proxy-aware app, regardless of Scope")
+        let other = withFacts(facts(.other, state: both("127.0.0.1", 9090), managed: false))
+        #expect(step(other, .systemProxy)?.title == "system proxy on · 127.0.0.1:9090, not this core — Another app owns the system proxy."
+                + " Set as System Proxy records its setting and restores it on quit.")
+        #expect(step(other, .systemProxy)?.action == .setSystemProxy)
+        let managed = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true))
+        #expect(step(managed, .systemProxy)?.title == "system proxy on · 127.0.0.1:8080")
+        #expect(step(managed, .systemProxy)?.done == true)
+        #expect(step(managed, .systemProxy)?.action == nil, "a done row offers no Restore button; the card does")
+        let outside = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: false))
+        #expect(step(outside, .systemProxy)?.title == "system proxy on · 127.0.0.1:8080 · set outside the app")
+        #expect(step(outside, .systemProxy)?.done == true)
+        let admin = withFacts(facts(.needsPrivilege, remedy: adminSentence))
+        #expect(step(admin, .systemProxy)?.title == "system proxy needs an administrator — macOS asks for an administrator to change network settings on this Mac.")
+        #expect(step(admin, .systemProxy)?.done == false)
+        #expect(step(admin, .systemProxy)?.action == nil)
+        let setting = withFacts(facts(.off, state: .off, setting: true))
+        #expect(step(setting, .systemProxy)?.title == "setting system proxy…")
+        #expect(step(setting, .systemProxy)?.action == nil)
+        let offUnsupported = withFacts(facts(.off, state: .off, supported: false))
+        #expect(step(offUnsupported, .systemProxy)?.title == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(step(offUnsupported, .systemProxy)?.action == nil)
+        #expect(off.steps.map(\.kind) == [.coreRunning, .busConnected, .systemProxy, .extensionOn, .scopeSet, .firstFlow])
+    }
+
+    /// §D13 "Getting started": the `.firstFlow` row's undone title follows the system-proxy route.
+    @Test func firstFlowStepFollowsTheSystemProxy() {
+        let off = withFacts(facts(.off, state: .off), flows: 0)
+        #expect(step(off, .firstFlow)?.title == "Set aitmproxy as the system proxy, or open the browser")
+        #expect(step(off, .firstFlow)?.action == .setSystemProxy)
+        #expect(step(off, .firstFlow)?.done == false)
+        #expect(step(off, .firstFlow)?.detail == nil)
+        let other = withFacts(facts(.other, state: both("127.0.0.1", 9090), managed: false), flows: 0)
+        #expect(step(other, .firstFlow)?.title == "Set aitmproxy as the system proxy, or open the browser")
+        #expect(step(other, .firstFlow)?.action == .setSystemProxy)
+
+        let atUs = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true), flows: 0)
+        #expect(step(atUs, .firstFlow)?.title == "System proxy points at 127.0.0.1:8080 — waiting for the first flow")
+        #expect(step(atUs, .firstFlow)?.action == .openBrowser)
+        #expect(step(atUs, .firstFlow)?.done == false)
+        let outside = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: false), flows: 0)
+        #expect(step(outside, .firstFlow)?.title == "System proxy points at 127.0.0.1:8080 — waiting for the first flow")
+        // The CFNetwork read alone, pointing at us, reads the same: the row follows the route, not the source.
+        let readAtUs = withFacts(nil, systemProxy: both("127.0.0.1", 8080), flows: 0)
+        #expect(step(readAtUs, .firstFlow)?.title == "System proxy points at 127.0.0.1:8080 — waiting for the first flow")
+        #expect(step(readAtUs, .firstFlow)?.action == .openBrowser)
+
+        for summary in [
+            withFacts(facts(.unsupported, supported: false), flows: 0),
+            withFacts(facts(.unknown), flows: 0),
+            withFacts(facts(.off, state: .off, supported: false), flows: 0),
+            withFacts(facts(.needsPrivilege, remedy: adminSentence), flows: 0),
+            withFacts(facts(.off, state: .off, setting: true), flows: 0),
+            withFacts(nil, flows: 0),
+            withFacts(nil, systemProxy: .off, flows: 0),
+        ] {
+            #expect(step(summary, .firstFlow)?.title == "Point a client at 127.0.0.1:8080, or open the browser")
+            #expect(step(summary, .firstFlow)?.action == .openBrowser)
+        }
+        // With rows the step is the count, whatever the route.
+        let flows = withFacts(facts(.off, state: .off), flows: 3)
+        #expect(step(flows, .firstFlow)?.title == "3 flows captured")
+        #expect(step(flows, .firstFlow)?.done == true)
+        #expect(step(flows, .firstFlow)?.action == nil)
+    }
+
+    /// D5's banner button through the filled actions: the system proxy leads, so Set as System Proxy is the button.
+    @Test func bannerActionIsSetAsSystemProxyWhenTheProxyIsOff() {
+        let off = withFacts(facts(.off, state: .off), capability: .inactive, hosts: 2, flows: 3).routes
+        #expect(off.banner == "system proxy off · All Apps off")
+        #expect(off.bannerAction == .setSystemProxy)
+        #expect(off.advice.map(\.kind) == [.systemProxy, .allApps])
+        expectOneDerivation(off, "off")
+        let other = withFacts(facts(.other, state: both("127.0.0.1", 9090), managed: false), capability: .inactive, hosts: 2, flows: 3).routes
+        #expect(other.banner == "system proxy on · 127.0.0.1:9090, not this core · All Apps off")
+        #expect(other.bannerAction == .setSystemProxy)
+        expectOneDerivation(other, "other")
+        // No extension in this build: the system proxy alone, its button.
+        let alone = withFacts(facts(.off, state: .off), extensionSupported: false, hosts: 2, flows: 3).routes
+        #expect(alone.banner == "system proxy off")
+        #expect(alone.bannerAction == .setSystemProxy)
+        // Unsupported here: the system-proxy entry has no button, so All Apps' is the banner's.
+        let unsupported = withFacts(facts(.off, state: .off, supported: false), capability: .inactive, hosts: 2, flows: 3).routes
+        #expect(unsupported.banner == "system proxy off · All Apps off")
+        #expect(unsupported.bannerAction == .openCaptureSettings)
+        // A restore wait has no button either.
+        #expect(withFacts(facts(.needsPrivilege, remedy: adminSentence), capability: .inactive, hosts: 2, flows: 3).routes.bannerAction
+                == .openCaptureSettings)
+        #expect(withFacts(facts(.needsPrivilege, remedy: adminSentence), capability: .inactive, hosts: 2, flows: 3).routes.banner
+                == "system proxy needs an administrator · All Apps off")
+        // No rows: no banner, but the empty state's first line carries the same button.
+        let fresh = withFacts(facts(.off, state: .off), capability: .inactive, hosts: 2, flows: 0).routes
+        #expect(fresh.banner == nil)
+        #expect(fresh.bannerAction == nil)
+        #expect(fresh.advice.first?.actions == [.setSystemProxy])
+        // An open system proxy, managed: nothing shown, no button, whatever its own actions.
+        let managed = withFacts(facts(.pointsAtUs, state: both("127.0.0.1", 8080), managed: true), capability: .inactive, hosts: 2, flows: 3).routes
+        #expect(managed.banner == nil)
+        #expect(managed.bannerAction == nil)
+        #expect(managed.systemProxy?.actions == [.unsetSystemProxy])
+    }
+
+    /// With no verb facts the CFNetwork read renders exactly as before this task: today's words, no actions.
+    @Test func withoutFactsNothingChanges() {
+        let off = withFacts(nil, systemProxy: .off, capability: .inactive, hosts: 2, flows: 3)
+        #expect(off.routes.systemProxy?.open == false)
+        #expect(off.routes.systemProxy?.state == "system proxy off")
+        #expect(off.routes.systemProxy?.remedy == "set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(off.routes.systemProxy?.actions == [])
+        #expect(off.routes.banner == "system proxy off · All Apps off")
+        #expect(off.routes.bannerAction == .openCaptureSettings)
+        #expect(step(off, .systemProxy)?.title == "system proxy off — set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(step(off, .systemProxy)?.action == nil)
+        let other = withFacts(nil, systemProxy: both("127.0.0.1", 9090))
+        #expect(other.routes.systemProxy?.state == "system proxy on · 127.0.0.1:9090, not this core")
+        #expect(other.routes.systemProxy?.remedy == "set 127.0.0.1:8080 as the system proxy, or point a client at it")
+        #expect(other.routes.systemProxy?.actions == [])
+        #expect(step(other, .systemProxy)?.action == nil)
+        let ours = withFacts(nil, systemProxy: both("127.0.0.1", 8080))
+        #expect(ours.routes.systemProxy?.open == true)
+        #expect(ours.routes.systemProxy?.state == "system proxy on · 127.0.0.1:8080")
+        #expect(ours.routes.systemProxy?.actions == [])
+        let httpOnly = withFacts(nil, systemProxy: SystemProxyState(http: SystemProxyState.Endpoint(host: "127.0.0.1", port: 8080), https: nil))
+        #expect(httpOnly.routes.systemProxy?.state == "system proxy on · 127.0.0.1:8080 · HTTP only")
+        let none = withFacts(nil)
+        #expect(none.routes.systemProxy == nil)
+        #expect(none.steps.map(\.kind) == [.coreRunning, .busConnected, .extensionOn, .scopeSet, .firstFlow])
+        #expect(step(none, .firstFlow)?.title == "Point a client at 127.0.0.1:8080, or open the browser")
+    }
+
+    /// §D12's button titles and the two sentences the Settings and sheet views print verbatim.
+    @Test func systemProxyButtonTitlesAndCopy() {
+        #expect(ConnectionAction.setSystemProxy.title == "Set as System Proxy")
+        #expect(ConnectionAction.unsetSystemProxy.title == "Restore System Proxy")
+        #expect(ConnectionAction.setSystemProxy.isDestructive == false)
+        #expect(ConnectionAction.unsetSystemProxy.isDestructive == false)
+        #expect(ConnectionSummary.systemProxyLaneSentence
+                == "System proxy → every proxy-aware app, regardless of Scope. All Apps → in-scope hosts of every app.")
+        #expect(ConnectionSummary.bypassFieldCopy
+                == "Hosts that skip the system proxy. Add the hosts your own tools talk to (today's incident: a tool whose API calls were routed to another proxy).")
     }
 }
