@@ -123,14 +123,17 @@ struct ProviderRuleSet: Equatable {
     }
 
     /// For the "provider rules applied" log line (spec Design D): `1 rule (TCP
-    /// catch-all)` or `N rules (TCP catch-all + UDP a:any, [b]:443, …)`, with
-    /// ` (+K dropped)` appended when the cap left K targets out. Scoped target
-    /// addresses are the operator's own configuration, not user traffic.
+    /// catch-all)` or `N rules (TCP catch-all + UDP a:any, [b]:443, …)`; when the cap
+    /// left K targets out, `N rules, K dropped (TCP catch-all + UDP …)`. The drop count
+    /// sits at the HEAD, before up to 256 targets (~5-6 KiB): os_log truncates a long
+    /// dynamic argument from its tail, and the drop is the one signal the cap exists
+    /// for (fix R2-1). Scoped target addresses are the operator's own configuration,
+    /// not user traffic.
     var summary: String {
         if udpTargets.isEmpty { return "1 rule (TCP catch-all)" }
         let targets = udpTargets.map(\.summaryText).joined(separator: ", ")
-        let suffix = dropped > 0 ? " (+\(dropped) dropped)" : ""
-        return "\(1 + udpTargets.count) rules (TCP catch-all + UDP \(targets))\(suffix)"
+        let droppedText = dropped > 0 ? ", \(dropped) dropped" : ""
+        return "\(1 + udpTargets.count) rules\(droppedText) (TCP catch-all + UDP \(targets))"
     }
 
     /// Addresses that yield no rule: the wildcards (the header forbids them with port 0
@@ -387,10 +390,10 @@ extension HandoffSelfCheck {
               capped.udpTargets.allSatisfy { $0.address.hasPrefix("10.2.0.") }, "\(capped.udpTargets.suffix(3))")
         r.check("providerRulesEdges: capped set builds 257 rules", capped.networkRules().count == 257,
               "\(capped.networkRules().count)")
-        r.check("providerRulesEdges: capped summary starts with 257 rules and the first target",
-              capped.summary.hasPrefix("257 rules (TCP catch-all + UDP 10.2.0.0:5000, "), capped.summary)
-        r.check("providerRulesEdges: capped summary ends with the dropped count",
-              capped.summary.hasSuffix(", 10.2.0.99:5099) (+44 dropped)"), capped.summary)
+        r.check("providerRulesEdges: capped summary starts with 257 rules, 44 dropped, then the first target (fix R2-1: the count at the head)",
+              capped.summary.hasPrefix("257 rules, 44 dropped (TCP catch-all + UDP 10.2.0.0:5000, "), capped.summary)
+        r.check("providerRulesEdges: capped summary ends with the last target and nothing after it",
+              capped.summary.hasSuffix(", 10.2.0.99:5099)") && !capped.summary.contains("(+"), capped.summary)
         r.check("providerRulesEdges: the cap is canonical (reversed token order gives the same set)",
               ProviderRuleSet.wanted(for: ScopeMatcher(spec: capTokens.reversed().joined(separator: "\n"))) == capped)
         let justKept = ProviderRuleSet.wanted(for: ScopeMatcher(spec: capTokens.prefix(256).joined(separator: " ")))
@@ -398,8 +401,12 @@ extension HandoffSelfCheck {
         r.check("providerRulesEdges: equality keys on the dropped count too (256 kept + 44 dropped != 256 kept + 0)",
               justKept != capped)
         r.check("providerRulesEdges: the kept 256 alone drop nothing", justKept.dropped == 0, "\(justKept.dropped)")
-        r.check("providerRulesEdges: an uncapped summary has no dropped suffix",
+        r.check("providerRulesEdges: an uncapped summary has no dropped count anywhere",
               !justKept.summary.contains("dropped"), justKept.summary)
+        r.check("providerRulesEdges: an uncapped 257-rule summary keeps the plain form (count, then the targets)",
+              justKept.summary.hasPrefix("257 rules (TCP catch-all + UDP 10.2.0.0:5000, ")
+                  && justKept.summary.hasSuffix(", 10.2.0.99:5099)"),
+              justKept.summary)
         r.check("providerRulesEdges: the 72-target set and tcpOnly drop nothing",
               wantedBig.dropped == 0 && ProviderRuleSet.tcpOnly.dropped == 0, "\(wantedBig.dropped)")
 
@@ -486,8 +493,9 @@ extension HandoffSelfCheck {
               oneOver.udpTargets.count == 256 && oneOver.dropped == 1, "\(oneOver.udpTargets.count) kept, \(oneOver.dropped) dropped")
         r.check("providerRulesEdges: the one dropped is the text-last 10.2.1.0 (the kept 256 are unchanged)",
               oneOver.udpTargets == justKept.udpTargets, "\(String(describing: oneOver.udpTargets.last))")
-        r.check("providerRulesEdges: 257-target summary is 257 rules … (+1 dropped)",
-              oneOver.summary.hasPrefix("257 rules (TCP catch-all + UDP 10.2.0.0:5000, ") && oneOver.summary.hasSuffix(", 10.2.0.99:5099) (+1 dropped)"),
+        r.check("providerRulesEdges: 257-target summary is 257 rules, 1 dropped (TCP catch-all + UDP … 10.2.0.99:5099)",
+              oneOver.summary.hasPrefix("257 rules, 1 dropped (TCP catch-all + UDP 10.2.0.0:5000, ")
+                  && oneOver.summary.hasSuffix(", 10.2.0.99:5099)") && !oneOver.summary.contains("(+"),
               oneOver.summary)
         r.check("providerRulesEdges: 257 and 300 targets with the same kept 256 are different sets (dropped 1 vs 44)",
               oneOver != capped && oneOver.udpTargets == capped.udpTargets)
