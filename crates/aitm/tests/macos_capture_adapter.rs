@@ -305,6 +305,9 @@ async fn macos_tcp_flow_adapts_and_dispatches() {
         "the hint carries the authoritative original dst, not a socket peer"
     );
     assert_eq!(hint.client_hello_sni.as_deref(), Some("example.com"));
+    // SA-AC0: the provider's `source_app` and the NE interface ride the hint.
+    assert_eq!(hint.peer_identity.as_deref(), Some("com.example.browser"));
+    assert_eq!(hint.capture_interface.as_deref(), Some(CAPTURE_INTERFACE));
 
     // NE-AC3: an out-of-scope TCP flow is refused before any module match or dial.
     let spawn_calls = Arc::new(AtomicUsize::new(0));

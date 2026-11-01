@@ -668,3 +668,244 @@ fn flow_get_and_flow_table_saturate_an_absurd_duration() {
         "flow.table saturates the same way"
     );
 }
+
+/// Stamps the attribution a capture backend would have recorded on the flow:
+/// the macOS Network Extension observed `com.apple.Safari` opening the
+/// connection, and the backend names itself `macos-ne`.
+fn attributed(mut flow: Flow) -> Flow {
+    flow.metadata_mut().source_app = Some("com.apple.Safari".into());
+    flow.metadata_mut().capture_interface = Some("macos-ne".into());
+    flow
+}
+
+/// `flow.get` and `flow.table` emit `source_app` and `capture_interface` on every
+/// row: the strings a capture backend recorded, or null (key present) for a
+/// proxied flow, for HTTP and WebSocket alike.
+#[test]
+fn flow_get_and_table_report_source_app() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+
+    let store = MemFlowStore::new();
+    let captured = store.insert(attributed(http_flow("GET", "/cap", Some(200))));
+    let proxied = store.insert(http_flow("GET", "/proxied", Some(200)));
+    let ws = store.insert(attributed(ws_flow(captured)));
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let summary = |id: FlowId| -> BTreeMap<String, Value> {
+        let got = reg
+            .command("flow.get")
+            .expect("flow.get registered")
+            .invoke(id_params(id), &host)
+            .expect("flow.get ok");
+        let Value::Object(obj) = got else {
+            panic!("flow.get must return an object, got {got:?}");
+        };
+        obj
+    };
+
+    let cap = summary(captured);
+    assert_eq!(
+        cap.get("source_app"),
+        Some(&Value::Str("com.apple.Safari".into())),
+        "captured HTTP flow reports the app the backend observed"
+    );
+    assert_eq!(
+        cap.get("capture_interface"),
+        Some(&Value::Str("macos-ne".into())),
+        "captured HTTP flow names its backend"
+    );
+
+    let prox = summary(proxied);
+    assert_eq!(
+        prox.get("source_app"),
+        Some(&Value::Null),
+        "proxied flow carries the key with a null value, never a placeholder"
+    );
+    assert_eq!(
+        prox.get("capture_interface"),
+        Some(&Value::Null),
+        "proxied flow carries the key with a null value, never a placeholder"
+    );
+
+    let sock = summary(ws);
+    assert_eq!(
+        sock.get("source_app"),
+        Some(&Value::Str("com.apple.Safari".into())),
+        "WebSocket rows carry the attribution too"
+    );
+    assert_eq!(
+        sock.get("capture_interface"),
+        Some(&Value::Str("macos-ne".into())),
+        "WebSocket rows carry the attribution too"
+    );
+
+    let table = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .invoke(Params::default(), &host)
+        .expect("flow.table ok");
+    let Value::Object(obj) = table else {
+        panic!("flow.table must return an object, got {table:?}");
+    };
+    let Some(Value::Array(rows)) = obj.get("flows") else {
+        panic!("flow.table result must have a `flows` array: {obj:?}");
+    };
+    assert_eq!(rows.len(), 3, "three flows captured, in insertion order");
+    let row = |i: usize| -> &BTreeMap<String, Value> {
+        let Value::Object(r) = &rows[i] else {
+            panic!("row {i} must be an object, got {:?}", rows[i]);
+        };
+        r
+    };
+
+    assert_eq!(row(0).get("id"), Some(&Value::Str(captured.to_string())));
+    assert_eq!(
+        row(0).get("source_app"),
+        Some(&Value::Str("com.apple.Safari".into()))
+    );
+    assert_eq!(
+        row(0).get("capture_interface"),
+        Some(&Value::Str("macos-ne".into()))
+    );
+
+    assert_eq!(row(1).get("id"), Some(&Value::Str(proxied.to_string())));
+    assert_eq!(row(1).get("source_app"), Some(&Value::Null));
+    assert_eq!(row(1).get("capture_interface"), Some(&Value::Null));
+
+    assert_eq!(row(2).get("id"), Some(&Value::Str(ws.to_string())));
+    assert_eq!(row(2).get("kind"), Some(&Value::Str("websocket".into())));
+    assert_eq!(
+        row(2).get("source_app"),
+        Some(&Value::Str("com.apple.Safari".into()))
+    );
+    assert_eq!(
+        row(2).get("capture_interface"),
+        Some(&Value::Str("macos-ne".into()))
+    );
+}
+
+/// Both result schemas declare `source_app` and `capture_interface` as optional
+/// strings whose description says what a proxied flow reports, so a surface that
+/// builds its columns from `tools/list` learns about them without hard-coding.
+#[test]
+fn schemas_declare_source_app_and_capture_interface() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+
+    let get_schema = reg
+        .command("flow.get")
+        .expect("flow.get registered")
+        .schema();
+    let TypeDesc::Object(get_fields) = get_schema.result else {
+        panic!(
+            "flow.get result must be an object schema, got {:?}",
+            get_schema.result
+        );
+    };
+
+    let table_schema = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .schema();
+    let TypeDesc::Object(table_fields) = table_schema.result else {
+        panic!(
+            "flow.table result must be an object schema, got {:?}",
+            table_schema.result
+        );
+    };
+    let flows = table_fields
+        .iter()
+        .find(|f| f.name == "flows")
+        .expect("flow.table result has a `flows` field");
+    let TypeDesc::Array(elem) = &flows.ty else {
+        panic!("`flows` must be an array, got {:?}", flows.ty);
+    };
+    let TypeDesc::Object(row_fields) = elem.as_ref() else {
+        panic!("`flows` elements must be objects, got {:?}", elem);
+    };
+
+    for (command, fields) in [("flow.get", &get_fields), ("flow.table", row_fields)] {
+        for name in ["source_app", "capture_interface"] {
+            let field = fields
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from the {command} schema"));
+            assert!(
+                matches!(field.ty, TypeDesc::Str),
+                "{command}.{name} is a string, got {:?}",
+                field.ty
+            );
+            assert!(
+                !field.required,
+                "{command}.{name} is optional (null for a proxied flow)"
+            );
+            assert!(
+                field.description.contains("proxied"),
+                "{command}.{name} says what a proxied flow reports: {}",
+                field.description
+            );
+        }
+    }
+}
+
+/// Tester addition (whole-branch stage 5). `source_app` is text a capture backend
+/// supplied about a client. The read commands pass it through verbatim as a
+/// string: quotes, CR/LF, a NUL, non-ASCII and a 64 KiB identifier all survive
+/// untouched — no truncation, escaping or interpretation — on both `flow.get` and
+/// `flow.table`. Escaping for a wire is the transport's job; what to show is the
+/// UI's.
+#[test]
+fn source_app_text_passes_through_verbatim_on_flow_get_and_flow_table() {
+    let mut reg = Registry::new();
+    reg.add_plugin(Box::new(CapturePlugin::new()));
+
+    let hostile = format!(
+        "com.evil.\"quoted\"\r\n\u{0}日本語.{}",
+        "x".repeat(64 * 1024)
+    );
+    let mut flow = http_flow("GET", "/hostile", Some(200));
+    flow.metadata_mut().source_app = Some(hostile.clone());
+    flow.metadata_mut().capture_interface = Some("macos-ne\n".into());
+    let store = MemFlowStore::new();
+    let id = store.insert(flow);
+    let guard = StdGuard::default();
+    let client = StubClient;
+    let host = CommandHost::new(&store, &client, &guard, None);
+
+    let got = reg
+        .command("flow.get")
+        .expect("flow.get registered")
+        .invoke(id_params(id), &host)
+        .expect("flow.get ok");
+    let Value::Object(obj) = got else {
+        panic!("flow.get must return an object, got {got:?}");
+    };
+    assert_eq!(obj.get("source_app"), Some(&Value::Str(hostile.clone())));
+    assert_eq!(
+        obj.get("capture_interface"),
+        Some(&Value::Str("macos-ne\n".into()))
+    );
+
+    let table = reg
+        .command("flow.table")
+        .expect("flow.table registered")
+        .invoke(Params::default(), &host)
+        .expect("flow.table ok");
+    let Value::Object(obj) = table else {
+        panic!("flow.table must return an object, got {table:?}");
+    };
+    let Some(Value::Array(rows)) = obj.get("flows") else {
+        panic!("flow.table result must have a `flows` array: {obj:?}");
+    };
+    let Some(Value::Object(row)) = rows.first() else {
+        panic!("one row expected, got {rows:?}");
+    };
+    assert_eq!(row.get("source_app"), Some(&Value::Str(hostile)));
+    assert_eq!(
+        row.get("capture_interface"),
+        Some(&Value::Str("macos-ne\n".into()))
+    );
+}

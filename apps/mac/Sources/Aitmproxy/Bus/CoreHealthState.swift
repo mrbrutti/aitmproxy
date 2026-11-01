@@ -25,7 +25,7 @@ final class CoreHealthState {
 
     /// Whether this launch can run L4 capture at all: a real run (not a fixture, snapshot
     /// or self-test) of a build that embeds the capture extension. Without it the
-    /// Settings ▸ Capture controls and Proxy ▸ Enable Capture stay unavailable, so a
+    /// Settings ▸ All Apps controls and Proxy ▸ Capture All Apps stay unavailable, so a
     /// development build never shows a live control that does nothing. Decided once at
     /// launch, mirroring the guards in `ExtensionController.start()`; a snapshot seeds it
     /// to render every state.

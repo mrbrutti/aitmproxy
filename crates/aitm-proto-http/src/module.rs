@@ -264,7 +264,8 @@ impl HttpModule {
             if next.first() == Some(&TLS_HANDSHAKE) {
                 self.mitm(client, ctx, peer, Some(target)).await
             } else {
-                let conn = Conn::plain(peer, Some((target.authority(), target.addr)));
+                let conn = Conn::plain(peer, Some((target.authority(), target.addr)))
+                    .with_attribution(ctx.hint());
                 serve(
                     &ctx,
                     Box::pin(client),
@@ -283,7 +284,7 @@ impl HttpModule {
                 Box::pin(client),
                 None,
                 None,
-                Conn::plain(peer, None),
+                Conn::plain(peer, None).with_attribution(ctx.hint()),
                 self.max_body_bytes,
             )
             .await
@@ -385,7 +386,10 @@ impl HttpModule {
                 tls: true,
                 established: now,
             }),
-        };
+            source_app: None,
+            capture_interface: None,
+        }
+        .with_attribution(ctx.hint());
 
         // Branch on the negotiated protocol: h2 runs the per-stream `serve_h2`
         // driver; everything else runs the h1 `serve` loop.
@@ -480,12 +484,20 @@ pub(crate) struct Conn {
     pub(crate) tunnel_addr: Option<SocketAddr>,
     pub(crate) client_conn: ConnInfo,
     pub(crate) server_conn: Option<ConnInfo>,
+    /// The signing identifier of the client process, as the capture backend that
+    /// delivered this connection observed it (the hint's `peer_identity`). `None`
+    /// on a proxied connection. Stamped on every flow the connection carries.
+    pub(crate) source_app: Option<String>,
+    /// The capture backend that delivered this connection (the hint's
+    /// `capture_interface`). `None` on a proxied connection.
+    pub(crate) capture_interface: Option<String>,
 }
 
 impl Conn {
     /// A cleartext connection. `tunnel` is the `CONNECT` authority and the
     /// address it resolved to, for a connection inside a tunnel, and `None` for
-    /// a forward-proxy connection.
+    /// a forward-proxy connection. No capture attribution; see
+    /// [`Conn::with_attribution`].
     fn plain(peer: SocketAddr, tunnel: Option<(String, SocketAddr)>) -> Self {
         let (tunnel_authority, tunnel_addr) = match tunnel {
             Some((authority, addr)) => (Some(authority), Some(addr)),
@@ -503,7 +515,27 @@ impl Conn {
                 established: SystemTime::now(),
             },
             server_conn: None,
+            source_app: None,
+            capture_interface: None,
         }
+    }
+
+    /// Take the capture attribution the acceptor's hint carries (`peer_identity`,
+    /// `capture_interface`). With no hint, or a hint from the explicit-proxy path,
+    /// both stay `None`.
+    fn with_attribution(mut self, hint: Option<&NextLayerHint>) -> Self {
+        if let Some(h) = hint {
+            self.source_app = h.peer_identity.clone();
+            self.capture_interface = h.capture_interface.clone();
+        }
+        self
+    }
+
+    /// A fresh [`FlowMeta`] for a flow on this connection: exactly the capture
+    /// attribution is carried over; marks, comment, replay flag and timing are
+    /// the flow's own.
+    pub(crate) fn flow_meta(&self) -> FlowMeta {
+        FlowMeta::with_attribution(self.source_app.clone(), self.capture_interface.clone())
     }
 }
 
@@ -600,7 +632,7 @@ async fn serve(
                             response: None,
                             client_conn: conn.client_conn.clone(),
                             server_conn: conn.server_conn.clone(),
-                            metadata: FlowMeta::default(),
+                            metadata: conn.flow_meta(),
                             intercept: InterceptState::Observed,
                         }));
                         // A client that sent `Expect: 100-continue` holds its body
@@ -1058,6 +1090,10 @@ async fn serve(
                 alpn: vec![protocol],
                 first_bytes: client_rest.clone(),
                 from_upgrade: true,
+                // The re-dispatched module sees the same attribution this
+                // connection's flows were stamped with.
+                peer_identity: conn.source_app.clone(),
+                capture_interface: conn.capture_interface.clone(),
             };
             let client_io: ByteStream = Box::pin(Prefixed::with_prefix(client, client_rest));
             let upstream_io: ByteStream = Box::pin(Prefixed::with_prefix(upstream_io, server_rest));
@@ -2410,6 +2446,8 @@ mod tests {
                 tls: true,
                 established: SystemTime::UNIX_EPOCH,
             }),
+            source_app: None,
+            capture_interface: None,
         }
     }
 
@@ -3693,6 +3731,8 @@ mod tests {
                 established: SystemTime::now(),
             },
             server_conn: None,
+            source_app: None,
+            capture_interface: None,
         };
         let (mut client, proxy_side) = duplex(64 * 1024);
 
@@ -3785,11 +3825,83 @@ mod tests {
         );
         assert!(!flow.metadata.truncated);
         assert_eq!(flow.metadata.marks, Vec::<String>::new());
+        // A proxied connection has no capture attribution: both are `None`, never
+        // a placeholder.
+        assert_eq!(flow.metadata.source_app, None);
+        assert_eq!(flow.metadata.capture_interface, None);
         assert!(
             matches!(flow.intercept, InterceptState::Observed),
             "intercept: {:?}",
             flow.intercept
         );
+    }
+
+    // ---- capture attribution (SA-AC0) ------------------------------------
+
+    /// `Conn::flow_meta` carries exactly the attribution onto a fresh `FlowMeta`:
+    /// marks, comment, replay flag and timing are each flow's own.
+    #[test]
+    fn conn_flow_meta_carries_only_attribution() {
+        let mut conn = Conn::plain(unknown_peer(), None);
+        conn.source_app = Some("com.apple.Safari".into());
+        conn.capture_interface = Some("macos-ne".into());
+
+        let meta = conn.flow_meta();
+
+        assert_eq!(meta.source_app, Some("com.apple.Safari".into()));
+        assert_eq!(meta.capture_interface, Some("macos-ne".into()));
+        assert!(meta.marks.is_empty());
+        assert!(!meta.is_replay);
+        assert_eq!(meta.comment, None);
+    }
+
+    /// SA-AC0: the attribution a capture ingress puts on the hint (`peer_identity`,
+    /// `capture_interface`) reaches the flow the module stores for a cleartext
+    /// request served through `spawn`, as `source_app` / `capture_interface`.
+    #[tokio::test]
+    async fn drive_stamps_the_hint_attribution_on_the_stored_flow() {
+        let (up, origin_end) = duplex(64 * 1024);
+        let store = Arc::new(MemFlowStore::new());
+        let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store.clone(), Arc::new(NoSink));
+        let ctx = ctx.with_hint(NextLayerHint {
+            dst: unknown_peer(),
+            is_tls: false,
+            client_hello_sni: None,
+            alpn: vec![],
+            first_bytes: b"GET ".to_vec(),
+            from_upgrade: false,
+            peer_identity: Some("com.apple.Safari".into()),
+            capture_interface: Some("macos-ne".into()),
+        });
+        let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], true));
+        let module = HttpModule::new();
+
+        let (mut client, proxy_side) = duplex(64 * 1024);
+        let serving = module.spawn(Box::pin(proxy_side), ctx);
+        let script = async {
+            let body = client_get(&mut client, "/one", "127.0.0.1:8080").await;
+            // Hang up, so the module sees the client finish and returns.
+            drop(client);
+            body
+        };
+        let (served, body) =
+            tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                .await
+                .expect("spawn hung: the request went to an upstream that never answers");
+        served.expect("the module ends cleanly when the client hangs up");
+        assert_eq!(body, "first");
+
+        // `spawn` took the context, so read the flow back through the shared store.
+        let flow = store
+            .list()
+            .into_iter()
+            .find_map(|id| match store.get(id) {
+                Some(Flow::Http(f)) if f.request.path == "/one" => Some(f),
+                _ => None,
+            })
+            .expect("a stored flow for /one");
+        assert_eq!(flow.metadata.source_app, Some("com.apple.Safari".into()));
+        assert_eq!(flow.metadata.capture_interface, Some("macos-ne".into()));
     }
 
     /// A taint lasts for one replacement. Once the new upstream is in place the
@@ -6177,5 +6289,367 @@ mod tests {
             vec![(true, true)],
             "the store holds the buffered, truncated response when Event::Error is dispatched"
         );
+    }
+
+    // ---- Tester additions (whole-branch stage 5): capture attribution on the
+    // TLS, h2 and upgrade paths, which the SA-AC0 tests above do not reach.
+    mod attribution {
+        use super::*;
+
+        /// A CA in a fresh temp dir, so a MITM test never touches the user's CA.
+        fn test_ca() -> Arc<CertAuthority> {
+            let dir = std::env::temp_dir().join(format!("aitm-attr-ca-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("ca dir");
+            Arc::new(CertAuthority::load_or_generate(&dir, 0o600).expect("test CA"))
+        }
+
+        /// The hint a capture ingress attaches: Safari on the macOS NE backend.
+        fn attributed_hint(is_tls: bool, first_bytes: Vec<u8>) -> NextLayerHint {
+            NextLayerHint {
+                dst: unknown_peer(),
+                is_tls,
+                client_hello_sni: None,
+                alpn: vec![],
+                first_bytes,
+                from_upgrade: false,
+                peer_identity: Some("com.apple.Safari".into()),
+                capture_interface: Some("macos-ne".into()),
+            }
+        }
+
+        /// The stored HTTP flow for `path` in `store` (the context is consumed by
+        /// the driver under test, so the store is read directly).
+        fn stored_in(store: &MemFlowStore, path: &str) -> HttpFlow {
+            store
+                .list()
+                .into_iter()
+                .find_map(|id| match store.get(id) {
+                    Some(Flow::Http(f)) if f.request.path == path => Some(f),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("no stored flow for {path}"))
+        }
+
+        fn assert_attributed(flow: &HttpFlow) {
+            assert_eq!(
+                flow.metadata.source_app.as_deref(),
+                Some("com.apple.Safari")
+            );
+            assert_eq!(flow.metadata.capture_interface.as_deref(), Some("macos-ne"));
+            assert!(flow.metadata.marks.is_empty());
+            assert!(!flow.metadata.is_replay);
+        }
+
+        /// Read one `Content-Length`-framed 200 from any stream (the TLS client end
+        /// is not a `DuplexStream`, so [`client_get`] does not apply).
+        async fn read_one_200<S: AsyncRead + Unpin>(io: &mut S) -> String {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let head_end = loop {
+                if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break p + 4;
+                }
+                let n = io.read(&mut chunk).await.expect("read head");
+                assert!(
+                    n > 0,
+                    "EOF before the response head: {:?}",
+                    String::from_utf8_lossy(&buf)
+                );
+                buf.extend_from_slice(&chunk[..n]);
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            assert!(head.starts_with("HTTP/1.1 200"), "status line: {head}");
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().to_string())
+                })
+                .expect("Content-Length")
+                .parse()
+                .expect("a numeric Content-Length");
+            while buf.len() < head_end + len {
+                let n = io.read(&mut chunk).await.expect("read body");
+                assert!(n > 0, "EOF before the body ended");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            String::from_utf8_lossy(&buf[head_end..head_end + len]).into_owned()
+        }
+
+        /// SA-AC0 on the TLS path: `mitm` builds its `Conn` from the hint, so a
+        /// captured HTTPS request (h1 after the ALPN mirror) is stored attributed.
+        /// The cleartext test above never reaches the `Conn` literal in `mitm`.
+        #[tokio::test]
+        async fn mitm_stamps_the_hint_attribution_on_the_stored_flow() {
+            let module = HttpModule::with_ca(test_ca()).with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+
+            // The origin: TLS over a duplex, one 200 then close.
+            let (up_ours, up_origin) = duplex(64 * 1024);
+            let origin = tokio::spawn(async move {
+                let tls = TlsAcceptor::from(server_config(&[b"http/1.1"]))
+                    .accept(up_origin)
+                    .await
+                    .expect("origin handshake");
+                origin_serve(tls, vec!["first"], true).await;
+            });
+            let (ctx, _dialed) =
+                ctx_with_sink(vec![Box::pin(up_ours)], store.clone(), Arc::new(NoSink));
+            let ctx = ctx.with_hint(attributed_hint(true, vec![TLS_HANDSHAKE]));
+
+            // The client: a real handshake against the forged leaf, one GET, hang up.
+            let (client_end, proxy_side) = duplex(64 * 1024);
+            let client_cfg = HttpModule::new()
+                .with_insecure(true)
+                .upstream_tls_alpn(&[b"http/1.1".to_vec()])
+                .expect("client config");
+            let script = async move {
+                let mut tls = TlsConnector::from(client_cfg)
+                    .connect(
+                        ServerName::try_from("origin.test").expect("name"),
+                        client_end,
+                    )
+                    .await
+                    .expect("client handshake against the forged leaf");
+                tls.write_all(get_request("/one", "origin.test:8443").as_bytes())
+                    .await
+                    .expect("send");
+                tls.flush().await.expect("flush");
+                let body = read_one_200(&mut tls).await;
+                let _ = tls.shutdown().await;
+                body
+            };
+            let proxy_side: ByteStream = Box::pin(proxy_side);
+            let serving = module.mitm(
+                Prefixed::new(proxy_side),
+                ctx,
+                unknown_peer(),
+                Some(Target {
+                    host: "origin.test".into(),
+                    port: 8443,
+                    addr: origin_addr(),
+                }),
+            );
+            let (_served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("mitm hung");
+            assert_eq!(
+                body, "first",
+                "the request went through the MITM to the origin"
+            );
+            origin.abort();
+
+            assert_attributed(&stored_in(&store, "/one"));
+        }
+
+        /// SA-AC0 on the h2 path — the one Safari and Chrome take for a captured
+        /// HTTPS site: `stream_task` stamps `conn.flow_meta()` on each stream's flow.
+        /// `serve_h2` is driven directly over duplexes with the attributed `Conn`
+        /// that `mitm` would have built after the ALPN mirror.
+        #[tokio::test]
+        async fn serve_h2_stamps_the_connection_attribution_on_the_stored_flow() {
+            let module = HttpModule::new().with_insecure(true);
+            let store = Arc::new(MemFlowStore::new());
+            let (ctx, _dialed) = ctx_with_sink(vec![], store.clone(), Arc::new(NoSink));
+            let mut conn = Conn::plain(
+                unknown_peer(),
+                Some(("origin.test:443".to_string(), origin_addr())),
+            );
+            conn.scheme = "https".to_string();
+            conn.source_app = Some("com.apple.Safari".into());
+            conn.capture_interface = Some("macos-ne".into());
+
+            // An h2 origin: 200 "first" for every stream, until the connection ends.
+            let (up_ours, up_origin) = duplex(64 * 1024);
+            let origin = tokio::spawn(async move {
+                let mut server = h2::server::handshake(up_origin)
+                    .await
+                    .expect("origin h2 handshake");
+                while let Some(Ok((request, mut respond))) = server.accept().await {
+                    let (_head, mut body) = request.into_parts();
+                    while let Some(Ok(chunk)) = body.data().await {
+                        let _ = body.flow_control().release_capacity(chunk.len());
+                    }
+                    let response = http::Response::builder()
+                        .status(200)
+                        .body(())
+                        .expect("response");
+                    let mut send = respond
+                        .send_response(response, false)
+                        .expect("send response");
+                    send.send_data(bytes::Bytes::from_static(b"first"), true)
+                        .expect("send body");
+                }
+            });
+
+            let (client_end, proxy_side) = duplex(64 * 1024);
+            let upstream_h2_tls = module
+                .upstream_tls_alpn(&[b"h2".to_vec()])
+                .expect("h2 client config");
+            let serving = crate::h2::serve_h2(
+                ctx,
+                Box::pin(proxy_side),
+                Box::pin(up_ours),
+                conn,
+                MAX_BODY,
+                16,
+                upstream_h2_tls,
+            );
+            let script = async move {
+                let (send_req, connection) = h2::client::handshake(client_end)
+                    .await
+                    .expect("client h2 handshake");
+                let connection = tokio::spawn(async move {
+                    let _ = connection.await;
+                });
+                let mut ready = send_req.ready().await.expect("h2 ready");
+                let request = http::Request::builder()
+                    .method("GET")
+                    .uri("https://origin.test/one")
+                    .body(())
+                    .expect("request");
+                let (response, _body) = ready.send_request(request, true).expect("send request");
+                let response = response.await.expect("response");
+                assert_eq!(response.status().as_u16(), 200);
+                let mut body = response.into_body();
+                let mut got = Vec::new();
+                while let Some(chunk) = body.data().await {
+                    let chunk = chunk.expect("body chunk");
+                    let _ = body.flow_control().release_capacity(chunk.len());
+                    got.extend_from_slice(&chunk);
+                }
+                // Hang up: dropping the handle and the connection closes the transport.
+                drop(ready);
+                connection.abort();
+                got
+            };
+            let (served, body) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("serve_h2 hung");
+            served.expect("serve_h2 ends when the client connection closes");
+            assert_eq!(body, b"first");
+            origin.abort();
+
+            let flow = stored_in(&store, "/one");
+            assert!(
+                matches!(flow.request.version, aitm_core::HttpVersion::H2),
+                "the flow came through the h2 driver"
+            );
+            assert_attributed(&flow);
+        }
+
+        /// The module an upgrade is re-dispatched to: records the hint it was
+        /// spawned with and returns at once.
+        struct RecordingUpgradeModule {
+            hint: Mutex<Option<NextLayerHint>>,
+        }
+
+        impl ProtocolModule for RecordingUpgradeModule {
+            fn id(&self) -> &str {
+                "recording-upgrade"
+            }
+
+            fn matches(&self, hint: &NextLayerHint) -> bool {
+                hint.from_upgrade
+            }
+
+            fn spawn(&self, _io: ByteStream, ctx: ModuleCtx) -> BoxFuture<'_, Result<()>> {
+                *self.hint.lock().expect("hint lock") = ctx.hint().cloned();
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        /// Spec D2: the upgrade hint `serve` hands the next module carries the
+        /// connection's attribution, so the re-dispatched module sees what the
+        /// handshake flow was stamped with — and the handshake flow is stamped too.
+        #[tokio::test]
+        async fn upgrade_handoff_hint_carries_the_connection_attribution() {
+            let (up, origin_end) = duplex(64 * 1024);
+            let store = Arc::new(MemFlowStore::new());
+            let recorder = Arc::new(RecordingUpgradeModule {
+                hint: Mutex::new(None),
+            });
+            let modules: Arc<[Arc<dyn ProtocolModule>]> =
+                Arc::from(vec![recorder.clone() as Arc<dyn ProtocolModule>]);
+            let (ctx, _dialed) = ctx_with_sink(vec![Box::pin(up)], store.clone(), Arc::new(NoSink));
+            let ctx = ctx
+                .with_modules(modules)
+                .with_hint(attributed_hint(false, b"GET ".to_vec()));
+
+            // An origin that answers the upgrade with a 101 and then holds the line.
+            let origin = tokio::spawn(async move {
+                let mut io = origin_end;
+                let mut seen = Vec::new();
+                let mut chunk = [0u8; 256];
+                while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match io.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => seen.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let _ = io
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    )
+                    .await;
+                let _ = io.flush().await;
+                while matches!(io.read(&mut chunk).await, Ok(n) if n > 0) {}
+            });
+
+            let module = HttpModule::new();
+            let (mut client, proxy_side) = duplex(64 * 1024);
+            let serving = module.spawn(Box::pin(proxy_side), ctx);
+            let script = async {
+                client
+                    .write_all(
+                        b"GET /chat HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                    )
+                    .await
+                    .expect("send the upgrade request");
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 256];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = client.read(&mut chunk).await.expect("read the 101");
+                    assert!(
+                        n > 0,
+                        "EOF before the 101: {:?}",
+                        String::from_utf8_lossy(&buf)
+                    );
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                String::from_utf8_lossy(&buf).into_owned()
+            };
+            let (served, head) =
+                tokio::time::timeout(STALL_GUARD, async { tokio::join!(serving, script) })
+                    .await
+                    .expect("the upgrade hand-off hung");
+            served.expect("serve returns the hand-off's result");
+            assert!(
+                head.starts_with("HTTP/1.1 101"),
+                "the 101 reached the client: {head}"
+            );
+            origin.abort();
+
+            let hint = recorder
+                .hint
+                .lock()
+                .expect("hint lock")
+                .clone()
+                .expect("the upgrade module was spawned with a hint");
+            assert!(hint.from_upgrade);
+            assert!(
+                hint.alpn
+                    .iter()
+                    .any(|p| p.eq_ignore_ascii_case("websocket")),
+                "alpn: {:?}",
+                hint.alpn
+            );
+            assert_eq!(hint.peer_identity.as_deref(), Some("com.apple.Safari"));
+            assert_eq!(hint.capture_interface.as_deref(), Some("macos-ne"));
+            assert_attributed(&stored_in(&store, "/chat"));
+        }
     }
 }
