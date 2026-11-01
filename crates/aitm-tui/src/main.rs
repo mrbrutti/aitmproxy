@@ -1,4 +1,4 @@
-//! `aitm-tui` — run the terminal operator UI against a proxy's bus, the
+//! `aitm-tui`: run the terminal operator UI against a proxy's bus, the
 //! recorded fixture, or render a snapshot of the main screen to a file.
 //!
 //! ```text
@@ -7,7 +7,7 @@
 //! aitm-tui --snapshot out.svg [--cols 200 --rows 50] [--fixture path]
 //! aitm-tui --snapshot-core out.svg      (the 56 core tools only)
 //! ```
-//! `--poc-dir` is where a built PoC (`P`) is written — `poc.build` answers
+//! `--poc-dir` is where a built PoC (`P`) is written: `poc.build` answers
 //! with the YAML text; it should be the proxy's `poc.dir` so `poc.run` can
 //! read it back. `--ansi` forces the 16-colour palette, `--truecolor` the hex palette.
 //! `--token t` is accepted but visible to every process on the machine

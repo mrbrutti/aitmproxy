@@ -65,7 +65,7 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     }
     // The box sits above the prompt line and never leaves the screen: shrink
     // it to the rows available there, and draw nothing when fewer than three
-    // fit (border, one item, border) — a short terminal keeps the prompt.
+    // fit (border, one item, border): a short terminal keeps the prompt.
     let above = prompt_line.y.saturating_sub(screen.y);
     let h = cells(items.len().min(10) + 2).min(above);
     let w = screen.width.min(100);
@@ -361,7 +361,7 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             theme.fg(&color::status::SUCCESS),
         ),
         Some(a) => Span::styled(
-            format!("{a} is out of scope — add it with :scope add"),
+            format!("{a} is out of scope: add it with :scope add"),
             theme.fg(&color::intercept::BASE),
         ),
         None => Span::styled("enter a URL", theme.text_tertiary()),
@@ -389,7 +389,7 @@ pub fn compose(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 }
 
 pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Scope — the authorised hosts", area, buf);
+    let inner = boxed(theme, "Scope: the authorised hosts", area, buf);
     let mut lines = vec![
         Line::styled(
             " Only in-scope hosts can be acted on (replay, edit, compose, PoC). Adding is a human action.",
@@ -399,7 +399,7 @@ pub fn scope(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     ];
     if app.scope.is_empty() {
         lines.push(Line::styled(
-            " Scope is empty — every flow is dimmed and read-only. Press a to add a host.",
+            " Scope is empty: every flow is dimmed and read-only. Press a to add a host.",
             theme.intercept_armed_quiet(),
         ));
     }
@@ -480,7 +480,7 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         buf.set_string(
             inner.x + 1,
             inner.y + 1,
-            "No findings — build a PoC from any flow with P.",
+            "No findings: build a PoC from any flow with P.",
             theme.text_tertiary(),
         );
         return;
@@ -597,7 +597,7 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         }
     } else {
         d.push(Line::styled(
-            " not run yet — r runs it (poc.run: target, then vars)",
+            " not run yet: r runs it (poc.run: target, then vars)",
             theme.text_tertiary(),
         ));
     }
@@ -661,7 +661,7 @@ pub fn findings(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
 /// line per leaf. Nested keys join with `.`, arrays with `, `; `null` is a
 /// dash. Read-only.
 pub fn config(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Config — the redacted config.get view", area, buf);
+    let inner = boxed(theme, "Config: the redacted config.get view", area, buf);
     let mut lines = Vec::new();
     match &app.config {
         Some(v) => {
@@ -719,10 +719,10 @@ fn flatten_config(prefix: &str, v: &serde_json::Value, out: &mut Vec<(String, St
 }
 
 /// The CA panel (§3.6): the facts `ca.status` reports, and the three
-/// actions — `e` export, `i` install, `u` uninstall (the last two confirmed
+/// actions: `e` export, `i` install, `u` uninstall (the last two confirmed
 /// locally, see `CONFIRM_TOOLS`).
 pub fn ca(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "CA — the MITM certificate", area, buf);
+    let inner = boxed(theme, "CA: the MITM certificate", area, buf);
     let mut lines = Vec::new();
     match &app.ca_status {
         Some(serde_json::Value::Object(map)) if !map.is_empty() => {
@@ -786,7 +786,7 @@ fn l4_capabilities(app: &App, theme: &Theme, lines: &mut Vec<Line<'static>>) {
     let settable = app.has_tool("l4.agent.set");
     let keys = ["c", "i", "n", "w"];
     lines.push(Line::styled(
-        " L4 agent capabilities — each toggle is the gate that governs the agent L4 path",
+        " L4 agent capabilities: each toggle is the gate that governs the agent L4 path",
         theme.accent().add_modifier(Modifier::BOLD),
     ));
     for (gate, key) in crate::l4::L4Gate::ALL.into_iter().zip(keys) {
@@ -804,18 +804,18 @@ fn l4_capabilities(app: &App, theme: &Theme, lines: &mut Vec<Line<'static>>) {
         ]));
     }
     let note = if !app.l4.gates.present {
-        " (l4.agent.status is not on this bus — gate states unknown)"
+        " (l4.agent.status is not on this bus: gate states unknown)"
     } else if settable {
         " Toggle with the key; the agent can never flip its own gates."
     } else {
-        " Read-only here — set l4.allow_agent_* in config and restart (l4.agent.set is not on this bus)."
+        " Read-only here: set l4.allow_agent_* in config and restart (l4.agent.set is not on this bus)."
     };
     lines.push(Line::styled(note, theme.text_tertiary()));
     lines.push(Line::raw(""));
 }
 
 pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
-    let inner = boxed(theme, "Agent (MCP) — policy and activity", area, buf);
+    let inner = boxed(theme, "Agent (MCP): policy and activity", area, buf);
     let policy_line = |p: AgentPolicy, key: &str, what: &str| -> Line<'static> {
         let on = app.agent.policy == Some(p);
         let dot = if on { "●" } else { "○" };
@@ -835,7 +835,7 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
             Span::styled(
                 match app.agent.policy {
                     Some(p) => format!("policy: {} · {} actions in the last minute · {} client(s)", p.label(), app.agent.actions_last_minute, app.agent.connected_clients),
-                    None => "agent.status is not on this bus (core follow-up F1) — the toggle is read-only here".to_string(),
+                    None => "agent.status is not on this bus (core follow-up F1): the toggle is read-only here".to_string(),
                 },
                 theme.text_primary(),
             ),
@@ -848,12 +848,12 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     ];
     l4_capabilities(app, theme, &mut lines);
     lines.push(Line::styled(
-        " Activity log — every command from every frontend (agent rows in teal)",
+        " Activity log: every command from every frontend (agent rows in teal)",
         theme.accent().add_modifier(Modifier::BOLD),
     ));
     if app.agent.log.is_empty() {
         lines.push(Line::styled(
-            "   (empty — needs core follow-up F2 for the audit ring)",
+            "   (empty: needs core follow-up F2 for the audit ring)",
             theme.text_tertiary(),
         ));
     }

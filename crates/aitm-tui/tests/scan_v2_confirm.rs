@@ -26,8 +26,8 @@ fn toast(app: &App) -> &str {
         .map_or("<no toast>", |t| t.text.as_str())
 }
 
-/// D7: the title and footnote are picked by the call name — `scan.*` reads the
-/// scan-launch wording, `l4.*` the guarded-L4 wording — and the server's prompt
+/// D7: the title and footnote are picked by the call name (`scan.*` reads the
+/// scan-launch wording, `l4.*` the guarded-L4 wording) and the server's prompt
 /// is shown verbatim between them.
 #[test]
 fn the_overlay_titles_and_footnotes_by_call_name() {

@@ -1,4 +1,4 @@
-//! `aitm-tui` — aitmproxy's terminal operator UI (foundation §2.10(c)).
+//! `aitm-tui`: aitmproxy's terminal operator UI (foundation §2.10(c)).
 //!
 //! A ratatui client of the command bus: the same flow list, inspector,
 //! intercept bar, compose, scope, PoC and agent surfaces as the macOS and web
@@ -220,15 +220,15 @@ pub async fn run(opts: RunOptions) -> anyhow::Result<()> {
     result
 }
 
-/// The commands the bus serves today — `tools/list` of the core as of
+/// The commands the bus serves today: `tools/list` of the core as of
 /// the 2026-10-29 M4 merge: foundation §4.1's 22, plus `flow.detail` (F5),
 /// `flow.mark` / `flow.comment` (F6), `proxy.status` / `proxy.pause` /
 /// `proxy.resume` / `flow.clear` / `config.get` (F7), `scope.remove` (F12),
 /// `poc.list` / `poc.get` / `poc.artifact` (F13), the M3 Rhai commands
 /// `findings.list`, `script.reload`, `script.validate`, the M6 parity
-/// additions — `ws.intercept` / `ws.frame` / `ws.send` (F9), `session.save` /
+/// additions, `ws.intercept` / `ws.frame` / `ws.send` (F9), `session.save` /
 /// `session.load` / `flow.export` / `flow.import` (F10), `tls.passthrough.*`
-/// (F11), `map.add` / `map.list` / `map.remove` (Map) — and the M4 additions:
+/// (F11), `map.add` / `map.list` / `map.remove` (Map), and the M4 additions:
 /// `agent.status` / `agent.set` / `agent.activity` / `agent.approve` (F1) and
 /// `flow.subscribe` / `flow.unsubscribe` (F4). What [`fixture_app_core`] limits
 /// the fixture to; with M4 merged the whole fixture is now core.
@@ -312,7 +312,7 @@ pub const CORE_TOOLS: &[&str] = &[
 ];
 
 /// An [`App`] loaded synchronously from the built-in fixture, sized `cols`×`rows`,
-/// with the paused login request selected — the state every snapshot and UI
+/// with the paused login request selected: the state every snapshot and UI
 /// test starts from. The fixture's whole tool list is offered, F-gated
 /// commands included.
 pub fn fixture_app(cols: u16, rows: u16) -> App {
@@ -417,8 +417,8 @@ fn load_fixture_app(mut fx: Fixture, cols: u16, rows: u16, core_only: bool) -> A
         let _ = app.on_bus(BusEvent::Agent(agent));
     }
     // The PoC library (`poc.list`, files not run), then the recorded run
-    // results replayed as `poc.run` answers — oldest first, so the newest
-    // ends up on top — then the YAML each asks for through `poc.get`.
+    // results replayed as `poc.run` answers (oldest first, so the newest
+    // ends up on top), then the YAML each asks for through `poc.get`.
     let mut pending = Vec::new();
     if app.has_tool("poc.list") {
         if let Ok(Value::Array(items)) = fx.call("poc.list", &serde_json::Map::new()) {

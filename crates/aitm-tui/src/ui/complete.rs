@@ -3,7 +3,7 @@
 //! (`rhai.api.json`, `poc-yaml.schema.json`, embedded via [`crate::languages`])
 //! so the terminal offers exactly the set the web and macOS surfaces do; the
 //! shared completion conformance fixtures pin that set. [`CompleteState`] +
-//! [`render`] are the floating popup an editor anchors at the caret — a
+//! [`render`] are the floating popup an editor anchors at the caret: a
 //! `floating`-style list, `↑`/`↓` to move, accept-selected to insert.
 //!
 //! Only the candidate source and the popup live here; wiring into an authorable
@@ -83,7 +83,7 @@ pub fn rhai_candidates(src: &str, caret: usize) -> Vec<Candidate> {
 }
 
 /// A naive `{` − `}` nesting depth for `text` (string/comment contents are not
-/// excluded — enough to tell "declaring a hook" from "inside a body").
+/// excluded: enough to tell "declaring a hook" from "inside a body").
 fn brace_depth(text: &str) -> i32 {
     let mut depth = 0;
     for c in text.bytes() {

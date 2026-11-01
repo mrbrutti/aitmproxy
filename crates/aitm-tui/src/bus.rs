@@ -339,7 +339,7 @@ impl Session {
 
     /// Read a slow-changing panel. A transport failure ends the session like
     /// anywhere else; a tool or protocol error leaves the panel as it was
-    /// (`Null`) — it is re-read on the next slow pass, no toast every 3 s.
+    /// (`Null`): it is re-read on the next slow pass, no toast every 3 s.
     async fn panel(&self, name: &str) -> Result<Value, Outcome> {
         match self.client.call(name, json!({})).await {
             Ok(v) => Ok(v),

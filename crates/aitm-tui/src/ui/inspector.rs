@@ -1,6 +1,6 @@
 //! The inspector (§2.7): a summary strip (`POST · 200 OK · URL · meta`), then
-//! Request | Response panes — side by side at 120 columns or more, stacked
-//! below that — each with its tab row and a body viewer. In Edit mode the
+//! Request | Response panes, side by side at 120 columns or more, stacked
+//! below that, each with its tab row and a body viewer. In Edit mode the
 //! request pane is the raw editor for the paused request.
 
 use ratatui::buffer::Buffer;
@@ -511,10 +511,10 @@ fn pending_response<'a>(
     d: &FlowDetail,
 ) -> Vec<Line<'a>> {
     let why = match d.intercept {
-        Intercept::Intercepted => "No response yet — the request is paused.",
-        Intercept::Killed => "No response — the request was killed.",
+        Intercept::Intercepted => "No response yet: the request is paused.",
+        Intercept::Killed => "No response: the request was killed.",
         _ if row.kind == FlowKind::WebSocket => "WebSocket: see the frames below.",
-        _ => "No response yet — the request is in flight.",
+        _ => "No response yet: the request is in flight.",
     };
     let mut lines = vec![Line::styled(why, theme.text_tertiary())];
     if row.kind == FlowKind::WebSocket {
@@ -635,7 +635,7 @@ fn summary_facts<'a>(app: &App, row: &FlowRow, d: Option<&FlowDetail>) -> Vec<(&
             if app.in_scope(row) {
                 "in scope".into()
             } else {
-                "out of scope — mutating actions disabled".into()
+                "out of scope: mutating actions disabled".into()
             },
         ),
     ];
@@ -671,7 +671,7 @@ fn summary_facts<'a>(app: &App, row: &FlowRow, d: Option<&FlowDetail>) -> Vec<(&
             d.meta.comment.clone().unwrap_or_else(|| "—".into()),
         ));
         if d.meta.truncated {
-            rows.push(("truncated", "yes — body capture cap hit".into()));
+            rows.push(("truncated", "yes: body capture cap hit".into()));
         }
     }
     rows
@@ -804,7 +804,7 @@ mod tests {
         }
     }
 
-    /// I1/I17a: only Timing waits on F5 — it is labelled, dim, and says why.
+    /// I1/I17a: only Timing waits on F5: it is labelled, dim, and says why.
     #[test]
     fn timing_tab_is_labelled_and_explains_itself() {
         let theme = Theme::new(true);

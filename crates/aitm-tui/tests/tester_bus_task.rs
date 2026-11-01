@@ -1,4 +1,4 @@
-//! Tester (stage 5) — the bus task against the recorded fixture, through a
+//! Tester (stage 5): the bus task against the recorded fixture, through a
 //! transport that records every line it sends. Proves foundation §4.2's
 //! connect sequence as the TUI performs it (`initialize` with
 //! `clientInfo.name == "aitm-tui"`, then `tools/list` once, features from the
@@ -322,7 +322,7 @@ async fn connect_sequence_identifies_as_aitm_tui_and_builds_features_from_tools_
     };
     assert_eq!(a.policy, Some(aitm_tui::model::AgentPolicy::All));
     assert_eq!(a.log.len(), 7);
-    // C8: `poc.list` is the PoC library — files, not runs — so none has run.
+    // C8: `poc.list` is the PoC library (files, not runs), so none has run.
     let findings = next_where(&mut r.ev_rx, |e| matches!(e, BusEvent::Findings(_))).await;
     let BusEvent::Findings(f) = findings else {
         unreachable!()
@@ -788,7 +788,7 @@ async fn a_transport_failure_mid_session_reconnects_and_resumes_polling() {
 }
 
 /// Q9: a transport failure while reading a slow panel (scope.list here) ends
-/// the session at once — the next line on the wire is a fresh `initialize`,
+/// the session at once: the next line on the wire is a fresh `initialize`,
 /// not the remaining panels on a dead socket.
 #[tokio::test]
 async fn a_transport_failure_in_a_slow_panel_reconnects_at_once() {
@@ -943,7 +943,7 @@ async fn a_per_flow_get_error_keeps_the_cached_row_and_warns_once_per_poll() {
     finish(r).await;
 }
 
-/// Q6: a mutation invalidates the row it touched, not every settled row — the
+/// Q6: a mutation invalidates the row it touched, not every settled row: the
 /// next poll re-reads that one id (plus the flows that are always polled).
 #[tokio::test]
 async fn a_mutation_re_reads_only_the_touched_flow() {

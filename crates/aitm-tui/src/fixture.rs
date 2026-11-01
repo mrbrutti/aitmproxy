@@ -33,8 +33,8 @@ pub struct Fixture {
     pub tools: Vec<Value>,
     pub flows: Vec<Value>,
     /// Recorded `poc.run` results (the `findings` key): what a run this
-    /// session would have answered. `poc.list` does not serve these — the
-    /// core's library lists files — so `fixture_app` replays them as
+    /// session would have answered. `poc.list` does not serve these (the
+    /// core's library lists files), so `fixture_app` replays them as
     /// `CallOk { name: "poc.run" }`.
     pub findings: Vec<Value>,
     /// The PoC library (`pocs` key): `poc.list` summaries and `poc.get`
@@ -813,13 +813,13 @@ fn l4_needs_confirmation(name: &str, args: &Map<String, Value>) -> Value {
     let count = args.get("count").and_then(Value::as_u64).unwrap_or(1);
     let prompt = match name {
         "l4.inject" | "l4.send_recv" => format!(
-            "{name}: {count} packet(s) to destination {dst} on {iface} — matched scope entry \
+            "{name}: {count} packet(s) to destination {dst} on {iface}. Matched scope entry \
              lo0 127.0.0.0/8 (inject), minted permit budget 10 pps. Confirm?"
         ),
         _ => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or("?");
             format!(
-                "{name}: parked packet {id} on destination {dst} ({iface}) — matched scope \
+                "{name}: parked packet {id} on destination {dst} ({iface}). Matched scope \
                  entry lo0 127.0.0.0/8, permit budget 10 pps. Confirm?"
             )
         }

@@ -1,4 +1,4 @@
-//! Tester (stage 5) — the shell and its degradations.
+//! Tester (stage 5): the shell and its degradations.
 //!
 //! Foundation §2.6 (regions, `b` sidebar, `Enter`/`Esc` on narrow terminals),
 //! §2.8 empty states, §2.9/§2.10(c) degradations (28-column sidebar, full-screen
@@ -144,7 +144,7 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
         );
     }
 
-    // Intercept bar: count, the oldest paused flow, the verbs — in the
+    // Intercept bar: count, the oldest paused flow, the verbs, in the
     // intercept bar style (yellow reverse video, §2.7).
     let bar_y = line_index(
         &text,
@@ -202,7 +202,7 @@ fn shell_regions_render_in_the_mockup_order_at_200x50() {
         "request headers table: {text}"
     );
     assert!(
-        text.contains("No response yet — the request is paused."),
+        text.contains("No response yet: the request is paused."),
         "{text}"
     );
 
@@ -371,7 +371,7 @@ fn empty_states_keep_the_frame_and_say_the_trades_words() {
     assert_eq!(reqs, vec![aitm_tui::action::BusRequest::Refresh]);
     let text = text_of(&app, 160, 30);
     assert!(
-        text.contains("No flows yet — point a client at 127.0.0.1:8080 or open the browser."),
+        text.contains("No flows yet: point a client at 127.0.0.1:8080 or open the browser."),
         "{text}"
     );
     assert!(text.contains("– / 0 rows · 0 in scope"), "{text}");
@@ -384,7 +384,7 @@ fn empty_states_keep_the_frame_and_say_the_trades_words() {
     let _ = connect(&mut unknown, PRE_MERGE_TOOLS, None);
     let text = text_of(&unknown, 160, 30);
     assert!(
-        text.contains("No flows yet — point a client at the proxy or open the browser."),
+        text.contains("No flows yet: point a client at the proxy or open the browser."),
         "{text}"
     );
     assert!(
@@ -402,7 +402,7 @@ fn empty_states_keep_the_frame_and_say_the_trades_words() {
         "observed",
     )]));
     let _ = app.run_command("filter ~m DELETE");
-    assert!(text_of(&app, 120, 30).contains("No flows match this filter — Esc clears it."));
+    assert!(text_of(&app, 120, 30).contains("No flows match this filter: Esc clears it."));
     let _ = app.update(Action::Back);
     assert!(app.filter.is_none());
     assert!(!text_of(&app, 120, 30).contains("No flows match"));
@@ -415,10 +415,10 @@ fn empty_states_keep_the_frame_and_say_the_trades_words() {
 
     // No findings; empty scope.
     let _ = app.update(Action::OpenFindings);
-    assert!(text_of(&app, 120, 30).contains("No findings — build a PoC from any flow with P."));
+    assert!(text_of(&app, 120, 30).contains("No findings: build a PoC from any flow with P."));
     let _ = app.update(Action::OpenScope);
     assert!(text_of(&app, 120, 30)
-        .contains("Scope is empty — every flow is dimmed and read-only. Press a to add a host."));
+        .contains("Scope is empty: every flow is dimmed and read-only. Press a to add a host."));
 }
 
 #[test]
@@ -439,8 +439,8 @@ fn bus_state_shows_in_the_status_bar() {
     assert!(text.contains("bus disconnected"), "the pill too: {text}");
 }
 
-/// FINDING (minor): at exactly 120 columns — the width the foundation calls
-/// "wide" — the toolbar's right cluster and the status bar's key hints leave
+/// FINDING (minor): at exactly 120 columns (the width the foundation calls
+/// "wide") the toolbar's right cluster and the status bar's key hints leave
 /// no room: the listening pill is cut mid-address straight into the agent
 /// toggle (`listening 1[⚙ Agent`) and the counts become `– / 0 r`.
 #[test]
@@ -507,7 +507,7 @@ fn import_is_a_command_not_a_drop_target() {
         )]
     );
     // A bus without flow.import (an older core) still degrades honestly, never
-    // silently — the label names the missing tool.
+    // silently: the label names the missing tool.
     app.tools.retain(|t| t.name != "flow.import");
     assert!(app.run_command("import /tmp/session.har").is_empty());
     assert_eq!(toast(&app), "Import needs core follow-up F10 (flow.import)");
@@ -777,7 +777,7 @@ fn five_thousand_flows_ingest_and_render_within_bounds() {
     assert!(items > 0);
 
     eprintln!(
-        "tester: 5000 flows — ingest {ingest:?}, refresh {refresh:?}, render 200×50 {render_time:?}, filter {filter_time:?} ({n} rows), palette {palette_time:?} ({items} items)"
+        "tester: 5000 flows: ingest {ingest:?}, refresh {refresh:?}, render 200×50 {render_time:?}, filter {filter_time:?} ({n} rows), palette {palette_time:?} ({items} items)"
     );
     for (what, d) in [
         ("ingest", ingest),
@@ -880,7 +880,7 @@ fn a_five_megabyte_json_body_renders_without_panicking() {
     assert!(text_of(&app, 200, 50).contains("00000000  5b 7b 22 69"));
 
     eprintln!(
-        "tester: 5 MB JSON ({} bytes) — viewers::body {pretty:?} ({} lines), tree_with_paths {tree_time:?} ({} lines), hex::dump {hex_time:?} ({} rows)",
+        "tester: 5 MB JSON ({} bytes): viewers::body {pretty:?} ({} lines), tree_with_paths {tree_time:?} ({} lines), hex::dump {hex_time:?} ({} rows)",
         msg.body.len(),
         lines.len(),
         tree.len(),
@@ -916,7 +916,7 @@ fn inspector_frames_with_a_five_megabyte_body_do_not_freeze() {
             slow.push(format!("{tab} tab frame {d:?}"));
         }
     }
-    eprintln!("tester: one inspector frame at 200×50 with a 5 MB body — {report}");
+    eprintln!("tester: one inspector frame at 200×50 with a 5 MB body: {report}");
     assert!(slow.is_empty(), "{}", slow.join(", "));
 }
 
@@ -924,7 +924,7 @@ fn inspector_frames_with_a_five_megabyte_body_do_not_freeze() {
 /// limited to the 59 commands the bus serves today (the 2026-10-29 M4 merge on
 /// top of the M6 parity additions). F5/F6/F7/F12/F13, the M3 commands, the M6
 /// F9/F10/F11/Map commands and the M4 F1 agent / F4 subscription commands are
-/// all lit — with M4 merged nothing in the fixture is ahead of the core.
+/// all lit: with M4 merged nothing in the fixture is ahead of the core.
 #[test]
 fn fixture_app_core_offers_exactly_the_core_tools_with_the_agent_surface_lit() {
     let app = fixture_app_core(200, 50);

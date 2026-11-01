@@ -9,7 +9,7 @@ use serde_json::Value;
 
 /// `http`, `websocket`, or `l4` (ui-ext §3.1: the flow list and inspector
 /// iterate this enum with per-kind renderers, so a surface can never "only
-/// render HTTP" — an unknown/absent kind renders a labelled placeholder).
+/// render HTTP": an unknown/absent kind renders a labelled placeholder).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowKind {
     Http,
@@ -909,7 +909,7 @@ pub fn clock_of(ts: &str) -> String {
 }
 
 /// Scope-as-authorisation (§2.7): whether `authority` is covered by any scope
-/// entry — `host`, `host:port` (exact) or `*.wildcard` (the suffix itself or
+/// entry: `host`, `host:port` (exact) or `*.wildcard` (the suffix itself or
 /// any subdomain of it).
 pub fn scope_covers(scope: &[String], authority: &str) -> bool {
     let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h);
@@ -1078,7 +1078,7 @@ mod tests {
         assert_eq!(row.content_type.as_deref(), Some("text/html"));
     }
 
-    /// C1: the core's WebSocket `flow.detail` — `messages`, not `frames`;
+    /// C1: the core's WebSocket `flow.detail`: `messages`, not `frames`;
     /// `dir` as `client_to_server` / `server_to_client`; `timestamp`; `data`
     /// base64 or null.
     #[test]
@@ -1171,7 +1171,7 @@ mod tests {
         assert_eq!(row.req_size, Some(5));
     }
 
-    /// C8: a `poc.list` entry is a PoC file, not a run — `ran` is false until
+    /// C8: a `poc.list` entry is a PoC file, not a run: `ran` is false until
     /// a `poc.run` result (which carries `passed` / `evaluated`) says otherwise.
     #[test]
     fn finding_from_a_library_entry_is_not_run_and_a_run_result_is() {

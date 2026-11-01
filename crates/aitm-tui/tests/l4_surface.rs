@@ -102,8 +102,8 @@ fn screen(app: &App) -> String {
     to_text(&render(app, &Theme::new(true), app.width, app.height))
 }
 
-/// L4OPS-AC7 / AC12: the union flow list renders every kind — HTTP method
-/// badges, the `WS` badge, and the L4 badge + TCP/UDP/ICMP sub-label — and an
+/// L4OPS-AC7 / AC12: the union flow list renders every kind (HTTP method
+/// badges, the `WS` badge, and the L4 badge + TCP/UDP/ICMP sub-label) and an
 /// L4 row with no cells renders a labelled placeholder, never an empty line.
 #[test]
 fn every_kind_renders() {
@@ -132,7 +132,7 @@ fn every_kind_renders() {
     }
     let text = screen(&app);
     assert!(
-        text.contains("L4 flow l4-2 — details pending"),
+        text.contains("L4 flow l4-2: details pending"),
         "labelled placeholder for a cell-less L4 row: {text}"
     );
 }
@@ -142,7 +142,7 @@ fn every_kind_renders() {
 #[test]
 fn out_of_scope_inject_disabled() {
     let mut app = l4_app(200, 50);
-    app.selected = Some("l4-3".into()); // eth0 — not in L4 scope
+    app.selected = Some("l4-3".into()); // eth0: not in L4 scope
     app.mode = Mode::Inspector;
     assert!(
         !app.in_scope(app.selected_row().unwrap()),
@@ -175,7 +175,7 @@ fn out_of_scope_inject_disabled() {
 #[test]
 fn inject_shows_confirm() {
     let mut app = l4_app(200, 50);
-    app.selected = Some("l4-2".into()); // craft flow on lo0 — in scope
+    app.selected = Some("l4-2".into()); // craft flow on lo0, in scope
     app.mode = Mode::Inspector;
     app.l4.pane = aitm_tui::l4::L4Pane::Craft;
 
@@ -193,7 +193,7 @@ fn inject_shows_confirm() {
     // summary (what M4 + the fixture produce).
     let reply = json!({
         "status": "needs_confirmation",
-        "prompt": "l4.inject: 1 packet(s) to destination 127.0.0.1 on lo0 — matched scope entry \
+        "prompt": "l4.inject: 1 packet(s) to destination 127.0.0.1 on lo0. Matched scope entry \
                    lo0 127.0.0.0/8 (inject), minted permit budget 10 pps. Confirm?",
         "confirm_token": "tok-1"
     });
@@ -224,7 +224,7 @@ fn inject_shows_confirm() {
 }
 
 /// L4OPS-AC8: a packet's layer tree renders as a labelled, indented **text**
-/// tree (a terminal cannot draw a graphical tree — it is rendered, not dropped).
+/// tree (a terminal cannot draw a graphical tree: it is rendered, not dropped).
 #[test]
 fn layer_tree_degrades_labelled() {
     let mut app = l4_app(200, 60);

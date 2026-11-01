@@ -1,4 +1,4 @@
-//! Tester (stage 5), pass 2 — regression pins for the pass-1 and panel-1
+//! Tester (stage 5), pass 2: regression pins for the pass-1 and panel-1
 //! fixes that had state-level tests but no render-level or edge-case test,
 //! plus the interaction between the modes added since pass 1 (Browser, Ca,
 //! Confirm). Each test names the finding it pins.
@@ -125,8 +125,8 @@ fn confirm_prompt_renders_the_tool_description_and_y_n() {
     assert_eq!(app.mode, Mode::Flows);
 }
 
-/// I2 (render): the `:ca` panel in each of its states — no `ca.status` on
-/// the bus, loading, facts, a non-object reply — and the action hints that
+/// I2 (render): the `:ca` panel in each of its states (no `ca.status` on
+/// the bus, loading, facts, a non-object reply) and the action hints that
 /// name what the bus lacks.
 #[test]
 fn ca_panel_renders_status_facts_and_its_degraded_states() {
@@ -141,7 +141,7 @@ fn ca_panel_renders_status_facts_and_its_degraded_states() {
     assert!(app.run_command("ca").is_empty());
     assert_eq!(app.mode, Mode::Ca);
     let text = text_of(&app, 120, 30);
-    assert!(text.contains("CA — the MITM certificate"), "{text}");
+    assert!(text.contains("CA: the MITM certificate"), "{text}");
     assert!(text.contains("ca.status is not on this bus."), "{text}");
     assert!(
         text.contains(
@@ -271,7 +271,7 @@ fn finding_yaml_read_failure_is_shown_in_the_panel() {
 
 /// `--snapshot-core` (M-misc), re-pinned after the 2026-10-28 core merge:
 /// against the 56 core tools the screen carries the F5/F13 data the core
-/// now serves — sizes, durations, headers, cookies, the PoC library — plus the
+/// now serves (sizes, durations, headers, cookies, the PoC library) plus the
 /// lit F1 agent surface; only the surfaces still ahead of the core (F3 rules, the
 /// F4 push throughput, F10 sessions, M3 scripts, the F5 timing tab) keep their
 /// labels (Cookies/Set-Cookie now render live from the served headers).
@@ -397,7 +397,7 @@ fn core_fixture_render_is_lit_with_the_agent_surface_and_only_f3_f4_f10_still_ah
 
 /// FINDING P2-F1 (Important, §2.10(c) "never silently", §3.7 tui ✓): the
 /// core's `flow.get` summary for a WebSocket flow carries no `authority`,
-/// `scheme` or `path` — only `handshake` (the id of the 101 HTTP flow, which
+/// `scheme` or `path`, only `handshake` (the id of the 101 HTTP flow, which
 /// is in the same list) and `messages` (`crates/aitm-plugins/src/capture.rs`
 /// `summarize`, `Flow::WebSocket` arm). `FlowRow::from_summary` keeps the
 /// `handshake` id but nothing resolves it, so on the real bus every
@@ -462,7 +462,7 @@ fn websocket_rows_on_the_core_bus_take_their_url_from_the_handshake_row() {
 /// FINDING P2-F2 (Minor, §2.8 "missing is —, a real 0 B is 0 B"): the status
 /// bar's byte total is `human_bytes(sum of unwrap_or(0))`
 /// (`crates/aitm-tui/src/app.rs` `total_bytes`, `ui/bars.rs` status right
-/// cluster), so against the core bus — where no size is known without F5 —
+/// cluster), so against the core bus, where no size is known without F5,
 /// it reads `0 B`. It must be a dash until at least one size is known.
 #[test]
 fn status_bar_total_is_a_dash_until_a_size_is_known() {
@@ -515,8 +515,8 @@ fn status_bar_total_is_a_dash_until_a_size_is_known() {
 
 // ------------------------------------------------- browser view edges
 
-/// Task 10 edges: malformed HTML through the bus — unclosed tags, `<` in
-/// text, unterminated comments/quotes, 10 000 nested divs — yields a bounded
+/// Task 10 edges: malformed HTML through the bus (unclosed tags, `<` in
+/// text, unterminated comments/quotes, 10 000 nested divs) yields a bounded
 /// outline that renders and navigates at both plan sizes.
 #[test]
 fn browser_outline_survives_malformed_html_through_the_app() {
@@ -577,7 +577,7 @@ fn browser_outline_survives_malformed_html_through_the_app() {
     assert_eq!(app.browser.dom_cursor, 0);
     let _ = app.update(Action::Resize(200, 50));
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("no DOM yet — d reads the page"), "{text}");
+    assert!(text.contains("no DOM yet: d reads the page"), "{text}");
     let _ = app.update(Action::Down);
     let _ = app.update(Action::End);
     assert_eq!(app.browser.dom_cursor, 0);
@@ -604,8 +604,8 @@ fn browser_outline_survives_malformed_html_through_the_app() {
     assert!(!text.contains('\u{1b}'));
 }
 
-/// Task 10 edges: a `browser.screenshot` reply that is not a PNG — other
-/// image magic, bytes that are no image, bad base64, a non-string — is
+/// Task 10 edges: a `browser.screenshot` reply that is not a PNG (other
+/// image magic, bytes that are no image, bad base64, a non-string) is
 /// labelled honestly and never panics; `o` still hands real bytes over.
 #[test]
 fn browser_screenshot_of_non_png_bytes_is_labelled_not_trusted() {
@@ -969,7 +969,7 @@ fn key_codes() -> Vec<KeyCode> {
 
 /// I3 / S9: a `/re/` argument that would compile past the 1 MiB program
 /// limit is refused with the limit named, one under it compiles, an invalid
-/// one names the syntax error — at the parser and through `:filter`.
+/// one names the syntax error, at the parser and through `:filter`.
 #[test]
 fn regex_filters_name_the_size_limit_and_syntax_errors() {
     let err = filter::parse("~u /x{99999}/").unwrap_err();
@@ -1125,20 +1125,20 @@ fn resume_all_skip_toast_is_on_screen_and_the_bar_still_targets_in_scope() {
     assert_eq!(app.update(action), vec![BusRequest::Resume("i1".into())]);
     let text = text_of(&app, 160, 40);
     assert!(
-        text.contains("Resume all: 1 resumed, 2 skipped — out of scope"),
+        text.contains("Resume all: 1 resumed, 2 skipped out of scope"),
         "{text}"
     );
     // `a` on the oldest (out of scope) is refused with the host; the bar
     // still shows 3 paused.
     app.selected = Some("o1".into());
     assert!(app.update(Action::Resume).is_empty());
-    assert_eq!(toast(&app), "Out of scope — add `out.test` to scope to act");
+    assert_eq!(toast(&app), "Out of scope: add `out.test` to scope to act");
     assert!(text_of(&app, 160, 40).contains("3 paused"));
     // All out of scope: nothing sent, 0 resumed.
     let _ = app.on_bus(BusEvent::Scope(vec![]));
     assert!(app.update(Action::ResumeAll).is_empty());
     assert_eq!(
         toast(&app),
-        "Resume all: 0 resumed, 3 skipped — out of scope (add their hosts to scope to act)"
+        "Resume all: 0 resumed, 3 skipped out of scope (add their hosts to scope to act)"
     );
 }

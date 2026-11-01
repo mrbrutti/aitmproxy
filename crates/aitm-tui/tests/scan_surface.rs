@@ -319,7 +319,7 @@ fn enter_opens_the_selected_injection_points_flow() {
 /// AC3 endpoint→flow link: the result's `endpoint_flows` map (endpoint URL →
 /// flow id, keyed by the same scrubbed URL as `endpoints`) populates the state;
 /// Tab focuses the endpoints list and ⏎ opens the selected endpoint's flow in
-/// the existing inspector — parity with the injection-point path. An endpoint
+/// the existing inspector, parity with the injection-point path. An endpoint
 /// with no entry in the map opens nothing (and does not crash).
 #[test]
 fn enter_opens_the_selected_endpoints_flow() {

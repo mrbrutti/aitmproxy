@@ -1,4 +1,4 @@
-//! Coder (stage 4), panel pass 2 fix task — one test per finding, written
+//! Coder (stage 4), panel pass 2 fix task: one test per finding, written
 //! red before the fix. Each test names the finding it covers.
 
 mod common;
@@ -42,7 +42,7 @@ fn fixture_png() -> Vec<u8> {
 // ------------------------------------------------------- pass-2 re-check M1
 
 /// M1: a prompt returns to the mode it was opened from, not to a mode fixed
-/// by its kind — `:` from the Scope panel lands back in Scope, `/` from the
+/// by its kind: `:` from the Scope panel lands back in Scope, `/` from the
 /// inspector back in the inspector.
 #[test]
 fn a_prompt_returns_to_the_mode_it_was_opened_from() {
@@ -88,7 +88,7 @@ fn a_prompt_returns_to_the_mode_it_was_opened_from() {
 // ------------------------------------------------------- pass-2 re-check M2
 
 /// M2: only the `browser.*` calls the view tracks (those with a busy label)
-/// count as in flight — an answer for an untracked `browser.*` tool does
+/// count as in flight: an answer for an untracked `browser.*` tool does
 /// not settle a tracked call that is still waiting.
 #[test]
 fn an_untracked_browser_tool_answer_does_not_settle_a_tracked_call_in_flight() {
@@ -131,7 +131,7 @@ fn an_untracked_browser_tool_answer_does_not_settle_a_tracked_call_in_flight() {
 
 // ------------------------------------------------------- pass-2 re-check M3
 
-/// M3: the fixture loader does not swallow a tool entry it cannot read — a
+/// M3: the fixture loader does not swallow a tool entry it cannot read: a
 /// nameless tool parses as a document but loading the app from it panics
 /// naming the fixture.
 #[test]
@@ -232,7 +232,7 @@ fn findings_o_opens_only_a_regular_file_that_is_an_image() {
 // ------------------------------------------------------------------ QI-1
 
 /// QI-1: an error toast about something else while a `browser.*` call is in
-/// flight is not that call's answer — the view stays busy and shows no
+/// flight is not that call's answer: the view stays busy and shows no
 /// error; only a `CallFailed` naming a `browser.*` tool settles it.
 #[test]
 fn an_unrelated_error_toast_does_not_settle_an_in_flight_browser_call() {
@@ -288,7 +288,7 @@ fn an_unrelated_error_toast_does_not_settle_an_in_flight_browser_call() {
 }
 
 /// QI-1: a disconnect (and the reconnect that follows) forgets every
-/// `browser.*` call in flight — the bus will never answer them.
+/// `browser.*` call in flight: the bus will never answer them.
 #[test]
 fn a_disconnect_during_a_navigate_clears_the_browser_busy_state() {
     let mut app = fixture_app(200, 50);
@@ -470,7 +470,7 @@ fn finding_yaml_is_read_only_from_small_regular_yaml_files_and_is_carried_forwar
 // ----------------------------------------------------------------- SEC-2
 
 /// SEC-2: Findings `o` opens the screenshot by its canonical path; a path
-/// that does not resolve here opens nothing locally — on a bus with
+/// that does not resolve here opens nothing locally: on a bus with
 /// `poc.artifact` (C10) it is fetched, on one without it the toast says why.
 #[test]
 fn findings_o_canonicalizes_the_screenshot_path_and_refuses_one_that_does_not_resolve() {
@@ -653,7 +653,7 @@ fn ca_panel_install_without_the_ca_plugin_names_the_missing_tool() {
 
 // ------------------------------------------------------------------- Q-2
 
-/// Q-2: Esc and Enter from every prompt land in the same mode — the one the
+/// Q-2: Esc and Enter from every prompt land in the same mode, the one the
 /// prompt was opened from (here ScopeAdd from Scope, CaExport from Ca, the
 /// browser prompts from Browser, the PoC run prompts from Findings, Confirm
 /// from where the call was made, everything else from Flows).
@@ -774,7 +774,7 @@ fn esc_and_enter_from_every_prompt_land_in_the_same_mode() {
         let _ = app.update(Action::Submit);
         assert_eq!(app.mode, Mode::Prompt(next), "Enter from {kind:?}");
     }
-    // Confirm: Enter on the blank line is a "no", like Esc — nothing is sent.
+    // Confirm: Enter on the blank line is a "no", like Esc: nothing is sent.
     let mut app = fixture_app(200, 50);
     open(&mut app, PromptKind::Confirm);
     assert!(app.update(Action::Submit).is_empty());

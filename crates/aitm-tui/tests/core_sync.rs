@@ -1,5 +1,5 @@
 //! Core sync (2026-10-28): the F-gated rows lit up against the real core's
-//! shapes — what the operator sees (render) for C1–C12. The model and
+//! shapes: what the operator sees (render) for C1–C12. The model and
 //! reducer halves are unit tests in `model.rs` / `app.rs`; the bus halves in
 //! `tester_bus_task.rs`.
 
@@ -172,7 +172,7 @@ fn config_panel_flattens_the_redacted_object() {
     assert_eq!(app.mode, Mode::Config);
     let text = text_of(&app, 200, 50);
     assert!(
-        text.contains("Config — the redacted config.get view"),
+        text.contains("Config: the redacted config.get view"),
         "{text}"
     );
     assert!(

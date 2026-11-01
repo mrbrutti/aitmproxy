@@ -148,7 +148,7 @@ impl L4Flow {
 
 /// The `TCP` / `UDP` / `ICMP` transport sub-label for a layer list, if any.
 pub fn proto_of(layers: &[String]) -> Option<&'static str> {
-    // Innermost transport wins — scan inner-to-outer, matching the web
+    // Innermost transport wins: scan inner-to-outer, matching the web
     // (`protoSubLabel`) and macOS (`L4Proto.fromLayers`) rule so the three
     // surfaces print the same sub-label.
     layers
@@ -163,7 +163,7 @@ pub fn proto_of(layers: &[String]) -> Option<&'static str> {
 }
 
 /// A packet's layer tree as an honest, **labelled** indented text tree
-/// (ui-ext §3.2: a terminal cannot draw a graphical tree, so render it as text —
+/// (ui-ext §3.2: a terminal cannot draw a graphical tree, so render it as text,
 /// never drop it). Outermost layer first, each nested one a step deeper.
 pub fn layer_tree_lines(layers: &[String]) -> Vec<String> {
     let mut lines = vec!["layer tree (text):".to_string()];
@@ -196,7 +196,7 @@ impl L4ScopeEntry {
     pub fn from_json(v: &Value) -> Option<Self> {
         let interface = v.get("interface").and_then(Value::as_str)?.to_string();
         // `l4.scope.list` serializes `cidr` and `ports` as STRINGS ("127.0.0.1/32",
-        // "0-65535") — see `commands::scope_entry_to_value`. Read them as such (the
+        // "0-65535"), see `commands::scope_entry_to_value`. Read them as such (the
         // web + macOS surfaces do the same); collapse the port range to its display
         // form.
         let cidr = v

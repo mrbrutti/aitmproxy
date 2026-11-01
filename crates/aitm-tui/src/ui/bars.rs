@@ -211,7 +211,7 @@ pub fn intercept(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &m
             Line::from(vec![
                 Span::styled(
                     format!(
-                        " {} Intercept armed — every request pauses here",
+                        " {} Intercept armed: every request pauses here",
                         glyph::INTERCEPT
                     ),
                     theme.intercept_armed_quiet().add_modifier(Modifier::BOLD),
@@ -394,7 +394,7 @@ pub fn status(app: &App, theme: &Theme, view: &FrameView, area: Rect, buf: &mut 
         BusStatus::Connected { address, role, .. } => {
             if app.role_mismatch() {
                 // AC8: the token did not resolve to the expected role (or no
-                // role was echoed) — warn rather than proceed silently.
+                // role was echoed): warn rather than proceed silently.
                 let resolved = role.as_deref().unwrap_or("role unknown");
                 let expected = app.expect_role.as_deref().unwrap_or("");
                 (
@@ -472,7 +472,7 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         PromptKind::Pin => ("pin host:", "⏎ pin"),
         PromptKind::ScopeAdd => (
             "scope add:",
-            "host · host:port · *.wildcard — a human action",
+            "host · host:port · *.wildcard, a human action",
         ),
         PromptKind::PocName => (
             "poc name:",
@@ -509,7 +509,7 @@ pub fn prompt(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     let text = match (kind, &app.confirm) {
         (PromptKind::Confirm, Some(c)) => {
             format!(
-                " {sigil} {} — {} [y/N] {}",
+                " {sigil} {}: {} [y/N] {}",
                 c.name, c.description, app.prompt
             )
         }

@@ -83,7 +83,7 @@ pub fn tools(names: &[&str]) -> Vec<ToolInfo> {
 #[allow(unused_imports)]
 pub use aitm_tui::CORE_TOOLS;
 
-/// The 22 commands the bus served before that merge — a bus with none of
+/// The 22 commands the bus served before that merge: a bus with none of
 /// the F5/F6/F7/F12/F13/M3 tools. Tests that prove a *missing* tool degrades
 /// honestly connect to this list; `CORE_TOOLS` is for "today's core".
 pub const PRE_MERGE_TOOLS: &[&str] = &[
@@ -144,7 +144,7 @@ pub fn summary(
 }
 
 /// Connect `app` to a bus offering `tool_names`, as the bus task would:
-/// `Connected`, then — when the caller names a listen address — the
+/// `Connected`, then, when the caller names a listen address, the
 /// `proxy.status` the handshake reads (listening, armed off, capturing).
 pub fn connect(app: &mut App, tool_names: &[&str], listening: Option<&str>) -> Vec<BusRequest> {
     let mut out = app.on_bus(BusEvent::Connected {

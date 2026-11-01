@@ -1,4 +1,4 @@
-//! Tester (stage 5) — malformed, empty and oversized input, and a key/reducer
+//! Tester (stage 5): malformed, empty and oversized input, and a key/reducer
 //! sweep. Nothing a proxy peer, a fixture file or the keyboard can send may
 //! panic the UI: a crash here is a crash of the operator's console mid-test.
 
@@ -1017,11 +1017,8 @@ fn compose_kv_and_edit_buffer_edge_cases() {
             ..Message::default()
         },
     );
-    assert_eq!(
-        bin.lines[2],
-        "<3 binary bytes — edit in hex is a follow-up>"
-    );
-    // A binary body is described, never sent back — even if the placeholder is edited.
+    assert_eq!(bin.lines[2], "<3 binary bytes: edit in hex is a follow-up>");
+    // A binary body is described, never sent back, even if the placeholder is edited.
     let mut bin_edited = bin.clone();
     bin_edited.lines[2] = "typed over".into();
     assert!(bin_edited.to_edits().get("body").is_none());

@@ -105,9 +105,9 @@ pub enum Mode {
 /// What the one-line prompt is collecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind {
-    /// `:` — the command palette.
+    /// `:`, the command palette.
     Palette,
-    /// `/` — the filter expression.
+    /// `/`, the filter expression.
     Filter,
     Comment,
     Mark,
@@ -500,8 +500,8 @@ impl InspectorState {
 /// line, body. `to_edits` turns it back into `flow.mutate` edits.
 ///
 /// The body is sent back only when its lines changed, and then with the line
-/// ending and trailing newline the original had, so an untouched body — and
-/// any body that is not UTF-8, which the editor only describes — reaches the
+/// ending and trailing newline the original had, so an untouched body, and
+/// any body that is not UTF-8, which the editor only describes, reaches the
 /// upstream byte for byte as it was captured.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditBuffer {
@@ -521,7 +521,7 @@ pub struct EditBuffer {
 
 /// The body line shown for a body the editor cannot represent as text.
 fn binary_placeholder(len: usize) -> String {
-    format!("<{len} binary bytes — edit in hex is a follow-up>")
+    format!("<{len} binary bytes: edit in hex is a follow-up>")
 }
 
 impl EditBuffer {
@@ -574,8 +574,8 @@ impl EditBuffer {
     }
 
     /// The `flow.mutate` `edits` object: method, path, every header (the core
-    /// replaces by name) and — only when its lines changed and the body is
-    /// text — the body, rebuilt with the original line ending and trailing
+    /// replaces by name) and, only when its lines changed and the body is
+    /// text, the body rebuilt with the original line ending and trailing
     /// newline. An untouched or binary body is left to the core as captured.
     pub fn to_edits(&self) -> Value {
         let mut edits = Map::new();
@@ -861,7 +861,7 @@ pub struct App {
     pub filter: Option<Expr>,
     pub filter_text: String,
     pub prompt: String,
-    /// The mode the open prompt was opened from — where Esc or Enter
+    /// The mode the open prompt was opened from, where Esc or Enter
     /// returns. Set by `open_prompt` only when a prompt is not already open,
     /// so a chained prompt (PoC name → param) keeps the first one's origin.
     pub prompt_from: Mode,
@@ -1044,7 +1044,7 @@ impl App {
     }
 
     /// AC8: an expectation was set (`--expect-role`) and the connection did not
-    /// resolve to it — a different role, or no role echoed at all. False when
+    /// resolve to it: a different role, or no role echoed at all. False when
     /// no expectation was set or while the bus is not connected.
     pub fn role_mismatch(&self) -> bool {
         match (&self.expect_role, &self.bus) {
@@ -1302,7 +1302,7 @@ impl App {
 
     /// Bytes captured across the list, once at least one row knows a size
     /// (sizes come with `flow.detail`, F5); `None` until then, which the
-    /// status bar draws as a dash — a real `0 B` is `Some(0)` (§2.8).
+    /// status bar draws as a dash: a real `0 B` is `Some(0)` (§2.8).
     pub fn total_bytes(&self) -> Option<u64> {
         let mut known = false;
         let mut total = 0u64;
@@ -1605,7 +1605,7 @@ impl App {
                     self.toast(
                         Level::Warn,
                         format!(
-                            "Resume all: {sent} resumed, {skipped} skipped — out of scope (add their hosts to scope to act)"
+                            "Resume all: {sent} resumed, {skipped} skipped out of scope (add their hosts to scope to act)"
                         ),
                     );
                 }
@@ -2010,7 +2010,7 @@ impl App {
             };
             self.toast(
                 Level::Warn,
-                format!("Out of L4 scope — add an inject entry for {iface} to inject"),
+                format!("Out of L4 scope: add an inject entry for {iface} to inject"),
             );
             return Vec::new();
         }
@@ -2114,19 +2114,19 @@ impl App {
         if !self.has_tool(tool) {
             self.toast(
                 Level::Warn,
-                format!("{tool} is not on this bus — in-path intercept is documented-limited here"),
+                format!("{tool} is not on this bus: in-path intercept is documented-limited here"),
             );
             return Vec::new();
         }
         if flow.parked().is_none() {
             self.toast(
                 Level::Info,
-                "No parked L4 packet — Forward/Drop need an in-path intercept session",
+                "No parked L4 packet: Forward/Drop need an in-path intercept session",
             );
             return Vec::new();
         }
         if !self.l4.in_scope(flow) {
-            self.toast(Level::Warn, "Out of L4 scope — intercept actions disabled");
+            self.toast(Level::Warn, "Out of L4 scope: intercept actions disabled");
             return Vec::new();
         }
         let args = json!({ "id": flow.id });
@@ -2148,14 +2148,14 @@ impl App {
             // handshake id alone, and that flow is not in the list.
             "Out of scope: unknown host (the WebSocket handshake is not listed)".to_string()
         } else {
-            format!("Out of scope — add `{host}` to scope to act")
+            format!("Out of scope: add `{host}` to scope to act")
         };
         self.toast(Level::Warn, msg);
         false
     }
 
     /// `o`: hand the thing under the cursor to the desktop (§2.9). In the
-    /// Findings panel that is the screenshot — a local file on a loopback
+    /// Findings panel that is the screenshot: a local file on a loopback
     /// bus, else fetched through `poc.artifact` (F13); elsewhere an image or
     /// large body, written to a private temp file first. Anything the
     /// terminal can show inline is not opened, and the toast says so.
@@ -2176,7 +2176,7 @@ impl App {
                         }
                     }
                 }
-                None => self.toast(Level::Info, "no screenshot yet — s captures one"),
+                None => self.toast(Level::Info, "no screenshot yet: s captures one"),
             }
             return;
         }
@@ -2191,8 +2191,8 @@ impl App {
             // The path is the bus's word. On a loopback bus it may name a
             // file here: resolve it before the desktop sees it (SEC-2) and
             // open it only when it is a regular file whose header is an
-            // image we know. Otherwise — a remote bus, or a path that does
-            // not exist here — the bytes come through `poc.artifact` (F13).
+            // image we know. Otherwise, on a remote bus or for a path that does
+            // not exist here, the bytes come through `poc.artifact` (F13).
             let local = if self.is_loopback_bus() {
                 std::fs::canonicalize(&p).ok()
             } else {
@@ -2288,7 +2288,7 @@ impl App {
         };
         match open::body_to_temp_file(&id, ext, &msg.body) {
             Ok(path) => {
-                self.toast(Level::Info, format!("wrote {} — opening", path.display()));
+                self.toast(Level::Info, format!("wrote {}, opening", path.display()));
                 self.pending_open = Some(OpenTarget {
                     path,
                     label: format!("{id} {which} body"),
@@ -3166,7 +3166,7 @@ impl App {
     }
 
     /// The core's `flow.get` summary of a WebSocket flow carries no
-    /// authority, scheme or path — only the id of its 101 handshake flow
+    /// authority, scheme or path, only the id of its 101 handshake flow
     /// (`capture.rs` `summarize`). When that flow is listed, the row takes
     /// its URL from it: `https` → `wss`, `http` → `ws`. Until then (or when
     /// the handshake was evicted) the authority stays empty and the row is
@@ -3218,8 +3218,8 @@ impl App {
     }
 
     /// Get the YAML of findings that have none yet (§2.7 "PoC panel … the
-    /// YAML"): through `poc.get` (F13) when the bus has it — one request per
-    /// path, none while one is in flight — else from `poc_path` on this
+    /// YAML"): through `poc.get` (F13) when the bus has it (one request per
+    /// path, none while one is in flight), else from `poc_path` on this
     /// machine, which only means something on a loopback bus. What an
     /// earlier pass got (or failed to get) for the same `poc_path` is carried
     /// over from `previous`, so a `poc.list` poll does not ask again.
@@ -3342,7 +3342,7 @@ impl App {
             Some(d) => (d, ""),
             None => (
                 std::env::temp_dir().join("aitm-pocs"),
-                " — no PoC dir configured, so it went under the temp dir; poc.run confined to \
+                ": no PoC dir configured, so it went under the temp dir; poc.run confined to \
                  poc.dir will refuse it (pass --poc-dir)",
             ),
         };
@@ -3799,7 +3799,7 @@ impl App {
                         );
                     }
                     // C12: the core answers with the PoC's YAML text, not a
-                    // path — the TUI writes the file and lists it.
+                    // path: the TUI writes the file and lists it.
                     "poc.build" => {
                         let slug = self
                             .poc_build_pending
@@ -3934,7 +3934,7 @@ impl App {
                             .or_else(|| value.as_bool())
                             .unwrap_or(self.intercept_armed);
                         let msg = if self.intercept_armed {
-                            "Intercept armed — every request pauses"
+                            "Intercept armed: every request pauses"
                         } else {
                             "Intercept disarmed"
                         };
@@ -3985,7 +3985,7 @@ impl App {
                         );
                     }
                     // F6: the row's swatch and comment come from its detail,
-                    // which is now stale — drop it and ask again.
+                    // which is now stale: drop it and ask again.
                     "flow.mark" | "flow.comment" => {
                         let msg = match (name.as_str(), &value) {
                             ("flow.mark", Value::Array(marks)) if marks.is_empty() => {
@@ -4062,7 +4062,7 @@ impl App {
                         self.l4.gates = crate::l4::L4Gates::from_json(&value);
                         self.toast(Level::Info, "L4 agent gate updated");
                     }
-                    // Scanner Stage 1: the crawl result — reached endpoints and
+                    // Scanner Stage 1: the crawl result, reached endpoints and
                     // the injection points enumerated from captured requests.
                     "scan.discover" => {
                         self.scan.legacy.running = false;
@@ -5640,7 +5640,7 @@ impl App {
 }
 
 /// Whether `path` is a regular file whose first bytes are an image header
-/// [`crate::viewers::image::dimensions`] recognises — what Findings `o` is
+/// [`crate::viewers::image::dimensions`] recognises: what Findings `o` is
 /// willing to hand to the desktop. Judged on the opened handle, like
 /// [`read_poc_yaml`]; a file that cannot be opened is not an image either.
 fn is_image_file(path: &Path) -> bool {
@@ -5699,7 +5699,7 @@ fn title_case(word: &str) -> String {
 }
 
 /// C12: whether a `poc.build` reply is the PoC's YAML text rather than a
-/// path — it spans lines, or it neither contains a `/` nor ends in
+/// path: it spans lines, or it neither contains a `/` nor ends in
 /// `.yaml`/`.yml`.
 fn looks_like_yaml(s: &str) -> bool {
     s.contains('\n') || !(s.contains('/') || s.ends_with(".yaml") || s.ends_with(".yml"))
@@ -5715,7 +5715,7 @@ fn poc_slug(name: Option<&str>, seq: usize) -> String {
 }
 
 /// The scalar value of the first `key:` line in a YAML text (any indent),
-/// quotes stripped — enough to title a PoC the TUI just wrote.
+/// quotes stripped: enough to title a PoC the TUI just wrote.
 fn yaml_field(yaml: &str, key: &str) -> Option<String> {
     yaml.lines().find_map(|l| {
         let (k, v) = l.trim_start().split_once(':')?;
@@ -6063,7 +6063,7 @@ mod tests {
         assert!(reqs.is_empty());
         assert_eq!(
             app.current_toast().map(|t| t.text.as_str()),
-            Some("Out of scope — add `telemetry.vendor.example` to scope to act")
+            Some("Out of scope: add `telemetry.vendor.example` to scope to act")
         );
         app.selected = Some("f1".into());
         assert_eq!(
@@ -6147,7 +6147,7 @@ mod tests {
         let bytes = [0x00u8, 0xff, 0x89, b'P', b'N', b'G', 0xfe];
         let mut e = EditBuffer::from_request("f9", &message_with_body(&bytes));
         assert!(!e.body_is_text);
-        assert_eq!(e.lines[3], "<7 binary bytes — edit in hex is a follow-up>");
+        assert_eq!(e.lines[3], "<7 binary bytes: edit in hex is a follow-up>");
         // Edit a header: that is sent; the body key is absent.
         e.lines[1] = "host: other.test".into();
         let edits = e.to_edits();
@@ -6655,7 +6655,7 @@ mod tests {
             .current_toast()
             .unwrap()
             .text
-            .ends_with("aitm-tui-img.png — opening"));
+            .ends_with("aitm-tui-img.png, opening"));
         assert!(app.take_open_target().is_none(), "taken once");
         let _ = std::fs::remove_file(&t.path);
         // The request pane of the same flow has no body to open.
@@ -6911,9 +6911,7 @@ mod tests {
         );
         assert_eq!(
             app.current_toast().map(|t| t.text.as_str()),
-            Some(
-                "Resume all: 1 resumed, 1 skipped — out of scope (add their hosts to scope to act)"
-            )
+            Some("Resume all: 1 resumed, 1 skipped out of scope (add their hosts to scope to act)")
         );
     }
 

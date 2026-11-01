@@ -1,4 +1,4 @@
-//! Tester (stage 5) — the §2.7 component vocabulary as the TUI draws it, the
+//! Tester (stage 5): the §2.7 component vocabulary as the TUI draws it, the
 //! "needs core follow-up F*n*" rule (§2.10(c): never silent), and §4.2's
 //! "`tools/list` drives features". Each test states which commitment it proves.
 
@@ -305,7 +305,7 @@ fn sidebar_items_group_the_list_and_open_the_panels() {
     assert_eq!(app.mode, Mode::Browser);
     assert_eq!(reqs.len(), 2, "{reqs:?}");
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("Browser — embedded obscura"), "{text}");
+    assert!(text.contains("Browser: embedded obscura"), "{text}");
     assert!(!text.contains("not built"), "{text}");
     assert!(
         text.contains("live viewport and tabs need core follow-up F14"),
@@ -724,19 +724,19 @@ fn inspector_tabs_draw_their_viewers() {
             Pane::Response,
             "Headers",
             "f50",
-            &["No response yet — the request is paused."],
+            &["No response yet: the request is paused."],
         ),
         (
             Pane::Response,
             "Body",
             "f49",
-            &["No response — the request was killed."],
+            &["No response: the request was killed."],
         ),
         (
             Pane::Response,
             "Body",
             "f52",
-            &["No response yet — the request is in flight."],
+            &["No response yet: the request is in flight."],
         ),
     ];
     for (pane, tab, id, wants) in cases {
@@ -974,7 +974,7 @@ fn body_viewer_dispatches_on_content_type_and_bytes() {
     );
     assert_eq!(std::fs::read(&target.path).unwrap(), png);
     assert!(
-        toast(&app).ends_with("aitm-tui-img.png — opening"),
+        toast(&app).ends_with("aitm-tui-img.png, opening"),
         "{}",
         toast(&app)
     );
@@ -1069,10 +1069,10 @@ fn intercept_bar_has_three_states_and_targets_the_selection() {
         name: "flow.intercept".into(),
         value: json!(true),
     });
-    assert_eq!(toast(&app), "Intercept armed — every request pauses");
+    assert_eq!(toast(&app), "Intercept armed: every request pauses");
     let buf = draw(&app, 160, 40);
     let text = aitm_tui::snapshot::to_text(&buf);
-    let y = line_index(&text, "Intercept armed — every request pauses here").expect("quiet bar");
+    let y = line_index(&text, "Intercept armed: every request pauses here").expect("quiet bar");
     let line = text.lines().nth(y).unwrap();
     assert!(line.contains("[i] Disarm"), "{line}");
     assert!(line.contains("Rules… needs core follow-up F3"), "{line}");
@@ -1242,7 +1242,7 @@ fn compose_form_imports_curl_prefills_from_flows_and_prechecks_scope() {
     assert_eq!(app.compose.method, "POST");
     let text = text_of(&app, 200, 50);
     assert!(
-        text.contains("evil.example is out of scope — add it with :scope add"),
+        text.contains("evil.example is out of scope: add it with :scope add"),
         "{text}"
     );
     assert!(text.contains("1 sent this session"), "{text}");
@@ -1321,7 +1321,7 @@ fn scope_panel_lists_entries_counts_and_out_of_scope_hosts() {
     let _ = app.update(Action::OpenScope);
     assert_eq!(app.mode, Mode::Scope);
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("Scope — the authorised hosts"), "{text}");
+    assert!(text.contains("Scope: the authorised hosts"), "{text}");
     assert!(
         line_with(&text, "api.shop-staging.test")
             .unwrap()
@@ -1400,7 +1400,7 @@ fn scope_panel_lists_entries_counts_and_out_of_scope_hosts() {
         assert!(app.update(action).is_empty());
         assert_eq!(
             toast(&app),
-            "Out of scope — add `telemetry.vendor-analytics.example` to scope to act"
+            "Out of scope: add `telemetry.vendor-analytics.example` to scope to act"
         );
     }
 }
@@ -1566,7 +1566,7 @@ fn agent_toggle_and_panel_follow_the_policy() {
     );
     let _ = app.update(Action::OpenAgent);
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("Agent (MCP) — policy and activity"), "{text}");
+    assert!(text.contains("Agent (MCP): policy and activity"), "{text}");
     assert!(
         text.contains("policy: all tools · 14 actions in the last minute · 1 client(s)"),
         "{text}"
@@ -1735,7 +1735,7 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
         assert!(text.contains(label), "{label}: {text}");
     }
     // The Browser item's count is the tab count, which needs F14: a dash
-    // for "missing" (§2.8), not a "not built" label — the view is built.
+    // for "missing" (§2.8), not a "not built" label: the view is built.
     assert!(
         line_with(&text, "  Browser").is_some_and(|l| l.ends_with("—│")),
         "{:?}",
@@ -1820,7 +1820,7 @@ fn every_absent_tool_degrades_to_a_labelled_follow_up() {
     );
 }
 
-/// §4.2 step 3: `tools/list` drives features — `flow.detail` fetches happen
+/// §4.2 step 3: `tools/list` drives features: `flow.detail` fetches happen
 /// only when the bus offers the tool, for new rows, on Enter, and when a
 /// row's state changes after its detail was loaded.
 #[test]
@@ -1946,7 +1946,7 @@ fn shot_facts(app: &App) -> Option<(u32, u32, &'static str, usize)> {
 }
 
 /// The browser view opened on the fixture, its first DOM and screenshot
-/// answered — where every browser test below starts.
+/// answered: where every browser test below starts.
 fn browser_open() -> (App, Fixture) {
     let mut app = fixture_app(200, 50);
     let mut fx = Fixture::builtin();
@@ -2006,7 +2006,7 @@ fn browser_view_opens_asking_for_the_page_and_shows_url_screenshot_and_outline()
     );
     assert_eq!(shot_facts(&app), Some((1, 1, "PNG", 70)));
     let text = text_of(&app, 200, 50);
-    assert!(text.contains("Browser — embedded obscura"), "{text}");
+    assert!(text.contains("Browser: embedded obscura"), "{text}");
     assert!(
         text.contains("[screenshot 1×1 PNG · 70 B · o to open]"),
         "{text}"
@@ -2247,7 +2247,7 @@ fn browser_view_says_when_the_bus_has_no_browser_and_shows_tool_errors() {
     // `o` with no screenshot says so instead of opening nothing.
     let _ = app.update(Action::OpenExternally);
     assert!(app.take_open_target().is_none());
-    assert_eq!(toast(&app), "no screenshot yet — s captures one");
+    assert_eq!(toast(&app), "no screenshot yet: s captures one");
 
     // A fixture document without a `browser` section still answers like the
     // bus did before task 10, so that error path stays reachable in tests.

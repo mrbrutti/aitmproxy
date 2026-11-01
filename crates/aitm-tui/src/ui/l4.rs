@@ -118,7 +118,7 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
         buf.set_string(
             list_area.x + 1,
             list_area.y,
-            "no packets yet — craft and inject one, or start capture",
+            "no packets yet: craft and inject one, or start capture",
             theme.text_tertiary(),
         );
     } else {
@@ -186,7 +186,7 @@ fn packets_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut B
                 theme.accent().add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::styled(
-                "raw bytes are not carried by l4.flow.get — craft a packet (Craft pane) to preview its hex",
+                "raw bytes are not carried by l4.flow.get: craft a packet (Craft pane) to preview its hex",
                 theme.text_tertiary(),
             ));
         }
@@ -203,12 +203,12 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     let [editor, preview] =
         Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
     // The YAML editor (read + highlighted; editing lands via the command bus
-    // and the palette today — the hook for in-pane Rhai craft is the
+    // and the palette today: the hook for in-pane Rhai craft is the
     // protocol-extensible seam, ui-ext §3.2).
     buf.set_string(
         editor.x + 1,
         editor.y,
-        "PacketSpec (YAML) — b build · s inject (guarded)",
+        "PacketSpec (YAML): b build · s inject (guarded)",
         theme.accent().add_modifier(Modifier::BOLD),
     );
     let body = Rect::new(
@@ -278,7 +278,7 @@ fn craft_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut Buf
     if !app.l4.inject_in_scope(flow) {
         lines.push(Line::raw(""));
         lines.push(Line::styled(
-            "inject disabled — out of L4 scope (add an inject entry for this interface)",
+            "inject disabled: out of L4 scope (add an inject entry for this interface)",
             theme.text_tertiary(),
         ));
     }
@@ -335,7 +335,7 @@ fn intercept_pane(app: &App, theme: &Theme, flow: &L4Flow, area: Rect, buf: &mut
             }
             if !app.l4.in_scope(flow) {
                 lines.push(Line::styled(
-                    "out of L4 scope — Forward/Drop disabled",
+                    "out of L4 scope: Forward/Drop disabled",
                     theme.text_tertiary(),
                 ));
             }
