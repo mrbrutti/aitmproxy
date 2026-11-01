@@ -1670,4 +1670,16 @@ Kept by the main session during stage 6. One row per finding.
 
 ## Shipped
 
-What merged, what was cut, follow-ups. Filled at stage 7.
+Filled 2026-11-01 at integration (branch `claude/wizardly-nightingale-441e25`, PR against `main`; the coordinator merges in milestone order).
+
+**Merged content.** Tasks 1-19 in full: the engine crate (`JobRegistry`/`admit`, worker, `JobClient`, profiles, issue store, catalogue + scheduler, session reuse, PoC-hint reproduction, interim HTTP lane with client-crawl fallback), the 15 new `scan.*` verbs + uniform `check.<id>`, legacy verbs over the job model, `JobBus` + `notifications/aitm/job`, the Rhai `reg.add_check` bridge + `probe.*`, the model additions, binary wiring (`scanner:` config, `collect_lanes_with` + `ssl_insecure` to the WS lane), `docs/scanner.md`. Final contract pins after main f2b0dae6 (T5): `EXPECTED_TOOLS` 92, `CORE_TOOLS` 95, `bus-fixture.json` 95.
+
+**Cut / deferred by ruling.** `confirm_required` is reserved, not emitted (B18). The bundled-origin half of AC T1-6 waits for T3's scripts (cell conditional). `scan.discover`'s browser path is unchanged behind the job model.
+
+**Follow-ups (not in this branch).**
+- Structural: split `worker.rs` (`drive` ~230 lines, `RunCtx` mirrors `JobRuntime`) and `jobs.rs`; move `guard_authority_for`/`parse_target` out of `crawl.rs` before T2 deletes it; `util.rs` module doc now undersells its contents; `JobEntry` test builder.
+- Tests: cross-crate ParamSchema conformance test through `aitm_mcp::json::object_from_json` (replaces the mirrored `keys_the_mcp_validator_refuses`); a live T10 cell against a 5xx target for `stopped_reason: errors`; the browser branch of `crawl.pages` attribution is unit-unproven.
+- Model: constructors/builders for `CheckMeta`/`Verdict` so lane crates stop filling the T1b fields by hand (T3, T4 and T5 each needed a literal fix-up after merging); `aitm-mcp` could re-export the model's `JOB_NOTIFICATION_METHOD` instead of defining its own (pinned equal for now).
+- T4: `WsLane::tls_policy()` accessor so the `ssl_insecure` hand-off is asserted on the lane, not the handed policy; `cswsh` is the one WS check id without the `ws-` prefix.
+- T3 PR 2: `blind_timing::tracked` embeds the fitter's `Timing { correlated: false }` in a Vulnerable verdict's evidence; `check.open_redirect` vs `check.open-redirect` naming in `aitmproxy-plugin/docs/tool-reference.md`.
+- Engine: `ProbeRefused::HostLadder`/`Timeout` now name `host:port` (operator-visible text change); `probes.timeouts` does not count per-check timeouts (logged at debug only); blocking FS writes on terminal/upsert paths accepted (commented).
