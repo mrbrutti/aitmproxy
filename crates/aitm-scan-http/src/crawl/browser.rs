@@ -1540,6 +1540,128 @@ mod tests {
         assert_nothing_left_for_search_or_evil(&store);
     }
 
+    /// A page with two submittable forms: a `GET` search at index 0 and a
+    /// `POST` login at index 1, each with one text field and no button.
+    const TWO_FORMS: &str = "<html><body>\
+<form action=\"/search\" method=\"get\"><input name=\"q\"></form>\
+<form action=\"/login\" method=\"post\"><input name=\"u\"></form>\
+</body></html>";
+
+    /// Where submitting the login form lands.
+    const LOGIN: &str = "http://t:8080/login";
+
+    /// A site whose root is [`TWO_FORMS`], with the two landing pages.
+    fn two_form_pages(home: PageScript) -> FakeBrowser {
+        FakeBrowser::new(vec![
+            (ROOT, home),
+            (
+                SEARCH,
+                PageScript::new("<html><body>results</body></html>").with_captures(vec![request(
+                    "GET",
+                    SEARCH,
+                    &[],
+                    None,
+                )]),
+            ),
+            (
+                LOGIN,
+                PageScript::new("<html><body>in</body></html>").with_captures(vec![request(
+                    "POST",
+                    LOGIN,
+                    &[],
+                    None,
+                )]),
+            ),
+        ])
+    }
+
+    /// Two forms on one page; form 0 is retargeted off-origin by submit time
+    /// and form 1 is untouched. The submit expression addresses each form by
+    /// its own tag: form 1 is submitted (`submit 1`) and form 0 is refused,
+    /// never submitted in form 1's place (F4-1, R-I1).
+    #[tokio::test]
+    async fn two_forms_submit_by_their_own_tag() {
+        let store = Arc::new(MemFlowStore::new());
+        let home = PageScript::new(TWO_FORMS)
+            .with_forms(&[(0, SEARCH), (1, LOGIN)])
+            .with_captures(vec![request("GET", ROOT, &[], None)])
+            .with_live_form(
+                0,
+                matching_live_form().with_action_at_submit("https://evil.test/collect"),
+            );
+        let browser =
+            Arc::new(two_form_pages(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        let submits: Vec<String> = browser
+            .log_lines()
+            .into_iter()
+            .filter(|line| line.starts_with("submit "))
+            .collect();
+        assert_eq!(submits, vec!["submit 1".to_string()]);
+        assert_eq!(report.forms_submitted, 1);
+        assert_eq!(report.forms_skipped, 1);
+        assert_eq!(report.stopped_reason, None);
+        // The login landed and was collected; nothing left for `evil.test`
+        // or `/search`.
+        assert!(
+            store.list().into_iter().any(|id| matches!(
+                store.get(id),
+                Some(Flow::Http(flow)) if flow.request.path == "/login"
+            )),
+            "the login submission was captured"
+        );
+        assert_nothing_left_for_search_or_evil(&store);
+    }
+
+    /// The submit expression's in-eval check is bypassed (a browser that
+    /// answers `{ok:true}` for an off-origin action): the engine judges the
+    /// returned `action` by [`form_action`] itself and refuses it. The
+    /// double's `submit 0` line is the browser having submitted; the lane
+    /// counts it as a skip, not a submission, and collects nothing (F4-1).
+    #[tokio::test]
+    async fn engine_recheck_refuses_an_off_origin_action_the_browser_accepted() {
+        let store = Arc::new(MemFlowStore::new());
+        // No `forms` landing: the double stays on the page after its submit.
+        let home = home().with_forms(&[]).with_live_form(
+            0,
+            matching_live_form()
+                .with_action_at_submit("https://evil.test/collect")
+                .answers_ok_regardless(),
+        );
+        let browser =
+            Arc::new(pages_with_home(home).recording_into(store.clone() as Arc<dyn FlowStore>));
+        let job = job_with(browser.clone(), store.clone());
+        let limits = limits_for(&CrawlOptions::default());
+
+        let report = BrowserCrawler
+            .crawl(&url(ROOT), vec![url(ROOT)], &job, &limits)
+            .await
+            .expect("the crawl succeeds");
+
+        let submits: Vec<String> = browser
+            .log_lines()
+            .into_iter()
+            .filter(|line| line.starts_with("submit "))
+            .collect();
+        assert_eq!(
+            submits,
+            vec!["submit 0".to_string()],
+            "the browser did submit"
+        );
+        assert_eq!(report.forms_submitted, 0, "the engine did not count it");
+        assert_eq!(report.forms_skipped, 1);
+        assert_eq!(report.clicks, 1);
+        assert_eq!(report.stopped_reason, None);
+        assert_nothing_left_for_search_or_evil(&store);
+    }
+
     /// The lane's reading of the submit expression's answer: `ok` and the live
     /// `action` when it is a string; anything but that object is no answer.
     #[test]

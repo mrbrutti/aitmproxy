@@ -270,9 +270,9 @@ pub(crate) struct PageScript {
     /// **Deviation from the plan, noted for task 18.** The plan has the double
     /// resolve a form's action out of `html` with `crawl::extract` (task 4).
     /// That module was still a placeholder when this file was written, so the
-    /// landing URL is declared explicitly here instead. A submit `eval` picks
-    /// the entry whose index it names (`document.forms[1].requestSubmit()` →
-    /// index 1, no index in the expression → 0).
+    /// landing URL is declared explicitly here instead. The crawler's submit
+    /// expression (`submit_form_js(1)`) picks the entry whose tagged index it
+    /// names; an expression naming none is index 0.
     pub forms: Vec<(usize, String)>,
     /// Requests inserted into the store as captured flows when this page is
     /// reached, standing in for what the proxy would have captured.
@@ -303,6 +303,11 @@ pub(crate) struct LiveFormScript {
     /// The tagged element's `action` at submit time, when a script changed it
     /// after the tag eval; `None` means it still reads `action`.
     pub action_at_submit: Option<String>,
+    /// The submit expression answers `{ok:true, action}` and submits whatever
+    /// the live `action` is, without the in-eval origin and scheme check: a
+    /// browser whose check was bypassed, so a test can prove the engine's own
+    /// re-check of the returned `action` refuses it (F4-1).
+    pub answers_ok_regardless: bool,
 }
 
 impl LiveFormScript {
@@ -315,6 +320,13 @@ impl LiveFormScript {
     /// The same live form whose `action` reads `action` by submit time.
     pub(crate) fn with_action_at_submit(mut self, action: &str) -> Self {
         self.action_at_submit = Some(action.to_string());
+        self
+    }
+
+    /// The same live form whose submit expression answers `{ok:true, action}`
+    /// without checking the action's origin or scheme.
+    pub(crate) fn answers_ok_regardless(mut self) -> Self {
+        self.answers_ok_regardless = true;
         self
     }
 
@@ -533,6 +545,10 @@ impl FakeBrowser {
     /// origin answers `{ok:false, action}` and submits nothing; otherwise the
     /// form is submitted (logged `submit <index>`, landing where the page's
     /// `forms` entry says) and the answer is `{ok:true, action}` (R-I1).
+    ///
+    /// A [`LiveFormScript::answers_ok_regardless`] form skips the origin check
+    /// and submits whatever the action is, standing in for a browser whose
+    /// in-eval check was bypassed.
     fn submit_tagged(&self, index: usize) -> Value {
         let answer = |ok: bool, action: Option<&str>| {
             let mut fields: BTreeMap<String, Value> = BTreeMap::new();
@@ -548,10 +564,10 @@ impl FakeBrowser {
         if live.missing_at_submit {
             return answer(false, None);
         }
-        let action = live.action_at_submit.clone().or(live.action.clone());
+        let action = live.action_at_submit.as_deref().or(live.action.as_deref());
         let current = self.current_url();
         let here = crate::url_norm::parse_absolute(&current);
-        let target = match (&here, action.as_deref().map(str::trim)) {
+        let target = match (&here, action.map(str::trim)) {
             (Some(here), None | Some("")) => Some(here.clone()),
             (Some(here), Some(action)) => crate::url_norm::resolve(here, action),
             (None, _) => None,
@@ -560,8 +576,8 @@ impl FakeBrowser {
             (Some(here), Some(target)) => crate::url_norm::same_origin(target, here),
             _ => false,
         };
-        if !same_origin {
-            return answer(false, action.as_deref());
+        if !same_origin && !live.answers_ok_regardless {
+            return answer(false, action);
         }
         self.log_line(format!("submit {index}"));
         let lands_on = self.pages.get(&current).and_then(|page| {
@@ -573,7 +589,7 @@ impl FakeBrowser {
         if let Some(lands_on) = lands_on {
             self.land_on(&lands_on);
         }
-        answer(true, action.as_deref())
+        answer(true, action)
     }
 }
 
@@ -589,7 +605,12 @@ fn quoted(expr: &str) -> Option<&str> {
 /// The form index an expression names: the `N` of `data-aitm-form="N"` (the
 /// tagged selector the submit expression uses) or of `document.forms[N]` (the
 /// tag expression), defaulting to 0 when it names none.
+///
+/// The submit expression carries the selector inside a JS string literal, so
+/// its quotes arrive escaped (`data-aitm-form=\"N\"`); the backslashes are
+/// dropped before matching so both spellings resolve to the same `N`.
 fn form_index(expr: &str) -> usize {
+    let expr = expr.replace('\\', "");
     let after = expr
         .find("data-aitm-form=\"")
         .map(|open| open + "data-aitm-form=\"".len())
@@ -724,28 +745,7 @@ impl BrowserDriver for FakeBrowser {
             if expr.contains(SUBMIT_FORM_MARKER) {
                 return Ok(self.submit_tagged(form_index(&expr)));
             }
-            if expr.contains("requestSubmit") || expr.contains(".submit()") {
-                let index = form_index(&expr);
-                self.log_line(format!("submit {index}"));
-                let lands_on = {
-                    let current = self.current_url();
-                    self.pages.get(&current).and_then(|page| {
-                        page.forms
-                            .iter()
-                            .find(|(i, _)| *i == index)
-                            .map(|(_, lands_on)| lands_on.clone())
-                    })
-                };
-                match lands_on {
-                    Some(lands_on) => {
-                        self.land_on(&lands_on);
-                        Ok(Value::Null)
-                    }
-                    None => Err(anyhow::anyhow!(
-                        "the double has no form {index} on the current page"
-                    )),
-                }
-            } else if expr.contains("location.href") {
+            if expr.contains("location.href") {
                 Ok(Value::Str(self.current_url()))
             } else if expr.contains("document.readyState") {
                 Ok(Value::Str("complete".to_string()))
@@ -1083,13 +1083,17 @@ mod tests {
         assert_eq!(missing.response.as_ref().unwrap().status, 404);
     }
 
+    /// The self-test's home page: one form at index 0, posting to `/posted`.
+    const HOME_WITH_FORM: &str =
+        "<html><form action=\"/posted\" method=\"post\"><input name=\"x\"></form>home</html>";
+
     #[tokio::test]
     async fn fake_browser_navigates_clicks_submits_and_captures() {
         let store = Arc::new(MemFlowStore::new());
         let browser = FakeBrowser::new(vec![
             (
                 "http://t:8080/",
-                PageScript::new("<html>home</html>")
+                PageScript::new(HOME_WITH_FORM)
                     .with_clickables(&[("#next", "http://t:8080/a")])
                     .with_forms(&[(0, "http://t:8080/posted")])
                     .with_captures(vec![request("GET", "http://t:8080/app.js", &[], None)]),
@@ -1103,7 +1107,7 @@ mod tests {
         assert_eq!(outcome.final_url, "http://t:8080/");
         assert_eq!(outcome.status, Some(200));
         assert_eq!(store.count(), 1);
-        assert_eq!(browser.get_dom().await.unwrap(), "<html>home</html>");
+        assert_eq!(browser.get_dom().await.unwrap(), HOME_WITH_FORM);
         assert_eq!(
             browser.eval("location.href").await.unwrap(),
             Value::Str("http://t:8080/".to_string())
@@ -1127,10 +1131,23 @@ mod tests {
             )])
         );
 
-        browser
-            .eval("document.forms[0].requestSubmit()")
+        // The crawler's real submit expression: the double finds the form the
+        // markup declares at index 0 and lands where `forms` says.
+        let submitted = browser
+            .eval(&crate::crawl::browser::submit_form_js(0))
             .await
             .unwrap();
+        assert_eq!(
+            submitted,
+            Value::Object(
+                [
+                    ("ok".to_string(), Value::Bool(true)),
+                    ("action".to_string(), Value::Str("/posted".to_string())),
+                ]
+                .into_iter()
+                .collect()
+            )
+        );
         assert_eq!(browser.current_url(), "http://t:8080/posted");
 
         browser.navigate("http://t:8080/").await.unwrap();
@@ -1161,5 +1178,24 @@ mod tests {
             .click(ClickTarget::Selector("#nope".to_string()))
             .await
             .is_err());
+    }
+
+    /// The double reads the form index out of the real expressions it is
+    /// handed: the tag expression names `document.forms[N]`, and the submit
+    /// expression names the tagged selector inside a JS string, where the
+    /// quotes are escaped (`form[data-aitm-form=\"N\"]`). A double that only
+    /// matched the unescaped form would submit form 0 for every index and
+    /// never prove the tagged index (F4-1).
+    #[test]
+    fn form_index_reads_the_tag_and_submit_expressions() {
+        use crate::crawl::browser::{submit_form_js, tag_form_js};
+
+        assert_eq!(form_index(&tag_form_js(0)), 0);
+        assert_eq!(form_index(&tag_form_js(1)), 1);
+        assert_eq!(form_index(&tag_form_js(12)), 12);
+        assert_eq!(form_index(&submit_form_js(0)), 0);
+        assert_eq!(form_index(&submit_form_js(1)), 1);
+        assert_eq!(form_index(&submit_form_js(12)), 12);
+        assert_eq!(form_index("document.cookie"), 0);
     }
 }
