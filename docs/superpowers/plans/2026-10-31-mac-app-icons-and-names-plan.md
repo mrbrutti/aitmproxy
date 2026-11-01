@@ -712,7 +712,17 @@ in both plans' logs, fixed in the follow-up docs PR from this branch.
 | all | Spec (3rd pass) | Minor | `GettingStartedStep.Kind` listing showed `caTrusted` after `scopeSet`; PR D's enum is `coreRunning, busConnected, caTrusted, extensionOn, scopeSet, firstFlow` | fixed in ad83ab78: listings use PR D's source order; the steps order stays make's |
 | 2 | Coder (stop-and-report) | Important | spec D1 / plan Task 2 said an overwrite "does not change its age" while AI-AC12 and the plan's literal test expect `c["b"] = 20; c["e"] = 5` to evict `c`, not `b` | ruled 2026-11-01 (architect, self-approved): the AC is the oracle — overwrite refreshes to newest; D1 and Task 2 prose amended; `BoundedCache` setter moves the key to newest |
 | 2 | Coder (noticed) | Important | `FlowGroup.clientHost` makes `Session.swift:410-430` (`pin`/`unpin`/`isPinned`) non-exhaustive, so the app target (and thus `swift test`) cannot build before Task 5 | orchestrator GRANTED 2026-11-01 a narrow interim claim on `Session.swift` for exactly the three one-line functions `pin`/`unpin`/`isPinned` delegating to `Pins.pin/unpin/contains(_ group:)`, landed in the Kit-half PR (nothing near `systemProxy`/`decrypt`/`caTrust`/the poll loop; system-proxy PR 4 owns the rest of the file and whoever lands later re-merges); done by the orchestrating session in the Wave A commit |
+| 4 | Coder (deviations flagged) | Minor | (a) one storage member beyond the plan's four: `nonisolated private let iconSide: CGFloat`, read once from `Tok.Size.icon` on the main actor because the token is actor-isolated under the app target's default MainActor isolation and the `nonisolated` lookup cannot read it; (b) icon sharing per owner path happens in `store` on the main actor (a second helper's transient copy is discarded) so lookups stay off-main; (c) `onResolve` on a miss also schedules a lookup; (d) step 6 falls back to `AppIdentifier.fallbackName(for:)` when all three name sources sanitize to nil; (e) `resolve` is `nonisolated` (must run on the detached task); the pre-authorised `Handoff` wrapper was NOT needed — no `unchecked`/`unsafe` in the file | accepted 2026-11-01 (orchestrating session): none changes D2's order or a verdict; (c) and (d) close holes the spec left open (a caller using `onResolve` alone would never fire; an empty label); recorded for the spec reviewer |
+| 4 | Coder (noticed) | Minor | `apps/web/src/components/Icon.tsx` has no Lucide entry for `glyph.network.web = "network"`; nothing generates from `glyph.web`, so no gate breaks | follow-up (web), listed in Shipped |
+| 4 | Coder (noticed) | Minor | `Shell/SidebarView.swift` still holds `AppMark` (uses `NSRunningApplication`) | Task 5 replaces it with `ClientMark` as planned (waits for system-proxy PR 4) |
+| 7 | Coder (noticed) | Minor | two stale "gallery" words remain in KIT.md's token tables (`Tok.Ground.surface` "the gallery ground", section role "gallery section labels"), outside Task 7's three parts | follow-up docs sweep, listed in Shipped |
 
 ## Shipped
 
 What merged, what was cut, follow-ups. Filled at stage 7.
+
+Pre-filled 2026-11-01 — follow-ups accepted during implementation, each a small PR of its own:
+
+1. Web: add a Lucide mapping for `network` in `apps/web/src/components/Icon.tsx` (glyph.network.web; Task 4 noticed).
+2. KIT.md: drop the two stale "gallery" words in the token tables (Task 7 noticed).
+3. Sandbox typecheck recipe for app-target coders (memory `sandbox-swift-typecheck-in-process-plugins`) — fold into the plan TEMPLATE's Environment adaptation.
