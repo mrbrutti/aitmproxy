@@ -42,7 +42,7 @@ use crate::codec::hex_encode;
 use crate::fields::FieldPath;
 use crate::mutate::{boundary_cases, random_case, Mutation, DEFAULT_MAX_RAW_BYTES};
 use crate::oracle::{classify, liveness_passes, CaseClass, LatencyWindow};
-use crate::plan::{is_decodable, send_recv_spec, SeedSpec, TargetPlan};
+use crate::plan::{is_decodable, send_recv_spec, PlanError, SeedSpec, TargetPlan};
 use crate::rng::{derive_seed, Rng};
 use crate::state::{
     report_counters, Candidate, CaseRecord, CrashRecord, LaneState, PointRun, StopReason,
@@ -157,13 +157,10 @@ impl fmt::Display for HostError {
     }
 }
 
-// Deliberately not `std::error::Error`: anyhow's blanket `From<E: Error>` would
-// collide with the conversion the `ProbeHost` impl needs.
-impl From<HostError> for anyhow::Error {
-    fn from(err: HostError) -> Self {
-        Self::msg(err.to_string())
-    }
-}
+// `std::error::Error`, so anyhow's blanket `From<E: Error>` is the conversion a
+// `ProbeHost` method's `?` uses and an engine caller can `downcast_ref`
+// (review finding M1).
+impl std::error::Error for HostError {}
 
 /// One stimulus as it went out and came back. `Debug` prints the reply as a
 /// byte count, never its contents.
@@ -230,8 +227,12 @@ pub struct PointRunner {
     plan: TargetPlan,
     field: FieldPath,
     rng_seed: u64,
+    /// Seed 0's built spec, crafted once at construction and reused by every
+    /// baseline, liveness probe and boundary table instead of rebuilt each time
+    /// (review finding M8).
+    seed0: SeedSpec,
     baseline: Mutex<Option<CaseClass>>,
-    run: tokio::sync::Mutex<Option<Arc<PointRun>>>,
+    run: tokio::sync::OnceCell<Arc<PointRun>>,
 }
 
 impl fmt::Debug for PointRunner {
@@ -248,26 +249,32 @@ impl fmt::Debug for PointRunner {
 
 impl PointRunner {
     /// A runner for one `(point, field)` of one job. The point's PRNG seed is
-    /// derived from the job marker and the point id, so the run replays.
-    #[must_use]
+    /// derived from the job marker and the point id, so the run replays. Seed 0
+    /// is built here, once, so a seed that does not craft is refused at
+    /// `probe_host_for` rather than at send time (review finding M8).
+    ///
+    /// # Errors
+    /// [`PlanError`] when the plan carries no seed or seed 0 does not build.
     pub fn new(
         shared: Arc<Shared>,
         job: Arc<dyn JobCtx>,
         point: InsertionPoint,
         plan: TargetPlan,
         field: FieldPath,
-    ) -> Self {
+    ) -> Result<Self, PlanError> {
         let rng_seed = derive_seed(&job.marker(), &point.id);
-        Self {
+        let seed0 = plan.seed_spec(0)?;
+        Ok(Self {
             shared,
             job,
             point,
             plan,
             field,
             rng_seed,
+            seed0,
             baseline: Mutex::new(None),
-            run: tokio::sync::Mutex::new(None),
-        }
+            run: tokio::sync::OnceCell::new(),
+        })
     }
 
     /// The insertion point this runner fuzzes.
@@ -353,10 +360,7 @@ impl PointRunner {
     /// # Errors
     /// As [`PointRunner::send_spec`]; the probe is charged but is never a case.
     pub async fn liveness_probe(&self) -> Result<bool, HostError> {
-        let seed = self
-            .plan
-            .seed_spec(0)
-            .map_err(|err| HostError::Craft(err.to_string()))?;
+        let seed = self.seed0.clone();
         let delivered = self
             .deliver(
                 seed.spec,
@@ -379,22 +383,22 @@ impl PointRunner {
     /// Drive this point's whole run once, and hand every later caller the same
     /// `Arc`: a second check over the same point sends nothing.
     pub async fn run_point(self: &Arc<Self>) -> Arc<PointRun> {
-        let mut cached = self.run.lock().await;
-        if let Some(run) = cached.as_ref() {
-            return Arc::clone(run);
-        }
-        let job_id = self.job.job_id().to_string();
-        if let Some(run) = self.shared.state.run(&job_id, &self.point.id) {
-            *cached = Some(Arc::clone(&run));
-            return run;
-        }
-        let run = Arc::new(self.drive(&job_id).await);
-        self.shared
-            .state
-            .set_run(&job_id, &self.point.id, Arc::clone(&run));
-        self.report(&job_id);
-        *cached = Some(Arc::clone(&run));
-        run
+        Arc::clone(
+            self.run
+                .get_or_init(|| async {
+                    let job_id = self.job.job_id().to_string();
+                    if let Some(run) = self.shared.state.run(&job_id, &self.point.id) {
+                        return run;
+                    }
+                    let run = Arc::new(self.drive(&job_id).await);
+                    self.shared
+                        .state
+                        .set_run(&job_id, &self.point.id, Arc::clone(&run));
+                    self.report(&job_id);
+                    run
+                })
+                .await,
+        )
     }
 
     /// Render the first cases without sending any of them (spec D8.4's dry
@@ -410,9 +414,7 @@ impl PointRunner {
             .allocate_cases(self.job.job_id())
             .unwrap_or(0)
             .min(timing.dry_run_cases);
-        let Some(boundary) = self.boundary_table() else {
-            return run;
-        };
+        let boundary = self.boundary_table();
         let mut rng = Rng::new(self.rng_seed);
         for index in 0..allocated {
             let Some((seed, mutation)) = self.case_at(index, &boundary, &mut rng) else {
@@ -459,16 +461,15 @@ impl PointRunner {
         }
     }
 
-    /// The deterministic boundary table, read off seed 0 so a point's case
-    /// count does not depend on which seed a case cycles to.
-    fn boundary_table(&self) -> Option<Vec<Mutation>> {
-        let seed = self.plan.seed_spec(0).ok()?;
-        Some(boundary_cases(
+    /// The deterministic boundary table, read off the cached seed 0 so a point's
+    /// case count does not depend on which seed a case cycles to.
+    fn boundary_table(&self) -> Vec<Mutation> {
+        boundary_cases(
             self.field,
-            &seed.spec,
+            &self.seed0.spec,
             self.plan.target.framing.header_len(),
             self.shared.timing.max_raw_bytes,
-        ))
+        )
     }
 
     /// The seed and the mutation for case `index`: the boundary table first,
@@ -671,9 +672,7 @@ impl PointRunner {
         match tokio::task::spawn_blocking(move || send_recv(&guard, backend, store, request)).await
         {
             Ok(result) => result.map(|(_flow, outcome)| outcome),
-            Err(err) => Err(L4Error::Unavailable(format!(
-                "the send_recv task did not finish: {err}"
-            ))),
+            Err(err) => Err(L4Error::Unavailable(join_error_message(&err))),
         }
     }
 
@@ -694,9 +693,7 @@ impl PointRunner {
 
         // The baseline is the yardstick every case and every liveness probe is
         // read against. It is charged, but it is not a case.
-        let Ok(seed) = self.plan.seed_spec(0) else {
-            return run;
-        };
+        let seed = self.seed0.clone();
         match self
             .deliver(
                 seed.spec,
@@ -725,9 +722,7 @@ impl PointRunner {
         let options = &self.job.profile().l4;
         let (liveness_every, reproduce_count) = (options.liveness_every, options.reproduce_count);
         let allocated = self.shared.state.allocate_cases(job_id).unwrap_or(0);
-        let Some(boundary) = self.boundary_table() else {
-            return run;
-        };
+        let boundary = self.boundary_table();
         let mut rng = Rng::new(self.rng_seed);
         let mut latency = LatencyWindow::new();
         let mut sent_cases: u32 = 0;
@@ -1018,7 +1013,6 @@ impl PointRunner {
                 tokio::time::sleep(spacing).await;
             }
             triage.recovered = true;
-            triage.attempts += 1;
             let delivered = match self
                 .deliver(
                     spec.clone(),
@@ -1037,6 +1031,11 @@ impl PointRunner {
                 }
                 Err(HostError::Craft(_)) => return triage,
             };
+            // Only a replay that actually went out is an attempt: a `deliver`
+            // the charge or the wire refused never reached the target, so it is
+            // counted (above, as a stop) but is not a reproduction attempt
+            // (round-1 leftover).
+            triage.attempts += 1;
             let candidate = delivered
                 .sent
                 .record
@@ -1081,6 +1080,18 @@ impl PointRunner {
             }
         }
         Ok(false)
+    }
+}
+
+/// The `L4Error::Unavailable` message for a `send_recv` task that did not
+/// return a value: a panic is called out distinctly from a cancelled or aborted
+/// task, so the stop ladder's `Unavailable` reason tells the two apart (review
+/// finding M8).
+fn join_error_message(err: &tokio::task::JoinError) -> String {
+    if err.is_panic() {
+        format!("send_recv panicked: {err}")
+    } else {
+        format!("the send_recv task did not finish: {err}")
     }
 }
 
@@ -1133,7 +1144,7 @@ fn response_for(sent: &Sent) -> ProbeResponse {
 /// guard, budget and deadline as a case.
 pub struct PacketHost {
     runner: Arc<PointRunner>,
-    baseline: tokio::sync::Mutex<Option<ProbeResponse>>,
+    baseline: tokio::sync::OnceCell<ProbeResponse>,
 }
 
 impl fmt::Debug for PacketHost {
@@ -1150,7 +1161,7 @@ impl PacketHost {
     pub fn new(runner: Arc<PointRunner>) -> Self {
         Self {
             runner,
-            baseline: tokio::sync::Mutex::new(None),
+            baseline: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1164,22 +1175,18 @@ impl PacketHost {
 impl ProbeHost for PacketHost {
     fn baseline(&self) -> BoxFuture<'_, anyhow::Result<ProbeResponse>> {
         Box::pin(async move {
-            let mut cached = self.baseline.lock().await;
-            if let Some(response) = cached.as_ref() {
-                return Ok(response.clone());
-            }
-            let seed = self
-                .runner
-                .plan
-                .seed_spec(0)
-                .map_err(|err| anyhow::Error::msg(err.to_string()))?;
-            let sent = self
-                .runner
-                .send_spec(seed.spec, &seed.id, vec!["baseline".to_string()], 0)
+            let response = self
+                .baseline
+                .get_or_try_init(|| async {
+                    let seed = self.runner.seed0.clone();
+                    let sent = self
+                        .runner
+                        .send_spec(seed.spec, &seed.id, vec!["baseline".to_string()], 0)
+                        .await?;
+                    Ok::<_, anyhow::Error>(response_for(&sent))
+                })
                 .await?;
-            let response = response_for(&sent);
-            *cached = Some(response.clone());
-            Ok(response)
+            Ok(response.clone())
         })
     }
 
@@ -1208,11 +1215,14 @@ impl ProbeHost for PacketHost {
             let spec = PacketSpec {
                 layers: vec![Layer::Raw(bytes)],
             };
+            // The seed id is read off the plan's corpus, not rebuilt into a
+            // packet (review finding M8).
             let seed_id = self
                 .runner
                 .plan
-                .seed_spec(0)
-                .map(|seed| seed.id)
+                .seeds
+                .first()
+                .map(|seed| seed.id.clone())
                 .unwrap_or_default();
             let sent = self
                 .runner
@@ -1337,7 +1347,7 @@ mod tests {
         Discovery, InsertionPoint, JobCtx, L4Counters, Payload, PayloadMode, ProbeHost, ScanProfile,
     };
 
-    use super::{PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
+    use super::{join_error_message, PacketHost, PointRunner, RunnerRegistry, Shared, Timing};
     use crate::codec::hex_encode;
     use crate::discover::discover_all;
     use crate::fields::FieldPath;
@@ -1417,13 +1427,16 @@ mod tests {
             .find(|point| point.id == id)
             .expect("the field's point")
             .clone();
-        Arc::new(PointRunner::new(
-            Arc::clone(shared),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-            point,
-            plan,
-            path,
-        ))
+        Arc::new(
+            PointRunner::new(
+                Arc::clone(shared),
+                Arc::clone(job) as Arc<dyn JobCtx>,
+                point,
+                plan,
+                path,
+            )
+            .expect("the field's seed builds"),
+        )
     }
 
     /// Read an injected frame back as the packet views see it.
@@ -1862,7 +1875,9 @@ mod tests {
             assert!(!case.sent, "{label} cannot be put on the wire");
         }
         let stats = shared.state.stats(job.job_id()).expect("stats");
-        assert!(stats.cases_unsendable >= 5);
+        // Every one of the eight `ipv4.ihl` cases garbles the header length, so
+        // none decodes to an IP packet and none can be sent (review finding M8).
+        assert_eq!(stats.cases_unsendable, 8);
         assert_eq!(stats.cases_unsendable + stats.l4.cases, 8);
         assert_eq!(u64::from(job.charged()), 1 + stats.l4.cases);
     }
@@ -1927,6 +1942,32 @@ mod tests {
             .expect_err("the lane replays frame bytes only")
             .to_string()
             .contains("frame bytes only"));
+    }
+
+    /// Review finding M8: a `send_recv` task that panicked is reported with a
+    /// message distinct from one that was cancelled or aborted, so the stop
+    /// ladder's `Unavailable` reason tells the two apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn join_error_message_calls_out_a_panic() {
+        let panicked = tokio::spawn(async { panic!("send_recv blew up") })
+            .await
+            .expect_err("the task panicked");
+        assert!(panicked.is_panic());
+        assert!(
+            join_error_message(&panicked).starts_with("send_recv panicked:"),
+            "{}",
+            join_error_message(&panicked)
+        );
+
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let cancelled = handle.await.expect_err("the task was aborted");
+        assert!(!cancelled.is_panic());
+        assert!(
+            join_error_message(&cancelled).starts_with("the send_recv task did not finish:"),
+            "{}",
+            join_error_message(&cancelled)
+        );
     }
 
     /// Review finding SEC4: a replay is pinned to the point's own target, so a

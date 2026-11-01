@@ -940,6 +940,37 @@ mod tests {
         assert!(state.counters("j9").is_some());
     }
 
+    /// Review findings SEC2/Q4 (round-1 leftover): `begin_job` hands back the
+    /// markers of every job state it dropped, so the caller can forget their
+    /// runners. The ninth job returns the evicted first marker; re-beginning a
+    /// known job returns that job's previous marker and evicts nothing.
+    #[test]
+    fn begin_job_returns_forgotten_markers() {
+        let state = LaneState::new();
+        let begin = |id: &str, marker: &str| {
+            state.begin_job(
+                JobKey::new(id, marker),
+                vec![plan_fixture()],
+                points(1),
+                100,
+                20,
+                false,
+            )
+        };
+
+        for i in 1..=8 {
+            assert!(
+                begin(&format!("j{i}"), &format!("m-j{i}")).is_empty(),
+                "job {i} evicted nothing"
+            );
+        }
+        // The ninth job evicts the oldest, so its marker comes back.
+        assert_eq!(begin("j9", "m-j9"), vec!["m-j1".to_string()]);
+        // Re-beginning a known job returns its previous marker, evicting
+        // nothing: the slot is reused, not taken a second time.
+        assert_eq!(begin("j9", "m-j9-again"), vec!["m-j9".to_string()]);
+    }
+
     #[test]
     fn point_run_reactions_in_first_seen_order() {
         let run = PointRun {

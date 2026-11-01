@@ -23,7 +23,7 @@ use aitm_scan_model::{
 use futures::future::BoxFuture;
 
 use crate::codec::truncate_hex;
-use crate::host::RunnerRegistry;
+use crate::host::{PointRunner, RunnerRegistry};
 use crate::state::{Candidate, CrashRecord, PointRun};
 
 /// The crash check's catalogue id.
@@ -137,10 +137,10 @@ impl Check for CrashCheck {
         host: &'a dyn ProbeHost,
     ) -> BoxFuture<'a, Verdict> {
         Box::pin(async move {
-            let Some(runner) = self.registry.get(&host.marker(), &point.id) else {
-                return missing_runner(&point.id);
+            let (_runner, run) = match resolve_run(&self.registry, point, host).await {
+                Ok(pair) => pair,
+                Err(verdict) => return verdict,
             };
-            let run = runner.run_point().await;
             if let Some(crash) = run.crash.as_ref() {
                 return crash_verdict(&run, crash);
             }
@@ -199,10 +199,10 @@ impl Check for ReactionCheck {
         host: &'a dyn ProbeHost,
     ) -> BoxFuture<'a, Verdict> {
         Box::pin(async move {
-            let Some(runner) = self.registry.get(&host.marker(), &point.id) else {
-                return missing_runner(&point.id);
+            let (runner, run) = match resolve_run(&self.registry, point, host).await {
+                Ok(pair) => pair,
+                Err(verdict) => return verdict,
             };
-            let run = runner.run_point().await;
             if run.dry_run {
                 return dry_run_verdict(&run);
             }
@@ -212,6 +212,23 @@ impl Check for ReactionCheck {
             reaction_verdict(&run, runner.scope_entry())
         })
     }
+}
+
+/// The preamble both checks share: find the point's one runner through the
+/// registry and drive (or read) its cached run (review finding M8).
+///
+/// `Err` carries the [`missing_runner`] verdict for a point whose runner was
+/// never registered, so a caller returns it directly.
+async fn resolve_run(
+    registry: &RunnerRegistry,
+    point: &InsertionPoint,
+    host: &dyn ProbeHost,
+) -> Result<(Arc<PointRunner>, Arc<PointRun>), Verdict> {
+    let Some(runner) = registry.get(&host.marker(), &point.id) else {
+        return Err(missing_runner(&point.id));
+    };
+    let run = runner.run_point().await;
+    Ok((runner, run))
 }
 
 /// The verdict for a point whose runner was never registered: the engine
@@ -549,13 +566,16 @@ mod tests {
             .find(|point| point.id == id)
             .expect("the field's point")
             .clone();
-        Arc::new(PointRunner::new(
-            Arc::clone(shared),
-            Arc::clone(job) as Arc<dyn JobCtx>,
-            point,
-            plan,
-            path,
-        ))
+        Arc::new(
+            PointRunner::new(
+                Arc::clone(shared),
+                Arc::clone(job) as Arc<dyn JobCtx>,
+                point,
+                plan,
+                path,
+            )
+            .expect("the field's seed builds"),
+        )
     }
 
     /// A registry holding the one runner of the point under test, the way

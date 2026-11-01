@@ -227,19 +227,39 @@ impl Lane for PacketLane {
             if requested.is_empty() {
                 requested.clone_from(&self.default_fields);
             }
-            // `discover_all`'s errors already read `invalid_profile: `,
+            // `discover_all` opens a pcap handle for its privilege probe, which
+            // blocks the thread, so it runs on the blocking pool rather than a
+            // tokio worker (review findings M7/SEC5). Its inputs are cloned in:
+            // the handles are `Arc`s, and `ProfileTarget`/`ScanProfile` are
+            // `Clone`.
+            let guard = Arc::clone(&shared.guard);
+            let backend = Arc::clone(&shared.backend);
+            let seed_store = shared.seed_store.clone();
+            let target_owned = target.clone();
+            let profile_owned = profile.clone();
+            let marker = job.marker();
+            let planned = tokio::task::spawn_blocking(move || {
+                discover_all(
+                    guard.as_ref(),
+                    backend.as_ref(),
+                    seed_store.as_deref(),
+                    &target_owned,
+                    &profile_owned,
+                    &requested,
+                    &marker,
+                )
+            })
+            .await;
+            // `discover_all`'s own errors already read `invalid_profile: `,
             // `out_of_scope: ` or `lane_unavailable: `, so the D3 code the
-            // engine matches on survives the conversion to `anyhow`.
-            let (plans, discovery) = discover_all(
-                shared.guard.as_ref(),
-                shared.backend.as_ref(),
-                shared.seed_store.as_deref(),
-                target,
-                profile,
-                &requested,
-                &job.marker(),
-            )
-            .map_err(|err| anyhow!("{err}"))?;
+            // engine matches on survives the conversion to `anyhow`; a task that
+            // panicked or was cancelled is itself a `lane_unavailable:`.
+            let (plans, discovery) = match planned {
+                Ok(result) => result.map_err(|err| anyhow!("{err}"))?,
+                Err(join) => {
+                    return Err(anyhow!("lane_unavailable: discovery task failed: {join}"))
+                }
+            };
             let forgotten = shared.state.begin_job(
                 JobKey::new(job.job_id(), &job.marker()),
                 plans,
@@ -296,20 +316,16 @@ impl Lane for PacketLane {
             .ok_or_else(|| anyhow!("no target plan for point {} in job {job_id}", point.id))?;
 
         let marker = job.marker();
+        // Seed 0 is built here, once, so a seed that does not craft is refused
+        // with its D3 code rather than at send time (review finding M8); it was
+        // already validated at discovery, so this is unreachable short of a
+        // guard ceiling change mid-job.
+        let runner = PointRunner::new(Arc::clone(shared), job, point.clone(), plan, field)
+            .map_err(|err| anyhow!("{err}"))?;
         // The registry owns the point's runner: a second host for the same
         // point wraps the runner already registered, so both hosts drive one
         // idempotent run (review finding Q3).
-        let runner = self.registry.register(
-            &marker,
-            &point.id,
-            Arc::new(PointRunner::new(
-                Arc::clone(shared),
-                job,
-                point.clone(),
-                plan,
-                field,
-            )),
-        );
+        let runner = self.registry.register(&marker, &point.id, Arc::new(runner));
         Ok(Box::new(PacketHost::new(runner)))
     }
 
