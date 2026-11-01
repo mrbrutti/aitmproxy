@@ -228,14 +228,14 @@ pub fn manifest() -> &'static [PlantedVuln] {
                 // --- /ws seeds (D4) -------------------------------------
                 planted(
                     "ws-cswsh",
-                    "cswsh",
+                    "ws-cswsh",
                     "/ws",
                     "GET /ws upgrade with a foreign Origin (e.g. https://evil.example) — the vulnerable handshake accepts any Origin and sends the hello frame; patched answers 403 <p>forbidden origin</p> unless Origin is absent or equals <scheme>://<Host>",
                     "{\"type\":\"hello\"",
                 ),
                 planted(
                     "ws-input-reflection",
-                    "ws-input-reflection",
+                    "ws-injection",
                     "/ws",
                     "text frame {\"type\":\"echo\",\"msg\":\"<b>x\"} (or type chat) — the reply's html field carries msg raw in the vulnerable mode and HTML-escaped in the patched one",
                     "\"html\":\"<b>",
@@ -555,8 +555,8 @@ mod tests {
             "crlf",
             "nosqli",
             "ldapi",
-            "cswsh",
-            "ws-input-reflection",
+            "ws-cswsh",
+            "ws-injection",
             "missing-hsts",
             "missing-csp",
             "missing-nosniff",
@@ -677,6 +677,9 @@ mod tests {
         assert_eq!(by_id("auth-only-account-tab").vulnerable_path, "/account");
         assert_eq!(by_id("ws-cswsh").vulnerable_path, "/ws");
         assert_eq!(by_id("ws-input-reflection").vulnerable_path, "/ws");
+        // Issue classes are vulnerability families (the WS rows' ids stay).
+        assert_eq!(by_id("ws-cswsh").class, "ws-cswsh");
+        assert_eq!(by_id("ws-input-reflection").class, "ws-injection");
         assert_eq!(by_id("passive-missing-hsts").vulnerable_path, "/");
         assert_eq!(by_id("passive-missing-csp").class, "missing-csp");
         assert_eq!(by_id("passive-missing-nosniff").class, "missing-nosniff");
