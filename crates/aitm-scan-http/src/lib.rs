@@ -8,10 +8,30 @@
 //! shared files"). `crates/aitm/src/wire.rs` is frozen after T1a.
 
 #![forbid(unsafe_code)]
+#![deny(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 
 use aitm_scan_model::Lane;
+
+pub(crate) mod crawl;
+pub(crate) mod hash;
+pub(crate) mod host;
+pub(crate) mod lane;
+pub(crate) mod limits;
+pub(crate) mod multipart;
+pub(crate) mod mutate;
+pub(crate) mod params;
+pub(crate) mod points;
+pub(crate) mod redact;
+pub(crate) mod session;
+pub(crate) mod sitemap;
+pub(crate) mod template;
+pub(crate) mod url_norm;
+pub(crate) mod xml;
+
+#[cfg(test)]
+mod testutil;
 
 /// The HTTP lane, or `None` while the lane is unimplemented.
 ///
