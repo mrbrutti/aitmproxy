@@ -37,8 +37,16 @@ pub fn map(key: KeyEvent, mode: Mode) -> Option<Action> {
         // Read-only: back, palette, help.
         Mode::Config => panel(key),
         Mode::WireConfirm => wire_confirm(key),
-        // Any key closes help (README); `:` goes straight to the palette.
+        // The arrow, page and Home/End keys scroll the help (fix round G,
+        // G85), `:` goes straight to the palette, any other key closes it
+        // (README).
         Mode::Help => Some(match key.code {
+            KeyCode::Up => Action::Up,
+            KeyCode::Down => Action::Down,
+            KeyCode::PageUp => Action::PageUp,
+            KeyCode::PageDown => Action::PageDown,
+            KeyCode::Home => Action::Home,
+            KeyCode::End => Action::End,
             KeyCode::Char(':') => Action::PaletteOpen,
             _ => Action::Back,
         }),

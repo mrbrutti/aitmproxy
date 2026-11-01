@@ -989,6 +989,10 @@ pub struct App {
     /// A non-job push line arrived since the last `Tick` (spec D5): the flow
     /// list is stale and the next tick issues one `Refresh` for all of them.
     pub flows_dirty: bool,
+    /// The help overlay's first visible line (fix round G, G85): reset when
+    /// the overlay opens, moved by the arrow, page and Home/End keys while
+    /// it is shown, clamped by the view to the lines that do not fit.
+    pub help_scroll: u16,
 }
 
 impl App {
@@ -1054,6 +1058,7 @@ impl App {
             wire_confirm: None,
             wire_confirm_from: Mode::Flows,
             flows_dirty: false,
+            help_scroll: 0,
         }
     }
 
@@ -1445,7 +1450,7 @@ impl App {
                 self.width = w;
                 self.height = h;
             }
-            Action::Help => self.mode = Mode::Help,
+            Action::Help => self.open_help(),
             Action::Back => self.back(),
             Action::Input(c) if self.mode == Mode::Prompt(PromptKind::Confirm) => {
                 out.extend(self.answer_confirm(matches!(c, 'y' | 'Y')));
@@ -2892,8 +2897,21 @@ impl App {
         out
     }
 
+    /// Open the help overlay at its top (fix round G, G85).
+    fn open_help(&mut self) {
+        self.help_scroll = 0;
+        self.mode = Mode::Help;
+    }
+
     fn navigate(&mut self, action: &Action, out: &mut Vec<BusRequest>) {
         match self.mode {
+            Mode::Help => {
+                // The overlay scrolls over the lines its box cannot show
+                // (fix round G, G85); the view clamps the same way.
+                let max = crate::ui::overlays::help_scroll_max(self.width, self.height);
+                let page = crate::ui::overlays::help_page(self.width, self.height);
+                scroll(&mut self.help_scroll, action, max + 1, page);
+            }
             Mode::Prompt(PromptKind::Palette) => {
                 let n = self.palette_items().len();
                 if n > 0 {
@@ -3426,7 +3444,7 @@ impl App {
         match cmd {
             "" => {}
             "q" | "quit" => self.should_quit = true,
-            "help" | "?" => self.mode = Mode::Help,
+            "help" | "?" => self.open_help(),
             "import" => {
                 if rest.is_empty() {
                     self.toast(

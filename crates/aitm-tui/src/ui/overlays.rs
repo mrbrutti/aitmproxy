@@ -105,48 +105,61 @@ pub fn palette(app: &App, theme: &Theme, screen: Rect, prompt_line: Rect, buf: &
     }
 }
 
-pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
-    // 34 lines of keys and commands, the six Scan lines, a blank and the
-    // closing line, inside the box's two border rows.
-    let area = centered(screen, 110, 42);
-    let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
-    let k = |a: &str, b: &str| key_line(theme, a, b);
-    let mut lines = vec![
-        heading(theme, "Flow list"),
-        k("↑↓ j k", "move · PgUp/PgDn · g/G first/last"),
-        k(
-            "⏎ / Esc",
-            "inspect the selection · back (full screen below 120 columns)",
-        ),
-        k("Space", "quick-look the body"),
-        k("i", "arm / disarm intercept"),
-        k("a / A", "resume the targeted paused flow / resume all"),
-        k("d", "kill the targeted paused flow"),
-        k("e", "edit the paused request (raw), then ^S Apply & Resume"),
-        k(
-            "r / n",
-            "replay unchanged / compose (prefilled from the selection)",
-        ),
-        k("p / m / c", "pin host / mark / comment"),
-        k("P", "build a PoC from the selected flow"),
-        k(
-            "F / S / @",
-            "findings · scope · agent panels · :scan the Scan view (keys below)",
-        ),
-        k("1-9 0 Tab", "content-type chips"),
-        k("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
-        k(
-            "b / l / t",
-            "toggle sidebar · layout below/right · auto-select",
-        ),
-        k("y / o", "copy URL (OSC 52) · open externally"),
-        k(
-            "/",
-            "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed · & | ! ( )",
-        ),
-        k(":", "command palette — every bus tool plus:"),
-    ];
-    for (cmd, detail) in BUILTIN_COMMANDS.iter().take(14) {
+/// The flow list's help lines, as `(key, what)` pairs: the table the overlay
+/// draws under its `Flow list` heading, so [`help_line_count`] can count
+/// them without a theme.
+const FLOW_KEYS: &[(&str, &str)] = &[
+    ("↑↓ j k", "move · PgUp/PgDn · g/G first/last"),
+    (
+        "⏎ / Esc",
+        "inspect the selection · back (full screen below 120 columns)",
+    ),
+    ("Space", "quick-look the body"),
+    ("i", "arm / disarm intercept"),
+    ("a / A", "resume the targeted paused flow / resume all"),
+    ("d", "kill the targeted paused flow"),
+    ("e", "edit the paused request (raw), then ^S Apply & Resume"),
+    (
+        "r / n",
+        "replay unchanged / compose (prefilled from the selection)",
+    ),
+    ("p / m / c", "pin host / mark / comment"),
+    ("P", "build a PoC from the selected flow"),
+    (
+        "F / S / @",
+        "findings · scope · agent panels · :scan the Scan view (keys below)",
+    ),
+    ("1-9 0 Tab", "content-type chips"),
+    ("[ ]", "sidebar items (Apps, Domains, Scope, …)"),
+    (
+        "b / l / t",
+        "toggle sidebar · layout below/right · auto-select",
+    ),
+    ("y / o", "copy URL (OSC 52) · open externally"),
+    (
+        "/",
+        "filter expression: ~u ~d ~m ~s ~h ~b ~t ~a ~paused ~killed · & | ! ( )",
+    ),
+    (":", "command palette, every bus tool plus:"),
+];
+
+/// How many palette commands the help lists.
+const HELP_COMMANDS: usize = 14;
+
+/// The help overlay's closing line.
+const HELP_CLOSE: &str = " ↑↓ PgUp PgDn Home End scroll · any other key closes this help.";
+
+/// The help overlay's box width.
+const HELP_WIDTH: u16 = 110;
+
+/// Every line of the help overlay, in order: the flow list's keys and
+/// palette commands, the Scan section, a blank and the closing line.
+fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
+    let mut lines = vec![heading(theme, "Flow list")];
+    for (key, what) in FLOW_KEYS {
+        lines.push(key_line(theme, key, what));
+    }
+    for (cmd, detail) in BUILTIN_COMMANDS.iter().take(HELP_COMMANDS) {
         lines.push(Line::from(vec![
             Span::styled(format!("   :{cmd:<26}"), theme.accent()),
             Span::styled((*detail).to_string(), theme.text_tertiary()),
@@ -154,14 +167,83 @@ pub fn help(_app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
     }
     lines.push(heading(theme, "Scan"));
     for (key, what) in crate::ui::scan::HELP {
-        lines.push(k(key, what));
+        lines.push(key_line(theme, key, what));
     }
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        " Any key closes this help.",
-        theme.text_tertiary(),
-    ));
-    lines_into(buf, inner, &lines, 0);
+    lines.push(Line::styled(HELP_CLOSE, theme.text_tertiary()));
+    lines
+}
+
+/// The number of lines [`help_lines`] builds, from the same tables, so the
+/// reducer can clamp the scroll without a theme.
+fn help_line_count() -> usize {
+    1 + FLOW_KEYS.len()
+        + BUILTIN_COMMANDS.len().min(HELP_COMMANDS)
+        + 1
+        + crate::ui::scan::HELP.len()
+        + 2
+}
+
+/// The help box on a `cols`x`rows` screen: wide enough for its lines, as
+/// tall as they need up to the screen (fix round G, G89).
+fn help_box(screen: Rect, lines: usize) -> Rect {
+    centered(
+        screen,
+        HELP_WIDTH,
+        u16::try_from(lines + 2).unwrap_or(u16::MAX),
+    )
+}
+
+/// The furthest the help overlay scrolls on a `cols`x`rows` screen: the
+/// lines that do not fit inside its box (fix round G, G85). Zero when the
+/// screen is tall enough for all of them.
+pub fn help_scroll_max(cols: u16, rows: u16) -> usize {
+    let lines = help_line_count();
+    let inner = help_box(Rect::new(0, 0, cols, rows), lines)
+        .height
+        .saturating_sub(2);
+    lines.saturating_sub(usize::from(inner))
+}
+
+/// The rows the help overlay shows at once on a `cols`x`rows` screen: its
+/// page for PgUp/PgDn.
+pub fn help_page(cols: u16, rows: u16) -> usize {
+    usize::from(
+        help_box(Rect::new(0, 0, cols, rows), help_line_count())
+            .height
+            .saturating_sub(2),
+    )
+    .max(1)
+}
+
+/// The help overlay: every key and palette command, scrolled by
+/// `app.help_scroll` when the screen is too short for all of its lines,
+/// with a `more` marker on the cut edge (fix round G, G85).
+pub fn help(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
+    let lines = help_lines(theme);
+    let area = help_box(screen, lines.len());
+    let inner = boxed(theme, "aitm-tui · keys and commands", area, buf);
+    if inner.height == 0 {
+        return;
+    }
+    let max = lines.len().saturating_sub(usize::from(inner.height));
+    let scroll = usize::from(app.help_scroll).min(max);
+    lines_into(buf, inner, &lines, scroll);
+    let mut marker = |text: &str, y: u16| {
+        let row = fit(&format!(" {text}"), usize::from(inner.width));
+        buf.set_line(
+            inner.x,
+            y,
+            &Line::styled(row, theme.text_tertiary()),
+            inner.width,
+        );
+    };
+    if scroll < max {
+        marker("more ↓", inner.bottom() - 1);
+    }
+    if scroll > 0 {
+        marker("↑ more", inner.y);
+    }
 }
 
 pub fn quick_look(app: &App, theme: &Theme, screen: Rect, buf: &mut Buffer) {
@@ -796,4 +878,23 @@ pub fn agent(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
         ]));
     }
     lines_into(buf, inner, &lines, 0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fix round G, G85/G89: the line count the reducer clamps with is the
+    /// count the overlay draws, and the box is as tall as the lines need.
+    #[test]
+    fn help_line_count_matches_the_lines_drawn() {
+        let theme = Theme::new(true);
+        let lines = help_lines(&theme);
+        assert_eq!(help_line_count(), lines.len());
+        let tall = help_box(Rect::new(0, 0, 200, 50), lines.len());
+        assert_eq!(usize::from(tall.height), lines.len() + 2);
+        assert_eq!(help_scroll_max(200, 50), 0);
+        assert_eq!(help_scroll_max(100, 30), lines.len() - 28);
+        assert_eq!(help_page(100, 30), 28);
+    }
 }

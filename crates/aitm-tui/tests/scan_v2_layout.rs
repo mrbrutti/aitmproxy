@@ -20,6 +20,7 @@ use aitm_tui::caps::TermCaps;
 use aitm_tui::scan::ScanTab;
 use aitm_tui::ui::scan::HELP;
 use common::*;
+use crossterm::event::KeyCode;
 use serde_json::{json, Value};
 
 /// Every verb of the v2 surface (spec D2, D3).
@@ -395,4 +396,89 @@ fn palette_and_help_name_the_surface() {
             "{key} help names {word:?}: {entry:?}"
         );
     }
+}
+
+/// Fix round G, G85: on a terminal too short for the whole help the Scan
+/// section is off screen until the overlay is scrolled; ↑/↓, PgUp/PgDn and
+/// Home/End move it, a `more` marker sits at the cut edge, and a terminal
+/// tall enough is unchanged by the keys.
+#[test]
+fn help_overlay_scrolls_to_the_scan_section_on_a_short_terminal() {
+    let mut app = App::new(TermCaps::full(), "127.0.0.1:9090");
+    let _ = app.update(Action::Resize(100, 30));
+    let _ = connect(&mut app, TOOLS, None);
+    let _ = app.update(Action::Help);
+    assert_eq!(app.mode, Mode::Help);
+    let top = text_of(&app, 100, 30);
+    assert!(
+        line_index(&top, "│ Scan").is_none(),
+        "at 100x30 the Scan heading is below the box:\n{top}"
+    );
+    assert!(
+        line_index(&top, "more ↓").is_some() && line_index(&top, "↑ more").is_none(),
+        "the cut edge is marked below only:\n{top}"
+    );
+
+    let _ = app.update(Action::End);
+    assert_eq!(app.mode, Mode::Help, "End scrolls, it does not close");
+    let end = text_of(&app, 100, 30);
+    let heading = row_of(&end, "│ Scan");
+    assert_eq!(row_of(&end, "1 2 3 4"), heading + 1, "{end}");
+    assert!(
+        line_index(&end, "any other key closes").is_some(),
+        "End shows the last line:\n{end}"
+    );
+    assert!(
+        line_index(&end, "↑ more").is_some() && line_index(&end, "more ↓").is_none(),
+        "the cut edge is marked above only:\n{end}"
+    );
+
+    let _ = app.update(Action::Home);
+    assert_eq!(text_of(&app, 100, 30), top, "Home is back at the top");
+    let _ = app.update(Action::PageDown);
+    assert_eq!(text_of(&app, 100, 30), end, "one page down is the end here");
+    let _ = app.update(Action::PageUp);
+    assert_eq!(text_of(&app, 100, 30), top);
+    let _ = app.update(Action::Down);
+    let one = text_of(&app, 100, 30);
+    assert_eq!(
+        line_index(&one, "Space"),
+        line_index(&top, "Space").map(|r| r - 1),
+        "Down moves the lines up one row:\n{one}"
+    );
+    let _ = app.update(Action::Up);
+    assert_eq!(text_of(&app, 100, 30), top);
+
+    // Reopening starts at the top again.
+    let _ = app.update(Action::End);
+    let _ = app.update(Action::Back);
+    let _ = app.update(Action::Help);
+    assert_eq!(
+        text_of(&app, 100, 30),
+        top,
+        "the overlay reopens at the top"
+    );
+
+    // The keys reach the overlay through the key map too.
+    let _ = app.update(Action::Back);
+    let _ = app.update(Action::Help);
+    let keyed = aitm_tui::keys::map(press(KeyCode::End), Mode::Help);
+    assert_eq!(keyed, Some(Action::End));
+    let _ = app.update(Action::End);
+    assert_eq!(text_of(&app, 100, 30), end);
+
+    // A tall terminal shows everything and the keys change nothing.
+    let _ = app.update(Action::Back);
+    let _ = app.update(Action::Resize(200, 50));
+    let _ = app.update(Action::Help);
+    let tall = text_of(&app, 200, 50);
+    assert!(line_index(&tall, "│ Scan").is_some());
+    assert!(
+        !tall.contains("more ↓") && !tall.contains("↑ more"),
+        "{tall}"
+    );
+    let _ = app.update(Action::End);
+    assert_eq!(text_of(&app, 200, 50), tall);
+    let _ = app.update(Action::PageDown);
+    assert_eq!(text_of(&app, 200, 50), tall);
 }
