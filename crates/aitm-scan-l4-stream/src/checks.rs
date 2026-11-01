@@ -37,14 +37,14 @@ use crate::denylist;
 use crate::grammar::{self, Grammar};
 use crate::host::{HostError, LIVENESS_PAYLOAD};
 use crate::mutate::schedule::Schedule;
-use crate::mutate::structure::Case;
+use crate::mutate::structure::{affects_framing, Case};
 use crate::oracle;
 use crate::spec::GrammarKind;
 use crate::state::{
     lock, DiscoveredPoint, JobState, LaneState, MAX_CASES_PER_JOB, MAX_PRELUDE, RECOVERY_WINDOW,
     REPRODUCE_SPACING,
 };
-use crate::tree::FieldPath;
+use crate::tree::{FieldPath, Node};
 
 /// The verdict `detail` bound outside a dry run (spec S6.5).
 const MAX_DETAIL: usize = 2048;
@@ -217,6 +217,9 @@ pub struct Campaign {
     pub skipped_too_large: u32,
     /// How often the guard's injection rate made the host wait.
     pub rate_waits: u32,
+    /// Latency evaluations the F4 guard skipped: cases that leave the frame
+    /// incomplete, whose delay is the peer's framing timeout.
+    pub latency_skipped_framing: u32,
     /// The confirmed crash, if any.
     pub crash: Option<Finding>,
     /// The confirmed parser fault, if any.
@@ -239,6 +242,7 @@ impl fmt::Debug for Campaign {
             .field("skipped_denylisted", &self.skipped_denylisted)
             .field("skipped_too_large", &self.skipped_too_large)
             .field("rate_waits", &self.rate_waits)
+            .field("latency_skipped_framing", &self.latency_skipped_framing)
             .field("crash", &self.crash)
             .field("parser_fault", &self.parser_fault)
             .field("latency", &self.latency)
@@ -259,6 +263,7 @@ impl Campaign {
             skipped_denylisted: 0,
             skipped_too_large: 0,
             rate_waits: 0,
+            latency_skipped_framing: 0,
             crash: None,
             parser_fault: None,
             latency: None,
@@ -376,6 +381,9 @@ async fn run(
         job.points_total.load(Ordering::SeqCst),
         host.budget_left(),
     );
+    // The point's own node, kept for the latency path's framing guard (F4);
+    // the schedule takes the tree.
+    let node = tree.get(&path).cloned();
     let schedule = Schedule::new(
         tree,
         grammar.spec(),
@@ -405,6 +413,7 @@ async fn run(
         job,
         dp: &dp,
         grammar: &grammar,
+        node,
         rng_seed,
         reproduce: profile.l4.reproduce_count.max(1),
         alive: true,
@@ -472,6 +481,9 @@ struct Runner<'a> {
     job: &'a Arc<JobState>,
     dp: &'a DiscoveredPoint,
     grammar: &'a Arc<dyn Grammar>,
+    /// The node the point names, when the seed's tree has one. Only the
+    /// latency path reads it, for the F4 framing guard.
+    node: Option<Node>,
     rng_seed: u64,
     reproduce: u32,
     /// The last known liveness of the target, which becomes a finding's
@@ -792,6 +804,19 @@ impl Runner<'_> {
         campaign: &mut Campaign,
     ) -> bool {
         if campaign.latency.is_some() {
+            return false;
+        }
+        // F4: a case that leaves the frame incomplete is answered when the
+        // peer's framing timeout expires, so its latency says nothing about
+        // the peer's processing. The whole rule is skipped, the confirming
+        // repeat included. A point with no node in the tree has no cases at
+        // all, so the `None` arm is never the one that matters.
+        if self
+            .node
+            .as_ref()
+            .is_some_and(|node| affects_framing(node, &case.chain))
+        {
+            campaign.latency_skipped_framing = campaign.latency_skipped_framing.saturating_add(1);
             return false;
         }
         let Some(median) = self.job.latency_median() else {
@@ -1163,7 +1188,7 @@ fn detail_base(campaign: &Campaign, job: &JobState, dp: Option<&DiscoveredPoint>
         "l4_stream {grammar} {endpoint} point={path} cases={sent}/{planned} \
          skipped_denylisted={denylisted} skipped_too_large={too_large} \
          liveness_probes={probes} liveness_failures={failures} rate_waits={waits} \
-         stop={stop} selection={selection}",
+         latency_skipped_framing={skipped_framing} stop={stop} selection={selection}",
         sent = campaign.cases_sent,
         planned = campaign.cases_planned,
         denylisted = campaign.skipped_denylisted,
@@ -1171,6 +1196,7 @@ fn detail_base(campaign: &Campaign, job: &JobState, dp: Option<&DiscoveredPoint>
         probes = job.liveness_probes.load(Ordering::SeqCst),
         failures = job.liveness_failures.load(Ordering::SeqCst),
         waits = campaign.rate_waits,
+        skipped_framing = campaign.latency_skipped_framing,
         stop = campaign.stopped.token(),
     )
 }
@@ -1285,7 +1311,10 @@ fn latency_meta() -> CheckMeta {
         wants_traits: None,
         targets_session: false,
         cwe: Some(400),
-        description: "One mutated message took more than five times the median reply time, twice."
+        description: "One mutated message took more than five times the median reply time, twice. \
+                      Cases that leave the frame incomplete — a mutated length or count, a \
+                      removed delimiter, an over-long varint — are excluded, because the delay \
+                      such a case measures is the peer's framing timeout."
             .to_string(),
         remediation: None,
         origin: CheckOrigin::Native,
@@ -1682,7 +1711,8 @@ mod tests {
             verdict.detail,
             "l4_stream tlv 127.0.0.1:9000/tcp point=payload cases=20/20 skipped_denylisted=0 \
              skipped_too_large=0 liveness_probes=0 liveness_failures=0 rate_waits=0 \
-             stop=completed selection=inferred(u16 be at 0, counts body) clean"
+             latency_skipped_framing=0 stop=completed selection=inferred(u16 be at 0, counts \
+             body) clean"
         );
         assert_eq!(
             host.calls().len(),
@@ -1868,6 +1898,38 @@ mod tests {
                 .contains("latency outlier 80 ms vs median 10 ms"),
             "{detail}",
             detail = verdict.detail
+        );
+    }
+
+    /// F4: a case whose declared length no longer matches the bytes sent is
+    /// an incomplete frame by construction, so the peer answers only when its
+    /// own framing timeout expires. That delay is not a processing anomaly:
+    /// on a framing node the latency oracle is skipped — no confirming repeat
+    /// is sent — and the skips are counted on the detail line.
+    #[tokio::test]
+    async fn latency_rule_skips_framing_cases() {
+        let job = NullJob::new("m1", 20);
+        let (state, point) = lane_state_with(&job, "length");
+        let job_state = state.job_by_marker("m1").expect("the job was recorded");
+        let mut script: Vec<Result<ProbeResponse, HostError>> =
+            (0..13).map(|_| clean(10)).collect();
+        script.push(clean(300));
+        script.extend((0..7).map(|_| clean(10)));
+        let host = FakeHost::new("m1", job.profile.clone(), Some(job_state)).script(script);
+
+        let verdict = checks(Arc::clone(&state))[2].run(&point.point, &host).await;
+
+        assert_eq!(verdict.outcome, Outcome::Clean);
+        assert!(verdict.evidence.l4.is_none());
+        assert!(
+            verdict.detail.contains("latency_skipped_framing=20"),
+            "{detail}",
+            detail = verdict.detail
+        );
+        assert_eq!(
+            host.case_calls().len(),
+            20,
+            "the twenty planned cases and no confirming repeat"
         );
     }
 

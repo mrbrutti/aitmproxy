@@ -101,6 +101,58 @@ pub fn structure_cases(
     out
 }
 
+/// The mutators whose cases leave the frame incomplete by construction: the
+/// declared size, the separator or the continuation no longer matches the
+/// bytes that were sent (spec S6.4).
+const FRAMING_MUTATORS: [&str; 5] = [
+    "len_desync",
+    "count_mismatch",
+    "delim_remove",
+    "delim_dup",
+    "varint_overlong",
+];
+
+/// Whether a case on `node` built by `chain` leaves the frame incomplete,
+/// which the latency oracle must not time (spec S6.1 as refined by F4).
+///
+/// A peer that frames on a declared length, an element count, a separator or
+/// a varint continuation has no way to know the message ended: it waits for
+/// the rest until its own idle timeout and only then answers. The latency
+/// that measures is the peer's framing timeout, not its processing, so the
+/// S6.2 rule would read every such case as an outlier on a target that is
+/// behaving exactly as its protocol says.
+///
+/// True when any of:
+///
+/// * the node carries a `len` or `count` relation — a byte-level flip of
+///   those bytes desyncs the frame just as `len_desync` does, so the node
+///   decides this on its own, whatever the chain;
+/// * the node is a `delim` or a `varint`, the other two fields framing
+///   depends on;
+/// * any entry of `chain` names one of [`FRAMING_MUTATORS`], which desync a
+///   frame from a node elsewhere in the message. A chain entry names its
+///   mutator up to the first `(`, so `Splice(len_desync)` is not one of them,
+///   and `delim_inject` — which writes into the text *before* a separator and
+///   leaves the framing intact — is deliberately off the list.
+#[must_use]
+pub fn affects_framing(node: &Node, chain: &[String]) -> bool {
+    if matches!(
+        node.relation,
+        Some(Relation::Len { .. } | Relation::Count { .. })
+    ) {
+        return true;
+    }
+    if matches!(node.kind, FieldKind::Delim | FieldKind::Varint) {
+        return true;
+    }
+    chain.iter().any(|entry| {
+        let name = entry
+            .split_once('(')
+            .map_or(entry.as_str(), |(name, _rest)| name);
+        FRAMING_MUTATORS.contains(&name)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The mutators
 // ---------------------------------------------------------------------------
@@ -780,11 +832,12 @@ fn five_byte_varint(value: i64) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::denylist;
-    use crate::mutate::structure::{structure_cases, Case};
+    use crate::grammar::by_kind;
+    use crate::mutate::structure::{affects_framing, structure_cases, Case};
     use crate::spec::{
         Endian, FieldKind, FieldSpec, GrammarKind, LenOf, MessageSpec, Relation, Transport,
     };
-    use crate::tree::{self, FieldPath, Tree};
+    use crate::tree::{self, FieldPath, Node, Tree};
 
     /// The S2 Modbus example, with every function code the T10 speaker
     /// accepts in `one_of` — the write codes included, so the denylist has
@@ -883,6 +936,118 @@ message:
 
     fn chains(cases: &[Case]) -> Vec<String> {
         cases.iter().map(|case| case.chain.concat()).collect()
+    }
+
+    /// A node with no relation and no framing kind, for the clauses that
+    /// must read the kind alone.
+    fn bare(kind: FieldKind) -> Node {
+        Node {
+            path: FieldPath::new("x"),
+            kind,
+            bytes: vec![0x00],
+            children: Vec::new(),
+            relation: None,
+            mutable: true,
+            secret: false,
+            relation_broken: false,
+        }
+    }
+
+    /// F4: the latency oracle must not judge a case that leaves the frame
+    /// incomplete, because the delay it measures is the peer's framing
+    /// timeout. The predicate decides that from the node and the chain.
+    #[test]
+    fn affects_framing_reads_node_and_chain() {
+        let modbus = modbus_tree();
+        let length = modbus
+            .get(&FieldPath::new("header.length"))
+            .expect("the MBAP frame has a length field");
+        let address = modbus
+            .get(&FieldPath::new("pdu.address"))
+            .expect("the MBAP frame has a PDU address");
+
+        // (a) a `len` relation: any mutation of those bytes, byte-level ones
+        // included, makes the declared length disagree with what was sent.
+        assert!(affects_framing(length, &[]));
+        assert!(affects_framing(
+            length,
+            &["BitFlip(header.length,@13)".to_string()]
+        ));
+        assert!(affects_framing(
+            length,
+            &["len_desync(header.length,+1)".to_string()]
+        ));
+
+        // A plain field under a byte-level chain still gets timed.
+        assert!(!affects_framing(address, &[]));
+        assert!(!affects_framing(
+            address,
+            &["BytesInsert(pdu.address,@1,+3)".to_string()]
+        ));
+
+        // (c) the chain names a framing mutator, whatever the node is.
+        for chain in [
+            "len_desync(x,+1)",
+            "count_mismatch(x,+1)",
+            "delim_remove(x)",
+            "delim_dup(x)",
+            "varint_overlong(x,max)",
+        ] {
+            assert!(
+                affects_framing(address, &[chain.to_string()]),
+                "chain {chain}"
+            );
+        }
+        // A chain entry that merely mentions one is not one.
+        assert!(!affects_framing(
+            address,
+            &[
+                "BytesInsert(pdu.address,@1,+3)".to_string(),
+                "Splice(len_desync)".to_string()
+            ]
+        ));
+        // `delim_inject` writes into the text before a delimiter and leaves
+        // the framing intact, so it is not on the list.
+        assert!(!affects_framing(
+            address,
+            &["delim_inject(pdu.address,\"\\r\\n\")".to_string()]
+        ));
+
+        // (a) a `count` relation.
+        let resp = resp_tree();
+        let count = resp
+            .get(&FieldPath::new("count"))
+            .expect("the RESP array has an element count");
+        assert!(affects_framing(count, &[]));
+
+        // (b) a delimiter node, which carries no relation of its own.
+        let crlf = resp
+            .get(&FieldPath::new("args[0].crlf"))
+            .expect("the first bulk string has a CRLF");
+        assert_eq!(crlf.relation, None);
+        assert!(affects_framing(crlf, &[]));
+        assert!(affects_framing(&bare(FieldKind::Delim), &[]));
+
+        // (b) a varint node.
+        let mqtt = by_kind(GrammarKind::Mqtt)
+            .parse(&[0xc0, 0x00])
+            .expect("the PINGREQ packet parses");
+        let remaining = mqtt
+            .get(&FieldPath::new("fixed.remaining_length"))
+            .expect("the fixed header has a remaining length");
+        assert_eq!(remaining.kind, FieldKind::Varint);
+        assert!(affects_framing(remaining, &[]));
+        assert!(affects_framing(&bare(FieldKind::Varint), &[]));
+
+        // Nothing else is excluded.
+        assert!(!affects_framing(
+            &bare(FieldKind::U16 { endian: Endian::Be }),
+            &[]
+        ));
+        assert!(!affects_framing(
+            &bare(FieldKind::Bytes { size: None }),
+            &[]
+        ));
     }
 
     #[test]
