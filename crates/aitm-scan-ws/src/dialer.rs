@@ -696,11 +696,16 @@ impl WsConn {
     ///
     /// `cancelled` is polled at least every 50 ms so a cancelled job stops
     /// waiting; `deadline` bounds the window the same way.
+    ///
+    /// The `Sync` bound on `cancelled` is load-bearing: it is held across this
+    /// method's awaits, and a bare `&dyn Fn` is not `Sync`, so without it this
+    /// future is not `Send` and no caller can return it as the `BoxFuture` the
+    /// `ProbeHost` trait requires (task 7).
     pub async fn collect(
         &mut self,
         window: Duration,
         deadline: Instant,
-        cancelled: &dyn Fn() -> bool,
+        cancelled: &(dyn Fn() -> bool + Sync),
     ) -> CollectOutcome {
         let window_end = Instant::now() + window;
         let first = self.recorded.len();
