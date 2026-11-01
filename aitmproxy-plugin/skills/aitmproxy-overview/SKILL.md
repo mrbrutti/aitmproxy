@@ -1,6 +1,6 @@
 ---
 name: aitmproxy-overview
-description: Drive aitmproxy — the intercepting HTTP/WebSocket proxy for AUTHORIZED security testing — end to end over MCP. Use when the user wants to inspect captured web traffic, intercept and mutate live requests or responses, replay or craft requests, or build reproducible PoCs and record findings against an engagement they are authorized to test. Explains the capture → intercept → replay → findings workflow, names the key MCP tools per stage, the scope gating and agent policy, the raw L4 (TCP/UDP) packet family and its status/scope/gate rules when the core enables it, and how output renders across hosts.
+description: Drive aitmproxy — the intercepting HTTP/WebSocket proxy for AUTHORIZED security testing — end to end over MCP. Use when the user wants to inspect captured web traffic, intercept and mutate live requests or responses, replay or craft requests, or build reproducible PoCs and record findings against an engagement they are authorized to test. Explains the capture → intercept → replay → findings workflow, names the key MCP tools per stage, the scope gating and agent policy, the per-host decryption model (Scope is the decryption list; every CONNECT is a row), the raw L4 (TCP/UDP) packet family and its status/scope/gate rules when the core enables it, and how output renders across hosts.
 ---
 
 # aitmproxy overview
@@ -19,6 +19,37 @@ authorized to test. Active tools (`flow.replay`, `request.send`, `ws.send`,
 target host is in the active scope (`scope.list` / `scope.add`). Narrowing scope
 is always allowed; widening from an agent frontend is refused unless the operator
 enabled it. Never use these tools to reach systems outside your authorization.
+
+### Scope is the decryption list
+
+The proxy decrypts TLS only for hosts in Scope and tunnels every other HTTPS
+connection untouched; an empty Scope decrypts nothing. `proxy.status` then
+reports `decrypt.decrypting: false` and `decrypt.advice: "Nothing is decrypted
+until a host is in Scope."` — show that sentence verbatim. Every CONNECT is a
+row in `flow.table` / `flow.get` / `flow.detail` and on the `flow.subscribe`
+push, with the same keys everywhere:
+
+- `tunnel`: `decrypted` (its inner requests are their own rows), `passthrough`
+  (relayed byte for byte; `bytes_up` / `bytes_down` and `duration_ms` once it
+  closes) or `failed` (`status` null); null on a row that is not a tunnel.
+- `tunnel_reason`: `out_of_scope` or `pinned` for a passthrough; for a failure
+  `client_rejected_certificate` (the client refused the proxy's certificate —
+  the usual cause of an empty capture on an untrusted CA), `client_closed`,
+  `client_tls_error`, `upstream_unreachable`, `upstream_tls_failed` or
+  `protocol_error`. A tunnel relays TLS only: a CONNECT whose first byte inside
+  the tunnel is not a TLS record is refused as `failed` / `protocol_error` and
+  nothing is relayed.
+- `passive`: true for plain HTTP to a host outside Scope. It is shown, but
+  nothing acts on it: no script hook, breakpoint rule, mutation or map rule.
+
+`scope.add` decrypts the next connection to that host and `scope.remove` tunnels
+it, live, with no restart; connections already open are left alone. A row with
+`tunnel: passthrough` and `tunnel_reason: out_of_scope`, or with `passive: true`,
+names the host to offer for `scope.add` (its `authority` without the port); a
+`pinned` row does not — `tls.passthrough` pins win over Scope and are lifted
+with `tls.passthrough.remove`. Do not count tunnel rows as requests: a decrypted
+tunnel shares its `authority` with its inner rows. The agent gate on `scope.add`
+is unchanged (below).
 
 ### Agent policy — the operator's governor
 
@@ -44,13 +75,16 @@ The agent cannot change its own policy or approve its own requests. Check
 
 ## The workflow and its tools
 
-1. **Scope first.** `scope.list` to see what is in bounds; `scope.add` /
-   `scope.remove` to adjust (narrowing always allowed). `tls.passthrough.list`
-   shows hosts tunnelled without decryption.
+1. **Scope first.** `scope.list` to see what is in bounds and decrypted;
+   `scope.add` / `scope.remove` to adjust (narrowing always allowed; both apply
+   to new connections). `tls.passthrough.list` shows hosts pinned as tunnelled
+   even when they are in Scope.
 2. **Capture.** `flow.table` for a rendered/tabular overview of captured flows;
    `flow.list` for raw ids; `flow.detail --id` for one flow's headers, bodies,
    timing and edit state. `flow.subscribe` streams live flows. `proxy.status`
-   shows listening state, armed interception, paused count and flow count.
+   shows listening state, armed interception, paused count, flow count and the
+   `decrypt` state (whether anything is decrypted, and the advice to show when
+   nothing is).
 3. **Intercept & mutate.** `flow.intercept` arms parking (global, or by rules);
    a parked flow waits for `flow.resume` (forward, possibly mutated) or
    `flow.kill` (reset / 429 / 503). `flow.mutate` edits a flow's request (or the
