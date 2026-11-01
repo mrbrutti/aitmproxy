@@ -168,6 +168,11 @@ actor EmbeddedCore {
         // that does not embed the capture extension (a development build sharing this
         // defaults domain with a signed one) never opens the gate, whatever the key says.
         let captureEnabled = (defaults.object(forKey: "capture.enabled") as? Bool ?? false) && CaptureExtension.isEmbedded(inApp: Bundle.main.bundleURL)
+        // Settings ▸ Proxy's system-proxy choices (spec §D13): "Set system proxy at launch"
+        // and the "Bypass hosts" field, read fresh here too so Apply & Restart Core applies
+        // them; they ride the per-launch config as the top-level `system_proxy:` block.
+        let systemProxyAuto = defaults.object(forKey: SystemProxyPreferences.autoKey) as? Bool ?? false
+        let systemProxyBypass = SystemProxyPreferences.bypassHosts(defaults.string(forKey: SystemProxyPreferences.bypassKey) ?? "")
         // The operator's persisted scope rides the per-launch config, read fresh every spawn
         // so relaunch, crash-restart and Apply & Restart Core all keep it; nothing is pushed
         // over the bus (D3). `load` already dropped anything unsafe to emit.
@@ -198,7 +203,9 @@ actor EmbeddedCore {
                 endpointFile: endpointURL,
                 sslInsecure: sslInsecure,
                 captureEnabled: captureEnabled,
-                scopeHosts: scopeHosts
+                scopeHosts: scopeHosts,
+                systemProxyAuto: systemProxyAuto,
+                systemProxyBypass: systemProxyBypass
             )
             try EmbeddedCoreLaunch.writeConfig(config.yaml(), to: configURL)  // yaml() escapes/validates spliced paths
         } catch {

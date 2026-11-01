@@ -122,6 +122,10 @@ final class EmbeddedCoreController {
             // 8080 matches Settings ▸ Proxy's @AppStorage default and EmbeddedCore's default port.
             let appliedPort = defaults.object(forKey: "proxy.preferredPort") as? Int ?? 8080
             let appliedVerifyTLS = defaults.object(forKey: "proxy.verifyUpstreamTLS") as? Bool ?? true
+            // The two system-proxy keys, with the defaults EmbeddedCore.spawn() uses; the bypass
+            // field is kept as typed so the dirty-check compares what the operator sees.
+            let appliedSystemProxyAuto = defaults.object(forKey: SystemProxyPreferences.autoKey) as? Bool ?? false
+            let appliedSystemProxyBypass = defaults.string(forKey: SystemProxyPreferences.bypassKey) ?? ""
             update {
                 $0.endpoint = runtime.endpoint
                 $0.status = .ready
@@ -130,6 +134,8 @@ final class EmbeddedCoreController {
                 $0.label = "Embedded core · proxy \(proxy)"
                 $0.appliedPort = appliedPort
                 $0.appliedVerifyUpstreamTLS = appliedVerifyTLS
+                $0.appliedSystemProxyAuto = appliedSystemProxyAuto
+                $0.appliedSystemProxyBypass = appliedSystemProxyBypass
             }
             // Point the live bus client at the core we just brought up.
             bus.useEmbeddedEndpoint(runtime.endpoint)

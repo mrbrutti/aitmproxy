@@ -80,6 +80,11 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
     /// a non-embedded core and until the embedded core reports ready.
     public var appliedPort: Int?
     public var appliedVerifyUpstreamTLS: Bool?
+    /// The Settings ▸ Proxy system-proxy values this embedded core was last started with
+    /// (`SystemProxyPreferences.autoKey` / `.bypassKey`, the bypass field as typed), for the
+    /// same Apply & Restart dirty-check. nil for a non-embedded core and until ready.
+    public var appliedSystemProxyAuto: Bool?
+    public var appliedSystemProxyBypass: String?
 
     public init(
         id: CoreID = CoreID(),
@@ -89,7 +94,9 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
         label: String,
         proxyAddress: String? = nil,
         appliedPort: Int? = nil,
-        appliedVerifyUpstreamTLS: Bool? = nil
+        appliedVerifyUpstreamTLS: Bool? = nil,
+        appliedSystemProxyAuto: Bool? = nil,
+        appliedSystemProxyBypass: String? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -99,6 +106,8 @@ public struct CoreConnection: Identifiable, Hashable, Sendable {
         self.proxyAddress = proxyAddress
         self.appliedPort = appliedPort
         self.appliedVerifyUpstreamTLS = appliedVerifyUpstreamTLS
+        self.appliedSystemProxyAuto = appliedSystemProxyAuto
+        self.appliedSystemProxyBypass = appliedSystemProxyBypass
     }
 }
 
