@@ -41,7 +41,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use aitm_proto_l4::flow::L4FlowStore;
-use aitm_proto_l4::guard::{interface_covers, L4Guard, ANY_INTERFACE};
+use aitm_proto_l4::guard::{interface_covers, L4Guard, L4GuardError, ANY_INTERFACE};
 use aitm_proto_l4::types::{IpCidr, L4Action, L4Capability, L4Direction, L4ScopeEntry, L4Target};
 use aitm_scan_model::{
     Discovery, InsertionPoint, JobCtx, L4Counters, L4Transport, Lane, LaneKind, ProbeHost,
@@ -163,10 +163,15 @@ impl L4StreamLane {
     /// runs **before** the guard (amendment A1, C18), so a loopback listener of
     /// the core's own is refused even when the operator scoped `127.0.0.0/8`.
     ///
+    /// An injection-rate refusal is not a refusal here: it proves the entry
+    /// grants `Inject` at this destination, which is all the preview asks,
+    /// and the permit it would have minted is dropped unused anyway. Pacing
+    /// against the rate cap is the campaign's job (spec S5.4, F11).
+    ///
     /// # Errors
     ///
     /// `scan: refused_l4: ...` when L4 is disabled; `scan: out_of_scope: ...`
-    /// for one of the core's own listener ports or any guard refusal.
+    /// for one of the core's own listener ports or any other guard refusal.
     pub(crate) fn authorise_preview(
         &self,
         ip: IpAddr,
@@ -183,25 +188,30 @@ impl L4StreamLane {
                 format!("scan: out_of_scope: {ip}:{port} is one of the core's own listener ports")
             )));
         }
-        let permit = guard
-            .check(
-                L4Action::Inject,
-                &L4Target {
-                    interface: ANY_INTERFACE.to_string(),
-                    direction: L4Direction::Outbound,
-                    dst: Some(ip),
-                    dst_port: Some(port),
-                    proto: proto_of(proto),
-                },
-            )
-            .map_err(|error| {
-                anyhow!(refused_preview(
+        match guard.check(
+            L4Action::Inject,
+            &L4Target {
+                interface: ANY_INTERFACE.to_string(),
+                direction: L4Direction::Outbound,
+                dst: Some(ip),
+                dst_port: Some(port),
+                proto: proto_of(proto),
+            },
+        ) {
+            // The permit opens nothing: it is minted to ask the question and
+            // dropped with the answer.
+            Ok(permit) => drop(permit),
+            // Authorised, and paced: the destination is in scope with the
+            // capability, and the bucket is a campaign-time concern (F11).
+            Err(L4GuardError::InjectionRateExceeded { .. }) => {}
+            Err(error) => {
+                return Err(anyhow!(refused_preview(
                     ip,
                     port,
                     format!("scan: out_of_scope: {error}")
-                ))
-            })?;
-        drop(permit);
+                )))
+            }
+        }
         Ok(Self::scope_entry_for(guard, ip, port))
     }
 
@@ -941,6 +951,44 @@ mod tests {
             selection,
             "inferred 2-byte be length at offset 0 counting body only"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // S5.2 step 1 / F11: a rate refusal at the preview is not a scope refusal
+    // -----------------------------------------------------------------
+
+    /// The preview asks the guard one question — may this lane inject here —
+    /// and drops the permit unused. An entry whose injection rate refuses
+    /// still answers that question with yes: it names the destination, the
+    /// capability and the direction, so discovery goes on and the pacing is
+    /// the campaign's problem, not discovery's (spec S5.4, F11).
+    #[tokio::test]
+    async fn a_rate_refused_preview_still_authorises() {
+        let mut drained = entry(
+            Ipv4Addr::new(127, 0, 0, 0),
+            8,
+            ANY_INTERFACE,
+            L4Capability::Inject,
+        );
+        drained.inject_rate = RateCap { pps: 0, burst: 0 };
+        let lane = dry_lane(Some(guard_over(vec![drained])));
+        let job = TestJob::with_seeds(&["0003616263", "0001ff"]);
+
+        let found = lane
+            .discover(&one_target("127.0.0.1", 9000), &job)
+            .await
+            .expect("a rate refusal is pacing, not a refusal to authorise");
+
+        assert_eq!(found.nodes.len(), 1);
+        assert!(!found.points.is_empty());
+        // The entry that authorised it is the one the evidence will name.
+        let state = lane.state().get("scan-20").expect("the job's state");
+        let point = lock(&state.points)
+            .values()
+            .next()
+            .cloned()
+            .expect("a discovered point");
+        assert_eq!(point.scope_entry, "127.0.0.0/8:0-65535 * outbound");
     }
 
     // -----------------------------------------------------------------

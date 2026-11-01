@@ -50,12 +50,23 @@ use crate::L4_DISABLED;
 /// through the one channel it has.
 pub const LIVENESS_PAYLOAD: &str = "liveness";
 
-/// How many times one exchange is retried after the guard's injection-rate
-/// refusal before it becomes an error (spec S5.4).
-const MAX_RATE_WAITS: u32 = 10;
+/// The shortest one rate-refusal retry sleeps (spec S5.4, F11).
+///
+/// The guard's `retry_after` can be a fraction of a millisecond; sleeping it
+/// exactly would spin the lane against a bucket eight concurrent checks are
+/// draining, so one wait is never shorter than this.
+const MIN_RATE_SLEEP: Duration = Duration::from_millis(10);
 
 /// The longest one rate-refusal retry sleeps (spec S5.4).
 const MAX_RATE_SLEEP: Duration = Duration::from_secs(1);
+
+/// How many times a run of consecutive rate refusals doubles its wait before
+/// it holds steady (spec S5.4, F11).
+///
+/// `retry_after` is the bucket's own refill time, so waiting far past it only
+/// burns the job's deadline: the backoff exists to stop a crowd of checks
+/// hammering one bucket, and four refill windows is enough for that.
+const RATE_BACKOFF_DOUBLINGS: u32 = 2;
 
 /// Why a probe sent nothing, or could not finish (spec S5.6).
 ///
@@ -324,11 +335,44 @@ impl StreamHost {
         }
     }
 
+    /// Wait out one injection-rate refusal (spec S5.4, F11).
+    ///
+    /// The guard's rate cap says *when*, not *no*: the bucket this job shares
+    /// with its other checks is empty for `retry_after`, and the lane's part
+    /// is to pace itself. So a rate refusal is never turned into a refusal of
+    /// its own — the wait runs until the job's deadline, and the deadline (or
+    /// a cancellation) is what the campaign is finally told.
+    ///
+    /// One wait is `max(retry_after, MIN_RATE_SLEEP)`, doubled for each of the
+    /// first [`RATE_BACKOFF_DOUBLINGS`] consecutive refusals, never longer
+    /// than [`MAX_RATE_SLEEP`], and — like every other await here — bounded by
+    /// `min(remaining to deadline, MAX_AWAIT)`.
+    async fn wait_out_rate(&self, retry_after: Duration, waits: u32) -> Result<(), HostError> {
+        if self.job.cancelled() {
+            return Err(HostError::Cancelled);
+        }
+        let remaining = self
+            .job
+            .deadline()
+            .saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(HostError::Deadline);
+        }
+        let doublings = waits.saturating_sub(1).min(RATE_BACKOFF_DOUBLINGS);
+        let paced = retry_after
+            .max(MIN_RATE_SLEEP)
+            .saturating_mul(1u32 << doublings)
+            .min(MAX_RATE_SLEEP);
+        tokio::time::sleep(paced.min(remaining).min(MAX_AWAIT)).await;
+        Ok(())
+    }
+
     /// One exchange on one fresh connection, with the S5.4 retry rules.
     ///
-    /// A rate refusal sleeps `min(retry_after, 1 s)` and retries, at most
-    /// [`MAX_RATE_WAITS`] times; a spent permit (`CountExceeded`) is re-minted
-    /// once. Any other guard refusal is final.
+    /// A rate refusal is pacing, not a refusal: it is waited out and retried
+    /// for as long as the job has time (F11), so the only way out of that
+    /// wait is the deadline or a cancellation. A spent permit
+    /// (`CountExceeded`) is re-minted once. Any other guard refusal is final.
     async fn run_exchange(
         &self,
         messages: &[Vec<u8>],
@@ -358,16 +402,11 @@ impl StreamHost {
             match result {
                 Ok(steps) => return Ok(steps),
                 Err(ClientError::Guard(L4GuardError::InjectionRateExceeded { retry_after })) => {
-                    rate_waits += 1;
+                    rate_waits = rate_waits.saturating_add(1);
                     self.state.rate_waits.fetch_add(1, Ordering::SeqCst);
-                    if rate_waits > MAX_RATE_WAITS {
-                        return Err(self.guard_refusal(guard_message(
-                            &L4GuardError::InjectionRateExceeded { retry_after },
-                        )));
-                    }
                     // Hold no connection permit while waiting out the rate cap.
                     drop(connection);
-                    tokio::time::sleep(retry_after.min(MAX_RATE_SLEEP)).await;
+                    self.wait_out_rate(retry_after, rate_waits).await?;
                 }
                 // The permit is spent: mint a new one for the same connection,
                 // once (spec S5.4).
@@ -793,7 +832,7 @@ mod tests {
         StdGuard,
     };
     use aitm_proto_l4::config::L4Config;
-    use aitm_proto_l4::guard::{L4Guard, ANY_INTERFACE};
+    use aitm_proto_l4::guard::{L4Guard, L4GuardError, ANY_INTERFACE};
     use aitm_proto_l4::types::{
         IpCidr, L4Capability, L4Direction, L4ScopeEntry, L4ScopeId, L4ScopeSource, PortRange,
         RateCap,
@@ -834,6 +873,11 @@ mod tests {
         client: Arc<dyn ProxyClient>,
         store: Arc<dyn FlowStore>,
         guard: Arc<dyn ScopeRateGuard>,
+        /// When this job was made: the fixed origin its deadline is measured
+        /// from, so the deadline does not slide forward with every read.
+        started: Instant,
+        /// How far past `started` this job's deadline sits.
+        deadline_in: Duration,
     }
 
     impl TestJob {
@@ -848,6 +892,8 @@ mod tests {
                 client: Arc::new(NullClient),
                 store: Arc::new(MemFlowStore::new()),
                 guard: Arc::new(StdGuard::default()),
+                started: Instant::now(),
+                deadline_in: Duration::from_secs(600),
             }
         }
 
@@ -871,6 +917,12 @@ mod tests {
 
         fn consecutive_timeouts(mut self, n: u32) -> Self {
             self.profile.l4.consecutive_timeouts = n;
+            self
+        }
+
+        /// A job whose deadline is `d` away, for the S5.4 rate-wait tests.
+        fn deadline_in(mut self, d: Duration) -> Self {
+            self.deadline_in = d;
             self
         }
 
@@ -912,7 +964,7 @@ mod tests {
             1000
         }
         fn deadline(&self) -> Instant {
-            Instant::now() + Duration::from_secs(600)
+            self.started + self.deadline_in
         }
         fn cancelled(&self) -> bool {
             false
@@ -1152,6 +1204,84 @@ mod tests {
                 }
                 Ok(steps)
             })
+        }
+    }
+
+    /// A `StreamClient` whose permit path is rate-refused for its first
+    /// `refusals` attempts, then answers (spec S5.4, F11).
+    ///
+    /// The guard meters injection per packet, so a busy job — eight checks
+    /// probing one entry's bucket — sees `InjectionRateExceeded` on a write
+    /// long before anything is wrong. This double is that bucket, with a
+    /// known refill: the lane must pace itself against it, not stop.
+    struct RateRefusingClient {
+        reply: Vec<u8>,
+        /// How many more attempts are refused; `u32::MAX` never relents.
+        refusals_left: AtomicU32,
+        refusals_served: AtomicU32,
+        retry_after: Duration,
+    }
+
+    impl RateRefusingClient {
+        fn new(reply: &[u8], refusals: u32, retry_after: Duration) -> Self {
+            Self {
+                reply: reply.to_vec(),
+                refusals_left: AtomicU32::new(refusals),
+                refusals_served: AtomicU32::new(0),
+                retry_after,
+            }
+        }
+
+        /// A bucket that never refills.
+        fn always(retry_after: Duration) -> Self {
+            Self::new(b"+PONG\r\n", u32::MAX, retry_after)
+        }
+
+        fn refusals_served(&self) -> u32 {
+            self.refusals_served.load(Ordering::SeqCst)
+        }
+    }
+
+    impl StreamClient for RateRefusingClient {
+        #[allow(clippy::too_many_arguments, reason = "the StreamClient signature")]
+        fn exchange<'a>(
+            &'a self,
+            _ep: &'a Endpoint,
+            _permit: &'a mut L4Permit,
+            _pacer: &'a Mutex<BytePacer>,
+            messages: &'a [Vec<u8>],
+            _complete: &'a (dyn Fn(&[u8]) -> bool + Sync),
+            _expects_banner: bool,
+            _reply_timeout: Duration,
+            _connect_timeout: Duration,
+        ) -> BoxFuture<'a, Result<Vec<ExchangeStep>, ClientError>> {
+            let refuse = self
+                .refusals_left
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| match left {
+                    0 => None,
+                    u32::MAX => Some(u32::MAX),
+                    n => Some(n - 1),
+                })
+                .is_ok();
+            if refuse {
+                self.refusals_served.fetch_add(1, Ordering::SeqCst);
+                let retry_after = self.retry_after;
+                return Box::pin(async move {
+                    Err(ClientError::Guard(L4GuardError::InjectionRateExceeded {
+                        retry_after,
+                    }))
+                });
+            }
+            let steps: Vec<ExchangeStep> = messages
+                .iter()
+                .map(|message| ExchangeStep {
+                    sent_len: message.len(),
+                    reply: self.reply.clone(),
+                    ended: Ended::Replied,
+                    elapsed_ms: 3,
+                })
+                .collect();
+            Box::pin(async move { Ok(steps) })
         }
     }
 
@@ -1760,5 +1890,72 @@ mod tests {
         assert_eq!(host.state.consecutive_timeouts.load(Ordering::SeqCst), 1);
         // The case plus two liveness probes, one budget unit each.
         assert_eq!(job.charges(), 3);
+    }
+
+    // -----------------------------------------------------------------
+    // S5.4 / F11: an injection-rate refusal is pacing, not a refusal
+    // -----------------------------------------------------------------
+
+    /// The guard's rate cap is the lane being told *when*, not *no*: however
+    /// many times the bucket is empty, the probe waits and goes on, and no
+    /// such wait ever becomes a `Guard` stop (spec S5.4, F11).
+    #[tokio::test]
+    async fn rate_refusals_are_waited_out_not_refused() {
+        let job = Arc::new(TestJob::new());
+        let client = Arc::new(RateRefusingClient::new(
+            b"+PONG\r\n",
+            25,
+            Duration::from_millis(5),
+        ));
+        let host = host_with(
+            endpoint(6379),
+            Some(loopback_guard()),
+            &job,
+            Arc::clone(&client) as Arc<dyn StreamClient>,
+        );
+
+        let response = host
+            .probe(&payload(b"PING\r\n"))
+            .await
+            .expect("25 rate refusals are waited out, not turned into a stop");
+
+        assert_eq!(response.body, b"+PONG\r\n".to_vec());
+        assert_eq!(client.refusals_served(), 25);
+        assert!(
+            host.state.rate_waits.load(Ordering::SeqCst) >= 25,
+            "every wait is counted: {}",
+            host.state.rate_waits.load(Ordering::SeqCst)
+        );
+    }
+
+    /// A bucket that never refills ends the probe at the job's deadline —
+    /// `Deadline`, the honest reason, never `Guard` (spec S5.4, F11).
+    #[tokio::test]
+    async fn rate_refusals_stop_at_the_deadline() {
+        let job = Arc::new(TestJob::new().deadline_in(Duration::from_millis(50)));
+        let client = Arc::new(RateRefusingClient::always(Duration::from_millis(1)));
+        let host = host_with(
+            endpoint(6379),
+            Some(loopback_guard()),
+            &job,
+            Arc::clone(&client) as Arc<dyn StreamClient>,
+        );
+
+        let started = Instant::now();
+        let error = host
+            .probe(&payload(b"PING\r\n"))
+            .await
+            .expect_err("a bucket that never refills runs the job out of time");
+        let waited = started.elapsed();
+
+        assert_eq!(host_error(&error), &HostError::Deadline, "{error}");
+        assert!(
+            waited < Duration::from_millis(500),
+            "the wait stops at the deadline, not long after it: {waited:?}"
+        );
+        assert!(
+            host.state.rate_waits.load(Ordering::SeqCst) >= 1,
+            "the waits it did make are counted"
+        );
     }
 }
