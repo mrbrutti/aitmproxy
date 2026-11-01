@@ -1269,7 +1269,7 @@ mod tests {
     use crate::fields::FieldPath;
     use crate::oracle::CaseClass;
     use crate::plan::{point_id, TargetPlan};
-    use crate::state::{Candidate, LaneState, StopReason};
+    use crate::state::{Candidate, JobKey, LaneState, StopReason};
     use crate::testing::{
         fields, l4_profile, loopback_guard, tcp_target, udp_target, with_hex_seed, MockBackend,
         MockReply, TestJob,
@@ -1302,7 +1302,7 @@ mod tests {
         .expect("the loopback profile discovers");
         let state = Arc::new(LaneState::new());
         state.begin_job(
-            job.job_id(),
+            JobKey::new(job.job_id(), &job.marker()),
             plans.clone(),
             discovery.points.iter().map(|p| p.id.clone()).collect(),
             profile.l4.cases,

@@ -509,6 +509,7 @@ pub struct TestJob {
     store: Arc<dyn FlowStore>,
     guard: Arc<dyn ScopeRateGuard>,
     job_id: OnceLock<String>,
+    marker: OnceLock<String>,
     budget: AtomicU32,
     charged: AtomicU32,
     deadline: Mutex<Instant>,
@@ -537,6 +538,7 @@ impl TestJob {
             store: Arc::new(MemFlowStore::new()),
             guard: Arc::new(StdGuard::default()),
             job_id: OnceLock::new(),
+            marker: OnceLock::new(),
             budget: AtomicU32::new(DEFAULT_BUDGET),
             charged: AtomicU32::new(0),
             deadline: Mutex::new(Instant::now() + Duration::from_secs(60)),
@@ -548,6 +550,14 @@ impl TestJob {
     #[must_use]
     pub fn with_budget(self: Arc<Self>, n: u32) -> Arc<Self> {
         self.budget.store(n, Ordering::SeqCst);
+        self
+    }
+
+    /// Set the job's marker, for a test that runs more than one job through
+    /// one lane and needs their runners kept apart.
+    #[must_use]
+    pub fn with_marker(self: Arc<Self>, marker: &str) -> Arc<Self> {
+        let _ = self.marker.set(marker.to_string());
         self
     }
 
@@ -643,7 +653,10 @@ impl JobCtx for TestJob {
     }
 
     fn marker(&self) -> String {
-        "aitm7f3a".to_string()
+        self.marker
+            .get()
+            .cloned()
+            .unwrap_or_else(|| "aitm7f3a".to_string())
     }
 }
 

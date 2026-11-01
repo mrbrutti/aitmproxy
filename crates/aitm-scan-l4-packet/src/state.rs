@@ -321,7 +321,28 @@ pub struct JobStats {
 
 /// One job's state. Private: everything outside reaches it through
 /// [`LaneState`], which keeps the locking in one place.
+/// The identity a job is begun under: the id the engine knows it by and the
+/// marker its points, seeds and runners are keyed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobKey<'a> {
+    /// The engine's job id.
+    pub job_id: &'a str,
+    /// The job's marker.
+    pub marker: &'a str,
+}
+
+impl<'a> JobKey<'a> {
+    /// The key for `job_id` running under `marker`.
+    #[must_use]
+    pub const fn new(job_id: &'a str, marker: &'a str) -> Self {
+        Self { job_id, marker }
+    }
+}
+
 struct JobState {
+    /// The job's marker: what its runners are keyed by, so evicting the job
+    /// can evict them too (review findings SEC2/Q4).
+    marker: String,
     plans: Vec<TargetPlan>,
     point_ids: HashSet<String>,
     retired: HashSet<String>,
@@ -336,6 +357,7 @@ struct JobState {
 
 impl JobState {
     fn new(
+        marker: &str,
         plans: Vec<TargetPlan>,
         point_ids: Vec<String>,
         cases_requested: u32,
@@ -344,6 +366,7 @@ impl JobState {
     ) -> Self {
         let points = u32::try_from(point_ids.len()).unwrap_or(u32::MAX);
         Self {
+            marker: marker.to_string(),
             plans,
             point_ids: point_ids.into_iter().collect(),
             retired: HashSet::new(),
@@ -411,16 +434,22 @@ impl LaneState {
     ///
     /// `cases_cap` is `min(cases_requested, CASES_CEILING)`. Re-beginning a
     /// known job replaces its state; beginning a ninth job evicts the oldest.
+    ///
+    /// Returns the markers of every job whose state this call dropped — the
+    /// evicted ones and, when a known job is re-begun, its previous marker.
+    /// The caller forgets their runners, so the registry is bounded by the
+    /// same window this state is (review findings SEC2/Q4).
     pub fn begin_job(
         &self,
-        job_id: &str,
+        job: JobKey<'_>,
         plans: Vec<TargetPlan>,
         point_ids: Vec<String>,
         cases_requested: u32,
         consecutive_timeouts: u32,
         dry_run: bool,
-    ) {
+    ) -> Vec<String> {
         let state = JobState::new(
+            job.marker,
             plans,
             point_ids,
             cases_requested,
@@ -428,15 +457,21 @@ impl LaneState {
             dry_run,
         );
         let mut inner = lock(&self.inner);
-        if inner.jobs.insert(job_id.to_string(), state).is_none() {
-            inner.order.push_back(job_id.to_string());
+        let mut forgotten = Vec::new();
+        match inner.jobs.insert(job.job_id.to_string(), state) {
+            // A re-begun job's old runners hold its old plans and its old run.
+            Some(previous) => forgotten.push(previous.marker),
+            None => inner.order.push_back(job.job_id.to_string()),
         }
         while inner.order.len() > MAX_JOBS_REMEMBERED {
             let Some(oldest) = inner.order.pop_front() else {
                 break;
             };
-            inner.jobs.remove(&oldest);
+            if let Some(evicted) = inner.jobs.remove(&oldest) {
+                forgotten.push(evicted.marker);
+            }
         }
+        forgotten
     }
 
     /// The job's target plans.
@@ -676,14 +711,21 @@ mod tests {
     fn cases_cap_is_min_of_profile_and_ceiling() {
         let state = LaneState::new();
 
-        state.begin_job("scan-big", vec![plan_fixture()], points(1), 9000, 20, false);
+        state.begin_job(
+            JobKey::new("scan-big", "m-scan-big"),
+            vec![plan_fixture()],
+            points(1),
+            9000,
+            20,
+            false,
+        );
         assert_eq!(
             state.stats("scan-big").expect("the job is known").cases_cap,
             5000
         );
 
         state.begin_job(
-            "scan-small",
+            JobKey::new("scan-small", "m-scan-small"),
             vec![plan_fixture()],
             points(1),
             500,
@@ -702,7 +744,14 @@ mod tests {
     #[test]
     fn allocation_is_ceil_and_bounded() {
         let state = LaneState::new();
-        state.begin_job("scan-a", vec![plan_fixture()], points(14), 100, 20, false);
+        state.begin_job(
+            JobKey::new("scan-a", "m-scan-a"),
+            vec![plan_fixture()],
+            points(14),
+            100,
+            20,
+            false,
+        );
 
         assert_eq!(state.allocate_cases("scan-a"), Some(8));
 
@@ -720,7 +769,14 @@ mod tests {
     #[test]
     fn consecutive_timeouts_stop() {
         let state = LaneState::new();
-        state.begin_job("scan-t", vec![plan_fixture()], points(1), 100, 3, false);
+        state.begin_job(
+            JobKey::new("scan-t", "m-scan-t"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            3,
+            false,
+        );
 
         assert_eq!(
             state.record_case("scan-t", CaseClass::Silence, true),
@@ -747,7 +803,14 @@ mod tests {
         );
 
         // A clean case after two silent ones resets the ladder.
-        state.begin_job("scan-r", vec![plan_fixture()], points(1), 100, 3, false);
+        state.begin_job(
+            JobKey::new("scan-r", "m-scan-r"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            3,
+            false,
+        );
         assert_eq!(
             state.record_case("scan-r", CaseClass::Silence, true),
             Ok(())
@@ -766,7 +829,14 @@ mod tests {
     #[test]
     fn unsendable_counts_separately() {
         let state = LaneState::new();
-        state.begin_job("scan-u", vec![plan_fixture()], points(1), 100, 3, false);
+        state.begin_job(
+            JobKey::new("scan-u", "m-scan-u"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            3,
+            false,
+        );
 
         assert_eq!(
             state.record_case("scan-u", CaseClass::Silence, false),
@@ -783,7 +853,14 @@ mod tests {
     #[test]
     fn crash_retires_point() {
         let state = LaneState::new();
-        state.begin_job("scan-c", vec![plan_fixture()], points(2), 100, 20, false);
+        state.begin_job(
+            JobKey::new("scan-c", "m-scan-c"),
+            vec![plan_fixture()],
+            points(2),
+            100,
+            20,
+            false,
+        );
 
         for _ in 0..5 {
             assert_eq!(state.record_case("scan-c", CaseClass::Clean, true), Ok(()));
@@ -810,7 +887,7 @@ mod tests {
     fn unknown_job_is_none() {
         let state = LaneState::new();
         state.begin_job(
-            "scan-known",
+            JobKey::new("scan-known", "m-scan-known"),
             vec![plan_fixture()],
             points(1),
             100,
@@ -849,7 +926,7 @@ mod tests {
         let state = LaneState::new();
         for i in 1..=9 {
             state.begin_job(
-                &format!("j{i}"),
+                JobKey::new(&format!("j{i}"), &format!("m-j{i}")),
                 vec![plan_fixture()],
                 points(1),
                 100,
@@ -922,7 +999,14 @@ mod tests {
     #[test]
     fn run_cache_round_trip() {
         let state = LaneState::new();
-        state.begin_job("scan-run", vec![plan_fixture()], points(1), 100, 20, false);
+        state.begin_job(
+            JobKey::new("scan-run", "m-scan-run"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            20,
+            false,
+        );
 
         let run = Arc::new(PointRun {
             point_id: "p0".to_string(),
@@ -956,7 +1040,14 @@ mod tests {
     #[test]
     fn allocation_when_points_outnumber_cases() {
         let state = LaneState::new();
-        state.begin_job("scan-p", vec![plan_fixture()], points(14), 10, 20, false);
+        state.begin_job(
+            JobKey::new("scan-p", "m-scan-p"),
+            vec![plan_fixture()],
+            points(14),
+            10,
+            20,
+            false,
+        );
         assert_eq!(state.allocate_cases("scan-p"), Some(1));
         for _ in 0..9 {
             assert_eq!(state.record_case("scan-p", CaseClass::Clean, true), Ok(()));
@@ -966,12 +1057,26 @@ mod tests {
         assert_eq!(state.allocate_cases("scan-p"), Some(0));
         assert_eq!(state.stats("scan-p").expect("known").points, 14);
 
-        state.begin_job("scan-z", vec![plan_fixture()], Vec::new(), 7, 20, false);
+        state.begin_job(
+            JobKey::new("scan-z", "m-scan-z"),
+            vec![plan_fixture()],
+            Vec::new(),
+            7,
+            20,
+            false,
+        );
         assert_eq!(state.allocate_cases("scan-z"), Some(7));
         assert_eq!(state.stats("scan-z").expect("known").points, 0);
 
         // A profile asking for zero cases allocates nothing.
-        state.begin_job("scan-0", vec![plan_fixture()], points(3), 0, 20, false);
+        state.begin_job(
+            JobKey::new("scan-0", "m-scan-0"),
+            vec![plan_fixture()],
+            points(3),
+            0,
+            20,
+            false,
+        );
         assert_eq!(state.allocate_cases("scan-0"), Some(0));
     }
 
@@ -981,7 +1086,7 @@ mod tests {
     fn ceiling_allocation_is_exhausted_at_5000() {
         let state = LaneState::new();
         state.begin_job(
-            "scan-max",
+            JobKey::new("scan-max", "m-scan-max"),
             vec![plan_fixture()],
             points(1),
             u32::MAX,
@@ -1011,7 +1116,7 @@ mod tests {
 
         // Exactly the ceiling is not clamped.
         state.begin_job(
-            "scan-5000",
+            JobKey::new("scan-5000", "m-scan-5000"),
             vec![plan_fixture()],
             points(1),
             5000,
@@ -1020,7 +1125,7 @@ mod tests {
         );
         assert_eq!(state.stats("scan-5000").expect("known").cases_cap, 5000);
         state.begin_job(
-            "scan-5001",
+            JobKey::new("scan-5001", "m-scan-5001"),
             vec![plan_fixture()],
             points(1),
             5001,
@@ -1035,12 +1140,26 @@ mod tests {
     #[test]
     fn zero_threshold_stops_on_the_first_silence() {
         let state = LaneState::new();
-        state.begin_job("scan-0t", vec![plan_fixture()], points(1), 100, 0, false);
+        state.begin_job(
+            JobKey::new("scan-0t", "m-scan-0t"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            0,
+            false,
+        );
         assert_eq!(
             state.record_case("scan-0t", CaseClass::Silence, true),
             Err(StopReason::ConsecutiveTimeouts(1))
         );
-        state.begin_job("scan-1t", vec![plan_fixture()], points(1), 100, 1, false);
+        state.begin_job(
+            JobKey::new("scan-1t", "m-scan-1t"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            1,
+            false,
+        );
         assert_eq!(state.record_case("scan-1t", CaseClass::Clean, true), Ok(()));
         assert_eq!(
             state.record_case("scan-1t", CaseClass::Silence, true),
@@ -1053,7 +1172,14 @@ mod tests {
     #[test]
     fn first_stop_reason_wins() {
         let state = LaneState::new();
-        state.begin_job("scan-s", vec![plan_fixture()], points(1), 100, 2, false);
+        state.begin_job(
+            JobKey::new("scan-s", "m-scan-s"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            2,
+            false,
+        );
         state.mark_stopped("scan-s", StopReason::Budget);
         state.mark_stopped("scan-s", StopReason::Deadline);
         assert_eq!(state.stopped("scan-s"), Some(StopReason::Budget));
@@ -1075,12 +1201,26 @@ mod tests {
     #[test]
     fn re_begin_replaces_state_and_keeps_its_slot() {
         let state = LaneState::new();
-        state.begin_job("j-first", vec![plan_fixture()], points(1), 100, 20, false);
+        state.begin_job(
+            JobKey::new("j-first", "m-j-first"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            20,
+            false,
+        );
         for _ in 0..5 {
             assert_eq!(state.record_case("j-first", CaseClass::Clean, true), Ok(()));
         }
         state.record_crash("j-first", "p0");
-        state.begin_job("j-first", vec![plan_fixture()], points(2), 50, 20, true);
+        state.begin_job(
+            JobKey::new("j-first", "m-j-first"),
+            vec![plan_fixture()],
+            points(2),
+            50,
+            20,
+            true,
+        );
 
         assert_eq!(state.counters("j-first"), Some(L4Counters::default()));
         assert!(!state.is_retired("j-first", "p0"));
@@ -1089,7 +1229,7 @@ mod tests {
 
         for i in 2..=8 {
             state.begin_job(
-                &format!("j{i}"),
+                JobKey::new(&format!("j{i}"), &format!("m-j{i}")),
                 vec![plan_fixture()],
                 points(1),
                 100,
@@ -1098,7 +1238,14 @@ mod tests {
             );
         }
         assert!(state.counters("j-first").is_some(), "eight jobs fit");
-        state.begin_job("j9", vec![plan_fixture()], points(1), 100, 20, false);
+        state.begin_job(
+            JobKey::new("j9", "m-j9"),
+            vec![plan_fixture()],
+            points(1),
+            100,
+            20,
+            false,
+        );
         assert_eq!(
             state.counters("j-first"),
             None,
@@ -1141,7 +1288,14 @@ mod tests {
     #[test]
     fn cases_remaining_counts_down_from_the_cap() {
         let state = LaneState::new();
-        state.begin_job("scan-rem", vec![plan_fixture()], points(1), 3, 20, false);
+        state.begin_job(
+            JobKey::new("scan-rem", "m-scan-rem"),
+            vec![plan_fixture()],
+            points(1),
+            3,
+            20,
+            false,
+        );
 
         assert_eq!(state.cases_remaining("scan-rem"), Some(3));
         assert_eq!(
