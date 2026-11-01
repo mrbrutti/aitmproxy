@@ -509,16 +509,27 @@ pub fn out_of_scope(scope: &[String], raw: &str) -> Option<String> {
 /// origins share (fix round G, G31), so `https://h:443` and `h` name one
 /// origin.
 fn origin(scheme: &str, host: &str, port: Option<u16>) -> String {
-    let default_port = if scheme == "https" { 443 } else { 80 };
-    match port.filter(|p| *p != default_port) {
+    match port.filter(|p| *p != default_port(scheme)) {
         Some(p) => format!("{scheme}://{host}:{p}"),
         None => format!("{scheme}://{host}"),
     }
 }
 
 /// The authority of a URL remainder: up to the first `/`, `?` or `#`.
-fn authority_of(rest: &str) -> &str {
+/// Shared with the Site map's legacy node reader (fix round G, G27).
+pub(super) fn authority_of(rest: &str) -> &str {
     rest.find(['/', '?', '#']).map_or(rest, |i| &rest[..i])
+}
+
+/// A scheme's default port: 443 for `https`, 80 otherwise (the one rule
+/// the origin spelling, the Site map's host key and its legacy nodes
+/// share; fix round G, G27, G31).
+pub(super) fn default_port(scheme: &str) -> u16 {
+    if scheme == "https" {
+        443
+    } else {
+        80
+    }
 }
 
 /// Split an authority into its host and port under the D8 rule. A

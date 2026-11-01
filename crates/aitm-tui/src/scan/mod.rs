@@ -188,9 +188,10 @@ impl ScanState {
 
     /// The focused pane's cursor and its row count, for the shared `nav()`
     /// keys (spec D11). `None` when the focused pane has no walkable list
-    /// here: the Jobs detail scroll is the Jobs task's and the Issues detail
-    /// flow cursor is the Issues task's, and an editor pane is dead while no
-    /// profile is open.
+    /// here: the Jobs detail scroll is the Jobs task's, the Issues detail
+    /// flow cursor the Issues task's, the Profiles Checks pane walks the
+    /// flattened tree in the reducer (fix round G, G32), and an editor pane
+    /// is dead while no profile is open.
     ///
     /// The Site map panes walk the lists [`MapSource::from`] picks for
     /// `offer`: the v2 nodes and points on a v2 bus, the legacy
@@ -212,13 +213,7 @@ impl ScanState {
                     let n = e.origin_choices.len();
                     (&mut e.origin_cursor, n)
                 }),
-                ProfilePane::Checks => {
-                    let n = self.profiles.checks.len();
-                    self.profiles
-                        .editor
-                        .as_mut()
-                        .map(|e| (&mut e.tree_cursor, n))
-                }
+                ProfilePane::Checks => None,
             },
             ScanTab::Jobs => match self.jobs.pane {
                 JobPane::List => {
@@ -243,8 +238,10 @@ impl ScanState {
                     Some((&mut self.sitemap.node_cursor, n))
                 }
                 (MapSource::V2, MapPane::Points) => {
-                    let n = self.sitemap.points.len();
-                    Some((&mut self.sitemap.point_cursor, n))
+                    // The offset within the selected node's points (fix
+                    // round G, G24).
+                    let n = self.sitemap.node_points(self.sitemap.node_cursor).len();
+                    Some((&mut self.sitemap.point_offset, n))
                 }
             },
             ScanTab::Issues => match self.issues.pane {
@@ -287,8 +284,7 @@ impl ScanState {
                 .map(ToString::to_string),
             (MapSource::V2, MapPane::Points) => self
                 .sitemap
-                .points
-                .get(self.sitemap.point_cursor)
+                .selected_point()
                 .and_then(|p| p.flow.as_ref())
                 .map(ToString::to_string),
         }
@@ -584,6 +580,14 @@ fn is_wire_id(s: &str, prefix: &str) -> bool {
     })
 }
 
+/// Whether a timer-driven read is due (spec D6; fix round G, G28): `every`
+/// or more ticks have passed since `last`, the tick the previous request
+/// left on; never before a first request has left (`None`), so a tab whose
+/// entry read was quiet (the verb missing) asks nothing on the timer.
+pub(crate) fn due(last: Option<u64>, now: u64, every: u64) -> bool {
+    last.is_some_and(|l| now.saturating_sub(l) >= every)
+}
+
 /// The tag of a keyed tagged call: `<verb>:<key>` (spec D5).
 pub fn tag_keyed(verb: &str, key: &str) -> String {
     format!("{verb}:{key}")
@@ -713,6 +717,19 @@ mod tests {
             ScanError::from_message("scan.status", "scan: not_found: x").wording(),
             "No longer known to the core (it may have restarted): x",
             "a bare status tag ran no heal"
+        );
+    }
+
+    /// Fix round G, G28: the one since-last-request rule.
+    #[test]
+    fn due_counts_from_the_last_request() {
+        assert!(!due(None, 100, 20), "never before a request left");
+        assert!(due(Some(0), 20, 20));
+        assert!(!due(Some(1), 20, 20));
+        assert!(due(Some(5), 45, 40));
+        assert!(
+            !due(Some(50), 45, 40),
+            "a clock behind the stamp is not due"
         );
     }
 

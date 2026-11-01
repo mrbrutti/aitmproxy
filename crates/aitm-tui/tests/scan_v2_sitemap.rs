@@ -25,7 +25,7 @@ use aitm_tui::model::FlowRow;
 use aitm_tui::scan::{
     origin_choices, typed_origin, IssueFilterKey, MapPane, OriginChoice, OriginSource, ScanTab,
     AUDITED_MARK, ORIGIN_HOST_ERROR, POINT_TRAITS_MAX, SITEMAP_PAGE_LIMIT, SITEMAP_POLL_TICKS,
-    SITEMAP_TOTAL_LIMIT,
+    SITEMAP_TOTAL_LIMIT, SITEMAP_VALUE_MAX,
 };
 use common::*;
 use serde_json::{json, Value};
@@ -136,6 +136,17 @@ fn open_site_map(app: &mut App) {
     );
 }
 
+/// The pane segment (between box or pane rules) of the first row carrying
+/// `needle`, trimmed.
+fn pane_row(text: &str, needle: &str) -> String {
+    let line = line_with(text, needle).unwrap_or_else(|| panic!("no row with {needle:?}:\n{text}"));
+    line.split('│')
+        .find(|seg| seg.contains(needle))
+        .expect("the needle's pane")
+        .trim()
+        .to_string()
+}
+
 fn screen(app: &App) -> String {
     text_of(app, 200, 50)
 }
@@ -165,23 +176,21 @@ fn sitemap_renders_nodes_points_and_pages() {
         line_with(&text, "127.0.0.1:8080").is_some(),
         "the host header groups the node: {text}"
     );
-    let node = line_with(&text, "/account/{id}").unwrap_or_else(|| panic!("no node line: {text}"));
-    assert!(node.contains("GET"), "the method: {node:?}");
-    assert!(
-        node.contains("flows 1 · pts 2"),
-        "the flow and point counts: {node:?}"
+    // The rows as drawn, trimmed to their pane (fix round G, G30): the
+    // node under the cursor with its method, counts and audited mark, the
+    // fixed-width point rows (the first under the Points cursor).
+    assert_eq!(
+        pane_row(&text, "/account/{id}"),
+        format!("> GET  /account/{{id}}  flows 1 · pts 2 · {AUDITED_MARK}")
     );
-    assert!(node.contains(AUDITED_MARK), "the audited mark: {node:?}");
-    let city = line_with(&text, "profile.address.city")
-        .unwrap_or_else(|| panic!("no json point line: {text}"));
-    for literal in ["json_value", "city", "json", "Lisbon"] {
-        assert!(city.contains(literal), "{literal:?} in {city:?}");
-    }
-    let cookie =
-        line_with(&text, "<redacted>").unwrap_or_else(|| panic!("no cookie point line: {text}"));
-    for literal in ["cookie", "theme", "id"] {
-        assert!(cookie.contains(literal), "{literal:?} in {cookie:?}");
-    }
+    assert_eq!(
+        pane_row(&text, "profile.address.city"),
+        "> json_value   city           profile.address.city     json     Lisbon"
+    );
+    assert_eq!(
+        pane_row(&text, "<redacted>"),
+        "cookie       theme          -                        id       <redacted>"
+    );
     assert!(
         line_with(&text, "1 nodes · 2 points of node-1 · n next page").is_some(),
         "the summary line: {text}"
@@ -295,7 +304,7 @@ fn enter_opens_the_nodes_first_flow_via_row() {
     assert_eq!(app.scan.sitemap.pane, MapPane::Points);
     let _ = app.update(Action::Down);
     assert_eq!(
-        app.scan.sitemap.point_cursor, 1,
+        app.scan.sitemap.point_offset, 1,
         "Down walks the node's points"
     );
     let _ = app.update(Action::Enter);
@@ -621,7 +630,7 @@ fn huge_and_empty_pages_render_within_bounds() {
                 "path": long,
                 "example": long,
                 "flow": NODE_FLOW,
-                "site_node": format!("node-{}", k % 2000),
+                "site_node": format!("node-{k}"),
                 "traits": ["json"],
                 "frequency": 1,
             })
@@ -633,13 +642,11 @@ fn huge_and_empty_pages_render_within_bounds() {
         "next_cursor": long,
     })));
     assert_eq!(app.scan.sitemap.nodes.len(), SITEMAP_PAGE_LIMIT);
+    assert_eq!(app.scan.sitemap.points.len(), SITEMAP_PAGE_LIMIT);
+    // A cut string is at most the cap in cells plus the ellipsis; a cell
+    // is at most four bytes, so the char count is bounded by it too.
     assert!(
-        app.scan.sitemap.points.len() <= SITEMAP_PAGE_LIMIT,
-        "{} points",
-        app.scan.sitemap.points.len()
-    );
-    assert!(
-        app.scan.sitemap.nodes[0].path_template.chars().count() <= 801,
+        app.scan.sitemap.nodes[0].path_template.chars().count() <= 4 * SITEMAP_VALUE_MAX + 1,
         "the path is bounded at fold time"
     );
     for (w, h) in [(200, 50), (90, 40), (20, 5), (3, 2)] {
@@ -664,4 +671,72 @@ fn huge_and_empty_pages_render_within_bounds() {
     let _ = app.update(Action::Down);
     let _ = app.update(Action::Enter);
     assert_eq!(app.mode, Mode::Scan);
+}
+
+/// Fix round G, G24: the Points cursor is an offset within the selected
+/// node, so the walk stops at that node's points without a sentinel; a
+/// Nodes walk resets it, a fold clamps it, and `selected_point` is what
+/// `Enter` and the view read.
+#[test]
+fn the_point_cursor_is_an_offset_within_the_selected_node() {
+    let mut app = app();
+    open_site_map(&mut app);
+    assert_eq!(app.scan.sitemap.point_offset, 0);
+    assert_eq!(
+        app.scan.sitemap.selected_point().map(|p| p.name.as_str()),
+        Some("city")
+    );
+    let _ = app.update(Action::ScanPaneNext);
+    assert_eq!(app.scan.sitemap.pane, MapPane::Points);
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.sitemap.point_offset, 1);
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.sitemap.point_offset, 1, "the node has two points");
+    let _ = app.update(Action::End);
+    assert_eq!(app.scan.sitemap.point_offset, 1);
+    assert_eq!(
+        app.scan.sitemap.selected_point().map(|p| p.name.as_str()),
+        Some("theme")
+    );
+    let text = screen(&app);
+    let row = line_with(&text, "theme").unwrap_or_else(|| panic!("{text}"));
+    assert!(
+        row.contains("> cookie"),
+        "the cursor marks the second point: {row:?}"
+    );
+    let _ = app.update(Action::Home);
+    assert_eq!(app.scan.sitemap.point_offset, 0);
+
+    // A second node without points: walking the Nodes pane onto it resets
+    // the offset and leaves nothing selected.
+    let _ = app.update(Action::End);
+    let _ = app.update(Action::ScanNextPage);
+    let mut second = fixture("scan.sitemap.json");
+    second["nodes"][0]["id"] = json!("node-2");
+    second["nodes"][0]["path_template"] = json!("/second");
+    second["points"] = json!([]);
+    second["next_cursor"] = Value::Null;
+    let _ = app.on_bus(sitemap_reply(second));
+    assert_eq!(
+        app.scan.sitemap.point_offset, 1,
+        "a fold keeps a still-valid offset"
+    );
+    let _ = app.update(Action::ScanPanePrev);
+    assert_eq!(app.scan.sitemap.pane, MapPane::Nodes);
+    let _ = app.update(Action::Down);
+    assert_eq!(app.scan.sitemap.node_cursor, 1);
+    assert_eq!(
+        app.scan.sitemap.point_offset, 0,
+        "a Nodes walk resets the offset"
+    );
+    assert_eq!(app.scan.sitemap.selected_point(), None);
+    let _ = app.update(Action::ScanPaneNext);
+    let _ = app.update(Action::Down);
+    assert_eq!(
+        app.scan.sitemap.point_offset, 0,
+        "no points: nothing to walk"
+    );
+    let reqs = app.update(Action::Enter);
+    assert!(reqs.is_empty());
+    assert_eq!(app.mode, Mode::Scan, "Enter on no point opens nothing");
 }

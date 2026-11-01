@@ -17,16 +17,15 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 
 use crate::app::App;
 use crate::scan::{point_header, MapPane, MapSource, NodeLine, ScanOffer};
+use crate::text::truncate;
 use crate::theme::Theme;
 use crate::ui::bars::put;
-use crate::ui::scan::{hint, note, pane_rule, panes};
-use crate::ui::selection_bg;
-use crate::ui::text::{cells, truncate};
+use crate::ui::scan::{hint, note, pane_rule, panes, rows};
 
 /// Today's legacy pane titles (D12).
 const LEGACY_NODES_TITLE: &str = "Endpoints";
@@ -65,26 +64,25 @@ fn v2(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     nodes(
         theme,
         &map.lines,
-        map.node_cursor,
-        map.pane == MapPane::Nodes,
-        Head::Hint(&summary),
-        NO_POINTS,
+        Pane {
+            cursor: map.node_cursor,
+            focused: map.pane == MapPane::Nodes,
+            head: Head::Hint(&summary),
+            empty: NO_POINTS,
+        },
         split.list,
         buf,
     );
-    let range = map.node_points(map.node_cursor);
-    let cursor = map
-        .point_cursor
-        .checked_sub(range.start)
-        .filter(|c| *c < range.len());
     let header = point_header();
     points(
         theme,
-        &map.point_lines[range],
-        cursor,
-        map.pane == MapPane::Points,
-        Head::Columns(&header),
-        NO_POINTS,
+        &map.point_lines[map.node_points(map.node_cursor)],
+        Pane {
+            cursor: map.point_offset,
+            focused: map.pane == MapPane::Points,
+            head: Head::Columns(&header),
+            empty: NO_POINTS,
+        },
         split.detail,
         buf,
     );
@@ -100,26 +98,31 @@ fn legacy(app: &App, theme: &Theme, area: Rect, buf: &mut Buffer) {
     nodes(
         theme,
         &map.lines,
-        legacy.endpoint_cursor,
-        map.pane == MapPane::Nodes,
-        Head::Title(LEGACY_NODES_TITLE),
-        LEGACY_NO_ENDPOINTS,
+        Pane {
+            cursor: legacy.endpoint_cursor,
+            focused: map.pane == MapPane::Nodes,
+            head: Head::Title(LEGACY_NODES_TITLE),
+            empty: LEGACY_NO_ENDPOINTS,
+        },
         split.list,
         buf,
     );
     points(
         theme,
         &map.point_lines,
-        Some(legacy.cursor),
-        map.pane == MapPane::Points,
-        Head::Title(LEGACY_POINTS_TITLE),
-        LEGACY_NO_POINTS,
+        Pane {
+            cursor: legacy.cursor,
+            focused: map.pane == MapPane::Points,
+            head: Head::Title(LEGACY_POINTS_TITLE),
+            empty: LEGACY_NO_POINTS,
+        },
         split.detail,
         buf,
     );
 }
 
 /// What a pane's first row carries.
+#[derive(Clone, Copy)]
 enum Head<'a> {
     /// A legacy title, in the accent.
     Title(&'a str),
@@ -129,20 +132,44 @@ enum Head<'a> {
     Columns(&'a str),
 }
 
+/// How one pane is drawn (fix round G, G29): the cursor into its list,
+/// whether it is focused, its first row and its empty text.
+struct Pane<'a> {
+    cursor: usize,
+    focused: bool,
+    head: Head<'a>,
+    empty: &'a str,
+}
+
 /// Draw `head` on the first row of `area`.
 fn head(theme: &Theme, area: Rect, head: Head<'_>, buf: &mut Buffer) {
-    let row = Rect::new(area.x, area.y, area.width, 1);
     let (text, style) = match head {
         Head::Hint(text) => return hint(theme, area, text, buf),
         Head::Title(text) => (text, theme.accent().add_modifier(Modifier::BOLD)),
         Head::Columns(text) => (text, theme.text_secondary()),
     };
+    let row = Rect::new(area.x, area.y, area.width, 1);
     let w = usize::from(area.width).saturating_sub(1);
     put(
         buf,
         row,
         Line::styled(format!(" {}", truncate(text, w)), style),
     );
+}
+
+/// The body of a pane under its head: `None` when there is no row for it.
+fn body_under_head(theme: &Theme, pane: &Pane<'_>, area: Rect, buf: &mut Buffer) -> Option<Rect> {
+    if area.height == 0 || area.width < 2 {
+        return None;
+    }
+    head(theme, area, pane.head, buf);
+    let body = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(1),
+    );
+    (body.height > 0).then_some(body)
 }
 
 /// One line of the Nodes pane: a host header or a node line.
@@ -155,33 +182,14 @@ enum Entry {
 /// The Nodes pane: the head, then the lines under their host headers (in
 /// the accent; `lines` is index for index with the nodes, in group order,
 /// so a header opens wherever the key changes), scrolled so the line of the
-/// node at `cursor` is on screen and highlighted while the pane is focused.
-#[allow(clippy::too_many_arguments)]
-fn nodes(
-    theme: &Theme,
-    lines: &[NodeLine],
-    cursor: usize,
-    focused: bool,
-    top_row: Head<'_>,
-    empty: &str,
-    area: Rect,
-    buf: &mut Buffer,
-) {
-    if area.height == 0 || area.width < 2 {
+/// node at the cursor is on screen and highlighted while the pane is
+/// focused.
+fn nodes(theme: &Theme, lines: &[NodeLine], pane: Pane<'_>, area: Rect, buf: &mut Buffer) {
+    let Some(body) = body_under_head(theme, &pane, area, buf) else {
         return;
-    }
-    head(theme, area, top_row, buf);
-    let body = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(1),
-    );
-    if body.height == 0 {
-        return;
-    }
+    };
     if lines.is_empty() {
-        note(theme, body, empty, buf);
+        note(theme, body, pane.empty, buf);
         return;
     }
     let mut entries: Vec<Entry> = Vec::with_capacity(lines.len() * 2);
@@ -195,88 +203,57 @@ fn nodes(
     }
     let cursor_entry = entries
         .iter()
-        .position(|e| matches!(e, Entry::Row(k) if *k == cursor))
+        .position(|e| matches!(e, Entry::Row(k) if *k == pane.cursor))
         .unwrap_or(0);
-    let h = usize::from(body.height);
-    let top = cursor_entry.saturating_sub(h - 1);
     let w = usize::from(body.width);
-    for (k, entry) in entries.iter().enumerate().skip(top).take(h) {
-        let row = Rect::new(body.x, body.y + cells(k - top), body.width, 1);
-        match entry {
-            Entry::Header(i) => put(
-                buf,
-                row,
-                Line::styled(
-                    format!(" {}", truncate(&lines[*i].host, w.saturating_sub(1))),
-                    theme.accent(),
-                ),
+    rows(
+        buf,
+        theme,
+        body,
+        entries.len(),
+        cursor_entry,
+        pane.focused,
+        |k| match entries[k] {
+            Entry::Header(i) => Line::styled(
+                format!(" {}", truncate(&lines[i].host, w.saturating_sub(1))),
+                theme.accent(),
             ),
-            Entry::Row(i) => {
-                let line = &lines[*i];
-                let is_cursor = *i == cursor;
-                if is_cursor && focused {
-                    buf.set_style(row, selection_bg(theme));
-                }
-                put(buf, row, marked(theme, &line.text, is_cursor, w));
-            }
-        }
-    }
+            Entry::Row(i) => marked(theme, &lines[i].text, i == pane.cursor, w),
+        },
+    );
 }
 
 /// The Points pane: the head, then one line per point (`points`, the
-/// `point_lines` twin the fold built; fix round G, G15), scrolled so
-/// `cursor` is on screen and highlighted while the pane is focused;
-/// `cursor` is `None` when no point is under it.
-#[allow(clippy::too_many_arguments)]
-fn points(
-    theme: &Theme,
-    points: &[String],
-    cursor: Option<usize>,
-    focused: bool,
-    top_row: Head<'_>,
-    empty: &str,
-    area: Rect,
-    buf: &mut Buffer,
-) {
-    if area.height == 0 || area.width < 2 {
+/// `point_lines` twin the fold built; fix round G, G15), scrolled so the
+/// cursor is on screen and highlighted while the pane is focused.
+fn points(theme: &Theme, points: &[String], pane: Pane<'_>, area: Rect, buf: &mut Buffer) {
+    let Some(body) = body_under_head(theme, &pane, area, buf) else {
         return;
-    }
-    head(theme, area, top_row, buf);
-    let body = Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(1),
-    );
-    if body.height == 0 {
-        return;
-    }
+    };
     if points.is_empty() {
-        note(theme, body, empty, buf);
+        note(theme, body, pane.empty, buf);
         return;
     }
-    let h = usize::from(body.height);
-    let top = cursor
-        .unwrap_or(0)
-        .min(points.len() - 1)
-        .saturating_sub(h - 1);
     let w = usize::from(body.width);
-    for (k, point) in points.iter().enumerate().skip(top).take(h) {
-        let row = Rect::new(body.x, body.y + cells(k - top), body.width, 1);
-        let is_cursor = Some(k) == cursor;
-        if is_cursor && focused {
-            buf.set_style(row, selection_bg(theme));
-        }
-        put(buf, row, marked(theme, point, is_cursor, w));
-    }
+    rows(
+        buf,
+        theme,
+        body,
+        points.len(),
+        pane.cursor,
+        pane.focused,
+        |k| marked(theme, &points[k], k == pane.cursor, w),
+    );
 }
 
 /// `> text` on the cursor row, `  text` elsewhere, cut to `w` cells.
 fn marked(theme: &Theme, text: &str, is_cursor: bool, w: usize) -> Line<'static> {
     let mark = if is_cursor { ">" } else { " " };
-    let style: Style = theme.text_primary();
     Line::from(vec![
         Span::styled(mark, theme.text_secondary()),
-        Span::styled(format!(" {}", truncate(text, w.saturating_sub(2))), style),
+        Span::styled(
+            format!(" {}", truncate(text, w.saturating_sub(2))),
+            theme.text_primary(),
+        ),
     ])
 }

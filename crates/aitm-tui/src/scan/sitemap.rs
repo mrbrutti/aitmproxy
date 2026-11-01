@@ -18,7 +18,7 @@ use aitm_scan_model::{
 use serde_json::{json, Map, Value};
 
 use super::legacy::LegacyState;
-use super::profiles::authority_parts;
+use super::profiles::{authority_of, authority_parts, default_port};
 use super::{wire_token, ScanError, ScanOffer};
 use crate::text::truncate;
 
@@ -55,7 +55,7 @@ pub const AUDITED_MARK: &str = "✓";
 
 /// The widest any string of a node or point grows before it is cut, once,
 /// at fold time (D6 hostile-core bounds).
-const VALUE_MAX: usize = 200;
+pub const SITEMAP_VALUE_MAX: usize = 200;
 
 /// The method a legacy endpoint is listed under: the legacy crawler reaches
 /// its endpoints by browser navigation, which is a GET (builder's reading of
@@ -188,16 +188,19 @@ pub struct SitemapState {
     /// so and no further page is asked for.
     pub limit_reached: bool,
     pub node_cursor: usize,
-    /// An index into `points`, kept inside the selected node's range by
-    /// [`SitemapState::settle_point_cursor`], or `points.len()` when that
-    /// node has no points (so nothing is under the cursor).
-    pub point_cursor: usize,
+    /// The Points cursor as an offset within the selected node's points
+    /// (fix round G, G24): the shared walk runs over
+    /// `node_points(node_cursor).len()`, a Nodes walk resets it and a fold
+    /// clamps it, so [`SitemapState::selected_point`] is the point under
+    /// it or `None` when the node has none.
+    pub point_offset: usize,
     pub pane: MapPane,
     pub query: SitemapQuery,
-    /// The tick of the last `scan.sitemap` request.
-    pub fetched_at_tick: u64,
-    /// The `scan.sitemap` in flight was `n`'s: its reply appends (D10)
-    /// instead of replacing. Set when the request leaves, taken by the fold.
+    /// The tick the last `scan.sitemap` left on; `None` until one has.
+    pub fetched_at_tick: Option<u64>,
+    /// The mode of the last `scan.sitemap` that left: `n`'s page appends
+    /// (D10) instead of replacing. Overwritten by every send, taken by the
+    /// fold.
     pub appending: bool,
     /// This tab's last error.
     pub error: Option<ScanError>,
@@ -268,7 +271,9 @@ impl SitemapState {
         let found = selected.and_then(|id| self.nodes.iter().position(|n| n.id == id));
         self.node_cursor =
             found.unwrap_or(self.node_cursor.min(self.nodes.len().saturating_sub(1)));
-        self.settle_point_cursor();
+        self.point_offset = self
+            .point_offset
+            .min(self.node_points(self.node_cursor).len().saturating_sub(1));
     }
 
     /// On a legacy bus (D12) the lists are the `scan.discover` result read
@@ -345,23 +350,15 @@ impl SitemapState {
             .unwrap_or(self.points.len()..self.points.len())
     }
 
-    /// Keep `point_cursor` on a point of the selected node: inside that
-    /// node's range after a walk of the Points pane, on its first point
-    /// after a walk of the Nodes pane or a fold, and at `points.len()` (no
-    /// point) when the node has none. The shared cursor walk is over the
-    /// whole `points` list, so this is what makes `Up`/`Down`/`End` stop at
-    /// the node's own points and `Enter` never open another node's flow.
-    pub fn settle_point_cursor(&mut self) {
+    /// The point under the Points cursor: the selected node's point at
+    /// `point_offset`, `None` when the node has none (or fewer).
+    pub fn selected_point(&self) -> Option<&InsertionPoint> {
         let range = self.node_points(self.node_cursor);
-        self.point_cursor = if range.is_empty() {
-            self.points.len()
-        } else if self.pane == MapPane::Points && range.contains(&self.point_cursor) {
-            self.point_cursor
-        } else if self.pane == MapPane::Points && self.point_cursor >= range.end {
-            range.end - 1
+        if self.point_offset < range.len() {
+            self.points.get(range.start + self.point_offset)
         } else {
-            range.start
-        };
+            None
+        }
     }
 
     /// The summary line the view draws first (D11: `12 nodes · 2 points of
@@ -384,7 +381,8 @@ impl SitemapState {
     }
 }
 
-/// Cut every string the screen reads off a node to [`VALUE_MAX`] cells.
+/// Cut every string the screen reads off a node to [`SITEMAP_VALUE_MAX`]
+/// cells.
 fn bound_node(node: &mut SiteNode) {
     for s in [
         &mut node.id,
@@ -398,7 +396,7 @@ fn bound_node(node: &mut SiteNode) {
     node.flows.truncate(SITEMAP_PAGE_LIMIT);
 }
 
-/// Cut every string the screen reads off a point to [`VALUE_MAX`] cells,
+/// Cut every string the screen reads off a point to [`SITEMAP_VALUE_MAX`] cells,
 /// and its traits to their distinct values, at most [`POINT_TRAITS_MAX`]
 /// (fix round G, G15).
 fn bound_point(point: &mut InsertionPoint) {
@@ -422,11 +420,12 @@ fn bound_point(point: &mut InsertionPoint) {
     }
 }
 
-/// [`truncate`] to [`VALUE_MAX`], skipping the walk when the string is
-/// within the cap in bytes (a char is never more cells than bytes).
+/// [`truncate`] to [`SITEMAP_VALUE_MAX`], skipping the walk when the
+/// string is within the cap in bytes (a char is never more cells than
+/// bytes).
 fn cut(s: &mut String) {
-    if s.len() > VALUE_MAX {
-        *s = truncate(s, VALUE_MAX);
+    if s.len() > SITEMAP_VALUE_MAX {
+        *s = truncate(s, SITEMAP_VALUE_MAX);
     }
 }
 
@@ -485,11 +484,7 @@ pub fn node_lines(nodes: &[SiteNode]) -> Vec<NodeLine> {
 
 /// `host[:port]`, the port only when it is not the scheme's default.
 fn host_key(node: &SiteNode) -> String {
-    let default_port = match node.scheme.as_str() {
-        "https" => 443,
-        _ => 80,
-    };
-    if node.port == default_port {
+    if node.port == default_port(&node.scheme) {
         node.host.clone()
     } else {
         format!("{}:{}", node.host, node.port)
@@ -566,18 +561,16 @@ pub fn legacy_nodes(legacy: &LegacyState) -> Vec<SiteNode> {
             let (scheme, rest) = url
                 .split_once("://")
                 .map_or(("http", url.as_str()), |(s, r)| (s, r));
-            let (authority, path) = match rest.find(['/', '?', '#']) {
-                Some(i) => (&rest[..i], &rest[i..]),
-                None => (rest, "/"),
+            let authority = authority_of(rest);
+            let path = match &rest[authority.len()..] {
+                "" => "/",
+                p => p,
             };
             let (host, port) =
                 authority_parts(authority).unwrap_or_else(|_| (authority.to_string(), None));
-            let port = port.unwrap_or(if scheme == "https" { 443 } else { 80 });
+            let port = port.unwrap_or_else(|| default_port(scheme));
             let flow = legacy.endpoint_flows.get(url);
-            let flows: Vec<FlowRef> = flow
-                .and_then(|id| serde_json::from_value(json!(id)).ok())
-                .into_iter()
-                .collect();
+            let flows: Vec<FlowRef> = flow.and_then(|id| flow_ref(id)).into_iter().collect();
             let points = flow.map_or(0, |id| {
                 legacy.points.iter().filter(|p| p.flow == *id).count()
             });
@@ -596,6 +589,13 @@ pub fn legacy_nodes(legacy: &LegacyState) -> Vec<SiteNode> {
             }
         })
         .collect()
+}
+
+/// A legacy flow id as the contract's [`FlowRef`]: `Some` when it is a
+/// UUID in the wire form, read through `FlowId`'s parser (fix round G,
+/// G27), never through JSON.
+fn flow_ref(id: &str) -> Option<FlowRef> {
+    id.parse().ok().map(FlowRef)
 }
 
 /// The legacy injection points as insertion points (D12), in the order the
@@ -625,7 +625,7 @@ pub fn legacy_points(legacy: &LegacyState) -> Vec<InsertionPoint> {
                 name: p.name.clone(),
                 path: None,
                 example: Some(p.example.clone()),
-                flow: serde_json::from_value(json!(p.flow)).ok(),
+                flow: flow_ref(&p.flow),
                 site_node: None,
                 traits,
                 frequency: 1,
@@ -795,9 +795,9 @@ mod tests {
     }
 
     /// The fold sorts points into node order, keeps the orphans last and
-    /// settles the point cursor onto the selected node's range.
+    /// clamps the point offset to the selected node's points.
     #[test]
-    fn fold_orders_points_by_node_and_settles_the_cursor() {
+    fn fold_orders_points_by_node_and_clamps_the_offset() {
         let point = |id: &str, node: Option<&str>| InsertionPoint {
             id: id.into(),
             lane: LaneKind::Http,
@@ -833,27 +833,18 @@ mod tests {
         assert_eq!(s.node_points(0), 0..1);
         assert_eq!(s.node_points(1), 1..3);
         assert_eq!(s.node_points(7), 5..5);
-        assert_eq!(s.point_cursor, 0);
+        assert_eq!(s.point_offset, 0);
+        assert_eq!(s.selected_point().map(|p| p.id.as_str()), Some("a1"));
         assert_eq!(s.summary(), "2 nodes · 1 points of a · n next page");
 
+        // The offset is within the selected node (fix round G, G24): on
+        // `b` it names `b1` then `b2`; a fold clamps it to what is left.
         s.node_cursor = 1;
-        s.settle_point_cursor();
-        assert_eq!(
-            s.point_cursor, 1,
-            "the Nodes pane lands on the node's first point"
-        );
-        s.pane = MapPane::Points;
-        s.point_cursor = 0;
-        s.settle_point_cursor();
-        assert_eq!(s.point_cursor, 1, "Up out of the range stops at its start");
-        s.point_cursor = 2;
-        s.settle_point_cursor();
-        assert_eq!(s.point_cursor, 2, "inside the range it stays");
-        s.point_cursor = 9;
-        s.settle_point_cursor();
-        assert_eq!(s.point_cursor, 2, "past the range it stops at its end");
-
-        // A node without points leaves nothing under the cursor.
+        assert_eq!(s.selected_point().map(|p| p.id.as_str()), Some("b1"));
+        s.point_offset = 1;
+        assert_eq!(s.selected_point().map(|p| p.id.as_str()), Some("b2"));
+        s.point_offset = 9;
+        assert_eq!(s.selected_point(), None, "past the node's points");
         s.appending = true;
         s.fold_result(SitemapResult {
             nodes: vec![node("c", "h", 80, "http")],
@@ -861,9 +852,16 @@ mod tests {
             next_cursor: None,
         });
         assert_eq!(s.nodes.len(), 3, "n appends");
+        assert_eq!(
+            s.point_offset, 1,
+            "the fold clamps the offset to b's last point"
+        );
+        assert_eq!(s.selected_point().map(|p| p.id.as_str()), Some("b2"));
+
+        // A node without points leaves nothing under the cursor.
         s.node_cursor = 2;
-        s.settle_point_cursor();
-        assert_eq!(s.point_cursor, s.points.len());
+        s.point_offset = 0;
+        assert_eq!(s.selected_point(), None);
         assert_eq!(s.summary(), "3 nodes · 0 points of c");
     }
 

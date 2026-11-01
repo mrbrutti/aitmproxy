@@ -31,10 +31,10 @@ use crate::model::{
 };
 use crate::open::{self, OpenTarget};
 use crate::scan::{
-    fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
+    due, fold_profile, is_job_id, l4_gate, lane_token, launch_args, out_of_scope, parse_l4_target,
     parse_result, row_gate, scan_host, state_text, status_token, step, tag_keyed, tag_parts,
     typed_origin, usable_selector, Dir, EditorField, FieldKind, IssueFilterKey, IssuePane, JobPane,
-    MapSource, PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab,
+    MapPane, PendingLaunch, ProfileEditor, ProfilePane, ScanError, ScanOffer, ScanState, ScanTab,
     ISSUES_POLL_TICKS, LIST_POLL_TICKS, MAX_STATUS_FOLLOWUPS, NO_SCANNER, OTHER_ISSUE, OTHER_JOB,
     OTHER_ORIGIN, OTHER_PROFILE, OTHER_SAVED, SITEMAP_POLL_TICKS, STATUS_POLL_TICKS,
 };
@@ -1870,20 +1870,10 @@ impl App {
                 // the bus has no `scan.list` (a legacy bus): the Jobs tab's
                 // degraded text says so, a toast on every open would not.
                 self.request_scan_list(&mut out);
-                // Coming back to the view on the Issues tab is entering it
-                // (D6): the list may have moved while the operator was away.
-                if self.scan.tab == ScanTab::Issues {
-                    self.request_issues(&mut out);
-                }
-                // The same for the Site map (D6, "entering Site map").
-                if self.scan.tab == ScanTab::SiteMap {
-                    self.request_sitemap(None, &mut out);
-                }
-                // And for Profiles (D6, "entering Profiles the first
-                // time"): the list and the check catalogue, while empty.
-                if self.scan.tab == ScanTab::Profiles {
-                    self.enter_profiles(&mut out);
-                }
+                // Coming back to the view is entering its tab (D6): the
+                // lists may have moved while the operator was away.
+                let tab = self.scan.tab;
+                self.enter_tab_reads(tab, &mut out);
             }
             Action::ScanLaunch => {
                 if self.scan.legacy.running {
@@ -3032,13 +3022,13 @@ impl App {
                             self.scan.issues.follow_flow = false;
                             self.issue_cursor_landed(out);
                         }
-                        // The Site map's point cursor stays on the selected
-                        // node's points (D11: the Points pane lists that
-                        // node's points, the walk is over the whole list).
-                        if self.scan.tab == ScanTab::SiteMap
-                            && MapSource::from(offer) == MapSource::V2
+                        // A new node under the Site map's Nodes cursor
+                        // shows its points from the first (G24).
+                        if moved
+                            && self.scan.tab == ScanTab::SiteMap
+                            && self.scan.sitemap.pane == MapPane::Nodes
                         {
-                            self.scan.sitemap.settle_point_cursor();
+                            self.scan.sitemap.point_offset = 0;
                         }
                     }
                 }
@@ -4336,7 +4326,7 @@ impl App {
     fn request_sitemap(&mut self, cursor: Option<&str>, out: &mut Vec<BusRequest>) {
         let args = self.scan.sitemap.query.args(cursor);
         if self.scan_poll("scan.sitemap".to_string(), "scan.sitemap", args, out) {
-            self.scan.sitemap.fetched_at_tick = self.ticks;
+            self.scan.sitemap.fetched_at_tick = Some(self.ticks);
             self.scan.sitemap.appending = cursor.is_some();
         }
     }
@@ -4376,23 +4366,29 @@ impl App {
         }
     }
 
-    /// `1`..`4`: show a tab (spec D11). Entering Issues from another tab
-    /// reads the list with the current filters (D6); the other tabs' entry
-    /// reads arrive with their tasks.
+    /// `1`..`4`: show a tab (spec D11), with the reads entering it makes
+    /// ([`App::enter_tab_reads`]). Pressing `1` on the Profiles tab itself
+    /// retries a read that failed or was lost (its reads run only while
+    /// the lists are empty).
     fn scan_tab(&mut self, tab: ScanTab, out: &mut Vec<BusRequest>) {
         let entering = self.scan.tab != tab;
         self.scan.tab = tab;
-        if entering && tab == ScanTab::Issues {
-            self.request_issues(out);
+        if entering || tab == ScanTab::Profiles {
+            self.enter_tab_reads(tab, out);
         }
-        if entering && tab == ScanTab::SiteMap {
-            self.request_sitemap(None, out);
-        }
-        // Profiles reads its list and catalogue while they are empty (D6,
-        // "entering Profiles the first time"): pressing `1` on the tab
-        // itself retries a read that failed or was lost.
-        if tab == ScanTab::Profiles {
-            self.enter_profiles(out);
+    }
+
+    /// The reads entering `tab` makes (spec D6; fix round G, G28: the one
+    /// list the open and `1`..`4` share): Issues re-reads its list with
+    /// the current filters, the Site map its first page, Profiles its list
+    /// and the check catalogue while they are empty; Jobs needs none, the
+    /// open lists the jobs.
+    fn enter_tab_reads(&mut self, tab: ScanTab, out: &mut Vec<BusRequest>) {
+        match tab {
+            ScanTab::Issues => self.request_issues(out),
+            ScanTab::SiteMap => self.request_sitemap(None, out),
+            ScanTab::Profiles => self.enter_profiles(out),
+            ScanTab::Jobs => {}
         }
     }
 
@@ -5264,11 +5260,7 @@ impl App {
             self.scan.jobs.healed.clear();
             self.request_scan_list(out);
         }
-        let issues_due = self
-            .scan
-            .issues
-            .fetched_at_tick
-            .is_some_and(|f| t.saturating_sub(f) >= ISSUES_POLL_TICKS);
+        let issues_due = due(self.scan.issues.fetched_at_tick, t, ISSUES_POLL_TICKS);
         if issues_due
             && self.mode == Mode::Scan
             && self.scan.tab == ScanTab::Issues
@@ -5278,7 +5270,7 @@ impl App {
         }
         // The Site map: forty ticks after the last read, while the tab is
         // shown and a covered job is crawling (D6).
-        let sitemap_due = t.saturating_sub(self.scan.sitemap.fetched_at_tick) >= SITEMAP_POLL_TICKS;
+        let sitemap_due = due(self.scan.sitemap.fetched_at_tick, t, SITEMAP_POLL_TICKS);
         if sitemap_due
             && self.mode == Mode::Scan
             && self.scan.tab == ScanTab::SiteMap
@@ -5438,17 +5430,14 @@ impl App {
             }
             "scan.sitemap" => {
                 // The page replaces the map, or appends after `n` (D10);
-                // a reply that misses the contract leaves the map and
-                // drops the append flag, so the next page starts clean.
-                match self.scan_reply::<SitemapResult>(tag, &value) {
-                    Some(result) => {
-                        // An over-long `next_cursor` is dropped by the
-                        // fold and recorded here (fix round G, G16).
-                        if let Some(err) = self.scan.sitemap.fold_result(result) {
-                            self.scan.set_error(err);
-                        }
+                // a reply that misses the contract leaves the map (the
+                // next send sets the append flag again).
+                if let Some(result) = self.scan_reply::<SitemapResult>(tag, &value) {
+                    // An over-long `next_cursor` is dropped by the fold
+                    // and recorded here (fix round G, G16).
+                    if let Some(err) = self.scan.sitemap.fold_result(result) {
+                        self.scan.set_error(err);
                     }
-                    None => self.scan.sitemap.appending = false,
                 }
             }
             "scan.profile.list" => {
@@ -5665,9 +5654,6 @@ impl App {
         let (verb, key) = tag_parts(tag);
         if verb == "scan.issue" {
             self.scan.issues.pending_read = None;
-        }
-        if tag == "scan.sitemap" {
-            self.scan.sitemap.appending = false;
         }
         // A refused launch is answered: the key is live again (D7, D13).
         if tag == "scan.start" || tag == "scan.map" {
