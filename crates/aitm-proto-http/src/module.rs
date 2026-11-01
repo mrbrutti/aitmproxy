@@ -304,10 +304,12 @@ impl HttpModule {
     /// - cleartext inside an in-scope tunnel → `decrypted` with `client.tls =
     ///   false`, closed when the connection ends.
     ///
-    /// A row needs an authority. A head that never yields one (no token after
-    /// `CONNECT`, a non-UTF-8 head) and that the acceptor's peek does not name
-    /// either ends the connection with the error and no row: there is nothing
-    /// to key a row on. An authority token that does not parse is recorded under
+    /// A row needs an authority. A head that does not parse (no token after
+    /// `CONNECT`, a non-UTF-8 header line) is a `failed/protocol_error` row
+    /// keyed on the authority the acceptor's peek named, with no headers, as
+    /// the passthrough module records it; one the peek did not name either
+    /// ends the connection with the error and no row: there is nothing to key
+    /// a row on. An authority token that does not parse is recorded under
     /// the label `Authority::new(raw, 443)` — the raw text, lowercased, as the
     /// host — so the operator sees what the client asked for; it is never
     /// dialled.
@@ -342,7 +344,30 @@ impl HttpModule {
         let ConnectHead {
             authority: raw,
             headers,
-        } = parse_connect(&head)?;
+        } = match parse_connect(&head) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                // D5: a head that does not parse is still a row when the
+                // acceptor's peek named the authority (the request line fit the
+                // peek; a later line is what did not parse). With no authority
+                // from either source there is nothing to key a row on, so that
+                // connection stays rowless, as before.
+                if let Some(authority) = ctx.hint().and_then(NextLayerHint::tunnel_authority) {
+                    let head = TunnelHead {
+                        authority,
+                        headers: HeaderMap::new(),
+                        opened_at,
+                    };
+                    TunnelRow::open(
+                        &ctx,
+                        tunnel_request(&ctx, peer, head, false),
+                        TunnelInfo::failed(TunnelReason::ProtocolError),
+                    )
+                    .await;
+                }
+                return Err(e);
+            }
+        };
         let authority = match Authority::parse_with_default(&raw, DEFAULT_TLS_PORT) {
             Ok(authority) => authority,
             Err(e) => {
@@ -1798,8 +1823,14 @@ impl Target {
         })
     }
 
+    /// `host:port` as [`Authority`] prints it: brackets around an IPv6 literal,
+    /// the host lowercased. This is the string handed to the connector's scope
+    /// and SSRF check, which parses it back through `Authority`, and the one the
+    /// passthrough module hands its connector (spec D2: both modules compute the
+    /// same string); a bracket-less `::1:8443` would read as an IPv6 host with
+    /// no port and be refused as out of scope.
     fn authority(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        Authority::new(&self.host, self.port).to_string()
     }
 }
 
@@ -1832,9 +1863,9 @@ fn split_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> 
 /// Whether `request`, the authority a request names, is a different origin than
 /// `tunnel`, the `CONNECT` target of the tunnel it arrived in: compared
 /// case-insensitively, with port 80 assumed where one is absent. Only log lines
-/// read this; where a tunnel connects never depends on it. It misreports an
-/// IPv6-literal tunnel (its authority string has lost its brackets), which
-/// affects those log lines and nothing else.
+/// read this; where a tunnel connects never depends on it. An IPv6-literal
+/// tunnel keeps its brackets (`Target::authority` prints through `Authority`),
+/// so `split_host_port` reads both sides the same way.
 fn differs_from_tunnel_target(request: &str, tunnel: &str) -> bool {
     let origin = |authority: &str| {
         split_host_port(authority, 80)
@@ -4207,37 +4238,56 @@ mod tests {
         // An authority that cannot be split falls back to a case-insensitive match.
         assert!(!differs("[::1", "[::1"));
         assert!(differs("[::1", "example.test:80"));
+        // An IPv6-literal tunnel keeps its brackets (`Target::authority`), which
+        // `split_host_port` reads back.
+        assert!(!differs("[::1]:8080", "[::1]:8080"));
+        assert!(differs("[::1]:9090", "[::1]:8080"));
+    }
+
+    /// `Target::authority()` prints like `Authority` (spec D2: both modules hand
+    /// their connector the same string): an IPv6 literal keeps its brackets, so
+    /// the guarded connector's `Authority::parse_with_default` reads `[::1]:8443`
+    /// back as host `::1`, port 8443, not as a bracket-less IPv6 host with no
+    /// port; IPv4 literals and names are unchanged, and a name is lowercased.
+    #[test]
+    fn target_authority_prints_like_authority() {
+        let target = |host: &str, port: u16| Target {
+            host: host.to_string(),
+            port,
+            addr: unknown_peer(),
+        };
+        assert_eq!(target("::1", 8443).authority(), "[::1]:8443");
+        assert_eq!(target("127.0.0.1", 8443).authority(), "127.0.0.1:8443");
+        assert_eq!(target("example.com", 443).authority(), "example.com:443");
+        assert_eq!(target("Example.COM", 443).authority(), "example.com:443");
     }
 
     #[tokio::test]
     async fn serve_dials_an_ipv6_literal_tunnel_at_the_recorded_address() {
-        // `Target::authority()` writes the bracketed `[::1]:8080` as `::1:8080`,
-        // which `split_host_port` cannot read back, so the dial must use the
-        // address recorded when the tunnel was opened. The request's `Host` names
-        // another port, so a dial derived from it would be told apart. The
-        // authority string is deliberately not asserted: its form is a separate,
-        // known quirk.
+        // A tunnel dials the address recorded when it was opened, never one
+        // derived from the request's `Host`, which here names another port so
+        // the two would be told apart. The tunnel authority is the bracketed
+        // `[::1]:8080` that `Target::authority()` writes (through `Authority`),
+        // and that is what the connector is handed.
         let (up, origin_end) = duplex(64 * 1024);
         let (ctx, dialed) = ctx_with(vec![Box::pin(up)]);
         let _origin = tokio::spawn(origin_serve(origin_end, vec!["first"], false));
 
         let bodies = serve_requests(
             &ctx,
-            cleartext_tunnel_conn("::1:8080", "[::1]:8080"),
+            cleartext_tunnel_conn("[::1]:8080", "[::1]:8080"),
             &[get_request("/one", "[::1]:9090")],
         )
         .await;
 
         assert_eq!(bodies, vec!["first"]);
-        let dialed_addrs: Vec<SocketAddr> = dialed
-            .lock()
-            .expect("dialed lock")
-            .iter()
-            .map(|(_, addr)| *addr)
-            .collect();
         assert_eq!(
-            dialed_addrs,
-            vec!["[::1]:8080".parse::<SocketAddr>().expect("addr")]
+            dialed.lock().expect("dialed lock").clone(),
+            vec![(
+                "[::1]:8080".to_string(),
+                "[::1]:8080".parse::<SocketAddr>().expect("addr")
+            )],
+            "the connector gets the tunnel's bracketed authority and its recorded address"
         );
     }
 
@@ -8470,12 +8520,10 @@ mod tests {
         /// (`malformed_connect_head_is_a_failed_protocol_error_row`). The client
         /// gets no acknowledgement and nothing is dialled.
         ///
-        /// Tester finding T1 (stage 5, whole branch): `HttpModule::tunnel` returns
-        /// `parse_connect(&head)?` with no row even when `ctx.hint()` names the
-        /// authority, so today this CONNECT is silent (the store stays empty). Enable
-        /// once the HTTP module records the row the way the passthrough module does.
+        /// Tester finding T1 (stage 5, whole branch): `HttpModule::tunnel` returned
+        /// `parse_connect(&head)?` with no row even when `ctx.hint()` named the
+        /// authority, so this CONNECT was silent (the store stayed empty).
         #[tokio::test]
-        #[ignore = "Tester finding T1: a non-UTF-8 CONNECT head the peek named leaves no row in the HTTP module (spec D5)"]
         async fn non_utf8_connect_head_is_a_failed_protocol_error_row() {
             let module = HttpModule::with_ca(test_ca()).with_insecure(true);
             let store = Arc::new(MemFlowStore::new());
@@ -8641,18 +8689,15 @@ mod tests {
             let server = row.server_conn.as_ref().expect("the dialled origin");
             assert_eq!(server.peer, v6_peer);
             assert_eq!(server.sni.as_deref(), Some("::1"));
-            let dialed = dialed.lock().expect("dialed lock").clone();
+            // Tester finding T2: the connector is handed the bracketed `[::1]:8443`
+            // the row carries and the passthrough module hands its connector (spec
+            // D2) — the form the guarded connector's `Authority::parse_with_default`
+            // reads back as `::1` on port 8443.
             assert_eq!(
-                dialed.iter().map(|(_, addr)| *addr).collect::<Vec<_>>(),
-                vec![v6_peer],
-                "an IPv6 literal is dialled as is, with no lookup"
+                dialed.lock().expect("dialed lock").clone(),
+                vec![(V6.to_string(), v6_peer)],
+                "an IPv6 literal is dialled as is, with no lookup, under its bracketed authority"
             );
-            // Tester finding T2: the authority string handed to the connector here is
-            // `Target::authority()`'s `::1:8443`, not the `[::1]:8443` the row carries
-            // and the passthrough module hands its connector; the guarded connector
-            // cannot parse the bracket-less form. Pinned loosely until the Coder
-            // decides: both spellings name the same host and port.
-            assert_eq!(dialed.len(), 1);
             assert!(request_paths(&store).is_empty());
         }
 
@@ -8704,14 +8749,10 @@ mod tests {
                 "the row opens before `serve` dials the origin lazily (spec D5: \"when one was dialled\")"
             );
             assert_eq!(
-                dialed
-                    .lock()
-                    .expect("dialed lock")
-                    .iter()
-                    .map(|(_, addr)| *addr)
-                    .collect::<Vec<_>>(),
-                vec![v6_peer],
-                "the tunnel target is dialled as the IPv6 literal"
+                dialed.lock().expect("dialed lock").clone(),
+                vec![(V6.to_string(), v6_peer)],
+                "the connector is handed the bracketed authority (spec D2: the string the \
+                 passthrough module hands its connector) and dials the IPv6 literal"
             );
 
             let inner = request_row(&store, "/v6");
