@@ -346,6 +346,13 @@ Kept by the main session during stage 6. One row per finding.
 | fix B | coder note | note | `a_terminal_line_on_the_issues_tab_requests_issues` will need re-pinning once Task 7 fetches on entering Issues | Task 7 settles the entering-Issues fetch first in that test |
 | fix B | security | re-review | B1, B2, B3, B4, B7 closed; worst case against a hostile core is about 18 `scan.status` per second plus one per push line, no amplification | closed |
 | fix B | security | Minor | outside `Mode::Scan` push-driven unknown jobs are never pruned (no `scan.list` arrives), so state grows one entry per pushed id | fix round C: in `on_job_line`, a job not in `order`/`started_here` gets a `scan.status` only in `Mode::Scan`; elsewhere the line is a trigger for the next list |
+| fix B | quality | re-review | B1 to B10 closed as prescribed | closed |
+| fix B | quality | Minor | `live()` still chains `summaries`/`full` keys though both are retained to `order` | fix round C: iterate cursor then `order` only; invariant in the field docs plus a `debug_assert!` in `fold_list` |
+| fix B | quality | Minor | `ScanError` tag assigned twice; the four-field literal spelled at three sites; `.tagged()` is a caller convention | fix round C: constructors take the tag and derive `verb` from `tag_parts`; `ScanError::uncoded(tag, detail)`; delete `tagged()` |
+| fix B | quality | Minor | `request_scan_statuses` generic over an iterator both callers build the same way | fix round C: take `&[JobId]` |
+| fix B | quality | Minor | three more fix-round provenance tags in production doc comments | fix round C (same row as the six from round A) |
+| fix B | quality | Minor | `scan_v2_cadence.rs` hand-builds the bus envelopes in nine places; mid-file helpers; two expectations computed with `tag_keyed` | fix round C: `job_line()`, `list_reply()`, `status_reply_for()` helpers at the top; literal `format!("scan.status:{id}")` expectations |
+| fix B | quality | Minor | stale binding name `text` in `scan_v2_parse.rs` after B10 | fix round C |
 
 ## Shipped
 
