@@ -19,7 +19,7 @@ PR A makes `aitm-testtarget` the proving ground: a logging core (`log.rs`), a co
 | A-2 | A1b (legacy `tests/target.rs` + `tests/grader.rs` scoped to the legacy six), A5 (`app.rs` router refactor + `routes/` stubs + `ws::serve_upgrade` stub), A6 (`control.rs`), A7 (tlv + udp_payload), A8 (dns), A9 (resp + memcached), A10 (modbus), A11 (mqtt), A12 (smtp + ftp) | A1b: A1; A5: A1, A2, A4; A6: A2; A7-A12: A3 |
 | A-3 | A13 (`routes/inject.rs`), A14 (`routes/reflect.rs`), A15 (`routes/session.rs`), A16 (`routes/misc.rs`), A17 (`ws.rs` upgrade), A18 (`tls.rs`), A19 (`speakers/driver.rs`) | A13-A16: A5; A17: A4, A5; A18: A5; A19: A3, A7-A12 |
 | A-4 | A20 (`lib.rs` builder + `main.rs` flags), A22 (`tests/speakers_live.rs`) | A20: A6, A17, A18, A19; A22: A19 |
-| A-5 | A21 (`tests/scan_http.rs` socket tests) | A20 |
+| A-5 | A20b (legacy L4 pair under `l4(true)`, dead-code sweep), A21 (`tests/scan_http.rs` socket tests) | A20 |
 | A-6 | A23 (integration PR A) | all |
 
 **PR B waves:**
@@ -244,6 +244,15 @@ PR A makes `aitm-testtarget` the proving ground: a logging core (`log.rs`), a co
 - **Change:** `pub struct TargetBuilder { mode: SeedMode, port: u16, tls: Option<u16>, tls_h1: Option<u16>, control: Option<u16>, l4: bool }`; `impl TestTarget { pub fn builder(mode: SeedMode) -> TargetBuilder; pub fn tls_url(&self) -> Option<&str>; pub fn tls_h1_url(&self) -> Option<&str>; pub fn control_url(&self) -> Option<&str>; pub fn l4_services(&self) -> &[RunningService]; pub fn mode(&self) -> SeedMode }`; `impl TargetBuilder { pub fn port(mut self, p: u16) -> Self; pub fn tls(mut self, p: u16) -> Self; pub fn tls_h1(mut self, p: u16) -> Self; pub fn control(mut self, p: u16) -> Self; pub fn l4(mut self, on: bool) -> Self; pub async fn start(self) -> std::io::Result<TestTarget> }` (order: plain, tls, tls_h1, control, l4; `l4(true)` without `control` is `Err(InvalidInput, "l4 needs control")`); `TestTarget` holds `_l4: Option<L4Services>`; `start`/`start_on` delegate. `main.rs`: `parse_args() -> Result<Args, String>` with `struct Args { mode, port, tls: Option<u16>, tls_h1: Option<u16>, control: Option<u16>, l4: bool }`; usage line lists every flag; prints `listening`, then `tls`, `tls_h1`, `control` lines for started listeners, then `ready`, each flushed; `--l4` without `--control-port` -> stderr `--l4 needs --control-port` and exit 1. `pub use speakers::{L4Services, RunningService};`.
 - **Test**: `main.rs` `#[cfg(test)]` `parse_args_full`: `["--mode","patched","--tls-port","0","--tls-h1-port","0","--control-port","0","--l4"]` -> `Args { mode: Patched, port: 0, tls: Some(0), tls_h1: Some(0), control: Some(0), l4: true }`; `parse_args_legacy`: `["--mode","vulnerable","--port","0"]` -> `tls == None, control == None, l4 == false`; `l4_needs_control`: `["--l4"]` -> `Err` containing `--l4 needs --control-port`. `tests/serve_bin.rs` (Terminal) `serve_bin_prints_every_line_in_order`: spawn with all flags -> the stdout lines match, in order, `^listening http://127\.0\.0\.1:\d+$`, `^tls https://127\.0\.0\.1:\d+$`, `^tls_h1 https://127\.0\.0\.1:\d+$`, `^control http://127\.0\.0\.1:\d+$`, `^ready$`; the legacy invocation's first line still matches `^listening http://` (existing tests).
 - **Done when:** `--lib --offline` passes and `cargo test -p aitm-testtarget --test serve_bin` passes in the Terminal.
+
+### Task A20b: legacy L4 pair under `l4(true)`, stale `allow(dead_code)` sweep
+
+- **Satisfies:** D2 (`--l4` also lists `l4-udp-echo`/`l4-tcp-service` with `"grammar":null`), S1 hygiene; found by the A20 coder, 2026-11-01.
+- **Depends on:** A20.
+- **Files:** `crates/aitm-testtarget/src/lib.rs` (modify), `src/l4.rs` (modify: additive only), and the `allow(dead_code)` lines in `src/{app,control,log,ws,tls}.rs` and `src/speakers/{dns,driver,ftp,smtp,tlv,mqtt,udp_payload}.rs` (remove only; no other edit to those files).
+- **Change:** `TargetBuilder::start` with `l4 == true` also starts the legacy `L4Service::start(L4Config { enabled: true })` and registers both legacy services in the control log (`ServiceInfo { name: "l4-udp-echo", proto: "udp", role: "l4", alpn: None, grammar: None }` and `l4-tcp-service` / `tcp`); `TestTarget` holds `_legacy_l4: Option<L4Service>`; `l4_services()` keeps returning only the nine speakers (the legacy pair is reachable via `/services`). Remove every stale `#[allow(dead_code)]`/`#![allow(dead_code)]` whose item is now consumed; keep one only where clippy still needs it and say why in its comment.
+- **Test:** a `--lib` unit test cannot bind; extend `tests/scan_http.rs`'s `services_lists_everything` expectation (owned by A21, which already asserts the legacy pair) and prove compilation; `cargo clippy -p aitm-testtarget --all-targets --offline -- -D warnings` exit 0 after the sweep.
+- **Done when:** clippy and the lib tests pass with the allowances gone.
 
 ### Task A21: `tests/scan_http.rs` socket tests (TLS ALPN, h2 counter, `/ws`, control)
 
