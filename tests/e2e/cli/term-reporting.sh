@@ -441,29 +441,45 @@ tui_feeder() {
 }
 
 # ===========================================================================
+# pb_version "<label>" <args...>: the pre-boot version line (AC-W1-1): stdout
+# is exactly `aitm <version>`, stderr empty, exit 0.
+pb_version() {
+  local label="$1"; shift
+  HOME="$HOME_DIR" "$AITM_BIN" "$@" >"$ROOT/pb.out" 2>"$ROOT/pb.err" </dev/null; local rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(cat "$ROOT/pb.out")" = "aitm $EXPECT_VERSION" ] && [ ! -s "$ROOT/pb.err" ]; then
+    pass "$label → stdout 'aitm $EXPECT_VERSION', stderr empty, exit 0"
+  else
+    fail "$label: rc=$rc stdout=[$(head -c 120 "$ROOT/pb.out" | tr '\n' ' ')] stderr=[$(head -c 120 "$ROOT/pb.err" | tr '\n' ' ')]"
+  fi
+}
+
+# pb_help "<label>" <args...>: the pre-boot synopsis (AC-W1-1, AC-W1-2) on
+# stdout, exit 0.
+pb_help() {
+  local label="$1"; shift
+  HOME="$HOME_DIR" "$AITM_BIN" "$@" >"$ROOT/pb.out" 2>"$ROOT/pb.err" </dev/null; local rc=$?
+  local first; first="$(head -1 "$ROOT/pb.out")"
+  if [ "$rc" -eq 0 ] && starts_with "$first" "aitm $EXPECT_VERSION — intercepting proxy" \
+     && grep -q '^Groups:' "$ROOT/pb.out" && grep -q -F 'aitm scope add --host <host>' "$ROOT/pb.out"; then
+    pass "$label → synopsis on stdout ('$first'; Groups:; scope add), exit 0"
+  else
+    fail "$label: rc=$rc first line=[$first]"
+  fi
+}
+
 section_preboot() {
   begin_section "1. pre-boot --version / --help (AC-W1-1, AC-W1-2)"
   new_home preboot
   touch "$ROOT/marker"; sleep 1
-  local a rc first
-  for a in --version -V version; do
-    HOME="$HOME_DIR" "$AITM_BIN" "$a" >"$ROOT/pb.out" 2>"$ROOT/pb.err" </dev/null; rc=$?
-    if [ "$rc" -eq 0 ] && [ "$(cat "$ROOT/pb.out")" = "aitm $EXPECT_VERSION" ] && [ ! -s "$ROOT/pb.err" ]; then
-      pass "aitm $a → stdout 'aitm $EXPECT_VERSION', stderr empty, exit 0"
-    else
-      fail "aitm $a: rc=$rc stdout=[$(head -c 120 "$ROOT/pb.out" | tr '\n' ' ')] stderr=[$(head -c 120 "$ROOT/pb.err" | tr '\n' ' ')]"
-    fi
-  done
-  for a in --help -h help; do
-    HOME="$HOME_DIR" "$AITM_BIN" "$a" >"$ROOT/pb.out" 2>"$ROOT/pb.err" </dev/null; rc=$?
-    first="$(head -1 "$ROOT/pb.out")"
-    if [ "$rc" -eq 0 ] && starts_with "$first" "aitm $EXPECT_VERSION — intercepting proxy" \
-       && grep -q '^Groups:' "$ROOT/pb.out" && grep -q -F 'aitm scope add --host <host>' "$ROOT/pb.out"; then
-      pass "aitm $a → synopsis on stdout ('$first'; Groups:; scope add), exit 0"
-    else
-      fail "aitm $a: rc=$rc first line=[$first]"
-    fi
-  done
+  local a
+  for a in --version -V version; do pb_version "aitm $a" "$a"; done
+  for a in --help -h help; do pb_help "aitm $a" "$a"; done
+  # Amended AC-W1-1 (spec D8): leading global flags are stepped over before
+  # anything boots. The `--config` path is never read, so it need not exist
+  # (and must not be created: the `find` below sees it).
+  pb_version "aitm -v --version" -v --version
+  pb_version 'aitm --config $HOME/does-not-exist.yaml --version' --config "$HOME_DIR/does-not-exist.yaml" --version
+  pb_help "aitm --color never -h" --color never -h
   local created; created="$(find "$HOME_DIR" -mindepth 1 -newer "$ROOT/marker" | wc -l | tr -d ' ')"
   check "pre-boot created nothing under a fresh HOME ($created entries)" [ "$created" = 0 ]
   local med; med="$(median_of 5 "$AITM_BIN" --version)"
@@ -562,6 +578,7 @@ section_exitcodes() {
   ec "aitm nonsense"                          2 'unknown command `nonsense`' 'fix: aitm --help'      -- "$AITM_BIN" nonsense
   ec "aitm flow list --bogus 1"               2 'error: unknown flag --bogus' 'fix: aitm --help'     -- "$AITM_BIN" flow list --bogus 1
   ec "aitm --flag-first"                      2 'error: expected a command before flags, got `--flag-first`' 'fix: aitm --help' -- "$AITM_BIN" --flag-first
+  ec "aitm --config (no value)"               2 'error: --config requires a path' 'fix: aitm --help'    -- "$AITM_BIN" --config
   ec "aitm -v -q"                             2 '`-v` and `-q` cannot be combined' ''                -- "$AITM_BIN" -v -q
   ec "aitm --config /nonexistent.yaml flow list" 1 'in config file /nonexistent.yaml' 'Create it, or run without --config' -- "$AITM_BIN" --config /nonexistent.yaml flow list
   ec "aitm findings get --id nope"            1 'error: findings.get: ' '  log: '                     -- "$AITM_BIN" findings get --id nope
@@ -698,7 +715,7 @@ section_raw() {
 
 # ===========================================================================
 section_stdout() {
-  begin_section "9. stdout silence on the stdio transport (AC-W1-21; spec Open question 3 default)"
+  begin_section "9. stdout silence on the stdio transport (AC-W1-21, AC-W1-32; spec Open question 3 default)"
   new_env stdio || return
   HOME="$HOME_DIR" "$AITM_BIN" --config "$CFG_STDIO" >"$ROOT/stdio.out" 2>"$ROOT/stdio.err" </dev/null &
   local pid=$! i=0 exited=0
@@ -717,7 +734,20 @@ section_stdout() {
   # pipe is plain mode, so the note carries the `·` separator and no glyph.
   local eof_notes; eof_notes="$(count_re '^stdin closed · stdio MCP transport ended$' "$ROOT/stdio.err")"
   check "spec Open question 3 default: stderr has exactly one 'stdin closed · stdio MCP transport ended' line ($eof_notes)" [ "$eof_notes" = 1 ]
-  end_section "$ROOT/stdio.err"
+  check "AC-W1-32: the note is the last stderr line" [ "$(tail -1 "$ROOT/stdio.err")" = 'stdin closed · stdio MCP transport ended' ]
+  # AC-W1-32 names `aitm web` too: the same stdio config, bounded like the
+  # bare run, nothing on stdout, the note exactly once and last.
+  run_bounded "$ROOT/stdio-web.out" "$ROOT/stdio-web.err" 20 "$AITM_BIN" --config "$CFG_STDIO" web --no-open --listen "127.0.0.1:$WEB_PORT"
+  if [ "$RC" = 124 ]; then
+    fail "aitm web on the stdio transport did not exit within 20 s of stdin EOF"
+  else
+    pass "aitm web on the stdio transport exits on its own after stdin EOF (exit $RC)"
+  fi
+  check "aitm web: stdout received 0 bytes" [ "$(wc -c <"$ROOT/stdio-web.out" | tr -d ' ')" = 0 ]
+  eof_notes="$(count_re '^stdin closed · stdio MCP transport ended$' "$ROOT/stdio-web.err")"
+  check "aitm web: stderr has exactly one 'stdin closed · stdio MCP transport ended' line ($eof_notes)" [ "$eof_notes" = 1 ]
+  check "aitm web: the note is the last stderr line" [ "$(tail -1 "$ROOT/stdio-web.err")" = 'stdin closed · stdio MCP transport ended' ]
+  end_section "$ROOT/stdio.err" "$ROOT/stdio-web.err"
 }
 
 # ===========================================================================
